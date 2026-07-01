@@ -113,3 +113,13 @@ def test_ftp_history_isolated_per_user():
     assert db.latest_ftp(a)["ftp_watts"] == pytest.approx(300.0)
     assert db.latest_ftp(b) is None
     assert db.ftp_history_list(b) == []
+
+
+def test_estimate_ftp_tz_aware_start_time_does_not_crash():
+    # Regression: FIT timestamps are tz-aware (UTC) while the window cutoff is
+    # naive; the trailing-window filter must not raise TypeError.
+    from tranalyzer.metrics.power import estimate_ftp
+
+    acts = [{"start_time": "2026-06-20T10:00:00+00:00",
+             "streams": {"power": [200] * 1300}}]
+    assert round(estimate_ftp(acts, window_days=42), 1) == 190.0

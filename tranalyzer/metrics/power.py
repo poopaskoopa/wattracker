@@ -121,6 +121,11 @@ def _activity_power_streams(
                         when = _dt.datetime.fromisoformat(st)
                     except (ValueError, TypeError):
                         when = None
+                    # FIT timestamps are tz-aware (UTC); `cutoff` is naive local.
+                    # Drop tzinfo so the trailing-window comparison never mixes
+                    # offset-aware and offset-naive datetimes.
+                    if when is not None and when.tzinfo is not None:
+                        when = when.replace(tzinfo=None)
                     if when is not None and when < cutoff:
                         continue
             out.append(power)
