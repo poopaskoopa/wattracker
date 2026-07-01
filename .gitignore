@@ -29,3 +29,7 @@ config.json
 .pytest_cache/
 .coverage
 htmlcov/
+
+# runtime artifacts
+.tranalyzer.pid
+tranalyzer.log
