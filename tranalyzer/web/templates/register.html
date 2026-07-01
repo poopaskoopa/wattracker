@@ -1,0 +1,20 @@
+{% extends "base.html" %}
+{% block title %}Register &mdash; TRanalyzer{% endblock %}
+{% block content %}
+<h2>Create account</h2>
+
+{% if error %}<p class="alert">{{ error }}</p>{% endif %}
+
+<form method="post" action="/register" class="auth-form">
+    <label>Username
+        <input type="text" name="username" autocomplete="username" required autofocus>
+    </label>
+    <label>Password (min 8 characters)
+        <input type="password" name="password" autocomplete="new-password"
+               minlength="8" required>
+    </label>
+    <button type="submit">Create account</button>
+</form>
+
+<p>Already have an account? <a href="/login">Log in</a>.</p>
+{% endblock %}

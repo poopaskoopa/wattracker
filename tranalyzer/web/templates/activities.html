@@ -1,0 +1,71 @@
+{% extends "base.html" %}
+{% block title %}Activities &mdash; TRanalyzer{% endblock %}
+{% block content %}
+<h2>Activities</h2>
+
+{% if scan %}
+<p class="{{ 'ok' if scan.imported or scan.found else 'alert' }}">
+    {% if not scan.exists %}
+        Scanned <code>{{ scan.directory }}</code> &mdash; directory not found.
+        Check the path below or set it in <a href="/settings">Settings</a>.
+    {% elif scan.found == 0 %}
+        Scanned <code>{{ scan.directory }}</code> &mdash; no .fit files found in this folder.
+    {% else %}
+        Scanned <code>{{ scan.directory }}</code> &mdash; {{ scan.found }} .fit
+        file(s) found, {{ scan.imported }} imported, {{ scan.skipped }} duplicate(s) skipped.
+    {% endif %}
+</p>
+{% endif %}
+
+<section class="scan-panel">
+    <form method="post" action="/activities/rescan" class="scan-form">
+        <label>Activities directory
+            <input type="text" name="activities_dir" value="{{ prefill_dir or '' }}"
+                   placeholder="/path/to/Zwift/Activities">
+        </label>
+        <button type="submit">Rescan folder</button>
+    </form>
+    <p class="hint">
+        Recommended location(s) for this OS:
+        {% for c in candidates %}
+            <code>{{ c.path }}</code>
+            <span class="{{ 'ok' if c.exists else 'muted' }}">
+                ({{ 'found' if c.exists else 'not found' }})</span>{{ ", " if not loop.last else "" }}
+        {% endfor %}
+    </p>
+</section>
+
+<div class="toolbar">
+    <form method="post" action="/activities/upload" enctype="multipart/form-data">
+        <input type="file" name="file" accept=".fit,.FIT" required>
+        <button type="submit">Upload .fit</button>
+    </form>
+</div>
+
+{% if activities %}
+<table>
+    <thead>
+        <tr>
+            <th>Start</th><th>Duration</th><th>Distance</th>
+            <th>Avg Power</th><th>NP</th><th>IF</th><th>TSS</th>
+        </tr>
+    </thead>
+    <tbody>
+    {% for a in activities %}
+        <tr>
+            <td>{{ a.start_time or '&mdash;'|safe }}</td>
+            <td>{{ (a.duration_s // 60) if a.duration_s else 0 }} min</td>
+            <td>{{ '%.1f'|format((a.distance_m or 0) / 1000) }} km</td>
+            <td>{{ '%.0f'|format(a.avg_power or 0) }} W</td>
+            <td>{{ '%.0f'|format(a.np or 0) }} W</td>
+            <td>{{ '%.2f'|format(a.if_ or 0) }}</td>
+            <td>{{ '%.0f'|format(a.tss or 0) }}</td>
+        </tr>
+    {% endfor %}
+    </tbody>
+</table>
+{% else %}
+<p>No activities imported yet. Set your Zwift folder in
+   <a href="/settings">Settings</a>, then rescan &mdash; or upload a .fit file.</p>
+{% endif %}
+{% endblock %}

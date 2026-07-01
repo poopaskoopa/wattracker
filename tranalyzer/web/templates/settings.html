@@ -1,0 +1,42 @@
+{% extends "base.html" %}
+{% block title %}Settings &mdash; TRanalyzer{% endblock %}
+{% block content %}
+<h2>Settings</h2>
+
+{% if saved %}<p class="ok">Settings saved.</p>{% endif %}
+
+<p class="current-ftp"><strong>Current FTP:</strong> {{ current_ftp }} W</p>
+<p class="hint">Setting FTP below records a manual entry for today. The app also
+   auto-estimates FTP monthly from your best 20-minute efforts.</p>
+
+<form method="post" action="/settings" class="settings-form">
+    <label>FTP (watts, overrides estimate):
+        <input type="number" step="1" name="ftp"
+               value="{{ settings.ftp if settings.ftp is not none else '' }}">
+    </label>
+    <label>Zwift ID:
+        <input type="text" name="zwift_id"
+               value="{{ settings.zwift_id or '' }}">
+    </label>
+    <label>Activities folder (override):
+        <input type="text" name="activities_dir"
+               value="{{ settings.activities_dir or '' }}">
+    </label>
+    <label>Workouts folder (override):
+        <input type="text" name="workouts_dir"
+               value="{{ settings.workouts_dir or '' }}">
+    </label>
+    <label>Anthropic API key (app-level, shared)
+        {% if api_key_set %}(currently set){% endif %}:
+        <input type="password" name="anthropic_api_key"
+               placeholder="{{ 'leave blank to keep' if api_key_set else 'sk-ant-...' }}">
+    </label>
+    <button type="submit">Save</button>
+</form>
+
+<p class="hint">FTP, Zwift ID, and folder paths are private to your account.
+   The Anthropic API key is app-level (shared) and the app is fully functional
+   without one &mdash; LLM refinement is optional. Environment variables
+   (<code>ANTHROPIC_API_KEY</code>, <code>TRANALYZER_SECRET</code>) override
+   stored values.</p>
+{% endblock %}

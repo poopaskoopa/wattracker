@@ -1,0 +1,32 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>{% block title %}TRanalyzer{% endblock %}</title>
+    <link rel="stylesheet" href="/static/style.css">
+    <script src="https://cdn.jsdelivr.net/npm/chart.js@4"></script>
+</head>
+<body>
+    <header>
+        <h1><a href="/">TRanalyzer</a></h1>
+        {% if username %}
+        <nav>
+            <a href="/">Dashboard</a>
+            <a href="/activities">Activities</a>
+            <a href="/generate">Generate</a>
+            <a href="/settings">Settings</a>
+            <span class="user">{{ username }}</span>
+            <a href="/logout" class="logout">Logout</a>
+        </nav>
+        {% endif %}
+    </header>
+    <main>
+        {% block content %}{% endblock %}
+    </main>
+    <footer>
+        <small>TRanalyzer &mdash; local cycling training analyzer</small>
+    </footer>
+    {% block scripts %}{% endblock %}
+</body>
+</html>

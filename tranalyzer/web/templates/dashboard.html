@@ -1,0 +1,47 @@
+{% extends "base.html" %}
+{% block title %}Dashboard &mdash; TRanalyzer{% endblock %}
+{% block content %}
+<h2>Dashboard</h2>
+
+<section class="cards">
+    <div class="card"><span class="label">FTP</span><span class="value">{{ state.ftp }} W</span></div>
+    <div class="card"><span class="label">CP</span><span class="value">{{ state.cp if state.cp is not none else '&mdash;'|safe }} W</span></div>
+    <div class="card"><span class="label">W'</span><span class="value">{{ state.wprime if state.wprime is not none else '&mdash;'|safe }} J</span></div>
+    <div class="card"><span class="label">CTL (Fitness)</span><span class="value">{{ state.ctl }}</span></div>
+    <div class="card"><span class="label">ATL (Fatigue)</span><span class="value">{{ state.atl }}</span></div>
+    <div class="card"><span class="label">TSB (Form)</span><span class="value">{{ state.tsb }}</span></div>
+    <div class="card"><span class="label">Readiness</span><span class="value">{{ state.readiness }}/100</span></div>
+    <div class="card"><span class="label">Decoupling</span><span class="value">{{ state.decoupling if state.decoupling is not none else '&mdash;'|safe }}%</span></div>
+</section>
+
+{% if state.alerts %}
+<section class="alerts">
+    <h3>Alerts</h3>
+    <ul>
+    {% for a in state.alerts %}<li class="alert">{{ a }}</li>{% endfor %}
+    </ul>
+</section>
+{% else %}
+<p class="ok">No plateau or overreach detected. Keep training.</p>
+{% endif %}
+
+<section class="chart-block">
+    <h3>Fitness / Fatigue / Form (CTL / ATL / TSB)</h3>
+    <canvas id="loadChart" height="120"></canvas>
+</section>
+
+<section class="chart-block">
+    <h3>Power&ndash;Duration Curve</h3>
+    <canvas id="curveChart" height="120"></canvas>
+</section>
+
+<section class="chart-block">
+    <h3>FTP Over Time</h3>
+    <canvas id="ftpChart" height="120"></canvas>
+</section>
+{% endblock %}
+
+{% block scripts %}
+<script src="/static/app.js"></script>
+<script>renderDashboard();</script>
+{% endblock %}

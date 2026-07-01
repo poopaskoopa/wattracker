@@ -1,0 +1,67 @@
+{% extends "base.html" %}
+{% block title %}Generate &mdash; TRanalyzer{% endblock %}
+{% block content %}
+<h2>Generate Workout</h2>
+
+{% if exported_path %}
+<p class="ok">Exported to Zwift: <code>{{ exported_path }}</code></p>
+{% endif %}
+
+<form method="post" action="/generate" class="generate-form">
+    <label>Duration (minutes):
+        <input type="number" name="duration_min" min="30" max="120"
+               value="{{ duration or 60 }}" required>
+    </label>
+    <button type="submit">Prescribe</button>
+</form>
+
+{% if error %}
+<p class="alert">Error: {{ error }}</p>
+{% endif %}
+
+{% if session %}
+<section class="workout">
+    <h3>{{ session.name }}</h3>
+    <p>{{ session.description }}</p>
+    <p><strong>Type:</strong> {{ session.workout_type }} &middot;
+       <strong>Total:</strong> {{ session.total_duration // 60 }} min &middot;
+       <strong>Est. TSS:</strong> {{ session.estimated_tss }}</p>
+
+    <table>
+        <thead><tr><th>#</th><th>Block</th><th>Detail</th><th>Duration</th></tr></thead>
+        <tbody>
+        {% for s in session.segments %}
+            <tr>
+                <td>{{ loop.index }}</td>
+                <td>{{ s.kind }}</td>
+                <td>
+                    {% if s.kind == 'intervals' %}
+                        {{ s.repeat }} x ({{ s.on_duration }}s @ {{ (s.on_power*100)|round(0) }}% /
+                        {{ s.off_duration }}s @ {{ (s.off_power*100)|round(0) }}%)
+                    {% elif s.kind in ['warmup','cooldown','ramp'] %}
+                        {{ (s.power_low*100)|round(0) }}% &rarr; {{ (s.power_high*100)|round(0) }}% FTP
+                    {% elif s.kind == 'steadystate' %}
+                        {{ (s.power*100)|round(0) }}% FTP
+                    {% else %}&mdash;{% endif %}
+                    {% if s.text %}<br><em>{{ s.text }}</em>{% endif %}
+                </td>
+                <td>{{ s.duration }}s</td>
+            </tr>
+        {% endfor %}
+        </tbody>
+    </table>
+
+    <div class="toolbar">
+        <form method="post" action="/generate/export">
+            <button type="submit">Export to Zwift</button>
+        </form>
+        <a class="button" href="/generate/download">Download .zwo</a>
+    </div>
+
+    <details>
+        <summary>.zwo preview</summary>
+        <pre>{{ session.zwo }}</pre>
+    </details>
+</section>
+{% endif %}
+{% endblock %}
