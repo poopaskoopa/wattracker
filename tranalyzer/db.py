@@ -14,9 +14,11 @@ from typing import Dict, List, Optional
 
 from .config import db_path
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 
 _DROP = """
+DROP TABLE IF EXISTS plan_workouts;
+DROP TABLE IF EXISTS plans;
 DROP TABLE IF EXISTS activities;
 DROP TABLE IF EXISTS ftp_history;
 DROP TABLE IF EXISTS user_settings;
@@ -68,6 +70,32 @@ CREATE TABLE IF NOT EXISTS ftp_history (
     PRIMARY KEY(user_id, date),
     FOREIGN KEY(user_id) REFERENCES users(id)
 );
+
+CREATE TABLE IF NOT EXISTS plans (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id    INTEGER NOT NULL,
+    name       TEXT NOT NULL,
+    start_date TEXT NOT NULL,
+    weeks      INTEGER NOT NULL,
+    created    TEXT NOT NULL,
+    FOREIGN KEY(user_id) REFERENCES users(id)
+);
+
+CREATE TABLE IF NOT EXISTS plan_workouts (
+    id                INTEGER PRIMARY KEY AUTOINCREMENT,
+    plan_id           INTEGER NOT NULL,
+    user_id           INTEGER NOT NULL,
+    date              TEXT NOT NULL,
+    name              TEXT NOT NULL,
+    type              TEXT NOT NULL,
+    duration_s        INTEGER NOT NULL,
+    tss               REAL NOT NULL,
+    zwo_or_segments   TEXT NOT NULL,
+    FOREIGN KEY(plan_id) REFERENCES plans(id),
+    FOREIGN KEY(user_id) REFERENCES users(id)
+);
+CREATE INDEX IF NOT EXISTS idx_plan_workouts_user_date
+    ON plan_workouts(user_id, date);
 """
 
 
@@ -400,5 +428,136 @@ def ftp_history_list(user_id: int, path: Optional[str] = None) -> List[dict]:
             {"date": r["date"], "ftp_watts": r["ftp_watts"], "source": r["source"]}
             for r in rows
         ]
+    finally:
+        conn.close()
+
+
+# ---------------------------------------------------------------- plans
+def create_plan(
+    user_id: int, name: str, start_date: str, weeks: int, path: Optional[str] = None
+) -> int:
+    conn = connect(path)
+    try:
+        cur = conn.execute(
+            "INSERT INTO plans (user_id, name, start_date, weeks, created) "
+            "VALUES (?, ?, ?, ?, ?)",
+            (user_id, name, start_date, int(weeks), _dt.datetime.now().isoformat()),
+        )
+        conn.commit()
+        return cur.lastrowid
+    finally:
+        conn.close()
+
+
+def add_plan_workout(
+    plan_id: int,
+    user_id: int,
+    date: str,
+    name: str,
+    type: str,
+    duration_s: int,
+    tss: float,
+    zwo_or_segments: str,
+    path: Optional[str] = None,
+) -> int:
+    conn = connect(path)
+    try:
+        cur = conn.execute(
+            """
+            INSERT INTO plan_workouts
+              (plan_id, user_id, date, name, type, duration_s, tss, zwo_or_segments)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (plan_id, user_id, date, name, type, int(duration_s), float(tss),
+             zwo_or_segments),
+        )
+        conn.commit()
+        return cur.lastrowid
+    finally:
+        conn.close()
+
+
+def get_plan(user_id: int, plan_id: int, path: Optional[str] = None) -> Optional[dict]:
+    conn = connect(path)
+    try:
+        row = conn.execute(
+            "SELECT id, name, start_date, weeks, created FROM plans "
+            "WHERE user_id = ? AND id = ?",
+            (user_id, plan_id),
+        ).fetchone()
+        return dict(row) if row else None
+    finally:
+        conn.close()
+
+
+def list_plans(user_id: int, path: Optional[str] = None) -> List[dict]:
+    conn = connect(path)
+    try:
+        rows = conn.execute(
+            "SELECT id, name, start_date, weeks, created FROM plans "
+            "WHERE user_id = ? ORDER BY created DESC",
+            (user_id,),
+        ).fetchall()
+        return [dict(r) for r in rows]
+    finally:
+        conn.close()
+
+
+def _plan_workout_row(r: sqlite3.Row, include_zwo: bool = False) -> dict:
+    d = {
+        "id": r["id"],
+        "plan_id": r["plan_id"],
+        "date": r["date"],
+        "name": r["name"],
+        "type": r["type"],
+        "duration_s": r["duration_s"],
+        "tss": r["tss"],
+    }
+    if include_zwo:
+        d["zwo_or_segments"] = r["zwo_or_segments"]
+    return d
+
+
+def plan_workouts_for_plan(
+    user_id: int, plan_id: int, include_zwo: bool = False, path: Optional[str] = None
+) -> List[dict]:
+    conn = connect(path)
+    try:
+        rows = conn.execute(
+            "SELECT * FROM plan_workouts WHERE user_id = ? AND plan_id = ? "
+            "ORDER BY date ASC",
+            (user_id, plan_id),
+        ).fetchall()
+        return [_plan_workout_row(r, include_zwo) for r in rows]
+    finally:
+        conn.close()
+
+
+def plan_workouts_for_month(
+    user_id: int, year: int, month: int, path: Optional[str] = None
+) -> List[dict]:
+    prefix = f"{int(year):04d}-{int(month):02d}-"
+    conn = connect(path)
+    try:
+        rows = conn.execute(
+            "SELECT * FROM plan_workouts WHERE user_id = ? AND date LIKE ? "
+            "ORDER BY date ASC",
+            (user_id, prefix + "%"),
+        ).fetchall()
+        return [_plan_workout_row(r) for r in rows]
+    finally:
+        conn.close()
+
+
+def get_plan_workout(
+    user_id: int, workout_id: int, path: Optional[str] = None
+) -> Optional[dict]:
+    conn = connect(path)
+    try:
+        row = conn.execute(
+            "SELECT * FROM plan_workouts WHERE user_id = ? AND id = ?",
+            (user_id, workout_id),
+        ).fetchone()
+        return _plan_workout_row(row, include_zwo=True) if row else None
     finally:
         conn.close()

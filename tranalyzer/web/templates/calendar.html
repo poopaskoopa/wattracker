@@ -1,0 +1,44 @@
+{% extends "base.html" %}
+{% block title %}Calendar &mdash; TRanalyzer{% endblock %}
+{% block content %}
+<h2>Calendar</h2>
+
+<div class="cal-head">
+    <a class="button" href="/calendar{{ prev }}">&larr; Prev</a>
+    <h3>{{ month_name }} {{ year }}</h3>
+    <a class="button" href="/calendar{{ next }}">Next &rarr;</a>
+</div>
+
+{% if plans %}
+<p class="hint">Your plans:
+    {% for p in plans %}
+        <a href="/calendar?year={{ p.start_date[:4] }}&month={{ p.start_date[5:7]|int }}">{{ p.name }}</a>
+        (starts {{ p.start_date }}){{ ", " if not loop.last else "" }}
+    {% endfor %}
+</p>
+{% else %}
+<p class="hint">No plans yet. Build one on the <a href="/generate">Generate</a> page (Plan mode).</p>
+{% endif %}
+
+<table class="calendar">
+    <thead>
+        <tr>{% for d in day_labels %}<th>{{ d }}</th>{% endfor %}</tr>
+    </thead>
+    <tbody>
+    {% for week in weeks %}
+        <tr>
+        {% for cell in week %}
+            <td class="cal-cell {{ 'other-month' if not cell.in_month else '' }}">
+                <div class="cal-day">{{ cell.day }}</div>
+                {% for w in cell.workouts %}
+                    <div class="cal-workout cal-{{ w.type }}" title="{{ w.name }} — {{ (w.duration_s // 60) }} min, {{ w.tss }} TSS">
+                        {{ w.name }}<span class="cal-type">{{ w.type }}</span>
+                    </div>
+                {% endfor %}
+            </td>
+        {% endfor %}
+        </tr>
+    {% endfor %}
+    </tbody>
+</table>
+{% endblock %}

@@ -290,3 +290,27 @@ def plan_workout(state, duration_min: int) -> Session:
     if fresh:
         return _threshold(total_s)
     return _easy_endurance(total_s)
+
+
+# Public dispatch by workout kind, for the multi-week plan generator. Reuses the
+# exact interval builders above so plan sessions match single-workout sessions.
+WORKOUT_BUILDERS = {
+    "vo2max": _vo2max,
+    "threshold": _threshold,
+    "sweet_spot": _sweet_spot,
+    "endurance": _z2_endurance,
+    "recovery": _easy_endurance,
+}
+
+
+def build_workout(kind: str, duration_min: float) -> Session:
+    """Build a Session of the given kind at the given duration (minutes).
+
+    Raises ValueError for an unknown kind.
+    """
+    if kind not in WORKOUT_BUILDERS:
+        raise ValueError(f"unknown workout kind: {kind}")
+    total_s = int(round(float(duration_min))) * 60
+    session = WORKOUT_BUILDERS[kind](total_s)
+    session.compute_tss()
+    return session

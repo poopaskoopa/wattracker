@@ -114,6 +114,37 @@ def _safe_filename(name: str) -> str:
     return (base or "workout") + ".zwo"
 
 
+def plan_filename(date_iso: str, name: str) -> str:
+    """Date-led, filesystem-safe .zwo filename, e.g. '2026-07-07 VO2 5x4.zwo'."""
+    safe = "".join(c if (c.isalnum() or c in " -_.") else "_" for c in name).strip()
+    safe = safe or "workout"
+    return f"{date_iso} {safe}.zwo"
+
+
+def write_plan_to_zwift(
+    workouts: "list[dict]",
+    zwift_id: str,
+    workouts_override: "str | None" = None,
+) -> dict:
+    """Write each plan workout as a date-named .zwo into the Zwift folder.
+
+    Each workout dict needs ``date``, ``name`` and ``zwo`` (the XML string).
+    Returns {"directory": ..., "paths": [...], "count": N}.
+    """
+    from ..paths import workouts_dir
+
+    target_dir = workouts_dir(zwift_id, override=workouts_override)
+    os.makedirs(target_dir, exist_ok=True)
+    written: "list[str]" = []
+    for w in workouts:
+        fname = plan_filename(w["date"], w["name"])
+        p = os.path.join(target_dir, fname)
+        with open(p, "w", encoding="utf-8") as f:
+            f.write(w["zwo"])
+        written.append(p)
+    return {"directory": target_dir, "paths": written, "count": len(written)}
+
+
 def write_to_zwift(
     zwo_str: str,
     zwift_id: str,

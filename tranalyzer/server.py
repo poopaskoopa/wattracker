@@ -1,10 +1,13 @@
 """FastAPI application: auth + per-user dashboard, activities, generate, settings."""
 from __future__ import annotations
 
+import calendar as _cal
 import datetime as _dt
+import io
 import os
+import zipfile
 from contextlib import asynccontextmanager
-from typing import Optional
+from typing import List, Optional
 
 from fastapi import FastAPI, Form, Request, UploadFile
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse, Response
@@ -16,9 +19,18 @@ from starlette.middleware.sessions import SessionMiddleware
 from . import auth, config, db, paths
 from .analysis import pipeline
 from .ingest import importer
+from .prescribe import plan as planmod
 from .prescribe import zwo
 from .prescribe import llm
 from .prescribe.planner import plan_workout
+
+DAY_LABELS = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
+
+
+def _upcoming_monday(today: Optional[_dt.date] = None) -> _dt.date:
+    today = today or _dt.date.today()
+    delta = (0 - today.weekday()) % 7  # 0 if today is Monday, else days to next Monday
+    return today + _dt.timedelta(days=delta)
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
 _TEMPLATES_DIR = os.path.join(_HERE, "web", "templates")
@@ -191,12 +203,48 @@ def create_app() -> FastAPI:
         importer.ingest_upload(_uid(request), file.filename or "upload.fit", content)
         return RedirectResponse(url="/activities", status_code=303)
 
+    def _plan_defaults() -> dict:
+        return {
+            "weeks": 8,
+            "hours_per_week": 6.0,
+            "hit_days_per_week": 2,
+            "days": [0, 2, 4, 5],
+            "start_date": _upcoming_monday().isoformat(),
+            "name": "Training Plan",
+        }
+
+    def _generate_ctx(request: Request, **kw) -> dict:
+        base = dict(
+            session=None,
+            error=None,
+            duration=60,
+            mode="workout",
+            plan=None,
+            plan_error=None,
+            plan_defaults=_plan_defaults(),
+            day_labels=DAY_LABELS,
+            exported=None,
+            exported_path=None,
+        )
+        base.update(kw)
+        return _ctx(request, **base)
+
+    def _plan_summary(uid: int, plan_id: int) -> Optional[dict]:
+        plan = db.get_plan(uid, plan_id)
+        if not plan:
+            return None
+        workouts = db.plan_workouts_for_plan(uid, plan_id)
+        summary = dict(plan)
+        summary["plan_id"] = plan_id
+        summary["count"] = len(workouts)
+        summary["workouts"] = workouts
+        summary["total_tss"] = round(sum(w["tss"] for w in workouts), 1)
+        return summary
+
     @app.get("/generate", response_class=HTMLResponse)
     def generate_form(request: Request):
         return templates.TemplateResponse(
-            request,
-            "generate.html",
-            _ctx(request, session=None, error=None, duration=60),
+            request, "generate.html", _generate_ctx(request)
         )
 
     @app.post("/generate", response_class=HTMLResponse)
@@ -218,7 +266,195 @@ def create_app() -> FastAPI:
         return templates.TemplateResponse(
             request,
             "generate.html",
-            _ctx(request, session=session_dict, error=error, duration=duration_min),
+            _generate_ctx(
+                request, mode="workout", session=session_dict,
+                error=error, duration=duration_min,
+            ),
+        )
+
+    @app.post("/generate/plan", response_class=HTMLResponse)
+    def generate_plan_submit(
+        request: Request,
+        name: str = Form("Training Plan"),
+        weeks: int = Form(...),
+        hours_per_week: float = Form(...),
+        hit_days_per_week: int = Form(...),
+        start_date: str = Form(""),
+        days: List[str] = Form([]),
+    ):
+        uid = _uid(request)
+        try:
+            day_ints = sorted({int(d) for d in days})
+        except (ValueError, TypeError):
+            day_ints = []
+        try:
+            start = _dt.date.fromisoformat(start_date) if start_date else _upcoming_monday()
+        except ValueError:
+            start = _upcoming_monday()
+
+        plan_error: Optional[str] = None
+        summary = None
+        # Preserve the user's inputs in the redisplayed form.
+        defaults = {
+            "weeks": weeks, "hours_per_week": hours_per_week,
+            "hit_days_per_week": hit_days_per_week, "days": day_ints,
+            "start_date": start.isoformat(), "name": name,
+        }
+        try:
+            generated = planmod.generate_plan(
+                name, start, weeks, day_ints, hours_per_week, hit_days_per_week
+            )
+            plan_id = db.create_plan(
+                uid, name or "Training Plan", generated["start_date"], generated["weeks"]
+            )
+            for w in generated["workouts"]:
+                zwo_str = zwo.zwo_string(w["session"])
+                db.add_plan_workout(
+                    plan_id, uid, w["date"], w["name"], w["type"],
+                    w["duration_s"], w["tss"], zwo_str,
+                )
+            summary = _plan_summary(uid, plan_id)
+            summary["polarized_hard_fraction"] = generated["polarized_hard_fraction"]
+            summary["weekly"] = generated["weekly"]
+        except ValueError as e:
+            plan_error = str(e)
+
+        return templates.TemplateResponse(
+            request,
+            "generate.html",
+            _generate_ctx(
+                request, mode="plan", plan=summary, plan_error=plan_error,
+                plan_defaults=defaults,
+            ),
+        )
+
+    @app.post("/plan/{plan_id}/export", response_class=HTMLResponse)
+    def plan_export(request: Request, plan_id: int):
+        uid = _uid(request)
+        workouts = db.plan_workouts_for_plan(uid, plan_id, include_zwo=True)
+        settings = db.get_user_settings(uid)
+        exported = None
+        if workouts:
+            result = zwo.write_plan_to_zwift(
+                [
+                    {"date": w["date"], "name": w["name"], "zwo": w["zwo_or_segments"]}
+                    for w in workouts
+                ],
+                settings.get("zwift_id") or "me",
+                workouts_override=settings.get("workouts_dir"),
+            )
+            exported = {"count": result["count"], "directory": result["directory"]}
+        summary = _plan_summary(uid, plan_id)
+        return templates.TemplateResponse(
+            request,
+            "generate.html",
+            _generate_ctx(request, mode="plan", plan=summary, exported=exported),
+        )
+
+    @app.get("/plan/{plan_id}/download.zip")
+    def plan_download_zip(request: Request, plan_id: int):
+        uid = _uid(request)
+        workouts = db.plan_workouts_for_plan(uid, plan_id, include_zwo=True)
+        if not workouts:
+            return RedirectResponse(url="/generate", status_code=303)
+        buf = io.BytesIO()
+        with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
+            for w in workouts:
+                fname = zwo.plan_filename(w["date"], w["name"])
+                zf.writestr(fname, w["zwo_or_segments"])
+        buf.seek(0)
+        plan = db.get_plan(uid, plan_id)
+        zipname = zwo._safe_filename(plan["name"] if plan else "plan").replace(".zwo", "")
+        return Response(
+            content=buf.getvalue(),
+            media_type="application/zip",
+            headers={"Content-Disposition": f'attachment; filename="{zipname}.zip"'},
+        )
+
+    @app.post("/plan/workout/{workout_id}/export", response_class=HTMLResponse)
+    def plan_workout_export(request: Request, workout_id: int):
+        uid = _uid(request)
+        w = db.get_plan_workout(uid, workout_id)
+        exported = None
+        summary = None
+        if w:
+            settings = db.get_user_settings(uid)
+            result = zwo.write_plan_to_zwift(
+                [{"date": w["date"], "name": w["name"], "zwo": w["zwo_or_segments"]}],
+                settings.get("zwift_id") or "me",
+                workouts_override=settings.get("workouts_dir"),
+            )
+            exported = {"count": result["count"], "directory": result["directory"]}
+            summary = _plan_summary(uid, w["plan_id"])
+        return templates.TemplateResponse(
+            request,
+            "generate.html",
+            _generate_ctx(request, mode="plan", plan=summary, exported=exported),
+        )
+
+    @app.get("/plan/workout/{workout_id}/download")
+    def plan_workout_download(request: Request, workout_id: int):
+        w = db.get_plan_workout(_uid(request), workout_id)
+        if not w:
+            return RedirectResponse(url="/generate", status_code=303)
+        fname = zwo.plan_filename(w["date"], w["name"])
+        return Response(
+            content=w["zwo_or_segments"],
+            media_type="application/xml",
+            headers={"Content-Disposition": f'attachment; filename="{fname}"'},
+        )
+
+    @app.get("/calendar", response_class=HTMLResponse)
+    def calendar_view(
+        request: Request,
+        year: Optional[int] = None,
+        month: Optional[int] = None,
+    ):
+        uid = _uid(request)
+        today = _dt.date.today()
+        y = year or today.year
+        m = month or today.month
+        # Normalise month into 1..12 (defensive).
+        if m < 1:
+            y, m = y - 1, 12
+        elif m > 12:
+            y, m = y + 1, 1
+
+        by_date: dict = {}
+        for w in db.plan_workouts_for_month(uid, y, m):
+            by_date.setdefault(w["date"], []).append(w)
+
+        cal = _cal.Calendar(firstweekday=0)  # Monday
+        weeks = []
+        for week in cal.monthdatescalendar(y, m):
+            row = []
+            for d in week:
+                row.append(
+                    {
+                        "date": d.isoformat(),
+                        "day": d.day,
+                        "in_month": d.month == m,
+                        "workouts": by_date.get(d.isoformat(), []),
+                    }
+                )
+            weeks.append(row)
+
+        prev_y, prev_m = (y - 1, 12) if m == 1 else (y, m - 1)
+        next_y, next_m = (y + 1, 1) if m == 12 else (y, m + 1)
+        return templates.TemplateResponse(
+            request,
+            "calendar.html",
+            _ctx(
+                request,
+                year=y,
+                month=m,
+                month_name=_cal.month_name[m],
+                weeks=weeks,
+                day_labels=DAY_LABELS,
+                prev=f"?year={prev_y}&month={prev_m}",
+                next=f"?year={next_y}&month={next_m}",
+                plans=db.list_plans(uid),
+            ),
         )
 
     @app.post("/generate/export")
@@ -238,7 +474,7 @@ def create_app() -> FastAPI:
         return templates.TemplateResponse(
             request,
             "generate.html",
-            _ctx(request, session=None, error=None, exported_path=path, duration=60),
+            _generate_ctx(request, mode="workout", exported_path=path),
         )
 
     @app.get("/generate/download")

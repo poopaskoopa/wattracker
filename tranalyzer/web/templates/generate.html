@@ -1,67 +1,194 @@
 {% extends "base.html" %}
 {% block title %}Generate &mdash; TRanalyzer{% endblock %}
 {% block content %}
-<h2>Generate Workout</h2>
+<h2>Generate</h2>
 
-{% if exported_path %}
-<p class="ok">Exported to Zwift: <code>{{ exported_path }}</code></p>
-{% endif %}
+<div class="mode-toggle">
+    <label><input type="radio" name="genmode" value="workout"
+        {{ 'checked' if mode != 'plan' else '' }}> Single Workout</label>
+    <label><input type="radio" name="genmode" value="plan"
+        {{ 'checked' if mode == 'plan' else '' }}> Training Plan</label>
+</div>
 
-<form method="post" action="/generate" class="generate-form">
-    <label>Duration (minutes):
-        <input type="number" name="duration_min" min="30" max="120"
-               value="{{ duration or 60 }}" required>
-    </label>
-    <button type="submit">Prescribe</button>
-</form>
+<!-- ============================ WORKOUT MODE ============================ -->
+<section id="mode-workout" class="mode-panel">
+    {% if exported_path %}
+    <p class="ok">Exported to Zwift: <code>{{ exported_path }}</code></p>
+    {% endif %}
 
-{% if error %}
-<p class="alert">Error: {{ error }}</p>
-{% endif %}
+    <form method="post" action="/generate" class="generate-form">
+        <label>Duration (minutes):
+            <input type="number" name="duration_min" min="30" max="120"
+                   value="{{ duration or 60 }}" required>
+        </label>
+        <button type="submit">Prescribe</button>
+    </form>
 
-{% if session %}
-<section class="workout">
-    <h3>{{ session.name }}</h3>
-    <p>{{ session.description }}</p>
-    <p><strong>Type:</strong> {{ session.workout_type }} &middot;
-       <strong>Total:</strong> {{ session.total_duration // 60 }} min &middot;
-       <strong>Est. TSS:</strong> {{ session.estimated_tss }}</p>
+    {% if error %}<p class="alert">Error: {{ error }}</p>{% endif %}
 
-    <table>
-        <thead><tr><th>#</th><th>Block</th><th>Detail</th><th>Duration</th></tr></thead>
-        <tbody>
-        {% for s in session.segments %}
-            <tr>
-                <td>{{ loop.index }}</td>
-                <td>{{ s.kind }}</td>
-                <td>
-                    {% if s.kind == 'intervals' %}
-                        {{ s.repeat }} x ({{ s.on_duration }}s @ {{ (s.on_power*100)|round(0) }}% /
-                        {{ s.off_duration }}s @ {{ (s.off_power*100)|round(0) }}%)
-                    {% elif s.kind in ['warmup','cooldown','ramp'] %}
-                        {{ (s.power_low*100)|round(0) }}% &rarr; {{ (s.power_high*100)|round(0) }}% FTP
-                    {% elif s.kind == 'steadystate' %}
-                        {{ (s.power*100)|round(0) }}% FTP
-                    {% else %}&mdash;{% endif %}
-                    {% if s.text %}<br><em>{{ s.text }}</em>{% endif %}
-                </td>
-                <td>{{ s.duration }}s</td>
-            </tr>
-        {% endfor %}
-        </tbody>
-    </table>
+    {% if session %}
+    <section class="workout">
+        <h3>{{ session.name }}</h3>
+        <p>{{ session.description }}</p>
+        <p><strong>Type:</strong> {{ session.workout_type }} &middot;
+           <strong>Total:</strong> {{ session.total_duration // 60 }} min &middot;
+           <strong>Est. TSS:</strong> {{ session.estimated_tss }}</p>
 
-    <div class="toolbar">
-        <form method="post" action="/generate/export">
-            <button type="submit">Export to Zwift</button>
-        </form>
-        <a class="button" href="/generate/download">Download .zwo</a>
-    </div>
+        <table>
+            <thead><tr><th>#</th><th>Block</th><th>Detail</th><th>Duration</th></tr></thead>
+            <tbody>
+            {% for s in session.segments %}
+                <tr>
+                    <td>{{ loop.index }}</td>
+                    <td>{{ s.kind }}</td>
+                    <td>
+                        {% if s.kind == 'intervals' %}
+                            {{ s.repeat }} x ({{ s.on_duration }}s @ {{ (s.on_power*100)|round(0) }}% /
+                            {{ s.off_duration }}s @ {{ (s.off_power*100)|round(0) }}%)
+                        {% elif s.kind in ['warmup','cooldown','ramp'] %}
+                            {{ (s.power_low*100)|round(0) }}% &rarr; {{ (s.power_high*100)|round(0) }}% FTP
+                        {% elif s.kind == 'steadystate' %}
+                            {{ (s.power*100)|round(0) }}% FTP
+                        {% else %}&mdash;{% endif %}
+                        {% if s.text %}<br><em>{{ s.text }}</em>{% endif %}
+                    </td>
+                    <td>{{ s.duration }}s</td>
+                </tr>
+            {% endfor %}
+            </tbody>
+        </table>
 
-    <details>
-        <summary>.zwo preview</summary>
-        <pre>{{ session.zwo }}</pre>
-    </details>
+        <div class="toolbar">
+            <form method="post" action="/generate/export">
+                <button type="submit">Export to Zwift</button>
+            </form>
+            <a class="button" href="/generate/download">Download .zwo</a>
+        </div>
+
+        <details>
+            <summary>.zwo preview</summary>
+            <pre>{{ session.zwo }}</pre>
+        </details>
+    </section>
+    {% endif %}
 </section>
-{% endif %}
+
+<!-- ============================= PLAN MODE ============================= -->
+<section id="mode-plan" class="mode-panel">
+    <h3>Build a multi-week polarized plan (~80% easy / 20% hard)</h3>
+
+    {% if plan_error %}<p class="alert">Error: {{ plan_error }}</p>{% endif %}
+
+    <form method="post" action="/generate/plan" class="plan-form">
+        <label>Plan name:
+            <input type="text" name="name" value="{{ plan_defaults.name }}">
+        </label>
+        <label>Weeks:
+            <input type="number" name="weeks" min="1" max="52"
+                   value="{{ plan_defaults.weeks }}" required>
+        </label>
+        <label>Hours per week:
+            <input type="number" step="0.5" min="1" name="hours_per_week"
+                   value="{{ plan_defaults.hours_per_week }}" required>
+        </label>
+        <label>High-intensity days per week:
+            <input type="number" min="0" max="7" name="hit_days_per_week"
+                   value="{{ plan_defaults.hit_days_per_week }}" required>
+        </label>
+        <label>Start date (a Monday is ideal):
+            <input type="date" name="start_date" value="{{ plan_defaults.start_date }}">
+        </label>
+        <fieldset class="days-picker">
+            <legend>Days you ride</legend>
+            {% for label in day_labels %}
+            <label class="day-check">
+                <input type="checkbox" name="days" value="{{ loop.index0 }}"
+                    {{ 'checked' if loop.index0 in plan_defaults.days else '' }}>
+                {{ label }}
+            </label>
+            {% endfor %}
+        </fieldset>
+        <button type="submit">Generate plan</button>
+    </form>
+
+    {% if exported %}
+    <p class="ok">Exported {{ exported.count }} .zwo file(s) to
+       <code>{{ exported.directory }}</code></p>
+    {% endif %}
+
+    {% if plan %}
+    <section class="plan-result">
+        <h3>{{ plan.name }}</h3>
+        <p><strong>{{ plan.weeks }}</strong> weeks &middot;
+           starts <strong>{{ plan.start_date }}</strong> &middot;
+           <strong>{{ plan.count }}</strong> workouts &middot;
+           total TSS <strong>{{ plan.total_tss }}</strong>
+           {% if plan.polarized_hard_fraction is defined %}
+           &middot; hard time ~{{ (plan.polarized_hard_fraction * 100)|round(0)|int }}%
+           {% endif %}
+        </p>
+
+        <div class="toolbar">
+            <form method="post" action="/plan/{{ plan.plan_id }}/export">
+                <button type="submit">Export plan to Zwift</button>
+            </form>
+            <a class="button" href="/plan/{{ plan.plan_id }}/download.zip">Download .zip</a>
+            <a class="button" href="/calendar">View on calendar</a>
+        </div>
+
+        {% if plan.weekly is defined %}
+        <table class="weekly-table">
+            <thead><tr><th>Week</th><th>Volume</th><th>TSS</th><th>Hard %</th></tr></thead>
+            <tbody>
+            {% for wk in plan.weekly %}
+                <tr class="{{ 'recovery-week' if wk.recovery else '' }}">
+                    <td>{{ wk.week }}{{ ' (recovery)' if wk.recovery else '' }}</td>
+                    <td>{{ (wk.total_s // 60) }} min</td>
+                    <td>{{ wk.total_tss }}</td>
+                    <td>{{ (wk.hard_fraction * 100)|round(0)|int }}%</td>
+                </tr>
+            {% endfor %}
+            </tbody>
+        </table>
+        {% endif %}
+
+        <table>
+            <thead><tr><th>Date</th><th>Workout</th><th>Type</th><th>Duration</th><th>TSS</th><th></th></tr></thead>
+            <tbody>
+            {% for w in plan.workouts %}
+                <tr>
+                    <td>{{ w.date }}</td>
+                    <td>{{ w.name }}</td>
+                    <td>{{ w.type }}</td>
+                    <td>{{ (w.duration_s // 60) }} min</td>
+                    <td>{{ w.tss }}</td>
+                    <td>
+                        <a href="/plan/workout/{{ w.id }}/download">.zwo</a>
+                        <form method="post" action="/plan/workout/{{ w.id }}/export"
+                              style="display:inline">
+                            <button type="submit" class="link-btn">export</button>
+                        </form>
+                    </td>
+                </tr>
+            {% endfor %}
+            </tbody>
+        </table>
+    </section>
+    {% endif %}
+</section>
+
+<script>
+(function () {
+    function applyMode() {
+        var sel = document.querySelector('input[name="genmode"]:checked');
+        var mode = sel ? sel.value : 'workout';
+        document.getElementById('mode-workout').style.display = mode === 'plan' ? 'none' : 'block';
+        document.getElementById('mode-plan').style.display = mode === 'plan' ? 'block' : 'none';
+    }
+    document.querySelectorAll('input[name="genmode"]').forEach(function (r) {
+        r.addEventListener('change', applyMode);
+    });
+    applyMode();
+})();
+</script>
 {% endblock %}
