@@ -317,8 +317,8 @@ def create_app() -> FastAPI:
         return JSONResponse(pipeline.build_state(_uid(request)).to_dict())
 
     @app.get("/api/load")
-    def api_load(request: Request):
-        return JSONResponse(pipeline.load_series(_uid(request)))
+    def api_load(request: Request, months: Optional[float] = None):
+        return JSONResponse(pipeline.load_series(_uid(request), months=months))
 
     @app.get("/api/curve")
     def api_curve(request: Request):
@@ -329,8 +329,14 @@ def create_app() -> FastAPI:
         return JSONResponse(db.list_activities(_uid(request)))
 
     @app.get("/api/ftp")
-    def api_ftp(request: Request):
-        return JSONResponse(db.ftp_history_list(_uid(request)))
+    def api_ftp(request: Request, months: Optional[float] = None):
+        return JSONResponse(pipeline.ftp_recorded(_uid(request), months=months))
+
+    @app.get("/api/ftp_series")
+    def api_ftp_series(request: Request, months: Optional[float] = None):
+        return JSONResponse(
+            pipeline.ftp_rolling_series(_uid(request), months=months)
+        )
 
     return app
 

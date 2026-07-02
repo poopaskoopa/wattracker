@@ -7,6 +7,7 @@ from typing import Dict, List, Optional, Tuple
 from .. import db
 from ..timeutil import parse_naive
 from ..ingest.importer import current_ftp
+from ..metrics.power import estimate_ftp
 from ..metrics.curve import MMP_DURATIONS, fit_cp_wprime, mean_maximal_power
 from ..metrics.decoupling import aerobic_decoupling
 from ..metrics.load import compute_load, daily_tss_series
@@ -97,9 +98,100 @@ def build_state(user_id: int) -> TrainingState:
     return state
 
 
-def load_series(user_id: int) -> List[dict]:
-    """CTL/ATL/TSB daily series for charting."""
-    return compute_load(daily_tss_series(db.daily_tss(user_id)))
+_DAYS_PER_MONTH = 30.44
+
+FTP_WINDOW_DAYS = 42
+FTP_STEP_DAYS = 7
+
+
+def _filter_by_months(
+    series: List[dict], months: Optional[float], now: Optional[_dt.datetime] = None
+) -> List[dict]:
+    """Keep only series items whose ``date`` falls in the trailing N months."""
+    if not months or float(months) <= 0:
+        return series
+    now = now or _dt.datetime.now()
+    cutoff = now - _dt.timedelta(days=int(round(float(months) * _DAYS_PER_MONTH)))
+    out: List[dict] = []
+    for item in series:
+        d = parse_naive(item.get("date"))
+        if d is not None and d >= cutoff:
+            out.append(item)
+    return out
+
+
+def load_series(user_id: int, months: Optional[float] = None) -> List[dict]:
+    """CTL/ATL/TSB daily series for charting, optionally trailing N months."""
+    series = compute_load(daily_tss_series(db.daily_tss(user_id)))
+    return _filter_by_months(series, months)
+
+
+def ftp_recorded(user_id: int, months: Optional[float] = None) -> List[dict]:
+    """Recorded (manual/monthly) FTP history rows, optionally trailing N months."""
+    return _filter_by_months(db.ftp_history_list(user_id), months)
+
+
+def ftp_rolling_series(
+    user_id: int,
+    months: Optional[float] = None,
+    window_days: int = FTP_WINDOW_DAYS,
+    step_days: int = FTP_STEP_DAYS,
+    now: Optional[_dt.datetime] = None,
+) -> dict:
+    """Rolling estimated-FTP time series plus recorded FTP-history points.
+
+    The estimate at each sampled date is best-20-min power * 0.95 over the
+    trailing ``window_days`` of activities, so it fluctuates as fitness changes.
+    Sampled every ``step_days`` from the first activity to the last (or ``now``).
+
+    Returns {"estimated": [{date, ftp}], "recorded": [{date, ftp, source}]}.
+    """
+    activities = db.full_activities(user_id)
+    dated: List[Tuple[_dt.datetime, list]] = []
+    for a in activities:
+        when = parse_naive(a.get("start_time"))
+        power = (a.get("streams") or {}).get("power") or []
+        if when is not None and power:
+            dated.append((when, power))
+
+    recorded = _filter_by_months(db.ftp_history_list(user_id), months, now)
+    if not dated:
+        return {"estimated": [], "recorded": recorded}
+
+    start = min(d for d, _ in dated)
+    last = max(d for d, _ in dated)
+    end = now if (now is not None and now > last) else last
+
+    window = _dt.timedelta(days=window_days)
+    step = _dt.timedelta(days=step_days)
+
+    def _estimate_at(dt: _dt.datetime) -> Optional[float]:
+        w_start = dt - window
+        streams = [p for (d, p) in dated if w_start < d <= dt]
+        if not streams:
+            return None
+        est = estimate_ftp(streams)
+        return est if est > 0 else None
+
+    est_points: List[dict] = []
+    cur = start
+    while cur <= end:
+        est = _estimate_at(cur)
+        if est is not None:
+            est_points.append({"date": cur.date().isoformat(), "ftp": round(est, 1)})
+        cur += step
+
+    # Always include a final sample exactly at the end date.
+    end_iso = end.date().isoformat()
+    if not est_points or est_points[-1]["date"] != end_iso:
+        est = _estimate_at(end)
+        if est is not None:
+            est_points.append({"date": end_iso, "ftp": round(est, 1)})
+
+    return {
+        "estimated": _filter_by_months(est_points, months, now),
+        "recorded": recorded,
+    }
 
 
 def curve_points(user_id: int, state: Optional[TrainingState] = None) -> dict:

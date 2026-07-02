@@ -4,14 +4,22 @@
 <h2>Dashboard</h2>
 
 <section class="cards">
-    <div class="card"><span class="label">FTP</span><span class="value">{{ state.ftp }} W</span></div>
-    <div class="card"><span class="label">CP</span><span class="value">{{ state.cp if state.cp is not none else '&mdash;'|safe }} W</span></div>
-    <div class="card"><span class="label">W'</span><span class="value">{{ state.wprime if state.wprime is not none else '&mdash;'|safe }} J</span></div>
-    <div class="card"><span class="label">CTL (Fitness)</span><span class="value">{{ state.ctl }}</span></div>
-    <div class="card"><span class="label">ATL (Fatigue)</span><span class="value">{{ state.atl }}</span></div>
-    <div class="card"><span class="label">TSB (Form)</span><span class="value">{{ state.tsb }}</span></div>
-    <div class="card"><span class="label">Readiness</span><span class="value">{{ state.readiness }}/100</span></div>
-    <div class="card"><span class="label">Decoupling</span><span class="value">{{ state.decoupling if state.decoupling is not none else '&mdash;'|safe }}%</span></div>
+    <div class="card" title="Functional Threshold Power — the highest power you can sustain for about an hour; the basis for your training zones.">
+        <span class="label">FTP</span><span class="value">{{ state.ftp }} W</span></div>
+    <div class="card" title="Critical Power — the power you could theoretically hold indefinitely; the asymptote of your power–duration curve.">
+        <span class="label">CP</span><span class="value">{{ state.cp if state.cp is not none else '&mdash;'|safe }} W</span></div>
+    <div class="card" title="W-prime — your finite anaerobic work capacity (in joules) available above Critical Power before exhaustion.">
+        <span class="label">W'</span><span class="value">{{ state.wprime if state.wprime is not none else '&mdash;'|safe }} J</span></div>
+    <div class="card" title="Chronic Training Load — a 42-day exponentially-weighted average of training stress; your long-term 'fitness'.">
+        <span class="label">CTL (Fitness)</span><span class="value">{{ state.ctl }}</span></div>
+    <div class="card" title="Acute Training Load — a 7-day exponentially-weighted average of training stress; your recent 'fatigue'.">
+        <span class="label">ATL (Fatigue)</span><span class="value">{{ state.atl }}</span></div>
+    <div class="card" title="Training Stress Balance — CTL minus ATL; your 'form'. Positive means fresh, strongly negative means fatigued.">
+        <span class="label">TSB (Form)</span><span class="value">{{ state.tsb }}</span></div>
+    <div class="card" title="Readiness — a 0–100 score blending form, fatigue and decoupling; higher means more ready to train hard.">
+        <span class="label">Readiness</span><span class="value">{{ state.readiness }}/100</span></div>
+    <div class="card" title="Aerobic decoupling — the % drift of heart-rate-to-power from the first to second half of a long steady ride; lower is more aerobically durable.">
+        <span class="label">Decoupling</span><span class="value">{{ state.decoupling if state.decoupling is not none else '&mdash;'|safe }}%</span></div>
 </section>
 
 {% if state.alerts %}
@@ -26,18 +34,28 @@
 {% endif %}
 
 <section class="chart-block">
-    <h3>Fitness / Fatigue / Form (CTL / ATL / TSB)</h3>
-    <canvas id="loadChart" height="120"></canvas>
+    <div class="chart-head">
+        <h3>Fitness / Fatigue / Form &amp; FTP</h3>
+        <div class="range-controls">
+            <button type="button" class="range-btn" data-months="1">1 month</button>
+            <button type="button" class="range-btn" data-months="12">1 year</button>
+            <button type="button" class="range-btn active" data-months="0">All</button>
+            <label class="custom-range">Custom
+                <input type="number" id="customMonths" min="1" max="120" step="1"
+                       placeholder="months">
+            </label>
+            <button type="button" id="resetZoom">Reset zoom</button>
+        </div>
+    </div>
+    <div id="mainLegend" class="chart-legend"></div>
+    <canvas id="mainChart" height="130"></canvas>
+    <p id="mainEmpty" class="hint" style="display:none">No training data yet — import or upload activities to see your trends.</p>
+    <p class="hint">Tip: drag horizontally across the chart to zoom into a date range. Click a legend item to isolate it; Ctrl/Cmd-click to toggle it.</p>
 </section>
 
 <section class="chart-block">
     <h3>Power&ndash;Duration Curve</h3>
     <canvas id="curveChart" height="120"></canvas>
-</section>
-
-<section class="chart-block">
-    <h3>FTP Over Time</h3>
-    <canvas id="ftpChart" height="120"></canvas>
 </section>
 {% endblock %}
 
