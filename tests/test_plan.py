@@ -67,6 +67,50 @@ def test_both_hit_types_used():
     assert "vo2max" in types and "threshold" in types
 
 
+def _hard_weekdays(workouts):
+    return {
+        dt.date.fromisoformat(w["date"]).weekday()
+        for w in workouts
+        if w["type"] in ("vo2max", "threshold")
+    }
+
+
+def test_hard_days_pin_hit_days():
+    p = plan.generate_plan("P", MONDAY, 3, [0, 2, 4, 5], 8.0, 2, hard_days=[2, 5])
+    assert p["hard_days"] == [2, 5]
+    for _wk, workouts in _by_week(p).items():
+        assert _hard_weekdays(workouts) == {2, 5}
+
+
+def test_hard_days_partial_marks_fill_to_cap():
+    # One marked day + cap of 2: the marked day is always hard, and the second
+    # HIT slot is auto-filled, keeping exactly `hit_days_per_week` hard days.
+    p = plan.generate_plan("P", MONDAY, 2, [0, 2, 4, 5], 8.0, 2, hard_days=[0])
+    for _wk, workouts in _by_week(p).items():
+        hard = _hard_weekdays(workouts)
+        assert 0 in hard
+        assert len(hard) == 2
+
+
+def test_hard_days_validation_errors():
+    with pytest.raises(ValueError):
+        # More days marked hard than the HIT cap.
+        plan.generate_plan("P", MONDAY, 2, [0, 2, 4], 6.0, 1, hard_days=[0, 2])
+    with pytest.raises(ValueError):
+        # Hard day not among the selected ride days.
+        plan.generate_plan("P", MONDAY, 2, [0, 2], 6.0, 1, hard_days=[3])
+
+
+def test_hard_days_none_keeps_auto_assignment():
+    auto = plan.generate_plan("P", MONDAY, 2, [0, 2, 4, 5], 8.0, 2)
+    explicit_none = plan.generate_plan(
+        "P", MONDAY, 2, [0, 2, 4, 5], 8.0, 2, hard_days=None
+    )
+    assert [w["type"] for w in auto["workouts"]] == [
+        w["type"] for w in explicit_none["workouts"]
+    ]
+
+
 def test_validation_errors():
     with pytest.raises(ValueError):
         plan.generate_plan("P", MONDAY, 0, [0], 6.0, 0)  # weeks < 1

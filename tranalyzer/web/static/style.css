@@ -112,7 +112,11 @@ details summary { cursor: pointer; color: var(--accent); margin: 0.5rem 0; }
 .plan-form input[type=text], .plan-form input[type=number], .plan-form input[type=date] { width: 100%; margin-top: 0.25rem; }
 .days-picker { grid-column: 1 / -1; border: 1px solid #2a333d; border-radius: 6px; padding: 0.5rem; }
 .days-picker legend { color: var(--muted); font-size: 0.8rem; }
-.day-check { display: inline-flex; align-items: center; gap: 0.3rem; margin: 0 0.75rem 0 0; }
+.day-check { display: inline-flex; align-items: center; gap: 0.3rem; margin: 0 0.9rem 0 0; }
+.day-check label { display: inline-flex; align-items: center; gap: 0.3rem; margin: 0; }
+.day-check .hard-toggle { font-size: 0.72rem; color: var(--muted); text-transform: uppercase; }
+.day-check .hard-toggle:has(input:checked) { color: var(--alert); }
+.day-check .hard-toggle input:disabled { opacity: 0.4; }
 .plan-form button { grid-column: 1 / -1; justify-self: start; }
 .weekly-table .recovery-week { color: var(--ok); }
 .link-btn { background: none; border: none; color: var(--accent); cursor: pointer; padding: 0; font: inherit; }
@@ -125,10 +129,32 @@ table.calendar th { text-align: center; }
 .cal-cell.other-month { opacity: 0.4; }
 .cal-day { font-size: 0.75rem; color: var(--muted); }
 .cal-workout { font-size: 0.72rem; background: rgba(242,169,0,0.15); border-left: 3px solid var(--accent);
-    border-radius: 3px; padding: 2px 4px; margin-top: 2px; overflow: hidden; }
+    border-radius: 3px; padding: 2px 4px; margin-top: 2px; overflow: hidden; cursor: pointer; }
+.cal-workout:hover, .cal-workout:focus { outline: 1px solid var(--accent); }
 .cal-workout .cal-type { display: block; color: var(--muted); font-size: 0.65rem; }
 .cal-vo2max, .cal-threshold { background: rgba(224,82,82,0.18); border-left-color: var(--alert); }
 .cal-endurance, .cal-recovery { background: rgba(76,175,125,0.15); border-left-color: var(--ok); }
+
+/* Calendar workout-detail modal */
+.modal-overlay {
+    position: fixed; inset: 0; background: rgba(0, 0, 0, 0.6);
+    display: flex; align-items: flex-start; justify-content: center;
+    padding: 3rem 1rem; z-index: 100; overflow-y: auto;
+}
+.modal-overlay[hidden] { display: none; }
+.modal-box {
+    background: var(--panel); border: 1px solid #2a333d; border-radius: 8px;
+    padding: 1rem 1.25rem; max-width: 640px; width: 100%; position: relative;
+}
+.modal-box h3 { margin-top: 0.25rem; padding-right: 2rem; }
+.modal-close {
+    position: absolute; top: 0.5rem; right: 0.5rem; background: none;
+    border: none; color: var(--muted); font-size: 1.3rem; cursor: pointer;
+    padding: 0.1rem 0.4rem; line-height: 1;
+}
+.modal-close:hover { color: var(--text); filter: none; }
+.profile-wrap { background: #10161d; border: 1px solid #2a333d; border-radius: 6px;
+    padding: 0.5rem; margin: 0.75rem 0; }
 
 /* Ride */
 .ride-setup { margin: 1rem 0; }

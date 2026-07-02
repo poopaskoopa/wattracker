@@ -113,6 +113,145 @@ def test_poll_drives_from_simulated_sources():
     assert c.status == "finished"         # zeros after start -> auto-stop
 
 
+def test_erg_started_once_and_stopped_on_finish():
+    trainer = SimulatedTrainer()
+    c = RideController(_two_block_session(), 200, trainer=trainer, autosave=False)
+    c.tick(power=0)  # idle: no ERG commands yet
+    assert trainer.commands == []
+    c.tick(power=120)  # ride start -> Request Control + Start
+    assert trainer.commands == ["request_control", "start"]
+    c.tick(power=0)    # pause
+    c.tick(power=120)  # resume must NOT re-send request control
+    assert trainer.commands == ["request_control", "start"]
+    for _ in range(20):
+        c.tick(power=120)
+    assert c.status == "finished"
+    assert trainer.commands == ["request_control", "start", "stop"]
+    assert trainer.targets[-1] == 0  # ERG target zeroed before stop
+
+
+def test_erg_target_follows_ramp_each_second():
+    # 10s warmup ramp 50% -> 100% at FTP 200: target steps up every tick.
+    session = Session(
+        name="Ramp", description="", workout_type="custom",
+        segments=[Segment(kind="warmup", duration=10, power_low=0.5, power_high=1.0)],
+    )
+    trainer = SimulatedTrainer()
+    c = RideController(session, 200, trainer=trainer, autosave=False)
+    for _ in range(10):
+        c.tick(power=150, dt=1)
+    # Expected: fraction 0.5 + 0.05*t at t=1..10 -> 110,120,...,200 W, then the
+    # finish zeroes the ERG target.
+    assert c.status == "finished"
+    assert trainer.targets == [110, 120, 130, 140, 150, 160, 170, 180, 190, 200, 0]
+
+
+def test_ride_survives_failing_trainer():
+    class FailingTrainer(SimulatedTrainer):
+        def set_target_power(self, watts):
+            raise RuntimeError("BLE write failed")
+
+        def start_erg(self):
+            raise RuntimeError("BLE write failed")
+
+    c = RideController(
+        _two_block_session(), 200, trainer=FailingTrainer(), autosave=False
+    )
+    for _ in range(20):
+        c.tick(power=150)
+    assert c.status == "finished"  # trainer errors never crash the ride
+
+
+def test_no_trainer_power_display_still_works():
+    c = RideController(_two_block_session(), 200, trainer=None, autosave=False)
+    st = c.tick(power=180)
+    assert st["status"] == "running"
+    assert st["power"] == 180
+    assert st["target_watts"] == 100  # target still computed for display
+
+
+# ------------------------------------------- BleakTrainer over a fake client
+class FakeBleakClient:
+    """Records GATT writes/notify subscriptions; optionally fails writes."""
+
+    def __init__(self, fail_writes=False):
+        self.writes = []
+        self.notify_subs = []
+        self.fail_writes = fail_writes
+
+    async def write_gatt_char(self, char, data, response=False):
+        if self.fail_writes:
+            raise RuntimeError("device gone")
+        self.writes.append((char, bytes(data)))
+
+    async def start_notify(self, char, callback):
+        self.notify_subs.append((char, callback))
+
+
+def test_bleak_trainer_sends_erg_command_bytes():
+    import asyncio
+
+    from tranalyzer.ble.devices import BleakTrainer
+    from tranalyzer.ble.protocol import FITNESS_MACHINE_CONTROL_POINT
+
+    client = FakeBleakClient()
+    trainer = BleakTrainer(client)
+    asyncio.run(trainer.prepare())
+    asyncio.run(trainer.async_set_target_power(250))
+    asyncio.run(trainer.async_stop())
+
+    chars = {c for c, _ in client.writes}
+    assert chars == {FITNESS_MACHINE_CONTROL_POINT}
+    payloads = [d for _, d in client.writes]
+    assert payloads == [
+        bytes([0x00]),              # Request Control
+        bytes([0x07]),              # Start/Resume
+        bytes([0x05, 0xFA, 0x00]),  # Set Target Power 250W sint16 LE
+        bytes([0x08, 0x01]),        # Stop
+    ]
+    # Subscribed to control-point indications for 0x80 responses.
+    assert client.notify_subs and client.notify_subs[0][0] == FITNESS_MACHINE_CONTROL_POINT
+
+
+def test_bleak_trainer_sync_entrypoints_drive_writes():
+    from tranalyzer.ble.devices import BleakTrainer
+
+    client = FakeBleakClient()
+    trainer = BleakTrainer(client)
+    trainer.start_erg()             # no running loop -> executed to completion
+    trainer.set_target_power(180)
+    trainer.stop_erg()
+    payloads = [d for _, d in client.writes]
+    assert bytes([0x05, 0xB4, 0x00]) in payloads  # 180W target
+    assert payloads[0] == bytes([0x00]) and payloads[-1] == bytes([0x08, 0x01])
+
+
+def test_bleak_trainer_handles_indication_responses():
+    from tranalyzer.ble.devices import BleakTrainer
+
+    trainer = BleakTrainer(FakeBleakClient())
+    # Success response is recorded.
+    trainer._on_control_point(None, bytearray([0x80, 0x05, 0x01]))
+    assert trainer.last_response["success"] is True
+    # Failure response is logged/recorded, never raised.
+    trainer._on_control_point(None, bytearray([0x80, 0x05, 0x04]))
+    assert trainer.last_response["success"] is False
+    # Garbage indication is ignored.
+    trainer._on_control_point(None, bytearray([0x42]))
+    assert trainer.last_response["result"] == 0x04
+
+
+def test_bleak_trainer_write_failure_degrades_gracefully():
+    import asyncio
+
+    from tranalyzer.ble.devices import BleakTrainer
+
+    trainer = BleakTrainer(FakeBleakClient(fail_writes=True))
+    asyncio.run(trainer.prepare())              # must not raise
+    asyncio.run(trainer.async_set_target_power(200))
+    trainer.set_target_power(150)               # sync path must not raise either
+
+
 def test_finished_ride_saves_activity(user_id):
     trainer = SimulatedTrainer()
     c = RideController(

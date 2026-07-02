@@ -90,3 +90,43 @@ def test_encode_set_target_power_rounds_and_clamps():
 def test_encode_request_control_and_start():
     assert p.encode_request_control() == bytes([0x00])
     assert p.encode_start() == bytes([0x07])
+
+
+def test_encode_stop():
+    assert p.encode_stop() == bytes([0x08, 0x01])
+
+
+def test_encode_set_target_power_negative_clamped():
+    assert p.encode_set_target_power(-40000) == bytes([0x05]) + (-32768).to_bytes(
+        2, "little", signed=True
+    )
+
+
+# ---------------------------------------- FTMS control point responses (0x80)
+def test_parse_control_point_response_success():
+    # 0x80, request op 0x05 (set target power), result 0x01 (success)
+    resp = p.parse_control_point_response(bytes([0x80, 0x05, 0x01]))
+    assert resp["request_op"] == p.FTMS_SET_TARGET_POWER
+    assert resp["result"] == p.FTMS_RESULT_SUCCESS
+    assert resp["success"] is True
+    assert resp["message"] == "success"
+
+
+def test_parse_control_point_response_failure():
+    resp = p.parse_control_point_response(bytes([0x80, 0x00, 0x05]))
+    assert resp["request_op"] == p.FTMS_REQUEST_CONTROL
+    assert resp["success"] is False
+    assert resp["message"] == "control not permitted"
+
+
+def test_parse_control_point_response_unknown_result():
+    resp = p.parse_control_point_response(bytes([0x80, 0x07, 0x7F]))
+    assert resp["success"] is False
+    assert "unknown" in resp["message"]
+
+
+def test_parse_control_point_response_invalid():
+    with pytest.raises(ValueError):
+        p.parse_control_point_response(bytes([0x80, 0x05]))  # too short
+    with pytest.raises(ValueError):
+        p.parse_control_point_response(bytes([0x00, 0x05, 0x01]))  # wrong code

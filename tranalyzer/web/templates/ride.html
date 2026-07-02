@@ -81,9 +81,20 @@
         setBtns(true);
         ws.onmessage = function (ev) {
             var st = JSON.parse(ev.data);
-            if (st.status === "unavailable") {
-                document.getElementById("rStatus").textContent = "unavailable";
+            if (st.status === "unavailable" || st.status === "error") {
+                document.getElementById("rStatus").textContent =
+                    st.error || st.message || "unavailable";
                 setBtns(false);
+                return;
+            }
+            if (st.status === "connected") {
+                var names = st.devices || {};
+                var parts = [];
+                if (names.trainer) parts.push("trainer: " + names.trainer + (st.erg ? " (ERG)" : ""));
+                if (names.power) parts.push("power: " + names.power);
+                if (names.hr) parts.push("HR: " + names.hr);
+                document.getElementById("deviceList").textContent =
+                    parts.length ? "Connected — " + parts.join(", ") : "Connected.";
                 return;
             }
             render(st);

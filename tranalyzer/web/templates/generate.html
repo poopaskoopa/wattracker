@@ -99,14 +99,22 @@
             <input type="date" name="start_date" value="{{ plan_defaults.start_date }}">
         </label>
         <fieldset class="days-picker">
-            <legend>Days you ride</legend>
+            <legend>Days you ride (tick "hard" to pin a high-intensity day)</legend>
             {% for label in day_labels %}
-            <label class="day-check">
-                <input type="checkbox" name="days" value="{{ loop.index0 }}"
-                    {{ 'checked' if loop.index0 in plan_defaults.days else '' }}>
-                {{ label }}
-            </label>
+            <span class="day-check">
+                <label>
+                    <input type="checkbox" name="days" value="{{ loop.index0 }}"
+                        {{ 'checked' if loop.index0 in plan_defaults.days else '' }}>
+                    {{ label }}
+                </label>
+                <label class="hard-toggle" title="Make this a hard (HIT) day">
+                    <input type="checkbox" name="hard_days" value="{{ loop.index0 }}"
+                        {{ 'checked' if loop.index0 in plan_defaults.hard_days else '' }}>
+                    hard
+                </label>
+            </span>
             {% endfor %}
+            <p class="hint" id="hardHint"></p>
         </fieldset>
         <button type="submit">Generate plan</button>
     </form>
@@ -189,6 +197,51 @@
         r.addEventListener('change', applyMode);
     });
     applyMode();
+
+    // ------- per-day hard/not-hard picker: enforce the HIT-days cap -------
+    var hitInput = document.querySelector('.plan-form input[name="hit_days_per_week"]');
+    var dayBoxes = Array.prototype.slice.call(
+        document.querySelectorAll('.plan-form input[name="days"]'));
+    var hardBoxes = Array.prototype.slice.call(
+        document.querySelectorAll('.plan-form input[name="hard_days"]'));
+    function hardFor(value) {
+        return hardBoxes.filter(function (h) { return h.value === value; })[0];
+    }
+    function syncHard() {
+        var cap = parseInt(hitInput ? hitInput.value : '0', 10);
+        if (isNaN(cap) || cap < 0) cap = 0;
+        // A hard toggle needs its day selected.
+        dayBoxes.forEach(function (d) {
+            var h = hardFor(d.value);
+            if (!h) return;
+            if (!d.checked) h.checked = false;
+            h.disabled = !d.checked;
+        });
+        // Uncheck extras (last first) if the cap shrank.
+        var checked = hardBoxes.filter(function (h) { return h.checked; });
+        for (var i = checked.length - 1; i >= cap && i >= 0; i--) {
+            checked[i].checked = false;
+        }
+        // At the cap, block checking more.
+        var n = hardBoxes.filter(function (h) { return h.checked; }).length;
+        hardBoxes.forEach(function (h) {
+            if (!h.checked && !h.disabled) h.disabled = n >= cap;
+        });
+        var hint = document.getElementById('hardHint');
+        if (hint) {
+            hint.textContent = cap > 0
+                ? n + '/' + cap + ' hard day' + (cap === 1 ? '' : 's') +
+                  ' pinned; unpinned hard slots are auto-placed.'
+                : 'Set high-intensity days per week above to pin hard days.';
+        }
+    }
+    dayBoxes.forEach(function (d) { d.addEventListener('change', syncHard); });
+    hardBoxes.forEach(function (h) { h.addEventListener('change', syncHard); });
+    if (hitInput) {
+        hitInput.addEventListener('change', syncHard);
+        hitInput.addEventListener('input', syncHard);
+    }
+    syncHard();
 })();
 </script>
 {% endblock %}

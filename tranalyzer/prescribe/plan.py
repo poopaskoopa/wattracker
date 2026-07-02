@@ -42,6 +42,33 @@ def _hit_positions(n: int, hit: int) -> Set[int]:
     return {min(n - 1, int(round((i + 0.5) * n / hit))) for i in range(hit)}
 
 
+def _resolve_hit_positions(n: int, hit: int, marked: Set[int]) -> Set[int]:
+    """HIT day indices honoring explicit user marks.
+
+    Marked positions are always HIT. If fewer are marked than `hit`, the
+    remaining slots are filled from the unmarked days using the existing
+    even-spread auto-assignment (then left-to-right as a last resort), so a
+    week always gets exactly `hit` hard days.
+    """
+    positions = set(i for i in marked if 0 <= i < n)
+    remaining = hit - len(positions)
+    if remaining <= 0:
+        return positions
+    for cand in sorted(_hit_positions(n, hit)):
+        if remaining <= 0:
+            break
+        if cand not in positions:
+            positions.add(cand)
+            remaining -= 1
+    for i in range(n):
+        if remaining <= 0:
+            break
+        if i not in positions:
+            positions.add(i)
+            remaining -= 1
+    return positions
+
+
 def _clamp(v: float, lo: float, hi: float) -> float:
     return max(lo, min(hi, v))
 
@@ -60,6 +87,7 @@ def validate_plan_inputs(
     days_of_week: Sequence[int],
     hours_per_week: float,
     hit_days_per_week: int,
+    hard_days: Optional[Sequence[int]] = None,
 ) -> Optional[str]:
     """Return an error message if inputs are invalid, else None."""
     if weeks is None or int(weeks) < 1:
@@ -72,6 +100,12 @@ def validate_plan_inputs(
         return "High-intensity days cannot be negative."
     if int(hit_days_per_week) > len(days_of_week):
         return "High-intensity days cannot exceed the number of selected ride days."
+    if hard_days:
+        marked = set(int(d) for d in hard_days)
+        if not marked.issubset(set(int(d) for d in days_of_week)):
+            return "Hard days must be among the selected ride days."
+        if len(marked) > int(hit_days_per_week):
+            return "Days marked hard cannot exceed high-intensity days per week."
     return None
 
 
@@ -82,14 +116,20 @@ def generate_plan(
     days_of_week: Sequence[int],
     hours_per_week: float,
     hit_days_per_week: int,
+    hard_days: Optional[Sequence[int]] = None,
 ) -> Dict:
     """Generate a dated, polarized multi-week plan.
 
-    days_of_week are weekday indices (Mon=0 .. Sun=6). Returns a dict with the
-    plan metadata, a list of dated workouts (each carrying its Session), and a
-    per-week summary. Raises ValueError on invalid input.
+    days_of_week are weekday indices (Mon=0 .. Sun=6). ``hard_days`` optionally
+    pins specific weekdays as the HIT days (must be a subset of days_of_week and
+    at most hit_days_per_week long); unpinned HIT slots keep the even-spread
+    auto-assignment. Returns a dict with the plan metadata, a list of dated
+    workouts (each carrying its Session), and a per-week summary. Raises
+    ValueError on invalid input.
     """
-    err = validate_plan_inputs(weeks, days_of_week, hours_per_week, hit_days_per_week)
+    err = validate_plan_inputs(
+        weeks, days_of_week, hours_per_week, hit_days_per_week, hard_days
+    )
     if err:
         raise ValueError(err)
 
@@ -97,6 +137,8 @@ def generate_plan(
     hit_per_week = int(hit_days_per_week)
     days = sorted(set(int(d) for d in days_of_week))
     n = len(days)
+    hard_set = set(int(d) for d in (hard_days or []))
+    marked_pos = {i for i, d in enumerate(days) if d in hard_set}
 
     # Anchor to the Monday of the start week so weeks are calendar Mon-Sun.
     monday0 = start_date - _dt.timedelta(days=start_date.weekday())
@@ -109,7 +151,10 @@ def generate_plan(
     for w in range(weeks):
         weekly_minutes = float(hours_per_week) * 60.0 * week_multiplier(w + 1)
         hit = min(hit_per_week, n)
-        hit_pos = _hit_positions(n, hit)
+        hit_pos = (
+            _resolve_hit_positions(n, hit, marked_pos)
+            if marked_pos else _hit_positions(n, hit)
+        )
         easy_days = n - hit
 
         # Steer ~20% of weekly volume to the HIT sessions, split across HIT
@@ -181,6 +226,7 @@ def generate_plan(
         "days_of_week": days,
         "hours_per_week": float(hours_per_week),
         "hit_days_per_week": hit_per_week,
+        "hard_days": sorted(hard_set),
         "workouts": workouts,
         "weekly": weekly,
         "polarized_hard_fraction": round(total_hard_s / total_s, 3) if total_s else 0.0,

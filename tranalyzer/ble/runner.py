@@ -10,9 +10,12 @@ On finish it records the ride as an activity for the user.
 from __future__ import annotations
 
 import datetime as _dt
+import logging
 from typing import List, Optional, Tuple
 
 from ..prescribe.planner import Session
+
+_log = logging.getLogger(__name__)
 
 IDLE = "idle"
 RUNNING = "running"
@@ -51,6 +54,10 @@ def _flatten(session: Session) -> Tuple[List[tuple], int]:
             blocks.append((t, t + seg.duration, "const", float(seg.power or 0.0)))
             t += seg.duration
     return blocks, t
+
+
+# Public alias: the web layer reuses the flattened timeline for power profiles.
+flatten_session = _flatten
 
 
 class RideController:
@@ -138,18 +145,21 @@ class RideController:
                     self._ever_started = True
                     if self.started_at is None:
                         self.started_at = _dt.datetime.now()
+                    # Put the trainer in ERG mode once, at ride start
+                    # (FTMS Request Control + Start/Resume).
+                    self._trainer_call("start_erg")
             self._zero_run = 0.0
             self.elapsed += dt
+
+            # Set the ERG target for the current position. Sent every tick, so
+            # it both follows segment/ramp changes and acts as a keepalive.
+            self.current_target = self.target_watts(min(self.elapsed, self.total_s))
+            self._trainer_call("set_target_power", self.current_target)
 
             # record a sample for the ride file
             self._samples["power"].append(p)
             self._samples["cadence"].append(cadence)
             self._samples["heartrate"].append(hr)
-
-            # set ERG target for the current position
-            self.current_target = self.target_watts(min(self.elapsed, self.total_s))
-            if self.trainer is not None:
-                self.trainer.set_target_power(self.current_target)
 
             if self.elapsed >= self.total_s:
                 self._finish()
@@ -180,14 +190,24 @@ class RideController:
             self._finish()
         return self.state()
 
+    def _trainer_call(self, method: str, *args) -> None:
+        """Invoke a trainer command, degrading gracefully (no trainer / BLE error)."""
+        if self.trainer is None:
+            return
+        fn = getattr(self.trainer, method, None)
+        if fn is None:
+            return
+        try:
+            fn(*args)
+        except Exception:
+            _log.warning("trainer %s failed; continuing without ERG", method,
+                         exc_info=True)
+
     # --------------------------------------------------------- finishing
     def _finish(self) -> None:
         self.status = FINISHED
-        if self.trainer is not None:
-            try:
-                self.trainer.set_target_power(0)
-            except Exception:
-                pass
+        self._trainer_call("set_target_power", 0)
+        self._trainer_call("stop_erg")
         if self.autosave and self.user_id is not None:
             try:
                 self._save()

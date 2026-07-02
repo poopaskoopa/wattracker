@@ -106,6 +106,22 @@ FTMS_REQUEST_CONTROL = 0x00
 FTMS_SET_TARGET_POWER = 0x05
 FTMS_START_RESUME = 0x07
 FTMS_STOP_PAUSE = 0x08
+FTMS_RESPONSE_CODE = 0x80
+
+# Control-point response result codes (FTMS spec 4.16.2.22).
+FTMS_RESULT_SUCCESS = 0x01
+FTMS_RESULT_NOT_SUPPORTED = 0x02
+FTMS_RESULT_INVALID_PARAMETER = 0x03
+FTMS_RESULT_OPERATION_FAILED = 0x04
+FTMS_RESULT_CONTROL_NOT_PERMITTED = 0x05
+
+_FTMS_RESULT_NAMES = {
+    FTMS_RESULT_SUCCESS: "success",
+    FTMS_RESULT_NOT_SUPPORTED: "op code not supported",
+    FTMS_RESULT_INVALID_PARAMETER: "invalid parameter",
+    FTMS_RESULT_OPERATION_FAILED: "operation failed",
+    FTMS_RESULT_CONTROL_NOT_PERMITTED: "control not permitted",
+}
 
 
 def encode_request_control() -> bytes:
@@ -128,3 +144,23 @@ def encode_set_target_power(watts: int) -> bytes:
 def encode_stop() -> bytes:
     """Op code 0x08 + 0x01 (stop) parameter."""
     return bytes([FTMS_STOP_PAUSE, 0x01])
+
+
+def parse_control_point_response(data: bytes) -> dict:
+    """Parse an FTMS control-point indication (response code 0x80).
+
+    Layout: 0x80, request op code, result code. Returns ``request_op``,
+    ``result``, ``success`` and a human-readable ``message``.
+    """
+    if len(data) < 3:
+        raise ValueError("FTMS control point response too short")
+    if data[0] != FTMS_RESPONSE_CODE:
+        raise ValueError(f"not an FTMS response (first byte 0x{data[0]:02x})")
+    request_op = data[1]
+    result = data[2]
+    return {
+        "request_op": request_op,
+        "result": result,
+        "success": result == FTMS_RESULT_SUCCESS,
+        "message": _FTMS_RESULT_NAMES.get(result, f"unknown result 0x{result:02x}"),
+    }

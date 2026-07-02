@@ -20,7 +20,7 @@ from starlette.middleware.sessions import SessionMiddleware
 from . import auth, config, db, paths
 from .analysis import pipeline
 from .ble import devices as bledevices
-from .ble.runner import RideController
+from .ble.runner import RideController, flatten_session
 from .ingest import importer
 from .prescribe import plan as planmod
 from .prescribe import zwo
@@ -28,6 +28,9 @@ from .prescribe import llm
 from .prescribe.planner import build_workout, plan_workout
 
 DAY_LABELS = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
+
+# Real-hardware ride loop cadence (seconds); module-level so tests can shrink it.
+RIDE_POLL_INTERVAL_S = 1.0
 
 
 def _upcoming_monday(today: Optional[_dt.date] = None) -> _dt.date:
@@ -212,6 +215,7 @@ def create_app() -> FastAPI:
             "hours_per_week": 6.0,
             "hit_days_per_week": 2,
             "days": [0, 2, 4, 5],
+            "hard_days": [],
             "start_date": _upcoming_monday().isoformat(),
             "name": "Training Plan",
         }
@@ -284,12 +288,17 @@ def create_app() -> FastAPI:
         hit_days_per_week: int = Form(...),
         start_date: str = Form(""),
         days: List[str] = Form([]),
+        hard_days: List[str] = Form([]),
     ):
         uid = _uid(request)
         try:
             day_ints = sorted({int(d) for d in days})
         except (ValueError, TypeError):
             day_ints = []
+        try:
+            hard_ints = sorted({int(d) for d in hard_days})
+        except (ValueError, TypeError):
+            hard_ints = []
         try:
             start = _dt.date.fromisoformat(start_date) if start_date else _upcoming_monday()
         except ValueError:
@@ -301,11 +310,13 @@ def create_app() -> FastAPI:
         defaults = {
             "weeks": weeks, "hours_per_week": hours_per_week,
             "hit_days_per_week": hit_days_per_week, "days": day_ints,
+            "hard_days": hard_ints,
             "start_date": start.isoformat(), "name": name,
         }
         try:
             generated = planmod.generate_plan(
-                name, start, weeks, day_ints, hours_per_week, hit_days_per_week
+                name, start, weeks, day_ints, hours_per_week, hit_days_per_week,
+                hard_days=hard_ints or None,
             )
             plan_id = db.create_plan(
                 uid, name or "Training Plan", generated["start_date"], generated["weeks"]
@@ -655,9 +666,67 @@ def create_app() -> FastAPI:
             await websocket.close()
             return
 
+        if not sim:
+            # Real hardware: connect sensors, put the trainer in ERG (Request
+            # Control + Start inside prepare), then poll in real time. A ride
+            # without an FTMS trainer still works read-only (power/HR display).
+            conn = None
+            try:
+                try:
+                    conn = await bledevices.connect_sensors()
+                except Exception as e:  # no adapter, scan failure, ...
+                    await websocket.send_json({"status": "error", "error": str(e)})
+                    return
+                if not conn["power_source"] and not conn["trainer"]:
+                    await websocket.send_json(
+                        {
+                            "status": "error",
+                            "error": "No power meter or FTMS trainer found. "
+                            "Scan first, or use Simulate.",
+                        }
+                    )
+                    return
+                controller = RideController(
+                    session,
+                    ftp,
+                    trainer=conn["trainer"],
+                    power_source=conn["power_source"],
+                    hr_source=conn["hr_source"],
+                    user_id=uid,
+                    autosave=True,
+                )
+                await websocket.send_json(
+                    {"status": "connected", "devices": conn["names"],
+                     "erg": conn["trainer"] is not None}
+                )
+                while controller.status != "finished":
+                    controller.poll(dt=1)
+                    await websocket.send_json(controller.state())
+                    await asyncio.sleep(RIDE_POLL_INTERVAL_S)
+                await websocket.send_json(controller.state())
+            except Exception:
+                # Client closed the socket or BLE failed mid-ride: stop cleanly
+                # (stop() zeroes the ERG target and saves the ride).
+                try:
+                    if conn is not None and "controller" in locals():
+                        controller.stop()
+                except Exception:
+                    pass
+            finally:
+                for client in (conn or {}).get("clients", []):
+                    try:
+                        await client.disconnect()
+                    except Exception:
+                        pass
+                try:
+                    await websocket.close()
+                except Exception:
+                    pass
+            return
+
         # Simulated ride: pedal at a steady wattage, compressing time so the
-        # whole session streams quickly. (Real hardware would tick at dt=1 in
-        # real time from a connected power source.)
+        # whole session streams quickly. (Real hardware ticks at dt=1 in real
+        # time from a connected power source.)
         trainer = bledevices.SimulatedTrainer()
         controller = RideController(
             session, ftp, trainer=trainer, user_id=uid, autosave=True
@@ -684,6 +753,65 @@ def create_app() -> FastAPI:
                 pass
 
     # --------------------------------------------------------- JSON API
+    def _watts(frac: Optional[float], ftp: float) -> Optional[int]:
+        return int(round(frac * ftp)) if frac is not None else None
+
+    @app.get("/api/plan/workout/{workout_id}")
+    def api_plan_workout_detail(request: Request, workout_id: int):
+        """Structured segments + power profile for one plan workout (user-scoped).
+
+        Segments are reconstructed deterministically via ``build_workout`` (the
+        stored type/duration fully determine the session, matching the stored
+        .zwo), so no extra persistence is needed.
+        """
+        uid = _uid(request)
+        w = db.get_plan_workout(uid, workout_id)
+        if not w:
+            return JSONResponse({"error": "workout not found"}, status_code=404)
+        ftp = importer.current_ftp(uid)
+        session = build_workout(w["type"], max(1, w["duration_s"] / 60))
+
+        segments = []
+        for seg in session.segments:
+            d = seg.to_dict()
+            d["watts"] = _watts(seg.power, ftp)
+            d["watts_low"] = _watts(seg.power_low, ftp)
+            d["watts_high"] = _watts(seg.power_high, ftp)
+            d["watts_on"] = _watts(seg.on_power, ftp)
+            d["watts_off"] = _watts(seg.off_power, ftp)
+            segments.append(d)
+
+        # Flattened timeline (intervals expanded, ramps kept) for the chart.
+        blocks, total_s = flatten_session(session)
+        profile = []
+        for (s, e, kind, val) in blocks:
+            lo, hi = (val, val) if kind == "const" else val
+            profile.append(
+                {
+                    "start": s,
+                    "end": e,
+                    "watts_start": int(round(lo * ftp)),
+                    "watts_end": int(round(hi * ftp)),
+                }
+            )
+
+        return JSONResponse(
+            {
+                "id": w["id"],
+                "plan_id": w["plan_id"],
+                "date": w["date"],
+                "name": w["name"],
+                "type": w["type"],
+                "duration_s": w["duration_s"],
+                "tss": w["tss"],
+                "ftp": round(ftp, 1),
+                "description": session.description,
+                "total_duration": total_s,
+                "segments": segments,
+                "profile": profile,
+            }
+        )
+
     @app.get("/api/state")
     def api_state(request: Request):
         return JSONResponse(pipeline.build_state(_uid(request)).to_dict())

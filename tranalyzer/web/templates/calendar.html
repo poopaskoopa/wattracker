@@ -31,7 +31,9 @@
             <td class="cal-cell {{ 'other-month' if not cell.in_month else '' }}">
                 <div class="cal-day">{{ cell.day }}</div>
                 {% for w in cell.workouts %}
-                    <div class="cal-workout cal-{{ w.type }}" title="{{ w.name }} — {{ (w.duration_s // 60) }} min, {{ w.tss }} TSS">
+                    <div class="cal-workout cal-{{ w.type }}" data-workout-id="{{ w.id }}"
+                         role="button" tabindex="0"
+                         title="{{ w.name }} — {{ (w.duration_s // 60) }} min, {{ w.tss }} TSS. Click for power details.">
                         {{ w.name }}<span class="cal-type">{{ w.type }}</span>
                     </div>
                 {% endfor %}
@@ -41,4 +43,147 @@
     {% endfor %}
     </tbody>
 </table>
+
+<!-- Workout power-detail modal (filled by JS from /api/plan/workout/{id}) -->
+<div id="workoutModal" class="modal-overlay" hidden>
+    <div class="modal-box" role="dialog" aria-modal="true" aria-labelledby="wmTitle">
+        <button type="button" class="modal-close" id="wmClose" aria-label="Close">&times;</button>
+        <h3 id="wmTitle"></h3>
+        <p class="hint" id="wmMeta"></p>
+        <p id="wmDesc"></p>
+        <div class="profile-wrap"><canvas id="wmChart" height="140"></canvas></div>
+        <table>
+            <thead><tr><th>#</th><th>Block</th><th>Duration</th><th>Target (%FTP)</th><th>Target (W)</th></tr></thead>
+            <tbody id="wmSegments"></tbody>
+        </table>
+    </div>
+</div>
+
+<script>
+(function () {
+    var modal = document.getElementById("workoutModal");
+    var chart = null;
+
+    function fmtDur(sec) {
+        sec = Math.round(sec || 0);
+        var m = Math.floor(sec / 60), s = sec % 60;
+        return s ? m + "m " + s + "s" : m + " min";
+    }
+    function pct(frac) { return Math.round(frac * 100) + "%"; }
+
+    function segmentCells(s) {
+        if (s.kind === "intervals") {
+            return [
+                s.repeat + " x (" + fmtDur(s.on_duration) + " on / " + fmtDur(s.off_duration) + " off)",
+                pct(s.on_power) + " / " + pct(s.off_power),
+                s.watts_on + " W / " + s.watts_off + " W",
+            ];
+        }
+        if (s.kind === "warmup" || s.kind === "cooldown" || s.kind === "ramp") {
+            return [
+                fmtDur(s.duration),
+                pct(s.power_low) + " → " + pct(s.power_high),
+                s.watts_low + " → " + s.watts_high + " W",
+            ];
+        }
+        return [fmtDur(s.duration), pct(s.power || 0), (s.watts || 0) + " W"];
+    }
+
+    function renderChart(detail) {
+        var canvas = document.getElementById("wmChart");
+        if (chart) { chart.destroy(); chart = null; }
+        if (typeof Chart === "undefined") {  // chart lib unavailable: table still shows
+            canvas.parentElement.style.display = "none";
+            return;
+        }
+        canvas.parentElement.style.display = "block";
+        // Piecewise-linear power profile: two points per flattened block
+        // (const blocks are flat, ramps slope). X in minutes.
+        var pts = [];
+        (detail.profile || []).forEach(function (b) {
+            pts.push({ x: b.start / 60, y: b.watts_start });
+            pts.push({ x: b.end / 60, y: b.watts_end });
+        });
+        chart = new Chart(canvas, {
+            type: "line",
+            data: { datasets: [{
+                label: "Target power",
+                data: pts,
+                borderColor: "#f2a900",
+                backgroundColor: "rgba(242,169,0,0.25)",
+                fill: "origin",
+                pointRadius: 0,
+                borderWidth: 2,
+                tension: 0,
+            }] },
+            options: {
+                responsive: true,
+                animation: false,
+                interaction: { mode: "nearest", axis: "x", intersect: false },
+                plugins: {
+                    legend: { display: false },
+                    tooltip: { callbacks: {
+                        title: function (items) { return items.length ? Math.round(items[0].parsed.x) + " min" : ""; },
+                        label: function (item) { return item.parsed.y + " W"; },
+                    } },
+                },
+                scales: {
+                    x: { type: "linear", min: 0, title: { display: true, text: "Time (min)" } },
+                    y: { min: 0, title: { display: true, text: "Target (W)" } },
+                },
+            },
+        });
+    }
+
+    function openModal(detail) {
+        document.getElementById("wmTitle").textContent = detail.name;
+        document.getElementById("wmMeta").textContent =
+            detail.date + " · " + detail.type + " · " + fmtDur(detail.duration_s) +
+            " · est. TSS " + detail.tss + " · targets at FTP " + detail.ftp + " W";
+        document.getElementById("wmDesc").textContent = detail.description || "";
+        var tbody = document.getElementById("wmSegments");
+        tbody.innerHTML = "";
+        (detail.segments || []).forEach(function (s, i) {
+            var cells = segmentCells(s);
+            var tr = document.createElement("tr");
+            [String(i + 1), s.kind, cells[0], cells[1], cells[2]].forEach(function (text) {
+                var td = document.createElement("td");
+                td.textContent = text;
+                tr.appendChild(td);
+            });
+            tbody.appendChild(tr);
+        });
+        modal.hidden = false;
+        renderChart(detail);
+    }
+
+    function closeModal() {
+        modal.hidden = true;
+        if (chart) { chart.destroy(); chart = null; }
+    }
+
+    async function showWorkout(id) {
+        try {
+            var resp = await fetch("/api/plan/workout/" + id);
+            if (!resp.ok) return;
+            openModal(await resp.json());
+        } catch (e) { /* leave the calendar as-is */ }
+    }
+
+    document.querySelectorAll("[data-workout-id]").forEach(function (el) {
+        el.addEventListener("click", function () { showWorkout(el.dataset.workoutId); });
+        el.addEventListener("keydown", function (ev) {
+            if (ev.key === "Enter" || ev.key === " ") {
+                ev.preventDefault();
+                showWorkout(el.dataset.workoutId);
+            }
+        });
+    });
+    document.getElementById("wmClose").addEventListener("click", closeModal);
+    modal.addEventListener("click", function (ev) { if (ev.target === modal) closeModal(); });
+    document.addEventListener("keydown", function (ev) {
+        if (ev.key === "Escape" && !modal.hidden) closeModal();
+    });
+})();
+</script>
 {% endblock %}

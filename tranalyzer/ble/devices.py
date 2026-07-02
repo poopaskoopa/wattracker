@@ -7,6 +7,7 @@ installed and a Bluetooth adapter is present.
 from __future__ import annotations
 
 import abc
+import logging
 from typing import List, Optional, Sequence, Tuple
 
 from .protocol import (
@@ -14,12 +15,19 @@ from .protocol import (
     encode_request_control,
     encode_set_target_power,
     encode_start,
+    encode_stop,
+    parse_control_point_response,
     parse_cycling_power_measurement,
     parse_heart_rate_measurement,
+    CYCLING_POWER_SERVICE,
     CYCLING_POWER_MEASUREMENT,
+    FITNESS_MACHINE_SERVICE,
     FITNESS_MACHINE_CONTROL_POINT,
+    HEART_RATE_SERVICE,
     HEART_RATE_MEASUREMENT,
 )
+
+log = logging.getLogger(__name__)
 
 
 def bleak_available() -> Tuple[bool, str]:
@@ -61,6 +69,12 @@ class Trainer(abc.ABC):
 
     @abc.abstractmethod
     def set_target_power(self, watts: int) -> None: ...
+
+    def start_erg(self) -> None:
+        """Take control + start (FTMS Request Control 0x00, Start/Resume 0x07)."""
+
+    def stop_erg(self) -> None:
+        """Release ERG at ride end (FTMS Stop 0x08)."""
 
 
 # --------------------------------------------------------------- simulated
@@ -115,13 +129,21 @@ class SimulatedHeartRateSource(HeartRateSource):
 
 
 class SimulatedTrainer(Trainer):
-    """Records every ERG target it is told to hold (for assertions in tests)."""
+    """Records every ERG target/command it is told to hold (for test assertions)."""
 
     def __init__(self) -> None:
         self.targets: List[int] = []
+        self.commands: List[str] = []
 
     def set_target_power(self, watts: int) -> None:
         self.targets.append(int(round(watts)))
+
+    def start_erg(self) -> None:
+        self.commands.append("request_control")
+        self.commands.append("start")
+
+    def stop_erg(self) -> None:
+        self.commands.append("stop")
 
     @property
     def last_target(self) -> Optional[int]:
@@ -179,35 +201,76 @@ class BleakHeartRateSource(HeartRateSource):
 
 
 class BleakTrainer(Trainer):
-    """FTMS trainer over bleak: request control, start, then set ERG target."""
+    """FTMS trainer over bleak: request control, start, then set ERG targets.
+
+    Control-point indications (response code 0x80) are logged: failures are
+    reported but never raised, so a stubborn trainer degrades to display-only.
+    """
 
     def __init__(self, client) -> None:
         self._client = client
+        self.last_response: Optional[dict] = None
+
+    def _on_control_point(self, _char, data: bytearray) -> None:
+        try:
+            resp = parse_control_point_response(bytes(data))
+        except ValueError as e:
+            log.debug("Ignoring non-response FTMS indication: %s", e)
+            return
+        self.last_response = resp
+        if resp["success"]:
+            log.debug("FTMS op 0x%02x acknowledged", resp["request_op"])
+        else:
+            log.warning(
+                "FTMS op 0x%02x rejected: %s", resp["request_op"], resp["message"]
+            )
+
+    async def _write(self, payload: bytes, what: str) -> bool:
+        try:
+            await self._client.write_gatt_char(
+                FITNESS_MACHINE_CONTROL_POINT, payload, response=True
+            )
+            return True
+        except Exception as e:  # trainer went away / write rejected
+            log.warning("FTMS %s write failed: %s", what, e)
+            return False
 
     async def prepare(self) -> None:
-        await self._client.write_gatt_char(
-            FITNESS_MACHINE_CONTROL_POINT, encode_request_control(), response=True
-        )
-        await self._client.write_gatt_char(
-            FITNESS_MACHINE_CONTROL_POINT, encode_start(), response=True
-        )
+        """Put the trainer in ERG: subscribe to responses, take control, start."""
+        try:
+            await self._client.start_notify(
+                FITNESS_MACHINE_CONTROL_POINT, self._on_control_point
+            )
+        except Exception as e:  # indications unsupported: continue blind
+            log.warning("FTMS control point indications unavailable: %s", e)
+        await self._write(encode_request_control(), "request control")
+        await self._write(encode_start(), "start")
 
     async def async_set_target_power(self, watts: int) -> None:
-        await self._client.write_gatt_char(
-            FITNESS_MACHINE_CONTROL_POINT, encode_set_target_power(watts), response=True
-        )
+        await self._write(encode_set_target_power(watts), "set target power")
 
-    def set_target_power(self, watts: int) -> None:
+    async def async_stop(self) -> None:
+        await self._write(encode_stop(), "stop")
+
+    def _schedule(self, coro) -> None:
         # Synchronous entry point: schedule the async write if an event loop is
         # running; otherwise run it to completion.
         import asyncio
 
-        coro = self.async_set_target_power(watts)
         try:
             loop = asyncio.get_running_loop()
             loop.create_task(coro)
         except RuntimeError:
             asyncio.run(coro)
+
+    def set_target_power(self, watts: int) -> None:
+        self._schedule(self.async_set_target_power(watts))
+
+    def start_erg(self) -> None:
+        self._schedule(self.prepare())
+
+    def stop_erg(self) -> None:
+        self._schedule(self.async_stop())
 
 
 async def scan(timeout: float = 5.0) -> List[dict]:
@@ -231,4 +294,68 @@ async def scan(timeout: float = 5.0) -> List[dict]:
                 "rssi": adv.rssi,
             }
         )
+    return out
+
+
+async def connect_sensors(timeout: float = 6.0) -> dict:
+    """Scan and connect the first FTMS trainer / power meter / HR strap found.
+
+    Returns ``{"trainer", "power_source", "hr_source", "clients", "names"}``.
+    Any of the three roles may be None (graceful degradation: e.g. power-only
+    with no controllable trainer). The caller must disconnect every client in
+    ``clients`` when the ride ends. Raises RuntimeError when bleak/adapter is
+    unavailable.
+    """
+    ok, reason = bleak_available()
+    if not ok:
+        raise RuntimeError(f"Bluetooth unavailable: {reason}")
+    from bleak import BleakClient  # type: ignore
+
+    found = await scan(timeout=timeout)
+
+    def _first_with(service_uuid: str) -> Optional[dict]:
+        for d in found:
+            if service_uuid in [s.lower() for s in d["services"]]:
+                return d
+        return None
+
+    roles = {
+        "trainer": _first_with(FITNESS_MACHINE_SERVICE),
+        "power": _first_with(CYCLING_POWER_SERVICE),
+        "hr": _first_with(HEART_RATE_SERVICE),
+    }
+
+    clients: dict = {}  # address -> connected BleakClient (dedup: one per device)
+    out = {"trainer": None, "power_source": None, "hr_source": None,
+           "clients": [], "names": {}}
+    for role, dev in roles.items():
+        if not dev:
+            continue
+        addr = dev["address"]
+        client = clients.get(addr)
+        if client is None:
+            client = BleakClient(addr)
+            try:
+                await client.connect()
+            except Exception as e:
+                log.warning("Could not connect %s (%s): %s", dev["name"], addr, e)
+                continue
+            clients[addr] = client
+            out["clients"].append(client)
+        out["names"][role] = dev["name"]
+        try:
+            if role == "trainer":
+                trainer = BleakTrainer(client)
+                await trainer.prepare()
+                out["trainer"] = trainer
+            elif role == "power":
+                src = BleakPowerSource(client)
+                await src.start()
+                out["power_source"] = src
+            elif role == "hr":
+                hr = BleakHeartRateSource(client)
+                await hr.start()
+                out["hr_source"] = hr
+        except Exception as e:  # role setup failed: keep the others working
+            log.warning("Could not set up %s on %s: %s", role, dev["name"], e)
     return out
