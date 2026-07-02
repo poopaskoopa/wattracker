@@ -129,3 +129,11 @@ table.calendar th { text-align: center; }
 .cal-workout .cal-type { display: block; color: var(--muted); font-size: 0.65rem; }
 .cal-vo2max, .cal-threshold { background: rgba(224,82,82,0.18); border-left-color: var(--alert); }
 .cal-endurance, .cal-recovery { background: rgba(76,175,125,0.15); border-left-color: var(--ok); }
+
+/* Ride */
+.ride-setup { margin: 1rem 0; }
+.ride-setup select { margin-left: 0.5rem; }
+.ride-live { margin-top: 1rem; }
+.progress-wrap { background: #10161d; border: 1px solid #2a333d; border-radius: 6px;
+    height: 16px; overflow: hidden; margin: 0.75rem 0; }
+.progress-bar { height: 100%; width: 0; background: var(--accent); transition: width 0.2s linear; }

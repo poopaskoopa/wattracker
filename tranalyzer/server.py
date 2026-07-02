@@ -1,6 +1,7 @@
 """FastAPI application: auth + per-user dashboard, activities, generate, settings."""
 from __future__ import annotations
 
+import asyncio
 import calendar as _cal
 import datetime as _dt
 import io
@@ -9,7 +10,7 @@ import zipfile
 from contextlib import asynccontextmanager
 from typing import List, Optional
 
-from fastapi import FastAPI, Form, Request, UploadFile
+from fastapi import FastAPI, Form, Request, UploadFile, WebSocket
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse, Response
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
@@ -18,11 +19,13 @@ from starlette.middleware.sessions import SessionMiddleware
 
 from . import auth, config, db, paths
 from .analysis import pipeline
+from .ble import devices as bledevices
+from .ble.runner import RideController
 from .ingest import importer
 from .prescribe import plan as planmod
 from .prescribe import zwo
 from .prescribe import llm
-from .prescribe.planner import plan_workout
+from .prescribe.planner import build_workout, plan_workout
 
 DAY_LABELS = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
 
@@ -546,6 +549,139 @@ def create_app() -> FastAPI:
                 saved=True,
             ),
         )
+
+    # ------------------------------------------------------- ride (BLE)
+    def _upcoming_plan_workouts(uid: int, limit: int = 40) -> List[dict]:
+        today = _dt.date.today().isoformat()
+        out: List[dict] = []
+        for p in db.list_plans(uid):
+            for w in db.plan_workouts_for_plan(uid, p["id"]):
+                if w["date"] >= today:
+                    out.append(w)
+        out.sort(key=lambda w: w["date"])
+        return out[:limit]
+
+    def _ride_session(uid, workout_id=None, wtype=None, minutes=None):
+        """Build the Session to ride, from a plan workout or an ad-hoc type/duration."""
+        if workout_id:
+            w = db.get_plan_workout(uid, int(workout_id))
+            if w:
+                return build_workout(w["type"], max(1, w["duration_s"] / 60)), w["name"]
+        if wtype:
+            try:
+                mins = float(minutes) if minutes else 45
+            except (TypeError, ValueError):
+                mins = 45
+            try:
+                s = build_workout(wtype, max(20, mins))
+                return s, s.name
+            except ValueError:
+                pass
+        s = build_workout("endurance", 45)
+        return s, s.name
+
+    @app.get("/ride", response_class=HTMLResponse)
+    def ride_page(request: Request):
+        uid = _uid(request)
+        available, reason = bledevices.bluetooth_available()
+        return templates.TemplateResponse(
+            request,
+            "ride.html",
+            _ctx(
+                request,
+                ble_available=available,
+                ble_reason=reason,
+                workouts=_upcoming_plan_workouts(uid),
+                ftp=round(importer.current_ftp(uid), 0),
+            ),
+        )
+
+    @app.get("/ride/status")
+    def ride_status(request: Request):
+        available, reason = bledevices.bluetooth_available()
+        return JSONResponse({"available": available, "reason": reason})
+
+    @app.post("/ride/scan")
+    async def ride_scan(request: Request):
+        available, reason = bledevices.bluetooth_available()
+        if not available:
+            return JSONResponse(
+                {"available": False, "reason": reason, "devices": []}
+            )
+        try:
+            found = await bledevices.scan()
+            return JSONResponse({"available": True, "devices": found})
+        except Exception as e:  # no adapter, timeout, etc.
+            return JSONResponse(
+                {"available": False, "reason": str(e), "devices": []}
+            )
+
+    @app.websocket("/ride/ws")
+    async def ride_ws(websocket: WebSocket):
+        await websocket.accept()
+        uid = None
+        try:
+            uid = websocket.session.get("user_id")
+        except Exception:
+            uid = None
+        if not uid:
+            await websocket.send_json({"status": "error", "error": "not authenticated"})
+            await websocket.close()
+            return
+
+        params = websocket.query_params
+        sim = params.get("sim")
+        session, _name = _ride_session(
+            uid,
+            workout_id=params.get("workout_id"),
+            wtype=params.get("type"),
+            minutes=params.get("minutes"),
+        )
+        ftp = importer.current_ftp(uid)
+        available, reason = bledevices.bluetooth_available()
+
+        # Without a simulation request and without hardware, report the
+        # unavailable state (page still works) and close cleanly.
+        if not sim and not available:
+            await websocket.send_json(
+                {
+                    "status": "unavailable",
+                    "ble_available": available,
+                    "reason": reason,
+                    "message": "Bluetooth riding needs an adapter and `pip install "
+                    ".[ble]`. Use Simulate to preview the live screen.",
+                }
+            )
+            await websocket.close()
+            return
+
+        # Simulated ride: pedal at a steady wattage, compressing time so the
+        # whole session streams quickly. (Real hardware would tick at dt=1 in
+        # real time from a connected power source.)
+        trainer = bledevices.SimulatedTrainer()
+        controller = RideController(
+            session, ftp, trainer=trainer, user_id=uid, autosave=True
+        )
+        step_dt = 30
+        pedal = max(60, int(0.55 * ftp))
+        max_frames = int(controller.total_s / step_dt) + 5
+        frames = 0
+        try:
+            while controller.status != "finished" and frames < max_frames:
+                controller.tick(power=pedal, dt=step_dt)
+                await websocket.send_json(controller.state())
+                frames += 1
+                await asyncio.sleep(0.01)
+            if controller.status != "finished":
+                controller.stop()
+            await websocket.send_json(controller.state())
+        except Exception:
+            pass
+        finally:
+            try:
+                await websocket.close()
+            except Exception:
+                pass
 
     # --------------------------------------------------------- JSON API
     @app.get("/api/state")

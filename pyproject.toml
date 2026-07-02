@@ -19,6 +19,9 @@ dependencies = [
 
 [project.optional-dependencies]
 dev = ["pytest", "httpx"]
+# Real-hardware Bluetooth riding. Not needed for core install or the test suite;
+# requires a Bluetooth adapter + trainer/sensors to actually use.
+ble = ["bleak"]
 
 [project.scripts]
 tranalyzer = "tranalyzer.__main__:main"

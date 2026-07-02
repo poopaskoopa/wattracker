@@ -1,0 +1,114 @@
+{% extends "base.html" %}
+{% block title %}Ride &mdash; TRanalyzer{% endblock %}
+{% block content %}
+<h2>Ride</h2>
+
+{% if ble_available %}
+<p class="ok">Bluetooth available. Scan for your power meter, trainer, and HR strap.</p>
+{% else %}
+<p class="alert">Bluetooth unavailable: {{ ble_reason }}.
+   Real riding needs a Bluetooth adapter and <code>pip install .[ble]</code>.
+   You can still preview the live screen with <strong>Simulate</strong>.</p>
+{% endif %}
+
+<section class="ride-setup">
+    <label>Workout:
+        <select id="workoutSelect">
+            <option value="">Endurance (45 min)</option>
+            {% for w in workouts %}
+            <option value="{{ w.id }}">{{ w.date }} &mdash; {{ w.name }}
+                ({{ (w.duration_s // 60) }} min)</option>
+            {% endfor %}
+        </select>
+    </label>
+    <div class="toolbar">
+        <button type="button" id="scanBtn" {{ '' if ble_available else 'disabled' }}>Scan devices</button>
+        <button type="button" id="connectBtn" {{ '' if ble_available else 'disabled' }}>Connect</button>
+        <button type="button" id="startBtn">Start ride</button>
+        <button type="button" id="simBtn">Simulate</button>
+        <button type="button" id="stopBtn" disabled>Stop</button>
+    </div>
+    <div id="deviceList" class="hint"></div>
+</section>
+
+<section class="ride-live">
+    <div class="cards">
+        <div class="card"><span class="label">Status</span><span class="value" id="rStatus">idle</span></div>
+        <div class="card"><span class="label">Target</span><span class="value"><span id="rTarget">0</span> W</span></div>
+        <div class="card"><span class="label">Power</span><span class="value"><span id="rPower">0</span> W</span></div>
+        <div class="card"><span class="label">Cadence</span><span class="value"><span id="rCad">&mdash;</span> rpm</span></div>
+        <div class="card"><span class="label">HR</span><span class="value"><span id="rHr">&mdash;</span> bpm</span></div>
+        <div class="card"><span class="label">Elapsed</span><span class="value" id="rElapsed">0:00</span></div>
+    </div>
+    <div class="progress-wrap"><div id="rProgress" class="progress-bar"></div></div>
+    <p class="hint">Segment <span id="rSeg">0</span>/<span id="rSegCount">0</span>.
+       The clock auto-pauses when power is 0 and auto-starts when you pedal.</p>
+</section>
+
+<script>
+(function () {
+    var ws = null;
+    function fmt(sec) {
+        sec = Math.round(sec || 0);
+        var m = Math.floor(sec / 60), s = sec % 60;
+        return m + ":" + (s < 10 ? "0" + s : s);
+    }
+    function setBtns(running) {
+        document.getElementById("stopBtn").disabled = !running;
+        document.getElementById("startBtn").disabled = running;
+        document.getElementById("simBtn").disabled = running;
+    }
+    function render(st) {
+        document.getElementById("rStatus").textContent = st.status;
+        document.getElementById("rTarget").textContent = st.target_watts;
+        document.getElementById("rPower").textContent = st.power;
+        document.getElementById("rCad").textContent = st.cadence == null ? "—" : st.cadence;
+        document.getElementById("rHr").textContent = st.hr == null ? "—" : st.hr;
+        document.getElementById("rElapsed").textContent = fmt(st.elapsed);
+        document.getElementById("rSeg").textContent = (st.segment_index || 0) + 1;
+        document.getElementById("rSegCount").textContent = st.segment_count;
+        document.getElementById("rProgress").style.width = ((st.progress || 0) * 100) + "%";
+        if (st.status === "finished") setBtns(false);
+    }
+    function openRide(sim) {
+        if (ws) { try { ws.close(); } catch (e) {} }
+        var proto = location.protocol === "https:" ? "wss:" : "ws:";
+        var wid = document.getElementById("workoutSelect").value;
+        var q = [];
+        if (wid) q.push("workout_id=" + encodeURIComponent(wid));
+        if (sim) q.push("sim=1");
+        ws = new WebSocket(proto + "//" + location.host + "/ride/ws" + (q.length ? "?" + q.join("&") : ""));
+        setBtns(true);
+        ws.onmessage = function (ev) {
+            var st = JSON.parse(ev.data);
+            if (st.status === "unavailable") {
+                document.getElementById("rStatus").textContent = "unavailable";
+                setBtns(false);
+                return;
+            }
+            render(st);
+        };
+        ws.onclose = function () { setBtns(false); };
+        ws.onerror = function () { setBtns(false); };
+    }
+    document.getElementById("startBtn").addEventListener("click", function () { openRide(false); });
+    document.getElementById("simBtn").addEventListener("click", function () { openRide(true); });
+    document.getElementById("stopBtn").addEventListener("click", function () {
+        if (ws) { try { ws.close(); } catch (e) {} }
+        setBtns(false);
+    });
+    document.getElementById("scanBtn").addEventListener("click", async function () {
+        var el = document.getElementById("deviceList");
+        el.textContent = "Scanning...";
+        try {
+            var resp = await fetch("/ride/scan", { method: "POST" });
+            var data = await resp.json();
+            if (!data.available) { el.textContent = "Unavailable: " + (data.reason || ""); return; }
+            el.innerHTML = data.devices.length
+                ? data.devices.map(function (d) { return d.name + " (" + d.address + ")"; }).join("<br>")
+                : "No devices found.";
+        } catch (e) { el.textContent = "Scan failed."; }
+    });
+})();
+</script>
+{% endblock %}

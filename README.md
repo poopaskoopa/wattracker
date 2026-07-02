@@ -48,6 +48,30 @@ pip install -e ".[dev]"
 pytest
 ```
 
+## Ride (Bluetooth)
+
+The **Ride** page runs a generated/planned workout directly in the app, talking
+to cycling equipment over BLE:
+
+- **Cycling Power Service (0x1818)** for power/cadence, **Heart Rate (0x180D)**
+  for HR, and **FTMS (0x1826)** to set ERG target power (control trainer
+  resistance).
+- The workout clock **auto-pauses at 0 W and auto-starts when you pedal**, and
+  auto-stops after a short grace period of continuous 0 W (or when segments
+  finish). Completed rides are saved as activities and feed CTL/ATL/FTP.
+
+BLE hardware support is an **optional extra** — the core app and test suite run
+without it:
+
+```sh
+pip install .[ble]     # installs bleak; needs a Bluetooth adapter + trainer
+```
+
+Without an adapter (or without `bleak`), the page loads fine, reports Bluetooth
+as unavailable, and offers a **Simulate** button that drives the same live
+screen and state machine with a virtual trainer. **Real-hardware riding must be
+verified against actual equipment** — it cannot be exercised in CI.
+
 ## Configuration
 
 FTP override, ZwiftID, and folder paths are **per-user** settings stored in the

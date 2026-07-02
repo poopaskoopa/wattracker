@@ -1,0 +1,245 @@
+"""RideController: the workout-runner state machine (pure, testable).
+
+Given a Session (segments with %FTP + seconds) and the user's FTP, it drives a
+trainer over ERG: at each tick it computes the current target watts and calls
+``trainer.set_target_power``. The workout clock only advances while measured
+power > 0 (auto-pause at 0 W); it auto-starts on the first pedal stroke and
+auto-stops after a grace period of continuous 0 W (or when segments complete).
+On finish it records the ride as an activity for the user.
+"""
+from __future__ import annotations
+
+import datetime as _dt
+from typing import List, Optional, Tuple
+
+from ..prescribe.planner import Session
+
+IDLE = "idle"
+RUNNING = "running"
+PAUSED = "paused"
+FINISHED = "finished"
+
+_DEFAULT_ZERO_GRACE_S = 5.0
+
+
+def _flatten(session: Session) -> Tuple[List[tuple], int]:
+    """Flatten a Session into timed blocks: (start, end, 'const'|'ramp', value).
+
+    Intervals expand into steady on/off blocks; warmup/cooldown become ramps.
+    ``value`` is a fraction of FTP (float) for const, or (lo, hi) for ramp.
+    """
+    blocks: List[tuple] = []
+    t = 0
+    for seg in session.segments:
+        if seg.kind == "intervals" and seg.repeat:
+            on = int(seg.on_duration or 0)
+            off = int(seg.off_duration or 0)
+            for _ in range(int(seg.repeat)):
+                if on > 0:
+                    blocks.append((t, t + on, "const", float(seg.on_power or 0.0)))
+                    t += on
+                if off > 0:
+                    blocks.append((t, t + off, "const", float(seg.off_power or 0.0)))
+                    t += off
+        elif seg.kind in ("warmup", "cooldown", "ramp"):
+            blocks.append(
+                (t, t + seg.duration, "ramp",
+                 (float(seg.power_low or 0.0), float(seg.power_high or 0.0)))
+            )
+            t += seg.duration
+        else:  # steadystate / freeride
+            blocks.append((t, t + seg.duration, "const", float(seg.power or 0.0)))
+            t += seg.duration
+    return blocks, t
+
+
+class RideController:
+    def __init__(
+        self,
+        session: Session,
+        ftp: float,
+        trainer=None,
+        power_source=None,
+        hr_source=None,
+        user_id: Optional[int] = None,
+        zero_grace_s: float = _DEFAULT_ZERO_GRACE_S,
+        autosave: bool = True,
+        started_at: Optional[_dt.datetime] = None,
+    ) -> None:
+        self.session = session
+        self.ftp = float(ftp)
+        self.trainer = trainer
+        self.power_source = power_source
+        self.hr_source = hr_source
+        self.user_id = user_id
+        self.zero_grace_s = float(zero_grace_s)
+        self.autosave = autosave
+
+        self.blocks, self.total_s = _flatten(session)
+        self.status = IDLE
+        self.elapsed = 0.0
+        self._zero_run = 0.0
+        self._ever_started = False
+
+        self.current_power = 0
+        self.current_cadence: Optional[float] = None
+        self.current_hr: Optional[int] = None
+        self.current_target = 0
+
+        self._samples = {"power": [], "cadence": [], "heartrate": []}
+        self.started_at = started_at
+        self.activity_id: Optional[int] = None
+        self.saved_record: Optional[dict] = None
+
+    # ---------------------------------------------------------- targets
+    def target_fraction(self, t: float) -> float:
+        """%FTP fraction at elapsed second `t`."""
+        for (s, e, kind, val) in self.blocks:
+            if s <= t < e:
+                if kind == "const":
+                    return val
+                lo, hi = val
+                return lo + (hi - lo) * ((t - s) / (e - s)) if e > s else lo
+        if self.blocks:  # past the end -> hold the final block's value
+            s, e, kind, val = self.blocks[-1]
+            return val if kind == "const" else val[1]
+        return 0.0
+
+    def target_watts(self, t: float) -> int:
+        return int(round(self.target_fraction(t) * self.ftp))
+
+    def _block_index(self, t: float) -> int:
+        for i, (s, e, _k, _v) in enumerate(self.blocks):
+            if s <= t < e:
+                return i
+        return max(0, len(self.blocks) - 1)
+
+    # ------------------------------------------------------------ ticks
+    def tick(
+        self,
+        power: int = 0,
+        cadence: Optional[float] = None,
+        hr: Optional[int] = None,
+        dt: float = 1.0,
+    ) -> dict:
+        """Advance the state machine by `dt` seconds with a measured `power`."""
+        if self.status == FINISHED:
+            return self.state()
+
+        p = int(power or 0)
+        self.current_power = p
+        self.current_cadence = cadence
+        self.current_hr = hr
+
+        if p > 0:
+            if self.status in (IDLE, PAUSED):
+                self.status = RUNNING
+                if not self._ever_started:
+                    self._ever_started = True
+                    if self.started_at is None:
+                        self.started_at = _dt.datetime.now()
+            self._zero_run = 0.0
+            self.elapsed += dt
+
+            # record a sample for the ride file
+            self._samples["power"].append(p)
+            self._samples["cadence"].append(cadence)
+            self._samples["heartrate"].append(hr)
+
+            # set ERG target for the current position
+            self.current_target = self.target_watts(min(self.elapsed, self.total_s))
+            if self.trainer is not None:
+                self.trainer.set_target_power(self.current_target)
+
+            if self.elapsed >= self.total_s:
+                self._finish()
+        else:
+            # zero power: auto-pause; auto-stop after the grace period (post-start)
+            if self.status == RUNNING:
+                self.status = PAUSED
+            if self._ever_started:
+                self._zero_run += dt
+                if self._zero_run >= self.zero_grace_s:
+                    self._finish()
+        return self.state()
+
+    def poll(self, dt: float = 1.0) -> dict:
+        """Read the attached sources (advancing simulated ones), then tick."""
+        for src in (self.power_source, self.hr_source):
+            adv = getattr(src, "advance", None)
+            if callable(adv):
+                adv()
+        p = self.power_source.latest_power() if self.power_source else 0
+        cad = self.power_source.latest_cadence() if self.power_source else None
+        hr = self.hr_source.latest_hr() if self.hr_source else None
+        return self.tick(power=int(p or 0), cadence=cad, hr=hr, dt=dt)
+
+    def stop(self) -> dict:
+        """Manual stop/finish."""
+        if self.status != FINISHED:
+            self._finish()
+        return self.state()
+
+    # --------------------------------------------------------- finishing
+    def _finish(self) -> None:
+        self.status = FINISHED
+        if self.trainer is not None:
+            try:
+                self.trainer.set_target_power(0)
+            except Exception:
+                pass
+        if self.autosave and self.user_id is not None:
+            try:
+                self._save()
+            except Exception:
+                # Recording must never crash the ride; leave activity_id None.
+                pass
+
+    def _save(self) -> None:
+        from .. import db
+        from ..ingest import importer
+
+        started = self.started_at or _dt.datetime.now()
+        n = len(self._samples["power"])
+        times = [(started + _dt.timedelta(seconds=i)).isoformat() for i in range(n)]
+        streams = {
+            "time": times,
+            "power": self._samples["power"],
+            "cadence": self._samples["cadence"],
+            "heartrate": self._samples["heartrate"],
+            "distance": [],
+            "altitude": [],
+        }
+        parsed = {
+            "start_time": started.isoformat(),
+            "duration_s": int(self.elapsed),
+            "streams": streams,
+        }
+        name = f"Ride {started.date().isoformat()} {self.session.name}"
+        record = importer._build_record(parsed, name, self.ftp)
+        self.saved_record = record
+        self.activity_id = db.insert_activity(self.user_id, record)
+        try:
+            importer.maybe_update_ftp(self.user_id)
+        except Exception:
+            pass
+
+    # ------------------------------------------------------------- state
+    def state(self) -> dict:
+        clamped = min(self.elapsed, self.total_s)
+        return {
+            "status": self.status,
+            "elapsed": round(self.elapsed, 1),
+            "total": self.total_s,
+            "segment_index": self._block_index(clamped),
+            "segment_count": len(self.blocks),
+            "target_watts": self.current_target,
+            "power": self.current_power,
+            "cadence": round(self.current_cadence, 1)
+            if self.current_cadence is not None else None,
+            "hr": self.current_hr,
+            "progress": round(clamped / self.total_s, 3) if self.total_s else 0.0,
+            "ftp": self.ftp,
+            "name": self.session.name,
+            "activity_id": self.activity_id,
+        }
