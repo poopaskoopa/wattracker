@@ -115,19 +115,11 @@ def _activity_power_streams(
             if not power:
                 continue
             if cutoff is not None:
-                st = item.get("start_time")
-                if st:
-                    try:
-                        when = _dt.datetime.fromisoformat(st)
-                    except (ValueError, TypeError):
-                        when = None
-                    # FIT timestamps are tz-aware (UTC); `cutoff` is naive local.
-                    # Drop tzinfo so the trailing-window comparison never mixes
-                    # offset-aware and offset-naive datetimes.
-                    if when is not None and when.tzinfo is not None:
-                        when = when.replace(tzinfo=None)
-                    if when is not None and when < cutoff:
-                        continue
+                from ..timeutil import parse_naive
+
+                when = parse_naive(item.get("start_time"))
+                if when is not None and when < cutoff:
+                    continue
             out.append(power)
         else:
             out.append(item)

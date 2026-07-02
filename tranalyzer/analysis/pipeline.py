@@ -5,6 +5,7 @@ import datetime as _dt
 from typing import Dict, List, Optional, Tuple
 
 from .. import db
+from ..timeutil import parse_naive
 from ..ingest.importer import current_ftp
 from ..metrics.curve import MMP_DURATIONS, fit_cp_wprime, mean_maximal_power
 from ..metrics.decoupling import aerobic_decoupling
@@ -21,12 +22,8 @@ def _window_power(
     hi = now - _dt.timedelta(days=end_days_ago)
     out: List[List[float]] = []
     for a in activities:
-        st = a.get("start_time")
-        if not st:
-            continue
-        try:
-            when = _dt.datetime.fromisoformat(st)
-        except (ValueError, TypeError):
+        when = parse_naive(a.get("start_time"))
+        if when is None:
             continue
         if hi <= when < lo:
             power = (a.get("streams") or {}).get("power") or []

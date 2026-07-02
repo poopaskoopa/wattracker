@@ -67,7 +67,11 @@ def parse_fit(path: str) -> Dict:
     start_time: Optional[str] = None
     duration_s = 0
     if timestamps:
-        start_time = timestamps[0].isoformat()
+        # Normalize to naive so all downstream window comparisons stay
+        # naive-vs-naive (FIT timestamps are tz-aware UTC).
+        from ..timeutil import to_naive
+
+        start_time = to_naive(timestamps[0]).isoformat()
         duration_s = int((timestamps[-1] - timestamps[0]).total_seconds())
     if duration_s <= 0:
         duration_s = max(len(streams["time"]) - 1, len(streams["time"]))
