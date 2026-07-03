@@ -8,8 +8,11 @@ from scipy.optimize import least_squares
 
 from .power import rolling_mean
 
-# Durations (seconds) at which we sample the mean-maximal power curve.
-MMP_DURATIONS: Tuple[int, ...] = (5, 60, 300, 1200, 3600)
+# Durations (seconds) at which we sample the mean-maximal power curve. A dense
+# standard grid so the dashboard curve has a measured dot at every axis tick.
+MMP_DURATIONS: Tuple[int, ...] = (
+    5, 10, 15, 30, 60, 120, 180, 300, 600, 900, 1200, 1800, 2700, 3600, 5400,
+)
 
 
 def best_rolling_power(power: Sequence[float], window: int) -> float:

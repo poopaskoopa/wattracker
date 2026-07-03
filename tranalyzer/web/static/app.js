@@ -30,6 +30,46 @@ function alignedFrom(labels, points, valueKey) {
     return labels.map((l) => (l in m ? m[l] : null));
 }
 
+// Like alignedFrom, but linearly interpolates between known samples so a
+// sparse series (e.g. weekly FTP estimates) has a value at EVERY label. The
+// drawn line is unchanged (spanGaps already drew the same straight chords),
+// but the shared index-mode tooltip can now always include the series.
+function interpolatedFrom(labels, points, valueKey) {
+    const out = alignedFrom(labels, points, valueKey);
+    const t = labels.map((l) => Date.parse(l));
+    const known = [];
+    out.forEach((v, i) => { if (v != null) known.push(i); });
+    for (let k = 0; k + 1 < known.length; k++) {
+        const i0 = known[k], i1 = known[k + 1];
+        const v0 = out[i0], v1 = out[i1];
+        const t0 = t[i0], t1 = t[i1];
+        for (let i = i0 + 1; i < i1; i++) {
+            const f = t1 > t0 ? (t[i] - t0) / (t1 - t0) : 0;
+            out[i] = Math.round((v0 + (v1 - v0) * f) * 10) / 10;
+        }
+    }
+    return out;
+}
+
+const MONTH_NAMES = ["Jan", "Feb", "Mar", "Apr", "May", "Jun",
+                     "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
+
+// Compact date ticks: plain month names, with the year only on the first tick
+// and at year boundaries ("Jan 2026"); further ticks within a month are hidden.
+function monthYearTicks(labels) {
+    return function (value, index, ticks) {
+        const label = labels[value] || "";
+        const y = label.slice(0, 4);
+        const m = parseInt(label.slice(5, 7), 10) - 1;
+        if (!(m >= 0 && m <= 11)) return label;
+        const prev = index > 0 && ticks[index - 1]
+            ? (labels[ticks[index - 1].value] || "") : "";
+        if (!prev || prev.slice(0, 4) !== y) return MONTH_NAMES[m] + " " + y;
+        if (prev.slice(5, 7) === label.slice(5, 7)) return "";
+        return MONTH_NAMES[m];
+    };
+}
+
 function unionDates(...arrays) {
     const set = new Set();
     arrays.forEach((arr) => (arr || []).forEach((p) => set.add(p.date)));
@@ -103,7 +143,7 @@ function buildMainChart(load, ftpSeries) {
           yAxisID: "y", tension: 0.2, pointRadius: 0, spanGaps: true },
         { label: "TSB", data: alignedFrom(labels, load, "tsb"), borderColor: COLORS.TSB,
           yAxisID: "y", tension: 0.2, pointRadius: 0, spanGaps: true },
-        { label: "FTP (est)", data: alignedFrom(labels, est, "ftp"), borderColor: COLORS.FTP,
+        { label: "FTP (est)", data: interpolatedFrom(labels, est, "ftp"), borderColor: COLORS.FTP,
           yAxisID: "yFtp", tension: 0.1, pointRadius: 0, spanGaps: true, borderDash: [4, 3] },
         { label: "FTP (recorded)", data: alignedFrom(labels, recorded, "ftp_watts"),
           yAxisID: "yFtp", borderColor: COLORS.FTP, backgroundColor: COLORS.FTP,
@@ -126,7 +166,14 @@ function buildMainChart(load, ftpSeries) {
                 },
             },
             scales: {
-                x: { ticks: { maxTicksLimit: 12 } },
+                x: {
+                    ticks: {
+                        maxTicksLimit: 12,
+                        maxRotation: 0,
+                        autoSkip: true,
+                        callback: monthYearTicks(labels),
+                    },
+                },
                 y: { position: "left", title: { display: true, text: "Load (CTL/ATL/TSB)" } },
                 yFtp: {
                     position: "right", title: { display: true, text: "FTP (W)" },
@@ -176,6 +223,16 @@ function wireControls() {
     }
 }
 
+function fmtDuration(sec) {
+    if (sec < 60) return sec + "s";
+    if (sec < 3600) {
+        const m = sec / 60;
+        return (Number.isInteger(m) ? m : m.toFixed(1)) + "m";
+    }
+    const h = sec / 3600;
+    return (Number.isInteger(h) ? h : h.toFixed(1)) + "h";
+}
+
 async function renderCurveChart() {
     const el = document.getElementById("curveChart");
     if (!el) return;
@@ -184,6 +241,9 @@ async function renderCurveChart() {
     const measured = (data.measured || []).map((p) => ({ x: p.t, y: p.power }));
     const model = (data.model || []).map((p) => ({ x: p.t, y: p.power }));
     if (!measured.length && !model.length) return;
+    // Axis ticks are exactly the sampled durations, so every tick has its
+    // measured (yellow) dot and vice versa.
+    const tickDurations = (measured.length ? measured : model).map((p) => p.x);
     new Chart(el, {
         type: "scatter",
         data: {
@@ -196,8 +256,27 @@ async function renderCurveChart() {
         },
         options: {
             responsive: true,
+            plugins: {
+                tooltip: {
+                    callbacks: {
+                        title: (items) => (items.length ? fmtDuration(items[0].parsed.x) : ""),
+                        label: (item) => item.dataset.label + ": " + item.parsed.y + " W",
+                    },
+                },
+            },
             scales: {
-                x: { type: "logarithmic", title: { display: true, text: "Duration (s)" } },
+                x: {
+                    type: "logarithmic",
+                    title: { display: true, text: "Duration" },
+                    afterBuildTicks: (axis) => {
+                        axis.ticks = tickDurations.map((t) => ({ value: t }));
+                    },
+                    ticks: {
+                        autoSkip: false,
+                        maxRotation: 0,
+                        callback: (value) => fmtDuration(value),
+                    },
+                },
                 y: { title: { display: true, text: "Power (W)" } },
             },
         },

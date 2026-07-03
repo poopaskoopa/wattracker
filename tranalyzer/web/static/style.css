@@ -155,6 +155,17 @@ table.calendar th { text-align: center; }
 .modal-close:hover { color: var(--text); filter: none; }
 .profile-wrap { background: #10161d; border: 1px solid #2a333d; border-radius: 6px;
     padding: 0.5rem; margin: 0.75rem 0; }
+.profile-wrap[hidden] { display: none; }
+#wmTable[hidden], #wmError[hidden] { display: none; }
+.profile-svg { display: block; width: 100%; height: auto; }
+.profile-svg .pf-grid { stroke: #2a333d; stroke-width: 1; }
+.profile-svg .pf-area { fill: rgba(242, 169, 0, 0.22); stroke: none; }
+.profile-svg .pf-line { fill: none; stroke: var(--accent); stroke-width: 2; }
+.profile-svg .pf-ftp { stroke: var(--muted); stroke-width: 1; stroke-dasharray: 4 3; }
+.profile-svg .pf-ylab { fill: var(--muted); font-size: 10px; text-anchor: end;
+    dominant-baseline: middle; }
+.profile-svg .pf-xlab { fill: var(--muted); font-size: 10px; text-anchor: middle; }
+.profile-svg .pf-ftplab { fill: var(--muted); font-size: 10px; text-anchor: end; }
 
 /* Ride */
 .ride-setup { margin: 1rem 0; }
