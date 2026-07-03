@@ -62,6 +62,7 @@ h2 { border-bottom: 1px solid #2a333d; padding-bottom: 0.4rem; }
     display: inline-flex; align-items: center; gap: 0.35rem; }
 .legend-item.off { opacity: 0.4; text-decoration: line-through; }
 .legend-swatch { width: 12px; height: 12px; border-radius: 2px; display: inline-block; }
+.legend-value { color: var(--accent); font-weight: 600; }
 
 .alerts ul { list-style: none; padding: 0; }
 .alert {
@@ -134,6 +135,15 @@ table.calendar th { text-align: center; }
 .cal-workout .cal-type { display: block; color: var(--muted); font-size: 0.65rem; }
 .cal-vo2max, .cal-threshold { background: rgba(224,82,82,0.18); border-left-color: var(--alert); }
 .cal-endurance, .cal-recovery { background: rgba(76,175,125,0.15); border-left-color: var(--ok); }
+.cal-workout.cal-completed { opacity: 0.78; border-left-style: double; }
+.cal-check { color: var(--ok); font-weight: 700; }
+
+/* Settings: Zwift player-folder picker */
+.zwift-picker { border: 1px solid #2a333d; border-radius: 6px; padding: 0.5rem 0.75rem;
+    max-width: 520px; margin: 0.6rem 0; }
+.zwift-picker legend { color: var(--muted); font-size: 0.8rem; }
+.zwift-candidate { display: flex; align-items: center; gap: 0.4rem; margin: 0.3rem 0; }
+.zwift-candidate input { width: auto; margin: 0; }
 
 /* Calendar workout-detail modal */
 .modal-overlay {

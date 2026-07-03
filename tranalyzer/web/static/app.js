@@ -84,6 +84,21 @@ const LEGEND_GROUPS = [
     { label: "FTP", datasets: [3, 4] }, // rolling line + recorded points
 ];
 
+// Most recent value across a legend group's datasets (a later dataset in the
+// group wins a tie on the same date, e.g. recorded FTP over the estimate).
+function latestGroupValue(group) {
+    if (!mainChart) return null;
+    const datasets = group.datasets.map((i) => mainChart.data.datasets[i]);
+    const n = (mainChart.data.labels || []).length;
+    for (let i = n - 1; i >= 0; i--) {
+        for (let d = datasets.length - 1; d >= 0; d--) {
+            const v = ((datasets[d] || {}).data || [])[i];
+            if (v != null) return v;
+        }
+    }
+    return null;
+}
+
 function buildLegend() {
     const container = document.getElementById("mainLegend");
     if (!container || !mainChart) return;
@@ -93,9 +108,13 @@ function buildLegend() {
         const item = document.createElement("span");
         item.className = "legend-item" + (visible ? "" : " off");
         item.title = SERIES_TIPS[group.label] || group.label;
+        const latest = latestGroupValue(group);
+        const valueHtml = latest == null
+            ? ""
+            : ' <span class="legend-value">' + (Math.round(latest * 10) / 10) + "</span>";
         item.innerHTML =
             '<span class="legend-swatch" style="background:' +
-            (COLORS[group.label] || "#999") + '"></span>' + group.label;
+            (COLORS[group.label] || "#999") + '"></span>' + group.label + valueHtml;
         item.addEventListener("click", (e) => {
             if (e.ctrlKey || e.metaKey) {
                 // Ctrl/Cmd-click = toggle just this group; leave others as-is.

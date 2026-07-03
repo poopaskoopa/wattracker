@@ -5,6 +5,7 @@ import asyncio
 import calendar as _cal
 import datetime as _dt
 import io
+import logging
 import os
 import zipfile
 from contextlib import asynccontextmanager
@@ -31,6 +32,30 @@ DAY_LABELS = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
 
 # Real-hardware ride loop cadence (seconds); module-level so tests can shrink it.
 RIDE_POLL_INTERVAL_S = 1.0
+
+# Background activity-scan cadence (seconds); module-level so tests can shrink it.
+SCAN_INTERVAL_S = 24 * 3600.0
+
+_log = logging.getLogger(__name__)
+
+
+async def auto_scan_loop(stop: "asyncio.Event") -> None:
+    """Daily background sweep: import new .fit files, re-evaluate FTP, match
+    plan-workout completions. Runs once immediately, then every SCAN_INTERVAL_S
+    until `stop` is set. The sweep itself runs in a worker thread so FIT
+    parsing never blocks the event loop.
+    """
+    while True:
+        try:
+            totals = await asyncio.to_thread(importer.run_auto_scan)
+            _log.info("auto-scan: %s", totals)
+        except Exception:
+            _log.warning("background activity scan failed", exc_info=True)
+        try:
+            await asyncio.wait_for(stop.wait(), timeout=SCAN_INTERVAL_S)
+            return
+        except asyncio.TimeoutError:
+            continue  # interval elapsed -> next daily sweep
 
 
 def _upcoming_monday(today: Optional[_dt.date] = None) -> _dt.date:
@@ -78,7 +103,17 @@ def create_app() -> FastAPI:
     @asynccontextmanager
     async def lifespan(_app: FastAPI):
         db.init_db()
+        stop = asyncio.Event()
+        task: Optional[asyncio.Task] = None
+        if config.auto_scan_enabled():
+            task = asyncio.create_task(auto_scan_loop(stop))
         yield
+        if task is not None:
+            stop.set()
+            try:
+                await asyncio.wait_for(task, timeout=5.0)
+            except (asyncio.TimeoutError, asyncio.CancelledError):
+                task.cancel()
 
     app = FastAPI(title="TRanalyzer", lifespan=lifespan)
     app.mount("/static", StaticFiles(directory=_STATIC_DIR), name="static")
@@ -248,6 +283,43 @@ def create_app() -> FastAPI:
         summary["total_tss"] = round(sum(w["tss"] for w in workouts), 1)
         return summary
 
+    def _auto_export_plan(uid: int, plan_id: int) -> dict:
+        """Export a new plan's .zwo files to the user's Zwift folder when the
+        target can be determined; otherwise report why so the UI can point the
+        user at the Settings picker. Never guesses between player folders.
+        """
+        settings = db.get_user_settings(uid)
+        target, reason = paths.resolve_export_dir(
+            settings.get("zwift_id"), settings.get("workouts_dir")
+        )
+        if not target:
+            return {
+                "auto_export": None,
+                "auto_export_reason": reason,  # 'choose' | 'missing'
+                "zwift_candidates": paths.candidate_zwift_ids(),
+            }
+        workouts = db.plan_workouts_for_plan(uid, plan_id, include_zwo=True)
+        try:
+            result = zwo.write_plan_to_zwift(
+                [
+                    {"date": w["date"], "name": w["name"], "zwo": w["zwo_or_segments"]}
+                    for w in workouts
+                ],
+                settings.get("zwift_id") or "me",
+                workouts_override=target,
+            )
+        except OSError as e:
+            _log.warning("plan auto-export failed: %s", e)
+            return {"auto_export": None, "auto_export_reason": f"error: {e}"}
+        return {
+            "auto_export": {
+                "count": result["count"],
+                "directory": result["directory"],
+                "reason": reason,
+            },
+            "auto_export_reason": None,
+        }
+
     @app.get("/generate", response_class=HTMLResponse)
     def generate_form(request: Request):
         return templates.TemplateResponse(
@@ -330,6 +402,7 @@ def create_app() -> FastAPI:
             summary = _plan_summary(uid, plan_id)
             summary["polarized_hard_fraction"] = generated["polarized_hard_fraction"]
             summary["weekly"] = generated["weekly"]
+            summary.update(_auto_export_plan(uid, plan_id))
         except ValueError as e:
             plan_error = str(e)
 
@@ -504,19 +577,22 @@ def create_app() -> FastAPI:
             headers={"Content-Disposition": f'attachment; filename="{fname}.zwo"'},
         )
 
+    def _settings_ctx(request: Request, uid: int, saved: bool) -> dict:
+        settings = db.get_user_settings(uid)
+        return _ctx(
+            request,
+            settings=settings,
+            current_ftp=round(importer.current_ftp(uid), 1),
+            api_key_set=config.anthropic_api_key_set(),
+            saved=saved,
+            zwift_candidates=paths.candidate_zwift_ids(),
+            watch_default=paths.activities_dir(),
+        )
+
     @app.get("/settings", response_class=HTMLResponse)
     def settings_page(request: Request):
-        uid = _uid(request)
         return templates.TemplateResponse(
-            request,
-            "settings.html",
-            _ctx(
-                request,
-                settings=db.get_user_settings(uid),
-                current_ftp=round(importer.current_ftp(uid), 1),
-                api_key_set=config.anthropic_api_key_set(),
-                saved=False,
-            ),
+            request, "settings.html", _settings_ctx(request, _uid(request), False)
         )
 
     @app.post("/settings", response_class=HTMLResponse)
@@ -524,16 +600,19 @@ def create_app() -> FastAPI:
         request: Request,
         ftp: str = Form(""),
         zwift_id: str = Form(""),
+        zwift_id_choice: str = Form(""),
         activities_dir: str = Form(""),
         workouts_dir: str = Form(""),
         anthropic_api_key: str = Form(""),
     ):
         uid = _uid(request)
+        # A picked player folder (radio) wins over the free-text field.
+        chosen_zwift_id = (zwift_id_choice or "").strip() or zwift_id
         db.save_user_settings(
             uid,
             {
                 "ftp": ftp,
-                "zwift_id": zwift_id,
+                "zwift_id": chosen_zwift_id,
                 "activities_dir": activities_dir,
                 "workouts_dir": workouts_dir,
             },
@@ -550,15 +629,7 @@ def create_app() -> FastAPI:
         if anthropic_api_key:
             config.set_anthropic_api_key(anthropic_api_key)
         return templates.TemplateResponse(
-            request,
-            "settings.html",
-            _ctx(
-                request,
-                settings=db.get_user_settings(uid),
-                current_ftp=round(importer.current_ftp(uid), 1),
-                api_key_set=config.anthropic_api_key_set(),
-                saved=True,
-            ),
+            request, "settings.html", _settings_ctx(request, uid, True)
         )
 
     # ------------------------------------------------------- ride (BLE)

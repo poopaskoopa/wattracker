@@ -86,6 +86,60 @@ def test_update_seeds_first_entry_when_empty(user_id):
     assert db.latest_ftp(user_id)["ftp_watts"] == pytest.approx(285.0, abs=0.5)
 
 
+def test_update_cadence_is_three_weeks(user_id):
+    # >= 21 days since the last entry -> due; < 21 -> not due.
+    assert importer.FTP_UPDATE_DAYS == 21
+    now = dt.datetime(2026, 7, 1, 12, 0)
+    db.add_ftp_entry(user_id, (now - dt.timedelta(days=20)).date().isoformat(),
+                     250.0, "manual")
+    assert importer.ftp_update_due(user_id, now) is False
+    db.init_db()
+    other_now = now + dt.timedelta(days=1)  # 21 days since the entry
+    assert importer.ftp_update_due(user_id, other_now) is True
+
+
+def test_estimate_window_anchors_at_last_activity(user_id):
+    # Regression (live-data bug): the user stopped riding 33 days ago. A window
+    # anchored at wall-clock now would be nearly empty and collapse the FTP;
+    # it must instead end at the last activity, matching the dashboard series.
+    now = dt.datetime(2026, 7, 3, 12, 0)
+    _insert_activity(user_id, (now - dt.timedelta(days=33)).isoformat(),
+                     power_watts=300.0)
+    assert importer.evaluate_ftp(user_id, now) is True
+    latest = db.latest_ftp(user_id)
+    assert latest["ftp_watts"] == pytest.approx(285.0, abs=0.5)  # 300 * 0.95
+    assert latest["date"] == now.date().isoformat()
+    # current_ftp everywhere now reflects that evaluation.
+    assert importer.current_ftp(user_id, now=now) == pytest.approx(285.0, abs=0.5)
+
+
+def test_evaluate_self_heals_stale_estimated_row(user_id):
+    # A mis-recorded estimated row (the old wall-clock anchoring) is refreshed
+    # in place on the next evaluation, without waiting out the 21-day gate and
+    # without appending a second row.
+    now = dt.datetime(2026, 7, 3, 12, 0)
+    _insert_activity(user_id, (now - dt.timedelta(days=33)).isoformat(),
+                     power_watts=300.0)
+    db.add_ftp_entry(user_id, now.date().isoformat(), 160.9, "estimated")
+    assert importer.evaluate_ftp(user_id, now) is True
+    rows = db.ftp_history_list(user_id)
+    assert len(rows) == 1
+    assert rows[0]["ftp_watts"] == pytest.approx(285.0, abs=0.5)
+    assert rows[0]["source"] == "estimated"
+
+
+def test_evaluate_never_touches_recent_manual_row(user_id):
+    now = dt.datetime(2026, 7, 3, 12, 0)
+    _insert_activity(user_id, (now - dt.timedelta(days=3)).isoformat(),
+                     power_watts=300.0)
+    db.add_ftp_entry(user_id, now.date().isoformat(), 260.0, "manual")
+    assert importer.evaluate_ftp(user_id, now) is False
+    rows = db.ftp_history_list(user_id)
+    assert len(rows) == 1
+    assert rows[0]["ftp_watts"] == pytest.approx(260.0)
+    assert rows[0]["source"] == "manual"
+
+
 def test_current_ftp_precedence(user_id):
     now = dt.datetime(2026, 7, 1, 12, 0)
     _insert_activity(user_id, (now - dt.timedelta(days=3)).isoformat(), power_watts=300.0)

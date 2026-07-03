@@ -27,8 +27,40 @@ def dedup_hash(start_time: Optional[str], duration_s: int) -> str:
     return hashlib.sha1(key.encode("utf-8")).hexdigest()
 
 
-FTP_UPDATE_DAYS = 30
+FTP_UPDATE_DAYS = 21  # re-evaluate at least every 3 weeks
 FTP_ESTIMATE_WINDOW_DAYS = 42
+
+
+def _estimate_anchor(
+    activities: List[dict], now: Optional[_dt.datetime] = None
+) -> _dt.datetime:
+    """Where the trailing FTP-estimate window should END.
+
+    Anchored at the most recent activity (never later than `now`). Anchoring at
+    wall-clock time instead would empty the window after a break in training and
+    make the estimate collapse - the value must reflect the last evaluation of
+    actual riding, matching the dashboard's rolling FTP(est) series.
+    """
+    from ..timeutil import parse_naive
+
+    now = now or _dt.datetime.now()
+    last = None
+    for a in activities:
+        when = parse_naive(a.get("start_time"))
+        if when is not None and (last is None or when > last):
+            last = when
+    if last is None or last > now:
+        return now
+    return last
+
+
+def _anchored_estimate(
+    activities: List[dict], now: Optional[_dt.datetime] = None
+) -> float:
+    anchor = _estimate_anchor(activities, now)
+    return estimate_ftp(
+        activities, window_days=FTP_ESTIMATE_WINDOW_DAYS, now=anchor
+    )
 
 
 def current_ftp(
@@ -38,8 +70,9 @@ def current_ftp(
 ) -> float:
     """Resolve the current FTP for a user.
 
-    Precedence: latest ftp_history value -> user's FTP override -> fresh estimate
-    over the trailing 42 days. Falls back to a sane default if no power data.
+    Precedence: latest ftp_history value -> user's FTP override -> fresh
+    estimate over the 42 days ending at the most recent activity. Falls back to
+    a sane default if no power data.
     """
     db.init_db()
     latest = db.latest_ftp(user_id)
@@ -53,7 +86,8 @@ def current_ftp(
     streams: List = list(activities)
     if extra_power:
         streams = streams + [p for p in extra_power if p]
-    ftp = estimate_ftp(streams, window_days=FTP_ESTIMATE_WINDOW_DAYS, now=now)
+    anchor = _estimate_anchor(activities, now)
+    ftp = estimate_ftp(streams, window_days=FTP_ESTIMATE_WINDOW_DAYS, now=anchor)
     return ftp if ftp > 0 else 200.0
 
 
@@ -79,24 +113,36 @@ def ftp_update_due(user_id: int, now: Optional[_dt.datetime] = None) -> bool:
     return (now.date() - last_date).days >= FTP_UPDATE_DAYS
 
 
-def maybe_update_ftp(user_id: int, now: Optional[_dt.datetime] = None) -> bool:
-    """Append a fresh estimated FTP row for the user if a monthly update is due.
+def evaluate_ftp(user_id: int, now: Optional[_dt.datetime] = None) -> bool:
+    """Record/refresh the user's estimated FTP so history tracks evaluations.
 
-    Estimates over the trailing 42 days of the user's activities. Only appends
-    when due and when a positive estimate is available; never overwrites a manual
-    entry. Returns True if a row was appended.
+    - When an update is due (>= FTP_UPDATE_DAYS since the last row, or no
+      history), a new dated 'estimated' row is appended.
+    - Otherwise, if the LATEST row is 'estimated' but disagrees with the current
+      evaluation (e.g. it was recorded with a mis-anchored window, or new rides
+      changed the picture), its value is refreshed in place - so `current_ftp`
+      always reflects the most recent evaluation. Manual rows are never touched.
+
+    The estimate window ends at the most recent activity (see _estimate_anchor).
+    Returns True when a row was appended or refreshed.
     """
     db.init_db()
     now = now or _dt.datetime.now()
-    if not ftp_update_due(user_id, now):
-        return False
-    est = estimate_ftp(
-        db.full_activities(user_id), window_days=FTP_ESTIMATE_WINDOW_DAYS, now=now
-    )
+    est = _anchored_estimate(db.full_activities(user_id), now)
     if est <= 0:
         return False
-    db.add_ftp_entry(user_id, now.date().isoformat(), round(est, 1), "estimated")
-    return True
+    est = round(est, 1)
+    latest = db.latest_ftp(user_id)
+    if latest is None or ftp_update_due(user_id, now):
+        db.add_ftp_entry(user_id, now.date().isoformat(), est, "estimated")
+        return True
+    if latest["source"] == "estimated" and abs(float(latest["ftp_watts"]) - est) >= 0.1:
+        return db.update_estimated_ftp_entry(user_id, latest["date"], est)
+    return False
+
+
+# Backwards-compatible alias (older call sites / tests).
+maybe_update_ftp = evaluate_ftp
 
 
 def _mean(vals) -> float:
@@ -185,12 +231,14 @@ def scan_activities(user_id: int, directory: Optional[str] = None) -> Dict[str, 
         else:
             imported += 1
 
-    maybe_update_ftp(user_id)
+    evaluate_ftp(user_id)
+    completed = match_plan_completions(user_id)
 
     return {
         "found": found,
         "imported": imported,
         "skipped": skipped,
+        "completed": completed,
         "directory": directory,
     }
 
@@ -204,10 +252,98 @@ def ingest_upload(user_id: int, filename: str, content: bytes) -> Optional[int]:
         tmp.flush()
         tmp.close()
         result = ingest_file(user_id, tmp.name)
-        maybe_update_ftp(user_id)
+        evaluate_ftp(user_id)
+        match_plan_completions(user_id)
         return result
     finally:
         try:
             os.unlink(tmp.name)
         except OSError:
             pass
+
+
+# ----------------------------------------------- plan-workout completion
+# An activity completes a same-day plan workout when its duration or TSS is
+# within this relative tolerance of the prescription.
+COMPLETION_TOLERANCE = 0.30
+
+
+def _completion_score(activity: dict, workout: dict) -> Optional[float]:
+    """Match quality (lower is better), or None if outside tolerance.
+
+    Simple and defensible: same user + same date is required by the caller;
+    here the ride must be within +/-30% of the prescribed duration, or (when
+    duration is off, e.g. a ride cut short) within +/-30% of the prescribed
+    TSS. Score is the relative duration error so the closest ride wins.
+    """
+    plan_dur = float(workout.get("duration_s") or 0)
+    act_dur = float(activity.get("duration_s") or 0)
+    if plan_dur <= 0:
+        return None
+    dur_err = abs(act_dur - plan_dur) / plan_dur
+    if dur_err <= COMPLETION_TOLERANCE:
+        return dur_err
+    plan_tss = float(workout.get("tss") or 0)
+    act_tss = float(activity.get("tss") or 0)
+    if plan_tss > 0 and abs(act_tss - plan_tss) / plan_tss <= COMPLETION_TOLERANCE:
+        return COMPLETION_TOLERANCE + abs(act_tss - plan_tss) / plan_tss
+    return None
+
+
+def match_plan_completions(user_id: int, now: Optional[_dt.datetime] = None) -> int:
+    """Mark plan workouts completed by matching same-day activities.
+
+    For every not-yet-completed plan workout dated today or earlier, find the
+    user's best-matching activity on that date (each activity completes at most
+    one workout). Returns the number of workouts newly marked completed.
+    """
+    db.init_db()
+    now = now or _dt.datetime.now()
+    used = db.completed_activity_ids(user_id)
+    marked = 0
+    for workout in db.incomplete_plan_workouts_up_to(user_id, now.date().isoformat()):
+        best = None
+        best_score = None
+        for act in db.activities_on_date(user_id, workout["date"]):
+            if act["id"] in used:
+                continue
+            score = _completion_score(act, workout)
+            if score is not None and (best_score is None or score < best_score):
+                best, best_score = act, score
+        if best is not None:
+            if db.mark_plan_workout_completed(
+                user_id, workout["id"], best["id"], workout["date"]
+            ):
+                used.add(best["id"])
+                marked += 1
+    return marked
+
+
+def run_auto_scan(now: Optional[_dt.datetime] = None) -> Dict[str, int]:
+    """One pass of the daily background job, over every known user.
+
+    Imports new .fit files from each user's watch folder (their activities_dir
+    setting, defaulting to the OS Zwift Activities folder), re-evaluates FTP,
+    and matches plan-workout completions. Safe to call repeatedly (idempotent).
+    """
+    db.init_db()
+    totals = {"users": 0, "imported": 0, "completed": 0}
+    for uid in db.all_user_ids():
+        totals["users"] += 1
+        scanned = False
+        try:
+            result = scan_activities(uid)  # also evaluates FTP + matches
+            totals["imported"] += int(result.get("imported", 0))
+            totals["completed"] += int(result.get("completed", 0))
+            d = result.get("directory")
+            scanned = bool(d) and os.path.isdir(d)
+        except Exception:
+            pass  # a broken folder for one user must not stop the sweep
+        if not scanned:
+            # Watch folder missing: still re-evaluate FTP + match completions.
+            try:
+                evaluate_ftp(uid, now)
+                totals["completed"] += match_plan_completions(uid, now)
+            except Exception:
+                pass
+    return totals

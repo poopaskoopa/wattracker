@@ -82,6 +82,15 @@ def anthropic_api_key_set() -> bool:
     return bool(load_config().anthropic_api_key)
 
 
+def auto_scan_enabled() -> bool:
+    """Whether the background daily activity scan runs (TRANALYZER_AUTO_SCAN).
+
+    Defaults to on; set TRANALYZER_AUTO_SCAN=0 to disable (used by the tests to
+    keep the suite deterministic).
+    """
+    return os.environ.get("TRANALYZER_AUTO_SCAN", "1") not in ("0", "false", "no")
+
+
 def session_secret() -> str:
     """Return the signed-cookie session secret, generating + persisting once.
 

@@ -56,6 +56,71 @@ def activities_dir(override: Optional[str] = None) -> str:
     return candidate_activities_dirs()[0]
 
 
+def zwift_workouts_root() -> str:
+    """The Zwift Workouts root that contains per-player-ID subfolders.
+
+    Overridable via TRANALYZER_ZWIFT_WORKOUTS_ROOT (tests point it at a temp
+    dir so player-folder detection never touches the real Zwift install).
+    """
+    override = os.environ.get("TRANALYZER_ZWIFT_WORKOUTS_ROOT")
+    if override:
+        return override
+    return os.path.join(_documents_zwift(), "Workouts")
+
+
+def candidate_zwift_ids(root: Optional[str] = None) -> List[dict]:
+    """Detected Zwift player-ID folders under Documents/Zwift/Workouts.
+
+    Zwift only reads custom workouts from Workouts/<numeric player id>/, so
+    candidates are the positive-numeric subfolders, most recently used first
+    (folder mtime). Each entry: {"zwift_id", "path", "mtime"}.
+    """
+    root = root or zwift_workouts_root()
+    out: List[dict] = []
+    if not os.path.isdir(root):
+        return out
+    for name in os.listdir(root):
+        p = os.path.join(root, name)
+        if not os.path.isdir(p):
+            continue
+        if not name.isdigit():  # excludes 'Downloaded', junk like '-16807'
+            continue
+        try:
+            mtime = os.path.getmtime(p)
+        except OSError:
+            mtime = 0.0
+        out.append({"zwift_id": name, "path": p, "mtime": mtime})
+    out.sort(key=lambda d: d["mtime"], reverse=True)
+    return out
+
+
+def resolve_export_dir(
+    zwift_id: Optional[str] = None, override: Optional[str] = None
+) -> "tuple[Optional[str], str]":
+    """Resolve where plan .zwo files should be exported, without guessing.
+
+    Returns (directory, reason). Reasons:
+      - 'override'  : the user's workouts_dir setting
+      - 'zwift_id'  : Workouts/<their zwift_id> exists on disk
+      - 'detected'  : exactly one player-ID folder exists, use it
+      - 'choose'    : several candidates - the user must pick in Settings
+      - 'missing'   : no Zwift Workouts folders found at all
+    Directory is None for 'choose'/'missing'.
+    """
+    if override:
+        return override, "override"
+    if zwift_id:
+        d = os.path.join(zwift_workouts_root(), str(zwift_id))
+        if os.path.isdir(d):
+            return d, "zwift_id"
+    candidates = candidate_zwift_ids()
+    if len(candidates) == 1:
+        return candidates[0]["path"], "detected"
+    if candidates:
+        return None, "choose"
+    return None, "missing"
+
+
 def workouts_dir(zwift_id: Optional[str] = None, override: Optional[str] = None) -> str:
     """Resolve the Zwift Workouts directory for a given ZwiftID.
 

@@ -127,6 +127,19 @@
     {% if plan %}
     <section class="plan-result">
         <h3>{{ plan.name }}</h3>
+        {% if plan.auto_export %}
+        <p class="ok">Auto-exported {{ plan.auto_export.count }} .zwo file(s) to
+           <code>{{ plan.auto_export.directory }}</code> &mdash; they appear under
+           Custom Workouts in Zwift.</p>
+        {% elif plan.auto_export_reason == 'choose' %}
+        <p class="alert">Not exported to Zwift yet: several Zwift player folders
+           exist on this computer. Pick yours in <a href="/settings">Settings</a>,
+           then press &ldquo;Export plan to Zwift&rdquo; below.</p>
+        {% elif plan.auto_export_reason == 'missing' %}
+        <p class="hint">No Zwift Workouts folder found on this computer &mdash; set
+           a workouts folder in <a href="/settings">Settings</a> or use
+           &ldquo;Download .zip&rdquo;.</p>
+        {% endif %}
         <p><strong>{{ plan.weeks }}</strong> weeks &middot;
            starts <strong>{{ plan.start_date }}</strong> &middot;
            <strong>{{ plan.count }}</strong> workouts &middot;

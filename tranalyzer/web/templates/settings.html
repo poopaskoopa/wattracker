@@ -7,7 +7,8 @@
 
 <p class="current-ftp"><strong>Current FTP:</strong> {{ current_ftp }} W</p>
 <p class="hint">Setting FTP below records a manual entry for today. The app also
-   auto-estimates FTP monthly from your best 20-minute efforts.</p>
+   re-estimates FTP at least every 3 weeks (and after each import) from your
+   best 20-minute efforts.</p>
 
 <form method="post" action="/settings" class="settings-form">
     <label>FTP (watts, overrides estimate):
@@ -18,7 +19,21 @@
         <input type="text" name="zwift_id"
                value="{{ settings.zwift_id or '' }}">
     </label>
-    <label>Activities folder (override):
+    {% if zwift_candidates %}
+    <fieldset class="zwift-picker">
+        <legend>Zwift player folders detected on this computer &mdash; pick yours
+            so plan exports land where Zwift reads custom workouts</legend>
+        {% for c in zwift_candidates %}
+        <label class="zwift-candidate">
+            <input type="radio" name="zwift_id_choice" value="{{ c.zwift_id }}"
+                {{ 'checked' if settings.zwift_id == c.zwift_id else '' }}>
+            {{ c.zwift_id }} <span class="hint">({{ c.path }})</span>
+        </label>
+        {% endfor %}
+    </fieldset>
+    {% endif %}
+    <label>Activities watch folder (scanned daily for new rides;
+        default <code>{{ watch_default }}</code>):
         <input type="text" name="activities_dir"
                value="{{ settings.activities_dir or '' }}">
     </label>

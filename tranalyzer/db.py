@@ -1,8 +1,9 @@
 """SQLite storage (stdlib only) with per-user isolation.
 
 Everything a user owns - activities, streams, ftp_history, settings - is scoped
-by ``user_id``. Schema changes bump ``SCHEMA_VERSION``; a version mismatch
-triggers a clean drop/recreate (safe for dev - there is no production data).
+by ``user_id``. Schema changes bump ``SCHEMA_VERSION``. Versions with an entry
+in ``_MIGRATIONS`` are upgraded in place (no data loss); anything without a
+migration chain falls back to a clean drop/recreate.
 """
 from __future__ import annotations
 
@@ -14,7 +15,16 @@ from typing import Dict, List, Optional
 
 from .config import db_path
 
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
+
+# In-place migrations: version N -> N+1 statement lists. A database whose
+# version has an unbroken chain here is upgraded without losing live data.
+_MIGRATIONS: Dict[int, List[str]] = {
+    3: [
+        "ALTER TABLE plan_workouts ADD COLUMN completed_activity_id INTEGER",
+        "ALTER TABLE plan_workouts ADD COLUMN completed_date TEXT",
+    ],
+}
 
 _DROP = """
 DROP TABLE IF EXISTS plan_workouts;
@@ -91,6 +101,8 @@ CREATE TABLE IF NOT EXISTS plan_workouts (
     duration_s        INTEGER NOT NULL,
     tss               REAL NOT NULL,
     zwo_or_segments   TEXT NOT NULL,
+    completed_activity_id INTEGER,
+    completed_date    TEXT,
     FOREIGN KEY(plan_id) REFERENCES plans(id),
     FOREIGN KEY(user_id) REFERENCES users(id)
 );
@@ -105,17 +117,38 @@ def connect(path: Optional[str] = None) -> sqlite3.Connection:
     return conn
 
 
+def _can_migrate(version: int) -> bool:
+    """True when an unbroken migration chain leads from `version` to current."""
+    v = version
+    while v < SCHEMA_VERSION:
+        if v not in _MIGRATIONS:
+            return False
+        v += 1
+    return v == SCHEMA_VERSION
+
+
 def init_db(path: Optional[str] = None) -> None:
-    """Create the schema, recreating cleanly if the schema version changed."""
+    """Create/upgrade the schema.
+
+    - Current version: idempotent CREATE IF NOT EXISTS.
+    - Older version with a migration chain: upgraded in place (data preserved).
+    - Anything else (fresh db, unknown/newer version): clean drop/recreate.
+    """
     conn = connect(path)
     try:
         version = conn.execute("PRAGMA user_version").fetchone()[0]
-        if version != SCHEMA_VERSION:
+        if version == SCHEMA_VERSION:
+            conn.executescript(_SCHEMA)  # idempotent CREATE IF NOT EXISTS
+        elif 0 < version < SCHEMA_VERSION and _can_migrate(version):
+            for v in range(version, SCHEMA_VERSION):
+                for stmt in _MIGRATIONS[v]:
+                    conn.execute(stmt)
+            conn.executescript(_SCHEMA)  # new tables/indexes, if any
+            conn.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
+        else:
             conn.executescript(_DROP)
             conn.executescript(_SCHEMA)
             conn.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
-        else:
-            conn.executescript(_SCHEMA)  # idempotent CREATE IF NOT EXISTS
         conn.commit()
     finally:
         conn.close()
@@ -401,6 +434,23 @@ def add_ftp_entry(
         conn.close()
 
 
+def update_estimated_ftp_entry(
+    user_id: int, date: str, ftp_watts: float, path: Optional[str] = None
+) -> bool:
+    """Refresh the value of an existing *estimated* row (never touches manual)."""
+    conn = connect(path)
+    try:
+        cur = conn.execute(
+            "UPDATE ftp_history SET ftp_watts = ? "
+            "WHERE user_id = ? AND date = ? AND source = 'estimated'",
+            (float(ftp_watts), user_id, date),
+        )
+        conn.commit()
+        return cur.rowcount > 0
+    finally:
+        conn.close()
+
+
 def latest_ftp(user_id: int, path: Optional[str] = None) -> Optional[dict]:
     conn = connect(path)
     try:
@@ -512,6 +562,8 @@ def _plan_workout_row(r: sqlite3.Row, include_zwo: bool = False) -> dict:
         "type": r["type"],
         "duration_s": r["duration_s"],
         "tss": r["tss"],
+        "completed_activity_id": r["completed_activity_id"],
+        "completed_date": r["completed_date"],
     }
     if include_zwo:
         d["zwo_or_segments"] = r["zwo_or_segments"]
@@ -559,5 +611,90 @@ def get_plan_workout(
             (user_id, workout_id),
         ).fetchone()
         return _plan_workout_row(row, include_zwo=True) if row else None
+    finally:
+        conn.close()
+
+
+# ------------------------------------------------- workout completion state
+def incomplete_plan_workouts_up_to(
+    user_id: int, date_iso: str, path: Optional[str] = None
+) -> List[dict]:
+    """Not-yet-completed plan workouts dated on or before `date_iso`."""
+    conn = connect(path)
+    try:
+        rows = conn.execute(
+            "SELECT * FROM plan_workouts WHERE user_id = ? AND date <= ? "
+            "AND completed_activity_id IS NULL ORDER BY date ASC",
+            (user_id, date_iso),
+        ).fetchall()
+        return [_plan_workout_row(r) for r in rows]
+    finally:
+        conn.close()
+
+
+def completed_activity_ids(user_id: int, path: Optional[str] = None) -> set:
+    """Activity ids already linked to a completed plan workout."""
+    conn = connect(path)
+    try:
+        rows = conn.execute(
+            "SELECT completed_activity_id FROM plan_workouts "
+            "WHERE user_id = ? AND completed_activity_id IS NOT NULL",
+            (user_id,),
+        ).fetchall()
+        return {r[0] for r in rows}
+    finally:
+        conn.close()
+
+
+def mark_plan_workout_completed(
+    user_id: int,
+    workout_id: int,
+    activity_id: int,
+    completed_date: str,
+    path: Optional[str] = None,
+) -> bool:
+    conn = connect(path)
+    try:
+        cur = conn.execute(
+            "UPDATE plan_workouts SET completed_activity_id = ?, completed_date = ? "
+            "WHERE user_id = ? AND id = ? AND completed_activity_id IS NULL",
+            (activity_id, completed_date, user_id, workout_id),
+        )
+        conn.commit()
+        return cur.rowcount > 0
+    finally:
+        conn.close()
+
+
+def activities_on_date(
+    user_id: int, date_iso: str, path: Optional[str] = None
+) -> List[dict]:
+    """Activity summaries whose start_time falls on the given date."""
+    conn = connect(path)
+    try:
+        rows = conn.execute(
+            "SELECT * FROM activities WHERE user_id = ? AND start_time LIKE ? "
+            "ORDER BY start_time ASC",
+            (user_id, date_iso + "%"),
+        ).fetchall()
+        return [_row_summary(r) for r in rows]
+    finally:
+        conn.close()
+
+
+def all_user_ids(path: Optional[str] = None) -> List[int]:
+    """Every known user id (union of users, settings and activity owners).
+
+    The union is defensive: per-user rows can outlive a users row, and the
+    background scanner must still serve those accounts.
+    """
+    conn = connect(path)
+    try:
+        rows = conn.execute(
+            "SELECT id FROM users "
+            "UNION SELECT user_id FROM user_settings "
+            "UNION SELECT DISTINCT user_id FROM activities"
+        ).fetchall()
+        return sorted(r[0] for r in rows)
     finally:
         conn.close()

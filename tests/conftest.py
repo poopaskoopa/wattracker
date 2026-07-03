@@ -13,6 +13,13 @@ def isolated_env(tmp_path, monkeypatch):
     monkeypatch.setenv("TRANALYZER_DB", str(tmp_path / "test.db"))
     # Ensure no ambient config leaks in.
     monkeypatch.setenv("TRANALYZER_SECRET", "test-secret-key")
+    # Keep the suite deterministic: no background scan task, and Zwift
+    # player-folder detection looks at an isolated (empty) root, never the
+    # machine's real Zwift install.
+    monkeypatch.setenv("TRANALYZER_AUTO_SCAN", "0")
+    zwift_root = tmp_path / "ZwiftWorkouts"
+    zwift_root.mkdir()
+    monkeypatch.setenv("TRANALYZER_ZWIFT_WORKOUTS_ROOT", str(zwift_root))
     for key in (
         "TRANALYZER_FTP",
         "TRANALYZER_ZWIFT_ID",

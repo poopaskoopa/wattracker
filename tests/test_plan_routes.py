@@ -194,6 +194,19 @@ def test_calendar_workouts_are_clickable(client):
     assert "workoutModal" in r.text
 
 
+def test_calendar_shows_completion_checkmark(client):
+    _register(client)
+    client.post("/generate/plan", data=PLAN_FORM)
+    uid = db.get_user_by_username("rider")["id"]
+    plan_id = db.list_plans(uid)[0]["id"]
+    w = db.plan_workouts_for_plan(uid, plan_id)[0]
+    assert db.mark_plan_workout_completed(uid, w["id"], 1234, w["date"]) is True
+    y, m = w["date"][:4], int(w["date"][5:7])
+    r = client.get(f"/calendar?year={y}&month={m}")
+    assert "cal-completed" in r.text
+    assert "cal-check" in r.text
+
+
 def test_calendar_isolated_between_users(client):
     _register(client, "alice")
     client.post("/generate/plan", data=PLAN_FORM)
