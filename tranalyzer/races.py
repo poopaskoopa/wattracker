@@ -9,11 +9,14 @@ API for Zwift race results:
     allowed" (API key / origin gated)
   - zwift-ranking.herokuapp.com                 -> app gone (404)
 
-The remote fetch below still TRIES ZwiftPower first (cheap, and it degrades
-gracefully if Zwift ever re-opens the endpoint), but the reliable source is
-the documented fallback: races are derived from the user's imported FIT rides
-with a simple heuristic (sustained intensity factor >= RACE_IF_MIN over a
-15 min - 3 h ride). The UI labels the source explicitly.
+Since every user of this app has a Zwift login, the PRIMARY source is an
+authenticated ZwiftPower fetch using the user's own saved credentials (see
+``zwiftauth``: Zwift SSO password grant + the ZwiftPower SSO cookie dance),
+which unlocks the same cache3 JSON endpoints with real placements/categories.
+Fallbacks, in order: anonymous cache3 fetch (dead today, self-healing), then
+races derived from the user's imported FIT rides with a simple heuristic
+(sustained intensity factor >= RACE_IF_MIN over a 15 min - 3 h ride). The UI
+labels the active source explicitly, including "login failed".
 
 Power-per-period durations are fixed by spec: 1s/5s/10s/30s/1m/2m/5m/10m/
 20m/40m/60m.
@@ -68,13 +71,18 @@ def _http_get_json(url: str, timeout: float = _TIMEOUT_S) -> dict:
 
 
 def fetch_zwiftpower_results(rider_id: str) -> List[dict]:
-    """Fetch race results from ZwiftPower's cached profile JSON.
+    """Fetch race results from ZwiftPower's cached profile JSON, anonymously.
 
     NOTE: gated behind a login cookie as of 2026-07 (403 MissingKey), so this
-    normally raises RaceSourceUnavailable; kept because it needs no scraping
-    and self-heals if the endpoint opens up again.
+    normally raises RaceSourceUnavailable; kept as a last resort for users
+    without saved credentials (self-heals if the endpoint opens up again).
     """
     doc = _http_get_json(ZWIFTPOWER_PROFILE_URL.format(rider_id=rider_id))
+    return parse_zwiftpower_profile(doc)
+
+
+def parse_zwiftpower_profile(doc: dict) -> List[dict]:
+    """Normalize a ZwiftPower profile JSON document into result rows."""
     rows = doc.get("data") or []
     out: List[dict] = []
     fetched = _dt.datetime.now().isoformat(timespec="seconds")
@@ -171,28 +179,72 @@ def compute_bests(user_id: int) -> Dict[str, int]:
     return bests
 
 
-def refresh_race_results(user_id: int, rider_id: Optional[str] = None) -> Dict:
-    """Refresh the user's cached race results (remote first, local fallback).
+def refresh_race_results(
+    user_id: int,
+    rider_id: Optional[str] = None,
+    respect_backoff: bool = False,
+) -> Dict:
+    """Refresh the user's cached race results.
+
+    Source order:
+      1. Authenticated ZwiftPower fetch (real results, incl. placement and
+         category) when the user has Zwift credentials saved - a single auth
+         attempt per refresh; when the credentials were rejected on a previous
+         attempt and ``respect_backoff`` is set (the daily sweep), the attempt
+         is skipped until the user refreshes manually or re-saves credentials,
+         so retry storms can never lock the Zwift account.
+      2. Anonymous ZwiftPower fetch (no credentials + numeric rider id; gated
+         by Zwift's login wall as of 2026-07, kept as a self-healing fallback).
+      3. Local FIT-derived race efforts.
 
     Stores results + sync metadata in the DB and returns a summary dict:
-    {source, count, error (remote failure reason or None)}.
+    {source, count, error (remote failure reason or None), auth_failed}.
     """
+    from . import credstore, zwiftauth  # local import: keeps db-only callers light
+
     db.init_db()
     if rider_id is None:
         rider_id = (db.get_user_settings(user_id).get("zwift_id") or "").strip()
     rider_id = (rider_id or "").strip()
 
     remote_error: Optional[str] = None
+    auth_failed = False
     results: List[dict] = []
     source = "local"
-    if rider_id.isdigit():
+    creds = credstore.get_zwift_credentials(user_id)
+
+    if creds is not None:
+        prev = db.get_race_sync(user_id)
+        if respect_backoff and prev and prev.get("auth_failed"):
+            remote_error = (
+                "Zwift login previously failed - automatic fetching is paused "
+                "until you re-save credentials or refresh manually"
+            )
+            auth_failed = True
+        else:
+            try:
+                doc, detected_id = zwiftauth.fetch_results_authenticated(
+                    creds.email, creds.password,
+                    rider_id if rider_id.isdigit() else None,
+                )
+                results = parse_zwiftpower_profile(doc)
+                source = "zwiftpower"
+                if detected_id and detected_id != rider_id:
+                    # Auto-detected from the Zwift profile: persist it.
+                    rider_id = detected_id
+                    db.save_user_settings(user_id, {"zwift_id": detected_id})
+            except zwiftauth.ZwiftAuthError as e:
+                remote_error = str(e)
+                auth_failed = bool(getattr(e, "credential_problem", False))
+    elif rider_id.isdigit():
         try:
             results = fetch_zwiftpower_results(rider_id)
             source = "zwiftpower"
         except RaceSourceUnavailable as e:
             remote_error = str(e)
     else:
-        remote_error = "no numeric Zwift rider ID configured"
+        remote_error = ("no numeric Zwift rider ID configured and no Zwift "
+                        "credentials saved")
 
     if source != "zwiftpower":
         results = derive_local_results(user_id)
@@ -213,9 +265,10 @@ def refresh_race_results(user_id: int, rider_id: Optional[str] = None) -> Dict:
     count = db.replace_race_results(user_id, source, results)
     db.save_race_sync(
         user_id, rider_id or None, source, remote_error,
-        bests=compute_bests(user_id),
+        bests=compute_bests(user_id), auth_failed=auth_failed,
     )
-    return {"source": source, "count": count, "error": remote_error}
+    return {"source": source, "count": count, "error": remote_error,
+            "auth_failed": auth_failed}
 
 
 def race_page_data(user_id: int) -> Dict:

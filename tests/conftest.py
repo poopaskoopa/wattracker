@@ -20,6 +20,9 @@ def isolated_env(tmp_path, monkeypatch):
     zwift_root = tmp_path / "ZwiftWorkouts"
     zwift_root.mkdir()
     monkeypatch.setenv("TRANALYZER_ZWIFT_WORKOUTS_ROOT", str(zwift_root))
+    # Credential storage: force the encrypted file-key backend so tests never
+    # touch the developer's real macOS Keychain.
+    monkeypatch.setenv("TRANALYZER_KEYRING", "0")
     for key in (
         "TRANALYZER_FTP",
         "TRANALYZER_ZWIFT_ID",

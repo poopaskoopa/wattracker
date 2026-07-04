@@ -15,7 +15,7 @@ from typing import Dict, List, Optional
 
 from .config import db_path
 
-SCHEMA_VERSION = 5
+SCHEMA_VERSION = 6
 
 # In-place migrations: version N -> N+1 statement lists. A database whose
 # version has an unbroken chain here is upgraded without losing live data.
@@ -28,6 +28,11 @@ _MIGRATIONS: Dict[int, List[str]] = {
     4: [
         "ALTER TABLE plan_workouts ADD COLUMN adapted TEXT",
         "ALTER TABLE plan_workouts ADD COLUMN adapted_at TEXT",
+    ],
+    5: [
+        "ALTER TABLE user_settings ADD COLUMN zwift_email TEXT",
+        "ALTER TABLE user_settings ADD COLUMN zwift_password_enc TEXT",
+        "ALTER TABLE race_sync ADD COLUMN auth_failed INTEGER NOT NULL DEFAULT 0",
     ],
 }
 
@@ -51,11 +56,13 @@ CREATE TABLE IF NOT EXISTS users (
 );
 
 CREATE TABLE IF NOT EXISTS user_settings (
-    user_id        INTEGER PRIMARY KEY,
-    ftp            REAL,
-    zwift_id       TEXT,
-    activities_dir TEXT,
-    workouts_dir   TEXT,
+    user_id            INTEGER PRIMARY KEY,
+    ftp                REAL,
+    zwift_id           TEXT,
+    activities_dir     TEXT,
+    workouts_dir       TEXT,
+    zwift_email        TEXT,
+    zwift_password_enc TEXT,
     FOREIGN KEY(user_id) REFERENCES users(id)
 );
 
@@ -146,6 +153,7 @@ CREATE TABLE IF NOT EXISTS race_sync (
     source       TEXT,
     error        TEXT,
     bests_json   TEXT,
+    auth_failed  INTEGER NOT NULL DEFAULT 0,
     FOREIGN KEY(user_id) REFERENCES users(id)
 );
 """
@@ -182,7 +190,16 @@ def init_db(path: Optional[str] = None) -> None:
         elif 0 < version < SCHEMA_VERSION and _can_migrate(version):
             for v in range(version, SCHEMA_VERSION):
                 for stmt in _MIGRATIONS[v]:
-                    conn.execute(stmt)
+                    try:
+                        conn.execute(stmt)
+                    except sqlite3.OperationalError as e:
+                        # A later migration may target a table the older
+                        # database never had (_SCHEMA below creates it in its
+                        # final shape) or a column that already exists.
+                        msg = str(e).lower()
+                        if "no such table" in msg or "duplicate column" in msg:
+                            continue
+                        raise
             conn.executescript(_SCHEMA)  # new tables/indexes, if any
             conn.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
         else:
@@ -235,14 +252,15 @@ def get_user_by_id(user_id: int, path: Optional[str] = None) -> Optional[dict]:
 
 
 # -------------------------------------------------------------- settings
-_SETTING_KEYS = ("ftp", "zwift_id", "activities_dir", "workouts_dir")
+_SETTING_KEYS = ("ftp", "zwift_id", "activities_dir", "workouts_dir",
+                 "zwift_email")
 
 
 def get_user_settings(user_id: int, path: Optional[str] = None) -> dict:
     conn = connect(path)
     try:
         row = conn.execute(
-            "SELECT ftp, zwift_id, activities_dir, workouts_dir "
+            "SELECT ftp, zwift_id, activities_dir, workouts_dir, zwift_email "
             "FROM user_settings WHERE user_id = ?",
             (user_id,),
         ).fetchone()
@@ -263,13 +281,15 @@ def save_user_settings(user_id: int, updates: dict, path: Optional[str] = None) 
     try:
         conn.execute(
             """
-            INSERT INTO user_settings (user_id, ftp, zwift_id, activities_dir, workouts_dir)
-            VALUES (?, ?, ?, ?, ?)
+            INSERT INTO user_settings
+                (user_id, ftp, zwift_id, activities_dir, workouts_dir, zwift_email)
+            VALUES (?, ?, ?, ?, ?, ?)
             ON CONFLICT(user_id) DO UPDATE SET
                 ftp=excluded.ftp,
                 zwift_id=excluded.zwift_id,
                 activities_dir=excluded.activities_dir,
-                workouts_dir=excluded.workouts_dir
+                workouts_dir=excluded.workouts_dir,
+                zwift_email=excluded.zwift_email
             """,
             (
                 user_id,
@@ -277,10 +297,48 @@ def save_user_settings(user_id: int, updates: dict, path: Optional[str] = None) 
                 current["zwift_id"],
                 current["activities_dir"],
                 current["workouts_dir"],
+                current["zwift_email"],
             ),
         )
         conn.commit()
         return current
+    finally:
+        conn.close()
+
+
+def set_zwift_credentials_row(
+    user_id: int,
+    email: Optional[str],
+    password_enc: Optional[str],
+    path: Optional[str] = None,
+) -> None:
+    """Set (or clear, with Nones) the stored Zwift email + encrypted password."""
+    save_user_settings(user_id, {}, path=path)  # ensure the row exists
+    conn = connect(path)
+    try:
+        conn.execute(
+            "UPDATE user_settings SET zwift_email = ?, zwift_password_enc = ? "
+            "WHERE user_id = ?",
+            (email, password_enc, user_id),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def get_zwift_credentials_row(
+    user_id: int, path: Optional[str] = None
+) -> "tuple[Optional[str], Optional[str]]":
+    conn = connect(path)
+    try:
+        row = conn.execute(
+            "SELECT zwift_email, zwift_password_enc FROM user_settings "
+            "WHERE user_id = ?",
+            (user_id,),
+        ).fetchone()
+        if not row:
+            return None, None
+        return row["zwift_email"], row["zwift_password_enc"]
     finally:
         conn.close()
 
@@ -848,19 +906,33 @@ def save_race_sync(
     error: Optional[str],
     bests: Optional[dict] = None,
     last_refresh: Optional[str] = None,
+    auth_failed: bool = False,
     path: Optional[str] = None,
 ) -> None:
     conn = connect(path)
     try:
         conn.execute(
             "INSERT OR REPLACE INTO race_sync "
-            "(user_id, rider_id, last_refresh, source, error, bests_json) "
-            "VALUES (?, ?, ?, ?, ?, ?)",
+            "(user_id, rider_id, last_refresh, source, error, bests_json, "
+            " auth_failed) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?)",
             (
                 user_id, rider_id,
                 last_refresh or _dt.datetime.now().isoformat(timespec="seconds"),
-                source, error, json.dumps(bests or {}),
+                source, error, json.dumps(bests or {}), int(bool(auth_failed)),
             ),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def clear_race_auth_failure(user_id: int, path: Optional[str] = None) -> None:
+    """Re-arm authenticated fetching (e.g. after new credentials are saved)."""
+    conn = connect(path)
+    try:
+        conn.execute(
+            "UPDATE race_sync SET auth_failed = 0 WHERE user_id = ?", (user_id,)
         )
         conn.commit()
     finally:

@@ -15,6 +15,7 @@ dependencies = [
     "jinja2",
     "python-multipart",
     "itsdangerous",
+    "keyring",
 ]
 
 [project.optional-dependencies]

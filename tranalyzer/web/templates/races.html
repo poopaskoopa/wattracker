@@ -23,24 +23,34 @@
 
 {% if refreshed %}
     {% if refreshed.source == 'zwiftpower' %}
-    <p class="ok">Fetched {{ refreshed.count }} result(s) from ZwiftPower.</p>
+    <p class="ok">Fetched {{ refreshed.count }} result(s) from ZwiftPower
+       using your Zwift login.</p>
     {% elif refreshed.source == 'local' %}
     <p class="ok">Derived {{ refreshed.count }} race effort(s) from your imported rides.</p>
     {% endif %}
 {% endif %}
 
+{% if sync and sync.auth_failed %}
+<p class="alert"><strong>Zwift login failed</strong> &mdash;
+   {{ sync.error or 'the credentials were rejected' }}.
+   Check your Zwift email/password in <a href="/settings">Settings</a>;
+   automatic fetching is paused until they are re-saved or you press
+   &ldquo;Refresh results&rdquo; again.</p>
+{% endif %}
+
 {% if sync %}
 <p class="hint">
     {% if sync.source == 'zwiftpower' %}
-    Source: ZwiftPower &middot; last refreshed {{ sync.last_refresh }}.
+    Source: <strong>ZwiftPower</strong> (your Zwift login) &middot;
+    last refreshed {{ sync.last_refresh }}.
     {% else %}
     Source: <strong>detected from your imported rides</strong> (sustained
-    &ge;83% FTP efforts of 15&nbsp;min&ndash;3&nbsp;h). Online race-result
-    services (ZwiftPower, zwiftracing.app) currently require a login, so no
-    event names or placings are available without one.
+    &ge;83% FTP efforts of 15&nbsp;min&ndash;3&nbsp;h) &mdash; no event names
+    or placings. For real results, save your Zwift login in
+    <a href="/settings">Settings</a> and refresh.
     Last refreshed {{ sync.last_refresh }}.
     {% endif %}
-    {% if sync.error and sync.source != 'zwiftpower' %}
+    {% if sync.error and sync.source != 'zwiftpower' and not sync.auth_failed %}
     <br>Remote source unavailable: {{ sync.error }}.
     {% endif %}
 </p>

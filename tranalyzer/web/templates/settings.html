@@ -4,6 +4,7 @@
 <h2>Settings</h2>
 
 {% if saved %}<p class="ok">Settings saved.</p>{% endif %}
+{% if cred_message %}<p class="{{ 'ok' if 'saved (' in cred_message or 'cleared' in cred_message else 'alert' }}">{{ cred_message }}</p>{% endif %}
 
 <p class="current-ftp"><strong>Current FTP:</strong> {{ current_ftp }} W</p>
 <p class="hint">Setting FTP below records a manual entry for today. The app also
@@ -41,6 +42,30 @@
         <input type="text" name="workouts_dir"
                value="{{ settings.workouts_dir or '' }}">
     </label>
+    <fieldset class="zwift-account">
+        <legend>Zwift account (for fetching your race results)</legend>
+        <p class="hint">Used only to log in to Zwift / ZwiftPower and download
+           your race results and rider ID. Credentials never leave this
+           machine except to Zwift&rsquo;s own servers.
+           {% if zwift_creds_saved %}
+           <br><strong class="ok">Credentials saved</strong>
+           (password stored in the {{ zwift_cred_backend }}).
+           Enter both fields again to replace them.
+           {% else %}
+           <br>Password is stored in the {{ zwift_cred_backend }}, never as
+           plaintext in the database.
+           {% endif %}
+        </p>
+        <label>Zwift email:
+            <input type="email" name="zwift_email"
+                   value="{{ settings.zwift_email or '' }}" autocomplete="off">
+        </label>
+        <label>Zwift password{% if zwift_creds_saved %} (saved &mdash; leave blank to keep){% endif %}:
+            <input type="password" name="zwift_password" value=""
+                   autocomplete="new-password"
+                   placeholder="{{ 'leave blank to keep' if zwift_creds_saved else '' }}">
+        </label>
+    </fieldset>
     <label>Anthropic API key (app-level, shared)
         {% if api_key_set %}(currently set){% endif %}:
         <input type="password" name="anthropic_api_key"
@@ -48,6 +73,12 @@
     </label>
     <button type="submit">Save</button>
 </form>
+
+{% if zwift_creds_saved %}
+<form method="post" action="/settings/zwift-credentials/clear" class="clear-creds-form">
+    <button type="submit" class="danger-btn">Clear Zwift credentials</button>
+</form>
+{% endif %}
 
 <p class="hint">FTP, Zwift ID, and folder paths are private to your account.
    The Anthropic API key is app-level (shared) and the app is fully functional

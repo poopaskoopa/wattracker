@@ -18,7 +18,7 @@ from fastapi.templating import Jinja2Templates
 from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.middleware.sessions import SessionMiddleware
 
-from . import auth, config, db, paths, races
+from . import auth, config, credstore, db, paths, races
 from .analysis import pipeline
 from .ble import devices as bledevices
 from .ble.runner import RideController, flatten_session
@@ -56,7 +56,7 @@ def run_daily_maintenance() -> dict:
         except Exception:
             _log.warning("plan adaptation failed for user %s", uid, exc_info=True)
         try:
-            races.refresh_race_results(uid)
+            races.refresh_race_results(uid, respect_backoff=True)
             totals["races"] += 1
         except Exception:
             _log.warning("race refresh failed for user %s", uid, exc_info=True)
@@ -613,7 +613,8 @@ def create_app() -> FastAPI:
             headers={"Content-Disposition": f'attachment; filename="{fname}.zwo"'},
         )
 
-    def _settings_ctx(request: Request, uid: int, saved: bool) -> dict:
+    def _settings_ctx(request: Request, uid: int, saved: bool,
+                      cred_message: Optional[str] = None) -> dict:
         settings = db.get_user_settings(uid)
         return _ctx(
             request,
@@ -623,6 +624,9 @@ def create_app() -> FastAPI:
             saved=saved,
             zwift_candidates=paths.candidate_zwift_ids(),
             watch_default=paths.activities_dir(),
+            zwift_creds_saved=credstore.credentials_saved(uid),
+            zwift_cred_backend=credstore.storage_backend(),
+            cred_message=cred_message,
         )
 
     @app.get("/settings", response_class=HTMLResponse)
@@ -640,6 +644,8 @@ def create_app() -> FastAPI:
         activities_dir: str = Form(""),
         workouts_dir: str = Form(""),
         anthropic_api_key: str = Form(""),
+        zwift_email: str = Form(""),
+        zwift_password: str = Form(""),
     ):
         uid = _uid(request)
         # A picked player folder (radio) wins over the free-text field.
@@ -664,8 +670,32 @@ def create_app() -> FastAPI:
         # The Anthropic API key is app-level (shared).
         if anthropic_api_key:
             config.set_anthropic_api_key(anthropic_api_key)
+        # Zwift account credentials: only saved when both fields are supplied;
+        # the password is never redisplayed. Saving re-arms authenticated
+        # race fetching after a previous login failure.
+        cred_message = None
+        if zwift_email.strip() and zwift_password:
+            backend = credstore.save_zwift_credentials(
+                uid, zwift_email, zwift_password
+            )
+            db.clear_race_auth_failure(uid)
+            cred_message = f"Zwift credentials saved ({backend})."
+        elif zwift_email.strip() or zwift_password:
+            cred_message = ("Zwift credentials NOT saved - both email and "
+                            "password are needed.")
         return templates.TemplateResponse(
-            request, "settings.html", _settings_ctx(request, uid, True)
+            request, "settings.html",
+            _settings_ctx(request, uid, True, cred_message=cred_message),
+        )
+
+    @app.post("/settings/zwift-credentials/clear", response_class=HTMLResponse)
+    def settings_clear_zwift_credentials(request: Request):
+        uid = _uid(request)
+        credstore.clear_zwift_credentials(uid)
+        return templates.TemplateResponse(
+            request, "settings.html",
+            _settings_ctx(request, uid, False,
+                          cred_message="Zwift credentials cleared."),
         )
 
     # ------------------------------------------------------------- races

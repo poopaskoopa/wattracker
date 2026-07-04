@@ -185,6 +185,12 @@ table.calendar th { text-align: center; }
 .zwift-picker legend { color: var(--muted); font-size: 0.8rem; }
 .zwift-candidate { display: flex; align-items: center; gap: 0.4rem; margin: 0.3rem 0; }
 .zwift-candidate input { width: auto; margin: 0; }
+.zwift-account { border: 1px solid #2a333d; border-radius: 6px;
+    padding: 0.5rem 0.75rem; max-width: 520px; margin: 0.6rem 0; }
+.zwift-account legend { color: var(--muted); font-size: 0.8rem; }
+.clear-creds-form { margin-top: 0.5rem; }
+.danger-btn { background: none; border: 1px solid var(--alert); color: var(--alert); }
+.danger-btn:hover { background: rgba(224, 82, 82, 0.15); filter: none; }
 
 /* Calendar workout-detail modal */
 .modal-overlay {
