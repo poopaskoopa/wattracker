@@ -137,6 +137,47 @@ table.calendar th { text-align: center; }
 .cal-endurance, .cal-recovery { background: rgba(76,175,125,0.15); border-left-color: var(--ok); }
 .cal-workout.cal-completed { opacity: 0.78; border-left-style: double; }
 .cal-check { color: var(--ok); font-weight: 700; }
+.cal-workout.cal-adapted { border-left-style: dashed; }
+.cal-adapt-mark { color: var(--accent); font-weight: 700; }
+
+/* Adaptive training status banner */
+.status-banner {
+    display: flex; align-items: flex-start; gap: 0.9rem;
+    border-radius: 10px; padding: 0.9rem 1.1rem; margin: 1rem 0;
+    border: 1px solid; border-left-width: 5px;
+}
+.status-banner .status-icon { display: inline-flex; margin-top: 0.1rem; }
+.status-banner .status-body { display: flex; flex-direction: column; gap: 0.15rem; }
+.status-banner .status-headline { font-size: 1.05rem; letter-spacing: 0.01em; }
+.status-banner .status-detail { font-size: 0.88rem; }
+.status-banner .status-detail.muted { color: var(--muted); }
+.status-banner .status-adaptation { font-size: 0.85rem; margin-top: 0.25rem;
+    color: var(--muted); }
+.status-banner .status-adaptation a { color: inherit; }
+.status-ok {
+    background: rgba(76, 175, 125, 0.12); border-color: rgba(76, 175, 125, 0.55);
+    color: #bfe8d2;
+}
+.status-ok .status-icon, .status-ok .status-headline { color: var(--ok); }
+.status-warn {
+    background: rgba(242, 169, 0, 0.10); border-color: rgba(242, 169, 0, 0.55);
+    color: #f3ddae;
+}
+.status-warn .status-icon, .status-warn .status-headline { color: var(--accent); }
+.status-danger {
+    background: rgba(224, 82, 82, 0.12); border-color: rgba(224, 82, 82, 0.6);
+    color: #f0c4c4;
+}
+.status-danger .status-icon, .status-danger .status-headline { color: var(--alert); }
+
+/* Races */
+.races-form { display: flex; align-items: flex-end; gap: 0.75rem; flex-wrap: wrap; }
+.races-form label { margin: 0; }
+.races-form input { display: block; margin-top: 0.25rem; width: 220px; }
+.power-table-wrap { overflow-x: auto; }
+.power-table th, .power-table td { text-align: right; white-space: nowrap; }
+.power-table th:first-child, .power-table td:first-child { text-align: left; }
+.power-table .bests-row td { border-top: 2px solid var(--accent); }
 
 /* Settings: Zwift player-folder picker */
 .zwift-picker { border: 1px solid #2a333d; border-radius: 6px; padding: 0.5rem 0.75rem;

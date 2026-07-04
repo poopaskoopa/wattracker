@@ -1,0 +1,102 @@
+{% extends "base.html" %}
+{% block title %}Races &mdash; TRanalyzer{% endblock %}
+{% block content %}
+<h2>Race Results</h2>
+
+<form method="post" action="/races/refresh" class="races-form">
+    <label>Zwift rider ID:
+        <input type="text" name="rider_id" inputmode="numeric" pattern="[0-9]*"
+               value="{{ rider_id }}" placeholder="e.g. 1234567">
+    </label>
+    <button type="submit">Refresh results</button>
+</form>
+<p class="hint">Your Zwift rider ID is the <strong>numeric player ID</strong>:
+   the number in your ZwiftPower profile URL
+   (<code>zwiftpower.com/profile.php?z=<strong>XXXXXX</strong></code>) &mdash;
+   which is also the numeric folder name under
+   <code>~/Documents/Zwift/Workouts/</code>.
+   {% if saved_zwift_id and not rider_id %}
+   (Your saved Zwift ID &ldquo;{{ saved_zwift_id }}&rdquo; is not numeric, so it
+   can&rsquo;t be used here.)
+   {% endif %}
+</p>
+
+{% if refreshed %}
+    {% if refreshed.source == 'zwiftpower' %}
+    <p class="ok">Fetched {{ refreshed.count }} result(s) from ZwiftPower.</p>
+    {% elif refreshed.source == 'local' %}
+    <p class="ok">Derived {{ refreshed.count }} race effort(s) from your imported rides.</p>
+    {% endif %}
+{% endif %}
+
+{% if sync %}
+<p class="hint">
+    {% if sync.source == 'zwiftpower' %}
+    Source: ZwiftPower &middot; last refreshed {{ sync.last_refresh }}.
+    {% else %}
+    Source: <strong>detected from your imported rides</strong> (sustained
+    &ge;83% FTP efforts of 15&nbsp;min&ndash;3&nbsp;h). Online race-result
+    services (ZwiftPower, zwiftracing.app) currently require a login, so no
+    event names or placings are available without one.
+    Last refreshed {{ sync.last_refresh }}.
+    {% endif %}
+    {% if sync.error and sync.source != 'zwiftpower' %}
+    <br>Remote source unavailable: {{ sync.error }}.
+    {% endif %}
+</p>
+{% endif %}
+
+{% if results %}
+<table>
+    <thead><tr><th>Date</th><th>Event</th><th>Place</th><th>Cat</th>
+        <th>Duration</th><th>Avg&nbsp;W</th><th>NP</th><th>IF</th></tr></thead>
+    <tbody>
+    {% for r in results %}
+        <tr>
+            <td>{{ r.event_date }}</td>
+            <td>{{ r.event_title }}</td>
+            <td>{{ r.position or '—' }}</td>
+            <td>{{ r.category or '—' }}</td>
+            <td>{{ (r.duration_s // 60) ~ ' min' if r.duration_s else '—' }}</td>
+            <td>{{ r.avg_power|round(0)|int if r.avg_power else '—' }}</td>
+            <td>{{ r.np|round(0)|int if r.np else '—' }}</td>
+            <td>{{ r.if_|round(2) if r.if_ else '—' }}</td>
+        </tr>
+    {% endfor %}
+    </tbody>
+</table>
+
+<h3>Average power per period (W)</h3>
+<div class="power-table-wrap">
+<table class="power-table">
+    <thead>
+        <tr><th>Race</th>{% for l in duration_labels %}<th>{{ l }}</th>{% endfor %}</tr>
+    </thead>
+    <tbody>
+    {% for r in results %}
+        {% if r.power %}
+        <tr>
+            <td>{{ r.event_date }} &mdash; {{ r.event_title }}</td>
+            {% for d in durations %}
+            <td>{{ r.power.get(d, '—') }}</td>
+            {% endfor %}
+        </tr>
+        {% endif %}
+    {% endfor %}
+    {% if bests %}
+        <tr class="bests-row">
+            <td><strong>All-time bests</strong> (all imported rides)</td>
+            {% for d in durations %}
+            <td><strong>{{ bests.get(d, '—') }}</strong></td>
+            {% endfor %}
+        </tr>
+    {% endif %}
+    </tbody>
+</table>
+</div>
+{% else %}
+<p class="hint">No race results yet. Enter your rider ID and press
+   &ldquo;Refresh results&rdquo; &mdash; or import rides on the
+   <a href="/activities">Activities</a> page so race efforts can be detected.</p>
+{% endif %}
+{% endblock %}

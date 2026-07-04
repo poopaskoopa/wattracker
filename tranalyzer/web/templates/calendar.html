@@ -31,11 +31,11 @@
             <td class="cal-cell {{ 'other-month' if not cell.in_month else '' }}">
                 <div class="cal-day">{{ cell.day }}</div>
                 {% for w in cell.workouts %}
-                    <div class="cal-workout cal-{{ w.type }}{{ ' cal-completed' if w.completed_activity_id else '' }}"
+                    <div class="cal-workout cal-{{ w.type }}{{ ' cal-completed' if w.completed_activity_id else '' }}{{ ' cal-adapted' if w.adapted else '' }}"
                          data-workout-id="{{ w.id }}"
                          role="button" tabindex="0"
-                         title="{{ w.name }} — {{ (w.duration_s // 60) }} min, {{ w.tss }} TSS.{{ ' Completed.' if w.completed_activity_id else '' }} Click for power details.">
-                        {% if w.completed_activity_id %}<span class="cal-check" aria-label="completed">&#10003;</span> {% endif %}{{ w.name }}<span class="cal-type">{{ w.type }}</span>
+                         title="{{ w.name }} — {{ (w.duration_s // 60) }} min, {{ w.tss }} TSS.{{ ' Completed.' if w.completed_activity_id else '' }}{{ ' Adapted (' ~ w.adapted ~ ').' if w.adapted else '' }} Click for power details.">
+                        {% if w.completed_activity_id %}<span class="cal-check" aria-label="completed">&#10003;</span> {% endif %}{% if w.adapted %}<span class="cal-adapt-mark" aria-label="adapted ({{ w.adapted }})">&#8635;</span> {% endif %}{{ w.name }}<span class="cal-type">{{ w.type }}</span>
                     </div>
                 {% endfor %}
             </td>
@@ -187,7 +187,8 @@
         $("wmTitle").textContent = detail.name;
         $("wmMeta").textContent =
             detail.date + " · " + detail.type + " · " + fmtDur(detail.duration_s) +
-            " · est. TSS " + detail.tss + " · targets at FTP " + detail.ftp + " W";
+            " · est. TSS " + detail.tss + " · targets at FTP " + detail.ftp + " W" +
+            (detail.adapted ? " · adapted (" + detail.adapted + ")" : "");
         $("wmDesc").textContent = detail.description || "";
         $("wmError").hidden = true;
 

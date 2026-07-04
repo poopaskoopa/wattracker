@@ -22,16 +22,38 @@
         <span class="label">Decoupling</span><span class="value">{{ state.decoupling if state.decoupling is not none else '&mdash;'|safe }}%</span></div>
 </section>
 
-{% if state.alerts %}
-<section class="alerts">
-    <h3>Alerts</h3>
-    <ul>
-    {% for a in state.alerts %}<li class="alert">{{ a }}</li>{% endfor %}
-    </ul>
+<section class="status-banner status-{{ banner.level }}" role="status">
+    <span class="status-icon" aria-hidden="true">
+        {% if banner.level == 'ok' %}
+        <svg viewBox="0 0 24 24" width="30" height="30" fill="none" stroke="currentColor"
+             stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round">
+            <circle cx="12" cy="12" r="10"></circle><path d="M8 12.5l2.6 2.6L16 9.5"></path>
+        </svg>
+        {% elif banner.level == 'warn' %}
+        <svg viewBox="0 0 24 24" width="30" height="30" fill="none" stroke="currentColor"
+             stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round">
+            <path d="M3 15l5-5 4 4 7-8"></path><path d="M15 6h4v4"></path>
+        </svg>
+        {% else %}
+        <svg viewBox="0 0 24 24" width="30" height="30" fill="none" stroke="currentColor"
+             stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round">
+            <path d="M12 3L2 20h20L12 3z"></path><line x1="12" y1="10" x2="12" y2="14.5"></line>
+            <line x1="12" y1="17" x2="12" y2="17.01"></line>
+        </svg>
+        {% endif %}
+    </span>
+    <span class="status-body">
+        <strong class="status-headline">{{ banner.headline }}</strong>
+        <span class="status-detail">{{ banner.detail }}</span>
+        {% if banner.alerts|length > 1 %}
+        <span class="status-detail muted">{{ banner.alerts[1:]|join(' · ') }}</span>
+        {% endif %}
+        {% if banner.adaptation %}
+        <span class="status-adaptation">Plan adapted: {{ banner.adaptation }} &mdash;
+            marked on the <a href="/calendar">calendar</a>.</span>
+        {% endif %}
+    </span>
 </section>
-{% else %}
-<p class="ok">No plateau or overreach detected. Keep training.</p>
-{% endif %}
 
 <section class="chart-block">
     <div class="chart-head">

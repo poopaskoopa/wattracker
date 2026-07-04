@@ -15,18 +15,25 @@ from typing import Dict, List, Optional
 
 from .config import db_path
 
-SCHEMA_VERSION = 4
+SCHEMA_VERSION = 5
 
 # In-place migrations: version N -> N+1 statement lists. A database whose
 # version has an unbroken chain here is upgraded without losing live data.
+# (Brand-new tables need no entry: init_db runs _SCHEMA after migrating.)
 _MIGRATIONS: Dict[int, List[str]] = {
     3: [
         "ALTER TABLE plan_workouts ADD COLUMN completed_activity_id INTEGER",
         "ALTER TABLE plan_workouts ADD COLUMN completed_date TEXT",
     ],
+    4: [
+        "ALTER TABLE plan_workouts ADD COLUMN adapted TEXT",
+        "ALTER TABLE plan_workouts ADD COLUMN adapted_at TEXT",
+    ],
 }
 
 _DROP = """
+DROP TABLE IF EXISTS race_sync;
+DROP TABLE IF EXISTS race_results;
 DROP TABLE IF EXISTS plan_workouts;
 DROP TABLE IF EXISTS plans;
 DROP TABLE IF EXISTS activities;
@@ -103,11 +110,44 @@ CREATE TABLE IF NOT EXISTS plan_workouts (
     zwo_or_segments   TEXT NOT NULL,
     completed_activity_id INTEGER,
     completed_date    TEXT,
+    adapted           TEXT,
+    adapted_at        TEXT,
     FOREIGN KEY(plan_id) REFERENCES plans(id),
     FOREIGN KEY(user_id) REFERENCES users(id)
 );
 CREATE INDEX IF NOT EXISTS idx_plan_workouts_user_date
     ON plan_workouts(user_id, date);
+
+CREATE TABLE IF NOT EXISTS race_results (
+    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id      INTEGER NOT NULL,
+    source       TEXT NOT NULL,
+    event_date   TEXT NOT NULL,
+    event_title  TEXT NOT NULL,
+    position     TEXT,
+    category     TEXT,
+    activity_id  INTEGER,
+    duration_s   INTEGER,
+    avg_power    REAL,
+    np           REAL,
+    if_          REAL,
+    power_json   TEXT,
+    fetched_at   TEXT NOT NULL,
+    UNIQUE(user_id, source, event_date, event_title),
+    FOREIGN KEY(user_id) REFERENCES users(id)
+);
+CREATE INDEX IF NOT EXISTS idx_race_results_user_date
+    ON race_results(user_id, event_date);
+
+CREATE TABLE IF NOT EXISTS race_sync (
+    user_id      INTEGER PRIMARY KEY,
+    rider_id     TEXT,
+    last_refresh TEXT,
+    source       TEXT,
+    error        TEXT,
+    bests_json   TEXT,
+    FOREIGN KEY(user_id) REFERENCES users(id)
+);
 """
 
 
@@ -564,6 +604,8 @@ def _plan_workout_row(r: sqlite3.Row, include_zwo: bool = False) -> dict:
         "tss": r["tss"],
         "completed_activity_id": r["completed_activity_id"],
         "completed_date": r["completed_date"],
+        "adapted": r["adapted"],
+        "adapted_at": r["adapted_at"],
     }
     if include_zwo:
         d["zwo_or_segments"] = r["zwo_or_segments"]
@@ -678,6 +720,167 @@ def activities_on_date(
             (user_id, date_iso + "%"),
         ).fetchall()
         return [_row_summary(r) for r in rows]
+    finally:
+        conn.close()
+
+
+# --------------------------------------------------------- plan adaptation
+def adaptable_plan_workouts(
+    user_id: int, after_date: str, up_to_date: str, path: Optional[str] = None
+) -> List[dict]:
+    """Future, not-completed, never-adapted plan workouts in (after, up_to]."""
+    conn = connect(path)
+    try:
+        rows = conn.execute(
+            "SELECT * FROM plan_workouts WHERE user_id = ? AND date > ? "
+            "AND date <= ? AND completed_activity_id IS NULL "
+            "AND adapted IS NULL ORDER BY date ASC",
+            (user_id, after_date, up_to_date),
+        ).fetchall()
+        return [_plan_workout_row(r, include_zwo=True) for r in rows]
+    finally:
+        conn.close()
+
+
+def update_plan_workout_content(
+    user_id: int,
+    workout_id: int,
+    name: str,
+    type: str,
+    duration_s: int,
+    tss: float,
+    zwo_or_segments: str,
+    adapted: str,
+    adapted_at: str,
+    path: Optional[str] = None,
+) -> bool:
+    """Rewrite an (unadapted) workout's prescription; records the adaptation."""
+    conn = connect(path)
+    try:
+        cur = conn.execute(
+            "UPDATE plan_workouts SET name = ?, type = ?, duration_s = ?, "
+            "tss = ?, zwo_or_segments = ?, adapted = ?, adapted_at = ? "
+            "WHERE user_id = ? AND id = ? AND adapted IS NULL",
+            (name, type, int(duration_s), float(tss), zwo_or_segments,
+             adapted, adapted_at, user_id, workout_id),
+        )
+        conn.commit()
+        return cur.rowcount > 0
+    finally:
+        conn.close()
+
+
+def upcoming_adapted_counts(
+    user_id: int, after_date: str, path: Optional[str] = None
+) -> Dict[str, int]:
+    """Count of future adapted workouts per adaptation kind."""
+    conn = connect(path)
+    try:
+        rows = conn.execute(
+            "SELECT adapted, COUNT(*) AS n FROM plan_workouts "
+            "WHERE user_id = ? AND date > ? AND adapted IS NOT NULL "
+            "GROUP BY adapted",
+            (user_id, after_date),
+        ).fetchall()
+        return {r["adapted"]: r["n"] for r in rows}
+    finally:
+        conn.close()
+
+
+# ------------------------------------------------------------ race results
+def replace_race_results(
+    user_id: int, source: str, results: List[dict], path: Optional[str] = None
+) -> int:
+    """Replace the user's cached race results for a source. Returns row count."""
+    conn = connect(path)
+    try:
+        conn.execute(
+            "DELETE FROM race_results WHERE user_id = ? AND source = ?",
+            (user_id, source),
+        )
+        for r in results:
+            conn.execute(
+                """
+                INSERT OR REPLACE INTO race_results
+                  (user_id, source, event_date, event_title, position, category,
+                   activity_id, duration_s, avg_power, np, if_, power_json,
+                   fetched_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    user_id, source, r["event_date"], r["event_title"],
+                    r.get("position"), r.get("category"), r.get("activity_id"),
+                    r.get("duration_s"), r.get("avg_power"), r.get("np"),
+                    r.get("if_"), json.dumps(r.get("power") or {}),
+                    r["fetched_at"],
+                ),
+            )
+        conn.commit()
+        return len(results)
+    finally:
+        conn.close()
+
+
+def list_race_results(user_id: int, path: Optional[str] = None) -> List[dict]:
+    conn = connect(path)
+    try:
+        rows = conn.execute(
+            "SELECT * FROM race_results WHERE user_id = ? ORDER BY event_date DESC",
+            (user_id,),
+        ).fetchall()
+        out = []
+        for r in rows:
+            d = dict(r)
+            try:
+                d["power"] = json.loads(d.pop("power_json") or "{}")
+            except ValueError:
+                d["power"] = {}
+            out.append(d)
+        return out
+    finally:
+        conn.close()
+
+
+def save_race_sync(
+    user_id: int,
+    rider_id: Optional[str],
+    source: Optional[str],
+    error: Optional[str],
+    bests: Optional[dict] = None,
+    last_refresh: Optional[str] = None,
+    path: Optional[str] = None,
+) -> None:
+    conn = connect(path)
+    try:
+        conn.execute(
+            "INSERT OR REPLACE INTO race_sync "
+            "(user_id, rider_id, last_refresh, source, error, bests_json) "
+            "VALUES (?, ?, ?, ?, ?, ?)",
+            (
+                user_id, rider_id,
+                last_refresh or _dt.datetime.now().isoformat(timespec="seconds"),
+                source, error, json.dumps(bests or {}),
+            ),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def get_race_sync(user_id: int, path: Optional[str] = None) -> Optional[dict]:
+    conn = connect(path)
+    try:
+        row = conn.execute(
+            "SELECT * FROM race_sync WHERE user_id = ?", (user_id,)
+        ).fetchone()
+        if not row:
+            return None
+        d = dict(row)
+        try:
+            d["bests"] = json.loads(d.pop("bests_json") or "{}")
+        except ValueError:
+            d["bests"] = {}
+        return d
     finally:
         conn.close()
 

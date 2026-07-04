@@ -9,9 +9,11 @@ from scipy.optimize import least_squares
 from .power import rolling_mean
 
 # Durations (seconds) at which we sample the mean-maximal power curve. A dense
-# standard grid so the dashboard curve has a measured dot at every axis tick.
+# standard grid so the dashboard curve has a measured dot at every axis tick;
+# includes 1s and 40min (2400s) for the race power-per-period table.
 MMP_DURATIONS: Tuple[int, ...] = (
-    5, 10, 15, 30, 60, 120, 180, 300, 600, 900, 1200, 1800, 2700, 3600, 5400,
+    1, 5, 10, 15, 30, 60, 120, 180, 300, 600, 900, 1200, 1800, 2400, 2700,
+    3600, 5400,
 )
 
 

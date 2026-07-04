@@ -18,11 +18,12 @@ from fastapi.templating import Jinja2Templates
 from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.middleware.sessions import SessionMiddleware
 
-from . import auth, config, db, paths
+from . import auth, config, db, paths, races
 from .analysis import pipeline
 from .ble import devices as bledevices
 from .ble.runner import RideController, flatten_session
 from .ingest import importer
+from .prescribe import adapt as adaptmod
 from .prescribe import plan as planmod
 from .prescribe import zwo
 from .prescribe import llm
@@ -39,15 +40,38 @@ SCAN_INTERVAL_S = 24 * 3600.0
 _log = logging.getLogger(__name__)
 
 
+def run_daily_maintenance() -> dict:
+    """One synchronous pass of all daily jobs: import scan (FTP re-eval +
+    completion matching inside), then per-user plan adaptation and race-result
+    refresh. Each stage is fault-isolated per user.
+    """
+    totals = importer.run_auto_scan()
+    totals["adapted"] = 0
+    totals["races"] = 0
+    for uid in db.all_user_ids():
+        try:
+            state = pipeline.build_state(uid)
+            summary = adaptmod.apply_adaptations(uid, state)
+            totals["adapted"] += summary.get("adjusted", 0)
+        except Exception:
+            _log.warning("plan adaptation failed for user %s", uid, exc_info=True)
+        try:
+            races.refresh_race_results(uid)
+            totals["races"] += 1
+        except Exception:
+            _log.warning("race refresh failed for user %s", uid, exc_info=True)
+    return totals
+
+
 async def auto_scan_loop(stop: "asyncio.Event") -> None:
     """Daily background sweep: import new .fit files, re-evaluate FTP, match
-    plan-workout completions. Runs once immediately, then every SCAN_INTERVAL_S
-    until `stop` is set. The sweep itself runs in a worker thread so FIT
-    parsing never blocks the event loop.
+    plan-workout completions, adapt upcoming workouts, refresh race results.
+    Runs once immediately, then every SCAN_INTERVAL_S until `stop` is set. The
+    sweep runs in a worker thread so FIT parsing never blocks the event loop.
     """
     while True:
         try:
-            totals = await asyncio.to_thread(importer.run_auto_scan)
+            totals = await asyncio.to_thread(run_daily_maintenance)
             _log.info("auto-scan: %s", totals)
         except Exception:
             _log.warning("background activity scan failed", exc_info=True)
@@ -192,9 +216,21 @@ def create_app() -> FastAPI:
     # ------------------------------------------------------------- pages
     @app.get("/", response_class=HTMLResponse)
     def dashboard(request: Request):
-        state = pipeline.build_state(_uid(request))
+        uid = _uid(request)
+        state = pipeline.build_state(uid)
+        # Detection is actionable: adapt upcoming plan workouts (idempotent -
+        # each workout is only ever adjusted once), then describe it.
+        try:
+            summary = adaptmod.apply_adaptations(uid, state)
+        except Exception:
+            _log.warning("plan adaptation failed", exc_info=True)
+            summary = {"status": adaptmod.detection_status(state),
+                       "adjusted": 0, "upcoming": {}}
+        banner = adaptmod.banner_for(state, summary)
         return templates.TemplateResponse(
-            request, "dashboard.html", _ctx(request, state=state.to_dict())
+            request,
+            "dashboard.html",
+            _ctx(request, state=state.to_dict(), banner=banner),
         )
 
     def _activities_context(request: Request, scan: Optional[dict] = None) -> dict:
@@ -632,6 +668,45 @@ def create_app() -> FastAPI:
             request, "settings.html", _settings_ctx(request, uid, True)
         )
 
+    # ------------------------------------------------------------- races
+    def _races_ctx(request: Request, uid: int, refreshed: Optional[dict] = None) -> dict:
+        data = races.race_page_data(uid)
+        settings = db.get_user_settings(uid)
+        zid = (settings.get("zwift_id") or "").strip()
+        return _ctx(
+            request,
+            results=data["results"],
+            sync=data["sync"],
+            bests=data["bests"],
+            durations=data["durations"],
+            duration_labels=data["duration_labels"],
+            rider_id=zid if zid.isdigit() else "",
+            saved_zwift_id=zid,
+            refreshed=refreshed,
+        )
+
+    @app.get("/races", response_class=HTMLResponse)
+    def races_page(request: Request):
+        return templates.TemplateResponse(
+            request, "races.html", _races_ctx(request, _uid(request))
+        )
+
+    @app.post("/races/refresh", response_class=HTMLResponse)
+    def races_refresh(request: Request, rider_id: str = Form("")):
+        uid = _uid(request)
+        rider_id = (rider_id or "").strip()
+        # Persist a typed numeric rider ID as the user's zwift_id setting.
+        if rider_id.isdigit():
+            db.save_user_settings(uid, {"zwift_id": rider_id})
+        try:
+            refreshed = races.refresh_race_results(uid, rider_id or None)
+        except Exception as e:  # never let a refresh kill the page
+            _log.warning("race refresh failed", exc_info=True)
+            refreshed = {"source": None, "count": 0, "error": str(e)}
+        return templates.TemplateResponse(
+            request, "races.html", _races_ctx(request, uid, refreshed=refreshed)
+        )
+
     # ------------------------------------------------------- ride (BLE)
     def _upcoming_plan_workouts(uid: int, limit: int = 40) -> List[dict]:
         today = _dt.date.today().isoformat()
@@ -875,6 +950,7 @@ def create_app() -> FastAPI:
                 "type": w["type"],
                 "duration_s": w["duration_s"],
                 "tss": w["tss"],
+                "adapted": w.get("adapted"),
                 "ftp": round(ftp, 1),
                 "description": session.description,
                 "total_duration": total_s,
