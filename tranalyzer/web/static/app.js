@@ -99,10 +99,36 @@ function latestGroupValue(group) {
     return null;
 }
 
+// Shared legend behaviour for any chart. `units` is the set of selectable
+// legend entries, each a list of dataset indices (one index for a simple
+// series, several for a group like FTP). `target` must be the same array
+// reference as one of `units`.
+//   - additive (Ctrl/Cmd-click): toggle just this unit on/off, leave others.
+//   - plain click: isolate this unit; clicking the already-isolated unit
+//     (the only visible one) restores ALL units.
+// Only the datasets listed in `units` are touched, so a background dataset
+// (e.g. the ride chart's elevation band) omitted from `units` is never
+// hidden or exposed by isolation.
+function applyLegendSelection(chart, units, target, additive) {
+    const visibleOf = (u) => u.some((i) => chart.isDatasetVisible(i));
+    if (additive) {
+        const nowVisible = visibleOf(target);
+        target.forEach((i) => chart.setDatasetVisibility(i, !nowVisible));
+    } else {
+        const isIsolated = units.every((u) => (u === target ? visibleOf(u) : !visibleOf(u)));
+        units.forEach((u) => {
+            const on = isIsolated ? true : u === target;
+            u.forEach((i) => chart.setDatasetVisibility(i, on));
+        });
+    }
+    chart.update();
+}
+
 function buildLegend() {
     const container = document.getElementById("mainLegend");
     if (!container || !mainChart) return;
     container.innerHTML = "";
+    const units = LEGEND_GROUPS.map((g) => g.datasets);
     LEGEND_GROUPS.forEach((group) => {
         const visible = group.datasets.some((i) => mainChart.isDatasetVisible(i));
         const item = document.createElement("span");
@@ -116,23 +142,7 @@ function buildLegend() {
             '<span class="legend-swatch" style="background:' +
             (COLORS[group.label] || "#999") + '"></span>' + group.label + valueHtml;
         item.addEventListener("click", (e) => {
-            if (e.ctrlKey || e.metaKey) {
-                // Ctrl/Cmd-click = toggle just this group; leave others as-is.
-                const nowVisible = group.datasets.some((i) => mainChart.isDatasetVisible(i));
-                group.datasets.forEach((i) => mainChart.setDatasetVisibility(i, !nowVisible));
-            } else {
-                // Plain click = isolate this group. Clicking the group that is
-                // ALREADY isolated (the only one visible) restores all series.
-                const isIsolated = LEGEND_GROUPS.every((g) => {
-                    const on = g.datasets.some((i) => mainChart.isDatasetVisible(i));
-                    return g === group ? on : !on;
-                });
-                LEGEND_GROUPS.forEach((g) => {
-                    const on = isIsolated ? true : g === group;
-                    g.datasets.forEach((i) => mainChart.setDatasetVisibility(i, on));
-                });
-            }
-            mainChart.update();
+            applyLegendSelection(mainChart, units, group.datasets, e.ctrlKey || e.metaKey);
             buildLegend();
         });
         container.appendChild(item);
@@ -390,6 +400,15 @@ async function renderActivityDetail(activityId) {
     if (!(have.heartrate || have.cadence)) delete scales.yBio;
     if (!have.altitude) delete scales.yAlt;
 
+    // Real data series (power/HR/cadence) are the isolate/restore units; the
+    // elevation background band is excluded so legend clicks never hide or
+    // expose it. Each real series is its own single-dataset unit.
+    const elevationIndex = datasets.findIndex((d) => d.yAxisID === "yAlt");
+    const realUnits = datasets
+        .map((_d, i) => i)
+        .filter((i) => i !== elevationIndex)
+        .map((i) => [i]);
+
     const labelled = t.map((x) => Math.round(x * 10) / 10);
     new Chart(canvas, {
         type: "line",
@@ -399,7 +418,25 @@ async function renderActivityDetail(activityId) {
             animation: false,
             interaction: { mode: "index", intersect: false },
             plugins: {
-                legend: { position: "top" },
+                legend: {
+                    position: "top",
+                    // Match the dashboard legend: plain click isolates (and a
+                    // second click on the isolated series restores all);
+                    // Ctrl/Cmd-click toggles just that series. Elevation stays
+                    // an independent on/off, never part of the isolation.
+                    onClick: (e, legendItem, legend) => {
+                        const chart = legend.chart;
+                        const idx = legendItem.datasetIndex;
+                        const additive = !!(e.native && (e.native.ctrlKey || e.native.metaKey));
+                        if (idx === elevationIndex) {
+                            chart.setDatasetVisibility(idx, !chart.isDatasetVisible(idx));
+                            chart.update();
+                            return;
+                        }
+                        const target = realUnits.find((u) => u.indexOf(idx) !== -1);
+                        if (target) applyLegendSelection(chart, realUnits, target, additive);
+                    },
+                },
                 tooltip: {
                     callbacks: {
                         title: (items) => (items.length ? items[0].label + " min" : ""),
