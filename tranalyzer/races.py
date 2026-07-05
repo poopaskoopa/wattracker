@@ -35,8 +35,12 @@ from .metrics.curve import best_rolling_power
 
 log = logging.getLogger(__name__)
 
-# Exactly the spec'd per-race table columns (seconds).
-RACE_POWER_DURATIONS = (1, 5, 10, 30, 60, 120, 300, 600, 1200, 2400, 3600)
+# Per-race table columns (seconds), spec: 1s/5s/15s/30s/1m/2m/5m/10m/20m.
+RACE_POWER_DURATIONS = (1, 5, 15, 30, 60, 120, 300, 600, 1200)
+# ZwiftPower publishes per-result peak power as ``w<seconds>`` fields; this maps
+# the ones it carries to our grid (it lacks 1s and 10m, filled from local rides).
+ZP_POWER_FIELDS = {5: "w5", 15: "w15", 30: "w30", 60: "w60", 120: "w120",
+                   300: "w300", 1200: "w1200"}
 # The "Power profile" section durations (spec: 1s/5s/15s/30s/1m/2m/5m/10m/20m/
 # 40m/1h) - all-time bests across every imported ride.
 PROFILE_DURATIONS = (1, 5, 15, 30, 60, 120, 300, 600, 1200, 2400, 3600)
@@ -87,28 +91,57 @@ def fetch_zwiftpower_results(rider_id: str) -> List[dict]:
     return parse_zwiftpower_profile(doc)
 
 
+def _is_zp_race(row: dict) -> bool:
+    """A ZwiftPower result is a race iff its event-type flags contain TYPE_RACE.
+
+    ZwiftPower tags every result with ``f_t`` (e.g. ``"TYPE_RACE TYPE_RACE "``
+    for races, ``"TYPE_RIDE"`` for group rides, ``"TYPE_WORKOUT ..."`` for
+    workouts). Group rides and workouts are excluded here.
+    """
+    return "TYPE_RACE" in str(row.get("f_t") or "")
+
+
+def _zp_power_periods(row: dict) -> Dict[str, int]:
+    """Peak power per period from a ZwiftPower result's ``w<seconds>`` fields."""
+    out: Dict[str, int] = {}
+    for secs, field in ZP_POWER_FIELDS.items():
+        w = _f(row.get(field))
+        if w and w > 0:
+            out[str(secs)] = int(round(w))
+    return out
+
+
 def parse_zwiftpower_profile(doc: dict) -> List[dict]:
-    """Normalize a ZwiftPower profile JSON document into result rows."""
+    """Normalize a ZwiftPower profile JSON document into race result rows.
+
+    Only actual races are kept (see ``_is_zp_race``); each row carries its raw
+    ``f_t`` in ``source_type`` so the filter stays auditable, plus the per-race
+    peak-power periods ZwiftPower publishes (``w5``..``w1200``).
+    """
     rows = doc.get("data") or []
     out: List[dict] = []
     fetched = _dt.datetime.now().isoformat(timespec="seconds")
     for r in rows:
+        if not _is_zp_race(r):
+            continue
         try:
             when = _dt.datetime.fromtimestamp(int(r.get("event_date") or 0))
         except (ValueError, TypeError, OSError):
             continue
+        dur = _f(r.get("time"))  # seconds ([value, flag] or scalar)
         out.append(
             {
                 "event_date": when.date().isoformat(),
                 "event_title": str(r.get("event_title") or "Zwift event"),
                 "position": str(r.get("position_in_cat") or r.get("pos") or ""),
                 "category": str(r.get("category") or ""),
+                "source_type": str(r.get("f_t") or "").strip(),
                 "activity_id": None,
-                "duration_s": None,
+                "duration_s": int(dur) if dur and dur > 0 else None,
                 "avg_power": _f(r.get("avg_power")),
                 "np": _f(r.get("np")),
                 "if_": None,
-                "power": {},
+                "power": _zp_power_periods(r),
                 "fetched_at": fetched,
             }
         )
@@ -269,17 +302,20 @@ def refresh_race_results(
         db.save_user_settings(user_id, {"weight_kg": weight_kg})
 
     if source == "zwiftpower":
-        # Fill per-race power from the local ride imported on the same date
-        # (ZwiftPower rows carry no power stream).
+        # ZwiftPower publishes most periods (w5..w1200) but not 1s or 10m; fill
+        # any period a race is missing from the matching imported ride of that
+        # date (closest by duration when the date has several rides).
         for r in results:
-            if r["power"]:
+            missing = [d for d in RACE_POWER_DURATIONS if str(d) not in r["power"]]
+            if not missing:
                 continue
-            same_day = db.activities_on_date(user_id, r["event_date"])
-            if same_day:
-                act = db.get_activity(user_id, same_day[0]["id"])
-                stream = (act.get("streams") or {}).get("power") or []
-                r["power"] = power_per_period(stream)
-                r["activity_id"] = act["id"]
+            act = _matching_activity(user_id, r["event_date"], r.get("duration_s"))
+            if act is None:
+                continue
+            stream = (act.get("streams") or {}).get("power") or []
+            for key, watts in power_per_period(stream, missing).items():
+                r["power"].setdefault(key, watts)
+            r["activity_id"] = act["id"]
         count = db.replace_race_results(user_id, "zwiftpower", results)
         # Real results supersede the heuristic ones: purge them for good.
         db.delete_race_results(user_id, "local")
@@ -298,6 +334,20 @@ def refresh_race_results(
     )
     return {"source": source, "count": count, "error": remote_error,
             "auth_failed": auth_failed}
+
+
+def _matching_activity(
+    user_id: int, date_iso: str, duration_s: Optional[int]
+) -> Optional[dict]:
+    """The imported ride best matching a race on a date (closest duration)."""
+    cands = db.activities_on_date(user_id, date_iso)
+    if not cands:
+        return None
+    if duration_s and len(cands) > 1:
+        cands = sorted(
+            cands, key=lambda a: abs((a.get("duration_s") or 0) - int(duration_s))
+        )
+    return db.get_activity(user_id, cands[0]["id"])
 
 
 def _weight_from_zwiftpower_doc(doc: dict) -> Optional[float]:

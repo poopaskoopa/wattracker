@@ -194,6 +194,81 @@ def ftp_rolling_series(
     }
 
 
+DETAIL_MAX_POINTS = 1500
+
+
+def _downsample(values: List, target: int) -> List:
+    """Block-average a numeric stream down to ~target points (None-safe).
+
+    Non-numeric / empty streams collapse to []. Averaging (rather than picking)
+    keeps power/HR shapes faithful; altitude too. Returns rounded floats.
+    """
+    clean = [v for v in (values or []) if v is not None]
+    if not clean:
+        return []
+    n = len(values)
+    if n <= target:
+        return [round(float(v), 1) if v is not None else None for v in values]
+    step = n / float(target)
+    out: List = []
+    i = 0.0
+    while int(i) < n:
+        lo = int(i)
+        hi = min(n, int(i + step))
+        bucket = [v for v in values[lo:hi] if v is not None]
+        out.append(round(sum(bucket) / len(bucket), 1) if bucket else None)
+        i += step
+    return out
+
+
+def activity_detail(
+    user_id: int, activity_id: int, max_points: int = DETAIL_MAX_POINTS
+) -> Optional[dict]:
+    """Per-ride detail + downsampled streams for the activity graphs.
+
+    Streams are persisted per activity (see importer), so no FIT re-parse is
+    needed. Each of power/heartrate/cadence/altitude is downsampled to
+    ~max_points; the x axis is elapsed minutes. Missing streams come back as
+    empty lists so the page renders whatever is available. Returns None when
+    the activity does not belong to the user.
+    """
+    act = db.get_activity(user_id, activity_id)
+    if not act:
+        return None
+    streams = act.get("streams") or {}
+    n = max(
+        (len(streams.get(k) or []) for k in
+         ("power", "heartrate", "cadence", "altitude", "time")),
+        default=0,
+    )
+    minutes = [round(i / 60.0, 3) for i in range(n)]
+    series = {
+        k: _downsample(streams.get(k) or [], max_points)
+        for k in ("power", "heartrate", "cadence", "altitude")
+    }
+    t = _downsample(minutes, max_points)
+    have = {k: any(v is not None for v in vals) for k, vals in series.items()}
+    return {
+        "id": act["id"],
+        "filename": act.get("filename"),
+        "start_time": act.get("start_time"),
+        "duration_s": act.get("duration_s"),
+        "distance_m": act.get("distance_m"),
+        "avg_power": act.get("avg_power"),
+        "avg_hr": act.get("avg_hr"),
+        "np": act.get("np"),
+        "if_": act.get("if_"),
+        "tss": act.get("tss"),
+        "t": t,
+        "power": series["power"],
+        "heartrate": series["heartrate"],
+        "cadence": series["cadence"],
+        "altitude": series["altitude"],
+        "have": have,
+        "points": len(t),
+    }
+
+
 def curve_points(user_id: int, state: Optional[TrainingState] = None) -> dict:
     """Power-duration data: measured MMP points + modeled CP/W' curve."""
     if state is None:

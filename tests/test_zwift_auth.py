@@ -256,13 +256,73 @@ ZP_DOC = {
         {
             "event_date": 1780000000,
             "event_title": "WTRL TTT",
+            "f_t": "TYPE_RACE TYPE_RACE ",
             "position_in_cat": 4,
             "category": "B",
             "avg_power": [255, 1],
             "np": [270, 1],
-        }
+            "w15": [400, 0], "w60": [320, 0],
+        },
+        {  # a group ride - must be filtered out, never listed as a race
+            "event_date": 1779900000,
+            "event_title": "Coffee Ride",
+            "f_t": "TYPE_RIDE",
+            "avg_power": [150, 1],
+        },
     ]
 }
+
+
+def test_parse_filters_group_rides_and_workouts_keeps_races():
+    doc = {"data": [
+        {"event_date": 1780000000, "event_title": "Crit City Race",
+         "f_t": "TYPE_RACE TYPE_RACE ", "position_in_cat": 3, "category": "A"},
+        {"event_date": 1779900000, "event_title": "Group Ride",
+         "f_t": "TYPE_RIDE"},
+        {"event_date": 1779800000, "event_title": "Workout #6",
+         "f_t": "TYPE_WORKOUT TYPE_WORKOUT "},
+        {"event_date": 1779700000, "event_title": "Short Race", "f_t": "TYPE_RACE"},
+    ]}
+    rows = races.parse_zwiftpower_profile(doc)
+    titles = [r["event_title"] for r in rows]
+    assert titles == ["Crit City Race", "Short Race"]
+    assert all("TYPE_RACE" in r["source_type"] for r in rows)
+
+
+def test_parse_extracts_zwiftpower_power_periods():
+    doc = {"data": [{
+        "event_date": 1780000000, "event_title": "R", "f_t": "TYPE_RACE",
+        "w5": [500, 0], "w15": [420, 0], "w30": [360, 0], "w60": [300, 0],
+        "w120": [270, 0], "w300": [240, 0], "w1200": [210, 0],
+        "time": [2796.0, 0],
+    }]}
+    row = races.parse_zwiftpower_profile(doc)[0]
+    assert row["power"] == {"5": 500, "15": 420, "30": 360, "60": 300,
+                            "120": 270, "300": 240, "1200": 210}
+    assert row["duration_s"] == 2796
+    # 1s and 10m (600) are not published by ZwiftPower.
+    assert "1" not in row["power"] and "600" not in row["power"]
+
+
+def test_refresh_retroactively_purges_cached_group_rides(user_id, monkeypatch):
+    # An old cache mixed a race with a group ride; a fresh fetch (filtered)
+    # replaces the whole zwiftpower set, dropping the group ride.
+    db.replace_race_results(user_id, "zwiftpower", [
+        {"event_date": "2026-05-01", "event_title": "Old Group Ride",
+         "position": None, "category": None, "source_type": "TYPE_RIDE",
+         "activity_id": None, "duration_s": None, "avg_power": 150.0,
+         "np": None, "if_": None, "power": {}, "fetched_at": "2026-05-01T00:00:00"},
+        {"event_date": "2026-05-02", "event_title": "Old Race",
+         "position": "1", "category": "A", "source_type": "TYPE_RACE",
+         "activity_id": None, "duration_s": None, "avg_power": 250.0,
+         "np": None, "if_": None, "power": {}, "fetched_at": "2026-05-01T00:00:00"}])
+    credstore.save_zwift_credentials(user_id, "a@b.com", "pw")
+    monkeypatch.setattr(
+        zwiftauth, "fetch_results_authenticated",
+        lambda email, password, rider_id=None: (ZP_DOC, "5555", 72.5))
+    races.refresh_race_results(user_id)
+    titles = [r["event_title"] for r in db.list_race_results(user_id)]
+    assert titles == ["WTRL TTT"]  # only the race from the fresh fetch remains
 
 
 def test_refresh_uses_credentials_and_autodetects_rider_id(user_id, monkeypatch):

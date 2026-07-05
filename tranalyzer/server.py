@@ -254,6 +254,28 @@ def create_app() -> FastAPI:
             request, "activities.html", _activities_context(request)
         )
 
+    @app.get("/activity/{activity_id}", response_class=HTMLResponse)
+    def activity_detail_page(request: Request, activity_id: int):
+        uid = _uid(request)
+        detail = pipeline.activity_detail(uid, activity_id)
+        if not detail:
+            return RedirectResponse(url="/activities", status_code=303)
+        # Only the scalar summary goes into the template; the (larger) stream
+        # arrays load from the JSON endpoint so the HTML stays small.
+        summary = {k: detail[k] for k in (
+            "id", "filename", "start_time", "duration_s", "distance_m",
+            "avg_power", "avg_hr", "np", "if_", "tss", "have", "points")}
+        return templates.TemplateResponse(
+            request, "activity_detail.html", _ctx(request, activity=summary)
+        )
+
+    @app.get("/api/activity/{activity_id}")
+    def api_activity_detail(request: Request, activity_id: int):
+        detail = pipeline.activity_detail(_uid(request), activity_id)
+        if not detail:
+            return JSONResponse({"error": "not found"}, status_code=404)
+        return JSONResponse(detail)
+
     @app.post("/activities/rescan", response_class=HTMLResponse)
     def rescan(request: Request, activities_dir: str = Form("")):
         uid = _uid(request)

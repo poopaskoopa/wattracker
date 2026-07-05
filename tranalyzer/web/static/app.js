@@ -121,9 +121,14 @@ function buildLegend() {
                 const nowVisible = group.datasets.some((i) => mainChart.isDatasetVisible(i));
                 group.datasets.forEach((i) => mainChart.setDatasetVisibility(i, !nowVisible));
             } else {
-                // Plain click = isolate this group (others hidden).
+                // Plain click = isolate this group. Clicking the group that is
+                // ALREADY isolated (the only one visible) restores all series.
+                const isIsolated = LEGEND_GROUPS.every((g) => {
+                    const on = g.datasets.some((i) => mainChart.isDatasetVisible(i));
+                    return g === group ? on : !on;
+                });
                 LEGEND_GROUPS.forEach((g) => {
-                    const on = g === group;
+                    const on = isIsolated ? true : g === group;
                     g.datasets.forEach((i) => mainChart.setDatasetVisibility(i, on));
                 });
             }
@@ -306,4 +311,102 @@ function renderDashboard() {
     wireControls();
     loadMainChart(0);
     renderCurveChart();
+}
+
+// ---------------------------------------------- activity detail ride graphs
+const DETAIL_COLORS = {
+    power: "#e05252",
+    heartrate: "#f2a900",
+    cadence: "#5a9bd4",
+    altitude: "#8a94a0",
+};
+
+async function renderActivityDetail(activityId) {
+    const canvas = document.getElementById("detailChart");
+    if (!canvas) return;
+    const empty = document.getElementById("detailEmpty");
+    const data = await fetchJSON("/api/activity/" + activityId);
+    if (!data) { if (empty) { empty.style.display = "block"; } return; }
+
+    const t = data.t || [];
+    const have = data.have || {};
+    const anyLine = have.power || have.heartrate || have.cadence;
+    if (!t.length || (!anyLine && !have.altitude)) {
+        canvas.style.display = "none";
+        if (empty) empty.style.display = "block";
+        return;
+    }
+
+    const datasets = [];
+    // Elevation first + high order so it renders as a background band.
+    if (have.altitude) {
+        datasets.push({
+            label: "Elevation (m)", data: data.altitude,
+            borderColor: "rgba(138,148,160,0.5)", backgroundColor: "rgba(138,148,160,0.18)",
+            yAxisID: "yAlt", fill: "start", pointRadius: 0, borderWidth: 1,
+            tension: 0.3, order: 10, spanGaps: true,
+        });
+    }
+    if (have.power) {
+        datasets.push({
+            label: "Power (W)", data: data.power, borderColor: DETAIL_COLORS.power,
+            yAxisID: "yPower", pointRadius: 0, borderWidth: 1.5, tension: 0.2,
+            spanGaps: true, order: 1,
+        });
+    }
+    if (have.heartrate) {
+        datasets.push({
+            label: "Heart rate (bpm)", data: data.heartrate, borderColor: DETAIL_COLORS.heartrate,
+            yAxisID: "yBio", pointRadius: 0, borderWidth: 1.5, tension: 0.2,
+            spanGaps: true, order: 2,
+        });
+    }
+    if (have.cadence) {
+        datasets.push({
+            label: "Cadence (rpm)", data: data.cadence, borderColor: DETAIL_COLORS.cadence,
+            yAxisID: "yBio", pointRadius: 0, borderWidth: 1.5, tension: 0.2,
+            spanGaps: true, order: 3,
+        });
+    }
+
+    const scales = {
+        x: {
+            type: "linear", title: { display: true, text: "Time (min)" },
+            ticks: { maxTicksLimit: 12, maxRotation: 0 },
+        },
+        yPower: {
+            position: "left", title: { display: true, text: "Power (W)" },
+            beginAtZero: true,
+        },
+        yBio: {
+            position: "right", title: { display: true, text: "HR / cadence" },
+            beginAtZero: true, grid: { drawOnChartArea: false },
+        },
+        yAlt: {
+            position: "right", display: false, grid: { drawOnChartArea: false },
+        },
+    };
+    if (!have.power) delete scales.yPower;
+    if (!(have.heartrate || have.cadence)) delete scales.yBio;
+    if (!have.altitude) delete scales.yAlt;
+
+    const labelled = t.map((x) => Math.round(x * 10) / 10);
+    new Chart(canvas, {
+        type: "line",
+        data: { labels: labelled, datasets },
+        options: {
+            responsive: true,
+            animation: false,
+            interaction: { mode: "index", intersect: false },
+            plugins: {
+                legend: { position: "top" },
+                tooltip: {
+                    callbacks: {
+                        title: (items) => (items.length ? items[0].label + " min" : ""),
+                    },
+                },
+            },
+            scales,
+        },
+    });
 }

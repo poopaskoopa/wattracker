@@ -43,14 +43,13 @@ def _activity(user_id, start_time, seconds, watts, if_=0.9, tss=80.0):
 
 # ------------------------------------------------------- power per period
 def test_power_per_period_exact_spec_durations():
-    assert races.RACE_POWER_DURATIONS == (1, 5, 10, 30, 60, 120, 300, 600,
-                                          1200, 2400, 3600)
-    stream = [400.0] * 10 + [200.0] * 3600  # sprint then steady
+    assert races.RACE_POWER_DURATIONS == (1, 5, 15, 30, 60, 120, 300, 600, 1200)
+    stream = [400.0] * 15 + [200.0] * 1200  # sprint then steady
     p = races.power_per_period(stream)
     assert set(p.keys()) == {str(d) for d in races.RACE_POWER_DURATIONS}
     assert p["1"] == 400
-    assert p["10"] == 400
-    assert p["3600"] < 210  # includes the steady block
+    assert p["15"] == 400
+    assert p["1200"] < 210  # includes the steady block
 
 
 def test_power_per_period_omits_durations_longer_than_ride():
@@ -74,7 +73,7 @@ def test_local_race_detection_heuristic(user_id):
     r = results[0]
     assert r["event_date"] == "2026-06-01"
     assert "Race effort" in r["event_title"]
-    assert r["power"]["3600"] == 260
+    assert r["power"]["1200"] == 260
 
 
 # ------------------------------------------------------------ refresh flow
@@ -100,15 +99,17 @@ def test_refresh_uses_zwiftpower_when_it_answers(user_id, monkeypatch):
             {
                 "event_date": int(dt.datetime(2026, 6, 1, 10).timestamp()),
                 "event_title": "3R Volcano Flat Race",
+                "f_t": "TYPE_RACE TYPE_RACE ",
                 "position_in_cat": 7,
                 "category": "B",
                 "avg_power": [251, 1],
                 "np": [265, 1],
+                "w15": [420, 0],  # ZwiftPower peak-power period
             }
         ]
     }
     monkeypatch.setattr(races, "_http_get_json", lambda url, timeout=0: doc)
-    # A same-day imported ride supplies the per-period power.
+    # A same-day imported ride supplies periods ZwiftPower doesn't carry (300s).
     _activity(user_id, "2026-06-01T10:00:00", 3600, 260.0, if_=0.9)
     out = races.refresh_race_results(user_id, "1234567")
     assert out["source"] == "zwiftpower"
@@ -118,6 +119,8 @@ def test_refresh_uses_zwiftpower_when_it_answers(user_id, monkeypatch):
     assert rows[0]["position"] == "7"
     assert rows[0]["category"] == "B"
     assert rows[0]["avg_power"] == 251.0
+    assert rows[0]["source_type"] == "TYPE_RACE TYPE_RACE"
+    assert rows[0]["power"]["15"] == 420  # from ZwiftPower's w15
     assert rows[0]["power"]["300"] == 260  # filled from the local ride
 
 
@@ -213,7 +216,9 @@ def test_bests_cover_profile_grid(user_id):
     bests = races.compute_bests(user_id)
     for d in races.PROFILE_DURATIONS:
         assert bests[str(d)] == 250
-    assert "10" in bests  # per-race grid still covered
+    # Per-race grid durations are also covered by the union bests.
+    for d in races.RACE_POWER_DURATIONS:
+        assert str(d) in bests
 
 
 def test_power_profile_section_and_toggle_disabled_without_weight(client):
