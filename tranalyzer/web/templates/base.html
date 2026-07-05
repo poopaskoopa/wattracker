@@ -26,7 +26,7 @@
         </nav>
         {% endif %}
     </header>
-    <main>
+    <main class="{% block main_class %}{% endblock %}">
         {% block content %}{% endblock %}
     </main>
     <footer>

@@ -302,20 +302,19 @@ def refresh_race_results(
         db.save_user_settings(user_id, {"weight_kg": weight_kg})
 
     if source == "zwiftpower":
-        # ZwiftPower publishes most periods (w5..w1200) but not 1s or 10m; fill
-        # any period a race is missing from the matching imported ride of that
-        # date (closest by duration when the date has several rides).
+        # Resolve each race to the local ride of that date so the row links to
+        # its ride detail; also fill any power period ZwiftPower doesn't publish
+        # (1s / 10m) from that ride's stream.
         for r in results:
-            missing = [d for d in RACE_POWER_DURATIONS if str(d) not in r["power"]]
-            if not missing:
-                continue
             act = _matching_activity(user_id, r["event_date"], r.get("duration_s"))
             if act is None:
                 continue
-            stream = (act.get("streams") or {}).get("power") or []
-            for key, watts in power_per_period(stream, missing).items():
-                r["power"].setdefault(key, watts)
             r["activity_id"] = act["id"]
+            missing = [d for d in RACE_POWER_DURATIONS if str(d) not in r["power"]]
+            if missing:
+                stream = (act.get("streams") or {}).get("power") or []
+                for key, watts in power_per_period(stream, missing).items():
+                    r["power"].setdefault(key, watts)
         count = db.replace_race_results(user_id, "zwiftpower", results)
         # Real results supersede the heuristic ones: purge them for good.
         db.delete_race_results(user_id, "local")
@@ -371,6 +370,13 @@ def race_page_data(user_id: int) -> Dict:
     # rows exist, heuristic rows are hidden (and purged at next refresh).
     if any(r["source"] == "zwiftpower" for r in results):
         results = [r for r in results if r["source"] == "zwiftpower"]
+    # Lazily resolve the matching local ride so each race links to its detail
+    # graphs, even for rows cached before activity_id was persisted.
+    for r in results:
+        if not r.get("activity_id"):
+            act = _matching_activity(user_id, r["event_date"], r.get("duration_s"))
+            if act is not None:
+                r["activity_id"] = act["id"]
     weight = db.get_user_settings(user_id).get("weight_kg")
     return {
         "sync": sync,

@@ -20,6 +20,26 @@
 <p class="hint">No plans yet. Build one on the <a href="/generate">Generate</a> page (Plan mode).</p>
 {% endif %}
 
+{% if plans %}
+<div class="toolbar">
+    <form method="post" action="/plan/export-all">
+        <button type="submit">Export all to Zwift</button>
+    </form>
+    <span class="hint">Writes every not-yet-completed, non-OOTO workout as a
+        date-named <code>.zwo</code> into your Zwift Custom Workouts folder.</span>
+</div>
+{% if export_result == 'ok' %}
+<p class="ok">Exported plan workouts to your Zwift folder.</p>
+{% elif export_result == 'choose' %}
+<p class="alert">Several Zwift player folders were found &mdash; pick yours in
+    <a href="/settings">Settings</a>, then export again.</p>
+{% elif export_result == 'missing' %}
+<p class="alert">No Zwift Workouts folder found on this computer.</p>
+{% endif %}
+{% endif %}
+
+<div class="cal-layout">
+<div class="cal-main">
 <table class="calendar">
     <thead>
         <tr>{% for d in day_labels %}<th>{{ d }}</th>{% endfor %}</tr>
@@ -28,14 +48,14 @@
     {% for week in weeks %}
         <tr>
         {% for cell in week %}
-            <td class="cal-cell {{ 'other-month' if not cell.in_month else '' }}">
-                <div class="cal-day">{{ cell.day }}</div>
+            <td class="cal-cell {{ 'other-month' if not cell.in_month else '' }} {{ 'cal-ooto-day' if cell.ooto else '' }}">
+                <div class="cal-day">{{ cell.day }}{% if cell.ooto %} <span class="cal-ooto-tag">OOTO</span>{% endif %}</div>
                 {% for w in cell.workouts %}
-                    <div class="cal-workout cal-{{ w.type }}{{ ' cal-completed' if w.completed_activity_id else '' }}{{ ' cal-adapted' if w.adapted else '' }}"
+                    <div class="cal-workout cal-{{ w.type }}{{ ' cal-completed' if w.completed_activity_id else '' }}{{ ' cal-adapted' if w.adapted else '' }}{{ ' cal-skipped' if w.skipped else '' }}"
                          data-workout-id="{{ w.id }}"
                          role="button" tabindex="0"
-                         title="{{ w.name }} — {{ (w.duration_s // 60) }} min, {{ w.tss }} TSS.{{ ' Completed.' if w.completed_activity_id else '' }}{{ ' Adapted (' ~ w.adapted ~ ').' if w.adapted else '' }} Click for power details.">
-                        {% if w.completed_activity_id %}<span class="cal-check" aria-label="completed">&#10003;</span> {% endif %}{% if w.adapted %}<span class="cal-adapt-mark" aria-label="adapted ({{ w.adapted }})">&#8635;</span> {% endif %}{{ w.name }}<span class="cal-type">{{ w.type }}</span>
+                         title="{{ w.name }} — {{ (w.duration_s // 60) }} min, {{ w.tss }} TSS.{{ ' Completed.' if w.completed_activity_id else '' }}{{ ' Skipped (out of office).' if w.skipped else '' }}{{ ' Adapted (' ~ w.adapted ~ ').' if w.adapted else '' }} Click for power details.">
+                        {% if w.completed_activity_id %}<span class="cal-check" aria-label="completed">&#10003;</span> {% elif w.skipped %}<span class="cal-skip-mark" aria-label="skipped">&#8856;</span> {% endif %}{% if w.adapted %}<span class="cal-adapt-mark" aria-label="adapted ({{ w.adapted }})">&#8635;</span> {% endif %}{{ w.name }}<span class="cal-type">{{ w.type }}</span>
                     </div>
                 {% endfor %}
             </td>
@@ -44,6 +64,35 @@
     {% endfor %}
     </tbody>
 </table>
+</div>
+
+<aside class="ooto-panel">
+    <h3>Out of office</h3>
+    <p class="hint">Days you can&rsquo;t train. Workouts inside these ranges are
+        skipped on the calendar and excluded from Zwift export.</p>
+    <form method="post" action="/ooto/add" class="ooto-form">
+        <label>From <input type="date" name="start_date" required></label>
+        <label>To <input type="date" name="end_date"></label>
+        <label>Note <input type="text" name="note" placeholder="optional"></label>
+        <button type="submit">Add OOTO</button>
+    </form>
+    {% if ooto_ranges %}
+    <ul class="ooto-list">
+        {% for o in ooto_ranges %}
+        <li>
+            <span class="nowrap">{{ o.start_date }} &rarr; {{ o.end_date }}</span>
+            {% if o.note %}<span class="hint">{{ o.note }}</span>{% endif %}
+            <form method="post" action="/ooto/{{ o.id }}/delete" style="display:inline">
+                <button type="submit" class="link-btn">remove</button>
+            </form>
+        </li>
+        {% endfor %}
+    </ul>
+    {% else %}
+    <p class="hint">No out-of-office ranges set.</p>
+    {% endif %}
+</aside>
+</div>
 
 <!-- Workout power-detail modal (filled by JS from /api/plan/workout/{id}) -->
 <div id="workoutModal" class="modal-overlay" hidden>

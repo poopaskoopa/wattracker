@@ -32,6 +32,7 @@ nav a.logout { margin-left: 0.75rem; color: var(--muted); }
 .auth-form input { width: 100%; margin-top: 0.25rem; }
 .current-ftp { font-size: 1.05rem; }
 main { max-width: 960px; margin: 1.5rem auto; padding: 0 1.5rem; }
+main.wide { max-width: min(96vw, 1600px); }
 footer { text-align: center; color: var(--muted); padding: 2rem 0; }
 
 h2 { border-bottom: 1px solid #2a333d; padding-bottom: 0.4rem; }
@@ -90,6 +91,10 @@ button, .button {
     display: inline-block;
 }
 button:hover, .button:hover { filter: brightness(1.1); }
+.button.small { padding: 0.2rem 0.55rem; font-size: 0.78rem; }
+td.nowrap, th.nowrap { white-space: nowrap; }
+.race-table { width: 100%; }
+.race-table td, .race-table th { white-space: nowrap; }
 input, select {
     background: #10161d; color: var(--text); border: 1px solid #2a333d;
     border-radius: 6px; padding: 0.45rem 0.6rem;
@@ -135,10 +140,35 @@ table.calendar th { text-align: center; }
 .cal-workout .cal-type { display: block; color: var(--muted); font-size: 0.65rem; }
 .cal-vo2max, .cal-threshold { background: rgba(224,82,82,0.18); border-left-color: var(--alert); }
 .cal-endurance, .cal-recovery { background: rgba(76,175,125,0.15); border-left-color: var(--ok); }
-.cal-workout.cal-completed { opacity: 0.78; border-left-style: double; }
+.cal-workout.cal-completed {
+    background: rgba(76,175,125,0.28); border-left-color: var(--ok);
+    border-left-width: 4px;
+}
 .cal-check { color: var(--ok); font-weight: 700; }
 .cal-workout.cal-adapted { border-left-style: dashed; }
 .cal-adapt-mark { color: var(--accent); font-weight: 700; }
+.cal-workout.cal-skipped { opacity: 0.5; text-decoration: line-through;
+    border-left-color: var(--muted); }
+.cal-skip-mark { color: var(--muted); font-weight: 700; }
+.cal-cell.cal-ooto-day { background: repeating-linear-gradient(45deg,
+    rgba(138,148,160,0.10), rgba(138,148,160,0.10) 6px,
+    transparent 6px, transparent 12px); }
+.cal-ooto-tag { font-size: 0.6rem; color: var(--muted); border: 1px solid var(--muted);
+    border-radius: 3px; padding: 0 3px; vertical-align: middle; }
+
+/* Calendar layout with OOTO side panel */
+.cal-layout { display: flex; gap: 1rem; align-items: flex-start; flex-wrap: wrap; }
+.cal-main { flex: 1 1 640px; min-width: 0; overflow-x: auto; }
+.ooto-panel { flex: 0 0 260px; background: var(--panel); border: 1px solid #2a333d;
+    border-radius: 8px; padding: 0.75rem 1rem; }
+.ooto-panel h3 { margin-top: 0.2rem; }
+.ooto-form { display: flex; flex-direction: column; gap: 0.4rem; margin: 0.5rem 0; }
+.ooto-form label { display: flex; justify-content: space-between; align-items: center;
+    gap: 0.5rem; margin: 0; font-size: 0.85rem; }
+.ooto-form input { width: 150px; }
+.ooto-list { list-style: none; padding: 0; margin: 0.5rem 0 0; }
+.ooto-list li { display: flex; align-items: center; gap: 0.5rem; flex-wrap: wrap;
+    padding: 0.35rem 0; border-top: 1px solid #2a333d; font-size: 0.85rem; }
 
 /* Adaptive training status banner */
 .status-banner {

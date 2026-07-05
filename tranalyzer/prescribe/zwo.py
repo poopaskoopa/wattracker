@@ -2,10 +2,29 @@
 from __future__ import annotations
 
 import os
+import re
 import xml.etree.ElementTree as ET
 from xml.dom import minidom
 
 from .planner import Segment, Session
+
+_NAME_RE = re.compile(r"(<name>)(.*?)(</name>)", re.DOTALL)
+
+
+def dated_name_zwo(zwo_str: str, date_iso: str) -> str:
+    """Prefix the .zwo's internal <name> with the date (idempotent).
+
+    Zwift lists custom workouts by their internal <name>, so a date prefix lets
+    the user tell which day's workout is which. Skips prefixing when the name
+    already starts with the date.
+    """
+    def repl(m: "re.Match") -> str:
+        inner = m.group(2)
+        if inner.strip().startswith(date_iso):
+            return m.group(0)
+        return f"{m.group(1)}{date_iso} {inner}{m.group(3)}"
+
+    return _NAME_RE.sub(repl, zwo_str, count=1)
 
 
 def _fmt_power(frac: float) -> str:
@@ -139,8 +158,10 @@ def write_plan_to_zwift(
     for w in workouts:
         fname = plan_filename(w["date"], w["name"])
         p = os.path.join(target_dir, fname)
+        # Date-prefix the internal <name> too, so Zwift's list shows the date.
+        content = dated_name_zwo(w["zwo"], w["date"])
         with open(p, "w", encoding="utf-8") as f:
-            f.write(w["zwo"])
+            f.write(content)
         written.append(p)
     return {"directory": target_dir, "paths": written, "count": len(written)}
 

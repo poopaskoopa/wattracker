@@ -18,7 +18,7 @@ from fastapi.templating import Jinja2Templates
 from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.middleware.sessions import SessionMiddleware
 
-from . import auth, config, credstore, db, paths, races
+from . import auth, config, credstore, db, exporter, paths, races
 from .analysis import pipeline
 from .ble import devices as bledevices
 from .ble.runner import RideController, flatten_session
@@ -48,6 +48,7 @@ def run_daily_maintenance() -> dict:
     totals = importer.run_auto_scan()
     totals["adapted"] = 0
     totals["races"] = 0
+    totals["exported"] = 0
     for uid in db.all_user_ids():
         try:
             state = pipeline.build_state(uid)
@@ -60,6 +61,13 @@ def run_daily_maintenance() -> dict:
             totals["races"] += 1
         except Exception:
             _log.warning("race refresh failed for user %s", uid, exc_info=True)
+        try:
+            # Keep the Zwift custom-workout folder in sync with the plan
+            # (exports new/updated workouts, prunes completed/OOTO-skipped).
+            res = exporter.sync_plan_exports(uid)
+            totals["exported"] += res.get("exported", 0)
+        except Exception:
+            _log.warning("export sync failed for user %s", uid, exc_info=True)
     return totals
 
 
@@ -565,21 +573,31 @@ def create_app() -> FastAPI:
         elif m > 12:
             y, m = y + 1, 1
 
+        ooto_ranges = db.list_ooto_ranges(uid)
+
+        def _in_ooto(date_iso: str) -> bool:
+            return any(r["start_date"] <= date_iso <= r["end_date"]
+                       for r in ooto_ranges)
+
         by_date: dict = {}
         for w in db.plan_workouts_for_month(uid, y, m):
-            by_date.setdefault(w["date"], []).append(w)
+            wd = dict(w)
+            wd["skipped"] = _in_ooto(w["date"]) and not w.get("completed_activity_id")
+            by_date.setdefault(w["date"], []).append(wd)
 
         cal = _cal.Calendar(firstweekday=0)  # Monday
         weeks = []
         for week in cal.monthdatescalendar(y, m):
             row = []
             for d in week:
+                iso = d.isoformat()
                 row.append(
                     {
-                        "date": d.isoformat(),
+                        "date": iso,
                         "day": d.day,
                         "in_month": d.month == m,
-                        "workouts": by_date.get(d.isoformat(), []),
+                        "ooto": _in_ooto(iso),
+                        "workouts": by_date.get(iso, []),
                     }
                 )
             weeks.append(row)
@@ -599,8 +617,52 @@ def create_app() -> FastAPI:
                 prev=f"?year={prev_y}&month={prev_m}",
                 next=f"?year={next_y}&month={next_m}",
                 plans=db.list_plans(uid),
+                ooto_ranges=ooto_ranges,
+                export_result=request.query_params.get("exported"),
             ),
         )
+
+    @app.post("/plan/export-all")
+    def plan_export_all(request: Request):
+        uid = _uid(request)
+        result = exporter.sync_plan_exports(uid)
+        return RedirectResponse(
+            url=f"/calendar?exported={result['status']}", status_code=303
+        )
+
+    @app.post("/ooto/add")
+    def ooto_add(
+        request: Request,
+        start_date: str = Form(...),
+        end_date: str = Form(""),
+        note: str = Form(""),
+    ):
+        uid = _uid(request)
+        start = (start_date or "").strip()
+        end = (end_date or "").strip() or start
+        if start:
+            try:
+                _dt.date.fromisoformat(start)
+                _dt.date.fromisoformat(end)
+                db.add_ooto_range(uid, start, end, note.strip() or None)
+                # Keep the Zwift folder in sync (drop newly-skipped .zwo).
+                try:
+                    exporter.sync_plan_exports(uid)
+                except Exception:
+                    _log.warning("export sync after OOTO add failed", exc_info=True)
+            except ValueError:
+                pass
+        return RedirectResponse(url="/calendar", status_code=303)
+
+    @app.post("/ooto/{ooto_id}/delete")
+    def ooto_delete(request: Request, ooto_id: int):
+        uid = _uid(request)
+        db.delete_ooto_range(uid, ooto_id)
+        try:
+            exporter.sync_plan_exports(uid)  # re-export days that are back in
+        except Exception:
+            _log.warning("export sync after OOTO delete failed", exc_info=True)
+        return RedirectResponse(url="/calendar", status_code=303)
 
     @app.post("/generate/export")
     def generate_export(request: Request):

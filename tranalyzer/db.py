@@ -15,11 +15,12 @@ from typing import Dict, List, Optional
 
 from .config import db_path
 
-SCHEMA_VERSION = 8
+SCHEMA_VERSION = 9
 
 # In-place migrations: version N -> N+1 statement lists. A database whose
 # version has an unbroken chain here is upgraded without losing live data.
-# (Brand-new tables need no entry: init_db runs _SCHEMA after migrating.)
+# (Brand-new tables need no ALTERs - init_db runs _SCHEMA after migrating - but
+# each version still needs an entry, even an empty list, to keep the chain.)
 _MIGRATIONS: Dict[int, List[str]] = {
     3: [
         "ALTER TABLE plan_workouts ADD COLUMN completed_activity_id INTEGER",
@@ -40,9 +41,13 @@ _MIGRATIONS: Dict[int, List[str]] = {
     7: [
         "ALTER TABLE race_results ADD COLUMN source_type TEXT",
     ],
+    8: [
+        # New table ooto_ranges is created by _SCHEMA after migrating.
+    ],
 }
 
 _DROP = """
+DROP TABLE IF EXISTS ooto_ranges;
 DROP TABLE IF EXISTS race_sync;
 DROP TABLE IF EXISTS race_results;
 DROP TABLE IF EXISTS plan_workouts;
@@ -164,6 +169,18 @@ CREATE TABLE IF NOT EXISTS race_sync (
     auth_failed  INTEGER NOT NULL DEFAULT 0,
     FOREIGN KEY(user_id) REFERENCES users(id)
 );
+
+CREATE TABLE IF NOT EXISTS ooto_ranges (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id    INTEGER NOT NULL,
+    start_date TEXT NOT NULL,
+    end_date   TEXT NOT NULL,
+    note       TEXT,
+    created    TEXT NOT NULL,
+    FOREIGN KEY(user_id) REFERENCES users(id)
+);
+CREATE INDEX IF NOT EXISTS idx_ooto_user
+    ON ooto_ranges(user_id, start_date);
 """
 
 
@@ -993,6 +1010,68 @@ def get_race_sync(user_id: int, path: Optional[str] = None) -> Optional[dict]:
         except ValueError:
             d["bests"] = {}
         return d
+    finally:
+        conn.close()
+
+
+# -------------------------------------------------- out-of-office (OOTO)
+def add_ooto_range(
+    user_id: int, start_date: str, end_date: str, note: Optional[str] = None,
+    path: Optional[str] = None,
+) -> int:
+    """Add an out-of-office date range (inclusive). start<=end is enforced."""
+    if end_date < start_date:
+        start_date, end_date = end_date, start_date
+    conn = connect(path)
+    try:
+        cur = conn.execute(
+            "INSERT INTO ooto_ranges (user_id, start_date, end_date, note, created) "
+            "VALUES (?, ?, ?, ?, ?)",
+            (user_id, start_date, end_date, note or None,
+             _dt.datetime.now().isoformat(timespec="seconds")),
+        )
+        conn.commit()
+        return cur.lastrowid
+    finally:
+        conn.close()
+
+
+def list_ooto_ranges(user_id: int, path: Optional[str] = None) -> List[dict]:
+    conn = connect(path)
+    try:
+        rows = conn.execute(
+            "SELECT id, start_date, end_date, note FROM ooto_ranges "
+            "WHERE user_id = ? ORDER BY start_date ASC",
+            (user_id,),
+        ).fetchall()
+        return [dict(r) for r in rows]
+    finally:
+        conn.close()
+
+
+def delete_ooto_range(user_id: int, ooto_id: int, path: Optional[str] = None) -> bool:
+    conn = connect(path)
+    try:
+        cur = conn.execute(
+            "DELETE FROM ooto_ranges WHERE user_id = ? AND id = ?",
+            (user_id, ooto_id),
+        )
+        conn.commit()
+        return cur.rowcount > 0
+    finally:
+        conn.close()
+
+
+def ooto_covers(user_id: int, date_iso: str, path: Optional[str] = None) -> bool:
+    """True if the given date falls within any of the user's OOTO ranges."""
+    conn = connect(path)
+    try:
+        row = conn.execute(
+            "SELECT 1 FROM ooto_ranges WHERE user_id = ? "
+            "AND start_date <= ? AND end_date >= ? LIMIT 1",
+            (user_id, date_iso, date_iso),
+        ).fetchone()
+        return row is not None
     finally:
         conn.close()
 

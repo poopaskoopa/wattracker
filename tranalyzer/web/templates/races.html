@@ -1,5 +1,6 @@
 {% extends "base.html" %}
 {% block title %}Races &mdash; TRanalyzer{% endblock %}
+{% block main_class %}wide{% endblock %}
 {% block content %}
 <h2>Race Results</h2>
 
@@ -72,37 +73,47 @@
 {% endif %}
 
 {% if results %}
-<table>
+<div class="power-table-wrap">
+<table class="race-table">
     <thead><tr><th>Date</th><th>Event</th><th>Place</th><th>Cat</th>
         <th>Duration</th><th>Avg&nbsp;<span class="unit-label">W</span></th>
-        <th>NP&nbsp;(<span class="unit-label">W</span>)</th><th>IF</th></tr></thead>
+        <th>NP&nbsp;(<span class="unit-label">W</span>)</th><th>IF</th><th></th></tr></thead>
     <tbody>
     {% for r in results %}
         <tr>
-            <td>{{ r.event_date }}</td>
-            <td>{{ r.event_title }}</td>
+            <td class="nowrap">{{ r.event_date }}</td>
+            <td class="nowrap">
+                {% if r.activity_id %}<a href="/activity/{{ r.activity_id }}">{{ r.event_title }}</a>
+                {% else %}{{ r.event_title }}{% endif %}
+            </td>
             <td>{{ r.position or '—' }}</td>
             <td>{{ r.category or '—' }}</td>
-            <td>{{ (r.duration_s // 60) ~ ' min' if r.duration_s else '—' }}</td>
+            <td class="nowrap">{{ (r.duration_s // 60) ~ ' min' if r.duration_s else '—' }}</td>
             <td>{% if r.avg_power %}<span class="pw" data-w="{{ r.avg_power|round(0)|int }}">{{ r.avg_power|round(0)|int }}</span>{% else %}—{% endif %}</td>
             <td>{% if r.np %}<span class="pw" data-w="{{ r.np|round(0)|int }}">{{ r.np|round(0)|int }}</span>{% else %}—{% endif %}</td>
             <td>{{ r.if_|round(2) if r.if_ else '—' }}</td>
+            <td class="nowrap">{% if r.activity_id %}<a class="button small" href="/activity/{{ r.activity_id }}">Graphs</a>{% else %}<span class="muted">no ride data</span>{% endif %}</td>
         </tr>
     {% endfor %}
     </tbody>
 </table>
+</div>
 
 <h3>Average power per period (<span class="unit-label">W</span>)</h3>
 <div class="power-table-wrap">
 <table class="power-table">
     <thead>
-        <tr><th>Race</th>{% for l in duration_labels %}<th>{{ l }}</th>{% endfor %}</tr>
+        <tr><th>Date</th><th>Race</th>{% for l in duration_labels %}<th>{{ l }}</th>{% endfor %}</tr>
     </thead>
     <tbody>
     {% for r in results %}
         {% if r.power %}
         <tr>
-            <td>{{ r.event_date }} &mdash; {{ r.event_title }}</td>
+            <td class="nowrap">{{ r.event_date }}</td>
+            <td class="nowrap">
+                {% if r.activity_id %}<a href="/activity/{{ r.activity_id }}">{{ r.event_title }}</a>
+                {% else %}{{ r.event_title }}{% endif %}
+            </td>
             {% for d in durations %}
             <td>{% if r.power.get(d) %}<span class="pw" data-w="{{ r.power.get(d) }}">{{ r.power.get(d) }}</span>{% else %}—{% endif %}</td>
             {% endfor %}

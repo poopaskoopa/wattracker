@@ -23,7 +23,7 @@ def _register(client, username="rider"):
 
 
 def _activity(user_id, start_time, seconds, watts, if_=0.9, tss=80.0):
-    db.insert_activity(
+    return db.insert_activity(
         user_id,
         {
             "dedup_hash": f"h-{start_time}-{seconds}",
@@ -122,6 +122,52 @@ def test_refresh_uses_zwiftpower_when_it_answers(user_id, monkeypatch):
     assert rows[0]["source_type"] == "TYPE_RACE TYPE_RACE"
     assert rows[0]["power"]["15"] == 420  # from ZwiftPower's w15
     assert rows[0]["power"]["300"] == 260  # filled from the local ride
+    # The race resolves to its same-day imported ride for the graphs link.
+    assert rows[0]["activity_id"] is not None
+
+
+def test_race_links_to_matching_ride_and_none_when_absent(user_id, monkeypatch):
+    doc = {"data": [
+        {"event_date": int(dt.datetime(2026, 6, 1, 10).timestamp()),
+         "event_title": "Has Ride", "f_t": "TYPE_RACE", "w15": [400, 0]},
+        {"event_date": int(dt.datetime(2026, 5, 1, 10).timestamp()),
+         "event_title": "No Ride", "f_t": "TYPE_RACE", "w15": [380, 0]},
+    ]}
+    monkeypatch.setattr(races, "_http_get_json", lambda url, timeout=0: doc)
+    aid = _activity(user_id, "2026-06-01T10:00:00", 3600, 260.0, if_=0.9)
+    races.refresh_race_results(user_id, "1234567")
+    by_title = {r["event_title"]: r for r in races.race_page_data(user_id)["results"]}
+    assert by_title["Has Ride"]["activity_id"] == aid
+    assert by_title["No Ride"]["activity_id"] is None
+
+
+def test_race_page_renders_period_columns_and_graph_links(client, monkeypatch):
+    from tranalyzer import zwiftauth
+
+    _register(client)
+    uid = db.get_user_by_username("rider")["id"]
+    aid = _activity(uid, "2026-06-01T10:00:00", 3600, 260.0, if_=0.9)
+    doc = {"data": [{
+        "event_date": int(dt.datetime(2026, 6, 1, 10).timestamp()),
+        "event_title": "Crit City", "f_t": "TYPE_RACE",
+        "position_in_cat": 2, "category": "A",
+        "w5": [500, 0], "w15": [420, 0], "w30": [360, 0], "w60": [300, 0],
+        "w120": [270, 0], "w300": [240, 0], "w1200": [210, 0],
+    }]}
+    from tranalyzer import credstore
+    credstore.save_zwift_credentials(uid, "a@b.com", "pw")
+    monkeypatch.setattr(
+        zwiftauth, "fetch_results_authenticated",
+        lambda email, password, rider_id=None: (doc, "1234567", 72.0))
+    client.post("/races/refresh", data={"rider_id": "1234567"})
+    text = client.get("/races").text
+    # Per-period columns present with values (root-cause: were pushed off a
+    # 960px page; page is now wide + first column compact).
+    for label in ("1s", "5s", "15s", "30s", "1m", "5m", "20m"):
+        assert f"<th>{label}</th>" in text
+    assert 'data-w="420"' in text          # w15 value rendered
+    assert f'href="/activity/{aid}"' in text  # race links to its ride graphs
+    assert 'class="wide"' in text          # widened page
 
 
 def test_refresh_without_numeric_id_derives_locally(user_id):
