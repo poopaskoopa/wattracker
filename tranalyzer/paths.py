@@ -83,7 +83,7 @@ def candidate_zwift_ids(root: Optional[str] = None) -> List[dict]:
         p = os.path.join(root, name)
         if not os.path.isdir(p):
             continue
-        if not name.isdigit():  # excludes 'Downloaded', junk like '-16807'
+        if not name.isdigit():  # excludes 'Downloaded', junk like '-42'
             continue
         try:
             mtime = os.path.getmtime(p)

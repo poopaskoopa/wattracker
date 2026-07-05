@@ -215,22 +215,43 @@ def detect_rider_id(email: str, password: str) -> Tuple[str, Dict]:
     return str(rid), token
 
 
+def weight_kg_from_profile(profile: Dict) -> Optional[float]:
+    """Rider weight in kg from a Zwift profile (the API reports grams)."""
+    grams = profile.get("weight")
+    try:
+        kg = float(grams) / 1000.0
+    except (TypeError, ValueError):
+        return None
+    return round(kg, 1) if kg > 0 else None
+
+
 def fetch_results_authenticated(
     email: str,
     password: str,
     rider_id: Optional[str] = None,
     profile_url_template: Optional[str] = None,
-) -> Tuple[Dict, str]:
-    """One authenticated fetch: SSO (+rider-id auto-detect) then ZwiftPower.
+) -> Tuple[Dict, str, Optional[float]]:
+    """One authenticated fetch: Zwift SSO + profile, then ZwiftPower results.
 
-    Returns (profile results JSON document, rider_id). Raises ZwiftAuthError
-    on any authentication problem.
+    The Zwift profile is always fetched (rider-id auto-detect + current weight
+    for W/kg display). Returns (profile results JSON document, rider_id,
+    weight_kg or None). Raises ZwiftAuthError on any authentication problem.
     """
+    token = sso_token(email, password)
+    weight_kg: Optional[float] = None
+    try:
+        profile = fetch_profile_me(token.get("access_token") or "")
+        weight_kg = weight_kg_from_profile(profile)
+        detected = profile.get("id")
+    except ZwiftAuthError:
+        detected = None  # profile fetch is best-effort when rider_id is known
     if not rider_id or not str(rider_id).isdigit():
-        rider_id, _token = detect_rider_id(email, password)
+        if not detected:
+            raise ZwiftAuthError("Zwift profile has no rider id")
+        rider_id = detected
     opener = zwiftpower_login(email, password)
     template = profile_url_template or (
         "https://zwiftpower.com/cache3/profile/{rider_id}_all.json"
     )
     doc = fetch_zwiftpower_json(opener, template.format(rider_id=rider_id))
-    return doc, str(rider_id)
+    return doc, str(rider_id), weight_kg

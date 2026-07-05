@@ -15,7 +15,7 @@ from typing import Dict, List, Optional
 
 from .config import db_path
 
-SCHEMA_VERSION = 6
+SCHEMA_VERSION = 7
 
 # In-place migrations: version N -> N+1 statement lists. A database whose
 # version has an unbroken chain here is upgraded without losing live data.
@@ -33,6 +33,9 @@ _MIGRATIONS: Dict[int, List[str]] = {
         "ALTER TABLE user_settings ADD COLUMN zwift_email TEXT",
         "ALTER TABLE user_settings ADD COLUMN zwift_password_enc TEXT",
         "ALTER TABLE race_sync ADD COLUMN auth_failed INTEGER NOT NULL DEFAULT 0",
+    ],
+    6: [
+        "ALTER TABLE user_settings ADD COLUMN weight_kg REAL",
     ],
 }
 
@@ -63,6 +66,7 @@ CREATE TABLE IF NOT EXISTS user_settings (
     workouts_dir       TEXT,
     zwift_email        TEXT,
     zwift_password_enc TEXT,
+    weight_kg          REAL,
     FOREIGN KEY(user_id) REFERENCES users(id)
 );
 
@@ -253,15 +257,15 @@ def get_user_by_id(user_id: int, path: Optional[str] = None) -> Optional[dict]:
 
 # -------------------------------------------------------------- settings
 _SETTING_KEYS = ("ftp", "zwift_id", "activities_dir", "workouts_dir",
-                 "zwift_email")
+                 "zwift_email", "weight_kg")
 
 
 def get_user_settings(user_id: int, path: Optional[str] = None) -> dict:
     conn = connect(path)
     try:
         row = conn.execute(
-            "SELECT ftp, zwift_id, activities_dir, workouts_dir, zwift_email "
-            "FROM user_settings WHERE user_id = ?",
+            "SELECT ftp, zwift_id, activities_dir, workouts_dir, zwift_email, "
+            "weight_kg FROM user_settings WHERE user_id = ?",
             (user_id,),
         ).fetchone()
         if not row:
@@ -282,14 +286,16 @@ def save_user_settings(user_id: int, updates: dict, path: Optional[str] = None) 
         conn.execute(
             """
             INSERT INTO user_settings
-                (user_id, ftp, zwift_id, activities_dir, workouts_dir, zwift_email)
-            VALUES (?, ?, ?, ?, ?, ?)
+                (user_id, ftp, zwift_id, activities_dir, workouts_dir,
+                 zwift_email, weight_kg)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(user_id) DO UPDATE SET
                 ftp=excluded.ftp,
                 zwift_id=excluded.zwift_id,
                 activities_dir=excluded.activities_dir,
                 workouts_dir=excluded.workouts_dir,
-                zwift_email=excluded.zwift_email
+                zwift_email=excluded.zwift_email,
+                weight_kg=excluded.weight_kg
             """,
             (
                 user_id,
@@ -298,6 +304,7 @@ def save_user_settings(user_id: int, updates: dict, path: Optional[str] = None) 
                 current["activities_dir"],
                 current["workouts_dir"],
                 current["zwift_email"],
+                current["weight_kg"],
             ),
         )
         conn.commit()
@@ -875,6 +882,35 @@ def replace_race_results(
             )
         conn.commit()
         return len(results)
+    finally:
+        conn.close()
+
+
+def delete_race_results(
+    user_id: int, source: str, path: Optional[str] = None
+) -> int:
+    """Delete a user's cached results of one source. Returns rows removed."""
+    conn = connect(path)
+    try:
+        cur = conn.execute(
+            "DELETE FROM race_results WHERE user_id = ? AND source = ?",
+            (user_id, source),
+        )
+        conn.commit()
+        return cur.rowcount
+    finally:
+        conn.close()
+
+
+def count_race_results(
+    user_id: int, source: str, path: Optional[str] = None
+) -> int:
+    conn = connect(path)
+    try:
+        return conn.execute(
+            "SELECT COUNT(*) FROM race_results WHERE user_id = ? AND source = ?",
+            (user_id, source),
+        ).fetchone()[0]
     finally:
         conn.close()
 

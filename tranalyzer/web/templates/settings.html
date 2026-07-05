@@ -20,6 +20,11 @@
         <input type="text" name="zwift_id"
                value="{{ settings.zwift_id or '' }}">
     </label>
+    <label>Weight (kg) &mdash; used for W/kg on the Races page; auto-updated
+        from your Zwift profile whenever race results are refreshed:
+        <input type="number" step="0.1" min="20" max="200" name="weight_kg"
+               value="{{ settings.weight_kg if settings.weight_kg else '' }}">
+    </label>
     {% if zwift_candidates %}
     <fieldset class="zwift-picker">
         <legend>Zwift player folders detected on this computer &mdash; pick yours

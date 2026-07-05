@@ -646,10 +646,18 @@ def create_app() -> FastAPI:
         anthropic_api_key: str = Form(""),
         zwift_email: str = Form(""),
         zwift_password: str = Form(""),
+        weight_kg: str = Form(""),
     ):
         uid = _uid(request)
         # A picked player folder (radio) wins over the free-text field.
         chosen_zwift_id = (zwift_id_choice or "").strip() or zwift_id
+        weight_val: Optional[float] = None
+        try:
+            weight_val = float(weight_kg) if weight_kg.strip() else None
+            if weight_val is not None and weight_val <= 0:
+                weight_val = None
+        except ValueError:
+            weight_val = None
         db.save_user_settings(
             uid,
             {
@@ -657,6 +665,7 @@ def create_app() -> FastAPI:
                 "zwift_id": chosen_zwift_id,
                 "activities_dir": activities_dir,
                 "workouts_dir": workouts_dir,
+                "weight_kg": weight_val,
             },
         )
         # A manual FTP entry records a source='manual' row for today (per user).
@@ -710,6 +719,9 @@ def create_app() -> FastAPI:
             bests=data["bests"],
             durations=data["durations"],
             duration_labels=data["duration_labels"],
+            profile_durations=data["profile_durations"],
+            profile_labels=data["profile_labels"],
+            weight_kg=data["weight_kg"],
             rider_id=zid if zid.isdigit() else "",
             saved_zwift_id=zid,
             refreshed=refreshed,

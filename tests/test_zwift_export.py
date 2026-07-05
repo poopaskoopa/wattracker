@@ -45,7 +45,7 @@ PLAN_FORM = {
 def test_candidate_zwift_ids_numeric_only_most_recent_first(tmp_path):
     root = tmp_path / "W"
     root.mkdir()
-    for name in ("7654321", "1234567", "Downloaded", "-16807", "notes.txt"):
+    for name in ("7654321", "1234567", "Downloaded", "-42", "notes.txt"):
         (root / name).mkdir() if name != "notes.txt" else (root / name).write_text("x")
     os.utime(root / "1234567", (2_000_000_000, 2_000_000_000))  # most recent
     cands = paths.candidate_zwift_ids(root=str(root))

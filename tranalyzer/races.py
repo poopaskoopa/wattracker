@@ -35,10 +35,16 @@ from .metrics.curve import best_rolling_power
 
 log = logging.getLogger(__name__)
 
-# Exactly the spec'd table columns (seconds).
+# Exactly the spec'd per-race table columns (seconds).
 RACE_POWER_DURATIONS = (1, 5, 10, 30, 60, 120, 300, 600, 1200, 2400, 3600)
-DURATION_LABELS = {1: "1s", 5: "5s", 10: "10s", 30: "30s", 60: "1m", 120: "2m",
-                   300: "5m", 600: "10m", 1200: "20m", 2400: "40m", 3600: "1h"}
+# The "Power profile" section durations (spec: 1s/5s/15s/30s/1m/2m/5m/10m/20m/
+# 40m/1h) - all-time bests across every imported ride.
+PROFILE_DURATIONS = (1, 5, 15, 30, 60, 120, 300, 600, 1200, 2400, 3600)
+# Union grid used when computing/caching bests so both tables can render.
+BESTS_DURATIONS = tuple(sorted(set(RACE_POWER_DURATIONS) | set(PROFILE_DURATIONS)))
+DURATION_LABELS = {1: "1s", 5: "5s", 10: "10s", 15: "15s", 30: "30s", 60: "1m",
+                   120: "2m", 300: "5m", 600: "10m", 1200: "20m", 2400: "40m",
+                   3600: "1h"}
 
 # Local race heuristic: hard, sustained, race-length efforts.
 RACE_IF_MIN = 0.83
@@ -119,12 +125,14 @@ def _f(v) -> Optional[float]:
         return None
 
 
-def power_per_period(stream: List[float]) -> Dict[str, int]:
+def power_per_period(
+    stream: List[float], durations=RACE_POWER_DURATIONS
+) -> Dict[str, int]:
     """Best average power for each spec'd duration available in the stream."""
     out: Dict[str, int] = {}
     if not stream:
         return out
-    for d in RACE_POWER_DURATIONS:
+    for d in durations:
         if len(stream) >= d:
             best = best_rolling_power(stream, d)
             if best > 0:
@@ -169,11 +177,12 @@ def derive_local_results(user_id: int) -> List[dict]:
 
 
 def compute_bests(user_id: int) -> Dict[str, int]:
-    """All-time best power per spec'd duration across every imported ride."""
+    """All-time best power across every imported ride, over the union grid
+    (per-race table durations + Power-profile durations, incl. 15s)."""
     bests: Dict[str, int] = {}
     for a in db.full_activities(user_id):
         stream = (a.get("streams") or {}).get("power") or []
-        for key, watts in power_per_period(stream).items():
+        for key, watts in power_per_period(stream, BESTS_DURATIONS).items():
             if watts > bests.get(key, 0):
                 bests[key] = watts
     return bests
@@ -199,6 +208,11 @@ def refresh_race_results(
 
     Stores results + sync metadata in the DB and returns a summary dict:
     {source, count, error (remote failure reason or None), auth_failed}.
+
+    Real results replace heuristics, never mix with them: a successful
+    ZwiftPower fetch PURGES any previously-persisted FIT-derived rows, and
+    once real results are cached a later failed refresh keeps them (stale)
+    instead of regenerating heuristic entries.
     """
     from . import credstore, zwiftauth  # local import: keeps db-only callers light
 
@@ -209,6 +223,7 @@ def refresh_race_results(
 
     remote_error: Optional[str] = None
     auth_failed = False
+    weight_kg: Optional[float] = None
     results: List[dict] = []
     source = "local"
     creds = credstore.get_zwift_credentials(user_id)
@@ -223,7 +238,7 @@ def refresh_race_results(
             auth_failed = True
         else:
             try:
-                doc, detected_id = zwiftauth.fetch_results_authenticated(
+                doc, detected_id, weight_kg = zwiftauth.fetch_results_authenticated(
                     creds.email, creds.password,
                     rider_id if rider_id.isdigit() else None,
                 )
@@ -233,6 +248,8 @@ def refresh_race_results(
                     # Auto-detected from the Zwift profile: persist it.
                     rider_id = detected_id
                     db.save_user_settings(user_id, {"zwift_id": detected_id})
+                if weight_kg is None:
+                    weight_kg = _weight_from_zwiftpower_doc(doc)
             except zwiftauth.ZwiftAuthError as e:
                 remote_error = str(e)
                 auth_failed = bool(getattr(e, "credential_problem", False))
@@ -246,12 +263,14 @@ def refresh_race_results(
         remote_error = ("no numeric Zwift rider ID configured and no Zwift "
                         "credentials saved")
 
-    if source != "zwiftpower":
-        results = derive_local_results(user_id)
+    # Weight (for W/kg display): Zwift profile is primary, ZwiftPower rows
+    # secondary; refreshed on every successful authenticated refresh.
+    if weight_kg:
+        db.save_user_settings(user_id, {"weight_kg": weight_kg})
 
-    # Remote rows carry no power stream; fill per-race power from the local
-    # ride imported on the same date, when we have one.
     if source == "zwiftpower":
+        # Fill per-race power from the local ride imported on the same date
+        # (ZwiftPower rows carry no power stream).
         for r in results:
             if r["power"]:
                 continue
@@ -261,8 +280,18 @@ def refresh_race_results(
                 stream = (act.get("streams") or {}).get("power") or []
                 r["power"] = power_per_period(stream)
                 r["activity_id"] = act["id"]
+        count = db.replace_race_results(user_id, "zwiftpower", results)
+        # Real results supersede the heuristic ones: purge them for good.
+        db.delete_race_results(user_id, "local")
+    elif db.count_race_results(user_id, "zwiftpower") > 0:
+        # Refresh failed but real results are cached: keep them (stale)
+        # rather than fabricating heuristic rows next to real races.
+        source = "zwiftpower"
+        count = db.count_race_results(user_id, "zwiftpower")
+    else:
+        results = derive_local_results(user_id)
+        count = db.replace_race_results(user_id, "local", results)
 
-    count = db.replace_race_results(user_id, source, results)
     db.save_race_sync(
         user_id, rider_id or None, source, remote_error,
         bests=compute_bests(user_id), auth_failed=auth_failed,
@@ -271,14 +300,35 @@ def refresh_race_results(
             "auth_failed": auth_failed}
 
 
+def _weight_from_zwiftpower_doc(doc: dict) -> Optional[float]:
+    """Secondary weight source: the most recent ZwiftPower result row (kg)."""
+    rows = doc.get("data") or []
+    best = None
+    for r in rows:
+        w = _f(r.get("weight"))
+        when = r.get("event_date") or 0
+        if w and w > 20:  # sanity: kg, not garbage
+            if best is None or when >= best[0]:
+                best = (when, w)
+    return round(best[1], 1) if best else None
+
+
 def race_page_data(user_id: int) -> Dict:
     """Everything the /races page needs from the cache (no network)."""
     sync = db.get_race_sync(user_id)
     results = db.list_race_results(user_id)
+    # Real results and heuristics never mix on the page: if any ZwiftPower
+    # rows exist, heuristic rows are hidden (and purged at next refresh).
+    if any(r["source"] == "zwiftpower" for r in results):
+        results = [r for r in results if r["source"] == "zwiftpower"]
+    weight = db.get_user_settings(user_id).get("weight_kg")
     return {
         "sync": sync,
         "results": results,
         "bests": (sync or {}).get("bests") or {},
         "durations": [str(d) for d in RACE_POWER_DURATIONS],
         "duration_labels": [DURATION_LABELS[d] for d in RACE_POWER_DURATIONS],
+        "profile_durations": [str(d) for d in PROFILE_DURATIONS],
+        "profile_labels": [DURATION_LABELS[d] for d in PROFILE_DURATIONS],
+        "weight_kg": float(weight) if weight else None,
     }

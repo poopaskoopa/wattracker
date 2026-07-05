@@ -178,6 +178,15 @@ table.calendar th { text-align: center; }
 .power-table th, .power-table td { text-align: right; white-space: nowrap; }
 .power-table th:first-child, .power-table td:first-child { text-align: left; }
 .power-table .bests-row td { border-top: 2px solid var(--accent); }
+.profile-table th, .profile-table td { text-align: center; }
+.profile-table .bests-row td { border-top: none; color: var(--accent);
+    font-size: 1.05rem; }
+.unit-toggle { display: flex; align-items: center; gap: 0.5rem; margin: 0.75rem 0;
+    flex-wrap: wrap; }
+.unit-btn { background: #10161d; color: var(--text); border: 1px solid #2a333d;
+    border-radius: 6px; padding: 0.25rem 0.7rem; font-size: 0.85rem; font-weight: 600; }
+.unit-btn.active { background: var(--accent); color: #1a1a1a; border-color: var(--accent); }
+.unit-btn:disabled { opacity: 0.4; cursor: not-allowed; }
 
 /* Settings: Zwift player-folder picker */
 .zwift-picker { border: 1px solid #2a333d; border-radius: 6px; padding: 0.5rem 0.75rem;

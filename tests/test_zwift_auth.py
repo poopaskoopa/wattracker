@@ -269,7 +269,7 @@ def test_refresh_uses_credentials_and_autodetects_rider_id(user_id, monkeypatch)
     credstore.save_zwift_credentials(user_id, "a@b.com", "pw")
     monkeypatch.setattr(
         zwiftauth, "fetch_results_authenticated",
-        lambda email, password, rider_id=None: (ZP_DOC, "5555"),
+        lambda email, password, rider_id=None: (ZP_DOC, "5555", 72.5),
     )
     out = races.refresh_race_results(user_id)
     assert out["source"] == "zwiftpower"
@@ -313,7 +313,7 @@ def test_refresh_login_failure_marks_auth_failed_and_backs_off(user_id, monkeypa
     db.clear_race_auth_failure(user_id)
     monkeypatch.setattr(
         zwiftauth, "fetch_results_authenticated",
-        lambda email, password, rider_id=None: (ZP_DOC, "5555"))
+        lambda email, password, rider_id=None: (ZP_DOC, "5555", 72.5))
     out3 = races.refresh_race_results(user_id, respect_backoff=True)
     assert out3["source"] == "zwiftpower"
 
@@ -328,6 +328,90 @@ def test_transient_network_error_does_not_back_off(user_id, monkeypatch):
     assert out["source"] == "local"
     assert out["auth_failed"] is False  # transient, not a credential problem
     assert db.get_race_sync(user_id)["auth_failed"] == 0
+
+
+def test_successful_fetch_purges_heuristic_rows(user_id, monkeypatch):
+    # A previous fallback run left FIT-derived rows; a real fetch removes them.
+    db.replace_race_results(user_id, "local", [{
+        "event_date": "2026-06-01", "event_title": "Race effort - old",
+        "position": None, "category": None, "activity_id": 1,
+        "duration_s": 3600, "avg_power": 250.0, "np": 255.0, "if_": 0.9,
+        "power": {}, "fetched_at": "2026-06-01T12:00:00"}])
+    credstore.save_zwift_credentials(user_id, "a@b.com", "pw")
+    monkeypatch.setattr(
+        zwiftauth, "fetch_results_authenticated",
+        lambda email, password, rider_id=None: (ZP_DOC, "5555", 72.5))
+    races.refresh_race_results(user_id)
+    rows = db.list_race_results(user_id)
+    assert len(rows) == 1
+    assert rows[0]["source"] == "zwiftpower"
+    assert all("Race effort" not in r["event_title"] for r in rows)
+
+
+def test_failed_refresh_keeps_stale_real_results(user_id, monkeypatch):
+    # Real results cached, then the login starts failing: keep the real rows
+    # (stale) - never regenerate heuristic entries next to them.
+    credstore.save_zwift_credentials(user_id, "a@b.com", "pw")
+    monkeypatch.setattr(
+        zwiftauth, "fetch_results_authenticated",
+        lambda email, password, rider_id=None: (ZP_DOC, "5555", 72.5))
+    races.refresh_race_results(user_id)
+    # An imported hard ride that WOULD be flagged by the heuristic.
+    db.insert_activity(user_id, {
+        "dedup_hash": "hard1", "filename": "hard.fit",
+        "start_time": "2026-06-20T10:00:00", "duration_s": 3600,
+        "distance_m": 0, "avg_power": 260, "avg_hr": 0, "np": 265,
+        "if_": 0.9, "tss": 81.0, "streams": {"power": [260.0] * 100}})
+    monkeypatch.setattr(
+        zwiftauth, "fetch_results_authenticated",
+        lambda email, password, rider_id=None: (_ for _ in ()).throw(
+            zwiftauth.ZwiftAuthError("login failed", credential_problem=True)))
+    out = races.refresh_race_results(user_id)
+    assert out["source"] == "zwiftpower"  # stale real results still shown
+    rows = db.list_race_results(user_id)
+    assert len(rows) == 1 and rows[0]["source"] == "zwiftpower"
+
+
+def test_page_data_hides_heuristics_when_real_results_exist(user_id):
+    fetched = "2026-06-01T12:00:00"
+    db.replace_race_results(user_id, "zwiftpower", [{
+        "event_date": "2026-06-02", "event_title": "Real Race", "position": "1",
+        "category": "A", "activity_id": None, "duration_s": None,
+        "avg_power": 250.0, "np": None, "if_": None, "power": {},
+        "fetched_at": fetched}])
+    db.replace_race_results(user_id, "local", [{
+        "event_date": "2026-06-01", "event_title": "Race effort - x",
+        "position": None, "category": None, "activity_id": 1,
+        "duration_s": 3600, "avg_power": 240.0, "np": None, "if_": 0.9,
+        "power": {}, "fetched_at": fetched}])
+    data = races.race_page_data(user_id)
+    assert [r["event_title"] for r in data["results"]] == ["Real Race"]
+
+
+def test_refresh_persists_weight_from_zwift_profile(user_id, monkeypatch):
+    credstore.save_zwift_credentials(user_id, "a@b.com", "pw")
+    monkeypatch.setattr(
+        zwiftauth, "fetch_results_authenticated",
+        lambda email, password, rider_id=None: (ZP_DOC, "5555", 72.5))
+    races.refresh_race_results(user_id)
+    assert db.get_user_settings(user_id)["weight_kg"] == 72.5
+
+
+def test_refresh_uses_zwiftpower_weight_as_secondary(user_id, monkeypatch):
+    doc = dict(ZP_DOC)
+    doc["data"] = [dict(ZP_DOC["data"][0], weight=[71.2, 0])]
+    credstore.save_zwift_credentials(user_id, "a@b.com", "pw")
+    monkeypatch.setattr(
+        zwiftauth, "fetch_results_authenticated",
+        lambda email, password, rider_id=None: (doc, "5555", None))
+    races.refresh_race_results(user_id)
+    assert db.get_user_settings(user_id)["weight_kg"] == 71.2
+
+
+def test_weight_kg_from_profile_grams():
+    assert zwiftauth.weight_kg_from_profile({"weight": 72500}) == 72.5
+    assert zwiftauth.weight_kg_from_profile({"weight": 0}) is None
+    assert zwiftauth.weight_kg_from_profile({}) is None
 
 
 # ----------------------------------------------------------------- routes
@@ -393,7 +477,7 @@ def test_races_page_labels_authenticated_source(client, monkeypatch):
     credstore.save_zwift_credentials(uid, "a@b.com", "pw")
     monkeypatch.setattr(
         zwiftauth, "fetch_results_authenticated",
-        lambda email, password, rider_id=None: (ZP_DOC, "5555"))
+        lambda email, password, rider_id=None: (ZP_DOC, "5555", 72.5))
     r = client.post("/races/refresh", data={"rider_id": ""})
     assert "using your Zwift login" in r.text
     assert "WTRL TTT" in r.text

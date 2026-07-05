@@ -123,7 +123,7 @@ def test_refresh_uses_zwiftpower_when_it_answers(user_id, monkeypatch):
 
 def test_refresh_without_numeric_id_derives_locally(user_id):
     _activity(user_id, "2026-06-01T10:00:00", 3600, 260.0, if_=0.9)
-    out = races.refresh_race_results(user_id, "demo rider")
+    out = races.refresh_race_results(user_id, "not a number")
     assert out["source"] == "local"
     assert "no numeric" in out["error"]
 
@@ -174,9 +174,9 @@ def test_races_refresh_route_persists_id_and_shows_results(client, monkeypatch):
     assert db.get_user_settings(uid)["zwift_id"] == "1234567"
     assert "Derived 1 race effort" in r.text
     assert "detected from your imported rides" in r.text  # source labeled
-    assert "All-time bests" in r.text
-    # Power table shows the spec'd period columns.
-    for label in ("1s", "5s", "30s", "2m", "20m", "40m", "1h"):
+    assert "Power profile" in r.text and "all-time bests" in r.text
+    # Power tables show the spec'd period columns (incl. 15s in the profile).
+    for label in ("1s", "5s", "15s", "30s", "2m", "20m", "40m", "1h"):
         assert f"<th>{label}</th>" in r.text
 
 
@@ -197,3 +197,55 @@ def test_races_page_shows_stale_cache_without_network(client, monkeypatch):
     text = client.get("/races").text
     assert "Race effort" in text
     assert "Last refreshed" in text
+
+
+# ----------------------------------------------- power profile + W/kg toggle
+def test_profile_durations_spec_includes_15s():
+    assert races.PROFILE_DURATIONS == (1, 5, 15, 30, 60, 120, 300, 600,
+                                       1200, 2400, 3600)
+    from tranalyzer.metrics.curve import MMP_DURATIONS
+
+    assert 15 in MMP_DURATIONS
+
+
+def test_bests_cover_profile_grid(user_id):
+    _activity(user_id, "2026-06-01T10:00:00", 3600, 250.0, if_=0.9)
+    bests = races.compute_bests(user_id)
+    for d in races.PROFILE_DURATIONS:
+        assert bests[str(d)] == 250
+    assert "10" in bests  # per-race grid still covered
+
+
+def test_power_profile_section_and_toggle_disabled_without_weight(client):
+    _register(client)
+    uid = db.get_user_by_username("rider")["id"]
+    _activity(uid, "2026-06-01T10:00:00", 3600, 260.0, if_=0.9)
+    client.post("/races/refresh", data={"rider_id": ""})
+    text = client.get("/races").text
+    assert "Power profile" in text and "<th>15s</th>" in text
+    # No weight from any source: W/kg toggle disabled with a Settings hint.
+    assert 'id="unitWkg"' in text and "disabled" in text
+    assert "set it in" in text and "/settings" in text
+    # Values carry machine-readable watts for the client-side conversion.
+    assert 'data-w="260"' in text
+
+
+def test_toggle_enabled_with_weight_and_settings_override(client):
+    _register(client)
+    uid = db.get_user_by_username("rider")["id"]
+    _activity(uid, "2026-06-01T10:00:00", 3600, 260.0, if_=0.9)
+    # Manual weight override via Settings.
+    r = client.post("/settings", data={"weight_kg": "68.0"})
+    assert r.status_code == 200
+    assert db.get_user_settings(uid)["weight_kg"] == 68.0
+    client.post("/races/refresh", data={"rider_id": ""})
+    text = client.get("/races").text
+    assert 'data-weight="68.0"' in text
+    assert "(at 68.0 kg)" in text
+    # Enabled toggle: the W/kg button carries no disabled attribute.
+    import re
+
+    btn = re.search(r'<button[^>]*id="unitWkg"[^>]*>', text).group(0)
+    assert "disabled" not in btn
+    # Preference persistence is client-side (localStorage) in the page script.
+    assert "localStorage" in text and "tr_power_unit" in text

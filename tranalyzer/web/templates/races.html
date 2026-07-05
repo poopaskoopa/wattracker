@@ -56,10 +56,26 @@
 </p>
 {% endif %}
 
+{% if results or bests %}
+<div class="unit-toggle" data-weight="{{ weight_kg or '' }}">
+    <span class="hint">Units:</span>
+    <button type="button" id="unitW" class="unit-btn active">W</button>
+    <button type="button" id="unitWkg" class="unit-btn"
+            {{ 'disabled' if not weight_kg else '' }}>W/kg</button>
+    {% if weight_kg %}
+    <span class="hint">(at {{ weight_kg }} kg)</span>
+    {% else %}
+    <span class="hint">W/kg needs your weight &mdash; refresh results with
+        Zwift credentials or set it in <a href="/settings">Settings</a>.</span>
+    {% endif %}
+</div>
+{% endif %}
+
 {% if results %}
 <table>
     <thead><tr><th>Date</th><th>Event</th><th>Place</th><th>Cat</th>
-        <th>Duration</th><th>Avg&nbsp;W</th><th>NP</th><th>IF</th></tr></thead>
+        <th>Duration</th><th>Avg&nbsp;<span class="unit-label">W</span></th>
+        <th>NP&nbsp;(<span class="unit-label">W</span>)</th><th>IF</th></tr></thead>
     <tbody>
     {% for r in results %}
         <tr>
@@ -68,15 +84,15 @@
             <td>{{ r.position or '—' }}</td>
             <td>{{ r.category or '—' }}</td>
             <td>{{ (r.duration_s // 60) ~ ' min' if r.duration_s else '—' }}</td>
-            <td>{{ r.avg_power|round(0)|int if r.avg_power else '—' }}</td>
-            <td>{{ r.np|round(0)|int if r.np else '—' }}</td>
+            <td>{% if r.avg_power %}<span class="pw" data-w="{{ r.avg_power|round(0)|int }}">{{ r.avg_power|round(0)|int }}</span>{% else %}—{% endif %}</td>
+            <td>{% if r.np %}<span class="pw" data-w="{{ r.np|round(0)|int }}">{{ r.np|round(0)|int }}</span>{% else %}—{% endif %}</td>
             <td>{{ r.if_|round(2) if r.if_ else '—' }}</td>
         </tr>
     {% endfor %}
     </tbody>
 </table>
 
-<h3>Average power per period (W)</h3>
+<h3>Average power per period (<span class="unit-label">W</span>)</h3>
 <div class="power-table-wrap">
 <table class="power-table">
     <thead>
@@ -88,19 +104,11 @@
         <tr>
             <td>{{ r.event_date }} &mdash; {{ r.event_title }}</td>
             {% for d in durations %}
-            <td>{{ r.power.get(d, '—') }}</td>
+            <td>{% if r.power.get(d) %}<span class="pw" data-w="{{ r.power.get(d) }}">{{ r.power.get(d) }}</span>{% else %}—{% endif %}</td>
             {% endfor %}
         </tr>
         {% endif %}
     {% endfor %}
-    {% if bests %}
-        <tr class="bests-row">
-            <td><strong>All-time bests</strong> (all imported rides)</td>
-            {% for d in durations %}
-            <td><strong>{{ bests.get(d, '—') }}</strong></td>
-            {% endfor %}
-        </tr>
-    {% endif %}
     </tbody>
 </table>
 </div>
@@ -109,4 +117,53 @@
    &ldquo;Refresh results&rdquo; &mdash; or import rides on the
    <a href="/activities">Activities</a> page so race efforts can be detected.</p>
 {% endif %}
+
+{% if bests %}
+<h3>Power profile &mdash; all-time bests (<span class="unit-label">W</span>)</h3>
+<p class="hint">Best average power across every imported ride.</p>
+<div class="power-table-wrap">
+<table class="power-table profile-table">
+    <thead>
+        <tr>{% for l in profile_labels %}<th>{{ l }}</th>{% endfor %}</tr>
+    </thead>
+    <tbody>
+        <tr class="bests-row">
+            {% for d in profile_durations %}
+            <td>{% if bests.get(d) %}<strong><span class="pw" data-w="{{ bests.get(d) }}">{{ bests.get(d) }}</span></strong>{% else %}—{% endif %}</td>
+            {% endfor %}
+        </tr>
+    </tbody>
+</table>
+</div>
+{% endif %}
+
+<script>
+(function () {
+    var toggle = document.querySelector(".unit-toggle");
+    if (!toggle) return;
+    var weight = parseFloat(toggle.dataset.weight);
+    var btnW = document.getElementById("unitW");
+    var btnWkg = document.getElementById("unitWkg");
+
+    function apply(mode) {
+        var wkg = mode === "wkg" && weight > 0;
+        document.querySelectorAll(".pw").forEach(function (el) {
+            var w = parseFloat(el.dataset.w);
+            el.textContent = wkg ? (w / weight).toFixed(2) : Math.round(w);
+        });
+        document.querySelectorAll(".unit-label").forEach(function (el) {
+            el.textContent = wkg ? "W/kg" : "W";
+        });
+        btnW.classList.toggle("active", !wkg);
+        btnWkg.classList.toggle("active", wkg);
+        try { localStorage.setItem("tr_power_unit", wkg ? "wkg" : "w"); } catch (e) {}
+    }
+    btnW.addEventListener("click", function () { apply("w"); });
+    btnWkg.addEventListener("click", function () { apply("wkg"); });
+
+    var saved = "w";
+    try { saved = localStorage.getItem("tr_power_unit") || "w"; } catch (e) {}
+    if (saved === "wkg" && weight > 0) apply("wkg");
+})();
+</script>
 {% endblock %}

@@ -15,10 +15,19 @@ dist/
 *.db
 *.sqlite
 *.sqlite3
+*.sqlite-*
 
-# Environment / secrets
+# User ride/workout data (never commit personal training files)
+*.fit
+*.FIT
+*.zwo
+
+# Environment / secrets / keys
 .env
 config.json
+credentials.key
+*.key
+*.pem
 
 # OS / editor
 .DS_Store
@@ -33,3 +42,10 @@ htmlcov/
 # runtime artifacts
 .tranalyzer.pid
 tranalyzer.log
+*.log
+nohup.out
+
+# scratch / one-off scripts
+scratch/
+sanity*.py
+tmp/
