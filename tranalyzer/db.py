@@ -592,6 +592,30 @@ def latest_ftp(user_id: int, path: Optional[str] = None) -> Optional[dict]:
         conn.close()
 
 
+def ftp_as_of(
+    user_id: int, date_iso: str, path: Optional[str] = None
+) -> Optional[float]:
+    """The user's FTP effective on a date: the latest ftp_history entry on or
+    before it, else the earliest entry after it (so older races still get a
+    sensible FTP). Returns watts, or None when there is no history at all."""
+    conn = connect(path)
+    try:
+        row = conn.execute(
+            "SELECT ftp_watts FROM ftp_history WHERE user_id = ? AND date <= ? "
+            "ORDER BY date DESC LIMIT 1",
+            (user_id, date_iso),
+        ).fetchone()
+        if row is None:
+            row = conn.execute(
+                "SELECT ftp_watts FROM ftp_history WHERE user_id = ? "
+                "ORDER BY date ASC LIMIT 1",
+                (user_id,),
+            ).fetchone()
+        return float(row["ftp_watts"]) if row and row["ftp_watts"] else None
+    finally:
+        conn.close()
+
+
 def ftp_history_list(user_id: int, path: Optional[str] = None) -> List[dict]:
     conn = connect(path)
     try:

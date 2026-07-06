@@ -32,7 +32,8 @@ nav a.logout { margin-left: 0.75rem; color: var(--muted); }
 .auth-form input { width: 100%; margin-top: 0.25rem; }
 .current-ftp { font-size: 1.05rem; }
 main { max-width: 960px; margin: 1.5rem auto; padding: 0 1.5rem; }
-main.wide { max-width: min(96vw, 1600px); }
+/* Full-bleed pages (races): span essentially the whole viewport, small gutter. */
+main.wide { max-width: none; margin: 1.5rem 0; padding: 0 1rem; }
 footer { text-align: center; color: var(--muted); padding: 2rem 0; }
 
 h2 { border-bottom: 1px solid #2a333d; padding-bottom: 0.4rem; }
@@ -95,6 +96,9 @@ button:hover, .button:hover { filter: brightness(1.1); }
 td.nowrap, th.nowrap { white-space: nowrap; }
 .race-table { width: 100%; }
 .race-table td, .race-table th { white-space: nowrap; }
+.race-table td.place { text-align: center; }
+.trophy { vertical-align: middle; display: inline-block; }
+.trophy title { pointer-events: none; }
 input, select {
     background: #10161d; color: var(--text); border: 1px solid #2a333d;
     border-radius: 6px; padding: 0.45rem 0.6rem;

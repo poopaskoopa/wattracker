@@ -72,12 +72,22 @@
 </div>
 {% endif %}
 
+{% macro trophy(place) %}
+{%- set colors = {1: '#d4af37', 2: '#bfc1c2', 3: '#cd7f32'} -%}
+<svg class="trophy" viewBox="0 0 24 24" width="18" height="18" role="img"
+     aria-label="{{ place }}{{ 'st' if place == 1 else ('nd' if place == 2 else 'rd') }} place"
+     fill="{{ colors[place] }}"><title>{{ place }}{{ 'st' if place == 1 else ('nd' if place == 2 else 'rd') }} place</title>
+<path d="M6 3h12v2h3v3a4 4 0 0 1-4 4h-.35A6 6 0 0 1 13 15.9V18h3v2H8v-2h3v-2.1A6 6 0 0 1 7.35 12H7a4 4 0 0 1-4-4V5h3V3zm0 4H5v1a2 2 0 0 0 1 1.73V7zm12 0v2.73A2 2 0 0 0 19 8V7h-1z"/></svg>
+{%- endmacro %}
+
 {% if results %}
 <div class="power-table-wrap">
 <table class="race-table">
     <thead><tr><th>Date</th><th>Event</th><th>Place</th><th>Cat</th>
         <th>Duration</th><th>Avg&nbsp;<span class="unit-label">W</span></th>
-        <th>NP&nbsp;(<span class="unit-label">W</span>)</th><th>IF</th><th></th></tr></thead>
+        <th>NP&nbsp;(<span class="unit-label">W</span>)</th>
+        {% for l in duration_labels %}<th>{{ l }}</th>{% endfor %}
+        <th>IF</th><th></th></tr></thead>
     <tbody>
     {% for r in results %}
         <tr>
@@ -86,39 +96,17 @@
                 {% if r.activity_id %}<a href="/activity/{{ r.activity_id }}">{{ r.event_title }}</a>
                 {% else %}{{ r.event_title }}{% endif %}
             </td>
-            <td>{{ r.position or '—' }}</td>
+            <td class="place">{% if r.place in (1, 2, 3) %}{{ trophy(r.place) }}{% else %}{{ r.position or '—' }}{% endif %}</td>
             <td>{{ r.category or '—' }}</td>
             <td class="nowrap">{{ (r.duration_s // 60) ~ ' min' if r.duration_s else '—' }}</td>
             <td>{% if r.avg_power %}<span class="pw" data-w="{{ r.avg_power|round(0)|int }}">{{ r.avg_power|round(0)|int }}</span>{% else %}—{% endif %}</td>
             <td>{% if r.np %}<span class="pw" data-w="{{ r.np|round(0)|int }}">{{ r.np|round(0)|int }}</span>{% else %}—{% endif %}</td>
-            <td>{{ r.if_|round(2) if r.if_ else '—' }}</td>
-            <td class="nowrap">{% if r.activity_id %}<a class="button small" href="/activity/{{ r.activity_id }}">Graphs</a>{% else %}<span class="muted">no ride data</span>{% endif %}</td>
-        </tr>
-    {% endfor %}
-    </tbody>
-</table>
-</div>
-
-<h3>Average power per period (<span class="unit-label">W</span>)</h3>
-<div class="power-table-wrap">
-<table class="power-table">
-    <thead>
-        <tr><th>Date</th><th>Race</th>{% for l in duration_labels %}<th>{{ l }}</th>{% endfor %}</tr>
-    </thead>
-    <tbody>
-    {% for r in results %}
-        {% if r.power %}
-        <tr>
-            <td class="nowrap">{{ r.event_date }}</td>
-            <td class="nowrap">
-                {% if r.activity_id %}<a href="/activity/{{ r.activity_id }}">{{ r.event_title }}</a>
-                {% else %}{{ r.event_title }}{% endif %}
-            </td>
             {% for d in durations %}
             <td>{% if r.power.get(d) %}<span class="pw" data-w="{{ r.power.get(d) }}">{{ r.power.get(d) }}</span>{% else %}—{% endif %}</td>
             {% endfor %}
+            <td>{{ r.if_|round(2) if r.if_ else '—' }}</td>
+            <td class="nowrap">{% if r.activity_id %}<a class="button small" href="/activity/{{ r.activity_id }}">Graphs</a>{% else %}<span class="muted">no ride data</span>{% endif %}</td>
         </tr>
-        {% endif %}
     {% endfor %}
     </tbody>
 </table>

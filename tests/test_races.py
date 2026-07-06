@@ -170,6 +170,100 @@ def test_race_page_renders_period_columns_and_graph_links(client, monkeypatch):
     assert 'class="wide"' in text          # widened page
 
 
+def test_period_columns_merged_after_np_no_separate_table(client, monkeypatch):
+    from tranalyzer import credstore, zwiftauth
+
+    _register(client)
+    uid = db.get_user_by_username("rider")["id"]
+    doc = {"data": [{
+        "event_date": int(dt.datetime(2026, 6, 1, 10).timestamp()),
+        "event_title": "Crit City", "f_t": "TYPE_RACE",
+        "np": [270, 1], "w5": [500, 0], "w15": [420, 0],
+    }]}
+    credstore.save_zwift_credentials(uid, "a@b.com", "pw")
+    monkeypatch.setattr(
+        zwiftauth, "fetch_results_authenticated",
+        lambda email, password, rider_id=None: (doc, "1234567", 72.0))
+    client.post("/races/refresh", data={"rider_id": "1234567"})
+    text = client.get("/races").text
+    # Merged into ONE table: NP header then the period headers then IF, and the
+    # old standalone "Average power per period" table is gone.
+    assert "Average power per period" not in text
+    head = text[text.index("<thead>"):text.index("</thead>")]
+    assert (head.index("NP") < head.index("<th>1s</th>")
+            < head.index("<th>20m</th>") < head.index("<th>IF</th>"))
+
+
+def test_if_computed_from_np_and_ftp_as_of_date(client, monkeypatch):
+    from tranalyzer import credstore, zwiftauth
+
+    _register(client)
+    uid = db.get_user_by_username("rider")["id"]
+    # FTP history: 250 W from 2026-01-01. A race on 2026-06-01 with NP 275
+    # -> IF = 275/250 = 1.10 (ZP provides no IF field).
+    db.add_ftp_entry(uid, "2026-01-01", 250.0, "manual")
+    doc = {"data": [{
+        "event_date": int(dt.datetime(2026, 6, 1, 10).timestamp()),
+        "event_title": "R", "f_t": "TYPE_RACE", "np": [275, 1],
+    }]}
+    credstore.save_zwift_credentials(uid, "a@b.com", "pw")
+    monkeypatch.setattr(
+        zwiftauth, "fetch_results_authenticated",
+        lambda email, password, rider_id=None: (doc, "1234567", 72.0))
+    client.post("/races/refresh", data={"rider_id": "1234567"})
+    rows = db.list_race_results(uid)
+    assert rows[0]["if_"] == pytest.approx(1.10, abs=0.001)
+    assert "1.1" in client.get("/races").text  # rendered, no longer blank
+
+
+def test_if_from_zwiftpower_race_ftp_field():
+    # ZP carries the rider's FTP at the race; IF = NP / that FTP.
+    doc = {"data": [{
+        "event_date": int(dt.datetime(2026, 6, 1, 10).timestamp()),
+        "event_title": "R", "f_t": "TYPE_RACE", "np": [240, 0], "ftp": "200",
+    }]}
+    row = races.parse_zwiftpower_profile(doc)[0]
+    assert row["if_"] == pytest.approx(1.20, abs=0.001)
+
+
+def test_place_int_parsing():
+    assert races._place_int("1") == 1
+    assert races._place_int(3) == 3
+    assert races._place_int("2nd") == 2
+    assert races._place_int("15 /40") == 15
+    assert races._place_int("") is None
+    assert races._place_int(None) is None
+
+
+def test_podium_trophies_rendered(client, monkeypatch):
+    from tranalyzer import credstore, zwiftauth
+
+    _register(client)
+    uid = db.get_user_by_username("rider")["id"]
+    ts = lambda d: int(dt.datetime(2026, 6, d, 10).timestamp())  # noqa: E731
+    doc = {"data": [
+        {"event_date": ts(1), "event_title": "Win", "f_t": "TYPE_RACE",
+         "position_in_cat": 1, "np": [270, 1]},
+        {"event_date": ts(2), "event_title": "Third", "f_t": "TYPE_RACE",
+         "position_in_cat": 3, "np": [260, 1]},
+        {"event_date": ts(3), "event_title": "Pack", "f_t": "TYPE_RACE",
+         "position_in_cat": 12, "np": [250, 1]},
+    ]}
+    credstore.save_zwift_credentials(uid, "a@b.com", "pw")
+    monkeypatch.setattr(
+        zwiftauth, "fetch_results_authenticated",
+        lambda email, password, rider_id=None: (doc, "1234567", 72.0))
+    client.post("/races/refresh", data={"rider_id": "1234567"})
+    text = client.get("/races").text
+    assert 'class="trophy"' in text
+    assert 'fill="#d4af37"' in text       # gold for 1st
+    assert 'fill="#cd7f32"' in text       # bronze for 3rd
+    assert "1st place" in text and "3rd place" in text
+    assert 'fill="#bfc1c2"' not in text   # no 2nd place in this set
+    # 12th renders as plain text, not a trophy.
+    assert ">12<" in text or ">12 " in text
+
+
 def test_refresh_without_numeric_id_derives_locally(user_id):
     _activity(user_id, "2026-06-01T10:00:00", 3600, 260.0, if_=0.9)
     out = races.refresh_race_results(user_id, "not a number")

@@ -26,6 +26,7 @@ from __future__ import annotations
 import datetime as _dt
 import json
 import logging
+import re
 import urllib.error
 import urllib.request
 from typing import Dict, List, Optional
@@ -129,6 +130,12 @@ def parse_zwiftpower_profile(doc: dict) -> List[dict]:
         except (ValueError, TypeError, OSError):
             continue
         dur = _f(r.get("time"))  # seconds ([value, flag] or scalar)
+        np = _f(r.get("np"))
+        # ZwiftPower does not publish IF, but it does carry the rider's FTP at
+        # the race (``ftp`` / ``wftp``); IF = NP / FTP. When that FTP is
+        # missing/zero it is filled later from ftp_history as-of the race date.
+        zp_ftp = _f(r.get("ftp")) or _f(r.get("wftp"))
+        if_ = round(np / zp_ftp, 2) if (np and zp_ftp and zp_ftp > 0) else None
         out.append(
             {
                 "event_date": when.date().isoformat(),
@@ -139,8 +146,8 @@ def parse_zwiftpower_profile(doc: dict) -> List[dict]:
                 "activity_id": None,
                 "duration_s": int(dur) if dur and dur > 0 else None,
                 "avg_power": _f(r.get("avg_power")),
-                "np": _f(r.get("np")),
-                "if_": None,
+                "np": np,
+                "if_": if_,
                 "power": _zp_power_periods(r),
                 "fetched_at": fetched,
             }
@@ -306,6 +313,12 @@ def refresh_race_results(
         # its ride detail; also fill any power period ZwiftPower doesn't publish
         # (1s / 10m) from that ride's stream.
         for r in results:
+            # IF that ZwiftPower's per-race FTP didn't yield: compute from NP
+            # and the user's FTP as-of the race date (a local record).
+            if r.get("if_") is None and r.get("np"):
+                ftp = db.ftp_as_of(user_id, r["event_date"])
+                if ftp and ftp > 0:
+                    r["if_"] = round(r["np"] / ftp, 2)
             act = _matching_activity(user_id, r["event_date"], r.get("duration_s"))
             if act is None:
                 continue
@@ -362,6 +375,14 @@ def _weight_from_zwiftpower_doc(doc: dict) -> Optional[float]:
     return round(best[1], 1) if best else None
 
 
+def _place_int(position) -> Optional[int]:
+    """Parse a race position field to an int (handles '1', 1, '1st', '3 /40')."""
+    if position is None:
+        return None
+    m = re.match(r"\s*(\d+)", str(position))
+    return int(m.group(1)) if m else None
+
+
 def race_page_data(user_id: int) -> Dict:
     """Everything the /races page needs from the cache (no network)."""
     sync = db.get_race_sync(user_id)
@@ -370,13 +391,19 @@ def race_page_data(user_id: int) -> Dict:
     # rows exist, heuristic rows are hidden (and purged at next refresh).
     if any(r["source"] == "zwiftpower" for r in results):
         results = [r for r in results if r["source"] == "zwiftpower"]
-    # Lazily resolve the matching local ride so each race links to its detail
-    # graphs, even for rows cached before activity_id was persisted.
+    # Lazily backfill fields for rows cached before this logic existed:
+    #  - activity_id so each race links to its detail graphs;
+    #  - IF (= NP / FTP as-of the race date) which ZwiftPower never provides.
     for r in results:
         if not r.get("activity_id"):
             act = _matching_activity(user_id, r["event_date"], r.get("duration_s"))
             if act is not None:
                 r["activity_id"] = act["id"]
+        if r.get("if_") is None and r.get("np"):
+            ftp = db.ftp_as_of(user_id, r["event_date"])
+            if ftp and ftp > 0:
+                r["if_"] = round(r["np"] / ftp, 2)
+        r["place"] = _place_int(r.get("position"))
     weight = db.get_user_settings(user_id).get("weight_kg")
     return {
         "sync": sync,
