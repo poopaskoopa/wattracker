@@ -144,8 +144,41 @@ def test_calendar_shows_ooto_and_skipped_and_completed(client, tmp_path):
     assert "cal-check" in text
     assert "cal-ooto-day" in text           # 8th shaded OOTO
     assert "cal-skipped" in text            # 8th workout skipped
+    assert "cal-ooto-tag" in text           # visible "OOTO" badge
     assert "Export all to Zwift" in text
     assert "Out of office" in text
+
+
+def test_calendar_two_column_layout_markup(client):
+    _register(client)
+    text = client.get("/calendar?year=2026&month=7").text
+    # Calendar (cal-main) and OOTO sidebar (aside.ooto-panel) live inside the
+    # same two-column grid container; the panel comes AFTER the calendar.
+    assert "cal-layout" in text
+    assert "cal-main" in text and "ooto-panel" in text
+    assert text.index("cal-main") < text.index("ooto-panel")
+
+
+def test_ooto_marks_every_day_in_range_incl_boundaries(client):
+    _register(client)
+    uid = db.get_user_by_username("rider")["id"]
+    # A multi-day range: every day from start..end inclusive must be marked.
+    db.add_ooto_range(uid, "2026-07-10", "2026-07-13", "holiday")
+    text = client.get("/calendar?year=2026&month=7").text
+
+    # Locate each day cell and check its class for the OOTO marker. Cells are
+    # rendered as <td class="cal-cell ..."><div class="cal-day">N ...
+    def cell_for(day):
+        # Find the <td ...> that contains the day-number div for this day.
+        marker = '<div class="cal-day">%d' % day
+        idx = text.index(marker)
+        td_start = text.rfind("<td", 0, idx)
+        return text[td_start:idx]
+
+    for day in (10, 11, 12, 13):            # start, middle, end (all inclusive)
+        assert "cal-ooto-day" in cell_for(day), f"day {day} not marked OOTO"
+    for day in (9, 14):                     # just outside the range -> unmarked
+        assert "cal-ooto-day" not in cell_for(day), f"day {day} wrongly marked"
 
 
 # ----------------------------------------------------- schema migration
