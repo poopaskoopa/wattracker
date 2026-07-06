@@ -81,30 +81,39 @@
 {%- endmacro %}
 
 {% if results %}
+<p class="hint">Click a column header to sort. Power columns sort by watts
+    (order is the same in W/kg).</p>
 <div class="power-table-wrap">
-<table class="race-table">
-    <thead><tr><th>Date</th><th>Event</th><th>Place</th><th>Cat</th>
-        <th>Duration</th><th>Avg&nbsp;<span class="unit-label">W</span></th>
-        <th>NP&nbsp;(<span class="unit-label">W</span>)</th>
-        {% for l in duration_labels %}<th>{{ l }}</th>{% endfor %}
-        <th>IF</th><th></th></tr></thead>
+<table class="race-table" id="raceTable">
+    <thead><tr>
+        <th class="sortable" data-type="text">Date</th>
+        <th class="sortable" data-type="text">Event</th>
+        <th class="sortable" data-type="num">Place</th>
+        <th class="sortable" data-type="text">Cat</th>
+        <th class="sortable" data-type="num">Duration</th>
+        <th class="sortable" data-type="num">Distance</th>
+        <th class="sortable" data-type="num">Avg&nbsp;<span class="unit-label">W</span></th>
+        <th class="sortable" data-type="num">NP&nbsp;(<span class="unit-label">W</span>)</th>
+        {% for l in duration_labels %}<th class="sortable" data-type="num">{{ l }}</th>{% endfor %}
+        <th class="sortable" data-type="num">IF</th><th></th></tr></thead>
     <tbody>
     {% for r in results %}
         <tr>
-            <td class="nowrap">{{ r.event_date }}</td>
-            <td class="nowrap">
+            <td class="nowrap" data-sort="{{ r.event_date }}">{{ r.event_date }}</td>
+            <td class="nowrap" data-sort="{{ r.event_title }}">
                 {% if r.activity_id %}<a href="/activity/{{ r.activity_id }}">{{ r.event_title }}</a>
                 {% else %}{{ r.event_title }}{% endif %}
             </td>
-            <td class="place">{% if r.place in (1, 2, 3) %}{{ trophy(r.place) }}{% else %}{{ r.position or '—' }}{% endif %}</td>
-            <td>{{ r.category or '—' }}</td>
-            <td class="nowrap">{{ (r.duration_s // 60) ~ ' min' if r.duration_s else '—' }}</td>
-            <td>{% if r.avg_power %}<span class="pw" data-w="{{ r.avg_power|round(0)|int }}">{{ r.avg_power|round(0)|int }}</span>{% else %}—{% endif %}</td>
-            <td>{% if r.np %}<span class="pw" data-w="{{ r.np|round(0)|int }}">{{ r.np|round(0)|int }}</span>{% else %}—{% endif %}</td>
+            <td class="place" data-sort="{{ r.place if r.place else '' }}">{% if r.place in (1, 2, 3) %}{{ trophy(r.place) }}{% else %}{{ r.position or '—' }}{% endif %}</td>
+            <td data-sort="{{ r.category or '' }}">{{ r.category or '—' }}</td>
+            <td class="nowrap" data-sort="{{ r.duration_s or 0 }}">{{ (r.duration_s // 60) ~ ' min' if r.duration_s else '—' }}</td>
+            <td class="nowrap" data-sort="{{ r.distance_km if r.distance_km else '' }}">{{ ('%g'|format(r.distance_km|round(1))) ~ ' km' if r.distance_km else '—' }}</td>
+            <td data-sort="{{ r.avg_power|round(0)|int if r.avg_power else '' }}">{% if r.avg_power %}<span class="pw" data-w="{{ r.avg_power|round(0)|int }}">{{ r.avg_power|round(0)|int }}</span>{% else %}—{% endif %}</td>
+            <td data-sort="{{ r.np|round(0)|int if r.np else '' }}">{% if r.np %}<span class="pw" data-w="{{ r.np|round(0)|int }}">{{ r.np|round(0)|int }}</span>{% else %}—{% endif %}</td>
             {% for d in durations %}
-            <td>{% if r.power.get(d) %}<span class="pw" data-w="{{ r.power.get(d) }}">{{ r.power.get(d) }}</span>{% else %}—{% endif %}</td>
+            <td data-sort="{{ r.power.get(d) if r.power.get(d) else '' }}">{% if r.power.get(d) %}<span class="pw" data-w="{{ r.power.get(d) }}">{{ r.power.get(d) }}</span>{% else %}—{% endif %}</td>
             {% endfor %}
-            <td>{{ r.if_|round(2) if r.if_ else '—' }}</td>
+            <td data-sort="{{ r.if_|round(2) if r.if_ else '' }}">{{ r.if_|round(2) if r.if_ else '—' }}</td>
             <td class="nowrap">{% if r.activity_id %}<a class="button small" href="/activity/{{ r.activity_id }}">Graphs</a>{% else %}<span class="muted">no ride data</span>{% endif %}</td>
         </tr>
     {% endfor %}
@@ -163,6 +172,56 @@
     var saved = "w";
     try { saved = localStorage.getItem("tr_power_unit") || "w"; } catch (e) {}
     if (saved === "wkg" && weight > 0) apply("wkg");
+})();
+
+// -------- sortable race table (vanilla JS; sorts by data-sort keys) --------
+(function () {
+    var table = document.getElementById("raceTable");
+    if (!table) return;
+    var tbody = table.tBodies[0];
+    var headers = table.tHead.rows[0].cells;
+
+    function cellKey(row, col) {
+        var cell = row.cells[col];
+        if (!cell) return "";
+        var v = cell.getAttribute("data-sort");
+        return v == null ? cell.textContent.trim() : v;
+    }
+
+    function sortBy(col, type, asc) {
+        var rows = Array.prototype.slice.call(tbody.rows);
+        rows.sort(function (a, b) {
+            var ka = cellKey(a, col), kb = cellKey(b, col);
+            if (type === "num") {
+                var na = ka === "" ? NaN : parseFloat(ka);
+                var nb = kb === "" ? NaN : parseFloat(kb);
+                // Missing values always sort last, regardless of direction.
+                if (isNaN(na) && isNaN(nb)) return 0;
+                if (isNaN(na)) return 1;
+                if (isNaN(nb)) return -1;
+                return asc ? na - nb : nb - na;
+            }
+            return asc ? ka.localeCompare(kb) : kb.localeCompare(ka);
+        });
+        rows.forEach(function (r) { tbody.appendChild(r); });
+    }
+
+    for (var i = 0; i < headers.length; i++) {
+        (function (col) {
+            var th = headers[col];
+            if (!th.classList.contains("sortable")) return;
+            th.addEventListener("click", function () {
+                var asc = th.getAttribute("data-dir") !== "asc";
+                for (var j = 0; j < headers.length; j++) {
+                    headers[j].removeAttribute("data-dir");
+                    headers[j].classList.remove("sort-asc", "sort-desc");
+                }
+                th.setAttribute("data-dir", asc ? "asc" : "desc");
+                th.classList.add(asc ? "sort-asc" : "sort-desc");
+                sortBy(col, th.getAttribute("data-type") || "text", asc);
+            });
+        })(i);
+    }
 })();
 </script>
 {% endblock %}

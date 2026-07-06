@@ -190,8 +190,8 @@ def test_period_columns_merged_after_np_no_separate_table(client, monkeypatch):
     # old standalone "Average power per period" table is gone.
     assert "Average power per period" not in text
     head = text[text.index("<thead>"):text.index("</thead>")]
-    assert (head.index("NP") < head.index("<th>1s</th>")
-            < head.index("<th>20m</th>") < head.index("<th>IF</th>"))
+    assert (head.index("NP") < head.index(">1s<")
+            < head.index(">20m<") < head.index(">IF<"))
 
 
 def test_if_computed_from_np_and_ftp_as_of_date(client, monkeypatch):
@@ -233,6 +233,67 @@ def test_place_int_parsing():
     assert races._place_int("15 /40") == 15
     assert races._place_int("") is None
     assert races._place_int(None) is None
+
+
+# ------------------------------------------------------------- distance
+def test_distance_parsed_from_zwiftpower_km(user_id, monkeypatch):
+    doc = {"data": [{
+        "event_date": int(dt.datetime(2026, 6, 1, 10).timestamp()),
+        "event_title": "R", "f_t": "TYPE_RACE", "np": [240, 0],
+        "distance": 30,  # ZwiftPower distance is in km
+    }]}
+    monkeypatch.setattr(races, "_http_get_json", lambda url, timeout=0: doc)
+    races.refresh_race_results(user_id, "1234567")
+    assert db.list_race_results(user_id)[0]["distance_km"] == 30.0
+
+
+def test_distance_backfilled_from_local_ride(user_id, monkeypatch):
+    # ZwiftPower omits distance -> backfill from the same-day ride (metres).
+    doc = {"data": [{
+        "event_date": int(dt.datetime(2026, 6, 1, 10).timestamp()),
+        "event_title": "R", "f_t": "TYPE_RACE", "np": [240, 0],
+    }]}
+    monkeypatch.setattr(races, "_http_get_json", lambda url, timeout=0: doc)
+    aid = _activity(user_id, "2026-06-01T10:00:00", 3600, 260.0, if_=0.9)
+    db.insert_activity  # noqa: keep flake happy; activity already inserted
+    # give the activity a real distance
+    import tranalyzer.db as _db
+    conn = _db.connect()
+    conn.execute("UPDATE activities SET distance_m = ? WHERE id = ?", (27198.79, aid))
+    conn.commit()
+    conn.close()
+    races.refresh_race_results(user_id, "1234567")
+    row = db.list_race_results(user_id)[0]
+    assert row["distance_km"] == pytest.approx(27.2, abs=0.05)
+
+
+def test_distance_column_and_sort_attrs_rendered(client, monkeypatch):
+    from tranalyzer import credstore, zwiftauth
+
+    _register(client)
+    uid = db.get_user_by_username("rider")["id"]
+    doc = {"data": [{
+        "event_date": int(dt.datetime(2026, 6, 1, 10).timestamp()),
+        "event_title": "Crit City", "f_t": "TYPE_RACE",
+        "position_in_cat": 2, "np": [270, 1], "distance": 24,
+        "w5": [500, 0], "w15": [420, 0],
+    }]}
+    credstore.save_zwift_credentials(uid, "a@b.com", "pw")
+    monkeypatch.setattr(
+        zwiftauth, "fetch_results_authenticated",
+        lambda email, password, rider_id=None: (doc, "1234567", 72.0))
+    client.post("/races/refresh", data={"rider_id": "1234567"})
+    text = client.get("/races").text
+    # Distance column present, after Duration and before Avg.
+    head = text[text.index("<thead>"):text.index("</thead>")]
+    assert head.index("Duration") < head.index("Distance") < head.index("Avg")
+    assert "24 km" in text
+    # Sortable headers + numeric sort keys on cells.
+    assert 'class="sortable"' in text and 'data-type="num"' in text
+    assert 'data-sort="24.0"' in text    # distance sort key (km, parseFloat-safe)
+    assert 'data-sort="270"' in text     # NP sort key (watts, unit-independent)
+    assert 'data-sort="2"' in text       # place sort key (parsed position)
+    assert 'id="raceTable"' in text
 
 
 def test_podium_trophies_rendered(client, monkeypatch):

@@ -136,6 +136,8 @@ def parse_zwiftpower_profile(doc: dict) -> List[dict]:
         # missing/zero it is filled later from ftp_history as-of the race date.
         zp_ftp = _f(r.get("ftp")) or _f(r.get("wftp"))
         if_ = round(np / zp_ftp, 2) if (np and zp_ftp and zp_ftp > 0) else None
+        # ZwiftPower exposes race distance in kilometres (integer field).
+        dist = _f(r.get("distance"))
         out.append(
             {
                 "event_date": when.date().isoformat(),
@@ -148,6 +150,7 @@ def parse_zwiftpower_profile(doc: dict) -> List[dict]:
                 "avg_power": _f(r.get("avg_power")),
                 "np": np,
                 "if_": if_,
+                "distance_km": dist if dist and dist > 0 else None,
                 "power": _zp_power_periods(r),
                 "fetched_at": fetched,
             }
@@ -323,6 +326,9 @@ def refresh_race_results(
             if act is None:
                 continue
             r["activity_id"] = act["id"]
+            # Backfill distance from the local ride when ZwiftPower omits it.
+            if not r.get("distance_km") and act.get("distance_m"):
+                r["distance_km"] = round(act["distance_m"] / 1000.0, 1)
             missing = [d for d in RACE_POWER_DURATIONS if str(d) not in r["power"]]
             if missing:
                 stream = (act.get("streams") or {}).get("power") or []
@@ -395,10 +401,17 @@ def race_page_data(user_id: int) -> Dict:
     #  - activity_id so each race links to its detail graphs;
     #  - IF (= NP / FTP as-of the race date) which ZwiftPower never provides.
     for r in results:
+        act = None
         if not r.get("activity_id"):
             act = _matching_activity(user_id, r["event_date"], r.get("duration_s"))
             if act is not None:
                 r["activity_id"] = act["id"]
+        if not r.get("distance_km"):
+            # Backfill distance from the matching local ride (metres -> km).
+            if act is None and r.get("activity_id"):
+                act = db.get_activity(user_id, r["activity_id"])
+            if act and act.get("distance_m"):
+                r["distance_km"] = round(act["distance_m"] / 1000.0, 1)
         if r.get("if_") is None and r.get("np"):
             ftp = db.ftp_as_of(user_id, r["event_date"])
             if ftp and ftp > 0:

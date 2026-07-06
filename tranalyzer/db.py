@@ -15,7 +15,7 @@ from typing import Dict, List, Optional
 
 from .config import db_path
 
-SCHEMA_VERSION = 9
+SCHEMA_VERSION = 10
 
 # In-place migrations: version N -> N+1 statement lists. A database whose
 # version has an unbroken chain here is upgraded without losing live data.
@@ -43,6 +43,9 @@ _MIGRATIONS: Dict[int, List[str]] = {
     ],
     8: [
         # New table ooto_ranges is created by _SCHEMA after migrating.
+    ],
+    9: [
+        "ALTER TABLE race_results ADD COLUMN distance_km REAL",
     ],
 }
 
@@ -152,6 +155,7 @@ CREATE TABLE IF NOT EXISTS race_results (
     if_          REAL,
     power_json   TEXT,
     source_type  TEXT,
+    distance_km  REAL,
     fetched_at   TEXT NOT NULL,
     UNIQUE(user_id, source, event_date, event_title),
     FOREIGN KEY(user_id) REFERENCES users(id)
@@ -914,15 +918,15 @@ def replace_race_results(
                 INSERT OR REPLACE INTO race_results
                   (user_id, source, event_date, event_title, position, category,
                    activity_id, duration_s, avg_power, np, if_, power_json,
-                   source_type, fetched_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                   source_type, distance_km, fetched_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     user_id, source, r["event_date"], r["event_title"],
                     r.get("position"), r.get("category"), r.get("activity_id"),
                     r.get("duration_s"), r.get("avg_power"), r.get("np"),
                     r.get("if_"), json.dumps(r.get("power") or {}),
-                    r.get("source_type"), r["fetched_at"],
+                    r.get("source_type"), r.get("distance_km"), r["fetched_at"],
                 ),
             )
         conn.commit()
