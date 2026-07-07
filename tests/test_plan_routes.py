@@ -207,6 +207,35 @@ def test_calendar_shows_completion_checkmark(client):
     assert "cal-check" in r.text
 
 
+def test_calendar_marks_missed_past_workouts(client):
+    # A past-dated plan (well before any plausible "today") whose workouts were
+    # never completed should be flagged missed; a completed one is not.
+    _register(client)
+    form = dict(PLAN_FORM, start_date="2020-01-06")  # Mon, long past
+    client.post("/generate/plan", data=form)
+    uid = db.get_user_by_username("rider")["id"]
+    workouts = db.plan_workouts_for_plan(uid, db.list_plans(uid)[0]["id"])
+    first = min(workouts, key=lambda w: w["date"])
+    db.mark_plan_workout_completed(uid, first["id"], 42, first["date"])
+    y, m = first["date"][:4], int(first["date"][5:7])
+    text = client.get(f"/calendar?year={y}&month={m}").text
+    assert "cal-missed" in text
+    assert "cal-miss-mark" in text
+    # completed + missed counts add up to that month's workouts (no overlap)
+    month_workouts = [w for w in workouts if w["date"][:7] == f"{y}-{m:02d}"]
+    assert text.count("cal-missed") == len(month_workouts) - 1
+
+
+def test_calendar_future_workouts_not_missed(client):
+    # A plan far in the future: none of its days have passed, so none is missed.
+    future_year = dt.date.today().year + 5
+    _register(client)
+    form = dict(PLAN_FORM, start_date=f"{future_year}-08-05")
+    client.post("/generate/plan", data=form)
+    assert "cal-missed" not in client.get(
+        f"/calendar?year={future_year}&month=8").text
+
+
 def test_calendar_isolated_between_users(client):
     _register(client, "alice")
     client.post("/generate/plan", data=PLAN_FORM)

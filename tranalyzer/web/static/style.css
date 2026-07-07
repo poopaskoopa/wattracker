@@ -167,6 +167,12 @@ table.calendar th { text-align: center; }
     text-decoration-color: var(--alert); text-decoration-thickness: 2px;
     border-left-color: var(--alert); }
 .cal-skip-mark { color: var(--alert); font-weight: 700; }
+/* Missed: past-dated workout left uncompleted (not an OOTO skip). */
+.cal-workout.cal-missed {
+    background: rgba(224,82,82,0.10); border-left-color: var(--alert);
+    border-left-style: dashed; opacity: 0.85;
+}
+.cal-miss-mark { color: var(--alert); font-weight: 700; }
 /* Out-of-office day cells: unmistakable tinted background + hatch + top accent. */
 .cal-cell.cal-ooto-day {
     background-color: rgba(224, 82, 82, 0.14);

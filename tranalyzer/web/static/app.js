@@ -202,11 +202,18 @@ function buildMainChart(load, ftpSeries) {
             scales: {
                 x: {
                     ticks: {
+                        color: "#c2cad4",
                         maxTicksLimit: 12,
                         maxRotation: 0,
                         autoSkip: true,
                         callback: monthYearTicks(labels),
                     },
+                    grid: {
+                        color: "rgba(138,148,160,0.10)",   // faint plot gridlines
+                        tickColor: "rgba(194,202,212,0.8)", // clearly visible tick marks
+                        tickLength: 8,
+                    },
+                    border: { color: "rgba(138,148,160,0.6)" },
                 },
                 y: { position: "left", title: { display: true, text: "Load (CTL/ATL/TSB)" } },
                 yFtp: {

@@ -579,10 +579,18 @@ def create_app() -> FastAPI:
             return any(r["start_date"] <= date_iso <= r["end_date"]
                        for r in ooto_ranges)
 
+        today_iso = today.isoformat()
         by_date: dict = {}
         for w in db.plan_workouts_for_month(uid, y, m):
             wd = dict(w)
             wd["skipped"] = _in_ooto(w["date"]) and not w.get("completed_activity_id")
+            # Missed: a past-dated workout left uncompleted that wasn't an
+            # out-of-office skip (i.e. its day passed without completion).
+            wd["missed"] = (
+                w["date"] < today_iso
+                and not w.get("completed_activity_id")
+                and not wd["skipped"]
+            )
             by_date.setdefault(w["date"], []).append(wd)
 
         cal = _cal.Calendar(firstweekday=0)  # Monday
