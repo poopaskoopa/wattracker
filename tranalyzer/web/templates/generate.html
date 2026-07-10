@@ -75,7 +75,7 @@
 
 <!-- ============================= PLAN MODE ============================= -->
 <section id="mode-plan" class="mode-panel">
-    <h3>Build a multi-week polarized plan (~80% easy / 20% hard)</h3>
+    <h3>Build a multi-week structured training plan</h3>
 
     {% if plan_error %}<p class="alert">Error: {{ plan_error }}</p>{% endif %}
 
@@ -83,6 +83,31 @@
         <label>Plan name:
             <input type="text" name="name" value="{{ plan_defaults.name }}">
         </label>
+        <fieldset class="model-picker">
+            <legend>Training model</legend>
+            <label class="model-option">
+                <input type="radio" name="model" value="polarized"
+                    {{ 'checked' if plan_defaults.model != 'sweet_spot' and plan_defaults.model != 'pyramidal' else '' }}>
+                <span><strong>Polarized (80/20, default)</strong> &mdash; 80/20
+                    (Seiler): most rides easy Z1&ndash;Z2, small dose of
+                    high-intensity VO2max work.</span>
+            </label>
+            <label class="model-option">
+                <input type="radio" name="model" value="sweet_spot"
+                    {{ 'checked' if plan_defaults.model == 'sweet_spot' else '' }}>
+                <span><strong>Sweet spot base</strong> &mdash; time-crunched:
+                    frequent 88&ndash;94% FTP sessions for efficient CTL
+                    growth.</span>
+            </label>
+            <label class="model-option">
+                <input type="radio" name="model" value="pyramidal"
+                    {{ 'checked' if plan_defaults.model == 'pyramidal' else '' }}>
+                <span><strong>Pyramidal (traditional)</strong> &mdash; large
+                    aerobic base, moderate tempo/threshold, small top of
+                    VO2max.</span>
+            </label>
+            <p class="hint" id="modelHint"></p>
+        </fieldset>
         <label>Weeks:
             <input type="number" name="weeks" min="1" max="52"
                    value="{{ plan_defaults.weeks }}" required>
@@ -126,7 +151,7 @@
 
     {% if plan %}
     <section class="plan-result">
-        <h3>{{ plan.name }}</h3>
+        <h3>{{ plan.name }}{% if plan.model %} <span class="hint">({{ plan.model.replace('_', ' ') }})</span>{% endif %}</h3>
         {% if plan.auto_export %}
         <p class="ok">Auto-exported {{ plan.auto_export.count }} .zwo file(s) to
            <code>{{ plan.auto_export.directory }}</code> &mdash; they appear under
@@ -220,9 +245,47 @@
     function hardFor(value) {
         return hardBoxes.filter(function (h) { return h.value === value; })[0];
     }
+
+    // Per-model hard-days-per-week cap as a function of selected ride days.
+    // Mirrors prescribe/plan.py MODELS[*].max_hard — server stays authoritative.
+    var MODEL_CAP = {
+        polarized: function (d) { return d <= 3 ? 1 : 2; },
+        sweet_spot: function (d) { return Math.max(1, Math.min(4, d - 1)); },
+        pyramidal: function (d) { return Math.min(3, Math.max(1, d - 2)); },
+    };
+    var MODEL_LABEL = {
+        polarized: 'Polarized', sweet_spot: 'Sweet spot', pyramidal: 'Pyramidal',
+    };
+    function selectedModel() {
+        var r = document.querySelector('.plan-form input[name="model"]:checked');
+        return r ? r.value : 'polarized';
+    }
+    function modelCap() {
+        var d = dayBoxes.filter(function (b) { return b.checked; }).length;
+        var fn = MODEL_CAP[selectedModel()] || MODEL_CAP.polarized;
+        return d > 0 ? fn(d) : 0;
+    }
+
     function syncHard() {
+        var mCap = modelCap();
+        // Clamp the HIT-days input to the model's cap.
+        if (hitInput) {
+            hitInput.max = String(Math.max(0, mCap));
+            var hv = parseInt(hitInput.value, 10);
+            if (!isNaN(hv) && mCap > 0 && hv > mCap) hitInput.value = String(mCap);
+        }
         var cap = parseInt(hitInput ? hitInput.value : '0', 10);
         if (isNaN(cap) || cap < 0) cap = 0;
+        if (mCap > 0) cap = Math.min(cap, mCap);
+        var mHint = document.getElementById('modelHint');
+        if (mHint) {
+            mHint.textContent = mCap > 0
+                ? MODEL_LABEL[selectedModel()] + ': max ' + mCap +
+                  ' hard day' + (mCap === 1 ? '' : 's') + '/week for ' +
+                  dayBoxes.filter(function (b) { return b.checked; }).length +
+                  ' ride days.'
+                : 'Select the days you ride to see this model’s hard-day cap.';
+        }
         // A hard toggle needs its day selected.
         dayBoxes.forEach(function (d) {
             var h = hardFor(d.value);
@@ -250,6 +313,8 @@
     }
     dayBoxes.forEach(function (d) { d.addEventListener('change', syncHard); });
     hardBoxes.forEach(function (h) { h.addEventListener('change', syncHard); });
+    document.querySelectorAll('.plan-form input[name="model"]').forEach(
+        function (r) { r.addEventListener('change', syncHard); });
     if (hitInput) {
         hitInput.addEventListener('change', syncHard);
         hitInput.addEventListener('input', syncHard);

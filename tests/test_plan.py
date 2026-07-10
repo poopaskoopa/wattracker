@@ -2,6 +2,7 @@
 import datetime as dt
 import os
 import re
+import sqlite3
 import xml.etree.ElementTree as ET
 from collections import defaultdict
 
@@ -131,6 +132,80 @@ def test_sessions_are_valid_and_dated():
         ET.fromstring(zwo.zwo_string(w["session"]))
 
 
+# ------------------------------------------------------- training models
+def test_model_caps_at_boundary_ok():
+    # polarized: 4 ride days -> cap 2; sweet_spot: 5 days -> cap 4; pyramidal 3.
+    assert plan.validate_plan_inputs(4, [0, 1, 2, 3], 8.0, 2, model="polarized") is None
+    assert plan.validate_plan_inputs(
+        4, [0, 1, 2, 3, 4], 8.0, 4, model="sweet_spot") is None
+    assert plan.validate_plan_inputs(
+        4, [0, 1, 2, 3, 4], 8.0, 3, model="pyramidal") is None
+
+
+def test_model_cap_plus_one_rejected_names_model():
+    msg = plan.validate_plan_inputs(4, [0, 1, 2, 3], 8.0, 3, model="polarized")
+    assert msg and "polarized" in msg and "2" in msg
+    msg = plan.validate_plan_inputs(4, [0, 1, 2, 3, 4], 8.0, 5, model="sweet_spot")
+    assert msg and "sweet_spot" in msg and "4" in msg
+    msg = plan.validate_plan_inputs(4, [0, 1, 2, 3, 4], 8.0, 4, model="pyramidal")
+    assert msg and "pyramidal" in msg and "3" in msg
+
+
+def test_unknown_model_rejected():
+    msg = plan.validate_plan_inputs(4, [0, 2, 4], 8.0, 1, model="nonsense")
+    assert msg and "nonsense" in msg
+    with pytest.raises(ValueError):
+        plan.generate_plan("P", MONDAY, 2, [0, 2, 4], 8.0, 1, model="nonsense")
+
+
+def test_polarized_cannot_be_all_hard():
+    # 5 ride days, every day hard -> exceeds polarized cap of 2.
+    msg = plan.validate_plan_inputs(
+        4, [0, 1, 2, 3, 4], 8.0, 5, model="polarized")
+    assert msg and "polarized" in msg
+    with pytest.raises(ValueError):
+        plan.generate_plan("P", MONDAY, 2, [0, 1, 2, 3, 4], 8.0, 5,
+                           model="polarized")
+
+
+def test_sweet_spot_model_hard_types():
+    # Enough hard days that a sweet_spot hard slot must appear (seq is
+    # sweet_spot, sweet_spot, threshold). vo2max is never a hard slot here, and
+    # the model never builds a vo2max session at all.
+    p = plan.generate_plan("P", MONDAY, 4, [0, 2, 4, 5], 10.0, 2,
+                           model="sweet_spot")
+    assert p["model"] == "sweet_spot"
+    types = {w["type"] for w in p["workouts"]}
+    assert "sweet_spot" in types
+    assert "vo2max" not in types
+
+
+def test_pyramidal_model_hard_types():
+    # Hard slots are threshold-weighted with some vo2max (seq threshold,
+    # threshold, vo2max). Both appear across a multi-week plan; sweet_spot is
+    # never a pyramidal hard slot (only the occasional easy-day tempo).
+    p = plan.generate_plan("P", MONDAY, 6, [0, 2, 4, 5], 10.0, 2,
+                           model="pyramidal")
+    assert p["model"] == "pyramidal"
+    hard_weekdays = _hard_weekdays(p["workouts"])
+    hard_types = {
+        w["type"] for w in p["workouts"]
+        if dt.date.fromisoformat(w["date"]).weekday() in hard_weekdays
+        and w["type"] in ("vo2max", "threshold")
+    }
+    assert "threshold" in hard_types
+    assert hard_types.issubset({"threshold", "vo2max"})
+
+
+def test_polarized_default_unchanged():
+    # Default model must match an explicit polarized call (backward compat).
+    a = plan.generate_plan("P", MONDAY, 3, [0, 2, 4, 5], 8.0, 2)
+    b = plan.generate_plan("P", MONDAY, 3, [0, 2, 4, 5], 8.0, 2,
+                           model="polarized")
+    assert [w["type"] for w in a["workouts"]] == [w["type"] for w in b["workouts"]]
+    assert a["model"] == "polarized"
+
+
 # --------------------------------------------------------- persistence
 def test_persistence_and_isolation():
     db.init_db()
@@ -168,6 +243,60 @@ def test_calendar_month_query():
     assert len(aug) == 1 and aug[0]["date"] == "2026-08-04"
     # Empty month is safe.
     assert db.plan_workouts_for_month(a, 2026, 9) == []
+
+
+# ------------------------------------------------------- schema migration
+def test_v10_migrates_to_v11_in_place(tmp_path):
+    """A live v10 database gains rpe + model columns, keeping all rows."""
+    path = str(tmp_path / "v10.db")
+    conn = sqlite3.connect(path)
+    conn.executescript(
+        """
+        CREATE TABLE users (id INTEGER PRIMARY KEY AUTOINCREMENT,
+            username TEXT UNIQUE NOT NULL, password_hash TEXT NOT NULL,
+            created TEXT NOT NULL);
+        CREATE TABLE plans (id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER NOT NULL, name TEXT NOT NULL,
+            start_date TEXT NOT NULL, weeks INTEGER NOT NULL, created TEXT NOT NULL);
+        CREATE TABLE plan_workouts (id INTEGER PRIMARY KEY AUTOINCREMENT,
+            plan_id INTEGER NOT NULL, user_id INTEGER NOT NULL, date TEXT NOT NULL,
+            name TEXT NOT NULL, type TEXT NOT NULL, duration_s INTEGER NOT NULL,
+            tss REAL NOT NULL, zwo_or_segments TEXT NOT NULL,
+            completed_activity_id INTEGER, completed_date TEXT,
+            adapted TEXT, adapted_at TEXT);
+        INSERT INTO users (username, password_hash, created)
+            VALUES ('keeper', 'x', '2026-01-01');
+        INSERT INTO plans (user_id, name, start_date, weeks, created)
+            VALUES (1, 'Keep', '2026-07-06', 4, '2026-01-01');
+        INSERT INTO plan_workouts
+            (plan_id, user_id, date, name, type, duration_s, tss, zwo_or_segments)
+            VALUES (1, 1, '2026-07-07', 'W', 'endurance', 3600, 60.0, '<x/>');
+        PRAGMA user_version = 10;
+        """
+    )
+    conn.commit()
+    conn.close()
+
+    db.init_db(path=path)
+
+    conn = sqlite3.connect(path)
+    assert conn.execute("PRAGMA user_version").fetchone()[0] == db.SCHEMA_VERSION
+    pw = conn.execute(
+        "SELECT name, rpe FROM plan_workouts"
+    ).fetchone()
+    assert pw == ("W", None)  # row kept, new nullable column present
+    pl = conn.execute("SELECT name, model FROM plans").fetchone()
+    assert pl == ("Keep", None)
+    assert conn.execute("SELECT username FROM users").fetchone()[0] == "keeper"
+    conn.close()
+
+
+def test_create_plan_persists_model():
+    db.init_db()
+    a = db.create_user("mira", auth.hash_password("password123"))
+    pid = db.create_plan(a, "SS", "2026-07-06", 3, model="sweet_spot")
+    assert db.get_plan(a, pid)["model"] == "sweet_spot"
+    assert db.list_plans(a)[0]["model"] == "sweet_spot"
 
 
 # ------------------------------------------------------------- export

@@ -236,6 +236,91 @@ def test_calendar_future_workouts_not_missed(client):
         f"/calendar?year={future_year}&month=8").text
 
 
+# ----------------------------------------------------- RPE (exertion) grading
+def _completed_workout_id(client, username="rider"):
+    uid = db.get_user_by_username(username)["id"]
+    plan_id = db.list_plans(uid)[0]["id"]
+    w = db.plan_workouts_for_plan(uid, plan_id)[0]
+    db.mark_plan_workout_completed(uid, w["id"], 1234, w["date"])
+    return uid, w["id"]
+
+
+def test_rpe_out_of_range_rejected(client):
+    _register(client)
+    client.post("/generate/plan", data=PLAN_FORM)
+    _uid, wid = _completed_workout_id(client)
+    assert client.post(f"/api/plan/workout/{wid}/rpe", json={"rpe": 0}).status_code == 400
+    assert client.post(f"/api/plan/workout/{wid}/rpe", json={"rpe": 11}).status_code == 400
+
+
+def test_rpe_not_completed_rejected(client):
+    _register(client)
+    client.post("/generate/plan", data=PLAN_FORM)
+    _uid, wid = _first_workout_id()  # never completed
+    r = client.post(f"/api/plan/workout/{wid}/rpe", json={"rpe": 5})
+    assert r.status_code == 400
+
+
+def test_rpe_other_users_workout_404(client):
+    _register(client, "alice")
+    client.post("/generate/plan", data=PLAN_FORM)
+    _uid, wid = _completed_workout_id(client, "alice")
+    client.get("/logout")
+    _register(client, "bob")
+    r = client.post(f"/api/plan/workout/{wid}/rpe", json={"rpe": 5})
+    assert r.status_code == 404
+
+
+def test_rpe_success_and_detail_returns_it(client):
+    _register(client)
+    client.post("/generate/plan", data=PLAN_FORM)
+    _uid, wid = _completed_workout_id(client)
+    r = client.post(f"/api/plan/workout/{wid}/rpe", json={"rpe": 7})
+    assert r.status_code == 200 and r.json()["rpe"] == 7
+    detail = client.get(f"/api/plan/workout/{wid}").json()
+    assert detail["rpe"] == 7
+    assert detail["completed"] is True
+
+
+def test_rpe_overwrite_allowed(client):
+    _register(client)
+    client.post("/generate/plan", data=PLAN_FORM)
+    _uid, wid = _completed_workout_id(client)
+    client.post(f"/api/plan/workout/{wid}/rpe", json={"rpe": 3})
+    r = client.post(f"/api/plan/workout/{wid}/rpe", json={"rpe": 9})
+    assert r.status_code == 200 and r.json()["rpe"] == 9
+    assert client.get(f"/api/plan/workout/{wid}").json()["rpe"] == 9
+
+
+def test_plan_submit_persists_model(client):
+    _register(client)
+    form = dict(PLAN_FORM, model="sweet_spot")
+    r = client.post("/generate/plan", data=form)
+    assert r.status_code == 200
+    uid = db.get_user_by_username("rider")["id"]
+    plan_id = db.list_plans(uid)[0]["id"]
+    assert db.get_plan(uid, plan_id)["model"] == "sweet_spot"
+
+
+def test_generate_form_has_model_radios(client):
+    _register(client)
+    text = client.get("/generate").text
+    assert 'name="model"' in text
+    assert "sweet_spot" in text and "pyramidal" in text
+
+
+def test_calendar_shows_rpe_badge(client):
+    _register(client)
+    client.post("/generate/plan", data=PLAN_FORM)
+    _uid, wid = _completed_workout_id(client)
+    db.set_plan_workout_rpe(_uid, wid, 6)
+    w = db.get_plan_workout(_uid, wid)
+    y, m = w["date"][:4], int(w["date"][5:7])
+    text = client.get(f"/calendar?year={y}&month={m}").text
+    assert "cal-rpe" in text
+    assert "RPE 6" in text
+
+
 def test_calendar_isolated_between_users(client):
     _register(client, "alice")
     client.post("/generate/plan", data=PLAN_FORM)

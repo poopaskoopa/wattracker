@@ -11,7 +11,7 @@ import zipfile
 from contextlib import asynccontextmanager
 from typing import List, Optional
 
-from fastapi import FastAPI, Form, Request, UploadFile, WebSocket
+from fastapi import Body, FastAPI, Form, Request, UploadFile, WebSocket
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse, Response
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
@@ -319,6 +319,7 @@ def create_app() -> FastAPI:
             "hard_days": [],
             "start_date": _upcoming_monday().isoformat(),
             "name": "Training Plan",
+            "model": planmod.DEFAULT_MODEL,
         }
 
     def _generate_ctx(request: Request, **kw) -> dict:
@@ -427,6 +428,7 @@ def create_app() -> FastAPI:
         start_date: str = Form(""),
         days: List[str] = Form([]),
         hard_days: List[str] = Form([]),
+        model: str = Form("polarized"),
     ):
         uid = _uid(request)
         try:
@@ -450,14 +452,16 @@ def create_app() -> FastAPI:
             "hit_days_per_week": hit_days_per_week, "days": day_ints,
             "hard_days": hard_ints,
             "start_date": start.isoformat(), "name": name,
+            "model": model,
         }
         try:
             generated = planmod.generate_plan(
                 name, start, weeks, day_ints, hours_per_week, hit_days_per_week,
-                hard_days=hard_ints or None,
+                hard_days=hard_ints or None, model=model,
             )
             plan_id = db.create_plan(
-                uid, name or "Training Plan", generated["start_date"], generated["weeks"]
+                uid, name or "Training Plan", generated["start_date"],
+                generated["weeks"], model=generated["model"],
             )
             for w in generated["workouts"]:
                 zwo_str = zwo.zwo_string(w["session"])
@@ -1085,6 +1089,8 @@ def create_app() -> FastAPI:
                 "duration_s": w["duration_s"],
                 "tss": w["tss"],
                 "adapted": w.get("adapted"),
+                "rpe": w.get("rpe"),
+                "completed": w.get("completed_activity_id") is not None,
                 "ftp": round(ftp, 1),
                 "description": session.description,
                 "total_duration": total_s,
@@ -1092,6 +1098,30 @@ def create_app() -> FastAPI:
                 "profile": profile,
             }
         )
+
+    @app.post("/api/plan/workout/{workout_id}/rpe")
+    def api_plan_workout_rpe(
+        request: Request, workout_id: int, rpe: int = Body(..., embed=True)
+    ):
+        """Grade a completed plan workout's perceived exertion (1-10)."""
+        uid = _uid(request)
+        try:
+            rpe_val = int(rpe)
+        except (TypeError, ValueError):
+            return JSONResponse({"error": "rpe must be an integer"}, status_code=400)
+        if rpe_val < 1 or rpe_val > 10:
+            return JSONResponse(
+                {"error": "rpe must be between 1 and 10"}, status_code=400
+            )
+        w = db.get_plan_workout(uid, workout_id)
+        if not w:
+            return JSONResponse({"error": "workout not found"}, status_code=404)
+        if w.get("completed_activity_id") is None:
+            return JSONResponse(
+                {"error": "only completed workouts can be graded"}, status_code=400
+            )
+        db.set_plan_workout_rpe(uid, workout_id, rpe_val)
+        return JSONResponse({"id": workout_id, "rpe": rpe_val})
 
     @app.get("/api/state")
     def api_state(request: Request):

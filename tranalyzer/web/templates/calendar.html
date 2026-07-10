@@ -55,7 +55,7 @@
                          data-workout-id="{{ w.id }}"
                          role="button" tabindex="0"
                          title="{{ w.name }} — {{ (w.duration_s // 60) }} min, {{ w.tss }} TSS.{{ ' Completed.' if w.completed_activity_id else '' }}{{ ' Skipped (out of office).' if w.skipped else '' }}{{ ' Missed (not completed).' if w.missed else '' }}{{ ' Adapted (' ~ w.adapted ~ ').' if w.adapted else '' }} Click for power details.">
-                        {% if w.completed_activity_id %}<span class="cal-check" aria-label="completed">&#10003;</span> {% elif w.skipped %}<span class="cal-skip-mark" aria-label="skipped">&#8856;</span> {% elif w.missed %}<span class="cal-miss-mark" aria-label="missed">&#10007;</span> {% endif %}{% if w.adapted %}<span class="cal-adapt-mark" aria-label="adapted ({{ w.adapted }})">&#8635;</span> {% endif %}{{ w.name }}<span class="cal-type">{{ w.type }}</span>
+                        {% if w.completed_activity_id %}<span class="cal-check" aria-label="completed">&#10003;</span> {% elif w.skipped %}<span class="cal-skip-mark" aria-label="skipped">&#8856;</span> {% elif w.missed %}<span class="cal-miss-mark" aria-label="missed">&#10007;</span> {% endif %}{% if w.adapted %}<span class="cal-adapt-mark" aria-label="adapted ({{ w.adapted }})">&#8635;</span> {% endif %}{{ w.name }}<span class="cal-type">{{ w.type }}</span>{% if w.rpe %}<span class="cal-rpe" title="Perceived exertion {{ w.rpe }}/10">RPE {{ w.rpe }}</span>{% endif %}
                     </div>
                 {% endfor %}
             </td>
@@ -103,6 +103,14 @@
         <p class="alert" id="wmError" hidden></p>
         <div class="profile-wrap" id="wmProfile" hidden></div>
         <p class="hint" id="wmDesc"></p>
+        <div class="rpe-section" id="wmRpe" hidden>
+            <h4>Perceived exertion</h4>
+            <p class="hint">How hard did this session feel? 1 = easiest,
+                10 = all-out.</p>
+            <div class="rpe-buttons" id="wmRpeButtons" role="group"
+                 aria-label="Perceived exertion 1 to 10"></div>
+            <p class="hint" id="wmRpeStatus"></p>
+        </div>
         <table id="wmTable" hidden>
             <thead><tr><th>#</th><th>Block</th><th>Duration</th><th>Target (%FTP)</th><th>Target (W)</th></tr></thead>
             <tbody id="wmSegments"></tbody>
@@ -221,7 +229,63 @@
         $("wmProfile").hidden = true;
         $("wmTable").hidden = true;
         $("wmSegments").innerHTML = "";
+        $("wmRpe").hidden = true;
+        $("wmRpeButtons").innerHTML = "";
+        $("wmRpeStatus").textContent = "";
         modal.hidden = false;
+    }
+
+    // --------------------------------------- perceived-exertion (RPE) grading
+    function renderRpe(detail) {
+        var section = $("wmRpe");
+        if (!detail.completed) { section.hidden = true; return; }
+        section.hidden = false;
+        var wrap = $("wmRpeButtons");
+        wrap.innerHTML = "";
+        var status = $("wmRpeStatus");
+        var current = detail.rpe || null;
+
+        function paint() {
+            Array.prototype.forEach.call(wrap.children, function (b) {
+                var on = String(current) === b.dataset.rpe;
+                b.classList.toggle("rpe-on", on);
+                b.setAttribute("aria-pressed", on ? "true" : "false");
+            });
+            status.textContent = current
+                ? "Graded " + current + "/10." : "Not graded yet.";
+        }
+
+        async function grade(val) {
+            status.textContent = "Saving…";
+            try {
+                var resp = await fetch(
+                    "/api/plan/workout/" + detail.id + "/rpe",
+                    {
+                        method: "POST",
+                        headers: { "Content-Type": "application/json" },
+                        body: JSON.stringify({ rpe: val }),
+                    });
+                if (!resp.ok) { status.textContent = "Could not save grade."; return; }
+                var data = await resp.json();
+                current = data.rpe;
+                paint();
+            } catch (e) {
+                status.textContent = "Could not save grade: " + e.message;
+            }
+        }
+
+        for (var i = 1; i <= 10; i++) {
+            var btn = document.createElement("button");
+            btn.type = "button";
+            btn.className = "rpe-btn";
+            btn.dataset.rpe = String(i);
+            btn.textContent = String(i);
+            (function (v) {
+                btn.addEventListener("click", function () { grade(v); });
+            })(i);
+            wrap.appendChild(btn);
+        }
+        paint();
     }
 
     function showError(message) {
@@ -258,6 +322,7 @@
             tbody.appendChild(tr);
         });
         $("wmTable").hidden = false;
+        renderRpe(detail);
         modal.hidden = false;
     }
 

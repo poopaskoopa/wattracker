@@ -8,7 +8,8 @@ interval machinery in ``planner.build_workout`` - it does not reinvent the math.
 from __future__ import annotations
 
 import datetime as _dt
-from typing import Dict, List, Optional, Sequence, Set
+from dataclasses import dataclass
+from typing import Callable, Dict, List, Optional, Sequence, Set
 
 from .planner import Session, build_workout
 
@@ -20,6 +21,51 @@ SWEET_SPOT_MIN_MIN = 35
 
 # Polarized target: ~20% of weekly volume steered toward the HIT sessions.
 HARD_VOLUME_FRACTION = 0.18
+
+
+@dataclass(frozen=True)
+class PlanModel:
+    """A training-plan philosophy: how hard days are capped, which workout
+    types fill hard slots, and how much weekly volume goes to intensity."""
+
+    label: str
+    description: str
+    # days_per_week -> maximum allowed hard days that week.
+    max_hard: Callable[[int], int]
+    # Cycled through, in order, to type each hard slot across the whole plan.
+    hard_types: List[str]
+    # Fraction of weekly minutes steered toward the hard sessions.
+    hard_volume_fraction: float
+
+
+MODELS: Dict[str, PlanModel] = {
+    "polarized": PlanModel(
+        label="Polarized (80/20)",
+        description="80/20 (Seiler): most rides easy Z1-Z2, small dose of "
+                    "high-intensity VO2max work.",
+        max_hard=lambda d: 1 if d <= 3 else 2,
+        hard_types=["vo2max", "threshold"],
+        hard_volume_fraction=0.18,
+    ),
+    "sweet_spot": PlanModel(
+        label="Sweet spot base",
+        description="Sweet spot base (time-crunched): frequent 88-94% FTP "
+                    "sessions for efficient CTL growth.",
+        max_hard=lambda d: max(1, min(4, d - 1)),
+        hard_types=["sweet_spot", "sweet_spot", "threshold"],
+        hard_volume_fraction=0.35,
+    ),
+    "pyramidal": PlanModel(
+        label="Pyramidal",
+        description="Pyramidal (traditional): large aerobic base, moderate "
+                    "tempo/threshold, small top of VO2max.",
+        max_hard=lambda d: min(3, max(1, d - 2)),
+        hard_types=["threshold", "threshold", "vo2max"],
+        hard_volume_fraction=0.25,
+    ),
+}
+
+DEFAULT_MODEL = "polarized"
 
 RECOVERY_WEEK_EVERY = 4
 RECOVERY_MULTIPLIER = 0.65
@@ -82,14 +128,26 @@ def hard_seconds(session: Session) -> int:
     return total
 
 
+def _cap_message(model: str, cap: int, selected: int) -> str:
+    plural = "s" if cap != 1 else ""
+    return (
+        f"A {model} plan allows at most {cap} hard day{plural}/week "
+        f"— you selected {selected}. Reduce hard days or choose a "
+        f"different plan model."
+    )
+
+
 def validate_plan_inputs(
     weeks: int,
     days_of_week: Sequence[int],
     hours_per_week: float,
     hit_days_per_week: int,
     hard_days: Optional[Sequence[int]] = None,
+    model: str = DEFAULT_MODEL,
 ) -> Optional[str]:
     """Return an error message if inputs are invalid, else None."""
+    if model not in MODELS:
+        return f"Unknown plan model '{model}'."
     if weeks is None or int(weeks) < 1:
         return "Weeks must be at least 1."
     if not days_of_week:
@@ -98,14 +156,20 @@ def validate_plan_inputs(
         return "Hours per week must be greater than 0."
     if hit_days_per_week is None or int(hit_days_per_week) < 0:
         return "High-intensity days cannot be negative."
-    if int(hit_days_per_week) > len(days_of_week):
+    n_days = len(set(int(d) for d in days_of_week))
+    if int(hit_days_per_week) > n_days:
         return "High-intensity days cannot exceed the number of selected ride days."
+    cap = MODELS[model].max_hard(n_days)
+    if int(hit_days_per_week) > cap:
+        return _cap_message(model, cap, int(hit_days_per_week))
     if hard_days:
         marked = set(int(d) for d in hard_days)
         if not marked.issubset(set(int(d) for d in days_of_week)):
             return "Hard days must be among the selected ride days."
         if len(marked) > int(hit_days_per_week):
             return "Days marked hard cannot exceed high-intensity days per week."
+        if len(marked) > cap:
+            return _cap_message(model, cap, len(marked))
     return None
 
 
@@ -117,8 +181,9 @@ def generate_plan(
     hours_per_week: float,
     hit_days_per_week: int,
     hard_days: Optional[Sequence[int]] = None,
+    model: str = DEFAULT_MODEL,
 ) -> Dict:
-    """Generate a dated, polarized multi-week plan.
+    """Generate a dated, multi-week plan for the chosen training model.
 
     days_of_week are weekday indices (Mon=0 .. Sun=6). ``hard_days`` optionally
     pins specific weekdays as the HIT days (must be a subset of days_of_week and
@@ -128,11 +193,12 @@ def generate_plan(
     ValueError on invalid input.
     """
     err = validate_plan_inputs(
-        weeks, days_of_week, hours_per_week, hit_days_per_week, hard_days
+        weeks, days_of_week, hours_per_week, hit_days_per_week, hard_days, model
     )
     if err:
         raise ValueError(err)
 
+    cfg = MODELS[model]
     weeks = int(weeks)
     hit_per_week = int(hit_days_per_week)
     days = sorted(set(int(d) for d in days_of_week))
@@ -161,7 +227,8 @@ def generate_plan(
         # days, feasibility-clamped so the interval builders always fit.
         if hit > 0:
             hit_dur = _clamp(
-                weekly_minutes * HARD_VOLUME_FRACTION / hit, HIT_MIN_MIN, HIT_MAX_MIN
+                weekly_minutes * cfg.hard_volume_fraction / hit,
+                HIT_MIN_MIN, HIT_MAX_MIN,
             )
         else:
             hit_dur = 0.0
@@ -177,7 +244,7 @@ def generate_plan(
         for i, weekday in enumerate(days):
             date = monday + _dt.timedelta(days=weekday)
             if i in hit_pos:
-                kind = "vo2max" if hit_counter % 2 == 0 else "threshold"
+                kind = cfg.hard_types[hit_counter % len(cfg.hard_types)]
                 hit_counter += 1
                 dur = hit_dur
             else:
@@ -221,6 +288,7 @@ def generate_plan(
     total_hard_s = sum(x["hard_s"] for x in weekly)
     return {
         "name": name,
+        "model": model,
         "start_date": monday0.isoformat(),
         "weeks": weeks,
         "days_of_week": days,

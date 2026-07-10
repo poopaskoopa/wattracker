@@ -15,7 +15,7 @@ from typing import Dict, List, Optional
 
 from .config import db_path
 
-SCHEMA_VERSION = 10
+SCHEMA_VERSION = 11
 
 # In-place migrations: version N -> N+1 statement lists. A database whose
 # version has an unbroken chain here is upgraded without losing live data.
@@ -46,6 +46,10 @@ _MIGRATIONS: Dict[int, List[str]] = {
     ],
     9: [
         "ALTER TABLE race_results ADD COLUMN distance_km REAL",
+    ],
+    10: [
+        "ALTER TABLE plan_workouts ADD COLUMN rpe INTEGER",
+        "ALTER TABLE plans ADD COLUMN model TEXT",
     ],
 }
 
@@ -117,6 +121,7 @@ CREATE TABLE IF NOT EXISTS plans (
     start_date TEXT NOT NULL,
     weeks      INTEGER NOT NULL,
     created    TEXT NOT NULL,
+    model      TEXT,
     FOREIGN KEY(user_id) REFERENCES users(id)
 );
 
@@ -134,6 +139,7 @@ CREATE TABLE IF NOT EXISTS plan_workouts (
     completed_date    TEXT,
     adapted           TEXT,
     adapted_at        TEXT,
+    rpe               INTEGER,
     FOREIGN KEY(plan_id) REFERENCES plans(id),
     FOREIGN KEY(user_id) REFERENCES users(id)
 );
@@ -638,14 +644,16 @@ def ftp_history_list(user_id: int, path: Optional[str] = None) -> List[dict]:
 
 # ---------------------------------------------------------------- plans
 def create_plan(
-    user_id: int, name: str, start_date: str, weeks: int, path: Optional[str] = None
+    user_id: int, name: str, start_date: str, weeks: int,
+    model: Optional[str] = None, path: Optional[str] = None
 ) -> int:
     conn = connect(path)
     try:
         cur = conn.execute(
-            "INSERT INTO plans (user_id, name, start_date, weeks, created) "
-            "VALUES (?, ?, ?, ?, ?)",
-            (user_id, name, start_date, int(weeks), _dt.datetime.now().isoformat()),
+            "INSERT INTO plans (user_id, name, start_date, weeks, created, model) "
+            "VALUES (?, ?, ?, ?, ?, ?)",
+            (user_id, name, start_date, int(weeks),
+             _dt.datetime.now().isoformat(), model),
         )
         conn.commit()
         return cur.lastrowid
@@ -685,7 +693,7 @@ def get_plan(user_id: int, plan_id: int, path: Optional[str] = None) -> Optional
     conn = connect(path)
     try:
         row = conn.execute(
-            "SELECT id, name, start_date, weeks, created FROM plans "
+            "SELECT id, name, start_date, weeks, created, model FROM plans "
             "WHERE user_id = ? AND id = ?",
             (user_id, plan_id),
         ).fetchone()
@@ -698,7 +706,7 @@ def list_plans(user_id: int, path: Optional[str] = None) -> List[dict]:
     conn = connect(path)
     try:
         rows = conn.execute(
-            "SELECT id, name, start_date, weeks, created FROM plans "
+            "SELECT id, name, start_date, weeks, created, model FROM plans "
             "WHERE user_id = ? ORDER BY created DESC",
             (user_id,),
         ).fetchall()
@@ -720,6 +728,7 @@ def _plan_workout_row(r: sqlite3.Row, include_zwo: bool = False) -> dict:
         "completed_date": r["completed_date"],
         "adapted": r["adapted"],
         "adapted_at": r["adapted_at"],
+        "rpe": r["rpe"],
     }
     if include_zwo:
         d["zwo_or_segments"] = r["zwo_or_segments"]
@@ -815,6 +824,27 @@ def mark_plan_workout_completed(
             "UPDATE plan_workouts SET completed_activity_id = ?, completed_date = ? "
             "WHERE user_id = ? AND id = ? AND completed_activity_id IS NULL",
             (activity_id, completed_date, user_id, workout_id),
+        )
+        conn.commit()
+        return cur.rowcount > 0
+    finally:
+        conn.close()
+
+
+def set_plan_workout_rpe(
+    user_id: int, workout_id: int, rpe: int, path: Optional[str] = None
+) -> bool:
+    """Set (or overwrite) the perceived-exertion grade of a completed workout.
+
+    Scoped to the user and to workouts that have been completed; returns True
+    when a row was updated.
+    """
+    conn = connect(path)
+    try:
+        cur = conn.execute(
+            "UPDATE plan_workouts SET rpe = ? "
+            "WHERE user_id = ? AND id = ? AND completed_activity_id IS NOT NULL",
+            (int(rpe), user_id, workout_id),
         )
         conn.commit()
         return cur.rowcount > 0

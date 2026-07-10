@@ -139,6 +139,11 @@ details summary { cursor: pointer; color: var(--accent); margin: 0.5rem 0; }
 .day-check .hard-toggle { font-size: 0.72rem; color: var(--muted); text-transform: uppercase; }
 .day-check .hard-toggle:has(input:checked) { color: var(--alert); }
 .day-check .hard-toggle input:disabled { opacity: 0.4; }
+.model-picker { grid-column: 1 / -1; border: 1px solid #2a333d; border-radius: 6px; padding: 0.5rem; }
+.model-picker legend { color: var(--muted); font-size: 0.8rem; }
+.model-option { display: flex; align-items: flex-start; gap: 0.5rem; margin: 0.3rem 0; cursor: pointer; }
+.model-option span { font-size: 0.82rem; }
+.model-option span strong { color: var(--accent); }
 .plan-form button { grid-column: 1 / -1; justify-self: start; }
 .weekly-table .recovery-week { color: var(--ok); }
 .link-btn { background: none; border: none; color: var(--accent); cursor: pointer; padding: 0; font: inherit; }
@@ -163,6 +168,18 @@ table.calendar th { text-align: center; }
 .cal-check { color: var(--ok); font-weight: 700; }
 .cal-workout.cal-adapted { border-left-style: dashed; }
 .cal-adapt-mark { color: var(--accent); font-weight: 700; }
+.cal-rpe { display: inline-block; margin-left: 4px; font-size: 0.6rem; font-weight: 700;
+    letter-spacing: 0.02em; color: #1a1a1a; background: var(--accent);
+    border-radius: 3px; padding: 0 4px; vertical-align: middle; }
+
+/* Perceived-exertion (RPE) grading in the workout modal. */
+.rpe-section { border-top: 1px solid #2a333d; margin-top: 0.75rem; padding-top: 0.5rem; }
+.rpe-section h4 { margin: 0 0 0.25rem; }
+.rpe-buttons { display: flex; flex-wrap: wrap; gap: 0.3rem; margin: 0.4rem 0; }
+.rpe-btn { min-width: 2rem; padding: 0.3rem 0; border: 1px solid #2a333d;
+    background: var(--panel); color: var(--text); border-radius: 4px; cursor: pointer; }
+.rpe-btn:hover { border-color: var(--accent); }
+.rpe-btn.rpe-on { background: var(--accent); color: #1a1a1a; border-color: var(--accent); font-weight: 700; }
 .cal-workout.cal-skipped { opacity: 0.6; text-decoration: line-through;
     text-decoration-color: var(--alert); text-decoration-thickness: 2px;
     border-left-color: var(--alert); }
