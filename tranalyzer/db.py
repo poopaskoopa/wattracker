@@ -275,6 +275,34 @@ def get_user_by_username(username: str, path: Optional[str] = None) -> Optional[
         conn.close()
 
 
+def set_password_hash(
+    username: str, password_hash: str, path: Optional[str] = None
+) -> bool:
+    """Overwrite a user's stored password hash. Returns False if no such user."""
+    conn = connect(path)
+    try:
+        cur = conn.execute(
+            "UPDATE users SET password_hash = ? WHERE username = ?",
+            (password_hash, username),
+        )
+        conn.commit()
+        return cur.rowcount > 0
+    finally:
+        conn.close()
+
+
+def list_usernames(path: Optional[str] = None) -> List[str]:
+    """All usernames, alphabetically. No hashes or other columns exposed."""
+    conn = connect(path)
+    try:
+        rows = conn.execute(
+            "SELECT username FROM users ORDER BY username ASC"
+        ).fetchall()
+        return [r["username"] for r in rows]
+    finally:
+        conn.close()
+
+
 def get_user_by_id(user_id: int, path: Optional[str] = None) -> Optional[dict]:
     conn = connect(path)
     try:
