@@ -106,7 +106,7 @@
             </td>
             <td class="place" data-sort="{{ r.place if r.place else '' }}">{% if r.place in (1, 2, 3) %}{{ trophy(r.place) }}{% else %}{{ r.position or '—' }}{% endif %}</td>
             <td data-sort="{{ r.category or '' }}">{{ r.category or '—' }}</td>
-            <td class="nowrap" data-sort="{{ r.duration_s or 0 }}">{{ (r.duration_s // 60) ~ ' min' if r.duration_s else '—' }}</td>
+            <td class="nowrap" data-sort="{{ r.duration_s or 0 }}">{{ r.duration_fmt or '—' }}</td>
             <td class="nowrap" data-sort="{{ r.distance_km if r.distance_km else '' }}">{{ ('%g'|format(r.distance_km|round(1))) ~ ' km' if r.distance_km else '—' }}</td>
             <td data-sort="{{ r.avg_power|round(0)|int if r.avg_power else '' }}">{% if r.avg_power %}<span class="pw" data-w="{{ r.avg_power|round(0)|int }}">{{ r.avg_power|round(0)|int }}</span>{% else %}—{% endif %}</td>
             <td data-sort="{{ r.np|round(0)|int if r.np else '' }}">{% if r.np %}<span class="pw" data-w="{{ r.np|round(0)|int }}">{{ r.np|round(0)|int }}</span>{% else %}—{% endif %}</td>

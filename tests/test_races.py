@@ -42,6 +42,22 @@ def _activity(user_id, start_time, seconds, watts, if_=0.9, tss=80.0):
 
 
 # ------------------------------------------------------- power per period
+def test_format_duration_under_1h():
+    assert races.format_duration(46 * 60 + 12) == "46:12.000"
+
+
+def test_format_duration_over_1h():
+    assert races.format_duration(3600 + 2 * 60 + 7.25) == "1:02:07.250"
+
+
+def test_format_duration_fractional_seconds():
+    assert races.format_duration(12.5) == "00:12.500"
+
+
+def test_format_duration_none():
+    assert races.format_duration(None) is None
+
+
 def test_power_per_period_exact_spec_durations():
     assert races.RACE_POWER_DURATIONS == (1, 5, 15, 30, 60, 120, 300, 600, 1200)
     stream = [400.0] * 15 + [200.0] * 1200  # sprint then steady

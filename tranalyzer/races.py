@@ -381,6 +381,20 @@ def _weight_from_zwiftpower_doc(doc: dict) -> Optional[float]:
     return round(best[1], 1) if best else None
 
 
+def format_duration(seconds: Optional[float]) -> Optional[str]:
+    """Format a duration in seconds as ``h:mm:ss.sss`` (>=1h) or ``mm:ss.sss``
+    (<1h), always with zero-padded 3-digit milliseconds."""
+    if seconds is None:
+        return None
+    total_ms = round(float(seconds) * 1000)
+    hours, rem_ms = divmod(total_ms, 3_600_000)
+    minutes, rem_ms = divmod(rem_ms, 60_000)
+    secs, ms = divmod(rem_ms, 1000)
+    if hours:
+        return f"{hours}:{minutes:02d}:{secs:02d}.{ms:03d}"
+    return f"{minutes:02d}:{secs:02d}.{ms:03d}"
+
+
 def _place_int(position) -> Optional[int]:
     """Parse a race position field to an int (handles '1', 1, '1st', '3 /40')."""
     if position is None:
@@ -417,6 +431,7 @@ def race_page_data(user_id: int) -> Dict:
             if ftp and ftp > 0:
                 r["if_"] = round(r["np"] / ftp, 2)
         r["place"] = _place_int(r.get("position"))
+        r["duration_fmt"] = format_duration(r.get("duration_s"))
     weight = db.get_user_settings(user_id).get("weight_kg")
     return {
         "sync": sync,
