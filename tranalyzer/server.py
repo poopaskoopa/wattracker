@@ -247,9 +247,12 @@ def create_app() -> FastAPI:
         candidates = paths.annotated_candidates()
         saved = settings.get("activities_dir")
         prefill = saved or (candidates[0]["path"] if candidates else "")
+        activities = db.list_activities(uid)
+        for a in activities:
+            a["duration_fmt"] = races.format_duration(a.get("duration_s"))
         return _ctx(
             request,
-            activities=db.list_activities(uid),
+            activities=activities,
             scan=scan,
             candidates=candidates,
             saved_dir=saved,
@@ -273,6 +276,7 @@ def create_app() -> FastAPI:
         summary = {k: detail[k] for k in (
             "id", "filename", "start_time", "duration_s", "distance_m",
             "avg_power", "avg_hr", "np", "if_", "tss", "have", "points")}
+        summary["duration_fmt"] = races.format_duration(summary.get("duration_s"))
         return templates.TemplateResponse(
             request, "activity_detail.html", _ctx(request, activity=summary)
         )

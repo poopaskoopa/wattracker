@@ -382,17 +382,16 @@ def _weight_from_zwiftpower_doc(doc: dict) -> Optional[float]:
 
 
 def format_duration(seconds: Optional[float]) -> Optional[str]:
-    """Format a duration in seconds as ``h:mm:ss.sss`` (>=1h) or ``mm:ss.sss``
-    (<1h), always with zero-padded 3-digit milliseconds."""
+    """Format a duration in seconds as ``h:mm:ss`` (>=1h) or ``mm:ss`` (<1h),
+    rounded to the nearest second."""
     if seconds is None:
         return None
-    total_ms = round(float(seconds) * 1000)
-    hours, rem_ms = divmod(total_ms, 3_600_000)
-    minutes, rem_ms = divmod(rem_ms, 60_000)
-    secs, ms = divmod(rem_ms, 1000)
+    total_s = round(float(seconds))
+    hours, rem_s = divmod(total_s, 3600)
+    minutes, secs = divmod(rem_s, 60)
     if hours:
-        return f"{hours}:{minutes:02d}:{secs:02d}.{ms:03d}"
-    return f"{minutes:02d}:{secs:02d}.{ms:03d}"
+        return f"{hours}:{minutes:02d}:{secs:02d}"
+    return f"{minutes:02d}:{secs:02d}"
 
 
 def _place_int(position) -> Optional[int]:

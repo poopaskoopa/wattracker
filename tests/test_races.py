@@ -43,15 +43,15 @@ def _activity(user_id, start_time, seconds, watts, if_=0.9, tss=80.0):
 
 # ------------------------------------------------------- power per period
 def test_format_duration_under_1h():
-    assert races.format_duration(46 * 60 + 12) == "46:12.000"
+    assert races.format_duration(46 * 60 + 12) == "46:12"
 
 
 def test_format_duration_over_1h():
-    assert races.format_duration(3600 + 2 * 60 + 7.25) == "1:02:07.250"
+    assert races.format_duration(3600 + 2 * 60 + 7.25) == "1:02:07"
 
 
-def test_format_duration_fractional_seconds():
-    assert races.format_duration(12.5) == "00:12.500"
+def test_format_duration_rounds_to_nearest_second():
+    assert races.format_duration(12.6) == "00:13"
 
 
 def test_format_duration_none():

@@ -54,7 +54,7 @@
     {% for a in activities %}
         <tr>
             <td><a href="/activity/{{ a.id }}">{{ a.start_time or '&mdash;'|safe }}</a></td>
-            <td>{{ (a.duration_s // 60) if a.duration_s else 0 }} min</td>
+            <td>{{ a.duration_fmt or '—' }}</td>
             <td>{{ '%.1f'|format((a.distance_m or 0) / 1000) }} km</td>
             <td>{{ '%.0f'|format(a.avg_power or 0) }} W</td>
             <td>{{ '%.0f'|format(a.np or 0) }} W</td>
