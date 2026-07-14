@@ -8,6 +8,7 @@ import io
 import logging
 import os
 import threading
+import urllib.parse as _url
 import zipfile
 from contextlib import asynccontextmanager
 from typing import List, Optional
@@ -414,6 +415,54 @@ def create_app() -> FastAPI:
             "model": planmod.DEFAULT_MODEL,
         }
 
+    def _plan_management(uid: Optional[int]) -> dict:
+        """Summarize the user's plans for the management section.
+
+        current: the plan whose date range (start_date .. +weeks*7d) covers
+        today; if none covers today, the most recent plan flagged in_effect=False;
+        None only when the user has no plans. others: every other plan, newest
+        first. Each entry carries name, model, dates, end_date, and progress
+        (completed/total workouts).
+        """
+        if uid is None:
+            return {"current": None, "others": []}
+        today = _dt.date.today()
+        entries = []
+        for p in db.list_plans(uid):  # created DESC
+            workouts = db.plan_workouts_for_plan(uid, p["id"])
+            total = len(workouts)
+            completed = sum(
+                1 for w in workouts if w.get("completed_activity_id")
+            )
+            try:
+                start = _dt.date.fromisoformat(p["start_date"])
+                end = start + _dt.timedelta(days=int(p["weeks"]) * 7)
+            except (ValueError, TypeError):
+                start = end = None
+            covers = bool(start and end and start <= today < end)
+            entries.append({
+                "id": p["id"],
+                "name": p["name"],
+                "model": p["model"],
+                "start_date": p["start_date"],
+                "end_date": end.isoformat() if end else None,
+                "weeks": p["weeks"],
+                "total": total,
+                "completed": completed,
+                "covers_today": covers,
+            })
+        if not entries:
+            return {"current": None, "others": []}
+        current = next((e for e in entries if e["covers_today"]), None)
+        if current is not None:
+            current["in_effect"] = True
+        else:
+            # Most recent plan (list is created DESC) but flag not-in-effect.
+            current = entries[0]
+            current["in_effect"] = False
+        others = [e for e in entries if e["id"] != current["id"]]
+        return {"current": current, "others": others}
+
     def _generate_ctx(request: Request, **kw) -> dict:
         base = dict(
             session=None,
@@ -426,6 +475,8 @@ def create_app() -> FastAPI:
             day_labels=DAY_LABELS,
             exported=None,
             exported_path=None,
+            flash=None,
+            plan_mgmt=_plan_management(_uid(request)),
         )
         base.update(kw)
         return _ctx(request, **base)
@@ -479,11 +530,17 @@ def create_app() -> FastAPI:
             "auto_export_reason": None,
         }
 
-    @app.get("/generate", response_class=HTMLResponse)
-    def generate_form(request: Request):
+    @app.get("/plan", response_class=HTMLResponse)
+    def plan_page(request: Request):
         return templates.TemplateResponse(
-            request, "generate.html", _generate_ctx(request)
+            request, "plan.html",
+            _generate_ctx(request, flash=request.query_params.get("flash")),
         )
+
+    @app.get("/generate")
+    def generate_redirect():
+        # Old link target; the page moved to /plan.
+        return RedirectResponse(url="/plan", status_code=307)
 
     @app.post("/generate", response_class=HTMLResponse)
     def generate_submit(request: Request, duration_min: int = Form(...)):
@@ -503,7 +560,7 @@ def create_app() -> FastAPI:
             error = str(e)
         return templates.TemplateResponse(
             request,
-            "generate.html",
+            "plan.html",
             _generate_ctx(
                 request, mode="workout", session=session_dict,
                 error=error, duration=duration_min,
@@ -575,7 +632,7 @@ def create_app() -> FastAPI:
 
         return templates.TemplateResponse(
             request,
-            "generate.html",
+            "plan.html",
             _generate_ctx(
                 request, mode="plan", plan=summary, plan_error=plan_error,
                 plan_defaults=defaults,
@@ -601,7 +658,7 @@ def create_app() -> FastAPI:
         summary = _plan_summary(uid, plan_id)
         return templates.TemplateResponse(
             request,
-            "generate.html",
+            "plan.html",
             _generate_ctx(request, mode="plan", plan=summary, exported=exported),
         )
 
@@ -610,7 +667,7 @@ def create_app() -> FastAPI:
         uid = _uid(request)
         workouts = db.plan_workouts_for_plan(uid, plan_id, include_zwo=True)
         if not workouts:
-            return RedirectResponse(url="/generate", status_code=303)
+            return RedirectResponse(url="/plan", status_code=303)
         buf = io.BytesIO()
         with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
             for w in workouts:
@@ -642,7 +699,7 @@ def create_app() -> FastAPI:
             summary = _plan_summary(uid, w["plan_id"])
         return templates.TemplateResponse(
             request,
-            "generate.html",
+            "plan.html",
             _generate_ctx(request, mode="plan", plan=summary, exported=exported),
         )
 
@@ -650,12 +707,35 @@ def create_app() -> FastAPI:
     def plan_workout_download(request: Request, workout_id: int):
         w = db.get_plan_workout(_uid(request), workout_id)
         if not w:
-            return RedirectResponse(url="/generate", status_code=303)
+            return RedirectResponse(url="/plan", status_code=303)
         fname = zwo.plan_filename(w["date"], w["name"])
         return Response(
             content=w["zwo_or_segments"],
             media_type="application/xml",
             headers={"Content-Disposition": f'attachment; filename="{fname}"'},
+        )
+
+    @app.post("/plan/{plan_id}/delete")
+    def plan_delete(request: Request, plan_id: int):
+        uid = _uid(request)
+        plan = db.get_plan(uid, plan_id)
+        if not plan:
+            # Not this user's plan (or already gone) -> 404, no cross-user delete.
+            return JSONResponse({"error": "not found"}, status_code=404)
+        # Remove Zwift .zwo files BEFORE the rows go (filenames come from rows).
+        export = exporter.remove_plan_exports(uid, plan_id)
+        counts = db.delete_plan(uid, plan_id)
+        workouts_deleted = counts["workouts"] if counts else 0
+        files_removed = export.get("removed", 0)
+        flash = (
+            f"Deleted plan “{plan['name']}” — "
+            f"{workouts_deleted} workout"
+            f"{'' if workouts_deleted == 1 else 's'}, "
+            f"{files_removed} .zwo file"
+            f"{'' if files_removed == 1 else 's'} removed from Zwift folder"
+        )
+        return RedirectResponse(
+            url="/plan?flash=" + _url.quote(flash), status_code=303
         )
 
     @app.get("/calendar", response_class=HTMLResponse)
@@ -778,7 +858,7 @@ def create_app() -> FastAPI:
         uid = _uid(request)
         last = app.state.last.get(uid)
         if not last:
-            return RedirectResponse(url="/generate", status_code=303)
+            return RedirectResponse(url="/plan", status_code=303)
         zwo_str, name = last
         settings = db.get_user_settings(uid)
         path = zwo.write_to_zwift(
@@ -789,7 +869,7 @@ def create_app() -> FastAPI:
         )
         return templates.TemplateResponse(
             request,
-            "generate.html",
+            "plan.html",
             _generate_ctx(request, mode="workout", exported_path=path),
         )
 
@@ -797,7 +877,7 @@ def create_app() -> FastAPI:
     def generate_download(request: Request):
         last = app.state.last.get(_uid(request))
         if not last:
-            return RedirectResponse(url="/generate", status_code=303)
+            return RedirectResponse(url="/plan", status_code=303)
         zwo_str, name = last
         fname = (name or "workout").replace(" ", "_")
         return Response(

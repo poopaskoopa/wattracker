@@ -80,3 +80,39 @@ def sync_plan_exports(user_id: int) -> Dict:
 
     return {"status": "ok", "directory": target, "exported": exported,
             "removed": removed, "reason": reason}
+
+
+def remove_plan_exports(user_id: int, plan_id: int) -> Dict:
+    """Remove a plan's generated .zwo files from the Zwift custom-workout folder.
+
+    MUST run BEFORE the plan's DB rows are deleted - filenames are derived from
+    the workout rows via zwo.plan_filename(date, name). Reuses sync_plan_exports'
+    export-dir resolution and per-file OSError handling.
+
+    Returns {status, directory, removed, reason}.
+      - status 'ok'      : resolved a folder and pruned files (may be 0)
+      - status 'choose'  : several Zwift player folders, none removed
+      - status 'missing' : no Zwift Workouts folder on this machine
+    """
+    settings = db.get_user_settings(user_id)
+    target, reason = paths.resolve_export_dir(
+        settings.get("zwift_id"), settings.get("workouts_dir")
+    )
+    if not target:
+        return {"status": reason, "directory": None, "removed": 0,
+                "reason": reason}
+
+    workouts = db.plan_workouts_for_plan(user_id, plan_id)
+    removed = 0
+    for w in workouts:
+        fname = zwo.plan_filename(w["date"], w["name"])
+        p = os.path.join(target, fname)
+        try:
+            if os.path.exists(p):
+                os.unlink(p)
+                removed += 1
+        except OSError as e:
+            log.warning("could not remove plan export %s: %s", p, e)
+
+    return {"status": "ok", "directory": target, "removed": removed,
+            "reason": reason}

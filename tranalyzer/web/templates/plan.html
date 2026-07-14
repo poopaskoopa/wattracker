@@ -1,7 +1,57 @@
 {% extends "base.html" %}
-{% block title %}Generate &mdash; TRanalyzer{% endblock %}
+{% block title %}Plan &mdash; TRanalyzer{% endblock %}
 {% block content %}
-<h2>Generate</h2>
+<h2>Plan</h2>
+
+{% if flash %}<p class="ok flash">{{ flash }}</p>{% endif %}
+
+<!-- ======================== PLAN MANAGEMENT ======================== -->
+<section class="plan-mgmt">
+    {% if plan_mgmt.current %}
+    {% set cur = plan_mgmt.current %}
+    <div class="current-plan{{ ' not-in-effect' if not cur.in_effect else '' }}">
+        <h3>Current plan
+            {% if not cur.in_effect %}<span class="hint">(not currently in effect)</span>{% endif %}
+        </h3>
+        <p><strong>{{ cur.name }}</strong>
+           {% if cur.model %}<span class="hint">({{ cur.model.replace('_', ' ') }})</span>{% endif %}</p>
+        <p>{{ cur.weeks }} weeks &middot; {{ cur.start_date }} &rarr; {{ cur.end_date }}
+           &middot; progress <strong>{{ cur.completed }}/{{ cur.total }}</strong> workouts</p>
+        <form method="post" action="/plan/{{ cur.id }}/delete" class="delete-plan-form"
+              onsubmit="return confirmPlanDelete(this);">
+            <button type="submit" class="danger">Delete plan</button>
+        </form>
+    </div>
+    {% else %}
+    <p class="hint">No training plans yet &mdash; create one below.</p>
+    {% endif %}
+
+    {% if plan_mgmt.others %}
+    <h4>Other plans</h4>
+    <table class="other-plans">
+        <thead><tr><th>Name</th><th>Dates</th><th>Progress</th><th></th></tr></thead>
+        <tbody>
+        {% for p in plan_mgmt.others %}
+            <tr>
+                <td>{{ p.name }}{% if p.model %} <span class="hint">({{ p.model.replace('_', ' ') }})</span>{% endif %}</td>
+                <td>{{ p.start_date }} &rarr; {{ p.end_date }}</td>
+                <td>{{ p.completed }}/{{ p.total }}</td>
+                <td>
+                    <form method="post" action="/plan/{{ p.id }}/delete"
+                          class="delete-plan-form" style="display:inline"
+                          onsubmit="return confirmPlanDelete(this);">
+                        <button type="submit" class="danger link-btn">delete</button>
+                    </form>
+                </td>
+            </tr>
+        {% endfor %}
+        </tbody>
+    </table>
+    {% endif %}
+</section>
+
+<hr>
+<h3>Create a workout or plan</h3>
 
 <div class="mode-toggle">
     <label><input type="radio" name="genmode" value="workout"
@@ -224,6 +274,17 @@
 </section>
 
 <script>
+// Explicit confirmation before deleting a plan: warns that BOTH the plan and
+// its workouts are deleted from the app AND that the generated custom-workout
+// files are removed from Zwift's custom workout folder.
+function confirmPlanDelete(form) {
+    return window.confirm(
+        "Delete this plan?\n\n" +
+        "This permanently removes the plan and ALL its workouts from " +
+        "TRanalyzer, and deletes the plan's generated .zwo files from " +
+        "Zwift's custom workout folder. This cannot be undone."
+    );
+}
 (function () {
     function applyMode() {
         var sel = document.querySelector('input[name="genmode"]:checked');

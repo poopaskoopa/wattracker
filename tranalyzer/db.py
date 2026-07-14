@@ -208,8 +208,16 @@ CREATE TABLE IF NOT EXISTS scanned_files (
 
 
 def connect(path: Optional[str] = None) -> sqlite3.Connection:
-    conn = sqlite3.connect(path or db_path())
+    conn = sqlite3.connect(path or db_path(), timeout=10)
     conn.row_factory = sqlite3.Row
+    # WAL lets the background scan thread's writes proceed without blocking
+    # concurrent reads (dashboard/pipeline) on the same DB file. journal_mode is
+    # persisted in the DB header, but set it on every connect so fresh temp/test
+    # DBs get it too. busy_timeout backs the connect timeout for in-flight locks;
+    # synchronous=NORMAL is the recommended durability pairing with WAL.
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("PRAGMA busy_timeout=10000")
+    conn.execute("PRAGMA synchronous=NORMAL")
     return conn
 
 
@@ -817,6 +825,37 @@ def get_plan_workout(
             (user_id, workout_id),
         ).fetchone()
         return _plan_workout_row(row, include_zwo=True) if row else None
+    finally:
+        conn.close()
+
+
+def delete_plan(
+    user_id: int, plan_id: int, path: Optional[str] = None
+) -> Optional[Dict[str, int]]:
+    """Delete a plan and its workouts, user-scoped.
+
+    Returns {"workouts": n, "plans": 1} on success, or None if the plan does not
+    exist for this user (so the caller can 404). Deletes plan_workouts first,
+    then the plans row, in one transaction.
+    """
+    conn = connect(path)
+    try:
+        exists = conn.execute(
+            "SELECT 1 FROM plans WHERE user_id = ? AND id = ?",
+            (user_id, plan_id),
+        ).fetchone()
+        if exists is None:
+            return None
+        wcur = conn.execute(
+            "DELETE FROM plan_workouts WHERE user_id = ? AND plan_id = ?",
+            (user_id, plan_id),
+        )
+        pcur = conn.execute(
+            "DELETE FROM plans WHERE user_id = ? AND id = ?",
+            (user_id, plan_id),
+        )
+        conn.commit()
+        return {"workouts": wcur.rowcount, "plans": pcur.rowcount}
     finally:
         conn.close()
 

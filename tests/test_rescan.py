@@ -170,6 +170,49 @@ def test_scan_status_conflict_when_running(client, tmp_path, monkeypatch):
     _wait_done(client)
 
 
+def test_connect_enables_wal(tmp_path):
+    """A fresh connect must put the DB in WAL journal mode."""
+    dbfile = tmp_path / "wal.db"
+    conn = db.connect(str(dbfile))
+    try:
+        mode = conn.execute("PRAGMA journal_mode").fetchone()[0]
+    finally:
+        conn.close()
+    assert mode.lower() == "wal"
+
+
+def test_dashboard_responsive_during_scan(client, tmp_path, monkeypatch):
+    """A long background rescan must not block dashboard reads. With WAL + a
+    per-file GIL yield, GET / returns 200 well before the scan finishes."""
+    _register(client)
+    act_dir = tmp_path / "Activities"
+    act_dir.mkdir()
+    for i in range(10):
+        (act_dir / f"ride{i}.fit").write_bytes(b"dummy")
+
+    # ~0.2s of pure-Python parse work per file (10 files -> ~2s scan).
+    def slow_parse(path):
+        time.sleep(0.2)
+        return _fake_parsed(start_time=f"2026-06-{int(path[-5]) + 1:02d}T10:00:00")
+
+    monkeypatch.setattr(importer, "parse_fit", slow_parse)
+
+    r = client.post("/activities/rescan", data={"activities_dir": str(act_dir)})
+    assert r.status_code == 202
+
+    # While the scan is still running, the dashboard must answer promptly.
+    assert client.get("/api/scan/status").json()["running"] is True
+    t0 = time.time()
+    resp = client.get("/")
+    elapsed = time.time() - t0
+    assert resp.status_code == 200
+    # Still running (the scan is far from done) and the read was fast.
+    assert client.get("/api/scan/status").json()["running"] is True
+    assert elapsed < 1.0, f"dashboard blocked for {elapsed:.2f}s during scan"
+
+    _wait_done(client)
+
+
 def test_activities_page_prefills_recommended_when_unset(client):
     _register(client)
     text = client.get("/activities").text

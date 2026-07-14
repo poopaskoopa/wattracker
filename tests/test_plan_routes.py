@@ -372,3 +372,113 @@ def test_calendar_isolated_between_users(client):
     assert r.status_code == 200
     assert "Intervals" not in r.text
     assert "cal-workout" not in r.text
+
+
+# ---------------------------------------------------------- plan management
+def test_generate_redirects_to_plan(client):
+    _register(client)
+    # No auto-follow so we can see the redirect itself.
+    r = client.get("/generate", follow_redirects=False)
+    assert r.status_code == 307
+    assert r.headers["location"] == "/plan"
+
+
+def test_plan_page_no_plans_message(client):
+    _register(client)
+    text = client.get("/plan").text
+    assert "No training plans yet" in text
+
+
+def test_plan_page_current_plan_covers_today(client, monkeypatch):
+    """A plan whose date range covers today is shown as the current plan and
+    marked in effect (no 'not currently in effect' label)."""
+    import tranalyzer.server as servermod
+
+    _register(client)
+    uid = db.get_user_by_username("rider")["id"]
+    today = dt.date(2026, 8, 20)
+    monkeypatch.setattr(servermod._dt, "date", _FrozenDate(today))
+    # Plan starts before today, ends after (4 weeks from Aug 3).
+    form = dict(PLAN_FORM, name="Live Plan")
+    client.post("/generate/plan", data=form)
+    text = client.get("/plan").text
+    assert "Live Plan" in text
+    assert "Current plan" in text
+    assert "not currently in effect" not in text
+
+
+def test_plan_page_not_in_effect_when_no_plan_covers_today(client, monkeypatch):
+    import tranalyzer.server as servermod
+
+    _register(client)
+    today = dt.date(2027, 1, 1)  # long after the Aug 2026 plan window
+    monkeypatch.setattr(servermod._dt, "date", _FrozenDate(today))
+    client.post("/generate/plan", data=dict(PLAN_FORM, name="Old Plan"))
+    text = client.get("/plan").text
+    assert "Old Plan" in text
+    assert "not currently in effect" in text
+
+
+def test_delete_plan_removes_rows_and_files(client, tmp_path):
+    import os
+    from tranalyzer import exporter
+    from tranalyzer.prescribe import zwo
+
+    out = tmp_path / "zwo"
+    _register(client)
+    uid = db.get_user_by_username("rider")["id"]
+    db.save_user_settings(uid, {"workouts_dir": str(out), "zwift_id": "me"})
+    client.post("/generate/plan", data=PLAN_FORM)  # 16 workouts, auto-exports
+    plan_id = db.list_plans(uid)[0]["id"]
+    workouts = db.plan_workouts_for_plan(uid, plan_id)
+    assert len(os.listdir(out)) == 16
+
+    # remove_plan_exports must run before the rows are gone -> route order.
+    r = client.post(f"/plan/{plan_id}/delete", follow_redirects=False)
+    assert r.status_code == 303
+    assert r.headers["location"].startswith("/plan?flash=")
+
+    # DB rows gone (user-scoped) and all .zwo files pruned from the folder.
+    assert db.get_plan(uid, plan_id) is None
+    assert db.plan_workouts_for_plan(uid, plan_id) == []
+    for w in workouts:
+        assert not os.path.exists(out / zwo.plan_filename(w["date"], w["name"]))
+    assert os.listdir(out) == []
+
+
+def test_delete_plan_direct_helper(client, tmp_path):
+    _register(client)
+    uid = db.get_user_by_username("rider")["id"]
+    client.post("/generate/plan", data=PLAN_FORM)
+    plan_id = db.list_plans(uid)[0]["id"]
+    counts = db.delete_plan(uid, plan_id)
+    assert counts == {"workouts": 16, "plans": 1}
+    assert db.get_plan(uid, plan_id) is None
+    # Deleting again is a clean no-op (None -> caller 404s).
+    assert db.delete_plan(uid, plan_id) is None
+
+
+def test_delete_plan_other_user_404(client):
+    _register(client, "alice")
+    client.post("/generate/plan", data=PLAN_FORM)
+    alice_uid = db.get_user_by_username("alice")["id"]
+    plan_id = db.list_plans(alice_uid)[0]["id"]
+    client.get("/logout")
+
+    _register(client, "bob")
+    r = client.post(f"/plan/{plan_id}/delete", follow_redirects=False)
+    assert r.status_code == 404
+    # Alice's plan is untouched.
+    assert db.get_plan(alice_uid, plan_id) is not None
+
+
+def _FrozenDate(fixed):
+    """A dt.date subclass whose today() returns `fixed`; fromisoformat and
+    arithmetic behave normally, so it can drop-in replace server._dt.date."""
+
+    class Frozen(dt.date):
+        @classmethod
+        def today(cls):
+            return fixed
+
+    return Frozen

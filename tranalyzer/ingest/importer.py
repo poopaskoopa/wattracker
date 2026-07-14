@@ -6,6 +6,7 @@ import glob
 import hashlib
 import os
 import tempfile
+import time
 from typing import Callable, Dict, List, Optional
 
 import numpy as np
@@ -273,6 +274,11 @@ def scan_activities(
         else:
             imported += 1
         _report(processed=found, imported=imported, skipped=skipped)
+        # FIT parsing is pure-Python CPU-bound and holds the GIL; yield briefly
+        # after each actually-parsed file so request threads (dashboard reads)
+        # stay responsive during a long background rescan. Incrementally
+        # skipped files never reach here, so the fast path is unaffected.
+        time.sleep(0.01)
 
     # Only the (relatively expensive) post-scan work runs when something new
     # actually landed - a rescan that imported nothing changes no derived state.

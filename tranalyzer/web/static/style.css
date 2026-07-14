@@ -280,6 +280,17 @@ table.calendar th { text-align: center; }
 .danger-btn { background: none; border: 1px solid var(--alert); color: var(--alert); }
 .danger-btn:hover { background: rgba(224, 82, 82, 0.15); filter: none; }
 
+/* Plan management section */
+.plan-mgmt { margin-bottom: 1rem; }
+.plan-mgmt .current-plan { border: 1px solid var(--accent); border-radius: 6px;
+    padding: 0.6rem 0.9rem; max-width: 620px; }
+.plan-mgmt .current-plan.not-in-effect { border-color: #2a333d; }
+.plan-mgmt table.other-plans { margin-top: 0.5rem; }
+.flash { font-weight: 600; }
+button.danger { background: none; border: 1px solid var(--alert); color: var(--alert); }
+button.danger:hover { background: rgba(224, 82, 82, 0.15); filter: none; }
+button.danger.link-btn { border: none; color: var(--alert); }
+
 /* Calendar workout-detail modal */
 .modal-overlay {
     position: fixed; inset: 0; background: rgba(0, 0, 0, 0.6);
