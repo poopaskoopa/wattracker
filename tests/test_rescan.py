@@ -1,4 +1,10 @@
-"""Tests for the Activities rescan UX (directory input, counts, recommendations)."""
+"""Tests for the Activities rescan UX (directory input, counts, recommendations).
+
+The rescan endpoint is asynchronous: POST /activities/rescan starts a background
+scan (202) and the client polls GET /api/scan/status for progress/results.
+"""
+import time
+
 import pytest
 
 pytest.importorskip("httpx")
@@ -7,6 +13,17 @@ from fastapi.testclient import TestClient  # noqa: E402
 import tranalyzer.ingest.importer as importer  # noqa: E402
 from tranalyzer import db, paths  # noqa: E402
 from tranalyzer.server import create_app  # noqa: E402
+
+
+def _wait_done(client, timeout=10.0):
+    """Poll the status endpoint until the scan finishes; return final status."""
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        s = client.get("/api/scan/status").json()
+        if not s.get("running"):
+            return s
+        time.sleep(0.02)
+    raise AssertionError("scan did not finish in time")
 
 
 def _fake_parsed(start_time="2026-06-01T10:00:00", seconds=1800, watts=200.0):
@@ -52,11 +69,12 @@ def test_rescan_explicit_dir_imports_and_reports(client, tmp_path, monkeypatch):
     monkeypatch.setattr(importer, "parse_fit", lambda path: _fake_parsed())
 
     r = client.post("/activities/rescan", data={"activities_dir": str(act_dir)})
-    assert r.status_code == 200
+    assert r.status_code == 202
+    status = _wait_done(client)
     # Reports the scanned path and the counts.
-    assert str(act_dir) in r.text
-    assert "1 .fit\n" in r.text or "1 .fit" in r.text
-    assert "1 imported" in r.text
+    assert status["directory"] == str(act_dir)
+    assert status["found"] == 1
+    assert status["imported"] == 1
 
     # The activity was actually imported for this user.
     uid = db.get_user_by_username("rider")["id"]
@@ -67,9 +85,10 @@ def test_rescan_nonexistent_dir_reports_not_found(client, tmp_path):
     _register(client)
     missing = tmp_path / "does_not_exist"
     r = client.post("/activities/rescan", data={"activities_dir": str(missing)})
-    assert r.status_code == 200
-    assert "not found" in r.text
-    assert str(missing) in r.text
+    assert r.status_code == 202
+    status = _wait_done(client)
+    assert status["exists"] is False
+    assert status["directory"] == str(missing)
     # No activities imported, no error.
     uid = db.get_user_by_username("rider")["id"]
     assert db.list_activities(uid) == []
@@ -80,8 +99,10 @@ def test_rescan_empty_dir_reports_zero(client, tmp_path, monkeypatch):
     empty = tmp_path / "Empty"
     empty.mkdir()
     r = client.post("/activities/rescan", data={"activities_dir": str(empty)})
-    assert r.status_code == 200
-    assert "no .fit files found" in r.text
+    assert r.status_code == 202
+    status = _wait_done(client)
+    assert status["exists"] is True
+    assert status["found"] == 0
 
 
 def test_rescan_persists_activities_dir_setting(client, tmp_path):
@@ -89,6 +110,7 @@ def test_rescan_persists_activities_dir_setting(client, tmp_path):
     act_dir = tmp_path / "MyRides"
     act_dir.mkdir()
     client.post("/activities/rescan", data={"activities_dir": str(act_dir)})
+    _wait_done(client)
 
     uid = db.get_user_by_username("rider")["id"]
     assert db.get_user_settings(uid)["activities_dir"] == str(act_dir)
@@ -96,6 +118,56 @@ def test_rescan_persists_activities_dir_setting(client, tmp_path):
     # And it is reflected on both the Activities and Settings pages.
     assert str(act_dir) in client.get("/activities").text
     assert str(act_dir) in client.get("/settings").text
+
+
+def test_scan_status_lifecycle(client, tmp_path, monkeypatch):
+    _register(client)
+    act_dir = tmp_path / "Activities"
+    act_dir.mkdir()
+    (act_dir / "ride.fit").write_bytes(b"dummy")
+    monkeypatch.setattr(importer, "parse_fit", lambda path: _fake_parsed())
+
+    # No scan yet: status reports not running.
+    assert client.get("/api/scan/status").json()["running"] is False
+
+    r = client.post("/activities/rescan", data={"activities_dir": str(act_dir)})
+    assert r.status_code == 202
+    started = r.json()
+    assert started["running"] is True
+    assert started["directory"] == str(act_dir)
+
+    final = _wait_done(client)
+    assert final["running"] is False
+    assert final["finished_at"]
+    assert final["imported"] == 1
+    assert final["error"] is None
+
+
+def test_scan_status_conflict_when_running(client, tmp_path, monkeypatch):
+    _register(client)
+    act_dir = tmp_path / "Activities"
+    act_dir.mkdir()
+    (act_dir / "ride.fit").write_bytes(b"dummy")
+
+    # Make parsing block so the first scan is still running when we post again.
+    import threading
+    release = threading.Event()
+
+    def slow_parse(path):
+        release.wait(timeout=5)
+        return _fake_parsed()
+
+    monkeypatch.setattr(importer, "parse_fit", slow_parse)
+
+    r1 = client.post("/activities/rescan", data={"activities_dir": str(act_dir)})
+    assert r1.status_code == 202
+    # Second post while the first is in flight -> 409 with the running status.
+    r2 = client.post("/activities/rescan", data={"activities_dir": str(act_dir)})
+    assert r2.status_code == 409
+    assert r2.json()["running"] is True
+
+    release.set()
+    _wait_done(client)
 
 
 def test_activities_page_prefills_recommended_when_unset(client):

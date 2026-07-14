@@ -15,7 +15,7 @@ from typing import Dict, List, Optional
 
 from .config import db_path
 
-SCHEMA_VERSION = 11
+SCHEMA_VERSION = 12
 
 # In-place migrations: version N -> N+1 statement lists. A database whose
 # version has an unbroken chain here is upgraded without losing live data.
@@ -51,9 +51,13 @@ _MIGRATIONS: Dict[int, List[str]] = {
         "ALTER TABLE plan_workouts ADD COLUMN rpe INTEGER",
         "ALTER TABLE plans ADD COLUMN model TEXT",
     ],
+    11: [
+        # New table scanned_files is created by _SCHEMA after migrating.
+    ],
 }
 
 _DROP = """
+DROP TABLE IF EXISTS scanned_files;
 DROP TABLE IF EXISTS ooto_ranges;
 DROP TABLE IF EXISTS race_sync;
 DROP TABLE IF EXISTS race_results;
@@ -191,6 +195,15 @@ CREATE TABLE IF NOT EXISTS ooto_ranges (
 );
 CREATE INDEX IF NOT EXISTS idx_ooto_user
     ON ooto_ranges(user_id, start_date);
+
+CREATE TABLE IF NOT EXISTS scanned_files (
+    user_id    INTEGER NOT NULL,
+    path       TEXT NOT NULL,
+    mtime      REAL,
+    size       INTEGER,
+    UNIQUE(user_id, path),
+    FOREIGN KEY(user_id) REFERENCES users(id)
+);
 """
 
 
@@ -1158,6 +1171,47 @@ def ooto_covers(user_id: int, date_iso: str, path: Optional[str] = None) -> bool
             (user_id, date_iso, date_iso),
         ).fetchone()
         return row is not None
+    finally:
+        conn.close()
+
+
+# ---------------------------------------------------------- scanned files
+def seen_files(
+    user_id: int, path: Optional[str] = None
+) -> "Dict[str, tuple]":
+    """Map of already-scanned file path -> (mtime, size) for a user.
+
+    Lets a rescan skip files whose mtime+size are unchanged WITHOUT parsing.
+    """
+    conn = connect(path)
+    try:
+        rows = conn.execute(
+            "SELECT path, mtime, size FROM scanned_files WHERE user_id = ?",
+            (user_id,),
+        ).fetchall()
+        return {r["path"]: (r["mtime"], r["size"]) for r in rows}
+    finally:
+        conn.close()
+
+
+def record_scanned_file(
+    user_id: int,
+    file_path: str,
+    mtime: float,
+    size: int,
+    path: Optional[str] = None,
+) -> None:
+    """Remember (or refresh) a scanned file's mtime+size so it is not reparsed."""
+    conn = connect(path)
+    try:
+        conn.execute(
+            "INSERT INTO scanned_files (user_id, path, mtime, size) "
+            "VALUES (?, ?, ?, ?) "
+            "ON CONFLICT(user_id, path) DO UPDATE SET "
+            "mtime = excluded.mtime, size = excluded.size",
+            (user_id, file_path, float(mtime), int(size)),
+        )
+        conn.commit()
     finally:
         conn.close()
 

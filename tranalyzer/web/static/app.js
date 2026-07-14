@@ -22,7 +22,7 @@ const COLORS = {
 };
 
 let mainChart = null;
-let currentMonths = 0; // 0 = all
+let currentMonths = 1; // default view: last 1 month (0 = all)
 
 function alignedFrom(labels, points, valueKey) {
     const m = {};
@@ -326,7 +326,7 @@ async function renderCurveChart() {
 
 function renderDashboard() {
     wireControls();
-    loadMainChart(0);
+    loadMainChart(1);
     renderCurveChart();
 }
 

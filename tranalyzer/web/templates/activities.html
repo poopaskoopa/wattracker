@@ -3,27 +3,15 @@
 {% block content %}
 <h2>Activities</h2>
 
-{% if scan %}
-<p class="{{ 'ok' if scan.imported or scan.found else 'alert' }}">
-    {% if not scan.exists %}
-        Scanned <code>{{ scan.directory }}</code> &mdash; directory not found.
-        Check the path below or set it in <a href="/settings">Settings</a>.
-    {% elif scan.found == 0 %}
-        Scanned <code>{{ scan.directory }}</code> &mdash; no .fit files found in this folder.
-    {% else %}
-        Scanned <code>{{ scan.directory }}</code> &mdash; {{ scan.found }} .fit
-        file(s) found, {{ scan.imported }} imported, {{ scan.skipped }} duplicate(s) skipped.
-    {% endif %}
-</p>
-{% endif %}
+<p id="scanStatus" class="hint" style="display:none"></p>
 
 <section class="scan-panel">
-    <form method="post" action="/activities/rescan" class="scan-form">
+    <form id="scanForm" method="post" action="/activities/rescan" class="scan-form">
         <label>Activities directory
             <input type="text" name="activities_dir" value="{{ prefill_dir or '' }}"
                    placeholder="/path/to/Zwift/Activities">
         </label>
-        <button type="submit">Rescan folder</button>
+        <button type="submit" id="scanBtn">Rescan folder</button>
     </form>
     <p class="hint">
         Recommended location(s) for this OS:
@@ -69,4 +57,91 @@
 <p>No activities imported yet. Set your Zwift folder in
    <a href="/settings">Settings</a>, then rescan &mdash; or upload a .fit file.</p>
 {% endif %}
+{% endblock %}
+
+{% block scripts %}
+<script>
+(function () {
+    var form = document.getElementById("scanForm");
+    var btn = document.getElementById("scanBtn");
+    var out = document.getElementById("scanStatus");
+    if (!form || !btn || !out) return;
+    var polling = null;
+
+    function show(msg, cls) {
+        out.textContent = msg;
+        out.className = cls;
+        out.style.display = "block";
+    }
+
+    function runningMsg(s) {
+        var total = s.total || 0;
+        var processed = s.processed || 0;
+        var imported = s.imported || 0;
+        var skipped = s.skipped || 0;
+        return "Scanning… " + processed + "/" + total + " files — " +
+               imported + " imported, " + skipped + " skipped";
+    }
+
+    function doneMsg(s) {
+        var dir = s.directory || "";
+        if (s.error) return "Scan failed: " + s.error;
+        if (s.exists === false) {
+            return "Scanned " + dir + " — directory not found. " +
+                   "Check the path below or set it in Settings.";
+        }
+        var found = s.found || 0;
+        if (found === 0) {
+            return "Scanned " + dir + " — no .fit files found in this folder.";
+        }
+        return "Scanned " + dir + " — " + found + " .fit file(s) found, " +
+               (s.imported || 0) + " imported, " + (s.skipped || 0) +
+               " duplicate(s) skipped.";
+    }
+
+    function finish(s) {
+        if (polling) { clearInterval(polling); polling = null; }
+        btn.disabled = false;
+        var cls = s.error ? "alert"
+                : ((s.imported || s.found) ? "ok" : "alert");
+        show(doneMsg(s), cls);
+    }
+
+    function poll() {
+        fetch("/api/scan/status").then(function (r) { return r.json(); })
+            .then(function (s) {
+                if (!s) return;
+                if (s.running) { show(runningMsg(s), "hint"); }
+                else { finish(s); }
+            }).catch(function () {});
+    }
+
+    function startPolling() {
+        btn.disabled = true;
+        if (!polling) polling = setInterval(poll, 1000);
+        poll();
+    }
+
+    form.addEventListener("submit", function (e) {
+        e.preventDefault();
+        btn.disabled = true;
+        show("Scanning…", "hint");
+        fetch("/activities/rescan", { method: "POST", body: new FormData(form) })
+            .then(function (r) { return r.json().then(function (s) {
+                return { status: r.status, body: s };
+            }); })
+            .then(function (res) {
+                if (res.status === 409) { startPolling(); return; }
+                startPolling();
+            })
+            .catch(function () { btn.disabled = false; show("Scan request failed.", "alert"); });
+    });
+
+    // A scan started earlier (e.g. before a reload) should still show progress.
+    fetch("/api/scan/status").then(function (r) { return r.json(); })
+        .then(function (s) {
+            if (s && s.running) { startPolling(); }
+        }).catch(function () {});
+})();
+</script>
 {% endblock %}

@@ -7,6 +7,7 @@ import datetime as _dt
 import io
 import logging
 import os
+import threading
 import zipfile
 from contextlib import asynccontextmanager
 from typing import List, Optional
@@ -38,6 +39,80 @@ RIDE_POLL_INTERVAL_S = 1.0
 SCAN_INTERVAL_S = 24 * 3600.0
 
 _log = logging.getLogger(__name__)
+
+# In-memory, per-user progress for interactive (button-triggered) rescans.
+# Single-process app, so a plain dict guarded by a lock is enough; the
+# background daemon thread doing the scan updates its entry, the status
+# endpoint reads it. Keys are user ids; values are the status dicts returned
+# verbatim as JSON by GET /api/scan/status.
+_scan_lock = threading.Lock()
+_scan_status: dict = {}
+
+
+def _scan_status_snapshot(user_id: Optional[int]) -> Optional[dict]:
+    with _scan_lock:
+        st = _scan_status.get(user_id)
+        return dict(st) if st else None
+
+
+def _start_user_scan(user_id: int, directory: Optional[str]) -> Optional[dict]:
+    """Begin an interactive rescan in a daemon thread.
+
+    Returns None if a scan is already running for this user (caller should
+    respond 409 with the current status); otherwise seeds and returns the fresh
+    running status.
+    """
+    with _scan_lock:
+        cur = _scan_status.get(user_id)
+        if cur and cur.get("running"):
+            return None
+        status = {
+            "running": True,
+            "started_at": _dt.datetime.now().isoformat(timespec="seconds"),
+            "total": 0,
+            "processed": 0,
+            "imported": 0,
+            "skipped": 0,
+            "error": None,
+            "finished_at": None,
+            "directory": directory,
+        }
+        _scan_status[user_id] = status
+        snapshot = dict(status)
+
+    def _progress(fields: dict) -> None:
+        with _scan_lock:
+            _scan_status[user_id].update(fields)
+
+    def _run() -> None:
+        try:
+            result = importer.scan_activities(
+                user_id, directory=directory, progress=_progress
+            )
+            d = result.get("directory")
+            with _scan_lock:
+                _scan_status[user_id].update(
+                    found=result.get("found", 0),
+                    imported=result.get("imported", 0),
+                    skipped=result.get("skipped", 0),
+                    directory=d,
+                    exists=bool(d and os.path.isdir(d)),
+                )
+        except Exception as exc:  # surface, don't crash the daemon thread
+            with _scan_lock:
+                _scan_status[user_id]["error"] = str(exc)
+            _log.warning("interactive rescan failed for user %s", user_id,
+                         exc_info=True)
+        finally:
+            with _scan_lock:
+                st = _scan_status[user_id]
+                st["running"] = False
+                st["finished_at"] = _dt.datetime.now().isoformat(
+                    timespec="seconds"
+                )
+
+    threading.Thread(target=_run, daemon=True).start()
+    return snapshot
 
 
 def run_daily_maintenance() -> dict:
@@ -288,25 +363,30 @@ def create_app() -> FastAPI:
             return JSONResponse({"error": "not found"}, status_code=404)
         return JSONResponse(detail)
 
-    @app.post("/activities/rescan", response_class=HTMLResponse)
+    @app.post("/activities/rescan")
     def rescan(request: Request, activities_dir: str = Form("")):
+        """Start an asynchronous rescan and return immediately.
+
+        The scan runs in a background daemon thread; the client polls
+        GET /api/scan/status for live progress. A rescan already in flight for
+        this user returns 409 with the running status (no second scan starts).
+        """
         uid = _uid(request)
         posted = (activities_dir or "").strip()
         # Persist a typed directory as the user's activities_dir setting.
         if posted:
             db.save_user_settings(uid, {"activities_dir": posted})
-        result = importer.scan_activities(uid, directory=posted or None)
-        directory = result.get("directory")
-        scan = {
-            "directory": directory,
-            "exists": bool(directory and os.path.isdir(directory)),
-            "found": result.get("found", 0),
-            "imported": result.get("imported", 0),
-            "skipped": result.get("skipped", 0),
-        }
-        return templates.TemplateResponse(
-            request, "activities.html", _activities_context(request, scan=scan)
-        )
+        started = _start_user_scan(uid, directory=posted or None)
+        if started is None:
+            return JSONResponse(_scan_status_snapshot(uid), status_code=409)
+        return JSONResponse(started, status_code=202)
+
+    @app.get("/api/scan/status")
+    def scan_status(request: Request):
+        snapshot = _scan_status_snapshot(_uid(request))
+        if snapshot is None:
+            return JSONResponse({"running": False})
+        return JSONResponse(snapshot)
 
     @app.post("/activities/upload")
     async def upload(request: Request, file: UploadFile):

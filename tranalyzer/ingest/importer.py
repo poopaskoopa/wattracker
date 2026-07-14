@@ -6,7 +6,7 @@ import glob
 import hashlib
 import os
 import tempfile
-from typing import Dict, List, Optional
+from typing import Callable, Dict, List, Optional
 
 import numpy as np
 
@@ -201,38 +201,85 @@ def _user_activities_dir(user_id: int) -> Optional[str]:
     return activities_dir(override=override)
 
 
-def scan_activities(user_id: int, directory: Optional[str] = None) -> Dict[str, int]:
+def scan_activities(
+    user_id: int,
+    directory: Optional[str] = None,
+    progress: Optional[Callable[[dict], None]] = None,
+) -> Dict[str, int]:
     """Scan a user's Activities directory for .fit files and import new ones.
 
-    Idempotent: already-imported activities are skipped.
+    Fast incremental rescan: files already recorded in ``scanned_files`` with an
+    unchanged mtime+size are skipped WITHOUT parsing. Every file that is
+    parsed - whether newly imported or a duplicate - is recorded so it is never
+    parsed again (changed mtime/size re-processes and refreshes the row).
+
+    ``progress`` (optional) is called with incremental field updates so a caller
+    can surface live status: once with ``{"total": N}`` after globbing, then
+    after each file with ``processed``/``imported``/``skipped`` counts.
     """
     db.init_db()
     directory = directory or _user_activities_dir(user_id)
     found = 0
     imported = 0
     skipped = 0
+
+    def _report(**fields):
+        if progress:
+            progress(fields)
+
     if not directory or not os.path.isdir(directory):
-        return {"found": 0, "imported": 0, "skipped": 0, "directory": directory}
+        _report(total=0, processed=0, imported=0, skipped=0)
+        return {"found": 0, "imported": 0, "skipped": 0, "completed": 0,
+                "directory": directory}
 
     ftp = current_ftp(user_id)
 
     files: List[str] = []
     for pat in ("*.fit", "*.FIT"):
         files.extend(glob.glob(os.path.join(directory, pat)))
-    for path in sorted(set(files)):
+    ordered = sorted(set(files))
+    _report(total=len(ordered), processed=0, imported=0, skipped=0)
+
+    seen = db.seen_files(user_id)
+    for path in ordered:
         found += 1
+        try:
+            st = os.stat(path)
+            mtime, size = st.st_mtime, st.st_size
+        except OSError:
+            skipped += 1
+            _report(processed=found, imported=imported, skipped=skipped)
+            continue
+
+        prev = seen.get(path)
+        if prev is not None and prev[0] == mtime and prev[1] == size:
+            # Already scanned, unchanged - skip without parsing.
+            skipped += 1
+            _report(processed=found, imported=imported, skipped=skipped)
+            continue
+
         try:
             new_id = ingest_file(user_id, path, ftp=ftp)
         except Exception:
             skipped += 1
+            _report(processed=found, imported=imported, skipped=skipped)
             continue
+
+        # Record whether it was a new import or a duplicate, so subsequent
+        # rescans skip it without parsing.
+        db.record_scanned_file(user_id, path, mtime, size)
         if new_id is None:
             skipped += 1
         else:
             imported += 1
+        _report(processed=found, imported=imported, skipped=skipped)
 
-    evaluate_ftp(user_id)
-    completed = match_plan_completions(user_id)
+    # Only the (relatively expensive) post-scan work runs when something new
+    # actually landed - a rescan that imported nothing changes no derived state.
+    completed = 0
+    if imported > 0:
+        evaluate_ftp(user_id)
+        completed = match_plan_completions(user_id)
 
     return {
         "found": found,
@@ -330,20 +377,12 @@ def run_auto_scan(now: Optional[_dt.datetime] = None) -> Dict[str, int]:
     totals = {"users": 0, "imported": 0, "completed": 0}
     for uid in db.all_user_ids():
         totals["users"] += 1
-        scanned = False
         try:
-            result = scan_activities(uid)  # also evaluates FTP + matches
+            # scan_activities gates FTP re-eval + completion matching on new
+            # imports and reports both back - no separate second pass needed.
+            result = scan_activities(uid)
             totals["imported"] += int(result.get("imported", 0))
             totals["completed"] += int(result.get("completed", 0))
-            d = result.get("directory")
-            scanned = bool(d) and os.path.isdir(d)
         except Exception:
             pass  # a broken folder for one user must not stop the sweep
-        if not scanned:
-            # Watch folder missing: still re-evaluate FTP + match completions.
-            try:
-                evaluate_ftp(uid, now)
-                totals["completed"] += match_plan_completions(uid, now)
-            except Exception:
-                pass
     return totals
