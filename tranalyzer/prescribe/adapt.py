@@ -15,10 +15,9 @@ the calendar detail, ERG targets and .zwo export all see the same content):
                 swapped (vo2max <-> threshold, sweet_spot -> vo2max) at the
                 same duration. Same polarized volume, different signal - the
                 classic response to a training plateau.
-- progress   -> (no overreach, no plateau) progressive overload: upcoming
-                workouts get a one-time +5% duration bump (rounded to whole
-                minutes). Because a workout is only ever adapted once, the
-                cumulative adjustment per workout is capped at that 5%.
+- progress   -> (no overreach, no plateau) no adaptation. Planned volume is
+                held flat and must never increase week to week, so a healthy
+                "keep going" signal leaves upcoming workouts untouched.
 """
 from __future__ import annotations
 
@@ -35,7 +34,6 @@ log = logging.getLogger(__name__)
 
 ADAPT_WINDOW_DAYS = 7
 RECOVERY_DURATION_FACTOR = 0.75
-OVERLOAD_DURATION_FACTOR = 1.05
 MIN_DURATION_MIN = 20
 
 OVERREACH = "overreach"
@@ -65,11 +63,8 @@ def _plan_change(status: str, wtype: str, duration_min: float):
         if wtype not in _STIMULUS_SWAP:
             return None  # easy days keep their role during a plateau
         return _STIMULUS_SWAP[wtype], max(MIN_DURATION_MIN, round(duration_min)), "stimulus"
-    # progress: modest, one-time volume bump
-    new_min = max(MIN_DURATION_MIN, round(duration_min * OVERLOAD_DURATION_FACTOR))
-    if new_min == round(duration_min):
-        new_min = round(duration_min) + 1  # very short sessions still progress
-    return wtype, new_min, "overload"
+    # progress: no change - volume is held flat and must never increase.
+    return None
 
 
 def _reexport(uid: int, date: str, old_name: str, new_name: str, zwo_str: str) -> None:
@@ -150,8 +145,8 @@ BANNER = {
     PROGRESS: {
         "level": "ok",
         "headline": "Progressing well",
-        "detail": "No plateau or overreach detected - progressive overload "
-                  "continues with small volume bumps.",
+        "detail": "No plateau or overreach detected - training continues at "
+                  "your planned volume.",
     },
 }
 

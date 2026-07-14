@@ -91,6 +91,32 @@ def test_plan_creation_matches_already_imported_activity(client, monkeypatch):
     assert workouts[0]["completed_activity_id"] is not None
 
 
+def test_plan_page_uses_graph_button_not_download_links(client):
+    _register(client)
+    r = client.post("/generate/plan", data=PLAN_FORM)
+    assert r.status_code == 200
+    uid = db.get_user_by_username("rider")["id"]
+    plan_id = db.list_plans(uid)[0]["id"]
+    workouts = db.plan_workouts_for_plan(uid, plan_id)
+    # No per-workout .zwo download links remain.
+    for w in workouts:
+        assert f"/plan/workout/{w['id']}/download" not in r.text
+    # The power-curve graph button and shared script are present instead.
+    assert "wk-graph-btn" in r.text
+    assert f'data-workout-id="{workouts[0]["id"]}"' in r.text
+    assert "/static/workout_graph.js" in r.text
+    # Plan-LEVEL export/zip controls stay untouched.
+    assert f"/plan/{plan_id}/download.zip" in r.text
+    assert f"/plan/{plan_id}/export" in r.text
+
+
+def test_calendar_includes_shared_graph_script(client):
+    _register(client)
+    r = client.get("/calendar")
+    assert r.status_code == 200
+    assert "/static/workout_graph.js" in r.text
+
+
 def test_plan_submit_invalid_shows_error(client):
     _register(client)
     bad = dict(PLAN_FORM)

@@ -248,7 +248,7 @@
         </table>
         {% endif %}
 
-        <table>
+        <table class="plan-workouts">
             <thead><tr><th>Date</th><th>Workout</th><th>Type</th><th>Duration</th><th>TSS</th><th></th></tr></thead>
             <tbody>
             {% for w in plan.workouts %}
@@ -259,16 +259,86 @@
                     <td>{{ (w.duration_s // 60) }} min</td>
                     <td>{{ w.tss }}</td>
                     <td>
-                        <a href="/plan/workout/{{ w.id }}/download">.zwo</a>
-                        <form method="post" action="/plan/workout/{{ w.id }}/export"
-                              style="display:inline">
-                            <button type="submit" class="link-btn">export</button>
-                        </form>
+                        <button type="button" class="link-btn wk-graph-btn"
+                                data-workout-id="{{ w.id }}"
+                                aria-expanded="false">graph</button>
+                    </td>
+                </tr>
+                <tr class="wk-graph-row" id="wk-graph-{{ w.id }}" hidden>
+                    <td colspan="6">
+                        <div class="wk-graph-body">
+                            <p class="hint wk-graph-title"></p>
+                            <div class="profile-wrap wk-graph-svg"></div>
+                        </div>
                     </td>
                 </tr>
             {% endfor %}
             </tbody>
         </table>
+        <script src="/static/workout_graph.js"></script>
+        <script>
+        (function () {
+            var cache = {};  // workout id -> fetched detail (no refetch on reopen)
+            var openId = null;
+
+            function bodyFor(id) { return document.getElementById("wk-graph-" + id); }
+
+            function closeRow(id) {
+                var row = bodyFor(id);
+                if (row) row.hidden = true;
+                var btn = document.querySelector('.wk-graph-btn[data-workout-id="' + id + '"]');
+                if (btn) btn.setAttribute("aria-expanded", "false");
+            }
+
+            function render(id, detail) {
+                var row = bodyFor(id);
+                if (!row) return;
+                row.querySelector(".wk-graph-title").textContent =
+                    detail.name + " · " + window.fmtDur(detail.total_duration) +
+                    " · targets at FTP " + detail.ftp + " W";
+                row.querySelector(".wk-graph-svg").innerHTML =
+                    window.profileSvg(detail.profile, detail.total_duration, detail.ftp);
+            }
+
+            function showError(id, msg) {
+                var row = bodyFor(id);
+                if (!row) return;
+                row.querySelector(".wk-graph-title").textContent = msg;
+                row.querySelector(".wk-graph-svg").innerHTML = "";
+            }
+
+            async function openRow(id) {
+                var row = bodyFor(id);
+                if (!row) return;
+                row.hidden = false;
+                var btn = document.querySelector('.wk-graph-btn[data-workout-id="' + id + '"]');
+                if (btn) btn.setAttribute("aria-expanded", "true");
+                if (cache[id]) { render(id, cache[id]); return; }
+                row.querySelector(".wk-graph-title").textContent = "Loading…";
+                row.querySelector(".wk-graph-svg").innerHTML = "";
+                try {
+                    var resp = await fetch("/api/plan/workout/" + id,
+                                           { headers: { "Accept": "application/json" } });
+                    if (!resp.ok) { showError(id, "Could not load graph (HTTP " + resp.status + ")."); return; }
+                    var detail = await resp.json();
+                    cache[id] = detail;
+                    render(id, detail);
+                } catch (e) {
+                    showError(id, "Could not load graph: " + e.message);
+                }
+            }
+
+            document.querySelectorAll(".wk-graph-btn").forEach(function (btn) {
+                btn.addEventListener("click", function () {
+                    var id = btn.dataset.workoutId;
+                    if (openId === id) { closeRow(id); openId = null; return; }
+                    if (openId !== null) closeRow(openId);  // one open at a time
+                    openId = id;
+                    openRow(id);
+                });
+            });
+        })();
+        </script>
     </section>
     {% endif %}
 </section>

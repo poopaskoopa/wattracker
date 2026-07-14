@@ -51,15 +51,29 @@ def test_polarized_split_mostly_easy():
     assert (1 - frac) >= 0.70
 
 
-def test_ramp_and_recovery_week():
+def test_flat_volume_and_recovery_week():
     p = plan.generate_plan("P", MONDAY, 4, [0, 2, 4, 5], 8.0, 2)
     vol = [wk["total_s"] for wk in p["weekly"]]
-    # Gentle upward ramp on weeks 1-3...
-    assert vol[0] < vol[1] < vol[2]
+    # Volume is flat across non-recovery weeks (no week-over-week increase)...
+    assert vol[0] == vol[1] == vol[2]
     # ...then a recovery week (4th) with clearly less volume.
     assert vol[3] < vol[2]
     assert p["weekly"][3]["recovery"] is True
     assert p["weekly"][3]["total_s"] <= 0.75 * vol[2]
+
+
+def test_weekly_volume_matches_requested_and_never_exceeds():
+    hours = 8.0
+    target_s = hours * 3600
+    p = plan.generate_plan("P", MONDAY, 6, [0, 2, 4, 5], hours, 2)
+    for wk in p["weekly"]:
+        if wk["recovery"]:
+            assert wk["total_s"] < target_s
+            continue
+        # Non-recovery weeks sum to ~requested hours (rounding tolerance from
+        # per-workout whole-minute quantization) and never materially exceed.
+        assert abs(wk["total_s"] - target_s) <= 300
+        assert wk["total_s"] <= target_s + 60
 
 
 def test_both_hit_types_used():

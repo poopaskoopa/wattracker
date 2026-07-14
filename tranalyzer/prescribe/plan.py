@@ -69,14 +69,15 @@ DEFAULT_MODEL = "polarized"
 
 RECOVERY_WEEK_EVERY = 4
 RECOVERY_MULTIPLIER = 0.65
-RAMP_PER_WEEK = 0.06  # ~6% gentle progression on non-recovery weeks
 
 
 def week_multiplier(week: int) -> float:
-    """Volume multiplier for a 1-indexed week (recovery every 4th week)."""
+    """Volume multiplier for a 1-indexed week. Volume is flat (1.0) on normal
+    weeks and never increases week to week; every 4th week is a reduced
+    recovery week (0.65)."""
     if week % RECOVERY_WEEK_EVERY == 0:
         return RECOVERY_MULTIPLIER
-    return round(1.0 + RAMP_PER_WEEK * (week - 1), 4)
+    return 1.0
 
 
 def _hit_positions(n: int, hit: int) -> Set[int]:

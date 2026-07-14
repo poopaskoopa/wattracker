@@ -79,27 +79,32 @@ def test_overreach_wins_over_plateau(user_id):
 
 
 # -------------------------------------------------------------- progress
-def test_progress_bumps_duration_modestly(user_id):
+def test_progress_leaves_volume_unchanged(user_id):
+    # Volume must never increase week to week, so a healthy "progress" signal
+    # is a no-op: no duration bump, no adaptation recorded.
     wid = _workout(user_id, 2, type_="endurance", duration_s=3600)
     summary = adapt.apply_adaptations(user_id, _state(), NOW)
     assert summary["status"] == "progress"
+    assert summary["adjusted"] == 0
     w = db.get_plan_workout(user_id, wid)
-    assert w["adapted"] == "overload"
-    assert w["duration_s"] == 63 * 60  # +5% of 60 min
+    assert w["adapted"] is None
+    assert w["duration_s"] == 3600
 
 
 def test_adaptation_is_idempotent_no_stacking(user_id):
+    # A later hard adaptation (overreach) still applies exactly once; the prior
+    # progress runs never touched the workout.
     wid = _workout(user_id, 2, type_="endurance", duration_s=3600)
-    adapt.apply_adaptations(user_id, _state(), NOW)
-    first = db.get_plan_workout(user_id, wid)
-    for _ in range(5):  # repeated detection runs must not stack bumps
+    for _ in range(5):  # repeated progress detection runs never adapt
         summary = adapt.apply_adaptations(user_id, _state(), NOW)
         assert summary["adjusted"] == 0
-    again = db.get_plan_workout(user_id, wid)
-    assert again["duration_s"] == first["duration_s"] == 63 * 60
-    # ...even if the detected status later changes: one adaptation per workout.
+    assert db.get_plan_workout(user_id, wid)["duration_s"] == 3600
+    # An overreach signal eases it once, then stays fixed (one adaptation ever).
     adapt.apply_adaptations(user_id, _state(overreach=True), NOW)
-    assert db.get_plan_workout(user_id, wid)["type"] == "endurance"
+    eased = db.get_plan_workout(user_id, wid)
+    assert eased["adapted"] == "recovery"
+    adapt.apply_adaptations(user_id, _state(overreach=True), NOW)
+    assert db.get_plan_workout(user_id, wid)["duration_s"] == eased["duration_s"]
 
 
 def test_adapted_content_flows_to_detail_and_zwo(user_id):
