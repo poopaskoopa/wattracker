@@ -50,6 +50,47 @@ def test_plan_submit_creates_and_persists(client):
     assert len(workouts) == 4 * 4  # 4 weeks x 4 days
 
 
+def test_plan_creation_matches_already_imported_activity(client, monkeypatch):
+    """Regression: creating a plan must match its workouts against activities
+    that were already imported before the plan existed (the gated fast rescan
+    only matches on new imports)."""
+    from tranalyzer import server as servermod
+
+    _register(client)
+    uid = db.get_user_by_username("rider")["id"]
+    # An activity imported BEFORE the plan is created.
+    db.insert_activity(
+        uid,
+        {
+            "dedup_hash": "pre-import-1", "filename": "ride.fit",
+            "start_time": "2026-06-10T08:00:00", "duration_s": 3600,
+            "distance_m": 0.0, "avg_power": 200.0, "avg_hr": 0.0,
+            "np": 200.0, "if_": 1.0, "tss": 100.0, "streams": {"power": [200.0]},
+        },
+    )
+
+    # Deterministic plan with one workout on that same date.
+    def fake_generate_plan(*a, **k):
+        return {
+            "start_date": "2026-06-10", "weeks": 1, "model": "polarized",
+            "polarized_hard_fraction": 0.0, "weekly": [],
+            "workouts": [{
+                "date": "2026-06-10", "name": "W", "type": "endurance",
+                "duration_s": 3600, "tss": 100.0, "session": {},
+            }],
+        }
+
+    monkeypatch.setattr(servermod.planmod, "generate_plan", fake_generate_plan)
+    monkeypatch.setattr(servermod.zwo, "zwo_string", lambda s: "<x/>")
+
+    r = client.post("/generate/plan", data=PLAN_FORM)
+    assert r.status_code == 200
+
+    plans = db.list_plans(uid)
+    workouts = db.plan_workouts_for_plan(uid, plans[0]["id"])
+    assert workouts[0]["completed_activity_id"] is not None
+
+
 def test_plan_submit_invalid_shows_error(client):
     _register(client)
     bad = dict(PLAN_FORM)

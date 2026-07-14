@@ -220,6 +220,31 @@ def test_run_auto_scan_survives_missing_dirs(user_id):
     assert totals["imported"] == 0
 
 
+def test_run_daily_maintenance_self_heals_late_created_plan(user_id, monkeypatch):
+    """Regression: with rescan gated on imported>0, a plan created AFTER its
+    rides were already imported would never get completions matched. The daily
+    maintenance pass must re-run matching unconditionally to self-heal."""
+    from tranalyzer import server as servermod
+
+    # Ride imported first, then a same-day matching workout created afterwards -
+    # no NEW import happens, so only the daily self-heal can match it.
+    _activity(user_id, "2026-06-10T08:00:00", seconds=3600, tss=100.0)
+    wid = _plan_workout(user_id, "2026-06-10", duration_s=3600, tss=100.0)
+    assert db.get_plan_workout(user_id, wid)["completed_activity_id"] is None
+
+    # Neutralize folder scanning + network race refresh; keep real matching.
+    monkeypatch.setattr(
+        servermod.importer, "run_auto_scan",
+        lambda: {"users": 0, "imported": 0, "completed": 0},
+    )
+    monkeypatch.setattr(
+        servermod.races, "refresh_race_results", lambda *a, **k: None
+    )
+    totals = servermod.run_daily_maintenance()
+    assert totals["completed"] >= 1
+    assert db.get_plan_workout(user_id, wid)["completed_activity_id"] is not None
+
+
 def test_auto_scan_loop_runs_daily_without_real_sleep(monkeypatch):
     from tranalyzer import server as servermod
 

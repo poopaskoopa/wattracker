@@ -126,6 +126,14 @@ def run_daily_maintenance() -> dict:
     totals["exported"] = 0
     for uid in db.all_user_ids():
         try:
+            # Daily self-heal: the fast rescan only matches completions when new
+            # files import, so re-run matching unconditionally here (cheap:
+            # incomplete workouts x same-date activities) to catch plans created
+            # after their rides were already imported.
+            totals["completed"] += importer.match_plan_completions(uid)
+        except Exception:
+            _log.warning("completion matching failed for user %s", uid, exc_info=True)
+        try:
             state = pipeline.build_state(uid)
             summary = adaptmod.apply_adaptations(uid, state)
             totals["adapted"] += summary.get("adjusted", 0)
@@ -553,6 +561,11 @@ def create_app() -> FastAPI:
                     plan_id, uid, w["date"], w["name"], w["type"],
                     w["duration_s"], w["tss"], zwo_str,
                 )
+            # Match any already-imported activities against the new plan's
+            # workouts now - the gated rescan path only matches when NEW files
+            # import, so a plan created after its rides were imported would
+            # otherwise never be marked completed until a future import.
+            importer.match_plan_completions(uid)
             summary = _plan_summary(uid, plan_id)
             summary["polarized_hard_fraction"] = generated["polarized_hard_fraction"]
             summary["weekly"] = generated["weekly"]
