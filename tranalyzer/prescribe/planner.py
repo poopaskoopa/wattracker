@@ -256,6 +256,397 @@ def _z2_endurance(total_s: int) -> Session:
     return _finish(s, total_s, cooldown_low=0.45, cooldown_high=0.55)
 
 
+# ---------------------------------------------------------------------------
+# Variant builders. Each preserves its type's training purpose (comparable
+# IF/TSS/time-in-zone at equal duration) while producing a distinct session
+# name and structure so day-to-day plan workouts feel different. The `classic`
+# variant of every kind is the original builder above, reproduced byte-for-byte
+# when variant is None/"classic" so legacy plan rows rebuild identically.
+# ---------------------------------------------------------------------------
+
+
+def _vo2max_short_short(total_s: int) -> Session:
+    """VO2max 30/30s: sets of 10 x 30s @118% / 30s easy."""
+    warmup = 600
+    on, off, per_set = 30, 30, 10
+    set_len = per_set * (on + off)  # 600s
+    set_rest = 180
+    sets = 4
+
+    def used(n: int) -> int:
+        return warmup + n * set_len + max(0, n - 1) * set_rest
+
+    while sets > 2 and used(sets) + 120 > total_s:
+        sets -= 1
+    while used(sets) + 120 > total_s and warmup > 300:
+        warmup -= 60
+    s = Session(
+        name="VO2max 30/30s",
+        description=f"{sets} sets of 10 x 30s at 118% FTP / 30s easy.",
+        workout_type="vo2max",
+    )
+    s.segments.append(
+        Segment(kind="warmup", duration=warmup, power_low=0.50, power_high=0.85,
+                text="Progressive warmup with a couple of openers.")
+    )
+    for k in range(sets):
+        s.segments.append(
+            Segment(kind="intervals", duration=set_len, repeat=per_set,
+                    on_duration=on, off_duration=off,
+                    on_power=1.18, off_power=0.55,
+                    text="30s hard / 30s easy - punchy VO2 efforts.")
+        )
+        if k < sets - 1:
+            s.segments.append(
+                Segment(kind="steadystate", duration=set_rest, power=0.50,
+                        text="Easy spin between sets.")
+            )
+    return _finish(s, total_s)
+
+
+def _vo2max_long_intervals(total_s: int) -> Session:
+    """VO2max long intervals: 4 x 5min @108% FTP."""
+    warmup = 600
+    on, off = 300, 240
+    reps = 4
+    work = reps * (on + off)
+    while reps > 3 and warmup + work + 120 > total_s:
+        reps -= 1
+        work = reps * (on + off)
+    while warmup + work + 120 > total_s and warmup > 300:
+        warmup -= 60
+    s = Session(
+        name="VO2max Long Intervals",
+        description=f"{reps} x 5min at 108% FTP - sustained VO2 efforts.",
+        workout_type="vo2max",
+    )
+    s.segments.append(
+        Segment(kind="warmup", duration=warmup, power_low=0.50, power_high=0.85,
+                text="Progressive warmup with a couple of openers.")
+    )
+    s.segments.append(
+        Segment(kind="intervals", duration=work, repeat=reps,
+                on_duration=on, off_duration=off,
+                on_power=1.08, off_power=0.52,
+                text="5min hard, 4min easy. Hold ~108% FTP.")
+    )
+    return _finish(s, total_s)
+
+
+def _vo2max_descending(total_s: int) -> Session:
+    """VO2max descending ladder: 5-4-3-2min with equal recoveries."""
+    warmup = 600
+    rungs = [(300, 1.10), (240, 1.12), (180, 1.13), (120, 1.14)]
+
+    def used(rs) -> int:
+        # each work rung followed by equal-length recovery except the last
+        return warmup + sum(d for d, _ in rs) + sum(d for d, _ in rs[:-1])
+
+    while len(rungs) > 2 and used(rungs) + 120 > total_s:
+        rungs = rungs[:-1]
+    while used(rungs) + 120 > total_s and warmup > 300:
+        warmup -= 60
+    s = Session(
+        name="VO2max Descending Ladder",
+        description="5-4-3-2min VO2 efforts at 110-114% FTP, equal recoveries.",
+        workout_type="vo2max",
+    )
+    s.segments.append(
+        Segment(kind="warmup", duration=warmup, power_low=0.50, power_high=0.85,
+                text="Progressive warmup with a couple of openers.")
+    )
+    for i, (dur, pw) in enumerate(rungs):
+        s.segments.append(
+            Segment(kind="steadystate", duration=dur, power=pw,
+                    text=f"{dur // 60}min hard at {int(pw * 100)}% FTP.")
+        )
+        if i < len(rungs) - 1:
+            s.segments.append(
+                Segment(kind="steadystate", duration=dur, power=0.52,
+                        text="Equal recovery - spin easy.")
+            )
+    return _finish(s, total_s)
+
+
+def _threshold_two_by_twenty(total_s: int) -> Session:
+    """Threshold long intervals: 2 long sustained blocks at 91% FTP.
+
+    Interval length scales with duration (keeping ~43% of time as work, like
+    the classic builder) so IF/TSS stay comparable across durations.
+    """
+    warmup = 600
+    reps, off = 2, 300
+    # ~43% of ride time as work power, split across 2 reps, 60s-quantized.
+    on = int(round(0.43 * total_s / reps / 60.0)) * 60
+    on = max(600, min(1200, on))
+    work = reps * (on + off)
+    while warmup + work + 120 > total_s and on > 300:
+        on -= 60
+        work = reps * (on + off)
+    while warmup + work + 60 > total_s and warmup > 180:
+        warmup -= 60
+    s = Session(
+        name="Threshold Long Intervals",
+        description=f"2 x {on // 60}min at 91% FTP - long sustained blocks.",
+        workout_type="threshold",
+    )
+    s.segments.append(
+        Segment(kind="warmup", duration=warmup, power_low=0.50, power_high=0.85,
+                text="Warm up to threshold effort.")
+    )
+    s.segments.append(
+        Segment(kind="intervals", duration=work, repeat=reps,
+                on_duration=on, off_duration=off,
+                on_power=0.91, off_power=0.55,
+                text="Long threshold block - steady at 91% FTP.")
+    )
+    return _finish(s, total_s)
+
+
+def _threshold_over_unders(total_s: int) -> Session:
+    """Threshold over-unders: blocks alternating 2min@95% / 1min@105%."""
+    warmup = 600
+    under, over = 120, 60
+    cycles = 3  # per block -> 9min block
+    block = cycles * (under + over)
+    rest = 240
+    blocks = 3
+    work = blocks * block
+
+    def used(nb: int) -> int:
+        return warmup + nb * block + max(0, nb - 1) * rest
+
+    while blocks > 2 and used(blocks) + 120 > total_s:
+        blocks -= 1
+    while used(blocks) + 120 > total_s and warmup > 300:
+        warmup -= 60
+    s = Session(
+        name="Threshold Over-Unders",
+        description=f"{blocks} blocks alternating 2min@91% / 1min@101% FTP.",
+        workout_type="threshold",
+    )
+    s.segments.append(
+        Segment(kind="warmup", duration=warmup, power_low=0.50, power_high=0.85,
+                text="Warm up to threshold effort.")
+    )
+    for k in range(blocks):
+        s.segments.append(
+            Segment(kind="intervals", duration=block, repeat=cycles,
+                    on_duration=under, off_duration=over,
+                    on_power=0.91, off_power=1.01,
+                    text="Over-under: 2min just under, 1min just over threshold.")
+        )
+        if k < blocks - 1:
+            s.segments.append(
+                Segment(kind="steadystate", duration=rest, power=0.55,
+                        text="Easy spin between blocks.")
+            )
+    return _finish(s, total_s)
+
+
+def _sweet_spot_long_blocks(total_s: int) -> Session:
+    """Sweet spot long blocks: 2 long blocks at 88% FTP (scales with duration)."""
+    warmup = 600
+    reps, off = 2, 300
+    on = int(round(0.40 * total_s / reps / 60.0)) * 60
+    on = max(600, min(1320, on))
+    work = reps * (on + off)
+    while warmup + work + 120 > total_s and on > 300:
+        on -= 60
+        work = reps * (on + off)
+    while warmup + work + 60 > total_s and warmup > 180:
+        warmup -= 60
+    s = Session(
+        name="Sweet Spot Long Blocks",
+        description=f"2 x {on // 60}min at 88% FTP - long sweet-spot blocks.",
+        workout_type="sweet_spot",
+    )
+    s.segments.append(
+        Segment(kind="warmup", duration=warmup, power_low=0.50, power_high=0.80,
+                text="Warm up progressively.")
+    )
+    s.segments.append(
+        Segment(kind="intervals", duration=work, repeat=reps,
+                on_duration=on, off_duration=off,
+                on_power=0.88, off_power=0.55,
+                text="Sweet spot: long, steady and controlled at ~88% FTP.")
+    )
+    return _finish(s, total_s)
+
+
+def _sweet_spot_with_surges(total_s: int) -> Session:
+    """Sweet spot with surges: 3 x 12min @89% with a 10s@110% surge every 3min."""
+    warmup = 600
+    surges = 4          # per block
+    on_seg, surge = 170, 10
+    block = surges * (on_seg + surge)  # 720s = 12min
+    off = 300
+    reps = 2
+    work = reps * block + (reps - 1) * off
+
+    def used(nb: int) -> int:
+        return warmup + nb * block + max(0, nb - 1) * off
+
+    while reps > 2 and used(reps) + 120 > total_s:
+        reps -= 1
+    while used(reps) + 120 > total_s and warmup > 300:
+        warmup -= 60
+    s = Session(
+        name="Sweet Spot with Surges",
+        description=f"{reps} x 12min at 89% FTP with a 10s surge every 3min.",
+        workout_type="sweet_spot",
+    )
+    s.segments.append(
+        Segment(kind="warmup", duration=warmup, power_low=0.50, power_high=0.80,
+                text="Warm up progressively.")
+    )
+    for k in range(reps):
+        s.segments.append(
+            Segment(kind="intervals", duration=block, repeat=surges,
+                    on_duration=on_seg, off_duration=surge,
+                    on_power=0.89, off_power=1.10,
+                    text="Sweet spot at ~89% with a short 110% surge every 3min.")
+        )
+        if k < reps - 1:
+            s.segments.append(
+                Segment(kind="steadystate", duration=off, power=0.55,
+                        text="Easy spin between blocks.")
+            )
+    return _finish(s, total_s)
+
+
+def _endurance_negative_split(total_s: int) -> Session:
+    """Endurance negative split: first half @64%, second half @72% FTP."""
+    warmup = 600
+    s = Session(
+        name="Endurance Negative Split",
+        description="Aerobic ride building from 64% to 72% FTP.",
+        workout_type="endurance",
+    )
+    s.segments.append(
+        Segment(kind="warmup", duration=warmup, power_low=0.45, power_high=0.62,
+                text="Ease into aerobic pace.")
+    )
+    body = total_s - warmup - 300
+    if body < 0:
+        body = total_s - warmup
+    first = body // 2
+    second = body - first
+    s.segments.append(
+        Segment(kind="steadystate", duration=first, power=0.64,
+                text="First half - relaxed Zone 2.")
+    )
+    s.segments.append(
+        Segment(kind="steadystate", duration=second, power=0.72,
+                text="Second half - lift to upper Zone 2.")
+    )
+    return _finish(s, total_s, cooldown_low=0.45, cooldown_high=0.55)
+
+
+def _endurance_tempo_finish(total_s: int) -> Session:
+    """Endurance with a tempo finish: Zone 2 then a final ~13% at 80% FTP."""
+    warmup = 600
+    s = Session(
+        name="Endurance Tempo Finish",
+        description="Zone 2 aerobic ride with a tempo push to finish.",
+        workout_type="endurance",
+    )
+    s.segments.append(
+        Segment(kind="warmup", duration=warmup, power_low=0.45, power_high=0.65,
+                text="Ease into aerobic pace.")
+    )
+    body = total_s - warmup - 300
+    if body < 0:
+        body = total_s - warmup
+    tempo = int(round(total_s * 0.13))
+    tempo = max(0, min(tempo, body))
+    base = body - tempo
+    s.segments.append(
+        Segment(kind="steadystate", duration=base, power=0.67,
+                text="Steady Zone 2 - fuel and hydrate.")
+    )
+    if tempo:
+        s.segments.append(
+            Segment(kind="steadystate", duration=tempo, power=0.80,
+                    text="Tempo finish - lift to ~80% FTP.")
+        )
+    return _finish(s, total_s, cooldown_low=0.45, cooldown_high=0.55)
+
+
+def _endurance_cadence_play(total_s: int) -> Session:
+    """Endurance with high-cadence blocks: Zone 2 base, 4-6 x 2min high-cadence."""
+    warmup = 600
+    on, off = 120, 180
+    reps = 6
+    work = reps * (on + off)
+    while reps > 4 and warmup + work + 300 > total_s:
+        reps -= 1
+        work = reps * (on + off)
+    while reps > 2 and warmup + work + 180 > total_s:
+        reps -= 1
+        work = reps * (on + off)
+    while warmup + work + 120 > total_s and warmup > 180:
+        warmup -= 60
+    s = Session(
+        name="Endurance Cadence Play",
+        description=f"Zone 2 with {reps} x 2min high-cadence (100+ rpm) blocks.",
+        workout_type="endurance",
+    )
+    s.segments.append(
+        Segment(kind="warmup", duration=warmup, power_low=0.45, power_high=0.65,
+                text="Ease into aerobic pace.")
+    )
+    pre = total_s - warmup - work - 300
+    if pre < 0:
+        pre = 0
+    if pre:
+        s.segments.append(
+            Segment(kind="steadystate", duration=pre, power=0.68,
+                    text="Steady Zone 2 endurance.")
+        )
+    s.segments.append(
+        Segment(kind="intervals", duration=work, repeat=reps,
+                on_duration=on, off_duration=off,
+                on_power=0.72, off_power=0.66,
+                text="2min high cadence (100+ rpm) at easy power, then settle.")
+    )
+    return _finish(s, total_s, cooldown_low=0.45, cooldown_high=0.55)
+
+
+# variant name -> builder, per kind. "classic" is the original builder.
+_VARIANT_BUILDERS = {
+    "vo2max": {
+        "classic": _vo2max,
+        "short_short": _vo2max_short_short,
+        "long_intervals": _vo2max_long_intervals,
+        "descending": _vo2max_descending,
+    },
+    "threshold": {
+        "classic": _threshold,
+        "two_by_twenty": _threshold_two_by_twenty,
+        "over_unders": _threshold_over_unders,
+    },
+    "sweet_spot": {
+        "classic": _sweet_spot,
+        "long_blocks": _sweet_spot_long_blocks,
+        "with_surges": _sweet_spot_with_surges,
+    },
+    "endurance": {
+        "classic": _z2_endurance,
+        "negative_split": _endurance_negative_split,
+        "tempo_finish": _endurance_tempo_finish,
+        "cadence_play": _endurance_cadence_play,
+    },
+    "recovery": {
+        "classic": _easy_endurance,
+    },
+}
+
+# Public: ordered variant names per kind (classic first). Used by the plan
+# generator to rotate variants across same-kind days.
+VARIANTS = {kind: list(builders.keys()) for kind, builders in _VARIANT_BUILDERS.items()}
+
+
 def plan_workout(state, duration_min: int) -> Session:
     """Prescribe a workout for the given training state and duration (minutes).
 
@@ -303,14 +694,18 @@ WORKOUT_BUILDERS = {
 }
 
 
-def build_workout(kind: str, duration_min: float) -> Session:
-    """Build a Session of the given kind at the given duration (minutes).
+def build_workout(kind: str, duration_min: float,
+                  variant: Optional[str] = None) -> Session:
+    """Build a Session of the given kind/duration (minutes), optional variant.
 
-    Raises ValueError for an unknown kind.
+    ``variant`` None or "classic" reproduces the original output byte-for-byte;
+    an unknown variant falls back to classic. Raises ValueError for unknown kind.
     """
-    if kind not in WORKOUT_BUILDERS:
+    if kind not in _VARIANT_BUILDERS:
         raise ValueError(f"unknown workout kind: {kind}")
+    builders = _VARIANT_BUILDERS[kind]
+    builder = builders.get(variant or "classic", builders["classic"])
     total_s = int(round(float(duration_min))) * 60
-    session = WORKOUT_BUILDERS[kind](total_s)
+    session = builder(total_s)
     session.compute_tss()
     return session

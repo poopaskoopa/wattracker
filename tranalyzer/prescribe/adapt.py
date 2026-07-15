@@ -106,15 +106,17 @@ def apply_adaptations(user_id: int, state, now: Optional[_dt.datetime] = None) -
         if change is None:
             continue
         new_type, new_min, kind = change
+        # Adaptation resets the session to the new kind's classic variant.
+        new_variant = "classic"
         try:
-            session = build_workout(new_type, new_min)
+            session = build_workout(new_type, new_min, new_variant)
         except ValueError:
             continue
         zwo_str = zwo.zwo_string(session)
         ok = db.update_plan_workout_content(
             user_id, w["id"], session.name, new_type,
             session.total_duration(), session.estimated_tss, zwo_str,
-            kind, now.isoformat(timespec="seconds"),
+            kind, now.isoformat(timespec="seconds"), variant=new_variant,
         )
         if ok:
             adjusted += 1

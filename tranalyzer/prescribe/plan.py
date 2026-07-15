@@ -11,7 +11,7 @@ import datetime as _dt
 from dataclasses import dataclass
 from typing import Callable, Dict, List, Optional, Sequence, Set
 
-from .planner import Session, build_workout
+from .planner import VARIANTS, Session, build_workout
 
 # Session-duration limits (minutes).
 MIN_SESSION_MIN = 20
@@ -214,6 +214,10 @@ def generate_plan(
     weekly: List[dict] = []
     hit_counter = 0
     easy_counter = 0
+    # Per-kind occurrence counter: the i-th workout of a kind gets
+    # VARIANTS[kind][i % len], so consecutive same-kind days always differ
+    # (deterministically) while each keeps its training purpose.
+    kind_counter: dict = {}
 
     for w in range(weeks):
         weekly_minutes = float(hours_per_week) * 60.0 * week_multiplier(w + 1)
@@ -257,7 +261,10 @@ def generate_plan(
                 easy_counter += 1
                 dur = easy_dur
 
-            session = build_workout(kind, dur)
+            names = VARIANTS.get(kind, ["classic"])
+            variant = names[kind_counter.get(kind, 0) % len(names)]
+            kind_counter[kind] = kind_counter.get(kind, 0) + 1
+            session = build_workout(kind, dur, variant)
             hs = hard_seconds(session)
             week_total_s += session.total_duration()
             week_hard_s += hs
@@ -267,6 +274,7 @@ def generate_plan(
                     "date": date.isoformat(),
                     "name": session.name,
                     "type": kind,
+                    "variant": variant,
                     "duration_s": session.total_duration(),
                     "tss": session.estimated_tss,
                     "hard_s": hs,

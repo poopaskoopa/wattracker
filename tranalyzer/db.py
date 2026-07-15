@@ -15,7 +15,7 @@ from typing import Dict, List, Optional
 
 from .config import db_path
 
-SCHEMA_VERSION = 12
+SCHEMA_VERSION = 13
 
 # In-place migrations: version N -> N+1 statement lists. A database whose
 # version has an unbroken chain here is upgraded without losing live data.
@@ -53,6 +53,9 @@ _MIGRATIONS: Dict[int, List[str]] = {
     ],
     11: [
         # New table scanned_files is created by _SCHEMA after migrating.
+    ],
+    12: [
+        "ALTER TABLE plan_workouts ADD COLUMN variant TEXT",
     ],
 }
 
@@ -144,6 +147,7 @@ CREATE TABLE IF NOT EXISTS plan_workouts (
     adapted           TEXT,
     adapted_at        TEXT,
     rpe               INTEGER,
+    variant           TEXT,
     FOREIGN KEY(plan_id) REFERENCES plans(id),
     FOREIGN KEY(user_id) REFERENCES users(id)
 );
@@ -719,6 +723,7 @@ def add_plan_workout(
     duration_s: int,
     tss: float,
     zwo_or_segments: str,
+    variant: Optional[str] = None,
     path: Optional[str] = None,
 ) -> int:
     conn = connect(path)
@@ -726,11 +731,12 @@ def add_plan_workout(
         cur = conn.execute(
             """
             INSERT INTO plan_workouts
-              (plan_id, user_id, date, name, type, duration_s, tss, zwo_or_segments)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+              (plan_id, user_id, date, name, type, duration_s, tss,
+               zwo_or_segments, variant)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (plan_id, user_id, date, name, type, int(duration_s), float(tss),
-             zwo_or_segments),
+             zwo_or_segments, variant),
         )
         conn.commit()
         return cur.lastrowid
@@ -778,6 +784,7 @@ def _plan_workout_row(r: sqlite3.Row, include_zwo: bool = False) -> dict:
         "adapted": r["adapted"],
         "adapted_at": r["adapted_at"],
         "rpe": r["rpe"],
+        "variant": r["variant"],
     }
     if include_zwo:
         d["zwo_or_segments"] = r["zwo_or_segments"]
@@ -976,6 +983,7 @@ def update_plan_workout_content(
     zwo_or_segments: str,
     adapted: str,
     adapted_at: str,
+    variant: Optional[str] = None,
     path: Optional[str] = None,
 ) -> bool:
     """Rewrite an (unadapted) workout's prescription; records the adaptation."""
@@ -983,10 +991,11 @@ def update_plan_workout_content(
     try:
         cur = conn.execute(
             "UPDATE plan_workouts SET name = ?, type = ?, duration_s = ?, "
-            "tss = ?, zwo_or_segments = ?, adapted = ?, adapted_at = ? "
+            "tss = ?, zwo_or_segments = ?, adapted = ?, adapted_at = ?, "
+            "variant = ? "
             "WHERE user_id = ? AND id = ? AND adapted IS NULL",
             (name, type, int(duration_s), float(tss), zwo_or_segments,
-             adapted, adapted_at, user_id, workout_id),
+             adapted, adapted_at, variant, user_id, workout_id),
         )
         conn.commit()
         return cur.rowcount > 0

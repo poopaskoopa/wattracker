@@ -617,6 +617,7 @@ def create_app() -> FastAPI:
                 db.add_plan_workout(
                     plan_id, uid, w["date"], w["name"], w["type"],
                     w["duration_s"], w["tss"], zwo_str,
+                    variant=w.get("variant"),
                 )
             # Match any already-imported activities against the new plan's
             # workouts now - the gated rescan path only matches when NEW files
@@ -1038,7 +1039,8 @@ def create_app() -> FastAPI:
         if workout_id:
             w = db.get_plan_workout(uid, int(workout_id))
             if w:
-                return build_workout(w["type"], max(1, w["duration_s"] / 60)), w["name"]
+                return build_workout(w["type"], max(1, w["duration_s"] / 60),
+                                     w.get("variant")), w["name"]
         if wtype:
             try:
                 mins = float(minutes) if minutes else 45
@@ -1230,7 +1232,8 @@ def create_app() -> FastAPI:
         if not w:
             return JSONResponse({"error": "workout not found"}, status_code=404)
         ftp = importer.current_ftp(uid)
-        session = build_workout(w["type"], max(1, w["duration_s"] / 60))
+        session = build_workout(w["type"], max(1, w["duration_s"] / 60),
+                                w.get("variant"))
 
         segments = []
         for seg in session.segments:

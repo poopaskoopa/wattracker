@@ -159,7 +159,7 @@ def test_v12_migration_adds_scanned_files_and_preserves_data(tmp_path):
 
     conn = sqlite3.connect(p)
     try:
-        assert conn.execute("PRAGMA user_version").fetchone()[0] == 12
+        assert conn.execute("PRAGMA user_version").fetchone()[0] == db.SCHEMA_VERSION
         # New table exists.
         tbl = conn.execute(
             "SELECT name FROM sqlite_master WHERE type='table' AND name='scanned_files'"
