@@ -185,6 +185,26 @@ _STATIC_DIR = os.path.join(_HERE, "web", "static")
 
 templates = Jinja2Templates(directory=_TEMPLATES_DIR)
 
+
+def static_url(path: str) -> str:
+    """Return /static/<path>?v=<mtime> for cache-busting; no v param if file is missing."""
+    file_path = os.path.join(_STATIC_DIR, path)
+    try:
+        version = int(os.path.getmtime(file_path))
+    except OSError:
+        return f"/static/{path}"
+    return f"/static/{path}?v={version}"
+
+
+templates.env.globals["static_url"] = static_url
+
+
+class NoCacheStaticFiles(StaticFiles):
+    async def get_response(self, path, scope):
+        response = await super().get_response(path, scope)
+        response.headers["Cache-Control"] = "no-cache"
+        return response
+
 # Paths served without authentication.
 _EXEMPT = ("/login", "/register")
 _EXEMPT_PREFIXES = ("/static", "/docs", "/openapi", "/redoc", "/favicon")
@@ -232,7 +252,7 @@ def create_app() -> FastAPI:
                 task.cancel()
 
     app = FastAPI(title="TRanalyzer", lifespan=lifespan)
-    app.mount("/static", StaticFiles(directory=_STATIC_DIR), name="static")
+    app.mount("/static", NoCacheStaticFiles(directory=_STATIC_DIR), name="static")
     # Per-user cache of the last generated .zwo (avoids cross-user bleed).
     app.state.last = {}
 

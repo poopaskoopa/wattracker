@@ -38,6 +38,6 @@
 <script>
 window.ACTIVITY_ID = {{ activity.id }};
 </script>
-<script src="/static/app.js"></script>
+<script src="{{ static_url('app.js') }}"></script>
 <script>renderActivityDetail(window.ACTIVITY_ID);</script>
 {% endblock %}

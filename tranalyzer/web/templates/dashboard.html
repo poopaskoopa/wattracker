@@ -82,6 +82,6 @@
 {% endblock %}
 
 {% block scripts %}
-<script src="/static/app.js"></script>
+<script src="{{ static_url('app.js') }}"></script>
 <script>renderDashboard();</script>
 {% endblock %}

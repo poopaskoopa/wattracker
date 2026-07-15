@@ -275,7 +275,7 @@
             {% endfor %}
             </tbody>
         </table>
-        <script src="/static/workout_graph.js"></script>
+        <script src="{{ static_url('workout_graph.js') }}"></script>
         <script>
         (function () {
             var cache = {};  // workout id -> fetched detail (no refetch on reopen)

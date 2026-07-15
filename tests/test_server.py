@@ -129,3 +129,30 @@ def test_per_user_data_isolation(client):
     client.post("/login", data={"username": "alice", "password": "password123"})
     assert len(client.get("/api/activities").json()) == 1
     assert client.get("/api/state").json()["ftp"] == pytest.approx(300.0)
+
+
+# ------------------------------------------------------------- static asset cache-busting
+
+def test_static_url_appends_mtime_version():
+    from tranalyzer.server import static_url, _STATIC_DIR
+    import os
+
+    mtime = int(os.path.getmtime(os.path.join(_STATIC_DIR, "app.js")))
+    assert static_url("app.js") == f"/static/app.js?v={mtime}"
+
+
+def test_static_url_missing_file_has_no_version():
+    from tranalyzer.server import static_url
+
+    assert static_url("does-not-exist.js") == "/static/does-not-exist.js"
+
+
+def test_dashboard_page_references_versioned_app_js(client):
+    _register(client)
+    r = client.get("/")
+    assert "app.js?v=" in r.text
+
+
+def test_static_response_has_no_cache_header(client):
+    r = client.get("/static/app.js")
+    assert r.headers["cache-control"] == "no-cache"
