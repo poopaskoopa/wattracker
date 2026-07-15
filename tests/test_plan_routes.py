@@ -498,6 +498,72 @@ def test_delete_plan_other_user_404(client):
     assert db.get_plan(alice_uid, plan_id) is not None
 
 
+# --------------------------------------------------- reopen plan via GET /plan
+def test_get_plan_with_plan_id_shows_summary(client):
+    _register(client)
+    client.post("/generate/plan", data=PLAN_FORM)
+    uid = db.get_user_by_username("rider")["id"]
+    plan_id = db.list_plans(uid)[0]["id"]
+
+    text = client.get(f"/plan?plan_id={plan_id}").text
+    assert "Base Plan" in text
+    assert "Export plan to Zwift" in text
+    assert "Download .zip" in text
+    assert f'action="/plan/{plan_id}/export"' in text
+    assert f'/plan/{plan_id}/download.zip' in text
+
+
+def test_get_plan_with_foreign_plan_id_does_not_leak(client):
+    _register(client, "alice")
+    client.post("/generate/plan", data=dict(PLAN_FORM, name="Alice Plan"))
+    alice_uid = db.get_user_by_username("alice")["id"]
+    plan_id = db.list_plans(alice_uid)[0]["id"]
+    client.get("/logout")
+
+    _register(client, "bob")
+    r = client.get(f"/plan?plan_id={plan_id}")
+    assert r.status_code == 200
+    assert "Alice Plan" not in r.text
+    assert "Export plan to Zwift" not in r.text
+
+
+def test_get_plan_with_unknown_plan_id_renders_page(client):
+    _register(client)
+    r = client.get("/plan?plan_id=999999")
+    assert r.status_code == 200
+    assert "No training plans yet" in r.text
+
+
+def test_plan_management_links_to_summary(client):
+    _register(client)
+    client.post("/generate/plan", data=PLAN_FORM)
+    uid = db.get_user_by_username("rider")["id"]
+    plan_id = db.list_plans(uid)[0]["id"]
+    text = client.get("/plan").text
+    assert f'/plan?plan_id={plan_id}' in text
+
+
+def test_plan_management_other_plans_links(client):
+    _register(client)
+    client.post("/generate/plan", data=dict(PLAN_FORM, name="Plan A"))
+    client.post("/generate/plan", data=dict(PLAN_FORM, name="Plan B", start_date="2026-09-02"))
+    uid = db.get_user_by_username("rider")["id"]
+    plans = db.list_plans(uid)  # created DESC -> [B, A]
+    other_id = plans[1]["id"]
+    text = client.get("/plan").text
+    assert f'/plan?plan_id={other_id}' in text
+
+
+def test_generate_plan_post_flow_unchanged(client):
+    """Post-generation summary (with weekly table and hard-fraction) still
+    renders exactly as before — the new GET path must not regress it."""
+    _register(client)
+    r = client.post("/generate/plan", data=PLAN_FORM)
+    assert r.status_code == 200
+    assert "weekly-table" in r.text
+    assert "hard time" in r.text
+
+
 def _FrozenDate(fixed):
     """A dt.date subclass whose today() returns `fixed`; fromisoformat and
     arithmetic behave normally, so it can drop-in replace server._dt.date."""

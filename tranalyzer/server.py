@@ -551,10 +551,17 @@ def create_app() -> FastAPI:
         }
 
     @app.get("/plan", response_class=HTMLResponse)
-    def plan_page(request: Request):
+    def plan_page(request: Request, plan_id: Optional[int] = None):
+        uid = _uid(request)
+        summary = None
+        if plan_id is not None and uid is not None:
+            summary = _plan_summary(uid, plan_id)  # None if missing/foreign - ignored
         return templates.TemplateResponse(
             request, "plan.html",
-            _generate_ctx(request, flash=request.query_params.get("flash")),
+            _generate_ctx(
+                request, mode="plan" if summary else "workout",
+                plan=summary, flash=request.query_params.get("flash"),
+            ),
         )
 
     @app.get("/generate")

@@ -13,7 +13,8 @@
         <h3>Current plan
             {% if not cur.in_effect %}<span class="hint">(not currently in effect)</span>{% endif %}
         </h3>
-        <p><strong>{{ cur.name }}</strong>
+        <p><strong><a href="/plan?plan_id={{ cur.id }}">{{ cur.name }}</a></strong>
+           {% if plan and plan.plan_id == cur.id %}<span class="hint">(viewing)</span>{% endif %}
            {% if cur.model %}<span class="hint">({{ cur.model.replace('_', ' ') }})</span>{% endif %}</p>
         <p>{{ cur.weeks }} weeks &middot; {{ cur.start_date }} &rarr; {{ cur.end_date }}
            &middot; progress <strong>{{ cur.completed }}/{{ cur.total }}</strong> workouts</p>
@@ -33,7 +34,7 @@
         <tbody>
         {% for p in plan_mgmt.others %}
             <tr>
-                <td>{{ p.name }}{% if p.model %} <span class="hint">({{ p.model.replace('_', ' ') }})</span>{% endif %}</td>
+                <td><a href="/plan?plan_id={{ p.id }}">{{ p.name }}</a>{% if plan and plan.plan_id == p.id %} <span class="hint">(viewing)</span>{% endif %}{% if p.model %} <span class="hint">({{ p.model.replace('_', ' ') }})</span>{% endif %}</td>
                 <td>{{ p.start_date }} &rarr; {{ p.end_date }}</td>
                 <td>{{ p.completed }}/{{ p.total }}</td>
                 <td>
