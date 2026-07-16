@@ -274,6 +274,21 @@ function fmtDuration(sec) {
     return (Number.isInteger(h) ? h : h.toFixed(1)) + "h";
 }
 
+function wrapText(text, maxLen) {
+    const lines = [];
+    let line = "";
+    for (const word of text.split(" ")) {
+        if (line && (line.length + 1 + word.length) > maxLen) {
+            lines.push(line);
+            line = word;
+        } else {
+            line = line ? line + " " + word : word;
+        }
+    }
+    if (line) lines.push(line);
+    return lines;
+}
+
 async function renderCurveChart() {
     const el = document.getElementById("curveChart");
     if (!el) return;
@@ -285,12 +300,17 @@ async function renderCurveChart() {
     // Axis ticks are exactly the sampled durations, so every tick has its
     // measured (yellow) dot and vice versa.
     const tickDurations = (measured.length ? measured : model).map((p) => p.x);
+    const SERIES_DESC = {
+        "Measured MMP": "Your best average power actually recorded for each duration, across all rides in the last 90 days.",
+        "CP/W' model": "The fitted curve estimating your sustainable power at any duration (Critical Power plus your anaerobic W' reserve divided by time).",
+    };
     new Chart(el, {
         type: "scatter",
         data: {
             datasets: [
-                { label: "Measured MMP", data: measured, backgroundColor: "#f2a900",
-                  showLine: false, pointRadius: 5 },
+                { label: "Measured MMP", data: measured, borderColor: "#f2a900",
+                  backgroundColor: "#f2a900", showLine: true, pointRadius: 0,
+                  pointHitRadius: 8, tension: 0.1 },
                 { label: "CP/W' model", data: model, borderColor: "#4caf7d",
                   showLine: true, pointRadius: 0, tension: 0.1 },
             ],
@@ -302,6 +322,10 @@ async function renderCurveChart() {
                     callbacks: {
                         title: (items) => (items.length ? fmtDuration(items[0].parsed.x) : ""),
                         label: (item) => item.dataset.label + ": " + item.parsed.y + " W",
+                        footer: (items) =>
+                            items.length
+                                ? wrapText(SERIES_DESC[items[0].dataset.label] || "", 44)
+                                : "",
                     },
                 },
             },
