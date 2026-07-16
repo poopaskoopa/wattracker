@@ -65,12 +65,22 @@ class RaceSourceUnavailable(Exception):
 
 
 def _http_get_json(url: str, timeout: float = _TIMEOUT_S) -> dict:
-    """GET a JSON document (no auth). Raises RaceSourceUnavailable on failure."""
-    req = urllib.request.Request(url, headers={"User-Agent": "TRanalyzer/0.1"})
+    """GET a ZwiftPower cache JSON document without credentials.
+
+    The ``cache3`` profile JSON is served by CloudFront behind signed cookies
+    (``CloudFront-Policy`` / ``-Signature`` / ``-Key-Pair-Id``); a bare request
+    gets ``403 MissingKey``. Those cookies are minted by ZwiftPower's OAuth-SSO
+    round-trip, so we open an anonymous ZwiftPower session first and fetch the
+    JSON through its cookie jar. Raises RaceSourceUnavailable on failure.
+    """
+    from . import zwiftauth  # local import: avoids an import cycle at load time
     try:
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
+        opener = zwiftauth.zwiftpower_session(timeout=timeout)[0]
+        with opener.open(url, timeout=timeout) as resp:
             ctype = resp.headers.get("Content-Type", "")
             body = resp.read()
+    except zwiftauth.ZwiftAuthError as e:
+        raise RaceSourceUnavailable(str(e)) from e
     except (urllib.error.URLError, OSError, TimeoutError) as e:
         raise RaceSourceUnavailable(f"unreachable: {e}") from e
     if "json" not in ctype:

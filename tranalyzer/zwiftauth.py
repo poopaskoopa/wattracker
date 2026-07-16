@@ -147,17 +147,32 @@ def fetch_profile_me(access_token: str, timeout: float = _TIMEOUT_S) -> Dict:
         raise ZwiftAuthError(f"Zwift profile fetch failed: {e}") from e
 
 
-def zwiftpower_login(email: str, password: str, timeout: float = _TIMEOUT_S):
-    """Run the ZwiftPower SSO dance; returns an opener with session cookies."""
+def zwiftpower_session(timeout: float = _TIMEOUT_S):
+    """Open a ZwiftPower session and mint the CloudFront signed cookies.
+
+    GETs the OAuth-SSO entry point - a redirect round-trip through
+    secure.zwift.com - which is what sets the ``CloudFront-Policy`` /
+    ``CloudFront-Signature`` / ``CloudFront-Key-Pair-Id`` cookies that authorize
+    the ``cache3/profile/{id}_all.json`` endpoints. Without those cookies
+    CloudFront answers ``403 MissingKey``; a bare request to the JSON URL (no
+    session warm-up) always fails. No credentials are sent here - the returned
+    opener is an *anonymous* session whose cookie jar already reads the public
+    profile JSON; ``zwiftpower_login`` reuses it and POSTs credentials on top to
+    upgrade to a signed-in session. Returns ``(opener, landing_html, landed_url)``.
+    """
     jar = http.cookiejar.CookieJar()
     opener = urllib.request.build_opener(urllib.request.HTTPCookieProcessor(jar))
     opener.addheaders = [("User-Agent", _UA)]
     try:
         with opener.open(ZP_SSO_URL, timeout=timeout) as resp:
-            page = _read(resp)
-            landed = resp.geturl()
+            return opener, _read(resp), resp.geturl()
     except (urllib.error.URLError, OSError, TimeoutError) as e:
         raise ZwiftAuthError(f"ZwiftPower SSO unreachable: {e}") from e
+
+
+def zwiftpower_login(email: str, password: str, timeout: float = _TIMEOUT_S):
+    """Run the ZwiftPower SSO dance; returns an opener with session cookies."""
+    opener, page, landed = zwiftpower_session(timeout)
 
     if "zwiftpower.com" in urllib.parse.urlparse(landed).netloc:
         return opener  # already had a valid session (cookie reuse)
