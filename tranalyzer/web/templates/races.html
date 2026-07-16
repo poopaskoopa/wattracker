@@ -99,7 +99,7 @@
     <tbody>
     {% for r in results %}
         <tr>
-            <td class="nowrap" data-sort="{{ r.event_date }}">{{ r.event_date }}</td>
+            <td class="nowrap" data-sort="{{ r.event_date }}">{% if r.zp_event_id %}<a href="https://zwiftpower.com/events.php?zid={{ r.zp_event_id }}" target="_blank" rel="noopener">{{ r.event_date }}</a>{% else %}{{ r.event_date }}{% endif %}</td>
             <td class="nowrap" data-sort="{{ r.event_title }}">
                 {% if r.activity_id %}<a href="/activity/{{ r.activity_id }}">{{ r.event_title }}</a>
                 {% else %}{{ r.event_title }}{% endif %}

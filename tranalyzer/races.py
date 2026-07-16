@@ -151,6 +151,9 @@ def parse_zwiftpower_profile(doc: dict) -> List[dict]:
                 "np": np,
                 "if_": if_,
                 "distance_km": dist if dist and dist > 0 else None,
+                # ZwiftPower event id (``zid``) links each race to its results
+                # page; encoded like other ZP fields (scalar or [value, flag]).
+                "zp_event_id": _zid(r.get("zid")),
                 "power": _zp_power_periods(r),
                 "fetched_at": fetched,
             }
@@ -166,6 +169,20 @@ def _f(v) -> Optional[float]:
         return float(v)
     except (TypeError, ValueError):
         return None
+
+
+def _zid(v) -> Optional[str]:
+    """A ZwiftPower event id as a digit string, or None.
+
+    ``zid`` may be an int, a numeric string, or a ``[value, flag]`` list like
+    other ZwiftPower fields; anything non-numeric (or 0) yields None.
+    """
+    if isinstance(v, (list, tuple)) and v:
+        v = v[0]
+    if v is None:
+        return None
+    s = str(v).strip()
+    return s if s.isdigit() and int(s) > 0 else None
 
 
 def power_per_period(

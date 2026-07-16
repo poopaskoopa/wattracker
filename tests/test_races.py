@@ -242,6 +242,63 @@ def test_if_from_zwiftpower_race_ftp_field():
     assert row["if_"] == pytest.approx(1.20, abs=0.001)
 
 
+# --------------------------------------------------- ZwiftPower event id
+def test_zp_event_id_parsed_from_zid_list_and_scalar():
+    doc = {"data": [
+        {  # [value, flag] encoding like other ZwiftPower fields
+            "event_date": int(dt.datetime(2026, 6, 1, 10).timestamp()),
+            "event_title": "With zid", "f_t": "TYPE_RACE", "zid": [3456789, 0],
+        },
+        {  # no zid at all -> None (field is optional in the payload)
+            "event_date": int(dt.datetime(2026, 5, 1, 10).timestamp()),
+            "event_title": "No zid", "f_t": "TYPE_RACE",
+        },
+    ]}
+    rows = races.parse_zwiftpower_profile(doc)
+    by_title = {r["event_title"]: r for r in rows}
+    assert by_title["With zid"]["zp_event_id"] == "3456789"
+    assert by_title["No zid"]["zp_event_id"] is None
+
+
+def test_zp_event_id_backfilled_on_resync(user_id):
+    db.init_db()
+    base = {
+        "event_date": "2026-06-01", "event_title": "R", "fetched_at": "t0",
+        "power": {},
+    }
+    # First sync: ZwiftPower payload lacked the event id.
+    db.replace_race_results(user_id, "zwiftpower", [dict(base)])
+    assert db.list_race_results(user_id)[0]["zp_event_id"] is None
+    # Re-sync: same race now carries a zid -> backfilled onto the row.
+    db.replace_race_results(
+        user_id, "zwiftpower", [dict(base, zp_event_id="3456789")]
+    )
+    assert db.list_race_results(user_id)[0]["zp_event_id"] == "3456789"
+    # A later re-sync missing the id must not clobber the stored one.
+    db.replace_race_results(user_id, "zwiftpower", [dict(base)])
+    assert db.list_race_results(user_id)[0]["zp_event_id"] == "3456789"
+
+
+def test_race_date_links_to_zwiftpower_when_event_id_present(client, monkeypatch):
+    from tranalyzer import credstore, zwiftauth
+
+    _register(client)
+    uid = db.get_user_by_username("rider")["id"]
+    doc = {"data": [{
+        "event_date": int(dt.datetime(2026, 6, 1, 10).timestamp()),
+        "event_title": "Crit City", "f_t": "TYPE_RACE",
+        "position_in_cat": 2, "np": [270, 1], "zid": [3456789, 0],
+    }]}
+    credstore.save_zwift_credentials(uid, "a@b.com", "pw")
+    monkeypatch.setattr(
+        zwiftauth, "fetch_results_authenticated",
+        lambda email, password, rider_id=None: (doc, "1234567", 72.0))
+    client.post("/races/refresh", data={"rider_id": "1234567"})
+    text = client.get("/races").text
+    assert ('href="https://zwiftpower.com/events.php?zid=3456789"'
+            in text)
+
+
 def test_place_int_parsing():
     assert races._place_int("1") == 1
     assert races._place_int(3) == 3
