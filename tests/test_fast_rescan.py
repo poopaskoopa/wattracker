@@ -78,6 +78,27 @@ def test_duplicate_import_is_recorded_and_not_reparsed(uid, tmp_path, monkeypatc
     assert calls["n"] == 2  # neither reparsed (dup was recorded too)
 
 
+def test_in_progress_activity_is_skipped_and_never_parsed(uid, tmp_path, monkeypatch):
+    # Zwift's live-recording buffer must never be imported, cached, or parsed.
+    act_dir = tmp_path / "Activities"
+    act_dir.mkdir()
+    (act_dir / "inProgressActivity.fit").write_bytes(b"dummy")
+    calls = {"n": 0}
+
+    def counting(path):
+        calls["n"] += 1
+        return _fake_parsed()
+
+    monkeypatch.setattr(importer, "parse_fit", counting)
+
+    r = importer.scan_activities(uid, directory=str(act_dir))
+    assert r["imported"] == 0
+    assert r["skipped"] == 1
+    assert calls["n"] == 0  # never parsed
+    # Not recorded in scanned_files, so it's re-evaluated (and re-skipped) next scan.
+    assert db.seen_files(uid) == {}
+
+
 def test_changed_file_is_reprocessed(uid, tmp_path, monkeypatch):
     act_dir = tmp_path / "Activities"
     act_dir.mkdir()

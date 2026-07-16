@@ -189,6 +189,14 @@ def ingest_file(user_id: int, path: str, ftp: Optional[float] = None) -> Optiona
     h = dedup_hash(parsed["start_time"], parsed["duration_s"])
     if db.activity_exists(user_id, h):
         return None
+    # Same ride can land in two files with an identical start second but a
+    # slightly different duration (Zwift's in-progress temp file vs. the final
+    # timestamped .fit), so the dedup_hash alone won't catch it - dedup on the
+    # exact start_time too.
+    if parsed["start_time"] is not None and db.activity_exists_by_start(
+        user_id, parsed["start_time"]
+    ):
+        return None
     if ftp is None:
         ftp = current_ftp(
             user_id, extra_power=[parsed["streams"].get("power") or []]
@@ -244,6 +252,14 @@ def scan_activities(
     seen = db.seen_files(user_id)
     for path in ordered:
         found += 1
+        # Zwift keeps `inProgressActivity.fit` as a live recording buffer while
+        # a ride is being recorded; it's never a finished ride (and its start
+        # second collides with the eventual final .fit). Skip it before the
+        # scanned_files cache check so it's never cached or reparsed.
+        if os.path.basename(path).lower() == "inprogressactivity.fit":
+            skipped += 1
+            _report(processed=found, imported=imported, skipped=skipped)
+            continue
         try:
             st = os.stat(path)
             mtime, size = st.st_mtime, st.st_size

@@ -99,19 +99,30 @@
                " duplicate(s) skipped.";
     }
 
+    // Set true only once this page has observed a scan actually running, so a
+    // completed-scan status seen on plain page load never triggers a reload.
+    var wasPolling = false;
+
     function finish(s) {
         if (polling) { clearInterval(polling); polling = null; }
         btn.disabled = false;
         var cls = s.error ? "alert"
                 : ((s.imported || s.found) ? "ok" : "alert");
         show(doneMsg(s), cls);
+        // A scan this page was polling has finished - reload so newly imported
+        // rides appear in the table. Only reload when we actually saw it run,
+        // to avoid reloading on plain load (and thus any reload loop).
+        if (wasPolling) {
+            wasPolling = false;
+            setTimeout(function () { window.location.reload(); }, 600);
+        }
     }
 
     function poll() {
         fetch("/api/scan/status").then(function (r) { return r.json(); })
             .then(function (s) {
                 if (!s) return;
-                if (s.running) { show(runningMsg(s), "hint"); }
+                if (s.running) { wasPolling = true; show(runningMsg(s), "hint"); }
                 else { finish(s); }
             }).catch(function () {});
     }

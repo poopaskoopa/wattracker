@@ -460,6 +460,26 @@ def activity_exists(user_id: int, dedup_hash: str, path: Optional[str] = None) -
         conn.close()
 
 
+def activity_exists_by_start(
+    user_id: int, start_time: str, path: Optional[str] = None
+) -> bool:
+    """True if the user already has any activity with this exact start_time.
+
+    Robust dedup for a ride captured in two files (e.g. Zwift's in-progress temp
+    file and the final timestamped .fit share a start second but differ in
+    duration, so the dedup_hash differs).
+    """
+    conn = connect(path)
+    try:
+        cur = conn.execute(
+            "SELECT 1 FROM activities WHERE user_id = ? AND start_time = ?",
+            (user_id, start_time),
+        )
+        return cur.fetchone() is not None
+    finally:
+        conn.close()
+
+
 def insert_activity(user_id: int, record: dict, path: Optional[str] = None) -> Optional[int]:
     """Insert an activity for a user. Returns row id, or None if it existed."""
     conn = connect(path)
