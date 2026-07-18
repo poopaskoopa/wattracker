@@ -4,8 +4,8 @@ import pytest
 pytest.importorskip("httpx")
 from fastapi.testclient import TestClient  # noqa: E402
 
-from tranalyzer import auth, db  # noqa: E402
-from tranalyzer.server import create_app  # noqa: E402
+from wattracker import auth, db  # noqa: E402
+from wattracker.server import create_app  # noqa: E402
 
 
 @pytest.fixture()

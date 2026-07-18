@@ -10,9 +10,9 @@ import pytest
 pytest.importorskip("httpx")
 from fastapi.testclient import TestClient  # noqa: E402
 
-import tranalyzer.ingest.importer as importer  # noqa: E402
-from tranalyzer import db, paths  # noqa: E402
-from tranalyzer.server import create_app  # noqa: E402
+import wattracker.ingest.importer as importer  # noqa: E402
+from wattracker import db, paths  # noqa: E402
+from wattracker.server import create_app  # noqa: E402
 
 
 def _wait_done(client, timeout=10.0):

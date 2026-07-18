@@ -3,8 +3,8 @@ import datetime as dt
 
 import pytest
 
-from tranalyzer import auth, db
-from tranalyzer.analysis import pipeline
+from wattracker import auth, db
+from wattracker.analysis import pipeline
 
 
 def _insert(user_id, when: dt.datetime, watts=300.0, seconds=1200):

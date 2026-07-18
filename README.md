@@ -1,4 +1,4 @@
-# TRanalyzer
+# wattracker
 
 A local, cross-platform (macOS-first) cycling training analyzer. It ingests
 Zwift / TrainerRoad `.fit` files, computes training-science metrics, detects
@@ -35,7 +35,7 @@ plateau / overreach, and prescribes progressive workouts exported as Zwift
 ```sh
 python -m venv .venv && . .venv/bin/activate
 pip install -e .
-python -m tranalyzer          # serves http://localhost:8000 and opens a browser
+python -m wattracker          # serves http://localhost:8000 and opens a browser
 ```
 
 On first visit you are redirected to `/login`; create an account at `/register`
@@ -76,7 +76,7 @@ verified against actual equipment** — it cannot be exercised in CI.
 
 FTP override, ZwiftID, and folder paths are **per-user** settings stored in the
 database. App-level config — the `ANTHROPIC_API_KEY` and the session secret —
-is read from environment variables (`ANTHROPIC_API_KEY`, `TRANALYZER_SECRET`)
-first, then an optional `config.json` in `~/.tranalyzer/` (the session secret is
+is read from environment variables (`ANTHROPIC_API_KEY`, `WATTRACKER_SECRET`)
+first, then an optional `config.json` in `~/.wattracker/` (the session secret is
 generated and persisted there on first run). The app is fully functional without
 an API key — LLM refinement is an optional layer over the pure-formula planner.

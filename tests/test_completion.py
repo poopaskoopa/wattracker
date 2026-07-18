@@ -5,8 +5,8 @@ import sqlite3
 
 import pytest
 
-import tranalyzer.ingest.importer as importer
-from tranalyzer import auth, config, db
+import wattracker.ingest.importer as importer
+from wattracker import auth, config, db
 
 NOW = dt.datetime(2026, 7, 10, 18, 0)
 
@@ -224,7 +224,7 @@ def test_run_daily_maintenance_self_heals_late_created_plan(user_id, monkeypatch
     """Regression: with rescan gated on imported>0, a plan created AFTER its
     rides were already imported would never get completions matched. The daily
     maintenance pass must re-run matching unconditionally to self-heal."""
-    from tranalyzer import server as servermod
+    from wattracker import server as servermod
 
     # Ride imported first, then a same-day matching workout created afterwards -
     # no NEW import happens, so only the daily self-heal can match it.
@@ -246,7 +246,7 @@ def test_run_daily_maintenance_self_heals_late_created_plan(user_id, monkeypatch
 
 
 def test_auto_scan_loop_runs_daily_without_real_sleep(monkeypatch):
-    from tranalyzer import server as servermod
+    from wattracker import server as servermod
 
     calls = []
     monkeypatch.setattr(
@@ -267,7 +267,7 @@ def test_auto_scan_loop_runs_daily_without_real_sleep(monkeypatch):
 
 
 def test_auto_scan_loop_stops_promptly(monkeypatch):
-    from tranalyzer import server as servermod
+    from wattracker import server as servermod
 
     monkeypatch.setattr(servermod.importer, "run_auto_scan", lambda: {})
     monkeypatch.setattr(servermod, "SCAN_INTERVAL_S", 3600.0)  # long interval
@@ -283,24 +283,24 @@ def test_auto_scan_loop_stops_promptly(monkeypatch):
 
 
 def test_auto_scan_config_flag(monkeypatch):
-    monkeypatch.setenv("TRANALYZER_AUTO_SCAN", "0")
+    monkeypatch.setenv("WATTRACKER_AUTO_SCAN", "0")
     assert config.auto_scan_enabled() is False
-    monkeypatch.setenv("TRANALYZER_AUTO_SCAN", "1")
+    monkeypatch.setenv("WATTRACKER_AUTO_SCAN", "1")
     assert config.auto_scan_enabled() is True
-    monkeypatch.delenv("TRANALYZER_AUTO_SCAN")
+    monkeypatch.delenv("WATTRACKER_AUTO_SCAN")
     assert config.auto_scan_enabled() is True
 
 
 def test_lifespan_starts_scan_task_when_enabled(monkeypatch):
     pytest.importorskip("httpx")
     from fastapi.testclient import TestClient
-    from tranalyzer import server as servermod
+    from wattracker import server as servermod
 
     calls = []
     monkeypatch.setattr(
         servermod.importer, "run_auto_scan", lambda: calls.append(1) or {}
     )
-    monkeypatch.setenv("TRANALYZER_AUTO_SCAN", "1")
+    monkeypatch.setenv("WATTRACKER_AUTO_SCAN", "1")
     app = servermod.create_app()
     with TestClient(app):
         for _ in range(100):

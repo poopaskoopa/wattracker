@@ -44,7 +44,7 @@ PROFILE_ME_URL = API_HOST + "/api/profiles/me"
 ZP_SSO_URL = ("https://zwiftpower.com/ucp.php?mode=login&login=external"
               "&oauth_service=oauthzpsso")
 
-_UA = "TRanalyzer/0.1 (local training analyzer)"
+_UA = "wattracker/0.1 (local training analyzer)"
 _TIMEOUT_S = 20
 
 

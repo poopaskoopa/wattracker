@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #
-# restart.sh — safely stop and (re)start the TRanalyzer app.
+# restart.sh — safely stop and (re)start the wattracker app.
 #
 # Usage:
 #   scripts/restart.sh            # restart (stop if running, then start)
@@ -16,16 +16,16 @@
 set -euo pipefail
 
 # --- config ---------------------------------------------------------------
-PORT="${TRANALYZER_PORT:-8000}"
-HOST="${TRANALYZER_HOST:-localhost}"
-TERM_TIMEOUT="${TRANALYZER_TERM_TIMEOUT:-10}"   # seconds to wait for graceful exit
-START_TIMEOUT="${TRANALYZER_START_TIMEOUT:-20}" # seconds to wait for health check
+PORT="${WATTRACKER_PORT:-8000}"
+HOST="${WATTRACKER_HOST:-localhost}"
+TERM_TIMEOUT="${WATTRACKER_TERM_TIMEOUT:-10}"   # seconds to wait for graceful exit
+START_TIMEOUT="${WATTRACKER_START_TIMEOUT:-20}" # seconds to wait for health check
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 PYTHON="$ROOT/.venv/bin/python"
 [ -x "$PYTHON" ] || PYTHON="$(command -v python3)"
-PID_FILE="$ROOT/.tranalyzer.pid"
-LOG_FILE="$ROOT/tranalyzer.log"
+PID_FILE="$ROOT/.wattracker.pid"
+LOG_FILE="$ROOT/wattracker.log"
 HEALTH_URL="http://$HOST:$PORT/login"
 
 log() { printf '%s %s\n' "$(date '+%H:%M:%S')" "$*"; }
@@ -44,7 +44,7 @@ server_pids() {
     pids="$pids $(lsof -ti tcp:"$PORT" -sTCP:LISTEN 2>/dev/null || true)"
   fi
   # module matches (fallback)
-  pids="$pids $(pgrep -f 'tranalyzer' 2>/dev/null || true)"
+  pids="$pids $(pgrep -f 'wattracker' 2>/dev/null || true)"
   # dedupe
   printf '%s\n' $pids | sort -u | tr '\n' ' '
 }
@@ -87,10 +87,10 @@ start() {
     log "already running (PID(s):$(server_pids)) — leaving as is"
     return 0
   fi
-  log "starting: $PYTHON -m tranalyzer  (logs -> $LOG_FILE)"
+  log "starting: $PYTHON -m wattracker  (logs -> $LOG_FILE)"
   cd "$ROOT"
   # detach so it survives this shell; disable auto-open browser on restart
-  BROWSER=true nohup "$PYTHON" -m tranalyzer >>"$LOG_FILE" 2>&1 &
+  BROWSER=true nohup "$PYTHON" -m wattracker >>"$LOG_FILE" 2>&1 &
   local pid=$!
   echo "$pid" >"$PID_FILE"
   # health check

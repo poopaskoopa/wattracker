@@ -1,13 +1,13 @@
 """Tests for the activity-detail streams endpoint + page (downsampling, gaps)."""
 import pytest
 
-from tranalyzer import auth, db
-from tranalyzer.analysis import pipeline
+from wattracker import auth, db
+from wattracker.analysis import pipeline
 
 pytest.importorskip("httpx")
 from fastapi.testclient import TestClient  # noqa: E402
 
-from tranalyzer.server import create_app  # noqa: E402
+from wattracker.server import create_app  # noqa: E402
 
 
 @pytest.fixture()

@@ -1,7 +1,7 @@
 """Tests for the CP / W' model fit."""
 import pytest
 
-from tranalyzer.metrics import curve
+from wattracker.metrics import curve
 
 
 def test_fit_recovers_planted_cp_wprime():

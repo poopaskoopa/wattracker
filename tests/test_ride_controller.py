@@ -1,14 +1,14 @@
 """Tests for the RideController state machine using simulated devices."""
 import pytest
 
-from tranalyzer import db
-from tranalyzer.ble.devices import (
+from wattracker import db
+from wattracker.ble.devices import (
     SimulatedHeartRateSource,
     SimulatedPowerSource,
     SimulatedTrainer,
 )
-from tranalyzer.ble.runner import RideController
-from tranalyzer.prescribe.planner import Segment, Session
+from wattracker.ble.runner import RideController
+from wattracker.prescribe.planner import Segment, Session
 
 
 def _two_block_session():
@@ -191,8 +191,8 @@ class FakeBleakClient:
 def test_bleak_trainer_sends_erg_command_bytes():
     import asyncio
 
-    from tranalyzer.ble.devices import BleakTrainer
-    from tranalyzer.ble.protocol import FITNESS_MACHINE_CONTROL_POINT
+    from wattracker.ble.devices import BleakTrainer
+    from wattracker.ble.protocol import FITNESS_MACHINE_CONTROL_POINT
 
     client = FakeBleakClient()
     trainer = BleakTrainer(client)
@@ -214,7 +214,7 @@ def test_bleak_trainer_sends_erg_command_bytes():
 
 
 def test_bleak_trainer_sync_entrypoints_drive_writes():
-    from tranalyzer.ble.devices import BleakTrainer
+    from wattracker.ble.devices import BleakTrainer
 
     client = FakeBleakClient()
     trainer = BleakTrainer(client)
@@ -227,7 +227,7 @@ def test_bleak_trainer_sync_entrypoints_drive_writes():
 
 
 def test_bleak_trainer_handles_indication_responses():
-    from tranalyzer.ble.devices import BleakTrainer
+    from wattracker.ble.devices import BleakTrainer
 
     trainer = BleakTrainer(FakeBleakClient())
     # Success response is recorded.
@@ -244,7 +244,7 @@ def test_bleak_trainer_handles_indication_responses():
 def test_bleak_trainer_write_failure_degrades_gracefully():
     import asyncio
 
-    from tranalyzer.ble.devices import BleakTrainer
+    from wattracker.ble.devices import BleakTrainer
 
     trainer = BleakTrainer(FakeBleakClient(fail_writes=True))
     asyncio.run(trainer.prepare())              # must not raise
@@ -268,7 +268,7 @@ def test_finished_ride_saves_activity(user_id):
 
 
 def test_saved_ride_isolated_per_user(user_id):
-    from tranalyzer import auth
+    from wattracker import auth
     other = db.create_user("someone_else", auth.hash_password("password123"))
     c = RideController(
         _two_block_session(), 200, user_id=user_id, autosave=True,

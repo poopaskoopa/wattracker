@@ -6,8 +6,8 @@ import pytest
 pytest.importorskip("httpx")
 from fastapi.testclient import TestClient  # noqa: E402
 
-from tranalyzer import db  # noqa: E402
-from tranalyzer.server import create_app  # noqa: E402
+from wattracker import db  # noqa: E402
+from wattracker.server import create_app  # noqa: E402
 
 
 @pytest.fixture()
@@ -54,7 +54,7 @@ def test_plan_creation_matches_already_imported_activity(client, monkeypatch):
     """Regression: creating a plan must match its workouts against activities
     that were already imported before the plan existed (the gated fast rescan
     only matches on new imports)."""
-    from tranalyzer import server as servermod
+    from wattracker import server as servermod
 
     _register(client)
     uid = db.get_user_by_username("rider")["id"]
@@ -418,7 +418,7 @@ def test_plan_page_no_plans_message(client):
 def test_plan_page_current_plan_covers_today(client, monkeypatch):
     """A plan whose date range covers today is shown as the current plan and
     marked in effect (no 'not currently in effect' label)."""
-    import tranalyzer.server as servermod
+    import wattracker.server as servermod
 
     _register(client)
     uid = db.get_user_by_username("rider")["id"]
@@ -434,7 +434,7 @@ def test_plan_page_current_plan_covers_today(client, monkeypatch):
 
 
 def test_plan_page_not_in_effect_when_no_plan_covers_today(client, monkeypatch):
-    import tranalyzer.server as servermod
+    import wattracker.server as servermod
 
     _register(client)
     today = dt.date(2027, 1, 1)  # long after the Aug 2026 plan window
@@ -447,8 +447,8 @@ def test_plan_page_not_in_effect_when_no_plan_covers_today(client, monkeypatch):
 
 def test_delete_plan_removes_rows_and_files(client, tmp_path):
     import os
-    from tranalyzer import exporter
-    from tranalyzer.prescribe import zwo
+    from wattracker import exporter
+    from wattracker.prescribe import zwo
 
     out = tmp_path / "zwo"
     _register(client)

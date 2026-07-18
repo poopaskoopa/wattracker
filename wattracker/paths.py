@@ -59,10 +59,10 @@ def activities_dir(override: Optional[str] = None) -> str:
 def zwift_workouts_root() -> str:
     """The Zwift Workouts root that contains per-player-ID subfolders.
 
-    Overridable via TRANALYZER_ZWIFT_WORKOUTS_ROOT (tests point it at a temp
+    Overridable via WATTRACKER_ZWIFT_WORKOUTS_ROOT (tests point it at a temp
     dir so player-folder detection never touches the real Zwift install).
     """
-    override = os.environ.get("TRANALYZER_ZWIFT_WORKOUTS_ROOT")
+    override = os.environ.get("WATTRACKER_ZWIFT_WORKOUTS_ROOT")
     if override:
         return override
     return os.path.join(_documents_zwift(), "Workouts")

@@ -1,8 +1,8 @@
 """Tests for the rule-based workout planner."""
 import pytest
 
-from tranalyzer.analysis.state import TrainingState
-from tranalyzer.prescribe.planner import plan_workout
+from wattracker.analysis.state import TrainingState
+from wattracker.prescribe.planner import plan_workout
 
 
 def _neutral(tsb=0.0):

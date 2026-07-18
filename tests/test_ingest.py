@@ -1,6 +1,6 @@
 """Tests for the importer using a mocked FIT parser (no real .fit needed)."""
-import tranalyzer.ingest.importer as importer
-from tranalyzer import auth, db
+import wattracker.ingest.importer as importer
+from wattracker import auth, db
 
 
 def _fake_parsed(start_time="2026-06-01T10:00:00", seconds=1800, watts=200.0):

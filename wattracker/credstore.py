@@ -5,7 +5,7 @@ clear. Two backends, best available wins:
 
 1. **keyring** (macOS Keychain / OS credential vault) when the package is
    importable and working - the password is stored under service
-   ``TRanalyzer-Zwift`` keyed by user id, nothing password-shaped in the DB
+   ``wattracker-Zwift`` keyed by user id, nothing password-shaped in the DB
    (a sentinel marks which backend holds it).
 2. **Encrypted at rest** fallback: an HMAC-SHA256 keystream cipher (CTR-style,
    random 16-byte nonce, constant-time-decryptable with the same key) using a
@@ -13,7 +13,7 @@ clear. Two backends, best available wins:
    with 0600 permissions. Not HSM-grade, but the DB alone (or a copied DB)
    can't reveal the password.
 
-The env var TRANALYZER_KEYRING=0 forces the file-key backend (the test suite
+The env var WATTRACKER_KEYRING=0 forces the file-key backend (the test suite
 sets it so tests never touch the real Keychain).
 """
 from __future__ import annotations
@@ -27,7 +27,7 @@ from typing import NamedTuple, Optional
 
 from . import config, db
 
-_SERVICE = "TRanalyzer-Zwift"
+_SERVICE = "wattracker-Zwift"
 _KEYRING_SENTINEL = "@keyring"
 _KEY_FILE = "credentials.key"
 _ENC_PREFIX = "enc1$"
@@ -40,7 +40,7 @@ class ZwiftCredentials(NamedTuple):
 
 # ------------------------------------------------------------- keyring
 def _keyring_enabled() -> bool:
-    return os.environ.get("TRANALYZER_KEYRING", "1") not in ("0", "false", "no")
+    return os.environ.get("WATTRACKER_KEYRING", "1") not in ("0", "false", "no")
 
 
 def _keyring():

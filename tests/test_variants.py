@@ -10,9 +10,9 @@ import sqlite3
 
 import pytest
 
-from tranalyzer import db
-from tranalyzer.prescribe import zwo
-from tranalyzer.prescribe.planner import VARIANTS, build_workout
+from wattracker import db
+from wattracker.prescribe import zwo
+from wattracker.prescribe.planner import VARIANTS, build_workout
 
 
 def _if(session):
@@ -94,7 +94,7 @@ def test_variants_fit_across_plan_durations():
 
 # ------------------------------------------------------------ rotation in plan
 def test_plan_generation_rotates_variants():
-    from tranalyzer.prescribe import plan as planmod
+    from wattracker.prescribe import plan as planmod
     import datetime as dt
 
     gen = planmod.generate_plan(
@@ -133,8 +133,8 @@ def test_graph_api_returns_stored_variant_segments(user_id):
 
     pytest.importorskip("httpx")
     from fastapi.testclient import TestClient
-    from tranalyzer.server import create_app
-    from tranalyzer import auth
+    from wattracker.server import create_app
+    from wattracker import auth
 
     app = create_app()
     with TestClient(app) as c:
@@ -187,8 +187,8 @@ def test_v13_migration_preserves_data_and_legacy_null_rebuilds(tmp_path):
 # ------------------------------------------------------------------- adapt path
 def test_adapt_stores_classic_variant_on_stimulus_swap(user_id):
     import datetime as dt
-    from tranalyzer.prescribe import adapt
-    from tranalyzer.analysis.state import TrainingState
+    from wattracker.prescribe import adapt
+    from wattracker.analysis.state import TrainingState
 
     now = dt.datetime(2026, 7, 10, 9, 0)
     date = (now.date() + dt.timedelta(days=2)).isoformat()

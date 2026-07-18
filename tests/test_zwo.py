@@ -1,9 +1,9 @@
 """Tests for .zwo XML rendering."""
 import xml.etree.ElementTree as ET
 
-from tranalyzer.analysis.state import TrainingState
-from tranalyzer.prescribe.planner import plan_workout
-from tranalyzer.prescribe import zwo
+from wattracker.analysis.state import TrainingState
+from wattracker.prescribe.planner import plan_workout
+from wattracker.prescribe import zwo
 
 
 def _session():

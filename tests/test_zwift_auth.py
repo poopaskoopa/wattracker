@@ -8,12 +8,12 @@ import urllib.error
 
 import pytest
 
-from tranalyzer import config, credstore, db, races, zwiftauth
+from wattracker import config, credstore, db, races, zwiftauth
 
 pytest.importorskip("httpx")
 from fastapi.testclient import TestClient  # noqa: E402
 
-from tranalyzer.server import create_app  # noqa: E402
+from wattracker.server import create_app  # noqa: E402
 
 
 @pytest.fixture()
@@ -29,7 +29,7 @@ def _register(client, username="rider"):
 
 # ------------------------------------------------------------- credstore
 def test_credentials_roundtrip_with_file_key_backend(user_id):
-    # conftest sets TRANALYZER_KEYRING=0 -> encrypted file-key backend.
+    # conftest sets WATTRACKER_KEYRING=0 -> encrypted file-key backend.
     backend = credstore.save_zwift_credentials(user_id, "a@b.com", "hunter2!")
     assert backend == "encrypted local file key"
     got = credstore.get_zwift_credentials(user_id)
@@ -55,7 +55,7 @@ def test_clear_credentials(user_id):
 
 
 def test_credentials_are_user_scoped(user_id):
-    from tranalyzer import auth
+    from wattracker import auth
 
     other = db.create_user("other", auth.hash_password("password123"))
     credstore.save_zwift_credentials(user_id, "a@b.com", "pw-a")
@@ -91,7 +91,7 @@ def test_keyring_backend_used_when_available(user_id, monkeypatch):
 
 
 def test_keyring_absent_falls_back(monkeypatch, user_id):
-    monkeypatch.setenv("TRANALYZER_KEYRING", "1")
+    monkeypatch.setenv("WATTRACKER_KEYRING", "1")
     # Simulate the package being missing entirely.
     import builtins
 

@@ -1,5 +1,5 @@
-"""Tests for the offline password-reset CLI (tranalyzer.reset_password)."""
-from tranalyzer import auth, db, reset_password
+"""Tests for the offline password-reset CLI (wattracker.reset_password)."""
+from wattracker import auth, db, reset_password
 
 
 def _make_user(username="lockedout", password="oldpassword"):

@@ -3,8 +3,8 @@ import datetime as dt
 
 import pytest
 
-from tranalyzer import db
-from tranalyzer.ingest import importer
+from wattracker import db
+from wattracker.ingest import importer
 
 
 def _insert_activity(user_id, start_time, power_watts=300.0, seconds=1200):
@@ -158,7 +158,7 @@ def test_settings_ftp_override_used_before_estimate(user_id):
 
 
 def test_ftp_history_isolated_per_user():
-    from tranalyzer import auth
+    from wattracker import auth
 
     db.init_db()
     a = db.create_user("alice", auth.hash_password("password123"))
@@ -172,7 +172,7 @@ def test_ftp_history_isolated_per_user():
 def test_estimate_ftp_tz_aware_start_time_does_not_crash():
     # Regression: FIT timestamps are tz-aware (UTC) while the window cutoff is
     # naive; the trailing-window filter must not raise TypeError.
-    from tranalyzer.metrics.power import estimate_ftp
+    from wattracker.metrics.power import estimate_ftp
 
     acts = [{"start_time": "2026-06-20T10:00:00+00:00",
              "streams": {"power": [200] * 1300}}]

@@ -2,7 +2,7 @@
 import numpy as np
 import pytest
 
-from tranalyzer.metrics import power
+from wattracker.metrics import power
 
 
 def test_np_constant_equals_mean():

@@ -1,21 +1,21 @@
-"""Offline password-reset CLI for a locally-installed TRanalyzer.
+"""Offline password-reset CLI for a locally-installed wattracker.
 
 Usage:
-    python -m tranalyzer.reset_password <username>   # reset one user's password
-    python -m tranalyzer.reset_password --list       # list usernames only
+    python -m wattracker.reset_password <username>   # reset one user's password
+    python -m wattracker.reset_password --list       # list usernames only
 
 Passwords are scrypt-hashed with no email/recovery path, so a forgotten
 password would otherwise strand the user's data. This tool re-hashes a new
 password directly into ``users.password_hash`` using the exact same
-``tranalyzer.auth.hash_password`` primitive (same scrypt params/format) that
+``wattracker.auth.hash_password`` primitive (same scrypt params/format) that
 ``/register`` uses -- there is no second hashing path.
 
 Security model
 --------------
 The trust anchor is local machine access. Anyone who can run this tool already
 has read/write access to the SQLite database file (default
-``~/.tranalyzer/tranalyzer.db``, or wherever ``TRANALYZER_DB`` /
-``TRANALYZER_DATA_DIR`` point). Such a person could already overwrite the hash
+``~/.wattracker/wattracker.db``, or wherever ``WATTRACKER_DB`` /
+``WATTRACKER_DATA_DIR`` point). Such a person could already overwrite the hash
 by hand, so requiring an identity check here would add friction without adding
 security -- the tool grants no capability that local file access does not
 already confer. It therefore performs no further authentication.
@@ -96,7 +96,7 @@ def _reset(username: str) -> int:
 def main(argv: "list[str] | None" = None) -> int:
     args = sys.argv[1:] if argv is None else argv
     if len(args) != 1 or args[0] in ("-h", "--help"):
-        prog = "python -m tranalyzer.reset_password"
+        prog = "python -m wattracker.reset_password"
         print(
             f"Usage:\n  {prog} <username>   reset a user's password\n"
             f"  {prog} --list       list usernames",

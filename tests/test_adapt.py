@@ -5,9 +5,9 @@ import xml.etree.ElementTree as ET
 
 import pytest
 
-from tranalyzer import db
-from tranalyzer.analysis.state import TrainingState
-from tranalyzer.prescribe import adapt
+from wattracker import db
+from wattracker.analysis.state import TrainingState
+from wattracker.prescribe import adapt
 
 NOW = dt.datetime(2026, 7, 10, 9, 0)
 
@@ -108,7 +108,7 @@ def test_adaptation_is_idempotent_no_stacking(user_id):
 
 
 def test_adapted_content_flows_to_detail_and_zwo(user_id):
-    from tranalyzer.prescribe.planner import build_workout
+    from wattracker.prescribe.planner import build_workout
 
     wid = _workout(user_id, 2, type_="vo2max", duration_s=3600)
     adapt.apply_adaptations(user_id, _state(overreach=True), NOW)
@@ -128,7 +128,7 @@ def test_adaptation_reexports_zwo_when_configured(user_id, tmp_path):
     wid = _workout(user_id, 2, type_="vo2max", duration_s=3600)
     w0 = db.get_plan_workout(user_id, wid)
     # Simulate a prior export of the original workout.
-    from tranalyzer.prescribe import zwo as zwomod
+    from wattracker.prescribe import zwo as zwomod
 
     stale = out / zwomod.plan_filename(w0["date"], w0["name"])
     stale.write_text("<old/>")
@@ -157,7 +157,7 @@ def test_banner_levels_and_adaptation_text(user_id):
 def test_dashboard_renders_status_banner(monkeypatch):
     pytest.importorskip("httpx")
     from fastapi.testclient import TestClient
-    from tranalyzer import server as servermod
+    from wattracker import server as servermod
 
     app = servermod.create_app()
     with TestClient(app) as client:

@@ -251,7 +251,7 @@ def create_app() -> FastAPI:
             except (asyncio.TimeoutError, asyncio.CancelledError):
                 task.cancel()
 
-    app = FastAPI(title="TRanalyzer", lifespan=lifespan)
+    app = FastAPI(title="wattracker", lifespan=lifespan)
     app.mount("/static", NoCacheStaticFiles(directory=_STATIC_DIR), name="static")
     # Per-user cache of the last generated .zwo (avoids cross-user bleed).
     app.state.last = {}
@@ -262,7 +262,7 @@ def create_app() -> FastAPI:
     app.add_middleware(
         SessionMiddleware,
         secret_key=config.session_secret(),
-        session_cookie="tranalyzer_session",
+        session_cookie="wattracker_session",
         same_site="lax",
     )
 
@@ -892,7 +892,7 @@ def create_app() -> FastAPI:
         path = zwo.write_to_zwift(
             zwo_str,
             settings.get("zwift_id") or "me",
-            name=name or "TRanalyzer_Workout",
+            name=name or "wattracker_Workout",
             workouts_override=settings.get("workouts_dir"),
         )
         return templates.TemplateResponse(

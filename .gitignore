@@ -40,8 +40,8 @@ credentials.key
 htmlcov/
 
 # runtime artifacts
-.tranalyzer.pid
-tranalyzer.log
+.wattracker.pid
+wattracker.log
 *.log
 nohup.out
 

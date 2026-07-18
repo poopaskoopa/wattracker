@@ -1,7 +1,7 @@
 """Tests for the LLM refinement fallback."""
-from tranalyzer.analysis.state import TrainingState
-from tranalyzer.prescribe.planner import plan_workout
-from tranalyzer.prescribe import llm
+from wattracker.analysis.state import TrainingState
+from wattracker.prescribe.planner import plan_workout
+from wattracker.prescribe import llm
 
 
 def test_shape_session_no_key_returns_unchanged(monkeypatch):

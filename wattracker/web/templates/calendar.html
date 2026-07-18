@@ -1,5 +1,5 @@
 {% extends "base.html" %}
-{% block title %}Calendar &mdash; TRanalyzer{% endblock %}
+{% block title %}Calendar &mdash; wattracker{% endblock %}
 {% block content %}
 <h2>Calendar</h2>
 
@@ -267,7 +267,7 @@
         }
         if (!resp.ok) {
             showError("The server returned HTTP " + resp.status +
-                " for this workout. If TRanalyzer was updated, restart the app " +
+                " for this workout. If wattracker was updated, restart the app " +
                 "server and reload this page.");
             return;
         }

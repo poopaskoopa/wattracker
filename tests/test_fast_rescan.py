@@ -4,8 +4,8 @@ import time
 
 import pytest
 
-import tranalyzer.ingest.importer as importer
-from tranalyzer import db
+import wattracker.ingest.importer as importer
+from wattracker import db
 
 
 def _fake_parsed(start_time="2026-06-01T10:00:00", seconds=1800, watts=200.0):
@@ -25,7 +25,7 @@ def _fake_parsed(start_time="2026-06-01T10:00:00", seconds=1800, watts=200.0):
 
 @pytest.fixture()
 def uid():
-    from tranalyzer import auth
+    from wattracker import auth
     db.init_db()
     return db.create_user("rider", auth.hash_password("password123"))
 

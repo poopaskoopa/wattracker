@@ -3,12 +3,12 @@ import datetime as dt
 
 import pytest
 
-from tranalyzer import db, races
+from wattracker import db, races
 
 pytest.importorskip("httpx")
 from fastapi.testclient import TestClient  # noqa: E402
 
-from tranalyzer.server import create_app  # noqa: E402
+from wattracker.server import create_app  # noqa: E402
 
 
 @pytest.fixture()
@@ -74,7 +74,7 @@ def test_power_per_period_omits_durations_longer_than_ride():
 
 
 def test_mmp_grid_includes_1s_and_40min():
-    from tranalyzer.metrics.curve import MMP_DURATIONS
+    from wattracker.metrics.curve import MMP_DURATIONS
 
     assert 1 in MMP_DURATIONS and 2400 in MMP_DURATIONS
 
@@ -158,7 +158,7 @@ def test_race_links_to_matching_ride_and_none_when_absent(user_id, monkeypatch):
 
 
 def test_race_page_renders_period_columns_and_graph_links(client, monkeypatch):
-    from tranalyzer import zwiftauth
+    from wattracker import zwiftauth
 
     _register(client)
     uid = db.get_user_by_username("rider")["id"]
@@ -170,7 +170,7 @@ def test_race_page_renders_period_columns_and_graph_links(client, monkeypatch):
         "w5": [500, 0], "w15": [420, 0], "w30": [360, 0], "w60": [300, 0],
         "w120": [270, 0], "w300": [240, 0], "w1200": [210, 0],
     }]}
-    from tranalyzer import credstore
+    from wattracker import credstore
     credstore.save_zwift_credentials(uid, "a@b.com", "pw")
     monkeypatch.setattr(
         zwiftauth, "fetch_results_authenticated",
@@ -187,7 +187,7 @@ def test_race_page_renders_period_columns_and_graph_links(client, monkeypatch):
 
 
 def test_period_columns_merged_after_np_no_separate_table(client, monkeypatch):
-    from tranalyzer import credstore, zwiftauth
+    from wattracker import credstore, zwiftauth
 
     _register(client)
     uid = db.get_user_by_username("rider")["id"]
@@ -211,7 +211,7 @@ def test_period_columns_merged_after_np_no_separate_table(client, monkeypatch):
 
 
 def test_if_computed_from_np_and_ftp_as_of_date(client, monkeypatch):
-    from tranalyzer import credstore, zwiftauth
+    from wattracker import credstore, zwiftauth
 
     _register(client)
     uid = db.get_user_by_username("rider")["id"]
@@ -280,7 +280,7 @@ def test_zp_event_id_backfilled_on_resync(user_id):
 
 
 def test_race_date_links_to_zwiftpower_when_event_id_present(client, monkeypatch):
-    from tranalyzer import credstore, zwiftauth
+    from wattracker import credstore, zwiftauth
 
     _register(client)
     uid = db.get_user_by_username("rider")["id"]
@@ -330,7 +330,7 @@ def test_distance_backfilled_from_local_ride(user_id, monkeypatch):
     aid = _activity(user_id, "2026-06-01T10:00:00", 3600, 260.0, if_=0.9)
     db.insert_activity  # noqa: keep flake happy; activity already inserted
     # give the activity a real distance
-    import tranalyzer.db as _db
+    import wattracker.db as _db
     conn = _db.connect()
     conn.execute("UPDATE activities SET distance_m = ? WHERE id = ?", (27198.79, aid))
     conn.commit()
@@ -341,7 +341,7 @@ def test_distance_backfilled_from_local_ride(user_id, monkeypatch):
 
 
 def test_distance_column_and_sort_attrs_rendered(client, monkeypatch):
-    from tranalyzer import credstore, zwiftauth
+    from wattracker import credstore, zwiftauth
 
     _register(client)
     uid = db.get_user_by_username("rider")["id"]
@@ -370,7 +370,7 @@ def test_distance_column_and_sort_attrs_rendered(client, monkeypatch):
 
 
 def test_podium_trophies_rendered(client, monkeypatch):
-    from tranalyzer import credstore, zwiftauth
+    from wattracker import credstore, zwiftauth
 
     _register(client)
     uid = db.get_user_by_username("rider")["id"]
@@ -406,7 +406,7 @@ def test_refresh_without_numeric_id_derives_locally(user_id):
 
 
 def test_results_are_user_scoped(user_id, monkeypatch):
-    from tranalyzer import auth
+    from wattracker import auth
 
     other = db.create_user("other", auth.hash_password("password123"))
     _activity(user_id, "2026-06-01T10:00:00", 3600, 260.0, if_=0.9)
@@ -480,7 +480,7 @@ def test_races_page_shows_stale_cache_without_network(client, monkeypatch):
 def test_profile_durations_spec_includes_15s():
     assert races.PROFILE_DURATIONS == (1, 5, 15, 30, 60, 120, 300, 600,
                                        1200, 2400, 3600)
-    from tranalyzer.metrics.curve import MMP_DURATIONS
+    from wattracker.metrics.curve import MMP_DURATIONS
 
     assert 15 in MMP_DURATIONS
 

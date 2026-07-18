@@ -24,9 +24,9 @@ def main() -> None:
     from . import db
 
     db.init_db()
-    print(f"TRanalyzer running at {URL}")
+    print(f"wattracker running at {URL}")
     threading.Thread(target=_open_browser, daemon=True).start()
-    uvicorn.run("tranalyzer.server:app", host=HOST, port=PORT, reload=False)
+    uvicorn.run("wattracker.server:app", host=HOST, port=PORT, reload=False)
 
 
 if __name__ == "__main__":

@@ -3,7 +3,7 @@
 <head>
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
-    <title>{% block title %}TRanalyzer{% endblock %}</title>
+    <title>{% block title %}wattracker{% endblock %}</title>
     <link rel="stylesheet" href="{{ static_url('style.css') }}">
     <script src="https://cdn.jsdelivr.net/npm/chart.js@4"></script>
     <!-- Drag-to-zoom on the time-series chart (matches Chart.js v4). -->
@@ -11,7 +11,7 @@
 </head>
 <body>
     <header>
-        <h1><a href="/">TRanalyzer</a></h1>
+        <h1><a href="/">wattracker</a></h1>
         {% if username %}
         <nav>
             <a href="/">Dashboard</a>
@@ -30,7 +30,7 @@
         {% block content %}{% endblock %}
     </main>
     <footer>
-        <small>TRanalyzer &mdash; local cycling training analyzer</small>
+        <small>wattracker &mdash; local cycling training analyzer</small>
     </footer>
     {% block scripts %}{% endblock %}
 </body>

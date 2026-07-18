@@ -8,8 +8,8 @@ from collections import defaultdict
 
 import pytest
 
-from tranalyzer import auth, db
-from tranalyzer.prescribe import plan, zwo
+from wattracker import auth, db
+from wattracker.prescribe import plan, zwo
 
 MONDAY = dt.date(2026, 7, 6)  # a Monday
 

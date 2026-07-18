@@ -5,14 +5,14 @@ import sqlite3
 
 import pytest
 
-from tranalyzer import db, exporter
-from tranalyzer.prescribe import zwo
-from tranalyzer.prescribe.planner import build_workout
+from wattracker import db, exporter
+from wattracker.prescribe import zwo
+from wattracker.prescribe.planner import build_workout
 
 pytest.importorskip("httpx")
 from fastapi.testclient import TestClient  # noqa: E402
 
-from tranalyzer.server import create_app  # noqa: E402
+from wattracker.server import create_app  # noqa: E402
 
 
 @pytest.fixture()

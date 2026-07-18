@@ -6,8 +6,8 @@ import pytest
 pytest.importorskip("httpx")
 from fastapi.testclient import TestClient  # noqa: E402
 
-from tranalyzer import db  # noqa: E402
-from tranalyzer.server import create_app  # noqa: E402
+from wattracker import db  # noqa: E402
+from wattracker.server import create_app  # noqa: E402
 
 
 @pytest.fixture()
@@ -134,7 +134,7 @@ def test_per_user_data_isolation(client):
 # ------------------------------------------------------------- static asset cache-busting
 
 def test_static_url_appends_mtime_version():
-    from tranalyzer.server import static_url, _STATIC_DIR
+    from wattracker.server import static_url, _STATIC_DIR
     import os
 
     mtime = int(os.path.getmtime(os.path.join(_STATIC_DIR, "app.js")))
@@ -142,7 +142,7 @@ def test_static_url_appends_mtime_version():
 
 
 def test_static_url_missing_file_has_no_version():
-    from tranalyzer.server import static_url
+    from wattracker.server import static_url
 
     assert static_url("does-not-exist.js") == "/static/does-not-exist.js"
 

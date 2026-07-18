@@ -2,13 +2,13 @@
 
 FIT timestamps are timezone-aware (UTC); the app's windows use a naive
 datetime.now(). Comparing them raised "can't compare offset-naive and
-offset-aware datetimes" and 500'd the dashboard. See tranalyzer/timeutil.py.
+offset-aware datetimes" and 500'd the dashboard. See wattracker/timeutil.py.
 """
 import tempfile
 
-from tranalyzer.timeutil import parse_naive, to_naive
-from tranalyzer import db
-from tranalyzer.analysis import pipeline
+from wattracker.timeutil import parse_naive, to_naive
+from wattracker import db
+from wattracker.analysis import pipeline
 
 
 def test_parse_naive_strips_tzinfo():
@@ -44,7 +44,7 @@ def test_build_state_with_tz_aware_activity(tmp_path):
         # build_state resolves its own DB path; point it there via env.
         import os
 
-        os.environ["TRANALYZER_DB"] = dbfile
+        os.environ["WATTRACKER_DB"] = dbfile
         state = pipeline.build_state(uid)
     assert state.ftp == 190.0
 

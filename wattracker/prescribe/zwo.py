@@ -42,7 +42,7 @@ def _add_text(parent: ET.Element, segment: Segment) -> None:
         )
 
 
-def session_to_zwo(session: Session, author: str = "TRanalyzer") -> str:
+def session_to_zwo(session: Session, author: str = "wattracker") -> str:
     """Render a Session to a valid .zwo XML string."""
     root = ET.Element("workout_file")
     ET.SubElement(root, "author").text = author
@@ -122,7 +122,7 @@ def session_to_zwo(session: Session, author: str = "TRanalyzer") -> str:
     return minidom.parseString(rough).toprettyxml(indent="    ")
 
 
-def zwo_string(session: Session, author: str = "TRanalyzer") -> str:
+def zwo_string(session: Session, author: str = "wattracker") -> str:
     """Return the .zwo XML string for download (alias of session_to_zwo)."""
     return session_to_zwo(session, author=author)
 
@@ -169,7 +169,7 @@ def write_plan_to_zwift(
 def write_to_zwift(
     zwo_str: str,
     zwift_id: str,
-    name: str = "TRanalyzer_Workout",
+    name: str = "wattracker_Workout",
     workouts_override: "str | None" = None,
 ) -> str:
     """Write a .zwo string into the Zwift Workouts directory for `zwift_id`.

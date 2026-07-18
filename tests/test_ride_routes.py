@@ -4,9 +4,9 @@ import pytest
 pytest.importorskip("httpx")
 from fastapi.testclient import TestClient  # noqa: E402
 
-from tranalyzer import db  # noqa: E402
-from tranalyzer.ble import devices as bledevices  # noqa: E402
-from tranalyzer.server import create_app  # noqa: E402
+from wattracker import db  # noqa: E402
+from wattracker.ble import devices as bledevices  # noqa: E402
+from wattracker.server import create_app  # noqa: E402
 
 
 @pytest.fixture()
@@ -89,8 +89,8 @@ def test_ride_ws_unavailable_without_sim(client):
 
 # ------------------------------------------------ real-hardware path (mocked)
 def _patch_real_ride(monkeypatch, trainer, power_script):
-    from tranalyzer import server as servermod
-    from tranalyzer.ble.devices import (
+    from wattracker import server as servermod
+    from wattracker.ble.devices import (
         SimulatedHeartRateSource,
         SimulatedPowerSource,
     )
@@ -113,7 +113,7 @@ def _patch_real_ride(monkeypatch, trainer, power_script):
 
 
 def test_ride_ws_real_path_erg_drives_trainer(client, monkeypatch):
-    from tranalyzer.ble.devices import SimulatedTrainer
+    from wattracker.ble.devices import SimulatedTrainer
 
     _register(client)
     trainer = SimulatedTrainer()
@@ -163,7 +163,7 @@ def test_ride_ws_real_path_degrades_without_trainer(client, monkeypatch):
 
 
 def test_ride_ws_real_path_no_devices(client, monkeypatch):
-    from tranalyzer import server as servermod
+    from wattracker import server as servermod
 
     _register(client)
 

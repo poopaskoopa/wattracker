@@ -6,12 +6,12 @@ import pytest
 pytest.importorskip("httpx")
 from fastapi.testclient import TestClient  # noqa: E402
 
-from tranalyzer import db, paths  # noqa: E402
-from tranalyzer.server import create_app  # noqa: E402
+from wattracker import db, paths  # noqa: E402
+from wattracker.server import create_app  # noqa: E402
 
 
 def _zwift_root() -> str:
-    return os.environ["TRANALYZER_ZWIFT_WORKOUTS_ROOT"]
+    return os.environ["WATTRACKER_ZWIFT_WORKOUTS_ROOT"]
 
 
 def _mk_player_folder(zwift_id: str) -> str:

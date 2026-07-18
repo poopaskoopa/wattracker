@@ -1,7 +1,7 @@
 """Tests for BLE GATT parsers/encoders against known byte payloads (no hardware)."""
 import pytest
 
-from tranalyzer.ble import protocol as p
+from wattracker.ble import protocol as p
 
 
 # ------------------------------------------------ cycling power measurement

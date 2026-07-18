@@ -3,7 +3,7 @@ import datetime as dt
 
 import pytest
 
-from tranalyzer.metrics import load
+from wattracker.metrics import load
 
 
 def test_daily_series_fills_gaps():

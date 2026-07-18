@@ -16,12 +16,12 @@ from typing import Optional
 
 
 def app_data_dir() -> str:
-    """Directory for TRanalyzer's own data (db + config.json)."""
-    override = os.environ.get("TRANALYZER_DATA_DIR")
+    """Directory for wattracker's own data (db + config.json)."""
+    override = os.environ.get("WATTRACKER_DATA_DIR")
     if override:
         os.makedirs(override, exist_ok=True)
         return override
-    base = os.path.join(os.path.expanduser("~"), ".tranalyzer")
+    base = os.path.join(os.path.expanduser("~"), ".wattracker")
     os.makedirs(base, exist_ok=True)
     return base
 
@@ -31,10 +31,10 @@ def config_path() -> str:
 
 
 def db_path() -> str:
-    override = os.environ.get("TRANALYZER_DB")
+    override = os.environ.get("WATTRACKER_DB")
     if override:
         return override
-    return os.path.join(app_data_dir(), "tranalyzer.db")
+    return os.path.join(app_data_dir(), "wattracker.db")
 
 
 @dataclass
@@ -83,20 +83,20 @@ def anthropic_api_key_set() -> bool:
 
 
 def auto_scan_enabled() -> bool:
-    """Whether the background daily activity scan runs (TRANALYZER_AUTO_SCAN).
+    """Whether the background daily activity scan runs (WATTRACKER_AUTO_SCAN).
 
-    Defaults to on; set TRANALYZER_AUTO_SCAN=0 to disable (used by the tests to
+    Defaults to on; set WATTRACKER_AUTO_SCAN=0 to disable (used by the tests to
     keep the suite deterministic).
     """
-    return os.environ.get("TRANALYZER_AUTO_SCAN", "1") not in ("0", "false", "no")
+    return os.environ.get("WATTRACKER_AUTO_SCAN", "1") not in ("0", "false", "no")
 
 
 def session_secret() -> str:
     """Return the signed-cookie session secret, generating + persisting once.
 
-    Priority: TRANALYZER_SECRET env var -> config.json -> freshly generated.
+    Priority: WATTRACKER_SECRET env var -> config.json -> freshly generated.
     """
-    env = os.environ.get("TRANALYZER_SECRET")
+    env = os.environ.get("WATTRACKER_SECRET")
     if env:
         return env
     data = _load_json()

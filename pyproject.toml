@@ -1,5 +1,5 @@
 [project]
-name = "tranalyzer"
+name = "wattracker"
 version = "0.1.0"
 description = "Local cross-platform cycling training analyzer: ingest .fit files, compute training-science metrics, detect plateau/overreach, prescribe progressive workouts as Zwift .zwo files."
 readme = "README.md"
@@ -25,14 +25,14 @@ dev = ["pytest", "httpx"]
 ble = ["bleak"]
 
 [project.scripts]
-tranalyzer = "tranalyzer.__main__:main"
+wattracker = "wattracker.__main__:main"
 
 [build-system]
 requires = ["setuptools>=61.0"]
 build-backend = "setuptools.build_meta"
 
 [tool.setuptools.packages.find]
-include = ["tranalyzer*"]
+include = ["wattracker*"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
