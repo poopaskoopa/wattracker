@@ -29,39 +29,25 @@ def dedup_hash(start_time: Optional[str], duration_s: int) -> str:
 
 
 FTP_UPDATE_DAYS = 21  # re-evaluate at least every 3 weeks
-FTP_ESTIMATE_WINDOW_DAYS = 42
 
 
-def _estimate_anchor(
-    activities: List[dict], now: Optional[_dt.datetime] = None
-) -> _dt.datetime:
-    """Where the trailing FTP-estimate window should END.
-
-    Anchored at the most recent activity (never later than `now`). Anchoring at
-    wall-clock time instead would empty the window after a break in training and
-    make the estimate collapse - the value must reflect the last evaluation of
-    actual riding, matching the dashboard's rolling FTP(est) series.
-    """
-    from ..timeutil import parse_naive
-
-    now = now or _dt.datetime.now()
-    last = None
-    for a in activities:
-        when = parse_naive(a.get("start_time"))
-        if when is not None and (last is None or when > last):
-            last = when
-    if last is None or last > now:
-        return now
-    return last
-
-
-def _anchored_estimate(
-    activities: List[dict], now: Optional[_dt.datetime] = None
+def _current_estimate(
+    activities: List[dict],
+    now: Optional[_dt.datetime] = None,
+    extra_power: Optional[List[List[float]]] = None,
 ) -> float:
-    anchor = _estimate_anchor(activities, now)
-    return estimate_ftp(
-        activities, window_days=FTP_ESTIMATE_WINDOW_DAYS, now=anchor
-    )
+    """FTP estimate anchored at wall-clock `now` using the detraining decay.
+
+    Anchoring at `now` (rather than the last activity) is intentional: with the
+    smooth decay model the estimate never "empties" during a layoff, it just
+    decays honestly, which is the desired behavior - a rider genuinely loses
+    fitness across a break.
+    """
+    now = now or _dt.datetime.now()
+    streams: List = list(activities)
+    if extra_power:
+        streams = streams + [p for p in extra_power if p]
+    return estimate_ftp(streams, now=now)
 
 
 def current_ftp(
@@ -72,8 +58,8 @@ def current_ftp(
     """Resolve the current FTP for a user.
 
     Precedence: latest ftp_history value -> user's FTP override -> fresh
-    estimate over the 42 days ending at the most recent activity. Falls back to
-    a sane default if no power data.
+    detraining-decayed estimate anchored at `now`. Falls back to a sane default
+    if no power data.
     """
     db.init_db()
     latest = db.latest_ftp(user_id)
@@ -83,12 +69,7 @@ def current_ftp(
     override = settings.get("ftp")
     if override and float(override) > 0:
         return float(override)
-    activities = db.full_activities(user_id)
-    streams: List = list(activities)
-    if extra_power:
-        streams = streams + [p for p in extra_power if p]
-    anchor = _estimate_anchor(activities, now)
-    ftp = estimate_ftp(streams, window_days=FTP_ESTIMATE_WINDOW_DAYS, now=anchor)
+    ftp = _current_estimate(db.full_activities(user_id), now, extra_power)
     return ftp if ftp > 0 else 200.0
 
 
@@ -124,12 +105,12 @@ def evaluate_ftp(user_id: int, now: Optional[_dt.datetime] = None) -> bool:
       changed the picture), its value is refreshed in place - so `current_ftp`
       always reflects the most recent evaluation. Manual rows are never touched.
 
-    The estimate window ends at the most recent activity (see _estimate_anchor).
-    Returns True when a row was appended or refreshed.
+    The estimate is the detraining-decayed value anchored at `now`
+    (see _current_estimate). Returns True when a row was appended or refreshed.
     """
     db.init_db()
     now = now or _dt.datetime.now()
-    est = _anchored_estimate(db.full_activities(user_id), now)
+    est = _current_estimate(db.full_activities(user_id), now)
     if est <= 0:
         return False
     est = round(est, 1)
@@ -400,11 +381,16 @@ def run_auto_scan(now: Optional[_dt.datetime] = None) -> Dict[str, int]:
     for uid in db.all_user_ids():
         totals["users"] += 1
         try:
-            # scan_activities gates FTP re-eval + completion matching on new
-            # imports and reports both back - no separate second pass needed.
+            # scan_activities gates completion matching (and its own FTP
+            # re-eval) on new imports and reports both back.
             result = scan_activities(uid)
             totals["imported"] += int(result.get("imported", 0))
             totals["completed"] += int(result.get("completed", 0))
+            # Re-evaluate FTP for every user even when nothing new imported:
+            # existing DBs may hold a stale collapsed 'estimated' row from the
+            # old hard-window anchoring, and evaluate_ftp self-heals the latest
+            # estimated row in place when it disagrees (no migration needed).
+            evaluate_ftp(uid)
         except Exception:
             pass  # a broken folder for one user must not stop the sweep
     return totals

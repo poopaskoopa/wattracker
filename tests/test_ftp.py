@@ -98,33 +98,39 @@ def test_update_cadence_is_three_weeks(user_id):
     assert importer.ftp_update_due(user_id, other_now) is True
 
 
-def test_estimate_window_anchors_at_last_activity(user_id):
-    # Regression (live-data bug): the user stopped riding 33 days ago. A window
-    # anchored at wall-clock now would be nearly empty and collapse the FTP;
-    # it must instead end at the last activity, matching the dashboard series.
+def test_estimate_decays_after_layoff_anchored_at_now(user_id):
+    # Semantics changed: the estimate is anchored at wall-clock `now` and the
+    # 33-day-old effort is detraining-decayed (not cliffed to zero, not frozen
+    # at the last-activity value). 300 * factor(33) * 0.95 ~= 259.
     now = dt.datetime(2026, 7, 3, 12, 0)
     _insert_activity(user_id, (now - dt.timedelta(days=33)).isoformat(),
                      power_watts=300.0)
+    from wattracker.metrics.power import detraining_factor
+    expected = 300.0 * detraining_factor(33) * 0.95
     assert importer.evaluate_ftp(user_id, now) is True
     latest = db.latest_ftp(user_id)
-    assert latest["ftp_watts"] == pytest.approx(285.0, abs=0.5)  # 300 * 0.95
+    assert latest["ftp_watts"] == pytest.approx(expected, abs=0.5)
     assert latest["date"] == now.date().isoformat()
+    # Decayed, but nowhere near a collapse.
+    assert latest["ftp_watts"] > 250.0
     # current_ftp everywhere now reflects that evaluation.
-    assert importer.current_ftp(user_id, now=now) == pytest.approx(285.0, abs=0.5)
+    assert importer.current_ftp(user_id, now=now) == pytest.approx(expected, abs=0.5)
 
 
 def test_evaluate_self_heals_stale_estimated_row(user_id):
-    # A mis-recorded estimated row (the old wall-clock anchoring) is refreshed
-    # in place on the next evaluation, without waiting out the 21-day gate and
-    # without appending a second row.
+    # A stale collapsed 'estimated' row (from the old hard-window anchoring) is
+    # refreshed in place on the next evaluation, without waiting out the 21-day
+    # gate and without appending a second row.
     now = dt.datetime(2026, 7, 3, 12, 0)
     _insert_activity(user_id, (now - dt.timedelta(days=33)).isoformat(),
                      power_watts=300.0)
     db.add_ftp_entry(user_id, now.date().isoformat(), 160.9, "estimated")
+    from wattracker.metrics.power import detraining_factor
+    expected = 300.0 * detraining_factor(33) * 0.95
     assert importer.evaluate_ftp(user_id, now) is True
     rows = db.ftp_history_list(user_id)
     assert len(rows) == 1
-    assert rows[0]["ftp_watts"] == pytest.approx(285.0, abs=0.5)
+    assert rows[0]["ftp_watts"] == pytest.approx(expected, abs=0.5)
     assert rows[0]["source"] == "estimated"
 
 

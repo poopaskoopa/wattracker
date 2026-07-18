@@ -46,7 +46,11 @@ def test_build_state_with_tz_aware_activity(tmp_path):
 
         os.environ["WATTRACKER_DB"] = dbfile
         state = pipeline.build_state(uid)
-    assert state.ftp == 190.0
+    # The estimate is now anchored at wall-clock now() and detraining-decayed,
+    # so the exact value drifts with the real date; the regression here is that
+    # a tz-aware start_time no longer crashes. Best-20 of 200W -> 190 undecayed,
+    # decay only reduces it, so assert a positive value not exceeding 190.
+    assert 0.0 < state.ftp <= 190.0
 
 
 def _accepts_path() -> bool:

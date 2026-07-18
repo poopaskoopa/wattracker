@@ -48,26 +48,31 @@ def test_filter_by_months_none_returns_all():
 
 
 # --------------------------------------------------- rolling FTP series
-def test_rolling_ftp_varies_and_respects_window(user_id):
+def test_rolling_ftp_varies_and_decays_through_gap(user_id):
     base = dt.datetime(2026, 1, 1, 10, 0)
     _insert(user_id, base, watts=300.0)                       # 20 min @ 300W
     _insert(user_id, base + dt.timedelta(days=60), watts=340.0)  # later, stronger
 
     now = base + dt.timedelta(days=60)
     result = pipeline.ftp_rolling_series(
-        user_id, window_days=42, step_days=7, now=now
+        user_id, step_days=7, now=now
     )
     est = result["estimated"]
     values = [p["ftp"] for p in est]
 
     assert result["recorded"] == []  # no manual/monthly rows
-    # Early samples see only the 300W effort -> 285; later ones the 340W -> 323.
-    assert any(abs(v - 285.0) < 1.0 for v in values)
-    assert any(abs(v - 323.0) < 1.0 for v in values)
-    # The 60-day gap exceeds the 42-day window, so the two never overlap.
+    # First sample sees the fresh 300W effort -> 285.
+    assert values[0] == pytest.approx(285.0, abs=0.5)
+    # Semantics changed: no hard window/cliff. Through the 60-day gap the 300W
+    # effort decays smoothly (no None gaps), so the minimum is BELOW 285 rather
+    # than pinned at it. day56 sample: 300 * factor(56) * 0.95 ~= 235.
+    assert min(values) < 285.0
+    assert min(values) == pytest.approx(235.3, abs=1.0)
+    # The samples strictly decay until the stronger effort lands at the end.
+    gap_vals = values[:-1]
+    assert all(b <= a + 1e-6 for a, b in zip(gap_vals, gap_vals[1:]))
+    # Final sample (at `now`) reflects the recent stronger 340W effort -> 323.
     assert max(values) == pytest.approx(323.0, abs=0.5)
-    assert min(values) == pytest.approx(285.0, abs=0.5)
-    # Final sample (at `now`) reflects only the recent stronger effort.
     assert est[-1]["ftp"] == pytest.approx(323.0, abs=0.5)
 
 

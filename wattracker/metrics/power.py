@@ -4,9 +4,33 @@ All functions operate on per-second power streams (one sample per second).
 """
 from __future__ import annotations
 
+import math
 from typing import Iterable, Sequence
 
 import numpy as np
+
+
+# --- Detraining decay model for the FTP estimate ------------------------------
+# The FTP estimate weights each past effort by how much fitness is expected to
+# have decayed since it was ridden. Efforts inside a short grace window count in
+# full; after that, the weight decays exponentially with an e-folding time of
+# FTP_DECAY_TAU_DAYS. This replaces the old hard trailing window, which cliffed
+# every pre-break effort to zero the moment the anchor moved past it and made
+# the estimate collapse after a training layoff.
+FTP_DECAY_GRACE_DAYS = 10   # no detraining penalty inside this many days
+FTP_DECAY_TAU_DAYS = 240    # e-folding time of detraining after the grace period
+
+
+def detraining_factor(days_since: float) -> float:
+    """Fraction of a past effort's power still assumed available after a layoff.
+
+    1.0 for efforts within FTP_DECAY_GRACE_DAYS, then a smooth exponential decay
+    (tau = FTP_DECAY_TAU_DAYS) afterwards. Roughly 0.875 at 42 days, i.e. a
+    ~12% loss after a six-week break, in line with detraining physiology.
+    """
+    if days_since <= FTP_DECAY_GRACE_DAYS:
+        return 1.0
+    return math.exp(-(days_since - FTP_DECAY_GRACE_DAYS) / FTP_DECAY_TAU_DAYS)
 
 
 def _clean_power(power: Iterable[float]) -> np.ndarray:
@@ -87,42 +111,25 @@ def best_20min_power(power: Sequence[float]) -> float:
     return float(roll.max())
 
 
-def _activity_power_streams(
-    activities: Iterable,
-    window_days: "int | None" = None,
-    now=None,
-) -> "list[Sequence[float]]":
-    """Extract per-second power streams from a mixed iterable of activities.
+def _activity_power_streams(activities: Iterable) -> "list[tuple[object, Sequence[float]]]":
+    """Extract (when, per-second power stream) pairs from a mixed iterable.
 
     Each item may be:
-      - a raw power stream (list/sequence of numbers), or
-      - an activity dict with a "streams" mapping and optional "start_time".
-
-    When `window_days` is given and an activity dict carries a parseable
-    "start_time", only activities within the trailing window (relative to `now`)
-    are kept. Raw-stream items are always kept (no date to filter on).
+      - a raw power stream (list/sequence of numbers) -> ``when`` is None, or
+      - an activity dict with a "streams" mapping and optional "start_time" ->
+        ``when`` is the parsed naive datetime (or None if unparseable).
     """
-    import datetime as _dt
+    from ..timeutil import parse_naive
 
-    if now is None:
-        now = _dt.datetime.now()
-    cutoff = now - _dt.timedelta(days=window_days) if window_days else None
-
-    out: "list[Sequence[float]]" = []
+    out: "list[tuple[object, Sequence[float]]]" = []
     for item in activities:
         if isinstance(item, dict):
             power = (item.get("streams") or {}).get("power") or item.get("power")
             if not power:
                 continue
-            if cutoff is not None:
-                from ..timeutil import parse_naive
-
-                when = parse_naive(item.get("start_time"))
-                if when is not None and when < cutoff:
-                    continue
-            out.append(power)
+            out.append((parse_naive(item.get("start_time")), power))
         else:
-            out.append(item)
+            out.append((None, item))
     return out
 
 
@@ -132,18 +139,36 @@ def estimate_ftp(
     window_days: "int | None" = None,
     now=None,
 ) -> float:
-    """Estimate FTP as best 20-min rolling avg power * 0.95.
+    """Estimate FTP as best (detraining-weighted) 20-min power * 0.95.
 
-    Uses the best 20-minute effort across the provided activities. Accepts
-    either raw power streams or activity dicts (with "streams"/"start_time");
-    when `window_days` is set, dated activities outside the trailing window are
-    excluded. A user override always wins when provided and positive.
+    Each activity contributes ``best_20min_power * detraining_factor(days since
+    the effort)``; the estimate is 0.95 * the maximum of those weighted values.
+    A recent hard effort therefore dominates, while older efforts fade smoothly
+    rather than dropping off a cliff - so the estimate decays honestly through a
+    training break instead of collapsing.
+
+    Accepts either raw power streams or activity dicts (with "streams" /
+    "start_time"). When ``now`` is None, no decay is applied and the result is
+    simply best-20-min * 0.95 (used with raw streams). Undated items always get
+    a decay factor of 1.0.
+
+    ``window_days`` is deprecated and ignored (the smooth decay replaces the old
+    hard trailing window); the kwarg is kept for call-site compatibility.
+    A user override always wins when provided and positive.
     """
     if override is not None and override > 0:
         return float(override)
+
+    import datetime as _dt
+
     best = 0.0
-    for stream in _activity_power_streams(activities, window_days=window_days, now=now):
+    for when, stream in _activity_power_streams(activities):
         b = best_20min_power(stream)
+        if b <= 0:
+            continue
+        if now is not None and when is not None:
+            days = (now - when).total_seconds() / 86400.0
+            b *= detraining_factor(days)
         if b > best:
             best = b
     return best * 0.95
