@@ -11,7 +11,7 @@ const SERIES_TIPS = {
     CTL: "Chronic Training Load — 42-day average of training stress; your 'fitness'.",
     ATL: "Acute Training Load — 7-day average of training stress; your 'fatigue'.",
     TSB: "Training Stress Balance — CTL minus ATL; your 'form' (positive = fresh).",
-    FTP: "Estimated FTP — best 20-min power x 0.95 over a rolling 42-day window (plus recorded points).",
+    "Training FTP": "Training FTP — best 20-min power x 0.95, adjusted for inactivity (plus recorded points).",
 };
 
 const COLORS = {
@@ -19,6 +19,7 @@ const COLORS = {
     ATL: "#f2a900",
     TSB: "#5a9bd4",
     FTP: "#e05252",
+    "Training FTP": "#e05252",
 };
 
 let mainChart = null;
@@ -81,7 +82,7 @@ const LEGEND_GROUPS = [
     { label: "CTL", datasets: [0] },
     { label: "ATL", datasets: [1] },
     { label: "TSB", datasets: [2] },
-    { label: "FTP", datasets: [3, 4] }, // rolling line + recorded points
+    { label: "Training FTP", datasets: [3, 4] }, // estimated line + recorded points
 ];
 
 // Most recent value across a legend group's datasets (a later dataset in the
@@ -177,9 +178,9 @@ function buildMainChart(load, ftpSeries) {
           yAxisID: "y", tension: 0.2, pointRadius: 0, spanGaps: true },
         { label: "TSB", data: alignedFrom(labels, load, "tsb"), borderColor: COLORS.TSB,
           yAxisID: "y", tension: 0.2, pointRadius: 0, spanGaps: true },
-        { label: "FTP (est)", data: interpolatedFrom(labels, est, "ftp"), borderColor: COLORS.FTP,
+        { label: "Training FTP (est)", data: interpolatedFrom(labels, est, "ftp"), borderColor: COLORS.FTP,
           yAxisID: "yFtp", tension: 0.1, pointRadius: 0, spanGaps: true, borderDash: [4, 3] },
-        { label: "FTP (recorded)", data: alignedFrom(labels, recorded, "ftp_watts"),
+        { label: "Training FTP (recorded)", data: alignedFrom(labels, recorded, "ftp_watts"),
           yAxisID: "yFtp", borderColor: COLORS.FTP, backgroundColor: COLORS.FTP,
           showLine: false, pointRadius: 4, spanGaps: true },
     ];
@@ -217,7 +218,7 @@ function buildMainChart(load, ftpSeries) {
                 },
                 y: { position: "left", title: { display: true, text: "Load (CTL/ATL/TSB)" } },
                 yFtp: {
-                    position: "right", title: { display: true, text: "FTP (W)" },
+                    position: "right", title: { display: true, text: "Training FTP (W)" },
                     grid: { drawOnChartArea: false },
                 },
             },

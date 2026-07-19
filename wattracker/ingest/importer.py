@@ -7,6 +7,7 @@ import hashlib
 import os
 import tempfile
 import time
+import xml.etree.ElementTree as _ET
 from typing import Callable, Dict, List, Optional
 
 import numpy as np
@@ -30,6 +31,14 @@ def dedup_hash(start_time: Optional[str], duration_s: int) -> str:
 
 FTP_UPDATE_DAYS = 21  # re-evaluate at least every 3 weeks
 
+# Standalone workout matching and conservative RPE feedback policy.
+STANDALONE_DURATION_TOLERANCE = 0.20
+PROFILE_MIN_COMPLIANCE = 0.90
+PROFILE_MIN_HARD_SECONDS = 180
+FTP_FEEDBACK_WINDOW_DAYS = 28
+FTP_FEEDBACK_MIN_WORKOUTS = 2
+FTP_FEEDBACK_MAX_STEP = 0.02
+
 
 def _current_estimate(
     activities: List[dict],
@@ -48,6 +57,23 @@ def _current_estimate(
     if extra_power:
         streams = streams + [p for p in extra_power if p]
     return estimate_ftp(streams, now=now)
+
+
+def recent_best_effort_ftp(
+    user_id: int, now: Optional[_dt.datetime] = None
+) -> float:
+    """Trailing-90-day best-20-minute power * 0.95, without inactivity decay."""
+    from ..timeutil import parse_naive
+
+    db.init_db()
+    now = now or _dt.datetime.now()
+    cutoff = now - _dt.timedelta(days=90)
+    recent = []
+    for activity in db.full_activities(user_id):
+        when = parse_naive(activity.get("start_time"))
+        if when is not None and cutoff <= when <= now:
+            recent.append(activity)
+    return estimate_ftp(recent)
 
 
 def current_ftp(
@@ -318,6 +344,117 @@ def ingest_upload(user_id: int, filename: str, content: bytes) -> Optional[int]:
 COMPLETION_TOLERANCE = 0.30
 
 
+def _zwo_fraction_profile(zwo_str: str) -> List[float]:
+    """Expand a ZWO workout into one target-FTP fraction per second."""
+    try:
+        root = _ET.fromstring(zwo_str)
+    except (_ET.ParseError, TypeError):
+        return []
+    workout = root.find("workout")
+    if workout is None:
+        return []
+    out: List[float] = []
+    for el in workout:
+        tag = el.tag.lower()
+        try:
+            if tag in ("warmup", "cooldown", "ramp"):
+                duration = int(el.attrib.get("Duration", 0))
+                low = float(el.attrib.get("PowerLow", 0))
+                high = float(el.attrib.get("PowerHigh", 0))
+                if duration > 0:
+                    out.extend(np.linspace(low, high, duration).tolist())
+            elif tag == "steadystate":
+                out.extend([float(el.attrib["Power"])] * int(el.attrib["Duration"]))
+            elif tag == "intervalst":
+                repeat = int(el.attrib.get("Repeat", 0))
+                on = [float(el.attrib["OnPower"])] * int(el.attrib["OnDuration"])
+                off = [float(el.attrib["OffPower"])] * int(el.attrib["OffDuration"])
+                for _ in range(repeat):
+                    out.extend(on)
+                    out.extend(off)
+            elif tag == "freeride":
+                return []  # no objective target profile
+        except (KeyError, TypeError, ValueError):
+            return []
+    return out
+
+
+def _profile_evidence(activity: dict, workout: dict) -> Optional[tuple]:
+    """Return profile match quality and FTP evidence when both streams exist."""
+    target = np.asarray(_zwo_fraction_profile(
+        workout.get("zwo") or workout.get("zwo_or_segments") or ""
+    ), dtype=float)
+    actual_raw = ((activity.get("streams") or {}).get("power") or [])
+    actual = np.asarray(
+        [0.0 if p is None else float(p) for p in actual_raw], dtype=float
+    )
+    if target.size < 600 or actual.size < 600:
+        return None
+    # Align by relative workout progress; this tolerates small recording/pause
+    # differences while preserving the prescribed interval shape.
+    x_old = np.linspace(0.0, 1.0, actual.size)
+    x_new = np.linspace(0.0, 1.0, target.size)
+    aligned = np.interp(x_new, x_old, actual)
+    eligible = target >= 0.50
+    if not eligible.any():
+        return (0.0, None)
+    scale = float(np.median(aligned[eligible] / target[eligible]))
+    export_ftp = float(workout.get("export_ftp") or 0)
+    if scale <= 0:
+        return (0.0, None)
+    if export_ftp and not 0.60 * export_ftp <= scale <= 1.40 * export_ftp:
+        return (0.0, None)
+    if not export_ftp and not 50.0 <= scale <= 600.0:
+        return (0.0, None)
+    expected = target[eligible] * scale
+    mae = float(np.mean(np.abs(aligned[eligible] - expected) / scale))
+    compliance = max(0.0, min(1.0, 1.0 - mae))
+    hard_enough = int((target >= 0.85).sum()) >= PROFILE_MIN_HARD_SECONDS
+    return compliance, scale if hard_enough else None
+
+
+def _match_standalone_completions(
+    user_id: int, now: Optional[_dt.datetime] = None
+) -> int:
+    """Match persisted one-off exports using date, duration and target profile."""
+    db.init_db()
+    now = now or _dt.datetime.now()
+    used = db.completed_activity_ids(user_id)
+    marked = 0
+    for workout in db.incomplete_standalone_workouts_up_to(
+        user_id, now.date().isoformat()
+    ):
+        best = None
+        best_score = None
+        for summary in db.activities_on_date(user_id, workout["scheduled_date"]):
+            if summary["id"] in used:
+                continue
+            plan_duration = float(workout.get("duration_s") or 0)
+            if plan_duration <= 0:
+                continue
+            duration_error = abs(float(summary.get("duration_s") or 0) - plan_duration) / plan_duration
+            if duration_error > STANDALONE_DURATION_TOLERANCE:
+                continue
+            activity = db.get_activity(user_id, summary["id"])
+            evidence = _profile_evidence(activity or {}, workout)
+            if evidence is None:
+                continue
+            compliance, effective = evidence
+            if compliance < PROFILE_MIN_COMPLIANCE:
+                continue
+            score = duration_error + (1.0 - compliance)
+            if best_score is None or score < best_score:
+                best = (summary, compliance, effective)
+                best_score = score
+        if best and db.mark_standalone_completed(
+            user_id, workout["id"], best[0]["id"], workout["scheduled_date"],
+            best[1], best[2],
+        ):
+            used.add(best[0]["id"])
+            marked += 1
+    return marked
+
+
 def _completion_score(activity: dict, workout: dict) -> Optional[float]:
     """Match quality (lower is better), or None if outside tolerance.
 
@@ -349,24 +486,117 @@ def match_plan_completions(user_id: int, now: Optional[_dt.datetime] = None) -> 
     """
     db.init_db()
     now = now or _dt.datetime.now()
-    used = db.completed_activity_ids(user_id)
+    # Scheduled plan commitments always get first refusal on same-day rides.
     marked = 0
+    used = db.completed_activity_ids(user_id)
     for workout in db.incomplete_plan_workouts_up_to(user_id, now.date().isoformat()):
         best = None
         best_score = None
         for act in db.activities_on_date(user_id, workout["date"]):
             if act["id"] in used:
                 continue
-            score = _completion_score(act, workout)
+            full = db.get_activity(user_id, act["id"])
+            evidence = _profile_evidence(full or {}, workout)
+            duration = float(workout.get("duration_s") or 0)
+            duration_error = (
+                abs(float(act.get("duration_s") or 0) - duration) / duration
+                if duration > 0 else 999.0
+            )
+            if evidence is not None and duration_error <= STANDALONE_DURATION_TOLERANCE:
+                compliance, effective = evidence
+                score = duration_error + (1.0 - compliance) if compliance >= PROFILE_MIN_COMPLIANCE else None
+            else:
+                compliance = effective = None
+                fallback = _completion_score(act, workout)
+                score = 1.0 + fallback if fallback is not None else None
             if score is not None and (best_score is None or score < best_score):
-                best, best_score = act, score
+                best, best_score = (act, compliance, effective), score
         if best is not None:
             if db.mark_plan_workout_completed(
-                user_id, workout["id"], best["id"], workout["date"]
+                user_id, workout["id"], best[0]["id"], workout["date"],
+                best[1], best[2],
             ):
-                used.add(best["id"])
+                used.add(best[0]["id"])
                 marked += 1
-    return marked
+    return marked + _match_standalone_completions(user_id, now)
+
+
+def match_standalone_completions(
+    user_id: int, now: Optional[_dt.datetime] = None
+) -> int:
+    """Run completion matching with scheduled plans receiving first refusal."""
+    return match_plan_completions(user_id, now)
+
+
+def apply_rpe_ftp_feedback(
+    user_id: int, now: Optional[_dt.datetime] = None
+) -> Optional[float]:
+    """Apply one bounded FTP step from multiple new compliant hard workouts.
+
+    Expected effort is type-aware: VO2 RPE 9 is neutral, while threshold and
+    sweet-spot RPE 8 are neutral. Evidence is consumed in reversible batches.
+    """
+    now = now or _dt.datetime.now()
+    settings = db.get_user_settings(user_id)
+    if settings.get("ftp") and float(settings["ftp"]) > 0:
+        return None
+    latest = db.latest_ftp(user_id)
+    if not latest or latest.get("source") != "estimated":
+        return None
+    since = (now.date() - _dt.timedelta(days=FTP_FEEDBACK_WINDOW_DAYS)).isoformat()
+    evidence = [
+        e for e in db.unused_feedback_evidence(user_id, since)
+        if float(e.get("compliance") or 0) >= PROFILE_MIN_COMPLIANCE
+    ]
+    low = [
+        e for e in evidence
+        if int(e["rpe"]) <= (8 if e["type"] == "vo2max" else 7)
+    ]
+    high = [
+        e for e in evidence
+        if int(e["rpe"]) >= (10 if e["type"] == "vo2max" else 9)
+    ]
+    current = float(latest["ftp_watts"])
+    chosen: List[dict]
+    if len(low) >= FTP_FEEDBACK_MIN_WORKOUTS:
+        chosen = low
+        demonstrated = float(np.median([e["effective_ftp"] for e in chosen]))
+        desired = max(current, demonstrated)
+    elif len(high) >= FTP_FEEDBACK_MIN_WORKOUTS:
+        chosen = high
+        desired = current * (1.0 - FTP_FEEDBACK_MAX_STEP)
+    else:
+        return None
+    limit = current * FTP_FEEDBACK_MAX_STEP
+    updated = max(50.0, min(600.0, current + max(-limit, min(limit, desired - current))))
+    updated = round(updated, 1)
+    delta = round(updated - current, 1)
+    if abs(updated - current) < 0.1:
+        batch = db.apply_feedback_batch(
+            user_id, latest["date"], current, 0.0, chosen
+        )
+        return current if batch is not None else None
+    batch = db.apply_feedback_batch(
+        user_id, latest["date"], updated, delta, chosen
+    )
+    return updated if batch is not None else None
+
+
+def save_workout_rpe(
+    user_id: int, kind: str, workout_id: int, rpe: int,
+    now: Optional[_dt.datetime] = None,
+) -> bool:
+    """Save/correct a rating, reversing its prior feedback batch first."""
+    if kind not in ("plan", "standalone"):
+        return False
+    db.rollback_feedback_for_workout(user_id, kind, workout_id)
+    if kind == "plan":
+        saved = db.set_plan_workout_rpe(user_id, workout_id, rpe)
+    else:
+        saved = db.set_standalone_rpe(user_id, workout_id, rpe)
+    if saved:
+        apply_rpe_ftp_feedback(user_id, now)
+    return saved
 
 
 def run_auto_scan(now: Optional[_dt.datetime] = None) -> Dict[str, int]:

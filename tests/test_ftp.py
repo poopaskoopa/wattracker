@@ -87,6 +87,27 @@ def test_update_seeds_first_entry_when_empty(user_id):
     assert db.latest_ftp(user_id)["ftp_watts"] == pytest.approx(285.0, abs=1.5)
 
 
+def test_recent_best_effort_ftp_is_undecayed_90_day_estimate(user_id):
+    now = dt.datetime(2026, 7, 1, 12, 0)
+    _insert_activity(
+        user_id,
+        (now - dt.timedelta(days=180)).isoformat(),
+        power_watts=300.0,
+    )
+    _insert_activity(
+        user_id,
+        (now - dt.timedelta(days=2)).isoformat(),
+        power_watts=250.0,
+    )
+
+    assert importer.recent_best_effort_ftp(user_id, now=now) == pytest.approx(237.5)
+    assert importer.current_ftp(user_id, now=now) < 285.0
+
+
+def test_recent_best_effort_ftp_is_zero_without_usable_power(user_id):
+    assert importer.recent_best_effort_ftp(user_id) == 0.0
+
+
 def test_update_cadence_is_three_weeks(user_id):
     # >= 21 days since the last entry -> due; < 21 -> not due.
     assert importer.FTP_UPDATE_DAYS == 21

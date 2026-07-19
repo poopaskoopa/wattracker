@@ -111,6 +111,9 @@
 
         <div class="toolbar">
             <form method="post" action="/generate/export">
+                <label>Scheduled date:
+                    <input type="date" name="scheduled_date" value="{{ scheduled_date }}" required>
+                </label>
                 <button type="submit">Export to Zwift</button>
             </form>
             <a class="button" href="/generate/download">Download .zwo</a>

@@ -3,9 +3,12 @@
 {% block content %}
 <h2>Dashboard</h2>
 
+{% set rating_next = '/' %}
+{% include "_pending_ratings.html" %}
+
 <section class="cards">
-    <div class="card" title="Functional Threshold Power — the highest power you can sustain for about an hour; the basis for your training zones.">
-        <span class="label">FTP</span><span class="value">{{ state.ftp }} W</span></div>
+    <div class="card" title="Training FTP — your inactivity-adjusted FTP estimate; it drives workout targets and training zones.">
+        <span class="label">Training FTP</span><span class="value">{{ state.ftp }} W</span></div>
     <div class="card" title="Critical Power — the power you could theoretically hold indefinitely; the asymptote of your power–duration curve.">
         <span class="label">CP</span><span class="value">{{ state.cp if state.cp is not none else '&mdash;'|safe }} W</span></div>
     <div class="card" title="W-prime — your finite anaerobic work capacity (in joules) available above Critical Power before exhaustion.">
@@ -57,7 +60,7 @@
 
 <section class="chart-block">
     <div class="chart-head">
-        <h3>Fitness / Fatigue / Form &amp; FTP</h3>
+        <h3>Fitness / Fatigue / Form &amp; Training FTP</h3>
         <div class="range-controls">
             <button type="button" class="range-btn active" data-months="1">1 month</button>
             <button type="button" class="range-btn" data-months="12">1 year</button>

@@ -3,6 +3,9 @@
 {% block content %}
 <h2>Calendar</h2>
 
+{% set rating_next = '/calendar' %}
+{% include "_pending_ratings.html" %}
+
 <div class="cal-head">
     <a class="button" href="/calendar{{ prev }}">&larr; Prev</a>
     <h3>{{ month_name }} {{ year }}</h3>
@@ -52,9 +55,11 @@
                 <div class="cal-day">{{ cell.day }}{% if cell.ooto %} <span class="cal-ooto-tag">OOTO</span>{% endif %}</div>
                 {% for w in cell.workouts %}
                     <div class="cal-workout cal-{{ w.type }}{{ ' cal-completed' if w.completed_activity_id else '' }}{{ ' cal-adapted' if w.adapted else '' }}{{ ' cal-skipped' if w.skipped else '' }}{{ ' cal-missed' if w.missed else '' }}"
+                         {% if not w.standalone %}
                          data-workout-id="{{ w.id }}"
                          role="button" tabindex="0"
-                         title="{{ w.name }} — {{ (w.duration_s // 60) }} min, {{ w.tss }} TSS.{{ ' Completed.' if w.completed_activity_id else '' }}{{ ' Skipped (out of office).' if w.skipped else '' }}{{ ' Missed (not completed).' if w.missed else '' }}{{ ' Adapted (' ~ w.adapted ~ ').' if w.adapted else '' }} Click for power details.">
+                         {% endif %}
+                         title="{{ w.name }} — {{ (w.duration_s // 60) }} min, {{ w.tss }} TSS.{{ ' Completed.' if w.completed_activity_id else '' }}{{ ' Skipped (out of office).' if w.skipped else '' }}{{ ' Missed (not completed).' if w.missed else '' }}{{ ' Adapted (' ~ w.adapted ~ ').' if w.adapted else '' }}{{ '' if w.standalone else ' Click for power details.' }}">
                         {% if w.completed_activity_id %}<span class="cal-check" aria-label="completed">&#10003;</span> {% elif w.skipped %}<span class="cal-skip-mark" aria-label="skipped">&#8856;</span> {% elif w.missed %}<span class="cal-miss-mark" aria-label="missed">&#10007;</span> {% endif %}{% if w.adapted %}<span class="cal-adapt-mark" aria-label="adapted ({{ w.adapted }})">&#8635;</span> {% endif %}{{ w.name }}<span class="cal-type">{{ w.type }}</span>{% if w.rpe %}<span class="cal-rpe" title="Perceived exertion {{ w.rpe }}/10">RPE {{ w.rpe }}</span>{% endif %}
                     </div>
                 {% endfor %}

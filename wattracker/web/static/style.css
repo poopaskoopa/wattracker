@@ -233,6 +233,10 @@ table.calendar th { text-align: center; }
 .status-banner .status-adaptation { font-size: 0.85rem; margin-top: 0.25rem;
     color: var(--muted); }
 .status-banner .status-adaptation a { color: inherit; }
+.rpe-queue-item { display: flex; align-items: center; gap: 0.6rem;
+    flex-wrap: wrap; margin-top: 0.45rem; }
+.rpe-queue-item label { margin: 0; }
+.rpe-queue-item select { margin-left: 0.4rem; }
 .status-ok {
     background: rgba(76, 175, 125, 0.12); border-color: rgba(76, 175, 125, 0.55);
     color: #bfe8d2;

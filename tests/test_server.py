@@ -78,9 +78,22 @@ def test_authed_pages_and_api(client):
         r.json()
 
 
-def test_settings_shows_current_ftp(client):
+def test_settings_explains_training_and_recent_best_effort_ftp(client):
     _register(client)
-    assert "Current FTP" in client.get("/settings").text
+    uid = db.get_user_by_username("tester")["id"]
+    _seed_activity(uid, watts=300.0)
+    text = client.get("/settings").text
+    assert "Current Training FTP" in text
+    assert "90-day best-effort FTP estimate" in text
+    assert "285.0 W" in text
+    assert "drives workout targets" in text
+    assert "adjusts for" in text and "inactivity" in text
+    assert "External and zFTP estimates may differ" in text
+
+
+def test_dashboard_labels_training_ftp(client):
+    r = _register(client)
+    assert "Training FTP" in r.text
 
 
 def test_generate_submit(client):

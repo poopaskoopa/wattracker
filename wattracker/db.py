@@ -15,7 +15,7 @@ from typing import Dict, List, Optional
 
 from .config import db_path
 
-SCHEMA_VERSION = 14
+SCHEMA_VERSION = 15
 
 # In-place migrations: version N -> N+1 statement lists. A database whose
 # version has an unbroken chain here is upgraded without losing live data.
@@ -60,9 +60,19 @@ _MIGRATIONS: Dict[int, List[str]] = {
     13: [
         "ALTER TABLE race_results ADD COLUMN zp_event_id TEXT",
     ],
+    14: [
+        "ALTER TABLE plan_workouts ADD COLUMN compliance REAL",
+        "ALTER TABLE plan_workouts ADD COLUMN effective_ftp REAL",
+        "ALTER TABLE plan_workouts ADD COLUMN feedback_applied INTEGER NOT NULL DEFAULT 0",
+        "ALTER TABLE plan_workouts ADD COLUMN feedback_batch_id INTEGER",
+        # New standalone_workouts and ftp_feedback_batches tables are created
+        # by _SCHEMA after migrating.
+    ],
 }
 
 _DROP = """
+DROP TABLE IF EXISTS ftp_feedback_batches;
+DROP TABLE IF EXISTS standalone_workouts;
 DROP TABLE IF EXISTS scanned_files;
 DROP TABLE IF EXISTS ooto_ranges;
 DROP TABLE IF EXISTS race_sync;
@@ -151,11 +161,50 @@ CREATE TABLE IF NOT EXISTS plan_workouts (
     adapted_at        TEXT,
     rpe               INTEGER,
     variant           TEXT,
+    compliance        REAL,
+    effective_ftp     REAL,
+    feedback_applied  INTEGER NOT NULL DEFAULT 0,
+    feedback_batch_id INTEGER,
     FOREIGN KEY(plan_id) REFERENCES plans(id),
     FOREIGN KEY(user_id) REFERENCES users(id)
 );
 CREATE INDEX IF NOT EXISTS idx_plan_workouts_user_date
     ON plan_workouts(user_id, date);
+
+CREATE TABLE IF NOT EXISTS standalone_workouts (
+    id                    INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id               INTEGER NOT NULL,
+    export_key            TEXT NOT NULL,
+    scheduled_date        TEXT NOT NULL,
+    name                  TEXT NOT NULL,
+    type                  TEXT NOT NULL,
+    duration_s            INTEGER NOT NULL,
+    tss                   REAL NOT NULL,
+    zwo                   TEXT NOT NULL,
+    export_ftp            REAL NOT NULL,
+    completed_activity_id INTEGER,
+    completed_date        TEXT,
+    rpe                   INTEGER,
+    compliance            REAL,
+    effective_ftp         REAL,
+    feedback_applied      INTEGER NOT NULL DEFAULT 0,
+    feedback_batch_id     INTEGER,
+    created               TEXT NOT NULL,
+    UNIQUE(user_id, export_key),
+    FOREIGN KEY(user_id) REFERENCES users(id)
+);
+CREATE INDEX IF NOT EXISTS idx_standalone_user_date
+    ON standalone_workouts(user_id, scheduled_date);
+
+CREATE TABLE IF NOT EXISTS ftp_feedback_batches (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id    INTEGER NOT NULL,
+    ftp_date   TEXT NOT NULL,
+    delta      REAL NOT NULL,
+    applied    INTEGER NOT NULL DEFAULT 1,
+    created    TEXT NOT NULL,
+    FOREIGN KEY(user_id) REFERENCES users(id)
+);
 
 CREATE TABLE IF NOT EXISTS race_results (
     id           INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -895,6 +944,10 @@ def _plan_workout_row(r: sqlite3.Row, include_zwo: bool = False) -> dict:
         "adapted_at": r["adapted_at"],
         "rpe": r["rpe"],
         "variant": r["variant"],
+        "compliance": r["compliance"],
+        "effective_ftp": r["effective_ftp"],
+        "feedback_applied": bool(r["feedback_applied"]),
+        "feedback_batch_id": r["feedback_batch_id"],
     }
     if include_zwo:
         d["zwo_or_segments"] = r["zwo_or_segments"]
@@ -989,19 +1042,21 @@ def incomplete_plan_workouts_up_to(
             "AND completed_activity_id IS NULL ORDER BY date ASC",
             (user_id, date_iso),
         ).fetchall()
-        return [_plan_workout_row(r) for r in rows]
+        return [_plan_workout_row(r, include_zwo=True) for r in rows]
     finally:
         conn.close()
 
 
 def completed_activity_ids(user_id: int, path: Optional[str] = None) -> set:
-    """Activity ids already linked to a completed plan workout."""
+    """Activity ids already linked to any completed persisted workout."""
     conn = connect(path)
     try:
         rows = conn.execute(
             "SELECT completed_activity_id FROM plan_workouts "
+            "WHERE user_id = ? AND completed_activity_id IS NOT NULL "
+            "UNION SELECT completed_activity_id FROM standalone_workouts "
             "WHERE user_id = ? AND completed_activity_id IS NOT NULL",
-            (user_id,),
+            (user_id, user_id),
         ).fetchall()
         return {r[0] for r in rows}
     finally:
@@ -1013,14 +1068,18 @@ def mark_plan_workout_completed(
     workout_id: int,
     activity_id: int,
     completed_date: str,
+    compliance: Optional[float] = None,
+    effective_ftp: Optional[float] = None,
     path: Optional[str] = None,
 ) -> bool:
     conn = connect(path)
     try:
         cur = conn.execute(
-            "UPDATE plan_workouts SET completed_activity_id = ?, completed_date = ? "
+            "UPDATE plan_workouts SET completed_activity_id=?, completed_date=?, "
+            "compliance=?, effective_ftp=? "
             "WHERE user_id = ? AND id = ? AND completed_activity_id IS NULL",
-            (activity_id, completed_date, user_id, workout_id),
+            (activity_id, completed_date, compliance, effective_ftp,
+             user_id, workout_id),
         )
         conn.commit()
         return cur.rowcount > 0
@@ -1045,6 +1104,272 @@ def set_plan_workout_rpe(
         )
         conn.commit()
         return cur.rowcount > 0
+    finally:
+        conn.close()
+
+
+# ------------------------------------------------ standalone exported workouts
+def _standalone_row(row: sqlite3.Row, include_zwo: bool = False) -> dict:
+    out = {
+        "id": row["id"],
+        "scheduled_date": row["scheduled_date"],
+        "name": row["name"],
+        "type": row["type"],
+        "duration_s": row["duration_s"],
+        "tss": row["tss"],
+        "export_ftp": row["export_ftp"],
+        "completed_activity_id": row["completed_activity_id"],
+        "completed_date": row["completed_date"],
+        "rpe": row["rpe"],
+        "compliance": row["compliance"],
+        "effective_ftp": row["effective_ftp"],
+        "feedback_applied": bool(row["feedback_applied"]),
+        "feedback_batch_id": row["feedback_batch_id"],
+    }
+    if include_zwo:
+        out["zwo"] = row["zwo"]
+    return out
+
+
+def add_standalone_workout(
+    user_id: int, export_key: str, scheduled_date: str, name: str, type: str,
+    duration_s: int, tss: float, zwo: str, export_ftp: float,
+    path: Optional[str] = None,
+) -> int:
+    """Persist an exported one-off workout, idempotently by export_key."""
+    conn = connect(path)
+    try:
+        conn.execute(
+            "INSERT OR IGNORE INTO standalone_workouts "
+            "(user_id,export_key,scheduled_date,name,type,duration_s,tss,zwo,"
+            " export_ftp,created) VALUES (?,?,?,?,?,?,?,?,?,?)",
+            (user_id, export_key, scheduled_date, name, type, int(duration_s),
+             float(tss), zwo, float(export_ftp), _dt.datetime.now().isoformat()),
+        )
+        row = conn.execute(
+            "SELECT id FROM standalone_workouts WHERE user_id=? AND export_key=?",
+            (user_id, export_key),
+        ).fetchone()
+        conn.commit()
+        return int(row["id"])
+    finally:
+        conn.close()
+
+
+def standalone_workouts_on_date(
+    user_id: int, date_iso: str, path: Optional[str] = None,
+    include_zwo: bool = False,
+) -> List[dict]:
+    conn = connect(path)
+    try:
+        rows = conn.execute(
+            "SELECT * FROM standalone_workouts WHERE user_id=? AND scheduled_date=? "
+            "ORDER BY id", (user_id, date_iso),
+        ).fetchall()
+        return [_standalone_row(r, include_zwo) for r in rows]
+    finally:
+        conn.close()
+
+
+def incomplete_standalone_workouts_up_to(
+    user_id: int, date_iso: str, path: Optional[str] = None,
+) -> List[dict]:
+    conn = connect(path)
+    try:
+        rows = conn.execute(
+            "SELECT * FROM standalone_workouts WHERE user_id=? "
+            "AND scheduled_date<=? AND completed_activity_id IS NULL "
+            "ORDER BY scheduled_date,id", (user_id, date_iso),
+        ).fetchall()
+        return [_standalone_row(r, True) for r in rows]
+    finally:
+        conn.close()
+
+
+def mark_standalone_completed(
+    user_id: int, workout_id: int, activity_id: int, completed_date: str,
+    compliance: Optional[float], effective_ftp: Optional[float],
+    path: Optional[str] = None,
+) -> bool:
+    conn = connect(path)
+    try:
+        cur = conn.execute(
+            "UPDATE standalone_workouts SET completed_activity_id=?,completed_date=?,"
+            "compliance=?,effective_ftp=? WHERE user_id=? AND id=? "
+            "AND completed_activity_id IS NULL",
+            (activity_id, completed_date, compliance, effective_ftp,
+             user_id, workout_id),
+        )
+        conn.commit()
+        return cur.rowcount > 0
+    finally:
+        conn.close()
+
+
+def standalone_workouts_for_month(
+    user_id: int, year: int, month: int, path: Optional[str] = None,
+) -> List[dict]:
+    prefix = f"{int(year):04d}-{int(month):02d}"
+    conn = connect(path)
+    try:
+        rows = conn.execute(
+            "SELECT * FROM standalone_workouts WHERE user_id=? "
+            "AND scheduled_date LIKE ? ORDER BY scheduled_date,id",
+            (user_id, prefix + "%"),
+        ).fetchall()
+        return [_standalone_row(r) for r in rows]
+    finally:
+        conn.close()
+
+
+def pending_ratings(user_id: int, path: Optional[str] = None) -> List[dict]:
+    """Completed workouts that still require a perceived-effort rating."""
+    conn = connect(path)
+    try:
+        rows = conn.execute(
+            "SELECT 'plan' AS kind,id,date AS scheduled_date,name,type "
+            "FROM plan_workouts WHERE user_id=? AND completed_activity_id IS NOT NULL "
+            "AND rpe IS NULL UNION ALL "
+            "SELECT 'standalone',id,scheduled_date,name,type FROM standalone_workouts "
+            "WHERE user_id=? AND completed_activity_id IS NOT NULL AND rpe IS NULL "
+            "ORDER BY scheduled_date,id", (user_id, user_id),
+        ).fetchall()
+        return [dict(r) for r in rows]
+    finally:
+        conn.close()
+
+
+def set_standalone_rpe(
+    user_id: int, workout_id: int, rpe: int, path: Optional[str] = None,
+) -> bool:
+    conn = connect(path)
+    try:
+        cur = conn.execute(
+            "UPDATE standalone_workouts SET rpe=? WHERE user_id=? AND id=? "
+            "AND completed_activity_id IS NOT NULL",
+            (int(rpe), user_id, workout_id),
+        )
+        conn.commit()
+        return cur.rowcount > 0
+    finally:
+        conn.close()
+
+
+def get_standalone_workout(
+    user_id: int, workout_id: int, path: Optional[str] = None,
+) -> Optional[dict]:
+    conn = connect(path)
+    try:
+        row = conn.execute(
+            "SELECT * FROM standalone_workouts WHERE user_id=? AND id=?",
+            (user_id, workout_id),
+        ).fetchone()
+        return _standalone_row(row, True) if row else None
+    finally:
+        conn.close()
+
+
+def unused_feedback_evidence(
+    user_id: int, since_date: str, path: Optional[str] = None,
+) -> List[dict]:
+    conn = connect(path)
+    try:
+        rows = conn.execute(
+            "SELECT 'plan' AS kind,id,completed_date,type,rpe,compliance,effective_ftp "
+            "FROM plan_workouts WHERE user_id=? AND completed_date>=? "
+            "AND rpe IS NOT NULL AND feedback_batch_id IS NULL AND type IN "
+            "('threshold','sweet_spot','vo2max') AND compliance IS NOT NULL "
+            "AND effective_ftp IS NOT NULL UNION ALL "
+            "SELECT 'standalone',id,completed_date,type,rpe,compliance,effective_ftp "
+            "FROM standalone_workouts WHERE user_id=? AND completed_date>=? "
+            "AND rpe IS NOT NULL AND feedback_batch_id IS NULL AND type IN "
+            "('threshold','sweet_spot','vo2max') AND compliance IS NOT NULL "
+            "AND effective_ftp IS NOT NULL ORDER BY completed_date,id",
+            (user_id, since_date, user_id, since_date),
+        ).fetchall()
+        return [dict(r) for r in rows]
+    finally:
+        conn.close()
+
+
+def apply_feedback_batch(
+    user_id: int, ftp_date: str, updated_ftp: float, delta: float,
+    evidence: List[dict],
+    path: Optional[str] = None,
+) -> Optional[int]:
+    """Atomically adjust estimated FTP, record the batch, and consume evidence."""
+    conn = connect(path)
+    try:
+        updated = conn.execute(
+            "UPDATE ftp_history SET ftp_watts=? WHERE user_id=? AND date=? "
+            "AND source='estimated'",
+            (float(updated_ftp), user_id, ftp_date),
+        )
+        if updated.rowcount == 0:
+            conn.rollback()
+            return None
+        cur = conn.execute(
+            "INSERT INTO ftp_feedback_batches(user_id,ftp_date,delta,created) "
+            "VALUES (?,?,?,?)",
+            (user_id, ftp_date, float(delta), _dt.datetime.now().isoformat()),
+        )
+        batch_id = int(cur.lastrowid)
+        for kind in ("plan", "standalone"):
+            ids = [int(e["id"]) for e in evidence if e["kind"] == kind]
+            if not ids:
+                continue
+            table = "plan_workouts" if kind == "plan" else "standalone_workouts"
+            marks = ",".join("?" for _ in ids)
+            conn.execute(
+                f"UPDATE {table} SET feedback_applied=1,feedback_batch_id=? "
+                f"WHERE user_id=? AND id IN ({marks})",
+                (batch_id, user_id, *ids),
+            )
+        conn.commit()
+        return batch_id
+    finally:
+        conn.close()
+
+
+def rollback_feedback_for_workout(
+    user_id: int, kind: str, workout_id: int, path: Optional[str] = None,
+) -> bool:
+    """Undo the active batch containing a workout and release its evidence."""
+    table = "plan_workouts" if kind == "plan" else "standalone_workouts"
+    conn = connect(path)
+    try:
+        row = conn.execute(
+            f"SELECT feedback_batch_id FROM {table} WHERE user_id=? AND id=?",
+            (user_id, workout_id),
+        ).fetchone()
+        batch_id = row["feedback_batch_id"] if row else None
+        if batch_id is None:
+            return False
+        batch = conn.execute(
+            "SELECT * FROM ftp_feedback_batches WHERE id=? AND user_id=? AND applied=1",
+            (batch_id, user_id),
+        ).fetchone()
+        if not batch:
+            return False
+        # The batch points at the exact estimated row it changed. Reversing
+        # that row is safe even when a newer manual row/override now exists;
+        # the source predicate guarantees manual FTP is never touched.
+        conn.execute(
+            "UPDATE ftp_history SET ftp_watts=ftp_watts-? "
+            "WHERE user_id=? AND date=? AND source='estimated'",
+            (batch["delta"], user_id, batch["ftp_date"]),
+        )
+        conn.execute(
+            "UPDATE ftp_feedback_batches SET applied=0 WHERE id=? AND user_id=?",
+            (batch_id, user_id),
+        )
+        for evidence_table in ("plan_workouts", "standalone_workouts"):
+            conn.execute(
+                f"UPDATE {evidence_table} SET feedback_applied=0,feedback_batch_id=NULL "
+                "WHERE user_id=? AND feedback_batch_id=?", (user_id, batch_id),
+            )
+        conn.commit()
+        return True
     finally:
         conn.close()
 

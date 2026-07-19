@@ -4,6 +4,7 @@ from __future__ import annotations
 import asyncio
 import calendar as _cal
 import datetime as _dt
+import hashlib
 import io
 import logging
 import os
@@ -232,6 +233,9 @@ def _username(request: Request) -> Optional[str]:
 def _ctx(request: Request, **kw) -> dict:
     kw["request"] = request
     kw.setdefault("username", _username(request))
+    uid = _uid(request)
+    if uid is not None:
+        kw.setdefault("pending_ratings", db.pending_ratings(uid))
     return kw
 
 
@@ -495,6 +499,7 @@ def create_app() -> FastAPI:
             day_labels=DAY_LABELS,
             exported=None,
             exported_path=None,
+            scheduled_date=_dt.date.today().isoformat(),
             flash=None,
             plan_mgmt=_plan_management(_uid(request)),
         )
@@ -580,7 +585,14 @@ def create_app() -> FastAPI:
             session = llm.shape_session(session, state)
             session.compute_tss()
             zwo_str = zwo.zwo_string(session)
-            app.state.last[uid] = (zwo_str, session.name)
+            app.state.last[uid] = {
+                "zwo": zwo_str,
+                "name": session.name,
+                "type": session.workout_type,
+                "duration_s": session.total_duration(),
+                "tss": session.estimated_tss,
+                "export_ftp": float(state.ftp),
+            }
             session_dict = session.to_dict()
             session_dict["zwo"] = zwo_str
         except ValueError as e:
@@ -809,6 +821,19 @@ def create_app() -> FastAPI:
                 and not wd["skipped"]
             )
             by_date.setdefault(w["date"], []).append(wd)
+        for w in db.standalone_workouts_for_month(uid, y, m):
+            wd = dict(w)
+            wd.update({
+                "date": w["scheduled_date"],
+                "standalone": True,
+                "adapted": None,
+                "skipped": False,
+                "missed": (
+                    w["scheduled_date"] < today_iso
+                    and not w.get("completed_activity_id")
+                ),
+            })
+            by_date.setdefault(w["scheduled_date"], []).append(wd)
 
         cal = _cal.Calendar(firstweekday=0)  # Monday
         weeks = []
@@ -846,6 +871,23 @@ def create_app() -> FastAPI:
                 export_result=request.query_params.get("exported"),
             ),
         )
+
+    @app.post("/ratings/{kind}/{workout_id}")
+    def save_rating(
+        request: Request,
+        kind: str,
+        workout_id: int,
+        rpe: int = Form(...),
+        next_path: str = Form("/"),
+    ):
+        uid = _uid(request)
+        if rpe < 1 or rpe > 10:
+            return JSONResponse({"error": "rpe must be between 1 and 10"}, status_code=400)
+        ok = importer.save_workout_rpe(uid, kind, workout_id, rpe)
+        if not ok:
+            return JSONResponse({"error": "workout not found or incomplete"}, status_code=404)
+        target = next_path if next_path in ("/", "/calendar") else "/"
+        return RedirectResponse(target, status_code=303)
 
     @app.post("/plan/export-all")
     def plan_export_all(request: Request):
@@ -890,23 +932,37 @@ def create_app() -> FastAPI:
         return RedirectResponse(url="/calendar", status_code=303)
 
     @app.post("/generate/export")
-    def generate_export(request: Request):
+    def generate_export(request: Request, scheduled_date: str = Form("")):
         uid = _uid(request)
         last = app.state.last.get(uid)
         if not last:
             return RedirectResponse(url="/plan", status_code=303)
-        zwo_str, name = last
+        try:
+            scheduled = _dt.date.fromisoformat(scheduled_date).isoformat()
+        except (TypeError, ValueError):
+            return templates.TemplateResponse(
+                request, "plan.html",
+                _generate_ctx(request, mode="workout", error="Choose a valid scheduled date."),
+                status_code=400,
+            )
         settings = db.get_user_settings(uid)
-        path = zwo.write_to_zwift(
-            zwo_str,
+        result = zwo.write_plan_to_zwift(
+            [{"date": scheduled, "name": last["name"], "zwo": last["zwo"]}],
             settings.get("zwift_id") or "me",
-            name=name or "wattracker_Workout",
             workouts_override=settings.get("workouts_dir"),
         )
+        export_key = hashlib.sha256(
+            f"{scheduled}\0{last['name']}\0{last['zwo']}".encode("utf-8")
+        ).hexdigest()
+        db.add_standalone_workout(
+            uid, export_key, scheduled, last["name"], last["type"],
+            last["duration_s"], last["tss"], last["zwo"], last["export_ftp"],
+        )
+        importer.match_plan_completions(uid)
         return templates.TemplateResponse(
             request,
             "plan.html",
-            _generate_ctx(request, mode="workout", exported_path=path),
+            _generate_ctx(request, mode="workout", exported_path=result["paths"][0]),
         )
 
     @app.get("/generate/download")
@@ -914,10 +970,9 @@ def create_app() -> FastAPI:
         last = app.state.last.get(_uid(request))
         if not last:
             return RedirectResponse(url="/plan", status_code=303)
-        zwo_str, name = last
-        fname = (name or "workout").replace(" ", "_")
+        fname = (last["name"] or "workout").replace(" ", "_")
         return Response(
-            content=zwo_str,
+            content=last["zwo"],
             media_type="application/xml",
             headers={"Content-Disposition": f'attachment; filename="{fname}.zwo"'},
         )
@@ -929,6 +984,7 @@ def create_app() -> FastAPI:
             request,
             settings=settings,
             current_ftp=round(importer.current_ftp(uid), 1),
+            recent_best_effort_ftp=round(importer.recent_best_effort_ftp(uid), 1),
             api_key_set=config.anthropic_api_key_set(),
             saved=saved,
             zwift_candidates=paths.candidate_zwift_ids(),
@@ -1335,7 +1391,22 @@ def create_app() -> FastAPI:
             return JSONResponse(
                 {"error": "only completed workouts can be graded"}, status_code=400
             )
-        db.set_plan_workout_rpe(uid, workout_id, rpe_val)
+        importer.save_workout_rpe(uid, "plan", workout_id, rpe_val)
+        return JSONResponse({"id": workout_id, "rpe": rpe_val})
+
+    @app.post("/api/standalone-workout/{workout_id}/rpe")
+    def api_standalone_rpe(
+        request: Request, workout_id: int, rpe: int = Body(..., embed=True)
+    ):
+        uid = _uid(request)
+        try:
+            rpe_val = int(rpe)
+        except (TypeError, ValueError):
+            return JSONResponse({"error": "rpe must be an integer"}, status_code=400)
+        if rpe_val < 1 or rpe_val > 10:
+            return JSONResponse({"error": "rpe must be between 1 and 10"}, status_code=400)
+        if not importer.save_workout_rpe(uid, "standalone", workout_id, rpe_val):
+            return JSONResponse({"error": "workout not found or incomplete"}, status_code=404)
         return JSONResponse({"id": workout_id, "rpe": rpe_val})
 
     @app.get("/api/state")

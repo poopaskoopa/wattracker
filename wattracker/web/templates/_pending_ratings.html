@@ -1,0 +1,20 @@
+{% if pending_ratings %}
+<section class="status-banner status-warn pending-ratings" aria-labelledby="pendingRatingsTitle">
+    <span class="status-body">
+        <strong class="status-headline" id="pendingRatingsTitle">Rate completed workouts</strong>
+        <span class="status-detail">How hard did each session feel? 1 = easiest, 10 = all-out.</span>
+        {% for item in pending_ratings %}
+        <form method="post" action="/ratings/{{ item.kind }}/{{ item.id }}" class="rpe-queue-item">
+            <input type="hidden" name="next_path" value="{{ rating_next }}">
+            <label>{{ item.scheduled_date }} &middot; {{ item.name }}
+                <select name="rpe" aria-label="RPE for {{ item.name }}" required>
+                    <option value="">RPE</option>
+                    {% for score in range(1, 11) %}<option value="{{ score }}">{{ score }}</option>{% endfor %}
+                </select>
+            </label>
+            <button type="submit">Save rating</button>
+        </form>
+        {% endfor %}
+    </span>
+</section>
+{% endif %}
