@@ -4,13 +4,20 @@ from __future__ import annotations
 import datetime as _dt
 from typing import Dict, List, Optional, Tuple
 
+import bisect
+
 from .. import db
 from ..timeutil import parse_naive
 from ..ingest.importer import current_ftp
-from ..metrics.power import best_20min_power, detraining_factor, _idle_active_days
+from ..metrics.power import (
+    detraining_factor,
+    FTP_DECAY_GRACE_DAYS,
+    FTP_DECAY_TAU_IDLE,
+    FTP_DECAY_TAU_ACTIVE,
+)
 from ..metrics.curve import MMP_DURATIONS, fit_cp_wprime, mean_maximal_power
-from ..metrics.decoupling import aerobic_decoupling
 from ..metrics.load import compute_load, daily_tss_series
+from . import activity_cache
 from .detect import evaluate
 from .state import TrainingState
 
@@ -45,8 +52,6 @@ def build_state(user_id: int) -> TrainingState:
     db.init_db()
     ftp = current_ftp(user_id)
 
-    activities = db.full_activities(user_id)
-
     # Load / CTL-ATL-TSB
     load = compute_load(daily_tss_series(db.daily_tss(user_id)))
     ctl = load[-1]["ctl"] if load else 0.0
@@ -58,25 +63,20 @@ def build_state(user_id: int) -> TrainingState:
     mmp = mean_maximal_power(streams_90) if streams_90 else {}
     cp, wprime = _safe_cp(mmp) if len(mmp) >= 2 else (None, None)
 
-    # Prior/recent 4-week windows for plateau detection
-    recent_streams = _window_power(activities, 0, 28)
-    prior_streams = _window_power(activities, 28, 56)
+    # Prior/recent 4-week windows for plateau detection. Only the trailing ~8
+    # weeks are needed, so decompress just those activities (not all history).
+    recent_activities = db.recent_full_activities(user_id, days=57)
+    recent_streams = _window_power(recent_activities, 0, 28)
+    prior_streams = _window_power(recent_activities, 28, 56)
     mmp_recent = mean_maximal_power(recent_streams) if recent_streams else {}
     mmp_prior = mean_maximal_power(prior_streams) if prior_streams else {}
     cp_prior, wprime_prior = (
         _safe_cp(mmp_prior) if len(mmp_prior) >= 2 else (None, None)
     )
 
-    # Aerobic decoupling from the most recent long steady effort (>45min)
-    decoupling: Optional[float] = None
-    for a in reversed(activities):
-        streams = a.get("streams") or {}
-        power = streams.get("power") or []
-        hr = streams.get("heartrate") or []
-        d = aerobic_decoupling(power, hr)
-        if d is not None:
-            decoupling = d
-            break
+    # Aerobic decoupling from the most recent long steady effort (>45min).
+    # Cached (activity-static): avoids inflating every stream per request.
+    decoupling = activity_cache.get_digest(user_id).decoupling
 
     state = TrainingState(
         ftp=ftp,
@@ -154,53 +154,84 @@ def ftp_rolling_series(
 
     Returns {"estimated": [{date, ftp}], "recorded": [{date, ftp, source}]}.
     """
-    activities = db.full_activities(user_id)
-    # Precompute (when, best20) once per activity, plus the full activity
-    # calendar (every dated ride, even power-less ones, counts for the gaps).
-    dated: List[Tuple[_dt.datetime, float]] = []
-    activity_days: List[_dt.datetime] = []
-    for a in activities:
-        when = parse_naive(a.get("start_time"))
-        if when is None:
-            continue
-        activity_days.append(when)
-        power = (a.get("streams") or {}).get("power") or []
-        if not power:
-            continue
-        b20 = best_20min_power(power)
-        if b20 > 0:
-            dated.append((when, b20))
-    activity_days.sort()
+    # (when, best20) per effort + the full activity calendar (every dated ride,
+    # even power-less ones, counts for the gaps) come from the cached digest, so
+    # the ~850 stream BLOBs are inflated at most once per import, not per request.
+    digest = activity_cache.get_digest(user_id)
+    activity_days = digest.activity_days
+    effort_days = digest.effort_days
+    effort_b20 = digest.effort_b20
+    effort_i = digest.effort_i
+    prefix = digest.prefix
 
     recorded = _filter_by_months(db.ftp_history_list(user_id), months, now)
-    if not dated:
+    if not effort_days:
         return {"estimated": [], "recorded": recorded}
 
-    start = min(d for d, _ in dated)
-    last = max(d for d, _ in dated)
+    start = effort_days[0]
+    last = effort_days[-1]
     end = now if (now is not None and now > last) else last
 
     step = _dt.timedelta(days=step_days)
 
-    def _estimate_at(dt: _dt.datetime) -> Optional[float]:
+    g = FTP_DECAY_GRACE_DAYS
+
+    def _estimate_at(anchor: _dt.datetime) -> Optional[float]:
+        # idle/active for each (effort, anchor) pair via the prefix-sum identity
+        # (verified equivalent to metrics.power._idle_active_days): the interior
+        # gaps between the effort and anchor are P[j]-P[i]; the two boundary
+        # gaps are handled explicitly. O(1) per effort instead of rescanning the
+        # calendar, so the whole series is O(samples x efforts).
+        j = bisect.bisect_right(activity_days, anchor) - 1
+        if j < 0:
+            return None
+        p_j = prefix[j]
+        trail = (anchor - activity_days[j]).total_seconds() / 86400.0
+        trail_idle = trail - g if trail > g else 0.0
         best = 0.0
-        for when, b20 in dated:
-            if when > dt:
-                continue
-            idle, active = _idle_active_days(when, dt, activity_days)
-            weighted = b20 * detraining_factor(idle, active)
+        for k in range(len(effort_days)):
+            when = effort_days[k]
+            if when > anchor:
+                break
+            span = (anchor - when).total_seconds() / 86400.0
+            if span <= 0:
+                idle = 0.0
+                active = 0.0
+            else:
+                i = effort_i[k]
+                if i > j:
+                    idle = span - g if span > g else 0.0
+                else:
+                    g1 = (activity_days[i] - when).total_seconds() / 86400.0
+                    idle = (g1 - g if g1 > g else 0.0) + (p_j - prefix[i]) + trail_idle
+                active = span - idle
+                if active < 0.0:
+                    active = 0.0
+            weighted = effort_b20[k] * detraining_factor(idle, active)
             if weighted > best:
                 best = weighted
         if best <= 0:
             return None
         return best * 0.95
 
+    # Only samples inside the requested trailing window survive _filter_by_months,
+    # so skip evaluating the (expensive) estimate for samples outside it. The
+    # grid itself is still anchored to ``start`` (identical sample dates).
+    if months and float(months) > 0:
+        _now = now or _dt.datetime.now()
+        cutoff = _now - _dt.timedelta(days=int(round(float(months) * _DAYS_PER_MONTH)))
+    else:
+        cutoff = None
+
     est_points: List[dict] = []
     cur = start
     while cur <= end:
-        est = _estimate_at(cur)
-        if est is not None:
-            est_points.append({"date": cur.date().isoformat(), "ftp": round(est, 1)})
+        if cutoff is None or _dt.datetime.combine(cur.date(), _dt.time()) >= cutoff:
+            est = _estimate_at(cur)
+            if est is not None:
+                est_points.append(
+                    {"date": cur.date().isoformat(), "ftp": round(est, 1)}
+                )
         cur += step
 
     # Always include a final sample exactly at the end date.

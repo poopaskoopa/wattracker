@@ -673,6 +673,34 @@ def full_activities(user_id: int, path: Optional[str] = None) -> List[dict]:
         conn.close()
 
 
+def recent_full_activities(
+    user_id: int, days: int, path: Optional[str] = None
+) -> List[dict]:
+    """``full_activities`` restricted to the trailing ``days`` (streams inflated).
+
+    Only recent activities are decompressed, so callers that need short trailing
+    windows (e.g. plateau detection over the last few weeks) avoid inflating the
+    user's entire stream history. Ordered by start_time ascending, like
+    ``full_activities``.
+    """
+    cutoff = (_dt.datetime.now() - _dt.timedelta(days=days)).isoformat()
+    conn = connect(path)
+    try:
+        rows = conn.execute(
+            "SELECT * FROM activities "
+            "WHERE user_id = ? AND start_time >= ? ORDER BY start_time",
+            (user_id, cutoff),
+        ).fetchall()
+        out = []
+        for r in rows:
+            d = _row_summary(r)
+            d["streams"] = _unpack_streams(r["streams"])
+            out.append(d)
+        return out
+    finally:
+        conn.close()
+
+
 # ----------------------------------------------------------- ftp history
 def add_ftp_entry(
     user_id: int,
