@@ -7,6 +7,19 @@
 
 <p id="volumeEmpty" class="hint" style="display:none">No training data yet — import or upload activities to see your weekly volume.</p>
 
+<section id="volumeControls" class="chart-block" style="display:none">
+    <div class="range-controls">
+        <button type="button" class="range-btn" data-preset="1m">1m</button>
+        <button type="button" class="range-btn" data-preset="1y">1y</button>
+        <button type="button" class="range-btn active" data-preset="all">All</button>
+        <label class="custom-range">From <input type="date" id="volFrom"></label>
+        <label class="custom-range">To <input type="date" id="volTo"></label>
+        <button type="button" id="volApply">Apply</button>
+        <button type="button" id="volResetZoom">Reset zoom</button>
+    </div>
+    <p class="hint">Tip: drag horizontally across any chart to zoom all four into that date range.</p>
+</section>
+
 <section class="chart-block">
     <div class="chart-head"><h3>Hours per week</h3></div>
     <canvas id="hoursChart" height="90"></canvas>
