@@ -1,0 +1,34 @@
+{% extends "base.html" %}
+{% block title %}Volume &mdash; wattracker{% endblock %}
+{% block content %}
+<h2>Training Volume</h2>
+
+<section id="volumeSummary" class="cards" style="display:none"></section>
+
+<p id="volumeEmpty" class="hint" style="display:none">No training data yet — import or upload activities to see your weekly volume.</p>
+
+<section class="chart-block">
+    <div class="chart-head"><h3>Hours per week</h3></div>
+    <canvas id="hoursChart" height="90"></canvas>
+</section>
+
+<section class="chart-block">
+    <div class="chart-head"><h3>TSS per week</h3></div>
+    <canvas id="tssChart" height="90"></canvas>
+</section>
+
+<section class="chart-block">
+    <div class="chart-head"><h3>Distance per week (km)</h3></div>
+    <canvas id="distanceChart" height="90"></canvas>
+</section>
+
+<section class="chart-block">
+    <div class="chart-head"><h3>Calories per week (kcal)</h3></div>
+    <canvas id="caloriesChart" height="90"></canvas>
+</section>
+{% endblock %}
+
+{% block scripts %}
+<script src="{{ static_url('volume.js') }}"></script>
+<script>renderVolume();</script>
+{% endblock %}

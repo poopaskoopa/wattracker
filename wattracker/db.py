@@ -610,6 +610,52 @@ def daily_tss(user_id: int, path: Optional[str] = None) -> Dict[_dt.date, float]
         conn.close()
 
 
+def weekly_volume(user_id: int, path: Optional[str] = None) -> List[dict]:
+    """Per-week training volume for a user, ordered by week ascending.
+
+    Each dict is one Monday-started week (only weeks with at least one activity
+    appear here; JS fills any gaps with zeros):
+      - week_start: ISO date of that week's Monday
+      - hours:       sum of duration_s / 3600
+      - tss:         sum of tss (NULLs counted as 0)
+      - distance_km: sum of distance_m / 1000 (NULLs counted as 0)
+      - calories:    sum of avg_power * duration_s / 1000 over activities that
+                     have avg_power (kJ ~= kcal for cycling); rows with a NULL
+                     avg_power contribute nothing to calories.
+    Rows with a NULL start_time are skipped (no week to bucket them into).
+    """
+    conn = connect(path)
+    try:
+        rows = conn.execute(
+            """
+            SELECT date(start_time, 'weekday 0', '-6 days') AS week_start,
+                   SUM(COALESCE(duration_s, 0)) / 3600.0        AS hours,
+                   SUM(COALESCE(tss, 0))                        AS tss,
+                   SUM(COALESCE(distance_m, 0)) / 1000.0        AS distance_km,
+                   SUM(CASE WHEN avg_power IS NOT NULL
+                            THEN avg_power * COALESCE(duration_s, 0) / 1000.0
+                            ELSE 0 END)                          AS calories
+            FROM activities
+            WHERE user_id = ? AND start_time IS NOT NULL
+            GROUP BY week_start
+            ORDER BY week_start ASC
+            """,
+            (user_id,),
+        ).fetchall()
+        return [
+            {
+                "week_start": r["week_start"],
+                "hours": round(float(r["hours"] or 0.0), 2),
+                "tss": round(float(r["tss"] or 0.0), 1),
+                "distance_km": round(float(r["distance_km"] or 0.0), 1),
+                "calories": round(float(r["calories"] or 0.0)),
+            }
+            for r in rows
+        ]
+    finally:
+        conn.close()
+
+
 def full_activities(user_id: int, path: Optional[str] = None) -> List[dict]:
     conn = connect(path)
     try:

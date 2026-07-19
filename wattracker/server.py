@@ -766,6 +766,14 @@ def create_app() -> FastAPI:
             url="/plan?flash=" + _url.quote(flash), status_code=303
         )
 
+    @app.get("/volume", response_class=HTMLResponse)
+    def volume_page(request: Request):
+        return templates.TemplateResponse(request, "volume.html", _ctx(request))
+
+    @app.get("/api/volume")
+    def api_volume(request: Request):
+        return JSONResponse({"weeks": db.weekly_volume(_uid(request))})
+
     @app.get("/calendar", response_class=HTMLResponse)
     def calendar_view(
         request: Request,
