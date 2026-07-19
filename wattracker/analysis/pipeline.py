@@ -7,7 +7,7 @@ from typing import Dict, List, Optional, Tuple
 from .. import db
 from ..timeutil import parse_naive
 from ..ingest.importer import current_ftp
-from ..metrics.power import best_20min_power, detraining_factor
+from ..metrics.power import best_20min_power, detraining_factor, _idle_active_days
 from ..metrics.curve import MMP_DURATIONS, fit_cp_wprime, mean_maximal_power
 from ..metrics.decoupling import aerobic_decoupling
 from ..metrics.load import compute_load, daily_tss_series
@@ -141,28 +141,36 @@ def ftp_rolling_series(
     """Rolling estimated-FTP time series plus recorded FTP-history points.
 
     The estimate at each sampled date is ``0.95 * max(best20 *
-    detraining_factor(sample - effort date))`` over every activity ridden on or
-    before that date. Older efforts fade smoothly via the detraining decay, so
-    the series shows honest decline through a training break instead of gaps or
-    cliffs. Sampled every ``step_days`` from the first activity to the last (or
-    ``now``).
+    detraining_factor(...))`` over every effort ridden on or before that date,
+    where the factor uses the gap-aware detraining model (decay accrues only
+    during inactivity, measured against the activity calendar up to the sample
+    date - trailing gap = sample minus the last ride before it). The series
+    therefore declines through a training break and holds steady while the rider
+    keeps training, without gaps or cliffs. Sampled every ``step_days`` from the
+    first activity to the last (or ``now``).
 
-    ``window_days`` is deprecated and ignored (the smooth decay replaces the old
+    ``window_days`` is deprecated and ignored (the decay model replaces the old
     hard trailing window); kept for call-site compatibility.
 
     Returns {"estimated": [{date, ftp}], "recorded": [{date, ftp, source}]}.
     """
     activities = db.full_activities(user_id)
-    # Precompute (when, best20) once per activity, then reuse across all samples.
+    # Precompute (when, best20) once per activity, plus the full activity
+    # calendar (every dated ride, even power-less ones, counts for the gaps).
     dated: List[Tuple[_dt.datetime, float]] = []
+    activity_days: List[_dt.datetime] = []
     for a in activities:
         when = parse_naive(a.get("start_time"))
+        if when is None:
+            continue
+        activity_days.append(when)
         power = (a.get("streams") or {}).get("power") or []
-        if when is None or not power:
+        if not power:
             continue
         b20 = best_20min_power(power)
         if b20 > 0:
             dated.append((when, b20))
+    activity_days.sort()
 
     recorded = _filter_by_months(db.ftp_history_list(user_id), months, now)
     if not dated:
@@ -179,8 +187,8 @@ def ftp_rolling_series(
         for when, b20 in dated:
             if when > dt:
                 continue
-            days = (dt - when).total_seconds() / 86400.0
-            weighted = b20 * detraining_factor(days)
+            idle, active = _idle_active_days(when, dt, activity_days)
+            weighted = b20 * detraining_factor(idle, active)
             if weighted > best:
                 best = weighted
         if best <= 0:

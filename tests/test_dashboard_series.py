@@ -63,11 +63,12 @@ def test_rolling_ftp_varies_and_decays_through_gap(user_id):
     assert result["recorded"] == []  # no manual/monthly rows
     # First sample sees the fresh 300W effort -> 285.
     assert values[0] == pytest.approx(285.0, abs=0.5)
-    # Semantics changed: no hard window/cliff. Through the 60-day gap the 300W
-    # effort decays smoothly (no None gaps), so the minimum is BELOW 285 rather
-    # than pinned at it. day56 sample: 300 * factor(56) * 0.95 ~= 235.
+    # Semantics changed: no hard window/cliff. Through the 60-day gap (all of it
+    # idle, since there are no rides between the two efforts) the 300W effort
+    # decays smoothly with no None gaps, so the minimum is BELOW 285 rather than
+    # pinned at it. Last pre-jump sample (day56): ~237.
     assert min(values) < 285.0
-    assert min(values) == pytest.approx(235.3, abs=1.0)
+    assert min(values) == pytest.approx(236.9, abs=1.5)
     # The samples strictly decay until the stronger effort lands at the end.
     gap_vals = values[:-1]
     assert all(b <= a + 1e-6 for a, b in zip(gap_vals, gap_vals[1:]))

@@ -10,27 +10,70 @@ from typing import Iterable, Sequence
 import numpy as np
 
 
-# --- Detraining decay model for the FTP estimate ------------------------------
+# --- Gap-aware detraining decay model for the FTP estimate --------------------
 # The FTP estimate weights each past effort by how much fitness is expected to
-# have decayed since it was ridden. Efforts inside a short grace window count in
-# full; after that, the weight decays exponentially with an e-folding time of
-# FTP_DECAY_TAU_DAYS. This replaces the old hard trailing window, which cliffed
-# every pre-break effort to zero the moment the anchor moved past it and made
-# the estimate collapse after a training layoff.
-FTP_DECAY_GRACE_DAYS = 10   # no detraining penalty inside this many days
-FTP_DECAY_TAU_DAYS = 240    # e-folding time of detraining after the grace period
+# have decayed SINCE it was ridden - but detraining accrues only while the rider
+# is OFF the bike, not merely because an effort is old. So the interval from an
+# effort to the evaluation anchor is split, using the rider's activity calendar,
+# into:
+#   * idle-excess days: the portion of each inactivity gap beyond a short grace
+#     window (short breaks cost nothing - research shows minimal loss under ~2
+#     weeks). This includes the trailing gap from the last ride up to the anchor,
+#     so the estimate keeps decaying while a rider stays away.
+#   * active days: everything else (days the rider was training, or inside a
+#     grace window). These decay very slowly - a mild staleness term that keeps a
+#     year of easy-only riding from pegging FTP to one ancient hard effort.
+# factor = exp(-idle_excess / TAU_IDLE  -  active_days / TAU_ACTIVE)
+# This replaces the old trailing hard window (which cliffed pre-break efforts to
+# zero) and the effort-age decay (which wrongly charged detraining for days the
+# rider was actually training).
+FTP_DECAY_GRACE_DAYS = 14      # inactivity gaps shorter than this cost nothing
+FTP_DECAY_TAU_IDLE = 240       # e-folding time of detraining while off the bike
+FTP_DECAY_TAU_ACTIVE = 1440    # slow staleness of an old effort while still training
 
 
-def detraining_factor(days_since: float) -> float:
-    """Fraction of a past effort's power still assumed available after a layoff.
+def _idle_active_days(effort, anchor, activity_days) -> "tuple[float, float]":
+    """Split the interval [effort, anchor] into (idle_excess_days, active_days).
 
-    1.0 for efforts within FTP_DECAY_GRACE_DAYS, then a smooth exponential decay
-    (tau = FTP_DECAY_TAU_DAYS) afterwards. Roughly 0.875 at 42 days, i.e. a
-    ~12% loss after a six-week break, in line with detraining physiology.
+    ``activity_days`` is the sorted list of the user's activity timestamps (any
+    ride counts, even with no/zero power - time on the bike maintains fitness).
+    Consecutive gaps between activity days in (effort, anchor], plus the trailing
+    gap from the last such activity up to ``anchor``, each contribute
+    ``max(0, gap_days - FTP_DECAY_GRACE_DAYS)`` to the idle excess. Active days
+    are the remainder of the span.
     """
-    if days_since <= FTP_DECAY_GRACE_DAYS:
-        return 1.0
-    return math.exp(-(days_since - FTP_DECAY_GRACE_DAYS) / FTP_DECAY_TAU_DAYS)
+    span = (anchor - effort).total_seconds() / 86400.0
+    if span <= 0:
+        return 0.0, 0.0
+    boundaries = [effort]
+    for d in activity_days:
+        if effort < d <= anchor:
+            boundaries.append(d)
+    boundaries.append(anchor)
+    idle_excess = 0.0
+    for a, b in zip(boundaries, boundaries[1:]):
+        gap = (b - a).total_seconds() / 86400.0
+        if gap > FTP_DECAY_GRACE_DAYS:
+            idle_excess += gap - FTP_DECAY_GRACE_DAYS
+    active = span - idle_excess
+    if active < 0.0:
+        active = 0.0
+    return idle_excess, active
+
+
+def detraining_factor(idle_excess_days: float, active_days: float) -> float:
+    """Fraction of a past effort's power still assumed available now.
+
+    Decay tracks INACTIVITY, not effort age: ``idle_excess_days`` (inactivity
+    beyond the grace window) decays fast (tau = FTP_DECAY_TAU_IDLE), while
+    ``active_days`` (days spent training, or inside a grace window) decay slowly
+    (tau = FTP_DECAY_TAU_ACTIVE). See ``_idle_active_days`` for how the split is
+    derived from the activity calendar. A continuously-training rider barely
+    decays; a long layoff decays substantially.
+    """
+    return math.exp(
+        -idle_excess_days / FTP_DECAY_TAU_IDLE - active_days / FTP_DECAY_TAU_ACTIVE
+    )
 
 
 def _clean_power(power: Iterable[float]) -> np.ndarray:
@@ -111,26 +154,33 @@ def best_20min_power(power: Sequence[float]) -> float:
     return float(roll.max())
 
 
-def _activity_power_streams(activities: Iterable) -> "list[tuple[object, Sequence[float]]]":
-    """Extract (when, per-second power stream) pairs from a mixed iterable.
+def _split_activities(activities: Iterable):
+    """Split a mixed activity iterable into efforts and the activity calendar.
 
-    Each item may be:
-      - a raw power stream (list/sequence of numbers) -> ``when`` is None, or
-      - an activity dict with a "streams" mapping and optional "start_time" ->
-        ``when`` is the parsed naive datetime (or None if unparseable).
+    Returns ``(efforts, activity_days)`` where:
+      - ``efforts`` is a list of ``(when, power_stream)`` for items that carry
+        power (``when`` is the parsed naive datetime, or None for raw streams /
+        undated dicts).
+      - ``activity_days`` is the sorted list of every dated activity's timestamp
+        - including power-less rides, which still count as time on the bike for
+        the detraining-gap calendar.
     """
     from ..timeutil import parse_naive
 
-    out: "list[tuple[object, Sequence[float]]]" = []
+    efforts: "list[tuple[object, Sequence[float]]]" = []
+    activity_days: list = []
     for item in activities:
         if isinstance(item, dict):
+            when = parse_naive(item.get("start_time"))
+            if when is not None:
+                activity_days.append(when)
             power = (item.get("streams") or {}).get("power") or item.get("power")
-            if not power:
-                continue
-            out.append((parse_naive(item.get("start_time")), power))
+            if power:
+                efforts.append((when, power))
         else:
-            out.append((None, item))
-    return out
+            efforts.append((None, item))
+    activity_days.sort()
+    return efforts, activity_days
 
 
 def estimate_ftp(
@@ -141,34 +191,37 @@ def estimate_ftp(
 ) -> float:
     """Estimate FTP as best (detraining-weighted) 20-min power * 0.95.
 
-    Each activity contributes ``best_20min_power * detraining_factor(days since
-    the effort)``; the estimate is 0.95 * the maximum of those weighted values.
-    A recent hard effort therefore dominates, while older efforts fade smoothly
-    rather than dropping off a cliff - so the estimate decays honestly through a
-    training break instead of collapsing.
+    Each dated effort contributes ``best_20min_power * detraining_factor(...)``
+    where the factor is derived from the rider's activity calendar between the
+    effort and ``now`` (see ``detraining_factor`` / ``_idle_active_days``):
+    detraining accrues only during INACTIVITY, so an effort ridden while the
+    rider kept training barely decays, while an effort followed by a long layoff
+    decays substantially. The estimate is 0.95 * the maximum weighted value, so a
+    recent hard effort dominates and old efforts fade smoothly rather than
+    cliffing to zero.
 
     Accepts either raw power streams or activity dicts (with "streams" /
     "start_time"). When ``now`` is None, no decay is applied and the result is
     simply best-20-min * 0.95 (used with raw streams). Undated items always get
     a decay factor of 1.0.
 
-    ``window_days`` is deprecated and ignored (the smooth decay replaces the old
+    ``window_days`` is deprecated and ignored (the decay model replaces the old
     hard trailing window); the kwarg is kept for call-site compatibility.
     A user override always wins when provided and positive.
     """
     if override is not None and override > 0:
         return float(override)
 
-    import datetime as _dt
+    efforts, activity_days = _split_activities(activities)
 
     best = 0.0
-    for when, stream in _activity_power_streams(activities):
+    for when, stream in efforts:
         b = best_20min_power(stream)
         if b <= 0:
             continue
         if now is not None and when is not None:
-            days = (now - when).total_seconds() / 86400.0
-            b *= detraining_factor(days)
+            idle, active = _idle_active_days(when, now, activity_days)
+            b *= detraining_factor(idle, active)
         if b > best:
             best = b
     return best * 0.95

@@ -75,7 +75,8 @@ def test_update_due_after_30_days_appends_row(user_id):
     latest = db.latest_ftp(user_id)
     assert latest["date"] == now.date().isoformat()
     assert latest["source"] == "estimated"
-    assert latest["ftp_watts"] == pytest.approx(285.0, abs=0.5)
+    # ~285 (300 * 0.95); a few days of active staleness shave a fraction of a watt.
+    assert latest["ftp_watts"] == pytest.approx(285.0, abs=1.5)
 
 
 def test_update_seeds_first_entry_when_empty(user_id):
@@ -83,7 +84,7 @@ def test_update_seeds_first_entry_when_empty(user_id):
     _insert_activity(user_id, (now - dt.timedelta(days=2)).isoformat(), power_watts=300.0)
     assert db.latest_ftp(user_id) is None
     assert importer.maybe_update_ftp(user_id, now) is True
-    assert db.latest_ftp(user_id)["ftp_watts"] == pytest.approx(285.0, abs=0.5)
+    assert db.latest_ftp(user_id)["ftp_watts"] == pytest.approx(285.0, abs=1.5)
 
 
 def test_update_cadence_is_three_weeks(user_id):
@@ -98,20 +99,26 @@ def test_update_cadence_is_three_weeks(user_id):
     assert importer.ftp_update_due(user_id, other_now) is True
 
 
+def _decayed(watts, effort, anchor, days):
+    """Expected estimate for a single effort given the activity calendar."""
+    from wattracker.metrics.power import detraining_factor, _idle_active_days
+    idle, active = _idle_active_days(effort, anchor, days)
+    return watts * detraining_factor(idle, active) * 0.95
+
+
 def test_estimate_decays_after_layoff_anchored_at_now(user_id):
     # Semantics changed: the estimate is anchored at wall-clock `now` and the
-    # 33-day-old effort is detraining-decayed (not cliffed to zero, not frozen
-    # at the last-activity value). 300 * factor(33) * 0.95 ~= 259.
+    # 33-day-old effort is detraining-decayed against the activity calendar
+    # (a lone effort with no rides since -> the whole 33-day gap past the grace
+    # window is idle). Decayed, but nowhere near a collapse.
     now = dt.datetime(2026, 7, 3, 12, 0)
-    _insert_activity(user_id, (now - dt.timedelta(days=33)).isoformat(),
-                     power_watts=300.0)
-    from wattracker.metrics.power import detraining_factor
-    expected = 300.0 * detraining_factor(33) * 0.95
+    effort = now - dt.timedelta(days=33)
+    _insert_activity(user_id, effort.isoformat(), power_watts=300.0)
+    expected = _decayed(300.0, effort, now, [effort])
     assert importer.evaluate_ftp(user_id, now) is True
     latest = db.latest_ftp(user_id)
     assert latest["ftp_watts"] == pytest.approx(expected, abs=0.5)
     assert latest["date"] == now.date().isoformat()
-    # Decayed, but nowhere near a collapse.
     assert latest["ftp_watts"] > 250.0
     # current_ftp everywhere now reflects that evaluation.
     assert importer.current_ftp(user_id, now=now) == pytest.approx(expected, abs=0.5)
@@ -122,11 +129,10 @@ def test_evaluate_self_heals_stale_estimated_row(user_id):
     # refreshed in place on the next evaluation, without waiting out the 21-day
     # gate and without appending a second row.
     now = dt.datetime(2026, 7, 3, 12, 0)
-    _insert_activity(user_id, (now - dt.timedelta(days=33)).isoformat(),
-                     power_watts=300.0)
+    effort = now - dt.timedelta(days=33)
+    _insert_activity(user_id, effort.isoformat(), power_watts=300.0)
     db.add_ftp_entry(user_id, now.date().isoformat(), 160.9, "estimated")
-    from wattracker.metrics.power import detraining_factor
-    expected = 300.0 * detraining_factor(33) * 0.95
+    expected = _decayed(300.0, effort, now, [effort])
     assert importer.evaluate_ftp(user_id, now) is True
     rows = db.ftp_history_list(user_id)
     assert len(rows) == 1
@@ -149,8 +155,8 @@ def test_evaluate_never_touches_recent_manual_row(user_id):
 def test_current_ftp_precedence(user_id):
     now = dt.datetime(2026, 7, 1, 12, 0)
     _insert_activity(user_id, (now - dt.timedelta(days=3)).isoformat(), power_watts=300.0)
-    # No history, no override -> estimate.
-    assert importer.current_ftp(user_id, now=now) == pytest.approx(285.0, abs=0.5)
+    # No history, no override -> estimate (~285, minus a fraction for staleness).
+    assert importer.current_ftp(user_id, now=now) == pytest.approx(285.0, abs=1.5)
     # A manual history row now wins.
     db.add_ftp_entry(user_id, now.date().isoformat(), 260.0, "manual")
     assert importer.current_ftp(user_id, now=now) == pytest.approx(260.0)

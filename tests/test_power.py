@@ -54,10 +54,8 @@ def test_estimate_ftp_override_wins():
 
 
 def test_estimate_ftp_recent_effort_dominates_decayed_old():
-    # Semantics changed: instead of a hard cutoff, old efforts are detraining-
-    # decayed. A recent 300W effort still beats a 400W effort from 100 days ago
-    # once the latter is decayed (400 * factor(100) ~= 275 < 300), so the
-    # estimate is 300 * 0.95.
+    # A recent 300W effort beats a 400W effort from 100 days ago once the latter
+    # is detraining-decayed across the ~95-day idle gap between them.
     import datetime as dt
 
     now = dt.datetime(2026, 7, 1, 12, 0, 0)
@@ -70,36 +68,76 @@ def test_estimate_ftp_recent_effort_dominates_decayed_old():
         "streams": {"power": [400.0] * 1200},
     }
     est = power.estimate_ftp([recent, old], now=now)
-    assert est == pytest.approx(285.0, abs=1e-6)
+    # Recent wins: 300 * factor(idle~0, active~5) * 0.95 ~= 284.
+    assert est == pytest.approx(284.0, abs=0.5)
 
 
-# ----------------------------------------------- detraining decay model
-def test_detraining_factor_flat_through_grace():
-    assert power.detraining_factor(0) == 1.0
-    assert power.detraining_factor(5) == 1.0
-    assert power.detraining_factor(power.FTP_DECAY_GRACE_DAYS) == 1.0
+# ----------------------------------------------- gap-aware detraining model
+def test_idle_active_split_continuous_training_is_all_active():
+    # An effort followed by riding every 5 days accrues no idle excess: the
+    # whole span is "active", so decay stays minimal (this is the v1 bug case).
+    import datetime as dt
+
+    t = dt.datetime(2026, 1, 1, 10, 0)
+    days = [t + dt.timedelta(days=5 * i) for i in range(8)]  # t .. t+35
+    anchor = t + dt.timedelta(days=35)
+    idle, active = power._idle_active_days(t, anchor, days)
+    assert idle == pytest.approx(0.0, abs=1e-9)
+    assert active == pytest.approx(35.0, abs=1e-9)
 
 
-def test_detraining_factor_monotonically_decreasing_after_grace():
-    vals = [power.detraining_factor(d) for d in range(11, 200)]
-    assert all(b < a for a, b in zip(vals, vals[1:]))
-    assert all(0.0 < v < 1.0 for v in vals)
+def test_idle_active_split_lone_effort_then_layoff():
+    # A single effort with no rides until the anchor: the whole gap past the
+    # grace window is idle excess.
+    import datetime as dt
+
+    t = dt.datetime(2026, 1, 1, 10, 0)
+    anchor = t + dt.timedelta(days=40)
+    idle, active = power._idle_active_days(t, anchor, [t])
+    assert idle == pytest.approx(40 - power.FTP_DECAY_GRACE_DAYS, abs=1e-9)
+    assert active == pytest.approx(power.FTP_DECAY_GRACE_DAYS, abs=1e-9)
 
 
-def test_detraining_factor_about_0875_at_six_weeks():
-    # ~12% loss after a six-week (42-day) break.
-    assert power.detraining_factor(42) == pytest.approx(0.875, abs=0.01)
+def test_detraining_factor_no_decay_when_no_idle_no_active():
+    assert power.detraining_factor(0.0, 0.0) == 1.0
+
+
+def test_detraining_factor_active_days_decay_slowly():
+    # 30 continuously-trained days barely touch the effort (~0.98).
+    assert power.detraining_factor(0.0, 30.0) == pytest.approx(0.979, abs=0.005)
+
+
+def test_detraining_factor_monotonic_in_both_terms():
+    base = power.detraining_factor(20.0, 20.0)
+    assert power.detraining_factor(40.0, 20.0) < base   # more idle -> lower
+    assert power.detraining_factor(20.0, 40.0) < base   # more active -> lower
+    assert power.detraining_factor(10.0, 20.0) > base   # less idle -> higher
+
+
+def test_detraining_factor_about_088_before_six_week_stop():
+    # Effort ridden immediately before a six-week full stop, evaluated at return:
+    # idle excess ~28, active ~14 -> ~0.88.
+    assert power.detraining_factor(28.0, 14.0) == pytest.approx(0.88, abs=0.01)
 
 
 def test_estimate_ftp_decays_over_layoff_not_collapse():
-    # Regression for the reported bug: a ~216W best-20 effort six weeks ago
-    # (a ~205 baseline) followed by easy return rides must decay smoothly to
-    # ~178-180, NOT collapse toward ~143 as the old hard window did.
+    # Regression for the reported live-data bug (rider): a ~216W best-20 effort at
+    # the START of a six-week break, with regular training before it and easy
+    # return rides after, must decay by ~0.87 (only the 44-day gap counts, NOT
+    # the weeks of active training) -> ~179, NOT collapse to ~143/159.
     import datetime as dt
 
     now = dt.datetime(2026, 7, 1, 12, 0, 0)
+    # Regular training every 4 days ending just before the break start.
+    train = [
+        {
+            "start_time": (now - dt.timedelta(days=d)).isoformat(),
+            "streams": {"power": [180.0] * 1200},
+        }
+        for d in range(93, 49, -4)  # 93, 89, ... 53
+    ]
     hard = {
-        "start_time": (now - dt.timedelta(days=42)).isoformat(),
+        "start_time": (now - dt.timedelta(days=49)).isoformat(),  # break start
         "streams": {"power": [216.0] * 1200},
     }
     easy = [
@@ -107,12 +145,32 @@ def test_estimate_ftp_decays_over_layoff_not_collapse():
             "start_time": (now - dt.timedelta(days=d)).isoformat(),
             "streams": {"power": [150.0] * 1200},
         }
-        for d in (1, 3, 5)
+        for d in (5, 3, 1)  # return rides after the 44-day gap
     ]
-    est = power.estimate_ftp([hard] + easy, now=now)
-    # 216 * factor(42) * 0.95 ~= 179.6; well above the collapsed ~143.
-    assert est == pytest.approx(179.6, abs=1.5)
-    assert est > 170.0
+    est = power.estimate_ftp(train + [hard] + easy, now=now)
+    # 216 * 0.95 = 205.2 baseline; * ~0.87 -> ~178.7.
+    assert est == pytest.approx(178.7, abs=2.0)
+    assert est > 170.0  # nowhere near the collapsed ~143/159
+
+
+def test_estimate_ftp_continuous_training_barely_decays_old_effort():
+    # The v1 bug: an effort ridden while the rider KEEPS training must not be
+    # charged detraining. 250W effort 35 days ago, riding every 5 days since.
+    import datetime as dt
+
+    now = dt.datetime(2026, 7, 1, 12, 0, 0)
+    acts = [
+        {
+            "start_time": (now - dt.timedelta(days=d)).isoformat(),
+            "streams": {"power": ([250.0] if d == 35 else [180.0]) * 1200},
+        }
+        for d in range(35, -1, -5)  # 35, 30, ... 0
+    ]
+    est = power.estimate_ftp(acts, now=now)
+    baseline = 250.0 * 0.95  # 237.5
+    # Almost no decay: ~0.976 -> ~231.8, far above v1's effort-age ~214.
+    assert est == pytest.approx(231.8, abs=1.5)
+    assert est > 0.97 * baseline
 
 
 def test_estimate_ftp_fresh_hard_effort_dominates_history():
@@ -128,4 +186,5 @@ def test_estimate_ftp_fresh_hard_effort_dominates_history():
         "streams": {"power": [320.0] * 1200},
     }
     est = power.estimate_ftp([old, fresh], now=now)
-    assert est == pytest.approx(304.0, abs=1e-6)  # 320 * 0.95, decay-free (grace)
+    # 320 * factor(idle~0, active~1) * 0.95 ~= 303.8.
+    assert est == pytest.approx(303.8, abs=0.5)
