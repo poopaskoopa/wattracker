@@ -142,6 +142,30 @@ def test_v3_database_migrates_in_place_without_data_loss(tmp_path):
     conn.close()
 
 
+def test_newer_db_version_refused_data_intact(tmp_path):
+    # Stale code (older SCHEMA_VERSION) against a newer live DB must crash,
+    # not drop/recreate - this exact path has wiped live tables twice.
+    path = str(tmp_path / "future.db")
+    conn = sqlite3.connect(path)
+    conn.executescript(
+        f"""
+        CREATE TABLE users (id INTEGER PRIMARY KEY, username TEXT);
+        INSERT INTO users (username) VALUES ('keeper');
+        PRAGMA user_version = {db.SCHEMA_VERSION + 1};
+        """
+    )
+    conn.commit()
+    conn.close()
+
+    with pytest.raises(RuntimeError, match="refusing"):
+        db.init_db(path=path)
+
+    conn = sqlite3.connect(path)
+    assert conn.execute("PRAGMA user_version").fetchone()[0] == db.SCHEMA_VERSION + 1
+    assert conn.execute("SELECT username FROM users").fetchone()[0] == "keeper"
+    conn.close()
+
+
 def test_unknown_old_version_still_recreates(tmp_path):
     path = str(tmp_path / "old.db")
     conn = sqlite3.connect(path)

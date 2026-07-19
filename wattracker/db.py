@@ -244,11 +244,23 @@ def init_db(path: Optional[str] = None) -> None:
 
     - Current version: idempotent CREATE IF NOT EXISTS.
     - Older version with a migration chain: upgraded in place (data preserved).
-    - Anything else (fresh db, unknown/newer version): clean drop/recreate.
+    - NEWER version than this code: refuse loudly. A long-lived server process
+      still holding old code in memory has twice re-run init_db against a
+      freshly-migrated live DB and wiped tables via the drop/recreate branch
+      (v10 incident, and the 2026-07-18 users/plans wipe) - stale code must
+      crash, never "fix" a database from the future.
+    - Anything else (fresh db, unmigratable older version): clean drop/recreate.
     """
     conn = connect(path)
     try:
         version = conn.execute("PRAGMA user_version").fetchone()[0]
+        if version > SCHEMA_VERSION:
+            raise RuntimeError(
+                f"database schema is v{version} but this code only knows "
+                f"v{SCHEMA_VERSION} - refusing to touch it. You are running "
+                "outdated code (often a stale long-lived server process); "
+                "stop it and start the current version."
+            )
         if version == SCHEMA_VERSION:
             conn.executescript(_SCHEMA)  # idempotent CREATE IF NOT EXISTS
         elif 0 < version < SCHEMA_VERSION and _can_migrate(version):
