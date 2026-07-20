@@ -15,7 +15,7 @@ from typing import Dict, List, Optional
 
 from .config import db_path
 
-SCHEMA_VERSION = 16
+SCHEMA_VERSION = 17
 
 # In-place migrations: version N -> N+1 statement lists. A database whose
 # version has an unbroken chain here is upgraded without losing live data.
@@ -73,6 +73,9 @@ _MIGRATIONS: Dict[int, List[str]] = {
         "ALTER TABLE race_results ADD COLUMN max_hr REAL",
         "ALTER TABLE race_results ADD COLUMN weight_kg REAL",
     ],
+    16: [
+        "ALTER TABLE user_settings ADD COLUMN hr_max INTEGER",
+    ],
 }
 
 _DROP = """
@@ -107,6 +110,7 @@ CREATE TABLE IF NOT EXISTS user_settings (
     zwift_email        TEXT,
     zwift_password_enc TEXT,
     weight_kg          REAL,
+    hr_max             INTEGER,
     FOREIGN KEY(user_id) REFERENCES users(id)
 );
 
@@ -414,7 +418,7 @@ def get_user_by_id(user_id: int, path: Optional[str] = None) -> Optional[dict]:
 
 # -------------------------------------------------------------- settings
 _SETTING_KEYS = ("ftp", "zwift_id", "activities_dir", "workouts_dir",
-                 "zwift_email", "weight_kg")
+                 "zwift_email", "weight_kg", "hr_max")
 
 
 def get_user_settings(user_id: int, path: Optional[str] = None) -> dict:
@@ -422,7 +426,7 @@ def get_user_settings(user_id: int, path: Optional[str] = None) -> dict:
     try:
         row = conn.execute(
             "SELECT ftp, zwift_id, activities_dir, workouts_dir, zwift_email, "
-            "weight_kg FROM user_settings WHERE user_id = ?",
+            "weight_kg, hr_max FROM user_settings WHERE user_id = ?",
             (user_id,),
         ).fetchone()
         if not row:
@@ -444,15 +448,16 @@ def save_user_settings(user_id: int, updates: dict, path: Optional[str] = None) 
             """
             INSERT INTO user_settings
                 (user_id, ftp, zwift_id, activities_dir, workouts_dir,
-                 zwift_email, weight_kg)
-            VALUES (?, ?, ?, ?, ?, ?, ?)
+                 zwift_email, weight_kg, hr_max)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(user_id) DO UPDATE SET
                 ftp=excluded.ftp,
                 zwift_id=excluded.zwift_id,
                 activities_dir=excluded.activities_dir,
                 workouts_dir=excluded.workouts_dir,
                 zwift_email=excluded.zwift_email,
-                weight_kg=excluded.weight_kg
+                weight_kg=excluded.weight_kg,
+                hr_max=excluded.hr_max
             """,
             (
                 user_id,
@@ -462,10 +467,27 @@ def save_user_settings(user_id: int, updates: dict, path: Optional[str] = None) 
                 current["workouts_dir"],
                 current["zwift_email"],
                 current["weight_kg"],
+                current["hr_max"],
             ),
         )
         conn.commit()
         return current
+    finally:
+        conn.close()
+
+
+def set_user_hr_max(
+    user_id: int, hr_max: Optional[int], path: Optional[str] = None
+) -> None:
+    """Set or explicitly clear a user's manual HRmax override."""
+    save_user_settings(user_id, {}, path=path)
+    conn = connect(path)
+    try:
+        conn.execute(
+            "UPDATE user_settings SET hr_max = ? WHERE user_id = ?",
+            (hr_max, user_id),
+        )
+        conn.commit()
     finally:
         conn.close()
 

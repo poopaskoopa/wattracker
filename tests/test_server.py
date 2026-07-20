@@ -70,7 +70,7 @@ def test_register_then_dashboard(client):
 
 def test_authed_pages_and_api(client):
     _register(client)
-    for path in ("/", "/activities", "/generate", "/settings"):
+    for path in ("/", "/activities", "/generate", "/profile", "/settings"):
         assert client.get(path).status_code == 200
     for path in ("/api/state", "/api/load", "/api/curve", "/api/activities", "/api/ftp"):
         r = client.get(path)
