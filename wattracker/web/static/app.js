@@ -363,12 +363,50 @@ const DETAIL_COLORS = {
     altitude: "#8a94a0",
 };
 
+function escapeHTML(value) {
+    return String(value == null ? "" : value).replace(/[&<>"']/g, (char) => ({
+        "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;",
+    })[char]);
+}
+
+function renderZoneSummary(targetId, summary, unit) {
+    const target = document.getElementById(targetId);
+    if (!target) return;
+    const heading = target.querySelector("h4");
+    const title = heading ? heading.outerHTML : "";
+    if (!summary || !summary.available) {
+        target.innerHTML = title + '<p class="hint">' +
+            escapeHTML((summary && summary.reason) || "Zone data unavailable") + ".</p>";
+        return;
+    }
+    const anchorLabel = unit === "W" ? "FTP" : "HRmax";
+    const anchor = Math.round(Number(summary.anchor) * 10) / 10;
+    const rows = (summary.zones || []).map((zone) => {
+        const pct = Math.max(0, Math.min(100, Number(zone.percent) || 0));
+        return '<tr><th scope="row">' + escapeHTML(zone.label) + '</th>' +
+            '<td class="zone-range">' + escapeHTML(zone.range) + " " + escapeHTML(unit) + '</td>' +
+            '<td class="zone-duration">' + escapeHTML(zone.duration) + '</td>' +
+            '<td class="zone-percent"><span class="zone-bar" style="--zone-pct:' + pct +
+            '%"></span><span>' + pct.toFixed(1) + '%</span></td></tr>';
+    }).join("");
+    target.innerHTML = title + '<p class="hint">' + anchorLabel + ": " + anchor + " " + unit +
+        " · " + escapeHTML(summary.source) + '</p><div class="table-scroll"><table class="zone-time-table">' +
+        '<caption class="sr-only">Time spent in each zone</caption><thead><tr>' +
+        '<th scope="col">Zone</th><th scope="col">Range</th><th scope="col">Time</th>' +
+        '<th scope="col">% valid</th></tr></thead><tbody>' + rows + '</tbody></table></div>' +
+        '<p class="hint">Stream coverage: ' + Number(summary.coverage_pct || 0).toFixed(1) +
+        "% · missing/uncredited: " + fmtDuration(Number(summary.missing_s || 0)) + "</p>";
+}
+
 async function renderActivityDetail(activityId) {
     const canvas = document.getElementById("detailChart");
     if (!canvas) return;
     const empty = document.getElementById("detailEmpty");
     const data = await fetchJSON("/api/activity/" + activityId);
     if (!data) { if (empty) { empty.style.display = "block"; } return; }
+
+    renderZoneSummary("powerZoneSummary", data.zones && data.zones.power, "W");
+    renderZoneSummary("hrZoneSummary", data.zones && data.zones.heart_rate, "bpm");
 
     const t = data.t || [];
     const have = data.have || {};

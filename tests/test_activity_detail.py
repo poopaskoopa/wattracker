@@ -118,6 +118,22 @@ def test_activity_detail_api_json(client):
     d = r.json()
     assert d["id"] == aid and d["have"]["power"] is True
     assert len(d["t"]) == d["points"]
+    assert set(d["zones"]) == {"power", "heart_rate"}
+    assert "covered_s" in d["zones"]["power"]
+
+
+def test_activity_detail_page_renders_zone_summary_without_replacing_graph(client):
+    _register(client)
+    uid = db.get_user_by_username("rider")["id"]
+    db.save_user_settings(uid, {"ftp": 200})
+    db.set_user_hr_max(uid, 190)
+    aid = _insert(uid, seconds=1200)
+    text = client.get(f"/activity/{aid}").text
+    assert "Time in zones" in text
+    assert 'id="powerZoneSummary"' in text
+    assert 'id="hrZoneSummary"' in text
+    assert 'id="detailChart"' in text
+    assert "renderActivityDetail" in text
 
 
 def test_activity_detail_api_404_and_scoped(client):

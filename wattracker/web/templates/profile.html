@@ -1,0 +1,53 @@
+{% extends "base.html" %}
+{% block title %}Rider profile &mdash; wattracker{% endblock %}
+{% block content %}
+<h2>Rider profile</h2>
+{% if saved %}<p class="ok" role="status">Heart-rate setting saved.</p>{% endif %}
+{% if error %}<p class="alert" role="alert">{{ error }}</p>{% endif %}
+
+<section class="profile-section" aria-labelledby="power-zone-title">
+    <h3 id="power-zone-title">Power zones</h3>
+    {% if profile.power.available %}
+    <p><strong>Training FTP: {{ '%.1f'|format(profile.power.value) }} W</strong><br>
+       <span class="hint">Source: {{ profile.power.source }}</span></p>
+    <div class="table-scroll">
+    <table class="zone-table">
+        <caption class="sr-only">Personalized power-zone ranges</caption>
+        <thead><tr><th scope="col">Zone</th><th scope="col">Purpose</th><th scope="col">% FTP</th><th scope="col">Range</th></tr></thead>
+        <tbody>{% for zone in profile.power.zones %}
+        <tr><th scope="row">{{ zone.label }}</th><td>{{ zone.name }}</td><td>{{ zone.pct }}</td><td>{{ zone.range }} W</td></tr>
+        {% endfor %}</tbody>
+    </table>
+    </div>
+    {% else %}
+    <p class="hint">No personalized Training FTP is available yet. Import a FIT ride with at least 20 minutes of usable power, or set FTP in Settings.</p>
+    {% endif %}
+</section>
+
+<section class="profile-section" aria-labelledby="hr-zone-title">
+    <h3 id="hr-zone-title">Heart-rate zones</h3>
+    {% if profile.heart_rate.available %}
+    <p><strong>HRmax: {{ profile.heart_rate.value }} bpm</strong><br>
+       <span class="hint">Source: {{ profile.heart_rate.source }}. Confidence: {{ profile.heart_rate.confidence }}.</span></p>
+    <div class="table-scroll">
+    <table class="zone-table">
+        <caption class="sr-only">Personalized heart-rate-zone ranges</caption>
+        <thead><tr><th scope="col">Zone</th><th scope="col">Purpose</th><th scope="col">% HRmax</th><th scope="col">Range</th></tr></thead>
+        <tbody>{% for zone in profile.heart_rate.zones %}
+        <tr><th scope="row">{{ zone.label }}</th><td>{{ zone.name }}</td><td>{{ zone.pct }}</td><td>{{ zone.range }} bpm</td></tr>
+        {% endfor %}</tbody>
+    </table>
+    </div>
+    <p class="hint">Valid readings below 50% HRmax are included in Z1. This model does not infer resting heart rate or lactate-threshold heart rate.</p>
+    {% else %}
+    <p class="hint">Automatic HRmax needs at least two separate rides in the last year, 60 total valid minutes, 10 valid minutes per qualifying ride, and corroborated 30-second peaks within 5 bpm.</p>
+    {% endif %}
+
+    <form class="hrmax-form" method="post" action="/profile/hr-max">
+        <label for="hr-max">Manual HRmax override (80–230 bpm)</label>
+        <input id="hr-max" name="hr_max" type="number" min="80" max="230" step="1" value="{{ manual_hr_max or '' }}" inputmode="numeric">
+        <button type="submit" name="action" value="save">Save HRmax</button>
+        {% if manual_hr_max %}<button class="button-secondary" type="submit" name="action" value="reset">Use FIT estimate</button>{% endif %}
+    </form>
+</section>
+{% endblock %}

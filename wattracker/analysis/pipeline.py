@@ -17,7 +17,7 @@ from ..metrics.power import (
 )
 from ..metrics.curve import MMP_DURATIONS, fit_cp_wprime, mean_maximal_power
 from ..metrics.load import compute_load, daily_tss_series
-from . import activity_cache
+from . import activity_cache, zones
 from .detect import evaluate
 from .state import TrainingState
 
@@ -289,6 +289,9 @@ def activity_detail(
     if not act:
         return None
     streams = act.get("streams") or {}
+    # Zone duration is derived from the full-resolution aligned streams before
+    # graph downsampling, so short peaks and exact elapsed time are preserved.
+    zone_summary = zones.activity_zone_summary(user_id, act)
     n = max(
         (len(streams.get(k) or []) for k in
          ("power", "heartrate", "cadence", "altitude", "time")),
@@ -319,6 +322,7 @@ def activity_detail(
         "altitude": series["altitude"],
         "have": have,
         "points": len(t),
+        "zones": zone_summary,
     }
 
 

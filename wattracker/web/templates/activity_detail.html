@@ -22,6 +22,18 @@
         <span class="value">{{ '%.0f'|format(activity.tss or 0) }}</span></div>
 </section>
 
+<section class="zone-summary" aria-labelledby="zone-summary-title">
+    <h3 id="zone-summary-title">Time in zones</h3>
+    <div class="zone-summary-grid">
+        <article class="zone-panel" id="powerZoneSummary" aria-live="polite">
+            <h4>Power zones</h4><p class="hint">Loading…</p>
+        </article>
+        <article class="zone-panel" id="hrZoneSummary" aria-live="polite">
+            <h4>Heart-rate zones</h4><p class="hint">Loading…</p>
+        </article>
+    </div>
+</section>
+
 <section class="chart-block">
     <h3>Ride graphs</h3>
     <p id="detailEmpty" class="hint" style="display:none">

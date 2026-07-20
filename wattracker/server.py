@@ -22,7 +22,7 @@ from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.middleware.sessions import SessionMiddleware
 
 from . import auth, config, credstore, db, exporter, paths, races
-from .analysis import pipeline
+from .analysis import pipeline, zones
 from .ble import devices as bledevices
 from .ble.runner import RideController, flatten_session
 from .ingest import importer
@@ -372,6 +372,43 @@ def create_app() -> FastAPI:
         return templates.TemplateResponse(
             request, "activities.html", _activities_context(request)
         )
+
+    def _profile_response(request: Request, error: Optional[str] = None):
+        uid = _uid(request)
+        return templates.TemplateResponse(
+            request,
+            "profile.html",
+            _ctx(
+                request,
+                profile=zones.rider_profile(uid),
+                manual_hr_max=db.get_user_settings(uid).get("hr_max"),
+                error=error,
+                saved=request.query_params.get("saved") == "1",
+            ),
+        )
+
+    @app.get("/profile", response_class=HTMLResponse)
+    def profile_page(request: Request):
+        return _profile_response(request)
+
+    @app.post("/profile/hr-max", response_class=HTMLResponse)
+    def profile_hr_max_save(
+        request: Request,
+        hr_max: str = Form(""),
+        action: str = Form("save"),
+    ):
+        uid = _uid(request)
+        if action == "reset":
+            db.set_user_hr_max(uid, None)
+            return RedirectResponse("/profile?saved=1", status_code=303)
+        try:
+            value = int(hr_max.strip())
+        except (TypeError, ValueError):
+            return _profile_response(request, "HRmax must be a whole number from 80 to 230 bpm.")
+        if not 80 <= value <= 230:
+            return _profile_response(request, "HRmax must be a whole number from 80 to 230 bpm.")
+        db.set_user_hr_max(uid, value)
+        return RedirectResponse("/profile?saved=1", status_code=303)
 
     @app.get("/activity/{activity_id}", response_class=HTMLResponse)
     def activity_detail_page(request: Request, activity_id: int):
