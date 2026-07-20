@@ -316,8 +316,8 @@ def test_feedback_raises_and_caps_then_is_idempotent(user_id):
 
     assert importer.apply_rpe_ftp_feedback(
         user_id, dt.datetime.fromisoformat(f"{DATE}T20:00:00")
-    ) == 204.0
-    assert db.latest_ftp(user_id)["ftp_watts"] == 204.0
+    ) == 210.0
+    assert db.latest_ftp(user_id)["ftp_watts"] == 210.0
     assert importer.apply_rpe_ftp_feedback(
         user_id, dt.datetime.fromisoformat(f"{DATE}T20:00:00")
     ) is None
@@ -335,7 +335,7 @@ def test_feedback_lowers_caps_and_ignores_insufficient_or_bad_evidence(user_id):
     _complete(user_id, "second", 10)
     assert importer.apply_rpe_ftp_feedback(
         user_id, dt.datetime.fromisoformat(f"{DATE}T20:00:00")
-    ) == 196.0
+    ) == 192.5
 
 
 def test_feedback_never_changes_manual_ftp(user_id):
@@ -351,15 +351,15 @@ def test_feedback_never_changes_manual_ftp(user_id):
 
 
 @pytest.mark.parametrize(("kind", "rpe", "expected"), [
-    ("sweet_spot", 7, 204.0),
+    ("sweet_spot", 7, 210.0),
     ("sweet_spot", 8, None),
-    ("sweet_spot", 9, 196.0),
-    ("threshold", 7, 204.0),
+    ("sweet_spot", 9, 195.0),
+    ("threshold", 7, 210.0),
     ("threshold", 8, None),
-    ("threshold", 9, 196.0),
-    ("vo2max", 8, 204.0),
+    ("threshold", 9, 195.0),
+    ("vo2max", 8, 210.0),
     ("vo2max", 9, None),
-    ("vo2max", 10, 196.0),
+    ("vo2max", 10, 195.0),
 ])
 def test_feedback_expected_rpe_bands_are_type_aware(user_id, kind, rpe, expected):
     db.add_ftp_entry(user_id, DATE, 200, "estimated")
@@ -378,7 +378,7 @@ def test_rating_correction_rolls_back_batch_and_is_idempotent(user_id):
     _complete(user_id, "correct-2", 6, effective=230)
     assert importer.apply_rpe_ftp_feedback(
         user_id, dt.datetime.fromisoformat(f"{DATE}T20:00:00")
-    ) == 204.0
+    ) == 210.0
 
     now = dt.datetime.fromisoformat(f"{DATE}T20:00:00")
     assert importer.save_workout_rpe(user_id, "standalone", first, 9, now)
@@ -392,7 +392,7 @@ def test_plan_ratings_share_feedback_policy(user_id):
     first = _complete_plan(user_id, "plan-feedback-1", 6, effective=230)
     assert db.latest_ftp(user_id)["ftp_watts"] == 200
     second = _complete_plan(user_id, "plan-feedback-2", 6, effective=230)
-    assert db.latest_ftp(user_id)["ftp_watts"] == 204.0
+    assert db.latest_ftp(user_id)["ftp_watts"] == 210.0
     assert db.get_plan_workout(user_id, first)["feedback_applied"]
     assert db.get_plan_workout(user_id, second)["feedback_applied"]
 
@@ -401,7 +401,7 @@ def test_mixed_plan_standalone_batch_rolls_back_across_kinds(user_id):
     db.add_ftp_entry(user_id, DATE, 200, "estimated")
     standalone = _complete(user_id, "mixed-standalone", 6, effective=230)
     plan = _complete_plan(user_id, "mixed-plan", 6, effective=230)
-    assert db.latest_ftp(user_id)["ftp_watts"] == 204.0
+    assert db.latest_ftp(user_id)["ftp_watts"] == 210.0
 
     now = dt.datetime.fromisoformat(f"{DATE}T20:00:00")
     assert importer.save_workout_rpe(user_id, "plan", plan, 9, now)

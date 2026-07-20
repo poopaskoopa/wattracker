@@ -37,7 +37,8 @@ PROFILE_MIN_COMPLIANCE = 0.90
 PROFILE_MIN_HARD_SECONDS = 180
 FTP_FEEDBACK_WINDOW_DAYS = 28
 FTP_FEEDBACK_MIN_WORKOUTS = 2
-FTP_FEEDBACK_MAX_STEP = 0.02
+FTP_FEEDBACK_MAX_STEP = 0.05
+FTP_RPE_STEP_PER_POINT = 0.025
 
 
 def _current_estimate(
@@ -528,6 +529,10 @@ def match_standalone_completions(
     return match_plan_completions(user_id, now)
 
 
+def _neutral_rpe(workout_type: str) -> int:
+    return 9 if workout_type == "vo2max" else 8
+
+
 def apply_rpe_ftp_feedback(
     user_id: int, now: Optional[_dt.datetime] = None
 ) -> Optional[float]:
@@ -535,6 +540,14 @@ def apply_rpe_ftp_feedback(
 
     Expected effort is type-aware: VO2 RPE 9 is neutral, while threshold and
     sweet-spot RPE 8 are neutral. Evidence is consumed in reversible batches.
+
+    The step size is driven by how far RPE sits from neutral, not by the
+    workout's own realized wattage: an ERG-controlled ride tracks its target
+    power almost exactly, so "effective_ftp" (actual/target) mostly just
+    reflects the FTP the workout was generated from and can't reveal that the
+    prescribed intensity felt too easy - which is exactly the case a returning
+    rider needs this to catch. Wattage evidence still applies (via max()) so a
+    genuinely higher realized effort (e.g. non-ERG, free ride) isn't ignored.
     """
     now = now or _dt.datetime.now()
     settings = db.get_user_settings(user_id)
@@ -561,10 +574,17 @@ def apply_rpe_ftp_feedback(
     if len(low) >= FTP_FEEDBACK_MIN_WORKOUTS:
         chosen = low
         demonstrated = float(np.median([e["effective_ftp"] for e in chosen]))
-        desired = max(current, demonstrated)
+        rpe_gap = float(np.median(
+            [_neutral_rpe(e["type"]) - int(e["rpe"]) for e in chosen]
+        ))
+        rpe_implied = current * (1.0 + FTP_RPE_STEP_PER_POINT * max(0.0, rpe_gap))
+        desired = max(current, demonstrated, rpe_implied)
     elif len(high) >= FTP_FEEDBACK_MIN_WORKOUTS:
         chosen = high
-        desired = current * (1.0 - FTP_FEEDBACK_MAX_STEP)
+        rpe_gap = float(np.median(
+            [int(e["rpe"]) - _neutral_rpe(e["type"]) for e in chosen]
+        ))
+        desired = current * (1.0 - FTP_RPE_STEP_PER_POINT * max(0.0, rpe_gap))
     else:
         return None
     limit = current * FTP_FEEDBACK_MAX_STEP
