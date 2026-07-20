@@ -24,17 +24,9 @@ import sqlite3
 from typing import Dict, List, Optional
 
 from .config import app_data_dir, db_path
+from .config import _restrict  # owner-only chmod (POSIX) / ACL (Windows)
 
 _log = logging.getLogger(__name__)
-
-
-def _restrict(path: str, mode: int) -> None:
-    """Best-effort chmod (see config._restrict); never crash on odd filesystems."""
-    try:
-        if os.path.exists(path):
-            os.chmod(path, mode)
-    except OSError:
-        _log.debug("could not chmod %s to %o", path, mode, exc_info=True)
 
 # Recognised backup reasons and how many of each to keep. "daily" and
 # "pre-migration" are the safety-critical automatic classes, so they retain a

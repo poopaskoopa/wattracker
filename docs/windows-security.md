@@ -20,6 +20,31 @@ delete or overwrite that marker merely because unprotection failed.
 DPAPI and Credential Manager protect against an offline database copy. They do
 not protect secrets from malware already running as the same Windows user.
 
+## Data directory permissions
+
+The data directory and every sensitive file inside it (`config.json`, which holds
+the session secret and Anthropic API key; `wattracker.db` and its `-wal`/`-shm`
+sidecars and `backups/`, which hold password hashes and encrypted credential
+markers) are locked to the current Windows user with an explicit owner-only ACL.
+
+POSIX `chmod` is inert on Windows: it only toggles the read-only attribute and
+sets no ACL. `config._restrict` therefore runs
+`icacls <path> /inheritance:r /grant:r <user>:...F` on Windows (`(OI)(CI)F` for
+directories so children inherit the same lock, `F` for files), disabling
+inheritance and granting full control to the current user only. This matters
+when the data directory is relocated off `%USERPROFILE%` via
+`WATTRACKER_DATA_DIR` or `WATTRACKER_DB` onto a drive or share whose inherited
+ACL would otherwise grant e.g. `Users:(R)`, letting another local standard
+account read the session secret and password hashes. The default
+`%USERPROFILE%\.wattracker` is already protected by the profile ACL; this closes
+the relocated-directory gap.
+
+The lockdown is best-effort and never crashes the app: if `icacls` is missing or
+fails (e.g. a filesystem that does not support ACLs), the failure is logged at
+debug and startup continues, mirroring the existing chmod-can-fail contract.
+This is defense against another local account reading an at-rest copy; it does
+not protect secrets from malware already running as the same Windows user.
+
 Credential Manager writes use unique versioned slots. A resave writes and
 reads back a fresh slot, commits its marker to SQLite, and only then attempts
 best-effort removal of the formerly referenced slot. Any verification or DB

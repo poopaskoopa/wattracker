@@ -8,28 +8,73 @@ file (config.json in the app data dir).
 """
 from __future__ import annotations
 
+import getpass
 import json
 import logging
 import os
 import secrets
+import subprocess
 from dataclasses import dataclass
 from typing import Optional
 
 _log = logging.getLogger(__name__)
 
 
-def _restrict(path: str, mode: int) -> None:
-    """Best-effort ``chmod`` so the data dir/files aren't world-readable.
+def _restrict_windows_acl(path: str, is_dir: bool) -> None:
+    """Best-effort owner-only NTFS ACL on Windows.
 
-    makedirs()'s mode is masked by the umask, and some filesystems (Windows,
-    network mounts) don't honour POSIX modes at all - so chmod explicitly and
-    never let an unsupported-FS failure crash the app.
+    POSIX modes are inert on Windows: ``os.chmod`` only toggles the read-only
+    attribute and sets no ACL. So when the data dir is relocated off the user
+    profile (WATTRACKER_DATA_DIR / WATTRACKER_DB) onto a volume whose inherited
+    ACL grants e.g. ``Users:(R)``, another local standard account could read the
+    session secret, Anthropic key and password hashes. Reset inheritance and
+    grant full control to the current user only.
+
+    Done via ``icacls`` (shipped with every supported Windows; no extra
+    dependency, and cleaner than hand-building a SID/DACL through ctypes). The
+    argv is passed as a list (no ``shell=True``) so a data-dir path containing
+    spaces stays a single argument and nothing is shell-interpreted. Best-effort:
+    it must never crash the app, mirroring the chmod-can-fail contract.
     """
     try:
-        if os.path.exists(path):
+        user = getpass.getuser()
+    except Exception:  # pragma: no cover - getuser is extremely robust
+        user = os.environ.get("USERNAME", "")
+    if not user:
+        return
+    # Dirs get object+container inheritance so new children (db, -wal, -shm,
+    # backups) are owner-only too; files just get full control.
+    grant = f"{user}:(OI)(CI)F" if is_dir else f"{user}:F"
+    try:
+        subprocess.run(
+            ["icacls", path, "/inheritance:r", "/grant:r", grant],
+            check=True,
+            capture_output=True,
+        )
+    except (subprocess.SubprocessError, OSError, ImportError):
+        _log.debug("could not set owner-only ACL on %s", path, exc_info=True)
+
+
+def _restrict(path: str, mode: int, *, is_dir: Optional[bool] = None) -> None:
+    """Best-effort owner-only lockdown of the data dir/files.
+
+    On POSIX this is a plain ``chmod`` (makedirs()'s mode is umask-masked, and
+    some filesystems don't honour it, so set it explicitly). On Windows POSIX
+    modes are meaningless, so enforce an owner-only ACL instead (see
+    ``_restrict_windows_acl``). Never let an unsupported-FS failure crash the
+    app. ``is_dir`` is inferred from the path when not given.
+    """
+    try:
+        if not os.path.exists(path):
+            return
+        if os.name == "nt":
+            if is_dir is None:
+                is_dir = os.path.isdir(path)
+            _restrict_windows_acl(path, is_dir)
+        else:
             os.chmod(path, mode)
     except OSError:
-        _log.debug("could not chmod %s to %o", path, mode, exc_info=True)
+        _log.debug("could not restrict %s to %o", path, mode, exc_info=True)
 
 
 def app_data_dir() -> str:

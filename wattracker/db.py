@@ -16,6 +16,7 @@ import zlib
 from typing import Dict, List, Optional
 
 from .config import db_path
+from .config import _restrict
 
 _log = logging.getLogger(__name__)
 
@@ -23,18 +24,15 @@ SCHEMA_VERSION = 17
 
 
 def _restrict_db_files(path: str) -> None:
-    """Best-effort 0600 on the DB file and its WAL/SHM sidecars.
+    """Best-effort owner-only lockdown of the DB file and its WAL/SHM sidecars.
 
     The DB holds password hashes and encrypted Zwift credentials, so it must not
-    be world-readable. chmod is best-effort: filesystems that don't support
-    POSIX modes (Windows, some network mounts) must not crash the app.
+    be readable by other accounts. Delegates to ``config._restrict``: 0600 on
+    POSIX, an owner-only ACL on Windows. Best-effort - filesystems that don't
+    support either (some network mounts) must not crash the app.
     """
     for p in (path, path + "-wal", path + "-shm"):
-        try:
-            if os.path.exists(p):
-                os.chmod(p, 0o600)
-        except OSError:
-            _log.debug("could not chmod %s to 0600", p, exc_info=True)
+        _restrict(p, 0o600, is_dir=False)
 
 # In-place migrations: version N -> N+1 statement lists. A database whose
 # version has an unbroken chain here is upgraded without losing live data.
