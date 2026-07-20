@@ -62,6 +62,9 @@ class Config:
 def _load_json() -> dict:
     path = config_path()
     if os.path.exists(path):
+        # Self-heal permissions on installs created before perms were tightened:
+        # config.json can hold the session secret and Anthropic key.
+        _restrict(path, 0o600)
         try:
             with open(path, "r", encoding="utf-8") as f:
                 return json.load(f) or {}
