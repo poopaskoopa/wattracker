@@ -17,7 +17,32 @@ $env:WATTRACKER_HOST = "127.0.0.1"
 $env:WATTRACKER_OPEN_BROWSER = "0"
 $env:WATTRACKER_AUTO_SCAN = "0"
 New-Item -ItemType Directory -Force -Path $TempRoot | Out-Null
-$process = Start-Process -FilePath (Resolve-Path $Executable) -WorkingDirectory $TempRoot -PassThru
+$StdoutPath = Join-Path $TempRoot "stdout.txt"
+$StderrPath = Join-Path $TempRoot "stderr.txt"
+function Write-FrozenLog {
+    param(
+        [string]$Label,
+        [string]$Path
+    )
+    Write-Host "=== frozen app $Label ==="
+    if (-not (Test-Path -LiteralPath $Path)) {
+        Write-Host "<missing>"
+        return
+    }
+    try {
+        $content = Get-Content -LiteralPath $Path -Raw -ErrorAction Stop
+        if ([string]::IsNullOrEmpty($content)) { Write-Host "<empty>" }
+        else { Write-Host $content }
+    } catch {
+        Write-Host "<unavailable: $($_.Exception.Message)>"
+    }
+}
+function Write-FrozenLogs {
+    Write-FrozenLog -Label "stdout" -Path $StdoutPath
+    Write-FrozenLog -Label "stderr" -Path $StderrPath
+}
+$process = Start-Process -FilePath (Resolve-Path $Executable) -WorkingDirectory $TempRoot `
+    -RedirectStandardOutput $StdoutPath -RedirectStandardError $StderrPath -PassThru
 try {
     $base = "http://127.0.0.1:$($env:WATTRACKER_PORT)"
     $deadline = (Get-Date).AddSeconds(90)
@@ -25,6 +50,9 @@ try {
     while ((Get-Date) -lt $deadline) {
         $process.Refresh()
         if ($process.HasExited) {
+            $process.WaitForExit()
+            $process.Refresh()
+            Write-FrozenLogs
             throw "frozen app exited before becoming ready (exit code $($process.ExitCode))"
         }
         try {
@@ -38,8 +66,12 @@ try {
     if (-not $ready) {
         $process.Refresh()
         if ($process.HasExited) {
+            $process.WaitForExit()
+            $process.Refresh()
+            Write-FrozenLogs
             throw "frozen app exited before becoming ready (exit code $($process.ExitCode))"
         }
+        Write-FrozenLogs
         throw "frozen app did not become ready at $base/login within 90 seconds"
     }
     if ((Invoke-WebRequest -UseBasicParsing "$base/static/style.css" -TimeoutSec 10).StatusCode -ne 200) { throw "static smoke failed" }

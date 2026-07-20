@@ -3,7 +3,7 @@ from pathlib import Path
 from PyInstaller.utils.hooks import collect_submodules
 
 root = Path(SPECPATH).parent
-hidden = collect_submodules("uvicorn") + collect_submodules("keyring.backends")
+hidden = ["wattracker.server"] + collect_submodules("uvicorn") + collect_submodules("keyring.backends")
 try:
     hidden += collect_submodules("bleak.backends.winrt")
 except Exception:
