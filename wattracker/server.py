@@ -8,6 +8,7 @@ import hashlib
 import io
 import logging
 import os
+import sys
 import threading
 import urllib.parse as _url
 import zipfile
@@ -15,7 +16,13 @@ from contextlib import asynccontextmanager
 from typing import List, Optional
 
 from fastapi import Body, FastAPI, Form, Request, UploadFile, WebSocket
-from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse, Response
+from fastapi.responses import (
+    HTMLResponse,
+    JSONResponse,
+    PlainTextResponse,
+    RedirectResponse,
+    Response,
+)
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 from starlette.middleware.base import BaseHTTPMiddleware
@@ -208,6 +215,15 @@ def static_url(path: str) -> str:
 templates.env.globals["static_url"] = static_url
 
 
+def _restore_command() -> str:
+    if sys.platform.startswith("win"):
+        if getattr(sys, "frozen", False):
+            executable = os.path.basename(sys.executable) or "wattracker.exe"
+            return f"{executable} restore"
+        return "wattracker-restore"
+    return ".venv/bin/python -m wattracker.restore_backup"
+
+
 class NoCacheStaticFiles(StaticFiles):
     async def get_response(self, path, scope):
         response = await super().get_response(path, scope)
@@ -225,7 +241,55 @@ MAX_UPLOAD_BYTES = 50 * 1024 * 1024
 
 # WebSocket handshakes are only accepted from same-origin (local) browsers; a
 # cross-site page's Origin will never match, blocking cross-site WS hijacking.
-_ALLOWED_WS_ORIGIN_HOSTS = ("localhost", "127.0.0.1", "[::1]")
+_ALLOWED_WS_ORIGIN_HOSTS = ("localhost", "127.0.0.1", "::1")
+
+
+class IPv6TrustedHostMiddleware(TrustedHostMiddleware):
+    """TrustedHostMiddleware with correct bracketed-IPv6 host parsing.
+
+    The Starlette version supported by the app splits Host on the first colon,
+    which turns ``[::1]:8000`` into ``[``. Keep its exact allowlist semantics
+    while parsing IPv6 literals without broadening trust to other IPv6 hosts.
+    """
+
+    @staticmethod
+    def _host_only(value: str) -> Optional[str]:
+        value = (value or "").strip().lower()
+        if value.startswith("["):
+            end = value.find("]")
+            if end < 0:
+                return None
+            suffix = value[end + 1:]
+            if suffix and (not suffix.startswith(":") or not suffix[1:].isdigit()):
+                return None
+            return value[:end + 1]
+        if value == "::1":
+            return value
+        if value.count(":") > 1:
+            return None
+        if ":" in value:
+            host, port = value.split(":", 1)
+            if not port.isdigit():
+                return None
+            return host
+        return value
+
+    async def __call__(self, scope, receive, send) -> None:
+        if self.allow_any or scope["type"] not in ("http", "websocket"):
+            await self.app(scope, receive, send)
+            return
+        raw_host = ""
+        for name, value in scope.get("headers", []):
+            if name.lower() == b"host":
+                raw_host = value.decode("latin-1")
+                break
+        host = self._host_only(raw_host)
+        if host in self.allowed_hosts:
+            await self.app(scope, receive, send)
+            return
+        await PlainTextResponse("Invalid host header", status_code=400)(
+            scope, receive, send
+        )
 
 
 class AuthMiddleware(BaseHTTPMiddleware):
@@ -298,8 +362,9 @@ def create_app() -> FastAPI:
         same_site="lax",
     )
     app.add_middleware(
-        TrustedHostMiddleware,
-        allowed_hosts=["localhost", "127.0.0.1", "testserver"],
+        IPv6TrustedHostMiddleware,
+        allowed_hosts=["localhost", "127.0.0.1", "[::1]", "::1", "testserver"],
+        www_redirect=False,
     )
 
     # -------------------------------------------------------------- auth
@@ -1104,27 +1169,39 @@ def create_app() -> FastAPI:
             backups=backup.list_backups(),
             backup_message=backup_message,
             dir_message=dir_message,
-            restore_cmd=".venv/bin/python -m wattracker.restore_backup",
+            restore_cmd=_restore_command(),
         )
 
     def _validate_dir(value: str) -> "tuple[Optional[str], Optional[str]]":
         """Validate a user-supplied folder path.
 
         Returns (clean_path, error). A folder is accepted only when it exists,
-        is a directory, and resolves under the user's home directory - this
-        confines both the activities and Zwift-workouts folders to a sane root
-        and blocks pointing the app at arbitrary system paths. An empty value is
-        accepted as "unchanged" (clean_path="", error=None).
+        is a directory, and its real path remains under the user's home,
+        OS-discovered Documents/Zwift roots, or a process-owner environment
+        override. This admits redirected Windows Known Folders and OneDrive/UNC
+        roots without permitting arbitrary web-supplied system paths or symlink
+        escapes. Empty means "unchanged" (clean_path="", error=None).
         """
         raw = (value or "").strip()
         if not raw:
             return "", None
-        expanded = os.path.abspath(os.path.expanduser(raw))
-        home = os.path.abspath(os.path.expanduser("~"))
+        expanded = os.path.realpath(os.path.abspath(os.path.expanduser(raw)))
         if not os.path.isdir(expanded):
             return None, f"Folder not found or not a directory: {raw}"
-        if os.path.commonpath([expanded, home]) != home:
-            return None, f"Folder must be inside your home directory: {raw}"
+        allowed = False
+        for root in paths.trusted_storage_roots():
+            resolved_root = os.path.realpath(os.path.abspath(os.path.expanduser(root)))
+            try:
+                if os.path.commonpath([expanded, resolved_root]) == resolved_root:
+                    allowed = True
+                    break
+            except ValueError:
+                continue  # Different Windows drives or UNC shares.
+        if not allowed:
+            return None, (
+                "Folder must be inside your home directory or a configured "
+                f"Zwift data directory: {raw}"
+            )
         return expanded, None
 
     @app.get("/settings", response_class=HTMLResponse)
@@ -1193,11 +1270,18 @@ def create_app() -> FastAPI:
         # race fetching after a previous login failure.
         cred_message = None
         if zwift_email.strip() and zwift_password:
-            backend = credstore.save_zwift_credentials(
-                uid, zwift_email, zwift_password
-            )
-            db.clear_race_auth_failure(uid)
-            cred_message = f"Zwift credentials saved ({backend})."
+            try:
+                backend = credstore.save_zwift_credentials(
+                    uid, zwift_email, zwift_password
+                )
+            except credstore.CredentialStorageError as exc:
+                cred_message = (
+                    "Zwift credentials NOT saved securely. Check Windows "
+                    f"Credential Manager and try again ({exc})."
+                )
+            else:
+                db.clear_race_auth_failure(uid)
+                cred_message = f"Zwift credentials saved ({backend})."
         elif zwift_email.strip() or zwift_password:
             cred_message = ("Zwift credentials NOT saved - both email and "
                             "password are needed.")
@@ -1249,6 +1333,7 @@ def create_app() -> FastAPI:
             weight_kg=data["weight_kg"],
             rider_id=zid if zid.isdigit() else "",
             saved_zwift_id=zid,
+            workouts_root=paths.zwift_workouts_root(),
             refreshed=refreshed,
         )
 

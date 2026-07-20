@@ -1,6 +1,6 @@
 # wattracker
 
-A local, cross-platform (macOS-first) cycling training analyzer. It ingests
+A local, cross-platform cycling training analyzer. It ingests
 Zwift / TrainerRoad `.fit` files, computes training-science metrics, detects
 plateau / overreach, and prescribes progressive workouts exported as Zwift
 `.zwo` files.
@@ -22,7 +22,7 @@ plateau / overreach, and prescribes progressive workouts exported as Zwift
   from training state + duration, optional LLM refinement of coaching text
   (Anthropic `claude-sonnet-5`; fully functional without a key), and `.zwo`
   export you can download or write straight into the Zwift Workouts folder.
-- **Web UI** (FastAPI + Jinja2 + Chart.js from CDN): dashboard, activities,
+- **Web UI** (FastAPI + Jinja2 + vendored Chart.js): dashboard, activities,
   generate, settings, plus JSON API endpoints backing the charts.
 - **Multi-user with authentication**: register/login/logout with a signed-cookie
   session (`SessionMiddleware`); passwords hashed with `hashlib.scrypt` + a
@@ -37,6 +37,32 @@ python -m venv .venv && . .venv/bin/activate
 pip install -e .
 python -m wattracker          # serves http://localhost:8000 and opens a browser
 ```
+
+### Windows (native PowerShell)
+
+Windows 10/11 with Python 3.10+ is supported directly; WSL and Docker are not
+required:
+
+```powershell
+py -m venv .venv
+.venv\Scripts\python -m pip install -e ".[dev]"
+.\scripts\wattracker.ps1 start
+.\scripts\wattracker.ps1 status
+.\scripts\wattracker.ps1 restart
+.\scripts\wattracker.ps1 stop
+```
+
+The lifecycle script manages only the exact PID it started. Its atomic identity
+record includes start time, executable, unique command marker, and port; stale
+or tampered records fail closed. It never kills by process name or port owner,
+and refuses to start on an occupied port. `WATTRACKER_EXECUTABLE` may name an
+exact installed/frozen executable; otherwise `.venv\Scripts\python.exe` is used.
+
+Windows folder discovery checks `%LOCALAPPDATA%\Zwift\Activities`, redirected
+Windows Documents, OneDrive consumer/commercial Documents,
+`%USERPROFILE%\Documents`, then home Documents. Workouts use all Documents
+candidates. Settings and `WATTRACKER_ACTIVITIES_DIR`,
+`WATTRACKER_WORKOUTS_DIR`, or `WATTRACKER_ZWIFT_WORKOUTS_ROOT` override discovery.
 
 On first visit you are redirected to `/login`; create an account at `/register`
 (username + password, min 8 chars). Each account sees only its own data.
@@ -80,3 +106,25 @@ is read from environment variables (`ANTHROPIC_API_KEY`, `WATTRACKER_SECRET`)
 first, then an optional `config.json` in `~/.wattracker/` (the session secret is
 generated and persisted there on first run). The app is fully functional without
 an API key — LLM refinement is an optional layer over the pure-formula planner.
+
+Runtime variables include `WATTRACKER_DATA_DIR`, `WATTRACKER_DB`,
+`WATTRACKER_HOST`, `WATTRACKER_PORT`, `WATTRACKER_OPEN_BROWSER`, and
+`WATTRACKER_AUTO_SCAN`. The host is loopback-only: `127.0.0.1` (default),
+`localhost`, or `::1`; port must be 1–65535. Browser values accept
+`1/true/yes/on` and `0/false/no/off`. IPv6 URLs are bracketed correctly.
+
+## Backup, packages, and Windows validation
+
+Create backups in Settings. Stop the server before running `wattracker-restore`
+or `wattracker-restore --restore 1`; a frozen bundle uses
+`wattracker.exe restore [--restore N]`. Restore safety follows the configured
+loopback port.
+
+Windows CI runs Python 3.10 and 3.13 tests, lifecycle safety, an installed-wheel
+smoke test outside the checkout, and a PyInstaller **onedir** smoke test. Its
+artifacts are explicitly `unsigned`; PRs never sign. Windows executables must be
+built on Windows. Real BLE hardware and production signing cannot be verified
+here; use [the Windows BLE checklist](docs/windows-ble-validation.md).
+
+Chart.js and the zoom plugin are vendored with the application, so ride,
+training-load, power-curve, and volume charts work without internet access.

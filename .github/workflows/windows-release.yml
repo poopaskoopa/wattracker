@@ -1,0 +1,101 @@
+name: Windows signed release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: read
+
+jobs:
+  build-test-sign:
+    runs-on: windows-latest
+    environment: windows-code-signing
+    timeout-minutes: 45
+    env:
+      WATTRACKER_AUTO_SCAN: "0"
+      WATTRACKER_OPEN_BROWSER: "0"
+
+    steps:
+      - name: Check out selected source
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install pinned build tools and project
+        shell: pwsh
+        run: |
+          python -m pip install --disable-pip-version-check --upgrade "pip==25.1.1"
+          python -m pip install --disable-pip-version-check "build==1.2.2.post1" "pyinstaller==6.16.0" ".[dev,ble]"
+
+      - name: Run full test suite
+        shell: pwsh
+        run: python -m pytest -q
+
+      - name: Build and smoke-test installed wheel
+        shell: pwsh
+        run: |
+          python -m build --wheel --outdir wheelhouse
+          $wheel = (Get-ChildItem -Path "wheelhouse\*.whl" | Select-Object -First 1).FullName
+          if (-not $wheel) { throw "Wheel build produced no artifact" }
+          python -m venv wheel-smoke
+          .\wheel-smoke\Scripts\python.exe -m pip install --disable-pip-version-check $wheel
+          .\wheel-smoke\Scripts\python.exe "packaging\smoke_installed.py"
+
+      - name: Build frozen onedir application
+        shell: pwsh
+        run: |
+          if (-not (Test-Path -LiteralPath "packaging\wattracker.spec")) {
+            throw "packaging/wattracker.spec is required for a signed release"
+          }
+          python -m PyInstaller --clean --noconfirm "packaging\wattracker.spec"
+          if (-not (Test-Path -LiteralPath "dist\wattracker\wattracker.exe")) {
+            throw "Frozen application was not produced"
+          }
+
+      - name: Smoke-test frozen application
+        shell: pwsh
+        run: |
+          & "packaging\smoke_frozen.ps1" -ExecutablePath "dist\wattracker\wattracker.exe"
+
+      - name: Sign and verify every frozen binary
+        shell: pwsh
+        env:
+          WATTRACKER_SIGNING_PFX_B64: ${{ secrets.WATTRACKER_SIGNING_PFX_B64 }}
+          WATTRACKER_SIGNING_PFX_PASSWORD: ${{ secrets.WATTRACKER_SIGNING_PFX_PASSWORD }}
+          WATTRACKER_SIGNING_THUMBPRINT: ${{ vars.WATTRACKER_SIGNING_THUMBPRINT }}
+        run: |
+          if ([string]::IsNullOrWhiteSpace($env:WATTRACKER_SIGNING_THUMBPRINT)) {
+            throw "Protected signing thumbprint is required"
+          }
+          & "packaging\sign-windows.ps1" `
+            -ArtifactPath "dist\wattracker" `
+            -ExpectedThumbprint $env:WATTRACKER_SIGNING_THUMBPRINT
+
+      - name: Package verified signed artifact and checksum
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Path "release" | Out-Null
+          Compress-Archive -Path "dist\wattracker\*" `
+            -DestinationPath "release\wattracker-windows-x64-signed.zip"
+          $archive = Resolve-Path "release\wattracker-windows-x64-signed.zip"
+          $hash = (Get-FileHash -LiteralPath $archive -Algorithm SHA256).Hash.ToLowerInvariant()
+          "$hash  wattracker-windows-x64-signed.zip" | `
+            Set-Content -Path "release\wattracker-windows-x64-signed.zip.sha256" -Encoding ascii
+
+      - name: Upload signed artifact only
+        uses: actions/upload-artifact@v4
+        with:
+          name: wattracker-windows-x64-signed
+          path: |
+            release/wattracker-windows-x64-signed.zip
+            release/wattracker-windows-x64-signed.zip.sha256
+          if-no-files-found: error
+          retention-days: 30

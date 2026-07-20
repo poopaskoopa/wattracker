@@ -28,6 +28,7 @@ ble = ["bleak>=0.22"]
 
 [project.scripts]
 wattracker = "wattracker.__main__:main"
+wattracker-restore = "wattracker.restore_backup:main"
 
 [build-system]
 requires = ["setuptools>=61.0"]
@@ -35,6 +36,14 @@ build-backend = "setuptools.build_meta"
 
 [tool.setuptools.packages.find]
 include = ["wattracker*"]
+
+[tool.setuptools.package-data]
+wattracker = [
+    "web/templates/*.html",
+    "web/static/*.js",
+    "web/static/*.css",
+    "web/static/vendor/*.js",
+]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

@@ -113,6 +113,47 @@ def auto_scan_enabled() -> bool:
     return os.environ.get("WATTRACKER_AUTO_SCAN", "1") not in ("0", "false", "no")
 
 
+def server_host() -> str:
+    """Validated loopback bind host (Windows v1 is intentionally local-only)."""
+    raw = os.environ.get("WATTRACKER_HOST", "127.0.0.1").strip()
+    if raw.startswith("[") and raw.endswith("]"):
+        raw = raw[1:-1]
+    if not raw:
+        raise ValueError("WATTRACKER_HOST must be a loopback host")
+    if raw.lower() == "localhost":
+        return "localhost"
+    if raw in ("127.0.0.1", "::1"):
+        return raw
+    raise ValueError("WATTRACKER_HOST must be loopback-only (127.0.0.1, localhost, or ::1)")
+
+
+def server_port() -> int:
+    raw = os.environ.get("WATTRACKER_PORT", "8000").strip()
+    try:
+        port = int(raw)
+    except ValueError as exc:
+        raise ValueError("WATTRACKER_PORT must be an integer from 1 to 65535") from exc
+    if not 1 <= port <= 65535:
+        raise ValueError("WATTRACKER_PORT must be an integer from 1 to 65535")
+    return port
+
+
+def open_browser_enabled() -> bool:
+    raw = os.environ.get("WATTRACKER_OPEN_BROWSER", "1").strip().lower()
+    if raw in ("1", "true", "yes", "on"):
+        return True
+    if raw in ("0", "false", "no", "off"):
+        return False
+    raise ValueError("WATTRACKER_OPEN_BROWSER must be a boolean")
+
+
+def browser_url(host: Optional[str] = None, port: Optional[int] = None) -> str:
+    host = server_host() if host is None else host
+    port = server_port() if port is None else port
+    display_host = f"[{host}]" if ":" in host and not host.startswith("[") else host
+    return f"http://{display_host}:{port}"
+
+
 def session_secret() -> str:
     """Return the signed-cookie session secret, generating + persisting once.
 

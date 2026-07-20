@@ -1,8 +1,10 @@
 """Tests: credential storage, Zwift SSO / ZwiftPower auth flows (all mocked),
 and the authenticated race-results refresh integration."""
+import base64
 import io
 import json
 import os
+import secrets
 import stat
 import urllib.error
 
@@ -25,6 +27,18 @@ def client():
 
 def _register(client, username="rider"):
     client.post("/register", data={"username": username, "password": "password123"})
+
+
+def _legacy_enc1(password: str) -> str:
+    """Build the unauthenticated format written before enc2 was introduced."""
+    key = credstore._install_key()
+    nonce = secrets.token_bytes(16)
+    data = password.encode("utf-8")
+    cipher = bytes(
+        a ^ b for a, b in
+        zip(data, credstore._keystream(key, nonce, len(data)))
+    )
+    return "enc1$" + base64.b64encode(nonce + cipher).decode("ascii")
 
 
 # ------------------------------------------------------------- credstore
@@ -83,7 +97,7 @@ def test_keyring_backend_used_when_available(user_id, monkeypatch):
     assert backend == "system keychain"
     # DB stores only a sentinel, no ciphertext and no plaintext.
     _email, enc = db.get_zwift_credentials_row(user_id)
-    assert enc == "@keyring"
+    assert enc.startswith("@keyring:v1:")
     assert credstore.get_zwift_credentials(user_id).password == "s3cret"
     credstore.clear_zwift_credentials(user_id)
     assert fake.store == {}
@@ -107,6 +121,245 @@ def test_keyring_absent_falls_back(monkeypatch, user_id):
     assert credstore.save_zwift_credentials(user_id, "a@b.com", "pw") == (
         "encrypted local file key")
     assert credstore.get_zwift_credentials(user_id).password == "pw"
+
+
+def test_windows_keyring_backend_allowlist(monkeypatch):
+    monkeypatch.setattr(credstore, "_is_windows", lambda: True)
+    WinVault = type("WinVaultKeyring", (), {})
+    WinVault.__module__ = "keyring.backends.Windows"
+    Plaintext = type("PlaintextKeyring", (), {})
+    Plaintext.__module__ = "keyrings.alt.file"
+    Mac = type("Keyring", (), {})
+    Mac.__module__ = "keyring.backends.macOS"
+    Fail = type("FailKeyring", (), {})
+    Fail.__module__ = "keyring.backends.fail"
+
+    assert credstore._keyring_backend_allowed(WinVault()) is True
+    assert credstore._keyring_backend_allowed(Plaintext()) is False
+    assert credstore._keyring_backend_allowed(Mac()) is False
+    assert credstore._keyring_backend_allowed(Fail()) is False
+
+
+def test_windows_falls_back_to_dpapi_never_file_key(user_id, monkeypatch):
+    monkeypatch.setattr(credstore, "_is_windows", lambda: True)
+    monkeypatch.setattr(credstore, "_keyring", lambda: None)
+    seen = []
+
+    def protect(password, service, uid):
+        seen.append((password, service, uid))
+        return "dpapi1$cHJvdGVjdGVk"
+
+    monkeypatch.setattr(credstore.windows_secrets, "protect_password", protect)
+    monkeypatch.setattr(
+        credstore.windows_secrets, "unprotect_password",
+        lambda marker, service, uid: "win-secret",
+    )
+    monkeypatch.setattr(
+        credstore, "_encrypt",
+        lambda password: pytest.fail("Windows must never create enc1"),
+    )
+
+    assert credstore.save_zwift_credentials(
+        user_id, "a@b.com", "win-secret"
+    ) == "Windows DPAPI"
+    assert seen == [("win-secret", "wattracker-Zwift", user_id)]
+    assert db.get_zwift_credentials_row(user_id)[1].startswith("dpapi1$")
+    assert credstore.get_zwift_credentials(user_id).password == "win-secret"
+
+
+def test_windows_backend_failure_leaves_existing_row(user_id, monkeypatch):
+    db.set_zwift_credentials_row(user_id, "old@example.com", "enc1$old")
+    monkeypatch.setattr(credstore, "_is_windows", lambda: True)
+
+    class BrokenKeyring:
+        def set_password(self, *args):
+            raise RuntimeError("vault unavailable")
+
+        def delete_password(self, *args):
+            pass
+
+    monkeypatch.setattr(credstore, "_keyring", lambda: BrokenKeyring())
+
+    def fail_dpapi(*args):
+        raise credstore.windows_secrets.DPAPIError("DPAPI unavailable")
+
+    monkeypatch.setattr(credstore.windows_secrets, "protect_password", fail_dpapi)
+    with pytest.raises(credstore.CredentialStorageError) as exc:
+        credstore.save_zwift_credentials(user_id, "new@example.com", "secret")
+    assert "not saved" in str(exc.value)
+    assert db.get_zwift_credentials_row(user_id) == (
+        "old@example.com", "enc1$old"
+    )
+
+
+def test_windows_reads_legacy_enc1_without_migrating(user_id, monkeypatch):
+    # Store a genuine historical row; current saves intentionally produce enc2.
+    db.set_zwift_credentials_row(
+        user_id, "legacy@example.com", _legacy_enc1("old-secret")
+    )
+    before = db.get_zwift_credentials_row(user_id)
+    assert before[1].startswith("enc1$")
+
+    monkeypatch.setattr(credstore, "_is_windows", lambda: True)
+    assert credstore.get_zwift_credentials(user_id).password == "old-secret"
+    assert db.get_zwift_credentials_row(user_id) == before
+
+
+def test_windows_explicit_resave_replaces_legacy_then_clear(user_id, monkeypatch):
+    db.set_zwift_credentials_row(
+        user_id, "legacy@example.com", _legacy_enc1("old-secret")
+    )
+    monkeypatch.setattr(credstore, "_is_windows", lambda: True)
+    monkeypatch.setattr(credstore, "_keyring", lambda: None)
+    monkeypatch.setattr(
+        credstore.windows_secrets, "protect_password",
+        lambda password, service, uid: "dpapi1$bmV3",
+    )
+
+    assert credstore.save_zwift_credentials(
+        user_id, "new@example.com", "new-secret"
+    ) == "Windows DPAPI"
+    assert db.get_zwift_credentials_row(user_id) == (
+        "new@example.com", "dpapi1$bmV3"
+    )
+    credstore.clear_zwift_credentials(user_id)
+    assert db.get_zwift_credentials_row(user_id) == (None, None)
+
+
+def test_keyring_db_failure_preserves_old_and_cleans_staged_slot(
+    user_id, monkeypatch
+):
+    class FakeKeyring:
+        def __init__(self):
+            self.store = {("wattracker-Zwift", f"user{user_id}"): "old-password"}
+
+        def set_password(self, service, key, value):
+            self.store[(service, key)] = value
+
+        def get_password(self, service, key):
+            return self.store.get((service, key))
+
+        def delete_password(self, service, key):
+            self.store.pop((service, key), None)
+
+    fake = FakeKeyring()
+    db.set_zwift_credentials_row(user_id, "old@example.com", "@keyring")
+    monkeypatch.setattr(credstore, "_keyring", lambda: fake)
+    monkeypatch.setattr(
+        credstore.db, "set_zwift_credentials_row",
+        lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError("DB failed")),
+    )
+
+    with pytest.raises(RuntimeError, match="DB failed"):
+        credstore.save_zwift_credentials(user_id, "new@example.com", "new-password")
+    assert fake.get_password(
+        "wattracker-Zwift", f"user{user_id}"
+    ) == "old-password"
+    assert fake.store == {
+        ("wattracker-Zwift", f"user{user_id}"): "old-password"
+    }
+
+
+def test_unreadable_old_keyring_secret_survives_failed_resave(
+    user_id, monkeypatch
+):
+    old_target = f"user{user_id}"
+
+    class UnverifiableKeyring:
+        def __init__(self):
+            self.store = {("wattracker-Zwift", old_target): "old-password"}
+
+        def set_password(self, service, key, value):
+            self.store[(service, key)] = value
+
+        def get_password(self, service, key):
+            if key == old_target:
+                raise RuntimeError("old slot cannot be read")
+            return None  # force verification failure for the staged slot
+
+        def delete_password(self, service, key):
+            self.store.pop((service, key), None)
+
+    fake = UnverifiableKeyring()
+    db.set_zwift_credentials_row(user_id, "old@example.com", "@keyring")
+    monkeypatch.setattr(credstore, "_is_windows", lambda: True)
+    monkeypatch.setattr(credstore, "_keyring", lambda: fake)
+    monkeypatch.setattr(
+        credstore.windows_secrets, "protect_password",
+        lambda *args: (_ for _ in ()).throw(
+            credstore.windows_secrets.DPAPIError("DPAPI unavailable")
+        ),
+    )
+
+    with pytest.raises(credstore.CredentialStorageError):
+        credstore.save_zwift_credentials(
+            user_id, "new@example.com", "new-password"
+        )
+    assert db.get_zwift_credentials_row(user_id) == (
+        "old@example.com", "@keyring"
+    )
+    assert fake.store == {
+        ("wattracker-Zwift", old_target): "old-password"
+    }
+
+
+def test_legacy_bare_keyring_marker_still_reads_and_clears(
+    user_id, monkeypatch
+):
+    target = f"user{user_id}"
+
+    class FakeKeyring:
+        def __init__(self):
+            self.store = {("wattracker-Zwift", target): "legacy-password"}
+
+        def get_password(self, service, key):
+            return self.store.get((service, key))
+
+        def delete_password(self, service, key):
+            self.store.pop((service, key), None)
+
+    fake = FakeKeyring()
+    db.set_zwift_credentials_row(user_id, "old@example.com", "@keyring")
+    monkeypatch.setattr(credstore, "_keyring", lambda: fake)
+
+    assert credstore.get_zwift_credentials(user_id).password == "legacy-password"
+    credstore.clear_zwift_credentials(user_id)
+    assert fake.store == {}
+    assert db.get_zwift_credentials_row(user_id) == (None, None)
+
+
+def test_versioned_keyring_marker_get_resave_and_clear(user_id, monkeypatch):
+    class FakeKeyring:
+        def __init__(self):
+            self.store = {}
+
+        def set_password(self, service, key, value):
+            self.store[(service, key)] = value
+
+        def get_password(self, service, key):
+            return self.store.get((service, key))
+
+        def delete_password(self, service, key):
+            self.store.pop((service, key), None)
+
+    fake = FakeKeyring()
+    monkeypatch.setattr(credstore, "_keyring", lambda: fake)
+
+    credstore.save_zwift_credentials(user_id, "a@b.com", "first")
+    first_marker = db.get_zwift_credentials_row(user_id)[1]
+    first_target = credstore._keyring_target(user_id, first_marker)
+    assert credstore.get_zwift_credentials(user_id).password == "first"
+
+    credstore.save_zwift_credentials(user_id, "a@b.com", "second")
+    second_marker = db.get_zwift_credentials_row(user_id)[1]
+    second_target = credstore._keyring_target(user_id, second_marker)
+    assert second_marker != first_marker
+    assert ("wattracker-Zwift", first_target) not in fake.store
+    assert fake.store[("wattracker-Zwift", second_target)] == "second"
+
+    credstore.clear_zwift_credentials(user_id)
+    assert fake.store == {}
+    assert db.get_zwift_credentials_row(user_id) == (None, None)
 
 
 # --------------------------------------------------------- SSO (mocked)

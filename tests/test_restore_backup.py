@@ -99,3 +99,19 @@ def test_non_numeric_index_errors(capsys):
     rc = restore_backup.main(["--restore", "abc"], server_check=_server_down)
     assert rc == 2
     assert "not a number" in capsys.readouterr().err
+
+
+def test_server_probe_uses_configured_loopback_port(monkeypatch):
+    seen = {}
+    monkeypatch.setenv("WATTRACKER_HOST", "::1")
+    monkeypatch.setenv("WATTRACKER_PORT", "9123")
+    monkeypatch.setattr(restore_backup.subprocess, "run", lambda *a, **k: type("R", (), {"stdout": "", "returncode": 1})())
+    class Connection:
+        def __enter__(self): return self
+        def __exit__(self, *args): return None
+    def connect(address, timeout):
+        seen.update(address=address, timeout=timeout)
+        raise OSError
+    monkeypatch.setattr(restore_backup.socket, "create_connection", connect)
+    assert restore_backup._server_running() == (False, "")
+    assert seen["address"] == ("::1", 9123)

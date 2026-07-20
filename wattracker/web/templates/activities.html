@@ -9,7 +9,7 @@
     <form id="scanForm" method="post" action="/activities/rescan" class="scan-form">
         <label>Activities directory
             <input type="text" name="activities_dir" value="{{ prefill_dir or '' }}"
-                   placeholder="/path/to/Zwift/Activities">
+                   placeholder="{{ candidates[0].path if candidates else 'Zwift Activities folder' }}">
         </label>
         <button type="submit" id="scanBtn">Rescan folder</button>
     </form>

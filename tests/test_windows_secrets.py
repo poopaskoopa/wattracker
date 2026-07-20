@@ -1,0 +1,104 @@
+"""Platform-neutral unit tests for the Windows DPAPI wrapper."""
+import hashlib
+from pathlib import Path
+
+import pytest
+
+from wattracker import windows_secrets
+
+
+class FakeDPAPI:
+    """Authenticated stand-in whose output is bound to supplied entropy."""
+
+    def protect(self, plaintext: bytes, entropy: bytes) -> bytes:
+        return hashlib.sha256(entropy).digest() + plaintext[::-1]
+
+    def unprotect(self, ciphertext: bytes, entropy: bytes) -> bytes:
+        expected = hashlib.sha256(entropy).digest()
+        if not ciphertext.startswith(expected):
+            raise windows_secrets.DPAPIError("wrong entropy")
+        return ciphertext[len(expected):][::-1]
+
+
+def test_module_imports_without_loading_dpapi_on_non_windows():
+    assert windows_secrets.entropy_for("svc", 7) == b"svc\x00user:7"
+
+
+def test_protect_unprotect_roundtrip_with_injected_backend():
+    api = FakeDPAPI()
+    marker = windows_secrets.protect_password(
+        "correct horse", "wattracker-Zwift", 42, backend=api
+    )
+    assert marker.startswith("dpapi1$")
+    assert "correct horse" not in marker
+    assert windows_secrets.unprotect_password(
+        marker, "wattracker-Zwift", 42, backend=api
+    ) == "correct horse"
+
+
+def test_entropy_isolates_users_and_services():
+    api = FakeDPAPI()
+    marker = windows_secrets.protect_password("pw", "service-a", 1, backend=api)
+    with pytest.raises(windows_secrets.DPAPIError):
+        windows_secrets.unprotect_password(marker, "service-a", 2, backend=api)
+    with pytest.raises(windows_secrets.DPAPIError):
+        windows_secrets.unprotect_password(marker, "service-b", 1, backend=api)
+
+
+@pytest.mark.parametrize("marker", ["", "enc1$abc", "dpapi1$", "dpapi1$%%%"])
+def test_corrupt_marker_is_rejected(marker):
+    with pytest.raises(windows_secrets.DPAPIError):
+        windows_secrets.unprotect_password(marker, "svc", 1, backend=FakeDPAPI())
+
+
+def test_backend_failures_are_wrapped_without_plaintext():
+    class Broken:
+        def protect(self, plaintext, entropy):
+            raise OSError("native failure")
+
+    with pytest.raises(windows_secrets.DPAPIError) as exc:
+        windows_secrets.protect_password(
+            "do-not-leak-this", "svc", 1, backend=Broken()
+        )
+    assert "do-not-leak-this" not in str(exc.value)
+
+
+def test_unprotect_rejects_non_utf8_plaintext():
+    class NonUtf8:
+        def unprotect(self, ciphertext, entropy):
+            return b"\xff\xfe"
+
+    marker = "dpapi1$YQ=="
+    with pytest.raises(windows_secrets.DPAPIError):
+        windows_secrets.unprotect_password(
+            marker, "svc", 1, backend=NonUtf8()
+        )
+
+
+def test_release_workflow_scopes_signing_secrets_to_sign_step():
+    workflow = Path(".github/workflows/windows-release.yml").read_text()
+    job_env = workflow.split("    env:\n", 1)[1].split("\n\n    steps:", 1)[0]
+    assert "WATTRACKER_SIGNING_PFX_B64" not in job_env
+    assert "WATTRACKER_SIGNING_PFX_PASSWORD" not in job_env
+
+    sign_step = workflow.split(
+        "      - name: Sign and verify every frozen binary", 1
+    )[1].split("\n      - name:", 1)[0]
+    assert "secrets.WATTRACKER_SIGNING_PFX_B64" in sign_step
+    assert "secrets.WATTRACKER_SIGNING_PFX_PASSWORD" in sign_step
+    assert '".[dev,ble]"' in workflow
+
+
+def test_signed_release_only_builds_the_triggering_release_tag():
+    workflow = Path(".github/workflows/windows-release.yml").read_text()
+    assert "workflow_dispatch" not in workflow
+    assert "inputs.ref" not in workflow
+    assert 'tags:\n      - "v*"' in workflow
+
+
+def test_signing_script_requires_rfc3161_timestamp_verification():
+    script = Path("packaging/sign-windows.ps1").read_text()
+    assert "/tr $TimestampUrl /td SHA256" in script
+    assert "verify /pa /all /v /tw" in script
+    assert 'PSObject.Properties[\n            "TimeStamperCertificate"' in script
+    assert "RFC3161 timestamp verification failed" in script
