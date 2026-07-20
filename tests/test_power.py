@@ -121,7 +121,7 @@ def test_detraining_factor_about_088_before_six_week_stop():
 
 
 def test_estimate_ftp_decays_over_layoff_not_collapse():
-    # Regression for the reported live-data bug (rider): a ~216W best-20 effort at
+    # Regression for the reported live-data bug: a ~216W best-20 effort at
     # the START of a six-week break, with regular training before it and easy
     # return rides after, must decay by ~0.87 (only the 44-day gap counts, NOT
     # the weeks of active training) -> ~179, NOT collapse to ~143/159.

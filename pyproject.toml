@@ -4,25 +4,27 @@ version = "0.1.0"
 description = "Local cross-platform cycling training analyzer: ingest .fit files, compute training-science metrics, detect plateau/overreach, prescribe progressive workouts as Zwift .zwo files."
 readme = "README.md"
 requires-python = ">=3.10"
+# Minimum versions pin past known-CVE-fixed releases (e.g. jinja2>=3.1.5,
+# python-multipart>=0.0.18) for auditable, reproducible installs.
 dependencies = [
-    "fastapi",
-    "uvicorn[standard]",
-    "fitdecode",
-    "numpy",
-    "pandas",
-    "scipy",
-    "anthropic",
-    "jinja2",
-    "python-multipart",
-    "itsdangerous",
-    "keyring",
+    "fastapi>=0.138.2",
+    "uvicorn[standard]>=0.49.0",
+    "fitdecode>=0.11.0",
+    "numpy>=2.0",
+    "pandas>=2.2",
+    "scipy>=1.13",
+    "anthropic>=0.115.0",
+    "jinja2>=3.1.6",
+    "python-multipart>=0.0.32",
+    "itsdangerous>=2.2.0",
+    "keyring>=25.0",
 ]
 
 [project.optional-dependencies]
-dev = ["pytest", "httpx"]
+dev = ["pytest>=8.0", "httpx>=0.27"]
 # Real-hardware Bluetooth riding. Not needed for core install or the test suite;
 # requires a Bluetooth adapter + trainer/sensors to actually use.
-ble = ["bleak"]
+ble = ["bleak>=0.22"]
 
 [project.scripts]
 wattracker = "wattracker.__main__:main"

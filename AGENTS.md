@@ -7,9 +7,9 @@ server process wiping a migrated live DB).
 
 ## Worktrees — never share a checkout
 
-- **Integrator (Claude session):** `/home/user/repos/wattracker`, branch `main`.
-- **Second agent:** `/home/user/repos/wattracker-agent2`, branch `agent2/work`
-  (or `agent2/<feature>` branches cut from `main`).
+- **Integrator (Claude session):** the primary checkout, branch `main`.
+- **Second agent:** a separate linked worktree (e.g. `../wattracker-agent2`),
+  branch `agent2/work` (or `agent2/<feature>` branches cut from `main`).
 - Never edit files in the other agent's worktree. Never leave work-in-progress
   in a tree you don't own.
 
