@@ -1,4 +1,4 @@
-"""Launch entry point: start uvicorn and open the browser."""
+"""Launch entry point."""
 from __future__ import annotations
 
 import threading
@@ -7,15 +7,13 @@ import webbrowser
 
 import uvicorn
 
-HOST = "127.0.0.1"
-PORT = 8000
-URL = f"http://localhost:{PORT}"
+from . import config
 
 
-def _open_browser() -> None:
+def _open_browser(url: str) -> None:
     time.sleep(1.2)
     try:
-        webbrowser.open(URL)
+        webbrowser.open(url)
     except Exception:
         pass
 
@@ -23,10 +21,14 @@ def _open_browser() -> None:
 def main() -> None:
     from . import db
 
+    host = config.server_host()
+    port = config.server_port()
+    url = config.browser_url(host, port)
     db.init_db()
-    print(f"wattracker running at {URL}")
-    threading.Thread(target=_open_browser, daemon=True).start()
-    uvicorn.run("wattracker.server:app", host=HOST, port=PORT, reload=False)
+    print(f"wattracker running at {url}")
+    if config.open_browser_enabled():
+        threading.Thread(target=_open_browser, args=(url,), daemon=True).start()
+    uvicorn.run("wattracker.server:app", host=host, port=port, reload=False)
 
 
 if __name__ == "__main__":

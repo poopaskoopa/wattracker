@@ -36,19 +36,20 @@ import sys
 from typing import Callable, List, Optional
 
 from . import backup
-from .config import db_path
+from .config import db_path, server_host, server_port
 
 # A callable returning (running: bool, why: str). Injectable so tests can force
 # either verdict without a real server or process table.
 ServerCheck = Callable[[], "tuple[bool, str]"]
 
 
-def _server_running(port: int = 8000) -> "tuple[bool, str]":
+def _server_running(port: Optional[int] = None) -> "tuple[bool, str]":
     """Best-effort detection of a live wattracker server.
 
     True if either a ``python -m wattracker`` process is found (pgrep) or
     something accepts a TCP connection on ``port``.
     """
+    port = server_port() if port is None else port
     try:
         res = subprocess.run(
             ["pgrep", "-f", "--", "-m wattracker"],
@@ -65,7 +66,7 @@ def _server_running(port: int = 8000) -> "tuple[bool, str]":
     except (OSError, ValueError):
         pass  # pgrep missing (non-unix) -> fall back to the port probe
     try:
-        with socket.create_connection(("127.0.0.1", port), timeout=0.5):
+        with socket.create_connection((server_host(), port), timeout=0.5):
             return True, f"something is listening on port {port}"
     except OSError:
         pass

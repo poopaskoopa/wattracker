@@ -90,7 +90,7 @@ start() {
   log "starting: $PYTHON -m wattracker  (logs -> $LOG_FILE)"
   cd "$ROOT"
   # detach so it survives this shell; disable auto-open browser on restart
-  BROWSER=true nohup "$PYTHON" -m wattracker >>"$LOG_FILE" 2>&1 &
+  WATTRACKER_OPEN_BROWSER=0 nohup "$PYTHON" -m wattracker >>"$LOG_FILE" 2>&1 &
   local pid=$!
   echo "$pid" >"$PID_FILE"
   # health check

@@ -5,7 +5,7 @@ import sqlite3
 
 import pytest
 
-from wattracker import db, races
+from wattracker import db, paths, races
 
 pytest.importorskip("httpx")
 from fastapi.testclient import TestClient  # noqa: E402
@@ -578,7 +578,7 @@ def test_races_page_explains_rider_id(client):
     _register(client)
     text = client.get("/races").text
     assert "zwiftpower.com/profile.php?z=" in text
-    assert "Documents/Zwift/Workouts" in text
+    assert paths.zwift_workouts_root() in text
     assert 'name="rider_id"' in text
 
 

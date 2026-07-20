@@ -169,3 +169,47 @@ def test_dashboard_page_references_versioned_app_js(client):
 def test_static_response_has_no_cache_header(client):
     r = client.get("/static/app.js")
     assert r.headers["cache-control"] == "no-cache"
+
+
+@pytest.mark.parametrize(
+    "asset",
+    ["chart.umd.min.js", "chartjs-plugin-zoom.umd.min.js"],
+)
+def test_vendored_chart_assets_are_served_and_referenced(client, asset):
+    response = client.get(f"/static/vendor/{asset}")
+    assert response.status_code == 200
+    assert len(response.content) > 1000
+    login = client.get("/login")
+    assert f"/static/vendor/{asset}?v=" in login.text
+    assert "cdn.jsdelivr.net" not in login.text
+
+
+def test_settings_surfaces_secure_credential_storage_failure(client, monkeypatch):
+    from wattracker import credstore
+
+    _register(client)
+
+    def fail(*_args):
+        raise credstore.CredentialStorageError("vault unavailable")
+
+    monkeypatch.setattr(credstore, "save_zwift_credentials", fail)
+    response = client.post(
+        "/settings",
+        data={"zwift_email": "rider@example.com", "zwift_password": "secret123"},
+    )
+    assert response.status_code == 200
+    assert "NOT saved securely" in response.text
+    assert "vault unavailable" in response.text
+
+
+def test_frozen_windows_settings_uses_embedded_restore_command(client, monkeypatch):
+    import wattracker.server as server
+
+    monkeypatch.setattr(server.sys, "platform", "win32")
+    monkeypatch.setattr(server.sys, "frozen", True, raising=False)
+    monkeypatch.setattr(server.sys, "executable", r"C:\Program Files\wattracker\wattracker.exe")
+    _register(client)
+    response = client.get("/settings")
+    assert response.status_code == 200
+    assert "wattracker.exe restore" in response.text
+    assert "wattracker-restore" not in response.text

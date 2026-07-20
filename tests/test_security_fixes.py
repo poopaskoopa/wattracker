@@ -123,6 +123,42 @@ def test_settings_accepts_dir_under_home(client, tmp_path, monkeypatch):
     assert db.get_user_settings(uid)["activities_dir"] == str(good)
 
 
+def test_settings_accepts_configured_redirect_outside_home(
+    client, tmp_path, monkeypatch
+):
+    home = tmp_path / "home"
+    redirected = tmp_path / "redirected-documents" / "Zwift" / "Activities"
+    home.mkdir()
+    redirected.mkdir(parents=True)
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setenv("WATTRACKER_ACTIVITIES_DIR", str(redirected))
+    _register(client)
+    response = client.post(
+        "/settings", data={"activities_dir": str(redirected)}
+    )
+    assert response.status_code == 200
+    uid = db.get_user_by_username("tester")["id"]
+    assert db.get_user_settings(uid)["activities_dir"] == str(redirected)
+
+
+@pytest.mark.skipif(os.name != "posix", reason="symlink semantics tested on POSIX")
+def test_settings_rejects_symlink_escape_from_trusted_root(
+    client, tmp_path, monkeypatch
+):
+    home = tmp_path / "home"
+    outside = tmp_path / "outside"
+    home.mkdir()
+    outside.mkdir()
+    link = home / "escaped"
+    link.symlink_to(outside, target_is_directory=True)
+    monkeypatch.setenv("HOME", str(home))
+    _register(client)
+    response = client.post("/settings", data={"activities_dir": str(link)})
+    assert "inside your home directory" in response.text
+    uid = db.get_user_by_username("tester")["id"]
+    assert db.get_user_settings(uid)["activities_dir"] is None
+
+
 # --------------------------------------------- L2 authenticated credstore
 def test_credstore_new_format_roundtrip_and_tamper_detection(user_id):
     token = credstore._encrypt("s3cret-password")
@@ -182,6 +218,16 @@ def test_untrusted_host_rejected(client):
 
 def test_trusted_host_accepted(client):
     assert client.get("/login").status_code == 200  # default host "testserver"
+
+
+@pytest.mark.parametrize("host", ["[::1]", "[::1]:8000", "::1"])
+def test_ipv6_loopback_trusted_host_accepted(client, host):
+    assert client.get("/login", headers={"host": host}).status_code == 200
+
+
+@pytest.mark.parametrize("host", ["[::2]", "[2001:db8::1]:8000", "localhost:bad"])
+def test_other_ipv6_and_malformed_hosts_rejected(client, host):
+    assert client.get("/login", headers={"host": host}).status_code == 400
 
 
 # ------------------------------------------------------ L5 docs disabled

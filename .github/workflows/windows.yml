@@ -1,0 +1,65 @@
+name: Windows
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    runs-on: windows-latest
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.10", "3.13"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+      - run: python -m pip install -e ".[dev]"
+      - run: python -m pytest -q
+
+  package-unsigned:
+    runs-on: windows-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+          cache: pip
+      - name: Create lifecycle virtual environment
+        shell: pwsh
+        run: |
+          python -m venv .venv
+          .venv\Scripts\python -m pip install -e ".[dev]"
+      - name: PowerShell lifecycle safety
+        shell: powershell
+        run: tests\windows\lifecycle.ps1
+      - name: Build wheel and installed smoke
+        shell: pwsh
+        run: |
+          python -m pip install build
+          python -m build --wheel
+          $smoke = Join-Path $env:RUNNER_TEMP "wheel-smoke"
+          python -m venv $smoke
+          & "$smoke\Scripts\python.exe" -m pip install (Get-ChildItem dist\*.whl | Select-Object -First 1).FullName
+          Push-Location $env:RUNNER_TEMP
+          & "$smoke\Scripts\python.exe" "$env:GITHUB_WORKSPACE\packaging\smoke_installed.py"
+          Pop-Location
+      - name: Build onedir and smoke
+        shell: pwsh
+        run: |
+          python -m pip install pyinstaller ".[ble]"
+          pyinstaller --clean --noconfirm packaging\wattracker.spec
+          powershell -File packaging\smoke_frozen.ps1 -Executable dist\wattracker\wattracker.exe
+          Compress-Archive -Path dist\wattracker -DestinationPath dist\wattracker-windows-x64-unsigned.zip
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wattracker-windows-x64-unsigned
+          path: |
+            dist/*.whl
+            dist/wattracker-windows-x64-unsigned.zip
+          if-no-files-found: error
