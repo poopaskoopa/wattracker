@@ -49,3 +49,6 @@ nohup.out
 scratch/
 sanity*.py
 tmp/
+
+# local agent/editor tooling settings (may contain machine-specific paths)
+.claude/settings.local.json
