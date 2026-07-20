@@ -26,6 +26,7 @@ from __future__ import annotations
 import datetime as _dt
 import json
 import logging
+import math
 import re
 import urllib.error
 import urllib.request
@@ -158,6 +159,9 @@ def parse_zwiftpower_profile(doc: dict) -> List[dict]:
                 "activity_id": None,
                 "duration_s": int(dur) if dur and dur > 0 else None,
                 "avg_power": _f(r.get("avg_power")),
+                "avg_hr": _bounded(r.get("avg_hr"), 20, 250),
+                "max_hr": _bounded(r.get("max_hr"), 20, 250),
+                "weight_kg": _bounded(r.get("weight"), 20, 300),
                 "np": np,
                 "if_": if_,
                 "distance_km": dist if dist and dist > 0 else None,
@@ -179,6 +183,23 @@ def _f(v) -> Optional[float]:
         return float(v)
     except (TypeError, ValueError):
         return None
+
+
+def _bounded(v, low: float, high: float) -> Optional[float]:
+    """A finite ZwiftPower number inside an inclusive plausible range."""
+    value = _f(v)
+    if value is None or not math.isfinite(value) or not low <= value <= high:
+        return None
+    return value
+
+
+def _fit_hr(activity: dict) -> tuple[Optional[float], Optional[float]]:
+    """Validated average/max HR from an imported FIT activity."""
+    avg_hr = _bounded(activity.get("avg_hr"), 20, 250)
+    raw = ((activity.get("streams") or {}).get("heartrate") or [])
+    samples = [_bounded(value, 20, 250) for value in raw]
+    valid = [value for value in samples if value is not None]
+    return avg_hr, max(valid) if valid else None
 
 
 def _zid(v) -> Optional[str]:
@@ -225,6 +246,7 @@ def derive_local_results(user_id: int) -> List[dict]:
         if not _is_race(a):
             continue
         stream = (a.get("streams") or {}).get("power") or []
+        avg_hr, max_hr = _fit_hr(a)
         date = (a.get("start_time") or "")[:10] or "unknown"
         title = (a.get("filename") or "ride").rsplit(".", 1)[0]
         out.append(
@@ -236,6 +258,9 @@ def derive_local_results(user_id: int) -> List[dict]:
                 "activity_id": a["id"],
                 "duration_s": a.get("duration_s"),
                 "avg_power": a.get("avg_power"),
+                "avg_hr": avg_hr,
+                "max_hr": max_hr,
+                "weight_kg": None,
                 "np": a.get("np"),
                 "if_": a.get("if_"),
                 "power": power_per_period(stream),
@@ -353,6 +378,11 @@ def refresh_race_results(
             if act is None:
                 continue
             r["activity_id"] = act["id"]
+            fit_avg_hr, fit_max_hr = _fit_hr(act)
+            if r.get("avg_hr") is None:
+                r["avg_hr"] = fit_avg_hr
+            if r.get("max_hr") is None:
+                r["max_hr"] = fit_max_hr
             # Backfill distance from the local ride when ZwiftPower omits it.
             if not r.get("distance_km") and act.get("distance_m"):
                 r["distance_km"] = round(act["distance_m"] / 1000.0, 1)
@@ -400,9 +430,9 @@ def _weight_from_zwiftpower_doc(doc: dict) -> Optional[float]:
     rows = doc.get("data") or []
     best = None
     for r in rows:
-        w = _f(r.get("weight"))
+        w = _bounded(r.get("weight"), 20, 300)
         when = r.get("event_date") or 0
-        if w and w > 20:  # sanity: kg, not garbage
+        if w is not None:
             if best is None or when >= best[0]:
                 best = (when, w)
     return round(best[1], 1) if best else None
@@ -452,6 +482,15 @@ def race_page_data(user_id: int) -> Dict:
                 act = db.get_activity(user_id, r["activity_id"])
             if act and act.get("distance_m"):
                 r["distance_km"] = round(act["distance_m"] / 1000.0, 1)
+        if r.get("avg_hr") is None or r.get("max_hr") is None:
+            if act is None and r.get("activity_id"):
+                act = db.get_activity(user_id, r["activity_id"])
+            if act:
+                fit_avg_hr, fit_max_hr = _fit_hr(act)
+                if r.get("avg_hr") is None:
+                    r["avg_hr"] = fit_avg_hr
+                if r.get("max_hr") is None:
+                    r["max_hr"] = fit_max_hr
         if r.get("if_") is None and r.get("np"):
             ftp = db.ftp_as_of(user_id, r["event_date"])
             if ftp and ftp > 0:

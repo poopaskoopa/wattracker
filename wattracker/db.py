@@ -15,7 +15,7 @@ from typing import Dict, List, Optional
 
 from .config import db_path
 
-SCHEMA_VERSION = 15
+SCHEMA_VERSION = 16
 
 # In-place migrations: version N -> N+1 statement lists. A database whose
 # version has an unbroken chain here is upgraded without losing live data.
@@ -67,6 +67,11 @@ _MIGRATIONS: Dict[int, List[str]] = {
         "ALTER TABLE plan_workouts ADD COLUMN feedback_batch_id INTEGER",
         # New standalone_workouts and ftp_feedback_batches tables are created
         # by _SCHEMA after migrating.
+    ],
+    15: [
+        "ALTER TABLE race_results ADD COLUMN avg_hr REAL",
+        "ALTER TABLE race_results ADD COLUMN max_hr REAL",
+        "ALTER TABLE race_results ADD COLUMN weight_kg REAL",
     ],
 }
 
@@ -217,6 +222,9 @@ CREATE TABLE IF NOT EXISTS race_results (
     activity_id  INTEGER,
     duration_s   INTEGER,
     avg_power    REAL,
+    avg_hr       REAL,
+    max_hr       REAL,
+    weight_kg    REAL,
     np           REAL,
     if_          REAL,
     power_json   TEXT,
@@ -1485,17 +1493,18 @@ def replace_race_results(
                 """
                 INSERT OR REPLACE INTO race_results
                   (user_id, source, event_date, event_title, position, category,
-                   activity_id, duration_s, avg_power, np, if_, power_json,
-                   source_type, distance_km, zp_event_id, fetched_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                   activity_id, duration_s, avg_power, avg_hr, max_hr, weight_kg,
+                   np, if_, power_json, source_type, distance_km, zp_event_id,
+                   fetched_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     user_id, source, r["event_date"], r["event_title"],
                     r.get("position"), r.get("category"), r.get("activity_id"),
-                    r.get("duration_s"), r.get("avg_power"), r.get("np"),
-                    r.get("if_"), json.dumps(r.get("power") or {}),
-                    r.get("source_type"), r.get("distance_km"), zp_event_id,
-                    r["fetched_at"],
+                    r.get("duration_s"), r.get("avg_power"), r.get("avg_hr"),
+                    r.get("max_hr"), r.get("weight_kg"), r.get("np"), r.get("if_"),
+                    json.dumps(r.get("power") or {}), r.get("source_type"),
+                    r.get("distance_km"), zp_event_id, r["fetched_at"],
                 ),
             )
         conn.commit()

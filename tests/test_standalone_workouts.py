@@ -87,7 +87,7 @@ def test_v14_migration_preserves_data_and_adds_standalone_table(tmp_path):
     db.init_db(path)
 
     conn = sqlite3.connect(path)
-    assert conn.execute("PRAGMA user_version").fetchone()[0] == 15
+    assert conn.execute("PRAGMA user_version").fetchone()[0] == db.SCHEMA_VERSION
     assert conn.execute("SELECT username FROM users WHERE id=?", (uid,)).fetchone()[0] == "kept"
     assert conn.execute(
         "SELECT name FROM sqlite_master WHERE type='table' AND name='standalone_workouts'"

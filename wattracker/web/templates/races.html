@@ -92,6 +92,9 @@
         <th class="sortable" data-type="text">Cat</th>
         <th class="sortable" data-type="num">Duration</th>
         <th class="sortable" data-type="num">Distance</th>
+        <th class="sortable" data-type="num">Avg HR</th>
+        <th class="sortable" data-type="num">Max HR</th>
+        <th class="sortable" data-type="num">Weight</th>
         <th class="sortable" data-type="num">Avg&nbsp;<span class="unit-label">W</span></th>
         <th class="sortable" data-type="num">NP&nbsp;(<span class="unit-label">W</span>)</th>
         {% for l in duration_labels %}<th class="sortable" data-type="num">{{ l }}</th>{% endfor %}
@@ -108,6 +111,9 @@
             <td data-sort="{{ r.category or '' }}">{{ r.category or '—' }}</td>
             <td class="nowrap" data-sort="{{ r.duration_s or 0 }}">{{ r.duration_fmt or '—' }}</td>
             <td class="nowrap" data-sort="{{ r.distance_km if r.distance_km else '' }}">{{ ('%g'|format(r.distance_km|round(1))) ~ ' km' if r.distance_km else '—' }}</td>
+            <td class="nowrap" data-sort="{{ r.avg_hr if r.avg_hr is not none else '' }}">{{ (r.avg_hr|round(0)|int) ~ ' bpm' if r.avg_hr is not none else '—' }}</td>
+            <td class="nowrap" data-sort="{{ r.max_hr if r.max_hr is not none else '' }}">{{ (r.max_hr|round(0)|int) ~ ' bpm' if r.max_hr is not none else '—' }}</td>
+            <td class="nowrap" data-sort="{{ r.weight_kg if r.weight_kg is not none else '' }}">{{ ('%.1f'|format(r.weight_kg)) ~ ' kg' if r.weight_kg is not none else '—' }}</td>
             <td data-sort="{{ r.avg_power|round(0)|int if r.avg_power else '' }}">{% if r.avg_power %}<span class="pw" data-w="{{ r.avg_power|round(0)|int }}">{{ r.avg_power|round(0)|int }}</span>{% else %}—{% endif %}</td>
             <td data-sort="{{ r.np|round(0)|int if r.np else '' }}">{% if r.np %}<span class="pw" data-w="{{ r.np|round(0)|int }}">{{ r.np|round(0)|int }}</span>{% else %}—{% endif %}</td>
             {% for d in durations %}

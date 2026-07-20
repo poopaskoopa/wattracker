@@ -1,5 +1,7 @@
 """Tests for race results: source fallback, heuristics, power table, routes."""
 import datetime as dt
+import re
+import sqlite3
 
 import pytest
 
@@ -22,7 +24,8 @@ def _register(client, username="rider"):
     client.post("/register", data={"username": username, "password": "password123"})
 
 
-def _activity(user_id, start_time, seconds, watts, if_=0.9, tss=80.0):
+def _activity(user_id, start_time, seconds, watts, if_=0.9, tss=80.0,
+              avg_hr=0.0, heartrate=None):
     return db.insert_activity(
         user_id,
         {
@@ -32,11 +35,14 @@ def _activity(user_id, start_time, seconds, watts, if_=0.9, tss=80.0):
             "duration_s": seconds,
             "distance_m": 0.0,
             "avg_power": watts,
-            "avg_hr": 0.0,
+            "avg_hr": avg_hr,
             "np": watts,
             "if_": if_,
             "tss": tss,
-            "streams": {"power": [watts] * seconds},
+            "streams": {
+                "power": [watts] * seconds,
+                "heartrate": heartrate or [],
+            },
         },
     )
 
@@ -140,6 +146,157 @@ def test_refresh_uses_zwiftpower_when_it_answers(user_id, monkeypatch):
     assert rows[0]["power"]["300"] == 260  # filled from the local ride
     # The race resolves to its same-day imported ride for the graphs link.
     assert rows[0]["activity_id"] is not None
+
+
+def test_parse_hr_and_weight_scalar_string_pair_and_invalid_ranges():
+    base = {
+        "event_date": int(dt.datetime(2026, 6, 1, 10).timestamp()),
+        "f_t": "TYPE_RACE",
+    }
+    doc = {"data": [
+        dict(base, event_title="pairs", avg_hr=[151, 0], max_hr=[188, 1],
+             weight=[71.25, 0]),
+        dict(base, event_title="strings", avg_hr="149.5", max_hr="190",
+             weight="68.4"),
+        dict(base, event_title="nonpositive", avg_hr=0, max_hr=-1, weight=0),
+        dict(base, event_title="invalid", avg_hr=19, max_hr=251, weight=301),
+        dict(base, event_title="nonfinite", avg_hr="nan", max_hr="inf",
+             weight="nan"),
+    ]}
+    rows = {row["event_title"]: row for row in races.parse_zwiftpower_profile(doc)}
+    assert rows["pairs"]["avg_hr"] == 151
+    assert rows["pairs"]["max_hr"] == 188
+    assert rows["pairs"]["weight_kg"] == 71.25
+    assert rows["strings"]["avg_hr"] == 149.5
+    assert rows["strings"]["max_hr"] == 190
+    assert rows["strings"]["weight_kg"] == 68.4
+    assert rows["nonpositive"]["avg_hr"] is None
+    assert rows["nonpositive"]["max_hr"] is None
+    assert rows["nonpositive"]["weight_kg"] is None
+    assert rows["invalid"]["avg_hr"] is None
+    assert rows["invalid"]["max_hr"] is None
+    assert rows["invalid"]["weight_kg"] is None
+    assert rows["nonfinite"]["avg_hr"] is None
+    assert rows["nonfinite"]["max_hr"] is None
+    assert rows["nonfinite"]["weight_kg"] is None
+
+
+def test_remote_hr_wins_and_missing_hr_falls_back_to_fit(user_id, monkeypatch):
+    _activity(
+        user_id, "2026-06-01T10:00:00", 3600, 260, avg_hr=145,
+        heartrate=[140, 155, None, 201, float("nan")],
+    )
+    doc = {"data": [{
+        "event_date": int(dt.datetime(2026, 6, 1, 10).timestamp()),
+        "event_title": "Remote HR", "f_t": "TYPE_RACE",
+        "avg_hr": [160, 0], "max_hr": "190", "weight": [70.2, 0],
+    }]}
+    monkeypatch.setattr(races, "_http_get_json", lambda url, timeout=0: doc)
+    races.refresh_race_results(user_id, "1234567")
+    row = db.list_race_results(user_id)[0]
+    assert (row["avg_hr"], row["max_hr"], row["weight_kg"]) == (160, 190, 70.2)
+
+    doc["data"][0].pop("avg_hr")
+    doc["data"][0].pop("max_hr")
+    races.refresh_race_results(user_id, "1234567")
+    row = db.list_race_results(user_id)[0]
+    assert row["avg_hr"] == 145
+    assert row["max_hr"] == 201
+    assert row["weight_kg"] == 70.2
+
+
+def test_local_heuristic_includes_fit_hr_but_not_current_weight(user_id):
+    db.save_user_settings(user_id, {"weight_kg": 68.0})
+    _activity(
+        user_id, "2026-06-01T10:00:00", 3600, 260, avg_hr=152,
+        heartrate=[145, 180, None],
+    )
+    row = races.derive_local_results(user_id)[0]
+    assert row["avg_hr"] == 152
+    assert row["max_hr"] == 180
+    assert row["weight_kg"] is None
+
+
+def test_older_cached_linked_race_gets_page_time_fit_hr_fallback(user_id):
+    activity_id = _activity(
+        user_id, "2026-06-01T10:00:00", 3600, 260, avg_hr=148,
+        heartrate=[142, 176, None],
+    )
+    db.replace_race_results(user_id, "zwiftpower", [{
+        "event_date": "2026-06-01", "event_title": "Cached Race",
+        "position": "1", "category": "B", "activity_id": activity_id,
+        "duration_s": 3600, "avg_power": 250, "np": 260, "if_": 1.0,
+        "power": {}, "fetched_at": "2026-06-01T12:00:00",
+    }])
+    row = races.race_page_data(user_id)["results"][0]
+    assert row["avg_hr"] == 148
+    assert row["max_hr"] == 176
+    assert row["weight_kg"] is None
+
+
+def test_v15_migration_preserves_races_and_hr_weight_roundtrip(tmp_path):
+    path = str(tmp_path / "race-v15.db")
+    db.init_db(path)
+    uid = db.create_user("kept", "hash", path)
+    result = {
+        "event_date": "2026-06-01", "event_title": "Kept Race",
+        "position": "2", "category": "B", "activity_id": None,
+        "duration_s": 3600, "avg_power": 250, "avg_hr": 151.5,
+        "max_hr": 188, "weight_kg": 70.2, "np": 260, "if_": 1.0,
+        "power": {}, "fetched_at": "2026-06-01T12:00:00",
+    }
+    db.replace_race_results(uid, "zwiftpower", [result], path)
+    conn = sqlite3.connect(path)
+    for column in ("avg_hr", "max_hr", "weight_kg"):
+        conn.execute(f"ALTER TABLE race_results DROP COLUMN {column}")
+    conn.execute("PRAGMA user_version=15")
+    conn.commit()
+    conn.close()
+
+    db.init_db(path)
+    row = db.list_race_results(uid, path)[0]
+    assert row["event_title"] == "Kept Race"
+    assert row["avg_hr"] is None and row["max_hr"] is None
+    assert row["weight_kg"] is None
+    db.replace_race_results(uid, "zwiftpower", [result], path)
+    row = db.list_race_results(uid, path)[0]
+    assert (row["avg_hr"], row["max_hr"], row["weight_kg"]) == (151.5, 188, 70.2)
+    other = db.create_user("other", "hash", path)
+    assert db.list_race_results(other, path) == []
+
+
+def test_race_table_renders_sortable_hr_weight_and_missing_values(client, monkeypatch):
+    from wattracker import credstore, zwiftauth
+
+    _register(client)
+    uid = db.get_user_by_username("rider")["id"]
+    doc = {"data": [
+        {
+            "event_date": int(dt.datetime(2026, 6, 1, 10).timestamp()),
+            "event_title": "With Biometrics", "f_t": "TYPE_RACE",
+            "avg_hr": [151.4, 0], "max_hr": "189", "weight": 70.25,
+        },
+        {
+            "event_date": int(dt.datetime(2026, 5, 1, 10).timestamp()),
+            "event_title": "Missing Biometrics", "f_t": "TYPE_RACE",
+        },
+    ]}
+    credstore.save_zwift_credentials(uid, "a@b.com", "pw")
+    monkeypatch.setattr(
+        zwiftauth, "fetch_results_authenticated",
+        lambda email, password, rider_id=None: (doc, "1234567", 72.0),
+    )
+    client.post("/races/refresh", data={"rider_id": "1234567"})
+    text = client.get("/races").text
+    headers = [text.index(label) for label in ("Avg HR", "Max HR", "Weight")]
+    assert headers == sorted(headers)
+    assert text.count('class="sortable" data-type="num"') >= 3
+    assert "151 bpm" in text and "189 bpm" in text and "70.2 kg" in text
+    missing_row = re.search(
+        r"<tr>.*?Missing Biometrics.*?</tr>", text, flags=re.DOTALL
+    ).group(0)
+    assert missing_row.count("—") >= 3
+    assert 'data-weight="72.0"' in text  # existing current-weight W/kg toggle
 
 
 def test_race_links_to_matching_ride_and_none_when_absent(user_id, monkeypatch):
