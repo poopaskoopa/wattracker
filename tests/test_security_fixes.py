@@ -93,6 +93,7 @@ def test_parse_fit_caps_record_count(monkeypatch):
 
 
 # --------------------------------------------------- M3 directory confinement
+@pytest.mark.skipif(os.name == "nt", reason="/etc is POSIX-specific")
 def test_settings_rejects_dir_outside_home(client):
     _register(client)
     r = client.post("/settings", data={"activities_dir": "/etc"})
