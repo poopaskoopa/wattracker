@@ -20,19 +20,36 @@ New-Item -ItemType Directory -Force -Path $TempRoot | Out-Null
 $process = Start-Process -FilePath (Resolve-Path $Executable) -WorkingDirectory $TempRoot -PassThru
 try {
     $base = "http://127.0.0.1:$($env:WATTRACKER_PORT)"
-    $deadline = (Get-Date).AddSeconds(30)
+    $deadline = (Get-Date).AddSeconds(90)
+    $ready = $false
     while ((Get-Date) -lt $deadline) {
-        try { if ((Invoke-WebRequest -UseBasicParsing "$base/login" -TimeoutSec 2).StatusCode -eq 200) { break } } catch {}
+        $process.Refresh()
+        if ($process.HasExited) {
+            throw "frozen app exited before becoming ready (exit code $($process.ExitCode))"
+        }
+        try {
+            if ((Invoke-WebRequest -UseBasicParsing "$base/login" -TimeoutSec 2).StatusCode -eq 200) {
+                $ready = $true
+                break
+            }
+        } catch {}
         Start-Sleep -Milliseconds 500
     }
-    if ((Invoke-WebRequest -UseBasicParsing "$base/static/style.css").StatusCode -ne 200) { throw "static smoke failed" }
+    if (-not $ready) {
+        $process.Refresh()
+        if ($process.HasExited) {
+            throw "frozen app exited before becoming ready (exit code $($process.ExitCode))"
+        }
+        throw "frozen app did not become ready at $base/login within 90 seconds"
+    }
+    if ((Invoke-WebRequest -UseBasicParsing "$base/static/style.css" -TimeoutSec 10).StatusCode -ne 200) { throw "static smoke failed" }
     foreach ($asset in @("chart.umd.min.js", "chartjs-plugin-zoom.umd.min.js")) {
-        $response = Invoke-WebRequest -UseBasicParsing "$base/static/vendor/$asset"
+        $response = Invoke-WebRequest -UseBasicParsing "$base/static/vendor/$asset" -TimeoutSec 10
         if ($response.StatusCode -ne 200 -or $response.Content.Length -lt 1000) {
             throw "vendored chart asset smoke failed: $asset"
         }
     }
-    if ((Invoke-WebRequest -UseBasicParsing "$base/register").StatusCode -ne 200) { throw "register smoke failed" }
+    if ((Invoke-WebRequest -UseBasicParsing "$base/register" -TimeoutSec 10).StatusCode -ne 200) { throw "register smoke failed" }
 } finally {
     Stop-Process -Id $process.Id -ErrorAction SilentlyContinue
     Wait-Process -Id $process.Id -Timeout 10 -ErrorAction SilentlyContinue
