@@ -325,6 +325,13 @@ def init_db(path: Optional[str] = None) -> None:
         if version == SCHEMA_VERSION:
             conn.executescript(_SCHEMA)  # idempotent CREATE IF NOT EXISTS
         elif 0 < version < SCHEMA_VERSION and _can_migrate(version):
+            # Back up the live data BEFORE mutating it. A migration that goes
+            # wrong (or stale code that mis-migrates) has twice wiped the live
+            # DB; a pre-migration snapshot is the recovery anchor. If the backup
+            # cannot be written, abort - never migrate an unbacked database.
+            from . import backup as _backup
+
+            _backup.create_backup("pre-migration", src_path=path or db_path())
             for v in range(version, SCHEMA_VERSION):
                 for stmt in _MIGRATIONS[v]:
                     try:

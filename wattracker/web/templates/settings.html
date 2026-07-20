@@ -5,6 +5,7 @@
 
 {% if saved %}<p class="ok">Settings saved.</p>{% endif %}
 {% if cred_message %}<p class="{{ 'ok' if 'saved (' in cred_message or 'cleared' in cred_message else 'alert' }}">{{ cred_message }}</p>{% endif %}
+{% if backup_message %}<p class="{{ 'alert' if 'failed' in backup_message else 'ok' }}">{{ backup_message }}</p>{% endif %}
 
 <p class="current-ftp"><strong>Current Training FTP:</strong> {{ current_ftp }} W</p>
 {% if recent_best_effort_ftp > 0 %}
@@ -88,6 +89,42 @@
     <button type="submit" class="danger-btn">Clear Zwift credentials</button>
 </form>
 {% endif %}
+
+<h3>Backups</h3>
+<p class="hint">Backups are full snapshots of the database and therefore cover
+   <strong>all users&rsquo; data</strong>, not just yours. They are taken
+   automatically before every schema migration and once a day; you can also
+   trigger one now. The newest 10 daily, 10 pre-migration, 5 manual, and 5
+   pre-restore backups are kept.</p>
+
+<form method="post" action="/settings/backup" class="backup-form">
+    <button type="submit">Back up now</button>
+</form>
+
+{% if backups %}
+<table class="backup-table">
+    <thead><tr><th>Date</th><th>Reason</th><th>Size</th></tr></thead>
+    <tbody>
+    {% for b in backups %}
+        <tr>
+            <td>{{ b.timestamp.strftime('%Y-%m-%d %H:%M:%S') }}</td>
+            <td>{{ b.reason }}</td>
+            <td>{{ b.size | filesizeformat }}</td>
+        </tr>
+    {% endfor %}
+    </tbody>
+</table>
+{% else %}
+<p class="hint">No backups yet.</p>
+{% endif %}
+
+<p class="hint">Restore is done <strong>offline</strong> via the command line
+   &mdash; never while the server is running (that corrupts the database). Stop
+   the server, then run:
+   <br><code>{{ restore_cmd }}</code>
+   to list backups, and
+   <br><code>{{ restore_cmd }} --restore N</code>
+   to restore backup number <code>N</code>.</p>
 
 <p class="hint">FTP, Zwift ID, and folder paths are private to your account.
    The Anthropic API key is app-level (shared) and the app is fully functional

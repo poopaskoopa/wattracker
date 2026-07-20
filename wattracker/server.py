@@ -21,7 +21,7 @@ from fastapi.templating import Jinja2Templates
 from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.middleware.sessions import SessionMiddleware
 
-from . import auth, config, credstore, db, exporter, paths, races
+from . import auth, backup, config, credstore, db, exporter, paths, races
 from .analysis import pipeline, zones
 from .ble import devices as bledevices
 from .ble.runner import RideController, flatten_session
@@ -126,6 +126,13 @@ def run_daily_maintenance() -> dict:
     totals["adapted"] = 0
     totals["races"] = 0
     totals["exported"] = 0
+    # Daily safety snapshot of the whole DB (once per ~day even if the sweep
+    # runs more often). Never let a backup failure abort maintenance.
+    try:
+        if backup.create_daily_if_due() is not None:
+            totals["backed_up"] = 1
+    except Exception:
+        _log.warning("daily backup failed", exc_info=True)
     for uid in db.all_user_ids():
         try:
             # Daily self-heal: the fast rescan only matches completions when new
@@ -1015,7 +1022,8 @@ def create_app() -> FastAPI:
         )
 
     def _settings_ctx(request: Request, uid: int, saved: bool,
-                      cred_message: Optional[str] = None) -> dict:
+                      cred_message: Optional[str] = None,
+                      backup_message: Optional[str] = None) -> dict:
         settings = db.get_user_settings(uid)
         return _ctx(
             request,
@@ -1029,6 +1037,9 @@ def create_app() -> FastAPI:
             zwift_creds_saved=credstore.credentials_saved(uid),
             zwift_cred_backend=credstore.storage_backend(),
             cred_message=cred_message,
+            backups=backup.list_backups(),
+            backup_message=backup_message,
+            restore_cmd=".venv/bin/python -m wattracker.restore_backup",
         )
 
     @app.get("/settings", response_class=HTMLResponse)
@@ -1107,6 +1118,20 @@ def create_app() -> FastAPI:
             request, "settings.html",
             _settings_ctx(request, uid, False,
                           cred_message="Zwift credentials cleared."),
+        )
+
+    @app.post("/settings/backup", response_class=HTMLResponse)
+    def settings_backup_now(request: Request):
+        uid = _uid(request)
+        try:
+            path = backup.create_backup("manual")
+            msg = f"Backup created: {os.path.basename(path)}"
+        except Exception as e:  # never crash the settings page on a bad backup
+            _log.warning("manual backup failed", exc_info=True)
+            msg = f"Backup failed: {e}"
+        return templates.TemplateResponse(
+            request, "settings.html",
+            _settings_ctx(request, uid, False, backup_message=msg),
         )
 
     # ------------------------------------------------------------- races
