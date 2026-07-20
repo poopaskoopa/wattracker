@@ -5,9 +5,12 @@
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <title>{% block title %}wattracker{% endblock %}</title>
     <link rel="stylesheet" href="{{ static_url('style.css') }}">
-    <script src="https://cdn.jsdelivr.net/npm/chart.js@4"></script>
-    <!-- Drag-to-zoom on the time-series chart (matches Chart.js v4). -->
-    <script src="https://cdn.jsdelivr.net/npm/chartjs-plugin-zoom@2"></script>
+    <!-- Vendored locally so the app is fully self-contained (no external CDN).
+         chart.js v4.5.1 UMD build; chartjs-plugin-zoom v2.2.0 (v2 requires
+         chart.js v4 - keep these majors aligned when updating). -->
+    <script src="{{ static_url('vendor/chart.umd.min.js') }}"></script>
+    <!-- Drag-to-zoom on the time-series chart (loaded after chart.js). -->
+    <script src="{{ static_url('vendor/chartjs-plugin-zoom.umd.min.js') }}"></script>
 </head>
 <body>
     <header>
@@ -24,7 +27,9 @@
             <a href="/profile">Profile</a>
             <a href="/settings">Settings</a>
             <span class="user">{{ username }}</span>
-            <a href="/logout" class="logout">Logout</a>
+            <form action="/logout" method="post" class="logout-form">
+                <button type="submit" class="logout">Logout</button>
+            </form>
         </nav>
         {% endif %}
     </header>

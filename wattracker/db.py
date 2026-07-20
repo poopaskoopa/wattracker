@@ -9,13 +9,32 @@ from __future__ import annotations
 
 import datetime as _dt
 import json
+import logging
+import os
 import sqlite3
 import zlib
 from typing import Dict, List, Optional
 
 from .config import db_path
 
+_log = logging.getLogger(__name__)
+
 SCHEMA_VERSION = 17
+
+
+def _restrict_db_files(path: str) -> None:
+    """Best-effort 0600 on the DB file and its WAL/SHM sidecars.
+
+    The DB holds password hashes and encrypted Zwift credentials, so it must not
+    be world-readable. chmod is best-effort: filesystems that don't support
+    POSIX modes (Windows, some network mounts) must not crash the app.
+    """
+    for p in (path, path + "-wal", path + "-shm"):
+        try:
+            if os.path.exists(p):
+                os.chmod(p, 0o600)
+        except OSError:
+            _log.debug("could not chmod %s to 0600", p, exc_info=True)
 
 # In-place migrations: version N -> N+1 statement lists. A database whose
 # version has an unbroken chain here is upgraded without losing live data.
@@ -312,6 +331,7 @@ def init_db(path: Optional[str] = None) -> None:
       crash, never "fix" a database from the future.
     - Anything else (fresh db, unmigratable older version): clean drop/recreate.
     """
+    resolved = path or db_path()
     conn = connect(path)
     try:
         version = conn.execute("PRAGMA user_version").fetchone()[0]
@@ -353,6 +373,8 @@ def init_db(path: Optional[str] = None) -> None:
         conn.commit()
     finally:
         conn.close()
+    # Lock down the DB file (and any WAL/SHM sidecars) after it exists.
+    _restrict_db_files(resolved)
 
 
 # ----------------------------------------------------------------- users

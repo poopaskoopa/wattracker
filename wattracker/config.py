@@ -9,20 +9,35 @@ file (config.json in the app data dir).
 from __future__ import annotations
 
 import json
+import logging
 import os
 import secrets
 from dataclasses import dataclass
 from typing import Optional
 
+_log = logging.getLogger(__name__)
+
+
+def _restrict(path: str, mode: int) -> None:
+    """Best-effort ``chmod`` so the data dir/files aren't world-readable.
+
+    makedirs()'s mode is masked by the umask, and some filesystems (Windows,
+    network mounts) don't honour POSIX modes at all - so chmod explicitly and
+    never let an unsupported-FS failure crash the app.
+    """
+    try:
+        if os.path.exists(path):
+            os.chmod(path, mode)
+    except OSError:
+        _log.debug("could not chmod %s to %o", path, mode, exc_info=True)
+
 
 def app_data_dir() -> str:
-    """Directory for wattracker's own data (db + config.json)."""
+    """Directory for wattracker's own data (db + config.json), owner-only (0700)."""
     override = os.environ.get("WATTRACKER_DATA_DIR")
-    if override:
-        os.makedirs(override, exist_ok=True)
-        return override
-    base = os.path.join(os.path.expanduser("~"), ".wattracker")
-    os.makedirs(base, exist_ok=True)
+    base = override or os.path.join(os.path.expanduser("~"), ".wattracker")
+    os.makedirs(base, mode=0o700, exist_ok=True)
+    _restrict(base, 0o700)
     return base
 
 
@@ -56,8 +71,12 @@ def _load_json() -> dict:
 
 
 def _save_json(data: dict) -> None:
-    with open(config_path(), "w", encoding="utf-8") as f:
+    path = config_path()
+    with open(path, "w", encoding="utf-8") as f:
         json.dump(data, f, indent=2)
+    # config.json can hold the session secret and the Anthropic API key - keep
+    # it owner-only.
+    _restrict(path, 0o600)
 
 
 def load_config() -> Config:

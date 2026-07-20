@@ -140,7 +140,7 @@ def test_activity_detail_api_404_and_scoped(client):
     _register(client, "alice")
     uid = db.get_user_by_username("alice")["id"]
     aid = _insert(uid, seconds=600)
-    client.get("/logout")
+    client.post("/logout")
     _register(client, "bob")
     assert client.get(f"/api/activity/{aid}").status_code == 404
 
@@ -149,7 +149,7 @@ def test_activity_page_redirects_when_not_owner(client):
     _register(client, "alice")
     uid = db.get_user_by_username("alice")["id"]
     aid = _insert(uid, seconds=600)
-    client.get("/logout")
+    client.post("/logout")
     _register(client, "bob")
     r = client.get(f"/activity/{aid}", follow_redirects=False)
     assert r.status_code == 303

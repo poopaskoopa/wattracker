@@ -20,6 +20,7 @@ from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.middleware.sessions import SessionMiddleware
+from starlette.middleware.trustedhost import TrustedHostMiddleware
 
 from . import auth, backup, config, credstore, db, exporter, paths, races
 from .analysis import pipeline, zones
@@ -213,9 +214,18 @@ class NoCacheStaticFiles(StaticFiles):
         response.headers["Cache-Control"] = "no-cache"
         return response
 
-# Paths served without authentication.
+# Paths served without authentication. Interactive docs are disabled (see the
+# FastAPI() constructor), so no /docs, /openapi or /redoc prefixes are exempt.
 _EXEMPT = ("/login", "/register")
-_EXEMPT_PREFIXES = ("/static", "/docs", "/openapi", "/redoc", "/favicon")
+_EXEMPT_PREFIXES = ("/static", "/favicon")
+
+# Max in-memory size for an uploaded activity file (bytes). A real .fit ride is
+# well under this; the cap stops a huge upload from exhausting memory.
+MAX_UPLOAD_BYTES = 50 * 1024 * 1024
+
+# WebSocket handshakes are only accepted from same-origin (local) browsers; a
+# cross-site page's Origin will never match, blocking cross-site WS hijacking.
+_ALLOWED_WS_ORIGIN_HOSTS = ("localhost", "127.0.0.1", "[::1]")
 
 
 class AuthMiddleware(BaseHTTPMiddleware):
@@ -262,19 +272,34 @@ def create_app() -> FastAPI:
             except (asyncio.TimeoutError, asyncio.CancelledError):
                 task.cancel()
 
-    app = FastAPI(title="wattracker", lifespan=lifespan)
+    # Local single-purpose app: interactive API docs / OpenAPI schema are
+    # disabled to reduce surface area.
+    app = FastAPI(
+        title="wattracker",
+        lifespan=lifespan,
+        docs_url=None,
+        redoc_url=None,
+        openapi_url=None,
+    )
     app.mount("/static", NoCacheStaticFiles(directory=_STATIC_DIR), name="static")
     # Per-user cache of the last generated .zwo (avoids cross-user bleed).
     app.state.last = {}
+    # In-process brute-force throttle for /login (per lowercased username).
+    app.state.login_throttle = auth.LoginThrottle()
 
-    # SessionMiddleware must be OUTER (added last) so request.session is
-    # populated before AuthMiddleware runs.
+    # SessionMiddleware must be OUTER (added after AuthMiddleware) so
+    # request.session is populated before AuthMiddleware runs. TrustedHost is
+    # added last so it runs first and rejects spoofed Host headers early.
     app.add_middleware(AuthMiddleware)
     app.add_middleware(
         SessionMiddleware,
         secret_key=config.session_secret(),
         session_cookie="wattracker_session",
         same_site="lax",
+    )
+    app.add_middleware(
+        TrustedHostMiddleware,
+        allowed_hosts=["localhost", "127.0.0.1", "testserver"],
     )
 
     # -------------------------------------------------------------- auth
@@ -320,18 +345,45 @@ def create_app() -> FastAPI:
         username: str = Form(...),
         password: str = Form(...),
     ):
-        user = db.get_user_by_username((username or "").strip())
-        if not user or not auth.verify_password(password, user["password_hash"]):
+        uname = (username or "").strip()
+        throttle = app.state.login_throttle
+        if throttle.retry_after(uname) > 0:
+            # Locked out after repeated failures. Generic message, no hint about
+            # whether the username exists.
+            return templates.TemplateResponse(
+                request,
+                "login.html",
+                {"request": request,
+                 "error": "Too many failed attempts. Please wait and try again."},
+                status_code=429,
+            )
+        user = db.get_user_by_username(uname)
+        if user:
+            ok = auth.verify_password(password, user["password_hash"])
+        else:
+            # Spend the same scrypt time as a real verify so a missing username
+            # isn't distinguishable by timing.
+            auth.dummy_verify(password)
+            ok = False
+        if not ok:
+            throttle.record_failure(uname)
             return templates.TemplateResponse(
                 request,
                 "login.html",
                 {"request": request, "error": "Invalid username or password."},
             )
+        throttle.record_success(uname)
+        # Transparent upgrade: re-hash legacy/low-cost hashes at the current cost.
+        if auth.needs_rehash(user["password_hash"]):
+            try:
+                db.set_password_hash(user["username"], auth.hash_password(password))
+            except Exception:
+                _log.warning("password rehash on login failed", exc_info=True)
         request.session["user_id"] = user["id"]
         request.session["username"] = user["username"]
         return RedirectResponse("/", status_code=303)
 
-    @app.get("/logout")
+    @app.post("/logout")
     def logout(request: Request):
         request.session.clear()
         return RedirectResponse("/login", status_code=303)
@@ -467,7 +519,15 @@ def create_app() -> FastAPI:
 
     @app.post("/activities/upload")
     async def upload(request: Request, file: UploadFile):
+        # Reject oversized uploads before/while reading the whole body into
+        # memory. Prefer the declared size when present, but always re-check the
+        # bytes actually read (Content-Length can lie).
+        size = getattr(file, "size", None)
+        if size is not None and size > MAX_UPLOAD_BYTES:
+            return Response("Uploaded file is too large.", status_code=413)
         content = await file.read()
+        if len(content) > MAX_UPLOAD_BYTES:
+            return Response("Uploaded file is too large.", status_code=413)
         importer.ingest_upload(_uid(request), file.filename or "upload.fit", content)
         return RedirectResponse(url="/activities", status_code=303)
 
@@ -1014,16 +1074,20 @@ def create_app() -> FastAPI:
         last = app.state.last.get(_uid(request))
         if not last:
             return RedirectResponse(url="/plan", status_code=303)
-        fname = (last["name"] or "workout").replace(" ", "_")
+        # Sanitize with the same helper the plan/zip paths use so the header
+        # can't be injected/broken by an odd workout name. _safe_filename
+        # already appends ".zwo".
+        fname = zwo._safe_filename(last["name"] or "workout")
         return Response(
             content=last["zwo"],
             media_type="application/xml",
-            headers={"Content-Disposition": f'attachment; filename="{fname}.zwo"'},
+            headers={"Content-Disposition": f'attachment; filename="{fname}"'},
         )
 
     def _settings_ctx(request: Request, uid: int, saved: bool,
                       cred_message: Optional[str] = None,
-                      backup_message: Optional[str] = None) -> dict:
+                      backup_message: Optional[str] = None,
+                      dir_message: Optional[str] = None) -> dict:
         settings = db.get_user_settings(uid)
         return _ctx(
             request,
@@ -1039,8 +1103,29 @@ def create_app() -> FastAPI:
             cred_message=cred_message,
             backups=backup.list_backups(),
             backup_message=backup_message,
+            dir_message=dir_message,
             restore_cmd=".venv/bin/python -m wattracker.restore_backup",
         )
+
+    def _validate_dir(value: str) -> "tuple[Optional[str], Optional[str]]":
+        """Validate a user-supplied folder path.
+
+        Returns (clean_path, error). A folder is accepted only when it exists,
+        is a directory, and resolves under the user's home directory - this
+        confines both the activities and Zwift-workouts folders to a sane root
+        and blocks pointing the app at arbitrary system paths. An empty value is
+        accepted as "unchanged" (clean_path="", error=None).
+        """
+        raw = (value or "").strip()
+        if not raw:
+            return "", None
+        expanded = os.path.abspath(os.path.expanduser(raw))
+        home = os.path.abspath(os.path.expanduser("~"))
+        if not os.path.isdir(expanded):
+            return None, f"Folder not found or not a directory: {raw}"
+        if os.path.commonpath([expanded, home]) != home:
+            return None, f"Folder must be inside your home directory: {raw}"
+        return expanded, None
 
     @app.get("/settings", response_class=HTMLResponse)
     def settings_page(request: Request):
@@ -1071,13 +1156,24 @@ def create_app() -> FastAPI:
                 weight_val = None
         except ValueError:
             weight_val = None
+        # Confine user-supplied folders to existing directories under $HOME; a
+        # rejected folder is dropped from the update (existing value kept).
+        dir_msgs: List[str] = []
+        clean_activities, act_err = _validate_dir(activities_dir)
+        if act_err:
+            dir_msgs.append(act_err)
+            clean_activities = ""  # don't persist an invalid path
+        clean_workouts, wk_err = _validate_dir(workouts_dir)
+        if wk_err:
+            dir_msgs.append(wk_err)
+            clean_workouts = ""
         db.save_user_settings(
             uid,
             {
                 "ftp": ftp,
                 "zwift_id": chosen_zwift_id,
-                "activities_dir": activities_dir,
-                "workouts_dir": workouts_dir,
+                "activities_dir": clean_activities,
+                "workouts_dir": clean_workouts,
                 "weight_kg": weight_val,
             },
         )
@@ -1107,7 +1203,8 @@ def create_app() -> FastAPI:
                             "password are needed.")
         return templates.TemplateResponse(
             request, "settings.html",
-            _settings_ctx(request, uid, True, cred_message=cred_message),
+            _settings_ctx(request, uid, True, cred_message=cred_message,
+                          dir_message="; ".join(dir_msgs) or None),
         )
 
     @app.post("/settings/zwift-credentials/clear", response_class=HTMLResponse)
@@ -1126,9 +1223,10 @@ def create_app() -> FastAPI:
         try:
             path = backup.create_backup("manual")
             msg = f"Backup created: {os.path.basename(path)}"
-        except Exception as e:  # never crash the settings page on a bad backup
+        except Exception:  # never crash the settings page on a bad backup
             _log.warning("manual backup failed", exc_info=True)
-            msg = f"Backup failed: {e}"
+            # Don't leak the raw error/local paths to the UI.
+            msg = "Backup failed. See the server log for details."
         return templates.TemplateResponse(
             request, "settings.html",
             _settings_ctx(request, uid, False, backup_message=msg),
@@ -1169,9 +1267,11 @@ def create_app() -> FastAPI:
             db.save_user_settings(uid, {"zwift_id": rider_id})
         try:
             refreshed = races.refresh_race_results(uid, rider_id or None)
-        except Exception as e:  # never let a refresh kill the page
+        except Exception:  # never let a refresh kill the page
             _log.warning("race refresh failed", exc_info=True)
-            refreshed = {"source": None, "count": 0, "error": str(e)}
+            # Generic message; the detail (and any local paths) stays in the log.
+            refreshed = {"source": None, "count": 0,
+                         "error": "Race refresh failed. See the server log."}
         return templates.TemplateResponse(
             request, "races.html", _races_ctx(request, uid, refreshed=refreshed)
         )
@@ -1243,8 +1343,26 @@ def create_app() -> FastAPI:
                 {"available": False, "reason": str(e), "devices": []}
             )
 
+    def _ws_origin_ok(websocket: WebSocket) -> bool:
+        """Allow only same-origin (local) browsers; a cross-site page always
+        sends an Origin that won't match. A missing Origin (native BLE/CLI
+        clients that aren't browsers) is allowed."""
+        origin = websocket.headers.get("origin")
+        if not origin:
+            return True
+        try:
+            host = _url.urlparse(origin).hostname
+        except ValueError:
+            return False
+        return host in _ALLOWED_WS_ORIGIN_HOSTS
+
     @app.websocket("/ride/ws")
     async def ride_ws(websocket: WebSocket):
+        if not _ws_origin_ok(websocket):
+            # Reject cross-origin handshakes before accepting (1008 = policy
+            # violation).
+            await websocket.close(code=1008)
+            return
         await websocket.accept()
         uid = None
         try:

@@ -39,7 +39,7 @@ def test_credentials_roundtrip_with_file_key_backend(user_id):
     # The DB never holds the plaintext password.
     _email, enc = db.get_zwift_credentials_row(user_id)
     assert "hunter2" not in (enc or "")
-    assert enc.startswith("enc1$")
+    assert enc.startswith("enc2$")  # authenticated format
 
     # The per-install key file exists with 0600 permissions.
     key_path = os.path.join(config.app_data_dir(), "credentials.key")

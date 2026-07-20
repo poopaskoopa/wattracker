@@ -113,7 +113,7 @@ def test_generate_invalid_duration_shows_error(client):
 def test_logout_clears_session(client):
     _register(client)
     assert client.get("/", follow_redirects=False).status_code == 200
-    client.get("/logout", follow_redirects=False)
+    client.post("/logout", follow_redirects=False)
     assert client.get("/", follow_redirects=False).status_code == 303
 
 
@@ -130,7 +130,7 @@ def test_per_user_data_isolation(client):
     assert client.get("/api/state").json()["ftp"] == pytest.approx(300.0)
 
     # Switch to a brand-new user B: independent, empty data.
-    client.get("/logout")
+    client.post("/logout")
     _register(client, "bob", "password123")
     assert client.get("/api/activities").json() == []
     assert client.get("/api/ftp").json() == []
@@ -138,7 +138,7 @@ def test_per_user_data_isolation(client):
     assert b_state["ftp"] != pytest.approx(300.0)  # B does not see A's FTP
 
     # Back to A: data still present.
-    client.get("/logout")
+    client.post("/logout")
     client.post("/login", data={"username": "alice", "password": "password123"})
     assert len(client.get("/api/activities").json()) == 1
     assert client.get("/api/state").json()["ftp"] == pytest.approx(300.0)

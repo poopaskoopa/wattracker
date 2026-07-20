@@ -242,7 +242,7 @@ def test_workout_detail_api_user_scoped(client):
     _register(client, "alice")
     client.post("/generate/plan", data=PLAN_FORM)
     _uid, wid = _first_workout_id("alice")
-    client.get("/logout")
+    client.post("/logout")
     _register(client, "bob")
     r = client.get(f"/api/plan/workout/{wid}")
     assert r.status_code == 404
@@ -332,7 +332,7 @@ def test_rpe_other_users_workout_404(client):
     _register(client, "alice")
     client.post("/generate/plan", data=PLAN_FORM)
     _uid, wid = _completed_workout_id(client, "alice")
-    client.get("/logout")
+    client.post("/logout")
     _register(client, "bob")
     r = client.post(f"/api/plan/workout/{wid}/rpe", json={"rpe": 5})
     assert r.status_code == 404
@@ -391,7 +391,7 @@ def test_calendar_shows_rpe_badge(client):
 def test_calendar_isolated_between_users(client):
     _register(client, "alice")
     client.post("/generate/plan", data=PLAN_FORM)
-    client.get("/logout")
+    client.post("/logout")
     _register(client, "bob")
     # Bob's August calendar has no workouts from Alice's plan.
     r = client.get("/calendar?year=2026&month=8")
@@ -489,7 +489,7 @@ def test_delete_plan_other_user_404(client):
     client.post("/generate/plan", data=PLAN_FORM)
     alice_uid = db.get_user_by_username("alice")["id"]
     plan_id = db.list_plans(alice_uid)[0]["id"]
-    client.get("/logout")
+    client.post("/logout")
 
     _register(client, "bob")
     r = client.post(f"/plan/{plan_id}/delete", follow_redirects=False)
@@ -518,7 +518,7 @@ def test_get_plan_with_foreign_plan_id_does_not_leak(client):
     client.post("/generate/plan", data=dict(PLAN_FORM, name="Alice Plan"))
     alice_uid = db.get_user_by_username("alice")["id"]
     plan_id = db.list_plans(alice_uid)[0]["id"]
-    client.get("/logout")
+    client.post("/logout")
 
     _register(client, "bob")
     r = client.get(f"/plan?plan_id={plan_id}")

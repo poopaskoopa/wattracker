@@ -6,6 +6,7 @@
 {% if saved %}<p class="ok">Settings saved.</p>{% endif %}
 {% if cred_message %}<p class="{{ 'ok' if 'saved (' in cred_message or 'cleared' in cred_message else 'alert' }}">{{ cred_message }}</p>{% endif %}
 {% if backup_message %}<p class="{{ 'alert' if 'failed' in backup_message else 'ok' }}">{{ backup_message }}</p>{% endif %}
+{% if dir_message %}<p class="alert">{{ dir_message }}</p>{% endif %}
 
 <p class="current-ftp"><strong>Current Training FTP:</strong> {{ current_ftp }} W</p>
 {% if recent_best_effort_ftp > 0 %}

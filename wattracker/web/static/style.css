@@ -28,10 +28,17 @@ nav a {
 nav a:hover { color: var(--accent); }
 nav .user { margin-left: 1.5rem; color: var(--accent); font-weight: 600; }
 nav a.logout { margin-left: 0.75rem; color: var(--muted); }
+/* Logout is a POST form; the button is styled to read like the old nav link. */
+nav .logout-form { display: inline; margin-left: 0.75rem; }
+nav button.logout {
+    background: none; border: none; padding: 0; cursor: pointer;
+    color: var(--muted); font: inherit; font-weight: 500;
+}
+nav button.logout:hover { color: var(--accent); }
 @media (max-width: 900px) {
     header { flex-wrap: wrap; gap: 0.5rem 1rem; }
     header nav { display: flex; flex-wrap: wrap; gap: 0.5rem 1rem; width: 100%; }
-    nav a, nav .user, nav a.logout { margin-left: 0; }
+    nav a, nav .user, nav a.logout, nav .logout-form { margin-left: 0; }
 }
 .auth-form { max-width: 360px; }
 .auth-form input { width: 100%; margin-top: 0.25rem; }

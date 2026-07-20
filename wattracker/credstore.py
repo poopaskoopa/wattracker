@@ -8,10 +8,12 @@ clear. Two backends, best available wins:
    ``wattracker-Zwift`` keyed by user id, nothing password-shaped in the DB
    (a sentinel marks which backend holds it).
 2. **Encrypted at rest** fallback: an HMAC-SHA256 keystream cipher (CTR-style,
-   random 16-byte nonce, constant-time-decryptable with the same key) using a
-   per-install random 32-byte key at ``<data dir>/credentials.key`` created
-   with 0600 permissions. Not HSM-grade, but the DB alone (or a copied DB)
-   can't reveal the password.
+   random 16-byte nonce) with an HMAC-SHA256 authentication tag over
+   nonce||ciphertext, using enc/mac subkeys derived from a per-install random
+   32-byte key at ``<data dir>/credentials.key`` (created 0600). The tag makes
+   the ciphertext tamper-evident (the old ``enc1$`` unauthenticated format is
+   still readable for backward compatibility). Not HSM-grade, but the DB alone
+   (or a copied DB) can't reveal - or silently alter - the password.
 
 The env var WATTRACKER_KEYRING=0 forces the file-key backend (the test suite
 sets it so tests never touch the real Keychain).
@@ -30,7 +32,9 @@ from . import config, db
 _SERVICE = "wattracker-Zwift"
 _KEYRING_SENTINEL = "@keyring"
 _KEY_FILE = "credentials.key"
-_ENC_PREFIX = "enc1$"
+_ENC_PREFIX = "enc1$"       # legacy: unauthenticated (still decrypted)
+_ENC_PREFIX_V2 = "enc2$"    # current: authenticated (HMAC tag appended)
+_TAG_LEN = 32               # HMAC-SHA256 digest length
 
 
 class ZwiftCredentials(NamedTuple):
@@ -89,25 +93,54 @@ def _keystream(key: bytes, nonce: bytes, length: int) -> bytes:
     return out[:length]
 
 
+def _subkeys(key: bytes) -> "tuple[bytes, bytes]":
+    """Derive independent (enc, mac) subkeys from the file key (HKDF-style)."""
+    enc = hmac.new(key, b"wattracker-cred-enc", hashlib.sha256).digest()
+    mac = hmac.new(key, b"wattracker-cred-mac", hashlib.sha256).digest()
+    return enc, mac
+
+
 def _encrypt(plaintext: str) -> str:
     key = _install_key()
+    enc_key, mac_key = _subkeys(key)
     nonce = _secrets.token_bytes(16)
     data = plaintext.encode("utf-8")
-    cipher = bytes(a ^ b for a, b in zip(data, _keystream(key, nonce, len(data))))
-    return _ENC_PREFIX + base64.b64encode(nonce + cipher).decode("ascii")
+    cipher = bytes(a ^ b for a, b in zip(data, _keystream(enc_key, nonce, len(data))))
+    tag = hmac.new(mac_key, nonce + cipher, hashlib.sha256).digest()
+    return _ENC_PREFIX_V2 + base64.b64encode(nonce + cipher + tag).decode("ascii")
 
 
 def _decrypt(token: str) -> Optional[str]:
-    if not token or not token.startswith(_ENC_PREFIX):
+    if not token:
         return None
-    try:
-        raw = base64.b64decode(token[len(_ENC_PREFIX):])
-        nonce, cipher = raw[:16], raw[16:]
-        key = _install_key()
-        data = bytes(a ^ b for a, b in zip(cipher, _keystream(key, nonce, len(cipher))))
-        return data.decode("utf-8")
-    except Exception:
-        return None
+    # Current authenticated format: verify the tag before decrypting.
+    if token.startswith(_ENC_PREFIX_V2):
+        try:
+            raw = base64.b64decode(token[len(_ENC_PREFIX_V2):])
+            if len(raw) < 16 + _TAG_LEN:
+                return None
+            nonce, cipher, tag = raw[:16], raw[16:-_TAG_LEN], raw[-_TAG_LEN:]
+            enc_key, mac_key = _subkeys(_install_key())
+            expected = hmac.new(mac_key, nonce + cipher, hashlib.sha256).digest()
+            if not hmac.compare_digest(tag, expected):
+                return None  # tampered or wrong key
+            data = bytes(a ^ b for a, b in
+                         zip(cipher, _keystream(enc_key, nonce, len(cipher))))
+            return data.decode("utf-8")
+        except Exception:
+            return None
+    # Legacy unauthenticated format (no integrity check available).
+    if token.startswith(_ENC_PREFIX):
+        try:
+            raw = base64.b64decode(token[len(_ENC_PREFIX):])
+            nonce, cipher = raw[:16], raw[16:]
+            key = _install_key()
+            data = bytes(a ^ b for a, b in
+                         zip(cipher, _keystream(key, nonce, len(cipher))))
+            return data.decode("utf-8")
+        except Exception:
+            return None
+    return None
 
 
 # ------------------------------------------------------------ public API

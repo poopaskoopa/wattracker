@@ -6,6 +6,10 @@ from typing import Dict, List, Optional
 
 import fitdecode
 
+# Guard against a hostile/corrupt file with an unbounded record count blowing up
+# memory: ~200k records is ~55 hours at 1 Hz, well beyond any real ride.
+MAX_FIT_RECORDS = 200_000
+
 # Record fields we care about, mapped to our stream keys.
 _FIELD_MAP = {
     "power": "power",
@@ -37,6 +41,7 @@ def parse_fit(path: str) -> Dict:
         "altitude": [],
     }
     timestamps: List[_dt.datetime] = []
+    record_count = 0
 
     with fitdecode.FitReader(path) as reader:
         for frame in reader:
@@ -44,6 +49,13 @@ def parse_fit(path: str) -> Dict:
                 continue
             if frame.name != "record":
                 continue
+
+            record_count += 1
+            if record_count > MAX_FIT_RECORDS:
+                raise ValueError(
+                    f"FIT file has more than {MAX_FIT_RECORDS} records; refusing "
+                    "to ingest (file too large or corrupt)."
+                )
 
             ts = _get(frame, "timestamp")
             if isinstance(ts, _dt.datetime):

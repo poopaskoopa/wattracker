@@ -215,11 +215,11 @@ def test_profile_get_post_validation_reset_and_isolation(client):
     assert saved.status_code == 303 and saved.headers["location"] == "/profile?saved=1"
     assert db.get_user_settings(alice)["hr_max"] == 190
 
-    client.get("/logout")
+    client.post("/logout")
     bob = _register(client, "bob")
     assert db.get_user_settings(bob)["hr_max"] is None
     assert "HRmax: 190 bpm" not in client.get("/profile").text
-    client.get("/logout")
+    client.post("/logout")
     client.post("/login", data={"username": "alice", "password": "password123"})
     reset = client.post("/profile/hr-max", data={"action": "reset"}, follow_redirects=False)
     assert reset.status_code == 303

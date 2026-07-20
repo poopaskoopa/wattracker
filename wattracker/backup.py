@@ -17,12 +17,24 @@ under a running server corrupts the DB, so it is an offline CLI only.
 from __future__ import annotations
 
 import datetime as _dt
+import logging
 import os
 import re
 import sqlite3
 from typing import Dict, List, Optional
 
 from .config import app_data_dir, db_path
+
+_log = logging.getLogger(__name__)
+
+
+def _restrict(path: str, mode: int) -> None:
+    """Best-effort chmod (see config._restrict); never crash on odd filesystems."""
+    try:
+        if os.path.exists(path):
+            os.chmod(path, mode)
+    except OSError:
+        _log.debug("could not chmod %s to %o", path, mode, exc_info=True)
 
 # Recognised backup reasons and how many of each to keep. "daily" and
 # "pre-migration" are the safety-critical automatic classes, so they retain a
@@ -44,7 +56,8 @@ _TS_FMT = "%Y%m%d-%H%M%S"
 def backups_dir() -> str:
     """The directory holding backup files, created on demand."""
     d = os.path.join(app_data_dir(), "backups")
-    os.makedirs(d, exist_ok=True)
+    os.makedirs(d, mode=0o700, exist_ok=True)
+    _restrict(d, 0o700)  # makedirs mode is umask-masked; enforce owner-only.
     return d
 
 
@@ -93,6 +106,9 @@ def create_backup(reason: str, src_path: Optional[str] = None) -> str:
             dst.close()
     finally:
         src.close()
+    # A backup is a full copy of the DB (password hashes, encrypted creds) - keep
+    # it owner-only.
+    _restrict(dest, 0o600)
     prune()
     return dest
 
