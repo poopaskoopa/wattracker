@@ -42,6 +42,7 @@ def _legacy_enc1(password: str) -> str:
 
 
 # ------------------------------------------------------------- credstore
+@pytest.mark.skipif(os.name == "nt", reason="file-key backend is POSIX-only")
 def test_credentials_roundtrip_with_file_key_backend(user_id):
     # conftest sets WATTRACKER_KEYRING=0 -> encrypted file-key backend.
     backend = credstore.save_zwift_credentials(user_id, "a@b.com", "hunter2!")
@@ -117,9 +118,12 @@ def test_keyring_absent_falls_back(monkeypatch, user_id):
         return real_import(name, *a, **kw)
 
     monkeypatch.setattr(builtins, "__import__", no_keyring)
-    assert credstore.storage_backend() == "encrypted local file key"
+    expected_backend = (
+        "Windows DPAPI" if os.name == "nt" else "encrypted local file key"
+    )
+    assert credstore.storage_backend() == expected_backend
     assert credstore.save_zwift_credentials(user_id, "a@b.com", "pw") == (
-        "encrypted local file key")
+        expected_backend)
     assert credstore.get_zwift_credentials(user_id).password == "pw"
 
 
@@ -733,7 +737,10 @@ def test_settings_saves_credentials_and_never_echoes_password(client):
     r = client.post("/settings", data={
         "zwift_email": "a@b.com", "zwift_password": "sup3r-secret-pw"})
     assert r.status_code == 200
-    assert "Zwift credentials saved (encrypted local file key)" in r.text
+    expected_backend = (
+        "Windows DPAPI" if os.name == "nt" else "encrypted local file key"
+    )
+    assert f"Zwift credentials saved ({expected_backend})" in r.text
     assert "sup3r-secret-pw" not in r.text  # never echoed back
     uid = db.get_user_by_username("rider")["id"]
     assert credstore.get_zwift_credentials(uid).password == "sup3r-secret-pw"

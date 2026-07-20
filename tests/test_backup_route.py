@@ -1,4 +1,6 @@
 """Tests for the /settings/backup web route."""
+import os
+
 import pytest
 
 pytest.importorskip("httpx")
@@ -40,4 +42,5 @@ def test_settings_page_shows_backup_section(client):
     r = client.get("/settings")
     assert r.status_code == 200
     assert "Backups" in r.text
-    assert "restore_backup" in r.text  # restore CLI command shown
+    restore_command = "wattracker-restore" if os.name == "nt" else "restore_backup"
+    assert restore_command in r.text  # restore CLI command shown
