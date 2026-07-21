@@ -499,21 +499,42 @@ def create_app() -> FastAPI:
 
     def _profile_response(request: Request, error: Optional[str] = None):
         uid = _uid(request)
+        settings = db.get_user_settings(uid)
         return templates.TemplateResponse(
             request,
             "profile.html",
             _ctx(
                 request,
                 profile=zones.rider_profile(uid),
-                manual_hr_max=db.get_user_settings(uid).get("hr_max"),
+                manual_ftp=settings.get("ftp"),
+                manual_hr_max=settings.get("hr_max"),
                 error=error,
-                saved=request.query_params.get("saved") == "1",
+                saved=request.query_params.get("saved"),
             ),
         )
 
     @app.get("/profile", response_class=HTMLResponse)
     def profile_page(request: Request):
         return _profile_response(request)
+
+    @app.post("/profile/ftp", response_class=HTMLResponse)
+    def profile_ftp_save(
+        request: Request,
+        ftp: str = Form(""),
+        action: str = Form("save"),
+    ):
+        uid = _uid(request)
+        if action == "reset":
+            db.set_user_ftp_override(uid, None)
+            return RedirectResponse("/profile?saved=ftp", status_code=303)
+        try:
+            value = int(ftp.strip())
+        except (TypeError, ValueError):
+            return _profile_response(request, "FTP must be a whole number from 1 to 2000 W.")
+        if not 1 <= value <= 2000:
+            return _profile_response(request, "FTP must be a whole number from 1 to 2000 W.")
+        db.set_user_ftp_override(uid, value)
+        return RedirectResponse("/profile?saved=ftp", status_code=303)
 
     @app.post("/profile/hr-max", response_class=HTMLResponse)
     def profile_hr_max_save(

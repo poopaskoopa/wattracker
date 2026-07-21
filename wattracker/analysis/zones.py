@@ -140,6 +140,9 @@ def zone_ranges(anchor: float, definitions) -> list[dict]:
 
 def resolve_current_ftp(user_id: int) -> dict:
     """Return a real personalized Training FTP, never the 200 W fallback."""
+    setting = _finite(db.get_user_settings(user_id).get("ftp"))
+    if setting is not None and setting > 0:
+        return {"available": True, "value": setting, "source": "Manual Training FTP setting"}
     latest = db.latest_ftp(user_id)
     if latest and _finite(latest.get("ftp_watts")) and float(latest["ftp_watts"]) > 0:
         source = latest.get("source") or "recorded"
@@ -147,9 +150,6 @@ def resolve_current_ftp(user_id: int) -> dict:
             "available": True, "value": float(latest["ftp_watts"]),
             "source": f"Training FTP history ({source}, {latest['date']})",
         }
-    setting = _finite(db.get_user_settings(user_id).get("ftp"))
-    if setting is not None and setting > 0:
-        return {"available": True, "value": setting, "source": "Manual Training FTP setting"}
 
     # current_ftp is personalized only when a usable 20-minute FIT effort
     # exists. Guard it so its generic 200 W empty-data fallback cannot leak.
