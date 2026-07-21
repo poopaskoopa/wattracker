@@ -84,18 +84,18 @@ def current_ftp(
 ) -> float:
     """Resolve the current FTP for a user.
 
-    Precedence: latest ftp_history value -> user's FTP override -> fresh
+    Precedence: user's FTP override -> latest ftp_history value -> fresh
     detraining-decayed estimate anchored at `now`. Falls back to a sane default
     if no power data.
     """
     db.init_db()
-    latest = db.latest_ftp(user_id)
-    if latest and latest.get("ftp_watts", 0) > 0:
-        return float(latest["ftp_watts"])
     settings = db.get_user_settings(user_id)
     override = settings.get("ftp")
     if override and float(override) > 0:
         return float(override)
+    latest = db.latest_ftp(user_id)
+    if latest and latest.get("ftp_watts", 0) > 0:
+        return float(latest["ftp_watts"])
     ftp = _current_estimate(db.full_activities(user_id), now, extra_power)
     return ftp if ftp > 0 else 200.0
 

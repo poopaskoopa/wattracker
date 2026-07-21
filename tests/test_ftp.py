@@ -181,6 +181,11 @@ def test_current_ftp_precedence(user_id):
     # A manual history row now wins.
     db.add_ftp_entry(user_id, now.date().isoformat(), 260.0, "manual")
     assert importer.current_ftp(user_id, now=now) == pytest.approx(260.0)
+    # An explicit Rider Profile override wins over history.
+    db.set_user_ftp_override(user_id, 275.0)
+    assert importer.current_ftp(user_id, now=now) == pytest.approx(275.0)
+    db.set_user_ftp_override(user_id, None)
+    assert importer.current_ftp(user_id, now=now) == pytest.approx(260.0)
 
 
 def test_settings_ftp_override_used_before_estimate(user_id):

@@ -162,11 +162,14 @@ def test_current_power_profile_never_uses_unexplained_200_default(user_id):
     manual = zones.resolve_current_ftp(user_id)
     assert manual["value"] == 247
     assert "Manual" in manual["source"]
+    db.add_ftp_entry(user_id, "2026-07-01", 260, "estimated")
+    assert zones.resolve_current_ftp(user_id)["value"] == 247
 
 
 def test_activity_ftp_prefers_history_then_np_if_recovery(user_id):
     db.add_ftp_entry(user_id, "2026-01-01", 230, "estimated")
     db.add_ftp_entry(user_id, "2026-06-01", 250, "manual")
+    db.set_user_ftp_override(user_id, 300)
     historical = zones.resolve_activity_ftp(user_id, {
         "start_time": "2026-03-01T09:00:00", "np": 300, "if_": 1.0,
     })
@@ -214,6 +217,7 @@ def test_profile_get_post_validation_reset_and_isolation(client):
     )
     assert saved.status_code == 303 and saved.headers["location"] == "/profile?saved=1"
     assert db.get_user_settings(alice)["hr_max"] == 190
+    assert "Heart-rate setting saved." in client.get(saved.headers["location"]).text
 
     client.post("/logout")
     bob = _register(client, "bob")
@@ -226,9 +230,44 @@ def test_profile_get_post_validation_reset_and_isolation(client):
     assert db.get_user_settings(alice)["hr_max"] is None
 
 
+def test_profile_ftp_save_validation_reset_and_isolation(client):
+    alice = _register(client, "ftp-alice")
+    db.add_ftp_entry(alice, "2026-06-01", 240)
+
+    for invalid in ("250.5", "0", "2001", ""):
+        bad = client.post("/profile/ftp", data={"ftp": invalid, "action": "save"})
+        assert bad.status_code == 200
+        assert 'role="alert"' in bad.text and "whole number from 1 to 2000" in bad.text
+        assert db.get_user_settings(alice)["ftp"] is None
+
+    saved = client.post(
+        "/profile/ftp", data={"ftp": "275", "action": "save"},
+        follow_redirects=False,
+    )
+    assert saved.status_code == 303 and saved.headers["location"] == "/profile?saved=ftp"
+    assert db.get_user_settings(alice)["ftp"] == pytest.approx(275)
+    page = client.get(saved.headers["location"])
+    assert "Training FTP setting saved." in page.text
+    assert 'value="275"' in page.text
+    assert "Use FTP history or FIT estimate" in page.text
+
+    client.post("/logout")
+    bob = _register(client, "ftp-bob")
+    assert db.get_user_settings(bob)["ftp"] is None
+    assert "Training FTP: 275.0 W" not in client.get("/profile").text
+
+    client.post("/logout")
+    client.post("/login", data={"username": "ftp-alice", "password": "password123"})
+    reset = client.post("/profile/ftp", data={"action": "reset"}, follow_redirects=False)
+    assert reset.status_code == 303
+    assert db.get_user_settings(alice)["ftp"] is None
+    assert zones.resolve_current_ftp(alice)["value"] == 240
+
+
 def test_profile_and_api_require_authentication(client):
     assert client.get("/profile", follow_redirects=False).status_code == 303
     assert client.post("/profile/hr-max", data={"hr_max": "190"}, follow_redirects=False).status_code == 303
+    assert client.post("/profile/ftp", data={"ftp": "250"}, follow_redirects=False).status_code == 303
 
 
 def test_v16_to_v17_migration_preserves_users_settings_and_races(tmp_path):
