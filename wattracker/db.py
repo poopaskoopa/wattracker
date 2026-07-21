@@ -519,6 +519,22 @@ def set_user_hr_max(
         conn.close()
 
 
+def set_user_ftp_override(
+    user_id: int, ftp: Optional[float], path: Optional[str] = None
+) -> None:
+    """Set or explicitly clear a user's manual Training FTP override."""
+    save_user_settings(user_id, {}, path=path)
+    conn = connect(path)
+    try:
+        conn.execute(
+            "UPDATE user_settings SET ftp = ? WHERE user_id = ?",
+            (float(ftp) if ftp is not None else None, user_id),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
 def set_zwift_credentials_row(
     user_id: int,
     email: Optional[str],
