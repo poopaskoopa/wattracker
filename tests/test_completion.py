@@ -7,6 +7,8 @@ import pytest
 
 import wattracker.ingest.importer as importer
 from wattracker import auth, config, db
+from wattracker.prescribe import zwo
+from wattracker.prescribe.planner import build_workout
 
 NOW = dt.datetime(2026, 7, 10, 18, 0)
 
@@ -98,6 +100,80 @@ def test_matching_is_idempotent_and_user_scoped(user_id):
     assert importer.match_plan_completions(user_id, NOW) == 1
     assert importer.match_plan_completions(user_id, NOW) == 0  # already done
     assert importer.match_plan_completions(other, NOW) == 0  # no ride of their own
+
+
+def test_single_workout_match_is_today_only_and_does_not_sweep_plan(user_id):
+    session = build_workout("threshold", 60)
+    xml = zwo.zwo_string(session)
+    profile = importer._zwo_fraction_profile(xml)
+    plan_id = db.create_plan(user_id, "P", "2026-07-10", 1)
+    first = db.add_plan_workout(
+        plan_id, user_id, "2026-07-10", "A", "threshold",
+        session.total_duration(), session.estimated_tss, xml,
+    )
+    second = db.add_plan_workout(
+        plan_id, user_id, "2026-07-10", "B", "threshold",
+        session.total_duration(), session.estimated_tss, xml,
+    )
+    activity_id = db.insert_activity(
+        user_id,
+        {
+            "dedup_hash": "single-click-match",
+            "filename": "ride.fit",
+            "start_time": "2026-07-10T10:00:00",
+            "duration_s": len(profile),
+            "distance_m": 0,
+            "avg_power": 210,
+            "avg_hr": None,
+            "np": 210,
+            "if_": 1.0,
+            "tss": session.estimated_tss,
+            "streams": {"power": [p * 210 for p in profile]},
+        },
+    )
+
+    assert not importer.match_plan_workout_completion(
+        user_id, second, dt.date(2026, 7, 9)
+    )
+    assert importer.match_plan_workout_completion(
+        user_id, second, dt.date(2026, 7, 10)
+    )
+    assert db.get_plan_workout(user_id, second)["completed_activity_id"] == activity_id
+    assert db.get_plan_workout(user_id, first)["completed_activity_id"] is None
+
+
+@pytest.mark.parametrize("power", [None, "mismatch"])
+def test_profile_backed_plan_never_batch_matches_without_strong_profile(
+    user_id, power
+):
+    session = build_workout("threshold", 60)
+    xml = zwo.zwo_string(session)
+    profile = importer._zwo_fraction_profile(xml)
+    plan_id = db.create_plan(user_id, "Profile", "2026-07-10", 1)
+    workout_id = db.add_plan_workout(
+        plan_id, user_id, "2026-07-10", session.name, "threshold",
+        session.total_duration(), session.estimated_tss, xml,
+    )
+    stream = [] if power is None else [0.0] * len(profile)
+    db.insert_activity(
+        user_id,
+        {
+            "dedup_hash": f"weak-profile-{power}",
+            "filename": "weak.fit",
+            "start_time": "2026-07-10T10:00:00",
+            "duration_s": len(profile),
+            "distance_m": 0,
+            "avg_power": 0,
+            "avg_hr": None,
+            "np": 0,
+            "if_": 0,
+            "tss": session.estimated_tss,
+            "streams": {"power": stream},
+        },
+    )
+
+    assert importer.match_plan_completions(user_id, NOW) == 0
+    assert db.get_plan_workout(user_id, workout_id)["completed_activity_id"] is None
 
 
 # ------------------------------------------------------- schema migration

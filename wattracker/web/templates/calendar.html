@@ -105,13 +105,15 @@
         <button type="button" class="modal-close" id="wmClose" aria-label="Close">&times;</button>
         <h3 id="wmTitle">Workout</h3>
         <p class="hint" id="wmMeta"></p>
+        <p class="hint" id="wmMatchStatus"></p>
         <p class="alert" id="wmError" hidden></p>
         <div class="profile-wrap" id="wmProfile" hidden></div>
         <p class="hint" id="wmDesc"></p>
         <div class="rpe-section" id="wmRpe" hidden>
             <h4>Perceived exertion</h4>
             <p class="hint">How hard did this session feel? 1 = easiest,
-                10 = all-out.</p>
+                10 = hardest and means the workout was too hard. A rating of
+                10 informs future estimated FTP calculations.</p>
             <div class="rpe-buttons" id="wmRpeButtons" role="group"
                  aria-label="Perceived exertion 1 to 10"></div>
             <p class="hint" id="wmRpeStatus"></p>
@@ -156,6 +158,7 @@
     function openLoading() {
         $("wmTitle").textContent = "Loading workout…";
         $("wmMeta").textContent = "";
+        $("wmMatchStatus").textContent = "";
         $("wmDesc").textContent = "";
         $("wmError").hidden = true;
         $("wmProfile").hidden = true;
@@ -170,7 +173,7 @@
     // --------------------------------------- perceived-exertion (RPE) grading
     function renderRpe(detail) {
         var section = $("wmRpe");
-        if (!detail.completed) { section.hidden = true; return; }
+        if (!detail.rpe_eligible) { section.hidden = true; return; }
         section.hidden = false;
         var wrap = $("wmRpeButtons");
         wrap.innerHTML = "";
@@ -184,7 +187,10 @@
                 b.setAttribute("aria-pressed", on ? "true" : "false");
             });
             status.textContent = current
-                ? "Graded " + current + "/10." : "Not graded yet.";
+                ? (current === 10
+                    ? "Graded 10/10 — too hard. This will inform future estimated FTP calculations."
+                    : "Graded " + current + "/10.")
+                : "Not graded yet.";
         }
 
         async function grade(val) {
@@ -236,6 +242,18 @@
             (detail.adapted ? " · adapted (" + detail.adapted + ")" : "");
         $("wmDesc").textContent = detail.description || "";
         $("wmError").hidden = true;
+        var matchStatus = $("wmMatchStatus");
+        if (detail.reconcileStatus === "matched") {
+            matchStatus.textContent = "Matched to today's imported Zwift activity.";
+        } else if (detail.reconcileStatus === "no_match") {
+            matchStatus.textContent =
+                "No matching imported Zwift activity was found for today. Import the completed activity, then click again.";
+        } else if (detail.reconcileStatus === "unverified_completion") {
+            matchStatus.textContent =
+                "This completion is recorded, but its power-profile match could not be verified. Effort rating is unavailable.";
+        } else {
+            matchStatus.textContent = "";
+        }
 
         var wrap = $("wmProfile");
         wrap.innerHTML = profileSvg(detail.profile, detail.total_duration, detail.ftp);
@@ -262,6 +280,20 @@
 
     async function showWorkout(id) {
         openLoading();
+        var reconcileStatus = null;
+        try {
+            var reconcile = await fetch(
+                "/api/plan/workout/" + id + "/reconcile",
+                {
+                    method: "POST",
+                    headers: { "Accept": "application/json" },
+                });
+            if (reconcile.ok) {
+                reconcileStatus = (await reconcile.json()).status;
+            }
+        } catch (e) {
+            // Detail loading below reports connectivity failures to the user.
+        }
         var resp;
         try {
             resp = await fetch("/api/plan/workout/" + id,
@@ -283,7 +315,9 @@
             return;
         }
         try {
-            openModal(await resp.json());
+            var detail = await resp.json();
+            detail.reconcileStatus = reconcileStatus;
+            openModal(detail);
         } catch (e) {
             showError("Could not render workout details: " + e.message);
         }

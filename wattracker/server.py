@@ -316,7 +316,14 @@ def _ctx(request: Request, **kw) -> dict:
     kw.setdefault("username", _username(request))
     uid = _uid(request)
     if uid is not None:
-        kw.setdefault("pending_ratings", db.pending_ratings(uid))
+        pending = []
+        for item in db.pending_ratings(uid):
+            if item["kind"] == "plan":
+                workout = db.get_plan_workout(uid, item["id"])
+                if not importer.plan_workout_completion_verified(uid, workout or {}):
+                    continue
+            pending.append(item)
+        kw.setdefault("pending_ratings", pending)
     return kw
 
 
@@ -1596,6 +1603,43 @@ def create_app() -> FastAPI:
     def _watts(frac: Optional[float], ftp: float) -> Optional[int]:
         return int(round(frac * ftp)) if frac is not None else None
 
+    @app.post("/api/plan/workout/{workout_id}/reconcile")
+    def api_plan_workout_reconcile(request: Request, workout_id: int):
+        """Reconcile one today's workout against already-imported Zwift data."""
+        uid = _uid(request)
+        workout = db.get_plan_workout(uid, workout_id)
+        if not workout:
+            return JSONResponse({"error": "workout not found"}, status_code=404)
+
+        today = _dt.date.today()
+        verified = importer.plan_workout_completion_verified(uid, workout)
+        if workout["date"] != today.isoformat():
+            status = (
+                "completed"
+                if verified
+                else "unverified_completion"
+                if workout.get("completed_activity_id")
+                else "not_today"
+            )
+            return JSONResponse({"id": workout_id, "status": status, "matched": False})
+        if workout.get("completed_activity_id") is not None:
+            return JSONResponse(
+                {
+                    "id": workout_id,
+                    "status": "completed" if verified else "unverified_completion",
+                    "matched": False,
+                }
+            )
+
+        matched = importer.match_plan_workout_completion(uid, workout_id, today)
+        return JSONResponse(
+            {
+                "id": workout_id,
+                "status": "matched" if matched else "no_match",
+                "matched": matched,
+            }
+        )
+
     @app.get("/api/plan/workout/{workout_id}")
     def api_plan_workout_detail(request: Request, workout_id: int):
         """Structured segments + power profile for one plan workout (user-scoped).
@@ -1608,6 +1652,7 @@ def create_app() -> FastAPI:
         w = db.get_plan_workout(uid, workout_id)
         if not w:
             return JSONResponse({"error": "workout not found"}, status_code=404)
+        completion_verified = importer.plan_workout_completion_verified(uid, w)
         ftp = importer.current_ftp(uid)
         session = build_workout(w["type"], max(1, w["duration_s"] / 60),
                                 w.get("variant"))
@@ -1647,7 +1692,11 @@ def create_app() -> FastAPI:
                 "tss": w["tss"],
                 "adapted": w.get("adapted"),
                 "rpe": w.get("rpe"),
+                "too_hard": w.get("rpe") == 10,
+                "ftp_feedback_applied": bool(w.get("feedback_applied")),
                 "completed": w.get("completed_activity_id") is not None,
+                "completion_verified": completion_verified,
+                "rpe_eligible": completion_verified,
                 "ftp": round(ftp, 1),
                 "description": session.description,
                 "total_duration": total_s,
@@ -1673,12 +1722,23 @@ def create_app() -> FastAPI:
         w = db.get_plan_workout(uid, workout_id)
         if not w:
             return JSONResponse({"error": "workout not found"}, status_code=404)
-        if w.get("completed_activity_id") is None:
+        if not importer.plan_workout_completion_verified(uid, w):
             return JSONResponse(
-                {"error": "only completed workouts can be graded"}, status_code=400
+                {"error": "only verified completed workouts can be graded"},
+                status_code=400,
             )
         importer.save_workout_rpe(uid, "plan", workout_id, rpe_val)
-        return JSONResponse({"id": workout_id, "rpe": rpe_val})
+        updated = db.get_plan_workout(uid, workout_id)
+        return JSONResponse(
+            {
+                "id": workout_id,
+                "rpe": rpe_val,
+                "too_hard": rpe_val == 10,
+                "ftp_feedback_applied": bool(
+                    updated and updated.get("feedback_applied")
+                ),
+            }
+        )
 
     @app.post("/api/standalone-workout/{workout_id}/rpe")
     def api_standalone_rpe(
