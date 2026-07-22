@@ -398,6 +398,78 @@ function renderZoneSummary(targetId, summary, unit) {
         "% · missing/uncredited: " + fmtDuration(Number(summary.missing_s || 0)) + "</p>";
 }
 
+// Type-aware perceived-exertion (RPE) control on the activity detail page.
+// A ride matched to a verified plan/standalone workout drives that workout's
+// rating (feeding the FTP estimate); an unmatched ride stores a subjective
+// rating on the activity itself and does not affect FTP.
+function renderActivityRpe(activityId, detail) {
+    const section = document.getElementById("rpeSection");
+    if (!section) return;
+    const wrap = document.getElementById("rpeButtons");
+    const hint = document.getElementById("rpeHint");
+    const status = document.getElementById("rpeStatus");
+    section.hidden = false;
+    wrap.innerHTML = "";
+
+    const linked = detail.linked_workout;
+    const matched = !!(linked && linked.rpe_eligible);
+    let endpoint;
+    if (matched) {
+        endpoint = linked.kind === "plan"
+            ? "/api/plan/workout/" + linked.id + "/rpe"
+            : "/api/standalone-workout/" + linked.id + "/rpe";
+        hint.textContent = "Matched to your planned “" + linked.name +
+            "” — this rating tunes your FTP estimate (10 = too hard).";
+    } else {
+        endpoint = "/api/activity/" + activityId + "/rpe";
+        hint.textContent = "Subjective effort rating for this ride.";
+    }
+    let current = matched ? (linked.rpe || null) : (detail.rpe || null);
+
+    function paint() {
+        Array.prototype.forEach.call(wrap.children, function (b) {
+            const on = String(current) === b.dataset.rpe;
+            b.classList.toggle("rpe-on", on);
+            b.setAttribute("aria-pressed", on ? "true" : "false");
+        });
+        status.textContent = current
+            ? (current === 10
+                ? "Rated 10/10 — too hard."
+                : "Rated " + current + "/10.")
+            : "Not rated yet.";
+    }
+
+    async function grade(val) {
+        status.textContent = "Saving…";
+        try {
+            const resp = await fetch(endpoint, {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({ rpe: val }),
+            });
+            if (!resp.ok) { status.textContent = "Could not save rating."; return; }
+            const saved = await resp.json();
+            current = saved.rpe;
+            paint();
+        } catch (e) {
+            status.textContent = "Could not save rating: " + e.message;
+        }
+    }
+
+    for (let i = 1; i <= 10; i++) {
+        const btn = document.createElement("button");
+        btn.type = "button";
+        btn.className = "rpe-btn";
+        btn.dataset.rpe = String(i);
+        btn.textContent = String(i);
+        (function (v) {
+            btn.addEventListener("click", function () { grade(v); });
+        })(i);
+        wrap.appendChild(btn);
+    }
+    paint();
+}
+
 async function renderActivityDetail(activityId) {
     const canvas = document.getElementById("detailChart");
     if (!canvas) return;
@@ -405,6 +477,7 @@ async function renderActivityDetail(activityId) {
     const data = await fetchJSON("/api/activity/" + activityId);
     if (!data) { if (empty) { empty.style.display = "block"; } return; }
 
+    renderActivityRpe(activityId, data);
     renderZoneSummary("powerZoneSummary", data.zones && data.zones.power, "W");
     renderZoneSummary("hrZoneSummary", data.zones && data.zones.heart_rate, "bpm");
 

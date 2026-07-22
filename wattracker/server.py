@@ -580,10 +580,48 @@ def create_app() -> FastAPI:
 
     @app.get("/api/activity/{activity_id}")
     def api_activity_detail(request: Request, activity_id: int):
-        detail = pipeline.activity_detail(_uid(request), activity_id)
+        uid = _uid(request)
+        detail = pipeline.activity_detail(uid, activity_id)
         if not detail:
             return JSONResponse({"error": "not found"}, status_code=404)
+        # A ride completed against a plan/standalone workout drives that
+        # workout's RPE (feeding the FTP loop) instead of a subjective rating;
+        # only expose the link when the completion is verified.
+        link = db.linked_workout_for_activity(uid, activity_id)
+        if link:
+            if link["kind"] == "plan":
+                w = db.get_plan_workout(uid, link["id"])
+                verified = bool(
+                    w and importer.plan_workout_completion_verified(uid, w)
+                )
+            else:
+                verified = True  # standalone links are verified once completed
+            detail["linked_workout"] = {
+                "kind": link["kind"],
+                "id": link["id"],
+                "name": link["name"],
+                "rpe": link["rpe"],
+                "rpe_eligible": verified,
+            }
         return JSONResponse(detail)
+
+    @app.post("/api/activity/{activity_id}/rpe")
+    def api_activity_rpe(
+        request: Request, activity_id: int, rpe: int = Body(..., embed=True)
+    ):
+        """Store a subjective effort rating (1-10) on an unmatched activity."""
+        uid = _uid(request)
+        try:
+            rpe_val = int(rpe)
+        except (TypeError, ValueError):
+            return JSONResponse({"error": "rpe must be an integer"}, status_code=400)
+        if rpe_val < 1 or rpe_val > 10:
+            return JSONResponse(
+                {"error": "rpe must be between 1 and 10"}, status_code=400
+            )
+        if not db.set_activity_rpe(uid, activity_id, rpe_val):
+            return JSONResponse({"error": "activity not found"}, status_code=404)
+        return JSONResponse({"id": activity_id, "rpe": rpe_val})
 
     @app.post("/activities/rescan")
     def rescan(request: Request, activities_dir: str = Form("")):
