@@ -145,9 +145,14 @@ class RideController:
                     self._ever_started = True
                     if self.started_at is None:
                         self.started_at = _dt.datetime.now()
-                    # Put the trainer in ERG mode once, at ride start
-                    # (FTMS Request Control + Start/Resume).
-                    self._trainer_call("start_erg")
+                # (Re-)arm ERG on every start AND resume (FTMS Request Control +
+                # Start/Resume). When the rider stops, many trainers drop out of
+                # ERG (or, after an FTMS Stop/Pause, refuse control until a fresh
+                # Start/Resume). A bare set_target_power below does NOT put them
+                # back in ERG, so on resume the trainer free-rides below target.
+                # Request Control + Start is idempotent when already in ERG, so
+                # re-issuing it on each resume is safe.
+                self._trainer_call("start_erg")
             self._zero_run = 0.0
             self.elapsed += dt
 
