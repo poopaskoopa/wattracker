@@ -59,6 +59,29 @@ class PowerSource(abc.ABC):
         return None
 
 
+class AggregatePowerSource(PowerSource):
+    """Combine independent power meters into one rider power source.
+
+    Dual-sided pedals that advertise as two devices report each pedal's watts
+    independently. Available readings are summed; cadence is averaged across
+    the sources currently reporting it (normally both pedals report the same
+    crank cadence).
+    """
+
+    def __init__(self, sources: Sequence[PowerSource]) -> None:
+        self.sources = list(sources)
+
+    def latest_power(self) -> Optional[int]:
+        readings = [source.latest_power() for source in self.sources]
+        available = [watts for watts in readings if watts is not None]
+        return sum(available) if available else None
+
+    def latest_cadence(self) -> Optional[float]:
+        readings = [source.latest_cadence() for source in self.sources]
+        available = [cadence for cadence in readings if cadence is not None]
+        return sum(available) / len(available) if available else None
+
+
 class HeartRateSource(abc.ABC):
     @abc.abstractmethod
     def latest_hr(self) -> Optional[int]: ...
@@ -286,76 +309,137 @@ async def scan(timeout: float = 5.0) -> List[dict]:
     devices = await BleakScanner.discover(timeout=timeout, return_adv=True)
     out: List[dict] = []
     for _addr, (device, adv) in devices.items():
+        services = [service.lower() for service in (adv.service_uuids or [])]
+        roles = []
+        if CYCLING_POWER_SERVICE in services:
+            roles.append("power")
+        if HEART_RATE_SERVICE in services:
+            roles.append("hr")
+        if FITNESS_MACHINE_SERVICE in services:
+            roles.append("trainer")
         out.append(
             {
                 "address": device.address,
                 "name": device.name or adv.local_name or "(unknown)",
-                "services": list(adv.service_uuids or []),
+                "services": services,
+                "roles": roles,
                 "rssi": adv.rssi,
             }
         )
     return out
 
 
-async def connect_sensors(timeout: float = 6.0) -> dict:
-    """Scan and connect the first FTMS trainer / power meter / HR strap found.
+async def connect_sensors(
+    timeout: float = 6.0,
+    selected: Optional[dict] = None,
+) -> dict:
+    """Connect selected sensors, or auto-discover the first sensor per role.
 
     Returns ``{"trainer", "power_source", "hr_source", "clients", "names"}``.
     Any of the three roles may be None (graceful degradation: e.g. power-only
     with no controllable trainer). The caller must disconnect every client in
     ``clients`` when the ride ends. Raises RuntimeError when bleak/adapter is
-    unavailable.
+    unavailable. ``selected`` maps ``power`` to zero or more opaque addresses
+    and ``trainer`` / ``hr`` to zero or one. Explicit addresses are never
+    replaced with a different discovered device.
     """
     ok, reason = bleak_available()
     if not ok:
         raise RuntimeError(f"Bluetooth unavailable: {reason}")
     from bleak import BleakClient  # type: ignore
 
-    found = await scan(timeout=timeout)
+    roles: dict = {"trainer": [], "power": [], "hr": []}
+    if selected is None:
+        found = await scan(timeout=timeout)
 
-    def _first_with(service_uuid: str) -> Optional[dict]:
-        for d in found:
-            if service_uuid in [s.lower() for s in d["services"]]:
-                return d
-        return None
+        def _first_with(service_uuid: str) -> Optional[dict]:
+            for device in found:
+                if service_uuid in [s.lower() for s in device["services"]]:
+                    return device
+            return None
 
-    roles = {
-        "trainer": _first_with(FITNESS_MACHINE_SERVICE),
-        "power": _first_with(CYCLING_POWER_SERVICE),
-        "hr": _first_with(HEART_RATE_SERVICE),
-    }
+        for role, service in (
+            ("trainer", FITNESS_MACHINE_SERVICE),
+            ("power", CYCLING_POWER_SERVICE),
+            ("hr", HEART_RATE_SERVICE),
+        ):
+            device = _first_with(service)
+            if device:
+                roles[role].append(device)
+    else:
+        for role in roles:
+            raw_addresses = selected.get(role, [])
+            if isinstance(raw_addresses, str):
+                raw_addresses = [raw_addresses]
+            seen = set()
+            for address in raw_addresses:
+                if address in seen:
+                    continue
+                seen.add(address)
+                roles[role].append({"address": address, "name": address})
 
     clients: dict = {}  # address -> connected BleakClient (dedup: one per device)
     out = {"trainer": None, "power_source": None, "hr_source": None,
-           "clients": [], "names": {}}
-    for role, dev in roles.items():
-        if not dev:
-            continue
-        addr = dev["address"]
-        client = clients.get(addr)
-        if client is None:
-            client = BleakClient(addr)
+           "clients": [], "names": {}, "errors": []}
+    power_sources = []
+    power_names = []
+    try:
+        for role in ("trainer", "power", "hr"):
+            for dev in roles[role]:
+                addr = dev["address"]
+                client = clients.get(addr)
+                if client is None:
+                    client = BleakClient(addr)
+                    try:
+                        await client.connect()
+                    except BaseException as e:
+                        try:
+                            await client.disconnect()
+                        except BaseException:
+                            pass
+                        if not isinstance(e, Exception):
+                            raise
+                        message = f"Could not connect {role} sensor {dev['name']} ({addr}): {e}"
+                        log.warning(message)
+                        out["errors"].append(message)
+                        continue
+                    clients[addr] = client
+                    out["clients"].append(client)
+                try:
+                    if role == "trainer":
+                        trainer = BleakTrainer(client)
+                        await trainer.prepare()
+                        out["trainer"] = trainer
+                        out["names"][role] = dev["name"]
+                    elif role == "power":
+                        source = BleakPowerSource(client)
+                        await source.start()
+                        power_sources.append(source)
+                        power_names.append(dev["name"])
+                    elif role == "hr":
+                        hr = BleakHeartRateSource(client)
+                        await hr.start()
+                        out["hr_source"] = hr
+                        out["names"][role] = dev["name"]
+                except Exception as e:  # role setup failed: keep the others working
+                    message = f"Could not set up {role} sensor {dev['name']} ({addr}): {e}"
+                    log.warning(message)
+                    out["errors"].append(message)
+    except BaseException:
+        for client in reversed(out["clients"]):
             try:
-                await client.connect()
-            except Exception as e:
-                log.warning("Could not connect %s (%s): %s", dev["name"], addr, e)
-                continue
-            clients[addr] = client
-            out["clients"].append(client)
-        out["names"][role] = dev["name"]
-        try:
-            if role == "trainer":
-                trainer = BleakTrainer(client)
-                await trainer.prepare()
-                out["trainer"] = trainer
-            elif role == "power":
-                src = BleakPowerSource(client)
-                await src.start()
-                out["power_source"] = src
-            elif role == "hr":
-                hr = BleakHeartRateSource(client)
-                await hr.start()
-                out["hr_source"] = hr
-        except Exception as e:  # role setup failed: keep the others working
-            log.warning("Could not set up %s on %s: %s", role, dev["name"], e)
+                await client.disconnect()
+            except BaseException:
+                pass
+        raise
+
+    if power_sources:
+        out["power_source"] = (
+            power_sources[0]
+            if len(power_sources) == 1
+            else AggregatePowerSource(power_sources)
+        )
+        out["names"]["power"] = (
+            power_names[0] if len(power_names) == 1 else power_names
+        )
     return out
