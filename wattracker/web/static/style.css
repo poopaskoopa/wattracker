@@ -358,6 +358,10 @@ button.danger.link-btn { border: none; color: var(--alert); }
 /* Ride */
 .ride-setup { margin: 1rem 0; }
 .ride-setup select { margin-left: 0.5rem; }
+.device-list table { margin: 0.5rem 0; }
+.device-address { display: block; color: var(--muted); overflow-wrap: anywhere; }
+.device-role { display: inline-block; margin: 0.15rem 0.7rem 0.15rem 0; white-space: nowrap; }
+.device-role input { padding: 0; }
 .ride-live { margin-top: 1rem; }
 .progress-wrap { background: #10161d; border: 1px solid #2a333d; border-radius: 6px;
     height: 16px; overflow: hidden; margin: 0.75rem 0; }

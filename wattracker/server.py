@@ -243,6 +243,11 @@ MAX_UPLOAD_BYTES = 50 * 1024 * 1024
 # cross-site page's Origin will never match, blocking cross-site WS hijacking.
 _ALLOWED_WS_ORIGIN_HOSTS = ("localhost", "127.0.0.1", "::1")
 
+# BLE addresses are opaque identifiers (UUIDs on macOS, MAC-like strings on
+# other platforms). Bound user-supplied selections without imposing a format.
+_MAX_SELECTED_POWER_SOURCES = 8
+_MAX_BLE_ADDRESS_LENGTH = 256
+
 
 class IPv6TrustedHostMiddleware(TrustedHostMiddleware):
     """TrustedHostMiddleware with correct bracketed-IPv6 host parsing.
@@ -1507,6 +1512,44 @@ def create_app() -> FastAPI:
             return False
         return host in _ALLOWED_WS_ORIGIN_HOSTS
 
+    def _selected_ble_addresses(params) -> Optional[dict]:
+        """Parse an explicit, bounded sensor selection from WS query params."""
+        if params.get("selected") != "1":
+            return None
+
+        power = params.getlist("power")
+        hr = params.getlist("hr")
+        trainer = params.getlist("trainer")
+        if len(power) > _MAX_SELECTED_POWER_SOURCES:
+            raise ValueError(
+                f"Select at most {_MAX_SELECTED_POWER_SOURCES} power sensors."
+            )
+        if len(hr) > 1 or len(trainer) > 1:
+            raise ValueError("Select at most one heart-rate monitor and one trainer.")
+
+        selected = {"power": [], "hr": [], "trainer": []}
+        for role, addresses in (("power", power), ("hr", hr), ("trainer", trainer)):
+            for address in addresses:
+                if not address or len(address) > _MAX_BLE_ADDRESS_LENGTH:
+                    raise ValueError(f"Invalid {role} sensor address.")
+                if address not in selected[role]:
+                    selected[role].append(address)
+        return selected
+
+    async def _stop_ble_trainer(conn: Optional[dict]) -> None:
+        """Best-effort stop for a prepared trainer without a RideController."""
+        trainer = (conn or {}).get("trainer")
+        if trainer is None:
+            return
+        try:
+            async_stop = getattr(trainer, "async_stop", None)
+            if callable(async_stop):
+                await async_stop()
+            else:
+                trainer.stop_erg()
+        except Exception:
+            pass
+
     @app.websocket("/ride/ws")
     async def ride_ws(websocket: WebSocket):
         if not _ws_origin_ok(websocket):
@@ -1527,6 +1570,13 @@ def create_app() -> FastAPI:
 
         params = websocket.query_params
         sim = params.get("sim")
+        prepare_only = params.get("prepare") == "1"
+        try:
+            selected = _selected_ble_addresses(params)
+        except ValueError as e:
+            await websocket.send_json({"status": "error", "error": str(e)})
+            await websocket.close()
+            return
         session, _name = _ride_session(
             uid,
             workout_id=params.get("workout_id"),
@@ -1556,21 +1606,45 @@ def create_app() -> FastAPI:
             # Control + Start inside prepare), then poll in real time. A ride
             # without an FTMS trainer still works read-only (power/HR display).
             conn = None
+            controller = None
+            abnormal_cleanup = False
             try:
                 try:
-                    conn = await bledevices.connect_sensors()
+                    if selected is None:
+                        conn = await bledevices.connect_sensors()
+                    else:
+                        conn = await bledevices.connect_sensors(selected=selected)
                 except Exception as e:  # no adapter, scan failure, ...
                     await websocket.send_json({"status": "error", "error": str(e)})
                     return
                 if not conn["power_source"] and not conn["trainer"]:
+                    details = " ".join(conn.get("errors", []))
                     await websocket.send_json(
                         {
                             "status": "error",
-                            "error": "No power meter or FTMS trainer found. "
-                            "Scan first, or use Simulate.",
+                            "error": (
+                                "No selected power meter or FTMS trainer could be set up."
+                                if selected is not None
+                                else "No power meter or FTMS trainer found. "
+                                     "Scan first, or use Simulate."
+                            ) + (f" {details}" if details else ""),
                         }
                     )
                     return
+                await websocket.send_json(
+                    {"status": "connected", "devices": conn["names"],
+                     "erg": conn["trainer"] is not None,
+                     "warnings": conn.get("errors", []),
+                     "prepared": prepare_only}
+                )
+                if prepare_only:
+                    while True:
+                        message = await websocket.receive_json()
+                        if message.get("action") == "start":
+                            break
+                        if message.get("action") == "stop":
+                            return
+
                 controller = RideController(
                     session,
                     ftp,
@@ -1580,32 +1654,45 @@ def create_app() -> FastAPI:
                     user_id=uid,
                     autosave=True,
                 )
-                await websocket.send_json(
-                    {"status": "connected", "devices": conn["names"],
-                     "erg": conn["trainer"] is not None}
-                )
+                if prepare_only:
+                    await websocket.send_json({"status": "started"})
                 while controller.status != "finished":
                     controller.poll(dt=1)
                     await websocket.send_json(controller.state())
                     await asyncio.sleep(RIDE_POLL_INTERVAL_S)
                 await websocket.send_json(controller.state())
-            except Exception:
+            except BaseException as exc:
+                abnormal_cleanup = True
                 # Client closed the socket or BLE failed mid-ride: stop cleanly
-                # (stop() zeroes the ERG target and saves the ride).
+                # once a ride actually started. An idle controller must not
+                # create a zero-duration activity.
                 try:
-                    if conn is not None and "controller" in locals():
+                    if controller is not None and controller.status not in (
+                        "idle", "finished"
+                    ):
                         controller.stop()
-                except Exception:
+                except BaseException:
                     pass
+                if not isinstance(exc, Exception):
+                    raise
             finally:
+                if (
+                    abnormal_cleanup
+                    or controller is None
+                    or controller.status != "finished"
+                ):
+                    try:
+                        await _stop_ble_trainer(conn)
+                    except BaseException:
+                        pass
                 for client in (conn or {}).get("clients", []):
                     try:
                         await client.disconnect()
-                    except Exception:
+                    except BaseException:
                         pass
                 try:
                     await websocket.close()
-                except Exception:
+                except BaseException:
                     pass
             return
 
