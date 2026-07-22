@@ -20,7 +20,7 @@ from .config import _restrict
 
 _log = logging.getLogger(__name__)
 
-SCHEMA_VERSION = 17
+SCHEMA_VERSION = 18
 
 
 def _restrict_db_files(path: str) -> None:
@@ -93,6 +93,9 @@ _MIGRATIONS: Dict[int, List[str]] = {
     16: [
         "ALTER TABLE user_settings ADD COLUMN hr_max INTEGER",
     ],
+    17: [
+        "ALTER TABLE activities ADD COLUMN rpe INTEGER",
+    ],
 }
 
 _DROP = """
@@ -144,6 +147,7 @@ CREATE TABLE IF NOT EXISTS activities (
     np          REAL,
     if_         REAL,
     tss         REAL,
+    rpe         INTEGER,
     streams     BLOB,
     UNIQUE(user_id, dedup_hash),
     FOREIGN KEY(user_id) REFERENCES users(id)
@@ -662,6 +666,7 @@ def _row_summary(row: sqlite3.Row) -> dict:
         "np": row["np"],
         "if_": row["if_"],
         "tss": row["tss"],
+        "rpe": row["rpe"],
     }
 
 
@@ -1324,6 +1329,59 @@ def set_standalone_rpe(
         )
         conn.commit()
         return cur.rowcount > 0
+    finally:
+        conn.close()
+
+
+def set_activity_rpe(
+    user_id: int, activity_id: int, rpe: int, path: Optional[str] = None,
+) -> bool:
+    """Set a subjective perceived-exertion rating directly on an activity.
+
+    Used only for rides not matched to a verified plan/standalone workout;
+    matched rides route their rating through the workout so it feeds the FTP
+    loop. Scoped to the user; returns True when a row was updated.
+    """
+    conn = connect(path)
+    try:
+        cur = conn.execute(
+            "UPDATE activities SET rpe=? WHERE user_id=? AND id=?",
+            (int(rpe), user_id, activity_id),
+        )
+        conn.commit()
+        return cur.rowcount > 0
+    finally:
+        conn.close()
+
+
+def linked_workout_for_activity(
+    user_id: int, activity_id: int, path: Optional[str] = None,
+) -> Optional[dict]:
+    """The plan/standalone workout this activity completes, if any.
+
+    Returns {"kind","id","name","rpe"} for the workout whose
+    completed_activity_id is this activity (plan checked first), else None.
+    Verification/eligibility is decided by the caller.
+    """
+    conn = connect(path)
+    try:
+        row = conn.execute(
+            "SELECT id, name, rpe FROM plan_workouts "
+            "WHERE user_id=? AND completed_activity_id=? LIMIT 1",
+            (user_id, activity_id),
+        ).fetchone()
+        if row:
+            return {"kind": "plan", "id": row["id"], "name": row["name"],
+                    "rpe": row["rpe"]}
+        row = conn.execute(
+            "SELECT id, name, rpe FROM standalone_workouts "
+            "WHERE user_id=? AND completed_activity_id=? LIMIT 1",
+            (user_id, activity_id),
+        ).fetchone()
+        if row:
+            return {"kind": "standalone", "id": row["id"], "name": row["name"],
+                    "rpe": row["rpe"]}
+        return None
     finally:
         conn.close()
 
