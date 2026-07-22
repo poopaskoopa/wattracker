@@ -1,4 +1,5 @@
-"""Route + WebSocket tests for the Ride page (no hardware, bleak absent)."""
+"""Route + WebSocket tests for the Ride page (no hardware; availability is
+forced via monkeypatch so results don't depend on whether bleak is installed)."""
 import pytest
 
 pytest.importorskip("httpx")
@@ -20,8 +21,20 @@ def _register(client, username="rider"):
     client.post("/register", data={"username": username, "password": "password123"})
 
 
-def test_ride_page_renders_unavailable(client):
-    # bleak is absent in the test env -> Bluetooth unavailable, page still loads.
+def _force_bt_unavailable(monkeypatch):
+    # Force the "no Bluetooth" branch regardless of whether the [ble] extra
+    # (bleak) is installed in the test environment, so the suite is deterministic
+    # for developers who have installed real-hardware support.
+    monkeypatch.setattr(
+        bledevices,
+        "bluetooth_available",
+        lambda: (False, "bleak not installed (ModuleNotFoundError)"),
+    )
+
+
+def test_ride_page_renders_unavailable(client, monkeypatch):
+    # Bluetooth unavailable -> page still loads and offers Simulate.
+    _force_bt_unavailable(monkeypatch)
     _register(client)
     r = client.get("/ride")
     assert r.status_code == 200
@@ -37,14 +50,16 @@ def test_ride_page_renders_available_when_monkeypatched(client, monkeypatch):
     assert "Bluetooth available" in r.text
 
 
-def test_ride_status_endpoint(client):
+def test_ride_status_endpoint(client, monkeypatch):
+    _force_bt_unavailable(monkeypatch)
     _register(client)
     data = client.get("/ride/status").json()
     assert data["available"] is False
     assert "bleak" in data["reason"]
 
 
-def test_ride_scan_unavailable(client):
+def test_ride_scan_unavailable(client, monkeypatch):
+    _force_bt_unavailable(monkeypatch)
     _register(client)
     r = client.post("/ride/scan")
     data = r.json()
@@ -80,7 +95,8 @@ def test_ride_ws_unauthenticated_closes(client):
         assert msg["status"] == "error"
 
 
-def test_ride_ws_unavailable_without_sim(client):
+def test_ride_ws_unavailable_without_sim(client, monkeypatch):
+    _force_bt_unavailable(monkeypatch)
     _register(client)
     with client.websocket_connect("/ride/ws?type=endurance&minutes=30") as ws:
         msg = ws.receive_json()
