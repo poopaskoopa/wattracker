@@ -315,6 +315,7 @@ def activity_detail(
         "np": act.get("np"),
         "if_": act.get("if_"),
         "tss": act.get("tss"),
+        "rpe": act.get("rpe"),
         "t": t,
         "power": series["power"],
         "heartrate": series["heartrate"],

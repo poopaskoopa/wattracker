@@ -288,7 +288,7 @@ def test_v16_to_v17_migration_preserves_users_settings_and_races(tmp_path):
 
     db.init_db(path)
     conn = db.connect(path)
-    assert conn.execute("PRAGMA user_version").fetchone()[0] == 17
+    assert conn.execute("PRAGMA user_version").fetchone()[0] == db.SCHEMA_VERSION
     setting = conn.execute(
         "SELECT ftp, weight_kg, hr_max FROM user_settings WHERE user_id = ?", (uid,)
     ).fetchone()

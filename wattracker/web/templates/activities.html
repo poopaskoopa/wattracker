@@ -35,7 +35,7 @@
     <thead>
         <tr>
             <th>Start</th><th>Duration</th><th>Distance</th>
-            <th>Avg Power</th><th>NP</th><th>IF</th><th>TSS</th><th></th>
+            <th>Avg Power</th><th>NP</th><th>IF</th><th>TSS</th><th>Effort</th><th></th>
         </tr>
     </thead>
     <tbody>
@@ -48,6 +48,10 @@
             <td>{{ '%.0f'|format(a.np or 0) }} W</td>
             <td>{{ '%.2f'|format(a.if_ or 0) }}</td>
             <td>{{ '%.0f'|format(a.tss or 0) }}</td>
+            <td>
+                {% if a.rpe %}<span class="cal-rpe">RPE {{ a.rpe }}</span>
+                {% else %}<a class="hint" href="/activity/{{ a.id }}">Rate</a>{% endif %}
+            </td>
             <td><a class="button" href="/activity/{{ a.id }}">View graphs</a></td>
         </tr>
     {% endfor %}
