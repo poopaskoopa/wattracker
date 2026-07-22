@@ -414,6 +414,46 @@ def _profile_evidence(activity: dict, workout: dict) -> Optional[tuple]:
     return compliance, scale if hard_enough else None
 
 
+def _requires_power_profile(workout: dict) -> bool:
+    """Whether a prescription has a usable objective target-power profile."""
+    target = _zwo_fraction_profile(
+        workout.get("zwo") or workout.get("zwo_or_segments") or ""
+    )
+    return len(target) >= 600 and any(power >= 0.50 for power in target)
+
+
+def plan_workout_completion_verified(user_id: int, workout: dict) -> bool:
+    """Whether a stored completion is strong enough to expose RPE feedback.
+
+    Legacy prescriptions without an objective profile retain their historical
+    duration/TSS completion semantics.  Profile-backed prescriptions require
+    linked, user-owned activity data that still passes duration and objective
+    profile checks. Old weak links remain stored but are treated as unverified
+    rather than silently deleted.
+    """
+    if not workout or workout.get("completed_activity_id") is None:
+        return False
+    if not _requires_power_profile(workout):
+        return True
+    duration = float(workout.get("duration_s") or 0)
+    activity = db.get_activity(user_id, workout["completed_activity_id"])
+    if not activity or duration <= 0:
+        return False
+    try:
+        activity_date = _dt.datetime.fromisoformat(
+            str(activity.get("start_time") or "")
+        ).date().isoformat()
+    except (TypeError, ValueError):
+        return False
+    if activity_date != workout.get("date"):
+        return False
+    duration_error = abs(float(activity.get("duration_s") or 0) - duration) / duration
+    if duration_error > STANDALONE_DURATION_TOLERANCE:
+        return False
+    evidence = _profile_evidence(activity, workout)
+    return bool(evidence and evidence[0] >= PROFILE_MIN_COMPLIANCE)
+
+
 def _match_standalone_completions(
     user_id: int, now: Optional[_dt.datetime] = None
 ) -> int:
@@ -478,6 +518,64 @@ def _completion_score(activity: dict, workout: dict) -> Optional[float]:
     return None
 
 
+def match_plan_workout_completion(
+    user_id: int,
+    workout_id: int,
+    on_date: Optional[_dt.date] = None,
+) -> bool:
+    """Match one today's plan workout against already-imported power data.
+
+    This is the narrow calendar-click path: it never scans files, never looks
+    at another user's data, and never considers another plan workout.  Unlike
+    the legacy batch matcher, an objective power-profile match is required.
+    """
+    db.init_db()
+    on_date = on_date or _dt.date.today()
+    workout = db.get_plan_workout(user_id, workout_id)
+    if (
+        not workout
+        or workout.get("completed_activity_id") is not None
+        or workout.get("date") != on_date.isoformat()
+    ):
+        return False
+
+    used = db.completed_activity_ids(user_id)
+    best = None
+    best_score = None
+    duration = float(workout.get("duration_s") or 0)
+    if duration <= 0:
+        return False
+
+    for summary in db.activities_on_date(user_id, workout["date"]):
+        if summary["id"] in used:
+            continue
+        duration_error = abs(float(summary.get("duration_s") or 0) - duration) / duration
+        if duration_error > STANDALONE_DURATION_TOLERANCE:
+            continue
+        activity = db.get_activity(user_id, summary["id"])
+        evidence = _profile_evidence(activity or {}, workout)
+        if evidence is None:
+            continue
+        compliance, effective = evidence
+        if compliance < PROFILE_MIN_COMPLIANCE:
+            continue
+        score = duration_error + (1.0 - compliance)
+        if best_score is None or score < best_score:
+            best = (summary, compliance, effective)
+            best_score = score
+
+    if best is None:
+        return False
+    return db.mark_plan_workout_completed(
+        user_id,
+        workout_id,
+        best[0]["id"],
+        workout["date"],
+        best[1],
+        best[2],
+    )
+
+
 def match_plan_completions(user_id: int, now: Optional[_dt.datetime] = None) -> int:
     """Mark plan workouts completed by matching same-day activities.
 
@@ -503,9 +601,20 @@ def match_plan_completions(user_id: int, now: Optional[_dt.datetime] = None) -> 
                 abs(float(act.get("duration_s") or 0) - duration) / duration
                 if duration > 0 else 999.0
             )
-            if evidence is not None and duration_error <= STANDALONE_DURATION_TOLERANCE:
-                compliance, effective = evidence
-                score = duration_error + (1.0 - compliance) if compliance >= PROFILE_MIN_COMPLIANCE else None
+            if _requires_power_profile(workout):
+                if (
+                    evidence is not None
+                    and duration_error <= STANDALONE_DURATION_TOLERANCE
+                ):
+                    compliance, effective = evidence
+                    score = (
+                        duration_error + (1.0 - compliance)
+                        if compliance >= PROFILE_MIN_COMPLIANCE
+                        else None
+                    )
+                else:
+                    compliance = effective = None
+                    score = None
             else:
                 compliance = effective = None
                 fallback = _completion_score(act, workout)
@@ -557,10 +666,18 @@ def apply_rpe_ftp_feedback(
     if not latest or latest.get("source") != "estimated":
         return None
     since = (now.date() - _dt.timedelta(days=FTP_FEEDBACK_WINDOW_DAYS)).isoformat()
-    evidence = [
-        e for e in db.unused_feedback_evidence(user_id, since)
-        if float(e.get("compliance") or 0) >= PROFILE_MIN_COMPLIANCE
-    ]
+    evidence = []
+    for item in db.unused_feedback_evidence(user_id, since):
+        if float(item.get("compliance") or 0) < PROFILE_MIN_COMPLIANCE:
+            continue
+        # Plan completions must still verify (linked activity, matching date,
+        # duration and objective profile) before their RPE can move FTP; a stale
+        # or weak completion link is treated as unverified rather than trusted.
+        if item.get("kind") == "plan":
+            workout = db.get_plan_workout(user_id, int(item["id"]))
+            if not plan_workout_completion_verified(user_id, workout or {}):
+                continue
+        evidence.append(item)
     low = [
         e for e in evidence
         if int(e["rpe"]) <= (8 if e["type"] == "vo2max" else 7)
@@ -609,6 +726,10 @@ def save_workout_rpe(
     """Save/correct a rating, reversing its prior feedback batch first."""
     if kind not in ("plan", "standalone"):
         return False
+    if kind == "plan":
+        workout = db.get_plan_workout(user_id, workout_id)
+        if not plan_workout_completion_verified(user_id, workout or {}):
+            return False
     db.rollback_feedback_for_workout(user_id, kind, workout_id)
     if kind == "plan":
         saved = db.set_plan_workout_rpe(user_id, workout_id, rpe)
