@@ -113,21 +113,38 @@ def test_poll_drives_from_simulated_sources():
     assert c.status == "finished"         # zeros after start -> auto-stop
 
 
-def test_erg_started_once_and_stopped_on_finish():
+def test_erg_rearmed_on_resume_and_stopped_on_finish():
     trainer = SimulatedTrainer()
     c = RideController(_two_block_session(), 200, trainer=trainer, autosave=False)
     c.tick(power=0)  # idle: no ERG commands yet
     assert trainer.commands == []
     c.tick(power=120)  # ride start -> Request Control + Start
     assert trainer.commands == ["request_control", "start"]
-    c.tick(power=0)    # pause
-    c.tick(power=120)  # resume must NOT re-send request control
-    assert trainer.commands == ["request_control", "start"]
+    c.tick(power=0)    # pause -> trainer may have dropped ERG
+    c.tick(power=120)  # resume MUST re-arm ERG (Request Control + Start again)
+    assert trainer.commands == ["request_control", "start", "request_control", "start"]
     for _ in range(20):
         c.tick(power=120)
     assert c.status == "finished"
-    assert trainer.commands == ["request_control", "start", "stop"]
+    assert trainer.commands[-1] == "stop"
     assert trainer.targets[-1] == 0  # ERG target zeroed before stop
+
+
+def test_erg_reengaged_after_pause_regression():
+    """Regression: stopping mid-ride drops the trainer out of ERG; on resume the
+    controller must re-issue Request Control + Start so ERG is re-engaged rather
+    than the trainer free-riding below target (observed 2026-07-21 .fit)."""
+    trainer = SimulatedTrainer()
+    c = RideController(_two_block_session(), 200, trainer=trainer, autosave=False)
+    c.tick(power=120)                      # start
+    for _ in range(30):                    # long stop: rider off the pedals
+        if c.status == "finished":
+            break
+        c.tick(power=0, dt=0.1)            # small dt so grace isn't tripped
+    c.tick(power=120)                      # resume
+    # ERG was re-armed on resume, not just re-targeted.
+    assert trainer.commands.count("request_control") == 2
+    assert trainer.commands.count("start") == 2
 
 
 def test_erg_target_follows_ramp_each_second():
