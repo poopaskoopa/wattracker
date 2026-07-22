@@ -22,6 +22,13 @@
         <span class="value">{{ '%.0f'|format(activity.tss or 0) }}</span></div>
 </section>
 
+<section class="rpe-section" id="rpeSection" hidden aria-labelledby="rpeTitle">
+    <h4 id="rpeTitle">Perceived exertion</h4>
+    <p class="hint" id="rpeHint"></p>
+    <div class="rpe-buttons" id="rpeButtons"></div>
+    <p class="hint" id="rpeStatus"></p>
+</section>
+
 <section class="zone-summary" aria-labelledby="zone-summary-title">
     <h3 id="zone-summary-title">Time in zones</h3>
     <div class="zone-summary-grid">
