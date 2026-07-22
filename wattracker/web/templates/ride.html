@@ -23,12 +23,19 @@
     </label>
     <div class="toolbar">
         <button type="button" id="scanBtn" {{ '' if ble_available else 'disabled' }}>Scan devices</button>
-        <button type="button" id="connectBtn" {{ '' if ble_available else 'disabled' }}>Connect</button>
-        <button type="button" id="startBtn">Start ride</button>
+        <button type="button" id="connectBtn" {{ '' if ble_available else 'disabled' }}>Connect selected sensors</button>
+        <button type="button" id="startBtn">Connect &amp; ride</button>
         <button type="button" id="simBtn">Simulate</button>
         <button type="button" id="stopBtn" disabled>Stop</button>
     </div>
-    <div id="deviceList" class="hint"></div>
+    <p id="scanStatus" class="hint" aria-live="polite">
+        Scan to identify devices by advertised role and signal strength. You can
+        assign an unknown device manually. Select multiple power devices only when
+        each reports partial/one-sided power; never combine a trainer or full-power
+        source with pedals.
+    </p>
+    <div id="deviceList" class="device-list"></div>
+    <p id="connectionStatus" class="hint" aria-live="polite"></p>
 </section>
 
 <section class="ride-live">
@@ -48,15 +55,23 @@
 <script>
 (function () {
     var ws = null;
+    var scanned = false;
+    var deviceNames = {};
+    var rideState = "idle";
+    var bleAvailable = !document.getElementById("scanBtn").disabled;
     function fmt(sec) {
         sec = Math.round(sec || 0);
         var m = Math.floor(sec / 60), s = sec % 60;
         return m + ":" + (s < 10 ? "0" + s : s);
     }
-    function setBtns(running) {
-        document.getElementById("stopBtn").disabled = !running;
-        document.getElementById("startBtn").disabled = running;
-        document.getElementById("simBtn").disabled = running;
+    function setRideState(state) {
+        rideState = state;
+        var active = state !== "idle";
+        document.getElementById("stopBtn").disabled = !active;
+        document.getElementById("startBtn").disabled = state === "connecting" || state === "running";
+        document.getElementById("simBtn").disabled = active;
+        document.getElementById("scanBtn").disabled = active || !bleAvailable;
+        document.getElementById("connectBtn").disabled = active || !bleAvailable;
     }
     function render(st) {
         document.getElementById("rStatus").textContent = st.status;
@@ -68,57 +83,220 @@
         document.getElementById("rSeg").textContent = (st.segment_index || 0) + 1;
         document.getElementById("rSegCount").textContent = st.segment_count;
         document.getElementById("rProgress").style.width = ((st.progress || 0) * 100) + "%";
-        if (st.status === "finished") setBtns(false);
+        if (st.status === "finished") setRideState("idle");
     }
-    function openRide(sim) {
+    function openRide(sim, prepare) {
         if (ws) { try { ws.close(); } catch (e) {} }
         var proto = location.protocol === "https:" ? "wss:" : "ws:";
         var wid = document.getElementById("workoutSelect").value;
         var q = [];
         if (wid) q.push("workout_id=" + encodeURIComponent(wid));
         if (sim) q.push("sim=1");
+        if (prepare) q.push("prepare=1");
+        if (!sim && scanned) {
+            q.push("selected=1");
+            document.querySelectorAll('#deviceList input[data-role="power"]:checked').forEach(function (input) {
+                q.push("power=" + encodeURIComponent(input.value));
+            });
+            var hr = document.querySelector('#deviceList input[data-role="hr"]:checked');
+            var trainer = document.querySelector('#deviceList input[data-role="trainer"]:checked');
+            if (hr && hr.value) q.push("hr=" + encodeURIComponent(hr.value));
+            if (trainer && trainer.value) q.push("trainer=" + encodeURIComponent(trainer.value));
+        }
         ws = new WebSocket(proto + "//" + location.host + "/ride/ws" + (q.length ? "?" + q.join("&") : ""));
-        setBtns(true);
+        document.getElementById("rStatus").textContent = "connecting";
+        document.getElementById("connectionStatus").textContent =
+            sim ? "Starting simulation..." : "Connecting sensors...";
+        setRideState("connecting");
         ws.onmessage = function (ev) {
             var st = JSON.parse(ev.data);
             if (st.status === "unavailable" || st.status === "error") {
-                document.getElementById("rStatus").textContent =
-                    st.error || st.message || "unavailable";
-                setBtns(false);
+                var error = st.error || st.message || "unavailable";
+                document.getElementById("rStatus").textContent = error;
+                document.getElementById("connectionStatus").textContent = error;
+                setRideState("idle");
                 return;
             }
             if (st.status === "connected") {
                 var names = st.devices || {};
                 var parts = [];
-                if (names.trainer) parts.push("trainer: " + names.trainer + (st.erg ? " (ERG)" : ""));
-                if (names.power) parts.push("power: " + names.power);
-                if (names.hr) parts.push("HR: " + names.hr);
-                document.getElementById("deviceList").textContent =
-                    parts.length ? "Connected — " + parts.join(", ") : "Connected.";
+                if (names.trainer) parts.push("trainer: " + displayName(names.trainer) + (st.erg ? " (ERG)" : ""));
+                if (names.power) {
+                    var powerNames = Array.isArray(names.power) ? names.power : [names.power];
+                    parts.push("power: " + powerNames.map(displayName).join(" + "));
+                }
+                if (names.hr) parts.push("HR: " + displayName(names.hr));
+                var message = parts.length ? "Connected — " + parts.join(", ") : "Connected.";
+                message += st.prepared
+                    ? " Press Connect & ride to start the workout."
+                    : " Start pedaling to begin the workout.";
+                if (st.warnings && st.warnings.length) {
+                    message += " Warning: " + st.warnings.join(" ");
+                }
+                document.getElementById("connectionStatus").textContent = message;
+                setRideState(st.prepared ? "prepared" : "running");
+                return;
+            }
+            if (st.status === "started") {
+                document.getElementById("rStatus").textContent = "idle";
+                document.getElementById("connectionStatus").textContent =
+                    "Workout started. Start pedaling to begin the clock.";
+                setRideState("running");
                 return;
             }
             render(st);
         };
-        ws.onclose = function () { setBtns(false); };
-        ws.onerror = function () { setBtns(false); };
+        ws.onclose = function () { setRideState("idle"); };
+        ws.onerror = function () { setRideState("idle"); };
     }
-    document.getElementById("startBtn").addEventListener("click", function () { openRide(false); });
-    document.getElementById("simBtn").addEventListener("click", function () { openRide(true); });
+    function roleLabel(role) {
+        if (role === "power") return "Power";
+        if (role === "hr") return "Heart rate";
+        if (role === "trainer") return "Trainer";
+        return role;
+    }
+    function displayName(value) {
+        var address = String(value);
+        return deviceNames[address] || address;
+    }
+    function renderDevices(devices) {
+        var el = document.getElementById("deviceList");
+        var status = document.getElementById("scanStatus");
+        el.replaceChildren();
+        deviceNames = {};
+        scanned = true;
+        if (!devices.length) {
+            status.textContent = "No devices found.";
+            return;
+        }
+
+        status.textContent = "Found " + devices.length + " device" +
+            (devices.length === 1 ? "." : "s.") +
+            " Detected roles come from advertised services; unknown devices can be assigned manually. RSSI closer to 0 is stronger. Select multiple power devices only for partial/one-sided sources; never combine a trainer or full-power source with pedals.";
+        var noSensors = document.createElement("div");
+        [["hr", "No HR"], ["trainer", "No trainer"]].forEach(function (choice) {
+            var label = document.createElement("label");
+            label.className = "device-role";
+            var input = document.createElement("input");
+            input.type = "radio";
+            input.name = "ble-" + choice[0];
+            input.dataset.role = choice[0];
+            input.value = "";
+            input.checked = true;
+            label.appendChild(input);
+            label.appendChild(document.createTextNode(" " + choice[1]));
+            noSensors.appendChild(label);
+        });
+        el.appendChild(noSensors);
+        var wrap = document.createElement("div");
+        wrap.className = "table-scroll";
+        var table = document.createElement("table");
+        var head = document.createElement("thead");
+        var headerRow = document.createElement("tr");
+        ["Device", "Detected", "Signal", "Use as"].forEach(function (label) {
+            var th = document.createElement("th");
+            th.textContent = label;
+            headerRow.appendChild(th);
+        });
+        head.appendChild(headerRow);
+        table.appendChild(head);
+        var body = document.createElement("tbody");
+        var choseHr = false, choseTrainer = false;
+        var preferredPower = null;
+        devices.forEach(function (device) {
+            var roles = Array.isArray(device.roles) ? device.roles : [];
+            if (preferredPower === null && roles.indexOf("power") !== -1 && roles.indexOf("trainer") === -1) {
+                preferredPower = String(device.address || "");
+            }
+        });
+        if (preferredPower === null) {
+            devices.some(function (device) {
+                var roles = Array.isArray(device.roles) ? device.roles : [];
+                if (roles.indexOf("power") === -1) return false;
+                preferredPower = String(device.address || "");
+                return true;
+            });
+        }
+        devices.forEach(function (device) {
+            var roles = Array.isArray(device.roles) ? device.roles : [];
+            var deviceAddress = String(device.address || "");
+            deviceNames[deviceAddress] = device.name || "(unknown)";
+            var row = document.createElement("tr");
+            var identity = document.createElement("td");
+            var name = document.createElement("strong");
+            name.textContent = device.name || "(unknown)";
+            var address = document.createElement("small");
+            address.className = "device-address";
+            address.textContent = deviceAddress;
+            identity.appendChild(name);
+            identity.appendChild(address);
+            row.appendChild(identity);
+
+            var detected = document.createElement("td");
+            detected.textContent = roles.length ? roles.map(roleLabel).join(", ") : "Unknown";
+            row.appendChild(detected);
+            var signal = document.createElement("td");
+            signal.textContent = device.rssi == null ? "—" : String(device.rssi) + " dBm";
+            row.appendChild(signal);
+
+            var uses = document.createElement("td");
+            ["power", "hr", "trainer"].forEach(function (role) {
+                var label = document.createElement("label");
+                label.className = "device-role";
+                var input = document.createElement("input");
+                input.type = role === "power" ? "checkbox" : "radio";
+                input.name = role === "power" ? "ble-power" : "ble-" + role;
+                input.dataset.role = role;
+                input.value = deviceAddress;
+                if (role === "power" && deviceAddress === preferredPower) input.checked = true;
+                if (role === "hr" && roles.indexOf(role) !== -1 && !choseHr) {
+                    input.checked = true;
+                    choseHr = true;
+                }
+                if (role === "trainer" && roles.indexOf(role) !== -1 && !choseTrainer) {
+                    input.checked = true;
+                    choseTrainer = true;
+                }
+                label.appendChild(input);
+                label.appendChild(document.createTextNode(" " + roleLabel(role)));
+                uses.appendChild(label);
+            });
+            row.appendChild(uses);
+            body.appendChild(row);
+        });
+        table.appendChild(body);
+        wrap.appendChild(table);
+        el.appendChild(wrap);
+    }
+    document.getElementById("connectBtn").addEventListener("click", function () { openRide(false, true); });
+    document.getElementById("startBtn").addEventListener("click", function () {
+        if (rideState === "prepared" && ws) {
+            ws.send(JSON.stringify({action: "start"}));
+            document.getElementById("connectionStatus").textContent = "Starting workout...";
+            setRideState("running");
+        } else {
+            openRide(false, false);
+        }
+    });
+    document.getElementById("simBtn").addEventListener("click", function () { openRide(true, false); });
     document.getElementById("stopBtn").addEventListener("click", function () {
         if (ws) { try { ws.close(); } catch (e) {} }
-        setBtns(false);
+        setRideState("idle");
     });
     document.getElementById("scanBtn").addEventListener("click", async function () {
         var el = document.getElementById("deviceList");
-        el.textContent = "Scanning...";
+        var status = document.getElementById("scanStatus");
+        scanned = false;
+        deviceNames = {};
+        el.replaceChildren();
+        status.textContent = "Scanning...";
+        document.getElementById("connectionStatus").textContent = "";
         try {
             var resp = await fetch("/ride/scan", { method: "POST" });
             var data = await resp.json();
-            if (!data.available) { el.textContent = "Unavailable: " + (data.reason || ""); return; }
-            el.innerHTML = data.devices.length
-                ? data.devices.map(function (d) { return d.name + " (" + d.address + ")"; }).join("<br>")
-                : "No devices found.";
-        } catch (e) { el.textContent = "Scan failed."; }
+            if (!data.available) { status.textContent = "Unavailable: " + (data.reason || ""); return; }
+            renderDevices(data.devices || []);
+        } catch (e) { status.textContent = "Scan failed."; }
     });
 })();
 </script>
