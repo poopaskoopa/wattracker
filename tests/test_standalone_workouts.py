@@ -65,9 +65,13 @@ def _plan_workout(user_id, key="plan", kind="threshold", date=DATE):
 
 
 def _complete_plan(user_id, key, rpe, kind="threshold", effective=220.0):
-    workout_id, _ = _plan_workout(user_id, key, kind)
+    workout_id, xml = _plan_workout(user_id, key, kind)
+    profile = importer._zwo_fraction_profile(xml)
+    activity_id = _activity(
+        user_id, DATE, [p * effective for p in profile], suffix=key
+    )
     assert db.mark_plan_workout_completed(
-        user_id, workout_id, 20_000 + workout_id, DATE, .95, effective
+        user_id, workout_id, activity_id, DATE, .95, effective
     )
     assert importer.save_workout_rpe(user_id, "plan", workout_id, rpe,
                                      dt.datetime.fromisoformat(f"{DATE}T20:00:00"))
@@ -395,6 +399,54 @@ def test_plan_ratings_share_feedback_policy(user_id):
     assert db.latest_ftp(user_id)["ftp_watts"] == 210.0
     assert db.get_plan_workout(user_id, first)["feedback_applied"]
     assert db.get_plan_workout(user_id, second)["feedback_applied"]
+
+
+def test_valid_plan_rpe_ten_participates_in_ftp_feedback(user_id):
+    db.add_ftp_entry(user_id, DATE, 200, "estimated")
+    first = _complete_plan(user_id, "plan-too-hard-1", 10)
+    assert db.latest_ftp(user_id)["ftp_watts"] == 200
+    second = _complete_plan(user_id, "plan-too-hard-2", 10)
+
+    # threshold RPE 10 -> 2 points over neutral (8) -> 2 * 0.025 = 5% drop.
+    assert db.latest_ftp(user_id)["ftp_watts"] == 190.0
+    assert db.get_plan_workout(user_id, first)["feedback_applied"]
+    assert db.get_plan_workout(user_id, second)["feedback_applied"]
+
+
+def test_invalid_plan_evidence_cannot_change_estimated_ftp(user_id):
+    db.add_ftp_entry(user_id, DATE, 200, "estimated")
+
+    wrong_date, xml = _plan_workout(user_id, "wrong-date-feedback")
+    profile = importer._zwo_fraction_profile(xml)
+    wrong_date_activity = _activity(
+        user_id,
+        "2026-07-18",
+        [p * 220 for p in profile],
+        suffix="wrong-date-feedback",
+    )
+    assert db.mark_plan_workout_completed(
+        user_id, wrong_date, wrong_date_activity, DATE, .95, 220
+    )
+    assert db.set_plan_workout_rpe(user_id, wrong_date, 10)
+
+    missing_activity, _ = _plan_workout(user_id, "missing-feedback")
+    assert db.mark_plan_workout_completed(
+        user_id, missing_activity, 999_999, DATE, .95, 220
+    )
+    assert db.set_plan_workout_rpe(user_id, missing_activity, 10)
+
+    assert not importer.plan_workout_completion_verified(
+        user_id, db.get_plan_workout(user_id, wrong_date)
+    )
+    assert not importer.plan_workout_completion_verified(
+        user_id, db.get_plan_workout(user_id, missing_activity)
+    )
+    assert importer.apply_rpe_ftp_feedback(
+        user_id, dt.datetime.fromisoformat(f"{DATE}T20:00:00")
+    ) is None
+    assert db.latest_ftp(user_id)["ftp_watts"] == 200
+    assert not db.get_plan_workout(user_id, wrong_date)["feedback_applied"]
+    assert not db.get_plan_workout(user_id, missing_activity)["feedback_applied"]
 
 
 def test_mixed_plan_standalone_batch_rolls_back_across_kinds(user_id):
