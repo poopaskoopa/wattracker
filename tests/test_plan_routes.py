@@ -7,6 +7,9 @@ pytest.importorskip("httpx")
 from fastapi.testclient import TestClient  # noqa: E402
 
 from wattracker import db  # noqa: E402
+from wattracker.ingest import importer  # noqa: E402
+from wattracker.prescribe import zwo  # noqa: E402
+from wattracker.prescribe.planner import build_workout  # noqa: E402
 from wattracker.server import create_app  # noqa: E402
 
 
@@ -261,6 +264,174 @@ def test_calendar_workouts_are_clickable(client):
     assert "workoutModal" in r.text
 
 
+def _today_profile_workout(uid, date="2026-08-05", power_scale=210.0):
+    session = build_workout("threshold", 60)
+    xml = zwo.zwo_string(session)
+    plan_id = db.create_plan(uid, "Today", date, 1)
+    workout_id = db.add_plan_workout(
+        plan_id,
+        uid,
+        date,
+        session.name,
+        "threshold",
+        session.total_duration(),
+        session.estimated_tss,
+        xml,
+    )
+    profile = importer._zwo_fraction_profile(xml)
+    activity_id = db.insert_activity(
+        uid,
+        {
+            "dedup_hash": f"today-{uid}-{date}-{power_scale}",
+            "filename": "today.fit",
+            "start_time": f"{date}T10:00:00",
+            "duration_s": len(profile),
+            "distance_m": 0,
+            "avg_power": power_scale,
+            "avg_hr": None,
+            "np": power_scale,
+            "if_": 1.0,
+            "tss": session.estimated_tss,
+            "streams": {"power": [p * power_scale for p in profile]},
+        },
+    )
+    return workout_id, activity_id
+
+
+def test_calendar_click_reconciles_today_and_exposes_rpe_prompt(client, monkeypatch):
+    import wattracker.server as servermod
+
+    _register(client)
+    uid = db.get_user_by_username("rider")["id"]
+    today = dt.date(2026, 8, 5)
+    monkeypatch.setattr(servermod._dt, "date", _FrozenDate(today))
+    workout_id, activity_id = _today_profile_workout(uid, today.isoformat())
+
+    reconciled = client.post(f"/api/plan/workout/{workout_id}/reconcile")
+    assert reconciled.status_code == 200
+    assert reconciled.json() == {
+        "id": workout_id,
+        "status": "matched",
+        "matched": True,
+    }
+    stored = db.get_plan_workout(uid, workout_id)
+    assert stored["completed_activity_id"] == activity_id
+    assert stored["compliance"] >= importer.PROFILE_MIN_COMPLIANCE
+
+    detail = client.get(f"/api/plan/workout/{workout_id}").json()
+    assert detail["completed"] is True
+    assert detail["rpe"] is None
+    assert detail["too_hard"] is False
+    assert "10 = hardest and means the workout was too hard" in client.get(
+        "/calendar?year=2026&month=8"
+    ).text
+
+    # A repeated click is a no-op and preserves the original match.
+    again = client.post(f"/api/plan/workout/{workout_id}/reconcile").json()
+    assert again == {"id": workout_id, "status": "completed", "matched": False}
+    assert db.get_plan_workout(uid, workout_id)["completed_activity_id"] == activity_id
+
+
+def test_calendar_click_rejects_profile_mismatch_and_foreign_workout(client, monkeypatch):
+    import wattracker.server as servermod
+
+    _register(client, "alice")
+    alice = db.get_user_by_username("alice")["id"]
+    today = dt.date(2026, 8, 5)
+    monkeypatch.setattr(servermod._dt, "date", _FrozenDate(today))
+    workout_id, _ = _today_profile_workout(alice, today.isoformat(), power_scale=0.0)
+
+    no_match = client.post(f"/api/plan/workout/{workout_id}/reconcile")
+    assert no_match.status_code == 200
+    assert no_match.json()["status"] == "no_match"
+    assert db.get_plan_workout(alice, workout_id)["completed_activity_id"] is None
+
+    client.post("/logout")
+    _register(client, "bob")
+    assert client.post(
+        f"/api/plan/workout/{workout_id}/reconcile"
+    ).status_code == 404
+
+
+def test_calendar_click_does_not_trust_mismatched_precompleted_profile(
+    client, monkeypatch
+):
+    import wattracker.server as servermod
+
+    _register(client)
+    uid = db.get_user_by_username("rider")["id"]
+    today = dt.date(2026, 8, 5)
+    monkeypatch.setattr(servermod._dt, "date", _FrozenDate(today))
+    workout_id, activity_id = _today_profile_workout(
+        uid, today.isoformat(), power_scale=0.0
+    )
+    assert db.mark_plan_workout_completed(
+        uid, workout_id, activity_id, today.isoformat()
+    )
+
+    reconciled = client.post(f"/api/plan/workout/{workout_id}/reconcile")
+    assert reconciled.json() == {
+        "id": workout_id,
+        "status": "unverified_completion",
+        "matched": False,
+    }
+    detail = client.get(f"/api/plan/workout/{workout_id}").json()
+    assert detail["completed"] is True
+    assert detail["completion_verified"] is False
+    assert detail["rpe_eligible"] is False
+    assert client.post(
+        f"/api/plan/workout/{workout_id}/rpe", json={"rpe": 10}
+    ).status_code == 400
+    assert "Rate completed workouts" not in client.get(
+        "/calendar?year=2026&month=8"
+    ).text
+
+
+def test_stored_compliance_cannot_verify_oversized_linked_activity(
+    client, monkeypatch
+):
+    import wattracker.server as servermod
+
+    _register(client)
+    uid = db.get_user_by_username("rider")["id"]
+    today = dt.date(2026, 8, 5)
+    monkeypatch.setattr(servermod._dt, "date", _FrozenDate(today))
+    workout_id, _ = _today_profile_workout(uid, today.isoformat())
+    workout = db.get_plan_workout(uid, workout_id)
+    profile = importer._zwo_fraction_profile(workout["zwo_or_segments"])
+    oversized_power = [p * 210 for p in profile for _ in range(2)]
+    oversized_id = db.insert_activity(
+        uid,
+        {
+            "dedup_hash": "oversized-linked-activity",
+            "filename": "oversized.fit",
+            "start_time": f"{today.isoformat()}T12:00:00",
+            "duration_s": len(oversized_power),
+            "distance_m": 0,
+            "avg_power": 210,
+            "avg_hr": None,
+            "np": 210,
+            "if_": 1.0,
+            "tss": workout["tss"],
+            "streams": {"power": oversized_power},
+        },
+    )
+    assert db.mark_plan_workout_completed(
+        uid, workout_id, oversized_id, today.isoformat(), .95, 210
+    )
+    linked = db.get_plan_workout(uid, workout_id)
+
+    assert not importer.plan_workout_completion_verified(uid, linked)
+    assert not importer.save_workout_rpe(uid, "plan", workout_id, 10)
+    detail = client.get(f"/api/plan/workout/{workout_id}").json()
+    assert detail["completion_verified"] is False
+    assert detail["rpe_eligible"] is False
+    assert client.post(
+        f"/api/plan/workout/{workout_id}/rpe", json={"rpe": 10}
+    ).status_code == 400
+    assert db.get_plan_workout(uid, workout_id)["rpe"] is None
+
+
 def test_calendar_shows_completion_checkmark(client):
     _register(client)
     client.post("/generate/plan", data=PLAN_FORM)
@@ -308,7 +479,27 @@ def _completed_workout_id(client, username="rider"):
     uid = db.get_user_by_username(username)["id"]
     plan_id = db.list_plans(uid)[0]["id"]
     w = db.plan_workouts_for_plan(uid, plan_id)[0]
-    db.mark_plan_workout_completed(uid, w["id"], 1234, w["date"])
+    full = db.get_plan_workout(uid, w["id"])
+    profile = importer._zwo_fraction_profile(full["zwo_or_segments"])
+    activity_id = db.insert_activity(
+        uid,
+        {
+            "dedup_hash": f"completed-{uid}-{w['id']}",
+            "filename": "completed.fit",
+            "start_time": f"{w['date']}T10:00:00",
+            "duration_s": len(profile),
+            "distance_m": 0,
+            "avg_power": 210,
+            "avg_hr": None,
+            "np": 210,
+            "if_": 1.0,
+            "tss": w["tss"],
+            "streams": {"power": [p * 210 for p in profile]},
+        },
+    )
+    db.mark_plan_workout_completed(
+        uid, w["id"], activity_id, w["date"], .95, 210
+    )
     return uid, w["id"]
 
 
@@ -347,6 +538,18 @@ def test_rpe_success_and_detail_returns_it(client):
     detail = client.get(f"/api/plan/workout/{wid}").json()
     assert detail["rpe"] == 7
     assert detail["completed"] is True
+
+
+def test_rpe_ten_is_reported_as_too_hard_for_ftp_feedback(client):
+    _register(client)
+    client.post("/generate/plan", data=PLAN_FORM)
+    _uid, wid = _completed_workout_id(client)
+    r = client.post(f"/api/plan/workout/{wid}/rpe", json={"rpe": 10})
+    assert r.status_code == 200
+    assert r.json()["too_hard"] is True
+    detail = client.get(f"/api/plan/workout/{wid}").json()
+    assert detail["rpe"] == 10
+    assert detail["too_hard"] is True
 
 
 def test_rpe_overwrite_allowed(client):
