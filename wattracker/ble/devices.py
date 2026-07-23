@@ -330,36 +330,46 @@ class BleakTrainer(Trainer):
             self._notify_started = True
 
     async def _procedure(self, payload: bytes, what: str) -> dict:
-        request_op = payload[0]
         async with self._procedure_lock:
-            await self._ensure_notify()
-            loop = asyncio.get_running_loop()
-            response = loop.create_future()
-            self._pending_op = request_op
-            self._pending_response = response
-            try:
-                await self._client.write_gatt_char(
-                    FITNESS_MACHINE_CONTROL_POINT, payload, response=True
-                )
-                result = await asyncio.wait_for(
-                    response, timeout=self._response_timeout_s
-                )
-            except asyncio.TimeoutError as exc:
-                message = f"FTMS {what} timed out waiting for acknowledgement"
-                self.last_error = message
-                raise TimeoutError(message) from exc
-            except Exception as exc:
-                self.last_error = f"FTMS {what} failed: {exc}"
-                raise
-            finally:
-                self._pending_op = None
-                self._pending_response = None
-            if not result["success"]:
-                message = f"FTMS {what} rejected: {result['message']}"
-                self.last_error = message
-                raise RuntimeError(message)
-            self.last_error = None
-            return result
+            return await self._procedure_locked(payload, what)
+
+    async def _procedure_locked(self, payload: bytes, what: str) -> dict:
+        """Run one FTMS control-point procedure and await its acknowledgement.
+
+        The caller must already hold ``self._procedure_lock``. Holding it across
+        a multi-step operation (e.g. enable ERG: request-control -> start ->
+        set-target) keeps that operation atomic, so a concurrent command such as
+        set-target-power cannot interleave between the handshake steps.
+        """
+        request_op = payload[0]
+        await self._ensure_notify()
+        loop = asyncio.get_running_loop()
+        response = loop.create_future()
+        self._pending_op = request_op
+        self._pending_response = response
+        try:
+            await self._client.write_gatt_char(
+                FITNESS_MACHINE_CONTROL_POINT, payload, response=True
+            )
+            result = await asyncio.wait_for(
+                response, timeout=self._response_timeout_s
+            )
+        except asyncio.TimeoutError as exc:
+            message = f"FTMS {what} timed out waiting for acknowledgement"
+            self.last_error = message
+            raise TimeoutError(message) from exc
+        except Exception as exc:
+            self.last_error = f"FTMS {what} failed: {exc}"
+            raise
+        finally:
+            self._pending_op = None
+            self._pending_response = None
+        if not result["success"]:
+            message = f"FTMS {what} rejected: {result['message']}"
+            self.last_error = message
+            raise RuntimeError(message)
+        self.last_error = None
+        return result
 
     async def _write(self, payload: bytes, what: str) -> bool:
         """Compatibility wrapper returning success while retaining strict ACKs."""
@@ -375,19 +385,25 @@ class BleakTrainer(Trainer):
         await self.async_enable_erg()
 
     async def async_enable_erg(self, target_watts: Optional[int] = None) -> None:
-        self._erg_enabled = False
-        await self._procedure(encode_request_control(), "request control")
-        await self._procedure(encode_start(), "start")
-        self._erg_available = True
-        try:
-            if target_watts is not None:
-                await self._procedure(
-                    encode_set_target_power(target_watts), "set target power"
-                )
-        except Exception:
+        # Hold the procedure lock across the whole handshake so no other command
+        # (e.g. a concurrent set-target-power) interleaves between request
+        # control, start, and the initial target.
+        async with self._procedure_lock:
             self._erg_enabled = False
-            raise
-        self._erg_enabled = True
+            await self._procedure_locked(
+                encode_request_control(), "request control"
+            )
+            await self._procedure_locked(encode_start(), "start")
+            self._erg_available = True
+            try:
+                if target_watts is not None:
+                    await self._procedure_locked(
+                        encode_set_target_power(target_watts), "set target power"
+                    )
+            except Exception:
+                self._erg_enabled = False
+                raise
+            self._erg_enabled = True
 
     async def async_set_target_power(self, watts: int) -> None:
         try:
