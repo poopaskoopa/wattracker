@@ -74,6 +74,24 @@ def test_stopping_during_start_countdown_does_not_save(user_id):
     assert trainer.commands[-1] == "stop"
 
 
+def test_completing_start_gate_without_riding_does_not_save(user_id):
+    trainer = SimulatedTrainer()
+    c = RideController(
+        _two_block_session(), 200, trainer=trainer, user_id=user_id, autosave=True
+    )
+    c.tick(power=100)
+    c.tick(power=100)
+    assert c.tick(power=100)["status"] == "running"  # start gate completed
+    assert c.elapsed == 0.0
+    assert c.has_started is False  # no ride time accumulated yet
+    c.tick(power=0)
+    c.stop()
+
+    assert c.status == "finished"
+    assert c.activity_id is None
+    assert db.list_activities(user_id) == []
+
+
 def test_erg_target_follows_each_segment():
     trainer = SimulatedTrainer()
     c = RideController(_two_block_session(), 200, trainer=trainer, start_grace_s=0, autosave=False)

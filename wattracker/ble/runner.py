@@ -152,7 +152,6 @@ class RideController:
                     self.current_target = self.target_watts(0)
                     return self.state()
                 self.status = RUNNING
-                self._ever_started = True
                 if self.started_at is None:
                     self.started_at = _dt.datetime.now()
                 self._trainer_call("start_erg")
@@ -177,6 +176,9 @@ class RideController:
             self._positive_run = self.start_grace_s
             self._zero_run = 0.0
             self.elapsed += dt
+            # Only real ride time counts as "started": completing the start gate
+            # alone must never persist a zero-duration, zero-sample activity.
+            self._ever_started = True
 
             # Set the ERG target for the current position. Sent every tick, so
             # it both follows segment/ramp changes and acts as a keepalive.

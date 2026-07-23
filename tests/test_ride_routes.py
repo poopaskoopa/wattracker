@@ -203,8 +203,9 @@ def test_ride_ws_real_path_erg_drives_trainer(client, monkeypatch):
 
     _register(client)
     trainer = SimulatedTrainer()
-    # Pedal 3s, then stop until the shortened inactivity timeout finalizes.
-    _patch_real_ride(monkeypatch, trainer, [150, 150, 150] + [0] * 10)
+    # Pedal through the 3s start gate plus 1s of ride time, then stop until the
+    # shortened inactivity timeout finalizes.
+    _patch_real_ride(monkeypatch, trainer, [150, 150, 150, 150] + [0] * 10)
 
     frames = []
     with client.websocket_connect("/ride/ws?type=endurance&minutes=30") as ws:
@@ -232,7 +233,7 @@ def test_ride_ws_real_path_erg_drives_trainer(client, monkeypatch):
 
 def test_ride_ws_real_path_degrades_without_trainer(client, monkeypatch):
     _register(client)
-    _patch_real_ride(monkeypatch, None, [150, 150, 150] + [0] * 10)
+    _patch_real_ride(monkeypatch, None, [150, 150, 150, 150] + [0] * 10)
 
     frames = []
     with client.websocket_connect("/ride/ws?type=endurance&minutes=30") as ws:
@@ -324,7 +325,7 @@ def test_ride_ws_prepare_waits_for_start_action(client, monkeypatch):
     async def fake_connect(timeout=6.0, selected=None):
         return {
             "trainer": trainer,
-            "power_source": SimulatedPowerSource([150, 150, 150, 0, 0, 0, 0, 0]),
+            "power_source": SimulatedPowerSource([150, 150, 150, 150, 0, 0, 0, 0]),
             "hr_source": None,
             "clients": [],
             "names": {"power": "Pedals", "trainer": "Trainer"},
@@ -464,7 +465,7 @@ def test_ride_ws_base_exception_finalizes_active_ride_and_cleans_every_client(
 
         def advance(self):
             self.calls += 1
-            if self.calls == 4:
+            if self.calls == 5:
                 raise RideCancelled("ride task cancelled")
 
         def latest_power(self):
