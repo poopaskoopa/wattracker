@@ -35,6 +35,40 @@ def test_aggregate_power_source_sums_available_watts_and_averages_cadence():
     assert devices.AggregatePowerSource([FixedPower(None)]).latest_power() is None
 
 
+def test_bleak_power_and_cadence_expire_by_monotonic_age(monkeypatch):
+    now = [100.0]
+    monkeypatch.setattr(devices.time, "monotonic", lambda: now[0])
+    source = devices.BleakPowerSource(object(), stale_after_s=3)
+
+    def measurement(power, revs, event_time):
+        return bytearray(
+            b"\x20\x00"
+            + int(power).to_bytes(2, "little", signed=True)
+            + int(revs).to_bytes(2, "little")
+            + int(event_time).to_bytes(2, "little")
+        )
+
+    source._on_notify(None, measurement(105, 10, 1000))
+    source._on_notify(None, measurement(110, 11, 2024))
+    assert source.latest_power() == 110
+    assert source.latest_cadence() == 60
+
+    now[0] += 3.01
+    assert source.latest_power() is None
+    assert source.latest_cadence() is None
+
+
+def test_bleak_heart_rate_expires_by_monotonic_age(monkeypatch):
+    now = [50.0]
+    monkeypatch.setattr(devices.time, "monotonic", lambda: now[0])
+    source = devices.BleakHeartRateSource(object(), stale_after_s=3)
+    source._on_notify(None, bytearray([0, 148]))
+    assert source.latest_hr() == 148
+
+    now[0] += 3.01
+    assert source.latest_hr() is None
+
+
 def _install_fake_bleak(monkeypatch):
     module = types.ModuleType("bleak")
 

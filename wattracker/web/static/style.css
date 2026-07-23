@@ -362,6 +362,23 @@ button.danger.link-btn { border: none; color: var(--alert); }
 .device-address { display: block; color: var(--muted); overflow-wrap: anywhere; }
 .device-role { display: inline-block; margin: 0.15rem 0.7rem 0.15rem 0; white-space: nowrap; }
 .device-role input { padding: 0; }
+.connection-badge { display: inline-block; margin-top: 0.25rem; padding: 0.1rem 0.4rem;
+    border-radius: 999px; background: #2a333d; color: var(--muted); font-size: 0.72rem; }
+.connection-badge:empty { display: none; }
+.device-connected { background: rgba(67, 160, 71, 0.12); }
+.device-connected .connection-badge, .status-success { color: #7bd88f; }
+.status-failure { color: #ff7b72; }
+.status-working { color: var(--accent); }
+.scan-busy { display: inline-flex; align-items: center; gap: 0.4rem; color: var(--muted); }
+.scan-busy[hidden] { display: none; }
+.spinner { width: 0.9rem; height: 0.9rem; border: 2px solid #2a333d;
+    border-top-color: var(--accent); border-radius: 50%; animation: ride-spin 0.8s linear infinite; }
+@keyframes ride-spin { to { transform: rotate(360deg); } }
+.ride-workout { background: #10161d; border-left: 3px solid var(--accent);
+    border-radius: 4px; padding: 0.65rem 0.8rem; margin-bottom: 0.8rem; }
+.ride-chart-block { position: relative; min-height: 280px; background: var(--panel);
+    border-radius: 8px; padding: 0.8rem; margin-top: 1rem; }
+.ride-chart-block canvas { width: 100% !important; height: 230px !important; }
 .ride-live { margin-top: 1rem; }
 .progress-wrap { background: #10161d; border: 1px solid #2a333d; border-radius: 6px;
     height: 16px; overflow: hidden; margin: 0.75rem 0; }

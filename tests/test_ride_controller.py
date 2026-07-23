@@ -32,19 +32,51 @@ def test_pauses_at_zero_power_before_start():
     assert c.trainer.targets == []  # no ERG target while idle
 
 
-def test_starts_on_first_pedal_and_sets_erg_target():
+def test_requires_three_continuous_power_seconds_to_start_and_sets_erg_target():
     trainer = SimulatedTrainer()
     c = RideController(_two_block_session(), 200, trainer=trainer, autosave=False)
+    assert c.tick(power=120)["status"] == "starting"
+    assert c.state()["start_countdown"] == 2
+    assert c.tick(power=120)["status"] == "starting"
+    assert c.state()["start_countdown"] == 1
     st = c.tick(power=120)
     assert st["status"] == "running"
-    assert c.elapsed == 1.0
-    # elapsed 1 is in block 0 (50% x 200 = 100W)
+    assert c.elapsed == 0.0
+    assert c._samples["power"] == []
+    # The initial target is armed at workout time zero.
     assert trainer.last_target == 100
+    c.tick(power=120)
+    assert c.elapsed == 1.0
+    assert c._samples["power"] == [120]
+
+
+def test_start_countdown_resets_when_positive_power_is_not_continuous():
+    c = RideController(_two_block_session(), 200, autosave=False)
+    assert c.tick(power=100)["start_countdown"] == 2
+    assert c.tick(power=100)["start_countdown"] == 1
+    assert c.tick(power=0)["status"] == "idle"
+    assert c.tick(power=100)["start_countdown"] == 2
+    assert c.has_started is False
+
+
+def test_stopping_during_start_countdown_does_not_save(user_id):
+    trainer = SimulatedTrainer()
+    c = RideController(
+        _two_block_session(), 200, trainer=trainer, user_id=user_id, autosave=True
+    )
+    c.tick(power=100)
+    c.tick(power=100)
+    assert c.status == "starting"
+    c.stop()
+
+    assert c.status == "finished"
+    assert db.list_activities(user_id) == []
+    assert trainer.commands[-1] == "stop"
 
 
 def test_erg_target_follows_each_segment():
     trainer = SimulatedTrainer()
-    c = RideController(_two_block_session(), 200, trainer=trainer, autosave=False)
+    c = RideController(_two_block_session(), 200, trainer=trainer, start_grace_s=0, autosave=False)
     for _ in range(20):
         c.tick(power=150, dt=1)
     # Block 0 (50% -> 100W) then block 1 (100% -> 200W) must both appear.
@@ -54,10 +86,13 @@ def test_erg_target_follows_each_segment():
 
 
 def test_auto_pause_then_resume():
-    c = RideController(_two_block_session(), 200, trainer=SimulatedTrainer(), autosave=False)
+    c = RideController(_two_block_session(), 200, trainer=SimulatedTrainer(), start_grace_s=0, autosave=False)
     c.tick(power=100)            # running, elapsed 1
     assert c.status == "running"
-    c.tick(power=0)             # pause
+    c.tick(power=0)
+    c.tick(power=0)
+    assert c.status == "running"  # brief dropouts do not pause
+    c.tick(power=0)             # pause after 3 continuous seconds
     assert c.status == "paused"
     assert c.elapsed == 1.0     # clock did not advance
     c.tick(power=100)           # resume
@@ -65,17 +100,20 @@ def test_auto_pause_then_resume():
     assert c.elapsed == 2.0
 
 
-def test_auto_stop_after_zero_power_grace():
+def test_pause_after_zero_power_grace_does_not_auto_finish():
     c = RideController(
         _two_block_session(), 200, trainer=SimulatedTrainer(),
-        zero_grace_s=3, autosave=False,
+        start_grace_s=0, zero_grace_s=3, autosave=False,
     )
     c.tick(power=100)  # start
     c.tick(power=0)    # zero_run 1
     c.tick(power=0)    # zero_run 2
+    assert c.status == "running"
+    c.tick(power=0)    # zero_run 3 >= grace -> pause
     assert c.status == "paused"
-    c.tick(power=0)    # zero_run 3 >= grace -> finish
-    assert c.status == "finished"
+    for _ in range(20):
+        c.tick(power=0)
+    assert c.status == "paused"
 
 
 def test_zero_before_start_never_auto_stops():
@@ -89,7 +127,7 @@ def test_zero_before_start_never_auto_stops():
 
 def test_finish_sets_trainer_to_zero():
     trainer = SimulatedTrainer()
-    c = RideController(_two_block_session(), 200, trainer=trainer, autosave=False)
+    c = RideController(_two_block_session(), 200, trainer=trainer, start_grace_s=0, autosave=False)
     for _ in range(20):
         c.tick(power=150)
     assert c.status == "finished"
@@ -97,7 +135,7 @@ def test_finish_sets_trainer_to_zero():
 
 
 def test_poll_drives_from_simulated_sources():
-    # power script: idle, idle, pedal x3, then zeros to auto-stop (grace 2)
+    # power script: idle, idle, pedal x3, then zeros to pause (grace 2)
     ps = SimulatedPowerSource([0, 0, 120, 120, 120, 0, 0, 0], cadences=[0, 0, 85, 88, 90, 0, 0, 0])
     hrs = SimulatedHeartRateSource([0, 0, 140, 142, 145, 145, 145, 145])
     c = RideController(
@@ -110,17 +148,18 @@ def test_poll_drives_from_simulated_sources():
         statuses.append(st["status"])
     assert statuses[0] == "idle"          # first 0W tick
     assert "running" in statuses          # started on pedal
-    assert c.status == "finished"         # zeros after start -> auto-stop
+    assert c.status == "paused"           # zeros after start -> pause, not finish
 
 
 def test_erg_rearmed_on_resume_and_stopped_on_finish():
     trainer = SimulatedTrainer()
-    c = RideController(_two_block_session(), 200, trainer=trainer, autosave=False)
+    c = RideController(_two_block_session(), 200, trainer=trainer, start_grace_s=0, autosave=False)
     c.tick(power=0)  # idle: no ERG commands yet
     assert trainer.commands == []
     c.tick(power=120)  # ride start -> Request Control + Start
     assert trainer.commands == ["request_control", "start"]
-    c.tick(power=0)    # pause -> trainer may have dropped ERG
+    for _ in range(3):
+        c.tick(power=0)  # pause -> trainer may have dropped ERG
     c.tick(power=120)  # resume MUST re-arm ERG (Request Control + Start again)
     assert trainer.commands == ["request_control", "start", "request_control", "start"]
     for _ in range(20):
@@ -135,7 +174,7 @@ def test_erg_reengaged_after_pause_regression():
     controller must re-issue Request Control + Start so ERG is re-engaged rather
     than the trainer free-riding below target (observed 2026-07-21 .fit)."""
     trainer = SimulatedTrainer()
-    c = RideController(_two_block_session(), 200, trainer=trainer, autosave=False)
+    c = RideController(_two_block_session(), 200, trainer=trainer, start_grace_s=0, autosave=False)
     c.tick(power=120)                      # start
     for _ in range(30):                    # long stop: rider off the pedals
         if c.status == "finished":
@@ -154,7 +193,7 @@ def test_erg_target_follows_ramp_each_second():
         segments=[Segment(kind="warmup", duration=10, power_low=0.5, power_high=1.0)],
     )
     trainer = SimulatedTrainer()
-    c = RideController(session, 200, trainer=trainer, autosave=False)
+    c = RideController(session, 200, trainer=trainer, start_grace_s=0, autosave=False)
     for _ in range(10):
         c.tick(power=150, dt=1)
     # Expected: fraction 0.5 + 0.05*t at t=1..10 -> 110,120,...,200 W, then the
@@ -172,7 +211,8 @@ def test_ride_survives_failing_trainer():
             raise RuntimeError("BLE write failed")
 
     c = RideController(
-        _two_block_session(), 200, trainer=FailingTrainer(), autosave=False
+        _two_block_session(), 200, trainer=FailingTrainer(),
+        start_grace_s=0, autosave=False,
     )
     for _ in range(20):
         c.tick(power=150)
@@ -180,7 +220,7 @@ def test_ride_survives_failing_trainer():
 
 
 def test_no_trainer_power_display_still_works():
-    c = RideController(_two_block_session(), 200, trainer=None, autosave=False)
+    c = RideController(_two_block_session(), 200, trainer=None, start_grace_s=0, autosave=False)
     st = c.tick(power=180)
     assert st["status"] == "running"
     assert st["power"] == 180
@@ -272,7 +312,8 @@ def test_bleak_trainer_write_failure_degrades_gracefully():
 def test_finished_ride_saves_activity(user_id):
     trainer = SimulatedTrainer()
     c = RideController(
-        _two_block_session(), 200, trainer=trainer, user_id=user_id, autosave=True,
+        _two_block_session(), 200, trainer=trainer, user_id=user_id,
+        start_grace_s=0, autosave=True,
     )
     for _ in range(20):
         c.tick(power=180, cadence=90, hr=150, dt=1)
@@ -288,7 +329,7 @@ def test_saved_ride_isolated_per_user(user_id):
     from wattracker import auth
     other = db.create_user("someone_else", auth.hash_password("password123"))
     c = RideController(
-        _two_block_session(), 200, user_id=user_id, autosave=True,
+        _two_block_session(), 200, user_id=user_id, start_grace_s=0, autosave=True,
     )
     for _ in range(20):
         c.tick(power=150, dt=1)
