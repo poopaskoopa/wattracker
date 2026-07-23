@@ -90,8 +90,15 @@ def test_ride_page_renders_available_when_monkeypatched(client, monkeypatch):
     assert 'decimation: {enabled: true, algorithm: "lttb", samples: 1000' in r.text
     assert r.text.count("var wid") == 1
     assert 'getElementById("workoutSelect").disabled = active' in r.text
-    assert 'id="ridePowerChart"' in r.text
-    assert 'id="rideHrChart"' in r.text
+    assert 'id="rideChartPanel"' in r.text
+    assert 'id="rideChart"' in r.text
+    assert 'id="rideHrChart"' not in r.text
+    assert 'id="hrChartBlock"' not in r.text
+    assert 'id="rideChartSummary"' in r.text
+    assert 'aria-label="Target and measured power, cadence, and heart rate over workout time"' in r.text
+    assert 'id="chartPowerValue"' in r.text
+    assert 'id="chartCadenceValue"' in r.text
+    assert 'id="chartHrValue"' in r.text
     assert "Cadence (power sensor)" in r.text
     assert "devices.slice().sort" in r.text
     assert "playCue(\"scan\")" in r.text
@@ -102,10 +109,43 @@ def test_ride_page_renders_available_when_monkeypatched(client, monkeypatch):
     assert 'text: "Workout time (minutes)"' in r.text
     assert "min: 0, max: duration" in r.text
     assert "var minutes = Number(value) / 60;" in r.text
-    assert '{label: "Cadence", data: liveCadence, yAxisID: "cadence"' in r.text
-    assert 'scales.cadence = {beginAtZero: true, position: "right"' in r.text
+    assert '{label: "Target power", data: prescribed, yAxisID: "y"' in r.text
+    assert '{label: "Measured power", data: livePower, yAxisID: "y"' in r.text
+    assert 'borderColor: "#f2a900"' in r.text
+    assert 'borderColor: "#ffd166", backgroundColor: "#ffd166"' in r.text
+    assert "borderDash: [8, 4]" in r.text
+    assert '{label: "Cadence", data: liveCadence, yAxisID: "metrics"' in r.text
+    assert '{label: "Heart rate", data: liveHr, yAxisID: "metrics"' in r.text
+    assert 'metrics: {beginAtZero: true, position: "right"' in r.text
+    assert 'text: "Cadence (rpm) / Heart rate (bpm)"' in r.text
+    assert "appendOrReplace(liveHr" in r.text
+    assert "if (rideChart) {" in r.text
+    assert "rideChart.destroy();" in r.text
+    assert "pointRadius: 2.5" in r.text
+    assert "borderWidth: 3" in r.text
+    assert 'id="chartFullscreenBtn"' in r.text
+    assert 'aria-controls="rideChartPanel"' in r.text
+    assert "panel.requestFullscreen || panel.webkitRequestFullscreen" in r.text
+    assert '"ride-chart-fullscreen-fallback"' in r.text
+    assert 'event.key === "Escape"' in r.text
+    assert 'button.setAttribute("aria-pressed", active ? "true" : "false")' in r.text
+    assert "rideChart.resize();" in r.text
+    assert 'return number == null ? "—" : String(Math.round(number));' in r.text
     assert 'id="ergBtn"' in r.text
     assert '{action: "set_erg", enabled: !ergEnabled}' in r.text
+
+
+def test_ride_chart_styles_support_live_metrics_and_fullscreen(client):
+    r = client.get("/static/style.css")
+    assert r.status_code == 200
+    assert ".ride-chart-metrics strong" in r.text
+    assert "font-size: 28px" in r.text
+    assert ".ride-chart-metrics .metric-power { color: #ffd166; }" in r.text
+    assert ".ride-chart-metrics .metric-cadence { color: #57c7ff; }" in r.text
+    assert ".ride-chart-metrics .metric-heart-rate { color: #ff4d8d; }" in r.text
+    assert ".ride-chart-block:fullscreen" in r.text
+    assert ".ride-chart-fullscreen-fallback" in r.text
+    assert "body.ride-chart-fullscreen-open" in r.text
 
 
 def test_ride_status_endpoint(client, monkeypatch):

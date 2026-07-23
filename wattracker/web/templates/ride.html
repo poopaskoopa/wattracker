@@ -66,16 +66,24 @@
     <p class="hint">Segment <span id="rSeg">0</span>/<span id="rSegCount">0</span>.
        Hold positive power for 3 seconds to start. The clock pauses after 3 seconds
        without power and resumes when you pedal.</p>
-    <div class="ride-chart-block">
-        <h3>Power &amp; cadence</h3>
-        <canvas id="ridePowerChart" role="img"
-                aria-label="Prescribed power, actual power, and cadence over workout time"></canvas>
-        <p id="powerChartSummary" class="sr-only" aria-live="polite"></p>
-    </div>
-    <div id="hrChartBlock" class="ride-chart-block" hidden>
-        <h3>Heart rate</h3>
-        <canvas id="rideHrChart" role="img" aria-label="Heart rate over workout time"></canvas>
-        <p id="hrChartSummary" class="sr-only" aria-live="polite"></p>
+    <div id="rideChartPanel" class="ride-chart-block">
+        <div class="ride-chart-heading">
+            <h3>Workout metrics</h3>
+            <button type="button" id="chartFullscreenBtn" class="button-secondary"
+                    aria-controls="rideChartPanel" aria-pressed="false">
+                View chart full screen
+            </button>
+        </div>
+        <div class="ride-chart-canvas">
+            <div class="ride-chart-metrics" aria-hidden="true">
+                <span class="metric-power"><strong id="chartPowerValue">&mdash;</strong><small>W</small></span>
+                <span class="metric-cadence"><strong id="chartCadenceValue">&mdash;</strong><small>rpm</small></span>
+                <span class="metric-heart-rate"><strong id="chartHrValue">&mdash;</strong><small>bpm</small></span>
+            </div>
+            <canvas id="rideChart" role="img"
+                    aria-label="Target and measured power, cadence, and heart rate over workout time"></canvas>
+        </div>
+        <p id="rideChartSummary" class="sr-only" aria-live="polite"></p>
     </div>
 </section>
 
@@ -91,7 +99,7 @@
     var bleAvailable = !document.getElementById("scanBtn").disabled;
     var cacheKey = {{ ble_cache_key|tojson }};
     var cache = readCache();
-    var powerChart = null, hrChart = null;
+    var rideChart = null;
     var livePower = [], liveCadence = [], liveHr = [];
     var MAX_CHART_POINTS = 30000;
     var chartPointLimit = MAX_CHART_POINTS;
@@ -165,8 +173,11 @@
         element.classList.remove("status-success", "status-failure", "status-working");
         if (kind) element.classList.add("status-" + kind);
     }
-    function chartOptions(yTitle, duration, includeCadence) {
-        var scales = {
+    function chartOptions(duration) {
+        return {responsive: true, maintainAspectRatio: false, animation: false,
+            parsing: false, plugins: {legend: {display: true},
+                decimation: {enabled: true, algorithm: "lttb", samples: 1000, threshold: 2000}},
+            scales: {
             x: {type: "linear", title: {display: true, text: "Workout time (minutes)"},
                 min: 0, max: duration,
                 ticks: {callback: function (value) {
@@ -174,17 +185,25 @@
                     return Number.isInteger(minutes) ? String(minutes) : minutes.toFixed(1);
                 }}},
             y: {beginAtZero: true, position: "left",
-                title: {display: true, text: yTitle}}
-        };
-        if (includeCadence) {
-            scales.cadence = {beginAtZero: true, position: "right",
-                title: {display: true, text: "Cadence (rpm)"},
-                grid: {drawOnChartArea: false}};
-        }
-        return {responsive: true, maintainAspectRatio: false, animation: false,
-            parsing: false, plugins: {legend: {display: true},
-                decimation: {enabled: true, algorithm: "lttb", samples: 1000, threshold: 2000}},
-            scales: scales};
+                title: {display: true, text: "Power (W)"}},
+            metrics: {beginAtZero: true, position: "right",
+                title: {display: true, text: "Cadence (rpm) / Heart rate (bpm)"},
+                grid: {drawOnChartArea: false}}
+        }};
+    }
+    function finiteNumber(value) {
+        if (value == null || value === "") return null;
+        var number = Number(value);
+        return Number.isFinite(number) ? number : null;
+    }
+    function metricText(value) {
+        var number = finiteNumber(value);
+        return number == null ? "—" : String(Math.round(number));
+    }
+    function updateChartMetrics(st) {
+        document.getElementById("chartPowerValue").textContent = metricText(st.power);
+        document.getElementById("chartCadenceValue").textContent = metricText(st.cadence);
+        document.getElementById("chartHrValue").textContent = metricText(st.hr);
     }
     function setupWorkout(workout) {
         if (!workout) return;
@@ -199,18 +218,26 @@
         livePower = []; liveCadence = []; liveHr = [];
         chartPointLimit = Math.min(MAX_CHART_POINTS,
             Math.max(3600, Math.ceil(Number(workout.duration_s) || 0) + 10));
-        if (powerChart) powerChart.destroy();
-        powerChart = new Chart(document.getElementById("ridePowerChart"), {
+        if (rideChart) {
+            rideChart.destroy();
+            rideChart = null;
+        }
+        updateChartMetrics({power: null, cadence: null, hr: null});
+        document.getElementById("rideChartSummary").textContent = "";
+        rideChart = new Chart(document.getElementById("rideChart"), {
             type: "line", data: {datasets: [
-                {label: "Prescribed", data: prescribed, yAxisID: "y",
-                    borderColor: "#f2a900", pointRadius: 0, borderWidth: 2},
-                {label: "Actual", data: livePower, yAxisID: "y",
-                    borderColor: "#4db6ff", pointRadius: 0, borderWidth: 2},
-                {label: "Cadence", data: liveCadence, yAxisID: "cadence",
-                    borderColor: "#7bd88f", pointRadius: 0, borderWidth: 2}
-            ]}, options: chartOptions("Power (W)", workoutDuration, true)});
-        if (hrChart) { hrChart.destroy(); hrChart = null; }
-        document.getElementById("hrChartBlock").hidden = true;
+                {label: "Target power", data: prescribed, yAxisID: "y",
+                    borderColor: "#f2a900", pointRadius: 0, borderWidth: 2,
+                    borderDash: [8, 4]},
+                {label: "Measured power", data: livePower, yAxisID: "y",
+                    borderColor: "#ffd166", backgroundColor: "#ffd166",
+                    pointBackgroundColor: "#ffd166", pointRadius: 2.5,
+                    pointHoverRadius: 4, borderWidth: 3},
+                {label: "Cadence", data: liveCadence, yAxisID: "metrics",
+                    borderColor: "#57c7ff", pointRadius: 0, borderWidth: 2},
+                {label: "Heart rate", data: liveHr, yAxisID: "metrics",
+                    borderColor: "#ff4d8d", pointRadius: 0, borderWidth: 2}
+            ]}, options: chartOptions(workoutDuration)});
     }
     function appendOrReplace(points, point) {
         if (points.length && points[points.length - 1].x === point.x) {
@@ -221,24 +248,18 @@
         if (points.length > chartPointLimit) points.shift();
     }
     function appendCharts(st) {
-        if (!powerChart || st.elapsed == null) return;
-        appendOrReplace(livePower, {x: Number(st.elapsed), y: Number(st.power || 0)});
-        appendOrReplace(liveCadence, {x: Number(st.elapsed),
-            y: st.cadence == null ? null : Number(st.cadence)});
-        powerChart.update("none");
-        document.getElementById("powerChartSummary").textContent =
-            "Actual power " + (st.power || 0) + " watts; target " + (st.target_watts || 0) +
-            " watts; cadence " + (st.cadence == null ? "unavailable" : st.cadence + " rpm") + ".";
-        if (st.hr != null) {
-            document.getElementById("hrChartBlock").hidden = false;
-            if (!hrChart) hrChart = new Chart(document.getElementById("rideHrChart"), {
-                type: "line", data: {datasets: [{label: "Heart rate", data: liveHr,
-                    borderColor: "#ff6384", pointRadius: 0, borderWidth: 2}]},
-                options: chartOptions("Heart rate (bpm)", workoutDuration, false)});
-            appendOrReplace(liveHr, {x: Number(st.elapsed), y: Number(st.hr)});
-            hrChart.update("none");
-            document.getElementById("hrChartSummary").textContent = "Heart rate " + st.hr + " beats per minute.";
-        }
+        if (!rideChart) return;
+        var elapsed = finiteNumber(st.elapsed);
+        if (elapsed == null) return;
+        appendOrReplace(livePower, {x: elapsed, y: finiteNumber(st.power)});
+        appendOrReplace(liveCadence, {x: elapsed, y: finiteNumber(st.cadence)});
+        appendOrReplace(liveHr, {x: elapsed, y: finiteNumber(st.hr)});
+        rideChart.update("none");
+        document.getElementById("rideChartSummary").textContent =
+            "Measured power " + (finiteNumber(st.power) == null ? "unavailable" : metricText(st.power) + " watts") +
+            "; target power " + (finiteNumber(st.target_watts) == null ? "unavailable" : metricText(st.target_watts) + " watts") +
+            "; cadence " + (finiteNumber(st.cadence) == null ? "unavailable" : metricText(st.cadence) + " rpm") +
+            "; heart rate " + (finiteNumber(st.hr) == null ? "unavailable" : metricText(st.hr) + " beats per minute") + ".";
     }
     function fmt(sec) {
         sec = Math.round(sec || 0);
@@ -257,6 +278,7 @@
         document.getElementById("workoutSelect").disabled = active;
     }
     function render(st) {
+        updateChartMetrics(st);
         document.getElementById("rStatus").textContent = st.status === "starting"
             ? "starting in " + st.start_countdown + "s" : st.status;
         document.getElementById("rTarget").textContent = st.target_watts;
@@ -596,6 +618,68 @@
         pendingDisconnects = {};
         updateConnectedRows({});
     }
+    function fullscreenElement() {
+        return document.fullscreenElement || document.webkitFullscreenElement || null;
+    }
+    function chartIsFullscreen() {
+        var panel = document.getElementById("rideChartPanel");
+        return fullscreenElement() === panel ||
+            panel.classList.contains("ride-chart-fullscreen-fallback");
+    }
+    function resizeRideChart() {
+        if (!rideChart) return;
+        window.requestAnimationFrame(function () {
+            if (rideChart) rideChart.resize();
+        });
+    }
+    function updateChartFullscreenState() {
+        var active = chartIsFullscreen();
+        var button = document.getElementById("chartFullscreenBtn");
+        button.setAttribute("aria-pressed", active ? "true" : "false");
+        button.textContent = active ? "Exit full screen" : "View chart full screen";
+        document.body.classList.toggle("ride-chart-fullscreen-open", active);
+        resizeRideChart();
+    }
+    function useFullscreenFallback() {
+        document.getElementById("rideChartPanel").classList.add(
+            "ride-chart-fullscreen-fallback");
+        updateChartFullscreenState();
+    }
+    function enterChartFullscreen() {
+        var panel = document.getElementById("rideChartPanel");
+        var request = panel.requestFullscreen || panel.webkitRequestFullscreen;
+        if (!request) {
+            useFullscreenFallback();
+            return;
+        }
+        try {
+            var result = request.call(panel);
+            if (result && typeof result.catch === "function") {
+                result.catch(useFullscreenFallback);
+            }
+        } catch (e) {
+            useFullscreenFallback();
+        }
+    }
+    function exitChartFullscreen() {
+        var panel = document.getElementById("rideChartPanel");
+        if (panel.classList.contains("ride-chart-fullscreen-fallback")) {
+            panel.classList.remove("ride-chart-fullscreen-fallback");
+            updateChartFullscreenState();
+            return;
+        }
+        var exit = document.exitFullscreen || document.webkitExitFullscreen;
+        if (exit && fullscreenElement()) {
+            try {
+                var result = exit.call(document);
+                if (result && typeof result.catch === "function") {
+                    result.catch(updateChartFullscreenState);
+                }
+            } catch (e) {
+                updateChartFullscreenState();
+            }
+        }
+    }
     function renderDevices(devices) {
         var el = document.getElementById("deviceList");
         var status = document.getElementById("scanStatus");
@@ -795,6 +879,15 @@
                 "Unable to change ERG mode. Check the connection and try again.", "failure");
             playCue("failure");
         }
+    });
+    document.getElementById("chartFullscreenBtn").addEventListener("click", function () {
+        if (chartIsFullscreen()) exitChartFullscreen();
+        else enterChartFullscreen();
+    });
+    document.addEventListener("fullscreenchange", updateChartFullscreenState);
+    document.addEventListener("webkitfullscreenchange", updateChartFullscreenState);
+    document.addEventListener("keydown", function (event) {
+        if (event.key === "Escape" && chartIsFullscreen()) exitChartFullscreen();
     });
     document.getElementById("stopBtn").addEventListener("click", function () {
         queuedOpen = null;
