@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import abc
 import logging
+import time
 from typing import List, Optional, Sequence, Tuple
 
 from .protocol import (
@@ -28,6 +29,8 @@ from .protocol import (
 )
 
 log = logging.getLogger(__name__)
+
+BLE_VALUE_STALE_S = 3.0
 
 
 def bleak_available() -> Tuple[bool, str]:
@@ -181,10 +184,13 @@ class BleakPowerSource(PowerSource):
     never exercised in the no-hardware test suite.
     """
 
-    def __init__(self, client) -> None:
+    def __init__(self, client, stale_after_s: float = BLE_VALUE_STALE_S) -> None:
         self._client = client
+        self._stale_after_s = float(stale_after_s)
         self._power: Optional[int] = None
         self._cadence: Optional[float] = None
+        self._power_updated_at: Optional[float] = None
+        self._cadence_updated_at: Optional[float] = None
         self._prev_revs: Optional[int] = None
         self._prev_time: Optional[int] = None
 
@@ -194,32 +200,54 @@ class BleakPowerSource(PowerSource):
     def _on_notify(self, _char, data: bytearray) -> None:
         parsed = parse_cycling_power_measurement(bytes(data))
         self._power = parsed["power"]
-        revs, time = parsed["crank_revs"], parsed["crank_event_time"]
-        if revs is not None and time is not None:
-            cad = cadence_from_cranks(self._prev_revs, self._prev_time, revs, time)
+        self._power_updated_at = time.monotonic()
+        revs, event_time = parsed["crank_revs"], parsed["crank_event_time"]
+        if revs is not None and event_time is not None:
+            cad = cadence_from_cranks(
+                self._prev_revs, self._prev_time, revs, event_time
+            )
             if cad is not None:
                 self._cadence = cad
-            self._prev_revs, self._prev_time = revs, time
+                self._cadence_updated_at = time.monotonic()
+            self._prev_revs, self._prev_time = revs, event_time
 
     def latest_power(self) -> Optional[int]:
+        if (
+            self._power_updated_at is None
+            or time.monotonic() - self._power_updated_at > self._stale_after_s
+        ):
+            return None
         return self._power
 
     def latest_cadence(self) -> Optional[float]:
+        if (
+            self._cadence_updated_at is None
+            or time.monotonic() - self._cadence_updated_at > self._stale_after_s
+        ):
+            return None
         return self._cadence
 
 
 class BleakHeartRateSource(HeartRateSource):
-    def __init__(self, client) -> None:
+    def __init__(self, client, stale_after_s: float = BLE_VALUE_STALE_S) -> None:
         self._client = client
+        self._stale_after_s = float(stale_after_s)
         self._hr: Optional[int] = None
+        self._hr_updated_at: Optional[float] = None
 
     async def start(self) -> None:
         await self._client.start_notify(HEART_RATE_MEASUREMENT, self._on_notify)
 
     def _on_notify(self, _char, data: bytearray) -> None:
         self._hr = parse_heart_rate_measurement(bytes(data))["hr"]
+        self._hr_updated_at = time.monotonic()
 
     def latest_hr(self) -> Optional[int]:
+        if (
+            self._hr_updated_at is None
+            or time.monotonic() - self._hr_updated_at > self._stale_after_s
+        ):
+            return None
         return self._hr
 
 

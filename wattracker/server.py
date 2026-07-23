@@ -44,6 +44,7 @@ DAY_LABELS = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
 
 # Real-hardware ride loop cadence (seconds); module-level so tests can shrink it.
 RIDE_POLL_INTERVAL_S = 1.0
+RIDE_INACTIVITY_TIMEOUT_S = 300.0
 
 # Background activity-scan cadence (seconds); module-level so tests can shrink it.
 SCAN_INTERVAL_S = 24 * 3600.0
@@ -1463,6 +1464,26 @@ def create_app() -> FastAPI:
         s = build_workout("endurance", 45)
         return s, s.name
 
+    def _ride_workout_payload(session, ftp: float, name: Optional[str] = None) -> dict:
+        blocks, total_s = flatten_session(session)
+        profile = []
+        for start, end, kind, value in blocks:
+            lo, hi = (value, value) if kind == "const" else value
+            profile.append(
+                {
+                    "start": start,
+                    "end": end,
+                    "watts_start": int(round(lo * ftp)),
+                    "watts_end": int(round(hi * ftp)),
+                }
+            )
+        return {
+            "name": name or session.name,
+            "duration_s": total_s,
+            "ftp": round(ftp, 1),
+            "profile": profile,
+        }
+
     @app.get("/ride", response_class=HTMLResponse)
     def ride_page(request: Request):
         uid = _uid(request)
@@ -1476,6 +1497,7 @@ def create_app() -> FastAPI:
                 ble_reason=reason,
                 workouts=_upcoming_plan_workouts(uid),
                 ftp=round(importer.current_ftp(uid), 0),
+                ble_cache_key=f"wattracker.ride.ble.v1.user-{uid}",
             ),
         )
 
@@ -1577,13 +1599,15 @@ def create_app() -> FastAPI:
             await websocket.send_json({"status": "error", "error": str(e)})
             await websocket.close()
             return
-        session, _name = _ride_session(
+        session, ride_name = _ride_session(
             uid,
             workout_id=params.get("workout_id"),
             wtype=params.get("type"),
             minutes=params.get("minutes"),
         )
         ftp = importer.current_ftp(uid)
+        workout_payload = _ride_workout_payload(session, ftp, ride_name)
+        await websocket.send_json({"status": "workout", "workout": workout_payload})
         available, reason = bledevices.bluetooth_available()
 
         # Without a simulation request and without hardware, report the
@@ -1635,11 +1659,25 @@ def create_app() -> FastAPI:
                     {"status": "connected", "devices": conn["names"],
                      "erg": conn["trainer"] is not None,
                      "warnings": conn.get("errors", []),
-                     "prepared": prepare_only}
+                     "prepared": prepare_only,
+                     "workout": workout_payload}
                 )
                 if prepare_only:
                     while True:
-                        message = await websocket.receive_json()
+                        try:
+                            message = await asyncio.wait_for(
+                                websocket.receive_json(),
+                                timeout=RIDE_INACTIVITY_TIMEOUT_S,
+                            )
+                        except asyncio.TimeoutError:
+                            await websocket.send_json(
+                                {
+                                    "status": "inactivity_timeout",
+                                    "message": "Disconnected after 5 minutes without starting. No activity was saved.",
+                                    "saved": False,
+                                }
+                            )
+                            return
                         if message.get("action") == "start":
                             break
                         if message.get("action") == "stop":
@@ -1656,9 +1694,34 @@ def create_app() -> FastAPI:
                 )
                 if prepare_only:
                     await websocket.send_json({"status": "started"})
+                inactive_s = 0.0
                 while controller.status != "finished":
                     controller.poll(dt=1)
                     await websocket.send_json(controller.state())
+                    if controller.current_power > 0:
+                        inactive_s = 0.0
+                    else:
+                        inactive_s += 1.0
+                    if inactive_s >= RIDE_INACTIVITY_TIMEOUT_S:
+                        saved = controller.has_started
+                        if saved:
+                            controller.stop()
+                        await websocket.send_json(
+                            {
+                                "status": "inactivity_timeout",
+                                "message": (
+                                    "Ride saved and Bluetooth disconnected after "
+                                    "5 minutes without power."
+                                    if saved
+                                    else "Bluetooth disconnected after 5 minutes "
+                                         "without power. No activity was saved."
+                                ),
+                                "saved": saved,
+                            }
+                        )
+                        if not saved:
+                            return
+                        break
                     await asyncio.sleep(RIDE_POLL_INTERVAL_S)
                 await websocket.send_json(controller.state())
             except BaseException as exc:
@@ -1667,8 +1730,10 @@ def create_app() -> FastAPI:
                 # once a ride actually started. An idle controller must not
                 # create a zero-duration activity.
                 try:
-                    if controller is not None and controller.status not in (
-                        "idle", "finished"
+                    if (
+                        controller is not None
+                        and controller.has_started
+                        and controller.status != "finished"
                     ):
                         controller.stop()
                 except BaseException:

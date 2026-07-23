@@ -23,6 +23,9 @@
     </label>
     <div class="toolbar">
         <button type="button" id="scanBtn" {{ '' if ble_available else 'disabled' }}>Scan devices</button>
+        <span id="scanBusy" class="scan-busy" role="status" hidden>
+            <span class="spinner" aria-hidden="true"></span> Scanning Bluetooth devices
+        </span>
         <button type="button" id="connectBtn" {{ '' if ble_available else 'disabled' }}>Connect selected sensors</button>
         <button type="button" id="startBtn">Connect &amp; ride</button>
         <button type="button" id="simBtn">Simulate</button>
@@ -39,17 +42,31 @@
 </section>
 
 <section class="ride-live">
+    <div id="workoutDetails" class="ride-workout" aria-live="polite">
+        Select Connect &amp; ride to load the workout.
+    </div>
     <div class="cards">
         <div class="card"><span class="label">Status</span><span class="value" id="rStatus">idle</span></div>
         <div class="card"><span class="label">Target</span><span class="value"><span id="rTarget">0</span> W</span></div>
         <div class="card"><span class="label">Power</span><span class="value"><span id="rPower">0</span> W</span></div>
-        <div class="card"><span class="label">Cadence</span><span class="value"><span id="rCad">&mdash;</span> rpm</span></div>
+        <div class="card"><span class="label">Cadence (power sensor)</span><span class="value"><span id="rCad">&mdash;</span> rpm</span></div>
         <div class="card"><span class="label">HR</span><span class="value"><span id="rHr">&mdash;</span> bpm</span></div>
         <div class="card"><span class="label">Elapsed</span><span class="value" id="rElapsed">0:00</span></div>
     </div>
     <div class="progress-wrap"><div id="rProgress" class="progress-bar"></div></div>
     <p class="hint">Segment <span id="rSeg">0</span>/<span id="rSegCount">0</span>.
-       The clock auto-pauses when power is 0 and auto-starts when you pedal.</p>
+       Hold positive power for 3 seconds to start. The clock pauses after 3 seconds
+       without power and resumes when you pedal.</p>
+    <div class="ride-chart-block">
+        <h3>Power</h3>
+        <canvas id="ridePowerChart" role="img" aria-label="Prescribed and actual power over workout time"></canvas>
+        <p id="powerChartSummary" class="sr-only" aria-live="polite"></p>
+    </div>
+    <div id="hrChartBlock" class="ride-chart-block" hidden>
+        <h3>Heart rate</h3>
+        <canvas id="rideHrChart" role="img" aria-label="Heart rate over workout time"></canvas>
+        <p id="hrChartSummary" class="sr-only" aria-live="polite"></p>
+    </div>
 </section>
 
 <script>
@@ -57,8 +74,134 @@
     var ws = null;
     var scanned = false;
     var deviceNames = {};
+    var scannedDevices = {};
     var rideState = "idle";
     var bleAvailable = !document.getElementById("scanBtn").disabled;
+    var cacheKey = {{ ble_cache_key|tojson }};
+    var cache = readCache();
+    var powerChart = null, hrChart = null;
+    var livePower = [], liveHr = [];
+    var MAX_CHART_POINTS = 30000;
+    var chartPointLimit = MAX_CHART_POINTS;
+    function readCache() {
+        try {
+            var parsed = JSON.parse(localStorage.getItem(cacheKey) || "null");
+            if (!parsed || parsed.version !== 1 || !Array.isArray(parsed.entries)) return null;
+            parsed.entries = parsed.entries.slice(0, 12).filter(function (entry) {
+                return entry && typeof entry.address === "string" && entry.address.length <= 256 &&
+                    typeof entry.name === "string" && entry.name.length <= 128 &&
+                    Array.isArray(entry.roles);
+            });
+            return parsed;
+        } catch (e) { return null; }
+    }
+    function selectedRoles() {
+        var byAddress = {};
+        document.querySelectorAll("#deviceList input[data-role]:checked").forEach(function (input) {
+            if (!input.value) return;
+            if (!byAddress[input.value]) byAddress[input.value] = [];
+            byAddress[input.value].push(input.dataset.role);
+        });
+        return byAddress;
+    }
+    function saveSuccessfulSelection(connectedNames) {
+        var selected = selectedRoles();
+        var now = new Date().toISOString();
+        var reported = {};
+        ["power", "hr", "trainer"].forEach(function (role) {
+            var values = connectedNames && connectedNames[role];
+            reported[role] = (Array.isArray(values) ? values : (values ? [values] : [])).map(String);
+        });
+        var entries = Object.keys(selected).slice(0, 12).map(function (address) {
+            return {address: address, name: String(deviceNames[address] || address).slice(0, 128),
+                roles: selected[address].filter(function (role) {
+                    return ["power", "hr", "trainer"].indexOf(role) !== -1 && reported[role].indexOf(address) !== -1;
+                }),
+                last_connected: now};
+        }).filter(function (entry) { return entry.roles.length > 0; });
+        if (!entries.length) return;
+        cache = {version: 1, entries: entries, multi_power:
+            entries.filter(function (entry) { return entry.roles.indexOf("power") !== -1; }).length > 1};
+        try { localStorage.setItem(cacheKey, JSON.stringify(cache)); } catch (e) {}
+    }
+    function primeAudio() {
+        try {
+            var AudioCtx = window.AudioContext || window.webkitAudioContext;
+            if (!AudioCtx) return null;
+            var ctx = primeAudio.ctx || (primeAudio.ctx = new AudioCtx());
+            if (ctx.state === "suspended") ctx.resume();
+            return ctx;
+        } catch (e) { return null; }
+    }
+    function playCue(kind) {
+        try {
+            var ctx = primeAudio();
+            if (!ctx) return;
+            var osc = ctx.createOscillator(), gain = ctx.createGain();
+            osc.frequency.value = kind === "success" ? 880 : (kind === "failure" ? 220 : 520);
+            gain.gain.setValueAtTime(0.05, ctx.currentTime);
+            gain.gain.exponentialRampToValueAtTime(0.001, ctx.currentTime + 0.12);
+            osc.connect(gain); gain.connect(ctx.destination); osc.start(); osc.stop(ctx.currentTime + 0.12);
+        } catch (e) {}
+    }
+    function setLive(element, message, kind) {
+        element.textContent = message;
+        element.classList.remove("status-success", "status-failure", "status-working");
+        if (kind) element.classList.add("status-" + kind);
+    }
+    function chartOptions(yTitle) {
+        return {responsive: true, maintainAspectRatio: false, animation: false,
+            parsing: false, plugins: {legend: {display: true},
+                decimation: {enabled: true, algorithm: "lttb", samples: 1000, threshold: 2000}},
+            scales: {x: {type: "linear", title: {display: true, text: "Workout time (seconds)"}, min: 0},
+                y: {beginAtZero: true, title: {display: true, text: yTitle}}}};
+    }
+    function setupWorkout(workout) {
+        if (!workout) return;
+        document.getElementById("workoutDetails").textContent = workout.name + " — " +
+            fmt(workout.duration_s) + " — FTP " + workout.ftp + " W";
+        var prescribed = [];
+        (workout.profile || []).forEach(function (block) {
+            prescribed.push({x: block.start, y: block.watts_start});
+            prescribed.push({x: block.end, y: block.watts_end});
+        });
+        livePower = []; liveHr = [];
+        chartPointLimit = Math.min(MAX_CHART_POINTS,
+            Math.max(3600, Math.ceil(Number(workout.duration_s) || 0) + 10));
+        if (powerChart) powerChart.destroy();
+        powerChart = new Chart(document.getElementById("ridePowerChart"), {
+            type: "line", data: {datasets: [
+                {label: "Prescribed", data: prescribed, borderColor: "#f2a900", pointRadius: 0, borderWidth: 2},
+                {label: "Actual", data: livePower, borderColor: "#4db6ff", pointRadius: 0, borderWidth: 2}
+            ]}, options: chartOptions("Power (W)")});
+        if (hrChart) { hrChart.destroy(); hrChart = null; }
+        document.getElementById("hrChartBlock").hidden = true;
+    }
+    function appendOrReplace(points, point) {
+        if (points.length && points[points.length - 1].x === point.x) {
+            points[points.length - 1] = point;
+        } else {
+            points.push(point);
+        }
+        if (points.length > chartPointLimit) points.shift();
+    }
+    function appendCharts(st) {
+        if (!powerChart || st.elapsed == null) return;
+        appendOrReplace(livePower, {x: Number(st.elapsed), y: Number(st.power || 0)});
+        powerChart.update("none");
+        document.getElementById("powerChartSummary").textContent =
+            "Actual power " + (st.power || 0) + " watts; target " + (st.target_watts || 0) + " watts.";
+        if (st.hr != null) {
+            document.getElementById("hrChartBlock").hidden = false;
+            if (!hrChart) hrChart = new Chart(document.getElementById("rideHrChart"), {
+                type: "line", data: {datasets: [{label: "Heart rate", data: liveHr,
+                    borderColor: "#ff6384", pointRadius: 0, borderWidth: 2}]},
+                options: chartOptions("Heart rate (bpm)")});
+            appendOrReplace(liveHr, {x: Number(st.elapsed), y: Number(st.hr)});
+            hrChart.update("none");
+            document.getElementById("hrChartSummary").textContent = "Heart rate " + st.hr + " beats per minute.";
+        }
+    }
     function fmt(sec) {
         sec = Math.round(sec || 0);
         var m = Math.floor(sec / 60), s = sec % 60;
@@ -72,9 +215,11 @@
         document.getElementById("simBtn").disabled = active;
         document.getElementById("scanBtn").disabled = active || !bleAvailable;
         document.getElementById("connectBtn").disabled = active || !bleAvailable;
+        document.getElementById("workoutSelect").disabled = active;
     }
     function render(st) {
-        document.getElementById("rStatus").textContent = st.status;
+        document.getElementById("rStatus").textContent = st.status === "starting"
+            ? "starting in " + st.start_countdown + "s" : st.status;
         document.getElementById("rTarget").textContent = st.target_watts;
         document.getElementById("rPower").textContent = st.power;
         document.getElementById("rCad").textContent = st.cadence == null ? "—" : st.cadence;
@@ -83,10 +228,13 @@
         document.getElementById("rSeg").textContent = (st.segment_index || 0) + 1;
         document.getElementById("rSegCount").textContent = st.segment_count;
         document.getElementById("rProgress").style.width = ((st.progress || 0) * 100) + "%";
+        appendCharts(st);
         if (st.status === "finished") setRideState("idle");
+        else if (["starting", "running", "paused"].indexOf(st.status) !== -1) setRideState("running");
     }
     function openRide(sim, prepare) {
         if (ws) { try { ws.close(); } catch (e) {} }
+        resetConnectedRows();
         var proto = location.protocol === "https:" ? "wss:" : "ws:";
         var wid = document.getElementById("workoutSelect").value;
         var q = [];
@@ -103,21 +251,38 @@
             if (hr && hr.value) q.push("hr=" + encodeURIComponent(hr.value));
             if (trainer && trainer.value) q.push("trainer=" + encodeURIComponent(trainer.value));
         }
-        ws = new WebSocket(proto + "//" + location.host + "/ride/ws" + (q.length ? "?" + q.join("&") : ""));
+        var socket = new WebSocket(proto + "//" + location.host + "/ride/ws" + (q.length ? "?" + q.join("&") : ""));
+        var preserveDisconnectMessage = false;
+        ws = socket;
         document.getElementById("rStatus").textContent = "connecting";
-        document.getElementById("connectionStatus").textContent =
-            sim ? "Starting simulation..." : "Connecting sensors...";
+        setLive(document.getElementById("connectionStatus"),
+            sim ? "Starting simulation..." : "Connecting sensors...", "working");
         setRideState("connecting");
-        ws.onmessage = function (ev) {
+        socket.onmessage = function (ev) {
+            if (ws !== socket) return;
             var st = JSON.parse(ev.data);
+            if (st.status === "workout") {
+                setupWorkout(st.workout);
+                return;
+            }
             if (st.status === "unavailable" || st.status === "error") {
                 var error = st.error || st.message || "unavailable";
                 document.getElementById("rStatus").textContent = error;
-                document.getElementById("connectionStatus").textContent = error;
+                setLive(document.getElementById("connectionStatus"), error, "failure");
+                preserveDisconnectMessage = true;
+                playCue("failure");
                 setRideState("idle");
                 return;
             }
+            if (st.status === "inactivity_timeout") {
+                setLive(document.getElementById("connectionStatus"), st.message, "failure");
+                preserveDisconnectMessage = true;
+                document.getElementById("rStatus").textContent = "disconnected for inactivity";
+                playCue("failure");
+                return;
+            }
             if (st.status === "connected") {
+                setupWorkout(st.workout);
                 var names = st.devices || {};
                 var parts = [];
                 if (names.trainer) parts.push("trainer: " + displayName(names.trainer) + (st.erg ? " (ERG)" : ""));
@@ -133,21 +298,54 @@
                 if (st.warnings && st.warnings.length) {
                     message += " Warning: " + st.warnings.join(" ");
                 }
-                document.getElementById("connectionStatus").textContent = message;
+                var hasWarnings = st.warnings && st.warnings.length;
+                setLive(document.getElementById("connectionStatus"), message,
+                    hasWarnings ? "failure" : "success");
+                saveSuccessfulSelection(names);
+                var connectedAddresses = [];
+                ["power", "hr", "trainer"].forEach(function (role) {
+                    var values = names[role];
+                    (Array.isArray(values) ? values : (values ? [values] : [])).forEach(function (value) {
+                        connectedAddresses.push(String(value));
+                    });
+                });
+                document.querySelectorAll("#deviceList tr[data-address]").forEach(function (row) {
+                    if (connectedAddresses.indexOf(row.dataset.address) === -1) return;
+                    row.classList.add("device-connected");
+                    var badge = row.querySelector(".connection-badge");
+                    if (badge) badge.textContent = "Connected";
+                });
+                playCue(hasWarnings ? "failure" : "success");
                 setRideState(st.prepared ? "prepared" : "running");
                 return;
             }
             if (st.status === "started") {
                 document.getElementById("rStatus").textContent = "idle";
-                document.getElementById("connectionStatus").textContent =
-                    "Workout started. Start pedaling to begin the clock.";
+                setLive(document.getElementById("connectionStatus"),
+                    "Workout started. Hold positive power for 3 seconds to begin the clock.", "success");
                 setRideState("running");
                 return;
             }
             render(st);
         };
-        ws.onclose = function () { setRideState("idle"); };
-        ws.onerror = function () { setRideState("idle"); };
+        socket.onclose = function () {
+            if (ws !== socket) return;
+            resetConnectedRows();
+            ws = null;
+            setRideState("idle");
+            if (!preserveDisconnectMessage) {
+                setLive(document.getElementById("connectionStatus"), "Disconnected.", null);
+            }
+        };
+        socket.onerror = function () {
+            if (ws !== socket) return;
+            preserveDisconnectMessage = true;
+            document.getElementById("rStatus").textContent = "connection failed";
+            setLive(document.getElementById("connectionStatus"),
+                "Bluetooth connection failed. Check the device and try again.", "failure");
+            playCue("failure");
+            setRideState("idle");
+        };
     }
     function roleLabel(role) {
         if (role === "power") return "Power";
@@ -159,20 +357,39 @@
         var address = String(value);
         return deviceNames[address] || address;
     }
+    function resetConnectedRows() {
+        var cached = {};
+        (cache && cache.entries || []).forEach(function (entry) { cached[entry.address] = entry; });
+        document.querySelectorAll("#deviceList tr[data-address]").forEach(function (row) {
+            row.classList.remove("device-connected");
+            var badge = row.querySelector(".connection-badge");
+            if (!badge) return;
+            var entry = cached[row.dataset.address];
+            badge.textContent = entry ? "Last connected" : "";
+            badge.title = entry ? "Last connected " + entry.last_connected : "";
+        });
+    }
     function renderDevices(devices) {
         var el = document.getElementById("deviceList");
         var status = document.getElementById("scanStatus");
+        devices = devices.slice().sort(function (a, b) {
+            var an = String(a.name || "(unknown)"), bn = String(b.name || "(unknown)");
+            if (an === "(unknown)" && bn !== "(unknown)") return 1;
+            if (bn === "(unknown)" && an !== "(unknown)") return -1;
+            return an.toLocaleLowerCase().localeCompare(bn.toLocaleLowerCase());
+        });
         el.replaceChildren();
         deviceNames = {};
+        scannedDevices = {};
         scanned = true;
         if (!devices.length) {
-            status.textContent = "No devices found.";
+            setLive(status, "No devices found.", "success");
             return;
         }
 
-        status.textContent = "Found " + devices.length + " device" +
+        setLive(status, "Found " + devices.length + " device" +
             (devices.length === 1 ? "." : "s.") +
-            " Detected roles come from advertised services; unknown devices can be assigned manually. RSSI closer to 0 is stronger. Select multiple power devices only for partial/one-sided sources; never combine a trainer or full-power source with pedals.";
+            " Detected roles come from advertised services; unknown devices can be assigned manually. RSSI closer to 0 is stronger. Select multiple power devices only for partial/one-sided sources; never combine a trainer or full-power source with pedals.", "success");
         var noSensors = document.createElement("div");
         [["hr", "No HR"], ["trainer", "No trainer"]].forEach(function (choice) {
             var label = document.createElement("label");
@@ -202,26 +419,55 @@
         table.appendChild(head);
         var body = document.createElement("tbody");
         var choseHr = false, choseTrainer = false;
-        var preferredPower = null;
+        var cacheEntries = {};
+        (cache && cache.entries || []).forEach(function (entry) { cacheEntries[entry.address] = entry; });
+        var cachedPower = (cache && cache.entries || []).filter(function (entry) {
+            return entry.roles.indexOf("power") !== -1 && devices.some(function (device) {
+                return String(device.address || "") === entry.address;
+            });
+        });
+        var preferredPower = [];
+        var safeCachedMulti = cachedPower.length > 1 && cache.multi_power && cachedPower.every(function (entry) {
+            var device = devices.find(function (item) { return String(item.address || "") === entry.address; });
+            return device && (device.roles || []).indexOf("trainer") === -1;
+        });
+        if (cachedPower.length) preferredPower = (safeCachedMulti ? cachedPower : cachedPower.slice(0, 1)).map(function (entry) {
+            return entry.address;
+        });
         devices.forEach(function (device) {
             var roles = Array.isArray(device.roles) ? device.roles : [];
-            if (preferredPower === null && roles.indexOf("power") !== -1 && roles.indexOf("trainer") === -1) {
-                preferredPower = String(device.address || "");
+            if (!preferredPower.length && roles.indexOf("power") !== -1 && roles.indexOf("trainer") === -1) {
+                preferredPower = [String(device.address || "")];
             }
         });
-        if (preferredPower === null) {
+        if (!preferredPower.length) {
             devices.some(function (device) {
                 var roles = Array.isArray(device.roles) ? device.roles : [];
                 if (roles.indexOf("power") === -1) return false;
-                preferredPower = String(device.address || "");
+                preferredPower = [String(device.address || "")];
                 return true;
             });
+        }
+        var cachedHr = Object.keys(cacheEntries).find(function (address) {
+            return cacheEntries[address].roles.indexOf("hr") !== -1 && devices.some(function (device) {
+                return String(device.address || "") === address;
+            });
+        });
+        var cachedTrainer = Object.keys(cacheEntries).find(function (address) {
+            return cacheEntries[address].roles.indexOf("trainer") !== -1 && devices.some(function (device) {
+                return String(device.address || "") === address;
+            });
+        });
+        if (cachedPower.length || cachedHr || cachedTrainer) {
+            status.textContent += " Last-connected roles were restored from this browser; verify any multi-power selection.";
         }
         devices.forEach(function (device) {
             var roles = Array.isArray(device.roles) ? device.roles : [];
             var deviceAddress = String(device.address || "");
             deviceNames[deviceAddress] = device.name || "(unknown)";
+            scannedDevices[deviceAddress] = device;
             var row = document.createElement("tr");
+            row.dataset.address = deviceAddress;
             var identity = document.createElement("td");
             var name = document.createElement("strong");
             name.textContent = device.name || "(unknown)";
@@ -230,6 +476,13 @@
             address.textContent = deviceAddress;
             identity.appendChild(name);
             identity.appendChild(address);
+            var badge = document.createElement("span");
+            badge.className = "connection-badge";
+            if (cacheEntries[deviceAddress]) {
+                badge.textContent = "Last connected";
+                badge.title = "Last connected " + cacheEntries[deviceAddress].last_connected;
+            }
+            identity.appendChild(badge);
             row.appendChild(identity);
 
             var detected = document.createElement("td");
@@ -248,12 +501,14 @@
                 input.name = role === "power" ? "ble-power" : "ble-" + role;
                 input.dataset.role = role;
                 input.value = deviceAddress;
-                if (role === "power" && deviceAddress === preferredPower) input.checked = true;
-                if (role === "hr" && roles.indexOf(role) !== -1 && !choseHr) {
+                if (role === "power" && preferredPower.indexOf(deviceAddress) !== -1) input.checked = true;
+                if (role === "hr" && ((cachedHr && deviceAddress === cachedHr) ||
+                    (!cachedHr && roles.indexOf(role) !== -1 && !choseHr))) {
                     input.checked = true;
                     choseHr = true;
                 }
-                if (role === "trainer" && roles.indexOf(role) !== -1 && !choseTrainer) {
+                if (role === "trainer" && ((cachedTrainer && deviceAddress === cachedTrainer) ||
+                    (!cachedTrainer && roles.indexOf(role) !== -1 && !choseTrainer))) {
                     input.checked = true;
                     choseTrainer = true;
                 }
@@ -268,11 +523,15 @@
         wrap.appendChild(table);
         el.appendChild(wrap);
     }
-    document.getElementById("connectBtn").addEventListener("click", function () { openRide(false, true); });
+    document.getElementById("connectBtn").addEventListener("click", function () {
+        primeAudio();
+        openRide(false, true);
+    });
     document.getElementById("startBtn").addEventListener("click", function () {
+        primeAudio();
         if (rideState === "prepared" && ws) {
             ws.send(JSON.stringify({action: "start"}));
-            document.getElementById("connectionStatus").textContent = "Starting workout...";
+            setLive(document.getElementById("connectionStatus"), "Starting workout...", "working");
             setRideState("running");
         } else {
             openRide(false, false);
@@ -286,17 +545,39 @@
     document.getElementById("scanBtn").addEventListener("click", async function () {
         var el = document.getElementById("deviceList");
         var status = document.getElementById("scanStatus");
+        var scanButton = document.getElementById("scanBtn");
+        var busy = document.getElementById("scanBusy");
         scanned = false;
         deviceNames = {};
         el.replaceChildren();
-        status.textContent = "Scanning...";
+        setLive(status, "Scanning...", "working");
         document.getElementById("connectionStatus").textContent = "";
+        scanButton.disabled = true;
+        document.getElementById("connectBtn").disabled = true;
+        document.getElementById("startBtn").disabled = true;
+        document.getElementById("simBtn").disabled = true;
+        document.getElementById("workoutSelect").disabled = true;
+        scanButton.setAttribute("aria-busy", "true");
+        busy.hidden = false;
+        playCue("scan");
         try {
             var resp = await fetch("/ride/scan", { method: "POST" });
             var data = await resp.json();
-            if (!data.available) { status.textContent = "Unavailable: " + (data.reason || ""); return; }
+            if (!data.available) {
+                setLive(status, "Unavailable: " + (data.reason || ""), "failure");
+                playCue("failure");
+                return;
+            }
             renderDevices(data.devices || []);
-        } catch (e) { status.textContent = "Scan failed."; }
+            playCue("success");
+        } catch (e) {
+            setLive(status, "Scan failed.", "failure");
+            playCue("failure");
+        } finally {
+            scanButton.setAttribute("aria-busy", "false");
+            busy.hidden = true;
+            setRideState(rideState);
+        }
     });
 })();
 </script>
