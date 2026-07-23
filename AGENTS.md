@@ -13,6 +13,33 @@ server process wiping a migrated live DB).
 - Never edit files in the other agent's worktree. Never leave work-in-progress
   in a tree you don't own.
 
+## Commit identity — set this in every clone and worktree, first thing
+
+This repo is **public**, and its history was deliberately rewritten once to
+strip the owner's personal identity. The machine's *global* git config still
+carries a personal address, so any clone that doesn't override it locally
+re-publishes that address in every commit. This has already happened once.
+
+Run inside each clone/worktree, before your first commit:
+
+```sh
+git config user.name  wattrackerboss
+git config user.email wattrackerboss@users.noreply.github.com
+git config user.email   # verify — must print the noreply address
+```
+
+Repo-local on purpose; do not touch the global config. Before pushing, check
+your unmerged commits:
+
+```sh
+git log --format='%h %an <%ae> | %cn <%ce>' origin/main..HEAD
+```
+
+If any commit shows a personal address, fix it *before* it reaches `main` —
+`git rebase origin/main --exec 'git commit --amend --no-edit --reset-author'`
+— then force-push your `agent2/*` branch. Never rewrite commits already on
+`main`.
+
 ## Integration
 
 - Only the integrator pushes to `main`. The second agent commits to its
