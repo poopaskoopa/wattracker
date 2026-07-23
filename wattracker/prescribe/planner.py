@@ -116,6 +116,11 @@ def _finish(session: Session, total_s: int, cooldown_low: float = 0.50,
             )
         )
     session.compute_tss()
+    # Cap the trailing cooldown at 10min and reclaim the rest as a Zone 2 base
+    # after the warmup. Every builder funnels its remainder into the cooldown
+    # here, so applying the fix in _finish covers all kinds and variants at the
+    # source (plan-generated and ad-hoc alike). No-op when already within cap.
+    absorb_long_cooldown(session)
     return session
 
 
@@ -345,9 +350,7 @@ def _tempo(total_s: int) -> Session:
                 on_power=0.80, off_power=0.55,
                 text="Tempo: steady at 76-90% FTP, breathing controlled.")
     )
-    _finish(s, total_s)
-    absorb_long_cooldown(s)
-    return s
+    return _finish(s, total_s)
 
 
 def _sprint(total_s: int) -> Session:
@@ -383,9 +386,7 @@ def _sprint(total_s: int) -> Session:
                      "The 200% FTP figure is a nominal target, not a cap. "
                      "Spin easy for 3min between efforts.")
     )
-    _finish(s, total_s)
-    absorb_long_cooldown(s)
-    return s
+    return _finish(s, total_s)
 
 
 # ---------------------------------------------------------------------------

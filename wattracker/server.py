@@ -43,7 +43,6 @@ from .prescribe.planner import (
     JUST_RIDE_DURATIONS,
     WORKOUT_TYPE_INFO,
     WORKOUT_TYPE_KEYS,
-    absorb_long_cooldown,
     build_workout,
     plan_workout,
     workout_type_info,
@@ -1506,9 +1505,6 @@ def create_app() -> FastAPI:
         if wtype:
             kind, mins = _validate_just_ride(wtype, minutes)
             s = build_workout(kind, mins)
-            # Just Ride only: keep a 4h "Sweet Spot" from being 3h of cooldown.
-            # Plan workouts (the workout_id branch) must stay untouched.
-            absorb_long_cooldown(s)
             return s, s.name
         s = build_workout("endurance", 45)
         return s, s.name
@@ -1589,7 +1585,6 @@ def create_app() -> FastAPI:
         try:
             kind, mins = _validate_just_ride(type, minutes)
             session = build_workout(kind, mins)
-            absorb_long_cooldown(session)
         except (ValueError, OverflowError) as e:
             return JSONResponse({"error": str(e)}, status_code=400)
         ftp = importer.current_ftp(uid)
