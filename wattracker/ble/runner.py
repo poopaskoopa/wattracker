@@ -3,9 +3,10 @@
 Given a Session (segments with %FTP + seconds) and the user's FTP, it drives a
 trainer over ERG: at each tick it computes the current target watts and calls
 ``trainer.set_target_power``. The workout clock only advances while measured
-power > 0 (auto-pause at 0 W); it auto-starts on the first pedal stroke and
-auto-stops after a grace period of continuous 0 W (or when segments complete).
-On finish it records the ride as an activity for the user.
+power > 0. A ride starts after three continuous positive-power seconds, pauses
+after three continuous no-power seconds, and resumes on the next positive
+sample. Long-inactivity disconnect policy belongs to the WebSocket owner. On
+finish the controller records the ride as an activity for the user.
 """
 from __future__ import annotations
 
@@ -18,11 +19,13 @@ from ..prescribe.planner import Session
 _log = logging.getLogger(__name__)
 
 IDLE = "idle"
+STARTING = "starting"
 RUNNING = "running"
 PAUSED = "paused"
 FINISHED = "finished"
 
-_DEFAULT_ZERO_GRACE_S = 5.0
+_DEFAULT_START_GRACE_S = 3.0
+_DEFAULT_ZERO_GRACE_S = 3.0
 
 
 def _flatten(session: Session) -> Tuple[List[tuple], int]:
@@ -69,6 +72,7 @@ class RideController:
         power_source=None,
         hr_source=None,
         user_id: Optional[int] = None,
+        start_grace_s: float = _DEFAULT_START_GRACE_S,
         zero_grace_s: float = _DEFAULT_ZERO_GRACE_S,
         autosave: bool = True,
         started_at: Optional[_dt.datetime] = None,
@@ -79,12 +83,14 @@ class RideController:
         self.power_source = power_source
         self.hr_source = hr_source
         self.user_id = user_id
+        self.start_grace_s = float(start_grace_s)
         self.zero_grace_s = float(zero_grace_s)
         self.autosave = autosave
 
         self.blocks, self.total_s = _flatten(session)
         self.status = IDLE
         self.elapsed = 0.0
+        self._positive_run = 0.0
         self._zero_run = 0.0
         self._ever_started = False
 
@@ -139,12 +145,27 @@ class RideController:
         self.current_hr = hr
 
         if p > 0:
-            if self.status in (IDLE, PAUSED):
+            if self.status in (IDLE, STARTING):
+                self._positive_run += dt
+                if self._positive_run < self.start_grace_s:
+                    self.status = STARTING
+                    self.current_target = self.target_watts(0)
+                    return self.state()
                 self.status = RUNNING
-                if not self._ever_started:
-                    self._ever_started = True
-                    if self.started_at is None:
-                        self.started_at = _dt.datetime.now()
+                self._ever_started = True
+                if self.started_at is None:
+                    self.started_at = _dt.datetime.now()
+                self._trainer_call("start_erg")
+                if self.start_grace_s > 0:
+                    # Countdown power proves the rider is ready but is not part
+                    # of the prescribed workout or its saved samples.
+                    self._positive_run = self.start_grace_s
+                    self._zero_run = 0.0
+                    self.current_target = self.target_watts(0)
+                    self._trainer_call("set_target_power", self.current_target)
+                    return self.state()
+            elif self.status == PAUSED:
+                self.status = RUNNING
                 # (Re-)arm ERG on every start AND resume (FTMS Request Control +
                 # Start/Resume). When the rider stops, many trainers drop out of
                 # ERG (or, after an FTMS Stop/Pause, refuse control until a fresh
@@ -153,6 +174,7 @@ class RideController:
                 # Request Control + Start is idempotent when already in ERG, so
                 # re-issuing it on each resume is safe.
                 self._trainer_call("start_erg")
+            self._positive_run = self.start_grace_s
             self._zero_run = 0.0
             self.elapsed += dt
 
@@ -169,13 +191,15 @@ class RideController:
             if self.elapsed >= self.total_s:
                 self._finish()
         else:
-            # zero power: auto-pause; auto-stop after the grace period (post-start)
+            self._positive_run = 0.0
+            if self.status == STARTING:
+                self.status = IDLE
+            # Do not pause on a dropped packet/brief coast. Long inactivity is
+            # finalized by the WebSocket so device cleanup remains centralized.
             if self.status == RUNNING:
-                self.status = PAUSED
-            if self._ever_started:
                 self._zero_run += dt
                 if self._zero_run >= self.zero_grace_s:
-                    self._finish()
+                    self.status = PAUSED
         return self.state()
 
     def poll(self, dt: float = 1.0) -> dict:
@@ -195,6 +219,10 @@ class RideController:
             self._finish()
         return self.state()
 
+    @property
+    def has_started(self) -> bool:
+        return self._ever_started
+
     def _trainer_call(self, method: str, *args) -> None:
         """Invoke a trainer command, degrading gracefully (no trainer / BLE error)."""
         if self.trainer is None:
@@ -213,7 +241,7 @@ class RideController:
         self.status = FINISHED
         self._trainer_call("set_target_power", 0)
         self._trainer_call("stop_erg")
-        if self.autosave and self.user_id is not None:
+        if self.autosave and self.user_id is not None and self._ever_started:
             try:
                 self._save()
             except Exception:
@@ -267,4 +295,8 @@ class RideController:
             "ftp": self.ftp,
             "name": self.session.name,
             "activity_id": self.activity_id,
+            "start_countdown": round(
+                max(0.0, self.start_grace_s - self._positive_run), 1
+            ) if not self._ever_started else 0.0,
+            "no_power_s": round(self._zero_run, 1),
         }
