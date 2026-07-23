@@ -224,13 +224,15 @@ def test_description_discloses_the_inserted_zone2_base(client, kind, minutes):
     uid = _register(client, f"rider_disc_{kind}_{minutes}")
     db.save_user_settings(uid, {"ftp": 200})
 
+    # The builder now caps the cooldown at the source and discloses the base in
+    # its description; a second absorb pass has nothing left to move.
     reference = build_workout(kind, minutes)
-    moved = absorb_long_cooldown(reference)
+    assert absorb_long_cooldown(reference) == 0
 
     data = client.get(
         f"/ride/workout/preview?type={kind}&minutes={minutes}"
     ).json()
-    if moved:
+    if "Zone 2 base" in reference.description:
         assert "Zone 2 base" in data["description"], (
             f"{kind} @{minutes}: {data['description']!r}"
         )
@@ -272,18 +274,25 @@ def test_absorb_long_cooldown_is_a_no_op_when_already_short():
 
 
 def test_absorb_long_cooldown_preserves_duration_and_recomputes_tss():
+    # The builder now caps the cooldown at the source (in _finish) and re-runs
+    # compute_tss, so a fresh long build is already absorbed.
     s = build_workout("sweet_spot", 240)
-    total = s.total_duration()
-    tss_before = s.estimated_tss
-    moved = absorb_long_cooldown(s)
-    assert moved == 14400 - 600 - 3060 - 600
-    assert s.total_duration() == total
-    assert s.estimated_tss > tss_before
+    assert s.total_duration() == 14400
+    tail = s.segments[-1]
+    assert tail.kind == "cooldown" and tail.duration == 600
+    # The reclaimed time became a Zone 2 base right after the warmup.
+    base = s.segments[1]
+    assert base.kind == "steadystate" and base.power == 0.68
+    assert base.duration == 14400 - 600 - 3060 - 600
+    # A second explicit pass has nothing left to move, and TSS stays consistent.
+    assert absorb_long_cooldown(s) == 0
+    assert s.total_duration() == 14400
     assert s.estimated_tss == pytest.approx(s.compute_tss())
 
 
-def test_plan_workouts_do_not_get_the_just_ride_cooldown_fix(client):
-    """The workout_id branch must reproduce the plan builder byte-for-byte."""
+def test_plan_workouts_also_get_the_cooldown_fix(client):
+    """The fix now lives in _finish, so the workout_id (plan) branch is capped
+    at the source too - a long plan sweet_spot is no longer a ~3h cooldown."""
     uid = _register(client, "rider_planpath")
     plan_id = db.create_plan(uid, "Base", "2026-06-01", 4)
     wid = db.add_plan_workout(
@@ -297,8 +306,13 @@ def test_plan_workouts_do_not_get_the_just_ride_cooldown_fix(client):
     profile = msg["workout"]["profile"]
     assert len(profile) == len(expected)
     tail = profile[-1]
-    # Untouched: the plan session still ends with its long absorbing cooldown.
-    assert tail["end"] - tail["start"] == 14400 - 600 - 3060
+    # Capped at 10min, not the old 14400 - 600 - 3060 = 10740s absorbing cooldown.
+    assert tail["end"] - tail["start"] == MAX_COOLDOWN_S
+    # The reclaimed time is ridden as a Zone 2 base right after the warmup.
+    session = build_workout("sweet_spot", 240)
+    assert "Zone 2 base" in session.description
+    base = session.segments[1]
+    assert base.kind == "steadystate" and base.power == 0.68
 
 
 def test_long_rides_scale_the_work_up():
