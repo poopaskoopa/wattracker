@@ -83,7 +83,9 @@ def test_each_variant_has_distinct_name():
 
 def test_variants_fit_across_plan_durations():
     ranges = {"vo2max": (50, 91), "threshold": (50, 91), "sweet_spot": (35, 91),
-              "endurance": (20, 181), "recovery": (20, 121)}
+              "endurance": (20, 181), "recovery": (20, 121),
+              # Just Ride kinds: offered from the 30min minimum upwards.
+              "tempo": (30, 181), "sprint": (30, 181)}
     for kind, variants in VARIANTS.items():
         lo, hi = ranges[kind]
         for v in variants:

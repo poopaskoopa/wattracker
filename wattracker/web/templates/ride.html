@@ -12,15 +12,40 @@
 {% endif %}
 
 <section class="ride-setup">
-    <label>Workout:
-        <select id="workoutSelect">
-            <option value="">Endurance (45 min)</option>
-            {% for w in workouts %}
-            <option value="{{ w.id }}">{{ w.date }} &mdash; {{ w.name }}
-                ({{ (w.duration_s // 60) }} min)</option>
-            {% endfor %}
-        </select>
-    </label>
+    <div class="ride-mode" role="group" aria-label="Ride mode">
+        <label><input type="radio" name="rideMode" value="plan" checked> Plan workout</label>
+        <label><input type="radio" name="rideMode" value="just"> Just ride</label>
+    </div>
+    <div id="planMode">
+        <label>Workout:
+            <select id="workoutSelect">
+                <option value="">Endurance (45 min)</option>
+                {% for w in workouts %}
+                <option value="{{ w.id }}">{{ w.date }} &mdash; {{ w.name }}
+                    ({{ (w.duration_s // 60) }} min)</option>
+                {% endfor %}
+            </select>
+        </label>
+    </div>
+    <div id="justRideMode" hidden>
+        <label>Type:
+            <select id="rideTypeSelect">
+                {% for t in ride_types %}
+                <option value="{{ t.key }}">{{ t.label }} &mdash; {{ t.zone }}</option>
+                {% endfor %}
+            </select>
+        </label>
+        <label>Duration:
+            <select id="rideDurationSelect">
+                {% for m in ride_durations %}
+                <option value="{{ m }}" {{ 'selected' if m == 60 else '' }}>
+                    {%- if m >= 60 %}{{ m // 60 }} h{% if m % 60 %} {{ m % 60 }} min{% endif %}
+                    {%- else %}{{ m }} min{% endif -%}
+                </option>
+                {% endfor %}
+            </select>
+        </label>
+    </div>
     <div class="toolbar">
         <button type="button" id="scanBtn" {{ '' if ble_available else 'disabled' }}>Scan devices</button>
         <button type="button" id="connectBtn" {{ '' if ble_available else 'disabled' }}>Connect selected sensors</button>
@@ -44,6 +69,7 @@
 </section>
 
 <section class="ride-live">
+    <div id="ridePreview" class="ride-preview" aria-live="polite" hidden></div>
     <div id="workoutDetails" class="ride-workout" aria-live="polite">
         Select Connect &amp; ride to load the workout.
     </div>
@@ -276,6 +302,127 @@
         document.getElementById("connectBtn").disabled =
             (state === "connecting" || state === "running") || !bleAvailable;
         document.getElementById("workoutSelect").disabled = active;
+        document.getElementById("rideTypeSelect").disabled = active;
+        document.getElementById("rideDurationSelect").disabled = active;
+        modeInputs().forEach(function (input) { input.disabled = active; });
+    }
+    function modeInputs() {
+        return Array.prototype.slice.call(
+            document.querySelectorAll('input[name="rideMode"]'));
+    }
+    function justRide() {
+        var checked = document.querySelector('input[name="rideMode"]:checked');
+        return !!checked && checked.value === "just";
+    }
+    function fmtClock(sec) {
+        sec = Math.round(Number(sec) || 0);
+        if (sec < 60) return sec + " s";
+        var m = Math.floor(sec / 60), s = sec % 60;
+        var h = Math.floor(m / 60);
+        var out = h ? h + " h " + (m % 60) + " min" : m + " min";
+        return s ? out + " " + s + " s" : out;
+    }
+    function wattRange(low, high) {
+        if (low == null && high == null) return "—";
+        if (low == null) return high + " W";
+        if (high == null) return low + " W+";
+        return low === high ? low + " W" : low + "–" + high + " W";
+    }
+    function cell(row, text, tag) {
+        var el = document.createElement(tag || "td");
+        el.textContent = text;
+        row.appendChild(el);
+        return el;
+    }
+    function renderPreview(data) {
+        var box = document.getElementById("ridePreview");
+        box.replaceChildren();
+        box.hidden = false;
+        var info = data.type_info || {};
+        var title = document.createElement("h3");
+        title.textContent = data.name;
+        box.appendChild(title);
+
+        var meta = document.createElement("p");
+        meta.className = "ride-preview-meta";
+        var pct = info.high == null
+            ? ">" + Math.round(info.low * 100) + "% FTP"
+            : Math.round(info.low * 100) + "–" + Math.round(info.high * 100) + "% FTP";
+        meta.textContent = (info.zone || "") + " · " + pct + " · " +
+            wattRange(info.low_watts, info.high_watts) + " at FTP " + data.ftp + " W · " +
+            fmtClock(data.duration_s) + " · est. TSS " + data.estimated_tss;
+        box.appendChild(meta);
+
+        if (info.focus || info.structure) {
+            var purpose = document.createElement("p");
+            purpose.className = "hint";
+            purpose.textContent = [info.focus, info.structure].filter(Boolean).join(" ");
+            box.appendChild(purpose);
+        }
+
+        // The type blurb above is duration-agnostic; the session description is
+        // generated for this exact duration, so show it as the concrete plan.
+        if (data.description) {
+            var thisRide = document.createElement("p");
+            thisRide.className = "ride-preview-this";
+            var lead = document.createElement("strong");
+            lead.textContent = "This ride: ";
+            thisRide.appendChild(lead);
+            thisRide.appendChild(document.createTextNode(data.description));
+            box.appendChild(thisRide);
+        }
+
+        var wrap = document.createElement("div");
+        wrap.className = "table-scroll";
+        var table = document.createElement("table");
+        var head = document.createElement("thead");
+        var headerRow = document.createElement("tr");
+        ["Segment", "Duration", "Watts"].forEach(function (label) {
+            cell(headerRow, label, "th");
+        });
+        head.appendChild(headerRow);
+        table.appendChild(head);
+        var body = document.createElement("tbody");
+        (data.segments || []).forEach(function (seg) {
+            var row = document.createElement("tr");
+            cell(row, seg.label);
+            cell(row, fmtClock(seg.duration_s));
+            cell(row, seg.on_watts != null
+                ? seg.on_watts + " W on / " + seg.off_watts + " W easy"
+                : wattRange(seg.watts_low, seg.watts_high));
+            body.appendChild(row);
+        });
+        table.appendChild(body);
+        wrap.appendChild(table);
+        box.appendChild(wrap);
+    }
+    function loadPreview() {
+        if (!justRide()) {
+            document.getElementById("ridePreview").hidden = true;
+            return;
+        }
+        var type = document.getElementById("rideTypeSelect").value;
+        var minutes = document.getElementById("rideDurationSelect").value;
+        fetch("/ride/workout/preview?type=" + encodeURIComponent(type) +
+              "&minutes=" + encodeURIComponent(minutes))
+            .then(function (resp) { return resp.ok ? resp.json() : null; })
+            .then(function (data) {
+                if (!data) {
+                    document.getElementById("ridePreview").hidden = true;
+                    return;
+                }
+                renderPreview(data);
+                setupWorkout(data);
+            })
+            .catch(function () {
+                document.getElementById("ridePreview").hidden = true;
+            });
+    }
+    function applyMode() {
+        var just = justRide();
+        document.getElementById("planMode").hidden = just;
+        document.getElementById("justRideMode").hidden = !just;
+        loadPreview();
     }
     function render(st) {
         updateChartMetrics(st);
@@ -331,7 +478,12 @@
         var proto = location.protocol === "https:" ? "wss:" : "ws:";
         var wid = document.getElementById("workoutSelect").value;
         var q = [];
-        if (wid) q.push("workout_id=" + encodeURIComponent(wid));
+        if (justRide()) {
+            q.push("type=" + encodeURIComponent(document.getElementById("rideTypeSelect").value));
+            q.push("minutes=" + encodeURIComponent(document.getElementById("rideDurationSelect").value));
+        } else if (wid) {
+            q.push("workout_id=" + encodeURIComponent(wid));
+        }
         if (sim) q.push("sim=1");
         if (prepare) q.push("prepare=1");
         if (!sim && scanned) {
@@ -850,6 +1002,11 @@
         wrap.appendChild(table);
         el.appendChild(wrap);
     }
+    modeInputs().forEach(function (input) {
+        input.addEventListener("change", applyMode);
+    });
+    document.getElementById("rideTypeSelect").addEventListener("change", loadPreview);
+    document.getElementById("rideDurationSelect").addEventListener("change", loadPreview);
     document.getElementById("connectBtn").addEventListener("click", function () {
         primeAudio();
         openRide(false, true);
@@ -909,6 +1066,8 @@
         document.getElementById("startBtn").disabled = true;
         document.getElementById("simBtn").disabled = true;
         document.getElementById("workoutSelect").disabled = true;
+        document.getElementById("rideTypeSelect").disabled = true;
+        document.getElementById("rideDurationSelect").disabled = true;
         scanButton.setAttribute("aria-busy", "true");
         busy.hidden = false;
         playCue("scan");

@@ -154,6 +154,17 @@ def _vo2max(total_s: int) -> Session:
         work = reps * (on + off)
     while warmup + work + 120 > total_s and warmup > 300:
         warmup -= 60
+    # Short rides (30-44min): the loops above stop at 5 reps / 300s warmup, which
+    # does not fit. Trim further - reps down to 3, then warmup, then recoveries -
+    # using the exact-overflow test so 45min+ output is untouched.
+    while warmup + work > total_s and reps > 3:
+        reps -= 1
+        work = reps * (on + off)
+    while warmup + work > total_s and warmup > 180:
+        warmup -= 60
+    while warmup + work > total_s and off > 120:
+        off -= 30
+        work = reps * (on + off)
     s = Session(
         name="VO2max Intervals",
         description=f"{reps} x 4min at 110-115% FTP to break through a plateau.",
@@ -256,6 +267,127 @@ def _z2_endurance(total_s: int) -> Session:
     return _finish(s, total_s, cooldown_low=0.45, cooldown_high=0.55)
 
 
+ENDURANCE_FILLER_POWER = 0.68
+MAX_COOLDOWN_S = 600
+
+
+def absorb_long_cooldown(session: Session, max_cooldown_s: int = MAX_COOLDOWN_S,
+                         power: float = ENDURANCE_FILLER_POWER) -> int:
+    """Trim an over-long trailing cooldown into a Zone 2 block before the work.
+
+    Interval builders let `_finish` dump every unallocated second into the
+    cooldown, so a long ride ends up mostly "cool down easy". This post-processing
+    pass caps the trailing cooldown at `max_cooldown_s` and re-inserts the
+    reclaimed time as a Zone 2 steadystate block positioned between the warmup
+    and the work. Total duration is preserved exactly and TSS is recomputed.
+
+    Mutates `session` in place and returns the number of seconds moved (0 when
+    the cooldown is already within the cap, i.e. a no-op).
+    """
+    if not session.segments:
+        return 0
+    tail = session.segments[-1]
+    if tail.kind != "cooldown" or tail.duration <= max_cooldown_s:
+        return 0
+    spare = tail.duration - max_cooldown_s
+    tail.duration = max_cooldown_s
+    at = 1 if session.segments[0].kind == "warmup" else 0
+    session.segments.insert(
+        at,
+        Segment(kind="steadystate", duration=spare, power=power,
+                text="Steady Zone 2 endurance - settle in and fuel."),
+    )
+    session.compute_tss()
+    session.description += f" Ridden on a {spare // 60}min Zone 2 base."
+    return spare
+
+
+def _tempo(total_s: int) -> Session:
+    """Tempo intervals at 76-90% FTP (Coggan Level 3) on a Zone 2 base.
+
+    Up to 5 x 15min @80% as the duration allows; any time beyond a 10min
+    cooldown is ridden as Zone 2 endurance before the tempo blocks.
+    """
+    warmup = 600
+    on = 900  # 15 min
+    off = 300
+    reps = max(2, min(5, (total_s - warmup - 120) // (on + off)))
+    work = reps * (on + off)
+    while warmup + work + 120 > total_s and reps > 2:
+        reps -= 1
+        work = reps * (on + off)
+    while warmup + work + 120 > total_s and on > 480:
+        on -= 60
+        work = reps * (on + off)
+    if warmup + work + 120 > total_s and warmup > 300:
+        warmup = 300
+    while warmup + work + 120 > total_s and off > 180:
+        off -= 60
+        work = reps * (on + off)
+    while warmup + work + 120 > total_s and on > 300:
+        on -= 60
+        work = reps * (on + off)
+    while warmup + work > total_s and reps > 1:
+        reps -= 1
+        work = reps * (on + off)
+    s = Session(
+        name="Tempo Intervals",
+        description=f"{reps} x {on // 60}min at 80% FTP (tempo).",
+        workout_type="tempo",
+    )
+    s.segments.append(
+        Segment(kind="warmup", duration=warmup, power_low=0.50, power_high=0.75,
+                text="Warm up into tempo pace.")
+    )
+    s.segments.append(
+        Segment(kind="intervals", duration=work, repeat=reps,
+                on_duration=on, off_duration=off,
+                on_power=0.80, off_power=0.55,
+                text="Tempo: steady at 76-90% FTP, breathing controlled.")
+    )
+    _finish(s, total_s)
+    absorb_long_cooldown(s)
+    return s
+
+
+def _sprint(total_s: int) -> Session:
+    """Neuromuscular sprints (Coggan Level 7): 12s maximal, full recovery."""
+    warmup = 600
+    on = 12
+    off = 168  # ~3 min easy between efforts
+    reps = max(3, min(12, (total_s - warmup - 120) // (on + off)))
+    work = reps * (on + off)
+    while warmup + work + 120 > total_s and reps > 3:
+        reps -= 1
+        work = reps * (on + off)
+    while warmup + work + 120 > total_s and warmup > 300:
+        warmup -= 60
+    while warmup + work > total_s and reps > 1:
+        reps -= 1
+        work = reps * (on + off)
+    s = Session(
+        name="Sprint / Neuromuscular",
+        description=f"{reps} x 12s all-out sprints with full recovery, on an "
+                    "aerobic base.",
+        workout_type="sprint",
+    )
+    s.segments.append(
+        Segment(kind="warmup", duration=warmup, power_low=0.50, power_high=0.80,
+                text="Progressive warmup with two brief openers.")
+    )
+    s.segments.append(
+        Segment(kind="intervals", duration=work, repeat=reps,
+                on_duration=on, off_duration=off,
+                on_power=2.00, off_power=0.55,
+                text="12s all-out from a rolling start - go as hard as you can. "
+                     "The 200% FTP figure is a nominal target, not a cap. "
+                     "Spin easy for 3min between efforts.")
+    )
+    _finish(s, total_s)
+    absorb_long_cooldown(s)
+    return s
+
+
 # ---------------------------------------------------------------------------
 # Variant builders. Each preserves its type's training purpose (comparable
 # IF/TSS/time-in-zone at equal duration) while producing a distinct session
@@ -314,6 +446,12 @@ def _vo2max_long_intervals(total_s: int) -> Session:
         reps -= 1
         work = reps * (on + off)
     while warmup + work + 120 > total_s and warmup > 300:
+        warmup -= 60
+    # Short rides: trim further (exact-overflow test keeps 45min+ untouched).
+    while warmup + work > total_s and reps > 2:
+        reps -= 1
+        work = reps * (on + off)
+    while warmup + work > total_s and warmup > 180:
         warmup -= 60
     s = Session(
         name="VO2max Long Intervals",
@@ -491,6 +629,12 @@ def _sweet_spot_with_surges(total_s: int) -> Session:
         reps -= 1
     while used(reps) + 120 > total_s and warmup > 300:
         warmup -= 60
+    # Short rides: a single block still fits (exact-overflow test keeps 45min+
+    # output untouched).
+    while used(reps) > total_s and reps > 1:
+        reps -= 1
+    while used(reps) > total_s and warmup > 180:
+        warmup -= 60
     s = Session(
         name="Sweet Spot with Surges",
         description=f"{reps} x 12min at 89% FTP with a 10s surge every 3min.",
@@ -637,10 +781,122 @@ _VARIANT_BUILDERS = {
         "tempo_finish": _endurance_tempo_finish,
         "cadence_play": _endurance_cadence_play,
     },
+    "tempo": {
+        "classic": _tempo,
+    },
+    "sprint": {
+        "classic": _sprint,
+    },
     "recovery": {
         "classic": _easy_endurance,
     },
 }
+
+# ---------------------------------------------------------------------------
+# Published power-target metadata for the "Just Ride" picker.
+#
+# Zone boundaries follow the Coggan/Allen power-training levels (L1-L7) used by
+# wattracker.analysis.zones.POWER_ZONES:
+#   Allen & Coggan, "Training and Racing with a Power Meter" (training levels).
+# `low`/`high` are fractions of FTP for the primary work effort of the session
+# (not the whole-ride average). `high` is None for the open-ended top level.
+# ---------------------------------------------------------------------------
+WORKOUT_TYPE_INFO: List[dict] = [
+    {
+        "key": "endurance",
+        "label": "Endurance",
+        "zone": "Zone 2",
+        "low": 0.56,
+        "high": 0.75,
+        "work": 0.70,
+        "focus": "Builds aerobic base, fat oxidation and capillary density.",
+        "structure": "Easy warmup, then a long steady Zone 2 block and a cooldown, "
+                     "all ridden on that same Zone 2 base.",
+    },
+    {
+        "key": "tempo",
+        "label": "Tempo",
+        "zone": "Zone 3",
+        "low": 0.76,
+        "high": 0.90,
+        "work": 0.80,
+        "focus": "Raises aerobic durability and muscular endurance below threshold.",
+        "structure": "Warmup, then sustained tempo blocks at ~80% FTP with easy "
+                     "recoveries, ridden on a Zone 2 base when the ride is long.",
+    },
+    {
+        "key": "sweet_spot",
+        "label": "Sweet Spot",
+        "zone": "Zone 3-4 (sweet spot)",
+        "low": 0.88,
+        "high": 0.94,
+        "work": 0.90,
+        "focus": "Best fitness-per-fatigue trade-off for lifting FTP.",
+        "structure": "Warmup, then sweet-spot blocks at ~90% FTP with easy "
+                     "recoveries between them, ridden on a Zone 2 base when the "
+                     "ride is long.",
+    },
+    {
+        "key": "threshold",
+        "label": "Threshold",
+        "zone": "Zone 4",
+        "low": 0.91,
+        "high": 1.05,
+        "work": 0.93,
+        "focus": "Pushes lactate threshold and sustainable one-hour power.",
+        "structure": "Warmup, then sustained threshold blocks at 91-95% FTP with "
+                     "easy recoveries between them, ridden on a Zone 2 base when "
+                     "the ride is long.",
+    },
+    {
+        "key": "vo2max",
+        "label": "VO2max",
+        "zone": "Zone 5",
+        "low": 1.06,
+        "high": 1.20,
+        "work": 1.12,
+        "focus": "Develops maximal oxygen uptake and top-end aerobic power.",
+        "structure": "Warmup, then hard VO2 intervals at 110-115% FTP with equal "
+                     "easy recoveries, ridden on a Zone 2 base when the ride is "
+                     "long.",
+    },
+    {
+        "key": "sprint",
+        "label": "Sprint / Neuromuscular",
+        "zone": "Zone 7",
+        "low": 1.50,
+        "high": None,
+        "work": 2.00,
+        "focus": "Trains neuromuscular power, recruitment and peak sprint watts.",
+        "structure": "Warmup, then short all-out sprints with ~3min full recovery "
+                     "between each, on an easy aerobic base.",
+    },
+    {
+        "key": "recovery",
+        "label": "Recovery",
+        "zone": "Zone 1-2",
+        "low": 0.45,
+        "high": 0.65,
+        "work": 0.65,
+        "focus": "Easy aerobic recovery: promotes blood flow at minimal training load.",
+        "structure": "Very easy warmup, a comfortable steady block at ~65% FTP "
+                     "and an easy cooldown - nothing above low Zone 2, ridden on "
+                     "a Zone 2 base when the ride is long.",
+    },
+]
+
+WORKOUT_TYPE_KEYS = [info["key"] for info in WORKOUT_TYPE_INFO]
+
+# Just Ride durations: 30 minutes to 4 hours in 15-minute increments.
+JUST_RIDE_DURATIONS = list(range(30, 241, 15))
+
+
+def workout_type_info(key: str) -> Optional[dict]:
+    """Return the published metadata dict for a workout kind, or None."""
+    for info in WORKOUT_TYPE_INFO:
+        if info["key"] == key:
+            return dict(info)
+    return None
 
 # Public: ordered variant names per kind (classic first). Used by the plan
 # generator to rotate variants across same-kind days.
