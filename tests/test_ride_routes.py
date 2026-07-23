@@ -96,6 +96,16 @@ def test_ride_page_renders_available_when_monkeypatched(client, monkeypatch):
     assert "devices.slice().sort" in r.text
     assert "playCue(\"scan\")" in r.text
     assert "finally" in r.text
+    assert r.text.index('id="scanBusy"') > r.text.index('id="connectBtn"')
+    assert 'className = "device-disconnect button-secondary"' in r.text
+    assert 'requestDisconnect(deviceAddress);' in r.text
+    assert 'text: "Workout time (minutes)"' in r.text
+    assert "min: 0, max: duration" in r.text
+    assert "var minutes = Number(value) / 60;" in r.text
+    assert '{label: "Cadence", data: liveCadence, yAxisID: "cadence"' in r.text
+    assert 'scales.cadence = {beginAtZero: true, position: "right"' in r.text
+    assert 'id="ergBtn"' in r.text
+    assert '{action: "set_erg", enabled: !ergEnabled}' in r.text
 
 
 def test_ride_status_endpoint(client, monkeypatch):
@@ -198,11 +208,47 @@ def _patch_real_ride(monkeypatch, trainer, power_script):
     monkeypatch.setattr(servermod, "RIDE_INACTIVITY_TIMEOUT_S", 5)
 
 
+class _AckingFtmsClient:
+    def __init__(self, results=None, delay=0.001):
+        self.results = results or {}
+        self.delay = delay
+        self.callback = None
+        self.active_procedure = False
+        self.events = []
+
+    async def start_notify(self, _char, callback):
+        self.callback = callback
+        self.events.append("notify")
+
+    async def write_gatt_char(self, char, data, response=False):
+        assert response is True
+        assert self.active_procedure is False, "FTMS procedures overlapped"
+        self.active_procedure = True
+        op = data[0]
+        self.events.append(("write", op))
+
+        def acknowledge():
+            self.active_procedure = False
+            self.callback(
+                char, bytearray([0x80, op, self.results.get(op, 0x01)])
+            )
+
+        asyncio.get_running_loop().call_later(self.delay, acknowledge)
+
+    async def disconnect(self):
+        assert self.active_procedure is False
+        self.events.append("disconnect")
+
+
 def test_ride_ws_real_path_erg_drives_trainer(client, monkeypatch):
     from wattracker.ble.devices import SimulatedTrainer
 
     _register(client)
     trainer = SimulatedTrainer()
+    # connect_sensors prepares a real FTMS trainer before handing it to the
+    # route; represent that state so initial targeting must not re-request
+    # control/start.
+    trainer.start_erg()
     # Pedal through the 3s start gate plus 1s of ride time, then stop until the
     # shortened inactivity timeout finalizes.
     _patch_real_ride(monkeypatch, trainer, [150, 150, 150, 150] + [0] * 10)
@@ -223,12 +269,142 @@ def test_ride_ws_real_path_erg_drives_trainer(client, monkeypatch):
     # ERG lifecycle: Request Control + Start at ride start, Stop at the end,
     # with real workout targets in between and a zeroed target on finish.
     assert trainer.commands[:2] == ["request_control", "start"]
+    assert trainer.commands.count("request_control") == 1
     assert trainer.commands[-1] == "stop"
     assert any(t > 0 for t in trainer.targets)
+    assert trainer.targets[0] > 0  # prescribed target applied before pedal gate
     assert trainer.targets[-1] == 0
     # The ride was saved for the user.
     uid = db.get_user_by_username("rider")["id"]
     assert len(db.list_activities(uid)) == 1
+
+
+def test_ride_ws_awaits_ftms_commands_and_stops_before_disconnect(
+    client, monkeypatch
+):
+    from wattracker import server as servermod
+    from wattracker.ble.devices import BleakTrainer, SimulatedPowerSource
+
+    _register(client)
+    hardware = _AckingFtmsClient()
+    connected_trainers = []
+    clock_calls = 0
+    requested_sleeps = []
+    real_sleep = asyncio.sleep
+
+    def fake_ride_time():
+        nonlocal clock_calls
+        tick = clock_calls // 2
+        processing = 0.02 if clock_calls % 2 else 0.0
+        clock_calls += 1
+        return float(tick) + processing
+
+    async def capture_ride_sleep(delay):
+        requested_sleeps.append(delay)
+        await real_sleep(0)
+
+    async def fake_connect(timeout=6.0, selected=None):
+        trainer = BleakTrainer(hardware, response_timeout_s=0.1)
+        await trainer.prepare()
+        connected_trainers.append(trainer)
+        return {
+            "trainer": trainer,
+            "power_source": SimulatedPowerSource(
+                [150, 150, 150, 150] + [0] * 10
+            ),
+            "hr_source": None,
+            "clients": [hardware],
+            "clients_by_address": {"TRAINER": hardware},
+            "bindings": {
+                "TRAINER": {"name": "Kickr", "roles": {"trainer": trainer}}
+            },
+            "names": {"trainer": "Kickr", "power": "Pedals"},
+            "errors": [],
+        }
+
+    monkeypatch.setattr(servermod.bledevices, "bluetooth_available", lambda: (True, "ok"))
+    monkeypatch.setattr(servermod.bledevices, "connect_sensors", fake_connect)
+    monkeypatch.setattr(servermod, "RIDE_POLL_INTERVAL_S", 0.05)
+    monkeypatch.setattr(servermod, "RIDE_INACTIVITY_TIMEOUT_S", 5)
+    monkeypatch.setattr(servermod, "_ride_loop_time", fake_ride_time)
+    monkeypatch.setattr(servermod, "_ride_sleep", capture_ride_sleep)
+
+    with client.websocket_connect("/ride/ws") as ws:
+        assert _receive_after_workout(ws)["status"] == "connected"
+        try:
+            while True:
+                ws.receive_json()
+        except Exception:
+            pass
+
+    trainer = connected_trainers[0]
+    stop_index = max(
+        i for i, event in enumerate(hardware.events)
+        if event == ("write", 0x08)
+    )
+    assert stop_index < hardware.events.index("disconnect")
+    assert trainer._pending_response is None
+    assert trainer._tasks == set()
+    # Request Control and Start happened once during prepare; initial/per-tick
+    # target procedures never queued another start sequence.
+    assert hardware.events.count(("write", 0x00)) == 1
+    assert hardware.events.count(("write", 0x07)) == 1
+    # Deterministic clock models 20 ms of command/processing time per tick.
+    # The server requests only the remaining 30 ms of its 50 ms cadence.
+    assert requested_sleeps
+    assert requested_sleeps == pytest.approx([0.03] * len(requested_sleeps))
+
+
+def test_ride_ws_target_rejection_reports_erg_off_without_aborting(
+    client, monkeypatch
+):
+    from wattracker import server as servermod
+    from wattracker.ble.devices import BleakTrainer, SimulatedPowerSource
+
+    _register(client)
+    hardware = _AckingFtmsClient(results={0x05: 0x04})
+    connected_trainers = []
+
+    async def fake_connect(timeout=6.0, selected=None):
+        trainer = BleakTrainer(hardware, response_timeout_s=0.1)
+        await trainer.prepare()
+        connected_trainers.append(trainer)
+        return {
+            "trainer": trainer,
+            "power_source": SimulatedPowerSource(
+                [150, 150, 150, 150] + [0] * 10
+            ),
+            "hr_source": None,
+            "clients": [hardware],
+            "clients_by_address": {"TRAINER": hardware},
+            "bindings": {
+                "TRAINER": {"name": "Kickr", "roles": {"trainer": trainer}}
+            },
+            "names": {"trainer": "Kickr", "power": "Pedals"},
+            "errors": [],
+        }
+
+    monkeypatch.setattr(servermod.bledevices, "bluetooth_available", lambda: (True, "ok"))
+    monkeypatch.setattr(servermod.bledevices, "connect_sensors", fake_connect)
+    monkeypatch.setattr(servermod, "RIDE_POLL_INTERVAL_S", 0)
+    monkeypatch.setattr(servermod, "RIDE_INACTIVITY_TIMEOUT_S", 5)
+
+    frames = []
+    with client.websocket_connect("/ride/ws") as ws:
+        assert _receive_after_workout(ws)["status"] == "connected"
+        try:
+            while True:
+                frames.append(ws.receive_json())
+        except Exception:
+            pass
+
+    failure = next(frame for frame in frames if frame.get("status") == "erg")
+    assert failure["enabled"] is False
+    assert "operation failed" in failure["error"]
+    assert connected_trainers[0].erg_enabled is False
+    assert any(frame.get("status") == "inactivity_timeout" for frame in frames)
+    assert frames[-1]["status"] == "finished"
+    assert hardware.events[-1] == "disconnect"
 
 
 def test_ride_ws_real_path_degrades_without_trainer(client, monkeypatch):
@@ -355,6 +531,263 @@ def test_ride_ws_prepare_waits_for_start_action(client, monkeypatch):
 
     assert frames[-1]["status"] == "finished"
     assert len(db.list_activities(uid)) == 1
+
+
+def test_ride_ws_prepared_stop_cleans_hardware_before_server_close(
+    client, monkeypatch
+):
+    from starlette.datastructures import QueryParams
+    from wattracker import server as servermod
+    from wattracker.ble.devices import SimulatedPowerSource
+
+    _register(client)
+    uid = db.get_user_by_username("rider")["id"]
+    events = []
+
+    class AwaitedTrainer:
+        erg_available = True
+        erg_enabled = True
+
+        async def async_set_target_power(self, watts):
+            events.append(("target", watts))
+
+        async def async_stop(self):
+            events.append("stop")
+            self.erg_enabled = False
+
+    class AwaitedClient:
+        async def disconnect(self):
+            events.append("disconnect")
+
+    trainer = AwaitedTrainer()
+    ble_client = AwaitedClient()
+
+    async def fake_connect(timeout=6.0, selected=None):
+        return {
+            "trainer": trainer,
+            "power_source": SimulatedPowerSource([0]),
+            "hr_source": None,
+            "clients": [ble_client],
+            "clients_by_address": {"TRAINER": ble_client},
+            "bindings": {
+                "TRAINER": {"name": "Kickr", "roles": {"trainer": trainer}}
+            },
+            "names": {"trainer": "Kickr", "power": "Pedals"},
+            "errors": [],
+        }
+
+    monkeypatch.setattr(servermod.bledevices, "bluetooth_available", lambda: (True, "ok"))
+    monkeypatch.setattr(servermod.bledevices, "connect_sensors", fake_connect)
+
+    class FakeWebSocket:
+        headers = {}
+        session = {"user_id": uid}
+        query_params = QueryParams("prepare=1")
+
+        def __init__(self):
+            self.receive_count = 0
+            self.messages = []
+
+        async def accept(self):
+            pass
+
+        async def send_json(self, message):
+            self.messages.append(message)
+
+        async def receive_json(self):
+            self.receive_count += 1
+            if self.receive_count == 1:
+                return {"action": "stop"}
+            await asyncio.Future()
+
+        async def close(self, code=None):
+            events.append("close")
+
+    endpoint = next(
+        route.endpoint
+        for route in client.app.routes
+        if getattr(route, "path", None) == "/ride/ws"
+    )
+    websocket = FakeWebSocket()
+    asyncio.run(endpoint(websocket))
+
+    assert websocket.messages[0]["status"] == "workout"
+    assert websocket.messages[1]["status"] == "connected"
+    assert events == [("target", 0), "stop", "disconnect", "close"]
+    assert db.list_activities(uid) == []
+
+
+def test_ride_ws_prepared_actions_toggle_erg_and_disconnect_one_device(
+    client, monkeypatch
+):
+    from wattracker import server as servermod
+    from wattracker.ble.devices import (
+        AggregatePowerSource,
+        SimulatedPowerSource,
+        SimulatedTrainer,
+    )
+
+    _register(client)
+    trainer = SimulatedTrainer()
+    trainer.start_erg()
+    left = SimulatedPowerSource([100])
+    right = SimulatedPowerSource([120])
+
+    class FakeClient:
+        def __init__(self, address):
+            self.address = address
+            self.disconnected = False
+
+        async def disconnect(self):
+            self.disconnected = True
+
+    left_client = FakeClient("LEFT")
+    right_client = FakeClient("RIGHT")
+    trainer_client = FakeClient("TRAINER")
+    conn = {
+        "trainer": trainer,
+        "power_source": AggregatePowerSource([left, right]),
+        "hr_source": None,
+        "clients": [left_client, right_client, trainer_client],
+        "clients_by_address": {
+            "LEFT": left_client, "RIGHT": right_client, "TRAINER": trainer_client,
+        },
+        "bindings": {
+            "LEFT": {"name": "Left", "roles": {"power": left}},
+            "RIGHT": {"name": "Right", "roles": {"power": right}},
+            "TRAINER": {"name": "Kickr", "roles": {"trainer": trainer}},
+        },
+        "names": {"power": ["Left", "Right"], "trainer": "Kickr"},
+        "errors": [],
+    }
+
+    async def fake_connect(timeout=6.0, selected=None):
+        return conn
+
+    monkeypatch.setattr(servermod.bledevices, "bluetooth_available", lambda: (True, "ok"))
+    monkeypatch.setattr(servermod.bledevices, "connect_sensors", fake_connect)
+    monkeypatch.setattr(servermod, "RIDE_POLL_INTERVAL_S", 0)
+
+    with client.websocket_connect("/ride/ws?prepare=1") as ws:
+        connected = _receive_after_workout(ws)
+        assert connected["erg_available"] is True
+        assert connected["erg_enabled"] is True
+
+        ws.send_json({"action": "set_erg", "enabled": "false"})
+        invalid = ws.receive_json()
+        assert invalid == {
+            "status": "erg",
+            "available": True,
+            "enabled": True,
+            "error": "ERG enabled must be a boolean.",
+        }
+
+        ws.send_json({"action": "set_erg", "enabled": False})
+        disabled = ws.receive_json()
+        assert disabled["status"] == "erg"
+        assert disabled["available"] is True
+        assert disabled["enabled"] is False
+        assert disabled["error"] is None
+
+        ws.send_json({"action": "disconnect", "address": "LEFT"})
+        disconnected = ws.receive_json()
+        assert disconnected["status"] == "device_disconnected"
+        assert disconnected["address"] == "LEFT"
+        assert disconnected["devices"]["power"] == "Right"
+        assert disconnected["erg_available"] is True
+        assert left_client.disconnected is True
+
+        ws.send_json({"action": "start"})
+        assert ws.receive_json()["status"] == "started"
+
+    assert right_client.disconnected is True
+    assert trainer_client.disconnected is True
+
+
+def test_ride_ws_active_actions_toggle_erg_and_validate_disconnect(
+    client, monkeypatch
+):
+    from wattracker import server as servermod
+    from wattracker.ble.devices import SimulatedPowerSource, SimulatedTrainer
+
+    _register(client)
+    trainer = SimulatedTrainer()
+
+    async def fake_connect(timeout=6.0, selected=None):
+        return {
+            "trainer": trainer,
+            "power_source": SimulatedPowerSource([150] * 100),
+            "hr_source": None,
+            "clients": [],
+            "clients_by_address": {},
+            "bindings": {},
+            "names": {"power": "Pedals", "trainer": "Kickr"},
+            "errors": [],
+        }
+
+    monkeypatch.setattr(servermod.bledevices, "bluetooth_available", lambda: (True, "ok"))
+    monkeypatch.setattr(servermod.bledevices, "connect_sensors", fake_connect)
+    monkeypatch.setattr(servermod, "RIDE_POLL_INTERVAL_S", 0.001)
+
+    with client.websocket_connect("/ride/ws") as ws:
+        assert _receive_after_workout(ws)["status"] == "connected"
+        ws.send_json({"action": "set_erg", "enabled": False})
+        messages = []
+        while not any(message.get("status") == "erg" for message in messages):
+            messages.append(ws.receive_json())
+        result = next(message for message in messages if message.get("status") == "erg")
+        assert result["enabled"] is False
+
+        ws.send_json({"action": "disconnect", "address": 123})
+        messages = []
+        while not any(
+            message.get("status") == "error"
+            and message.get("action") == "disconnect"
+            for message in messages
+        ):
+            messages.append(ws.receive_json())
+        error = next(
+            message for message in messages
+            if message.get("status") == "error"
+            and message.get("action") == "disconnect"
+        )
+        assert error["error"] == "Invalid device address."
+
+
+def test_ride_ws_erg_action_reports_unavailable_without_trainer(
+    client, monkeypatch
+):
+    from wattracker import server as servermod
+    from wattracker.ble.devices import SimulatedPowerSource
+
+    _register(client)
+
+    async def fake_connect(timeout=6.0, selected=None):
+        return {
+            "trainer": None,
+            "power_source": SimulatedPowerSource([0]),
+            "hr_source": None,
+            "clients": [],
+            "clients_by_address": {},
+            "bindings": {},
+            "names": {"power": "Pedals"},
+            "errors": [],
+        }
+
+    monkeypatch.setattr(servermod.bledevices, "bluetooth_available", lambda: (True, "ok"))
+    monkeypatch.setattr(servermod.bledevices, "connect_sensors", fake_connect)
+
+    with client.websocket_connect("/ride/ws?prepare=1") as ws:
+        connected = _receive_after_workout(ws)
+        assert connected["erg_available"] is False
+        assert connected["erg_enabled"] is False
+        ws.send_json({"action": "set_erg", "enabled": True})
+        response = ws.receive_json()
+        assert response["status"] == "erg"
+        assert response["available"] is False
+        assert response["enabled"] is False
+        assert "No controllable FTMS trainer" in response["error"]
+        ws.send_json({"action": "stop"})
 
 
 @pytest.mark.parametrize("prepare", [True, False])

@@ -109,9 +109,13 @@ def test_connect_sensors_uses_exact_selection_and_deduplicates_client(monkeypatc
     class FakeTrainer:
         def __init__(self, client):
             self.client = client
+            self.stopped = False
 
         async def prepare(self):
             pass
+
+        async def async_stop(self):
+            self.stopped = True
 
     monkeypatch.setattr(devices, "scan", no_scan)
     monkeypatch.setattr(devices, "BleakPowerSource", FakePower)
@@ -127,7 +131,64 @@ def test_connect_sensors_uses_exact_selection_and_deduplicates_client(monkeypatc
     assert result["trainer"].client is fake_client.instances[0]
     assert result["power_source"].latest_power() == 212
     assert result["names"]["power"] == ["LEFT", "RIGHT"]
+    assert set(result["clients_by_address"]) == {"LEFT", "RIGHT"}
+    assert set(result["bindings"]["LEFT"]["roles"]) == {"trainer", "power"}
     assert result["errors"] == []
+
+    connected_trainer = result["trainer"]
+    asyncio.run(devices.disconnect_sensor(result, "LEFT"))
+    assert connected_trainer.stopped is True
+    assert fake_client.instances[0].disconnected is True
+    assert result["trainer"] is None
+    assert result["power_source"].latest_power() == 107
+    assert result["names"] == {"power": "RIGHT"}
+    assert [client.address for client in result["clients"]] == ["RIGHT"]
+
+
+def test_disconnect_sensor_rebuilds_dual_power_and_preserves_other_roles(
+    monkeypatch,
+):
+    _module, fake_client = _install_fake_bleak(monkeypatch)
+
+    class FakePower(FixedPower):
+        def __init__(self, client):
+            super().__init__({"COMBO": 100, "RIGHT": 120}[client.address])
+
+        async def start(self):
+            pass
+
+    class FakeHeart:
+        def __init__(self, client):
+            self.client = client
+
+        async def start(self):
+            pass
+
+        def latest_hr(self):
+            return 145
+
+    monkeypatch.setattr(devices, "BleakPowerSource", FakePower)
+    monkeypatch.setattr(devices, "BleakHeartRateSource", FakeHeart)
+    result = asyncio.run(
+        devices.connect_sensors(
+            selected={"power": ["COMBO", "RIGHT"], "hr": ["COMBO"]}
+        )
+    )
+    assert result["power_source"].latest_power() == 220
+    assert result["hr_source"].latest_hr() == 145
+
+    asyncio.run(devices.disconnect_sensor(result, "RIGHT"))
+    assert result["power_source"].latest_power() == 100
+    assert result["hr_source"].latest_hr() == 145
+    assert result["names"] == {"power": "COMBO", "hr": "COMBO"}
+    assert fake_client.instances[1].disconnected is True
+
+    asyncio.run(devices.disconnect_sensor(result, "COMBO"))
+    assert result["power_source"] is None
+    assert result["hr_source"] is None
+    assert result["names"] == {}
+    with pytest.raises(ValueError, match="not connected"):
+        asyncio.run(devices.disconnect_sensor(result, "MISSING"))
 
 
 def test_connect_sensors_reports_selected_setup_failure_and_keeps_other_power(

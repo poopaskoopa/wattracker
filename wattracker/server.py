@@ -46,6 +46,15 @@ DAY_LABELS = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
 RIDE_POLL_INTERVAL_S = 1.0
 RIDE_INACTIVITY_TIMEOUT_S = 300.0
 
+
+def _ride_loop_time() -> float:
+    return asyncio.get_running_loop().time()
+
+
+async def _ride_sleep(delay: float) -> None:
+    await asyncio.sleep(delay)
+
+
 # Background activity-scan cadence (seconds); module-level so tests can shrink it.
 SCAN_INTERVAL_S = 24 * 3600.0
 
@@ -1564,6 +1573,14 @@ def create_app() -> FastAPI:
         if trainer is None:
             return
         try:
+            async_set_target = getattr(trainer, "async_set_target_power", None)
+            if callable(async_set_target):
+                await async_set_target(0)
+            else:
+                trainer.set_target_power(0)
+        except Exception:
+            pass
+        try:
             async_stop = getattr(trainer, "async_stop", None)
             if callable(async_stop):
                 await async_stop()
@@ -1571,6 +1588,58 @@ def create_app() -> FastAPI:
                 trainer.stop_erg()
         except Exception:
             pass
+
+    def _connection_erg_state(conn: Optional[dict]) -> tuple:
+        trainer = (conn or {}).get("trainer")
+        available = bool(
+            trainer is not None and getattr(trainer, "erg_available", True)
+        )
+        enabled = bool(
+            available and getattr(trainer, "erg_enabled", True)
+        )
+        return available, enabled
+
+    async def _set_connection_erg(
+        conn: dict,
+        enabled: bool,
+        target_watts: int,
+        force_rearm: bool = False,
+    ) -> tuple:
+        trainer = conn.get("trainer")
+        available, current = _connection_erg_state(conn)
+        if not available:
+            return False, False, "No controllable FTMS trainer is connected."
+        try:
+            if enabled:
+                async_set_target = getattr(
+                    trainer, "async_set_target_power", None
+                )
+                async_enable = getattr(trainer, "async_enable_erg", None)
+                if current and not force_rearm and callable(async_set_target):
+                    await async_set_target(target_watts)
+                elif current and not force_rearm:
+                    trainer.set_target_power(target_watts)
+                elif callable(async_enable):
+                    await async_enable(target_watts)
+                else:
+                    trainer.start_erg()
+                    trainer.set_target_power(target_watts)
+            else:
+                async_disable = getattr(trainer, "async_disable_erg", None)
+                if callable(async_disable):
+                    await async_disable()
+                else:
+                    trainer.set_target_power(0)
+                    trainer.stop_erg()
+        except Exception as exc:
+            available, current = _connection_erg_state(conn)
+            return available, False if enabled else current, str(exc)
+        available, actual = _connection_erg_state(conn)
+        # Generic trainers may not expose state; successful commands are the
+        # authoritative result for those backwards-compatible implementations.
+        if not hasattr(trainer, "erg_enabled"):
+            actual = enabled
+        return available, actual, None
 
     @app.websocket("/ride/ws")
     async def ride_ws(websocket: WebSocket):
@@ -1631,6 +1700,8 @@ def create_app() -> FastAPI:
             # without an FTMS trainer still works read-only (power/HR display).
             conn = None
             controller = None
+            receive_task = None
+            action_queue = None
             abnormal_cleanup = False
             try:
                 try:
@@ -1655,18 +1726,133 @@ def create_app() -> FastAPI:
                         }
                     )
                     return
+                erg_available, erg_enabled = _connection_erg_state(conn)
                 await websocket.send_json(
                     {"status": "connected", "devices": conn["names"],
-                     "erg": conn["trainer"] is not None,
+                     "erg": erg_available,
+                     "erg_available": erg_available,
+                     "erg_enabled": erg_enabled,
                      "warnings": conn.get("errors", []),
                      "prepared": prepare_only,
                      "workout": workout_payload}
                 )
+
+                async def _receive_actions() -> None:
+                    try:
+                        while True:
+                            await action_queue.put(await websocket.receive_json())
+                    except BaseException as exc:
+                        await action_queue.put(exc)
+
+                async def _handle_action(message) -> Optional[str]:
+                    nonlocal controller
+                    if isinstance(message, BaseException):
+                        raise message
+                    if not isinstance(message, dict):
+                        await websocket.send_json(
+                            {"status": "error", "error": "Invalid ride action."}
+                        )
+                        return None
+                    action = message.get("action")
+                    if action == "start":
+                        return "start"
+                    if action == "stop":
+                        return "stop"
+                    if action == "disconnect":
+                        address = message.get("address")
+                        if (
+                            not isinstance(address, str)
+                            or not address
+                            or len(address) > _MAX_BLE_ADDRESS_LENGTH
+                        ):
+                            await websocket.send_json(
+                                {
+                                    "status": "error",
+                                    "action": "disconnect",
+                                    "error": "Invalid device address.",
+                                }
+                            )
+                            return None
+                        try:
+                            await bledevices.disconnect_sensor(conn, address)
+                            if controller is not None:
+                                controller.update_sources(
+                                    trainer=conn.get("trainer"),
+                                    power_source=conn.get("power_source"),
+                                    hr_source=conn.get("hr_source"),
+                                )
+                            available_now, enabled_now = _connection_erg_state(conn)
+                            await websocket.send_json(
+                                {
+                                    "status": "device_disconnected",
+                                    "address": address,
+                                    "devices": conn.get("names", {}),
+                                    "erg_available": available_now,
+                                    "erg_enabled": enabled_now,
+                                    "message": "Device disconnected.",
+                                }
+                            )
+                        except Exception as exc:
+                            await websocket.send_json(
+                                {
+                                    "status": "error",
+                                    "action": "disconnect",
+                                    "address": address,
+                                    "error": str(exc),
+                                }
+                            )
+                        return None
+                    if action == "set_erg":
+                        enabled = message.get("enabled")
+                        if type(enabled) is not bool:
+                            await websocket.send_json(
+                                {
+                                    "status": "erg",
+                                    "available": _connection_erg_state(conn)[0],
+                                    "enabled": _connection_erg_state(conn)[1],
+                                    "error": "ERG enabled must be a boolean.",
+                                }
+                            )
+                            return None
+                        target = (
+                            controller.target_watts(
+                                min(controller.elapsed, controller.total_s)
+                            )
+                            if controller is not None
+                            else int(workout_payload["profile"][0]["watts_start"])
+                            if workout_payload.get("profile")
+                            else 0
+                        )
+                        available_now, enabled_now, error = (
+                            await _set_connection_erg(conn, enabled, target)
+                        )
+                        if controller is not None:
+                            controller.erg_available = available_now
+                            controller.set_erg_enabled(
+                                enabled_now, command_trainer=False
+                            )
+                        await websocket.send_json(
+                            {
+                                "status": "erg",
+                                "available": available_now,
+                                "enabled": enabled_now,
+                                "error": error,
+                            }
+                        )
+                        return None
+                    await websocket.send_json(
+                        {"status": "error", "error": "Unknown ride action."}
+                    )
+                    return None
+
+                if callable(getattr(websocket, "receive_json", None)):
+                    action_queue = asyncio.Queue()
+                    receive_task = asyncio.create_task(_receive_actions())
                 if prepare_only:
                     while True:
                         try:
                             message = await asyncio.wait_for(
-                                websocket.receive_json(),
+                                action_queue.get(),
                                 timeout=RIDE_INACTIVITY_TIMEOUT_S,
                             )
                         except asyncio.TimeoutError:
@@ -1678,11 +1864,15 @@ def create_app() -> FastAPI:
                                 }
                             )
                             return
-                        if message.get("action") == "start":
+                        outcome = await _handle_action(message)
+                        if outcome == "start":
                             break
-                        if message.get("action") == "stop":
+                        if outcome == "stop":
                             return
 
+                initial_erg_available, initial_erg_enabled = (
+                    _connection_erg_state(conn)
+                )
                 controller = RideController(
                     session,
                     ftp,
@@ -1691,12 +1881,77 @@ def create_app() -> FastAPI:
                     hr_source=conn["hr_source"],
                     user_id=uid,
                     autosave=True,
+                    erg_enabled=initial_erg_enabled,
+                    manage_trainer_commands=False,
                 )
+                controller.current_target = controller.target_watts(0)
+                initial_erg_error = None
+                if initial_erg_enabled:
+                    (
+                        initial_erg_available,
+                        initial_erg_enabled,
+                        initial_erg_error,
+                    ) = await _set_connection_erg(
+                        conn, True, controller.current_target
+                    )
+                    controller.erg_available = initial_erg_available
+                    controller.set_erg_enabled(
+                        initial_erg_enabled, command_trainer=False
+                    )
                 if prepare_only:
                     await websocket.send_json({"status": "started"})
+                if initial_erg_error:
+                    await websocket.send_json(
+                        {
+                            "status": "erg",
+                            "available": initial_erg_available,
+                            "enabled": initial_erg_enabled,
+                            "error": initial_erg_error,
+                        }
+                    )
                 inactive_s = 0.0
                 while controller.status != "finished":
+                    tick_started = _ride_loop_time()
+                    if action_queue is not None:
+                        while not action_queue.empty():
+                            outcome = await _handle_action(action_queue.get_nowait())
+                            if outcome == "stop":
+                                controller.stop()
+                                break
+                    if controller.status == "finished":
+                        break
+                    previous_status = controller.status
                     controller.poll(dt=1)
+                    if (
+                        controller.erg_enabled
+                        and controller.status in ("running", "finished")
+                    ):
+                        (
+                            command_available,
+                            command_enabled,
+                            command_error,
+                        ) = await _set_connection_erg(
+                            conn,
+                            True,
+                            controller.current_target,
+                            force_rearm=(
+                                previous_status == "paused"
+                                and controller.status == "running"
+                            ),
+                        )
+                        controller.erg_available = command_available
+                        controller.set_erg_enabled(
+                            command_enabled, command_trainer=False
+                        )
+                        if command_error:
+                            await websocket.send_json(
+                                {
+                                    "status": "erg",
+                                    "available": command_available,
+                                    "enabled": False,
+                                    "error": command_error,
+                                }
+                            )
                     await websocket.send_json(controller.state())
                     if controller.current_power > 0:
                         inactive_s = 0.0
@@ -1722,7 +1977,10 @@ def create_app() -> FastAPI:
                         if not saved:
                             return
                         break
-                    await asyncio.sleep(RIDE_POLL_INTERVAL_S)
+                    tick_elapsed = _ride_loop_time() - tick_started
+                    await _ride_sleep(
+                        max(0.0, RIDE_POLL_INTERVAL_S - tick_elapsed)
+                    )
                 await websocket.send_json(controller.state())
             except BaseException as exc:
                 abnormal_cleanup = True
@@ -1741,15 +1999,16 @@ def create_app() -> FastAPI:
                 if not isinstance(exc, Exception):
                     raise
             finally:
-                if (
-                    abnormal_cleanup
-                    or controller is None
-                    or controller.status != "finished"
-                ):
+                if receive_task is not None:
+                    receive_task.cancel()
                     try:
-                        await _stop_ble_trainer(conn)
+                        await receive_task
                     except BaseException:
                         pass
+                try:
+                    await _stop_ble_trainer(conn)
+                except BaseException:
+                    pass
                 for client in (conn or {}).get("clients", []):
                     try:
                         await client.disconnect()
