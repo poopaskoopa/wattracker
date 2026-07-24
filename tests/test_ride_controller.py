@@ -245,22 +245,103 @@ def test_no_trainer_power_display_still_works():
     assert st["target_watts"] == 100  # target still computed for display
 
 
+def test_erg_toggle_suppresses_targets_then_releases_and_rearms():
+    trainer = SimulatedTrainer()
+    c = RideController(
+        _two_block_session(), 200, trainer=trainer,
+        start_grace_s=0, autosave=False,
+    )
+    c.tick(power=150)
+    targets_before_disable = list(trainer.targets)
+
+    assert c.set_erg_enabled(False) is False
+    assert trainer.targets[-1] == 0
+    assert trainer.commands[-1] == "stop"
+    c.tick(power=150)
+    assert trainer.targets == targets_before_disable + [0]
+    assert c.state()["target_watts"] == 100
+    assert c.state()["erg_available"] is True
+    assert c.state()["erg_enabled"] is False
+
+    assert c.set_erg_enabled(True) is True
+    assert trainer.commands[-2:] == ["request_control", "start"]
+    assert trainer.targets[-1] == 100
+    assert c.state()["erg_enabled"] is True
+
+
+def test_erg_toggle_is_unavailable_without_trainer_but_target_remains_visible():
+    c = RideController(
+        _two_block_session(), 200, trainer=None,
+        start_grace_s=0, autosave=False,
+    )
+    c.tick(power=150)
+    assert c.set_erg_enabled(True) is False
+    assert c.state()["erg_available"] is False
+    assert c.state()["erg_enabled"] is False
+    assert c.state()["target_watts"] == 100
+
+
+def test_prearmed_erg_sets_initial_target_without_duplicate_start():
+    trainer = SimulatedTrainer()
+    trainer.start_erg()
+    c = RideController(
+        _two_block_session(), 200, trainer=trainer, autosave=False
+    )
+    c.current_target = c.target_watts(0)
+    trainer.set_target_power(c.current_target)
+    for _ in range(3):
+        c.tick(power=120)
+
+    assert trainer.commands == ["request_control", "start"]
+    assert trainer.targets[0] == 100
+    assert trainer.targets[-1] == 100
+    assert c.elapsed == 0
+    assert c.has_started is False
+
+
+def test_server_managed_controller_never_schedules_trainer_commands():
+    trainer = SimulatedTrainer()
+    c = RideController(
+        _two_block_session(),
+        200,
+        trainer=trainer,
+        start_grace_s=0,
+        autosave=False,
+        manage_trainer_commands=False,
+    )
+    state = c.tick(power=150)
+
+    assert state["status"] == "running"
+    assert state["target_watts"] == 100
+    assert trainer.commands == []
+    assert trainer.targets == []
+
+
 # ------------------------------------------- BleakTrainer over a fake client
 class FakeBleakClient:
-    """Records GATT writes/notify subscriptions; optionally fails writes."""
+    """Records GATT procedures and emits configurable FTMS indications."""
 
-    def __init__(self, fail_writes=False):
+    def __init__(self, fail_writes=False, results=None, drop_ops=None):
         self.writes = []
         self.notify_subs = []
         self.fail_writes = fail_writes
+        self.results = results or {}
+        self.drop_ops = set(drop_ops or [])
+        self._callback = None
 
     async def write_gatt_char(self, char, data, response=False):
         if self.fail_writes:
             raise RuntimeError("device gone")
         self.writes.append((char, bytes(data)))
+        op = data[0]
+        if op not in self.drop_ops:
+            self._callback(
+                char, bytearray([0x80, op, self.results.get(op, 0x01)])
+            )
 
     async def start_notify(self, char, callback):
         self.notify_subs.append((char, callback))
+        self._callback = callback
 
 
 def test_bleak_trainer_sends_erg_command_bytes():
@@ -316,15 +397,61 @@ def test_bleak_trainer_handles_indication_responses():
     assert trainer.last_response["result"] == 0x04
 
 
-def test_bleak_trainer_write_failure_degrades_gracefully():
+def test_bleak_trainer_write_failure_is_surfaced():
     import asyncio
 
     from wattracker.ble.devices import BleakTrainer
 
     trainer = BleakTrainer(FakeBleakClient(fail_writes=True))
-    asyncio.run(trainer.prepare())              # must not raise
-    asyncio.run(trainer.async_set_target_power(200))
-    trainer.set_target_power(150)               # sync path must not raise either
+    with pytest.raises(RuntimeError, match="device gone"):
+        asyncio.run(trainer.prepare())
+    assert trainer.erg_available is False
+    assert "device gone" in trainer.last_error
+
+
+def test_bleak_trainer_serializes_procedures_and_subscribes_once():
+    import asyncio
+
+    from wattracker.ble.devices import BleakTrainer
+
+    async def exercise():
+        client = FakeBleakClient()
+        trainer = BleakTrainer(client)
+        await asyncio.gather(
+            trainer.async_enable_erg(210),
+            trainer.async_set_target_power(220),
+        )
+        return client, trainer
+
+    client, trainer = asyncio.run(exercise())
+    assert [payload[0] for _, payload in client.writes] == [0x00, 0x07, 0x05, 0x05]
+    assert len(client.notify_subs) == 1
+    assert trainer.erg_available is True
+    assert trainer.erg_enabled is True
+
+
+def test_bleak_trainer_rejection_and_timeout_are_surfaced():
+    import asyncio
+
+    from wattracker.ble.devices import BleakTrainer
+
+    rejected = BleakTrainer(FakeBleakClient(results={0x00: 0x05}))
+    with pytest.raises(RuntimeError, match="control not permitted"):
+        asyncio.run(rejected.prepare())
+    assert "control not permitted" in rejected.last_error
+
+    timed_out = BleakTrainer(
+        FakeBleakClient(drop_ops={0x00}), response_timeout_s=0.01
+    )
+    with pytest.raises(TimeoutError, match="timed out"):
+        asyncio.run(timed_out.prepare())
+    assert "timed out" in timed_out.last_error
+
+    target_rejected = BleakTrainer(FakeBleakClient(results={0x05: 0x04}))
+    with pytest.raises(RuntimeError, match="operation failed"):
+        asyncio.run(target_rejected.async_enable_erg(200))
+    assert target_rejected.erg_available is True
+    assert target_rejected.erg_enabled is False
 
 
 def test_finished_ride_saves_activity(user_id):

@@ -7,9 +7,10 @@ installed and a Bluetooth adapter is present.
 from __future__ import annotations
 
 import abc
+import asyncio
 import logging
 import time
-from typing import List, Optional, Sequence, Tuple
+from typing import Dict, List, Optional, Sequence, Set, Tuple
 
 from .protocol import (
     cadence_from_cranks,
@@ -102,6 +103,14 @@ class Trainer(abc.ABC):
     def stop_erg(self) -> None:
         """Release ERG at ride end (FTMS Stop 0x08)."""
 
+    @property
+    def erg_available(self) -> bool:
+        return True
+
+    @property
+    def erg_enabled(self) -> bool:
+        return False
+
 
 # --------------------------------------------------------------- simulated
 class SimulatedPowerSource(PowerSource):
@@ -160,6 +169,7 @@ class SimulatedTrainer(Trainer):
     def __init__(self) -> None:
         self.targets: List[int] = []
         self.commands: List[str] = []
+        self._erg_enabled = False
 
     def set_target_power(self, watts: int) -> None:
         self.targets.append(int(round(watts)))
@@ -167,9 +177,15 @@ class SimulatedTrainer(Trainer):
     def start_erg(self) -> None:
         self.commands.append("request_control")
         self.commands.append("start")
+        self._erg_enabled = True
 
     def stop_erg(self) -> None:
         self.commands.append("stop")
+        self._erg_enabled = False
+
+    @property
+    def erg_enabled(self) -> bool:
+        return self._erg_enabled
 
     @property
     def last_target(self) -> Optional[int]:
@@ -254,13 +270,32 @@ class BleakHeartRateSource(HeartRateSource):
 class BleakTrainer(Trainer):
     """FTMS trainer over bleak: request control, start, then set ERG targets.
 
-    Control-point indications (response code 0x80) are logged: failures are
-    reported but never raised, so a stubborn trainer degrades to display-only.
+    Every control-point procedure is serialized and completed only after the
+    matching indication arrives. This is required by FTMS and prevents Request
+    Control, Start/Resume and target writes from racing one another.
     """
 
-    def __init__(self, client) -> None:
+    def __init__(self, client, response_timeout_s: float = 2.0) -> None:
         self._client = client
+        self._response_timeout_s = float(response_timeout_s)
+        self._procedure_lock = asyncio.Lock()
+        self._notify_lock = asyncio.Lock()
+        self._notify_started = False
+        self._pending_op: Optional[int] = None
+        self._pending_response = None
+        self._tasks: Set[asyncio.Task] = set()
+        self._erg_available = False
+        self._erg_enabled = False
         self.last_response: Optional[dict] = None
+        self.last_error: Optional[str] = None
+
+    @property
+    def erg_available(self) -> bool:
+        return self._erg_available
+
+    @property
+    def erg_enabled(self) -> bool:
+        return self._erg_enabled
 
     def _on_control_point(self, _char, data: bytearray) -> None:
         try:
@@ -269,6 +304,13 @@ class BleakTrainer(Trainer):
             log.debug("Ignoring non-response FTMS indication: %s", e)
             return
         self.last_response = resp
+        pending = self._pending_response
+        if (
+            pending is not None
+            and not pending.done()
+            and resp["request_op"] == self._pending_op
+        ):
+            pending.set_result(resp)
         if resp["success"]:
             log.debug("FTMS op 0x%02x acknowledged", resp["request_op"])
         else:
@@ -276,32 +318,108 @@ class BleakTrainer(Trainer):
                 "FTMS op 0x%02x rejected: %s", resp["request_op"], resp["message"]
             )
 
-    async def _write(self, payload: bytes, what: str) -> bool:
+    async def _ensure_notify(self) -> None:
+        if self._notify_started:
+            return
+        async with self._notify_lock:
+            if self._notify_started:
+                return
+            await self._client.start_notify(
+                FITNESS_MACHINE_CONTROL_POINT, self._on_control_point
+            )
+            self._notify_started = True
+
+    async def _procedure(self, payload: bytes, what: str) -> dict:
+        async with self._procedure_lock:
+            return await self._procedure_locked(payload, what)
+
+    async def _procedure_locked(self, payload: bytes, what: str) -> dict:
+        """Run one FTMS control-point procedure and await its acknowledgement.
+
+        The caller must already hold ``self._procedure_lock``. Holding it across
+        a multi-step operation (e.g. enable ERG: request-control -> start ->
+        set-target) keeps that operation atomic, so a concurrent command such as
+        set-target-power cannot interleave between the handshake steps.
+        """
+        request_op = payload[0]
+        await self._ensure_notify()
+        loop = asyncio.get_running_loop()
+        response = loop.create_future()
+        self._pending_op = request_op
+        self._pending_response = response
         try:
             await self._client.write_gatt_char(
                 FITNESS_MACHINE_CONTROL_POINT, payload, response=True
             )
+            result = await asyncio.wait_for(
+                response, timeout=self._response_timeout_s
+            )
+        except asyncio.TimeoutError as exc:
+            message = f"FTMS {what} timed out waiting for acknowledgement"
+            self.last_error = message
+            raise TimeoutError(message) from exc
+        except Exception as exc:
+            self.last_error = f"FTMS {what} failed: {exc}"
+            raise
+        finally:
+            self._pending_op = None
+            self._pending_response = None
+        if not result["success"]:
+            message = f"FTMS {what} rejected: {result['message']}"
+            self.last_error = message
+            raise RuntimeError(message)
+        self.last_error = None
+        return result
+
+    async def _write(self, payload: bytes, what: str) -> bool:
+        """Compatibility wrapper returning success while retaining strict ACKs."""
+        try:
+            await self._procedure(payload, what)
             return True
-        except Exception as e:  # trainer went away / write rejected
+        except Exception as e:
             log.warning("FTMS %s write failed: %s", what, e)
             return False
 
     async def prepare(self) -> None:
         """Put the trainer in ERG: subscribe to responses, take control, start."""
-        try:
-            await self._client.start_notify(
-                FITNESS_MACHINE_CONTROL_POINT, self._on_control_point
+        await self.async_enable_erg()
+
+    async def async_enable_erg(self, target_watts: Optional[int] = None) -> None:
+        # Hold the procedure lock across the whole handshake so no other command
+        # (e.g. a concurrent set-target-power) interleaves between request
+        # control, start, and the initial target.
+        async with self._procedure_lock:
+            self._erg_enabled = False
+            await self._procedure_locked(
+                encode_request_control(), "request control"
             )
-        except Exception as e:  # indications unsupported: continue blind
-            log.warning("FTMS control point indications unavailable: %s", e)
-        await self._write(encode_request_control(), "request control")
-        await self._write(encode_start(), "start")
+            await self._procedure_locked(encode_start(), "start")
+            self._erg_available = True
+            try:
+                if target_watts is not None:
+                    await self._procedure_locked(
+                        encode_set_target_power(target_watts), "set target power"
+                    )
+            except Exception:
+                self._erg_enabled = False
+                raise
+            self._erg_enabled = True
 
     async def async_set_target_power(self, watts: int) -> None:
-        await self._write(encode_set_target_power(watts), "set target power")
+        try:
+            await self._procedure(
+                encode_set_target_power(watts), "set target power"
+            )
+        except Exception:
+            self._erg_enabled = False
+            raise
 
     async def async_stop(self) -> None:
-        await self._write(encode_stop(), "stop")
+        await self._procedure(encode_stop(), "stop")
+        self._erg_enabled = False
+
+    async def async_disable_erg(self) -> None:
+        await self.async_stop()
 
     def _schedule(self, coro) -> None:
         # Synchronous entry point: schedule the async write if an event loop is
@@ -310,7 +428,17 @@ class BleakTrainer(Trainer):
 
         try:
             loop = asyncio.get_running_loop()
-            loop.create_task(coro)
+            task = loop.create_task(coro)
+            self._tasks.add(task)
+
+            def _done(completed: asyncio.Task) -> None:
+                self._tasks.discard(completed)
+                try:
+                    completed.result()
+                except Exception as exc:
+                    log.warning("FTMS command failed: %s", exc)
+
+            task.add_done_callback(_done)
         except RuntimeError:
             asyncio.run(coro)
 
@@ -318,7 +446,7 @@ class BleakTrainer(Trainer):
         self._schedule(self.async_set_target_power(watts))
 
     def start_erg(self) -> None:
-        self._schedule(self.prepare())
+        self._schedule(self.async_enable_erg())
 
     def stop_erg(self) -> None:
         self._schedule(self.async_stop())
@@ -408,7 +536,8 @@ async def connect_sensors(
 
     clients: dict = {}  # address -> connected BleakClient (dedup: one per device)
     out = {"trainer": None, "power_source": None, "hr_source": None,
-           "clients": [], "names": {}, "errors": []}
+           "clients": [], "clients_by_address": clients, "bindings": {},
+           "names": {}, "errors": []}
     power_sources = []
     power_names = []
     try:
@@ -439,16 +568,25 @@ async def connect_sensors(
                         await trainer.prepare()
                         out["trainer"] = trainer
                         out["names"][role] = dev["name"]
+                        out["bindings"].setdefault(
+                            addr, {"name": dev["name"], "roles": {}}
+                        )["roles"][role] = trainer
                     elif role == "power":
                         source = BleakPowerSource(client)
                         await source.start()
                         power_sources.append(source)
                         power_names.append(dev["name"])
+                        out["bindings"].setdefault(
+                            addr, {"name": dev["name"], "roles": {}}
+                        )["roles"][role] = source
                     elif role == "hr":
                         hr = BleakHeartRateSource(client)
                         await hr.start()
                         out["hr_source"] = hr
                         out["names"][role] = dev["name"]
+                        out["bindings"].setdefault(
+                            addr, {"name": dev["name"], "roles": {}}
+                        )["roles"][role] = hr
                 except Exception as e:  # role setup failed: keep the others working
                     message = f"Could not set up {role} sensor {dev['name']} ({addr}): {e}"
                     log.warning(message)
@@ -471,3 +609,77 @@ async def connect_sensors(
             power_names[0] if len(power_names) == 1 else power_names
         )
     return out
+
+
+def _rebuild_connection_roles(conn: dict) -> None:
+    """Rebuild public role objects/names after one device is removed."""
+    powers = []
+    power_names = []
+    trainer = None
+    trainer_name = None
+    hr_source = None
+    hr_name = None
+    for binding in conn.get("bindings", {}).values():
+        roles = binding.get("roles", {})
+        name = binding.get("name", "(unknown)")
+        if "power" in roles:
+            powers.append(roles["power"])
+            power_names.append(name)
+        if trainer is None and "trainer" in roles:
+            trainer = roles["trainer"]
+            trainer_name = name
+        if hr_source is None and "hr" in roles:
+            hr_source = roles["hr"]
+            hr_name = name
+    conn["power_source"] = (
+        None
+        if not powers
+        else powers[0]
+        if len(powers) == 1
+        else AggregatePowerSource(powers)
+    )
+    conn["trainer"] = trainer
+    conn["hr_source"] = hr_source
+    names = {}
+    if power_names:
+        names["power"] = power_names[0] if len(power_names) == 1 else power_names
+    if trainer_name is not None:
+        names["trainer"] = trainer_name
+    if hr_name is not None:
+        names["hr"] = hr_name
+    conn["names"] = names
+
+
+async def disconnect_sensor(conn: dict, address: str) -> dict:
+    """Disconnect exactly one BLE address and remove every role it provided."""
+    clients_by_address: Dict[str, object] = conn.get("clients_by_address", {})
+    if address not in clients_by_address:
+        raise ValueError("Device is not connected.")
+    client = clients_by_address[address]
+    trainer = (
+        conn.get("bindings", {}).get(address, {}).get("roles", {}).get("trainer")
+    )
+    if trainer is not None:
+        try:
+            async_disable = getattr(trainer, "async_disable_erg", None)
+            async_stop = getattr(trainer, "async_stop", None)
+            if callable(async_disable):
+                await async_disable()
+            elif callable(async_stop):
+                await async_stop()
+            else:
+                trainer.stop_erg()
+        except Exception as exc:
+            log.warning("Could not release trainer before disconnect: %s", exc)
+    try:
+        await client.disconnect()
+    except Exception as exc:
+        raise RuntimeError(f"Could not disconnect device: {exc}") from exc
+    clients_by_address.pop(address, None)
+    conn.get("bindings", {}).pop(address, None)
+    try:
+        conn.get("clients", []).remove(client)
+    except ValueError:
+        pass
+    _rebuild_connection_roles(conn)
+    return conn
