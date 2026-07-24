@@ -76,6 +76,8 @@ class RideController:
         zero_grace_s: float = _DEFAULT_ZERO_GRACE_S,
         autosave: bool = True,
         started_at: Optional[_dt.datetime] = None,
+        erg_enabled: Optional[bool] = None,
+        manage_trainer_commands: bool = True,
     ) -> None:
         self.session = session
         self.ftp = float(ftp)
@@ -86,6 +88,7 @@ class RideController:
         self.start_grace_s = float(start_grace_s)
         self.zero_grace_s = float(zero_grace_s)
         self.autosave = autosave
+        self.manage_trainer_commands = bool(manage_trainer_commands)
 
         self.blocks, self.total_s = _flatten(session)
         self.status = IDLE
@@ -93,6 +96,16 @@ class RideController:
         self._positive_run = 0.0
         self._zero_run = 0.0
         self._ever_started = False
+        self.erg_available = bool(
+            trainer is not None and getattr(trainer, "erg_available", True)
+        )
+        self._erg_armed = bool(
+            self.erg_available and getattr(trainer, "erg_enabled", False)
+        )
+        self.erg_enabled = bool(
+            self.erg_available
+            and (True if erg_enabled is None else erg_enabled)
+        )
 
         self.current_power = 0
         self.current_cadence: Optional[float] = None
@@ -154,14 +167,17 @@ class RideController:
                 self.status = RUNNING
                 if self.started_at is None:
                     self.started_at = _dt.datetime.now()
-                self._trainer_call("start_erg")
+                if self.erg_enabled and not self._erg_armed:
+                    self._trainer_call("start_erg")
+                    self._erg_armed = True
                 if self.start_grace_s > 0:
                     # Countdown power proves the rider is ready but is not part
                     # of the prescribed workout or its saved samples.
                     self._positive_run = self.start_grace_s
                     self._zero_run = 0.0
                     self.current_target = self.target_watts(0)
-                    self._trainer_call("set_target_power", self.current_target)
+                    if self.erg_enabled:
+                        self._trainer_call("set_target_power", self.current_target)
                     return self.state()
             elif self.status == PAUSED:
                 self.status = RUNNING
@@ -172,7 +188,9 @@ class RideController:
                 # back in ERG, so on resume the trainer free-rides below target.
                 # Request Control + Start is idempotent when already in ERG, so
                 # re-issuing it on each resume is safe.
-                self._trainer_call("start_erg")
+                if self.erg_enabled:
+                    self._trainer_call("start_erg")
+                    self._erg_armed = True
             self._positive_run = self.start_grace_s
             self._zero_run = 0.0
             self.elapsed += dt
@@ -183,7 +201,8 @@ class RideController:
             # Set the ERG target for the current position. Sent every tick, so
             # it both follows segment/ramp changes and acts as a keepalive.
             self.current_target = self.target_watts(min(self.elapsed, self.total_s))
-            self._trainer_call("set_target_power", self.current_target)
+            if self.erg_enabled:
+                self._trainer_call("set_target_power", self.current_target)
 
             # record a sample for the ride file
             self._samples["power"].append(p)
@@ -225,9 +244,51 @@ class RideController:
     def has_started(self) -> bool:
         return self._ever_started
 
+    def set_erg_enabled(self, enabled: bool, command_trainer: bool = True) -> bool:
+        """Enable/disable ERG without changing prescribed-target display."""
+        requested = bool(enabled)
+        if requested and not self.erg_available:
+            self.erg_enabled = False
+            return False
+        if (
+            requested == self.erg_enabled
+            and (not command_trainer or not requested or self._erg_armed)
+        ):
+            return self.erg_enabled
+        self.erg_enabled = requested
+        if not command_trainer:
+            self._erg_armed = requested
+            return self.erg_enabled
+        if requested:
+            self._trainer_call("start_erg")
+            self._erg_armed = True
+            target = self.target_watts(min(self.elapsed, self.total_s))
+            self.current_target = target
+            self._trainer_call("set_target_power", target)
+        else:
+            self._trainer_call("set_target_power", 0)
+            self._trainer_call("stop_erg")
+            self._erg_armed = False
+        return self.erg_enabled
+
+    def update_sources(self, trainer=None, power_source=None, hr_source=None) -> None:
+        """Replace live BLE role bindings after a per-device disconnect."""
+        self.trainer = trainer
+        self.power_source = power_source
+        self.hr_source = hr_source
+        available = bool(
+            trainer is not None and getattr(trainer, "erg_available", True)
+        )
+        if not available:
+            self.erg_enabled = False
+        self.erg_available = available
+        self._erg_armed = bool(
+            available and getattr(trainer, "erg_enabled", False)
+        )
+
     def _trainer_call(self, method: str, *args) -> None:
         """Invoke a trainer command, degrading gracefully (no trainer / BLE error)."""
-        if self.trainer is None:
+        if self.trainer is None or not self.manage_trainer_commands:
             return
         fn = getattr(self.trainer, method, None)
         if fn is None:
@@ -241,8 +302,11 @@ class RideController:
     # --------------------------------------------------------- finishing
     def _finish(self) -> None:
         self.status = FINISHED
-        self._trainer_call("set_target_power", 0)
-        self._trainer_call("stop_erg")
+        if self.trainer is not None:
+            self._trainer_call("set_target_power", 0)
+            self._trainer_call("stop_erg")
+        self.erg_enabled = False
+        self._erg_armed = False
         if self.autosave and self.user_id is not None and self._ever_started:
             try:
                 self._save()
@@ -297,6 +361,8 @@ class RideController:
             "ftp": self.ftp,
             "name": self.session.name,
             "activity_id": self.activity_id,
+            "erg_available": self.erg_available,
+            "erg_enabled": self.erg_enabled,
             "start_countdown": round(
                 max(0.0, self.start_grace_s - self._positive_run), 1
             ) if not self._ever_started else 0.0,

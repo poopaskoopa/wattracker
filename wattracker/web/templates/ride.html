@@ -23,13 +23,15 @@
     </label>
     <div class="toolbar">
         <button type="button" id="scanBtn" {{ '' if ble_available else 'disabled' }}>Scan devices</button>
-        <span id="scanBusy" class="scan-busy" role="status" hidden>
-            <span class="spinner" aria-hidden="true"></span> Scanning Bluetooth devices
-        </span>
         <button type="button" id="connectBtn" {{ '' if ble_available else 'disabled' }}>Connect selected sensors</button>
         <button type="button" id="startBtn">Connect &amp; ride</button>
         <button type="button" id="simBtn">Simulate</button>
         <button type="button" id="stopBtn" disabled>Stop</button>
+    </div>
+    <div class="scan-feedback">
+        <span id="scanBusy" class="scan-busy" role="status" hidden>
+            <span class="spinner" aria-hidden="true"></span> Scanning Bluetooth devices
+        </span>
     </div>
     <p id="scanStatus" class="hint" aria-live="polite">
         Scan to identify devices by advertised role and signal strength. You can
@@ -45,6 +47,13 @@
     <div id="workoutDetails" class="ride-workout" aria-live="polite">
         Select Connect &amp; ride to load the workout.
     </div>
+    <div class="ride-live-controls" aria-label="Trainer controls">
+        <button type="button" id="ergBtn" class="button-secondary erg-toggle" aria-pressed="false"
+                aria-describedby="ergStatus" disabled>ERG mode unavailable</button>
+        <span id="ergStatus" class="hint" role="status" aria-live="polite">
+            Connect a controllable trainer to use ERG mode.
+        </span>
+    </div>
     <div class="cards">
         <div class="card"><span class="label">Status</span><span class="value" id="rStatus">idle</span></div>
         <div class="card"><span class="label">Target</span><span class="value"><span id="rTarget">0</span> W</span></div>
@@ -57,21 +66,32 @@
     <p class="hint">Segment <span id="rSeg">0</span>/<span id="rSegCount">0</span>.
        Hold positive power for 3 seconds to start. The clock pauses after 3 seconds
        without power and resumes when you pedal.</p>
-    <div class="ride-chart-block">
-        <h3>Power</h3>
-        <canvas id="ridePowerChart" role="img" aria-label="Prescribed and actual power over workout time"></canvas>
-        <p id="powerChartSummary" class="sr-only" aria-live="polite"></p>
-    </div>
-    <div id="hrChartBlock" class="ride-chart-block" hidden>
-        <h3>Heart rate</h3>
-        <canvas id="rideHrChart" role="img" aria-label="Heart rate over workout time"></canvas>
-        <p id="hrChartSummary" class="sr-only" aria-live="polite"></p>
+    <div id="rideChartPanel" class="ride-chart-block">
+        <div class="ride-chart-heading">
+            <h3>Workout metrics</h3>
+            <button type="button" id="chartFullscreenBtn" class="button-secondary"
+                    aria-controls="rideChartPanel" aria-pressed="false">
+                View chart full screen
+            </button>
+        </div>
+        <div class="ride-chart-canvas">
+            <div class="ride-chart-metrics" aria-hidden="true">
+                <span class="metric-power"><strong id="chartPowerValue">&mdash;</strong><small>W</small></span>
+                <span class="metric-cadence"><strong id="chartCadenceValue">&mdash;</strong><small>rpm</small></span>
+                <span class="metric-heart-rate"><strong id="chartHrValue">&mdash;</strong><small>bpm</small></span>
+            </div>
+            <canvas id="rideChart" role="img"
+                    aria-label="Target and measured power, cadence, and heart rate over workout time"></canvas>
+        </div>
+        <p id="rideChartSummary" class="sr-only" aria-live="polite"></p>
     </div>
 </section>
 
 <script>
 (function () {
     var ws = null;
+    var queuedOpen = null;
+    var reconnectCloseNotice = null;
     var scanned = false;
     var deviceNames = {};
     var scannedDevices = {};
@@ -79,10 +99,14 @@
     var bleAvailable = !document.getElementById("scanBtn").disabled;
     var cacheKey = {{ ble_cache_key|tojson }};
     var cache = readCache();
-    var powerChart = null, hrChart = null;
-    var livePower = [], liveHr = [];
+    var rideChart = null;
+    var livePower = [], liveCadence = [], liveHr = [];
     var MAX_CHART_POINTS = 30000;
     var chartPointLimit = MAX_CHART_POINTS;
+    var workoutDuration = 0;
+    var connectedAddresses = {};
+    var pendingDisconnects = {};
+    var ergAvailable = false, ergEnabled = false, ergPending = false;
     function readCache() {
         try {
             var parsed = JSON.parse(localStorage.getItem(cacheKey) || "null");
@@ -149,15 +173,41 @@
         element.classList.remove("status-success", "status-failure", "status-working");
         if (kind) element.classList.add("status-" + kind);
     }
-    function chartOptions(yTitle) {
+    function chartOptions(duration) {
         return {responsive: true, maintainAspectRatio: false, animation: false,
             parsing: false, plugins: {legend: {display: true},
                 decimation: {enabled: true, algorithm: "lttb", samples: 1000, threshold: 2000}},
-            scales: {x: {type: "linear", title: {display: true, text: "Workout time (seconds)"}, min: 0},
-                y: {beginAtZero: true, title: {display: true, text: yTitle}}}};
+            scales: {
+            x: {type: "linear", title: {display: true, text: "Workout time (minutes)"},
+                min: 0, max: duration,
+                ticks: {callback: function (value) {
+                    var minutes = Number(value) / 60;
+                    return Number.isInteger(minutes) ? String(minutes) : minutes.toFixed(1);
+                }}},
+            y: {beginAtZero: true, position: "left",
+                title: {display: true, text: "Power (W)"}},
+            metrics: {beginAtZero: true, position: "right",
+                title: {display: true, text: "Cadence (rpm) / Heart rate (bpm)"},
+                grid: {drawOnChartArea: false}}
+        }};
+    }
+    function finiteNumber(value) {
+        if (value == null || value === "") return null;
+        var number = Number(value);
+        return Number.isFinite(number) ? number : null;
+    }
+    function metricText(value) {
+        var number = finiteNumber(value);
+        return number == null ? "—" : String(Math.round(number));
+    }
+    function updateChartMetrics(st) {
+        document.getElementById("chartPowerValue").textContent = metricText(st.power);
+        document.getElementById("chartCadenceValue").textContent = metricText(st.cadence);
+        document.getElementById("chartHrValue").textContent = metricText(st.hr);
     }
     function setupWorkout(workout) {
         if (!workout) return;
+        workoutDuration = Math.max(0, Number(workout.duration_s) || 0);
         document.getElementById("workoutDetails").textContent = workout.name + " — " +
             fmt(workout.duration_s) + " — FTP " + workout.ftp + " W";
         var prescribed = [];
@@ -165,17 +215,29 @@
             prescribed.push({x: block.start, y: block.watts_start});
             prescribed.push({x: block.end, y: block.watts_end});
         });
-        livePower = []; liveHr = [];
+        livePower = []; liveCadence = []; liveHr = [];
         chartPointLimit = Math.min(MAX_CHART_POINTS,
             Math.max(3600, Math.ceil(Number(workout.duration_s) || 0) + 10));
-        if (powerChart) powerChart.destroy();
-        powerChart = new Chart(document.getElementById("ridePowerChart"), {
+        if (rideChart) {
+            rideChart.destroy();
+            rideChart = null;
+        }
+        updateChartMetrics({power: null, cadence: null, hr: null});
+        document.getElementById("rideChartSummary").textContent = "";
+        rideChart = new Chart(document.getElementById("rideChart"), {
             type: "line", data: {datasets: [
-                {label: "Prescribed", data: prescribed, borderColor: "#f2a900", pointRadius: 0, borderWidth: 2},
-                {label: "Actual", data: livePower, borderColor: "#4db6ff", pointRadius: 0, borderWidth: 2}
-            ]}, options: chartOptions("Power (W)")});
-        if (hrChart) { hrChart.destroy(); hrChart = null; }
-        document.getElementById("hrChartBlock").hidden = true;
+                {label: "Target power", data: prescribed, yAxisID: "y",
+                    borderColor: "#f2a900", pointRadius: 0, borderWidth: 2,
+                    borderDash: [8, 4]},
+                {label: "Measured power", data: livePower, yAxisID: "y",
+                    borderColor: "#ffd166", backgroundColor: "#ffd166",
+                    pointBackgroundColor: "#ffd166", pointRadius: 2.5,
+                    pointHoverRadius: 4, borderWidth: 3},
+                {label: "Cadence", data: liveCadence, yAxisID: "metrics",
+                    borderColor: "#57c7ff", pointRadius: 0, borderWidth: 2},
+                {label: "Heart rate", data: liveHr, yAxisID: "metrics",
+                    borderColor: "#ff4d8d", pointRadius: 0, borderWidth: 2}
+            ]}, options: chartOptions(workoutDuration)});
     }
     function appendOrReplace(points, point) {
         if (points.length && points[points.length - 1].x === point.x) {
@@ -186,21 +248,18 @@
         if (points.length > chartPointLimit) points.shift();
     }
     function appendCharts(st) {
-        if (!powerChart || st.elapsed == null) return;
-        appendOrReplace(livePower, {x: Number(st.elapsed), y: Number(st.power || 0)});
-        powerChart.update("none");
-        document.getElementById("powerChartSummary").textContent =
-            "Actual power " + (st.power || 0) + " watts; target " + (st.target_watts || 0) + " watts.";
-        if (st.hr != null) {
-            document.getElementById("hrChartBlock").hidden = false;
-            if (!hrChart) hrChart = new Chart(document.getElementById("rideHrChart"), {
-                type: "line", data: {datasets: [{label: "Heart rate", data: liveHr,
-                    borderColor: "#ff6384", pointRadius: 0, borderWidth: 2}]},
-                options: chartOptions("Heart rate (bpm)")});
-            appendOrReplace(liveHr, {x: Number(st.elapsed), y: Number(st.hr)});
-            hrChart.update("none");
-            document.getElementById("hrChartSummary").textContent = "Heart rate " + st.hr + " beats per minute.";
-        }
+        if (!rideChart) return;
+        var elapsed = finiteNumber(st.elapsed);
+        if (elapsed == null) return;
+        appendOrReplace(livePower, {x: elapsed, y: finiteNumber(st.power)});
+        appendOrReplace(liveCadence, {x: elapsed, y: finiteNumber(st.cadence)});
+        appendOrReplace(liveHr, {x: elapsed, y: finiteNumber(st.hr)});
+        rideChart.update("none");
+        document.getElementById("rideChartSummary").textContent =
+            "Measured power " + (finiteNumber(st.power) == null ? "unavailable" : metricText(st.power) + " watts") +
+            "; target power " + (finiteNumber(st.target_watts) == null ? "unavailable" : metricText(st.target_watts) + " watts") +
+            "; cadence " + (finiteNumber(st.cadence) == null ? "unavailable" : metricText(st.cadence) + " rpm") +
+            "; heart rate " + (finiteNumber(st.hr) == null ? "unavailable" : metricText(st.hr) + " beats per minute") + ".";
     }
     function fmt(sec) {
         sec = Math.round(sec || 0);
@@ -214,10 +273,12 @@
         document.getElementById("startBtn").disabled = state === "connecting" || state === "running";
         document.getElementById("simBtn").disabled = active;
         document.getElementById("scanBtn").disabled = active || !bleAvailable;
-        document.getElementById("connectBtn").disabled = active || !bleAvailable;
+        document.getElementById("connectBtn").disabled =
+            (state === "connecting" || state === "running") || !bleAvailable;
         document.getElementById("workoutSelect").disabled = active;
     }
     function render(st) {
+        updateChartMetrics(st);
         document.getElementById("rStatus").textContent = st.status === "starting"
             ? "starting in " + st.start_countdown + "s" : st.status;
         document.getElementById("rTarget").textContent = st.target_watts;
@@ -233,8 +294,40 @@
         else if (["starting", "running", "paused"].indexOf(st.status) !== -1) setRideState("running");
     }
     function openRide(sim, prepare) {
-        if (ws) { try { ws.close(); } catch (e) {} }
+        if (ws) {
+            var previousState = rideState;
+            queuedOpen = {sim: sim, prepare: prepare};
+            setLive(document.getElementById("connectionStatus"),
+                "Disconnecting the current sensor session before reconnecting...", "working");
+            setRideState("connecting");
+            function cancelQueuedReconnect() {
+                queuedOpen = null;
+                reconnectCloseNotice =
+                    "The reconnect request could not be queued safely. Retry after the current session closes.";
+                try {
+                    ws.close();
+                } catch (closeError) {
+                    setRideState(previousState);
+                }
+                setLive(document.getElementById("connectionStatus"),
+                    reconnectCloseNotice, "failure");
+                playCue("failure");
+            }
+            if (ws.readyState === WebSocket.OPEN) {
+                try {
+                    ws.send(JSON.stringify({action: "stop"}));
+                    reconnectCloseNotice = null;
+                } catch (sendError) {
+                    cancelQueuedReconnect();
+                }
+            } else {
+                cancelQueuedReconnect();
+            }
+            return;
+        }
         resetConnectedRows();
+        ergPending = false;
+        applyErgState(false, false);
         var proto = location.protocol === "https:" ? "wss:" : "ws:";
         var wid = document.getElementById("workoutSelect").value;
         var q = [];
@@ -260,9 +353,17 @@
         setRideState("connecting");
         socket.onmessage = function (ev) {
             if (ws !== socket) return;
+            if (queuedOpen) return;
             var st = JSON.parse(ev.data);
             if (st.status === "workout") {
                 setupWorkout(st.workout);
+                return;
+            }
+            if (st.status === "error" && st.action === "disconnect") {
+                finishDisconnectRequest(st.address);
+                setLive(document.getElementById("connectionStatus"),
+                    st.error || st.message || "Device disconnect failed.", "failure");
+                playCue("failure");
                 return;
             }
             if (st.status === "unavailable" || st.status === "error") {
@@ -281,11 +382,54 @@
                 playCue("failure");
                 return;
             }
+            if (st.status === "device_disconnected") {
+                finishDisconnectRequest(st.address);
+                if (st.error) {
+                    setLive(document.getElementById("connectionStatus"),
+                        st.error || st.message || "Device disconnect failed.", "failure");
+                    playCue("failure");
+                    updateConnectedRows(st.devices || connectedDeviceNames());
+                } else {
+                    updateConnectedRows(st.devices || {});
+                    uncheckDeviceRoles(st.address);
+                    var reconnectAdvice = rideState === "prepared"
+                        ? " Reselect its role, then use Connect selected sensors to reconnect."
+                        : rideState === "running"
+                        ? " Stop the ride before reconnecting it."
+                        : " Reselect its role to reconnect.";
+                    setLive(document.getElementById("connectionStatus"),
+                        displayName(st.address) + " disconnected." + reconnectAdvice, "success");
+                    playCue("success");
+                }
+                applyErgState(Boolean(st.erg_available), Boolean(st.erg_enabled));
+                return;
+            }
+            if (st.status === "erg") {
+                ergPending = false;
+                applyErgState(Boolean(st.available), Boolean(st.enabled));
+                if (st.error) {
+                    setLive(document.getElementById("ergStatus"),
+                        st.error || "Unable to change ERG mode.", "failure");
+                    playCue("failure");
+                } else if (!st.available) {
+                    setLive(document.getElementById("ergStatus"),
+                        st.message || "ERG mode is unavailable for the connected trainer.", "failure");
+                    playCue("failure");
+                } else {
+                    setLive(document.getElementById("ergStatus"),
+                        st.message || ("ERG mode " + (st.enabled ? "enabled." : "disabled.")), "success");
+                    playCue("success");
+                }
+                return;
+            }
             if (st.status === "connected") {
                 setupWorkout(st.workout);
                 var names = st.devices || {};
                 var parts = [];
-                if (names.trainer) parts.push("trainer: " + displayName(names.trainer) + (st.erg ? " (ERG)" : ""));
+                if (names.trainer) {
+                    parts.push("trainer: " + displayName(names.trainer) +
+                        (st.erg_enabled ? " (ERG)" : ""));
+                }
                 if (names.power) {
                     var powerNames = Array.isArray(names.power) ? names.power : [names.power];
                     parts.push("power: " + powerNames.map(displayName).join(" + "));
@@ -302,19 +446,8 @@
                 setLive(document.getElementById("connectionStatus"), message,
                     hasWarnings ? "failure" : "success");
                 saveSuccessfulSelection(names);
-                var connectedAddresses = [];
-                ["power", "hr", "trainer"].forEach(function (role) {
-                    var values = names[role];
-                    (Array.isArray(values) ? values : (values ? [values] : [])).forEach(function (value) {
-                        connectedAddresses.push(String(value));
-                    });
-                });
-                document.querySelectorAll("#deviceList tr[data-address]").forEach(function (row) {
-                    if (connectedAddresses.indexOf(row.dataset.address) === -1) return;
-                    row.classList.add("device-connected");
-                    var badge = row.querySelector(".connection-badge");
-                    if (badge) badge.textContent = "Connected";
-                });
+                updateConnectedRows(names);
+                applyErgState(Boolean(st.erg_available), Boolean(st.erg_enabled));
                 playCue(hasWarnings ? "failure" : "success");
                 setRideState(st.prepared ? "prepared" : "running");
                 return;
@@ -331,14 +464,27 @@
         socket.onclose = function () {
             if (ws !== socket) return;
             resetConnectedRows();
+            ergPending = false;
+            applyErgState(false, false);
             ws = null;
+            var nextOpen = queuedOpen;
+            queuedOpen = null;
+            if (nextOpen) {
+                openRide(nextOpen.sim, nextOpen.prepare);
+                return;
+            }
             setRideState("idle");
-            if (!preserveDisconnectMessage) {
+            if (reconnectCloseNotice) {
+                setLive(document.getElementById("connectionStatus"),
+                    reconnectCloseNotice, "failure");
+                reconnectCloseNotice = null;
+            } else if (!preserveDisconnectMessage) {
                 setLive(document.getElementById("connectionStatus"), "Disconnected.", null);
             }
         };
         socket.onerror = function () {
             if (ws !== socket) return;
+            if (queuedOpen) return;
             preserveDisconnectMessage = true;
             document.getElementById("rStatus").textContent = "connection failed";
             setLive(document.getElementById("connectionStatus"),
@@ -357,17 +503,182 @@
         var address = String(value);
         return deviceNames[address] || address;
     }
-    function resetConnectedRows() {
+    function connectedDeviceNames() {
+        var names = {power: [], hr: null, trainer: null};
+        Object.keys(connectedAddresses).forEach(function (address) {
+            (connectedAddresses[address] || []).forEach(function (role) {
+                if (role === "power") names.power.push(address);
+                else if (role === "hr" || role === "trainer") names[role] = address;
+            });
+        });
+        return names;
+    }
+    function addressesByRole(devices) {
+        var result = {};
+        ["power", "hr", "trainer"].forEach(function (role) {
+            var values = devices && devices[role];
+            (Array.isArray(values) ? values : (values ? [values] : [])).forEach(function (value) {
+                var address = String(value);
+                if (!result[address]) result[address] = [];
+                if (result[address].indexOf(role) === -1) result[address].push(role);
+            });
+        });
+        return result;
+    }
+    function updateConnectedRows(devices) {
+        connectedAddresses = addressesByRole(devices);
         var cached = {};
         (cache && cache.entries || []).forEach(function (entry) { cached[entry.address] = entry; });
         document.querySelectorAll("#deviceList tr[data-address]").forEach(function (row) {
-            row.classList.remove("device-connected");
+            var connected = Object.prototype.hasOwnProperty.call(
+                connectedAddresses, row.dataset.address);
+            row.classList.toggle("device-connected", connected);
             var badge = row.querySelector(".connection-badge");
-            if (!badge) return;
-            var entry = cached[row.dataset.address];
-            badge.textContent = entry ? "Last connected" : "";
-            badge.title = entry ? "Last connected " + entry.last_connected : "";
+            if (badge) {
+                var entry = cached[row.dataset.address];
+                badge.textContent = connected ? "Connected" : (entry ? "Last connected" : "");
+                badge.title = connected ? "Currently connected" :
+                    (entry ? "Last connected " + entry.last_connected : "");
+            }
+            var button = row.querySelector(".device-disconnect");
+            if (button) {
+                button.hidden = !connected;
+                button.disabled = !connected || !ws;
+                if (!pendingDisconnects[row.dataset.address]) button.textContent = "Disconnect";
+            }
         });
+    }
+    function uncheckDeviceRoles(address) {
+        address = String(address || "");
+        document.querySelectorAll("#deviceList input[data-role]").forEach(function (input) {
+            if (input.value === address) input.checked = false;
+        });
+        ["hr", "trainer"].forEach(function (role) {
+            if (document.querySelector('#deviceList input[data-role="' + role + '"]:checked')) return;
+            var none = document.querySelector(
+                '#deviceList input[data-role="' + role + '"][value=""]');
+            if (none) none.checked = true;
+        });
+    }
+    function finishDisconnectRequest(address) {
+        address = String(address || "");
+        delete pendingDisconnects[address];
+        var row = Array.from(document.querySelectorAll("#deviceList tr[data-address]")).find(
+            function (item) { return item.dataset.address === address; });
+        if (!row) return;
+        var button = row.querySelector(".device-disconnect");
+        if (button) {
+            button.textContent = "Disconnect";
+            button.disabled = !connectedAddresses[address] || !ws;
+        }
+    }
+    function requestDisconnect(address) {
+        address = String(address || "");
+        if (!ws || ws.readyState !== WebSocket.OPEN || !connectedAddresses[address]) {
+            setLive(document.getElementById("connectionStatus"),
+                "That device is not connected.", "failure");
+            return;
+        }
+        pendingDisconnects[address] = true;
+        var row = Array.from(document.querySelectorAll("#deviceList tr[data-address]")).find(
+            function (item) { return item.dataset.address === address; });
+        var button = row && row.querySelector(".device-disconnect");
+        if (button) {
+            button.disabled = true;
+            button.textContent = "Disconnecting…";
+        }
+        try {
+            ws.send(JSON.stringify({action: "disconnect", address: address}));
+        } catch (e) {
+            finishDisconnectRequest(address);
+            setLive(document.getElementById("connectionStatus"),
+                "Device disconnect failed. Check the connection and try again.", "failure");
+            playCue("failure");
+        }
+    }
+    function applyErgState(available, enabled) {
+        ergAvailable = available;
+        ergEnabled = available && enabled;
+        var button = document.getElementById("ergBtn");
+        button.disabled = !ergAvailable || ergPending || !ws;
+        button.setAttribute("aria-pressed", ergEnabled ? "true" : "false");
+        button.classList.toggle("erg-on", ergEnabled);
+        button.textContent = ergAvailable
+            ? "ERG mode: " + (ergEnabled ? "On" : "Off")
+            : "ERG mode unavailable";
+        if (!ergAvailable) {
+            setLive(document.getElementById("ergStatus"),
+                "Connect a controllable trainer to use ERG mode.", null);
+        } else if (!ergPending) {
+            setLive(document.getElementById("ergStatus"),
+                "ERG mode is " + (ergEnabled ? "enabled." : "disabled."), null);
+        }
+    }
+    function resetConnectedRows() {
+        pendingDisconnects = {};
+        updateConnectedRows({});
+    }
+    function fullscreenElement() {
+        return document.fullscreenElement || document.webkitFullscreenElement || null;
+    }
+    function chartIsFullscreen() {
+        var panel = document.getElementById("rideChartPanel");
+        return fullscreenElement() === panel ||
+            panel.classList.contains("ride-chart-fullscreen-fallback");
+    }
+    function resizeRideChart() {
+        if (!rideChart) return;
+        window.requestAnimationFrame(function () {
+            if (rideChart) rideChart.resize();
+        });
+    }
+    function updateChartFullscreenState() {
+        var active = chartIsFullscreen();
+        var button = document.getElementById("chartFullscreenBtn");
+        button.setAttribute("aria-pressed", active ? "true" : "false");
+        button.textContent = active ? "Exit full screen" : "View chart full screen";
+        document.body.classList.toggle("ride-chart-fullscreen-open", active);
+        resizeRideChart();
+    }
+    function useFullscreenFallback() {
+        document.getElementById("rideChartPanel").classList.add(
+            "ride-chart-fullscreen-fallback");
+        updateChartFullscreenState();
+    }
+    function enterChartFullscreen() {
+        var panel = document.getElementById("rideChartPanel");
+        var request = panel.requestFullscreen || panel.webkitRequestFullscreen;
+        if (!request) {
+            useFullscreenFallback();
+            return;
+        }
+        try {
+            var result = request.call(panel);
+            if (result && typeof result.catch === "function") {
+                result.catch(useFullscreenFallback);
+            }
+        } catch (e) {
+            useFullscreenFallback();
+        }
+    }
+    function exitChartFullscreen() {
+        var panel = document.getElementById("rideChartPanel");
+        if (panel.classList.contains("ride-chart-fullscreen-fallback")) {
+            panel.classList.remove("ride-chart-fullscreen-fallback");
+            updateChartFullscreenState();
+            return;
+        }
+        var exit = document.exitFullscreen || document.webkitExitFullscreen;
+        if (exit && fullscreenElement()) {
+            try {
+                var result = exit.call(document);
+                if (result && typeof result.catch === "function") {
+                    result.catch(updateChartFullscreenState);
+                }
+            } catch (e) {
+                updateChartFullscreenState();
+            }
+        }
     }
     function renderDevices(devices) {
         var el = document.getElementById("deviceList");
@@ -410,7 +721,7 @@
         var table = document.createElement("table");
         var head = document.createElement("thead");
         var headerRow = document.createElement("tr");
-        ["Device", "Detected", "Signal", "Use as"].forEach(function (label) {
+        ["Device", "Detected", "Signal", "Use as", "Actions"].forEach(function (label) {
             var th = document.createElement("th");
             th.textContent = label;
             headerRow.appendChild(th);
@@ -517,6 +828,22 @@
                 uses.appendChild(label);
             });
             row.appendChild(uses);
+
+            var actions = document.createElement("td");
+            actions.className = "device-actions";
+            var disconnect = document.createElement("button");
+            disconnect.type = "button";
+            disconnect.className = "device-disconnect button-secondary";
+            disconnect.textContent = "Disconnect";
+            disconnect.hidden = true;
+            disconnect.disabled = true;
+            disconnect.setAttribute("aria-label",
+                "Disconnect " + (device.name || "(unknown)") + " " + deviceAddress);
+            disconnect.addEventListener("click", function () {
+                requestDisconnect(deviceAddress);
+            });
+            actions.appendChild(disconnect);
+            row.appendChild(actions);
             body.appendChild(row);
         });
         table.appendChild(body);
@@ -538,7 +865,32 @@
         }
     });
     document.getElementById("simBtn").addEventListener("click", function () { openRide(true, false); });
+    document.getElementById("ergBtn").addEventListener("click", function () {
+        if (!ws || ws.readyState !== WebSocket.OPEN || !ergAvailable || ergPending) return;
+        ergPending = true;
+        this.disabled = true;
+        setLive(document.getElementById("ergStatus"), "Changing ERG mode...", "working");
+        try {
+            ws.send(JSON.stringify({action: "set_erg", enabled: !ergEnabled}));
+        } catch (e) {
+            ergPending = false;
+            applyErgState(ergAvailable, ergEnabled);
+            setLive(document.getElementById("ergStatus"),
+                "Unable to change ERG mode. Check the connection and try again.", "failure");
+            playCue("failure");
+        }
+    });
+    document.getElementById("chartFullscreenBtn").addEventListener("click", function () {
+        if (chartIsFullscreen()) exitChartFullscreen();
+        else enterChartFullscreen();
+    });
+    document.addEventListener("fullscreenchange", updateChartFullscreenState);
+    document.addEventListener("webkitfullscreenchange", updateChartFullscreenState);
+    document.addEventListener("keydown", function (event) {
+        if (event.key === "Escape" && chartIsFullscreen()) exitChartFullscreen();
+    });
     document.getElementById("stopBtn").addEventListener("click", function () {
+        queuedOpen = null;
         if (ws) { try { ws.close(); } catch (e) {} }
         setRideState("idle");
     });

@@ -367,8 +367,15 @@ button.danger.link-btn { border: none; color: var(--alert); }
 .connection-badge:empty { display: none; }
 .device-connected { background: rgba(67, 160, 71, 0.12); }
 .device-connected .connection-badge, .status-success { color: #7bd88f; }
+.device-actions { white-space: nowrap; }
+.device-disconnect { padding: 0.35rem 0.65rem; font-size: 0.78rem; }
+.device-disconnect[hidden] { display: none; }
+.device-disconnect:disabled, .ride-live-controls button:disabled {
+    opacity: 0.55; cursor: not-allowed; filter: none;
+}
 .status-failure { color: #ff7b72; }
 .status-working { color: var(--accent); }
+.scan-feedback { min-height: 1.5rem; margin: -0.35rem 0 0.25rem; }
 .scan-busy { display: inline-flex; align-items: center; gap: 0.4rem; color: var(--muted); }
 .scan-busy[hidden] { display: none; }
 .spinner { width: 0.9rem; height: 0.9rem; border: 2px solid #2a333d;
@@ -376,9 +383,55 @@ button.danger.link-btn { border: none; color: var(--alert); }
 @keyframes ride-spin { to { transform: rotate(360deg); } }
 .ride-workout { background: #10161d; border-left: 3px solid var(--accent);
     border-radius: 4px; padding: 0.65rem 0.8rem; margin-bottom: 0.8rem; }
-.ride-chart-block { position: relative; min-height: 280px; background: var(--panel);
+.ride-live-controls { display: flex; align-items: center; gap: 0.75rem; flex-wrap: wrap;
+    margin: 0.75rem 0; }
+.ride-live-controls .hint { margin: 0; }
+.ride-live-controls .erg-toggle.erg-on { background: var(--ok); color: #10161d; }
+.ride-chart-block { position: relative; min-height: 320px; background: var(--panel);
     border-radius: 8px; padding: 0.8rem; margin-top: 1rem; }
-.ride-chart-block canvas { width: 100% !important; height: 230px !important; }
+.ride-chart-heading { display: flex; align-items: center; justify-content: space-between;
+    gap: 1rem; margin-bottom: 0.35rem; }
+.ride-chart-heading h3 { margin: 0; }
+.ride-chart-heading button { white-space: nowrap; }
+.ride-chart-canvas { position: relative; height: 260px; min-height: 0; }
+.ride-chart-block canvas { width: 100% !important; height: 100% !important; position: relative;
+    z-index: 1; }
+.ride-chart-metrics { position: absolute; z-index: 2; top: 2.25rem; left: 50%;
+    transform: translateX(-50%); display: flex; align-items: baseline; justify-content: center;
+    gap: clamp(1rem, 5vw, 4rem); width: min(80%, 680px); pointer-events: none;
+    color: rgba(232, 237, 243, 0.78); text-shadow: 0 1px 5px #10161d, 0 0 12px #10161d; }
+.ride-chart-metrics span { display: inline-flex; align-items: baseline; gap: 0.25rem; }
+.ride-chart-metrics strong { font-size: 28px; line-height: 1; font-variant-numeric: tabular-nums;
+    color: inherit; }
+.ride-chart-metrics small { font-size: 0.8rem; font-weight: 700; text-transform: uppercase; }
+.ride-chart-metrics .metric-power { color: #ffd166; }
+.ride-chart-metrics .metric-cadence { color: #57c7ff; }
+.ride-chart-metrics .metric-heart-rate { color: #ff4d8d; }
+.ride-chart-block:fullscreen, .ride-chart-block:-webkit-full-screen,
+.ride-chart-block.ride-chart-fullscreen-fallback {
+    width: 100%; height: 100%; max-width: none; margin: 0; border-radius: 0;
+    padding: clamp(0.75rem, 2vw, 1.5rem); background: #10161d;
+}
+.ride-chart-block.ride-chart-fullscreen-fallback {
+    position: fixed; inset: 0; z-index: 1000;
+}
+.ride-chart-block:fullscreen .ride-chart-canvas,
+.ride-chart-block:-webkit-full-screen .ride-chart-canvas,
+.ride-chart-block.ride-chart-fullscreen-fallback .ride-chart-canvas {
+    height: calc(100vh - 5.5rem);
+}
+.ride-chart-block:fullscreen .ride-chart-metrics strong,
+.ride-chart-block:-webkit-full-screen .ride-chart-metrics strong,
+.ride-chart-block.ride-chart-fullscreen-fallback .ride-chart-metrics strong {
+    font-size: clamp(28px, 4vw, 54px);
+}
+body.ride-chart-fullscreen-open { overflow: hidden; }
+@media (max-width: 560px) {
+    .ride-chart-heading { align-items: flex-start; }
+    .ride-chart-metrics { top: 2rem; gap: 0.8rem; width: 86%; }
+    .ride-chart-metrics strong { font-size: 24px; }
+    .ride-chart-metrics small { font-size: 0.68rem; }
+}
 .ride-live { margin-top: 1rem; }
 .progress-wrap { background: #10161d; border: 1px solid #2a333d; border-radius: 6px;
     height: 16px; overflow: hidden; margin: 0.75rem 0; }
