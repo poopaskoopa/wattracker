@@ -74,15 +74,17 @@ def cadence_from_cranks(
     """Compute cadence (rpm) from two consecutive crank samples.
 
     ``time`` is the last-crank-event-time in 1/1024s units (both uint16, so they
-    wrap). Returns None when either sample lacks crank data; 0.0 when the crank
-    hasn't turned (no time delta).
+    wrap). Returns None when either sample lacks crank data or the event time is
+    unchanged, since repeated power notifications often carry the same last
+    crank event and do not represent a new cadence observation. A new event
+    time with no additional revolutions returns 0.0.
     """
     if None in (prev_revs, prev_time, revs, time):
         return None
     d_revs = (revs - prev_revs) & 0xFFFF
     d_time = (time - prev_time) & 0xFFFF
     if d_time == 0:
-        return 0.0
+        return None
     return d_revs * resolution * 60.0 / d_time
 
 

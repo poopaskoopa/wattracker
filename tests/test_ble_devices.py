@@ -58,6 +58,40 @@ def test_bleak_power_and_cadence_expire_by_monotonic_age(monkeypatch):
     assert source.latest_cadence() is None
 
 
+def test_bleak_power_duplicates_hold_cadence_without_refreshing_it(monkeypatch):
+    now = [100.0]
+    monkeypatch.setattr(devices.time, "monotonic", lambda: now[0])
+    source = devices.BleakPowerSource(object(), stale_after_s=3)
+
+    def measurement(power, revs, event_time):
+        return bytearray(
+            b"\x20\x00"
+            + int(power).to_bytes(2, "little", signed=True)
+            + int(revs).to_bytes(2, "little")
+            + int(event_time).to_bytes(2, "little")
+        )
+
+    source._on_notify(None, measurement(150, 10, 1000))
+    now[0] = 100.5
+    source._on_notify(None, measurement(155, 11, 1878))
+    assert source.latest_cadence() == pytest.approx(70.0, abs=0.1)
+
+    now[0] = 101.0
+    source._on_notify(None, measurement(160, 11, 1878))
+    assert source.latest_power() == 160
+    assert source.latest_cadence() == pytest.approx(70.0, abs=0.1)
+
+    now[0] = 101.5
+    source._on_notify(None, measurement(165, 12, 2756))
+    assert source.latest_cadence() == pytest.approx(70.0, abs=0.1)
+
+    now[0] = 103.0
+    source._on_notify(None, measurement(170, 12, 2756))
+    now[0] = 104.51
+    assert source.latest_power() == 170
+    assert source.latest_cadence() is None
+
+
 def test_bleak_heart_rate_expires_by_monotonic_age(monkeypatch):
     now = [50.0]
     monkeypatch.setattr(devices.time, "monotonic", lambda: now[0])

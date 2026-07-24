@@ -225,7 +225,11 @@ class BleakPowerSource(PowerSource):
             if cad is not None:
                 self._cadence = cad
                 self._cadence_updated_at = time.monotonic()
-            self._prev_revs, self._prev_time = revs, event_time
+            # A Cycling Power sensor may emit power notifications faster than
+            # new crank events occur. Repeated event data is not a zero-rpm
+            # observation and must not refresh cadence freshness.
+            if self._prev_time is None or event_time != self._prev_time:
+                self._prev_revs, self._prev_time = revs, event_time
 
     def latest_power(self) -> Optional[int]:
         if (
