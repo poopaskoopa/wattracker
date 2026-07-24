@@ -58,8 +58,23 @@ def test_cadence_handles_uint16_wraparound():
     assert p.cadence_from_cranks(0, 65000, 1, 488) == pytest.approx(60.0)
 
 
-def test_cadence_zero_when_no_delta():
-    assert p.cadence_from_cranks(5, 1000, 5, 1000) == 0.0
+def test_cadence_handles_crank_revolution_wraparound():
+    assert p.cadence_from_cranks(65535, 65000, 0, 488) == pytest.approx(60.0)
+
+
+def test_cadence_none_for_duplicate_crank_event():
+    assert p.cadence_from_cranks(5, 1000, 5, 1000) is None
+
+
+def test_cadence_zero_for_new_event_without_revolution():
+    assert p.cadence_from_cranks(5, 1000, 5, 1100) == 0.0
+
+
+def test_cadence_approximately_70rpm():
+    # One revolution per 878 ticks is 69.98 rpm.
+    assert p.cadence_from_cranks(10, 1000, 11, 1878) == pytest.approx(
+        70.0, abs=0.1
+    )
 
 
 def test_cadence_none_without_prev():
