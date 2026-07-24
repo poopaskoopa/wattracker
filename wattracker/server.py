@@ -7,6 +7,7 @@ import datetime as _dt
 import hashlib
 import io
 import logging
+import math as _math
 import os
 import sys
 import threading
@@ -38,7 +39,14 @@ from .prescribe import adapt as adaptmod
 from .prescribe import plan as planmod
 from .prescribe import zwo
 from .prescribe import llm
-from .prescribe.planner import build_workout, plan_workout
+from .prescribe.planner import (
+    JUST_RIDE_DURATIONS,
+    WORKOUT_TYPE_INFO,
+    WORKOUT_TYPE_KEYS,
+    build_workout,
+    plan_workout,
+    workout_type_info,
+)
 
 DAY_LABELS = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
 
@@ -1453,23 +1461,51 @@ def create_app() -> FastAPI:
         out.sort(key=lambda w: w["date"])
         return out[:limit]
 
+    def _validate_just_ride(wtype, minutes):
+        """Validate an ad-hoc (Just Ride) type/duration pair.
+
+        Returns (kind, whole minutes). Raises ValueError on an unknown kind, a
+        non-numeric/non-finite duration, or a duration that is not one of the
+        offered JUST_RIDE_DURATIONS (30-240 minutes in 15-minute steps).
+        """
+        kind = str(wtype or "").strip()
+        if kind not in WORKOUT_TYPE_KEYS:
+            raise ValueError(f"unknown workout type: {kind or '(missing)'}")
+        if minutes is None or str(minutes).strip() == "":
+            raise ValueError("duration is required")
+        try:
+            raw = float(minutes)
+        except (TypeError, ValueError, OverflowError):
+            raise ValueError(f"invalid duration: {minutes}")
+        if not _math.isfinite(raw):
+            raise ValueError(f"invalid duration: {minutes}")
+        try:
+            mins = int(round(raw))
+        except (TypeError, ValueError, OverflowError):
+            raise ValueError(f"invalid duration: {minutes}")
+        if mins not in JUST_RIDE_DURATIONS:
+            raise ValueError(
+                f"duration must be between {JUST_RIDE_DURATIONS[0]} and "
+                f"{JUST_RIDE_DURATIONS[-1]} minutes, in 15-minute steps"
+            )
+        return kind, mins
+
     def _ride_session(uid, workout_id=None, wtype=None, minutes=None):
-        """Build the Session to ride, from a plan workout or an ad-hoc type/duration."""
+        """Build the Session to ride, from a plan workout or an ad-hoc type/duration.
+
+        An explicit ad-hoc type that is invalid (or cannot be built) raises
+        ValueError - the caller reports it rather than silently riding something
+        else. Only the no-type-at-all case falls back to the default ride.
+        """
         if workout_id:
             w = db.get_plan_workout(uid, int(workout_id))
             if w:
                 return build_workout(w["type"], max(1, w["duration_s"] / 60),
                                      w.get("variant")), w["name"]
         if wtype:
-            try:
-                mins = float(minutes) if minutes else 45
-            except (TypeError, ValueError):
-                mins = 45
-            try:
-                s = build_workout(wtype, max(20, mins))
-                return s, s.name
-            except ValueError:
-                pass
+            kind, mins = _validate_just_ride(wtype, minutes)
+            s = build_workout(kind, mins)
+            return s, s.name
         s = build_workout("endurance", 45)
         return s, s.name
 
@@ -1493,6 +1529,79 @@ def create_app() -> FastAPI:
             "profile": profile,
         }
 
+    def _watts(fraction, ftp: float) -> Optional[int]:
+        return None if fraction is None else int(round(float(fraction) * ftp))
+
+    def _preview_segments(session, ftp: float) -> List[dict]:
+        """Human-readable per-segment breakdown with watt ranges."""
+        rows: List[dict] = []
+        for seg in session.segments:
+            if seg.kind == "intervals" and seg.repeat:
+                on_s = int(seg.on_duration or 0)
+                off_s = int(seg.off_duration or 0)
+                rows.append({
+                    "label": (
+                        f"{seg.repeat} x {_fmt_clock(on_s)} on / "
+                        f"{_fmt_clock(off_s)} easy"
+                    ),
+                    "duration_s": seg.duration,
+                    "watts_low": _watts(seg.off_power, ftp),
+                    "watts_high": _watts(seg.on_power, ftp),
+                    "on_watts": _watts(seg.on_power, ftp),
+                    "off_watts": _watts(seg.off_power, ftp),
+                    "text": seg.text,
+                })
+                continue
+            if seg.kind in ("warmup", "cooldown"):
+                lo = _watts(seg.power_low, ftp)
+                hi = _watts(seg.power_high, ftp)
+                if lo is not None and hi is not None and lo > hi:
+                    lo, hi = hi, lo
+                label = "Warmup ramp" if seg.kind == "warmup" else "Cooldown"
+            else:
+                lo = hi = _watts(seg.power, ftp)
+                label = "Steady block" if seg.kind == "steadystate" else seg.kind
+            rows.append({
+                "label": label,
+                "duration_s": seg.duration,
+                "watts_low": lo,
+                "watts_high": hi,
+                "on_watts": None,
+                "off_watts": None,
+                "text": seg.text,
+            })
+        return rows
+
+    def _fmt_clock(seconds: int) -> str:
+        seconds = int(seconds or 0)
+        if seconds < 60:
+            return f"{seconds}s"
+        minutes, secs = divmod(seconds, 60)
+        return f"{minutes}min" if not secs else f"{minutes}min {secs}s"
+
+    @app.get("/ride/workout/preview")
+    def ride_workout_preview(request: Request, type: str = "", minutes: str = ""):
+        uid = _uid(request)
+        try:
+            kind, mins = _validate_just_ride(type, minutes)
+            session = build_workout(kind, mins)
+        except (ValueError, OverflowError) as e:
+            return JSONResponse({"error": str(e)}, status_code=400)
+        ftp = importer.current_ftp(uid)
+        payload = _ride_workout_payload(session, ftp)
+        info = workout_type_info(kind) or {}
+        info["low_watts"] = _watts(info.get("low"), ftp)
+        info["high_watts"] = _watts(info.get("high"), ftp)
+        info["work_watts"] = _watts(info.get("work"), ftp)
+        payload.update({
+            "description": session.description,
+            "workout_type": session.workout_type,
+            "estimated_tss": session.estimated_tss,
+            "type_info": info,
+            "segments": _preview_segments(session, ftp),
+        })
+        return JSONResponse(payload)
+
     @app.get("/ride", response_class=HTMLResponse)
     def ride_page(request: Request):
         uid = _uid(request)
@@ -1505,6 +1614,8 @@ def create_app() -> FastAPI:
                 ble_available=available,
                 ble_reason=reason,
                 workouts=_upcoming_plan_workouts(uid),
+                ride_types=WORKOUT_TYPE_INFO,
+                ride_durations=JUST_RIDE_DURATIONS,
                 ftp=round(importer.current_ftp(uid), 0),
                 ble_cache_key=f"wattracker.ride.ble.v1.user-{uid}",
             ),
@@ -1668,12 +1779,17 @@ def create_app() -> FastAPI:
             await websocket.send_json({"status": "error", "error": str(e)})
             await websocket.close()
             return
-        session, ride_name = _ride_session(
-            uid,
-            workout_id=params.get("workout_id"),
-            wtype=params.get("type"),
-            minutes=params.get("minutes"),
-        )
+        try:
+            session, ride_name = _ride_session(
+                uid,
+                workout_id=params.get("workout_id"),
+                wtype=params.get("type"),
+                minutes=params.get("minutes"),
+            )
+        except (ValueError, OverflowError) as e:
+            await websocket.send_json({"status": "error", "error": str(e)})
+            await websocket.close()
+            return
         ftp = importer.current_ftp(uid)
         workout_payload = _ride_workout_payload(session, ftp, ride_name)
         await websocket.send_json({"status": "workout", "workout": workout_payload})

@@ -358,6 +358,15 @@ button.danger.link-btn { border: none; color: var(--alert); }
 /* Ride */
 .ride-setup { margin: 1rem 0; }
 .ride-setup select { margin-left: 0.5rem; }
+.ride-mode { margin-bottom: 0.5rem; }
+.ride-mode label { display: inline-block; margin-right: 1rem; }
+.ride-preview { background: var(--panel); border-radius: 8px;
+    padding: 0.8rem; margin-bottom: 0.8rem; }
+.ride-preview[hidden] { display: none; }
+.ride-preview h3 { margin: 0 0 0.35rem; }
+.ride-preview table { width: 100%; margin: 0.5rem 0 0; }
+.ride-preview-meta { margin: 0; color: var(--accent); }
+.ride-preview-this { margin: 0.35rem 0 0; font-size: 0.85rem; }
 .device-list table { margin: 0.5rem 0; }
 .device-address { display: block; color: var(--muted); overflow-wrap: anywhere; }
 .device-role { display: inline-block; margin: 0.15rem 0.7rem 0.15rem 0; white-space: nowrap; }
