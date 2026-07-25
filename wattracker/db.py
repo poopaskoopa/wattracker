@@ -13,14 +13,14 @@ import logging
 import os
 import sqlite3
 import zlib
-from typing import Dict, List, Optional
+from typing import Callable, Dict, List, Optional, Sequence, Union
 
 from .config import db_path
 from .config import _restrict
 
 _log = logging.getLogger(__name__)
 
-SCHEMA_VERSION = 18
+SCHEMA_VERSION = 19
 
 
 def _restrict_db_files(path: str) -> None:
@@ -34,11 +34,52 @@ def _restrict_db_files(path: str) -> None:
     for p in (path, path + "-wal", path + "-shm"):
         _restrict(p, 0o600, is_dir=False)
 
+# In-app rides are named "Ride <ISO date> <workout name>" (ble/runner.py);
+# imported rows carry the .fit file's basename. The distinction is what tells
+# the two sources apart in SQL (the '_' are LIKE single-char wildcards).
+IN_APP_FILENAME_SQL = "filename LIKE 'Ride ____-__-__ %' AND filename NOT LIKE '%.fit'"
+
+
+def _backfill_inapp_utc(conn: sqlite3.Connection) -> None:
+    """v18 -> v19: rewrite in-app rides' naive-local start_time as naive UTC.
+
+    Until v19 an in-app ride stored ``datetime.now()`` (local) while an
+    imported .fit stored UTC, so the same ride recorded by both landed hours
+    apart. One UPDATE fixes every historical row: a CASE over the local
+    timezone's offset ranges picks the offset that was actually in force at
+    each timestamp (so historical DST is honored), and every row is shifted
+    exactly once regardless of statement ordering.
+    """
+    from .timeutil import local_offset_ranges
+
+    now = _dt.datetime.now()
+    ranges = local_offset_ranges(
+        _dt.datetime(2000, 1, 1), now + _dt.timedelta(days=366)
+    )
+    case = "CASE "
+    prev = ranges[0][1]
+    for boundary, offset in ranges[1:]:
+        case += f"WHEN start_time < '{boundary.isoformat()}' THEN {-prev} "
+        prev = offset
+    case += f"ELSE {-prev} END"
+    conn.execute(
+        # COALESCE keeps an unparseable timestamp as-is instead of nulling it;
+        # substr(...,20) carries the original fractional seconds across, since
+        # strftime would truncate them to milliseconds.
+        "UPDATE activities SET start_time = COALESCE("
+        f"strftime('%Y-%m-%dT%H:%M:%S', start_time, printf('%+d seconds', {case}))"
+        " || substr(start_time, 20), start_time) "
+        f"WHERE start_time IS NOT NULL AND {IN_APP_FILENAME_SQL}"
+    )
+
+
 # In-place migrations: version N -> N+1 statement lists. A database whose
 # version has an unbroken chain here is upgraded without losing live data.
 # (Brand-new tables need no ALTERs - init_db runs _SCHEMA after migrating - but
 # each version still needs an entry, even an empty list, to keep the chain.)
-_MIGRATIONS: Dict[int, List[str]] = {
+# An entry may also be a callable taking the open connection, for a migration
+# whose SQL has to be computed (see _backfill_inapp_utc).
+_MIGRATIONS: Dict[int, Sequence[Union[str, Callable[[sqlite3.Connection], None]]]] = {
     3: [
         "ALTER TABLE plan_workouts ADD COLUMN completed_activity_id INTEGER",
         "ALTER TABLE plan_workouts ADD COLUMN completed_date TEXT",
@@ -96,6 +137,10 @@ _MIGRATIONS: Dict[int, List[str]] = {
     17: [
         "ALTER TABLE activities ADD COLUMN rpe INTEGER",
     ],
+    18: [
+        "ALTER TABLE activities ADD COLUMN duplicate_of INTEGER",
+        _backfill_inapp_utc,
+    ],
 }
 
 _DROP = """
@@ -148,12 +193,15 @@ CREATE TABLE IF NOT EXISTS activities (
     if_         REAL,
     tss         REAL,
     rpe         INTEGER,
+    duplicate_of INTEGER,
     streams     BLOB,
     UNIQUE(user_id, dedup_hash),
     FOREIGN KEY(user_id) REFERENCES users(id)
 );
 CREATE INDEX IF NOT EXISTS idx_activities_user_start
     ON activities(user_id, start_time);
+CREATE INDEX IF NOT EXISTS idx_activities_duplicate_of
+    ON activities(user_id, duplicate_of);
 
 CREATE TABLE IF NOT EXISTS ftp_history (
     user_id    INTEGER NOT NULL,
@@ -357,13 +405,17 @@ def init_db(path: Optional[str] = None) -> None:
             for v in range(version, SCHEMA_VERSION):
                 for stmt in _MIGRATIONS[v]:
                     try:
-                        conn.execute(stmt)
+                        if callable(stmt):
+                            stmt(conn)
+                        else:
+                            conn.execute(stmt)
                     except sqlite3.OperationalError as e:
-                        # A later migration may target a table the older
-                        # database never had (_SCHEMA below creates it in its
-                        # final shape) or a column that already exists.
+                        # A later migration may target a table or column the
+                        # older database never had (_SCHEMA below creates it in
+                        # its final shape) or a column that already exists.
                         msg = str(e).lower()
-                        if "no such table" in msg or "duplicate column" in msg:
+                        if ("no such table" in msg or "duplicate column" in msg
+                                or "no such column" in msg):
                             continue
                         raise
             conn.executescript(_SCHEMA)  # new tables/indexes, if any
@@ -667,14 +719,22 @@ def _row_summary(row: sqlite3.Row) -> dict:
         "if_": row["if_"],
         "tss": row["tss"],
         "rpe": row["rpe"],
+        "duplicate_of": row["duplicate_of"],
     }
+
+
+# A ride recorded twice (in-app and by Zwift) keeps both rows, but the
+# secondary carries duplicate_of = <primary id> and must never be listed or
+# summed a second time. Every aggregation over activities filters on this.
+_NOT_DUPLICATE = "duplicate_of IS NULL"
 
 
 def list_activities(user_id: int, path: Optional[str] = None) -> List[dict]:
     conn = connect(path)
     try:
         rows = conn.execute(
-            "SELECT * FROM activities WHERE user_id = ? ORDER BY start_time DESC",
+            f"SELECT * FROM activities WHERE user_id = ? AND {_NOT_DUPLICATE} "
+            "ORDER BY start_time DESC",
             (user_id,),
         ).fetchall()
         return [_row_summary(r) for r in rows]
@@ -704,7 +764,8 @@ def recent_power_streams(user_id: int, days: int = 90, path: Optional[str] = Non
     try:
         rows = conn.execute(
             "SELECT streams FROM activities "
-            "WHERE user_id = ? AND start_time >= ? ORDER BY start_time",
+            f"WHERE user_id = ? AND start_time >= ? AND {_NOT_DUPLICATE} "
+            "ORDER BY start_time",
             (user_id, cutoff),
         ).fetchall()
         out: List[List[float]] = []
@@ -722,7 +783,7 @@ def daily_tss(user_id: int, path: Optional[str] = None) -> Dict[_dt.date, float]
     try:
         rows = conn.execute(
             "SELECT start_time, tss FROM activities "
-            "WHERE user_id = ? AND start_time IS NOT NULL",
+            f"WHERE user_id = ? AND start_time IS NOT NULL AND {_NOT_DUPLICATE}",
             (user_id,),
         ).fetchall()
         out: Dict[_dt.date, float] = {}
@@ -764,6 +825,7 @@ def weekly_volume(user_id: int, path: Optional[str] = None) -> List[dict]:
                             ELSE 0 END)                          AS calories
             FROM activities
             WHERE user_id = ? AND start_time IS NOT NULL
+              AND duplicate_of IS NULL
             GROUP BY week_start
             ORDER BY week_start ASC
             """,
@@ -787,7 +849,8 @@ def full_activities(user_id: int, path: Optional[str] = None) -> List[dict]:
     conn = connect(path)
     try:
         rows = conn.execute(
-            "SELECT * FROM activities WHERE user_id = ? ORDER BY start_time",
+            f"SELECT * FROM activities WHERE user_id = ? AND {_NOT_DUPLICATE} "
+            "ORDER BY start_time",
             (user_id,),
         ).fetchall()
         out = []
@@ -815,7 +878,8 @@ def recent_full_activities(
     try:
         rows = conn.execute(
             "SELECT * FROM activities "
-            "WHERE user_id = ? AND start_time >= ? ORDER BY start_time",
+            f"WHERE user_id = ? AND start_time >= ? AND {_NOT_DUPLICATE} "
+            "ORDER BY start_time",
             (user_id, cutoff),
         ).fetchall()
         out = []
@@ -824,6 +888,110 @@ def recent_full_activities(
             d["streams"] = _unpack_streams(r["streams"])
             out.append(d)
         return out
+    finally:
+        conn.close()
+
+
+# ------------------------------------------------- cross-source duplicates
+def activities_for_matching(
+    user_id: int,
+    lo: Optional[str] = None,
+    hi: Optional[str] = None,
+    path: Optional[str] = None,
+) -> List[dict]:
+    """Summaries in a start_time window, INCLUDING rows already marked duplicate.
+
+    Duplicate detection is the one reader that must see every row: filtering
+    linked secondaries out here would make re-linking and repair impossible.
+    """
+    sql = "SELECT * FROM activities WHERE user_id = ? AND start_time IS NOT NULL"
+    args: List = [user_id]
+    if lo is not None:
+        sql += " AND start_time >= ?"
+        args.append(lo)
+    if hi is not None:
+        sql += " AND start_time <= ?"
+        args.append(hi)
+    conn = connect(path)
+    try:
+        rows = conn.execute(sql + " ORDER BY start_time ASC", args).fetchall()
+        return [_row_summary(r) for r in rows]
+    finally:
+        conn.close()
+
+
+def set_duplicate_of(
+    user_id: int, activity_id: int, primary_id: int, path: Optional[str] = None
+) -> bool:
+    """Mark ``activity_id`` as a duplicate of ``primary_id`` (same user).
+
+    Refuses to build chains: the row must not already be a duplicate or be some
+    other row's primary, and the primary must not itself be a duplicate.
+    """
+    if activity_id == primary_id:
+        return False
+    conn = connect(path)
+    try:
+        cur = conn.execute(
+            "UPDATE activities SET duplicate_of = ? "
+            "WHERE user_id = ? AND id = ? AND duplicate_of IS NULL "
+            "AND EXISTS (SELECT 1 FROM activities WHERE user_id = ? AND id = ? "
+            "            AND duplicate_of IS NULL) "
+            "AND NOT EXISTS (SELECT 1 FROM activities WHERE user_id = ? "
+            "                AND duplicate_of = ?)",
+            (primary_id, user_id, activity_id, user_id, primary_id,
+             user_id, activity_id),
+        )
+        conn.commit()
+        return cur.rowcount > 0
+    finally:
+        conn.close()
+
+
+def primaries_with_duplicates(user_id: int, path: Optional[str] = None) -> set:
+    """Ids of activities that have at least one linked duplicate."""
+    conn = connect(path)
+    try:
+        rows = conn.execute(
+            "SELECT DISTINCT duplicate_of FROM activities "
+            "WHERE user_id = ? AND duplicate_of IS NOT NULL",
+            (user_id,),
+        ).fetchall()
+        return {r[0] for r in rows}
+    finally:
+        conn.close()
+
+
+def repoint_completed_activity(
+    user_id: int, old_id: int, new_id: int, path: Optional[str] = None
+) -> bool:
+    """Move a workout completion from one activity to another.
+
+    Used when a duplicate is linked: whatever the secondary completed has to
+    follow the primary, or the workout would point at a hidden ride. Honors the
+    "an activity is consumed by only one workout" invariant - if the target is
+    already consumed, the link stays where it is.
+    """
+    if old_id == new_id:
+        return False
+    conn = connect(path)
+    try:
+        guard = (
+            " AND NOT EXISTS (SELECT 1 FROM plan_workouts WHERE user_id = ? "
+            "                 AND completed_activity_id = ?)"
+            " AND NOT EXISTS (SELECT 1 FROM standalone_workouts WHERE user_id = ? "
+            "                 AND completed_activity_id = ?)"
+        )
+        moved = 0
+        for table in ("plan_workouts", "standalone_workouts"):
+            cur = conn.execute(
+                f"UPDATE {table} SET completed_activity_id = ? "
+                "WHERE user_id = ? AND completed_activity_id = ?" + guard,
+                (new_id, user_id, old_id, user_id, new_id, user_id, new_id),
+            )
+            moved += cur.rowcount
+        conn.commit()
+        return moved > 0
     finally:
         conn.close()
 
@@ -1524,8 +1692,8 @@ def activities_on_date(
     conn = connect(path)
     try:
         rows = conn.execute(
-            "SELECT * FROM activities WHERE user_id = ? AND start_time LIKE ? "
-            "ORDER BY start_time ASC",
+            f"SELECT * FROM activities WHERE user_id = ? AND start_time LIKE ? "
+            f"AND {_NOT_DUPLICATE} ORDER BY start_time ASC",
             (user_id, date_iso + "%"),
         ).fetchall()
         return [_row_summary(r) for r in rows]
