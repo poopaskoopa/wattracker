@@ -141,10 +141,12 @@
     var rideChart = null;
     var livePower = [], liveCadence = [], liveHr = [];
     var smoothPower = [], smoothCadence = [], smoothHr = [];
-    // Trailing rolling-mean windows. Power is the noisiest signal (pedal stroke
-    // ripple plus meter jitter) so it gets the longest window; cadence and heart
-    // rate only need enough to take the sawtooth off.
-    var POWER_SMOOTH_S = 10, METRIC_SMOOTH_S = 5;
+    // Trailing rolling-mean windows. 3s power is the head-unit convention
+    // (Garmin/Wahoo/Zwift all default to it): long enough to take out pedal
+    // stroke ripple and meter jitter, short enough that the trace still moves
+    // with the rider when an interval starts. Cadence and heart rate change
+    // more slowly, so a longer window costs nothing there.
+    var POWER_SMOOTH_S = 3, METRIC_SMOOTH_S = 5;
     var powerSmoother = null, cadenceSmoother = null, hrSmoother = null;
     var MAX_CHART_POINTS = 30000;
     var chartPointLimit = MAX_CHART_POINTS;
