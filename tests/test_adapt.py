@@ -8,6 +8,7 @@ import pytest
 from wattracker import db
 from wattracker.analysis.state import TrainingState
 from wattracker.prescribe import adapt
+from wattracker.timeutil import utc_today
 
 NOW = dt.datetime(2026, 7, 10, 9, 0)
 
@@ -174,7 +175,7 @@ def test_dashboard_renders_status_banner(monkeypatch):
             lambda uid: _state(overreach=True, alerts=["Overreach: test reason"]),
         )
         uid = db.get_user_by_username("rider")["id"]
-        date = (dt.date.today() + dt.timedelta(days=2)).isoformat()
+        date = (utc_today() + dt.timedelta(days=2)).isoformat()
         plan_id = db.create_plan(uid, "P", date, 1)
         db.add_plan_workout(plan_id, uid, date, "VO2max Intervals", "vo2max",
                             3600, 60.0, "<x/>")

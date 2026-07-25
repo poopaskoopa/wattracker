@@ -7,7 +7,7 @@ from typing import Dict, List, Optional, Tuple
 import bisect
 
 from .. import db
-from ..timeutil import parse_naive
+from ..timeutil import parse_naive, utc_now
 from ..ingest.importer import current_ftp
 from ..metrics.power import (
     detraining_factor,
@@ -25,7 +25,7 @@ from .state import TrainingState
 def _window_power(
     activities: List[dict], start_days_ago: int, end_days_ago: int
 ) -> List[List[float]]:
-    now = _dt.datetime.now()
+    now = utc_now()
     lo = now - _dt.timedelta(days=start_days_ago)
     hi = now - _dt.timedelta(days=end_days_ago)
     out: List[List[float]] = []
@@ -110,7 +110,7 @@ def _filter_by_months(
     """Keep only series items whose ``date`` falls in the trailing N months."""
     if not months or float(months) <= 0:
         return series
-    now = now or _dt.datetime.now()
+    now = now or utc_now()
     cutoff = now - _dt.timedelta(days=int(round(float(months) * _DAYS_PER_MONTH)))
     out: List[dict] = []
     for item in series:
@@ -218,7 +218,7 @@ def ftp_rolling_series(
     # so skip evaluating the (expensive) estimate for samples outside it. The
     # grid itself is still anchored to ``start`` (identical sample dates).
     if months and float(months) > 0:
-        _now = now or _dt.datetime.now()
+        _now = now or utc_now()
         cutoff = _now - _dt.timedelta(days=int(round(float(months) * _DAYS_PER_MONTH)))
     else:
         cutoff = None

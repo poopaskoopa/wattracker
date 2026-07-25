@@ -25,6 +25,7 @@ from typing import Dict, List, Optional
 
 from .config import app_data_dir, db_path
 from .config import _restrict  # owner-only chmod (POSIX) / ACL (Windows)
+from .timeutil import utc_now
 
 _log = logging.getLogger(__name__)
 
@@ -78,7 +79,7 @@ def create_backup(reason: str, src_path: Optional[str] = None) -> str:
             f"{sorted(RETENTION)}"
         )
     src_path = src_path or db_path()
-    when = _dt.datetime.now()
+    when = utc_now()
     # A same-second collision (e.g. two backups within one second) would
     # otherwise overwrite; bump the timestamp forward a second until the name is
     # free so every backup stays a distinct, pattern-parseable file.
@@ -174,7 +175,7 @@ def create_daily_if_due(
     ``max_age_hours`` is already present. Called from the daily maintenance
     sweep, which may fire more than once a day.
     """
-    now = now or _dt.datetime.now()
+    now = now or utc_now()
     latest = newest_backup("daily")
     if latest is not None:
         age = now - latest["timestamp"]

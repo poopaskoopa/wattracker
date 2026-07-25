@@ -148,6 +148,22 @@ def test_refresh_uses_zwiftpower_when_it_answers(user_id, monkeypatch):
     assert rows[0]["activity_id"] is not None
 
 
+def test_zwiftpower_event_date_epoch_is_interpreted_as_utc():
+    """ZwiftPower's ``event_date`` is a UNIX epoch: read it in UTC.
+
+    Reading it with the local clock dated a race by the rider's wall calendar,
+    so a race at 01:00 UTC landed on the previous day west of Greenwich - and
+    then failed to line up with the UTC-stamped ride imported for it.
+    """
+    epoch = int(
+        dt.datetime(2026, 6, 2, 1, 0, tzinfo=dt.timezone.utc).timestamp()
+    )
+    doc = {"data": [{
+        "event_date": epoch, "event_title": "Midnight-ish", "f_t": "TYPE_RACE",
+    }]}
+    assert races.parse_zwiftpower_profile(doc)[0]["event_date"] == "2026-06-02"
+
+
 def test_parse_hr_and_weight_scalar_string_pair_and_invalid_ranges():
     base = {
         "event_date": int(dt.datetime(2026, 6, 1, 10).timestamp()),

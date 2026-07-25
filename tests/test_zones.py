@@ -120,7 +120,7 @@ def test_hrmax_estimate_requires_sufficient_corroborated_sustained_data():
 def test_hrmax_default_now_uses_utc_naive_fit_clock(monkeypatch):
     # At 03:00 UTC these FIT rides are fresh even though their naive UTC
     # timestamps are later than the prior evening's local wall clock.
-    monkeypatch.setattr(zones, "_utc_naive_now", lambda: dt.datetime(2026, 7, 1, 3))
+    monkeypatch.setattr(zones, "utc_now", lambda: dt.datetime(2026, 7, 1, 3))
     result = zones.estimate_hr_max([
         _hr_ride("2026-07-01T02:00:00", 185),
         _hr_ride("2026-07-01T02:30:00", 188),

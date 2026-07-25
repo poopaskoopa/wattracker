@@ -155,6 +155,85 @@ def test_ride_page_renders_available_when_monkeypatched(client, monkeypatch):
     assert '{action: "set_erg", enabled: !ergEnabled}' in r.text
 
 
+def test_ride_page_plays_countdown_cues_before_block_and_workout_ends(client, monkeypatch):
+    _register(client)
+    monkeypatch.setattr(bledevices, "bluetooth_available", lambda: (True, "ok"))
+    r = client.get("/ride")
+    assert r.status_code == 200
+    # New cue kinds ride on the existing playCue/primeAudio path.
+    assert "function playTone(ctx, frequency, delay, duration)" in r.text
+    assert 'if (kind === "countdown") { playTone(ctx, 660, 0, 0.1); return; }' in r.text
+    assert 'if (kind === "blockChange") { playTone(ctx, 1046, 0, 0.4); return; }' in r.text
+    assert 'if (kind === "workoutEnd") {' in r.text
+    # The end-of-workout motif is three notes, so it is audibly distinct.
+    assert "playTone(ctx, 660, 0, 0.16);" in r.text
+    assert "playTone(ctx, 880, 0.2, 0.16);" in r.text
+    assert "playTone(ctx, 1320, 0.4, 0.5);" in r.text
+    assert "var CUE_LEAD = 3;" in r.text
+    assert "var cuesPlayed = {};" in r.text
+    # Bookkeeping is keyed on the boundary, not on an elapsed equality test.
+    assert "function cueOnce(key, threshold, elapsed, kind)" in r.text
+    assert "if (!(threshold > 0) || elapsed < threshold || cuesPlayed[key]) return;" in r.text
+    assert "cuesPlayed[key] = true;" in r.text
+    assert 'if (elapsed - threshold < 1.5) playCue(kind);' in r.text
+    assert "function updateAudioCues(elapsed)" in r.text
+    assert "if (!(elapsed > 0)) return;" in r.text
+    assert 'cueOnce("block:" + boundary + ":" + n, boundary - n, elapsed, "countdown");' in r.text
+    assert 'cueOnce("block:" + boundary, boundary, elapsed, "blockChange");' in r.text
+    assert 'cueOnce("end:" + n, workoutDuration - n, elapsed, "countdown");' in r.text
+    assert 'cueOnce("end", workoutDuration, elapsed, "workoutEnd");' in r.text
+    # The final block ends with the workout; only the workout-end cue fires.
+    assert "if (boundary <= 0 || (workoutDuration > 0 && boundary >= workoutDuration)) continue;" in r.text
+    assert "updateAudioCues(elapsed);" in r.text
+    # A second ride in the same page session starts from a clean slate.
+    assert "cuesPlayed = {};" in r.text
+
+
+def test_ride_page_grows_chart_axis_past_the_prescribed_end(client, monkeypatch):
+    _register(client)
+    monkeypatch.setattr(bledevices, "bluetooth_available", lambda: (True, "ok"))
+    r = client.get("/ride")
+    assert r.status_code == 200
+    assert "var chartMaxX = 0;" in r.text
+    assert "chartMaxX = workoutDuration;" in r.text
+    assert "function growChartAxis(elapsed)" in r.text
+    assert "if (!rideChart || !(elapsed > chartMaxX)) return;" in r.text
+    assert "chartMaxX = Math.ceil(elapsed / 60) * 60;" in r.text
+    assert "if (chartMaxX <= elapsed) chartMaxX = elapsed + 60;" in r.text
+    assert "rideChart.options.scales.x.max = chartMaxX;" in r.text
+    assert "growChartAxis(elapsed);" in r.text
+    assert r.text.index("growChartAxis(elapsed);") < r.text.index('rideChart.update("none");')
+
+
+def test_ride_page_end_workout_button_reuses_the_stop_path(client, monkeypatch):
+    _register(client)
+    monkeypatch.setattr(bledevices, "bluetooth_available", lambda: (True, "ok"))
+    r = client.get("/ride")
+    assert r.status_code == 200
+    assert 'id="endWorkoutBtn"' in r.text
+    assert 'class="button-secondary ride-chart-end"' in r.text
+    assert "End workout now" in r.text
+    # Real button, in the heading rather than the aria-hidden canvas overlays.
+    assert r.text.index('id="endWorkoutBtn"') < r.text.index('class="ride-chart-canvas"')
+    assert '<div class="ride-chart-actions">' in r.text
+    # Disabled until a ride is active, exactly like #stopBtn.
+    assert 'document.getElementById("endWorkoutBtn").disabled = !active;' in r.text
+    # One stop code path, shared with #stopBtn.
+    assert "function stopRide() {" in r.text
+    assert 'document.getElementById("stopBtn").addEventListener("click", stopRide);' in r.text
+    assert "End the workout now? The rest of the workout is discarded." in r.text
+    assert "if (!window.confirm(" in r.text
+    assert "stopRide();" in r.text
+
+
+def test_ride_chart_end_button_styles(client):
+    r = client.get("/static/style.css")
+    assert r.status_code == 200
+    assert ".ride-chart-actions { display: flex;" in r.text
+    assert ".ride-chart-heading .ride-chart-end { border-color: var(--alert); color: var(--alert); }" in r.text
+    assert ".ride-chart-heading .ride-chart-end:disabled" in r.text
+
+
 def test_ride_chart_styles_support_live_metrics_and_fullscreen(client):
     r = client.get("/static/style.css")
     assert r.status_code == 200
@@ -1138,3 +1217,67 @@ def test_ride_ws_close_during_start_countdown_never_saves_activity(
     assert db.list_activities(uid) == []
     assert trainer.commands[-1] == "stop"
     assert ble_client.disconnected is True
+
+
+def test_ride_ws_keeps_streaming_after_the_workout_then_finishes_on_stop_pedalling(
+    client, monkeypatch
+):
+    """The prescribed workout ending starts a cooldown, not a finish: telemetry
+    keeps flowing (and ERG keeps its target) until the rider stops pedalling."""
+    from wattracker.ble.devices import SimulatedTrainer
+
+    _register(client)
+    uid = db.get_user_by_username("rider")["id"]
+    plan_id = db.create_plan(uid, "Short ride", "2026-07-10", 1)
+    workout_id = db.add_plan_workout(
+        plan_id, uid, "2026-07-10", "One minute", "endurance", 60, 1.0, "<x/>"
+    )
+    trainer = SimulatedTrainer()
+    trainer.start_erg()
+    # 3s start gate, then long enough to finish the 60s workout and spin down.
+    _patch_real_ride(monkeypatch, trainer, [150] * 90 + [0] * 5)
+
+    frames = []
+    with client.websocket_connect(f"/ride/ws?workout_id={workout_id}") as ws:
+        assert _receive_after_workout(ws)["status"] == "connected"
+        try:
+            while True:
+                frames.append(ws.receive_json())
+        except Exception:
+            pass
+
+    states = [f for f in frames if "status" in f and "elapsed" in f]
+    cooldown = [f for f in states if f["status"] == "cooldown"]
+    assert cooldown, "expected a cooldown phase past the prescribed end"
+    total = cooldown[0]["total"]
+    assert cooldown[0]["elapsed"] >= total
+    # Readings past the end keep streaming, charting past the workout duration.
+    assert cooldown[-1]["elapsed"] > total
+    assert all(f["progress"] == 1.0 for f in cooldown)
+    # ERG kept its (final prescribed) target during the cooldown, and the ride
+    # ended only once power read zero for the grace period.
+    assert all(f["target_watts"] > 0 for f in cooldown)
+    assert cooldown[-1]["finish_countdown"] > 0
+    assert states[-1]["status"] == "finished"
+    assert states[-1]["elapsed"] > total
+    assert trainer.targets[-1] == 0
+    # The server keeps commanding the trainer through the cooldown, so it does
+    # not drop out of ERG: more positive writes than prescribed workout seconds.
+    assert len([t for t in trainer.targets if t > 0]) >= total + 20
+    acts = db.list_activities(uid)
+    assert len(acts) == 1
+    assert acts[0]["duration_s"] > total  # the spin-down is part of the ride
+
+
+def test_ride_page_treats_the_cooldown_as_an_active_ride(client, monkeypatch):
+    _register(client)
+    monkeypatch.setattr(bledevices, "bluetooth_available", lambda: (True, "ok"))
+    r = client.get("/ride")
+    assert r.status_code == 200
+    assert ('["starting", "running", "paused", "cooldown"].indexOf(st.status) !== -1'
+            in r.text)
+    assert "function statusText(st)" in r.text
+    assert 'if (st.status === "cooldown") {' in r.text
+    assert '"cooldown — stop pedalling to finish"' in r.text
+    assert '"cooldown — finishing in " + left + "s"' in r.text
+    assert 'document.getElementById("rStatus").textContent = statusText(st);' in r.text

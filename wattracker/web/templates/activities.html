@@ -28,7 +28,16 @@
         <input type="file" name="file" accept=".fit,.FIT" required>
         <button type="submit">Upload .fit</button>
     </form>
+    <form method="post" action="/activities/link-duplicates">
+        <button type="submit">Merge double-recorded rides</button>
+    </form>
 </div>
+
+{% if linked is not none %}
+<p class="{{ 'ok' if linked|int else 'hint' }}">
+    {{ linked }} ride(s) recorded both in-app and by Zwift are now counted once.
+</p>
+{% endif %}
 
 {% if activities %}
 <table>
@@ -41,7 +50,12 @@
     <tbody>
     {% for a in activities %}
         <tr>
-            <td><a href="/activity/{{ a.id }}">{{ a.start_time or '&mdash;'|safe }}</a></td>
+            <td>
+                <a href="/activity/{{ a.id }}">{{ a.start_time or '&mdash;'|safe }}</a>
+                {% if a.has_duplicate %}
+                <span class="hint">also recorded in-app &mdash; counted once</span>
+                {% endif %}
+            </td>
             <td>{{ a.duration_fmt or '—' }}</td>
             <td>{{ '%.1f'|format((a.distance_m or 0) / 1000) }} km</td>
             <td>{{ '%.0f'|format(a.avg_power or 0) }} W</td>

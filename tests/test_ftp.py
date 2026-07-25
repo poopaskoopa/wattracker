@@ -5,6 +5,7 @@ import pytest
 
 from wattracker import db
 from wattracker.ingest import importer
+from wattracker.timeutil import utc_now
 
 
 def _insert_activity(user_id, start_time, power_watts=300.0, seconds=1200):
@@ -106,6 +107,36 @@ def test_recent_best_effort_ftp_is_undecayed_90_day_estimate(user_id):
 
 def test_recent_best_effort_ftp_is_zero_without_usable_power(user_id):
     assert importer.recent_best_effort_ftp(user_id) == 0.0
+
+
+def test_recent_best_effort_window_is_anchored_in_utc(user_id):
+    """The default trailing window is UTC-anchored, like stored start_times.
+
+    A ride recorded seconds ago carries a naive-UTC start_time. Against a naive
+    LOCAL "now" it looks hours in the future west of Greenwich (so the
+    ``when <= now`` guard drops it) or hours too old to the east; against UTC it
+    is simply inside the window.
+    """
+    _insert_activity(user_id, (utc_now() - dt.timedelta(minutes=1)).isoformat(),
+                     power_watts=300.0)
+    assert importer.recent_best_effort_ftp(user_id) > 0.0
+
+
+def test_recent_best_effort_window_edges_come_from_the_utc_clock(monkeypatch,
+                                                                 user_id):
+    # The default "now" is the shared UTC clock (03:00 UTC here is still the
+    # previous day for a local clock in the Americas), and the 90-day window is
+    # measured from it.
+    frozen = dt.datetime(2027, 1, 1, 3, 0)
+    monkeypatch.setattr(importer, "utc_now", lambda: frozen)
+    _insert_activity(user_id, (frozen - dt.timedelta(hours=2)).isoformat(),
+                     power_watts=300.0)
+    _insert_activity(user_id, (frozen - dt.timedelta(days=91)).isoformat(),
+                     power_watts=400.0)
+
+    # Only the in-window ride counts (400 W would win if the old one leaked in),
+    # and it counts despite being "in the future" by a local UTC-4 clock.
+    assert importer.recent_best_effort_ftp(user_id) == pytest.approx(285.0)
 
 
 def test_update_cadence_is_three_weeks(user_id):
