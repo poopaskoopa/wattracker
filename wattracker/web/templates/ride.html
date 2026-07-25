@@ -94,10 +94,16 @@
     <div id="rideChartPanel" class="ride-chart-block">
         <div class="ride-chart-heading">
             <h3 id="rideChartTitle">Workout metrics</h3>
-            <button type="button" id="chartFullscreenBtn" class="button-secondary"
-                    aria-controls="rideChartPanel" aria-pressed="false">
-                View chart full screen
-            </button>
+            <div class="ride-chart-actions">
+                <button type="button" id="chartFullscreenBtn" class="button-secondary"
+                        aria-controls="rideChartPanel" aria-pressed="false">
+                    View chart full screen
+                </button>
+                <button type="button" id="endWorkoutBtn" class="button-secondary ride-chart-end"
+                        disabled>
+                    End workout now
+                </button>
+            </div>
         </div>
         <div class="ride-chart-canvas">
             <div class="ride-chart-clocks" aria-hidden="true">
@@ -138,6 +144,9 @@
     var chartPointLimit = MAX_CHART_POINTS;
     var workoutDuration = 0;
     var workoutProfile = [];
+    var CUE_LEAD = 3;
+    var cuesPlayed = {};
+    var chartMaxX = 0;
     var connectedAddresses = {};
     var pendingDisconnects = {};
     var ergAvailable = false, ergEnabled = false, ergPending = false;
@@ -191,16 +200,58 @@
             return ctx;
         } catch (e) { return null; }
     }
+    function playTone(ctx, frequency, delay, duration) {
+        var osc = ctx.createOscillator(), gain = ctx.createGain();
+        var start = ctx.currentTime + delay;
+        osc.frequency.value = frequency;
+        gain.gain.setValueAtTime(0.05, start);
+        gain.gain.exponentialRampToValueAtTime(0.001, start + duration);
+        osc.connect(gain); gain.connect(ctx.destination);
+        osc.start(start); osc.stop(start + duration);
+    }
     function playCue(kind) {
         try {
             var ctx = primeAudio();
             if (!ctx) return;
-            var osc = ctx.createOscillator(), gain = ctx.createGain();
-            osc.frequency.value = kind === "success" ? 880 : (kind === "failure" ? 220 : 520);
-            gain.gain.setValueAtTime(0.05, ctx.currentTime);
-            gain.gain.exponentialRampToValueAtTime(0.001, ctx.currentTime + 0.12);
-            osc.connect(gain); gain.connect(ctx.destination); osc.start(); osc.stop(ctx.currentTime + 0.12);
+            if (kind === "countdown") { playTone(ctx, 660, 0, 0.1); return; }
+            if (kind === "blockChange") { playTone(ctx, 1046, 0, 0.4); return; }
+            if (kind === "workoutEnd") {
+                playTone(ctx, 660, 0, 0.16);
+                playTone(ctx, 880, 0.2, 0.16);
+                playTone(ctx, 1320, 0.4, 0.5);
+                return;
+            }
+            playTone(ctx, kind === "success" ? 880 : (kind === "failure" ? 220 : 520), 0, 0.12);
         } catch (e) {}
+    }
+    // Countdown bookkeeping is keyed on the boundary time, never on the raw
+    // elapsed value: state frames repeat and the clock pauses when the rider
+    // stops pedaling, so an equality test would fire twice or not at all.
+    function cueOnce(key, threshold, elapsed, kind) {
+        if (!(threshold > 0) || elapsed < threshold || cuesPlayed[key]) return;
+        cuesPlayed[key] = true;
+        // A jump over several thresholds marks them played but only sounds the
+        // one we actually arrived at.
+        if (elapsed - threshold < 1.5) playCue(kind);
+    }
+    function updateAudioCues(elapsed) {
+        if (!(elapsed > 0)) return;
+        var i, n, boundary;
+        for (i = 0; i < workoutProfile.length; i++) {
+            boundary = Number(workoutProfile[i].end) || 0;
+            // The last block ends with the workout; the end-of-workout cue wins.
+            if (boundary <= 0 || (workoutDuration > 0 && boundary >= workoutDuration)) continue;
+            for (n = CUE_LEAD; n >= 1; n--) {
+                cueOnce("block:" + boundary + ":" + n, boundary - n, elapsed, "countdown");
+            }
+            cueOnce("block:" + boundary, boundary, elapsed, "blockChange");
+        }
+        if (workoutDuration > 0) {
+            for (n = CUE_LEAD; n >= 1; n--) {
+                cueOnce("end:" + n, workoutDuration - n, elapsed, "countdown");
+            }
+            cueOnce("end", workoutDuration, elapsed, "workoutEnd");
+        }
     }
     function setLive(element, message, kind) {
         element.textContent = message;
@@ -279,6 +330,8 @@
         if (!workout) return;
         workoutDuration = Math.max(0, Number(workout.duration_s) || 0);
         workoutProfile = workout.profile || [];
+        cuesPlayed = {};
+        chartMaxX = workoutDuration;
         document.getElementById("rideChartTitle").textContent =
             workout.name || "Workout metrics";
         setChartClocks(0, workoutDuration);
@@ -321,12 +374,23 @@
         }
         if (points.length > chartPointLimit) points.shift();
     }
+    // The rider may keep pedalling past the prescribed end; grow the axis a
+    // minute at a time so the measured traces stay on screen. The target-power
+    // line legitimately stops at workoutDuration.
+    function growChartAxis(elapsed) {
+        if (!rideChart || !(elapsed > chartMaxX)) return;
+        chartMaxX = Math.ceil(elapsed / 60) * 60;
+        if (chartMaxX <= elapsed) chartMaxX = elapsed + 60;
+        rideChart.options.scales.x.max = chartMaxX;
+    }
     function appendCharts(st) {
         if (!rideChart) return;
         var elapsed = finiteNumber(st.elapsed);
         if (elapsed == null) return;
         var total = finiteNumber(st.total);
         setChartClocks(elapsed, total == null ? workoutDuration : total);
+        updateAudioCues(elapsed);
+        growChartAxis(elapsed);
         appendOrReplace(livePower, {x: elapsed, y: finiteNumber(st.power)});
         appendOrReplace(liveCadence, {x: elapsed, y: finiteNumber(st.cadence)});
         appendOrReplace(liveHr, {x: elapsed, y: finiteNumber(st.hr)});
@@ -346,6 +410,7 @@
         rideState = state;
         var active = state !== "idle";
         document.getElementById("stopBtn").disabled = !active;
+        document.getElementById("endWorkoutBtn").disabled = !active;
         document.getElementById("simBtn").disabled = active;
         document.getElementById("scanBtn").disabled = active || !bleAvailable;
         document.getElementById("connectBtn").disabled =
@@ -1081,10 +1146,16 @@
     document.addEventListener("keydown", function (event) {
         if (event.key === "Escape" && chartIsFullscreen()) exitChartFullscreen();
     });
-    document.getElementById("stopBtn").addEventListener("click", function () {
+    function stopRide() {
         queuedOpen = null;
         if (ws) { try { ws.close(); } catch (e) {} }
         setRideState("idle");
+    }
+    document.getElementById("stopBtn").addEventListener("click", stopRide);
+    document.getElementById("endWorkoutBtn").addEventListener("click", function () {
+        if (rideState === "idle") return;
+        if (!window.confirm("End the workout now? The rest of the workout is discarded.")) return;
+        stopRide();
     });
     document.getElementById("scanBtn").addEventListener("click", async function () {
         var el = document.getElementById("deviceList");
