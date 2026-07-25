@@ -72,6 +72,7 @@ class RideController:
         power_source=None,
         hr_source=None,
         user_id: Optional[int] = None,
+        workout_id: Optional[int] = None,
         start_grace_s: float = _DEFAULT_START_GRACE_S,
         zero_grace_s: float = _DEFAULT_ZERO_GRACE_S,
         autosave: bool = True,
@@ -85,6 +86,7 @@ class RideController:
         self.power_source = power_source
         self.hr_source = hr_source
         self.user_id = user_id
+        self.workout_id = workout_id
         self.start_grace_s = float(start_grace_s)
         self.zero_grace_s = float(zero_grace_s)
         self.autosave = autosave
@@ -338,6 +340,10 @@ class RideController:
         record = importer._build_record(parsed, name, self.ftp)
         self.saved_record = record
         self.activity_id = db.insert_activity(self.user_id, record)
+        if self.activity_id is not None and self.workout_id is not None:
+            importer.link_selected_plan_workout(
+                self.user_id, self.workout_id, self.activity_id
+            )
         try:
             importer.maybe_update_ftp(self.user_id)
         except Exception:
@@ -361,6 +367,7 @@ class RideController:
             "ftp": self.ftp,
             "name": self.session.name,
             "activity_id": self.activity_id,
+            "workout_id": self.workout_id,
             "erg_available": self.erg_available,
             "erg_enabled": self.erg_enabled,
             "start_countdown": round(

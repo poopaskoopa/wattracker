@@ -107,6 +107,10 @@
         <p class="hint" id="wmMeta"></p>
         <p class="hint" id="wmMatchStatus"></p>
         <p class="alert" id="wmError" hidden></p>
+        <div id="wmComplete" hidden>
+            <button type="button" id="wmCompleteButton">Mark complete</button>
+            <span class="hint">Links the closest-duration activity recorded on this workout&rsquo;s scheduled date.</span>
+        </div>
         <div class="profile-wrap" id="wmProfile" hidden></div>
         <p class="hint" id="wmDesc"></p>
         <div class="rpe-section" id="wmRpe" hidden>
@@ -167,6 +171,7 @@
         $("wmRpe").hidden = true;
         $("wmRpeButtons").innerHTML = "";
         $("wmRpeStatus").textContent = "";
+        $("wmComplete").hidden = true;
         modal.hidden = false;
     }
 
@@ -244,16 +249,46 @@
         $("wmError").hidden = true;
         var matchStatus = $("wmMatchStatus");
         if (detail.reconcileStatus === "matched") {
-            matchStatus.textContent = "Matched to today's imported Zwift activity.";
+            matchStatus.textContent = "Matched to an activity recorded on this workout’s scheduled date.";
         } else if (detail.reconcileStatus === "no_match") {
             matchStatus.textContent =
-                "No matching imported Zwift activity was found for today. Import the completed activity, then click again.";
+                "No activity matched automatically. If you completed this workout, use Mark complete to link a same-day activity.";
         } else if (detail.reconcileStatus === "unverified_completion") {
             matchStatus.textContent =
                 "This completion is recorded, but its power-profile match could not be verified. Effort rating is unavailable.";
         } else {
             matchStatus.textContent = "";
         }
+        $("wmComplete").hidden = !detail.can_mark_complete;
+        $("wmCompleteButton").onclick = async function () {
+            var button = $("wmCompleteButton");
+            button.disabled = true;
+            matchStatus.textContent = "Marking complete…";
+            try {
+                var response = await fetch(
+                    "/api/plan/workout/" + detail.id + "/complete",
+                    { method: "POST", headers: { "Accept": "application/json" } }
+                );
+                var result = await response.json();
+                if (!response.ok) {
+                    matchStatus.textContent = result.error || "Could not mark this workout complete.";
+                    button.disabled = false;
+                    return;
+                }
+                detail.completed = true;
+                detail.can_mark_complete = false;
+                detail.completion_verified = false;
+                detail.rpe_eligible = false;
+                matchStatus.textContent =
+                    "Marked complete using an activity from the scheduled date. Effort rating may remain unavailable if the power profile cannot be verified.";
+                $("wmComplete").hidden = true;
+                renderRpe(detail);
+                window.location.reload();
+            } catch (e) {
+                matchStatus.textContent = "Could not mark this workout complete: " + e.message;
+                button.disabled = false;
+            }
+        };
 
         var wrap = $("wmProfile");
         wrap.innerHTML = profileSvg(detail.profile, detail.total_duration, detail.ftp);

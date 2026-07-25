@@ -1501,13 +1501,14 @@ def create_app() -> FastAPI:
             w = db.get_plan_workout(uid, int(workout_id))
             if w:
                 return build_workout(w["type"], max(1, w["duration_s"] / 60),
-                                     w.get("variant")), w["name"]
+                                     w.get("variant")), w["name"], w["id"]
+            raise ValueError("workout not found")
         if wtype:
             kind, mins = _validate_just_ride(wtype, minutes)
             s = build_workout(kind, mins)
-            return s, s.name
+            return s, s.name, None
         s = build_workout("endurance", 45)
-        return s, s.name
+        return s, s.name, None
 
     def _ride_workout_payload(session, ftp: float, name: Optional[str] = None) -> dict:
         blocks, total_s = flatten_session(session)
@@ -1780,7 +1781,7 @@ def create_app() -> FastAPI:
             await websocket.close()
             return
         try:
-            session, ride_name = _ride_session(
+            session, ride_name, selected_workout_id = _ride_session(
                 uid,
                 workout_id=params.get("workout_id"),
                 wtype=params.get("type"),
@@ -1996,6 +1997,7 @@ def create_app() -> FastAPI:
                     power_source=conn["power_source"],
                     hr_source=conn["hr_source"],
                     user_id=uid,
+                    workout_id=selected_workout_id,
                     autosave=True,
                     erg_enabled=initial_erg_enabled,
                     manage_trainer_commands=False,
@@ -2141,7 +2143,8 @@ def create_app() -> FastAPI:
         # time from a connected power source.)
         trainer = bledevices.SimulatedTrainer()
         controller = RideController(
-            session, ftp, trainer=trainer, user_id=uid, autosave=True
+            session, ftp, trainer=trainer, user_id=uid,
+            workout_id=selected_workout_id, autosave=True
         )
         step_dt = 30
         pedal = max(60, int(0.55 * ftp))
@@ -2170,7 +2173,7 @@ def create_app() -> FastAPI:
 
     @app.post("/api/plan/workout/{workout_id}/reconcile")
     def api_plan_workout_reconcile(request: Request, workout_id: int):
-        """Reconcile one today's workout against already-imported Zwift data."""
+        """Reconcile one non-future workout against existing activity data."""
         uid = _uid(request)
         workout = db.get_plan_workout(uid, workout_id)
         if not workout:
@@ -2178,13 +2181,13 @@ def create_app() -> FastAPI:
 
         today = _dt.date.today()
         verified = importer.plan_workout_completion_verified(uid, workout)
-        if workout["date"] != today.isoformat():
+        if workout["date"] > today.isoformat():
             status = (
                 "completed"
                 if verified
                 else "unverified_completion"
                 if workout.get("completed_activity_id")
-                else "not_today"
+                else "future"
             )
             return JSONResponse({"id": workout_id, "status": status, "matched": False})
         if workout.get("completed_activity_id") is not None:
@@ -2196,12 +2199,56 @@ def create_app() -> FastAPI:
                 }
             )
 
-        matched = importer.match_plan_workout_completion(uid, workout_id, today)
+        matched = importer.match_plan_workout_completion(
+            uid, workout_id, _dt.date.fromisoformat(workout["date"])
+        )
         return JSONResponse(
             {
                 "id": workout_id,
                 "status": "matched" if matched else "no_match",
                 "matched": matched,
+            }
+        )
+
+    @app.post("/api/plan/workout/{workout_id}/complete")
+    def api_plan_workout_complete(request: Request, workout_id: int):
+        """Manually link the best same-day, unused activity to a workout.
+
+        Repeating the action for an already completed workout is an idempotent
+        success and returns its existing activity link.
+        """
+        uid = _uid(request)
+        result = importer.manually_complete_plan_workout(uid, workout_id)
+        if result == "not_found":
+            return JSONResponse({"error": "workout not found"}, status_code=404)
+        if result == "future":
+            return JSONResponse(
+                {"error": "future workouts cannot be marked complete"},
+                status_code=400,
+            )
+        if result == "no_activity":
+            return JSONResponse(
+                {"error": "no activity exists on this workout's scheduled date"},
+                status_code=400,
+            )
+        if result == "activities_used":
+            return JSONResponse(
+                {"error": "all activities on this date are already linked to another workout"},
+                status_code=409,
+            )
+        if result in ("invalid_date", "conflict"):
+            return JSONResponse(
+                {"error": "the workout could not be marked complete"},
+                status_code=409,
+            )
+        workout = db.get_plan_workout(uid, workout_id)
+        return JSONResponse(
+            {
+                "id": workout_id,
+                "status": result,
+                "activity_id": (
+                    workout.get("completed_activity_id") if workout else None
+                ),
             }
         )
 
@@ -2262,6 +2309,10 @@ def create_app() -> FastAPI:
                 "completed": w.get("completed_activity_id") is not None,
                 "completion_verified": completion_verified,
                 "rpe_eligible": completion_verified,
+                "can_mark_complete": (
+                    w.get("completed_activity_id") is None
+                    and w["date"] <= _dt.date.today().isoformat()
+                ),
                 "ftp": round(ftp, 1),
                 "description": session.description,
                 "total_duration": total_s,

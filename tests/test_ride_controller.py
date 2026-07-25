@@ -1,4 +1,6 @@
 """Tests for the RideController state machine using simulated devices."""
+import datetime as dt
+
 import pytest
 
 from wattracker import db
@@ -468,6 +470,58 @@ def test_finished_ride_saves_activity(user_id):
     assert len(acts) == 1
     assert acts[0]["filename"].startswith("Ride ")
     assert acts[0]["tss"] >= 0
+
+
+def test_finished_selected_ride_links_saved_activity_to_plan_workout(user_id):
+    started = dt.datetime(2026, 7, 10, 9, 0, 0)
+    plan_id = db.create_plan(user_id, "Selected ride", "2026-07-10", 1)
+    workout_id = db.add_plan_workout(
+        plan_id,
+        user_id,
+        "2026-07-10",
+        "Selected workout",
+        "endurance",
+        20,
+        1.0,
+        "<workout_file/>",
+    )
+    c = RideController(
+        _two_block_session(),
+        200,
+        user_id=user_id,
+        workout_id=workout_id,
+        started_at=started,
+        start_grace_s=0,
+        autosave=True,
+    )
+
+    for _ in range(20):
+        c.tick(power=150, dt=1)
+
+    assert c.status == "finished"
+    assert c.activity_id is not None
+    workout = db.get_plan_workout(user_id, workout_id)
+    assert workout["completed_activity_id"] == c.activity_id
+    assert workout["completed_date"] == "2026-07-10"
+
+
+def test_unsaved_selected_ride_does_not_complete_plan_workout(user_id):
+    plan_id = db.create_plan(user_id, "Not started", "2026-07-10", 1)
+    workout_id = db.add_plan_workout(
+        plan_id, user_id, "2026-07-10", "W", "endurance", 20, 1.0, "<x/>"
+    )
+    c = RideController(
+        _two_block_session(),
+        200,
+        user_id=user_id,
+        workout_id=workout_id,
+        autosave=True,
+    )
+
+    c.stop()
+
+    assert c.activity_id is None
+    assert db.get_plan_workout(user_id, workout_id)["completed_activity_id"] is None
 
 
 def test_saved_ride_isolated_per_user(user_id):

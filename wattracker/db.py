@@ -1155,9 +1155,15 @@ def mark_plan_workout_completed(
         cur = conn.execute(
             "UPDATE plan_workouts SET completed_activity_id=?, completed_date=?, "
             "compliance=?, effective_ftp=? "
-            "WHERE user_id = ? AND id = ? AND completed_activity_id IS NULL",
-            (activity_id, completed_date, compliance, effective_ftp,
-             user_id, workout_id),
+            "WHERE user_id = ? AND id = ? AND completed_activity_id IS NULL "
+            "AND NOT EXISTS (SELECT 1 FROM plan_workouts "
+            "WHERE user_id=? AND completed_activity_id=?) "
+            "AND NOT EXISTS (SELECT 1 FROM standalone_workouts "
+            "WHERE user_id=? AND completed_activity_id=?)",
+            (
+                activity_id, completed_date, compliance, effective_ftp,
+                user_id, workout_id, user_id, activity_id, user_id, activity_id,
+            ),
         )
         conn.commit()
         return cur.rowcount > 0
@@ -1274,9 +1280,15 @@ def mark_standalone_completed(
         cur = conn.execute(
             "UPDATE standalone_workouts SET completed_activity_id=?,completed_date=?,"
             "compliance=?,effective_ftp=? WHERE user_id=? AND id=? "
-            "AND completed_activity_id IS NULL",
-            (activity_id, completed_date, compliance, effective_ftp,
-             user_id, workout_id),
+            "AND completed_activity_id IS NULL "
+            "AND NOT EXISTS (SELECT 1 FROM plan_workouts "
+            "WHERE user_id=? AND completed_activity_id=?) "
+            "AND NOT EXISTS (SELECT 1 FROM standalone_workouts "
+            "WHERE user_id=? AND completed_activity_id=?)",
+            (
+                activity_id, completed_date, compliance, effective_ftp,
+                user_id, workout_id, user_id, activity_id, user_id, activity_id,
+            ),
         )
         conn.commit()
         return cur.rowcount > 0
