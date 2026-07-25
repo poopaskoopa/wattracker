@@ -406,6 +406,16 @@
         var m = Math.floor(sec / 60), s = sec % 60;
         return m + ":" + (s < 10 ? "0" + s : s);
     }
+    function statusText(st) {
+        if (st.status === "starting") return "starting in " + st.start_countdown + "s";
+        if (st.status === "cooldown") {
+            var left = Number(st.finish_countdown) || 0;
+            return left > 0 && Number(st.no_power_s) > 0
+                ? "cooldown — finishing in " + left + "s"
+                : "cooldown — stop pedalling to finish";
+        }
+        return st.status;
+    }
     function setRideState(state) {
         rideState = state;
         var active = state !== "idle";
@@ -540,8 +550,7 @@
     }
     function render(st) {
         updateChartMetrics(st);
-        document.getElementById("rStatus").textContent = st.status === "starting"
-            ? "starting in " + st.start_countdown + "s" : st.status;
+        document.getElementById("rStatus").textContent = statusText(st);
         document.getElementById("rTarget").textContent = st.target_watts;
         document.getElementById("rPower").textContent = st.power;
         document.getElementById("rCad").textContent = st.cadence == null ? "—" : st.cadence;
@@ -552,7 +561,7 @@
         document.getElementById("rProgress").style.width = ((st.progress || 0) * 100) + "%";
         appendCharts(st);
         if (st.status === "finished") setRideState("idle");
-        else if (["starting", "running", "paused"].indexOf(st.status) !== -1) setRideState("running");
+        else if (["starting", "running", "paused", "cooldown"].indexOf(st.status) !== -1) setRideState("running");
     }
     function openRide(sim) {
         if (ws) {

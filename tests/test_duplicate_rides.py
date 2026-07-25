@@ -82,6 +82,8 @@ def test_in_app_ride_is_stored_as_utc_with_a_local_filename_date(user_id):
         )
         for _ in range(20):
             controller.tick(power=150, dt=1)
+        for _ in range(3):  # spin-down: three still seconds end the cooldown
+            controller.tick(power=0, dt=1)
 
         assert controller.status == "finished"
         activity = db.list_activities(user_id)[0]
@@ -107,6 +109,8 @@ def test_in_app_ride_links_to_an_already_imported_fit(monkeypatch, user_id):
     )
     for _ in range(1300):
         controller.tick(power=150, dt=1)
+    for _ in range(3):  # spin-down: three still seconds end the cooldown
+        controller.tick(power=0, dt=1)
 
     assert controller.status == "finished"
     assert len(db.list_activities(user_id)) == 1  # the .fit, counted once

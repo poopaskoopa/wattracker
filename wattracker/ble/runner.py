@@ -5,8 +5,11 @@ trainer over ERG: at each tick it computes the current target watts and calls
 ``trainer.set_target_power``. The workout clock only advances while measured
 power > 0. A ride starts after three continuous positive-power seconds, pauses
 after three continuous no-power seconds, and resumes on the next positive
-sample. Long-inactivity disconnect policy belongs to the WebSocket owner. On
-finish the controller records the ride as an activity for the user.
+sample. When the prescribed workout runs out the ride enters COOLDOWN: the
+clock and recording keep going while the rider spins down, and three continuous
+no-power seconds finish it. Long-inactivity disconnect policy belongs to the
+WebSocket owner. On finish the controller records the ride as an activity for
+the user.
 """
 from __future__ import annotations
 
@@ -23,6 +26,7 @@ IDLE = "idle"
 STARTING = "starting"
 RUNNING = "running"
 PAUSED = "paused"
+COOLDOWN = "cooldown"
 FINISHED = "finished"
 
 _DEFAULT_START_GRACE_S = 3.0
@@ -212,8 +216,11 @@ class RideController:
             self._samples["cadence"].append(cadence)
             self._samples["heartrate"].append(hr)
 
-            if self.elapsed >= self.total_s:
-                self._finish()
+            # The prescribed workout is over but the rider may keep spinning:
+            # enter COOLDOWN and keep clocking/recording until they stop. Only
+            # RUNNING promotes - COOLDOWN never falls back into RUNNING.
+            if self.status == RUNNING and self.elapsed >= self.total_s:
+                self.status = COOLDOWN
         else:
             self._positive_run = 0.0
             if self.status == STARTING:
@@ -224,6 +231,12 @@ class RideController:
                 self._zero_run += dt
                 if self._zero_run >= self.zero_grace_s:
                     self.status = PAUSED
+            elif self.status == COOLDOWN:
+                # Same zero-power grace, opposite meaning: after the workout,
+                # stopping ends the ride rather than pausing it.
+                self._zero_run += dt
+                if self._zero_run >= self.zero_grace_s:
+                    self._finish()
         return self.state()
 
     def poll(self, dt: float = 1.0) -> dict:
@@ -384,4 +397,9 @@ class RideController:
                 max(0.0, self.start_grace_s - self._positive_run), 1
             ) if not self._ever_started else 0.0,
             "no_power_s": round(self._zero_run, 1),
+            # Seconds of stillness left before a cooldown finalizes the ride, so
+            # the client need not hardcode the grace period.
+            "finish_countdown": round(
+                max(0.0, self.zero_grace_s - self._zero_run), 1
+            ) if self.status == COOLDOWN else 0.0,
         }
