@@ -42,6 +42,9 @@ wattracker = [
     "web/templates/*.html",
     "web/static/*.js",
     "web/static/*.css",
+    "web/static/*.svg",
+    "web/static/*.ico",
+    "web/static/*.png",
     "web/static/vendor/*.js",
 ]
 
