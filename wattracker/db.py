@@ -40,8 +40,25 @@ def _restrict_db_files(path: str) -> None:
 IN_APP_FILENAME_SQL = "filename LIKE 'Ride ____-__-__ %' AND filename NOT LIKE '%.fit'"
 
 
+def _add_duplicate_of_and_backfill_utc(conn: sqlite3.Connection) -> None:
+    """v18 -> v19: add ``duplicate_of``, then rewrite in-app start_time as UTC.
+
+    The two steps are one unit because the column doubles as the "already
+    migrated" marker. Shifting timestamps is the only migration here that is
+    not naturally repeatable - running it twice moves a ride another four or
+    five hours - and the version counter alone does not protect a database
+    that was left at v18 with the column already added. If the column is
+    present, this version has already run and there is nothing to do.
+    """
+    columns = {row[1] for row in conn.execute("PRAGMA table_info(activities)")}
+    if "duplicate_of" in columns:
+        return
+    conn.execute("ALTER TABLE activities ADD COLUMN duplicate_of INTEGER")
+    _backfill_inapp_utc(conn)
+
+
 def _backfill_inapp_utc(conn: sqlite3.Connection) -> None:
-    """v18 -> v19: rewrite in-app rides' naive-local start_time as naive UTC.
+    """Rewrite in-app rides' naive-local start_time as naive UTC.
 
     Until v19 an in-app ride stored ``datetime.now()`` (local) while an
     imported .fit stored UTC, so the same ride recorded by both landed hours
@@ -49,6 +66,8 @@ def _backfill_inapp_utc(conn: sqlite3.Connection) -> None:
     timezone's offset ranges picks the offset that was actually in force at
     each timestamp (so historical DST is honored), and every row is shifted
     exactly once regardless of statement ordering.
+
+    Not idempotent on its own - see ``_add_duplicate_of_and_backfill_utc``.
     """
     from .timeutil import local_offset_ranges
 
@@ -138,8 +157,7 @@ _MIGRATIONS: Dict[int, Sequence[Union[str, Callable[[sqlite3.Connection], None]]
         "ALTER TABLE activities ADD COLUMN rpe INTEGER",
     ],
     18: [
-        "ALTER TABLE activities ADD COLUMN duplicate_of INTEGER",
-        _backfill_inapp_utc,
+        _add_duplicate_of_and_backfill_utc,
     ],
 }
 

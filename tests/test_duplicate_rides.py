@@ -170,6 +170,27 @@ def test_v19_migration_is_not_applied_twice(tmp_path):
     assert start == "2025-07-15T23:00:00"
 
 
+def test_v19_does_not_shift_again_when_the_column_already_exists(tmp_path):
+    # The version counter alone is not enough: a database left at v18 with
+    # duplicate_of already added would otherwise be shifted a second time,
+    # moving every in-app ride another four or five hours. The column's
+    # presence is the marker that says this version already ran.
+    path = str(tmp_path / "old.db")
+    _v18_database(path, [("Ride 2025-07-15 Summer", "2025-07-15T23:00:00")])
+    conn = sqlite3.connect(path)
+    conn.execute("ALTER TABLE activities ADD COLUMN duplicate_of INTEGER")
+    conn.commit()
+    conn.close()
+
+    with _timezone("America/New_York"):
+        db.init_db(path)
+
+    conn = sqlite3.connect(path)
+    start = conn.execute("SELECT start_time FROM activities").fetchone()[0]
+    conn.close()
+    assert start == "2025-07-15T23:00:00"
+
+
 # ------------------------------------------------------------ match rules
 def test_cross_source_pair_is_linked_fit_first(user_id):
     in_app, fit = _seed_real_pair(user_id)
