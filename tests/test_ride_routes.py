@@ -1217,3 +1217,67 @@ def test_ride_ws_close_during_start_countdown_never_saves_activity(
     assert db.list_activities(uid) == []
     assert trainer.commands[-1] == "stop"
     assert ble_client.disconnected is True
+
+
+def test_ride_ws_keeps_streaming_after_the_workout_then_finishes_on_stop_pedalling(
+    client, monkeypatch
+):
+    """The prescribed workout ending starts a cooldown, not a finish: telemetry
+    keeps flowing (and ERG keeps its target) until the rider stops pedalling."""
+    from wattracker.ble.devices import SimulatedTrainer
+
+    _register(client)
+    uid = db.get_user_by_username("rider")["id"]
+    plan_id = db.create_plan(uid, "Short ride", "2026-07-10", 1)
+    workout_id = db.add_plan_workout(
+        plan_id, uid, "2026-07-10", "One minute", "endurance", 60, 1.0, "<x/>"
+    )
+    trainer = SimulatedTrainer()
+    trainer.start_erg()
+    # 3s start gate, then long enough to finish the 60s workout and spin down.
+    _patch_real_ride(monkeypatch, trainer, [150] * 90 + [0] * 5)
+
+    frames = []
+    with client.websocket_connect(f"/ride/ws?workout_id={workout_id}") as ws:
+        assert _receive_after_workout(ws)["status"] == "connected"
+        try:
+            while True:
+                frames.append(ws.receive_json())
+        except Exception:
+            pass
+
+    states = [f for f in frames if "status" in f and "elapsed" in f]
+    cooldown = [f for f in states if f["status"] == "cooldown"]
+    assert cooldown, "expected a cooldown phase past the prescribed end"
+    total = cooldown[0]["total"]
+    assert cooldown[0]["elapsed"] >= total
+    # Readings past the end keep streaming, charting past the workout duration.
+    assert cooldown[-1]["elapsed"] > total
+    assert all(f["progress"] == 1.0 for f in cooldown)
+    # ERG kept its (final prescribed) target during the cooldown, and the ride
+    # ended only once power read zero for the grace period.
+    assert all(f["target_watts"] > 0 for f in cooldown)
+    assert cooldown[-1]["finish_countdown"] > 0
+    assert states[-1]["status"] == "finished"
+    assert states[-1]["elapsed"] > total
+    assert trainer.targets[-1] == 0
+    # The server keeps commanding the trainer through the cooldown, so it does
+    # not drop out of ERG: more positive writes than prescribed workout seconds.
+    assert len([t for t in trainer.targets if t > 0]) >= total + 20
+    acts = db.list_activities(uid)
+    assert len(acts) == 1
+    assert acts[0]["duration_s"] > total  # the spin-down is part of the ride
+
+
+def test_ride_page_treats_the_cooldown_as_an_active_ride(client, monkeypatch):
+    _register(client)
+    monkeypatch.setattr(bledevices, "bluetooth_available", lambda: (True, "ok"))
+    r = client.get("/ride")
+    assert r.status_code == 200
+    assert ('["starting", "running", "paused", "cooldown"].indexOf(st.status) !== -1'
+            in r.text)
+    assert "function statusText(st)" in r.text
+    assert 'if (st.status === "cooldown") {' in r.text
+    assert '"cooldown — stop pedalling to finish"' in r.text
+    assert '"cooldown — finishing in " + left + "s"' in r.text
+    assert 'document.getElementById("rStatus").textContent = statusText(st);' in r.text

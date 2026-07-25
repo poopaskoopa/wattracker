@@ -2029,7 +2029,8 @@ def create_app() -> FastAPI:
                     controller.poll(dt=1)
                     if (
                         controller.erg_enabled
-                        and controller.status in ("running", "finished")
+                        and controller.status in
+                        ("running", "cooldown", "finished")
                     ):
                         (
                             command_available,
@@ -2138,7 +2139,12 @@ def create_app() -> FastAPI:
         max_frames = int(controller.total_s / step_dt) + 5
         frames = 0
         try:
-            while controller.status != "finished" and frames < max_frames:
+            # The demo replays the prescription only; reaching the cooldown
+            # state means the workout is done, so stop instead of spinning on.
+            while (
+                controller.status not in ("cooldown", "finished")
+                and frames < max_frames
+            ):
                 controller.tick(power=pedal, dt=step_dt)
                 await websocket.send_json(controller.state())
                 frames += 1
