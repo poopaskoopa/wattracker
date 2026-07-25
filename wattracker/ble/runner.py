@@ -18,7 +18,7 @@ import logging
 from typing import List, Optional, Tuple
 
 from ..prescribe.planner import Session
-from ..timeutil import utc_now, utc_to_local
+from ..timeutil import utc_now
 
 _log = logging.getLogger(__name__)
 
@@ -353,10 +353,9 @@ class RideController:
             "duration_s": int(self.elapsed),
             "streams": streams,
         }
-        # The rider names their ride by the day they rode it, so the filename
-        # keeps the LOCAL date even though start_time is UTC.
-        local_date = (utc_to_local(started) or started).date().isoformat()
-        name = f"Ride {local_date} {self.session.name}"
+        # The app is UTC end to end, so the ride is named by its UTC date -
+        # a late-evening ride west of Greenwich reads as the next day.
+        name = f"Ride {started.date().isoformat()} {self.session.name}"
         record = importer._build_record(parsed, name, self.ftp)
         self.saved_record = record
         self.activity_id = db.insert_activity(self.user_id, record)

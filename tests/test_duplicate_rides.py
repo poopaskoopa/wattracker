@@ -11,6 +11,7 @@ from wattracker import db
 from wattracker.ble.runner import RideController
 from wattracker.ingest import importer
 from wattracker.prescribe.planner import Segment, Session
+from wattracker.timeutil import utc_now as utcnow
 
 
 @contextlib.contextmanager
@@ -75,7 +76,7 @@ def _seed_real_pair(user_id):
 
 
 # --------------------------------------------------------------- write path
-def test_in_app_ride_is_stored_as_utc_with_a_local_filename_date(user_id):
+def test_in_app_ride_is_stored_as_utc_with_a_utc_filename_date(user_id):
     with _timezone("America/New_York"):
         controller = RideController(
             _session(), 200, user_id=user_id, start_grace_s=0, autosave=True
@@ -92,10 +93,10 @@ def test_in_app_ride_is_stored_as_utc_with_a_local_filename_date(user_id):
         assert abs((started - utc_now).total_seconds()) < 120
         # ... and it is NOT the local wall clock (the old, skewed behavior).
         assert abs((started - dt.datetime.now()).total_seconds()) > 3600
-        # The rider names the ride by the day they rode it, so the filename
-        # keeps the local date.
-        local_date = dt.datetime.now().date().isoformat()
-        assert activity["filename"] == f"Ride {local_date} Endurance Negative Split"
+        # The app is UTC end to end, so the filename carries the UTC date.
+        assert activity["filename"] == (
+            f"Ride {utc_now.date().isoformat()} Endurance Negative Split"
+        )
 
 
 def test_in_app_ride_links_to_an_already_imported_fit(monkeypatch, user_id):
@@ -316,7 +317,7 @@ def test_linked_duplicate_is_counted_once_everywhere(user_id):
 
 
 def test_recent_full_activities_excludes_the_duplicate(user_id):
-    started = dt.datetime.now() - dt.timedelta(hours=2)
+    started = utcnow() - dt.timedelta(hours=2)
     in_app = _insert(user_id, "Ride 2026-07-24 Endurance",
                      started.isoformat(), 5216, 135.73)
     fit = _insert(user_id, "recent.fit",
@@ -374,3 +375,19 @@ def test_is_in_app_activity_recognizes_both_sources():
     assert not importer.is_in_app_activity("Ride the Rockies.fit")
     assert not importer.is_in_app_activity("")
     assert not importer.is_in_app_activity(None)
+
+
+def test_v19_migrates_in_a_timezone_that_has_never_had_dst(tmp_path):
+    # A DST-free zone yields a single offset range, and "CASE ELSE x END" with
+    # no WHEN is a syntax error - the migration would abort outright.
+    path = str(tmp_path / "old.db")
+    _v18_database(path, [("Ride 2025-07-15 Summer", "2025-07-15T19:00:00")])
+    with _timezone("Asia/Tokyo"):
+        db.init_db(path)
+
+    conn = sqlite3.connect(path)
+    start = conn.execute("SELECT start_time FROM activities").fetchone()[0]
+    version = conn.execute("PRAGMA user_version").fetchone()[0]
+    conn.close()
+    assert version == 19
+    assert start == "2025-07-15T10:00:00"  # JST is UTC+9 year-round

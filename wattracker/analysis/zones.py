@@ -10,7 +10,7 @@ from typing import Iterable, Optional
 from .. import db
 from ..ingest import importer
 from ..metrics.power import best_20min_power
-from ..timeutil import parse_naive
+from ..timeutil import parse_naive, utc_now
 
 
 POWER_ZONES = (
@@ -35,14 +35,9 @@ _auto_hr_cache: dict[int, tuple[tuple[str, int, int, str], dict]] = {}
 _cache_lock = threading.Lock()
 
 
-def _utc_naive_now() -> _dt.datetime:
-    """Current UTC with tzinfo removed, matching stored FIT timestamps."""
-    return _dt.datetime.now(_dt.timezone.utc).replace(tzinfo=None)
-
-
 def _as_utc_naive(value: Optional[_dt.datetime]) -> _dt.datetime:
     if value is None:
-        return _utc_naive_now()
+        return utc_now()
     if value.tzinfo is not None:
         return value.astimezone(_dt.timezone.utc).replace(tzinfo=None)
     return value

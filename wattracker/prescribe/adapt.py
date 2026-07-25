@@ -27,6 +27,7 @@ import os
 from typing import Dict, List, Optional
 
 from .. import db, paths
+from ..timeutil import utc_now
 from . import zwo
 from .planner import build_workout
 
@@ -95,7 +96,7 @@ def apply_adaptations(user_id: int, state, now: Optional[_dt.datetime] = None) -
       {status, adjusted (this run), upcoming (kind -> count of future adapted
        workouts), window_days}
     """
-    now = now or _dt.datetime.now()
+    now = now or utc_now()
     today = now.date().isoformat()
     horizon = (now.date() + _dt.timedelta(days=ADAPT_WINDOW_DAYS)).isoformat()
     status = detection_status(state)

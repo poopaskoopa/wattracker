@@ -21,7 +21,7 @@ from ..metrics.power import (
     training_stress_score,
 )
 from ..paths import activities_dir
-from ..timeutil import parse_naive
+from ..timeutil import parse_naive, utc_now, utc_today
 from .fit_parser import parse_fit
 
 
@@ -63,7 +63,7 @@ def _current_estimate(
     decays honestly, which is the desired behavior - a rider genuinely loses
     fitness across a break.
     """
-    now = now or _dt.datetime.now()
+    now = now or utc_now()
     streams: List = list(activities)
     if extra_power:
         streams = streams + [p for p in extra_power if p]
@@ -75,7 +75,7 @@ def recent_best_effort_ftp(
 ) -> float:
     """Trailing-90-day best-20-minute power * 0.95, without inactivity decay."""
     db.init_db()
-    now = now or _dt.datetime.now()
+    now = now or utc_now()
     cutoff = now - _dt.timedelta(days=90)
     recent = []
     for activity in db.full_activities(user_id):
@@ -119,7 +119,7 @@ def ftp_update_due(user_id: int, now: Optional[_dt.datetime] = None) -> bool:
     With no history at all, an update is due (seeds the first estimate).
     """
     db.init_db()
-    now = now or _dt.datetime.now()
+    now = now or utc_now()
     latest = db.latest_ftp(user_id)
     if not latest:
         return True
@@ -144,7 +144,7 @@ def evaluate_ftp(user_id: int, now: Optional[_dt.datetime] = None) -> bool:
     (see _current_estimate). Returns True when a row was appended or refreshed.
     """
     db.init_db()
-    now = now or _dt.datetime.now()
+    now = now or utc_now()
     est = _current_estimate(db.full_activities(user_id), now)
     if est <= 0:
         return False
@@ -619,7 +619,7 @@ def _match_standalone_completions(
 ) -> int:
     """Match persisted one-off exports using date, duration and target profile."""
     db.init_db()
-    now = now or _dt.datetime.now()
+    now = now or utc_now()
     used = db.completed_activity_ids(user_id)
     marked = 0
     for workout in db.incomplete_standalone_workouts_up_to(
@@ -690,7 +690,7 @@ def match_plan_workout_completion(
     the legacy batch matcher, an objective power-profile match is required.
     """
     db.init_db()
-    on_date = on_date or _dt.date.today()
+    on_date = on_date or utc_today()
     workout = db.get_plan_workout(user_id, workout_id)
     if (
         not workout
@@ -794,7 +794,7 @@ def manually_complete_plan_workout(user_id: int, workout_id: int) -> str:
         scheduled = _dt.date.fromisoformat(str(workout.get("date") or ""))
     except (TypeError, ValueError):
         return "invalid_date"
-    if scheduled > _dt.date.today():
+    if scheduled > utc_today():
         return "future"
 
     activities = db.activities_on_date(user_id, workout["date"])
@@ -838,7 +838,7 @@ def match_plan_completions(user_id: int, now: Optional[_dt.datetime] = None) -> 
     one workout). Returns the number of workouts newly marked completed.
     """
     db.init_db()
-    now = now or _dt.datetime.now()
+    now = now or utc_now()
     # Scheduled plan commitments always get first refusal on same-day rides.
     marked = 0
     used = db.completed_activity_ids(user_id)
@@ -912,7 +912,7 @@ def apply_rpe_ftp_feedback(
     rider needs this to catch. Wattage evidence still applies (via max()) so a
     genuinely higher realized effort (e.g. non-ERG, free ride) isn't ignored.
     """
-    now = now or _dt.datetime.now()
+    now = now or utc_now()
     settings = db.get_user_settings(user_id)
     if settings.get("ftp") and float(settings["ftp"]) > 0:
         return None

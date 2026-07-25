@@ -7,6 +7,7 @@ import pytest
 
 from wattracker import backup, db
 from wattracker.config import db_path
+from wattracker.timeutil import utc_now
 
 
 def _make_backup(reason, ts):
@@ -86,7 +87,7 @@ def test_create_backup_runs_prune():
     manuals = [b for b in backup.list_backups() if b["reason"] == "manual"]
     assert len(manuals) == 5
     # The freshly-created (real, now) one survived; an old placeholder was culled.
-    assert manuals[0]["timestamp"].year == dt.datetime.now().year
+    assert manuals[0]["timestamp"].year == utc_now().year
 
 
 def test_create_daily_if_due_at_most_once_per_day():
@@ -98,7 +99,7 @@ def test_create_daily_if_due_at_most_once_per_day():
     dailies = [b for b in backup.list_backups() if b["reason"] == "daily"]
     assert len(dailies) == 1
     # But once the existing one is > 23h old, a new one is due.
-    now_later = dt.datetime.now() + dt.timedelta(hours=24)
+    now_later = utc_now() + dt.timedelta(hours=24)
     assert backup.create_daily_if_due(now=now_later) is not None
     dailies = [b for b in backup.list_backups() if b["reason"] == "daily"]
     assert len(dailies) == 2

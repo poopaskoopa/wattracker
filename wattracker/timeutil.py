@@ -1,10 +1,11 @@
 """Datetime helpers.
 
-FIT files carry timezone-aware (UTC) timestamps, while the app computes
-windows from the naive local ``datetime.now()``. Mixing the two raises
-"can't compare offset-naive and offset-aware datetimes". Everything that
-parses or stores an activity timestamp funnels through here so comparisons
-are always naive-vs-naive.
+FIT files carry timezone-aware (UTC) timestamps. Mixing those with a naive
+local ``datetime.now()`` raises "can't compare offset-naive and offset-aware
+datetimes", and comparing naive local against naive UTC silently skews every
+window by the local offset. So the app is UTC end to end: everything that
+parses, stores or compares an activity timestamp funnels through here, and
+"now"/"today" come from ``utc_now`` / ``utc_today``.
 """
 from __future__ import annotations
 
@@ -39,11 +40,14 @@ def utc_now() -> _dt.datetime:
     return to_naive(_dt.datetime.now(_dt.timezone.utc))
 
 
-def utc_to_local(dt: Optional[_dt.datetime]) -> Optional[_dt.datetime]:
-    """Convert a naive-UTC datetime to naive local time (for display/naming)."""
-    if dt is None:
-        return None
-    return to_naive(dt.replace(tzinfo=_dt.timezone.utc).astimezone())
+def utc_today() -> _dt.date:
+    """Today's date in UTC.
+
+    The calendar counterpart of ``utc_now``: plan dates, completion dates and
+    "is this workout in the future" all compare against UTC-stored activity
+    timestamps, so the reference day has to be the UTC one.
+    """
+    return utc_now().date()
 
 
 def local_offset_seconds(dt: _dt.datetime) -> int:
