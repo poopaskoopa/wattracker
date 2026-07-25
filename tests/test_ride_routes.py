@@ -135,7 +135,7 @@ def test_ride_page_renders_available_when_monkeypatched(client, monkeypatch):
     assert '{label: "Measured power (" + POWER_SMOOTH_S + "s)", data: smoothPower, yAxisID: "y"' in r.text
     assert '{label: "Measured power (raw)", data: livePower, yAxisID: "y"' in r.text
     assert 'borderColor: "rgba(255, 209, 102, 0.25)", pointRadius: 0' in r.text
-    assert "var POWER_SMOOTH_S = 10, METRIC_SMOOTH_S = 5;" in r.text
+    assert "var POWER_SMOOTH_S = 3, METRIC_SMOOTH_S = 5;" in r.text
     assert "function smoothedValue(state, x, y)" in r.text
     assert 'borderColor: "#f2a900"' in r.text
     assert 'borderColor: "rgba(255, 209, 102, 0.7)", backgroundColor: "rgba(255, 209, 102, 0.7)"' in r.text
