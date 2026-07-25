@@ -120,12 +120,13 @@ or `wattracker-restore --restore 1`; a frozen bundle uses
 `wattracker.exe restore [--restore N]`. Restore safety follows the configured
 loopback port.
 
-Windows CI runs Python 3.12 tests. Windows packaging and signed-release jobs are
-currently hard-disabled to avoid consuming hosted-runner minutes; their retained
-workflow definitions must be explicitly re-enabled by a later code change.
-Windows executables must be
-built on Windows. Real BLE hardware and production signing cannot be verified
-here; use [the Windows BLE checklist](docs/windows-ble-validation.md).
+Windows CI runs Python 3.10 tests, matching the project's minimum supported
+version and the version used in development. Windows packaging and
+signed-release jobs are currently hard-disabled to avoid consuming
+hosted-runner minutes; their retained workflow definitions must be explicitly
+re-enabled by a later code change. Windows executables must be built on
+Windows. Real BLE hardware and production signing cannot be verified here; use
+[the Windows BLE checklist](docs/windows-ble-validation.md).
 
 Chart.js and the zoom plugin are vendored with the application, so ride,
 training-load, power-curve, and volume charts work without internet access.

@@ -101,7 +101,7 @@ def test_windows_ci_uses_one_fixed_python_version():
     test_job = workflow.split("  test:\n", 1)[1].split(
         "\n  package-unsigned:", 1
     )[0]
-    assert 'python-version: "3.12"' in test_job
+    assert 'python-version: "3.10"' in test_job
     assert "matrix:" not in test_job
     assert test_job.count("python-version:") == 1
 
