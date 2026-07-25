@@ -49,7 +49,6 @@
     <div class="toolbar">
         <button type="button" id="scanBtn" {{ '' if ble_available else 'disabled' }}>Scan devices</button>
         <button type="button" id="connectBtn" {{ '' if ble_available else 'disabled' }}>Connect selected sensors</button>
-        <button type="button" id="startBtn">Connect &amp; ride</button>
         <button type="button" id="simBtn">Simulate</button>
         <button type="button" id="stopBtn" disabled>Stop</button>
     </div>
@@ -71,7 +70,7 @@
 <section class="ride-live">
     <div id="ridePreview" class="ride-preview" aria-live="polite" hidden></div>
     <div id="workoutDetails" class="ride-workout" aria-live="polite">
-        Select Connect &amp; ride to load the workout.
+        Select Connect selected sensors to load the workout.
     </div>
     <div class="ride-live-controls" aria-label="Trainer controls">
         <button type="button" id="ergBtn" class="button-secondary erg-toggle" aria-pressed="false"
@@ -347,7 +346,6 @@
         rideState = state;
         var active = state !== "idle";
         document.getElementById("stopBtn").disabled = !active;
-        document.getElementById("startBtn").disabled = state === "connecting" || state === "running";
         document.getElementById("simBtn").disabled = active;
         document.getElementById("scanBtn").disabled = active || !bleAvailable;
         document.getElementById("connectBtn").disabled =
@@ -491,10 +489,10 @@
         if (st.status === "finished") setRideState("idle");
         else if (["starting", "running", "paused"].indexOf(st.status) !== -1) setRideState("running");
     }
-    function openRide(sim, prepare) {
+    function openRide(sim) {
         if (ws) {
             var previousState = rideState;
-            queuedOpen = {sim: sim, prepare: prepare};
+            queuedOpen = {sim: sim};
             setLive(document.getElementById("connectionStatus"),
                 "Disconnecting the current sensor session before reconnecting...", "working");
             setRideState("connecting");
@@ -536,7 +534,6 @@
             q.push("workout_id=" + encodeURIComponent(wid));
         }
         if (sim) q.push("sim=1");
-        if (prepare) q.push("prepare=1");
         if (!sim && scanned) {
             q.push("selected=1");
             document.querySelectorAll('#deviceList input[data-role="power"]:checked').forEach(function (input) {
@@ -595,9 +592,7 @@
                 } else {
                     updateConnectedRows(st.devices || {});
                     uncheckDeviceRoles(st.address);
-                    var reconnectAdvice = rideState === "prepared"
-                        ? " Reselect its role, then use Connect selected sensors to reconnect."
-                        : rideState === "running"
+                    var reconnectAdvice = rideState === "running"
                         ? " Stop the ride before reconnecting it."
                         : " Reselect its role to reconnect.";
                     setLive(document.getElementById("connectionStatus"),
@@ -639,26 +634,18 @@
                 }
                 if (names.hr) parts.push("HR: " + displayName(names.hr));
                 var message = parts.length ? "Connected — " + parts.join(", ") : "Connected.";
-                message += st.prepared
-                    ? " Press Connect & ride to start the workout."
-                    : " Start pedaling to begin the workout.";
+                message += " Start pedaling to begin the workout.";
                 if (st.warnings && st.warnings.length) {
                     message += " Warning: " + st.warnings.join(" ");
                 }
                 var hasWarnings = st.warnings && st.warnings.length;
                 setLive(document.getElementById("connectionStatus"), message,
                     hasWarnings ? "failure" : "success");
+                document.getElementById("rStatus").textContent = "ready — pedal to start";
                 saveSuccessfulSelection(names);
                 updateConnectedRows(names);
                 applyErgState(Boolean(st.erg_available), Boolean(st.erg_enabled));
                 playCue(hasWarnings ? "failure" : "success");
-                setRideState(st.prepared ? "prepared" : "running");
-                return;
-            }
-            if (st.status === "started") {
-                document.getElementById("rStatus").textContent = "idle";
-                setLive(document.getElementById("connectionStatus"),
-                    "Workout started. Hold positive power for 3 seconds to begin the clock.", "success");
                 setRideState("running");
                 return;
             }
@@ -674,7 +661,7 @@
             var nextOpen = queuedOpen;
             queuedOpen = null;
             if (nextOpen) {
-                openRide(nextOpen.sim, nextOpen.prepare);
+                openRide(nextOpen.sim);
                 return;
             }
             setRideState("idle");
@@ -890,12 +877,14 @@
     function renderDevices(devices) {
         var el = document.getElementById("deviceList");
         var status = document.getElementById("scanStatus");
-        devices = devices.slice().sort(function (a, b) {
-            var an = String(a.name || "(unknown)"), bn = String(b.name || "(unknown)");
-            if (an === "(unknown)" && bn !== "(unknown)") return 1;
-            if (bn === "(unknown)" && an !== "(unknown)") return -1;
+        var totalFound = devices.length;
+        devices = devices.slice().filter(function (device) {
+            return !(!device.name || String(device.name).trim() === "" || device.name === "(unknown)");
+        }).sort(function (a, b) {
+            var an = String(a.name), bn = String(b.name);
             return an.toLocaleLowerCase().localeCompare(bn.toLocaleLowerCase());
         });
+        var hiddenCount = totalFound - devices.length;
         el.replaceChildren();
         deviceNames = {};
         scannedDevices = {};
@@ -907,7 +896,8 @@
 
         setLive(status, "Found " + devices.length + " device" +
             (devices.length === 1 ? "." : "s.") +
-            " Detected roles come from advertised services; unknown devices can be assigned manually. RSSI closer to 0 is stronger. Select multiple power devices only for partial/one-sided sources; never combine a trainer or full-power source with pedals.", "success");
+            " Detected roles come from advertised services. RSSI closer to 0 is stronger. Select multiple power devices only for partial/one-sided sources; never combine a trainer or full-power source with pedals." +
+            (hiddenCount ? " (" + hiddenCount + " unnamed device" + (hiddenCount === 1 ? "" : "s") + " hidden)" : ""), "success");
         var noSensors = document.createElement("div");
         [["hr", "No HR"], ["trainer", "No trainer"]].forEach(function (choice) {
             var label = document.createElement("label");
@@ -1064,19 +1054,9 @@
     document.getElementById("rideDurationSelect").addEventListener("change", loadPreview);
     document.getElementById("connectBtn").addEventListener("click", function () {
         primeAudio();
-        openRide(false, true);
+        openRide(false);
     });
-    document.getElementById("startBtn").addEventListener("click", function () {
-        primeAudio();
-        if (rideState === "prepared" && ws) {
-            ws.send(JSON.stringify({action: "start"}));
-            setLive(document.getElementById("connectionStatus"), "Starting workout...", "working");
-            setRideState("running");
-        } else {
-            openRide(false, false);
-        }
-    });
-    document.getElementById("simBtn").addEventListener("click", function () { openRide(true, false); });
+    document.getElementById("simBtn").addEventListener("click", function () { openRide(true); });
     document.getElementById("ergBtn").addEventListener("click", function () {
         if (!ws || ws.readyState !== WebSocket.OPEN || !ergAvailable || ergPending) return;
         ergPending = true;
@@ -1118,7 +1098,6 @@
         document.getElementById("connectionStatus").textContent = "";
         scanButton.disabled = true;
         document.getElementById("connectBtn").disabled = true;
-        document.getElementById("startBtn").disabled = true;
         document.getElementById("simBtn").disabled = true;
         document.getElementById("workoutSelect").disabled = true;
         document.getElementById("rideTypeSelect").disabled = true;

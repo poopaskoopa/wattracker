@@ -263,6 +263,27 @@ def test_connect_sensors_disconnects_client_after_connect_failure(monkeypatch):
     assert "radio refused" in result["errors"][0]
 
 
+def test_connect_sensors_connect_timeout_becomes_error_not_exception(monkeypatch):
+    # A device the OS still holds (common with a KICKR right after a session)
+    # can make client.connect() hang. The bounded connect must surface this as a
+    # visible errors entry and continue, never hang or raise.
+    _module, fake_client = _install_fake_bleak(monkeypatch)
+    monkeypatch.setattr(devices, "CONNECT_TIMEOUT_S", 0.01)
+
+    async def never_returns(self):
+        await asyncio.Future()  # never completes
+
+    monkeypatch.setattr(fake_client, "connect", never_returns)
+    result = asyncio.run(devices.connect_sensors(selected={"power": ["STUCK"]}))
+
+    assert result["clients"] == []
+    assert result["power_source"] is None
+    assert fake_client.instances[0].disconnected is True
+    assert len(result["errors"]) == 1
+    assert "Timed out connecting" in result["errors"][0]
+    assert "STUCK" in result["errors"][0]
+
+
 def test_connect_sensors_disconnects_client_when_connect_is_cancelled(monkeypatch):
     _module, fake_client = _install_fake_bleak(monkeypatch)
 

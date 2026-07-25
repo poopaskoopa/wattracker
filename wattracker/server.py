@@ -1773,7 +1773,6 @@ def create_app() -> FastAPI:
 
         params = websocket.query_params
         sim = params.get("sim")
-        prepare_only = params.get("prepare") == "1"
         try:
             selected = _selected_ble_addresses(params)
         except ValueError as e:
@@ -1850,7 +1849,7 @@ def create_app() -> FastAPI:
                      "erg_available": erg_available,
                      "erg_enabled": erg_enabled,
                      "warnings": conn.get("errors", []),
-                     "prepared": prepare_only,
+                     "prepared": False,
                      "workout": workout_payload}
                 )
 
@@ -1871,8 +1870,6 @@ def create_app() -> FastAPI:
                         )
                         return None
                     action = message.get("action")
-                    if action == "start":
-                        return "start"
                     if action == "stop":
                         return "stop"
                     if action == "disconnect":
@@ -1965,27 +1962,6 @@ def create_app() -> FastAPI:
                 if callable(getattr(websocket, "receive_json", None)):
                     action_queue = asyncio.Queue()
                     receive_task = asyncio.create_task(_receive_actions())
-                if prepare_only:
-                    while True:
-                        try:
-                            message = await asyncio.wait_for(
-                                action_queue.get(),
-                                timeout=RIDE_INACTIVITY_TIMEOUT_S,
-                            )
-                        except asyncio.TimeoutError:
-                            await websocket.send_json(
-                                {
-                                    "status": "inactivity_timeout",
-                                    "message": "Disconnected after 5 minutes without starting. No activity was saved.",
-                                    "saved": False,
-                                }
-                            )
-                            return
-                        outcome = await _handle_action(message)
-                        if outcome == "start":
-                            break
-                        if outcome == "stop":
-                            return
 
                 initial_erg_available, initial_erg_enabled = (
                     _connection_erg_state(conn)
@@ -2016,8 +1992,6 @@ def create_app() -> FastAPI:
                     controller.set_erg_enabled(
                         initial_erg_enabled, command_trainer=False
                     )
-                if prepare_only:
-                    await websocket.send_json({"status": "started"})
                 if initial_erg_error:
                     await websocket.send_json(
                         {
