@@ -49,7 +49,6 @@
     <div class="toolbar">
         <button type="button" id="scanBtn" {{ '' if ble_available else 'disabled' }}>Scan devices</button>
         <button type="button" id="connectBtn" {{ '' if ble_available else 'disabled' }}>Connect selected sensors</button>
-        <button type="button" id="startBtn">Connect &amp; ride</button>
         <button type="button" id="simBtn">Simulate</button>
         <button type="button" id="stopBtn" disabled>Stop</button>
     </div>
@@ -71,7 +70,7 @@
 <section class="ride-live">
     <div id="ridePreview" class="ride-preview" aria-live="polite" hidden></div>
     <div id="workoutDetails" class="ride-workout" aria-live="polite">
-        Select Connect &amp; ride to load the workout.
+        Select Connect selected sensors to load the workout.
     </div>
     <div class="ride-live-controls" aria-label="Trainer controls">
         <button type="button" id="ergBtn" class="button-secondary erg-toggle" aria-pressed="false"
@@ -347,7 +346,6 @@
         rideState = state;
         var active = state !== "idle";
         document.getElementById("stopBtn").disabled = !active;
-        document.getElementById("startBtn").disabled = state === "connecting" || state === "running";
         document.getElementById("simBtn").disabled = active;
         document.getElementById("scanBtn").disabled = active || !bleAvailable;
         document.getElementById("connectBtn").disabled =
@@ -1058,10 +1056,6 @@
         primeAudio();
         openRide(false);
     });
-    document.getElementById("startBtn").addEventListener("click", function () {
-        primeAudio();
-        openRide(false);
-    });
     document.getElementById("simBtn").addEventListener("click", function () { openRide(true); });
     document.getElementById("ergBtn").addEventListener("click", function () {
         if (!ws || ws.readyState !== WebSocket.OPEN || !ergAvailable || ergPending) return;
@@ -1104,7 +1098,6 @@
         document.getElementById("connectionStatus").textContent = "";
         scanButton.disabled = true;
         document.getElementById("connectBtn").disabled = true;
-        document.getElementById("startBtn").disabled = true;
         document.getElementById("simBtn").disabled = true;
         document.getElementById("workoutSelect").disabled = true;
         document.getElementById("rideTypeSelect").disabled = true;

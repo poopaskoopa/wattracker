@@ -60,6 +60,10 @@ def test_ride_page_renders_available_when_monkeypatched(client, monkeypatch):
     assert r.status_code == 200
     assert "Bluetooth available" in r.text
     assert "Connect selected sensors" in r.text
+    # The separate "Connect & ride" button is gone: both buttons did the same
+    # thing once the prepare/start two-step was removed.
+    assert 'id="startBtn"' not in r.text
+    assert "Connect &amp; ride" not in r.text
     assert 'input[data-role="power"]:checked' in r.text
     assert "replaceChildren" in r.text
     assert "innerHTML" not in r.text
