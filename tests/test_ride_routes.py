@@ -112,7 +112,20 @@ def test_ride_page_renders_available_when_monkeypatched(client, monkeypatch):
     assert '{label: "Target power", data: prescribed, yAxisID: "y"' in r.text
     assert '{label: "Measured power", data: livePower, yAxisID: "y"' in r.text
     assert 'borderColor: "#f2a900"' in r.text
-    assert 'borderColor: "#ffd166", backgroundColor: "#ffd166"' in r.text
+    assert 'borderColor: "rgba(255, 209, 102, 0.7)", backgroundColor: "rgba(255, 209, 102, 0.7)"' in r.text
+    assert 'borderColor: "rgba(87, 199, 255, 0.7)"' in r.text
+    assert 'borderColor: "rgba(255, 77, 141, 0.7)"' in r.text
+    assert 'id="rideChartTitle"' in r.text
+    assert 'workout.name || "Workout metrics"' in r.text
+    assert 'id="ergIndicator"' in r.text
+    assert 'indicator.classList.toggle("erg-lit", ergEnabled)' in r.text
+    assert "function fmtHms(sec)" in r.text
+    assert "function blockRemaining(elapsed)" in r.text
+    assert 'id="clockElapsed"' in r.text
+    assert 'id="clockBlock"' in r.text
+    assert 'id="clockTotal"' in r.text
+    assert "grid: {drawTicks: true, tickLength: 8, tickColor: tickMark}" in r.text
+    assert "grid: {drawOnChartArea: false, drawTicks: true, tickLength: 8," in r.text
     assert "borderDash: [8, 4]" in r.text
     assert '{label: "Cadence", data: liveCadence, yAxisID: "metrics"' in r.text
     assert '{label: "Heart rate", data: liveHr, yAxisID: "metrics"' in r.text
@@ -146,6 +159,8 @@ def test_ride_chart_styles_support_live_metrics_and_fullscreen(client):
     assert ".ride-chart-block:fullscreen" in r.text
     assert ".ride-chart-fullscreen-fallback" in r.text
     assert "body.ride-chart-fullscreen-open" in r.text
+    assert ".ride-chart-clocks" in r.text
+    assert ".ride-chart-erg.erg-lit .erg-led" in r.text
 
 
 def test_ride_status_endpoint(client, monkeypatch):

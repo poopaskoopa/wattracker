@@ -94,13 +94,21 @@
        without power and resumes when you pedal.</p>
     <div id="rideChartPanel" class="ride-chart-block">
         <div class="ride-chart-heading">
-            <h3>Workout metrics</h3>
+            <h3 id="rideChartTitle">Workout metrics</h3>
             <button type="button" id="chartFullscreenBtn" class="button-secondary"
                     aria-controls="rideChartPanel" aria-pressed="false">
                 View chart full screen
             </button>
         </div>
         <div class="ride-chart-canvas">
+            <div class="ride-chart-clocks" aria-hidden="true">
+                <span><strong id="clockElapsed">0:00</strong><small>Elapsed</small></span>
+                <span><strong id="clockBlock">0:00</strong><small>Block left</small></span>
+                <span><strong id="clockTotal">0:00</strong><small>Workout left</small></span>
+            </div>
+            <div id="ergIndicator" class="ride-chart-erg erg-dark" aria-hidden="true">
+                <span class="erg-led"></span><span class="erg-label">ERG</span>
+            </div>
             <div class="ride-chart-metrics" aria-hidden="true">
                 <span class="metric-power"><strong id="chartPowerValue">&mdash;</strong><small>W</small></span>
                 <span class="metric-cadence"><strong id="chartCadenceValue">&mdash;</strong><small>rpm</small></span>
@@ -130,6 +138,7 @@
     var MAX_CHART_POINTS = 30000;
     var chartPointLimit = MAX_CHART_POINTS;
     var workoutDuration = 0;
+    var workoutProfile = [];
     var connectedAddresses = {};
     var pendingDisconnects = {};
     var ergAvailable = false, ergEnabled = false, ergPending = false;
@@ -199,22 +208,38 @@
         element.classList.remove("status-success", "status-failure", "status-working");
         if (kind) element.classList.add("status-" + kind);
     }
+    function themeColor(name, fallback) {
+        var value = getComputedStyle(document.documentElement).getPropertyValue(name);
+        value = (value || "").trim();
+        return value || fallback;
+    }
     function chartOptions(duration) {
+        var axisText = themeColor("--text", "#e6e6e6");
+        var tickMark = themeColor("--muted", "#8a94a0");
+        var axisFont = {size: 13, weight: "600"};
+        var titleFont = {size: 13, weight: "700"};
         return {responsive: true, maintainAspectRatio: false, animation: false,
             parsing: false, plugins: {legend: {display: true},
                 decimation: {enabled: true, algorithm: "lttb", samples: 1000, threshold: 2000}},
             scales: {
-            x: {type: "linear", title: {display: true, text: "Workout time (minutes)"},
+            x: {type: "linear", title: {display: true, text: "Workout time (minutes)",
+                    color: axisText, font: titleFont},
                 min: 0, max: duration,
-                ticks: {callback: function (value) {
+                grid: {drawTicks: true, tickLength: 8, tickColor: tickMark},
+                ticks: {color: axisText, font: axisFont, callback: function (value) {
                     var minutes = Number(value) / 60;
                     return Number.isInteger(minutes) ? String(minutes) : minutes.toFixed(1);
                 }}},
             y: {beginAtZero: true, position: "left",
-                title: {display: true, text: "Power (W)"}},
+                title: {display: true, text: "Power (W)", color: axisText, font: titleFont},
+                ticks: {color: axisText, font: axisFont},
+                grid: {drawTicks: true, tickLength: 8, tickColor: tickMark}},
             metrics: {beginAtZero: true, position: "right",
-                title: {display: true, text: "Cadence (rpm) / Heart rate (bpm)"},
-                grid: {drawOnChartArea: false}}
+                title: {display: true, text: "Cadence (rpm) / Heart rate (bpm)",
+                    color: axisText, font: titleFont},
+                ticks: {color: axisText, font: axisFont},
+                grid: {drawOnChartArea: false, drawTicks: true, tickLength: 8,
+                    tickColor: tickMark}}
         }};
     }
     function finiteNumber(value) {
@@ -231,9 +256,33 @@
         document.getElementById("chartCadenceValue").textContent = metricText(st.cadence);
         document.getElementById("chartHrValue").textContent = metricText(st.hr);
     }
+    function fmtHms(sec) {
+        sec = Math.max(0, Math.round(Number(sec) || 0));
+        var h = Math.floor(sec / 3600), m = Math.floor((sec % 3600) / 60), s = sec % 60;
+        var ss = s < 10 ? "0" + s : String(s);
+        if (!h) return m + ":" + ss;
+        return h + ":" + (m < 10 ? "0" + m : m) + ":" + ss;
+    }
+    function blockRemaining(elapsed) {
+        for (var i = 0; i < workoutProfile.length; i++) {
+            var block = workoutProfile[i];
+            var start = Number(block.start) || 0, end = Number(block.end) || 0;
+            if (elapsed >= start && elapsed < end) return end - elapsed;
+        }
+        return 0;
+    }
+    function setChartClocks(elapsed, total) {
+        document.getElementById("clockElapsed").textContent = fmtHms(elapsed);
+        document.getElementById("clockBlock").textContent = fmtHms(blockRemaining(elapsed));
+        document.getElementById("clockTotal").textContent = fmtHms(total - elapsed);
+    }
     function setupWorkout(workout) {
         if (!workout) return;
         workoutDuration = Math.max(0, Number(workout.duration_s) || 0);
+        workoutProfile = workout.profile || [];
+        document.getElementById("rideChartTitle").textContent =
+            workout.name || "Workout metrics";
+        setChartClocks(0, workoutDuration);
         document.getElementById("workoutDetails").textContent = workout.name + " — " +
             fmt(workout.duration_s) + " — FTP " + workout.ftp + " W";
         var prescribed = [];
@@ -256,13 +305,13 @@
                     borderColor: "#f2a900", pointRadius: 0, borderWidth: 2,
                     borderDash: [8, 4]},
                 {label: "Measured power", data: livePower, yAxisID: "y",
-                    borderColor: "#ffd166", backgroundColor: "#ffd166",
-                    pointBackgroundColor: "#ffd166", pointRadius: 2.5,
+                    borderColor: "rgba(255, 209, 102, 0.7)", backgroundColor: "rgba(255, 209, 102, 0.7)",
+                    pointBackgroundColor: "rgba(255, 209, 102, 0.7)", pointRadius: 2.5,
                     pointHoverRadius: 4, borderWidth: 3},
                 {label: "Cadence", data: liveCadence, yAxisID: "metrics",
-                    borderColor: "#57c7ff", pointRadius: 0, borderWidth: 2},
+                    borderColor: "rgba(87, 199, 255, 0.7)", pointRadius: 0, borderWidth: 2},
                 {label: "Heart rate", data: liveHr, yAxisID: "metrics",
-                    borderColor: "#ff4d8d", pointRadius: 0, borderWidth: 2}
+                    borderColor: "rgba(255, 77, 141, 0.7)", pointRadius: 0, borderWidth: 2}
             ]}, options: chartOptions(workoutDuration)});
     }
     function appendOrReplace(points, point) {
@@ -277,6 +326,8 @@
         if (!rideChart) return;
         var elapsed = finiteNumber(st.elapsed);
         if (elapsed == null) return;
+        var total = finiteNumber(st.total);
+        setChartClocks(elapsed, total == null ? workoutDuration : total);
         appendOrReplace(livePower, {x: elapsed, y: finiteNumber(st.power)});
         appendOrReplace(liveCadence, {x: elapsed, y: finiteNumber(st.cadence)});
         appendOrReplace(liveHr, {x: elapsed, y: finiteNumber(st.hr)});
@@ -618,6 +669,7 @@
             resetConnectedRows();
             ergPending = false;
             applyErgState(false, false);
+            setChartClocks(0, workoutDuration);
             ws = null;
             var nextOpen = queuedOpen;
             queuedOpen = null;
@@ -755,6 +807,9 @@
         button.disabled = !ergAvailable || ergPending || !ws;
         button.setAttribute("aria-pressed", ergEnabled ? "true" : "false");
         button.classList.toggle("erg-on", ergEnabled);
+        var indicator = document.getElementById("ergIndicator");
+        indicator.classList.toggle("erg-lit", ergEnabled);
+        indicator.classList.toggle("erg-dark", !ergEnabled);
         button.textContent = ergAvailable
             ? "ERG mode: " + (ergEnabled ? "On" : "Off")
             : "ERG mode unavailable";
