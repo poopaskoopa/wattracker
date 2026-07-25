@@ -33,6 +33,7 @@ import urllib.request
 from typing import Dict, List, Optional
 
 from . import db
+from .timeutil import utc_now
 from .metrics.curve import best_rolling_power
 
 log = logging.getLogger(__name__)
@@ -132,12 +133,14 @@ def parse_zwiftpower_profile(doc: dict) -> List[dict]:
     """
     rows = doc.get("data") or []
     out: List[dict] = []
-    fetched = _dt.datetime.now().isoformat(timespec="seconds")
+    fetched = utc_now().isoformat(timespec="seconds")
     for r in rows:
         if not _is_zp_race(r):
             continue
         try:
-            when = _dt.datetime.fromtimestamp(int(r.get("event_date") or 0))
+            when = _dt.datetime.fromtimestamp(
+                int(r.get("event_date") or 0), _dt.timezone.utc
+            ).replace(tzinfo=None)
         except (ValueError, TypeError, OSError):
             continue
         dur = _f(r.get("time"))  # seconds ([value, flag] or scalar)
@@ -240,7 +243,7 @@ def _is_race(activity: dict) -> bool:
 
 def derive_local_results(user_id: int) -> List[dict]:
     """Derive race results from imported FIT rides (heuristic, labeled as such)."""
-    fetched = _dt.datetime.now().isoformat(timespec="seconds")
+    fetched = utc_now().isoformat(timespec="seconds")
     out: List[dict] = []
     for a in db.full_activities(user_id):
         if not _is_race(a):

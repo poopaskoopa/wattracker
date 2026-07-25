@@ -304,7 +304,7 @@ def test_calendar_click_reconciles_today_and_exposes_rpe_prompt(client, monkeypa
     _register(client)
     uid = db.get_user_by_username("rider")["id"]
     today = dt.date(2026, 8, 5)
-    monkeypatch.setattr(servermod._dt, "date", _FrozenDate(today))
+    monkeypatch.setattr(servermod, "utc_today", lambda: today)
     workout_id, activity_id = _today_profile_workout(uid, today.isoformat())
 
     reconciled = client.post(f"/api/plan/workout/{workout_id}/reconcile")
@@ -339,7 +339,7 @@ def test_calendar_click_reconciles_past_scheduled_date(client, monkeypatch):
     uid = db.get_user_by_username("rider")["id"]
     today = dt.date(2026, 8, 8)
     scheduled = dt.date(2026, 8, 5)
-    monkeypatch.setattr(servermod._dt, "date", _FrozenDate(today))
+    monkeypatch.setattr(servermod, "utc_today", lambda: today)
     workout_id, activity_id = _today_profile_workout(uid, scheduled.isoformat())
 
     reconciled = client.post(f"/api/plan/workout/{workout_id}/reconcile")
@@ -475,7 +475,7 @@ def test_calendar_click_rejects_profile_mismatch_and_foreign_workout(client, mon
     _register(client, "alice")
     alice = db.get_user_by_username("alice")["id"]
     today = dt.date(2026, 8, 5)
-    monkeypatch.setattr(servermod._dt, "date", _FrozenDate(today))
+    monkeypatch.setattr(servermod, "utc_today", lambda: today)
     workout_id, _ = _today_profile_workout(alice, today.isoformat(), power_scale=0.0)
 
     no_match = client.post(f"/api/plan/workout/{workout_id}/reconcile")
@@ -498,7 +498,7 @@ def test_calendar_click_does_not_trust_mismatched_precompleted_profile(
     _register(client)
     uid = db.get_user_by_username("rider")["id"]
     today = dt.date(2026, 8, 5)
-    monkeypatch.setattr(servermod._dt, "date", _FrozenDate(today))
+    monkeypatch.setattr(servermod, "utc_today", lambda: today)
     workout_id, activity_id = _today_profile_workout(
         uid, today.isoformat(), power_scale=0.0
     )
@@ -532,7 +532,7 @@ def test_stored_compliance_cannot_verify_oversized_linked_activity(
     _register(client)
     uid = db.get_user_by_username("rider")["id"]
     today = dt.date(2026, 8, 5)
-    monkeypatch.setattr(servermod._dt, "date", _FrozenDate(today))
+    monkeypatch.setattr(servermod, "utc_today", lambda: today)
     workout_id, _ = _today_profile_workout(uid, today.isoformat())
     workout = db.get_plan_workout(uid, workout_id)
     profile = importer._zwo_fraction_profile(workout["zwo_or_segments"])
@@ -763,7 +763,7 @@ def test_plan_page_current_plan_covers_today(client, monkeypatch):
     _register(client)
     uid = db.get_user_by_username("rider")["id"]
     today = dt.date(2026, 8, 20)
-    monkeypatch.setattr(servermod._dt, "date", _FrozenDate(today))
+    monkeypatch.setattr(servermod, "utc_today", lambda: today)
     # Plan starts before today, ends after (4 weeks from Aug 3).
     form = dict(PLAN_FORM, name="Live Plan")
     client.post("/generate/plan", data=form)
@@ -778,7 +778,7 @@ def test_plan_page_not_in_effect_when_no_plan_covers_today(client, monkeypatch):
 
     _register(client)
     today = dt.date(2027, 1, 1)  # long after the Aug 2026 plan window
-    monkeypatch.setattr(servermod._dt, "date", _FrozenDate(today))
+    monkeypatch.setattr(servermod, "utc_today", lambda: today)
     client.post("/generate/plan", data=dict(PLAN_FORM, name="Old Plan"))
     text = client.get("/plan").text
     assert "Old Plan" in text
@@ -904,13 +904,3 @@ def test_generate_plan_post_flow_unchanged(client):
     assert "hard time" in r.text
 
 
-def _FrozenDate(fixed):
-    """A dt.date subclass whose today() returns `fixed`; fromisoformat and
-    arithmetic behave normally, so it can drop-in replace server._dt.date."""
-
-    class Frozen(dt.date):
-        @classmethod
-        def today(cls):
-            return fixed
-
-    return Frozen

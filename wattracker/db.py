@@ -17,6 +17,7 @@ from typing import Callable, Dict, List, Optional, Sequence, Union
 
 from .config import db_path
 from .config import _restrict
+from .timeutil import utc_now
 
 _log = logging.getLogger(__name__)
 
@@ -71,22 +72,27 @@ def _backfill_inapp_utc(conn: sqlite3.Connection) -> None:
     """
     from .timeutil import local_offset_ranges
 
-    now = _dt.datetime.now()
+    now = _dt.datetime.now()  # local on purpose: bounds a local-offset scan
     ranges = local_offset_ranges(
         _dt.datetime(2000, 1, 1), now + _dt.timedelta(days=366)
     )
-    case = "CASE "
     prev = ranges[0][1]
-    for boundary, offset in ranges[1:]:
-        case += f"WHEN start_time < '{boundary.isoformat()}' THEN {-prev} "
-        prev = offset
-    case += f"ELSE {-prev} END"
+    if len(ranges) == 1:
+        # A timezone that has never observed DST (UTC, Tokyo, Phoenix) yields a
+        # single range, and "CASE ELSE x END" with no WHEN is a syntax error.
+        shift = str(-prev)
+    else:
+        case = "CASE "
+        for boundary, offset in ranges[1:]:
+            case += f"WHEN start_time < '{boundary.isoformat()}' THEN {-prev} "
+            prev = offset
+        shift = case + f"ELSE {-prev} END"
     conn.execute(
         # COALESCE keeps an unparseable timestamp as-is instead of nulling it;
         # substr(...,20) carries the original fractional seconds across, since
         # strftime would truncate them to milliseconds.
         "UPDATE activities SET start_time = COALESCE("
-        f"strftime('%Y-%m-%dT%H:%M:%S', start_time, printf('%+d seconds', {case}))"
+        f"strftime('%Y-%m-%dT%H:%M:%S', start_time, printf('%+d seconds', {shift}))"
         " || substr(start_time, 20), start_time) "
         f"WHERE start_time IS NOT NULL AND {IN_APP_FILENAME_SQL}"
     )
@@ -456,7 +462,7 @@ def create_user(username: str, password_hash: str, path: Optional[str] = None) -
     try:
         cur = conn.execute(
             "INSERT INTO users (username, password_hash, created) VALUES (?, ?, ?)",
-            (username, password_hash, _dt.datetime.now().isoformat()),
+            (username, password_hash, utc_now().isoformat()),
         )
         conn.commit()
         return cur.lastrowid
@@ -777,7 +783,7 @@ def get_activity(user_id: int, activity_id: int, path: Optional[str] = None) -> 
 
 
 def recent_power_streams(user_id: int, days: int = 90, path: Optional[str] = None) -> List[List[float]]:
-    cutoff = (_dt.datetime.now() - _dt.timedelta(days=days)).isoformat()
+    cutoff = (utc_now() - _dt.timedelta(days=days)).isoformat()
     conn = connect(path)
     try:
         rows = conn.execute(
@@ -891,7 +897,7 @@ def recent_full_activities(
     user's entire stream history. Ordered by start_time ascending, like
     ``full_activities``.
     """
-    cutoff = (_dt.datetime.now() - _dt.timedelta(days=days)).isoformat()
+    cutoff = (utc_now() - _dt.timedelta(days=days)).isoformat()
     conn = connect(path)
     try:
         rows = conn.execute(
@@ -1129,7 +1135,7 @@ def create_plan(
             "INSERT INTO plans (user_id, name, start_date, weeks, created, model) "
             "VALUES (?, ?, ?, ?, ?, ?)",
             (user_id, name, start_date, int(weeks),
-             _dt.datetime.now().isoformat(), model),
+             utc_now().isoformat(), model),
         )
         conn.commit()
         return cur.lastrowid
@@ -1414,7 +1420,7 @@ def add_standalone_workout(
             "(user_id,export_key,scheduled_date,name,type,duration_s,tss,zwo,"
             " export_ftp,created) VALUES (?,?,?,?,?,?,?,?,?,?)",
             (user_id, export_key, scheduled_date, name, type, int(duration_s),
-             float(tss), zwo, float(export_ftp), _dt.datetime.now().isoformat()),
+             float(tss), zwo, float(export_ftp), utc_now().isoformat()),
         )
         row = conn.execute(
             "SELECT id FROM standalone_workouts WHERE user_id=? AND export_key=?",
@@ -1640,7 +1646,7 @@ def apply_feedback_batch(
         cur = conn.execute(
             "INSERT INTO ftp_feedback_batches(user_id,ftp_date,delta,created) "
             "VALUES (?,?,?,?)",
-            (user_id, ftp_date, float(delta), _dt.datetime.now().isoformat()),
+            (user_id, ftp_date, float(delta), utc_now().isoformat()),
         )
         batch_id = int(cur.lastrowid)
         for kind in ("plan", "standalone"):
@@ -1902,7 +1908,7 @@ def save_race_sync(
             "VALUES (?, ?, ?, ?, ?, ?, ?)",
             (
                 user_id, rider_id,
-                last_refresh or _dt.datetime.now().isoformat(timespec="seconds"),
+                last_refresh or utc_now().isoformat(timespec="seconds"),
                 source, error, json.dumps(bests or {}), int(bool(auth_failed)),
             ),
         )
@@ -1955,7 +1961,7 @@ def add_ooto_range(
             "INSERT INTO ooto_ranges (user_id, start_date, end_date, note, created) "
             "VALUES (?, ?, ?, ?, ?)",
             (user_id, start_date, end_date, note or None,
-             _dt.datetime.now().isoformat(timespec="seconds")),
+             utc_now().isoformat(timespec="seconds")),
         )
         conn.commit()
         return cur.lastrowid

@@ -47,6 +47,7 @@ from .prescribe.planner import (
     plan_workout,
     workout_type_info,
 )
+from .timeutil import utc_now, utc_today
 
 DAY_LABELS = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
 
@@ -96,7 +97,7 @@ def _start_user_scan(user_id: int, directory: Optional[str]) -> Optional[dict]:
             return None
         status = {
             "running": True,
-            "started_at": _dt.datetime.now().isoformat(timespec="seconds"),
+            "started_at": utc_now().isoformat(timespec="seconds"),
             "total": 0,
             "processed": 0,
             "imported": 0,
@@ -135,7 +136,7 @@ def _start_user_scan(user_id: int, directory: Optional[str]) -> Optional[dict]:
             with _scan_lock:
                 st = _scan_status[user_id]
                 st["running"] = False
-                st["finished_at"] = _dt.datetime.now().isoformat(
+                st["finished_at"] = utc_now().isoformat(
                     timespec="seconds"
                 )
 
@@ -209,7 +210,7 @@ async def auto_scan_loop(stop: "asyncio.Event") -> None:
 
 
 def _upcoming_monday(today: Optional[_dt.date] = None) -> _dt.date:
-    today = today or _dt.date.today()
+    today = today or utc_today()
     delta = (0 - today.weekday()) % 7  # 0 if today is Monday, else days to next Monday
     return today + _dt.timedelta(days=delta)
 
@@ -721,7 +722,7 @@ def create_app() -> FastAPI:
         """
         if uid is None:
             return {"current": None, "others": []}
-        today = _dt.date.today()
+        today = utc_today()
         entries = []
         for p in db.list_plans(uid):  # created DESC
             workouts = db.plan_workouts_for_plan(uid, p["id"])
@@ -770,7 +771,7 @@ def create_app() -> FastAPI:
             day_labels=DAY_LABELS,
             exported=None,
             exported_path=None,
-            scheduled_date=_dt.date.today().isoformat(),
+            scheduled_date=utc_today().isoformat(),
             flash=None,
             plan_mgmt=_plan_management(_uid(request)),
         )
@@ -1064,7 +1065,7 @@ def create_app() -> FastAPI:
         month: Optional[int] = None,
     ):
         uid = _uid(request)
-        today = _dt.date.today()
+        today = utc_today()
         y = year or today.year
         m = month or today.month
         # Normalise month into 1..12 (defensive).
@@ -1361,7 +1362,7 @@ def create_app() -> FastAPI:
             try:
                 watts = float(ftp)
                 if watts > 0:
-                    db.add_ftp_entry(uid, _dt.date.today().isoformat(), watts, "manual")
+                    db.add_ftp_entry(uid, utc_today().isoformat(), watts, "manual")
             except ValueError:
                 pass
         # The Anthropic API key is app-level (shared).
@@ -1465,7 +1466,7 @@ def create_app() -> FastAPI:
 
     # ------------------------------------------------------- ride (BLE)
     def _upcoming_plan_workouts(uid: int, limit: int = 40) -> List[dict]:
-        today = _dt.date.today().isoformat()
+        today = utc_today().isoformat()
         out: List[dict] = []
         for p in db.list_plans(uid):
             for w in db.plan_workouts_for_plan(uid, p["id"]):
@@ -2172,7 +2173,7 @@ def create_app() -> FastAPI:
         if not workout:
             return JSONResponse({"error": "workout not found"}, status_code=404)
 
-        today = _dt.date.today()
+        today = utc_today()
         verified = importer.plan_workout_completion_verified(uid, workout)
         if workout["date"] > today.isoformat():
             status = (
@@ -2304,7 +2305,7 @@ def create_app() -> FastAPI:
                 "rpe_eligible": completion_verified,
                 "can_mark_complete": (
                     w.get("completed_activity_id") is None
-                    and w["date"] <= _dt.date.today().isoformat()
+                    and w["date"] <= utc_today().isoformat()
                 ),
                 "ftp": round(ftp, 1),
                 "description": session.description,

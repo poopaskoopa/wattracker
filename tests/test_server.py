@@ -8,6 +8,7 @@ from fastapi.testclient import TestClient  # noqa: E402
 
 from wattracker import db  # noqa: E402
 from wattracker.server import create_app  # noqa: E402
+from wattracker.timeutil import utc_today  # noqa: E402
 
 
 @pytest.fixture()
@@ -123,7 +124,7 @@ def test_per_user_data_isolation(client):
     _register(client, "alice", "password123")
     a_id = db.get_user_by_username("alice")["id"]
     _seed_activity(a_id)
-    db.add_ftp_entry(a_id, dt.date.today().isoformat(), 300.0, "manual")
+    db.add_ftp_entry(a_id, utc_today().isoformat(), 300.0, "manual")
 
     assert len(client.get("/api/activities").json()) == 1
     assert len(client.get("/api/ftp").json()) == 1

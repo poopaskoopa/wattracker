@@ -8,6 +8,7 @@ from fastapi.testclient import TestClient  # noqa: E402
 
 from wattracker import db  # noqa: E402
 from wattracker.server import create_app  # noqa: E402
+from wattracker.timeutil import utc_now, utc_today  # noqa: E402
 
 
 @pytest.fixture()
@@ -39,7 +40,7 @@ def _seed(uid, when, watts=300.0, seconds=1200):
 def _setup(client):
     client.post("/register", data={"username": "rider", "password": "password123"})
     uid = db.get_user_by_username("rider")["id"]
-    now = dt.datetime.now().replace(microsecond=0)
+    now = utc_now().replace(microsecond=0)
     _seed(uid, now - dt.timedelta(days=60), watts=300.0)
     _seed(uid, now, watts=340.0)
     return uid
@@ -73,7 +74,7 @@ def test_api_ftp_series_months_param_accepted(client):
 
 def test_api_ftp_still_returns_recorded_list(client):
     uid = _setup(client)
-    db.add_ftp_entry(uid, dt.date.today().isoformat(), 300.0, "manual")
+    db.add_ftp_entry(uid, utc_today().isoformat(), 300.0, "manual")
     data = client.get("/api/ftp").json()
     assert isinstance(data, list)
     assert len(data) == 1
