@@ -81,8 +81,8 @@ def test_ride_page_renders_available_when_monkeypatched(client, monkeypatch):
     assert "new Chart" in r.text
     assert "MAX_CHART_POINTS" in r.text
     assert "MAX_CHART_POINTS = 30000" in r.text
-    assert "appendOrReplace(livePower" in r.text
-    assert "appendOrReplace(liveHr" in r.text
+    assert "appendSmoothed(livePower, smoothPower, powerSmoother" in r.text
+    assert "appendSmoothed(liveHr, smoothHr, hrSmoother" in r.text
     assert "normalized: true" not in r.text
     assert "hasWarnings ? \"failure\" : \"success\"" in r.text
     assert "primeAudio();" in r.text
@@ -130,13 +130,24 @@ def test_ride_page_renders_available_when_monkeypatched(client, monkeypatch):
     assert "window.confirm(" in r.text
     assert 'socket.send(JSON.stringify({action: "stop"}))' in r.text
     assert '{label: "Target power", data: prescribed, yAxisID: "y"' in r.text
-    assert '{label: "Measured power", data: livePower, yAxisID: "y"' in r.text
+    # The prominent measured trace is the rolling mean; the raw samples survive
+    # only as a faint point-less ghost behind it.
+    assert '{label: "Measured power (" + POWER_SMOOTH_S + "s)", data: smoothPower, yAxisID: "y"' in r.text
+    assert '{label: "Measured power (raw)", data: livePower, yAxisID: "y"' in r.text
+    assert 'borderColor: "rgba(255, 209, 102, 0.25)", pointRadius: 0' in r.text
+    assert "var POWER_SMOOTH_S = 10, METRIC_SMOOTH_S = 5;" in r.text
+    assert "function smoothedValue(state, x, y)" in r.text
     assert 'borderColor: "#f2a900"' in r.text
     assert 'borderColor: "rgba(255, 209, 102, 0.7)", backgroundColor: "rgba(255, 209, 102, 0.7)"' in r.text
     assert 'borderColor: "rgba(87, 199, 255, 0.7)"' in r.text
     assert 'borderColor: "rgba(255, 77, 141, 0.7)"' in r.text
     assert 'id="rideChartTitle"' in r.text
     assert 'workout.name || "Workout metrics"' in r.text
+    # In plan mode setupWorkout only runs once the ride connects, so the heading
+    # follows the select until then.
+    assert "function showSelectedWorkoutTitle()" in r.text
+    assert '<option value="" data-name="Endurance">' in r.text
+    assert 'document.getElementById("workoutSelect").addEventListener("change", showSelectedWorkoutTitle)' in r.text
     assert 'id="ergIndicator"' in r.text
     assert 'indicator.classList.toggle("erg-lit", ergEnabled)' in r.text
     assert "function fmtHms(sec)" in r.text
@@ -144,17 +155,37 @@ def test_ride_page_renders_available_when_monkeypatched(client, monkeypatch):
     assert 'id="clockElapsed"' in r.text
     assert 'id="clockBlock"' in r.text
     assert 'id="clockTotal"' in r.text
-    assert "grid: {drawTicks: true, tickLength: 8, tickColor: tickMark}" in r.text
+    # Intermediate gridlines exist only as intermediate ticks in Chart.js v4.
+    assert "grid: {drawTicks: true, tickLength: 8, tickColor: tickMark, color: gridLine}" in r.text
+    assert "function timeStepSize(duration)" in r.text
+    assert "stepSize: timeStepSize(duration)" in r.text
+    # A fixed watt step would give an easy 110 W ride three gridlines, so the
+    # step is chosen from the live range once the data limits are known.
+    assert "function powerStepSize(max)" in r.text
+    assert "scale.options.ticks.stepSize = powerStepSize(scale.max);" in r.text
+    assert "stepSize: 50, maxTicksLimit: 14" in r.text
+    # With no cadence or HR sensor the right-hand axis has no data and would
+    # otherwise collapse to a 0-1 scale.
+    assert 'metrics: {beginAtZero: true, position: "right", suggestedMax: 200,' in r.text
+    # setupWorkout is destructive, so a preview response that arrives after the
+    # rider changed mode or duration again must be discarded.
+    assert "var previewToken = 0;" in r.text
+    assert "var token = ++previewToken;" in r.text
+    assert "if (token !== previewToken || !justRide()) return;" in r.text
     assert "grid: {drawOnChartArea: false, drawTicks: true, tickLength: 8," in r.text
     assert "borderDash: [8, 4]" in r.text
-    assert '{label: "Cadence", data: liveCadence, yAxisID: "metrics"' in r.text
-    assert '{label: "Heart rate", data: liveHr, yAxisID: "metrics"' in r.text
+    assert '{label: "Cadence", data: smoothCadence, yAxisID: "metrics"' in r.text
+    assert '{label: "Heart rate", data: smoothHr, yAxisID: "metrics"' in r.text
     assert 'metrics: {beginAtZero: true, position: "right"' in r.text
     assert 'text: "Cadence (rpm) / Heart rate (bpm)"' in r.text
-    assert "appendOrReplace(liveHr" in r.text
+    assert "appendSmoothed(liveHr" in r.text
     assert "if (rideChart) {" in r.text
     assert "rideChart.destroy();" in r.text
-    assert "pointRadius: 2.5" in r.text
+    # A dot per sample was the chart's main source of visual noise.
+    assert "pointRadius: 2.5" not in r.text
+    assert "pointHoverRadius: 4" in r.text
+    # The target is a prescription of steps and ramps: it must not be rounded.
+    assert "borderDash: [8, 4], tension: 0, order: 0" in r.text
     assert "borderWidth: 3" in r.text
     assert 'id="chartFullscreenBtn"' in r.text
     assert 'aria-controls="rideChartPanel"' in r.text
@@ -263,6 +294,10 @@ def test_ride_chart_styles_support_live_metrics_and_fullscreen(client):
     assert "body.ride-chart-fullscreen-open" in r.text
     assert ".ride-chart-clocks" in r.text
     assert ".ride-chart-erg.erg-lit .erg-led" in r.text
+    # The inline chart grows with the page: a fixed 260px box is a 5:1 letter
+    # slot on a wide main. The full-screen rule still overrides it.
+    assert "height: clamp(260px, 28vw, 400px)" in r.text
+    assert ".ride-chart-fullscreen-fallback .ride-chart-canvas {\n    height: calc(100vh - 5.5rem);" in r.text
 
 
 def test_ride_status_endpoint(client, monkeypatch):
