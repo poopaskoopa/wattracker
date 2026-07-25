@@ -33,6 +33,11 @@ log = logging.getLogger(__name__)
 
 BLE_VALUE_STALE_S = 3.0
 
+# Bound each per-client BLE connect so a device the OS still holds (common with
+# a KICKR right after a session) fails fast with a visible error instead of
+# hanging the WebSocket forever.
+CONNECT_TIMEOUT_S = 10.0
+
 
 def bleak_available() -> Tuple[bool, str]:
     """Return (available, reason). Feature-detects the optional ``bleak`` import.
@@ -552,7 +557,22 @@ async def connect_sensors(
                 if client is None:
                     client = BleakClient(addr)
                     try:
-                        await client.connect()
+                        await asyncio.wait_for(
+                            client.connect(), timeout=CONNECT_TIMEOUT_S
+                        )
+                    except asyncio.TimeoutError:
+                        try:
+                            await client.disconnect()
+                        except BaseException:
+                            pass
+                        message = (
+                            f"Timed out connecting {role} sensor {dev['name']} "
+                            f"({addr}) — it may still be held by another app or a "
+                            f"previous ride; wait a few seconds and retry."
+                        )
+                        log.warning(message)
+                        out["errors"].append(message)
+                        continue
                     except BaseException as e:
                         try:
                             await client.disconnect()
