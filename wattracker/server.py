@@ -18,6 +18,7 @@ from typing import List, Optional
 
 from fastapi import Body, FastAPI, Form, Request, UploadFile, WebSocket
 from fastapi.responses import (
+    FileResponse,
     HTMLResponse,
     JSONResponse,
     PlainTextResponse,
@@ -252,7 +253,7 @@ class NoCacheStaticFiles(StaticFiles):
 # Paths served without authentication. Interactive docs are disabled (see the
 # FastAPI() constructor), so no /docs, /openapi or /redoc prefixes are exempt.
 _EXEMPT = ("/login", "/register")
-_EXEMPT_PREFIXES = ("/static", "/favicon")
+_EXEMPT_PREFIXES = ("/static", "/favicon", "/apple-touch-icon")
 
 # Max in-memory size for an uploaded activity file (bytes). A real .fit ride is
 # well under this; the cap stops a huge upload from exhausting memory.
@@ -377,6 +378,18 @@ def create_app() -> FastAPI:
         openapi_url=None,
     )
     app.mount("/static", NoCacheStaticFiles(directory=_STATIC_DIR), name="static")
+
+    # Safari (and some other agents) ignore the <link rel="icon"> SVG and fetch
+    # these from the site root regardless of what the document declares, so
+    # serve them there too rather than only under /static.
+    @app.get("/favicon.ico", include_in_schema=False)
+    async def favicon_ico() -> FileResponse:
+        return FileResponse(os.path.join(_STATIC_DIR, "favicon.ico"))
+
+    @app.get("/apple-touch-icon.png", include_in_schema=False)
+    async def apple_touch_icon() -> FileResponse:
+        return FileResponse(os.path.join(_STATIC_DIR, "apple-touch-icon.png"))
+
     # Per-user cache of the last generated .zwo (avoids cross-user bleed).
     app.state.last = {}
     # In-process brute-force throttle for /login (per lowercased username).

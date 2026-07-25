@@ -4,6 +4,12 @@
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <title>{% block title %}wattracker{% endblock %}</title>
+    <!-- Tab icon: chainring + watt bolt. SVG for modern browsers, PNG fallback. -->
+    <link rel="icon" type="image/svg+xml" href="{{ static_url('favicon.svg') }}">
+    <!-- Safari ignores the SVG above; it uses the .ico (also served from / ). -->
+    <link rel="icon" type="image/x-icon" sizes="any" href="/favicon.ico">
+    <link rel="alternate icon" type="image/png" sizes="32x32" href="{{ static_url('favicon-32.png') }}">
+    <link rel="apple-touch-icon" href="{{ static_url('apple-touch-icon.png') }}">
     <link rel="stylesheet" href="{{ static_url('style.css') }}">
     <!-- Vendored locally so the app is fully self-contained (no external CDN).
          chart.js v4.5.1 UMD build; chartjs-plugin-zoom v2.2.0 (v2 requires
