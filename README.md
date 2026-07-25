@@ -120,11 +120,16 @@ or `wattracker-restore --restore 1`; a frozen bundle uses
 `wattracker.exe restore [--restore N]`. Restore safety follows the configured
 loopback port.
 
-Windows CI runs Python 3.10 tests, matching the project's minimum supported
-version and the version used in development. Windows packaging and
-signed-release jobs are currently hard-disabled to avoid consuming
-hosted-runner minutes; their retained workflow definitions must be explicitly
-re-enabled by a later code change. Windows executables must be built on
+All GitHub Actions jobs are currently hard-disabled, so the test gate is a
+local `python -m pytest tests` run. The Windows test job targeted Python 3.10,
+matching the project's minimum supported version and the version used in
+development; it is disabled because Actions runs are blocked at the account
+level (failed payment or spending limit) and every run reported a red check
+that could not be told apart from a real failure. Windows packaging and
+signed-release jobs were already disabled to avoid consuming hosted-runner
+minutes, which are billable on this private repo. The retained workflow
+definitions must be explicitly re-enabled by a later code change, and the test
+job additionally needs billing resolved. Windows executables must be built on
 Windows. Real BLE hardware and production signing cannot be verified here; use
 [the Windows BLE checklist](docs/windows-ble-validation.md).
 
