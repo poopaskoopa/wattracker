@@ -1165,17 +1165,46 @@
     document.addEventListener("keydown", function (event) {
         if (event.key === "Escape" && chartIsFullscreen()) exitChartFullscreen();
     });
+    // Ask the server to finalize rather than just dropping the socket. The
+    // server does save a started ride when the connection breaks, but that is
+    // its error path; an explicit stop finalizes deterministically and reports
+    // back. Fall back to closing if the socket is already gone, or if the
+    // server does not come back within a few seconds.
     function stopRide() {
         queuedOpen = null;
-        if (ws) { try { ws.close(); } catch (e) {} }
-        setRideState("idle");
+        if (!ws) { setRideState("idle"); return; }
+        var socket = ws;
+        if (socket.readyState !== WebSocket.OPEN) {
+            try { socket.close(); } catch (e) {}
+            setRideState("idle");
+            return;
+        }
+        try {
+            socket.send(JSON.stringify({action: "stop"}));
+        } catch (e) {
+            try { socket.close(); } catch (closeError) {}
+            setRideState("idle");
+            return;
+        }
+        setLive(document.getElementById("connectionStatus"),
+            "Finishing the ride and saving...", "working");
+        window.setTimeout(function () {
+            if (ws === socket && socket.readyState === WebSocket.OPEN) {
+                try { socket.close(); } catch (e) {}
+            }
+        }, 5000);
     }
-    document.getElementById("stopBtn").addEventListener("click", stopRide);
-    document.getElementById("endWorkoutBtn").addEventListener("click", function () {
+    function requestEndRide() {
         if (rideState === "idle") return;
-        if (!window.confirm("End the workout now? The rest of the workout is discarded.")) return;
+        // Browsers suppress or auto-dismiss dialogs raised from full screen,
+        // so come back to the page before asking.
+        exitChartFullscreen();
+        if (!window.confirm("End the ride now? The rest of the workout is " +
+                "discarded and the ride is saved.")) return;
         stopRide();
-    });
+    }
+    document.getElementById("stopBtn").addEventListener("click", requestEndRide);
+    document.getElementById("endWorkoutBtn").addEventListener("click", requestEndRide);
     document.getElementById("scanBtn").addEventListener("click", async function () {
         var el = document.getElementById("deviceList");
         var status = document.getElementById("scanStatus");
