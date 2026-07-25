@@ -120,9 +120,10 @@ or `wattracker-restore --restore 1`; a frozen bundle uses
 `wattracker.exe restore [--restore N]`. Restore safety follows the configured
 loopback port.
 
-Windows CI runs Python 3.10 and 3.13 tests, lifecycle safety, an installed-wheel
-smoke test outside the checkout, and a PyInstaller **onedir** smoke test. Its
-artifacts are explicitly `unsigned`; PRs never sign. Windows executables must be
+Windows CI runs Python 3.12 tests. Windows packaging and signed-release jobs are
+currently hard-disabled to avoid consuming hosted-runner minutes; their retained
+workflow definitions must be explicitly re-enabled by a later code change.
+Windows executables must be
 built on Windows. Real BLE hardware and production signing cannot be verified
 here; use [the Windows BLE checklist](docs/windows-ble-validation.md).
 

@@ -96,6 +96,28 @@ def test_signed_release_only_builds_the_triggering_release_tag():
     assert 'tags:\n      - "v*"' in workflow
 
 
+def test_windows_ci_uses_one_fixed_python_version():
+    workflow = Path(".github/workflows/windows.yml").read_text()
+    test_job = workflow.split("  test:\n", 1)[1].split(
+        "\n  package-unsigned:", 1
+    )[0]
+    assert 'python-version: "3.12"' in test_job
+    assert "matrix:" not in test_job
+    assert test_job.count("python-version:") == 1
+
+
+def test_all_windows_packaging_jobs_are_hard_disabled():
+    workflow = Path(".github/workflows/windows.yml").read_text()
+    package_job = workflow.split("  package-unsigned:\n", 1)[1]
+    assert package_job.startswith("    if: ${{ false }}\n")
+
+    release_workflow = Path(
+        ".github/workflows/windows-release.yml"
+    ).read_text()
+    release_job = release_workflow.split("  build-test-sign:\n", 1)[1]
+    assert release_job.startswith("    if: ${{ false }}\n")
+
+
 def test_signing_script_requires_rfc3161_timestamp_verification():
     script = Path("packaging/sign-windows.ps1").read_text()
     assert "/tr $TimestampUrl /td SHA256" in script
