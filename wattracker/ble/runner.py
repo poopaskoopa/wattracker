@@ -5,8 +5,11 @@ trainer over ERG: at each tick it computes the current target watts and calls
 ``trainer.set_target_power``. The workout clock only advances while measured
 power > 0. A ride starts after three continuous positive-power seconds, pauses
 after three continuous no-power seconds, and resumes on the next positive
-sample. Long-inactivity disconnect policy belongs to the WebSocket owner. On
-finish the controller records the ride as an activity for the user.
+sample. When the prescribed workout runs out the ride enters COOLDOWN: the
+clock and recording keep going while the rider spins down, and three continuous
+no-power seconds finish it. Long-inactivity disconnect policy belongs to the
+WebSocket owner. On finish the controller records the ride as an activity for
+the user.
 """
 from __future__ import annotations
 
@@ -15,6 +18,7 @@ import logging
 from typing import List, Optional, Tuple
 
 from ..prescribe.planner import Session
+from ..timeutil import utc_now
 
 _log = logging.getLogger(__name__)
 
@@ -22,6 +26,7 @@ IDLE = "idle"
 STARTING = "starting"
 RUNNING = "running"
 PAUSED = "paused"
+COOLDOWN = "cooldown"
 FINISHED = "finished"
 
 _DEFAULT_START_GRACE_S = 3.0
@@ -168,7 +173,7 @@ class RideController:
                     return self.state()
                 self.status = RUNNING
                 if self.started_at is None:
-                    self.started_at = _dt.datetime.now()
+                    self.started_at = utc_now()
                 if self.erg_enabled and not self._erg_armed:
                     self._trainer_call("start_erg")
                     self._erg_armed = True
@@ -211,8 +216,11 @@ class RideController:
             self._samples["cadence"].append(cadence)
             self._samples["heartrate"].append(hr)
 
-            if self.elapsed >= self.total_s:
-                self._finish()
+            # The prescribed workout is over but the rider may keep spinning:
+            # enter COOLDOWN and keep clocking/recording until they stop. Only
+            # RUNNING promotes - COOLDOWN never falls back into RUNNING.
+            if self.status == RUNNING and self.elapsed >= self.total_s:
+                self.status = COOLDOWN
         else:
             self._positive_run = 0.0
             if self.status == STARTING:
@@ -223,6 +231,12 @@ class RideController:
                 self._zero_run += dt
                 if self._zero_run >= self.zero_grace_s:
                     self.status = PAUSED
+            elif self.status == COOLDOWN:
+                # Same zero-power grace, opposite meaning: after the workout,
+                # stopping ends the ride rather than pausing it.
+                self._zero_run += dt
+                if self._zero_run >= self.zero_grace_s:
+                    self._finish()
         return self.state()
 
     def poll(self, dt: float = 1.0) -> dict:
@@ -320,7 +334,10 @@ class RideController:
         from .. import db
         from ..ingest import importer
 
-        started = self.started_at or _dt.datetime.now()
+        # started_at is naive UTC, like the timestamps parsed out of .fit files -
+        # the same ride recorded by both the app and Zwift has to land on the
+        # same instant, not four hours apart.
+        started = self.started_at or utc_now()
         n = len(self._samples["power"])
         times = [(started + _dt.timedelta(seconds=i)).isoformat() for i in range(n)]
         streams = {
@@ -336,6 +353,8 @@ class RideController:
             "duration_s": int(self.elapsed),
             "streams": streams,
         }
+        # The app is UTC end to end, so the ride is named by its UTC date -
+        # a late-evening ride west of Greenwich reads as the next day.
         name = f"Ride {started.date().isoformat()} {self.session.name}"
         record = importer._build_record(parsed, name, self.ftp)
         self.saved_record = record
@@ -344,6 +363,9 @@ class RideController:
             importer.link_selected_plan_workout(
                 self.user_id, self.workout_id, self.activity_id
             )
+        if self.activity_id is not None:
+            # Zwift may already have written the .fit for this same ride.
+            importer.link_duplicate_activity(self.user_id, self.activity_id)
         try:
             importer.maybe_update_ftp(self.user_id)
         except Exception:
@@ -374,4 +396,9 @@ class RideController:
                 max(0.0, self.start_grace_s - self._positive_run), 1
             ) if not self._ever_started else 0.0,
             "no_power_s": round(self._zero_run, 1),
+            # Seconds of stillness left before a cooldown finalizes the ride, so
+            # the client need not hardcode the grace period.
+            "finish_countdown": round(
+                max(0.0, self.zero_grace_s - self._zero_run), 1
+            ) if self.status == COOLDOWN else 0.0,
         }

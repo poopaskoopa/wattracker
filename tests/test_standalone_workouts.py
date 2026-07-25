@@ -12,6 +12,7 @@ from wattracker.prescribe import zwo
 from wattracker.prescribe.planner import build_workout
 from wattracker.server import create_app
 import wattracker.server as servermod
+from wattracker.timeutil import utc_today
 
 
 DATE = "2026-07-19"
@@ -139,7 +140,7 @@ def test_export_route_persists_only_after_success(user_id, monkeypatch, tmp_path
             follow_redirects=False,
         )
         generated = client.post("/generate", data={"duration_min": 60})
-        assert f'name="scheduled_date" value="{dt.date.today().isoformat()}"' in generated.text
+        assert f'name="scheduled_date" value="{utc_today().isoformat()}"' in generated.text
         response = client.post("/generate/export", data={"scheduled_date": DATE})
         assert response.status_code == 200
         assert str(output) in response.text

@@ -102,7 +102,10 @@ def test_erg_target_follows_each_segment():
     # Block 0 (50% -> 100W) then block 1 (100% -> 200W) must both appear.
     assert 100 in trainer.targets
     assert 200 in trainer.targets
-    assert c.status == "finished"  # 20s session complete
+    assert c.status == "cooldown"  # 20s session complete, rider still spinning
+    for _ in range(3):
+        c.tick(power=0, dt=1)
+    assert c.status == "finished"
 
 
 def test_auto_pause_then_resume():
@@ -150,6 +153,8 @@ def test_finish_sets_trainer_to_zero():
     c = RideController(_two_block_session(), 200, trainer=trainer, start_grace_s=0, autosave=False)
     for _ in range(20):
         c.tick(power=150)
+    for _ in range(3):  # spin down out of the cooldown
+        c.tick(power=0)
     assert c.status == "finished"
     assert trainer.targets[-1] == 0  # ERG released on finish
 
@@ -184,6 +189,8 @@ def test_erg_rearmed_on_resume_and_stopped_on_finish():
     assert trainer.commands == ["request_control", "start", "request_control", "start"]
     for _ in range(20):
         c.tick(power=120)
+    for _ in range(3):
+        c.tick(power=0)
     assert c.status == "finished"
     assert trainer.commands[-1] == "stop"
     assert trainer.targets[-1] == 0  # ERG target zeroed before stop
@@ -216,6 +223,8 @@ def test_erg_target_follows_ramp_each_second():
     c = RideController(session, 200, trainer=trainer, start_grace_s=0, autosave=False)
     for _ in range(10):
         c.tick(power=150, dt=1)
+    for _ in range(3):  # cooldown sends no new targets, only the finish zero
+        c.tick(power=0, dt=1)
     # Expected: fraction 0.5 + 0.05*t at t=1..10 -> 110,120,...,200 W, then the
     # finish zeroes the ERG target.
     assert c.status == "finished"
@@ -236,6 +245,8 @@ def test_ride_survives_failing_trainer():
     )
     for _ in range(20):
         c.tick(power=150)
+    for _ in range(3):
+        c.tick(power=0)
     assert c.status == "finished"  # trainer errors never crash the ride
 
 
@@ -464,6 +475,8 @@ def test_finished_ride_saves_activity(user_id):
     )
     for _ in range(20):
         c.tick(power=180, cadence=90, hr=150, dt=1)
+    for _ in range(3):
+        c.tick(power=0, dt=1)
     assert c.status == "finished"
     assert c.activity_id is not None
     acts = db.list_activities(user_id)
@@ -497,6 +510,8 @@ def test_finished_selected_ride_links_saved_activity_to_plan_workout(user_id):
 
     for _ in range(20):
         c.tick(power=150, dt=1)
+    for _ in range(3):
+        c.tick(power=0, dt=1)
 
     assert c.status == "finished"
     assert c.activity_id is not None
@@ -532,5 +547,96 @@ def test_saved_ride_isolated_per_user(user_id):
     )
     for _ in range(20):
         c.tick(power=150, dt=1)
+    for _ in range(3):
+        c.tick(power=0, dt=1)
     assert len(db.list_activities(user_id)) == 1
     assert db.list_activities(other) == []
+
+
+# ------------------------------------------------------- cooldown (spin-down)
+def _ridden_to_cooldown(user_id=None, trainer=None, autosave=False):
+    """A controller that pedalled the 20s prescription and is now spinning down."""
+    c = RideController(
+        _two_block_session(), 200, trainer=trainer, user_id=user_id,
+        start_grace_s=0, autosave=autosave,
+    )
+    for _ in range(20):
+        c.tick(power=150, dt=1)
+    assert c.status == "cooldown"
+    return c
+
+
+def test_workout_end_enters_cooldown_without_saving(user_id):
+    trainer = SimulatedTrainer()
+    c = _ridden_to_cooldown(user_id=user_id, trainer=trainer, autosave=True)
+    assert c.elapsed == 20.0
+    assert c.activity_id is None
+    assert db.list_activities(user_id) == []
+    assert trainer.commands[-1] != "stop"  # ERG still engaged for the spin-down
+
+
+def test_cooldown_pedalling_extends_elapsed_and_records_samples():
+    trainer = SimulatedTrainer()
+    c = _ridden_to_cooldown(trainer=trainer)
+    for _ in range(5):
+        c.tick(power=90, cadence=70, hr=130, dt=1)
+    assert c.status == "cooldown"
+    assert c.elapsed == 25.0
+    assert len(c._samples["power"]) == 25
+    assert c._samples["power"][-5:] == [90] * 5
+    # The final prescribed target is held; no cooldown target is invented.
+    assert trainer.targets[-1] == 200
+    assert c.state()["progress"] == 1.0
+
+
+def test_cooldown_finishes_after_three_zero_power_seconds(user_id):
+    trainer = SimulatedTrainer()
+    c = _ridden_to_cooldown(user_id=user_id, trainer=trainer, autosave=True)
+    c.tick(power=0, dt=1)
+    c.tick(power=0, dt=1)
+    assert c.status == "cooldown"
+    assert c.state()["finish_countdown"] == 1.0
+    c.tick(power=0, dt=1)
+    assert c.status == "finished"
+    assert trainer.targets[-1] == 0
+    assert trainer.commands[-1] == "stop"
+    assert c.activity_id is not None
+    assert len(db.list_activities(user_id)) == 1
+
+
+def test_short_zero_gap_in_cooldown_does_not_finish(user_id):
+    c = _ridden_to_cooldown(user_id=user_id, autosave=True)
+    c.tick(power=0, dt=1)
+    c.tick(power=0, dt=1)
+    assert c.status == "cooldown"
+    c.tick(power=80, dt=1)  # back on the pedals: the grace restarts
+    assert c.status == "cooldown"
+    assert c.state()["no_power_s"] == 0.0
+    c.tick(power=0, dt=1)
+    c.tick(power=0, dt=1)
+    assert c.status == "cooldown"
+    assert db.list_activities(user_id) == []
+    assert c.elapsed == 21.0
+
+
+def test_stop_during_cooldown_saves_the_ride_including_the_spin_down(user_id):
+    c = _ridden_to_cooldown(user_id=user_id, autosave=True)
+    for _ in range(30):
+        c.tick(power=100, dt=1)
+    c.stop()
+
+    assert c.status == "finished"
+    acts = db.list_activities(user_id)
+    assert len(acts) == 1
+    assert acts[0]["duration_s"] == 50  # 20s prescribed + 30s cooldown
+    assert len(c.saved_record["streams"]["power"]) == 50
+
+
+def test_cooldown_never_returns_to_running_or_paused():
+    c = _ridden_to_cooldown()
+    for _ in range(2):
+        c.tick(power=0, dt=1)  # under the grace: still cooling down
+    c.tick(power=120, dt=1)
+    assert c.status == "cooldown"
+    c.tick(power=120, dt=1)
+    assert c.status == "cooldown"
