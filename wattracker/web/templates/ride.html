@@ -19,9 +19,9 @@
     <div id="planMode">
         <label>Workout:
             <select id="workoutSelect">
-                <option value="">Endurance (45 min)</option>
+                <option value="" data-name="Endurance">Endurance (45 min)</option>
                 {% for w in workouts %}
-                <option value="{{ w.id }}">{{ w.date }} &mdash; {{ w.name }}
+                <option value="{{ w.id }}" data-name="{{ w.name }}">{{ w.date }} &mdash; {{ w.name }}
                     ({{ (w.duration_s // 60) }} min)</option>
                 {% endfor %}
             </select>
@@ -140,6 +140,12 @@
     var cache = readCache();
     var rideChart = null;
     var livePower = [], liveCadence = [], liveHr = [];
+    var smoothPower = [], smoothCadence = [], smoothHr = [];
+    // Trailing rolling-mean windows. Power is the noisiest signal (pedal stroke
+    // ripple plus meter jitter) so it gets the longest window; cadence and heart
+    // rate only need enough to take the sawtooth off.
+    var POWER_SMOOTH_S = 10, METRIC_SMOOTH_S = 5;
+    var powerSmoother = null, cadenceSmoother = null, hrSmoother = null;
     var MAX_CHART_POINTS = 30000;
     var chartPointLimit = MAX_CHART_POINTS;
     var workoutDuration = 0;
@@ -263,28 +269,63 @@
         value = (value || "").trim();
         return value || fallback;
     }
+    // Chart.js v4 has no minor gridlines, so intermediate lines only exist if
+    // there are intermediate ticks. Pick the coarsest round step that still
+    // leaves about a dozen lines, so a 30-minute session and a 3-hour session
+    // both read well instead of one being bare and the other a picket fence.
+    function timeStepSize(duration) {
+        var steps = [30, 60, 120, 180, 300, 600, 900, 1800];
+        if (!(duration > 0)) return 300;
+        for (var i = 0; i < steps.length; i++) {
+            if (duration / steps[i] <= 12) return steps[i];
+        }
+        return steps[steps.length - 1];
+    }
+    // A fixed watt step tracks the power range rather than the axis: an easy
+    // endurance ride topping out near 150 W would get three lines on a 50 W
+    // step. Pick the smallest round step that still keeps the count in hand.
+    function powerStepSize(max) {
+        var steps = [10, 20, 25, 50, 100, 200];
+        for (var i = 0; i < steps.length; i++) {
+            if (max / steps[i] <= 12) return steps[i];
+        }
+        return steps[steps.length - 1];
+    }
     function chartOptions(duration) {
-        var axisText = themeColor("--text", "#e6e6e6");
+        var axisText = themeColor("--text-bright", "#f5f7fa");
+        var titleText = themeColor("--text", "#e6e6e6");
         var tickMark = themeColor("--muted", "#8a94a0");
-        var axisFont = {size: 13, weight: "600"};
-        var titleFont = {size: 13, weight: "700"};
+        var gridLine = themeColor("--grid", "rgba(255, 255, 255, 0.12)");
+        var axisFont = {size: 15, weight: "600"};
+        var titleFont = {size: 14, weight: "700"};
         return {responsive: true, maintainAspectRatio: false, animation: false,
             parsing: false, plugins: {legend: {display: true},
                 decimation: {enabled: true, algorithm: "lttb", samples: 1000, threshold: 2000}},
             scales: {
             x: {type: "linear", title: {display: true, text: "Workout time",
-                    color: axisText, font: titleFont},
+                    color: titleText, font: titleFont},
                 min: 0, max: duration,
-                grid: {drawTicks: true, tickLength: 8, tickColor: tickMark},
-                ticks: {color: axisText, font: axisFont, callback: fmtAxisTime}},
+                grid: {drawTicks: true, tickLength: 8, tickColor: tickMark, color: gridLine},
+                ticks: {color: axisText, font: axisFont, callback: fmtAxisTime,
+                    stepSize: timeStepSize(duration), maxTicksLimit: 14,
+                    autoSkip: true, maxRotation: 0}},
             y: {beginAtZero: true, position: "left",
-                title: {display: true, text: "Power (W)", color: axisText, font: titleFont},
-                ticks: {color: axisText, font: axisFont},
-                grid: {drawTicks: true, tickLength: 8, tickColor: tickMark}},
-            metrics: {beginAtZero: true, position: "right",
+                title: {display: true, text: "Power (W)", color: titleText, font: titleFont},
+                // The watt range is only known once the ride produces data, so
+                // the step is chosen here (after the limits, before the ticks
+                // are built) instead of being frozen when the chart is created.
+                afterDataLimits: function (scale) {
+                    scale.options.ticks.stepSize = powerStepSize(scale.max);
+                },
+                ticks: {color: axisText, font: axisFont, stepSize: 50, maxTicksLimit: 14},
+                grid: {drawTicks: true, tickLength: 8, tickColor: tickMark, color: gridLine}},
+            // Without a cadence or HR sensor this axis has no data and would
+            // collapse to a 0-1 scale, which reads as broken; 200 covers both
+            // plausible rpm and bpm ranges.
+            metrics: {beginAtZero: true, position: "right", suggestedMax: 200,
                 title: {display: true, text: "Cadence (rpm) / Heart rate (bpm)",
-                    color: axisText, font: titleFont},
-                ticks: {color: axisText, font: axisFont},
+                    color: titleText, font: titleFont},
+                ticks: {color: axisText, font: axisFont, stepSize: 20, maxTicksLimit: 14},
                 grid: {drawOnChartArea: false, drawTicks: true, tickLength: 8,
                     tickColor: tickMark}}
         }};
@@ -331,6 +372,35 @@
         document.getElementById("clockBlock").textContent = fmtHms(blockRemaining(elapsed));
         document.getElementById("clockTotal").textContent = fmtHms(total - elapsed);
     }
+    // Rolling means are maintained incrementally: the traces run to thousands of
+    // points over a long workout and this recomputes on every 1 Hz sample, so
+    // re-averaging the whole array each tick would be wasted work. State holds
+    // only the samples still inside the trailing window, so it stays bounded
+    // however long the ride runs.
+    function makeSmoother(windowSeconds) {
+        return {window: windowSeconds, samples: [], sum: 0, lastX: null, lastY: null};
+    }
+    function smoothedValue(state, x, y) {
+        // appendOrReplace overwrites the last point when the same elapsed time
+        // arrives twice; retract the superseded sample so it is not counted twice.
+        if (state.lastX === x && state.lastY != null) {
+            state.samples.pop();
+            state.sum -= state.lastY;
+        }
+        state.lastX = x;
+        state.lastY = y;
+        // Dropouts arrive as null and must not be averaged in as zero.
+        if (y != null) {
+            state.samples.push({x: x, y: y});
+            state.sum += y;
+        }
+        while (state.samples.length && state.samples[0].x < x - state.window) {
+            state.sum -= state.samples.shift().y;
+        }
+        // Nothing valid in the window means the sensor is out: emit a gap rather
+        // than dragging the last reading along a flat line.
+        return state.samples.length ? state.sum / state.samples.length : null;
+    }
     function setupWorkout(workout) {
         if (!workout) return;
         workoutDuration = Math.max(0, Number(workout.duration_s) || 0);
@@ -348,6 +418,12 @@
             prescribed.push({x: block.end, y: block.watts_end});
         });
         livePower = []; liveCadence = []; liveHr = [];
+        smoothPower = []; smoothCadence = []; smoothHr = [];
+        // Without this a second ride would open with the tail of the first one
+        // still inside the averaging windows.
+        powerSmoother = makeSmoother(POWER_SMOOTH_S);
+        cadenceSmoother = makeSmoother(METRIC_SMOOTH_S);
+        hrSmoother = makeSmoother(METRIC_SMOOTH_S);
         chartPointLimit = Math.min(MAX_CHART_POINTS,
             Math.max(3600, Math.ceil(Number(workout.duration_s) || 0) + 10));
         if (rideChart) {
@@ -358,17 +434,29 @@
         document.getElementById("rideChartSummary").textContent = "";
         rideChart = new Chart(document.getElementById("rideChart"), {
             type: "line", data: {datasets: [
+                // The target is a prescription of steps and ramps: it must stay
+                // perfectly angular, so no tension here. `order` sets the paint
+                // stack (highest is drawn first, i.e. furthest back) and keeps the
+                // raw ghost behind everything it is meant to texture.
                 {label: "Target power", data: prescribed, yAxisID: "y",
                     borderColor: "#f2a900", pointRadius: 0, borderWidth: 2,
-                    borderDash: [8, 4]},
-                {label: "Measured power", data: livePower, yAxisID: "y",
+                    borderDash: [8, 4], tension: 0, order: 0},
+                {label: "Measured power (" + POWER_SMOOTH_S + "s)", data: smoothPower, yAxisID: "y",
                     borderColor: "rgba(255, 209, 102, 0.7)", backgroundColor: "rgba(255, 209, 102, 0.7)",
-                    pointBackgroundColor: "rgba(255, 209, 102, 0.7)", pointRadius: 2.5,
-                    pointHoverRadius: 4, borderWidth: 3},
-                {label: "Cadence", data: liveCadence, yAxisID: "metrics",
-                    borderColor: "rgba(87, 199, 255, 0.7)", pointRadius: 0, borderWidth: 2},
-                {label: "Heart rate", data: liveHr, yAxisID: "metrics",
-                    borderColor: "rgba(255, 77, 141, 0.7)", pointRadius: 0, borderWidth: 2}
+                    pointBackgroundColor: "rgba(255, 209, 102, 0.7)", pointRadius: 0,
+                    pointHoverRadius: 4, borderWidth: 3, tension: 0.25, order: 1},
+                // A dot per sample was the main source of visual noise; the raw
+                // trace survives only as a faint hairline so spikes still read as
+                // texture behind the line the rider actually follows.
+                {label: "Measured power (raw)", data: livePower, yAxisID: "y",
+                    borderColor: "rgba(255, 209, 102, 0.25)", pointRadius: 0,
+                    pointHoverRadius: 4, borderWidth: 1, tension: 0, order: 4},
+                {label: "Cadence", data: smoothCadence, yAxisID: "metrics",
+                    borderColor: "rgba(87, 199, 255, 0.7)", pointRadius: 0, borderWidth: 2,
+                    tension: 0.25, order: 2},
+                {label: "Heart rate", data: smoothHr, yAxisID: "metrics",
+                    borderColor: "rgba(255, 77, 141, 0.7)", pointRadius: 0, borderWidth: 2,
+                    tension: 0.25, order: 3}
             ]}, options: chartOptions(workoutDuration)});
     }
     function appendOrReplace(points, point) {
@@ -378,6 +466,10 @@
             points.push(point);
         }
         if (points.length > chartPointLimit) points.shift();
+    }
+    function appendSmoothed(raw, smoothed, state, x, y) {
+        appendOrReplace(raw, {x: x, y: y});
+        appendOrReplace(smoothed, {x: x, y: smoothedValue(state, x, y)});
     }
     // The rider may keep pedalling past the prescribed end; grow the axis a
     // minute at a time so the measured traces stay on screen. The target-power
@@ -396,9 +488,11 @@
         setChartClocks(elapsed, total == null ? workoutDuration : total);
         updateAudioCues(elapsed);
         growChartAxis(elapsed);
-        appendOrReplace(livePower, {x: elapsed, y: finiteNumber(st.power)});
-        appendOrReplace(liveCadence, {x: elapsed, y: finiteNumber(st.cadence)});
-        appendOrReplace(liveHr, {x: elapsed, y: finiteNumber(st.hr)});
+        // Raw and smoothed arrays are appended through the same helper so they
+        // share the replace-last and shift-oldest behaviour and stay in lockstep.
+        appendSmoothed(livePower, smoothPower, powerSmoother, elapsed, finiteNumber(st.power));
+        appendSmoothed(liveCadence, smoothCadence, cadenceSmoother, elapsed, finiteNumber(st.cadence));
+        appendSmoothed(liveHr, smoothHr, hrSmoother, elapsed, finiteNumber(st.hr));
         rideChart.update("none");
         document.getElementById("rideChartSummary").textContent =
             "Measured power " + (finiteNumber(st.power) == null ? "unavailable" : metricText(st.power) + " watts") +
@@ -530,7 +624,14 @@
         wrap.appendChild(table);
         box.appendChild(wrap);
     }
+    // Every call invalidates the requests before it. The fetch is async but
+    // setupWorkout is destructive — it retitles the heading and rebuilds the
+    // chart — so a response that lands after the rider switched back to Plan
+    // mode, or after they changed type/duration again, must be dropped instead
+    // of overwriting the current selection. Only the newest request may win.
+    var previewToken = 0;
     function loadPreview() {
+        var token = ++previewToken;
         if (!justRide()) {
             document.getElementById("ridePreview").hidden = true;
             return;
@@ -541,6 +642,7 @@
               "&minutes=" + encodeURIComponent(minutes))
             .then(function (resp) { return resp.ok ? resp.json() : null; })
             .then(function (data) {
+                if (token !== previewToken || !justRide()) return;
                 if (!data) {
                     document.getElementById("ridePreview").hidden = true;
                     return;
@@ -549,14 +651,32 @@
                 setupWorkout(data);
             })
             .catch(function () {
+                if (token !== previewToken) return;
                 document.getElementById("ridePreview").hidden = true;
             });
+    }
+    // In plan mode setupWorkout only runs once the ride connects, so until then
+    // nothing would move the heading off the generic placeholder. Track the
+    // select instead. Just-ride mode is left alone: loadPreview -> setupWorkout
+    // already names the previewed workout, and once a ride is running the select
+    // is disabled and the ws-driven setupWorkout is the only source of truth.
+    function showSelectedWorkoutTitle() {
+        if (rideState !== "idle" || justRide()) return;
+        var select = document.getElementById("workoutSelect");
+        var option = select.options[select.selectedIndex];
+        // The option text reads "date — name (N min)", so prefer data-name and
+        // only fall back to the whole label rather than trying to parse it.
+        var name = option
+            ? (option.dataset.name || "").trim() || (option.textContent || "").trim()
+            : "";
+        document.getElementById("rideChartTitle").textContent = name || "Workout metrics";
     }
     function applyMode() {
         var just = justRide();
         document.getElementById("planMode").hidden = just;
         document.getElementById("justRideMode").hidden = !just;
         loadPreview();
+        showSelectedWorkoutTitle();
     }
     function render(st) {
         updateChartMetrics(st);
@@ -1134,6 +1254,8 @@
     modeInputs().forEach(function (input) {
         input.addEventListener("change", applyMode);
     });
+    document.getElementById("workoutSelect").addEventListener("change", showSelectedWorkoutTitle);
+    showSelectedWorkoutTitle();
     document.getElementById("rideTypeSelect").addEventListener("change", loadPreview);
     document.getElementById("rideDurationSelect").addEventListener("change", loadPreview);
     document.getElementById("connectBtn").addEventListener("click", function () {
