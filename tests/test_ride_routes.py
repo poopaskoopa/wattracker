@@ -207,6 +207,40 @@ def test_ride_ws_simulation_streams_and_saves(client):
     assert len(db.list_activities(uid)) == 1
 
 
+def test_ride_ws_selected_plan_workout_links_saved_activity(client):
+    _register(client)
+    uid = db.get_user_by_username("rider")["id"]
+    plan_id = db.create_plan(uid, "Ride selection", "2026-07-10", 1)
+    workout_id = db.add_plan_workout(
+        plan_id,
+        uid,
+        "2026-07-10",
+        "Selected endurance",
+        "endurance",
+        60,
+        1.0,
+        "<workout_file/>",
+    )
+
+    frames = []
+    with client.websocket_connect(
+        f"/ride/ws?sim=1&workout_id={workout_id}"
+    ) as ws:
+        first = ws.receive_json()
+        assert first["status"] == "workout"
+        try:
+            while True:
+                frames.append(ws.receive_json())
+        except Exception:
+            pass
+
+    assert frames[-1]["status"] == "finished"
+    assert frames[-1]["workout_id"] == workout_id
+    assert frames[-1]["activity_id"] is not None
+    linked = db.get_plan_workout(uid, workout_id)
+    assert linked["completed_activity_id"] == frames[-1]["activity_id"]
+
+
 def test_ride_ws_unauthenticated_closes(client):
     # No login -> WS should report an auth error and close, not crash.
     with client.websocket_connect("/ride/ws?sim=1") as ws:
