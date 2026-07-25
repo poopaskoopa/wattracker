@@ -113,9 +113,15 @@ def test_ride_page_renders_available_when_monkeypatched(client, monkeypatch):
     assert r.text.index('id="scanBusy"') > r.text.index('id="connectBtn"')
     assert 'className = "device-disconnect button-secondary"' in r.text
     assert 'requestDisconnect(deviceAddress);' in r.text
-    assert 'text: "Workout time (minutes)"' in r.text
+    assert 'text: "Workout time"' in r.text
     assert "min: 0, max: duration" in r.text
-    assert "var minutes = Number(value) / 60;" in r.text
+    # The axis reads as a clock (mm:ss, h:mm:ss past the hour), not decimal minutes.
+    assert "callback: fmtAxisTime" in r.text
+    assert "function fmtAxisTime(value)" in r.text
+    assert "var minutes = Number(value) / 60;" not in r.text
+    # Ending the ride must drop out of the full-screen overlay; otherwise the
+    # rider is left on a fixed, never-updating chart covering the whole page.
+    assert "if (!active) exitChartFullscreen();" in r.text
     assert '{label: "Target power", data: prescribed, yAxisID: "y"' in r.text
     assert '{label: "Measured power", data: livePower, yAxisID: "y"' in r.text
     assert 'borderColor: "#f2a900"' in r.text
