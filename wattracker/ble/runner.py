@@ -15,6 +15,7 @@ import logging
 from typing import List, Optional, Tuple
 
 from ..prescribe.planner import Session
+from ..timeutil import utc_now, utc_to_local
 
 _log = logging.getLogger(__name__)
 
@@ -168,7 +169,7 @@ class RideController:
                     return self.state()
                 self.status = RUNNING
                 if self.started_at is None:
-                    self.started_at = _dt.datetime.now()
+                    self.started_at = utc_now()
                 if self.erg_enabled and not self._erg_armed:
                     self._trainer_call("start_erg")
                     self._erg_armed = True
@@ -320,7 +321,10 @@ class RideController:
         from .. import db
         from ..ingest import importer
 
-        started = self.started_at or _dt.datetime.now()
+        # started_at is naive UTC, like the timestamps parsed out of .fit files -
+        # the same ride recorded by both the app and Zwift has to land on the
+        # same instant, not four hours apart.
+        started = self.started_at or utc_now()
         n = len(self._samples["power"])
         times = [(started + _dt.timedelta(seconds=i)).isoformat() for i in range(n)]
         streams = {
@@ -336,7 +340,10 @@ class RideController:
             "duration_s": int(self.elapsed),
             "streams": streams,
         }
-        name = f"Ride {started.date().isoformat()} {self.session.name}"
+        # The rider names their ride by the day they rode it, so the filename
+        # keeps the LOCAL date even though start_time is UTC.
+        local_date = (utc_to_local(started) or started).date().isoformat()
+        name = f"Ride {local_date} {self.session.name}"
         record = importer._build_record(parsed, name, self.ftp)
         self.saved_record = record
         self.activity_id = db.insert_activity(self.user_id, record)
@@ -344,6 +351,9 @@ class RideController:
             importer.link_selected_plan_workout(
                 self.user_id, self.workout_id, self.activity_id
             )
+        if self.activity_id is not None:
+            # Zwift may already have written the .fit for this same ride.
+            importer.link_duplicate_activity(self.user_id, self.activity_id)
         try:
             importer.maybe_update_ftp(self.user_id)
         except Exception:

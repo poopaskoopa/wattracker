@@ -510,8 +510,10 @@ def create_app() -> FastAPI:
         saved = settings.get("activities_dir")
         prefill = saved or (candidates[0]["path"] if candidates else "")
         activities = db.list_activities(uid)
+        merged = db.primaries_with_duplicates(uid)
         for a in activities:
             a["duration_fmt"] = races.format_duration(a.get("duration_s"))
+            a["has_duplicate"] = a["id"] in merged
         return _ctx(
             request,
             activities=activities,
@@ -519,6 +521,7 @@ def create_app() -> FastAPI:
             candidates=candidates,
             saved_dir=saved,
             prefill_dir=prefill,
+            linked=request.query_params.get("linked"),
         )
 
     @app.get("/activities", response_class=HTMLResponse)
@@ -684,6 +687,16 @@ def create_app() -> FastAPI:
             return Response("Uploaded file is too large.", status_code=413)
         importer.ingest_upload(_uid(request), file.filename or "upload.fit", content)
         return RedirectResponse(url="/activities", status_code=303)
+
+    @app.post("/activities/link-duplicates")
+    def link_duplicates(request: Request):
+        """Repair pass: link rides this user recorded in-app AND in Zwift.
+
+        New rides are linked as they land; this walks the existing history for
+        pairs recorded before duplicate detection existed.
+        """
+        linked = importer.backfill_duplicate_links(_uid(request))
+        return RedirectResponse(url=f"/activities?linked={linked}", status_code=303)
 
     def _plan_defaults() -> dict:
         return {

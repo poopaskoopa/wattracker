@@ -1,6 +1,7 @@
 """Scan and import .fit activities into the database (idempotent, per-user)."""
 from __future__ import annotations
 
+import bisect
 import datetime as _dt
 import glob
 import hashlib
@@ -20,6 +21,7 @@ from ..metrics.power import (
     training_stress_score,
 )
 from ..paths import activities_dir
+from ..timeutil import parse_naive
 from .fit_parser import parse_fit
 
 
@@ -30,6 +32,14 @@ def dedup_hash(start_time: Optional[str], duration_s: int) -> str:
 
 
 FTP_UPDATE_DAYS = 21  # re-evaluate at least every 3 weeks
+
+# ------------------------------------------------- cross-source duplicates
+# Riding with Zwift and the app running at the same time records one ride
+# twice: an in-app activity and an imported .fit. Both rows are kept, but the
+# in-app one is marked duplicate_of the .fit so training load counts it once.
+DUPLICATE_START_TOLERANCE_S = 180
+DUPLICATE_DURATION_TOLERANCE = 0.20  # the app's clock pauses when the rider does
+DUPLICATE_POWER_TOLERANCE = 0.15
 
 # Standalone workout matching and conservative RPE feedback policy.
 STANDALONE_DURATION_TOLERANCE = 0.20
@@ -64,8 +74,6 @@ def recent_best_effort_ftp(
     user_id: int, now: Optional[_dt.datetime] = None
 ) -> float:
     """Trailing-90-day best-20-minute power * 0.95, without inactivity decay."""
-    from ..timeutil import parse_naive
-
     db.init_db()
     now = now or _dt.datetime.now()
     cutoff = now - _dt.timedelta(days=90)
@@ -210,7 +218,159 @@ def ingest_file(user_id: int, path: str, ftp: Optional[float] = None) -> Optiona
             user_id, extra_power=[parsed["streams"].get("power") or []]
         )
     record = _build_record(parsed, os.path.basename(path), ftp)
-    return db.insert_activity(user_id, record)
+    new_id = db.insert_activity(user_id, record)
+    if new_id is not None:
+        # The rider may have recorded this same ride in-app at the same time.
+        link_duplicate_activity(user_id, new_id)
+    return new_id
+
+
+def is_in_app_activity(filename: Optional[str]) -> bool:
+    """True when an activity was recorded in-app rather than imported.
+
+    In-app rides are named ``Ride <ISO date> <workout name>``
+    (``ble/runner.py``); imported rows carry the .fit file's basename. Keep in
+    step with ``db.IN_APP_FILENAME_SQL``.
+    """
+    name = (filename or "").strip()
+    if len(name) < 17 or not name.startswith("Ride ") or name[15] != " ":
+        return False
+    if name.lower().endswith(".fit"):
+        return False
+    try:
+        _dt.date.fromisoformat(name[5:15])
+    except ValueError:
+        return False
+    return True
+
+
+def _within(a: Optional[float], b: Optional[float], tolerance: float) -> bool:
+    """Whether two magnitudes agree within a symmetric relative tolerance."""
+    x, y = float(a or 0.0), float(b or 0.0)
+    scale = max(abs(x), abs(y))
+    if scale <= 0:
+        return True
+    return abs(x - y) / scale <= tolerance
+
+
+def _same_ride(a: dict, b: dict) -> bool:
+    """Whether two activity summaries are one ride recorded by both sources.
+
+    Cross-source is a hard requirement, not a heuristic: two .fit files a few
+    minutes apart with similar durations are genuinely separate rides (the
+    user's history has 129 such pairs), and only the in-app/imported split
+    separates them from a real double-recording.
+    """
+    if is_in_app_activity(a.get("filename")) == is_in_app_activity(b.get("filename")):
+        return False
+    start_a = parse_naive(a.get("start_time"))
+    start_b = parse_naive(b.get("start_time"))
+    if start_a is None or start_b is None:
+        return False
+    if abs((start_a - start_b).total_seconds()) > DUPLICATE_START_TOLERANCE_S:
+        return False
+    if not _within(a.get("duration_s"), b.get("duration_s"),
+                   DUPLICATE_DURATION_TOLERANCE):
+        return False
+    # A ride with no power at all can't be compared on power; time and duration
+    # carry the match on their own.
+    if a.get("avg_power") and b.get("avg_power"):
+        return _within(a["avg_power"], b["avg_power"], DUPLICATE_POWER_TOLERANCE)
+    return True
+
+
+def _link_pair(user_id: int, primary: dict, secondary: dict) -> Optional[int]:
+    """Mark ``secondary`` a duplicate of ``primary``, carrying its data over."""
+    if not db.set_duplicate_of(user_id, secondary["id"], primary["id"]):
+        return None
+    if not primary.get("rpe") and secondary.get("rpe"):
+        db.set_activity_rpe(user_id, primary["id"], int(secondary["rpe"]))
+    db.repoint_completed_activity(user_id, secondary["id"], primary["id"])
+    return secondary["id"]
+
+
+def find_duplicate_activity(user_id: int, activity: dict) -> Optional[dict]:
+    """The other-source activity that is the same ride as ``activity``, or None."""
+    when = parse_naive(activity.get("start_time"))
+    if when is None:
+        return None
+    window = _dt.timedelta(seconds=DUPLICATE_START_TOLERANCE_S)
+    candidates = []
+    for other in db.activities_for_matching(
+        user_id, (when - window).isoformat(), (when + window).isoformat()
+    ):
+        if other["id"] == activity.get("id") or other.get("duplicate_of") is not None:
+            continue
+        if _same_ride(activity, other):
+            other_when = parse_naive(other["start_time"])
+            candidates.append(
+                (abs((other_when - when).total_seconds()), other["id"], other)
+            )
+    if not candidates:
+        return None
+    return min(candidates)[2]
+
+
+def link_duplicate_activity(user_id: int, activity_id: int) -> Optional[int]:
+    """Link a just-saved activity to the same ride recorded by the other source.
+
+    The imported .fit is always the primary (it has distance and an unpaused
+    clock); the in-app ride becomes the secondary. Returns the id of the row
+    marked as a duplicate, or None when there is no counterpart.
+    """
+    db.init_db()
+    activity = db.get_activity(user_id, activity_id)
+    if not activity or activity.get("duplicate_of") is not None:
+        return None
+    activity["id"] = activity_id
+    other = find_duplicate_activity(user_id, activity)
+    if other is None:
+        return None
+    if is_in_app_activity(activity.get("filename")):
+        return _link_pair(user_id, other, activity)
+    return _link_pair(user_id, activity, other)
+
+
+def backfill_duplicate_links(user_id: int) -> int:
+    """Link every historical cross-source pair for a user. Safe to re-run.
+
+    Repairs a database recorded before duplicate detection existed. Runs off a
+    single pass over activity summaries (no streams inflated) with the imported
+    rides indexed by start time, so a 13k-activity history stays linear.
+    """
+    db.init_db()
+    rows = db.activities_for_matching(user_id)
+    fresh = [r for r in rows if r.get("duplicate_of") is None]
+    imported = sorted(
+        (r for r in fresh if not is_in_app_activity(r.get("filename"))),
+        key=lambda r: str(r.get("start_time") or ""),
+    )
+    starts = [str(r.get("start_time") or "") for r in imported]
+    taken = db.primaries_with_duplicates(user_id)
+    window = _dt.timedelta(seconds=DUPLICATE_START_TOLERANCE_S)
+    linked = 0
+    for ride in fresh:
+        if not is_in_app_activity(ride.get("filename")):
+            continue
+        when = parse_naive(ride.get("start_time"))
+        if when is None:
+            continue
+        best = None
+        i = bisect.bisect_left(starts, (when - window).isoformat())
+        while i < len(imported) and starts[i] <= (when + window).isoformat():
+            candidate = imported[i]
+            i += 1
+            if candidate["id"] in taken or not _same_ride(ride, candidate):
+                continue
+            gap = abs(
+                (parse_naive(candidate["start_time"]) - when).total_seconds()
+            )
+            if best is None or gap < best[0]:
+                best = (gap, candidate)
+        if best and _link_pair(user_id, best[1], ride) is not None:
+            taken.add(best[1]["id"])
+            linked += 1
+    return linked
 
 
 def _user_activities_dir(user_id: int) -> Optional[str]:

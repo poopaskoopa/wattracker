@@ -6,7 +6,7 @@ activities, ~1.8s just to inflate + scan them). None of the derived quantities
 below change unless the user's activity set changes, so we cache them keyed by a
 cheap fingerprint of that set.
 
-Fingerprint = (activity count, max activity id). Activities are inserted with
+Fingerprint = (activity count, max activity id, duplicate-link count). Activities are inserted with
 ``INSERT OR IGNORE`` and their streams are never updated in place (see
 ``db.insert_activity``), so any new import strictly increases the count and the
 max id - either component moving invalidates the cache. This needs no schema
@@ -77,15 +77,19 @@ _lock = threading.Lock()
 _cache: Dict[int, Tuple[Tuple[int, int], ActivityDigest]] = {}
 
 
-def _fingerprint(user_id: int) -> Tuple[int, int]:
+def _fingerprint(user_id: int) -> Tuple[int, int, int]:
     conn = db.connect()
     try:
         row = conn.execute(
-            "SELECT COUNT(*) AS c, COALESCE(MAX(id), 0) AS m "
+            "SELECT COUNT(*) AS c, COALESCE(MAX(id), 0) AS m, "
+            "SUM(duplicate_of IS NOT NULL) AS d "
             "FROM activities WHERE user_id = ?",
             (user_id,),
         ).fetchone()
-        return (int(row["c"]), int(row["m"]))
+        # Linking a duplicate drops a ride out of the digest without changing
+        # the count or max id (the backfill links historical rows), so the
+        # number of links is part of the fingerprint.
+        return (int(row["c"]), int(row["m"]), int(row["d"] or 0))
     finally:
         conn.close()
 

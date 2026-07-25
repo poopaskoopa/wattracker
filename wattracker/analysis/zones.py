@@ -255,15 +255,18 @@ def estimate_hr_max(activities: list[dict], now: Optional[_dt.datetime] = None) 
     }
 
 
-def _activity_fingerprint(user_id: int) -> tuple[str, int, int]:
+def _activity_fingerprint(user_id: int) -> tuple[str, int, int, int]:
     conn = db.connect()
     try:
         database = conn.execute("PRAGMA database_list").fetchone()["file"]
         row = conn.execute(
-            "SELECT COUNT(*) AS c, COALESCE(MAX(id), 0) AS m FROM activities WHERE user_id = ?",
+            "SELECT COUNT(*) AS c, COALESCE(MAX(id), 0) AS m, "
+            "SUM(duplicate_of IS NOT NULL) AS d FROM activities WHERE user_id = ?",
             (user_id,),
         ).fetchone()
-        return str(database), int(row["c"]), int(row["m"])
+        # Linking a duplicate removes a ride from full_activities without
+        # changing the count or max id, so it belongs in the fingerprint.
+        return str(database), int(row["c"]), int(row["m"]), int(row["d"] or 0)
     finally:
         conn.close()
 
