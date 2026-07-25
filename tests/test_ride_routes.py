@@ -60,6 +60,10 @@ def test_ride_page_renders_available_when_monkeypatched(client, monkeypatch):
     assert r.status_code == 200
     assert "Bluetooth available" in r.text
     assert "Connect selected sensors" in r.text
+    # The separate "Connect & ride" button is gone: both buttons did the same
+    # thing once the prepare/start two-step was removed.
+    assert 'id="startBtn"' not in r.text
+    assert "Connect &amp; ride" not in r.text
     assert 'input[data-role="power"]:checked' in r.text
     assert "replaceChildren" in r.text
     assert "innerHTML" not in r.text
@@ -69,8 +73,9 @@ def test_ride_page_renders_available_when_monkeypatched(client, monkeypatch):
     assert "preferredPower" in r.text
     assert "No HR" in r.text
     assert "No trainer" in r.text
-    assert 'q.push("prepare=1")' in r.text
-    assert 'ws.send(JSON.stringify({action: "start"}))' in r.text
+    assert 'q.push("prepare=1")' not in r.text
+    assert 'ws.send(JSON.stringify({action: "start"}))' not in r.text
+    assert "ready — pedal to start" in r.text
     assert 'id="scanBusy"' in r.text
     assert "localStorage.getItem(cacheKey)" in r.text
     assert "new Chart" in r.text
@@ -100,7 +105,9 @@ def test_ride_page_renders_available_when_monkeypatched(client, monkeypatch):
     assert 'id="chartCadenceValue"' in r.text
     assert 'id="chartHrValue"' in r.text
     assert "Cadence (power sensor)" in r.text
-    assert "devices.slice().sort" in r.text
+    assert "devices.slice().filter" in r.text
+    assert 'device.name === "(unknown)"' in r.text
+    assert "unnamed device" in r.text
     assert "playCue(\"scan\")" in r.text
     assert "finally" in r.text
     assert r.text.index('id="scanBusy"') > r.text.index('id="connectBtn"')
@@ -580,7 +587,11 @@ def test_ride_ws_rejects_unbounded_power_selection(client, monkeypatch):
     assert "at most 8 power sensors" in msg["error"]
 
 
-def test_ride_ws_prepare_waits_for_start_action(client, monkeypatch):
+def test_ride_ws_prepare_streams_and_auto_starts_on_power(client, monkeypatch):
+    # The "Connect selected sensors" (prepare=1) button now behaves identically
+    # to a fresh connect: it streams telemetry immediately and the controller's
+    # power-gated start begins the workout clock once the rider pedals. No
+    # explicit "start" action is required.
     from wattracker import server as servermod
     from wattracker.ble.devices import SimulatedPowerSource, SimulatedTrainer
 
@@ -602,22 +613,21 @@ def test_ride_ws_prepare_waits_for_start_action(client, monkeypatch):
     monkeypatch.setattr(servermod, "RIDE_POLL_INTERVAL_S", 0)
     monkeypatch.setattr(servermod, "RIDE_INACTIVITY_TIMEOUT_S", 5)
 
+    uid = db.get_user_by_username("rider")["id"]
+    frames = []
     with client.websocket_connect("/ride/ws?prepare=1") as ws:
         connected = _receive_after_workout(ws)
         assert connected["status"] == "connected"
-        assert connected["prepared"] is True
-        uid = db.get_user_by_username("rider")["id"]
-        assert db.list_activities(uid) == []
-
-        ws.send_json({"action": "start"})
-        assert ws.receive_json()["status"] == "started"
-        frames = []
+        # Both connect buttons stream immediately; nothing is "prepared" anymore.
+        assert connected["prepared"] is False
         try:
             while True:
                 frames.append(ws.receive_json())
         except Exception:
             pass
 
+    # Auto-started on power (3s gate) without any explicit start action.
+    assert any(f.get("status") == "running" for f in frames)
     assert frames[-1]["status"] == "finished"
     assert len(db.list_activities(uid)) == 1
 
@@ -702,7 +712,10 @@ def test_ride_ws_prepared_stop_cleans_hardware_before_server_close(
 
     assert websocket.messages[0]["status"] == "workout"
     assert websocket.messages[1]["status"] == "connected"
-    assert events == [("target", 0), "stop", "disconnect", "close"]
+    # A stop before pedaling still releases ERG (target 0 + stop) and cleans the
+    # hardware in order before the server closes; no activity is saved.
+    assert events[-3:] == ["stop", "disconnect", "close"]
+    assert ("target", 0) in events
     assert db.list_activities(uid) == []
 
 
@@ -719,8 +732,16 @@ def test_ride_ws_prepared_actions_toggle_erg_and_disconnect_one_device(
     _register(client)
     trainer = SimulatedTrainer()
     trainer.start_erg()
-    left = SimulatedPowerSource([100])
-    right = SimulatedPowerSource([120])
+    # Zero power keeps the controller idle so its live state frames don't drown
+    # the action responses we assert on (both connect buttons now stream).
+    left = SimulatedPowerSource([0])
+    right = SimulatedPowerSource([0])
+
+    def _next(ws, status):
+        message = ws.receive_json()
+        while message.get("status") != status:
+            message = ws.receive_json()
+        return message
 
     class FakeClient:
         def __init__(self, address):
@@ -763,7 +784,7 @@ def test_ride_ws_prepared_actions_toggle_erg_and_disconnect_one_device(
         assert connected["erg_enabled"] is True
 
         ws.send_json({"action": "set_erg", "enabled": "false"})
-        invalid = ws.receive_json()
+        invalid = _next(ws, "erg")
         assert invalid == {
             "status": "erg",
             "available": True,
@@ -772,22 +793,17 @@ def test_ride_ws_prepared_actions_toggle_erg_and_disconnect_one_device(
         }
 
         ws.send_json({"action": "set_erg", "enabled": False})
-        disabled = ws.receive_json()
-        assert disabled["status"] == "erg"
+        disabled = _next(ws, "erg")
         assert disabled["available"] is True
         assert disabled["enabled"] is False
         assert disabled["error"] is None
 
         ws.send_json({"action": "disconnect", "address": "LEFT"})
-        disconnected = ws.receive_json()
-        assert disconnected["status"] == "device_disconnected"
+        disconnected = _next(ws, "device_disconnected")
         assert disconnected["address"] == "LEFT"
         assert disconnected["devices"]["power"] == "Right"
         assert disconnected["erg_available"] is True
         assert left_client.disconnected is True
-
-        ws.send_json({"action": "start"})
-        assert ws.receive_json()["status"] == "started"
 
     assert right_client.disconnected is True
     assert trainer_client.disconnected is True
@@ -872,7 +888,8 @@ def test_ride_ws_erg_action_reports_unavailable_without_trainer(
         assert connected["erg_enabled"] is False
         ws.send_json({"action": "set_erg", "enabled": True})
         response = ws.receive_json()
-        assert response["status"] == "erg"
+        while response.get("status") != "erg":
+            response = ws.receive_json()
         assert response["available"] is False
         assert response["enabled"] is False
         assert "No controllable FTMS trainer" in response["error"]
@@ -916,7 +933,8 @@ def test_ride_ws_close_before_pedaling_does_not_save_activity(
     with client.websocket_connect(url) as ws:
         connected = _receive_after_workout(ws)
         assert connected["status"] == "connected"
-        assert connected["prepared"] is prepare
+        # Both connect buttons stream now; the prepared/blocking path is gone.
+        assert connected["prepared"] is False
 
     uid = db.get_user_by_username("rider")["id"]
     assert db.list_activities(uid) == []
