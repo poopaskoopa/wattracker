@@ -523,7 +523,7 @@ def match_plan_workout_completion(
     workout_id: int,
     on_date: Optional[_dt.date] = None,
 ) -> bool:
-    """Match one today's plan workout against already-imported power data.
+    """Match one non-future plan workout against already-imported power data.
 
     This is the narrow calendar-click path: it never scans files, never looks
     at another user's data, and never considers another plan workout.  Unlike
@@ -574,6 +574,100 @@ def match_plan_workout_completion(
         best[1],
         best[2],
     )
+
+
+def link_selected_plan_workout(
+    user_id: int, workout_id: int, activity_id: int
+) -> bool:
+    """Authoritatively link a saved in-app ride to its selected plan workout.
+
+    The explicit Ride selection is authoritative even when the ride happened
+    on a different date or does not satisfy heuristic profile matching. Both
+    records must belong to the same user, and an activity may only be consumed
+    by one persisted workout.
+    """
+    db.init_db()
+    workout = db.get_plan_workout(user_id, workout_id)
+    activity = db.get_activity(user_id, activity_id)
+    if (
+        not workout
+        or not activity
+        or workout.get("completed_activity_id") is not None
+        or activity_id in db.completed_activity_ids(user_id)
+    ):
+        return False
+    try:
+        completed_date = _dt.datetime.fromisoformat(
+            str(activity.get("start_time") or "")
+        ).date().isoformat()
+    except (TypeError, ValueError):
+        return False
+
+    compliance = effective = None
+    if completed_date == workout.get("date"):
+        evidence = _profile_evidence(activity, workout)
+        if evidence is not None and evidence[0] >= PROFILE_MIN_COMPLIANCE:
+            compliance, effective = evidence
+    return db.mark_plan_workout_completed(
+        user_id,
+        workout_id,
+        activity_id,
+        completed_date,
+        compliance,
+        effective,
+    )
+
+
+def manually_complete_plan_workout(user_id: int, workout_id: int) -> str:
+    """Link the closest-duration eligible activity on the workout's date.
+
+    Manual calendar completion deliberately does not require power-profile
+    evidence, but it remains user/date scoped and never reuses an activity.
+    """
+    db.init_db()
+    workout = db.get_plan_workout(user_id, workout_id)
+    if not workout:
+        return "not_found"
+    if workout.get("completed_activity_id") is not None:
+        return "already_completed"
+    try:
+        scheduled = _dt.date.fromisoformat(str(workout.get("date") or ""))
+    except (TypeError, ValueError):
+        return "invalid_date"
+    if scheduled > _dt.date.today():
+        return "future"
+
+    activities = db.activities_on_date(user_id, workout["date"])
+    if not activities:
+        return "no_activity"
+    used = db.completed_activity_ids(user_id)
+    eligible = [activity for activity in activities if activity["id"] not in used]
+    if not eligible:
+        return "activities_used"
+    duration = float(workout.get("duration_s") or 0)
+    best = min(
+        eligible,
+        key=lambda activity: (
+            abs(float(activity.get("duration_s") or 0) - duration),
+            str(activity.get("start_time") or ""),
+            int(activity["id"]),
+        ),
+    )
+    activity = db.get_activity(user_id, best["id"])
+    evidence = _profile_evidence(activity or {}, workout)
+    compliance = effective = None
+    if evidence is not None and evidence[0] >= PROFILE_MIN_COMPLIANCE:
+        compliance, effective = evidence
+    if db.mark_plan_workout_completed(
+        user_id,
+        workout_id,
+        best["id"],
+        workout["date"],
+        compliance,
+        effective,
+    ):
+        return "completed"
+    return "conflict"
 
 
 def match_plan_completions(user_id: int, now: Optional[_dt.datetime] = None) -> int:

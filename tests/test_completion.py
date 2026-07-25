@@ -2,6 +2,7 @@
 import asyncio
 import datetime as dt
 import sqlite3
+import threading
 
 import pytest
 
@@ -76,6 +77,63 @@ def test_one_activity_completes_at_most_one_workout(user_id):
     workouts = db.plan_workouts_for_plan(user_id, plan_id)
     done = [w for w in workouts if w["completed_activity_id"]]
     assert len(done) == 1
+
+
+def test_concurrent_manual_completion_atomically_consumes_activity(
+    user_id, monkeypatch
+):
+    plan_id = db.create_plan(user_id, "Concurrent", "2026-07-10", 1)
+    workout_ids = [
+        db.add_plan_workout(
+            plan_id,
+            user_id,
+            "2026-07-10",
+            name,
+            "endurance",
+            3600,
+            60.0,
+            "<x/>",
+        )
+        for name in ("A", "B")
+    ]
+    activity_id = _activity(
+        user_id, "2026-07-10T08:00:00", seconds=3600
+    )
+    barrier = threading.Barrier(2)
+    original_completed_ids = db.completed_activity_ids
+
+    def synchronized_completed_ids(uid):
+        snapshot = original_completed_ids(uid)
+        barrier.wait(timeout=5)
+        return snapshot
+
+    monkeypatch.setattr(db, "completed_activity_ids", synchronized_completed_ids)
+    results = []
+    result_lock = threading.Lock()
+
+    def complete(workout_id):
+        result = importer.manually_complete_plan_workout(user_id, workout_id)
+        with result_lock:
+            results.append(result)
+
+    threads = [
+        threading.Thread(target=complete, args=(workout_id,))
+        for workout_id in workout_ids
+    ]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=10)
+
+    assert all(not thread.is_alive() for thread in threads)
+    assert sorted(results) == ["completed", "conflict"]
+    completed = [
+        workout
+        for workout in db.plan_workouts_for_plan(user_id, plan_id)
+        if workout["completed_activity_id"] is not None
+    ]
+    assert len(completed) == 1
+    assert completed[0]["completed_activity_id"] == activity_id
 
 
 def test_closest_duration_wins(user_id):

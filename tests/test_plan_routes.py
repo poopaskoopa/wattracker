@@ -332,6 +332,143 @@ def test_calendar_click_reconciles_today_and_exposes_rpe_prompt(client, monkeypa
     assert db.get_plan_workout(uid, workout_id)["completed_activity_id"] == activity_id
 
 
+def test_calendar_click_reconciles_past_scheduled_date(client, monkeypatch):
+    import wattracker.server as servermod
+
+    _register(client)
+    uid = db.get_user_by_username("rider")["id"]
+    today = dt.date(2026, 8, 8)
+    scheduled = dt.date(2026, 8, 5)
+    monkeypatch.setattr(servermod._dt, "date", _FrozenDate(today))
+    workout_id, activity_id = _today_profile_workout(uid, scheduled.isoformat())
+
+    reconciled = client.post(f"/api/plan/workout/{workout_id}/reconcile")
+
+    assert reconciled.status_code == 200
+    assert reconciled.json() == {
+        "id": workout_id,
+        "status": "matched",
+        "matched": True,
+    }
+    assert (
+        db.get_plan_workout(uid, workout_id)["completed_activity_id"]
+        == activity_id
+    )
+
+
+def _manual_activity(uid, date, duration_s, suffix):
+    return db.insert_activity(
+        uid,
+        {
+            "dedup_hash": f"manual-{uid}-{date}-{suffix}",
+            "filename": f"manual-{suffix}.fit",
+            "start_time": f"{date}T10:00:00",
+            "duration_s": duration_s,
+            "distance_m": 0,
+            "avg_power": 100,
+            "avg_hr": None,
+            "np": 100,
+            "if_": 0.5,
+            "tss": 10,
+            "streams": {"power": [0.0] * min(duration_s, 600)},
+        },
+    )
+
+
+def test_calendar_manual_completion_uses_closest_unused_same_day_activity(client):
+    _register(client)
+    uid = db.get_user_by_username("rider")["id"]
+    date = "2026-06-05"
+    plan_id = db.create_plan(uid, "Manual", date, 1)
+    workout_id = db.add_plan_workout(
+        plan_id, uid, date, "W", "threshold", 3600, 60, "<x/>"
+    )
+    farther = _manual_activity(uid, date, 1800, "farther")
+    closest = _manual_activity(uid, date, 3500, "closest")
+
+    response = client.post(f"/api/plan/workout/{workout_id}/complete")
+
+    assert response.status_code == 200
+    assert response.json()["activity_id"] == closest
+    linked = db.get_plan_workout(uid, workout_id)
+    assert linked["completed_activity_id"] == closest
+    assert linked["compliance"] is None
+    assert farther not in db.completed_activity_ids(uid)
+
+
+def test_calendar_manual_completion_reports_no_activity_and_used_activity(client):
+    _register(client)
+    uid = db.get_user_by_username("rider")["id"]
+    date = "2026-06-06"
+    plan_id = db.create_plan(uid, "Manual errors", date, 1)
+    first = db.add_plan_workout(
+        plan_id, uid, date, "First", "endurance", 3600, 50, "<x/>"
+    )
+    second = db.add_plan_workout(
+        plan_id, uid, date, "Second", "endurance", 3600, 50, "<x/>"
+    )
+    no_activity = client.post(f"/api/plan/workout/{first}/complete")
+    assert no_activity.status_code == 400
+    assert "no activity" in no_activity.json()["error"]
+
+    activity_id = _manual_activity(uid, date, 3600, "only")
+    assert client.post(f"/api/plan/workout/{first}/complete").status_code == 200
+    used = client.post(f"/api/plan/workout/{second}/complete")
+    assert used.status_code == 409
+    assert "already linked" in used.json()["error"]
+    assert db.get_plan_workout(uid, second)["completed_activity_id"] is None
+    assert db.completed_activity_ids(uid) == {activity_id}
+
+
+def test_calendar_manual_completion_is_user_scoped(client):
+    _register(client, "alice")
+    alice = db.get_user_by_username("alice")["id"]
+    date = "2026-06-07"
+    plan_id = db.create_plan(alice, "Alice", date, 1)
+    workout_id = db.add_plan_workout(
+        plan_id, alice, date, "Alice W", "endurance", 3600, 50, "<x/>"
+    )
+    client.post("/logout")
+    _register(client, "bob")
+    bob = db.get_user_by_username("bob")["id"]
+    _manual_activity(bob, date, 3600, "bob")
+
+    response = client.post(f"/api/plan/workout/{workout_id}/complete")
+
+    assert response.status_code == 404
+    assert db.get_plan_workout(alice, workout_id)["completed_activity_id"] is None
+
+
+def test_calendar_future_workout_cannot_reconcile_or_be_manually_completed(client):
+    _register(client)
+    uid = db.get_user_by_username("rider")["id"]
+    date = "2099-06-07"
+    plan_id = db.create_plan(uid, "Future", date, 1)
+    workout_id = db.add_plan_workout(
+        plan_id, uid, date, "Future W", "endurance", 3600, 50, "<x/>"
+    )
+    _manual_activity(uid, date, 3600, "future")
+
+    reconcile = client.post(f"/api/plan/workout/{workout_id}/reconcile")
+    manual = client.post(f"/api/plan/workout/{workout_id}/complete")
+
+    assert reconcile.status_code == 200
+    assert reconcile.json()["status"] == "future"
+    assert reconcile.json()["matched"] is False
+    assert manual.status_code == 400
+    assert "future workouts" in manual.json()["error"]
+    assert db.get_plan_workout(uid, workout_id)["completed_activity_id"] is None
+
+
+def test_calendar_manual_completion_ui_refreshes_completion_state(client):
+    _register(client)
+    text = client.get("/calendar").text
+
+    assert 'id="wmCompleteButton"' in text
+    assert "window.location.reload()" in text
+    assert "today's imported Zwift activity" not in text
+
+
 def test_calendar_click_rejects_profile_mismatch_and_foreign_workout(client, monkeypatch):
     import wattracker.server as servermod
 
