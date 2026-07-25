@@ -122,6 +122,13 @@ def test_ride_page_renders_available_when_monkeypatched(client, monkeypatch):
     # Ending the ride must drop out of the full-screen overlay; otherwise the
     # rider is left on a fixed, never-updating chart covering the whole page.
     assert "if (!active) exitChartFullscreen();" in r.text
+    # Both end buttons confirm first, and ending asks the server to finalize
+    # rather than silently dropping the socket.
+    assert 'document.getElementById("stopBtn").addEventListener("click", requestEndRide)' in r.text
+    assert 'document.getElementById("endWorkoutBtn").addEventListener("click", requestEndRide)' in r.text
+    assert "function requestEndRide()" in r.text
+    assert "window.confirm(" in r.text
+    assert 'socket.send(JSON.stringify({action: "stop"}))' in r.text
     assert '{label: "Target power", data: prescribed, yAxisID: "y"' in r.text
     assert '{label: "Measured power", data: livePower, yAxisID: "y"' in r.text
     assert 'borderColor: "#f2a900"' in r.text
@@ -226,8 +233,11 @@ def test_ride_page_end_workout_button_reuses_the_stop_path(client, monkeypatch):
     assert 'document.getElementById("endWorkoutBtn").disabled = !active;' in r.text
     # One stop code path, shared with #stopBtn.
     assert "function stopRide() {" in r.text
-    assert 'document.getElementById("stopBtn").addEventListener("click", stopRide);' in r.text
-    assert "End the workout now? The rest of the workout is discarded." in r.text
+    # Both buttons share one guarded path: confirm, leave full screen, then stop.
+    assert 'document.getElementById("stopBtn").addEventListener("click", requestEndRide);' in r.text
+    assert ('document.getElementById("endWorkoutBtn").addEventListener('
+            '"click", requestEndRide);') in r.text
+    assert "End the ride now? The rest of the workout is " in r.text
     assert "if (!window.confirm(" in r.text
     assert "stopRide();" in r.text
 
