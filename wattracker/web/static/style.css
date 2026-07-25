@@ -3,6 +3,11 @@
     --panel: #1a2028;
     --accent: #f2a900;
     --text: #e6e6e6;
+    /* Chart tick labels only: brighter than body text so the numbers stay
+       readable at a glance from the bike, without lifting the whole page. */
+    --text-bright: #f5f7fa;
+    /* Gridlines must be visible on the dark panel but stay behind the data. */
+    --grid: rgba(255, 255, 255, 0.12);
     --muted: #8a94a0;
     --alert: #e05252;
     --ok: #4caf7d;
@@ -43,7 +48,11 @@ nav button.logout:hover { color: var(--accent); }
 .auth-form { max-width: 360px; }
 .auth-form input { width: 100%; margin-top: 0.25rem; }
 .current-ftp { font-size: 1.05rem; }
-main { max-width: 960px; margin: 1.5rem auto; padding: 0 1.5rem; }
+/* 1440px is 960 + 50%: on a typical laptop the content used roughly the middle
+   half of the window, leaving tables and charts cramped while the sides sat
+   empty. Kept as a cap rather than a percentage so prose and forms don't turn
+   into unreadably long lines on an ultrawide display. */
+main { max-width: 1440px; margin: 1.5rem auto; padding: 0 1.5rem; }
 /* Full-bleed pages (races): span essentially the whole viewport, small gutter. */
 main.wide { max-width: none; margin: 1.5rem 0; padding: 0 1rem; }
 footer { text-align: center; color: var(--muted); padding: 2rem 0; }
@@ -341,8 +350,12 @@ button.danger.link-btn { border: none; color: var(--alert); }
     padding: 0.1rem 0.4rem; line-height: 1;
 }
 .modal-close:hover { color: var(--text); filter: none; }
+/* The SVG has a 560x200 viewBox and 10px labels, so letting it stretch to a
+   full-width main only scales the type up and blurs it. Cap it near its natural
+   size and leave it left-aligned. Inert inside the calendar modal, which is
+   already narrower than this. */
 .profile-wrap { background: #10161d; border: 1px solid #2a333d; border-radius: 6px;
-    padding: 0.5rem; margin: 0.75rem 0; }
+    padding: 0.5rem; margin: 0.75rem 0; max-width: 760px; }
 .profile-wrap[hidden] { display: none; }
 #wmTable[hidden], #wmError[hidden] { display: none; }
 .profile-svg { display: block; width: 100%; height: auto; }
@@ -406,7 +419,11 @@ button.danger.link-btn { border: none; color: var(--alert); }
     justify-content: flex-end; }
 .ride-chart-heading .ride-chart-end { border-color: var(--alert); color: var(--alert); }
 .ride-chart-heading .ride-chart-end:disabled { border-color: #2a333d; color: var(--muted); }
-.ride-chart-canvas { position: relative; height: 260px; min-height: 0; }
+/* Grow with the page width: at a 1440px main a fixed 260px box is a 5:1 letter
+   slot the traces have no room to move in. Clamped at both ends so a phone
+   keeps the old height and a wide desktop stops before the chart eats the fold.
+   The full-screen rule below overrides this with a viewport height. */
+.ride-chart-canvas { position: relative; height: clamp(260px, 28vw, 400px); min-height: 0; }
 .ride-chart-block canvas { width: 100% !important; height: 100% !important; position: relative;
     z-index: 1; }
 .ride-chart-metrics { position: absolute; z-index: 2; top: 2.25rem; left: 50%;
