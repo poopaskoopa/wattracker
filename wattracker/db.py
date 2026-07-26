@@ -21,7 +21,7 @@ from .timeutil import utc_now
 
 _log = logging.getLogger(__name__)
 
-SCHEMA_VERSION = 22
+SCHEMA_VERSION = 23
 
 
 def _restrict_db_files(path: str) -> None:
@@ -189,6 +189,12 @@ _MIGRATIONS: Dict[int, Sequence[Union[str, Callable[[sqlite3.Connection], None]]
         # decompresses months of streams per user) and wrong for any user
         # whose data has since changed.
     ],
+    22: [
+        # The unattended nightly reflow now leaves a note behind when it changed
+        # a rider's upcoming workouts. NULL means "nothing to tell them", which
+        # is the correct state for every plan that existed before this column.
+        "ALTER TABLE plans ADD COLUMN reflow_notice TEXT",
+    ],
 }
 
 _DROP = """
@@ -272,6 +278,9 @@ CREATE TABLE IF NOT EXISTS plans (
     model      TEXT,
     recipe     TEXT,
     active     INTEGER NOT NULL DEFAULT 0,
+    -- Pending "the nightly sweep changed your plan" notice (JSON), cleared
+    -- when the rider dismisses it. See set_plan_reflow_notice.
+    reflow_notice TEXT,
     FOREIGN KEY(user_id) REFERENCES users(id)
 );
 
@@ -1203,27 +1212,56 @@ def ftp_history_list(user_id: int, path: Optional[str] = None) -> List[dict]:
 
 
 # ---------------------------------------------------------------- plans
-_PLAN_COLUMNS = "id, name, start_date, weeks, created, model, recipe, active"
+_PLAN_COLUMNS = ("id, name, start_date, weeks, created, model, recipe, active, "
+                 "reflow_notice")
 
 
 def _plan_row(r: sqlite3.Row) -> dict:
-    """Plan row with the recipe parsed back to a dict and active as a bool.
+    """Plan row with the JSON columns parsed back and active as a bool.
 
     A recipe that fails to parse is surfaced as None - i.e. the plan degrades
-    to "legacy, not reflowable" rather than blowing up a page render.
+    to "legacy, not reflowable" rather than blowing up a page render. The
+    pending reflow notice degrades the same way: an unreadable notice is no
+    notice, never an exception on the calendar.
     """
     d = dict(r)
-    raw = d.get("recipe")
-    if raw:
-        try:
-            parsed = json.loads(raw)
-        except (ValueError, TypeError):
-            parsed = None
-        d["recipe"] = parsed if isinstance(parsed, dict) else None
-    else:
-        d["recipe"] = None
+    for key in ("recipe", "reflow_notice"):
+        raw = d.get(key)
+        if raw:
+            try:
+                parsed = json.loads(raw)
+            except (ValueError, TypeError):
+                parsed = None
+            d[key] = parsed if isinstance(parsed, dict) else None
+        else:
+            d[key] = None
     d["active"] = bool(d.get("active"))
     return d
+
+
+def set_plan_reflow_notice(
+    user_id: int, plan_id: int, notice: Optional[dict],
+    path: Optional[str] = None,
+) -> bool:
+    """Record (or clear, with None) the pending "your plan changed" notice.
+
+    The unattended nightly sweep rewrites upcoming workouts; a rewrite the rider
+    is never told about is indistinguishable from us quietly changing their
+    training. The notice is stored on the plan rather than flashed through the
+    URL because the sweep runs with nobody watching - the rider has to be able
+    to find out hours later, on whichever page they open first.
+    """
+    conn = connect(path)
+    try:
+        cur = conn.execute(
+            "UPDATE plans SET reflow_notice = ? WHERE user_id = ? AND id = ?",
+            (json.dumps(notice) if notice is not None else None,
+             user_id, plan_id),
+        )
+        conn.commit()
+        return cur.rowcount > 0
+    finally:
+        conn.close()
 
 
 def create_plan(

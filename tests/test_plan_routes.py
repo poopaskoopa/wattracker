@@ -870,8 +870,11 @@ def test_generated_plan_persists_its_recipe_and_becomes_active(client):
     stored = db.list_plans(uid)[0]
     assert stored["active"] is True
     assert stored["recipe"] == {
-        "version": 1, "days_of_week": [0, 2, 4, 5], "hours_per_week": 8.0,
+        "version": 2, "days_of_week": [0, 2, 4, 5], "hours_per_week": 8.0,
         "hit_days_per_week": 2, "hard_days": [], "model": "polarized",
+        # The form posted no goal, so the plan is the flat one the app has
+        # always generated - the goal is recorded as absent, not defaulted.
+        "goal": None,
     }
     workouts = db.plan_workouts_for_plan(uid, stored["id"])
     assert all(w["origin"] == "generated" for w in workouts)

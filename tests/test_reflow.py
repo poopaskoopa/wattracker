@@ -426,8 +426,9 @@ def test_recipe_round_trips_as_a_dict(user_id):
 
     stored = db.get_plan(user_id, plan_id)
     assert stored["recipe"] == {
-        "version": 1, "days_of_week": [0, 2, 4], "hours_per_week": 6.0,
+        "version": 2, "days_of_week": [0, 2, 4], "hours_per_week": 6.0,
         "hit_days_per_week": 1, "hard_days": [2], "model": "polarized",
+        "goal": None,
     }
     assert stored["active"] is True
     assert db.list_plans(user_id)[0]["recipe"] == stored["recipe"]

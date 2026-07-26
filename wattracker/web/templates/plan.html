@@ -18,7 +18,16 @@
            {% if plan and plan.plan_id == cur.id %}<span class="hint">(viewing)</span>{% endif %}
            {% if cur.model %}<span class="hint">({{ cur.model.replace('_', ' ') }})</span>{% endif %}</p>
         <p>{{ cur.weeks }} weeks &middot; {{ cur.start_date }} &rarr; {{ cur.end_date }}
-           &middot; progress <strong>{{ cur.completed }}/{{ cur.total }}</strong> workouts</p>
+           &middot; progress <strong>{{ cur.completed }}/{{ cur.total }}</strong> workouts
+           {% if cur.goal %}&middot; goal <strong>{{ cur.goal.label }}</strong>{% endif %}</p>
+        {% if cur.reflow_notice %}
+        <p class="alert reflow-notice">{{ cur.reflow_notice.message }}
+            <form method="post" action="/plan/{{ cur.id }}/reflow-notice/dismiss"
+                  style="display:inline">
+                <button type="submit" class="link-btn">dismiss</button>
+            </form>
+        </p>
+        {% endif %}
         <form method="post" action="/plan/{{ cur.id }}/delete" class="delete-plan-form"
               onsubmit="return confirmPlanDelete(this);">
             <button type="submit" class="danger">Delete plan</button>
@@ -146,6 +155,42 @@
         <label>Plan name:
             <input type="text" name="name" value="{{ plan_defaults.name }}">
         </label>
+        <fieldset class="goal-picker">
+            <legend>Goal (optional)</legend>
+            <label class="model-option">
+                <input type="radio" name="goal" value=""
+                    {{ 'checked' if not plan_defaults.goal else '' }}>
+                <span><strong>No goal</strong> &mdash; a flat plan: every week
+                    the same rotation and the same intensity share. Pick a goal
+                    to periodize it instead.</span>
+            </label>
+            {% for g in goal_options %}
+            <label class="model-option">
+                <input type="radio" name="goal" value="{{ g.key }}"
+                       data-weeks="{{ g.ideal_weeks }}" data-model="{{ g.default_model }}"
+                       data-floor="{{ g.floor_weeks }}" data-viable="{{ g.min_viable_weeks }}"
+                       data-label="{{ g.label }}"
+                    {{ 'checked' if plan_defaults.goal == g.key else '' }}>
+                <span><strong>{{ g.label }}</strong> &mdash; {{ g.description }}
+                    <br><span class="hint">Blocks: {{ g.phases|join(' &rarr; ')|safe }}
+                    &middot; suggests the <strong>{{ g.default_model_label }}</strong>
+                    model (you can pick another)</span>
+                    <br><span class="hint">Recommended length
+                    <strong>{{ g.ideal_weeks }} weeks</strong> (floor
+                    {{ g.floor_weeks }}) &mdash;
+                    {% if g.basis_strength == 'LITERATURE' %}
+                    <span class="basis basis-literature">literature-informed</span>
+                    {% else %}
+                    <span class="basis basis-convention">coaching convention, not
+                        a literature result</span>
+                    {% endif %}
+                    </span>
+                    <br><span class="hint">{{ g.rationale }}</span>
+                </span>
+            </label>
+            {% endfor %}
+            <p class="hint" id="goalHint"></p>
+        </fieldset>
         <fieldset class="model-picker">
             <legend>Training model</legend>
             <label class="model-option">
@@ -237,6 +282,77 @@
            {% endif %}
         </p>
 
+        {% if plan.goal %}
+        <section class="plan-goal">
+            <h4>Goal: {{ plan.goal.label }}</h4>
+            <p class="hint">{{ plan.goal.description }}</p>
+
+            {% if plan.phases and plan.phases.blocks %}
+            <ul class="phase-blocks">
+                {% for b in plan.phases.blocks %}
+                <li><strong>{{ b.name }}</strong> &mdash; {{ b.weeks }} week{{ '' if b.weeks == 1 else 's' }}</li>
+                {% endfor %}
+            </ul>
+            {% endif %}
+            {% if plan.phases and plan.phases.omitted %}
+            <p class="hint">Not enough weeks for:
+               <strong>{{ plan.phases.omitted|join(', ') }}</strong> &mdash; this is
+               a block of preparation, not the full arc.</p>
+            {% endif %}
+            {% if plan.phases and plan.phases.unphased_reason %}
+            <p class="hint">{{ plan.phases.unphased_reason }}</p>
+            {% endif %}
+
+            {% if plan.length %}
+            <p class="hint">
+                {% if plan.length.classification == 'short' %}
+                {{ plan.weeks }} weeks is below this goal's {{ plan.length.floor_weeks }}-week
+                floor ({{ plan.length.ideal_weeks }} recommended). The plan was
+                generated as asked &mdash; the blocks above are what fitted.
+                {% elif plan.length.classification == 'over-long' %}
+                {{ plan.weeks }} weeks is longer than the {{ plan.length.ideal_weeks }} recommended;
+                the base and build blocks repeat rather than stretch.
+                {% else %}
+                {{ plan.weeks }} weeks is within this goal's recommended range
+                ({{ plan.length.floor_weeks }}&ndash;{{ plan.length.ideal_weeks }} weeks).
+                {% endif %}
+                {% if plan.length.basis_strength == 'LITERATURE' %}
+                <span class="basis basis-literature">literature-informed</span>
+                {% else %}
+                <span class="basis basis-convention">coaching convention, not a
+                    literature result</span>
+                {% endif %}
+            </p>
+            {% endif %}
+
+            {% if plan.progress %}
+            <h4>Progress signal</h4>
+            {% for s in plan.progress.signals %}
+            <p class="goal-signal{{ ' secondary' if s.role != 'primary' else '' }}">
+                <strong>{{ s.label }}</strong>{% if s.role != 'primary' %}
+                <span class="hint">(secondary)</span>{% endif %}:
+                {% if s.key == 'ftp_trend' %}
+                    {{ s.value.current }} W
+                    ({{ '+' if s.value.change > 0 else '' }}{{ s.value.change }} W
+                    since {{ s.value.from_date }})
+                {% elif s.key == 'peak_power' %}
+                    {% if s.value.peak_5s %}5s {{ s.value.peak_5s }} W{% endif %}
+                    {% if s.value.peak_5s and s.value.peak_60s %} &middot; {% endif %}
+                    {% if s.value.peak_60s %}1min {{ s.value.peak_60s }} W{% endif %}
+                {% elif s.key == 'decoupling' %}
+                    {{ s.value.percent }}%
+                {% elif s.key == 'durability' %}
+                    {{ s.value.retention_pct }}% retention
+                    ({{ s.value.late_w }} W late vs {{ s.value.fresh_w }} W fresh,
+                    {{ s.value.rides }} rides)
+                {% endif %}
+                <br><span class="hint">{{ s.description }}</span>
+            </p>
+            {% endfor %}
+            {% endif %}
+        </section>
+        {% endif %}
+
         <div class="toolbar">
             <form method="post" action="/plan/{{ plan.plan_id }}/export">
                 <button type="submit">Export plan to Zwift</button>
@@ -247,11 +363,14 @@
 
         {% if plan.weekly is defined %}
         <table class="weekly-table">
-            <thead><tr><th>Week</th><th>Volume</th><th>TSS</th><th>Hard %</th></tr></thead>
+            <thead><tr><th>Week</th>{% if plan.phases and plan.phases.blocks %}<th>Phase</th>{% endif %}<th>Volume</th><th>TSS</th><th>Hard %</th></tr></thead>
             <tbody>
             {% for wk in plan.weekly %}
                 <tr class="{{ 'recovery-week' if wk.recovery else '' }}">
                     <td>{{ wk.week }}{{ ' (recovery)' if wk.recovery else '' }}</td>
+                    {% if plan.phases and plan.phases.blocks %}
+                    <td class="phase-cell">{{ plan.phases.weeks[wk.week - 1] or '&mdash;'|safe }}</td>
+                    {% endif %}
                     <td>{{ (wk.total_s // 60) }} min</td>
                     <td>{{ wk.total_tss }}</td>
                     <td>{{ (wk.hard_fraction * 100)|round(0)|int }}%</td>
@@ -380,6 +499,60 @@ function confirmPlanDelete(form) {
     });
     applyMode();
 
+    // ---- goal picker: prefill the recommended length, never enforce it ----
+    // Picking a goal PREFILLS the recommended week count and selects the model
+    // that goal suggests. Both remain fully editable: the recommendation is
+    // advice (and for two of the three goals it is coaching convention rather
+    // than a literature result), so nothing here clamps, blocks or reverts what
+    // the rider types. A length below the goal's floor just gets explained.
+    var weeksInput = document.querySelector('.plan-form input[name="weeks"]');
+    var goalRadios = Array.prototype.slice.call(
+        document.querySelectorAll('.plan-form input[name="goal"]'));
+    function selectedGoal() {
+        return goalRadios.filter(function (r) { return r.checked; })[0] || null;
+    }
+    function goalHint() {
+        var hint = document.getElementById('goalHint');
+        if (!hint) return;
+        var g = selectedGoal();
+        if (!g || !g.value) {
+            hint.textContent = 'No goal: the plan stays flat — the same hard-day '
+                + 'rotation every week.';
+            return;
+        }
+        var weeks = parseInt(weeksInput ? weeksInput.value : '0', 10);
+        var floor = parseInt(g.dataset.floor, 10);
+        var viable = parseInt(g.dataset.viable, 10);
+        if (isNaN(weeks)) { hint.textContent = ''; return; }
+        if (weeks < viable) {
+            hint.textContent = weeks + ' weeks is too short to periodize this '
+                + 'arc (it needs ' + viable + '). The plan will still be '
+                + 'generated — it just runs unperiodized.';
+        } else if (weeks < floor) {
+            hint.textContent = weeks + ' weeks is below this goal’s ' + floor
+                + '-week floor. The plan will still be generated; the earliest '
+                + 'blocks are dropped to fit.';
+        } else {
+            hint.textContent = g.dataset.label + ': ' + weeks + ' weeks '
+                + '(recommended ' + g.dataset.weeks + ').';
+        }
+    }
+    function applyGoal() {
+        var g = selectedGoal();
+        if (g && g.value) {
+            if (weeksInput && g.dataset.weeks) weeksInput.value = g.dataset.weeks;
+            var m = document.querySelector(
+                '.plan-form input[name="model"][value="' + g.dataset.model + '"]');
+            if (m) { m.checked = true; syncHard(); }
+        }
+        goalHint();
+    }
+    goalRadios.forEach(function (r) { r.addEventListener('change', applyGoal); });
+    if (weeksInput) {
+        weeksInput.addEventListener('input', goalHint);
+        weeksInput.addEventListener('change', goalHint);
+    }
+
     // ------- per-day hard/not-hard picker: enforce the HIT-days cap -------
     var hitInput = document.querySelector('.plan-form input[name="hit_days_per_week"]');
     var dayBoxes = Array.prototype.slice.call(
@@ -464,6 +637,7 @@ function confirmPlanDelete(form) {
         hitInput.addEventListener('input', syncHard);
     }
     syncHard();
+    goalHint();
 })();
 </script>
 {% endblock %}

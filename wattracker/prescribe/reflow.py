@@ -45,27 +45,44 @@ from typing import Dict, List, Optional
 from .. import db
 from ..metrics import profile_store
 from ..timeutil import utc_now
-from . import zwo
+from . import goals, zwo
 from .adapt import reexport_workout
 from .plan import generate_plan
 
 log = logging.getLogger(__name__)
 
-RECIPE_VERSION = 1
+RECIPE_VERSION = 2
+
+# Recipe shapes this module can still recompute. v1 predates training goals and
+# simply has no ``goal`` key, which reads as "no goal" and reproduces exactly
+# the flat plan it was generated as. Refusing v1 would strand every plan created
+# before goals existed as "not reflowable", so both shapes are supported and the
+# absence of the key - not the version number - is what means "no goal".
+SUPPORTED_RECIPE_VERSIONS = (1, 2)
 
 # The generator arguments the recipe carries. name/start_date/weeks are columns
 # on `plans` and are deliberately NOT duplicated here.
+#
+# ``goal`` is the one input that IS stored rather than read fresh. Races and the
+# rider's profile change on their own and must track reality every night; a goal
+# is a deliberate choice made at plan creation, so re-deriving it nightly could
+# silently repoint a plan at a different arc (see prescribe/goals.py).
 _RECIPE_KEYS = ("days_of_week", "hours_per_week", "hit_days_per_week",
-                "hard_days", "model")
+                "hard_days", "model", "goal")
 
 GENERATED = "generated"
 
 
 def build_recipe(
     days_of_week, hours_per_week: float, hit_days_per_week: int,
-    hard_days=None, model: str = "polarized",
+    hard_days=None, model: str = "polarized", goal: Optional[str] = None,
 ) -> Dict:
-    """The recipe dict to persist alongside a freshly generated plan."""
+    """The recipe dict to persist alongside a freshly generated plan.
+
+    ``goal`` is a key from ``prescribe.goals.GOALS`` or None. It is normalized
+    here so an unrecognized key is stored as no goal at all rather than as a
+    string that would silently stop resolving to an arc later.
+    """
     return {
         "version": RECIPE_VERSION,
         "days_of_week": sorted({int(d) for d in days_of_week}),
@@ -73,6 +90,7 @@ def build_recipe(
         "hit_days_per_week": int(hit_days_per_week),
         "hard_days": sorted({int(d) for d in (hard_days or [])}),
         "model": model,
+        "goal": goals.normalize_key(goal),
     }
 
 
@@ -146,9 +164,19 @@ def _by_date(rows: List[dict]) -> tuple:
 
 
 def reflow_plan(
-    user_id: int, plan_id: int, now: Optional[_dt.datetime] = None
+    user_id: int, plan_id: int, now: Optional[_dt.datetime] = None,
+    notify: bool = False,
 ) -> Dict:
     """Recompute `plan_id` from its recipe and apply the diff. Idempotent.
+
+    ``notify`` records a "your plan changed" notice on the plan when the run
+    actually rewrote something, for the UI to surface later. It is set by the
+    UNATTENDED nightly sweep only: a reflow the rider triggered by editing a
+    race is one they already know about, but the nightly one happens while
+    nobody is looking and a silent rewrite of tomorrow's session is not
+    acceptable. A run that changed nothing leaves any existing notice alone -
+    reflow is idempotent, and a second no-op run must not erase the message
+    from the run that did change something.
 
     Returns {status, updated, inserted, deleted, skipped_locked, raced_lost,
     failed, conflicts, races, race_conflicts} on success, or
@@ -183,7 +211,7 @@ def reflow_plan(
     recipe = plan.get("recipe")
     if not recipe:
         return _not_reflowable("legacy")
-    if recipe.get("version") != RECIPE_VERSION:
+    if recipe.get("version") not in SUPPORTED_RECIPE_VERSIONS:
         return _not_reflowable("unsupported_version")
 
     try:
@@ -201,6 +229,11 @@ def reflow_plan(
     # through the cache: deriving it decompresses months of streams, and race
     # CRUD reflows on a request thread.
     profile = profile_store.for_user(user_id)
+    # A recipe with no goal (every plan created before goals existed, and every
+    # plan whose rider picked none) resolves to None here, which is the code
+    # path generate_plan took before phases existed - byte-identical output, so
+    # the nightly sweep does not rewrite a single stored workout.
+    arc = goals.arc_for(args.get("goal"))
     try:
         generated = generate_plan(
             plan["name"], start, int(plan["weeks"]),
@@ -211,6 +244,7 @@ def reflow_plan(
             model=args["model"] or "polarized",
             races=races,
             profile=profile,
+            phases=arc,
         )
     except (ValueError, TypeError) as e:
         log.warning("plan %s has an unusable recipe: %s", plan_id, e)
@@ -243,8 +277,60 @@ def reflow_plan(
                 (stored or {}).get("id"), exc_info=True,
             )
 
+    if notify:
+        _record_notice(user_id, plan_id, counts, now, bool(races))
+
     return {"status": "ok", "races": race_info.get("planned") or [],
             "race_conflicts": race_info.get("conflicts") or [], **counts}
+
+
+def _notice_message(counts: Dict, has_races: bool) -> str:
+    """The sentence the rider reads. States WHAT changed and WHY.
+
+    The 'why' is deliberately a description of what the nightly recomputation
+    reads rather than a claim about which input moved: reflow recomputes the
+    whole plan and diffs it, so it genuinely does not know whether a race, the
+    rider's measured capacity, or both are responsible. Naming a cause we did
+    not establish would be worse than naming the mechanism.
+    """
+    parts = []
+    for key, verb in (("updated", "updated"), ("inserted", "added"),
+                      ("deleted", "removed")):
+        n = counts.get(key, 0)
+        if n:
+            parts.append(f"{n} {verb}")
+    changed = ", ".join(parts)
+    because = ("your races and your measured fitness" if has_races
+               else "your measured fitness")
+    return (
+        f"Your plan was updated overnight: {changed}. Upcoming workouts are "
+        f"recomputed each night from {because}, so they track where you are "
+        f"now. Completed and past workouts are never touched."
+    )
+
+
+def _record_notice(
+    user_id: int, plan_id: int, counts: Dict, now: _dt.datetime,
+    has_races: bool,
+) -> None:
+    """Store the rider-facing notice for a sweep run that changed something."""
+    changed = (counts.get("updated", 0) + counts.get("inserted", 0)
+               + counts.get("deleted", 0))
+    if changed <= 0:
+        return
+    notice = {
+        "at": now.isoformat(timespec="seconds"),
+        "updated": counts.get("updated", 0),
+        "inserted": counts.get("inserted", 0),
+        "deleted": counts.get("deleted", 0),
+        "changed": changed,
+        "message": _notice_message(counts, has_races),
+    }
+    try:
+        db.set_plan_reflow_notice(user_id, plan_id, notice)
+    except Exception:  # noqa: BLE001 - telling the rider must not break the sweep
+        log.warning("could not record reflow notice for plan %s", plan_id,
+                    exc_info=True)
 
 
 def _apply_one(user_id: int, plan_id: int, date: str, today: str,
