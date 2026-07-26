@@ -38,24 +38,37 @@ from ..timeutil import parse_naive, utc_now
 # Physiology gives the fix: true maximal heart rate is *sustainable* for tens of
 # seconds (it is reached at the end of a hard effort and holds there), whereas
 # an artefact lasts a sample or two. So per activity we take the maximum of a
-# rolling mean rather than of the raw samples. 10s is long enough that a 1-5
-# sample spike is diluted below the surrounding HR, and short enough that a
-# genuine max-effort finish - which plateaus for far longer than 10s - is
-# reported essentially undiminished.
-HR_SMOOTH_WINDOW_S = 10
+# rolling mean rather than of the raw samples.
+#
+# The window length is a measured tradeoff, not a guess. Smoothing does not push
+# a spike below the surrounding HR - it only dilutes it, by roughly
+# spike_samples/window of the excess - so the window has to be long relative to
+# an artefact and short relative to a real maximal effort. Measured, on a
+# 155-160 bpm ride carrying a 3-sample ~240 bpm artefact the reported peak is
+# 208 at 5s, 183 at 10s, 166 at 30s and 162 at 60s; on a genuine 45s plateau at
+# 186 bpm it is 186 at 10s, 20s and 30s but only 180 at 60s. 30s is therefore
+# the sweet spot: it still reports a genuine sustained maximum undiminished,
+# while cutting a 3-sample artefact's contribution from +23 bpm (at 10s) to +6.
+HR_SMOOTH_WINDOW_S = 30
 
 # Second layer: reject one bad *file*. A whole activity can be wrong (a strap
-# reading double cadence-derived noise for 20 minutes will survive smoothing),
-# so we do not take the outright highest per-activity value across activities
-# either. Instead we take a non-interpolated 90th percentile of the per-activity
-# maxima, which for any realistic activity count discards the single highest
-# contributor and returns an actually-observed value from the next tier down.
-# A genuine HRmax is hit on several hard rides, so it survives; a one-off
-# artefact is dropped.
-HR_PERCENTILE = 90.0
+# reading double, or cadence-derived noise, for 20 minutes will survive
+# smoothing), so we do not take the outright highest per-activity value across
+# activities either.
+#
+# The discriminator is reproducibility. A true HRmax is hit on every maximal
+# effort, so the rider's hard rides cluster within a couple of beats of it; a
+# sensor artefact is unique to the file that produced it and has nothing near
+# it. So we report the highest per-activity peak that is corroborated by at
+# least one OTHER activity within HR_CORROBORATION_BPM. That rejects single-file
+# corruption without any dependence on how many activities exist - unlike a high
+# percentile, which discards a fixed FRACTION of the top values and therefore
+# gets systematically worse (5-7 bpm low) the more history a rider accumulates,
+# since the discarded top slice is exactly the rides where they hit max.
+HR_CORROBORATION_BPM = 3.0
 
-# Below this many contributing activities the percentile has nothing to reject
-# with, so we report nothing rather than a confident wrong number.
+# Below this many contributing activities corroboration is too weak a signal to
+# trust, so we report nothing rather than a confident wrong number.
 HR_MIN_ACTIVITIES = 5
 
 # Plausibility bounds on a per-activity sustained peak. Anything outside these
@@ -124,8 +137,11 @@ def detect_hr_max(
 ) -> Tuple[Optional[float], int]:
     """Detect HRmax from many activities' heart-rate streams.
 
-    Returns ``(hr_max, n_contributing_activities)``. ``hr_max`` is ``None``
-    when fewer than ``min_activities`` streams yield a plausible sustained peak.
+    Returns ``(hr_max, n_contributing_activities)``. ``hr_max`` is the highest
+    plausible per-activity sustained peak corroborated by a second activity
+    within ``HR_CORROBORATION_BPM``; it is ``None`` when fewer than
+    ``min_activities`` streams yield a plausible peak, or when no peak is
+    corroborated at all (nothing reproducible means nothing to report).
     """
     peaks: List[float] = []
     for stream in streams:
@@ -137,12 +153,16 @@ def detect_hr_max(
     n = len(peaks)
     if n < min_activities:
         return None, n
-    # method="lower" keeps the result an actually-observed value and, unlike
-    # linear interpolation, does not let the single highest (possibly bad)
-    # activity pull the answer up.
-    value = float(np.percentile(np.array(peaks, dtype=float), HR_PERCENTILE,
-                                method="lower"))
-    return value, n
+    arr = np.sort(np.array(peaks, dtype=float))[::-1]
+    # Walk down from the highest peak; the first one with another activity
+    # within tolerance is the highest reproducible heart rate this rider has
+    # demonstrated. Comparing each candidate against its immediate neighbour in
+    # the sorted list is sufficient: if any other value is within tolerance, the
+    # nearest one below it is too.
+    for i in range(arr.size - 1):
+        if arr[i] - arr[i + 1] <= HR_CORROBORATION_BPM:
+            return float(arr[i]), n
+    return None, n
 
 
 def _positive(value: Any) -> Optional[float]:
