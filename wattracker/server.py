@@ -619,6 +619,10 @@ def create_app() -> FastAPI:
         uid = _uid(request)
         if action == "reset":
             db.set_user_ftp_override(uid, None)
+            try:
+                profile_store.refresh(uid)
+            except Exception:
+                _log.warning("profile refresh after FTP reset failed", exc_info=True)
             return RedirectResponse("/profile?saved=ftp", status_code=303)
         try:
             value = int(ftp.strip())
@@ -627,6 +631,10 @@ def create_app() -> FastAPI:
         if not 1 <= value <= 2000:
             return _profile_response(request, "FTP must be a whole number from 1 to 2000 W.")
         db.set_user_ftp_override(uid, value)
+        try:
+            profile_store.refresh(uid)
+        except Exception:
+            _log.warning("profile refresh after FTP save failed", exc_info=True)
         return RedirectResponse("/profile?saved=ftp", status_code=303)
 
     @app.post("/profile/hr-max", response_class=HTMLResponse)
@@ -638,6 +646,10 @@ def create_app() -> FastAPI:
         uid = _uid(request)
         if action == "reset":
             db.set_user_hr_max(uid, None)
+            try:
+                profile_store.refresh(uid)
+            except Exception:
+                _log.warning("profile refresh after HRmax reset failed", exc_info=True)
             return RedirectResponse("/profile?saved=1", status_code=303)
         try:
             value = int(hr_max.strip())
@@ -646,6 +658,10 @@ def create_app() -> FastAPI:
         if not 80 <= value <= 230:
             return _profile_response(request, "HRmax must be a whole number from 80 to 230 bpm.")
         db.set_user_hr_max(uid, value)
+        try:
+            profile_store.refresh(uid)
+        except Exception:
+            _log.warning("profile refresh after HRmax save failed", exc_info=True)
         return RedirectResponse("/profile?saved=1", status_code=303)
 
     @app.get("/activity/{activity_id}", response_class=HTMLResponse)
@@ -1557,6 +1573,10 @@ def create_app() -> FastAPI:
                     db.add_ftp_entry(uid, utc_today().isoformat(), watts, "manual")
             except ValueError:
                 pass
+        try:
+            profile_store.refresh(uid)
+        except Exception:
+            _log.warning("profile refresh after settings save failed", exc_info=True)
         # The Anthropic API key is app-level (shared).
         if anthropic_api_key:
             config.set_anthropic_api_key(anthropic_api_key)

@@ -6,6 +6,7 @@ import pytest
 
 from wattracker import auth, db
 from wattracker.analysis import pipeline, zones
+from wattracker.metrics import profile_store
 
 pytest.importorskip("httpx")
 from fastapi.testclient import TestClient  # noqa: E402
@@ -303,6 +304,46 @@ def test_profile_and_api_require_authentication(client):
     assert client.get("/profile", follow_redirects=False).status_code == 303
     assert client.post("/profile/hr-max", data={"hr_max": "190"}, follow_redirects=False).status_code == 303
     assert client.post("/profile/ftp", data={"ftp": "250"}, follow_redirects=False).status_code == 303
+
+
+def test_settings_save_refreshes_profile_weight(client):
+    uid = _register(client, "weight-alice")
+    client.post("/settings", data={"weight_kg": "68.5"})
+    assert profile_store.for_user(uid).weight_kg == pytest.approx(68.5)
+    client.post("/settings", data={"weight_kg": "70.2"})
+    assert profile_store.for_user(uid).weight_kg == pytest.approx(70.2)
+
+
+def test_ftp_override_set_and_clear_refreshes_profile(client):
+    uid = _register(client, "ftp-refresh")
+    client.post("/profile/ftp", data={"ftp": "280", "action": "save"})
+    assert profile_store.for_user(uid).ftp == pytest.approx(280)
+    client.post("/profile/ftp", data={"action": "reset"})
+    assert profile_store.for_user(uid).ftp != pytest.approx(280)
+
+
+def test_hr_max_set_and_clear_refreshes_profile_and_source(client):
+    uid = _register(client, "hrmax-refresh")
+    client.post("/profile/hr-max", data={"hr_max": "192", "action": "save"})
+    metrics = profile_store.for_user(uid)
+    assert metrics.hr_max == pytest.approx(192)
+    assert metrics.hr_max_source == "manual"
+
+    client.post("/profile/hr-max", data={"action": "reset"})
+    metrics = profile_store.for_user(uid)
+    assert metrics.hr_max_source != "manual"
+
+
+def test_settings_save_succeeds_even_when_profile_refresh_raises(client, monkeypatch):
+    uid = _register(client, "refresh-fails")
+
+    def _boom(*args, **kwargs):
+        raise RuntimeError("boom")
+
+    monkeypatch.setattr(profile_store, "refresh", _boom)
+    resp = client.post("/settings", data={"weight_kg": "72"})
+    assert resp.status_code == 200
+    assert db.get_user_settings(uid)["weight_kg"] == pytest.approx(72)
 
 
 def test_v16_to_v17_migration_preserves_users_settings_and_races(tmp_path):
