@@ -166,6 +166,40 @@ def test_current_power_profile_never_uses_unexplained_200_default(user_id):
     assert zones.resolve_current_ftp(user_id)["value"] == 247
 
 
+@pytest.mark.parametrize("payload", [42, "250", b"250", {"sample": 250}])
+def test_current_ftp_skips_corrupt_nonsequence_power(user_id, monkeypatch, payload):
+    monkeypatch.setattr(db, "full_activities", lambda _uid: [
+        {"streams": {"power": payload}},
+    ])
+    assert zones.resolve_current_ftp(user_id) == {
+        "available": False,
+        "value": None,
+        "source": "No personalized FTP available",
+    }
+
+
+def test_current_ftp_skips_persisted_corrupt_power_then_uses_valid_list(
+    user_id, monkeypatch
+):
+    frozen = dt.datetime(2026, 7, 25, 12)
+    monkeypatch.setattr(zones.importer, "utc_now", lambda: frozen)
+    db.insert_activity(user_id, {
+        "dedup_hash": "corrupt-scalar",
+        "filename": "corrupt.fit",
+        "start_time": "2026-06-01T10:00:00",
+        "duration_s": 1,
+        "streams": {"power": 42},
+    })
+    _activity(
+        user_id, "valid-power", frozen.isoformat(), power=[250] * 1200
+    )
+    assert zones.resolve_current_ftp(user_id) == {
+        "available": True,
+        "value": pytest.approx(237.5),
+        "source": "FIT power estimate",
+    }
+
+
 def test_activity_ftp_prefers_history_then_np_if_recovery(user_id):
     db.add_ftp_entry(user_id, "2026-01-01", 230, "estimated")
     db.add_ftp_entry(user_id, "2026-06-01", 250, "manual")
@@ -203,6 +237,7 @@ def test_profile_get_post_validation_reset_and_isolation(client):
     db.save_user_settings(alice, {"ftp": 240})
     page = client.get("/profile")
     assert page.status_code == 200
+    assert "Power profile" in page.text
     assert "Power zones" in page.text and "Training FTP: 240.0 W" in page.text
     assert "Heart-rate zones" in page.text
 

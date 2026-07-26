@@ -5,6 +5,7 @@ All functions operate on per-second power streams (one sample per second).
 from __future__ import annotations
 
 import math
+from collections.abc import Mapping
 from typing import Iterable, Sequence
 
 import numpy as np
@@ -169,16 +170,36 @@ def _split_activities(activities: Iterable):
 
     efforts: "list[tuple[object, Sequence[float]]]" = []
     activity_days: list = []
+
+    def stream_or_none(value, *, persisted: bool = False):
+        if value is None or isinstance(value, (str, bytes, bytearray, Mapping)):
+            return None
+        if persisted and not isinstance(value, (list, tuple)):
+            return None
+        try:
+            iter(value)
+        except TypeError:
+            return None
+        if isinstance(value, (list, tuple)) and not value:
+            return None
+        return value
+
     for item in activities:
         if isinstance(item, dict):
             when = parse_naive(item.get("start_time"))
             if when is not None:
                 activity_days.append(when)
-            power = (item.get("streams") or {}).get("power") or item.get("power")
-            if power:
+            streams = item.get("streams")
+            power = streams.get("power") if isinstance(streams, Mapping) else None
+            if power is None:
+                power = item.get("power")
+            power = stream_or_none(power, persisted=True)
+            if power is not None:
                 efforts.append((when, power))
         else:
-            efforts.append((None, item))
+            power = stream_or_none(item)
+            if power is not None:
+                efforts.append((None, power))
     activity_days.sort()
     return efforts, activity_days
 

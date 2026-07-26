@@ -32,7 +32,7 @@ from starlette.middleware.sessions import SessionMiddleware
 from starlette.middleware.trustedhost import TrustedHostMiddleware
 
 from . import auth, backup, config, credstore, db, exporter, paths, races
-from .analysis import pipeline, zones
+from .analysis import pipeline, power_profile, zones
 from .ble import devices as bledevices
 from .ble.runner import RideController, flatten_session
 from .ingest import importer
@@ -553,6 +553,7 @@ def create_app() -> FastAPI:
             _ctx(
                 request,
                 profile=zones.rider_profile(uid),
+                power_profile=power_profile.for_user(uid),
                 manual_ftp=settings.get("ftp"),
                 manual_hr_max=settings.get("hr_max"),
                 error=error,
