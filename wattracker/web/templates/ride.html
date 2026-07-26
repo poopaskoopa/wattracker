@@ -111,8 +111,23 @@
                 <span><strong id="clockBlock">0:00</strong><small>Block left</small></span>
                 <span><strong id="clockTotal">0:00</strong><small>Workout left</small></span>
             </div>
-            <div id="ergIndicator" class="ride-chart-erg erg-dark" aria-hidden="true">
+            <div id="ergIndicator" class="ride-chart-chip ride-chart-erg erg-dark"
+                 aria-hidden="true">
                 <span class="erg-led"></span><span class="erg-label">ERG</span>
+            </div>
+            <div id="deviceIndicators" class="ride-chart-devices" aria-hidden="true">
+                <div class="ride-chart-chip device-chip device-dark" data-role="power"
+                     title="Power" hidden>
+                    <span class="erg-led"></span><span class="device-glyph">&#9889;</span>
+                </div>
+                <div class="ride-chart-chip device-chip device-dark" data-role="hr"
+                     title="Heart rate" hidden>
+                    <span class="erg-led"></span><span class="device-glyph">&#9829;</span>
+                </div>
+                <div class="ride-chart-chip device-chip device-dark" data-role="trainer"
+                     title="Trainer" hidden>
+                    <span class="erg-led"></span><span class="device-glyph">&#9881;</span>
+                </div>
             </div>
             <div class="ride-chart-metrics" aria-hidden="true">
                 <span class="metric-power"><strong id="chartPowerValue">&mdash;</strong><small>W</small></span>
@@ -156,6 +171,9 @@
     var cuesPlayed = {};
     var chartMaxX = 0;
     var connectedAddresses = {};
+    // Roles that have connected at least once this page session. Never cleared:
+    // a sensor that drops mid-ride has to go dark, not disappear.
+    var seenRoles = {};
     var pendingDisconnects = {};
     var ergAvailable = false, ergEnabled = false, ergPending = false;
     function readCache() {
@@ -959,6 +977,24 @@
                 button.disabled = !connected || !ws;
                 if (!pendingDisconnects[row.dataset.address]) button.textContent = "Disconnect";
             }
+        });
+        updateDeviceIndicators();
+    }
+    function updateDeviceIndicators() {
+        var live = {};
+        Object.keys(connectedAddresses).forEach(function (address) {
+            (connectedAddresses[address] || []).forEach(function (role) {
+                live[role] = true;
+                seenRoles[role] = true;
+            });
+        });
+        document.querySelectorAll("#deviceIndicators .device-chip").forEach(function (chip) {
+            var role = chip.dataset.role;
+            // A rider with no strap never sees an HR chip at all.
+            chip.hidden = !seenRoles[role];
+            chip.title = roleLabel(role) + (live[role] ? ": connected" : ": disconnected");
+            chip.classList.toggle("device-lit", !!live[role]);
+            chip.classList.toggle("device-dark", !live[role]);
         });
     }
     function uncheckDeviceRoles(address) {
