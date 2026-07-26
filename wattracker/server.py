@@ -36,7 +36,7 @@ from .analysis import pipeline, power_profile, zones
 from .ble import devices as bledevices
 from .ble.runner import RideController, flatten_session
 from .ingest import importer
-from .metrics import profile_cache
+from .metrics import profile_store
 from .prescribe import adapt as adaptmod
 from .prescribe import plan as planmod
 from .prescribe import reflow
@@ -156,6 +156,7 @@ def run_daily_maintenance() -> dict:
     totals = importer.run_auto_scan()
     totals["adapted"] = 0
     totals["races"] = 0
+    totals["race_skipped"] = 0
     totals["reflowed"] = 0
     totals["exported"] = 0
     # Daily safety snapshot of the whole DB (once per ~day even if the sweep
@@ -174,10 +175,26 @@ def run_daily_maintenance() -> dict:
             totals["completed"] += importer.match_plan_completions(uid)
         except Exception:
             _log.warning("completion matching failed for user %s", uid, exc_info=True)
+        # None when the state could not be built; adaptation then reads as
+        # "progress" and changes nothing, which is the right failure mode.
+        state = None
         try:
             state = pipeline.build_state(uid)
+            # Recompute the stored rider profile FIRST: everything below
+            # (adaptation, reflow, the .zwo export) prescribes against the
+            # snapshot, and the profile depends on wall-clock time as well as
+            # on rides - FTP decays across a layoff even when no new activity
+            # lands - so a sweep that skipped this would keep prescribing
+            # against a rider who no longer exists. Reuses the state just
+            # built rather than building a second one.
+            profile_store.refresh(uid, state=state)
+        except Exception:
+            _log.warning("rider profile refresh failed for user %s", uid,
+                         exc_info=True)
+        try:
             summary = adaptmod.apply_adaptations(uid, state)
             totals["adapted"] += summary.get("adjusted", 0)
+            totals["race_skipped"] += summary.get("skipped_raced", 0)
         except Exception:
             _log.warning("plan adaptation failed for user %s", uid, exc_info=True)
         try:
@@ -897,7 +914,8 @@ def create_app() -> FastAPI:
         error: Optional[str] = None
         session_dict = None
         try:
-            session = plan_workout(state, duration_min)
+            session = plan_workout(state, duration_min,
+                                   profile=profile_store.for_user(uid))
             session = llm.shape_session(session, state)
             session.compute_tss()
             zwo_str = zwo.zwo_string(session)
@@ -965,7 +983,7 @@ def create_app() -> FastAPI:
             generated = planmod.generate_plan(
                 name, start, weeks, day_ints, hours_per_week, hit_days_per_week,
                 hard_days=hard_ints or None, model=model,
-                profile=profile_cache.for_user(uid),
+                profile=profile_store.for_user(uid),
             )
             # Persist the generator inputs, not just their output, so the plan
             # can be recomputed later (see prescribe/reflow.py).
@@ -1688,7 +1706,7 @@ def create_app() -> FastAPI:
         # Ridden in ERG here, exported as a .zwo there - both must be the
         # same session, so the rebuild gets the rider's profile just as the
         # export did.
-        profile = profile_cache.for_user(uid)
+        profile = profile_store.for_user(uid)
         if workout_id:
             w = db.get_plan_workout(uid, int(workout_id))
             if w:
@@ -1791,7 +1809,7 @@ def create_app() -> FastAPI:
         try:
             kind, mins = _validate_just_ride(type, minutes)
             session = build_workout(kind, mins,
-                                    profile=profile_cache.for_user(uid))
+                                    profile=profile_store.for_user(uid))
         except (ValueError, OverflowError) as e:
             return JSONResponse({"error": str(e)}, status_code=400)
         ftp = importer.current_ftp(uid)
@@ -2459,7 +2477,7 @@ def create_app() -> FastAPI:
         ftp = importer.current_ftp(uid)
         session = build_workout(w["type"], max(1, w["duration_s"] / 60),
                                 w.get("variant"),
-                                profile=profile_cache.for_user(uid))
+                                profile=profile_store.for_user(uid))
 
         segments = []
         for seg in session.segments:

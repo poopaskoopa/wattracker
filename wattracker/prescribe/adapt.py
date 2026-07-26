@@ -47,7 +47,7 @@ import os
 from typing import Dict, List, Optional
 
 from .. import db, paths
-from ..metrics import profile_cache
+from ..metrics import profile_store
 from ..timeutil import utc_now
 from . import zwo
 from .plan import normalize_races, race_effects, resolve_race_conflicts
@@ -131,13 +131,20 @@ def reexport_workout(
         log.warning("re-export of adapted workout failed: %s", e)
 
 
-def race_window(user_id: int, now: _dt.datetime) -> set:
-    """ISO dates around ``now`` that a race already has an opinion about.
+def race_window(user_id: int, plan_id: int, now: _dt.datetime) -> set:
+    """ISO dates in ``plan_id`` that a race already has an opinion about.
 
     Delegates every date decision to ``plan.race_effects``, the function the
     generator itself uses, so "inside a race window" means exactly the same
-    thing here, in the generator and in reflow. Never raises: a rider with no
-    races, no plan or unparseable rows simply owns no dates.
+    thing here, in the generator and in reflow.
+
+    Scoped to ONE plan, because the generator's is: post-race recovery lands on
+    the first N ride days after the race *of the plan being generated*. Feeding
+    it a second, overlapping plan's rows would hand this function ride days the
+    generator never saw and produce a window the two disagree about.
+
+    Never raises: a rider with no races, no plan or unparseable rows simply
+    owns no dates.
     """
     try:
         lo = (now.date() - _dt.timedelta(days=RACE_CONTEXT_DAYS)).isoformat()
@@ -149,7 +156,7 @@ def race_window(user_id: int, now: _dt.datetime) -> set:
         # window can only be computed against the days they ride.
         scheduled = [
             _dt.date.fromisoformat(d)
-            for d in db.plan_workout_dates(user_id, lo, hi)
+            for d in db.plan_workout_dates(user_id, plan_id, lo, hi)
         ]
         resolved, _conflicts = resolve_race_conflicts(normalize_races(races))
         return race_effects(resolved, scheduled).window()
@@ -162,9 +169,10 @@ def race_window(user_id: int, now: _dt.datetime) -> set:
 def apply_adaptations(user_id: int, state, now: Optional[_dt.datetime] = None) -> Dict:
     """Run detection-driven plan adaptation for a user. Idempotent.
 
-    Returns a summary for the dashboard banner:
-      {status, adjusted (this run), upcoming (kind -> count of future adapted
-       workouts), window_days}
+    Returns a summary for the dashboard banner, with the SAME keys on every
+    path: {status, adjusted (this run), skipped_raced (left alone because a
+    race already owns the day), upcoming (kind -> count of future adapted
+    workouts), window_days}.
     """
     now = now or utc_now()
     today = now.date().isoformat()
@@ -181,6 +189,9 @@ def apply_adaptations(user_id: int, state, now: Optional[_dt.datetime] = None) -
         return {
             "status": POST_RACE,
             "adjusted": 0,
+            # Same keys on every path: a summary with two shapes is a trap for
+            # every consumer (the banner, the sweep totals, the tests).
+            "skipped_raced": 0,
             "upcoming": db.upcoming_adapted_counts(user_id, today),
             "window_days": ADAPT_WINDOW_DAYS,
             "post_race_until": (
@@ -192,12 +203,17 @@ def apply_adaptations(user_id: int, state, now: Optional[_dt.datetime] = None) -
     status = detection_status(state)
     adjusted = 0
     skipped_raced = 0
-    window = race_window(user_id, now)
+    # Race windows are per-plan, so they are resolved per-plan and memoized
+    # for the handful of plans this window can touch.
+    windows: Dict[int, set] = {}
     # Rebuilt sessions must match the exported .zwo, so adaptation uses the
     # same rider profile the generator and reflow do.
-    profile = profile_cache.for_user(user_id)
+    profile = profile_store.for_user(user_id)
     for w in db.adaptable_plan_workouts(user_id, today, horizon):
-        if w["date"] in window:
+        plan_id = w["plan_id"]
+        if plan_id not in windows:
+            windows[plan_id] = race_window(user_id, plan_id, now)
+        if w["date"] in windows[plan_id]:
             # A taper, a race day or a post-race recovery day: the generator
             # has already cut this day's load on purpose (see the module
             # docstring). Easing it again double-counts, and reflow would put
@@ -285,4 +301,15 @@ def banner_for(state, summary: Dict) -> Dict:
                          f"{kind_word.get(kind, kind)}")
     banner["adaptation"] = "; ".join(parts) if parts else None
     banner["adjusted_now"] = summary.get("adjusted", 0)
+    # Say when a race is the reason nothing was eased. Silently doing nothing
+    # reads as "the adaptation is broken"; the rider is mid-taper and the plan
+    # has already cut those days on purpose.
+    skipped = summary.get("skipped_raced", 0)
+    banner["race_skipped"] = skipped
+    if skipped:
+        banner["race_note"] = (
+            f"{skipped} upcoming workout{'s' if skipped != 1 else ''} left as "
+            "planned - they sit inside a race taper or recovery window, which "
+            "already reduces the load."
+        )
     return banner

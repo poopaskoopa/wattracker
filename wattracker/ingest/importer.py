@@ -20,6 +20,7 @@ from ..metrics.power import (
     normalized_power,
     training_stress_score,
 )
+from ..metrics import profile_store
 from ..paths import activities_dir
 from ..timeutil import parse_naive, utc_now, utc_today
 from .fit_parser import parse_fit
@@ -470,6 +471,13 @@ def scan_activities(
     if imported > 0:
         evaluate_ftp(user_id)
         completed = match_plan_completions(user_id)
+        # New rides move the rider's measured capacities (a new 5s or 5min
+        # peak, a new FTP), and every prescription is built on the STORED
+        # snapshot - so refresh it here, after FTP re-evaluation, rather than
+        # leaving the plan quoting yesterday's rider until the nightly sweep.
+        # Deliberately inside the `imported > 0` guard: nothing new landed
+        # means nothing derived changed.
+        profile_store.refresh(user_id)
 
     return {
         "found": found,

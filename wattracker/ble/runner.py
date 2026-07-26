@@ -165,6 +165,13 @@ class RideController:
     def target_watts(self, t: float) -> int:
         return int(round(self.target_fraction(t) * self.ftp))
 
+    def target_is_free(self, t: float) -> bool:
+        """Is second ``t`` inside an untargeted (maximal-effort) block?"""
+        for (s, e, kind, _val) in self.blocks:
+            if s <= t < e:
+                return kind == "free"
+        return False
+
     def _block_index(self, t: float) -> int:
         for i, (s, e, _k, _v) in enumerate(self.blocks):
             if s <= t < e:
@@ -405,6 +412,12 @@ class RideController:
             "segment_index": self._block_index(clamped),
             "segment_count": len(self.blocks),
             "target_watts": self.current_target,
+            # True while the rider is inside an untargeted (maximal-effort)
+            # block. target_watts still carries the ERG resistance the trainer
+            # is holding, because the trainer needs a number - but the UI must
+            # not present it as a target, or a "no target" sprint announces a
+            # target anyway.
+            "target_free": self.target_is_free(clamped),
             "power": self.current_power,
             "cadence": round(self.current_cadence, 1)
             if self.current_cadence is not None else None,

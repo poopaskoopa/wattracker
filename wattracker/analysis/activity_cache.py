@@ -94,16 +94,6 @@ def _fingerprint(user_id: int) -> Tuple[int, int, int]:
         conn.close()
 
 
-def fingerprint(user_id: int) -> Tuple[int, int, int]:
-    """Public view of the activity-set fingerprint.
-
-    Exposed so other per-user caches (``metrics.profile_cache``) key off the
-    same "did this user's activity set change" signal instead of inventing a
-    second, subtly different invalidation rule.
-    """
-    return _fingerprint(user_id)
-
-
 def _build(user_id: int) -> ActivityDigest:
     activities = db.full_activities(user_id)
 
