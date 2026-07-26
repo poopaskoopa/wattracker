@@ -635,6 +635,37 @@ def test_race_add_rejects_a_bad_date(client):
     assert db.list_race_dates(uid) == []
 
 
+def _create_plan_via_route(client, weeks=10, start=MONDAY):
+    resp = client.post("/generate/plan", data={
+        "name": "Base", "weeks": str(weeks), "hours_per_week": str(HOURS),
+        "hit_days_per_week": "1", "start_date": start.isoformat(),
+        "days": [str(d) for d in RIDE_DAYS],
+    })
+    assert resp.status_code == 200
+    return resp
+
+
+def test_plan_created_with_races_is_born_race_aware(client):
+    """Regression: a plan created while races are on the calendar was built
+    race-blind, so the very first nightly reflow rewrote it end to end and told
+    the rider their brand-new plan had "changed overnight"."""
+    uid = _register(client)
+    db.add_race_date(uid, "2026-08-17", "A", "Nationals", 120)
+    db.add_race_date(uid, "2026-09-05", "B", "Local crit", 60)
+    _create_plan_via_route(client)
+    plan_id = db.list_plans(uid)[0]["id"]
+
+    # Race day itself carries no workout: proof the races reached the generator.
+    assert [w for w in _rows(uid, plan_id) if w["date"] == "2026-08-17"] == []
+
+    # The first reflow is a no-op, and therefore leaves no notice.
+    result = reflow.reflow_plan(uid, plan_id, now=NOW)
+    assert result["status"] == "ok"
+    for key in ("updated", "inserted", "deleted", "skipped_locked", "failed"):
+        assert result[key] == 0, (key, result)
+    assert db.get_plan(uid, plan_id)["reflow_notice"] is None
+
+
 def test_calendar_shows_race_days_and_the_panel(client):
     uid = _register(client)
     db.add_race_date(uid, "2026-08-17", "A", "Nationals", 120)
