@@ -17,6 +17,7 @@ import datetime as _dt
 import logging
 from typing import List, Optional, Tuple
 
+from ..metrics import profile_store
 from ..prescribe.planner import Session
 from ..timeutil import utc_now
 
@@ -401,6 +402,17 @@ class RideController:
             importer.maybe_update_ftp(self.user_id)
         except Exception:
             pass
+        if self.activity_id is not None:
+            # An in-app ride is a new ride like any other - it can set a new 5s
+            # or 5min peak and it moves FTP - but it is NOT a file import, so
+            # scan_activities' refresh never sees it. Without this a rider who
+            # only rides in the app prescribes against a snapshot that is stale
+            # until the next daily sweep, or forever with auto-scan disabled.
+            try:
+                profile_store.refresh(self.user_id)
+            except Exception:
+                _log.warning("rider profile refresh after in-app ride failed",
+                             exc_info=True)
 
     # ------------------------------------------------------------- state
     def state(self) -> dict:

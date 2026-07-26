@@ -188,24 +188,31 @@
     // (loaded in the scripts block); reference lazily so load order is safe.
     function fmtDur(sec) { return window.fmtDur(sec); }
     function profileSvg(p, t, f) { return window.profileSvg(p, t, f); }
-    function pct(frac) { return Math.round(frac * 100) + "%"; }
+    // A missing target is NOT a zero target. `|| 0` here is what rendered a
+    // maximal-effort sprint as "0% · 0 W" twelve times over.
+    function pct(frac) { return frac == null ? "—" : Math.round(frac * 100) + "%"; }
+    function w(watts) { return watts == null ? "—" : watts + " W"; }
 
     function segmentCells(s) {
+        if (s.free) {
+            // No prescribed power: the rider drives, the trainer follows.
+            return [fmtDur(s.duration), "maximal", "no target"];
+        }
         if (s.kind === "intervals") {
             return [
                 s.repeat + " x (" + fmtDur(s.on_duration) + " on / " + fmtDur(s.off_duration) + " off)",
                 pct(s.on_power) + " / " + pct(s.off_power),
-                s.watts_on + " W / " + s.watts_off + " W",
+                w(s.watts_on) + " / " + w(s.watts_off),
             ];
         }
         if (s.kind === "warmup" || s.kind === "cooldown" || s.kind === "ramp") {
             return [
                 fmtDur(s.duration),
                 pct(s.power_low) + " → " + pct(s.power_high),
-                s.watts_low + " → " + s.watts_high + " W",
+                w(s.watts_low) + " → " + w(s.watts_high),
             ];
         }
-        return [fmtDur(s.duration), pct(s.power || 0), (s.watts || 0) + " W"];
+        return [fmtDur(s.duration), pct(s.power), w(s.watts)];
     }
 
     function openLoading() {

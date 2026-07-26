@@ -12,6 +12,8 @@ alone:
 from __future__ import annotations
 
 import datetime as dt
+import pathlib
+import re
 import threading
 import xml.etree.ElementTree as ET
 
@@ -25,6 +27,7 @@ from wattracker.analysis.state import TrainingState
 from wattracker.ble.runner import FREERIDE_ERG_FRACTION, RideController, flatten_session
 from wattracker.metrics import profile_store
 from wattracker.metrics.rider import RiderMetrics
+from wattracker import server as server_mod
 from wattracker.prescribe import adapt, plan as planmod, reflow, zwo
 from wattracker.prescribe.planner import (
     SPRINT_LOAD_RATIO_DEFAULT,
@@ -81,6 +84,77 @@ def test_sprint_load_leaves_real_ratios_alone():
             RiderMetrics(sprint_ratio=ratio)) <= SPRINT_RATIO_MAX
         assert sprint_load_ratio(RiderMetrics(sprint_ratio=ratio)) == \
             pytest.approx(ratio, abs=0.025)  # only quantization moves it
+
+
+# ------------------------- one segment shape, shared by every consumer
+def test_both_endpoints_describe_a_sprint_identically(client):
+    """Regression: the calendar modal showed "0% - 0 W" twelve times.
+
+    api_plan_workout_detail had its own segment formatter, so it never learned
+    the freeride case the preview already handled; the template then filled the
+    resulting nulls with zeros - telling the rider a maximal sprint has a
+    zero-watt target, on the same session ride.html labels "no target".
+    """
+    uid = _register(client, "both")
+    db.save_user_settings(uid, {"ftp": 250})
+    plan_id = db.create_plan(uid, "P", MONDAY.isoformat(), 1)
+    session = build_workout("sprint", 60)
+    wid = db.add_plan_workout(plan_id, uid, MONDAY.isoformat(), session.name,
+                              "sprint", session.total_duration(),
+                              session.estimated_tss, zwo.zwo_string(session))
+
+    detail = client.get(f"/api/plan/workout/{wid}").json()["segments"]
+    preview = client.get("/ride/workout/preview?type=sprint&minutes=60"
+                         ).json()["segments"]
+
+    assert detail == preview, "one session, two shapes"
+    free = [s for s in detail if s["free"]]
+    assert free, "the sprint efforts must be marked free"
+    for row in free:
+        # Nothing a renderer could turn into "0 W" or "0%".
+        for key in ("watts", "watts_low", "watts_high", "watts_on", "watts_off",
+                    "power", "on_power", "off_power"):
+            assert row[key] is None, (key, row)
+        assert row["label"] == "Max effort - no target"
+
+
+def test_no_segment_reports_a_zero_watt_target(client):
+    """A zero-watt target is never a real prescription, in any workout kind."""
+    uid = _register(client, "zerowatt")
+    db.save_user_settings(uid, {"ftp": 250})
+    for kind in ("sprint", "vo2max", "endurance", "recovery"):
+        data = client.get(f"/ride/workout/preview?type={kind}&minutes=60").json()
+        for row in data["segments"]:
+            for key in ("watts", "watts_low", "watts_high", "watts_on",
+                        "watts_off"):
+                assert row[key] is None or row[key] > 0, (kind, key, row)
+
+
+def test_detail_and_preview_agree_for_every_kind(client):
+    """The shared formatter is the point: they cannot drift apart again."""
+    from wattracker.prescribe.present import segment_rows
+
+    uid = _register(client, "everykind")
+    db.save_user_settings(uid, {"ftp": 250})
+    plan_id = db.create_plan(uid, "P", MONDAY.isoformat(), 1)
+    for i, kind in enumerate(("sprint", "vo2max", "threshold", "endurance")):
+        date = (MONDAY + dt.timedelta(days=i)).isoformat()
+        session = build_workout(kind, 60)
+        wid = db.add_plan_workout(plan_id, uid, date, session.name, kind,
+                                  session.total_duration(),
+                                  session.estimated_tss,
+                                  zwo.zwo_string(session))
+        detail = client.get(f"/api/plan/workout/{wid}").json()["segments"]
+        assert detail == segment_rows(build_workout(kind, 60), 250.0)
+
+
+def test_workout_chart_breaks_the_line_across_a_free_block():
+    """The shared SVG renderer must not trace a target through a free block."""
+    js = (pathlib.Path("wattracker/web/static/workout_graph.js")).read_text()
+    # The line/area are built per RUN of targeted blocks, so a free block ends
+    # one subpath and the next starts with a fresh move.
+    assert "if (b.free) { current = null; return; }" in js
+    assert "runs.push(current)" in js
 
 
 # --------------------------------- defect 4: no target reaches trainer or UI
@@ -171,6 +245,44 @@ def test_ride_preview_still_reports_targets_for_targeted_sessions(client):
     data = client.get("/ride/workout/preview?type=vo2max&minutes=60").json()
     assert not any(b.get("free") for b in data["profile"])
     assert max(b["watts_start"] for b in data["profile"]) > 250
+
+
+# ------------------------------------- the target readout, and dead UI hooks
+def test_target_card_can_hide_its_unit(client):
+    """Regression: the readout showed "MAX W" - "MAX" plus a literal " W".
+
+    The unit was a bare text sibling of #rTarget, and the class the script
+    toggled to hide it did not exist in any stylesheet.
+    """
+    _register(client, "readout")
+    html = client.get("/ride").text
+    # The unit must be an element the script can hide, not loose text.
+    assert re.search(r'<span id="rTarget">[^<]*</span>\s*<span class="unit" '
+                     r'id="rTargetUnit">\s*W\s*</span>', html)
+    # The unit must not be loose text right after the number.
+    assert not re.search(r'id="rTarget">[^<]*</span>\s*W', html)
+    assert 'document.getElementById("rTargetUnit").hidden' in html
+
+
+def test_no_javascript_toggles_a_class_that_has_no_style():
+    """Generalises the dead `no-target` hook that let "MAX W" ship.
+
+    A class toggled in JS with no CSS rule behind it is a silent no-op; the
+    code reads as if it handles the case and nothing happens.
+    """
+    css = pathlib.Path("wattracker/web/static/style.css").read_text()
+    roots = [pathlib.Path("wattracker/web/templates"),
+             pathlib.Path("wattracker/web/static")]
+    missing = []
+    for root in roots:
+        for path in list(root.glob("*.html")) + list(root.glob("*.js")):
+            for name in re.findall(
+                r"classList\.(?:add|toggle|remove)\(\s*[\"']([A-Za-z0-9_-]+)[\"']",
+                path.read_text(),
+            ):
+                if not re.search(r"\.%s\b" % re.escape(name), css):
+                    missing.append(f"{path.name}: .{name}")
+    assert not missing, f"classes toggled in JS with no CSS rule: {missing}"
 
 
 # --------------------------- defect 1: every rebuild path sees the same rider
@@ -443,6 +555,127 @@ def test_import_refreshes_the_snapshot(user_id, monkeypatch):
     stored = profile_store.for_user(user_id)
     assert stored.vo2_ratio == pytest.approx(1.25)
     assert stored.sprint_ratio == pytest.approx(4.35)
+
+
+# ------------------------------ every path that changes the rider refreshes it
+def test_an_in_app_ride_refreshes_the_snapshot(user_id, monkeypatch):
+    """An in-app BLE ride is not a file import, so scan_activities never sees
+    it - a rider who only rides in the app had a snapshot that went stale until
+    the next sweep, or forever with the sweep disabled."""
+    _measures_as(monkeypatch, RiderMetrics(vo2_ratio=1.22, sprint_ratio=4.10))
+    ctl = RideController(build_workout("endurance", 45), ftp=250.0,
+                         user_id=user_id)
+    ctl._samples = {"power": [200] * 120, "cadence": [90] * 120,
+                    "heartrate": [140] * 120}
+    ctl.started_at = dt.datetime(2026, 7, 20, 8, 0)
+    ctl.elapsed = 120
+    assert db.get_rider_profile(user_id) is None
+
+    ctl._save()
+
+    stored = profile_store.for_user(user_id)
+    assert stored.vo2_ratio == pytest.approx(1.22)
+    assert stored.sprint_ratio == pytest.approx(4.10)
+
+
+def test_linking_duplicates_refreshes_the_snapshot(client, monkeypatch):
+    """Duplicates are excluded from the MMP curve, so linking them moves CP,
+    W' and every peak the profile is built from."""
+    uid = _register(client, "dupes")
+    refreshed = []
+    monkeypatch.setattr(server_mod.importer, "backfill_duplicate_links",
+                        lambda u: 3)
+    monkeypatch.setattr(server_mod.profile_store, "refresh",
+                        lambda u, state=None: refreshed.append(u))
+
+    client.post("/activities/link-duplicates", follow_redirects=False)
+
+    assert refreshed == [uid]
+
+
+def test_linking_nothing_does_not_refresh(client, monkeypatch):
+    uid = _register(client, "nodupes")
+    refreshed = []
+    monkeypatch.setattr(server_mod.importer, "backfill_duplicate_links",
+                        lambda u: 0)
+    monkeypatch.setattr(server_mod.profile_store, "refresh",
+                        lambda u, state=None: refreshed.append(u))
+    client.post("/activities/link-duplicates", follow_redirects=False)
+    assert refreshed == []
+
+
+def test_sweep_syncs_races_before_recomputing_the_profile(user_id, monkeypatch):
+    """Zwift writes the rider's weight during a race sync, and weight feeds
+    wprime_j_per_kg / cp_w_per_kg - so a profile computed first was a day stale
+    every time the weight moved."""
+    order = []
+
+    monkeypatch.setattr(server_mod.importer, "run_auto_scan",
+                        lambda: {"users": 0, "imported": 0, "completed": 0})
+
+    def fake_race_refresh(uid, respect_backoff=True):
+        order.append("races")
+        db.save_user_settings(uid, {"weight_kg": 71.5})
+
+    def fake_profile_refresh(uid, state=None):
+        order.append("profile")
+        # The weight the race sync just wrote must be visible here.
+        order.append(db.get_user_settings(uid).get("weight_kg"))
+
+    monkeypatch.setattr(server_mod.races, "refresh_race_results",
+                        fake_race_refresh)
+    monkeypatch.setattr(server_mod.profile_store, "refresh", fake_profile_refresh)
+
+    server_mod.run_daily_maintenance()
+
+    assert order == ["races", "profile", 71.5]
+
+
+# ------------------------------------------ the profile state is visible
+def test_profile_page_says_when_targets_are_not_personalised(client):
+    """The silence around an uncomputed profile is what let a stale-profile bug
+    live: with no sweep, targets are population constants and nothing said so."""
+    _register(client, "generic")
+    html = client.get("/profile").text
+    assert "no rider profile computed yet" in html
+    assert "112% FTP" in html  # the population default it is actually using
+
+
+def test_profile_page_shows_the_personalised_targets_and_when(client):
+    uid = _register(client, "personal")
+    _store_profile(uid, RiderMetrics(ftp=250.0, vo2_ratio=1.20,
+                                     sprint_ratio=4.35))
+    html = client.get("/profile").text
+    assert "Personalised from your own data" in html
+    assert "110% FTP" in html          # the derived VO2 target
+    assert "4.35x FTP" in html         # the measured sprint peak
+    assert profile_store.computed_at(uid) in html
+
+
+def test_target_status_is_honest_about_a_half_measured_rider():
+    from wattracker.prescribe.present import target_status
+
+    status = target_status(RiderMetrics(vo2_ratio=1.20), "2026-07-26T06:00:00")
+    assert status["personalised"] is True
+    assert status["vo2_target"] == pytest.approx(1.10)
+    # Sprint is unmeasured, so it is the population figure, not the rider's.
+    assert status["sprint_ratio"] is None
+    assert status["sprint_load"] == status["sprint_default"]
+
+
+def test_refresh_returns_what_is_actually_stored(user_id, monkeypatch):
+    """The return value and the stored row must never diverge."""
+    _measures_as(monkeypatch, RiderMetrics(vo2_ratio=1.25))
+    assert profile_store.refresh(user_id).vo2_ratio == pytest.approx(1.25)
+
+    def boom(*a, **k):
+        raise RuntimeError("disk full")
+
+    monkeypatch.setattr(profile_store.db, "save_rider_profile", boom)
+    _measures_as(monkeypatch, RiderMetrics(vo2_ratio=1.40))
+    assert profile_store.refresh(user_id) is None       # write failed
+    # ... and the stored row is untouched, so readers stay coherent.
+    assert profile_store.for_user(user_id).vo2_ratio == pytest.approx(1.25)
 
 
 # -------------------------- defect 2: the nightly adapt <-> reflow ping-pong

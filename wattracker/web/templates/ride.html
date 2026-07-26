@@ -81,7 +81,7 @@
     </div>
     <div class="cards">
         <div class="card"><span class="label">Status</span><span class="value" id="rStatus">idle</span></div>
-        <div class="card"><span class="label">Target</span><span class="value"><span id="rTarget">0</span> W</span></div>
+        <div class="card"><span class="label">Target</span><span class="value"><span id="rTarget">0</span><span class="unit" id="rTargetUnit"> W</span></span></div>
         <div class="card"><span class="label">Power</span><span class="value"><span id="rPower">0</span> W</span></div>
         <div class="card"><span class="label">Cadence (power sensor)</span><span class="value"><span id="rCad">&mdash;</span> rpm</span></div>
         <div class="card"><span class="label">HR</span><span class="value"><span id="rHr">&mdash;</span> bpm</span></div>
@@ -599,6 +599,9 @@
         if (low == null && high == null) return "—";
         if (low == null) return high + " W";
         if (high == null) return low + " W+";
+        // A cooldown ramps DOWN, so the stored pair is descending; a range
+        // reads ascending. Sorting here keeps the payload literal.
+        if (low > high) { var t = low; low = high; high = t; }
         return low === high ? low + " W" : low + "–" + high + " W";
     }
     function cell(row, text, tag) {
@@ -666,8 +669,14 @@
             var row = document.createElement("tr");
             cell(row, seg.label);
             cell(row, fmtClock(seg.duration_s));
-            cell(row, seg.on_watts != null
-                ? seg.on_watts + " W on / " + seg.off_watts + " W easy"
+            // A free block has no target at all - never fall back to a
+            // wattage (or a zero) for it.
+            cell(row, seg.free
+                ? "max effort"
+                : seg.watts_on != null
+                ? seg.watts_on + " W on / " + seg.watts_off + " W easy"
+                : seg.watts != null
+                ? seg.watts + " W"
                 : wattRange(seg.watts_low, seg.watts_high));
             body.appendChild(row);
         });
@@ -733,10 +742,12 @@
         updateChartMetrics(st);
         document.getElementById("rStatus").textContent = statusText(st);
         // A maximal-effort block has no target - say so instead of showing the
-        // resistance the trainer happens to be holding.
-        var target = document.getElementById("rTarget");
-        target.textContent = st.target_free ? "MAX" : st.target_watts;
-        target.parentNode.classList.toggle("no-target", !!st.target_free);
+        // resistance the trainer happens to be holding. The unit is a separate
+        // element so it can be removed with the number: "MAX W" is not a
+        // reading.
+        document.getElementById("rTarget").textContent =
+            st.target_free ? "MAX" : st.target_watts;
+        document.getElementById("rTargetUnit").hidden = !!st.target_free;
         document.getElementById("rPower").textContent = st.power;
         document.getElementById("rCad").textContent = st.cadence == null ? "—" : st.cadence;
         document.getElementById("rHr").textContent = st.hr == null ? "—" : st.hr;

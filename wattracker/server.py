@@ -39,6 +39,7 @@ from .ingest import importer
 from .metrics import profile_store
 from .prescribe import adapt as adaptmod
 from .prescribe import plan as planmod
+from .prescribe import present
 from .prescribe import reflow
 from .prescribe import zwo
 from .prescribe import llm
@@ -175,18 +176,28 @@ def run_daily_maintenance() -> dict:
             totals["completed"] += importer.match_plan_completions(uid)
         except Exception:
             _log.warning("completion matching failed for user %s", uid, exc_info=True)
+        # The race sync runs BEFORE the profile is recomputed: an
+        # authenticated refresh writes the rider's weight from Zwift, and
+        # weight feeds wprime_j_per_kg and cp_w_per_kg. With the old ordering
+        # every weight Zwift reported was a full day stale before it reached a
+        # single prescription.
+        try:
+            races.refresh_race_results(uid, respect_backoff=True)
+            totals["races"] += 1
+        except Exception:
+            _log.warning("race refresh failed for user %s", uid, exc_info=True)
         # None when the state could not be built; adaptation then reads as
         # "progress" and changes nothing, which is the right failure mode.
         state = None
         try:
             state = pipeline.build_state(uid)
-            # Recompute the stored rider profile FIRST: everything below
-            # (adaptation, reflow, the .zwo export) prescribes against the
-            # snapshot, and the profile depends on wall-clock time as well as
-            # on rides - FTP decays across a layoff even when no new activity
-            # lands - so a sweep that skipped this would keep prescribing
-            # against a rider who no longer exists. Reuses the state just
-            # built rather than building a second one.
+            # Recompute the stored rider profile before anything prescribes:
+            # adaptation, reflow and the .zwo export all read the snapshot, and
+            # the profile depends on wall-clock time as well as on rides - FTP
+            # decays across a layoff even when no new activity lands - so a
+            # sweep that skipped this would keep prescribing against a rider
+            # who no longer exists. Reuses the state just built rather than
+            # building a second one.
             profile_store.refresh(uid, state=state)
         except Exception:
             _log.warning("rider profile refresh failed for user %s", uid,
@@ -197,11 +208,6 @@ def run_daily_maintenance() -> dict:
             totals["race_skipped"] += summary.get("skipped_raced", 0)
         except Exception:
             _log.warning("plan adaptation failed for user %s", uid, exc_info=True)
-        try:
-            races.refresh_race_results(uid, respect_backoff=True)
-            totals["races"] += 1
-        except Exception:
-            _log.warning("race refresh failed for user %s", uid, exc_info=True)
         try:
             # This is an adaptive program, so the active plan is recomputed
             # every day: reflow re-reads the rider's measured profile and their
@@ -599,6 +605,13 @@ def create_app() -> FastAPI:
                 request,
                 profile=zones.rider_profile(uid),
                 power_profile=power_profile.for_user(uid),
+                # What the rider's workout targets are actually built on, and
+                # when it was last computed. Without this the app can silently
+                # prescribe population defaults forever and never say so.
+                targets=present.target_status(
+                    profile_store.for_user(uid),
+                    profile_store.computed_at(uid),
+                ),
                 manual_ftp=settings.get("ftp"),
                 manual_hr_max=settings.get("hr_max"),
                 error=error,
@@ -771,7 +784,17 @@ def create_app() -> FastAPI:
         New rides are linked as they land; this walks the existing history for
         pairs recorded before duplicate detection existed.
         """
-        linked = importer.backfill_duplicate_links(_uid(request))
+        uid = _uid(request)
+        linked = importer.backfill_duplicate_links(uid)
+        if linked:
+            # Duplicates are excluded from the mean-maximal curve, so linking
+            # them moves CP, W' and every peak the profile is built from.
+            # Never let a refresh failure lose the repair the user just ran.
+            try:
+                profile_store.refresh(uid)
+            except Exception:
+                _log.warning("rider profile refresh after duplicate linking "
+                             "failed", exc_info=True)
         return RedirectResponse(url=f"/activities?linked={linked}", status_code=303)
 
     def _plan_defaults() -> dict:
@@ -1770,58 +1793,10 @@ def create_app() -> FastAPI:
         }
 
     def _watts(fraction, ftp: float) -> Optional[int]:
-        return None if fraction is None else int(round(float(fraction) * ftp))
-
-    def _preview_segments(session, ftp: float) -> List[dict]:
-        """Human-readable per-segment breakdown with watt ranges."""
-        rows: List[dict] = []
-        for seg in session.segments:
-            if seg.kind == "intervals" and seg.repeat:
-                on_s = int(seg.on_duration or 0)
-                off_s = int(seg.off_duration or 0)
-                rows.append({
-                    "label": (
-                        f"{seg.repeat} x {_fmt_clock(on_s)} on / "
-                        f"{_fmt_clock(off_s)} easy"
-                    ),
-                    "duration_s": seg.duration,
-                    "watts_low": _watts(seg.off_power, ftp),
-                    "watts_high": _watts(seg.on_power, ftp),
-                    "on_watts": _watts(seg.on_power, ftp),
-                    "off_watts": _watts(seg.off_power, ftp),
-                    "text": seg.text,
-                })
-                continue
-            if seg.kind in ("warmup", "cooldown"):
-                lo = _watts(seg.power_low, ftp)
-                hi = _watts(seg.power_high, ftp)
-                if lo is not None and hi is not None and lo > hi:
-                    lo, hi = hi, lo
-                label = "Warmup ramp" if seg.kind == "warmup" else "Cooldown"
-            elif seg.kind == "freeride":
-                # No target by design (sprints) - show the cue, not a wattage.
-                lo = hi = None
-                label = "Max effort - no target"
-            else:
-                lo = hi = _watts(seg.power, ftp)
-                label = "Steady block" if seg.kind == "steadystate" else seg.kind
-            rows.append({
-                "label": label,
-                "duration_s": seg.duration,
-                "watts_low": lo,
-                "watts_high": hi,
-                "on_watts": None,
-                "off_watts": None,
-                "text": seg.text,
-            })
-        return rows
+        return present.watts(fraction, ftp)
 
     def _fmt_clock(seconds: int) -> str:
-        seconds = int(seconds or 0)
-        if seconds < 60:
-            return f"{seconds}s"
-        minutes, secs = divmod(seconds, 60)
-        return f"{minutes}min" if not secs else f"{minutes}min {secs}s"
+        return present.fmt_clock(seconds)
 
     @app.get("/ride/workout/preview")
     def ride_workout_preview(request: Request, type: str = "", minutes: str = ""):
@@ -1843,7 +1818,7 @@ def create_app() -> FastAPI:
             "workout_type": session.workout_type,
             "estimated_tss": session.estimated_tss,
             "type_info": info,
-            "segments": _preview_segments(session, ftp),
+            "segments": present.segment_rows(session, ftp),
         })
         return JSONResponse(payload)
 
@@ -2392,8 +2367,6 @@ def create_app() -> FastAPI:
                 pass
 
     # --------------------------------------------------------- JSON API
-    def _watts(frac: Optional[float], ftp: float) -> Optional[int]:
-        return int(round(frac * ftp)) if frac is not None else None
 
     @app.post("/api/plan/workout/{workout_id}/reconcile")
     def api_plan_workout_reconcile(request: Request, workout_id: int):
@@ -2499,15 +2472,11 @@ def create_app() -> FastAPI:
                                 w.get("variant"),
                                 profile=profile_store.for_user(uid))
 
-        segments = []
-        for seg in session.segments:
-            d = seg.to_dict()
-            d["watts"] = _watts(seg.power, ftp)
-            d["watts_low"] = _watts(seg.power_low, ftp)
-            d["watts_high"] = _watts(seg.power_high, ftp)
-            d["watts_on"] = _watts(seg.on_power, ftp)
-            d["watts_off"] = _watts(seg.off_power, ftp)
-            segments.append(d)
+        # The SAME formatter the ride preview uses. These two endpoints
+        # describing one session in two hand-written shapes is precisely how a
+        # sprint came to read "Max effort - no target" in one place and
+        # "0% - 0 W" in the other.
+        segments = present.segment_rows(session, ftp)
 
         # Flattened timeline (intervals expanded, ramps kept) for the chart.
         blocks, total_s = flatten_session(session)

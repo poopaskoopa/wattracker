@@ -43,21 +43,31 @@
                    '" y2="' + (H - padB + 4) + '" class="pf-grid"/>' +
                    '<text x="' + x(t) + '" y="' + (H - 8) + '" class="pf-xlab">' + Math.round(mn) + 'm</text>';
         }
-        // filled area under the line
-        var area = 'M ' + x(0) + ' ' + y(0);
+        // Target area and line, BROKEN across any untargeted block. Tracing
+        // them through a free block draws a target the rider is told to
+        // ignore - it plots the ERG resistance, not a prescription - so each
+        // run of targeted blocks becomes its own subpath.
+        var runs = [], current = null;
         profile.forEach(function (b) {
-            area += ' L ' + x(b.start) + ' ' + y(b.watts_start) +
-                    ' L ' + x(b.end) + ' ' + y(b.watts_end);
+            if (b.free) { current = null; return; }
+            if (!current) { current = []; runs.push(current); }
+            current.push(b);
         });
-        area += ' L ' + x(totalS) + ' ' + y(0) + ' Z';
-        svg += '<path d="' + area + '" class="pf-area"/>';
-        // the step/ramp line itself
-        var line = 'M ' + x(0) + ' ' + y(profile[0].watts_start);
-        profile.forEach(function (b) {
-            line += ' L ' + x(b.start) + ' ' + y(b.watts_start) +
-                    ' L ' + x(b.end) + ' ' + y(b.watts_end);
+        var area = '', line = '';
+        runs.forEach(function (run) {
+            var first = run[0], last = run[run.length - 1];
+            area += ' M ' + x(first.start) + ' ' + y(0);
+            line += ' M ' + x(first.start) + ' ' + y(first.watts_start);
+            run.forEach(function (b) {
+                var step = ' L ' + x(b.start) + ' ' + y(b.watts_start) +
+                           ' L ' + x(b.end) + ' ' + y(b.watts_end);
+                area += step;
+                line += step;
+            });
+            area += ' L ' + x(last.end) + ' ' + y(0) + ' Z';
         });
-        svg += '<path d="' + line + '" class="pf-line"/>';
+        if (area) svg += '<path d="' + area.trim() + '" class="pf-area"/>';
+        if (line) svg += '<path d="' + line.trim() + '" class="pf-line"/>';
         // dashed FTP reference
         if (ftp && ftp <= yMax) {
             svg += '<line x1="' + padL + '" y1="' + y(ftp) + '" x2="' + (W - padR) +
