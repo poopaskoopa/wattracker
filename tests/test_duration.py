@@ -12,6 +12,16 @@ from wattracker.prescribe.duration import (
 )
 
 
+class _RaisingFloat(float):
+    def __float__(self) -> float:
+        raise RuntimeError("conversion refused")
+
+
+class _RaisingStr(str):
+    def strip(self, chars: str | None = None) -> str:
+        raise RuntimeError("normalization refused")
+
+
 @pytest.mark.parametrize(
     ("goal", "floor", "ideal", "basis"),
     [
@@ -102,13 +112,18 @@ def test_modifiers_are_monotonic_and_never_shorten_the_baseline() -> None:
         (True, False),
         (math.nan, math.inf),
         (-math.inf, {"hours": 4}),
+        pytest.param(10**10000, 10**10000, id="huge-integers"),
+        (_RaisingFloat(1), _RaisingFloat(1)),
     ],
 )
 def test_malformed_optional_inputs_are_ignored(ctl: object, hours: object) -> None:
     assert recommend_weeks("ftp", ctl, hours) == recommend_weeks("ftp")
 
 
-@pytest.mark.parametrize("goal", ["unknown", "", None, object()])
+@pytest.mark.parametrize(
+    "goal",
+    ["unknown", "", None, object(), _RaisingStr("ftp")],
+)
 def test_unknown_or_malformed_goal_uses_sane_default(goal: object) -> None:
     recommendation = recommend_weeks(goal)
 
