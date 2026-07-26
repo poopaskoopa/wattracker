@@ -179,6 +179,116 @@ def resolve_race_conflicts(races: List[dict]) -> tuple:
     return resolved, conflicts
 
 
+def scheduled_days(start_date: _dt.date, weeks: int,
+                   days_of_week: Sequence[int]) -> List[_dt.date]:
+    """Every date a plan of this shape rides, in order.
+
+    Extracted so a plan can be DESCRIBED after the fact from its recipe using
+    exactly the dates generation laid out - a second, subtly different
+    reconstruction would let the summary claim a taper the plan never applied.
+    """
+    monday0 = start_date - _dt.timedelta(days=start_date.weekday())
+    days = sorted({int(d) for d in days_of_week or ()})
+    return [monday0 + _dt.timedelta(days=7 * w + weekday)
+            for w in range(int(weeks)) for weekday in days]
+
+
+def describe_races(
+    races: Optional[Sequence[dict]],
+    start_date: Optional[_dt.date] = None,
+    weeks: Optional[int] = None,
+    days_of_week: Optional[Sequence[int]] = None,
+) -> List[dict]:
+    """What a plan of this shape does about each race. -> list of descriptors
+
+    Races are an INPUT to generation and are deliberately never stored in the
+    plan recipe (see the module notes above and prescribe/reflow.py), so the
+    only honest way to say what a stored plan did about them is to resolve them
+    again the same way generation does. This is that single re-resolution:
+    every view that needs an EFFECTIVE priority - the plan summary, the
+    calendar badge - calls it rather than re-deriving the rule.
+
+    Conflict resolution always runs over the rider's WHOLE race list before any
+    windowing, because the A race that causes a demotion can sit outside the
+    window of the plan being described.
+
+    With ``start_date``/``weeks`` given, only races inside the plan's span come
+    back. The last day of the span is deliberately inclusive of ``weeks * 7``:
+    a race the Monday after the plan's final Sunday still has its whole taper
+    inside the plan, so the plan does have something to say about it.
+
+    ``days_of_week`` (the recipe's ride days) unlocks the per-race effects,
+    which are read off the same ``race_effects`` the generator applies. Without
+    it - a legacy plan with no recipe - the priority and any demotion are still
+    described; only the dated effects are omitted.
+    """
+    resolved, _conflicts = resolve_race_conflicts(normalize_races(races))
+    by_date = {r["date"]: r for r in resolved if r["priority"] == PRIORITY_A}
+
+    if start_date is not None and weeks is not None:
+        monday0 = start_date - _dt.timedelta(days=start_date.weekday())
+        last = monday0 + _dt.timedelta(days=7 * int(weeks))
+        in_window = [r for r in resolved if monday0 <= r["date"] <= last]
+    else:
+        in_window = list(resolved)
+
+    scheduled: List[_dt.date] = []
+    if start_date is not None and weeks is not None and days_of_week:
+        scheduled = scheduled_days(start_date, int(weeks), days_of_week)
+    effects = race_effects(resolved, scheduled) if scheduled else None
+
+    out: List[dict] = []
+    for r in in_window:
+        day = r["date"]
+        iso = day.isoformat()
+        item: dict = {
+            "id": r.get("id"),
+            "date": iso,
+            "name": r.get("name"),
+            "priority": r["priority"],          # EFFECTIVE, post-resolution
+            "duration_min": r.get("duration_min"),
+            "demoted": bool(r.get("demoted")),
+            # Only set on a demotion: the earlier A race that took the taper.
+            "conflicts_with": None,
+            "separation_days": A_RACE_SEPARATION_DAYS,
+            # True when the plan would otherwise have prescribed a session on
+            # race day - i.e. the race really is displacing a workout.
+            "displaces_workout": day in scheduled,
+            "taper_from": None,
+            "taper_hard_from": None,
+            "recovery_dates": [],
+            "easy_dates": [],
+        }
+        if r.get("demoted"):
+            prior = [d for d in by_date if d < day]
+            item["conflicts_with"] = max(prior).isoformat() if prior else None
+        if effects is not None:
+            if r["priority"] == PRIORITY_A:
+                far = (day - _dt.timedelta(days=TAPER_FAR_DAYS)).isoformat()
+                if far in effects.taper:
+                    item["taper_from"] = far
+                    item["taper_hard_from"] = (
+                        day - _dt.timedelta(days=TAPER_NEAR_DAYS)
+                    ).isoformat()
+                after = [d for d in scheduled if d > day]
+                item["recovery_dates"] = [
+                    d.isoformat()
+                    for d in after[:recovery_sessions_for(r["duration_min"])]
+                    if d.isoformat() in effects.recovery
+                ]
+            else:
+                ride = {d.isoformat() for d in scheduled}
+                item["easy_dates"] = [
+                    d for d in (
+                        (day - _dt.timedelta(days=1)).isoformat(),
+                        (day + _dt.timedelta(days=1)).isoformat(),
+                    )
+                    if d in effects.easy_adjacent and d in ride
+                ]
+        out.append(item)
+    return out
+
+
 def recovery_sessions_for(duration_min: Optional[int]) -> int:
     """How many easy sessions follow a race of this length."""
     hours = -(-int(duration_min or 0) // 60)  # ceil

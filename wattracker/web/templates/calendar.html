@@ -37,6 +37,17 @@
 {%- endif -%}
 {% endmacro %}
 
+{# The race's EFFECTIVE priority - what the plan actually treats it as. A
+   demoted A race shows "B", because a badge saying "A" beside a plan that
+   tapers for a different race is the confusion, not the information. The
+   tooltip carries the reason and the reassurance that the saved priority is
+   untouched. #}
+{% macro race_priority_badge(race) %}
+{%- set why %}{{ race.name or 'Race' }} — {% if race.demoted %}marked an A race, planned as a B race: it is within {{ race.separation_days }} days of your A race on {{ race.conflicts_with }}, and only the earlier race can be tapered for. Your saved priority is unchanged — move or delete the earlier race and this one's taper comes back.{% else %}priority {{ race.priority }}{% endif %}{% endset -%}
+<span class="cal-race-tag cal-race-{{ race.priority }}{{ ' cal-race-demoted' if race.demoted else '' }}"
+      title="{{ why }}">{{ race.priority }}</span>
+{%- endmacro %}
+
 <div class="cal-head">
     <a class="button" href="/calendar{{ prev }}">&larr; Prev</a>
     <h3>{{ month_name }} {{ year }}</h3>
@@ -93,7 +104,7 @@
         <tr>
         {% for cell in week %}
             <td class="cal-cell {{ 'other-month' if not cell.in_month else '' }} {{ 'cal-ooto-day' if cell.ooto else '' }} {{ 'cal-race-day' if cell.race else '' }}">
-                <div class="cal-day">{{ cell.day }}{% if cell.ooto %} <span class="cal-ooto-tag">OOTO</span>{% endif %}{% if cell.race %} <span class="cal-race-tag cal-race-{{ cell.race.priority }}" title="{{ cell.race.name or 'Race' }} — priority {{ cell.race.priority }}">{{ cell.race.priority }}</span>{% if cell.race.result %} {{ race_result_badge(cell.race.result) }}{% endif %}{% endif %}{% if cell.phase %} <span class="cal-phase-tag" title="This week is part of your plan's {{ cell.phase }} block">{{ cell.phase }}</span>{% endif %}</div>
+                <div class="cal-day">{{ cell.day }}{% if cell.ooto %} <span class="cal-ooto-tag">OOTO</span>{% endif %}{% if cell.race %} {{ race_priority_badge(cell.race) }}{% if cell.race.result %} {{ race_result_badge(cell.race.result) }}{% endif %}{% endif %}{% if cell.phase %} <span class="cal-phase-tag" title="This week is part of your plan's {{ cell.phase }} block">{{ cell.phase }}</span>{% endif %}</div>
                 {% for w in cell.workouts %}
                     <div class="cal-workout cal-{{ w.type }}{{ ' cal-completed' if w.completed_activity_id else '' }}{{ ' cal-adapted' if w.adapted else '' }}{{ ' cal-skipped' if w.skipped else '' }}{{ ' cal-missed' if w.missed else '' }}"
                          {% if not w.standalone %}
@@ -162,8 +173,10 @@
         {% for r in race_dates %}
         <li>
             <span class="nowrap">{{ r.date }}</span>
-            <span class="cal-race-tag cal-race-{{ r.priority }}">{{ r.priority }}</span>
+            {{ race_priority_badge(r) }}
             {% if r.result %}{{ race_result_badge(r.result) }}{% endif %}
+            {% if r.demoted %}<span class="hint">planned as B &mdash; within
+                {{ r.separation_days }} days of your A race on {{ r.conflicts_with }}</span>{% endif %}
             {% if r.name %}<span class="hint">{{ r.name }}</span>{% endif %}
             {% if r.duration_min %}<span class="hint">{{ r.duration_min }} min</span>{% endif %}
             <form method="post" action="/race/{{ r.id }}/delete" style="display:inline">
