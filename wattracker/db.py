@@ -21,7 +21,7 @@ from .timeutil import utc_now
 
 _log = logging.getLogger(__name__)
 
-SCHEMA_VERSION = 19
+SCHEMA_VERSION = 20
 
 
 def _restrict_db_files(path: str) -> None:
@@ -165,6 +165,18 @@ _MIGRATIONS: Dict[int, Sequence[Union[str, Callable[[sqlite3.Connection], None]]
     18: [
         _add_duplicate_of_and_backfill_utc,
     ],
+    19: [
+        # The generator inputs a plan was built from ("the recipe"), so a plan
+        # can be recomputed from scratch instead of incrementally patched.
+        # Deliberately NOT backfilled: a guessed recipe would silently rewrite
+        # a user's plan into something they never asked for. recipe IS NULL
+        # marks a legacy plan, which reflow refuses to touch.
+        "ALTER TABLE plans ADD COLUMN recipe TEXT",
+        "ALTER TABLE plans ADD COLUMN active INTEGER NOT NULL DEFAULT 0",
+        # Provenance: 'generated' rows are the ones the recipe owns and may
+        # rewrite. Legacy rows stay NULL and are never reflowed.
+        "ALTER TABLE plan_workouts ADD COLUMN origin TEXT",
+    ],
 }
 
 _DROP = """
@@ -244,6 +256,8 @@ CREATE TABLE IF NOT EXISTS plans (
     weeks      INTEGER NOT NULL,
     created    TEXT NOT NULL,
     model      TEXT,
+    recipe     TEXT,
+    active     INTEGER NOT NULL DEFAULT 0,
     FOREIGN KEY(user_id) REFERENCES users(id)
 );
 
@@ -267,6 +281,7 @@ CREATE TABLE IF NOT EXISTS plan_workouts (
     effective_ftp     REAL,
     feedback_applied  INTEGER NOT NULL DEFAULT 0,
     feedback_batch_id INTEGER,
+    origin            TEXT,
     FOREIGN KEY(plan_id) REFERENCES plans(id),
     FOREIGN KEY(user_id) REFERENCES users(id)
 );
@@ -1125,20 +1140,94 @@ def ftp_history_list(user_id: int, path: Optional[str] = None) -> List[dict]:
 
 
 # ---------------------------------------------------------------- plans
+_PLAN_COLUMNS = "id, name, start_date, weeks, created, model, recipe, active"
+
+
+def _plan_row(r: sqlite3.Row) -> dict:
+    """Plan row with the recipe parsed back to a dict and active as a bool.
+
+    A recipe that fails to parse is surfaced as None - i.e. the plan degrades
+    to "legacy, not reflowable" rather than blowing up a page render.
+    """
+    d = dict(r)
+    raw = d.get("recipe")
+    if raw:
+        try:
+            parsed = json.loads(raw)
+        except (ValueError, TypeError):
+            parsed = None
+        d["recipe"] = parsed if isinstance(parsed, dict) else None
+    else:
+        d["recipe"] = None
+    d["active"] = bool(d.get("active"))
+    return d
+
+
 def create_plan(
     user_id: int, name: str, start_date: str, weeks: int,
-    model: Optional[str] = None, path: Optional[str] = None
+    model: Optional[str] = None, recipe: Optional[dict] = None,
+    path: Optional[str] = None
 ) -> int:
+    """Insert a plan and make it the user's active plan.
+
+    ``recipe`` is the generator input dict (see prescribe/reflow.py); it is
+    serialized here so callers never deal with JSON. Leaving it None creates a
+    plan that reflow will refuse to touch.
+    """
     conn = connect(path)
     try:
         cur = conn.execute(
-            "INSERT INTO plans (user_id, name, start_date, weeks, created, model) "
-            "VALUES (?, ?, ?, ?, ?, ?)",
-            (user_id, name, start_date, int(weeks),
-             utc_now().isoformat(), model),
+            "INSERT INTO plans "
+            "(user_id, name, start_date, weeks, created, model, recipe, active) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, 0)",
+            (user_id, name, start_date, int(weeks), utc_now().isoformat(),
+             model, json.dumps(recipe) if recipe is not None else None),
+        )
+        plan_id = cur.lastrowid
+        # A new plan supersedes whatever was active - same transaction so the
+        # "at most one active" invariant is never observable as broken.
+        conn.execute("UPDATE plans SET active = 0 WHERE user_id = ?", (user_id,))
+        conn.execute(
+            "UPDATE plans SET active = 1 WHERE user_id = ? AND id = ?",
+            (user_id, plan_id),
         )
         conn.commit()
-        return cur.lastrowid
+        return plan_id
+    finally:
+        conn.close()
+
+
+def set_active_plan(user_id: int, plan_id: int, path: Optional[str] = None) -> bool:
+    """Make `plan_id` the user's only active plan. False if it isn't theirs."""
+    conn = connect(path)
+    try:
+        owned = conn.execute(
+            "SELECT 1 FROM plans WHERE user_id = ? AND id = ?",
+            (user_id, plan_id),
+        ).fetchone()
+        if owned is None:
+            return False
+        conn.execute("UPDATE plans SET active = 0 WHERE user_id = ?", (user_id,))
+        conn.execute(
+            "UPDATE plans SET active = 1 WHERE user_id = ? AND id = ?",
+            (user_id, plan_id),
+        )
+        conn.commit()
+        return True
+    finally:
+        conn.close()
+
+
+def get_active_plan(user_id: int, path: Optional[str] = None) -> Optional[dict]:
+    """The user's active plan row, or None if none is flagged (legacy users)."""
+    conn = connect(path)
+    try:
+        row = conn.execute(
+            f"SELECT {_PLAN_COLUMNS} FROM plans WHERE user_id = ? AND active = 1 "
+            "ORDER BY created DESC",
+            (user_id,),
+        ).fetchone()
+        return _plan_row(row) if row else None
     finally:
         conn.close()
 
@@ -1153,6 +1242,7 @@ def add_plan_workout(
     tss: float,
     zwo_or_segments: str,
     variant: Optional[str] = None,
+    origin: Optional[str] = None,
     path: Optional[str] = None,
 ) -> int:
     conn = connect(path)
@@ -1161,11 +1251,11 @@ def add_plan_workout(
             """
             INSERT INTO plan_workouts
               (plan_id, user_id, date, name, type, duration_s, tss,
-               zwo_or_segments, variant)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+               zwo_or_segments, variant, origin)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (plan_id, user_id, date, name, type, int(duration_s), float(tss),
-             zwo_or_segments, variant),
+             zwo_or_segments, variant, origin),
         )
         conn.commit()
         return cur.lastrowid
@@ -1177,11 +1267,10 @@ def get_plan(user_id: int, plan_id: int, path: Optional[str] = None) -> Optional
     conn = connect(path)
     try:
         row = conn.execute(
-            "SELECT id, name, start_date, weeks, created, model FROM plans "
-            "WHERE user_id = ? AND id = ?",
+            f"SELECT {_PLAN_COLUMNS} FROM plans WHERE user_id = ? AND id = ?",
             (user_id, plan_id),
         ).fetchone()
-        return dict(row) if row else None
+        return _plan_row(row) if row else None
     finally:
         conn.close()
 
@@ -1190,11 +1279,11 @@ def list_plans(user_id: int, path: Optional[str] = None) -> List[dict]:
     conn = connect(path)
     try:
         rows = conn.execute(
-            "SELECT id, name, start_date, weeks, created, model FROM plans "
-            "WHERE user_id = ? ORDER BY created DESC",
+            f"SELECT {_PLAN_COLUMNS} FROM plans WHERE user_id = ? "
+            "ORDER BY created DESC",
             (user_id,),
         ).fetchall()
-        return [dict(r) for r in rows]
+        return [_plan_row(r) for r in rows]
     finally:
         conn.close()
 
@@ -1218,6 +1307,7 @@ def _plan_workout_row(r: sqlite3.Row, include_zwo: bool = False) -> dict:
         "effective_ftp": r["effective_ftp"],
         "feedback_applied": bool(r["feedback_applied"]),
         "feedback_batch_id": r["feedback_batch_id"],
+        "origin": r["origin"],
     }
     if include_zwo:
         d["zwo_or_segments"] = r["zwo_or_segments"]
@@ -1276,16 +1366,19 @@ def delete_plan(
 
     Returns {"workouts": n, "plans": 1} on success, or None if the plan does not
     exist for this user (so the caller can 404). Deletes plan_workouts first,
-    then the plans row, in one transaction.
+    then the plans row, in one transaction. Deleting the ACTIVE plan promotes
+    the most recently created survivor, so a user who had an active plan still
+    has one afterwards (unless that was their last plan).
     """
     conn = connect(path)
     try:
         exists = conn.execute(
-            "SELECT 1 FROM plans WHERE user_id = ? AND id = ?",
+            "SELECT active FROM plans WHERE user_id = ? AND id = ?",
             (user_id, plan_id),
         ).fetchone()
         if exists is None:
             return None
+        was_active = bool(exists["active"])
         wcur = conn.execute(
             "DELETE FROM plan_workouts WHERE user_id = ? AND plan_id = ?",
             (user_id, plan_id),
@@ -1294,6 +1387,19 @@ def delete_plan(
             "DELETE FROM plans WHERE user_id = ? AND id = ?",
             (user_id, plan_id),
         )
+        if was_active:
+            successor = conn.execute(
+                # id DESC breaks the tie when two plans share a `created`
+                # timestamp, so promotion is deterministic.
+                "SELECT id FROM plans WHERE user_id = ? "
+                "ORDER BY created DESC, id DESC LIMIT 1",
+                (user_id,),
+            ).fetchone()
+            if successor is not None:
+                conn.execute(
+                    "UPDATE plans SET active = 1 WHERE user_id = ? AND id = ?",
+                    (user_id, successor["id"]),
+                )
         conn.commit()
         return {"workouts": wcur.rowcount, "plans": pcur.rowcount}
     finally:
@@ -1756,7 +1862,13 @@ def update_plan_workout_content(
     variant: Optional[str] = None,
     path: Optional[str] = None,
 ) -> bool:
-    """Rewrite an (unadapted) workout's prescription; records the adaptation."""
+    """Rewrite an (unadapted) workout's prescription; records the adaptation.
+
+    The ``adapted IS NULL`` guard is what makes adaptation once-only and stops
+    plateau/overreach adjustments from stacking - do not relax it. Whole-plan
+    recomputation uses ``replace_plan_workout_content`` instead, which has the
+    opposite contract (it may claim an already-adapted row).
+    """
     conn = connect(path)
     try:
         cur = conn.execute(
@@ -1766,6 +1878,64 @@ def update_plan_workout_content(
             "WHERE user_id = ? AND id = ? AND adapted IS NULL",
             (name, type, int(duration_s), float(tss), zwo_or_segments,
              adapted, adapted_at, variant, user_id, workout_id),
+        )
+        conn.commit()
+        return cur.rowcount > 0
+    finally:
+        conn.close()
+
+
+def replace_plan_workout_content(
+    user_id: int,
+    workout_id: int,
+    name: str,
+    type: str,
+    duration_s: int,
+    tss: float,
+    zwo_or_segments: str,
+    after_date: str,
+    variant: Optional[str] = None,
+    path: Optional[str] = None,
+) -> bool:
+    """Overwrite a generated, future, not-completed workout from a recomputation.
+
+    Counterpart to ``update_plan_workout_content``: that one is adapt.py's
+    once-only patch, this one is whole-plan reflow, which is a pure function of
+    the recipe and therefore safe to run any number of times. The guard here is
+    about ownership (generated + future + not ridden), not about a budget.
+
+    Claiming a row CLEARS ``adapted``/``adapted_at`` - the recomputed content
+    replaces whatever adapt.py had put there, and the row's one-shot adaptation
+    budget is handed back. See prescribe/reflow.py for why.
+    """
+    conn = connect(path)
+    try:
+        cur = conn.execute(
+            "UPDATE plan_workouts SET name = ?, type = ?, duration_s = ?, "
+            "tss = ?, zwo_or_segments = ?, variant = ?, "
+            "adapted = NULL, adapted_at = NULL "
+            "WHERE user_id = ? AND id = ? AND origin = 'generated' "
+            "AND completed_activity_id IS NULL AND date > ?",
+            (name, type, int(duration_s), float(tss), zwo_or_segments, variant,
+             user_id, workout_id, after_date),
+        )
+        conn.commit()
+        return cur.rowcount > 0
+    finally:
+        conn.close()
+
+
+def delete_generated_plan_workout(
+    user_id: int, workout_id: int, after_date: str, path: Optional[str] = None
+) -> bool:
+    """Drop a generated, future, not-completed workout (reflow's delete arm)."""
+    conn = connect(path)
+    try:
+        cur = conn.execute(
+            "DELETE FROM plan_workouts WHERE user_id = ? AND id = ? "
+            "AND origin = 'generated' AND completed_activity_id IS NULL "
+            "AND date > ?",
+            (user_id, workout_id, after_date),
         )
         conn.commit()
         return cur.rowcount > 0
