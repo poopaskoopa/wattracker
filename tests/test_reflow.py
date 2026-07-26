@@ -96,14 +96,14 @@ def test_reflow_is_idempotent_after_a_recipe_change(user_id):
     assert _rows(user_id, plan_id) == snapshot
 
 
-def _harder(kind, duration_min, variant=None):
+def _harder(kind, duration_min, variant=None, profile=None):
     """build_workout, but every target 5% higher: same shape, new content.
 
     Stands in for a real planner change (e.g. making targets profile-aware):
     name, type, variant and duration are untouched, only the segments and the
     TSS move.
     """
-    session = planner.build_workout(kind, duration_min, variant)
+    session = planner.build_workout(kind, duration_min, variant, profile)
     for seg in session.segments:
         for attr in ("power", "power_low", "power_high", "on_power", "off_power"):
             value = getattr(seg, attr)

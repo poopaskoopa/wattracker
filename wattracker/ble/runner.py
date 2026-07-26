@@ -58,7 +58,18 @@ def _flatten(session: Session) -> Tuple[List[tuple], int]:
                  (float(seg.power_low or 0.0), float(seg.power_high or 0.0)))
             )
             t += seg.duration
-        else:  # steadystate / freeride
+        elif seg.kind == "freeride":
+            # A free effort has no target, but this controller only speaks ERG,
+            # so the block still needs a number. Use the segment's
+            # load-accounting estimate (the rider's own measured sprint power
+            # where we have it): holding the resistance there lets the rider
+            # drive against something, whereas the 0 W an absent target would
+            # give means no resistance at all and nothing to sprint against.
+            blocks.append(
+                (t, t + seg.duration, "const", float(seg.avg_fraction()))
+            )
+            t += seg.duration
+        else:  # steadystate
             blocks.append((t, t + seg.duration, "const", float(seg.power or 0.0)))
             t += seg.duration
     return blocks, t
