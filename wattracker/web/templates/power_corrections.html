@@ -1,0 +1,96 @@
+{% extends "base.html" %}
+{% block title %}Correct power data &mdash; wattracker{% endblock %}
+{% block content %}
+<h2>Correct power data</h2>
+<p><a href="/profile">&larr; Rider profile</a></p>
+<p class="hint">Searches every unmasked, full-resolution power sample. Applying a correction preserves the original activity and masks only the selected inclusive power indices; Undo restores them.</p>
+
+{% if saved == 'applied' %}<p class="ok" role="status">Power correction applied.</p>
+{% elif saved == 'undone' %}<p class="ok" role="status">Power correction undone.</p>{% endif %}
+{% if error %}<p class="alert" role="alert">{{ error }}</p>{% endif %}
+
+<section aria-labelledby="find-power-title">
+    <h3 id="find-power-title">1. Find anomalous samples</h3>
+    <p class="hint">Results stop after {{ candidate_cap }} anomalous ranges. Raise the threshold to refine a capped search. Long ranges show only their first three and last two target samples, plus five neighbors on each side.</p>
+    <form method="get" action="/profile/power-corrections">
+        <label for="threshold">Watt threshold</label>
+        <input id="threshold" name="threshold" type="number" min="1" max="10000" step="1" required value="{{ threshold }}">
+        <button type="submit">Search full-resolution history</button>
+    </form>
+</section>
+
+{% if searched and not error %}
+<section aria-labelledby="review-power-title">
+    <h3 id="review-power-title">2. Review and apply</h3>
+    {% if candidates %}
+    <p>{{ candidates|length }} consecutive anomalous range{% if candidates|length != 1 %}s{% endif %} found.</p>
+    {% for candidate in candidates %}
+    <article class="profile-section">
+        <h4>Activity {{ candidate.activity_id }} — {{ candidate.start_time or 'Unknown date' }} — {{ candidate.filename or 'Unnamed activity' }}</h4>
+        <p><strong>Inclusive indices {{ candidate.start_index }}–{{ candidate.end_index }}</strong> ({{ candidate.sample_count }} sample{% if candidate.sample_count != 1 %}s{% endif %})</p>
+        {% if candidate.preview_truncated %}<p class="hint">Preview abbreviated{% if candidate.applicable %}; applying still masks the entire inclusive range{% endif %}.</p>{% endif %}
+        <div class="table-scroll">
+        <table>
+            <caption>Before and after preview with neighboring samples</caption>
+            <thead><tr><th>Index</th><th>Timestamp</th><th>Before</th><th>After</th></tr></thead>
+            <tbody>
+            {% for before in candidate.neighbors %}
+            {% set after = candidate.after[loop.index0] %}
+            <tr{% if before.targeted %} class="correction-target"{% endif %}>
+                <td>{{ before.index }}</td>
+                <td>{{ before.timestamp }}</td>
+                <td>{{ before.value if before.value is not none else 'masked' }}{% if before.value is not none %} W{% endif %}</td>
+                <td>{{ after.value if after.value is not none else 'masked' }}{% if after.value is not none %} W{% endif %}</td>
+            </tr>
+            {% endfor %}
+            </tbody>
+        </table>
+        </div>
+        {% if candidate.applicable %}
+        <form method="post" action="/profile/power-corrections/apply">
+            <input type="hidden" name="activity_id" value="{{ candidate.activity_id }}">
+            <input type="hidden" name="start_index" value="{{ candidate.start_index }}">
+            <input type="hidden" name="end_index" value="{{ candidate.end_index }}">
+            <input type="hidden" name="threshold" value="{{ threshold }}">
+            <label for="reason-{{ loop.index }}">Optional reason</label>
+            <input id="reason-{{ loop.index }}" name="reason" maxlength="500" placeholder="e.g. trainer dropout spike">
+            <button type="submit">Mask this exact range</button>
+        </form>
+        {% else %}
+        <p class="alert">This range exceeds the {{ correction_range_cap }}-sample safety limit. Raise the threshold to narrow it.</p>
+        {% endif %}
+    </article>
+    {% endfor %}
+    {% else %}
+    <p>No unmasked samples met the threshold.</p>
+    {% endif %}
+</section>
+{% endif %}
+
+<section aria-labelledby="active-corrections-title">
+    <h3 id="active-corrections-title">Active corrections</h3>
+    {% if corrections %}
+    <div class="table-scroll">
+    <table>
+        <thead><tr><th>Activity</th><th>Inclusive indices</th><th>Reason</th><th>Applied</th><th></th></tr></thead>
+        <tbody>{% for correction in corrections %}
+        <tr>
+            <td>{{ correction.activity_id }} — {{ correction.start_time or 'Unknown date' }} — {{ correction.filename or 'Unnamed activity' }}</td>
+            <td>{{ correction.start_index }}–{{ correction.end_index }}</td>
+            <td>{{ correction.reason or '—' }}</td>
+            <td>{{ correction.created }}</td>
+            <td>
+                <form method="post" action="/profile/power-corrections/undo">
+                    <input type="hidden" name="correction_id" value="{{ correction.id }}">
+                    <button class="button-secondary" type="submit">Undo</button>
+                </form>
+            </td>
+        </tr>
+        {% endfor %}</tbody>
+    </table>
+    </div>
+    {% else %}
+    <p class="hint">No active corrections.</p>
+    {% endif %}
+</section>
+{% endblock %}
