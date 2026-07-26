@@ -47,6 +47,22 @@ REFERENCE_SHORT_RATIO = 2.40   # mean(15s, 30s) / 20min for a balanced trained r
 REFERENCE_PUNCH_RATIO = 1.55   # mean(1, 2, 5min) / 20min
 REFERENCE_RETENTION = 0.94     # mean(40, 60min) / 20min
 
+# Longest run of consecutive invalid samples that is filled in by linear
+# interpolation between the surrounding valid samples. A one-off sensor
+# dropout is not a break in the effort -- discarding every window that spans
+# it would erase a rider's 60-minute best over a single bad second -- but a
+# genuine pause really does interrupt the effort, so anything longer than this
+# still invalidates the windows that contain it. Runs touching the start or
+# end of the stream have no anchor on one side and are never bridged.
+MAX_BRIDGED_GAP_S = 3
+
+# Trailing windows, narrowest first, tried in turn when classifying the
+# phenotype; ``None`` means all time. The narrowest window that carries enough
+# coverage wins, so a three-year-old sprint no longer shapes a rider's current
+# label. Every ratio comes from a single window -- domains are never mixed.
+PHENOTYPE_WINDOWS = (90, 180, 365, None)
+PRIMARY_PHENOTYPE_WINDOW_DAYS = 90
+
 
 def _finite_nonnegative(value) -> Optional[float]:
     try:
@@ -56,11 +72,40 @@ def _finite_nonnegative(value) -> Optional[float]:
     return number if math.isfinite(number) and number >= 0 else None
 
 
+def _bridge_short_gaps(values: list[Optional[float]]) -> None:
+    """Linearly interpolate invalid runs of at most ``MAX_BRIDGED_GAP_S``.
+
+    Mutates ``values`` in place. Only runs with a valid sample on both sides
+    are filled; leading and trailing runs are left invalid.
+    """
+    length = len(values)
+    index = 0
+    while index < length:
+        if values[index] is not None:
+            index += 1
+            continue
+        start = index
+        while index < length and values[index] is None:
+            index += 1
+        end = index  # exclusive
+        gap = end - start
+        if gap > MAX_BRIDGED_GAP_S or start == 0 or end == length:
+            continue
+        before = values[start - 1]
+        after = values[end]
+        step = (after - before) / (gap + 1)
+        for offset in range(gap):
+            values[start + offset] = before + step * (offset + 1)
+
+
 def rolling_maxima(power: Iterable, durations: Iterable[int] = ()) -> dict[int, float]:
     """Return exact rolling-mean maxima for a one-sample-per-second stream.
 
     Invalid and negative samples break a window rather than being silently
-    turned into zero. A result is omitted unless its best mean is positive.
+    turned into zero, except that a run of at most ``MAX_BRIDGED_GAP_S``
+    invalid samples with valid samples on both sides is linearly interpolated
+    and then treated as valid. A result is omitted unless its best mean is
+    positive.
     """
     if (
         power is None
@@ -76,6 +121,7 @@ def rolling_maxima(power: Iterable, durations: Iterable[int] = ()) -> dict[int, 
     values = [_finite_nonnegative(value) for value in iterator]
     if not values:
         return {}
+    _bridge_short_gaps(values)
 
     valid = np.fromiter((value is not None for value in values), dtype=bool)
     samples = np.fromiter(
@@ -122,17 +168,42 @@ def _is_recent(start_time, cutoff: _dt.datetime, now: _dt.datetime) -> bool:
     return parsed is not None and cutoff <= parsed <= now
 
 
-def _insufficient(rationale: str) -> dict:
+def _best_within(
+    records: Iterable[tuple], cutoff: Optional[_dt.datetime], now: _dt.datetime
+) -> dict[int, float]:
+    """Fold per-activity maxima into one best-of dict for a trailing window.
+
+    ``cutoff`` of ``None`` means all time and admits every activity, including
+    the ones whose ``start_time`` could not be parsed. Any finite window keeps
+    only activities that ``_is_recent`` accepts, so undated and future-dated
+    rides contribute all-time only.
+    """
+    best: dict[int, float] = {}
+    for start_time, maxima in records:
+        if cutoff is not None and not _is_recent(start_time, cutoff, now):
+            continue
+        for duration, value in maxima.items():
+            best[duration] = max(value, best.get(duration, 0.0))
+    return best
+
+
+def _insufficient(rationale: str, window_days: Optional[int] = None) -> dict:
     return {
         "label": "Insufficient data",
         "key": "insufficient_data",
         "rationale": rationale,
         "caveat": METHODOLOGY_CAVEAT,
         "indices": None,
+        "window_days": window_days,
+        # There is no classification here to be fresh about, and a consumer
+        # that checks staleness before coverage must not read this as current.
+        "stale": True,
     }
 
 
-def classify_phenotype(all_time: dict[int, float]) -> dict:
+def classify_phenotype(
+    all_time: dict[int, float], window_days: Optional[int] = None
+) -> dict:
     """Describe curve shape with indices relative to a balanced reference rider.
 
     Requires both the 15- and 30-second bests, at least two 1--5-minute bests,
@@ -148,6 +219,14 @@ def classify_phenotype(all_time: dict[int, float]) -> dict:
     least 0.95 of reference retention with a short index no higher than 0.90
     and a punch index no higher than 0.95. Anything less distinctive is an
     all-rounder.
+
+    ``window_days`` records which trailing window the supplied bests came
+    from; ``None`` means all time. It is echoed back in the result alongside
+    ``stale``, which is ``True`` unless the classification came from the
+    primary ``PRIMARY_PHENOTYPE_WINDOW_DAYS``-day window. That definition is
+    deliberately mechanical so a consumer -- the prescription engine in
+    particular -- can set its own freshness bar instead of inferring one from
+    the rationale prose.
     """
     # Exclude one-second peaks: they are naturally far above 20-minute power
     # even on balanced curves and are unusually sensitive to sensor spikes.
@@ -176,7 +255,8 @@ def classify_phenotype(all_time: dict[int, float]) -> dict:
         return _insufficient(
             "Broader record coverage is needed: both 15- and 30-second "
             "bests, at least two 1–5-minute bests, a 20-minute best, and "
-            "six durations overall."
+            "six durations overall.",
+            window_days,
         )
 
     short_ratio = sum(short) / len(short) / anchor
@@ -201,7 +281,8 @@ def classify_phenotype(all_time: dict[int, float]) -> dict:
     ):
         return _insufficient(
             "The recorded bests are not on a plausible scale relative to the "
-            "20-minute best."
+            "20-minute best.",
+            window_days,
         )
 
     if short_index >= 1.10 and short_index >= punch_index * 1.12:
@@ -246,7 +327,45 @@ def classify_phenotype(all_time: dict[int, float]) -> dict:
                 round(retention_index, 3) if retention_index is not None else None
             ),
         },
+        "window_days": window_days,
+        "stale": window_days != PRIMARY_PHENOTYPE_WINDOW_DAYS,
     }
+
+
+def classify_with_recency(
+    records: Iterable[tuple],
+    now: Optional[_dt.datetime] = None,
+    windows: Iterable[Optional[int]] = PHENOTYPE_WINDOWS,
+) -> dict:
+    """Classify from the narrowest trailing window that has enough coverage.
+
+    ``records`` is an iterable of ``(start_time, maxima)`` pairs, one per
+    activity, where ``maxima`` is that activity's ``{duration: watts}`` dict.
+    Windows are tried narrowest first; the first one whose bests clear
+    ``classify_phenotype``'s eligibility gate wins, and every ratio then comes
+    from that one window. When no window qualifies, the all-time
+    insufficient-data result is returned.
+    """
+    reference = _utc_naive(now or utc_now())
+    materialized = list(records)
+    fallback = None
+    for window_days in windows:
+        cutoff = (
+            reference - _dt.timedelta(days=window_days)
+            if window_days is not None
+            else None
+        )
+        result = classify_phenotype(
+            _best_within(materialized, cutoff, reference), window_days
+        )
+        if result["key"] != "insufficient_data":
+            return result
+        fallback = result
+    if fallback is not None and fallback["window_days"] is None:
+        return fallback
+    return classify_phenotype(
+        _best_within(materialized, None, reference), None
+    )
 
 
 def compute(
@@ -261,12 +380,14 @@ def compute(
     recent_best: dict[int, float] = {}
     all_counts = {duration: 0 for duration, _ in DURATIONS}
     recent_counts = {duration: 0 for duration, _ in DURATIONS}
+    records: list[tuple] = []
 
     for activity in activities:
         streams = activity.get("streams") if isinstance(activity, dict) else None
         power = streams.get("power") if isinstance(streams, dict) else None
         maxima = rolling_maxima(power)
         start_time = activity.get("start_time") if isinstance(activity, dict) else None
+        records.append((start_time, maxima))
         recent = _is_recent(start_time, cutoff, reference)
         for duration, value in maxima.items():
             all_counts[duration] += 1
@@ -318,7 +439,7 @@ def compute(
         "available": bool(available_rows),
         "rows": rows,
         "chart": chart,
-        "phenotype": classify_phenotype(all_best),
+        "phenotype": classify_with_recency(records, now=reference),
         "cutoff_date": cutoff.date().isoformat(),
         "cutoff_text": f"{cutoff.strftime('%b')} {cutoff.day}, {cutoff.year}",
         "as_of_date": reference.date().isoformat(),

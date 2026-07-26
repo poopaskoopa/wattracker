@@ -12,7 +12,8 @@
     <p>
         <strong>Rider type: {{ power_profile.phenotype.label }}</strong><br>
         <span class="hint">{{ power_profile.phenotype.rationale }}
-        {{ power_profile.phenotype.caveat }}</span>
+        {{ power_profile.phenotype.caveat }}<br>
+        Computed from {% if power_profile.phenotype.window_days %}the last {{ power_profile.phenotype.window_days }} days{% else %}all recorded rides{% endif %}.</span>
     </p>
     <div class="power-profile-layout">
         <div class="power-radar-wrap">
@@ -60,7 +61,8 @@
     <p>
         <strong>Rider type: {{ power_profile.phenotype.label }}</strong><br>
         <span class="hint">{{ power_profile.phenotype.rationale }}
-        {{ power_profile.phenotype.caveat }}</span>
+        {{ power_profile.phenotype.caveat }}<br>
+        Computed from {% if power_profile.phenotype.window_days %}the last {{ power_profile.phenotype.window_days }} days{% else %}all recorded rides{% endif %}.</span>
     </p>
     <p class="hint">Import Zwift or FIT rides with power to build all-time and recent record power.</p>
     {% endif %}
