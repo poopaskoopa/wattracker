@@ -214,6 +214,143 @@ def test_sparse_curves_are_insufficient(curve):
     assert "Broader record coverage" in result["rationale"]
 
 
+def _dropout_stream(length=4000, gap_at=500, gap=1):
+    stream = [200.0 + index % 5 for index in range(length)]
+    for offset in range(gap):
+        stream[gap_at + offset] = None
+    return stream
+
+
+def test_single_sample_dropout_is_bridged_and_keeps_the_hour_best():
+    clean = [200.0 + index % 5 for index in range(4000)]
+    bridged = power_profile.rolling_maxima(_dropout_stream(), [3600])
+    assert 3600 in bridged
+    assert bridged[3600] == pytest.approx(
+        power_profile.rolling_maxima(clean, [3600])[3600], abs=1.0
+    )
+
+
+def test_dropout_longer_than_the_bridge_limit_still_invalidates():
+    long_gap = power_profile.rolling_maxima(_dropout_stream(gap=10), [3600])
+    assert 3600 not in long_gap
+    # Four is one more than MAX_BRIDGED_GAP_S and is already too long.
+    assert power_profile.MAX_BRIDGED_GAP_S == 3
+    assert power_profile.rolling_maxima([100] + [None] * 4 + [300], [6]) == {}
+
+
+def test_unanchored_dropouts_at_stream_edges_are_never_bridged():
+    leading = power_profile.rolling_maxima([None, 100, 200], [1, 2, 3])
+    assert leading == {1: 200, 2: 150}
+
+    trailing = power_profile.rolling_maxima([100, 200, None], [1, 2, 3])
+    assert trailing == {1: 200, 2: 150}
+
+    assert power_profile.rolling_maxima([None], [1]) == {}
+    assert power_profile.rolling_maxima([None, None, None], [1, 2, 3]) == {}
+
+
+def test_bridged_samples_are_linearly_interpolated():
+    assert power_profile.rolling_maxima([100, None, 300], [1, 2, 3]) == {
+        1: 300,
+        2: 250,
+        3: 200,
+    }
+    assert power_profile.rolling_maxima(
+        [100, None, None, None, 500], [5]
+    ) == {5: 300}
+
+
+NOW = dt.datetime(2026, 7, 25, 12)
+
+
+def _at(days_ago):
+    return (NOW - dt.timedelta(days=days_ago)).isoformat()
+
+
+def _punchy():
+    return _curve(250, {60: 2.4, 120: 2.0, 300: 1.55})
+
+
+def _sprinty():
+    return _curve(250, {15: 4.2, 30: 3.4})
+
+
+def test_recent_window_wins_over_an_old_sprint_peak():
+    records = [(_at(30), _punchy()), (_at(700), _sprinty())]
+    result = power_profile.classify_with_recency(records, now=NOW)
+    assert result["label"] == "Puncheur"
+    assert result["window_days"] == 90
+    assert result["stale"] is False
+    # The bug being fixed: all-time bests would have called this a sprinter.
+    all_time = power_profile._best_within(records, None, NOW)
+    assert power_profile.classify_phenotype(all_time)["label"] == "Sprinter"
+
+
+def test_ladder_falls_back_to_the_widest_window_with_coverage():
+    result = power_profile.classify_with_recency(
+        [(_at(300), _punchy())], now=NOW
+    )
+    assert result["window_days"] == 365
+    assert result["stale"] is True
+    assert result["key"] == "puncheur"
+
+
+def test_full_recent_coverage_is_not_stale():
+    result = power_profile.classify_with_recency(
+        [(_at(10), _curve(250))], now=NOW
+    )
+    assert result["key"] == "all_rounder"
+    assert result["window_days"] == 90
+    assert result["stale"] is False
+
+
+@pytest.mark.parametrize("start_time", [None, "", "not-a-date", 12345])
+def test_undated_activities_classify_all_time_only(start_time):
+    result = power_profile.classify_with_recency(
+        [(start_time, _sprinty())], now=NOW
+    )
+    assert result["label"] == "Sprinter"
+    assert result["window_days"] is None
+    assert result["stale"] is True
+
+
+def test_future_dated_activities_are_all_time_only():
+    result = power_profile.classify_with_recency(
+        [(_at(-5), _sprinty())], now=NOW
+    )
+    assert result["label"] == "Sprinter"
+    assert result["window_days"] is None
+
+
+def test_insufficient_data_branches_carry_window_fields():
+    empty = power_profile.classify_with_recency([], now=NOW)
+    assert empty["key"] == "insufficient_data"
+    assert empty["window_days"] is None
+    assert empty["stale"] is True
+
+    direct = power_profile.classify_phenotype({1: 900, 1200: 300}, 180)
+    assert direct["window_days"] == 180 and direct["stale"] is True
+
+    denormal = power_profile.classify_phenotype(
+        {**_curve(250), 1200: 5e-324}, 90
+    )
+    assert denormal["key"] == "insufficient_data"
+    # Even from the primary window: there is no classification to be fresh
+    # about, so a consumer gating on staleness alone still rejects it.
+    assert denormal["window_days"] == 90 and denormal["stale"] is True
+
+
+def test_compute_classifies_from_the_recent_window_only():
+    result = power_profile.compute([
+        _ride(_at(20), [250] * 60),
+        _ride(_at(900), [900] * 60),
+    ], now=NOW)
+    # The old ride still owns the all-time row, but not the phenotype window.
+    assert _row(result, 60)["all_time"] == 900
+    assert result["phenotype"]["window_days"] in (90, 180, 365, None)
+    assert "stale" in result["phenotype"]
+
+
 @pytest.fixture()
 def client():
     with TestClient(create_app()) as value:
@@ -242,6 +379,7 @@ def test_profile_render_chart_table_validation_and_user_isolation(client, monkey
     assert '"recent_60d":' in page.text
     assert "Each spoke is normalized" in page.text
     assert 'aria-label="Radar chart' in page.text
+    assert "Computed from the last 90 days." in page.text
 
     bad = client.post("/profile/ftp", data={"ftp": "bad", "action": "save"})
     assert bad.status_code == 200 and "350 W" in bad.text
