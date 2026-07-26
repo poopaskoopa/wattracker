@@ -20,7 +20,7 @@ import pytest
 from wattracker import db
 from wattracker.metrics.rider import RiderMetrics
 from wattracker.prescribe import plan as planmod
-from wattracker.prescribe import reflow, zwo
+from wattracker.prescribe import planner, reflow, zwo
 from wattracker.timeutil import utc_today
 from wattracker.prescribe.planner import (
     SPRINT_LOAD_RATIO_DEFAULT,
@@ -195,11 +195,12 @@ def test_vo2_target_falls_back_when_unmeasured():
 
 
 def test_vo2_target_derives_from_measured_five_minute_power():
-    # 5min power is a MAXIMAL effort; 4-6 repeats of 4min sit ~92% of it.
-    assert vo2_target(RiderMetrics(vo2_ratio=1.20)) == pytest.approx(1.104)
+    # 5min power is a MAXIMAL effort; 4-6 repeats of 4min sit ~92% of it,
+    # snapped to the nearest whole percent of FTP (1.20 * 0.92 = 1.104 -> 1.10).
+    assert vo2_target(RiderMetrics(vo2_ratio=1.20)) == pytest.approx(1.10)
     session = build_workout("vo2max", 60, profile=MEASURED)
     seg = next(s for s in session.segments if s.kind == "intervals")
-    assert seg.on_power == pytest.approx(1.104)
+    assert seg.on_power == pytest.approx(1.10)
     assert "110% FTP" in session.description
     assert "110% FTP" in seg.text
 
@@ -216,6 +217,57 @@ def test_vo2_target_is_clamped_at_both_ends(ratio, expected):
         "vo2max", 60, profile=RiderMetrics(vo2_ratio=ratio)).segments
         if s.kind == "intervals")
     assert seg.on_power == expected
+
+
+# --------------------------------------------------------------- quantization
+# `mmp` is recomputed over a ROLLING 90-day window, so a measured ratio drifts
+# by fractions of a watt every single day with no change in the rider. Derived
+# targets are therefore snapped to a coarse grid; without that, an unattended
+# nightly reflow rewrites every plan and every .zwo file forever on noise
+# alone.
+@pytest.mark.parametrize("ratio", [1.2000, 1.2005, 1.2009])
+def test_vo2_target_ignores_sub_percent_measurement_drift(ratio):
+    assert vo2_target(RiderMetrics(vo2_ratio=ratio)) == vo2_target(
+        RiderMetrics(vo2_ratio=1.20))
+    for variant in VARIANTS["vo2max"]:
+        drifted = build_workout("vo2max", 60, variant,
+                                profile=RiderMetrics(vo2_ratio=ratio))
+        steady = build_workout("vo2max", 60, variant,
+                               profile=RiderMetrics(vo2_ratio=1.20))
+        assert zwo.zwo_string(drifted) == zwo.zwo_string(steady), variant
+
+
+@pytest.mark.parametrize("ratio", [4.35, 4.36, 4.37])
+def test_sprint_load_ignores_sub_step_measurement_drift(ratio):
+    profile = RiderMetrics(sprint_ratio=ratio)
+    assert planner.sprint_load_ratio(profile) == pytest.approx(4.35)
+    assert zwo.zwo_string(build_workout("sprint", 45, profile=profile)) == \
+        zwo.zwo_string(build_workout("sprint", 45, profile=MEASURED))
+
+
+def test_quantized_targets_land_on_the_grid():
+    """Every emitted VO2 target is a whole percent of FTP, in every variant."""
+    for ratio in (1.13, 1.20, 1.2345, 1.31, 1.99):
+        profile = RiderMetrics(vo2_ratio=ratio)
+        for variant in VARIANTS["vo2max"]:
+            for seg in build_workout("vo2max", 60, variant, profile=profile).segments:
+                for value in (seg.on_power, seg.power):
+                    if value is None or seg.kind in ("warmup", "cooldown"):
+                        continue
+                    assert round(value * 100, 6) == round(round(value * 100), 6), (
+                        variant, ratio, value)
+
+
+def test_a_real_capacity_change_still_moves_the_target():
+    """Quantization must not flatten genuine improvement."""
+    before = vo2_target(RiderMetrics(vo2_ratio=1.20))
+    after = vo2_target(RiderMetrics(vo2_ratio=1.26))
+    assert after > before
+    assert zwo.zwo_string(build_workout("vo2max", 60, profile=RiderMetrics(
+        vo2_ratio=1.26))) != zwo.zwo_string(build_workout(
+            "vo2max", 60, profile=RiderMetrics(vo2_ratio=1.20)))
+    assert planner.sprint_load_ratio(RiderMetrics(sprint_ratio=4.60)) > \
+        planner.sprint_load_ratio(RiderMetrics(sprint_ratio=4.35))
 
 
 def test_derived_vo2_session_still_fits_and_scores():
@@ -292,6 +344,61 @@ def test_reflow_with_a_profile_is_idempotent(user_id, monkeypatch):
     assert (second["updated"], second["inserted"], second["deleted"]) == (0, 0, 0)
     assert second["skipped_locked"] == first["skipped_locked"]
     assert _rows(user_id, plan_id) == snapshot
+
+
+def test_daily_reflow_does_not_churn_on_measurement_noise(user_id, monkeypatch):
+    """Regression: profile-awareness x unattended daily reflow.
+
+    ``mmp`` comes from a rolling 90-day window, so both ratios wobble every day
+    on their own. Reflow diffs on tss and the stored .zwo, so before the derived
+    values were quantized this rewrote every future workout - and renamed every
+    exported .zwo - nightly, forever, with the rider unchanged.
+    """
+    _use_profile(monkeypatch, RiderMetrics(vo2_ratio=1.2000, sprint_ratio=4.35))
+    plan_id = _seed_plan(user_id)
+    reflow.reflow_plan(user_id, plan_id, now=NOW)  # converge
+    converged = _rows(user_id, plan_id)
+
+    # A day later: same rider, a new ride in and an old one out of the window.
+    _use_profile(monkeypatch, RiderMetrics(vo2_ratio=1.2009, sprint_ratio=4.36))
+    result = reflow.reflow_plan(user_id, plan_id, now=NOW)
+
+    assert (result["updated"], result["inserted"], result["deleted"]) == (0, 0, 0)
+    assert _rows(user_id, plan_id) == converged
+
+
+def test_reflow_still_rewrites_on_a_real_capacity_change(user_id, monkeypatch):
+    """The other half: quantization must not swallow genuine improvement."""
+    _use_profile(monkeypatch, RiderMetrics(vo2_ratio=1.2000))
+    plan_id = _seed_plan(user_id)
+    reflow.reflow_plan(user_id, plan_id, now=NOW)
+    before = {r["id"]: r for r in _rows(user_id, plan_id)}
+
+    _use_profile(monkeypatch, RiderMetrics(vo2_ratio=1.2600))
+    result = reflow.reflow_plan(user_id, plan_id, now=NOW)
+
+    changed = [r for r in _rows(user_id, plan_id)
+               if r["zwo_or_segments"] != before[r["id"]]["zwo_or_segments"]]
+    assert changed and all(r["type"] == "vo2max" for r in changed)
+    assert result["updated"] == len(changed)
+
+
+def test_reflow_agrees_with_a_directly_built_session(user_id, monkeypatch):
+    """Quantization is applied inside the builder, so both paths must agree.
+
+    If it were applied at only one call site, a stored row and a freshly built
+    session would disagree by a hair and reflow would rewrite it every run.
+    """
+    profile = RiderMetrics(vo2_ratio=1.2345, sprint_ratio=4.37)
+    _use_profile(monkeypatch, profile)
+    plan_id = _seed_plan(user_id)
+    reflow.reflow_plan(user_id, plan_id, now=NOW)
+
+    for row in _rows(user_id, plan_id):
+        direct = build_workout(row["type"], row["duration_s"] / 60,
+                               row["variant"], profile=profile)
+        if row["date"] > NOW.date().isoformat():
+            assert row["zwo_or_segments"] == zwo.zwo_string(direct), row["date"]
 
 
 def test_reflow_with_a_profile_still_preserves_adaptations(user_id, monkeypatch):
