@@ -47,8 +47,14 @@
         </label>
     </div>
     <div class="toolbar">
-        <button type="button" id="scanBtn" {{ '' if ble_available else 'disabled' }}>Scan devices</button>
-        <button type="button" id="connectBtn" {{ '' if ble_available else 'disabled' }}>Connect selected sensors</button>
+        <button type="button" id="scanBtn" aria-busy="false" {{ '' if ble_available else 'disabled' }}>
+            <span class="spinner button-spinner" aria-hidden="true" hidden></span>
+            <span class="button-label">Scan devices</span>
+        </button>
+        <button type="button" id="connectBtn" aria-busy="false" {{ '' if ble_available else 'disabled' }}>
+            <span class="spinner button-spinner" aria-hidden="true" hidden></span>
+            <span class="button-label">Connect selected sensors</span>
+        </button>
         <button type="button" id="simBtn">Simulate</button>
         <button type="button" id="stopBtn" disabled>Stop</button>
     </div>
@@ -64,7 +70,7 @@
         source with pedals.
     </p>
     <div id="deviceList" class="device-list"></div>
-    <p id="connectionStatus" class="hint" aria-live="polite"></p>
+    <p id="connectionStatus" class="hint" role="status" aria-live="polite"></p>
 </section>
 
 <section class="ride-live">
@@ -157,6 +163,9 @@
     var chartMaxX = 0;
     var connectedAddresses = {};
     var pendingDisconnects = {};
+    var releaseAfterDisconnect = false;
+    var RECONNECT_RELEASE_DELAY_MS = 750;
+    var reconnectTimer = null;
     var ergAvailable = false, ergEnabled = false, ergPending = false;
     function readCache() {
         try {
@@ -530,11 +539,33 @@
         document.getElementById("simBtn").disabled = active;
         document.getElementById("scanBtn").disabled = active || !bleAvailable;
         document.getElementById("connectBtn").disabled =
-            (state === "connecting" || state === "running") || !bleAvailable;
+            state === "connecting" || !bleAvailable;
         document.getElementById("workoutSelect").disabled = active;
         document.getElementById("rideTypeSelect").disabled = active;
         document.getElementById("rideDurationSelect").disabled = active;
         modeInputs().forEach(function (input) { input.disabled = active; });
+    }
+    function setButtonBusy(button, busy, busyText, idleText) {
+        button.setAttribute("aria-busy", busy ? "true" : "false");
+        var spinner = button.querySelector(".button-spinner");
+        var label = button.querySelector(".button-label");
+        if (spinner) spinner.hidden = !busy;
+        if (label) label.textContent = busy ? busyText : idleText;
+    }
+    function setConnectBusy(busy) {
+        var button = document.getElementById("connectBtn");
+        setButtonBusy(button, busy, "Connecting…", "Connect selected sensors");
+        if (busy) button.disabled = true;
+        else setRideState(rideState);
+    }
+    function cancelPendingReconnect() {
+        var cancelled = queuedOpen !== null || reconnectTimer !== null;
+        queuedOpen = null;
+        if (reconnectTimer !== null) {
+            window.clearTimeout(reconnectTimer);
+            reconnectTimer = null;
+        }
+        return cancelled;
     }
     function modeInputs() {
         return Array.prototype.slice.call(
@@ -696,6 +727,11 @@
         else if (["starting", "running", "paused", "cooldown"].indexOf(st.status) !== -1) setRideState("running");
     }
     function openRide(sim) {
+        if (reconnectTimer !== null) {
+            window.clearTimeout(reconnectTimer);
+            reconnectTimer = null;
+        }
+        if (!sim) setConnectBusy(true);
         if (ws) {
             var previousState = rideState;
             queuedOpen = {sim: sim};
@@ -703,7 +739,7 @@
                 "Disconnecting the current sensor session before reconnecting...", "working");
             setRideState("connecting");
             function cancelQueuedReconnect() {
-                queuedOpen = null;
+                cancelPendingReconnect();
                 reconnectCloseNotice =
                     "The reconnect request could not be queued safely. Retry after the current session closes.";
                 try {
@@ -779,6 +815,7 @@
                 preserveDisconnectMessage = true;
                 playCue("failure");
                 setRideState("idle");
+                if (!sim) setConnectBusy(false);
                 return;
             }
             if (st.status === "inactivity_timeout") {
@@ -798,11 +835,19 @@
                 } else {
                     updateConnectedRows(st.devices || {});
                     uncheckDeviceRoles(st.address);
-                    var reconnectAdvice = rideState === "running"
-                        ? " Stop the ride before reconnecting it."
-                        : " Reselect its role to reconnect.";
-                    setLive(document.getElementById("connectionStatus"),
-                        displayName(st.address) + " disconnected." + reconnectAdvice, "success");
+                    if (st.ending_session) {
+                        releaseAfterDisconnect = true;
+                        preserveDisconnectMessage = true;
+                        setLive(document.getElementById("connectionStatus"),
+                            displayName(st.address) +
+                            " disconnected. Releasing Bluetooth before Scan/Connect…",
+                            "working");
+                    } else {
+                        setLive(document.getElementById("connectionStatus"),
+                            displayName(st.address) +
+                            " disconnected. Reselect its role and use Connect to reconnect.",
+                            "success");
+                    }
                     playCue("success");
                 }
                 applyErgState(Boolean(st.erg_available), Boolean(st.erg_enabled));
@@ -853,6 +898,7 @@
                 applyErgState(Boolean(st.erg_available), Boolean(st.erg_enabled));
                 playCue(hasWarnings ? "failure" : "success");
                 setRideState("running");
+                if (!sim) setConnectBusy(false);
                 return;
             }
             render(st);
@@ -867,11 +913,23 @@
             var nextOpen = queuedOpen;
             queuedOpen = null;
             if (nextOpen) {
-                openRide(nextOpen.sim);
+                setLive(document.getElementById("connectionStatus"),
+                    "Bluetooth released. Reconnecting in a moment…", "working");
+                if (reconnectTimer !== null) window.clearTimeout(reconnectTimer);
+                reconnectTimer = window.setTimeout(function () {
+                    reconnectTimer = null;
+                    openRide(nextOpen.sim);
+                }, RECONNECT_RELEASE_DELAY_MS);
                 return;
             }
             setRideState("idle");
-            if (reconnectCloseNotice) {
+            if (!sim) setConnectBusy(false);
+            if (releaseAfterDisconnect) {
+                releaseAfterDisconnect = false;
+                preserveDisconnectMessage = true;
+                setLive(document.getElementById("connectionStatus"),
+                    "Bluetooth released — ready to Scan or Connect.", "success");
+            } else if (reconnectCloseNotice) {
                 setLive(document.getElementById("connectionStatus"),
                     reconnectCloseNotice, "failure");
                 reconnectCloseNotice = null;
@@ -888,6 +946,7 @@
                 "Bluetooth connection failed. Check the device and try again.", "failure");
             playCue("failure");
             setRideState("idle");
+            if (!sim) setConnectBusy(false);
         };
     }
     function roleLabel(role) {
@@ -930,20 +989,34 @@
             var connected = Object.prototype.hasOwnProperty.call(
                 connectedAddresses, row.dataset.address);
             row.classList.toggle("device-connected", connected);
+            var pending = Boolean(pendingDisconnects[row.dataset.address]);
+            row.classList.toggle("device-disconnect-pending", pending);
+            row.setAttribute("aria-busy", pending ? "true" : "false");
             var badge = row.querySelector(".connection-badge");
             if (badge) {
                 var entry = cached[row.dataset.address];
-                badge.textContent = connected ? "Connected" : (entry ? "Last connected" : "");
-                badge.title = connected ? "Currently connected" :
-                    (entry ? "Last connected " + entry.last_connected : "");
+                badge.textContent = pending ? "Disconnecting" :
+                    (connected ? "Connected" : (entry ? "Last connected" : ""));
+                badge.title = pending ? "Disconnect in progress" :
+                    (connected ? "Currently connected" :
+                    (entry ? "Last connected " + entry.last_connected : ""));
+                if (!pending) badge.removeAttribute("aria-busy");
+                else badge.setAttribute("aria-busy", "true");
             }
             var button = row.querySelector(".device-disconnect");
             if (button) {
                 button.hidden = !connected;
-                button.disabled = !connected || !ws;
-                if (!pendingDisconnects[row.dataset.address]) button.textContent = "Disconnect";
+                setDisconnectBusy(button, pending);
+                button.disabled = pending || !connected || !ws;
             }
         });
+    }
+    function setDisconnectBusy(button, busy) {
+        button.setAttribute("aria-busy", busy ? "true" : "false");
+        var spinner = button.querySelector(".button-spinner");
+        var label = button.querySelector(".button-label");
+        if (spinner) spinner.hidden = !busy;
+        if (label) label.textContent = busy ? "Disconnecting…" : "Disconnect";
     }
     function uncheckDeviceRoles(address) {
         address = String(address || "");
@@ -965,12 +1038,20 @@
         if (!row) return;
         var button = row.querySelector(".device-disconnect");
         if (button) {
-            button.textContent = "Disconnect";
+            setDisconnectBusy(button, false);
             button.disabled = !connectedAddresses[address] || !ws;
+        }
+        row.classList.remove("device-disconnect-pending");
+        row.setAttribute("aria-busy", "false");
+        var badge = row.querySelector(".connection-badge");
+        if (badge) {
+            badge.textContent = connectedAddresses[address] ? "Connected" : "";
+            badge.removeAttribute("aria-busy");
         }
     }
     function requestDisconnect(address) {
         address = String(address || "");
+        if (pendingDisconnects[address]) return;
         if (!ws || ws.readyState !== WebSocket.OPEN || !connectedAddresses[address]) {
             setLive(document.getElementById("connectionStatus"),
                 "That device is not connected.", "failure");
@@ -980,10 +1061,21 @@
         var row = Array.from(document.querySelectorAll("#deviceList tr[data-address]")).find(
             function (item) { return item.dataset.address === address; });
         var button = row && row.querySelector(".device-disconnect");
+        if (row) {
+            row.classList.add("device-disconnect-pending");
+            row.setAttribute("aria-busy", "true");
+            var badge = row.querySelector(".connection-badge");
+            if (badge) {
+                badge.textContent = "Disconnecting";
+                badge.setAttribute("aria-busy", "true");
+            }
+        }
         if (button) {
             button.disabled = true;
-            button.textContent = "Disconnecting…";
+            setDisconnectBusy(button, true);
         }
+        setLive(document.getElementById("connectionStatus"),
+            "Disconnecting " + displayName(address) + "…", "working");
         try {
             ws.send(JSON.stringify({action: "disconnect", address: address}));
         } catch (e) {
@@ -1096,8 +1188,11 @@
         scannedDevices = {};
         scanned = true;
         if (!devices.length) {
-            setLive(status, "No devices found.", "success");
-            return;
+            scanned = false;
+            setLive(status,
+                "No Bluetooth devices found. Wake or spin the device, make sure no other app owns it, then retry Scan.",
+                "failure");
+            return false;
         }
 
         setLive(status, "Found " + devices.length + " device" +
@@ -1237,7 +1332,16 @@
             var disconnect = document.createElement("button");
             disconnect.type = "button";
             disconnect.className = "device-disconnect button-secondary";
-            disconnect.textContent = "Disconnect";
+            disconnect.setAttribute("aria-busy", "false");
+            var disconnectSpinner = document.createElement("span");
+            disconnectSpinner.className = "spinner button-spinner";
+            disconnectSpinner.setAttribute("aria-hidden", "true");
+            disconnectSpinner.hidden = true;
+            var disconnectLabel = document.createElement("span");
+            disconnectLabel.className = "button-label";
+            disconnectLabel.textContent = "Disconnect";
+            disconnect.appendChild(disconnectSpinner);
+            disconnect.appendChild(disconnectLabel);
             disconnect.hidden = true;
             disconnect.disabled = true;
             disconnect.setAttribute("aria-label",
@@ -1252,6 +1356,7 @@
         table.appendChild(body);
         wrap.appendChild(table);
         el.appendChild(wrap);
+        return true;
     }
     modeInputs().forEach(function (input) {
         input.addEventListener("change", applyMode);
@@ -1261,6 +1366,7 @@
     document.getElementById("rideTypeSelect").addEventListener("change", loadPreview);
     document.getElementById("rideDurationSelect").addEventListener("change", loadPreview);
     document.getElementById("connectBtn").addEventListener("click", function () {
+        if (this.getAttribute("aria-busy") === "true") return;
         primeAudio();
         openRide(false);
     });
@@ -1295,8 +1401,18 @@
     // back. Fall back to closing if the socket is already gone, or if the
     // server does not come back within a few seconds.
     function stopRide() {
-        queuedOpen = null;
-        if (!ws) { setRideState("idle"); return; }
+        var cancelledReconnect = cancelPendingReconnect();
+        if (!ws) {
+            setRideState("idle");
+            setConnectBusy(false);
+            if (cancelledReconnect) {
+                document.getElementById("rStatus").textContent = "idle";
+                setLive(document.getElementById("connectionStatus"),
+                    "Pending reconnect cancelled — ready to Scan or Connect.",
+                    "success");
+            }
+            return;
+        }
         var socket = ws;
         if (socket.readyState !== WebSocket.OPEN) {
             try { socket.close(); } catch (e) {}
@@ -1311,7 +1427,10 @@
             return;
         }
         setLive(document.getElementById("connectionStatus"),
-            "Finishing the ride and saving...", "working");
+            cancelledReconnect
+                ? "Pending reconnect cancelled. Finishing the ride and saving..."
+                : "Finishing the ride and saving...",
+            "working");
         window.setTimeout(function () {
             if (ws === socket && socket.readyState === WebSocket.OPEN) {
                 try { socket.close(); } catch (e) {}
@@ -1345,24 +1464,28 @@
         document.getElementById("workoutSelect").disabled = true;
         document.getElementById("rideTypeSelect").disabled = true;
         document.getElementById("rideDurationSelect").disabled = true;
-        scanButton.setAttribute("aria-busy", "true");
+        setButtonBusy(scanButton, true, "Scanning…", "Scan devices");
         busy.hidden = false;
         playCue("scan");
         try {
             var resp = await fetch("/ride/scan", { method: "POST" });
             var data = await resp.json();
+            if (!resp.ok) {
+                throw new Error(data.reason || "Scan request failed (" + resp.status + ").");
+            }
             if (!data.available) {
                 setLive(status, "Unavailable: " + (data.reason || ""), "failure");
                 playCue("failure");
                 return;
             }
-            renderDevices(data.devices || []);
-            playCue("success");
+            if (renderDevices(data.devices || [])) playCue("success");
+            else playCue("failure");
         } catch (e) {
-            setLive(status, "Scan failed.", "failure");
+            setLive(status, "Scan failed: " + (e.message || "check Bluetooth and retry."),
+                "failure");
             playCue("failure");
         } finally {
-            scanButton.setAttribute("aria-busy", "false");
+            setButtonBusy(scanButton, false, "Scanning…", "Scan devices");
             busy.hidden = true;
             setRideState(rideState);
         }
