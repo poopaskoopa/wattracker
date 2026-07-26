@@ -34,7 +34,7 @@ def _insert(user_id, idx, streams, start=None):
 # ------------------------------------------------------- sustained HR peak
 def test_short_spike_is_not_reported_as_hr_max():
     # 150-170 bpm ride with a 3-sample 240 bpm sensor artefact. A raw max()
-    # would report 240; the 10s rolling mean must dilute it away.
+    # would report 240; the rolling mean must dilute it away.
     stream = [150.0 + (i % 21) for i in range(1800)]
     for i in range(900, 903):
         stream[i] = 240.0
@@ -44,10 +44,28 @@ def test_short_spike_is_not_reported_as_hr_max():
     assert max(stream) == 240.0  # the spike really is in the data
 
 
+def test_three_sample_artefact_on_a_flat_ride_is_well_contained():
+    # Defect-1 regression: a genuinely 155-160 bpm ride carrying a 3-sample
+    # ~240 artefact reported 183 with the old 10s window. The 30s window keeps
+    # it near 166, so require well under the old figure.
+    stream = [155.0 + (i % 6) for i in range(1800)]
+    stream[900:903] = [240.0, 242.0, 238.0]
+    peak = rider.sustained_hr_peak(stream)
+    assert peak is not None
+    assert peak < 172.0
+
+
 def test_genuine_sustained_effort_is_reported():
     # A 60s plateau at 185 is physiological, not an artefact.
     stream = _hr_ride(base=160.0, peak=185.0, peak_len=60)
     assert rider.sustained_hr_peak(stream) == pytest.approx(185.0, abs=0.5)
+
+
+def test_genuine_45s_plateau_is_undiminished():
+    # Defect-1 regression the other way: the window must not be so long that a
+    # real 45s maximal finish gets blunted.
+    stream = _hr_ride(base=160.0, peak=186.0, peak_len=45)
+    assert rider.sustained_hr_peak(stream) == pytest.approx(186.0, abs=0.5)
 
 
 def test_sustained_peak_survives_empty_and_junk_streams():
@@ -55,12 +73,12 @@ def test_sustained_peak_survives_empty_and_junk_streams():
     assert rider.sustained_hr_peak([None] * 100) is None
     assert rider.sustained_hr_peak(["x", None, "", {}]) is None
     # Junk mixed with enough real samples still yields the real peak.
-    stream = ["bad", None] * 5 + [180.0] * 20
+    stream = ["bad", None] * 5 + [180.0] * 40
     assert rider.sustained_hr_peak(stream) == pytest.approx(180.0)
 
 
 def test_stream_shorter_than_window_is_none():
-    assert rider.sustained_hr_peak([180.0] * 5) is None
+    assert rider.sustained_hr_peak([180.0] * (rider.HR_SMOOTH_WINDOW_S - 1)) is None
 
 
 # ------------------------------------------------------- detect_hr_max
@@ -79,6 +97,44 @@ def test_one_corrupt_activity_does_not_move_the_answer():
     hr, n = rider.detect_hr_max(good + [corrupt])
     assert n == 10
     assert hr == pytest.approx(185.0, abs=0.5)
+
+
+@pytest.mark.parametrize("n,k", [(10, 2), (20, 2), (30, 3), (50, 4), (100, 6)])
+def test_detection_does_not_degrade_with_more_history(n, k):
+    # Defect-2 regression. A true HRmax of 188 reached on k of n rides, the
+    # rest scattered 168-183. The old 90th-percentile rule discarded a fixed
+    # FRACTION of the top peaks, so it read 5-7 bpm low for every n above ~10 -
+    # more history made the answer worse. Corroboration must be n-independent.
+    streams = [_hr_ride(peak=188.0, peak_len=60) for _ in range(k)]
+    for i in range(n - k):
+        streams.append(_hr_ride(peak=168.0 + (i % 16), peak_len=60))
+    hr, count = rider.detect_hr_max(streams)
+    assert count == n
+    assert hr == pytest.approx(188.0, abs=0.5)
+
+
+def test_single_corrupt_file_among_twenty_good_rides():
+    # 20 real rides topping out at 180, plus one file stuck at a sustained
+    # 215 bpm. 215 is in bounds and survives smoothing, so only the
+    # "no other activity corroborates it" rule can reject it.
+    streams = [_hr_ride(peak=180.0, peak_len=60) for _ in range(4)]
+    for i in range(16):
+        streams.append(_hr_ride(peak=165.0 + (i % 14), peak_len=60))
+    streams.append(_hr_ride(base=215.0))
+    hr, count = rider.detect_hr_max(streams)
+    assert count == 21
+    assert hr == pytest.approx(180.0, abs=0.5)
+
+
+def test_no_corroborated_peak_returns_none():
+    # Six activities whose peaks are all more than the tolerance apart: nothing
+    # is reproducible, so there is nothing to report.
+    streams = [
+        _hr_ride(base=140.0, peak=150.0 + 10 * i, peak_len=60) for i in range(6)
+    ]
+    hr, count = rider.detect_hr_max(streams)
+    assert count == 6
+    assert hr is None
 
 
 def test_too_few_activities_returns_none():
