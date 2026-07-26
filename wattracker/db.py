@@ -2594,6 +2594,16 @@ def list_race_results(user_id: int, path: Optional[str] = None) -> List[dict]:
         conn.close()
 
 
+def _race_result_row(row) -> dict:
+    """A race_results row as a dict, with power_json decoded into ``power``."""
+    d = dict(row)
+    try:
+        d["power"] = json.loads(d.pop("power_json") or "{}")
+    except ValueError:
+        d["power"] = {}
+    return d
+
+
 def race_results_on_date(
     user_id: int, date_iso: str, path: Optional[str] = None
 ) -> List[dict]:
@@ -2601,26 +2611,43 @@ def race_results_on_date(
 
     Used to resolve a planned ``race_dates`` row against the past results
     cached from ZwiftPower/local heuristics at read time - see
-    ``races.match_result_for_race_date``.
+    ``races.match_result_for_race_date``. Resolving a whole calendar's worth
+    of planned races goes through ``race_results_on_dates`` instead, so the
+    render costs one query rather than one per race.
     """
+    return race_results_on_dates(user_id, [date_iso], path).get(date_iso, [])
+
+
+def race_results_on_dates(
+    user_id: int, dates: Sequence[str], path: Optional[str] = None
+) -> Dict[str, List[dict]]:
+    """Cached race results for this user on any of ``dates``, grouped by date.
+
+    Each date's list keeps ``id ASC`` order, which the read-time matcher in
+    ``races`` relies on as its final, deterministic tie-break.
+    """
+    wanted = sorted({d for d in dates if d})
+    if not wanted:
+        return {}
+    out: Dict[str, List[dict]] = {}
     conn = connect(path)
     try:
-        rows = conn.execute(
-            "SELECT * FROM race_results WHERE user_id = ? AND event_date = ? "
-            "ORDER BY id ASC",
-            (user_id, date_iso),
-        ).fetchall()
-        out = []
-        for r in rows:
-            d = dict(r)
-            try:
-                d["power"] = json.loads(d.pop("power_json") or "{}")
-            except ValueError:
-                d["power"] = {}
-            out.append(d)
-        return out
+        # Chunked so a rider with an implausibly long race list can still
+        # never exceed SQLite's bound-parameter ceiling.
+        for start in range(0, len(wanted), 400):
+            chunk = wanted[start:start + 400]
+            placeholders = ",".join("?" * len(chunk))
+            rows = conn.execute(
+                "SELECT * FROM race_results WHERE user_id = ? "
+                f"AND event_date IN ({placeholders}) ORDER BY id ASC",
+                (user_id, *chunk),
+            ).fetchall()
+            for r in rows:
+                d = _race_result_row(r)
+                out.setdefault(d["event_date"], []).append(d)
     finally:
         conn.close()
+    return out
 
 
 def save_race_sync(

@@ -471,6 +471,43 @@ def _result_match_score(planned: dict, candidate: dict) -> tuple:
     return (title_match, duration_gap, candidate.get("id") or 0)
 
 
+def _resolvable_race_date(race_date: dict) -> Optional[str]:
+    """The date to look results up on, or None if it can't have one yet.
+
+    A race in the future has not been ridden, so it is never worth a lookup -
+    and a stray same-date result from a previous year's edition of the event
+    must not be presented as this year's outcome.
+    """
+    date_iso = race_date.get("date") or ""
+    if not date_iso or date_iso > utc_today().isoformat():
+        return None
+    return date_iso
+
+
+def _best_result(planned: dict, candidates: List[dict]) -> Optional[dict]:
+    """The candidate that best matches ``planned`` - see _result_match_score."""
+    if not candidates:
+        return None
+    if len(candidates) == 1:
+        return candidates[0]
+    return min(candidates, key=lambda c: _result_match_score(planned, c))
+
+
+def _result_for_display(result: Optional[dict]) -> Optional[dict]:
+    """A matched result with the same derived fields /races renders.
+
+    A linked result should read identically wherever it appears, so `place`
+    and `duration_fmt` are derived here exactly as `race_page_data` does
+    rather than re-implemented in each template.
+    """
+    if result is None:
+        return None
+    out = dict(result)
+    out["place"] = _place_int(out.get("position"))
+    out["duration_fmt"] = format_duration(out.get("duration_s"))
+    return out
+
+
 def match_result_for_race_date(
     user_id: int, race_date: dict
 ) -> Optional[dict]:
@@ -480,9 +517,12 @@ def match_result_for_race_date(
     rider hasn't refreshed race results since racing it. This never raises -
     an unmatched or ambiguous race must never break a calendar/races-page
     render.
+
+    Single-race helper. Resolving a whole list goes through
+    ``attach_results_to_race_dates``, which shares one query across them.
     """
-    date_iso = race_date.get("date") or ""
-    if not date_iso or date_iso > utc_today().isoformat():
+    date_iso = _resolvable_race_date(race_date)
+    if not date_iso:
         return None
     try:
         candidates = db.race_results_on_date(user_id, date_iso)
@@ -490,11 +530,7 @@ def match_result_for_race_date(
         log.warning("race result lookup failed for a planned race date",
                     exc_info=True)
         return None
-    if not candidates:
-        return None
-    if len(candidates) == 1:
-        return candidates[0]
-    return min(candidates, key=lambda c: _result_match_score(race_date, c))
+    return _result_for_display(_best_result(race_date, candidates))
 
 
 def attach_results_to_race_dates(
@@ -504,11 +540,28 @@ def attach_results_to_race_dates(
 
     ``result`` is the matched ``race_results`` row (or None). Idempotent and
     side-effect free - it only reads, never writes `race_dates`.
+
+    One query serves every race: the calendar resolves the rider's whole
+    planned-race list on every render, and going per-race meant a fresh
+    sqlite connection per planned race for a page that is already the app's
+    heaviest read.
     """
+    dates = {d for d in (_resolvable_race_date(r) for r in race_dates) if d}
+    by_date: Dict[str, List[dict]] = {}
+    if dates:
+        try:
+            by_date = db.race_results_on_dates(user_id, sorted(dates))
+        except Exception:  # noqa: BLE001 - a lookup failure just means "no link"
+            log.warning("race result lookup failed for planned race dates",
+                        exc_info=True)
+            by_date = {}
     out = []
     for r in race_dates:
         d = dict(r)
-        d["result"] = match_result_for_race_date(user_id, r)
+        date_iso = _resolvable_race_date(r)
+        d["result"] = _result_for_display(
+            _best_result(r, by_date.get(date_iso) or []) if date_iso else None
+        )
         out.append(d)
     return out
 
