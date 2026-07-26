@@ -19,10 +19,18 @@ with no recipe (everything created before the recipe column existed) are
 refused outright - guessing a recipe would silently rewrite a plan into
 something the user never asked for.
 
-On clearing ``adapted``: when reflow claims a row it resets that row's
-one-shot adapt.py adjustment budget. That is deliberate. An A-race taper has
-to be able to overwrite a week adapt.py already locked; the alternative leaves
-a rider doing VO2max intervals three days before their A-race. adapt.py's own
+Races are the one INPUT that is deliberately not in the recipe. They live in
+their own table and are read fresh on every reflow, because they change
+independently of the plan they bend (added, moved and deleted repeatedly);
+baking them into the recipe would create a second source of truth for them.
+
+On adapted rows: a row carrying ``adapted`` is SKIPPED (counted in
+``skipped_locked``) unless it falls inside a race window - a taper, a
+post-race recovery day or a race day itself - in which case the race wins and
+the row is claimed like any other, clearing ``adapted``. An adaptation is a
+considered response to the rider's current state and should not be thrown away
+by an unrelated reflow; but a rider doing VO2max intervals three days before
+their A race is strictly worse than losing one adaptation. adapt.py's own
 once-only guard (``db.update_plan_workout_content``) is untouched.
 """
 from __future__ import annotations
@@ -68,8 +76,15 @@ def _not_reflowable(reason: str) -> Dict:
     return {"status": "not_reflowable", "reason": reason}
 
 
-def _eligible(row: dict, today: str) -> bool:
-    """Is this stored row one the recipe owns and may rewrite?"""
+def _eligible(row: dict, today: str, race_window: Optional[set] = None) -> bool:
+    """Is this stored row one the recipe owns and may rewrite?
+
+    An adapted row is off limits unless a race has an opinion about its date -
+    inside a taper or a post-race recovery window the race outranks the
+    adaptation (see the module docstring).
+    """
+    if row.get("adapted") is not None and row["date"] not in (race_window or ()):
+        return False
     return (
         row["date"] > today
         and row.get("completed_activity_id") is None
@@ -132,8 +147,12 @@ def reflow_plan(
     """Recompute `plan_id` from its recipe and apply the diff. Idempotent.
 
     Returns {status, updated, inserted, deleted, skipped_locked, raced_lost,
-    failed, conflicts} on success, or {status: 'not_reflowable', reason}
-    having changed nothing.
+    failed, conflicts, races, race_conflicts} on success, or
+    {status: 'not_reflowable', reason} having changed nothing.
+
+    ``races`` echoes the races the recomputation planned around (with their
+    EFFECTIVE priority) and ``race_conflicts`` reports A races demoted to B
+    because they sat inside an earlier A race's taper, so the UI can warn.
 
     ``skipped_locked`` counts rows that WOULD have changed but were already
     past-dated, completed or not generator-owned when they were read. It is
@@ -169,6 +188,9 @@ def reflow_plan(
         return _not_reflowable("bad_start_date")
 
     args = {k: recipe.get(k) for k in _RECIPE_KEYS}
+    # Read races fresh: they are an input to generation but are deliberately
+    # NOT part of the recipe (see the module docstring).
+    races = db.list_race_dates(user_id)
     try:
         generated = generate_plan(
             plan["name"], start, int(plan["weeks"]),
@@ -177,6 +199,7 @@ def reflow_plan(
             hit_days_per_week=args["hit_days_per_week"],
             hard_days=args["hard_days"] or None,
             model=args["model"] or "polarized",
+            races=races,
         )
     except (ValueError, TypeError) as e:
         log.warning("plan %s has an unusable recipe: %s", plan_id, e)
@@ -184,6 +207,8 @@ def reflow_plan(
 
     now = now or utc_now()
     today = now.date().isoformat()
+    race_info = generated.get("races") or {}
+    race_window = set(race_info.get("window") or ())
     fresh_by_date = {w["date"]: w for w in generated["workouts"]}
     stored_by_date, conflicted = _by_date(
         db.plan_workouts_for_plan(user_id, plan_id, include_zwo=True)
@@ -198,7 +223,8 @@ def reflow_plan(
         fresh = fresh_by_date.get(date)
         stored = stored_by_date.get(date)
         try:
-            _apply_one(user_id, plan_id, date, today, fresh, stored, counts)
+            _apply_one(user_id, plan_id, date, today, fresh, stored, counts,
+                       race_window)
         except Exception:  # noqa: BLE001 - one bad row must not sink the plan
             counts["failed"] += 1
             log.warning(
@@ -206,12 +232,13 @@ def reflow_plan(
                 (stored or {}).get("id"), exc_info=True,
             )
 
-    return {"status": "ok", **counts}
+    return {"status": "ok", "races": race_info.get("planned") or [],
+            "race_conflicts": race_info.get("conflicts") or [], **counts}
 
 
 def _apply_one(user_id: int, plan_id: int, date: str, today: str,
                fresh: Optional[dict], stored: Optional[dict],
-               counts: Dict) -> None:
+               counts: Dict, race_window: Optional[set] = None) -> None:
     """Apply one date's diff, mutating `counts`. Raises on a write failure."""
     if fresh is not None and stored is None:
         # New training day. Past dates are never back-filled: a workout
@@ -231,7 +258,7 @@ def _apply_one(user_id: int, plan_id: int, date: str, today: str,
 
     if fresh is None and stored is not None:
         # The recipe no longer wants a workout here.
-        if not _eligible(stored, today):
+        if not _eligible(stored, today, race_window):
             counts["skipped_locked"] += 1
             return
         if db.delete_generated_plan_workout(user_id, stored["id"], today):
@@ -246,7 +273,7 @@ def _apply_one(user_id: int, plan_id: int, date: str, today: str,
     zwo_str = zwo.zwo_string(fresh["session"])
     if not _differs(stored, fresh, zwo_str):
         return
-    if not _eligible(stored, today):
+    if not _eligible(stored, today, race_window):
         counts["skipped_locked"] += 1
         return
     ok = db.replace_plan_workout_content(

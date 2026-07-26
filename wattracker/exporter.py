@@ -1,9 +1,10 @@
 """Keep a user's Zwift custom-workout folder in sync with their plan.
 
 Exports EVERY not-yet-completed plan workout (past and future) whose date is
-not inside an out-of-office (OOTO) range, and removes the .zwo of any workout
-that is now OOTO-skipped (or completed) so the Zwift list stays clean. Used by
-the "Export all to Zwift" action and the daily maintenance sweep.
+not inside an out-of-office (OOTO) range and is not a planned race day, and
+removes the .zwo of any workout that is now skipped (or completed) so the
+Zwift list stays clean. Used by the "Export all to Zwift" action and the daily
+maintenance sweep.
 """
 from __future__ import annotations
 
@@ -49,12 +50,17 @@ def sync_plan_exports(user_id: int) -> Dict:
     to_write: List[dict] = []
     to_remove: List[str] = []
     for w in workouts:
-        skip = bool(w.get("completed_activity_id")) or db.ooto_covers(
-            user_id, w["date"]
+        skip = (
+            bool(w.get("completed_activity_id"))
+            or db.ooto_covers(user_id, w["date"])
+            # On a race day the race IS the session; reflow normally removes
+            # the plan row, but a past-dated or otherwise locked row can
+            # survive it, and it must still not be exported.
+            or db.race_on(user_id, w["date"]) is not None
         )
         fname = zwo.plan_filename(w["date"], w["name"])
         if skip:
-            # Completed rides / OOTO days should not linger in Zwift.
+            # Completed rides / OOTO / race days should not linger in Zwift.
             to_remove.append(fname)
         else:
             to_write.append(
