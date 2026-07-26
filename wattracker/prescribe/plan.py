@@ -179,112 +179,180 @@ def resolve_race_conflicts(races: List[dict]) -> tuple:
     return resolved, conflicts
 
 
-def scheduled_days(start_date: _dt.date, weeks: int,
-                   days_of_week: Sequence[int]) -> List[_dt.date]:
-    """Every date a plan of this shape rides, in order.
+def race_priorities(races: Optional[Sequence[dict]]) -> List[dict]:
+    """Each stored race with the priority the PLAN would use, plus any demotion.
 
-    Extracted so a plan can be DESCRIBED after the fact from its recipe using
-    exactly the dates generation laid out - a second, subtly different
-    reconstruction would let the summary claim a taper the plan never applied.
+    This is the resolution rule's only public front door for views: the
+    calendar badge and the plan summary both come through here rather than
+    re-deriving when an A race counts as an A race. It needs no plan, because
+    the demotion depends on the race list alone.
     """
-    monday0 = start_date - _dt.timedelta(days=start_date.weekday())
-    days = sorted({int(d) for d in days_of_week or ()})
-    return [monday0 + _dt.timedelta(days=7 * w + weekday)
-            for w in range(int(weeks)) for weekday in days]
+    resolved, _conflicts = resolve_race_conflicts(normalize_races(races))
+    a_dates = [r["date"] for r in resolved if r["priority"] == PRIORITY_A]
+    out: List[dict] = []
+    for r in resolved:
+        prior = [d for d in a_dates if d < r["date"]]
+        out.append({
+            "id": r.get("id"),
+            "date": r["date"].isoformat(),
+            "name": r.get("name"),
+            "priority": r["priority"],       # EFFECTIVE, post-resolution
+            "duration_min": r.get("duration_min"),
+            "demoted": bool(r.get("demoted")),
+            # The earlier A race that took the taper; only set on a demotion.
+            "conflicts_with": (max(prior).isoformat()
+                               if r.get("demoted") and prior else None),
+            "separation_days": A_RACE_SEPARATION_DAYS,
+        })
+    return out
+
+
+def _workout_matches(stored: Optional[dict], fresh: Optional[dict]) -> bool:
+    """Does a stored plan row hold the workout generation says belongs there?
+
+    Absence is part of the comparison: a race day is only truly cleared when
+    NEITHER side has a row. Type and duration are enough - they are what every
+    claim in the race description is about.
+    """
+    if stored is None or fresh is None:
+        return stored is None and fresh is None
+    return (stored.get("type") == fresh.get("type")
+            and int(stored.get("duration_s") or 0) == int(fresh["duration_s"]))
 
 
 def describe_races(
     races: Optional[Sequence[dict]],
-    start_date: Optional[_dt.date] = None,
-    weeks: Optional[int] = None,
-    days_of_week: Optional[Sequence[int]] = None,
+    name: str,
+    start_date: _dt.date,
+    weeks: int,
+    days_of_week: Sequence[int],
+    hours_per_week: float,
+    hit_days_per_week: int,
+    hard_days: Optional[Sequence[int]] = None,
+    model: str = DEFAULT_MODEL,
+    profile: Optional["RiderMetrics"] = None,
+    phases: Optional[Sequence[Phase]] = None,
+    stored: Optional[Dict[str, dict]] = None,
 ) -> List[dict]:
-    """What a plan of this shape does about each race. -> list of descriptors
+    """What this plan actually DID about each race, established by diff.
 
-    Races are an INPUT to generation and are deliberately never stored in the
-    plan recipe (see the module notes above and prescribe/reflow.py), so the
-    only honest way to say what a stored plan did about them is to resolve them
-    again the same way generation does. This is that single re-resolution:
-    every view that needs an EFFECTIVE priority - the plan summary, the
-    calendar badge - calls it rather than re-deriving the rule.
+    The description is not re-derived from the race rules - it is read off a
+    DIFF of two generations of the same recipe, one with the rider\'s races and
+    one without. Generation is a pure function, so the difference between the
+    two IS what the races did: a day is tapered iff its session really got
+    shorter, a day drops to endurance iff its kind really changed, race day is
+    cleared iff the workout really is absent, a recovery day is one whose kind
+    really became recovery. Deriving those from the constants instead - which
+    an earlier version of this did - produced claims that were merely plausible
+    (a taper on days the plan does not ride, an "eased" neighbour that was
+    already endurance) and some that were simply false.
 
-    Conflict resolution always runs over the rider's WHOLE race list before any
-    windowing, because the A race that causes a demotion can sit outside the
-    window of the plan being described.
+    ``stored`` (date -> the plan_workouts row) closes the second gap: a plan is
+    only recomputed around races when it is reflowed, and reflow rewrites just
+    the rows it owns - so a non-active plan, a plan whose reflow failed, and any
+    locked or already-past row may not contain these effects at all. Every date
+    a race claims is checked against what is actually stored; when they
+    disagree the race is marked ``stale`` and the caller must say the plan does
+    not reflect it rather than describing effects it does not contain. Omitting
+    ``stored`` means "not checked" and leaves ``stale`` False.
 
-    With ``start_date``/``weeks`` given, only races inside the plan's span come
-    back. The last day of the span is deliberately inclusive of ``weeks * 7``:
-    a race the Monday after the plan's final Sunday still has its whole taper
-    inside the plan, so the plan does have something to say about it.
-
-    ``days_of_week`` (the recipe's ride days) unlocks the per-race effects,
-    which are read off the same ``race_effects`` the generator applies. Without
-    it - a legacy plan with no recipe - the priority and any demotion are still
-    described; only the dated effects are omitted.
+    A race is described when it falls inside the plan\'s span OR when its diff
+    touches any day of it - a race the week after the plan ends really does
+    shorten the plan\'s final sessions, and saying nothing about that would be
+    the same silence this whole description exists to end.
     """
-    resolved, _conflicts = resolve_race_conflicts(normalize_races(races))
-    by_date = {r["date"]: r for r in resolved if r["priority"] == PRIORITY_A}
+    base = race_priorities(races)
+    if not base:
+        return []
 
-    if start_date is not None and weeks is not None:
-        monday0 = start_date - _dt.timedelta(days=start_date.weekday())
-        last = monday0 + _dt.timedelta(days=7 * int(weeks))
-        in_window = [r for r in resolved if monday0 <= r["date"] <= last]
-    else:
-        in_window = list(resolved)
+    args = dict(days_of_week=days_of_week, hours_per_week=hours_per_week,
+                hit_days_per_week=hit_days_per_week, hard_days=hard_days,
+                model=model, profile=profile, phases=phases)
+    with_races = generate_plan(name, start_date, weeks, races=races, **args)
+    raceless = generate_plan(name, start_date, weeks, races=None, **args)
+    w_by = {x["date"]: x for x in with_races["workouts"]}
+    o_by = {x["date"]: x for x in raceless["workouts"]}
 
-    scheduled: List[_dt.date] = []
-    if start_date is not None and weeks is not None and days_of_week:
-        scheduled = scheduled_days(start_date, int(weeks), days_of_week)
-    effects = race_effects(resolved, scheduled) if scheduled else None
+    monday0 = start_date - _dt.timedelta(days=start_date.weekday())
+    last_day = monday0 + _dt.timedelta(days=7 * int(weeks) - 1)
+    # Attribution boundaries. A shortened day belongs to the next A race after
+    # it and a recovery day to the previous one, so neighbouring races cannot
+    # claim each other\'s work: without this, a demoted race would report the
+    # taper of the very A race that demoted it as its own.
+    a_days = sorted(_dt.date.fromisoformat(r["date"]) for r in base
+                    if r["priority"] == PRIORITY_A)
 
     out: List[dict] = []
-    for r in in_window:
-        day = r["date"]
-        iso = day.isoformat()
-        item: dict = {
-            "id": r.get("id"),
-            "date": iso,
-            "name": r.get("name"),
-            "priority": r["priority"],          # EFFECTIVE, post-resolution
-            "duration_min": r.get("duration_min"),
-            "demoted": bool(r.get("demoted")),
-            # Only set on a demotion: the earlier A race that took the taper.
-            "conflicts_with": None,
-            "separation_days": A_RACE_SEPARATION_DAYS,
-            # True when the plan would otherwise have prescribed a session on
-            # race day - i.e. the race really is displacing a workout.
-            "displaces_workout": day in scheduled,
-            "taper_from": None,
-            "taper_hard_from": None,
-            "recovery_dates": [],
-            "easy_dates": [],
-        }
-        if r.get("demoted"):
-            prior = [d for d in by_date if d < day]
-            item["conflicts_with"] = max(prior).isoformat() if prior else None
-        if effects is not None:
-            if r["priority"] == PRIORITY_A:
-                far = (day - _dt.timedelta(days=TAPER_FAR_DAYS)).isoformat()
-                if far in effects.taper:
-                    item["taper_from"] = far
-                    item["taper_hard_from"] = (
-                        day - _dt.timedelta(days=TAPER_NEAR_DAYS)
-                    ).isoformat()
-                after = [d for d in scheduled if d > day]
-                item["recovery_dates"] = [
-                    d.isoformat()
-                    for d in after[:recovery_sessions_for(r["duration_min"])]
-                    if d.isoformat() in effects.recovery
-                ]
-            else:
-                ride = {d.isoformat() for d in scheduled}
-                item["easy_dates"] = [
-                    d for d in (
-                        (day - _dt.timedelta(days=1)).isoformat(),
-                        (day + _dt.timedelta(days=1)).isoformat(),
-                    )
-                    if d in effects.easy_adjacent and d in ride
-                ]
+    for item in base:
+        item = dict(item)
+        day = _dt.date.fromisoformat(item["date"])
+        iso = item["date"]
+        prev_a = max([d for d in a_days if d < day], default=None)
+        next_a = min([d for d in a_days if d > day], default=None)
+
+        def _shorter(d: _dt.date) -> bool:
+            k = d.isoformat()
+            return (k in w_by and k in o_by
+                    and w_by[k]["duration_s"] < o_by[k]["duration_s"])
+
+        # Race day: the plan had a session here and now has none.
+        item["displaces_workout"] = iso in o_by and iso not in w_by
+
+        # Taper: days in the fortnight before this race whose session genuinely
+        # got shorter. Only an A race tapers, and only back as far as the
+        # previous A race. A hard day already at its feasible floor does not
+        # shorten and is therefore never claimed.
+        tapered: List[str] = []
+        if item["priority"] == PRIORITY_A:
+            tapered = [
+                (day - _dt.timedelta(days=off)).isoformat()
+                for off in range(TAPER_FAR_DAYS, 0, -1)
+                if (prev_a is None or day - _dt.timedelta(days=off) > prev_a)
+                and _shorter(day - _dt.timedelta(days=off))
+            ]
+        near_start = (day - _dt.timedelta(days=TAPER_NEAR_DAYS)).isoformat()
+        item["taper_from"] = tapered[0] if tapered else None
+        item["taper_hard_from"] = next(
+            (d for d in tapered if d >= near_start), None)
+
+        # Post-race recovery: days after an A race whose kind became a recovery
+        # spin, up to the next A race (which owns everything past it).
+        item["recovery_dates"] = []
+        if item["priority"] == PRIORITY_A:
+            item["recovery_dates"] = [
+                d for d in sorted(w_by)
+                if d > iso and (next_a is None or d < next_a.isoformat())
+                and d in o_by
+                and w_by[d]["type"] == "recovery" != o_by[d]["type"]
+            ]
+
+        # A B race\'s neighbours: a day either side whose kind actually changed
+        # from interval work to endurance. Only a B race does this, so an A
+        # race next to one cannot claim it.
+        item["easy_dates"] = []
+        if item["priority"] == PRIORITY_B:
+            item["easy_dates"] = [
+                d for d in ((day - _dt.timedelta(days=1)).isoformat(),
+                            (day + _dt.timedelta(days=1)).isoformat())
+                if d in w_by and d in o_by
+                and w_by[d]["type"] == "endurance"
+                and o_by[d]["type"] in HARD_KINDS
+            ]
+
+        claimed = sorted(
+            set(tapered) | set(item["recovery_dates"]) | set(item["easy_dates"])
+            | ({iso} if item["displaces_workout"] else set())
+        )
+        item["affects"] = claimed
+        item["outside_plan"] = not (monday0 <= day <= last_day)
+        # A race outside the span that changes nothing inside it is not this
+        # plan\'s business at all.
+        if item["outside_plan"] and not claimed:
+            continue
+
+        item["stale"] = bool(stored is not None and any(
+            not _workout_matches(stored.get(d), w_by.get(d)) for d in claimed
+        ))
         out.append(item)
     return out
 
