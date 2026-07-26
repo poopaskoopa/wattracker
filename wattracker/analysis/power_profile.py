@@ -122,6 +122,16 @@ def _is_recent(start_time, cutoff: _dt.datetime, now: _dt.datetime) -> bool:
     return parsed is not None and cutoff <= parsed <= now
 
 
+def _insufficient(rationale: str) -> dict:
+    return {
+        "label": "Insufficient data",
+        "key": "insufficient_data",
+        "rationale": rationale,
+        "caveat": METHODOLOGY_CAVEAT,
+        "indices": None,
+    }
+
+
 def classify_phenotype(all_time: dict[int, float]) -> dict:
     """Describe curve shape with indices relative to a balanced reference rider.
 
@@ -163,17 +173,11 @@ def classify_phenotype(all_time: dict[int, float]) -> dict:
         or anchor is None
         or len(valid_records) < 6
     ):
-        return {
-            "label": "Insufficient data",
-            "key": "insufficient_data",
-            "rationale": (
-                "Broader record coverage is needed: both 15- and 30-second "
-                "bests, at least two 1–5-minute bests, a 20-minute best, and "
-                "six durations overall."
-            ),
-            "caveat": METHODOLOGY_CAVEAT,
-            "indices": None,
-        }
+        return _insufficient(
+            "Broader record coverage is needed: both 15- and 30-second "
+            "bests, at least two 1–5-minute bests, a 20-minute best, and "
+            "six durations overall."
+        )
 
     short_ratio = sum(short) / len(short) / anchor
     punch_ratio = sum(punch) / len(punch) / anchor
@@ -187,6 +191,18 @@ def classify_phenotype(all_time: dict[int, float]) -> dict:
     retention_index = (
         retention / REFERENCE_RETENTION if retention is not None else None
     )
+    # A denormal 20-minute anchor overflows the ratios to infinity, which would
+    # then be handed to the prescription consumer and to any JSON encoder. Such
+    # a record is not a real effort, so decline to classify rather than emit it.
+    if not all(
+        math.isfinite(index)
+        for index in (short_index, punch_index, retention_index)
+        if index is not None
+    ):
+        return _insufficient(
+            "The recorded bests are not on a plausible scale relative to the "
+            "20-minute best."
+        )
 
     if short_index >= 1.10 and short_index >= punch_index * 1.12:
         label = "Sprinter"
