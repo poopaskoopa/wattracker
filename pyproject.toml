@@ -21,7 +21,11 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-dev = ["pytest>=8.0", "httpx>=0.27"]
+# playwright drives the real UI in Chromium (tests/test_dom_smoke.py). It is
+# optional: the browser binary is a ~150MB download outside pip
+# (`playwright install chromium`), so machines and CI without it simply skip
+# those tests instead of failing.
+dev = ["pytest>=8.0", "httpx>=0.27", "playwright>=1.47"]
 # Real-hardware Bluetooth riding. Not needed for core install or the test suite;
 # requires a Bluetooth adapter + trainer/sensors to actually use.
 ble = ["bleak>=0.22"]
@@ -50,3 +54,9 @@ wattracker = [
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+markers = [
+    # Real-browser DOM tests. They run by default (they add only a few
+    # seconds) and skip themselves when playwright/chromium is absent.
+    # Only these:  pytest -m browser      Everything else:  pytest -m "not browser"
+    "browser: drives the app in a real Chromium via playwright",
+]
