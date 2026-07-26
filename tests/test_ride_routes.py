@@ -300,6 +300,40 @@ def test_ride_chart_styles_support_live_metrics_and_fullscreen(client):
     assert ".ride-chart-fullscreen-fallback .ride-chart-canvas {\n    height: calc(100vh - 5.5rem);" in r.text
 
 
+def test_ride_chart_device_indicator_styles(client):
+    r = client.get("/static/style.css")
+    assert r.status_code == 200
+    assert ".ride-chart-devices { position: absolute; z-index: 2; right: 0.35rem;" in r.text
+    assert "pointer-events: none" in r.text
+    assert '.ride-chart-devices .device-chip[data-role="power"] { --device-color: #ffd166;' in r.text
+    assert '.ride-chart-devices .device-chip[data-role="hr"] { --device-color: #ff4d8d;' in r.text
+    assert '.ride-chart-devices .device-chip[data-role="trainer"] { --device-color: #4dff9b;' in r.text
+    assert ".ride-chart-devices .device-chip.device-lit" in r.text
+    assert ".ride-chart-chip.erg-dark, .ride-chart-chip.device-dark" in r.text
+    assert ".ride-chart-devices .device-chip[hidden] { display: none; }" in r.text
+
+
+def test_ride_page_shows_sensor_indicators_on_the_chart(client, monkeypatch):
+    _register(client)
+    monkeypatch.setattr(bledevices, "bluetooth_available", lambda: (True, "ok"))
+    r = client.get("/ride")
+    assert r.status_code == 200
+    assert 'id="deviceIndicators"' in r.text
+    for role in ("power", "hr", "trainer"):
+        assert 'data-role="' + role + '"' in r.text
+    # The chips live inside the chart canvas, opposite the ERG chip.
+    assert r.text.index('class="ride-chart-canvas"') < r.text.index('id="deviceIndicators"')
+    assert r.text.index('id="deviceIndicators"') < r.text.index('id="rideChart"')
+    # A role is only ever added to seenRoles, so a dropped sensor goes dark
+    # rather than vanishing from the corner.
+    assert "var seenRoles = {};" in r.text
+    assert "function updateDeviceIndicators()" in r.text
+    assert "updateDeviceIndicators();" in r.text
+    assert "chip.hidden = !seenRoles[role];" in r.text
+    assert 'chip.classList.toggle("device-lit", !!live[role]);' in r.text
+    assert "seenRoles = {}" not in r.text.split("var seenRoles = {};", 1)[1]
+
+
 def test_ride_status_endpoint(client, monkeypatch):
     _force_bt_unavailable(monkeypatch)
     _register(client)

@@ -111,8 +111,23 @@
                 <span><strong id="clockBlock">0:00</strong><small>Block left</small></span>
                 <span><strong id="clockTotal">0:00</strong><small>Workout left</small></span>
             </div>
-            <div id="ergIndicator" class="ride-chart-erg erg-dark" aria-hidden="true">
+            <div id="ergIndicator" class="ride-chart-chip ride-chart-erg erg-dark"
+                 aria-hidden="true">
                 <span class="erg-led"></span><span class="erg-label">ERG</span>
+            </div>
+            <div id="deviceIndicators" class="ride-chart-devices" aria-hidden="true">
+                <div class="ride-chart-chip device-chip device-dark" data-role="power"
+                     title="Power" hidden>
+                    <span class="erg-led"></span><span class="device-glyph">&#9889;</span>
+                </div>
+                <div class="ride-chart-chip device-chip device-dark" data-role="hr"
+                     title="Heart rate" hidden>
+                    <span class="erg-led"></span><span class="device-glyph">&#9829;</span>
+                </div>
+                <div class="ride-chart-chip device-chip device-dark" data-role="trainer"
+                     title="Trainer" hidden>
+                    <span class="erg-led"></span><span class="device-glyph">&#9881;</span>
+                </div>
             </div>
             <div class="ride-chart-metrics" aria-hidden="true">
                 <span class="metric-power"><strong id="chartPowerValue">&mdash;</strong><small>W</small></span>
@@ -156,6 +171,9 @@
     var cuesPlayed = {};
     var chartMaxX = 0;
     var connectedAddresses = {};
+    // Roles that have connected at least once this page session. Never cleared:
+    // a sensor that drops mid-ride has to go dark, not disappear.
+    var seenRoles = {};
     var pendingDisconnects = {};
     var ergAvailable = false, ergEnabled = false, ergPending = false;
     function readCache() {
@@ -293,7 +311,18 @@
         }
         return steps[steps.length - 1];
     }
-    function chartOptions(duration) {
+    // The target trace is what the rider reads, so it should sit in the body of
+    // the axis instead of skimming the lid. Auto-scaling to the data put a
+    // sprint's 200%-FTP prescription hard against the top of the frame with
+    // nowhere for the actual effort to go - and a real neuromuscular sprint
+    // routinely lands far above its nominal target. Park the highest prescribed
+    // watt at about two thirds height and leave the rest as overshoot room.
+    // suggestedMax, not max, so a spike past that still expands the axis.
+    function powerAxisMax(peakTarget) {
+        if (!(peakTarget > 0)) return 200;
+        return Math.ceil(peakTarget / 0.65 / 50) * 50;
+    }
+    function chartOptions(duration, peakTarget) {
         var axisText = themeColor("--text-bright", "#f5f7fa");
         var titleText = themeColor("--text", "#e6e6e6");
         var tickMark = themeColor("--muted", "#8a94a0");
@@ -312,6 +341,7 @@
                     stepSize: timeStepSize(duration), maxTicksLimit: 14,
                     autoSkip: true, maxRotation: 0}},
             y: {beginAtZero: true, position: "left",
+                suggestedMax: powerAxisMax(peakTarget),
                 title: {display: true, text: "Power (W)", color: titleText, font: titleFont},
                 // The watt range is only known once the ride produces data, so
                 // the step is chosen here (after the limits, before the ticks
@@ -419,6 +449,10 @@
             prescribed.push({x: block.start, y: block.watts_start});
             prescribed.push({x: block.end, y: block.watts_end});
         });
+        var peakTarget = 0;
+        prescribed.forEach(function (point) {
+            if (Number.isFinite(point.y) && point.y > peakTarget) peakTarget = point.y;
+        });
         livePower = []; liveCadence = []; liveHr = [];
         smoothPower = []; smoothCadence = []; smoothHr = [];
         // Without this a second ride would open with the tail of the first one
@@ -459,7 +493,7 @@
                 {label: "Heart rate", data: smoothHr, yAxisID: "metrics",
                     borderColor: "rgba(255, 77, 141, 0.7)", pointRadius: 0, borderWidth: 2,
                     tension: 0.25, order: 3}
-            ]}, options: chartOptions(workoutDuration)});
+            ]}, options: chartOptions(workoutDuration, peakTarget)});
     }
     function appendOrReplace(points, point) {
         if (points.length && points[points.length - 1].x === point.x) {
@@ -943,6 +977,24 @@
                 button.disabled = !connected || !ws;
                 if (!pendingDisconnects[row.dataset.address]) button.textContent = "Disconnect";
             }
+        });
+        updateDeviceIndicators();
+    }
+    function updateDeviceIndicators() {
+        var live = {};
+        Object.keys(connectedAddresses).forEach(function (address) {
+            (connectedAddresses[address] || []).forEach(function (role) {
+                live[role] = true;
+                seenRoles[role] = true;
+            });
+        });
+        document.querySelectorAll("#deviceIndicators .device-chip").forEach(function (chip) {
+            var role = chip.dataset.role;
+            // A rider with no strap never sees an HR chip at all.
+            chip.hidden = !seenRoles[role];
+            chip.title = roleLabel(role) + (live[role] ? ": connected" : ": disconnected");
+            chip.classList.toggle("device-lit", !!live[role]);
+            chip.classList.toggle("device-dark", !live[role]);
         });
     }
     function uncheckDeviceRoles(address) {
