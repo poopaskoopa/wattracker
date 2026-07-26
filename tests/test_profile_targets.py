@@ -18,7 +18,7 @@ import xml.etree.ElementTree as ET
 import pytest
 
 from wattracker import db
-from wattracker.metrics import profile_cache
+from wattracker.metrics import profile_store
 from wattracker.metrics.rider import RiderMetrics
 from wattracker.prescribe import plan as planmod
 from wattracker.prescribe import planner, reflow, zwo
@@ -297,14 +297,28 @@ def _seed_plan(user_id, hours=6.0, start=MONDAY, weeks=4):
     return plan_id
 
 
-def _use_profile(monkeypatch, profile):
-    """Pin the profile every consumer sees.
+def _store_profile(user_id, profile):
+    """Write the snapshot every consumer will read.
 
-    Reflow, adapt and the web routes all read through ``metrics.profile_cache``
-    (deriving a profile decompresses months of streams), so patching that one
-    accessor pins the rider everywhere at once.
+    Reflow, adapt and the web routes all read the STORED profile
+    (``metrics.profile_store``), written by the daily sweep and by activity
+    import - so a test pins a rider by writing the row, which is the same path
+    production takes.
     """
-    monkeypatch.setattr(profile_cache, "for_user", lambda *a, **k: profile)
+    db.save_rider_profile(
+        user_id,
+        {f: getattr(profile, f, None) for f in db.RIDER_PROFILE_FIELDS},
+    )
+
+
+def _measures_as(monkeypatch, profile):
+    """Make the expensive COMPUTATION yield ``profile``.
+
+    For tests that exercise a writer (the sweep, an import): they refresh the
+    snapshot themselves, so pinning the stored row would just be overwritten.
+    """
+    monkeypatch.setattr(profile_store.rider, "for_user",
+                        lambda uid, state=None, now=None: profile)
 
 
 def _rows(user_id, plan_id):
@@ -321,12 +335,12 @@ def _sql(statement, *params):
 
 
 def test_reflow_rewrites_workouts_the_profile_changed(user_id, monkeypatch):
-    _use_profile(monkeypatch, UNMEASURED)
+    _store_profile(user_id, UNMEASURED)
     plan_id = _seed_plan(user_id)
     today = NOW.date().isoformat()
     before = {r["id"]: r for r in _rows(user_id, plan_id)}
 
-    _use_profile(monkeypatch, MEASURED)
+    _store_profile(user_id, MEASURED)
     result = reflow.reflow_plan(user_id, plan_id, now=NOW)
 
     assert result["status"] == "ok"
@@ -341,7 +355,7 @@ def test_reflow_rewrites_workouts_the_profile_changed(user_id, monkeypatch):
 def test_reflow_with_a_profile_is_idempotent(user_id, monkeypatch):
     """The property that makes an unattended DAILY reflow safe: once converged,
     re-running changes nothing and renames no .zwo file."""
-    _use_profile(monkeypatch, MEASURED)
+    _store_profile(user_id, MEASURED)
     plan_id = _seed_plan(user_id)
     first = reflow.reflow_plan(user_id, plan_id, now=NOW)
     snapshot = _rows(user_id, plan_id)
@@ -361,13 +375,13 @@ def test_daily_reflow_does_not_churn_on_measurement_noise(user_id, monkeypatch):
     values were quantized this rewrote every future workout - and renamed every
     exported .zwo - nightly, forever, with the rider unchanged.
     """
-    _use_profile(monkeypatch, RiderMetrics(vo2_ratio=1.2000, sprint_ratio=4.35))
+    _store_profile(user_id, RiderMetrics(vo2_ratio=1.2000, sprint_ratio=4.35))
     plan_id = _seed_plan(user_id)
     reflow.reflow_plan(user_id, plan_id, now=NOW)  # converge
     converged = _rows(user_id, plan_id)
 
     # A day later: same rider, a new ride in and an old one out of the window.
-    _use_profile(monkeypatch, RiderMetrics(vo2_ratio=1.2009, sprint_ratio=4.36))
+    _store_profile(user_id, RiderMetrics(vo2_ratio=1.2009, sprint_ratio=4.36))
     result = reflow.reflow_plan(user_id, plan_id, now=NOW)
 
     assert (result["updated"], result["inserted"], result["deleted"]) == (0, 0, 0)
@@ -376,12 +390,12 @@ def test_daily_reflow_does_not_churn_on_measurement_noise(user_id, monkeypatch):
 
 def test_reflow_still_rewrites_on_a_real_capacity_change(user_id, monkeypatch):
     """The other half: quantization must not swallow genuine improvement."""
-    _use_profile(monkeypatch, RiderMetrics(vo2_ratio=1.2000))
+    _store_profile(user_id, RiderMetrics(vo2_ratio=1.2000))
     plan_id = _seed_plan(user_id)
     reflow.reflow_plan(user_id, plan_id, now=NOW)
     before = {r["id"]: r for r in _rows(user_id, plan_id)}
 
-    _use_profile(monkeypatch, RiderMetrics(vo2_ratio=1.2600))
+    _store_profile(user_id, RiderMetrics(vo2_ratio=1.2600))
     result = reflow.reflow_plan(user_id, plan_id, now=NOW)
 
     changed = [r for r in _rows(user_id, plan_id)
@@ -397,7 +411,7 @@ def test_reflow_agrees_with_a_directly_built_session(user_id, monkeypatch):
     session would disagree by a hair and reflow would rewrite it every run.
     """
     profile = RiderMetrics(vo2_ratio=1.2345, sprint_ratio=4.37)
-    _use_profile(monkeypatch, profile)
+    _store_profile(user_id, profile)
     plan_id = _seed_plan(user_id)
     reflow.reflow_plan(user_id, plan_id, now=NOW)
 
@@ -410,7 +424,7 @@ def test_reflow_agrees_with_a_directly_built_session(user_id, monkeypatch):
 
 def test_reflow_with_a_profile_still_preserves_adaptations(user_id, monkeypatch):
     """A daily profile-driven reflow must not undo adapt.py's work."""
-    _use_profile(monkeypatch, UNMEASURED)
+    _store_profile(user_id, UNMEASURED)
     plan_id = _seed_plan(user_id)
     today = NOW.date().isoformat()
     target = next(r for r in _rows(user_id, plan_id)
@@ -418,7 +432,7 @@ def test_reflow_with_a_profile_still_preserves_adaptations(user_id, monkeypatch)
     _sql("UPDATE plan_workouts SET adapted = 'recovery', "
          "adapted_at = '2026-07-15T09:00:00' WHERE id = ?", target["id"])
 
-    _use_profile(monkeypatch, MEASURED)
+    _store_profile(user_id, MEASURED)
     result = reflow.reflow_plan(user_id, plan_id, now=NOW)
 
     kept = db.get_plan_workout(user_id, target["id"])
@@ -431,12 +445,12 @@ def test_reflow_reads_the_profile_fresh_every_time(user_id, monkeypatch):
     """The profile is an input, never stored in the recipe - so a rider whose
     measured capacity moves gets a new prescription without re-creating the
     plan."""
-    _use_profile(monkeypatch, UNMEASURED)
+    _store_profile(user_id, UNMEASURED)
     plan_id = _seed_plan(user_id)
     reflow.reflow_plan(user_id, plan_id, now=NOW)
     baseline = _rows(user_id, plan_id)
 
-    _use_profile(monkeypatch, RiderMetrics(vo2_ratio=1.30))
+    _store_profile(user_id, RiderMetrics(vo2_ratio=1.30))
     reflow.reflow_plan(user_id, plan_id, now=NOW)
     grown = _rows(user_id, plan_id)
 
@@ -456,16 +470,28 @@ def _neutralize_sweep(monkeypatch):
     return servermod
 
 
+def _measures_as(monkeypatch, profile):
+    """Pin what the sweep's profile REFRESH will compute.
+
+    The sweep recomputes and stores the snapshot itself, so a pre-stored row
+    would simply be overwritten - the writer is the seam to pin here.
+    """
+    monkeypatch.setattr(profile_store.rider, "for_user",
+                        lambda uid, state=None, now=None: profile)
+
+
 def test_daily_sweep_reflows_the_active_plan(user_id, monkeypatch):
     """The sweep has no `now` override, so the plan has to straddle the real
     date for its future rows to be rewritable."""
     servermod = _neutralize_sweep(monkeypatch)
-    _use_profile(monkeypatch, UNMEASURED)
+    _store_profile(user_id, UNMEASURED)
     today = utc_today()
     plan_id = _seed_plan(user_id, start=today - dt.timedelta(days=today.weekday()),
                          weeks=6)
     before = {r["id"]: r for r in _rows(user_id, plan_id)}
-    _use_profile(monkeypatch, MEASURED)
+    # The rider has since been measured; the sweep refreshes the snapshot and
+    # then reflows against it, in that order.
+    _measures_as(monkeypatch, MEASURED)
 
     totals = servermod.run_daily_maintenance()
 

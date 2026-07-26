@@ -132,7 +132,8 @@ def test_export_route_persists_only_after_success(user_id, monkeypatch, tmp_path
         lambda *args, **kwargs: {"paths": [str(output)]},
     )
     monkeypatch.setattr(servermod.pipeline, "build_state", lambda uid: type("S", (), {"ftp": 200})())
-    monkeypatch.setattr(servermod, "plan_workout", lambda state, minutes: session)
+    monkeypatch.setattr(servermod, "plan_workout",
+                        lambda state, minutes, profile=None: session)
     monkeypatch.setattr(servermod.llm, "shape_session", lambda value, state: value)
     with TestClient(app) as client:
         client.post(

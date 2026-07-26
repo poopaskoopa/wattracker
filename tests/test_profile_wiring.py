@@ -12,6 +12,7 @@ alone:
 from __future__ import annotations
 
 import datetime as dt
+import threading
 import xml.etree.ElementTree as ET
 
 import pytest
@@ -22,7 +23,7 @@ from fastapi.testclient import TestClient  # noqa: E402
 from wattracker import db
 from wattracker.analysis.state import TrainingState
 from wattracker.ble.runner import FREERIDE_ERG_FRACTION, RideController, flatten_session
-from wattracker.metrics import profile_cache
+from wattracker.metrics import profile_store
 from wattracker.metrics.rider import RiderMetrics
 from wattracker.prescribe import adapt, plan as planmod, reflow, zwo
 from wattracker.prescribe.planner import (
@@ -121,6 +122,49 @@ def test_ride_preview_quotes_no_wattage_for_a_sprint_effort(client):
                for s in labelled)
 
 
+def test_sprint_type_info_advertises_no_work_wattage(client):
+    """The picker meta line read ">150% FTP - 375 W" for a targetless session."""
+    from wattracker.prescribe.planner import workout_type_info
+
+    assert workout_type_info("sprint")["work"] is None
+    uid = _register(client, "picker")
+    db.save_user_settings(uid, {"ftp": 250})
+    info = client.get("/ride/workout/preview?type=sprint&minutes=60").json()["type_info"]
+    assert info["work"] is None and info["work_watts"] is None
+    # Every other type still publishes one.
+    other = client.get("/ride/workout/preview?type=vo2max&minutes=60").json()
+    assert other["type_info"]["work_watts"] == 280
+
+
+def test_live_ride_reports_no_target_during_a_sprint_effort():
+    """The in-ride readout must not announce a target on a free block.
+
+    RideController still holds ERG resistance there - the trainer needs a
+    number - but the state flags it so the UI can say MAX instead of quoting
+    the resistance as a goal (including to screen readers).
+    """
+    session = build_workout("sprint", 45, profile=STRONG)
+    ctl = RideController(session, ftp=250.0, autosave=False)
+    blocks, _ = flatten_session(session)
+    free_start = next(b[0] for b in blocks if b[2] == "free")
+    steady_start = next(b[0] for b in blocks if b[2] == "const")
+
+    assert ctl.target_is_free(free_start + 1) is True
+    assert ctl.target_is_free(steady_start + 1) is False
+
+    ctl.elapsed = free_start + 1
+    assert ctl.state()["target_free"] is True
+    ctl.elapsed = steady_start + 1
+    assert ctl.state()["target_free"] is False
+
+
+def test_live_ride_state_flags_nothing_free_in_a_targeted_workout():
+    ctl = RideController(build_workout("vo2max", 60), ftp=250.0, autosave=False)
+    for t in (0, 100, 1500, 3000):
+        ctl.elapsed = t
+        assert ctl.state()["target_free"] is False
+
+
 def test_ride_preview_still_reports_targets_for_targeted_sessions(client):
     uid = _register(client, "vo2rider")
     db.save_user_settings(uid, {"ftp": 250})
@@ -155,10 +199,22 @@ def _seed_plan(user_id, profile=None, weeks=4):
     return plan_id
 
 
-def _use_profile(monkeypatch, profile):
-    """Pin the profile every consumer reads (they all go through the cache)."""
-    monkeypatch.setattr(profile_cache, "for_user",
-                        lambda *a, **k: profile)
+def _store_profile(user_id, profile):
+    """Write the snapshot every consumer will read (the real path)."""
+    db.save_rider_profile(
+        user_id,
+        {f: getattr(profile, f, None) for f in db.RIDER_PROFILE_FIELDS},
+    )
+
+
+def _measures_as(monkeypatch, profile):
+    """Make the expensive COMPUTATION yield ``profile``.
+
+    For tests that exercise a WRITER (the sweep, an import): they refresh the
+    snapshot themselves, so a pre-stored row would just be overwritten.
+    """
+    monkeypatch.setattr(profile_store.rider, "for_user",
+                        lambda uid, state=None, now=None: profile)
 
 
 def test_plan_detail_rebuild_matches_the_stored_zwo(client, monkeypatch):
@@ -166,7 +222,7 @@ def test_plan_detail_rebuild_matches_the_stored_zwo(client, monkeypatch):
     stored .zwo had been generated from the rider's measured 5-min power - a
     ~30 W gap at FTP 250 on the same workout."""
     uid = _register(client, "detail")
-    _use_profile(monkeypatch, STRONG)
+    _store_profile(uid, STRONG)
     plan_id = _seed_plan(uid, profile=STRONG)
 
     for row in db.plan_workouts_for_plan(uid, plan_id, include_zwo=True):
@@ -182,7 +238,7 @@ def test_ride_session_matches_the_stored_zwo(client, monkeypatch):
     """The in-app ERG ride and the exported .zwo must be one workout."""
     uid = _register(client, "erg")
     db.save_user_settings(uid, {"ftp": 250})
-    _use_profile(monkeypatch, STRONG)
+    _store_profile(uid, STRONG)
     plan_id = _seed_plan(uid, profile=STRONG)
     row = next(r for r in db.plan_workouts_for_plan(uid, plan_id, include_zwo=True)
                if r["type"] == "vo2max")
@@ -205,7 +261,7 @@ def test_ride_session_matches_the_stored_zwo(client, monkeypatch):
 def test_generated_plan_is_born_profile_aware(client, monkeypatch):
     """Otherwise the first nightly reflow rewrites the plan the user just made."""
     uid = _register(client, "creator")
-    _use_profile(monkeypatch, STRONG)
+    _store_profile(uid, STRONG)
     client.post("/generate/plan", data={
         "name": "P", "weeks": "3", "hours_per_week": "6", "days": ["0", "2", "4"],
         "hit_days_per_week": "1", "model": "polarized",
@@ -217,62 +273,176 @@ def test_generated_plan_is_born_profile_aware(client, monkeypatch):
     assert (result["updated"], result["inserted"], result["deleted"]) == (0, 0, 0)
 
 
-# --------------------------------------------------- the profile cache itself
-def test_profile_cache_serves_repeats_without_recomputing(user_id, monkeypatch):
-    calls = []
-    profile_cache.invalidate()
+# ------------------------------------------- the stored profile (not a cache)
+# The profile depends on WALL-CLOCK time, not only on the activity set: FTP
+# decays across a layoff and HRmax detection has a rolling lookback. An
+# in-process cache keyed on the activity set therefore served a 30-day-stale
+# rider forever - the reason this is a stored snapshot refreshed by writers.
+def test_detraining_changes_the_prescription_without_a_new_activity(user_id,
+                                                                    monkeypatch):
+    """Regression: 30 days off moved FTP 269.7 -> 238.0 with no new rides.
 
-    def counted(uid, state=None, now=None):
-        calls.append(uid)
-        return RiderMetrics(vo2_ratio=1.20)
+    The old cache's key never moved, so it kept prescribing 1.16 x 269.7 while
+    the rider's FTP had fallen to 238 - a 33 W error that never expired.
+    """
+    day0 = RiderMetrics(ftp=269.7, vo2_ratio=1.261)
+    day30 = RiderMetrics(ftp=238.0, vo2_ratio=1.429)
 
-    monkeypatch.setattr(profile_cache.rider, "for_user", counted)
-    for _ in range(5):
-        assert profile_cache.for_user(user_id).vo2_ratio == 1.20
-    assert len(calls) == 1
+    _measures_as(monkeypatch, day0)
+    profile_store.refresh(user_id)
+    fresh = profile_store.for_user(user_id)
+    assert fresh.ftp == pytest.approx(269.7)
+    before = build_workout("vo2max", 60, profile=fresh)
+
+    # A month passes. No ride is imported; only the wall clock and the decayed
+    # FTP estimate move - exactly the case the cache could not see.
+    _measures_as(monkeypatch, day30)
+    profile_store.refresh(user_id)
+    after_profile = profile_store.for_user(user_id)
+
+    assert after_profile.ftp == pytest.approx(238.0)
+    assert after_profile.vo2_ratio == pytest.approx(1.429)
+    after = build_workout("vo2max", 60, profile=after_profile)
+    assert zwo.zwo_string(after) != zwo.zwo_string(before)
 
 
-def test_profile_cache_notices_a_new_activity(user_id, monkeypatch):
-    calls = []
-    profile_cache.invalidate()
-    monkeypatch.setattr(profile_cache.rider, "for_user",
-                        lambda uid, state=None, now=None: calls.append(uid)
-                        or RiderMetrics())
-    profile_cache.for_user(user_id)
+def test_an_ftp_history_write_reaches_the_next_prescription(user_id):
+    """FTP comes from ftp_history, which no activity-set key can see."""
+    from wattracker.ingest import importer
+
     db.insert_activity(user_id, {
         "dedup_hash": "h1", "filename": "r.fit",
         "start_time": "2026-07-14T08:00:00", "duration_s": 3600,
-        "distance_m": 0.0, "avg_power": 200.0, "avg_hr": 140.0, "np": 200.0,
-        "if_": 0.8, "tss": 60.0, "streams": {"power": [200] * 60},
+        "distance_m": 0.0, "avg_power": 250.0, "avg_hr": 150.0, "np": 250.0,
+        "if_": 1.0, "tss": 100.0, "streams": {"power": [250] * 3600},
     })
-    profile_cache.for_user(user_id)
-    assert len(calls) == 2
+    db.add_ftp_entry(user_id, "2026-07-14", 300.0, "manual")
+    profile_store.refresh(user_id)
+    assert profile_store.for_user(user_id).ftp == pytest.approx(300.0)
+
+    # Same activity set, new FTP row: the snapshot must move with it.
+    db.add_ftp_entry(user_id, "2026-07-15", 240.0, "manual")
+    profile_store.refresh(user_id)
+    assert profile_store.for_user(user_id).ftp == pytest.approx(240.0)
+    assert importer.current_ftp(user_id) == pytest.approx(240.0)
 
 
-def test_profile_cache_notices_a_settings_change(user_id, monkeypatch):
-    calls = []
-    profile_cache.invalidate()
-    monkeypatch.setattr(profile_cache.rider, "for_user",
-                        lambda uid, state=None, now=None: calls.append(uid)
-                        or RiderMetrics())
-    profile_cache.for_user(user_id)
-    db.save_user_settings(user_id, {"weight_kg": 71})
-    profile_cache.for_user(user_id)
-    assert len(calls) == 2
+def test_reads_never_compute_however_many_there_are(user_id, monkeypatch):
+    """No compute-on-read path means no cold miss and no thundering herd.
+
+    The old cache let N concurrent callers each trigger a full computation;
+    here a read is one indexed row read and the expensive function is simply
+    not reachable from it.
+    """
+    computed = []
+    monkeypatch.setattr(profile_store.rider, "for_user",
+                        lambda uid, state=None, now=None: computed.append(uid)
+                        or RiderMetrics(vo2_ratio=1.20))
+    _store_profile(user_id, RiderMetrics(vo2_ratio=1.20))
+
+    results = []
+    threads = [threading.Thread(target=lambda: results.append(
+        profile_store.for_user(user_id))) for _ in range(16)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    assert len(results) == 16
+    assert all(r.vo2_ratio == pytest.approx(1.20) for r in results)
+    assert computed == []
 
 
-def test_profile_cache_bypasses_for_explicit_arguments(user_id, monkeypatch):
-    calls = []
-    profile_cache.invalidate()
-    monkeypatch.setattr(profile_cache.rider, "for_user",
-                        lambda uid, state=None, now=None: calls.append((state, now))
-                        or RiderMetrics())
-    profile_cache.for_user(user_id)
-    profile_cache.for_user(user_id, state=TrainingState(ftp=250.0))
-    profile_cache.for_user(user_id, now=NOW)
-    assert len(calls) == 3  # neither served from nor written to the cache
-    profile_cache.for_user(user_id)
-    assert len(calls) == 3
+def test_v21_migration_adds_the_profile_table_and_keeps_data(tmp_path):
+    """The snapshot arrives by migration, not by wiping the user's database."""
+    path = str(tmp_path / "migration.db")
+    db.init_db(path)
+    uid = db.create_user("kept", "hash", path)
+    import sqlite3
+
+    conn = sqlite3.connect(path)
+    conn.execute("DROP TABLE rider_profile")
+    conn.execute("PRAGMA user_version=21")
+    conn.commit()
+    conn.close()
+
+    db.init_db(path)
+
+    conn = sqlite3.connect(path)
+    assert conn.execute("PRAGMA user_version").fetchone()[0] == db.SCHEMA_VERSION
+    assert conn.execute(
+        "SELECT name FROM sqlite_master WHERE type='table' AND name='rider_profile'"
+    ).fetchone()
+    assert conn.execute("SELECT username FROM users WHERE id=?",
+                        (uid,)).fetchone()[0] == "kept"
+    # Not backfilled: an absent row prescribes the population constants, which
+    # is exactly what the app did before profiles existed.
+    assert conn.execute("SELECT COUNT(*) FROM rider_profile").fetchone()[0] == 0
+    conn.close()
+
+
+def test_stored_profile_round_trips_every_field(user_id):
+    full = RiderMetrics(
+        ftp=250.0, weight_kg=72.5, hr_max=189.0, hr_max_source="measured",
+        n_hr_activities=12, cp=245.0, wprime=21000.0, wprime_j_per_kg=290.0,
+        cp_w_per_kg=3.4, peak_5s=1088.0, peak_60s=520.0, peak_300s=300.0,
+        sprint_ratio=4.35, vo2_ratio=1.20,
+    )
+    _store_profile(user_id, full)
+    assert profile_store.for_user(user_id) == full
+
+
+def test_a_missing_snapshot_reads_as_unmeasured(user_id):
+    """"Not computed yet" prescribes the population constants, not nonsense."""
+    assert db.get_rider_profile(user_id) is None
+    profile = profile_store.for_user(user_id)
+    assert profile.vo2_ratio is None and profile.sprint_ratio is None
+    assert zwo.zwo_string(build_workout("vo2max", 60, profile=profile)) == \
+        zwo.zwo_string(build_workout("vo2max", 60))
+
+
+def test_snapshot_records_when_it_was_computed(user_id, monkeypatch):
+    """Staleness has to be inspectable, which is half the point of storing it."""
+    assert profile_store.computed_at(user_id) is None
+    _measures_as(monkeypatch, RiderMetrics(vo2_ratio=1.20))
+    profile_store.refresh(user_id)
+    stamp = profile_store.computed_at(user_id)
+    assert stamp and stamp.startswith("20")
+
+
+def test_refresh_keeps_the_previous_snapshot_when_computation_fails(user_id,
+                                                                    monkeypatch):
+    """Stale but coherent beats empty: the next sweep tries again."""
+    _store_profile(user_id, RiderMetrics(vo2_ratio=1.20))
+
+    def boom(*a, **k):
+        raise RuntimeError("stream decompression failed")
+
+    monkeypatch.setattr(profile_store.rider, "for_user", boom)
+    profile_store.refresh(user_id)  # must not raise
+    assert profile_store.for_user(user_id).vo2_ratio == pytest.approx(1.20)
+
+
+def test_import_refreshes_the_snapshot(user_id, monkeypatch):
+    """A new ride can set a new 5s or 5min peak; the plan must see it."""
+    from wattracker.ingest import importer
+
+    _measures_as(monkeypatch, RiderMetrics(vo2_ratio=1.25, sprint_ratio=4.35))
+    monkeypatch.setattr(importer, "evaluate_ftp", lambda *a, **k: False)
+    monkeypatch.setattr(importer, "match_plan_completions", lambda *a, **k: 0)
+    monkeypatch.setattr(importer, "ingest_file", lambda *a, **k: 1)
+    monkeypatch.setattr(importer.db, "record_scanned_file", lambda *a, **k: None)
+    assert db.get_rider_profile(user_id) is None
+
+    import os
+    import tempfile
+    folder = tempfile.mkdtemp()
+    open(os.path.join(folder, "ride.fit"), "wb").write(b"x")
+    importer.scan_activities(user_id, directory=folder)
+
+    stored = profile_store.for_user(user_id)
+    assert stored.vo2_ratio == pytest.approx(1.25)
+    assert stored.sprint_ratio == pytest.approx(4.35)
 
 
 # -------------------------- defect 2: the nightly adapt <-> reflow ping-pong
@@ -335,6 +505,54 @@ def test_adapt_reports_what_it_skipped_for_a_race(user_id):
         user_id, TrainingState(ftp=250.0, tsb=-30.0, overreach=True), NOW)
     assert summary["adjusted"] == 0
     assert summary["skipped_raced"] > 0
+
+
+def test_the_banner_explains_a_race_skip(user_id):
+    """Silently doing nothing reads as a broken adaptation - say why."""
+    _seed_plan(user_id)
+    db.add_race_date(user_id, (NOW.date() + dt.timedelta(days=10)).isoformat(),
+                     priority="A", name="Nationals", duration_min=120)
+    state = TrainingState(ftp=250.0, tsb=-30.0, overreach=True)
+    summary = adapt.apply_adaptations(user_id, state, NOW)
+    banner = adapt.banner_for(state, summary)
+    assert banner["race_skipped"] == summary["skipped_raced"] > 0
+    assert "race taper" in banner["race_note"]
+
+
+def test_the_post_race_summary_has_the_same_shape(user_id):
+    """Two summary shapes is a trap for every consumer."""
+    _seed_plan(user_id)
+    db.add_race_date(user_id, (NOW.date() - dt.timedelta(days=2)).isoformat(),
+                     priority="B", name="Yesterday", duration_min=90)
+    summary = adapt.apply_adaptations(
+        user_id, TrainingState(ftp=250.0, tsb=-30.0, overreach=True), NOW)
+    assert summary["status"] == adapt.POST_RACE
+    assert set(summary) >= {"status", "adjusted", "skipped_raced", "upcoming",
+                            "window_days"}
+    assert adapt.banner_for(TrainingState(ftp=250.0), summary)["race_skipped"] == 0
+
+
+def test_race_window_is_scoped_to_one_plan(user_id):
+    """A second, overlapping plan's ride days are days THIS plan never had.
+
+    Feeding them to race_effects moved post-race recovery onto dates the
+    generator does not own, so adapt and the generator disagreed about the
+    window.
+    """
+    plan_id = _seed_plan(user_id)
+    race_day = NOW.date() + dt.timedelta(days=3)
+    db.add_race_date(user_id, race_day.isoformat(), priority="A", name="R",
+                     duration_min=300)
+    mine = adapt.race_window(user_id, plan_id, NOW)
+
+    # A second plan riding EVERY day, overlapping the first.
+    other = db.create_plan(user_id, "Other", MONDAY.isoformat(), 4)
+    for offset in range(0, 28):
+        day = (MONDAY + dt.timedelta(days=offset)).isoformat()
+        db.add_plan_workout(other, user_id, day, "X", "endurance", 3600, 50.0,
+                            "<x/>", origin=reflow.GENERATED)
+
+    assert adapt.race_window(user_id, plan_id, NOW) == mine
 
 
 def test_adaptation_outside_a_race_window_still_survives_reflow(user_id):

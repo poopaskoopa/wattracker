@@ -1118,10 +1118,13 @@ WORKOUT_TYPE_INFO: List[dict] = [
         "zone": "Zone 7",
         "low": 1.50,
         "high": None,
-        # Nominal only - the session itself prescribes no sprint target (see
-        # ``_sprint``). Shared with the load-accounting constant so the picker
-        # and the TSS estimate can never quote two different figures.
-        "work": SPRINT_LOAD_RATIO_DEFAULT,
+        # None, not a number: this session prescribes no power target at all
+        # (see ``_sprint``), so the picker must advertise the effort rather
+        # than a wattage. Publishing the load-accounting constant here put
+        # ">150% FTP - 375 W" next to a workout whose own segment rows read
+        # "Max effort - no target". `low` is kept as a floor the builder is
+        # checked against, not as something shown for this type.
+        "work": None,
         "focus": "Trains neuromuscular power, recruitment and peak sprint watts.",
         "structure": "Warmup, then short all-out sprints with ~3min full recovery "
                      "between each, on an easy aerobic base.",
@@ -1158,10 +1161,14 @@ def workout_type_info(key: str) -> Optional[dict]:
 VARIANTS = {kind: list(builders.keys()) for kind, builders in _VARIANT_BUILDERS.items()}
 
 
-def plan_workout(state, duration_min: int) -> Session:
+def plan_workout(state, duration_min: int,
+                 profile: Optional["RiderMetrics"] = None) -> Session:
     """Prescribe a workout for the given training state and duration (minutes).
 
-    Raises ValueError if duration_min is outside [30, 480].
+    ``profile`` is the rider's measured capacities, passed to whichever builder
+    the state selects - the one-off "generate a workout" path must prescribe
+    against the same rider as their plan does. Raises ValueError if
+    duration_min is outside [30, 480].
     """
     if duration_min < MIN_DURATION_MIN or duration_min > MAX_DURATION_MIN:
         raise ValueError(
@@ -1176,22 +1183,22 @@ def plan_workout(state, duration_min: int) -> Session:
     tsb = getattr(state, "tsb", 0.0) or 0.0
 
     if overreach:
-        return _easy_endurance(total_s)
+        return _easy_endurance(total_s, profile)
     if plateau:
-        return _vo2max(total_s)
+        return _vo2max(total_s, profile)
 
     # Neutral / adapting: branch on TSB and duration.
     fresh = tsb > -5.0
     if duration_min > 105:
-        return _z2_endurance(total_s)
+        return _z2_endurance(total_s, profile)
     if 45 <= duration_min <= 105:
         if fresh:
-            return _sweet_spot(total_s)
-        return _threshold(total_s)
+            return _sweet_spot(total_s, profile)
+        return _threshold(total_s, profile)
     # short (30-44): threshold if fresh, else easy endurance
     if fresh:
-        return _threshold(total_s)
-    return _easy_endurance(total_s)
+        return _threshold(total_s, profile)
+    return _easy_endurance(total_s, profile)
 
 
 # Public dispatch by workout kind, for the multi-week plan generator. Reuses the

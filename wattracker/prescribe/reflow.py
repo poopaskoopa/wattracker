@@ -43,7 +43,7 @@ import logging
 from typing import Dict, List, Optional
 
 from .. import db
-from ..metrics import profile_cache
+from ..metrics import profile_store
 from ..timeutil import utc_now
 from . import zwo
 from .adapt import reexport_workout
@@ -200,7 +200,7 @@ def reflow_plan(
     # profile, which builds exactly the population-constant prescription. Read
     # through the cache: deriving it decompresses months of streams, and race
     # CRUD reflows on a request thread.
-    profile = profile_cache.for_user(user_id)
+    profile = profile_store.for_user(user_id)
     try:
         generated = generate_plan(
             plan["name"], start, int(plan["weeks"]),
