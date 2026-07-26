@@ -22,6 +22,14 @@ class _RaisingStr(str):
         raise RuntimeError("normalization refused")
 
 
+class _UnhashableNormalizedStr(str):
+    def strip(self, chars: str | None = None) -> "_UnhashableNormalizedStr":
+        return self
+
+    def lower(self) -> list[object]:
+        return []
+
+
 @pytest.mark.parametrize(
     ("goal", "floor", "ideal", "basis"),
     [
@@ -122,7 +130,14 @@ def test_malformed_optional_inputs_are_ignored(ctl: object, hours: object) -> No
 
 @pytest.mark.parametrize(
     "goal",
-    ["unknown", "", None, object(), _RaisingStr("ftp")],
+    [
+        "unknown",
+        "",
+        None,
+        object(),
+        _RaisingStr("ftp"),
+        _UnhashableNormalizedStr("ftp"),
+    ],
 )
 def test_unknown_or_malformed_goal_uses_sane_default(goal: object) -> None:
     recommendation = recommend_weeks(goal)

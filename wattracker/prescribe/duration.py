@@ -133,7 +133,10 @@ def recommend_weeks(
 ) -> Recommendation:
     """Recommend a plan length without rejecting incomplete profile data."""
     try:
-        normalized = goal_key.strip().lower() if isinstance(goal_key, str) else ""
+        candidate = goal_key.strip().lower() if isinstance(goal_key, str) else ""
+        # A str subclass can return an arbitrary, even unhashable, object from
+        # normalization. Only a plain string is safe as a baseline lookup key.
+        normalized = candidate if type(candidate) is str else ""
     except Exception:
         # A hostile str subclass is malformed input, equivalent to an unknown key.
         normalized = ""
