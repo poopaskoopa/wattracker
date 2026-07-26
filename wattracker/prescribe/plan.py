@@ -290,6 +290,12 @@ def hard_seconds(session: Session) -> int:
     return total
 
 
+def _hours_label(hours: float) -> str:
+    """'6 h' / '6.5 h' - no trailing '.0' in a user-facing message."""
+    h = float(hours)
+    return f"{h:g} h"
+
+
 def _cap_message(model: str, cap: int, selected: int) -> str:
     plural = "s" if cap != 1 else ""
     return (
@@ -324,6 +330,23 @@ def validate_plan_inputs(
     cap = MODELS[model].max_hard(n_days)
     if int(hit_days_per_week) > cap:
         return _cap_message(model, cap, int(hit_days_per_week))
+    # Feasibility: every session has a floor its interval builder cannot go
+    # below, so a week has a minimum length regardless of how the hours are
+    # distributed. If the floors do not fit the budget, no allocation exists
+    # and the plan must be refused - the only alternatives are dropping ride
+    # days or dropping hard days, and both would override one explicit user
+    # choice to honour another. Name the knobs instead.
+    hit = min(int(hit_days_per_week), n_days)
+    floor_min = hit * HIT_MIN_MIN + (n_days - hit) * MIN_SESSION_MIN
+    if floor_min > float(hours_per_week) * 60.0:
+        return (
+            f"{_hours_label(hours_per_week)}/week across {n_days} day"
+            f"{'s' if n_days != 1 else ''} with {hit} hard day"
+            f"{'s' if hit != 1 else ''} needs at least {floor_min} min/week "
+            f"(a hard session needs {HIT_MIN_MIN} min and an easy one "
+            f"{MIN_SESSION_MIN}). Ride fewer days, do fewer hard days, or "
+            f"raise your weekly hours."
+        )
     if hard_days:
         marked = set(int(d) for d in hard_days)
         if not marked.issubset(set(int(d) for d in days_of_week)):
@@ -333,6 +356,47 @@ def validate_plan_inputs(
         if len(marked) > cap:
             return _cap_message(model, cap, len(marked))
     return None
+
+
+def _fit_week_to_budget(week_days: List[dict], budget_min: float) -> None:
+    """Trim a week's laid-out sessions back under ``budget_min``, in place.
+
+    Weekly hours are a hard user promise: a plan may come in under the number
+    the rider gave us, never over. The allocation above distributes fractional
+    minutes, but ``build_workout`` can only construct whole minutes, so every
+    session rounds independently - a week of five 97.5-minute days becomes five
+    98-minute days and overshoots the budget by 2 minutes. (The error scales
+    with the number of ride days, up to n/2 minutes.)
+
+    Minutes come off the LONGEST easy session first, one at a time, so the cut
+    lands where it is least felt and stays evenly spread. Hard sessions are a
+    last resort: intensity is the part of a week worth protecting, and by then
+    we are trimming single minutes anyway. Every session keeps its own
+    feasible floor.
+
+    Raises ValueError if the excess cannot be absorbed at all - that means the
+    floors do not fit the budget, which ``validate_plan_inputs`` rejects up
+    front, so it should be unreachable.
+    """
+    excess = sum(d["minutes"] for d in week_days) - int(budget_min)
+    if excess <= 0:
+        return
+    # Easy days first, then hard ones; within each group, longest first.
+    for hard_pass in (False, True):
+        while excess > 0:
+            candidates = [d for d in week_days
+                          if d["hard_slot"] is hard_pass
+                          and d["minutes"] > d["floor"]]
+            if not candidates:
+                break
+            victim = max(candidates, key=lambda d: (d["minutes"], d["date"]))
+            victim["minutes"] -= 1
+            excess -= 1
+    if excess > 0:
+        raise ValueError(
+            f"{int(budget_min)} min/week cannot hold this week's sessions "
+            f"even at their minimum durations."
+        )
 
 
 def generate_plan(
@@ -421,9 +485,9 @@ def generate_plan(
         easy_dur = max(MIN_SESSION_MIN, easy_total / easy_days) if easy_days else 0.0
 
         monday = monday0 + _dt.timedelta(days=7 * w)
-        week_total_s = 0
-        week_hard_s = 0
-        week_tss = 0.0
+        # The week is laid out first and only then built, so the rounding
+        # reconciliation below can see the whole week at once.
+        week_days: List[dict] = []
 
         for i, weekday in enumerate(days):
             date = monday + _dt.timedelta(days=weekday)
@@ -469,17 +533,34 @@ def generate_plan(
             names = VARIANTS.get(kind, ["classic"])
             variant = names[kind_counter.get(kind, 0) % len(names)]
             kind_counter[kind] = kind_counter.get(kind, 0) + 1
-            session = build_workout(kind, dur, variant)
+            week_days.append({
+                "date": date.isoformat(),
+                "kind": kind,
+                "variant": variant,
+                # build_workout rounds to whole minutes, so track the day in
+                # minutes and let the reconciliation below work in that unit.
+                "minutes": int(round(dur)),
+                "floor": int(_feasible_min(kind, hard_slot)),
+                "hard_slot": hard_slot,
+            })
+
+        _fit_week_to_budget(week_days, float(hours_per_week) * 60.0)
+
+        week_total_s = 0
+        week_hard_s = 0
+        week_tss = 0.0
+        for day in week_days:
+            session = build_workout(day["kind"], day["minutes"], day["variant"])
             hs = hard_seconds(session)
             week_total_s += session.total_duration()
             week_hard_s += hs
             week_tss += session.estimated_tss
             workouts.append(
                 {
-                    "date": date.isoformat(),
+                    "date": day["date"],
                     "name": session.name,
-                    "type": kind,
-                    "variant": variant,
+                    "type": day["kind"],
+                    "variant": day["variant"],
                     "duration_s": session.total_duration(),
                     "tss": session.estimated_tss,
                     "hard_s": hs,

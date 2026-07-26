@@ -70,10 +70,84 @@ def test_weekly_volume_matches_requested_and_never_exceeds():
         if wk["recovery"]:
             assert wk["total_s"] < target_s
             continue
-        # Non-recovery weeks sum to ~requested hours (rounding tolerance from
-        # per-workout whole-minute quantization) and never materially exceed.
+        # Non-recovery weeks sum to ~requested hours (per-workout whole-minute
+        # quantization can leave a week slightly short) and NEVER exceed them.
         assert abs(wk["total_s"] - target_s) <= 300
-        assert wk["total_s"] <= target_s + 60
+        assert wk["total_s"] <= target_s
+
+
+# ------------------------------------------- the weekly-volume invariant
+# "A week never exceeds the hours the rider asked for" is a hard promise, and
+# it has to hold for EVERY configuration, not the handful the examples above
+# happen to use. Two things once broke it: session floors that could not fit
+# the budget at all (now refused by validate_plan_inputs), and per-session
+# whole-minute rounding that pushed a week a minute or two over (now
+# reconciled inside generate_plan). This sweep is what keeps both fixed.
+
+_SWEEP_HOURS = [3.0, 3.5, 4.0, 5.0, 6.0, 8.0, 10.0, 12.0, 15.0, 20.0]
+_SWEEP_RACES = [
+    {"id": 1, "date": "2026-08-16", "priority": "A", "duration_min": 180},
+    {"id": 2, "date": "2026-07-18", "priority": "B"},
+    {"id": 3, "date": "2026-07-27", "priority": "B", "duration_min": 60},
+]
+
+
+def _sweep_configs():
+    for hours in _SWEEP_HOURS:
+        for n_days in range(2, 8):
+            for hit in range(1, 5):
+                for model in plan.MODELS:
+                    yield hours, list(range(n_days)), hit, model
+
+
+@pytest.mark.parametrize("with_races", [False, True])
+def test_weekly_volume_never_exceeds_requested_hours_across_the_grid(with_races):
+    races = _SWEEP_RACES if with_races else None
+    checked = 0
+    for hours, days, hit, model in _sweep_configs():
+        if plan.validate_plan_inputs(8, days, hours, hit, None, model):
+            continue  # a configuration the generator refuses to build
+        p = plan.generate_plan("P", MONDAY, 8, days, hours, hit, model=model,
+                               races=races)
+        cap_s = hours * 3600
+        for wk in p["weekly"]:
+            assert wk["total_s"] <= cap_s, (
+                f"{hours}h, {len(days)} days, {hit} hard, {model}, "
+                f"week {wk['week']}: {wk['total_s'] / 60:.1f} min "
+                f"> {cap_s / 60:.0f} min"
+            )
+        checked += 1
+    assert checked > 200  # the grid really was exercised
+
+
+def test_infeasible_configurations_are_refused_with_both_knobs_named():
+    # 3 h across 7 days with 2 hard days: 2*50 + 5*20 = 200 min > 180 min.
+    err = plan.validate_plan_inputs(4, [0, 1, 2, 3, 4, 5, 6], 3.0, 2)
+    assert err
+    assert "200 min" in err
+    assert "fewer days" in err and "fewer hard days" in err and "hours" in err
+    with pytest.raises(ValueError):
+        plan.generate_plan("P", MONDAY, 4, [0, 1, 2, 3, 4, 5, 6], 3.0, 2)
+
+
+def test_a_configuration_that_exactly_fits_is_allowed():
+    # 2 hard (50) + 5 easy (20) = 200 min, and 200 min/week is 3.334 h.
+    days = [0, 1, 2, 3, 4, 5, 6]
+    assert plan.validate_plan_inputs(4, days, 200 / 60, 2) is None
+    p = plan.generate_plan("P", MONDAY, 4, days, 200 / 60, 2)
+    for wk in p["weekly"]:
+        assert wk["total_s"] <= 200 * 60
+
+
+def test_rounding_excess_is_trimmed_from_the_longest_easy_day():
+    """5 days at 97.5 min each would round to 98 and overshoot by 2 minutes."""
+    p = plan.generate_plan("P", MONDAY, 1, [0, 1, 2, 3, 4], 8.0, 1,
+                           model="sweet_spot")
+    assert p["weekly"][0]["total_s"] <= 8 * 3600
+    minutes = sorted(w["duration_s"] // 60 for w in p["workouts"])
+    # The hard day keeps its full 90 minutes; the trim lands on easy days.
+    assert max(minutes) == 98
+    assert sum(minutes) == 480
 
 
 def test_both_hit_types_used():
