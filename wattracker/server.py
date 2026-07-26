@@ -1201,6 +1201,22 @@ def create_app() -> FastAPI:
                 float(recipe.get("hours_per_week") or 0.0) or 6.0, uid,
             )
             summary["progress"] = _goal_progress(uid, goal.key)
+        # What the plan does about the rider's races, recomputed here at VIEW
+        # time. Races are never stored in the recipe - they are read fresh on
+        # every reflow - so re-resolving them is the only description that
+        # matches the workouts actually on the calendar. This is the SINGLE
+        # place it is computed: unlike `phases`, a freshly generated plan must
+        # NOT overwrite it, or the plan would say one thing on creation and
+        # another when re-opened.
+        try:
+            start = _dt.date.fromisoformat(plan["start_date"])
+        except (ValueError, TypeError):
+            start = None
+        if start is not None:
+            summary["races"] = planmod.describe_races(
+                db.list_race_dates(uid), start, int(plan["weeks"]),
+                days_of_week=recipe.get("days_of_week"),
+            )
         return summary
 
     def _auto_export_plan(uid: int, plan_id: int) -> dict:
@@ -1542,7 +1558,21 @@ def create_app() -> FastAPI:
         # passed and one was found) attached under "result" - see
         # races.match_result_for_race_date for why this is resolved live
         # rather than stored on race_dates.
-        race_dates = races.attach_results_to_race_dates(uid, db.list_race_dates(uid))
+        stored_races = db.list_race_dates(uid)
+        race_dates = races.attach_results_to_race_dates(uid, stored_races)
+        # The badge must show the priority the PLAN uses, not the one the row
+        # stores: an A race inside an earlier A race's taper is planned as a B
+        # race, and a calendar saying "A" next to a plan that tapers it as a B
+        # is exactly the confusion this describes away. Same resolution the plan
+        # summary uses - never a second copy of the rule.
+        described = {d["id"]: d for d in planmod.describe_races(stored_races)}
+        for r in race_dates:
+            d = described.get(r["id"])
+            if d is not None:
+                r["priority"] = d["priority"]        # EFFECTIVE
+                r["demoted"] = d["demoted"]
+                r["conflicts_with"] = d["conflicts_with"]
+                r["separation_days"] = d["separation_days"]
         races_by_date = {r["date"]: r for r in race_dates}
 
         def _in_ooto(date_iso: str) -> bool:

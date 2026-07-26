@@ -47,7 +47,7 @@ from ..metrics import profile_store
 from ..timeutil import utc_now
 from . import goals, zwo
 from .adapt import reexport_workout
-from .plan import generate_plan
+from .plan import A_RACE_SEPARATION_DAYS, generate_plan
 
 log = logging.getLogger(__name__)
 
@@ -278,13 +278,37 @@ def reflow_plan(
             )
 
     if notify:
-        _record_notice(user_id, plan_id, counts, now, bool(races))
+        _record_notice(user_id, plan_id, counts, now, bool(races),
+                       race_info.get("conflicts") or [])
 
     return {"status": "ok", "races": race_info.get("planned") or [],
             "race_conflicts": race_info.get("conflicts") or [], **counts}
 
 
-def _notice_message(counts: Dict, has_races: bool) -> str:
+def _conflict_sentences(conflicts: List[dict]) -> str:
+    """The demotion sentences appended to the notice. '' when there are none.
+
+    This is the one thing the notice may state as a CAUSE (see
+    ``_notice_message``): a demotion is not inferred from the diff, it is a
+    deterministic output of ``plan.resolve_race_conflicts``, which reports
+    exactly which race it demoted and which A race took the taper. Naming it is
+    a fact, not a guess about what moved.
+    """
+    out = []
+    for c in conflicts or []:
+        name = f" ({c['name']})" if c.get("name") else ""
+        out.append(
+            f" Your A race on {c['date']}{name} is planned as a B race: it "
+            f"falls within {A_RACE_SEPARATION_DAYS} days of your A race on "
+            f"{c['conflicts_with']}, and only the earlier one can be tapered "
+            f"for. Its saved priority is unchanged - move or delete the "
+            f"earlier race and the taper comes back."
+        )
+    return "".join(out)
+
+
+def _notice_message(counts: Dict, has_races: bool,
+                    conflicts: Optional[List[dict]] = None) -> str:
     """The sentence the rider reads. States WHAT changed and WHY.
 
     The 'why' is deliberately a description of what the nightly recomputation
@@ -292,6 +316,9 @@ def _notice_message(counts: Dict, has_races: bool) -> str:
     whole plan and diffs it, so it genuinely does not know whether a race, the
     rider's measured capacity, or both are responsible. Naming a cause we did
     not establish would be worse than naming the mechanism.
+
+    A race demotion is the exception and is appended after that sentence, which
+    is left exactly as it was - see ``_conflict_sentences``.
     """
     parts = []
     for key, verb in (("updated", "updated"), ("inserted", "added"),
@@ -306,17 +333,27 @@ def _notice_message(counts: Dict, has_races: bool) -> str:
         f"Your plan was updated overnight: {changed}. Upcoming workouts are "
         f"recomputed each night from {because}, so they track where you are "
         f"now. Completed and past workouts are never touched."
+        + _conflict_sentences(conflicts or [])
     )
 
 
 def _record_notice(
     user_id: int, plan_id: int, counts: Dict, now: _dt.datetime,
-    has_races: bool,
+    has_races: bool, conflicts: Optional[List[dict]] = None,
 ) -> None:
     """Store the rider-facing notice for a sweep run that changed something."""
     changed = (counts.get("updated", 0) + counts.get("inserted", 0)
                + counts.get("deleted", 0))
     if changed <= 0:
+        # A demotion with no workout change IS reachable - a race whose whole
+        # taper window is already past, locked or outside the plan resolves to
+        # a demotion the diff cannot see - and it still gets no notice. The
+        # notice reports an EVENT (we rewrote sessions while you were asleep);
+        # a demotion is a stable STATE that stays true every night, so firing
+        # here would repeat the same alert nightly, forever, with counts of
+        # zero. The state is already permanently visible where it belongs: the
+        # plan summary's races block and the calendar's effective-priority
+        # badge, neither of which depends on a notice having fired.
         return
     notice = {
         "at": now.isoformat(timespec="seconds"),
@@ -324,7 +361,7 @@ def _record_notice(
         "inserted": counts.get("inserted", 0),
         "deleted": counts.get("deleted", 0),
         "changed": changed,
-        "message": _notice_message(counts, has_races),
+        "message": _notice_message(counts, has_races, conflicts),
     }
     try:
         db.set_plan_reflow_notice(user_id, plan_id, notice)
