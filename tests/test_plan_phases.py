@@ -18,7 +18,12 @@ import pytest
 from wattracker import db
 from wattracker.prescribe import phases as ph
 from wattracker.prescribe import plan, reflow, zwo
-from wattracker.prescribe.phases import DEFAULT_ARC, Phase, resolve_phases
+from wattracker.prescribe.phases import (
+    DEFAULT_ARC, MIN_PHASE_WEEKS, MIN_VIABLE_PHASES, Phase,
+    minimum_viable_weeks, resolve_phases,
+)
+
+MIN_VIABLE = minimum_viable_weeks(DEFAULT_ARC)
 
 MONDAY = dt.date(2026, 7, 6)  # a Monday
 NOW = dt.datetime(2026, 7, 15, 9, 0)
@@ -201,33 +206,37 @@ def test_a_phase_that_cannot_meet_its_minimum_is_dropped_not_shrunk():
 
 def test_the_taper_is_allocated_first_and_never_below_its_floor():
     taper = next(p for p in DEFAULT_ARC if p.name == "taper")
-    for weeks in range(taper.min_weeks, 40):
+    for weeks in range(MIN_VIABLE, 60):
         r = resolve_phases(weeks, DEFAULT_ARC)
         assert _names(r)[-1] == "taper"          # always at the very end
-        assert dict(r.blocks)["taper"] >= taper.min_weeks
-        assert dict(r.blocks)["taper"] <= taper.max_weeks
-    # Shorter than the taper itself: the plan IS the taper, nothing else fits.
-    r1 = resolve_phases(1, DEFAULT_ARC)
-    assert r1.blocks == (("taper", 1),)
-    assert set(r1.omitted) == {"base", "build", "peak"}
+        assert taper.min_weeks <= dict(r.blocks)["taper"] <= taper.max_weeks
 
 
 def test_a_short_plan_drops_phases_from_the_front_and_reports_them():
     r8 = resolve_phases(8, DEFAULT_ARC)
     assert r8.omitted == ("base",)              # base goes first
     assert [n for n, _ in r8.blocks] == ["build", "peak", "taper"]
+    assert r8.unphased_reason is None
 
-    r5 = resolve_phases(5, DEFAULT_ARC)
-    assert r5.omitted == ("base", "build")
-    assert [n for n, _ in r5.blocks] == ["peak", "taper"]
-
-    # 12 weeks is enough for the whole arc.
-    assert resolve_phases(12, DEFAULT_ARC).omitted == ()
+    # 11 weeks is enough for the whole arc.
+    assert resolve_phases(11, DEFAULT_ARC).omitted == ()
 
 
 def test_omissions_are_reported_in_arc_order_not_drop_order():
-    r = resolve_phases(5, DEFAULT_ARC)
-    order = [p.name for p in DEFAULT_ARC]
+    arc = (
+        Phase(name="a", share=0.4, hard_types=("endurance",),
+              hard_volume_fraction=0.15),
+        Phase(name="b", share=0.3, hard_types=("threshold",),
+              hard_volume_fraction=0.2),
+        Phase(name="c", share=0.2, hard_types=("vo2max",),
+              hard_volume_fraction=0.25),
+        Phase(name="d", share=0.1, hard_types=("vo2max",),
+              hard_volume_fraction=0.25, min_weeks=2, max_weeks=2,
+              anchored_end=True),
+    )
+    r = resolve_phases(8, arc)          # only b, c, d fit
+    assert r.omitted == ("a",)
+    order = [p.name for p in arc]
     assert list(r.omitted) == [n for n in order if n in r.omitted]
 
 
@@ -248,6 +257,105 @@ def test_repetition_never_stretches_any_block_past_its_ceiling():
         for name, count in resolve_phases(weeks, DEFAULT_ARC).blocks:
             phase = next(p for p in DEFAULT_ARC if p.name == name)
             assert count <= phase.max_weeks, (weeks, name, count)
+
+
+# ------------------------------------------------- the shape of the result
+# Counts alone do not say whether an arc is coherent TRAINING. These assert the
+# progression itself: a repeated body must still climb, and a plan too short to
+# hold a structure must not emit a fragment of one.
+
+def _declared_order(arc):
+    return {p.name: i for i, p in enumerate(arc)}
+
+
+def test_a_repeated_body_never_enters_peak_out_of_a_base():
+    """base -> peak skips the block that bridges them, and puts the arc's
+    lowest-intensity work directly before its highest."""
+    for weeks in range(MIN_VIABLE, 60):
+        names = [n for n, _ in resolve_phases(weeks, DEFAULT_ARC).blocks]
+        if "peak" not in names:
+            continue
+        before_peak = names[names.index("peak") - 1]
+        assert before_peak == "build", (weeks, names)
+
+
+def test_block_order_always_follows_the_arcs_declared_order():
+    """Within a cycle the order is the arc's own; the only allowed step back
+    is a wrap from the LAST repeatable phase to the FIRST one."""
+    order = _declared_order(DEFAULT_ARC)
+    repeatable = [p.name for p in DEFAULT_ARC if p.repeatable]
+    for weeks in range(1, 60):
+        names = [n for n, _ in resolve_phases(weeks, DEFAULT_ARC).blocks]
+        for a, b in zip(names, names[1:]):
+            if order[b] > order[a]:
+                continue
+            assert a == repeatable[-1] and b == repeatable[0], (weeks, names)
+
+
+def test_every_resolved_arc_in_the_whole_range_is_a_sane_structure():
+    """The sweep that would have caught both defects at once."""
+    order = _declared_order(DEFAULT_ARC)
+    by_name = {p.name: p for p in DEFAULT_ARC}
+    repeatable = [p.name for p in DEFAULT_ARC if p.repeatable]
+    for weeks in range(1, 53):
+        r = resolve_phases(weeks, DEFAULT_ARC)
+        assert len(r.weeks) == weeks
+        if r.unphased_reason:
+            # Abandoned wholesale - no fragment of an arc survives.
+            assert r.blocks == () and all(p is None for p in r.weeks)
+            assert weeks < MIN_VIABLE
+            continue
+        names = [n for n, _ in r.blocks]
+        # 1. Every week belongs to a phase, and every block is a real
+        #    mesocycle inside its own bounds.
+        assert sum(c for _, c in r.blocks) == weeks
+        assert all(p is not None for p in r.weeks)
+        for name, count in r.blocks:
+            assert by_name[name].min_weeks <= count <= by_name[name].max_weeks
+        # 2. At least a viable structure, ending on the taper.
+        assert len(set(names)) >= min(MIN_VIABLE_PHASES, len(DEFAULT_ARC))
+        assert names[-1] == "taper"
+        # 3. The progression climbs, wrapping only between whole cycles.
+        for a, b in zip(names, names[1:]):
+            assert order[b] > order[a] or (a == repeatable[-1]
+                                           and b == repeatable[0]), (weeks, names)
+
+
+def test_a_plan_too_short_for_a_structure_is_unphased_with_a_reason():
+    for weeks in range(1, MIN_VIABLE):
+        r = resolve_phases(weeks, DEFAULT_ARC)
+        assert r.weeks == (None,) * weeks
+        assert r.blocks == ()
+        assert set(r.omitted) == {p.name for p in DEFAULT_ARC}
+        assert r.unphased_reason
+        assert str(MIN_VIABLE) in r.unphased_reason
+    # ...and one week more is periodized.
+    assert resolve_phases(MIN_VIABLE, DEFAULT_ARC).unphased_reason is None
+
+
+def test_the_viability_floor_is_not_met_by_shrinking_phases():
+    """The arc is abandoned, never rescued by lowering a phase's minimum."""
+    for weeks in range(1, MIN_VIABLE):
+        assert resolve_phases(weeks, DEFAULT_ARC).blocks == ()
+    taper = next(p for p in DEFAULT_ARC if p.name == "taper")
+    assert taper.min_weeks == 2 and MIN_PHASE_WEEKS == 3
+
+
+def test_minimum_viable_weeks_matches_where_the_resolver_gives_up():
+    assert minimum_viable_weeks(DEFAULT_ARC) == MIN_VIABLE
+    assert resolve_phases(MIN_VIABLE - 1, DEFAULT_ARC).unphased_reason
+    assert resolve_phases(MIN_VIABLE, DEFAULT_ARC).unphased_reason is None
+    # An arc with fewer phases than the viability floor needs all of them.
+    two = (
+        Phase(name="build", share=0.7, hard_types=("threshold",),
+              hard_volume_fraction=0.2),
+        Phase(name="taper", share=0.3, hard_types=("vo2max",),
+              hard_volume_fraction=0.25, min_weeks=2, max_weeks=2,
+              volume_multiplier=0.6, anchored_end=True),
+    )
+    assert minimum_viable_weeks(two) == 5
+    assert resolve_phases(4, two).unphased_reason
+    assert resolve_phases(5, two).blocks == (("build", 3), ("taper", 2))
 
 
 def test_a_phase_with_no_ceiling_absorbs_the_remainder():
@@ -324,16 +432,20 @@ def test_a_phased_plan_reports_its_blocks_and_omissions():
     assert len(p["phases"]["weeks"]) == 8
 
 
-def test_unphased_weeks_of_a_short_plan_use_the_model(pre_phases):
-    """A week no phase could claim behaves exactly as it does with no arc."""
-    # 4 weeks: only the 2-week taper fits, weeks 1-2 stay unperiodized.
-    p = plan.generate_plan("P", MONDAY, 4, [0, 2, 4], 6.0, 1, phases=DEFAULT_ARC)
-    flat = pre_phases.generate_plan("P", MONDAY, 4, [0, 2, 4], 6.0, 1)
-    assert p["phases"]["weeks"][:2] == [None, None]
-    early = [w for w in p["workouts"] if w["date"] < "2026-07-20"]
-    early_flat = [w for w in flat["workouts"] if w["date"] < "2026-07-20"]
-    assert [(w["type"], w["variant"], w["duration_s"]) for w in early] == [
-        (w["type"], w["variant"], w["duration_s"]) for w in early_flat
+@pytest.mark.parametrize("weeks", list(range(1, MIN_VIABLE)))
+def test_a_plan_too_short_to_periodize_generates_exactly_as_an_unphased_one(
+    pre_phases, weeks
+):
+    """The arc is abandoned, so the rider gets a normal plan - not a taper
+    bolted to nothing - and the caller gets a sentence explaining why."""
+    args = ("P", MONDAY, weeks, [0, 2, 4], 6.0, 1)
+    p = plan.generate_plan(*args, phases=DEFAULT_ARC, races=_GRID_RACES)
+    old = pre_phases.generate_plan(*args, races=_GRID_RACES)
+    assert p["phases"]["unphased_reason"]
+    assert p["phases"]["weeks"] == [None] * weeks
+    assert _comparable(p) == _comparable(old)
+    assert [zwo.zwo_string(w["session"]) for w in p["workouts"]] == [
+        zwo.zwo_string(w["session"]) for w in old["workouts"]
     ]
 
 

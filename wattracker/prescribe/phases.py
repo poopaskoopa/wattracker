@@ -41,6 +41,16 @@ from typing import List, Optional, Sequence, Tuple
 # phase that cannot reach its floor is DROPPED rather than shrunk to a stub.
 MIN_PHASE_WEEKS = 3
 
+# Fewer phases than this is not a structure, it is a fragment. Dropping from
+# the front degrades an arc gracefully right up to the point where what is left
+# stops being coherent training: a plan short enough to hold only the taper
+# would be a taper for an event that does not exist, and one holding only
+# peak + taper would be weeks of top-end work with no base under it - the way
+# people get hurt. Below this, the arc is abandoned wholesale and the plan runs
+# UNPERIODIZED, which is a perfectly good plan. The floors are never lowered to
+# make an arc fit; that would just move the incoherence inside the phases.
+MIN_VIABLE_PHASES = 3
+
 
 @dataclass(frozen=True)
 class Phase:
@@ -112,11 +122,19 @@ class PhasePlan:
     ``(phase_name, week_count)`` runs, and ``omitted`` names the phases that
     did not fit at all, so a caller can tell the rider "this is a build block,
     not full preparation".
+
+    ``unphased_reason`` is set when the arc was abandoned entirely because the
+    plan is too short to carry a coherent structure (see
+    ``MIN_VIABLE_PHASES``). Every week is then None and the plan generates
+    exactly as an unperiodized one - which is a real training plan, where a
+    taper bolted to nothing is not. It is a message for the rider, e.g. "12
+    weeks is too short for this arc; the plan runs unperiodized".
     """
 
     weeks: Tuple[Optional[Phase], ...]
     blocks: Tuple[Tuple[str, int], ...]
     omitted: Tuple[str, ...]
+    unphased_reason: Optional[str] = None
 
     def phase_for(self, week_index: int) -> Optional[Phase]:
         """The phase owning a 0-indexed week (None outside the plan)."""
@@ -134,9 +152,41 @@ def _natural_weeks(phase: Phase, weeks: int) -> int:
     return want
 
 
-def _repeat_length(phase: Phase) -> int:
-    """How long one repeated block of this phase is."""
-    return phase.max_weeks if phase.max_weeks is not None else phase.min_weeks
+def _proportional(sequence: Sequence[Phase], available: int) -> List[int]:
+    """Whole-week lengths for an ordered block sequence, share-proportional.
+
+    Every block lands inside its own ``[min_weeks, max_weeks]``. The result
+    sums to ``available`` unless every block is already at its ceiling, in
+    which case it sums to less and the caller decides what to do with the rest.
+    """
+    total_share = sum(p.share for p in sequence)
+    raw = [available * p.share / total_share for p in sequence]
+    counts = [
+        max(p.min_weeks, int(math.floor(r))) if p.max_weeks is None
+        else min(p.max_weeks, max(p.min_weeks, int(math.floor(r))))
+        for p, r in zip(sequence, raw)
+    ]
+
+    # Snap to whole weeks: give back what the floors over-claimed, then hand
+    # out what rounding left over. Ties break on the lowest index so the
+    # assignment is deterministic - reflow recomputes plans nightly and any
+    # instability would rewrite every workout every night.
+    while sum(counts) > available:
+        eligible = [i for i, p in enumerate(sequence) if counts[i] > p.min_weeks]
+        if not eligible:
+            break
+        i = max(eligible, key=lambda i: (counts[i] - raw[i], -i))
+        counts[i] -= 1
+    while sum(counts) < available:
+        eligible = [
+            i for i, p in enumerate(sequence)
+            if p.max_weeks is None or counts[i] < p.max_weeks
+        ]
+        if not eligible:
+            break  # everything is at its ceiling - the caller adds a cycle
+        i = max(eligible, key=lambda i: (raw[i] - counts[i], -i))
+        counts[i] += 1
+    return counts
 
 
 def _allocate_body(
@@ -145,9 +195,15 @@ def _allocate_body(
     """Split ``available`` weeks across the non-anchored phases.
 
     Returns (blocks, omitted) where blocks is a list of ``[phase, weeks]``.
-    Blocks always consume ``available`` exactly, unless every phase was
-    dropped, in which case no block is produced and the caller leaves those
-    weeks unperiodized.
+
+    A plan longer than the arc's natural length repeats whole MESOCYCLE
+    CYCLES - base, build, base, build, ... - rather than stretching one phase:
+    the training effect of a block comes from its length being about right, so
+    12 weeks of "build" is not a longer build, it is a plateau. Repeating whole
+    cycles in the arc's declared order is also what keeps the progression
+    intact: the run of repeats always ENDS on the highest-intensity repeatable
+    phase, so the plan enters its peak block from a build and never straight
+    out of a base.
     """
     survivors = list(body)
     omitted: List[str] = []
@@ -160,87 +216,24 @@ def _allocate_body(
     if not survivors:
         return [], omitted
 
-    total_share = sum(p.share for p in survivors)
-    raw = [available * p.share / total_share for p in survivors]
-    counts = [
-        max(p.min_weeks, int(math.floor(r))) if p.max_weeks is None
-        else min(p.max_weeks, max(p.min_weeks, int(math.floor(r))))
-        for p, r in zip(survivors, raw)
-    ]
-
-    # Snap to whole weeks: give back what the floors over-claimed, then hand
-    # out what rounding left over. Ties break on the lowest index so the
-    # assignment is deterministic - reflow recomputes plans nightly and any
-    # instability would rewrite every workout every night.
-    while sum(counts) > available:
-        eligible = [i for i, p in enumerate(survivors) if counts[i] > p.min_weeks]
-        if not eligible:
-            break
-        i = max(eligible, key=lambda i: (counts[i] - raw[i], -i))
-        counts[i] -= 1
-    while sum(counts) < available:
-        eligible = [
-            i for i, p in enumerate(survivors)
-            if p.max_weeks is None or counts[i] < p.max_weeks
-        ]
-        if not eligible:
-            break  # everything is at its natural ceiling - repeat instead
-        i = max(eligible, key=lambda i: (raw[i] - counts[i], -i))
-        counts[i] += 1
-
-    blocks: List[List] = [[p, c] for p, c in zip(survivors, counts)]
-    leftover = available - sum(counts)
-    if leftover > 0:
-        _repeat_into(blocks, survivors, leftover)
-    return blocks, omitted
-
-
-def _fold_into(block: List, leftover: int) -> bool:
-    """Add ``leftover`` weeks to a block if that stays inside its ceiling."""
-    ceiling = block[0].max_weeks
-    if ceiling is None or block[1] + leftover <= ceiling:
-        block[1] += leftover
-        return True
-    return False
-
-
-def _repeat_into(
-    blocks: List[List], survivors: Sequence[Phase], leftover: int
-) -> None:
-    """Absorb ``leftover`` weeks by REPEATING mesocycles, in place.
-
-    A plan longer than the arc's natural length gets another base/build cycle
-    rather than one enormous stretched phase: the training effect of a block
-    comes from its length being about right, so 12 weeks of "build" is not a
-    longer build, it is a plateau.
-
-    Weeks that cannot be placed without pushing some block past its ceiling are
-    left unplaced; ``resolve_phases`` puts them at the FRONT of the plan as
-    unperiodized weeks, which behave exactly as a plan with no arc at all.
-    """
+    sequence = list(survivors)
+    counts = _proportional(sequence, available)
     repeatable = [p for p in survivors if p.repeatable]
-    if not repeatable:
-        # Nothing may repeat, so the last block absorbs what it can.
-        _fold_into(blocks[-1], leftover)
-        return
-    # Repeats are inserted after the last repeatable block so the sequence
-    # reads base, build, base, build, ..., peak, taper.
-    insert_at = max(i for i, b in enumerate(blocks) if b[0] in repeatable) + 1
-    added: List[List] = []
-    k = 0
-    while leftover > 0:
-        phase = repeatable[k % len(repeatable)]
-        k += 1
-        take = min(_repeat_length(phase), leftover)
-        if take < phase.min_weeks:
-            # Too little left for a block of its own: fold it into the
-            # preceding block if that block has headroom, otherwise leave it
-            # unperiodized rather than stretch a phase past its ceiling.
-            _fold_into(added[-1] if added else blocks[insert_at - 1], leftover)
-            break
-        added.append([phase, take])
-        leftover -= take
-    blocks[insert_at:insert_at] = added
+    # Add whole cycles while the weeks do not fit inside the blocks' ceilings.
+    # Extra cycles are PREPENDED so the arc's own order still closes the body:
+    # (base, build) x n, then the full declared sequence.
+    cycles = 1
+    while repeatable and sum(counts) < available:
+        candidate = list(repeatable) * cycles + list(survivors)
+        if sum(p.min_weeks for p in candidate) > available:
+            break  # another cycle cannot reach its own floors
+        candidate_counts = _proportional(candidate, available)
+        if sum(candidate_counts) <= sum(counts):
+            break  # no improvement; leave the rest unperiodized
+        sequence, counts = candidate, candidate_counts
+        cycles += 1
+
+    return [[p, c] for p, c in zip(sequence, counts)], omitted
 
 
 def resolve_phases(weeks: int, phases: Sequence[Phase]) -> PhasePlan:
@@ -255,8 +248,13 @@ def resolve_phases(weeks: int, phases: Sequence[Phase]) -> PhasePlan:
       not get squeezed when the plan is short.
     * The remaining weeks are split proportionally by ``share`` and snapped to
       whole weeks, with every phase held at or above its ``min_weeks`` floor.
-    * Too short: phases are dropped from the FRONT and reported in ``omitted``.
-    * Too long: ``repeatable`` mesocycles repeat instead of stretching.
+    * Too short: phases are dropped from the FRONT and reported in ``omitted``,
+      until fewer than ``MIN_VIABLE_PHASES`` are left - at which point the arc
+      is abandoned and the plan runs UNPERIODIZED with a stated reason, because
+      the fragment that survives (a bare taper, or peak with no base under it)
+      is worse training than no periodization at all.
+    * Too long: whole ``repeatable`` mesocycle CYCLES repeat, in the arc's
+      declared order, instead of any phase stretching.
 
     Deterministic: identical inputs always produce an identical assignment.
     """
@@ -307,7 +305,46 @@ def resolve_phases(weeks: int, phases: Sequence[Phase]) -> PhasePlan:
         raise AssertionError(
             f"phase allocation produced {len(assigned)} weeks, expected {weeks}"
         )
+
+    # The viability gate. It is checked on the RESULT rather than on the week
+    # count, so it covers both a plan too short to hold the structure and one
+    # where the phases' own floors happen not to fit.
+    distinct = {name for name, _ in blocks}
+    floors_met = all(
+        count >= next(p for p in phases if p.name == name).min_weeks
+        for name, count in blocks
+    )
+    if len(distinct) < min(MIN_VIABLE_PHASES, len(phases)) or not floors_met:
+        return unphased(weeks, phases)
+
     return PhasePlan(tuple(assigned), tuple(blocks), tuple(omitted))
+
+
+def minimum_viable_weeks(phases: Sequence[Phase]) -> int:
+    """Shortest plan this arc can periodize coherently.
+
+    The phases that survive a short plan are the LAST ones declared (dropping
+    is from the front) plus every anchored-end phase, each at its floor.
+    """
+    if not phases:
+        return 0
+    tail = [p for p in phases if p.anchored_end]
+    body = [p for p in phases if not p.anchored_end]
+    need = max(0, min(MIN_VIABLE_PHASES, len(phases)) - len(tail))
+    kept = body[len(body) - need:] if need else []
+    return sum(p.min_weeks for p in tail + kept)
+
+
+def unphased(weeks: int, phases: Sequence[Phase]) -> PhasePlan:
+    """The arc gave up: every week runs on the plan model, with a reason."""
+    floor = minimum_viable_weeks(phases)
+    reason = (
+        f"{weeks} week{'s' if weeks != 1 else ''} is too short to periodize "
+        f"this arc ({', '.join(p.name for p in phases)}): it needs at least "
+        f"{floor} weeks to hold {min(MIN_VIABLE_PHASES, len(phases))} phases "
+        f"at their minimum lengths. The plan runs unperiodized."
+    )
+    return PhasePlan((None,) * weeks, (), tuple(p.name for p in phases), reason)
 
 
 # ------------------------------------------------------------- reference arc
