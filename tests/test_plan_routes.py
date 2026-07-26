@@ -140,6 +140,20 @@ def test_plan_submit_invalid_shows_error(client):
     assert db.list_plans(uid) == []
 
 
+def test_plan_submit_infeasible_hours_names_the_stuck_knobs(client):
+    """The floors can't fit the budget: say so instead of silently overshooting."""
+    _register(client)
+    bad = dict(PLAN_FORM)
+    bad["hours_per_week"] = "3"
+    bad["days"] = ["0", "1", "2", "3", "4", "5", "6"]
+    r = client.post("/generate/plan", data=bad)
+    assert r.status_code == 200
+    assert "needs at least" in r.text
+    assert "fewer days" in r.text and "raise your weekly hours" in r.text
+    uid = db.get_user_by_username("rider")["id"]
+    assert db.list_plans(uid) == []
+
+
 def test_calendar_page_ok_empty(client):
     _register(client)
     r = client.get("/calendar")

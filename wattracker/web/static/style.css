@@ -251,6 +251,18 @@ table.calendar th { text-align: center; }
 .cal-ooto-tag { font-size: 0.6rem; font-weight: 700; letter-spacing: 0.03em;
     color: #1a1a1a; background: var(--alert); border-radius: 3px;
     padding: 0 4px; vertical-align: middle; }
+/* Race day cells: the race IS the session, so no workout is scheduled -
+   mark the day clearly and badge it with its A/B priority. */
+.cal-cell.cal-race-day {
+    background-color: rgba(76, 175, 125, 0.14);
+    box-shadow: inset 0 3px 0 var(--ok);
+}
+.cal-race-tag { font-size: 0.6rem; font-weight: 700; letter-spacing: 0.03em;
+    color: #1a1a1a; background: var(--ok); border-radius: 3px;
+    padding: 0 4px; vertical-align: middle; }
+/* An A race is the one the season bends around - make it the loud one. */
+.cal-race-tag.cal-race-A { background: var(--accent); }
+.ooto-form select { width: 150px; }
 
 /* Calendar layout: calendar left (fills), OOTO panel right (fixed sidebar).
    Grid so it never wraps below; stacks only on narrow viewports. */

@@ -70,6 +70,167 @@ DEFAULT_MODEL = "polarized"
 RECOVERY_WEEK_EVERY = 4
 RECOVERY_MULTIPLIER = 0.65
 
+# ------------------------------------------------------------------- races
+# A rider's planned races are an INPUT to generation, never stored in the plan
+# recipe: they live in their own table and are read fresh every time the plan
+# is recomputed (see prescribe/reflow.py). The plan bends around them; they
+# never bend around the plan.
+
+# Taper shape (Bosquet et al. 2007, meta-analysis of tapering): the effect
+# comes from cutting session DURATION while holding frequency and intensity.
+# So no training day is dropped and no hard day is softened - only minutes go.
+TAPER_FAR_DAYS = 14      # taper starts this many days before an A race
+TAPER_NEAR_DAYS = 7      # the final week cuts harder
+TAPER_FAR_MULT = 0.75    # days -14..-8
+TAPER_NEAR_MULT = 0.45   # days -7..-1
+
+# Two A-races closer than this cannot both be tapered for; the later one is
+# planned as a B race instead (see resolve_race_conflicts).
+A_RACE_SEPARATION_DAYS = 21
+
+# Post-race recovery: ceil(race hours) easy sessions, bounded.
+RECOVERY_SESSIONS_MIN = 2
+RECOVERY_SESSIONS_MAX = 5
+
+HARD_KINDS = ("vo2max", "threshold", "sweet_spot")
+
+PRIORITY_A = "A"
+PRIORITY_B = "B"
+
+
+def _race_date(value) -> _dt.date:
+    if isinstance(value, _dt.datetime):
+        return value.date()
+    if isinstance(value, _dt.date):
+        return value
+    return _dt.date.fromisoformat(str(value))
+
+
+def normalize_races(races: Optional[Sequence[dict]]) -> List[dict]:
+    """Parse race rows into {date, priority, name, duration_min}, date-sorted.
+
+    Unparseable dates are dropped rather than raising: a single bad row must
+    not make a rider's whole plan un-regenerable.
+    """
+    out: List[dict] = []
+    for r in races or []:
+        try:
+            d = _race_date(r.get("date"))
+        except (ValueError, TypeError):
+            continue
+        priority = str(r.get("priority") or PRIORITY_B).strip().upper()
+        if priority not in (PRIORITY_A, PRIORITY_B):
+            priority = PRIORITY_B
+        duration = r.get("duration_min")
+        out.append({
+            "id": r.get("id"),
+            "date": d,
+            "priority": priority,
+            "name": r.get("name"),
+            "duration_min": int(duration) if duration else None,
+        })
+    # id breaks date ties so the ordering (and therefore the plan) is stable.
+    out.sort(key=lambda r: (r["date"], r["id"] if r["id"] is not None else 0))
+    return out
+
+
+def resolve_race_conflicts(races: List[dict]) -> tuple:
+    """Demote A races that sit inside another A race's taper. -> (races, conflicts)
+
+    Two A races closer than ``A_RACE_SEPARATION_DAYS`` cannot both be tapered
+    for - the second taper would start before the first race happened. Resolve
+    it deterministically in favour of the EARLIER race (it is the one already
+    being trained for) and plan the later one as a B race. This is a
+    planning-time decision only: the stored row keeps its priority, so moving
+    or deleting the first race restores the second one's taper.
+    """
+    resolved: List[dict] = []
+    conflicts: List[dict] = []
+    last_a: Optional[dict] = None
+    for r in races:
+        if r["priority"] == PRIORITY_A:
+            if last_a is not None and (
+                (r["date"] - last_a["date"]).days < A_RACE_SEPARATION_DAYS
+            ):
+                r = {**r, "priority": PRIORITY_B, "demoted": True}
+                conflicts.append({
+                    "date": r["date"].isoformat(),
+                    "name": r["name"],
+                    "conflicts_with": last_a["date"].isoformat(),
+                    "planned_as": PRIORITY_B,
+                })
+            else:
+                last_a = r
+        resolved.append(r)
+    return resolved, conflicts
+
+
+def recovery_sessions_for(duration_min: Optional[int]) -> int:
+    """How many easy sessions follow a race of this length."""
+    hours = -(-int(duration_min or 0) // 60)  # ceil
+    return max(RECOVERY_SESSIONS_MIN, min(RECOVERY_SESSIONS_MAX, hours))
+
+
+@dataclass(frozen=True)
+class RaceEffects:
+    """Per-date instructions the day loop applies (all keys are ISO dates)."""
+
+    skip: Set[str]            # race day itself - the race IS the session
+    taper: Dict[str, float]   # duration multiplier (A races only)
+    recovery: Set[str]        # post-race easy days (A races only)
+    easy_adjacent: Set[str]   # B-race neighbours: hard day -> endurance
+
+    def window(self) -> Set[str]:
+        """Every date a race has an opinion about.
+
+        Reflow uses this to decide when a race is allowed to overwrite an
+        adapt.py adjustment (see prescribe/reflow.py).
+        """
+        return set(self.skip) | set(self.taper) | self.recovery | self.easy_adjacent
+
+
+def race_effects(races: List[dict], scheduled: Sequence[_dt.date]) -> RaceEffects:
+    """Turn resolved races into per-date instructions for the given ride days."""
+    skip = {r["date"].isoformat() for r in races}
+    taper: Dict[str, float] = {}
+    recovery: Set[str] = set()
+    easy_adjacent: Set[str] = set()
+    ride_days = sorted(d for d in scheduled if d.isoformat() not in skip)
+
+    for r in races:
+        day = r["date"]
+        if r["priority"] == PRIORITY_A:
+            for offset in range(1, TAPER_FAR_DAYS + 1):
+                iso = (day - _dt.timedelta(days=offset)).isoformat()
+                mult = (TAPER_NEAR_MULT if offset <= TAPER_NEAR_DAYS
+                        else TAPER_FAR_MULT)
+                # Overlapping tapers: the deeper cut wins. Tapers only ever
+                # reduce, so taking the minimum keeps the volume invariant.
+                taper[iso] = min(taper.get(iso, 1.0), mult)
+            after = [d for d in ride_days if d > day]
+            for d in after[:recovery_sessions_for(r["duration_min"])]:
+                recovery.add(d.isoformat())
+        else:
+            easy_adjacent.add((day - _dt.timedelta(days=1)).isoformat())
+            easy_adjacent.add((day + _dt.timedelta(days=1)).isoformat())
+    return RaceEffects(skip, taper, recovery, easy_adjacent)
+
+
+def _feasible_min(kind: str, hard_slot: bool) -> float:
+    """Shortest duration ``build_workout`` can actually construct this session in.
+
+    The taper multiplier is applied and THEN clamped here. A 0.45x cut on a
+    70-min VO2max session asks for 31 minutes, which the interval builder
+    cannot fit and would raise on. Clamping (rather than swapping to a shorter
+    interval variant) is deliberate: keeping the intensity intact is the whole
+    point of a taper, so the volume reduction comes from the easy days instead.
+    """
+    if hard_slot:
+        return HIT_MIN_MIN
+    if kind == "sweet_spot":
+        return SWEET_SPOT_MIN_MIN
+    return MIN_SESSION_MIN
+
 
 def week_multiplier(week: int) -> float:
     """Volume multiplier for a 1-indexed week. Volume is flat (1.0) on normal
@@ -129,6 +290,12 @@ def hard_seconds(session: Session) -> int:
     return total
 
 
+def _hours_label(hours: float) -> str:
+    """'6 h' / '6.5 h' - no trailing '.0' in a user-facing message."""
+    h = float(hours)
+    return f"{h:g} h"
+
+
 def _cap_message(model: str, cap: int, selected: int) -> str:
     plural = "s" if cap != 1 else ""
     return (
@@ -163,6 +330,23 @@ def validate_plan_inputs(
     cap = MODELS[model].max_hard(n_days)
     if int(hit_days_per_week) > cap:
         return _cap_message(model, cap, int(hit_days_per_week))
+    # Feasibility: every session has a floor its interval builder cannot go
+    # below, so a week has a minimum length regardless of how the hours are
+    # distributed. If the floors do not fit the budget, no allocation exists
+    # and the plan must be refused - the only alternatives are dropping ride
+    # days or dropping hard days, and both would override one explicit user
+    # choice to honour another. Name the knobs instead.
+    hit = min(int(hit_days_per_week), n_days)
+    floor_min = hit * HIT_MIN_MIN + (n_days - hit) * MIN_SESSION_MIN
+    if floor_min > float(hours_per_week) * 60.0:
+        return (
+            f"{_hours_label(hours_per_week)}/week across {n_days} day"
+            f"{'s' if n_days != 1 else ''} with {hit} hard day"
+            f"{'s' if hit != 1 else ''} needs at least {floor_min} min/week "
+            f"(a hard session needs {HIT_MIN_MIN} min and an easy one "
+            f"{MIN_SESSION_MIN}). Ride fewer days, do fewer hard days, or "
+            f"raise your weekly hours."
+        )
     if hard_days:
         marked = set(int(d) for d in hard_days)
         if not marked.issubset(set(int(d) for d in days_of_week)):
@@ -174,6 +358,47 @@ def validate_plan_inputs(
     return None
 
 
+def _fit_week_to_budget(week_days: List[dict], budget_min: float) -> None:
+    """Trim a week's laid-out sessions back under ``budget_min``, in place.
+
+    Weekly hours are a hard user promise: a plan may come in under the number
+    the rider gave us, never over. The allocation above distributes fractional
+    minutes, but ``build_workout`` can only construct whole minutes, so every
+    session rounds independently - a week of five 97.5-minute days becomes five
+    98-minute days and overshoots the budget by 2 minutes. (The error scales
+    with the number of ride days, up to n/2 minutes.)
+
+    Minutes come off the LONGEST easy session first, one at a time, so the cut
+    lands where it is least felt and stays evenly spread. Hard sessions are a
+    last resort: intensity is the part of a week worth protecting, and by then
+    we are trimming single minutes anyway. Every session keeps its own
+    feasible floor.
+
+    Raises ValueError if the excess cannot be absorbed at all - that means the
+    floors do not fit the budget, which ``validate_plan_inputs`` rejects up
+    front, so it should be unreachable.
+    """
+    excess = sum(d["minutes"] for d in week_days) - int(budget_min)
+    if excess <= 0:
+        return
+    # Easy days first, then hard ones; within each group, longest first.
+    for hard_pass in (False, True):
+        while excess > 0:
+            candidates = [d for d in week_days
+                          if d["hard_slot"] is hard_pass
+                          and d["minutes"] > d["floor"]]
+            if not candidates:
+                break
+            victim = max(candidates, key=lambda d: (d["minutes"], d["date"]))
+            victim["minutes"] -= 1
+            excess -= 1
+    if excess > 0:
+        raise ValueError(
+            f"{int(budget_min)} min/week cannot hold this week's sessions "
+            f"even at their minimum durations."
+        )
+
+
 def generate_plan(
     name: str,
     start_date: _dt.date,
@@ -183,6 +408,7 @@ def generate_plan(
     hit_days_per_week: int,
     hard_days: Optional[Sequence[int]] = None,
     model: str = DEFAULT_MODEL,
+    races: Optional[Sequence[dict]] = None,
 ) -> Dict:
     """Generate a dated, multi-week plan for the chosen training model.
 
@@ -192,6 +418,13 @@ def generate_plan(
     auto-assignment. Returns a dict with the plan metadata, a list of dated
     workouts (each carrying its Session), and a per-week summary. Raises
     ValueError on invalid input.
+
+    ``races`` are the rider's planned races ({date, priority, name,
+    duration_min}); the plan bends around them - no workout on race day, a
+    two-week duration taper before an A race, easy days after it, and a hard
+    day either side of a B race softened to endurance. They only ever REDUCE
+    volume, so a week never exceeds ``hours_per_week``. The resolved races and
+    any A-race conflicts come back under the ``races`` key.
     """
     err = validate_plan_inputs(
         weeks, days_of_week, hours_per_week, hit_days_per_week, hard_days, model
@@ -209,6 +442,16 @@ def generate_plan(
 
     # Anchor to the Monday of the start week so weeks are calendar Mon-Sun.
     monday0 = start_date - _dt.timedelta(days=start_date.weekday())
+
+    # Races are resolved against the plan's full set of ride days up front:
+    # post-race recovery needs to know which days are actually ridden, and
+    # that is only knowable once every date is laid out.
+    scheduled = [
+        monday0 + _dt.timedelta(days=7 * w + weekday)
+        for w in range(weeks) for weekday in days
+    ]
+    resolved_races, race_conflicts = resolve_race_conflicts(normalize_races(races))
+    effects = race_effects(resolved_races, scheduled)
 
     workouts: List[dict] = []
     weekly: List[dict] = []
@@ -242,16 +485,23 @@ def generate_plan(
         easy_dur = max(MIN_SESSION_MIN, easy_total / easy_days) if easy_days else 0.0
 
         monday = monday0 + _dt.timedelta(days=7 * w)
-        week_total_s = 0
-        week_hard_s = 0
-        week_tss = 0.0
+        # The week is laid out first and only then built, so the rounding
+        # reconciliation below can see the whole week at once.
+        week_days: List[dict] = []
 
         for i, weekday in enumerate(days):
             date = monday + _dt.timedelta(days=weekday)
+            iso = date.isoformat()
+
+            # ---- Step 1: what a RACELESS plan would put here. -------------
+            # Every rotation counter is driven from this and only this, so a
+            # race can never perturb the sequence: the day a race touches is
+            # the only day that changes, and the plan after it is untouched.
             if i in hit_pos:
                 kind = cfg.hard_types[hit_counter % len(cfg.hard_types)]
                 hit_counter += 1
                 dur = hit_dur
+                hard_slot = True
             else:
                 # Mostly endurance, an occasional sweet-spot tempo day.
                 if easy_counter % 3 == 2 and easy_dur >= SWEET_SPOT_MIN_MIN:
@@ -260,21 +510,66 @@ def generate_plan(
                     kind = "endurance"
                 easy_counter += 1
                 dur = easy_dur
+                hard_slot = False
 
+            # ---- Step 2: consume this day's slot in the variant rotation. --
+            # Unconditional: skipped race days and substituted days consume
+            # their slot exactly as an untouched day would.
             names = VARIANTS.get(kind, ["classic"])
             variant = names[kind_counter.get(kind, 0) % len(names)]
             kind_counter[kind] = kind_counter.get(kind, 0) + 1
-            session = build_workout(kind, dur, variant)
+
+            if iso in effects.skip:
+                # Race day: the race IS the session, so nothing is generated.
+                continue
+
+            # ---- Step 3: apply the race's substitution, off-rotation. ------
+            # A substituted session is a one-off imposed by the race, not a
+            # member of the rotation, so it is pinned to "classic" and takes
+            # no variant slot of its own. (Its counter was already advanced
+            # above, for the kind the rotation actually asked for.)
+            if iso in effects.recovery:
+                # Post-race: keep the day, drop it to a recovery spin.
+                kind, hard_slot, variant = "recovery", False, "classic"
+            elif iso in effects.easy_adjacent and kind in HARD_KINDS:
+                # Either side of a B race: the race is the week's hard work, so
+                # the neighbouring interval day becomes endurance at the same
+                # duration. No taper, no extended recovery - it is a race, but
+                # it is not the one the season is built around.
+                kind, hard_slot, variant = "endurance", False, "classic"
+
+            mult = effects.taper.get(iso)
+            if mult is not None:
+                dur = max(dur * mult, _feasible_min(kind, hard_slot))
+
+            week_days.append({
+                "date": date.isoformat(),
+                "kind": kind,
+                "variant": variant,
+                # build_workout rounds to whole minutes, so track the day in
+                # minutes and let the reconciliation below work in that unit.
+                "minutes": int(round(dur)),
+                "floor": int(_feasible_min(kind, hard_slot)),
+                "hard_slot": hard_slot,
+            })
+
+        _fit_week_to_budget(week_days, float(hours_per_week) * 60.0)
+
+        week_total_s = 0
+        week_hard_s = 0
+        week_tss = 0.0
+        for day in week_days:
+            session = build_workout(day["kind"], day["minutes"], day["variant"])
             hs = hard_seconds(session)
             week_total_s += session.total_duration()
             week_hard_s += hs
             week_tss += session.estimated_tss
             workouts.append(
                 {
-                    "date": date.isoformat(),
+                    "date": day["date"],
                     "name": session.name,
-                    "type": kind,
-                    "variant": variant,
+                    "type": day["kind"],
+                    "variant": day["variant"],
                     "duration_s": session.total_duration(),
                     "tss": session.estimated_tss,
                     "hard_s": hs,
@@ -306,5 +601,16 @@ def generate_plan(
         "hard_days": sorted(hard_set),
         "workouts": workouts,
         "weekly": weekly,
+        "races": {
+            "planned": [
+                {"date": r["date"].isoformat(), "priority": r["priority"],
+                 "name": r["name"], "duration_min": r["duration_min"]}
+                for r in resolved_races
+            ],
+            "conflicts": race_conflicts,
+            # Dates a race has an opinion about; reflow needs them to know when
+            # a race may overwrite an adaptation.
+            "window": sorted(effects.window()),
+        },
         "polarized_hard_fraction": round(total_hard_s / total_s, 3) if total_s else 0.0,
     }

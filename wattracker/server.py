@@ -1116,6 +1116,8 @@ def create_app() -> FastAPI:
             y, m = y + 1, 1
 
         ooto_ranges = db.list_ooto_ranges(uid)
+        race_dates = db.list_race_dates(uid)
+        races_by_date = {r["date"]: r for r in race_dates}
 
         def _in_ooto(date_iso: str) -> bool:
             return any(r["start_date"] <= date_iso <= r["end_date"]
@@ -1160,6 +1162,7 @@ def create_app() -> FastAPI:
                         "day": d.day,
                         "in_month": d.month == m,
                         "ooto": _in_ooto(iso),
+                        "race": races_by_date.get(iso),
                         "workouts": by_date.get(iso, []),
                     }
                 )
@@ -1181,6 +1184,7 @@ def create_app() -> FastAPI:
                 next=f"?year={next_y}&month={next_m}",
                 plans=db.list_plans(uid),
                 ooto_ranges=ooto_ranges,
+                race_dates=race_dates,
                 export_result=request.query_params.get("exported"),
                 flash=request.query_params.get("flash"),
             ),
@@ -1244,6 +1248,103 @@ def create_app() -> FastAPI:
         except Exception:
             _log.warning("export sync after OOTO delete failed", exc_info=True)
         return RedirectResponse(url="/calendar", status_code=303)
+
+    # ------------------------------------------------------------- races
+    def _reflow_for_races(uid: int, lead: str = "Race saved.") -> str:
+        """Reflow the active plan around the user's races. Returns flash text.
+
+        Races are read fresh by reflow, so this is simply "recompute now".
+        Failures never block the CRUD that triggered them: the race row is the
+        user's data and is already saved; a plan that missed a reflow is fixed
+        by the next one (reflow is idempotent and self-healing).
+        """
+        plan = db.get_active_plan(uid)
+        if plan is None:
+            return f"{lead} No active plan to reflow — mark one active."
+        try:
+            result = reflow.reflow_plan(uid, plan["id"])
+        except Exception:
+            _log.warning("reflow after race change failed", exc_info=True)
+            return f"{lead} The plan could not be recomputed."
+        if result.get("status") != "ok":
+            return (f"{lead} “{plan['name']}” could not be recomputed "
+                    f"({result.get('reason')}).")
+        try:
+            exporter.sync_plan_exports(uid)
+        except Exception:
+            _log.warning("export sync after race change failed", exc_info=True)
+        changed = (result["updated"] + result["inserted"] + result["deleted"])
+        msg = f"{lead} {changed} workout{'' if changed == 1 else 's'} changed."
+        for c in result.get("race_conflicts") or []:
+            msg += (f" Note: the race on {c['date']} is within three weeks of "
+                    f"your A race on {c['conflicts_with']}, so it is planned "
+                    f"as a B race (only one taper is possible).")
+        return msg
+
+    def _race_form(date: str, priority: str, name: str, duration_min: str):
+        """Validate the race form. Returns parsed fields, or None if unusable."""
+        try:
+            day = _dt.date.fromisoformat((date or "").strip()).isoformat()
+        except (TypeError, ValueError):
+            return None
+        try:
+            minutes = int(duration_min) if str(duration_min).strip() else None
+        except (TypeError, ValueError):
+            minutes = None
+        if minutes is not None and minutes <= 0:
+            minutes = None
+        return day, (priority or "B"), (name or "").strip() or None, minutes
+
+    @app.post("/race/add")
+    def race_add(
+        request: Request,
+        date: str = Form(...),
+        priority: str = Form("B"),
+        name: str = Form(""),
+        duration_min: str = Form(""),
+    ):
+        uid = _uid(request)
+        parsed = _race_form(date, priority, name, duration_min)
+        if parsed is None:
+            return RedirectResponse(url="/calendar", status_code=303)
+        day, prio, race_name, minutes = parsed
+        db.add_race_date(uid, day, prio, race_name, minutes)
+        flash = _reflow_for_races(uid)
+        return RedirectResponse(
+            url="/calendar?flash=" + _url.quote(flash), status_code=303
+        )
+
+    @app.post("/race/{race_id}/update")
+    def race_update(
+        request: Request,
+        race_id: int,
+        date: str = Form(...),
+        priority: str = Form("B"),
+        name: str = Form(""),
+        duration_min: str = Form(""),
+    ):
+        uid = _uid(request)
+        parsed = _race_form(date, priority, name, duration_min)
+        if parsed is None:
+            return RedirectResponse(url="/calendar", status_code=303)
+        day, prio, race_name, minutes = parsed
+        if not db.update_race_date(uid, race_id, day, prio, race_name, minutes):
+            # Not this user's race (or already gone) -> no cross-user write.
+            return JSONResponse({"error": "not found"}, status_code=404)
+        flash = _reflow_for_races(uid)
+        return RedirectResponse(
+            url="/calendar?flash=" + _url.quote(flash), status_code=303
+        )
+
+    @app.post("/race/{race_id}/delete")
+    def race_delete(request: Request, race_id: int):
+        uid = _uid(request)
+        if not db.delete_race_date(uid, race_id):
+            return JSONResponse({"error": "not found"}, status_code=404)
+        flash = _reflow_for_races(uid, "Race removed.")
+        return RedirectResponse(
+            url="/calendar?flash=" + _url.quote(flash), status_code=303
+        )
 
     @app.post("/generate/export")
     def generate_export(request: Request, scheduled_date: str = Form("")):
