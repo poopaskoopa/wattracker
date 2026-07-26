@@ -113,6 +113,24 @@ def test_ride_page_renders_available_when_monkeypatched(client, monkeypatch):
     assert r.text.index('id="scanBusy"') > r.text.index('id="connectBtn"')
     assert 'className = "device-disconnect button-secondary"' in r.text
     assert 'requestDisconnect(deviceAddress);' in r.text
+    assert r.text.count('aria-busy="false"') >= 2
+    assert '"Connecting…", "Connect selected sensors"' in r.text
+    assert '"Disconnecting " + displayName(address) + "…"' in r.text
+    assert "device-disconnect-pending" in r.text
+    assert "RECONNECT_RELEASE_DELAY_MS = 750" in r.text
+    assert "var reconnectTimer = null;" in r.text
+    assert "function cancelPendingReconnect()" in r.text
+    assert "window.clearTimeout(reconnectTimer);" in r.text
+    assert "reconnectTimer = window.setTimeout(function ()" in r.text
+    assert r.text.index("reconnectTimer = null;\n                    openRide(nextOpen.sim);") > r.text.index(
+        "reconnectTimer = window.setTimeout(function ()"
+    )
+    assert "var cancelledReconnect = cancelPendingReconnect();" in r.text
+    assert '"Pending reconnect cancelled — ready to Scan or Connect."' in r.text
+    assert '"Bluetooth released — ready to Scan or Connect."' in r.text
+    assert 'state === "connecting" || !bleAvailable' in r.text
+    assert "if (!resp.ok)" in r.text
+    assert "Wake or spin the device" in r.text
     assert 'text: "Workout time"' in r.text
     assert "min: 0, max: duration" in r.text
     # The axis reads as a clock (mm:ss, h:mm:ss past the hour), not decimal minutes.
@@ -370,6 +388,21 @@ def test_ride_scan_returns_role_and_rssi_contract(client, monkeypatch):
     assert data["available"] is True
     assert data["devices"][0]["roles"] == ["power"]
     assert data["devices"][0]["rssi"] == -55
+
+
+def test_ride_scan_empty_result_is_actionable_http_failure(client, monkeypatch):
+    _register(client)
+    monkeypatch.setattr(bledevices, "bluetooth_available", lambda: (True, "ok"))
+
+    async def fake_scan():
+        return []
+
+    monkeypatch.setattr(bledevices, "scan", fake_scan)
+    response = client.post("/ride/scan")
+
+    assert response.status_code == 404
+    assert response.json()["available"] is True
+    assert "Wake or spin" in response.json()["reason"]
 
 
 def test_ride_requires_auth(client):
@@ -971,6 +1004,94 @@ def test_ride_ws_prepared_actions_toggle_erg_and_disconnect_one_device(
 
     assert right_client.disconnected is True
     assert trainer_client.disconnected is True
+
+
+def test_ride_ws_last_ride_device_disconnect_ends_session_and_releases_clients(
+    client, monkeypatch
+):
+    from starlette.datastructures import QueryParams
+    from wattracker import server as servermod
+    from wattracker.ble.devices import SimulatedHeartRateSource, SimulatedPowerSource
+
+    _register(client)
+    uid = db.get_user_by_username("rider")["id"]
+    events = []
+
+    class FakeClient:
+        def __init__(self, address):
+            self.address = address
+
+        async def disconnect(self):
+            events.append("disconnect:" + self.address)
+
+    power = SimulatedPowerSource([0])
+    heart = SimulatedHeartRateSource()
+    power_client = FakeClient("POWER")
+    heart_client = FakeClient("HR")
+    conn = {
+        "trainer": None,
+        "power_source": power,
+        "hr_source": heart,
+        "clients": [power_client, heart_client],
+        "clients_by_address": {"POWER": power_client, "HR": heart_client},
+        "bindings": {
+            "POWER": {"name": "Pedals", "roles": {"power": power}},
+            "HR": {"name": "Heart", "roles": {"hr": heart}},
+        },
+        "names": {"power": "Pedals", "hr": "Heart"},
+        "errors": [],
+    }
+
+    async def fake_connect(timeout=6.0, selected=None):
+        return conn
+
+    monkeypatch.setattr(
+        servermod.bledevices, "bluetooth_available", lambda: (True, "ok")
+    )
+    monkeypatch.setattr(servermod.bledevices, "connect_sensors", fake_connect)
+
+    class FakeWebSocket:
+        headers = {}
+        session = {"user_id": uid}
+        query_params = QueryParams("prepare=1")
+
+        def __init__(self):
+            self.messages = []
+            self.received = 0
+
+        async def accept(self):
+            pass
+
+        async def send_json(self, message):
+            self.messages.append(message)
+
+        async def receive_json(self):
+            self.received += 1
+            if self.received == 1:
+                return {"action": "disconnect", "address": "POWER"}
+            await asyncio.Future()
+
+        async def close(self, code=None):
+            events.append("close")
+
+    endpoint = next(
+        route.endpoint
+        for route in client.app.routes
+        if getattr(route, "path", None) == "/ride/ws"
+    )
+    websocket = FakeWebSocket()
+    asyncio.run(endpoint(websocket))
+
+    disconnected = next(
+        message
+        for message in websocket.messages
+        if message.get("status") == "device_disconnected"
+    )
+    assert disconnected["ending_session"] is True
+    assert disconnected["devices"] == {"hr": "Heart"}
+    assert "Releasing Bluetooth" in disconnected["message"]
+    assert events == ["disconnect:POWER", "disconnect:HR", "close"]
+    assert db.list_activities(uid) == []
 
 
 def test_ride_ws_active_actions_toggle_erg_and_validate_disconnect(

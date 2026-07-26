@@ -37,6 +37,8 @@ BLE_VALUE_STALE_S = 3.0
 # a KICKR right after a session) fails fast with a visible error instead of
 # hanging the WebSocket forever.
 CONNECT_TIMEOUT_S = 10.0
+CONNECT_RETRY_DELAY_S = 0.25
+SCAN_ATTEMPTS = 2
 
 
 def bleak_available() -> Tuple[bool, str]:
@@ -461,42 +463,78 @@ class BleakTrainer(Trainer):
         self._schedule(self.async_stop())
 
 
-async def scan(timeout: float = 5.0) -> List[dict]:
+async def scan(timeout: float = 5.0, attempts: int = SCAN_ATTEMPTS) -> List[dict]:
     """Discover nearby BLE devices grouped by advertised service.
 
     Requires ``bleak`` + an adapter. Raises RuntimeError when unavailable.
+    Multiple sweeps reduce intermittent advertising misses; sightings are
+    merged by the adapter's opaque address.
     """
     ok, reason = bleak_available()
     if not ok:
         raise RuntimeError(f"Bluetooth unavailable: {reason}")
     from bleak import BleakScanner  # type: ignore
 
-    devices = await BleakScanner.discover(timeout=timeout, return_adv=True)
-    out: List[dict] = []
-    for _addr, (device, adv) in devices.items():
-        services = [service.lower() for service in (adv.service_uuids or [])]
-        roles = []
+    attempts = max(1, int(attempts))
+    merged: Dict[str, dict] = {}
+    failures = []
+    for _attempt in range(attempts):
+        try:
+            discovered = await BleakScanner.discover(
+                timeout=timeout, return_adv=True
+            )
+        except Exception as exc:
+            failures.append(exc)
+            continue
+        for _addr, (device, adv) in discovered.items():
+            address = device.address
+            services = [
+                service.lower() for service in (adv.service_uuids or [])
+            ]
+            name = device.name or adv.local_name or "(unknown)"
+            rssi = adv.rssi
+            sighting = merged.setdefault(
+                address,
+                {
+                    "address": address,
+                    "name": name,
+                    "services": [],
+                    "roles": [],
+                    "rssi": rssi,
+                },
+            )
+            if sighting["name"] == "(unknown)" and name != "(unknown)":
+                sighting["name"] = name
+            for service in services:
+                if service not in sighting["services"]:
+                    sighting["services"].append(service)
+            if rssi is not None and (
+                sighting["rssi"] is None or rssi > sighting["rssi"]
+            ):
+                sighting["rssi"] = rssi
+
+    if not merged and len(failures) == attempts:
+        details = "; ".join(str(exc) for exc in failures if str(exc))
+        raise RuntimeError(
+            "Bluetooth scan failed on every attempt"
+            + (f": {details}" if details else ".")
+        ) from failures[-1]
+
+    for sighting in merged.values():
+        services = sighting["services"]
         if CYCLING_POWER_SERVICE in services:
-            roles.append("power")
+            sighting["roles"].append("power")
         if HEART_RATE_SERVICE in services:
-            roles.append("hr")
+            sighting["roles"].append("hr")
         if FITNESS_MACHINE_SERVICE in services:
-            roles.append("trainer")
-        out.append(
-            {
-                "address": device.address,
-                "name": device.name or adv.local_name or "(unknown)",
-                "services": services,
-                "roles": roles,
-                "rssi": adv.rssi,
-            }
-        )
-    return out
+            sighting["roles"].append("trainer")
+    return list(merged.values())
 
 
 async def connect_sensors(
     timeout: float = 6.0,
     selected: Optional[dict] = None,
+    retry_delay: Optional[float] = None,
 ) -> dict:
     """Connect selected sensors, or auto-discover the first sensor per role.
 
@@ -512,6 +550,8 @@ async def connect_sensors(
     if not ok:
         raise RuntimeError(f"Bluetooth unavailable: {reason}")
     from bleak import BleakClient  # type: ignore
+    if retry_delay is None:
+        retry_delay = CONNECT_RETRY_DELAY_S
 
     roles: dict = {"trainer": [], "power": [], "hr": []}
     if selected is None:
@@ -555,32 +595,44 @@ async def connect_sensors(
                 addr = dev["address"]
                 client = clients.get(addr)
                 if client is None:
-                    client = BleakClient(addr)
-                    try:
-                        await asyncio.wait_for(
-                            client.connect(), timeout=CONNECT_TIMEOUT_S
-                        )
-                    except asyncio.TimeoutError:
+                    final_error = None
+                    timed_out = False
+                    for attempt in range(2):
+                        client = BleakClient(addr)
                         try:
-                            await client.disconnect()
-                        except BaseException:
-                            pass
-                        message = (
-                            f"Timed out connecting {role} sensor {dev['name']} "
-                            f"({addr}) — it may still be held by another app or a "
-                            f"previous ride; wait a few seconds and retry."
-                        )
-                        log.warning(message)
-                        out["errors"].append(message)
-                        continue
-                    except BaseException as e:
-                        try:
-                            await client.disconnect()
-                        except BaseException:
-                            pass
-                        if not isinstance(e, Exception):
-                            raise
-                        message = f"Could not connect {role} sensor {dev['name']} ({addr}): {e}"
+                            await asyncio.wait_for(
+                                client.connect(), timeout=CONNECT_TIMEOUT_S
+                            )
+                            final_error = None
+                            break
+                        except asyncio.TimeoutError as exc:
+                            final_error = exc
+                            timed_out = True
+                        except BaseException as exc:
+                            final_error = exc
+                            timed_out = False
+                        finally:
+                            if final_error is not None:
+                                try:
+                                    await client.disconnect()
+                                except BaseException:
+                                    pass
+                        if not isinstance(final_error, Exception):
+                            raise final_error
+                        if attempt == 0 and retry_delay > 0:
+                            await asyncio.sleep(retry_delay)
+                    if final_error is not None:
+                        if timed_out:
+                            message = (
+                                f"Timed out connecting {role} sensor {dev['name']} "
+                                f"({addr}) — it may still be held by another app or a "
+                                f"previous ride; wait a few seconds and retry."
+                            )
+                        else:
+                            message = (
+                                f"Could not connect {role} sensor {dev['name']} "
+                                f"({addr}): {final_error}"
+                            )
                         log.warning(message)
                         out["errors"].append(message)
                         continue
@@ -622,6 +674,22 @@ async def connect_sensors(
             except BaseException:
                 pass
         raise
+
+    # A successful transport connection is useful only when at least one role
+    # was initialized. Release setup orphans, while retaining shared-address
+    # clients where another role on that same device succeeded.
+    for addr, client in list(clients.items()):
+        if out["bindings"].get(addr, {}).get("roles"):
+            continue
+        try:
+            await client.disconnect()
+        except BaseException:
+            pass
+        clients.pop(addr, None)
+        try:
+            out["clients"].remove(client)
+        except ValueError:
+            pass
 
     if power_sources:
         out["power_source"] = (
