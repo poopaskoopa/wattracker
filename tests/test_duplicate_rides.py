@@ -156,7 +156,7 @@ def test_v19_backfills_in_app_rides_to_utc_across_dst(tmp_path):
     version = conn.execute("PRAGMA user_version").fetchone()[0]
     conn.close()
 
-    assert version == 19
+    assert version == db.SCHEMA_VERSION
     assert starts[0] == "2025-01-16T00:00:00"          # +5h in winter
     assert starts[1] == "2025-07-15T23:00:00.500000"   # +4h in summer, precision kept
     assert starts[2] == "2025-07-15T23:00:00"          # imported row untouched
@@ -389,5 +389,5 @@ def test_v19_migrates_in_a_timezone_that_has_never_had_dst(tmp_path):
     start = conn.execute("SELECT start_time FROM activities").fetchone()[0]
     version = conn.execute("PRAGMA user_version").fetchone()[0]
     conn.close()
-    assert version == 19
+    assert version == db.SCHEMA_VERSION
     assert start == "2025-07-15T10:00:00"  # JST is UTC+9 year-round
