@@ -2,14 +2,132 @@
 
 Powers are stored as fractions of FTP (0.90 == 90% FTP). Durations are whole
 seconds. `plan_workout(state, duration_min)` is a pure function.
+
+Every builder takes an optional ``profile`` - the rider's MEASURED capacities
+(``metrics.rider.RiderMetrics``) - so a prescription can be built on what this
+rider can actually do rather than on a population constant. ``profile=None``
+reproduces the population constants exactly, which is what keeps ad-hoc
+previews, legacy plan rows and every existing caller identical.
+
+Only the targets that a fixed %FTP genuinely cannot express are profile-derived:
+neuromuscular sprint power and VO2max. Threshold, sweet spot, tempo, endurance
+and recovery are already rider-specific, because FTP itself is the rider's own
+measured 20-minute-derived number and those targets are expressed against it.
 """
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass, field
-from typing import List, Optional
+from typing import TYPE_CHECKING, List, Optional
+
+if TYPE_CHECKING:  # import for typing only - this module stays dependency-free
+    from ..metrics.rider import RiderMetrics
 
 MIN_DURATION_MIN = 30
 MAX_DURATION_MIN = 480
+
+# --------------------------------------------------------------- rider targets
+# Population fallbacks. Each is used verbatim when the rider has not measured
+# the corresponding capacity, so an unmeasured rider gets exactly the
+# prescription this planner has always produced.
+
+# Neuromuscular (Coggan/Allen Level 7) power is listed as "N/A" as a %FTP - it
+# is deliberately not prescribable that way. This figure is therefore NOT a
+# target: sprints are prescribed as maximal free efforts (see ``_sprint``) and
+# nothing is sent to the trainer. It exists only so a 12s all-out effort
+# contributes a plausible amount of load to the TSS estimate, and as the
+# nominal figure published to the "Just Ride" picker.
+SPRINT_LOAD_RATIO_DEFAULT = 3.00
+
+# VO2max work power as a multiple of FTP when 5-minute power is unmeasured.
+VO2_RATIO_DEFAULT = 1.12
+
+# A rider's 5-minute mean-maximal power is a single MAXIMAL effort by
+# definition, so it cannot be the target for five repeats of it. Physiology
+# gives the discount: repeated 4-minute intervals are sustainable at roughly
+# 90-95% of 5-minute maximal power, so we take the midpoint of that band.
+VO2_REPEATABLE_FRACTION = 0.92
+
+# Bounds on the derived VO2max target. A single corrupt MMP point (a power
+# spike, a mis-scaled file, an FTP that has not caught up with a step change in
+# fitness) must not be able to prescribe an absurd session. The band is the
+# Coggan Level 5 range widened slightly at the top for riders with a genuinely
+# large aerobic reserve over their FTP.
+VO2_RATIO_MIN = 1.06
+VO2_RATIO_MAX = 1.30
+
+# Deliberately NOT consumed here: rider phenotype (sprinter / pursuiter /
+# time-trialist / all-rounder) from ``analysis.power_profile.classify_phenotype``.
+# Phenotype changes WHICH sessions a rider should be given, not what a given
+# session's target is, so it belongs with the goal/plan-shape work rather than
+# half-wired into individual builders.
+
+
+def _measured(profile: Optional["RiderMetrics"], attr: str) -> Optional[float]:
+    """A positive, finite measured value off the profile, else None.
+
+    Duck-typed on purpose: callers pass a ``RiderMetrics``, but any object with
+    the attribute works, and a profile whose every field is None behaves exactly
+    like no profile at all.
+    """
+    if profile is None:
+        return None
+    value = getattr(profile, attr, None)
+    if value is None or isinstance(value, bool):
+        return None
+    try:
+        f = float(value)
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(f) or f <= 0:
+        return None
+    return f
+
+
+def sprint_load_ratio(profile: Optional["RiderMetrics"] = None) -> float:
+    """Multiple of FTP used to ACCOUNT for a 12s sprint's training load.
+
+    This is a load-accounting figure, never a target: no sprint power is sent
+    to the trainer or written into the .zwo (see ``_sprint``). The rider's own
+    measured 5s peak is the honest number when we have it - a rider who sprints
+    at 4.35x FTP does far more work in 12s than the 3.00x population stand-in
+    credits them with, and their TSS should say so.
+    """
+    return _measured(profile, "sprint_ratio") or SPRINT_LOAD_RATIO_DEFAULT
+
+
+def vo2_target(profile: Optional["RiderMetrics"] = None) -> Optional[float]:
+    """Repeatable VO2max target as a multiple of FTP, or None if unmeasured.
+
+    Returns None (rather than the default) so callers can keep their original
+    wording when nothing was measured; ``vo2_target(None)`` therefore reproduces
+    the previous prescription byte-for-byte.
+    """
+    ratio = _measured(profile, "vo2_ratio")
+    if ratio is None:
+        return None
+    return max(VO2_RATIO_MIN, min(VO2_RATIO_MAX, ratio * VO2_REPEATABLE_FRACTION))
+
+
+def vo2_power(base: float, profile: Optional["RiderMetrics"] = None) -> float:
+    """A VO2max variant's target, moved to this rider's aerobic ceiling.
+
+    Each VO2max variant prescribes a different %FTP because its intervals are a
+    different length (30/30s sit above 4-minute efforts, 5-minute efforts
+    below), and those relationships are a property of the session, not of the
+    rider. So a measured rider shifts the whole family by one factor - the ratio
+    between their repeatable VO2 target and the population 112% - rather than
+    every variant collapsing onto the same number. Each result is clamped to the
+    same sane band, so a corrupt MMP point cannot escape through a variant.
+
+    Returns ``base`` unchanged (same float, no rounding) when nothing is
+    measured, which is what keeps an unmeasured rider's .zwo byte-identical.
+    """
+    derived = vo2_target(profile)
+    if derived is None:
+        return base
+    scaled = base * (derived / VO2_RATIO_DEFAULT)
+    return round(max(VO2_RATIO_MIN, min(VO2_RATIO_MAX, scaled)), 3)
 
 
 @dataclass
@@ -35,9 +153,20 @@ class Segment:
     on_power: Optional[float] = None
     off_power: Optional[float] = None
     text: Optional[str] = None
+    # Load-accounting power for a segment that has no target (``freeride``).
+    # It is NEVER rendered into the .zwo and never becomes a trainer target -
+    # it exists so an unstructured maximal effort contributes its real share of
+    # the TSS estimate instead of counting as zero watts.
+    load_fraction: Optional[float] = None
 
     def avg_fraction(self) -> float:
-        """Average power as a fraction of FTP over the whole segment."""
+        """Average power as a fraction of FTP over the whole segment.
+
+        For a ``freeride`` segment this is the load-accounting estimate, not a
+        prescription: there is no target to average.
+        """
+        if self.kind == "freeride":
+            return self.load_fraction or self.power or 0.0
         if self.kind == "intervals" and self.repeat:
             on = (self.on_duration or 0) * (self.on_power or 0.0)
             off = (self.off_duration or 0) * (self.off_power or 0.0)
@@ -61,6 +190,7 @@ class Segment:
             "off_duration": self.off_duration,
             "on_power": self.on_power,
             "off_power": self.off_power,
+            "load_fraction": self.load_fraction,
             "text": self.text,
         }
 
@@ -124,7 +254,8 @@ def _finish(session: Session, total_s: int, cooldown_low: float = 0.50,
     return session
 
 
-def _easy_endurance(total_s: int) -> Session:
+def _easy_endurance(total_s: int,
+                    profile: Optional["RiderMetrics"] = None) -> Session:
     """Z1-2 easy endurance ride (recovery/overreach prescription)."""
     warmup = min(300, total_s // 6 or 60)
     s = Session(
@@ -146,7 +277,8 @@ def _easy_endurance(total_s: int) -> Session:
     return _finish(s, total_s, cooldown_low=0.45, cooldown_high=0.55)
 
 
-def _vo2max(total_s: int) -> Session:
+def _vo2max(total_s: int,
+            profile: Optional["RiderMetrics"] = None) -> Session:
     """VO2max: 5-6 x 4min @110-115% FTP with equal recoveries."""
     warmup = 600
     on = 240  # 4 min
@@ -170,9 +302,16 @@ def _vo2max(total_s: int) -> Session:
     while warmup + work > total_s and off > 120:
         off -= 30
         work = reps * (on + off)
+    # The rider's own repeatable VO2 power when we have measured 5-minute
+    # power, the population 112% when we do not. Wording follows the number:
+    # with nothing measured the original "110-115% FTP" band is kept verbatim,
+    # so an unmeasured rider's session is unchanged down to the .zwo text.
+    on_power = vo2_power(VO2_RATIO_DEFAULT, profile)
+    band = ("110-115% FTP" if on_power == VO2_RATIO_DEFAULT
+            else f"{on_power * 100:.0f}% FTP")
     s = Session(
         name="VO2max Intervals",
-        description=f"{reps} x 4min at 110-115% FTP to break through a plateau.",
+        description=f"{reps} x 4min at {band} to break through a plateau.",
         workout_type="vo2max",
     )
     s.segments.append(
@@ -182,13 +321,14 @@ def _vo2max(total_s: int) -> Session:
     s.segments.append(
         Segment(kind="intervals", duration=work, repeat=reps,
                 on_duration=on, off_duration=off,
-                on_power=1.12, off_power=0.50,
-                text="4min hard, 4min easy. Hold 110-115% FTP.")
+                on_power=on_power, off_power=0.50,
+                text=f"4min hard, 4min easy. Hold {band}.")
     )
     return _finish(s, total_s)
 
 
-def _sweet_spot(total_s: int) -> Session:
+def _sweet_spot(total_s: int,
+                profile: Optional["RiderMetrics"] = None) -> Session:
     """Sweet spot intervals at 88-94% FTP."""
     warmup = 600
     on = 720  # 12 min
@@ -219,7 +359,8 @@ def _sweet_spot(total_s: int) -> Session:
     return _finish(s, total_s)
 
 
-def _threshold(total_s: int) -> Session:
+def _threshold(total_s: int,
+               profile: Optional["RiderMetrics"] = None) -> Session:
     """Threshold intervals at 91-95% FTP (3 x 12-15min)."""
     warmup = 600
     on = 780  # 13 min
@@ -252,7 +393,8 @@ def _threshold(total_s: int) -> Session:
     return _finish(s, total_s)
 
 
-def _z2_endurance(total_s: int) -> Session:
+def _z2_endurance(total_s: int,
+                  profile: Optional["RiderMetrics"] = None) -> Session:
     """Long Zone 2 aerobic endurance."""
     warmup = 600
     s = Session(
@@ -307,7 +449,8 @@ def absorb_long_cooldown(session: Session, max_cooldown_s: int = MAX_COOLDOWN_S,
     return spare
 
 
-def _tempo(total_s: int) -> Session:
+def _tempo(total_s: int,
+           profile: Optional["RiderMetrics"] = None) -> Session:
     """Tempo intervals at 76-90% FTP (Coggan Level 3) on a Zone 2 base.
 
     Up to 5 x 15min @80% as the duration allows; any time beyond a 10min
@@ -353,8 +496,12 @@ def _tempo(total_s: int) -> Session:
     return _finish(s, total_s)
 
 
-def _sprint(total_s: int) -> Session:
-    """Neuromuscular sprints (Coggan Level 7): 12s maximal, full recovery."""
+def _sprint(total_s: int,
+            profile: Optional["RiderMetrics"] = None) -> Session:
+    """Neuromuscular sprints (Coggan Level 7): 12s maximal, full recovery.
+
+    Prescribed with NO power target - each effort is a free-ride block.
+    """
     warmup = 600
     on = 12
     off = 168  # ~3 min easy between efforts
@@ -378,20 +525,28 @@ def _sprint(total_s: int) -> Session:
         Segment(kind="warmup", duration=warmup, power_low=0.50, power_high=0.80,
                 text="Progressive warmup with two brief openers.")
     )
-    # Coggan/Allen list Level 7 (neuromuscular power) as "N/A" - it is
-    # deliberately not prescribable as a %FTP, so any number here is a
-    # stand-in. 2.00 was far below what a 12s maximal effort actually
-    # produces: the Coggan power-profile tables put trained 5s peak power
-    # near 3-4x FTP in W/kg terms, so 3.00 is the low end of a real
-    # neuromuscular effort rather than a threshold-ish number.
-    s.segments.append(
-        Segment(kind="intervals", duration=work, repeat=reps,
-                on_duration=on, off_duration=off,
-                on_power=3.00, off_power=0.55,
-                text="12s all-out from a rolling start - go as hard as you can. "
-                     "The 300% FTP figure is a nominal target, not a cap. "
-                     "Spin easy for 3min between efforts.")
-    )
+    # A sprint is prescribed as a MAXIMAL EFFORT WITH NO POWER TARGET. Coggan/
+    # Allen list Level 7 as "N/A" as a %FTP for a reason, and ERG mode makes it
+    # actively wrong to name a number: ERG clamps the rider to the target and
+    # cannot track a 12s effort anyway, so a nominal figure turns "go as hard as
+    # you can" into "do not exceed this". Each rep is therefore a free-ride
+    # block (Zwift's FreeRide - the rider drives the trainer) followed by its
+    # own recovery block, rather than one interval carrying an on_power.
+    #
+    # `load_fraction` is the separate, non-prescriptive concept: TSS still needs
+    # a number for those 12 seconds, and the rider's own measured 5s ratio is
+    # the honest one. It is never rendered into the .zwo.
+    load = sprint_load_ratio(profile)
+    for _ in range(reps):
+        s.segments.append(
+            Segment(kind="freeride", duration=on, load_fraction=load,
+                    text="12s all out from a rolling start - no target, "
+                         "just go as hard as you can.")
+        )
+        s.segments.append(
+            Segment(kind="steadystate", duration=off, power=0.55,
+                    text="Spin easy for 3min - full recovery before the next one.")
+        )
     return _finish(s, total_s)
 
 
@@ -404,7 +559,8 @@ def _sprint(total_s: int) -> Session:
 # ---------------------------------------------------------------------------
 
 
-def _vo2max_short_short(total_s: int) -> Session:
+def _vo2max_short_short(total_s: int,
+                        profile: Optional["RiderMetrics"] = None) -> Session:
     """VO2max 30/30s: sets of 10 x 30s @118% / 30s easy."""
     warmup = 600
     on, off, per_set = 30, 30, 10
@@ -419,9 +575,11 @@ def _vo2max_short_short(total_s: int) -> Session:
         sets -= 1
     while used(sets) + 120 > total_s and warmup > 300:
         warmup -= 60
+    on_power = vo2_power(1.18, profile)
     s = Session(
         name="VO2max 30/30s",
-        description=f"{sets} sets of 10 x 30s at 118% FTP / 30s easy.",
+        description=(f"{sets} sets of 10 x 30s at {on_power * 100:.0f}% FTP / "
+                     "30s easy."),
         workout_type="vo2max",
     )
     s.segments.append(
@@ -432,7 +590,7 @@ def _vo2max_short_short(total_s: int) -> Session:
         s.segments.append(
             Segment(kind="intervals", duration=set_len, repeat=per_set,
                     on_duration=on, off_duration=off,
-                    on_power=1.18, off_power=0.55,
+                    on_power=on_power, off_power=0.55,
                     text="30s hard / 30s easy - punchy VO2 efforts.")
         )
         if k < sets - 1:
@@ -443,7 +601,8 @@ def _vo2max_short_short(total_s: int) -> Session:
     return _finish(s, total_s)
 
 
-def _vo2max_long_intervals(total_s: int) -> Session:
+def _vo2max_long_intervals(total_s: int,
+                           profile: Optional["RiderMetrics"] = None) -> Session:
     """VO2max long intervals: 4 x 5min @108% FTP."""
     warmup = 600
     on, off = 300, 240
@@ -460,9 +619,11 @@ def _vo2max_long_intervals(total_s: int) -> Session:
         work = reps * (on + off)
     while warmup + work > total_s and warmup > 180:
         warmup -= 60
+    on_power = vo2_power(1.08, profile)
+    pct = f"{on_power * 100:.0f}%"
     s = Session(
         name="VO2max Long Intervals",
-        description=f"{reps} x 5min at 108% FTP - sustained VO2 efforts.",
+        description=f"{reps} x 5min at {pct} FTP - sustained VO2 efforts.",
         workout_type="vo2max",
     )
     s.segments.append(
@@ -472,16 +633,21 @@ def _vo2max_long_intervals(total_s: int) -> Session:
     s.segments.append(
         Segment(kind="intervals", duration=work, repeat=reps,
                 on_duration=on, off_duration=off,
-                on_power=1.08, off_power=0.52,
-                text="5min hard, 4min easy. Hold ~108% FTP.")
+                on_power=on_power, off_power=0.52,
+                text=f"5min hard, 4min easy. Hold ~{pct} FTP.")
     )
     return _finish(s, total_s)
 
 
-def _vo2max_descending(total_s: int) -> Session:
+def _vo2max_descending(total_s: int,
+                       profile: Optional["RiderMetrics"] = None) -> Session:
     """VO2max descending ladder: 5-4-3-2min with equal recoveries."""
     warmup = 600
-    rungs = [(300, 1.10), (240, 1.12), (180, 1.13), (120, 1.14)]
+    rungs = [(dur, vo2_power(base, profile)) for dur, base in
+             ((300, 1.10), (240, 1.12), (180, 1.13), (120, 1.14))]
+    # The advertised band describes the ladder's shape, so it is taken from the
+    # full ladder and does not narrow when a short ride drops the last rungs.
+    powers = [p for _, p in rungs]
 
     def used(rs) -> int:
         # each work rung followed by equal-length recovery except the last
@@ -491,9 +657,12 @@ def _vo2max_descending(total_s: int) -> Session:
         rungs = rungs[:-1]
     while used(rungs) + 120 > total_s and warmup > 300:
         warmup -= 60
+    lo_pct = min(powers) * 100
+    hi_pct = max(powers) * 100
     s = Session(
         name="VO2max Descending Ladder",
-        description="5-4-3-2min VO2 efforts at 110-114% FTP, equal recoveries.",
+        description=(f"5-4-3-2min VO2 efforts at {lo_pct:.0f}-{hi_pct:.0f}% FTP, "
+                     "equal recoveries."),
         workout_type="vo2max",
     )
     s.segments.append(
@@ -513,7 +682,8 @@ def _vo2max_descending(total_s: int) -> Session:
     return _finish(s, total_s)
 
 
-def _threshold_two_by_twenty(total_s: int) -> Session:
+def _threshold_two_by_twenty(total_s: int,
+                             profile: Optional["RiderMetrics"] = None) -> Session:
     """Threshold long intervals: 2 long sustained blocks at 91% FTP.
 
     Interval length scales with duration (keeping ~43% of time as work, like
@@ -548,7 +718,8 @@ def _threshold_two_by_twenty(total_s: int) -> Session:
     return _finish(s, total_s)
 
 
-def _threshold_over_unders(total_s: int) -> Session:
+def _threshold_over_unders(total_s: int,
+                           profile: Optional["RiderMetrics"] = None) -> Session:
     """Threshold over-unders: blocks alternating 2min@95% / 1min@105%."""
     warmup = 600
     under, over = 120, 60
@@ -589,7 +760,8 @@ def _threshold_over_unders(total_s: int) -> Session:
     return _finish(s, total_s)
 
 
-def _sweet_spot_long_blocks(total_s: int) -> Session:
+def _sweet_spot_long_blocks(total_s: int,
+                            profile: Optional["RiderMetrics"] = None) -> Session:
     """Sweet spot long blocks: 2 long blocks at 88% FTP (scales with duration)."""
     warmup = 600
     reps, off = 2, 300
@@ -619,7 +791,8 @@ def _sweet_spot_long_blocks(total_s: int) -> Session:
     return _finish(s, total_s)
 
 
-def _sweet_spot_with_surges(total_s: int) -> Session:
+def _sweet_spot_with_surges(total_s: int,
+                            profile: Optional["RiderMetrics"] = None) -> Session:
     """Sweet spot with surges: 3 x 12min @89% with a 10s@110% surge every 3min."""
     warmup = 600
     surges = 4          # per block
@@ -666,7 +839,8 @@ def _sweet_spot_with_surges(total_s: int) -> Session:
     return _finish(s, total_s)
 
 
-def _endurance_negative_split(total_s: int) -> Session:
+def _endurance_negative_split(total_s: int,
+                              profile: Optional["RiderMetrics"] = None) -> Session:
     """Endurance negative split: first half @64%, second half @72% FTP."""
     warmup = 600
     s = Session(
@@ -694,7 +868,8 @@ def _endurance_negative_split(total_s: int) -> Session:
     return _finish(s, total_s, cooldown_low=0.45, cooldown_high=0.55)
 
 
-def _endurance_tempo_finish(total_s: int) -> Session:
+def _endurance_tempo_finish(total_s: int,
+                            profile: Optional["RiderMetrics"] = None) -> Session:
     """Endurance with a tempo finish: Zone 2 then a final ~13% at 80% FTP."""
     warmup = 600
     s = Session(
@@ -724,7 +899,8 @@ def _endurance_tempo_finish(total_s: int) -> Session:
     return _finish(s, total_s, cooldown_low=0.45, cooldown_high=0.55)
 
 
-def _endurance_cadence_play(total_s: int) -> Session:
+def _endurance_cadence_play(total_s: int,
+                            profile: Optional["RiderMetrics"] = None) -> Session:
     """Endurance with high-cadence blocks: Zone 2 base, 4-6 x 2min high-cadence."""
     warmup = 600
     on, off = 120, 180
@@ -861,7 +1037,9 @@ WORKOUT_TYPE_INFO: List[dict] = [
         "zone": "Zone 5",
         "low": 1.06,
         "high": 1.20,
-        "work": 1.12,
+        # The published figure is the population default; a rider with measured
+        # 5-minute power gets their own target (see ``vo2_target``).
+        "work": VO2_RATIO_DEFAULT,
         "focus": "Develops maximal oxygen uptake and top-end aerobic power.",
         "structure": "Warmup, then hard VO2 intervals at 110-115% FTP with equal "
                      "easy recoveries, ridden on a Zone 2 base when the ride is "
@@ -873,7 +1051,10 @@ WORKOUT_TYPE_INFO: List[dict] = [
         "zone": "Zone 7",
         "low": 1.50,
         "high": None,
-        "work": 3.00,
+        # Nominal only - the session itself prescribes no sprint target (see
+        # ``_sprint``). Shared with the load-accounting constant so the picker
+        # and the TSS estimate can never quote two different figures.
+        "work": SPRINT_LOAD_RATIO_DEFAULT,
         "focus": "Trains neuromuscular power, recruitment and peak sprint watts.",
         "structure": "Warmup, then short all-out sprints with ~3min full recovery "
                      "between each, on an easy aerobic base.",
@@ -958,17 +1139,23 @@ WORKOUT_BUILDERS = {
 
 
 def build_workout(kind: str, duration_min: float,
-                  variant: Optional[str] = None) -> Session:
+                  variant: Optional[str] = None,
+                  profile: Optional["RiderMetrics"] = None) -> Session:
     """Build a Session of the given kind/duration (minutes), optional variant.
 
     ``variant`` None or "classic" reproduces the original output byte-for-byte;
     an unknown variant falls back to classic. Raises ValueError for unknown kind.
+
+    ``profile`` is the rider's measured capacities. It only ever refines a
+    target that a population constant cannot express (see the module docstring);
+    ``profile=None``, or a profile whose relevant fields are unmeasured,
+    produces exactly the same session as before profiles existed.
     """
     if kind not in _VARIANT_BUILDERS:
         raise ValueError(f"unknown workout kind: {kind}")
     builders = _VARIANT_BUILDERS[kind]
     builder = builders.get(variant or "classic", builders["classic"])
     total_s = int(round(float(duration_min))) * 60
-    session = builder(total_s)
+    session = builder(total_s, profile)
     session.compute_tss()
     return session

@@ -148,12 +148,14 @@ def _start_user_scan(user_id: int, directory: Optional[str]) -> Optional[dict]:
 
 def run_daily_maintenance() -> dict:
     """One synchronous pass of all daily jobs: import scan (FTP re-eval +
-    completion matching inside), then per-user plan adaptation and race-result
-    refresh. Each stage is fault-isolated per user.
+    completion matching inside), then per-user plan adaptation, race-result
+    refresh, active-plan reflow and Zwift export sync. Each stage is
+    fault-isolated per user.
     """
     totals = importer.run_auto_scan()
     totals["adapted"] = 0
     totals["races"] = 0
+    totals["reflowed"] = 0
     totals["exported"] = 0
     # Daily safety snapshot of the whole DB (once per ~day even if the sweep
     # runs more often). Never let a backup failure abort maintenance.
@@ -182,6 +184,30 @@ def run_daily_maintenance() -> dict:
             totals["races"] += 1
         except Exception:
             _log.warning("race refresh failed for user %s", uid, exc_info=True)
+        try:
+            # This is an adaptive program, so the active plan is recomputed
+            # every day: reflow re-reads the rider's measured profile and their
+            # races, so upcoming workouts track the rider's current capacity
+            # instead of the snapshot taken when the plan was created. It runs
+            # BEFORE the export sync so the folder picks the rewrite up in the
+            # same sweep.
+            #
+            # This is only safe because reflow now PRESERVES `adapted` rows
+            # outside race windows - a naive daily reflow would otherwise have
+            # reverted every one of adapt.py's adjustments overnight.
+            plan = db.get_active_plan(uid)
+            if plan is not None:
+                result = reflow.reflow_plan(uid, plan["id"])
+                totals["reflowed"] += (
+                    result.get("updated", 0) + result.get("inserted", 0)
+                    + result.get("deleted", 0)
+                )
+                # The first sweep after profile-aware targets shipped rewrites
+                # every future workout and renames its .zwo; log the counts so
+                # that (and any later churn) is diagnosable.
+                _log.info("daily reflow for user %s: %s", uid, result)
+        except Exception:
+            _log.warning("plan reflow failed for user %s", uid, exc_info=True)
         try:
             # Keep the Zwift custom-workout folder in sync with the plan
             # (exports new/updated workouts, prunes completed/OOTO-skipped).
@@ -1716,6 +1742,10 @@ def create_app() -> FastAPI:
                 if lo is not None and hi is not None and lo > hi:
                     lo, hi = hi, lo
                 label = "Warmup ramp" if seg.kind == "warmup" else "Cooldown"
+            elif seg.kind == "freeride":
+                # No target by design (sprints) - show the cue, not a wattage.
+                lo = hi = None
+                label = "Max effort - no target"
             else:
                 lo = hi = _watts(seg.power, ftp)
                 label = "Steady block" if seg.kind == "steadystate" else seg.kind
