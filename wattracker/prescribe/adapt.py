@@ -210,6 +210,9 @@ def apply_adaptations(user_id: int, state, now: Optional[_dt.datetime] = None) -
     # same rider profile the generator and reflow do.
     profile = profile_store.for_user(user_id)
     for w in db.adaptable_plan_workouts(user_id, today, horizon):
+        change = _plan_change(status, w["type"], w["duration_s"] / 60.0)
+        if change is None:
+            continue  # adaptation had no opinion about this day either way
         plan_id = w["plan_id"]
         if plan_id not in windows:
             windows[plan_id] = race_window(user_id, plan_id, now)
@@ -218,10 +221,12 @@ def apply_adaptations(user_id: int, state, now: Optional[_dt.datetime] = None) -
             # has already cut this day's load on purpose (see the module
             # docstring). Easing it again double-counts, and reflow would put
             # it straight back tomorrow night.
+            #
+            # Counted only AFTER _plan_change, so the number means "workouts a
+            # race stopped us changing", not "workouts inside a race window".
+            # A 14-day taper otherwise had the banner claiming a dozen
+            # workouts were left as planned when most were never candidates.
             skipped_raced += 1
-            continue
-        change = _plan_change(status, w["type"], w["duration_s"] / 60.0)
-        if change is None:
             continue
         new_type, new_min, kind = change
         # Adaptation resets the session to the new kind's classic variant.
@@ -307,9 +312,10 @@ def banner_for(state, summary: Dict) -> Dict:
     skipped = summary.get("skipped_raced", 0)
     banner["race_skipped"] = skipped
     if skipped:
+        plural = skipped != 1
         banner["race_note"] = (
-            f"{skipped} upcoming workout{'s' if skipped != 1 else ''} left as "
-            "planned - they sit inside a race taper or recovery window, which "
-            "already reduces the load."
+            f"{skipped} upcoming workout{'s' if plural else ''} left as "
+            f"planned - {'they sit' if plural else 'it sits'} inside a race "
+            "taper or recovery window, which already reduces the load."
         )
     return banner

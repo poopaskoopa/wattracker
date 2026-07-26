@@ -77,8 +77,12 @@ def computed_at(user_id: int) -> Optional[str]:
     return (row or {}).get("computed_at")
 
 
-def refresh(user_id: int, state=None) -> RiderMetrics:
+def refresh(user_id: int, state=None) -> Optional[RiderMetrics]:
     """Recompute the rider's capacities from their data and store them.
+
+    Returns what is now STORED - the previous snapshot if the computation
+    failed, or None if the write failed - never a value that only ever existed
+    in memory.
 
     This is the expensive half, and belongs on the write side only (the daily
     sweep and activity import). ``state`` lets a caller that has already built
@@ -99,4 +103,9 @@ def refresh(user_id: int, state=None) -> RiderMetrics:
     except Exception:  # noqa: BLE001
         log.warning("rider profile write failed for user %s", user_id,
                     exc_info=True)
+        # Return what is actually IN EFFECT, never what we merely computed:
+        # the stored row is what every prescription reads, so handing back the
+        # uncommitted value would let a caller act on a profile the app does
+        # not have.
+        return None
     return metrics

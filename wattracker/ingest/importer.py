@@ -499,6 +499,10 @@ def ingest_upload(user_id: int, filename: str, content: bytes) -> Optional[int]:
         result = ingest_file(user_id, tmp.name)
         evaluate_ftp(user_id)
         match_plan_completions(user_id)
+        if result is not None:
+            # Same reasoning as scan_activities: a new ride can move every
+            # measured capacity, and prescriptions read the stored snapshot.
+            profile_store.refresh(user_id)
         return result
     finally:
         try:

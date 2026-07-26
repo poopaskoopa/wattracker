@@ -111,8 +111,8 @@ def test_preview_returns_watts_for_known_ftp(client):
     assert info["zone"] == "Zone 3"
     assert info["low_watts"] == round(0.76 * data["ftp"])
     assert info["high_watts"] == round(0.90 * data["ftp"])
-    interval = next(s for s in data["segments"] if s["on_watts"] is not None)
-    assert interval["on_watts"] == round(0.80 * data["ftp"])
+    interval = next(s for s in data["segments"] if s["watts_on"] is not None)
+    assert interval["watts_on"] == round(0.80 * data["ftp"])
     assert sum(s["duration_s"] for s in data["segments"]) == 3600
 
 
@@ -173,7 +173,7 @@ def test_preview_every_type_at_extremes(client, kind, minutes):
         return
     peak = max(
         w for w in (
-            [s["on_watts"] for s in data["segments"] if s["on_watts"] is not None]
+            [s["watts_on"] for s in data["segments"] if s["watts_on"] is not None]
             + [s["watts_high"] for s in data["segments"] if s["watts_high"] is not None]
         )
     )
