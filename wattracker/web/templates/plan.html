@@ -20,7 +20,9 @@
         <p>{{ cur.weeks }} weeks &middot; {{ cur.start_date }} &rarr; {{ cur.end_date }}
            &middot; progress <strong>{{ cur.completed }}/{{ cur.total }}</strong> workouts
            {% if cur.goal %}&middot; goal <strong>{{ cur.goal.label }}</strong>{% endif %}</p>
-        {% if cur.reflow_notice %}
+        {# When this plan is the one being viewed below, its notice is shown
+           there instead - one notice, not two. #}
+        {% if cur.reflow_notice and not (plan and plan.plan_id == cur.id) %}
         <p class="alert reflow-notice">{{ cur.reflow_notice.message }}
             <form method="post" action="/plan/{{ cur.id }}/reflow-notice/dismiss"
                   style="display:inline">
@@ -260,6 +262,17 @@
     {% if plan %}
     <section class="plan-result">
         <h3>{{ plan.name }}{% if plan.model %} <span class="hint">({{ plan.model.replace('_', ' ') }})</span>{% endif %}</h3>
+        {# The nightly sweep can leave a notice on ANY plan, but the calendar
+           and the card above only ever surface the active/current one. Without
+           this, a notice on any other plan can never be seen or dismissed. #}
+        {% if plan.reflow_notice %}
+        <p class="alert reflow-notice">{{ plan.reflow_notice.message }}
+            <form method="post" action="/plan/{{ plan.plan_id }}/reflow-notice/dismiss"
+                  style="display:inline">
+                <button type="submit" class="link-btn">dismiss</button>
+            </form>
+        </p>
+        {% endif %}
         {% if plan.auto_export %}
         <p class="ok">Auto-exported {{ plan.auto_export.count }} .zwo file(s) to
            <code>{{ plan.auto_export.directory }}</code> &mdash; they appear under

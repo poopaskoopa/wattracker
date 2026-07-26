@@ -466,6 +466,42 @@ def test_the_notice_can_be_dismissed(client):
     assert "3 changed" not in client.get("/calendar").text
 
 
+def test_a_notice_on_a_non_active_plan_can_be_seen_and_dismissed(client):
+    """Regression: the calendar and the current-plan card only ever surface the
+    ACTIVE plan's notice, so a notice the sweep left on any other plan used to
+    be invisible - and therefore permanently undismissable."""
+    _register(client)
+    uid = db.get_user_by_username("rider")["id"]
+    active_id = _seed(uid, goal="ftp", name="Active")
+    other_id = _seed(uid, goal="ftp", name="Other")
+    db.set_active_plan(uid, active_id)
+    db.set_plan_reflow_notice(uid, other_id, {"changed": 3, "message": "3 changed"})
+
+    assert "3 changed" not in client.get("/calendar").text  # not the active plan
+    body = client.get(f"/plan?plan_id={other_id}").text
+    assert "3 changed" in body
+    assert f'action="/plan/{other_id}/reflow-notice/dismiss"' in body
+
+    r = client.post(f"/plan/{other_id}/reflow-notice/dismiss")
+    assert r.status_code in (200, 303)
+    assert db.get_plan(uid, other_id)["reflow_notice"] is None
+    assert "3 changed" not in client.get(f"/plan?plan_id={other_id}").text
+
+
+def test_a_viewed_plans_notice_is_shown_once(client):
+    """The current-plan card and the plan being viewed are the same plan here;
+    the rider must not get the same alert twice."""
+    _register(client)
+    uid = db.get_user_by_username("rider")["id"]
+    plan_id = _seed(uid, goal="ftp")
+    db.set_active_plan(uid, plan_id)
+    db.set_plan_reflow_notice(uid, plan_id, {"changed": 3, "message": "3 changed"})
+
+    assert client.get(f"/plan?plan_id={plan_id}").text.count("3 changed") == 1
+    # ...and still shown on the plan page when no plan is being viewed.
+    assert "3 changed" in client.get("/plan").text
+
+
 def test_a_notice_cannot_be_dismissed_on_someone_elses_plan(client):
     _register(client, "rider")
     _register(client, "other")
