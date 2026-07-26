@@ -74,12 +74,35 @@ def test_missing_zero_corrupt_and_short_streams():
     result = power_profile.compute([
         _ride("2026-07-01T00:00:00", []),
         _ride("2026-07-02T00:00:00", [0] * 60),
-        _ride("2026-07-03T00:00:00", [100, "bad", 500]),
+        # Four consecutive bad samples exceed MAX_BRIDGED_GAP_S, so this run
+        # is genuinely corrupt rather than quietly interpolated.
+        _ride("2026-07-03T00:00:00", [100, "bad", "bad", "bad", "bad", 500]),
         {"start_time": "2026-07-04T00:00:00", "streams": "corrupt"},
     ], now=dt.datetime(2026, 7, 25))
     assert _row(result, 1)["all_time"] == 500
     assert _row(result, 15)["all_time"] is None
     assert result["coverage"]["all_time_durations"] == 1
+
+
+def test_a_gap_too_long_to_bridge_removes_the_durations_that_span_it():
+    # Twenty samples with the bad run at 8..12: every 15-second window starts
+    # at 0..5 and therefore spans it, so no 15-second effort survives. The
+    # single-second best is unaffected because it never spans the gap.
+    def ride(bad_count):
+        power = [200.0] * 20
+        power[8:8 + bad_count] = [None] * bad_count
+        return _ride("2026-07-03T00:00:00", power)
+
+    unbridgeable = power_profile.compute(
+        [ride(5)], now=dt.datetime(2026, 7, 25)
+    )
+    assert _row(unbridgeable, 15)["all_time"] is None
+    assert _row(unbridgeable, 1)["all_time"] == 200
+
+    # The same shape one sample under the limit is bridged, and the effort
+    # counts in full.
+    bridged = power_profile.compute([ride(3)], now=dt.datetime(2026, 7, 25))
+    assert _row(bridged, 15)["all_time"] == 200
 
 
 @pytest.mark.parametrize("payload", [
