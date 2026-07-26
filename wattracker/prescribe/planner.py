@@ -39,6 +39,16 @@ MAX_DURATION_MIN = 480
 # nominal figure published to the "Just Ride" picker.
 SPRINT_LOAD_RATIO_DEFAULT = 3.00
 
+# Bounds on the measured sprint ratio, for the same reason VO2max has them: a
+# 5s peak is exactly the statistic a power-meter dropout or spike corrupts, and
+# an unbounded ratio propagates straight into the TSS estimate as its SQUARE
+# (a spiked 15x FTP turned a 60-min sprint session into 931 TSS). Trained 5s
+# peaks run from about 2x FTP for a pure endurance rider to about 6x for a
+# track sprinter (Coggan/Allen power-profile tables, converted from W/kg), so
+# anything outside that is a measurement artefact rather than an athlete.
+SPRINT_RATIO_MIN = 2.0
+SPRINT_RATIO_MAX = 6.0
+
 # VO2max work power as a multiple of FTP when 5-minute power is unmeasured.
 VO2_RATIO_DEFAULT = 1.12
 
@@ -128,13 +138,18 @@ def sprint_load_ratio(profile: Optional["RiderMetrics"] = None) -> float:
     at 4.35x FTP does far more work in 12s than the 3.00x population stand-in
     credits them with, and their TSS should say so.
 
-    Quantized to ``SPRINT_LOAD_QUANTUM`` so a rolling-window wobble in the
-    measured peak cannot churn every plan nightly (see the constant).
+    Clamped to [SPRINT_RATIO_MIN, SPRINT_RATIO_MAX] and quantized to
+    ``SPRINT_LOAD_QUANTUM``: bounded so a spiked 5s sample cannot inflate the
+    session's load without limit (the figure is squared to make TSS), coarse so
+    a rolling-window wobble in the measured peak cannot churn every plan
+    nightly (see the constants). Zero, negative, NaN and infinite inputs are
+    already rejected upstream by ``_measured`` and fall back to the default.
     """
     measured = _measured(profile, "sprint_ratio")
     if measured is None:
         return SPRINT_LOAD_RATIO_DEFAULT
-    return _quantize(measured, SPRINT_LOAD_QUANTUM)
+    clamped = max(SPRINT_RATIO_MIN, min(SPRINT_RATIO_MAX, measured))
+    return _quantize(clamped, SPRINT_LOAD_QUANTUM)
 
 
 def vo2_target(profile: Optional["RiderMetrics"] = None) -> Optional[float]:

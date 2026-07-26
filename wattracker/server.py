@@ -36,6 +36,7 @@ from .analysis import pipeline, power_profile, zones
 from .ble import devices as bledevices
 from .ble.runner import RideController, flatten_session
 from .ingest import importer
+from .metrics import profile_cache
 from .prescribe import adapt as adaptmod
 from .prescribe import plan as planmod
 from .prescribe import reflow
@@ -958,9 +959,13 @@ def create_app() -> FastAPI:
             "model": model,
         }
         try:
+            # Born profile-aware: without this a new plan is built on the
+            # population constants and the very next nightly reflow rewrites
+            # every workout in it.
             generated = planmod.generate_plan(
                 name, start, weeks, day_ints, hours_per_week, hit_days_per_week,
                 hard_days=hard_ints or None, model=model,
+                profile=profile_cache.for_user(uid),
             )
             # Persist the generator inputs, not just their output, so the plan
             # can be recomputed later (see prescribe/reflow.py).
@@ -1680,32 +1685,45 @@ def create_app() -> FastAPI:
         ValueError - the caller reports it rather than silently riding something
         else. Only the no-type-at-all case falls back to the default ride.
         """
+        # Ridden in ERG here, exported as a .zwo there - both must be the
+        # same session, so the rebuild gets the rider's profile just as the
+        # export did.
+        profile = profile_cache.for_user(uid)
         if workout_id:
             w = db.get_plan_workout(uid, int(workout_id))
             if w:
                 return build_workout(w["type"], max(1, w["duration_s"] / 60),
-                                     w.get("variant")), w["name"], w["id"]
+                                     w.get("variant"), profile=profile), \
+                    w["name"], w["id"]
             raise ValueError("workout not found")
         if wtype:
             kind, mins = _validate_just_ride(wtype, minutes)
-            s = build_workout(kind, mins)
+            s = build_workout(kind, mins, profile=profile)
             return s, s.name, None
-        s = build_workout("endurance", 45)
+        s = build_workout("endurance", 45, profile=profile)
         return s, s.name, None
 
     def _ride_workout_payload(session, ftp: float, name: Optional[str] = None) -> dict:
         blocks, total_s = flatten_session(session)
         profile = []
         for start, end, kind, value in blocks:
-            lo, hi = (value, value) if kind == "const" else value
-            profile.append(
-                {
-                    "start": start,
-                    "end": end,
-                    "watts_start": int(round(lo * ftp)),
-                    "watts_end": int(round(hi * ftp)),
-                }
-            )
+            lo, hi = value if kind == "ramp" else (value, value)
+            # A "free" block is a maximal effort with no prescribed power. The
+            # watts are the ERG resistance the trainer will hold, NOT a target,
+            # so the block is flagged and the UI shows no wattage for it -
+            # otherwise the chart would contradict the segment row next to it,
+            # which reads "Max effort - no target". Plotting the rider's
+            # load-accounting figure here is what produced a 750 W point on
+            # exactly that block.
+            row = {
+                "start": start,
+                "end": end,
+                "watts_start": int(round(lo * ftp)),
+                "watts_end": int(round(hi * ftp)),
+            }
+            if kind == "free":
+                row["free"] = True
+            profile.append(row)
         return {
             "name": name or session.name,
             "duration_s": total_s,
@@ -1772,7 +1790,8 @@ def create_app() -> FastAPI:
         uid = _uid(request)
         try:
             kind, mins = _validate_just_ride(type, minutes)
-            session = build_workout(kind, mins)
+            session = build_workout(kind, mins,
+                                    profile=profile_cache.for_user(uid))
         except (ValueError, OverflowError) as e:
             return JSONResponse({"error": str(e)}, status_code=400)
         ftp = importer.current_ftp(uid)
@@ -2423,9 +2442,14 @@ def create_app() -> FastAPI:
     def api_plan_workout_detail(request: Request, workout_id: int):
         """Structured segments + power profile for one plan workout (user-scoped).
 
-        Segments are reconstructed deterministically via ``build_workout`` (the
-        stored type/duration fully determine the session, matching the stored
-        .zwo), so no extra persistence is needed.
+        Segments are reconstructed deterministically via ``build_workout``, so
+        no extra persistence is needed - but the rebuild must be given the SAME
+        rider profile the stored .zwo was generated with, or this endpoint and
+        the exported file describe different workouts (measured before it was
+        threaded through: 1.16 stored vs 1.18 rebuilt on the same vo2max day).
+        The profile is read fresh rather than stored, exactly as reflow reads
+        it; the two therefore agree as long as neither has gone stale, and the
+        nightly reflow is what closes any gap.
         """
         uid = _uid(request)
         w = db.get_plan_workout(uid, workout_id)
@@ -2434,7 +2458,8 @@ def create_app() -> FastAPI:
         completion_verified = importer.plan_workout_completion_verified(uid, w)
         ftp = importer.current_ftp(uid)
         session = build_workout(w["type"], max(1, w["duration_s"] / 60),
-                                w.get("variant"))
+                                w.get("variant"),
+                                profile=profile_cache.for_user(uid))
 
         segments = []
         for seg in session.segments:
@@ -2450,15 +2475,18 @@ def create_app() -> FastAPI:
         blocks, total_s = flatten_session(session)
         profile = []
         for (s, e, kind, val) in blocks:
-            lo, hi = (val, val) if kind == "const" else val
-            profile.append(
-                {
-                    "start": s,
-                    "end": e,
-                    "watts_start": int(round(lo * ftp)),
-                    "watts_end": int(round(hi * ftp)),
-                }
-            )
+            lo, hi = val if kind == "ramp" else (val, val)
+            # See _ride_workout_payload: a "free" block carries the ERG
+            # resistance, not a target, and the UI must not read it as one.
+            row = {
+                "start": s,
+                "end": e,
+                "watts_start": int(round(lo * ftp)),
+                "watts_end": int(round(hi * ftp)),
+            }
+            if kind == "free":
+                row["free"] = True
+            profile.append(row)
 
         return JSONResponse(
             {

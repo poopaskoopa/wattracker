@@ -32,12 +32,20 @@ FINISHED = "finished"
 _DEFAULT_START_GRACE_S = 3.0
 _DEFAULT_ZERO_GRACE_S = 3.0
 
+# ERG resistance held during an untargeted ``freeride`` block (fraction of
+# FTP). Matches the easy-spin power either side of a sprint, so the trainer
+# feels continuous and the rider has something to push against without the
+# machine trying to hold them at any particular sprint wattage.
+FREERIDE_ERG_FRACTION = 0.55
+
 
 def _flatten(session: Session) -> Tuple[List[tuple], int]:
-    """Flatten a Session into timed blocks: (start, end, 'const'|'ramp', value).
+    """Flatten a Session into timed blocks: (start, end, kind, value).
 
-    Intervals expand into steady on/off blocks; warmup/cooldown become ramps.
-    ``value`` is a fraction of FTP (float) for const, or (lo, hi) for ramp.
+    kind is 'const' (steady target), 'ramp' (warmup/cooldown) or 'free' (an
+    untargeted maximal effort). ``value`` is a fraction of FTP (float) for
+    const and free, or (lo, hi) for ramp. A 'free' block's value is the ERG
+    resistance to hold, NOT a prescribed target - see the freeride arm below.
     """
     blocks: List[tuple] = []
     t = 0
@@ -60,13 +68,18 @@ def _flatten(session: Session) -> Tuple[List[tuple], int]:
             t += seg.duration
         elif seg.kind == "freeride":
             # A free effort has no target, but this controller only speaks ERG,
-            # so the block still needs a number. Use the segment's
-            # load-accounting estimate (the rider's own measured sprint power
-            # where we have it): holding the resistance there lets the rider
-            # drive against something, whereas the 0 W an absent target would
-            # give means no resistance at all and nothing to sprint against.
+            # so the block still needs a number. It is deliberately a FIXED,
+            # modest resistance and NOT the segment's load-accounting estimate:
+            # that figure is rider-derived (it can be 4.35x FTP) and using it
+            # would hand a stronger rider a harder sprint block, which is
+            # exactly the ERG-clamps-the-rider problem the freeride block
+            # exists to avoid. 0 W is not the alternative either - it leaves
+            # nothing to push against. The real fix is a resistance/slope mode
+            # in the controller; until then this is a floor, not a goal, and
+            # it is tagged "free" so the web layer can tell the two apart and
+            # refuse to present it as the block's prescribed power.
             blocks.append(
-                (t, t + seg.duration, "const", float(seg.avg_fraction()))
+                (t, t + seg.duration, "free", FREERIDE_ERG_FRACTION)
             )
             t += seg.duration
         else:  # steadystate
@@ -140,13 +153,13 @@ class RideController:
         """%FTP fraction at elapsed second `t`."""
         for (s, e, kind, val) in self.blocks:
             if s <= t < e:
-                if kind == "const":
+                if kind in ("const", "free"):
                     return val
                 lo, hi = val
                 return lo + (hi - lo) * ((t - s) / (e - s)) if e > s else lo
         if self.blocks:  # past the end -> hold the final block's value
             s, e, kind, val = self.blocks[-1]
-            return val if kind == "const" else val[1]
+            return val if kind in ("const", "free") else val[1]
         return 0.0
 
     def target_watts(self, t: float) -> int:

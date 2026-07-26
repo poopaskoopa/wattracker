@@ -65,10 +65,21 @@
                    '<text x="' + (W - padR - 2) + '" y="' + (parseFloat(y(ftp)) - 3) +
                    '" class="pf-ftplab">FTP ' + Math.round(ftp) + 'W</text>';
         }
+        // Untargeted blocks (sprints) are shaded rather than read as a power
+        // step: the plotted watts there are only the resistance the trainer
+        // holds, so quoting them as a target would be wrong.
+        profile.forEach(function (b) {
+            if (!b.free) return;
+            svg += '<rect x="' + x(b.start) + '" y="' + padT + '" width="' +
+                   Math.max(1, (plotW * (b.end - b.start) / totalS)).toFixed(1) +
+                   '" height="' + plotH + '" class="pf-free"/>';
+        });
         // hover targets: one transparent rect per block with a native tooltip
         profile.forEach(function (b) {
             var label = fmtDur(b.start) + '–' + fmtDur(b.end) + ' · ' +
-                (b.watts_start === b.watts_end
+                (b.free
+                    ? 'max effort — no target'
+                    : b.watts_start === b.watts_end
                     ? b.watts_start + ' W'
                     : b.watts_start + '→' + b.watts_end + ' W');
             svg += '<rect x="' + x(b.start) + '" y="' + padT + '" width="' +

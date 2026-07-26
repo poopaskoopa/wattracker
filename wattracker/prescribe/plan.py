@@ -285,7 +285,14 @@ def _clamp(v: float, lo: float, hi: float) -> float:
 
 
 def hard_seconds(session: Session) -> int:
-    """Seconds of high-intensity interval 'on' time in a session."""
+    """Seconds of high-intensity interval 'on' time in a session.
+
+    HAZARD: counts ``intervals`` segments only, so a sprint session - whose
+    efforts are untargeted ``freeride`` blocks - contributes zero hard seconds
+    and would report a polarized hard fraction of 0. Latent today because no
+    plan model schedules sprints; the goal work, where a criterium plan will,
+    must count freeride blocks here first.
+    """
     total = 0
     for seg in session.segments:
         if seg.kind == "intervals" and seg.repeat:
