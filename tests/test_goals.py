@@ -502,6 +502,33 @@ def test_a_viewed_plans_notice_is_shown_once(client):
     assert "3 changed" in client.get("/plan").text
 
 
+def test_dismissing_from_a_viewed_plan_stays_on_that_plan(client):
+    """Dismissing used to bounce to the bare plan page, dropping the plan the
+    rider was actually reading."""
+    _register(client)
+    uid = db.get_user_by_username("rider")["id"]
+    active_id = _seed(uid, goal="ftp", name="Active")
+    other_id = _seed(uid, goal="ftp", name="Other")
+    db.set_active_plan(uid, active_id)
+    db.set_plan_reflow_notice(uid, other_id, {"changed": 3, "message": "3 changed"})
+
+    r = client.post(
+        f"/plan/{other_id}/reflow-notice/dismiss",
+        headers={"referer": f"http://testserver/plan?plan_id={other_id}"},
+        follow_redirects=False,
+    )
+    assert r.headers["location"] == f"/plan?plan_id={other_id}"
+
+    # A Referer naming a DIFFERENT plan cannot steer the redirect.
+    db.set_plan_reflow_notice(uid, active_id, {"changed": 1, "message": "1 changed"})
+    r = client.post(
+        f"/plan/{active_id}/reflow-notice/dismiss",
+        headers={"referer": f"http://testserver/plan?plan_id={other_id}"},
+        follow_redirects=False,
+    )
+    assert r.headers["location"] == "/plan"
+
+
 def test_a_notice_cannot_be_dismissed_on_someone_elses_plan(client):
     _register(client, "rider")
     _register(client, "other")

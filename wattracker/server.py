@@ -1638,9 +1638,20 @@ def create_app() -> FastAPI:
         db.set_plan_reflow_notice(uid, plan_id, None)
         # Only ever bounce back to one of our own pages, never to an
         # attacker-supplied Referer.
-        referer = _url.urlparse(request.headers.get("referer") or "").path
-        target = "/calendar" if referer == "/calendar" else "/plan"
-        return RedirectResponse(url=target, status_code=303)
+        ref = _url.urlparse(request.headers.get("referer") or "")
+        if ref.path == "/calendar":
+            return RedirectResponse(url="/calendar", status_code=303)
+        # Dismissing from /plan?plan_id=N must leave the rider on the plan
+        # they were reading, not bounce them to the active one. Only the id
+        # we just dismissed is echoed back, so the Referer cannot steer the
+        # redirect anywhere the rider does not already have access to.
+        if ref.path == "/plan":
+            viewing = _url.parse_qs(ref.query).get("plan_id", [""])[0]
+            if viewing.isdigit() and int(viewing) == plan_id:
+                return RedirectResponse(
+                    url=f"/plan?plan_id={plan_id}", status_code=303
+                )
+        return RedirectResponse(url="/plan", status_code=303)
 
     @app.post("/ratings/{kind}/{workout_id}")
     def save_rating(
