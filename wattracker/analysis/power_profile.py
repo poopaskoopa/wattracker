@@ -37,6 +37,16 @@ METHODOLOGY_CAVEAT = (
     "not a validated physiological diagnosis."
 )
 
+# Reference ratios for a textbook balanced trained rider, taken from the
+# Coggan-style power-profile curve expressed as multiples of FTP:
+#   1s 6.4, 15s 2.9, 30s 2.2, 1min 2.0, 2min 1.60, 5min 1.27,
+#   10min 1.15, 20min 1.05, 40min 1.00, 60min 0.97
+# Phenotype ratios are divided by these so that an index of 1.0 means "the
+# same shape as that balanced rider" regardless of absolute fitness.
+REFERENCE_SHORT_RATIO = 2.40   # mean(15s, 30s) / 20min for a balanced trained rider
+REFERENCE_PUNCH_RATIO = 1.55   # mean(1, 2, 5min) / 20min
+REFERENCE_RETENTION = 0.94     # mean(40, 60min) / 20min
+
 
 def _finite_nonnegative(value) -> Optional[float]:
     try:
@@ -113,17 +123,21 @@ def _is_recent(start_time, cutoff: _dt.datetime, now: _dt.datetime) -> bool:
 
 
 def classify_phenotype(all_time: dict[int, float]) -> dict:
-    """Describe curve shape using conservative, scale-invariant thresholds.
+    """Describe curve shape with indices relative to a balanced reference rider.
 
-    At least one best in each of the short (<=30 s), punch (1--5 min), and
-    sustained (>=20 min) domains is required. Ratios are anchored to the
-    20-minute best.
-    A sprinter needs 15--30-second power at least 2.15x sustained and 1.45x
-    punch power; a puncheur needs 1--5-minute power at least 1.45x sustained without meeting
-    the sprint rule; an endurance specialist needs >=40-minute retention of at
-    least 88%, with neither short nor punch ratios elevated. Everything less
-    distinctive is an all-rounder. These deliberately broad thresholds avoid
-    asserting a specialty from small differences.
+    Requires both the 15- and 30-second bests, at least two 1--5-minute bests,
+    a 20-minute best used as the anchor, and six valid durations overall.
+    Three ratios are anchored to the 20-minute best -- short (mean of 15 and
+    30 s), punch (mean of 1, 2 and 5 min), and retention (mean of 40 and
+    60 min, ``None`` when neither exists) -- and each is divided by the
+    corresponding ``REFERENCE_*`` constant, so an index of 1.0 matches the
+    balanced reference curve and the result is scale-invariant.
+
+    A sprinter's short index is at least 1.10 and at least 1.12x the punch
+    index; a puncheur is the mirror image; an endurance specialist retains at
+    least 0.95 of reference retention with a short index no higher than 0.90
+    and a punch index no higher than 0.95. Anything less distinctive is an
+    all-rounder.
     """
     # Exclude one-second peaks: they are naturally far above 20-minute power
     # even on balanced curves and are unusually sensitive to sensor spikes.
@@ -142,9 +156,6 @@ def classify_phenotype(all_time: dict[int, float]) -> dict:
     }
     short = [value for d in (15, 30) if (value := usable(d)) is not None]
     punch = [value for d in (60, 120, 300) if (value := usable(d)) is not None]
-    sustained = [
-        value for d in (1200, 2400, 3600) if (value := usable(d)) is not None
-    ]
     anchor = usable(1200)
     if (
         len(short) < 2
@@ -154,12 +165,14 @@ def classify_phenotype(all_time: dict[int, float]) -> dict:
     ):
         return {
             "label": "Insufficient data",
+            "key": "insufficient_data",
             "rationale": (
                 "Broader record coverage is needed: both 15- and 30-second "
                 "bests, at least two 1–5-minute bests, a 20-minute best, and "
                 "six durations overall."
             ),
             "caveat": METHODOLOGY_CAVEAT,
+            "indices": None,
         }
 
     short_ratio = sum(short) / len(short) / anchor
@@ -169,24 +182,55 @@ def classify_phenotype(all_time: dict[int, float]) -> dict:
     ]
     retention = sum(long_values) / len(long_values) / anchor if long_values else None
 
-    if short_ratio >= 2.15 and short_ratio >= punch_ratio * 1.45:
+    short_index = short_ratio / REFERENCE_SHORT_RATIO
+    punch_index = punch_ratio / REFERENCE_PUNCH_RATIO
+    retention_index = (
+        retention / REFERENCE_RETENTION if retention is not None else None
+    )
+
+    if short_index >= 1.10 and short_index >= punch_index * 1.12:
         label = "Sprinter"
-        rationale = "Short-duration power stands well above both punch and sustained power."
-    elif punch_ratio >= 1.45 and short_ratio < punch_ratio * 1.6:
+        key = "sprinter"
+        rationale = (
+            "Short-duration power stands well above the balanced reference "
+            "shape, and above punch power."
+        )
+    elif punch_index >= 1.10 and punch_index >= short_index * 1.12:
         label = "Puncheur"
-        rationale = "One-to-five-minute power is the clearest strength relative to sustained power."
+        key = "puncheur"
+        rationale = (
+            "One-to-five-minute power is the clearest strength relative to "
+            "the balanced reference shape."
+        )
     elif (
-        retention is not None
-        and retention >= 0.88
-        and short_ratio < 1.85
-        and punch_ratio < 1.4
+        retention_index is not None
+        and retention_index >= 0.95
+        and short_index <= 0.90
+        and punch_index <= 0.95
     ):
         label = "Endurance specialist (climber/time-trialist)"
-        rationale = "Long-duration power is retained strongly while shorter efforts are less dominant."
+        key = "endurance"
+        rationale = (
+            "Long-duration power is retained strongly while shorter efforts "
+            "sit below the balanced reference shape."
+        )
     else:
         label = "All-rounder"
+        key = "all_rounder"
         rationale = "The recorded curve has no single domain dominant enough for a specialty label."
-    return {"label": label, "rationale": rationale, "caveat": METHODOLOGY_CAVEAT}
+    return {
+        "label": label,
+        "key": key,
+        "rationale": rationale,
+        "caveat": METHODOLOGY_CAVEAT,
+        "indices": {
+            "short": round(short_index, 3),
+            "punch": round(punch_index, 3),
+            "retention": (
+                round(retention_index, 3) if retention_index is not None else None
+            ),
+        },
+    }
 
 
 def compute(
