@@ -31,7 +31,17 @@ from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.middleware.sessions import SessionMiddleware
 from starlette.middleware.trustedhost import TrustedHostMiddleware
 
-from . import auth, backup, config, credstore, db, exporter, paths, races
+from . import (
+    auth,
+    backup,
+    config,
+    credstore,
+    db,
+    exporter,
+    paths,
+    power_corrections,
+    races,
+)
 from .analysis import activity_cache, pipeline, power_profile, zones
 from .ble import devices as bledevices
 from .ble.runner import RideController, flatten_session
@@ -409,6 +419,38 @@ def _ctx(request: Request, **kw) -> dict:
     return kw
 
 
+def _same_origin_or_absent(request: Request) -> bool:
+    """Accept native/test POSTs without Origin; browser Origin must match exactly."""
+    origin = request.headers.get("origin")
+    if not origin:
+        return True
+    try:
+        parsed = _url.urlparse(origin)
+        if (
+            parsed.scheme not in ("http", "https")
+            or not parsed.hostname
+            or parsed.username is not None
+            or parsed.password is not None
+            or parsed.path not in ("", "/")
+            or parsed.params
+            or parsed.query
+            or parsed.fragment
+        ):
+            return False
+        default_port = 443 if parsed.scheme == "https" else 80
+        origin_port = parsed.port or default_port
+        request_port = request.url.port or (
+            443 if request.url.scheme == "https" else 80
+        )
+    except (ValueError, TypeError):
+        return False
+    return (
+        parsed.scheme.lower() == request.url.scheme.lower()
+        and parsed.hostname.lower() == (request.url.hostname or "").lower()
+        and origin_port == request_port
+    )
+
+
 def create_app() -> FastAPI:
     @asynccontextmanager
     async def lifespan(_app: FastAPI):
@@ -628,6 +670,82 @@ def create_app() -> FastAPI:
     @app.get("/profile", response_class=HTMLResponse)
     def profile_page(request: Request):
         return _profile_response(request)
+
+    def _power_corrections_response(
+        request: Request,
+        threshold: str = "",
+        error: Optional[str] = None,
+        status_code: int = 200,
+    ):
+        uid = _uid(request)
+        candidates = []
+        searched = bool((threshold or "").strip())
+        if searched and error is None:
+            try:
+                candidates = power_corrections.find_anomalies(uid, float(threshold))
+            except (ValueError, power_corrections.CorrectionError) as exc:
+                error = str(exc)
+                status_code = 400
+        return templates.TemplateResponse(
+            request,
+            "power_corrections.html",
+            _ctx(
+                request,
+                threshold=threshold,
+                searched=searched,
+                candidates=candidates,
+                candidate_cap=power_corrections.MAX_CANDIDATES,
+                correction_range_cap=db.POWER_CORRECTION_MAX_SAMPLES,
+                corrections=db.list_power_corrections(uid, active_only=True),
+                error=error,
+                saved=request.query_params.get("saved"),
+            ),
+            status_code=status_code,
+        )
+
+    @app.get("/profile/power-corrections", response_class=HTMLResponse)
+    def power_corrections_page(request: Request, threshold: str = ""):
+        return _power_corrections_response(request, threshold)
+
+    @app.post("/profile/power-corrections/apply", response_class=HTMLResponse)
+    def power_correction_apply(
+        request: Request,
+        activity_id: int = Form(...),
+        start_index: int = Form(...),
+        end_index: int = Form(...),
+        reason: str = Form(""),
+        threshold: str = Form(""),
+    ):
+        if not _same_origin_or_absent(request):
+            return PlainTextResponse("Origin not allowed", status_code=403)
+        try:
+            power_corrections.apply(
+                _uid(request), activity_id, start_index, end_index, reason
+            )
+        except power_corrections.CorrectionError as exc:
+            return _power_corrections_response(
+                request, threshold, str(exc), status_code=400
+            )
+        return RedirectResponse(
+            "/profile/power-corrections?saved=applied", status_code=303
+        )
+
+    @app.post("/profile/power-corrections/undo", response_class=HTMLResponse)
+    def power_correction_undo(
+        request: Request,
+        correction_id: int = Form(...),
+    ):
+        if not _same_origin_or_absent(request):
+            return PlainTextResponse("Origin not allowed", status_code=403)
+        try:
+            power_corrections.undo(_uid(request), correction_id)
+        except power_corrections.CorrectionError as exc:
+            return _power_corrections_response(
+                request, error=str(exc), status_code=400
+            )
+        return RedirectResponse(
+            "/profile/power-corrections?saved=undone", status_code=303
+        )
 
     @app.post("/profile/ftp", response_class=HTMLResponse)
     def profile_ftp_save(

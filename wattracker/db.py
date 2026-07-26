@@ -10,10 +10,11 @@ from __future__ import annotations
 import datetime as _dt
 import json
 import logging
+import math
 import os
 import sqlite3
 import zlib
-from typing import Callable, Dict, List, Optional, Sequence, Union
+from typing import Callable, Dict, Iterator, List, Optional, Sequence, Union
 
 from .config import db_path
 from .config import _restrict
@@ -21,7 +22,7 @@ from .timeutil import utc_now
 
 _log = logging.getLogger(__name__)
 
-SCHEMA_VERSION = 23
+SCHEMA_VERSION = 24
 
 
 def _restrict_db_files(path: str) -> None:
@@ -195,9 +196,14 @@ _MIGRATIONS: Dict[int, Sequence[Union[str, Callable[[sqlite3.Connection], None]]
         # is the correct state for every plan that existed before this column.
         "ALTER TABLE plans ADD COLUMN reflow_notice TEXT",
     ],
+    23: [
+        # New table power_sample_corrections is created by _SCHEMA after
+        # migrating. Activity stream BLOBs remain immutable.
+    ],
 }
 
 _DROP = """
+DROP TABLE IF EXISTS power_sample_corrections;
 DROP TABLE IF EXISTS ftp_feedback_batches;
 DROP TABLE IF EXISTS standalone_workouts;
 DROP TABLE IF EXISTS scanned_files;
@@ -258,6 +264,48 @@ CREATE INDEX IF NOT EXISTS idx_activities_user_start
     ON activities(user_id, start_time);
 CREATE INDEX IF NOT EXISTS idx_activities_duplicate_of
     ON activities(user_id, duplicate_of);
+
+CREATE TABLE IF NOT EXISTS power_sample_corrections (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id     INTEGER NOT NULL,
+    activity_id INTEGER NOT NULL,
+    start_index INTEGER NOT NULL,
+    end_index   INTEGER NOT NULL,
+    ftp_basis   REAL NOT NULL,
+    original_avg_power REAL,
+    original_np        REAL,
+    original_if        REAL,
+    original_tss       REAL,
+    reason      TEXT,
+    created     TEXT NOT NULL,
+    undone_at   TEXT,
+    CHECK(start_index >= 0),
+    CHECK(end_index >= start_index),
+    CHECK(end_index - start_index + 1 <= 3600),
+    CHECK(ftp_basis > 0),
+    FOREIGN KEY(user_id) REFERENCES users(id),
+    FOREIGN KEY(activity_id) REFERENCES activities(id)
+);
+CREATE INDEX IF NOT EXISTS idx_power_corrections_active
+    ON power_sample_corrections(user_id, activity_id, undone_at);
+CREATE TRIGGER IF NOT EXISTS trg_power_correction_owner_insert
+BEFORE INSERT ON power_sample_corrections
+WHEN NOT EXISTS (
+    SELECT 1 FROM activities
+    WHERE id = NEW.activity_id AND user_id = NEW.user_id
+)
+BEGIN
+    SELECT RAISE(ABORT, 'power correction activity ownership mismatch');
+END;
+CREATE TRIGGER IF NOT EXISTS trg_power_correction_owner_update
+BEFORE UPDATE OF user_id, activity_id ON power_sample_corrections
+WHEN NOT EXISTS (
+    SELECT 1 FROM activities
+    WHERE id = NEW.activity_id AND user_id = NEW.user_id
+)
+BEGIN
+    SELECT RAISE(ABORT, 'power correction activity ownership mismatch');
+END;
 
 CREATE TABLE IF NOT EXISTS ftp_history (
     user_id    INTEGER NOT NULL,
@@ -753,6 +801,61 @@ def _unpack_streams(blob: Optional[bytes]) -> Dict[str, list]:
         return {}
 
 
+def _correction_ranges(
+    conn: sqlite3.Connection, user_id: int, activity_ids: Sequence[int]
+) -> Dict[int, List[tuple]]:
+    """Active inclusive correction ranges, grouped by owned activity id."""
+    if not activity_ids:
+        return {}
+    allowed = set(activity_ids)
+    rows = conn.execute(
+        "SELECT activity_id, start_index, end_index "
+        "FROM power_sample_corrections "
+        "WHERE user_id = ? AND undone_at IS NULL "
+        "ORDER BY activity_id, start_index",
+        (user_id,),
+    ).fetchall()
+    grouped: Dict[int, List[tuple]] = {}
+    for row in rows:
+        activity_id = int(row["activity_id"])
+        if activity_id not in allowed:
+            continue
+        grouped.setdefault(activity_id, []).append(
+            (int(row["start_index"]), int(row["end_index"]))
+        )
+    return grouped
+
+
+def _effective_streams(blob: Optional[bytes], ranges: Sequence[tuple]) -> Dict[str, list]:
+    """Inflate streams and mask corrected power samples without mutating storage."""
+    streams = _unpack_streams(blob)
+    if not isinstance(streams, dict):
+        return streams
+    power = streams.get("power")
+    if not isinstance(power, list) or not ranges:
+        return streams
+    masked = list(power)
+    for start, end in ranges:
+        lo = max(0, int(start))
+        hi = min(len(masked) - 1, int(end))
+        if lo <= hi:
+            masked[lo:hi + 1] = [None] * (hi - lo + 1)
+    streams["power"] = masked
+    return streams
+
+
+def _activity_correction_ranges(
+    conn: sqlite3.Connection, user_id: int, activity_id: int
+) -> List[tuple]:
+    rows = conn.execute(
+        "SELECT start_index, end_index FROM power_sample_corrections "
+        "WHERE user_id = ? AND activity_id = ? AND undone_at IS NULL "
+        "ORDER BY start_index",
+        (user_id, activity_id),
+    ).fetchall()
+    return [(int(row["start_index"]), int(row["end_index"])) for row in rows]
+
+
 def activity_exists(user_id: int, dedup_hash: str, path: Optional[str] = None) -> bool:
     conn = connect(path)
     try:
@@ -838,6 +941,8 @@ def _row_summary(row: sqlite3.Row) -> dict:
 # secondary carries duplicate_of = <primary id> and must never be listed or
 # summed a second time. Every aggregation over activities filters on this.
 _NOT_DUPLICATE = "duplicate_of IS NULL"
+POWER_CORRECTION_MAX_SAMPLES = 3600
+POWER_CORRECTION_REASON_MAX_LENGTH = 500
 
 
 def list_activities(user_id: int, path: Optional[str] = None) -> List[dict]:
@@ -863,7 +968,8 @@ def get_activity(user_id: int, activity_id: int, path: Optional[str] = None) -> 
         if not row:
             return None
         d = _row_summary(row)
-        d["streams"] = _unpack_streams(row["streams"])
+        ranges = _correction_ranges(conn, user_id, [activity_id]).get(activity_id, [])
+        d["streams"] = _effective_streams(row["streams"], ranges)
         return d
     finally:
         conn.close()
@@ -874,14 +980,19 @@ def recent_power_streams(user_id: int, days: int = 90, path: Optional[str] = Non
     conn = connect(path)
     try:
         rows = conn.execute(
-            "SELECT streams FROM activities "
+            "SELECT id, streams FROM activities "
             f"WHERE user_id = ? AND start_time >= ? AND {_NOT_DUPLICATE} "
             "ORDER BY start_time",
             (user_id, cutoff),
         ).fetchall()
         out: List[List[float]] = []
+        ranges = _correction_ranges(conn, user_id, [int(r["id"]) for r in rows])
         for r in rows:
-            power = _unpack_streams(r["streams"]).get("power") or []
+            streams = _effective_streams(
+                r["streams"], ranges.get(int(r["id"]), [])
+            )
+            power = streams.get("power") if isinstance(streams, dict) else None
+            power = power or []
             if power:
                 out.append(power)
         return out
@@ -964,12 +1075,38 @@ def full_activities(user_id: int, path: Optional[str] = None) -> List[dict]:
             "ORDER BY start_time",
             (user_id,),
         ).fetchall()
+        ranges = _correction_ranges(conn, user_id, [int(r["id"]) for r in rows])
         out = []
         for r in rows:
             d = _row_summary(r)
-            d["streams"] = _unpack_streams(r["streams"])
+            d["streams"] = _effective_streams(
+                r["streams"], ranges.get(int(r["id"]), [])
+            )
             out.append(d)
         return out
+    finally:
+        conn.close()
+
+
+def iter_full_activities_desc(
+    user_id: int, path: Optional[str] = None
+) -> Iterator[dict]:
+    """Yield effective full-resolution activities newest first, one at a time."""
+    conn = connect(path)
+    try:
+        rows = conn.execute(
+            f"SELECT * FROM activities WHERE user_id = ? AND {_NOT_DUPLICATE} "
+            "ORDER BY start_time DESC",
+            (user_id,),
+        )
+        for row in rows:
+            activity_id = int(row["id"])
+            activity = _row_summary(row)
+            activity["streams"] = _effective_streams(
+                row["streams"],
+                _activity_correction_ranges(conn, user_id, activity_id),
+            )
+            yield activity
     finally:
         conn.close()
 
@@ -993,12 +1130,285 @@ def recent_full_activities(
             "ORDER BY start_time",
             (user_id, cutoff),
         ).fetchall()
+        ranges = _correction_ranges(conn, user_id, [int(r["id"]) for r in rows])
         out = []
         for r in rows:
             d = _row_summary(r)
-            d["streams"] = _unpack_streams(r["streams"])
+            d["streams"] = _effective_streams(
+                r["streams"], ranges.get(int(r["id"]), [])
+            )
             out.append(d)
         return out
+    finally:
+        conn.close()
+
+
+# ---------------------------------------------- power sample corrections
+def list_power_corrections(
+    user_id: int, active_only: bool = False, path: Optional[str] = None
+) -> List[dict]:
+    """Audited corrections owned by ``user_id``, newest first."""
+    conn = connect(path)
+    try:
+        active_sql = " AND c.undone_at IS NULL" if active_only else ""
+        rows = conn.execute(
+            "SELECT c.*, a.filename, a.start_time "
+            "FROM power_sample_corrections c "
+            "JOIN activities a ON a.id = c.activity_id AND a.user_id = c.user_id "
+            f"WHERE c.user_id = ?{active_sql} ORDER BY c.created DESC, c.id DESC",
+            (user_id,),
+        ).fetchall()
+        return [dict(row) for row in rows]
+    finally:
+        conn.close()
+
+
+def power_correction_activity(
+    user_id: int, activity_id: int, path: Optional[str] = None
+) -> Optional[dict]:
+    """Owned activity with immutable raw streams and active correction ranges."""
+    conn = connect(path)
+    try:
+        row = conn.execute(
+            "SELECT * FROM activities WHERE user_id = ? AND id = ?",
+            (user_id, activity_id),
+        ).fetchone()
+        if row is None:
+            return None
+        result = _row_summary(row)
+        result["raw_streams"] = _unpack_streams(row["streams"])
+        result["corrections"] = _correction_ranges(
+            conn, user_id, [activity_id]
+        ).get(activity_id, [])
+        provenance = conn.execute(
+            "SELECT ftp_basis, original_avg_power, original_np, original_if, "
+            "original_tss FROM power_sample_corrections "
+            "WHERE user_id = ? AND activity_id = ? AND undone_at IS NULL "
+            "ORDER BY id LIMIT 1",
+            (user_id, activity_id),
+        ).fetchone()
+        result["correction_ftp_basis"] = (
+            float(provenance["ftp_basis"]) if provenance is not None else None
+        )
+        result["correction_original_summary"] = (
+            {
+                "avg_power": provenance["original_avg_power"],
+                "np": provenance["original_np"],
+                "if_": provenance["original_if"],
+                "tss": provenance["original_tss"],
+            }
+            if provenance is not None else None
+        )
+        return result
+    finally:
+        conn.close()
+
+
+def apply_power_correction(
+    user_id: int,
+    activity_id: int,
+    start_index: int,
+    end_index: int,
+    ftp_basis: float,
+    reason: Optional[str],
+    summary: dict,
+    expected_ranges: Optional[Sequence[tuple]] = None,
+    path: Optional[str] = None,
+) -> Optional[int]:
+    """Atomically add an active correction and refresh power-derived summary.
+
+    Returns the audit-row id. Invalid, overlapping, overlarge, or non-owned
+    requests return ``None`` without changing any data.
+    """
+    if (
+        isinstance(start_index, bool)
+        or isinstance(end_index, bool)
+        or not isinstance(start_index, int)
+        or not isinstance(end_index, int)
+        or start_index < 0
+        or end_index < start_index
+        or end_index - start_index + 1 > POWER_CORRECTION_MAX_SAMPLES
+    ):
+        return None
+    try:
+        ftp_basis = float(ftp_basis)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    if not math.isfinite(ftp_basis) or ftp_basis <= 0:
+        return None
+    if reason is not None and not isinstance(reason, str):
+        return None
+    cleaned_reason = (reason or "").strip() or None
+    if cleaned_reason and len(cleaned_reason) > POWER_CORRECTION_REASON_MAX_LENGTH:
+        return None
+    conn = connect(path)
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        row = conn.execute(
+            "SELECT streams, avg_power, np, if_, tss FROM activities "
+            "WHERE user_id = ? AND id = ?",
+            (user_id, activity_id),
+        ).fetchone()
+        streams = _unpack_streams(row["streams"]) if row is not None else None
+        power = streams.get("power") if isinstance(streams, dict) else None
+        if not isinstance(power, list) or end_index >= len(power):
+            conn.rollback()
+            return None
+        current_ranges = _correction_ranges(conn, user_id, [activity_id]).get(
+            activity_id, []
+        )
+        if expected_ranges is not None and list(expected_ranges) != current_ranges:
+            conn.rollback()
+            return None
+        overlap = conn.execute(
+            "SELECT 1 FROM power_sample_corrections "
+            "WHERE user_id = ? AND activity_id = ? AND undone_at IS NULL "
+            "AND NOT (end_index < ? OR start_index > ?)",
+            (user_id, activity_id, start_index, end_index),
+        ).fetchone()
+        if overlap:
+            conn.rollback()
+            return None
+        inconsistent_basis = conn.execute(
+            "SELECT 1 FROM power_sample_corrections "
+            "WHERE user_id = ? AND activity_id = ? AND undone_at IS NULL "
+            "AND ftp_basis != ?",
+            (user_id, activity_id, ftp_basis),
+        ).fetchone()
+        if inconsistent_basis:
+            conn.rollback()
+            return None
+        existing_provenance = conn.execute(
+            "SELECT original_avg_power, original_np, original_if, original_tss "
+            "FROM power_sample_corrections "
+            "WHERE user_id = ? AND activity_id = ? AND undone_at IS NULL "
+            "ORDER BY id LIMIT 1",
+            (user_id, activity_id),
+        ).fetchone()
+        if existing_provenance is None:
+            original_summary = (
+                row["avg_power"], row["np"], row["if_"], row["tss"]
+            )
+        else:
+            original_summary = (
+                existing_provenance["original_avg_power"],
+                existing_provenance["original_np"],
+                existing_provenance["original_if"],
+                existing_provenance["original_tss"],
+            )
+        cur = conn.execute(
+            "INSERT INTO power_sample_corrections "
+            "(user_id, activity_id, start_index, end_index, ftp_basis, "
+            "original_avg_power, original_np, original_if, original_tss, "
+            "reason, created) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                user_id,
+                activity_id,
+                start_index,
+                end_index,
+                ftp_basis,
+                *original_summary,
+                cleaned_reason,
+                utc_now().isoformat(timespec="seconds"),
+            ),
+        )
+        conn.execute(
+            "UPDATE activities SET avg_power = ?, np = ?, if_ = ?, tss = ? "
+            "WHERE user_id = ? AND id = ?",
+            (
+                summary.get("avg_power"),
+                summary.get("np"),
+                summary.get("if_"),
+                summary.get("tss"),
+                user_id,
+                activity_id,
+            ),
+        )
+        conn.commit()
+        return int(cur.lastrowid)
+    except sqlite3.Error:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+
+def undo_power_correction(
+    user_id: int,
+    correction_id: int,
+    summary: dict,
+    expected_ranges: Optional[Sequence[tuple]] = None,
+    path: Optional[str] = None,
+) -> bool:
+    """Atomically retire one owned correction and refresh its activity summary."""
+    conn = connect(path)
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        row = conn.execute(
+            "SELECT activity_id, original_avg_power, original_np, original_if, "
+            "original_tss FROM power_sample_corrections "
+            "WHERE id = ? AND user_id = ? AND undone_at IS NULL",
+            (correction_id, user_id),
+        ).fetchone()
+        if row is None:
+            conn.rollback()
+            return False
+        activity_id = int(row["activity_id"])
+        current_ranges = _correction_ranges(conn, user_id, [activity_id]).get(
+            activity_id, []
+        )
+        if expected_ranges is not None and list(expected_ranges) != current_ranges:
+            conn.rollback()
+            return False
+        if len(current_ranges) == 1:
+            summary = {
+                "avg_power": row["original_avg_power"],
+                "np": row["original_np"],
+                "if_": row["original_if"],
+                "tss": row["original_tss"],
+            }
+        cur = conn.execute(
+            "UPDATE power_sample_corrections SET undone_at = ? "
+            "WHERE id = ? AND user_id = ? AND undone_at IS NULL",
+            (utc_now().isoformat(timespec="seconds"), correction_id, user_id),
+        )
+        if cur.rowcount != 1:
+            conn.rollback()
+            return False
+        conn.execute(
+            "UPDATE activities SET avg_power = ?, np = ?, if_ = ?, tss = ? "
+            "WHERE user_id = ? AND id = ?",
+            (
+                summary.get("avg_power"),
+                summary.get("np"),
+                summary.get("if_"),
+                summary.get("tss"),
+                user_id,
+                activity_id,
+            ),
+        )
+        conn.commit()
+        return True
+    except sqlite3.Error:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+
+def power_correction_fingerprint(
+    user_id: int, path: Optional[str] = None
+) -> tuple:
+    """Persisted state token that changes on every apply and undo."""
+    conn = connect(path)
+    try:
+        row = conn.execute(
+            "SELECT COUNT(*) AS c, COALESCE(MAX(id), 0) AS m, "
+            "SUM(undone_at IS NOT NULL) AS u "
+            "FROM power_sample_corrections WHERE user_id = ?",
+            (user_id,),
+        ).fetchone()
+        return int(row["c"]), int(row["m"]), int(row["u"] or 0)
     finally:
         conn.close()
 
