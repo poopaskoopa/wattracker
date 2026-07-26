@@ -4,7 +4,7 @@ import sqlite3
 
 from wattracker import auth, db
 from wattracker.prescribe import plan as planmod
-from wattracker.prescribe import reflow, zwo
+from wattracker.prescribe import planner, reflow, zwo
 
 MONDAY = dt.date(2026, 7, 6)          # plan starts here
 NOW = dt.datetime(2026, 7, 15, 9, 0)  # a Wednesday, inside week 2
@@ -74,7 +74,8 @@ def test_reflow_of_an_unmodified_recipe_changes_nothing(user_id):
     result = reflow.reflow_plan(user_id, plan_id, now=NOW)
 
     assert result == {"status": "ok", "updated": 0, "inserted": 0, "deleted": 0,
-                      "skipped_locked": 0, "conflicts": 0}
+                      "skipped_locked": 0, "raced_lost": 0, "failed": 0,
+                      "conflicts": 0}
     after = _rows(user_id, plan_id)
     assert after == before  # every field, including the stored .zwo, byte-identical
 
@@ -93,6 +94,48 @@ def test_reflow_is_idempotent_after_a_recipe_change(user_id):
     # stable, not decaying, because nothing about them ever changes.
     assert second["skipped_locked"] == first["skipped_locked"]
     assert _rows(user_id, plan_id) == snapshot
+
+
+def _harder(kind, duration_min, variant=None):
+    """build_workout, but every target 5% higher: same shape, new content.
+
+    Stands in for a real planner change (e.g. making targets profile-aware):
+    name, type, variant and duration are untouched, only the segments and the
+    TSS move.
+    """
+    session = planner.build_workout(kind, duration_min, variant)
+    for seg in session.segments:
+        for attr in ("power", "power_low", "power_high", "on_power", "off_power"):
+            value = getattr(seg, attr)
+            if value is not None:
+                setattr(seg, attr, round(value + 0.05, 4))
+    session.compute_tss()
+    return session
+
+
+def test_a_planner_content_change_is_detected_and_repaired(user_id, monkeypatch):
+    """The diff covers tss and the stored .zwo, not just the row's labels."""
+    plan_id = _seed_plan(user_id)
+    today = NOW.date().isoformat()
+    before = {r["id"]: r for r in _rows(user_id, plan_id)}
+    monkeypatch.setattr(planmod, "build_workout", _harder)
+
+    result = reflow.reflow_plan(user_id, plan_id, now=NOW)
+
+    future = [r for r in _rows(user_id, plan_id) if r["date"] > today]
+    assert future
+    assert result["updated"] == len(future)
+    for row in future:
+        old = before[row["id"]]
+        # The labels are identical - only content moved, which is exactly the
+        # case the old name/type/variant/duration-only diff missed.
+        assert (row["name"], row["type"], row["variant"], row["duration_s"]) == (
+            old["name"], old["type"], old["variant"], old["duration_s"])
+        assert row["tss"] > old["tss"]
+        assert row["zwo_or_segments"] != old["zwo_or_segments"]
+    # And it converges: a second pass under the same planner is a no-op again.
+    second = reflow.reflow_plan(user_id, plan_id, now=NOW)
+    assert (second["updated"], second["inserted"], second["deleted"]) == (0, 0, 0)
 
 
 # ------------------------------------------------------- refusals / locks
@@ -257,6 +300,60 @@ def test_reflow_rewrites_the_zwift_export(user_id, tmp_path):
         assert not old_file.exists()  # the superseded .zwo was pruned
 
 
+# -------------------------------------------------- races and failures
+def test_a_row_completed_between_read_and_write_is_counted_as_raced_lost(
+    user_id, monkeypatch
+):
+    """The DB guard rejecting a row must not make it vanish from the counts."""
+    plan_id = _seed_plan(user_id)
+    victim = _future(user_id, plan_id)[0]
+    _set_recipe(user_id, plan_id, reflow.build_recipe([0, 2, 4], 12.0, 1))
+    real_replace = db.replace_plan_workout_content
+
+    def complete_it_first(uid, workout_id, *a, **kw):
+        if workout_id == victim["id"]:
+            db.mark_plan_workout_completed(uid, workout_id, 999, victim["date"])
+        return real_replace(uid, workout_id, *a, **kw)
+
+    monkeypatch.setattr(db, "replace_plan_workout_content", complete_it_first)
+
+    result = reflow.reflow_plan(user_id, plan_id, now=NOW)
+
+    assert result["raced_lost"] == 1
+    assert result["failed"] == 0
+    kept = db.get_plan_workout(user_id, victim["id"])
+    assert kept["duration_s"] == victim["duration_s"]  # the guard held
+
+
+def test_a_row_whose_write_raises_is_counted_as_failed_and_the_loop_continues(
+    user_id, monkeypatch
+):
+    plan_id = _seed_plan(user_id)
+    victim = _future(user_id, plan_id)[0]
+    _set_recipe(user_id, plan_id, reflow.build_recipe([0, 2, 4], 12.0, 1))
+    real_replace = db.replace_plan_workout_content
+
+    def boom(uid, workout_id, *a, **kw):
+        if workout_id == victim["id"]:
+            raise sqlite3.OperationalError("database is locked")
+        return real_replace(uid, workout_id, *a, **kw)
+
+    monkeypatch.setattr(db, "replace_plan_workout_content", boom)
+
+    result = reflow.reflow_plan(user_id, plan_id, now=NOW)
+
+    assert result["status"] == "ok"  # returned, did not raise
+    assert result["failed"] == 1
+    assert result["updated"] > 0  # later rows were still applied
+    assert db.get_plan_workout(user_id, victim["id"])["duration_s"] == \
+        victim["duration_s"]
+    # Self-healing: with the fault gone, a re-run repairs the row it skipped.
+    monkeypatch.setattr(db, "replace_plan_workout_content", real_replace)
+    again = reflow.reflow_plan(user_id, plan_id, now=NOW)
+    assert again["failed"] == 0 and again["updated"] == 1
+    assert reflow.reflow_plan(user_id, plan_id, now=NOW)["updated"] == 0
+
+
 # ----------------------------------------------------------- active plan
 def test_new_plan_becomes_the_active_plan(user_id):
     first = _seed_plan(user_id, name="First")
@@ -301,6 +398,21 @@ def test_deleting_an_inactive_plan_leaves_the_active_one_alone(user_id):
 
     db.delete_plan(user_id, first)
     assert db.get_active_plan(user_id)["id"] == second
+
+
+def test_promotion_is_deterministic_when_created_timestamps_tie(user_id):
+    """Same `created` on both plans: the higher id wins, every time."""
+    first = _seed_plan(user_id, name="First")
+    second = _seed_plan(user_id, name="Second")
+    third = _seed_plan(user_id, name="Third")
+    _sql("UPDATE plans SET created = '2026-07-01T00:00:00' WHERE user_id = ?",
+         user_id)
+
+    db.delete_plan(user_id, third)
+    assert db.get_active_plan(user_id)["id"] == second
+
+    db.delete_plan(user_id, second)
+    assert db.get_active_plan(user_id)["id"] == first
 
 
 def test_recipe_round_trips_as_a_dict(user_id):

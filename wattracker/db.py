@@ -1389,8 +1389,10 @@ def delete_plan(
         )
         if was_active:
             successor = conn.execute(
-                "SELECT id FROM plans WHERE user_id = ? ORDER BY created DESC "
-                "LIMIT 1",
+                # id DESC breaks the tie when two plans share a `created`
+                # timestamp, so promotion is deterministic.
+                "SELECT id FROM plans WHERE user_id = ? "
+                "ORDER BY created DESC, id DESC LIMIT 1",
                 (user_id,),
             ).fetchone()
             if successor is not None:
