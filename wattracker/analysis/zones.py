@@ -150,9 +150,17 @@ def resolve_current_ftp(user_id: int) -> dict:
     # exists. Guard it so its generic 200 W empty-data fallback cannot leak.
     usable = False
     for activity in db.full_activities(user_id):
-        power = (activity.get("streams") or {}).get("power") or []
-        if power and best_20min_power(power) > 0:
-            usable = True
+        streams = activity.get("streams")
+        if not isinstance(streams, dict):
+            continue
+        power = streams.get("power")
+        if not isinstance(power, (list, tuple)) or not power:
+            continue
+        try:
+            usable = best_20min_power(power) > 0
+        except (TypeError, ValueError, OverflowError):
+            continue
+        if usable:
             break
     if usable:
         value = _finite(importer.current_ftp(user_id))

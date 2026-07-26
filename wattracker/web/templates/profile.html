@@ -6,6 +6,66 @@
 {% elif saved == '1' %}<p class="ok" role="status">Heart-rate setting saved.</p>{% endif %}
 {% if error %}<p class="alert" role="alert">{{ error }}</p>{% endif %}
 
+<section class="profile-section power-profile" aria-labelledby="record-power-title">
+    <h3 id="record-power-title">Power profile</h3>
+    {% if power_profile.available %}
+    <p>
+        <strong>Rider type: {{ power_profile.phenotype.label }}</strong><br>
+        <span class="hint">{{ power_profile.phenotype.rationale }}
+        {{ power_profile.phenotype.caveat }}</span>
+    </p>
+    <div class="power-profile-layout">
+        <div class="power-radar-wrap">
+            <canvas id="powerProfileRadar" role="img"
+                    aria-label="Radar chart comparing all-time and last-60-day record power by duration"></canvas>
+        </div>
+        <div>
+            <p class="hint power-normalization-note">Each spoke is normalized to that duration’s all-time best (100%). Durations are not compared as raw watts.</p>
+            <p class="hint">
+                Coverage: {{ power_profile.coverage.all_time_durations }}/{{ power_profile.coverage.duration_count }} all-time durations;
+                {{ power_profile.coverage.recent_60d_durations }}/{{ power_profile.coverage.duration_count }} since {{ power_profile.cutoff_text }}.
+            </p>
+        </div>
+    </div>
+    <div class="table-scroll">
+    <table class="power-profile-table">
+        <caption class="sr-only">Record power by duration; text alternative to the radar chart</caption>
+        <thead><tr>
+            <th scope="col">Duration</th>
+            <th scope="col">All time</th>
+            <th scope="col">Last 60 days</th>
+            <th scope="col">60-day vs all-time</th>
+        </tr></thead>
+        <tbody>{% for row in power_profile.rows %}
+        <tr>
+            <th scope="row">{{ row.label }}</th>
+            <td>
+                {% if row.all_time is not none %}<strong>{{ row.all_time }} W</strong>
+                {% if row.all_time_wkg is not none %}<span class="power-wkg">{{ row.all_time_wkg }} W/kg</span>{% endif %}
+                <span class="sr-only">from {{ row.all_time_rides }} qualifying rides</span>
+                {% else %}<span class="muted">—</span>{% endif %}
+            </td>
+            <td>
+                {% if row.recent_60d is not none %}<strong>{{ row.recent_60d }} W</strong>
+                {% if row.recent_60d_wkg is not none %}<span class="power-wkg">{{ row.recent_60d_wkg }} W/kg</span>{% endif %}
+                <span class="sr-only">from {{ row.recent_60d_rides }} qualifying rides</span>
+                {% else %}<span class="muted">—</span>{% endif %}
+            </td>
+            <td>{% if row.recent_percent is not none %}{{ row.recent_percent }}%{% else %}<span class="muted">—</span>{% endif %}</td>
+        </tr>
+        {% endfor %}</tbody>
+    </table>
+    </div>
+    {% else %}
+    <p>
+        <strong>Rider type: {{ power_profile.phenotype.label }}</strong><br>
+        <span class="hint">{{ power_profile.phenotype.rationale }}
+        {{ power_profile.phenotype.caveat }}</span>
+    </p>
+    <p class="hint">Import Zwift or FIT rides with power to build all-time and recent record power.</p>
+    {% endif %}
+</section>
+
 <section class="profile-section" aria-labelledby="power-zone-title">
     <h3 id="power-zone-title">Power zones</h3>
     {% if profile.power.available %}
@@ -58,4 +118,72 @@
         {% if manual_hr_max %}<button class="button-secondary" type="submit" name="action" value="reset">Use FIT estimate</button>{% endif %}
     </form>
 </section>
+{% if power_profile.available %}
+<script>
+(function () {
+    "use strict";
+    var profileChart = {{ power_profile.chart|tojson }};
+    var canvas = document.getElementById("powerProfileRadar");
+    if (!canvas || typeof Chart === "undefined") return;
+
+    function dataset(label, data, watts, wkg, color, fill) {
+        return {
+            label: label,
+            data: data,
+            actualWatts: watts,
+            actualWkg: wkg,
+            borderColor: color,
+            backgroundColor: fill,
+            pointBackgroundColor: color,
+            pointBorderColor: "#10161d",
+            borderWidth: 2,
+            spanGaps: false
+        };
+    }
+
+    new Chart(canvas, {
+        type: "radar",
+        data: {
+            labels: profileChart.labels,
+            datasets: [
+                dataset("All time", profileChart.all_time, profileChart.all_time_watts,
+                    profileChart.all_time_wkg, "#f2a900", "rgba(242, 169, 0, 0.18)"),
+                dataset("Last 60 days", profileChart.recent_60d, profileChart.recent_60d_watts,
+                    profileChart.recent_60d_wkg, "#57c7ff", "rgba(87, 199, 255, 0.14)")
+            ]
+        },
+        options: {
+            responsive: true,
+            maintainAspectRatio: false,
+            animation: false,
+            scales: {
+                r: {
+                    suggestedMin: 0,
+                    suggestedMax: 110,
+                    angleLines: {color: "#39424d"},
+                    grid: {color: "#2a333d"},
+                    pointLabels: {color: "#e8edf3", font: {size: 11}},
+                    ticks: {color: "#aab3bd", backdropColor: "transparent", callback: function (v) { return v + "%"; }}
+                }
+            },
+            plugins: {
+                legend: {labels: {color: "#e8edf3"}},
+                tooltip: {
+                    callbacks: {
+                        label: function (context) {
+                            var watts = context.dataset.actualWatts[context.dataIndex];
+                            if (watts === null || watts === undefined) return context.dataset.label + ": unavailable";
+                            var wkg = context.dataset.actualWkg[context.dataIndex];
+                            return context.dataset.label + ": " + watts + " W" +
+                                (wkg === null || wkg === undefined ? "" : " (" + wkg + " W/kg)") +
+                                " — " + context.formattedValue + "%";
+                        }
+                    }
+                }
+            }
+        }
+    });
+}());
+</script>
+{% endif %}
 {% endblock %}
