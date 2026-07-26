@@ -21,6 +21,22 @@
 {% set rating_next = '/calendar' %}
 {% include "_pending_ratings.html" %}
 
+{# A planned race that has actually been raced, marked on its day cell. The
+   cell is tiny, so this is a badge plus a tooltip only - the Races page
+   carries the full row, and the badge links straight to the ZwiftPower event
+   when we know its id. #}
+{% macro race_result_badge(res) %}
+{%- set summary %}{{ res.event_title }} — raced.{% if res.place %} Placed {{ res.place }}.{% elif res.position %} Position {{ res.position }}.{% endif %}{% if res.category %} Cat {{ res.category }}.{% endif %}{% if res.duration_fmt %} {{ res.duration_fmt }}.{% endif %}{% if res.avg_power %} {{ res.avg_power|round(0)|int }} W avg.{% endif %} See the Races page for the full result.{% endset -%}
+{%- set label %}{% if res.place %}P{{ res.place }}{% else %}&#10003;{% endif %}{% endset -%}
+{%- if res.zp_event_id -%}
+<a class="cal-race-tag cal-race-result" title="{{ summary }}"
+   href="https://zwiftpower.com/events.php?zid={{ res.zp_event_id }}"
+   target="_blank" rel="noopener">{{ label }}</a>
+{%- else -%}
+<span class="cal-race-tag cal-race-result" title="{{ summary }}">{{ label }}</span>
+{%- endif -%}
+{% endmacro %}
+
 <div class="cal-head">
     <a class="button" href="/calendar{{ prev }}">&larr; Prev</a>
     <h3>{{ month_name }} {{ year }}</h3>
@@ -77,7 +93,7 @@
         <tr>
         {% for cell in week %}
             <td class="cal-cell {{ 'other-month' if not cell.in_month else '' }} {{ 'cal-ooto-day' if cell.ooto else '' }} {{ 'cal-race-day' if cell.race else '' }}">
-                <div class="cal-day">{{ cell.day }}{% if cell.ooto %} <span class="cal-ooto-tag">OOTO</span>{% endif %}{% if cell.race %} <span class="cal-race-tag cal-race-{{ cell.race.priority }}" title="{{ cell.race.name or 'Race' }} — priority {{ cell.race.priority }}">{{ cell.race.priority }}</span>{% endif %}{% if cell.phase %} <span class="cal-phase-tag" title="This week is part of your plan's {{ cell.phase }} block">{{ cell.phase }}</span>{% endif %}</div>
+                <div class="cal-day">{{ cell.day }}{% if cell.ooto %} <span class="cal-ooto-tag">OOTO</span>{% endif %}{% if cell.race %} <span class="cal-race-tag cal-race-{{ cell.race.priority }}" title="{{ cell.race.name or 'Race' }} — priority {{ cell.race.priority }}">{{ cell.race.priority }}</span>{% if cell.race.result %} {{ race_result_badge(cell.race.result) }}{% endif %}{% endif %}{% if cell.phase %} <span class="cal-phase-tag" title="This week is part of your plan's {{ cell.phase }} block">{{ cell.phase }}</span>{% endif %}</div>
                 {% for w in cell.workouts %}
                     <div class="cal-workout cal-{{ w.type }}{{ ' cal-completed' if w.completed_activity_id else '' }}{{ ' cal-adapted' if w.adapted else '' }}{{ ' cal-skipped' if w.skipped else '' }}{{ ' cal-missed' if w.missed else '' }}"
                          {% if not w.standalone %}
@@ -147,6 +163,7 @@
         <li>
             <span class="nowrap">{{ r.date }}</span>
             <span class="cal-race-tag cal-race-{{ r.priority }}">{{ r.priority }}</span>
+            {% if r.result %}{{ race_result_badge(r.result) }}{% endif %}
             {% if r.name %}<span class="hint">{{ r.name }}</span>{% endif %}
             {% if r.duration_min %}<span class="hint">{{ r.duration_min }} min</span>{% endif %}
             <form method="post" action="/race/{{ r.id }}/delete" style="display:inline">

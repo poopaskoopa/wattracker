@@ -1538,7 +1538,11 @@ def create_app() -> FastAPI:
             y, m = y + 1, 1
 
         ooto_ranges = db.list_ooto_ranges(uid)
-        race_dates = db.list_race_dates(uid)
+        # Each row gets its matched ZwiftPower/local result (if the race has
+        # passed and one was found) attached under "result" - see
+        # races.match_result_for_race_date for why this is resolved live
+        # rather than stored on race_dates.
+        race_dates = races.attach_results_to_race_dates(uid, db.list_race_dates(uid))
         races_by_date = {r["date"]: r for r in race_dates}
 
         def _in_ooto(date_iso: str) -> bool:

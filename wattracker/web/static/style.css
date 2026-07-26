@@ -281,6 +281,11 @@ table.calendar th { text-align: center; }
     padding: 0 4px; vertical-align: middle; }
 /* An A race is the one the season bends around - make it the loud one. */
 .cal-race-tag.cal-race-A { background: var(--accent); }
+/* A planned race that has a cached result: it was actually ridden. Outlined
+   rather than filled so it reads as history next to the solid priority badge,
+   which is the plan speaking about the future. */
+.cal-race-tag.cal-race-result { background: transparent; color: var(--ok);
+    border: 1px solid var(--ok); text-decoration: none; }
 /* Which block of the active plan's arc this week belongs to. Quiet on purpose:
    it is context for the day, not an event happening on it. */
 .cal-phase-tag { font-size: 0.6rem; letter-spacing: 0.03em; color: var(--muted);
