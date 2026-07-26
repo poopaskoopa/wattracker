@@ -6,11 +6,12 @@ activities, ~1.8s just to inflate + scan them). None of the derived quantities
 below change unless the user's activity set changes, so we cache them keyed by a
 cheap fingerprint of that set.
 
-Fingerprint = (activity count, max activity id, duplicate-link count). Activities are inserted with
-``INSERT OR IGNORE`` and their streams are never updated in place (see
-``db.insert_activity``), so any new import strictly increases the count and the
-max id - either component moving invalidates the cache. This needs no schema
-change: the cache lives entirely in process memory.
+Fingerprint = (activity count, max activity id, duplicate-link count, correction
+count, max correction id, undone-correction count). Activities are inserted
+with ``INSERT OR IGNORE`` and their original streams are never updated in place
+(see ``db.insert_activity``). Persisted correction state is included so a
+second process also observes apply/undo changes instead of relying only on
+in-process invalidation.
 
 The digest holds only small, activity-static artifacts (dates, per-effort best
 20-minute powers, a prefix-sum table, one decoupling value) - never the raw
@@ -74,10 +75,10 @@ class ActivityDigest:
 
 
 _lock = threading.Lock()
-_cache: Dict[int, Tuple[Tuple[int, int], ActivityDigest]] = {}
+_cache: Dict[int, Tuple[Tuple[int, ...], ActivityDigest]] = {}
 
 
-def _fingerprint(user_id: int) -> Tuple[int, int, int]:
+def _fingerprint(user_id: int) -> Tuple[int, ...]:
     conn = db.connect()
     try:
         row = conn.execute(
@@ -89,7 +90,12 @@ def _fingerprint(user_id: int) -> Tuple[int, int, int]:
         # Linking a duplicate drops a ride out of the digest without changing
         # the count or max id (the backfill links historical rows), so the
         # number of links is part of the fingerprint.
-        return (int(row["c"]), int(row["m"]), int(row["d"] or 0))
+        return (
+            int(row["c"]),
+            int(row["m"]),
+            int(row["d"] or 0),
+            *db.power_correction_fingerprint(user_id),
+        )
     finally:
         conn.close()
 
