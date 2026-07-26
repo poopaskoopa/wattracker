@@ -457,8 +457,10 @@ def generate_plan(
     from the phase instead of the model, and the phase's ``volume_multiplier``
     (never above 1.0) composes with recovery weeks and race tapers by taking the
     DEEPER reduction rather than multiplying - stacking two reductions would
-    over-cut and could push sessions under their feasible floors.
-    ``phases=None`` leaves every existing code path untouched.
+    over-cut and could push sessions under their feasible floors. An arc that
+    cannot be periodized coherently in the weeks available is abandoned by the
+    resolver, so the plan comes back unphased with ``phases.unphased_reason``
+    set. ``phases=None`` leaves every existing code path untouched.
     """
     err = validate_plan_inputs(
         weeks, days_of_week, hours_per_week, hit_days_per_week, hard_days, model
@@ -693,5 +695,9 @@ def generate_plan(
             # build block, not full preparation".
             "omitted": list(phase_plan.omitted),
             "weeks": [p.name if p else None for p in phase_plan.weeks],
+            # Set when the plan was too short to periodize coherently and the
+            # arc was abandoned: the plan below is exactly an unphased one, and
+            # this is the sentence explaining that to the rider.
+            "unphased_reason": phase_plan.unphased_reason,
         }
     return out
