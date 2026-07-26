@@ -10,6 +10,7 @@ import pytest
 
 from wattracker import auth, db
 from wattracker.prescribe import plan, zwo
+from wattracker.prescribe.phases import DEFAULT_ARC
 
 MONDAY = dt.date(2026, 7, 6)  # a Monday
 
@@ -101,20 +102,26 @@ def _sweep_configs():
 
 
 @pytest.mark.parametrize("with_races", [False, True])
-def test_weekly_volume_never_exceeds_requested_hours_across_the_grid(with_races):
+@pytest.mark.parametrize("with_phases", [False, True])
+def test_weekly_volume_never_exceeds_requested_hours_across_the_grid(
+    with_races, with_phases
+):
+    # Periodization redistributes intensity inside the SAME weekly budget, so
+    # the cap has to survive a phase arc exactly as it survives a race.
     races = _SWEEP_RACES if with_races else None
+    phases = DEFAULT_ARC if with_phases else None
     checked = 0
     for hours, days, hit, model in _sweep_configs():
         if plan.validate_plan_inputs(8, days, hours, hit, None, model):
             continue  # a configuration the generator refuses to build
         p = plan.generate_plan("P", MONDAY, 8, days, hours, hit, model=model,
-                               races=races)
+                               races=races, phases=phases)
         cap_s = hours * 3600
         for wk in p["weekly"]:
             assert wk["total_s"] <= cap_s, (
                 f"{hours}h, {len(days)} days, {hit} hard, {model}, "
-                f"week {wk['week']}: {wk['total_s'] / 60:.1f} min "
-                f"> {cap_s / 60:.0f} min"
+                f"phases={with_phases}, week {wk['week']}: "
+                f"{wk['total_s'] / 60:.1f} min > {cap_s / 60:.0f} min"
             )
         checked += 1
     assert checked > 200  # the grid really was exercised
