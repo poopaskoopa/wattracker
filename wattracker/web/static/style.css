@@ -184,6 +184,9 @@ details summary { cursor: pointer; color: var(--accent); margin: 0.5rem 0; }
 .plan-form button { grid-column: 1 / -1; justify-self: start; }
 .weekly-table .recovery-week { color: var(--ok); }
 .link-btn { background: none; border: none; color: var(--accent); cursor: pointer; padding: 0; font: inherit; }
+.badge { background: var(--accent); color: #fff; border-radius: 3px; padding: 0 0.35rem; font-size: 0.72rem; text-transform: uppercase; letter-spacing: 0.03em; }
+.plan-list { list-style: none; padding: 0; margin: 0.3rem 0 0.8rem; font-size: 0.85rem; color: var(--muted); }
+.plan-list li { margin: 0.15rem 0; }
 
 /* Calendar */
 .cal-head { display: flex; align-items: center; justify-content: space-between; gap: 1rem; }

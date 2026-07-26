@@ -11,6 +11,7 @@
     {% set cur = plan_mgmt.current %}
     <div class="current-plan{{ ' not-in-effect' if not cur.in_effect else '' }}">
         <h3>Current plan
+            {% if cur.active %}<span class="badge">Active</span>{% endif %}
             {% if not cur.in_effect %}<span class="hint">(not currently in effect)</span>{% endif %}
         </h3>
         <p><strong><a href="/plan?plan_id={{ cur.id }}">{{ cur.name }}</a></strong>
@@ -38,6 +39,14 @@
                 <td>{{ p.start_date }} &rarr; {{ p.end_date }}</td>
                 <td>{{ p.completed }}/{{ p.total }}</td>
                 <td>
+                    {% if p.active %}
+                        <span class="badge">Active</span>
+                    {% else %}
+                    <form method="post" action="/plan/{{ p.id }}/activate"
+                          style="display:inline">
+                        <button type="submit" class="link-btn">make active</button>
+                    </form>
+                    {% endif %}
                     <form method="post" action="/plan/{{ p.id }}/delete"
                           class="delete-plan-form" style="display:inline"
                           onsubmit="return confirmPlanDelete(this);">
