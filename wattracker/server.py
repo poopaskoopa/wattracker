@@ -1663,6 +1663,18 @@ def create_app() -> FastAPI:
             )
         try:
             found = await bledevices.scan()
+            if not found:
+                return JSONResponse(
+                    {
+                        "available": True,
+                        "reason": (
+                            "No Bluetooth devices found. Wake or spin the device, "
+                            "make sure no other app owns it, then retry."
+                        ),
+                        "devices": [],
+                    },
+                    status_code=404,
+                )
             return JSONResponse({"available": True, "devices": found})
         except Exception as e:  # no adapter, timeout, etc.
             return JSONResponse(
@@ -1922,6 +1934,9 @@ def create_app() -> FastAPI:
                                     power_source=conn.get("power_source"),
                                     hr_source=conn.get("hr_source"),
                                 )
+                            ending_session = not (
+                                conn.get("power_source") or conn.get("trainer")
+                            )
                             available_now, enabled_now = _connection_erg_state(conn)
                             await websocket.send_json(
                                 {
@@ -1930,9 +1945,17 @@ def create_app() -> FastAPI:
                                     "devices": conn.get("names", {}),
                                     "erg_available": available_now,
                                     "erg_enabled": enabled_now,
-                                    "message": "Device disconnected.",
+                                    "ending_session": ending_session,
+                                    "message": (
+                                        "Device disconnected. Releasing Bluetooth "
+                                        "before another scan or connection."
+                                        if ending_session
+                                        else "Device disconnected."
+                                    ),
                                 }
                             )
+                            if ending_session:
+                                return "stop"
                         except Exception as exc:
                             await websocket.send_json(
                                 {
