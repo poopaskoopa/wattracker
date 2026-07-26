@@ -2594,6 +2594,35 @@ def list_race_results(user_id: int, path: Optional[str] = None) -> List[dict]:
         conn.close()
 
 
+def race_results_on_date(
+    user_id: int, date_iso: str, path: Optional[str] = None
+) -> List[dict]:
+    """Cached race results (any source) for this user on one date.
+
+    Used to resolve a planned ``race_dates`` row against the past results
+    cached from ZwiftPower/local heuristics at read time - see
+    ``races.match_result_for_race_date``.
+    """
+    conn = connect(path)
+    try:
+        rows = conn.execute(
+            "SELECT * FROM race_results WHERE user_id = ? AND event_date = ? "
+            "ORDER BY id ASC",
+            (user_id, date_iso),
+        ).fetchall()
+        out = []
+        for r in rows:
+            d = dict(r)
+            try:
+                d["power"] = json.loads(d.pop("power_json") or "{}")
+            except ValueError:
+                d["power"] = {}
+            out.append(d)
+        return out
+    finally:
+        conn.close()
+
+
 def save_race_sync(
     user_id: int,
     rider_id: Optional[str],

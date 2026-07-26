@@ -33,7 +33,7 @@ import urllib.request
 from typing import Dict, List, Optional
 
 from . import db
-from .timeutil import utc_now
+from .timeutil import utc_now, utc_today
 from .metrics.curve import best_rolling_power
 
 log = logging.getLogger(__name__)
@@ -426,6 +426,91 @@ def _matching_activity(
             cands, key=lambda a: abs((a.get("duration_s") or 0) - int(duration_s))
         )
     return db.get_activity(user_id, cands[0]["id"])
+
+
+# ------------------------------------------------- planned-vs-actual linking
+# `race_dates` (future intent, see db.py's DDL comment) and `race_results`
+# (past fact, refreshed wholesale from ZwiftPower/local heuristics - see
+# `refresh_race_results`) are deliberately separate tables. The association
+# below is resolved at READ time rather than stored as a foreign key on
+# `race_dates`: `replace_race_results` DELETEs and re-INSERTs every row for a
+# source on each refresh, so a `race_results.id` is not stable across
+# refreshes - a persisted FK would go stale the moment results are next
+# fetched and would need re-resolving anyway, so a live resolver is strictly
+# simpler and can never point at a row that no longer exists. Matching is
+# also cheap: at most a handful of rows share a (user_id, event_date).
+
+
+def _result_match_score(planned: dict, candidate: dict) -> tuple:
+    """Lower is better. Tie-break for >1 race_results row on the same date.
+
+    Preference order:
+      1. Title overlap: the planned race's ``name`` and the result's
+         ``event_title`` share text (case-insensitive substring either way).
+         This is the strongest positive signal - a rider who named their
+         planned race after the actual event is telling us which result is
+         theirs.
+      2. Closest duration: |result duration - planned duration_min| in
+         minutes. Absent a duration on either side sorts last (treated as an
+         infinite gap) rather than winning by default.
+      3. Lowest `race_results.id`, purely for determinism when the above are
+         still tied (e.g. two untitled, undurationed results on one date) -
+         arbitrary, but stable and never crashes on a genuine tie.
+    """
+    name = (planned.get("name") or "").strip().lower()
+    title = (candidate.get("event_title") or "").strip().lower()
+    title_match = 0 if name and title and (name in title or title in name) else 1
+
+    planned_min = planned.get("duration_min")
+    cand_s = candidate.get("duration_s")
+    if planned_min and cand_s:
+        duration_gap = abs(cand_s / 60.0 - float(planned_min))
+    else:
+        duration_gap = math.inf
+
+    return (title_match, duration_gap, candidate.get("id") or 0)
+
+
+def match_result_for_race_date(
+    user_id: int, race_date: dict
+) -> Optional[dict]:
+    """The cached race result matching a planned race date, or None.
+
+    None is the ordinary case: most planned races are in the future, or the
+    rider hasn't refreshed race results since racing it. This never raises -
+    an unmatched or ambiguous race must never break a calendar/races-page
+    render.
+    """
+    date_iso = race_date.get("date") or ""
+    if not date_iso or date_iso > utc_today().isoformat():
+        return None
+    try:
+        candidates = db.race_results_on_date(user_id, date_iso)
+    except Exception:  # noqa: BLE001 - a lookup failure just means "no link"
+        log.warning("race result lookup failed for a planned race date",
+                    exc_info=True)
+        return None
+    if not candidates:
+        return None
+    if len(candidates) == 1:
+        return candidates[0]
+    return min(candidates, key=lambda c: _result_match_score(race_date, c))
+
+
+def attach_results_to_race_dates(
+    user_id: int, race_dates: List[dict]
+) -> List[dict]:
+    """Copies of ``race_dates`` rows, each with a ``result`` key attached.
+
+    ``result`` is the matched ``race_results`` row (or None). Idempotent and
+    side-effect free - it only reads, never writes `race_dates`.
+    """
+    out = []
+    for r in race_dates:
+        d = dict(r)
+        d["result"] = match_result_for_race_date(user_id, r)
+        out.append(d)
+    return out
 
 
 def _weight_from_zwiftpower_doc(doc: dict) -> Optional[float]:
