@@ -21,7 +21,7 @@ from .timeutil import utc_now
 
 _log = logging.getLogger(__name__)
 
-SCHEMA_VERSION = 20
+SCHEMA_VERSION = 21
 
 
 def _restrict_db_files(path: str) -> None:
@@ -177,6 +177,9 @@ _MIGRATIONS: Dict[int, Sequence[Union[str, Callable[[sqlite3.Connection], None]]
         # rewrite. Legacy rows stay NULL and are never reflowed.
         "ALTER TABLE plan_workouts ADD COLUMN origin TEXT",
     ],
+    20: [
+        # New table race_dates is created by _SCHEMA after migrating.
+    ],
 }
 
 _DROP = """
@@ -184,6 +187,7 @@ DROP TABLE IF EXISTS ftp_feedback_batches;
 DROP TABLE IF EXISTS standalone_workouts;
 DROP TABLE IF EXISTS scanned_files;
 DROP TABLE IF EXISTS ooto_ranges;
+DROP TABLE IF EXISTS race_dates;
 DROP TABLE IF EXISTS race_sync;
 DROP TABLE IF EXISTS race_results;
 DROP TABLE IF EXISTS plan_workouts;
@@ -372,6 +376,24 @@ CREATE TABLE IF NOT EXISTS ooto_ranges (
 );
 CREATE INDEX IF NOT EXISTS idx_ooto_user
     ON ooto_ranges(user_id, start_date);
+
+-- Races the rider INTENDS to do: future events the plan bends around (taper,
+-- post-race recovery, no workout on the day itself). Deliberately NOT the same
+-- table as race_results above, which caches PAST results fetched from
+-- ZwiftPower. Future intent and historical fact have different lifecycles,
+-- different owners and different columns - do not merge them.
+CREATE TABLE IF NOT EXISTS race_dates (
+    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id      INTEGER NOT NULL,
+    date         TEXT NOT NULL,
+    priority     TEXT NOT NULL,      -- 'A' important | 'B' casual
+    name         TEXT,
+    duration_min INTEGER,            -- expected race duration; drives post-race recovery
+    created      TEXT NOT NULL,
+    FOREIGN KEY(user_id) REFERENCES users(id)
+);
+CREATE INDEX IF NOT EXISTS idx_race_dates_user
+    ON race_dates(user_id, date);
 
 CREATE TABLE IF NOT EXISTS scanned_files (
     user_id    INTEGER NOT NULL,
@@ -2175,6 +2197,120 @@ def ooto_covers(user_id: int, date_iso: str, path: Optional[str] = None) -> bool
             (user_id, date_iso, date_iso),
         ).fetchone()
         return row is not None
+    finally:
+        conn.close()
+
+
+# ------------------------------------------------------- race dates (intent)
+# NOTE: these operate on `race_dates` (FUTURE races the plan bends around), not
+# on `race_results` (PAST results cached from ZwiftPower). See the DDL comment.
+
+RACE_PRIORITIES = ("A", "B")
+
+
+def _clean_priority(priority: str) -> str:
+    """Normalise a priority to 'A' or 'B'; anything unknown becomes 'B'.
+
+    'B' is the safe default: it only nudges the two adjacent days, whereas a
+    wrongly-inferred 'A' would rewrite three weeks of a rider's plan.
+    """
+    p = (priority or "").strip().upper()
+    return p if p in RACE_PRIORITIES else "B"
+
+
+def add_race_date(
+    user_id: int, date: str, priority: str = "B", name: Optional[str] = None,
+    duration_min: Optional[int] = None, path: Optional[str] = None,
+) -> int:
+    """Add a planned race. Returns the new row id."""
+    conn = connect(path)
+    try:
+        cur = conn.execute(
+            "INSERT INTO race_dates "
+            "(user_id, date, priority, name, duration_min, created) "
+            "VALUES (?, ?, ?, ?, ?, ?)",
+            (user_id, date, _clean_priority(priority), (name or None),
+             int(duration_min) if duration_min else None,
+             utc_now().isoformat(timespec="seconds")),
+        )
+        conn.commit()
+        return cur.lastrowid
+    finally:
+        conn.close()
+
+
+def list_race_dates(user_id: int, path: Optional[str] = None) -> List[dict]:
+    conn = connect(path)
+    try:
+        rows = conn.execute(
+            "SELECT id, date, priority, name, duration_min FROM race_dates "
+            "WHERE user_id = ? ORDER BY date ASC, id ASC",
+            (user_id,),
+        ).fetchall()
+        return [dict(r) for r in rows]
+    finally:
+        conn.close()
+
+
+def update_race_date(
+    user_id: int, race_id: int, date: str, priority: str = "B",
+    name: Optional[str] = None, duration_min: Optional[int] = None,
+    path: Optional[str] = None,
+) -> bool:
+    """Rewrite a race. Returns False if it is not this user's race."""
+    conn = connect(path)
+    try:
+        cur = conn.execute(
+            "UPDATE race_dates SET date = ?, priority = ?, name = ?, "
+            "duration_min = ? WHERE user_id = ? AND id = ?",
+            (date, _clean_priority(priority), (name or None),
+             int(duration_min) if duration_min else None, user_id, race_id),
+        )
+        conn.commit()
+        return cur.rowcount > 0
+    finally:
+        conn.close()
+
+
+def delete_race_date(user_id: int, race_id: int, path: Optional[str] = None) -> bool:
+    conn = connect(path)
+    try:
+        cur = conn.execute(
+            "DELETE FROM race_dates WHERE user_id = ? AND id = ?",
+            (user_id, race_id),
+        )
+        conn.commit()
+        return cur.rowcount > 0
+    finally:
+        conn.close()
+
+
+def race_on(user_id: int, date_iso: str, path: Optional[str] = None) -> Optional[dict]:
+    """The user's race on this date, or None. Earliest-added race wins a tie."""
+    conn = connect(path)
+    try:
+        row = conn.execute(
+            "SELECT id, date, priority, name, duration_min FROM race_dates "
+            "WHERE user_id = ? AND date = ? ORDER BY id ASC LIMIT 1",
+            (user_id, date_iso),
+        ).fetchone()
+        return dict(row) if row else None
+    finally:
+        conn.close()
+
+
+def races_in_range(
+    user_id: int, start_date: str, end_date: str, path: Optional[str] = None
+) -> List[dict]:
+    """The user's races within an inclusive date range."""
+    conn = connect(path)
+    try:
+        rows = conn.execute(
+            "SELECT id, date, priority, name, duration_min FROM race_dates "
+            "WHERE user_id = ? AND date >= ? AND date <= ? ORDER BY date ASC",
+            (user_id, start_date, end_date),
+        ).fetchall()
+        return [dict(r) for r in rows]
     finally:
         conn.close()
 
