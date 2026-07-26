@@ -55,6 +55,9 @@
         <span class="status-adaptation">Plan adapted: {{ banner.adaptation }} &mdash;
             marked on the <a href="/calendar">calendar</a>.</span>
         {% endif %}
+        {% if banner.race_note %}
+        <span class="status-detail muted">{{ banner.race_note }}</span>
+        {% endif %}
     </span>
 </section>
 

@@ -387,6 +387,8 @@ button.danger.link-btn { border: none; color: var(--alert); }
 .profile-svg .pf-grid { stroke: #2a333d; stroke-width: 1; }
 .profile-svg .pf-area { fill: rgba(242, 169, 0, 0.22); stroke: none; }
 .profile-svg .pf-line { fill: none; stroke: var(--accent); stroke-width: 2; }
+/* Untargeted (maximal-effort) block: shaded band, no power step to read. */
+.profile-svg .pf-free { fill: rgba(242, 169, 0, 0.30); stroke: none; }
 .profile-svg .pf-ftp { stroke: var(--muted); stroke-width: 1; stroke-dasharray: 4 3; }
 .profile-svg .pf-ylab { fill: var(--muted); font-size: 10px; text-anchor: end;
     dominant-baseline: middle; }

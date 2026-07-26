@@ -6,6 +6,47 @@
 {% elif saved == '1' %}<p class="ok" role="status">Heart-rate setting saved.</p>{% endif %}
 {% if error %}<p class="alert" role="alert">{{ error }}</p>{% endif %}
 
+<section class="profile-section" aria-labelledby="targets-title">
+    <h3 id="targets-title">Workout targets</h3>
+    {% if targets.personalised %}
+    <p>
+        <strong>Personalised from your own data.</strong><br>
+        <span class="hint">
+            VO2max intervals are prescribed at {{ (targets.vo2_target * 100)|round|int }}% FTP
+            {% if targets.vo2_ratio %}(from your measured 5-minute power at
+            {{ (targets.vo2_ratio * 100)|round|int }}% FTP){% endif %};
+            {% if targets.sprint_ratio %}sprints are prescribed as maximal efforts with no
+            power target, and your measured 5-second peak of
+            {{ '%.2f'|format(targets.sprint_ratio) }}x FTP is what their training load is
+            counted as{% else %}sprints are prescribed as maximal efforts with no power
+            target{% endif %}.<br>
+            Last computed {{ targets.computed_at }}.
+        </span>
+    </p>
+    {% elif targets.computed %}
+    <p>
+        <strong>Using population defaults.</strong><br>
+        <span class="hint">
+            Your profile was computed {{ targets.computed_at }}, but there is not yet
+            enough ride data to measure your 5-minute or 5-second power, so VO2max
+            targets use the population default of
+            {{ (targets.vo2_default * 100)|round|int }}% FTP. Ride more and this becomes
+            yours automatically.
+        </span>
+    </p>
+    {% else %}
+    <p>
+        <strong>Using population defaults &mdash; no rider profile computed yet.</strong><br>
+        <span class="hint">
+            Workout targets are not yet personalised: they use population constants
+            ({{ (targets.vo2_default * 100)|round|int }}% FTP for VO2max). Your profile is
+            computed when a ride is imported and by the daily background sweep &mdash; if
+            that sweep is disabled and you never import, targets will stay generic.
+        </span>
+    </p>
+    {% endif %}
+</section>
+
 <section class="profile-section power-profile" aria-labelledby="record-power-title">
     <h3 id="record-power-title">Power profile</h3>
     {% if power_profile.available %}

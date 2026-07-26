@@ -20,6 +20,7 @@ from ..metrics.power import (
     normalized_power,
     training_stress_score,
 )
+from ..metrics import profile_store
 from ..paths import activities_dir
 from ..timeutil import parse_naive, utc_now, utc_today
 from .fit_parser import parse_fit
@@ -470,6 +471,13 @@ def scan_activities(
     if imported > 0:
         evaluate_ftp(user_id)
         completed = match_plan_completions(user_id)
+        # New rides move the rider's measured capacities (a new 5s or 5min
+        # peak, a new FTP), and every prescription is built on the STORED
+        # snapshot - so refresh it here, after FTP re-evaluation, rather than
+        # leaving the plan quoting yesterday's rider until the nightly sweep.
+        # Deliberately inside the `imported > 0` guard: nothing new landed
+        # means nothing derived changed.
+        profile_store.refresh(user_id)
 
     return {
         "found": found,
@@ -491,6 +499,10 @@ def ingest_upload(user_id: int, filename: str, content: bytes) -> Optional[int]:
         result = ingest_file(user_id, tmp.name)
         evaluate_ftp(user_id)
         match_plan_completions(user_id)
+        if result is not None:
+            # Same reasoning as scan_activities: a new ride can move every
+            # measured capacity, and prescriptions read the stored snapshot.
+            profile_store.refresh(user_id)
         return result
     finally:
         try:
@@ -534,7 +546,15 @@ def _zwo_fraction_profile(zwo_str: str) -> List[float]:
                     out.extend(on)
                     out.extend(off)
             elif tag == "freeride":
-                return []  # no objective target profile
+                # No objective target profile, so this workout cannot be
+                # completion-matched on shape. KNOWN GAP since sprints became
+                # untargeted freeride blocks: a sprint session now falls back
+                # to the duration/TSS match alone. Acceptable - a 12s maximal
+                # effort was never trackable against an ERG target anyway -
+                # but if sprints ever become plan-scheduled (see the goal
+                # work) this wants revisiting, e.g. by matching only the
+                # targeted blocks and ignoring the free ones.
+                return []
         except (KeyError, TypeError, ValueError):
             return []
     return out
