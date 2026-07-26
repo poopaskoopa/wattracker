@@ -378,12 +378,18 @@ def _sprint(total_s: int) -> Session:
         Segment(kind="warmup", duration=warmup, power_low=0.50, power_high=0.80,
                 text="Progressive warmup with two brief openers.")
     )
+    # Coggan/Allen list Level 7 (neuromuscular power) as "N/A" - it is
+    # deliberately not prescribable as a %FTP, so any number here is a
+    # stand-in. 2.00 was far below what a 12s maximal effort actually
+    # produces: the Coggan power-profile tables put trained 5s peak power
+    # near 3-4x FTP in W/kg terms, so 3.00 is the low end of a real
+    # neuromuscular effort rather than a threshold-ish number.
     s.segments.append(
         Segment(kind="intervals", duration=work, repeat=reps,
                 on_duration=on, off_duration=off,
-                on_power=2.00, off_power=0.55,
+                on_power=3.00, off_power=0.55,
                 text="12s all-out from a rolling start - go as hard as you can. "
-                     "The 200% FTP figure is a nominal target, not a cap. "
+                     "The 300% FTP figure is a nominal target, not a cap. "
                      "Spin easy for 3min between efforts.")
     )
     return _finish(s, total_s)
@@ -867,7 +873,7 @@ WORKOUT_TYPE_INFO: List[dict] = [
         "zone": "Zone 7",
         "low": 1.50,
         "high": None,
-        "work": 2.00,
+        "work": 3.00,
         "focus": "Trains neuromuscular power, recruitment and peak sprint watts.",
         "structure": "Warmup, then short all-out sprints with ~3min full recovery "
                      "between each, on an easy aerobic base.",
