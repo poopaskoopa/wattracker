@@ -236,8 +236,11 @@ def test_weekly_volume_never_exceeds_the_users_hours():
     raced = _weekly_minutes(_gen(races, weeks=12))
     cap = HOURS * 60
     for monday, minutes in raced.items():
-        assert minutes <= cap + 0.5, f"week of {monday}: {minutes} > {cap}"
-        assert minutes <= base[monday] + 0.5, f"week of {monday} grew"
+        # No tolerance: the cap is exact, in both the raceless plan and the
+        # raced one. See test_plan.py for the property sweep over the grid.
+        assert minutes <= cap, f"week of {monday}: {minutes} > {cap}"
+        assert base[monday] <= cap, f"baseline week of {monday} already over"
+        assert minutes <= base[monday], f"week of {monday} grew"
 
 
 def test_taper_actually_reduces_volume():
