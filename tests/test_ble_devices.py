@@ -260,6 +260,7 @@ def test_connect_sensors_disconnects_client_after_connect_failure(monkeypatch):
 
     assert result["clients"] == []
     assert fake_client.instances[0].disconnected is True
+    assert fake_client.instances[1].disconnected is True
     assert "radio refused" in result["errors"][0]
 
 
@@ -279,6 +280,7 @@ def test_connect_sensors_connect_timeout_becomes_error_not_exception(monkeypatch
     assert result["clients"] == []
     assert result["power_source"] is None
     assert fake_client.instances[0].disconnected is True
+    assert fake_client.instances[1].disconnected is True
     assert len(result["errors"]) == 1
     assert "Timed out connecting" in result["errors"][0]
     assert "STUCK" in result["errors"][0]
@@ -298,6 +300,95 @@ def test_connect_sensors_disconnects_client_when_connect_is_cancelled(monkeypatc
         asyncio.run(devices.connect_sensors(selected={"power": ["CANCEL"]}))
 
     assert fake_client.instances[0].disconnected is True
+
+
+def test_connect_sensors_retries_with_fresh_client_and_cleans_failure(monkeypatch):
+    _module, fake_client = _install_fake_bleak(monkeypatch)
+    monkeypatch.setattr(devices, "CONNECT_RETRY_DELAY_S", 0)
+
+    async def flaky_connect(self):
+        if len(fake_client.instances) == 1:
+            raise RuntimeError("temporary radio failure")
+        self.connected = True
+
+    class FakePower(FixedPower):
+        def __init__(self, client):
+            super().__init__(175)
+
+        async def start(self):
+            pass
+
+    monkeypatch.setattr(fake_client, "connect", flaky_connect)
+    monkeypatch.setattr(devices, "BleakPowerSource", FakePower)
+    result = asyncio.run(
+        devices.connect_sensors(
+            selected={"power": ["PEDALS"]}, retry_delay=0
+        )
+    )
+
+    assert len(fake_client.instances) == 2
+    assert fake_client.instances[0].disconnected is True
+    assert result["clients"] == [fake_client.instances[1]]
+    assert result["power_source"].latest_power() == 175
+    assert result["errors"] == []
+
+
+def test_connect_sensors_disconnects_client_when_all_role_setup_fails(
+    monkeypatch,
+):
+    _module, fake_client = _install_fake_bleak(monkeypatch)
+
+    class BrokenPower(FixedPower):
+        def __init__(self, client):
+            super().__init__(100)
+
+        async def start(self):
+            raise RuntimeError("notify failed")
+
+    monkeypatch.setattr(devices, "BleakPowerSource", BrokenPower)
+    result = asyncio.run(
+        devices.connect_sensors(selected={"power": ["ORPHAN"]})
+    )
+
+    assert result["clients"] == []
+    assert result["clients_by_address"] == {}
+    assert fake_client.instances[0].disconnected is True
+    assert result["power_source"] is None
+    assert "notify failed" in result["errors"][0]
+
+
+def test_connect_sensors_preserves_shared_client_when_one_role_succeeds(
+    monkeypatch,
+):
+    _module, fake_client = _install_fake_bleak(monkeypatch)
+
+    class BrokenTrainer:
+        def __init__(self, client):
+            pass
+
+        async def prepare(self):
+            raise RuntimeError("trainer setup failed")
+
+    class FakePower(FixedPower):
+        def __init__(self, client):
+            super().__init__(210)
+
+        async def start(self):
+            pass
+
+    monkeypatch.setattr(devices, "BleakTrainer", BrokenTrainer)
+    monkeypatch.setattr(devices, "BleakPowerSource", FakePower)
+    result = asyncio.run(
+        devices.connect_sensors(
+            selected={"trainer": ["COMBO"], "power": ["COMBO"]}
+        )
+    )
+
+    assert len(fake_client.instances) == 1
+    assert fake_client.instances[0].disconnected is False
+    assert result["clients"] == [fake_client.instances[0]]
+    assert result["power_source"].latest_power() == 210
+    assert set(result["bindings"]["COMBO"]["roles"]) == {"power"}
 
 
 def test_connect_sensors_disconnects_accumulated_clients_on_base_exception(
@@ -387,3 +478,78 @@ def test_scan_returns_detected_roles_and_signal(monkeypatch):
             "rssi": -47,
         }
     ]
+
+
+def test_scan_merges_multiple_sweeps_and_tolerates_one_failure(monkeypatch):
+    module, _fake_client = _install_fake_bleak(monkeypatch)
+    calls = 0
+
+    class FakeScanner:
+        @staticmethod
+        async def discover(timeout, return_adv):
+            nonlocal calls
+            calls += 1
+            if calls == 1:
+                raise RuntimeError("adapter warming up")
+            weak = types.SimpleNamespace(address="COMBO", name=None)
+            weak_adv = types.SimpleNamespace(
+                local_name=None,
+                service_uuids=[CYCLING_POWER_SERVICE],
+                rssi=-70,
+            )
+            return {"COMBO": (weak, weak_adv)}
+
+    module.BleakScanner = FakeScanner
+    found = asyncio.run(devices.scan(timeout=0.01))
+
+    assert calls == 2
+    assert found[0]["address"] == "COMBO"
+    assert found[0]["roles"] == ["power"]
+
+
+def test_scan_merges_services_name_and_strongest_rssi_by_address(monkeypatch):
+    module, _fake_client = _install_fake_bleak(monkeypatch)
+    calls = 0
+
+    class FakeScanner:
+        @staticmethod
+        async def discover(timeout, return_adv):
+            nonlocal calls
+            calls += 1
+            device = types.SimpleNamespace(
+                address="COMBO", name=None if calls == 1 else "Bike"
+            )
+            adv = types.SimpleNamespace(
+                local_name=None,
+                service_uuids=[
+                    CYCLING_POWER_SERVICE
+                    if calls == 1
+                    else FITNESS_MACHINE_SERVICE
+                ],
+                rssi=-72 if calls == 1 else -44,
+            )
+            return {"COMBO": (device, adv)}
+
+    module.BleakScanner = FakeScanner
+    found = asyncio.run(devices.scan(timeout=0.01))
+
+    assert found == [{
+        "address": "COMBO",
+        "name": "Bike",
+        "services": [CYCLING_POWER_SERVICE, FITNESS_MACHINE_SERVICE],
+        "roles": ["power", "trainer"],
+        "rssi": -44,
+    }]
+
+
+def test_scan_raises_when_every_sweep_fails(monkeypatch):
+    module, _fake_client = _install_fake_bleak(monkeypatch)
+
+    class FakeScanner:
+        @staticmethod
+        async def discover(timeout, return_adv):
+            raise RuntimeError("Bluetooth powered off")
+
+    module.BleakScanner = FakeScanner
+    with pytest.raises(RuntimeError, match="every attempt.*powered off"):
+        asyncio.run(devices.scan(timeout=0.01))
