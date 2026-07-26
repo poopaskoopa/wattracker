@@ -139,6 +139,55 @@ def test_phenotype_shape_cases(curve, expected):
     assert power_profile.classify_phenotype(curve)["label"] == expected
 
 
+# Textbook Coggan-style balanced curve, as multiples of FTP.
+BALANCED = {
+    1: 6.4, 15: 2.9, 30: 2.2, 60: 2.0, 120: 1.60, 300: 1.27,
+    600: 1.15, 1200: 1.05, 2400: 1.00, 3600: 0.97,
+}
+
+
+def _curve(ftp, overrides=None):
+    multiples = {**BALANCED, **(overrides or {})}
+    return {
+        duration: round(multiple * ftp) for duration, multiple in multiples.items()
+    }
+
+
+@pytest.mark.parametrize("ftp", [180, 250, 320, 400])
+def test_balanced_reference_curve_is_an_all_rounder(ftp):
+    assert power_profile.classify_phenotype(_curve(ftp))["label"] == "All-rounder"
+
+
+def test_leaning_variants_of_the_balanced_curve_get_specialty_labels():
+    sprinty = _curve(250, {15: 3.6, 30: 2.9})
+    punchy = _curve(250, {60: 2.4, 120: 2.0, 300: 1.55})
+    assert power_profile.classify_phenotype(sprinty)["label"] == "Sprinter"
+    assert power_profile.classify_phenotype(punchy)["label"] == "Puncheur"
+
+
+def test_phenotype_key_and_indices_shape():
+    balanced = power_profile.classify_phenotype(_curve(250))
+    assert balanced["key"] == "all_rounder"
+    assert set(balanced["indices"]) == {"short", "punch", "retention"}
+    assert balanced["indices"]["short"] == pytest.approx(1.012, abs=0.01)
+
+    sprinter = power_profile.classify_phenotype({
+        1: 1300, 15: 900, 30: 780, 60: 500, 120: 450, 300: 390,
+        1200: 300, 2400: 260,
+    })
+    assert sprinter["key"] == "sprinter"
+    assert sprinter["indices"]["retention"] is not None
+
+    no_long = power_profile.classify_phenotype({
+        1: 1200, 15: 560, 30: 520, 60: 410, 120: 390, 300: 360, 1200: 300,
+    })
+    assert no_long["indices"]["retention"] is None
+
+    sparse = power_profile.classify_phenotype({1: 900, 1200: 300})
+    assert sparse["key"] == "insufficient_data"
+    assert sparse["indices"] is None
+
+
 def test_phenotype_requires_three_domains_and_is_scale_invariant():
     incomplete = power_profile.classify_phenotype({1: 900, 1200: 300})
     assert incomplete["label"] == "Insufficient data"
