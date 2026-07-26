@@ -49,6 +49,30 @@ def test_estimate_ftp_recovers_20min_effort():
     assert est == pytest.approx(285.0, abs=1e-6)
 
 
+@pytest.mark.parametrize("corrupt", [
+    42,
+    "300",
+    b"300",
+    bytearray(b"300"),
+    {"sample": 300},
+])
+def test_estimate_ftp_skips_corrupt_dict_power_and_uses_valid_effort(corrupt):
+    activities = [
+        {"start_time": "2026-06-01T10:00:00", "streams": {"power": corrupt}},
+        {
+            "start_time": "2026-06-02T10:00:00",
+            "streams": {"power": [300.0] * 1200},
+        },
+    ]
+    assert power.estimate_ftp(activities) == pytest.approx(285.0)
+
+
+def test_estimate_ftp_preserves_tuple_generator_and_numpy_raw_streams():
+    assert power.estimate_ftp([(300.0,) * 1200]) == pytest.approx(285.0)
+    assert power.estimate_ftp((iter([300.0] * 1200),)) == pytest.approx(285.0)
+    assert power.estimate_ftp([np.full(1200, 300.0)]) == pytest.approx(285.0)
+
+
 def test_estimate_ftp_override_wins():
     assert power.estimate_ftp([[300.0] * 1200], override=250.0) == 250.0
 
