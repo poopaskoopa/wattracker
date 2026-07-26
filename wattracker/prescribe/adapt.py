@@ -68,8 +68,16 @@ def _plan_change(status: str, wtype: str, duration_min: float):
     return None
 
 
-def _reexport(uid: int, date: str, old_name: str, new_name: str, zwo_str: str) -> None:
-    """Keep the Zwift folder in sync for an adapted workout (best effort)."""
+def reexport_workout(
+    uid: int, date: str, old_name: str, new_name: Optional[str],
+    zwo_str: Optional[str] = None,
+) -> None:
+    """Keep the Zwift folder in sync for one rewritten workout (best effort).
+
+    ``new_name=None`` means the workout is gone: remove the old .zwo and write
+    nothing. Shared with prescribe/reflow.py so both rewrite paths prune and
+    re-write files the same way.
+    """
     settings = db.get_user_settings(uid)
     target, _reason = paths.resolve_export_dir(
         settings.get("zwift_id"), settings.get("workouts_dir")
@@ -80,6 +88,8 @@ def _reexport(uid: int, date: str, old_name: str, new_name: str, zwo_str: str) -
         old_path = os.path.join(target, zwo.plan_filename(date, old_name))
         if old_name != new_name and os.path.exists(old_path):
             os.unlink(old_path)
+        if new_name is None or zwo_str is None:
+            return
         zwo.write_plan_to_zwift(
             [{"date": date, "name": new_name, "zwo": zwo_str}],
             settings.get("zwift_id") or "me",
@@ -121,7 +131,7 @@ def apply_adaptations(user_id: int, state, now: Optional[_dt.datetime] = None) -
         )
         if ok:
             adjusted += 1
-            _reexport(user_id, w["date"], w["name"], session.name, zwo_str)
+            reexport_workout(user_id, w["date"], w["name"], session.name, zwo_str)
 
     return {
         "status": status,

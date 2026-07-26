@@ -847,6 +847,62 @@ def test_delete_plan_other_user_404(client):
     assert db.get_plan(alice_uid, plan_id) is not None
 
 
+# ------------------------------------------------------------ active plan
+def test_generated_plan_persists_its_recipe_and_becomes_active(client):
+    _register(client)
+    uid = db.get_user_by_username("rider")["id"]
+    client.post("/generate/plan", data=PLAN_FORM)
+
+    stored = db.list_plans(uid)[0]
+    assert stored["active"] is True
+    assert stored["recipe"] == {
+        "version": 1, "days_of_week": [0, 2, 4, 5], "hours_per_week": 8.0,
+        "hit_days_per_week": 2, "hard_days": [], "model": "polarized",
+    }
+    workouts = db.plan_workouts_for_plan(uid, stored["id"])
+    assert all(w["origin"] == "generated" for w in workouts)
+
+
+def test_activate_route_switches_the_active_plan(client):
+    _register(client)
+    uid = db.get_user_by_username("rider")["id"]
+    client.post("/generate/plan", data=PLAN_FORM)
+    client.post("/generate/plan", data=dict(PLAN_FORM, name="Second"))
+    first = db.list_plans(uid)[-1]["id"]  # created DESC -> oldest last
+
+    r = client.post(f"/plan/{first}/activate", follow_redirects=False)
+    assert r.status_code == 303
+    assert r.headers["location"].startswith("/plan?flash=")
+    assert db.get_active_plan(uid)["id"] == first
+
+
+def test_activate_route_returns_to_the_calendar_when_called_from_it(client):
+    _register(client)
+    uid = db.get_user_by_username("rider")["id"]
+    client.post("/generate/plan", data=PLAN_FORM)
+    plan_id = db.list_plans(uid)[0]["id"]
+
+    r = client.post(
+        f"/plan/{plan_id}/activate",
+        headers={"referer": "http://testserver/calendar?year=2026&month=8"},
+        follow_redirects=False,
+    )
+    assert r.headers["location"].startswith("/calendar?flash=")
+
+
+def test_activate_other_users_plan_404(client):
+    _register(client, "alice")
+    client.post("/generate/plan", data=PLAN_FORM)
+    alice_uid = db.get_user_by_username("alice")["id"]
+    plan_id = db.list_plans(alice_uid)[0]["id"]
+    client.post("/logout")
+
+    _register(client, "bob")
+    r = client.post(f"/plan/{plan_id}/activate", follow_redirects=False)
+    assert r.status_code == 404
+    assert db.get_active_plan(alice_uid)["id"] == plan_id
+
+
 # --------------------------------------------------- reopen plan via GET /plan
 def test_get_plan_with_plan_id_shows_summary(client):
     _register(client)

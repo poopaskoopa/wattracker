@@ -38,6 +38,7 @@ from .ble.runner import RideController, flatten_session
 from .ingest import importer
 from .prescribe import adapt as adaptmod
 from .prescribe import plan as planmod
+from .prescribe import reflow
 from .prescribe import zwo
 from .prescribe import llm
 from .prescribe.planner import (
@@ -727,11 +728,12 @@ def create_app() -> FastAPI:
     def _plan_management(uid: Optional[int]) -> dict:
         """Summarize the user's plans for the management section.
 
-        current: the plan whose date range (start_date .. +weeks*7d) covers
-        today; if none covers today, the most recent plan flagged in_effect=False;
-        None only when the user has no plans. others: every other plan, newest
-        first. Each entry carries name, model, dates, end_date, and progress
-        (completed/total workouts).
+        current: the plan the user explicitly marked active; failing that (no
+        active plan - legacy users have none until they set one) the plan whose
+        date range (start_date .. +weeks*7d) covers today; failing that the most
+        recent plan, flagged in_effect=False. None only when the user has no
+        plans. others: every other plan, newest first. Each entry carries name,
+        model, dates, end_date, active, and progress (completed/total workouts).
         """
         if uid is None:
             return {"current": None, "others": []}
@@ -759,16 +761,17 @@ def create_app() -> FastAPI:
                 "total": total,
                 "completed": completed,
                 "covers_today": covers,
+                "active": bool(p.get("active")),
             })
         if not entries:
             return {"current": None, "others": []}
-        current = next((e for e in entries if e["covers_today"]), None)
-        if current is not None:
-            current["in_effect"] = True
-        else:
-            # Most recent plan (list is created DESC) but flag not-in-effect.
-            current = entries[0]
-            current["in_effect"] = False
+        # Explicit choice first; otherwise the date-coverage heuristic, which is
+        # all a legacy user (no active plan) has. Falls back to the most recent
+        # plan (list is created DESC). in_effect stays a statement about dates.
+        current = next((e for e in entries if e["active"]), None)
+        if current is None:
+            current = next((e for e in entries if e["covers_today"]), entries[0])
+        current["in_effect"] = current["covers_today"]
         others = [e for e in entries if e["id"] != current["id"]]
         return {"current": current, "others": others}
 
@@ -932,16 +935,22 @@ def create_app() -> FastAPI:
                 name, start, weeks, day_ints, hours_per_week, hit_days_per_week,
                 hard_days=hard_ints or None, model=model,
             )
+            # Persist the generator inputs, not just their output, so the plan
+            # can be recomputed later (see prescribe/reflow.py).
+            recipe = reflow.build_recipe(
+                day_ints, hours_per_week, hit_days_per_week,
+                hard_days=hard_ints, model=model,
+            )
             plan_id = db.create_plan(
                 uid, name or "Training Plan", generated["start_date"],
-                generated["weeks"], model=generated["model"],
+                generated["weeks"], model=generated["model"], recipe=recipe,
             )
             for w in generated["workouts"]:
                 zwo_str = zwo.zwo_string(w["session"])
                 db.add_plan_workout(
                     plan_id, uid, w["date"], w["name"], w["type"],
                     w["duration_s"], w["tss"], zwo_str,
-                    variant=w.get("variant"),
+                    variant=w.get("variant"), origin=reflow.GENERATED,
                 )
             # Match any already-imported activities against the new plan's
             # workouts now - the gated rescan path only matches when NEW files
@@ -985,6 +994,24 @@ def create_app() -> FastAPI:
             request,
             "plan.html",
             _generate_ctx(request, mode="plan", plan=summary, exported=exported),
+        )
+
+    @app.post("/plan/{plan_id}/activate")
+    def plan_activate(request: Request, plan_id: int):
+        """Mark a plan as the user's active plan, then go back where we came from."""
+        uid = _uid(request)
+        plan = db.get_plan(uid, plan_id)
+        if not plan:
+            # Not this user's plan (or already gone) -> 404, no cross-user write.
+            return JSONResponse({"error": "not found"}, status_code=404)
+        db.set_active_plan(uid, plan_id)
+        flash = f"“{plan['name']}” is now your active plan"
+        # The button lives on both /plan and /calendar; only ever bounce back to
+        # one of our own pages, never to an attacker-supplied Referer.
+        referer = _url.urlparse(request.headers.get("referer") or "").path
+        target = "/calendar" if referer == "/calendar" else "/plan"
+        return RedirectResponse(
+            url=f"{target}?flash=" + _url.quote(flash), status_code=303
         )
 
     @app.get("/plan/{plan_id}/download.zip")
@@ -1154,6 +1181,7 @@ def create_app() -> FastAPI:
                 plans=db.list_plans(uid),
                 ooto_ranges=ooto_ranges,
                 export_result=request.query_params.get("exported"),
+                flash=request.query_params.get("flash"),
             ),
         )
 
