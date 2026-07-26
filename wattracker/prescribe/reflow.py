@@ -185,6 +185,8 @@ def reflow_plan(
     ``races`` echoes the races the recomputation planned around (with their
     EFFECTIVE priority) and ``race_conflicts`` reports A races demoted to B
     because they sat inside an earlier A race's taper, so the UI can warn.
+    ``race_conflicts`` is narrowed to demotions falling inside THIS plan - a
+    demotion outside it is real but is not something this plan did.
 
     ``skipped_locked`` counts rows that WOULD have changed but were already
     past-dated, completed or not generator-owned when they were read. It is
@@ -277,12 +279,21 @@ def reflow_plan(
                 (stored or {}).get("id"), exc_info=True,
             )
 
+    # A demotion is only this plan's business if the demoted race falls inside
+    # it: the generator resolves the rider's WHOLE race calendar, so without
+    # this a plan ending in August would announce a demotion between two races
+    # in December while its own summary correctly says nothing about them. The
+    # plan summary and the notice must never contradict each other.
+    monday0 = start - _dt.timedelta(days=start.weekday())
+    last_day = (monday0 + _dt.timedelta(days=7 * int(plan["weeks"]) - 1)).isoformat()
+    conflicts = [c for c in (race_info.get("conflicts") or [])
+                 if monday0.isoformat() <= c["date"] <= last_day]
+
     if notify:
-        _record_notice(user_id, plan_id, counts, now, bool(races),
-                       race_info.get("conflicts") or [])
+        _record_notice(user_id, plan_id, counts, now, bool(races), conflicts)
 
     return {"status": "ok", "races": race_info.get("planned") or [],
-            "race_conflicts": race_info.get("conflicts") or [], **counts}
+            "race_conflicts": conflicts, **counts}
 
 
 def _conflict_sentences(conflicts: List[dict]) -> str:
