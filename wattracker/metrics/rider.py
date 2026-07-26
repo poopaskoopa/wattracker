@@ -65,6 +65,13 @@ HR_SMOOTH_WINDOW_S = 30
 # percentile, which discards a fixed FRACTION of the top values and therefore
 # gets systematically worse (5-7 bpm low) the more history a rider accumulates,
 # since the discarded top slice is exactly the rides where they hit max.
+# Known limitation: corroboration assumes artefacts are unique to the file that
+# produced them, which holds for a one-off dropout but not for a strap that
+# fails the same way on every ride. Two such files agreeing with each other are
+# indistinguishable here from a real peak (measured: two corrupt 214/213 rides
+# among 20 topping out at 180 report 214). The plausibility gate bounds the
+# damage and a manual hr_max overrides it; requiring more corroborators would
+# reintroduce the sample-size bias this rule exists to remove.
 HR_CORROBORATION_BPM = 3.0
 
 # Below this many contributing activities corroboration is too weak a signal to
