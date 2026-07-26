@@ -492,6 +492,11 @@ def generate_plan(
         for i, weekday in enumerate(days):
             date = monday + _dt.timedelta(days=weekday)
             iso = date.isoformat()
+
+            # ---- Step 1: what a RACELESS plan would put here. -------------
+            # Every rotation counter is driven from this and only this, so a
+            # race can never perturb the sequence: the day a race touches is
+            # the only day that changes, and the plan after it is untouched.
             if i in hit_pos:
                 kind = cfg.hard_types[hit_counter % len(cfg.hard_types)]
                 hit_counter += 1
@@ -507,32 +512,36 @@ def generate_plan(
                 dur = easy_dur
                 hard_slot = False
 
+            # ---- Step 2: consume this day's slot in the variant rotation. --
+            # Unconditional: skipped race days and substituted days consume
+            # their slot exactly as an untouched day would.
+            names = VARIANTS.get(kind, ["classic"])
+            variant = names[kind_counter.get(kind, 0) % len(names)]
+            kind_counter[kind] = kind_counter.get(kind, 0) + 1
+
             if iso in effects.skip:
                 # Race day: the race IS the session, so nothing is generated.
-                # The rotation counters still advance as if a workout had been
-                # placed here - otherwise removing one day would reshuffle the
-                # type and variant of every session after it, and adding a race
-                # would look like a change to the whole rest of the plan.
-                kind_counter[kind] = kind_counter.get(kind, 0) + 1
                 continue
 
+            # ---- Step 3: apply the race's substitution, off-rotation. ------
+            # A substituted session is a one-off imposed by the race, not a
+            # member of the rotation, so it is pinned to "classic" and takes
+            # no variant slot of its own. (Its counter was already advanced
+            # above, for the kind the rotation actually asked for.)
             if iso in effects.recovery:
                 # Post-race: keep the day, drop it to a recovery spin.
-                kind, hard_slot = "recovery", False
+                kind, hard_slot, variant = "recovery", False, "classic"
             elif iso in effects.easy_adjacent and kind in HARD_KINDS:
                 # Either side of a B race: the race is the week's hard work, so
                 # the neighbouring interval day becomes endurance at the same
                 # duration. No taper, no extended recovery - it is a race, but
                 # it is not the one the season is built around.
-                kind, hard_slot = "endurance", False
+                kind, hard_slot, variant = "endurance", False, "classic"
 
             mult = effects.taper.get(iso)
             if mult is not None:
                 dur = max(dur * mult, _feasible_min(kind, hard_slot))
 
-            names = VARIANTS.get(kind, ["classic"])
-            variant = names[kind_counter.get(kind, 0) % len(names)]
-            kind_counter[kind] = kind_counter.get(kind, 0) + 1
             week_days.append({
                 "date": date.isoformat(),
                 "kind": kind,

@@ -57,6 +57,24 @@ def _minutes(w):
     return round(w["duration_s"] / 60)
 
 
+# Everything a plan_workouts row stores about a session. Comparing on `type`
+# alone hides a whole class of bug: a variant rotation knocked one step out of
+# sync rewrites the name, variant and TSS of every later session while leaving
+# every type and duration untouched.
+_IDENTITY = ("name", "type", "variant", "duration_s", "tss")
+
+
+def _identity(generated):
+    return {w["date"]: tuple(w[k] for k in _IDENTITY)
+            for w in generated["workouts"]}
+
+
+def _changed_dates(base, raced):
+    """Dates whose session is not byte-identical between two generated plans."""
+    a, b = _identity(base), _identity(raced)
+    return {d for d in set(a) | set(b) if a.get(d) != b.get(d)}
+
+
 def _rows(user_id, plan_id):
     return db.plan_workouts_for_plan(user_id, plan_id, include_zwo=True)
 
@@ -101,13 +119,12 @@ def test_b_race_softens_the_hard_day_after_it():
     assert raced[hard_after]["type"] == "endurance"
     assert raced[hard_after]["duration_s"] == base[hard_after]["duration_s"]
 
-    # No taper: every day outside the two neighbours keeps its duration, and
-    # only the hard neighbour changes type.
-    neighbours = {"2026-08-12", "2026-08-14"}
-    for date, w in raced.items():
-        assert w["duration_s"] == base[date]["duration_s"], date
-        if date not in neighbours:
-            assert w["type"] == base[date]["type"], date
+    # A B race touches exactly one day here and NOTHING else - not the type,
+    # not the duration, and not the variant/name/TSS either. Comparing full
+    # row identity is the point: a rotation that drifts one step preserves
+    # every type and duration in the plan while renaming half the sessions.
+    assert _changed_dates(_gen(), _gen([{"id": 1, "date": "2026-08-13",
+                                         "priority": "B"}])) == {hard_after}
 
 
 def test_b_race_softens_the_hard_day_before_it():
@@ -224,6 +241,55 @@ def test_post_race_recovery_keeps_the_planned_duration():
     assert raced[day]["duration_s"] == base[day]["duration_s"]
 
 
+# ------------------------------------------- the blast radius of a race
+# A race must change the days it is ABOUT and nothing else. The rotation
+# counters are the trap here: they are driven by the raceless schedule, so
+# every day - skipped, substituted or untouched - has to consume exactly one
+# slot of its ORIGINAL kind. Getting that wrong desyncs the rotation from the
+# race onwards and silently rewrites months of sessions.
+
+LONG_START = dt.date(2026, 3, 2)
+LONG_DAYS = [0, 2, 4, 6]
+
+
+def _long(races=None):
+    return planmod.generate_plan("t", LONG_START, 26, LONG_DAYS, 8.0, 2,
+                                 model="polarized", races=races)
+
+
+def test_a_b_race_changes_one_day_of_a_26_week_plan():
+    """2026-04-04 is a Saturday - not even a ride day. Only Sunday changes."""
+    base = _long()
+    raced = _long([{"id": 1, "date": "2026-04-04", "priority": "B"}])
+
+    assert _changed_dates(base, raced) == {"2026-04-05"}
+    assert len(base["workouts"]) == len(raced["workouts"]) == 104
+
+
+def test_an_a_race_changes_only_its_taper_and_recovery_days():
+    race = dt.date(2026, 4, 4)
+    base = _long()
+    raced = _long([{"id": 1, "date": race.isoformat(), "priority": "A",
+                    "duration_min": 180}])
+
+    changed = _changed_dates(base, raced)
+    taper = {(race - dt.timedelta(days=o)).isoformat() for o in range(1, 15)}
+    recovery = {"2026-04-05", "2026-04-06", "2026-04-08"}  # ceil(3h) = 3 days
+    assert changed <= taper | recovery | {race.isoformat()}
+    assert changed >= recovery
+    # Nothing at all after the last recovery day - that is the regression.
+    assert max(changed) == max(recovery)
+
+
+def test_nothing_changes_after_the_last_affected_day():
+    """The tail of a long plan is bit-identical with and without a race."""
+    base, raced = _identity(_long()), _identity(
+        _long([{"id": 1, "date": "2026-04-04", "priority": "A",
+                "duration_min": 180}]))
+    tail = {d: v for d, v in base.items() if d > "2026-04-08"}
+    assert tail and {d: raced[d] for d in tail} == tail
+
+
 # --------------------------------------------------- the volume invariant
 def test_weekly_volume_never_exceeds_the_users_hours():
     """Hard requirement: races only ever REDUCE volume, never add to it."""
@@ -313,6 +379,22 @@ def test_adding_then_deleting_a_race_restores_the_plan_exactly(user_id):
     removed = reflow.reflow_plan(user_id, plan_id, now=NOW)
     assert removed["status"] == "ok"
     assert _rows(user_id, plan_id) == before  # byte-identical, .zwo included
+
+
+def test_reflow_of_a_b_race_touches_only_the_intended_rows(user_id):
+    """At DB level: one B race must not rewrite (and re-export) the whole plan."""
+    plan_id = _seed_plan(user_id, weeks=12)
+    before = {r["date"]: r for r in _rows(user_id, plan_id)}
+    # Thu 2026-08-13 is not a ride day; only Fri 2026-08-14 (a hard day) is
+    # adjacent to it and future-dated, so exactly one row may change.
+    db.add_race_date(user_id, "2026-08-13", "B", "Local crit", 60)
+
+    result = reflow.reflow_plan(user_id, plan_id, now=NOW)
+
+    assert (result["updated"], result["inserted"], result["deleted"]) == (1, 0, 0)
+    after = {r["date"]: r for r in _rows(user_id, plan_id)}
+    changed = {d for d in after if after[d] != before[d]}
+    assert changed == {"2026-08-14"}
 
 
 def test_reflowing_a_race_twice_is_a_no_op_the_second_time(user_id):
