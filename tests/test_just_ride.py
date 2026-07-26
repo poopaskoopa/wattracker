@@ -49,16 +49,19 @@ def test_tempo_builder(minutes):
 
 @pytest.mark.parametrize("minutes", [30, 60, 120])
 def test_sprint_builder(minutes):
+    """Sprints are maximal free efforts: no power target, only a cue."""
     s = build_workout("sprint", minutes)
     assert s.workout_type == "sprint"
     assert s.name == "Sprint / Neuromuscular"
     assert s.total_duration() == minutes * 60
-    interval = next(seg for seg in s.segments if seg.kind == "intervals")
-    assert interval.on_power > 1.50  # Coggan L7 neuromuscular
-    assert interval.on_duration == 12
-    assert interval.repeat >= 3
-    assert "all-out" in interval.text
-    assert "nominal" in interval.text
+    efforts = [seg for seg in s.segments if seg.kind == "freeride"]
+    assert len(efforts) >= 3
+    for effort in efforts:
+        assert effort.duration == 12
+        assert effort.power is None and effort.on_power is None
+        assert "all out" in effort.text
+        # Load accounting only - never a target sent to the trainer.
+        assert effort.load_fraction > 1.50  # Coggan L7 neuromuscular
     assert s.estimated_tss > 0
 
 
@@ -108,8 +111,8 @@ def test_preview_returns_watts_for_known_ftp(client):
     assert info["zone"] == "Zone 3"
     assert info["low_watts"] == round(0.76 * data["ftp"])
     assert info["high_watts"] == round(0.90 * data["ftp"])
-    interval = next(s for s in data["segments"] if s["on_watts"] is not None)
-    assert interval["on_watts"] == round(0.80 * data["ftp"])
+    interval = next(s for s in data["segments"] if s["watts_on"] is not None)
+    assert interval["watts_on"] == round(0.80 * data["ftp"])
     assert sum(s["duration_s"] for s in data["segments"]) == 3600
 
 
@@ -163,9 +166,14 @@ def test_preview_every_type_at_extremes(client, kind, minutes):
     assert data["duration_s"] == minutes * 60
     assert sum(s["duration_s"] for s in data["segments"]) == minutes * 60
     info = workout_type_info(kind)
+    if kind == "sprint":
+        # Prescribed as a maximal effort with no power target, so its work
+        # blocks deliberately carry no watts to compare against the band.
+        assert any(s["watts_high"] is None for s in data["segments"])
+        return
     peak = max(
         w for w in (
-            [s["on_watts"] for s in data["segments"] if s["on_watts"] is not None]
+            [s["watts_on"] for s in data["segments"] if s["watts_on"] is not None]
             + [s["watts_high"] for s in data["segments"] if s["watts_high"] is not None]
         )
     )
@@ -262,7 +270,9 @@ def test_reclaimed_cooldown_becomes_a_zone2_base_before_the_work(kind):
     base = [seg for seg in s.segments if seg.kind == "steadystate"]
     assert base and base[0].power == 0.68
     kinds = [seg.kind for seg in s.segments]
-    assert kinds.index("steadystate") < kinds.index("intervals")
+    # Sprints carry their work as untargeted freeride blocks, not intervals.
+    work_kind = "freeride" if kind == "sprint" else "intervals"
+    assert kinds.index("steadystate") < kinds.index(work_kind)
     assert kinds[0] == "warmup"
 
 
@@ -319,9 +329,11 @@ def test_long_rides_scale_the_work_up():
     assert next(
         seg for seg in build_workout("tempo", 240).segments if seg.kind == "intervals"
     ).repeat == 5
-    assert next(
-        seg for seg in build_workout("sprint", 240).segments if seg.kind == "intervals"
-    ).repeat == 12
+    # Sprint reps are one freeride block each (no interval target to scale).
+    assert len(
+        [seg for seg in build_workout("sprint", 240).segments
+         if seg.kind == "freeride"]
+    ) == 12
 
 
 # ------------------------------------- metadata matches what the builder makes
@@ -333,6 +345,10 @@ def _peak_work_fraction(session):
             continue
         if seg.kind == "intervals":
             out.append(max(seg.on_power or 0.0, seg.off_power or 0.0))
+        elif seg.kind == "freeride":
+            # A maximal effort with no target: unbounded by construction, so it
+            # satisfies any published floor and has no ceiling to check.
+            out.append(float("inf"))
         elif seg.power is not None:
             out.append(seg.power)
     return max(out)

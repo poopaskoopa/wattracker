@@ -9,9 +9,12 @@ from __future__ import annotations
 
 import datetime as _dt
 from dataclasses import dataclass
-from typing import Callable, Dict, List, Optional, Sequence, Set
+from typing import TYPE_CHECKING, Callable, Dict, List, Optional, Sequence, Set
 
 from .planner import VARIANTS, Session, build_workout
+
+if TYPE_CHECKING:  # typing only - generation stays a pure function
+    from ..metrics.rider import RiderMetrics
 
 # Session-duration limits (minutes).
 MIN_SESSION_MIN = 20
@@ -282,7 +285,14 @@ def _clamp(v: float, lo: float, hi: float) -> float:
 
 
 def hard_seconds(session: Session) -> int:
-    """Seconds of high-intensity interval 'on' time in a session."""
+    """Seconds of high-intensity interval 'on' time in a session.
+
+    HAZARD: counts ``intervals`` segments only, so a sprint session - whose
+    efforts are untargeted ``freeride`` blocks - contributes zero hard seconds
+    and would report a polarized hard fraction of 0. Latent today because no
+    plan model schedules sprints; the goal work, where a criterium plan will,
+    must count freeride blocks here first.
+    """
     total = 0
     for seg in session.segments:
         if seg.kind == "intervals" and seg.repeat:
@@ -409,6 +419,7 @@ def generate_plan(
     hard_days: Optional[Sequence[int]] = None,
     model: str = DEFAULT_MODEL,
     races: Optional[Sequence[dict]] = None,
+    profile: Optional["RiderMetrics"] = None,
 ) -> Dict:
     """Generate a dated, multi-week plan for the chosen training model.
 
@@ -425,6 +436,14 @@ def generate_plan(
     day either side of a B race softened to endurance. They only ever REDUCE
     volume, so a week never exceeds ``hours_per_week``. The resolved races and
     any A-race conflicts come back under the ``races`` key.
+
+    ``profile`` is the rider's measured capacities, passed straight through to
+    ``build_workout`` so prescriptions are built on what this rider can actually
+    do. Like races it is an INPUT to generation and is deliberately never stored
+    in the plan recipe: it is re-read on every reflow, so a rider's targets
+    follow their measured capacity as it changes instead of being frozen at the
+    moment the plan was created. ``profile=None`` reproduces the population
+    constants exactly.
     """
     err = validate_plan_inputs(
         weeks, days_of_week, hours_per_week, hit_days_per_week, hard_days, model
@@ -559,7 +578,8 @@ def generate_plan(
         week_hard_s = 0
         week_tss = 0.0
         for day in week_days:
-            session = build_workout(day["kind"], day["minutes"], day["variant"])
+            session = build_workout(day["kind"], day["minutes"], day["variant"],
+                                    profile=profile)
             hs = hard_seconds(session)
             week_total_s += session.total_duration()
             week_hard_s += hs

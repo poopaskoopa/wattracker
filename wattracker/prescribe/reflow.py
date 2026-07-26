@@ -19,10 +19,13 @@ with no recipe (everything created before the recipe column existed) are
 refused outright - guessing a recipe would silently rewrite a plan into
 something the user never asked for.
 
-Races are the one INPUT that is deliberately not in the recipe. They live in
-their own table and are read fresh on every reflow, because they change
-independently of the plan they bend (added, moved and deleted repeatedly);
-baking them into the recipe would create a second source of truth for them.
+Races and the rider's measured profile are the INPUTS that are deliberately not
+in the recipe. They live outside it and are read fresh on every reflow, because
+they change independently of the plan they shape - races are added, moved and
+deleted repeatedly, and the profile moves every time the rider's 5s or
+5-minute power does. Baking either into the recipe would create a second source
+of truth and freeze a snapshot: a rider whose sprint power grew would keep
+being prescribed against the capacity they had the day the plan was made.
 
 On adapted rows: a row carrying ``adapted`` is SKIPPED (counted in
 ``skipped_locked``) unless it falls inside a race window - a taper, a
@@ -40,6 +43,7 @@ import logging
 from typing import Dict, List, Optional
 
 from .. import db
+from ..metrics import profile_store
 from ..timeutil import utc_now
 from . import zwo
 from .adapt import reexport_workout
@@ -191,6 +195,12 @@ def reflow_plan(
     # Read races fresh: they are an input to generation but are deliberately
     # NOT part of the recipe (see the module docstring).
     races = db.list_race_dates(user_id)
+    # Same story for the rider's measured capacities: an input, never stored.
+    # ``for_user`` never raises - an unmeasured rider yields an all-None
+    # profile, which builds exactly the population-constant prescription. Read
+    # through the cache: deriving it decompresses months of streams, and race
+    # CRUD reflows on a request thread.
+    profile = profile_store.for_user(user_id)
     try:
         generated = generate_plan(
             plan["name"], start, int(plan["weeks"]),
@@ -200,6 +210,7 @@ def reflow_plan(
             hard_days=args["hard_days"] or None,
             model=args["model"] or "polarized",
             races=races,
+            profile=profile,
         )
     except (ValueError, TypeError) as e:
         log.warning("plan %s has an unusable recipe: %s", plan_id, e)

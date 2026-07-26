@@ -81,7 +81,7 @@
     </div>
     <div class="cards">
         <div class="card"><span class="label">Status</span><span class="value" id="rStatus">idle</span></div>
-        <div class="card"><span class="label">Target</span><span class="value"><span id="rTarget">0</span> W</span></div>
+        <div class="card"><span class="label">Target</span><span class="value"><span id="rTarget">0</span><span class="unit" id="rTargetUnit"> W</span></span></div>
         <div class="card"><span class="label">Power</span><span class="value"><span id="rPower">0</span> W</span></div>
         <div class="card"><span class="label">Cadence (power sensor)</span><span class="value"><span id="rCad">&mdash;</span> rpm</span></div>
         <div class="card"><span class="label">HR</span><span class="value"><span id="rHr">&mdash;</span> bpm</span></div>
@@ -446,6 +446,14 @@
             fmt(workout.duration_s) + " — FTP " + workout.ftp + " W";
         var prescribed = [];
         (workout.profile || []).forEach(function (block) {
+            // An untargeted block (a sprint) has no prescribed power: break the
+            // target line across it rather than plotting the ERG resistance,
+            // which would draw a "target" the rider is told to ignore.
+            if (block.free) {
+                prescribed.push({x: block.start, y: null});
+                prescribed.push({x: block.end, y: null});
+                return;
+            }
             prescribed.push({x: block.start, y: block.watts_start});
             prescribed.push({x: block.end, y: block.watts_end});
         });
@@ -532,7 +540,8 @@
         rideChart.update("none");
         document.getElementById("rideChartSummary").textContent =
             "Measured power " + (finiteNumber(st.power) == null ? "unavailable" : metricText(st.power) + " watts") +
-            "; target power " + (finiteNumber(st.target_watts) == null ? "unavailable" : metricText(st.target_watts) + " watts") +
+            "; target power " + (st.target_free ? "maximal effort, no target"
+                : finiteNumber(st.target_watts) == null ? "unavailable" : metricText(st.target_watts) + " watts") +
             "; cadence " + (finiteNumber(st.cadence) == null ? "unavailable" : metricText(st.cadence) + " rpm") +
             "; heart rate " + (finiteNumber(st.hr) == null ? "unavailable" : metricText(st.hr) + " beats per minute") + ".";
     }
@@ -590,6 +599,9 @@
         if (low == null && high == null) return "—";
         if (low == null) return high + " W";
         if (high == null) return low + " W+";
+        // A cooldown ramps DOWN, so the stored pair is descending; a range
+        // reads ascending. Sorting here keeps the payload literal.
+        if (low > high) { var t = low; low = high; high = t; }
         return low === high ? low + " W" : low + "–" + high + " W";
     }
     function cell(row, text, tag) {
@@ -609,11 +621,17 @@
 
         var meta = document.createElement("p");
         meta.className = "ride-preview-meta";
-        var pct = info.high == null
+        // work == null means the type prescribes no power target at all
+        // (sprints): advertise the effort, never a wattage.
+        var untargeted = info.work == null;
+        var pct = untargeted
+            ? "maximal effort — no target"
+            : info.high == null
             ? ">" + Math.round(info.low * 100) + "% FTP"
             : Math.round(info.low * 100) + "–" + Math.round(info.high * 100) + "% FTP";
         meta.textContent = (info.zone || "") + " · " + pct + " · " +
-            wattRange(info.low_watts, info.high_watts) + " at FTP " + data.ftp + " W · " +
+            (untargeted ? "" : wattRange(info.low_watts, info.high_watts) +
+                " at FTP " + data.ftp + " W · ") +
             fmtClock(data.duration_s) + " · est. TSS " + data.estimated_tss;
         box.appendChild(meta);
 
@@ -651,8 +669,14 @@
             var row = document.createElement("tr");
             cell(row, seg.label);
             cell(row, fmtClock(seg.duration_s));
-            cell(row, seg.on_watts != null
-                ? seg.on_watts + " W on / " + seg.off_watts + " W easy"
+            // A free block has no target at all - never fall back to a
+            // wattage (or a zero) for it.
+            cell(row, seg.free
+                ? "max effort"
+                : seg.watts_on != null
+                ? seg.watts_on + " W on / " + seg.watts_off + " W easy"
+                : seg.watts != null
+                ? seg.watts + " W"
                 : wattRange(seg.watts_low, seg.watts_high));
             body.appendChild(row);
         });
@@ -717,7 +741,13 @@
     function render(st) {
         updateChartMetrics(st);
         document.getElementById("rStatus").textContent = statusText(st);
-        document.getElementById("rTarget").textContent = st.target_watts;
+        // A maximal-effort block has no target - say so instead of showing the
+        // resistance the trainer happens to be holding. The unit is a separate
+        // element so it can be removed with the number: "MAX W" is not a
+        // reading.
+        document.getElementById("rTarget").textContent =
+            st.target_free ? "MAX" : st.target_watts;
+        document.getElementById("rTargetUnit").hidden = !!st.target_free;
         document.getElementById("rPower").textContent = st.power;
         document.getElementById("rCad").textContent = st.cadence == null ? "—" : st.cadence;
         document.getElementById("rHr").textContent = st.hr == null ? "—" : st.hr;

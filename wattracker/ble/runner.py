@@ -17,6 +17,7 @@ import datetime as _dt
 import logging
 from typing import List, Optional, Tuple
 
+from ..metrics import profile_store
 from ..prescribe.planner import Session
 from ..timeutil import utc_now
 
@@ -32,12 +33,20 @@ FINISHED = "finished"
 _DEFAULT_START_GRACE_S = 3.0
 _DEFAULT_ZERO_GRACE_S = 3.0
 
+# ERG resistance held during an untargeted ``freeride`` block (fraction of
+# FTP). Matches the easy-spin power either side of a sprint, so the trainer
+# feels continuous and the rider has something to push against without the
+# machine trying to hold them at any particular sprint wattage.
+FREERIDE_ERG_FRACTION = 0.55
+
 
 def _flatten(session: Session) -> Tuple[List[tuple], int]:
-    """Flatten a Session into timed blocks: (start, end, 'const'|'ramp', value).
+    """Flatten a Session into timed blocks: (start, end, kind, value).
 
-    Intervals expand into steady on/off blocks; warmup/cooldown become ramps.
-    ``value`` is a fraction of FTP (float) for const, or (lo, hi) for ramp.
+    kind is 'const' (steady target), 'ramp' (warmup/cooldown) or 'free' (an
+    untargeted maximal effort). ``value`` is a fraction of FTP (float) for
+    const and free, or (lo, hi) for ramp. A 'free' block's value is the ERG
+    resistance to hold, NOT a prescribed target - see the freeride arm below.
     """
     blocks: List[tuple] = []
     t = 0
@@ -58,7 +67,23 @@ def _flatten(session: Session) -> Tuple[List[tuple], int]:
                  (float(seg.power_low or 0.0), float(seg.power_high or 0.0)))
             )
             t += seg.duration
-        else:  # steadystate / freeride
+        elif seg.kind == "freeride":
+            # A free effort has no target, but this controller only speaks ERG,
+            # so the block still needs a number. It is deliberately a FIXED,
+            # modest resistance and NOT the segment's load-accounting estimate:
+            # that figure is rider-derived (it can be 4.35x FTP) and using it
+            # would hand a stronger rider a harder sprint block, which is
+            # exactly the ERG-clamps-the-rider problem the freeride block
+            # exists to avoid. 0 W is not the alternative either - it leaves
+            # nothing to push against. The real fix is a resistance/slope mode
+            # in the controller; until then this is a floor, not a goal, and
+            # it is tagged "free" so the web layer can tell the two apart and
+            # refuse to present it as the block's prescribed power.
+            blocks.append(
+                (t, t + seg.duration, "free", FREERIDE_ERG_FRACTION)
+            )
+            t += seg.duration
+        else:  # steadystate
             blocks.append((t, t + seg.duration, "const", float(seg.power or 0.0)))
             t += seg.duration
     return blocks, t
@@ -129,17 +154,24 @@ class RideController:
         """%FTP fraction at elapsed second `t`."""
         for (s, e, kind, val) in self.blocks:
             if s <= t < e:
-                if kind == "const":
+                if kind in ("const", "free"):
                     return val
                 lo, hi = val
                 return lo + (hi - lo) * ((t - s) / (e - s)) if e > s else lo
         if self.blocks:  # past the end -> hold the final block's value
             s, e, kind, val = self.blocks[-1]
-            return val if kind == "const" else val[1]
+            return val if kind in ("const", "free") else val[1]
         return 0.0
 
     def target_watts(self, t: float) -> int:
         return int(round(self.target_fraction(t) * self.ftp))
+
+    def target_is_free(self, t: float) -> bool:
+        """Is second ``t`` inside an untargeted (maximal-effort) block?"""
+        for (s, e, kind, _val) in self.blocks:
+            if s <= t < e:
+                return kind == "free"
+        return False
 
     def _block_index(self, t: float) -> int:
         for i, (s, e, _k, _v) in enumerate(self.blocks):
@@ -370,6 +402,17 @@ class RideController:
             importer.maybe_update_ftp(self.user_id)
         except Exception:
             pass
+        if self.activity_id is not None:
+            # An in-app ride is a new ride like any other - it can set a new 5s
+            # or 5min peak and it moves FTP - but it is NOT a file import, so
+            # scan_activities' refresh never sees it. Without this a rider who
+            # only rides in the app prescribes against a snapshot that is stale
+            # until the next daily sweep, or forever with auto-scan disabled.
+            try:
+                profile_store.refresh(self.user_id)
+            except Exception:
+                _log.warning("rider profile refresh after in-app ride failed",
+                             exc_info=True)
 
     # ------------------------------------------------------------- state
     def state(self) -> dict:
@@ -381,6 +424,12 @@ class RideController:
             "segment_index": self._block_index(clamped),
             "segment_count": len(self.blocks),
             "target_watts": self.current_target,
+            # True while the rider is inside an untargeted (maximal-effort)
+            # block. target_watts still carries the ERG resistance the trainer
+            # is holding, because the trainer needs a number - but the UI must
+            # not present it as a target, or a "no target" sprint announces a
+            # target anyway.
+            "target_free": self.target_is_free(clamped),
             "power": self.current_power,
             "cadence": round(self.current_cadence, 1)
             if self.current_cadence is not None else None,

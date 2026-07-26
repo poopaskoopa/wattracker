@@ -36,8 +36,10 @@ from .analysis import pipeline, power_profile, zones
 from .ble import devices as bledevices
 from .ble.runner import RideController, flatten_session
 from .ingest import importer
+from .metrics import profile_store
 from .prescribe import adapt as adaptmod
 from .prescribe import plan as planmod
+from .prescribe import present
 from .prescribe import reflow
 from .prescribe import zwo
 from .prescribe import llm
@@ -148,12 +150,15 @@ def _start_user_scan(user_id: int, directory: Optional[str]) -> Optional[dict]:
 
 def run_daily_maintenance() -> dict:
     """One synchronous pass of all daily jobs: import scan (FTP re-eval +
-    completion matching inside), then per-user plan adaptation and race-result
-    refresh. Each stage is fault-isolated per user.
+    completion matching inside), then per-user plan adaptation, race-result
+    refresh, active-plan reflow and Zwift export sync. Each stage is
+    fault-isolated per user.
     """
     totals = importer.run_auto_scan()
     totals["adapted"] = 0
     totals["races"] = 0
+    totals["race_skipped"] = 0
+    totals["reflowed"] = 0
     totals["exported"] = 0
     # Daily safety snapshot of the whole DB (once per ~day even if the sweep
     # runs more often). Never let a backup failure abort maintenance.
@@ -171,17 +176,62 @@ def run_daily_maintenance() -> dict:
             totals["completed"] += importer.match_plan_completions(uid)
         except Exception:
             _log.warning("completion matching failed for user %s", uid, exc_info=True)
-        try:
-            state = pipeline.build_state(uid)
-            summary = adaptmod.apply_adaptations(uid, state)
-            totals["adapted"] += summary.get("adjusted", 0)
-        except Exception:
-            _log.warning("plan adaptation failed for user %s", uid, exc_info=True)
+        # The race sync runs BEFORE the profile is recomputed: an
+        # authenticated refresh writes the rider's weight from Zwift, and
+        # weight feeds wprime_j_per_kg and cp_w_per_kg. With the old ordering
+        # every weight Zwift reported was a full day stale before it reached a
+        # single prescription.
         try:
             races.refresh_race_results(uid, respect_backoff=True)
             totals["races"] += 1
         except Exception:
             _log.warning("race refresh failed for user %s", uid, exc_info=True)
+        # None when the state could not be built; adaptation then reads as
+        # "progress" and changes nothing, which is the right failure mode.
+        state = None
+        try:
+            state = pipeline.build_state(uid)
+            # Recompute the stored rider profile before anything prescribes:
+            # adaptation, reflow and the .zwo export all read the snapshot, and
+            # the profile depends on wall-clock time as well as on rides - FTP
+            # decays across a layoff even when no new activity lands - so a
+            # sweep that skipped this would keep prescribing against a rider
+            # who no longer exists. Reuses the state just built rather than
+            # building a second one.
+            profile_store.refresh(uid, state=state)
+        except Exception:
+            _log.warning("rider profile refresh failed for user %s", uid,
+                         exc_info=True)
+        try:
+            summary = adaptmod.apply_adaptations(uid, state)
+            totals["adapted"] += summary.get("adjusted", 0)
+            totals["race_skipped"] += summary.get("skipped_raced", 0)
+        except Exception:
+            _log.warning("plan adaptation failed for user %s", uid, exc_info=True)
+        try:
+            # This is an adaptive program, so the active plan is recomputed
+            # every day: reflow re-reads the rider's measured profile and their
+            # races, so upcoming workouts track the rider's current capacity
+            # instead of the snapshot taken when the plan was created. It runs
+            # BEFORE the export sync so the folder picks the rewrite up in the
+            # same sweep.
+            #
+            # This is only safe because reflow now PRESERVES `adapted` rows
+            # outside race windows - a naive daily reflow would otherwise have
+            # reverted every one of adapt.py's adjustments overnight.
+            plan = db.get_active_plan(uid)
+            if plan is not None:
+                result = reflow.reflow_plan(uid, plan["id"])
+                totals["reflowed"] += (
+                    result.get("updated", 0) + result.get("inserted", 0)
+                    + result.get("deleted", 0)
+                )
+                # The first sweep after profile-aware targets shipped rewrites
+                # every future workout and renames its .zwo; log the counts so
+                # that (and any later churn) is diagnosable.
+                _log.info("daily reflow for user %s: %s", uid, result)
+        except Exception:
+            _log.warning("plan reflow failed for user %s", uid, exc_info=True)
         try:
             # Keep the Zwift custom-workout folder in sync with the plan
             # (exports new/updated workouts, prunes completed/OOTO-skipped).
@@ -555,6 +605,13 @@ def create_app() -> FastAPI:
                 request,
                 profile=zones.rider_profile(uid),
                 power_profile=power_profile.for_user(uid),
+                # What the rider's workout targets are actually built on, and
+                # when it was last computed. Without this the app can silently
+                # prescribe population defaults forever and never say so.
+                targets=present.target_status(
+                    profile_store.for_user(uid),
+                    profile_store.computed_at(uid),
+                ),
                 manual_ftp=settings.get("ftp"),
                 manual_hr_max=settings.get("hr_max"),
                 error=error,
@@ -575,6 +632,10 @@ def create_app() -> FastAPI:
         uid = _uid(request)
         if action == "reset":
             db.set_user_ftp_override(uid, None)
+            try:
+                profile_store.refresh(uid)
+            except Exception:
+                _log.warning("profile refresh after FTP reset failed", exc_info=True)
             return RedirectResponse("/profile?saved=ftp", status_code=303)
         try:
             value = int(ftp.strip())
@@ -583,6 +644,10 @@ def create_app() -> FastAPI:
         if not 1 <= value <= 2000:
             return _profile_response(request, "FTP must be a whole number from 1 to 2000 W.")
         db.set_user_ftp_override(uid, value)
+        try:
+            profile_store.refresh(uid)
+        except Exception:
+            _log.warning("profile refresh after FTP save failed", exc_info=True)
         return RedirectResponse("/profile?saved=ftp", status_code=303)
 
     @app.post("/profile/hr-max", response_class=HTMLResponse)
@@ -594,6 +659,10 @@ def create_app() -> FastAPI:
         uid = _uid(request)
         if action == "reset":
             db.set_user_hr_max(uid, None)
+            try:
+                profile_store.refresh(uid)
+            except Exception:
+                _log.warning("profile refresh after HRmax reset failed", exc_info=True)
             return RedirectResponse("/profile?saved=1", status_code=303)
         try:
             value = int(hr_max.strip())
@@ -602,6 +671,10 @@ def create_app() -> FastAPI:
         if not 80 <= value <= 230:
             return _profile_response(request, "HRmax must be a whole number from 80 to 230 bpm.")
         db.set_user_hr_max(uid, value)
+        try:
+            profile_store.refresh(uid)
+        except Exception:
+            _log.warning("profile refresh after HRmax save failed", exc_info=True)
         return RedirectResponse("/profile?saved=1", status_code=303)
 
     @app.get("/activity/{activity_id}", response_class=HTMLResponse)
@@ -711,7 +784,17 @@ def create_app() -> FastAPI:
         New rides are linked as they land; this walks the existing history for
         pairs recorded before duplicate detection existed.
         """
-        linked = importer.backfill_duplicate_links(_uid(request))
+        uid = _uid(request)
+        linked = importer.backfill_duplicate_links(uid)
+        if linked:
+            # Duplicates are excluded from the mean-maximal curve, so linking
+            # them moves CP, W' and every peak the profile is built from.
+            # Never let a refresh failure lose the repair the user just ran.
+            try:
+                profile_store.refresh(uid)
+            except Exception:
+                _log.warning("rider profile refresh after duplicate linking "
+                             "failed", exc_info=True)
         return RedirectResponse(url=f"/activities?linked={linked}", status_code=303)
 
     def _plan_defaults() -> dict:
@@ -870,7 +953,8 @@ def create_app() -> FastAPI:
         error: Optional[str] = None
         session_dict = None
         try:
-            session = plan_workout(state, duration_min)
+            session = plan_workout(state, duration_min,
+                                   profile=profile_store.for_user(uid))
             session = llm.shape_session(session, state)
             session.compute_tss()
             zwo_str = zwo.zwo_string(session)
@@ -932,9 +1016,13 @@ def create_app() -> FastAPI:
             "model": model,
         }
         try:
+            # Born profile-aware: without this a new plan is built on the
+            # population constants and the very next nightly reflow rewrites
+            # every workout in it.
             generated = planmod.generate_plan(
                 name, start, weeks, day_ints, hours_per_week, hit_days_per_week,
                 hard_days=hard_ints or None, model=model,
+                profile=profile_store.for_user(uid),
             )
             # Persist the generator inputs, not just their output, so the plan
             # can be recomputed later (see prescribe/reflow.py).
@@ -1508,6 +1596,10 @@ def create_app() -> FastAPI:
                     db.add_ftp_entry(uid, utc_today().isoformat(), watts, "manual")
             except ValueError:
                 pass
+        try:
+            profile_store.refresh(uid)
+        except Exception:
+            _log.warning("profile refresh after settings save failed", exc_info=True)
         # The Anthropic API key is app-level (shared).
         if anthropic_api_key:
             config.set_anthropic_api_key(anthropic_api_key)
@@ -1654,32 +1746,45 @@ def create_app() -> FastAPI:
         ValueError - the caller reports it rather than silently riding something
         else. Only the no-type-at-all case falls back to the default ride.
         """
+        # Ridden in ERG here, exported as a .zwo there - both must be the
+        # same session, so the rebuild gets the rider's profile just as the
+        # export did.
+        profile = profile_store.for_user(uid)
         if workout_id:
             w = db.get_plan_workout(uid, int(workout_id))
             if w:
                 return build_workout(w["type"], max(1, w["duration_s"] / 60),
-                                     w.get("variant")), w["name"], w["id"]
+                                     w.get("variant"), profile=profile), \
+                    w["name"], w["id"]
             raise ValueError("workout not found")
         if wtype:
             kind, mins = _validate_just_ride(wtype, minutes)
-            s = build_workout(kind, mins)
+            s = build_workout(kind, mins, profile=profile)
             return s, s.name, None
-        s = build_workout("endurance", 45)
+        s = build_workout("endurance", 45, profile=profile)
         return s, s.name, None
 
     def _ride_workout_payload(session, ftp: float, name: Optional[str] = None) -> dict:
         blocks, total_s = flatten_session(session)
         profile = []
         for start, end, kind, value in blocks:
-            lo, hi = (value, value) if kind == "const" else value
-            profile.append(
-                {
-                    "start": start,
-                    "end": end,
-                    "watts_start": int(round(lo * ftp)),
-                    "watts_end": int(round(hi * ftp)),
-                }
-            )
+            lo, hi = value if kind == "ramp" else (value, value)
+            # A "free" block is a maximal effort with no prescribed power. The
+            # watts are the ERG resistance the trainer will hold, NOT a target,
+            # so the block is flagged and the UI shows no wattage for it -
+            # otherwise the chart would contradict the segment row next to it,
+            # which reads "Max effort - no target". Plotting the rider's
+            # load-accounting figure here is what produced a 750 W point on
+            # exactly that block.
+            row = {
+                "start": start,
+                "end": end,
+                "watts_start": int(round(lo * ftp)),
+                "watts_end": int(round(hi * ftp)),
+            }
+            if kind == "free":
+                row["free"] = True
+            profile.append(row)
         return {
             "name": name or session.name,
             "duration_s": total_s,
@@ -1688,61 +1793,18 @@ def create_app() -> FastAPI:
         }
 
     def _watts(fraction, ftp: float) -> Optional[int]:
-        return None if fraction is None else int(round(float(fraction) * ftp))
-
-    def _preview_segments(session, ftp: float) -> List[dict]:
-        """Human-readable per-segment breakdown with watt ranges."""
-        rows: List[dict] = []
-        for seg in session.segments:
-            if seg.kind == "intervals" and seg.repeat:
-                on_s = int(seg.on_duration or 0)
-                off_s = int(seg.off_duration or 0)
-                rows.append({
-                    "label": (
-                        f"{seg.repeat} x {_fmt_clock(on_s)} on / "
-                        f"{_fmt_clock(off_s)} easy"
-                    ),
-                    "duration_s": seg.duration,
-                    "watts_low": _watts(seg.off_power, ftp),
-                    "watts_high": _watts(seg.on_power, ftp),
-                    "on_watts": _watts(seg.on_power, ftp),
-                    "off_watts": _watts(seg.off_power, ftp),
-                    "text": seg.text,
-                })
-                continue
-            if seg.kind in ("warmup", "cooldown"):
-                lo = _watts(seg.power_low, ftp)
-                hi = _watts(seg.power_high, ftp)
-                if lo is not None and hi is not None and lo > hi:
-                    lo, hi = hi, lo
-                label = "Warmup ramp" if seg.kind == "warmup" else "Cooldown"
-            else:
-                lo = hi = _watts(seg.power, ftp)
-                label = "Steady block" if seg.kind == "steadystate" else seg.kind
-            rows.append({
-                "label": label,
-                "duration_s": seg.duration,
-                "watts_low": lo,
-                "watts_high": hi,
-                "on_watts": None,
-                "off_watts": None,
-                "text": seg.text,
-            })
-        return rows
+        return present.watts(fraction, ftp)
 
     def _fmt_clock(seconds: int) -> str:
-        seconds = int(seconds or 0)
-        if seconds < 60:
-            return f"{seconds}s"
-        minutes, secs = divmod(seconds, 60)
-        return f"{minutes}min" if not secs else f"{minutes}min {secs}s"
+        return present.fmt_clock(seconds)
 
     @app.get("/ride/workout/preview")
     def ride_workout_preview(request: Request, type: str = "", minutes: str = ""):
         uid = _uid(request)
         try:
             kind, mins = _validate_just_ride(type, minutes)
-            session = build_workout(kind, mins)
+            session = build_workout(kind, mins,
+                                    profile=profile_store.for_user(uid))
         except (ValueError, OverflowError) as e:
             return JSONResponse({"error": str(e)}, status_code=400)
         ftp = importer.current_ftp(uid)
@@ -1756,7 +1818,7 @@ def create_app() -> FastAPI:
             "workout_type": session.workout_type,
             "estimated_tss": session.estimated_tss,
             "type_info": info,
-            "segments": _preview_segments(session, ftp),
+            "segments": present.segment_rows(session, ftp),
         })
         return JSONResponse(payload)
 
@@ -2305,8 +2367,6 @@ def create_app() -> FastAPI:
                 pass
 
     # --------------------------------------------------------- JSON API
-    def _watts(frac: Optional[float], ftp: float) -> Optional[int]:
-        return int(round(frac * ftp)) if frac is not None else None
 
     @app.post("/api/plan/workout/{workout_id}/reconcile")
     def api_plan_workout_reconcile(request: Request, workout_id: int):
@@ -2393,9 +2453,14 @@ def create_app() -> FastAPI:
     def api_plan_workout_detail(request: Request, workout_id: int):
         """Structured segments + power profile for one plan workout (user-scoped).
 
-        Segments are reconstructed deterministically via ``build_workout`` (the
-        stored type/duration fully determine the session, matching the stored
-        .zwo), so no extra persistence is needed.
+        Segments are reconstructed deterministically via ``build_workout``, so
+        no extra persistence is needed - but the rebuild must be given the SAME
+        rider profile the stored .zwo was generated with, or this endpoint and
+        the exported file describe different workouts (measured before it was
+        threaded through: 1.16 stored vs 1.18 rebuilt on the same vo2max day).
+        The profile is read fresh rather than stored, exactly as reflow reads
+        it; the two therefore agree as long as neither has gone stale, and the
+        nightly reflow is what closes any gap.
         """
         uid = _uid(request)
         w = db.get_plan_workout(uid, workout_id)
@@ -2404,31 +2469,31 @@ def create_app() -> FastAPI:
         completion_verified = importer.plan_workout_completion_verified(uid, w)
         ftp = importer.current_ftp(uid)
         session = build_workout(w["type"], max(1, w["duration_s"] / 60),
-                                w.get("variant"))
+                                w.get("variant"),
+                                profile=profile_store.for_user(uid))
 
-        segments = []
-        for seg in session.segments:
-            d = seg.to_dict()
-            d["watts"] = _watts(seg.power, ftp)
-            d["watts_low"] = _watts(seg.power_low, ftp)
-            d["watts_high"] = _watts(seg.power_high, ftp)
-            d["watts_on"] = _watts(seg.on_power, ftp)
-            d["watts_off"] = _watts(seg.off_power, ftp)
-            segments.append(d)
+        # The SAME formatter the ride preview uses. These two endpoints
+        # describing one session in two hand-written shapes is precisely how a
+        # sprint came to read "Max effort - no target" in one place and
+        # "0% - 0 W" in the other.
+        segments = present.segment_rows(session, ftp)
 
         # Flattened timeline (intervals expanded, ramps kept) for the chart.
         blocks, total_s = flatten_session(session)
         profile = []
         for (s, e, kind, val) in blocks:
-            lo, hi = (val, val) if kind == "const" else val
-            profile.append(
-                {
-                    "start": s,
-                    "end": e,
-                    "watts_start": int(round(lo * ftp)),
-                    "watts_end": int(round(hi * ftp)),
-                }
-            )
+            lo, hi = val if kind == "ramp" else (val, val)
+            # See _ride_workout_payload: a "free" block carries the ERG
+            # resistance, not a target, and the UI must not read it as one.
+            row = {
+                "start": s,
+                "end": e,
+                "watts_start": int(round(lo * ftp)),
+                "watts_end": int(round(hi * ftp)),
+            }
+            if kind == "free":
+                row["free"] = True
+            profile.append(row)
 
         return JSONResponse(
             {

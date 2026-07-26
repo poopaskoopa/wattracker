@@ -26,6 +26,18 @@ suppressed for ``POST_RACE_QUIET_DAYS`` after any race (either priority) and
 the plan's own post-race recovery days are left to do their job. Detection
 itself stays pure - it still reports what the numbers say; only the response
 is held back.
+
+Race WINDOWS are skipped for the same reason, looking forward instead of back:
+a workout inside a taper, on a race day, or on a post-race recovery day has
+already had its load deliberately reduced by the generator, so easing it again
+for overreach double-counts the reduction and wrecks the taper the rider is
+training for. It also breaks a loop that is otherwise invisible: reflow claims
+adapted rows inside a race window and clears ``adapted`` (races outrank an
+adaptation there), which makes the row adaptable again, so adapt and reflow
+rewrote the same rows and re-exported the same Zwift files every single night
+with no net change. The window comes from ``plan.race_effects`` - the same
+function the generator uses - so the two can never disagree about which dates
+a race owns.
 """
 from __future__ import annotations
 
@@ -35,8 +47,10 @@ import os
 from typing import Dict, List, Optional
 
 from .. import db, paths
+from ..metrics import profile_store
 from ..timeutil import utc_now
 from . import zwo
+from .plan import normalize_races, race_effects, resolve_race_conflicts
 from .planner import build_workout
 
 log = logging.getLogger(__name__)
@@ -46,6 +60,13 @@ RECOVERY_DURATION_FACTOR = 0.75
 MIN_DURATION_MIN = 20
 
 POST_RACE_QUIET_DAYS = 10
+
+# How far either side of the adaptation horizon to look for races when working
+# out which upcoming days a race already owns. An A race tapers for 14 days
+# before it and its recovery days trail it by up to ~2 weeks of ride days, so
+# this covers every race that could have an opinion about a date inside the
+# 7-day adaptation window with room to spare.
+RACE_CONTEXT_DAYS = 45
 
 OVERREACH = "overreach"
 PLATEAU = "plateau"
@@ -110,12 +131,48 @@ def reexport_workout(
         log.warning("re-export of adapted workout failed: %s", e)
 
 
+def race_window(user_id: int, plan_id: int, now: _dt.datetime) -> set:
+    """ISO dates in ``plan_id`` that a race already has an opinion about.
+
+    Delegates every date decision to ``plan.race_effects``, the function the
+    generator itself uses, so "inside a race window" means exactly the same
+    thing here, in the generator and in reflow.
+
+    Scoped to ONE plan, because the generator's is: post-race recovery lands on
+    the first N ride days after the race *of the plan being generated*. Feeding
+    it a second, overlapping plan's rows would hand this function ride days the
+    generator never saw and produce a window the two disagree about.
+
+    Never raises: a rider with no races, no plan or unparseable rows simply
+    owns no dates.
+    """
+    try:
+        lo = (now.date() - _dt.timedelta(days=RACE_CONTEXT_DAYS)).isoformat()
+        hi = (now.date() + _dt.timedelta(days=RACE_CONTEXT_DAYS)).isoformat()
+        races = db.races_in_range(user_id, lo, hi)
+        if not races:
+            return set()
+        # Post-race recovery lands on the rider's actual ride days, so the
+        # window can only be computed against the days they ride.
+        scheduled = [
+            _dt.date.fromisoformat(d)
+            for d in db.plan_workout_dates(user_id, plan_id, lo, hi)
+        ]
+        resolved, _conflicts = resolve_race_conflicts(normalize_races(races))
+        return race_effects(resolved, scheduled).window()
+    except Exception:  # noqa: BLE001 - never block adaptation on race context
+        log.warning("race window lookup failed for user %s", user_id,
+                    exc_info=True)
+        return set()
+
+
 def apply_adaptations(user_id: int, state, now: Optional[_dt.datetime] = None) -> Dict:
     """Run detection-driven plan adaptation for a user. Idempotent.
 
-    Returns a summary for the dashboard banner:
-      {status, adjusted (this run), upcoming (kind -> count of future adapted
-       workouts), window_days}
+    Returns a summary for the dashboard banner, with the SAME keys on every
+    path: {status, adjusted (this run), skipped_raced (left alone because a
+    race already owns the day), upcoming (kind -> count of future adapted
+    workouts), window_days}.
     """
     now = now or utc_now()
     today = now.date().isoformat()
@@ -132,6 +189,9 @@ def apply_adaptations(user_id: int, state, now: Optional[_dt.datetime] = None) -
         return {
             "status": POST_RACE,
             "adjusted": 0,
+            # Same keys on every path: a summary with two shapes is a trap for
+            # every consumer (the banner, the sweep totals, the tests).
+            "skipped_raced": 0,
             "upcoming": db.upcoming_adapted_counts(user_id, today),
             "window_days": ADAPT_WINDOW_DAYS,
             "post_race_until": (
@@ -142,15 +202,38 @@ def apply_adaptations(user_id: int, state, now: Optional[_dt.datetime] = None) -
 
     status = detection_status(state)
     adjusted = 0
+    skipped_raced = 0
+    # Race windows are per-plan, so they are resolved per-plan and memoized
+    # for the handful of plans this window can touch.
+    windows: Dict[int, set] = {}
+    # Rebuilt sessions must match the exported .zwo, so adaptation uses the
+    # same rider profile the generator and reflow do.
+    profile = profile_store.for_user(user_id)
     for w in db.adaptable_plan_workouts(user_id, today, horizon):
         change = _plan_change(status, w["type"], w["duration_s"] / 60.0)
         if change is None:
+            continue  # adaptation had no opinion about this day either way
+        plan_id = w["plan_id"]
+        if plan_id not in windows:
+            windows[plan_id] = race_window(user_id, plan_id, now)
+        if w["date"] in windows[plan_id]:
+            # A taper, a race day or a post-race recovery day: the generator
+            # has already cut this day's load on purpose (see the module
+            # docstring). Easing it again double-counts, and reflow would put
+            # it straight back tomorrow night.
+            #
+            # Counted only AFTER _plan_change, so the number means "workouts a
+            # race stopped us changing", not "workouts inside a race window".
+            # A 14-day taper otherwise had the banner claiming a dozen
+            # workouts were left as planned when most were never candidates.
+            skipped_raced += 1
             continue
         new_type, new_min, kind = change
         # Adaptation resets the session to the new kind's classic variant.
         new_variant = "classic"
         try:
-            session = build_workout(new_type, new_min, new_variant)
+            session = build_workout(new_type, new_min, new_variant,
+                                    profile=profile)
         except ValueError:
             continue
         zwo_str = zwo.zwo_string(session)
@@ -166,6 +249,7 @@ def apply_adaptations(user_id: int, state, now: Optional[_dt.datetime] = None) -
     return {
         "status": status,
         "adjusted": adjusted,
+        "skipped_raced": skipped_raced,
         "upcoming": db.upcoming_adapted_counts(user_id, today),
         "window_days": ADAPT_WINDOW_DAYS,
     }
@@ -222,4 +306,16 @@ def banner_for(state, summary: Dict) -> Dict:
                          f"{kind_word.get(kind, kind)}")
     banner["adaptation"] = "; ".join(parts) if parts else None
     banner["adjusted_now"] = summary.get("adjusted", 0)
+    # Say when a race is the reason nothing was eased. Silently doing nothing
+    # reads as "the adaptation is broken"; the rider is mid-taper and the plan
+    # has already cut those days on purpose.
+    skipped = summary.get("skipped_raced", 0)
+    banner["race_skipped"] = skipped
+    if skipped:
+        plural = skipped != 1
+        banner["race_note"] = (
+            f"{skipped} upcoming workout{'s' if plural else ''} left as "
+            f"planned - {'they sit' if plural else 'it sits'} inside a race "
+            "taper or recovery window, which already reduces the load."
+        )
     return banner

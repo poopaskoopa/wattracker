@@ -21,7 +21,7 @@ from .timeutil import utc_now
 
 _log = logging.getLogger(__name__)
 
-SCHEMA_VERSION = 21
+SCHEMA_VERSION = 22
 
 
 def _restrict_db_files(path: str) -> None:
@@ -180,6 +180,15 @@ _MIGRATIONS: Dict[int, Sequence[Union[str, Callable[[sqlite3.Connection], None]]
     20: [
         # New table race_dates is created by _SCHEMA after migrating.
     ],
+    21: [
+        # New table rider_profile is created by _SCHEMA after migrating.
+        # Deliberately not backfilled: an absent row means "not computed yet",
+        # which prescribes the population constants - the same thing the app
+        # did before profiles existed - and the next maintenance sweep fills
+        # it in. Guessing a profile at migration time would be both slow (it
+        # decompresses months of streams per user) and wrong for any user
+        # whose data has since changed.
+    ],
 }
 
 _DROP = """
@@ -187,6 +196,7 @@ DROP TABLE IF EXISTS ftp_feedback_batches;
 DROP TABLE IF EXISTS standalone_workouts;
 DROP TABLE IF EXISTS scanned_files;
 DROP TABLE IF EXISTS ooto_ranges;
+DROP TABLE IF EXISTS rider_profile;
 DROP TABLE IF EXISTS race_dates;
 DROP TABLE IF EXISTS race_sync;
 DROP TABLE IF EXISTS race_results;
@@ -394,6 +404,37 @@ CREATE TABLE IF NOT EXISTS race_dates (
 );
 CREATE INDEX IF NOT EXISTS idx_race_dates_user
     ON race_dates(user_id, date);
+
+-- The rider's MEASURED capacities (metrics/rider.py), stored rather than
+-- recomputed on read. Deriving them decompresses ~90 days of power streams and
+-- a year of heart-rate streams, so they cannot be computed per request; but
+-- they also cannot be memoized in process, because their inputs include
+-- wall-clock time (FTP decays with detraining, and HRmax detection has a
+-- rolling lookback), so any in-memory cache key has a staleness class nobody
+-- thought of. A stored snapshot makes staleness bounded and INSPECTABLE:
+-- computed_at says exactly how old the prescription's basis is, a missing row
+-- says "not computed yet" instead of being silently wrong, and the write side
+-- is the daily sweep and activity import - the two places that already know
+-- the rider's data changed.
+CREATE TABLE IF NOT EXISTS rider_profile (
+    user_id          INTEGER PRIMARY KEY,
+    computed_at      TEXT NOT NULL,
+    ftp              REAL,
+    weight_kg        REAL,
+    hr_max           REAL,
+    hr_max_source    TEXT,
+    n_hr_activities  INTEGER NOT NULL DEFAULT 0,
+    cp               REAL,
+    wprime           REAL,
+    wprime_j_per_kg  REAL,
+    cp_w_per_kg      REAL,
+    peak_5s          REAL,
+    peak_60s         REAL,
+    peak_300s        REAL,
+    sprint_ratio     REAL,
+    vo2_ratio        REAL,
+    FOREIGN KEY(user_id) REFERENCES users(id)
+);
 
 CREATE TABLE IF NOT EXISTS scanned_files (
     user_id    INTEGER NOT NULL,
@@ -1351,6 +1392,30 @@ def plan_workouts_for_plan(
         conn.close()
 
 
+def plan_workout_dates(
+    user_id: int, plan_id: int, start_date: str, end_date: str,
+    path: Optional[str] = None,
+) -> List[str]:
+    """Distinct dates ONE plan has a workout on, within an inclusive range.
+
+    Just the dates: this answers "which days does this plan ride?", which is
+    what race handling needs to place post-race recovery days, without
+    inflating a single stored .zwo. Scoped to a plan rather than a user
+    because the generator's own view is - a second, overlapping plan's rows
+    are days this plan never scheduled.
+    """
+    conn = connect(path)
+    try:
+        rows = conn.execute(
+            "SELECT DISTINCT date FROM plan_workouts WHERE user_id = ? "
+            "AND plan_id = ? AND date >= ? AND date <= ? ORDER BY date ASC",
+            (user_id, plan_id, start_date, end_date),
+        ).fetchall()
+        return [r["date"] for r in rows]
+    finally:
+        conn.close()
+
+
 def plan_workouts_for_month(
     user_id: int, year: int, month: int, path: Optional[str] = None
 ) -> List[dict]:
@@ -2295,6 +2360,59 @@ def race_on(user_id: int, date_iso: str, path: Optional[str] = None) -> Optional
             (user_id, date_iso),
         ).fetchone()
         return dict(row) if row else None
+    finally:
+        conn.close()
+
+
+# ------------------------------------------------------ rider profile
+# Column order is the write order; ``computed_at`` is added by the writer.
+RIDER_PROFILE_FIELDS = (
+    "ftp", "weight_kg", "hr_max", "hr_max_source", "n_hr_activities",
+    "cp", "wprime", "wprime_j_per_kg", "cp_w_per_kg",
+    "peak_5s", "peak_60s", "peak_300s", "sprint_ratio", "vo2_ratio",
+)
+
+
+def save_rider_profile(
+    user_id: int, values: dict, computed_at: Optional[str] = None,
+    path: Optional[str] = None,
+) -> None:
+    """Store (or replace) a user's measured-capacity snapshot.
+
+    ``values`` carries any subset of ``RIDER_PROFILE_FIELDS``; anything absent
+    is stored as NULL, which reads back as "unmeasured".
+    """
+    cols = ", ".join(("user_id", "computed_at") + RIDER_PROFILE_FIELDS)
+    marks = ", ".join(["?"] * (2 + len(RIDER_PROFILE_FIELDS)))
+    row = [user_id, computed_at or utc_now().isoformat(timespec="seconds")]
+    row.extend(values.get(f) for f in RIDER_PROFILE_FIELDS)
+    conn = connect(path)
+    try:
+        conn.execute(
+            f"INSERT OR REPLACE INTO rider_profile ({cols}) VALUES ({marks})",
+            row,
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def get_rider_profile(user_id: int, path: Optional[str] = None) -> Optional[dict]:
+    """A user's stored profile as a dict (with ``computed_at``), or None.
+
+    None means "never computed" - not "no capacity". Callers prescribe the
+    population constants in that case and the next sweep fills the row in.
+    """
+    conn = connect(path)
+    try:
+        row = conn.execute(
+            "SELECT * FROM rider_profile WHERE user_id = ?", (user_id,)
+        ).fetchone()
+        if row is None:
+            return None
+        out = {f: row[f] for f in RIDER_PROFILE_FIELDS}
+        out["computed_at"] = row["computed_at"]
+        return out
     finally:
         conn.close()
 
