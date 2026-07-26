@@ -1341,9 +1341,16 @@ def create_app() -> FastAPI:
             # ``phases`` is None for a goal-less plan, which is the path the
             # generator took before goals existed - so an existing plan and a
             # plan created with no goal are the same plan, byte for byte.
+            #
+            # Races are read here exactly the way the nightly sweep reads them
+            # (fresh from the DB, never into the recipe - see reflow.py). Born
+            # race-blind, a plan made by a rider with races on the calendar
+            # gets every skip and taper written in on night one, and the rider
+            # is told their brand-new plan "changed overnight".
             generated = planmod.generate_plan(
                 name, start, weeks, day_ints, hours_per_week, hit_days_per_week,
                 hard_days=hard_ints or None, model=model,
+                races=db.list_race_dates(uid),
                 profile=profile_store.for_user(uid),
                 phases=goalsmod.arc_for(goal_key),
             )
