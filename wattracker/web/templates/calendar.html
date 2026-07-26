@@ -3,6 +3,8 @@
 {% block content %}
 <h2>Calendar</h2>
 
+{% if flash %}<p class="ok flash">{{ flash }}</p>{% endif %}
+
 {% set rating_next = '/calendar' %}
 {% include "_pending_ratings.html" %}
 
@@ -13,12 +15,22 @@
 </div>
 
 {% if plans %}
-<p class="hint">Your plans:
+<p class="hint">Your plans:</p>
+<ul class="plan-list">
     {% for p in plans %}
+    <li>
         <a href="/calendar?year={{ p.start_date[:4] }}&month={{ p.start_date[5:7]|int }}">{{ p.name }}</a>
-        (starts {{ p.start_date }}){{ ", " if not loop.last else "" }}
+        (starts {{ p.start_date }})
+        {% if p.active %}
+            <span class="badge">Active</span>
+        {% else %}
+            <form method="post" action="/plan/{{ p.id }}/activate" style="display:inline">
+                <button type="submit" class="link-btn">Make active</button>
+            </form>
+        {% endif %}
+    </li>
     {% endfor %}
-</p>
+</ul>
 {% else %}
 <p class="hint">No plans yet. Build one on the <a href="/plan">Plan</a> page (Plan mode).</p>
 {% endif %}
