@@ -74,6 +74,27 @@ pip install -e ".[dev]"
 pytest
 ```
 
+### Browser (DOM) tests
+
+`tests/test_dom_smoke.py` drives the real app in Chromium with Playwright and
+asserts on *rendered* state — chart canvases that actually paint, power-profile
+SVGs with real geometry, a clean JS console on every page. Source-string tests
+cannot catch those regressions.
+
+They need a browser binary that pip does not install:
+
+```sh
+playwright install chromium   # ~150MB, one-off
+```
+
+Without it (CI, fresh checkouts) the whole module **skips** — it never fails.
+They run by default and add roughly 15s. To select or exclude them:
+
+```sh
+pytest -m browser         # only the browser tests
+pytest -m "not browser"   # everything else
+```
+
 ## Ride (Bluetooth)
 
 The **Ride** page runs a generated/planned workout directly in the app, talking
