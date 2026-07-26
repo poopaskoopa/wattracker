@@ -56,6 +56,32 @@ VO2_REPEATABLE_FRACTION = 0.92
 VO2_RATIO_MIN = 1.06
 VO2_RATIO_MAX = 1.30
 
+# --- Quantization: why derived targets are deliberately coarse ---------------
+# A measured ratio is not a stable number. It comes from ``mmp``, which
+# ``analysis.pipeline`` recomputes over a ROLLING 90-day window, so it moves
+# every single day as rides enter and 90-day-old rides leave - by fractions of
+# a watt, with no change in the rider at all.
+#
+# On its own that is harmless. Combined with an unattended nightly reflow it is
+# not: reflow diffs on tss and the stored .zwo, so any un-quantized derived
+# value makes every plan and every exported .zwo file get rewritten every
+# night, forever, driven purely by measurement noise. Measured before this was
+# added, a vo2_ratio move of 0.001 - under a watt at a 250 W FTP - was enough
+# to produce a different .zwo.
+#
+# So derived targets are snapped to a step coarse enough that ordinary noise
+# cannot cross it, and fine enough to be a meaningful prescription: 0.01 of FTP
+# for VO2max (~2.5 W at 250 W, well inside the precision of any interval a
+# rider can actually hold) and 0.05 for the sprint load figure, which is not a
+# target at all and only feeds a TSS estimate.
+#
+# Residual, accepted: a rider whose ratio sits exactly on a step edge can still
+# flip between two adjacent values. That is bounded, rare and self-limiting -
+# unlike continuous drift - so it is not worth the state that hysteresis would
+# need.
+VO2_QUANTUM = 0.01
+SPRINT_LOAD_QUANTUM = 0.05
+
 # Deliberately NOT consumed here: rider phenotype (sprinter / pursuiter /
 # time-trialist / all-rounder) from ``analysis.power_profile.classify_phenotype``.
 # Phenotype changes WHICH sessions a rider should be given, not what a given
@@ -84,6 +110,15 @@ def _measured(profile: Optional["RiderMetrics"], attr: str) -> Optional[float]:
     return f
 
 
+def _quantize(value: float, step: float) -> float:
+    """Snap ``value`` to the nearest multiple of ``step`` (see VO2_QUANTUM).
+
+    The trailing round() removes the binary-float residue that would otherwise
+    leave 4.36 -> 4.3500000000000005 and defeat the whole point.
+    """
+    return round(round(value / step) * step, 4)
+
+
 def sprint_load_ratio(profile: Optional["RiderMetrics"] = None) -> float:
     """Multiple of FTP used to ACCOUNT for a 12s sprint's training load.
 
@@ -92,8 +127,14 @@ def sprint_load_ratio(profile: Optional["RiderMetrics"] = None) -> float:
     measured 5s peak is the honest number when we have it - a rider who sprints
     at 4.35x FTP does far more work in 12s than the 3.00x population stand-in
     credits them with, and their TSS should say so.
+
+    Quantized to ``SPRINT_LOAD_QUANTUM`` so a rolling-window wobble in the
+    measured peak cannot churn every plan nightly (see the constant).
     """
-    return _measured(profile, "sprint_ratio") or SPRINT_LOAD_RATIO_DEFAULT
+    measured = _measured(profile, "sprint_ratio")
+    if measured is None:
+        return SPRINT_LOAD_RATIO_DEFAULT
+    return _quantize(measured, SPRINT_LOAD_QUANTUM)
 
 
 def vo2_target(profile: Optional["RiderMetrics"] = None) -> Optional[float]:
@@ -102,11 +143,16 @@ def vo2_target(profile: Optional["RiderMetrics"] = None) -> Optional[float]:
     Returns None (rather than the default) so callers can keep their original
     wording when nothing was measured; ``vo2_target(None)`` therefore reproduces
     the previous prescription byte-for-byte.
+
+    Quantized to ``VO2_QUANTUM``: the prescription tracks the rider's capacity,
+    not the third decimal place of a rolling-window estimate.
     """
     ratio = _measured(profile, "vo2_ratio")
     if ratio is None:
         return None
-    return max(VO2_RATIO_MIN, min(VO2_RATIO_MAX, ratio * VO2_REPEATABLE_FRACTION))
+    target = max(VO2_RATIO_MIN,
+                 min(VO2_RATIO_MAX, ratio * VO2_REPEATABLE_FRACTION))
+    return _quantize(target, VO2_QUANTUM)
 
 
 def vo2_power(base: float, profile: Optional["RiderMetrics"] = None) -> float:
@@ -122,12 +168,18 @@ def vo2_power(base: float, profile: Optional["RiderMetrics"] = None) -> float:
 
     Returns ``base`` unchanged (same float, no rounding) when nothing is
     measured, which is what keeps an unmeasured rider's .zwo byte-identical.
+
+    The scaled result is quantized on the same grid as ``vo2_target``, so every
+    variant lands on a whole percent of FTP and a noisy measurement cannot move
+    one variant while leaving another still (both bounds are multiples of the
+    step, so quantizing after clamping cannot escape the band).
     """
     derived = vo2_target(profile)
     if derived is None:
         return base
     scaled = base * (derived / VO2_RATIO_DEFAULT)
-    return round(max(VO2_RATIO_MIN, min(VO2_RATIO_MAX, scaled)), 3)
+    clamped = max(VO2_RATIO_MIN, min(VO2_RATIO_MAX, scaled))
+    return _quantize(clamped, VO2_QUANTUM)
 
 
 @dataclass
