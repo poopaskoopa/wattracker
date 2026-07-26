@@ -4,6 +4,11 @@ Distributes weekly riding hours across selected days, assigns high-intensity
 sessions to HIT days and endurance/tempo to the rest, applies a gentle weekly
 ramp with a recovery week every 4th week, and dates every workout. Reuses the
 interval machinery in ``planner.build_workout`` - it does not reinvent the math.
+
+An optional periodization arc (``phases``, see prescribe/phases.py) varies which
+intensity a week's hard days carry and how much of the week goes to them. It
+never varies the weekly hours upward: weekly volume is a hard promise to the
+rider, so a phase may only redistribute inside that budget or reduce it.
 """
 from __future__ import annotations
 
@@ -11,6 +16,7 @@ import datetime as _dt
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Callable, Dict, List, Optional, Sequence, Set
 
+from .phases import Phase, PhasePlan, resolve_phases
 from .planner import VARIANTS, Session, build_workout
 
 if TYPE_CHECKING:  # typing only - generation stays a pure function
@@ -420,6 +426,7 @@ def generate_plan(
     model: str = DEFAULT_MODEL,
     races: Optional[Sequence[dict]] = None,
     profile: Optional["RiderMetrics"] = None,
+    phases: Optional[Sequence[Phase]] = None,
 ) -> Dict:
     """Generate a dated, multi-week plan for the chosen training model.
 
@@ -444,6 +451,16 @@ def generate_plan(
     follow their measured capacity as it changes instead of being frozen at the
     moment the plan was created. ``profile=None`` reproduces the population
     constants exactly.
+
+    ``phases`` is an optional periodization arc (see prescribe/phases.py). Each
+    week the arc claims takes its ``hard_types`` and ``hard_volume_fraction``
+    from the phase instead of the model, and the phase's ``volume_multiplier``
+    (never above 1.0) composes with recovery weeks and race tapers by taking the
+    DEEPER reduction rather than multiplying - stacking two reductions would
+    over-cut and could push sessions under their feasible floors. An arc that
+    cannot be periodized coherently in the weeks available is abandoned by the
+    resolver, so the plan comes back unphased with ``phases.unphased_reason``
+    set. ``phases=None`` leaves every existing code path untouched.
     """
     err = validate_plan_inputs(
         weeks, days_of_week, hours_per_week, hit_days_per_week, hard_days, model
@@ -472,6 +489,12 @@ def generate_plan(
     resolved_races, race_conflicts = resolve_race_conflicts(normalize_races(races))
     effects = race_effects(resolved_races, scheduled)
 
+    # None unless a caller opted in; every phase-aware branch below is written
+    # so that this being None reproduces the pre-phases plan exactly.
+    phase_plan: Optional[PhasePlan] = (
+        resolve_phases(weeks, list(phases)) if phases else None
+    )
+
     workouts: List[dict] = []
     weekly: List[dict] = []
     hit_counter = 0
@@ -482,7 +505,20 @@ def generate_plan(
     kind_counter: dict = {}
 
     for w in range(weeks):
-        weekly_minutes = float(hours_per_week) * 60.0 * week_multiplier(w + 1)
+        phase = phase_plan.phase_for(w) if phase_plan is not None else None
+        # A week with no phase - either because no arc was given or because the
+        # arc had no room for one here - keeps the model's own knobs.
+        hard_types = list(phase.hard_types) if phase else cfg.hard_types
+        hard_fraction = (phase.hard_volume_fraction if phase
+                         else cfg.hard_volume_fraction)
+        recovery_mult = week_multiplier(w + 1)
+        phase_mult = phase.volume_multiplier if phase else 1.0
+        # Deeper-wins, not product: a phase reduction and a recovery week are
+        # two opinions about the same week, and multiplying them would cut
+        # twice for one reason.
+        week_mult = min(recovery_mult, phase_mult)
+
+        weekly_minutes = float(hours_per_week) * 60.0 * week_mult
         hit = min(hit_per_week, n)
         hit_pos = (
             _resolve_hit_positions(n, hit, marked_pos)
@@ -494,7 +530,7 @@ def generate_plan(
         # days, feasibility-clamped so the interval builders always fit.
         if hit > 0:
             hit_dur = _clamp(
-                weekly_minutes * cfg.hard_volume_fraction / hit,
+                weekly_minutes * hard_fraction / hit,
                 HIT_MIN_MIN, HIT_MAX_MIN,
             )
         else:
@@ -517,7 +553,7 @@ def generate_plan(
             # race can never perturb the sequence: the day a race touches is
             # the only day that changes, and the plan after it is untouched.
             if i in hit_pos:
-                kind = cfg.hard_types[hit_counter % len(cfg.hard_types)]
+                kind = hard_types[hit_counter % len(hard_types)]
                 hit_counter += 1
                 dur = hit_dur
                 hard_slot = True
@@ -557,9 +593,24 @@ def generate_plan(
                 # it is not the one the season is built around.
                 kind, hard_slot, variant = "endurance", False, "classic"
 
-            mult = effects.taper.get(iso)
-            if mult is not None:
-                dur = max(dur * mult, _feasible_min(kind, hard_slot))
+            if phase is None:
+                # No phase: the race taper applies exactly as it always has.
+                mult = effects.taper.get(iso)
+                if mult is not None:
+                    dur = max(dur * mult, _feasible_min(kind, hard_slot))
+            else:
+                # With a phase, the day's total reduction is the DEEPER of what
+                # the day already had (recovery week x race taper, unchanged
+                # from the raceless code above) and the phase's own multiplier -
+                # never their product. Two reductions stacked would over-cut and
+                # could drive sessions under the floors _feasible_min guards.
+                # ``dur`` already carries ``week_mult``, so only the difference
+                # between that and the target is applied here.
+                race_mult = effects.taper.get(iso, 1.0)
+                target = min(recovery_mult * race_mult, phase_mult)
+                if target < week_mult:
+                    dur = max(dur * (target / week_mult),
+                              _feasible_min(kind, hard_slot))
 
             week_days.append({
                 "date": date.isoformat(),
@@ -610,7 +661,7 @@ def generate_plan(
 
     total_s = sum(x["total_s"] for x in weekly)
     total_hard_s = sum(x["hard_s"] for x in weekly)
-    return {
+    out: Dict = {
         "name": name,
         "model": model,
         "start_date": monday0.isoformat(),
@@ -634,3 +685,19 @@ def generate_plan(
         },
         "polarized_hard_fraction": round(total_hard_s / total_s, 3) if total_s else 0.0,
     }
+    # The key only exists on a periodized plan: an unphased plan's dict must
+    # stay exactly what it was before phases existed.
+    if phase_plan is not None:
+        out["phases"] = {
+            "blocks": [{"name": phase_name, "weeks": count}
+                       for phase_name, count in phase_plan.blocks],
+            # Phases the arc could not fit, so a caller can say "this is a
+            # build block, not full preparation".
+            "omitted": list(phase_plan.omitted),
+            "weeks": [p.name if p else None for p in phase_plan.weeks],
+            # Set when the plan was too short to periodize coherently and the
+            # arc was abandoned: the plan below is exactly an unphased one, and
+            # this is the sentence explaining that to the rider.
+            "unphased_reason": phase_plan.unphased_reason,
+        }
+    return out
