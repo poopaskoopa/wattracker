@@ -266,6 +266,33 @@ def test_profile_get_post_validation_reset_and_isolation(client):
     assert db.get_user_settings(alice)["hr_max"] is None
 
 
+@pytest.mark.parametrize(
+    "streams",
+    [
+        [1, 2, 3],
+        42,
+        {"heartrate": 180, "time": 0},
+        {"heartrate": [10**1000], "time": []},
+    ],
+    ids=["top-level-list", "top-level-scalar", "scalar-hr-time", "huge-hr"],
+)
+def test_profile_ignores_malformed_persisted_activity_streams(client, streams):
+    user_id = _register(client)
+    db.insert_activity(user_id, {
+        "dedup_hash": "malformed-streams",
+        "filename": "malformed.fit",
+        "start_time": "2026-06-01T10:00:00",
+        "duration_s": 1,
+        "streams": streams,
+    })
+    assert db.full_activities(user_id)[0]["streams"] == streams
+
+    page = client.get("/profile")
+
+    assert page.status_code == 200
+    assert "Heart-rate zones" in page.text
+
+
 def test_profile_ftp_save_validation_reset_and_isolation(client):
     alice = _register(client, "ftp-alice")
     db.add_ftp_entry(alice, "2026-06-01", 240)
