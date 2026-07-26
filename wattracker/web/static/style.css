@@ -191,6 +191,25 @@ details summary { cursor: pointer; color: var(--accent); margin: 0.5rem 0; }
 .model-option { display: flex; align-items: flex-start; gap: 0.5rem; margin: 0.3rem 0; cursor: pointer; }
 .model-option span { font-size: 0.82rem; }
 .model-option span strong { color: var(--accent); }
+/* The goal picker sits above the model picker and reuses its option styling:
+   goal and model are separate, orthogonal choices, so they read as two lists of
+   the same kind of thing. */
+.goal-picker { grid-column: 1 / -1; border: 1px solid #2a333d; border-radius: 6px; padding: 0.5rem; }
+.goal-picker legend { color: var(--muted); font-size: 0.8rem; }
+/* How well-founded a recommendation is, shown next to the number itself so a
+   coaching convention is never mistaken for an evidence-backed figure. */
+.basis { font-size: 0.7rem; text-transform: uppercase; letter-spacing: 0.03em;
+    border-radius: 3px; padding: 0 4px; }
+.basis-literature { background: var(--ok); color: #1a1a1a; }
+.basis-convention { background: #3a4450; color: var(--muted); }
+.plan-goal { margin: 0.6rem 0; }
+.phase-blocks { list-style: none; padding: 0; margin: 0.3rem 0; font-size: 0.85rem; }
+.phase-blocks li { display: inline-block; margin-right: 0.8rem; }
+.phase-blocks li strong { color: var(--accent); text-transform: capitalize; }
+.phase-cell { text-transform: capitalize; color: var(--muted); }
+.goal-signal { font-size: 0.88rem; margin: 0.3rem 0; }
+.goal-signal.secondary { color: var(--muted); }
+.reflow-notice { font-size: 0.85rem; }
 .plan-form button { grid-column: 1 / -1; justify-self: start; }
 .weekly-table .recovery-week { color: var(--ok); }
 .link-btn { background: none; border: none; color: var(--accent); cursor: pointer; padding: 0; font: inherit; }
@@ -262,6 +281,11 @@ table.calendar th { text-align: center; }
     padding: 0 4px; vertical-align: middle; }
 /* An A race is the one the season bends around - make it the loud one. */
 .cal-race-tag.cal-race-A { background: var(--accent); }
+/* Which block of the active plan's arc this week belongs to. Quiet on purpose:
+   it is context for the day, not an event happening on it. */
+.cal-phase-tag { font-size: 0.6rem; letter-spacing: 0.03em; color: var(--muted);
+    border: 1px solid #2a333d; border-radius: 3px; padding: 0 4px;
+    vertical-align: middle; text-transform: capitalize; }
 .ooto-form select { width: 150px; }
 
 /* Calendar layout: calendar left (fills), OOTO panel right (fixed sidebar).

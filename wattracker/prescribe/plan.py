@@ -101,7 +101,12 @@ A_RACE_SEPARATION_DAYS = 21
 RECOVERY_SESSIONS_MIN = 2
 RECOVERY_SESSIONS_MAX = 5
 
-HARD_KINDS = ("vo2max", "threshold", "sweet_spot")
+# Session kinds a B race displaces: the race is that week's hard work, so an
+# interval day either side of it becomes endurance. ``sprint`` is here for the
+# same reason the others are - a criterium goal's sharpening block schedules
+# them, and a maximal-effort day the evening before a race is exactly the day
+# the race should take over.
+HARD_KINDS = ("vo2max", "threshold", "sweet_spot", "sprint")
 
 PRIORITY_A = "A"
 PRIORITY_B = "B"
@@ -291,18 +296,26 @@ def _clamp(v: float, lo: float, hi: float) -> float:
 
 
 def hard_seconds(session: Session) -> int:
-    """Seconds of high-intensity interval 'on' time in a session.
+    """Seconds of high-intensity work in a session.
 
-    HAZARD: counts ``intervals`` segments only, so a sprint session - whose
-    efforts are untargeted ``freeride`` blocks - contributes zero hard seconds
-    and would report a polarized hard fraction of 0. Latent today because no
-    plan model schedules sprints; the goal work, where a criterium plan will,
-    must count freeride blocks here first.
+    Two shapes count. An ``intervals`` segment contributes its 'on' time. A
+    ``freeride`` segment contributes its whole duration when its
+    ``load_fraction`` puts it at or above FTP: a maximal effort has no power
+    TARGET to inspect (see ``planner._sprint`` - naming a number would turn "go
+    as hard as you can" into "do not exceed this"), so the load-accounting
+    fraction is the only honest marker of how hard it is.
+
+    Counting freeride is what lets a sprint session report the hard time it
+    actually contains. Without it a criterium plan's sharpening block - the one
+    place in the product that schedules sprints - would score zero hard seconds
+    and report a hard fraction of 0 for its hardest weeks.
     """
     total = 0
     for seg in session.segments:
         if seg.kind == "intervals" and seg.repeat:
             total += int(seg.repeat) * int(seg.on_duration or 0)
+        elif seg.kind == "freeride" and (seg.load_fraction or 0.0) >= 1.0:
+            total += int(seg.duration or 0)
     return total
 
 

@@ -5,6 +5,19 @@
 
 {% if flash %}<p class="ok flash">{{ flash }}</p>{% endif %}
 
+{% if reflow_notice %}
+{# The nightly sweep rewrites upcoming workouts unattended. Saying so is not
+   optional: a silent rewrite is indistinguishable from us changing the rider's
+   training behind their back. #}
+<p class="alert reflow-notice">{{ reflow_notice.message }}
+    <form method="post"
+          action="/plan/{{ reflow_notice_plan_id }}/reflow-notice/dismiss"
+          style="display:inline">
+        <button type="submit" class="link-btn">dismiss</button>
+    </form>
+</p>
+{% endif %}
+
 {% set rating_next = '/calendar' %}
 {% include "_pending_ratings.html" %}
 
@@ -64,7 +77,7 @@
         <tr>
         {% for cell in week %}
             <td class="cal-cell {{ 'other-month' if not cell.in_month else '' }} {{ 'cal-ooto-day' if cell.ooto else '' }} {{ 'cal-race-day' if cell.race else '' }}">
-                <div class="cal-day">{{ cell.day }}{% if cell.ooto %} <span class="cal-ooto-tag">OOTO</span>{% endif %}{% if cell.race %} <span class="cal-race-tag cal-race-{{ cell.race.priority }}" title="{{ cell.race.name or 'Race' }} — priority {{ cell.race.priority }}">{{ cell.race.priority }}</span>{% endif %}</div>
+                <div class="cal-day">{{ cell.day }}{% if cell.ooto %} <span class="cal-ooto-tag">OOTO</span>{% endif %}{% if cell.race %} <span class="cal-race-tag cal-race-{{ cell.race.priority }}" title="{{ cell.race.name or 'Race' }} — priority {{ cell.race.priority }}">{{ cell.race.priority }}</span>{% endif %}{% if cell.phase %} <span class="cal-phase-tag" title="This week is part of your plan's {{ cell.phase }} block">{{ cell.phase }}</span>{% endif %}</div>
                 {% for w in cell.workouts %}
                     <div class="cal-workout cal-{{ w.type }}{{ ' cal-completed' if w.completed_activity_id else '' }}{{ ' cal-adapted' if w.adapted else '' }}{{ ' cal-skipped' if w.skipped else '' }}{{ ' cal-missed' if w.missed else '' }}"
                          {% if not w.standalone %}

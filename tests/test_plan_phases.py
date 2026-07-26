@@ -588,11 +588,14 @@ def test_reflow_of_a_phased_plan_converges_and_is_idempotent(user_id):
     assert db.plan_workouts_for_plan(user_id, plan_id, include_zwo=True) == settled
 
 
-def test_phases_are_not_yet_wired_into_any_caller():
-    """Phases are opted into through the Goal registry in a later step.
+def test_arcs_only_ever_reach_the_generator_through_the_goal_registry():
+    """Phases are opted into, never defaulted on.
 
-    Until then nothing in the product may pass an arc to generate_plan - a
-    default arc would rewrite every stored plan on the next nightly sweep.
+    An arc that arrived any other way - a module-level default, a route
+    hard-coding one - would rewrite every stored plan on the next nightly
+    sweep. So the only files allowed to pass ``phases=`` are the phase
+    machinery itself, the goal registry that owns the arcs, and the two callers
+    that ask the registry for one.
     """
     hits = subprocess.run(
         ["git", "grep", "-l", "-e", "DEFAULT_ARC", "-e", "phases=",
@@ -600,5 +603,12 @@ def test_phases_are_not_yet_wired_into_any_caller():
         cwd=REPO, capture_output=True, text=True,
     ).stdout.split()
     assert set(hits) <= {"wattracker/prescribe/phases.py",
-                         "wattracker/prescribe/plan.py"}
+                         "wattracker/prescribe/plan.py",
+                         "wattracker/prescribe/goals.py",
+                         "wattracker/prescribe/reflow.py",
+                         "wattracker/server.py"}
     assert ph.DEFAULT_ARC  # the reference arc exists and is constructible
+    # Both callers resolve the arc from the recipe's goal, and no goal means no
+    # arc - the flat plan every existing rider already has.
+    from wattracker.prescribe import goals
+    assert goals.arc_for(None) is None

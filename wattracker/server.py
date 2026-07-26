@@ -32,12 +32,16 @@ from starlette.middleware.sessions import SessionMiddleware
 from starlette.middleware.trustedhost import TrustedHostMiddleware
 
 from . import auth, backup, config, credstore, db, exporter, paths, races
-from .analysis import pipeline, power_profile, zones
+from .analysis import activity_cache, pipeline, power_profile, zones
 from .ble import devices as bledevices
 from .ble.runner import RideController, flatten_session
 from .ingest import importer
+from .metrics import durability as durabilitymod
 from .metrics import profile_store
 from .prescribe import adapt as adaptmod
+from .prescribe import duration as durationmod
+from .prescribe import goals as goalsmod
+from .prescribe import phases as phasesmod
 from .prescribe import plan as planmod
 from .prescribe import present
 from .prescribe import reflow
@@ -221,7 +225,9 @@ def run_daily_maintenance() -> dict:
             # reverted every one of adapt.py's adjustments overnight.
             plan = db.get_active_plan(uid)
             if plan is not None:
-                result = reflow.reflow_plan(uid, plan["id"])
+                # notify=True: this run is unattended, so anything it rewrites
+                # has to be reported back to the rider (see reflow.reflow_plan).
+                result = reflow.reflow_plan(uid, plan["id"], notify=True)
                 totals["reflowed"] += (
                     result.get("updated", 0) + result.get("inserted", 0)
                     + result.get("deleted", 0)
@@ -807,7 +813,169 @@ def create_app() -> FastAPI:
             "start_date": _upcoming_monday().isoformat(),
             "name": "Training Plan",
             "model": planmod.DEFAULT_MODEL,
+            # No goal is the default: a goal-less plan is the flat plan the app
+            # has always generated, and it must stay reachable in one click.
+            "goal": None,
         }
+
+    # ---------------------------------------------------------------- goals
+    def _current_ctl(uid: Optional[int]) -> Optional[float]:
+        """Latest CTL, for a plan-length recommendation. Never raises.
+
+        Uses the load series rather than a full ``build_state``: CTL comes
+        straight from stored daily TSS, so this costs one query instead of
+        inflating months of power streams on a page render.
+        """
+        if uid is None:
+            return None
+        try:
+            series = pipeline.load_series(uid)
+        except Exception:  # noqa: BLE001 - a recommendation is never load-bearing
+            _log.warning("could not read CTL for a goal recommendation",
+                         exc_info=True)
+            return None
+        return series[-1]["ctl"] if series else None
+
+    def _goal_options(uid: Optional[int], hours_per_week: float) -> List[dict]:
+        """Every goal, with the length it recommends and how well-founded it is.
+
+        The basis strength travels with the number deliberately: the FTP range
+        is literature-informed while the other two are coaching convention, and
+        showing all three as bare week counts would dress a heuristic as
+        evidence. It is ADVISORY - nothing here gates or clamps the form.
+        """
+        ctl = _current_ctl(uid)
+        options: List[dict] = []
+        for goal in goalsmod.all_goals():
+            rec = durationmod.recommend_weeks(goal.key, ctl, hours_per_week)
+            options.append({
+                "key": goal.key,
+                "label": goal.label,
+                "description": goal.description,
+                "default_model": goal.default_model,
+                "default_model_label":
+                    planmod.MODELS[goal.default_model].label,
+                "ideal_weeks": rec.ideal_weeks,
+                "floor_weeks": rec.floor_weeks,
+                "rationale": rec.rationale,
+                "basis_strength": rec.basis_strength.value,
+                "phases": [p.name for p in goal.arc],
+                "min_viable_weeks": phasesmod.minimum_viable_weeks(goal.arc),
+            })
+        return options
+
+    def _goal_length_note(
+        goal_key: Optional[str], weeks: int, hours_per_week: float,
+        uid: Optional[int],
+    ) -> Optional[dict]:
+        """What the chosen length means for this goal. Advice, never a refusal.
+
+        A length below the goal's floor, or below the arc's own viability
+        threshold, is generated anyway - the rider gets the plan they asked for
+        plus a plain statement of what they gave up (phases dropped from the
+        front, or an arc abandoned entirely).
+        """
+        goal = goalsmod.get(goal_key)
+        if goal is None:
+            return None
+        rec = durationmod.recommend_weeks(goal.key, _current_ctl(uid),
+                                          hours_per_week)
+        summary = goalsmod.block_summary(goal.key, weeks) or {}
+        return {
+            "goal": goal.key,
+            "label": goal.label,
+            "classification": durationmod.classify_chosen_weeks(weeks, rec),
+            "ideal_weeks": rec.ideal_weeks,
+            "floor_weeks": rec.floor_weeks,
+            "basis_strength": rec.basis_strength.value,
+            "rationale": rec.rationale,
+            "blocks": summary.get("blocks") or [],
+            "omitted": summary.get("omitted") or [],
+            "unphased_reason": summary.get("unphased_reason"),
+        }
+
+    def _durability_signal(uid: int) -> Optional[dict]:
+        """Late 5-minute power retention, or None when the evidence is thin.
+
+        Returning None (rather than a zero) is the point: durability needs a
+        hard 5-minute effort late in a long ride, and the steady endurance rides
+        this goal prescribes usually contain no such effort, so "no measurement"
+        is the common case and must read as silence.
+        """
+        try:
+            activities = db.recent_full_activities(uid, days=90)
+            weight = (db.get_user_settings(uid) or {}).get("weight_kg")
+            result = durabilitymod.compute_durability(activities, weight)
+        except Exception:  # noqa: BLE001 - a progress panel never breaks a page
+            _log.warning("durability computation failed", exc_info=True)
+            return None
+        if result.retention_ratio is None:
+            return None
+        return {
+            "retention_pct": round(result.retention_ratio * 100.0, 1),
+            "fresh_w": round(result.fresh_5min_power or 0.0, 0),
+            "late_w": round(result.late_5min_power or 0.0, 0),
+            "rides": result.qualifying_rides,
+        }
+
+    def _goal_progress(uid: Optional[int], goal_key: Optional[str]) -> Optional[dict]:
+        """The goal's own progress signals, with absent ones left out entirely.
+
+        Each goal names what "progress" means for it (see prescribe/goals.py),
+        so a criterium rider is shown their 5s/1min peaks rather than FTP. A
+        signal with no measurement behind it is omitted; a secondary signal is
+        never rendered as a zero when it simply is not there.
+        """
+        goal = goalsmod.get(goal_key)
+        if goal is None or uid is None:
+            return None
+        panels: List[dict] = []
+        for signal in goal.signals:
+            value: Optional[dict] = None
+            if signal.key == "ftp_trend":
+                try:
+                    series = pipeline.ftp_rolling_series(uid, months=6)
+                    points = series.get("estimated") or []
+                except Exception:  # noqa: BLE001
+                    points = []
+                if points:
+                    first, last = points[0], points[-1]
+                    value = {
+                        "current": round(float(last["ftp"]), 0),
+                        "from": round(float(first["ftp"]), 0),
+                        "from_date": first["date"][:10],
+                        "change": round(float(last["ftp"]) - float(first["ftp"]), 0),
+                    }
+            elif signal.key == "peak_power":
+                profile = profile_store.for_user(uid)
+                if profile.peak_5s is not None or profile.peak_60s is not None:
+                    value = {
+                        "peak_5s": (round(profile.peak_5s, 0)
+                                    if profile.peak_5s is not None else None),
+                        "peak_60s": (round(profile.peak_60s, 0)
+                                     if profile.peak_60s is not None else None),
+                    }
+            elif signal.key == "decoupling":
+                try:
+                    pct = activity_cache.get_digest(uid).decoupling
+                except Exception:  # noqa: BLE001
+                    pct = None
+                if pct is not None:
+                    value = {"percent": round(float(pct), 1)}
+            elif signal.key == "durability":
+                value = _durability_signal(uid)
+            if value is None:
+                continue
+            panels.append({
+                "key": signal.key,
+                "label": signal.label,
+                "description": signal.description,
+                "role": signal.role,
+                "value": value,
+            })
+        if not panels:
+            return None
+        return {"goal": goal.key, "label": goal.label, "signals": panels}
 
     def _plan_management(uid: Optional[int]) -> dict:
         """Summarize the user's plans for the management section.
@@ -846,6 +1014,9 @@ def create_app() -> FastAPI:
                 "completed": completed,
                 "covers_today": covers,
                 "active": bool(p.get("active")),
+                # Pending "the nightly sweep rewrote some of this" notice.
+                "reflow_notice": p.get("reflow_notice"),
+                "goal": goalsmod.get((p.get("recipe") or {}).get("goal")),
             })
         if not entries:
             return {"current": None, "others": []}
@@ -860,6 +1031,8 @@ def create_app() -> FastAPI:
         return {"current": current, "others": others}
 
     def _generate_ctx(request: Request, **kw) -> dict:
+        uid = _uid(request)
+        defaults = kw.get("plan_defaults") or _plan_defaults()
         base = dict(
             session=None,
             error=None,
@@ -867,13 +1040,14 @@ def create_app() -> FastAPI:
             mode="workout",
             plan=None,
             plan_error=None,
-            plan_defaults=_plan_defaults(),
+            plan_defaults=defaults,
+            goal_options=_goal_options(uid, defaults.get("hours_per_week") or 6.0),
             day_labels=DAY_LABELS,
             exported=None,
             exported_path=None,
             scheduled_date=utc_today().isoformat(),
             flash=None,
-            plan_mgmt=_plan_management(_uid(request)),
+            plan_mgmt=_plan_management(uid),
         )
         base.update(kw)
         return _ctx(request, **base)
@@ -888,6 +1062,27 @@ def create_app() -> FastAPI:
         summary["count"] = len(workouts)
         summary["workouts"] = workouts
         summary["total_tss"] = round(sum(w["tss"] for w in workouts), 1)
+        # The goal lives in the recipe, so a stored plan can say what it was
+        # built for - and show the arc and the progress signal that go with it -
+        # long after the form that created it is gone.
+        recipe = plan.get("recipe") or {}
+        goal = goalsmod.get(recipe.get("goal"))
+        if goal is not None:
+            summary["goal"] = {
+                "key": goal.key,
+                "label": goal.label,
+                "description": goal.description,
+                "default_model": goal.default_model,
+            }
+            # The arc as it resolves for this plan's length. A freshly generated
+            # plan overwrites this with what the generator actually applied;
+            # they agree, because both come from the same resolver.
+            summary["phases"] = goalsmod.block_summary(goal.key, int(plan["weeks"]))
+            summary["length"] = _goal_length_note(
+                goal.key, int(plan["weeks"]),
+                float(recipe.get("hours_per_week") or 0.0) or 6.0, uid,
+            )
+            summary["progress"] = _goal_progress(uid, goal.key)
         return summary
 
     def _auto_export_plan(uid: int, plan_id: int) -> dict:
@@ -990,8 +1185,13 @@ def create_app() -> FastAPI:
         days: List[str] = Form([]),
         hard_days: List[str] = Form([]),
         model: str = Form("polarized"),
+        goal: str = Form(""),
     ):
         uid = _uid(request)
+        # An unrecognized goal key reads as no goal at all: the plan is still
+        # generated, just flat. A goal must never be the reason a rider cannot
+        # create a plan.
+        goal_key = goalsmod.normalize_key(goal)
         try:
             day_ints = sorted({int(d) for d in days})
         except (ValueError, TypeError):
@@ -1013,22 +1213,28 @@ def create_app() -> FastAPI:
             "hit_days_per_week": hit_days_per_week, "days": day_ints,
             "hard_days": hard_ints,
             "start_date": start.isoformat(), "name": name,
-            "model": model,
+            "model": model, "goal": goal_key,
         }
         try:
             # Born profile-aware: without this a new plan is built on the
             # population constants and the very next nightly reflow rewrites
             # every workout in it.
+            #
+            # ``phases`` is None for a goal-less plan, which is the path the
+            # generator took before goals existed - so an existing plan and a
+            # plan created with no goal are the same plan, byte for byte.
             generated = planmod.generate_plan(
                 name, start, weeks, day_ints, hours_per_week, hit_days_per_week,
                 hard_days=hard_ints or None, model=model,
                 profile=profile_store.for_user(uid),
+                phases=goalsmod.arc_for(goal_key),
             )
             # Persist the generator inputs, not just their output, so the plan
-            # can be recomputed later (see prescribe/reflow.py).
+            # can be recomputed later (see prescribe/reflow.py). The goal is in
+            # there because it is a choice, not a measurement (see goals.py).
             recipe = reflow.build_recipe(
                 day_ints, hours_per_week, hit_days_per_week,
-                hard_days=hard_ints, model=model,
+                hard_days=hard_ints, model=model, goal=goal_key,
             )
             plan_id = db.create_plan(
                 uid, name or "Training Plan", generated["start_date"],
@@ -1049,6 +1255,9 @@ def create_app() -> FastAPI:
             summary = _plan_summary(uid, plan_id)
             summary["polarized_hard_fraction"] = generated["polarized_hard_fraction"]
             summary["weekly"] = generated["weekly"]
+            # The resolved arc as the generator actually applied it, including
+            # any phase it had no room for and the reason an arc was abandoned.
+            summary["phases"] = generated.get("phases")
             summary.update(_auto_export_plan(uid, plan_id))
         except ValueError as e:
             plan_error = str(e)
@@ -1238,6 +1447,17 @@ def create_app() -> FastAPI:
             })
             by_date.setdefault(w["scheduled_date"], []).append(wd)
 
+        # Which block of the active plan's arc each day belongs to, so a day
+        # cell can say "build" rather than leaving the rider to count weeks.
+        # Empty for a plan with no goal, which is every plan that predates them.
+        active = db.get_active_plan(uid) if uid is not None else None
+        phase_by_date = {}
+        if active is not None:
+            phase_by_date = goalsmod.phase_by_date(
+                active["start_date"], active["weeks"],
+                (active.get("recipe") or {}).get("goal"),
+            )
+
         cal = _cal.Calendar(firstweekday=0)  # Monday
         weeks = []
         for week in cal.monthdatescalendar(y, m):
@@ -1252,6 +1472,7 @@ def create_app() -> FastAPI:
                         "ooto": _in_ooto(iso),
                         "race": races_by_date.get(iso),
                         "workouts": by_date.get(iso, []),
+                        "phase": phase_by_date.get(iso),
                     }
                 )
             weeks.append(row)
@@ -1275,8 +1496,26 @@ def create_app() -> FastAPI:
                 race_dates=race_dates,
                 export_result=request.query_params.get("exported"),
                 flash=request.query_params.get("flash"),
+                # An unattended overnight rewrite the rider was never told
+                # about is indistinguishable from us changing their training
+                # behind their back, so it is surfaced until dismissed.
+                reflow_notice=(active or {}).get("reflow_notice"),
+                reflow_notice_plan_id=(active or {}).get("id"),
             ),
         )
+
+    @app.post("/plan/{plan_id}/reflow-notice/dismiss")
+    def plan_reflow_notice_dismiss(request: Request, plan_id: int):
+        """Acknowledge the "your plan changed overnight" notice."""
+        uid = _uid(request)
+        if db.get_plan(uid, plan_id) is None:
+            return JSONResponse({"error": "not found"}, status_code=404)
+        db.set_plan_reflow_notice(uid, plan_id, None)
+        # Only ever bounce back to one of our own pages, never to an
+        # attacker-supplied Referer.
+        referer = _url.urlparse(request.headers.get("referer") or "").path
+        target = "/calendar" if referer == "/calendar" else "/plan"
+        return RedirectResponse(url=target, status_code=303)
 
     @app.post("/ratings/{kind}/{workout_id}")
     def save_rating(
