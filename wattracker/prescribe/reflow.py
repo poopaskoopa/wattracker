@@ -43,7 +43,7 @@ import logging
 from typing import Dict, List, Optional
 
 from .. import db
-from ..metrics import rider
+from ..metrics import profile_cache
 from ..timeutil import utc_now
 from . import zwo
 from .adapt import reexport_workout
@@ -197,8 +197,10 @@ def reflow_plan(
     races = db.list_race_dates(user_id)
     # Same story for the rider's measured capacities: an input, never stored.
     # ``for_user`` never raises - an unmeasured rider yields an all-None
-    # profile, which builds exactly the population-constant prescription.
-    profile = rider.for_user(user_id)
+    # profile, which builds exactly the population-constant prescription. Read
+    # through the cache: deriving it decompresses months of streams, and race
+    # CRUD reflows on a request thread.
+    profile = profile_cache.for_user(user_id)
     try:
         generated = generate_plan(
             plan["name"], start, int(plan["weeks"]),

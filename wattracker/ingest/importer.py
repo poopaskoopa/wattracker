@@ -534,7 +534,15 @@ def _zwo_fraction_profile(zwo_str: str) -> List[float]:
                     out.extend(on)
                     out.extend(off)
             elif tag == "freeride":
-                return []  # no objective target profile
+                # No objective target profile, so this workout cannot be
+                # completion-matched on shape. KNOWN GAP since sprints became
+                # untargeted freeride blocks: a sprint session now falls back
+                # to the duration/TSS match alone. Acceptable - a 12s maximal
+                # effort was never trackable against an ERG target anyway -
+                # but if sprints ever become plan-scheduled (see the goal
+                # work) this wants revisiting, e.g. by matching only the
+                # targeted blocks and ignoring the free ones.
+                return []
         except (KeyError, TypeError, ValueError):
             return []
     return out

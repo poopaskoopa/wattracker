@@ -18,6 +18,7 @@ import xml.etree.ElementTree as ET
 import pytest
 
 from wattracker import db
+from wattracker.metrics import profile_cache
 from wattracker.metrics.rider import RiderMetrics
 from wattracker.prescribe import plan as planmod
 from wattracker.prescribe import planner, reflow, zwo
@@ -297,7 +298,13 @@ def _seed_plan(user_id, hours=6.0, start=MONDAY, weeks=4):
 
 
 def _use_profile(monkeypatch, profile):
-    monkeypatch.setattr(reflow.rider, "for_user", lambda *a, **k: profile)
+    """Pin the profile every consumer sees.
+
+    Reflow, adapt and the web routes all read through ``metrics.profile_cache``
+    (deriving a profile decompresses months of streams), so patching that one
+    accessor pins the rider everywhere at once.
+    """
+    monkeypatch.setattr(profile_cache, "for_user", lambda *a, **k: profile)
 
 
 def _rows(user_id, plan_id):

@@ -1351,6 +1351,27 @@ def plan_workouts_for_plan(
         conn.close()
 
 
+def plan_workout_dates(
+    user_id: int, start_date: str, end_date: str, path: Optional[str] = None
+) -> List[str]:
+    """Distinct dates the user has a plan workout on, within an inclusive range.
+
+    Just the dates: this answers "which days does this rider ride?", which is
+    what race handling needs to place post-race recovery days, without
+    inflating a single stored .zwo.
+    """
+    conn = connect(path)
+    try:
+        rows = conn.execute(
+            "SELECT DISTINCT date FROM plan_workouts WHERE user_id = ? "
+            "AND date >= ? AND date <= ? ORDER BY date ASC",
+            (user_id, start_date, end_date),
+        ).fetchall()
+        return [r["date"] for r in rows]
+    finally:
+        conn.close()
+
+
 def plan_workouts_for_month(
     user_id: int, year: int, month: int, path: Optional[str] = None
 ) -> List[dict]:
