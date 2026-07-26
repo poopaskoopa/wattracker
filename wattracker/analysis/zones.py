@@ -4,6 +4,7 @@ from __future__ import annotations
 import datetime as _dt
 import math
 import threading
+from collections.abc import Mapping, Sequence
 from collections import deque
 from typing import Iterable, Optional
 
@@ -46,7 +47,7 @@ def _as_utc_naive(value: Optional[_dt.datetime]) -> _dt.datetime:
 def _finite(value) -> Optional[float]:
     try:
         number = float(value)
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
         return None
     return number if math.isfinite(number) else None
 
@@ -77,14 +78,20 @@ def _delta(a, b) -> Optional[float]:
         return None
     try:
         return float((right - left).total_seconds()) if isinstance(left, _dt.datetime) else right - left
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
         return None
+
+
+def _safe_samples(value) -> Sequence:
+    if isinstance(value, Sequence) and not isinstance(value, (str, bytes, bytearray)):
+        return value
+    return ()
 
 
 def _sample_intervals(values: list, timestamps: Optional[list]) -> Iterable[tuple[object, float, bool]]:
     """Yield (sample, seconds, continuous) without inventing time for FIT gaps."""
-    values = values or []
-    timestamps = timestamps or []
+    values = _safe_samples(values)
+    timestamps = _safe_samples(timestamps)
     have_times = any(t is not None for t in timestamps)
     if not have_times:
         for value in values:
@@ -151,7 +158,7 @@ def resolve_current_ftp(user_id: int) -> dict:
     usable = False
     for activity in db.full_activities(user_id):
         streams = activity.get("streams")
-        if not isinstance(streams, dict):
+        if not isinstance(streams, Mapping):
             continue
         power = streams.get("power")
         if not isinstance(power, (list, tuple)) or not power:
@@ -230,9 +237,12 @@ def estimate_hr_max(activities: list[dict], now: Optional[_dt.datetime] = None) 
         when = parse_naive(activity.get("start_time"))
         if when is None or when < cutoff or when > now:
             continue
-        streams = activity.get("streams") or {}
+        streams = activity.get("streams")
+        if not isinstance(streams, Mapping):
+            streams = {}
         peak, valid_s = _rolling_peak(
-            streams.get("heartrate") or [], streams.get("time") or []
+            _safe_samples(streams.get("heartrate")),
+            _safe_samples(streams.get("time")),
         )
         total_valid += valid_s
         if peak is not None and valid_s >= 600.0:
@@ -354,15 +364,25 @@ def time_in_zones(values: list, timestamps: list, anchor: Optional[float], defin
 
 
 def activity_zone_summary(user_id: int, activity: dict) -> dict:
-    streams = activity.get("streams") or {}
-    timestamps = streams.get("time") or []
+    streams = activity.get("streams")
+    if not isinstance(streams, Mapping):
+        streams = {}
+    timestamps = _safe_samples(streams.get("time"))
     ftp = resolve_activity_ftp(user_id, activity)
     hrmax = resolve_hr_max(user_id)
     power = time_in_zones(
-        streams.get("power") or [], timestamps, ftp.get("value"), POWER_ZONES, "power"
+        _safe_samples(streams.get("power")),
+        timestamps,
+        ftp.get("value"),
+        POWER_ZONES,
+        "power",
     )
     heart_rate = time_in_zones(
-        streams.get("heartrate") or [], timestamps, hrmax.get("value"), HR_ZONES, "heart-rate"
+        _safe_samples(streams.get("heartrate")),
+        timestamps,
+        hrmax.get("value"),
+        HR_ZONES,
+        "heart-rate",
     )
     power["anchor"] = ftp.get("value")
     power["source"] = ftp.get("source")
