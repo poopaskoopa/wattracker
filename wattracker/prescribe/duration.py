@@ -88,7 +88,12 @@ def _finite_number(value: object) -> float | None:
     # would turn a serialization mistake into a large recommendation change.
     if isinstance(value, bool) or not isinstance(value, Real):
         return None
-    number = float(value)
+    try:
+        number = float(value)
+    except Exception:
+        # Real implementations can still reject conversion, and extremely large
+        # integers overflow float. Optional profile data must never gate planning.
+        return None
     return number if math.isfinite(number) else None
 
 
@@ -127,7 +132,11 @@ def recommend_weeks(
     hours_per_week: object = None,
 ) -> Recommendation:
     """Recommend a plan length without rejecting incomplete profile data."""
-    normalized = goal_key.strip().lower() if isinstance(goal_key, str) else ""
+    try:
+        normalized = goal_key.strip().lower() if isinstance(goal_key, str) else ""
+    except Exception:
+        # A hostile str subclass is malformed input, equivalent to an unknown key.
+        normalized = ""
     baseline = _BASELINES.get(normalized, _DEFAULT)
     extra, reasons = _extra_weeks(ctl, hours_per_week)
     rationale = baseline.rationale
