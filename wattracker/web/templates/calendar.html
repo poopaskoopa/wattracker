@@ -63,8 +63,8 @@
     {% for week in weeks %}
         <tr>
         {% for cell in week %}
-            <td class="cal-cell {{ 'other-month' if not cell.in_month else '' }} {{ 'cal-ooto-day' if cell.ooto else '' }}">
-                <div class="cal-day">{{ cell.day }}{% if cell.ooto %} <span class="cal-ooto-tag">OOTO</span>{% endif %}</div>
+            <td class="cal-cell {{ 'other-month' if not cell.in_month else '' }} {{ 'cal-ooto-day' if cell.ooto else '' }} {{ 'cal-race-day' if cell.race else '' }}">
+                <div class="cal-day">{{ cell.day }}{% if cell.ooto %} <span class="cal-ooto-tag">OOTO</span>{% endif %}{% if cell.race %} <span class="cal-race-tag cal-race-{{ cell.race.priority }}" title="{{ cell.race.name or 'Race' }} — priority {{ cell.race.priority }}">{{ cell.race.priority }}</span>{% endif %}</div>
                 {% for w in cell.workouts %}
                     <div class="cal-workout cal-{{ w.type }}{{ ' cal-completed' if w.completed_activity_id else '' }}{{ ' cal-adapted' if w.adapted else '' }}{{ ' cal-skipped' if w.skipped else '' }}{{ ' cal-missed' if w.missed else '' }}"
                          {% if not w.standalone %}
@@ -107,6 +107,43 @@
     </ul>
     {% else %}
     <p class="hint">No out-of-office ranges set.</p>
+    {% endif %}
+
+    <h3>Races</h3>
+    <p class="hint">Races you plan to do. No workout is scheduled on race day.
+        An <strong>A</strong> race gets a two-week taper (same intensity,
+        shorter sessions) and easy days afterwards; a <strong>B</strong> race
+        just softens the hard day either side.</p>
+    <form method="post" action="/race/add" class="ooto-form">
+        <label>Date <input type="date" name="date" required></label>
+        <label>Priority
+            <select name="priority">
+                <option value="A">A &mdash; important</option>
+                <option value="B" selected>B &mdash; casual</option>
+            </select>
+        </label>
+        <label>Name <input type="text" name="name" placeholder="optional"></label>
+        <label>Duration (min)
+            <input type="number" name="duration_min" min="1" step="1"
+                   placeholder="optional"></label>
+        <button type="submit">Add race</button>
+    </form>
+    {% if race_dates %}
+    <ul class="ooto-list">
+        {% for r in race_dates %}
+        <li>
+            <span class="nowrap">{{ r.date }}</span>
+            <span class="cal-race-tag cal-race-{{ r.priority }}">{{ r.priority }}</span>
+            {% if r.name %}<span class="hint">{{ r.name }}</span>{% endif %}
+            {% if r.duration_min %}<span class="hint">{{ r.duration_min }} min</span>{% endif %}
+            <form method="post" action="/race/{{ r.id }}/delete" style="display:inline">
+                <button type="submit" class="link-btn">remove</button>
+            </form>
+        </li>
+        {% endfor %}
+    </ul>
+    {% else %}
+    <p class="hint">No races planned.</p>
     {% endif %}
 </aside>
 </div>

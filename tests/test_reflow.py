@@ -75,7 +75,7 @@ def test_reflow_of_an_unmodified_recipe_changes_nothing(user_id):
 
     assert result == {"status": "ok", "updated": 0, "inserted": 0, "deleted": 0,
                       "skipped_locked": 0, "raced_lost": 0, "failed": 0,
-                      "conflicts": 0}
+                      "conflicts": 0, "races": [], "race_conflicts": []}
     after = _rows(user_id, plan_id)
     assert after == before  # every field, including the stored .zwo, byte-identical
 
@@ -250,18 +250,23 @@ def test_adding_and_removing_a_training_day_inserts_and_deletes(user_id):
     assert 4 in past_weekdays
 
 
-def test_reflow_clears_adapted_on_rows_it_claims(user_id):
+def test_reflow_leaves_adapted_rows_alone(user_id):
+    """An adaptation is a considered response to the rider's state: an
+    unrelated reflow must not discard it. (A race window is the one exception -
+    see tests/test_races_plan.py, where the race wins and `adapted` is cleared.)
+    """
     plan_id = _seed_plan(user_id)
     target = _future(user_id, plan_id)[0]
     _sql("UPDATE plan_workouts SET adapted = 'recovery', "
          "adapted_at = '2026-07-15T09:00:00' WHERE id = ?", target["id"])
     _set_recipe(user_id, plan_id, reflow.build_recipe([0, 2, 4], 12.0, 1))
 
-    reflow.reflow_plan(user_id, plan_id, now=NOW)
+    result = reflow.reflow_plan(user_id, plan_id, now=NOW)
 
-    claimed = db.get_plan_workout(user_id, target["id"])
-    assert claimed["duration_s"] != target["duration_s"]  # it really was rewritten
-    assert claimed["adapted"] is None and claimed["adapted_at"] is None
+    kept = db.get_plan_workout(user_id, target["id"])
+    assert kept["duration_s"] == target["duration_s"]
+    assert kept["adapted"] == "recovery"
+    assert result["skipped_locked"] >= 1
 
 
 def test_inserted_rows_carry_generated_origin(user_id):

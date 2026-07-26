@@ -18,6 +18,14 @@ the calendar detail, ERG targets and .zwo export all see the same content):
 - progress   -> (no overreach, no plateau) no adaptation. Planned volume is
                 held flat and must never increase week to week, so a healthy
                 "keep going" signal leaves upcoming workouts untouched.
+
+Post-race suppression: a race spikes ATL and craters TSB, so detection reports
+``overreach`` for days afterwards and would gut the following week. That
+fatigue is the EXPECTED cost of racing, not a training error, so adaptation is
+suppressed for ``POST_RACE_QUIET_DAYS`` after any race (either priority) and
+the plan's own post-race recovery days are left to do their job. Detection
+itself stays pure - it still reports what the numbers say; only the response
+is held back.
 """
 from __future__ import annotations
 
@@ -37,9 +45,12 @@ ADAPT_WINDOW_DAYS = 7
 RECOVERY_DURATION_FACTOR = 0.75
 MIN_DURATION_MIN = 20
 
+POST_RACE_QUIET_DAYS = 10
+
 OVERREACH = "overreach"
 PLATEAU = "plateau"
 PROGRESS = "progress"
+POST_RACE = "post_race"
 
 HARD_TYPES = ("vo2max", "threshold", "sweet_spot")
 _STIMULUS_SWAP = {"vo2max": "threshold", "threshold": "vo2max",
@@ -109,8 +120,27 @@ def apply_adaptations(user_id: int, state, now: Optional[_dt.datetime] = None) -
     now = now or utc_now()
     today = now.date().isoformat()
     horizon = (now.date() + _dt.timedelta(days=ADAPT_WINDOW_DAYS)).isoformat()
-    status = detection_status(state)
 
+    # Post-race quiet period. A race spikes ATL and drops TSB, so detection
+    # says "overreach" and the policy above would rewrite the whole next week
+    # as recovery rides - on top of the recovery days the plan already put
+    # there for the race. Expected fatigue is not overreaching: hold the
+    # response back and let the planned recovery run.
+    since = (now.date() - _dt.timedelta(days=POST_RACE_QUIET_DAYS)).isoformat()
+    recent_races = db.races_in_range(user_id, since, today)
+    if recent_races:
+        return {
+            "status": POST_RACE,
+            "adjusted": 0,
+            "upcoming": db.upcoming_adapted_counts(user_id, today),
+            "window_days": ADAPT_WINDOW_DAYS,
+            "post_race_until": (
+                _dt.date.fromisoformat(max(r["date"] for r in recent_races))
+                + _dt.timedelta(days=POST_RACE_QUIET_DAYS)
+            ).isoformat(),
+        }
+
+    status = detection_status(state)
     adjusted = 0
     for w in db.adaptable_plan_workouts(user_id, today, horizon):
         change = _plan_change(status, w["type"], w["duration_s"] / 60.0)
@@ -154,6 +184,12 @@ BANNER = {
         "headline": "Plateau detected",
         "detail": "Fitness has stalled - upcoming hard days get a different "
                   "stimulus to break through.",
+    },
+    POST_RACE: {
+        "level": "ok",
+        "headline": "Recovering from a race",
+        "detail": "Post-race fatigue is expected, so automatic plan "
+                  "adjustments are paused while you recover.",
     },
     PROGRESS: {
         "level": "ok",
