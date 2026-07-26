@@ -77,13 +77,29 @@ def _eligible(row: dict, today: str) -> bool:
     )
 
 
-def _differs(stored: dict, fresh: dict) -> bool:
-    return (
+# tss is a float that has been through SQLite REAL and back; compare it with a
+# tolerance rather than exactly.
+_TSS_EPSILON = 0.05
+
+
+def _differs(stored: dict, fresh: dict, fresh_zwo: str) -> bool:
+    """Does the stored row disagree with the freshly computed workout?
+
+    This covers everything the row stores, not just its labels: a change to
+    ``build_workout`` that leaves name/type/variant/duration alone but moves
+    the segments or the TSS still has to be detected, otherwise plans keep a
+    stale prescription forever while reflow reports zero updates.
+    """
+    if (
         stored["name"] != fresh["name"]
         or stored["type"] != fresh["type"]
         or stored.get("variant") != fresh.get("variant")
         or int(stored["duration_s"]) != int(fresh["duration_s"])
-    )
+    ):
+        return True
+    if abs(float(stored["tss"]) - float(fresh["tss"])) > _TSS_EPSILON:
+        return True
+    return stored.get("zwo_or_segments") != fresh_zwo
 
 
 def _by_date(rows: List[dict]) -> tuple:
@@ -93,6 +109,11 @@ def _by_date(rows: List[dict]) -> tuple:
     within a week), so date is a safe key. A date holding several rows means
     something outside the generator wrote there - report it as a conflict and
     leave every row on that date alone rather than guessing which one is ours.
+
+    KNOWN LIMITATION: the index is per-plan, so reflowing plan A can insert a
+    workout on a date where a DIFFERENT plan already has one. The active-plan
+    concept largely mitigates this in practice; a real fix needs a product
+    decision about what several plans on one date should mean.
     """
     index: Dict[str, dict] = {}
     conflicts = set()
@@ -110,13 +131,28 @@ def reflow_plan(
 ) -> Dict:
     """Recompute `plan_id` from its recipe and apply the diff. Idempotent.
 
-    Returns {status, updated, inserted, deleted, skipped_locked, conflicts} on
-    success, or {status: 'not_reflowable', reason} having changed nothing.
+    Returns {status, updated, inserted, deleted, skipped_locked, raced_lost,
+    failed, conflicts} on success, or {status: 'not_reflowable', reason}
+    having changed nothing.
 
-    ``skipped_locked`` counts rows that WOULD have changed but are past-dated,
-    completed or not generator-owned. It is stable across runs (a locked row
-    stays locked and keeps being counted); reflowing an unmodified recipe
-    reports zero across the board.
+    ``skipped_locked`` counts rows that WOULD have changed but were already
+    past-dated, completed or not generator-owned when they were read. It is
+    stable across runs (a locked row stays locked and keeps being counted).
+
+    ``raced_lost`` counts rows that looked eligible at read time but were
+    refused by the database guard at write time - they were completed, or
+    midnight rolled over, in between. The two are kept apart deliberately:
+    ``skipped_locked`` is "we knew it was locked", ``raced_lost`` is "it became
+    locked underneath us".
+
+    ``failed`` counts rows whose write raised. Each arm commits on its own
+    connection, so there is no enclosing transaction to roll back; instead a
+    failing row is logged, counted and stepped over so the remaining rows still
+    get their diff applied and the caller still gets its counts. That is safe
+    because reflow is self-healing: re-running after a partial write converges
+    on exactly the state a clean generation produces.
+
+    Reflowing an unmodified recipe reports zero across the board.
     """
     plan = db.get_plan(user_id, plan_id)
     if plan is None:
@@ -153,54 +189,73 @@ def reflow_plan(
         db.plan_workouts_for_plan(user_id, plan_id, include_zwo=True)
     )
 
-    counts = {"updated": 0, "inserted": 0, "deleted": 0,
-              "skipped_locked": 0, "conflicts": len(conflicted)}
+    counts = {"updated": 0, "inserted": 0, "deleted": 0, "skipped_locked": 0,
+              "raced_lost": 0, "failed": 0, "conflicts": len(conflicted)}
 
     for date in sorted(set(fresh_by_date) | set(stored_by_date)):
         if date in conflicted:
             continue  # already counted; leave every row on that date alone
         fresh = fresh_by_date.get(date)
         stored = stored_by_date.get(date)
-
-        if fresh is not None and stored is None:
-            # New training day. Past dates are never back-filled: a workout
-            # that never existed cannot retroactively have been ridden.
-            if date <= today:
-                counts["skipped_locked"] += 1
-                continue
-            zwo_str = zwo.zwo_string(fresh["session"])
-            db.add_plan_workout(
-                plan_id, user_id, date, fresh["name"], fresh["type"],
-                fresh["duration_s"], fresh["tss"], zwo_str,
-                variant=fresh.get("variant"), origin=GENERATED,
+        try:
+            _apply_one(user_id, plan_id, date, today, fresh, stored, counts)
+        except Exception:  # noqa: BLE001 - one bad row must not sink the plan
+            counts["failed"] += 1
+            log.warning(
+                "reflow of plan %s failed on %s (workout %s)", plan_id, date,
+                (stored or {}).get("id"), exc_info=True,
             )
-            counts["inserted"] += 1
-            reexport_workout(user_id, date, fresh["name"], fresh["name"], zwo_str)
-            continue
-
-        if fresh is None and stored is not None:
-            # The recipe no longer wants a workout here.
-            if not _eligible(stored, today):
-                counts["skipped_locked"] += 1
-                continue
-            if db.delete_generated_plan_workout(user_id, stored["id"], today):
-                counts["deleted"] += 1
-                reexport_workout(user_id, date, stored["name"], None)
-            continue
-
-        if fresh is None or stored is None or not _differs(stored, fresh):
-            continue
-        if not _eligible(stored, today):
-            counts["skipped_locked"] += 1
-            continue
-        zwo_str = zwo.zwo_string(fresh["session"])
-        ok = db.replace_plan_workout_content(
-            user_id, stored["id"], fresh["name"], fresh["type"],
-            fresh["duration_s"], fresh["tss"], zwo_str, today,
-            variant=fresh.get("variant"),
-        )
-        if ok:
-            counts["updated"] += 1
-            reexport_workout(user_id, date, stored["name"], fresh["name"], zwo_str)
 
     return {"status": "ok", **counts}
+
+
+def _apply_one(user_id: int, plan_id: int, date: str, today: str,
+               fresh: Optional[dict], stored: Optional[dict],
+               counts: Dict) -> None:
+    """Apply one date's diff, mutating `counts`. Raises on a write failure."""
+    if fresh is not None and stored is None:
+        # New training day. Past dates are never back-filled: a workout
+        # that never existed cannot retroactively have been ridden.
+        if date <= today:
+            counts["skipped_locked"] += 1
+            return
+        zwo_str = zwo.zwo_string(fresh["session"])
+        db.add_plan_workout(
+            plan_id, user_id, date, fresh["name"], fresh["type"],
+            fresh["duration_s"], fresh["tss"], zwo_str,
+            variant=fresh.get("variant"), origin=GENERATED,
+        )
+        counts["inserted"] += 1
+        reexport_workout(user_id, date, fresh["name"], fresh["name"], zwo_str)
+        return
+
+    if fresh is None and stored is not None:
+        # The recipe no longer wants a workout here.
+        if not _eligible(stored, today):
+            counts["skipped_locked"] += 1
+            return
+        if db.delete_generated_plan_workout(user_id, stored["id"], today):
+            counts["deleted"] += 1
+            reexport_workout(user_id, date, stored["name"], None)
+        else:
+            counts["raced_lost"] += 1
+        return
+
+    if fresh is None or stored is None:
+        return
+    zwo_str = zwo.zwo_string(fresh["session"])
+    if not _differs(stored, fresh, zwo_str):
+        return
+    if not _eligible(stored, today):
+        counts["skipped_locked"] += 1
+        return
+    ok = db.replace_plan_workout_content(
+        user_id, stored["id"], fresh["name"], fresh["type"],
+        fresh["duration_s"], fresh["tss"], zwo_str, today,
+        variant=fresh.get("variant"),
+    )
+    if ok:
+        counts["updated"] += 1
+        reexport_workout(user_id, date, stored["name"], fresh["name"], zwo_str)
+    else:
+        counts["raced_lost"] += 1
