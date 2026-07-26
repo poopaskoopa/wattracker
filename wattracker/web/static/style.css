@@ -426,7 +426,7 @@ button.danger.link-btn { border: none; color: var(--alert); }
 .ride-chart-canvas { position: relative; height: clamp(260px, 28vw, 400px); min-height: 0; }
 .ride-chart-block canvas { width: 100% !important; height: 100% !important; position: relative;
     z-index: 1; }
-.ride-chart-metrics { position: absolute; z-index: 2; top: 2.25rem; left: 50%;
+.ride-chart-metrics { position: absolute; z-index: 2; top: 20%; left: 50%;
     transform: translateX(-50%); display: flex; align-items: baseline; justify-content: center;
     gap: clamp(1rem, 5vw, 4rem); width: min(80%, 680px); pointer-events: none;
     color: rgba(232, 237, 243, 0.78); text-shadow: 0 1px 5px #10161d, 0 0 12px #10161d; }
@@ -482,7 +482,7 @@ body.ride-chart-fullscreen-open { overflow: hidden; }
 @media (max-width: 560px) {
     .ride-chart-heading { align-items: flex-start; }
     .ride-chart-actions { justify-content: flex-start; }
-    .ride-chart-metrics { top: 2rem; gap: 0.8rem; width: 86%; }
+    .ride-chart-metrics { top: 18%; gap: 0.8rem; width: 86%; }
     .ride-chart-metrics strong { font-size: 24px; }
     .ride-chart-metrics small { font-size: 0.68rem; }
 }
