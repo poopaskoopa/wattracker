@@ -416,36 +416,24 @@ WP-8 (ride)                 ← after all of the above are on main
 | WP-3 activity detail | Agent 1 | **merged** `2243771` |
 | WP-6 tables | Agent 2 | **merged** `52480ad` |
 | WP-5 workout SVG | Agent 2 | **merged** (cap reinstated — see below) |
-| WP-7 calendar | Agent 2 | not started — **next for Agent 2** |
-| WP-8 ride | unassigned | after all of the above |
+| WP-7 calendar | Agent 2 | **merged** `6717ff9` |
+| WP-8 ride | unassigned | **the only package left** |
 
-**Agent 2 — WP-3 has landed, so all of Agent 1's packages are on `main`.**
-Rebase on current `main` and start WP-6; nothing is in flight against you now.
+**All seven refresh packages are merged.** Only WP-8 (ride) is left, and it is
+deliberately last: `ride.html` is ~1600 lines of live WebSocket rendering,
+fullscreen handling and device LEDs, and it is the hardest file in the app to
+verify without a trainer and sensors on the other end. Keep it to swapping
+literals for tokens and series colours for `--s-*`. Do not restructure the ride
+chart, and do not touch the WebSocket or fullscreen paths.
 
-Two additions to shared code since you cut `agent2/ui-wp4`:
-- `applyLegendUnits` has an `independent: true` unit flag — a legend entry that
-  toggles on its own and takes no part in isolate/restore (the elevation band).
-- `chart-theme.js` has `strideTicks(maxTicks)`, the non-calendar sibling of
-  `dateAxisTicks`, for stacked panels on a numeric axis.
-
-**Correction to §1.9, learned the hard way in WP-5.** The spec said to lift the
-`.profile-wrap` 760px cap once strokes were non-scaling and labels CSS-sized.
-That was wrong: `vector-effect: non-scaling-stroke` governs **strokes only**.
-SVG text scales with the viewBox like everything else and no CSS can pin it, so
-uncapped in a 1440px main the 560-unit viewBox scales 2.45x and the axis labels
-render at 28px against 16px body text. The cap is back at 760px (~13px labels),
-and label `font-size` is back to `10px` rather than the `--fs-xs` rem token —
-inside a viewBox a rem is a false unit, resolving against the root font size and
-then being scaled anyway. Everything else WP-5 did is kept: per-zone fills on a
-single-hue opacity ramp, non-scaling strokes, and the missing-FTP guards.
-
-One trap worth knowing before WP-7, which will touch the calendar's cells: a
-class selector like `.chart-panels canvas { display: block }` outranks the UA
-sheet's `[hidden] { display: none }`, so an element the page hides still lays
-out. WP-3 lost 300px of page to this. If you write a `display` rule against a
-selector whose elements are ever `hidden`, pair it with a `[hidden]` rule.
-
-Read the WP-0 "LANDED" notes above before you start. `chart-theme.js` grew a
+Two things already point at it:
+- `ride.html:339` reads `--grid-strong` rather than `--grid`. That token was
+  added because the analysis-page gridline weight looked too faint for a screen
+  read at arm's length, but the value was picked by eye and has never been seen
+  on an actual bike. Worth confirming before anything else changes there.
+- `.erg-toggle.erg-on` has ink swept to `--surface-inset` where it semantically
+  wants `--on-accent`. The two are value-identical today, so it is a naming fix,
+  not a visual one.
 real shared API during WP-1/WP-2 — six helpers, plus two Chart.js v4 traps
 written down. WP-6 should not reinvent any of it.
 
