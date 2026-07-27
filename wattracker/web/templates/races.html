@@ -84,42 +84,42 @@
 <p class="hint">Click a column header to sort. Power columns sort by watts
     (order is the same in W/kg).</p>
 <div class="power-table-wrap">
-<table class="race-table" id="raceTable">
+<table class="data-table race-table" id="raceTable">
     <thead><tr>
-        <th class="sortable" data-type="text">Date</th>
+        <th class="sortable num" data-type="text">Date</th>
         <th class="sortable" data-type="text">Event</th>
-        <th class="sortable" data-type="num">Place</th>
+        <th class="sortable num" data-type="num">Place</th>
         <th class="sortable" data-type="text">Cat</th>
-        <th class="sortable" data-type="num">Duration</th>
-        <th class="sortable" data-type="num">Distance</th>
-        <th class="sortable" data-type="num">Avg HR</th>
-        <th class="sortable" data-type="num">Max HR</th>
-        <th class="sortable" data-type="num">Weight</th>
-        <th class="sortable" data-type="num">Avg&nbsp;<span class="unit-label">W</span></th>
-        <th class="sortable" data-type="num">NP&nbsp;(<span class="unit-label">W</span>)</th>
-        {% for l in duration_labels %}<th class="sortable" data-type="num">{{ l }}</th>{% endfor %}
-        <th class="sortable" data-type="num">IF</th><th></th></tr></thead>
+        <th class="sortable num" data-type="num">Duration</th>
+        <th class="sortable num" data-type="num">Distance</th>
+        <th class="sortable num" data-type="num">Avg HR</th>
+        <th class="sortable num" data-type="num">Max HR</th>
+        <th class="sortable num" data-type="num">Weight</th>
+        <th class="sortable num" data-type="num">Avg&nbsp;<span class="unit-label">W</span></th>
+        <th class="sortable num" data-type="num">NP&nbsp;(<span class="unit-label">W</span>)</th>
+        {% for l in duration_labels %}<th class="sortable num" data-type="num">{{ l }}</th>{% endfor %}
+        <th class="sortable num" data-type="num">IF</th><th></th></tr></thead>
     <tbody>
     {% for r in results %}
         <tr>
-            <td class="nowrap" data-sort="{{ r.event_date }}">{% if r.zp_event_id %}<a href="https://zwiftpower.com/events.php?zid={{ r.zp_event_id }}" target="_blank" rel="noopener">{{ r.event_date }}</a>{% else %}{{ r.event_date }}{% endif %}</td>
+            <td class="nowrap num" data-sort="{{ r.event_date }}">{% if r.zp_event_id %}<a href="https://zwiftpower.com/events.php?zid={{ r.zp_event_id }}" target="_blank" rel="noopener">{{ r.event_date }}</a>{% else %}{{ r.event_date }}{% endif %}</td>
             <td class="nowrap" data-sort="{{ r.event_title }}">
                 {% if r.activity_id %}<a href="/activity/{{ r.activity_id }}">{{ r.event_title }}</a>
                 {% else %}{{ r.event_title }}{% endif %}
             </td>
-            <td class="place" data-sort="{{ r.place if r.place else '' }}">{% if r.place in (1, 2, 3) %}{{ trophy(r.place) }}{% else %}{{ r.position or '—' }}{% endif %}</td>
+            <td class="place num" data-sort="{{ r.place if r.place else '' }}">{% if r.place in (1, 2, 3) %}{{ trophy(r.place) }}{% else %}{{ r.position or '—' }}{% endif %}</td>
             <td data-sort="{{ r.category or '' }}">{{ r.category or '—' }}</td>
-            <td class="nowrap" data-sort="{{ r.duration_s or 0 }}">{{ r.duration_fmt or '—' }}</td>
-            <td class="nowrap" data-sort="{{ r.distance_km if r.distance_km else '' }}">{{ ('%g'|format(r.distance_km|round(1))) ~ ' km' if r.distance_km else '—' }}</td>
-            <td class="nowrap" data-sort="{{ r.avg_hr if r.avg_hr is not none else '' }}">{{ (r.avg_hr|round(0)|int) ~ ' bpm' if r.avg_hr is not none else '—' }}</td>
-            <td class="nowrap" data-sort="{{ r.max_hr if r.max_hr is not none else '' }}">{{ (r.max_hr|round(0)|int) ~ ' bpm' if r.max_hr is not none else '—' }}</td>
-            <td class="nowrap" data-sort="{{ r.weight_kg if r.weight_kg is not none else '' }}">{{ ('%.1f'|format(r.weight_kg)) ~ ' kg' if r.weight_kg is not none else '—' }}</td>
-            <td data-sort="{{ r.avg_power|round(0)|int if r.avg_power else '' }}">{% if r.avg_power %}<span class="pw" data-w="{{ r.avg_power|round(0)|int }}">{{ r.avg_power|round(0)|int }}</span>{% else %}—{% endif %}</td>
-            <td data-sort="{{ r.np|round(0)|int if r.np else '' }}">{% if r.np %}<span class="pw" data-w="{{ r.np|round(0)|int }}">{{ r.np|round(0)|int }}</span>{% else %}—{% endif %}</td>
+            <td class="nowrap num" data-sort="{{ r.duration_s or 0 }}">{{ r.duration_fmt or '—' }}</td>
+            <td class="nowrap num" data-sort="{{ r.distance_km if r.distance_km else '' }}">{{ ('%g'|format(r.distance_km|round(1))) ~ ' km' if r.distance_km else '—' }}</td>
+            <td class="nowrap num" data-sort="{{ r.avg_hr if r.avg_hr is not none else '' }}">{{ (r.avg_hr|round(0)|int) ~ ' bpm' if r.avg_hr is not none else '—' }}</td>
+            <td class="nowrap num" data-sort="{{ r.max_hr if r.max_hr is not none else '' }}">{{ (r.max_hr|round(0)|int) ~ ' bpm' if r.max_hr is not none else '—' }}</td>
+            <td class="nowrap num" data-sort="{{ r.weight_kg if r.weight_kg is not none else '' }}">{{ ('%.1f'|format(r.weight_kg)) ~ ' kg' if r.weight_kg is not none else '—' }}</td>
+            <td class="num" data-sort="{{ r.avg_power|round(0)|int if r.avg_power else '' }}">{% if r.avg_power %}<span class="pw" data-w="{{ r.avg_power|round(0)|int }}">{{ r.avg_power|round(0)|int }}</span>{% else %}—{% endif %}</td>
+            <td class="num" data-sort="{{ r.np|round(0)|int if r.np else '' }}">{% if r.np %}<span class="pw" data-w="{{ r.np|round(0)|int }}">{{ r.np|round(0)|int }}</span>{% else %}—{% endif %}</td>
             {% for d in durations %}
-            <td data-sort="{{ r.power.get(d) if r.power.get(d) else '' }}">{% if r.power.get(d) %}<span class="pw" data-w="{{ r.power.get(d) }}">{{ r.power.get(d) }}</span>{% else %}—{% endif %}</td>
+            <td class="num" data-sort="{{ r.power.get(d) if r.power.get(d) else '' }}">{% if r.power.get(d) %}<span class="pw" data-w="{{ r.power.get(d) }}">{{ r.power.get(d) }}</span>{% else %}—{% endif %}</td>
             {% endfor %}
-            <td data-sort="{{ r.if_|round(2) if r.if_ else '' }}">{{ r.if_|round(2) if r.if_ else '—' }}</td>
+            <td class="num" data-sort="{{ r.if_|round(2) if r.if_ else '' }}">{{ r.if_|round(2) if r.if_ else '—' }}</td>
             <td class="nowrap">{% if r.activity_id %}<a class="button small" href="/activity/{{ r.activity_id }}">Graphs</a>{% else %}<span class="muted">no ride data</span>{% endif %}</td>
         </tr>
     {% endfor %}
@@ -136,14 +136,14 @@
 <h3>Power profile &mdash; all-time bests (<span class="unit-label">W</span>)</h3>
 <p class="hint">Best average power across every imported ride.</p>
 <div class="power-table-wrap">
-<table class="power-table profile-table">
+<table class="data-table power-table profile-table">
     <thead>
-        <tr>{% for l in profile_labels %}<th>{{ l }}</th>{% endfor %}</tr>
+        <tr>{% for l in profile_labels %}<th class="num">{{ l }}</th>{% endfor %}</tr>
     </thead>
     <tbody>
         <tr class="bests-row">
             {% for d in profile_durations %}
-            <td>{% if bests.get(d) %}<strong><span class="pw" data-w="{{ bests.get(d) }}">{{ bests.get(d) }}</span></strong>{% else %}—{% endif %}</td>
+            <td class="num">{% if bests.get(d) %}<strong><span class="pw" data-w="{{ bests.get(d) }}">{{ bests.get(d) }}</span></strong>{% else %}—{% endif %}</td>
             {% endfor %}
         </tr>
     </tbody>

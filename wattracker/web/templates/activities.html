@@ -40,28 +40,29 @@
 {% endif %}
 
 {% if activities %}
-<table>
+<div class="table-scroll">
+<table class="data-table">
     <thead>
         <tr>
-            <th>Start</th><th>Duration</th><th>Distance</th>
-            <th>Avg Power</th><th>NP</th><th>IF</th><th>TSS</th><th>Effort</th><th></th>
+            <th class="num">Start</th><th class="num">Duration</th><th class="num">Distance</th>
+            <th class="num">Avg Power</th><th class="num">NP</th><th class="num">IF</th><th class="num">TSS</th><th>Effort</th><th></th>
         </tr>
     </thead>
     <tbody>
     {% for a in activities %}
         <tr>
-            <td>
+            <td class="num">
                 <a href="/activity/{{ a.id }}">{{ a.start_time or '&mdash;'|safe }}</a>
                 {% if a.has_duplicate %}
                 <span class="hint">also recorded in-app &mdash; counted once</span>
                 {% endif %}
             </td>
-            <td>{{ a.duration_fmt or '—' }}</td>
-            <td>{{ '%.1f'|format((a.distance_m or 0) / 1000) }} km</td>
-            <td>{{ '%.0f'|format(a.avg_power or 0) }} W</td>
-            <td>{{ '%.0f'|format(a.np or 0) }} W</td>
-            <td>{{ '%.2f'|format(a.if_ or 0) }}</td>
-            <td>{{ '%.0f'|format(a.tss or 0) }}</td>
+            <td class="num">{{ a.duration_fmt or '—' }}</td>
+            <td class="num">{{ '%.1f'|format((a.distance_m or 0) / 1000) }} km</td>
+            <td class="num">{{ '%.0f'|format(a.avg_power or 0) }} W</td>
+            <td class="num">{{ '%.0f'|format(a.np or 0) }} W</td>
+            <td class="num">{{ '%.2f'|format(a.if_ or 0) }}</td>
+            <td class="num">{{ '%.0f'|format(a.tss or 0) }}</td>
             <td>
                 {% if a.rpe %}<span class="cal-rpe">RPE {{ a.rpe }}</span>
                 {% else %}<a class="hint" href="/activity/{{ a.id }}">Rate</a>{% endif %}
@@ -71,6 +72,7 @@
     {% endfor %}
     </tbody>
 </table>
+</div>
 {% else %}
 <p>No activities imported yet. Set your Zwift folder in
    <a href="/settings">Settings</a>, then rescan &mdash; or upload a .fit file.</p>
