@@ -306,7 +306,7 @@ def test_race_table_renders_sortable_hr_weight_and_missing_values(client, monkey
     text = client.get("/races").text
     headers = [text.index(label) for label in ("Avg HR", "Max HR", "Weight")]
     assert headers == sorted(headers)
-    assert text.count('class="sortable" data-type="num"') >= 3
+    assert text.count('class="sortable num" data-type="num"') >= 3
     assert "151 bpm" in text and "189 bpm" in text and "70.2 kg" in text
     missing_row = re.search(
         r"<tr>.*?Missing Biometrics.*?</tr>", text, flags=re.DOTALL
@@ -353,7 +353,7 @@ def test_race_page_renders_period_columns_and_graph_links(client, monkeypatch):
     # Per-period columns present with values (root-cause: were pushed off a
     # 960px page; page is now wide + first column compact).
     for label in ("1s", "5s", "15s", "30s", "1m", "5m", "20m"):
-        assert f"<th>{label}</th>" in text
+        assert f'<th class="num">{label}</th>' in text
     assert 'data-w="420"' in text          # w15 value rendered
     assert f'href="/activity/{aid}"' in text  # race links to its ride graphs
     assert 'class="wide"' in text          # widened page
@@ -627,7 +627,7 @@ def test_races_refresh_route_persists_id_and_shows_results(client, monkeypatch):
     assert "Power profile" in r.text and "all-time bests" in r.text
     # Power tables show the spec'd period columns (incl. 15s in the profile).
     for label in ("1s", "5s", "15s", "30s", "2m", "20m", "40m", "1h"):
-        assert f"<th>{label}</th>" in r.text
+        assert f'<th class="num">{label}</th>' in r.text
 
 
 def test_races_page_shows_stale_cache_without_network(client, monkeypatch):
@@ -674,7 +674,7 @@ def test_power_profile_section_and_toggle_disabled_without_weight(client):
     _activity(uid, "2026-06-01T10:00:00", 3600, 260.0, if_=0.9)
     client.post("/races/refresh", data={"rider_id": ""})
     text = client.get("/races").text
-    assert "Power profile" in text and "<th>15s</th>" in text
+    assert "Power profile" in text and '<th class="num">15s</th>' in text
     # No weight from any source: W/kg toggle disabled with a Settings hint.
     assert 'id="unitWkg"' in text and "disabled" in text
     assert "set it in" in text and "/settings" in text

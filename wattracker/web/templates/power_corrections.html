@@ -30,17 +30,17 @@
         <p><strong>Inclusive indices {{ candidate.start_index }}–{{ candidate.end_index }}</strong> ({{ candidate.sample_count }} sample{% if candidate.sample_count != 1 %}s{% endif %})</p>
         {% if candidate.preview_truncated %}<p class="hint">Preview abbreviated{% if candidate.applicable %}; applying still masks the entire inclusive range{% endif %}.</p>{% endif %}
         <div class="table-scroll">
-        <table>
+        <table class="data-table">
             <caption>Before and after preview with neighboring samples</caption>
-            <thead><tr><th>Index</th><th>Timestamp</th><th>Before</th><th>After</th></tr></thead>
+            <thead><tr><th class="num">Index</th><th class="num">Timestamp</th><th class="num">Before</th><th class="num">After</th></tr></thead>
             <tbody>
             {% for before in candidate.neighbors %}
             {% set after = candidate.after[loop.index0] %}
             <tr{% if before.targeted %} class="correction-target"{% endif %}>
-                <td>{{ before.index }}</td>
-                <td>{{ before.timestamp }}</td>
-                <td>{{ before.value if before.value is not none else 'masked' }}{% if before.value is not none %} W{% endif %}</td>
-                <td>{{ after.value if after.value is not none else 'masked' }}{% if after.value is not none %} W{% endif %}</td>
+                <td class="num">{{ before.index }}</td>
+                <td class="num">{{ before.timestamp }}</td>
+                <td class="num">{{ before.value if before.value is not none else 'masked' }}{% if before.value is not none %} W{% endif %}</td>
+                <td class="num">{{ after.value if after.value is not none else 'masked' }}{% if after.value is not none %} W{% endif %}</td>
             </tr>
             {% endfor %}
             </tbody>
@@ -71,14 +71,14 @@
     <h3 id="active-corrections-title">Active corrections</h3>
     {% if corrections %}
     <div class="table-scroll">
-    <table>
-        <thead><tr><th>Activity</th><th>Inclusive indices</th><th>Reason</th><th>Applied</th><th></th></tr></thead>
+    <table class="data-table">
+        <thead><tr><th>Activity</th><th class="num">Inclusive indices</th><th>Reason</th><th class="num">Applied</th><th></th></tr></thead>
         <tbody>{% for correction in corrections %}
         <tr>
             <td>{{ correction.activity_id }} — {{ correction.start_time or 'Unknown date' }} — {{ correction.filename or 'Unnamed activity' }}</td>
-            <td>{{ correction.start_index }}–{{ correction.end_index }}</td>
+            <td class="num">{{ correction.start_index }}–{{ correction.end_index }}</td>
             <td>{{ correction.reason or '—' }}</td>
-            <td>{{ correction.created }}</td>
+            <td class="num">{{ correction.created }}</td>
             <td>
                 <form method="post" action="/profile/power-corrections/undo">
                     <input type="hidden" name="correction_id" value="{{ correction.id }}">
