@@ -41,14 +41,15 @@
 
     {% if plan_mgmt.others %}
     <h4>Other plans</h4>
-    <table class="other-plans">
-        <thead><tr><th>Name</th><th>Dates</th><th>Progress</th><th></th></tr></thead>
+    <div class="table-scroll">
+    <table class="data-table other-plans">
+        <thead><tr><th>Name</th><th class="num">Dates</th><th class="num">Progress</th><th></th></tr></thead>
         <tbody>
         {% for p in plan_mgmt.others %}
             <tr>
                 <td><a href="/plan?plan_id={{ p.id }}">{{ p.name }}</a>{% if plan and plan.plan_id == p.id %} <span class="hint">(viewing)</span>{% endif %}{% if p.model %} <span class="hint">({{ p.model.replace('_', ' ') }})</span>{% endif %}</td>
-                <td>{{ p.start_date }} &rarr; {{ p.end_date }}</td>
-                <td>{{ p.completed }}/{{ p.total }}</td>
+                <td class="num">{{ p.start_date }} &rarr; {{ p.end_date }}</td>
+                <td class="num">{{ p.completed }}/{{ p.total }}</td>
                 <td>
                     {% if p.active %}
                         <span class="badge">Active</span>
@@ -68,6 +69,7 @@
         {% endfor %}
         </tbody>
     </table>
+    </div>
     {% endif %}
 </section>
 
@@ -105,12 +107,13 @@
            <strong>Total:</strong> {{ session.total_duration // 60 }} min &middot;
            <strong>Est. TSS:</strong> {{ session.estimated_tss }}</p>
 
-        <table>
-            <thead><tr><th>#</th><th>Block</th><th>Detail</th><th>Duration</th></tr></thead>
+        <div class="table-scroll">
+        <table class="data-table">
+            <thead><tr><th class="num">#</th><th>Block</th><th>Detail</th><th class="num">Duration</th></tr></thead>
             <tbody>
             {% for s in session.segments %}
                 <tr>
-                    <td>{{ loop.index }}</td>
+                    <td class="num">{{ loop.index }}</td>
                     <td>{{ s.kind }}</td>
                     <td>
                         {% if s.kind == 'intervals' %}
@@ -123,11 +126,12 @@
                         {% else %}&mdash;{% endif %}
                         {% if s.text %}<br><em>{{ s.text }}</em>{% endif %}
                     </td>
-                    <td>{{ s.duration }}s</td>
+                    <td class="num">{{ s.duration }}s</td>
                 </tr>
             {% endfor %}
             </tbody>
         </table>
+        </div>
 
         <div class="toolbar">
             <form method="post" action="/generate/export">
@@ -446,41 +450,44 @@
         </div>
 
         {% if plan.weekly is defined %}
-        <table class="weekly-table">
-            <thead><tr><th>Week</th>{% if plan.phases and plan.phases.blocks %}<th>Phase</th>{% endif %}<th>Volume</th><th>TSS</th><th>Hard %</th></tr></thead>
+        <div class="table-scroll">
+        <table class="data-table weekly-table">
+            <thead><tr><th class="num">Week</th>{% if plan.phases and plan.phases.blocks %}<th>Phase</th>{% endif %}<th class="num">Volume</th><th class="num">TSS</th><th class="num">Hard %</th></tr></thead>
             <tbody>
             {% for wk in plan.weekly %}
                 <tr class="{{ 'recovery-week' if wk.recovery else '' }}">
-                    <td>{{ wk.week }}{{ ' (recovery)' if wk.recovery else '' }}</td>
+                    <td class="num">{{ wk.week }}{{ ' (recovery)' if wk.recovery else '' }}</td>
                     {% if plan.phases and plan.phases.blocks %}
                     <td class="phase-cell">{{ plan.phases.weeks[wk.week - 1] or '&mdash;'|safe }}</td>
                     {% endif %}
-                    <td>{{ (wk.total_s // 60) }} min</td>
-                    <td>{{ wk.total_tss }}</td>
-                    <td>{{ (wk.hard_fraction * 100)|round(0)|int }}%</td>
+                    <td class="num">{{ (wk.total_s // 60) }} min</td>
+                    <td class="num">{{ wk.total_tss }}</td>
+                    <td class="num">{{ (wk.hard_fraction * 100)|round(0)|int }}%</td>
                 </tr>
             {% endfor %}
             </tbody>
         </table>
+        </div>
         {% endif %}
 
-        <table class="plan-workouts">
-            <thead><tr><th>Date</th><th>Workout</th><th>Type</th><th>Duration</th><th>TSS</th><th></th></tr></thead>
+        <div class="table-scroll">
+        <table class="data-table plan-workouts">
+            <thead><tr><th class="num">Date</th><th>Workout</th><th>Type</th><th class="num">Duration</th><th class="num">TSS</th><th></th></tr></thead>
             <tbody>
             {% for w in plan.workouts %}
-                <tr>
-                    <td>{{ w.date }}</td>
+                <tr class="workout-row{{ ' row-alt' if loop.index is even else '' }}">
+                    <td class="num">{{ w.date }}</td>
                     <td>{{ w.name }}</td>
                     <td>{{ w.type }}</td>
-                    <td>{{ (w.duration_s // 60) }} min</td>
-                    <td>{{ w.tss }}</td>
+                    <td class="num">{{ (w.duration_s // 60) }} min</td>
+                    <td class="num">{{ w.tss }}</td>
                     <td>
                         <button type="button" class="link-btn wk-graph-btn"
                                 data-workout-id="{{ w.id }}"
                                 aria-expanded="false">graph</button>
                     </td>
                 </tr>
-                <tr class="wk-graph-row" id="wk-graph-{{ w.id }}" hidden>
+                <tr class="wk-graph-row{{ ' row-alt' if loop.index is even else '' }}" id="wk-graph-{{ w.id }}" hidden>
                     <td colspan="6">
                         <div class="wk-graph-body">
                             <p class="hint wk-graph-title"></p>
@@ -491,6 +498,7 @@
             {% endfor %}
             </tbody>
         </table>
+        </div>
         <script src="{{ static_url('workout_graph.js') }}"></script>
         <script>
         (function () {
