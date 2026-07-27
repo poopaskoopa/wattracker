@@ -151,10 +151,77 @@ def test_detail_and_preview_agree_for_every_kind(client):
 def test_workout_chart_breaks_the_line_across_a_free_block():
     """The shared SVG renderer must not trace a target through a free block."""
     js = (pathlib.Path("wattracker/web/static/workout_graph.js")).read_text()
-    # The line/area are built per RUN of targeted blocks, so a free block ends
-    # one subpath and the next starts with a fresh move.
+    # The line is built per RUN of targeted blocks, so a free block ends one
+    # subpath and the next starts with a fresh move.
     assert "if (b.free) { current = null; return; }" in js
     assert "runs.push(current)" in js
+
+
+def test_workout_chart_fills_each_targeted_segment_separately():
+    js = pathlib.Path("wattracker/web/static/workout_graph.js").read_text()
+    fill_block = js.split("// One closed fill per prescribed segment", 1)[1].split(
+        "// The target line is BROKEN", 1
+    )[0]
+
+    assert "profile.forEach(function (b)" in fill_block
+    assert "if (b.free) return;" in fill_block
+    assert "' L ' + x(b.start) + ' ' + y(b.watts_start)" in fill_block
+    assert "' L ' + x(b.end) + ' ' + y(b.watts_end)" in fill_block
+    assert "' L ' + x(b.end) + ' ' + y(0) + ' Z'" in fill_block
+    assert 'class="pf-area' in fill_block
+
+
+def test_workout_chart_zone_boundaries_and_average_target():
+    js = pathlib.Path("wattracker/web/static/workout_graph.js").read_text()
+    classifier = js.split("function zoneClass", 1)[1].split(
+        "// Target-power LINE graph", 1
+    )[0]
+
+    assert "((wattsStart + wattsEnd) / 2) / ftp" in classifier
+    assert re.findall(
+        r'if \(ratio ([<]=? [0-9.]+)\) return " pf-zone-([1-6])";',
+        classifier,
+    ) == [
+        ("< 0.56", "1"),
+        ("<= 0.75", "2"),
+        ("<= 0.90", "3"),
+        ("<= 1.05", "4"),
+        ("<= 1.20", "5"),
+        ("<= 1.50", "6"),
+    ]
+    assert 'return " pf-zone-7";' in classifier
+
+
+def test_workout_chart_missing_ftp_keeps_neutral_fill():
+    js = pathlib.Path("wattracker/web/static/workout_graph.js").read_text()
+
+    assert 'if (!Number.isFinite(ftp) || ftp <= 0) return "";' in js
+    assert 'svg += \'<path d="\' + area + \'" class="pf-area\'' in js
+    assert "hasFtp ? ftpW : NaN" in js
+
+
+def test_workout_chart_profile_css_contract():
+    css = pathlib.Path("wattracker/web/static/style.css").read_text()
+    profile_css = css.split(".profile-wrap {", 1)[1].split("/* Ride */", 1)[0]
+
+    assert "max-width: 760px" not in profile_css
+    assert ".pf-area { fill: var(--accent);" in profile_css
+    fills = re.findall(
+        r"\.pf-zone-([1-7]) \{ fill-opacity: ([.0-9]+); \}",
+        profile_css,
+    )
+    assert [zone for zone, _ in fills] == [str(i) for i in range(1, 8)]
+    assert [float(opacity) for _, opacity in fills] == sorted(
+        float(opacity) for _, opacity in fills
+    )
+    for selector in (".pf-grid", ".pf-line", ".pf-ftp"):
+        rule = profile_css.split(selector + " {", 1)[1].split("}", 1)[0]
+        assert "vector-effect: non-scaling-stroke" in rule
+    assert "font-size: var(--fs-xs)" in profile_css
+    assert "font-size: 10px" not in profile_css
+    assert "dominant-baseline: middle" in profile_css
+    assert ".pf-xlab { text-anchor: middle; }" in profile_css
+    assert ".pf-ylab, .profile-svg .pf-ftplab { text-anchor: end; }" in profile_css
 
 
 # --------------------------------- defect 4: no target reaches trainer or UI

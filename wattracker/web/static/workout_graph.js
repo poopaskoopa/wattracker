@@ -10,13 +10,26 @@
         return s ? m + "m " + s + "s" : m + " min";
     }
 
+    function zoneClass(wattsStart, wattsEnd, ftp) {
+        if (!Number.isFinite(ftp) || ftp <= 0) return "";
+        var ratio = ((wattsStart + wattsEnd) / 2) / ftp;
+        if (ratio < 0.56) return " pf-zone-1";
+        if (ratio <= 0.75) return " pf-zone-2";
+        if (ratio <= 0.90) return " pf-zone-3";
+        if (ratio <= 1.05) return " pf-zone-4";
+        if (ratio <= 1.20) return " pf-zone-5";
+        if (ratio <= 1.50) return " pf-zone-6";
+        return " pf-zone-7";
+    }
+
     // Target-power LINE graph over the whole workout (x = time into workout,
     // y = target watts; flat steps for constant blocks, slopes for ramps).
     function profileSvg(profile, totalS, ftp) {
         if (!profile || !profile.length || !totalS) return "";
         var W = 560, H = 200, padL = 46, padR = 12, padT = 12, padB = 26;
         var plotW = W - padL - padR, plotH = H - padT - padB;
-        var maxW = ftp || 0;
+        var ftpW = Number(ftp), hasFtp = Number.isFinite(ftpW) && ftpW > 0;
+        var maxW = hasFtp ? ftpW : 0;
         profile.forEach(function (b) {
             maxW = Math.max(maxW, b.watts_start, b.watts_end);
         });
@@ -43,37 +56,46 @@
                    '" y2="' + (H - padB + 4) + '" class="pf-grid"/>' +
                    '<text x="' + x(t) + '" y="' + (H - 8) + '" class="pf-xlab">' + Math.round(mn) + 'm</text>';
         }
-        // Target area and line, BROKEN across any untargeted block. Tracing
-        // them through a free block draws a target the rider is told to
-        // ignore - it plots the ERG resistance, not a prescription - so each
-        // run of targeted blocks becomes its own subpath.
+        // One closed fill per prescribed segment, classified by its average
+        // target. A missing FTP retains the neutral base fill.
+        profile.forEach(function (b) {
+            if (b.free) return;
+            var area = 'M ' + x(b.start) + ' ' + y(0) +
+                       ' L ' + x(b.start) + ' ' + y(b.watts_start) +
+                       ' L ' + x(b.end) + ' ' + y(b.watts_end) +
+                       ' L ' + x(b.end) + ' ' + y(0) + ' Z';
+            svg += '<path d="' + area + '" class="pf-area' +
+                   zoneClass(b.watts_start, b.watts_end, hasFtp ? ftpW : NaN) +
+                   '"/>';
+        });
+
+        // The target line is BROKEN across any untargeted block. Tracing it
+        // through a free block draws a target the rider is told to ignore -
+        // it plots the ERG resistance, not a prescription - so each run of
+        // targeted blocks becomes its own subpath.
         var runs = [], current = null;
         profile.forEach(function (b) {
             if (b.free) { current = null; return; }
             if (!current) { current = []; runs.push(current); }
             current.push(b);
         });
-        var area = '', line = '';
+        var line = '';
         runs.forEach(function (run) {
-            var first = run[0], last = run[run.length - 1];
-            area += ' M ' + x(first.start) + ' ' + y(0);
+            var first = run[0];
             line += ' M ' + x(first.start) + ' ' + y(first.watts_start);
             run.forEach(function (b) {
                 var step = ' L ' + x(b.start) + ' ' + y(b.watts_start) +
                            ' L ' + x(b.end) + ' ' + y(b.watts_end);
-                area += step;
                 line += step;
             });
-            area += ' L ' + x(last.end) + ' ' + y(0) + ' Z';
         });
-        if (area) svg += '<path d="' + area.trim() + '" class="pf-area"/>';
         if (line) svg += '<path d="' + line.trim() + '" class="pf-line"/>';
         // dashed FTP reference
-        if (ftp && ftp <= yMax) {
-            svg += '<line x1="' + padL + '" y1="' + y(ftp) + '" x2="' + (W - padR) +
-                   '" y2="' + y(ftp) + '" class="pf-ftp"/>' +
-                   '<text x="' + (W - padR - 2) + '" y="' + (parseFloat(y(ftp)) - 3) +
-                   '" class="pf-ftplab">FTP ' + Math.round(ftp) + 'W</text>';
+        if (hasFtp && ftpW <= yMax) {
+            svg += '<line x1="' + padL + '" y1="' + y(ftpW) + '" x2="' + (W - padR) +
+                   '" y2="' + y(ftpW) + '" class="pf-ftp"/>' +
+                   '<text x="' + (W - padR - 2) + '" y="' + (parseFloat(y(ftpW)) - 3) +
+                   '" class="pf-ftplab">FTP ' + Math.round(ftpW) + 'W</text>';
         }
         // Untargeted blocks (sprints) are shaded rather than read as a power
         // step: the plotted watts there are only the resistance the trainer

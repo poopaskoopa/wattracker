@@ -576,25 +576,30 @@ button.danger.link-btn { border: none; color: var(--alert); }
     padding: 0.1rem 0.4rem; line-height: 1;
 }
 .modal-close:hover { color: var(--text); filter: none; }
-/* The SVG has a 560x200 viewBox and 10px labels, so letting it stretch to a
-   full-width main only scales the type up and blurs it. Cap it near its natural
-   size and leave it left-aligned. Inert inside the calendar modal, which is
-   already narrower than this. */
 .profile-wrap { background: var(--surface-inset); border: 1px solid var(--surface-border); border-radius: var(--r-md);
-    padding: 0.5rem; margin: 0.75rem 0; max-width: 760px; }
+    padding: 0.5rem; margin: 0.75rem 0; }
 .profile-wrap[hidden] { display: none; }
 #wmTable[hidden], #wmError[hidden] { display: none; }
 .profile-svg { display: block; width: 100%; height: auto; }
-.profile-svg .pf-grid { stroke: var(--surface-border); stroke-width: 1; }
-.profile-svg .pf-area { fill: rgba(242, 169, 0, 0.22); stroke: none; }
-.profile-svg .pf-line { fill: none; stroke: var(--accent); stroke-width: 2; }
+.profile-svg .pf-grid { stroke: var(--surface-border); stroke-width: 1; vector-effect: non-scaling-stroke; }
+.profile-svg .pf-area { fill: var(--accent); fill-opacity: .18; stroke: none; }
+.profile-svg .pf-zone-1 { fill-opacity: .08; }
+.profile-svg .pf-zone-2 { fill-opacity: .13; }
+.profile-svg .pf-zone-3 { fill-opacity: .18; }
+.profile-svg .pf-zone-4 { fill-opacity: .24; }
+.profile-svg .pf-zone-5 { fill-opacity: .31; }
+.profile-svg .pf-zone-6 { fill-opacity: .39; }
+.profile-svg .pf-zone-7 { fill-opacity: .48; }
+.profile-svg .pf-line { fill: none; stroke: var(--accent); stroke-width: 2; vector-effect: non-scaling-stroke; }
 /* Untargeted (maximal-effort) block: shaded band, no power step to read. */
-.profile-svg .pf-free { fill: rgba(242, 169, 0, 0.30); stroke: none; }
-.profile-svg .pf-ftp { stroke: var(--muted); stroke-width: 1; stroke-dasharray: 4 3; }
-.profile-svg .pf-ylab { fill: var(--muted); font-size: 10px; text-anchor: end;
-    dominant-baseline: middle; }
-.profile-svg .pf-xlab { fill: var(--muted); font-size: 10px; text-anchor: middle; }
-.profile-svg .pf-ftplab { fill: var(--muted); font-size: 10px; text-anchor: end; }
+.profile-svg .pf-free { fill: var(--accent); fill-opacity: .30; stroke: none; }
+.profile-svg .pf-ftp { stroke: var(--muted); stroke-width: 1; stroke-dasharray: 4 3;
+    vector-effect: non-scaling-stroke; }
+.profile-svg .pf-ylab, .profile-svg .pf-xlab, .profile-svg .pf-ftplab {
+    fill: var(--muted); font-size: var(--fs-xs); dominant-baseline: middle;
+}
+.profile-svg .pf-ylab, .profile-svg .pf-ftplab { text-anchor: end; }
+.profile-svg .pf-xlab { text-anchor: middle; }
 
 /* Ride */
 .ride-setup { margin: 1rem 0; }
