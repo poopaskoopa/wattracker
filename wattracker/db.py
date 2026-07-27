@@ -22,7 +22,7 @@ from .timeutil import utc_now, valid_timezone
 
 _log = logging.getLogger(__name__)
 
-SCHEMA_VERSION = 25
+SCHEMA_VERSION = 26
 
 
 def _restrict_db_files(path: str) -> None:
@@ -203,6 +203,17 @@ _MIGRATIONS: Dict[int, Sequence[Union[str, Callable[[sqlite3.Connection], None]]
     24: [
         "ALTER TABLE user_settings ADD COLUMN timezone TEXT",
     ],
+    25: [
+        # Per-user bearer token for the read-only /calendar.ics feed. Only the
+        # sha256 hex digest is stored - a phone calendar client sends the
+        # plaintext in a URL, so the database must not be a second copy of it
+        # (same reasoning as password_hash). NULL means "no feed link yet".
+        # The UNIQUE constraint cannot ride on ALTER TABLE ADD COLUMN in
+        # SQLite; _SCHEMA creates idx_users_calendar_token_hash right after
+        # this runs, and a UNIQUE INDEX permits many NULLs, which is what we
+        # want for the users who never generate a link.
+        "ALTER TABLE users ADD COLUMN calendar_token_hash TEXT",
+    ],
 }
 
 _DROP = """
@@ -228,8 +239,14 @@ CREATE TABLE IF NOT EXISTS users (
     id            INTEGER PRIMARY KEY AUTOINCREMENT,
     username      TEXT UNIQUE NOT NULL,
     password_hash TEXT NOT NULL,
-    created       TEXT NOT NULL
+    created       TEXT NOT NULL,
+    -- sha256 hex of the /calendar.ics feed token; never the token itself.
+    calendar_token_hash TEXT
 );
+-- UNIQUE, but as an index so the many NULLs (users without a feed link) are
+-- allowed: SQLite only treats NULLs as distinct inside a unique index.
+CREATE UNIQUE INDEX IF NOT EXISTS idx_users_calendar_token_hash
+    ON users(calendar_token_hash);
 
 CREATE TABLE IF NOT EXISTS user_settings (
     user_id            INTEGER PRIMARY KEY,
@@ -656,6 +673,68 @@ def get_user_by_id(user_id: int, path: Optional[str] = None) -> Optional[dict]:
     try:
         row = conn.execute(
             "SELECT id, username, created FROM users WHERE id = ?", (user_id,)
+        ).fetchone()
+        return dict(row) if row else None
+    finally:
+        conn.close()
+
+
+# ------------------------------------------------- calendar feed token
+# Only the sha256 hex digest of the token is ever stored or accepted here.
+# Callers hash the plaintext (see calendarfeed.py); this layer never sees it.
+def set_calendar_token_hash(
+    user_id: int, token_hash: str, path: Optional[str] = None
+) -> bool:
+    """Store (or replace) a user's calendar-feed token hash.
+
+    Replacing is the rotation primitive: one row per user, so writing a new
+    hash makes the previous token unresolvable and therefore dead.
+    Returns False if there is no such user.
+    """
+    if not token_hash:
+        raise ValueError("calendar token hash must be non-empty")
+    conn = connect(path)
+    try:
+        cur = conn.execute(
+            "UPDATE users SET calendar_token_hash = ? WHERE id = ?",
+            (token_hash, user_id),
+        )
+        conn.commit()
+        return cur.rowcount > 0
+    finally:
+        conn.close()
+
+
+def get_calendar_token_hash(
+    user_id: int, path: Optional[str] = None
+) -> Optional[str]:
+    conn = connect(path)
+    try:
+        row = conn.execute(
+            "SELECT calendar_token_hash FROM users WHERE id = ?", (user_id,)
+        ).fetchone()
+        return row["calendar_token_hash"] if row else None
+    finally:
+        conn.close()
+
+
+def user_by_calendar_token_hash(
+    token_hash: str, path: Optional[str] = None
+) -> Optional[dict]:
+    """Resolve a user from a calendar token hash, or None.
+
+    An empty/None hash returns None without querying, so a user row whose
+    calendar_token_hash is NULL can never be matched by a missing token.
+    The caller must still re-verify the returned hash in constant time.
+    """
+    if not token_hash:
+        return None
+    conn = connect(path)
+    try:
+        row = conn.execute(
+            "SELECT id, username, calendar_token_hash FROM users "
+            "WHERE calendar_token_hash IS NOT NULL AND calendar_token_hash = ?",
+            (token_hash,),
         ).fetchone()
         return dict(row) if row else None
     finally:
@@ -1892,6 +1971,26 @@ def plan_workouts_for_month(
         conn.close()
 
 
+def plan_workouts_in_range(
+    user_id: int, start_date: str, end_date: str, path: Optional[str] = None
+) -> List[dict]:
+    """Plan workouts with ``start_date <= date <= end_date``, user-scoped.
+
+    Dates are stored as ISO 'YYYY-MM-DD' text, so a lexicographic BETWEEN is
+    the same as a calendar comparison.
+    """
+    conn = connect(path)
+    try:
+        rows = conn.execute(
+            "SELECT * FROM plan_workouts WHERE user_id = ? "
+            "AND date >= ? AND date <= ? ORDER BY date ASC, id ASC",
+            (user_id, start_date, end_date),
+        ).fetchall()
+        return [_plan_workout_row(r) for r in rows]
+    finally:
+        conn.close()
+
+
 def get_plan_workout(
     user_id: int, workout_id: int, path: Optional[str] = None
 ) -> Optional[dict]:
@@ -2151,6 +2250,23 @@ def standalone_workouts_for_month(
             "SELECT * FROM standalone_workouts WHERE user_id=? "
             "AND scheduled_date LIKE ? ORDER BY scheduled_date,id",
             (user_id, prefix + "%"),
+        ).fetchall()
+        return [_standalone_row(r) for r in rows]
+    finally:
+        conn.close()
+
+
+def standalone_workouts_in_range(
+    user_id: int, start_date: str, end_date: str, path: Optional[str] = None
+) -> List[dict]:
+    """One-off workouts scheduled within [start_date, end_date], user-scoped."""
+    conn = connect(path)
+    try:
+        rows = conn.execute(
+            "SELECT * FROM standalone_workouts WHERE user_id=? "
+            "AND scheduled_date >= ? AND scheduled_date <= ? "
+            "ORDER BY scheduled_date ASC, id ASC",
+            (user_id, start_date, end_date),
         ).fetchall()
         return [_standalone_row(r) for r in rows]
     finally:

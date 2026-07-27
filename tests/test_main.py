@@ -39,7 +39,13 @@ def test_main_resolves_runtime_config_without_browser(monkeypatch):
     launcher.main()
     assert calls["db"] is True
     assert calls["args"] == ("wattracker.server:app",)
-    assert calls["kwargs"] == {"host": "localhost", "port": 8123, "reload": False}
+    # proxy_headers must stay explicitly off: the app binds loopback, so
+    # uvicorn's default trusted-proxy range (127.0.0.1) would cover every
+    # caller and let any of them set request.client.host via X-Forwarded-For.
+    assert calls["kwargs"] == {
+        "host": "localhost", "port": 8123, "reload": False,
+        "proxy_headers": False,
+    }
 
 
 def test_main_browser_thread_gets_correct_url(monkeypatch):
