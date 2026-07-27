@@ -21,7 +21,8 @@
             <select id="workoutSelect">
                 <option value="" data-name="Endurance">Endurance (45 min)</option>
                 {% for w in workouts %}
-                <option value="{{ w.id }}" data-name="{{ w.name }}">{{ w.date }} &mdash; {{ w.name }}
+                <option value="{{ w.id }}" data-name="{{ w.name }}"
+                        {{ 'selected' if w.id == selected_workout_id else '' }}>{{ w.date }} &mdash; {{ w.name }}
                     ({{ (w.duration_s // 60) }} min)</option>
                 {% endfor %}
             </select>

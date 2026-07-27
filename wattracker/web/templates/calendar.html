@@ -186,6 +186,9 @@
         <p class="hint" id="wmMeta"></p>
         <p class="hint" id="wmMatchStatus"></p>
         <p class="alert" id="wmError" hidden></p>
+        <p id="wmRideWrap" hidden>
+            <a class="button" id="wmRide">Do this ride</a>
+        </p>
         <div id="wmComplete" hidden>
             <button type="button" id="wmCompleteButton">Mark complete</button>
             <span class="hint">Links the closest-duration activity recorded on this workout&rsquo;s scheduled date.</span>
@@ -211,6 +214,7 @@
 <script>
 (function () {
     var modal = document.getElementById("workoutModal");
+    var workoutRequestGeneration = 0;
 
     function $(id) { return document.getElementById(id); }
 
@@ -258,6 +262,8 @@
         $("wmRpeButtons").innerHTML = "";
         $("wmRpeStatus").textContent = "";
         $("wmComplete").hidden = true;
+        $("wmRide").removeAttribute("href");
+        $("wmRideWrap").hidden = true;
         modal.hidden = false;
     }
 
@@ -333,6 +339,8 @@
             (detail.adapted ? " · adapted (" + detail.adapted + ")" : "");
         $("wmDesc").textContent = detail.description || "";
         $("wmError").hidden = true;
+        $("wmRide").href = "/ride?workout_id=" + encodeURIComponent(detail.id);
+        $("wmRideWrap").hidden = false;
         var matchStatus = $("wmMatchStatus");
         if (detail.reconcileStatus === "matched") {
             matchStatus.textContent = "Matched to an activity recorded on this workout’s scheduled date.";
@@ -397,9 +405,13 @@
         modal.hidden = false;
     }
 
-    function closeModal() { modal.hidden = true; }
+    function closeModal() {
+        workoutRequestGeneration += 1;
+        modal.hidden = true;
+    }
 
     async function showWorkout(id) {
+        var generation = ++workoutRequestGeneration;
         openLoading();
         var reconcileStatus = null;
         try {
@@ -415,14 +427,17 @@
         } catch (e) {
             // Detail loading below reports connectivity failures to the user.
         }
+        if (generation !== workoutRequestGeneration) return;
         var resp;
         try {
             resp = await fetch("/api/plan/workout/" + id,
                                { headers: { "Accept": "application/json" } });
         } catch (e) {
+            if (generation !== workoutRequestGeneration) return;
             showError("Could not reach the server: " + e.message);
             return;
         }
+        if (generation !== workoutRequestGeneration) return;
         if (!resp.ok) {
             showError("The server returned HTTP " + resp.status +
                 " for this workout. If wattracker was updated, restart the app " +
@@ -437,9 +452,11 @@
         }
         try {
             var detail = await resp.json();
+            if (generation !== workoutRequestGeneration) return;
             detail.reconcileStatus = reconcileStatus;
             openModal(detail);
         } catch (e) {
+            if (generation !== workoutRequestGeneration) return;
             showError("Could not render workout details: " + e.message);
         }
     }
