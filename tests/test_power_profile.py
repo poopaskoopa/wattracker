@@ -398,10 +398,10 @@ def test_profile_render_chart_table_validation_and_user_isolation(client, monkey
     assert "Power profile" in page.text
     assert "All time" in page.text and "Last 60 days" in page.text
     assert "350 W" in page.text and "5.0 W/kg" in page.text
-    assert 'type: "radar"' in page.text
+    assert 'id="powerProfileChart"' in page.text
     assert '"recent_60d":' in page.text
-    assert "Each spoke is normalized" in page.text
-    assert 'aria-label="Radar chart' in page.text
+    assert "Each row is normalized" in page.text
+    assert 'aria-label="Horizontal grouped bar chart' in page.text
     assert "Computed from the last 90 days." in page.text
 
     bad = client.post("/profile/ftp", data={"ftp": "bad", "action": "save"})
@@ -412,7 +412,7 @@ def test_profile_render_chart_table_validation_and_user_isolation(client, monkey
     bob_page = client.get("/profile")
     assert "Import Zwift or FIT rides with power" in bob_page.text
     assert "350 W" not in bob_page.text
-    assert "powerProfileRadar" not in bob_page.text
+    assert "powerProfileChart" not in bob_page.text
 
 
 def test_duplicate_secondary_is_excluded_from_user_profile(user_id):
