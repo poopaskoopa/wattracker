@@ -232,12 +232,19 @@ main a:hover { color: var(--accent); text-decoration: underline; }
 .power-radar-wrap canvas { width: 100% !important; height: 100% !important; }
 .power-normalization-note { max-width: 42rem; }
 .power-profile-table th, .power-profile-table td { white-space: nowrap; }
+.power-profile-table th:nth-child(n + 2),
+.power-profile-table td:nth-child(n + 2),
+.profile-section .zone-table th:nth-child(n + 3),
+.profile-section .zone-table td:nth-child(n + 3) {
+    text-align: right; font-variant-numeric: tabular-nums;
+    font-feature-settings: "tnum";
+}
 .power-wkg { display: block; color: var(--muted); font-size: 0.78rem; }
 .hrmax-form { display: flex; align-items: end; gap: 0.65rem; flex-wrap: wrap; margin-top: 1rem; }
 .hrmax-form label { width: 100%; margin-bottom: 0; }
 .hrmax-form input { width: 150px; }
 .button-secondary { background: var(--surface-border); color: var(--text); }
-.table-scroll { overflow-x: auto; }
+.table-scroll { overflow: auto; max-height: 70vh; }
 .zone-summary-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 1rem; }
 .zone-panel { min-width: 0; border: 1px solid var(--surface-border); border-radius: var(--r-md); padding: 0.8rem; }
 .zone-time-table { margin-bottom: 0.5rem; }
@@ -266,6 +273,33 @@ main a:hover { color: var(--accent); text-decoration: underline; }
 table { width: 100%; border-collapse: collapse; margin: 1rem 0; }
 th, td { text-align: left; padding: 0.45rem 0.6rem; border-bottom: 1px solid var(--surface-border); }
 th { color: var(--muted); font-size: 0.8rem; text-transform: uppercase; }
+.data-table .num { text-align: right; }
+.data-table tbody > tr > *,
+.power-profile-table tbody > tr > *,
+.profile-section .zone-table tbody > tr > * {
+    transition: background-color var(--dur) var(--ease),
+        box-shadow var(--dur) var(--ease);
+}
+.data-table:not(.plan-workouts) tbody > tr:nth-child(even) > *,
+.power-profile-table tbody > tr:nth-child(even) > *,
+.profile-section .zone-table tbody > tr:nth-child(even) > *,
+.plan-workouts tbody > tr.row-alt > * {
+    background: var(--surface-2);
+}
+.data-table tbody > tr:not(.wk-graph-row):hover > *,
+.power-profile-table tbody > tr:hover > *,
+.profile-section .zone-table tbody > tr:hover > * {
+    background: var(--surface-border);
+}
+.data-table tbody > tr.correction-target > :first-child {
+    box-shadow: inset 3px 0 var(--alert);
+}
+.table-scroll .data-table thead th,
+.table-scroll .power-profile-table thead th,
+.profile-section .table-scroll .zone-table thead th,
+.power-table-wrap .data-table thead th {
+    position: sticky; top: 0; z-index: 1; background: var(--panel);
+}
 
 .toolbar { display: flex; gap: 0.75rem; align-items: center; flex-wrap: wrap; margin: 1rem 0; }
 button, .button {
@@ -278,7 +312,7 @@ button:hover, .button:hover { filter: brightness(1.1); }
 td.nowrap, th.nowrap { white-space: nowrap; }
 .race-table { width: 100%; }
 .race-table td, .race-table th { white-space: nowrap; }
-.race-table td.place { text-align: center; }
+.race-table td.place.num { text-align: right; }
 .trophy { vertical-align: middle; display: inline-block; }
 .trophy title { pointer-events: none; }
 /* Sortable headers */
@@ -485,11 +519,12 @@ table.calendar th { text-align: center; }
 .races-form { display: flex; align-items: flex-end; gap: 0.75rem; flex-wrap: wrap; }
 .races-form label { margin: 0; }
 .races-form input { display: block; margin-top: 0.25rem; width: 220px; }
-.power-table-wrap { overflow-x: auto; }
+.power-table-wrap { overflow: auto; max-height: 70vh; }
 .power-table th, .power-table td { text-align: right; white-space: nowrap; }
 .power-table th:first-child, .power-table td:first-child { text-align: left; }
 .power-table .bests-row td { border-top: 2px solid var(--accent); }
 .profile-table th, .profile-table td { text-align: center; }
+.data-table.profile-table .num { text-align: right; }
 .profile-table .bests-row td { border-top: none; color: var(--accent);
     font-size: 1.05rem; }
 .unit-toggle { display: flex; align-items: center; gap: 0.5rem; margin: 0.75rem 0;
