@@ -2202,8 +2202,20 @@ def create_app() -> FastAPI:
         return JSONResponse(payload)
 
     @app.get("/ride", response_class=HTMLResponse)
-    def ride_page(request: Request):
+    def ride_page(request: Request, workout_id: Optional[int] = None):
         uid = _uid(request)
+        selected_workout = None
+        if workout_id is not None:
+            if workout_id <= 0 or workout_id > 2**63 - 1:
+                return PlainTextResponse("Workout not found", status_code=404)
+            selected_workout = db.get_plan_workout(uid, workout_id)
+            if selected_workout is None:
+                return PlainTextResponse("Workout not found", status_code=404)
+        workouts = _upcoming_plan_workouts(uid)
+        if selected_workout is not None and not any(
+            w["id"] == selected_workout["id"] for w in workouts
+        ):
+            workouts.append(selected_workout)
         available, reason = bledevices.bluetooth_available()
         return templates.TemplateResponse(
             request,
@@ -2212,7 +2224,8 @@ def create_app() -> FastAPI:
                 request,
                 ble_available=available,
                 ble_reason=reason,
-                workouts=_upcoming_plan_workouts(uid),
+                workouts=workouts,
+                selected_workout_id=workout_id,
                 ride_types=WORKOUT_TYPE_INFO,
                 ride_durations=JUST_RIDE_DURATIONS,
                 ftp=round(importer.current_ftp(uid), 0),

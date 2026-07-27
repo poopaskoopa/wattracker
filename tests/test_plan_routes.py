@@ -285,6 +285,17 @@ def test_calendar_workouts_are_clickable(client):
     r = client.get("/calendar?year=2026&month=8")
     assert 'data-workout-id="' in r.text
     assert "workoutModal" in r.text
+    assert 'id="wmRide"' in r.text
+    assert "Do this ride" in r.text
+    assert '"/ride?workout_id=" + encodeURIComponent(detail.id)' in r.text
+    assert '$("wmRide").removeAttribute("href")' in r.text
+    assert '$("wmRideWrap").hidden = true' in r.text
+    assert "var workoutRequestGeneration = 0" in r.text
+    assert "var generation = ++workoutRequestGeneration" in r.text
+    assert r.text.count(
+        "if (generation !== workoutRequestGeneration) return"
+    ) >= 5
+    assert "function closeModal() {\n        workoutRequestGeneration += 1;" in r.text
 
 
 def _today_profile_workout(uid, date="2026-08-05", power_scale=210.0):
@@ -984,5 +995,3 @@ def test_generate_plan_post_flow_unchanged(client):
     assert r.status_code == 200
     assert "weekly-table" in r.text
     assert "hard time" in r.text
-
-
