@@ -199,6 +199,26 @@ main a:hover { color: var(--accent); text-decoration: underline; }
    kills the inline-baseline gap that would otherwise open a ~4px seam between
    the panels and separate them visually. */
 .chart-panels canvas { display: block; }
+
+/* Volume small multiples: four panels, one shared x axis. The stack is sized
+   by aspect ratio rather than by canvas `height` attributes because the bottom
+   panel needs a FIXED +18px for the date labels it alone draws - expressed as
+   a ratio that strip would grow with the viewport and the bottom plot would
+   end up visibly taller than the other three. `flex: 1 1 0` on the panels
+   splits the remaining height equally, so all four plot areas match.
+   The floor keeps the stack at the footprint the four separate blocks used to
+   occupy once the page is narrow enough that width-proportional sizing would
+   undershoot it; below the desktop range it is dropped so the stack scales
+   down on a phone instead of turning into a 1400px column. */
+/* `width: 100%` is load-bearing, not decoration: with width left auto, the
+   floor below makes the height definite and the aspect ratio then resolves the
+   OTHER axis from it, widening the stack past its container. */
+.volume-panels { display: flex; flex-direction: column; width: 100%;
+    aspect-ratio: 300 / 472; }
+@media (min-width: 900px) { .volume-panels { min-height: 1428px; } }
+.volume-panel { flex: 1 1 0; min-height: 0; position: relative; }
+.volume-panel--x { flex-basis: 18px; }  /* measured cost of the date-label strip */
+.volume-panel canvas { width: 100% !important; height: 100% !important; }
 .profile-section, .zone-summary { background: var(--panel); border-radius: var(--r-md); padding: 1rem; margin: 1.25rem 0; }
 .profile-section h3, .zone-summary h3, .zone-panel h4 { margin-top: 0; }
 .power-profile-layout { display: grid; grid-template-columns: minmax(280px, 520px) minmax(220px, 1fr);

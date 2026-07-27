@@ -52,24 +52,8 @@ function interpolatedFrom(labels, points, valueKey) {
     return out;
 }
 
-const MONTH_NAMES = ["Jan", "Feb", "Mar", "Apr", "May", "Jun",
-                     "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
-
-// Compact date ticks: plain month names, with the year only on the first tick
-// and at year boundaries ("Jan 2026"); further ticks within a month are hidden.
-function monthYearTicks(labels) {
-    return function (value, index, ticks) {
-        const label = labels[value] || "";
-        const y = label.slice(0, 4);
-        const m = parseInt(label.slice(5, 7), 10) - 1;
-        if (!(m >= 0 && m <= 11)) return label;
-        const prev = index > 0 && ticks[index - 1]
-            ? (labels[ticks[index - 1].value] || "") : "";
-        if (!prev || prev.slice(0, 4) !== y) return MONTH_NAMES[m] + " " + y;
-        if (prev.slice(5, 7) === label.slice(5, 7)) return "";
-        return MONTH_NAMES[m];
-    };
-}
+// `monthYearTicks` now lives in chart-theme.js - the volume small multiples
+// want the same dated-category tick treatment, and a second copy would drift.
 
 function unionDates(...arrays) {
     const set = new Set();
@@ -181,55 +165,11 @@ function buildLegend() {
     renderLegend("mainLegend", panelLegendUnits);
 }
 
-// Chart.js sizes each y axis to its own tick text, so two stacked panels with
-// different value ranges start their plot areas at different x and read as two
-// unrelated charts. Both panels' y scales are pinned to the widest one via this
-// shared measurement: each scale reports its natural width, the widest wins,
-// and any panel that grows past the current pin schedules a re-layout of the
-// other. Measured, never guessed, so a wide tick label can't be clipped.
-const axisPin = { width: 0, pending: false };
-
-function schedulePinSync() {
-    if (axisPin.pending) return;
-    axisPin.pending = true;
-    requestAnimationFrame(() => {
-        axisPin.pending = false;
-        [loadChart, ftpChart].forEach((c) => { if (c && c.ctx) c.update("none"); });
-    });
-}
-
-function pinPanelAxis(scale) {
-    if (scale.width > axisPin.width) {
-        axisPin.width = scale.width;
-        schedulePinSync();
-    }
-    scale.width = axisPin.width;
-}
-
-// The same problem at the other end of the plot: only the bottom panel draws x
-// tick labels, so only it reserves room for the last one to overhang the axis.
-// That inset is ~5px, and left unmatched every gridline walks out of column
-// between the panels. It is layout output rather than a scale property, so it
-// is measured after a render (with the reservation zeroed, so it can shrink)
-// and then given to both panels as explicit right padding.
-let alignPending = false;
-
-function alignPanelAreas() {
-    const panels = [loadChart, ftpChart].filter((c) => c && c.ctx);
-    if (panels.length !== 2) return;
-    // Leaf assignment only: Chart.js v4's options are a resolver proxy and
-    // replacing a nested object on it recurses.
-    panels.forEach((c) => { c.options.layout.padding.right = 0; c.update("none"); });
-    let gap = 0;
-    panels.forEach((c) => { gap = Math.max(gap, c.width - c.chartArea.right); });
-    gap = Math.ceil(gap);
-    panels.forEach((c) => { c.options.layout.padding.right = gap; c.update("none"); });
-}
-
+// Keeping the two stacked panels on one pair of edges - a common y-axis width
+// and a common right inset - is `alignPanels` in chart-theme.js, shared with
+// the volume page's four-panel version of the same problem.
 function scheduleAlign() {
-    if (alignPending) return;
-    alignPending = true;
-    requestAnimationFrame(() => { alignPending = false; alignPanelAreas(); });
+    schedulePanelAlign([loadChart, ftpChart]);
 }
 
 // TSB is signed and "above or below zero" is the whole read, so the load panel
@@ -290,19 +230,22 @@ function destroyPanels() {
     if (panelCrosshair) { panelCrosshair.destroy(); panelCrosshair = null; }
     if (loadChart) { loadChart.destroy(); loadChart = null; }
     if (ftpChart) { ftpChart.destroy(); ftpChart = null; }
-    axisPin.width = 0;
 }
 
-// x axis shared by both panels. Identical tick generation on each keeps their
-// gridlines in the same columns; only the bottom panel draws the labels, so
-// the pair reads as one plot with one date axis.
+// x axis shared by both panels. Both run the same `dateAxisTicks` selection, so
+// their gridlines land in the same columns; only the bottom panel draws the
+// labels, so the pair reads as one plot with one date axis. (autoSkip cannot do
+// this - Chart.js gates it on `ticks.display`, so the label-free top panel kept
+// every tick while the bottom one thinned to 12.)
+const PANEL_X_TICKS = 12;
+
 function panelXScale(labels, showLabels) {
     return {
+        afterBuildTicks: dateAxisTicks(PANEL_X_TICKS),
         ticks: {
             display: showLabels,
-            maxTicksLimit: 12,
             maxRotation: 0,
-            autoSkip: true,
+            autoSkip: false,
             callback: monthYearTicks(labels),
         },
     };
@@ -360,8 +303,8 @@ function buildMainChart(load, ftpSeries) {
         options: {
             responsive: true,
             onResize: scheduleAlign,
-            // Declared here so alignPanelAreas only ever writes the leaf.
-            layout: { padding: { right: 0 } },
+            // Declared here so alignPanels only ever writes the leaves.
+            layout: { padding: { left: 0, right: 0 } },
             interaction: { mode: "index", intersect: false },
             plugins: panelZoomPlugins(),
             scales: {
@@ -369,7 +312,6 @@ function buildMainChart(load, ftpSeries) {
                 y: {
                     position: "left",
                     title: { display: true, text: "Load" },
-                    afterFit: pinPanelAxis,
                 },
             },
         },
@@ -393,8 +335,8 @@ function buildMainChart(load, ftpSeries) {
         options: {
             responsive: true,
             onResize: scheduleAlign,
-            // Declared here so alignPanelAreas only ever writes the leaf.
-            layout: { padding: { right: 0 } },
+            // Declared here so alignPanels only ever writes the leaves.
+            layout: { padding: { left: 0, right: 0 } },
             interaction: { mode: "index", intersect: false },
             plugins: panelZoomPlugins(),
             scales: {
@@ -403,7 +345,6 @@ function buildMainChart(load, ftpSeries) {
                     position: "left",
                     title: { display: true, text: "FTP (W)" },
                     ticks: { maxTicksLimit: 4 },
-                    afterFit: pinPanelAxis,
                 },
             },
         },

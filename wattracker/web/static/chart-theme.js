@@ -35,10 +35,197 @@ function tokenAlpha(name, alpha, fallback) {
         (n & 255) + "," + alpha + ")";
 }
 
+var MONTH_NAMES = ["Jan", "Feb", "Mar", "Apr", "May", "Jun",
+                   "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
+
+// Compact date ticks for a category axis whose labels are ISO dates. Pass the
+// label array, get back a Chart.js `ticks.callback`.
+//
+// The format follows the window, because one rule cannot serve both ends of the
+// range this app spans:
+//
+//   long window  (> ~10 weeks) - month names, the year only on the first tick
+//                 and at year boundaries ("Jan 2026"); further ticks inside the
+//                 same month are blanked, so a two-year view is not a wall of
+//                 repeated words.
+//   short window - day-of-month, with the month named on the first tick and
+//                 whenever it changes ("22 Jun", "29", "6 Jul"). The month rule
+//                 applied here labelled only the month boundaries, so the
+//                 dashboard's default 1-month view showed two ticks for thirty
+//                 days of daily data, and the volume page's 1m preset showed
+//                 two for five weekly buckets.
+//
+// Lives here rather than in a page script because every dated category axis in
+// the app wants the same treatment (the dashboard panels and the volume small
+// multiples both do) and a second copy would drift.
+var SHORT_WINDOW_DAYS = 70;
+
+function monthYearTicks(labels) {
+    var first = labels[0] || "";
+    var last = labels[labels.length - 1] || "";
+    var spanDays = (Date.parse(last) - Date.parse(first)) / 86400000;
+    var byDay = isFinite(spanDays) && spanDays <= SHORT_WINDOW_DAYS;
+    return function (value, index, ticks) {
+        var label = labels[value] || "";
+        var y = label.slice(0, 4);
+        var m = parseInt(label.slice(5, 7), 10) - 1;
+        if (!(m >= 0 && m <= 11)) return label;
+        var prev = index > 0 && ticks[index - 1]
+            ? (labels[ticks[index - 1].value] || "") : "";
+        var sameMonth = prev && prev.slice(0, 7) === label.slice(0, 7);
+        if (byDay) {
+            var day = parseInt(label.slice(8, 10), 10);
+            return sameMonth ? String(day) : day + " " + MONTH_NAMES[m];
+        }
+        if (!prev || prev.slice(0, 4) !== y) return MONTH_NAMES[m] + " " + y;
+        if (sameMonth) return "";
+        return MONTH_NAMES[m];
+    };
+}
+
+// Choose the ticks for a dated category axis. Use as `afterBuildTicks`, paired
+// with `monthYearTicks` as the `ticks.callback`.
+//
+// Chart.js' own `autoSkip` cannot be used on stacked panels, for two reasons
+// that only appear once several charts have to share one x axis:
+//
+//   * it is gated on `ticks.display`, so the panels that draw no labels never
+//     skip at all. The dashboard's two fitness panels were building 29 ticks on
+//     top against 10 on the bottom - i.e. their gridlines were never in the
+//     same columns, which is the whole point of stacking them.
+//   * it thins to an evenly spaced subset chosen by pixel budget, with no idea
+//     that on a long window the interesting dates are the month boundaries. On
+//     a 62-week volume window it kept 16 ticks of which only 4 landed on a
+//     month start, so `monthYearTicks` had nothing left to name.
+//
+// Choosing explicitly fixes both: every panel runs the same selection and lands
+// on the same dates, and the dates kept are the ones that carry a label.
+function dateAxisTicks(maxTicks) {
+    var max = maxTicks || 12;
+    return function (scale) {
+        var labels = scale.chart.data.labels || [];
+        var ticks = scale.ticks || [];
+        if (ticks.length <= max) return; // everything fits; keep the lot
+        var first = labels[0] || "";
+        var last = labels[labels.length - 1] || "";
+        var spanDays = (Date.parse(last) - Date.parse(first)) / 86400000;
+        if (!(spanDays > SHORT_WINDOW_DAYS)) {
+            // Short window, too many samples to label every one (a month of
+            // daily data). `monthYearTicks` is naming days here, so any evenly
+            // spaced subset labels fine - just make it the SAME subset on every
+            // panel, which a stride does and autoSkip does not.
+            var step = Math.ceil(ticks.length / max);
+            scale.ticks = ticks.filter(function (_t, i) { return i % step === 0; });
+            return;
+        }
+        // Long window: keep the first sample of each month.
+        var firsts = ticks.filter(function (t) {
+            var cur = labels[t.value] || "";
+            var prev = labels[t.value - 1] || "";
+            return !prev || prev.slice(0, 7) !== cur.slice(0, 7);
+        });
+        // Tick 0 is kept unconditionally (it has no predecessor to compare
+        // with), but a series starting late in a month puts it within a sample
+        // or two of the real first boundary and the two labels overprint -
+        // "May 2025Jun".
+        if (firsts.length > 1 && firsts[1].value - firsts[0].value < 3) firsts.shift();
+        // More months than will fit: drop to every k-th MONTH rather than to
+        // arbitrary dates, so every survivor still carries a label.
+        var stride = Math.ceil(firsts.length / max);
+        scale.ticks = stride > 1
+            ? firsts.filter(function (_t, i) { return i % stride === 0; })
+            : firsts;
+    };
+}
+
+// ------------------------------------------------------- panel alignment
+// N charts stacked as one plot with one shared x domain (the dashboard's two
+// fitness panels, the volume page's four small multiples) have to line up on
+// both edges, and Chart.js will not do it for them:
+//
+//   left  - each y axis is sized to its own tick text, so panels with
+//           different value ranges start their plot areas at different x and
+//           read as unrelated charts.
+//   right - only the bottom panel draws x tick labels, so only it reserves
+//           room for the last label to overhang the axis (~5px). Left
+//           unmatched, every gridline walks out of column between panels.
+//
+// Both are layout *output*, not scale properties, so both are measured after a
+// render rather than guessed, and both are corrected the same way: explicit
+// layout padding. One measure pass, one entry point.
+//
+// Two things the callers must do:
+//   1. Declare `layout: { padding: { left: 0, right: 0 } }` at construction.
+//      On Chart.js v4 `chart.options` is a resolver proxy and assigning a
+//      nested OBJECT into it after construction recurses into a stack
+//      overflow; only leaf assignment is safe, and a leaf needs its object to
+//      already exist. (Chart.js's own default is the scalar `padding: 0`,
+//      which would silently swallow `.left = 12`.)
+//   2. Re-run this whenever the tick text can change - new data window, new
+//      zoom range, resize - via `schedulePanelAlign`.
+function alignPanels(charts) {
+    var live = (charts || []).filter(function (c) {
+        return c && c.ctx && c.chartArea && c.options && c.options.layout &&
+            c.options.layout.padding && typeof c.options.layout.padding === "object";
+    });
+    if (live.length < 2) return;
+    // Zero the existing reservation before measuring. Measuring with it still
+    // applied folds the previous correction into the new one, so the insets
+    // could only ever grow - a window whose labels got narrower would keep the
+    // old, too-wide gutter forever.
+    live.forEach(function (c) {
+        c.options.layout.padding.left = 0;
+        c.options.layout.padding.right = 0;
+        c.update("none");
+    });
+    var natural = live.map(function (c) {
+        return { left: c.chartArea.left, right: c.width - c.chartArea.right };
+    });
+    var maxLeft = 0;
+    var maxRight = 0;
+    natural.forEach(function (n) {
+        if (n.left > maxLeft) maxLeft = n.left;
+        if (n.right > maxRight) maxRight = n.right;
+    });
+    live.forEach(function (c, i) {
+        // Left is a per-panel shim to the widest y axis; right is one shared
+        // reservation (Chart.js takes the larger of the padding and the
+        // scale's own overhang, so handing every panel the widest overhang
+        // lands them all on the same right edge).
+        c.options.layout.padding.left = Math.max(0, maxLeft - natural[i].left);
+        c.options.layout.padding.right = Math.ceil(maxRight);
+        c.update("none");
+    });
+}
+
+// rAF-coalesced `alignPanels`. A range change touches every panel and every
+// touch would otherwise trigger its own two-pass measure; this collapses a
+// burst into one alignment on the next frame. Groups are de-duplicated by
+// their member chart ids, so callers can pass a fresh array each time.
+var alignQueue = [];
+
+function schedulePanelAlign(charts) {
+    var group = (charts || []).filter(Boolean);
+    if (group.length < 2) return;
+    var sig = group.map(function (c) { return c.id; }).join(",");
+    if (alignQueue.some(function (q) { return q.sig === sig; })) return;
+    alignQueue.push({ sig: sig, charts: group });
+    if (alignQueue.length > 1) return;
+    requestAnimationFrame(function () {
+        var due = alignQueue;
+        alignQueue = [];
+        due.forEach(function (q) { alignPanels(q.charts); });
+    });
+}
+
 (function () {
     "use strict";
 
     window.tokenAlpha = tokenAlpha;
+    window.monthYearTicks = monthYearTicks;
+    window.dateAxisTicks = dateAxisTicks;
+    window.alignPanels = alignPanels;
+    window.schedulePanelAlign = schedulePanelAlign;
 
     // No module system in this codebase (app.js / volume.js are plain scripts),
     // so the two helpers are globals, like `renderDashboard` and friends.
