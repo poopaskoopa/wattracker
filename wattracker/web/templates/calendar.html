@@ -43,7 +43,7 @@
    tooltip carries the reason and the reassurance that the saved priority is
    untouched. #}
 {% macro race_priority_badge(race) %}
-{%- set why %}{{ race.name or 'Race' }} — {% if race.demoted %}marked an A race, planned as a B race: it is within {{ race.separation_days }} days of your A race on {{ race.conflicts_with }}, and only the earlier race can be tapered for. Your saved priority is unchanged — move or delete the earlier race and this one's taper comes back.{% else %}priority {{ race.priority }}{% endif %}{% endset -%}
+{%- set why %}{{ race.name or 'Race' }} — {% if race.demoted %}marked an A race, planned as a B race: it is within {{ race.separation_days }} days of {% if race.conflicts_with == race.date %}your other A race that day{% else %}your A race on {{ race.conflicts_with }}{% endif %}, and only one of them can be tapered for. Your saved priority is unchanged — move or delete that race and this one's taper comes back.{% else %}priority {{ race.priority }}{% endif %}{% endset -%}
 <span class="cal-race-tag cal-race-{{ race.priority }}{{ ' cal-race-demoted' if race.demoted else '' }}"
       title="{{ why }}">{{ race.priority }}</span>
 {%- endmacro %}
@@ -176,7 +176,9 @@
             {{ race_priority_badge(r) }}
             {% if r.result %}{{ race_result_badge(r.result) }}{% endif %}
             {% if r.demoted %}<span class="hint">planned as B &mdash; within
-                {{ r.separation_days }} days of your A race on {{ r.conflicts_with }}</span>{% endif %}
+                {{ r.separation_days }} days of
+                {%- if r.conflicts_with == r.date %} your other A race that day
+                {%- else %} your A race on {{ r.conflicts_with }}{% endif %}</span>{% endif %}
             {% if r.name %}<span class="hint">{{ r.name }}</span>{% endif %}
             {% if r.duration_min %}<span class="hint">{{ r.duration_min }} min</span>{% endif %}
             <form method="post" action="/race/{{ r.id }}/delete" style="display:inline">

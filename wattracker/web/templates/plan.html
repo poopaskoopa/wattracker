@@ -376,12 +376,17 @@
                     <span class="cal-race-tag cal-race-{{ r.priority }}">{{ r.priority }}</span>
                     {% if r.name %}{{ r.name }}{% endif %}
                     {% if r.demoted %}
+                    {#- Two A races on the same date are demoted by the same rule, so
+                        "the earlier race" would be false there; name it as the other
+                        race that day instead. #}
+                    {% set same_day = r.conflicts_with == r.date %}
                     <p class="alert">Marked an <strong>A</strong> race, planned as a
-                       <strong>B</strong> race: it falls within {{ r.separation_days }} days of your
-                       A race on <strong>{{ r.conflicts_with }}</strong>, and the second taper would
-                       have to start before the first race happened. Only the earlier race gets a
-                       taper. Your saved priority is untouched &mdash; moving or deleting the earlier
-                       race restores this one's taper.</p>
+                       <strong>B</strong> race: it falls within {{ r.separation_days }} days of
+                       {% if same_day %}your other <strong>A</strong> race that day
+                       {%- else %}your A race on <strong>{{ r.conflicts_with }}</strong>{% endif %},
+                       and only one of them can be tapered for. Your saved priority is untouched
+                       &mdash; moving or deleting {{ 'that race' if same_day else 'the earlier race' }}
+                       restores this one's taper.</p>
                     {% endif %}
                     {#- Every sentence below is about DATES, not about the race as a
                         whole: what landed is described, what is past or completed is
@@ -398,14 +403,16 @@
                         still bends towards it.{% endif %}
                         {%- if r.displaces_workout %} No workout is scheduled on race day &mdash;
                         the race is the session.{% endif %}
-                        {#- "shorter still" and "intensity holds" are only rendered when
-                            the stored rows bear them out; where they do not, the plain
-                            sentence is still true and is all that is said. #}
-                        {%- if r.taper_from %} Taper from {{ r.taper_from }}: sessions get shorter
-                        {%- if r.taper_hard_from %} (shorter still from
-                        {{ r.taper_hard_from }}){% endif %}
-                        {%- if r.intensity_held %}, while the number of rides and their
-                        intensity hold{% endif %}.{% endif %}
+                        {#- The taper is listed date by date, each number straight off a
+                            stored row. Nothing characterises the taper's shape: any such
+                            sentence quantifies over days the generator does not promise. #}
+                        {%- if r.shorter %} Shorter sessions before the race:
+                        {% for x in r.shorter[:6] -%}
+                        {{ x.date }} {{ x.minutes }} min (was {{ x.was }})
+                        {%- if not loop.last %}, {% endif %}
+                        {%- endfor %}
+                        {%- if r.shorter|length > 6 %}, and {{ r.shorter|length - 6 }}
+                        more{% endif %}.{% endif %}
                         {%- if r.recovery_dates %} Easy sessions afterwards on
                         {{ r.recovery_dates|join(', ') }}.{% endif %}
                         {%- if r.easy_dates %} Hard days either side ({{ r.easy_dates|join(', ') }})

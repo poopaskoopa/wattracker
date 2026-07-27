@@ -186,12 +186,19 @@ def race_priorities(races: Optional[Sequence[dict]]) -> List[dict]:
     calendar badge and the plan summary both come through here rather than
     re-deriving when an A race counts as an A race. It needs no plan, because
     the demotion depends on the race list alone.
+
+    Which race took the taper is read off ``resolve_race_conflicts``' own
+    output, in order, rather than re-derived from the dates. Re-deriving it as
+    "the latest A race strictly before this one" was wrong for two A races on
+    the SAME date - the resolver demotes the second, but no A race is earlier,
+    so the reason came out as "your A race on None".
     """
-    resolved, _conflicts = resolve_race_conflicts(normalize_races(races))
-    a_dates = [r["date"] for r in resolved if r["priority"] == PRIORITY_A]
+    resolved, conflicts = resolve_race_conflicts(normalize_races(races))
+    # One conflict per demoted race, appended in resolution order.
+    demotions = iter(conflicts)
     out: List[dict] = []
     for r in resolved:
-        prior = [d for d in a_dates if d < r["date"]]
+        conflict = next(demotions) if r.get("demoted") else None
         out.append({
             "id": r.get("id"),
             "date": r["date"].isoformat(),
@@ -199,9 +206,8 @@ def race_priorities(races: Optional[Sequence[dict]]) -> List[dict]:
             "priority": r["priority"],       # EFFECTIVE, post-resolution
             "duration_min": r.get("duration_min"),
             "demoted": bool(r.get("demoted")),
-            # The earlier A race that took the taper; only set on a demotion.
-            "conflicts_with": (max(prior).isoformat()
-                               if r.get("demoted") and prior else None),
+            # The A race that took the taper; only set on a demotion.
+            "conflicts_with": conflict["conflicts_with"] if conflict else None,
             "separation_days": A_RACE_SEPARATION_DAYS,
         })
     return out
@@ -238,10 +244,10 @@ def describe_races(
     * ATTRIBUTION - the with-races generation predicts an effect of THIS race
       on that date.
 
-    Only the intersection is described, and it is read off the stored rows:
-    ``taper_from`` is the earliest date whose STORED session is shorter than
-    the baseline, race day is displaced iff the row is really absent, a day is
-    eased or recovered iff its STORED kind really changed that way. Requiring
+    Only the intersection is described, and it is read off the stored rows: a
+    date is in ``shorter`` iff its STORED session is shorter than the baseline,
+    race day is displaced iff the row is really absent, a day is eased or
+    recovered iff its STORED kind really changed that way. Requiring
     attribution as well as evidence is also what makes this safe against
     baseline drift - the baseline is generated now while the rows were written
     earlier, possibly against a different measured profile, and a difference the
@@ -253,12 +259,14 @@ def describe_races(
     genuinely has not been recomputed for this race, e.g. it is not the active
     plan).
 
-    Two comparative claims get their comparison actually run against the stored
-    rows rather than assumed from the constants: ``taper_hard_from`` ("shorter
-    still from") is set only when those sessions really are shorter than the
-    tapered days before them, and ``intensity_held`` only when every tapered
-    day kept the kind the raceless plan gave it. Where the evidence is absent
-    the caller says less - the plain "sessions get shorter" is still true.
+    Nothing here describes the SHAPE of a taper. Sentences like "shorter still
+    from D" or "frequency and intensity hold" quantify over a set of days, and
+    the generator guarantees no such thing: a session already at its feasible
+    floor does not shorten, and another race can remove a ride from the middle
+    of the fortnight. Every one of those claims was false for some plan. The
+    taper therefore comes back as ``shorter`` - one entry per date that really
+    is shorter, carrying the stored minutes and the baseline it came down
+    from - and the caller lists the facts instead of characterising them.
 
     A race is described when it falls inside the plan's span OR when it
     predicts anything inside it - a race the week after the plan ends really
@@ -326,26 +334,19 @@ def describe_races(
                 row = rows.get(k)
                 if row is not None and int(row["duration_s"]) < o_by[k]["duration_s"]:
                     tapered.append(k)
-        item["taper_from"] = tapered[0] if tapered else None
-        # "Shorter still from D" is a COMPARISON, so it is only made when the
-        # stored durations bear it out: every session from D on must be shorter
-        # than every tapered session before it. The multiplier does step down at
-        # TAPER_NEAR_DAYS, but a deeper cut of a longer ride can still be the
-        # longer session, and saying "shorter still" over rows that got longer
-        # is exactly the kind of plausible-but-false claim this describes away.
-        near_start = (day - _dt.timedelta(days=TAPER_NEAR_DAYS)).isoformat()
-        near = [d for d in tapered if d >= near_start]
-        far = [d for d in tapered if d < near_start]
-        item["taper_hard_from"] = None
-        if near and far:
-            if (max(int(rows[d]["duration_s"]) for d in near)
-                    < min(int(rows[d]["duration_s"]) for d in far)):
-                item["taper_hard_from"] = near[0]
-        # Frequency and intensity holding through a taper is likewise a claim
-        # about the stored rows: every tapered day must still be ridden and
-        # still carry the kind the raceless plan gave it.
-        item["intensity_held"] = bool(tapered) and all(
-            rows[d]["type"] == o_by[d]["type"] for d in tapered)
+        # The taper is reported as the DATES that are actually shorter and by
+        # how much, straight off the rows. Every sentence that described its
+        # SHAPE instead - "taper from D", "shorter still from D", "frequency
+        # and intensity hold" - quantified over a set of days and was false
+        # for some plan: a floor-clamped session inside the "shorter still"
+        # period, a ride removed by another race inside the fortnight. These
+        # numbers each come from one row and can be checked against it.
+        item["shorter"] = [
+            {"date": d,
+             "minutes": int(round(int(rows[d]["duration_s"]) / 60)),
+             "was": int(round(int(o_by[d]["duration_s"]) / 60))}
+            for d in tapered
+        ]
 
         # Post-race recovery: days after an A race whose kind became a recovery
         # spin, up to the next A race (which owns everything past it).
@@ -391,10 +392,12 @@ def describe_races(
         # rows are never rewritten by design, so they are explained rather than
         # reported as something missing; the rest genuinely await a recompute.
         missing = predicted - claimed
+        # Only a date with a stored row can have "stayed as it was" - a date
+        # with no row has nothing that stayed.
         item["left_alone"] = sorted(
             d for d in missing
-            if (today is not None and d <= today)
-            or (rows.get(d) or {}).get("completed_activity_id") is not None
+            if d in rows and ((today is not None and d <= today)
+                              or rows[d].get("completed_activity_id") is not None)
         )
         item["pending"] = sorted(missing - set(item["left_alone"]))
         item["outside_plan"] = not (monday0 <= day <= last_day)
