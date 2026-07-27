@@ -362,6 +362,110 @@ def test_a_claim_needs_attribution_as_well_as_evidence(user_id):
     assert untouched not in r["affects"]      # evidence without attribution
 
 
+# ------------------------------------- comparative claims are compared for real
+def _long_plan(client, weeks, races):
+    """A plan created through the real route, around ``races`` (date, prio,
+    name, minutes). Returns (uid, plan_id, stored rows, raceless baseline)."""
+    uid = _register(client)
+    for date, prio, name, minutes in races:
+        db.add_race_date(uid, date, prio, name, minutes)
+    client.post("/generate/plan", data=dict(PLAN_FORM, weeks=str(weeks)))
+    plan_id = db.list_plans(uid)[0]["id"]
+    baseline = {w["date"]: w for w in planmod.generate_plan(
+        "Race Plan", MONDAY, weeks, RIDE_DAYS, HOURS, 2)["workouts"]}
+    return uid, plan_id, _stored(uid, plan_id), baseline
+
+
+def test_shorter_still_is_only_claimed_when_the_rows_are_shorter(client):
+    """The taper multiplier steps down at 7 days out, but a deeper cut of a
+    LONGER ride is still the longer session. Here the final week's stored
+    sessions are longer than the fortnight's, so the clause must be dropped -
+    the plain "sessions get shorter" is true and is all that is said."""
+    uid, plan_id, stored, base = _long_plan(
+        client, 8, [("2026-09-05", "A", "Nats", 120)])
+
+    # The stored evidence: the near window is NOT shorter than the far one.
+    far = [stored[d]["duration_s"] for d in ("2026-08-24", "2026-08-28")]
+    near = [stored[d]["duration_s"] for d in ("2026-08-31", "2026-09-04")]
+    assert max(near) > min(far)
+    assert all(stored[d]["duration_s"] < base[d]["duration_s"]
+               for d in ("2026-08-24", "2026-08-28", "2026-08-31", "2026-09-04"))
+
+    r = _by_date(_describe(uid, plan_id, today=TODAY.isoformat()), "2026-09-05")
+    assert r["taper_from"] == "2026-08-24"
+    assert r["taper_hard_from"] is None
+
+    read = _sentences(_races_section(client.get(f"/plan?plan_id={plan_id}").text))
+    assert "Taper from 2026-08-24: sessions get shorter," in read
+    assert "shorter still" not in read
+
+
+def test_shorter_still_is_claimed_when_the_rows_do_bear_it_out(client):
+    uid, plan_id, stored, base = _long_plan(
+        client, 12, [("2026-08-22", "A", "One", 300),
+                     ("2026-09-12", "A", "Two", 120)])
+    r = _by_date(_describe(uid, plan_id, today=TODAY.isoformat()), "2026-09-12")
+    assert r["taper_hard_from"] == "2026-09-07"
+    # Every session from the claimed date really is shorter than every tapered
+    # session before it.
+    near = [stored[d]["duration_s"] for d in r["affects"]
+            if r["taper_hard_from"] <= d < "2026-09-12"]
+    far = [stored[d]["duration_s"] for d in r["affects"]
+           if d < r["taper_hard_from"]]
+    assert near and far and max(near) < min(far)
+
+
+def test_a_taper_never_claims_the_previous_races_recovery_days(client):
+    """Race Two's fortnight opens on race One's post-race easy days. They are
+    shorter than the baseline, but they are recovery, not a taper - One reports
+    them itself, and Two must not claim them or the intensity that collapsed
+    on them."""
+    uid, plan_id, stored, base = _long_plan(
+        client, 12, [("2026-08-22", "A", "One", 300),
+                     ("2026-09-12", "A", "Two", 120)])
+    described = _describe(uid, plan_id, today=TODAY.isoformat())
+    one = _by_date(described, "2026-08-22")
+    two = _by_date(described, "2026-09-12")
+
+    for d in ("2026-08-29", "2026-08-31"):
+        # Stored as recovery, against an interval day in the raceless plan.
+        assert stored[d]["type"] == "recovery"
+        assert base[d]["type"] in planmod.HARD_KINDS
+        assert d in one["recovery_dates"]     # race One's, and it says so
+        assert d not in two["affects"]        # never race Two's taper
+    assert two["taper_from"] == "2026-09-04"
+    # Every day Two claims as TAPER kept its kind (the days after the race are
+    # recovery and are described as such), so the intensity clause is honest.
+    assert two["intensity_held"] is True
+    assert all(stored[d]["type"] == base[d]["type"] for d in two["affects"]
+               if d < "2026-09-12")
+
+
+def test_the_intensity_clause_is_dropped_when_a_tapered_day_changed_kind(client):
+    """Whatever the cause - an adaptation, a hand edit - if a tapered day no
+    longer carries the kind the plan gave it, intensity did not hold and the
+    clause goes."""
+    uid, plan_id, stored, base = _long_plan(
+        client, 8, [("2026-09-05", "A", "Nats", 120)])
+    before = _by_date(_describe(uid, plan_id, today=TODAY.isoformat()),
+                      "2026-09-05")
+    assert before["intensity_held"] is True
+    assert "intensity hold" in _sentences(
+        _races_section(client.get(f"/plan?plan_id={plan_id}").text))
+
+    row = stored["2026-08-24"]                # a claimed taper day
+    db.replace_plan_workout_content(
+        uid, row["id"], row["name"], "recovery", row["duration_s"], row["tss"],
+        "<x/>", "2026-08-01", variant=row.get("variant"))
+
+    r = _by_date(_describe(uid, plan_id, today=TODAY.isoformat()), "2026-09-05")
+    assert r["intensity_held"] is False
+    assert r["taper_from"] == "2026-08-24"    # it is still shorter, still said
+    read = _sentences(_races_section(client.get(f"/plan?plan_id={plan_id}").text))
+    assert "Taper from 2026-08-24: sessions get shorter." in read
+    assert "intensity hold" not in read
+
+
 # --------------------------------------------------------------- the demotion
 def test_a_demotion_is_described_with_its_reason(user_id):
     db.add_race_date(user_id, A_RACE, "A", "Nationals", 60)
