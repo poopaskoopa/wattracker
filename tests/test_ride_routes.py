@@ -1,6 +1,7 @@
 """Route + WebSocket tests for the Ride page (no hardware; availability is
 forced via monkeypatch so results don't depend on whether bleak is installed)."""
 import asyncio
+import datetime as dt
 import re
 
 import pytest
@@ -11,6 +12,7 @@ from fastapi.testclient import TestClient  # noqa: E402
 from wattracker import db  # noqa: E402
 from wattracker.ble import devices as bledevices  # noqa: E402
 from wattracker.server import create_app  # noqa: E402
+from wattracker import server as servermod  # noqa: E402
 
 
 @pytest.fixture()
@@ -94,6 +96,41 @@ def test_ride_page_without_deep_link_keeps_default_selection(client):
         rf'<option value="{workout_id}" data-name="Selected workout"\s+selected>',
         r.text,
     )
+
+
+def test_ride_page_uses_users_local_calendar_day(client, monkeypatch):
+    frozen = dt.datetime(2026, 1, 2, 0, 30)
+    monkeypatch.setattr(servermod, "utc_now", lambda: frozen)
+    _register(client)
+    uid = db.get_user_by_username("rider")["id"]
+    db.save_user_settings(uid, {"timezone": "America/New_York"})
+    _add_plan_workout(client, "2026-01-01", "New York workout")
+
+    assert "New York workout" in client.get("/ride").text
+
+    client.post("/logout")
+    _register(client, "utc-rider")
+    _add_plan_workout(
+        client, "2026-01-01", "UTC workout", username="utc-rider"
+    )
+    assert "UTC workout" not in client.get("/ride").text
+
+
+def test_settings_timezone_persists_and_invalid_value_is_safe(client):
+    _register(client)
+    uid = db.get_user_by_username("rider")["id"]
+
+    response = client.post("/settings", data={"timezone": "Europe/Paris"})
+    assert response.status_code == 200
+    assert db.get_user_settings(uid)["timezone"] == "Europe/Paris"
+    assert 'value="Europe/Paris"' in client.get("/settings").text
+
+    response = client.post(
+        "/settings", data={"timezone": "../../etc/passwd"}
+    )
+    assert response.status_code == 200
+    assert "Invalid IANA time zone" in response.text
+    assert db.get_user_settings(uid)["timezone"] == "Europe/Paris"
 
 
 def test_ride_page_deep_link_includes_past_workout(client):

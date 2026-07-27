@@ -11,6 +11,10 @@ from __future__ import annotations
 
 import datetime as _dt
 from typing import List, Optional, Tuple
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
+
+
+DEFAULT_TIMEZONE = "UTC"
 
 
 def to_naive(dt: Optional[_dt.datetime]) -> Optional[_dt.datetime]:
@@ -48,6 +52,69 @@ def utc_today() -> _dt.date:
     timestamps, so the reference day has to be the UTC one.
     """
     return utc_now().date()
+
+
+def valid_timezone(value: object) -> bool:
+    """Whether *value* is a usable IANA timezone key.
+
+    ZoneInfo also rejects absolute paths and keys containing path traversal.
+    The length cap avoids doing filesystem/package lookups for an unbounded
+    form value.
+    """
+    if not isinstance(value, str):
+        return False
+    key = value.strip()
+    if not key or len(key) > 255:
+        return False
+    try:
+        ZoneInfo(key)
+    except (
+        ZoneInfoNotFoundError,
+        ValueError,
+        TypeError,
+        OSError,
+        UnicodeError,
+    ):
+        return False
+    return True
+
+
+def to_user_timezone(
+    dt: _dt.datetime, timezone_name: object
+) -> _dt.datetime:
+    """Represent a UTC instant in a user's IANA timezone.
+
+    Naive datetimes are interpreted as UTC because that is wattracker's
+    storage/runtime convention. Invalid or missing saved values safely retain
+    UTC behavior.
+    """
+    key = (
+        timezone_name.strip()
+        if isinstance(timezone_name, str) and timezone_name.strip()
+        else DEFAULT_TIMEZONE
+    )
+    try:
+        zone = ZoneInfo(key) if len(key) <= 255 else ZoneInfo(DEFAULT_TIMEZONE)
+    except (
+        ZoneInfoNotFoundError,
+        ValueError,
+        TypeError,
+        OSError,
+        UnicodeError,
+    ):
+        zone = ZoneInfo(DEFAULT_TIMEZONE)
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=_dt.timezone.utc)
+    else:
+        dt = dt.astimezone(_dt.timezone.utc)
+    return dt.astimezone(zone)
+
+
+def local_today(
+    timezone_name: object, now: Optional[_dt.datetime] = None
+) -> _dt.date:
+    """The user's local calendar date at a UTC instant."""
+    return to_user_timezone(now or utc_now(), timezone_name).date()
 
 
 def local_offset_seconds(dt: _dt.datetime) -> int:

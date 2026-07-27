@@ -71,7 +71,10 @@ def test_v23_to_v24_preserves_rows_and_creates_audit_table(tmp_path):
     db.init_db(path)
 
     conn = sqlite3.connect(path)
-    assert conn.execute("PRAGMA user_version").fetchone()[0] == 24
+    assert (
+        conn.execute("PRAGMA user_version").fetchone()[0]
+        == db.SCHEMA_VERSION
+    )
     assert conn.execute("SELECT username FROM users").fetchone()[0] == "kept"
     columns = {
         row[1] for row in conn.execute("PRAGMA table_info(power_sample_corrections)")

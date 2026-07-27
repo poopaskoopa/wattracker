@@ -18,11 +18,11 @@ from typing import Callable, Dict, Iterator, List, Optional, Sequence, Union
 
 from .config import db_path
 from .config import _restrict
-from .timeutil import utc_now
+from .timeutil import utc_now, valid_timezone
 
 _log = logging.getLogger(__name__)
 
-SCHEMA_VERSION = 24
+SCHEMA_VERSION = 25
 
 
 def _restrict_db_files(path: str) -> None:
@@ -200,6 +200,9 @@ _MIGRATIONS: Dict[int, Sequence[Union[str, Callable[[sqlite3.Connection], None]]
         # New table power_sample_corrections is created by _SCHEMA after
         # migrating. Activity stream BLOBs remain immutable.
     ],
+    24: [
+        "ALTER TABLE user_settings ADD COLUMN timezone TEXT",
+    ],
 }
 
 _DROP = """
@@ -238,6 +241,7 @@ CREATE TABLE IF NOT EXISTS user_settings (
     zwift_password_enc TEXT,
     weight_kg          REAL,
     hr_max             INTEGER,
+    timezone           TEXT,
     FOREIGN KEY(user_id) REFERENCES users(id)
 );
 
@@ -660,7 +664,7 @@ def get_user_by_id(user_id: int, path: Optional[str] = None) -> Optional[dict]:
 
 # -------------------------------------------------------------- settings
 _SETTING_KEYS = ("ftp", "zwift_id", "activities_dir", "workouts_dir",
-                 "zwift_email", "weight_kg", "hr_max")
+                 "zwift_email", "weight_kg", "hr_max", "timezone")
 
 
 def get_user_settings(user_id: int, path: Optional[str] = None) -> dict:
@@ -668,7 +672,7 @@ def get_user_settings(user_id: int, path: Optional[str] = None) -> dict:
     try:
         row = conn.execute(
             "SELECT ftp, zwift_id, activities_dir, workouts_dir, zwift_email, "
-            "weight_kg, hr_max FROM user_settings WHERE user_id = ?",
+            "weight_kg, hr_max, timezone FROM user_settings WHERE user_id = ?",
             (user_id,),
         ).fetchone()
         if not row:
@@ -683,15 +687,21 @@ def save_user_settings(user_id: int, updates: dict, path: Optional[str] = None) 
     current = get_user_settings(user_id, path=path)
     for key in _SETTING_KEYS:
         if key in updates and updates[key] not in (None, ""):
-            current[key] = updates[key]
+            value = updates[key]
+            if key != "timezone":
+                current[key] = value
+            else:
+                timezone = value.strip() if isinstance(value, str) else value
+                if valid_timezone(timezone):
+                    current[key] = timezone
     conn = connect(path)
     try:
         conn.execute(
             """
             INSERT INTO user_settings
                 (user_id, ftp, zwift_id, activities_dir, workouts_dir,
-                 zwift_email, weight_kg, hr_max)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                 zwift_email, weight_kg, hr_max, timezone)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(user_id) DO UPDATE SET
                 ftp=excluded.ftp,
                 zwift_id=excluded.zwift_id,
@@ -699,7 +709,8 @@ def save_user_settings(user_id: int, updates: dict, path: Optional[str] = None) 
                 workouts_dir=excluded.workouts_dir,
                 zwift_email=excluded.zwift_email,
                 weight_kg=excluded.weight_kg,
-                hr_max=excluded.hr_max
+                hr_max=excluded.hr_max,
+                timezone=excluded.timezone
             """,
             (
                 user_id,
@@ -710,6 +721,7 @@ def save_user_settings(user_id: int, updates: dict, path: Optional[str] = None) 
                 current["zwift_email"],
                 current["weight_kg"],
                 current["hr_max"],
+                current["timezone"],
             ),
         )
         conn.commit()
