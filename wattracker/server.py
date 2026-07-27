@@ -65,7 +65,7 @@ from .prescribe.planner import (
     plan_workout,
     workout_type_info,
 )
-from .timeutil import utc_now, utc_today
+from .timeutil import local_today, utc_now, utc_today, valid_timezone
 
 DAY_LABELS = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
 
@@ -1935,6 +1935,7 @@ def create_app() -> FastAPI:
         zwift_email: str = Form(""),
         zwift_password: str = Form(""),
         weight_kg: str = Form(""),
+        timezone: str = Form(""),
     ):
         uid = _uid(request)
         # A picked player folder (radio) wins over the free-text field.
@@ -1957,6 +1958,10 @@ def create_app() -> FastAPI:
         if wk_err:
             dir_msgs.append(wk_err)
             clean_workouts = ""
+        clean_timezone = (timezone or "").strip()
+        if clean_timezone and not valid_timezone(clean_timezone):
+            dir_msgs.append("Invalid IANA time zone.")
+            clean_timezone = ""
         db.save_user_settings(
             uid,
             {
@@ -1965,6 +1970,7 @@ def create_app() -> FastAPI:
                 "activities_dir": clean_activities,
                 "workouts_dir": clean_workouts,
                 "weight_kg": weight_val,
+                "timezone": clean_timezone,
             },
         )
         # A manual FTP entry records a source='manual' row for today (per user).
@@ -2080,7 +2086,8 @@ def create_app() -> FastAPI:
 
     # ------------------------------------------------------- ride (BLE)
     def _upcoming_plan_workouts(uid: int, limit: int = 40) -> List[dict]:
-        today = utc_today().isoformat()
+        timezone = db.get_user_settings(uid).get("timezone")
+        today = local_today(timezone, utc_now()).isoformat()
         out: List[dict] = []
         for p in db.list_plans(uid):
             for w in db.plan_workouts_for_plan(uid, p["id"]):
