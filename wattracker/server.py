@@ -1180,11 +1180,11 @@ def create_app() -> FastAPI:
         must NOT overwrite it, or a plan would say one thing on creation and
         another when re-opened.
 
-        ``describe_races`` establishes the effects by diffing a with-races
-        generation against a raceless one and then checks them against the rows
-        actually stored, so a plan that was never recomputed for these races
-        (only the ACTIVE plan is reflowed when a race changes) reports them as
-        stale rather than claiming a taper it does not contain.
+        ``describe_races`` works date by date: a claim needs both evidence (the
+        STORED row differs from a raceless baseline) and attribution (the race
+        predicts that difference), so a plan never recomputed for a race - only
+        the ACTIVE plan is reflowed when one changes - describes nothing, while
+        a plan whose taper partly landed describes exactly the part that did.
         """
         races = db.list_race_dates(uid)
         if not races:
@@ -1200,10 +1200,10 @@ def create_app() -> FastAPI:
             described - reflow refuses it too. State the priorities, which are
             true of the race list alone, and nothing else."""
             return [
-                {**r, "stale": True, "no_recipe": True, "affects": [],
-                 "displaces_workout": False, "taper_from": None,
-                 "taper_hard_from": None, "recovery_dates": [],
-                 "easy_dates": [], "outside_plan": False}
+                {**r, "no_recipe": True, "affects": [], "predicted": [],
+                 "left_alone": [], "pending": [], "displaces_workout": False,
+                 "taper_from": None, "taper_hard_from": None,
+                 "recovery_dates": [], "easy_dates": [], "outside_plan": False}
                 for r in planmod.race_priorities(races)
                 if start.isoformat() <= r["date"] <= end.isoformat()
             ]
@@ -1221,6 +1221,9 @@ def create_app() -> FastAPI:
                 profile=profile_store.for_user(uid),
                 phases=goalsmod.arc_for(recipe.get("goal")),
                 stored={w["date"]: w for w in workouts},
+                # Reflow's own cutoff: a row dated today or earlier is never
+                # rewritten, so an effect missing there is explained, not owed.
+                today=utc_today().isoformat(),
             )
         except (ValueError, TypeError):
             _log.warning("cannot describe races for plan %s", plan.get("id"),

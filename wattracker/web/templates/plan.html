@@ -383,20 +383,16 @@
                        taper. Your saved priority is untouched &mdash; moving or deleting the earlier
                        race restores this one's taper.</p>
                     {% endif %}
-                    {#- Only the ACTIVE plan is recomputed when a race changes, and
-                        reflow never rewrites locked or past rows, so this plan may
-                        simply not contain the race's effects. Say that instead of
-                        describing a taper it does not have. #}
-                    {% if r.stale %}
-                    <p class="alert">This plan has not been recomputed for this race, so it
-                       does not bend around it: its workouts are unchanged.
-                       {%- if r.no_recipe %} It was created before plans stored the inputs they
-                       were generated from, so it cannot be recomputed at all &mdash; generate a
-                       new plan to train around this race.
-                       {%- else %} Make it your active plan on the
-                       <a href="/calendar">calendar</a>, or add, move or remove a race, and it is
-                       recomputed.{% endif %}</p>
-                    {% elif r.affects %}
+                    {#- Every sentence below is about DATES, not about the race as a
+                        whole: what landed is described, what is past or completed is
+                        explained (reflow never rewrites those - a feature), and only
+                        what is genuinely still owed asks for a recompute. #}
+                    {% if r.no_recipe %}
+                    <p class="alert">This plan was created before plans stored the inputs they
+                       were generated from, so it cannot be recomputed around this race &mdash;
+                       generate a new plan to train around it.</p>
+                    {% else %}
+                    {% if r.affects %}
                     <p class="hint">
                         {%- if r.outside_plan %} This race falls outside the plan, but the plan
                         still bends towards it.{% endif %}
@@ -411,9 +407,22 @@
                         {%- if r.easy_dates %} Hard days either side ({{ r.easy_dates|join(', ') }})
                         drop to endurance &mdash; the race is that week's hard work.{% endif %}
                     </p>
-                    {% else %}
+                    {% endif %}
+                    {% if r.left_alone %}
+                    <p class="hint">{{ r.left_alone|join(', ') }} stayed as
+                       {{ 'it was' if r.left_alone|length == 1 else 'they were' }}: past and
+                       completed workouts are never rewritten.</p>
+                    {% endif %}
+                    {% if r.pending %}
+                    <p class="alert">This plan does not reflect this race yet
+                       ({{ r.pending|join(', ') }} would change). Make it your active plan on the
+                       <a href="/calendar">calendar</a>, or add, move or remove a race, and it is
+                       recomputed.</p>
+                    {% endif %}
+                    {% if not r.predicted %}
                     <p class="hint">This plan schedules nothing on this date and nothing around
                        it, so it is unaffected.</p>
+                    {% endif %}
                     {% endif %}
                 </li>
                 {% endfor %}
