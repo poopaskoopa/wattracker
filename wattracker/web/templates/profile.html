@@ -179,7 +179,14 @@
             borderColor: color,
             backgroundColor: fill,
             pointBackgroundColor: color,
-            pointBorderColor: "#10161d",
+            pointBorderColor: typeof cssVar === "function"
+                ? cssVar("--surface-inset", "#10161d") : "#10161d",
+            // The global chart theme sets elements.point.radius to 0 for the
+            // line charts, which would erase this radar's vertex dots and its
+            // hit targets — the tooltip is the only place the actual watts and
+            // W/kg appear. Restated locally until WP-4 replaces the radar.
+            pointRadius: 3,
+            pointHitRadius: 8,
             borderWidth: 2,
             spanGaps: false
         };
