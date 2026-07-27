@@ -98,6 +98,38 @@
 </form>
 {% endif %}
 
+<h3>Calendar feed</h3>
+<p class="hint">Subscribe your phone&rsquo;s calendar to a read-only feed of your
+   scheduled workouts &mdash; 30 days back and 180 days ahead, one all-day entry
+   each. Completed sessions are marked with a &check;.</p>
+<p class="hint"><strong>Anyone who has the link can read your schedule.</strong>
+   Calendar apps cannot log in, so the link itself is the password: treat it
+   like one, and generate a new link if it leaks &mdash; that immediately stops
+   the old one from working.</p>
+
+{% if calendar_message %}<p class="ok">{{ calendar_message }}</p>{% endif %}
+
+{% if calendar_feed_url %}
+<p><strong>Your subscription URL</strong> &mdash; copy it now, it is not shown
+   again:</p>
+<label class="calendar-feed-url">
+    <input type="text" readonly value="{{ calendar_feed_url }}"
+           autocomplete="off" spellcheck="false"
+           onfocus="this.select()" size="80">
+</label>
+{% elif calendar_token_set %}
+<p class="hint">A calendar link is active. The link is stored only as a hash, so
+   it cannot be shown again &mdash; generate a new one if you no longer have it.</p>
+{% else %}
+<p class="hint">No calendar link yet.</p>
+{% endif %}
+
+<form method="post" action="/settings/calendar-feed" class="calendar-feed-form">
+    <button type="submit">
+        {{ 'Generate a new calendar link' if calendar_token_set else 'Create calendar link' }}
+    </button>
+</form>
+
 <h3>Backups</h3>
 <p class="hint">Backups are full snapshots of the database and therefore cover
    <strong>all users&rsquo; data</strong>, not just yours. They are taken

@@ -318,7 +318,9 @@ def test_v24_database_adds_timezone_without_losing_settings(tmp_path):
     assert settings["ftp"] == 245
     assert settings["timezone"] is None
     conn = sqlite3.connect(path)
-    assert conn.execute("PRAGMA user_version").fetchone()[0] == 25
+    # Migrated all the way to current, not just to the version that introduced
+    # the column - so this keeps passing as later versions are added.
+    assert conn.execute("PRAGMA user_version").fetchone()[0] == db.SCHEMA_VERSION
     assert "timezone" in {
         row[1] for row in conn.execute("PRAGMA table_info(user_settings)")
     }
