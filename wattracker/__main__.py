@@ -28,7 +28,19 @@ def main() -> None:
     print(f"wattracker running at {url}")
     if config.open_browser_enabled():
         threading.Thread(target=_open_browser, args=(url,), daemon=True).start()
-    uvicorn.run("wattracker.server:app", host=host, port=port, reload=False)
+    # proxy_headers=False on purpose. uvicorn defaults it to True with
+    # forwarded_allow_ips defaulting to "127.0.0.1" - and this app binds
+    # loopback, so EVERY caller is inside the trusted range. That makes
+    # X-Forwarded-For a client-controlled override of request.client.host: any
+    # local process could name itself an arbitrary address. There is no proxy
+    # in front of this app, so no forwarded header should ever be believed.
+    uvicorn.run(
+        "wattracker.server:app",
+        host=host,
+        port=port,
+        reload=False,
+        proxy_headers=False,
+    )
 
 
 if __name__ == "__main__":
