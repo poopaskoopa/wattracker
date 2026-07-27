@@ -44,6 +44,22 @@ B_RACE = "2026-08-06"
 LATE_A = "2026-08-24"       # 7 days after A_RACE -> demoted
 
 
+# What counts as "past" - and therefore as a row reflow may not rewrite - is
+# the whole subject here, so the clock is pinned rather than left to the day
+# the suite happens to run.
+TODAY = dt.date(2026, 7, 27)
+NOW_UTC = dt.datetime(2026, 7, 27, 0, 10)
+
+
+@pytest.fixture(autouse=True)
+def frozen_clock(monkeypatch):
+    import wattracker.server as servermod
+    from wattracker.prescribe import reflow as reflowmod
+
+    monkeypatch.setattr(servermod, "utc_today", lambda: TODAY)
+    monkeypatch.setattr(reflowmod, "utc_now", lambda: NOW_UTC)
+
+
 @pytest.fixture()
 def client():
     app = create_app()
@@ -62,12 +78,18 @@ def _races_section(html):
     return m.group(0) if m else None
 
 
-def _seed_plan(uid, weeks=WEEKS, active=True, races=None, name="Race Plan"):
+def _sentences(html):
+    """The block as the rider reads it: tags stripped, whitespace collapsed."""
+    return re.sub(r"\s+", " ", re.sub(r"<[^>]+>", " ", html)).strip()
+
+
+def _seed_plan(uid, weeks=WEEKS, active=True, races=None, name="Race Plan",
+               start=MONDAY):
     """A stored plan with a recipe, generated around ``races`` (default: the
     rider's current races, the way /generate/plan does it)."""
     recipe = reflow.build_recipe(RIDE_DAYS, HOURS, 2)
     generated = planmod.generate_plan(
-        name, MONDAY, weeks, recipe["days_of_week"], recipe["hours_per_week"],
+        name, start, weeks, recipe["days_of_week"], recipe["hours_per_week"],
         recipe["hit_days_per_week"],
         races=db.list_race_dates(uid) if races is None else races,
     )
@@ -88,13 +110,14 @@ def _stored(uid, plan_id):
     return {w["date"]: w for w in db.plan_workouts_for_plan(uid, plan_id)}
 
 
-def _describe(uid, plan_id):
-    """Exactly what the plan page renders from, including the stored-row check."""
+def _describe(uid, plan_id, today=None, start=MONDAY):
+    """Exactly what the plan page renders from: the stored rows are the
+    evidence for every claim, so they are always passed."""
     plan = db.get_plan(uid, plan_id)
     return planmod.describe_races(
-        db.list_race_dates(uid), plan["name"], MONDAY, plan["weeks"],
+        db.list_race_dates(uid), plan["name"], start, plan["weeks"],
         days_of_week=RIDE_DAYS, hours_per_week=HOURS, hit_days_per_week=2,
-        stored=_stored(uid, plan_id),
+        stored=_stored(uid, plan_id), today=today,
     )
 
 
@@ -195,29 +218,32 @@ def test_a_race_the_plan_does_nothing_about_is_dropped(user_id):
     assert _describe(user_id, plan_id) == []
 
 
-# ------------------------------------------------------------------ staleness
-def test_a_plan_never_recomputed_for_a_race_says_so(user_id):
+# ------------------------------------------ what landed vs what is still owed
+def test_a_plan_never_recomputed_for_a_race_claims_nothing(user_id):
     """Only the ACTIVE plan is reflowed when a race changes, so another plan's
     rows do not contain the race at all - and must not claim to."""
     plan_id = _seed_plan(user_id, active=False, races=[])   # born race-blind
     db.add_race_date(user_id, A_RACE, "A", "Nationals", 120)
 
     r = _by_date(_describe(user_id, plan_id), A_RACE)
-    assert r["stale"] is True
+    assert r["affects"] == []
+    assert r["taper_from"] is None and r["displaces_workout"] is False
+    assert r["recovery_dates"] == []
+    # Everything the race wants is still owed, and nothing is explained away.
+    assert r["pending"] and r["left_alone"] == []
     # The stored plan really does still have a full session on race day.
-    stored = _stored(user_id, plan_id)
-    assert A_RACE in stored
-    assert stored[A_RACE]["duration_s"] == _raceless_rows(user_id)[A_RACE]["duration_s"]
+    stored, base = _stored(user_id, plan_id), _raceless_rows(user_id)
+    assert stored[A_RACE]["duration_s"] == base[A_RACE]["duration_s"]
 
 
-def test_a_stale_plan_page_describes_no_effects(client):
+def test_an_unrecomputed_plan_page_describes_no_effects(client):
     uid = _register(client)
     client.post("/generate/plan", data=PLAN_FORM)          # race-blind plan
     plan_id = db.list_plans(uid)[0]["id"]
     db.add_race_date(uid, A_RACE, "A", "Nationals", 120)
 
     section = _races_section(client.get(f"/plan?plan_id={plan_id}").text)
-    assert "has not been recomputed for this race" in section
+    assert "does not reflect this race yet" in section
     assert "Taper from" not in section
     assert "No workout is scheduled on race day" not in section
 
@@ -225,29 +251,115 @@ def test_a_stale_plan_page_describes_no_effects(client):
 def test_the_effects_are_described_once_the_plan_is_recomputed(user_id):
     plan_id = _seed_plan(user_id, races=[])
     db.add_race_date(user_id, A_RACE, "A", "Nationals", 120)
-    assert _by_date(_describe(user_id, plan_id), A_RACE)["stale"] is True
+    assert _by_date(_describe(user_id, plan_id), A_RACE)["affects"] == []
 
     reflow.reflow_plan(user_id, plan_id, now=dt.datetime(2026, 8, 1, 9, 0))
     r = _by_date(_describe(user_id, plan_id), A_RACE)
-    assert r["stale"] is False
+    assert r["pending"] == []
     assert r["taper_from"] and r["displaces_workout"] is True
     assert A_RACE not in _stored(user_id, plan_id)
 
 
-def test_a_locked_row_reflow_cannot_rewrite_keeps_the_race_stale(user_id):
-    """Reflow never rewrites a completed row, so the plan does not contain the
-    race's full effect and must not claim it does."""
+def test_a_completed_row_inside_a_taper_is_explained_not_suppressed(user_id):
+    """Reflow never rewrites a completed row. The rest of the taper still
+    landed and is still described; the completed day is explained."""
     plan_id = _seed_plan(user_id, races=[])
     db.add_race_date(user_id, A_RACE, "A", "Nationals", 120)
-    # Complete an easy day inside the taper - reflow will refuse to shorten it.
-    locked = "2026-08-14"
+    locked = "2026-08-14"          # an easy day inside the taper window
     db.mark_plan_workout_completed(
         user_id, _stored(user_id, plan_id)[locked]["id"], 999, locked)
     reflow.reflow_plan(user_id, plan_id, now=dt.datetime(2026, 8, 1, 9, 0))
 
     stored, base = _stored(user_id, plan_id), _raceless_rows(user_id)
     assert stored[locked]["duration_s"] == base[locked]["duration_s"]  # untouched
-    assert _by_date(_describe(user_id, plan_id), A_RACE)["stale"] is True
+    r = _by_date(_describe(user_id, plan_id), A_RACE)
+    assert locked in r["left_alone"]
+    assert locked not in r["affects"]
+    assert r["pending"] == []
+    # The dates that DID taper are still described, and every one of them is a
+    # date whose stored session really is shorter than the baseline.
+    assert r["taper_from"] and r["taper_from"] != locked
+    assert all(stored[d]["duration_s"] < base[d]["duration_s"]
+               for d in r["affects"] if d in stored and d < A_RACE)
+
+
+def test_a_partly_applied_race_describes_the_part_that_landed(user_id):
+    """The verifier's counterexample: a plan already under way, an A race two
+    weeks out, so the first days of the taper are in the past. Four rows really
+    changed and all four must be described."""
+    start = dt.date(2026, 7, 20)          # already started
+    today = "2026-07-27"
+    plan_id = _seed_plan(user_id, races=[], start=start)
+    db.add_race_date(user_id, "2026-08-01", "A", "Nats", 120)
+    reflow.reflow_plan(user_id, plan_id, now=NOW_UTC)
+
+    stored = _stored(user_id, plan_id)
+    base = {w["date"]: w for w in planmod.generate_plan(
+        "Race Plan", start, WEEKS, RIDE_DAYS, HOURS, 2)["workouts"]}
+    changed = sorted(d for d in set(base) | set(stored)
+                     if (d in stored) != (d in base)
+                     or (d in stored and d in base
+                         and (stored[d]["type"], stored[d]["duration_s"])
+                         != (base[d]["type"], base[d]["duration_s"])))
+    assert changed == ["2026-07-31", "2026-08-01", "2026-08-03", "2026-08-05"]
+
+    r = _by_date(_describe(user_id, plan_id, today=TODAY.isoformat(),
+                           start=start),
+                 "2026-08-01")
+    # Every changed row is described, and nothing else is.
+    assert r["affects"] == changed
+    assert r["taper_from"] == "2026-07-31"          # the row that really shrank
+    assert stored["2026-07-31"]["duration_s"] < base["2026-07-31"]["duration_s"]
+    assert r["displaces_workout"] is True and "2026-08-01" not in stored
+    assert r["recovery_dates"] == ["2026-08-03", "2026-08-05"]
+    assert all(stored[d]["type"] == "recovery" for d in r["recovery_dates"])
+    # The taper days that fall in the past were left alone, and say so.
+    assert r["left_alone"] == ["2026-07-20", "2026-07-24", "2026-07-27"]
+    assert all(d <= today for d in r["left_alone"])
+    assert r["pending"] == []
+
+
+def test_the_partly_applied_race_reads_true_on_the_page(client):
+    """The same case through the real routes, rendered."""
+    uid = _register(client)
+    form = dict(PLAN_FORM, start_date="2026-07-20")
+    client.post("/generate/plan", data=form)
+    plan_id = db.list_plans(uid)[0]["id"]
+    client.post("/race/add", data={"date": "2026-08-01", "priority": "A",
+                                   "name": "Nats", "duration_min": "120"},
+                follow_redirects=False)
+
+    read = _sentences(_races_section(client.get(f"/plan?plan_id={plan_id}").text))
+    assert "Taper from 2026-07-31" in read
+    assert "No workout is scheduled on race day" in read
+    assert "Easy sessions afterwards on 2026-08-03, 2026-08-05" in read
+    assert ("2026-07-20, 2026-07-24, 2026-07-27 stayed as they were: past and "
+            "completed workouts are never rewritten") in read
+    assert "does not reflect this race yet" not in read
+    # And the stored rows back every word of it.
+    stored = _stored(uid, plan_id)
+    assert "2026-08-01" not in stored
+    assert stored["2026-08-03"]["type"] == "recovery"
+
+
+def test_a_claim_needs_attribution_as_well_as_evidence(user_id):
+    """A stored row that differs from the baseline for a reason the race does
+    not predict is never claimed - which is what keeps this honest when the
+    baseline drifts (a re-measured profile moves every duration)."""
+    plan_id = _seed_plan(user_id, races=[])
+    db.add_race_date(user_id, A_RACE, "A", "Nationals", 120)
+    reflow.reflow_plan(user_id, plan_id, now=dt.datetime(2026, 8, 1, 9, 0))
+    # Shorten a day the race has no opinion about at all.
+    untouched = "2026-08-28"
+    row = _stored(user_id, plan_id)[untouched]
+    db.replace_plan_workout_content(
+        user_id, row["id"], row["name"], row["type"], 600, row["tss"], "<x/>",
+        "2026-08-01", variant=row.get("variant"))
+
+    r = _by_date(_describe(user_id, plan_id), A_RACE)
+    stored, base = _stored(user_id, plan_id), _raceless_rows(user_id)
+    assert stored[untouched]["duration_s"] < base[untouched]["duration_s"]
+    assert untouched not in r["affects"]      # evidence without attribution
 
 
 # --------------------------------------------------------------- the demotion
