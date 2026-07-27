@@ -1,8 +1,11 @@
-// Weekly training-volume bar charts. Data comes from /api/volume.
+// Weekly training-volume small multiples. Data comes from /api/volume.
 //
-// The four charts share one x-window: presets (1m/1y/All) or a custom date
-// range slice the dense weekly series and re-set labels/data on all four.
-// A horizontal drag on any chart (chartjs-plugin-zoom, same gesture as the
+// Four metrics, four stacked panels, ONE x axis: the panels share a single
+// window (presets 1m/1y/All or a custom date range) that slices the dense
+// weekly series and re-sets labels/data on all four. Only the bottom panel
+// draws the date labels; `alignPanels` (chart-theme.js) keeps every panel's
+// plot area on the same left and right edges so the gridlines stay in column.
+// A horizontal drag on any panel (chartjs-plugin-zoom, same gesture as the
 // dashboard) re-windows all four to the dragged range and switches to Custom.
 
 async function fetchVolume() {
@@ -11,19 +14,14 @@ async function fetchVolume() {
     return await resp.json();
 }
 
-// Bar colour per metric (matches the app's dashboard palette).
-const VOLUME_COLORS = {
-    hours: "#4caf7d",
-    tss: "#f2a900",
-    distance_km: "#5a9bd4",
-    calories: "#e05252",
-};
-
+// One entry per panel, top to bottom. `token` is the series colour (never a
+// literal - see docs/ui-refresh Part 2); `label` is both the y-axis title and
+// the tooltip's series name; `digits` formats the direct-labelled latest value.
 const CHART_SPECS = [
-    { id: "hoursChart", label: "Hours", key: "hours" },
-    { id: "tssChart", label: "TSS", key: "tss" },
-    { id: "distanceChart", label: "Distance (km)", key: "distance_km" },
-    { id: "caloriesChart", label: "Calories", key: "calories" },
+    { id: "hoursChart", label: "Hours", key: "hours", token: "--s-1", digits: 1 },
+    { id: "tssChart", label: "TSS", key: "tss", token: "--s-2", digits: 0 },
+    { id: "distanceChart", label: "Distance (km)", key: "distance_km", token: "--s-3", digits: 0 },
+    { id: "caloriesChart", label: "Calories (kcal)", key: "calories", token: "--s-4", digits: 0 },
 ];
 
 // Module state for windowing.
@@ -32,6 +30,11 @@ const charts = {};       // canvasId -> Chart
 let winStart = 0;        // current window absolute index (inclusive)
 let winEnd = 0;
 let applying = false;    // re-entrancy guard while re-windowing
+let panelCrosshair = null;
+
+function panelCharts() {
+    return CHART_SPECS.map((s) => charts[s.id]).filter((c) => c && c.ctx);
+}
 
 // Add days to an ISO date (yyyy-mm-dd), returning a new ISO date. Uses UTC to
 // avoid any local-timezone drift on the pure-date arithmetic.
@@ -61,14 +64,94 @@ function fillWeeks(weeks) {
     return out;
 }
 
-function makeBarChart(spec) {
+// ------------------------------------------------------------- bar spacing
+// The design calls for 2px of surface between adjacent bars, but the bar count
+// moves over two orders of magnitude with the window: ~5 on the 1m preset,
+// several hundred on All. A fixed barPercentage tuned at 5 bars leaves ~1px of
+// ink at 300; a fixed 2px gap subtracted at 300 bars erases them outright,
+// because the whole category slot is only ~3px wide there.
+//
+// So the gap is a target, not a constant: 2px wherever the slot can afford it,
+// degrading to a quarter of the slot once it cannot, which keeps the bars
+// readable as bars all the way down. `maxBarThickness` caps the other end -
+// without it, five weeks across a 1000px panel would render as five 200px
+// mesas rather than bars.
+const BAR_SPACING_PLUGIN = {
+    id: "volumeBarSpacing",
+    beforeUpdate(chart) {
+        const ds = (chart.data.datasets || [])[0];
+        const n = (chart.data.labels || []).length;
+        if (!ds || !n) return;
+        // chartArea is last layout's; on the very first pass it does not exist
+        // yet, so approximate and let the next update converge (alignPanels
+        // runs two update passes over every panel anyway).
+        const area = chart.chartArea;
+        const plot = area && area.width > 0 ? area.width : chart.width * 0.9;
+        const slot = plot / n;
+        const gap = Math.min(2, Math.max(0.5, slot * 0.25));
+        ds.categoryPercentage = 1;
+        ds.barPercentage = Math.max(0.25, (slot - gap) / slot);
+        ds.maxBarThickness = 40;
+    },
+};
+
+// ------------------------------------------------- direct latest-value label
+// One panel, one series, no legend: the number worth reading is the most
+// recent week, so it is written next to its own bar rather than left for the
+// tooltip. Text token, never the series colour - the bar already carries the
+// hue, and colouring the text too would imply it encodes something.
+//
+// It cannot collide with the bar: the y scale carries `grace` so the tallest
+// bar always stops short of the top, and the label is clamped into that
+// headroom (and to the plot edges) rather than allowed to run off.
+const LATEST_LABEL_PLUGIN = {
+    id: "volumeLatestLabel",
+    afterDatasetsDraw(chart) {
+        const spec = chart.$volumeSpec;
+        const area = chart.chartArea;
+        if (!spec || !area) return;
+        const meta = chart.getDatasetMeta(0);
+        const bars = (meta && meta.data) || [];
+        const values = (chart.data.datasets[0] || {}).data || [];
+        const i = bars.length - 1;
+        if (i < 0 || values[i] == null) return;
+        const bar = bars[i];
+        const text = Number(values[i]).toFixed(spec.digits);
+
+        const ctx = chart.ctx;
+        const size = 11;
+        ctx.save();
+        ctx.font = "600 " + size + "px " + Chart.defaults.font.family;
+        ctx.fillStyle = cssVar("--text", "#e6e6e6");
+        ctx.textBaseline = "bottom";
+        const w = ctx.measureText(text).width;
+        let x = bar.x;
+        ctx.textAlign = "center";
+        if (x + w / 2 > area.right) { x = area.right; ctx.textAlign = "right"; }
+        else if (x - w / 2 < area.left) { x = area.left; ctx.textAlign = "left"; }
+        const y = Math.max(bar.y - 4, area.top + size);
+        ctx.fillText(text, x, y);
+        ctx.restore();
+    },
+};
+
+// ---------------------------------------------------------------- x ticks
+// Tick selection is `dateAxisTicks` in chart-theme.js - the dashboard's stacked
+// fitness panels have exactly the same problem (autoSkip is gated on
+// `ticks.display`, so label-free panels never thin and fall out of column) and
+// a second copy would drift. 16 rather than the dashboard's 12: the volume
+// panels are the full page width with no legend competing for the row.
+const MAX_X_TICKS = 16;
+
+function makeBarChart(spec, isBottom) {
     const el = document.getElementById(spec.id);
     if (!el) return null;
-    const color = VOLUME_COLORS[spec.key] || "#999";
-    return new Chart(el, {
+    const labels = dense.map((w) => w.week_start);
+    const color = cssVar(spec.token);
+    const chart = new Chart(el, {
         type: "bar",
         data: {
-            labels: dense.map((w) => w.week_start),
+            labels,
             datasets: [{
                 label: spec.label,
                 data: dense.map((w) => w[spec.key]),
@@ -79,8 +162,17 @@ function makeBarChart(spec) {
         },
         options: {
             responsive: true,
+            // Panel heights are CSS (.volume-panels); the canvas fills its
+            // panel rather than deriving a height from a width ratio.
+            maintainAspectRatio: false,
+            onResize: scheduleVolumeAlign,
+            // Declared here so alignPanels only ever writes the leaves: on
+            // Chart.js v4 assigning a nested object into `chart.options` after
+            // construction recurses into a stack overflow.
+            layout: { padding: { left: 0, right: 0 } },
+            interaction: { mode: "index", intersect: false },
             plugins: {
-                legend: { display: false },
+                legend: { display: false }, // one series per panel; the y title names it
                 tooltip: {
                     callbacks: {
                         title: (items) => (items.length ? "Week of " + items[0].label : ""),
@@ -89,7 +181,10 @@ function makeBarChart(spec) {
                 },
                 zoom: {
                     zoom: {
-                        drag: { enabled: true, backgroundColor: "rgba(242,169,0,0.15)" },
+                        drag: {
+                            enabled: true,
+                            backgroundColor: tokenAlpha("--accent", 0.15, "#f2a900"),
+                        },
                         mode: "x",
                         onZoomComplete: ({ chart }) => onDragZoom(chart),
                     },
@@ -97,30 +192,38 @@ function makeBarChart(spec) {
             },
             scales: {
                 x: {
+                    // Identical tick generation on every panel keeps the
+                    // gridlines in the same columns; only the bottom panel
+                    // draws the labels, so the four read as one plot with one
+                    // date axis.
+                    afterBuildTicks: dateAxisTicks(MAX_X_TICKS),
                     ticks: {
-                        color: "#c2cad4", maxTicksLimit: 16, maxRotation: 0,
-                        autoSkip: true,
+                        display: isBottom, maxRotation: 0, autoSkip: false,
+                        callback: monthYearTicks(labels),
                     },
-                    grid: {
-                        color: "rgba(138,148,160,0.10)",
-                        tickColor: "rgba(194,202,212,0.8)",
-                    },
-                    border: { color: "rgba(138,148,160,0.6)" },
                 },
                 y: {
                     beginAtZero: true,
+                    // Headroom for the direct label above the tallest bar.
+                    grace: "12%",
+                    ticks: { maxTicksLimit: 4 },
                     title: { display: true, text: spec.label },
-                    ticks: { color: "#c2cad4" },
-                    grid: { color: "rgba(138,148,160,0.10)" },
                 },
             },
         },
+        plugins: [BAR_SPACING_PLUGIN, LATEST_LABEL_PLUGIN],
     });
+    chart.$volumeSpec = spec;
+    return chart;
 }
 
-// A drag on one chart selects a range in that chart's CURRENT (windowed)
+function scheduleVolumeAlign() {
+    schedulePanelAlign(panelCharts());
+}
+
+// A drag on one panel selects a range in that panel's CURRENT (windowed)
 // labels; map those local indices back to absolute indices in `dense` and
-// re-window all four charts to match.
+// re-window all four panels to match.
 function onDragZoom(chart) {
     if (applying) return;
     const sx = chart.scales.x;
@@ -132,7 +235,7 @@ function onDragZoom(chart) {
 }
 
 // Slice `dense` to [lo, hi] (absolute, inclusive) and push labels+data to all
-// four charts, clearing any drag-zoom transform, then reflect the window into
+// four panels, clearing any drag-zoom transform, then reflect the window into
 // the custom date inputs.
 function setWindow(lo, hi) {
     if (!dense.length) return;
@@ -141,16 +244,22 @@ function setWindow(lo, hi) {
     winStart = lo;
     winEnd = hi;
     const slice = dense.slice(lo, hi + 1);
+    const labels = slice.map((w) => w.week_start);
     applying = true;
     CHART_SPECS.forEach((spec) => {
         const c = charts[spec.id];
         if (!c) return;
         if (c.resetZoom) c.resetZoom("none");
-        c.data.labels = slice.map((w) => w.week_start);
+        c.data.labels = labels;
         c.data.datasets[0].data = slice.map((w) => w[spec.key]);
+        // Leaf assignment: the tick formatter closes over the label array, so
+        // a new window needs a new closure or the ticks name the old dates.
+        c.options.scales.x.ticks.callback = monthYearTicks(labels);
         c.update("none");
     });
     applying = false;
+    // New window, new tick text on both axes: re-measure the shared insets.
+    scheduleVolumeAlign();
     const from = document.getElementById("volFrom");
     const to = document.getElementById("volTo");
     if (from) from.value = slice[0].week_start;
@@ -264,12 +373,19 @@ async function renderVolume() {
         if (empty) empty.style.display = "block";
         return;
     }
-    const controls = document.getElementById("volumeControls");
-    if (controls) controls.style.display = "";
+    const block = document.getElementById("volumeBlock");
+    if (block) block.style.display = "";
     renderSummary(dense);
-    CHART_SPECS.forEach((spec) => { charts[spec.id] = makeBarChart(spec); });
+    CHART_SPECS.forEach((spec, i) => {
+        charts[spec.id] = makeBarChart(spec, i === CHART_SPECS.length - 1);
+    });
     winStart = 0;
     winEnd = dense.length - 1;
+    // One hover reads the same week on all four panels - the point of stacking
+    // them on a shared x axis in the first place.
+    if (panelCrosshair) panelCrosshair.destroy();
+    panelCrosshair = linkedCrosshair(panelCharts());
+    scheduleVolumeAlign();
     wireControls();
     // Seed the custom inputs with the full (default "All") window.
     const from = document.getElementById("volFrom");

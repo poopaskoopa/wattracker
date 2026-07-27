@@ -293,11 +293,28 @@ literal `#2a333d`/`#10161d` remains in `style.css`.
 
 **LANDED.** Notes for everyone rebasing on it:
 
-- `chart-theme.js` exposes `cssVar(name, fallback)`,
-  `tokenAlpha(name, alpha, fallback)` (tokens are opaque `#rrggbb`, so
-  translucent fills — area fills, the elevation band, zoom drag boxes — go
-  through this) and `linkedCrosshair(charts) → {destroy()}` as globals. Use
-  them; do not re-read custom properties by hand.
+- `chart-theme.js` is the shared chart API. All globals; use them rather than
+  rolling your own, and add to it rather than copying into a page script:
+  - `cssVar(name, fallback)` — read a token.
+  - `tokenAlpha(name, alpha, fallback)` — tokens are opaque `#rrggbb`, so
+    translucent fills (area fills, the elevation band, zoom drag boxes) go
+    through this.
+  - `monthYearTicks(labels)` — `ticks.callback` for a dated category axis.
+    Format follows the window: day-of-month under ~10 weeks, month names above.
+  - `dateAxisTicks(maxTicks)` — `afterBuildTicks` for the same axis. **Use this
+    instead of `autoSkip` on any stacked panel.** Chart.js gates `autoSkip` on
+    `ticks.display`, so a panel that draws no labels never thins and its
+    gridlines fall out of column with the labelled one. Set
+    `ticks.autoSkip: false` alongside it.
+  - `alignPanels(charts)` / `schedulePanelAlign(charts)` — give N stacked
+    panels a common left edge (each y axis is otherwise sized to its own tick
+    text) and a common right inset (only the labelled panel reserves room for
+    its last label to overhang). Callers must declare
+    `layout: { padding: { left: 0, right: 0 } }` at construction — on v4,
+    assigning a nested object into `chart.options` afterwards recurses into a
+    stack overflow, and Chart.js's own default is the scalar `padding: 0`,
+    which silently swallows a later `.left`.
+  - `linkedCrosshair(charts) → {destroy()}` — one hover reads every panel.
 - `Chart.defaults.scales.<type>` shadows `Chart.defaults.scale` — `radialLinear`
   hard-codes tick colour `#666`, for instance. `chart-theme.js` loops every
   registered scale type, so this is handled; do not assume writing

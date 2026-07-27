@@ -7,37 +7,35 @@
 
 <p id="volumeEmpty" class="hint" style="display:none">No training data yet — import or upload activities to see your weekly volume.</p>
 
-<section id="volumeControls" class="chart-block" style="display:none">
-    <div class="range-controls">
-        <button type="button" class="range-btn" data-preset="1m">1m</button>
-        <button type="button" class="range-btn" data-preset="1y">1y</button>
-        <button type="button" class="range-btn active" data-preset="all">All</button>
-        <label class="custom-range">From <input type="date" id="volFrom"></label>
-        <label class="custom-range">To <input type="date" id="volTo"></label>
-        <button type="button" id="volApply">Apply</button>
-        <button type="button" id="volResetZoom">Reset zoom</button>
+{# Small multiples: four metrics, four panels, ONE x axis. Four separate blocks
+   each redrawing the same dates was four copies of the same information. Only
+   the bottom panel draws the date labels; the other three keep their gridlines
+   and are held in column by alignPanels(). Each panel keeps its own y scale -
+   hours, TSS, km and kcal are four units, which is exactly why this is four
+   panels and not four series. Panel heights come from CSS (.volume-panels) so
+   that the bottom panel can carry a fixed +18px for its tick labels and leave
+   all four plot areas the same height - a canvas `height` attribute can only
+   express a ratio, which would have made that strip grow with the viewport. #}
+<section id="volumeBlock" class="chart-block" style="display:none">
+    <div class="chart-head">
+        <h3>Weekly volume</h3>
+        <div class="range-controls" id="volumeControls">
+            <button type="button" class="range-btn" data-preset="1m">1m</button>
+            <button type="button" class="range-btn" data-preset="1y">1y</button>
+            <button type="button" class="range-btn active" data-preset="all">All</button>
+            <label class="custom-range">From <input type="date" id="volFrom"></label>
+            <label class="custom-range">To <input type="date" id="volTo"></label>
+            <button type="button" id="volApply">Apply</button>
+            <button type="button" id="volResetZoom">Reset zoom</button>
+        </div>
     </div>
-    <p class="hint">Tip: drag horizontally across any chart to zoom all four into that date range.</p>
-</section>
-
-<section class="chart-block">
-    <div class="chart-head"><h3>Hours per week</h3></div>
-    <canvas id="hoursChart" height="90"></canvas>
-</section>
-
-<section class="chart-block">
-    <div class="chart-head"><h3>TSS per week</h3></div>
-    <canvas id="tssChart" height="90"></canvas>
-</section>
-
-<section class="chart-block">
-    <div class="chart-head"><h3>Distance per week (km)</h3></div>
-    <canvas id="distanceChart" height="90"></canvas>
-</section>
-
-<section class="chart-block">
-    <div class="chart-head"><h3>Calories per week (kcal)</h3></div>
-    <canvas id="caloriesChart" height="90"></canvas>
+    <div id="volumePanels" class="chart-panels volume-panels">
+        <div class="volume-panel"><canvas id="hoursChart"></canvas></div>
+        <div class="volume-panel"><canvas id="tssChart"></canvas></div>
+        <div class="volume-panel"><canvas id="distanceChart"></canvas></div>
+        <div class="volume-panel volume-panel--x"><canvas id="caloriesChart"></canvas></div>
+    </div>
+    <p class="hint">Tip: drag horizontally across any panel to zoom all four into that date range.</p>
 </section>
 {% endblock %}
 
