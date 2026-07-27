@@ -576,8 +576,15 @@ button.danger.link-btn { border: none; color: var(--alert); }
     padding: 0.1rem 0.4rem; line-height: 1;
 }
 .modal-close:hover { color: var(--text); filter: none; }
+/* The cap is back, deliberately. WP-5 lifted it on the theory that
+   `vector-effect: non-scaling-stroke` plus CSS-driven label sizing let the
+   graph adapt to any width - but vector-effect governs STROKES only. SVG text
+   scales with the viewBox like everything else, and no CSS can hold it
+   constant against a scaling viewBox. Uncapped in a 1440px main the 560-unit
+   viewBox scales 2.45x and the axis labels render at 28px against 16px body
+   text. Capping the box is the only lever there is. */
 .profile-wrap { background: var(--surface-inset); border: 1px solid var(--surface-border); border-radius: var(--r-md);
-    padding: 0.5rem; margin: 0.75rem 0; }
+    padding: 0.5rem; margin: 0.75rem 0; max-width: 760px; }
 .profile-wrap[hidden] { display: none; }
 #wmTable[hidden], #wmError[hidden] { display: none; }
 .profile-svg { display: block; width: 100%; height: auto; }
@@ -595,8 +602,12 @@ button.danger.link-btn { border: none; color: var(--alert); }
 .profile-svg .pf-free { fill: var(--accent); fill-opacity: .30; stroke: none; }
 .profile-svg .pf-ftp { stroke: var(--muted); stroke-width: 1; stroke-dasharray: 4 3;
     vector-effect: non-scaling-stroke; }
+/* Sized in px, not the --fs-xs rem token: this is a length in viewBox USER
+   UNITS, not on-screen type, so a rem here is a false unit - it resolves
+   against the root font size and is then scaled by the viewBox anyway. 10
+   user units against the 760px cap lands at ~13px on screen. */
 .profile-svg .pf-ylab, .profile-svg .pf-xlab, .profile-svg .pf-ftplab {
-    fill: var(--muted); font-size: var(--fs-xs); dominant-baseline: middle;
+    fill: var(--muted); font-size: 10px; dominant-baseline: middle;
 }
 .profile-svg .pf-ylab, .profile-svg .pf-ftplab { text-anchor: end; }
 .profile-svg .pf-xlab { text-anchor: middle; }
