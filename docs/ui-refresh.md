@@ -413,27 +413,26 @@ WP-8 (ride)                 ← after all of the above are on main
 | WP-1 dashboard | Agent 1 | **merged** `93c2adc` |
 | WP-2 volume | Agent 1 | **merged** `ad0d17d` |
 | WP-4 power profile | Agent 2 | **merged** `4b8493f` |
-| WP-3 activity detail | Agent 1 | in progress |
+| WP-3 activity detail | Agent 1 | **merged** `2243771` |
 | WP-6 tables | Agent 2 | not started — **next for Agent 2** |
 | WP-5 workout SVG | Agent 2 | not started |
 | WP-7 calendar | Agent 2 | not started |
 | WP-8 ride | unassigned | after all of the above |
 
-**Agent 2 — start WP-6 now; do not wait for WP-3.** Rebase on current `main`
-first (it has moved five times since you cut `agent2/ui-wp4`). WP-3 is in
-flight in the integrator's tree but cannot collide with you:
+**Agent 2 — WP-3 has landed, so all of Agent 1's packages are on `main`.**
+Rebase on current `main` and start WP-6; nothing is in flight against you now.
 
-| | WP-3 (in flight) | WP-6 (yours) |
-|---|---|---|
-| templates | `activity_detail.html` only | `activities`, `races`, `plan`, `settings`, `power_corrections` |
-| `style.css` | `.zone-*` rules only | table rules only |
-| JS | `app.js` activity-detail section | none expected |
-
-Two things WP-3 is changing that you should know about but not touch:
-- `applyLegendUnits` grew an `independent: true` unit flag (a legend entry that
-  toggles on its own and takes no part in isolate/restore).
-- `chart-theme.js` gained `strideTicks(maxTicks)` — the non-calendar sibling of
+Two additions to shared code since you cut `agent2/ui-wp4`:
+- `applyLegendUnits` has an `independent: true` unit flag — a legend entry that
+  toggles on its own and takes no part in isolate/restore (the elevation band).
+- `chart-theme.js` has `strideTicks(maxTicks)`, the non-calendar sibling of
   `dateAxisTicks`, for stacked panels on a numeric axis.
+
+One trap worth knowing before WP-7, which will touch the calendar's cells: a
+class selector like `.chart-panels canvas { display: block }` outranks the UA
+sheet's `[hidden] { display: none }`, so an element the page hides still lays
+out. WP-3 lost 300px of page to this. If you write a `display` rule against a
+selector whose elements are ever `hidden`, pair it with a `[hidden]` rule.
 
 Read the WP-0 "LANDED" notes above before you start. `chart-theme.js` grew a
 real shared API during WP-1/WP-2 — six helpers, plus two Chart.js v4 traps
