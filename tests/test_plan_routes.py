@@ -113,15 +113,17 @@ def test_plan_page_uses_graph_button_not_download_links(client):
     assert f"/plan/{plan_id}/export" in r.text
 
 
-def test_workout_profile_svg_can_fill_the_plan_width(client):
-    # Non-scaling strokes and token-sized labels let the plan graph use the
-    # available width. The calendar modal remains capped separately.
+def test_workout_profile_svg_stays_capped(client):
+    # The graph box is capped on purpose. `vector-effect: non-scaling-stroke`
+    # holds STROKES constant against a scaling viewBox but not text: SVG type
+    # scales with the viewBox and no CSS can pin it. Uncapped in a 1440px main
+    # the 560-unit viewBox scales 2.45x and the 10-unit axis labels render at
+    # 28px against 16px body text, so capping the box is the only lever.
     r = client.get("/static/style.css")
     assert r.status_code == 200
     profile_rule = r.text.split(".profile-wrap {", 1)[1].split("}", 1)[0]
     assert "padding: 0.5rem; margin: 0.75rem 0;" in profile_rule
-    assert "max-width" not in profile_rule
-    assert "max-width: 640px" in r.text
+    assert "max-width: 760px" in profile_rule
 
 
 def test_calendar_includes_shared_graph_script(client):

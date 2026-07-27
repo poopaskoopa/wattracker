@@ -204,7 +204,8 @@ def test_workout_chart_profile_css_contract():
     css = pathlib.Path("wattracker/web/static/style.css").read_text()
     profile_css = css.split(".profile-wrap {", 1)[1].split("/* Ride */", 1)[0]
 
-    assert "max-width: 760px" not in profile_css
+    # Capped on purpose - see test_workout_profile_svg_stays_capped.
+    assert "max-width: 760px" in profile_css
     assert ".pf-area { fill: var(--accent);" in profile_css
     fills = re.findall(
         r"\.pf-zone-([1-7]) \{ fill-opacity: ([.0-9]+); \}",
@@ -217,8 +218,12 @@ def test_workout_chart_profile_css_contract():
     for selector in (".pf-grid", ".pf-line", ".pf-ftp"):
         rule = profile_css.split(selector + " {", 1)[1].split("}", 1)[0]
         assert "vector-effect: non-scaling-stroke" in rule
-    assert "font-size: var(--fs-xs)" in profile_css
-    assert "font-size: 10px" not in profile_css
+    # px, not the --fs-xs rem token: this is a length in viewBox USER UNITS,
+    # not on-screen type. A rem resolves against the root font size and is then
+    # scaled by the viewBox anyway, so it is a false unit here - and at 11.52
+    # units it was 15% larger than the 10 the layout was tuned for.
+    assert "font-size: 10px" in profile_css
+    assert "font-size: var(--fs-xs)" not in profile_css
     assert "dominant-baseline: middle" in profile_css
     assert ".pf-xlab { text-anchor: middle; }" in profile_css
     assert ".pf-ylab, .profile-svg .pf-ftplab { text-anchor: end; }" in profile_css

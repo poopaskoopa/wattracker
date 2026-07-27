@@ -415,8 +415,8 @@ WP-8 (ride)                 ← after all of the above are on main
 | WP-4 power profile | Agent 2 | **merged** `4b8493f` |
 | WP-3 activity detail | Agent 1 | **merged** `2243771` |
 | WP-6 tables | Agent 2 | **merged** `52480ad` |
-| WP-5 workout SVG | Agent 2 | not started — **next for Agent 2** |
-| WP-7 calendar | Agent 2 | not started |
+| WP-5 workout SVG | Agent 2 | **merged** (cap reinstated — see below) |
+| WP-7 calendar | Agent 2 | not started — **next for Agent 2** |
 | WP-8 ride | unassigned | after all of the above |
 
 **Agent 2 — WP-3 has landed, so all of Agent 1's packages are on `main`.**
@@ -427,6 +427,17 @@ Two additions to shared code since you cut `agent2/ui-wp4`:
   toggles on its own and takes no part in isolate/restore (the elevation band).
 - `chart-theme.js` has `strideTicks(maxTicks)`, the non-calendar sibling of
   `dateAxisTicks`, for stacked panels on a numeric axis.
+
+**Correction to §1.9, learned the hard way in WP-5.** The spec said to lift the
+`.profile-wrap` 760px cap once strokes were non-scaling and labels CSS-sized.
+That was wrong: `vector-effect: non-scaling-stroke` governs **strokes only**.
+SVG text scales with the viewBox like everything else and no CSS can pin it, so
+uncapped in a 1440px main the 560-unit viewBox scales 2.45x and the axis labels
+render at 28px against 16px body text. The cap is back at 760px (~13px labels),
+and label `font-size` is back to `10px` rather than the `--fs-xs` rem token —
+inside a viewBox a rem is a false unit, resolving against the root font size and
+then being scaled anyway. Everything else WP-5 did is kept: per-zone fills on a
+single-hue opacity ramp, non-scaling strokes, and the missing-FTP guards.
 
 One trap worth knowing before WP-7, which will touch the calendar's cells: a
 class selector like `.chart-panels canvas { display: block }` outranks the UA
