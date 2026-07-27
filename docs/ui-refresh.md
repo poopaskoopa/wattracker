@@ -405,5 +405,23 @@ WP-0  (integrator)          ← blocks everything
 WP-8 (ride)                 ← after all of the above are on main
 ```
 
+## Status
+
+| WP | Owner | State |
+|----|-------|-------|
+| WP-0 foundation | integrator | **merged** `0dd1832` |
+| WP-1 dashboard | Agent 1 | **merged** `93c2adc` |
+| WP-2 volume | Agent 1 | **merged** `ad0d17d` |
+| WP-4 power profile | Agent 2 | **merged** `4b8493f` |
+| WP-3 activity detail | Agent 1 | in progress |
+| WP-6 tables | Agent 2 | not started — **next for Agent 2** |
+| WP-5 workout SVG | Agent 2 | not started |
+| WP-7 calendar | Agent 2 | not started |
+| WP-8 ride | unassigned | after all of the above |
+
+Agent 2: rebase on `main` before starting WP-6 — `main` has moved four times.
+Read the WP-0 "LANDED" notes above first; `chart-theme.js` grew a real shared
+API during WP-1/WP-2 and WP-6 should not reinvent any of it.
+
 Agent 2: start at **WP-4**, it is the one with a real form change in it and the
 most visible payoff. WP-6 next because it touches the most pages.
