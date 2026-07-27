@@ -59,11 +59,14 @@
     </p>
     <div class="power-profile-layout">
         <div class="power-radar-wrap">
-            <canvas id="powerProfileRadar" role="img"
-                    aria-label="Radar chart comparing all-time and last-60-day record power by duration"></canvas>
+            <div id="powerProfileLegend" class="chart-legend"
+                 style="position:absolute;z-index:1;top:0;left:0"
+                 role="group" aria-label="Power profile chart series"></div>
+            <canvas id="powerProfileChart" role="img"
+                    aria-label="Horizontal grouped bar chart comparing normalized all-time and last-60-day record power by duration"></canvas>
         </div>
         <div>
-            <p class="hint power-normalization-note">Each spoke is normalized to that duration’s all-time best (100%). Durations are not compared as raw watts.</p>
+            <p class="hint power-normalization-note">Each row is normalized to that duration’s all-time best (100%). Durations are not compared as raw watts.</p>
             <p class="hint">
                 Coverage: {{ power_profile.coverage.all_time_durations }}/{{ power_profile.coverage.duration_count }} all-time durations;
                 {{ power_profile.coverage.recent_60d_durations }}/{{ power_profile.coverage.duration_count }} since {{ power_profile.cutoff_text }}.
@@ -72,7 +75,7 @@
     </div>
     <div class="table-scroll">
     <table class="power-profile-table">
-        <caption class="sr-only">Record power by duration; text alternative to the radar chart</caption>
+        <caption class="sr-only">Record power by duration; text alternative to the power profile chart</caption>
         <thead><tr>
             <th scope="col">Duration</th>
             <th scope="col">All time</th>
@@ -163,78 +166,12 @@
     </form>
 </section>
 {% if power_profile.available %}
-<script>
-(function () {
-    "use strict";
-    var profileChart = {{ power_profile.chart|tojson }};
-    var canvas = document.getElementById("powerProfileRadar");
-    if (!canvas || typeof Chart === "undefined") return;
+<script id="powerProfileData" type="application/json">{{ power_profile.chart|tojson }}</script>
+{% endif %}
+{% endblock %}
 
-    function dataset(label, data, watts, wkg, color, fill) {
-        return {
-            label: label,
-            data: data,
-            actualWatts: watts,
-            actualWkg: wkg,
-            borderColor: color,
-            backgroundColor: fill,
-            pointBackgroundColor: color,
-            pointBorderColor: typeof cssVar === "function"
-                ? cssVar("--surface-inset", "#10161d") : "#10161d",
-            // The global chart theme sets elements.point.radius to 0 for the
-            // line charts, which would erase this radar's vertex dots and its
-            // hit targets — the tooltip is the only place the actual watts and
-            // W/kg appear. Restated locally until WP-4 replaces the radar.
-            pointRadius: 3,
-            pointHitRadius: 8,
-            borderWidth: 2,
-            spanGaps: false
-        };
-    }
-
-    new Chart(canvas, {
-        type: "radar",
-        data: {
-            labels: profileChart.labels,
-            datasets: [
-                dataset("All time", profileChart.all_time, profileChart.all_time_watts,
-                    profileChart.all_time_wkg, "#f2a900", "rgba(242, 169, 0, 0.18)"),
-                dataset("Last 60 days", profileChart.recent_60d, profileChart.recent_60d_watts,
-                    profileChart.recent_60d_wkg, "#57c7ff", "rgba(87, 199, 255, 0.14)")
-            ]
-        },
-        options: {
-            responsive: true,
-            maintainAspectRatio: false,
-            animation: false,
-            scales: {
-                r: {
-                    suggestedMin: 0,
-                    suggestedMax: 110,
-                    angleLines: {color: "#39424d"},
-                    grid: {color: "#2a333d"},
-                    pointLabels: {color: "#e8edf3", font: {size: 11}},
-                    ticks: {color: "#aab3bd", backdropColor: "transparent", callback: function (v) { return v + "%"; }}
-                }
-            },
-            plugins: {
-                legend: {labels: {color: "#e8edf3"}},
-                tooltip: {
-                    callbacks: {
-                        label: function (context) {
-                            var watts = context.dataset.actualWatts[context.dataIndex];
-                            if (watts === null || watts === undefined) return context.dataset.label + ": unavailable";
-                            var wkg = context.dataset.actualWkg[context.dataIndex];
-                            return context.dataset.label + ": " + watts + " W" +
-                                (wkg === null || wkg === undefined ? "" : " (" + wkg + " W/kg)") +
-                                " — " + context.formattedValue + "%";
-                        }
-                    }
-                }
-            }
-        }
-    });
-}());
-</script>
+{% block scripts %}
+{% if power_profile.available %}
+<script src="{{ static_url('power_profile.js') }}"></script>
 {% endif %}
 {% endblock %}
