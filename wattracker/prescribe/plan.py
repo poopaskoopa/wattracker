@@ -251,12 +251,18 @@ def describe_races(
     in two: ``left_alone`` (past or already completed - reflow never rewrites
     those, which is a feature and gets said plainly) and ``pending`` (the plan
     genuinely has not been recomputed for this race, e.g. it is not the active
-    plan). ``predicted`` empty means the plan does nothing about this race at
-    all, which is a different sentence again.
+    plan).
 
-    A race is described when it falls inside the plan\'s span OR when it
+    Two comparative claims get their comparison actually run against the stored
+    rows rather than assumed from the constants: ``taper_hard_from`` ("shorter
+    still from") is set only when those sessions really are shorter than the
+    tapered days before them, and ``intensity_held`` only when every tapered
+    day kept the kind the raceless plan gave it. Where the evidence is absent
+    the caller says less - the plain "sessions get shorter" is still true.
+
+    A race is described when it falls inside the plan's span OR when it
     predicts anything inside it - a race the week after the plan ends really
-    does shorten the plan\'s final sessions, and saying nothing about that would
+    does shorten the plan's final sessions, and saying nothing about that would
     be the same silence this whole description exists to end.
     """
     base = race_priorities(races)
@@ -277,7 +283,7 @@ def describe_races(
 
     # Attribution boundaries. A shortened day belongs to the next A race after
     # it and a recovery day to the previous one, so neighbouring races cannot
-    # claim each other\'s work: without this, a demoted race would report the
+    # claim each other's work: without this, a demoted race would report the
     # taper of the very A race that demoted it as its own.
     a_days = sorted(_dt.date.fromisoformat(r["date"]) for r in base
                     if r["priority"] == PRIORITY_A)
@@ -292,14 +298,17 @@ def describe_races(
         predicted: Set[str] = set()
 
         # Race day: the raceless plan rides here and the race takes the day.
-        # Predicted by the workout\'s absence, evidenced by the row\'s absence.
+        # Predicted by the workout's absence, evidenced by the row's absence.
         if iso in o_by and iso not in w_by:
             predicted.add(iso)
         item["displaces_workout"] = iso in predicted and iso not in rows
 
         # Taper: days in the fortnight before an A race, back only as far as
         # the previous A race. A hard day already at its feasible floor does
-        # not shorten and is therefore neither predicted nor claimed.
+        # not shorten and is therefore neither predicted nor claimed. A day the
+        # generation turns into a recovery spin is excluded outright: it is the
+        # PREVIOUS A race's post-race easy day, which that race reports itself,
+        # and its shorter duration is not evidence of this race's taper.
         tapered: List[str] = []
         if item["priority"] == PRIORITY_A:
             for off in range(TAPER_FAR_DAYS, 0, -1):
@@ -311,14 +320,32 @@ def describe_races(
                     continue
                 if w_by[k]["duration_s"] >= o_by[k]["duration_s"]:
                     continue
+                if w_by[k]["type"] == "recovery" != o_by[k]["type"]:
+                    continue
                 predicted.add(k)
                 row = rows.get(k)
                 if row is not None and int(row["duration_s"]) < o_by[k]["duration_s"]:
                     tapered.append(k)
-        near_start = (day - _dt.timedelta(days=TAPER_NEAR_DAYS)).isoformat()
         item["taper_from"] = tapered[0] if tapered else None
-        item["taper_hard_from"] = next(
-            (d for d in tapered if d >= near_start), None)
+        # "Shorter still from D" is a COMPARISON, so it is only made when the
+        # stored durations bear it out: every session from D on must be shorter
+        # than every tapered session before it. The multiplier does step down at
+        # TAPER_NEAR_DAYS, but a deeper cut of a longer ride can still be the
+        # longer session, and saying "shorter still" over rows that got longer
+        # is exactly the kind of plausible-but-false claim this describes away.
+        near_start = (day - _dt.timedelta(days=TAPER_NEAR_DAYS)).isoformat()
+        near = [d for d in tapered if d >= near_start]
+        far = [d for d in tapered if d < near_start]
+        item["taper_hard_from"] = None
+        if near and far:
+            if (max(int(rows[d]["duration_s"]) for d in near)
+                    < min(int(rows[d]["duration_s"]) for d in far)):
+                item["taper_hard_from"] = near[0]
+        # Frequency and intensity holding through a taper is likewise a claim
+        # about the stored rows: every tapered day must still be ridden and
+        # still carry the kind the raceless plan gave it.
+        item["intensity_held"] = bool(tapered) and all(
+            rows[d]["type"] == o_by[d]["type"] for d in tapered)
 
         # Post-race recovery: days after an A race whose kind became a recovery
         # spin, up to the next A race (which owns everything past it).
@@ -337,7 +364,7 @@ def describe_races(
                     recovery.append(k)
         item["recovery_dates"] = recovery
 
-        # A B race\'s neighbours: a day either side whose kind changed from
+        # A B race's neighbours: a day either side whose kind changed from
         # interval work to endurance. Only a B race does this, so an A race
         # next to one cannot claim it.
         easy: List[str] = []
@@ -372,7 +399,7 @@ def describe_races(
         item["pending"] = sorted(missing - set(item["left_alone"]))
         item["outside_plan"] = not (monday0 <= day <= last_day)
         # A race outside the span that the plan does nothing about, applied or
-        # not, is not this plan\'s business at all.
+        # not, is not this plan's business at all.
         if item["outside_plan"] and not predicted:
             continue
         out.append(item)

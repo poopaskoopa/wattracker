@@ -1203,7 +1203,8 @@ def create_app() -> FastAPI:
                 {**r, "no_recipe": True, "affects": [], "predicted": [],
                  "left_alone": [], "pending": [], "displaces_workout": False,
                  "taper_from": None, "taper_hard_from": None,
-                 "recovery_dates": [], "easy_dates": [], "outside_plan": False}
+                 "intensity_held": False, "recovery_dates": [],
+                 "easy_dates": [], "outside_plan": False}
                 for r in planmod.race_priorities(races)
                 if start.isoformat() <= r["date"] <= end.isoformat()
             ]

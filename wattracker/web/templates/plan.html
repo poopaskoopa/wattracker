@@ -398,10 +398,14 @@
                         still bends towards it.{% endif %}
                         {%- if r.displaces_workout %} No workout is scheduled on race day &mdash;
                         the race is the session.{% endif %}
+                        {#- "shorter still" and "intensity holds" are only rendered when
+                            the stored rows bear them out; where they do not, the plain
+                            sentence is still true and is all that is said. #}
                         {%- if r.taper_from %} Taper from {{ r.taper_from }}: sessions get shorter
-                        {%- if r.taper_hard_from and r.taper_hard_from != r.taper_from %}
-                        (shorter still from {{ r.taper_hard_from }}){% endif %}, while the number
-                        of rides and their intensity hold.{% endif %}
+                        {%- if r.taper_hard_from %} (shorter still from
+                        {{ r.taper_hard_from }}){% endif %}
+                        {%- if r.intensity_held %}, while the number of rides and their
+                        intensity hold{% endif %}.{% endif %}
                         {%- if r.recovery_dates %} Easy sessions afterwards on
                         {{ r.recovery_dates|join(', ') }}.{% endif %}
                         {%- if r.easy_dates %} Hard days either side ({{ r.easy_dates|join(', ') }})
@@ -418,10 +422,6 @@
                        ({{ r.pending|join(', ') }} would change). Make it your active plan on the
                        <a href="/calendar">calendar</a>, or add, move or remove a race, and it is
                        recomputed.</p>
-                    {% endif %}
-                    {% if not r.predicted %}
-                    <p class="hint">This plan schedules nothing on this date and nothing around
-                       it, so it is unaffected.</p>
                     {% endif %}
                     {% endif %}
                 </li>
