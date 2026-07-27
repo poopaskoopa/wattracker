@@ -113,12 +113,14 @@ def test_plan_page_uses_graph_button_not_download_links(client):
     assert f"/plan/{plan_id}/export" in r.text
 
 
-def test_workout_profile_svg_is_capped_near_its_natural_size(client):
-    # The SVG has a 560x200 viewBox and 10px labels; stretching it to a wide
-    # main only scales the type up. The calendar modal is capped separately.
+def test_workout_profile_svg_can_fill_the_plan_width(client):
+    # Non-scaling strokes and token-sized labels let the plan graph use the
+    # available width. The calendar modal remains capped separately.
     r = client.get("/static/style.css")
     assert r.status_code == 200
-    assert "padding: 0.5rem; margin: 0.75rem 0; max-width: 760px; }" in r.text
+    profile_rule = r.text.split(".profile-wrap {", 1)[1].split("}", 1)[0]
+    assert "padding: 0.5rem; margin: 0.75rem 0;" in profile_rule
+    assert "max-width" not in profile_rule
     assert "max-width: 640px" in r.text
 
 
