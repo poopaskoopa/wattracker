@@ -179,6 +179,236 @@ def resolve_race_conflicts(races: List[dict]) -> tuple:
     return resolved, conflicts
 
 
+def race_priorities(races: Optional[Sequence[dict]]) -> List[dict]:
+    """Each stored race with the priority the PLAN would use, plus any demotion.
+
+    This is the resolution rule's only public front door for views: the
+    calendar badge and the plan summary both come through here rather than
+    re-deriving when an A race counts as an A race. It needs no plan, because
+    the demotion depends on the race list alone.
+
+    Which race took the taper is read off ``resolve_race_conflicts``' own
+    output, in order, rather than re-derived from the dates. Re-deriving it as
+    "the latest A race strictly before this one" was wrong for two A races on
+    the SAME date - the resolver demotes the second, but no A race is earlier,
+    so the reason came out as "your A race on None".
+    """
+    resolved, conflicts = resolve_race_conflicts(normalize_races(races))
+    # One conflict per demoted race, appended in resolution order.
+    demotions = iter(conflicts)
+    out: List[dict] = []
+    for r in resolved:
+        conflict = next(demotions) if r.get("demoted") else None
+        out.append({
+            "id": r.get("id"),
+            "date": r["date"].isoformat(),
+            "name": r.get("name"),
+            "priority": r["priority"],       # EFFECTIVE, post-resolution
+            "duration_min": r.get("duration_min"),
+            "demoted": bool(r.get("demoted")),
+            # The A race that took the taper; only set on a demotion.
+            "conflicts_with": conflict["conflicts_with"] if conflict else None,
+            "separation_days": A_RACE_SEPARATION_DAYS,
+        })
+    return out
+
+
+def describe_races(
+    races: Optional[Sequence[dict]],
+    name: str,
+    start_date: _dt.date,
+    weeks: int,
+    days_of_week: Sequence[int],
+    hours_per_week: float,
+    hit_days_per_week: int,
+    hard_days: Optional[Sequence[int]] = None,
+    model: str = DEFAULT_MODEL,
+    profile: Optional["RiderMetrics"] = None,
+    phases: Optional[Sequence[Phase]] = None,
+    stored: Optional[Dict[str, dict]] = None,
+    today: Optional[str] = None,
+) -> List[dict]:
+    """What this plan actually DID about each race, established date by date.
+
+    The unit here is a DATE, not a race. A race is never "applied" or "not
+    applied": parts of it land and parts deliberately cannot, because reflow
+    refuses to rewrite past and completed workouts. An earlier version judged
+    the whole race by whether every date it touched matched, and so suppressed
+    four real, stored effects because two dates in the past had (correctly)
+    never been tapered.
+
+    Every claim therefore needs two independent things to be true of one date:
+
+    * EVIDENCE - the row this plan actually STORES differs from the raceless
+      baseline in the relevant way (shorter, kind changed, row absent).
+    * ATTRIBUTION - the with-races generation predicts an effect of THIS race
+      on that date.
+
+    Only the intersection is described, and it is read off the stored rows: a
+    date is in ``shorter`` iff its STORED session is shorter than the baseline,
+    race day is displaced iff the row is really absent, a day is eased or
+    recovered iff its STORED kind really changed that way. Requiring
+    attribution as well as evidence is also what makes this safe against
+    baseline drift - the baseline is generated now while the rows were written
+    earlier, possibly against a different measured profile, and a difference the
+    race does not predict is never claimed.
+
+    Dates the race predicts but the stored plan does not show come back split
+    in two: ``left_alone`` (past or already completed - reflow never rewrites
+    those, which is a feature and gets said plainly) and ``pending`` (the plan
+    genuinely has not been recomputed for this race, e.g. it is not the active
+    plan).
+
+    Nothing here describes the SHAPE of a taper. Sentences like "shorter still
+    from D" or "frequency and intensity hold" quantify over a set of days, and
+    the generator guarantees no such thing: a session already at its feasible
+    floor does not shorten, and another race can remove a ride from the middle
+    of the fortnight. Every one of those claims was false for some plan. The
+    taper therefore comes back as ``shorter`` - one entry per date that really
+    is shorter, carrying the stored minutes and the baseline it came down
+    from - and the caller lists the facts instead of characterising them.
+
+    A race is described when it falls inside the plan's span OR when it
+    predicts anything inside it - a race the week after the plan ends really
+    does shorten the plan's final sessions, and saying nothing about that would
+    be the same silence this whole description exists to end.
+    """
+    base = race_priorities(races)
+    if not base:
+        return []
+
+    args = dict(days_of_week=days_of_week, hours_per_week=hours_per_week,
+                hit_days_per_week=hit_days_per_week, hard_days=hard_days,
+                model=model, profile=profile, phases=phases)
+    with_races = generate_plan(name, start_date, weeks, races=races, **args)
+    raceless = generate_plan(name, start_date, weeks, races=None, **args)
+    w_by = {x["date"]: x for x in with_races["workouts"]}
+    o_by = {x["date"]: x for x in raceless["workouts"]}
+    rows = stored or {}
+
+    monday0 = start_date - _dt.timedelta(days=start_date.weekday())
+    last_day = monday0 + _dt.timedelta(days=7 * int(weeks) - 1)
+
+    # Attribution boundaries. A shortened day belongs to the next A race after
+    # it and a recovery day to the previous one, so neighbouring races cannot
+    # claim each other's work: without this, a demoted race would report the
+    # taper of the very A race that demoted it as its own.
+    a_days = sorted(_dt.date.fromisoformat(r["date"]) for r in base
+                    if r["priority"] == PRIORITY_A)
+
+    out: List[dict] = []
+    for item in base:
+        item = dict(item)
+        day = _dt.date.fromisoformat(item["date"])
+        iso = item["date"]
+        prev_a = max([d for d in a_days if d < day], default=None)
+        next_a = min([d for d in a_days if d > day], default=None)
+        predicted: Set[str] = set()
+
+        # Race day: the raceless plan rides here and the race takes the day.
+        # Predicted by the workout's absence, evidenced by the row's absence.
+        if iso in o_by and iso not in w_by:
+            predicted.add(iso)
+        item["displaces_workout"] = iso in predicted and iso not in rows
+
+        # Taper: days in the fortnight before an A race, back only as far as
+        # the previous A race. A hard day already at its feasible floor does
+        # not shorten and is therefore neither predicted nor claimed. A day the
+        # generation turns into a recovery spin is excluded outright: it is the
+        # PREVIOUS A race's post-race easy day, which that race reports itself,
+        # and its shorter duration is not evidence of this race's taper.
+        tapered: List[str] = []
+        if item["priority"] == PRIORITY_A:
+            for off in range(TAPER_FAR_DAYS, 0, -1):
+                d = day - _dt.timedelta(days=off)
+                if prev_a is not None and d <= prev_a:
+                    continue
+                k = d.isoformat()
+                if k not in o_by or k not in w_by:
+                    continue
+                if w_by[k]["duration_s"] >= o_by[k]["duration_s"]:
+                    continue
+                if w_by[k]["type"] == "recovery" != o_by[k]["type"]:
+                    continue
+                predicted.add(k)
+                row = rows.get(k)
+                if row is not None and int(row["duration_s"]) < o_by[k]["duration_s"]:
+                    tapered.append(k)
+        # The taper is reported as the DATES that are actually shorter and by
+        # how much, straight off the rows. Every sentence that described its
+        # SHAPE instead - "taper from D", "shorter still from D", "frequency
+        # and intensity hold" - quantified over a set of days and was false
+        # for some plan: a floor-clamped session inside the "shorter still"
+        # period, a ride removed by another race inside the fortnight. These
+        # numbers each come from one row and can be checked against it.
+        item["shorter"] = [
+            {"date": d,
+             "minutes": int(round(int(rows[d]["duration_s"]) / 60)),
+             "was": int(round(int(o_by[d]["duration_s"]) / 60))}
+            for d in tapered
+        ]
+
+        # Post-race recovery: days after an A race whose kind became a recovery
+        # spin, up to the next A race (which owns everything past it).
+        recovery: List[str] = []
+        if item["priority"] == PRIORITY_A:
+            for k in sorted(w_by):
+                if k <= iso or (next_a is not None and k >= next_a.isoformat()):
+                    continue
+                if k not in o_by or w_by[k]["type"] != "recovery":
+                    continue
+                if o_by[k]["type"] == "recovery":
+                    continue
+                predicted.add(k)
+                row = rows.get(k)
+                if row is not None and row["type"] == "recovery":
+                    recovery.append(k)
+        item["recovery_dates"] = recovery
+
+        # A B race's neighbours: a day either side whose kind changed from
+        # interval work to endurance. Only a B race does this, so an A race
+        # next to one cannot claim it.
+        easy: List[str] = []
+        if item["priority"] == PRIORITY_B:
+            for k in ((day - _dt.timedelta(days=1)).isoformat(),
+                      (day + _dt.timedelta(days=1)).isoformat()):
+                if k not in o_by or k not in w_by:
+                    continue
+                if (w_by[k]["type"] != "endurance"
+                        or o_by[k]["type"] not in HARD_KINDS):
+                    continue
+                predicted.add(k)
+                row = rows.get(k)
+                if row is not None and row["type"] == "endurance":
+                    easy.append(k)
+        item["easy_dates"] = easy
+
+        claimed = set(tapered) | set(recovery) | set(easy)
+        if item["displaces_workout"]:
+            claimed.add(iso)
+        item["affects"] = sorted(claimed)
+        item["predicted"] = sorted(predicted)
+        # A date the race wanted but the plan does not show. Past and completed
+        # rows are never rewritten by design, so they are explained rather than
+        # reported as something missing; the rest genuinely await a recompute.
+        missing = predicted - claimed
+        # Only a date with a stored row can have "stayed as it was" - a date
+        # with no row has nothing that stayed.
+        item["left_alone"] = sorted(
+            d for d in missing
+            if d in rows and ((today is not None and d <= today)
+                              or rows[d].get("completed_activity_id") is not None)
+        )
+        item["pending"] = sorted(missing - set(item["left_alone"]))
+        item["outside_plan"] = not (monday0 <= day <= last_day)
+        # A race outside the span that the plan does nothing about, applied or
+        # not, is not this plan's business at all.
+        if item["outside_plan"] and not predicted:
+            continue
+        out.append(item)
+    return out
+
+
 def recovery_sessions_for(duration_min: Optional[int]) -> int:
     """How many easy sessions follow a race of this length."""
     hours = -(-int(duration_min or 0) // 60)  # ceil

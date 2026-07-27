@@ -1170,6 +1170,66 @@ def create_app() -> FastAPI:
         base.update(kw)
         return _ctx(request, **base)
 
+    def _plan_race_summary(uid: int, plan: dict, recipe: dict,
+                           workouts: List[dict]) -> List[dict]:
+        """What this plan did about the rider's races, as facts about its rows.
+
+        Recomputed at VIEW time, because races are deliberately never stored in
+        the recipe - they are an input read fresh on every reflow. This is the
+        SINGLE place it is computed: unlike `phases`, a freshly generated plan
+        must NOT overwrite it, or a plan would say one thing on creation and
+        another when re-opened.
+
+        ``describe_races`` works date by date: a claim needs both evidence (the
+        STORED row differs from a raceless baseline) and attribution (the race
+        predicts that difference), so a plan never recomputed for a race - only
+        the ACTIVE plan is reflowed when one changes - describes nothing, while
+        a plan whose taper partly landed describes exactly the part that did.
+        """
+        races = db.list_race_dates(uid)
+        if not races:
+            return []
+        try:
+            start = _dt.date.fromisoformat(plan["start_date"])
+        except (ValueError, TypeError):
+            return []
+        end = start + _dt.timedelta(days=7 * int(plan["weeks"]) - 1)
+
+        def _unrecomputable() -> List[dict]:
+            """A plan that cannot be regenerated cannot have its race handling
+            described - reflow refuses it too. State the priorities, which are
+            true of the race list alone, and nothing else."""
+            return [
+                {**r, "no_recipe": True, "affects": [], "predicted": [],
+                 "left_alone": [], "pending": [], "displaces_workout": False,
+                 "shorter": [], "recovery_dates": [], "easy_dates": [],
+                 "outside_plan": False}
+                for r in planmod.race_priorities(races)
+                if start.isoformat() <= r["date"] <= end.isoformat()
+            ]
+
+        if not recipe.get("days_of_week"):
+            return _unrecomputable()   # predates recipes; reflow refuses it
+        try:
+            return planmod.describe_races(
+                races, plan["name"], start, int(plan["weeks"]),
+                days_of_week=recipe["days_of_week"],
+                hours_per_week=recipe.get("hours_per_week"),
+                hit_days_per_week=recipe.get("hit_days_per_week"),
+                hard_days=recipe.get("hard_days") or None,
+                model=recipe.get("model") or planmod.DEFAULT_MODEL,
+                profile=profile_store.for_user(uid),
+                phases=goalsmod.arc_for(recipe.get("goal")),
+                stored={w["date"]: w for w in workouts},
+                # Reflow's own cutoff: a row dated today or earlier is never
+                # rewritten, so an effect missing there is explained, not owed.
+                today=utc_today().isoformat(),
+            )
+        except (ValueError, TypeError):
+            _log.warning("cannot describe races for plan %s", plan.get("id"),
+                         exc_info=True)
+            return _unrecomputable()
+
     def _plan_summary(uid: int, plan_id: int) -> Optional[dict]:
         plan = db.get_plan(uid, plan_id)
         if not plan:
@@ -1201,6 +1261,7 @@ def create_app() -> FastAPI:
                 float(recipe.get("hours_per_week") or 0.0) or 6.0, uid,
             )
             summary["progress"] = _goal_progress(uid, goal.key)
+        summary["races"] = _plan_race_summary(uid, plan, recipe, workouts)
         return summary
 
     def _auto_export_plan(uid: int, plan_id: int) -> dict:
@@ -1542,7 +1603,21 @@ def create_app() -> FastAPI:
         # passed and one was found) attached under "result" - see
         # races.match_result_for_race_date for why this is resolved live
         # rather than stored on race_dates.
-        race_dates = races.attach_results_to_race_dates(uid, db.list_race_dates(uid))
+        stored_races = db.list_race_dates(uid)
+        race_dates = races.attach_results_to_race_dates(uid, stored_races)
+        # The badge must show the priority the PLAN uses, not the one the row
+        # stores: an A race inside an earlier A race's taper is planned as a B
+        # race, and a calendar saying "A" next to a plan that tapers it as a B
+        # is exactly the confusion this describes away. Same resolution the plan
+        # summary uses - never a second copy of the rule.
+        described = {d["id"]: d for d in planmod.race_priorities(stored_races)}
+        for r in race_dates:
+            d = described.get(r["id"])
+            if d is not None:
+                r["priority"] = d["priority"]        # EFFECTIVE
+                r["demoted"] = d["demoted"]
+                r["conflicts_with"] = d["conflicts_with"]
+                r["separation_days"] = d["separation_days"]
         races_by_date = {r["date"]: r for r in race_dates}
 
         def _in_ooto(date_iso: str) -> bool:
@@ -1743,9 +1818,12 @@ def create_app() -> FastAPI:
         changed = (result["updated"] + result["inserted"] + result["deleted"])
         msg = f"{lead} {changed} workout{'' if changed == 1 else 's'} changed."
         for c in result.get("race_conflicts") or []:
-            msg += (f" Note: the race on {c['date']} is within three weeks of "
-                    f"your A race on {c['conflicts_with']}, so it is planned "
-                    f"as a B race (only one taper is possible).")
+            # Same wording as the calendar aside and the overnight notice
+            # rendered beside it: one rule, one number, one sentence.
+            msg += (f" Note: the race on {c['date']} is within "
+                    f"{planmod.A_RACE_SEPARATION_DAYS} days of your A race on "
+                    f"{c['conflicts_with']}, so it is planned as a B race "
+                    f"(only one taper is possible).")
         return msg
 
     def _race_form(date: str, priority: str, name: str, duration_min: str):

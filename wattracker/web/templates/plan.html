@@ -366,6 +366,77 @@
         </section>
         {% endif %}
 
+        {% if plan.races %}
+        <section class="plan-races">
+            <h4>Races in this plan</h4>
+            <ul class="race-blocks">
+                {% for r in plan.races %}
+                <li>
+                    <strong>{{ r.date }}</strong>
+                    <span class="cal-race-tag cal-race-{{ r.priority }}">{{ r.priority }}</span>
+                    {% if r.name %}{{ r.name }}{% endif %}
+                    {% if r.demoted %}
+                    {#- Two A races on the same date are demoted by the same rule, so
+                        "the earlier race" would be false there; name it as the other
+                        race that day instead. #}
+                    {% set same_day = r.conflicts_with == r.date %}
+                    <p class="alert">Marked an <strong>A</strong> race, planned as a
+                       <strong>B</strong> race: it falls within {{ r.separation_days }} days of
+                       {% if same_day %}your other <strong>A</strong> race that day
+                       {%- else %}your A race on <strong>{{ r.conflicts_with }}</strong>{% endif %},
+                       and only one of them can be tapered for. Your saved priority is untouched
+                       &mdash; moving or deleting {{ 'that race' if same_day else 'the earlier race' }}
+                       restores this one's taper.</p>
+                    {% endif %}
+                    {#- Every sentence below is about DATES, not about the race as a
+                        whole: what landed is described, what is past or completed is
+                        explained (reflow never rewrites those - a feature), and only
+                        what is genuinely still owed asks for a recompute. #}
+                    {% if r.no_recipe %}
+                    <p class="alert">This plan was created before plans stored the inputs they
+                       were generated from, so it cannot be recomputed around this race &mdash;
+                       generate a new plan to train around it.</p>
+                    {% else %}
+                    {% if r.affects %}
+                    <p class="hint">
+                        {%- if r.outside_plan %} This race falls outside the plan, but the plan
+                        still bends towards it.{% endif %}
+                        {%- if r.displaces_workout %} No workout is scheduled on race day &mdash;
+                        the race is the session.{% endif %}
+                        {#- The taper is listed date by date, each number straight off a
+                            stored row. Nothing characterises the taper's shape: any such
+                            sentence quantifies over days the generator does not promise. #}
+                        {%- if r.shorter %} Shorter sessions before the race:
+                        {% for x in r.shorter[:6] -%}
+                        {{ x.date }} {{ x.minutes }} min (was {{ x.was }})
+                        {%- if not loop.last %}, {% endif %}
+                        {%- endfor %}
+                        {%- if r.shorter|length > 6 %}, and {{ r.shorter|length - 6 }}
+                        more{% endif %}.{% endif %}
+                        {%- if r.recovery_dates %} Easy sessions afterwards on
+                        {{ r.recovery_dates|join(', ') }}.{% endif %}
+                        {%- if r.easy_dates %} Hard days either side ({{ r.easy_dates|join(', ') }})
+                        drop to endurance &mdash; the race is that week's hard work.{% endif %}
+                    </p>
+                    {% endif %}
+                    {% if r.left_alone %}
+                    <p class="hint">{{ r.left_alone|join(', ') }} stayed as
+                       {{ 'it was' if r.left_alone|length == 1 else 'they were' }}: past and
+                       completed workouts are never rewritten.</p>
+                    {% endif %}
+                    {% if r.pending %}
+                    <p class="alert">This plan does not reflect this race yet
+                       ({{ r.pending|join(', ') }} would change). Make it your active plan on the
+                       <a href="/calendar">calendar</a>, or add, move or remove a race, and it is
+                       recomputed.</p>
+                    {% endif %}
+                    {% endif %}
+                </li>
+                {% endfor %}
+            </ul>
+        </section>
+        {% endif %}
+
         <div class="toolbar">
             <form method="post" action="/plan/{{ plan.plan_id }}/export">
                 <button type="submit">Export plan to Zwift</button>
