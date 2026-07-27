@@ -207,6 +207,11 @@ details summary { cursor: pointer; color: var(--accent); margin: 0.5rem 0; }
 .phase-blocks li { display: inline-block; margin-right: 0.8rem; }
 .phase-blocks li strong { color: var(--accent); text-transform: capitalize; }
 .phase-cell { text-transform: capitalize; color: var(--muted); }
+/* What the plan did about each race. Same weight as the phase blocks above:
+   both answer "what shape is this plan and why", not "what do I ride today". */
+.plan-races { margin: 0.6rem 0; }
+.race-blocks { list-style: none; padding: 0; margin: 0.3rem 0; font-size: 0.85rem; }
+.race-blocks li { margin-bottom: 0.5rem; }
 .goal-signal { font-size: 0.88rem; margin: 0.3rem 0; }
 .goal-signal.secondary { color: var(--muted); }
 .reflow-notice { font-size: 0.85rem; }
@@ -281,6 +286,9 @@ table.calendar th { text-align: center; }
     padding: 0 4px; vertical-align: middle; }
 /* An A race is the one the season bends around - make it the loud one. */
 .cal-race-tag.cal-race-A { background: var(--accent); }
+/* A race whose stored priority is not the one the plan uses. Marked so the
+   badge invites the tooltip that explains why. */
+.cal-race-tag.cal-race-demoted { border-bottom: 2px dotted #1a1a1a; cursor: help; }
 /* A planned race that has a cached result: it was actually ridden. Outlined
    rather than filled so it reads as history next to the solid priority badge,
    which is the plan speaking about the future. */
