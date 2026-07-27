@@ -1,18 +1,84 @@
+/* Design tokens. Every value the rest of the file (and chart-theme.js) is
+   allowed to use lives here; a literal anywhere else is a bug waiting to
+   drift. Names are the shared contract - see docs/ui-refresh.md Part 2. */
 :root {
+    /* ---- surfaces ---- */
     --bg: #0f1419;
     --panel: #1a2028;
-    --accent: #f2a900;
+    /* Raised one step off --panel: table zebra, hovered rows, chips. */
+    --surface-2: #212934;
+    /* Recessed below --panel: inputs, <pre>, progress tracks, chart chips. */
+    --surface-inset: #10161d;
+    /* The panel edge. Panels sit on a --bg only ~7% darker than themselves,
+       so without this border they have no readable edge at all. */
+    --surface-border: #2a333d;
+    /* Two-part elevation: a tight contact shadow plus a soft ambient one. */
+    --shadow-1: 0 1px 2px rgba(0, 0, 0, .35), 0 2px 8px rgba(0, 0, 0, .22);
+
+    /* ---- ink ---- */
     --text: #e6e6e6;
     /* Chart tick labels only: brighter than body text so the numbers stay
        readable at a glance from the bike, without lifting the whole page. */
     --text-bright: #f5f7fa;
-    /* Gridlines must be visible on the dark panel but stay behind the data. */
-    --grid: rgba(255, 255, 255, 0.12);
     --muted: #8a94a0;
-    --alert: #e05252;
+
+    /* ---- brand / status (UI chrome only - never a series colour) ---- */
+    --accent: #f2a900;
+    /* Ink for anything sitting ON an accent/ok/alert fill. White on this gold
+       is ~1.9:1 and unreadable; near-black is ~11:1. */
+    --on-accent: #1a1a1a;
     --ok: #4caf7d;
+    --alert: #e05252;
+
+    /* ---- series palette (charts only) ----
+       Validated against the #1a2028 panel: all five dataviz checks pass, worst
+       adjacent CVD deltaE 10.6. Chrome gold (--accent) is deliberately NOT in
+       this set: series gold is darkened to --s-2 so it sits inside the
+       lightness band on the dark panel. Never mix the two roles. */
+    --s-1: #1baf7a;   /* CTL / fitness / hours                   */
+    --s-2: #c98500;   /* ATL / fatigue / TSS / power             */
+    --s-3: #3987e5;   /* TSB / form / distance / cadence         */
+    --s-4: #e05a5a;   /* FTP / calories                          */
+    --s-hr: #d55181;  /* heart rate                              */
+    --s-context: #8a94a0; /* elevation band, non-series context  */
+    /* Gridlines must be visible on the dark panel but stay well behind the
+       data; the axis line itself is the one rule the eye should find. */
+    --grid: rgba(255, 255, 255, .07);
+    /* The ride chart is read at arm's length from the bike, not at desk
+       distance, so it needs a heavier grid than the analysis pages. Same hue,
+       one step up - not a second grid style. */
+    --grid-strong: rgba(255, 255, 255, .14);
+    --axis: rgba(255, 255, 255, .20);
+
+    /* ---- spacing (4px base) ---- */
+    --sp-1: .25rem; --sp-2: .5rem;  --sp-3: .75rem;
+    --sp-4: 1rem;   --sp-5: 1.5rem; --sp-6: 2rem;
+
+    /* ---- radius ---- */
+    --r-sm: 4px; --r-md: 8px; --r-lg: 12px; --r-pill: 999px;
+
+    /* ---- type scale ---- */
+    --fs-xs: .72rem; --fs-sm: .8rem;  --fs-base: .9375rem;
+    --fs-md: 1.05rem; --fs-lg: 1.3rem; --fs-xl: 1.6rem; --fs-2xl: 2rem;
+    --lh-tight: 1.2; --lh-base: 1.5;
+    --font-mono: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+
+    /* ---- motion ---- */
+    --ease: cubic-bezier(.2, .6, .3, 1);
+    --dur: 140ms;
+}
+/* Honour the OS "reduce motion" setting everywhere at once: near-zero rather
+   than 0 so transitionend/animationend handlers still fire. */
+@media (prefers-reduced-motion: reduce) {
+    * { animation-duration: .01ms !important; transition-duration: .01ms !important; }
 }
 * { box-sizing: border-box; }
+/* Keyboard focus was the browser default ring, which is a dark outline on a
+   dark page. Only :focus-visible, so a mouse click never draws it. */
+:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+/* Numeric readouts: fixed-width digits so live values don't jitter as they
+   update and table columns line up on the decimal. */
+.num { font-variant-numeric: tabular-nums; font-feature-settings: "tnum"; }
 body {
     margin: 0;
     font-family: -apple-system, Segoe UI, Roboto, Helvetica, Arial, sans-serif;
@@ -31,6 +97,11 @@ nav a {
     font-weight: 500;
 }
 nav a:hover { color: var(--accent); }
+/* Active page. The 2px rule is drawn with a shadow rather than a border so it
+   costs no layout: a real border-bottom would make the active link 2px taller
+   than its siblings and nudge the header row. `aria-current` is set in
+   base.html, so the indicator and the accessibility state are one fact. */
+nav a[aria-current="page"] { color: var(--accent); box-shadow: 0 2px 0 var(--accent); }
 nav .user { margin-left: 1.5rem; color: var(--accent); font-weight: 600; }
 nav a.logout { margin-left: 0.75rem; color: var(--muted); }
 /* Logout is a POST form; the button is styled to read like the old nav link. */
@@ -57,7 +128,7 @@ main { max-width: 1440px; margin: 1.5rem auto; padding: 0 1.5rem; }
 main.wide { max-width: none; margin: 1.5rem 0; padding: 0 1rem; }
 footer { text-align: center; color: var(--muted); padding: 2rem 0; }
 
-h2 { border-bottom: 1px solid #2a333d; padding-bottom: 0.4rem; }
+h2 { border-bottom: 1px solid var(--surface-border); padding-bottom: 0.4rem; }
 
 /* Content links (tables, prose): readable light blue on the dark theme.
    Without this, links fall back to the browser default dark blue and are
@@ -68,7 +139,7 @@ main a:hover { color: var(--accent); text-decoration: underline; }
 
 .cards { display: flex; flex-wrap: wrap; gap: 0.75rem; margin: 1rem 0; }
 .card {
-    background: var(--panel); border-radius: 8px; padding: 0.75rem 1rem;
+    background: var(--panel); border-radius: var(--r-md); padding: 0.75rem 1rem;
     min-width: 120px; display: flex; flex-direction: column;
 }
 .card .label { color: var(--muted); font-size: 0.75rem; text-transform: uppercase; }
@@ -76,14 +147,30 @@ main a:hover { color: var(--accent); text-decoration: underline; }
 .card[title] { cursor: help; }
 .card[title]:hover { outline: 1px solid var(--accent); }
 
+/* Shared surface definition. Every panel used to be a borderless fill on a --bg
+   only ~7% darker, so the page read as one undifferentiated dark field. One
+   hairline plus one shadow gives each panel an edge.
+
+   Cost, measured rather than assumed: +2px height on every panel, and 2px off
+   each one's inner content box. `box-sizing: border-box` absorbs the border for
+   anything with a set size - so a `.card` sitting at its `min-width: 120px`
+   floor stays 120px - but a flex item sized by its own content has no set size
+   to absorb it into, so exactly the content-sized card in each row grows 2px
+   wide. Nothing re-wraps at 1600/1280/900px. `.ooto-panel` and `.modal-box`
+   already carried this treatment by hand and are left where they are. */
+.card, .chart-block, .profile-section, .zone-summary, .scan-panel, .ride-preview {
+    border: 1px solid var(--surface-border);
+    box-shadow: var(--shadow-1);
+}
+
 .chart-head { display: flex; justify-content: space-between; align-items: center;
     flex-wrap: wrap; gap: 0.5rem; }
 .range-controls { display: flex; align-items: center; gap: 0.4rem; flex-wrap: wrap; }
 .range-controls button, .range-controls .custom-range {
-    background: #10161d; color: var(--text); border: 1px solid #2a333d;
-    border-radius: 6px; padding: 0.3rem 0.6rem; font-size: 0.8rem; cursor: pointer;
+    background: var(--surface-inset); color: var(--text); border: 1px solid var(--surface-border);
+    border-radius: var(--r-md); padding: 0.3rem 0.6rem; font-size: 0.8rem; cursor: pointer;
 }
-.range-controls button.active { background: var(--accent); color: #1a1a1a; border-color: var(--accent); }
+.range-controls button.active { background: var(--accent); color: var(--on-accent); border-color: var(--accent); }
 .range-controls .custom-range { display: inline-flex; align-items: center; gap: 0.3rem; }
 .range-controls .custom-range input { width: 70px; padding: 0.15rem 0.3rem; }
 
@@ -97,18 +184,18 @@ main a:hover { color: var(--accent); text-decoration: underline; }
 .alerts ul { list-style: none; padding: 0; }
 .alert {
     background: rgba(224,82,82,0.12); border-left: 3px solid var(--alert);
-    padding: 0.5rem 0.75rem; margin: 0.4rem 0; border-radius: 4px;
+    padding: 0.5rem 0.75rem; margin: 0.4rem 0; border-radius: var(--r-sm);
 }
 .ok { color: var(--ok); }
 .muted { color: var(--muted); }
 .hint { color: var(--muted); font-size: 0.85rem; }
-.scan-panel { background: var(--panel); border-radius: 8px; padding: 1rem; margin: 1rem 0; }
+.scan-panel { background: var(--panel); border-radius: var(--r-md); padding: 1rem; margin: 1rem 0; }
 .scan-form { display: flex; gap: 0.75rem; align-items: flex-end; flex-wrap: wrap; }
 .scan-form label { flex: 1; min-width: 260px; margin: 0; }
 .scan-form input { width: 100%; margin-top: 0.25rem; }
 
-.chart-block { background: var(--panel); border-radius: 8px; padding: 1rem; margin: 1.25rem 0; }
-.profile-section, .zone-summary { background: var(--panel); border-radius: 8px; padding: 1rem; margin: 1.25rem 0; }
+.chart-block { background: var(--panel); border-radius: var(--r-md); padding: 1rem; margin: 1.25rem 0; }
+.profile-section, .zone-summary { background: var(--panel); border-radius: var(--r-md); padding: 1rem; margin: 1.25rem 0; }
 .profile-section h3, .zone-summary h3, .zone-panel h4 { margin-top: 0; }
 .power-profile-layout { display: grid; grid-template-columns: minmax(280px, 520px) minmax(220px, 1fr);
     gap: 1rem; align-items: center; }
@@ -120,15 +207,15 @@ main a:hover { color: var(--accent); text-decoration: underline; }
 .hrmax-form { display: flex; align-items: end; gap: 0.65rem; flex-wrap: wrap; margin-top: 1rem; }
 .hrmax-form label { width: 100%; margin-bottom: 0; }
 .hrmax-form input { width: 150px; }
-.button-secondary { background: #2a333d; color: var(--text); }
+.button-secondary { background: var(--surface-border); color: var(--text); }
 .table-scroll { overflow-x: auto; }
 .zone-summary-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 1rem; }
-.zone-panel { min-width: 0; border: 1px solid #2a333d; border-radius: 6px; padding: 0.8rem; }
+.zone-panel { min-width: 0; border: 1px solid var(--surface-border); border-radius: var(--r-md); padding: 0.8rem; }
 .zone-time-table { margin-bottom: 0.5rem; }
 .zone-time-table th, .zone-time-table td { padding: 0.35rem 0.4rem; white-space: nowrap; }
 .zone-duration { font-variant-numeric: tabular-nums; font-weight: 600; }
 .zone-percent { min-width: 120px; display: flex; align-items: center; gap: 0.4rem; }
-.zone-bar { display: inline-block; width: var(--zone-pct); max-width: 70px; height: 0.55rem; background: var(--accent); border-radius: 3px; }
+.zone-bar { display: inline-block; width: var(--zone-pct); max-width: 70px; height: 0.55rem; background: var(--accent); border-radius: var(--r-sm); }
 .sr-only { position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px; overflow: hidden; clip: rect(0, 0, 0, 0); white-space: nowrap; border: 0; }
 @media (max-width: 720px) {
     .zone-summary-grid, .power-profile-layout { grid-template-columns: 1fr; }
@@ -136,12 +223,12 @@ main a:hover { color: var(--accent); text-decoration: underline; }
 }
 
 table { width: 100%; border-collapse: collapse; margin: 1rem 0; }
-th, td { text-align: left; padding: 0.45rem 0.6rem; border-bottom: 1px solid #2a333d; }
+th, td { text-align: left; padding: 0.45rem 0.6rem; border-bottom: 1px solid var(--surface-border); }
 th { color: var(--muted); font-size: 0.8rem; text-transform: uppercase; }
 
 .toolbar { display: flex; gap: 0.75rem; align-items: center; flex-wrap: wrap; margin: 1rem 0; }
 button, .button {
-    background: var(--accent); color: #1a1a1a; border: none; border-radius: 6px;
+    background: var(--accent); color: var(--on-accent); border: none; border-radius: var(--r-md);
     padding: 0.5rem 1rem; font-weight: 600; cursor: pointer; text-decoration: none;
     display: inline-block;
 }
@@ -159,15 +246,15 @@ th.sortable:hover { color: var(--accent); }
 th.sortable.sort-asc::after { content: " \25B2"; font-size: 0.7em; color: var(--accent); }
 th.sortable.sort-desc::after { content: " \25BC"; font-size: 0.7em; color: var(--accent); }
 input, select {
-    background: #10161d; color: var(--text); border: 1px solid #2a333d;
-    border-radius: 6px; padding: 0.45rem 0.6rem;
+    background: var(--surface-inset); color: var(--text); border: 1px solid var(--surface-border);
+    border-radius: var(--r-md); padding: 0.45rem 0.6rem;
 }
 label { display: block; margin: 0.6rem 0; }
 .settings-form label, .generate-form label { max-width: 520px; }
 .settings-form input, .generate-form input { width: 100%; margin-top: 0.25rem; }
 
 pre {
-    background: #0b0f14; padding: 1rem; border-radius: 6px; overflow-x: auto;
+    background: #0b0f14; padding: 1rem; border-radius: var(--r-md); overflow-x: auto;
     font-size: 0.8rem; line-height: 1.4;
 }
 details summary { cursor: pointer; color: var(--accent); margin: 0.5rem 0; }
@@ -175,18 +262,18 @@ details summary { cursor: pointer; color: var(--accent); margin: 0.5rem 0; }
 /* Generate: mode toggle + plan form */
 .mode-toggle { display: flex; gap: 1.5rem; margin: 0.5rem 0 1rem; }
 .mode-toggle label { display: inline-flex; align-items: center; gap: 0.4rem; margin: 0; cursor: pointer; }
-.mode-panel { border-top: 1px solid #2a333d; padding-top: 1rem; }
+.mode-panel { border-top: 1px solid var(--surface-border); padding-top: 1rem; }
 .plan-form { display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 0.75rem; }
 .plan-form label { margin: 0; }
 .plan-form input[type=text], .plan-form input[type=number], .plan-form input[type=date] { width: 100%; margin-top: 0.25rem; }
-.days-picker { grid-column: 1 / -1; border: 1px solid #2a333d; border-radius: 6px; padding: 0.5rem; }
+.days-picker { grid-column: 1 / -1; border: 1px solid var(--surface-border); border-radius: var(--r-md); padding: 0.5rem; }
 .days-picker legend { color: var(--muted); font-size: 0.8rem; }
 .day-check { display: inline-flex; align-items: center; gap: 0.3rem; margin: 0 0.9rem 0 0; }
 .day-check label { display: inline-flex; align-items: center; gap: 0.3rem; margin: 0; }
 .day-check .hard-toggle { font-size: 0.72rem; color: var(--muted); text-transform: uppercase; }
 .day-check .hard-toggle:has(input:checked) { color: var(--alert); }
 .day-check .hard-toggle input:disabled { opacity: 0.4; }
-.model-picker { grid-column: 1 / -1; border: 1px solid #2a333d; border-radius: 6px; padding: 0.5rem; }
+.model-picker { grid-column: 1 / -1; border: 1px solid var(--surface-border); border-radius: var(--r-md); padding: 0.5rem; }
 .model-picker legend { color: var(--muted); font-size: 0.8rem; }
 .model-option { display: flex; align-items: flex-start; gap: 0.5rem; margin: 0.3rem 0; cursor: pointer; }
 .model-option span { font-size: 0.82rem; }
@@ -194,13 +281,13 @@ details summary { cursor: pointer; color: var(--accent); margin: 0.5rem 0; }
 /* The goal picker sits above the model picker and reuses its option styling:
    goal and model are separate, orthogonal choices, so they read as two lists of
    the same kind of thing. */
-.goal-picker { grid-column: 1 / -1; border: 1px solid #2a333d; border-radius: 6px; padding: 0.5rem; }
+.goal-picker { grid-column: 1 / -1; border: 1px solid var(--surface-border); border-radius: var(--r-md); padding: 0.5rem; }
 .goal-picker legend { color: var(--muted); font-size: 0.8rem; }
 /* How well-founded a recommendation is, shown next to the number itself so a
    coaching convention is never mistaken for an evidence-backed figure. */
 .basis { font-size: 0.7rem; text-transform: uppercase; letter-spacing: 0.03em;
-    border-radius: 3px; padding: 0 4px; }
-.basis-literature { background: var(--ok); color: #1a1a1a; }
+    border-radius: var(--r-sm); padding: 0 4px; }
+.basis-literature { background: var(--ok); color: var(--on-accent); }
 .basis-convention { background: #3a4450; color: var(--muted); }
 .plan-goal { margin: 0.6rem 0; }
 .phase-blocks { list-style: none; padding: 0; margin: 0.3rem 0; font-size: 0.85rem; }
@@ -218,7 +305,8 @@ details summary { cursor: pointer; color: var(--accent); margin: 0.5rem 0; }
 .plan-form button { grid-column: 1 / -1; justify-self: start; }
 .weekly-table .recovery-week { color: var(--ok); }
 .link-btn { background: none; border: none; color: var(--accent); cursor: pointer; padding: 0; font: inherit; }
-.badge { background: var(--accent); color: #fff; border-radius: 3px; padding: 0 0.35rem; font-size: 0.72rem; text-transform: uppercase; letter-spacing: 0.03em; }
+/* Dark ink on the gold fill: white here was ~1.9:1 and unreadable. */
+.badge { background: var(--accent); color: var(--on-accent); border-radius: var(--r-sm); padding: 0 0.35rem; font-size: 0.72rem; text-transform: uppercase; letter-spacing: 0.03em; }
 .plan-list { list-style: none; padding: 0; margin: 0.3rem 0 0.8rem; font-size: 0.85rem; color: var(--muted); }
 .plan-list li { margin: 0.15rem 0; }
 
@@ -226,11 +314,11 @@ details summary { cursor: pointer; color: var(--accent); margin: 0.5rem 0; }
 .cal-head { display: flex; align-items: center; justify-content: space-between; gap: 1rem; }
 table.calendar { table-layout: fixed; }
 table.calendar th { text-align: center; }
-.cal-cell { height: 90px; vertical-align: top; border: 1px solid #2a333d; padding: 3px; }
+.cal-cell { height: 90px; vertical-align: top; border: 1px solid var(--surface-border); padding: 3px; }
 .cal-cell.other-month { opacity: 0.4; }
 .cal-day { font-size: 0.75rem; color: var(--muted); }
 .cal-workout { font-size: 0.72rem; background: rgba(242,169,0,0.15); border-left: 3px solid var(--accent);
-    border-radius: 3px; padding: 2px 4px; margin-top: 2px; overflow: hidden; cursor: pointer; }
+    border-radius: var(--r-sm); padding: 2px 4px; margin-top: 2px; overflow: hidden; cursor: pointer; }
 .cal-workout:hover, .cal-workout:focus { outline: 1px solid var(--accent); }
 .cal-workout .cal-type { display: block; color: var(--muted); font-size: 0.65rem; }
 .cal-vo2max, .cal-threshold { background: rgba(224,82,82,0.18); border-left-color: var(--alert); }
@@ -243,17 +331,17 @@ table.calendar th { text-align: center; }
 .cal-workout.cal-adapted { border-left-style: dashed; }
 .cal-adapt-mark { color: var(--accent); font-weight: 700; }
 .cal-rpe { display: inline-block; margin-left: 4px; font-size: 0.6rem; font-weight: 700;
-    letter-spacing: 0.02em; color: #1a1a1a; background: var(--accent);
-    border-radius: 3px; padding: 0 4px; vertical-align: middle; }
+    letter-spacing: 0.02em; color: var(--on-accent); background: var(--accent);
+    border-radius: var(--r-sm); padding: 0 4px; vertical-align: middle; }
 
 /* Perceived-exertion (RPE) grading in the workout modal. */
-.rpe-section { border-top: 1px solid #2a333d; margin-top: 0.75rem; padding-top: 0.5rem; }
+.rpe-section { border-top: 1px solid var(--surface-border); margin-top: 0.75rem; padding-top: 0.5rem; }
 .rpe-section h4 { margin: 0 0 0.25rem; }
 .rpe-buttons { display: flex; flex-wrap: wrap; gap: 0.3rem; margin: 0.4rem 0; }
-.rpe-btn { min-width: 2rem; padding: 0.3rem 0; border: 1px solid #2a333d;
-    background: var(--panel); color: var(--text); border-radius: 4px; cursor: pointer; }
+.rpe-btn { min-width: 2rem; padding: 0.3rem 0; border: 1px solid var(--surface-border);
+    background: var(--panel); color: var(--text); border-radius: var(--r-sm); cursor: pointer; }
 .rpe-btn:hover { border-color: var(--accent); }
-.rpe-btn.rpe-on { background: var(--accent); color: #1a1a1a; border-color: var(--accent); font-weight: 700; }
+.rpe-btn.rpe-on { background: var(--accent); color: var(--on-accent); border-color: var(--accent); font-weight: 700; }
 .cal-workout.cal-skipped { opacity: 0.6; text-decoration: line-through;
     text-decoration-color: var(--alert); text-decoration-thickness: 2px;
     border-left-color: var(--alert); }
@@ -273,7 +361,7 @@ table.calendar th { text-align: center; }
     box-shadow: inset 0 3px 0 var(--alert);
 }
 .cal-ooto-tag { font-size: 0.6rem; font-weight: 700; letter-spacing: 0.03em;
-    color: #1a1a1a; background: var(--alert); border-radius: 3px;
+    color: var(--on-accent); background: var(--alert); border-radius: var(--r-sm);
     padding: 0 4px; vertical-align: middle; }
 /* Race day cells: the race IS the session, so no workout is scheduled -
    mark the day clearly and badge it with its A/B priority. */
@@ -282,13 +370,13 @@ table.calendar th { text-align: center; }
     box-shadow: inset 0 3px 0 var(--ok);
 }
 .cal-race-tag { font-size: 0.6rem; font-weight: 700; letter-spacing: 0.03em;
-    color: #1a1a1a; background: var(--ok); border-radius: 3px;
+    color: var(--on-accent); background: var(--ok); border-radius: var(--r-sm);
     padding: 0 4px; vertical-align: middle; }
 /* An A race is the one the season bends around - make it the loud one. */
 .cal-race-tag.cal-race-A { background: var(--accent); }
 /* A race whose stored priority is not the one the plan uses. Marked so the
    badge invites the tooltip that explains why. */
-.cal-race-tag.cal-race-demoted { border-bottom: 2px dotted #1a1a1a; cursor: help; }
+.cal-race-tag.cal-race-demoted { border-bottom: 2px dotted var(--on-accent); cursor: help; }
 /* A planned race that has a cached result: it was actually ridden. Outlined
    rather than filled so it reads as history next to the solid priority badge,
    which is the plan speaking about the future. */
@@ -297,7 +385,7 @@ table.calendar th { text-align: center; }
 /* Which block of the active plan's arc this week belongs to. Quiet on purpose:
    it is context for the day, not an event happening on it. */
 .cal-phase-tag { font-size: 0.6rem; letter-spacing: 0.03em; color: var(--muted);
-    border: 1px solid #2a333d; border-radius: 3px; padding: 0 4px;
+    border: 1px solid var(--surface-border); border-radius: var(--r-sm); padding: 0 4px;
     vertical-align: middle; text-transform: capitalize; }
 .ooto-form select { width: 150px; }
 
@@ -307,8 +395,8 @@ table.calendar th { text-align: center; }
     gap: 1rem; align-items: start; }
 @media (max-width: 820px) { .cal-layout { grid-template-columns: 1fr; } }
 .cal-main { min-width: 0; overflow-x: auto; }
-.ooto-panel { background: var(--panel); border: 1px solid #2a333d;
-    border-radius: 8px; padding: 0.75rem 1rem; position: sticky; top: 1rem; }
+.ooto-panel { background: var(--panel); border: 1px solid var(--surface-border);
+    border-radius: var(--r-md); padding: 0.75rem 1rem; position: sticky; top: 1rem; }
 .ooto-panel h3 { margin-top: 0.2rem; }
 .ooto-form { display: flex; flex-direction: column; gap: 0.4rem; margin: 0.5rem 0; }
 .ooto-form label { display: flex; justify-content: space-between; align-items: center;
@@ -316,12 +404,12 @@ table.calendar th { text-align: center; }
 .ooto-form input { width: 150px; }
 .ooto-list { list-style: none; padding: 0; margin: 0.5rem 0 0; }
 .ooto-list li { display: flex; align-items: center; gap: 0.5rem; flex-wrap: wrap;
-    padding: 0.35rem 0; border-top: 1px solid #2a333d; font-size: 0.85rem; }
+    padding: 0.35rem 0; border-top: 1px solid var(--surface-border); font-size: 0.85rem; }
 
 /* Adaptive training status banner */
 .status-banner {
     display: flex; align-items: flex-start; gap: 0.9rem;
-    border-radius: 10px; padding: 0.9rem 1.1rem; margin: 1rem 0;
+    border-radius: var(--r-lg); padding: 0.9rem 1.1rem; margin: 1rem 0;
     border: 1px solid; border-left-width: 5px;
 }
 .status-banner .status-icon { display: inline-flex; margin-top: 0.1rem; }
@@ -365,18 +453,18 @@ table.calendar th { text-align: center; }
     font-size: 1.05rem; }
 .unit-toggle { display: flex; align-items: center; gap: 0.5rem; margin: 0.75rem 0;
     flex-wrap: wrap; }
-.unit-btn { background: #10161d; color: var(--text); border: 1px solid #2a333d;
-    border-radius: 6px; padding: 0.25rem 0.7rem; font-size: 0.85rem; font-weight: 600; }
-.unit-btn.active { background: var(--accent); color: #1a1a1a; border-color: var(--accent); }
+.unit-btn { background: var(--surface-inset); color: var(--text); border: 1px solid var(--surface-border);
+    border-radius: var(--r-md); padding: 0.25rem 0.7rem; font-size: 0.85rem; font-weight: 600; }
+.unit-btn.active { background: var(--accent); color: var(--on-accent); border-color: var(--accent); }
 .unit-btn:disabled { opacity: 0.4; cursor: not-allowed; }
 
 /* Settings: Zwift player-folder picker */
-.zwift-picker { border: 1px solid #2a333d; border-radius: 6px; padding: 0.5rem 0.75rem;
+.zwift-picker { border: 1px solid var(--surface-border); border-radius: var(--r-md); padding: 0.5rem 0.75rem;
     max-width: 520px; margin: 0.6rem 0; }
 .zwift-picker legend { color: var(--muted); font-size: 0.8rem; }
 .zwift-candidate { display: flex; align-items: center; gap: 0.4rem; margin: 0.3rem 0; }
 .zwift-candidate input { width: auto; margin: 0; }
-.zwift-account { border: 1px solid #2a333d; border-radius: 6px;
+.zwift-account { border: 1px solid var(--surface-border); border-radius: var(--r-md);
     padding: 0.5rem 0.75rem; max-width: 520px; margin: 0.6rem 0; }
 .zwift-account legend { color: var(--muted); font-size: 0.8rem; }
 .clear-creds-form { margin-top: 0.5rem; }
@@ -385,9 +473,9 @@ table.calendar th { text-align: center; }
 
 /* Plan management section */
 .plan-mgmt { margin-bottom: 1rem; }
-.plan-mgmt .current-plan { border: 1px solid var(--accent); border-radius: 6px;
+.plan-mgmt .current-plan { border: 1px solid var(--accent); border-radius: var(--r-md);
     padding: 0.6rem 0.9rem; max-width: 620px; }
-.plan-mgmt .current-plan.not-in-effect { border-color: #2a333d; }
+.plan-mgmt .current-plan.not-in-effect { border-color: var(--surface-border); }
 .plan-mgmt table.other-plans { margin-top: 0.5rem; }
 .flash { font-weight: 600; }
 button.danger { background: none; border: 1px solid var(--alert); color: var(--alert); }
@@ -402,7 +490,7 @@ button.danger.link-btn { border: none; color: var(--alert); }
 }
 .modal-overlay[hidden] { display: none; }
 .modal-box {
-    background: var(--panel); border: 1px solid #2a333d; border-radius: 8px;
+    background: var(--panel); border: 1px solid var(--surface-border); border-radius: var(--r-md);
     padding: 1rem 1.25rem; max-width: 640px; width: 100%; position: relative;
 }
 .modal-box h3 { margin-top: 0.25rem; padding-right: 2rem; }
@@ -416,12 +504,12 @@ button.danger.link-btn { border: none; color: var(--alert); }
    full-width main only scales the type up and blurs it. Cap it near its natural
    size and leave it left-aligned. Inert inside the calendar modal, which is
    already narrower than this. */
-.profile-wrap { background: #10161d; border: 1px solid #2a333d; border-radius: 6px;
+.profile-wrap { background: var(--surface-inset); border: 1px solid var(--surface-border); border-radius: var(--r-md);
     padding: 0.5rem; margin: 0.75rem 0; max-width: 760px; }
 .profile-wrap[hidden] { display: none; }
 #wmTable[hidden], #wmError[hidden] { display: none; }
 .profile-svg { display: block; width: 100%; height: auto; }
-.profile-svg .pf-grid { stroke: #2a333d; stroke-width: 1; }
+.profile-svg .pf-grid { stroke: var(--surface-border); stroke-width: 1; }
 .profile-svg .pf-area { fill: rgba(242, 169, 0, 0.22); stroke: none; }
 .profile-svg .pf-line { fill: none; stroke: var(--accent); stroke-width: 2; }
 /* Untargeted (maximal-effort) block: shaded band, no power step to read. */
@@ -437,7 +525,7 @@ button.danger.link-btn { border: none; color: var(--alert); }
 .ride-setup select { margin-left: 0.5rem; }
 .ride-mode { margin-bottom: 0.5rem; }
 .ride-mode label { display: inline-block; margin-right: 1rem; }
-.ride-preview { background: var(--panel); border-radius: 8px;
+.ride-preview { background: var(--panel); border-radius: var(--r-md);
     padding: 0.8rem; margin-bottom: 0.8rem; }
 .ride-preview[hidden] { display: none; }
 .ride-preview h3 { margin: 0 0 0.35rem; }
@@ -449,7 +537,7 @@ button.danger.link-btn { border: none; color: var(--alert); }
 .device-role { display: inline-block; margin: 0.15rem 0.7rem 0.15rem 0; white-space: nowrap; }
 .device-role input { padding: 0; }
 .connection-badge { display: inline-block; margin-top: 0.25rem; padding: 0.1rem 0.4rem;
-    border-radius: 999px; background: #2a333d; color: var(--muted); font-size: 0.72rem; }
+    border-radius: var(--r-pill); background: var(--surface-border); color: var(--muted); font-size: 0.72rem; }
 .connection-badge:empty { display: none; }
 .device-connected { background: rgba(67, 160, 71, 0.12); }
 .device-connected .connection-badge, .status-success { color: #7bd88f; }
@@ -468,17 +556,17 @@ button.danger.link-btn { border: none; color: var(--alert); }
 .scan-busy { display: inline-flex; align-items: center; gap: 0.4rem; color: var(--muted); }
 .scan-busy[hidden] { display: none; }
 .button-spinner[hidden] { display: none; }
-.spinner { width: 0.9rem; height: 0.9rem; border: 2px solid #2a333d;
+.spinner { width: 0.9rem; height: 0.9rem; border: 2px solid var(--surface-border);
     border-top-color: var(--accent); border-radius: 50%; animation: ride-spin 0.8s linear infinite; }
 @keyframes ride-spin { to { transform: rotate(360deg); } }
-.ride-workout { background: #10161d; border-left: 3px solid var(--accent);
-    border-radius: 4px; padding: 0.65rem 0.8rem; margin-bottom: 0.8rem; }
+.ride-workout { background: var(--surface-inset); border-left: 3px solid var(--accent);
+    border-radius: var(--r-sm); padding: 0.65rem 0.8rem; margin-bottom: 0.8rem; }
 .ride-live-controls { display: flex; align-items: center; gap: 0.75rem; flex-wrap: wrap;
     margin: 0.75rem 0; }
 .ride-live-controls .hint { margin: 0; }
-.ride-live-controls .erg-toggle.erg-on { background: var(--ok); color: #10161d; }
+.ride-live-controls .erg-toggle.erg-on { background: var(--ok); color: var(--surface-inset); }
 .ride-chart-block { position: relative; min-height: 320px; background: var(--panel);
-    border-radius: 8px; padding: 0.8rem; margin-top: 1rem; }
+    border-radius: var(--r-md); padding: 0.8rem; margin-top: 1rem; }
 .ride-chart-heading { display: flex; align-items: center; justify-content: space-between;
     gap: 1rem; margin-bottom: 0.35rem; }
 .ride-chart-heading h3 { margin: 0; }
@@ -486,7 +574,7 @@ button.danger.link-btn { border: none; color: var(--alert); }
 .ride-chart-actions { display: flex; align-items: center; gap: 0.5rem; flex-wrap: wrap;
     justify-content: flex-end; }
 .ride-chart-heading .ride-chart-end { border-color: var(--alert); color: var(--alert); }
-.ride-chart-heading .ride-chart-end:disabled { border-color: #2a333d; color: var(--muted); }
+.ride-chart-heading .ride-chart-end:disabled { border-color: var(--surface-border); color: var(--muted); }
 /* Grow with the page width: at a 1440px main a fixed 260px box is a 5:1 letter
    slot the traces have no room to move in. Clamped at both ends so a phone
    keeps the old height and a wide desktop stops before the chart eats the fold.
@@ -497,7 +585,7 @@ button.danger.link-btn { border: none; color: var(--alert); }
 .ride-chart-metrics { position: absolute; z-index: 2; top: 20%; left: 50%;
     transform: translateX(-50%); display: flex; align-items: baseline; justify-content: center;
     gap: clamp(1rem, 5vw, 4rem); width: min(80%, 680px); pointer-events: none;
-    color: rgba(232, 237, 243, 0.78); text-shadow: 0 1px 5px #10161d, 0 0 12px #10161d; }
+    color: rgba(232, 237, 243, 0.78); text-shadow: 0 1px 5px var(--surface-inset), 0 0 12px var(--surface-inset); }
 .ride-chart-metrics span { display: inline-flex; align-items: baseline; gap: 0.25rem; }
 .ride-chart-metrics strong { font-size: 28px; line-height: 1; font-variant-numeric: tabular-nums;
     color: inherit; }
@@ -520,8 +608,8 @@ button.danger.link-btn { border: none; color: var(--alert); }
 /* Shared corner chip: an LED plus a short label, dim until whatever it reports
    is live. Used by the ERG indicator and by the sensor indicators opposite it. */
 .ride-chart-chip { display: inline-flex; align-items: center; gap: 0.4rem;
-    pointer-events: none; padding: 0.25rem 0.5rem; border-radius: 4px;
-    border: 1px solid #2a333d; background: #10161d; font-size: 0.72rem;
+    pointer-events: none; padding: 0.25rem 0.5rem; border-radius: var(--r-sm);
+    border: 1px solid var(--surface-border); background: var(--surface-inset); font-size: 0.72rem;
     font-weight: 700; letter-spacing: 0.08em; }
 .ride-chart-chip .erg-led { width: 0.55rem; height: 0.55rem; border-radius: 2px;
     background: #39424d; }
@@ -556,7 +644,7 @@ button.danger.link-btn { border: none; color: var(--alert); }
 .ride-chart-block:fullscreen, .ride-chart-block:-webkit-full-screen,
 .ride-chart-block.ride-chart-fullscreen-fallback {
     width: 100%; height: 100%; max-width: none; margin: 0; border-radius: 0;
-    padding: clamp(0.75rem, 2vw, 1.5rem); background: #10161d;
+    padding: clamp(0.75rem, 2vw, 1.5rem); background: var(--surface-inset);
 }
 .ride-chart-block.ride-chart-fullscreen-fallback {
     position: fixed; inset: 0; z-index: 1000;
@@ -583,6 +671,6 @@ body.ride-chart-fullscreen-open { overflow: hidden; }
     .ride-chart-devices .device-glyph { font-size: 0.7rem; }
 }
 .ride-live { margin-top: 1rem; }
-.progress-wrap { background: #10161d; border: 1px solid #2a333d; border-radius: 6px;
+.progress-wrap { background: var(--surface-inset); border: 1px solid var(--surface-border); border-radius: var(--r-md);
     height: 16px; overflow: hidden; margin: 0.75rem 0; }
 .progress-bar { height: 100%; width: 0; background: var(--accent); transition: width 0.2s linear; }

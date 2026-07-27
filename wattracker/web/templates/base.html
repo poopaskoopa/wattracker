@@ -17,21 +17,40 @@
     <script src="{{ static_url('vendor/chart.umd.min.js') }}"></script>
     <!-- Drag-to-zoom on the time-series chart (loaded after chart.js). -->
     <script src="{{ static_url('vendor/chartjs-plugin-zoom.umd.min.js') }}"></script>
+    <!-- Chart.defaults from the CSS tokens, plus cssVar()/linkedCrosshair().
+         Must come after chart.js (it mutates Chart.defaults) and before any
+         page script that constructs a chart. Not vendored - it is ours. -->
+    <script src="{{ static_url('chart-theme.js') }}"></script>
 </head>
 <body>
     <header>
         <h1><a href="/">wattracker</a></h1>
         {% if username %}
+        {#- The nav is a loop only so the active-page test is written once.
+            `request` is put in the context by Starlette's Jinja2Templates for
+            every response, so no extra template global is needed. A section is
+            active on an exact match or on a prefix match, so a sub-page
+            (/profile/power-corrections) still lights its section; "/" only ever
+            matches itself. The third tuple item is for routes whose path does
+            not start with the nav href - the activity detail route is
+            /activity/{id}, singular, and would otherwise light nothing.
+            `aria-current` drives the CSS indicator. -#}
+        {%- set nav_path = request.url.path if request else "" %}
         <nav>
-            <a href="/">Dashboard</a>
-            <a href="/activities">Activities</a>
-            <a href="/volume">Volume</a>
-            <a href="/plan">Plan</a>
-            <a href="/calendar">Calendar</a>
-            <a href="/races">Races</a>
-            <a href="/ride">Ride</a>
-            <a href="/profile">Profile</a>
-            <a href="/settings">Settings</a>
+            {%- for href, label, aliases in [
+                ("/", "Dashboard", []), ("/activities", "Activities", ["/activity"]),
+                ("/volume", "Volume", []), ("/plan", "Plan", []),
+                ("/calendar", "Calendar", []), ("/races", "Races", []),
+                ("/ride", "Ride", []), ("/profile", "Profile", []),
+                ("/settings", "Settings", [])] %}
+            {%- set ns = namespace(active = nav_path == href) %}
+            {%- for prefix in [href] + aliases %}
+                {%- if prefix != "/" and nav_path.startswith(prefix ~ "/") %}
+                    {%- set ns.active = true %}
+                {%- endif %}
+            {%- endfor %}
+            <a href="{{ href }}"{% if ns.active %} aria-current="page"{% endif %}>{{ label }}</a>
+            {%- endfor %}
             <span class="user">{{ username }}</span>
             <form action="/logout" method="post" class="logout-form">
                 <button type="submit" class="logout">Logout</button>
