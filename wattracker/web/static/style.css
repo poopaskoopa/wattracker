@@ -195,6 +195,10 @@ main a:hover { color: var(--accent); text-decoration: underline; }
 .scan-form input { width: 100%; margin-top: 0.25rem; }
 
 .chart-block { background: var(--panel); border-radius: var(--r-md); padding: 1rem; margin: 1.25rem 0; }
+/* Two stacked canvases that read as one plot with a shared x axis: `block`
+   kills the inline-baseline gap that would otherwise open a ~4px seam between
+   the panels and separate them visually. */
+.chart-panels canvas { display: block; }
 .profile-section, .zone-summary { background: var(--panel); border-radius: var(--r-md); padding: 1rem; margin: 1.25rem 0; }
 .profile-section h3, .zone-summary h3, .zone-panel h4 { margin-top: 0; }
 .power-profile-layout { display: grid; grid-template-columns: minmax(280px, 520px) minmax(220px, 1fr);
