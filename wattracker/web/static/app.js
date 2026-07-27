@@ -109,15 +109,19 @@ function latestGroupValue(unit) {
 // Only the datasets listed in `units` are touched, so a background dataset
 // (e.g. the ride chart's elevation band) omitted from `units` is never
 // hidden or exposed by isolation.
+// A unit flagged `independent` is a plain on/off and takes no part in
+// isolation: the activity-detail elevation band is context drawn behind the
+// data, so isolating a real series must neither hide nor expose it.
 function applyLegendUnits(units, target, additive) {
     const live = units.filter((u) => u.chart);
     const visibleOf = (u) => u.datasets.some((i) => u.chart.isDatasetVisible(i));
-    if (additive) {
+    if (additive || target.independent) {
         const nowVisible = visibleOf(target);
         target.datasets.forEach((i) => target.chart.setDatasetVisibility(i, !nowVisible));
     } else {
-        const isIsolated = live.every((u) => (u === target ? visibleOf(u) : !visibleOf(u)));
-        live.forEach((u) => {
+        const isolatable = live.filter((u) => !u.independent);
+        const isIsolated = isolatable.every((u) => (u === target ? visibleOf(u) : !visibleOf(u)));
+        isolatable.forEach((u) => {
             const on = isIsolated ? true : u === target;
             u.datasets.forEach((i) => u.chart.setDatasetVisibility(i, on));
         });
@@ -125,13 +129,6 @@ function applyLegendUnits(units, target, additive) {
     const charts = [];
     live.forEach((u) => { if (charts.indexOf(u.chart) === -1) charts.push(u.chart); });
     charts.forEach((c) => c.update());
-}
-
-// Single-chart form, kept for callers that pass bare index lists against one
-// chart (the activity-detail legend below).
-function applyLegendSelection(chart, units, target, additive) {
-    const wrapped = units.map((u) => ({ chart: chart, datasets: u }));
-    applyLegendUnits(wrapped, wrapped[units.indexOf(target)], additive);
 }
 
 // Render an HTML `.chart-legend` for a set of units. Rebuilt after every click
@@ -544,12 +541,36 @@ function renderDashboard(ftp) {
 }
 
 // ---------------------------------------------- activity detail ride graphs
-const DETAIL_COLORS = {
-    power: "#e05252",
-    heartrate: "#f2a900",
-    cadence: "#5a9bd4",
-    altitude: "#8a94a0",
-};
+// One panel per measure, stacked on a shared time axis (docs/ui-refresh 1.2).
+// This used to be a single chart with three y axes - power left, HR AND
+// cadence together on the right, elevation on a hidden third - so where the
+// power and HR traces crossed was an artifact of the scales. HR (~90-190 bpm)
+// and cadence (~60-110 rpm) genuinely overlap in range, so sharing one axis
+// reproduced the same problem in miniature; they get a panel each.
+//
+// `weight` splits the old single canvas's height attribute, so the block keeps
+// its footprint however many panels a ride actually has data for.
+const DETAIL_SERIES = [
+    { key: "power", id: "detailPower", label: "Power (W)",
+      token: "--s-2", axis: "Power (W)", weight: 68 },
+    { key: "heartrate", id: "detailHr", label: "Heart rate (bpm)",
+      token: "--s-hr", axis: "HR (bpm)", weight: 41 },
+    { key: "cadence", id: "detailCadence", label: "Cadence (rpm)",
+      token: "--s-3", axis: "Cadence (rpm)", weight: 41 },
+];
+const DETAIL_HEIGHT_BUDGET = 150; // the old single canvas's height attribute
+const DETAIL_X_TICKS = 10;
+
+let detailCharts = [];
+let detailUnits = [];
+let detailCrosshair = null;
+
+function destroyDetailPanels() {
+    if (detailCrosshair) { detailCrosshair.destroy(); detailCrosshair = null; }
+    detailCharts.forEach((c) => c.destroy());
+    detailCharts = [];
+    detailUnits = [];
+}
 
 function escapeHTML(value) {
     return String(value == null ? "" : value).replace(/[&<>"']/g, (char) => ({
@@ -573,9 +594,10 @@ function renderZoneSummary(targetId, summary, unit) {
         const pct = Math.max(0, Math.min(100, Number(zone.percent) || 0));
         return '<tr><th scope="row">' + escapeHTML(zone.label) + '</th>' +
             '<td class="zone-range">' + escapeHTML(zone.range) + " " + escapeHTML(unit) + '</td>' +
-            '<td class="zone-duration">' + escapeHTML(zone.duration) + '</td>' +
-            '<td class="zone-percent"><span class="zone-bar" style="--zone-pct:' + pct +
-            '%"></span><span>' + pct.toFixed(1) + '%</span></td></tr>';
+            '<td class="zone-duration num">' + escapeHTML(zone.duration) + '</td>' +
+            '<td class="zone-percent"><span class="zone-track">' +
+            '<span class="zone-bar" style="--zone-pct:' + pct + '%"></span></span>' +
+            '<span class="num">' + pct.toFixed(1) + '%</span></td></tr>';
     }).join("");
     target.innerHTML = title + '<p class="hint">' + anchorLabel + ": " + anchor + " " + unit +
         " · " + escapeHTML(summary.source) + '</p><div class="table-scroll"><table class="zone-time-table">' +
@@ -659,11 +681,15 @@ function renderActivityRpe(activityId, detail) {
 }
 
 async function renderActivityDetail(activityId) {
-    const canvas = document.getElementById("detailChart");
-    if (!canvas) return;
+    const panels = document.getElementById("detailPanels");
+    if (!panels) return;
     const empty = document.getElementById("detailEmpty");
+    const showEmpty = () => {
+        panels.hidden = true;
+        if (empty) empty.style.display = "block";
+    };
     const data = await fetchJSON("/api/activity/" + activityId);
-    if (!data) { if (empty) { empty.style.display = "block"; } return; }
+    if (!data) { showEmpty(); return; }
 
     renderActivityRpe(activityId, data);
     renderZoneSummary("powerZoneSummary", data.zones && data.zones.power, "W");
@@ -672,109 +698,104 @@ async function renderActivityDetail(activityId) {
     const t = data.t || [];
     const have = data.have || {};
     const anyLine = have.power || have.heartrate || have.cadence;
-    if (!t.length || (!anyLine && !have.altitude)) {
-        canvas.style.display = "none";
-        if (empty) empty.style.display = "block";
-        return;
-    }
-
-    const datasets = [];
-    // Elevation first + high order so it renders as a background band.
-    if (have.altitude) {
-        datasets.push({
-            label: "Elevation (m)", data: data.altitude,
-            borderColor: "rgba(138,148,160,0.5)", backgroundColor: "rgba(138,148,160,0.18)",
-            yAxisID: "yAlt", fill: "start", pointRadius: 0, borderWidth: 1,
-            tension: 0.3, order: 10, spanGaps: true,
-        });
-    }
-    if (have.power) {
-        datasets.push({
-            label: "Power (W)", data: data.power, borderColor: DETAIL_COLORS.power,
-            yAxisID: "yPower", pointRadius: 0, borderWidth: 1.5, tension: 0.2,
-            spanGaps: true, order: 1,
-        });
-    }
-    if (have.heartrate) {
-        datasets.push({
-            label: "Heart rate (bpm)", data: data.heartrate, borderColor: DETAIL_COLORS.heartrate,
-            yAxisID: "yBio", pointRadius: 0, borderWidth: 1.5, tension: 0.2,
-            spanGaps: true, order: 2,
-        });
-    }
-    if (have.cadence) {
-        datasets.push({
-            label: "Cadence (rpm)", data: data.cadence, borderColor: DETAIL_COLORS.cadence,
-            yAxisID: "yBio", pointRadius: 0, borderWidth: 1.5, tension: 0.2,
-            spanGaps: true, order: 3,
-        });
-    }
-
-    const scales = {
-        x: {
-            type: "linear", title: { display: true, text: "Time (min)" },
-            ticks: { maxTicksLimit: 12, maxRotation: 0 },
-        },
-        yPower: {
-            position: "left", title: { display: true, text: "Power (W)" },
-            beginAtZero: true,
-        },
-        yBio: {
-            position: "right", title: { display: true, text: "HR / cadence" },
-            beginAtZero: true, grid: { drawOnChartArea: false },
-        },
-        yAlt: {
-            position: "right", display: false, grid: { drawOnChartArea: false },
-        },
-    };
-    if (!have.power) delete scales.yPower;
-    if (!(have.heartrate || have.cadence)) delete scales.yBio;
-    if (!have.altitude) delete scales.yAlt;
-
-    // Real data series (power/HR/cadence) are the isolate/restore units; the
-    // elevation background band is excluded so legend clicks never hide or
-    // expose it. Each real series is its own single-dataset unit.
-    const elevationIndex = datasets.findIndex((d) => d.yAxisID === "yAlt");
-    const realUnits = datasets
-        .map((_d, i) => i)
-        .filter((i) => i !== elevationIndex)
-        .map((i) => [i]);
+    destroyDetailPanels();
+    if (!t.length || (!anyLine && !have.altitude)) { showEmpty(); return; }
+    panels.hidden = false;
+    if (empty) empty.style.display = "none";
 
     const labelled = t.map((x) => Math.round(x * 10) / 10);
-    new Chart(canvas, {
-        type: "line",
-        data: { labels: labelled, datasets },
-        options: {
-            responsive: true,
-            animation: false,
-            interaction: { mode: "index", intersect: false },
-            plugins: {
-                legend: {
-                    position: "top",
-                    // Match the dashboard legend: plain click isolates (and a
-                    // second click on the isolated series restores all);
-                    // Ctrl/Cmd-click toggles just that series. Elevation stays
-                    // an independent on/off, never part of the isolation.
-                    onClick: (e, legendItem, legend) => {
-                        const chart = legend.chart;
-                        const idx = legendItem.datasetIndex;
-                        const additive = !!(e.native && (e.native.ctrlKey || e.native.metaKey));
-                        if (idx === elevationIndex) {
-                            chart.setDatasetVisibility(idx, !chart.isDatasetVisible(idx));
-                            chart.update();
-                            return;
-                        }
-                        const target = realUnits.find((u) => u.indexOf(idx) !== -1);
-                        if (target) applyLegendSelection(chart, realUnits, target, additive);
-                    },
-                },
-                tooltip: {
-                    callbacks: {
-                        title: (items) => (items.length ? items[0].label + " min" : ""),
-                    },
-                },
+    // A ride with only an altitude stream still gets one panel to hang the
+    // band on; otherwise a panel exists only for a measure that has data.
+    const present = DETAIL_SERIES.filter((s) => have[s.key]);
+    const hosts = present.length ? present : [DETAIL_SERIES[0]];
+    const totalWeight = hosts.reduce((acc, s) => acc + s.weight, 0);
+
+    hosts.forEach((spec, i) => {
+        const el = document.getElementById(spec.id);
+        if (!el) return;
+        el.hidden = false;
+        // Split the old single canvas's height budget between however many
+        // panels this ride actually has, so the block's footprint is the same
+        // whether it draws one measure or three.
+        el.height = Math.round(spec.weight * DETAIL_HEIGHT_BUDGET / totalWeight);
+
+        const datasets = [];
+        const scales = {
+            x: {
+                type: "linear",
+                title: { display: i === hosts.length - 1, text: "Time (min)" },
+                afterBuildTicks: strideTicks(DETAIL_X_TICKS),
+                ticks: { display: i === hosts.length - 1, maxRotation: 0, autoSkip: false },
             },
-            scales,
-        },
+            y: {
+                position: "left", beginAtZero: true,
+                title: { display: true, text: spec.axis },
+            },
+        };
+        // Elevation rides on the first panel only: it is a context surface, so
+        // one band under the whole stack reads better than three copies, and
+        // its axis stays hidden because metres are not comparable with watts.
+        if (have.altitude && i === 0) {
+            datasets.push({
+                label: "Elevation (m)", data: data.altitude,
+                borderColor: tokenAlpha("--s-context", 0.5),
+                backgroundColor: tokenAlpha("--s-context", 0.18),
+                yAxisID: "yAlt", fill: "start", pointRadius: 0, borderWidth: 1,
+                order: 10, spanGaps: true,
+            });
+            scales.yAlt = { position: "right", display: false, grid: { drawOnChartArea: false } };
+        }
+        if (have[spec.key]) {
+            datasets.push({
+                label: spec.label, data: data[spec.key], borderColor: cssVar(spec.token),
+                yAxisID: "y", pointRadius: 0, borderWidth: 1.5, spanGaps: true, order: 1,
+            });
+        }
+
+        const chart = new Chart(el, {
+            type: "line",
+            data: { labels: labelled, datasets },
+            options: {
+                responsive: true,
+                animation: false,
+                interaction: { mode: "index", intersect: false },
+                // Declared here because alignPanels can only assign the leaf:
+                // see the trap note on it in chart-theme.js.
+                layout: { padding: { left: 0, right: 0 } },
+                plugins: {
+                    legend: { display: false }, // custom HTML legend instead
+                    tooltip: {
+                        callbacks: {
+                            title: (items) => (items.length ? items[0].label + " min" : ""),
+                        },
+                    },
+                },
+                scales,
+            },
+        });
+        detailCharts.push(chart);
+        if (have.altitude && i === 0) {
+            detailUnits.push({
+                label: "Elevation (m)", chart: chart, datasets: [0],
+                token: "--s-context", independent: true,
+                tip: "Elevation profile — context behind the data; toggles on its own.",
+            });
+        }
+        if (have[spec.key]) {
+            detailUnits.push({
+                label: spec.label, chart: chart,
+                datasets: [datasets.length - 1], token: spec.token,
+            });
+        }
     });
+
+    hosts.forEach((spec) => {
+        const el = document.getElementById(spec.id);
+        if (el && !detailCharts.some((c) => c.canvas === el)) el.hidden = true;
+    });
+
+    renderLegend("detailLegend", () => detailUnits);
+    detailCrosshair = linkedCrosshair(detailCharts);
+    schedulePanelAlign(detailCharts);
+    window.addEventListener("resize", () => schedulePanelAlign(detailCharts));
 }

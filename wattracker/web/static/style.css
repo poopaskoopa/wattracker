@@ -199,6 +199,11 @@ main a:hover { color: var(--accent); text-decoration: underline; }
    kills the inline-baseline gap that would otherwise open a ~4px seam between
    the panels and separate them visually. */
 .chart-panels canvas { display: block; }
+/* `display: block` above is a class selector and so outranks the UA sheet's
+   `[hidden] { display: none }`. Without this, a panel the page has hidden
+   (activity detail hides the measures a ride has no stream for) still lays out
+   at the canvas default 300x150 and silently pads the block. */
+.chart-panels canvas[hidden] { display: none; }
 
 /* Volume small multiples: four panels, one shared x axis. The stack is sized
    by aspect ratio rather than by canvas `height` attributes because the bottom
@@ -237,9 +242,21 @@ main a:hover { color: var(--accent); text-decoration: underline; }
 .zone-panel { min-width: 0; border: 1px solid var(--surface-border); border-radius: var(--r-md); padding: 0.8rem; }
 .zone-time-table { margin-bottom: 0.5rem; }
 .zone-time-table th, .zone-time-table td { padding: 0.35rem 0.4rem; white-space: nowrap; }
-.zone-duration { font-variant-numeric: tabular-nums; font-weight: 600; }
-.zone-percent { min-width: 120px; display: flex; align-items: center; gap: 0.4rem; }
-.zone-bar { display: inline-block; width: var(--zone-pct); max-width: 70px; height: 0.55rem; background: var(--accent); border-radius: var(--r-sm); }
+.zone-duration { font-weight: 600; }
+/* Time-in-zone bar. This was a bare bar capped at `max-width: 70px`, so every
+   zone above ~70% of the row drew the same length as every other - the
+   encoding broke exactly where the values are largest and most worth reading.
+   A fixed-width track with a proportional fill restores it and gives the short
+   zones something to be short against. Same row height as before.
+   The fill is a series token, not --accent: gold is UI chrome and never
+   encodes data. One flat hue rather than a light-to-dark ramp across Z1-Z7 -
+   at this height a light step would disappear into the track, and the zone
+   label in the row already carries the ordering. */
+.zone-percent { min-width: 140px; display: flex; align-items: center; gap: 0.4rem; }
+.zone-track { flex: 1 1 auto; min-width: 48px; max-width: 90px; height: 0.55rem;
+    background: var(--surface-inset); border-radius: var(--r-pill); overflow: hidden; }
+.zone-bar { display: block; width: var(--zone-pct); height: 100%;
+    background: var(--s-3); border-radius: var(--r-pill); }
 .sr-only { position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px; overflow: hidden; clip: rect(0, 0, 0, 0); white-space: nowrap; border: 0; }
 @media (max-width: 720px) {
     .zone-summary-grid, .power-profile-layout { grid-template-columns: 1fr; }

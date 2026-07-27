@@ -138,6 +138,20 @@ function dateAxisTicks(maxTicks) {
     };
 }
 
+// The same tick problem for an axis whose labels carry no calendar meaning
+// (the activity-detail panels are minutes into the ride). No month logic to
+// apply, but stacked panels still have to thin identically, and `autoSkip`
+// still will not do it for a panel that draws no labels.
+function strideTicks(maxTicks) {
+    var max = maxTicks || 12;
+    return function (scale) {
+        var ticks = scale.ticks || [];
+        if (ticks.length <= max) return;
+        var step = Math.ceil(ticks.length / max);
+        scale.ticks = ticks.filter(function (_t, i) { return i % step === 0; });
+    };
+}
+
 // ------------------------------------------------------- panel alignment
 // N charts stacked as one plot with one shared x domain (the dashboard's two
 // fitness panels, the volume page's four small multiples) have to line up on
@@ -224,6 +238,7 @@ function schedulePanelAlign(charts) {
     window.tokenAlpha = tokenAlpha;
     window.monthYearTicks = monthYearTicks;
     window.dateAxisTicks = dateAxisTicks;
+    window.strideTicks = strideTicks;
     window.alignPanels = alignPanels;
     window.schedulePanelAlign = schedulePanelAlign;
 
