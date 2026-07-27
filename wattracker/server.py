@@ -34,6 +34,7 @@ from starlette.middleware.trustedhost import TrustedHostMiddleware
 from . import (
     auth,
     backup,
+    calendarfeed,
     config,
     credstore,
     db,
@@ -319,8 +320,65 @@ class NoCacheStaticFiles(StaticFiles):
 
 # Paths served without authentication. Interactive docs are disabled (see the
 # FastAPI() constructor), so no /docs, /openapi or /redoc prefixes are exempt.
-_EXEMPT = ("/login", "/register")
+# "/calendar.ics" is exempt from the SESSION check only - it authenticates the
+# caller itself, from a per-user token, because a subscribing phone calendar
+# app has no cookie jar (see calendarfeed.py). It is an exact match, so the
+# session-protected "/calendar" page above it is untouched.
+_EXEMPT = ("/login", "/register", calendarfeed.FEED_PATH)
 _EXEMPT_PREFIXES = ("/static", "/favicon", "/apple-touch-icon")
+
+# One log line per this many rejected /calendar.ics tokens. Not a limit:
+# nothing is ever refused because of it (see CalendarFeedFailureCounter).
+CALENDAR_TOKEN_FAILURE_THRESHOLD = 10
+
+
+class CalendarFeedFailureCounter:
+    """One process-wide count of rejected /calendar.ics tokens.
+
+    What it is: a coarse "someone is guessing feed tokens" signal in the log.
+    Not a per-client metric, not a rate limit, and it refuses nothing.
+
+    Deliberately UNKEYED. The obvious key - the client address - is worthless
+    here and actively harmful. Worthless because a loopback-bound single-user
+    app sees one address; harmful because that address is client-controlled:
+    uvicorn enables proxy_headers with a trusted range of 127.0.0.1, so on a
+    loopback bind every caller is a "trusted proxy" and can set
+    request.client.host to anything via X-Forwarded-For. A keyed version was
+    tried and defeated exactly that way: 400 guesses under 400 forged
+    addresses each sat at count 1, so no threshold ever fired and the
+    key-eviction sweep additionally wiped the genuine tally accumulated
+    alongside - the counter went quiet precisely while being attacked.
+    ``proxy_headers=False`` in __main__ closes the header-spoofing hole; not
+    keying on the address at all is what makes this counter unspoofable
+    regardless of how the app is ever launched.
+
+    It also refuses nothing, unlike auth.LoginThrottle on /login. An earlier
+    version refused, and that was a self-inflicted outage: every caller shares
+    one address on loopback (and behind the SSH/Tailscale/Cloudflare tunnel a
+    phone would actually use), so a few bad guesses - or one stale
+    subscription still presenting a rotated token - started 404-ing the valid
+    subscriber. A calendar client answers a 404 by silently continuing to show
+    a stale calendar, which is the worst possible failure mode for a feature
+    whose whole point is that the schedule appears on the phone. /login can
+    afford to refuse because a password is guessable and the user is standing
+    there to read the error; a 256-bit token checked one indexed lookup at a
+    time is not guessable, so visibility is the only control worth having.
+    """
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._count = 0
+
+    def record_failure(self) -> int:
+        """Count one rejection; returns the running total."""
+        with self._lock:
+            self._count += 1
+            return self._count
+
+    @property
+    def count(self) -> int:
+        with self._lock:
+            return self._count
 
 # Max in-memory size for an uploaded activity file (bytes). A real .fit ride is
 # well under this; the cap stops a huge upload from exhausting memory.
@@ -493,6 +551,14 @@ def create_app() -> FastAPI:
     app.state.last = {}
     # In-process brute-force throttle for /login (per lowercased username).
     app.state.login_throttle = auth.LoginThrottle()
+    # Rejected /calendar.ics tokens: a single unkeyed count, not a throttle.
+    # The route resolves the token first and serves any valid one before this
+    # is consulted at all, so a subscribed calendar app can never be refused
+    # because of someone else's guessing - or its own earlier attempts with a
+    # rotated token.
+    app.state.calendar_failures = CalendarFeedFailureCounter()
+    # uvicorn logs the full request target; keep feed tokens out of the log.
+    calendarfeed.install_access_log_redaction()
 
     # SessionMiddleware must be OUTER (added after AuthMiddleware) so
     # request.session is populated before AuthMiddleware runs. TrustedHost is
@@ -1582,6 +1648,97 @@ def create_app() -> FastAPI:
     def api_volume(request: Request):
         return JSONResponse({"weeks": db.weekly_volume(_uid(request))})
 
+    # --------------------------------------------------- calendar feed
+    def _record_calendar_feed_failure() -> None:
+        """Tally a rejected feed token and surface sustained guessing.
+
+        Reached only after the token failed to resolve, so it can never delay
+        or refuse a valid subscriber. Nothing client-controlled is recorded or
+        logged: not the token, and not the source address (which a caller can
+        forge - see CalendarFeedFailureCounter). Only the running count.
+        """
+        count = app.state.calendar_failures.record_failure()
+        if count % CALENDAR_TOKEN_FAILURE_THRESHOLD == 0:
+            _log.warning(
+                "%d rejected calendar-feed tokens so far (valid tokens are "
+                "unaffected and still served)", count,
+            )
+
+    def _head_of(body: bytes, response: Response, is_head: bool) -> Response:
+        """Drop the body for a HEAD while keeping the headers a GET would send.
+
+        Starlette sends ``response.body`` regardless of method, so HEAD has to
+        be handled here. RFC 9110 8.6: the Content-Length of a HEAD is the one
+        the equivalent GET would have carried, so it is set explicitly (an
+        explicit content-length also suppresses Starlette's auto-computed one,
+        which would otherwise say 0).
+        """
+        if not is_head:
+            return response
+        response.headers["content-length"] = str(len(body))
+        response.body = b""
+        return response
+
+    def _calendar_feed_missing(is_head: bool = False) -> Response:
+        """The one answer for every rejected feed request.
+
+        Missing, empty, malformed and unknown all land here with an identical
+        404. A 401/403 would confirm that the endpoint takes a token and that
+        the presented one merely failed - and distinguishing "unknown token"
+        from "no token" would turn the endpoint into an existence oracle. HEAD
+        and GET are rejected identically apart from the absent body.
+        """
+        body = b"Not Found"
+        return _head_of(
+            body,
+            PlainTextResponse(
+                body,
+                status_code=404,
+                headers={"Cache-Control": "private, no-store"},
+            ),
+            is_head,
+        )
+
+    # GET and HEAD: some calendar clients probe with a conditional HEAD before
+    # fetching, and a 405 there makes them give up on the subscription.
+    @app.api_route(
+        calendarfeed.FEED_PATH, methods=["GET", "HEAD"], include_in_schema=False
+    )
+    def calendar_feed(request: Request, token: str = ""):
+        """Per-user .ics feed, authenticated solely by ``token``.
+
+        No session is consulted: the token alone names the user, and every row
+        the response contains is read with that user's id. ``token`` defaults
+        to "" rather than being required so that a missing parameter is a 404
+        like any other bad token, not FastAPI's 422 (which would announce the
+        parameter's existence).
+
+        The token is resolved BEFORE any rate-limit state is consulted, so a
+        valid token is served unconditionally - see the failure counter's note
+        in create_app for why that ordering is load-bearing.
+        """
+        is_head = request.method == "HEAD"
+        user = calendarfeed.user_for_token(token)
+        if user is None:
+            _record_calendar_feed_failure()
+            return _calendar_feed_missing(is_head)
+        body = calendarfeed.build_ics(user["id"]).encode("utf-8")
+        return _head_of(
+            body,
+            Response(
+                content=body,
+                media_type="text/calendar; charset=utf-8",
+                headers={
+                    # The URL is a bearer credential; no shared cache may keep
+                    # the response, and no client may write it to disk.
+                    "Cache-Control": "private, no-store",
+                    "X-Content-Type-Options": "nosniff",
+                    "Content-Disposition": 'inline; filename="wattracker.ics"',
+                },
+            ),
+            is_head,
+        )
+
     @app.get("/calendar", response_class=HTMLResponse)
     def calendar_view(
         request: Request,
@@ -1943,11 +2100,19 @@ def create_app() -> FastAPI:
     def _settings_ctx(request: Request, uid: int, saved: bool,
                       cred_message: Optional[str] = None,
                       backup_message: Optional[str] = None,
-                      dir_message: Optional[str] = None) -> dict:
+                      dir_message: Optional[str] = None,
+                      calendar_message: Optional[str] = None,
+                      calendar_feed_url: Optional[str] = None) -> dict:
         settings = db.get_user_settings(uid)
         return _ctx(
             request,
             settings=settings,
+            # Whether a link exists is safe to render; the token itself is only
+            # ever passed in as calendar_feed_url, by the route that just
+            # minted it, and is never read back out of the database.
+            calendar_token_set=calendarfeed.token_is_set(uid),
+            calendar_message=calendar_message,
+            calendar_feed_url=calendar_feed_url,
             current_ftp=round(importer.current_ftp(uid), 1),
             recent_best_effort_ftp=round(importer.recent_best_effort_ftp(uid), 1),
             api_key_set=config.anthropic_api_key_set(),
@@ -2101,6 +2266,46 @@ def create_app() -> FastAPI:
             _settings_ctx(request, uid, False,
                           cred_message="Zwift credentials cleared."),
         )
+
+    @app.post("/settings/calendar-feed", response_class=HTMLResponse)
+    def settings_calendar_feed_token(request: Request):
+        """Mint (or rotate) this user's calendar feed token.
+
+        Session-authenticated and same-origin checked like the other state-
+        changing settings actions. The plaintext token is rendered straight
+        into this one response and then discarded - only its hash is stored -
+        so a rotation is also the only moment the URL can be copied.
+        """
+        if not _same_origin_or_absent(request):
+            return PlainTextResponse("Origin not allowed", status_code=403)
+        uid = _uid(request)
+        rotated = calendarfeed.token_is_set(uid)
+        token = calendarfeed.generate_token(uid)
+        if token is None:
+            return templates.TemplateResponse(
+                request, "settings.html",
+                _settings_ctx(request, uid, False,
+                              calendar_message="Could not create a calendar link."),
+                status_code=500,
+            )
+        message = (
+            "New calendar link created. The previous link has stopped working."
+            if rotated else
+            "Calendar link created. Copy it now - it is not shown again."
+        )
+        response = templates.TemplateResponse(
+            request, "settings.html",
+            _settings_ctx(
+                request, uid, False,
+                calendar_message=message,
+                calendar_feed_url=calendarfeed.feed_url(
+                    str(request.base_url), token
+                ),
+            ),
+        )
+        # This page body contains the plaintext token exactly once.
+        response.headers["Cache-Control"] = "private, no-store"
+        return response
 
     @app.post("/settings/backup", response_class=HTMLResponse)
     def settings_backup_now(request: Request):
