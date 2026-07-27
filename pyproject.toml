@@ -18,6 +18,7 @@ dependencies = [
     "python-multipart>=0.0.32",
     "itsdangerous>=2.2.0",
     "keyring>=25.0",
+    "tzdata>=2024.1",
 ]
 
 [project.optional-dependencies]

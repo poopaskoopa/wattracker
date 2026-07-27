@@ -300,6 +300,31 @@ def test_newer_db_version_refused_data_intact(tmp_path):
     conn.close()
 
 
+def test_v24_database_adds_timezone_without_losing_settings(tmp_path):
+    path = str(tmp_path / "v24.db")
+    db.init_db(path=path)
+    uid = db.create_user("keeper", "hash", path=path)
+    db.save_user_settings(uid, {"ftp": 245}, path=path)
+
+    conn = sqlite3.connect(path)
+    conn.execute("ALTER TABLE user_settings DROP COLUMN timezone")
+    conn.execute("PRAGMA user_version = 24")
+    conn.commit()
+    conn.close()
+
+    db.init_db(path=path)
+
+    settings = db.get_user_settings(uid, path=path)
+    assert settings["ftp"] == 245
+    assert settings["timezone"] is None
+    conn = sqlite3.connect(path)
+    assert conn.execute("PRAGMA user_version").fetchone()[0] == 25
+    assert "timezone" in {
+        row[1] for row in conn.execute("PRAGMA table_info(user_settings)")
+    }
+    conn.close()
+
+
 def test_unknown_old_version_still_recreates(tmp_path):
     path = str(tmp_path / "old.db")
     conn = sqlite3.connect(path)

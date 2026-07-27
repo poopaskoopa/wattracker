@@ -31,6 +31,13 @@
         <input type="number" step="0.1" min="20" max="200" name="weight_kg"
                value="{{ settings.weight_kg if settings.weight_kg else '' }}">
     </label>
+    <label>Time zone (IANA name):
+        <input type="text" name="timezone" autocomplete="off"
+               placeholder="America/New_York"
+               value="{{ settings.timezone or 'UTC' }}">
+        <span class="hint">Used to decide which dated workouts are available
+            on the Ride page. Timestamps remain stored in UTC.</span>
+    </label>
     {% if zwift_candidates %}
     <fieldset class="zwift-picker">
         <legend>Zwift player folders detected on this computer &mdash; pick yours
