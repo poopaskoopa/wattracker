@@ -12,6 +12,7 @@ import getpass
 import json
 import logging
 import os
+import re
 import secrets
 import subprocess
 from dataclasses import dataclass
@@ -181,6 +182,88 @@ def server_port() -> int:
     if not 1 <= port <= 65535:
         raise ValueError("WATTRACKER_PORT must be an integer from 1 to 65535")
     return port
+
+
+# One DNS label: letters/digits/hyphen, 1-63 characters, no leading or
+# trailing hyphen. Applied to an already-lowercased, ASCII-only label.
+_DNS_LABEL_RE = re.compile(r"\A[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\Z")
+
+# Characters that would give a bare hostname structure it must not have here -
+# a path, query, fragment, userinfo, an IPv6 literal, quoting or percent
+# escaping - plus the wildcard. Any of them means the value is not the single
+# exact hostname this setting is documented to hold, so it is refused outright
+# rather than sanitised into something the operator did not write.
+_PUBLIC_HOST_FORBIDDEN = frozenset("/\\?#@*[]\"'%,;&=<>{}|^`~+$!()")
+
+
+def public_host() -> Optional[str]:
+    """Validated external hostname this app is reached by (WATTRACKER_PUBLIC_HOST).
+
+    Unset or empty -> None, and behaviour is exactly the default posture: the
+    Host allowlist stays loopback-only and calendar links are minted from the
+    request's own base URL. Set, it names the one extra host the server will
+    answer to (a ``tailscale serve`` tailnet name, say) and the host calendar
+    subscription links are built from.
+
+    This value is appended to a security allowlist, so it is the one place a
+    typo could widen exposure: it accepts an exact DNS hostname with an
+    optional ``:port`` and nothing else, and anything else raises. A wildcard
+    in any form is rejected - the allowlist does no pattern matching and must
+    never be given a value that looks like it does. The hostname is lowercased
+    because DNS names are case-insensitive while the allowlist comparison is
+    not; normalising here is what stops ``Foo.ts.net`` from either bypassing or
+    silently missing the entry.
+    """
+    raw = os.environ.get("WATTRACKER_PUBLIC_HOST", "").strip()
+    if not raw:
+        return None
+    err = ValueError(
+        "WATTRACKER_PUBLIC_HOST must be a bare hostname with an optional port "
+        "(e.g. 'laptop.tail1234.ts.net' or 'laptop.tail1234.ts.net:8443') - no "
+        "scheme, path, credentials, whitespace or wildcard"
+    )
+    # Printable ASCII only: this rejects control characters, embedded
+    # whitespace, and non-ASCII lookalikes (a Unicode digit passes str.isdigit
+    # and would sneak through the port check below; an IDN must be given in
+    # punycode).
+    if any(not ("\x21" <= ch <= "\x7e") for ch in raw):
+        raise err
+    if any(ch in _PUBLIC_HOST_FORBIDDEN for ch in raw):
+        raise err
+
+    host = raw.lower()
+    port: Optional[str] = None
+    if ":" in host:
+        host, _, port = host.rpartition(":")
+        # A second colon means an IPv6 literal or a mangled value, not
+        # "host:port"; either way it is not what this setting accepts.
+        if not host or ":" in host or not port.isdigit():
+            raise err
+        if not 1 <= int(port) <= 65535:
+            raise err
+
+    if len(host) > 253:
+        raise err
+    # A trailing dot yields an empty final label and is rejected here: the
+    # allowlist match is exact, so the value must be written the same way a
+    # client will send it in the Host header.
+    if any(not _DNS_LABEL_RE.match(label) for label in host.split(".")):
+        raise err
+    return f"{host}:{port}" if port else host
+
+
+def public_scheme() -> str:
+    """Scheme for links that name ``public_host`` (WATTRACKER_PUBLIC_SCHEME).
+
+    Defaults to https because ``tailscale serve`` terminates TLS: the app
+    itself still only ever speaks plain http on loopback, so this describes how
+    the outside world reaches it, not how it is served. Only http or https are
+    accepted; the escape hatch exists for anyone fronting it without TLS.
+    """
+    raw = os.environ.get("WATTRACKER_PUBLIC_SCHEME", "").strip().lower() or "https"
+    if raw not in ("http", "https"):
+        raise ValueError("WATTRACKER_PUBLIC_SCHEME must be 'http' or 'https'")
+    return raw
 
 
 def open_browser_enabled() -> bool:

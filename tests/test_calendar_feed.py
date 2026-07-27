@@ -829,3 +829,109 @@ def test_migration_adds_the_column_without_losing_data():
     # And the freshly migrated column is immediately usable.
     token = calendarfeed.generate_token(uid)
     assert calendarfeed.user_for_token(token)["id"] == uid
+
+
+# ------------------------------------------- reaching the feed over a tailnet
+# The app stays bound to loopback; a tailnet proxy (tailscale serve) forwards
+# to it and passes the original Host through. WATTRACKER_PUBLIC_HOST names the
+# one extra Host the server will answer to, and the host the subscription link
+# is minted from. Unset, everything below must behave exactly as before.
+PUBLIC_HOST = "laptop.tail1234.ts.net"
+
+
+def _app_with_public_host(monkeypatch, host=None, scheme=None):
+    if host is None:
+        monkeypatch.delenv("WATTRACKER_PUBLIC_HOST", raising=False)
+    else:
+        monkeypatch.setenv("WATTRACKER_PUBLIC_HOST", host)
+    if scheme is None:
+        monkeypatch.delenv("WATTRACKER_PUBLIC_SCHEME", raising=False)
+    else:
+        monkeypatch.setenv("WATTRACKER_PUBLIC_SCHEME", scheme)
+    return create_app()
+
+
+def test_unset_public_host_still_rejects_a_tailnet_host(monkeypatch):
+    """Default posture is unchanged: only loopback names are answered."""
+    with TestClient(_app_with_public_host(monkeypatch)) as c:
+        r = c.get("/login", headers={"host": PUBLIC_HOST})
+    assert r.status_code == 400
+    assert r.text == "Invalid host header"
+
+
+def test_configured_public_host_is_accepted(monkeypatch):
+    with TestClient(_app_with_public_host(monkeypatch, PUBLIC_HOST)) as c:
+        r = c.get("/login", headers={"host": PUBLIC_HOST})
+        assert r.status_code == 200
+        # Host matching is case-insensitive on both sides.
+        assert c.get("/login", headers={"host": PUBLIC_HOST.upper()}).status_code == 200
+        # ... and the loopback names still work, so the desktop is unaffected.
+        assert c.get("/login", headers={"host": "127.0.0.1:8000"}).status_code == 200
+
+
+@pytest.mark.parametrize("host", [
+    "other.tail1234.ts.net",
+    "evil.ts.net",
+    "ts.net",
+    "laptop.tail1234.ts.net.evil.example",
+    "evil.example",
+])
+def test_configured_public_host_is_not_a_wildcard(monkeypatch, host):
+    """One exact name is allowed - no sibling, suffix, or parent of it."""
+    with TestClient(_app_with_public_host(monkeypatch, PUBLIC_HOST)) as c:
+        r = c.get("/login", headers={"host": host})
+    assert r.status_code == 400
+
+
+def test_public_host_with_a_port_matches_the_host_portion(monkeypatch):
+    """Starlette compares the host portion, so a ':port' value must still match."""
+    with TestClient(_app_with_public_host(monkeypatch, f"{PUBLIC_HOST}:8443")) as c:
+        assert c.get(
+            "/login", headers={"host": f"{PUBLIC_HOST}:8443"}
+        ).status_code == 200
+        assert c.get("/login", headers={"host": PUBLIC_HOST}).status_code == 200
+        assert c.get(
+            "/login", headers={"host": "other.ts.net:8443"}
+        ).status_code == 400
+
+
+class _FakeRequest:
+    """Just enough Request for the base-URL decision."""
+
+    def __init__(self, base_url="http://127.0.0.1:8000/"):
+        self.base_url = base_url
+
+
+def test_feed_base_url_falls_back_to_the_request(monkeypatch):
+    monkeypatch.delenv("WATTRACKER_PUBLIC_HOST", raising=False)
+    assert servermod._feed_base_url(_FakeRequest()) == "http://127.0.0.1:8000/"
+
+
+def test_feed_base_url_uses_the_configured_host(monkeypatch):
+    monkeypatch.setenv("WATTRACKER_PUBLIC_HOST", PUBLIC_HOST)
+    monkeypatch.delenv("WATTRACKER_PUBLIC_SCHEME", raising=False)
+    # https by default: tailscale serve terminates TLS.
+    assert servermod._feed_base_url(_FakeRequest()) == f"https://{PUBLIC_HOST}"
+    monkeypatch.setenv("WATTRACKER_PUBLIC_SCHEME", "http")
+    assert servermod._feed_base_url(_FakeRequest()) == f"http://{PUBLIC_HOST}"
+    monkeypatch.setenv("WATTRACKER_PUBLIC_HOST", f"{PUBLIC_HOST}:8443")
+    assert servermod._feed_base_url(_FakeRequest()) == f"http://{PUBLIC_HOST}:8443"
+
+
+def test_minted_url_uses_the_request_when_unconfigured(monkeypatch):
+    with TestClient(_app_with_public_host(monkeypatch)) as c:
+        _register(c)
+        body = c.post("/settings/calendar-feed").text
+    assert "http://testserver/calendar.ics?token=" in body
+
+
+def test_minted_url_uses_the_configured_host(monkeypatch):
+    with TestClient(_app_with_public_host(monkeypatch, f"{PUBLIC_HOST}:8443")) as c:
+        _register(c)
+        body = c.post("/settings/calendar-feed").text
+        token = body.split("/calendar.ics?token=")[1].split('"')[0]
+        # The link is for the phone; the token itself is unchanged and still
+        # resolves on the loopback request that minted it.
+        assert c.get("/calendar.ics", params={"token": token}).status_code == 200
+    assert f"https://{PUBLIC_HOST}:8443/calendar.ics?token=" in body
+    assert "testserver" not in body.split("/calendar.ics?token=")[0].split("value=")[-1]

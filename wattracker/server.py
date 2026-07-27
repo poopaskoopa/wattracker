@@ -509,6 +509,25 @@ def _same_origin_or_absent(request: Request) -> bool:
     )
 
 
+def _feed_base_url(request: Request) -> str:
+    """Base URL to mint calendar subscription links from.
+
+    ``request.base_url`` is derived from the Host header, which on this app is
+    always a loopback name - a link a phone cannot resolve. When the deployment
+    declares how it is reached from outside (WATTRACKER_PUBLIC_HOST, plus
+    WATTRACKER_PUBLIC_SCHEME for the TLS-terminating front end), links are
+    built from that instead. Unconfigured, this is exactly the previous
+    behaviour.
+
+    Only the base URL changes. The token, its hashing, and the feed's own
+    authentication are untouched by which name the link carries.
+    """
+    public = config.public_host()
+    if public:
+        return f"{config.public_scheme()}://{public}"
+    return str(request.base_url)
+
+
 def create_app() -> FastAPI:
     @asynccontextmanager
     async def lifespan(_app: FastAPI):
@@ -570,9 +589,38 @@ def create_app() -> FastAPI:
         session_cookie="wattracker_session",
         same_site="lax",
     )
+    allowed_hosts = ["localhost", "127.0.0.1", "[::1]", "::1", "testserver"]
+    # An optional single extra name, so a reverse proxy on the owner's tailnet
+    # (tailscale serve) can forward requests that still carry their original
+    # Host. Exactly one literal hostname is added - never a wildcard, never a
+    # suffix pattern; config.public_host() refuses anything else, and the
+    # middleware below does a plain equality test with no pattern support.
+    #
+    # Why this is safe HERE: the app is still bound to loopback
+    # (config.server_host() enforces that), so nothing can reach this socket
+    # except the proxy on this machine, and that proxy only accepts connections
+    # from the owner's tailnet, which is authenticated by Tailscale itself.
+    # Widening the Host allowlist does not widen who can connect; it only stops
+    # the server rejecting the name the tailnet proxy passes through.
+    #
+    # What it would mean otherwise: pointing a PUBLIC DNS name at this and
+    # putting a proxy in front of it makes every route on this app reachable by
+    # anyone who resolves that name, with only the session cookie (and, for the
+    # feed, a URL-borne token) in the way. This app is designed as a
+    # single-user local server - the CSRF story is a same-origin check, the
+    # session cookie is not Secure, and there is no rate limiting beyond
+    # /login. Do not set this to an internet-facing name.
+    public_host = config.public_host()
+    if public_host:
+        # The value may carry ":port"; strip it with the middleware's own
+        # parser so the entry is exactly what _host_only() will produce for an
+        # incoming Host header (Starlette compares the host portion only).
+        host_only = IPv6TrustedHostMiddleware._host_only(public_host)
+        if host_only:
+            allowed_hosts.append(host_only)
     app.add_middleware(
         IPv6TrustedHostMiddleware,
-        allowed_hosts=["localhost", "127.0.0.1", "[::1]", "::1", "testserver"],
+        allowed_hosts=allowed_hosts,
         www_redirect=False,
     )
 
@@ -2299,7 +2347,7 @@ def create_app() -> FastAPI:
                 request, uid, False,
                 calendar_message=message,
                 calendar_feed_url=calendarfeed.feed_url(
-                    str(request.base_url), token
+                    _feed_base_url(request), token
                 ),
             ),
         )
