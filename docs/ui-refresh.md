@@ -414,8 +414,8 @@ WP-8 (ride)                 ← after all of the above are on main
 | WP-2 volume | Agent 1 | **merged** `ad0d17d` |
 | WP-4 power profile | Agent 2 | **merged** `4b8493f` |
 | WP-3 activity detail | Agent 1 | **merged** `2243771` |
-| WP-6 tables | Agent 2 | not started — **next for Agent 2** |
-| WP-5 workout SVG | Agent 2 | not started |
+| WP-6 tables | Agent 2 | **merged** `52480ad` |
+| WP-5 workout SVG | Agent 2 | not started — **next for Agent 2** |
 | WP-7 calendar | Agent 2 | not started |
 | WP-8 ride | unassigned | after all of the above |
 
