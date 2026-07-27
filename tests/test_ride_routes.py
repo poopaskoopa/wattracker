@@ -1,6 +1,7 @@
 """Route + WebSocket tests for the Ride page (no hardware; availability is
 forced via monkeypatch so results don't depend on whether bleak is installed)."""
 import asyncio
+import re
 
 import pytest
 
@@ -51,6 +52,110 @@ def test_ride_page_renders_unavailable(client, monkeypatch):
     assert r.status_code == 200
     assert "Bluetooth unavailable" in r.text
     assert "Simulate" in r.text
+
+
+def _add_plan_workout(client, date, name="Selected workout", username="rider"):
+    uid = db.get_user_by_username(username)["id"]
+    plan_id = db.create_plan(uid, name, date, 1)
+    return db.add_plan_workout(
+        plan_id,
+        uid,
+        date,
+        name,
+        "endurance",
+        3600,
+        50.0,
+        "<workout_file/>",
+    )
+
+
+def test_ride_page_deep_link_preselects_owned_workout(client):
+    _register(client)
+    workout_id = _add_plan_workout(client, "2099-01-02")
+
+    r = client.get(f"/ride?workout_id={workout_id}")
+
+    assert r.status_code == 200
+    assert re.search(
+        rf'<option value="{workout_id}" data-name="Selected workout"\s+selected>',
+        r.text,
+    )
+
+
+def test_ride_page_without_deep_link_keeps_default_selection(client):
+    _register(client)
+    workout_id = _add_plan_workout(client, "2099-01-02")
+
+    r = client.get("/ride")
+
+    assert r.status_code == 200
+    assert '<option value="" data-name="Endurance">Endurance (45 min)</option>' in r.text
+    assert not re.search(
+        rf'<option value="{workout_id}" data-name="Selected workout"\s+selected>',
+        r.text,
+    )
+
+
+def test_ride_page_deep_link_includes_past_workout(client):
+    _register(client)
+    workout_id = _add_plan_workout(client, "2000-01-02", "Past workout")
+
+    r = client.get(f"/ride?workout_id={workout_id}")
+
+    assert r.status_code == 200
+    assert re.search(
+        rf'<option value="{workout_id}" data-name="Past workout"\s+selected>',
+        r.text,
+    )
+
+
+def test_ride_page_deep_link_includes_workout_outside_upcoming_cap(client):
+    _register(client)
+    uid = db.get_user_by_username("rider")["id"]
+    plan_id = db.create_plan(uid, "Many workouts", "2099-01-01", 1)
+    workout_ids = [
+        db.add_plan_workout(
+            plan_id,
+            uid,
+            "2099-01-01",
+            f"Workout {day}",
+            "endurance",
+            3600,
+            50.0,
+            "<workout_file/>",
+        )
+        for day in range(1, 42)
+    ]
+    selected_id = workout_ids[-1]
+
+    r = client.get(f"/ride?workout_id={selected_id}")
+
+    assert r.status_code == 200
+    assert r.text.count(f'<option value="{selected_id}"') == 1
+    assert re.search(
+        rf'<option value="{selected_id}" data-name="Workout 41"\s+selected>',
+        r.text,
+    )
+
+
+def test_ride_page_deep_link_rejects_missing_and_foreign_workouts(client):
+    _register(client, "alice")
+    foreign_id = _add_plan_workout(client, "2099-01-02", username="alice")
+    client.post("/logout")
+    _register(client, "bob")
+
+    assert client.get(f"/ride?workout_id={foreign_id}").status_code == 404
+    assert client.get("/ride?workout_id=999999").status_code == 404
+
+
+@pytest.mark.parametrize("workout_id", ["0", "-1", str(2**63), str(10**100)])
+def test_ride_page_deep_link_rejects_out_of_range_ids(client, workout_id):
+    _register(client)
+
+    r = client.get(f"/ride?workout_id={workout_id}")
+
+    assert r.status_code == 404
+    assert r.text == "Workout not found"
 
 
 def test_ride_page_renders_available_when_monkeypatched(client, monkeypatch):
