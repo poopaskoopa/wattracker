@@ -22,8 +22,23 @@ function cssVar(name, fallback) {
     }
 }
 
+// A token colour with an alpha channel, for the places Chart.js wants a
+// translucent fill (zoom drag boxes, area fills under a line, the elevation
+// band). The tokens are opaque #rrggbb, so the alpha has to be added here
+// rather than stored as a second token per opacity.
+function tokenAlpha(name, alpha, fallback) {
+    var hex = cssVar(name, fallback || "#ffffff");
+    var m = /^#([0-9a-f]{6})$/i.exec(hex);
+    if (!m) return hex; // already rgba(), or a named colour: hand it back as-is
+    var n = parseInt(m[1], 16);
+    return "rgba(" + ((n >> 16) & 255) + "," + ((n >> 8) & 255) + "," +
+        (n & 255) + "," + alpha + ")";
+}
+
 (function () {
     "use strict";
+
+    window.tokenAlpha = tokenAlpha;
 
     // No module system in this codebase (app.js / volume.js are plain scripts),
     // so the two helpers are globals, like `renderDashboard` and friends.

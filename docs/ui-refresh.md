@@ -293,9 +293,11 @@ literal `#2a333d`/`#10161d` remains in `style.css`.
 
 **LANDED.** Notes for everyone rebasing on it:
 
-- `chart-theme.js` exposes `cssVar(name, fallback)` and
-  `linkedCrosshair(charts) → {destroy()}` as globals. Use them; do not re-read
-  custom properties by hand.
+- `chart-theme.js` exposes `cssVar(name, fallback)`,
+  `tokenAlpha(name, alpha, fallback)` (tokens are opaque `#rrggbb`, so
+  translucent fills — area fills, the elevation band, zoom drag boxes — go
+  through this) and `linkedCrosshair(charts) → {destroy()}` as globals. Use
+  them; do not re-read custom properties by hand.
 - `Chart.defaults.scales.<type>` shadows `Chart.defaults.scale` — `radialLinear`
   hard-codes tick colour `#666`, for instance. `chart-theme.js` loops every
   registered scale type, so this is handled; do not assume writing

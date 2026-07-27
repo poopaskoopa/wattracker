@@ -14,15 +14,15 @@ const SERIES_TIPS = {
     "Training FTP": "Training FTP — best 20-min power x 0.95, adjusted for inactivity (plus recorded points).",
 };
 
-const COLORS = {
-    CTL: "#4caf7d",
-    ATL: "#f2a900",
-    TSB: "#5a9bd4",
-    FTP: "#e05252",
-    "Training FTP": "#e05252",
-};
-
-let mainChart = null;
+// The fitness block is two stacked panels sharing one x axis (docs/ui-refresh
+// 1.2): load on top, Training FTP below. They are separate Chart instances, so
+// everything that used to be implicit in "one chart" - the legend, the hover,
+// the zoom, the y-axis left edge - is wired explicitly below.
+let loadChart = null;   // CTL / ATL / TSB
+let ftpChart = null;    // Training FTP (estimate + recorded)
+let panelCrosshair = null;
+let curveChart = null;
+let dashboardFtp = null; // the rider's Training FTP, for the curve reference line
 let currentMonths = 1; // default view: last 1 month (0 = all)
 
 function alignedFrom(labels, points, valueKey) {
@@ -77,20 +77,35 @@ function unionDates(...arrays) {
     return Array.from(set).sort();
 }
 
-// Legend groups map a label to one or more dataset indices.
+// Legend groups. One entry per selectable series, naming the panel it lives on
+// (the fitness block is two charts now) and the token its swatch reads from.
 const LEGEND_GROUPS = [
-    { label: "CTL", datasets: [0] },
-    { label: "ATL", datasets: [1] },
-    { label: "TSB", datasets: [2] },
-    { label: "Training FTP", datasets: [3, 4] }, // estimated line + recorded points
+    { label: "CTL", panel: "load", datasets: [0], token: "--s-1" },
+    { label: "ATL", panel: "load", datasets: [1], token: "--s-2" },
+    { label: "TSB", panel: "load", datasets: [2], token: "--s-3" },
+    // estimated line + recorded points, one unit
+    { label: "Training FTP", panel: "ftp", datasets: [0, 1], token: "--s-4" },
 ];
 
-// Most recent value across a legend group's datasets (a later dataset in the
-// group wins a tie on the same date, e.g. recorded FTP over the estimate).
-function latestGroupValue(group) {
-    if (!mainChart) return null;
-    const datasets = group.datasets.map((i) => mainChart.data.datasets[i]);
-    const n = (mainChart.data.labels || []).length;
+// The legend units for the fitness block, resolved against the live charts.
+function panelLegendUnits() {
+    return LEGEND_GROUPS.map((g) => ({
+        label: g.label,
+        chart: g.panel === "load" ? loadChart : ftpChart,
+        datasets: g.datasets,
+        token: g.token,
+        tip: SERIES_TIPS[g.label] || g.label,
+        showValue: true,
+    }));
+}
+
+// Most recent value across a legend unit's datasets (a later dataset in the
+// unit wins a tie on the same date, e.g. recorded FTP over the estimate).
+function latestGroupValue(unit) {
+    const chart = unit.chart;
+    if (!chart) return null;
+    const datasets = unit.datasets.map((i) => chart.data.datasets[i]);
+    const n = (chart.data.labels || []).length;
     for (let i = n - 1; i >= 0; i--) {
         for (let d = datasets.length - 1; d >= 0; d--) {
             const v = ((datasets[d] || {}).data || [])[i];
@@ -100,54 +115,210 @@ function latestGroupValue(group) {
     return null;
 }
 
-// Shared legend behaviour for any chart. `units` is the set of selectable
-// legend entries, each a list of dataset indices (one index for a simple
-// series, several for a group like FTP). `target` must be the same array
-// reference as one of `units`.
+// Shared legend behaviour. A unit is `{ chart, datasets }` - a chart plus the
+// dataset indices in it that the entry controls (one for a simple series,
+// several for a group like FTP). Units may span several charts, which is what
+// the stacked fitness panels need; `target` must be one of `units`.
 //   - additive (Ctrl/Cmd-click): toggle just this unit on/off, leave others.
 //   - plain click: isolate this unit; clicking the already-isolated unit
 //     (the only visible one) restores ALL units.
 // Only the datasets listed in `units` are touched, so a background dataset
 // (e.g. the ride chart's elevation band) omitted from `units` is never
 // hidden or exposed by isolation.
-function applyLegendSelection(chart, units, target, additive) {
-    const visibleOf = (u) => u.some((i) => chart.isDatasetVisible(i));
+function applyLegendUnits(units, target, additive) {
+    const live = units.filter((u) => u.chart);
+    const visibleOf = (u) => u.datasets.some((i) => u.chart.isDatasetVisible(i));
     if (additive) {
         const nowVisible = visibleOf(target);
-        target.forEach((i) => chart.setDatasetVisibility(i, !nowVisible));
+        target.datasets.forEach((i) => target.chart.setDatasetVisibility(i, !nowVisible));
     } else {
-        const isIsolated = units.every((u) => (u === target ? visibleOf(u) : !visibleOf(u)));
-        units.forEach((u) => {
+        const isIsolated = live.every((u) => (u === target ? visibleOf(u) : !visibleOf(u)));
+        live.forEach((u) => {
             const on = isIsolated ? true : u === target;
-            u.forEach((i) => chart.setDatasetVisibility(i, on));
+            u.datasets.forEach((i) => u.chart.setDatasetVisibility(i, on));
         });
     }
-    chart.update();
+    const charts = [];
+    live.forEach((u) => { if (charts.indexOf(u.chart) === -1) charts.push(u.chart); });
+    charts.forEach((c) => c.update());
 }
 
-function buildLegend() {
-    const container = document.getElementById("mainLegend");
-    if (!container || !mainChart) return;
+// Single-chart form, kept for callers that pass bare index lists against one
+// chart (the activity-detail legend below).
+function applyLegendSelection(chart, units, target, additive) {
+    const wrapped = units.map((u) => ({ chart: chart, datasets: u }));
+    applyLegendUnits(wrapped, wrapped[units.indexOf(target)], additive);
+}
+
+// Render an HTML `.chart-legend` for a set of units. Rebuilt after every click
+// so the on/off styling and the latest-value readout stay in step.
+function renderLegend(containerId, unitsFactory) {
+    const container = document.getElementById(containerId);
+    if (!container) return;
     container.innerHTML = "";
-    const units = LEGEND_GROUPS.map((g) => g.datasets);
-    LEGEND_GROUPS.forEach((group) => {
-        const visible = group.datasets.some((i) => mainChart.isDatasetVisible(i));
+    const units = unitsFactory().filter((u) => u.chart);
+    units.forEach((unit) => {
+        const visible = unit.datasets.some((i) => unit.chart.isDatasetVisible(i));
         const item = document.createElement("span");
         item.className = "legend-item" + (visible ? "" : " off");
-        item.title = SERIES_TIPS[group.label] || group.label;
-        const latest = latestGroupValue(group);
+        item.title = unit.tip || unit.label;
+        const latest = unit.showValue ? latestGroupValue(unit) : null;
         const valueHtml = latest == null
             ? ""
-            : ' <span class="legend-value">' + (Math.round(latest * 10) / 10) + "</span>";
+            : ' <span class="legend-value num">' + (Math.round(latest * 10) / 10) + "</span>";
         item.innerHTML =
             '<span class="legend-swatch" style="background:' +
-            (COLORS[group.label] || "#999") + '"></span>' + group.label + valueHtml;
+            cssVar(unit.token, "#999") + '"></span>' + unit.label + valueHtml;
         item.addEventListener("click", (e) => {
-            applyLegendSelection(mainChart, units, group.datasets, e.ctrlKey || e.metaKey);
-            buildLegend();
+            applyLegendUnits(units, unit, e.ctrlKey || e.metaKey);
+            renderLegend(containerId, unitsFactory);
         });
         container.appendChild(item);
     });
+}
+
+function buildLegend() {
+    renderLegend("mainLegend", panelLegendUnits);
+}
+
+// Chart.js sizes each y axis to its own tick text, so two stacked panels with
+// different value ranges start their plot areas at different x and read as two
+// unrelated charts. Both panels' y scales are pinned to the widest one via this
+// shared measurement: each scale reports its natural width, the widest wins,
+// and any panel that grows past the current pin schedules a re-layout of the
+// other. Measured, never guessed, so a wide tick label can't be clipped.
+const axisPin = { width: 0, pending: false };
+
+function schedulePinSync() {
+    if (axisPin.pending) return;
+    axisPin.pending = true;
+    requestAnimationFrame(() => {
+        axisPin.pending = false;
+        [loadChart, ftpChart].forEach((c) => { if (c && c.ctx) c.update("none"); });
+    });
+}
+
+function pinPanelAxis(scale) {
+    if (scale.width > axisPin.width) {
+        axisPin.width = scale.width;
+        schedulePinSync();
+    }
+    scale.width = axisPin.width;
+}
+
+// The same problem at the other end of the plot: only the bottom panel draws x
+// tick labels, so only it reserves room for the last one to overhang the axis.
+// That inset is ~5px, and left unmatched every gridline walks out of column
+// between the panels. It is layout output rather than a scale property, so it
+// is measured after a render (with the reservation zeroed, so it can shrink)
+// and then given to both panels as explicit right padding.
+let alignPending = false;
+
+function alignPanelAreas() {
+    const panels = [loadChart, ftpChart].filter((c) => c && c.ctx);
+    if (panels.length !== 2) return;
+    // Leaf assignment only: Chart.js v4's options are a resolver proxy and
+    // replacing a nested object on it recurses.
+    panels.forEach((c) => { c.options.layout.padding.right = 0; c.update("none"); });
+    let gap = 0;
+    panels.forEach((c) => { gap = Math.max(gap, c.width - c.chartArea.right); });
+    gap = Math.ceil(gap);
+    panels.forEach((c) => { c.options.layout.padding.right = gap; c.update("none"); });
+}
+
+function scheduleAlign() {
+    if (alignPending) return;
+    alignPending = true;
+    requestAnimationFrame(() => { alignPending = false; alignPanelAreas(); });
+}
+
+// TSB is signed and "above or below zero" is the whole read, so the load panel
+// gets a hairline at zero, drawn under the data. --axis rather than
+// --surface-border: the border token resolves to almost exactly the composited
+// grid colour on --panel, so the line would be invisible against the gridline
+// already sitting at zero. --axis is the "this is a reference, not a gridline"
+// step and is still one weight below any series.
+const ZERO_LINE_PLUGIN = {
+    id: "zeroLine",
+    beforeDatasetsDraw(chart) {
+        const scale = chart.scales.y;
+        const area = chart.chartArea;
+        if (!scale || !area || scale.min > 0 || scale.max < 0) return;
+        const y = scale.getPixelForValue(0);
+        const ctx = chart.ctx;
+        ctx.save();
+        ctx.beginPath();
+        ctx.lineWidth = 1;
+        ctx.strokeStyle = cssVar("--axis", "rgba(255,255,255,.20)");
+        ctx.moveTo(area.left, y);
+        ctx.lineTo(area.right, y);
+        ctx.stroke();
+        ctx.restore();
+    },
+};
+
+// Drag-zoom on either panel drives the other: the two panels are one plot with
+// one x axis, so a range chosen on one is meaningless if the other keeps its
+// own. The guard stops the pair ping-ponging updates at each other.
+let syncingPanelZoom = false;
+
+function syncPanelX(source) {
+    if (syncingPanelZoom) return;
+    const other = source === loadChart ? ftpChart : loadChart;
+    if (!other || !other.ctx || !source.scales.x || !other.zoomScale) return;
+    syncingPanelZoom = true;
+    // Through the plugin's own API, not by writing scale options: the plugin
+    // caches each chart's pre-zoom limits the first time it moves that chart,
+    // so a hand-written option would make "the range it was already dragged to"
+    // look like the original and break Reset zoom.
+    other.zoomScale("x", { min: source.scales.x.min, max: source.scales.x.max }, "none");
+    syncingPanelZoom = false;
+    // A new date range means new tick labels, so the overhang is re-measured.
+    scheduleAlign();
+}
+
+function resetPanelZoom() {
+    syncingPanelZoom = true;
+    [loadChart, ftpChart].forEach((c) => {
+        if (c && c.ctx && c.resetZoom) c.resetZoom("none");
+    });
+    syncingPanelZoom = false;
+    scheduleAlign();
+}
+
+function destroyPanels() {
+    if (panelCrosshair) { panelCrosshair.destroy(); panelCrosshair = null; }
+    if (loadChart) { loadChart.destroy(); loadChart = null; }
+    if (ftpChart) { ftpChart.destroy(); ftpChart = null; }
+    axisPin.width = 0;
+}
+
+// x axis shared by both panels. Identical tick generation on each keeps their
+// gridlines in the same columns; only the bottom panel draws the labels, so
+// the pair reads as one plot with one date axis.
+function panelXScale(labels, showLabels) {
+    return {
+        ticks: {
+            display: showLabels,
+            maxTicksLimit: 12,
+            maxRotation: 0,
+            autoSkip: true,
+            callback: monthYearTicks(labels),
+        },
+    };
+}
+
+function panelZoomPlugins() {
+    return {
+        legend: { display: false }, // custom HTML legend instead
+        zoom: {
+            zoom: {
+                drag: { enabled: true, backgroundColor: tokenAlpha("--accent", 0.15, "#f2a900") },
+                mode: "x",
+                onZoomComplete: (ctx) => syncPanelX(ctx.chart),
+            },
+        },
+    };
 }
 
 function buildMainChart(load, ftpSeries) {
@@ -155,76 +326,94 @@ function buildMainChart(load, ftpSeries) {
     const recorded = (ftpSeries && ftpSeries.recorded) || [];
     const labels = unionDates(load, est, recorded);
 
-    const canvas = document.getElementById("mainChart");
+    const loadCanvas = document.getElementById("mainChart");
+    const ftpCanvas = document.getElementById("ftpChart");
+    const panels = document.getElementById("mainPanels");
     const empty = document.getElementById("mainEmpty");
-    if (!canvas) return;
+    if (!loadCanvas || !ftpCanvas) return;
 
-    if (mainChart) { mainChart.destroy(); mainChart = null; }
+    destroyPanels();
 
     if (!labels.length) {
-        canvas.style.display = "none";
+        if (panels) panels.style.display = "none";
         if (empty) empty.style.display = "block";
         const legend = document.getElementById("mainLegend");
         if (legend) legend.innerHTML = "";
         return;
     }
-    canvas.style.display = "block";
+    if (panels) panels.style.display = "block";
     if (empty) empty.style.display = "none";
 
-    const datasets = [
-        { label: "CTL", data: alignedFrom(labels, load, "ctl"), borderColor: COLORS.CTL,
-          yAxisID: "y", tension: 0.2, pointRadius: 0, spanGaps: true },
-        { label: "ATL", data: alignedFrom(labels, load, "atl"), borderColor: COLORS.ATL,
-          yAxisID: "y", tension: 0.2, pointRadius: 0, spanGaps: true },
-        { label: "TSB", data: alignedFrom(labels, load, "tsb"), borderColor: COLORS.TSB,
-          yAxisID: "y", tension: 0.2, pointRadius: 0, spanGaps: true },
-        { label: "Training FTP (est)", data: interpolatedFrom(labels, est, "ftp"), borderColor: COLORS.FTP,
-          yAxisID: "yFtp", tension: 0.1, pointRadius: 0, spanGaps: true, borderDash: [4, 3] },
-        { label: "Training FTP (recorded)", data: alignedFrom(labels, recorded, "ftp_watts"),
-          yAxisID: "yFtp", borderColor: COLORS.FTP, backgroundColor: COLORS.FTP,
-          showLine: false, pointRadius: 4, spanGaps: true },
-    ];
-
-    mainChart = new Chart(canvas, {
+    loadChart = new Chart(loadCanvas, {
         type: "line",
-        data: { labels, datasets },
+        data: {
+            labels,
+            datasets: [
+                { label: "CTL", data: alignedFrom(labels, load, "ctl"),
+                  borderColor: cssVar("--s-1"), spanGaps: true },
+                { label: "ATL", data: alignedFrom(labels, load, "atl"),
+                  borderColor: cssVar("--s-2"), spanGaps: true },
+                { label: "TSB", data: alignedFrom(labels, load, "tsb"),
+                  borderColor: cssVar("--s-3"), spanGaps: true },
+            ],
+        },
         options: {
             responsive: true,
+            onResize: scheduleAlign,
+            // Declared here so alignPanelAreas only ever writes the leaf.
+            layout: { padding: { right: 0 } },
             interaction: { mode: "index", intersect: false },
-            plugins: {
-                legend: { display: false }, // custom HTML legend instead
-                zoom: {
-                    zoom: {
-                        drag: { enabled: true, backgroundColor: "rgba(242,169,0,0.15)" },
-                        mode: "x",
-                    },
+            plugins: panelZoomPlugins(),
+            scales: {
+                x: panelXScale(labels, false),
+                y: {
+                    position: "left",
+                    title: { display: true, text: "Load" },
+                    afterFit: pinPanelAxis,
                 },
             },
+        },
+        plugins: [ZERO_LINE_PLUGIN],
+    });
+
+    const ftpColor = cssVar("--s-4");
+    ftpChart = new Chart(ftpCanvas, {
+        type: "line",
+        data: {
+            labels,
+            datasets: [
+                { label: "Training FTP (est)", data: interpolatedFrom(labels, est, "ftp"),
+                  borderColor: ftpColor, spanGaps: true, borderDash: [4, 3] },
+                { label: "Training FTP (recorded)",
+                  data: alignedFrom(labels, recorded, "ftp_watts"),
+                  borderColor: ftpColor, backgroundColor: ftpColor,
+                  showLine: false, pointRadius: 4, pointHitRadius: 8, spanGaps: true },
+            ],
+        },
+        options: {
+            responsive: true,
+            onResize: scheduleAlign,
+            // Declared here so alignPanelAreas only ever writes the leaf.
+            layout: { padding: { right: 0 } },
+            interaction: { mode: "index", intersect: false },
+            plugins: panelZoomPlugins(),
             scales: {
-                x: {
-                    ticks: {
-                        color: "#c2cad4",
-                        maxTicksLimit: 12,
-                        maxRotation: 0,
-                        autoSkip: true,
-                        callback: monthYearTicks(labels),
-                    },
-                    grid: {
-                        color: "rgba(138,148,160,0.10)",   // faint plot gridlines
-                        tickColor: "rgba(194,202,212,0.8)", // clearly visible tick marks
-                        tickLength: 8,
-                    },
-                    border: { color: "rgba(138,148,160,0.6)" },
-                },
-                y: { position: "left", title: { display: true, text: "Load (CTL/ATL/TSB)" } },
-                yFtp: {
-                    position: "right", title: { display: true, text: "Training FTP (W)" },
-                    grid: { drawOnChartArea: false },
+                x: panelXScale(labels, true),
+                y: {
+                    position: "left",
+                    title: { display: true, text: "FTP (W)" },
+                    ticks: { maxTicksLimit: 4 },
+                    afterFit: pinPanelAxis,
                 },
             },
         },
     });
+
+    // One hover reads both panels at the same date - the only thing the old
+    // dual axis was buying.
+    panelCrosshair = linkedCrosshair([loadChart, ftpChart]);
     buildLegend();
+    scheduleAlign();
 }
 
 async function loadMainChart(months) {
@@ -258,11 +447,7 @@ function wireControls() {
         });
     }
     const reset = document.getElementById("resetZoom");
-    if (reset) {
-        reset.addEventListener("click", () => {
-            if (mainChart && mainChart.resetZoom) mainChart.resetZoom();
-        });
-    }
+    if (reset) reset.addEventListener("click", resetPanelZoom);
 }
 
 function fmtDuration(sec) {
@@ -290,42 +475,90 @@ function wrapText(text, maxLen) {
     return lines;
 }
 
+const CURVE_SERIES_DESC = {
+    "Measured MMP": "Your best average power actually recorded for each duration, across all rides in the last 90 days.",
+    "CP/W' model": "The fitted curve estimating your sustainable power at any duration (Critical Power plus your anaerobic W' reserve divided by time).",
+};
+
+// The rider's Training FTP as a dashed reference on the watts axis: it is the
+// number every target in the app is derived from, so "where does my curve sit
+// relative to it" is the read this chart is usually opened for.
+const FTP_REFERENCE_PLUGIN = {
+    id: "ftpReference",
+    afterDatasetsDraw(chart) {
+        const ftp = Number(dashboardFtp);
+        const scale = chart.scales.y;
+        const area = chart.chartArea;
+        if (!ftp || !scale || !area || ftp < scale.min || ftp > scale.max) return;
+        const y = scale.getPixelForValue(ftp);
+        const ink = cssVar("--muted", "#8a94a0");
+        const ctx = chart.ctx;
+        ctx.save();
+        ctx.beginPath();
+        ctx.lineWidth = 1;
+        ctx.strokeStyle = ink;
+        ctx.setLineDash([6, 4]);
+        ctx.moveTo(area.left, y);
+        ctx.lineTo(area.right, y);
+        ctx.stroke();
+        ctx.setLineDash([]);
+        ctx.fillStyle = ink;
+        ctx.font = Chart.defaults.font.size + "px " + Chart.defaults.font.family;
+        ctx.textAlign = "right";
+        ctx.textBaseline = "bottom";
+        ctx.fillText("FTP", area.right - 4, y - 3);
+        ctx.restore();
+    },
+};
+
 async function renderCurveChart() {
     const el = document.getElementById("curveChart");
     if (!el) return;
+    const empty = document.getElementById("curveEmpty");
     const data = await fetchJSON("/api/curve");
-    if (!data) return;
-    const measured = (data.measured || []).map((p) => ({ x: p.t, y: p.power }));
-    const model = (data.model || []).map((p) => ({ x: p.t, y: p.power }));
-    if (!measured.length && !model.length) return;
+    const measured = ((data && data.measured) || []).map((p) => ({ x: p.t, y: p.power }));
+    const model = ((data && data.model) || []).map((p) => ({ x: p.t, y: p.power }));
+
+    if (curveChart) { curveChart.destroy(); curveChart = null; }
+    const legend = document.getElementById("curveLegend");
+    if (legend) legend.innerHTML = "";
+
+    if (!measured.length && !model.length) {
+        el.style.display = "none";
+        if (empty) empty.style.display = "block";
+        return;
+    }
+    el.style.display = "block";
+    if (empty) empty.style.display = "none";
+
     // Axis ticks are exactly the sampled durations, so every tick has its
-    // measured (yellow) dot and vice versa.
+    // measured dot and vice versa - but ~12 of them collide on a narrow
+    // viewport, so they are thinned from the long end (the last duration is
+    // always kept; it anchors the axis).
     const tickDurations = (measured.length ? measured : model).map((p) => p.x);
-    const SERIES_DESC = {
-        "Measured MMP": "Your best average power actually recorded for each duration, across all rides in the last 90 days.",
-        "CP/W' model": "The fitted curve estimating your sustainable power at any duration (Critical Power plus your anaerobic W' reserve divided by time).",
-    };
-    new Chart(el, {
+
+    curveChart = new Chart(el, {
         type: "scatter",
         data: {
             datasets: [
-                { label: "Measured MMP", data: measured, borderColor: "#f2a900",
-                  backgroundColor: "#f2a900", showLine: true, pointRadius: 0,
-                  pointHitRadius: 8, tension: 0.1 },
-                { label: "CP/W' model", data: model, borderColor: "#4caf7d",
-                  showLine: true, pointRadius: 0, tension: 0.1 },
+                { label: "Measured MMP", data: measured, borderColor: cssVar("--s-2"),
+                  backgroundColor: cssVar("--s-2"), showLine: true, pointRadius: 0,
+                  pointHitRadius: 8 },
+                { label: "CP/W' model", data: model, borderColor: cssVar("--s-1"),
+                  showLine: true, pointRadius: 0, pointHitRadius: 8 },
             ],
         },
         options: {
             responsive: true,
             plugins: {
+                legend: { display: false }, // custom HTML legend instead
                 tooltip: {
                     callbacks: {
                         title: (items) => (items.length ? fmtDuration(items[0].parsed.x) : ""),
                         label: (item) => item.dataset.label + ": " + item.parsed.y + " W",
                         footer: (items) =>
                             items.length
-                                ? wrapText(SERIES_DESC[items[0].dataset.label] || "", 44)
+                                ? wrapText(CURVE_SERIES_DESC[items[0].dataset.label] || "", 44)
                                 : "",
                     },
                 },
@@ -335,7 +568,12 @@ async function renderCurveChart() {
                     type: "logarithmic",
                     title: { display: true, text: "Duration" },
                     afterBuildTicks: (axis) => {
-                        axis.ticks = tickDurations.map((t) => ({ value: t }));
+                        const width = (axis.chart && axis.chart.width) || 300;
+                        const room = Math.max(4, Math.floor(width / 90));
+                        const step = Math.max(1, Math.ceil(tickDurations.length / room));
+                        const keep = [];
+                        for (let i = tickDurations.length - 1; i >= 0; i -= step) keep.push(i);
+                        axis.ticks = keep.reverse().map((i) => ({ value: tickDurations[i] }));
                     },
                     ticks: {
                         autoSkip: false,
@@ -346,10 +584,19 @@ async function renderCurveChart() {
                 y: { title: { display: true, text: "Power (W)" } },
             },
         },
+        plugins: [FTP_REFERENCE_PLUGIN],
     });
+
+    renderLegend("curveLegend", () => [
+        { label: "Measured MMP", chart: curveChart, datasets: [0], token: "--s-2",
+          tip: CURVE_SERIES_DESC["Measured MMP"] },
+        { label: "CP/W' model", chart: curveChart, datasets: [1], token: "--s-1",
+          tip: CURVE_SERIES_DESC["CP/W' model"] },
+    ]);
 }
 
-function renderDashboard() {
+function renderDashboard(ftp) {
+    dashboardFtp = Number(ftp) || null;
     wireControls();
     loadMainChart(1);
     renderCurveChart();
