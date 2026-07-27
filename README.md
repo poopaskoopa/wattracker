@@ -134,6 +134,13 @@ Runtime variables include `WATTRACKER_DATA_DIR`, `WATTRACKER_DB`,
 `localhost`, or `::1`; port must be 1–65535. Browser values accept
 `1/true/yes/on` and `0/false/no/off`. IPv6 URLs are bracketed correctly.
 
+`WATTRACKER_PUBLIC_HOST` (unset by default) names the one external hostname a
+local reverse proxy — `tailscale serve` on the owner's tailnet — forwards under:
+it is added to the Host allowlist as that exact name (no wildcards, no suffix
+matching) and is the host calendar subscription links are minted from, with
+`WATTRACKER_PUBLIC_SCHEME` (`https` by default) as their scheme. The bind stays
+loopback-only either way; this must never be pointed at an internet-facing name.
+
 ## Backup, packages, and Windows validation
 
 Create backups in Settings. Stop the server before running `wattracker-restore`

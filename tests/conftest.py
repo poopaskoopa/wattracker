@@ -28,6 +28,11 @@ def isolated_env(tmp_path, monkeypatch):
         "WATTRACKER_ZWIFT_ID",
         "WATTRACKER_ACTIVITIES_DIR",
         "WATTRACKER_WORKOUTS_DIR",
+        # The default posture is loopback-only; a developer's real tailnet
+        # settings must never leak in and quietly widen the Host allowlist
+        # under test.
+        "WATTRACKER_PUBLIC_HOST",
+        "WATTRACKER_PUBLIC_SCHEME",
         "ANTHROPIC_API_KEY",
     ):
         monkeypatch.delenv(key, raising=False)
