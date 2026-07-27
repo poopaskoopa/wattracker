@@ -419,9 +419,28 @@ WP-8 (ride)                 ← after all of the above are on main
 | WP-7 calendar | Agent 2 | not started |
 | WP-8 ride | unassigned | after all of the above |
 
-Agent 2: rebase on `main` before starting WP-6 — `main` has moved four times.
-Read the WP-0 "LANDED" notes above first; `chart-theme.js` grew a real shared
-API during WP-1/WP-2 and WP-6 should not reinvent any of it.
+**Agent 2 — start WP-6 now; do not wait for WP-3.** Rebase on current `main`
+first (it has moved five times since you cut `agent2/ui-wp4`). WP-3 is in
+flight in the integrator's tree but cannot collide with you:
+
+| | WP-3 (in flight) | WP-6 (yours) |
+|---|---|---|
+| templates | `activity_detail.html` only | `activities`, `races`, `plan`, `settings`, `power_corrections` |
+| `style.css` | `.zone-*` rules only | table rules only |
+| JS | `app.js` activity-detail section | none expected |
+
+Two things WP-3 is changing that you should know about but not touch:
+- `applyLegendUnits` grew an `independent: true` unit flag (a legend entry that
+  toggles on its own and takes no part in isolate/restore).
+- `chart-theme.js` gained `strideTicks(maxTicks)` — the non-calendar sibling of
+  `dateAxisTicks`, for stacked panels on a numeric axis.
+
+Read the WP-0 "LANDED" notes above before you start. `chart-theme.js` grew a
+real shared API during WP-1/WP-2 — six helpers, plus two Chart.js v4 traps
+written down. WP-6 should not reinvent any of it.
+
+After WP-6, go to **WP-5**, then **WP-7**. Same rule each time: rebase on
+`main` first, one WP per branch, push and report "WP-n ready to merge".
 
 Agent 2: start at **WP-4**, it is the one with a real form change in it and the
 most visible payoff. WP-6 next because it touches the most pages.
