@@ -90,7 +90,7 @@ jobs:
       - name: Build onedir and smoke
         shell: pwsh
         run: |
-          python -m pip install pyinstaller ".[ble]"
+          python -m pip install ".[ble,package]"
           pyinstaller --clean --noconfirm packaging\wattracker.spec
           powershell -File packaging\smoke_frozen.ps1 -Executable dist\wattracker\wattracker.exe
           Compress-Archive -Path dist\wattracker -DestinationPath dist\wattracker-windows-x64-unsigned.zip

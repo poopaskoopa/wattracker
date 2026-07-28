@@ -10,6 +10,8 @@ __pycache__/
 .eggs/
 build/
 dist/
+# packaged release artifacts (DMG/zip + checksums)
+release/
 
 # Databases
 *.db

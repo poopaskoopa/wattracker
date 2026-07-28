@@ -1,0 +1,165 @@
+name: macOS signed release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: read
+
+jobs:
+  build-test-sign:
+    # Hard-disabled for the same reason as every other job in this repository:
+    # Actions runs are blocked at the account level (failed payment / spending
+    # limit) and macOS runners are billable on a private repo at a 10x
+    # multiplier, so this would only ever report a red "job was not started".
+    # The gate until billing is fixed is a local run of
+    # `packaging/build-macos.sh`. Drop this `if` to restore the job.
+    if: ${{ false }}
+    runs-on: macos-latest
+    environment: macos-code-signing
+    timeout-minutes: 45
+    env:
+      WATTRACKER_AUTO_SCAN: "0"
+      WATTRACKER_OPEN_BROWSER: "0"
+
+    steps:
+      - name: Check out selected source
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install pinned build tools and project
+        run: |
+          python -m pip install --disable-pip-version-check --upgrade "pip==25.1.1"
+          python -m pip install --disable-pip-version-check "build==1.2.2.post1" ".[dev,ble,package]"
+
+      - name: Run full test suite
+        run: python -m pytest -q
+
+      - name: Build and smoke-test installed wheel
+        run: |
+          python -m build --wheel --outdir wheelhouse
+          wheel="$(ls wheelhouse/*.whl | head -1)"
+          test -n "$wheel" || { echo "Wheel build produced no artifact" >&2; exit 1; }
+          python -m venv wheel-smoke
+          ./wheel-smoke/bin/python -m pip install --disable-pip-version-check "$wheel"
+          ./wheel-smoke/bin/python packaging/smoke_installed.py
+
+      - name: Build frozen application bundle
+        run: |
+          test -f packaging/wattracker.spec || \
+            { echo "packaging/wattracker.spec is required for a signed release" >&2; exit 1; }
+          python -m PyInstaller --clean --noconfirm packaging/wattracker.spec
+          test -d dist/wattracker.app || \
+            { echo "Frozen application bundle was not produced" >&2; exit 1; }
+
+      # The Developer ID private key is imported here rather than inside
+      # sign-macos.sh because locally the identity already lives in the
+      # developer's login keychain and the script must not touch it. On the
+      # ephemeral runner a dedicated keychain is created, used, and deleted.
+      #
+      # KNOWN RESIDUAL: `security import` takes the p12 passphrase only via -P
+      # (its sole alternative is an interactive GUI prompt, which a headless
+      # runner cannot answer), so that one argv is unavoidable - unlike the
+      # notarization step below, which was moved off argv entirely. Exposure is
+      # one short-lived `security` invocation on a single-tenant ephemeral VM
+      # with no other user's processes on it. Closing it properly means Azure-
+      # style hosted signing or a hardware token, not a shell workaround; see
+      # docs/macos-packaging.md.
+      - name: Import Developer ID certificate into a temporary keychain
+        env:
+          WATTRACKER_MACOS_SIGNING_P12_B64: ${{ secrets.WATTRACKER_MACOS_SIGNING_P12_B64 }}
+          WATTRACKER_MACOS_SIGNING_P12_PASSWORD: ${{ secrets.WATTRACKER_MACOS_SIGNING_P12_PASSWORD }}
+        run: |
+          set -euo pipefail
+          if [ -z "${WATTRACKER_MACOS_SIGNING_P12_B64:-}" ] || \
+             [ -z "${WATTRACKER_MACOS_SIGNING_P12_PASSWORD:-}" ]; then
+            echo "Signing material is required; no unsigned artifact will be produced" >&2
+            exit 1
+          fi
+          keychain="$RUNNER_TEMP/wattracker-signing.keychain-db"
+          keychain_password="$(openssl rand -hex 32)"
+          p12="$RUNNER_TEMP/wattracker-signing.p12"
+          printf '%s' "$WATTRACKER_MACOS_SIGNING_P12_B64" | base64 --decode > "$p12"
+          security create-keychain -p "$keychain_password" "$keychain"
+          security set-keychain-settings -lut 3600 "$keychain"
+          security unlock-keychain -p "$keychain_password" "$keychain"
+          security import "$p12" -k "$keychain" \
+            -P "$WATTRACKER_MACOS_SIGNING_P12_PASSWORD" \
+            -T /usr/bin/codesign -x
+          # Without this, codesign blocks on a GUI prompt the runner cannot answer.
+          security set-key-partition-list -S apple-tool:,apple: \
+            -k "$keychain_password" "$keychain" > /dev/null
+          security list-keychains -d user -s "$keychain" login.keychain-db
+          rm -f "$p12"
+          echo "WATTRACKER_SIGNING_KEYCHAIN=$keychain" >> "$GITHUB_ENV"
+
+      # An App Store Connect API key, not an app-specific password: notarytool
+      # would take the password only on its argv, and argv is readable by every
+      # process on the runner for the whole `--wait`. The .p8 is written 0600
+      # and removed in the same step.
+      - name: Sign, notarize and staple the bundle
+        env:
+          WATTRACKER_MACOS_SIGNING_IDENTITY: ${{ vars.WATTRACKER_MACOS_SIGNING_IDENTITY }}
+          WATTRACKER_MACOS_NOTARY_KEY_B64: ${{ secrets.WATTRACKER_MACOS_NOTARY_KEY_B64 }}
+          WATTRACKER_MACOS_NOTARY_KEY_ID: ${{ secrets.WATTRACKER_MACOS_NOTARY_KEY_ID }}
+          WATTRACKER_MACOS_NOTARY_ISSUER: ${{ secrets.WATTRACKER_MACOS_NOTARY_ISSUER }}
+        run: |
+          set -euo pipefail
+          if [ -z "${WATTRACKER_MACOS_SIGNING_IDENTITY:-}" ]; then
+            echo "Protected signing identity is required" >&2
+            exit 1
+          fi
+          if [ -z "${WATTRACKER_MACOS_NOTARY_KEY_B64:-}" ]; then
+            echo "Notary API key is required; an un-notarized release is not shippable" >&2
+            exit 1
+          fi
+          key="$RUNNER_TEMP/notary.p8"
+          (umask 077; printf '%s' "$WATTRACKER_MACOS_NOTARY_KEY_B64" | base64 --decode > "$key")
+          export WATTRACKER_MACOS_NOTARY_KEY_PATH="$key"
+          trap 'rm -f "$key"' EXIT
+          packaging/sign-macos.sh dist/wattracker.app
+
+      # After signing, so the artifact exercised here is byte-identical to the
+      # one that ships.
+      - name: Smoke-test frozen application
+        run: python3 packaging/smoke_frozen_macos.py dist/wattracker.app
+
+      - name: Package verified signed artifact and checksum
+        run: |
+          set -euo pipefail
+          name="wattracker-macos-$(uname -m)-signed"
+          mkdir -p release staging
+          ditto dist/wattracker.app "staging/wattracker.app"
+          ln -s /Applications staging/Applications
+          hdiutil create -volname wattracker -srcfolder staging -ov -format UDZO \
+            -quiet "release/$name.dmg"
+          packaging/sign-macos.sh "release/$name.dmg"
+          shasum -a 256 "release/$name.dmg" | \
+            awk -v n="$name.dmg" '{print $1 "  " n}' > "release/$name.dmg.sha256"
+
+      - name: Upload signed artifact only
+        uses: actions/upload-artifact@v4
+        with:
+          name: wattracker-macos-signed
+          path: |
+            release/*.dmg
+            release/*.dmg.sha256
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Remove the signing keychain
+        if: always()
+        run: |
+          security list-keychains -d user -s login.keychain-db || true
+          if [ -n "${WATTRACKER_SIGNING_KEYCHAIN:-}" ]; then
+            security delete-keychain "$WATTRACKER_SIGNING_KEYCHAIN" || true
+          fi
