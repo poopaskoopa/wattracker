@@ -1,0 +1,22 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+Entitlements for the hardened-runtime (Developer ID) signing path only. The
+ad-hoc path does not enable the hardened runtime and does not use this file.
+
+A frozen CPython loads its extension modules as dylibs at runtime and PyInstaller
+unpacks nothing at launch in onedir mode, so this stays deliberately small: only
+the two exceptions a CPython-based hardened-runtime app is known to need.
+Everything else is left at the hardened-runtime default. Untested here - this
+repository has no Developer ID certificate; see docs/macos-packaging.md.
+-->
+<plist version="1.0">
+<dict>
+    <!-- CPython's ctypes/libffi allocates writable-executable trampolines. -->
+    <key>com.apple.security.cs.allow-unsigned-executable-memory</key>
+    <true/>
+    <!-- keyring's macOS backend and bleak reach system frameworks through
+         ctypes/pyobjc, which dlopens libraries the app did not sign. -->
+    <key>com.apple.security.cs.disable-library-validation</key>
+    <true/>
+</dict>
+</plist>

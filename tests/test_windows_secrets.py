@@ -86,7 +86,11 @@ def test_release_workflow_scopes_signing_secrets_to_sign_step():
     )[1].split("\n      - name:", 1)[0]
     assert "secrets.WATTRACKER_SIGNING_PFX_B64" in sign_step
     assert "secrets.WATTRACKER_SIGNING_PFX_PASSWORD" in sign_step
-    assert '".[dev,ble]"' in workflow
+    # The release build must install the BLE extra (so the shipped binary can
+    # talk to hardware) and the [package] extra, which is where the PyInstaller
+    # pin lives - inlining a version here would let Windows and macOS drift.
+    assert '".[dev,ble,package]"' in workflow
+    assert "pyinstaller==" not in workflow
 
 
 def test_signed_release_only_builds_the_triggering_release_tag():

@@ -172,5 +172,12 @@ job additionally needs billing resolved. Windows executables must be built on
 Windows. Real BLE hardware and production signing cannot be verified here; use
 [the Windows BLE checklist](docs/windows-ble-validation.md).
 
+macOS ships as a `wattracker.app` inside a DMG, built end to end by
+`packaging/build-macos.sh` (the same `packaging/wattracker.spec` serves both
+platforms). Only ad-hoc signing can be produced here, so a downloaded DMG is
+still quarantined by Gatekeeper; see
+[the macOS packaging guide](docs/macos-packaging.md) for the Developer ID and
+notarization path and the full list of gaps.
+
 Chart.js and the zoom plugin are vendored with the application, so ride,
 training-load, power-curve, and volume charts work without internet access.
