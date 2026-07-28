@@ -1,7 +1,7 @@
 [project]
 name = "wattracker"
 version = "0.1.0"
-description = "Local cross-platform cycling training analyzer: ingest .fit files, compute training-science metrics, detect plateau/overreach, prescribe progressive workouts as Zwift .zwo files."
+description = "Local cross-platform cycling training app for FIT analysis, rider profiling, adaptive workout planning, Zwift export, race/calendar tracking, and optional BLE/ERG riding."
 readme = "README.md"
 requires-python = ">=3.10"
 # Minimum versions pin past known-CVE-fixed releases (e.g. jinja2>=3.1.5,

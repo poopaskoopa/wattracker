@@ -1,9 +1,8 @@
 # wattracker
 
-A local, cross-platform cycling training analyzer. It ingests
-Zwift / TrainerRoad `.fit` files, computes training-science metrics, detects
-plateau / overreach, and prescribes progressive workouts exported as Zwift
-`.zwo` files.
+A local, cross-platform cycling training app for `.fit` analysis, rider
+profiling, adaptive workout planning, Zwift export, race/calendar tracking,
+and optional BLE/ERG riding.
 
 ## Features
 
@@ -17,13 +16,24 @@ plateau / overreach, and prescribes progressive workouts exported as Zwift
   current FTP (latest history row → config override → estimate) drives
   TSS/IF/zones/planner.
 - **Analysis**: Coggan 7-zone model, plateau and overreach detection, a
-  0-100 readiness score with alert strings.
-- **Prescribe**: a pure-function planner (`plan_workout`) that picks a workout
-  from training state + duration, optional LLM refinement of coaching text
-  (Anthropic `claude-sonnet-5`; fully functional without a key), and `.zwo`
-  export you can download or write straight into the Zwift Workouts folder.
-- **Web UI** (FastAPI + Jinja2 + vendored Chart.js): dashboard, activities,
-  generate, settings, plus JSON API endpoints backing the charts.
+  0-100 readiness score with alert strings, plus a rider power profile and
+  reversible correction of anomalous full-resolution power samples.
+- **Adaptive planning**: profile-informed multi-week plans and standalone
+  workouts, with completion reconciliation, RPE feedback, out-of-office
+  ranges, and automatic reflow around availability and races. Optional LLM
+  refinement layers coaching text over the fully functional formula planner.
+- **Calendar and races**: monthly training calendar, race priorities/results,
+  race-aware planning, and private iCalendar subscription support.
+- **Zwift workouts**: download `.zwo` files, export a plan as a bundle, or sync
+  workouts directly into the selected Zwift Workouts folder.
+- **In-app riding**: optional BLE cycling-power/heart-rate sensors and FTMS ERG
+  control, with a hardware-free simulation mode; completed rides feed back
+  into training history.
+- **Backup and restore**: create database backups in Settings and restore them
+  with the command-line restore flow.
+- **Web UI** (FastAPI + Jinja2 + vendored Chart.js): Dashboard, Activities,
+  Volume, Plan, Calendar, Races, Ride, Profile, and Settings, plus JSON API
+  endpoints backing the charts and live ride state.
 - **Multi-user with authentication**: register/login/logout with a signed-cookie
   session (`SessionMiddleware`); passwords hashed with `hashlib.scrypt` + a
   per-user salt. Every request is guarded — unauthenticated visitors are
@@ -41,7 +51,8 @@ python -m wattracker          # serves http://localhost:8000 and opens a browser
 ### Windows (native PowerShell)
 
 Windows 10/11 with Python 3.10+ is supported directly; WSL and Docker are not
-required:
+required. A packaged installer is under development; the supported setup today
+uses Python and the PowerShell lifecycle script:
 
 ```powershell
 py -m venv .venv
