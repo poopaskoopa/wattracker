@@ -130,6 +130,55 @@
     </button>
 </form>
 
+{# The state line matters more than the steps: with no public host configured
+   the button above still works, but mints a loopback URL that fails silently on
+   a phone - a calendar client answers a bad feed by showing a stale one. Say so
+   before the link is generated, not after. #}
+{% if calendar_public_host %}
+<p class="hint"><span class="ok">Links will be created as
+   <code>{{ calendar_public_scheme }}://{{ calendar_public_host }}/calendar.ics</code>
+   &mdash; reachable from your phone.</span></p>
+{% else %}
+<p class="hint"><strong>This server does not know how your phone reaches it</strong>,
+   so the link above will point at <code>127.0.0.1</code> and will not work off this
+   machine. Set it up first &mdash; steps below.</p>
+{% endif %}
+
+<details class="calendar-setup">
+    <summary>How to reach this from your phone (Tailscale)</summary>
+    <p class="hint">wattracker only ever listens on this machine, so a phone
+       cannot reach it directly. Tailscale puts your devices on a private
+       network and fronts this app with HTTPS. Nothing is exposed to the
+       internet. Full version, including troubleshooting, is in
+       <code>docs/calendar-feed.md</code>.</p>
+    <ol class="hint calendar-steps">
+        <li>Install Tailscale on this machine and your phone, and sign in to
+            both.</li>
+        <li>Find this machine&rsquo;s tailnet name &mdash; run
+            <code>tailscale status</code> and take the first line&rsquo;s full
+            name, like <code>macbook.tail1a2b3c.ts.net</code>.</li>
+        <li>Tell wattracker that name and restart it, so the link it creates
+            carries a hostname your phone can resolve:
+            <pre>export WATTRACKER_PUBLIC_HOST=macbook.tail1a2b3c.ts.net
+./stop.sh &amp;&amp; ./start.sh</pre>
+            Read at startup, so the restart is required. Put the
+            <code>export</code> in your shell profile to survive a reboot.</li>
+        <li>Front it with HTTPS: <code>tailscale serve --bg {{ request.url.port or 8000 }}</code>.
+            Undo later with <code>tailscale serve reset</code>.</li>
+        <li>Come back here <strong>on this machine</strong> and press the button
+            above. Buttons that change something return 403 from a phone
+            browser, so generate and rotate links here. Copy the link
+            immediately &mdash; it is shown once.</li>
+        <li>On iOS: Settings &rarr; Calendar &rarr; Accounts &rarr; Add Account
+            &rarr; Other &rarr; <em>Add Subscribed Calendar</em>, and paste it.
+            Send yourself the link the way you would a password.</li>
+    </ol>
+    <p class="hint">Two things this does not cover: anyone on your tailnet can
+       reach this whole app, not just the feed &mdash; Tailscale ACLs are the
+       access control. And the live-ride page will not work over the tailnet;
+       its connection has a separate origin check.</p>
+</details>
+
 <h3>Backups</h3>
 <p class="hint">Backups are full snapshots of the database and therefore cover
    <strong>all users&rsquo; data</strong>, not just yours. They are taken

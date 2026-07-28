@@ -935,3 +935,37 @@ def test_minted_url_uses_the_configured_host(monkeypatch):
         assert c.get("/calendar.ics", params={"token": token}).status_code == 200
     assert f"https://{PUBLIC_HOST}:8443/calendar.ics?token=" in body
     assert "testserver" not in body.split("/calendar.ics?token=")[0].split("value=")[-1]
+
+
+def test_settings_warns_when_no_public_host_is_configured(monkeypatch):
+    """Say the link will be useless BEFORE it is generated, not after.
+
+    A calendar client answers an unreachable feed by quietly continuing to show
+    what it already had, so a loopback URL does not fail visibly on the phone -
+    it just never updates. The page has to be the thing that catches it.
+    """
+    with TestClient(_app_with_public_host(monkeypatch)) as c:
+        _register(c)
+        body = c.get("/settings").text
+    assert "does not know how your phone reaches it" in body
+    assert "127.0.0.1" in body
+    # The setup guide is present either way.
+    assert "WATTRACKER_PUBLIC_HOST" in body
+    assert "tailscale serve" in body
+
+
+def test_settings_confirms_the_configured_public_host(monkeypatch):
+    with TestClient(_app_with_public_host(monkeypatch, PUBLIC_HOST)) as c:
+        _register(c)
+        body = c.get("/settings").text
+    assert f"https://{PUBLIC_HOST}/calendar.ics" in body
+    assert "does not know how your phone reaches it" not in body
+
+
+def test_settings_guide_reflects_a_custom_scheme(monkeypatch):
+    with TestClient(
+        _app_with_public_host(monkeypatch, PUBLIC_HOST, scheme="http")
+    ) as c:
+        _register(c)
+        body = c.get("/settings").text
+    assert f"http://{PUBLIC_HOST}/calendar.ics" in body
