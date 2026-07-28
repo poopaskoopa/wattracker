@@ -132,12 +132,11 @@ def test_activity_detail_page_renders_zone_summary_without_replacing_graph(clien
     assert "Time in zones" in text
     assert 'id="powerZoneSummary"' in text
     assert 'id="hrZoneSummary"' in text
-    # The ride graph is one stacked panel per measure sharing a time axis, so
-    # there is no single canvas to look for; the point of the assertion is that
-    # the zone summary sits alongside the graph rather than replacing it.
-    assert 'id="detailPanels"' in text
-    for canvas_id in ("detailPower", "detailHr", "detailCadence"):
-        assert f'id="{canvas_id}"' in text
+    # The zone summary sits alongside one combined, independently toggleable
+    # activity graph rather than replacing it.
+    assert text.count('id="detailChart"') == 1
+    for old_canvas_id in ("detailPower", "detailHr", "detailCadence"):
+        assert f'id="{old_canvas_id}"' not in text
     assert "renderActivityDetail" in text
 
 

@@ -46,17 +46,12 @@
     <p id="detailEmpty" class="hint" style="display:none">
         No per-second streams stored for this activity.</p>
     <div class="chart-legend" id="detailLegend"></div>
-    {# One panel per measure on a shared time axis. Heights are set in JS from
-       the measures this ride actually has, so the block keeps its footprint.
-       A panel with no data stays hidden rather than drawing an empty box. #}
-    <div class="chart-panels" id="detailPanels" hidden>
-        <canvas id="detailPower" hidden></canvas>
-        <canvas id="detailHr" hidden></canvas>
-        <canvas id="detailCadence" hidden></canvas>
-    </div>
-    <p class="hint">Power, heart rate and cadence over ride time, each on its own
-       scale; the shaded grey band behind the top panel is the elevation profile.
-       Click a legend item to isolate it; Ctrl/Cmd-click to toggle it.</p>
+    <canvas id="detailChart" width="900" height="360" hidden
+            aria-label="Power, heart rate, cadence and elevation over ride time"
+            role="img"></canvas>
+    <p class="hint">Power, heart rate and cadence share the ride timeline while
+       retaining their own scales; the shaded grey band is the optional elevation
+       profile. Click any legend item to show or hide that series.</p>
 </section>
 {% endblock %}
 
