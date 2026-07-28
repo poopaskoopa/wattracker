@@ -662,9 +662,12 @@ button.danger.link-btn { border: none; color: var(--alert); }
 .connection-badge { display: inline-block; margin-top: 0.25rem; padding: 0.1rem 0.4rem;
     border-radius: var(--r-pill); background: var(--surface-border); color: var(--muted); font-size: 0.72rem; }
 .connection-badge:empty { display: none; }
-.device-connected { background: rgba(67, 160, 71, 0.12); }
-.device-connected .connection-badge, .status-success { color: #7bd88f; }
-.device-disconnect-pending { background: rgba(88, 166, 255, 0.1); }
+/* The tokens below are opaque hex, so a translucent wash has to be mixed
+   rather than written as an rgba() literal; if color-mix() were unsupported
+   these degrade to no tint, not to something broken. */
+.device-connected { background: color-mix(in srgb, var(--ok) 12%, transparent); }
+.device-connected .connection-badge, .status-success { color: var(--ok); }
+.device-disconnect-pending { background: color-mix(in srgb, var(--s-3) 10%, transparent); }
 .device-disconnect-pending .connection-badge { color: var(--accent); }
 .device-actions { white-space: nowrap; }
 .device-disconnect { padding: 0.35rem 0.65rem; font-size: 0.78rem;
@@ -673,7 +676,7 @@ button.danger.link-btn { border: none; color: var(--alert); }
 .device-disconnect:disabled, .ride-live-controls button:disabled {
     opacity: 0.55; cursor: not-allowed; filter: none;
 }
-.status-failure { color: #ff7b72; }
+.status-failure { color: var(--alert); }
 .status-working { color: var(--accent); }
 .scan-feedback { min-height: 1.5rem; margin: -0.35rem 0 0.25rem; }
 .scan-busy { display: inline-flex; align-items: center; gap: 0.4rem; color: var(--muted); }
@@ -687,7 +690,7 @@ button.danger.link-btn { border: none; color: var(--alert); }
 .ride-live-controls { display: flex; align-items: center; gap: 0.75rem; flex-wrap: wrap;
     margin: 0.75rem 0; }
 .ride-live-controls .hint { margin: 0; }
-.ride-live-controls .erg-toggle.erg-on { background: var(--ok); color: var(--surface-inset); }
+.ride-live-controls .erg-toggle.erg-on { background: var(--ok); color: var(--on-accent); }
 .ride-chart-block { position: relative; min-height: 320px; background: var(--panel);
     border-radius: var(--r-md); padding: 0.8rem; margin-top: 1rem; }
 .ride-chart-heading { display: flex; align-items: center; justify-content: space-between;
@@ -708,14 +711,15 @@ button.danger.link-btn { border: none; color: var(--alert); }
 .ride-chart-metrics { position: absolute; z-index: 2; top: 20%; left: 50%;
     transform: translateX(-50%); display: flex; align-items: baseline; justify-content: center;
     gap: clamp(1rem, 5vw, 4rem); width: min(80%, 680px); pointer-events: none;
-    color: rgba(232, 237, 243, 0.78); text-shadow: 0 1px 5px var(--surface-inset), 0 0 12px var(--surface-inset); }
+    color: color-mix(in srgb, var(--text-bright) 78%, transparent);
+    text-shadow: 0 1px 5px var(--surface-inset), 0 0 12px var(--surface-inset); }
 .ride-chart-metrics span { display: inline-flex; align-items: baseline; gap: 0.25rem; }
 .ride-chart-metrics strong { font-size: 28px; line-height: 1; font-variant-numeric: tabular-nums;
     color: inherit; }
 .ride-chart-metrics small { font-size: 0.8rem; font-weight: 700; text-transform: uppercase; }
-.ride-chart-metrics .metric-power { color: #ffd166; }
-.ride-chart-metrics .metric-cadence { color: #57c7ff; }
-.ride-chart-metrics .metric-heart-rate { color: #ff4d8d; }
+.ride-chart-metrics .metric-power { color: var(--s-2); }
+.ride-chart-metrics .metric-cadence { color: var(--s-3); }
+.ride-chart-metrics .metric-heart-rate { color: var(--s-hr); }
 /* Background clock watermark: sits behind the transparent chart canvas. */
 .ride-chart-clocks { position: absolute; z-index: 0; top: 50%; left: 50%;
     transform: translate(-50%, -50%); display: flex; align-items: flex-end;
@@ -735,14 +739,14 @@ button.danger.link-btn { border: none; color: var(--alert); }
     border: 1px solid var(--surface-border); background: var(--surface-inset); font-size: 0.72rem;
     font-weight: 700; letter-spacing: 0.08em; }
 .ride-chart-chip .erg-led { width: 0.55rem; height: 0.55rem; border-radius: 2px;
-    background: #39424d; }
+    background: var(--surface-border); }
 .ride-chart-chip.erg-dark, .ride-chart-chip.device-dark { opacity: 0.45;
     filter: saturate(0.4); color: var(--muted); }
 .ride-chart-erg { position: absolute; z-index: 2; left: 0.35rem; bottom: 0.35rem; }
-.ride-chart-erg.erg-lit { opacity: 1; border-color: var(--ok); color: #bfe8d2;
-    box-shadow: 0 0 10px rgba(76, 175, 125, 0.35); }
-.ride-chart-erg.erg-lit .erg-led { background: #4dff9b;
-    box-shadow: 0 0 6px #4dff9b, 0 0 14px rgba(77, 255, 155, 0.7); }
+.ride-chart-erg.erg-lit { opacity: 1; border-color: var(--ok); color: var(--ok);
+    box-shadow: 0 0 10px color-mix(in srgb, var(--ok) 35%, transparent); }
+.ride-chart-erg.erg-lit .erg-led { background: var(--ok);
+    box-shadow: 0 0 6px var(--ok), 0 0 14px color-mix(in srgb, var(--ok) 70%, transparent); }
 .ride-chart-devices { position: absolute; z-index: 2; right: 0.35rem; bottom: 0.35rem;
     display: inline-flex; align-items: center; gap: 0.3rem; pointer-events: none; }
 /* Secondary to the readouts: glyph-only chips, tighter than the ERG chip. */
@@ -752,12 +756,12 @@ button.danger.link-btn { border: none; color: var(--alert); }
     letter-spacing: 0; }
 /* Each role borrows its metric's accent; the trainer takes the ERG green,
    since ERG is what the trainer link buys you. */
-.ride-chart-devices .device-chip[data-role="power"] { --device-color: #ffd166;
-    --device-glow: rgba(255, 209, 102, 0.7); }
-.ride-chart-devices .device-chip[data-role="hr"] { --device-color: #ff4d8d;
-    --device-glow: rgba(255, 77, 141, 0.7); }
-.ride-chart-devices .device-chip[data-role="trainer"] { --device-color: #4dff9b;
-    --device-glow: rgba(77, 255, 155, 0.7); }
+.ride-chart-devices .device-chip[data-role="power"] { --device-color: var(--s-2);
+    --device-glow: color-mix(in srgb, var(--s-2) 70%, transparent); }
+.ride-chart-devices .device-chip[data-role="hr"] { --device-color: var(--s-hr);
+    --device-glow: color-mix(in srgb, var(--s-hr) 70%, transparent); }
+.ride-chart-devices .device-chip[data-role="trainer"] { --device-color: var(--ok);
+    --device-glow: color-mix(in srgb, var(--ok) 70%, transparent); }
 .ride-chart-devices .device-chip.device-lit { opacity: 1;
     border-color: var(--device-color); color: var(--device-color);
     box-shadow: 0 0 10px var(--device-glow); }

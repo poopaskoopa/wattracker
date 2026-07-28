@@ -294,13 +294,18 @@ def test_ride_page_renders_available_when_monkeypatched(client, monkeypatch):
     # only as a faint point-less ghost behind it.
     assert '{label: "Measured power (" + POWER_SMOOTH_S + "s)", data: smoothPower, yAxisID: "y"' in r.text
     assert '{label: "Measured power (raw)", data: livePower, yAxisID: "y"' in r.text
-    assert 'borderColor: "rgba(255, 209, 102, 0.25)", pointRadius: 0' in r.text
+    assert 'borderColor: tokenAlpha("--s-2", 0.40), pointRadius: 0' in r.text
     assert "var POWER_SMOOTH_S = 3, METRIC_SMOOTH_S = 5;" in r.text
     assert "function smoothedValue(state, x, y)" in r.text
-    assert 'borderColor: "#f2a900"' in r.text
-    assert 'borderColor: "rgba(255, 209, 102, 0.7)", backgroundColor: "rgba(255, 209, 102, 0.7)"' in r.text
-    assert 'borderColor: "rgba(87, 199, 255, 0.7)"' in r.text
-    assert 'borderColor: "rgba(255, 77, 141, 0.7)"' in r.text
+    # The live traces are full-opacity. The 0.7 they used to carry was tuned
+    # to take the glare off the old near-white brights; against the darker
+    # series tokens it only cost contrast, putting heart rate under the 3:1
+    # floor on the panel that gets read from the bike.
+    assert 'borderColor: cssVar("--s-2")' in r.text
+    assert 'borderColor: cssVar("--s-3")' in r.text
+    assert 'borderColor: cssVar("--s-hr")' in r.text
+    assert 'tokenAlpha("--s-3"' not in r.text
+    assert 'tokenAlpha("--s-hr"' not in r.text
     assert 'id="rideChartTitle"' in r.text
     assert 'workout.name || "Workout metrics"' in r.text
     # In plan mode setupWorkout only runs once the ride connects, so the heading
@@ -446,9 +451,9 @@ def test_ride_chart_styles_support_live_metrics_and_fullscreen(client):
     assert r.status_code == 200
     assert ".ride-chart-metrics strong" in r.text
     assert "font-size: 28px" in r.text
-    assert ".ride-chart-metrics .metric-power { color: #ffd166; }" in r.text
-    assert ".ride-chart-metrics .metric-cadence { color: #57c7ff; }" in r.text
-    assert ".ride-chart-metrics .metric-heart-rate { color: #ff4d8d; }" in r.text
+    assert ".ride-chart-metrics .metric-power { color: var(--s-2); }" in r.text
+    assert ".ride-chart-metrics .metric-cadence { color: var(--s-3); }" in r.text
+    assert ".ride-chart-metrics .metric-heart-rate { color: var(--s-hr); }" in r.text
     assert ".ride-chart-block:fullscreen" in r.text
     assert ".ride-chart-fullscreen-fallback" in r.text
     assert "body.ride-chart-fullscreen-open" in r.text
@@ -465,9 +470,9 @@ def test_ride_chart_device_indicator_styles(client):
     assert r.status_code == 200
     assert ".ride-chart-devices { position: absolute; z-index: 2; right: 0.35rem;" in r.text
     assert "pointer-events: none" in r.text
-    assert '.ride-chart-devices .device-chip[data-role="power"] { --device-color: #ffd166;' in r.text
-    assert '.ride-chart-devices .device-chip[data-role="hr"] { --device-color: #ff4d8d;' in r.text
-    assert '.ride-chart-devices .device-chip[data-role="trainer"] { --device-color: #4dff9b;' in r.text
+    assert '.ride-chart-devices .device-chip[data-role="power"] { --device-color: var(--s-2);' in r.text
+    assert '.ride-chart-devices .device-chip[data-role="hr"] { --device-color: var(--s-hr);' in r.text
+    assert '.ride-chart-devices .device-chip[data-role="trainer"] { --device-color: var(--ok);' in r.text
     assert ".ride-chart-devices .device-chip.device-lit" in r.text
     assert ".ride-chart-chip.erg-dark, .ride-chart-chip.device-dark" in r.text
     assert ".ride-chart-devices .device-chip[hidden] { display: none; }" in r.text
