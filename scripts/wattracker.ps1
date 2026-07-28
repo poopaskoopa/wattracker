@@ -1,7 +1,8 @@
 [CmdletBinding()]
 param(
     [ValidateSet("start", "stop", "restart", "status")]
-    [string]$Action = "restart"
+    [string]$Action = "restart",
+    [switch]$OpenBrowser
 )
 
 $ErrorActionPreference = "Stop"
@@ -14,6 +15,8 @@ $Port = if ($env:WATTRACKER_PORT) { [int]$env:WATTRACKER_PORT } else { 8000 }
 if ($Port -lt 1 -or $Port -gt 65535) { throw "WATTRACKER_PORT must be 1..65535." }
 $StartTimeout = if ($env:WATTRACKER_START_TIMEOUT) { [int]$env:WATTRACKER_START_TIMEOUT } else { 20 }
 $StopTimeout = if ($env:WATTRACKER_TERM_TIMEOUT) { [int]$env:WATTRACKER_TERM_TIMEOUT } else { 10 }
+if ($StartTimeout -lt 1 -or $StartTimeout -gt 300) { throw "WATTRACKER_START_TIMEOUT must be 1..300." }
+if ($StopTimeout -lt 1 -or $StopTimeout -gt 300) { throw "WATTRACKER_TERM_TIMEOUT must be 1..300." }
 $Root = Split-Path -Parent $PSScriptRoot
 $DataDir = if ($env:WATTRACKER_DATA_DIR) { $env:WATTRACKER_DATA_DIR } else { Join-Path $env:USERPROFILE ".wattracker" }
 $StatePath = Join-Path $DataDir "wattracker-process.json"
@@ -38,19 +41,27 @@ function Get-Identity([int]$ProcessId) {
         start_time_utc = $process.StartTime.ToUniversalTime().ToString("o")
         executable = [System.IO.Path]::GetFullPath([string]$cim.ExecutablePath)
         command_line = [string]$cim.CommandLine
+        process = $process
     }
 }
 
-function Confirm-Managed($State) {
-    if (-not $State -or -not $State.pid -or -not $State.marker -or -not $State.executable -or -not $State.start_time_utc) { return $false }
-    if ([int]$State.port -ne $Port) { return $false }
+function Get-ManagedIdentity($State) {
+    if (-not $State -or -not $State.pid -or -not $State.marker -or -not $State.executable -or -not $State.start_time_utc) { return $null }
+    if ([string]$State.marker -cnotmatch '\A--wattracker-managed=[0-9a-f]{32}\z') { return $null }
+    if ([int]$State.port -ne $Port) { return $null }
     $identity = Get-Identity ([int]$State.pid)
-    if (-not $identity) { return $false }
-    return (
-        $identity.start_time_utc -eq [string]$State.start_time_utc -and
-        $identity.executable -eq [System.IO.Path]::GetFullPath([string]$State.executable) -and
-        $identity.command_line.Contains([string]$State.marker)
-    )
+    if (-not $identity) { return $null }
+    $markerPattern = '(?<!\S)' + [regex]::Escape([string]$State.marker) + '(?!\S)'
+    if (
+        $identity.start_time_utc -ne [string]$State.start_time_utc -or
+        $identity.executable -ne [System.IO.Path]::GetFullPath([string]$State.executable) -or
+        $identity.command_line -notmatch $markerPattern
+    ) { return $null }
+    return $identity
+}
+
+function Confirm-Managed($State) {
+    return $null -ne (Get-ManagedIdentity $State)
 }
 
 function Test-PortFree {
@@ -69,6 +80,15 @@ function Test-Health {
         $response = Invoke-WebRequest -UseBasicParsing -Uri $HealthUrl -TimeoutSec 2
         return $response.StatusCode -eq 200
     } catch { return $false }
+}
+
+function Open-ReadyBrowser {
+    if (-not $OpenBrowser) { return }
+    try {
+        Start-Process -FilePath $HealthUrl | Out-Null
+    } catch {
+        Write-Warning "wattracker is ready, but the browser could not be opened: $($_.Exception.Message)"
+    }
 }
 
 function Save-State($State) {
@@ -100,31 +120,65 @@ function Cleanup-RecordedStartupFailure {
         Remove-Item -LiteralPath $StatePath -ErrorAction SilentlyContinue
         return
     }
-    if (-not (Confirm-Managed $state)) {
+    $managed = Get-ManagedIdentity $state
+    if (-not $managed) {
         return  # PID was reused or state changed: fail closed.
     }
-    Stop-Process -Id ([int]$state.pid) -ErrorAction SilentlyContinue
-    try { Wait-Process -Id ([int]$state.pid) -Timeout $StopTimeout -ErrorAction SilentlyContinue } catch {}
-    if ((Get-Process -Id ([int]$state.pid) -ErrorAction SilentlyContinue) -and
-        (Confirm-Managed $state)) {
-        Stop-Process -Id ([int]$state.pid) -Force -ErrorAction SilentlyContinue
-        try { Wait-Process -Id ([int]$state.pid) -Timeout $StopTimeout -ErrorAction SilentlyContinue } catch {}
+    try {
+        $managed.process.Kill()
+        if ($managed.process.WaitForExit($StopTimeout * 1000)) {
+            Remove-Item -LiteralPath $StatePath -ErrorAction SilentlyContinue
+        }
+    } catch {
+        # The verified process handle is the only permitted termination target.
+        # If it has exited or cannot be terminated, retain state and fail closed.
     }
-    if (-not (Get-Process -Id ([int]$state.pid) -ErrorAction SilentlyContinue)) {
-        Remove-Item -LiteralPath $StatePath -ErrorAction SilentlyContinue
+}
+
+function Stop-ManagedIdentity($Managed) {
+    try {
+        $Managed.process.Kill()
+        if (-not $Managed.process.WaitForExit($StopTimeout * 1000)) {
+            throw "timed out"
+        }
+    } catch {
+        throw "The verified managed process could not be terminated safely: $($_.Exception.Message)"
+    }
+    if ($Managed.process.HasExited) {
+        Remove-Item -LiteralPath $StatePath
     }
 }
 
 function Start-Wattracker {
     $existing = Read-State
     if ($existing) {
-        if (Confirm-Managed $existing) { Write-Host "running (PID $($existing.pid)) at $HealthUrl"; return }
+        if (Confirm-Managed $existing) {
+            Write-Host "running (PID $($existing.pid)) at $HealthUrl"
+            if ($OpenBrowser) {
+                $deadline = (Get-Date).AddSeconds($StartTimeout)
+                while ((Get-Date) -lt $deadline) {
+                    if (-not (Confirm-Managed (Read-State))) {
+                        throw "wattracker exited before the browser could be opened."
+                    }
+                    if (Test-Health) {
+                        Open-ReadyBrowser
+                        return
+                    }
+                    Start-Sleep -Milliseconds 500
+                }
+                throw "Health check timed out; browser was not opened."
+            }
+            return
+        }
         throw "Managed process state is stale or does not match exactly; refusing to start. Inspect $StatePath."
     }
     if (-not (Test-PortFree)) { throw "Port $Port is occupied; refusing to start or stop its owner." }
 
     if ($env:WATTRACKER_EXECUTABLE) {
         $Executable = [System.IO.Path]::GetFullPath($env:WATTRACKER_EXECUTABLE)
+        $Arguments = @()
+    } elseif (Test-Path -LiteralPath (Join-Path $Root "wattracker.exe")) {
+        $Executable = Join-Path $Root "wattracker.exe"
         $Arguments = @()
     } else {
         $Executable = Join-Path $Root ".venv\Scripts\python.exe"
@@ -156,7 +210,11 @@ function Start-Wattracker {
         $deadline = (Get-Date).AddSeconds($StartTimeout)
         while ((Get-Date) -lt $deadline) {
             if (-not (Confirm-Managed (Read-State))) { throw "wattracker exited during startup; see $ErrorLogPath" }
-            if (Test-Health) { Write-Host "up at $HealthUrl (PID $($process.Id))"; return }
+            if (Test-Health) {
+                Write-Host "up at $HealthUrl (PID $($process.Id))"
+                Open-ReadyBrowser
+                return
+            }
             Start-Sleep -Milliseconds 500
         }
         throw "Health check timed out; see $ErrorLogPath."
@@ -171,21 +229,10 @@ function Stop-Wattracker {
     if (-not $state) { Write-Host "not running (no managed state)"; return }
     $identity = Get-Identity ([int]$state.pid)
     if (-not $identity) { Remove-Item -LiteralPath $StatePath; Write-Host "not running (removed stale state)"; return }
-    if (-not (Confirm-Managed $state)) { throw "Process identity does not match managed state; refusing to terminate PID $($state.pid)." }
-    Stop-Process -Id ([int]$state.pid)
-    $deadline = (Get-Date).AddSeconds($StopTimeout)
-    while ((Get-Date) -lt $deadline) {
-        if (-not (Get-Process -Id ([int]$state.pid) -ErrorAction SilentlyContinue)) {
-            Remove-Item -LiteralPath $StatePath
-            Write-Host "stopped PID $($state.pid)"
-            return
-        }
-        Start-Sleep -Milliseconds 250
-    }
-    if (-not (Confirm-Managed $state)) { throw "Process identity changed while stopping; refusing force termination." }
-    Stop-Process -Id ([int]$state.pid) -Force
-    Remove-Item -LiteralPath $StatePath
-    Write-Host "force-stopped PID $($state.pid)"
+    $managed = Get-ManagedIdentity $state
+    if (-not $managed) { throw "Process identity does not match managed state; refusing to terminate PID $($state.pid)." }
+    Stop-ManagedIdentity $managed
+    Write-Host "stopped PID $($state.pid)"
 }
 
 function Show-Status {
