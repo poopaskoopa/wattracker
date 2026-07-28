@@ -167,6 +167,27 @@ def live_server(tmp_path):
         assert r.status_code == 200, r.text
         uid = db.get_user_by_username(USERNAME)["id"]
         _seed_activities(uid, today)
+        detail_activity_id = db.insert_activity(
+            uid,
+            {
+                "dedup_hash": "dom-detail-series",
+                "filename": "dom-detail-series.fit",
+                "start_time": f"{today.isoformat()}T12:00:00",
+                "duration_s": 120,
+                "distance_m": 1000.0,
+                "avg_power": 205.0,
+                "avg_hr": 145.0,
+                "np": 210.0,
+                "if_": 0.8,
+                "tss": 10.0,
+                "streams": {
+                    "power": [200.0 + i % 20 for i in range(120)],
+                    "heartrate": [140.0 + i % 10 for i in range(120)],
+                    "cadence": [85.0 + i % 8 for i in range(120)],
+                    "altitude": [100.0 + i % 15 for i in range(120)],
+                },
+            },
+        )
         # Anchor the plan inside the currently displayed calendar month: the
         # Monday on/before the 8th always falls in this month.
         start = dt.date(today.year, today.month, 8)
@@ -187,7 +208,8 @@ def live_server(tmp_path):
     try:
         yield type("Server", (), {"__str__": lambda self: base,
                                   "base": base, "plan_id": plan_id,
-                                  "uid": uid})()
+                                  "uid": uid,
+                                  "detail_activity_id": detail_activity_id})()
     finally:
         server.should_exit = True
         thread.join(timeout=10)
@@ -258,6 +280,36 @@ def _canvas_is_painted(page, canvas_id):
 
 
 # ------------------------------------------------------------------ tests
+def test_activity_detail_combines_and_independently_toggles_series(
+        page, live_server, console_errors):
+    page.goto(f"{live_server.base}/activity/{live_server.detail_activity_id}")
+    _wait_for_charts(page, "detailChart")
+
+    before = page.evaluate(
+        """() => {
+            const chart = Chart.getChart(document.getElementById("detailChart"));
+            return {
+                labels: chart.data.datasets.map(dataset => dataset.label),
+                visible: chart.data.datasets.map((_, i) => chart.isDatasetVisible(i)),
+            };
+        }"""
+    )
+    assert before["labels"] == [
+        "Elevation (m)", "Power (W)", "Heart rate (bpm)", "Cadence (rpm)",
+    ]
+    assert before["visible"] == [True, True, True, True]
+
+    page.get_by_text("Heart rate (bpm)", exact=True).click()
+    after = page.evaluate(
+        """() => {
+            const chart = Chart.getChart(document.getElementById("detailChart"));
+            return chart.data.datasets.map((_, i) => chart.isDatasetVisible(i));
+        }"""
+    )
+    assert after == [True, True, False, True]
+    _assert_clean(console_errors, "/activity/{id}")
+
+
 def test_calendar_workout_click_opens_modal_with_drawn_profile(page, live_server,
                                                                console_errors):
     """Calendar renders clickable workout cells; the modal draws a real SVG."""
