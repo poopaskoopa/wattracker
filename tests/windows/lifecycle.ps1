@@ -33,7 +33,14 @@ try {
     if (Get-Process -Id $unrelated.Id -ErrorAction SilentlyContinue) { Write-Host "unrelated process preserved" }
     else { throw "unrelated process was terminated" }
 
-    $tampered = [pscustomobject]@{ pid=$unrelated.Id; start_time_utc="bad"; executable=$unrelated.Path; marker="bad"; port=[int]$env:WATTRACKER_PORT }
+    $unrelatedCim = Get-CimInstance Win32_Process -Filter "ProcessId = $($unrelated.Id)"
+    $tampered = [pscustomobject]@{
+        pid=$unrelated.Id
+        start_time_utc=$unrelated.StartTime.ToUniversalTime().ToString("o")
+        executable=[System.IO.Path]::GetFullPath([string]$unrelatedCim.ExecutablePath)
+        marker="ping"
+        port=[int]$env:WATTRACKER_PORT
+    }
     $tampered | ConvertTo-Json | Set-Content (Join-Path $env:WATTRACKER_DATA_DIR "wattracker-process.json")
     $failedClosed = $false
     try { & $Script stop } catch { $failedClosed = $true }
