@@ -294,11 +294,6 @@
         element.classList.remove("status-success", "status-failure", "status-working");
         if (kind) element.classList.add("status-" + kind);
     }
-    function themeColor(name, fallback) {
-        var value = getComputedStyle(document.documentElement).getPropertyValue(name);
-        value = (value || "").trim();
-        return value || fallback;
-    }
     // Chart.js v4 has no minor gridlines, so intermediate lines only exist if
     // there are intermediate ticks. Pick the coarsest round step that still
     // leaves about a dozen lines, so a 30-minute session and a 3-hour session
@@ -333,10 +328,10 @@
         return Math.ceil(peakTarget / 0.65 / 50) * 50;
     }
     function chartOptions(duration, peakTarget) {
-        var axisText = themeColor("--text-bright", "#f5f7fa");
-        var titleText = themeColor("--text", "#e6e6e6");
-        var tickMark = themeColor("--muted", "#8a94a0");
-        var gridLine = themeColor("--grid-strong", "rgba(255, 255, 255, 0.14)");
+        var axisText = cssVar("--text-bright", "#f5f7fa");
+        var titleText = cssVar("--text", "#e6e6e6");
+        var tickMark = cssVar("--muted", "#8a94a0");
+        var gridLine = cssVar("--grid-strong", "rgba(255, 255, 255, 0.14)");
         var axisFont = {size: 15, weight: "600"};
         var titleFont = {size: 14, weight: "700"};
         return {responsive: true, maintainAspectRatio: false, animation: false,
@@ -492,24 +487,43 @@
                 // perfectly angular, so no tension here. `order` sets the paint
                 // stack (highest is drawn first, i.e. furthest back) and keeps the
                 // raw ghost behind everything it is meant to texture.
+                // Same hue as measured power on purpose: target and measured are
+                // the same measure (prescribed vs actual), not two different
+                // things, and a fourth distinct hue here would fail CVD against
+                // heart rate. Dash versus solid, and 2px versus 3px, is what
+                // separates them.
+                //
+                // The live traces are drawn at FULL opacity, unlike everywhere
+                // else in the app. The 0.7 these carried was tuned to take the
+                // glare off the old near-white brights (#ffd166 and friends);
+                // against the darker series tokens the same 0.7 is pure loss -
+                // it put heart rate at 2.83:1 on this panel, under the 3:1
+                // floor, on the one screen that gets read at arm's length while
+                // riding. At full opacity the trio is 5.9 / 5.0 / 4.6:1 and
+                // passes all-pairs CVD against the #10161d ride surface.
                 {label: "Target power", data: prescribed, yAxisID: "y",
-                    borderColor: "#f2a900", pointRadius: 0, borderWidth: 2,
+                    borderColor: cssVar("--s-2"), pointRadius: 0, borderWidth: 2,
                     borderDash: [8, 4], tension: 0, order: 0},
                 {label: "Measured power (" + POWER_SMOOTH_S + "s)", data: smoothPower, yAxisID: "y",
-                    borderColor: "rgba(255, 209, 102, 0.7)", backgroundColor: "rgba(255, 209, 102, 0.7)",
-                    pointBackgroundColor: "rgba(255, 209, 102, 0.7)", pointRadius: 0,
+                    borderColor: cssVar("--s-2"),
+                    backgroundColor: cssVar("--s-2"),
+                    pointBackgroundColor: cssVar("--s-2"), pointRadius: 0,
                     pointHoverRadius: 4, borderWidth: 3, tension: 0.25, order: 1},
                 // A dot per sample was the main source of visual noise; the raw
                 // trace survives only as a faint hairline so spikes still read as
-                // texture behind the line the rider actually follows.
+                // texture behind the line the rider actually follows. Alpha 0.40
+                // against the darker token, not the old 0.25 against the bright
+                // one: both land at 1.9:1 on this panel, which is the intended
+                // weight - present as texture, never competing with the smoothed
+                // line. Deliberately the one trace below the 3:1 floor.
                 {label: "Measured power (raw)", data: livePower, yAxisID: "y",
-                    borderColor: "rgba(255, 209, 102, 0.25)", pointRadius: 0,
+                    borderColor: tokenAlpha("--s-2", 0.40), pointRadius: 0,
                     pointHoverRadius: 4, borderWidth: 1, tension: 0, order: 4},
                 {label: "Cadence", data: smoothCadence, yAxisID: "metrics",
-                    borderColor: "rgba(87, 199, 255, 0.7)", pointRadius: 0, borderWidth: 2,
+                    borderColor: cssVar("--s-3"), pointRadius: 0, borderWidth: 2,
                     tension: 0.25, order: 2},
                 {label: "Heart rate", data: smoothHr, yAxisID: "metrics",
-                    borderColor: "rgba(255, 77, 141, 0.7)", pointRadius: 0, borderWidth: 2,
+                    borderColor: cssVar("--s-hr"), pointRadius: 0, borderWidth: 2,
                     tension: 0.25, order: 3}
             ]}, options: chartOptions(workoutDuration, peakTarget)});
     }
