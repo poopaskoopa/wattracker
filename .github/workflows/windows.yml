@@ -4,6 +4,9 @@ on:
   push:
   pull_request:
 
+permissions:
+  contents: read
+
 jobs:
   test:
     # Hard-disabled: Actions runs are blocked at the account level (failed
@@ -39,6 +42,37 @@ jobs:
         run: |
           python -m venv .venv
           .venv\Scripts\python -m pip install -e ".[dev]"
+      - name: Install pinned Inno Setup compiler
+        shell: pwsh
+        run: |
+          $innoVersion = "6.7.3"
+          $expectedInnoSha256 = "9c73c3bae7ed48d44112a0f48e66742c00090bdb5bef71d9d3c056c66e97b732"
+          $innoInstaller = Join-Path $env:RUNNER_TEMP "innosetup-$innoVersion.exe"
+          $innoRoot = Join-Path $env:RUNNER_TEMP "Inno Setup 6"
+          Invoke-WebRequest `
+            -Uri "https://github.com/jrsoftware/issrc/releases/download/is-6_7_3/innosetup-6.7.3.exe" `
+            -OutFile $innoInstaller
+          $actualInnoSha256 = (Get-FileHash -LiteralPath $innoInstaller -Algorithm SHA256).Hash.ToLowerInvariant()
+          if ($actualInnoSha256 -cne $expectedInnoSha256) {
+            throw "Inno Setup compiler SHA-256 verification failed"
+          }
+          $signature = Get-AuthenticodeSignature -FilePath $innoInstaller
+          $publisher = if ($signature.SignerCertificate) {
+            $signature.SignerCertificate.GetNameInfo(
+              [System.Security.Cryptography.X509Certificates.X509NameType]::SimpleName,
+              $false
+            )
+          }
+          if ($signature.Status -ne "Valid" -or $publisher -cne "Pyrsys B.V.") {
+            throw "Inno Setup compiler signature verification failed"
+          }
+          $install = Start-Process -FilePath $innoInstaller -ArgumentList @(
+            "/VERYSILENT", "/SUPPRESSMSGBOXES", "/NORESTART", "/CURRENTUSER", "/DIR=`"$innoRoot`""
+          ) -Wait -PassThru
+          if ($install.ExitCode -ne 0 -or -not (Test-Path -LiteralPath "$innoRoot\ISCC.exe")) {
+            throw "Inno Setup compiler installation failed with exit code $($install.ExitCode)"
+          }
+          $innoRoot | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
       - name: PowerShell lifecycle safety
         shell: powershell
         run: tests\windows\lifecycle.ps1
@@ -60,10 +94,16 @@ jobs:
           pyinstaller --clean --noconfirm packaging\wattracker.spec
           powershell -File packaging\smoke_frozen.ps1 -Executable dist\wattracker\wattracker.exe
           Compress-Archive -Path dist\wattracker -DestinationPath dist\wattracker-windows-x64-unsigned.zip
+          $version = python -c "import tomllib; print(tomllib.load(open('pyproject.toml','rb'))['project']['version'])"
+          ISCC.exe "/DAppVersion=$version" packaging\wattracker.iss
+          $setup = "dist\wattracker-$version-windows-x64-unsigned-setup.exe"
+          if (-not (Test-Path -LiteralPath $setup)) { throw "Setup compiler produced no artifact" }
+          powershell -File packaging\smoke_installer.ps1 -Installer $setup
       - uses: actions/upload-artifact@v4
         with:
           name: wattracker-windows-x64-unsigned
           path: |
             dist/*.whl
             dist/wattracker-windows-x64-unsigned.zip
+            dist/*-unsigned-setup.exe
           if-no-files-found: error

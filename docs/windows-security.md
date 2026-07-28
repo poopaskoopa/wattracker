@@ -59,6 +59,32 @@ requires a separate security design covering TLS, Secure cookies, CSRF and
 Origin validation, trusted hosts/proxies, login throttling, and registration
 policy.
 
+## Installer lifecycle and compiler provenance
+
+The per-user installer never requests elevation, adds no firewall rule, and
+keeps profile data outside its application directory. Upgrade and uninstall
+invoke only the installed launcher, which validates the recorded process ID,
+creation time, executable path, random marker syntax and exact command-line
+token before terminating the already-opened process handle. State for a
+recorded PID that no longer exists is safely cleared. Malformed or tampered
+state, or state that points to a live process whose identity does not match,
+aborts upgrade or uninstall before application files are replaced or removed;
+state is never used to kill a process by name or port.
+
+The unsigned CI packaging job pins the Inno Setup release and asset name. It
+requires both an exact reviewed SHA-256 digest and a valid Authenticode
+signature whose exact publisher simple name is `Pyrsys B.V.` before executing
+the compiler installer. The workflow token is read-only. The application
+installer remains unsigned and must be labeled as such; these compiler checks
+do not provide end-user publisher authentication.
+
+The launcher uses process-scoped `-ExecutionPolicy Bypass` because the shipped
+PowerShell script is itself unsigned. This does not elevate privileges or
+change machine/user execution policy, and all installer invocations use an
+absolute script path under the current user's installation. Its remaining
+risk is same-user modification of that launcher; production releases should
+prefer a signed native launcher.
+
 ## Signed releases
 
 `.github/workflows/windows-release.yml` creates no unsigned release artifact.
