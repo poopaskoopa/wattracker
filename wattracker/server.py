@@ -2161,6 +2161,13 @@ def create_app() -> FastAPI:
             calendar_token_set=calendarfeed.token_is_set(uid),
             calendar_message=calendar_message,
             calendar_feed_url=calendar_feed_url,
+            # Drives the setup guide on the page: whether this deployment knows
+            # the name a phone reaches it by. Unset means any link minted here
+            # would carry a loopback host and be useless off this machine, so
+            # the guide says so rather than letting the user find out after
+            # subscribing. The hostname is configuration, not a secret.
+            calendar_public_host=config.public_host(),
+            calendar_public_scheme=config.public_scheme(),
             current_ftp=round(importer.current_ftp(uid), 1),
             recent_best_effort_ftp=round(importer.recent_best_effort_ftp(uid), 1),
             api_key_set=config.anthropic_api_key_set(),
