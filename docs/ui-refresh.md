@@ -417,28 +417,43 @@ WP-8 (ride)                 ← after all of the above are on main
 | WP-6 tables | Agent 2 | **merged** `52480ad` |
 | WP-5 workout SVG | Agent 2 | **merged** (cap reinstated — see below) |
 | WP-7 calendar | Agent 2 | **merged** `6717ff9` |
-| WP-8 ride | unassigned | **the only package left** |
+| WP-8 ride | Agent 1 | **merged** `9e6233e` |
 
-**All seven refresh packages are merged.** Only WP-8 (ride) is left, and it is
-deliberately last: `ride.html` is ~1600 lines of live WebSocket rendering,
-fullscreen handling and device LEDs, and it is the hardest file in the app to
-verify without a trainer and sensors on the other end. Keep it to swapping
-literals for tokens and series colours for `--s-*`. Do not restructure the ride
-chart, and do not touch the WebSocket or fullscreen paths.
+**All eight packages are merged. The refresh is done.**
 
-Two things already point at it:
-- `ride.html:339` reads `--grid-strong` rather than `--grid`. That token was
-  added because the analysis-page gridline weight looked too faint for a screen
-  read at arm's length, but the value was picked by eye and has never been seen
-  on an actual bike. Worth confirming before anything else changes there.
-- `.erg-toggle.erg-on` has ink swept to `--surface-inset` where it semantically
-  wants `--on-accent`. The two are value-identical today, so it is a naming fix,
-  not a visual one.
-real shared API during WP-1/WP-2 — six helpers, plus two Chart.js v4 traps
-written down. WP-6 should not reinvent any of it.
+Two things still want a human eye, both on the ride screen, neither checkable
+from a desk:
 
-After WP-6, go to **WP-5**, then **WP-7**. Same rule each time: rebase on
-`main` first, one WP per branch, push and report "WP-n ready to merge".
+- **The ride chart is visibly less bright than it was.** WP-8 moved the live
+  traces onto the darker `--s-*` tokens. That is correct by every measurement
+  available — full opacity, 5.9 / 5.0 / 4.6:1 against the `#10161d` panel,
+  all-pairs CVD clean — but the old literals were near-white brights and this
+  is a real change in feel on a screen read at arm's length while exercising.
+  If it reads dim on an actual bike, the fix is a ride-specific brighter step
+  validated against that surface, **not** reverting to the old literals: they
+  failed the lightness band, which is what put them out of the set in the first
+  place.
+- **`--grid-strong` has never been seen on a bike either.** It was added in
+  WP-0 because the analysis-page gridline weight looked too faint for that
+  screen, but the value was picked by eye.
 
-Agent 2: start at **WP-4**, it is the one with a real form change in it and the
-most visible payoff. WP-6 next because it touches the most pages.
+One more judgement worth revisiting with real riding: target power and measured
+power are now the same hue, separated by dash and weight. §1.4 rules out a
+fourth hue there (it fails CVD against heart rate), and prescribed-versus-actual
+of one measure is not two series — but it is the pair most likely to read worse
+in motion.
+
+## What this left behind
+
+Reusable beyond the refresh, and worth knowing before touching charts again:
+
+- **`chart-theme.js` is the shared chart API.** `cssVar`, `tokenAlpha`,
+  `monthYearTicks`, `dateAxisTicks`, `strideTicks`, `alignPanels` /
+  `schedulePanelAlign`, `linkedCrosshair`. Add to it rather than copying out of
+  it. See the WP-0 notes above for the two Chart.js v4 traps it documents.
+- **Three bugs the work surfaced that predated it**: `autoSkip` is gated on
+  `ticks.display`, so stacked panels silently fell out of column; a class
+  selector beats the UA `[hidden]` rule, so hidden canvases still occupied
+  layout; and `.zone-bar`'s `max-width` cap flattened every value above ~70%.
+- **`vector-effect: non-scaling-stroke` governs strokes only.** SVG text scales
+  with the viewBox and no CSS pins it — see the §1.9 correction.
