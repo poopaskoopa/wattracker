@@ -721,17 +721,17 @@ button.danger.link-btn { border: none; color: var(--alert); }
 .ride-chart-metrics .metric-cadence { color: var(--s-3); }
 .ride-chart-metrics .metric-heart-rate { color: var(--s-hr); }
 /* Background clock watermark: sits behind the transparent chart canvas. */
-.ride-chart-clocks { position: absolute; z-index: 0; top: 50%; left: 50%;
+.ride-chart-clocks { position: absolute; z-index: 0; top: 62%; left: 50%;
     transform: translate(-50%, -50%); display: flex; align-items: flex-end;
     justify-content: center; gap: clamp(1rem, 6vw, 4.5rem); width: min(92%, 760px);
-    pointer-events: none; opacity: 0.16; color: var(--text); }
+    pointer-events: none; color: var(--text); }
 .ride-chart-clocks span { display: flex; flex-direction: column; align-items: center;
     gap: 0.15rem; }
 .ride-chart-clocks strong { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
     font-size: clamp(30px, 6vw, 58px); line-height: 1; font-variant-numeric: tabular-nums;
-    letter-spacing: -0.02em; }
+    letter-spacing: -0.02em; opacity: 0.4; }
 .ride-chart-clocks small { font-size: 0.7rem; font-weight: 700; letter-spacing: 0.08em;
-    text-transform: uppercase; }
+    text-transform: uppercase; opacity: 0.16; }
 /* Shared corner chip: an LED plus a short label, dim until whatever it reports
    is live. Used by the ERG indicator and by the sensor indicators opposite it. */
 .ride-chart-chip { display: inline-flex; align-items: center; gap: 0.4rem;
