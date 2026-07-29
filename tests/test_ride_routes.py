@@ -458,6 +458,11 @@ def test_ride_chart_styles_support_live_metrics_and_fullscreen(client):
     assert ".ride-chart-fullscreen-fallback" in r.text
     assert "body.ride-chart-fullscreen-open" in r.text
     assert ".ride-chart-clocks" in r.text
+    # Keep the clocks behind the traces and below the metric readouts, while
+    # making the large timer digits legible without lifting the small labels.
+    assert ".ride-chart-clocks { position: absolute; z-index: 0; top: 62%;" in r.text
+    assert "letter-spacing: -0.02em; opacity: 0.4;" in r.text
+    assert "text-transform: uppercase; opacity: 0.16;" in r.text
     assert ".ride-chart-erg.erg-lit .erg-led" in r.text
     # The inline chart grows with the page: a fixed 260px box is a 5:1 letter
     # slot on a wide main. The full-screen rule still overrides it.
