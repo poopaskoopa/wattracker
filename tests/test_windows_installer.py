@@ -1,6 +1,5 @@
 from pathlib import Path
 import re
-import tomllib
 
 
 ROOT = Path(__file__).parents[1]
@@ -23,9 +22,16 @@ def test_installer_is_stable_per_user_and_ships_the_full_payload():
 
 
 def test_version_comes_from_pyproject_compile_define():
-    version = tomllib.loads((ROOT / "pyproject.toml").read_text(encoding="utf-8"))[
-        "project"
-    ]["version"]
+    # Regex rather than tomllib: tomllib arrived in 3.11 and this project
+    # supports >=3.10, so importing it here broke collection of the whole
+    # suite on the declared minimum interpreter. packaging/wattracker.spec
+    # reads the version the same way, for the same reason.
+    match = re.search(
+        r'(?m)^version\s*=\s*"([^"]+)"',
+        (ROOT / "pyproject.toml").read_text(encoding="utf-8"),
+    )
+    assert match, "could not read version from pyproject.toml"
+    version = match.group(1)
     assert "#ifndef AppVersion" in ISS
     assert "AppVersion={#AppVersion}" in ISS
     assert "OutputBaseFilename=wattracker-{#AppVersion}-windows-x64-unsigned-setup" in ISS
