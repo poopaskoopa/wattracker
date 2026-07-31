@@ -646,8 +646,16 @@ button.danger.link-btn { border: none; color: var(--alert); }
 /* Ride */
 .ride-setup { margin: 1rem 0; }
 .ride-setup select { margin-left: 0.5rem; }
-.ride-mode { margin-bottom: 0.5rem; }
-.ride-mode label { display: inline-block; margin-right: 1rem; }
+.ride-mode { display: flex; gap: 0.65rem; margin-bottom: 0.75rem; }
+.ride-mode-button { display: inline-flex; align-items: center; cursor: pointer;
+    border: 2px solid var(--surface-border); border-radius: var(--r-sm);
+    padding: 0.65rem 1rem; font-weight: 600; }
+.ride-mode-button[aria-pressed="true"] { border-color: var(--accent); background: var(--surface-inset); color: var(--accent); }
+.ride-mode-button:focus-visible { outline: 3px solid var(--accent); outline-offset: 2px; }
+.ride-mode-button:disabled { opacity: 0.55; cursor: not-allowed; }
+.just-ride-layout { display: grid; grid-template-columns: minmax(180px, 0.7fr) minmax(300px, 1.3fr);
+    gap: 1rem; align-items: start; }
+.just-ride-controls { display: flex; flex-direction: column; gap: 0.65rem; }
 .ride-preview { background: var(--panel); border-radius: var(--r-md);
     padding: 0.8rem; margin-bottom: 0.8rem; }
 .ride-preview[hidden] { display: none; }
@@ -655,6 +663,11 @@ button.danger.link-btn { border: none; color: var(--alert); }
 .ride-preview table { width: 100%; margin: 0.5rem 0 0; }
 .ride-preview-meta { margin: 0; color: var(--accent); }
 .ride-preview-this { margin: 0.35rem 0 0; font-size: 0.85rem; }
+.ride-preview-graph { margin-top: 0.65rem; }
+.ride-preview-graph .profile-svg { max-height: 230px; }
+@media (max-width: 700px) {
+    .just-ride-layout { grid-template-columns: 1fr; }
+}
 .device-list table { margin: 0.5rem 0; }
 .device-address { display: block; color: var(--muted); overflow-wrap: anywhere; }
 .device-role { display: inline-block; margin: 0.15rem 0.7rem 0.15rem 0; white-space: nowrap; }

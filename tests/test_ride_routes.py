@@ -236,7 +236,7 @@ def test_ride_page_renders_available_when_monkeypatched(client, monkeypatch):
     assert 'socket.onmessage = function (ev) {\n            if (ws !== socket) return;' in r.text
     assert 'decimation: {enabled: true, algorithm: "lttb", samples: 1000' in r.text
     assert r.text.count("var wid") == 1
-    assert 'getElementById("workoutSelect").disabled = active' in r.text
+    assert 'getElementById("workoutSelect").disabled = controlsLocked' in r.text
     assert 'id="rideChartPanel"' in r.text
     assert 'id="rideChart"' in r.text
     assert 'id="rideHrChart"' not in r.text
@@ -312,7 +312,7 @@ def test_ride_page_renders_available_when_monkeypatched(client, monkeypatch):
     # follows the select until then.
     assert "function showSelectedWorkoutTitle()" in r.text
     assert '<option value="" data-name="Endurance">' in r.text
-    assert 'document.getElementById("workoutSelect").addEventListener("change", showSelectedWorkoutTitle)' in r.text
+    assert 'document.getElementById("workoutSelect").addEventListener("change", function () {' in r.text
     assert 'id="ergIndicator"' in r.text
     assert 'indicator.classList.toggle("erg-lit", ergEnabled)' in r.text
     assert "function fmtHms(sec)" in r.text
@@ -371,6 +371,9 @@ def test_ride_page_plays_countdown_cues_before_block_and_workout_ends(client, mo
     assert r.status_code == 200
     # New cue kinds ride on the existing playCue/primeAudio path.
     assert "function playTone(ctx, frequency, delay, duration)" in r.text
+    assert "var CUE_GAIN = 0.12;" in r.text
+    assert "gain.gain.setValueAtTime(CUE_GAIN, start);" in r.text
+    assert "gain.gain.exponentialRampToValueAtTime(0.001, start + duration);" in r.text
     assert 'if (kind === "countdown") { playTone(ctx, 660, 0, 0.1); return; }' in r.text
     assert 'if (kind === "blockChange") { playTone(ctx, 1046, 0, 0.4); return; }' in r.text
     assert 'if (kind === "workoutEnd") {' in r.text
@@ -396,6 +399,68 @@ def test_ride_page_plays_countdown_cues_before_block_and_workout_ends(client, mo
     assert "updateAudioCues(elapsed);" in r.text
     # A second ride in the same page session starts from a clean slate.
     assert "cuesPlayed = {};" in r.text
+
+
+def test_ride_page_just_ride_controls_preview_and_telemetry_locking(client, monkeypatch):
+    _register(client)
+    monkeypatch.setattr(bledevices, "bluetooth_available", lambda: (True, "ok"))
+    text = client.get("/ride").text
+
+    assert '<div class="ride-mode" role="radiogroup" aria-label="Ride mode">' in text
+    assert 'class="ride-mode-button" data-ride-mode="plan"' in text
+    assert 'class="ride-mode-button" data-ride-mode="just"' in text
+    assert 'aria-pressed="true" aria-controls="planMode"' in text
+    assert 'aria-pressed="false" aria-controls="justRideMode"' in text
+    assert 'type="radio"' not in text
+    assert 'id="justRideMode" class="just-ride-layout"' in text
+    assert 'id="ridePreview" class="ride-preview"' in text
+    assert "workout_graph.js" in text
+    assert "window.profileSvg(data.profile, data.duration_s, data.ftp)" in text
+    assert "document.importNode(parsed.documentElement, true)" in text
+    assert 'className = "ride-preview-graph"' in text
+    assert 'className = "table-scroll"' in text
+
+    # Connected/zero-power leaves setup controls available; first positive
+    # telemetry frame locks them for the remainder of the active ride.
+    assert "var positivePowerSeen = false;" in text
+    assert "var controlsLocked = active && positivePowerSeen;" in text
+    assert "if (finiteNumber(st.power) != null && finiteNumber(st.power) > 0)" in text
+    assert "document.getElementById(\"rideTypeSelect\").disabled = controlsLocked;" in text
+    assert "document.getElementById(\"rideDurationSelect\").disabled = controlsLocked;" in text
+    assert "modeButtons().forEach(function (button) { button.disabled = controlsLocked; });" in text
+    assert "if (!active) {" in text
+    assert "positivePowerSeen = false;" in text
+    assert "document.getElementById(\"stopBtn\").disabled = !active;" in text
+    assert "document.getElementById(\"endWorkoutBtn\").disabled = !active;" in text
+    assert "function selectMode(mode)" in text
+    assert "button.setAttribute(\"aria-pressed\", button.dataset.rideMode === mode ? \"true\" : \"false\");" in text
+
+    # Each selection invalidates prior preview requests, including a mode
+    # switch back to Plan.
+    assert "var previewToken = 0;" in text
+    assert "var token = ++previewToken;" in text
+    assert "if (token !== previewToken || !justRide()) return;" in text
+    assert "var CONFIG_RECONNECT_DEBOUNCE_MS = 250;" in text
+    assert "function scheduleConfigReconnect()" in text
+    assert "if (positivePowerSeen || !ws || rideState === \"idle\") return;" in text
+    assert "if (!positivePowerSeen && ws && rideState !== \"idle\") openRide(false);" in text
+    assert "scheduleConfigReconnect();" in text
+    assert "window.clearTimeout(configReconnectTimer);" in text
+    assert "} else if (ws.readyState === WebSocket.CONNECTING) {" in text
+    assert "// The replacement is already in queuedOpen." in text
+    assert "queuedOpen = {sim: sim};" in text
+    assert text.index("if (ws.readyState === WebSocket.OPEN)") < text.index(
+        "} else if (ws.readyState === WebSocket.CONNECTING) {")
+    assert text.index("} else if (ws.readyState === WebSocket.CONNECTING) {") < text.index(
+        "} else if (ws.readyState === WebSocket.CLOSING) {")
+    assert text.index("} else if (ws.readyState === WebSocket.CLOSING) {") < text.index(
+        "} else if (ws.readyState === WebSocket.CLOSED) {")
+    assert "// onclose owns the handoff for a closing socket." in text
+    assert "var closedOpen = queuedOpen;" in text
+    assert "queuedOpen = null;\n                ws = null;" in text
+    assert "openRide(closedOpen.sim);" in text
+    assert text.index("} else if (ws.readyState === WebSocket.CLOSED) {") < text.index(
+        "} else {\n                cancelQueuedReconnect();")
 
 
 def test_ride_page_grows_chart_axis_past_the_prescribed_end(client, monkeypatch):
