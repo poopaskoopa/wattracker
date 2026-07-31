@@ -36,6 +36,18 @@ def _project_version() -> str:
 
 
 hidden = ["wattracker.server"] + collect_submodules("uvicorn")
+# scipy vendors array-api-compat, whose numpy shim pulls two of its own
+# submodules through a string-built __import__ so the package stays vendorable:
+#
+#     __import__(__package__ + ".linalg")
+#     __import__(__package__ + ".fft")
+#
+# PyInstaller's modulegraph is static, so it sees neither. linalg survives by
+# accident - a plain `from .linalg import ...` follows two lines later - and fft
+# has no such static twin, so it is the one module that goes missing. The build
+# still succeeds and the frozen app then dies on first import of scipy.optimize,
+# which server.py reaches via races -> metrics.curve. Collect the subpackage.
+hidden += collect_submodules("scipy._external.array_api_compat")
 # keyring resolves its backend at runtime, so nothing static imports the
 # platform vault module. Collecting every backend covers Windows Credential
 # Manager (keyring.backends.Windows) and the macOS Keychain
