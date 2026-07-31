@@ -12,9 +12,11 @@
 {% endif %}
 
 <section class="ride-setup">
-    <div class="ride-mode" role="group" aria-label="Ride mode">
-        <label><input type="radio" name="rideMode" value="plan" checked> Plan workout</label>
-        <label><input type="radio" name="rideMode" value="just"> Just ride</label>
+    <div class="ride-mode" role="radiogroup" aria-label="Ride mode">
+        <button type="button" class="ride-mode-button" data-ride-mode="plan"
+                aria-pressed="true" aria-controls="planMode">Plan workout</button>
+        <button type="button" class="ride-mode-button" data-ride-mode="just"
+                aria-pressed="false" aria-controls="justRideMode">Just ride</button>
     </div>
     <div id="planMode">
         <label>Workout:
@@ -28,15 +30,14 @@
             </select>
         </label>
     </div>
-    <div id="justRideMode" hidden>
-        <label>Type:
+    <div id="justRideMode" class="just-ride-layout" hidden>
+        <div class="just-ride-controls"><label>Type:
             <select id="rideTypeSelect">
                 {% for t in ride_types %}
                 <option value="{{ t.key }}">{{ t.label }} &mdash; {{ t.zone }}</option>
                 {% endfor %}
             </select>
-        </label>
-        <label>Duration:
+        </label><label>Duration:
             <select id="rideDurationSelect">
                 {% for m in ride_durations %}
                 <option value="{{ m }}" {{ 'selected' if m == 60 else '' }}>
@@ -45,7 +46,8 @@
                 </option>
                 {% endfor %}
             </select>
-        </label>
+        </label></div>
+        <div id="ridePreview" class="ride-preview" aria-live="polite" hidden></div>
     </div>
     <div class="toolbar">
         <button type="button" id="scanBtn" aria-busy="false" {{ '' if ble_available else 'disabled' }}>
@@ -75,7 +77,6 @@
 </section>
 
 <section class="ride-live">
-    <div id="ridePreview" class="ride-preview" aria-live="polite" hidden></div>
     <div id="workoutDetails" class="ride-workout" aria-live="polite">
         Select Connect selected sensors to load the workout.
     </div>
@@ -148,6 +149,7 @@
     </div>
 </section>
 
+<script src="{{ static_url('workout_graph.js') }}"></script>
 <script>
 (function () {
     var ws = null;
@@ -178,6 +180,12 @@
     var cuesPlayed = {};
     var chartMaxX = 0;
     var connectedAddresses = {};
+    // One shared level makes every cue audible without changing its timing,
+    // frequency, or existing exponential fade-out.
+    var CUE_GAIN = 0.12;
+    var positivePowerSeen = false;
+    var configReconnectTimer = null;
+    var CONFIG_RECONNECT_DEBOUNCE_MS = 250;
     // Roles that have connected at least once this page session. Never cleared:
     // a sensor that drops mid-ride has to go dark, not disappear.
     var seenRoles = {};
@@ -240,7 +248,7 @@
         var osc = ctx.createOscillator(), gain = ctx.createGain();
         var start = ctx.currentTime + delay;
         osc.frequency.value = frequency;
-        gain.gain.setValueAtTime(0.05, start);
+        gain.gain.setValueAtTime(CUE_GAIN, start);
         gain.gain.exponentialRampToValueAtTime(0.001, start + duration);
         osc.connect(gain); gain.connect(ctx.destination);
         osc.start(start); osc.stop(start + duration);
@@ -587,6 +595,13 @@
     function setRideState(state) {
         rideState = state;
         var active = state !== "idle";
+        if (!active) {
+            positivePowerSeen = false;
+            if (configReconnectTimer !== null) {
+                window.clearTimeout(configReconnectTimer);
+                configReconnectTimer = null;
+            }
+        }
         // The full-screen chart is a fixed overlay covering the whole page. If
         // the ride ends while it is up, the rider is left staring at a chart
         // that will never update again with no visible way back, so drop out of
@@ -598,10 +613,11 @@
         document.getElementById("scanBtn").disabled = active || !bleAvailable;
         document.getElementById("connectBtn").disabled =
             state === "connecting" || !bleAvailable;
-        document.getElementById("workoutSelect").disabled = active;
-        document.getElementById("rideTypeSelect").disabled = active;
-        document.getElementById("rideDurationSelect").disabled = active;
-        modeInputs().forEach(function (input) { input.disabled = active; });
+        var controlsLocked = active && positivePowerSeen;
+        document.getElementById("workoutSelect").disabled = controlsLocked;
+        document.getElementById("rideTypeSelect").disabled = controlsLocked;
+        document.getElementById("rideDurationSelect").disabled = controlsLocked;
+        modeButtons().forEach(function (button) { button.disabled = controlsLocked; });
     }
     function setButtonBusy(button, busy, busyText, idleText) {
         button.setAttribute("aria-busy", busy ? "true" : "false");
@@ -623,15 +639,25 @@
             window.clearTimeout(reconnectTimer);
             reconnectTimer = null;
         }
+        if (configReconnectTimer !== null) {
+            window.clearTimeout(configReconnectTimer);
+            configReconnectTimer = null;
+        }
         return cancelled;
     }
-    function modeInputs() {
+    function modeButtons() {
         return Array.prototype.slice.call(
-            document.querySelectorAll('input[name="rideMode"]'));
+            document.querySelectorAll("[data-ride-mode]"));
     }
     function justRide() {
-        var checked = document.querySelector('input[name="rideMode"]:checked');
-        return !!checked && checked.value === "just";
+        var selected = document.querySelector('[data-ride-mode][aria-pressed="true"]');
+        return !!selected && selected.dataset.rideMode === "just";
+    }
+    function selectMode(mode) {
+        modeButtons().forEach(function (button) {
+            button.setAttribute("aria-pressed", button.dataset.rideMode === mode ? "true" : "false");
+        });
+        applyMode();
     }
     function fmtClock(sec) {
         sec = Math.round(Number(sec) || 0);
@@ -680,6 +706,21 @@
                 " at FTP " + data.ftp + " W · ") +
             fmtClock(data.duration_s) + " · est. TSS " + data.estimated_tss;
         box.appendChild(meta);
+
+        // Parse the offline shared SVG helper into a node; retain the table
+        // below as a text alternative.
+        if (data.profile && data.profile.length && window.profileSvg) {
+            var graph = document.createElement("div");
+            graph.className = "ride-preview-graph";
+            var svgText = window.profileSvg(data.profile, data.duration_s, data.ftp);
+            if (svgText) {
+                var parsed = new DOMParser().parseFromString(svgText, "image/svg+xml");
+                if (parsed.documentElement && parsed.documentElement.nodeName.toLowerCase() === "svg") {
+                    graph.appendChild(document.importNode(parsed.documentElement, true));
+                    box.appendChild(graph);
+                }
+            }
+        }
 
         if (info.focus || info.structure) {
             var purpose = document.createElement("p");
@@ -783,8 +824,24 @@
         document.getElementById("justRideMode").hidden = !just;
         loadPreview();
         showSelectedWorkoutTitle();
+        scheduleConfigReconnect();
+    }
+    function scheduleConfigReconnect() {
+        if (positivePowerSeen || !ws || rideState === "idle") return;
+        if (configReconnectTimer !== null) window.clearTimeout(configReconnectTimer);
+        configReconnectTimer = window.setTimeout(function () {
+            configReconnectTimer = null;
+            if (!positivePowerSeen && ws && rideState !== "idle") openRide(false);
+        }, CONFIG_RECONNECT_DEBOUNCE_MS);
     }
     function render(st) {
+        if (finiteNumber(st.power) != null && finiteNumber(st.power) > 0) {
+            positivePowerSeen = true;
+            if (configReconnectTimer !== null) {
+                window.clearTimeout(configReconnectTimer);
+                configReconnectTimer = null;
+            }
+        }
         updateChartMetrics(st);
         document.getElementById("rStatus").textContent = statusText(st);
         // A maximal-effort block has no target - say so instead of showing the
@@ -836,6 +893,34 @@
                     reconnectCloseNotice = null;
                 } catch (sendError) {
                     cancelQueuedReconnect();
+                }
+            } else if (ws.readyState === WebSocket.CONNECTING) {
+                // The replacement is already in queuedOpen. Closing a socket
+                // that has not opened cannot accept stop, so retain the latest
+                // config and let onclose schedule its replacement.
+                reconnectCloseNotice = null;
+                try {
+                    ws.close();
+                } catch (closeError) {
+                    setRideState(previousState);
+                }
+            } else if (ws.readyState === WebSocket.CLOSING) {
+                // onclose owns the handoff for a closing socket. Keep the
+                // latest queued config until that callback consumes it.
+                reconnectCloseNotice = null;
+            } else if (ws.readyState === WebSocket.CLOSED) {
+                // CLOSED sockets have already emitted onclose, so there is no
+                // callback left to consume queuedOpen. Drop only the stale
+                // reference and hand off once; openRide reads the latest DOM.
+                reconnectCloseNotice = null;
+                var closedOpen = queuedOpen;
+                queuedOpen = null;
+                ws = null;
+                if (closedOpen) {
+                    reconnectTimer = window.setTimeout(function () {
+                        reconnectTimer = null;
+                        openRide(closedOpen.sim);
+                    }, 0);
                 }
             } else {
                 cancelQueuedReconnect();
@@ -1455,13 +1540,24 @@
         el.appendChild(wrap);
         return true;
     }
-    modeInputs().forEach(function (input) {
-        input.addEventListener("change", applyMode);
+    modeButtons().forEach(function (button) {
+        button.addEventListener("click", function () {
+            if (!this.disabled) selectMode(this.dataset.rideMode);
+        });
     });
-    document.getElementById("workoutSelect").addEventListener("change", showSelectedWorkoutTitle);
+    document.getElementById("workoutSelect").addEventListener("change", function () {
+        showSelectedWorkoutTitle();
+        scheduleConfigReconnect();
+    });
     showSelectedWorkoutTitle();
-    document.getElementById("rideTypeSelect").addEventListener("change", loadPreview);
-    document.getElementById("rideDurationSelect").addEventListener("change", loadPreview);
+    document.getElementById("rideTypeSelect").addEventListener("change", function () {
+        loadPreview();
+        scheduleConfigReconnect();
+    });
+    document.getElementById("rideDurationSelect").addEventListener("change", function () {
+        loadPreview();
+        scheduleConfigReconnect();
+    });
     document.getElementById("connectBtn").addEventListener("click", function () {
         if (this.getAttribute("aria-busy") === "true") return;
         primeAudio();
