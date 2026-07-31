@@ -1,13 +1,13 @@
 """Rides recorded twice (in-app + Zwift .fit) are linked and counted once."""
 import contextlib
 import datetime as dt
-import os
 import sqlite3
-import time
+from unittest import mock
+from zoneinfo import ZoneInfo
 
 import pytest
 
-from wattracker import db
+from wattracker import db, timeutil
 from wattracker.ble.runner import RideController
 from wattracker.ingest import importer
 from wattracker.prescribe.planner import Segment, Session
@@ -16,18 +16,27 @@ from wattracker.timeutil import utc_now as utcnow
 
 @contextlib.contextmanager
 def _timezone(name):
-    """Run a block under a fixed system timezone (restored afterwards)."""
-    previous = os.environ.get("TZ")
-    os.environ["TZ"] = name
-    time.tzset()
-    try:
+    """Run a block as though the machine's local timezone were *name*.
+
+    ``TZ`` + ``time.tzset()`` is the obvious way to do this and is what this
+    used to do, but ``tzset`` does not exist on Windows - so that version could
+    not run at all on the platform this app ships to, and every timezone test
+    here died in the fixture.
+
+    The only thing the migration consults is ``local_offset_seconds``, the one
+    call that asks "what is this machine's offset at this instant". Substitute
+    exactly that and nothing else: ``local_offset_ranges``' binary search for
+    DST boundaries, the CASE construction and the shift itself all still run
+    for real, against real tzdata. On POSIX the two approaches agree; this one
+    also works on Windows and says plainly what it is faking.
+    """
+    zone = ZoneInfo(name)
+
+    def _offset(value):
+        return int(value.replace(tzinfo=zone).utcoffset().total_seconds())
+
+    with mock.patch.object(timeutil, "local_offset_seconds", _offset):
         yield
-    finally:
-        if previous is None:
-            os.environ.pop("TZ", None)
-        else:
-            os.environ["TZ"] = previous
-        time.tzset()
 
 
 def _session(name="Endurance Negative Split", duration=20):
@@ -77,26 +86,34 @@ def _seed_real_pair(user_id):
 
 # --------------------------------------------------------------- write path
 def test_in_app_ride_is_stored_as_utc_with_a_utc_filename_date(user_id):
-    with _timezone("America/New_York"):
-        controller = RideController(
-            _session(), 200, user_id=user_id, start_grace_s=0, autosave=True
-        )
-        for _ in range(20):
-            controller.tick(power=150, dt=1)
-        for _ in range(3):  # spin-down: three still seconds end the cooldown
-            controller.tick(power=0, dt=1)
+    # No _timezone() here: the write path goes through timeutil.utc_now, which
+    # never consults the local offset, so faking that offset would prove
+    # nothing. What this has to show is that the stored value is UTC and not
+    # *some* local wall clock, so it is compared against an explicitly named
+    # zone's wall clock instead of the machine's. That is a fixed 4-5 hour gap
+    # on every platform, rather than a gap that depends on how the machine
+    # running the suite happens to be configured.
+    elsewhere = dt.datetime.now(ZoneInfo("America/New_York")).replace(tzinfo=None)
 
-        assert controller.status == "finished"
-        activity = db.list_activities(user_id)[0]
-        started = dt.datetime.fromisoformat(activity["start_time"])
-        utc_now = dt.datetime.now(dt.timezone.utc).replace(tzinfo=None)
-        assert abs((started - utc_now).total_seconds()) < 120
-        # ... and it is NOT the local wall clock (the old, skewed behavior).
-        assert abs((started - dt.datetime.now()).total_seconds()) > 3600
-        # The app is UTC end to end, so the filename carries the UTC date.
-        assert activity["filename"] == (
-            f"Ride {utc_now.date().isoformat()} Endurance Negative Split"
-        )
+    controller = RideController(
+        _session(), 200, user_id=user_id, start_grace_s=0, autosave=True
+    )
+    for _ in range(20):
+        controller.tick(power=150, dt=1)
+    for _ in range(3):  # spin-down: three still seconds end the cooldown
+        controller.tick(power=0, dt=1)
+
+    assert controller.status == "finished"
+    activity = db.list_activities(user_id)[0]
+    started = dt.datetime.fromisoformat(activity["start_time"])
+    utc_now = dt.datetime.now(dt.timezone.utc).replace(tzinfo=None)
+    assert abs((started - utc_now).total_seconds()) < 120
+    # ... and it is NOT a local wall clock (the old, skewed behavior).
+    assert abs((started - elsewhere).total_seconds()) > 3600
+    # The app is UTC end to end, so the filename carries the UTC date.
+    assert activity["filename"] == (
+        f"Ride {utc_now.date().isoformat()} Endurance Negative Split"
+    )
 
 
 def test_in_app_ride_links_to_an_already_imported_fit(monkeypatch, user_id):
