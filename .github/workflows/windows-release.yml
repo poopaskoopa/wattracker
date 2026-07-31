@@ -68,6 +68,17 @@ jobs:
         run: |
           & "packaging\smoke_frozen.ps1" -ExecutablePath "dist\wattracker\wattracker.exe"
 
+      # Serving the UI does not prove bleak's backend survived packaging: a
+      # build that lost it starts and serves every page identically, and only
+      # fails once someone tries to find a trainer. The runner has no radio, so
+      # this asserts availability (an `import bleak` check, independent of
+      # hardware) and that a scan does not fail with an import error. Add
+      # --require-device only where a trainer is actually powered on.
+      - name: Assert frozen application can still see Bluetooth
+        shell: pwsh
+        run: |
+          python "packaging\smoke_frozen_ble.py" "dist\wattracker\wattracker.exe"
+
       - name: Sign and verify every frozen binary
         shell: pwsh
         env:
