@@ -342,7 +342,11 @@ def test_no_javascript_toggles_a_class_that_has_no_style():
     A class toggled in JS with no CSS rule behind it is a silent no-op; the
     code reads as if it handles the case and nothing happens.
     """
-    css = pathlib.Path("wattracker/web/static/style.css").read_text()
+    # encoding is explicit because read_text() defaults to the platform's
+    # preferred encoding - cp1252 on Windows - and these assets are UTF-8. A
+    # single curly quote in a tooltip string was enough to fail this test on
+    # Windows with a UnicodeDecodeError, before it had read a single class name.
+    css = pathlib.Path("wattracker/web/static/style.css").read_text(encoding="utf-8")
     roots = [pathlib.Path("wattracker/web/templates"),
              pathlib.Path("wattracker/web/static")]
     missing = []
@@ -350,7 +354,7 @@ def test_no_javascript_toggles_a_class_that_has_no_style():
         for path in list(root.glob("*.html")) + list(root.glob("*.js")):
             for name in re.findall(
                 r"classList\.(?:add|toggle|remove)\(\s*[\"']([A-Za-z0-9_-]+)[\"']",
-                path.read_text(),
+                path.read_text(encoding="utf-8"),
             ):
                 if not re.search(r"\.%s\b" % re.escape(name), css):
                     missing.append(f"{path.name}: .{name}")
