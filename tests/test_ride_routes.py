@@ -1125,7 +1125,16 @@ def test_ride_ws_prepared_actions_toggle_erg_and_disconnect_one_device(
 
     monkeypatch.setattr(servermod.bledevices, "bluetooth_available", lambda: (True, "ok"))
     monkeypatch.setattr(servermod.bledevices, "connect_sensors", fake_connect)
-    monkeypatch.setattr(servermod, "RIDE_POLL_INTERVAL_S", 0)
+    # Not 0: this test drives the ride loop by sending actions into it, and a
+    # zero interval makes _ride_sleep(0) a bare yield with no wall-clock delay.
+    # The loop then spins through the whole 300-second inactivity budget - power
+    # is pinned at 0, so every iteration adds a simulated second for free - in
+    # the few milliseconds before the client's first action can be handed across
+    # the TestClient's thread boundary into the action queue. The server closes
+    # on the inactivity timeout before it ever sees an action. A real delay
+    # keeps that budget in wall-clock terms and the loop still runs fast enough
+    # for the test to be quick.
+    monkeypatch.setattr(servermod, "RIDE_POLL_INTERVAL_S", 0.01)
 
     with client.websocket_connect("/ride/ws?prepare=1") as ws:
         connected = _receive_after_workout(ws)
