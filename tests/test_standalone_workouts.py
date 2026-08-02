@@ -55,12 +55,13 @@ def _complete(user_id, key, rpe, compliance=.95, effective=220.0,
     return workout_id
 
 
-def _plan_workout(user_id, key="plan", kind="threshold", date=DATE):
+def _plan_workout(user_id, key="plan", kind="threshold", date=DATE,
+                  export_ftp=None):
     session = build_workout(kind, 60)
     plan_id = db.create_plan(user_id, key, date, 1)
     workout_id = db.add_plan_workout(
         plan_id, user_id, date, session.name, kind, session.total_duration(),
-        session.estimated_tss, zwo.zwo_string(session),
+        session.estimated_tss, zwo.zwo_string(session), export_ftp=export_ftp,
     )
     return workout_id, zwo.zwo_string(session)
 
@@ -186,6 +187,14 @@ def test_profile_matching_requires_date_user_and_target_similarity(user_id):
 
 
 def test_threshold_does_not_match_same_duration_endurance_profile(user_id):
+    """Structure separates these; neither average power nor scale can.
+
+    A right-sized threshold hour is mostly one long near-steady effort, so a
+    Zone 2 hour fits its shape at 0.92 compliance - over the gate - at a scale
+    of 151W against a 200W export, which is a wattage a genuine completion can
+    also legitimately land on. What gives it away is that the ride never dips
+    for the recoveries. See PROFILE_MIN_STRUCTURE_RATIO.
+    """
     workout_id, _ = _workout(user_id, key="threshold-vs-endurance")
     endurance = zwo.zwo_string(build_workout("endurance", 60))
     profile = importer._zwo_fraction_profile(endurance)
@@ -211,6 +220,26 @@ def test_slightly_noisy_genuine_threshold_profile_still_matches(user_id):
     stored = db.get_standalone_workout(user_id, workout_id)
     assert stored["completed_activity_id"] == activity_id
     assert stored["compliance"] >= importer.PROFILE_MIN_COMPLIANCE
+
+
+def test_genuine_completion_below_the_export_ftp_still_matches(user_id):
+    """The scale gate must not reject a rider whose FTP moved since export.
+
+    175W against a workout exported at 200W is a real completion by someone
+    whose trainer FTP is set 12% lower - it has to survive the same check that
+    rejects the 150W endurance ride.
+    """
+    workout_id, xml = _workout(user_id, key="lower-ftp")
+    target = importer._zwo_fraction_profile(xml)
+    activity_id = _activity(user_id, DATE, [fraction * 175 for fraction in target],
+                            suffix="lower-ftp")
+
+    assert importer.match_standalone_completions(
+        user_id, dt.datetime.fromisoformat(f"{DATE}T20:00:00")
+    ) == 1
+    stored = db.get_standalone_workout(user_id, workout_id)
+    assert stored["completed_activity_id"] == activity_id
+    assert stored["effective_ftp"] == pytest.approx(175, rel=.02)
 
 
 def test_scheduled_plan_wins_activity_conflict_and_keeps_profile_evidence(user_id):
@@ -461,3 +490,159 @@ def test_mixed_plan_standalone_batch_rolls_back_across_kinds(user_id):
     assert importer.save_workout_rpe(user_id, "plan", plan, 9, now)
     assert db.latest_ftp(user_id)["ftp_watts"] == 200.0
     assert not db.get_standalone_workout(user_id, standalone)["feedback_applied"]
+
+
+# ------------------------------------------------------------------ sweeps
+# These pin the boundary the profile matcher is actually asked to police: a
+# Zone 2 endurance hour must never be recorded as a completed hard session (its
+# fabricated effective_ftp would feed the RPE -> FTP loop), while a genuine
+# completion must survive across every wattage a real rider lands on. The
+# metric is scale-free, so a single wattage proves nothing - both sides are
+# swept. See PROFILE_MIN_STRUCTURE_RATIO in importer.py.
+
+# The three kinds that clear PROFILE_MIN_HARD_SECONDS, i.e. the only ones that
+# can mint an effective_ftp.
+_HARD_KINDS = ("threshold", "sweet_spot", "vo2max")
+
+
+def _prescription(kind, export_ftp=200.0, minutes=60):
+    session = build_workout(kind, minutes)
+    return {"zwo": zwo.zwo_string(session), "export_ftp": export_ftp}
+
+
+def _matches(workout, power):
+    """The accept/reject decision every call site makes, on one power stream."""
+    evidence = importer._profile_evidence({"streams": {"power": power}}, workout)
+    if evidence is None:
+        return False, 0.0
+    return evidence[0] >= importer.PROFILE_MIN_COMPLIANCE, evidence[0]
+
+
+def test_endurance_hours_never_match_a_structured_prescription():
+    """No flat Zone 2 hour from 150W to 400W may complete a hard session."""
+    z2_shape = importer._zwo_fraction_profile(
+        zwo.zwo_string(build_workout("endurance", 60))
+    )
+    matched = []
+    for kind in _HARD_KINDS:
+        workout = _prescription(kind)
+        for watts in range(150, 401, 5):
+            for label, power in (
+                ("flat", [float(watts)] * 3600),
+                # The harder look-alike: a real Zone 2 ride, with its own
+                # warmup ramp and cooldown, so it is not literally constant.
+                ("shaped", [f * watts for f in z2_shape]),
+            ):
+                ok, compliance = _matches(workout, power)
+                if ok:
+                    matched.append((kind, label, watts, round(compliance, 3)))
+    assert matched == []
+
+
+def test_genuine_completions_match_across_the_realistic_wattage_band():
+    """171W-260W realized against a 200W export, plus an imperfect ride."""
+    missed = []
+    for kind in _HARD_KINDS:
+        workout = _prescription(kind)
+        target = importer._zwo_fraction_profile(workout["zwo"])
+        for watts in range(171, 261):
+            ok, compliance = _matches(workout, [f * watts for f in target])
+            if not ok:
+                missed.append((kind, watts, round(compliance, 3)))
+        # Imperfect completions: second-by-second jitter, a mid-ride pause, and
+        # a rider who skipped the warmup ramp and rode straight into the work.
+        imperfect = {
+            "jitter": [f * 205 * (1.09 if s % 2 else 0.91)
+                       for s, f in enumerate(target)],
+            # A two-minute dead stop. Longer stops are rejected on compliance,
+            # which predates the structure check and is a separate judgement.
+            "paused": ([f * 205 for f in target[:1800]] + [0.0] * 120
+                       + [f * 205 for f in target[1800:]]),
+            "no_warmup": [max(f, 0.85) * 205 if s < 600 else f * 205
+                          for s, f in enumerate(target)],
+        }
+        for label, power in imperfect.items():
+            ok, compliance = _matches(workout, power)
+            if not ok:
+                missed.append((kind, label, round(compliance, 3)))
+    assert missed == []
+
+
+def test_endurance_prescription_still_accepts_a_steady_ride(user_id):
+    """A near-flat prescription has no structure to demand of the rider."""
+    workout_id, _ = _workout(user_id, key="steady-z2", kind="endurance")
+    activity_id = _activity(user_id, DATE, [145.0] * 3600, suffix="steady-z2")
+
+    assert importer.match_standalone_completions(
+        user_id, dt.datetime.fromisoformat(f"{DATE}T20:00:00")
+    ) == 1
+    stored = db.get_standalone_workout(user_id, workout_id)
+    assert stored["completed_activity_id"] == activity_id
+    # No block at >= 85% FTP, so no FTP evidence is minted from it.
+    assert stored["effective_ftp"] is None
+
+
+# ------------------------------------------------- plan-workout export FTP
+
+def test_plan_completion_matches_with_and_without_stored_export_ftp(user_id):
+    """Plan rows now carry the FTP they were generated at; legacy rows are NULL.
+
+    Both must still complete end-to-end - the new column is a sanity rail on
+    the fitted wattage, not a new requirement.
+    """
+    now = dt.datetime.fromisoformat(f"{DATE}T20:00:00")
+    for suffix, export_ftp in (("with-ftp", 200.0), ("legacy", None)):
+        uid = db.create_user(f"rider-{suffix}", auth.hash_password("password123"))
+        workout_id, xml = _plan_workout(uid, key=suffix, export_ftp=export_ftp)
+        assert db.get_plan_workout(uid, workout_id)["export_ftp"] == export_ftp
+        target = importer._zwo_fraction_profile(xml)
+        activity_id = _activity(uid, DATE, [f * 205 for f in target],
+                                suffix=suffix)
+
+        assert importer.match_plan_completions(uid, now) == 1
+        stored = db.get_plan_workout(uid, workout_id)
+        assert stored["completed_activity_id"] == activity_id
+        assert stored["effective_ftp"] == pytest.approx(205, rel=.02)
+
+
+def test_stored_export_ftp_rejects_an_implausible_plan_wattage(user_id):
+    """The rail only bites once the column is populated (legacy rows keep NULL)."""
+    now = dt.datetime.fromisoformat(f"{DATE}T20:00:00")
+    workout_id, xml = _plan_workout(user_id, key="rail", export_ftp=200.0)
+    target = importer._zwo_fraction_profile(xml)
+    # 400W against a 200W export is twice the prescription: the shape fits, the
+    # wattage cannot be a completion of this workout.
+    _activity(user_id, DATE, [f * 400 for f in target], suffix="rail")
+
+    assert importer.match_plan_completions(user_id, now) == 0
+    assert db.get_plan_workout(user_id, workout_id)["completed_activity_id"] is None
+
+
+def test_v26_migration_adds_plan_export_ftp_without_losing_rows(tmp_path):
+    path = str(tmp_path / "v26.db")
+    db.init_db(path)
+    uid = db.create_user("kept", "hash", path)
+    plan_id = db.create_plan(uid, "Base", DATE, 1, path=path)
+    workout_id = db.add_plan_workout(
+        plan_id, uid, DATE, "Threshold", "threshold", 3600, 65.0, "<x/>",
+        export_ftp=210.0, path=path,
+    )
+    conn = sqlite3.connect(path)
+    conn.execute("ALTER TABLE plan_workouts DROP COLUMN export_ftp")
+    conn.execute("PRAGMA user_version = 26")
+    conn.commit()
+    conn.close()
+
+    db.init_db(path)
+
+    conn = sqlite3.connect(path)
+    assert conn.execute("PRAGMA user_version").fetchone()[0] == db.SCHEMA_VERSION
+    assert "export_ftp" in {
+        row[1] for row in conn.execute("PRAGMA table_info(plan_workouts)")
+    }
+    conn.close()
+    # The row survived, and a pre-existing workout keeps the loose fallback
+    # rather than being retro-rejected against a guessed FTP.
+    stored = db.get_plan_workout(uid, workout_id, path=path)
+    assert stored["name"] == "Threshold"
+    assert stored["export_ftp"] is None

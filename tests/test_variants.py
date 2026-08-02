@@ -47,13 +47,19 @@ def test_variant_none_matches_classic_byte_for_byte(kind, minutes):
 
 def test_classic_golden_segments_unchanged():
     """Pin classic segment lists so a regression in a builder is caught."""
+    # 5 x 4min, with recoveries only BETWEEN the reps: the repeated block holds
+    # four of them and the fifth is its own steadystate, so the session no
+    # longer ends on a recovery that runs straight into the cooldown. The
+    # 240s the dropped recovery used to occupy come back as Zone 2 base.
     vo2 = build_workout("vo2max", 60, "classic")
     assert [(s.kind, s.duration) for s in vo2.segments] == [
-        ("warmup", 600), ("intervals", 2400), ("cooldown", 600)
+        ("warmup", 600), ("steadystate", 240), ("intervals", 1920),
+        ("steadystate", 240), ("cooldown", 600)
     ]
-    iv = vo2.segments[1]
+    iv = vo2.segments[2]
     assert (iv.repeat, iv.on_duration, iv.off_duration, iv.on_power, iv.off_power) \
-        == (5, 240, 240, 1.12, 0.50)
+        == (4, 240, 240, 1.12, 0.50)
+    assert (vo2.segments[3].power, vo2.segments[3].duration) == (1.12, 240)
 
     z2 = build_workout("endurance", 90, "classic")
     assert [(s.kind, s.duration) for s in z2.segments] == [

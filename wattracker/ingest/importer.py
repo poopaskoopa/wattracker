@@ -46,6 +46,91 @@ DUPLICATE_POWER_TOLERANCE = 0.15
 STANDALONE_DURATION_TOLERANCE = 0.20
 PROFILE_MIN_COMPLIANCE = 0.90
 PROFILE_MIN_HARD_SECONDS = 180
+# How far the fitted power scale may sit from the FTP the workout was exported
+# at before the ride stops being a plausible completion of it. This is a
+# plausibility rail, NOT the thing that separates a real completion from a
+# look-alike: the fit has a free scale factor, so the false-positive band and
+# the genuine band overlap almost exactly (both run from ~0.86x to 1.30x of the
+# export FTP). Structure does the separating - see PROFILE_MIN_STRUCTURE_RATIO.
+# Kept wide on purpose so a rider whose trainer/Zwift FTP is set well away from
+# the estimate we exported at is never rejected on wattage alone.
+PROFILE_SCALE_MIN_FRACTION = 0.60
+PROFILE_SCALE_MAX_FRACTION = 1.40
+# Shape compliance is scale-free and is a plain mean-absolute-error, so it only
+# ever asks "was the rider roughly the right average multiple of the target?".
+# A right-sized threshold hour is mostly one long near-steady block, so a Zone 2
+# endurance hour scores 0.92 against it (the target's own mean deviation from
+# its median is only ~0.08 FTP, so "nowhere near the recoveries" is a small
+# error) and is silently recorded as a completed threshold session, feeding a
+# fabricated effective_ftp into the RPE feedback loop.
+#
+# So compliance is paired with a structure check: the ride has to show that it
+# went hard where the prescription asked for work and easy where it asked for
+# recovery. That is the WORK/RECOVERY CONTRAST below.
+#
+# The obvious cheaper check - "does the ride vary as much as the prescription?",
+# i.e. a whole-session dispersion ratio - does not survive short sessions. At 30
+# minutes a third of the prescription is its 600 s warmup ramp, so the
+# prescription's own dispersion is dominated by the ramp, and any ride with a
+# normal warmup and cooldown reproduces that dispersion without ever doing an
+# interval: measured look-alike ceilings of 0.81 at 30 min and 0.75 at 45 min
+# against a genuine floor of 0.87, i.e. no usable gap. Whatever single constant
+# is chosen, the warmup's share of total dispersion is duration-dependent, so
+# the check cannot be made duration-robust by retuning it. Dispersion is kept
+# only as the fallback for prescriptions with no identifiable work block (see
+# _work_recovery_masks).
+PROFILE_SMOOTH_WINDOW_S = 60
+# Below this the prescription is itself near-flat (Zone 2 endurance, recovery)
+# and has no structure to demand; the check stands down rather than rejecting a
+# legitimately steady ride. Structured kinds sit far above it: threshold and
+# sweet spot ~0.15, VO2max ~0.25, tempo ~0.12, versus endurance <=0.09.
+PROFILE_STRUCTURED_DISPERSION = 0.10
+# Fallback dispersion ratio, used only when no work block can be identified.
+PROFILE_MIN_STRUCTURE_RATIO = 0.75
+
+# ------------------------------------------------ work/recovery contrast
+# The prescription's work seconds and its recovery seconds are known, so ask
+# the ride the one question that actually separates the sessions: was the rider
+# meaningfully harder during the prescribed work than during the prescribed
+# recoveries, by as large a factor as was prescribed?
+#
+#   contrast = mean(ride over prescribed work seconds)
+#              / mean(ride over prescribed recovery seconds)
+#   ratio    = ride contrast / prescription contrast
+#
+# It is scale-free (a pure ratio), it never looks at the warmup or the cooldown
+# (both fall outside the work span), and it is duration-robust because it
+# compares like with like rather than integrating over the whole session. Any
+# steady ride - flat, warmup+steady+cooldown, undulating, negative-split, or
+# Zone 2 with surges - has roughly the same mean in both windows and lands near
+# 1/prescribed_contrast, far below a real session.
+#
+# Measured over durations {30,45,60,75,90,120} x {threshold, sweet_spot,
+# vo2max} x every variant x export FTP {150,200,250,300}, on rides that already
+# pass the scale rail and the 0.90 compliance gate (11.8k look-alikes, 51.3k
+# genuine completions):
+#   look-alike ceiling  0.658 0.649 0.642 0.609 0.633 0.644
+#   genuine floor       0.755 0.766 0.805 0.802 0.802 0.802
+# 0.70 sits in that gap at every duration. The genuine floor is the pathology
+# (a rider who abandoned the last interval, or a 2-minute stop recorded as a
+# gap); ERG-perfect, lagged, jittery and paused rides sit at 0.9-1.1.
+PROFILE_MIN_CONTRAST_RATIO = 0.70
+# A power level must hold for this long to count as "the work" - short enough
+# to catch 30/30s VO2max blocks, long enough that a warmup ramp passing through
+# a level is never mistaken for one.
+PROFILE_WORK_LEVEL_SECONDS = 240
+# Both windows need this much time before the contrast means anything.
+PROFILE_CONTRAST_MIN_SECONDS = 120
+# The leading transition of every block is dropped (capped at a third of the
+# block) so a trainer that takes time to settle is not read as non-compliance.
+# 60 s covers ERG transitions out to tau = 60 s.
+PROFILE_CONTRAST_ERODE_S = 60
+# The ride is aligned by stretching it onto workout progress, so a pause or a
+# dropout shifts it against the prescription. The best contrast within this
+# much slack is taken; a look-alike gains nothing from shifting, having no
+# blocks to line up.
+PROFILE_CONTRAST_SHIFT_S = 120
+PROFILE_CONTRAST_SHIFT_STEP_S = 15
 FTP_FEEDBACK_WINDOW_DAYS = 28
 FTP_FEEDBACK_MIN_WORKOUTS = 2
 FTP_FEEDBACK_MAX_STEP = 0.05
@@ -560,6 +645,114 @@ def _zwo_fraction_profile(zwo_str: str) -> List[float]:
     return out
 
 
+def _smoothed(values: np.ndarray, window: int = PROFILE_SMOOTH_WINDOW_S) -> np.ndarray:
+    """Boxcar-smoothed copy, edges dropped so no artificial flattening creeps in."""
+    if values.size <= window:
+        return values
+    return np.convolve(values, np.ones(window) / window, mode="valid")
+
+
+def _erode_blocks(mask: np.ndarray, seconds: int) -> np.ndarray:
+    """Drop the leading transition of every contiguous run in `mask`.
+
+    Capped at a third of the run so short blocks (30/30s VO2max) survive.
+    """
+    out = mask.copy()
+    idx = np.flatnonzero(mask)
+    if idx.size == 0:
+        return out
+    breaks = np.flatnonzero(np.diff(idx) > 1)
+    starts = [idx[0]] + [idx[i + 1] for i in breaks]
+    ends = [idx[i] for i in breaks] + [idx[-1]]
+    for start, end in zip(starts, ends):
+        out[start:start + min(seconds, (end - start + 1) // 3)] = False
+    return out
+
+
+def _work_level(target: np.ndarray) -> Optional[float]:
+    """The power level of the prescription's main work block, or None.
+
+    The highest level the prescription holds for PROFILE_WORK_LEVEL_SECONDS.
+    "Highest sustained" rather than "maximum" so a handful of sprint or surge
+    seconds never becomes the definition of the work.
+    """
+    levels, seconds = np.unique(np.round(target, 2), return_counts=True)
+    sustained = levels[(seconds >= PROFILE_WORK_LEVEL_SECONDS) & (levels >= 0.60)]
+    return float(sustained.max()) if sustained.size else None
+
+
+def _work_recovery_masks(target: np.ndarray) -> Optional[tuple]:
+    """Second masks for the prescribed work and the prescribed recoveries.
+
+    Both are confined to the work span - from the first work second to the
+    last - so the warmup ramp and the cooldown are excluded from the contrast
+    entirely. Returns None when the prescription has no identifiable work block
+    or too little of either window to compare.
+    """
+    level = _work_level(target)
+    if level is None:
+        return None
+    work_floor = 0.95 * level
+    hot = np.flatnonzero(target >= work_floor)
+    if hot.size == 0:
+        return None
+    span = np.zeros(target.size, dtype=bool)
+    span[hot[0]:hot[-1] + 1] = True
+    work = _erode_blocks(span & (target >= work_floor), PROFILE_CONTRAST_ERODE_S)
+    easy = _erode_blocks(span & (target <= 0.80 * work_floor),
+                         PROFILE_CONTRAST_ERODE_S)
+    if (work.sum() < PROFILE_CONTRAST_MIN_SECONDS
+            or easy.sum() < PROFILE_CONTRAST_MIN_SECONDS):
+        return None
+    return work, easy
+
+
+def _contrast(curve: np.ndarray, work: np.ndarray,
+              easy: np.ndarray) -> Optional[float]:
+    """How much harder `curve` is over the work seconds than the easy ones."""
+    recovery = float(curve[easy].mean())
+    if recovery <= 1e-6:
+        return None
+    return float(curve[work].mean()) / recovery
+
+
+def _best_contrast(curve: np.ndarray, work: np.ndarray,
+                   easy: np.ndarray) -> Optional[float]:
+    """Best contrast over PROFILE_CONTRAST_SHIFT_S of alignment slack."""
+    best = None
+    for shift in range(-PROFILE_CONTRAST_SHIFT_S, PROFILE_CONTRAST_SHIFT_S + 1,
+                       PROFILE_CONTRAST_SHIFT_STEP_S):
+        value = _contrast(np.roll(curve, -shift), work, easy)
+        if value is not None and (best is None or value > best):
+            best = value
+    return best
+
+
+def _structure_ok(aligned_fractions: np.ndarray, target: np.ndarray) -> bool:
+    """Whether the ride did the session that was prescribed, not just its average.
+
+    Both curves are in FTP fractions (the activity divided by its fitted scale)
+    and share a length, so they are directly comparable. See
+    PROFILE_MIN_CONTRAST_RATIO for why contrast rather than dispersion.
+    """
+    prescribed_spread = float(_smoothed(target).std())
+    if prescribed_spread < PROFILE_STRUCTURED_DISPERSION:
+        return True  # a near-flat prescription demands no structure
+    masks = _work_recovery_masks(target)
+    if masks is None:
+        # No identifiable work block: fall back to comparing dispersion.
+        realized = float(_smoothed(aligned_fractions).std())
+        return realized >= PROFILE_MIN_STRUCTURE_RATIO * prescribed_spread
+    work, easy = masks
+    prescribed = _contrast(target, work, easy)
+    realized = _best_contrast(aligned_fractions, work, easy)
+    if prescribed is None or prescribed <= 0:
+        return True
+    if realized is None:
+        return False
+    return realized >= PROFILE_MIN_CONTRAST_RATIO * prescribed
+
+
 def _profile_evidence(activity: dict, workout: dict) -> Optional[tuple]:
     """Return profile match quality and FTP evidence when both streams exist."""
     target = np.asarray(_zwo_fraction_profile(
@@ -583,9 +776,15 @@ def _profile_evidence(activity: dict, workout: dict) -> Optional[tuple]:
     export_ftp = float(workout.get("export_ftp") or 0)
     if scale <= 0:
         return (0.0, None)
-    if export_ftp and not 0.60 * export_ftp <= scale <= 1.40 * export_ftp:
+    if export_ftp and not (
+        PROFILE_SCALE_MIN_FRACTION * export_ftp
+        <= scale
+        <= PROFILE_SCALE_MAX_FRACTION * export_ftp
+    ):
         return (0.0, None)
     if not export_ftp and not 50.0 <= scale <= 600.0:
+        return (0.0, None)
+    if not _structure_ok(aligned / scale, target):
         return (0.0, None)
     expected = target[eligible] * scale
     mae = float(np.mean(np.abs(aligned[eligible] - expected) / scale))
