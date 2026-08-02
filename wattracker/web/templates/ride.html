@@ -1,7 +1,7 @@
 {% extends "base.html" %}
 {% block title %}Ride &mdash; wattracker{% endblock %}
 {% block content %}
-<h2>Ride</h2>
+<h2 class="page-title ride-page-title">Ride</h2>
 
 {% if ble_available %}
 <p class="ok">Bluetooth available. Scan for your power meter, trainer, and HR strap.</p>
@@ -11,7 +11,8 @@
    You can still preview the live screen with <strong>Simulate</strong>.</p>
 {% endif %}
 
-<section class="ride-setup">
+<section class="ride-setup" aria-labelledby="rideSetupTitle">
+    <div class="section-kicker" id="rideSetupTitle">Ride setup</div>
     <div class="ride-mode" role="radiogroup" aria-label="Ride mode">
         <button type="button" class="ride-mode-button" data-ride-mode="plan"
                 aria-pressed="true" aria-controls="planMode">Plan workout</button>
@@ -49,7 +50,7 @@
         </label></div>
         <div id="ridePreview" class="ride-preview" aria-live="polite" hidden></div>
     </div>
-    <div class="toolbar">
+    <div class="toolbar ride-setup-actions">
         <button type="button" id="scanBtn" aria-busy="false" {{ '' if ble_available else 'disabled' }}>
             <span class="spinner button-spinner" aria-hidden="true" hidden></span>
             <span class="button-label">Scan devices</span>
@@ -76,7 +77,8 @@
     <p id="connectionStatus" class="hint" role="status" aria-live="polite"></p>
 </section>
 
-<section class="ride-live">
+<section class="ride-live" aria-labelledby="rideLiveTitle">
+    <div class="section-kicker" id="rideLiveTitle">Live ride</div>
     <div id="workoutDetails" class="ride-workout" aria-live="polite">
         Select Connect selected sensors to load the workout.
     </div>

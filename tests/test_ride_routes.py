@@ -540,15 +540,20 @@ def test_ride_chart_styles_support_live_metrics_and_fullscreen(client):
     assert "text-transform: uppercase; opacity: 0.62;" in r.text
     assert ".ride-chart-erg.erg-lit .erg-led" in r.text
     # Fullscreen sizing follows the available panel space, including short
-    # viewports, instead of subtracting a fixed heading height from 100vh.
+    # viewports, instead of subtracting a fixed heading height from 100vh, and
+    # the flex column keeps the chart from being clipped below the fold.
     assert "height: clamp(260px, 28vw, 400px)" in r.text
+    assert "display: flex; flex-direction: column; overflow: hidden;" in r.text
     assert "width: 100%; height: 100%; min-height: 0; max-width: none;" in r.text
     assert "flex: 1 1 auto; height: auto; min-height: 0;" in r.text
     assert "@media (max-height: 520px)" in r.text
     assert "top: 68%; gap: 0.35rem; width: fit-content; max-width: 98%;" in r.text
     assert "font-size: clamp(16px, 7vh, 42px);" in r.text
+    assert "font-size: clamp(18px, 5vh, 32px);" in r.text
     assert ".ride-chart-clocks { gap: 0.2rem; padding: 0.2rem 0.3rem; max-width: 98%; }" in r.text
     assert ".ride-chart-clocks strong { font-size: clamp(12px, 5vw, 28px); }" in r.text
+    assert ".ride-chart-heading { align-items: flex-start; flex-wrap: wrap; }" in r.text
+    assert ".ride-chart-actions button { flex: 1 1 0; min-width: 0; white-space: normal; line-height: 1.2; }" in r.text
     assert "height: calc(100vh - 5.5rem)" not in r.text
 
 
