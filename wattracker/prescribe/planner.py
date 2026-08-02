@@ -295,6 +295,39 @@ class Session:
         }
 
 
+def _interval_block(reps: int, on_duration: int, off_duration: int,
+                    on_power: float, off_power: float,
+                    text: Optional[str] = None) -> List[Segment]:
+    """``reps`` work efforts with recoveries BETWEEN them and none after the last.
+
+    A plain ``intervals`` segment always emits a trailing recovery, so every
+    interval session used to end "5min at 55% FTP" immediately followed by the
+    cooldown ``_finish`` appends - two easy blocks back to back, the first of
+    them recovering into the second. The final rep is therefore emitted as its
+    own ``steadystate`` segment and the last recovery is simply not prescribed;
+    the seconds it used to occupy are returned to the cooldown (and from there
+    to a Zone 2 base by ``absorb_long_cooldown``) rather than lost.
+
+    Total work time is ``reps * on + (reps - 1) * off``. With ``reps <= 1``
+    there is nothing to repeat, so only the single effort is emitted.
+    """
+    segments: List[Segment] = []
+    if reps > 1:
+        segments.append(
+            Segment(kind="intervals",
+                    duration=(reps - 1) * (on_duration + off_duration),
+                    repeat=reps - 1,
+                    on_duration=on_duration, off_duration=off_duration,
+                    on_power=on_power, off_power=off_power,
+                    text=text)
+        )
+    segments.append(
+        Segment(kind="steadystate", duration=on_duration, power=on_power,
+                text=text)
+    )
+    return segments
+
+
 def _finish(session: Session, total_s: int, cooldown_low: float = 0.50,
             cooldown_high: float = 0.55) -> Session:
     """Append a cooldown that absorbs the remainder so segments sum to total_s."""
@@ -385,11 +418,9 @@ def _vo2max(total_s: int,
         Segment(kind="warmup", duration=warmup, power_low=0.50, power_high=0.85,
                 text="Progressive warmup with a couple of openers.")
     )
-    s.segments.append(
-        Segment(kind="intervals", duration=work, repeat=reps,
-                on_duration=on, off_duration=off,
-                on_power=on_power, off_power=0.50,
-                text=f"4min hard, 4min easy. Hold {band}.")
+    s.segments.extend(
+        _interval_block(reps, on, off, on_power, 0.50,
+                        text=f"4min hard, 4min easy. Hold {band}.")
     )
     return _finish(s, total_s)
 
@@ -417,45 +448,65 @@ def _sweet_spot(total_s: int,
         Segment(kind="warmup", duration=warmup, power_low=0.50, power_high=0.80,
                 text="Warm up progressively.")
     )
-    s.segments.append(
-        Segment(kind="intervals", duration=work, repeat=reps,
-                on_duration=on, off_duration=off,
-                on_power=0.90, off_power=0.55,
-                text="Sweet spot: steady and controlled at ~90% FTP.")
+    s.segments.extend(
+        _interval_block(reps, on, off, 0.90, 0.55,
+                        text="Sweet spot: steady and controlled at ~90% FTP.")
     )
     return _finish(s, total_s)
 
 
 def _threshold(total_s: int,
                profile: Optional["RiderMetrics"] = None) -> Session:
-    """Threshold intervals at 91-95% FTP (3 x 12-15min)."""
+    """Threshold intervals at 91-95% FTP (3 x 12-13min).
+
+    A 60-minute threshold session is 35-45 minutes of time in zone (2x20, 3x15,
+    3x12, 4x10 are the standard shapes). The fitting order below is what
+    delivers that: ``on`` is shortened FIRST, down to a 10-minute floor, and
+    reps are only dropped when even the shortest useful interval will not fit.
+    Dropping reps first - the previous behaviour - collapsed an hour to 2x13min
+    = 26 minutes in zone, a sweet-spot dose wearing a threshold label.
+    """
     warmup = 600
-    on = 780  # 13 min
-    off = 300
+    on_cap = 780    # 13 min
+    on = on_cap
+    off = 240       # 1 work : 3 rest; longer recoveries let VO2 decay
     reps = 3
-    work = reps * (on + off)
-    while warmup + work + 120 > total_s and reps > 2:
-        reps -= 1
-        work = reps * (on + off)
-    while warmup + work + 120 > total_s and on > 300:
+    cooldown_min = 300
+
+    def used(on_value: Optional[int] = None) -> int:
+        # No recovery after the final rep (see ``_interval_block``).
+        length = on if on_value is None else on_value
+        return warmup + reps * length + (reps - 1) * off
+
+    while used() + cooldown_min > total_s and on > 600:
         on -= 60
-        work = reps * (on + off)
-    if warmup + work + 120 > total_s and warmup > 300:
+    if used() + cooldown_min > total_s:
+        reps = 2
+        while used() + cooldown_min > total_s and on > 300:
+            on -= 60
+    if used() + cooldown_min > total_s and warmup > 300:
         warmup = 300
+    # The shrink loops only ever go down, so whatever short ``on`` forced the
+    # drop to 2 reps was kept even though two reps leave room for far more: a
+    # 45min session settled on 2x10min (20min in zone) when 2x13min fits inside
+    # the same warmup and cooldown. Now that the rep count is final, grow ``on``
+    # back toward its cap for as long as the session still fits.
+    while on < on_cap and used(on + 60) + cooldown_min <= total_s:
+        on += 60
+    work_min = (reps * on) // 60
     s = Session(
         name="Threshold Intervals",
-        description=f"{reps} x {on // 60}min at 91-95% FTP.",
+        description=(f"{reps} x {on // 60}min at 91-95% FTP - "
+                     f"{work_min}min at threshold."),
         workout_type="threshold",
     )
     s.segments.append(
         Segment(kind="warmup", duration=warmup, power_low=0.50, power_high=0.85,
                 text="Warm up to threshold effort.")
     )
-    s.segments.append(
-        Segment(kind="intervals", duration=work, repeat=reps,
-                on_duration=on, off_duration=off,
-                on_power=0.93, off_power=0.55,
-                text="Threshold: sustained at 91-95% FTP.")
+    s.segments.extend(
+        _interval_block(reps, on, off, 0.93, 0.55,
+                        text="Threshold: sustained at 91-95% FTP.")
     )
     return _finish(s, total_s)
 
@@ -697,11 +748,9 @@ def _vo2max_long_intervals(total_s: int,
         Segment(kind="warmup", duration=warmup, power_low=0.50, power_high=0.85,
                 text="Progressive warmup with a couple of openers.")
     )
-    s.segments.append(
-        Segment(kind="intervals", duration=work, repeat=reps,
-                on_duration=on, off_duration=off,
-                on_power=on_power, off_power=0.52,
-                text=f"5min hard, 4min easy. Hold ~{pct} FTP.")
+    s.segments.extend(
+        _interval_block(reps, on, off, on_power, 0.52,
+                        text=f"5min hard, 4min easy. Hold ~{pct} FTP.")
     )
     return _finish(s, total_s)
 
@@ -753,34 +802,35 @@ def _threshold_two_by_twenty(total_s: int,
                              profile: Optional["RiderMetrics"] = None) -> Session:
     """Threshold long intervals: 2 long sustained blocks at 91% FTP.
 
-    Interval length scales with duration (keeping ~43% of time as work, like
-    the classic builder) so IF/TSS stay comparable across durations.
+    Interval length scales with duration so IF/TSS stay comparable across
+    durations. The work fraction is 62% of ride time, not the 43% this used to
+    take: at 43% an hour bought 2x13min = 26min in zone, well under the 35-45min
+    a threshold session is supposed to deliver. At 62% an hour is 2x19min.
     """
     warmup = 600
-    reps, off = 2, 300
-    # ~43% of ride time as work power, split across 2 reps, 60s-quantized.
-    on = int(round(0.43 * total_s / reps / 60.0)) * 60
+    reps, off = 2, 240
+    # ~62% of ride time as work power, split across 2 reps, 60s-quantized.
+    on = int(round(0.62 * total_s / reps / 60.0)) * 60
     on = max(600, min(1200, on))
-    work = reps * (on + off)
+    work = reps * on + (reps - 1) * off
     while warmup + work + 120 > total_s and on > 300:
         on -= 60
-        work = reps * (on + off)
+        work = reps * on + (reps - 1) * off
     while warmup + work + 60 > total_s and warmup > 180:
         warmup -= 60
     s = Session(
         name="Threshold Long Intervals",
-        description=f"2 x {on // 60}min at 91% FTP - long sustained blocks.",
+        description=(f"2 x {on // 60}min at 91% FTP - long sustained blocks, "
+                     f"{(reps * on) // 60}min at threshold."),
         workout_type="threshold",
     )
     s.segments.append(
         Segment(kind="warmup", duration=warmup, power_low=0.50, power_high=0.85,
                 text="Warm up to threshold effort.")
     )
-    s.segments.append(
-        Segment(kind="intervals", duration=work, repeat=reps,
-                on_duration=on, off_duration=off,
-                on_power=0.91, off_power=0.55,
-                text="Long threshold block - steady at 91% FTP.")
+    s.segments.extend(
+        _interval_block(reps, on, off, 0.91, 0.55,
+                        text="Long threshold block - steady at 91% FTP.")
     )
     return _finish(s, total_s)
 
@@ -849,11 +899,9 @@ def _sweet_spot_long_blocks(total_s: int,
         Segment(kind="warmup", duration=warmup, power_low=0.50, power_high=0.80,
                 text="Warm up progressively.")
     )
-    s.segments.append(
-        Segment(kind="intervals", duration=work, repeat=reps,
-                on_duration=on, off_duration=off,
-                on_power=0.88, off_power=0.55,
-                text="Sweet spot: long, steady and controlled at ~88% FTP.")
+    s.segments.extend(
+        _interval_block(reps, on, off, 0.88, 0.55,
+                        text="Sweet spot: long, steady and controlled at ~88% FTP.")
     )
     return _finish(s, total_s)
 

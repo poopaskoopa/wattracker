@@ -185,7 +185,12 @@ def test_vo2max_builds_at_thirty_minutes():
     assert s.total_duration() == 1800
     interval = next(seg for seg in s.segments if seg.kind == "intervals")
     assert interval.on_power == 1.12
-    assert interval.repeat >= 3
+    # The final rep is emitted separately (no recovery after it), so the
+    # repeated block carries reps-1 and the rider still gets >= 3 efforts.
+    final = next(seg for seg in s.segments
+                 if seg.kind == "steadystate" and seg.power == 1.12)
+    assert interval.repeat + 1 >= 3
+    assert final.duration == interval.on_duration
 
 
 def test_vo2max_short_durations_all_build():
@@ -293,7 +298,8 @@ def test_absorb_long_cooldown_preserves_duration_and_recomputes_tss():
     # The reclaimed time became a Zone 2 base right after the warmup.
     base = s.segments[1]
     assert base.kind == "steadystate" and base.power == 0.68
-    assert base.duration == 14400 - 600 - 3060 - 600
+    # 3 x 12min work with only 2 recoveries: 3*720 + 2*300 = 2760.
+    assert base.duration == 14400 - 600 - 2760 - 600
     # A second explicit pass has nothing left to move, and TSS stays consistent.
     assert absorb_long_cooldown(s) == 0
     assert s.total_duration() == 14400

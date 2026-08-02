@@ -4,6 +4,7 @@ All functions operate on per-second power streams (one sample per second).
 """
 from __future__ import annotations
 
+import datetime
 import math
 from collections.abc import Mapping
 from typing import Iterable, Sequence
@@ -159,17 +160,26 @@ def _split_activities(activities: Iterable):
     """Split a mixed activity iterable into efforts and the activity calendar.
 
     Returns ``(efforts, activity_days)`` where:
-      - ``efforts`` is a list of ``(when, power_stream)`` for items that carry
-        power (``when`` is the parsed naive datetime, or None for raw streams /
-        undated dicts).
+      - ``efforts`` is a list of ``(when, power_stream, rpe)`` for items that
+        carry power (``when`` is the parsed naive datetime, or None for raw
+        streams / undated dicts; ``rpe`` is the rider's 1-10 session rating when
+        they recorded one, else None - see ``recent_effort_floor``).
       - ``activity_days`` is the sorted list of every dated activity's timestamp
         - including power-less rides, which still count as time on the bike for
         the detraining-gap calendar.
     """
     from ..timeutil import parse_naive
 
-    efforts: "list[tuple[object, Sequence[float]]]" = []
+    efforts: "list[tuple[object, Sequence[float], object]]" = []
     activity_days: list = []
+
+    def rpe_or_none(value):
+        if value is None or isinstance(value, bool):
+            return None
+        try:
+            return int(value)
+        except (TypeError, ValueError):
+            return None
 
     def stream_or_none(value, *, persisted: bool = False):
         if value is None or isinstance(value, (str, bytes, bytearray, Mapping)):
@@ -195,13 +205,91 @@ def _split_activities(activities: Iterable):
                 power = item.get("power")
             power = stream_or_none(power, persisted=True)
             if power is not None:
-                efforts.append((when, power))
+                efforts.append((when, power, rpe_or_none(item.get("rpe"))))
         else:
             power = stream_or_none(item)
             if power is not None:
-                efforts.append((None, power))
+                efforts.append((None, power, None))
     activity_days.sort()
     return efforts, activity_days
+
+
+# --- Recent-evidence floor ---------------------------------------------------
+# The 20-minute test is the only effort the decayed estimate can see, and a
+# rider who trains with structured ERG workouts never rides one: every interval
+# is deliberately submaximal and 12-20 minutes long, so their best 20-minute
+# number is diluted by the recoveries inside it and the estimate reads 15-20%
+# low. These are the durations a long effort genuinely constrains FTP at, with
+# the fraction of that mean power an FTP sits at (Coggan's 95%-of-20min
+# extended either side: shorter efforts are further above FTP, a 60-minute
+# effort IS FTP). Nothing shorter than 13 minutes is admitted - a 5-minute
+# maximal effort says almost nothing about the hour, and letting one in would
+# turn every VO2max session into an FTP bump.
+FTP_FLOOR_DURATIONS = (
+    (780, 0.92),    # 13 min
+    (1200, 0.95),   # 20 min
+    (1800, 0.98),   # 30 min
+    (3600, 1.00),   # 60 min
+)
+FTP_FLOOR_WINDOW_DAYS = 42
+# A submaximal effort under-reports what the rider could have done. RPE is the
+# only evidence we have of how hard it actually was, so an effort the rider
+# rated below 8/10 is credited a little more than its raw watts - 2.5% per RPE
+# point below 8, capped at +10% so a single "easy" rating can never invent a
+# fitness jump. No rating means no adjustment.
+FTP_FLOOR_RPE_REFERENCE = 8
+FTP_FLOOR_RPE_STEP = 0.025
+FTP_FLOOR_RPE_MAX = 1.10
+
+
+def _rpe_scale(rpe) -> float:
+    """Submaximality credit for an effort the rider rated below 8/10."""
+    if rpe is None or rpe >= FTP_FLOOR_RPE_REFERENCE:
+        return 1.0
+    scale = 1.0 + FTP_FLOOR_RPE_STEP * (FTP_FLOOR_RPE_REFERENCE - float(rpe))
+    return min(FTP_FLOOR_RPE_MAX, scale)
+
+
+def recent_effort_floor(
+    activities: Iterable, now, window_days: int = FTP_FLOOR_WINDOW_DAYS
+) -> float:
+    """Highest FTP implied by any long effort ridden in the last ``window_days``.
+
+    For every dated activity inside the window, the best rolling mean at each of
+    ``FTP_FLOOR_DURATIONS`` is converted to its FTP equivalent and scaled by the
+    rider's RPE (see ``_rpe_scale``); the maximum across every activity and
+    duration is returned. Durations longer than the stream are skipped.
+
+    Each contribution is then decayed by ``detraining_factor`` against the same
+    activity calendar ``estimate_ftp`` uses. Without it the floor would cancel
+    detraining inside its own window - the 20-minute mapping is numerically the
+    same 0.95 the decayed estimator applies, so a rider who did one 20-minute
+    max and then stopped riding for six weeks would keep the undecayed number
+    for the whole window. A rider who kept training barely decays, which is
+    exactly the case the floor exists to serve.
+
+    This is a FLOOR, not an estimate: it only ever says "the rider demonstrably
+    held this, so their FTP is at least this much". Returns 0.0 when ``now`` is
+    None or nothing in the window qualifies.
+    """
+    if now is None:
+        return 0.0
+    cutoff = now - datetime.timedelta(days=int(window_days))
+    efforts, activity_days = _split_activities(activities)
+    best = 0.0
+    for when, stream, rpe in efforts:
+        if when is None or when < cutoff:
+            continue
+        idle, active = _idle_active_days(when, now, activity_days)
+        scale = _rpe_scale(rpe) * detraining_factor(idle, active)
+        for window, fraction in FTP_FLOOR_DURATIONS:
+            roll = rolling_mean(stream, window)
+            if roll.size == 0:
+                continue
+            implied = float(roll.max()) * fraction * scale
+            if implied > best:
+                best = implied
+    return best
 
 
 def estimate_ftp(
@@ -221,6 +309,11 @@ def estimate_ftp(
     recent hard effort dominates and old efforts fade smoothly rather than
     cliffing to zero.
 
+    That figure is then floored by ``recent_effort_floor``: a rider who only
+    does structured ERG work never rides a maximal 20 minutes, so the decayed
+    number alone reads well below what their recent long efforts already prove
+    they can hold. The floor never lowers the estimate.
+
     Accepts either raw power streams or activity dicts (with "streams" /
     "start_time"). When ``now`` is None, no decay is applied and the result is
     simply best-20-min * 0.95 (used with raw streams). Undated items always get
@@ -233,10 +326,13 @@ def estimate_ftp(
     if override is not None and override > 0:
         return float(override)
 
+    # Materialized because the recent-evidence floor iterates the same input a
+    # second time and callers may pass a generator.
+    activities = list(activities)
     efforts, activity_days = _split_activities(activities)
 
     best = 0.0
-    for when, stream in efforts:
+    for when, stream, _rpe in efforts:
         b = best_20min_power(stream)
         if b <= 0:
             continue
@@ -245,4 +341,7 @@ def estimate_ftp(
             b *= detraining_factor(idle, active)
         if b > best:
             best = b
-    return best * 0.95
+    decayed = best * 0.95
+    if now is None:
+        return decayed
+    return max(decayed, recent_effort_floor(activities, now))

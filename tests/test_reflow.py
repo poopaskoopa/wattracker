@@ -504,3 +504,57 @@ def test_v19_migrates_to_v20_in_place(tmp_path):
     workouts = db.plan_workouts_for_plan(1, 1, path=path)
     assert [w["name"] for w in workouts] == ["W"]
     assert workouts[0]["origin"] is None
+
+
+# --------------------------------------------- export_ftp travels with content
+def test_reflow_restamps_export_ftp_on_rewritten_and_inserted_rows(
+    user_id, monkeypatch
+):
+    """A rewritten row must not keep an export_ftp that predates its fractions.
+
+    ``export_ftp`` is what the completion matcher checks fitted wattage against,
+    so a row whose .zwo is regenerated months later with a stale (or nulled)
+    FTP beside it silently mis-scores every completion. Both write paths in
+    _apply_one - insert and content-rewrite - have to stamp it.
+    """
+    from wattracker.ingest import importer
+
+    plan_id = _seed_plan(user_id)  # seeds with export_ftp NULL, like legacy rows
+    monkeypatch.setattr(reflow, "current_ftp", lambda uid: 231.0)
+    # A recipe change that both rewrites existing days and inserts new ones.
+    _set_recipe(user_id, plan_id, reflow.build_recipe([0, 1, 2, 4], 10.0, 1))
+
+    result = reflow.reflow_plan(user_id, plan_id, now=NOW)
+
+    assert result["updated"] > 0 and result["inserted"] > 0
+    touched = _future(user_id, plan_id)
+    assert touched
+    assert [r["export_ftp"] for r in touched] == [231.0] * len(touched)
+    # Past rows are never rewritten, so they keep their legacy NULL.
+    past = [r for r in _rows(user_id, plan_id)
+            if r["date"] <= NOW.date().isoformat()]
+    assert all(r["export_ftp"] is None for r in past)
+    assert importer.current_ftp  # the real source the call site uses
+
+
+def test_adapt_restamps_export_ftp_when_it_rewrites_a_workout(user_id,
+                                                              monkeypatch):
+    """adapt.py's once-only patch is the other content-rewrite path.
+
+    Driven through ``apply_adaptations`` rather than the db helper, so the test
+    fails if the call site stops passing ``export_ftp`` - which is exactly the
+    bug it guards.
+    """
+    from wattracker.prescribe import adapt
+
+    plan_id = _seed_plan(user_id)
+    target = _future(user_id, plan_id)[0]
+    monkeypatch.setattr(adapt, "current_ftp", lambda uid: 188.0)
+    monkeypatch.setattr(adapt, "detection_status", lambda state: "overreach")
+
+    summary = adapt.apply_adaptations(user_id, object(), now=NOW)
+
+    assert summary["adjusted"] > 0
+    adapted = [r for r in _rows(user_id, plan_id) if r["adapted"]]
+    assert adapted
+    assert [r["export_ftp"] for r in adapted] == [188.0] * len(adapted)

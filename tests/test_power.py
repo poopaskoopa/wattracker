@@ -92,7 +92,10 @@ def test_estimate_ftp_recent_effort_dominates_decayed_old():
         "streams": {"power": [400.0] * 1200},
     }
     est = power.estimate_ftp([recent, old], now=now)
-    # Recent wins: 300 * factor(idle~0, active~5) * 0.95 ~= 284.
+    # Recent wins: 300 * factor(idle~0, active~5) * 0.95 ~= 284. The
+    # recent-evidence floor sees the same effort but is decayed by the same
+    # factor, so on a plain 20-minute effort it agrees exactly rather than
+    # cancelling the decay.
     assert est == pytest.approx(284.0, abs=0.5)
 
 
@@ -212,3 +215,175 @@ def test_estimate_ftp_fresh_hard_effort_dominates_history():
     est = power.estimate_ftp([old, fresh], now=now)
     # 320 * factor(idle~0, active~1) * 0.95 ~= 303.8.
     assert est == pytest.approx(303.8, abs=0.5)
+
+
+# ------------------------------------------------- recent-evidence FTP floor
+# A rider who only does structured ERG work never rides a maximal 20 minutes,
+# so the decayed best-20 estimate reads 15-20% low. The floor reads FTP off the
+# long efforts they DO ride (>= 13min) instead.
+import datetime as _dt  # noqa: E402
+
+
+def _act(now, days_ago, watts, seconds, rpe=None):
+    a = {
+        "start_time": (now - _dt.timedelta(days=days_ago)).isoformat(),
+        "streams": {"power": [float(watts)] * seconds},
+    }
+    if rpe is not None:
+        a["rpe"] = rpe
+    return a
+
+
+def _decay(acts, now, days_ago):
+    """Detraining factor for an effort ``days_ago`` old against ``acts``.
+
+    The floor decays each contribution exactly as the estimator decays each
+    effort, so every expectation below carries this term rather than pretending
+    a recent effort is worth its raw watts forever.
+    """
+    _, calendar = power._split_activities(acts)
+    idle, active = power._idle_active_days(
+        now - _dt.timedelta(days=days_ago), now, calendar
+    )
+    return power.detraining_factor(idle, active)
+
+
+def test_recent_effort_floor_maps_each_duration_to_its_ftp_fraction():
+    now = _dt.datetime(2026, 8, 1, 12, 0, 0)
+    for seconds, fraction in power.FTP_FLOOR_DURATIONS:
+        acts = [_act(now, 3, 200.0, seconds)]
+        floor = power.recent_effort_floor(acts, now)
+        assert floor == pytest.approx(200.0 * fraction * _decay(acts, now, 3))
+
+
+def test_recent_effort_floor_takes_the_best_across_durations_and_activities():
+    now = _dt.datetime(2026, 8, 1, 12, 0, 0)
+    acts = [
+        _act(now, 10, 200.0, 780),    # -> 184.0 before decay
+        _act(now, 4, 195.0, 1800),    # -> 191.1 before decay
+    ]
+    assert power.recent_effort_floor(acts, now) == pytest.approx(
+        195.0 * 0.98 * _decay(acts, now, 4)
+    )
+
+
+def test_recent_effort_floor_ignores_efforts_shorter_than_thirteen_minutes():
+    now = _dt.datetime(2026, 8, 1, 12, 0, 0)
+    # A 5-minute maximal effort says nothing about the hour and must not floor.
+    assert power.recent_effort_floor([_act(now, 1, 400.0, 300)], now) == 0.0
+
+
+def test_recent_effort_floor_ignores_activities_outside_the_window():
+    now = _dt.datetime(2026, 8, 1, 12, 0, 0)
+    inside_acts = [_act(now, 41, 200.0, 1200)]
+    outside_acts = [_act(now, 43, 200.0, 1200)]
+    inside = power.recent_effort_floor(inside_acts, now)
+    outside = power.recent_effort_floor(outside_acts, now)
+    assert inside == pytest.approx(190.0 * _decay(inside_acts, now, 41))
+    assert outside == 0.0
+    # The window is a parameter, not a constant.
+    assert power.recent_effort_floor(
+        outside_acts, now, window_days=60
+    ) == pytest.approx(190.0 * _decay(outside_acts, now, 43))
+
+
+def test_recent_effort_floor_credits_a_submaximal_rpe():
+    now = _dt.datetime(2026, 8, 1, 12, 0, 0)
+
+    def floor(rpe):
+        acts = [_act(now, 2, 200.0, 1200, rpe=rpe)]
+        return power.recent_effort_floor(acts, now) / (
+            200.0 * 0.95 * _decay(acts, now, 2)
+        )
+
+    # rpe 6 -> +5%, rpe 4 -> +10% (the cap), rpe 1 -> still the +10% cap.
+    assert floor(6) == pytest.approx(1.05)
+    assert floor(4) == pytest.approx(1.10)
+    assert floor(1) == pytest.approx(1.10)
+
+
+def test_recent_effort_floor_does_not_adjust_maximal_or_missing_rpe():
+    now = _dt.datetime(2026, 8, 1, 12, 0, 0)
+    for rpe in (None, 8, 9, 10):
+        acts = [_act(now, 2, 200.0, 1200, rpe=rpe)]
+        assert power.recent_effort_floor(acts, now) == pytest.approx(
+            200.0 * 0.95 * _decay(acts, now, 2)
+        )
+
+
+def test_recent_effort_floor_decays_when_the_rider_stops_riding():
+    """The floor must not cancel detraining inside its own window.
+
+    Same 20-minute effort 40 days ago in both cases. The rider who kept riding
+    every 5 days keeps essentially all of it - that is what the floor exists
+    for. The rider who did the effort and then stopped loses real watts.
+    """
+    now = _dt.datetime(2026, 8, 1, 12, 0, 0)
+    stopped = [_act(now, 40, 200.0, 1200)]
+    kept = [_act(now, 40, 200.0, 1200)] + [
+        _act(now, d, 120.0, 1200) for d in range(35, -1, -5)
+    ]
+    assert power.recent_effort_floor(stopped, now) < 0.92 * 190.0
+    assert power.recent_effort_floor(kept, now) > 0.97 * 190.0
+
+
+def test_recent_effort_floor_is_zero_without_now():
+    now = _dt.datetime(2026, 8, 1, 12, 0, 0)
+    assert power.recent_effort_floor([_act(now, 1, 300.0, 1200)], None) == 0.0
+
+
+def test_estimate_ftp_with_now_none_ignores_the_floor():
+    # The raw-stream contract is unchanged: no decay, no floor, just 0.95 x
+    # best-20. A 13-minute effort at 300W would floor at 276 if it applied.
+    now = _dt.datetime(2026, 8, 1, 12, 0, 0)
+    acts = [_act(now, 1, 300.0, 780, rpe=5)]
+    assert power.estimate_ftp(acts) == 0.0
+    assert power.estimate_ftp(acts, now=None) == 0.0
+    mixed = acts + [_act(now, 1, 200.0, 1200)]
+    assert power.estimate_ftp(mixed) == pytest.approx(190.0)
+
+
+def test_estimate_floored_by_recent_effort_inside_window():
+    """The live case: structured ERG work only, no maximal 20 minutes.
+
+    A rider whose best 13-minute power is 197.8W at RPE 6, with no maximal
+    20-minute effort anywhere, read ~177W before the floor existed.
+    """
+    now = _dt.datetime(2026, 8, 1, 12, 0, 0)
+    # An ERG session: 3 x 13min at ~198W with easy recoveries between them.
+    stream = ([198.0] * 780 + [110.0] * 240) * 3
+    acts = [{"start_time": (now - _dt.timedelta(days=1)).isoformat(),
+             "rpe": 6,
+             "streams": {"power": stream}}]
+    decayed_only = power.estimate_ftp(acts, now=None)
+    est = power.estimate_ftp(acts, now=now)
+    # 197.8 * 0.92 * 1.05 = 191.0, well above the diluted best-20 estimate.
+    assert est == pytest.approx(
+        198.0 * 0.92 * 1.05 * _decay(acts, now, 1), abs=0.5
+    )
+    assert est > decayed_only * 1.05
+
+
+def test_estimate_ftp_floor_never_lowers_the_estimate():
+    now = _dt.datetime(2026, 8, 1, 12, 0, 0)
+    # A genuine 20-minute test dominates; the floor agrees rather than cutting.
+    acts = [_act(now, 2, 300.0, 1200), _act(now, 1, 120.0, 3600)]
+    assert power.estimate_ftp(acts, now=now) == pytest.approx(
+        285.0 * _decay(acts, now, 2), abs=0.5
+    )
+
+
+def test_estimate_ftp_accepts_a_generator_with_the_floor_active():
+    now = _dt.datetime(2026, 8, 1, 12, 0, 0)
+    acts = [_act(now, 2, 200.0, 1200)]
+    assert power.estimate_ftp(iter(acts), now=now) == pytest.approx(
+        190.0 * _decay(acts, now, 2)
+    )
+
+
+def test_split_activities_carries_rpe_through():
+    now = _dt.datetime(2026, 8, 1, 12, 0, 0)
+    efforts, _ = power._split_activities(
+        [_act(now, 1, 200.0, 60, rpe=7), _act(now, 2, 200.0, 60), [1.0, 2.0]]
+    )
+    assert [e[2] for e in efforts] == [7, None, None]

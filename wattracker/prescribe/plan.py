@@ -525,10 +525,17 @@ def _clamp(v: float, lo: float, hi: float) -> float:
     return max(lo, min(hi, v))
 
 
+# The fraction of FTP at which a steady block stops being aerobic work and
+# starts counting as intensity. 0.88 is the bottom of the sweet-spot band the
+# builders actually prescribe (``planner._sweet_spot_long_blocks``); below it
+# sit tempo and Zone 2, which a hard-fraction is supposed to exclude.
+HARD_STEADY_POWER = 0.88
+
+
 def hard_seconds(session: Session) -> int:
     """Seconds of high-intensity work in a session.
 
-    Two shapes count. An ``intervals`` segment contributes its 'on' time. A
+    Three shapes count. An ``intervals`` segment contributes its 'on' time. A
     ``freeride`` segment contributes its whole duration when its
     ``load_fraction`` puts it at or above FTP: a maximal effort has no power
     TARGET to inspect (see ``planner._sprint`` - naming a number would turn "go
@@ -539,12 +546,21 @@ def hard_seconds(session: Session) -> int:
     actually contains. Without it a criterium plan's sharpening block - the one
     place in the product that schedules sprints - would score zero hard seconds
     and report a hard fraction of 0 for its hardest weeks.
+
+    A ``steadystate`` segment counts when its target is at or above
+    ``HARD_STEADY_POWER`` of FTP. Interval sessions do not end on a recovery
+    (see ``planner._interval_block``), so their final work effort is emitted as
+    a plain steady block; without this branch an hour of 3x12min threshold
+    would report 24 hard minutes instead of 36, and ``_vo2max_descending``,
+    whose reps are steady blocks throughout, reported zero.
     """
     total = 0
     for seg in session.segments:
         if seg.kind == "intervals" and seg.repeat:
             total += int(seg.repeat) * int(seg.on_duration or 0)
         elif seg.kind == "freeride" and (seg.load_fraction or 0.0) >= 1.0:
+            total += int(seg.duration or 0)
+        elif seg.kind == "steadystate" and (seg.power or 0.0) >= HARD_STEADY_POWER:
             total += int(seg.duration or 0)
     return total
 
