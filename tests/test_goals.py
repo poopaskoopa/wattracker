@@ -73,6 +73,15 @@ def _pre_goals_plan_module():
     except Exception:  # pragma: no cover - a broken import must not linger
         sys.modules.pop(name, None)
         raise
+    # ``hard_seconds`` is a shared reporting helper, not part of the goals
+    # feature, and it has legitimately changed since this revision: it now also
+    # counts the steady work block that interval sessions end on, and the
+    # steady reps of _vo2max_descending, both of which it used to miss. This
+    # test asks whether a goal alters plan GENERATION, so both sides must
+    # measure the generated sessions with the same ruler - otherwise a fix to
+    # the ruler reads as a goals regression. The comparison itself is
+    # untouched: every field, including hard_s, is still compared.
+    mod.hard_seconds = plan.hard_seconds
     return mod
 
 

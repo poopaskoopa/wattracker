@@ -22,7 +22,7 @@ from .timeutil import utc_now, valid_timezone
 
 _log = logging.getLogger(__name__)
 
-SCHEMA_VERSION = 26
+SCHEMA_VERSION = 27
 
 
 def _restrict_db_files(path: str) -> None:
@@ -214,6 +214,17 @@ _MIGRATIONS: Dict[int, Sequence[Union[str, Callable[[sqlite3.Connection], None]]
         # want for the users who never generate a link.
         "ALTER TABLE users ADD COLUMN calendar_token_hash TEXT",
     ],
+    26: [
+        # The FTP a plan workout's fractions were generated against, so a
+        # completion match can sanity-check the wattage it fitted - standalone
+        # exports have carried this since they existed, plan rows never did,
+        # which left plan completions (the primary evidence for RPE -> FTP
+        # feedback) on the loose absolute 50-600W fallback.
+        # Deliberately NOT backfilled: today's FTP is not the FTP a row from
+        # six months ago was built at, and guessing one would retro-reject
+        # completions that already matched. NULL keeps the old fallback.
+        "ALTER TABLE plan_workouts ADD COLUMN export_ftp REAL",
+    ],
 }
 
 _DROP = """
@@ -374,6 +385,7 @@ CREATE TABLE IF NOT EXISTS plan_workouts (
     feedback_applied  INTEGER NOT NULL DEFAULT 0,
     feedback_batch_id INTEGER,
     origin            TEXT,
+    export_ftp        REAL,
     FOREIGN KEY(plan_id) REFERENCES plans(id),
     FOREIGN KEY(user_id) REFERENCES users(id)
 );
@@ -1845,6 +1857,7 @@ def add_plan_workout(
     zwo_or_segments: str,
     variant: Optional[str] = None,
     origin: Optional[str] = None,
+    export_ftp: Optional[float] = None,
     path: Optional[str] = None,
 ) -> int:
     conn = connect(path)
@@ -1853,11 +1866,12 @@ def add_plan_workout(
             """
             INSERT INTO plan_workouts
               (plan_id, user_id, date, name, type, duration_s, tss,
-               zwo_or_segments, variant, origin)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+               zwo_or_segments, variant, origin, export_ftp)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (plan_id, user_id, date, name, type, int(duration_s), float(tss),
-             zwo_or_segments, variant, origin),
+             zwo_or_segments, variant, origin,
+             float(export_ftp) if export_ftp else None),
         )
         conn.commit()
         return cur.lastrowid
@@ -1910,6 +1924,7 @@ def _plan_workout_row(r: sqlite3.Row, include_zwo: bool = False) -> dict:
         "feedback_applied": bool(r["feedback_applied"]),
         "feedback_batch_id": r["feedback_batch_id"],
         "origin": r["origin"],
+        "export_ftp": r["export_ftp"],
     }
     if include_zwo:
         d["zwo_or_segments"] = r["zwo_or_segments"]
@@ -2523,6 +2538,7 @@ def update_plan_workout_content(
     adapted: str,
     adapted_at: str,
     variant: Optional[str] = None,
+    export_ftp: Optional[float] = None,
     path: Optional[str] = None,
 ) -> bool:
     """Rewrite an (unadapted) workout's prescription; records the adaptation.
@@ -2531,16 +2547,22 @@ def update_plan_workout_content(
     plateau/overreach adjustments from stacking - do not relax it. Whole-plan
     recomputation uses ``replace_plan_workout_content`` instead, which has the
     opposite contract (it may claim an already-adapted row).
+
+    ``export_ftp`` is restamped with the content: it describes the FTP the new
+    fractions were written for, so leaving the old one behind would leave the
+    completion matcher checking fitted wattage against an FTP that no longer
+    belongs to the prescription stored beside it.
     """
     conn = connect(path)
     try:
         cur = conn.execute(
             "UPDATE plan_workouts SET name = ?, type = ?, duration_s = ?, "
             "tss = ?, zwo_or_segments = ?, adapted = ?, adapted_at = ?, "
-            "variant = ? "
+            "variant = ?, export_ftp = ? "
             "WHERE user_id = ? AND id = ? AND adapted IS NULL",
             (name, type, int(duration_s), float(tss), zwo_or_segments,
-             adapted, adapted_at, variant, user_id, workout_id),
+             adapted, adapted_at, variant,
+             float(export_ftp) if export_ftp else None, user_id, workout_id),
         )
         conn.commit()
         return cur.rowcount > 0
@@ -2558,6 +2580,7 @@ def replace_plan_workout_content(
     zwo_or_segments: str,
     after_date: str,
     variant: Optional[str] = None,
+    export_ftp: Optional[float] = None,
     path: Optional[str] = None,
 ) -> bool:
     """Overwrite a generated, future, not-completed workout from a recomputation.
@@ -2570,16 +2593,21 @@ def replace_plan_workout_content(
     Claiming a row CLEARS ``adapted``/``adapted_at`` - the recomputed content
     replaces whatever adapt.py had put there, and the row's one-shot adaptation
     budget is handed back. See prescribe/reflow.py for why.
+
+    ``export_ftp`` is restamped with the content, for the same reason as in
+    ``update_plan_workout_content``: it must keep describing the fractions it
+    is stored next to.
     """
     conn = connect(path)
     try:
         cur = conn.execute(
             "UPDATE plan_workouts SET name = ?, type = ?, duration_s = ?, "
-            "tss = ?, zwo_or_segments = ?, variant = ?, "
+            "tss = ?, zwo_or_segments = ?, variant = ?, export_ftp = ?, "
             "adapted = NULL, adapted_at = NULL "
             "WHERE user_id = ? AND id = ? AND origin = 'generated' "
             "AND completed_activity_id IS NULL AND date > ?",
             (name, type, int(duration_s), float(tss), zwo_or_segments, variant,
+             float(export_ftp) if export_ftp else None,
              user_id, workout_id, after_date),
         )
         conn.commit()
