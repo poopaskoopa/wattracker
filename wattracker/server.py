@@ -1540,12 +1540,17 @@ def create_app() -> FastAPI:
                 uid, name or "Training Plan", generated["start_date"],
                 generated["weeks"], model=generated["model"], recipe=recipe,
             )
+            # The FTP these fractions were written for, stored alongside them
+            # so a later completion match can sanity-check the wattage it
+            # fitted - the same thing a standalone export has always carried.
+            export_ftp = importer.current_ftp(uid)
             for w in generated["workouts"]:
                 zwo_str = zwo.zwo_string(w["session"])
                 db.add_plan_workout(
                     plan_id, uid, w["date"], w["name"], w["type"],
                     w["duration_s"], w["tss"], zwo_str,
                     variant=w.get("variant"), origin=reflow.GENERATED,
+                    export_ftp=export_ftp,
                 )
             # Match any already-imported activities against the new plan's
             # workouts now - the gated rescan path only matches when NEW files

@@ -11,6 +11,7 @@ import sqlite3
 import pytest
 
 from wattracker import db, exporter
+from wattracker.ingest import importer
 from wattracker.prescribe import adapt, plan as planmod, reflow, zwo
 
 MONDAY = dt.date(2026, 7, 6)          # plan starts here
@@ -37,7 +38,7 @@ def _seed_plan(user_id, recipe=None, name="Base", start=MONDAY, weeks=10,
         db.add_plan_workout(
             plan_id, user_id, w["date"], w["name"], w["type"], w["duration_s"],
             w["tss"], zwo.zwo_string(w["session"]), variant=w.get("variant"),
-            origin=reflow.GENERATED,
+            origin=reflow.GENERATED, export_ftp=importer.current_ftp(user_id),
         )
     if active:
         db.set_active_plan(user_id, plan_id)

@@ -43,6 +43,7 @@ import logging
 from typing import Dict, List, Optional
 
 from .. import db
+from ..ingest.importer import current_ftp
 from ..metrics import profile_store
 from ..timeutil import utc_now
 from . import goals, zwo
@@ -263,6 +264,10 @@ def reflow_plan(
 
     counts = {"updated": 0, "inserted": 0, "deleted": 0, "skipped_locked": 0,
               "raced_lost": 0, "failed": 0, "conflicts": len(conflicted)}
+    # Stamped on rows this sweep inserts, so a completion match can check the
+    # wattage it fitted against the FTP the fractions were written for. Read
+    # once: it is the same answer for every date in the plan.
+    export_ftp = current_ftp(user_id)
 
     for date in sorted(set(fresh_by_date) | set(stored_by_date)):
         if date in conflicted:
@@ -271,7 +276,7 @@ def reflow_plan(
         stored = stored_by_date.get(date)
         try:
             _apply_one(user_id, plan_id, date, today, fresh, stored, counts,
-                       race_window)
+                       race_window, export_ftp)
         except Exception:  # noqa: BLE001 - one bad row must not sink the plan
             counts["failed"] += 1
             log.warning(
@@ -383,7 +388,8 @@ def _record_notice(
 
 def _apply_one(user_id: int, plan_id: int, date: str, today: str,
                fresh: Optional[dict], stored: Optional[dict],
-               counts: Dict, race_window: Optional[set] = None) -> None:
+               counts: Dict, race_window: Optional[set] = None,
+               export_ftp: Optional[float] = None) -> None:
     """Apply one date's diff, mutating `counts`. Raises on a write failure."""
     if fresh is not None and stored is None:
         # New training day. Past dates are never back-filled: a workout
@@ -396,6 +402,7 @@ def _apply_one(user_id: int, plan_id: int, date: str, today: str,
             plan_id, user_id, date, fresh["name"], fresh["type"],
             fresh["duration_s"], fresh["tss"], zwo_str,
             variant=fresh.get("variant"), origin=GENERATED,
+            export_ftp=export_ftp,
         )
         counts["inserted"] += 1
         reexport_workout(user_id, date, fresh["name"], fresh["name"], zwo_str)
@@ -424,7 +431,7 @@ def _apply_one(user_id: int, plan_id: int, date: str, today: str,
     ok = db.replace_plan_workout_content(
         user_id, stored["id"], fresh["name"], fresh["type"],
         fresh["duration_s"], fresh["tss"], zwo_str, today,
-        variant=fresh.get("variant"),
+        variant=fresh.get("variant"), export_ftp=export_ftp,
     )
     if ok:
         counts["updated"] += 1

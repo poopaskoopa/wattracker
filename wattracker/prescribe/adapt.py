@@ -47,6 +47,7 @@ import os
 from typing import Dict, List, Optional
 
 from .. import db, paths
+from ..ingest.importer import current_ftp
 from ..metrics import profile_store
 from ..timeutil import utc_now
 from . import zwo
@@ -209,6 +210,10 @@ def apply_adaptations(user_id: int, state, now: Optional[_dt.datetime] = None) -
     # Rebuilt sessions must match the exported .zwo, so adaptation uses the
     # same rider profile the generator and reflow do.
     profile = profile_store.for_user(user_id)
+    # Restamped with the rewritten content: export_ftp must keep describing the
+    # FTP the stored fractions were written for, or the completion matcher ends
+    # up checking fitted wattage against an FTP the prescription never used.
+    export_ftp = current_ftp(user_id)
     for w in db.adaptable_plan_workouts(user_id, today, horizon):
         change = _plan_change(status, w["type"], w["duration_s"] / 60.0)
         if change is None:
@@ -241,6 +246,7 @@ def apply_adaptations(user_id: int, state, now: Optional[_dt.datetime] = None) -
             user_id, w["id"], session.name, new_type,
             session.total_duration(), session.estimated_tss, zwo_str,
             kind, now.isoformat(timespec="seconds"), variant=new_variant,
+            export_ftp=export_ftp,
         )
         if ok:
             adjusted += 1

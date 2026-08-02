@@ -163,6 +163,10 @@ def test_estimate_decays_after_layoff_anchored_at_now(user_id):
     # 33-day-old effort is detraining-decayed against the activity calendar
     # (a lone effort with no rides since -> the whole 33-day gap past the grace
     # window is idle). Decayed, but nowhere near a collapse.
+    #
+    # The recent-evidence floor sees this effort too (33 days is inside its
+    # 6-week window) but is decayed by the same factor, so it lands on the same
+    # number rather than cancelling the layoff.
     now = dt.datetime(2026, 7, 3, 12, 0)
     effort = now - dt.timedelta(days=33)
     _insert_activity(user_id, effort.isoformat(), power_watts=300.0)
