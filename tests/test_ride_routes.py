@@ -523,16 +523,33 @@ def test_ride_chart_styles_support_live_metrics_and_fullscreen(client):
     assert ".ride-chart-fullscreen-fallback" in r.text
     assert "body.ride-chart-fullscreen-open" in r.text
     assert ".ride-chart-clocks" in r.text
-    # Keep the clocks behind the traces and below the metric readouts, while
-    # making the large timer digits legible without lifting the small labels.
-    assert ".ride-chart-clocks { position: absolute; z-index: 0; top: 62%;" in r.text
-    assert "letter-spacing: -0.02em; opacity: 0.4;" in r.text
-    assert "text-transform: uppercase; opacity: 0.16;" in r.text
+    # Keep the clocks readable in a constrained surface without creating a
+    # broad high-priority layer over the chart traces.
+    clocks = re.search(r"\.ride-chart-clocks \{(?P<rule>.*?)\n\}", r.text, re.S)
+    assert clocks
+    clock_rule = clocks.group("rule")
+    assert "z-index: 2" in clock_rule
+    assert "top: 72%" in clock_rule
+    assert "background: color-mix(" in clock_rule
+    assert "border: 1px solid" in clock_rule
+    assert "width: fit-content" in clock_rule
+    assert "max-width: 96%" in clock_rule
+    assert "pointer-events: none; color: var(--text-bright);" in r.text
+    assert "text-shadow: 0 1px 5px var(--surface-inset), 0 0 12px var(--surface-inset);" in r.text
+    assert "letter-spacing: -0.02em; opacity: 0.82;" in r.text
+    assert "text-transform: uppercase; opacity: 0.62;" in r.text
     assert ".ride-chart-erg.erg-lit .erg-led" in r.text
-    # The inline chart grows with the page: a fixed 260px box is a 5:1 letter
-    # slot on a wide main. The full-screen rule still overrides it.
+    # Fullscreen sizing follows the available panel space, including short
+    # viewports, instead of subtracting a fixed heading height from 100vh.
     assert "height: clamp(260px, 28vw, 400px)" in r.text
-    assert ".ride-chart-fullscreen-fallback .ride-chart-canvas {\n    height: calc(100vh - 5.5rem);" in r.text
+    assert "width: 100%; height: 100%; min-height: 0; max-width: none;" in r.text
+    assert "flex: 1 1 auto; height: auto; min-height: 0;" in r.text
+    assert "@media (max-height: 520px)" in r.text
+    assert "top: 68%; gap: 0.35rem; width: fit-content; max-width: 98%;" in r.text
+    assert "font-size: clamp(16px, 7vh, 42px);" in r.text
+    assert ".ride-chart-clocks { gap: 0.2rem; padding: 0.2rem 0.3rem; max-width: 98%; }" in r.text
+    assert ".ride-chart-clocks strong { font-size: clamp(12px, 5vw, 28px); }" in r.text
+    assert "height: calc(100vh - 5.5rem)" not in r.text
 
 
 def test_ride_chart_device_indicator_styles(client):

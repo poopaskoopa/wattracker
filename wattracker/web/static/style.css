@@ -733,18 +733,25 @@ button.danger.link-btn { border: none; color: var(--alert); }
 .ride-chart-metrics .metric-power { color: var(--s-2); }
 .ride-chart-metrics .metric-cadence { color: var(--s-3); }
 .ride-chart-metrics .metric-heart-rate { color: var(--s-hr); }
-/* Background clock watermark: sits behind the transparent chart canvas. */
-.ride-chart-clocks { position: absolute; z-index: 0; top: 62%; left: 50%;
+/* Countdown overlay: a small readable surface over the chart, rather than a
+   full-width layer that competes with the traces. */
+.ride-chart-clocks { position: absolute; z-index: 2; top: 72%; left: 50%;
     transform: translate(-50%, -50%); display: flex; align-items: flex-end;
-    justify-content: center; gap: clamp(1rem, 6vw, 4.5rem); width: min(92%, 760px);
-    pointer-events: none; color: var(--text); }
+    justify-content: center; gap: clamp(0.35rem, 4vw, 3rem); width: fit-content;
+    max-width: 96%;
+    box-sizing: border-box; padding: clamp(0.25rem, 1vh, 0.5rem) clamp(0.5rem, 2vw, 1rem);
+    border: 1px solid color-mix(in srgb, var(--surface-border) 72%, transparent);
+    border-radius: var(--r-sm);
+    background: color-mix(in srgb, var(--surface-inset) 84%, transparent);
+    pointer-events: none; color: var(--text-bright);
+    text-shadow: 0 1px 5px var(--surface-inset), 0 0 12px var(--surface-inset); }
 .ride-chart-clocks span { display: flex; flex-direction: column; align-items: center;
     gap: 0.15rem; }
 .ride-chart-clocks strong { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
     font-size: clamp(30px, 6vw, 58px); line-height: 1; font-variant-numeric: tabular-nums;
-    letter-spacing: -0.02em; opacity: 0.4; }
+    letter-spacing: -0.02em; opacity: 0.82; }
 .ride-chart-clocks small { font-size: 0.7rem; font-weight: 700; letter-spacing: 0.08em;
-    text-transform: uppercase; opacity: 0.16; }
+    text-transform: uppercase; opacity: 0.62; }
 /* Shared corner chip: an LED plus a short label, dim until whatever it reports
    is live. Used by the ERG indicator and by the sensor indicators opposite it. */
 .ride-chart-chip { display: inline-flex; align-items: center; gap: 0.4rem;
@@ -783,7 +790,8 @@ button.danger.link-btn { border: none; color: var(--alert); }
     box-shadow: 0 0 6px var(--device-color), 0 0 14px var(--device-glow); }
 .ride-chart-block:fullscreen, .ride-chart-block:-webkit-full-screen,
 .ride-chart-block.ride-chart-fullscreen-fallback {
-    width: 100%; height: 100%; max-width: none; margin: 0; border-radius: 0;
+    display: flex; flex-direction: column; overflow: hidden;
+    width: 100%; height: 100%; min-height: 0; max-width: none; margin: 0; border-radius: 0;
     padding: clamp(0.75rem, 2vw, 1.5rem); background: var(--surface-inset);
 }
 .ride-chart-block.ride-chart-fullscreen-fallback {
@@ -792,7 +800,7 @@ button.danger.link-btn { border: none; color: var(--alert); }
 .ride-chart-block:fullscreen .ride-chart-canvas,
 .ride-chart-block:-webkit-full-screen .ride-chart-canvas,
 .ride-chart-block.ride-chart-fullscreen-fallback .ride-chart-canvas {
-    height: calc(100vh - 5.5rem);
+    flex: 1 1 auto; height: auto; min-height: 0;
 }
 .ride-chart-block:fullscreen .ride-chart-metrics strong,
 .ride-chart-block:-webkit-full-screen .ride-chart-metrics strong,
@@ -800,9 +808,55 @@ button.danger.link-btn { border: none; color: var(--alert); }
     font-size: clamp(28px, 4vw, 54px);
 }
 body.ride-chart-fullscreen-open { overflow: hidden; }
+@media (max-height: 520px) {
+    .ride-chart-block:fullscreen .ride-chart-heading,
+    .ride-chart-block:-webkit-full-screen .ride-chart-heading,
+    .ride-chart-block.ride-chart-fullscreen-fallback .ride-chart-heading {
+        margin-bottom: 0; gap: 0.5rem;
+    }
+    .ride-chart-block:fullscreen .ride-chart-heading h3,
+    .ride-chart-block:-webkit-full-screen .ride-chart-heading h3,
+    .ride-chart-block.ride-chart-fullscreen-fallback .ride-chart-heading h3 {
+        font-size: 0.9rem;
+    }
+    .ride-chart-block:fullscreen .ride-chart-heading button,
+    .ride-chart-block:-webkit-full-screen .ride-chart-heading button,
+    .ride-chart-block.ride-chart-fullscreen-fallback .ride-chart-heading button {
+        padding: 0.3rem 0.5rem; font-size: 0.75rem;
+    }
+    .ride-chart-block:fullscreen .ride-chart-metrics,
+    .ride-chart-block:-webkit-full-screen .ride-chart-metrics,
+    .ride-chart-block.ride-chart-fullscreen-fallback .ride-chart-metrics {
+        top: 10%;
+    }
+    .ride-chart-block:fullscreen .ride-chart-metrics strong,
+    .ride-chart-block:-webkit-full-screen .ride-chart-metrics strong,
+    .ride-chart-block.ride-chart-fullscreen-fallback .ride-chart-metrics strong {
+        font-size: clamp(18px, 5vh, 32px);
+    }
+    .ride-chart-block:fullscreen .ride-chart-clocks,
+    .ride-chart-block:-webkit-full-screen .ride-chart-clocks,
+    .ride-chart-block.ride-chart-fullscreen-fallback .ride-chart-clocks {
+        top: 68%; gap: 0.35rem; width: fit-content; max-width: 98%;
+        padding: 0.2rem 0.4rem;
+    }
+    .ride-chart-block:fullscreen .ride-chart-clocks strong,
+    .ride-chart-block:-webkit-full-screen .ride-chart-clocks strong,
+    .ride-chart-block.ride-chart-fullscreen-fallback .ride-chart-clocks strong {
+        font-size: clamp(16px, 7vh, 42px);
+    }
+    .ride-chart-block:fullscreen .ride-chart-clocks small,
+    .ride-chart-block:-webkit-full-screen .ride-chart-clocks small,
+    .ride-chart-block.ride-chart-fullscreen-fallback .ride-chart-clocks small {
+        font-size: 0.6rem;
+    }
+}
 @media (max-width: 560px) {
     .ride-chart-heading { align-items: flex-start; }
     .ride-chart-actions { justify-content: flex-start; }
+    .ride-chart-clocks { gap: 0.2rem; padding: 0.2rem 0.3rem; max-width: 98%; }
+    .ride-chart-clocks strong { font-size: clamp(12px, 5vw, 28px); }
+    .ride-chart-clocks small { font-size: clamp(0.48rem, 2vw, 0.65rem); letter-spacing: 0.04em; }
     .ride-chart-metrics { top: 18%; gap: 0.8rem; width: 86%; }
     .ride-chart-metrics strong { font-size: 24px; }
     .ride-chart-metrics small { font-size: 0.68rem; }
