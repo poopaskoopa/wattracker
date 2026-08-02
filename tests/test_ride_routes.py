@@ -529,10 +529,15 @@ def test_ride_chart_styles_support_live_metrics_and_fullscreen(client):
     assert "letter-spacing: -0.02em; opacity: 0.4;" in r.text
     assert "text-transform: uppercase; opacity: 0.16;" in r.text
     assert ".ride-chart-erg.erg-lit .erg-led" in r.text
-    # The inline chart grows with the page: a fixed 260px box is a 5:1 letter
-    # slot on a wide main. The full-screen rule still overrides it.
+    # The inline chart grows with the page. Fullscreen/fallback mode uses a
+    # flex column so short viewports do not clip the chart below the fold.
     assert "height: clamp(260px, 28vw, 400px)" in r.text
-    assert ".ride-chart-fullscreen-fallback .ride-chart-canvas {\n    height: calc(100vh - 5.5rem);" in r.text
+    assert "display: flex; flex-direction: column; overflow: hidden; min-height: 0;" in r.text
+    assert "flex: 1 1 auto; height: auto; min-height: 0;" in r.text
+    assert "@media (max-height: 520px)" in r.text
+    assert "font-size: clamp(18px, 5vh, 32px);" in r.text
+    assert ".ride-chart-heading { align-items: flex-start; flex-wrap: wrap; }" in r.text
+    assert ".ride-chart-actions button { flex: 1 1 0; min-width: 0; white-space: normal; line-height: 1.2; }" in r.text
 
 
 def test_ride_chart_device_indicator_styles(client):

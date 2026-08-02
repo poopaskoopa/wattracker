@@ -783,6 +783,7 @@ button.danger.link-btn { border: none; color: var(--alert); }
     box-shadow: 0 0 6px var(--device-color), 0 0 14px var(--device-glow); }
 .ride-chart-block:fullscreen, .ride-chart-block:-webkit-full-screen,
 .ride-chart-block.ride-chart-fullscreen-fallback {
+    display: flex; flex-direction: column; overflow: hidden; min-height: 0;
     width: 100%; height: 100%; max-width: none; margin: 0; border-radius: 0;
     padding: clamp(0.75rem, 2vw, 1.5rem); background: var(--surface-inset);
 }
@@ -792,7 +793,7 @@ button.danger.link-btn { border: none; color: var(--alert); }
 .ride-chart-block:fullscreen .ride-chart-canvas,
 .ride-chart-block:-webkit-full-screen .ride-chart-canvas,
 .ride-chart-block.ride-chart-fullscreen-fallback .ride-chart-canvas {
-    height: calc(100vh - 5.5rem);
+    flex: 1 1 auto; height: auto; min-height: 0;
 }
 .ride-chart-block:fullscreen .ride-chart-metrics strong,
 .ride-chart-block:-webkit-full-screen .ride-chart-metrics strong,
@@ -800,8 +801,25 @@ button.danger.link-btn { border: none; color: var(--alert); }
     font-size: clamp(28px, 4vw, 54px);
 }
 body.ride-chart-fullscreen-open { overflow: hidden; }
+@media (max-height: 520px) {
+    .ride-chart-block:fullscreen .ride-chart-heading,
+    .ride-chart-block:-webkit-full-screen .ride-chart-heading,
+    .ride-chart-block.ride-chart-fullscreen-fallback .ride-chart-heading {
+        margin-bottom: 0; gap: .5rem;
+    }
+    .ride-chart-block:fullscreen .ride-chart-metrics,
+    .ride-chart-block:-webkit-full-screen .ride-chart-metrics,
+    .ride-chart-block.ride-chart-fullscreen-fallback .ride-chart-metrics {
+        top: 10%;
+    }
+    .ride-chart-block:fullscreen .ride-chart-metrics strong,
+    .ride-chart-block:-webkit-full-screen .ride-chart-metrics strong,
+    .ride-chart-block.ride-chart-fullscreen-fallback .ride-chart-metrics strong {
+        font-size: clamp(18px, 5vh, 32px);
+    }
+}
 @media (max-width: 560px) {
-    .ride-chart-heading { align-items: flex-start; }
+    .ride-chart-heading { align-items: flex-start; flex-wrap: wrap; }
     .ride-chart-actions { justify-content: flex-start; }
     .ride-chart-metrics { top: 18%; gap: 0.8rem; width: 86%; }
     .ride-chart-metrics strong { font-size: 24px; }
@@ -814,3 +832,88 @@ body.ride-chart-fullscreen-open { overflow: hidden; }
 .progress-wrap { background: var(--surface-inset); border: 1px solid var(--surface-border); border-radius: var(--r-md);
     height: 16px; overflow: hidden; margin: 0.75rem 0; }
 .progress-bar { height: 100%; width: 0; background: var(--accent); transition: width 0.2s linear; }
+
+/* Ride + activities refresh. These page-scoped rules add hierarchy without
+   changing the existing controls, hooks, or data presentation. */
+.ride-page-title, .activities-page-title { margin-bottom: 1.25rem; letter-spacing: -0.02em; }
+.ride-setup .section-kicker, .ride-live .section-kicker, .activities-scan-panel .section-kicker {
+    color: var(--muted); font-size: var(--fs-xs); font-weight: 700;
+    letter-spacing: .12em; text-transform: uppercase; }
+.ride-setup, .ride-live { background: var(--panel); border: 1px solid var(--surface-border);
+    border-radius: var(--r-lg); box-shadow: var(--shadow-1); padding: clamp(1rem, 2vw, 1.5rem); }
+.ride-setup { margin-top: 1rem; }
+.ride-live { margin-top: 1.25rem; }
+.ride-mode { display: inline-flex; gap: 0; padding: .25rem; margin: .75rem 0 1rem;
+    background: var(--surface-inset); border: 1px solid var(--surface-border); border-radius: var(--r-md); }
+.ride-mode-button { min-width: 8.5rem; border: 1px solid transparent; border-radius: var(--r-sm);
+    padding: .6rem .9rem; background: transparent; color: var(--muted); }
+.ride-mode-button:hover { color: var(--text); background: var(--surface-2); filter: none; }
+.ride-mode-button[aria-pressed="true"] { background: var(--accent); border-color: var(--accent);
+    color: var(--on-accent); box-shadow: var(--shadow-1); }
+.ride-setup > #planMode, .ride-setup > #justRideMode { max-width: 48rem; }
+.ride-setup > #planMode label { display: flex; align-items: center; gap: .75rem; margin: 0; color: var(--text-bright); font-weight: 600; }
+.ride-setup > #planMode select { flex: 1; margin-left: auto; }
+.just-ride-controls label { color: var(--text-bright); font-weight: 600; }
+.just-ride-controls select { margin-left: .45rem; }
+.ride-setup-actions { border-top: 1px solid var(--surface-border); padding-top: 1rem; margin-top: 1.1rem; }
+.ride-setup-actions button { min-height: 2.5rem; }
+.ride-setup-actions #connectBtn { box-shadow: 0 0 0 1px color-mix(in srgb, var(--accent) 35%, transparent); }
+.ride-setup .scan-feedback { margin-top: .75rem; }
+.device-list { margin-top: .75rem; }
+.ride-workout { font-size: var(--fs-md); box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--accent) 12%, transparent); }
+.ride-live-controls { padding: .75rem; background: var(--surface-inset); border: 1px solid var(--surface-border);
+    border-radius: var(--r-md); }
+.ride-live .cards { display: grid; grid-template-columns: repeat(6, minmax(0, 1fr)); gap: .75rem; }
+.ride-live .card { min-width: 0; padding: .9rem; background: var(--surface-2); }
+.ride-live .card .label { line-height: 1.35; }
+.ride-live .card .value { margin-top: .35rem; font-family: var(--font-mono); font-size: clamp(1.15rem, 2vw, 1.55rem); }
+.ride-live .progress-wrap { height: .7rem; margin: 1rem 0 .65rem; }
+.ride-chart-block { margin-top: 1.25rem; padding: 1rem; border-radius: var(--r-lg); box-shadow: var(--shadow-1); }
+.ride-chart-heading { padding-bottom: .75rem; border-bottom: 1px solid var(--surface-border); }
+.ride-chart-heading h3 { font-size: var(--fs-lg); letter-spacing: -.01em; }
+.ride-chart-actions .button-secondary { border: 1px solid var(--surface-border); }
+
+.activities-page-title { margin-bottom: 1rem; }
+.activities-scan-panel { padding: clamp(1rem, 2vw, 1.35rem); margin-top: 0; }
+.activities-scan-panel .section-kicker { margin-bottom: .75rem; }
+.activities-scan-panel .hint { margin-bottom: 0; line-height: var(--lh-base); }
+.activities-scan-panel code { color: var(--text-bright); font-family: var(--font-mono); font-size: var(--fs-sm); }
+.activity-import-actions { align-items: stretch; gap: .75rem; padding: .25rem 0; }
+.activity-import-actions form { display: flex; align-items: center; gap: .6rem; padding: .65rem;
+    background: var(--panel); border: 1px solid var(--surface-border); border-radius: var(--r-md); }
+.activity-upload-form { flex: 1 1 24rem; }
+.activity-merge-form { flex: 0 1 auto; }
+.activity-import-actions input[type="file"] { min-width: 0; flex: 1; color: var(--muted); }
+.activity-import-actions button { white-space: nowrap; }
+.activities-table { min-width: 940px; margin-top: .5rem; }
+.activities-table th { position: sticky; top: 0; z-index: 2; padding-top: .7rem; padding-bottom: .7rem;
+    background: var(--surface-inset); color: var(--text-bright); border-bottom: 1px solid var(--accent); }
+.activities-table td { padding-top: .7rem; padding-bottom: .7rem; vertical-align: middle; }
+.activities-table td:first-child { min-width: 12rem; }
+.activities-table td:first-child .hint { display: block; margin-top: .25rem; }
+.activities-table .cal-rpe { display: inline-flex; align-items: center; min-height: 1.7rem; padding: .15rem .5rem;
+    border: 1px solid color-mix(in srgb, var(--accent) 45%, var(--surface-border)); border-radius: var(--r-pill);
+    color: var(--accent); font: 600 var(--fs-sm)/1 var(--font-mono); white-space: nowrap; }
+.activities-table .button { white-space: nowrap; }
+.activities-table tbody tr:hover td { box-shadow: inset 0 1px color-mix(in srgb, var(--accent) 20%, transparent),
+    inset 0 -1px color-mix(in srgb, var(--accent) 20%, transparent); }
+
+@media (max-width: 1050px) {
+    .ride-live .cards { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+}
+@media (max-width: 700px) {
+    .ride-mode { display: flex; width: 100%; }
+    .ride-mode-button { flex: 1; min-width: 0; }
+    .ride-setup > #planMode label { display: block; }
+    .ride-setup > #planMode select { display: block; width: 100%; margin: .4rem 0 0; }
+    .just-ride-controls select { width: 100%; margin: .35rem 0 0; }
+    .ride-live .cards { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+    .activity-import-actions form { align-items: stretch; flex-direction: column; }
+    .activity-import-actions input[type="file"] { width: 100%; }
+}
+@media (max-width: 420px) {
+    .ride-live .cards { grid-template-columns: 1fr; }
+    .ride-chart-heading h3 { flex: 1 1 100%; }
+    .ride-chart-actions { width: 100%; min-width: 0; }
+    .ride-chart-actions button { flex: 1 1 0; min-width: 0; white-space: normal; line-height: 1.2; }
+}
