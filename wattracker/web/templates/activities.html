@@ -1,11 +1,13 @@
 {% extends "base.html" %}
 {% block title %}Activities &mdash; wattracker{% endblock %}
 {% block content %}
-<h2>Activities</h2>
+<div class="activities-page">
+<h2 class="page-title activities-page-title">Activities</h2>
 
 <p id="scanStatus" class="hint" style="display:none"></p>
 
-<section class="scan-panel">
+<section class="scan-panel activities-scan-panel" aria-labelledby="activitiesImportTitle">
+    <div class="section-kicker" id="activitiesImportTitle">Import activities</div>
     <form id="scanForm" method="post" action="/activities/rescan" class="scan-form">
         <label>Activities directory
             <input type="text" name="activities_dir" value="{{ prefill_dir or '' }}"
@@ -23,12 +25,12 @@
     </p>
 </section>
 
-<div class="toolbar">
-    <form method="post" action="/activities/upload" enctype="multipart/form-data">
+<div class="toolbar activity-import-actions">
+    <form class="activity-upload-form" method="post" action="/activities/upload" enctype="multipart/form-data">
         <input type="file" name="file" accept=".fit,.FIT" required>
         <button type="submit">Upload .fit</button>
     </form>
-    <form method="post" action="/activities/link-duplicates">
+    <form class="activity-merge-form" method="post" action="/activities/link-duplicates">
         <button type="submit">Merge double-recorded rides</button>
     </form>
 </div>
@@ -41,7 +43,7 @@
 
 {% if activities %}
 <div class="table-scroll">
-<table class="data-table">
+<table class="data-table activities-table">
     <thead>
         <tr>
             <th class="num">Start</th><th class="num">Duration</th><th class="num">Distance</th>
@@ -77,6 +79,7 @@
 <p>No activities imported yet. Set your Zwift folder in
    <a href="/settings">Settings</a>, then rescan &mdash; or upload a .fit file.</p>
 {% endif %}
+</div>
 {% endblock %}
 
 {% block scripts %}
