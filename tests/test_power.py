@@ -92,11 +92,14 @@ def test_estimate_ftp_recent_effort_dominates_decayed_old():
         "streams": {"power": [400.0] * 1200},
     }
     est = power.estimate_ftp([recent, old], now=now)
-    # Recent wins: 300 * factor(idle~0, active~5) * 0.95 ~= 284. The
-    # recent-evidence floor sees the same effort but is decayed by the same
-    # factor, so on a plain 20-minute effort it agrees exactly rather than
-    # cancelling the decay.
-    assert est == pytest.approx(284.0, abs=0.5)
+    # Recent wins: 300 * factor(idle~0, active~5) * 0.95. Those 5 days were all
+    # training days, so they are charged staleness only - under 0.1% - and the
+    # result sits essentially on the undecayed 285. The recent-evidence floor
+    # sees the same effort decayed by the same factor, so on a plain 20-minute
+    # effort it agrees exactly rather than cancelling the decay.
+    assert est == pytest.approx(285.0 * power.detraining_factor(0.0, 5.0), abs=0.1)
+    assert est == pytest.approx(284.8, abs=0.2)
+    assert est > 285.0 * 0.999
 
 
 # ----------------------------------------------- gap-aware detraining model
@@ -129,9 +132,34 @@ def test_detraining_factor_no_decay_when_no_idle_no_active():
     assert power.detraining_factor(0.0, 0.0) == 1.0
 
 
-def test_detraining_factor_active_days_decay_slowly():
-    # 30 continuously-trained days barely touch the effort (~0.98).
-    assert power.detraining_factor(0.0, 30.0) == pytest.approx(0.979, abs=0.005)
+def test_detraining_factor_active_days_are_staleness_not_detraining():
+    # Days the rider spent TRAINING must not be charged detraining. The active
+    # term is an evidence-staleness discount only, calibrated in years:
+    # FTP_DECAY_ACTIVE_ANNUAL_LOSS per year of unbroken training, exactly.
+    year = power.detraining_factor(0.0, 365.0)
+    assert year == pytest.approx(1.0 - power.FTP_DECAY_ACTIVE_ANNUAL_LOSS, abs=1e-9)
+    # Regression on the reported bug: the old tau=1440 charged a rider who never
+    # stopped training 22% a year, a detraining-sized loss for training.
+    assert 1.0 - year < 0.06
+    # A training month is inside the noise of the underlying 20-minute number.
+    assert power.detraining_factor(0.0, 30.0) > 0.995
+    # A season of unbroken training still costs under 3%.
+    assert power.detraining_factor(0.0, 180.0) > 0.97
+
+
+def test_detraining_factor_active_term_still_retires_ancient_efforts():
+    # It is not simply removed: the recent-effort floor only looks back 42 days
+    # and can never lower the estimate, so without an active term one ancient
+    # hard effort would peg FTP forever. Three years of easy-only riding must
+    # visibly discount it - but by staleness magnitudes, not detraining ones.
+    three_years = power.detraining_factor(0.0, 3.0 * 365.0)
+    assert 0.10 < 1.0 - three_years < 0.20
+
+
+def test_detraining_factor_idle_dominates_active_by_orders_of_magnitude():
+    # The model's premise: being OFF the bike is what costs fitness. A single
+    # idle day past the grace window must outweigh a long stretch of training.
+    assert power.detraining_factor(1.0, 0.0) < power.detraining_factor(0.0, 25.0)
 
 
 def test_detraining_factor_monotonic_in_both_terms():
@@ -195,9 +223,11 @@ def test_estimate_ftp_continuous_training_barely_decays_old_effort():
     ]
     est = power.estimate_ftp(acts, now=now)
     baseline = 250.0 * 0.95  # 237.5
-    # Almost no decay: ~0.976 -> ~231.8, far above v1's effort-age ~214.
-    assert est == pytest.approx(231.8, abs=1.5)
-    assert est > 0.97 * baseline
+    # Every one of those 35 days was a training day, so the rider is charged
+    # staleness only (~0.5%) -> ~236.3, far above v1's effort-age ~214 and above
+    # the ~231.8 the old tau=1440 staleness term produced.
+    assert est == pytest.approx(236.3, abs=0.5)
+    assert est > 0.995 * baseline
 
 
 def test_estimate_ftp_fresh_hard_effort_dominates_history():

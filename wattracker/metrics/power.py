@@ -23,15 +23,37 @@ import numpy as np
 #     weeks). This includes the trailing gap from the last ride up to the anchor,
 #     so the estimate keeps decaying while a rider stays away.
 #   * active days: everything else (days the rider was training, or inside a
-#     grace window). These decay very slowly - a mild staleness term that keeps a
-#     year of easy-only riding from pegging FTP to one ancient hard effort.
+#     grace window). These are NOT charged detraining - a rider who never stops
+#     riding has not detrained. They carry only a very slow EVIDENCE-STALENESS
+#     discount (~5% per unbroken training year), because a 20-minute number from
+#     three years ago is weaker evidence about today than last month's, and
+#     without it one ancient hard effort would peg FTP forever for a rider who
+#     only ever rides easy afterwards.
 # factor = exp(-idle_excess / TAU_IDLE  -  active_days / TAU_ACTIVE)
 # This replaces the old trailing hard window (which cliffed pre-break efforts to
 # zero) and the effort-age decay (which wrongly charged detraining for days the
 # rider was actually training).
 FTP_DECAY_GRACE_DAYS = 14      # inactivity gaps shorter than this cost nothing
 FTP_DECAY_TAU_IDLE = 240       # e-folding time of detraining while off the bike
-FTP_DECAY_TAU_ACTIVE = 1440    # slow staleness of an old effort while still training
+
+# The active term is calibrated in the unit it is actually reasoned about: how
+# much a year of UNBROKEN training discounts an effort ridden at its start.
+#
+# It was previously tau = 1440 days, which costs 1 - exp(-365/1440) = 22% a
+# year. That is a detraining-sized number charged to a rider who never stopped
+# training - exactly what the model above says must not happen, and on real data
+# it was silently shaving several percent off riders who had done nothing wrong.
+#
+# It is not simply removed, because the case its docstring named is real: the
+# recent-effort floor (below) only looks back FTP_FLOOR_WINDOW_DAYS, and it is a
+# floor - it can raise the estimate but never lower it - so with no active term
+# at all, a single hard effort from years ago would hold the estimate up
+# forever, no matter how easy every ride since. 5%/yr keeps that from being
+# permanent (a 3-year-old effort is discounted ~14%) while being far too slow to
+# masquerade as detraining over the months that actually matter: a 6-month-old
+# effort loses 2.5%, well inside the noise of the underlying 20-minute number.
+FTP_DECAY_ACTIVE_ANNUAL_LOSS = 0.05
+FTP_DECAY_TAU_ACTIVE = 365.0 / -math.log(1.0 - FTP_DECAY_ACTIVE_ANNUAL_LOSS)
 
 
 def _idle_active_days(effort, anchor, activity_days) -> "tuple[float, float]":
@@ -68,10 +90,11 @@ def detraining_factor(idle_excess_days: float, active_days: float) -> float:
 
     Decay tracks INACTIVITY, not effort age: ``idle_excess_days`` (inactivity
     beyond the grace window) decays fast (tau = FTP_DECAY_TAU_IDLE), while
-    ``active_days`` (days spent training, or inside a grace window) decay slowly
+    ``active_days`` (days spent training, or inside a grace window) carry only
+    the evidence-staleness discount of FTP_DECAY_ACTIVE_ANNUAL_LOSS per year
     (tau = FTP_DECAY_TAU_ACTIVE). See ``_idle_active_days`` for how the split is
-    derived from the activity calendar. A continuously-training rider barely
-    decays; a long layoff decays substantially.
+    derived from the activity calendar. A continuously-training rider is
+    essentially undecayed over a season; a long layoff decays substantially.
     """
     return math.exp(
         -idle_excess_days / FTP_DECAY_TAU_IDLE - active_days / FTP_DECAY_TAU_ACTIVE
