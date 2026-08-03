@@ -185,9 +185,9 @@ def test_plan_zip_download(client):
     assert r.content[:2] == b"PK"  # zip magic
 
 
-def test_plan_export_to_temp_dir(client, tmp_path):
+def test_plan_export_to_temp_dir(client, home_dir):
     import os
-    out = tmp_path / "zwo"
+    out = home_dir / "zwo"
     _register(client)
     uid = db.get_user_by_username("rider")["id"]
     db.save_user_settings(uid, {"workouts_dir": str(out), "zwift_id": "me"})
@@ -823,12 +823,12 @@ def test_plan_page_not_in_effect_when_no_plan_covers_today(client, monkeypatch):
     assert "not currently in effect" in text
 
 
-def test_delete_plan_removes_rows_and_files(client, tmp_path):
+def test_delete_plan_removes_rows_and_files(client, home_dir):
     import os
     from wattracker import exporter
     from wattracker.prescribe import zwo
 
-    out = tmp_path / "zwo"
+    out = home_dir / "zwo"
     _register(client)
     uid = db.get_user_by_username("rider")["id"]
     db.save_user_settings(uid, {"workouts_dir": str(out), "zwift_id": "me"})

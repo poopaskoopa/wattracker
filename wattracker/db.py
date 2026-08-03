@@ -18,6 +18,7 @@ from typing import Callable, Dict, Iterator, List, Optional, Sequence, Union
 
 from .config import db_path
 from .config import _restrict
+from .paths import safe_zwift_id
 from .timeutil import utc_now, valid_timezone
 
 _log = logging.getLogger(__name__)
@@ -774,17 +775,31 @@ def get_user_settings(user_id: int, path: Optional[str] = None) -> dict:
 
 
 def save_user_settings(user_id: int, updates: dict, path: Optional[str] = None) -> dict:
-    """Merge non-empty updates into a user's settings row (upsert)."""
+    """Merge non-empty updates into a user's settings row (upsert).
+
+    Two keys are filtered here rather than at each caller, because this is the
+    single choke point every writer goes through: ``timezone`` (must be a real
+    IANA zone) and ``zwift_id`` (becomes one folder name under the Zwift
+    Workouts root, so it must not be able to traverse out of it). A rejected
+    value leaves the stored one unchanged; routes that can talk to the user
+    also check first, so they can say why.
+    """
     current = get_user_settings(user_id, path=path)
     for key in _SETTING_KEYS:
         if key in updates and updates[key] not in (None, ""):
             value = updates[key]
-            if key != "timezone":
-                current[key] = value
-            else:
+            if key == "timezone":
                 timezone = value.strip() if isinstance(value, str) else value
                 if valid_timezone(timezone):
                     current[key] = timezone
+            elif key == "zwift_id":
+                safe = safe_zwift_id(str(value))
+                if safe:
+                    current[key] = safe
+                else:
+                    _log.warning("refusing to store unusable zwift_id: %r", value)
+            else:
+                current[key] = value
     conn = connect(path)
     try:
         conn.execute(

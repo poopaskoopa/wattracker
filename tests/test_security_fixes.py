@@ -5,6 +5,8 @@ import base64
 import os
 import secrets
 import stat
+import threading
+import time
 import types
 
 import pytest
@@ -13,8 +15,10 @@ pytest.importorskip("httpx")
 from fastapi.testclient import TestClient  # noqa: E402
 from starlette.websockets import WebSocketDisconnect  # noqa: E402
 
-from wattracker import backup, config, credstore, db  # noqa: E402
+from wattracker import auth, backup, config, credstore, db, paths  # noqa: E402
 from wattracker.ingest import fit_parser  # noqa: E402
+from wattracker.prescribe import zwo  # noqa: E402
+from wattracker import server as server_mod  # noqa: E402
 from wattracker.server import create_app  # noqa: E402
 
 
@@ -127,9 +131,9 @@ def test_settings_accepts_dir_under_home(client, tmp_path, monkeypatch):
 def test_settings_accepts_configured_redirect_outside_home(
     client, tmp_path, monkeypatch
 ):
-    home = tmp_path / "home"
+    home = tmp_path / "home"  # already the sandboxed HOME (conftest)
     redirected = tmp_path / "redirected-documents" / "Zwift" / "Activities"
-    home.mkdir()
+    home.mkdir(exist_ok=True)
     redirected.mkdir(parents=True)
     monkeypatch.setenv("HOME", str(home))
     monkeypatch.setenv("WATTRACKER_ACTIVITIES_DIR", str(redirected))
@@ -146,9 +150,9 @@ def test_settings_accepts_configured_redirect_outside_home(
 def test_settings_rejects_symlink_escape_from_trusted_root(
     client, tmp_path, monkeypatch
 ):
-    home = tmp_path / "home"
+    home = tmp_path / "home"  # already the sandboxed HOME (conftest)
     outside = tmp_path / "outside"
-    home.mkdir()
+    home.mkdir(exist_ok=True)
     outside.mkdir()
     link = home / "escaped"
     link.symlink_to(outside, target_is_directory=True)
@@ -246,3 +250,681 @@ def test_logout_get_not_allowed(client):
     r = client.get("/logout", follow_redirects=False)
     assert r.status_code in (404, 405)
     assert client.get("/", follow_redirects=False).status_code == 200  # still authed
+
+
+# =====================================================================
+# 2026-07-27 review
+# =====================================================================
+
+def _poison_setting(user_id: int, key: str, value: str) -> None:
+    """Write a settings value straight into the DB, past every write-side check.
+
+    This is the "already stored before the fix" case: a row written by an older
+    build (POST /activities/rescan persisted whatever was posted), restored from
+    a backup, or hand-edited. Nothing may treat it as trusted merely because it
+    is in the database now.
+    """
+    db.save_user_settings(user_id, {})  # ensure the row exists
+    conn = db.connect()
+    try:
+        conn.execute(
+            f"UPDATE user_settings SET {key} = ? WHERE user_id = ?", (value, user_id)
+        )
+        conn.commit()
+    finally:
+        conn.close()
+    assert db.get_user_settings(user_id)[key] == value
+
+
+# ------------------- H1 (review) /login password-hash memory exhaustion
+#
+# scrypt at the configured cost peaks at ~128 MiB per hash and /login is
+# unauthenticated, so what has to be bounded is the number of hashes running at
+# once. LoginThrottle cannot do it: it is keyed by username, and the attack
+# rotates the username on every request.
+
+def test_hash_limiter_caps_concurrency_and_sheds_the_excess():
+    limiter = auth.PasswordHashLimiter(
+        max_concurrent=2, max_waiting=0, wait_timeout=0.0
+    )
+    release = threading.Event()
+    holding = threading.Semaphore(0)
+    shed = []
+
+    def worker():
+        try:
+            with limiter.reserve():
+                holding.release()
+                release.wait(timeout=10)
+        except auth.HashCapacityExceeded:
+            shed.append(1)
+
+    threads = [threading.Thread(target=worker) for _ in range(6)]
+    for t in threads:
+        t.start()
+    try:
+        # Exactly max_concurrent hashes may be in flight, whatever the order the
+        # threads got there in; the other four are refused, not queued.
+        assert holding.acquire(timeout=10)
+        assert holding.acquire(timeout=10)
+        deadline = time.time() + 10
+        while len(shed) < 4 and time.time() < deadline:
+            time.sleep(0.01)
+        assert len(shed) == 4  # uncapped, none of them would ever be refused
+        assert limiter.in_flight == 2
+    finally:
+        release.set()
+        for t in threads:
+            t.join(timeout=10)
+    assert limiter.peak_in_flight == 2
+    assert limiter.shed_total == 4
+    assert len(shed) == 4
+    assert limiter.in_flight == 0
+
+
+def test_hash_limiter_queues_briefly_then_sheds_on_timeout():
+    """A short bounded wait, then a shed: queueing without a bound just turns
+    memory exhaustion into unbounded latency (and pins ASGI worker threads)."""
+    limiter = auth.PasswordHashLimiter(
+        max_concurrent=1, max_waiting=4, wait_timeout=0.05
+    )
+    release = threading.Event()
+    with limiter.reserve():
+        # A waiter that never gets a slot is shed once its timeout expires.
+        with pytest.raises(auth.HashCapacityExceeded):
+            with limiter.reserve():
+                pass
+    release.set()
+    # With the slot free again, the next caller is served normally.
+    with limiter.reserve():
+        assert limiter.in_flight == 1
+
+
+def test_login_flood_with_rotating_usernames_cannot_exceed_the_ceiling(monkeypatch):
+    """The actual attack: cross-origin-style POSTs that never repeat a username.
+
+    Without a global cap every one of them buys ~128 MiB concurrently. The
+    assertion is on the cap being enforced (peak in-flight hashes and shed
+    responses), not on RSS.
+    """
+    app = create_app()
+    limiter = auth.PasswordHashLimiter(
+        max_concurrent=2, max_waiting=2, wait_timeout=0.05
+    )
+    app.state.hash_limiter = limiter
+    attempts = 12
+    with TestClient(app) as c:
+        c.post("/register", data={"username": "owner", "password": "password123"})
+        c.post("/logout")
+
+        # Stand in for scrypt: same shape, same cost profile, no 128 MiB.
+        def slow_verify(password, stored):
+            time.sleep(0.25)
+            return False
+
+        monkeypatch.setattr(auth, "verify_password", slow_verify)
+        monkeypatch.setattr(auth, "dummy_verify", lambda password: time.sleep(0.25))
+
+        statuses = []
+        lock = threading.Lock()
+
+        def attempt(i):
+            r = c.post(
+                "/login",
+                data={"username": f"ghost{i}", "password": "password123"},
+            )
+            with lock:
+                statuses.append(r.status_code)
+
+        threads = [threading.Thread(target=attempt, args=(i,))
+                   for i in range(attempts)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(timeout=30)
+
+    assert len(statuses) == attempts
+    # THE ceiling: the cap binds (the flood did overlap) and is never exceeded.
+    assert limiter.peak_in_flight == limiter.max_concurrent == 2
+    # The excess is shed fast, not queued behind an unbounded backlog.
+    assert limiter.shed_total >= 1
+    assert statuses.count(503) == limiter.shed_total
+    assert statuses.count(200) >= 1  # genuine attempts still got answered
+    assert set(statuses) <= {200, 503}
+    # The per-username throttle is blind to this shape - which is why the
+    # global cap has to exist. Not one of these usernames is locked out.
+    throttle = app.state.login_throttle
+    assert all(throttle.retry_after(f"ghost{i}") == 0.0 for i in range(attempts))
+    # ...but the unkeyed counter saw every one of them (visibility, not refusal).
+    assert app.state.login_failures.count == attempts
+
+
+def test_register_is_gated_by_the_same_hash_ceiling(monkeypatch):
+    """/register hashes too and is auth-exempt: gating only /login would just
+    move the flood one route across."""
+    app = create_app()
+    app.state.hash_limiter = auth.PasswordHashLimiter(
+        max_concurrent=1, max_waiting=0, wait_timeout=0.0
+    )
+    with TestClient(app) as c:
+        with app.state.hash_limiter.reserve():  # occupy the only slot
+            r = c.post(
+                "/register", data={"username": "newbie", "password": "password123"}
+            )
+        assert r.status_code == 503
+        assert r.headers["retry-after"] == "5"
+        assert db.get_user_by_username("newbie") is None
+        # Slot free again: registration works normally.
+        assert c.post(
+            "/register", data={"username": "newbie", "password": "password123"}
+        ).status_code == 200
+        assert db.get_user_by_username("newbie") is not None
+
+
+def test_login_shed_response_is_generic_and_costs_no_hash(monkeypatch):
+    app = create_app()
+    app.state.hash_limiter = auth.PasswordHashLimiter(
+        max_concurrent=1, max_waiting=0, wait_timeout=0.0
+    )
+    with TestClient(app) as c:
+        c.post("/register", data={"username": "owner", "password": "password123"})
+        c.post("/logout")
+
+        def boom(*a, **kw):
+            raise AssertionError("no password hash may run once shedding")
+
+        monkeypatch.setattr(auth, "verify_password", boom)
+        monkeypatch.setattr(auth, "dummy_verify", boom)
+        with app.state.hash_limiter.reserve():
+            known = c.post(
+                "/login", data={"username": "owner", "password": "password123"}
+            )
+            unknown = c.post(
+                "/login", data={"username": "ghost", "password": "password123"}
+            )
+    assert known.status_code == unknown.status_code == 503
+    # No username-enumeration oracle in the shed path.
+    assert known.text == unknown.text
+
+
+def test_login_and_register_refuse_cross_origin_browser_posts(monkeypatch):
+    """The drive-by: a page on evil.example.com POSTs a form at
+    http://localhost:8000/login. It can't read the reply, but pre-fix the
+    server had already paid ~128 MiB for it."""
+    app = create_app()
+    with TestClient(app) as c:
+        def boom(*a, **kw):
+            raise AssertionError("cross-origin post must not reach the hasher")
+
+        monkeypatch.setattr(auth, "verify_password", boom)
+        monkeypatch.setattr(auth, "dummy_verify", boom)
+        monkeypatch.setattr(auth, "hash_password", boom)
+        for path in ("/login", "/register"):
+            r = c.post(
+                path,
+                data={"username": "victim", "password": "password123"},
+                headers={"origin": "https://evil.example.com"},
+            )
+            assert r.status_code == 403, path
+
+
+def test_login_accepts_same_host_origin_and_the_tailnet_origin(monkeypatch):
+    """The Origin check compares HOSTS only, on purpose: `tailscale serve`
+    terminates TLS and forwards plain http to this loopback socket, so the
+    browser's https Origin legitimately differs in scheme and port from the
+    request the app sees. A strict comparison would lock the owner out."""
+    monkeypatch.setenv("WATTRACKER_PUBLIC_HOST", "box.example.ts.net")
+    app = create_app()
+    with TestClient(app) as c:
+        c.post("/register", data={"username": "owner", "password": "password123"})
+        c.post("/logout")
+        same_host = c.post(
+            "/login",
+            data={"username": "owner", "password": "password123"},
+            headers={"origin": "http://testserver"},
+            follow_redirects=False,
+        )
+        assert same_host.status_code == 303  # logged in
+        c.post("/logout")
+        tailnet = c.post(
+            "/login",
+            data={"username": "owner", "password": "password123"},
+            headers={"origin": "https://box.example.ts.net"},
+            follow_redirects=False,
+        )
+        assert tailnet.status_code == 303
+
+
+def test_normal_login_still_works_without_an_origin_header(client):
+    _register(client)
+    client.post("/logout")
+    r = client.post(
+        "/login", data={"username": "tester", "password": "password123"},
+        follow_redirects=False,
+    )
+    assert r.status_code == 303
+    assert client.get("/", follow_redirects=False).status_code == 200
+
+
+# ------------------------- M1 (review) zwift_id path-traversal confinement
+#
+# The zwift id is joined onto the Zwift Workouts root as a folder name and the
+# exporters makedirs() the result, so an id like "../../.." was an
+# arbitrary-directory-create plus arbitrary .zwo write outside the root.
+
+@pytest.mark.parametrize("bad", [
+    "../../etc", "..", ".", "/etc", "a/b", "a\\b", "C:\\Windows",
+    "with:colon", "nul\0byte", "x" * 65,
+])
+def test_safe_zwift_id_rejects_anything_that_is_not_a_bare_folder_name(bad):
+    assert paths.safe_zwift_id(bad) is None
+
+
+@pytest.mark.parametrize("good", ["1234567", "me", "not a number", "rider-1"])
+def test_safe_zwift_id_accepts_plain_folder_names(good):
+    assert paths.safe_zwift_id(good) == good
+
+
+def test_settings_rejects_traversing_zwift_id(client):
+    _register(client)
+    r = client.post("/settings", data={"zwift_id": "../../../../tmp/pwned"})
+    assert r.status_code == 200
+    assert "plain folder name" in r.text
+    uid = db.get_user_by_username("tester")["id"]
+    assert db.get_user_settings(uid)["zwift_id"] is None
+
+
+def test_settings_still_saves_a_normal_zwift_id(client):
+    _register(client)
+    r = client.post("/settings", data={"zwift_id": "1234567"})
+    assert r.status_code == 200
+    uid = db.get_user_by_username("tester")["id"]
+    assert db.get_user_settings(uid)["zwift_id"] == "1234567"
+
+
+def test_save_user_settings_refuses_a_traversing_zwift_id(user_id):
+    db.save_user_settings(user_id, {"zwift_id": "1234567"})
+    db.save_user_settings(user_id, {"zwift_id": "../../escape"})
+    # The bad write is dropped; the previous good value survives.
+    assert db.get_user_settings(user_id)["zwift_id"] == "1234567"
+
+
+def test_stored_traversing_zwift_id_cannot_escape_the_workouts_root(user_id):
+    """The stored-before-the-fix case: validating on write is not enough."""
+    root = os.path.realpath(os.environ["WATTRACKER_ZWIFT_WORKOUTS_ROOT"])
+    escape_rel = "../../pwned-by-zwift-id"
+    _poison_setting(user_id, "zwift_id", escape_rel)
+    stored = db.get_user_settings(user_id)["zwift_id"]
+
+    target = os.path.realpath(paths.workouts_dir(stored))
+    assert os.path.commonpath([target, root]) == root
+
+    # End to end: the exporter writes, and makedirs(), inside the root only.
+    result = zwo.write_plan_to_zwift(
+        [{"date": "2026-07-07", "name": "Test", "zwo": "<workout_file/>"}],
+        stored or "me",
+    )
+    written = os.path.realpath(result["paths"][0])
+    assert os.path.commonpath([written, root]) == root
+    assert not os.path.exists(os.path.join(root, escape_rel))
+
+
+def test_stored_traversing_zwift_id_is_not_resolved_as_an_export_dir(user_id, tmp_path):
+    """resolve_export_dir() only accepted an id whose folder EXISTS - so an
+    attacker pointed it at any directory on the machine that does."""
+    root = os.path.realpath(os.environ["WATTRACKER_ZWIFT_WORKOUTS_ROOT"])
+    outside = tmp_path / "outside-target"
+    outside.mkdir()
+    _poison_setting(user_id, "zwift_id", f"../{outside.name}")
+    stored = db.get_user_settings(user_id)["zwift_id"]
+    directory, reason = paths.resolve_export_dir(stored, None)
+    assert reason != "zwift_id"
+    assert directory is None or os.path.commonpath(
+        [os.path.realpath(directory), root]
+    ) == root
+
+
+# ---------------- stored workouts_dir confinement (read side)
+#
+# The stronger of the two stored-path primitives: zwift_id is ONE component
+# joined onto a trusted root, workouts_dir is the whole path, and it reaches
+# os.makedirs() + open(..., "w"). paths.workouts_dir() began "if override:
+# return override" - no confinement at all - so a poisoned row was an arbitrary
+# directory create plus an arbitrary .zwo write. Same argument as activities_dir
+# and zwift_id: a row is not trustworthy for being in the DB.
+
+_ESCAPE_DIR = "/private/tmp/wt_escape/deep"
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX absolute path")
+def test_stored_workouts_dir_cannot_escape_the_trusted_roots(user_id):
+    """The PoC: poison the row, then do exactly what the export routes do."""
+    _poison_setting(user_id, "workouts_dir", _ESCAPE_DIR)
+    _poison_setting(user_id, "zwift_id", "123")
+    settings = db.get_user_settings(user_id)
+    assert settings["workouts_dir"] == _ESCAPE_DIR  # the row really is poisoned
+
+    result = zwo.write_plan_to_zwift(
+        [{"date": "2026-08-05", "name": "pwn", "zwo": "<workout_file/>"}],
+        settings.get("zwift_id") or "me",
+        workouts_override=settings.get("workouts_dir"),
+    )
+    # Nothing was created outside, and the write landed in the trusted root.
+    assert not os.path.exists("/private/tmp/wt_escape")
+    root = os.path.realpath(os.environ["WATTRACKER_ZWIFT_WORKOUTS_ROOT"])
+    for written in result["paths"]:
+        assert os.path.commonpath([os.path.realpath(written), root]) == root
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX absolute path")
+def test_stored_workouts_dir_outside_roots_is_reported_not_silently_redirected(user_id):
+    """resolve_export_dir() says 'blocked' so the UI can tell the user.
+
+    Silently exporting somewhere else would leave a user staring at a Zwift
+    folder that never fills up, with only a log line to explain it.
+    """
+    _poison_setting(user_id, "workouts_dir", _ESCAPE_DIR)
+    settings = db.get_user_settings(user_id)
+    assert paths.resolve_export_dir(
+        settings.get("zwift_id"), settings.get("workouts_dir")
+    ) == (None, "blocked")
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX absolute path")
+def test_poisoned_workouts_dir_blocks_export_through_the_exporter(user_id):
+    """exporter.sync_plan_exports() is one of the 7 read sites; it must not
+    write - or unlink - anything outside the trusted roots."""
+    from wattracker import exporter
+
+    _poison_setting(user_id, "workouts_dir", _ESCAPE_DIR)
+    result = exporter.sync_plan_exports(user_id)
+    assert result["status"] == "blocked"
+    assert result["directory"] is None
+    assert result["exported"] == 0
+    assert not os.path.exists("/private/tmp/wt_escape")
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX absolute path")
+def test_poisoned_workouts_dir_blocks_the_plan_export_route(client):
+    """End to end through HTTP: the route must not create the directory."""
+    _register(client)
+    uid = db.get_user_by_username("tester")["id"]
+    _poison_setting(uid, "workouts_dir", _ESCAPE_DIR)
+    r = client.post("/plan/1/export")
+    assert r.status_code in (200, 303, 404)
+    assert not os.path.exists("/private/tmp/wt_escape")
+
+
+def test_stored_workouts_dir_inside_the_trusted_roots_still_works(user_id, home_dir):
+    """The confinement must not break the legitimate configured-folder case."""
+    good = home_dir / "Documents" / "Zwift" / "Workouts" / "123"
+    good.mkdir(parents=True)
+    db.save_user_settings(user_id, {"workouts_dir": str(good), "zwift_id": "123"})
+    settings = db.get_user_settings(user_id)
+    directory, reason = paths.resolve_export_dir(
+        settings.get("zwift_id"), settings.get("workouts_dir")
+    )
+    assert reason == "override"
+    assert os.path.realpath(directory) == os.path.realpath(str(good))
+
+
+# ------------------- M2 (review) POST /activities/rescan confinement
+#
+# The endpoint scanned AND persisted whatever directory was posted, straight
+# past the /settings check.
+
+@pytest.mark.skipif(os.name == "nt", reason="/etc is POSIX-specific")
+def test_rescan_rejects_dir_outside_trusted_roots(client):
+    _register(client)
+    r = client.post("/activities/rescan", data={"activities_dir": "/etc"})
+    assert r.status_code == 400
+    assert "inside your home directory" in r.json()["error"]
+    uid = db.get_user_by_username("tester")["id"]
+    assert db.get_user_settings(uid)["activities_dir"] is None
+    # No scan was started either. (The status dict is process-global and may
+    # still hold an earlier test's entry for this user id - what matters is
+    # that no scan of the rejected folder was ever started.)
+    status = client.get("/api/scan/status").json()
+    assert status.get("directory") != "/etc"
+
+
+def test_rescan_rejects_traversal_out_of_a_trusted_root(client, tmp_path):
+    _register(client)
+    outside = tmp_path / "outside-activities"
+    outside.mkdir()
+    root = os.environ["WATTRACKER_ZWIFT_WORKOUTS_ROOT"]  # a trusted root
+    r = client.post(
+        "/activities/rescan",
+        data={"activities_dir": os.path.join(root, "..", outside.name)},
+    )
+    assert r.status_code == 400
+    uid = db.get_user_by_username("tester")["id"]
+    assert db.get_user_settings(uid)["activities_dir"] is None
+
+
+def test_rescan_still_scans_a_folder_inside_the_trusted_roots(client, tmp_path,
+                                                              monkeypatch):
+    from wattracker.ingest import importer as importer_mod
+
+    home = os.path.realpath(tmp_path)
+    monkeypatch.setenv("HOME", home)
+    _register(client)
+    act_dir = os.path.join(home, "Rides")
+    os.mkdir(act_dir)
+    open(os.path.join(act_dir, "ride.fit"), "wb").write(b"dummy")
+    monkeypatch.setattr(importer_mod, "parse_fit", lambda path: {
+        "start_time": "2026-06-01T10:00:00",
+        "duration_s": 60,
+        "streams": {"time": [None] * 60, "power": [200.0] * 60,
+                    "heartrate": [140.0] * 60, "cadence": [90.0] * 60,
+                    "distance": list(range(60)), "altitude": [0.0] * 60},
+    })
+    r = client.post("/activities/rescan", data={"activities_dir": act_dir})
+    assert r.status_code == 202
+    deadline = time.time() + 10
+    while time.time() < deadline:
+        status = client.get("/api/scan/status").json()
+        if not status.get("running"):
+            break
+        time.sleep(0.02)
+    assert status["directory"] == act_dir
+    assert status["imported"] == 1
+    uid = db.get_user_by_username("tester")["id"]
+    assert db.get_user_settings(uid)["activities_dir"] == act_dir
+
+
+def test_stored_activities_dir_outside_the_roots_is_never_scanned(user_id, tmp_path):
+    """The stored-before-the-fix case for the scanner: a row planted through
+    the old rescan hole must stop being obeyed, including by the daily sweep."""
+    from wattracker.ingest import importer as importer_mod
+
+    outside = tmp_path / "outside-activities"
+    outside.mkdir()
+    (outside / "ride.fit").write_bytes(b"dummy")
+    _poison_setting(user_id, "activities_dir", str(outside))
+
+    result = importer_mod.scan_activities(user_id)
+    assert result["found"] == 0
+    assert result["directory"] is None
+    assert db.list_activities(user_id) == []
+
+
+# ------------------- LoginAttemptCounter (unkeyed login-failure visibility)
+#
+# The counter exists because auth.LoginThrottle is keyed by username: an
+# attacker who never reuses a username leaves every key at one failure and the
+# throttle stays silent. A single unkeyed count is the only thing that sees
+# that shape. It is visibility ONLY - it must never refuse anything, because a
+# global refusal would let one bad client lock the legitimate owner out.
+
+def test_login_attempt_counter_counts_and_returns_the_running_total():
+    counter = server_mod.LoginAttemptCounter()
+    assert counter.count == 0
+    assert counter.record_failure() == 1
+    assert counter.record_failure() == 2
+    assert counter.count == 2
+
+
+def test_login_attempt_counter_is_unkeyed():
+    """No username/address argument exists: rotating either cannot split the
+    tally into buckets that each stay under the threshold."""
+    import inspect
+
+    sig = inspect.signature(server_mod.LoginAttemptCounter.record_failure)
+    assert list(sig.parameters) == ["self"]
+
+
+def test_login_attempt_counter_refuses_nothing():
+    """record_failure() never raises and never signals 'deny' - the return is a
+    monotonically rising count, not a verdict."""
+    counter = server_mod.LoginAttemptCounter()
+    totals = [counter.record_failure() for _ in range(200)]
+    assert totals == list(range(1, 201))
+    assert all(isinstance(t, int) for t in totals)
+    assert counter.count == 200
+
+
+def test_login_attempt_counter_is_threadsafe():
+    """Concurrent failures must not lose counts to a read-modify-write race."""
+    counter = server_mod.LoginAttemptCounter()
+    threads = [
+        threading.Thread(target=lambda: [counter.record_failure() for _ in range(50)])
+        for _ in range(8)
+    ]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(timeout=30)
+    assert counter.count == 8 * 50
+
+
+def test_record_login_failure_logs_every_threshold_th_attempt(caplog):
+    """The log line is the whole point of the counter: it must fire on each
+    multiple of the threshold and stay quiet in between."""
+    counter = server_mod.LoginAttemptCounter()
+    threshold = server_mod.LOGIN_FAILURE_LOG_THRESHOLD
+    assert threshold > 1  # otherwise 'in between' is not a state
+
+    logged_at = []
+    with caplog.at_level("WARNING", logger="wattracker.server"):
+        for _ in range(threshold * 3):
+            caplog.clear()
+            total = server_mod._record_login_failure(counter)
+            if any("refused login attempts since start" in r.message
+                   for r in caplog.records):
+                logged_at.append(total)
+
+    assert logged_at == [threshold, threshold * 2, threshold * 3]
+
+
+def test_record_login_failure_rollover_keeps_counting_past_the_threshold(caplog):
+    """Rollover is a modulo, not a reset: the total keeps rising and the
+    message reports the true running total, not the position within a window."""
+    counter = server_mod.LoginAttemptCounter()
+    threshold = server_mod.LOGIN_FAILURE_LOG_THRESHOLD
+
+    with caplog.at_level("WARNING", logger="wattracker.server"):
+        for _ in range(threshold * 2):
+            server_mod._record_login_failure(counter)
+
+    assert counter.count == threshold * 2
+    messages = [r.getMessage() for r in caplog.records
+                if "refused login attempts since start" in r.getMessage()]
+    assert messages == [
+        f"{threshold} refused login attempts since start (all usernames)",
+        f"{threshold * 2} refused login attempts since start (all usernames)",
+    ]
+
+
+def test_record_login_failure_returns_the_total_and_never_raises():
+    counter = server_mod.LoginAttemptCounter()
+    threshold = server_mod.LOGIN_FAILURE_LOG_THRESHOLD
+    # Crossing the threshold must not change the return contract.
+    totals = [server_mod._record_login_failure(counter)
+              for _ in range(threshold + 3)]
+    assert totals == list(range(1, threshold + 4))
+
+
+def test_rotating_usernames_trip_the_counter_but_never_the_throttle(client):
+    """The exact shape the counter exists for, end to end through /login.
+
+    Every attempt uses a fresh username, so the per-username throttle stays at
+    zero for all of them - and every one of those users can still log in. The
+    unkeyed counter is what noticed.
+    """
+    _register(client, "victim", "password123")
+    app = client.app
+    attempts = server_mod.LOGIN_FAILURE_LOG_THRESHOLD + 2
+    before = app.state.login_failures.count
+
+    for i in range(attempts):
+        r = client.post(
+            "/login", data={"username": f"ghost{i}", "password": "wrong-password"}
+        )
+        assert r.status_code == 200  # refused the login, but never rate-limited
+
+    assert app.state.login_failures.count == before + attempts
+    throttle = app.state.login_throttle
+    assert all(throttle.retry_after(f"ghost{i}") == 0.0 for i in range(attempts))
+    # The counter refused nothing: the real owner is not locked out.
+    assert throttle.retry_after("victim") == 0.0
+    r = client.post(
+        "/login", data={"username": "victim", "password": "password123"},
+        follow_redirects=False,
+    )
+    assert r.status_code == 303
+
+
+def test_the_counter_also_sees_shed_attempts(client):
+    """A flood answered with 503 by the hash limiter is still a refused login
+    attempt and must still be counted - otherwise the attack that motivated the
+    limiter is exactly the one the counter goes blind to."""
+    app = client.app
+    app.state.hash_limiter = auth.PasswordHashLimiter(
+        max_concurrent=1, max_waiting=0, wait_timeout=0.0
+    )
+    before = app.state.login_failures.count
+    with app.state.hash_limiter.reserve():  # occupy the only slot
+        r = client.post(
+            "/login", data={"username": "ghost", "password": "password123"}
+        )
+    assert r.status_code == 503
+    assert app.state.login_failures.count == before + 1
+
+
+def test_shedding_does_not_lock_the_owner_out_through_the_throttle(client):
+    """Shedding must NOT call throttle.record_failure.
+
+    Otherwise the hash limiter becomes a lockout weapon: an attacker floods
+    until every request sheds, and each shed 503 counts as a failure against
+    whatever username was posted - so naming the real owner locks them out of
+    their own machine without ever guessing a password.
+    """
+    _register(client, "owner", "password123")
+    app = client.app
+    app.state.hash_limiter = auth.PasswordHashLimiter(
+        max_concurrent=1, max_waiting=0, wait_timeout=0.0
+    )
+    # Comfortably past LoginThrottle's default threshold of 5 consecutive
+    # failures, all naming the SAME username - the shape that would lock out.
+    shed = 12
+    with app.state.hash_limiter.reserve():  # occupy the only slot
+        for _ in range(shed):
+            r = client.post(
+                "/login", data={"username": "owner", "password": "wrong-password"}
+            )
+            assert r.status_code == 503
+
+    # Control: that many genuine failures DOES lock a username out, so the
+    # count above is unambiguously enough to trip the throttle.
+    for _ in range(shed):
+        app.state.login_throttle.record_failure("control-user")
+    assert app.state.login_throttle.retry_after("control-user") > 0
+
+    # The owner, however, is untouched and can still log in.
+    assert app.state.login_throttle.retry_after("owner") == 0.0
+    r = client.post(
+        "/login", data={"username": "owner", "password": "password123"},
+        follow_redirects=False,
+    )
+    assert r.status_code == 303

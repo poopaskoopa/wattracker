@@ -285,8 +285,8 @@ def test_inserted_rows_carry_generated_origin(user_id):
     assert reflow.reflow_plan(user_id, plan_id, now=NOW)["inserted"] == 0
 
 
-def test_reflow_rewrites_the_zwift_export(user_id, tmp_path):
-    out = tmp_path / "zwo"
+def test_reflow_rewrites_the_zwift_export(user_id, home_dir):
+    out = home_dir / "zwo"
     out.mkdir()
     db.save_user_settings(user_id, {"workouts_dir": str(out)})
     plan_id = _seed_plan(user_id)

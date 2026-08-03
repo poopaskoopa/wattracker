@@ -84,10 +84,59 @@ def test_workouts_env_override_wins_consistently(monkeypatch, tmp_path):
     }]
 
 
-def test_function_workouts_override_wins_over_environment(monkeypatch):
-    monkeypatch.setenv("WATTRACKER_WORKOUTS_DIR", "/environment")
-    assert paths.workouts_dir("123", "/per-user") == "/per-user"
-    assert paths.resolve_export_dir("123", "/per-user") == ("/per-user", "override")
+def test_function_workouts_override_wins_over_environment(
+    monkeypatch, tmp_path, home_dir
+):
+    # The per-user override still beats the environment - but only a confined
+    # one, i.e. a folder inside the sandboxed HOME that the Settings form would
+    # also accept.
+    per_user = home_dir / "per-user"
+    per_user.mkdir()
+    monkeypatch.setenv("WATTRACKER_WORKOUTS_DIR", str(tmp_path / "environment"))
+    assert paths.workouts_dir("123", str(per_user)) == str(per_user)
+    assert paths.resolve_export_dir("123", str(per_user)) == (str(per_user), "override")
+
+
+def test_workouts_override_outside_trusted_roots_is_refused(monkeypatch, tmp_path):
+    """A stored workouts_dir pointing outside the trusted roots is not honoured.
+
+    The Settings form validates on write, but a row can predate that check,
+    come from a restored backup or be hand-edited - and this value reaches
+    os.makedirs() plus open(..., "w"), so it is an arbitrary directory create
+    plus arbitrary .zwo write. resolve_export_dir() reports it ('blocked')
+    rather than silently exporting somewhere else; workouts_dir() falls back to
+    the default it would use with no override at all.
+    """
+    escape = "/private/tmp/wt_unit_escape/deep"
+    env_root = tmp_path / "ZwiftWorkouts"  # conftest's trusted root
+    monkeypatch.delenv("WATTRACKER_WORKOUTS_DIR", raising=False)
+
+    assert paths.resolve_export_dir("123", escape) == (None, "blocked")
+
+    resolved = paths.workouts_dir("123", override=escape)
+    assert resolved == os.path.join(str(env_root), "123")
+    assert not resolved.startswith("/private/tmp/wt_unit_escape")
+    assert not os.path.exists("/private/tmp/wt_unit_escape")
+
+
+def test_workouts_override_symlink_escape_is_refused(tmp_path, home_dir):
+    """Containment is checked on the realpath, so a symlink out is refused.
+
+    The link itself sits INSIDE the sandboxed HOME - a lexical containment
+    check would accept it. Only resolving the target catches this.
+    """
+    outside = tmp_path / "outside-target"
+    outside.mkdir()
+    link = home_dir / "looks-legit"
+    link.symlink_to(outside, target_is_directory=True)
+    # Guard against the test passing for the wrong reason: the link path really
+    # is under the trusted home, and a sibling real directory there is accepted.
+    sibling = home_dir / "real"
+    sibling.mkdir()
+    assert paths.resolve_export_dir("123", str(sibling)) == (str(sibling), "override")
+
+    assert paths.resolve_export_dir("123", str(link)) == (None, "blocked")
+    assert paths.workouts_dir("123", override=str(link)) != str(link)
 
 
 def test_trusted_roots_include_redirects_and_process_overrides(monkeypatch):
