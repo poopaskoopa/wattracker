@@ -512,6 +512,10 @@ def _ctx(request: Request, **kw) -> dict:
                     continue
             pending.append(item)
         kw.setdefault("pending_ratings", pending)
+        # What the rider's own ratings imply for a manually-set training FTP.
+        # Only the pages that already show the FTP render it (settings,
+        # profile); it lives here so both read the same one row.
+        kw.setdefault("ftp_suggestion", db.pending_ftp_suggestion(uid))
     return kw
 
 
@@ -1043,6 +1047,40 @@ def create_app() -> FastAPI:
         except Exception:
             _log.warning("profile refresh after FTP save failed", exc_info=True)
         return RedirectResponse("/profile?saved=ftp", status_code=303)
+
+    @app.post("/ftp-suggestion")
+    def ftp_suggestion_resolve(
+        request: Request,
+        suggestion_id: int = Form(...),
+        action: str = Form("dismiss"),
+        next_path: str = Form("/settings"),
+    ):
+        """Accept ('use') or dismiss the rider's pending FTP suggestion.
+
+        Accepting writes the number as their manual override - the same thing
+        typing it into the FTP field does - so the training FTP still only ever
+        moves because the rider said so. Dismissing changes nothing; the
+        evidence behind it was consumed when the suggestion was filed, so it
+        does not immediately come back.
+        """
+        uid = _uid(request)
+        target = next_path if next_path in ("/settings", "/profile") else "/settings"
+        row = db.resolve_ftp_suggestion(
+            uid, suggestion_id, "accepted" if action == "use" else "dismissed"
+        )
+        if row is None:
+            return RedirectResponse(target, status_code=303)
+        if action == "use":
+            value = int(round(float(row["suggested_ftp"])))
+            db.set_user_ftp_override(uid, max(1, min(2000, value)))
+            try:
+                profile_store.refresh(uid)
+            except Exception:
+                _log.warning(
+                    "profile refresh after FTP suggestion failed", exc_info=True
+                )
+        outcome = "used" if action == "use" else "dismissed"
+        return RedirectResponse(f"{target}?ftp_suggestion={outcome}", status_code=303)
 
     @app.post("/profile/hr-max", response_class=HTMLResponse)
     def profile_hr_max_save(

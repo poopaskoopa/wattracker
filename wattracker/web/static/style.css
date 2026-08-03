@@ -529,6 +529,8 @@ table.calendar th { text-align: center; }
 .rpe-queue-item { display: flex; align-items: center; gap: 0.6rem;
     flex-wrap: wrap; margin-top: 0.45rem; }
 .rpe-queue-item label { margin: 0; }
+.ftp-suggestion-actions { display: flex; gap: 0.6rem; flex-wrap: wrap;
+    margin-top: 0.55rem; }
 .rpe-queue-item select { margin-left: 0.4rem; }
 .status-ok {
     background: rgba(76, 175, 125, 0.12); border-color: rgba(76, 175, 125, 0.55);
