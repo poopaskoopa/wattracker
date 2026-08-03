@@ -21,7 +21,7 @@ from ..metrics.power import (
     training_stress_score,
 )
 from ..metrics import profile_store
-from ..paths import activities_dir
+from ..paths import activities_dir, confined_stored_dir
 from ..timeutil import parse_naive, utc_now, utc_today
 from .fit_parser import parse_fit
 
@@ -460,8 +460,19 @@ def backfill_duplicate_links(user_id: int) -> int:
 
 
 def _user_activities_dir(user_id: int) -> Optional[str]:
-    override = db.get_user_settings(user_id).get("activities_dir")
-    return activities_dir(override=override)
+    """The folder this user's scans read from (stored override, else discovery).
+
+    The stored value is re-confined on every read, not trusted because it is in
+    the database: POST /activities/rescan persisted whatever was posted until
+    the confinement landed, and a row can also arrive from a restored backup.
+    A stored value that escapes the trusted roots means NOTHING is scanned for
+    this user (None, logged) - deliberately not "fall back to OS discovery",
+    which would quietly import from a folder the user never configured.
+    """
+    stored = db.get_user_settings(user_id).get("activities_dir")
+    if stored:
+        return confined_stored_dir(stored, "activities_dir")
+    return activities_dir(override=None)
 
 
 def scan_activities(

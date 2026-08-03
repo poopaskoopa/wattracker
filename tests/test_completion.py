@@ -1,8 +1,10 @@
 """Tests: daily auto-scan, plan-workout completion matching, schema migration."""
 import asyncio
 import datetime as dt
+import os
 import sqlite3
 import threading
+from pathlib import Path
 
 import pytest
 
@@ -360,6 +362,11 @@ def _fake_parsed(start_time="2026-07-10T08:00:00", seconds=3600, watts=200.0):
 
 
 def test_run_auto_scan_imports_and_marks_completions(user_id, tmp_path, monkeypatch):
+    # Scanned folders must sit inside a trusted storage root: a stored
+    # activities_dir outside them is refused on READ, so point HOME at the
+    # scratch tree (realpath'd - the confinement canonicalises).
+    monkeypatch.setenv("HOME", os.path.realpath(tmp_path))
+    tmp_path = Path(os.path.realpath(tmp_path))
     watch = tmp_path / "Watch"
     watch.mkdir()
     (watch / "ride.fit").write_bytes(b"dummy")
@@ -385,6 +392,8 @@ def test_run_auto_scan_imports_and_marks_completions(user_id, tmp_path, monkeypa
 def test_run_auto_scan_covers_settings_only_users(user_id, tmp_path, monkeypatch):
     # A user id present only via settings/activities (no users row) is still
     # swept - mirrors the live database where per-user rows outlived the row.
+    monkeypatch.setenv("HOME", os.path.realpath(tmp_path))
+    tmp_path = Path(os.path.realpath(tmp_path))
     watch = tmp_path / "Watch2"
     watch.mkdir()
     (watch / "ride.fit").write_bytes(b"dummy")

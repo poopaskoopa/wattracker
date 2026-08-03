@@ -88,6 +88,10 @@
 {% elif export_result == 'choose' %}
 <p class="alert">Several Zwift player folders were found &mdash; pick yours in
     <a href="/settings">Settings</a>, then export again.</p>
+{% elif export_result == 'blocked' %}
+<p class="alert">Your saved workouts folder is outside your home directory and
+    your Zwift folders, so wattracker will not write to it. Pick a folder inside
+    your home directory in <a href="/settings">Settings</a>.</p>
 {% elif export_result == 'missing' %}
 <p class="alert">No Zwift Workouts folder found on this computer.</p>
 {% endif %}
