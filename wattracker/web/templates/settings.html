@@ -9,6 +9,8 @@
 {% if dir_message %}<p class="alert">{{ dir_message }}</p>{% endif %}
 
 <p class="current-ftp"><strong>Current Training FTP:</strong> {{ current_ftp }} W</p>
+{% set ftp_suggestion_next = '/settings' %}
+{% include "_ftp_suggestion.html" %}
 {% if recent_best_effort_ftp > 0 %}
 <p><strong>90-day best-effort FTP estimate:</strong> {{ recent_best_effort_ftp }} W</p>
 {% endif %}

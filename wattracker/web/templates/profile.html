@@ -131,6 +131,9 @@
     <p class="hint">No personalized Training FTP is available yet. Import a FIT ride with at least 20 minutes of usable power, or use the manual override below.</p>
     {% endif %}
 
+    {% set ftp_suggestion_next = '/profile' %}
+    {% include "_ftp_suggestion.html" %}
+
     <form class="ftp-form hrmax-form" method="post" action="/profile/ftp">
         <label for="manual-ftp">Manual Training FTP override (1–2000 W)</label>
         <input id="manual-ftp" name="ftp" type="number" min="1" max="2000" step="1" value="{{ manual_ftp|int if manual_ftp is not none else '' }}" inputmode="numeric">
