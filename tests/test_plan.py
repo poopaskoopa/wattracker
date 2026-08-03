@@ -395,8 +395,8 @@ def test_create_plan_persists_model():
 
 
 # ------------------------------------------------------------- export
-def test_batch_export_writes_dated_zwo(tmp_path):
-    out = tmp_path / "zwo"
+def test_batch_export_writes_dated_zwo(home_dir):
+    out = home_dir / "zwo"
     p = plan.generate_plan("P", MONDAY, 1, [0, 2, 4], 6.0, 1)
     workouts = [
         {"date": w["date"], "name": w["name"], "zwo": zwo.zwo_string(w["session"])}

@@ -52,12 +52,15 @@ def test_candidate_zwift_ids_numeric_only_most_recent_first(tmp_path):
     assert [c["zwift_id"] for c in cands] == ["1234567", "7654321"]
 
 
-def test_resolve_export_dir_branches(tmp_path, monkeypatch):
+def test_resolve_export_dir_branches(tmp_path, home_dir, monkeypatch):
     # missing: empty root (conftest default)
     assert paths.resolve_export_dir(None, None) == (None, "missing")
-    # override always wins
-    assert paths.resolve_export_dir("123", str(tmp_path / "o")) == (
-        str(tmp_path / "o"), "override")
+    # a confined override always wins
+    assert paths.resolve_export_dir("123", str(home_dir / "o")) == (
+        str(home_dir / "o"), "override")
+    # ...but an override outside the trusted roots is refused, not obeyed.
+    assert paths.resolve_export_dir("123", str(tmp_path / "outside")) == (
+        None, "blocked")
     # single candidate -> detected
     only = _mk_player_folder("1234567")
     d, reason = paths.resolve_export_dir(None, None)

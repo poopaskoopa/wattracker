@@ -166,6 +166,15 @@
             }); })
             .then(function (res) {
                 if (res.status === 409) { startPolling(); return; }
+                // A rejected folder (outside the allowed roots) never starts a
+                // scan, so show why instead of polling a status that will not
+                // change.
+                if (res.status >= 400) {
+                    btn.disabled = false;
+                    show((res.body && res.body.error) || "Scan request failed.",
+                         "alert");
+                    return;
+                }
                 startPolling();
             })
             .catch(function () { btn.disabled = false; show("Scan request failed.", "alert"); });

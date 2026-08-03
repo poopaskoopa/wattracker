@@ -3,7 +3,9 @@
 The rescan endpoint is asynchronous: POST /activities/rescan starts a background
 scan (202) and the client polls GET /api/scan/status for progress/results.
 """
+import os
 import time
+from pathlib import Path
 
 import pytest
 
@@ -48,6 +50,20 @@ def client():
         yield c
 
 
+@pytest.fixture()
+def home(tmp_path, monkeypatch):
+    """A scratch tree the rescan endpoint is allowed to scan.
+
+    POST /activities/rescan now confines the posted folder to the trusted
+    storage roots (home, the OS Documents/Zwift roots, env overrides), so these
+    tests put their scratch folders under HOME instead of a bare tmp_path.
+    Realpath'd because the endpoint canonicalises what it stores and reports.
+    """
+    root = Path(os.path.realpath(tmp_path))
+    monkeypatch.setenv("HOME", str(root))
+    return root
+
+
 def _register(client, username="rider"):
     client.post("/register", data={"username": username, "password": "password123"})
 
@@ -60,10 +76,10 @@ def test_annotated_candidates_have_exists_flag():
         assert isinstance(c["exists"], bool)
 
 
-def test_rescan_explicit_dir_imports_and_reports(client, tmp_path, monkeypatch):
+def test_rescan_explicit_dir_imports_and_reports(client, home, monkeypatch):
     _register(client)
     # A directory with one .fit file (parser mocked, so contents don't matter).
-    act_dir = tmp_path / "Activities"
+    act_dir = home / "Activities"
     act_dir.mkdir()
     (act_dir / "ride.fit").write_bytes(b"dummy")
     monkeypatch.setattr(importer, "parse_fit", lambda path: _fake_parsed())
@@ -81,9 +97,9 @@ def test_rescan_explicit_dir_imports_and_reports(client, tmp_path, monkeypatch):
     assert len(db.list_activities(uid)) == 1
 
 
-def test_rescan_nonexistent_dir_reports_not_found(client, tmp_path):
+def test_rescan_nonexistent_dir_reports_not_found(client, home):
     _register(client)
-    missing = tmp_path / "does_not_exist"
+    missing = home / "does_not_exist"
     r = client.post("/activities/rescan", data={"activities_dir": str(missing)})
     assert r.status_code == 202
     status = _wait_done(client)
@@ -94,9 +110,9 @@ def test_rescan_nonexistent_dir_reports_not_found(client, tmp_path):
     assert db.list_activities(uid) == []
 
 
-def test_rescan_empty_dir_reports_zero(client, tmp_path, monkeypatch):
+def test_rescan_empty_dir_reports_zero(client, home, monkeypatch):
     _register(client)
-    empty = tmp_path / "Empty"
+    empty = home / "Empty"
     empty.mkdir()
     r = client.post("/activities/rescan", data={"activities_dir": str(empty)})
     assert r.status_code == 202
@@ -105,9 +121,9 @@ def test_rescan_empty_dir_reports_zero(client, tmp_path, monkeypatch):
     assert status["found"] == 0
 
 
-def test_rescan_persists_activities_dir_setting(client, tmp_path):
+def test_rescan_persists_activities_dir_setting(client, home):
     _register(client)
-    act_dir = tmp_path / "MyRides"
+    act_dir = home / "MyRides"
     act_dir.mkdir()
     client.post("/activities/rescan", data={"activities_dir": str(act_dir)})
     _wait_done(client)
@@ -120,9 +136,9 @@ def test_rescan_persists_activities_dir_setting(client, tmp_path):
     assert str(act_dir) in client.get("/settings").text
 
 
-def test_scan_status_lifecycle(client, tmp_path, monkeypatch):
+def test_scan_status_lifecycle(client, home, monkeypatch):
     _register(client)
-    act_dir = tmp_path / "Activities"
+    act_dir = home / "Activities"
     act_dir.mkdir()
     (act_dir / "ride.fit").write_bytes(b"dummy")
     monkeypatch.setattr(importer, "parse_fit", lambda path: _fake_parsed())
@@ -143,9 +159,9 @@ def test_scan_status_lifecycle(client, tmp_path, monkeypatch):
     assert final["error"] is None
 
 
-def test_scan_status_conflict_when_running(client, tmp_path, monkeypatch):
+def test_scan_status_conflict_when_running(client, home, monkeypatch):
     _register(client)
-    act_dir = tmp_path / "Activities"
+    act_dir = home / "Activities"
     act_dir.mkdir()
     (act_dir / "ride.fit").write_bytes(b"dummy")
 
@@ -181,11 +197,11 @@ def test_connect_enables_wal(tmp_path):
     assert mode.lower() == "wal"
 
 
-def test_dashboard_responsive_during_scan(client, tmp_path, monkeypatch):
+def test_dashboard_responsive_during_scan(client, home, monkeypatch):
     """A long background rescan must not block dashboard reads. With WAL + a
     per-file GIL yield, GET / returns 200 well before the scan finishes."""
     _register(client)
-    act_dir = tmp_path / "Activities"
+    act_dir = home / "Activities"
     act_dir.mkdir()
     for i in range(10):
         (act_dir / f"ride{i}.fit").write_bytes(b"dummy")

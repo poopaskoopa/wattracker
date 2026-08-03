@@ -122,8 +122,8 @@ def test_adapted_content_flows_to_detail_and_zwo(user_id):
     assert all(s.avg_fraction() <= 0.75 for s in session.segments)
 
 
-def test_adaptation_reexports_zwo_when_configured(user_id, tmp_path):
-    out = tmp_path / "zwo"
+def test_adaptation_reexports_zwo_when_configured(user_id, home_dir):
+    out = home_dir / "zwo"
     out.mkdir()
     db.save_user_settings(user_id, {"workouts_dir": str(out)})
     wid = _workout(user_id, 2, type_="vo2max", duration_s=3600)

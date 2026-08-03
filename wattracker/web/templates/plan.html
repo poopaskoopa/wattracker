@@ -285,6 +285,11 @@
         <p class="alert">Not exported to Zwift yet: several Zwift player folders
            exist on this computer. Pick yours in <a href="/settings">Settings</a>,
            then press &ldquo;Export plan to Zwift&rdquo; below.</p>
+        {% elif plan.auto_export_reason == 'blocked' %}
+        <p class="alert">Not exported: your saved workouts folder is outside your
+           home directory and your Zwift folders, so wattracker will not write to
+           it. Pick a folder inside your home directory in
+           <a href="/settings">Settings</a>.</p>
         {% elif plan.auto_export_reason == 'missing' %}
         <p class="hint">No Zwift Workouts folder found on this computer &mdash; set
            a workouts folder in <a href="/settings">Settings</a> or use
