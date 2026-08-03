@@ -22,6 +22,7 @@ from ..metrics.power import (
 )
 from ..metrics import profile_store
 from ..paths import activities_dir, confined_stored_dir
+from ..prescribe.plan import HARD_STEADY_POWER
 from ..timeutil import parse_naive, utc_now, utc_today
 from .fit_parser import parse_fit
 
@@ -1122,8 +1123,86 @@ def match_standalone_completions(
     return match_plan_completions(user_id, now)
 
 
-def _neutral_rpe(workout_type: str) -> int:
-    return 9 if workout_type == "vo2max" else 8
+# Time in zone a full session of each type is built to deliver, in seconds.
+# These are the planner's own 60-minute prescriptions (plan.hard_seconds of
+# planner.build_workout(type, 60)) after the recent right-sizing, and they sit
+# where the sports-science norms do: 36 min of threshold work (3x12), 24 min of
+# sweet spot, 20 min of VO2max (the classic 4x4/5x4 band of 20-24 min). They
+# are the yardstick a rated session's own time in zone is measured against, so
+# a session that delivered a full dose keeps today's neutral RPE exactly.
+FTP_REFERENCE_HARD_SECONDS = {
+    "threshold": 2160,
+    "sweet_spot": 1440,
+    "vo2max": 1200,
+}
+# How far short of the reference dose can pull the neutral. Below RPE 5 a hard
+# session is no longer meaningfully hard and the rating stops discriminating,
+# so a very truncated session's expectation floors out rather than sliding
+# toward 1 - which would turn any ordinary rating into "too hard, drop FTP".
+NEUTRAL_RPE_MAX_DISCOUNT = 3
+
+
+def _zwo_hard_seconds(zwo_str: Optional[str]) -> int:
+    """Prescribed time in zone in a stored .zwo, in seconds.
+
+    The same definition as ``plan.hard_seconds`` - intervals contribute their
+    on-time, steady blocks count at or above ``HARD_STEADY_POWER`` - applied to
+    the storage form. ``hard_seconds`` itself takes a planner ``Session``,
+    which a completed workout no longer has: the database keeps the .zwo XML it
+    exported, not the object graph it was built from. Rebuilding a Session from
+    XML to call it would be more guesswork than reading the two element shapes
+    that matter, so this reads the XML and imports the same threshold constant.
+
+    FreeRide is deliberately not counted: the .zwo form carries no power at all
+    (see ``zwo.session_to_zwo``), so its load fraction - the thing
+    ``hard_seconds`` tests - is unrecoverable. It costs nothing here, because
+    ``_zwo_fraction_profile`` refuses to build a target profile for a workout
+    containing one, so such a workout can never be completion-matched and never
+    becomes RPE evidence.
+    """
+    try:
+        root = _ET.fromstring(zwo_str or "")
+    except (_ET.ParseError, TypeError):
+        return 0
+    workout = root.find("workout")
+    if workout is None:
+        return 0
+    total = 0
+    for el in workout:
+        tag = el.tag.lower()
+        try:
+            if tag == "intervalst":
+                total += int(el.attrib.get("Repeat", 0)) * int(
+                    el.attrib.get("OnDuration", 0)
+                )
+            elif tag == "steadystate":
+                if float(el.attrib.get("Power", 0)) >= HARD_STEADY_POWER:
+                    total += int(el.attrib.get("Duration", 0))
+        except (TypeError, ValueError):
+            return 0
+    return total
+
+
+def _neutral_rpe(workout_type: str, hard_s: Optional[int] = None) -> int:
+    """The RPE a session of this type and this dose is expected to feel like.
+
+    Type alone is not enough. RPE 8 is neutral for a threshold session that
+    delivers its full 36 minutes in zone; the same 8 out of a 2x13 truncated to
+    26 minutes would be a much harder session than was prescribed. Scaling the
+    expectation with the delivered dose is what stops a truncated session's
+    honest low rating from reading as "FTP is too low" - the rider did less
+    work, so less fatigue is exactly what should have happened.
+
+    Only shortfalls move the number. Extra time in zone is a different
+    stimulus, not proof that a rating one point under type-neutral means the
+    FTP is low, so the result is never above the type's neutral.
+    """
+    base = 9 if workout_type == "vo2max" else 8
+    reference = FTP_REFERENCE_HARD_SECONDS.get(workout_type)
+    if not reference or not hard_s or hard_s <= 0:
+        return base
+    scaled = int(round(base * (float(hard_s) / float(reference))))
+    return max(base - NEUTRAL_RPE_MAX_DISCOUNT, min(base, scaled))
 
 
 def apply_rpe_ftp_feedback(
@@ -1131,8 +1210,10 @@ def apply_rpe_ftp_feedback(
 ) -> Optional[float]:
     """Apply one bounded FTP step from multiple new compliant hard workouts.
 
-    Expected effort is type-aware: VO2 RPE 9 is neutral, while threshold and
-    sweet-spot RPE 8 are neutral. Evidence is consumed in reversible batches.
+    Expected effort is type- and dose-aware: VO2 RPE 9 is neutral and threshold
+    and sweet-spot RPE 8 are neutral for a session that delivered its full time
+    in zone, scaled down for one that fell short (see ``_neutral_rpe``).
+    Evidence is consumed in reversible batches.
 
     The step size is driven by how far RPE sits from neutral, not by the
     workout's own realized wattage: an ERG-controlled ride tracks its target
@@ -1141,14 +1222,29 @@ def apply_rpe_ftp_feedback(
     prescribed intensity felt too easy - which is exactly the case a returning
     rider needs this to catch. Wattage evidence still applies (via max()) so a
     genuinely higher realized effort (e.g. non-ERG, free ride) isn't ignored.
+
+    A rider who has set a manual FTP gets a *suggestion* instead: the same
+    evidence, the same arithmetic, filed via ``db.record_ftp_suggestion`` for
+    them to accept or dismiss. The training FTP never moves on its own while a
+    manual value is set - the point of setting one is that the rider decides -
+    but the evidence they gave is no longer thrown away. Returns the new FTP
+    when one was applied, and None otherwise (including the manual case, where
+    by definition nothing was applied).
     """
     now = now or utc_now()
     settings = db.get_user_settings(user_id)
-    if settings.get("ftp") and float(settings["ftp"]) > 0:
-        return None
+    manual = bool(settings.get("ftp") and float(settings["ftp"]) > 0)
     latest = db.latest_ftp(user_id)
-    if not latest or latest.get("source") != "estimated":
-        return None
+    if manual:
+        # Judge the evidence against the FTP the rider actually trained at -
+        # their manual value - not against a shadow estimate they never used.
+        current = float(settings["ftp"])
+        ftp_date = (latest or {}).get("date") or now.date().isoformat()
+    else:
+        if not latest or latest.get("source") != "estimated":
+            return None
+        current = float(latest["ftp_watts"])
+        ftp_date = latest["date"]
     since = (now.date() - _dt.timedelta(days=FTP_FEEDBACK_WINDOW_DAYS)).isoformat()
     evidence = []
     for item in db.unused_feedback_evidence(user_id, since):
@@ -1161,29 +1257,28 @@ def apply_rpe_ftp_feedback(
             workout = db.get_plan_workout(user_id, int(item["id"]))
             if not plan_workout_completion_verified(user_id, workout or {}):
                 continue
+        item["neutral_rpe"] = _neutral_rpe(
+            item["type"], _zwo_hard_seconds(item.get("zwo"))
+        )
         evidence.append(item)
-    low = [
-        e for e in evidence
-        if int(e["rpe"]) <= (8 if e["type"] == "vo2max" else 7)
-    ]
-    high = [
-        e for e in evidence
-        if int(e["rpe"]) >= (10 if e["type"] == "vo2max" else 9)
-    ]
-    current = float(latest["ftp_watts"])
+    # One point either side of the session's own neutral. At a full dose these
+    # are the same fixed bands as before (7/9 for threshold and sweet spot,
+    # 8/10 for VO2max); a truncated session simply expects less.
+    low = [e for e in evidence if int(e["rpe"]) <= e["neutral_rpe"] - 1]
+    high = [e for e in evidence if int(e["rpe"]) >= e["neutral_rpe"] + 1]
     chosen: List[dict]
     if len(low) >= FTP_FEEDBACK_MIN_WORKOUTS:
         chosen = low
         demonstrated = float(np.median([e["effective_ftp"] for e in chosen]))
         rpe_gap = float(np.median(
-            [_neutral_rpe(e["type"]) - int(e["rpe"]) for e in chosen]
+            [e["neutral_rpe"] - int(e["rpe"]) for e in chosen]
         ))
         rpe_implied = current * (1.0 + FTP_RPE_STEP_PER_POINT * max(0.0, rpe_gap))
         desired = max(current, demonstrated, rpe_implied)
     elif len(high) >= FTP_FEEDBACK_MIN_WORKOUTS:
         chosen = high
         rpe_gap = float(np.median(
-            [int(e["rpe"]) - _neutral_rpe(e["type"]) for e in chosen]
+            [int(e["rpe"]) - e["neutral_rpe"] for e in chosen]
         ))
         desired = current * (1.0 - FTP_RPE_STEP_PER_POINT * max(0.0, rpe_gap))
     else:
@@ -1192,15 +1287,37 @@ def apply_rpe_ftp_feedback(
     updated = max(50.0, min(600.0, current + max(-limit, min(limit, desired - current))))
     updated = round(updated, 1)
     delta = round(updated - current, 1)
+    if manual:
+        # Consume the evidence either way: a suggestion the rider dismisses
+        # must not reappear from the same workouts, and evidence that implies
+        # no change has still been used up.
+        db.record_ftp_suggestion(
+            user_id, ftp_date, current, updated, chosen,
+            summary=[_evidence_summary(e) for e in chosen],
+        )
+        return None
     if abs(updated - current) < 0.1:
         batch = db.apply_feedback_batch(
-            user_id, latest["date"], current, 0.0, chosen
+            user_id, ftp_date, current, 0.0, chosen
         )
         return current if batch is not None else None
     batch = db.apply_feedback_batch(
-        user_id, latest["date"], updated, delta, chosen
+        user_id, ftp_date, updated, delta, chosen
     )
     return updated if batch is not None else None
+
+
+def _evidence_summary(item: dict) -> dict:
+    """The human-readable part of one piece of evidence, for the UI."""
+    return {
+        "kind": item.get("kind"),
+        "id": int(item["id"]),
+        "date": item.get("completed_date"),
+        "type": item.get("type"),
+        "rpe": int(item["rpe"]),
+        "neutral_rpe": int(item.get("neutral_rpe") or 0),
+        "hard_minutes": int(round(_zwo_hard_seconds(item.get("zwo")) / 60.0)),
+    }
 
 
 def save_workout_rpe(
@@ -1246,6 +1363,13 @@ def run_auto_scan(now: Optional[_dt.datetime] = None) -> Dict[str, int]:
             # old hard-window anchoring, and evaluate_ftp self-heals the latest
             # estimated row in place when it disagrees (no migration needed).
             evaluate_ftp(uid)
+            # Then let unspent RPE evidence have its say. Ratings already
+            # trigger this, so for most users it is a no-op; it exists for the
+            # backlog - riders whose ratings were silently discarded before
+            # manual FTP produced a suggestion, and anyone who rated while a
+            # completion was still unverified. Runs after evaluate_ftp so the
+            # step lands on the row that re-evaluation just settled.
+            apply_rpe_ftp_feedback(uid, now)
         except Exception:
             pass  # a broken folder for one user must not stop the sweep
     return totals

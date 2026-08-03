@@ -23,7 +23,7 @@ from .timeutil import utc_now, valid_timezone
 
 _log = logging.getLogger(__name__)
 
-SCHEMA_VERSION = 27
+SCHEMA_VERSION = 28
 
 
 def _restrict_db_files(path: str) -> None:
@@ -226,9 +226,18 @@ _MIGRATIONS: Dict[int, Sequence[Union[str, Callable[[sqlite3.Connection], None]]
         # completions that already matched. NULL keeps the old fallback.
         "ALTER TABLE plan_workouts ADD COLUMN export_ftp REAL",
     ],
+    27: [
+        # New table ftp_suggestions is created by _SCHEMA after migrating. It
+        # holds what the RPE evidence implies for a rider who has set a manual
+        # FTP - the one case where the feedback loop must never write the
+        # training FTP itself. Nothing to backfill: the evidence that would
+        # have produced past suggestions was never consumed, so the next
+        # rating (or the next scan) computes one from it.
+    ],
 }
 
 _DROP = """
+DROP TABLE IF EXISTS ftp_suggestions;
 DROP TABLE IF EXISTS power_sample_corrections;
 DROP TABLE IF EXISTS ftp_feedback_batches;
 DROP TABLE IF EXISTS standalone_workouts;
@@ -427,6 +436,27 @@ CREATE TABLE IF NOT EXISTS ftp_feedback_batches (
     created    TEXT NOT NULL,
     FOREIGN KEY(user_id) REFERENCES users(id)
 );
+
+-- What the RPE evidence implies for a rider whose training FTP is a manual
+-- value. Nothing here changes any FTP on its own: the row is a proposal the
+-- rider accepts (which writes their manual override) or dismisses. batch_id
+-- ties it to the ftp_feedback_batch that consumed the evidence, so correcting
+-- a rating retracts the suggestion along with its evidence.
+CREATE TABLE IF NOT EXISTS ftp_suggestions (
+    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id       INTEGER NOT NULL,
+    batch_id      INTEGER,
+    current_ftp   REAL NOT NULL,
+    suggested_ftp REAL NOT NULL,
+    workouts      INTEGER NOT NULL,
+    evidence      TEXT NOT NULL,
+    status        TEXT NOT NULL DEFAULT 'pending',
+    created       TEXT NOT NULL,
+    resolved      TEXT,
+    FOREIGN KEY(user_id) REFERENCES users(id)
+);
+CREATE INDEX IF NOT EXISTS idx_ftp_suggestions_user_status
+    ON ftp_suggestions(user_id, status);
 
 CREATE TABLE IF NOT EXISTS race_results (
     id           INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -2409,12 +2439,16 @@ def unused_feedback_evidence(
     conn = connect(path)
     try:
         rows = conn.execute(
-            "SELECT 'plan' AS kind,id,completed_date,type,rpe,compliance,effective_ftp "
+            # zwo travels with the evidence so the feedback loop can read how
+            # much time in zone was actually prescribed (see
+            # importer._neutral_rpe) without a second query per workout.
+            "SELECT 'plan' AS kind,id,completed_date,type,rpe,compliance,"
+            "effective_ftp,zwo_or_segments AS zwo "
             "FROM plan_workouts WHERE user_id=? AND completed_date>=? "
             "AND rpe IS NOT NULL AND feedback_batch_id IS NULL AND type IN "
             "('threshold','sweet_spot','vo2max') AND compliance IS NOT NULL "
             "AND effective_ftp IS NOT NULL UNION ALL "
-            "SELECT 'standalone',id,completed_date,type,rpe,compliance,effective_ftp "
+            "SELECT 'standalone',id,completed_date,type,rpe,compliance,effective_ftp,zwo "
             "FROM standalone_workouts WHERE user_id=? AND completed_date>=? "
             "AND rpe IS NOT NULL AND feedback_batch_id IS NULL AND type IN "
             "('threshold','sweet_spot','vo2max') AND compliance IS NOT NULL "
@@ -2424,6 +2458,23 @@ def unused_feedback_evidence(
         return [dict(r) for r in rows]
     finally:
         conn.close()
+
+
+def _consume_evidence(
+    conn: sqlite3.Connection, user_id: int, batch_id: int, evidence: List[dict]
+) -> None:
+    """Attach every rated workout in `evidence` to `batch_id` (same tx)."""
+    for kind in ("plan", "standalone"):
+        ids = [int(e["id"]) for e in evidence if e["kind"] == kind]
+        if not ids:
+            continue
+        table = "plan_workouts" if kind == "plan" else "standalone_workouts"
+        marks = ",".join("?" for _ in ids)
+        conn.execute(
+            f"UPDATE {table} SET feedback_applied=1,feedback_batch_id=? "
+            f"WHERE user_id=? AND id IN ({marks})",
+            (batch_id, user_id, *ids),
+        )
 
 
 def apply_feedback_batch(
@@ -2448,19 +2499,120 @@ def apply_feedback_batch(
             (user_id, ftp_date, float(delta), utc_now().isoformat()),
         )
         batch_id = int(cur.lastrowid)
-        for kind in ("plan", "standalone"):
-            ids = [int(e["id"]) for e in evidence if e["kind"] == kind]
-            if not ids:
-                continue
-            table = "plan_workouts" if kind == "plan" else "standalone_workouts"
-            marks = ",".join("?" for _ in ids)
-            conn.execute(
-                f"UPDATE {table} SET feedback_applied=1,feedback_batch_id=? "
-                f"WHERE user_id=? AND id IN ({marks})",
-                (batch_id, user_id, *ids),
-            )
+        _consume_evidence(conn, user_id, batch_id, evidence)
         conn.commit()
         return batch_id
+    finally:
+        conn.close()
+
+
+def record_ftp_suggestion(
+    user_id: int, ftp_date: str, current_ftp: float,
+    suggested_ftp: Optional[float], evidence: List[dict],
+    summary: Optional[List[dict]] = None,
+    path: Optional[str] = None,
+) -> Optional[int]:
+    """Consume evidence WITHOUT touching any FTP, recording what it implies.
+
+    The manual-FTP counterpart of ``apply_feedback_batch``. It writes the same
+    reversible batch (delta 0.0 - there is nothing to reverse, because no FTP
+    row was changed) so a corrected rating releases this evidence through the
+    existing rollback path, and files the implied number as a suggestion the
+    rider can accept or dismiss. ``suggested_ftp`` of None (or a value equal to
+    the current FTP) consumes the evidence with nothing to show for it, which
+    is the honest outcome when the evidence implies no change.
+
+    Returns the suggestion id, or None when there was no suggestion to file.
+    """
+    conn = connect(path)
+    try:
+        cur = conn.execute(
+            "INSERT INTO ftp_feedback_batches(user_id,ftp_date,delta,created) "
+            "VALUES (?,?,0.0,?)",
+            (user_id, ftp_date, utc_now().isoformat()),
+        )
+        batch_id = int(cur.lastrowid)
+        _consume_evidence(conn, user_id, batch_id, evidence)
+        suggestion_id = None
+        if suggested_ftp is not None and abs(
+            float(suggested_ftp) - float(current_ftp)
+        ) >= 0.1:
+            # One live suggestion per rider: newer evidence supersedes the
+            # older proposal rather than queueing a second banner.
+            conn.execute(
+                "UPDATE ftp_suggestions SET status='superseded',resolved=? "
+                "WHERE user_id=? AND status='pending'",
+                (utc_now().isoformat(), user_id),
+            )
+            cur = conn.execute(
+                "INSERT INTO ftp_suggestions(user_id,batch_id,current_ftp,"
+                "suggested_ftp,workouts,evidence,status,created) "
+                "VALUES (?,?,?,?,?,?,'pending',?)",
+                (
+                    user_id, batch_id, float(current_ftp), float(suggested_ftp),
+                    len(evidence), json.dumps(summary or []),
+                    utc_now().isoformat(),
+                ),
+            )
+            suggestion_id = int(cur.lastrowid)
+        conn.commit()
+        return suggestion_id
+    finally:
+        conn.close()
+
+
+def _suggestion_row(row: sqlite3.Row) -> dict:
+    out = dict(row)
+    try:
+        out["evidence"] = json.loads(out.get("evidence") or "[]")
+    except (TypeError, ValueError):
+        out["evidence"] = []
+    return out
+
+
+def pending_ftp_suggestion(
+    user_id: int, path: Optional[str] = None
+) -> Optional[dict]:
+    """The rider's live FTP suggestion, if any."""
+    conn = connect(path)
+    try:
+        row = conn.execute(
+            "SELECT * FROM ftp_suggestions WHERE user_id=? AND status='pending' "
+            "ORDER BY id DESC LIMIT 1",
+            (user_id,),
+        ).fetchone()
+        return _suggestion_row(row) if row else None
+    finally:
+        conn.close()
+
+
+def resolve_ftp_suggestion(
+    user_id: int, suggestion_id: int, status: str, path: Optional[str] = None
+) -> Optional[dict]:
+    """Close a pending suggestion as 'accepted' or 'dismissed'.
+
+    Returns the row that was closed (so the caller can act on the number it
+    proposed), or None when it was not this user's, or already resolved. The
+    evidence stays consumed either way - a dismissed suggestion must not come
+    straight back from the same workouts.
+    """
+    if status not in ("accepted", "dismissed"):
+        return None
+    conn = connect(path)
+    try:
+        row = conn.execute(
+            "SELECT * FROM ftp_suggestions WHERE id=? AND user_id=? "
+            "AND status='pending'",
+            (suggestion_id, user_id),
+        ).fetchone()
+        if not row:
+            return None
+        conn.execute(
+            "UPDATE ftp_suggestions SET status=?,resolved=? WHERE id=? AND user_id=?",
+            (status, utc_now().isoformat(), suggestion_id, user_id),
+        )
+        conn.commit()
+        return _suggestion_row(row)
     finally:
         conn.close()
 
@@ -2502,6 +2654,14 @@ def rollback_feedback_for_workout(
                 f"UPDATE {evidence_table} SET feedback_applied=0,feedback_batch_id=NULL "
                 "WHERE user_id=? AND feedback_batch_id=?", (user_id, batch_id),
             )
+        # A suggestion is only as good as the ratings behind it; releasing its
+        # evidence retracts it, and the recomputation that follows the
+        # correction files an up-to-date one.
+        conn.execute(
+            "UPDATE ftp_suggestions SET status='retracted',resolved=? "
+            "WHERE user_id=? AND batch_id=? AND status='pending'",
+            (utc_now().isoformat(), user_id, batch_id),
+        )
         conn.commit()
         return True
     finally:

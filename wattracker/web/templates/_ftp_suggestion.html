@@ -1,0 +1,29 @@
+{% if request.query_params.get('ftp_suggestion') == 'used' %}
+<p class="ok" role="status">Training FTP updated to the suggested value.</p>
+{% elif request.query_params.get('ftp_suggestion') == 'dismissed' %}
+<p class="ok" role="status">Suggestion dismissed. Your Training FTP is unchanged.</p>
+{% endif %}
+{% if ftp_suggestion %}
+<section class="status-banner status-warn ftp-suggestion" aria-labelledby="ftpSuggestionTitle">
+    <span class="status-body">
+        <strong class="status-headline" id="ftpSuggestionTitle">Suggested Training FTP:
+            {{ ftp_suggestion.suggested_ftp|round|int }} W</strong>
+        <span class="status-detail">Your ratings say your training FTP of
+            {{ ftp_suggestion.current_ftp|round|int }} W is
+            {% if ftp_suggestion.suggested_ftp > ftp_suggestion.current_ftp %}too low{% else %}too high{% endif %}.
+            It has not been changed &mdash; you set it manually, so only you change it.</span>
+        <span class="status-detail muted">Evidence:
+            {{ ftp_suggestion.workouts }} rated hard workout{{ '' if ftp_suggestion.workouts == 1 else 's' }}{% if ftp_suggestion.evidence %} &mdash;
+            {% for item in ftp_suggestion.evidence %}{{ item.date }}
+                {{ item.type|replace('_', ' ') }}
+                ({{ item.hard_minutes }} min in zone) rated {{ item.rpe }}/10,
+                expected {{ item.neutral_rpe }}{% if not loop.last %}; {% endif %}{% endfor %}{% endif %}.</span>
+        <form method="post" action="/ftp-suggestion" class="ftp-suggestion-actions">
+            <input type="hidden" name="suggestion_id" value="{{ ftp_suggestion.id }}">
+            <input type="hidden" name="next_path" value="{{ ftp_suggestion_next }}">
+            <button type="submit" name="action" value="use">Use this</button>
+            <button class="button-secondary" type="submit" name="action" value="dismiss">Dismiss</button>
+        </form>
+    </span>
+</section>
+{% endif %}
