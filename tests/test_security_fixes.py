@@ -593,16 +593,23 @@ def test_stored_traversing_zwift_id_is_not_resolved_as_an_export_dir(user_id, tm
 # directory create plus an arbitrary .zwo write. Same argument as activities_dir
 # and zwift_id: a row is not trustworthy for being in the DB.
 
-_ESCAPE_DIR = "/private/tmp/wt_escape/deep"
+# Per-run and inside tmp_path (a SIBLING of the sandboxed HOME, so it is still
+# outside every trusted root - see conftest.isolated_env). Never a fixed machine
+# path: an absolute constant makes the assertion below depend on whatever else
+# has ever run on this box, and a leftover from a previous run fails the suite
+# while the fix is working perfectly.
+@pytest.fixture()
+def escape_dir(tmp_path):
+    return str(tmp_path / "escape" / "deep")
 
 
-@pytest.mark.skipif(os.name == "nt", reason="POSIX absolute path")
-def test_stored_workouts_dir_cannot_escape_the_trusted_roots(user_id):
+@pytest.mark.skipif(os.name == "nt", reason="POSIX path semantics")
+def test_stored_workouts_dir_cannot_escape_the_trusted_roots(user_id, escape_dir):
     """The PoC: poison the row, then do exactly what the export routes do."""
-    _poison_setting(user_id, "workouts_dir", _ESCAPE_DIR)
+    _poison_setting(user_id, "workouts_dir", escape_dir)
     _poison_setting(user_id, "zwift_id", "123")
     settings = db.get_user_settings(user_id)
-    assert settings["workouts_dir"] == _ESCAPE_DIR  # the row really is poisoned
+    assert settings["workouts_dir"] == escape_dir  # the row really is poisoned
 
     result = zwo.write_plan_to_zwift(
         [{"date": "2026-08-05", "name": "pwn", "zwo": "<workout_file/>"}],
@@ -610,49 +617,62 @@ def test_stored_workouts_dir_cannot_escape_the_trusted_roots(user_id):
         workouts_override=settings.get("workouts_dir"),
     )
     # Nothing was created outside, and the write landed in the trusted root.
-    assert not os.path.exists("/private/tmp/wt_escape")
+    assert not os.path.exists(os.path.dirname(escape_dir))
     root = os.path.realpath(os.environ["WATTRACKER_ZWIFT_WORKOUTS_ROOT"])
     for written in result["paths"]:
         assert os.path.commonpath([os.path.realpath(written), root]) == root
 
 
-@pytest.mark.skipif(os.name == "nt", reason="POSIX absolute path")
-def test_stored_workouts_dir_outside_roots_is_reported_not_silently_redirected(user_id):
+@pytest.mark.skipif(os.name == "nt", reason="POSIX path semantics")
+def test_stored_workouts_dir_outside_roots_is_reported_not_silently_redirected(user_id, escape_dir):
     """resolve_export_dir() says 'blocked' so the UI can tell the user.
 
     Silently exporting somewhere else would leave a user staring at a Zwift
     folder that never fills up, with only a log line to explain it.
     """
-    _poison_setting(user_id, "workouts_dir", _ESCAPE_DIR)
+    _poison_setting(user_id, "workouts_dir", escape_dir)
     settings = db.get_user_settings(user_id)
     assert paths.resolve_export_dir(
         settings.get("zwift_id"), settings.get("workouts_dir")
     ) == (None, "blocked")
 
 
-@pytest.mark.skipif(os.name == "nt", reason="POSIX absolute path")
-def test_poisoned_workouts_dir_blocks_export_through_the_exporter(user_id):
+@pytest.mark.skipif(os.name == "nt", reason="POSIX path semantics")
+def test_poisoned_workouts_dir_blocks_export_through_the_exporter(user_id, escape_dir):
     """exporter.sync_plan_exports() is one of the 7 read sites; it must not
     write - or unlink - anything outside the trusted roots."""
     from wattracker import exporter
 
-    _poison_setting(user_id, "workouts_dir", _ESCAPE_DIR)
+    _poison_setting(user_id, "workouts_dir", escape_dir)
     result = exporter.sync_plan_exports(user_id)
     assert result["status"] == "blocked"
     assert result["directory"] is None
     assert result["exported"] == 0
-    assert not os.path.exists("/private/tmp/wt_escape")
+    assert not os.path.exists(os.path.dirname(escape_dir))
 
 
-@pytest.mark.skipif(os.name == "nt", reason="POSIX absolute path")
-def test_poisoned_workouts_dir_blocks_the_plan_export_route(client):
-    """End to end through HTTP: the route must not create the directory."""
+@pytest.mark.skipif(os.name == "nt", reason="POSIX path semantics")
+def test_poisoned_workouts_dir_blocks_the_plan_export_route(client, escape_dir):
+    """End to end through HTTP: the route must not create the directory.
+
+    The plan and its workout are seeded deliberately: /plan/{id}/export only
+    writes `if workouts`, so against an empty plan the route 404s without ever
+    reaching zwo.write_plan_to_zwift and the assertion below holds whether or
+    not the fix is present. Seeding is what makes this a real guard.
+    """
     _register(client)
     uid = db.get_user_by_username("tester")["id"]
-    _poison_setting(uid, "workouts_dir", _ESCAPE_DIR)
-    r = client.post("/plan/1/export")
-    assert r.status_code in (200, 303, 404)
-    assert not os.path.exists("/private/tmp/wt_escape")
+    plan_id = db.create_plan(uid, "P", "2026-08-03", 1)
+    db.add_plan_workout(plan_id, uid, "2026-08-05", "pwn", "threshold",
+                        3600, 60.0, "<workout_file/>")
+    _poison_setting(uid, "workouts_dir", escape_dir)
+    _poison_setting(uid, "zwift_id", "123")
+    assert db.plan_workouts_for_plan(uid, plan_id, include_zwo=True)  # really exports
+
+    r = client.post(f"/plan/{plan_id}/export")
+
+    assert r.status_code in (200, 303)
+    assert not os.path.exists(os.path.dirname(escape_dir))
 
 
 def test_stored_workouts_dir_inside_the_trusted_roots_still_works(user_id, home_dir):
