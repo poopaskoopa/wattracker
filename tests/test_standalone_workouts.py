@@ -8,7 +8,7 @@ from fastapi.testclient import TestClient
 
 from wattracker import auth, db
 from wattracker.ingest import importer
-from wattracker.prescribe import zwo
+from wattracker.prescribe import plan, zwo
 from wattracker.prescribe.planner import build_workout
 from wattracker.server import create_app
 import wattracker.server as servermod
@@ -18,8 +18,9 @@ from wattracker.timeutil import utc_today
 DATE = "2026-07-19"
 
 
-def _workout(user_id, key="one", date=DATE, kind="threshold", ftp=200.0):
-    session = build_workout(kind, 60)
+def _workout(user_id, key="one", date=DATE, kind="threshold", ftp=200.0,
+             minutes=60):
+    session = build_workout(kind, minutes)
     xml = zwo.zwo_string(session)
     workout_id = db.add_standalone_workout(
         user_id, key, date, session.name, kind, session.total_duration(),
@@ -46,8 +47,8 @@ def _activity(user_id, date, power, duration=None, suffix="a"):
 
 
 def _complete(user_id, key, rpe, compliance=.95, effective=220.0,
-              date=DATE, kind="threshold"):
-    workout_id, _ = _workout(user_id, key, date, kind)
+              date=DATE, kind="threshold", minutes=60):
+    workout_id, _ = _workout(user_id, key, date, kind, minutes=minutes)
     assert db.mark_standalone_completed(
         user_id, workout_id, 10_000 + workout_id, date, compliance, effective
     )
@@ -646,3 +647,290 @@ def test_v26_migration_adds_plan_export_ftp_without_losing_rows(tmp_path):
     stored = db.get_plan_workout(uid, workout_id, path=path)
     assert stored["name"] == "Threshold"
     assert stored["export_ftp"] is None
+
+
+# ------------------------------------------- dose-aware expected effort (RPE)
+def test_zwo_hard_seconds_matches_plan_hard_seconds_for_every_prescription():
+    """The stored-XML reader and plan.hard_seconds are one definition.
+
+    ``hard_seconds`` needs a planner Session, which a completed workout no
+    longer has - only the .zwo it was exported as. This pins the two to the same
+    number for every workout the planner can build.
+    """
+    for kind in ("threshold", "sweet_spot", "vo2max", "endurance"):
+        for minutes in (45, 60, 75, 90):
+            session = build_workout(kind, minutes)
+            assert importer._zwo_hard_seconds(zwo.zwo_string(session)) == \
+                plan.hard_seconds(session), (kind, minutes)
+
+
+def test_zwo_hard_seconds_survives_junk():
+    assert importer._zwo_hard_seconds(None) == 0
+    assert importer._zwo_hard_seconds("not xml") == 0
+    assert importer._zwo_hard_seconds("<workout_file></workout_file>") == 0
+
+
+def test_neutral_rpe_scales_down_with_a_short_dose_but_never_up():
+    full_threshold = plan.hard_seconds(build_workout("threshold", 60))
+    assert full_threshold == 2160  # 36 min in zone, the reference dose
+    # A full dose keeps the type's long-standing neutral exactly.
+    assert importer._neutral_rpe("threshold", full_threshold) == 8
+    assert importer._neutral_rpe("sweet_spot",
+                                 plan.hard_seconds(build_workout("sweet_spot", 60))) == 8
+    assert importer._neutral_rpe("vo2max",
+                                 plan.hard_seconds(build_workout("vo2max", 60))) == 9
+    # The owner's session: a 2x13 threshold, 26 of the reference 36 minutes.
+    assert plan.hard_seconds(build_workout("threshold", 45)) == 1560
+    assert importer._neutral_rpe("threshold", 1560) == 6
+    # More time in zone than the reference is a different stimulus, not proof
+    # that an 8 means the FTP is low - the neutral is never raised.
+    assert importer._neutral_rpe("threshold", 4 * full_threshold) == 8
+    # A tiny dose floors out rather than sliding to 1, which would turn any
+    # ordinary rating into "too hard, drop the FTP".
+    assert importer._neutral_rpe("threshold", 60) == 5
+    assert importer._neutral_rpe("vo2max", 60) == 6
+    # Unknown dose (unparseable or absent prescription) = today's flat neutral.
+    assert importer._neutral_rpe("threshold", 0) == 8
+    assert importer._neutral_rpe("threshold") == 8
+    assert importer._neutral_rpe("endurance", 1) == 8
+
+
+def test_truncated_session_honest_low_rating_no_longer_inflates_ftp(user_id):
+    """26 of 36 minutes in zone rated 6/10 is exactly what should happen."""
+    db.add_ftp_entry(user_id, DATE, 200, "estimated")
+    for n in range(2):
+        _complete(user_id, f"short-{n}", 6, effective=230, minutes=45)
+
+    assert importer.apply_rpe_ftp_feedback(
+        user_id, dt.datetime.fromisoformat(f"{DATE}T20:00:00")
+    ) is None
+    assert db.latest_ftp(user_id)["ftp_watts"] == 200
+
+
+def test_full_volume_session_low_rating_still_raises_ftp(user_id):
+    """The full-dose path is untouched: 36 min in zone at 6/10 still moves."""
+    db.add_ftp_entry(user_id, DATE, 200, "estimated")
+    for n in range(2):
+        _complete(user_id, f"full-{n}", 6, effective=230, minutes=60)
+
+    assert importer.apply_rpe_ftp_feedback(
+        user_id, dt.datetime.fromisoformat(f"{DATE}T20:00:00")
+    ) == 210.0
+
+
+def test_truncated_session_can_still_move_ftp_when_the_rating_is_low_enough(user_id):
+    """Volume-awareness lowers the bar, it does not disconnect the loop."""
+    db.add_ftp_entry(user_id, DATE, 200, "estimated")
+    for n in range(2):
+        _complete(user_id, f"very-easy-{n}", 4, effective=230, minutes=45)
+
+    # Neutral 6, rated 4 -> 2 points under -> the same 5% step a full session
+    # rated 6 would have produced.
+    assert importer.apply_rpe_ftp_feedback(
+        user_id, dt.datetime.fromisoformat(f"{DATE}T20:00:00")
+    ) == 210.0
+
+
+# ----------------------------------------------- suggestions under manual FTP
+def _manual_evidence(user_id, manual=240, rpe=6, effective=230, minutes=60):
+    db.add_ftp_entry(user_id, DATE, 200, "estimated")
+    ids = [_complete(user_id, f"sugg-{n}", rpe, effective=effective,
+                     minutes=minutes) for n in range(2)]
+    db.set_user_ftp_override(user_id, manual)
+    return ids
+
+
+def test_manual_ftp_never_moves_but_the_evidence_becomes_a_suggestion(user_id):
+    ids = _manual_evidence(user_id)
+
+    assert importer.apply_rpe_ftp_feedback(
+        user_id, dt.datetime.fromisoformat(f"{DATE}T20:00:00")
+    ) is None
+    # Nothing moved: not the manual value, not the estimated history row.
+    assert db.get_user_settings(user_id)["ftp"] == 240
+    assert db.latest_ftp(user_id)["ftp_watts"] == 200
+
+    suggestion = db.pending_ftp_suggestion(user_id)
+    assert suggestion is not None
+    # Judged against the FTP the rider actually trained at (240), capped at 5%.
+    assert suggestion["current_ftp"] == 240.0
+    assert suggestion["suggested_ftp"] == 252.0
+    assert suggestion["workouts"] == 2
+    assert [item["rpe"] for item in suggestion["evidence"]] == [6, 6]
+    assert {item["type"] for item in suggestion["evidence"]} == {"threshold"}
+    assert all(item["hard_minutes"] == 36 for item in suggestion["evidence"])
+    # The evidence is consumed exactly as the applied path consumes it, so the
+    # same workouts cannot produce a second suggestion.
+    assert all(db.get_standalone_workout(user_id, i)["feedback_applied"] for i in ids)
+    assert importer.apply_rpe_ftp_feedback(
+        user_id, dt.datetime.fromisoformat(f"{DATE}T20:00:00")
+    ) is None
+    assert db.pending_ftp_suggestion(user_id)["id"] == suggestion["id"]
+
+
+def test_suggestion_survives_a_restart(user_id, tmp_path):
+    """It is a row, not process state: a fresh connection still sees it."""
+    _manual_evidence(user_id)
+    importer.apply_rpe_ftp_feedback(
+        user_id, dt.datetime.fromisoformat(f"{DATE}T20:00:00")
+    )
+    conn = sqlite3.connect(db.db_path())
+    try:
+        row = conn.execute(
+            "SELECT suggested_ftp,status FROM ftp_suggestions WHERE user_id=?",
+            (user_id,),
+        ).fetchone()
+    finally:
+        conn.close()
+    assert row == (252.0, "pending")
+
+
+def test_accepting_a_suggestion_writes_it_as_the_manual_value(user_id):
+    _manual_evidence(user_id)
+    importer.apply_rpe_ftp_feedback(
+        user_id, dt.datetime.fromisoformat(f"{DATE}T20:00:00")
+    )
+    suggestion = db.pending_ftp_suggestion(user_id)
+
+    app = create_app()
+    with TestClient(app) as client:
+        client.post("/login", data={"username": "tester", "password": "password123"})
+        assert "Suggested Training FTP" in client.get("/settings").text
+        assert "Suggested Training FTP" in client.get("/profile").text
+        response = client.post("/ftp-suggestion", data={
+            "suggestion_id": suggestion["id"], "action": "use",
+            "next_path": "/settings",
+        })
+        assert response.status_code == 200  # followed the 303
+        assert "Suggested Training FTP" not in response.text
+
+    assert db.get_user_settings(user_id)["ftp"] == 252
+    assert importer.current_ftp(user_id) == 252.0
+    assert db.pending_ftp_suggestion(user_id) is None
+    # Still nothing automatic: the estimated history row was never touched.
+    assert db.latest_ftp(user_id)["ftp_watts"] == 200
+
+
+def test_dismissing_a_suggestion_changes_nothing_and_it_does_not_return(user_id):
+    _manual_evidence(user_id)
+    importer.apply_rpe_ftp_feedback(
+        user_id, dt.datetime.fromisoformat(f"{DATE}T20:00:00")
+    )
+    suggestion = db.pending_ftp_suggestion(user_id)
+
+    app = create_app()
+    with TestClient(app) as client:
+        client.post("/login", data={"username": "tester", "password": "password123"})
+        response = client.post("/ftp-suggestion", data={
+            "suggestion_id": suggestion["id"], "action": "dismiss",
+            "next_path": "/profile",
+        })
+        assert response.status_code == 200
+        assert "Suggested Training FTP" not in response.text
+
+    assert db.get_user_settings(user_id)["ftp"] == 240
+    assert db.latest_ftp(user_id)["ftp_watts"] == 200
+    assert db.pending_ftp_suggestion(user_id) is None
+    # The same evidence must not immediately produce it again.
+    assert importer.apply_rpe_ftp_feedback(
+        user_id, dt.datetime.fromisoformat(f"{DATE}T20:00:00")
+    ) is None
+    assert db.pending_ftp_suggestion(user_id) is None
+
+
+def test_a_suggestion_belongs_to_its_owner(user_id):
+    _manual_evidence(user_id)
+    importer.apply_rpe_ftp_feedback(
+        user_id, dt.datetime.fromisoformat(f"{DATE}T20:00:00")
+    )
+    suggestion = db.pending_ftp_suggestion(user_id)
+    other = db.create_user("intruder", auth.hash_password("password123"))
+
+    assert db.resolve_ftp_suggestion(other, suggestion["id"], "accepted") is None
+    assert db.pending_ftp_suggestion(user_id)["id"] == suggestion["id"]
+    assert db.get_user_settings(other).get("ftp") in (None, 0)
+
+
+def test_evidence_implying_no_change_is_consumed_without_a_suggestion(user_id):
+    """A manual FTP the evidence agrees with produces no banner, and the
+    evidence is still spent rather than re-examined forever."""
+    db.add_ftp_entry(user_id, DATE, 200, "estimated")
+    ids = [_complete(user_id, f"agree-{n}", 8, effective=200) for n in range(2)]
+    db.set_user_ftp_override(user_id, 240)
+
+    assert importer.apply_rpe_ftp_feedback(
+        user_id, dt.datetime.fromisoformat(f"{DATE}T20:00:00")
+    ) is None
+    # RPE 8 on a full threshold session is neutral: no band, nothing consumed.
+    assert not any(db.get_standalone_workout(user_id, i)["feedback_applied"] for i in ids)
+    assert db.pending_ftp_suggestion(user_id) is None
+
+
+def test_correcting_a_rating_retracts_the_suggestion_it_produced(user_id):
+    ids = _manual_evidence(user_id)
+    importer.apply_rpe_ftp_feedback(
+        user_id, dt.datetime.fromisoformat(f"{DATE}T20:00:00")
+    )
+    assert db.pending_ftp_suggestion(user_id)["suggested_ftp"] == 252.0
+
+    now = dt.datetime.fromisoformat(f"{DATE}T20:00:00")
+    # Re-rating one of them releases the batch; the remaining single workout is
+    # no longer enough evidence, so the proposal is withdrawn.
+    assert importer.save_workout_rpe(user_id, "standalone", ids[0], 8, now)
+    assert db.pending_ftp_suggestion(user_id) is None
+    assert db.get_user_settings(user_id)["ftp"] == 240
+    assert db.latest_ftp(user_id)["ftp_watts"] == 200
+
+
+def test_suggestion_is_recomputed_from_the_manual_value_after_it_changes(user_id):
+    _manual_evidence(user_id)
+    importer.apply_rpe_ftp_feedback(
+        user_id, dt.datetime.fromisoformat(f"{DATE}T20:00:00")
+    )
+    first = db.pending_ftp_suggestion(user_id)
+    # New evidence against a new manual value supersedes the old proposal.
+    db.set_user_ftp_override(user_id, 200)
+    for n in range(2):
+        _complete(user_id, f"again-{n}", 6, effective=230)
+    importer.apply_rpe_ftp_feedback(
+        user_id, dt.datetime.fromisoformat(f"{DATE}T20:00:00")
+    )
+    live = db.pending_ftp_suggestion(user_id)
+    assert live["id"] != first["id"]
+    # Recomputed against the NEW manual value (200), not the old one, and still
+    # capped at one 5% step even though the wattage demonstrated 230.
+    assert live["current_ftp"] == 200.0
+    assert live["suggested_ftp"] == 210.0
+    assert db.get_user_settings(user_id)["ftp"] == 200
+
+
+def test_the_sweep_files_suggestions_for_a_backlog_of_old_ratings(user_id):
+    """Ratings given before this existed were discarded, not consumed; the
+    daily sweep is what finally gives that backlog a voice."""
+    _manual_evidence(user_id)
+    importer.run_auto_scan(dt.datetime.fromisoformat(f"{DATE}T20:00:00"))
+    assert db.pending_ftp_suggestion(user_id) is not None
+    assert db.get_user_settings(user_id)["ftp"] == 240
+
+
+def test_v27_migration_adds_ftp_suggestions_without_losing_rows(tmp_path):
+    path = str(tmp_path / "v27.db")
+    db.init_db(path)
+    uid = db.create_user("kept", "hash", path)
+    conn = sqlite3.connect(path)
+    conn.execute("DROP TABLE ftp_suggestions")
+    conn.execute("PRAGMA user_version = 27")
+    conn.commit()
+    conn.close()
+
+    db.init_db(path)
+
+    conn = sqlite3.connect(path)
+    assert conn.execute("PRAGMA user_version").fetchone()[0] == db.SCHEMA_VERSION
+    assert conn.execute(
+        "SELECT name FROM sqlite_master WHERE type='table' AND name='ftp_suggestions'"
+    ).fetchone()
+    assert conn.execute(
+        "SELECT username FROM users WHERE id=?", (uid,)
+    ).fetchone()[0] == "kept"
+    conn.close()
