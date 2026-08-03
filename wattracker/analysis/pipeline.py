@@ -41,6 +41,13 @@ def _window_power(
 
 
 def _safe_cp(mmp: Dict[int, float]) -> Tuple[Optional[float], Optional[float]]:
+    """CP/W' for this MMP curve, or (None, None) if it cannot honestly be fitted.
+
+    ``fit_cp_wprime`` raises when there is too little data inside the model's
+    valid 2-20 minute domain, or when the fit lands somewhere physiologically
+    impossible. Both mean "we do not know this rider's CP", which the rest of
+    the app already renders as an absent profile rather than a wrong one.
+    """
     try:
         return fit_cp_wprime(mmp)
     except ValueError:
@@ -61,7 +68,10 @@ def build_state(user_id: int) -> TrainingState:
     # Mean-maximal power over trailing 90 days and CP/W'
     streams_90 = db.recent_power_streams(user_id, days=90)
     mmp = mean_maximal_power(streams_90) if streams_90 else {}
-    cp, wprime = _safe_cp(mmp) if len(mmp) >= 2 else (None, None)
+    # No point-count pre-check here: the fit itself knows how many points it
+    # needs and, crucially, which ones count (only those inside its valid
+    # duration window - a rider with 17 sprint samples still has no CP).
+    cp, wprime = _safe_cp(mmp)
 
     # Prior/recent 4-week windows for plateau detection. Only the trailing ~8
     # weeks are needed, so decompress just those activities (not all history).
@@ -70,9 +80,7 @@ def build_state(user_id: int) -> TrainingState:
     prior_streams = _window_power(recent_activities, 28, 56)
     mmp_recent = mean_maximal_power(recent_streams) if recent_streams else {}
     mmp_prior = mean_maximal_power(prior_streams) if prior_streams else {}
-    cp_prior, wprime_prior = (
-        _safe_cp(mmp_prior) if len(mmp_prior) >= 2 else (None, None)
-    )
+    cp_prior, wprime_prior = _safe_cp(mmp_prior)
 
     # Aerobic decoupling from the most recent long steady effort (>45min).
     # Cached (activity-static): avoids inflating every stream per request.
