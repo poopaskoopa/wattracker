@@ -380,6 +380,44 @@ class CalendarFeedFailureCounter:
         with self._lock:
             return self._count
 
+
+# One log line per this many refused /login attempts. Not a limit: like the
+# calendar counter it refuses nothing (see LoginAttemptCounter).
+LOGIN_FAILURE_LOG_THRESHOLD = 25
+
+
+class LoginAttemptCounter:
+    """One process-wide count of refused /login attempts.
+
+    Exists because auth.LoginThrottle cannot see this: it is keyed by username,
+    so an attacker rotating the username on every request leaves every key at
+    one failure and the throttle stays silent while thousands of attempts go
+    through. A single unkeyed count is the only thing that notices that shape.
+
+    Deliberately UNKEYED and deliberately refusing NOTHING, for exactly the
+    reasons spelled out on CalendarFeedFailureCounter above: the obvious key
+    (client address) is worthless on a loopback bind and forgeable via
+    X-Forwarded-For, and a global refusal would let one bad client lock the
+    legitimate owner out of their own machine - which is the outcome the
+    throttle's per-username scoping exists to avoid. Refusal stays with the
+    per-username throttle (bounded blast radius) and with the hash limiter
+    (bounded memory); this is visibility only.
+    """
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._count = 0
+
+    def record_failure(self) -> int:
+        with self._lock:
+            self._count += 1
+            return self._count
+
+    @property
+    def count(self) -> int:
+        with self._lock:
+            return self._count
+
 # Max in-memory size for an uploaded activity file (bytes). A real .fit ride is
 # well under this; the cap stops a huge upload from exhausting memory.
 MAX_UPLOAD_BYTES = 50 * 1024 * 1024
@@ -509,6 +547,68 @@ def _same_origin_or_absent(request: Request) -> bool:
     )
 
 
+def _record_login_failure(counter: "LoginAttemptCounter") -> int:
+    """Count one refused login and log every LOGIN_FAILURE_LOG_THRESHOLD-th.
+
+    The log line is the whole point: nothing here refuses anything, and the
+    per-username throttle is blind to an attacker who never reuses a username.
+    """
+    total = counter.record_failure()
+    if total % LOGIN_FAILURE_LOG_THRESHOLD == 0:
+        _log.warning(
+            "%d refused login attempts since start (all usernames)", total
+        )
+    return total
+
+
+def _trusted_origin_or_absent(request: Request, allowed_hosts: List[str]) -> bool:
+    """Cross-origin guard for the UNAUTHENTICATED form posts (/login, /register).
+
+    Same convention as _same_origin_or_absent: a request with no Origin (native
+    clients, curl, the test client) is accepted; a browser's Origin must name a
+    host this app is actually reached by - i.e. the same allowlist
+    TrustedHostMiddleware enforces on the Host header. That is what stops the
+    drive-by: a page on evil.example.com can POST a form to
+    http://localhost:8000/login cross-origin and never read the reply, but the
+    Origin it is forced to send is its own, so the request is refused before any
+    scrypt runs.
+
+    Why this and not _same_origin_or_absent, which compares scheme and port too:
+    on the tailnet path the browser talks https to `tailscale serve`, which
+    forwards plain http to this loopback socket, so the Origin's scheme (and
+    port) legitimately differ from request.url's and a strict comparison would
+    lock the owner out of logging in from their own phone. The host comparison
+    survives that, because the proxy passes the original Host through and
+    config.public_host() is the single literal name allowed here.
+
+    Residual: another app on this machine (http://localhost:3000) has a host in
+    the allowlist, so its pages are not blocked. That is accepted - a local
+    process can hit this socket directly with no Origin at all, so the check was
+    never the control against local callers. The hash limiter is.
+    """
+    origin = request.headers.get("origin")
+    if not origin:
+        return True
+    try:
+        parsed = _url.urlparse(origin)
+    except (ValueError, TypeError):
+        return False
+    if (
+        parsed.scheme not in ("http", "https")
+        or not parsed.hostname
+        or parsed.username is not None
+        or parsed.password is not None
+        or parsed.path not in ("", "/")
+        or parsed.params
+        or parsed.query
+        or parsed.fragment
+    ):
+        return False
+    # urlparse strips the brackets from an IPv6 literal; the allowlist carries
+    # both spellings.
+    return parsed.hostname.lower() in allowed_hosts
+
+
 def _feed_base_url(request: Request) -> str:
     """Base URL to mint calendar subscription links from.
 
@@ -570,6 +670,13 @@ def create_app() -> FastAPI:
     app.state.last = {}
     # In-process brute-force throttle for /login (per lowercased username).
     app.state.login_throttle = auth.LoginThrottle()
+    # Hard ceiling on concurrent scrypt hashes (~128 MiB each). Shared by
+    # /login and /register - both unauthenticated, both reachable by anyone who
+    # can open a socket to this port, and the per-username throttle bounds
+    # neither of them in memory terms.
+    app.state.hash_limiter = auth.PasswordHashLimiter()
+    # Refused /login attempts: a single unkeyed count, not a throttle.
+    app.state.login_failures = LoginAttemptCounter()
     # Rejected /calendar.ics tokens: a single unkeyed count, not a throttle.
     # The route resolves the token first and serves any valid one before this
     # is consulted at all, so a subscribed calendar app can never be refused
@@ -623,6 +730,9 @@ def create_app() -> FastAPI:
         allowed_hosts=allowed_hosts,
         www_redirect=False,
     )
+    # The same allowlist, reused by the unauthenticated form posts to reject a
+    # cross-origin browser Origin (see _trusted_origin_or_absent).
+    app.state.allowed_hosts = allowed_hosts
 
     # -------------------------------------------------------------- auth
     @app.get("/register", response_class=HTMLResponse)
@@ -633,16 +743,41 @@ def create_app() -> FastAPI:
             request, "register.html", {"request": request, "error": None}
         )
 
+    def _hash_capacity_response(request: Request, template: str):
+        """Shed a request that arrived while the hash limiter was full.
+
+        Cheap and identical for every caller: no scrypt has run, and nothing
+        about the submitted username is revealed.
+        """
+        return templates.TemplateResponse(
+            request,
+            template,
+            {"request": request,
+             "error": "The server is busy. Please try again in a moment."},
+            status_code=503,
+            headers={"Retry-After": "5"},
+        )
+
     @app.post("/register", response_class=HTMLResponse)
     def register_submit(
         request: Request,
         username: str = Form(...),
         password: str = Form(...),
     ):
+        # /register hashes a password too (same ~128 MiB), and is exempt from
+        # auth as well, so it gets the same two guards as /login - otherwise the
+        # cheapest attack is simply to point the flood at this route instead.
+        if not _trusted_origin_or_absent(request, app.state.allowed_hosts):
+            return PlainTextResponse("Origin not allowed", status_code=403)
         username = (username or "").strip()
         err = auth.validate_credentials(username, password)
         if not err:
-            user_id = db.create_user(username, auth.hash_password(password))
+            try:
+                with app.state.hash_limiter.reserve():
+                    password_hash = auth.hash_password(password)
+            except auth.HashCapacityExceeded:
+                return _hash_capacity_response(request, "register.html")
+            user_id = db.create_user(username, password_hash)
             if user_id is None:
                 err = "That username is already taken."
         if err:
@@ -667,8 +802,13 @@ def create_app() -> FastAPI:
         username: str = Form(...),
         password: str = Form(...),
     ):
+        # Refuse a cross-origin browser POST before spending anything on it: a
+        # drive-by page rotating usernames never trips the per-username throttle.
+        if not _trusted_origin_or_absent(request, app.state.allowed_hosts):
+            return PlainTextResponse("Origin not allowed", status_code=403)
         uname = (username or "").strip()
         throttle = app.state.login_throttle
+        failures = app.state.login_failures
         if throttle.retry_after(uname) > 0:
             # Locked out after repeated failures. Generic message, no hint about
             # whether the username exists.
@@ -680,25 +820,41 @@ def create_app() -> FastAPI:
                 status_code=429,
             )
         user = db.get_user_by_username(uname)
-        if user:
-            ok = auth.verify_password(password, user["password_hash"])
-        else:
-            # Spend the same scrypt time as a real verify so a missing username
-            # isn't distinguishable by timing.
-            auth.dummy_verify(password)
-            ok = False
+        try:
+            # The hash is the expensive part (~128 MiB); hold a slot for exactly
+            # that, and only that. Both branches below hash, so shedding here
+            # cannot tell an existing username from a missing one.
+            with app.state.hash_limiter.reserve():
+                if user:
+                    ok = auth.verify_password(password, user["password_hash"])
+                else:
+                    # Spend the same scrypt time as a real verify so a missing
+                    # username isn't distinguishable by timing.
+                    auth.dummy_verify(password)
+                    ok = False
+        except auth.HashCapacityExceeded:
+            _record_login_failure(failures)
+            return _hash_capacity_response(request, "login.html")
         if not ok:
             throttle.record_failure(uname)
+            _record_login_failure(failures)
             return templates.TemplateResponse(
                 request,
                 "login.html",
                 {"request": request, "error": "Invalid username or password."},
             )
         throttle.record_success(uname)
-        # Transparent upgrade: re-hash legacy/low-cost hashes at the current cost.
+        # Transparent upgrade: re-hash legacy/low-cost hashes at the current
+        # cost. Best-effort and already authenticated, so a full limiter just
+        # postpones the upgrade to the next login rather than failing the login.
         if auth.needs_rehash(user["password_hash"]):
             try:
-                db.set_password_hash(user["username"], auth.hash_password(password))
+                with app.state.hash_limiter.reserve():
+                    db.set_password_hash(
+                        user["username"], auth.hash_password(password)
+                    )
+            except auth.HashCapacityExceeded:
+                _log.info("password rehash skipped: hashing at capacity")
             except Exception:
                 _log.warning("password rehash on login failed", exc_info=True)
         request.session["user_id"] = user["id"]
@@ -985,11 +1141,21 @@ def create_app() -> FastAPI:
         this user returns 409 with the running status (no second scan starts).
         """
         uid = _uid(request)
-        posted = (activities_dir or "").strip()
+        # Confine the posted folder to the same roots /settings allows. This
+        # endpoint both SCANS the path (reading and parsing every *.fit under
+        # it) and PERSISTS it, so without this it was a way to point the
+        # importer - and every later background scan - at any directory on the
+        # machine, straight past the /settings check. Existence is not required
+        # here: the status panel reports "folder not found" for a path that is
+        # simply not on this machine, and scanning a path that does not exist
+        # reads nothing.
+        clean, err = paths.confine_storage_dir(activities_dir, must_exist=False)
+        if err:
+            return JSONResponse({"error": err}, status_code=400)
         # Persist a typed directory as the user's activities_dir setting.
-        if posted:
-            db.save_user_settings(uid, {"activities_dir": posted})
-        started = _start_user_scan(uid, directory=posted or None)
+        if clean:
+            db.save_user_settings(uid, {"activities_dir": clean})
+        started = _start_user_scan(uid, directory=clean or None)
         if started is None:
             return JSONResponse(_scan_status_snapshot(uid), status_code=409)
         return JSONResponse(started, status_code=202)
@@ -2189,36 +2355,12 @@ def create_app() -> FastAPI:
         )
 
     def _validate_dir(value: str) -> "tuple[Optional[str], Optional[str]]":
-        """Validate a user-supplied folder path.
+        """Confine a user-supplied folder path (must already exist).
 
-        Returns (clean_path, error). A folder is accepted only when it exists,
-        is a directory, and its real path remains under the user's home,
-        OS-discovered Documents/Zwift roots, or a process-owner environment
-        override. This admits redirected Windows Known Folders and OneDrive/UNC
-        roots without permitting arbitrary web-supplied system paths or symlink
-        escapes. Empty means "unchanged" (clean_path="", error=None).
+        Thin wrapper over paths.confine_storage_dir so this route and
+        /activities/rescan share one rule; see that function for the policy.
         """
-        raw = (value or "").strip()
-        if not raw:
-            return "", None
-        expanded = os.path.realpath(os.path.abspath(os.path.expanduser(raw)))
-        if not os.path.isdir(expanded):
-            return None, f"Folder not found or not a directory: {raw}"
-        allowed = False
-        for root in paths.trusted_storage_roots():
-            resolved_root = os.path.realpath(os.path.abspath(os.path.expanduser(root)))
-            try:
-                if os.path.commonpath([expanded, resolved_root]) == resolved_root:
-                    allowed = True
-                    break
-            except ValueError:
-                continue  # Different Windows drives or UNC shares.
-        if not allowed:
-            return None, (
-                "Folder must be inside your home directory or a configured "
-                f"Zwift data directory: {raw}"
-            )
-        return expanded, None
+        return paths.confine_storage_dir(value, must_exist=True)
 
     @app.get("/settings", response_class=HTMLResponse)
     def settings_page(request: Request):
@@ -2265,6 +2407,17 @@ def create_app() -> FastAPI:
         if clean_timezone and not valid_timezone(clean_timezone):
             dir_msgs.append("Invalid IANA time zone.")
             clean_timezone = ""
+        # The Zwift player id is a FOLDER NAME under the Zwift Workouts root
+        # (paths.workouts_dir joins it, and the exporters makedirs() the
+        # result), so it gets confined exactly like the folders above rather
+        # than being passed through as free text. db.save_user_settings refuses
+        # it too; this is the half that can tell the user why.
+        if chosen_zwift_id and not paths.safe_zwift_id(chosen_zwift_id):
+            dir_msgs.append(
+                "Zwift ID must be a plain folder name (no slashes, no '..'): "
+                f"{chosen_zwift_id}"
+            )
+            chosen_zwift_id = ""
         db.save_user_settings(
             uid,
             {

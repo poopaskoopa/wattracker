@@ -50,8 +50,8 @@ def test_dated_name_zwo_prefixes_and_is_idempotent():
 
 
 # ---------------------------------------------------- export-all naming
-def test_export_all_writes_every_workout_with_dates(user_id, tmp_path):
-    out = tmp_path / "zwo"
+def test_export_all_writes_every_workout_with_dates(user_id, home_dir):
+    out = home_dir / "zwo"
     out.mkdir()
     db.save_user_settings(user_id, {"workouts_dir": str(out), "zwift_id": "123"})
     dates = ["2026-07-07", "2026-07-08", "2026-07-12"]
@@ -70,8 +70,8 @@ def test_export_all_writes_every_workout_with_dates(user_id, tmp_path):
     assert "<name>2026-07-12 Threshold Intervals</name>" in content
 
 
-def test_export_all_skips_completed(user_id, tmp_path):
-    out = tmp_path / "zwo"
+def test_export_all_skips_completed(user_id, home_dir):
+    out = home_dir / "zwo"
     out.mkdir()
     db.save_user_settings(user_id, {"workouts_dir": str(out), "zwift_id": "123"})
     _plan_id, ids = _plan_with_workouts(user_id, ["2026-07-07", "2026-07-08"])
@@ -100,8 +100,8 @@ def test_ooto_reversed_dates_normalized(user_id):
     assert r["start_date"] == "2026-07-10" and r["end_date"] == "2026-07-14"
 
 
-def test_export_excludes_and_removes_ooto_workouts(user_id, tmp_path):
-    out = tmp_path / "zwo"
+def test_export_excludes_and_removes_ooto_workouts(user_id, home_dir):
+    out = home_dir / "zwo"
     out.mkdir()
     db.save_user_settings(user_id, {"workouts_dir": str(out), "zwift_id": "123"})
     dates = ["2026-07-07", "2026-07-12", "2026-07-13"]
@@ -115,10 +115,10 @@ def test_export_excludes_and_removes_ooto_workouts(user_id, tmp_path):
     assert os.listdir(out) == ["2026-07-07 Threshold Intervals.zwo"]
 
 
-def test_export_all_route_and_ooto_routes(client, tmp_path):
+def test_export_all_route_and_ooto_routes(client, home_dir):
     _register(client)
     uid = db.get_user_by_username("rider")["id"]
-    out = tmp_path / "zwo"
+    out = home_dir / "zwo"
     out.mkdir()
     db.save_user_settings(uid, {"workouts_dir": str(out), "zwift_id": "123"})
     _plan_with_workouts(uid, ["2026-07-07", "2026-07-08"])

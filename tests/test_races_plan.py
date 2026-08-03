@@ -512,8 +512,8 @@ def test_suppression_banner_renders(user_id):
 
 
 # ------------------------------------------------------------- export
-def test_race_days_are_not_exported_and_a_stale_zwo_is_removed(user_id, tmp_path):
-    out = tmp_path / "zwo"
+def test_race_days_are_not_exported_and_a_stale_zwo_is_removed(user_id, home_dir):
+    out = home_dir / "zwo"
     out.mkdir()
     db.save_user_settings(user_id, {"workouts_dir": str(out), "zwift_id": "123"})
     plan_id = _seed_plan(user_id)
