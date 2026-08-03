@@ -1,5 +1,6 @@
 """Tests for time-range filtering and the rolling estimated-FTP series."""
 import datetime as dt
+import math
 
 import pytest
 
@@ -66,9 +67,12 @@ def test_rolling_ftp_varies_and_decays_through_gap(user_id):
     # Semantics changed: no hard window/cliff. Through the 60-day gap (all of it
     # idle, since there are no rides between the two efforts) the 300W effort
     # decays smoothly with no None gaps, so the minimum is BELOW 285 rather than
-    # pinned at it. Last pre-jump sample (day56): ~237.
+    # pinned at it. Last pre-jump sample (day56): idle excess 56-14=42 days plus
+    # the 14 grace days as "active". Essentially ALL of the loss is the idle
+    # term - the 14 active days now cost 0.2%, not 1% - so ~238.8.
     assert min(values) < 285.0
-    assert min(values) == pytest.approx(236.9, abs=1.5)
+    assert min(values) == pytest.approx(285.0 * math.exp(-42.0 / 240.0), abs=1.0)
+    assert min(values) == pytest.approx(238.8, abs=0.5)
     # The samples strictly decay until the stronger effort lands at the end.
     gap_vals = values[:-1]
     assert all(b <= a + 1e-6 for a, b in zip(gap_vals, gap_vals[1:]))
