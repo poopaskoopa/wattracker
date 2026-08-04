@@ -73,6 +73,13 @@ DAY_LABELS = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
 # Real-hardware ride loop cadence (seconds); module-level so tests can shrink it.
 RIDE_POLL_INTERVAL_S = 1.0
 RIDE_INACTIVITY_TIMEOUT_S = 300.0
+# Consecutive failed per-tick ERG commands tolerated before ERG is switched off
+# for the rest of the ride. One failure is not evidence of anything: a dropped
+# characteristic write, a momentary radio fault or (in server mode) a network
+# blip all surface here identically to a trainer that genuinely refused. Each is
+# retried on the next tick with a full re-arm; only a sustained run of them is
+# treated as "this trainer will not take targets" - and then the rider is told.
+ERG_COMMAND_FAILURE_LIMIT = 5
 
 
 def _ride_loop_time() -> float:
@@ -3025,7 +3032,7 @@ def create_app() -> FastAPI:
                         await action_queue.put(exc)
 
                 async def _handle_action(message) -> Optional[str]:
-                    nonlocal controller
+                    nonlocal controller, erg_failures
                     if isinstance(message, BaseException):
                         raise message
                     if not isinstance(message, dict):
@@ -3115,6 +3122,10 @@ def create_app() -> FastAPI:
                         available_now, enabled_now, error = (
                             await _set_connection_erg(conn, enabled, target)
                         )
+                        # An explicit toggle is the rider asking for a fresh
+                        # start, so it clears the consecutive-failure count that
+                        # may have switched ERG off in the first place.
+                        erg_failures = 0
                         if controller is not None:
                             controller.erg_available = available_now
                             controller.set_erg_enabled(
@@ -3155,6 +3166,7 @@ def create_app() -> FastAPI:
                 )
                 controller.current_target = controller.target_watts(0)
                 initial_erg_error = None
+                erg_failures = 0
                 if initial_erg_enabled:
                     (
                         initial_erg_available,
@@ -3164,9 +3176,17 @@ def create_app() -> FastAPI:
                         conn, True, controller.current_target
                     )
                     controller.erg_available = initial_erg_available
-                    controller.set_erg_enabled(
-                        initial_erg_enabled, command_trainer=False
-                    )
+                    if initial_erg_error:
+                        # Same reasoning as the per-tick block below: one failed
+                        # arming command is not proof the trainer will not take
+                        # targets, and clearing erg_enabled here would gate the
+                        # ride loop off before it ever ran. Count it and let the
+                        # loop retry with a re-arm.
+                        erg_failures = 1
+                    else:
+                        controller.set_erg_enabled(
+                            initial_erg_enabled, command_trainer=False
+                        )
                 if initial_erg_error:
                     await websocket.send_json(
                         {
@@ -3203,23 +3223,46 @@ def create_app() -> FastAPI:
                             True,
                             controller.current_target,
                             force_rearm=(
-                                previous_status == "paused"
-                                and controller.status == "running"
+                                # A failed command may have left the trainer out
+                                # of ERG (BleakTrainer clears its own flag before
+                                # re-raising), so a bare target would not put it
+                                # back. Retry with the full arming sequence.
+                                erg_failures > 0
+                                or (previous_status == "paused"
+                                    and controller.status == "running")
                             ),
                         )
                         controller.erg_available = command_available
-                        controller.set_erg_enabled(
-                            command_enabled, command_trainer=False
-                        )
-                        if command_error:
-                            await websocket.send_json(
-                                {
-                                    "status": "erg",
-                                    "available": command_available,
-                                    "enabled": False,
-                                    "error": command_error,
-                                }
+                        if not command_error:
+                            erg_failures = 0
+                            controller.set_erg_enabled(
+                                command_enabled, command_trainer=False
                             )
+                        else:
+                            erg_failures += 1
+                            # Do NOT mirror the failure into controller.erg_enabled
+                            # while retrying. The per-tick ERG block is gated on
+                            # that flag and nothing outside the block ever sets it
+                            # back, so clearing it here would latch ERG off for the
+                            # rest of the ride on a single transient fault.
+                            if erg_failures >= ERG_COMMAND_FAILURE_LIMIT:
+                                controller.set_erg_enabled(
+                                    False, command_trainer=False
+                                )
+                                await websocket.send_json(
+                                    {
+                                        "status": "erg",
+                                        "available": command_available,
+                                        "enabled": False,
+                                        "error": command_error,
+                                        "message": (
+                                            "ERG switched off after "
+                                            f"{erg_failures} consecutive failed "
+                                            "trainer commands. Re-enable it to "
+                                            "try again."
+                                        ),
+                                    }
+                                )
                     await websocket.send_json(controller.state())
                     if controller.current_power > 0:
                         inactive_s = 0.0
