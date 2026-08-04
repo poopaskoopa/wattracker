@@ -47,6 +47,21 @@ def test_cpm_too_short_raises():
         p.parse_cycling_power_measurement(bytes([0x00, 0x00]))
 
 
+# ----------------------------------------- speed and cadence measurement
+def test_csc_with_crank_data_after_wheel_data():
+    # flags bit0|bit1: six wheel bytes followed by crank revs/time.
+    data = bytes([0x03]) + bytes(6) + bytes([0x0A, 0x00, 0x00, 0x04])
+    parsed = p.parse_csc_measurement(data)
+    assert parsed["crank_revs"] == 10
+    assert parsed["crank_event_time"] == 1024
+
+
+def test_csc_without_crank_data_and_truncated_cranks():
+    assert p.parse_csc_measurement(bytes([0x00]))["crank_revs"] is None
+    with pytest.raises(ValueError, match="missing crank"):
+        p.parse_csc_measurement(bytes([0x02, 0x01]))
+
+
 # --------------------------------------------------------------- cadence
 def test_cadence_60rpm():
     # 1 crank rev in 1024 ticks (= 1.0s) -> 60 rpm
