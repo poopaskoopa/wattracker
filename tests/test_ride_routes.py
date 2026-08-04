@@ -503,6 +503,21 @@ def test_ride_page_end_workout_button_reuses_the_stop_path(client, monkeypatch):
     assert "stopRide();" in r.text
 
 
+def test_ride_page_shows_the_servers_erg_message_over_the_raw_error(client,
+                                                                    monkeypatch):
+    """An `erg` frame carrying both fields is one the server wrote prose for.
+
+    The give-up frame sends the raw FTMS error *and* a rider-facing message;
+    rendering only the error would repeat the mistake of computing a diagnostic
+    no template ever shows.
+    """
+    _register(client)
+    monkeypatch.setattr(bledevices, "bluetooth_available", lambda: (True, "ok"))
+    r = client.get("/ride")
+    assert r.status_code == 200
+    assert 'st.message || st.error || "Unable to change ERG mode."' in r.text
+
+
 def test_ride_chart_end_button_styles(client):
     r = client.get("/static/style.css")
     assert r.status_code == 200
@@ -937,6 +952,146 @@ def test_ride_ws_target_rejection_reports_erg_off_without_aborting(
     assert any(frame.get("status") == "inactivity_timeout" for frame in frames)
     assert frames[-1]["status"] == "finished"
     assert hardware.events[-1] == "disconnect"
+
+
+class _TransientFtmsClient(_AckingFtmsClient):
+    """Rejects the first ``failures`` writes of ``op``, then acknowledges."""
+
+    def __init__(self, op=0x05, failures=1, **kwargs):
+        super().__init__(**kwargs)
+        self.op = op
+        self.failures = failures
+        self.attempts = 0
+
+    async def write_gatt_char(self, char, data, response=False):
+        if data[0] == self.op:
+            self.attempts += 1
+            self.results = dict(self.results)
+            # 0x01 is success, 0x04 "operation failed".
+            self.results[self.op] = (
+                0x04 if self.attempts <= self.failures else 0x01
+            )
+        await super().write_gatt_char(char, data, response=response)
+
+
+def _run_erg_failure_ride(client, monkeypatch, hardware, powers):
+    """Drive a real-path ride against ``hardware`` and return its frames."""
+    from wattracker import server as servermod
+    from wattracker.ble.devices import BleakTrainer, SimulatedPowerSource
+
+    async def fake_connect(timeout=6.0, selected=None):
+        trainer = BleakTrainer(hardware, response_timeout_s=0.1)
+        await trainer.prepare()
+        return {
+            "trainer": trainer,
+            "power_source": SimulatedPowerSource(list(powers)),
+            "hr_source": None,
+            "clients": [hardware],
+            "clients_by_address": {"TRAINER": hardware},
+            "bindings": {
+                "TRAINER": {"name": "Kickr", "roles": {"trainer": trainer}}
+            },
+            "names": {"trainer": "Kickr", "power": "Pedals"},
+            "errors": [],
+        }
+
+    monkeypatch.setattr(
+        servermod.bledevices, "bluetooth_available", lambda: (True, "ok")
+    )
+    monkeypatch.setattr(servermod.bledevices, "connect_sensors", fake_connect)
+    monkeypatch.setattr(servermod, "RIDE_POLL_INTERVAL_S", 0)
+    monkeypatch.setattr(servermod, "RIDE_INACTIVITY_TIMEOUT_S", 5)
+
+    frames = []
+    with client.websocket_connect("/ride/ws") as ws:
+        assert _receive_after_workout(ws)["status"] == "connected"
+        try:
+            while True:
+                frames.append(ws.receive_json())
+        except Exception:
+            pass
+    return frames
+
+
+def test_ride_ws_transient_erg_failure_does_not_disable_erg_for_the_ride(
+    client, monkeypatch
+):
+    """One failed ERG command must not latch ERG off for the rest of the ride.
+
+    The per-tick ERG block is gated on ``controller.erg_enabled`` and the only
+    line that could set it back True lives *inside* that block, so mirroring a
+    single command failure into it used to be permanent: no retry, no re-arm,
+    and no target sent again until the rider knew to toggle ERG by hand. A
+    dropped characteristic write is not evidence that the trainer refuses
+    targets, so it is retried instead.
+    """
+    _register(client)
+    # Only the very first set-target-power fails - the one the ride issues while
+    # arming. Everything after it is acknowledged normally.
+    hardware = _TransientFtmsClient(op=0x05, failures=1)
+    frames = _run_erg_failure_ride(
+        client, monkeypatch, hardware, [150] * 8 + [0] * 10
+    )
+
+    # It retried rather than giving up on the first failure: one target write
+    # per running tick, not a single failed one and then silence.
+    assert hardware.attempts > 1
+    assert hardware.events.count(("write", 0x05)) >= 5
+    # ERG stayed on for every running tick, and the rider was never told it had
+    # been switched off. (The frames after the ride finishes report False,
+    # because _finish() clears the flag on the way out - that is the ride
+    # ending, not the latch.)
+    running = [
+        f for f in frames if f.get("status") == "running" and "erg_enabled" in f
+    ]
+    assert running, "expected per-tick state frames while running"
+    assert all(f["erg_enabled"] is True for f in running)
+    assert not any(
+        "switched off" in (f.get("message") or "")
+        for f in frames
+        if f.get("status") == "erg"
+    )
+    assert frames[-1]["status"] == "finished"
+
+
+def test_ride_ws_sustained_erg_failure_disables_erg_and_says_so(
+    client, monkeypatch
+):
+    """A trainer that keeps refusing targets does get ERG switched off - once
+    the failures are sustained, and with a message rather than in silence."""
+    from wattracker import server as servermod
+
+    _register(client)
+    monkeypatch.setattr(servermod, "ERG_COMMAND_FAILURE_LIMIT", 3)
+    # Every set-target-power is rejected, for the whole ride.
+    hardware = _TransientFtmsClient(op=0x05, failures=10_000)
+    frames = _run_erg_failure_ride(
+        client, monkeypatch, hardware, [150] * 8 + [0] * 10
+    )
+
+    # Each retry re-arms (Request Control + Start + target), so the 0x00 writes
+    # count the ride loop's ERG retries exactly - unlike the raw 0x05 count,
+    # which also picks up the best-effort target-0 of the teardown. One 0x00
+    # from the connect-time prepare, then exactly two retries before the limit
+    # is reached: it retried rather than latching off on the first failure, and
+    # it stopped rather than hammering a trainer that will not take targets.
+    assert hardware.events.count(("write", 0x00)) == 3
+    giveup = next(
+        f
+        for f in frames
+        if f.get("status") == "erg" and "switched off" in (f.get("message") or "")
+    )
+    assert giveup["enabled"] is False
+    assert "operation failed" in giveup["error"]
+    assert "Re-enable it to try again" in giveup["message"]
+    # And having given up, ERG reads as off for the rest of the ride.
+    running = [
+        f for f in frames if f.get("status") == "running" and "erg_enabled" in f
+    ]
+    assert running and running[-1]["erg_enabled"] is False
+    assert frames[-1]["status"] == "finished"
+
+
 
 
 def test_ride_ws_real_path_degrades_without_trainer(client, monkeypatch):

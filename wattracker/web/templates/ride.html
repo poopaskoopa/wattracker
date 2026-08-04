@@ -1023,8 +1023,13 @@
                 ergPending = false;
                 applyErgState(Boolean(st.available), Boolean(st.enabled));
                 if (st.error) {
+                    // A frame that carries both is one the server wrote a rider-
+                    // facing explanation for (e.g. ERG switched off after
+                    // repeated command failures); prefer it over the raw FTMS
+                    // error, which stays in the server log either way.
                     setLive(document.getElementById("ergStatus"),
-                        st.error || "Unable to change ERG mode.", "failure");
+                        st.message || st.error || "Unable to change ERG mode.",
+                        "failure");
                     playCue("failure");
                 } else if (!st.available) {
                     setLive(document.getElementById("ergStatus"),
