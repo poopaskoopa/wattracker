@@ -8,6 +8,7 @@ import pytest
 from wattracker.ble import devices
 from wattracker.ble.protocol import (
     CYCLING_POWER_SERVICE,
+    CYCLING_SPEED_AND_CADENCE_SERVICE,
     FITNESS_MACHINE_SERVICE,
     HEART_RATE_SERVICE,
 )
@@ -101,6 +102,27 @@ def test_bleak_heart_rate_expires_by_monotonic_age(monkeypatch):
 
     now[0] += 3.01
     assert source.latest_hr() is None
+
+
+def test_bleak_cadence_handles_wraparound_and_stale_duplicates(monkeypatch):
+    now = [100.0]
+    monkeypatch.setattr(devices.time, "monotonic", lambda: now[0])
+    source = devices.BleakCadenceSource(object(), stale_after_s=3)
+
+    def measurement(revs, event_time):
+        return (
+            bytearray([0x02])
+            + revs.to_bytes(2, "little")
+            + event_time.to_bytes(2, "little")
+        )
+
+    source._on_notify(None, measurement(65535, 65000))
+    source._on_notify(None, measurement(0, 488))
+    assert source.latest_cadence() == pytest.approx(60.0)
+    now[0] = 101.0
+    source._on_notify(None, measurement(0, 488))
+    now[0] = 103.01
+    assert source.latest_cadence() is None
 
 
 def _install_fake_bleak(monkeypatch):
@@ -443,6 +465,81 @@ def test_connect_sensors_without_selection_preserves_first_device_auto_behavior(
     assert result["names"]["power"] == "First"
 
 
+def test_connects_cadence_only_and_rebuilds_shared_address_bindings(monkeypatch):
+    _module, fake_client = _install_fake_bleak(monkeypatch)
+
+    class FakePower(FixedPower):
+        def __init__(self, client):
+            super().__init__(200, 88)
+
+        async def start(self):
+            pass
+
+    class FakeCadence:
+        def __init__(self, client):
+            self.client = client
+
+        async def start(self):
+            pass
+
+        def latest_power(self):
+            return None
+
+        def latest_cadence(self):
+            return 95
+
+    monkeypatch.setattr(devices, "BleakPowerSource", FakePower)
+    monkeypatch.setattr(devices, "BleakCadenceSource", FakeCadence)
+    result = asyncio.run(
+        devices.connect_sensors(selected={"power": ["COMBO"], "cadence": ["COMBO"]})
+    )
+
+    assert len(fake_client.instances) == 1
+    assert result["power_source"].latest_cadence() == 88
+    assert result["cadence_source"].latest_cadence() == 95
+    assert result["names"] == {"power": "COMBO", "cadence": "COMBO"}
+    assert set(result["bindings"]["COMBO"]["roles"]) == {"power", "cadence"}
+
+    asyncio.run(devices.disconnect_sensor(result, "COMBO"))
+    assert result["power_source"] is None
+    assert result["cadence_source"] is None
+    assert result["names"] == {}
+
+
+def test_auto_selects_cadence_only_as_legacy_power_source(monkeypatch):
+    _module, _fake_client = _install_fake_bleak(monkeypatch)
+
+    async def fake_scan(timeout=5.0):
+        return [
+            {
+                "address": "CAD",
+                "name": "Cadence sensor",
+                "services": [CYCLING_SPEED_AND_CADENCE_SERVICE],
+            }
+        ]
+
+    class FakeCadence:
+        def __init__(self, client):
+            pass
+
+        async def start(self):
+            pass
+
+        def latest_power(self):
+            return None
+
+        def latest_cadence(self):
+            return 92
+
+    monkeypatch.setattr(devices, "BleakCadenceSource", FakeCadence)
+    monkeypatch.setattr(devices, "scan", fake_scan)
+    result = asyncio.run(devices.connect_sensors())
+
+    assert result["cadence_source"].latest_cadence() == 92
+    assert result["power_source"] is result["cadence_source"]
+    assert result["names"] == {"cadence": "Cadence sensor"}
+
+
 def test_scan_returns_detected_roles_and_signal(monkeypatch):
     module, _fake_client = _install_fake_bleak(monkeypatch)
 
@@ -457,6 +554,7 @@ def test_scan_returns_detected_roles_and_signal(monkeypatch):
                     CYCLING_POWER_SERVICE.upper(),
                     HEART_RATE_SERVICE,
                     FITNESS_MACHINE_SERVICE,
+                    CYCLING_SPEED_AND_CADENCE_SERVICE,
                 ],
                 rssi=-47,
             )
@@ -473,8 +571,9 @@ def test_scan_returns_detected_roles_and_signal(monkeypatch):
                 CYCLING_POWER_SERVICE,
                 HEART_RATE_SERVICE,
                 FITNESS_MACHINE_SERVICE,
+                CYCLING_SPEED_AND_CADENCE_SERVICE,
             ],
-            "roles": ["power", "hr", "trainer"],
+            "roles": ["power", "hr", "trainer", "cadence"],
             "rssi": -47,
         }
     ]

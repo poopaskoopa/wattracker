@@ -4,7 +4,7 @@
 <h2 class="page-title ride-page-title">Ride</h2>
 
 {% if ble_available %}
-<p class="ok">Bluetooth available. Scan for your power meter, trainer, and HR strap.</p>
+<p class="ok">Bluetooth available. Scan for your power meter, trainer, HR strap, and cadence sensor.</p>
 {% else %}
 <p class="alert">Bluetooth unavailable: {{ ble_reason }}.
    Real riding needs a Bluetooth adapter and <code>pip install .[ble]</code>.
@@ -68,8 +68,8 @@
         </span>
     </div>
     <p id="scanStatus" class="hint" aria-live="polite">
-        Scan to identify devices by advertised role and signal strength. You can
-        assign an unknown device manually. Select multiple power devices only when
+        Scan to identify devices by advertised role and signal strength. Devices
+        can report one or more roles. Select multiple power devices only when
         each reports partial/one-sided power; never combine a trainer or full-power
         source with pedals.
     </p>
@@ -93,7 +93,7 @@
         <div class="card"><span class="label">Status</span><span class="value" id="rStatus">idle</span></div>
         <div class="card"><span class="label">Target</span><span class="value"><span id="rTarget">0</span><span class="unit" id="rTargetUnit"> W</span></span></div>
         <div class="card"><span class="label">Power</span><span class="value"><span id="rPower">0</span> W</span></div>
-        <div class="card"><span class="label">Cadence (power sensor)</span><span class="value"><span id="rCad">&mdash;</span> rpm</span></div>
+        <div class="card"><span class="label">Cadence</span><span class="value"><span id="rCad">&mdash;</span> rpm</span></div>
         <div class="card"><span class="label">HR</span><span class="value"><span id="rHr">&mdash;</span> bpm</span></div>
         <div class="card"><span class="label">Elapsed</span><span class="value" id="rElapsed">0:00</span></div>
     </div>
@@ -127,16 +127,20 @@
             </div>
             <div id="deviceIndicators" class="ride-chart-devices" aria-hidden="true">
                 <div class="ride-chart-chip device-chip device-dark" data-role="power"
-                     title="Power" hidden>
+                     title="Power meter" hidden>
                     <span class="erg-led"></span><span class="device-glyph">&#9889;</span>
                 </div>
                 <div class="ride-chart-chip device-chip device-dark" data-role="hr"
-                     title="Heart rate" hidden>
+                     title="HR strap" hidden>
                     <span class="erg-led"></span><span class="device-glyph">&#9829;</span>
                 </div>
                 <div class="ride-chart-chip device-chip device-dark" data-role="trainer"
                      title="Trainer" hidden>
                     <span class="erg-led"></span><span class="device-glyph">&#9881;</span>
+                </div>
+                <div class="ride-chart-chip device-chip device-dark" data-role="cadence"
+                     title="Cadence sensor" hidden>
+                    <span class="erg-led"></span><span class="device-glyph">&#8635;</span>
                 </div>
             </div>
             <div class="ride-chart-metrics" aria-hidden="true">
@@ -241,14 +245,15 @@
         var selected = selectedRoles();
         var now = new Date().toISOString();
         var reported = {};
-        ["power", "hr", "trainer"].forEach(function (role) {
+        ["power", "hr", "trainer", "cadence"].forEach(function (role) {
             var values = connectedNames && connectedNames[role];
             reported[role] = (Array.isArray(values) ? values : (values ? [values] : [])).map(String);
         });
         var entries = Object.keys(selected).slice(0, 12).map(function (address) {
             return {address: address, name: String(deviceNames[address] || address).slice(0, 128),
                 roles: selected[address].filter(function (role) {
-                    return ["power", "hr", "trainer"].indexOf(role) !== -1 && reported[role].indexOf(address) !== -1;
+                    return ["power", "hr", "trainer", "cadence"].indexOf(role) !== -1 &&
+                        reported[role].indexOf(address) !== -1;
                 }),
                 last_connected: now};
         }).filter(function (entry) { return entry.roles.length > 0; });
@@ -974,8 +979,10 @@
             });
             var hr = document.querySelector('#deviceList input[data-role="hr"]:checked');
             var trainer = document.querySelector('#deviceList input[data-role="trainer"]:checked');
+            var cadence = document.querySelector('#deviceList input[data-role="cadence"]:checked');
             if (hr && hr.value) q.push("hr=" + encodeURIComponent(hr.value));
             if (trainer && trainer.value) q.push("trainer=" + encodeURIComponent(trainer.value));
+            if (cadence && cadence.value) q.push("cadence=" + encodeURIComponent(cadence.value));
         }
         var socket = new WebSocket(proto + "//" + location.host + "/ride/ws" + (q.length ? "?" + q.join("&") : ""));
         var preserveDisconnectMessage = false;
@@ -1080,6 +1087,7 @@
                     parts.push("power: " + powerNames.map(displayName).join(" + "));
                 }
                 if (names.hr) parts.push("HR: " + displayName(names.hr));
+                if (names.cadence) parts.push("cadence: " + displayName(names.cadence));
                 var message = parts.length ? "Connected — " + parts.join(", ") : "Connected.";
                 message += " Start pedaling to begin the workout.";
                 if (st.warnings && st.warnings.length) {
@@ -1146,9 +1154,10 @@
         };
     }
     function roleLabel(role) {
-        if (role === "power") return "Power";
-        if (role === "hr") return "Heart rate";
+        if (role === "power") return "Power meter";
+        if (role === "hr") return "HR strap";
         if (role === "trainer") return "Trainer";
+        if (role === "cadence") return "Cadence sensor";
         return role;
     }
     function displayName(value) {
@@ -1156,18 +1165,20 @@
         return deviceNames[address] || address;
     }
     function connectedDeviceNames() {
-        var names = {power: [], hr: null, trainer: null};
+        var names = {power: [], hr: null, trainer: null, cadence: null};
         Object.keys(connectedAddresses).forEach(function (address) {
             (connectedAddresses[address] || []).forEach(function (role) {
                 if (role === "power") names.power.push(address);
-                else if (role === "hr" || role === "trainer") names[role] = address;
+                else if (role === "hr" || role === "trainer" || role === "cadence") {
+                    names[role] = address;
+                }
             });
         });
         return names;
     }
     function addressesByRole(devices) {
         var result = {};
-        ["power", "hr", "trainer"].forEach(function (role) {
+        ["power", "hr", "trainer", "cadence"].forEach(function (role) {
             var values = devices && devices[role];
             (Array.isArray(values) ? values : (values ? [values] : [])).forEach(function (value) {
                 var address = String(value);
@@ -1237,7 +1248,7 @@
         document.querySelectorAll("#deviceList input[data-role]").forEach(function (input) {
             if (input.value === address) input.checked = false;
         });
-        ["hr", "trainer"].forEach(function (role) {
+        ["hr", "trainer", "cadence"].forEach(function (role) {
             if (document.querySelector('#deviceList input[data-role="' + role + '"]:checked')) return;
             var none = document.querySelector(
                 '#deviceList input[data-role="' + role + '"][value=""]');
@@ -1411,10 +1422,11 @@
 
         setLive(status, "Found " + devices.length + " device" +
             (devices.length === 1 ? "." : "s.") +
-            " Detected roles come from advertised services. RSSI closer to 0 is stronger. Select multiple power devices only for partial/one-sided sources; never combine a trainer or full-power source with pedals." +
+            " Detected roles come from advertised services. RSSI closer to 0 is stronger. Devices may report multiple roles; select multiple power devices only for partial/one-sided sources; never combine a trainer or full-power source with pedals." +
             (hiddenCount ? " (" + hiddenCount + " unnamed device" + (hiddenCount === 1 ? "" : "s") + " hidden)" : ""), "success");
         var noSensors = document.createElement("div");
-        [["hr", "No HR"], ["trainer", "No trainer"]].forEach(function (choice) {
+        [["hr", "No HR strap"], ["trainer", "No trainer"],
+            ["cadence", "No cadence sensor"]].forEach(function (choice) {
             var label = document.createElement("label");
             label.className = "device-role";
             var input = document.createElement("input");
@@ -1441,7 +1453,7 @@
         head.appendChild(headerRow);
         table.appendChild(head);
         var body = document.createElement("tbody");
-        var choseHr = false, choseTrainer = false;
+        var choseHr = false, choseTrainer = false, choseCadence = false;
         var cacheEntries = {};
         (cache && cache.entries || []).forEach(function (entry) { cacheEntries[entry.address] = entry; });
         var cachedPower = (cache && cache.entries || []).filter(function (entry) {
@@ -1481,7 +1493,12 @@
                 return String(device.address || "") === address;
             });
         });
-        if (cachedPower.length || cachedHr || cachedTrainer) {
+        var cachedCadence = Object.keys(cacheEntries).find(function (address) {
+            return cacheEntries[address].roles.indexOf("cadence") !== -1 && devices.some(function (device) {
+                return String(device.address || "") === address;
+            });
+        });
+        if (cachedPower.length || cachedHr || cachedTrainer || cachedCadence) {
             status.textContent += " Last-connected roles were restored from this browser; verify any multi-power selection.";
         }
         devices.forEach(function (device) {
@@ -1516,7 +1533,7 @@
             row.appendChild(signal);
 
             var uses = document.createElement("td");
-            ["power", "hr", "trainer"].forEach(function (role) {
+            ["power", "hr", "trainer", "cadence"].forEach(function (role) {
                 var label = document.createElement("label");
                 label.className = "device-role";
                 var input = document.createElement("input");
@@ -1534,6 +1551,11 @@
                     (!cachedTrainer && roles.indexOf(role) !== -1 && !choseTrainer))) {
                     input.checked = true;
                     choseTrainer = true;
+                }
+                if (role === "cadence" && ((cachedCadence && deviceAddress === cachedCadence) ||
+                    (!cachedCadence && roles.indexOf(role) !== -1 && !choseCadence))) {
+                    input.checked = true;
+                    choseCadence = true;
                 }
                 label.appendChild(input);
                 label.appendChild(document.createTextNode(" " + roleLabel(role)));

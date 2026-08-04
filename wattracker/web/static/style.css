@@ -827,6 +827,8 @@ button.danger.link-btn { border: none; color: var(--alert); }
     --device-glow: color-mix(in srgb, var(--s-hr) 70%, transparent); }
 .ride-chart-devices .device-chip[data-role="trainer"] { --device-color: var(--ok);
     --device-glow: color-mix(in srgb, var(--ok) 70%, transparent); }
+.ride-chart-devices .device-chip[data-role="cadence"] { --device-color: var(--s-3);
+    --device-glow: color-mix(in srgb, var(--s-3) 70%, transparent); }
 .ride-chart-devices .device-chip.device-lit { opacity: 1;
     border-color: var(--device-color); color: var(--device-color);
     box-shadow: 0 0 10px var(--device-glow); }

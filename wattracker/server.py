@@ -3240,15 +3240,21 @@ def create_app() -> FastAPI:
         power = params.getlist("power")
         hr = params.getlist("hr")
         trainer = params.getlist("trainer")
+        cadence = params.getlist("cadence")
         if len(power) > _MAX_SELECTED_POWER_SOURCES:
             raise ValueError(
                 f"Select at most {_MAX_SELECTED_POWER_SOURCES} power sensors."
             )
-        if len(hr) > 1 or len(trainer) > 1:
-            raise ValueError("Select at most one heart-rate monitor and one trainer.")
+        if len(hr) > 1 or len(trainer) > 1 or len(cadence) > 1:
+            raise ValueError(
+                "Select at most one heart-rate monitor, one trainer, and one cadence sensor."
+            )
 
-        selected = {"power": [], "hr": [], "trainer": []}
-        for role, addresses in (("power", power), ("hr", hr), ("trainer", trainer)):
+        selected = {"power": [], "hr": [], "trainer": [], "cadence": []}
+        for role, addresses in (
+            ("power", power), ("hr", hr), ("trainer", trainer),
+            ("cadence", cadence),
+        ):
             for address in addresses:
                 if not address or len(address) > _MAX_BLE_ADDRESS_LENGTH:
                     raise ValueError(f"Invalid {role} sensor address.")
@@ -3287,6 +3293,12 @@ def create_app() -> FastAPI:
             available and getattr(trainer, "erg_enabled", True)
         )
         return available, enabled
+
+    def _connection_has_power(conn: Optional[dict]) -> bool:
+        """Do not mistake the cadence-only legacy power alias for watts."""
+        conn = conn or {}
+        power = conn.get("power_source")
+        return power is not None and power is not conn.get("cadence_source")
 
     async def _set_connection_erg(
         conn: dict,
@@ -3405,7 +3417,7 @@ def create_app() -> FastAPI:
                 except Exception as e:  # no adapter, scan failure, ...
                     await websocket.send_json({"status": "error", "error": str(e)})
                     return
-                if not conn["power_source"] and not conn["trainer"]:
+                if not _connection_has_power(conn) and not conn["trainer"]:
                     details = " ".join(conn.get("errors", []))
                     await websocket.send_json(
                         {
@@ -3470,10 +3482,11 @@ def create_app() -> FastAPI:
                                 controller.update_sources(
                                     trainer=conn.get("trainer"),
                                     power_source=conn.get("power_source"),
+                                    cadence_source=conn.get("cadence_source"),
                                     hr_source=conn.get("hr_source"),
                                 )
                             ending_session = not (
-                                conn.get("power_source") or conn.get("trainer")
+                                _connection_has_power(conn) or conn.get("trainer")
                             )
                             available_now, enabled_now = _connection_erg_state(conn)
                             await websocket.send_json(
@@ -3563,6 +3576,7 @@ def create_app() -> FastAPI:
                     ftp,
                     trainer=conn["trainer"],
                     power_source=conn["power_source"],
+                    cadence_source=conn.get("cadence_source"),
                     hr_source=conn["hr_source"],
                     user_id=uid,
                     workout_id=selected_workout_id,

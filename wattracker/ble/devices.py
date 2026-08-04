@@ -19,10 +19,13 @@ from .protocol import (
     encode_start,
     encode_stop,
     parse_control_point_response,
+    parse_csc_measurement,
     parse_cycling_power_measurement,
     parse_heart_rate_measurement,
     CYCLING_POWER_SERVICE,
     CYCLING_POWER_MEASUREMENT,
+    CYCLING_SPEED_AND_CADENCE_SERVICE,
+    CYCLING_SPEED_AND_CADENCE_MEASUREMENT,
     FITNESS_MACHINE_SERVICE,
     FITNESS_MACHINE_CONTROL_POINT,
     HEART_RATE_SERVICE,
@@ -68,6 +71,13 @@ class PowerSource(abc.ABC):
 
     def latest_cadence(self) -> Optional[float]:
         return None
+
+
+class CadenceSource(abc.ABC):
+    """A source of cadence (rpm) without an implied power measurement."""
+
+    @abc.abstractmethod
+    def latest_cadence(self) -> Optional[float]: ...
 
 
 class AggregatePowerSource(PowerSource):
@@ -245,6 +255,51 @@ class BleakPowerSource(PowerSource):
         ):
             return None
         return self._power
+
+    def latest_cadence(self) -> Optional[float]:
+        if (
+            self._cadence_updated_at is None
+            or time.monotonic() - self._cadence_updated_at > self._stale_after_s
+        ):
+            return None
+        return self._cadence
+
+
+class BleakCadenceSource(CadenceSource, PowerSource):
+    """CSC cadence via bleak notifications, with no power measurement.
+
+    It also implements ``PowerSource`` so legacy consumers can use a
+    cadence-only connection through ``power_source``.
+    """
+
+    def __init__(self, client, stale_after_s: float = BLE_VALUE_STALE_S) -> None:
+        self._client = client
+        self._stale_after_s = float(stale_after_s)
+        self._cadence: Optional[float] = None
+        self._cadence_updated_at: Optional[float] = None
+        self._prev_revs: Optional[int] = None
+        self._prev_time: Optional[int] = None
+
+    async def start(self) -> None:
+        await self._client.start_notify(
+            CYCLING_SPEED_AND_CADENCE_MEASUREMENT, self._on_notify
+        )
+
+    def _on_notify(self, _char, data: bytearray) -> None:
+        parsed = parse_csc_measurement(bytes(data))
+        revs, event_time = parsed["crank_revs"], parsed["crank_event_time"]
+        if revs is None or event_time is None:
+            return
+        cad = cadence_from_cranks(self._prev_revs, self._prev_time, revs, event_time)
+        if cad is not None:
+            self._cadence = cad
+            self._cadence_updated_at = time.monotonic()
+        # Repeated CSC events are not fresh zero-rpm observations.
+        if self._prev_time is None or event_time != self._prev_time:
+            self._prev_revs, self._prev_time = revs, event_time
+
+    def latest_power(self) -> Optional[int]:
+        return None
 
     def latest_cadence(self) -> Optional[float]:
         if (
@@ -528,6 +583,8 @@ async def scan(timeout: float = 5.0, attempts: int = SCAN_ATTEMPTS) -> List[dict
             sighting["roles"].append("hr")
         if FITNESS_MACHINE_SERVICE in services:
             sighting["roles"].append("trainer")
+        if CYCLING_SPEED_AND_CADENCE_SERVICE in services:
+            sighting["roles"].append("cadence")
     return list(merged.values())
 
 
@@ -538,12 +595,12 @@ async def connect_sensors(
 ) -> dict:
     """Connect selected sensors, or auto-discover the first sensor per role.
 
-    Returns ``{"trainer", "power_source", "hr_source", "clients", "names"}``.
-    Any of the three roles may be None (graceful degradation: e.g. power-only
+    Returns ``{"trainer", "power_source", "cadence_source", "hr_source", "clients", "names"}``.
+    Any role may be None (graceful degradation: e.g. power-only
     with no controllable trainer). The caller must disconnect every client in
     ``clients`` when the ride ends. Raises RuntimeError when bleak/adapter is
     unavailable. ``selected`` maps ``power`` to zero or more opaque addresses
-    and ``trainer`` / ``hr`` to zero or one. Explicit addresses are never
+    and ``trainer`` / ``hr`` / ``cadence`` to zero or one. Explicit addresses are never
     replaced with a different discovered device.
     """
     ok, reason = bleak_available()
@@ -553,7 +610,7 @@ async def connect_sensors(
     if retry_delay is None:
         retry_delay = CONNECT_RETRY_DELAY_S
 
-    roles: dict = {"trainer": [], "power": [], "hr": []}
+    roles: dict = {"trainer": [], "power": [], "hr": [], "cadence": []}
     if selected is None:
         found = await scan(timeout=timeout)
 
@@ -567,6 +624,7 @@ async def connect_sensors(
             ("trainer", FITNESS_MACHINE_SERVICE),
             ("power", CYCLING_POWER_SERVICE),
             ("hr", HEART_RATE_SERVICE),
+            ("cadence", CYCLING_SPEED_AND_CADENCE_SERVICE),
         ):
             device = _first_with(service)
             if device:
@@ -584,13 +642,16 @@ async def connect_sensors(
                 roles[role].append({"address": address, "name": address})
 
     clients: dict = {}  # address -> connected BleakClient (dedup: one per device)
-    out = {"trainer": None, "power_source": None, "hr_source": None,
+    out = {"trainer": None, "power_source": None, "cadence_source": None,
+           "hr_source": None,
            "clients": [], "clients_by_address": clients, "bindings": {},
            "names": {}, "errors": []}
     power_sources = []
     power_names = []
+    cadence_sources = []
+    cadence_names = []
     try:
-        for role in ("trainer", "power", "hr"):
+        for role in ("trainer", "power", "hr", "cadence"):
             for dev in roles[role]:
                 addr = dev["address"]
                 client = clients.get(addr)
@@ -663,6 +724,14 @@ async def connect_sensors(
                         out["bindings"].setdefault(
                             addr, {"name": dev["name"], "roles": {}}
                         )["roles"][role] = hr
+                    elif role == "cadence":
+                        cadence = BleakCadenceSource(client)
+                        await cadence.start()
+                        cadence_sources.append(cadence)
+                        cadence_names.append(dev["name"])
+                        out["bindings"].setdefault(
+                            addr, {"name": dev["name"], "roles": {}}
+                        )["roles"][role] = cadence
                 except Exception as e:  # role setup failed: keep the others working
                     message = f"Could not set up {role} sensor {dev['name']} ({addr}): {e}"
                     log.warning(message)
@@ -700,6 +769,15 @@ async def connect_sensors(
         out["names"]["power"] = (
             power_names[0] if len(power_names) == 1 else power_names
         )
+    if cadence_sources:
+        out["cadence_source"] = cadence_sources[0]
+        out["names"]["cadence"] = (
+            cadence_names[0] if len(cadence_names) == 1 else cadence_names
+        )
+        # Power-source cadence retains its existing meaning when power exists.
+        # A cadence-only connection remains usable by legacy consumers.
+        if out["power_source"] is None:
+            out["power_source"] = out["cadence_source"]
     return out
 
 
@@ -711,6 +789,8 @@ def _rebuild_connection_roles(conn: dict) -> None:
     trainer_name = None
     hr_source = None
     hr_name = None
+    cadence_source = None
+    cadence_name = None
     for binding in conn.get("bindings", {}).values():
         roles = binding.get("roles", {})
         name = binding.get("name", "(unknown)")
@@ -723,6 +803,9 @@ def _rebuild_connection_roles(conn: dict) -> None:
         if hr_source is None and "hr" in roles:
             hr_source = roles["hr"]
             hr_name = name
+        if cadence_source is None and "cadence" in roles:
+            cadence_source = roles["cadence"]
+            cadence_name = name
     conn["power_source"] = (
         None
         if not powers
@@ -730,6 +813,9 @@ def _rebuild_connection_roles(conn: dict) -> None:
         if len(powers) == 1
         else AggregatePowerSource(powers)
     )
+    conn["cadence_source"] = cadence_source
+    if conn["power_source"] is None:
+        conn["power_source"] = cadence_source
     conn["trainer"] = trainer
     conn["hr_source"] = hr_source
     names = {}
@@ -739,6 +825,8 @@ def _rebuild_connection_roles(conn: dict) -> None:
         names["trainer"] = trainer_name
     if hr_name is not None:
         names["hr"] = hr_name
+    if cadence_name is not None:
+        names["cadence"] = cadence_name
     conn["names"] = names
 
 
