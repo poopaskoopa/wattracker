@@ -498,9 +498,40 @@ def test_ride_page_end_workout_button_reuses_the_stop_path(client, monkeypatch):
     assert 'document.getElementById("stopBtn").addEventListener("click", requestEndRide);' in r.text
     assert ('document.getElementById("endWorkoutBtn").addEventListener('
             '"click", requestEndRide);') in r.text
-    assert "End the ride now? The rest of the workout is " in r.text
-    assert "if (!window.confirm(" in r.text
+    assert "End the ride now?" in r.text
+    assert "The rest of the workout is discarded and the ride is saved." in r.text
     assert "stopRide();" in r.text
+
+
+def test_ride_page_end_confirmation_is_in_page_not_a_browser_dialog(
+    client, monkeypatch
+):
+    """Ending a ride must not depend on a dialog the browser can suppress.
+
+    Both Stop buttons were gated on window.confirm(). Browsers suppress it
+    routinely - most often once "Prevent this page from creating additional
+    dialogs" has been ticked - and a suppressed confirm() returns false, which
+    the handler could not tell from Cancel. It returned silently, leaving both
+    buttons indistinguishable from dead with the ride still running.
+
+    tests/test_dom_smoke.py drives this in a real browser; this one pins the
+    wiring so a template edit cannot quietly put the browser dialog back.
+    """
+    _register(client)
+    monkeypatch.setattr(bledevices, "bluetooth_available", lambda: (True, "ok"))
+    r = client.get("/ride")
+    assert r.status_code == 200
+    # The confirmation is part of the page, so nothing outside it can take it
+    # away - and it offers both answers explicitly.
+    assert '<dialog id="endRideDialog"' in r.text
+    assert 'id="endRideConfirmBtn"' in r.text
+    assert 'id="endRideCancelBtn"' in r.text
+    assert "endRideDialog.showModal();" in r.text
+    # No browser dialog stands between the rider and stopping.
+    assert "if (!window.confirm(" not in r.text
+    # window.confirm survives only as a fallback for browsers without <dialog>,
+    # and even then it stops the ride rather than returning silently.
+    assert 'typeof endRideDialog.showModal !== "function"' in r.text
 
 
 def test_ride_page_shows_the_servers_erg_message_over_the_raw_error(client,
@@ -1090,8 +1121,6 @@ def test_ride_ws_sustained_erg_failure_disables_erg_and_says_so(
     ]
     assert running and running[-1]["erg_enabled"] is False
     assert frames[-1]["status"] == "finished"
-
-
 
 
 def test_ride_ws_real_path_degrades_without_trainer(client, monkeypatch):
@@ -1890,3 +1919,5 @@ def test_ride_page_treats_the_cooldown_as_an_active_ride(client, monkeypatch):
     assert '"cooldown — stop pedalling to finish"' in r.text
     assert '"cooldown — finishing in " + left + "s"' in r.text
     assert 'document.getElementById("rStatus").textContent = statusText(st);' in r.text
+
+

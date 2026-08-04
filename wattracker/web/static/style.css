@@ -716,6 +716,15 @@ button.danger.link-btn { border: none; color: var(--alert); }
     justify-content: flex-end; }
 .ride-chart-heading .ride-chart-end { border-color: var(--alert); color: var(--alert); }
 .ride-chart-heading .ride-chart-end:disabled { border-color: var(--surface-border); color: var(--muted); }
+/* In-page end-of-ride confirmation. Replaces window.confirm(), which browsers
+   can suppress - leaving both Stop buttons dead with a rider still riding. */
+.ride-confirm { background: var(--surface-2); color: var(--text);
+    border: 1px solid var(--surface-border); border-radius: 8px;
+    padding: 1.25rem; max-width: 26rem; width: calc(100% - 2rem); }
+.ride-confirm::backdrop { background: rgba(0, 0, 0, 0.6); }
+.ride-confirm h3 { margin: 0 0 0.5rem; }
+.ride-confirm p { margin: 0 0 1rem; color: var(--muted); }
+.ride-confirm-actions { justify-content: flex-end; }
 /* Grow with the page width: at a 1440px main a fixed 260px box is a 5:1 letter
    slot the traces have no room to move in. Clamped at both ends so a phone
    keeps the old height and a wide desktop stops before the chart eats the fold.
