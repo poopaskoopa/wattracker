@@ -590,6 +590,7 @@ def ingest_upload(
     filename: str,
     content: bytes,
     *,
+    ftp: Optional[float] = None,
     refresh: bool = True,
 ) -> Optional[int]:
     """Ingest an uploaded .fit file (raw bytes) for a user.
@@ -603,7 +604,7 @@ def ingest_upload(
         tmp.write(content)
         tmp.flush()
         tmp.close()
-        result = ingest_file(user_id, tmp.name)
+        result = ingest_file(user_id, tmp.name, ftp=ftp)
         if refresh:
             evaluate_ftp(user_id)
             match_plan_completions(user_id)

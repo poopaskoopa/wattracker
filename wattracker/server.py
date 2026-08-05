@@ -1013,10 +1013,11 @@ def create_app() -> FastAPI:
         skipped = 0
         failed = 0
         uid = _uid(request)
+        batch_ftp = importer.current_ftp(uid)
         for safe_name, content in staged:
             try:
                 activity_id = importer.ingest_upload(
-                    uid, safe_name, content, refresh=False
+                    uid, safe_name, content, ftp=batch_ftp, refresh=False
                 )
             except Exception:
                 failed += 1
