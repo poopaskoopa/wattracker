@@ -989,7 +989,7 @@ def create_app() -> FastAPI:
         }, status_code=202)
 
     @app.post("/setup/upload")
-    async def setup_upload(request: Request, files: List[UploadFile] = File(...)):
+    def setup_upload(request: Request, files: List[UploadFile] = File(...)):
         if not _same_origin_or_absent(request):
             return JSONResponse({"error": "Cross-origin request rejected."}, status_code=403)
         if not files or len(files) > MAX_ONBOARDING_UPLOAD_FILES:
@@ -1002,11 +1002,11 @@ def create_app() -> FastAPI:
                 return JSONResponse({"error": "Only .fit files can be imported."}, status_code=400)
             declared = getattr(uploaded, "size", None)
             if declared is not None and declared > MAX_ONBOARDING_UPLOAD_BYTES:
-                return Response("Selected files are too large.", status_code=413)
-            content = await uploaded.read()
+                return JSONResponse({"error": "Selected files are too large."}, status_code=413)
+            content = uploaded.file.read()
             total += len(content)
             if total > MAX_ONBOARDING_UPLOAD_BYTES:
-                return Response("Selected files are too large.", status_code=413)
+                return JSONResponse({"error": "Selected files are too large."}, status_code=413)
             # The generated name is deliberately independent of browser paths.
             staged.append((f"onboarding-{index}.fit", content))
         imported = 0
@@ -1015,7 +1015,9 @@ def create_app() -> FastAPI:
         uid = _uid(request)
         for safe_name, content in staged:
             try:
-                activity_id = importer.ingest_upload(uid, safe_name, content)
+                activity_id = importer.ingest_upload(
+                    uid, safe_name, content, refresh=False
+                )
             except Exception:
                 failed += 1
                 continue
@@ -1023,6 +1025,10 @@ def create_app() -> FastAPI:
                 skipped += 1
             else:
                 imported += 1
+        if imported > 0:
+            importer.evaluate_ftp(uid)
+            importer.match_plan_completions(uid)
+            importer.profile_store.refresh(uid)
         estimate = importer.recent_best_effort_ftp(uid)
         return JSONResponse({
             "selected": len(staged),
@@ -1054,7 +1060,13 @@ def create_app() -> FastAPI:
             if watts <= 0:
                 watts = 200.0
             db.set_user_ftp_override(uid, None)
-            db.add_ftp_entry(uid, utc_today().isoformat(), round(watts, 1), "estimated")
+            db.add_ftp_entry(
+                uid,
+                utc_today().isoformat(),
+                round(watts, 1),
+                "estimated",
+                replace_existing=True,
+            )
         else:
             return JSONResponse({"error": "Choose an estimated or manual FTP."}, status_code=400)
         return JSONResponse({"choice": choice, "ftp": round(watts, 1), "source": choice})
@@ -1157,7 +1169,13 @@ def create_app() -> FastAPI:
         if cred_saved:
             updates["zwift_id"] = rider_id
         db.save_user_settings(uid, updates)
-        db.add_ftp_entry(uid, utc_today().isoformat(), round(ftp, 1), choice)
+        db.add_ftp_entry(
+            uid,
+            utc_today().isoformat(),
+            round(ftp, 1),
+            choice,
+            replace_existing=choice == "estimated",
+        )
         db.complete_onboarding(uid)
         return templates.TemplateResponse(
             request, "setup.html", _setup_context(
