@@ -1,4 +1,6 @@
 """Focused regression coverage for first-run onboarding."""
+import logging
+import os
 import sqlite3
 import time
 
@@ -7,9 +9,10 @@ import pytest
 pytest.importorskip("httpx")
 from fastapi.testclient import TestClient
 
-from wattracker import auth, db
+from wattracker import auth, db, paths
 import wattracker.credstore as credstore
 import wattracker.ingest.importer as importer
+import wattracker.server as server_mod
 from wattracker.server import create_app
 
 
@@ -100,6 +103,146 @@ def test_fit_upload_imports_and_counts_with_parser_mocked(client, monkeypatch):
     assert len(db.list_activities(uid)) == 1
 
 
+def test_onboarding_posts_reject_cross_origin_without_mutation(
+    client, home_dir, monkeypatch
+):
+    uid = _register(client)
+    activities = home_dir / "Activities"
+    activities.mkdir()
+
+    def unexpected_import(*_args, **_kwargs):
+        raise AssertionError("cross-origin upload reached the importer")
+
+    monkeypatch.setattr(importer, "ingest_upload", unexpected_import)
+    requests = (
+        ("/setup/check-directory", {"data": {"activities_dir": str(activities)}}),
+        ("/setup/upload", {
+            "files": [("files", ("ride.fit", b"fit", "application/octet-stream"))]
+        }),
+        ("/setup/ftp", {"data": {"choice": "manual", "manual_ftp": "275"}}),
+        ("/setup/complete", {"data": {
+            "weight_kg": "72", "ftp_choice": "manual", "manual_ftp": "275",
+            "zwiftpower": "no", "activities_dir": str(activities),
+        }}),
+    )
+
+    for route, kwargs in requests:
+        response = client.post(
+            route, headers={"origin": "https://evil.example.com"}, **kwargs
+        )
+        assert response.status_code == 403, route
+
+    settings = db.get_user_settings(uid)
+    assert settings["activities_dir"] is None
+    assert settings["weight_kg"] is None
+    assert settings["ftp"] is None
+    assert db.latest_ftp(uid) is None
+    assert db.list_activities(uid) == []
+    assert db.onboarding_complete(uid) is False
+
+
+@pytest.mark.parametrize(
+    ("files", "expected_status"),
+    (
+        ([("files", ("large.fit", b"123456", "application/octet-stream"))], 413),
+        ([
+            ("files", ("first.fit", b"123", "application/octet-stream")),
+            ("files", ("second.fit", b"456", "application/octet-stream")),
+        ], 413),
+        ([
+            ("files", ("first.fit", b"1", "application/octet-stream")),
+            ("files", ("second.fit", b"2", "application/octet-stream")),
+            ("files", ("third.fit", b"3", "application/octet-stream")),
+        ], 400),
+    ),
+    ids=("per-file-bytes", "running-total-bytes", "file-count"),
+)
+def test_onboarding_upload_limits_are_json(
+    client, monkeypatch, files, expected_status
+):
+    _register(client)
+    monkeypatch.setattr(server_mod, "MAX_ONBOARDING_UPLOAD_BYTES", 5)
+    monkeypatch.setattr(server_mod, "MAX_ONBOARDING_UPLOAD_FILES", 2)
+    monkeypatch.setattr(
+        importer,
+        "ingest_upload",
+        lambda *_args, **_kwargs: pytest.fail("rejected upload reached the importer"),
+    )
+
+    response = client.post("/setup/upload", files=files)
+
+    assert response.status_code == expected_status
+    assert response.headers["content-type"].startswith("application/json")
+    assert response.json()["error"]
+
+
+def test_onboarding_upload_rejects_non_fit_before_import(client, monkeypatch):
+    _register(client)
+    monkeypatch.setattr(
+        importer,
+        "ingest_upload",
+        lambda *_args, **_kwargs: pytest.fail("non-FIT upload reached the importer"),
+    )
+
+    response = client.post(
+        "/setup/upload",
+        files=[("files", ("notes.txt", b"not a FIT file", "text/plain"))],
+    )
+
+    assert response.status_code == 400
+    assert response.headers["content-type"].startswith("application/json")
+    assert response.json()["error"]
+
+
+def test_onboarding_directory_rejections_preserve_accepted_directory(
+    client, tmp_path, home_dir
+):
+    uid = _register(client)
+    accepted = home_dir / "accepted"
+    accepted.mkdir()
+    response = client.post(
+        "/setup/check-directory", data={"activities_dir": str(accepted)}
+    )
+    assert response.status_code == 202
+    _wait_scan(client)
+    assert db.get_user_settings(uid)["activities_dir"] == str(accepted)
+
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    rejected_values = ("", "   ", str(home_dir / ".." / outside.name))
+    for value in rejected_values:
+        rejected = client.post(
+            "/setup/check-directory", data={"activities_dir": value}
+        )
+        assert rejected.status_code == 400, value
+        assert db.get_user_settings(uid)["activities_dir"] == str(accepted)
+
+
+@pytest.mark.skipif(os.name != "posix", reason="symlink semantics tested on POSIX")
+def test_onboarding_directory_symlink_escape_preserves_accepted_directory(
+    client, tmp_path, home_dir
+):
+    uid = _register(client)
+    accepted = home_dir / "accepted"
+    accepted.mkdir()
+    response = client.post(
+        "/setup/check-directory", data={"activities_dir": str(accepted)}
+    )
+    assert response.status_code == 202
+    _wait_scan(client)
+
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    escaped = home_dir / "escaped"
+    escaped.symlink_to(outside, target_is_directory=True)
+    rejected = client.post(
+        "/setup/check-directory", data={"activities_dir": str(escaped)}
+    )
+
+    assert rejected.status_code == 400
+    assert db.get_user_settings(uid)["activities_dir"] == str(accepted)
+
+
 def test_ftp_choices_persist_and_bad_manual_input_is_rejected(client, monkeypatch):
     uid = _register(client)
     bad = client.post("/setup/ftp", data={"choice": "manual", "manual_ftp": "watts"})
@@ -158,6 +301,57 @@ def test_completion_yes_profile_saves_credentials_without_password_in_response(c
     assert db.get_user_settings(uid)["zwift_id"] == "12345"
     assert saved == {"user_id": uid, "email": "rider@example.com", "password": "secret-pass"}
     assert "secret-pass" not in response.text
+
+
+def test_credential_save_failure_does_not_expose_password_in_response_or_logs(
+    client, monkeypatch, caplog
+):
+    _register(client)
+    password = "onboarding-secret-password"
+
+    def fail_save(_user_id, _email, supplied_password):
+        raise RuntimeError(f"credential backend rejected {supplied_password}")
+
+    monkeypatch.setattr(credstore, "save_zwift_credentials", fail_save)
+    with caplog.at_level(logging.WARNING, logger="wattracker.server"):
+        response = client.post("/setup/complete", data={
+            "weight_kg": "70", "ftp_choice": "estimated",
+            "zwiftpower": "yes", "zwift_id": "12345",
+            "zwift_email": "rider@example.com", "zwift_password": password,
+        })
+
+    assert response.status_code == 400
+    assert password not in response.text
+    assert password not in caplog.text
+
+
+def test_onboarding_directory_validation_delegates_to_paths(
+    client, home_dir, monkeypatch
+):
+    _register(client)
+    accepted = home_dir / "accepted"
+    accepted.mkdir()
+    calls = []
+
+    def confine(value, must_exist):
+        calls.append((value, must_exist))
+        return str(accepted), None
+
+    monkeypatch.setattr(paths, "confine_storage_dir", confine)
+    checked = client.post(
+        "/setup/check-directory", data={"activities_dir": "check-delegation"}
+    )
+    completed = client.post("/setup/complete", data={
+        "weight_kg": "70", "ftp_choice": "estimated", "zwiftpower": "no",
+        "activities_dir": "complete-delegation",
+    })
+
+    assert calls == [
+        ("check-delegation", True),
+        ("complete-delegation", True),
+    ]
+    assert checked.status_code == 202
+    assert completed.status_code == 200
 
 
 def test_register_and_root_dashboard_remain_compatible(client):
