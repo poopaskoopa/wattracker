@@ -392,3 +392,54 @@ def test_every_nav_page_loads_clean(page, live_server, console_errors):
         for err in console_errors:
             failures.append(f"{path}: {err}")
     assert not failures, "nav pages reported problems:\n" + "\n".join(failures)
+
+
+def test_ride_stop_ends_the_ride_through_an_in_page_dialog(
+    page, live_server, console_errors
+):
+    """A rider must always be able to end a ride from the page.
+
+    Both Stop buttons used to be gated on ``window.confirm()``. Browsers
+    suppress that dialog routinely -- most often once "Prevent this page from
+    creating additional dialogs" has been ticked on an earlier one -- and a
+    suppressed confirm() returns false, which the handler could not tell from
+    the rider pressing Cancel. It returned silently, so both buttons were
+    indistinguishable from dead while the ride stayed live and the trainer kept
+    holding its target.
+
+    Playwright dismisses browser dialogs, so this test runs in exactly that
+    environment: against the old confirm()-gated code the ride never ends here.
+    """
+    browser_dialogs = []
+    page.on(
+        "dialog",
+        lambda d: (browser_dialogs.append(d.type), d.dismiss()),
+    )
+
+    page.goto(f"{live_server.base}/ride")
+    page.wait_for_load_state("networkidle")
+    page.click("#simBtn")
+    page.wait_for_selector("#stopBtn:not([disabled])", timeout=15_000)
+
+    # Cancelling leaves the ride alone.
+    page.click("#stopBtn")
+    page.wait_for_selector("#endRideDialog[open]", timeout=10_000)
+    assert page.locator("#endRideCancelBtn").is_visible()
+    page.click("#endRideCancelBtn")
+    page.wait_for_selector(
+        "#endRideDialog:not([open])", state="attached", timeout=10_000
+    )
+    assert page.locator("#stopBtn").is_enabled(), "cancel ended the ride"
+
+    # Confirming actually ends it: back to idle, which is what re-disables the
+    # button. No browser-level dialog was involved at any point.
+    page.click("#stopBtn")
+    page.wait_for_selector("#endRideDialog[open]", timeout=10_000)
+    page.click("#endRideConfirmBtn")
+    page.wait_for_selector(
+        "#endRideDialog:not([open])", state="attached", timeout=10_000
+    )
+    page.wait_for_selector("#stopBtn[disabled]", timeout=15_000)
+
+    assert browser_dialogs == [], f"a browser dialog was used: {browser_dialogs}"
+    _assert_clean(console_errors, "/ride stop")

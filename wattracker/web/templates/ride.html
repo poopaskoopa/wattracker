@@ -151,6 +151,25 @@
     </div>
 </section>
 
+<!-- Ending a ride must never depend on window.confirm(): browsers suppress it
+     routinely (most often once "Prevent this page from creating additional
+     dialogs" has been ticked), and a suppressed confirm() returns false, which
+     is indistinguishable from the rider pressing Cancel. That left both Stop
+     buttons dead with a rider still on the trainer. This dialog is part of the
+     page, so nothing outside the page can take it away. -->
+<dialog id="endRideDialog" class="ride-confirm" aria-labelledby="endRideDialogTitle">
+    <form method="dialog">
+        <h3 id="endRideDialogTitle">End the ride now?</h3>
+        <p>The rest of the workout is discarded and the ride is saved.</p>
+        <div class="toolbar ride-confirm-actions">
+            <button type="submit" value="cancel" id="endRideCancelBtn"
+                    class="button-secondary">Keep riding</button>
+            <button type="submit" value="end" id="endRideConfirmBtn"
+                    class="danger">End ride</button>
+        </div>
+    </form>
+</dialog>
+
 <script src="{{ static_url('workout_graph.js') }}"></script>
 <script>
 (function () {
@@ -161,6 +180,7 @@
     var deviceNames = {};
     var scannedDevices = {};
     var rideState = "idle";
+    var endRideDialog = document.getElementById("endRideDialog");
     var bleAvailable = !document.getElementById("scanBtn").disabled;
     var cacheKey = {{ ble_cache_key|tojson }};
     var cache = readCache();
@@ -609,6 +629,11 @@
         // that will never update again with no visible way back, so drop out of
         // full screen whenever the ride goes idle (a no-op if it isn't up).
         if (!active) exitChartFullscreen();
+        // Asking "end the ride?" about a ride that has already ended would
+        // leave a modal the rider has to dismiss for no reason.
+        if (!active && endRideDialog && endRideDialog.open) {
+            endRideDialog.close("cancel");
+        }
         document.getElementById("stopBtn").disabled = !active;
         document.getElementById("endWorkoutBtn").disabled = !active;
         document.getElementById("simBtn").disabled = active;
@@ -1023,8 +1048,13 @@
                 ergPending = false;
                 applyErgState(Boolean(st.available), Boolean(st.enabled));
                 if (st.error) {
+                    // A frame that carries both is one the server wrote a rider-
+                    // facing explanation for (e.g. ERG switched off after
+                    // repeated command failures); prefer it over the raw FTMS
+                    // error, which stays in the server log either way.
                     setLive(document.getElementById("ergStatus"),
-                        st.error || "Unable to change ERG mode.", "failure");
+                        st.message || st.error || "Unable to change ERG mode.",
+                        "failure");
                     playCue("failure");
                 } else if (!st.available) {
                     setLive(document.getElementById("ergStatus"),
@@ -1634,12 +1664,33 @@
     }
     function requestEndRide() {
         if (rideState === "idle") return;
-        // Browsers suppress or auto-dismiss dialogs raised from full screen,
-        // so come back to the page before asking.
+        // The full-screen chart is a fixed overlay that would sit over the
+        // dialog, so come back to the page before asking.
         exitChartFullscreen();
-        if (!window.confirm("End the ride now? The rest of the workout is " +
-                "discarded and the ride is saved.")) return;
-        stopRide();
+        if (!endRideDialog || typeof endRideDialog.showModal !== "function") {
+            // No <dialog> support. A browser dialog can be suppressed, which is
+            // the bug this replaced - but a dead Stop button strands a rider on
+            // a trainer, so it is still the better of the two failures.
+            if (typeof window.confirm !== "function"
+                    || window.confirm("End the ride now? The rest of the "
+                        + "workout is discarded and the ride is saved.")) {
+                stopRide();
+            }
+            return;
+        }
+        if (endRideDialog.open) return;
+        // Esc leaves returnValue untouched in some browsers, so clear the
+        // previous answer rather than letting it stand in for this one.
+        endRideDialog.returnValue = "";
+        endRideDialog.showModal();
+    }
+    if (endRideDialog) {
+        endRideDialog.addEventListener("close", function () {
+            // "Keep riding" and Esc both land here with a non-"end" value.
+            if (endRideDialog.returnValue !== "end") return;
+            if (rideState === "idle") return;  // ride ended while we asked
+            stopRide();
+        });
     }
     document.getElementById("stopBtn").addEventListener("click", requestEndRide);
     document.getElementById("endWorkoutBtn").addEventListener("click", requestEndRide);
