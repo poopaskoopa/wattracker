@@ -23,7 +23,7 @@ from .timeutil import utc_now, valid_timezone
 
 _log = logging.getLogger(__name__)
 
-SCHEMA_VERSION = 28
+SCHEMA_VERSION = 29
 
 
 def _restrict_db_files(path: str) -> None:
@@ -234,6 +234,11 @@ _MIGRATIONS: Dict[int, Sequence[Union[str, Callable[[sqlite3.Connection], None]]
         # have produced past suggestions was never consumed, so the next
         # rating (or the next scan) computes one from it.
     ],
+    28: [
+        # Existing accounts have already completed the first-hour setup. New
+        # accounts are inserted explicitly as incomplete below.
+        "ALTER TABLE users ADD COLUMN onboarding_complete INTEGER NOT NULL DEFAULT 1",
+    ],
 }
 
 _DROP = """
@@ -262,7 +267,8 @@ CREATE TABLE IF NOT EXISTS users (
     password_hash TEXT NOT NULL,
     created       TEXT NOT NULL,
     -- sha256 hex of the /calendar.ics feed token; never the token itself.
-    calendar_token_hash TEXT
+    calendar_token_hash TEXT,
+    onboarding_complete INTEGER NOT NULL DEFAULT 0
 );
 -- UNIQUE, but as an index so the many NULLs (users without a feed link) are
 -- allowed: SQLite only treats NULLs as distinct inside a unique index.
@@ -660,13 +666,39 @@ def create_user(username: str, password_hash: str, path: Optional[str] = None) -
     conn = connect(path)
     try:
         cur = conn.execute(
-            "INSERT INTO users (username, password_hash, created) VALUES (?, ?, ?)",
+            "INSERT INTO users (username, password_hash, created, onboarding_complete) "
+            "VALUES (?, ?, ?, 0)",
             (username, password_hash, utc_now().isoformat()),
         )
         conn.commit()
         return cur.lastrowid
     except sqlite3.IntegrityError:
         return None
+    finally:
+        conn.close()
+
+
+def onboarding_complete(user_id: int, path: Optional[str] = None) -> bool:
+    """Return whether this account has finished first-hour onboarding."""
+    conn = connect(path)
+    try:
+        row = conn.execute(
+            "SELECT onboarding_complete FROM users WHERE id = ?", (user_id,)
+        ).fetchone()
+        return bool(row and row["onboarding_complete"])
+    finally:
+        conn.close()
+
+
+def complete_onboarding(user_id: int, path: Optional[str] = None) -> bool:
+    """Mark an existing account's onboarding as complete."""
+    conn = connect(path)
+    try:
+        cur = conn.execute(
+            "UPDATE users SET onboarding_complete = 1 WHERE id = ?", (user_id,)
+        )
+        conn.commit()
+        return cur.rowcount > 0
     finally:
         conn.close()
 
