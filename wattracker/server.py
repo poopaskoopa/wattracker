@@ -633,27 +633,6 @@ def _trusted_origin_or_absent(request: Request, allowed_hosts: List[str]) -> boo
     return parsed.hostname.lower() in allowed_hosts
 
 
-def _validate_trusted_directory(value: str) -> "tuple[Optional[str], Optional[str]]":
-    """Resolve an existing directory without widening the trusted roots."""
-    raw = (value or "").strip()
-    if not raw:
-        return "", None
-    expanded = os.path.realpath(os.path.abspath(os.path.expanduser(raw)))
-    if not os.path.isdir(expanded):
-        return None, f"Folder not found or not a directory: {raw}"
-    for root in paths.trusted_storage_roots():
-        resolved_root = os.path.realpath(os.path.abspath(os.path.expanduser(root)))
-        try:
-            if os.path.commonpath([expanded, resolved_root]) == resolved_root:
-                return expanded, None
-        except ValueError:
-            continue
-    return None, (
-        "Folder must be inside your home directory or a configured "
-        f"Zwift data directory: {raw}"
-    )
-
-
 def _setup_number(raw: str, minimum: float, maximum: float) -> Optional[float]:
     try:
         value = float((raw or "").strip())
@@ -982,7 +961,7 @@ def create_app() -> FastAPI:
         if not _same_origin_or_absent(request):
             return JSONResponse({"error": "Cross-origin request rejected."}, status_code=403)
         uid = _uid(request)
-        clean, error = _validate_trusted_directory(activities_dir)
+        clean, error = paths.confine_storage_dir(activities_dir, must_exist=True)
         if error:
             return JSONResponse({"error": error, "exists": False, "fit_count": 0}, status_code=400)
         if not clean:
@@ -1127,7 +1106,9 @@ def create_app() -> FastAPI:
             )
         clean_dir = None
         if activities_dir.strip():
-            clean_dir, dir_error = _validate_trusted_directory(activities_dir)
+            clean_dir, dir_error = paths.confine_storage_dir(
+                activities_dir, must_exist=True
+            )
             if dir_error:
                 return templates.TemplateResponse(
                     request, "setup.html", _setup_context(request, error=dir_error, form=form), status_code=400
@@ -1151,7 +1132,7 @@ def create_app() -> FastAPI:
                 backend = credstore.save_zwift_credentials(uid, zwift_email, zwift_password)
             except Exception:
                 # Do not expose backend details, exception text, or password.
-                _log.warning("onboarding credential save failed for user %s", uid, exc_info=True)
+                _log.warning("onboarding credential save failed for user %s", uid)
                 return templates.TemplateResponse(
                     request, "setup.html", _setup_context(
                         request, error="ZwiftPower details could not be saved securely. Try again.", form=form
