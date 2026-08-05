@@ -1704,19 +1704,23 @@ def add_ftp_entry(
     ftp_watts: float,
     source: str = "estimated",
     path: Optional[str] = None,
+    *,
+    replace_existing: bool = False,
 ) -> None:
     """Append/update an FTP history row for (user, date).
 
     - source='manual' replaces any existing row for that date.
-    - source='estimated' inserts only if no row exists (never overwrites manual).
+    - source='estimated' inserts only if no row exists (never overwrites manual),
+      unless ``replace_existing`` is explicitly requested by an onboarding
+      choice that replaces a previously entered value.
     """
     conn = connect(path)
     try:
-        if source == "manual":
+        if source == "manual" or replace_existing:
             conn.execute(
                 "INSERT OR REPLACE INTO ftp_history (user_id, date, ftp_watts, source) "
                 "VALUES (?, ?, ?, ?)",
-                (user_id, date, float(ftp_watts), "manual"),
+                (user_id, date, float(ftp_watts), source),
             )
         else:
             conn.execute(

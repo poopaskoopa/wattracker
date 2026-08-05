@@ -2,6 +2,7 @@
 import logging
 import os
 import sqlite3
+import inspect
 import time
 
 import pytest
@@ -243,6 +244,50 @@ def test_onboarding_directory_symlink_escape_preserves_accepted_directory(
     assert db.get_user_settings(uid)["activities_dir"] == str(accepted)
 
 
+def test_setup_upload_is_offloaded_from_event_loop(client):
+    _register(client)
+    endpoint = next(
+        route.endpoint for route in client.app.routes
+        if getattr(route, "path", None) == "/setup/upload"
+    )
+    assert not inspect.iscoroutinefunction(endpoint)
+
+
+def test_setup_upload_refreshes_derived_state_once_per_batch(client, monkeypatch):
+    _register(client)
+    calls = {"ftp": 0, "completions": 0, "profile": 0}
+
+    monkeypatch.setattr(importer, "ingest_file", lambda user_id, path: 1)
+    monkeypatch.setattr(
+        importer,
+        "evaluate_ftp",
+        lambda user_id: calls.__setitem__("ftp", calls["ftp"] + 1),
+    )
+    monkeypatch.setattr(
+        importer,
+        "match_plan_completions",
+        lambda user_id: calls.__setitem__("completions", calls["completions"] + 1),
+    )
+    monkeypatch.setattr(
+        importer.profile_store,
+        "refresh",
+        lambda user_id: calls.__setitem__("profile", calls["profile"] + 1),
+    )
+    monkeypatch.setattr(importer, "recent_best_effort_ftp", lambda user_id: 241.25)
+
+    response = client.post(
+        "/setup/upload",
+        files=[
+            ("files", ("one.fit", b"one", "application/octet-stream")),
+            ("files", ("two.fit", b"two", "application/octet-stream")),
+        ],
+    )
+
+    assert response.status_code == 200
+    assert response.json()["imported"] == 2
+    assert calls == {"ftp": 1, "completions": 1, "profile": 1}
+
+
 def test_ftp_choices_persist_and_bad_manual_input_is_rejected(client, monkeypatch):
     uid = _register(client)
     bad = client.post("/setup/ftp", data={"choice": "manual", "manual_ftp": "watts"})
@@ -279,6 +324,26 @@ def test_estimated_choice_clears_a_previous_manual_override(client, monkeypatch)
     })
     assert response.status_code == 200
     assert db.get_user_settings(uid)["ftp"] is None
+    latest = db.latest_ftp(uid)
+    assert latest["source"] == "estimated"
+    assert latest["ftp_watts"] == pytest.approx(241.2)
+    assert importer.current_ftp(uid) == pytest.approx(241.2)
+
+
+def test_setup_ftp_estimated_replaces_same_day_manual_history(client, monkeypatch):
+    uid = _register(client)
+    assert client.post(
+        "/setup/ftp", data={"choice": "manual", "manual_ftp": "275"}
+    ).status_code == 200
+    monkeypatch.setattr(importer, "recent_best_effort_ftp", lambda user_id: 241.25)
+
+    response = client.post("/setup/ftp", data={"choice": "estimated"})
+
+    assert response.status_code == 200
+    latest = db.latest_ftp(uid)
+    assert latest["source"] == "estimated"
+    assert latest["ftp_watts"] == pytest.approx(241.2)
+    assert importer.current_ftp(uid) == pytest.approx(241.2)
 
 
 def test_completion_no_profile_sets_flag_and_saves_settings(client):
