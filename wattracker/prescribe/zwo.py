@@ -149,6 +149,22 @@ def write_plan_to_zwift(
 
     Each workout dict needs ``date``, ``name`` and ``zwo`` (the XML string).
     Returns {"directory": ..., "paths": [...], "count": N}.
+
+    ``workouts_override`` is the user's STORED ``user_settings.workouts_dir``
+    and nothing else. Do not pass a directory that paths.resolve_export_dir()
+    already returned: this parameter is the untrusted submitted-path input, and
+    a resolved folder fed back through it is re-judged as if the user had typed
+    it - which refuses legitimate relocated (junctioned) Zwift folders. Let
+    this function resolve; it runs the same resolver on the same inputs, and
+    ``result["directory"]`` is what the caller's own resolve returned.
+
+    Raises paths.ExportTargetUnavailable when there is no confined directory to
+    write into (see paths.workouts_dir): an escaping stored workouts_dir
+    (``reason == "blocked"``), several Zwift player folders to choose between
+    ("choose"), or none at all ("missing"). It is deliberately not caught here
+    and there is no fallback directory - a partial or misdirected export
+    reported as success is the failure this replaces. Nothing is created or
+    written when it raises; the caller renders the reason.
     """
     from ..paths import workouts_dir
 
@@ -176,6 +192,11 @@ def write_to_zwift(
 
     A per-user `workouts_override` folder wins over the OS default. Creates the
     directory if it does not exist. Returns the written path.
+
+    Raises paths.ExportTargetUnavailable (``.reason`` / ``.refused``) when no
+    confined target can be determined, for the same reason write_plan_to_zwift
+    does: there is no fallback folder, because a folder Zwift never reads is
+    not a successful export. Nothing is created or written in that case.
     """
     from ..paths import workouts_dir
 

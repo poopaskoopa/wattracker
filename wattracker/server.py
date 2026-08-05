@@ -1473,6 +1473,26 @@ def create_app() -> FastAPI:
         others = [e for e in entries if e["id"] != current["id"]]
         return {"current": current, "others": others}
 
+    def _export_error(exc: paths.ExportTargetUnavailable) -> dict:
+        """Render-ready form of a refusal from the .zwo writers.
+
+        The explicit export buttons used to be incapable of failing: they went
+        through a resolver that fell back to a literal "me" folder, so they
+        always reported success, sometimes for a folder Zwift never reads
+        (issue #44). Now they share the automatic sweep's resolver, so they can
+        also come back with "there is nowhere to write" - and the page says so
+        in the SAME words the sweep already uses (plan.html's export_alert
+        macro), because the whole point of the fix is that the two paths stop
+        disagreeing about where a user's workouts go.
+
+        ``detail`` is only carried for 'blocked', the one reason where a folder
+        WAS configured and was refused: the user needs to know which value of
+        theirs was rejected and why. For 'choose'/'missing' nothing was
+        determined, so there is nothing specific to quote.
+        """
+        _log.info("export refused (%s): %s", exc.reason, exc.detail or exc)
+        return {"reason": exc.reason, "detail": exc.detail if exc.refused else ""}
+
     def _generate_ctx(request: Request, **kw) -> dict:
         uid = _uid(request)
         defaults = kw.get("plan_defaults") or _plan_defaults()
@@ -1488,6 +1508,7 @@ def create_app() -> FastAPI:
             day_labels=DAY_LABELS,
             exported=None,
             exported_path=None,
+            export_error=None,
             scheduled_date=utc_today().isoformat(),
             flash=None,
             plan_mgmt=_plan_management(uid),
@@ -1601,7 +1622,8 @@ def create_app() -> FastAPI:
         if not target:
             return {
                 "auto_export": None,
-                "auto_export_reason": reason,  # 'choose' | 'missing'
+                "auto_export_reason": reason,  # 'choose' | 'missing' | 'blocked'
+                "auto_export_detail": "",
                 "zwift_candidates": paths.candidate_zwift_ids(),
             }
         workouts = db.plan_workouts_for_plan(uid, plan_id, include_zwo=True)
@@ -1611,12 +1633,38 @@ def create_app() -> FastAPI:
                     {"date": w["date"], "name": w["name"], "zwo": w["zwo_or_segments"]}
                     for w in workouts
                 ],
-                settings.get("zwift_id") or "me",
-                workouts_override=target,
+                settings.get("zwift_id"),
+                # The STORED setting, not ``target``. workouts_override is the
+                # untrusted user value; handing a resolved directory back to it
+                # re-labels a folder the app DISCOVERED as one the user
+                # SUBMITTED, and it is then judged by the stricter
+                # submitted-path rule - which is how a relocated (junctioned)
+                # Zwift player folder resolved fine here and was refused one
+                # call later. Same resolver, same inputs, same directory.
+                workouts_override=settings.get("workouts_dir"),
             )
+        except paths.ExportTargetUnavailable as e:
+            # The plan's rows are already committed at this point, so this may
+            # not escape: it would 500 the response to a plan the user now
+            # owns and cannot see. It is a RuntimeError on purpose, so the
+            # OSError branch below does not cover it.
+            _log.warning("plan auto-export refused (%s): %s", e.reason, e.detail or e)
+            return {
+                "auto_export": None,
+                "auto_export_reason": e.reason,
+                "auto_export_detail": e.detail if e.refused else "",
+                "zwift_candidates": paths.candidate_zwift_ids(),
+            }
         except OSError as e:
+            # A real I/O failure (permissions, full disk, folder yanked). The
+            # reason used to be f"error: {e}", which matched no branch in
+            # plan.html's export_alert macro, so the plan card rendered NOTHING
+            # and the user was told their workouts had not been exported by
+            # being told nothing at all. It is now a reason the macro knows,
+            # with the OS message carried separately as the detail.
             _log.warning("plan auto-export failed: %s", e)
-            return {"auto_export": None, "auto_export_reason": f"error: {e}"}
+            return {"auto_export": None, "auto_export_reason": "error",
+                    "auto_export_detail": str(e)}
         return {
             "auto_export": {
                 "count": result["count"],
@@ -1624,6 +1672,7 @@ def create_app() -> FastAPI:
                 "reason": reason,
             },
             "auto_export_reason": None,
+            "auto_export_detail": "",
         }
 
     @app.get("/plan", response_class=HTMLResponse)
@@ -1793,21 +1842,31 @@ def create_app() -> FastAPI:
         workouts = db.plan_workouts_for_plan(uid, plan_id, include_zwo=True)
         settings = db.get_user_settings(uid)
         exported = None
+        export_error = None
         if workouts:
-            result = zwo.write_plan_to_zwift(
-                [
-                    {"date": w["date"], "name": w["name"], "zwo": w["zwo_or_segments"]}
-                    for w in workouts
-                ],
-                settings.get("zwift_id") or "me",
-                workouts_override=settings.get("workouts_dir"),
-            )
-            exported = {"count": result["count"], "directory": result["directory"]}
+            try:
+                result = zwo.write_plan_to_zwift(
+                    [
+                        {"date": w["date"], "name": w["name"],
+                         "zwo": w["zwo_or_segments"]}
+                        for w in workouts
+                    ],
+                    settings.get("zwift_id"),
+                    workouts_override=settings.get("workouts_dir"),
+                )
+            except paths.ExportTargetUnavailable as e:
+                # Nothing was written or created; the page explains why and
+                # points at Settings rather than claiming a bogus directory.
+                export_error = _export_error(e)
+            else:
+                exported = {"count": result["count"],
+                            "directory": result["directory"]}
         summary = _plan_summary(uid, plan_id)
         return templates.TemplateResponse(
             request,
             "plan.html",
-            _generate_ctx(request, mode="plan", plan=summary, exported=exported),
+            _generate_ctx(request, mode="plan", plan=summary, exported=exported,
+                          export_error=export_error),
         )
 
     @app.post("/plan/{plan_id}/activate")
@@ -1853,20 +1912,28 @@ def create_app() -> FastAPI:
         uid = _uid(request)
         w = db.get_plan_workout(uid, workout_id)
         exported = None
+        export_error = None
         summary = None
         if w:
             settings = db.get_user_settings(uid)
-            result = zwo.write_plan_to_zwift(
-                [{"date": w["date"], "name": w["name"], "zwo": w["zwo_or_segments"]}],
-                settings.get("zwift_id") or "me",
-                workouts_override=settings.get("workouts_dir"),
-            )
-            exported = {"count": result["count"], "directory": result["directory"]}
+            try:
+                result = zwo.write_plan_to_zwift(
+                    [{"date": w["date"], "name": w["name"],
+                      "zwo": w["zwo_or_segments"]}],
+                    settings.get("zwift_id"),
+                    workouts_override=settings.get("workouts_dir"),
+                )
+            except paths.ExportTargetUnavailable as e:
+                export_error = _export_error(e)
+            else:
+                exported = {"count": result["count"],
+                            "directory": result["directory"]}
             summary = _plan_summary(uid, w["plan_id"])
         return templates.TemplateResponse(
             request,
             "plan.html",
-            _generate_ctx(request, mode="plan", plan=summary, exported=exported),
+            _generate_ctx(request, mode="plan", plan=summary, exported=exported,
+                          export_error=export_error),
         )
 
     @app.get("/plan/workout/{workout_id}/download")
@@ -2173,9 +2240,17 @@ def create_app() -> FastAPI:
     @app.post("/plan/export-all")
     def plan_export_all(request: Request):
         uid = _uid(request)
-        result = exporter.sync_plan_exports(uid)
+        try:
+            status = exporter.sync_plan_exports(uid)["status"]
+        except paths.ExportTargetUnavailable as e:
+            # sync_plan_exports() already turns a refusal into a status; this
+            # is the backstop, because this route has no other error handling
+            # and a refusal is not an OSError anything upstream would catch.
+            # The reason vocabulary is a fixed set of bare words, so it is safe
+            # to put straight in the redirect's query string.
+            status = _export_error(e)["reason"]
         return RedirectResponse(
-            url=f"/calendar?exported={result['status']}", status_code=303
+            url=f"/calendar?exported={status}", status_code=303
         )
 
     @app.post("/ooto/add")
@@ -2327,11 +2402,22 @@ def create_app() -> FastAPI:
                 status_code=400,
             )
         settings = db.get_user_settings(uid)
-        result = zwo.write_plan_to_zwift(
-            [{"date": scheduled, "name": last["name"], "zwo": last["zwo"]}],
-            settings.get("zwift_id") or "me",
-            workouts_override=settings.get("workouts_dir"),
-        )
+        try:
+            result = zwo.write_plan_to_zwift(
+                [{"date": scheduled, "name": last["name"], "zwo": last["zwo"]}],
+                settings.get("zwift_id"),
+                workouts_override=settings.get("workouts_dir"),
+            )
+        except paths.ExportTargetUnavailable as e:
+            # No file exists, so no standalone_workouts row is recorded either:
+            # that row is what the calendar and the completion matcher treat as
+            # "this workout was exported to Zwift".
+            return templates.TemplateResponse(
+                request,
+                "plan.html",
+                _generate_ctx(request, mode="workout",
+                              export_error=_export_error(e)),
+            )
         export_key = hashlib.sha256(
             f"{scheduled}\0{last['name']}\0{last['zwo']}".encode("utf-8")
         ).hexdigest()

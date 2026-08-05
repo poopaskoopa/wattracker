@@ -110,6 +110,10 @@ def reexport_workout(
     ``new_name=None`` means the workout is gone: remove the old .zwo and write
     nothing. Shared with prescribe/reflow.py so both rewrite paths prune and
     re-write files the same way.
+
+    Never raises: an unwritable, unresolvable or refused Zwift folder is logged
+    and returned from. The caller is rewriting a plan; keeping the DB and the
+    Zwift folder in step is a side effect of that, not a reason to fail it.
     """
     settings = db.get_user_settings(uid)
     target, _reason = paths.resolve_export_dir(
@@ -125,11 +129,25 @@ def reexport_workout(
             return
         zwo.write_plan_to_zwift(
             [{"date": date, "name": new_name, "zwo": zwo_str}],
-            settings.get("zwift_id") or "me",
-            workouts_override=target,
+            settings.get("zwift_id"),
+            # The STORED setting, not ``target``: workouts_override is the
+            # untrusted user value, and passing a resolved directory back in
+            # re-labels a DISCOVERED folder as a SUBMITTED one, which is judged
+            # by the stricter rule (see paths.confine_detected_dir).
+            workouts_override=settings.get("workouts_dir"),
         )
     except OSError as e:
         log.warning("re-export of adapted workout failed: %s", e)
+    except paths.ExportTargetUnavailable as e:
+        # Best effort means best effort. The target came from
+        # resolve_export_dir() a few lines up, so a refusal here means the two
+        # disagree or the folder changed underneath us; either way this is a
+        # side effect of rewriting a plan, not the operation the user asked
+        # for, and it must not abort the rewrite. It is deliberately not an
+        # OSError, so the branch above does not cover it.
+        log.warning(
+            "re-export of adapted workout refused (%s): %s", e.reason, e.detail or e
+        )
 
 
 def race_window(user_id: int, plan_id: int, now: _dt.datetime) -> set:
