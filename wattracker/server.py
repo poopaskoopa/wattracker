@@ -16,7 +16,7 @@ import zipfile
 from contextlib import asynccontextmanager
 from typing import List, Optional
 
-from fastapi import Body, FastAPI, Form, Request, UploadFile, WebSocket
+from fastapi import Body, FastAPI, File, Form, Request, UploadFile, WebSocket
 from fastapi.responses import (
     FileResponse,
     HTMLResponse,
@@ -130,6 +130,7 @@ def _start_user_scan(user_id: int, directory: Optional[str]) -> Optional[dict]:
             "skipped": 0,
             "error": None,
             "finished_at": None,
+            "ftp_estimate": None,
             "directory": directory,
         }
         _scan_status[user_id] = status
@@ -152,6 +153,10 @@ def _start_user_scan(user_id: int, directory: Optional[str]) -> Optional[dict]:
                     skipped=result.get("skipped", 0),
                     directory=d,
                     exists=bool(d and os.path.isdir(d)),
+                    ftp_estimate=(
+                        round(importer.recent_best_effort_ftp(user_id), 1)
+                        if result.get("imported", 0) else None
+                    ),
                 )
         except Exception as exc:  # surface, don't crash the daemon thread
             with _scan_lock:
@@ -428,6 +433,14 @@ class LoginAttemptCounter:
 # Max in-memory size for an uploaded activity file (bytes). A real .fit ride is
 # well under this; the cap stops a huge upload from exhausting memory.
 MAX_UPLOAD_BYTES = 50 * 1024 * 1024
+# Onboarding accepts a batch of browser-selected files. Keep the whole request
+# bounded before importing any member, even when a browser omits file sizes.
+MAX_ONBOARDING_UPLOAD_BYTES = 50 * 1024 * 1024
+MAX_ONBOARDING_UPLOAD_FILES = 200
+ONBOARDING_WEIGHT_MIN_KG = 20.0
+ONBOARDING_WEIGHT_MAX_KG = 300.0
+ONBOARDING_FTP_MIN_WATTS = 1.0
+ONBOARDING_FTP_MAX_WATTS = 1000.0
 
 # WebSocket handshakes are only accepted from same-origin (local) browsers; a
 # cross-site page's Origin will never match, blocking cross-site WS hijacking.
@@ -618,6 +631,37 @@ def _trusted_origin_or_absent(request: Request, allowed_hosts: List[str]) -> boo
     # urlparse strips the brackets from an IPv6 literal; the allowlist carries
     # both spellings.
     return parsed.hostname.lower() in allowed_hosts
+
+
+def _validate_trusted_directory(value: str) -> "tuple[Optional[str], Optional[str]]":
+    """Resolve an existing directory without widening the trusted roots."""
+    raw = (value or "").strip()
+    if not raw:
+        return "", None
+    expanded = os.path.realpath(os.path.abspath(os.path.expanduser(raw)))
+    if not os.path.isdir(expanded):
+        return None, f"Folder not found or not a directory: {raw}"
+    for root in paths.trusted_storage_roots():
+        resolved_root = os.path.realpath(os.path.abspath(os.path.expanduser(root)))
+        try:
+            if os.path.commonpath([expanded, resolved_root]) == resolved_root:
+                return expanded, None
+        except ValueError:
+            continue
+    return None, (
+        "Folder must be inside your home directory or a configured "
+        f"Zwift data directory: {raw}"
+    )
+
+
+def _setup_number(raw: str, minimum: float, maximum: float) -> Optional[float]:
+    try:
+        value = float((raw or "").strip())
+    except (AttributeError, TypeError, ValueError):
+        return None
+    if not _math.isfinite(value) or value < minimum or value > maximum:
+        return None
+    return value
 
 
 def _feed_base_url(request: Request) -> str:
@@ -894,7 +938,252 @@ def create_app() -> FastAPI:
         return templates.TemplateResponse(
             request,
             "dashboard.html",
-            _ctx(request, state=state.to_dict(), banner=banner),
+            _ctx(
+                request,
+                state=state.to_dict(),
+                banner=banner,
+                onboarding_complete=db.onboarding_complete(_uid(request)),
+                setup_candidates=paths.annotated_candidates(),
+                setup_settings=db.get_user_settings(_uid(request)),
+                setup_estimate=round(importer.recent_best_effort_ftp(_uid(request)), 1),
+                setup_fallback_ftp=200,
+                setup_error=None,
+                setup_message=None,
+                setup_form={},
+            ),
+        )
+
+    def _setup_context(
+        request: Request, error: Optional[str] = None, message: Optional[str] = None,
+        form: Optional[dict] = None,
+    ) -> dict:
+        uid = _uid(request)
+        settings = db.get_user_settings(uid)
+        estimate = importer.recent_best_effort_ftp(uid)
+        latest = db.latest_ftp(uid)
+        return _ctx(
+            request,
+            setup_candidates=paths.annotated_candidates(),
+            setup_settings=settings,
+            setup_estimate=round(estimate, 1) if estimate > 0 else None,
+            setup_fallback_ftp=200,
+            setup_latest_ftp=latest,
+            setup_error=error,
+            setup_message=message,
+            setup_form=form or {},
+        )
+
+    @app.get("/setup", response_class=HTMLResponse)
+    def setup_page(request: Request):
+        return templates.TemplateResponse(request, "setup.html", _setup_context(request))
+
+    @app.post("/setup/check-directory")
+    def setup_check_directory(request: Request, activities_dir: str = Form("")):
+        if not _same_origin_or_absent(request):
+            return JSONResponse({"error": "Cross-origin request rejected."}, status_code=403)
+        uid = _uid(request)
+        clean, error = _validate_trusted_directory(activities_dir)
+        if error:
+            return JSONResponse({"error": error, "exists": False, "fit_count": 0}, status_code=400)
+        if not clean:
+            return JSONResponse({"error": "Choose or enter an Activities folder.",
+                                 "exists": False, "fit_count": 0}, status_code=400)
+        try:
+            fit_count = sum(
+                1 for entry in os.scandir(clean)
+                if entry.is_file() and entry.name.lower().endswith(".fit")
+            )
+        except OSError:
+            fit_count = 0
+        db.save_user_settings(uid, {"activities_dir": clean})
+        started = _start_user_scan(uid, directory=clean)
+        if started is None:
+            status = _scan_status_snapshot(uid) or {"running": True}
+        else:
+            status = started
+        return JSONResponse({
+            "path": clean,
+            "exists": True,
+            "fit_count": fit_count,
+            "status": "files-found" if fit_count else "no-files",
+            "scan": status,
+        }, status_code=202)
+
+    @app.post("/setup/upload")
+    async def setup_upload(request: Request, files: List[UploadFile] = File(...)):
+        if not _same_origin_or_absent(request):
+            return JSONResponse({"error": "Cross-origin request rejected."}, status_code=403)
+        if not files or len(files) > MAX_ONBOARDING_UPLOAD_FILES:
+            return JSONResponse({"error": "Select between one and 200 FIT files."}, status_code=400)
+        staged = []
+        total = 0
+        for index, uploaded in enumerate(files):
+            original = os.path.basename(uploaded.filename or "")
+            if not original or not original.lower().endswith(".fit"):
+                return JSONResponse({"error": "Only .fit files can be imported."}, status_code=400)
+            declared = getattr(uploaded, "size", None)
+            if declared is not None and declared > MAX_ONBOARDING_UPLOAD_BYTES:
+                return Response("Selected files are too large.", status_code=413)
+            content = await uploaded.read()
+            total += len(content)
+            if total > MAX_ONBOARDING_UPLOAD_BYTES:
+                return Response("Selected files are too large.", status_code=413)
+            # The generated name is deliberately independent of browser paths.
+            staged.append((f"onboarding-{index}.fit", content))
+        imported = 0
+        skipped = 0
+        failed = 0
+        uid = _uid(request)
+        for safe_name, content in staged:
+            try:
+                activity_id = importer.ingest_upload(uid, safe_name, content)
+            except Exception:
+                failed += 1
+                continue
+            if activity_id is None:
+                skipped += 1
+            else:
+                imported += 1
+        estimate = importer.recent_best_effort_ftp(uid)
+        return JSONResponse({
+            "selected": len(staged),
+            "fit_count": len(staged),
+            "imported": imported,
+            "skipped": skipped,
+            "failed": failed,
+            "ftp_estimate": round(estimate, 1) if estimate > 0 else None,
+        })
+
+    @app.post("/setup/ftp")
+    def setup_ftp(
+        request: Request,
+        choice: str = Form(""),
+        manual_ftp: str = Form(""),
+    ):
+        if not _same_origin_or_absent(request):
+            return JSONResponse({"error": "Cross-origin request rejected."}, status_code=403)
+        uid = _uid(request)
+        choice = (choice or "").strip().lower()
+        if choice == "manual":
+            watts = _setup_number(manual_ftp, ONBOARDING_FTP_MIN_WATTS, ONBOARDING_FTP_MAX_WATTS)
+            if watts is None:
+                return JSONResponse({"error": "Enter FTP from 1 to 1000 watts."}, status_code=400)
+            db.save_user_settings(uid, {"ftp": watts})
+            db.add_ftp_entry(uid, utc_today().isoformat(), watts, "manual")
+        elif choice == "estimated":
+            watts = importer.recent_best_effort_ftp(uid)
+            if watts <= 0:
+                watts = 200.0
+            db.set_user_ftp_override(uid, None)
+            db.add_ftp_entry(uid, utc_today().isoformat(), round(watts, 1), "estimated")
+        else:
+            return JSONResponse({"error": "Choose an estimated or manual FTP."}, status_code=400)
+        return JSONResponse({"choice": choice, "ftp": round(watts, 1), "source": choice})
+
+    @app.post("/setup/complete", response_class=HTMLResponse)
+    def setup_complete(
+        request: Request,
+        weight_kg: str = Form(""),
+        ftp_choice: str = Form(""),
+        manual_ftp: str = Form(""),
+        zwiftpower: str = Form("no"),
+        zwift_id: str = Form(""),
+        zwift_email: str = Form(""),
+        zwift_password: str = Form(""),
+        activities_dir: str = Form(""),
+    ):
+        if not _same_origin_or_absent(request):
+            return PlainTextResponse("Cross-origin request rejected.", status_code=403)
+        uid = _uid(request)
+        weight = _setup_number(weight_kg, ONBOARDING_WEIGHT_MIN_KG, ONBOARDING_WEIGHT_MAX_KG)
+        form = {"weight_kg": weight_kg, "ftp_choice": ftp_choice,
+                "manual_ftp": manual_ftp, "zwiftpower": zwiftpower,
+                "zwift_id": zwift_id, "zwift_email": zwift_email,
+                "activities_dir": activities_dir}
+        if weight is None:
+            return templates.TemplateResponse(
+                request, "setup.html", _setup_context(
+                    request, error="Enter a body weight from 20 to 300 kg.", form=form
+                ), status_code=400
+            )
+        choice = (ftp_choice or "").strip().lower()
+        if choice == "manual":
+            ftp = _setup_number(manual_ftp, ONBOARDING_FTP_MIN_WATTS, ONBOARDING_FTP_MAX_WATTS)
+            if ftp is None:
+                return templates.TemplateResponse(
+                    request, "setup.html", _setup_context(
+                        request, error="Enter FTP from 1 to 1000 watts.", form=form
+                    ), status_code=400
+                )
+        elif choice == "estimated":
+            ftp = importer.recent_best_effort_ftp(uid)
+            if ftp <= 0:
+                ftp = 200.0
+        else:
+            return templates.TemplateResponse(
+                request, "setup.html", _setup_context(
+                    request, error="Choose the FIT-derived estimate or enter a manual FTP.", form=form
+                ), status_code=400
+            )
+        clean_dir = None
+        if activities_dir.strip():
+            clean_dir, dir_error = _validate_trusted_directory(activities_dir)
+            if dir_error:
+                return templates.TemplateResponse(
+                    request, "setup.html", _setup_context(request, error=dir_error, form=form), status_code=400
+                )
+        zwiftpower_choice = (zwiftpower or "").strip().lower()
+        if zwiftpower_choice not in ("yes", "no"):
+            return templates.TemplateResponse(
+                request, "setup.html", _setup_context(
+                    request, error="Choose whether you have a ZwiftPower profile.", form=form
+                ), status_code=400
+            )
+        if zwiftpower_choice == "yes":
+            rider_id = (zwift_id or "").strip()
+            if not rider_id.isdigit() or len(rider_id) > 20 or not zwift_email.strip() or not zwift_password:
+                return templates.TemplateResponse(
+                    request, "setup.html", _setup_context(
+                        request, error="Enter the numeric ZwiftPower rider ID, email, and password.", form=form
+                    ), status_code=400
+                )
+            try:
+                backend = credstore.save_zwift_credentials(uid, zwift_email, zwift_password)
+            except Exception:
+                # Do not expose backend details, exception text, or password.
+                _log.warning("onboarding credential save failed for user %s", uid, exc_info=True)
+                return templates.TemplateResponse(
+                    request, "setup.html", _setup_context(
+                        request, error="ZwiftPower details could not be saved securely. Try again.", form=form
+                    ), status_code=400
+                )
+            db.clear_race_auth_failure(uid)
+            cred_saved = True
+        else:
+            backend = None
+            cred_saved = False
+            rider_id = ""
+        updates = {"weight_kg": weight}
+        if clean_dir:
+            updates["activities_dir"] = clean_dir
+        if choice == "manual":
+            updates["ftp"] = ftp
+        else:
+            # A rider may resume setup after trying a manual value. Choosing
+            # the analyzed estimate must remove that override so the estimate
+            # really drives the dashboard and workout targets.
+            db.set_user_ftp_override(uid, None)
+        if cred_saved:
+            updates["zwift_id"] = rider_id
+        db.save_user_settings(uid, updates)
+        db.add_ftp_entry(uid, utc_today().isoformat(), round(ftp, 1), choice)
+        db.complete_onboarding(uid)
+        return templates.TemplateResponse(
+            request, "setup.html", _setup_context(
+                request,
+                message=("Setup complete. " + (f"Credentials saved in the {backend}." if backend else "")),
+                form={"completed": True},
+            )
         )
 
     def _activities_context(request: Request, scan: Optional[dict] = None) -> dict:

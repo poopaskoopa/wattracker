@@ -97,7 +97,20 @@ def candidate_activities_dirs() -> List[str]:
 
 
 def annotated_candidates() -> List[dict]:
-    return [{"path": c, "exists": os.path.isdir(c)} for c in candidate_activities_dirs()]
+    out = []
+    for candidate in candidate_activities_dirs():
+        exists = os.path.isdir(candidate)
+        fit_count = 0
+        if exists:
+            try:
+                fit_count = sum(
+                    1 for entry in os.scandir(candidate)
+                    if entry.is_file() and entry.name.lower().endswith(".fit")
+                )
+            except OSError:
+                fit_count = 0
+        out.append({"path": candidate, "exists": exists, "fit_count": fit_count})
+    return out
 
 
 def _first_existing(candidates: List[str]) -> str:
