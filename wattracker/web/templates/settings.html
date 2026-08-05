@@ -41,16 +41,33 @@
             on the Ride page. Timestamps remain stored in UTC.</span>
     </label>
     {% if zwift_candidates %}
+    {#
+      With nothing saved and exactly ONE folder detected, pre-check it: that is
+      already the folder paths.resolve_export_dir() exports to (reason
+      "detected"), so leaving it unchecked showed the user the opposite of what
+      the exporter was doing, and the id was never written back - the day a
+      second player folder appeared, exports turned into "pick one" with
+      nothing saved to pick from. It is only pre-checked, never auto-saved:
+      the value lands in the database when the user submits the form, so a
+      folder wattracker guessed at is never silently recorded as their choice.
+      With several candidates nothing is pre-checked - that IS the choice.
+    #}
+    {% set autopick = zwift_candidates[0].zwift_id
+                      if (not settings.zwift_id and zwift_candidates|length == 1)
+                      else None %}
     <fieldset class="zwift-picker">
         <legend>Zwift player folders detected on this computer &mdash; pick yours
             so plan exports land where Zwift reads custom workouts</legend>
         {% for c in zwift_candidates %}
         <label class="zwift-candidate">
             <input type="radio" name="zwift_id_choice" value="{{ c.zwift_id }}"
-                {{ 'checked' if settings.zwift_id == c.zwift_id else '' }}>
+                {{ 'checked' if c.zwift_id in (settings.zwift_id, autopick) else '' }}>
             {{ c.zwift_id }} <span class="hint">({{ c.path }})</span>
         </label>
         {% endfor %}
+        {% if autopick %}
+        <p class="hint">Detected automatically &mdash; press Save to keep it.</p>
+        {% endif %}
     </fieldset>
     {% endif %}
     <label>Activities watch folder (scanned daily for new rides;
