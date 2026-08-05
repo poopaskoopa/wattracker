@@ -32,7 +32,12 @@ def sync_plan_exports(user_id: int) -> Dict:
       - status 'ok'      : wrote/pruned files (directory set)
       - status 'choose'  : several Zwift player folders, user must pick
       - status 'missing' : no Zwift Workouts folder on this machine
+      - status 'blocked' : a folder was configured/found and refused as unsafe
       - status 'empty'   : nothing to export
+
+    It never raises paths.ExportTargetUnavailable: a refusal comes back as a
+    status, because every caller of this function treats the return value as
+    the whole answer.
     """
     settings = db.get_user_settings(user_id)
     target, reason = paths.resolve_export_dir(
@@ -69,9 +74,32 @@ def sync_plan_exports(user_id: int) -> Dict:
 
     exported = 0
     if to_write:
-        result = zwo.write_plan_to_zwift(
-            to_write, settings.get("zwift_id") or "me", workouts_override=target
-        )
+        try:
+            # Pass the STORED setting, not the ``target`` resolved above.
+            # workouts_override is the untrusted user value; feeding a resolved
+            # directory back into it re-labels a folder the app DISCOVERED as
+            # one the user SUBMITTED, and the writer then judges it by the
+            # stricter submitted-path rule. That is how a rider whose Zwift
+            # player folder is a junction to another drive got a directory here
+            # and a refusal one call later. Both calls run the same resolver on
+            # the same inputs, so result["directory"] is ``target``.
+            result = zwo.write_plan_to_zwift(
+                to_write,
+                settings.get("zwift_id"),
+                workouts_override=settings.get("workouts_dir"),
+            )
+        except paths.ExportTargetUnavailable as e:
+            # resolve_export_dir() just handed us this directory, so the writer
+            # should not be able to refuse it - but this function's contract is
+            # a status dict, and callers (the "Export all" route, the OOTO and
+            # race handlers, the nightly sweep) treat it as one. It is also
+            # deliberately NOT an OSError, so the per-file `except OSError`
+            # below would not have caught it. Report it in the resolver's own
+            # vocabulary and prune nothing: a target the writer just rejected
+            # is not one to start unlinking files in.
+            log.warning("plan export refused (%s): %s", e.reason, e.detail or e)
+            return {"status": e.reason, "directory": None, "exported": 0,
+                    "removed": 0, "reason": e.reason}
         exported = result["count"]
 
     removed = 0

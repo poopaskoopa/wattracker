@@ -1,6 +1,44 @@
 {% extends "base.html" %}
 {% block title %}Plan &mdash; wattracker{% endblock %}
 {% block content %}
+{#
+  ONE vocabulary for "your workouts did not reach Zwift", shared by the
+  automatic plan-export sweep and the three explicit export buttons. Both go
+  through paths.resolve_export_dir(), so they must not describe the same
+  outcome in two different ways - a user who is told one thing on plan creation
+  and something else on the export button cannot tell it is the same problem.
+
+  'blocked' and 'error' are the reasons that carry a detail: one names the
+  folder that was refused, the other the OS error. The others determined
+  nothing, so there is nothing specific to quote.
+
+  EVERY reason the server can produce must have a branch here. 'error' exists
+  because it did not: the OSError path set auto_export_reason to "error: ..."
+  and this macro's predecessor had no arm for it, so a failed auto-export
+  rendered an empty gap and the user was told nothing at all. A reason with no
+  branch is silence where a warning belongs.
+#}
+{% macro export_alert(reason, detail='', next_step='then export again.') %}
+    {% if reason == 'choose' %}
+    <p class="alert">Not exported to Zwift: several Zwift player folders exist
+       on this computer. Pick yours in <a href="/settings">Settings</a>,
+       {{ next_step }}</p>
+    {% elif reason == 'blocked' %}
+    <p class="alert">Not exported: your saved workouts folder is
+       outside your home directory and your Zwift folders, so wattracker
+       will not write to it. Pick a folder inside your home directory in
+       <a href="/settings">Settings</a>.
+       {% if detail %}<span class="hint">{{ detail }}</span>{% endif %}</p>
+    {% elif reason == 'missing' %}
+    <p class="alert">No Zwift Workouts folder found on this computer &mdash; set
+       a workouts folder in <a href="/settings">Settings</a> or use
+       &ldquo;Download .zip&rdquo;.</p>
+    {% elif reason == 'error' %}
+    <p class="alert">Not exported to Zwift: writing the .zwo files failed.
+       Check that the folder exists and is writable, {{ next_step }}
+       {% if detail %}<span class="hint">{{ detail }}</span>{% endif %}</p>
+    {% endif %}
+{% endmacro %}
 <h2>Plan</h2>
 
 {% if flash %}<p class="ok flash">{{ flash }}</p>{% endif %}
@@ -87,6 +125,8 @@
 <section id="mode-workout" class="mode-panel">
     {% if exported_path %}
     <p class="ok">Exported to Zwift: <code>{{ exported_path }}</code></p>
+    {% elif export_error and mode != 'plan' %}
+    {{ export_alert(export_error.reason, export_error.detail) }}
     {% endif %}
 
     <form method="post" action="/generate" class="generate-form">
@@ -261,6 +301,8 @@
     {% if exported %}
     <p class="ok">Exported {{ exported.count }} .zwo file(s) to
        <code>{{ exported.directory }}</code></p>
+    {% elif export_error and mode == 'plan' %}
+    {{ export_alert(export_error.reason, export_error.detail) }}
     {% endif %}
 
     {% if plan %}
@@ -281,19 +323,9 @@
         <p class="ok">Auto-exported {{ plan.auto_export.count }} .zwo file(s) to
            <code>{{ plan.auto_export.directory }}</code> &mdash; they appear under
            Custom Workouts in Zwift.</p>
-        {% elif plan.auto_export_reason == 'choose' %}
-        <p class="alert">Not exported to Zwift yet: several Zwift player folders
-           exist on this computer. Pick yours in <a href="/settings">Settings</a>,
-           then press &ldquo;Export plan to Zwift&rdquo; below.</p>
-        {% elif plan.auto_export_reason == 'blocked' %}
-        <p class="alert">Not exported: your saved workouts folder is outside your
-           home directory and your Zwift folders, so wattracker will not write to
-           it. Pick a folder inside your home directory in
-           <a href="/settings">Settings</a>.</p>
-        {% elif plan.auto_export_reason == 'missing' %}
-        <p class="hint">No Zwift Workouts folder found on this computer &mdash; set
-           a workouts folder in <a href="/settings">Settings</a> or use
-           &ldquo;Download .zip&rdquo;.</p>
+        {% else %}
+        {{ export_alert(plan.auto_export_reason, plan.auto_export_detail,
+                        next_step='then press “Export plan to Zwift” below.') }}
         {% endif %}
         <p><strong>{{ plan.weeks }}</strong> weeks &middot;
            starts <strong>{{ plan.start_date }}</strong> &middot;

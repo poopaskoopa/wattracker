@@ -550,23 +550,49 @@ def test_save_user_settings_refuses_a_traversing_zwift_id(user_id):
 
 
 def test_stored_traversing_zwift_id_cannot_escape_the_workouts_root(user_id):
-    """The stored-before-the-fix case: validating on write is not enough."""
+    """The stored-before-the-fix case: validating on write is not enough.
+
+    The id is never joined onto a root, so with a real player folder present
+    the export lands in that folder - inside the root, exactly where an unset
+    id would have put it - and the traversal component appears nowhere.
+    """
     root = os.path.realpath(os.environ["WATTRACKER_ZWIFT_WORKOUTS_ROOT"])
+    player = os.path.join(root, "1234567")
+    os.mkdir(player)
     escape_rel = "../../pwned-by-zwift-id"
     _poison_setting(user_id, "zwift_id", escape_rel)
     stored = db.get_user_settings(user_id)["zwift_id"]
 
     target = os.path.realpath(paths.workouts_dir(stored))
+    assert target == os.path.realpath(player)
     assert os.path.commonpath([target, root]) == root
 
     # End to end: the exporter writes, and makedirs(), inside the root only.
     result = zwo.write_plan_to_zwift(
-        [{"date": "2026-07-07", "name": "Test", "zwo": "<workout_file/>"}],
-        stored or "me",
+        [{"date": "2026-07-07", "name": "Test", "zwo": "<workout_file/>"}], stored,
     )
     written = os.path.realpath(result["paths"][0])
     assert os.path.commonpath([written, root]) == root
     assert not os.path.exists(os.path.join(root, escape_rel))
+
+
+def test_stored_traversing_zwift_id_with_no_player_folder_is_refused(user_id):
+    """And with nothing to detect there is no fallback folder to write into.
+
+    paths.workouts_dir() used to answer <root>/me for exactly this input, so
+    the export "succeeded" into a folder Zwift never reads.
+    """
+    root = os.path.realpath(os.environ["WATTRACKER_ZWIFT_WORKOUTS_ROOT"])
+    _poison_setting(user_id, "zwift_id", "../../pwned-by-zwift-id")
+    stored = db.get_user_settings(user_id)["zwift_id"]
+
+    with pytest.raises(paths.ExportTargetUnavailable) as excinfo:
+        zwo.write_plan_to_zwift(
+            [{"date": "2026-07-07", "name": "Test", "zwo": "<workout_file/>"}], stored,
+        )
+    assert excinfo.value.reason == "missing"
+    assert os.listdir(root) == []
+    assert not os.path.exists(os.path.join(os.path.dirname(root), "pwned-by-zwift-id"))
 
 
 def test_stored_traversing_zwift_id_is_not_resolved_as_an_export_dir(user_id, tmp_path):
@@ -605,22 +631,30 @@ def escape_dir(tmp_path):
 
 @pytest.mark.skipif(os.name == "nt", reason="POSIX path semantics")
 def test_stored_workouts_dir_cannot_escape_the_trusted_roots(user_id, escape_dir):
-    """The PoC: poison the row, then do exactly what the export routes do."""
+    """The PoC: poison the row, then do exactly what the export routes do.
+
+    The escaping folder is refused outright rather than swapped for a default:
+    a user who configured a folder is told it was rejected instead of having
+    their workouts quietly written somewhere else. Nothing is created anywhere.
+    """
+    root = os.path.realpath(os.environ["WATTRACKER_ZWIFT_WORKOUTS_ROOT"])
+    os.mkdir(os.path.join(root, "123"))  # a perfectly good default exists...
     _poison_setting(user_id, "workouts_dir", escape_dir)
     _poison_setting(user_id, "zwift_id", "123")
     settings = db.get_user_settings(user_id)
     assert settings["workouts_dir"] == escape_dir  # the row really is poisoned
 
-    result = zwo.write_plan_to_zwift(
-        [{"date": "2026-08-05", "name": "pwn", "zwo": "<workout_file/>"}],
-        settings.get("zwift_id") or "me",
-        workouts_override=settings.get("workouts_dir"),
-    )
-    # Nothing was created outside, and the write landed in the trusted root.
+    with pytest.raises(paths.ExportTargetUnavailable) as excinfo:
+        zwo.write_plan_to_zwift(
+            [{"date": "2026-08-05", "name": "pwn", "zwo": "<workout_file/>"}],
+            settings.get("zwift_id"),
+            workouts_override=settings.get("workouts_dir"),
+        )
+    assert excinfo.value.reason == "blocked"
+    assert excinfo.value.refused
+    # Nothing was created outside - and nothing was written inside either.
     assert not os.path.exists(os.path.dirname(escape_dir))
-    root = os.path.realpath(os.environ["WATTRACKER_ZWIFT_WORKOUTS_ROOT"])
-    for written in result["paths"]:
-        assert os.path.commonpath([os.path.realpath(written), root]) == root
+    assert os.listdir(os.path.join(root, "123")) == []
 
 
 @pytest.mark.skipif(os.name == "nt", reason="POSIX path semantics")
@@ -657,8 +691,14 @@ def test_poisoned_workouts_dir_blocks_the_plan_export_route(client, escape_dir):
 
     The plan and its workout are seeded deliberately: /plan/{id}/export only
     writes `if workouts`, so against an empty plan the route 404s without ever
-    reaching zwo.write_plan_to_zwift and the assertion below holds whether or
+    reaching zwo.write_plan_to_zwift and the assertions below hold whether or
     not the fix is present. Seeding is what makes this a real guard.
+
+    The refusal reaches the route as paths.ExportTargetUnavailable and the
+    route now renders it: a 200 carrying the 'blocked' message and a link to
+    Settings, NOT a 200 reporting a directory the user never configured (the
+    old behaviour) and not a 500. The two filesystem assertions below are the
+    security invariant and are unchanged from when this test was written.
     """
     _register(client)
     uid = db.get_user_by_username("tester")["id"]
@@ -671,8 +711,61 @@ def test_poisoned_workouts_dir_blocks_the_plan_export_route(client, escape_dir):
 
     r = client.post(f"/plan/{plan_id}/export")
 
-    assert r.status_code in (200, 303)
+    assert r.status_code == 200
+    assert "outside your home directory" in r.text
+    assert '<a href="/settings">' in r.text
+    assert "Exported 1 .zwo" not in r.text  # never claims a bogus success
     assert not os.path.exists(os.path.dirname(escape_dir))
+    root = os.path.realpath(os.environ["WATTRACKER_ZWIFT_WORKOUTS_ROOT"])
+    assert os.listdir(root) == []  # no substitute folder, no stray .zwo
+
+
+# ---------------- issue #44: the "me" fallback folder
+#
+# paths.workouts_dir() ended with join(root, safe_zwift_id(id) or "me"), and the
+# explicit export routes still pass `settings.get("zwift_id") or "me"`. On a
+# real install with no zwift_id that wrote every .zwo into <Documents>\Zwift\
+# Workouts\me\ - which Zwift never reads - and reported the path as a success.
+# The resolver has no "me" branch left, so even the literal id "me" cannot
+# produce that folder; it is treated like any other id whose folder is absent.
+
+def test_export_with_no_zwift_id_refuses_instead_of_writing_into_me(user_id):
+    root = os.path.realpath(os.environ["WATTRACKER_ZWIFT_WORKOUTS_ROOT"])
+    settings = db.get_user_settings(user_id)  # nothing configured at all
+
+    with pytest.raises(paths.ExportTargetUnavailable) as excinfo:
+        zwo.write_plan_to_zwift(
+            [{"date": "2026-08-05", "name": "Test", "zwo": "<workout_file/>"}],
+            settings.get("zwift_id") or "me",  # what the routes still pass
+            workouts_override=settings.get("workouts_dir"),
+        )
+    assert excinfo.value.reason == "missing"
+    assert not excinfo.value.refused
+    assert not os.path.exists(os.path.join(root, "me"))
+    assert os.listdir(root) == []
+
+
+def test_a_literal_me_id_lands_in_the_real_player_folder(user_id):
+    """And where a player folder does exist, that is where the export goes."""
+    root = os.path.realpath(os.environ["WATTRACKER_ZWIFT_WORKOUTS_ROOT"])
+    player = os.path.join(root, "1234567")
+    os.mkdir(player)
+
+    result = zwo.write_plan_to_zwift(
+        [{"date": "2026-08-05", "name": "Test", "zwo": "<workout_file/>"}], "me",
+    )
+    assert result["directory"] == player
+    assert not os.path.exists(os.path.join(root, "me"))
+    assert len(os.listdir(player)) == 1
+
+
+def test_write_to_zwift_refuses_the_same_way(user_id):
+    """The single-workout writer shares the contract, not just the plan one."""
+    root = os.path.realpath(os.environ["WATTRACKER_ZWIFT_WORKOUTS_ROOT"])
+
+    with pytest.raises(paths.ExportTargetUnavailable):
+        zwo.write_to_zwift("<workout_file/>", "me", name="Test")
+    assert os.listdir(root) == []
 
 
 def test_stored_workouts_dir_inside_the_trusted_roots_still_works(user_id, home_dir):
