@@ -3,6 +3,10 @@
 {% block content %}
 <h2>Dashboard</h2>
 
+{% if not onboarding_complete %}
+{% include "_setup_wizard.html" %}
+{% endif %}
+
 {% set rating_next = '/' %}
 {% include "_pending_ratings.html" %}
 
