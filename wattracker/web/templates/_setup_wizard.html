@@ -1,0 +1,210 @@
+<section class="setup-wizard" aria-labelledby="setup-heading">
+    <div class="setup-intro">
+        <h3 id="setup-heading">Make your dashboard useful</h3>
+        <p>Work through these steps in order. Weight enables W/kg and weight-to-power
+           ratio metrics; FTP drives workout targets. You can return to this page
+           until setup is complete.</p>
+    </div>
+    {% if setup_error %}<p class="alert" role="alert">{{ setup_error }}</p>{% endif %}
+    {% if setup_message %}
+    <div class="setup-complete" role="status">
+        <strong>{{ setup_message }}</strong>
+        <p>Your dashboard is ready.</p>
+        <p><a class="button" href="/activities">Activities</a>
+           <a class="button" href="/profile">Profile</a>
+           <a class="button" href="/races">Races</a></p>
+    </div>
+    {% else %}
+    <form id="setup-form" method="post" action="/setup/complete" class="setup-form"
+          data-has-error="{{ 'true' if setup_error else 'false' }}">
+        <p id="setup-progress" class="setup-progress hint" role="status" aria-live="polite"></p>
+        <section class="setup-step" data-setup-step="1">
+            <h4><span>1</span> Body weight</h4>
+            <label for="setup-weight">Weight in kilograms
+                <input id="setup-weight" name="weight_kg" type="number" min="20" max="300"
+                       step="0.1" required value="{{ setup_form.weight_kg or setup_settings.weight_kg or '' }}">
+            </label>
+            <p class="hint">This enables W/kg and weight-to-power ratio metrics.</p>
+            <div class="setup-nav"><button type="button" data-setup-next>Continue</button></div>
+        </section>
+
+        <section class="setup-step" data-setup-step="2">
+            <h4><span>2</span> Find your Zwift Activities</h4>
+            <p>Zwift stores completed rides as FIT files. On Windows, macOS, or
+               Linux, look for Zwift&rsquo;s <code>Activities</code> folder. Imported
+               FIT rides populate the <a href="/activities">Activities</a> page.</p>
+            <ul class="setup-candidates">
+                {% for candidate in setup_candidates %}
+                <li><code>{{ candidate.path }}</code>
+                    {% if candidate.exists %}<span class="ok">exists &middot; {{ candidate.fit_count }} FIT file{{ '' if candidate.fit_count == 1 else 's' }}</span>
+                    {% else %}<span class="muted">not found</span>{% endif %}
+                    <button type="button" class="button-link setup-use-path" data-path="{{ candidate.path }}">Use this path</button>
+                </li>
+                {% else %}<li class="muted">No standard candidate was found on this computer.</li>{% endfor %}
+            </ul>
+            <label for="setup-directory">Known or typed Activities folder path
+                <input id="setup-directory" name="activities_dir" type="text" autocomplete="off"
+                       value="{{ setup_form.activities_dir or setup_settings.activities_dir or '' }}">
+            </label>
+            <button type="button" id="setup-check-directory">Check folder and scan</button>
+            <p id="setup-directory-status" class="hint" role="status" aria-live="polite"></p>
+            <p class="hint">A browser cannot reveal an absolute folder path. You
+               may type a known path, or select files below. Only direct FIT files
+               are counted here.</p>
+            <label for="setup-fit-files">Select a Zwift folder (browser-native)
+                <input id="setup-fit-files" type="file" webkitdirectory directory multiple accept=".fit,.FIT">
+            </label>
+            <p id="setup-selected-status" class="hint" role="status" aria-live="polite">No files selected.</p>
+            <button type="button" id="setup-upload-files">Import selected FIT files</button>
+            <p id="setup-upload-status" class="hint" role="status" aria-live="polite"></p>
+            <p id="setup-scan-status" class="hint" role="status" aria-live="polite"></p>
+            <div class="setup-nav">
+                <button type="button" class="button-secondary" data-setup-back>Back</button>
+                <button type="button" data-setup-next>Continue to FTP</button>
+            </div>
+        </section>
+
+        <section class="setup-step" data-setup-step="3">
+            <h4><span>3</span> Choose your FTP</h4>
+            <p>FTP is the baseline that drives workout targets. Use the analyzed
+               FIT-derived estimate when available, or enter your own number.</p>
+            <label class="setup-choice"><input type="radio" name="ftp_choice" value="estimated"
+                required {{ 'checked' if setup_form.ftp_choice == 'estimated' else '' }}>
+                Use FIT-derived estimate <span id="setup-estimate-value">{% if setup_estimate %}({{ setup_estimate }} W){% else %}(no-data fallback: {{ setup_fallback_ftp }} W){% endif %}</span></label>
+            <label class="setup-choice"><input type="radio" name="ftp_choice" value="manual"
+                {{ 'checked' if setup_form.ftp_choice == 'manual' else '' }}> Enter manual FTP</label>
+            <label for="setup-manual-ftp">Manual FTP in watts
+                <input id="setup-manual-ftp" name="manual_ftp" type="number" min="1" max="1000" step="1"
+                       value="{{ setup_form.manual_ftp or '' }}">
+            </label>
+            <div class="setup-nav">
+                <button type="button" class="button-secondary" data-setup-back>Back</button>
+                <button type="button" data-setup-next>Continue to ZwiftPower</button>
+            </div>
+        </section>
+
+        <section class="setup-step" data-setup-step="4">
+            <h4><span>4</span> ZwiftPower and races</h4>
+            <p>Races can use FIT-derived heuristics without ZwiftPower. If you
+               have a ZwiftPower profile, saving it enables and populates the
+               <a href="/races">Races</a> section. The numeric rider ID is in
+               <code>profile.php?z=...</code> and matches the numeric Workouts folder.</p>
+            <label class="setup-choice"><input type="radio" name="zwiftpower" value="no"
+                required {{ 'checked' if setup_form.zwiftpower != 'yes' else '' }}> No ZwiftPower profile</label>
+            <label class="setup-choice"><input type="radio" name="zwiftpower" value="yes"
+                {{ 'checked' if setup_form.zwiftpower == 'yes' else '' }}> Yes, configure ZwiftPower</label>
+            <div class="setup-zwift-fields">
+                <label for="setup-zwift-id">Numeric ZwiftPower rider ID
+                    <input id="setup-zwift-id" name="zwift_id" inputmode="numeric" pattern="[0-9]+"
+                           value="{{ setup_form.zwift_id or setup_settings.zwift_id or '' }}">
+                </label>
+                <label for="setup-zwift-email">ZwiftPower login email
+                    <input id="setup-zwift-email" name="zwift_email" type="email" autocomplete="username"
+                           value="{{ setup_form.zwift_email or '' }}">
+                </label>
+                <label for="setup-zwift-password">ZwiftPower login password
+                    <input id="setup-zwift-password" name="zwift_password" type="password" autocomplete="new-password" value="">
+                </label>
+                <p class="hint">The password is sent only to the existing secure
+                   credential backend and is never rendered or stored in the app database.</p>
+            </div>
+            <div class="setup-nav">
+                <button type="button" class="button-secondary" data-setup-back>Back</button>
+                <button type="submit" class="setup-finish">Finish setup</button>
+            </div>
+        </section>
+    </form>
+    {% endif %}
+</section>
+
+<script>
+(() => {
+    const form = document.getElementById('setup-form');
+    if (!form) return;
+    const directory = document.getElementById('setup-directory');
+    const dirStatus = document.getElementById('setup-directory-status');
+    const scanStatus = document.getElementById('setup-scan-status');
+    const filesInput = document.getElementById('setup-fit-files');
+    const selectedStatus = document.getElementById('setup-selected-status');
+    const uploadStatus = document.getElementById('setup-upload-status');
+    const estimateValue = document.getElementById('setup-estimate-value');
+    const progress = document.getElementById('setup-progress');
+    const steps = Array.from(form.querySelectorAll('[data-setup-step]'));
+    const countFits = files => Array.from(files || []).filter(f =>
+        (f.name || '').toLowerCase().endsWith('.fit'));
+    const postForm = (url, data) => fetch(url, {
+        method: 'POST', credentials: 'same-origin', body: data,
+        headers: {'Accept': 'application/json'}
+    });
+    const updateEstimate = value => {
+        if (!estimateValue || value === null || value === undefined || Number(value) <= 0) return;
+        estimateValue.textContent = `(${Number(value).toFixed(1)} W)`;
+    };
+    const hasServerError = form.dataset.hasError === 'true';
+    const showStep = index => {
+        steps.forEach((step, position) => {
+            step.hidden = !hasServerError && position !== index;
+        });
+        if (progress && !hasServerError) {
+            progress.textContent = `Step ${index + 1} of ${steps.length}`;
+        }
+    };
+    let currentStep = 0;
+    if (!hasServerError) {
+        form.classList.add('setup-js');
+        showStep(currentStep);
+    }
+    form.querySelectorAll('[data-setup-next]').forEach(button => {
+        button.addEventListener('click', () => {
+            const step = steps[currentStep];
+            const required = step.querySelectorAll('input[required], select[required], textarea[required]');
+            for (const input of required) {
+                if (!input.checkValidity()) { input.reportValidity(); return; }
+            }
+            if (currentStep < steps.length - 1) { currentStep += 1; showStep(currentStep); }
+        });
+    });
+    form.querySelectorAll('[data-setup-back]').forEach(button => {
+        button.addEventListener('click', () => {
+            if (currentStep > 0) { currentStep -= 1; showStep(currentStep); }
+        });
+    });
+    document.querySelectorAll('.setup-use-path').forEach(button => {
+        button.addEventListener('click', () => { directory.value = button.dataset.path; directory.focus(); });
+    });
+    filesInput.addEventListener('change', () => {
+        const fits = countFits(filesInput.files);
+        const rejected = filesInput.files.length - fits.length;
+        selectedStatus.textContent = `${fits.length} FIT file${fits.length === 1 ? '' : 's'} selected` +
+            (rejected ? `; ${rejected} other file${rejected === 1 ? '' : 's'} ignored.` : '.');
+    });
+    document.getElementById('setup-check-directory').addEventListener('click', async () => {
+        dirStatus.textContent = 'Checking folder…';
+        const data = new FormData(); data.append('activities_dir', directory.value);
+        const response = await postForm('/setup/check-directory', data);
+        const result = await response.json();
+        if (!response.ok) { dirStatus.textContent = result.error || 'Folder check failed.'; return; }
+        dirStatus.textContent = result.fit_count ? `${result.fit_count} FIT file${result.fit_count === 1 ? '' : 's'} found; scan started.` : 'Folder exists, but no direct FIT files were found.';
+        pollScan();
+    });
+    document.getElementById('setup-upload-files').addEventListener('click', async () => {
+        const fits = countFits(filesInput.files);
+        if (!fits.length) { uploadStatus.textContent = 'Select at least one .fit file.'; return; }
+        uploadStatus.textContent = 'Importing selected FIT files…';
+        const data = new FormData(); fits.forEach(file => data.append('files', file, file.name));
+        const response = await postForm('/setup/upload', data);
+        const result = await response.json();
+        updateEstimate(result.ftp_estimate);
+        uploadStatus.textContent = response.ok ? `${result.imported} imported, ${result.skipped} already present${result.failed ? `, ${result.failed} failed` : ''}.` : (result.error || 'Import failed.');
+    });
+    async function pollScan() {
+        const response = await fetch('/api/scan/status', {credentials: 'same-origin'});
+        const result = await response.json();
+        if (result.running) { scanStatus.textContent = `Scanning ${result.processed || 0} of ${result.total || 0}…`; setTimeout(pollScan, 500); return; }
+        if (result.directory) {
+            updateEstimate(result.ftp_estimate);
+            scanStatus.textContent = `${result.imported || 0} ride${result.imported === 1 ? '' : 's'} imported from the folder.`;
+        }
+    }
+})();
+</script>

@@ -194,6 +194,40 @@ main a:hover { color: var(--accent); text-decoration: underline; }
 .scan-form label { flex: 1; min-width: 260px; margin: 0; }
 .scan-form input { width: 100%; margin-top: 0.25rem; }
 
+.setup-wizard { background: var(--panel); border: 1px solid var(--surface-border);
+    border-left: 4px solid var(--accent); border-radius: var(--r-md); padding: 1rem;
+    margin: 1rem 0 1.5rem; box-shadow: var(--shadow-1); }
+.setup-intro h3 { margin-top: 0; }
+.setup-step { border-top: 1px solid var(--surface-border); padding: 1rem 0 0.25rem;
+    margin-top: 1rem; }
+.setup-step h4 { margin: 0 0 0.65rem; }
+.setup-step h4 span { display: inline-grid; place-items: center; width: 1.6rem; height: 1.6rem;
+    margin-right: 0.35rem; border-radius: 50%; background: var(--accent); color: var(--on-accent); }
+.setup-js .setup-step[hidden] { display: none; }
+.setup-progress { margin: 0 0 0.5rem; }
+.setup-nav { display: flex; gap: 0.5rem; flex-wrap: wrap; margin-top: 1rem; }
+.setup-form label { display: block; margin: 0.7rem 0; }
+.setup-form input[type="text"], .setup-form input[type="number"],
+.setup-form input[type="email"], .setup-form input[type="password"] { width: 100%; max-width: 42rem; }
+.setup-choice { display: flex !important; align-items: baseline; gap: 0.45rem; }
+.setup-choice input { width: auto; }
+.setup-candidates { padding-left: 1.2rem; overflow-wrap: anywhere; }
+.setup-candidates li { margin: 0.55rem 0; }
+.setup-candidates .ok, .setup-candidates .muted { margin-left: 0.35rem; }
+.button-link { background: none; border: 0; color: #7cc0ff; padding: 0 0.25rem; cursor: pointer; }
+.button-link:hover { color: var(--accent); text-decoration: underline; }
+.setup-zwift-fields { padding: 0.35rem 0.75rem; border-left: 2px solid var(--surface-border); }
+.setup-finish { margin-top: 1rem; font-size: 1rem; }
+.setup-complete { border: 1px solid var(--ok); border-radius: var(--r-md); padding: 0.8rem; }
+.setup-complete .button { display: inline-block; margin: 0.2rem 0.35rem 0.2rem 0; }
+@media (max-width: 600px) {
+    .setup-wizard { padding: 0.75rem; }
+    .setup-candidates { padding-left: 0.9rem; }
+    .setup-candidates li { display: grid; gap: 0.25rem; }
+    .setup-candidates .ok, .setup-candidates .muted { margin-left: 0; }
+    .setup-candidates .button-link { justify-self: start; padding-left: 0; }
+}
+
 .chart-block { background: var(--panel); border-radius: var(--r-md); padding: 1rem; margin: 1.25rem 0; }
 /* Two stacked canvases that read as one plot with a shared x axis: `block`
    kills the inline-baseline gap that would otherwise open a ~4px seam between
