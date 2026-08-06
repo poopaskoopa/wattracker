@@ -155,17 +155,88 @@ def normalized_power(power: Sequence[float], window: int = 30) -> float:
 # and progress in 25 W steps, so a rider mid-rehab can genuinely sit near 50 W;
 # a deconditioned adult beginning indoor cycling is typically 100-150 W; a
 # child on a trainer is 50-80 W. 50 W is at or below the bottom of every one of
-# those populations, while the failure mode it guards against produced values of
-# 0.6-41.5 W. Anything under 50 W is not a measurement of a rider, so it is
-# never accepted as the basis for scoring or written to FTP history.
+# those populations, while the failure mode it guards against produced basis
+# values of 0.64-49.9 W across 2,335 stored rows.
+#
+# The number is reasoned from that human range alone. It is NOT calibrated
+# against any observed population of riders, and nothing here should be read as
+# claiming it was: in the deployment where the bug was found, no FTP anywhere
+# between 50 and 100 W exists at all (ftp_history min 141 W, manual overrides
+# 200-250 W), so a 100 W floor would have rejected exactly as little real data
+# as this one. The choice between them rests on which populations a rider could
+# belong to, not on which ones happen to be in a database today - and on a
+# false reject (a real rider's rides silently unscored) being far worse than a
+# false accept (an absurd basis that is still absurd at 60 W, which is why
+# contemporaneous scoring, not this floor, is the real fix - see below).
 FTP_PLAUSIBLE_MIN_WATTS = 50.0
+
+# What this floor does NOT fix: the estimator is anchored at wall-clock now, so
+# the deeper defect is that a rider's *historical* rides are scored against a
+# basis decayed to *today*. The floor bounds how wrong that can be, it does not
+# make it right - a 300-day gap still yields a legitimate-looking 73 W estimate
+# and stores IF 2.7 / TSS 750 for a normal hour, and 325 existing rows sit in
+# the 50-100 W band for exactly that reason. Scoring each ride against the FTP
+# effective on its own date is the actual repair and lives in #54/#59; it is
+# deliberately not attempted here. evaluate_ftp likewise still persists a
+# heavily decayed estimate: as an answer to "what could this rider hold today"
+# it is correct and is what a returning rider's dashboard should show, so
+# refusing to record it would break the estimator's legitimate use to paper
+# over a scoring bug that has its own fix.
+
+
+class AssertedFTP(float):
+    """An FTP the rider stated, carrying that provenance with the number.
+
+    The plausibility floor exists to reject a FAILED ESTIMATE, not to overrule
+    the rider. But by the time a wattage reaches the scorer it is just a float,
+    and the scorer cannot tell 0.64 W (the estimator decayed across a three-year
+    gap) from 40 W (a rider mid-rehab who typed it into their settings). Getting
+    that distinction wrong in either direction is a silent data defect: honour
+    everything and TSS lands in the millions; filter everything and a rider who
+    asserted 40 W accrues *zero* training load, with CTL/ATL/TSB reading as
+    untrained.
+
+    Rather than thread a provenance flag through every call site - one float
+    leaves ``current_ftp`` and flows into ``_build_record``, the power-correction
+    rescorer and the offline rescore pass - the provenance travels on the value.
+    It is a float subclass, so it stores, serializes, rounds, compares and does
+    arithmetic exactly like the number it wraps; only ``is_plausible_ftp`` (and
+    hence the scorers below) treats it differently. Arithmetic on it yields a
+    plain float, which is correct: a number *derived* from an assertion is not
+    itself asserted.
+    """
+
+    __slots__ = ()
+
+    def __repr__(self) -> str:  # pragma: no cover - diagnostics only
+        return f"AssertedFTP({float(self)!r})"
+
+
+def asserted_ftp(watts) -> "AssertedFTP | None":
+    """Mark ``watts`` as a rider assertion, or None if it is not a usable number."""
+    if watts is None or isinstance(watts, bool):
+        return None
+    try:
+        value = float(watts)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    if not math.isfinite(value) or value <= 0:
+        return None
+    return AssertedFTP(value)
+
+
+def is_asserted_ftp(value) -> bool:
+    """Whether ``value`` carries rider-asserted provenance."""
+    return isinstance(value, AssertedFTP)
 
 
 def is_plausible_ftp(watts) -> bool:
-    """Whether ``watts`` can be a real rider's FTP (see FTP_PLAUSIBLE_MIN_WATTS).
+    """Whether ``watts`` may be used as a scoring basis.
 
-    False for None, non-numeric, non-finite and anything below the floor, so
-    callers can use it as the single admission test for a scoring basis.
+    False for None, non-numeric, non-finite and anything below
+    ``FTP_PLAUSIBLE_MIN_WATTS``, so callers can use it as the single admission
+    test. An ``AssertedFTP`` is admitted at any positive wattage: the floor
+    filters our estimates, never the rider's own statement of their FTP.
     """
     if watts is None or isinstance(watts, bool):
         return False
@@ -175,12 +246,25 @@ def is_plausible_ftp(watts) -> bool:
         return False
     if not math.isfinite(value):
         return False
+    if is_asserted_ftp(watts):
+        return value > 0.0
     return value >= FTP_PLAUSIBLE_MIN_WATTS
 
 
+# --- the scoring chokepoint --------------------------------------------------
+# IF and TSS are the only two stored quantities that divide by FTP, and these
+# two functions are the only way to compute them. The admission test therefore
+# lives HERE rather than at each call site: a rail that every future caller has
+# to remember to invoke is not a rail. In particular the offline rescore pass in
+# #59 (`ftp_rescore.score_activity`) resolves its own FTP from ftp_history and
+# never touches the importer, so this is the only place a guard can sit that it
+# cannot bypass. An implausible basis yields 0.0 - the same "stored but never
+# scored" state ``_build_record`` leaves, identifiable as np > 0 with if_ == 0.
+
+
 def intensity_factor(np_value: float, ftp: float) -> float:
-    """IF = NP / FTP."""
-    if ftp <= 0:
+    """IF = NP / FTP, or 0.0 when ``ftp`` is not an admissible scoring basis."""
+    if not is_plausible_ftp(ftp):
         return 0.0
     return float(np_value) / float(ftp)
 
@@ -190,9 +274,10 @@ def training_stress_score(
 ) -> float:
     """TSS = (duration_s * NP * IF) / (FTP * 3600) * 100.
 
-    One hour at FTP yields exactly 100 TSS.
+    One hour at FTP yields exactly 100 TSS. Returns 0.0 when ``ftp`` is not an
+    admissible scoring basis (see ``is_plausible_ftp``).
     """
-    if ftp <= 0 or duration_seconds <= 0:
+    if duration_seconds <= 0 or not is_plausible_ftp(ftp):
         return 0.0
     intensity = intensity_factor(np_value, ftp)
     return (float(duration_seconds) * float(np_value) * intensity) / (
@@ -203,7 +288,7 @@ def training_stress_score(
 def tss_from_stream(power: Sequence[float], ftp: float) -> float:
     """Convenience: compute TSS directly from a per-second power stream."""
     arr = _clean_power(power)
-    if arr.size == 0 or ftp <= 0:
+    if arr.size == 0 or not is_plausible_ftp(ftp):
         return 0.0
     npw = normalized_power(arr)
     return training_stress_score(arr.size, npw, ftp)

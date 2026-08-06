@@ -10,13 +10,25 @@ from . import db
 from .analysis import activity_cache
 from .ingest import importer
 from .metrics import profile_store
-from .metrics.power import intensity_factor, normalized_power, training_stress_score
+from .metrics.power import (
+    asserted_ftp,
+    intensity_factor,
+    is_asserted_ftp,
+    is_plausible_ftp,
+    normalized_power,
+    training_stress_score,
+)
 
 _log = logging.getLogger(__name__)
 MAX_CANDIDATES = 200
 NEIGHBOR_SAMPLES = 5
 MAX_TARGET_PREVIEW_SAMPLES = 5
 MAX_SAFE_POWER_WATTS = 1_000_000.0
+# Relative tolerance for recognising a back-solved basis as the rider's asserted
+# FTP. np is stored to 0.1 W and if_ to 1e-3, so np/if_ carries a little
+# rounding error; 2% swallows it while staying far away from any confusion
+# between an asserted 40 W and a failed estimate's 0.64 W.
+BASIS_MATCH_REL_TOL = 0.02
 
 
 class CorrectionError(ValueError):
@@ -148,26 +160,93 @@ def _masked_power(raw: Sequence, ranges: Sequence[tuple]) -> list:
     return power
 
 
-def _recovered_ftp(activity: dict, user_id: int) -> float:
-    np_value = activity.get("np")
-    intensity = activity.get("if_")
+def _number(value) -> Optional[float]:
     try:
-        np_number = float(np_value)
-        intensity_number = float(intensity)
-        recovered = np_number / intensity_number
-        if (
-            np_number > 0
-            and intensity_number > 0
-            and math.isfinite(recovered)
-        ):
-            return recovered
-    except (TypeError, ValueError, OverflowError, ZeroDivisionError):
-        pass
-    try:
-        current = float(importer.current_ftp(user_id))
+        number = float(value)
     except (TypeError, ValueError, OverflowError):
-        return 200.0
-    return current if math.isfinite(current) and current > 0 else 200.0
+        return None
+    return number if math.isfinite(number) else None
+
+
+def _never_scored(np_value, intensity) -> bool:
+    """True for the "imported but deliberately not scored" marker.
+
+    ``importer._build_record`` stores NP (a measurement) but leaves IF and TSS
+    at 0 when no plausible FTP basis was available - so ``np > 0`` with
+    ``if_ == 0`` means "this row has never been scored", which is precisely the
+    state issue #62's repair pass looks for. A correction masks bad samples; it
+    is not a decision to score, so it must leave that marker intact rather than
+    back-filling a score from whatever FTP happens to be current today.
+    """
+    np_number = _number(np_value) or 0.0
+    if_number = _number(intensity) or 0.0
+    return np_number > 0 and if_number == 0.0
+
+
+def _asserted_watts(user_id: int) -> Optional[float]:
+    """The rider's own stated FTP, if that is what currently resolves for them."""
+    try:
+        current = importer.current_ftp(user_id)
+    except Exception:  # pragma: no cover - defensive; a correction must not 500
+        _log.warning("could not resolve current FTP for user %s", user_id,
+                     exc_info=True)
+        return None
+    return float(current) if is_asserted_ftp(current) else None
+
+
+def _scoring_basis(basis, user_id: int) -> float:
+    """Resolve a stored or back-solved basis into one the scorer will accept.
+
+    This module deliberately re-scores a corrected ride against the SAME basis
+    the row was originally scored against, so a correction changes only what the
+    rider asked it to change. That design stands - but it cannot extend to
+    propagating a basis the app has just declared impossible. A sub-floor basis
+    recovered from a legacy row is a failed estimate baked into the data (issue
+    #60); passing it through unwrapped makes the scorers return 0.0, leaving the
+    corrected row unscored rather than minting a brand-new IF of 313 today.
+
+    The one sub-floor basis that is real is one the rider ASSERTED. Provenance
+    cannot be recovered from ``np / if_`` alone, so a sub-floor basis that
+    matches the rider's currently-asserted FTP is re-marked as asserted and
+    scores normally.
+    """
+    number = _number(basis)
+    if number is None or number <= 0 or is_plausible_ftp(number):
+        return number if number is not None else 0.0
+    asserted = _asserted_watts(user_id)
+    if asserted is not None and math.isclose(
+        number, asserted, rel_tol=BASIS_MATCH_REL_TOL
+    ):
+        return asserted_ftp(number) or 0.0
+    _log.warning(
+        "not re-scoring correction for user %s against recovered basis %.3f W: "
+        "below the plausibility floor and not the rider's asserted FTP",
+        user_id, number,
+    )
+    return number
+
+
+def _recovered_ftp(activity: dict, user_id: int) -> float:
+    """The basis a row was scored against, for the ``ftp_basis`` audit column.
+
+    Back-solved from the stored summary where the row was scored. A never-scored
+    row has no basis to recover; the schema requires a positive number, so the
+    rider's current FTP is recorded as "what a future rescore would use". It is
+    NOT used to score - see ``_never_scored`` and ``apply``.
+    """
+    np_number = _number(activity.get("np"))
+    intensity_number = _number(activity.get("if_"))
+    if np_number and intensity_number and np_number > 0 and intensity_number > 0:
+        recovered = _number(np_number / intensity_number)
+        if recovered is not None and recovered > 0:
+            return recovered
+    try:
+        current = _number(importer.current_ftp(user_id))
+    except (TypeError, ValueError, OverflowError):
+        # A stream so malformed the estimator cannot even coerce it; the audit
+        # column still needs a number and nothing here is used to score.
+        current = None
+    return current if current and current > 0 else 200.0
 
 
 def _summary(activity: dict, power: list, ftp: float) -> dict:
@@ -177,16 +256,17 @@ def _summary(activity: dict, power: list, ftp: float) -> dict:
     ]
     avg = sum(cleaned) / len(cleaned) if cleaned else 0.0
     np_value = normalized_power(cleaned) if cleaned else 0.0
-    intensity = intensity_factor(np_value, ftp) if ftp > 0 else 0.0
     try:
         duration = float(activity.get("duration_s") or 0)
     except (TypeError, ValueError, OverflowError):
         duration = 0.0
     if not math.isfinite(duration) or duration < 0:
         duration = 0.0
-    tss = training_stress_score(
-        duration, np_value, ftp
-    ) if ftp > 0 else 0.0
+    # No `if ftp > 0` guard: both scorers apply the plausibility admission test
+    # themselves, so an implausible or absent basis yields 0.0 here - the same
+    # never-scored state the importer leaves.
+    intensity = intensity_factor(np_value, ftp)
+    tss = training_stress_score(duration, np_value, ftp)
     return {
         "avg_power": avg,
         "np": round(np_value, 1),
@@ -245,7 +325,14 @@ def apply(
     ftp_basis = activity.get("correction_ftp_basis")
     if ftp_basis is None:
         ftp_basis = _recovered_ftp(activity, user_id)
-    summary = _summary(activity, effective, ftp_basis)
+    # A row that was never scored stays never scored: masking samples changes
+    # the measurement, not the decision to score. Otherwise re-score against the
+    # row's own basis, admitted by _scoring_basis.
+    basis = (
+        0.0 if _never_scored(activity.get("np"), activity.get("if_"))
+        else _scoring_basis(ftp_basis, user_id)
+    )
+    summary = _summary(activity, effective, basis)
     correction_id = db.apply_power_correction(
         user_id,
         activity_id,
@@ -288,8 +375,16 @@ def undo(user_id: int, correction_id: int) -> None:
         raise CorrectionError("Activity has no power stream.")
     if ranges:
         effective = _masked_power(raw, ranges)
-        ftp_basis = float(correction["ftp_basis"])
-        summary = _summary(activity, effective, ftp_basis)
+        # Same two rules as apply(), read off the metrics this correction
+        # captured: a partial undo must not score a row that apply() left
+        # unscored, nor revive an implausible basis.
+        basis = (
+            0.0 if _never_scored(
+                correction["original_np"], correction["original_if"]
+            )
+            else _scoring_basis(correction["ftp_basis"], user_id)
+        )
+        summary = _summary(activity, effective, basis)
     else:
         summary = {
             "avg_power": correction["original_avg_power"],
