@@ -914,6 +914,22 @@ def create_app() -> FastAPI:
             summary = {"status": adaptmod.detection_status(state),
                        "adjusted": 0, "upcoming": {}}
         banner = adaptmod.banner_for(state, summary)
+        complete = db.onboarding_complete(uid)
+        # Candidate discovery scans the filesystem and the FTP estimate
+        # decompresses the whole activity history; both only feed the setup
+        # wizard, which a completed rider never renders. Skipping them keeps
+        # the normal dashboard off a cost that grows with ride count.
+        setup_ctx: dict = {}
+        if not complete:
+            setup_ctx = dict(
+                setup_candidates=paths.annotated_candidates(),
+                setup_settings=db.get_user_settings(uid),
+                setup_estimate=round(importer.recent_best_effort_ftp(uid), 1),
+                setup_fallback_ftp=200,
+                setup_error=None,
+                setup_message=None,
+                setup_form={},
+            )
         return templates.TemplateResponse(
             request,
             "dashboard.html",
@@ -921,14 +937,8 @@ def create_app() -> FastAPI:
                 request,
                 state=state.to_dict(),
                 banner=banner,
-                onboarding_complete=db.onboarding_complete(_uid(request)),
-                setup_candidates=paths.annotated_candidates(),
-                setup_settings=db.get_user_settings(_uid(request)),
-                setup_estimate=round(importer.recent_best_effort_ftp(_uid(request)), 1),
-                setup_fallback_ftp=200,
-                setup_error=None,
-                setup_message=None,
-                setup_form={},
+                onboarding_complete=complete,
+                **setup_ctx,
             ),
         )
 
