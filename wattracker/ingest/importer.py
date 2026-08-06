@@ -35,6 +35,8 @@ from ..prescribe.plan import HARD_STEADY_POWER
 from ..timeutil import parse_naive, utc_now, utc_today
 from .fit_parser import parse_fit
 
+log = logging.getLogger(__name__)
+
 
 _log = logging.getLogger(__name__)
 
@@ -750,6 +752,68 @@ def scan_activities(
         # so an os.path.isdir here would say "no" to every valid folder.
         "exists": True,
     }
+
+
+def save_ride_record(
+    user_id: int,
+    started_at: _dt.datetime,
+    duration_s: int,
+    samples: Dict[str, list],
+    session_name: str,
+    ftp: float,
+    workout_id: Optional[int] = None,
+) -> "tuple[Optional[int], dict]":
+    """Store a ride recorded in-app as an activity. Returns (activity_id, record).
+
+    One code path for both ways a ride can reach here: the controller running
+    in this process, and a connector uploading a ride it buffered while the
+    network was down. They must produce byte-identical rows - a ride that
+    happened to span a reconnect is still one ride - so neither gets its own
+    copy of this chain.
+
+    ``started_at`` is naive UTC, like the timestamps parsed out of .fit files:
+    the same ride recorded by both the app and Zwift has to land on the same
+    instant, not four hours apart.
+    """
+    from ..metrics import profile_store
+
+    n = len(samples.get("power") or [])
+    streams = {
+        "time": [
+            (started_at + _dt.timedelta(seconds=i)).isoformat() for i in range(n)
+        ],
+        "power": samples.get("power") or [],
+        "cadence": samples.get("cadence") or [],
+        "heartrate": samples.get("heartrate") or [],
+        "distance": [],
+        "altitude": [],
+    }
+    parsed = {
+        "start_time": started_at.isoformat(),
+        "duration_s": int(duration_s),
+        "streams": streams,
+    }
+    # The app is UTC end to end, so the ride is named by its UTC date - a
+    # late-evening ride west of Greenwich reads as the next day.
+    name = f"Ride {started_at.date().isoformat()} {session_name}"
+    record = _build_record(parsed, name, ftp)
+    activity_id = db.insert_activity(user_id, record)
+    if activity_id is not None and workout_id is not None:
+        link_selected_plan_workout(user_id, workout_id, activity_id)
+    if activity_id is not None:
+        link_duplicate_activity(user_id, activity_id)
+    try:
+        maybe_update_ftp(user_id)
+    except Exception:
+        pass
+    if activity_id is not None:
+        try:
+            profile_store.refresh(user_id)
+        except Exception:
+            log.warning(
+                "rider profile refresh after in-app ride failed", exc_info=True
+            )
+    return activity_id, record
 
 
 def ingest_upload(

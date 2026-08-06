@@ -124,6 +124,10 @@ class RemoteBackend(Backend):
                     size=int(row.get("size") or 0),
                 )
             )
+        # Remember the folder the connector actually settled on, so the reads
+        # that follow are scoped to the same place the listing came from. It
+        # is the connector's own resolved answer, not the value we asked for.
+        self._listed_dir = result.get("directory") or None
         return ActivityListing(
             directory=result.get("directory"),
             exists=bool(result.get("exists")),
@@ -135,7 +139,9 @@ class RemoteBackend(Backend):
     def readable_activity(self, path: str) -> Iterator[str]:
         """Fetch the file's bytes and hand the parser a temporary local copy."""
         result = self._call(
-            "activities.read", {"path": path}, timeout=_READ_TIMEOUT_S
+            "activities.read",
+            {"path": path, "directory": getattr(self, "_listed_dir", None)},
+            timeout=_READ_TIMEOUT_S,
         ) or {}
         encoded = result.get("content")
         if not isinstance(encoded, str):
@@ -152,7 +158,12 @@ class RemoteBackend(Backend):
 
         # Suffix from the *remote* basename, so the parser sees a .fit. The
         # temp file lives on the server and is deleted whatever happens.
-        suffix = os.path.splitext(os.path.basename(path))[1] or ".fit"
+        # Only .fit in either case ever reaches the filesystem: the connector
+        # lists nothing else, and a name arriving from the wire should not get
+        # to choose how a server-side file is named however odd it is.
+        suffix = os.path.splitext(os.path.basename(path))[1]
+        if suffix.lower() != ".fit":
+            suffix = ".fit"
         tmp = tempfile.NamedTemporaryFile(delete=False, suffix=suffix)
         try:
             tmp.write(content)

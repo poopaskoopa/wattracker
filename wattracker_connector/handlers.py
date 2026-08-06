@@ -51,8 +51,31 @@ class ConnectorConfig:
 
 def _resolved_activities_dir(config: ConnectorConfig,
                              directory: Optional[str]) -> Optional[str]:
-    """The folder to scan: server's suggestion, local override, then discovery."""
-    return directory or config.activities_dir or paths.activities_dir()
+    """The folder to work in: server's suggestion, local override, discovery.
+
+    A folder the *server* names has to clear this machine's trusted roots
+    before we will act on it; one this machine configured or discovered for
+    itself is trusted already, because the person who set it was sitting here.
+    Returns ``None`` when the server asked for somewhere it may not go, which
+    every caller treats as "no such folder" rather than an error worth
+    explaining to a caller that should not have asked.
+
+    Listing and reading must resolve through *this* function identically. They
+    did not always: ``activities.read`` used to ignore ``directory`` and check
+    against the local folder alone, so whenever the server carried an
+    ``activities_dir`` override that differed from the connector's own - which
+    is exactly what setting one in the web UI does - the listing succeeded and
+    then every single read of the files it had just offered was refused.
+    """
+    local = config.activities_dir or paths.activities_dir()
+    if not directory:
+        return local
+    if local and _within(local, directory) and _within(directory, local):
+        return local  # the connector's own folder, handed straight back
+    clean, error = validate_dir(directory, require_exists=False)
+    if clean is None:
+        log.warning("refusing server-supplied activities folder: %s", error)
+    return clean
 
 
 def _within(directory: str, candidate: str) -> bool:
@@ -129,15 +152,17 @@ def build_handlers(config: ConnectorConfig) -> Dict[str, Callable]:
         return {"directory": target, "exists": True,
                 "files": files, "skipped": skipped}
 
-    async def activities_read(path: str = "") -> dict:
+    async def activities_read(path: str = "",
+                              directory: Optional[str] = None) -> dict:
         """Return one activity file's bytes, base64-encoded.
 
         Confined to the Activities folder. The server chooses this path from a
         listing this connector produced, so a path outside it means either a
         bug or a server that should not be trusted with arbitrary local reads
-        - either way, refuse.
+        - either way, refuse. ``directory`` is resolved by exactly the rule the
+        listing used, so the two can never disagree about what is in scope.
         """
-        target = _resolved_activities_dir(config, None)
+        target = _resolved_activities_dir(config, directory)
         if not target or not _within(target, path):
             raise ValueError("path is outside the activities folder")
         if not os.path.isfile(path):
