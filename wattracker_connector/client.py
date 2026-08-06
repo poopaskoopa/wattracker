@@ -29,9 +29,32 @@ _BACKOFF_START_S = 1.0
 _BACKOFF_MAX_S = 60.0
 _BACKOFF_FACTOR = 2.0
 
+# A much shorter ceiling while a ride is in progress. A minute of backoff is a
+# sensible way to wait out an overnight outage and a terrible way to wait out
+# one during a workout: on real hardware a 30-second drop cost 2m 06s of
+# reconnect, because the delay had already climbed to 56 s by the time the link
+# returned. Every second of that is a second the trainer holds a stale target.
+_RIDE_BACKOFF_MAX_S = 5.0
+
+# How long a reconnected connector holding a ride waits for a server to ask
+# for the samples it missed. Past this nobody is coming - the browser closed,
+# or the server gave up on us first - and continuing to hold the trainer in
+# ERG would leave a rider pushing against a workout that has already ended.
+CLAIM_TIMEOUT_S = 90.0
+
 # Sent by the server as soon as it accepts. Its absence within this many
 # seconds means we are talking to something that is not a wattracker server.
 _HELLO_TIMEOUT_S = 20.0
+
+
+async def _cancel(task: "Optional[asyncio.Task]") -> None:
+    if task is None:
+        return
+    task.cancel()
+    try:
+        await task
+    except (asyncio.CancelledError, Exception):
+        pass
 
 
 class _Replaced(Exception):
@@ -151,13 +174,19 @@ class Connector:
                 break
             # Jitter so a fleet of connectors does not stampede a server that
             # just came back up.
-            delay = min(backoff, _BACKOFF_MAX_S) * (0.5 + random.random())
+            ceiling = _RIDE_BACKOFF_MAX_S if self.ble.riding else _BACKOFF_MAX_S
+            delay = min(backoff, ceiling) * (0.5 + random.random())
             log.info("reconnecting in %.1fs", delay)
             try:
                 await asyncio.wait_for(self._stop.wait(), timeout=delay)
             except asyncio.TimeoutError:
                 pass
             backoff = min(backoff * _BACKOFF_FACTOR, _BACKOFF_MAX_S)
+        # Leaving the loop is definitive - Ctrl-C, the tray quitting, or being
+        # displaced by another connector - not a reconnect. So the radio goes
+        # back even if a ride was in progress: nothing is going to pick it up.
+        # The buffer survives, and goes up the next time this starts.
+        await self.ble.teardown()
 
     async def _session(self) -> None:
         # Imported here, not at module scope, so the rest of this package
@@ -205,18 +234,59 @@ class Connector:
                 # thing this process holds, and there is no reason to make it
                 # wait behind a scan.
                 await self._flush_buffered_ride()
-                await self._serve(socket, peer)
+                claim = self._start_claim_watchdog()
+                try:
+                    await self._serve(socket, peer)
+                finally:
+                    await _cancel(claim)
             finally:
                 self._peer = None
                 self.status.connected = False
                 peer.abandon("disconnected")
-                # Never leave the radio held across a reconnect: the server
-                # has no session to resume into, and a half-held adapter is
-                # what stops the next scan from finding anything.
-                await self.ble.teardown()
+                # Releases the radio, unless a ride is in progress - in which
+                # case the devices, the sampler and the buffer all outlive the
+                # socket, and the ride is picked up again on reconnect. See
+                # BleState.detach for why that is not a contradiction of the
+                # rule about never holding the adapter across a reconnect.
+                await self.ble.detach()
+
+    def _start_claim_watchdog(self) -> Optional[asyncio.Task]:
+        """After a reconnect mid-ride, make sure somebody takes the ride back."""
+        if not self.ble.riding:
+            return None
+        log.info(
+            "reconnected while riding; waiting for the server to pick the "
+            "ride back up"
+        )
+        return asyncio.create_task(self._abandon_unclaimed_ride())
+
+    async def _abandon_unclaimed_ride(self) -> None:
+        """End a ride no returning server has claimed. The safety net.
+
+        Without it, "keep the trainer through a reconnect" turns into "hold
+        the trainer forever" the moment the other end is not coming back - a
+        closed ride page, or a server that timed the ride out while we were
+        away. The rider would be left pushing against a workout nobody is
+        running, with no page to stop it from.
+        """
+        await asyncio.sleep(CLAIM_TIMEOUT_S)
+        if not self.ble.riding or self.ble.claimed:
+            return
+        log.warning(
+            "no server picked the ride up within %.0fs; releasing the trainer "
+            "and uploading what was recorded", CLAIM_TIMEOUT_S,
+        )
+        await self.ble.teardown()
+        await self._flush_buffered_ride()
 
     async def _flush_buffered_ride(self) -> None:
         """Upload a ride recorded while the server was unreachable."""
+        if self.ble.riding:
+            # The ride is still being ridden. Uploading now would store half a
+            # workout as a finished activity, and - because the buffer is
+            # discarded on a successful upload - throw away the half still to
+            # come. It goes up when the ride actually ends.
+            return
         try:
             await asyncio.to_thread(
                 upload_pending, self.server_url, self.token, self.ble.buffer

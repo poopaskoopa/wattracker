@@ -57,6 +57,7 @@ from .backend import (
 )
 from .backend import mode as backend_mode
 from .backend import remote_ble
+from .rpc import ConnectorUnavailable
 from .ble import devices as bledevices
 from .ble.runner import RideController, flatten_session
 from .ingest import importer
@@ -101,6 +102,14 @@ RIDE_INACTIVITY_TIMEOUT_S = 300.0
 # retried on the next tick with a full re-arm; only a sustained run of them is
 # treated as "this trainer will not take targets" - and then the rider is told.
 ERG_COMMAND_FAILURE_LIMIT = 5
+
+# How long a ride waits for a connector that has gone quiet before giving up on
+# it. Losing the connector is not losing the ride: the connector holds the
+# trainer, keeps sampling and keeps writing every second to its own buffer, and
+# a reconnect inside this window replays the missed seconds into the controller
+# so the activity comes out whole. Past it, nobody is coming back in time to be
+# worth holding a rider's workout open for.
+CONNECTOR_OFFLINE_TIMEOUT_S = 300.0
 
 
 def _ride_loop_time() -> float:
@@ -2272,7 +2281,7 @@ def create_app() -> FastAPI:
         try:
             result = backend.apply_exports(
                 ExportManifest(
-                    zwift_id=settings.get("zwift_id") or "me",
+                    zwift_id=settings.get("zwift_id"),
                     override=settings.get("workouts_dir"),
                     write=[
                         {"date": w["date"], "name": w["name"],
@@ -2303,6 +2312,10 @@ def create_app() -> FastAPI:
             _log.warning("plan auto-export failed: %s", e)
             return {"auto_export": None, "auto_export_reason": "error",
                     "auto_export_detail": str(e)}
+        if result.get("status") != "ok":
+            return {"auto_export": None,
+                    "auto_export_reason": result["reason"] or result.get("status", "error"),
+                    "auto_export_detail": ""}
         return {
             "auto_export": {
                 "count": result["exported"],
@@ -2484,7 +2497,7 @@ def create_app() -> FastAPI:
         if workouts:
             result = get_backend(uid).apply_exports(
                 ExportManifest(
-                    zwift_id=settings.get("zwift_id") or "me",
+                    zwift_id=settings.get("zwift_id"),
                     override=settings.get("workouts_dir"),
                     write=[
                         {"date": w["date"], "name": w["name"],
@@ -2494,7 +2507,11 @@ def create_app() -> FastAPI:
                     resolution="direct",
                 )
             )
-            exported = {"count": result["exported"], "directory": result["directory"]}
+            if result.get("status") == "ok":
+                exported = {"count": result["exported"], "directory": result["directory"]}
+            else:
+                export_error = {"reason": result["reason"] or result.get("status", "error"),
+                                "detail": ""}
         summary = _plan_summary(uid, plan_id)
         return templates.TemplateResponse(
             request,
@@ -2552,14 +2569,18 @@ def create_app() -> FastAPI:
             settings = db.get_user_settings(uid)
             result = get_backend(uid).apply_exports(
                 ExportManifest(
-                    zwift_id=settings.get("zwift_id") or "me",
+                    zwift_id=settings.get("zwift_id"),
                     override=settings.get("workouts_dir"),
                     write=[{"date": w["date"], "name": w["name"],
                             "zwo": w["zwo_or_segments"]}],
                     resolution="direct",
                 )
             )
-            exported = {"count": result["exported"], "directory": result["directory"]}
+            if result.get("status") == "ok":
+                exported = {"count": result["exported"], "directory": result["directory"]}
+            else:
+                export_error = {"reason": result["reason"] or result.get("status", "error"),
+                                "detail": ""}
             summary = _plan_summary(uid, w["plan_id"])
         return templates.TemplateResponse(
             request,
@@ -3036,12 +3057,20 @@ def create_app() -> FastAPI:
         settings = db.get_user_settings(uid)
         result = get_backend(uid).apply_exports(
             ExportManifest(
-                zwift_id=settings.get("zwift_id") or "me",
+                zwift_id=settings.get("zwift_id"),
                 override=settings.get("workouts_dir"),
                 write=[{"date": scheduled, "name": last["name"], "zwo": last["zwo"]}],
                 resolution="direct",
             )
         )
+        if result.get("status") != "ok":
+            return templates.TemplateResponse(
+                request,
+                "plan.html",
+                _generate_ctx(request, mode="workout",
+                              export_error={"reason": result["reason"] or result.get("status", "error"),
+                                            "detail": ""}),
+            )
         export_key = hashlib.sha256(
             f"{scheduled}\0{last['name']}\0{last['zwo']}".encode("utf-8")
         ).hexdigest()
@@ -3678,6 +3707,9 @@ def create_app() -> FastAPI:
                     power=message.get("power"),
                     cadence=message.get("cadence"),
                     hr=message.get("hr"),
+                    # The connector's own index for this sample. What makes a
+                    # reconnect ask for exactly the seconds it missed.
+                    index=message.get("n"),
                 )
             return
         _log.debug("ignoring unknown connector event %s", event)
@@ -3892,6 +3924,11 @@ def create_app() -> FastAPI:
                 else:
                     trainer.set_target_power(0)
                     trainer.stop_erg()
+        except ConnectorUnavailable:
+            # Transport failure — do not report as ERG-disabled. Let the
+            # per-tick caller distinguish "we could not ask" from "the trainer
+            # said no" so it skips this tick rather than counting a failure.
+            raise
         except Exception as exc:
             available, current = _connection_erg_state(conn)
             return available, False if enabled else current, str(exc)
@@ -3901,6 +3938,130 @@ def create_app() -> FastAPI:
         if not hasattr(trainer, "erg_enabled"):
             actual = enabled
         return available, actual, None
+
+    def _connector_live(conn: Optional[dict]) -> bool:
+        """Is the machine holding the radio still reachable?
+
+        Always true in local mode, where the radio is this process's own.
+        """
+        if not isinstance(conn, remote_ble.RemoteConnection):
+            return True
+        return conn.live_session is not None
+
+    async def _resume_after_offline(
+        websocket: WebSocket,
+        conn: "remote_ble.RemoteConnection",
+        controller: RideController,
+        offline_s: float,
+    ) -> bool:
+        """Take the ride back over, replaying the seconds we were not here for.
+
+        The connector kept sampling into its own buffer throughout, so the
+        missing seconds exist - they just have not been through the state
+        machine. Ticking them in one at a time is what makes the saved
+        activity identical to one that never dropped: elapsed advances,
+        pause and resume land where the rider actually stopped and started,
+        and the samples go in in order rather than leaving a hole.
+
+        Returns False when there is no ride left to carry on with, because the
+        connector ended it while we were away.
+        """
+        still_riding = True
+        try:
+            rows, still_riding = await remote_ble.resume_ride(conn)
+        except Exception as exc:
+            # Do not fail the ride over a failed catch-up. Riding on with a
+            # gap is strictly better than ending a workout the rider is still
+            # in the middle of.
+            _log.warning("could not replay the missed ride samples: %s", exc)
+            rows = []
+        for power, cadence, hr in rows:
+            controller.tick(
+                power=int(power or 0), cadence=cadence, hr=hr, dt=1
+            )
+        await websocket.send_json({
+            "status": "connector_resumed",
+            "offline_s": round(offline_s, 1),
+            "replayed": len(rows),
+            "riding": still_riding,
+            "message": (
+                f"Connector back after {int(offline_s)}s"
+                + (f"; recovered {len(rows)} seconds of riding." if rows
+                   else ".")
+            ),
+        })
+        return still_riding
+
+    def _connector_is_buffering(conn: Optional[dict]) -> bool:
+        """Has the connector demonstrably been recording this ride?
+
+        Every sample it sends carries its index in its own buffer, so an index
+        having arrived is proof there is a file on the far end holding the
+        ride. If none ever did - the buffer failed to open, or it is an older
+        connector - then handing it the record would hand it to nobody.
+        """
+        return (
+            isinstance(conn, remote_ble.RemoteConnection)
+            and conn.sink.index is not None
+        )
+
+    async def _defer_ride_to_connector(
+        websocket: WebSocket, controller: RideController,
+        conn: Optional[dict], offline_s: float,
+    ) -> bool:
+        """End a ride whose connector is not here, and save nothing.
+
+        The connector still holds the whole ride - every second of it,
+        including the ones this end never saw - and uploads it the moment it
+        can reach us again. Writing our own truncated copy first would not
+        merely be worse data: the dedup hash is over (start, duration), so the
+        short row and the complete one differ and both land, leaving one ride
+        stored as two activities.
+
+        Every way a ride can end while the connector is away goes through
+        here - the wait timing out, the rider pressing stop, and the connector
+        having ended the ride itself - because they would all otherwise
+        produce that second row.
+
+        Returns whether the record was handed over, which callers keep: it is
+        what stops the ``finally`` from telling a connector that reconnects in
+        the meantime to throw the buffer away. That would lose the ride
+        outright - and so, for the same reason, would deferring to a connector
+        that turns out not to be buffering at all.
+        """
+        if not _connector_is_buffering(conn):
+            _log.warning(
+                "the connector never reported buffering this ride; saving "
+                "what reached us rather than deferring to a file that may "
+                "not exist"
+            )
+            await websocket.send_json({
+                "status": "connector_lost",
+                "offline_s": round(offline_s, 1),
+                "buffered": False,
+                "message": (
+                    "The connector is not reachable and never reported "
+                    "recording locally. The ride was saved here, as far as it "
+                    "got."
+                ),
+            })
+            return False
+        controller.autosave = False
+        _log.warning(
+            "ending a ride with no connector attached (away %.0fs); it will "
+            "arrive as a buffered upload when the connector reconnects",
+            offline_s,
+        )
+        await websocket.send_json({
+            "status": "connector_lost",
+            "offline_s": round(offline_s, 1),
+            "buffered": True,
+            "message": (
+                "The connector is not reachable. The ride was recorded on "
+                "your PC and will appear in Activities once it reconnects."
+            ),
+        })
+        return True
 
     @app.websocket("/ride/ws")
     async def ride_ws(websocket: WebSocket):
@@ -3975,6 +4136,10 @@ def create_app() -> FastAPI:
             receive_task = None
             action_queue = None
             abnormal_cleanup = False
+            # True once the ride's record has been handed to the connector's
+            # buffer. Keeps the cleanup below from telling it to discard the
+            # only copy.
+            deferred = False
             try:
                 try:
                     ble_session = _ble_session(uid)
@@ -3991,6 +4156,11 @@ def create_app() -> FastAPI:
                                 "ftp": float(ftp),
                                 "workout_id": selected_workout_id,
                             },
+                            # By user, not the session object we connected
+                            # through: a connector that drops and comes back
+                            # is a *new* session, and a ride that outlives the
+                            # socket has to find the new one.
+                            resolve_session=lambda: connectorhub.get(uid),
                         )
                     elif selected is None:
                         conn = await bledevices.connect_sensors()
@@ -4202,16 +4372,83 @@ def create_app() -> FastAPI:
                         }
                     )
                 inactive_s = 0.0
+                offline_s = 0.0
+                resumed = False
                 while controller.status != "finished":
                     tick_started = _ride_loop_time()
                     if action_queue is not None:
                         while not action_queue.empty():
                             outcome = await _handle_action(action_queue.get_nowait())
                             if outcome == "stop":
+                                if not _connector_live(conn):
+                                    deferred = await _defer_ride_to_connector(
+                                        websocket, controller, conn, offline_s
+                                    )
                                 controller.stop()
                                 break
                     if controller.status == "finished":
                         break
+
+                    # The connector is the radio. Losing it is not the rider
+                    # stopping, so the controller is *frozen* rather than
+                    # polled: ticking it against a silent sink would fabricate
+                    # zero-power seconds, pause the workout and start the
+                    # inactivity clock on a rider who is still pedalling. The
+                    # real seconds are on the connector's disk and get replayed
+                    # when it comes back.
+                    if not _connector_live(conn):
+                        if offline_s == 0.0:
+                            _log.warning(
+                                "connector went away mid-ride for user %s; "
+                                "holding the ride open", uid,
+                            )
+                            await websocket.send_json({
+                                "status": "connector_offline",
+                                "message": (
+                                    "Lost the connector. Your PC is still "
+                                    "recording and the trainer is holding its "
+                                    "target - reconnecting."
+                                ),
+                            })
+                        offline_s += RIDE_POLL_INTERVAL_S
+                        if offline_s >= CONNECTOR_OFFLINE_TIMEOUT_S:
+                            deferred = await _defer_ride_to_connector(
+                                websocket, controller, conn, offline_s
+                            )
+                            controller.stop()
+                            break
+                        await websocket.send_json({
+                            **controller.state(),
+                            "connector_offline": True,
+                            "offline_s": round(offline_s, 1),
+                        })
+                        await _ride_sleep(
+                            max(0.0,
+                                RIDE_POLL_INTERVAL_S
+                                - (_ride_loop_time() - tick_started))
+                        )
+                        continue
+
+                    if offline_s:
+                        still_riding = await _resume_after_offline(
+                            websocket, conn, controller, offline_s
+                        )
+                        if not still_riding:
+                            # The connector gave up on this ride before we
+                            # came back - the rider stopped for long enough
+                            # with nobody driving. Its buffer is the record,
+                            # exactly as when we are the ones who give up.
+                            deferred = await _defer_ride_to_connector(
+                                websocket, controller, conn, offline_s
+                            )
+                            controller.stop()
+                            break
+                        offline_s = 0.0
+                        # The trainer has been holding one target throughout,
+                        # and may well have dropped out of ERG when the FTMS
+                        # writes stopped. Re-arm rather than nudge.
+                        resumed = True
+
                     previous_status = controller.status
                     controller.poll(dt=1)
                     if (
@@ -4219,55 +4456,61 @@ def create_app() -> FastAPI:
                         and controller.status in
                         ("running", "cooldown", "finished")
                     ):
-                        (
-                            command_available,
-                            command_enabled,
-                            command_error,
-                        ) = await _set_connection_erg(
-                            conn,
-                            True,
-                            controller.current_target,
-                            force_rearm=(
-                                # A failed command may have left the trainer out
-                                # of ERG (BleakTrainer clears its own flag before
-                                # re-raising), so a bare target would not put it
-                                # back. Retry with the full arming sequence.
-                                erg_failures > 0
-                                or (previous_status == "paused"
-                                    and controller.status == "running")
-                            ),
-                        )
-                        controller.erg_available = command_available
-                        if not command_error:
-                            erg_failures = 0
-                            controller.set_erg_enabled(
-                                command_enabled, command_trainer=False
+                        try:
+                            (
+                                command_available,
+                                command_enabled,
+                                command_error,
+                            ) = await _set_connection_erg(
+                                conn,
+                                True,
+                                controller.current_target,
+                                force_rearm=(
+                                    erg_failures > 0
+                                    or resumed
+                                    or (previous_status == "paused"
+                                        and controller.status == "running")
+                                ),
                             )
+                        except ConnectorUnavailable:
+                            # Transport failure — skip this tick's ERG command
+                            # so the next iteration's _connector_live check
+                            # transitions to the freeze path. Do not count as
+                            # a trainer refusal and do not touch erg_enabled.
+                            resumed = False
                         else:
-                            erg_failures += 1
-                            # Do NOT mirror the failure into controller.erg_enabled
-                            # while retrying. The per-tick ERG block is gated on
-                            # that flag and nothing outside the block ever sets it
-                            # back, so clearing it here would latch ERG off for the
-                            # rest of the ride on a single transient fault.
-                            if erg_failures >= ERG_COMMAND_FAILURE_LIMIT:
+                            resumed = False
+                            controller.erg_available = command_available
+                            if not command_error:
+                                erg_failures = 0
                                 controller.set_erg_enabled(
-                                    False, command_trainer=False
+                                    command_enabled, command_trainer=False
                                 )
-                                await websocket.send_json(
-                                    {
-                                        "status": "erg",
-                                        "available": command_available,
-                                        "enabled": False,
-                                        "error": command_error,
-                                        "message": (
-                                            "ERG switched off after "
-                                            f"{erg_failures} consecutive failed "
-                                            "trainer commands. Re-enable it to "
-                                            "try again."
-                                        ),
-                                    }
-                                )
+                            else:
+                                erg_failures += 1
+                                # Do NOT mirror the failure into controller.erg_enabled
+                                # while retrying. The per-tick ERG block is gated on
+                                # that flag and nothing outside the block ever sets it
+                                # back, so clearing it here would latch ERG off for the
+                                # rest of the ride on a single transient fault.
+                                if erg_failures >= ERG_COMMAND_FAILURE_LIMIT:
+                                    controller.set_erg_enabled(
+                                        False, command_trainer=False
+                                    )
+                                    await websocket.send_json(
+                                        {
+                                            "status": "erg",
+                                            "available": command_available,
+                                            "enabled": False,
+                                            "error": command_error,
+                                            "message": (
+                                                "ERG switched off after "
+                                                f"{erg_failures} consecutive failed "
+                                                "trainer commands. Re-enable it to "
+                                                "try again."
+                                            ),
+                                        }
+                                    )
                     await websocket.send_json(controller.state())
                     if controller.current_power > 0:
                         inactive_s = 0.0
@@ -4304,6 +4547,15 @@ def create_app() -> FastAPI:
                 # once a ride actually started. An idle controller must not
                 # create a zero-duration activity.
                 try:
+                    if controller is not None and not _connector_live(conn):
+                        # Same reasoning as _defer_ride_to_connector: the
+                        # connector holds a complete copy and will upload it,
+                        # and a truncated row here would land beside it rather
+                        # than dedupe against it. No frame is sent - the socket
+                        # is the thing that just failed.
+                        if _connector_is_buffering(conn):
+                            controller.autosave = False
+                            deferred = True
                     if (
                         controller is not None
                         and controller.has_started
@@ -4336,11 +4588,21 @@ def create_app() -> FastAPI:
                     # page reopens after a short delay expecting a free
                     # adapter, and with a network hop in the middle that delay
                     # is no longer enough on its own - so ask, and wait.
-                    try:
-                        conn.session.ble_sink = None
-                        await conn.session.call("ble.release")
-                    except BaseException:
-                        pass
+                    #
+                    # Reaching the connector here is also what tells it the
+                    # ride ended cleanly, so it can drop its buffer. If it is
+                    # unreachable this call simply fails, the buffer survives,
+                    # and the ride arrives as an upload instead - which is
+                    # exactly the outcome that case wants.
+                    live = conn.live_session
+                    if live is not None:
+                        try:
+                            live.ble_sink = None
+                            await live.call(
+                                "ble.release", {"discard_buffer": not deferred}
+                            )
+                        except BaseException:
+                            pass
                 try:
                     await websocket.close()
                 except BaseException:

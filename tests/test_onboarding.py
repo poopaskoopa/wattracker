@@ -13,6 +13,8 @@ import pytest
 pytest.importorskip("httpx")
 from fastapi.testclient import TestClient
 
+from conftest import redirect_home
+
 import wattracker
 from wattracker import auth, db, paths
 import wattracker.credstore as credstore
@@ -352,7 +354,12 @@ def test_setup_copy_and_dashboard_include_guidance(client):
 
 def test_directory_check_reports_missing_empty_fit_and_rejects_outside(client, tmp_path, monkeypatch):
     _register(client)
-    monkeypatch.setenv("HOME", str(tmp_path))
+    # redirect_home, not setenv: HOME alone is inert on Windows, where
+    # ntpath.expanduser reads USERPROFILE. Left as setenv, the sandboxed HOME
+    # stays at tmp_path/home and the folders below are siblings of it, so the
+    # containment check (correctly) refuses the ones this test expects it to
+    # accept.
+    redirect_home(monkeypatch, os.path.realpath(tmp_path))
     missing = client.post("/setup/check-directory", data={"activities_dir": str(tmp_path / "missing")})
     assert missing.status_code == 400
     assert "not found or not a directory" in missing.json()["error"]
@@ -538,7 +545,7 @@ def test_setup_upload_refreshes_derived_state_once_per_batch(client, monkeypatch
     calls = {"ftp": 0, "completions": 0, "profile": 0}
 
     monkeypatch.setattr(
-        importer, "ingest_file", lambda user_id, path, ftp=None: 1
+        importer, "ingest_file", lambda user_id, path, ftp=None, **kwargs: 1
     )
     monkeypatch.setattr(
         importer,
