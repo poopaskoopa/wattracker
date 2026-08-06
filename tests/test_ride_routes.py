@@ -1311,6 +1311,8 @@ def test_ride_ws_prepared_stop_cleans_hardware_before_server_close(
 
     monkeypatch.setattr(servermod.bledevices, "bluetooth_available", lambda: (True, "ok"))
     monkeypatch.setattr(servermod.bledevices, "connect_sensors", fake_connect)
+    # Zero poll interval: an idle prepared ride otherwise sleeps 1s per tick.
+    monkeypatch.setattr(servermod, "RIDE_POLL_INTERVAL_S", 0.0)
 
     class FakeWebSocket:
         headers = {}
@@ -1495,6 +1497,8 @@ def test_ride_ws_last_ride_device_disconnect_ends_session_and_releases_clients(
         servermod.bledevices, "bluetooth_available", lambda: (True, "ok")
     )
     monkeypatch.setattr(servermod.bledevices, "connect_sensors", fake_connect)
+    # Zero poll interval: an idle prepared ride otherwise sleeps 1s per tick.
+    monkeypatch.setattr(servermod, "RIDE_POLL_INTERVAL_S", 0.0)
 
     class FakeWebSocket:
         headers = {}
@@ -1612,6 +1616,8 @@ def test_ride_ws_erg_action_reports_unavailable_without_trainer(
 
     monkeypatch.setattr(servermod.bledevices, "bluetooth_available", lambda: (True, "ok"))
     monkeypatch.setattr(servermod.bledevices, "connect_sensors", fake_connect)
+    # Zero poll interval: an idle prepared ride otherwise sleeps 1s per tick.
+    monkeypatch.setattr(servermod, "RIDE_POLL_INTERVAL_S", 0.0)
 
     with client.websocket_connect("/ride/ws?prepare=1") as ws:
         connected = _receive_after_workout(ws)

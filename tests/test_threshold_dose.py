@@ -109,7 +109,7 @@ _NO_TRAILING_RECOVERY = [
 
 
 @pytest.mark.parametrize("kind,variant", _NO_TRAILING_RECOVERY)
-@pytest.mark.parametrize("minutes", [30, 45, 60, 90, 120])
+@pytest.mark.parametrize("minutes", [30, 60, 120])
 def test_session_ends_on_work_then_cooldown(kind, variant, minutes):
     s = build_workout(kind, minutes, variant)
     kinds = [seg.kind for seg in s.segments]

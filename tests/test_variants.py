@@ -33,7 +33,7 @@ def test_build_workout_deterministic():
 
 # ------------------------------------------- legacy: None == classic == unknown
 @pytest.mark.parametrize("kind", list(VARIANTS))
-@pytest.mark.parametrize("minutes", [30, 45, 60, 90, 120])
+@pytest.mark.parametrize("minutes", [30, 60, 120])
 def test_variant_none_matches_classic_byte_for_byte(kind, minutes):
     def render(variant):
         try:

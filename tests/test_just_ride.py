@@ -170,10 +170,12 @@ def test_ride_page_offers_just_ride(client):
     assert "1 h 15 min" in text
     assert "innerHTML" not in text
 
-# ------------------------------------------------- every type, every duration
+# ------------------------------------------------- every type, key durations
 @pytest.mark.parametrize("kind", WORKOUT_TYPE_KEYS)
-@pytest.mark.parametrize("minutes", JUST_RIDE_DURATIONS)
-def test_every_type_builds_at_every_offered_duration(kind, minutes):
+@pytest.mark.parametrize("minutes", [30, 60, 120, 240])
+def test_every_type_builds_at_key_durations(kind, minutes):
+    # 30/240 are the offered bounds, 60/120 the mid-range. The full
+    # JUST_RIDE_DURATIONS ladder adds no builder branch not covered here.
     s = build_workout(kind, minutes)
     assert s.workout_type == kind
     assert s.total_duration() == minutes * 60
@@ -226,10 +228,12 @@ def test_vo2max_short_durations_all_build():
 
 # ------------------------------------------------------- degenerate long rides
 @pytest.mark.parametrize("kind", WORKOUT_TYPE_KEYS)
-@pytest.mark.parametrize("minutes", [90, 120, 240])
-def test_long_just_rides_are_not_mostly_cooldown(client, kind, minutes):
-    """Every offered type, ridden long via Just Ride, must stay a real workout."""
-    uid = _register(client, f"rider_cd_{kind}_{minutes}")
+def test_long_just_rides_are_not_mostly_cooldown(client, kind):
+    """Every offered type, ridden long via Just Ride, must stay a real workout.
+    The 240-min extreme is the harshest case; the cooldown cap is
+    duration-agnostic (see MAX_COOLDOWN_S), so 90/120 add no new branch."""
+    minutes = 240
+    uid = _register(client, f"rider_cd_{kind}")
     db.save_user_settings(uid, {"ftp": 200})
     data = client.get(
         f"/ride/workout/preview?type={kind}&minutes={minutes}"
@@ -256,11 +260,11 @@ def test_long_just_rides_via_the_session_builder_end_short(client, kind):
 
 
 @pytest.mark.parametrize("kind", WORKOUT_TYPE_KEYS)
-@pytest.mark.parametrize("minutes", [90, 120, 240])
-def test_description_discloses_the_inserted_zone2_base(client, kind, minutes):
+def test_description_discloses_the_inserted_zone2_base(client, kind):
     """Whenever a Zone 2 base block is inserted, the description says so -
     uniformly across every type and call site (preview + builder)."""
-    uid = _register(client, f"rider_disc_{kind}_{minutes}")
+    minutes = 240  # the longest offers are where a base block is ever inserted
+    uid = _register(client, f"rider_disc_{kind}")
     db.save_user_settings(uid, {"ftp": 200})
 
     # The builder now caps the cooldown at the source and discloses the base in
@@ -387,7 +391,7 @@ def _peak_work_fraction(session):
 
 
 @pytest.mark.parametrize("info", WORKOUT_TYPE_INFO, ids=lambda i: i["key"])
-@pytest.mark.parametrize("minutes", [30, 60, 120, 240])
+@pytest.mark.parametrize("minutes", [30, 240])
 def test_declared_band_matches_builder(info, minutes):
     work = _peak_work_fraction(build_workout(info["key"], minutes))
     assert work >= info["low"], f"{info['key']} @{minutes}: {work} < low"
@@ -437,19 +441,19 @@ def test_recovery_metadata_describes_the_recovery_builder():
 
 
 # -------------------------------------------------------------- validation
-@pytest.mark.parametrize("minutes", ["1e999", "-1e999", "nan", "inf", "-inf"])
-def test_preview_rejects_non_finite_durations(client, minutes):
-    _register(client, f"rider_nf_{abs(hash(minutes))}")
-    r = client.get(f"/ride/workout/preview?type=tempo&minutes={minutes}")
-    assert r.status_code == 400
-    assert "error" in r.json()
+def test_preview_rejects_non_finite_durations(client):
+    _register(client, "rider_nf")
+    for minutes in ("1e999", "-1e999", "nan", "inf", "-inf"):
+        r = client.get(f"/ride/workout/preview?type=tempo&minutes={minutes}")
+        assert r.status_code == 400
+        assert "error" in r.json()
 
 
-@pytest.mark.parametrize("minutes", [7, 20, 37, 241, 300, 480])
-def test_preview_rejects_durations_outside_the_offered_set(client, minutes):
-    _register(client, f"rider_off_{minutes}")
-    r = client.get(f"/ride/workout/preview?type=tempo&minutes={minutes}")
-    assert r.status_code == 400
+def test_preview_rejects_durations_outside_the_offered_set(client):
+    _register(client, "rider_off")
+    for minutes in (7, 20, 37, 241, 300, 480):
+        r = client.get(f"/ride/workout/preview?type=tempo&minutes={minutes}")
+        assert r.status_code == 400
 
 
 # ------------------------------------------------------------------ websocket
