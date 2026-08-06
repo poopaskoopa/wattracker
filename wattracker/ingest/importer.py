@@ -16,6 +16,7 @@ import numpy as np
 
 from .. import db
 from ..ftp_provenance import is_asserted_source
+from ..ftp_rescore import rescore_imported_activities
 from ..metrics.power import (
     FTP_ASSERTION_MAX_WATTS,
     FTP_ASSERTION_MIN_WATTS,
@@ -661,6 +662,7 @@ def scan_activities(
                 "directory": directory}
 
     ftp = current_ftp(user_id)
+    imported_activity_ids: List[int] = []
 
     files: List[str] = []
     for pat in ("*.fit", "*.FIT"):
@@ -708,6 +710,7 @@ def scan_activities(
             skipped += 1
         else:
             imported += 1
+            imported_activity_ids.append(new_id)
         _report(processed=found, imported=imported, skipped=skipped)
         # FIT parsing is pure-Python CPU-bound and holds the GIL; yield briefly
         # after each actually-parsed file so request threads (dashboard reads)
@@ -720,6 +723,7 @@ def scan_activities(
     completed = 0
     if imported > 0:
         evaluate_ftp(user_id)
+        rescore_imported_activities(user_id, imported_activity_ids)
         completed = match_plan_completions(user_id)
         # New rides move the rider's measured capacities (a new 5s or 5min
         # peak, a new FTP), and every prescription is built on the STORED
