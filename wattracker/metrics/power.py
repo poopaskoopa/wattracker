@@ -140,6 +140,44 @@ def normalized_power(power: Sequence[float], window: int = 30) -> float:
     return float(np.power(np.mean(np.power(roll, 4)), 0.25))
 
 
+# --- plausibility floor for any FTP used as a scoring basis -------------------
+# TSS is quadratic in 1/FTP, so an FTP that is wrong by a factor of 300 makes a
+# ride's TSS wrong by a factor of ~90,000. A failed estimate therefore does not
+# degrade a ride's score, it destroys it (and every load metric derived from it
+# - see issue #60, where a decayed estimate of 0.64 W produced a TSS of
+# 16,136,334).
+#
+# The floor is set at the lowest wattage a human being could plausibly hold for
+# an hour, not at the lowest FTP this app expects to see - it exists only to
+# separate "an unusually weak rider" from "the estimator returned garbage", and
+# a false reject is much more costly than a slightly permissive floor.
+# Reference points: clinical cardiac-rehab ergometry protocols start at 20-25 W
+# and progress in 25 W steps, so a rider mid-rehab can genuinely sit near 50 W;
+# a deconditioned adult beginning indoor cycling is typically 100-150 W; a
+# child on a trainer is 50-80 W. 50 W is at or below the bottom of every one of
+# those populations, while the failure mode it guards against produced values of
+# 0.6-41.5 W. Anything under 50 W is not a measurement of a rider, so it is
+# never accepted as the basis for scoring or written to FTP history.
+FTP_PLAUSIBLE_MIN_WATTS = 50.0
+
+
+def is_plausible_ftp(watts) -> bool:
+    """Whether ``watts`` can be a real rider's FTP (see FTP_PLAUSIBLE_MIN_WATTS).
+
+    False for None, non-numeric, non-finite and anything below the floor, so
+    callers can use it as the single admission test for a scoring basis.
+    """
+    if watts is None or isinstance(watts, bool):
+        return False
+    try:
+        value = float(watts)
+    except (TypeError, ValueError):
+        return False
+    if not math.isfinite(value):
+        return False
+    return value >= FTP_PLAUSIBLE_MIN_WATTS
+
+
 def intensity_factor(np_value: float, ftp: float) -> float:
     """IF = NP / FTP."""
     if ftp <= 0:
