@@ -306,9 +306,16 @@ def build_ble_handlers(
                 if conn is None:
                     return
                 power_source = conn.get("power_source")
+                cadence_source = conn.get("cadence_source")
                 hr_source = conn.get("hr_source")
                 power = power_source.latest_power() if power_source else None
                 cadence = power_source.latest_cadence() if power_source else None
+                # Same precedence as RideController.poll: a power meter's own
+                # cadence wins, and a standalone cadence sensor fills the gap.
+                # Without this the server sees no cadence at all, because up
+                # here the frame is the only thing it ever gets to look at.
+                if cadence is None and cadence_source is not None:
+                    cadence = cadence_source.latest_cadence()
                 hr = hr_source.latest_hr() if hr_source else None
                 # Recorded before it is sent, deliberately: if the send is what
                 # fails, the sample is already safe on disk.

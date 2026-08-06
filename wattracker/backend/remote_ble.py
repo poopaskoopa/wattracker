@@ -105,6 +105,25 @@ class RemotePowerSource:
         return self._sink.latest_cadence()
 
 
+class RemoteCadenceSource:
+    """Cadence as seen through the connector, with no implied power.
+
+    Mirrors ``devices.BleakCadenceSource``, including its ``latest_power``
+    returning None: server.py aliases a cadence-only connection into
+    ``power_source`` for legacy consumers, and that alias must not report the
+    frame's watts as if this sensor had measured them.
+    """
+
+    def __init__(self, sink: RemoteSampleSink) -> None:
+        self._sink = sink
+
+    def latest_power(self) -> Optional[int]:
+        return None
+
+    def latest_cadence(self) -> Optional[float]:
+        return self._sink.latest_cadence()
+
+
 class RemoteHeartRateSource:
     def __init__(self, sink: RemoteSampleSink) -> None:
         self._sink = sink
@@ -271,12 +290,48 @@ def _names_from_devices(devices: List[dict]) -> Dict[str, Any]:
         names["power"] = powers[0]
     elif powers:
         names["power"] = powers
-    for role in ("hr", "trainer"):
+    for role in ("hr", "trainer", "cadence"):
         for d in devices:
             if role in d.get("roles", []):
                 names[role] = d["name"]
                 break
     return names
+
+
+def _sources_from_devices(devices: List[dict], sink: RemoteSampleSink, resolve):
+    """Bind the connector's device rows to role sources.
+
+    One implementation for both the initial connect and the rebind after a
+    per-device disconnect, because the roles have to come out identical either
+    way - a rider who drops their power meter mid-ride must land in the same
+    state as one who never selected it.
+
+    The cadence-only alias is ``devices.connect_sensors``' rule, reproduced
+    exactly: with no power meter, the cadence sensor also stands in as
+    ``power_source`` so legacy consumers keep working. It is aliased as the
+    *same object*, which is what lets ``server._connection_has_power`` tell the
+    stand-in from a real power measurement by identity.
+    """
+    trainer_device = next((d for d in devices if "trainer" in d["roles"]), None)
+    trainer = (
+        RemoteTrainer(resolve, trainer_device["address"])
+        if trainer_device else None
+    )
+    power_source = (
+        RemotePowerSource(sink)
+        if any("power" in d["roles"] for d in devices) else None
+    )
+    cadence_source = (
+        RemoteCadenceSource(sink)
+        if any("cadence" in d["roles"] for d in devices) else None
+    )
+    hr_source = (
+        RemoteHeartRateSource(sink)
+        if any("hr" in d["roles"] for d in devices) else None
+    )
+    if power_source is None and cadence_source is not None:
+        power_source = cadence_source
+    return trainer, power_source, cadence_source, hr_source
 
 
 async def connect_sensors(
@@ -311,21 +366,17 @@ async def connect_sensors(
         d["roles"] = [str(r) for r in (d.get("roles") or [])]
 
     sink = RemoteSampleSink()
-    has_power = any("power" in d["roles"] for d in devices)
-    has_hr = any("hr" in d["roles"] for d in devices)
-    trainer_device = next(
-        (d for d in devices if "trainer" in d["roles"]), None
+    trainer, power_source, cadence_source, hr_source = _sources_from_devices(
+        devices, sink, resolve
     )
 
     conn = RemoteConnection(
         resolve,
         sink,
-        trainer=(
-            RemoteTrainer(resolve, trainer_device["address"])
-            if trainer_device else None
-        ),
-        power_source=RemotePowerSource(sink) if has_power else None,
-        hr_source=RemoteHeartRateSource(sink) if has_hr else None,
+        trainer=trainer,
+        power_source=power_source,
+        cadence_source=cadence_source,
+        hr_source=hr_source,
         # No BLE clients on this side; the connector owns the radio and closes
         # everything itself when the ride's socket goes away.
         clients=[],
@@ -395,16 +446,13 @@ async def disconnect_sensor(conn: RemoteConnection, address: str) -> RemoteConne
         d["name"] = str(d.get("name") or d["address"])
         d["roles"] = [str(r) for r in (d.get("roles") or [])]
 
-    has_power = any("power" in d["roles"] for d in devices)
-    has_hr = any("hr" in d["roles"] for d in devices)
-    trainer_device = next((d for d in devices if "trainer" in d["roles"]), None)
-
-    conn["power_source"] = RemotePowerSource(conn.sink) if has_power else None
-    conn["hr_source"] = RemoteHeartRateSource(conn.sink) if has_hr else None
-    conn["trainer"] = (
-        RemoteTrainer(conn.resolve_session, trainer_device["address"])
-        if trainer_device else None
+    trainer, power_source, cadence_source, hr_source = _sources_from_devices(
+        devices, conn.sink, conn.resolve_session
     )
+    conn["trainer"] = trainer
+    conn["power_source"] = power_source
+    conn["cadence_source"] = cadence_source
+    conn["hr_source"] = hr_source
     conn["clients_by_address"] = {d["address"]: None for d in devices}
     conn["bindings"] = {
         d["address"]: {"name": d["name"], "roles": d["roles"]} for d in devices
