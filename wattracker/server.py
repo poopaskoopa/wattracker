@@ -36,6 +36,7 @@ from . import (
     backup,
     calendarfeed,
     config,
+    connectorauth,
     credstore,
     db,
     exporter,
@@ -2917,7 +2918,10 @@ def create_app() -> FastAPI:
                       calendar_feed_url: Optional[str] = None,
                       ftp_message: Optional[str] = None,
                       ftp_confirm_required: bool = False,
-                      ftp_form_value: Optional[str] = None) -> dict:
+                      ftp_form_value: Optional[str] = None,
+                      connector_message: Optional[str] = None,
+                      connector_new_token: Optional[str] = None,
+                      connector_new_label: Optional[str] = None) -> dict:
         settings = db.get_user_settings(uid)
         return _ctx(
             request,
@@ -2952,6 +2956,13 @@ def create_app() -> FastAPI:
             saved=saved,
             zwift_candidates=get_backend(uid).zwift_id_candidates(),
             watch_default=get_backend(uid).default_activities_dir(),
+            # Same contract as the calendar token: the list never contains a
+            # secret, and connector_new_token is only ever passed in by the
+            # route that just minted it - never read back out of the database.
+            connector_devices=connectorauth.list_devices(uid),
+            connector_message=connector_message,
+            connector_new_token=connector_new_token,
+            connector_new_label=connector_new_label,
             zwift_creds_saved=credstore.credentials_saved(uid),
             zwift_cred_backend=credstore.storage_backend(),
             cred_message=cred_message,
@@ -3142,6 +3153,63 @@ def create_app() -> FastAPI:
         # This page body contains the plaintext token exactly once.
         response.headers["Cache-Control"] = "private, no-store"
         return response
+
+    @app.post("/settings/connector", response_class=HTMLResponse)
+    def settings_connector_pair(request: Request, label: str = Form("")):
+        """Pair a new connector machine and show its token exactly once.
+
+        Same shape as the calendar-feed action: session-authenticated,
+        same-origin checked, and the plaintext is rendered into this one
+        response and then discarded - only the hash is stored, so this is the
+        only moment it can be copied.
+        """
+        if not _same_origin_or_absent(request):
+            return PlainTextResponse("Origin not allowed", status_code=403)
+        uid = _uid(request)
+        clean = connectorauth.clean_label(label)
+        minted = connectorauth.generate_token(uid, clean)
+        if minted is None:
+            return templates.TemplateResponse(
+                request, "settings.html",
+                _settings_ctx(request, uid, False,
+                              connector_message="Could not pair the device."),
+                status_code=500,
+            )
+        _device_id, token = minted
+        response = templates.TemplateResponse(
+            request, "settings.html",
+            _settings_ctx(
+                request, uid, False,
+                connector_message=(
+                    "Device paired. Copy the token now - it is not shown again."
+                ),
+                connector_new_token=token,
+                connector_new_label=clean,
+            ),
+        )
+        # This page body contains the plaintext token exactly once.
+        response.headers["Cache-Control"] = "private, no-store"
+        return response
+
+    @app.post("/settings/connector/{device_id}/revoke", response_class=HTMLResponse)
+    def settings_connector_revoke(request: Request, device_id: int):
+        if not _same_origin_or_absent(request):
+            return PlainTextResponse("Origin not allowed", status_code=403)
+        uid = _uid(request)
+        # Scoped by uid inside the delete, so a guessed id cannot unpair
+        # someone else's machine. A miss is reported the same as a hit would
+        # be if it were someone else's - there is nothing to learn either way.
+        revoked = connectorauth.revoke(uid, device_id)
+        return templates.TemplateResponse(
+            request, "settings.html",
+            _settings_ctx(
+                request, uid, False,
+                connector_message=(
+                    "Device revoked. Its token no longer works."
+                    if revoked else "No such device."
+                ),
+            ),
+        )
 
     @app.post("/settings/backup", response_class=HTMLResponse)
     def settings_backup_now(request: Request):
