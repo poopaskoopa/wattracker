@@ -3,7 +3,6 @@ from __future__ import annotations
 
 import bisect
 import datetime as _dt
-import glob
 import hashlib
 import logging
 import os
@@ -15,6 +14,7 @@ from typing import Callable, Dict, List, Optional
 import numpy as np
 
 from .. import db
+from ..backend import get_backend
 from ..config import db_path
 from ..ftp_provenance import is_asserted_source
 from ..ftp_rescore import rescore_imported_activities
@@ -31,7 +31,6 @@ from ..metrics.power import (
     training_stress_score,
 )
 from ..metrics import profile_store
-from ..paths import activities_dir, confined_stored_dir
 from ..prescribe.plan import HARD_STEADY_POWER
 from ..timeutil import parse_naive, utc_now, utc_today
 from .fit_parser import parse_fit
@@ -442,8 +441,20 @@ def _build_record(parsed: Dict, filename: str, ftp: float) -> Dict:
     }
 
 
-def ingest_file(user_id: int, path: str, ftp: Optional[float] = None) -> Optional[int]:
-    """Parse and store a single .fit file for a user. Returns id or None if dup."""
+def ingest_file(
+    user_id: int,
+    path: str,
+    ftp: Optional[float] = None,
+    filename: Optional[str] = None,
+) -> Optional[int]:
+    """Parse and store a single .fit file for a user. Returns id or None if dup.
+
+    ``filename`` overrides the name recorded on the activity row. It matters
+    whenever ``path`` is a temporary copy rather than the file the rider knows
+    - an upload, or a .fit fetched from a connector - because that column is
+    what tells an imported ride from an in-app one (``is_in_app_activity`` /
+    ``db.IN_APP_FILENAME_SQL``), and cross-source duplicate linking reads it.
+    """
     db.init_db()
     parsed = parse_fit(path)
     h = dedup_hash(parsed["start_time"], parsed["duration_s"])
@@ -461,7 +472,7 @@ def ingest_file(user_id: int, path: str, ftp: Optional[float] = None) -> Optiona
         ftp = current_ftp(
             user_id, extra_power=[parsed["streams"].get("power") or []]
         )
-    record = _build_record(parsed, os.path.basename(path), ftp)
+    record = _build_record(parsed, filename or os.path.basename(path), ftp)
     new_id = db.insert_activity(user_id, record)
     if new_id is not None:
         # The rider may have recorded this same ride in-app at the same time.
@@ -617,20 +628,11 @@ def backfill_duplicate_links(user_id: int) -> int:
     return linked
 
 
-def _user_activities_dir(user_id: int) -> Optional[str]:
-    """The folder this user's scans read from (stored override, else discovery).
-
-    The stored value is re-confined on every read, not trusted because it is in
-    the database: POST /activities/rescan persisted whatever was posted until
-    the confinement landed, and a row can also arrive from a restored backup.
-    A stored value that escapes the trusted roots means NOTHING is scanned for
-    this user (None, logged) - deliberately not "fall back to OS discovery",
-    which would quietly import from a folder the user never configured.
-    """
-    stored = db.get_user_settings(user_id).get("activities_dir")
-    if stored:
-        return confined_stored_dir(stored, "activities_dir")
-    return activities_dir(override=None)
+def _user_activities_dir(user_id: int, backend=None) -> Optional[str]:
+    override = db.get_user_settings(user_id).get("activities_dir")
+    if override:
+        return override
+    return (backend or get_backend(user_id)).default_activities_dir()
 
 
 def scan_activities(
@@ -646,20 +648,29 @@ def scan_activities(
     parsed again (changed mtime/size re-processes and refreshes the row).
 
     ``progress`` (optional) is called with incremental field updates so a caller
-    can surface live status: once with ``{"total": N}`` after globbing, then
+    can surface live status: once with ``{"total": N}`` after listing, then
     after each file with ``processed``/``imported``/``skipped`` counts.
+
+    The files themselves come from the backend, so in a server/client install
+    this scans the *connector's* Zwift folder. The ``scanned_files`` cache is
+    keyed by the path as that machine sees it, which is what keeps an
+    incremental rescan cheap across the network - an unchanged file is never
+    transferred, let alone parsed.
     """
     db.init_db()
-    directory = directory or _user_activities_dir(user_id)
-    found = 0
+    backend = get_backend(user_id)
+    directory = directory or _user_activities_dir(user_id, backend)
     imported = 0
-    skipped = 0
 
     def _report(**fields):
         if progress:
             progress(fields)
 
-    if not directory or not os.path.isdir(directory):
+    listing = backend.list_activities(directory)
+    # The backend resolves the folder in remote mode, so believe it over the
+    # value we asked for.
+    directory = listing.directory
+    if not listing.exists:
         _report(total=0, processed=0, imported=0, skipped=0)
         return {"found": 0, "imported": 0, "skipped": 0, "completed": 0,
                 "directory": directory}
@@ -667,48 +678,38 @@ def scan_activities(
     ftp = current_ftp(user_id)
     imported_activity_ids: List[int] = []
 
-    files: List[str] = []
-    for pat in ("*.fit", "*.FIT"):
-        files.extend(glob.glob(os.path.join(directory, pat)))
-    ordered = sorted(set(files))
-    _report(total=len(ordered), processed=0, imported=0, skipped=0)
+    # Files the backend declined to offer (Zwift's in-progress buffer, or one
+    # that vanished mid-listing) still count as found-and-skipped.
+    found = listing.skipped
+    skipped = listing.skipped
+    _report(total=len(listing.files) + listing.skipped, processed=found,
+            imported=0, skipped=skipped)
 
     seen = db.seen_files(user_id)
-    for path in ordered:
+    for entry in listing.files:
         found += 1
-        # Zwift keeps `inProgressActivity.fit` as a live recording buffer while
-        # a ride is being recorded; it's never a finished ride (and its start
-        # second collides with the eventual final .fit). Skip it before the
-        # scanned_files cache check so it's never cached or reparsed.
-        if os.path.basename(path).lower() == "inprogressactivity.fit":
-            skipped += 1
-            _report(processed=found, imported=imported, skipped=skipped)
-            continue
-        try:
-            st = os.stat(path)
-            mtime, size = st.st_mtime, st.st_size
-        except OSError:
-            skipped += 1
-            _report(processed=found, imported=imported, skipped=skipped)
-            continue
-
-        prev = seen.get(path)
-        if prev is not None and prev[0] == mtime and prev[1] == size:
-            # Already scanned, unchanged - skip without parsing.
+        prev = seen.get(entry.path)
+        if prev is not None and prev[0] == entry.mtime and prev[1] == entry.size:
+            # Already scanned, unchanged - skip without parsing (or, in remote
+            # mode, without even transferring it).
             skipped += 1
             _report(processed=found, imported=imported, skipped=skipped)
             continue
 
         try:
-            new_id = ingest_file(user_id, path, ftp=ftp)
+            with backend.readable_activity(entry.path) as local_path:
+                new_id = ingest_file(
+                    user_id, local_path, ftp=ftp, filename=entry.name
+                )
         except Exception:
             skipped += 1
             _report(processed=found, imported=imported, skipped=skipped)
             continue
 
         # Record whether it was a new import or a duplicate, so subsequent
-        # rescans skip it without parsing.
-        db.record_scanned_file(user_id, path, mtime, size)
+        # rescans skip it without parsing. Keyed by the path as the owning
+        # machine sees it.
+        db.record_scanned_file(user_id, entry.path, entry.mtime, entry.size)
         if new_id is None:
             skipped += 1
         else:
@@ -766,7 +767,13 @@ def ingest_upload(
         tmp.write(content)
         tmp.flush()
         tmp.close()
-        result = ingest_file(user_id, tmp.name, ftp=ftp)
+        # Record the name the rider uploaded, not the temp file's - see
+        # ingest_file's ``filename`` argument.
+        result = ingest_file(
+            user_id, tmp.name,
+            ftp=ftp,
+            filename=os.path.basename(filename or "upload.fit"),
+        )
         if refresh:
             evaluate_ftp(user_id)
             match_plan_completions(user_id)
