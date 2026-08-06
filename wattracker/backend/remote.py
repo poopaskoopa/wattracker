@@ -89,10 +89,15 @@ class RemoteBackend(Backend):
         ) or {}
         return result.get("directory"), str(result.get("reason") or "missing")
 
-    def validate_dir(self, value: str) -> Tuple[Optional[str], Optional[str]]:
+    def validate_dir(
+        self, value: str, require_exists: bool = True
+    ) -> Tuple[Optional[str], Optional[str]]:
         # Runs on the connector: these are its folders, and measuring them
         # against the server's trusted roots would reject every valid answer.
-        result = self._call("paths.validate_dir", {"value": value}) or {}
+        result = self._call(
+            "paths.validate_dir",
+            {"value": value, "require_exists": require_exists},
+        ) or {}
         return result.get("clean"), result.get("error")
 
     # ---------------------------------------------- activity files
@@ -163,6 +168,22 @@ class RemoteBackend(Backend):
     # ----------------------------------------------- workout files
 
     def apply_exports(self, manifest: ExportManifest) -> dict:
+        """Apply the manifest, or report 'offline' rather than raising.
+
+        The only method here that swallows ConnectorUnavailable, because its
+        return contract already means "here is what happened, and why if it
+        didn't" - the same shape 'choose' and 'missing' travel in. Every other
+        method raises, because a scan that silently reports zero files would be
+        indistinguishable from a Zwift folder that really is empty.
+        """
+        try:
+            return self._apply_exports(manifest)
+        except ConnectorUnavailable:
+            log.info("export skipped: no connector attached for user %s", self.user_id)
+            return {"status": "offline", "directory": None, "exported": 0,
+                    "removed": 0, "reason": "offline", "paths": []}
+
+    def _apply_exports(self, manifest: ExportManifest) -> dict:
         result = self._call(
             "workouts.sync",
             {

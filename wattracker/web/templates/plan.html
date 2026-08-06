@@ -37,6 +37,11 @@
     <p class="alert">Not exported to Zwift: writing the .zwo files failed.
        Check that the folder exists and is writable, {{ next_step }}
        {% if detail %}<span class="hint">{{ detail }}</span>{% endif %}</p>
+    {% elif reason == 'offline' %}
+    <p class="alert">Not exported: the connector on your Zwift machine is not
+       running, so this server cannot reach the Workouts folder. Start it and
+       press &ldquo;Export plan to Zwift&rdquo;, or use &ldquo;Download
+       .zip&rdquo; in the meantime.</p>
     {% endif %}
 {% endmacro %}
 <h2>Plan</h2>
@@ -325,7 +330,7 @@
            Custom Workouts in Zwift.</p>
         {% else %}
         {{ export_alert(plan.auto_export_reason, plan.auto_export_detail,
-                        next_step='then press “Export plan to Zwift” below.') }}
+                        next_step='then press "Export plan to Zwift" below.') }}
         {% endif %}
         <p><strong>{{ plan.weeks }}</strong> weeks &middot;
            starts <strong>{{ plan.start_date }}</strong> &middot;

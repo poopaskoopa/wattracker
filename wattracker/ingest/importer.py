@@ -673,7 +673,7 @@ def scan_activities(
     if not listing.exists:
         _report(total=0, processed=0, imported=0, skipped=0)
         return {"found": 0, "imported": 0, "skipped": 0, "completed": 0,
-                "directory": directory}
+                "directory": directory, "exists": False}
 
     ftp = current_ftp(user_id)
     imported_activity_ids: List[int] = []
@@ -745,6 +745,10 @@ def scan_activities(
         "skipped": skipped,
         "completed": completed,
         "directory": directory,
+        # Reported by whoever owns the folder. The server cannot answer this
+        # itself in a server/client install - the path is on another machine,
+        # so an os.path.isdir here would say "no" to every valid folder.
+        "exists": True,
     }
 
 

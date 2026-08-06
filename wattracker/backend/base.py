@@ -130,13 +130,22 @@ class Backend(abc.ABC):
         ``override|zwift_id|detected|choose|missing``."""
 
     @abc.abstractmethod
-    def validate_dir(self, value: str) -> Tuple[Optional[str], Optional[str]]:
+    def validate_dir(
+        self, value: str, require_exists: bool = True
+    ) -> Tuple[Optional[str], Optional[str]]:
         """Validate a user-submitted folder path against the trusted roots.
 
         Returns ``(clean_path, error)``. An empty submission means "unchanged"
         and yields ``("", None)``. This must run on the machine that owns the
         path - validating a client path against the server's roots would be
         meaningless.
+
+        Two separable checks. Containment under a trusted root is the security
+        control and always applies. Existence is a usability check, and the
+        rescan route turns it off (``require_exists=False``) because pointing
+        a scan at a folder that is not there is a normal thing to do by
+        mistake, and it answers that with a "no such folder" status rather
+        than an error.
         """
 
     # ----------------------------------------------- activity files
