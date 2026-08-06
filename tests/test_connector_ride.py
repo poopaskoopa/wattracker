@@ -302,3 +302,193 @@ def test_teardown_falls_back_when_a_trainer_offers_less():
 
 def test_teardown_survives_a_trainer_with_nothing_to_offer():
     assert _teardown_with(_RecordingTrainer(offers=())) == []
+
+
+# ----------------------------------------------------------- the cadence role
+# A standalone cadence sensor is a role the local radio grew after this branch
+# was cut (devices.BleakCadenceSource). It has to arrive through the connector
+# too, or the same sensor works when the app owns the radio and silently does
+# nothing when a connector does - the exact divergence the remote module exists
+# to prevent.
+class _AnsweringSession:
+    """A connector that answers ble.connect/ble.disconnect with a device list."""
+
+    def __init__(self, devices, errors=None):
+        self.devices = devices
+        self.errors = errors or []
+        self.ble_sink = None
+        self.calls = []
+
+    async def call(self, method, params=None, *, timeout=None):
+        self.calls.append((method, params or {}))
+        return {"devices": self.devices, "errors": self.errors}
+
+
+def _connect(devices):
+    import asyncio
+
+    from wattracker.backend import remote_ble
+
+    session = _AnsweringSession(devices)
+    conn = asyncio.run(remote_ble.connect_sensors(session))
+    return session, conn
+
+
+_CADENCE_ONLY = [{"address": "CC", "name": "FakeCadence", "roles": ["cadence"]}]
+_POWER_AND_CADENCE = [
+    {"address": "AA", "name": "FakePedals", "roles": ["power"]},
+    {"address": "CC", "name": "FakeCadence", "roles": ["cadence"]},
+]
+
+
+def test_a_standalone_cadence_sensor_arrives_as_a_cadence_source():
+    _, conn = _connect(_CADENCE_ONLY)
+
+    assert conn["cadence_source"] is not None
+    assert conn["names"]["cadence"] == "FakeCadence"
+    conn.sink.update(power=None, cadence=91.0, hr=None)
+    assert conn["cadence_source"].latest_cadence() == 91.0
+
+
+def test_a_cadence_only_connection_is_not_mistaken_for_power():
+    """server._connection_has_power tells the stand-in apart by identity.
+
+    devices.connect_sensors aliases a lone cadence sensor into ``power_source``
+    for legacy consumers, so the server distinguishes the alias from a real
+    power meter by asking whether the two are the same object. Building a
+    second, equal-looking RemoteCadenceSource here would defeat that check and
+    start a ride on a rider who has no way to produce watts.
+    """
+    _, conn = _connect(_CADENCE_ONLY)
+
+    assert conn["power_source"] is conn["cadence_source"]
+    # And the alias must not report the frame's watts as its own measurement.
+    conn.sink.update(power=210, cadence=91.0, hr=None)
+    assert conn["power_source"].latest_power() is None
+
+
+def test_a_power_meter_keeps_its_cadence_role_separate():
+    _, conn = _connect(_POWER_AND_CADENCE)
+
+    assert conn["power_source"] is not conn["cadence_source"]
+    conn.sink.update(power=210, cadence=91.0, hr=None)
+    assert conn["power_source"].latest_power() == 210
+    assert conn["cadence_source"].latest_cadence() == 91.0
+
+
+def test_dropping_the_power_meter_mid_ride_leaves_the_cadence_alias():
+    """The rebind after a per-device disconnect must land in the same state.
+
+    A rider who drops their power meter mid-ride has to end up where one who
+    never selected it starts - otherwise the two paths disagree about what
+    ``power_source`` means.
+    """
+    import asyncio
+
+    from wattracker.backend import remote_ble
+
+    session, conn = _connect(_POWER_AND_CADENCE)
+    session.devices = _CADENCE_ONLY
+    asyncio.run(remote_ble.disconnect_sensor(conn, "AA"))
+
+    assert conn["power_source"] is conn["cadence_source"]
+    assert conn["cadence_source"] is not None
+    assert conn["names"]["cadence"] == "FakeCadence"
+
+
+class _CadencelessPedals:
+    """A power meter that measures watts but reports no cadence."""
+
+    def latest_power(self):
+        return 205
+
+    def latest_cadence(self):
+        return None
+
+
+class _CadenceSensor:
+    """A CSC sensor: cadence, and explicitly no power. Mirrors BleakCadenceSource."""
+
+    def __init__(self, cadence=93.0):
+        self.cadence = cadence
+
+    def latest_power(self):
+        return None
+
+    def latest_cadence(self):
+        return self.cadence
+
+
+class _SplitRolesRadio:
+    """A radio holding a cadence-less power meter and a separate cadence sensor."""
+
+    def __init__(self):
+        self.pedals = _CadencelessPedals()
+        self.cadence = _CadenceSensor()
+
+    def bluetooth_available(self):
+        return True, "ok"
+
+    async def scan(self, timeout=5.0, attempts=2):
+        return []
+
+    async def connect_sensors(self, timeout=6.0, selected=None):
+        return {
+            "trainer": None,
+            "power_source": self.pedals,
+            "cadence_source": self.cadence,
+            "hr_source": None,
+            "clients": [],
+            "clients_by_address": {},
+            "bindings": {
+                "AA": {"name": "FakePedals", "roles": {"power": None}},
+                "CC": {"name": "FakeCadence", "roles": {"cadence": None}},
+            },
+            "names": {"power": "FakePedals", "cadence": "FakeCadence"},
+            "errors": [],
+        }
+
+    async def disconnect_sensor(self, conn, address):
+        return conn
+
+
+def test_the_connector_samples_a_standalone_cadence_sensor(tmp_path, monkeypatch):
+    """The frame is the only thing the server ever gets to look at.
+
+    RideController.poll prefers a power meter's own cadence and falls back to a
+    standalone sensor. Up here that precedence has to be applied *before* the
+    frame is sent, because the server has no second source to fall back to -
+    without it the rider's cadence sensor reads as no cadence at all.
+    """
+    import asyncio
+
+    from wattracker_connector import ble_handlers as blemod
+    from wattracker_connector.ble_handlers import BleState, build_ble_handlers
+
+    radio = _SplitRolesRadio()
+    monkeypatch.setattr(blemod, "bledevices", radio)
+
+    async def _drive():
+        sent = []
+        state = BleState(buffer=RideBuffer(str(tmp_path / "ride-buffer.jsonl")))
+
+        async def _send_event(event, **fields):
+            sent.append((event, fields))
+
+        handlers = build_ble_handlers(state, _send_event)
+        await handlers["ble.connect"](timeout=0.0)
+        # The loop records and sends its first frame before it ever sleeps.
+        for _ in range(10):
+            await asyncio.sleep(0)
+            if sent:
+                break
+        await state.teardown()
+        return sent
+
+    sent = asyncio.run(_drive())
+
+    assert sent, "the connector sent no sample frame at all"
+    event, fields = sent[0]
+    assert event == "ble.sample"
+    assert fields["power"] == 205
+    assert fields["cadence"] == 93.0
