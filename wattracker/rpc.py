@@ -28,7 +28,13 @@ from typing import Any, Awaitable, Callable, Dict, Optional
 # Wire-format version. Bumped when a change is not backward compatible; the
 # server refuses a connector that does not match, because a silently
 # half-understood protocol is worse than a refused connection.
-PROTOCOL_VERSION = 1
+#
+# 2: a ride survives losing the socket. Adds ble.catchup, a force_rearm
+#    parameter on ble.set_erg, a discard_buffer parameter on ble.release, and
+#    an index on ble.sample. An older connector would answer "bad params" to
+#    the ERG call every second of a ride, so this is a refusal case rather
+#    than a degradation.
+PROTOCOL_VERSION = 2
 
 # Ceiling on a single frame. Activity files travel base64-encoded over this
 # socket, and MAX_UPLOAD_BYTES is 50 MiB, so the limit has to clear

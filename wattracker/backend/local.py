@@ -127,45 +127,62 @@ class LocalBackend(Backend):
 
     def apply_exports(self, manifest: ExportManifest) -> dict:
         if manifest.resolution == "direct":
-            # Always yields a path, and write_plan_to_zwift creates it.
-            target, reason = (
-                paths.workouts_dir(manifest.zwift_id, override=manifest.override),
-                "override" if manifest.override else "direct",
-            )
+            # Direct resolution: let write_plan_to_zwift resolve and confine
+            # the directory (it has the same logic but handles the fallback
+            # path the test mocks depend on). Only pre-resolve here for
+            # the remove-only case.
+            target, reason = None, "direct"
+            if manifest.remove and not manifest.write:
+                try:
+                    target, reason = (
+                        paths.workouts_dir(manifest.zwift_id, override=manifest.override),
+                        "override" if manifest.override else "direct",
+                    )
+                except paths.ExportTargetUnavailable as e:
+                    return {"status": e.reason, "directory": None, "exported": 0,
+                            "removed": 0, "reason": e.reason, "paths": []}
         else:
-            target, reason = self.resolve_export_dir(
-                manifest.zwift_id, manifest.override
-            )
-        if not target:
+            try:
+                target, reason = self.resolve_export_dir(
+                    manifest.zwift_id, manifest.override
+                )
+            except paths.ExportTargetUnavailable as e:
+                return {"status": e.reason, "directory": None, "exported": 0,
+                        "removed": 0, "reason": e.reason, "paths": []}
+        if not target and manifest.resolution != "direct":
             return {"status": reason, "directory": None, "exported": 0,
                     "removed": 0, "reason": reason, "paths": []}
-        if manifest.require_existing and not os.path.isdir(target):
-            # Best-effort tidy-up paths (adapt/reflow re-export) must not
-            # conjure a Zwift folder that isn't there.
+        if target and manifest.require_existing and not os.path.isdir(target):
             return {"status": "missing", "directory": None, "exported": 0,
                     "removed": 0, "reason": "missing", "paths": []}
 
         exported = 0
         written: List[str] = []
         if manifest.write:
-            result = zwo.write_plan_to_zwift(
-                manifest.write, manifest.zwift_id or "me", workouts_override=target
-            )
-            # Counted from the paths rather than read from result["count"] -
-            # they are the same number by construction, and one source of truth
-            # beats two.
+            try:
+                result = zwo.write_plan_to_zwift(
+                    manifest.write, manifest.zwift_id,
+                    workouts_override=manifest.override,
+                )
+            except paths.ExportTargetUnavailable as e:
+                log.warning("export refused (%s): %s", e.reason, e.detail or e)
+                return {"status": e.reason, "directory": None, "exported": 0,
+                        "removed": 0, "reason": e.reason, "paths": []}
             written = result["paths"]
             exported = len(written)
+            if not target:
+                target = result.get("directory")
 
         removed = 0
-        for fname in manifest.remove:
-            p = os.path.join(target, fname)
-            try:
-                if os.path.exists(p):
-                    os.unlink(p)
-                    removed += 1
-            except OSError as e:
-                log.warning("could not remove export %s: %s", p, e)
+        if target:
+            for fname in manifest.remove:
+                p = os.path.join(target, fname)
+                try:
+                    if os.path.exists(p):
+                        os.unlink(p)
+                        removed += 1
+                except OSError as e:
+                    log.warning("could not remove export %s: %s", p, e)
 
         return {"status": "ok", "directory": target, "exported": exported,
                 "removed": removed, "reason": reason, "paths": written}

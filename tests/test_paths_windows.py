@@ -35,6 +35,34 @@ def test_windows_missing_env_still_has_documents_candidate(monkeypatch):
     assert paths.candidate_activities_dirs() == [os.path.normpath(r"C:\Users\Üser/Documents/Zwift/Activities")]
 
 
+def test_windows_workouts_roots_include_localappdata(monkeypatch):
+    """A Zwift install rooted at %LOCALAPPDATA% must be discoverable.
+
+    Found on hardware 2026-08-06: candidate_activities_dirs()
+    checked LOCALAPPDATA and candidate_workouts_roots() did not, so the two
+    halves of the same integration disagreed about where Zwift lives. The
+    .zwo was written to Documents\\Zwift\\Workouts\\<player id> - correct
+    player folder, correct dated name - the export reported success, and the
+    running Zwift (whose whole data root was under LOCALAPPDATA) never listed
+    it. Nothing short of launching Zwift could see the difference.
+    """
+    _windows(monkeypatch)
+    monkeypatch.setattr(paths, "_windows_documents_known_folder", lambda: None)
+    for key in ("OneDriveConsumer", "OneDrive", "OneDriveCommercial"):
+        monkeypatch.delenv(key, raising=False)
+    monkeypatch.setenv("LOCALAPPDATA", r"C:\Users\Rider\AppData\Local")
+    monkeypatch.setenv("USERPROFILE", r"C:\Users\Rider")
+    monkeypatch.setattr(paths, "_home", lambda: r"C:\Users\Rider")
+    roots = paths.candidate_workouts_roots()
+    assert roots[0] == os.path.normpath(
+        r"C:\Users\Rider\AppData\Local/Zwift/Workouts"
+    )
+    # The classic Documents location must remain a candidate, not be replaced.
+    assert any("Documents" in root for root in roots)
+    keys = [ntpath.normcase(ntpath.normpath(root)) for root in roots]
+    assert len(keys) == len(set(keys))
+
+
 def test_unicode_unc_known_folder_is_preserved(monkeypatch):
     _windows(monkeypatch)
     monkeypatch.setattr(paths, "_windows_documents_known_folder", lambda: r"\\server\riders\Zoë Documents")

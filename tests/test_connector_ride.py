@@ -84,7 +84,7 @@ def test_the_proxy_trainer_declares_erg_explicitly():
     """
     from wattracker.backend.remote_ble import RemoteTrainer
 
-    trainer = RemoteTrainer(session=None)
+    trainer = RemoteTrainer(lambda: None)
     assert isinstance(type(trainer).erg_available, property)
     assert isinstance(type(trainer).erg_enabled, property)
     assert trainer.erg_enabled is False

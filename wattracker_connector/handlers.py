@@ -183,7 +183,7 @@ def build_handlers(config: ConnectorConfig) -> Dict[str, Callable]:
 
     # --------------------------------------------------- workout files
     async def workouts_sync(
-        zwift_id: str = "me",
+        zwift_id: Optional[str] = None,
         override: Optional[str] = None,
         write: Optional[List[dict]] = None,
         remove: Optional[List[str]] = None,
@@ -193,7 +193,11 @@ def build_handlers(config: ConnectorConfig) -> Dict[str, Callable]:
         """Make the Zwift custom-workout folder match the server's manifest."""
         effective_override = override or config.workouts_dir
         if resolution == "direct":
-            target = paths.workouts_dir(zwift_id, override=effective_override)
+            try:
+                target = paths.workouts_dir(zwift_id, override=effective_override)
+            except paths.ExportTargetUnavailable as exc:
+                return {"status": exc.reason, "directory": None, "exported": 0,
+                        "removed": 0, "reason": exc.reason, "paths": []}
             reason = "override" if effective_override else "direct"
         else:
             target, reason = paths.resolve_export_dir(zwift_id, effective_override)
@@ -206,9 +210,13 @@ def build_handlers(config: ConnectorConfig) -> Dict[str, Callable]:
 
         written: List[str] = []
         if write:
-            result = zwo.write_plan_to_zwift(
-                write, zwift_id or "me", workouts_override=target
-            )
+            try:
+                result = zwo.write_plan_to_zwift(
+                    write, zwift_id or "", workouts_override=effective_override
+                )
+            except paths.ExportTargetUnavailable as exc:
+                return {"status": exc.reason, "directory": None, "exported": 0,
+                        "removed": 0, "reason": exc.reason, "paths": []}
             written = result["paths"]
 
         removed = 0

@@ -52,6 +52,21 @@ class RideBuffer:
     def path(self) -> str:
         return self._path
 
+    @property
+    def count(self) -> int:
+        """How many samples this ride has recorded.
+
+        Doubles as the sample's index on the wire: sample ``n`` is the
+        ``n``-th one appended, and the server quotes the last index it saw
+        when asking for what it missed.
+        """
+        return self._count
+
+    @property
+    def recording(self) -> bool:
+        """True while a ride is being written into this buffer."""
+        return self._open
+
     def start(self, started_at: str, name: str, ftp: float,
               workout_id: Optional[int]) -> None:
         """Begin a ride, discarding any earlier one.
@@ -74,15 +89,24 @@ class RideBuffer:
                         exc_info=True)
             self._open = False
 
-    def append(self, power=None, cadence=None, hr=None) -> None:
+    def append(self, power=None, cadence=None, hr=None) -> Optional[int]:
+        """Record one sample. Returns its index, or None if it was not stored.
+
+        The index is what makes a reconnect exact rather than approximate: the
+        server remembers the last index it received and asks for everything
+        after it, so a drop costs no samples and replays none twice.
+        """
         if not self._open or self._count >= MAX_SAMPLES:
-            return
+            return None
         try:
             with open(self._path, "a", encoding="utf-8") as handle:
                 handle.write(json.dumps([power, cadence, hr]) + "\n")
-            self._count += 1
         except OSError:
             log.debug("could not append to the ride buffer", exc_info=True)
+            return None
+        index = self._count
+        self._count += 1
+        return index
 
     def finish(self) -> None:
         self._open = False
@@ -95,6 +119,53 @@ class RideBuffer:
         except OSError:
             pass
 
+    def samples_from(self, index: int) -> List[list]:
+        """The ``[power, cadence, hr]`` rows recorded at or after ``index``.
+
+        What the server replays into its RideController after a reconnect, so
+        the seconds ridden while the link was down land in the activity in
+        order rather than as a hole. Read back off disk rather than kept in
+        memory: the file is already the authoritative copy, and a second one
+        would only be a chance for the two to disagree.
+        """
+        rows = self._rows()
+        start = max(0, int(index))
+        return rows[start:]
+
+    def _header(self) -> Optional[Dict]:
+        """The ride's identity line, or None if there is no usable buffer."""
+        if not os.path.exists(self._path):
+            return None
+        try:
+            with open(self._path, "r", encoding="utf-8") as handle:
+                first = handle.readline()
+        except OSError:
+            return None
+        try:
+            header = json.loads(first)
+        except ValueError:
+            return None
+        if not isinstance(header, dict) or header.get("kind") != "start":
+            return None
+        return header
+
+    def _rows(self) -> List[list]:
+        """Every recorded sample, skipping the header and any torn line."""
+        try:
+            with open(self._path, "r", encoding="utf-8") as handle:
+                lines = handle.read().splitlines()
+        except OSError:
+            return []
+        out: List[list] = []
+        for line in lines[1:]:
+            try:
+                row = json.loads(line)
+            except ValueError:
+                continue  # torn last line
+            if isinstance(row, list) and len(row) == 3:
+                out.append(row)
+        return out
+
     def load(self) -> Optional[Dict]:
         """Read a buffered ride back, or None if there is nothing usable.
 
@@ -102,32 +173,14 @@ class RideBuffer:
         rather than failing the whole ride: one lost second beats one lost
         hour.
         """
-        if not os.path.exists(self._path):
-            return None
-        try:
-            with open(self._path, "r", encoding="utf-8") as handle:
-                lines = handle.read().splitlines()
-        except OSError:
-            return None
-        if not lines:
-            return None
-        try:
-            header = json.loads(lines[0])
-        except ValueError:
-            return None
-        if not isinstance(header, dict) or header.get("kind") != "start":
+        header = self._header()
+        if header is None:
             return None
 
         power: List = []
         cadence: List = []
         heartrate: List = []
-        for line in lines[1:]:
-            try:
-                row = json.loads(line)
-            except ValueError:
-                continue  # torn last line
-            if not isinstance(row, list) or len(row) != 3:
-                continue
+        for row in self._rows():
             power.append(row[0] or 0)
             cadence.append(row[1])
             heartrate.append(row[2])

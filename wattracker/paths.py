@@ -130,10 +130,26 @@ def activities_dir(override: Optional[str] = None) -> str:
 
 
 def candidate_workouts_roots() -> List[str]:
-    return _dedupe(
-        [os.path.join(root, "Zwift", "Workouts") for root in candidate_documents_dirs()],
-        windows=sys.platform.startswith("win"),
+    """Per-OS candidate Zwift Workouts roots, in priority order.
+
+    Mirrors candidate_activities_dirs(): a Windows Zwift install can keep its
+    whole data root under %LOCALAPPDATA%\\Zwift rather than Documents\\Zwift,
+    and the two halves of the integration have to agree about that. They did
+    not - activities discovery checked LOCALAPPDATA and this did not - so on
+    such an install the .zwo landed in Documents with the right player-ID
+    folder and the right name, the export reported success, and Zwift never
+    read it. Confirmed on hardware 2026-08-06.
+    """
+    candidates: List[str] = []
+    if sys.platform.startswith("win"):
+        local = os.environ.get("LOCALAPPDATA")
+        if local:
+            candidates.append(os.path.join(local, "Zwift", "Workouts"))
+    candidates.extend(
+        os.path.join(root, "Zwift", "Workouts")
+        for root in candidate_documents_dirs()
     )
+    return _dedupe(candidates, windows=sys.platform.startswith("win"))
 
 
 def trusted_storage_roots() -> List[str]:
