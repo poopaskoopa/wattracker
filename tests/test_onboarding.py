@@ -454,6 +454,53 @@ def test_onboarding_directory_validation_delegates_to_paths(
     assert completed.status_code == 200
 
 
+def _spy_discovery(monkeypatch):
+    """Count the setup-only discovery helpers the dashboard may call."""
+    calls = {"candidates": 0, "estimate": 0}
+
+    def candidates():
+        calls["candidates"] += 1
+        return []
+
+    def estimate(user_id, *_args, **_kwargs):
+        calls["estimate"] += 1
+        return 241.25
+
+    monkeypatch.setattr(paths, "annotated_candidates", candidates)
+    monkeypatch.setattr(importer, "recent_best_effort_ftp", estimate)
+    return calls
+
+
+def test_dashboard_skips_setup_discovery_once_onboarding_is_complete(
+    client, monkeypatch
+):
+    uid = _register(client)
+    db.complete_onboarding(uid)
+    calls = _spy_discovery(monkeypatch)
+
+    response = client.get("/")
+
+    assert response.status_code == 200
+    assert calls == {"candidates": 0, "estimate": 0}
+    assert "setup-wizard" not in response.text
+
+
+def test_dashboard_still_runs_setup_discovery_while_onboarding_is_incomplete(
+    client, monkeypatch
+):
+    uid = _register(client)
+    assert db.onboarding_complete(uid) is False
+    calls = _spy_discovery(monkeypatch)
+
+    response = client.get("/")
+
+    assert response.status_code == 200
+    assert calls == {"candidates": 1, "estimate": 1}
+    # The wizard still renders every value it derives from that work.
+    assert "setup-wizard" in response.text
+    assert "(241.2 W)" in response.text
+
+
 def test_register_and_root_dashboard_remain_compatible(client):
     response = client.post("/register", data={"username": "compatible", "password": "password123"})
     assert response.status_code == 200
