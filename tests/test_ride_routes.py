@@ -415,6 +415,15 @@ def test_ride_page_just_ride_controls_preview_and_telemetry_locking(client, monk
     assert 'aria-pressed="false" aria-controls="justRideMode"' in text
     assert 'type="radio"' not in text
     assert 'id="justRideMode" class="just-ride-layout"' in text
+    assert 'id="rideVariantPicker" class="ride-variant-picker"' in text
+    assert 'id="rideVariantGrid" class="ride-variant-grid"' in text
+    assert 'role="listbox"' in text
+    assert 'className = "ride-variant-card"' in text
+    assert "variant_profiles" in text
+    assert 'card.tabIndex = key === wanted ? 0 : -1;' in text
+    assert 'keyName === "ArrowRight"' in text
+    assert 'keyName === "Home"' in text
+    assert 'q.push("variant=" + encodeURIComponent(selectedVariant || "classic"));' in text
     assert 'id="ridePreview" class="ride-preview"' in text
     assert "workout_graph.js" in text
     assert "window.profileSvg(data.profile, data.duration_s, data.ftp)" in text
