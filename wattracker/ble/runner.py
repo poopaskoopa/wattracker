@@ -373,61 +373,21 @@ class RideController:
                 pass
 
     def _save(self) -> None:
-        # Imported lazily, like db/importer below: saving is the one thing this
-        # controller does that needs the database. Keeping these out of the
-        # module scope is what lets the connector run the same state machine
-        # without pulling in numpy/scipy/pandas.
-        from .. import db
+        # Imported lazily: saving is the one thing this controller does that
+        # needs the database. Keeping it out of module scope is what lets the
+        # connector run the same state machine without pulling in
+        # numpy/scipy/pandas (tests/test_connector_client.py enforces that).
         from ..ingest import importer
-        from ..metrics import profile_store
 
-        # started_at is naive UTC, like the timestamps parsed out of .fit files -
-        # the same ride recorded by both the app and Zwift has to land on the
-        # same instant, not four hours apart.
-        started = self.started_at or utc_now()
-        n = len(self._samples["power"])
-        times = [(started + _dt.timedelta(seconds=i)).isoformat() for i in range(n)]
-        streams = {
-            "time": times,
-            "power": self._samples["power"],
-            "cadence": self._samples["cadence"],
-            "heartrate": self._samples["heartrate"],
-            "distance": [],
-            "altitude": [],
-        }
-        parsed = {
-            "start_time": started.isoformat(),
-            "duration_s": int(self.elapsed),
-            "streams": streams,
-        }
-        # The app is UTC end to end, so the ride is named by its UTC date -
-        # a late-evening ride west of Greenwich reads as the next day.
-        name = f"Ride {started.date().isoformat()} {self.session.name}"
-        record = importer._build_record(parsed, name, self.ftp)
-        self.saved_record = record
-        self.activity_id = db.insert_activity(self.user_id, record)
-        if self.activity_id is not None and self.workout_id is not None:
-            importer.link_selected_plan_workout(
-                self.user_id, self.workout_id, self.activity_id
-            )
-        if self.activity_id is not None:
-            # Zwift may already have written the .fit for this same ride.
-            importer.link_duplicate_activity(self.user_id, self.activity_id)
-        try:
-            importer.maybe_update_ftp(self.user_id)
-        except Exception:
-            pass
-        if self.activity_id is not None:
-            # An in-app ride is a new ride like any other - it can set a new 5s
-            # or 5min peak and it moves FTP - but it is NOT a file import, so
-            # scan_activities' refresh never sees it. Without this a rider who
-            # only rides in the app prescribes against a snapshot that is stale
-            # until the next daily sweep, or forever with auto-scan disabled.
-            try:
-                profile_store.refresh(self.user_id)
-            except Exception:
-                _log.warning("rider profile refresh after in-app ride failed",
-                             exc_info=True)
+        self.activity_id, self.saved_record = importer.save_ride_record(
+            user_id=self.user_id,
+            started_at=self.started_at or utc_now(),
+            duration_s=int(self.elapsed),
+            samples=self._samples,
+            session_name=self.session.name,
+            ftp=self.ftp,
+            workout_id=self.workout_id,
+        )
 
     # ------------------------------------------------------------- state
     def state(self) -> dict:

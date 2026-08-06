@@ -54,6 +54,8 @@ from .backend import (
     get_backend,
     is_offline,
 )
+from .backend import mode as backend_mode
+from .backend import remote_ble
 from .ble import devices as bledevices
 from .ble.runner import RideController, flatten_session
 from .ingest import importer
@@ -354,7 +356,13 @@ class NoCacheStaticFiles(StaticFiles):
 # caller itself, from a per-user token, because a subscribing phone calendar
 # app has no cookie jar (see calendarfeed.py). It is an exact match, so the
 # session-protected "/calendar" page above it is untouched.
-_EXEMPT = ("/login", "/register", calendarfeed.FEED_PATH)
+# Paths that authenticate themselves rather than by session cookie. The
+# connector upload carries a bearer token and belongs to a process with no
+# browser, so a redirect to /login would be the wrong answer to a bad
+# credential - it checks its own and returns 401.
+_EXEMPT = (
+    "/login", "/register", calendarfeed.FEED_PATH, "/api/connector/ride",
+)
 _EXEMPT_PREFIXES = ("/static", "/favicon", "/apple-touch-icon")
 
 # One log line per this many rejected /calendar.ics tokens. Not a limit:
@@ -1686,6 +1694,104 @@ def create_app() -> FastAPI:
                 "rpe_eligible": verified,
             }
         return JSONResponse(detail)
+
+    # Rides recorded by a connector while the link was down. Bounded so a
+    # buggy or hostile client cannot make the server hold an arbitrary amount:
+    # a day of 1 Hz samples is 86400, and no ride is a day long.
+    MAX_BUFFERED_RIDE_SAMPLES = 86400
+
+    @app.post("/api/connector/ride")
+    async def connector_ride_upload(request: Request):
+        """Accept a ride a connector buffered while it could not reach us.
+
+        Bearer-token authenticated like /connector/ws, not session
+        authenticated: this is the connector talking, and it has no cookie. It
+        goes through importer.save_ride_record, the same chain an in-process
+        ride uses, so a ride that happened to span a reconnect lands as exactly
+        the same row as one that did not - including the duplicate-linking that
+        pairs it with Zwift's own .fit for the same ride.
+        """
+        header = request.headers.get("authorization") or ""
+        scheme, _, token = header.partition(" ")
+        device = None
+        if scheme.lower() == "bearer" and token:
+            device = connectorauth.device_for_token(token.strip())
+        if device is None:
+            app.state.connector_failures.record_failure()
+            return JSONResponse({"error": "unauthorized"}, status_code=401)
+
+        try:
+            body = await request.json()
+        except Exception:
+            return JSONResponse({"error": "body must be JSON"}, status_code=400)
+        if not isinstance(body, dict):
+            return JSONResponse({"error": "body must be an object"}, status_code=400)
+
+        samples = body.get("samples") or {}
+        if not isinstance(samples, dict):
+            return JSONResponse({"error": "samples must be an object"},
+                                status_code=400)
+        power = samples.get("power") or []
+        if not isinstance(power, list) or not power:
+            return JSONResponse({"error": "samples.power is required"},
+                                status_code=400)
+        if len(power) > MAX_BUFFERED_RIDE_SAMPLES:
+            return JSONResponse({"error": "ride is too long"}, status_code=413)
+
+        try:
+            started_at = _dt.datetime.fromisoformat(str(body.get("started_at")))
+        except (TypeError, ValueError):
+            return JSONResponse(
+                {"error": "started_at must be an ISO timestamp"}, status_code=400
+            )
+        if started_at.tzinfo is not None:
+            # The app is naive-UTC end to end so an in-app ride and Zwift's
+            # .fit for it land on the same instant; normalise rather than
+            # storing an offset nothing else here understands.
+            started_at = started_at.astimezone(_dt.timezone.utc).replace(tzinfo=None)
+
+        workout_id = body.get("workout_id")
+        if workout_id is not None:
+            try:
+                workout_id = int(workout_id)
+            except (TypeError, ValueError):
+                return JSONResponse({"error": "workout_id must be an integer"},
+                                    status_code=400)
+            # Scoped, so a connector cannot attach a ride to a workout that is
+            # not its own user's.
+            if db.get_plan_workout(device["user_id"], workout_id) is None:
+                workout_id = None
+
+        try:
+            duration_s = int(body.get("duration_s") or len(power))
+        except (TypeError, ValueError):
+            return JSONResponse({"error": "duration_s must be an integer"},
+                                status_code=400)
+
+        activity_id, _record = await asyncio.to_thread(
+            importer.save_ride_record,
+            device["user_id"],
+            started_at,
+            duration_s,
+            {
+                "power": power,
+                "cadence": samples.get("cadence") or [],
+                "heartrate": samples.get("heartrate") or [],
+            },
+            str(body.get("name") or "Ride"),
+            float(body.get("ftp") or importer.current_ftp(device["user_id"])),
+            workout_id,
+        )
+        _log.info(
+            "connector '%s' uploaded a buffered ride -> activity %s",
+            device["label"], activity_id,
+        )
+        # activity_id is None when the ride is already stored - the connector
+        # retries until it gets an answer, so a duplicate upload must read as
+        # success rather than driving another retry.
+        return JSONResponse(
+            {"activity_id": activity_id, "duplicate": activity_id is None}
+        )
 
     @app.post("/api/activity/{activity_id}/rpe")
     def api_activity_rpe(
@@ -3558,11 +3664,25 @@ def create_app() -> FastAPI:
             _log.info("connector '%s' detached", session.label)
 
     async def _handle_connector_event(session, event: str, message: dict) -> None:
-        """Route one connector-originated event. Ride events land here in WP-5."""
-        _log.debug("connector event %s from %s", event, session.label)
+        """Route one connector-originated event.
+
+        Only ride telemetry so far, and it is fire-and-forget by design: a
+        dropped frame costs one second of a chart, whereas acknowledging every
+        sample would put a round trip in the middle of a 1 Hz loop.
+        """
+        if event == "ble.sample":
+            sink = session.ble_sink
+            if sink is not None:
+                sink.update(
+                    power=message.get("power"),
+                    cadence=message.get("cadence"),
+                    hr=message.get("hr"),
+                )
+            return
+        _log.debug("ignoring unknown connector event %s", event)
 
     @app.get("/ride", response_class=HTMLResponse)
-    def ride_page(request: Request, workout_id: Optional[int] = None):
+    async def ride_page(request: Request, workout_id: Optional[int] = None):
         uid = _uid(request)
         selected_workout = None
         if workout_id is not None:
@@ -3576,7 +3696,7 @@ def create_app() -> FastAPI:
             w["id"] == selected_workout["id"] for w in workouts
         ):
             workouts.append(selected_workout)
-        available, reason = bledevices.bluetooth_available()
+        available, reason = await _ble_available(uid)
         return templates.TemplateResponse(
             request,
             "ride.html",
@@ -3594,19 +3714,24 @@ def create_app() -> FastAPI:
         )
 
     @app.get("/ride/status")
-    def ride_status(request: Request):
-        available, reason = bledevices.bluetooth_available()
+    async def ride_status(request: Request):
+        available, reason = await _ble_available(_uid(request))
         return JSONResponse({"available": available, "reason": reason})
 
     @app.post("/ride/scan")
     async def ride_scan(request: Request):
-        available, reason = bledevices.bluetooth_available()
+        uid = _uid(request)
+        available, reason = await _ble_available(uid)
         if not available:
             return JSONResponse(
                 {"available": False, "reason": reason, "devices": []}
             )
         try:
-            found = await bledevices.scan()
+            session = _ble_session(uid)
+            found = (
+                await bledevices.scan() if session is None
+                else await remote_ble.scan(session)
+            )
             if not found:
                 return JSONResponse(
                     {
@@ -3624,6 +3749,22 @@ def create_app() -> FastAPI:
             return JSONResponse(
                 {"available": False, "reason": str(e), "devices": []}
             )
+
+    async def _ble_available(uid: Optional[int]) -> "tuple[bool, str]":
+        """Whether a BLE radio is usable, here or on the connector's machine."""
+        if backend_mode() == "local":
+            return bledevices.bluetooth_available()
+        session = connectorhub.get(uid)
+        if session is None:
+            return False, (
+                "No connector is attached. Start the wattracker connector on "
+                "the machine where Zwift and your trainer are."
+            )
+        return await remote_ble.bluetooth_available(session)
+
+    def _ble_session(uid: Optional[int]):
+        """The connector to ride through, or None in local mode."""
+        return None if backend_mode() == "local" else connectorhub.require(uid)
 
     def _ws_origin_ok(websocket: WebSocket) -> bool:
         """Allow only same-origin browsers; a cross-site page always sends an
@@ -3801,7 +3942,7 @@ def create_app() -> FastAPI:
         ftp = importer.current_ftp(uid)
         workout_payload = _ride_workout_payload(session, ftp, ride_name)
         await websocket.send_json({"status": "workout", "workout": workout_payload})
-        available, reason = bledevices.bluetooth_available()
+        available, reason = (False, "") if sim else await _ble_available(uid)
 
         # Without a simulation request and without hardware, report the
         # unavailable state (page still works) and close cleanly.
@@ -3811,8 +3952,14 @@ def create_app() -> FastAPI:
                     "status": "unavailable",
                     "ble_available": available,
                     "reason": reason,
-                    "message": "Bluetooth riding needs an adapter and `pip install "
-                    ".[ble]`. Use Simulate to preview the live screen.",
+                    "message": (
+                        "Bluetooth riding needs a connector running on the "
+                        "machine with your trainer. Use Simulate to preview "
+                        "the live screen."
+                        if backend_mode() == "server" else
+                        "Bluetooth riding needs an adapter and `pip install "
+                        ".[ble]`. Use Simulate to preview the live screen."
+                    ),
                 }
             )
             await websocket.close()
@@ -3829,7 +3976,22 @@ def create_app() -> FastAPI:
             abnormal_cleanup = False
             try:
                 try:
-                    if selected is None:
+                    ble_session = _ble_session(uid)
+                    if ble_session is not None:
+                        conn = await remote_ble.connect_sensors(
+                            ble_session,
+                            selected=selected,
+                            # So a ride survives losing us mid-way: the
+                            # connector keeps recording against this identity
+                            # and uploads it once it can reach us again.
+                            ride={
+                                "started_at": utc_now().isoformat(),
+                                "name": session.name,
+                                "ftp": float(ftp),
+                                "workout_id": selected_workout_id,
+                            },
+                        )
+                    elif selected is None:
                         conn = await bledevices.connect_sensors()
                     else:
                         conn = await bledevices.connect_sensors(selected=selected)
@@ -3896,7 +4058,10 @@ def create_app() -> FastAPI:
                             )
                             return None
                         try:
-                            await bledevices.disconnect_sensor(conn, address)
+                            if isinstance(conn, remote_ble.RemoteConnection):
+                                await remote_ble.disconnect_sensor(conn, address)
+                            else:
+                                await bledevices.disconnect_sensor(conn, address)
                             if controller is not None:
                                 controller.update_sources(
                                     trainer=conn.get("trainer"),
@@ -4162,6 +4327,17 @@ def create_app() -> FastAPI:
                 for client in (conn or {}).get("clients", []):
                     try:
                         await client.disconnect()
+                    except BaseException:
+                        pass
+                if isinstance(conn, remote_ble.RemoteConnection):
+                    # The radio is on the other machine, so releasing it is an
+                    # explicit request rather than a local disconnect. The ride
+                    # page reopens after a short delay expecting a free
+                    # adapter, and with a network hop in the middle that delay
+                    # is no longer enough on its own - so ask, and wait.
+                    try:
+                        conn.session.ble_sink = None
+                        await conn.session.call("ble.release")
                     except BaseException:
                         pass
                 try:

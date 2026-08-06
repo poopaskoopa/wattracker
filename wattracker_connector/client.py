@@ -16,6 +16,8 @@ from urllib.parse import urlsplit, urlunsplit
 
 from wattracker import rpc
 
+from .ble_handlers import BleState, build_ble_handlers
+from .buffer import upload_pending
 from .handlers import ConnectorConfig, build_handlers
 
 log = logging.getLogger(__name__)
@@ -94,6 +96,11 @@ class Connector:
         self.status = status or ConnectorStatus()
         self.status.server_url = server_url
         self._handlers = build_handlers(config)
+        # The BLE half needs to push events, so it is handed a sender that
+        # resolves the live peer at call time - the peer is replaced on every
+        # reconnect, and a captured one would go stale.
+        self.ble = BleState()
+        self._handlers.update(build_ble_handlers(self.ble, self._send_event))
         if extra_handlers:
             self._handlers.update(extra_handlers)
         self._peer: Optional[rpc.RpcPeer] = None
@@ -103,6 +110,12 @@ class Connector:
     def peer(self) -> Optional[rpc.RpcPeer]:
         """The live peer, for pushing events (ride telemetry) at the server."""
         return self._peer
+
+    async def _send_event(self, event: str, **fields) -> None:
+        peer = self._peer
+        if peer is None:
+            raise rpc.ConnectorUnavailable("not connected")
+        await peer.send_event(event, **fields)
 
     def stop(self) -> None:
         self._stop.set()
@@ -187,11 +200,31 @@ class Connector:
                 self.status.connected = True
                 self.status.last_error = None
                 log.info("connected")
+                # First thing after every connect, before serving anything: a
+                # ride buffered while we were away is the most perishable
+                # thing this process holds, and there is no reason to make it
+                # wait behind a scan.
+                await self._flush_buffered_ride()
                 await self._serve(socket, peer)
             finally:
                 self._peer = None
                 self.status.connected = False
                 peer.abandon("disconnected")
+                # Never leave the radio held across a reconnect: the server
+                # has no session to resume into, and a half-held adapter is
+                # what stops the next scan from finding anything.
+                await self.ble.teardown()
+
+    async def _flush_buffered_ride(self) -> None:
+        """Upload a ride recorded while the server was unreachable."""
+        try:
+            await asyncio.to_thread(
+                upload_pending, self.server_url, self.token, self.ble.buffer
+            )
+        except Exception:
+            # Never let this stop the session starting - the buffer keeps the
+            # ride and the next reconnect tries again.
+            log.warning("could not upload the buffered ride", exc_info=True)
 
     async def _serve(self, socket, peer: rpc.RpcPeer) -> None:
         """Answer requests until the socket closes or we are told to stop."""

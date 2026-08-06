@@ -180,3 +180,106 @@ def test_workout_prune_rules_travel_over_the_connector(
         result = exporter.sync_plan_exports(uid)
         assert result["removed"] == 1, result
         assert not written.exists()
+
+
+def test_reads_follow_the_folder_the_listing_actually_used(
+    client, zwift_home, monkeypatch, tmp_path
+):
+    """The server's activities_dir override and the connector's own may differ.
+
+    Setting one in the web UI is exactly how they come to differ, and the two
+    RPCs have to agree about what is in scope. They did not: activities.list
+    honoured the server's folder while activities.read only ever checked the
+    connector's, so the listing offered files and then every read of them was
+    refused as "outside the activities folder" - a scan that found the ride and
+    imported nothing.
+    """
+    monkeypatch.setenv("WATTRACKER_MODE", "server")
+    monkeypatch.setenv("HOME", str(zwift_home.parent))
+    monkeypatch.setattr(importer, "parse_fit", lambda path: _fake_parsed())
+
+    # A real folder on the connector's machine that is *not* its configured
+    # one; trusted because it is inside the home directory above.
+    elsewhere = tmp_path / "elsewhere"
+    elsewhere.mkdir()
+    (elsewhere / "ride.fit").write_bytes(b"dummy")
+
+    uid = _register(client)
+    attached, config = attach_connector(client, uid, zwift_home)
+    assert config.activities_dir != str(elsewhere)
+
+    with attached:
+        response = client.post(
+            "/activities/rescan", data={"activities_dir": str(elsewhere)}
+        )
+        assert response.status_code == 202
+        status = _wait_done(client)
+
+    assert status["directory"] == str(elsewhere)
+    assert status["exists"] is True
+    assert status["imported"] == 1, "listed the file, then refused to read it"
+    assert len(db.list_activities(uid)) == 1
+
+
+def test_a_folder_the_connector_does_not_trust_is_refused_outright(
+    zwift_home, monkeypatch, tmp_path
+):
+    """The connector answers to its own trusted roots, not the server's word.
+
+    The rescan route already refuses an untrusted folder by asking this same
+    connector to validate it, so in normal operation these handlers never see
+    one. That is exactly why the check belongs here too: the route is the
+    server being careful, and a server that has stopped being careful is the
+    case the connector has to survive on its own. Driven directly, without a
+    route in front, because that is the only way to represent it.
+    """
+    import asyncio
+
+    from wattracker_connector.handlers import ConnectorConfig, build_handlers
+
+    monkeypatch.setenv("HOME", str(zwift_home.parent))
+    outside = tmp_path.parent / "outside-the-home"
+    outside.mkdir(exist_ok=True)
+    (outside / "ride.fit").write_bytes(b"dummy")
+
+    handlers = build_handlers(
+        ConnectorConfig(activities_dir=str(zwift_home / "Activities"))
+    )
+
+    listing = asyncio.run(handlers["activities.list"](directory=str(outside)))
+    assert listing["exists"] is False
+    assert listing["files"] == []
+
+    with pytest.raises(ValueError):
+        asyncio.run(handlers["activities.read"](
+            path=str(outside / "ride.fit"), directory=str(outside)
+        ))
+
+
+def test_the_connectors_own_folder_needs_no_blessing_from_trusted_roots(
+    zwift_home, monkeypatch, tmp_path
+):
+    """Whoever configured the connector was sitting at the machine.
+
+    Its own folder is therefore trusted without a containment check - which
+    also keeps a Zwift install somewhere unusual working, rather than making
+    the connector refuse the folder its owner deliberately pointed it at.
+    """
+    import asyncio
+
+    from wattracker_connector.handlers import ConnectorConfig, build_handlers
+
+    monkeypatch.setenv("HOME", str(tmp_path / "somewhere-else"))
+    activities = zwift_home / "Activities"
+    (activities / "ride.fit").write_bytes(b"dummy")
+
+    handlers = build_handlers(ConnectorConfig(activities_dir=str(activities)))
+    # Both with no folder named, and with the connector's own echoed back.
+    for directory in (None, str(activities)):
+        listing = asyncio.run(handlers["activities.list"](directory=directory))
+        assert listing["exists"] is True, directory
+        assert [f["name"] for f in listing["files"]] == ["ride.fit"], directory
+        read = asyncio.run(handlers["activities.read"](
+            path=str(activities / "ride.fit"), directory=directory
+        ))
+        assert read["path"] == str(activities / "ride.fit")

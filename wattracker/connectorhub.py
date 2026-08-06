@@ -46,12 +46,15 @@ class ConnectorSession:
         self.peer = peer
         self._loop = loop
         self._loop_thread_id = threading.get_ident()
-        # Awaitable that shuts the underlying websocket. Without it a
-        # displaced connector would sit forever holding a socket nothing will
-        # ever use again, and - worse - would never reconnect, because from
-        # its side the connection still looks perfectly healthy.
+        # Awaitable that shuts the underlying websocket. Without it a displaced
+        # connector keeps a dead socket open and never reconnects: from its end
+        # the connection still looks healthy.
         self._closer = closer
         self.closed = False
+        # Where inbound ble.sample events land while a ride is connected. Set
+        # by remote_ble.connect_sensors, cleared when the ride ends. None means
+        # "no ride in progress", and a stray sample is simply dropped.
+        self.ble_sink = None
 
     # ------------------------------------------------------------- calling
     async def call(
@@ -127,6 +130,10 @@ def register(session: ConnectorSession) -> "Optional[ConnectorSession]":
     with _lock:
         previous = _sessions.get(session.user_id)
         _sessions[session.user_id] = session
+    # Closing happens outside the lock deliberately: close() schedules work on
+    # the event loop and takes the displaced peer's own locks, and no registry
+    # reader should be made to wait behind a socket teardown to find out who
+    # its connector is.
     if previous is not None:
         # A distinct code, so the displaced client stops instead of
         # reconnecting and evicting this one straight back - see WS_REPLACED.
