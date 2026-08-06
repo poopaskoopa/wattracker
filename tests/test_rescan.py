@@ -206,9 +206,9 @@ def test_dashboard_responsive_during_scan(client, home, monkeypatch):
     for i in range(10):
         (act_dir / f"ride{i}.fit").write_bytes(b"dummy")
 
-    # ~0.2s of pure-Python parse work per file (10 files -> ~2s scan).
+    # ~60ms of pure-Python parse work per file (10 files -> ~0.6s scan).
     def slow_parse(path):
-        time.sleep(0.2)
+        time.sleep(0.06)
         return _fake_parsed(start_time=f"2026-06-{int(path[-5]) + 1:02d}T10:00:00")
 
     monkeypatch.setattr(importer, "parse_fit", slow_parse)

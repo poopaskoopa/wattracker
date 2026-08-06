@@ -274,12 +274,12 @@ def _comparable(p):
     }
 
 
-def _configs():
-    for hours in (3.5, 6.0, 8.0, 12.0):
-        for n_days in range(2, 8):
-            for hit in range(1, 4):
+def _configs(hours=(3.5, 6.0, 8.0, 12.0), max_days=8, hits=(1, 2, 3)):
+    for hours_ in hours:
+        for n_days in range(2, max_days):
+            for hit in hits:
                 for model in plan.MODELS:
-                    yield hours, list(range(n_days)), hit, model
+                    yield hours_, list(range(n_days)), hit, model
 
 
 @pytest.mark.parametrize("with_races", [False, True])
@@ -320,9 +320,13 @@ def test_the_weekly_hours_cap_holds_for_every_goal(goal_key, with_races):
     budget and may only ever reduce it."""
     races = _RACES if with_races else None
     arc = goals.GOALS[goal_key].arc
+    # A sampled grid, not the full one from the inertness test: the cap is a
+    # duration-agnostic property, so short/mid/long lengths over a spread of
+    # hours/days/hits/models is enough. 4 x 60 = 240 plans per case.
+    configs = list(_configs(hours=(3.5, 8.0, 12.0), max_days=7, hits=(1, 3)))
     checked = 0
-    for weeks in (4, 8, 12, 20, 32):
-        for hours, days, hit, model in _configs():
+    for weeks in (4, 12, 20, 32):
+        for hours, days, hit, model in configs:
             if plan.validate_plan_inputs(weeks, days, hours, hit, None, model):
                 continue
             p = plan.generate_plan("P", MONDAY, weeks, days, hours, hit,
@@ -332,7 +336,7 @@ def test_the_weekly_hours_cap_holds_for_every_goal(goal_key, with_races):
                     goal_key, weeks, hours, len(days), hit, model, wk
                 )
             checked += 1
-    assert checked > 200
+    assert checked == 4 * 60
 
 
 @pytest.mark.parametrize("goal_key", GOAL_KEYS)

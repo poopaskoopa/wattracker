@@ -93,3 +93,29 @@ def user_id():
 
     db.init_db()
     return db.create_user("tester", auth.hash_password("password123"))
+
+
+@pytest.fixture(autouse=True)
+def cheap_scrypt(monkeypatch):
+    """Drop scrypt to a low cost for the whole suite.
+
+    The production hash is ~128 MiB of memory and ~0.25s of CPU per call, and
+    the suite runs it thousands of times - every /register, every login, and
+    every `user_id` fixture. What the tests exercise is the hashing CONTRACT
+    (format string, verify roundtrip, legacy format, rehash upgrade, timing
+    equalization), and all of that is independent of the absolute cost level.
+    A cheap but genuine scrypt (n=2**12) keeps every code path identical at
+    ~0.007s and ~4 MiB. ``_LEGACY_N`` is lowered to stay below ``_N`` so the
+    legacy-format tests keep meaning "an old cheap hash needs a rehash".
+    """
+    from wattracker import auth as auth_module
+
+    monkeypatch.setattr(auth_module, "_N", 2 ** 12)
+    monkeypatch.setattr(auth_module, "_LEGACY_N", 2 ** 10)
+    # _DUMMY_HASH is built at import time at the production cost; rebuild it
+    # cheaply so the failed-login timing-equalization verify stays cheap too.
+    monkeypatch.setattr(
+        auth_module,
+        "_DUMMY_HASH",
+        auth_module.hash_password("wattracker::no-such-user"),
+    )
