@@ -962,14 +962,28 @@ def create_app() -> FastAPI:
             setup_form=form or {},
         )
 
+    def _setup_closed(request: Request) -> bool:
+        """The wizard is a first-run surface; Settings owns later edits."""
+        return db.onboarding_complete(_uid(request))
+
+    def _setup_closed_json() -> JSONResponse:
+        return JSONResponse(
+            {"error": "Setup is already complete. Change this in Settings."},
+            status_code=409,
+        )
+
     @app.get("/setup", response_class=HTMLResponse)
     def setup_page(request: Request):
+        if _setup_closed(request):
+            return RedirectResponse("/settings", status_code=303)
         return templates.TemplateResponse(request, "setup.html", _setup_context(request))
 
     @app.post("/setup/check-directory")
     def setup_check_directory(request: Request, activities_dir: str = Form("")):
         if not _same_origin_or_absent(request):
             return JSONResponse({"error": "Cross-origin request rejected."}, status_code=403)
+        if _setup_closed(request):
+            return _setup_closed_json()
         uid = _uid(request)
         clean, error = paths.confine_storage_dir(activities_dir, must_exist=True)
         if error:
@@ -1002,6 +1016,8 @@ def create_app() -> FastAPI:
     def setup_upload(request: Request, files: List[UploadFile] = File(...)):
         if not _same_origin_or_absent(request):
             return JSONResponse({"error": "Cross-origin request rejected."}, status_code=403)
+        if _setup_closed(request):
+            return _setup_closed_json()
         if not files or len(files) > MAX_ONBOARDING_UPLOAD_FILES:
             return JSONResponse({"error": "Select between one and 200 FIT files."}, status_code=400)
         staged = []
@@ -1058,6 +1074,8 @@ def create_app() -> FastAPI:
     ):
         if not _same_origin_or_absent(request):
             return JSONResponse({"error": "Cross-origin request rejected."}, status_code=403)
+        if _setup_closed(request):
+            return _setup_closed_json()
         uid = _uid(request)
         choice = (choice or "").strip().lower()
         if choice == "manual":
@@ -1096,6 +1114,9 @@ def create_app() -> FastAPI:
     ):
         if not _same_origin_or_absent(request):
             return PlainTextResponse("Cross-origin request rejected.", status_code=403)
+        if _setup_closed(request):
+            # HTML route: send the rider somewhere useful, not to a dead page.
+            return RedirectResponse("/settings", status_code=303)
         uid = _uid(request)
         weight = _setup_number(weight_kg, ONBOARDING_WEIGHT_MIN_KG, ONBOARDING_WEIGHT_MAX_KG)
         form = {"weight_kg": weight_kg, "ftp_choice": ftp_choice,
