@@ -15,6 +15,23 @@ def client():
         yield c
 
 
+@pytest.fixture()
+def prod_scrypt(monkeypatch):
+    """Restore the PRODUCTION scrypt costs for the format/compat tests.
+
+    The autouse ``cheap_scrypt`` fixture lowers ``_N`` / ``_LEGACY_N`` for the
+    whole suite. The tests that request this fixture assert the exact bytes of
+    the hash format and of the legacy on-disk format, so they must pin 2**17 and
+    16384 as hard literals against the unpatched module - otherwise a change to
+    the production cost (or to the legacy constant, which is a fact about hashes
+    already stored on disk) silently passes as a tautology.
+    """
+    from wattracker import auth as auth_module
+
+    monkeypatch.setattr(auth_module, "_N", 2 ** 17)
+    monkeypatch.setattr(auth_module, "_LEGACY_N", 16384)
+
+
 # --------------------------------------------------------- hashing
 def test_password_is_hashed_not_plaintext():
     h = auth.hash_password("hunter2secret")
@@ -44,22 +61,22 @@ def test_validate_credentials_rejects_overlong_password():
 
 
 # ------------------------------------------ per-hash cost params + rehash
-def test_new_hash_encodes_params_and_verifies():
+def test_new_hash_encodes_params_and_verifies(prod_scrypt):
     h = auth.hash_password("password123")
     # scrypt$<n>$<r>$<p>$<salt>$<hash>
-    assert h.split("$")[:4] == ["scrypt", str(auth._N), "8", "1"]
+    assert h.split("$")[:4] == ["scrypt", str(2 ** 17), "8", "1"]
     assert auth.verify_password("password123", h) is True
     assert auth.verify_password("wrong", h) is False
     assert auth.needs_rehash(h) is False
 
 
-def test_legacy_hash_still_verifies_and_needs_rehash():
+def test_legacy_hash_still_verifies_and_needs_rehash(prod_scrypt):
     # A pre-upgrade 3-field hash (n=16384, r=8, p=1).
     import hashlib
     import os
 
     salt = os.urandom(16)
-    dk = hashlib.scrypt(b"password123", salt=salt, n=auth._LEGACY_N, r=8, p=1,
+    dk = hashlib.scrypt(b"password123", salt=salt, n=16384, r=8, p=1,
                         dklen=32)
     legacy = f"scrypt${salt.hex()}${dk.hex()}"
     assert auth.verify_password("password123", legacy) is True
@@ -93,12 +110,12 @@ def test_login_throttle_locks_resets_and_is_case_insensitive():
     assert thr.retry_after("carol") == 0.0
 
 
-def test_login_transparently_upgrades_legacy_hash(client):
+def test_login_transparently_upgrades_legacy_hash(prod_scrypt, client):
     import hashlib
     import os
 
     salt = os.urandom(16)
-    dk = hashlib.scrypt(b"password123", salt=salt, n=auth._LEGACY_N, r=8, p=1,
+    dk = hashlib.scrypt(b"password123", salt=salt, n=16384, r=8, p=1,
                         dklen=32)
     legacy = f"scrypt${salt.hex()}${dk.hex()}"
     db.init_db()
@@ -111,7 +128,7 @@ def test_login_transparently_upgrades_legacy_hash(client):
     # The stored hash was upgraded to the current 6-field format on login.
     stored = db.get_user_by_username("legacyuser")["password_hash"]
     assert stored != legacy
-    assert stored.startswith(f"scrypt${auth._N}$")
+    assert stored.startswith(f"scrypt${2 ** 17}$")
     assert auth.verify_password("password123", stored) is True
 
 
