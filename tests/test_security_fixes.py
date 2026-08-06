@@ -20,6 +20,7 @@ from wattracker.ingest import fit_parser  # noqa: E402
 from wattracker.prescribe import zwo  # noqa: E402
 from wattracker import server as server_mod  # noqa: E402
 from wattracker.server import create_app  # noqa: E402
+from conftest import redirect_home  # noqa: E402
 
 
 @pytest.fixture()
@@ -118,7 +119,10 @@ def test_settings_rejects_nonexistent_dir(client):
 
 
 def test_settings_accepts_dir_under_home(client, tmp_path, monkeypatch):
-    monkeypatch.setenv("HOME", str(tmp_path))
+    # setenv("HOME") alone is inert on Windows - ntpath.expanduser reads
+    # USERPROFILE - so the sandboxed HOME stayed at tmp_path/home and this
+    # test's sibling folder was (correctly) refused.
+    redirect_home(monkeypatch, tmp_path)
     _register(client)
     good = tmp_path / "acts"
     good.mkdir()
@@ -820,7 +824,7 @@ def test_rescan_still_scans_a_folder_inside_the_trusted_roots(client, tmp_path,
     from wattracker.ingest import importer as importer_mod
 
     home = os.path.realpath(tmp_path)
-    monkeypatch.setenv("HOME", home)
+    redirect_home(monkeypatch, home)  # setenv("HOME") alone is inert on Windows
     _register(client)
     act_dir = os.path.join(home, "Rides")
     os.mkdir(act_dir)

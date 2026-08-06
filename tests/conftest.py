@@ -119,3 +119,20 @@ def cheap_scrypt(monkeypatch):
         "_DUMMY_HASH",
         auth_module.hash_password("wattracker::no-such-user"),
     )
+
+
+def redirect_home(monkeypatch, path) -> None:
+    """Point ``os.path.expanduser("~")`` at *path*, on every platform.
+
+    Setting ``HOME`` alone does nothing on Windows: ``ntpath.expanduser``
+    reads ``USERPROFILE`` and never consults ``HOME``. A test that redirects
+    the home directory into a temp dir therefore silently keeps the real one,
+    and since pytest's ``tmp_path`` lives under
+    ``%USERPROFILE%\AppData\Local\Temp``, any folder the test builds to
+    stand for "outside the home" is in fact inside the trusted root. The
+    containment assertions then pass a folder they were written to refuse -
+    the test reports success while testing nothing.
+    """
+    path = str(path)
+    monkeypatch.setenv("HOME", path)
+    monkeypatch.setenv("USERPROFILE", path)

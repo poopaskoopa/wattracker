@@ -42,6 +42,7 @@ from . import (
     credstore,
     db,
     exporter,
+    paths,
     rpc,
     power_corrections,
     races,

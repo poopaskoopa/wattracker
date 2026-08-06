@@ -14,6 +14,7 @@ from wattracker.ingest import importer  # noqa: E402
 from wattracker.prescribe import zwo  # noqa: E402
 from wattracker.server import create_app  # noqa: E402
 
+from conftest import redirect_home  # noqa: E402
 from conftest_connector import attach_connector  # noqa: E402
 
 
@@ -75,7 +76,7 @@ def test_rescan_over_a_connector_imports_the_remote_file(
     client, zwift_home, monkeypatch
 ):
     monkeypatch.setenv("WATTRACKER_MODE", "server")
-    monkeypatch.setenv("HOME", str(zwift_home.parent))
+    redirect_home(monkeypatch, str(zwift_home.parent))
     monkeypatch.setattr(importer, "parse_fit", lambda path: _fake_parsed())
     (zwift_home / "Activities" / "ride.fit").write_bytes(b"dummy")
 
@@ -104,7 +105,7 @@ def test_scan_status_exists_reflects_the_connector_not_the_server(
     "not found" for a folder that is sitting there perfectly fine.
     """
     monkeypatch.setenv("WATTRACKER_MODE", "server")
-    monkeypatch.setenv("HOME", str(zwift_home.parent))
+    redirect_home(monkeypatch, str(zwift_home.parent))
     uid = _register(client)
     attached, _config = attach_connector(client, uid, zwift_home)
     with attached:
@@ -157,6 +158,10 @@ def test_workout_prune_rules_travel_over_the_connector(
 ):
     """OOTO days must prune the .zwo on the connector's machine, not ours."""
     monkeypatch.setenv("WATTRACKER_MODE", "server")
+    # As in the sibling tests: workouts_dir is confined to the trusted roots on
+    # read, so the Zwift tree has to sit under HOME or the export is refused
+    # and this reads as "prune did nothing" instead of "the folder was blocked".
+    redirect_home(monkeypatch, str(zwift_home.parent))
     uid = _register(client)
     workouts = zwift_home / "Workouts"
     db.save_user_settings(uid, {"zwift_id": "12345",
@@ -195,7 +200,7 @@ def test_reads_follow_the_folder_the_listing_actually_used(
     imported nothing.
     """
     monkeypatch.setenv("WATTRACKER_MODE", "server")
-    monkeypatch.setenv("HOME", str(zwift_home.parent))
+    redirect_home(monkeypatch, str(zwift_home.parent))
     monkeypatch.setattr(importer, "parse_fit", lambda path: _fake_parsed())
 
     # A real folder on the connector's machine that is *not* its configured
@@ -237,7 +242,7 @@ def test_a_folder_the_connector_does_not_trust_is_refused_outright(
 
     from wattracker_connector.handlers import ConnectorConfig, build_handlers
 
-    monkeypatch.setenv("HOME", str(zwift_home.parent))
+    redirect_home(monkeypatch, str(zwift_home.parent))
     outside = tmp_path.parent / "outside-the-home"
     outside.mkdir(exist_ok=True)
     (outside / "ride.fit").write_bytes(b"dummy")
@@ -269,7 +274,7 @@ def test_the_connectors_own_folder_needs_no_blessing_from_trusted_roots(
 
     from wattracker_connector.handlers import ConnectorConfig, build_handlers
 
-    monkeypatch.setenv("HOME", str(tmp_path / "somewhere-else"))
+    redirect_home(monkeypatch, str(tmp_path / "somewhere-else"))
     activities = zwift_home / "Activities"
     (activities / "ride.fit").write_bytes(b"dummy")
 

@@ -148,6 +148,25 @@ class Backend(abc.ABC):
         than an error.
         """
 
+    @abc.abstractmethod
+    def confine_stored_dir(self, value: Optional[str]) -> Optional[str]:
+        """Re-confine a directory setting read back *out* of the database.
+
+        Validating on write is not enough on its own: a row can predate the
+        write-side check, arrive from a restored backup, or be hand-edited, so
+        being in the database is not evidence a value is safe. This is the
+        read-side half.
+
+        Returns None when the stored value escapes. Callers must treat that as
+        "read nothing", NOT as "fall back to discovery" - quietly importing
+        from a folder the user never configured would be its own surprise, and
+        it would make the confinement look like it had worked.
+
+        Like ``validate_dir``, this has to run on the machine that owns the
+        path, which is why it is a backend method rather than a direct call to
+        ``paths.confined_stored_dir``.
+        """
+
     # ----------------------------------------------- activity files
 
     @abc.abstractmethod

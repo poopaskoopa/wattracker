@@ -84,6 +84,10 @@ class LocalBackend(Backend):
             )
         return expanded, None
 
+    def confine_stored_dir(self, value: Optional[str]) -> Optional[str]:
+        """These are this machine's folders, so measure them against its roots."""
+        return paths.confined_stored_dir(value, "activities_dir")
+
     # ----------------------------------------------- activity files
 
     def list_activities(self, directory: Optional[str] = None) -> ActivityListing:
