@@ -62,9 +62,11 @@ from .prescribe.planner import (
     JUST_RIDE_DURATIONS,
     WORKOUT_TYPE_INFO,
     WORKOUT_TYPE_KEYS,
+    VARIANTS,
     build_workout,
     plan_workout,
     workout_type_info,
+    validate_variant,
 )
 from .timeutil import local_today, utc_now, utc_today, valid_timezone
 
@@ -3043,7 +3045,7 @@ def create_app() -> FastAPI:
         out.sort(key=lambda w: w["date"])
         return out[:limit]
 
-    def _validate_just_ride(wtype, minutes):
+    def _validate_just_ride(wtype, minutes, variant=None):
         """Validate an ad-hoc (Just Ride) type/duration pair.
 
         Returns (kind, whole minutes). Raises ValueError on an unknown kind, a
@@ -3070,9 +3072,13 @@ def create_app() -> FastAPI:
                 f"duration must be between {JUST_RIDE_DURATIONS[0]} and "
                 f"{JUST_RIDE_DURATIONS[-1]} minutes, in 15-minute steps"
             )
-        return kind, mins
+        try:
+            selected_variant = validate_variant(kind, variant)
+        except ValueError as e:
+            raise ValueError(str(e))
+        return kind, mins, selected_variant
 
-    def _ride_session(uid, workout_id=None, wtype=None, minutes=None):
+    def _ride_session(uid, workout_id=None, wtype=None, minutes=None, variant=None):
         """Build the Session to ride, from a plan workout or an ad-hoc type/duration.
 
         An explicit ad-hoc type that is invalid (or cannot be built) raises
@@ -3091,8 +3097,8 @@ def create_app() -> FastAPI:
                     w["name"], w["id"]
             raise ValueError("workout not found")
         if wtype:
-            kind, mins = _validate_just_ride(wtype, minutes)
-            s = build_workout(kind, mins, profile=profile)
+            kind, mins, selected_variant = _validate_just_ride(wtype, minutes, variant)
+            s = build_workout(kind, mins, selected_variant, profile=profile)
             return s, s.name, None
         s = build_workout("endurance", 45, profile=profile)
         return s, s.name, None
@@ -3132,12 +3138,14 @@ def create_app() -> FastAPI:
         return present.fmt_clock(seconds)
 
     @app.get("/ride/workout/preview")
-    def ride_workout_preview(request: Request, type: str = "", minutes: str = ""):
+    def ride_workout_preview(request: Request, type: str = "", minutes: str = "",
+                             variant: Optional[str] = None):
         uid = _uid(request)
         try:
-            kind, mins = _validate_just_ride(type, minutes)
-            session = build_workout(kind, mins,
-                                    profile=profile_store.for_user(uid))
+            kind, mins, selected_variant = _validate_just_ride(type, minutes, variant)
+            rider_profile = profile_store.for_user(uid)
+            session = build_workout(kind, mins, selected_variant,
+                                    profile=rider_profile)
         except (ValueError, OverflowError) as e:
             return JSONResponse({"error": str(e)}, status_code=400)
         ftp = importer.current_ftp(uid)
@@ -3147,12 +3155,28 @@ def create_app() -> FastAPI:
         info["high_watts"] = _watts(info.get("high"), ftp)
         info["work_watts"] = _watts(info.get("work"), ftp)
         payload.update({
+            "variant": selected_variant,
+            "variant_options": list(VARIANTS[kind]),
             "description": session.description,
             "workout_type": session.workout_type,
             "estimated_tss": session.estimated_tss,
             "type_info": info,
             "segments": present.segment_rows(session, ftp),
         })
+        all_variants = {}
+        for option in VARIANTS[kind]:
+            candidate = build_workout(kind, mins, option, profile=rider_profile)
+            candidate_payload = _ride_workout_payload(candidate, ftp)
+            all_variants[option] = {
+                str(mins): {
+                    "name": candidate.name,
+                    "description": candidate.description,
+                    "estimated_tss": candidate.estimated_tss,
+                    "duration_s": candidate_payload["duration_s"],
+                    "profile": candidate_payload["profile"],
+                }
+            }
+        payload["variant_profiles"] = all_variants
         return JSONResponse(payload)
 
     @app.get("/ride", response_class=HTMLResponse)
@@ -3240,15 +3264,21 @@ def create_app() -> FastAPI:
         power = params.getlist("power")
         hr = params.getlist("hr")
         trainer = params.getlist("trainer")
+        cadence = params.getlist("cadence")
         if len(power) > _MAX_SELECTED_POWER_SOURCES:
             raise ValueError(
                 f"Select at most {_MAX_SELECTED_POWER_SOURCES} power sensors."
             )
-        if len(hr) > 1 or len(trainer) > 1:
-            raise ValueError("Select at most one heart-rate monitor and one trainer.")
+        if len(hr) > 1 or len(trainer) > 1 or len(cadence) > 1:
+            raise ValueError(
+                "Select at most one heart-rate monitor, one trainer, and one cadence sensor."
+            )
 
-        selected = {"power": [], "hr": [], "trainer": []}
-        for role, addresses in (("power", power), ("hr", hr), ("trainer", trainer)):
+        selected = {"power": [], "hr": [], "trainer": [], "cadence": []}
+        for role, addresses in (
+            ("power", power), ("hr", hr), ("trainer", trainer),
+            ("cadence", cadence),
+        ):
             for address in addresses:
                 if not address or len(address) > _MAX_BLE_ADDRESS_LENGTH:
                     raise ValueError(f"Invalid {role} sensor address.")
@@ -3287,6 +3317,12 @@ def create_app() -> FastAPI:
             available and getattr(trainer, "erg_enabled", True)
         )
         return available, enabled
+
+    def _connection_has_power(conn: Optional[dict]) -> bool:
+        """Do not mistake the cadence-only legacy power alias for watts."""
+        conn = conn or {}
+        power = conn.get("power_source")
+        return power is not None and power is not conn.get("cadence_source")
 
     async def _set_connection_erg(
         conn: dict,
@@ -3362,6 +3398,7 @@ def create_app() -> FastAPI:
                 workout_id=params.get("workout_id"),
                 wtype=params.get("type"),
                 minutes=params.get("minutes"),
+                variant=params.get("variant"),
             )
         except (ValueError, OverflowError) as e:
             await websocket.send_json({"status": "error", "error": str(e)})
@@ -3405,7 +3442,7 @@ def create_app() -> FastAPI:
                 except Exception as e:  # no adapter, scan failure, ...
                     await websocket.send_json({"status": "error", "error": str(e)})
                     return
-                if not conn["power_source"] and not conn["trainer"]:
+                if not _connection_has_power(conn) and not conn["trainer"]:
                     details = " ".join(conn.get("errors", []))
                     await websocket.send_json(
                         {
@@ -3470,10 +3507,11 @@ def create_app() -> FastAPI:
                                 controller.update_sources(
                                     trainer=conn.get("trainer"),
                                     power_source=conn.get("power_source"),
+                                    cadence_source=conn.get("cadence_source"),
                                     hr_source=conn.get("hr_source"),
                                 )
                             ending_session = not (
-                                conn.get("power_source") or conn.get("trainer")
+                                _connection_has_power(conn) or conn.get("trainer")
                             )
                             available_now, enabled_now = _connection_erg_state(conn)
                             await websocket.send_json(
@@ -3563,6 +3601,7 @@ def create_app() -> FastAPI:
                     ftp,
                     trainer=conn["trainer"],
                     power_source=conn["power_source"],
+                    cadence_source=conn.get("cadence_source"),
                     hr_source=conn["hr_source"],
                     user_id=uid,
                     workout_id=selected_workout_id,

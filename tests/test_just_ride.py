@@ -129,6 +129,32 @@ def test_preview_rejects_bad_type_and_duration(client):
     assert not_a_number.status_code == 400
 
 
+def test_preview_selects_variant_and_returns_duration_variant_profiles(client):
+    uid = _register(client, "rider_variant_preview")
+    db.save_user_settings(uid, {"ftp": 200})
+    response = client.get(
+        "/ride/workout/preview?type=tempo&minutes=60&variant=progression"
+    )
+    assert response.status_code == 200
+    data = response.json()
+    assert data["variant"] == "progression"
+    assert data["variant_options"] == ["classic", "progression"]
+    profiles = data["variant_profiles"]
+    assert set(profiles) == {"classic", "progression"}
+    assert set(profiles["classic"]) == {"60"}
+    assert profiles["classic"]["60"]["duration_s"] == 3600
+    assert profiles["progression"]["60"]["profile"] != profiles["classic"]["60"]["profile"]
+
+
+def test_preview_rejects_unknown_variant(client):
+    _register(client, "rider_bad_variant")
+    response = client.get(
+        "/ride/workout/preview?type=tempo&minutes=60&variant=surprise"
+    )
+    assert response.status_code == 400
+    assert "variant" in response.json()["error"]
+
+
 def test_preview_requires_auth(client):
     assert client.get(
         "/ride/workout/preview?type=tempo&minutes=60", follow_redirects=False
@@ -450,6 +476,26 @@ def test_ws_explicit_vo2max_thirty_is_honoured(client):
     assert msg["status"] == "workout"
     assert msg["workout"]["duration_s"] == 1800
     assert msg["workout"]["name"] == "VO2max Intervals"
+
+
+def test_ws_honours_selected_variant(client):
+    _register(client, "rider_ws_variant")
+    with client.websocket_connect(
+        "/ride/ws?type=tempo&minutes=60&variant=progression"
+    ) as ws:
+        msg = ws.receive_json()
+    assert msg["status"] == "workout"
+    assert msg["workout"]["name"] == "Tempo Progression"
+
+
+def test_ws_rejects_unknown_variant(client):
+    _register(client, "rider_ws_bad_variant")
+    with client.websocket_connect(
+        "/ride/ws?type=tempo&minutes=60&variant=surprise"
+    ) as ws:
+        msg = ws.receive_json()
+    assert msg["status"] == "error"
+    assert "variant" in msg["error"]
 
 
 def test_ws_without_a_type_still_defaults(client):

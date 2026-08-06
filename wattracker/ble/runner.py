@@ -109,11 +109,13 @@ class RideController:
         started_at: Optional[_dt.datetime] = None,
         erg_enabled: Optional[bool] = None,
         manage_trainer_commands: bool = True,
+        cadence_source=None,
     ) -> None:
         self.session = session
         self.ftp = float(ftp)
         self.trainer = trainer
         self.power_source = power_source
+        self.cadence_source = cadence_source
         self.hr_source = hr_source
         self.user_id = user_id
         self.workout_id = workout_id
@@ -273,12 +275,18 @@ class RideController:
 
     def poll(self, dt: float = 1.0) -> dict:
         """Read the attached sources (advancing simulated ones), then tick."""
-        for src in (self.power_source, self.hr_source):
+        advanced = set()
+        for src in (self.power_source, self.cadence_source, self.hr_source):
+            if src is None or id(src) in advanced:
+                continue
+            advanced.add(id(src))
             adv = getattr(src, "advance", None)
             if callable(adv):
                 adv()
         p = self.power_source.latest_power() if self.power_source else 0
         cad = self.power_source.latest_cadence() if self.power_source else None
+        if cad is None and self.cadence_source is not None:
+            cad = self.cadence_source.latest_cadence()
         hr = self.hr_source.latest_hr() if self.hr_source else None
         return self.tick(power=int(p or 0), cadence=cad, hr=hr, dt=dt)
 
@@ -319,10 +327,13 @@ class RideController:
             self._erg_armed = False
         return self.erg_enabled
 
-    def update_sources(self, trainer=None, power_source=None, hr_source=None) -> None:
+    def update_sources(
+        self, trainer=None, power_source=None, hr_source=None, cadence_source=None
+    ) -> None:
         """Replace live BLE role bindings after a per-device disconnect."""
         self.trainer = trainer
         self.power_source = power_source
+        self.cadence_source = cadence_source
         self.hr_source = hr_source
         available = bool(
             trainer is not None and getattr(trainer, "erg_available", True)

@@ -2,6 +2,7 @@
 
 Covers:
   - Cycling Power Measurement (0x2A63) -> instantaneous power + crank data
+  - CSC Measurement (0x2A5B)           -> crank data
   - Heart Rate Measurement (0x2A37)    -> heart rate bpm
   - Fitness Machine Control Point (0x2AD9) encoders -> ERG control
 
@@ -13,10 +14,12 @@ from typing import Optional
 
 # Service UUIDs (16-bit assigned numbers, and their 128-bit base forms).
 CYCLING_POWER_SERVICE = "00001818-0000-1000-8000-00805f9b34fb"
+CYCLING_SPEED_AND_CADENCE_SERVICE = "00001816-0000-1000-8000-00805f9b34fb"
 HEART_RATE_SERVICE = "0000180d-0000-1000-8000-00805f9b34fb"
 FITNESS_MACHINE_SERVICE = "00001826-0000-1000-8000-00805f9b34fb"
 
 CYCLING_POWER_MEASUREMENT = "00002a63-0000-1000-8000-00805f9b34fb"
+CYCLING_SPEED_AND_CADENCE_MEASUREMENT = "00002a5b-0000-1000-8000-00805f9b34fb"
 HEART_RATE_MEASUREMENT = "00002a37-0000-1000-8000-00805f9b34fb"
 FITNESS_MACHINE_CONTROL_POINT = "00002ad9-0000-1000-8000-00805f9b34fb"
 
@@ -86,6 +89,34 @@ def cadence_from_cranks(
     if d_time == 0:
         return None
     return d_revs * resolution * 60.0 / d_time
+
+
+def parse_csc_measurement(data: bytes) -> dict:
+    """Parse a Cycling Speed and Cadence Measurement (0x2A5B) payload.
+
+    The flags byte controls optional wheel (bit 0) and crank (bit 1) fields.
+    Only crank data is needed for cadence. Returns ``crank_revs`` and
+    ``crank_event_time`` as ``None`` when the sensor did not include them.
+    """
+    if not data:
+        raise ValueError("CSC payload too short")
+    flags = data[0]
+    idx = 1
+    if flags & 0x01:
+        idx += 6  # uint32 cumulative wheel revs + uint16 last wheel event time
+
+    crank_revs: Optional[int] = None
+    crank_event_time: Optional[int] = None
+    if flags & 0x02:
+        if len(data) < idx + 4:
+            raise ValueError("CSC payload missing crank data")
+        crank_revs = int.from_bytes(data[idx:idx + 2], "little")
+        crank_event_time = int.from_bytes(data[idx + 2:idx + 4], "little")
+    return {
+        "flags": flags,
+        "crank_revs": crank_revs,
+        "crank_event_time": crank_event_time,
+    }
 
 
 def parse_heart_rate_measurement(data: bytes) -> dict:

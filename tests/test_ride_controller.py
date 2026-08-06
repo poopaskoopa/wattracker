@@ -176,6 +176,30 @@ def test_poll_drives_from_simulated_sources():
     assert c.status == "paused"           # zeros after start -> pause, not finish
 
 
+def test_poll_uses_standalone_cadence_when_power_source_has_none():
+    class CadenceOnly:
+        def __init__(self, cadence):
+            self.cadence = cadence
+
+        def latest_cadence(self):
+            return self.cadence
+
+    power = SimulatedPowerSource([120], cadences=[None])
+    c = RideController(
+        _two_block_session(), 200, power_source=power,
+        cadence_source=CadenceOnly(94), start_grace_s=0, autosave=False,
+    )
+
+    assert c.poll(dt=1)["cadence"] == 94
+
+    power = SimulatedPowerSource([120], cadences=[82])
+    c = RideController(
+        _two_block_session(), 200, power_source=power,
+        cadence_source=CadenceOnly(94), start_grace_s=0, autosave=False,
+    )
+    assert c.poll(dt=1)["cadence"] == 82
+
+
 def test_erg_rearmed_on_resume_and_stopped_on_finish():
     trainer = SimulatedTrainer()
     c = RideController(_two_block_session(), 200, trainer=trainer, start_grace_s=0, autosave=False)

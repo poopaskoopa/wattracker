@@ -12,7 +12,8 @@ import pytest
 
 from wattracker import db
 from wattracker.prescribe import zwo
-from wattracker.prescribe.planner import VARIANTS, build_workout
+from wattracker.prescribe.planner import (
+    VARIANTS, WORKOUT_TYPE_INFO, build_workout)
 
 
 def _if(session):
@@ -79,6 +80,104 @@ def test_variants_comparable_to_classic_at_60min(kind):
         assert abs(_if(s) - c_if) <= 0.03, (kind, v, _if(s), c_if)
         assert abs(s.estimated_tss - c_tss) <= 0.10 * c_tss, \
             (kind, v, s.estimated_tss, c_tss)
+
+
+# ----------------------------------------- time in zone across every duration
+# TSS and IF at 60min hid a real defect: `_tempo_progression` hard-coded
+# 4 x 8min, so EVERY session of 60min or more got the same 32 minutes of Zone
+# 3 while classic tempo scaled to 75. The Zone 2 base absorbed the difference,
+# so TSS stayed comparable and only the dose - the thing that makes a tempo
+# session a tempo session - diverged. Assert on time in zone, at the durations
+# where the fitting loops actually change shape.
+_TIZ_DURATIONS = (60, 75, 90, 120, 180, 240)
+
+# Variants whose dose already diverges from classic by more than the band.
+# Found by this test when it was written (PR #63 review) and deliberately NOT
+# changed here: whether e.g. over-unders should carry a full threshold dose is
+# a prescription decision, not a defect fix. `strict` xfail means any later
+# change to one of these fails the suite until the entry is removed, so the
+# divergence cannot quietly grow or quietly disappear.
+_UNREVIEWED_DOSE = {
+    ("vo2max", "short_short"): _TIZ_DURATIONS,
+    ("vo2max", "long_intervals"): (75, 90, 120, 180, 240),
+    ("vo2max", "descending"): _TIZ_DURATIONS,
+    ("threshold", "over_unders"): _TIZ_DURATIONS,
+    ("sweet_spot", "long_blocks"): (75, 120, 180, 240),
+    ("sweet_spot", "with_surges"): (75, 90, 120, 180, 240),
+}
+
+_BANDS = {info["key"]: (info["low"], info["high"]) for info in WORKOUT_TYPE_INFO}
+
+
+def _time_in_zone(session, kind, tol=1e-9):
+    """Seconds prescribed inside this workout type's own published band.
+
+    The band comes from WORKOUT_TYPE_INFO rather than a literal so the check
+    follows whatever each type publishes to the picker. A `high` of None (the
+    open-ended sprint level) means no ceiling.
+    """
+    low, high = _BANDS[kind]
+    high = float("inf") if high is None else high
+
+    def inside(power):
+        return power is not None and low - tol <= power <= high + tol
+
+    total = 0
+    for s in session.segments:
+        if s.kind == "intervals" and s.repeat:
+            if inside(s.on_power):
+                total += s.repeat * (s.on_duration or 0)
+            if inside(s.off_power):
+                total += s.repeat * (s.off_duration or 0)
+        elif s.kind == "steadystate" and inside(s.power):
+            total += s.duration
+        elif s.kind == "freeride" and inside(s.load_fraction):
+            # A sprint prescribes no target; its load fraction is the honest
+            # stand-in for accounting (see `_sprint`).
+            total += s.duration
+    return total
+
+
+def _tiz_params():
+    for kind, variants in VARIANTS.items():
+        for v in variants:
+            if v == "classic":
+                continue
+            for minutes in _TIZ_DURATIONS:
+                marks = []
+                if minutes in _UNREVIEWED_DOSE.get((kind, v), ()):
+                    marks = [pytest.mark.xfail(
+                        strict=True,
+                        reason="dose diverges from classic; flagged in review, "
+                               "scope decision pending")]
+                yield pytest.param(kind, v, minutes, marks=marks,
+                                   id=f"{kind}-{v}-{minutes}")
+
+
+@pytest.mark.parametrize("kind,variant,minutes", list(_tiz_params()))
+def test_variant_time_in_zone_tracks_classic(kind, variant, minutes):
+    classic = build_workout(kind, minutes, "classic")
+    session = build_workout(kind, minutes, variant)
+    c_tiz = _time_in_zone(classic, kind)
+    v_tiz = _time_in_zone(session, kind)
+    assert c_tiz > 0, (kind, minutes)
+    assert abs(v_tiz - c_tiz) <= 0.10 * c_tiz, \
+        (kind, variant, minutes, v_tiz / 60, c_tiz / 60)
+
+
+def test_tempo_progression_dose_grows_with_the_ride():
+    """The dose must scale, not saturate - and the ramp must survive scaling."""
+    doses = [_time_in_zone(build_workout("tempo", m, "progression"), "tempo")
+             for m in (60, 90, 120)]
+    assert doses[0] < doses[1] < doses[2], doses
+    for minutes in (60, 90, 120):
+        s = build_workout("tempo", minutes, "progression")
+        powers = [seg.on_power for seg in s.segments if seg.kind == "intervals"]
+        assert len(powers) >= 2 and powers == sorted(powers), (minutes, powers)
+        assert powers[0] < powers[-1], (minutes, powers)
+        # Still Zone 3 at both ends of the ramp.
+        low, high = _BANDS["tempo"]
+        assert low <= min(powers) and max(powers) <= high, (minutes, powers)
 
 
 def test_each_variant_has_distinct_name():

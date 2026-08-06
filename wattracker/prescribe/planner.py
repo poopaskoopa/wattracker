@@ -614,6 +614,106 @@ def _tempo(total_s: int,
     return _finish(s, total_s)
 
 
+def _tempo_progression(total_s: int,
+                       profile: Optional["RiderMetrics"] = None) -> Session:
+    """Tempo progression: rising blocks that finish at the top of Zone 3.
+
+    Both the block length and the rep count scale with the ride, so the tempo
+    dose tracks classic ``_tempo`` (which grows to 5 x 15min = 75 minutes in
+    zone). The fixed ``4 x 8min`` this used to prescribe gave EVERY session of
+    60 minutes or more the same 32 minutes in zone: a two-hour "Tempo
+    Progression" was 32min of Zone 3 on a 52min Zone 2 base, an endurance dose
+    wearing a tempo label - the same defect already fixed in ``_threshold``.
+
+    Blocks stay shorter than classic's 15min and the ramp from 78% to 86% FTP
+    across them is kept: that rise is the variant's identity, not the dose.
+    """
+    warmup = min(600, max(300, total_s // 6))
+    # The dose to hit is whatever classic tempo prescribes for this ride, so
+    # the two shapes stay comparable at every duration instead of only at the
+    # 60min the comparability test used to check. Classic emits its tempo work
+    # as `intervals` segments and its Zone 2 base as steadystate, so the work
+    # time is exactly the repeated on-durations.
+    try:
+        target = sum((seg.repeat or 0) * (seg.on_duration or 0)
+                     for seg in _tempo(total_s, profile).segments
+                     if seg.kind == "intervals")
+    except ValueError:
+        target = 0  # classic does not fit either; take the longest that does.
+
+    def fit(warmup: int):
+        """Shape closest to `target` seconds in zone that fits, or None.
+
+        Blocks run 5-11min and 2-8 of them - always shorter than classic's
+        15min, because the point of the variant is the rise across the blocks.
+        Recoveries are 2-4min; a shorter one is only taken when it buys a
+        closer match to the dose. Ties then go to the shape with more reps,
+        which keeps the steps small and the top block earned.
+        """
+        budget = total_s - warmup - 120
+        best = None
+        for off in (240, 180, 120):
+            for reps in range(2, 9):
+                for on in range(300, 661, 60):
+                    if reps * (on + off) <= budget:
+                        cand = ((-abs(reps * on - target) if target
+                                 else reps * on), off, reps, on)
+                        if best is None or cand[:3] > best[:3]:
+                            best = cand
+        return None if best is None else best[1:]
+
+    shape = fit(warmup)
+    while shape is None and warmup > 180:
+        warmup -= 60
+        shape = fit(warmup)
+    if shape is None:
+        # Too short for even 2 x 5min: split what is left into two blocks.
+        off, reps = 120, 2
+        on = max(60, ((total_s - warmup - 120) // reps - off) // 60 * 60)
+    else:
+        off, reps, on = shape
+    s = Session(
+        name="Tempo Progression",
+        description=(f"{reps} x {on // 60}min tempo progression from 78% to "
+                     "86% FTP."),
+        workout_type="tempo",
+    )
+    s.segments.append(Segment(kind="warmup", duration=warmup,
+                              power_low=0.50, power_high=0.75,
+                              text="Warm up into tempo pace."))
+    for i in range(reps):
+        power = 0.78 + 0.08 * i / max(1, reps - 1)
+        s.segments.append(Segment(kind="intervals", duration=on + off,
+                                  repeat=1, on_duration=on, off_duration=off,
+                                  on_power=power, off_power=0.55,
+                                  text=f"Tempo block at {power * 100:.0f}% FTP."))
+    return _finish(s, total_s)
+
+
+def _recovery_progression(total_s: int,
+                          profile: Optional["RiderMetrics"] = None) -> Session:
+    """Recovery with a gentle power progression, never above low Zone 2."""
+    warmup = min(300, max(180, total_s // 6))
+    cooldown = min(300, max(180, total_s // 6))
+    body = max(0, total_s - warmup - cooldown)
+    first = body // 2
+    s = Session(
+        name="Recovery Progression",
+        description="Easy recovery ride progressing gently from 61% to 65% FTP.",
+        workout_type="recovery",
+    )
+    s.segments.append(Segment(kind="warmup", duration=warmup,
+                              power_low=0.45, power_high=0.55,
+                              text="Ease in gently."))
+    if first:
+        s.segments.append(Segment(kind="steadystate", duration=first,
+                                  power=0.61, text="Very easy recovery pace."))
+    if body - first:
+        s.segments.append(Segment(kind="steadystate", duration=body - first,
+                                  power=0.65, text="Comfortable low Zone 2 pace."))
+    return _finish(s, total_s, cooldown_low=0.45, cooldown_high=0.55)
+
+
 def _sprint(total_s: int,
             profile: Optional["RiderMetrics"] = None) -> Session:
     """Neuromuscular sprints (Coggan Level 7): 12s maximal, full recovery.
@@ -664,6 +764,52 @@ def _sprint(total_s: int,
         s.segments.append(
             Segment(kind="steadystate", duration=off, power=0.55,
                     text="Spin easy for 3min - full recovery before the next one.")
+        )
+    return _finish(s, total_s)
+
+
+def _sprint_recovery_waves(total_s: int,
+                           profile: Optional["RiderMetrics"] = None) -> Session:
+    """Neuromuscular sprints with alternating two- and four-minute recoveries.
+
+    The average recovery and total sprint time match the classic prescription;
+    only the spacing changes. Both recovery lengths are long enough to keep
+    each effort a quality maximal sprint rather than turning it into a
+    fatigue-tolerance interval.
+    """
+    warmup = 600
+    on = 12
+    recoveries = (120, 216)
+    reps = max(3, min(12, (total_s - warmup - 120) // 180))
+
+    def work_seconds(n: int) -> int:
+        return n * on + sum(recoveries[i % len(recoveries)] for i in range(n))
+
+    while warmup + work_seconds(reps) + 120 > total_s and reps > 3:
+        reps -= 1
+    while warmup + work_seconds(reps) > total_s and reps > 1:
+        reps -= 1
+    s = Session(
+        name="Sprint Recovery Waves",
+        description=(f"{reps} x 12s all-out sprints with alternating 2min and "
+                     "3min 36s recovery, on an aerobic base."),
+        workout_type="sprint",
+    )
+    s.segments.append(
+        Segment(kind="warmup", duration=warmup, power_low=0.50, power_high=0.80,
+                text="Progressive warmup with two brief openers.")
+    )
+    load = sprint_load_ratio(profile)
+    for i in range(reps):
+        s.segments.append(
+            Segment(kind="freeride", duration=on, load_fraction=load,
+                    text="12s all out from a rolling start - no target, "
+                         "just go as hard as you can.")
+        )
+        s.segments.append(
+            Segment(kind="steadystate", duration=recoveries[i % len(recoveries)],
+                    power=0.55,
+                    text="Spin easy before the next quality sprint.")
         )
     return _finish(s, total_s)
 
@@ -908,7 +1054,7 @@ def _sweet_spot_long_blocks(total_s: int,
 
 def _sweet_spot_with_surges(total_s: int,
                             profile: Optional["RiderMetrics"] = None) -> Session:
-    """Sweet spot with surges: 3 x 12min @89% with a 10s@110% surge every 3min."""
+    """Sweet spot with controlled surges inside the declared band."""
     warmup = 600
     surges = 4          # per block
     on_seg, surge = 170, 10
@@ -943,8 +1089,8 @@ def _sweet_spot_with_surges(total_s: int,
         s.segments.append(
             Segment(kind="intervals", duration=block, repeat=surges,
                     on_duration=on_seg, off_duration=surge,
-                    on_power=0.89, off_power=1.10,
-                    text="Sweet spot at ~89% with a short 110% surge every 3min.")
+                    on_power=0.89, off_power=0.94,
+                    text="Sweet spot at ~89% with a short 94% surge every 3min.")
         )
         if k < reps - 1:
             s.segments.append(
@@ -985,11 +1131,11 @@ def _endurance_negative_split(total_s: int,
 
 def _endurance_tempo_finish(total_s: int,
                             profile: Optional["RiderMetrics"] = None) -> Session:
-    """Endurance with a tempo finish: Zone 2 then a final ~13% at 80% FTP."""
+    """Endurance with an upper-Zone-2 finish."""
     warmup = 600
     s = Session(
-        name="Endurance Tempo Finish",
-        description="Zone 2 aerobic ride with a tempo push to finish.",
+        name="Endurance Upper-Zone-2 Finish",
+        description="Zone 2 aerobic ride with a gentle upper-Zone-2 finish.",
         workout_type="endurance",
     )
     s.segments.append(
@@ -1008,8 +1154,8 @@ def _endurance_tempo_finish(total_s: int,
     )
     if tempo:
         s.segments.append(
-            Segment(kind="steadystate", duration=tempo, power=0.80,
-                    text="Tempo finish - lift to ~80% FTP.")
+            Segment(kind="steadystate", duration=tempo, power=0.74,
+                    text="Upper Zone 2 finish - lift gently to ~74% FTP.")
         )
     return _finish(s, total_s, cooldown_low=0.45, cooldown_high=0.55)
 
@@ -1081,12 +1227,15 @@ _VARIANT_BUILDERS = {
     },
     "tempo": {
         "classic": _tempo,
+        "progression": _tempo_progression,
     },
     "sprint": {
         "classic": _sprint,
+        "recovery_waves": _sprint_recovery_waves,
     },
     "recovery": {
         "classic": _easy_endurance,
+        "progression": _recovery_progression,
     },
 }
 
@@ -1203,6 +1352,19 @@ def workout_type_info(key: str) -> Optional[dict]:
         if info["key"] == key:
             return dict(info)
     return None
+
+
+def variant_names(kind: str) -> List[str]:
+    """Return the Just Ride variant names for a known workout kind."""
+    return list(_VARIANT_BUILDERS.get(kind, {}).keys())
+
+
+def validate_variant(kind: str, variant: Optional[str]) -> str:
+    """Validate an API variant, retaining classic for an omitted value."""
+    selected = "classic" if variant is None or str(variant).strip() == "" else str(variant).strip()
+    if selected not in _VARIANT_BUILDERS.get(kind, {}):
+        raise ValueError(f"unknown variant: {variant or '(missing)'}")
+    return selected
 
 # Public: ordered variant names per kind (classic first). Used by the plan
 # generator to rotate variants across same-kind days.
