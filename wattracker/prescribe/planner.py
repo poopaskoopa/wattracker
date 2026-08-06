@@ -616,19 +616,66 @@ def _tempo(total_s: int,
 
 def _tempo_progression(total_s: int,
                        profile: Optional["RiderMetrics"] = None) -> Session:
-    """Tempo progression: shorter blocks that finish at the top of Zone 3."""
+    """Tempo progression: rising blocks that finish at the top of Zone 3.
+
+    Both the block length and the rep count scale with the ride, so the tempo
+    dose tracks classic ``_tempo`` (which grows to 5 x 15min = 75 minutes in
+    zone). The fixed ``4 x 8min`` this used to prescribe gave EVERY session of
+    60 minutes or more the same 32 minutes in zone: a two-hour "Tempo
+    Progression" was 32min of Zone 3 on a 52min Zone 2 base, an endurance dose
+    wearing a tempo label - the same defect already fixed in ``_threshold``.
+
+    Blocks stay shorter than classic's 15min and the ramp from 78% to 86% FTP
+    across them is kept: that rise is the variant's identity, not the dose.
+    """
     warmup = min(600, max(300, total_s // 6))
-    on, off = 480, 240
-    reps = max(2, min(4, (total_s - warmup - 120) // (on + off)))
-    work = reps * (on + off)
-    while warmup + work + 120 > total_s and reps > 2:
-        reps -= 1
-        work = reps * (on + off)
-    while warmup + work > total_s and warmup > 180:
+    # The dose to hit is whatever classic tempo prescribes for this ride, so
+    # the two shapes stay comparable at every duration instead of only at the
+    # 60min the comparability test used to check. Classic emits its tempo work
+    # as `intervals` segments and its Zone 2 base as steadystate, so the work
+    # time is exactly the repeated on-durations.
+    try:
+        target = sum((seg.repeat or 0) * (seg.on_duration or 0)
+                     for seg in _tempo(total_s, profile).segments
+                     if seg.kind == "intervals")
+    except ValueError:
+        target = 0  # classic does not fit either; take the longest that does.
+
+    def fit(warmup: int):
+        """Shape closest to `target` seconds in zone that fits, or None.
+
+        Blocks run 5-11min and 2-8 of them - always shorter than classic's
+        15min, because the point of the variant is the rise across the blocks.
+        Recoveries are 2-4min; a shorter one is only taken when it buys a
+        closer match to the dose. Ties then go to the shape with more reps,
+        which keeps the steps small and the top block earned.
+        """
+        budget = total_s - warmup - 120
+        best = None
+        for off in (240, 180, 120):
+            for reps in range(2, 9):
+                for on in range(300, 661, 60):
+                    if reps * (on + off) <= budget:
+                        cand = ((-abs(reps * on - target) if target
+                                 else reps * on), off, reps, on)
+                        if best is None or cand[:3] > best[:3]:
+                            best = cand
+        return None if best is None else best[1:]
+
+    shape = fit(warmup)
+    while shape is None and warmup > 180:
         warmup -= 60
+        shape = fit(warmup)
+    if shape is None:
+        # Too short for even 2 x 5min: split what is left into two blocks.
+        off, reps = 120, 2
+        on = max(60, ((total_s - warmup - 120) // reps - off) // 60 * 60)
+    else:
+        off, reps, on = shape
     s = Session(
         name="Tempo Progression",
-        description=f"{reps} x 8min tempo progression from 78% to 86% FTP.",
+        description=(f"{reps} x {on // 60}min tempo progression from 78% to "
+                     "86% FTP."),
         workout_type="tempo",
     )
     s.segments.append(Segment(kind="warmup", duration=warmup,
