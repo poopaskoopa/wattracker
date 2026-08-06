@@ -1,6 +1,9 @@
 """Focused regression coverage for first-run onboarding."""
+import ast
 import logging
 import os
+import pathlib
+import re
 import sqlite3
 import inspect
 import time
@@ -10,6 +13,7 @@ import pytest
 pytest.importorskip("httpx")
 from fastapi.testclient import TestClient
 
+import wattracker
 from wattracker import auth, db, paths
 import wattracker.credstore as credstore
 import wattracker.ingest.importer as importer
@@ -56,6 +60,282 @@ def test_new_user_is_incomplete_and_v26_migration_preserves_user(tmp_path, monke
     db.init_db(str(old_db))
     assert db.onboarding_complete(7, str(old_db)) is True
     assert db.get_user_by_username("legacy", str(old_db))["id"] == 7
+
+
+def _pre_onboarding_db(tmp_path, name="pre28.db"):
+    """A database from before migration 28 added onboarding_complete."""
+    old_db = tmp_path / name
+    conn = sqlite3.connect(old_db)
+    conn.executescript(
+        "CREATE TABLE users (id INTEGER PRIMARY KEY, username TEXT UNIQUE NOT NULL, "
+        "password_hash TEXT NOT NULL, created TEXT NOT NULL, calendar_token_hash TEXT);"
+        "CREATE UNIQUE INDEX idx_users_calendar_token_hash ON users(calendar_token_hash);"
+        "INSERT INTO users VALUES (7, 'legacy', 'hash', '2026-01-01', 'abc123');"
+        "INSERT INTO users VALUES (8, 'legacy2', 'hash', '2026-01-02', NULL);"
+        "INSERT INTO users VALUES (9, 'legacy3', 'hash', '2026-01-03', NULL);"
+        "PRAGMA user_version = 26;"
+    )
+    conn.commit()
+    conn.close()
+    return old_db
+
+
+def _users_ddl(path):
+    conn = sqlite3.connect(path)
+    try:
+        return conn.execute(
+            "SELECT sql FROM sqlite_master WHERE type='table' AND name='users'"
+        ).fetchone()[0]
+    finally:
+        conn.close()
+
+
+def _insert_user_without_onboarding_column(path, username):
+    conn = sqlite3.connect(path)
+    try:
+        cur = conn.execute(
+            "INSERT INTO users (username, password_hash, created) VALUES (?, ?, ?)",
+            (username, "hash", "2026-02-02"),
+        )
+        conn.commit()
+        return cur.lastrowid
+    finally:
+        conn.close()
+
+
+def test_fresh_and_migrated_schemas_default_onboarding_to_incomplete(tmp_path):
+    fresh = tmp_path / "fresh.db"
+    db.init_db(str(fresh))
+    migrated = _pre_onboarding_db(tmp_path)
+    db.init_db(str(migrated))
+
+    for path in (fresh, migrated):
+        assert "onboarding_complete INTEGER NOT NULL DEFAULT 0" in _users_ddl(path)
+        # A future INSERT that forgets the column must not pre-complete setup.
+        uid = _insert_user_without_onboarding_column(path, "omitted")
+        assert db.onboarding_complete(uid, str(path)) is False
+
+
+def test_migration_28_keeps_existing_accounts_onboarded_and_intact(tmp_path):
+    migrated = _pre_onboarding_db(tmp_path)
+
+    db.init_db(str(migrated))
+
+    conn = sqlite3.connect(migrated)
+    conn.row_factory = sqlite3.Row
+    try:
+        rows = {r["id"]: r for r in conn.execute("SELECT * FROM users ORDER BY id")}
+        indexes = {
+            r[0] for r in conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='index' AND tbl_name='users'"
+            )
+        }
+    finally:
+        conn.close()
+    assert set(rows) == {7, 8, 9}
+    assert [rows[i]["onboarding_complete"] for i in (7, 8, 9)] == [1, 1, 1]
+    assert rows[7]["calendar_token_hash"] == "abc123"
+    assert rows[8]["calendar_token_hash"] is None
+    assert rows[9]["calendar_token_hash"] is None
+    assert "idx_users_calendar_token_hash" in indexes
+    # New accounts on a migrated database still start incomplete.
+    new_uid = db.create_user("after-migration", "hash", str(migrated))
+    assert db.onboarding_complete(new_uid, str(migrated)) is False
+
+
+def test_init_db_is_rerunnable_after_the_onboarding_migration(tmp_path):
+    migrated = _pre_onboarding_db(tmp_path)
+    db.init_db(str(migrated))
+    uid = db.create_user("fresh-account", "hash", str(migrated))
+    db.complete_onboarding(7, str(migrated))
+
+    db.init_db(str(migrated))
+
+    conn = sqlite3.connect(migrated)
+    try:
+        version = conn.execute("PRAGMA user_version").fetchone()[0]
+        usernames = [r[0] for r in conn.execute("SELECT username FROM users ORDER BY id")]
+    finally:
+        conn.close()
+    assert version == db.SCHEMA_VERSION
+    assert usernames == ["legacy", "legacy2", "legacy3", "fresh-account"]
+    assert db.onboarding_complete(7, str(migrated)) is True
+    assert db.onboarding_complete(uid, str(migrated)) is False
+
+
+def _legacy_default_one_db(tmp_path, name="legacy-default1.db"):
+    """A database carrying the shipped-once ALTER ... DEFAULT 1 users DDL.
+
+    This is the state the owner's live database is in and can never leave:
+    SQLite cannot alter a column default, so the stored DDL keeps DEFAULT 1
+    forever. Any INSERT INTO users that omits onboarding_complete creates an
+    account with the setup wizard already closed.
+    """
+    path = _pre_onboarding_db(tmp_path, name)
+    conn = sqlite3.connect(path)
+    try:
+        conn.execute(
+            "ALTER TABLE users ADD COLUMN onboarding_complete "
+            "INTEGER NOT NULL DEFAULT 1"
+        )
+        conn.execute(f"PRAGMA user_version = {db.SCHEMA_VERSION}")
+        conn.commit()
+    finally:
+        conn.close()
+    assert "DEFAULT 1" in _users_ddl(path)
+    return path
+
+
+def test_user_creation_paths_leave_setup_open_on_a_legacy_default_1_db(
+    tmp_path, monkeypatch
+):
+    """Behavioural barrier: no creation path may inherit the DEFAULT 1."""
+    legacy = _legacy_default_one_db(tmp_path)
+
+    direct = db.create_user("direct", auth.hash_password("password123"), str(legacy))
+    assert db.onboarding_complete(direct, str(legacy)) is False
+
+    # And through the real registration route, on the same legacy database.
+    monkeypatch.setenv("WATTRACKER_DB", str(legacy))
+    with TestClient(create_app()) as registering:
+        assert _users_ddl(legacy).count("DEFAULT 1") == 1  # startup kept the DDL
+        registered = _register(registering, "registered")
+    assert db.onboarding_complete(registered, str(legacy)) is False
+    assert db.onboarding_complete(registered) is False
+
+
+# --------------------------------------------------------------- source scan
+
+_INSERT_USERS = re.compile(
+    r'insert\s+(?:or\s+\w+\s+)?into\s+["\'`\[]?users["\'`\]]?\s*',
+    re.IGNORECASE,
+)
+# Stands in for any run-time-computed piece of a string (f-string field,
+# non-literal concatenation operand). Its presence inside a statement means the
+# column list cannot be verified statically, which counts as a violation.
+_UNKNOWN = "\x00"
+
+
+def _literal_text(node):
+    """Best-effort static text of a string expression, or None."""
+    if isinstance(node, ast.Constant):
+        return node.value if isinstance(node.value, str) else None
+    if isinstance(node, ast.JoinedStr):
+        parts = []
+        for value in node.values:
+            if isinstance(value, ast.Constant) and isinstance(value.value, str):
+                parts.append(value.value)
+            else:
+                parts.append(_UNKNOWN)
+        return "".join(parts)
+    if isinstance(node, ast.BinOp) and isinstance(node.op, ast.Add):
+        left = _literal_text(node.left)
+        right = _literal_text(node.right)
+        if left is None and right is None:
+            return None
+        return (left or _UNKNOWN) + (right or _UNKNOWN)
+    return None
+
+
+def _docstring_nodes(tree):
+    holders = (ast.Module, ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)
+    found = set()
+    for node in ast.walk(tree):
+        if not isinstance(node, holders):
+            continue
+        body = getattr(node, "body", None)
+        if body and isinstance(body[0], ast.Expr):
+            first = body[0].value
+            if isinstance(first, ast.Constant) and isinstance(first.value, str):
+                found.add(id(first))
+    return found
+
+
+def _sql_literals(tree):
+    """Yield (lineno, text) for every string expression in the module.
+
+    Comments never reach the AST at all, and docstrings are excluded: prose
+    that mentions the statement must not be able to stand in for it.
+    """
+    skip = _docstring_nodes(tree)
+    for node in ast.walk(tree):
+        if id(node) in skip:
+            continue
+        text = _literal_text(node)
+        if text is None:
+            continue
+        # A composed expression reports for its operands; don't report twice.
+        for child in ast.walk(node):
+            if child is not node and _literal_text(child) is not None:
+                skip.add(id(child))
+        yield node.lineno, text
+
+
+def _column_list(remainder):
+    """Columns named between the balanced parens starting `remainder`, or None."""
+    if not remainder.startswith("("):
+        return None
+    depth = 0
+    for index, char in enumerate(remainder):
+        if char == "(":
+            depth += 1
+        elif char == ")":
+            depth -= 1
+            if depth == 0:
+                inner = remainder[1:index]
+                return [c.strip().strip('"\'`[]').lower() for c in inner.split(",")]
+    return None
+
+
+def _user_insert_violations(path):
+    tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+    violations = []
+    found = 0
+    for lineno, text in _sql_literals(tree):
+        for match in _INSERT_USERS.finditer(text):
+            found += 1
+            statement = text[match.start():match.start() + 200]
+            columns = _column_list(text[match.end():])
+            if columns is None:
+                violations.append(
+                    f"{path}:{lineno}: INSERT INTO users with no readable "
+                    f"column list: {statement!r}"
+                )
+            elif any(_UNKNOWN in column for column in columns):
+                violations.append(
+                    f"{path}:{lineno}: INSERT INTO users with a computed "
+                    f"column list: {statement!r}"
+                )
+            elif "onboarding_complete" not in columns:
+                violations.append(
+                    f"{path}:{lineno}: INSERT INTO users omits "
+                    f"onboarding_complete: {statement!r}"
+                )
+    return found, violations
+
+
+def test_every_user_insert_names_onboarding_complete():
+    """Defends databases migrated while the ALTER still said DEFAULT 1.
+
+    Parses the whole package rather than grepping: a comment, a docstring or an
+    unrelated nearby line must not be able to satisfy this.
+    """
+    package = pathlib.Path(inspect.getfile(wattracker)).parent
+    sources = sorted(
+        p for p in package.rglob("*.py") if "__pycache__" not in p.parts
+    )
+    assert sources
+
+    found = 0
+    violations = []
+    for source in sources:
+        hits, problems = _user_insert_violations(source)
+        found += hits
+        violations.extend(problems)
+
+    assert not violations, "\n".join(violations)
+    # The barrier is only worth anything while it still sees the real inserts.
+    assert found >= 1, "no INSERT INTO users found in the package"
 
 
 def test_setup_copy_and_dashboard_include_guidance(client):
@@ -452,6 +732,187 @@ def test_onboarding_directory_validation_delegates_to_paths(
     ]
     assert checked.status_code == 202
     assert completed.status_code == 200
+
+
+def _spy_discovery(monkeypatch):
+    """Count the setup-only discovery helpers the dashboard may call."""
+    calls = {"candidates": 0, "estimate": 0}
+
+    def candidates():
+        calls["candidates"] += 1
+        return []
+
+    def estimate(user_id, *_args, **_kwargs):
+        calls["estimate"] += 1
+        return 241.25
+
+    monkeypatch.setattr(paths, "annotated_candidates", candidates)
+    monkeypatch.setattr(importer, "recent_best_effort_ftp", estimate)
+    return calls
+
+
+def test_dashboard_skips_setup_discovery_once_onboarding_is_complete(
+    client, monkeypatch
+):
+    uid = _register(client)
+    db.complete_onboarding(uid)
+    calls = _spy_discovery(monkeypatch)
+
+    response = client.get("/")
+
+    assert response.status_code == 200
+    assert calls == {"candidates": 0, "estimate": 0}
+    assert "setup-wizard" not in response.text
+
+
+def test_dashboard_still_runs_setup_discovery_while_onboarding_is_incomplete(
+    client, monkeypatch
+):
+    uid = _register(client)
+    assert db.onboarding_complete(uid) is False
+    calls = _spy_discovery(monkeypatch)
+
+    response = client.get("/")
+
+    assert response.status_code == 200
+    assert calls == {"candidates": 1, "estimate": 1}
+    # The wizard still renders every value it derives from that work.
+    assert "setup-wizard" in response.text
+    assert "(241.2 W)" in response.text
+
+
+def _setup_post_requests(activities_dir):
+    return (
+        ("/setup/check-directory", {"data": {"activities_dir": str(activities_dir)}}),
+        ("/setup/upload", {
+            "files": [("files", ("ride.fit", b"fit", "application/octet-stream"))]
+        }),
+        ("/setup/ftp", {"data": {"choice": "manual", "manual_ftp": "999"}}),
+        ("/setup/complete", {"data": {
+            "weight_kg": "99", "ftp_choice": "manual", "manual_ftp": "999",
+            "zwiftpower": "no", "activities_dir": str(activities_dir),
+        }}),
+    )
+
+
+def test_setup_page_redirects_to_settings_once_onboarding_is_complete(client):
+    uid = _register(client)
+    assert client.get("/setup").status_code == 200
+
+    db.complete_onboarding(uid)
+    response = client.get("/setup", follow_redirects=False)
+
+    assert response.status_code == 303
+    assert response.headers["location"] == "/settings"
+
+
+def test_setup_posts_are_rejected_without_mutating_after_completion(
+    client, home_dir, monkeypatch
+):
+    uid = _register(client)
+    activities = home_dir / "Activities"
+    activities.mkdir()
+    client.post("/setup/complete", data={
+        "weight_kg": "72", "ftp_choice": "manual", "manual_ftp": "275",
+        "zwiftpower": "no",
+    })
+    assert db.onboarding_complete(uid) is True
+    before = db.get_user_settings(uid)
+    before_ftp = db.latest_ftp(uid)
+
+    monkeypatch.setattr(
+        importer,
+        "ingest_upload",
+        lambda *_a, **_k: pytest.fail("closed setup reached the importer"),
+    )
+    monkeypatch.setattr(
+        credstore,
+        "save_zwift_credentials",
+        lambda *_a, **_k: pytest.fail("closed setup reached the credential store"),
+    )
+
+    for route, kwargs in _setup_post_requests(activities):
+        response = client.post(route, follow_redirects=False, **kwargs)
+        if route == "/setup/complete":
+            assert response.status_code == 303, route
+            assert response.headers["location"] == "/settings"
+        else:
+            assert response.status_code == 409, route
+            assert response.headers["content-type"].startswith("application/json")
+            assert response.json()["error"]
+
+    after = db.get_user_settings(uid)
+    assert after["ftp"] == before["ftp"] == pytest.approx(275)
+    assert after["weight_kg"] == before["weight_kg"] == pytest.approx(72)
+    assert after["activities_dir"] == before["activities_dir"] is None
+    assert after["zwift_id"] == before["zwift_id"]
+    assert db.latest_ftp(uid)["ftp_watts"] == before_ftp["ftp_watts"]
+    assert db.list_activities(uid) == []
+
+
+def test_setup_stays_resumable_for_an_incomplete_rider(client, home_dir, monkeypatch):
+    uid = _register(client)
+    activities = home_dir / "Activities"
+    activities.mkdir()
+    monkeypatch.setattr(
+        importer,
+        "parse_fit",
+        lambda path: {"start_time": "2026-07-01T10:00:00", "duration_s": 60,
+                      "streams": {"power": [200] * 60}},
+    )
+
+    assert client.get("/setup").status_code == 200
+    checked = client.post(
+        "/setup/check-directory", data={"activities_dir": str(activities)}
+    )
+    assert checked.status_code == 202
+    _wait_scan(client)
+    uploaded = client.post(
+        "/setup/upload",
+        files=[("files", ("ride.fit", b"fit", "application/octet-stream"))],
+    )
+    assert uploaded.status_code == 200
+    assert client.post(
+        "/setup/ftp", data={"choice": "manual", "manual_ftp": "255"}
+    ).status_code == 200
+    # Abandon and come back: the wizard is still there and still finishes.
+    assert client.get("/setup").status_code == 200
+    completed = client.post("/setup/complete", data={
+        "weight_kg": "71", "ftp_choice": "manual", "manual_ftp": "265",
+        "zwiftpower": "no",
+    })
+
+    assert completed.status_code == 200
+    assert db.onboarding_complete(uid) is True
+    assert db.get_user_settings(uid)["ftp"] == pytest.approx(265)
+
+
+def test_closed_setup_posts_still_require_authentication(client, home_dir):
+    uid = _register(client)
+    activities = home_dir / "Activities"
+    activities.mkdir()
+    db.complete_onboarding(uid)
+    client.post("/logout")
+
+    for route, kwargs in _setup_post_requests(activities):
+        response = client.post(route, follow_redirects=False, **kwargs)
+        assert response.status_code == 303, route
+        assert response.headers["location"] == "/login", route
+    assert client.get("/setup", follow_redirects=False).headers["location"] == "/login"
+
+
+def test_setup_completion_state_is_read_per_user(client, home_dir):
+    finished = _register(client, "finished")
+    db.complete_onboarding(finished)
+    client.post("/logout")
+    starting = _register(client, "starting")
+
+    assert client.get("/setup").status_code == 200
+    response = client.post("/setup/ftp", data={"choice": "manual", "manual_ftp": "245"})
+
+    assert response.status_code == 200
+    assert db.get_user_settings(starting)["ftp"] == pytest.approx(245)
+    assert db.get_user_settings(finished)["ftp"] is None
 
 
 def test_register_and_root_dashboard_remain_compatible(client):
