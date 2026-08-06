@@ -179,11 +179,13 @@ FTP_PLAUSIBLE_MIN_WATTS = 50.0
 # unusual assertion, it is a typo, a unit mix-up or a corrupt row - and because
 # TSS is quadratic in 1/FTP, honouring it stores load figures in the millions.
 #
-# These bounds are on the SCORING BASIS and are deliberately independent of
-# what any input route accepts. /settings validates nothing today (issue #64,
-# not fixed here), so this is the layer that has to hold; conversely #64 will
-# want a much tighter, friendlier range, and should not be tempted to reuse
-# these numbers as a UI limit.
+# These bounds are on the SCORING BASIS and are enforced here regardless of what
+# any input route accepts: this is the layer that has to hold, because a basis
+# also arrives from migrations, imports and rescores that no form ever touched.
+# Issue #64 has since given the input routes one shared policy
+# (wattracker.ftp_input) which admits exactly this window and challenges the
+# sub-plausible part of it - but that is a courtesy to the rider, not this
+# rail's justification, and removing it must not weaken anything here.
 #
 # Lower: 20 W. Clinical cardiac-rehab and deconditioned-patient ergometry
 # protocols begin at 20-25 W and step up by 25 W, so 20 W is the bottom of the

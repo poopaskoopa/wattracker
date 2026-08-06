@@ -440,4 +440,4 @@ def test_profile_and_validation_post_survive_scalar_power_payload(client, monkey
     assert "250 W" in page.text
     bad = client.post("/profile/ftp", data={"ftp": "bad", "action": "save"})
     assert bad.status_code == 200
-    assert "FTP must be a whole number" in bad.text
+    assert "Enter FTP in watts, from 20 to 700." in bad.text
