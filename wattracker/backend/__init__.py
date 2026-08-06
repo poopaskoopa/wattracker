@@ -31,11 +31,47 @@ __all__ = [
     "BackendUnavailable",
     "ExportManifest",
     "LocalBackend",
+    "discover",
     "get_backend",
+    "is_offline",
     "mode",
 ]
 
 _LOCAL = LocalBackend()
+
+# Sentinels a page can render when the connector is offline: the discovery
+# calls all answer "nothing found here", which is exactly what the templates
+# already handle for a machine with no Zwift install.
+_OFFLINE_DISCOVERY = {
+    "activity_candidates": [],
+    "zwift_id_candidates": [],
+    "default_activities_dir": None,
+    "workouts_root": None,
+}
+
+
+def discover(user_id: Optional[int], what: str):
+    """A discovery call that degrades instead of raising when offline.
+
+    Page rendering must not depend on a connector being attached: the Settings
+    page is exactly where someone goes to find out *why* their connector is
+    not working, so it has to load without one.
+    """
+    if what not in _OFFLINE_DISCOVERY:
+        raise KeyError(f"not a discovery call: {what}")
+    try:
+        return getattr(get_backend(user_id), what)()
+    except BackendUnavailable:
+        return _OFFLINE_DISCOVERY[what]
+
+
+def is_offline(user_id: Optional[int] = None) -> bool:
+    """True when running in server mode with no connector attached."""
+    if mode() == "local":
+        return False
+    from .. import connectorhub
+
+    return not connectorhub.is_attached(user_id)
 
 
 def mode() -> str:

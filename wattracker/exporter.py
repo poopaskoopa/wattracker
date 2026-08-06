@@ -17,7 +17,7 @@ import logging
 from typing import Dict, List, Optional
 
 from . import db
-from .backend import ExportManifest, get_backend
+from .backend import BackendUnavailable, ExportManifest, get_backend
 from .prescribe import zwo
 
 log = logging.getLogger(__name__)
@@ -82,9 +82,13 @@ def sync_plan_exports(user_id: int) -> Dict:
     manifest = plan_export_manifest(user_id)
     if manifest is None:
         settings = db.get_user_settings(user_id)
-        target, reason = backend.resolve_export_dir(
-            settings.get("zwift_id"), settings.get("workouts_dir")
-        )
+        try:
+            target, reason = backend.resolve_export_dir(
+                settings.get("zwift_id"), settings.get("workouts_dir")
+            )
+        except BackendUnavailable:
+            return {"status": "offline", "directory": None, "exported": 0,
+                    "removed": 0, "reason": "offline"}
         if not target:
             return {"status": reason, "directory": None, "exported": 0,
                     "removed": 0, "reason": reason}

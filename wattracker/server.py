@@ -47,7 +47,13 @@ from . import (
     races,
 )
 from .analysis import activity_cache, pipeline, power_profile, zones
-from .backend import ExportManifest, get_backend
+from .backend import (
+    BackendUnavailable,
+    ExportManifest,
+    discover,
+    get_backend,
+    is_offline,
+)
 from .ble import devices as bledevices
 from .ble.runner import RideController, flatten_session
 from .ingest import importer
@@ -164,7 +170,7 @@ def _start_user_scan(user_id: int, directory: Optional[str]) -> Optional[dict]:
                     imported=result.get("imported", 0),
                     skipped=result.get("skipped", 0),
                     directory=d,
-                    exists=bool(d and os.path.isdir(d)),
+                    exists=bool(result.get("exists")),
                     ftp_estimate=(
                         round(importer.recent_best_effort_ftp(user_id), 1)
                         if result.get("imported", 0) else None
@@ -1386,7 +1392,7 @@ def create_app() -> FastAPI:
     def _activities_context(request: Request, scan: Optional[dict] = None) -> dict:
         uid = _uid(request)
         settings = db.get_user_settings(uid)
-        candidates = get_backend(uid).activity_candidates()
+        candidates = discover(uid, "activity_candidates")
         saved = settings.get("activities_dir")
         prefill = saved or (candidates[0]["path"] if candidates else "")
         activities = db.list_activities(uid)
@@ -1698,21 +1704,23 @@ def create_app() -> FastAPI:
         this user returns 409 with the running status (no second scan starts).
         """
         uid = _uid(request)
-        # Confine the posted folder to the same roots /settings allows. This
-        # endpoint both SCANS the path (reading and parsing every *.fit under
-        # it) and PERSISTS it, so without this it was a way to point the
-        # importer - and every later background scan - at any directory on the
-        # machine, straight past the /settings check. Existence is not required
-        # here: the status panel reports "folder not found" for a path that is
-        # simply not on this machine, and scanning a path that does not exist
-        # reads nothing.
-        clean, err = paths.confine_storage_dir(activities_dir, must_exist=False)
-        if err:
-            return JSONResponse({"error": err}, status_code=400)
-        # Persist a typed directory as the user's activities_dir setting.
-        if clean:
-            db.save_user_settings(uid, {"activities_dir": clean})
-        started = _start_user_scan(uid, directory=clean or None)
+        posted = (activities_dir or "").strip()
+        # Persist a typed directory as the user's activities_dir setting -
+        # but only once it has passed the same containment check POST
+        # /settings applies. This route used to save it unchecked, which meant
+        # the Activities page was a way around the validation on the Settings
+        # page for the very same field.
+        if posted:
+            # require_exists=False: a folder that is not there is answered by
+            # the scan status ("exists": false), which is the more useful
+            # response and what the page already renders. Containment under a
+            # trusted root is the part that must not be skippable.
+            clean, error = _validate_dir(posted, uid, require_exists=False)
+            if error:
+                return JSONResponse({"error": error}, status_code=400)
+            posted = clean or posted
+            db.save_user_settings(uid, {"activities_dir": posted})
+        started = _start_user_scan(uid, directory=posted or None)
         if started is None:
             return JSONResponse(_scan_status_snapshot(uid), status_code=409)
         return JSONResponse(started, status_code=202)
@@ -2129,14 +2137,19 @@ def create_app() -> FastAPI:
         """
         settings = db.get_user_settings(uid)
         backend = get_backend(uid)
-        target, reason = backend.resolve_export_dir(
-            settings.get("zwift_id"), settings.get("workouts_dir")
-        )
+        try:
+            target, reason = backend.resolve_export_dir(
+                settings.get("zwift_id"), settings.get("workouts_dir")
+            )
+        except BackendUnavailable:
+            # A new plan is still created and downloadable; only the automatic
+            # write into the Zwift folder is deferred.
+            return {"auto_export": None, "auto_export_reason": "offline"}
         if not target:
             return {
                 "auto_export": None,
                 "auto_export_reason": reason,  # 'choose' | 'missing'
-                "zwift_candidates": backend.zwift_id_candidates(),
+                "zwift_candidates": discover(uid, "zwift_id_candidates"),
             }
         workouts = db.plan_workouts_for_plan(uid, plan_id, include_zwo=True)
         try:
@@ -2985,8 +2998,12 @@ def create_app() -> FastAPI:
             recent_best_effort_ftp=round(importer.recent_best_effort_ftp(uid), 1),
             api_key_set=config.anthropic_api_key_set(),
             saved=saved,
-            zwift_candidates=get_backend(uid).zwift_id_candidates(),
-            watch_default=get_backend(uid).default_activities_dir(),
+            zwift_candidates=discover(uid, "zwift_id_candidates"),
+            watch_default=discover(uid, "default_activities_dir"),
+            # Rendered as a banner: the Settings page is where someone goes
+            # to find out why their connector is not working, so it must
+            # load without one.
+            connector_offline=is_offline(uid),
             # Same contract as the calendar token: the list never contains a
             # secret, and connector_new_token is only ever passed in by the
             # route that just minted it - never read back out of the database.
@@ -3004,7 +3021,7 @@ def create_app() -> FastAPI:
         )
 
     def _validate_dir(
-        value: str, uid: Optional[int] = None
+        value: str, uid: Optional[int] = None, require_exists: bool = True
     ) -> "tuple[Optional[str], Optional[str]]":
         """Validate a user-supplied folder path against the trusted roots.
 
@@ -3013,7 +3030,7 @@ def create_app() -> FastAPI:
         folders, and measuring them against the container's home directory
         would reject every legitimate answer.
         """
-        return get_backend(uid).validate_dir(value)
+        return get_backend(uid).validate_dir(value, require_exists=require_exists)
 
     @app.get("/settings", response_class=HTMLResponse)
     def settings_page(request: Request):
@@ -3274,7 +3291,7 @@ def create_app() -> FastAPI:
             weight_kg=data["weight_kg"],
             rider_id=zid if zid.isdigit() else "",
             saved_zwift_id=zid,
-            workouts_root=get_backend(uid).workouts_root(),
+            workouts_root=discover(uid, "workouts_root"),
             refreshed=refreshed,
         )
 

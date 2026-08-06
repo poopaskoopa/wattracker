@@ -94,8 +94,10 @@ def build_handlers(config: ConnectorConfig) -> Dict[str, Callable]:
         )
         return {"directory": directory, "reason": reason}
 
-    async def paths_validate_dir(value: str = "") -> dict:
-        clean, error = validate_dir(value)
+    async def paths_validate_dir(
+        value: str = "", require_exists: bool = True
+    ) -> dict:
+        clean, error = validate_dir(value, require_exists=require_exists)
         return {"clean": clean, "error": error}
 
     # -------------------------------------------------- activity files
@@ -216,7 +218,9 @@ def build_handlers(config: ConnectorConfig) -> Dict[str, Callable]:
     }
 
 
-def validate_dir(value: str) -> "tuple[Optional[str], Optional[str]]":
+def validate_dir(
+    value: str, require_exists: bool = True
+) -> "tuple[Optional[str], Optional[str]]":
     """Validate a user-supplied folder against this machine's trusted roots.
 
     Character-for-character the check the single-machine install runs in
@@ -228,7 +232,7 @@ def validate_dir(value: str) -> "tuple[Optional[str], Optional[str]]":
     if not raw:
         return "", None
     expanded = os.path.realpath(os.path.abspath(os.path.expanduser(raw)))
-    if not os.path.isdir(expanded):
+    if require_exists and not os.path.isdir(expanded):
         return None, f"Folder not found or not a directory: {raw}"
     for root in paths.trusted_storage_roots():
         resolved_root = os.path.realpath(os.path.abspath(os.path.expanduser(root)))

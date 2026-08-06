@@ -49,21 +49,24 @@ class LocalBackend(Backend):
     ) -> Tuple[Optional[str], str]:
         return paths.resolve_export_dir(zwift_id, override)
 
-    def validate_dir(self, value: str) -> Tuple[Optional[str], Optional[str]]:
+    def validate_dir(
+        self, value: str, require_exists: bool = True
+    ) -> Tuple[Optional[str], Optional[str]]:
         """Validate a user-supplied folder path.
 
-        Returns (clean_path, error). A folder is accepted only when it exists,
-        is a directory, and its real path remains under the user's home,
-        OS-discovered Documents/Zwift roots, or a process-owner environment
-        override. This admits redirected Windows Known Folders and OneDrive/UNC
-        roots without permitting arbitrary web-supplied system paths or symlink
-        escapes. Empty means "unchanged" (clean_path="", error=None).
+        Returns (clean_path, error). A folder is accepted only when its real
+        path remains under the user's home, OS-discovered Documents/Zwift
+        roots, or a process-owner environment override - and, unless
+        ``require_exists`` is False, when it exists and is a directory. This
+        admits redirected Windows Known Folders and OneDrive/UNC roots without
+        permitting arbitrary web-supplied system paths or symlink escapes.
+        Empty means "unchanged" (clean_path="", error=None).
         """
         raw = (value or "").strip()
         if not raw:
             return "", None
         expanded = os.path.realpath(os.path.abspath(os.path.expanduser(raw)))
-        if not os.path.isdir(expanded):
+        if require_exists and not os.path.isdir(expanded):
             return None, f"Folder not found or not a directory: {raw}"
         allowed = False
         for root in paths.trusted_storage_roots():
