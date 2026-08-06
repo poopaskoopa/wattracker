@@ -17,7 +17,6 @@ import datetime as _dt
 import logging
 from typing import List, Optional, Tuple
 
-from ..metrics import profile_store
 from ..prescribe.planner import Session
 from ..timeutil import utc_now
 
@@ -374,8 +373,13 @@ class RideController:
                 pass
 
     def _save(self) -> None:
+        # Imported lazily, like db/importer below: saving is the one thing this
+        # controller does that needs the database. Keeping these out of the
+        # module scope is what lets the connector run the same state machine
+        # without pulling in numpy/scipy/pandas.
         from .. import db
         from ..ingest import importer
+        from ..metrics import profile_store
 
         # started_at is naive UTC, like the timestamps parsed out of .fit files -
         # the same ride recorded by both the app and Zwift has to land on the

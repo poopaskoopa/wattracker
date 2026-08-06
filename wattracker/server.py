@@ -39,11 +39,11 @@ from . import (
     credstore,
     db,
     exporter,
-    paths,
     power_corrections,
     races,
 )
 from .analysis import activity_cache, pipeline, power_profile, zones
+from .backend import ExportManifest, get_backend
 from .ble import devices as bledevices
 from .ble.runner import RideController, flatten_session
 from .ingest import importer
@@ -1354,7 +1354,7 @@ def create_app() -> FastAPI:
     def _activities_context(request: Request, scan: Optional[dict] = None) -> dict:
         uid = _uid(request)
         settings = db.get_user_settings(uid)
-        candidates = paths.annotated_candidates()
+        candidates = get_backend(uid).activity_candidates()
         saved = settings.get("activities_dir")
         prefill = saved or (candidates[0]["path"] if candidates else "")
         activities = db.list_activities(uid)
@@ -2096,32 +2096,28 @@ def create_app() -> FastAPI:
         user at the Settings picker. Never guesses between player folders.
         """
         settings = db.get_user_settings(uid)
-        target, reason = paths.resolve_export_dir(
+        backend = get_backend(uid)
+        target, reason = backend.resolve_export_dir(
             settings.get("zwift_id"), settings.get("workouts_dir")
         )
         if not target:
             return {
                 "auto_export": None,
-                "auto_export_reason": reason,  # 'choose' | 'missing' | 'blocked'
-                "auto_export_detail": "",
-                "zwift_candidates": paths.candidate_zwift_ids(),
+                "auto_export_reason": reason,  # 'choose' | 'missing'
+                "zwift_candidates": backend.zwift_id_candidates(),
             }
         workouts = db.plan_workouts_for_plan(uid, plan_id, include_zwo=True)
         try:
-            result = zwo.write_plan_to_zwift(
-                [
-                    {"date": w["date"], "name": w["name"], "zwo": w["zwo_or_segments"]}
-                    for w in workouts
-                ],
-                settings.get("zwift_id"),
-                # The STORED setting, not ``target``. workouts_override is the
-                # untrusted user value; handing a resolved directory back to it
-                # re-labels a folder the app DISCOVERED as one the user
-                # SUBMITTED, and it is then judged by the stricter
-                # submitted-path rule - which is how a relocated (junctioned)
-                # Zwift player folder resolved fine here and was refused one
-                # call later. Same resolver, same inputs, same directory.
-                workouts_override=settings.get("workouts_dir"),
+            result = backend.apply_exports(
+                ExportManifest(
+                    zwift_id=settings.get("zwift_id") or "me",
+                    override=settings.get("workouts_dir"),
+                    write=[
+                        {"date": w["date"], "name": w["name"],
+                         "zwo": w["zwo_or_segments"]}
+                        for w in workouts
+                    ],
+                )
             )
         except paths.ExportTargetUnavailable as e:
             # The plan's rows are already committed at this point, so this may
@@ -2147,7 +2143,7 @@ def create_app() -> FastAPI:
                     "auto_export_detail": str(e)}
         return {
             "auto_export": {
-                "count": result["count"],
+                "count": result["exported"],
                 "directory": result["directory"],
                 "reason": reason,
             },
@@ -2324,23 +2320,19 @@ def create_app() -> FastAPI:
         exported = None
         export_error = None
         if workouts:
-            try:
-                result = zwo.write_plan_to_zwift(
-                    [
+            result = get_backend(uid).apply_exports(
+                ExportManifest(
+                    zwift_id=settings.get("zwift_id") or "me",
+                    override=settings.get("workouts_dir"),
+                    write=[
                         {"date": w["date"], "name": w["name"],
                          "zwo": w["zwo_or_segments"]}
                         for w in workouts
                     ],
-                    settings.get("zwift_id"),
-                    workouts_override=settings.get("workouts_dir"),
+                    resolution="direct",
                 )
-            except paths.ExportTargetUnavailable as e:
-                # Nothing was written or created; the page explains why and
-                # points at Settings rather than claiming a bogus directory.
-                export_error = _export_error(e)
-            else:
-                exported = {"count": result["count"],
-                            "directory": result["directory"]}
+            )
+            exported = {"count": result["exported"], "directory": result["directory"]}
         summary = _plan_summary(uid, plan_id)
         return templates.TemplateResponse(
             request,
@@ -2396,18 +2388,16 @@ def create_app() -> FastAPI:
         summary = None
         if w:
             settings = db.get_user_settings(uid)
-            try:
-                result = zwo.write_plan_to_zwift(
-                    [{"date": w["date"], "name": w["name"],
-                      "zwo": w["zwo_or_segments"]}],
-                    settings.get("zwift_id"),
-                    workouts_override=settings.get("workouts_dir"),
+            result = get_backend(uid).apply_exports(
+                ExportManifest(
+                    zwift_id=settings.get("zwift_id") or "me",
+                    override=settings.get("workouts_dir"),
+                    write=[{"date": w["date"], "name": w["name"],
+                            "zwo": w["zwo_or_segments"]}],
+                    resolution="direct",
                 )
-            except paths.ExportTargetUnavailable as e:
-                export_error = _export_error(e)
-            else:
-                exported = {"count": result["count"],
-                            "directory": result["directory"]}
+            )
+            exported = {"count": result["exported"], "directory": result["directory"]}
             summary = _plan_summary(uid, w["plan_id"])
         return templates.TemplateResponse(
             request,
@@ -2882,22 +2872,14 @@ def create_app() -> FastAPI:
                 status_code=400,
             )
         settings = db.get_user_settings(uid)
-        try:
-            result = zwo.write_plan_to_zwift(
-                [{"date": scheduled, "name": last["name"], "zwo": last["zwo"]}],
-                settings.get("zwift_id"),
-                workouts_override=settings.get("workouts_dir"),
+        result = get_backend(uid).apply_exports(
+            ExportManifest(
+                zwift_id=settings.get("zwift_id") or "me",
+                override=settings.get("workouts_dir"),
+                write=[{"date": scheduled, "name": last["name"], "zwo": last["zwo"]}],
+                resolution="direct",
             )
-        except paths.ExportTargetUnavailable as e:
-            # No file exists, so no standalone_workouts row is recorded either:
-            # that row is what the calendar and the completion matcher treat as
-            # "this workout was exported to Zwift".
-            return templates.TemplateResponse(
-                request,
-                "plan.html",
-                _generate_ctx(request, mode="workout",
-                              export_error=_export_error(e)),
-            )
+        )
         export_key = hashlib.sha256(
             f"{scheduled}\0{last['name']}\0{last['zwo']}".encode("utf-8")
         ).hexdigest()
@@ -2968,8 +2950,8 @@ def create_app() -> FastAPI:
             recent_best_effort_ftp=round(importer.recent_best_effort_ftp(uid), 1),
             api_key_set=config.anthropic_api_key_set(),
             saved=saved,
-            zwift_candidates=paths.candidate_zwift_ids(),
-            watch_default=paths.activities_dir(),
+            zwift_candidates=get_backend(uid).zwift_id_candidates(),
+            watch_default=get_backend(uid).default_activities_dir(),
             zwift_creds_saved=credstore.credentials_saved(uid),
             zwift_cred_backend=credstore.storage_backend(),
             cred_message=cred_message,
@@ -2979,13 +2961,17 @@ def create_app() -> FastAPI:
             restore_cmd=_restore_command(),
         )
 
-    def _validate_dir(value: str) -> "tuple[Optional[str], Optional[str]]":
-        """Confine a user-supplied folder path (must already exist).
+    def _validate_dir(
+        value: str, uid: Optional[int] = None
+    ) -> "tuple[Optional[str], Optional[str]]":
+        """Validate a user-supplied folder path against the trusted roots.
 
-        Thin wrapper over paths.confine_storage_dir so this route and
-        /activities/rescan share one rule; see that function for the policy.
+        Delegated to the backend because the check has to run on the machine
+        that owns the path: in a server/client install these are the *client's*
+        folders, and measuring them against the container's home directory
+        would reject every legitimate answer.
         """
-        return paths.confine_storage_dir(value, must_exist=True)
+        return get_backend(uid).validate_dir(value)
 
     @app.get("/settings", response_class=HTMLResponse)
     def settings_page(request: Request):
@@ -3034,11 +3020,11 @@ def create_app() -> FastAPI:
         # Confine user-supplied folders to existing directories under $HOME; a
         # rejected folder is dropped from the update (existing value kept).
         dir_msgs: List[str] = []
-        clean_activities, act_err = _validate_dir(activities_dir)
+        clean_activities, act_err = _validate_dir(activities_dir, uid)
         if act_err:
             dir_msgs.append(act_err)
             clean_activities = ""  # don't persist an invalid path
-        clean_workouts, wk_err = _validate_dir(workouts_dir)
+        clean_workouts, wk_err = _validate_dir(workouts_dir, uid)
         if wk_err:
             dir_msgs.append(wk_err)
             clean_workouts = ""
@@ -3189,7 +3175,7 @@ def create_app() -> FastAPI:
             weight_kg=data["weight_kg"],
             rider_id=zid if zid.isdigit() else "",
             saved_zwift_id=zid,
-            workouts_root=paths.zwift_workouts_root(),
+            workouts_root=get_backend(uid).workouts_root(),
             refreshed=refreshed,
         )
 
