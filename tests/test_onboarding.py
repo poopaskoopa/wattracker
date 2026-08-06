@@ -1,6 +1,9 @@
 """Focused regression coverage for first-run onboarding."""
+import ast
 import logging
 import os
+import pathlib
+import re
 import sqlite3
 import inspect
 import time
@@ -10,6 +13,7 @@ import pytest
 pytest.importorskip("httpx")
 from fastapi.testclient import TestClient
 
+import wattracker
 from wattracker import auth, db, paths
 import wattracker.credstore as credstore
 import wattracker.ingest.importer as importer
@@ -159,25 +163,179 @@ def test_init_db_is_rerunnable_after_the_onboarding_migration(tmp_path):
     assert db.onboarding_complete(uid, str(migrated)) is False
 
 
+def _legacy_default_one_db(tmp_path, name="legacy-default1.db"):
+    """A database carrying the shipped-once ALTER ... DEFAULT 1 users DDL.
+
+    This is the state the owner's live database is in and can never leave:
+    SQLite cannot alter a column default, so the stored DDL keeps DEFAULT 1
+    forever. Any INSERT INTO users that omits onboarding_complete creates an
+    account with the setup wizard already closed.
+    """
+    path = _pre_onboarding_db(tmp_path, name)
+    conn = sqlite3.connect(path)
+    try:
+        conn.execute(
+            "ALTER TABLE users ADD COLUMN onboarding_complete "
+            "INTEGER NOT NULL DEFAULT 1"
+        )
+        conn.execute(f"PRAGMA user_version = {db.SCHEMA_VERSION}")
+        conn.commit()
+    finally:
+        conn.close()
+    assert "DEFAULT 1" in _users_ddl(path)
+    return path
+
+
+def test_user_creation_paths_leave_setup_open_on_a_legacy_default_1_db(
+    tmp_path, monkeypatch
+):
+    """Behavioural barrier: no creation path may inherit the DEFAULT 1."""
+    legacy = _legacy_default_one_db(tmp_path)
+
+    direct = db.create_user("direct", auth.hash_password("password123"), str(legacy))
+    assert db.onboarding_complete(direct, str(legacy)) is False
+
+    # And through the real registration route, on the same legacy database.
+    monkeypatch.setenv("WATTRACKER_DB", str(legacy))
+    with TestClient(create_app()) as registering:
+        assert _users_ddl(legacy).count("DEFAULT 1") == 1  # startup kept the DDL
+        registered = _register(registering, "registered")
+    assert db.onboarding_complete(registered, str(legacy)) is False
+    assert db.onboarding_complete(registered) is False
+
+
+# --------------------------------------------------------------- source scan
+
+_INSERT_USERS = re.compile(
+    r'insert\s+(?:or\s+\w+\s+)?into\s+["\'`\[]?users["\'`\]]?\s*',
+    re.IGNORECASE,
+)
+# Stands in for any run-time-computed piece of a string (f-string field,
+# non-literal concatenation operand). Its presence inside a statement means the
+# column list cannot be verified statically, which counts as a violation.
+_UNKNOWN = "\x00"
+
+
+def _literal_text(node):
+    """Best-effort static text of a string expression, or None."""
+    if isinstance(node, ast.Constant):
+        return node.value if isinstance(node.value, str) else None
+    if isinstance(node, ast.JoinedStr):
+        parts = []
+        for value in node.values:
+            if isinstance(value, ast.Constant) and isinstance(value.value, str):
+                parts.append(value.value)
+            else:
+                parts.append(_UNKNOWN)
+        return "".join(parts)
+    if isinstance(node, ast.BinOp) and isinstance(node.op, ast.Add):
+        left = _literal_text(node.left)
+        right = _literal_text(node.right)
+        if left is None and right is None:
+            return None
+        return (left or _UNKNOWN) + (right or _UNKNOWN)
+    return None
+
+
+def _docstring_nodes(tree):
+    holders = (ast.Module, ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)
+    found = set()
+    for node in ast.walk(tree):
+        if not isinstance(node, holders):
+            continue
+        body = getattr(node, "body", None)
+        if body and isinstance(body[0], ast.Expr):
+            first = body[0].value
+            if isinstance(first, ast.Constant) and isinstance(first.value, str):
+                found.add(id(first))
+    return found
+
+
+def _sql_literals(tree):
+    """Yield (lineno, text) for every string expression in the module.
+
+    Comments never reach the AST at all, and docstrings are excluded: prose
+    that mentions the statement must not be able to stand in for it.
+    """
+    skip = _docstring_nodes(tree)
+    for node in ast.walk(tree):
+        if id(node) in skip:
+            continue
+        text = _literal_text(node)
+        if text is None:
+            continue
+        # A composed expression reports for its operands; don't report twice.
+        for child in ast.walk(node):
+            if child is not node and _literal_text(child) is not None:
+                skip.add(id(child))
+        yield node.lineno, text
+
+
+def _column_list(remainder):
+    """Columns named between the balanced parens starting `remainder`, or None."""
+    if not remainder.startswith("("):
+        return None
+    depth = 0
+    for index, char in enumerate(remainder):
+        if char == "(":
+            depth += 1
+        elif char == ")":
+            depth -= 1
+            if depth == 0:
+                inner = remainder[1:index]
+                return [c.strip().strip('"\'`[]').lower() for c in inner.split(",")]
+    return None
+
+
+def _user_insert_violations(path):
+    tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+    violations = []
+    found = 0
+    for lineno, text in _sql_literals(tree):
+        for match in _INSERT_USERS.finditer(text):
+            found += 1
+            statement = text[match.start():match.start() + 200]
+            columns = _column_list(text[match.end():])
+            if columns is None:
+                violations.append(
+                    f"{path}:{lineno}: INSERT INTO users with no readable "
+                    f"column list: {statement!r}"
+                )
+            elif any(_UNKNOWN in column for column in columns):
+                violations.append(
+                    f"{path}:{lineno}: INSERT INTO users with a computed "
+                    f"column list: {statement!r}"
+                )
+            elif "onboarding_complete" not in columns:
+                violations.append(
+                    f"{path}:{lineno}: INSERT INTO users omits "
+                    f"onboarding_complete: {statement!r}"
+                )
+    return found, violations
+
+
 def test_every_user_insert_names_onboarding_complete():
-    """Defends databases migrated while the ALTER still said DEFAULT 1."""
-    source = inspect.getsource(db)
-    statements = [
-        source[hit:hit + 200] for hit in _find_all(source, '"INSERT INTO users')
-    ]
-    assert statements
-    for statement in statements:
-        assert "onboarding_complete" in statement, statement
+    """Defends databases migrated while the ALTER still said DEFAULT 1.
 
+    Parses the whole package rather than grepping: a comment, a docstring or an
+    unrelated nearby line must not be able to satisfy this.
+    """
+    package = pathlib.Path(inspect.getfile(wattracker)).parent
+    sources = sorted(
+        p for p in package.rglob("*.py") if "__pycache__" not in p.parts
+    )
+    assert sources
 
-def _find_all(haystack, needle):
-    start = 0
-    while True:
-        found = haystack.find(needle, start)
-        if found < 0:
-            return
-        yield found
-        start = found + len(needle)
+    found = 0
+    violations = []
+    for source in sources:
+        hits, problems = _user_insert_violations(source)
+        found += hits
+        violations.extend(problems)
+
+    assert not violations, "\n".join(violations)
+    # The barrier is only worth anything while it still sees the real inserts.
+    assert found >= 1, "no INSERT INTO users found in the package"
 
 
 def test_setup_copy_and_dashboard_include_guidance(client):
