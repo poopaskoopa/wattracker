@@ -159,8 +159,24 @@ def auto_scan_enabled() -> bool:
     return os.environ.get("WATTRACKER_AUTO_SCAN", "1") not in ("0", "false", "no")
 
 
+def allow_non_loopback() -> bool:
+    """Whether a non-loopback bind is permitted (WATTRACKER_ALLOW_NON_LOOPBACK).
+
+    Off by default, and deliberately a separate variable from WATTRACKER_HOST
+    rather than something inferred from it. Binding beyond loopback is the one
+    change that turns this from a personal app into a networked service, and
+    every other control here - the Host allowlist, the WebSocket origin check,
+    a session cookie with no Secure flag - was written on the assumption that
+    it never happens. Requiring a second, explicit opt-in means it cannot be
+    done by fat-fingering a host, and it makes the container image the only
+    thing in the tree that asks for it.
+    """
+    raw = os.environ.get("WATTRACKER_ALLOW_NON_LOOPBACK", "").strip().lower()
+    return raw in ("1", "true", "yes", "on")
+
+
 def server_host() -> str:
-    """Validated loopback bind host (Windows v1 is intentionally local-only)."""
+    """Validated bind host. Loopback-only unless explicitly opted out of."""
     raw = os.environ.get("WATTRACKER_HOST", "127.0.0.1").strip()
     if raw.startswith("[") and raw.endswith("]"):
         raw = raw[1:-1]
@@ -170,7 +186,14 @@ def server_host() -> str:
         return "localhost"
     if raw in ("127.0.0.1", "::1"):
         return raw
-    raise ValueError("WATTRACKER_HOST must be loopback-only (127.0.0.1, localhost, or ::1)")
+    if allow_non_loopback():
+        return raw
+    raise ValueError(
+        "WATTRACKER_HOST must be loopback-only (127.0.0.1, localhost, or ::1). "
+        "To bind an interface reachable from the network - which is what the "
+        "container image does - also set WATTRACKER_ALLOW_NON_LOOPBACK=1, and "
+        "read the exposure note in the README first."
+    )
 
 
 def server_port() -> int:
@@ -196,25 +219,9 @@ _DNS_LABEL_RE = re.compile(r"\A[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\Z")
 _PUBLIC_HOST_FORBIDDEN = frozenset("/\\?#@*[]\"'%,;&=<>{}|^`~+$!()")
 
 
-def public_host() -> Optional[str]:
-    """Validated external hostname this app is reached by (WATTRACKER_PUBLIC_HOST).
-
-    Unset or empty -> None, and behaviour is exactly the default posture: the
-    Host allowlist stays loopback-only and calendar links are minted from the
-    request's own base URL. Set, it names the one extra host the server will
-    answer to (a ``tailscale serve`` tailnet name, say) and the host calendar
-    subscription links are built from.
-
-    This value is appended to a security allowlist, so it is the one place a
-    typo could widen exposure: it accepts an exact DNS hostname with an
-    optional ``:port`` and nothing else, and anything else raises. A wildcard
-    in any form is rejected - the allowlist does no pattern matching and must
-    never be given a value that looks like it does. The hostname is lowercased
-    because DNS names are case-insensitive while the allowlist comparison is
-    not; normalising here is what stops ``Foo.ts.net`` from either bypassing or
-    silently missing the entry.
-    """
-    raw = os.environ.get("WATTRACKER_PUBLIC_HOST", "").strip()
+def _validate_public_host(raw: str) -> Optional[str]:
+    """Validate one external hostname with an optional port. See public_host."""
+    raw = (raw or "").strip()
     if not raw:
         return None
     err = ValueError(
@@ -250,6 +257,60 @@ def public_host() -> Optional[str]:
     if any(not _DNS_LABEL_RE.match(label) for label in host.split(".")):
         raise err
     return f"{host}:{port}" if port else host
+
+
+def public_host() -> Optional[str]:
+    """Validated external hostname this app is reached by (WATTRACKER_PUBLIC_HOST).
+
+    Unset or empty -> None, and behaviour is exactly the default posture: the
+    Host allowlist stays loopback-only and calendar links are minted from the
+    request's own base URL. Set, it names the one extra host the server will
+    answer to (a ``tailscale serve`` tailnet name, say) and the host calendar
+    subscription links are built from.
+
+    This value is appended to a security allowlist, so it is the one place a
+    typo could widen exposure: it accepts an exact DNS hostname with an
+    optional ``:port`` and nothing else, and anything else raises. A wildcard
+    in any form is rejected - the allowlist does no pattern matching and must
+    never be given a value that looks like it does. The hostname is lowercased
+    because DNS names are case-insensitive while the allowlist comparison is
+    not; normalising here is what stops ``Foo.ts.net`` from either bypassing or
+    silently missing the entry.
+    """
+    return _validate_public_host(os.environ.get("WATTRACKER_PUBLIC_HOST", ""))
+
+
+def public_hosts() -> "list[str]":
+    """Every external name this app answers to (WATTRACKER_PUBLIC_HOSTS).
+
+    ``public_host`` accepts exactly one name, which is enough for a single
+    ``tailscale serve`` hostname but not for a LAN, where the same server is
+    legitimately reached as an IP, a short hostname and a .local name at the
+    same time. This is the comma-separated form; each value goes through the
+    identical, already-strict ``public_host`` validator, so widening the count
+    does not widen what any single entry may be. Duplicates and the value of
+    WATTRACKER_PUBLIC_HOST itself are folded in, order preserved.
+    """
+    out: "list[str]" = []
+    single = public_host()
+    if single:
+        out.append(single)
+    for part in os.environ.get("WATTRACKER_PUBLIC_HOSTS", "").split(","):
+        validated = _validate_public_host(part)
+        if validated and validated not in out:
+            out.append(validated)
+    return out
+
+
+def cookie_secure() -> bool:
+    """Whether the session cookie carries the Secure flag.
+
+    Off by default because the app speaks plain http; turn it on the moment
+    something terminates TLS in front (tailscale serve, Caddy), or the cookie
+    will travel in the clear to anyone on the same network.
+    """
+    raw = os.environ.get("WATTRACKER_COOKIE_SECURE", "").strip().lower()
+    return raw in ("1", "true", "yes", "on")
 
 
 def public_scheme() -> str:

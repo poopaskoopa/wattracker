@@ -804,6 +804,12 @@ def create_app() -> FastAPI:
         secret_key=config.session_secret(),
         session_cookie="wattracker_session",
         same_site="lax",
+        # same_site="lax" is the CSRF control and holds regardless: a
+        # cross-site POST carries no cookie at all. Secure is separate - it
+        # keeps the cookie off a plain-http hop - and defaults off because
+        # this app speaks http. Turn it on the moment TLS is terminated in
+        # front, or the cookie is readable by anyone on the same network.
+        https_only=config.cookie_secure(),
     )
     allowed_hosts = ["localhost", "127.0.0.1", "[::1]", "::1", "testserver"]
     # An optional single extra name, so a reverse proxy on the owner's tailnet
@@ -824,15 +830,19 @@ def create_app() -> FastAPI:
     # anyone who resolves that name, with only the session cookie (and, for the
     # feed, a URL-borne token) in the way. This app is designed as a
     # single-user local server - the CSRF story is a same-origin check, the
-    # session cookie is not Secure, and there is no rate limiting beyond
-    # /login. Do not set this to an internet-facing name.
-    public_host = config.public_host()
-    if public_host:
+    # session cookie is not Secure by default, and there is no rate limiting
+    # beyond /login. Do not set this to an internet-facing name.
+    #
+    # WATTRACKER_PUBLIC_HOSTS takes several, because one server on a LAN is
+    # legitimately reached as an IP, a short hostname and a .local name at the
+    # same time. Each value goes through the identical validator, so the count
+    # widens but what any single entry may be does not.
+    for public_host in config.public_hosts():
         # The value may carry ":port"; strip it with the middleware's own
         # parser so the entry is exactly what _host_only() will produce for an
         # incoming Host header (Starlette compares the host portion only).
         host_only = IPv6TrustedHostMiddleware._host_only(public_host)
-        if host_only:
+        if host_only and host_only not in allowed_hosts:
             allowed_hosts.append(host_only)
     app.add_middleware(
         IPv6TrustedHostMiddleware,
@@ -3616,9 +3626,16 @@ def create_app() -> FastAPI:
             )
 
     def _ws_origin_ok(websocket: WebSocket) -> bool:
-        """Allow only same-origin (local) browsers; a cross-site page always
-        sends an Origin that won't match. A missing Origin (native BLE/CLI
-        clients that aren't browsers) is allowed."""
+        """Allow only same-origin browsers; a cross-site page always sends an
+        Origin that won't match. A missing Origin (native BLE/CLI clients that
+        aren't browsers) is allowed.
+
+        The configured public hosts count as same-origin: reached over a LAN
+        name, the ride page's own Origin *is* that name, so an allowlist of
+        just localhost would refuse the very page this server served. The
+        names come from the same validated setting that feeds the Host
+        allowlist, so this cannot be widened independently of that.
+        """
         origin = websocket.headers.get("origin")
         if not origin:
             return True
@@ -3626,7 +3643,12 @@ def create_app() -> FastAPI:
             host = _url.urlparse(origin).hostname
         except ValueError:
             return False
-        return host in _ALLOWED_WS_ORIGIN_HOSTS
+        if host in _ALLOWED_WS_ORIGIN_HOSTS:
+            return True
+        return any(
+            host == IPv6TrustedHostMiddleware._host_only(public)
+            for public in config.public_hosts()
+        )
 
     def _selected_ble_addresses(params) -> Optional[dict]:
         """Parse an explicit, bounded sensor selection from WS query params."""
