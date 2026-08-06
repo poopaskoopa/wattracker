@@ -683,10 +683,18 @@ def _tempo_progression(total_s: int,
                               text="Warm up into tempo pace."))
     for i in range(reps):
         power = 0.78 + 0.08 * i / max(1, reps - 1)
-        s.segments.append(Segment(kind="intervals", duration=on + off,
-                                  repeat=1, on_duration=on, off_duration=off,
-                                  on_power=power, off_power=0.55,
-                                  text=f"Tempo block at {power * 100:.0f}% FTP."))
+        text = f"Tempo block at {power * 100:.0f}% FTP."
+        if i == reps - 1:
+            # The top block is the one the whole ramp builds to, and it used to
+            # be followed by a 2-4min recovery that ran straight into the
+            # cooldown - the "two easy blocks back to back" `_interval_block`
+            # exists to prevent. Emitting it through the helper drops that last
+            # recovery; the seconds return to the Zone 2 base via `_finish`.
+            s.segments.extend(_interval_block(1, on, off, power, 0.55, text=text))
+        else:
+            s.segments.append(Segment(kind="intervals", duration=on + off,
+                                      repeat=1, on_duration=on, off_duration=off,
+                                      on_power=power, off_power=0.55, text=text))
     return _finish(s, total_s)
 
 
@@ -820,30 +828,104 @@ def _sprint_recovery_waves(total_s: int,
 # name and structure so day-to-day plan workouts feel different. The `classic`
 # variant of every kind is the original builder above, reproduced byte-for-byte
 # when variant is None/"classic" so legacy plan rows rebuild identically.
+#
+# "Comparable time-in-zone" is enforced, not hoped for: every variant whose
+# shape is fitted to the ride reads its target dose off the classic builder for
+# the same `total_s` via `_classic_dose` and searches its own shape space for
+# the closest match. Hard-coded rep counts are what broke six variants (a fixed
+# 3 x 9min of over-unders bought no more threshold time on a four-hour ride than
+# on an hour; a fixed 5-4-3-2 ladder delivered 58% of a VO2max dose), so a
+# variant must not carry a literal shape that ignores the ride length.
 # ---------------------------------------------------------------------------
+
+
+def _dose_in_band(session: Session, kind: str) -> int:
+    """Seconds `session` prescribes inside `kind`'s published power band.
+
+    The band is read from ``WORKOUT_TYPE_INFO`` rather than a literal, so the
+    dose a builder aims at is the same number the picker advertises to the
+    rider. A `high` of None (the open-ended sprint level) means no ceiling.
+    """
+    info = workout_type_info(kind)
+    if info is None:
+        return 0
+    low = info["low"]
+    high = float("inf") if info["high"] is None else info["high"]
+    tol = 1e-9
+
+    def inside(power: Optional[float]) -> bool:
+        return power is not None and low - tol <= power <= high + tol
+
+    total = 0
+    for s in session.segments:
+        if s.kind == "intervals" and s.repeat:
+            if inside(s.on_power):
+                total += s.repeat * (s.on_duration or 0)
+            if inside(s.off_power):
+                total += s.repeat * (s.off_duration or 0)
+        elif s.kind == "steadystate" and inside(s.power):
+            total += s.duration
+        elif s.kind == "freeride" and inside(s.load_fraction):
+            total += s.duration
+    return total
+
+
+def _classic_dose(kind: str, total_s: int,
+                  profile: Optional["RiderMetrics"] = None) -> int:
+    """The in-band dose classic prescribes for this ride length.
+
+    Returns 0 when classic itself does not fit the ride, which the callers read
+    as "no target - take the largest shape that fits".
+    """
+    try:
+        classic = _VARIANT_BUILDERS[kind]["classic"](total_s, profile)
+    except (KeyError, ValueError):
+        return 0
+    return _dose_in_band(classic, kind)
 
 
 def _vo2max_short_short(total_s: int,
                         profile: Optional["RiderMetrics"] = None) -> Session:
-    """VO2max 30/30s: sets of 10 x 30s @118% / 30s easy."""
-    warmup = 600
-    on, off, per_set = 30, 30, 10
-    set_len = per_set * (on + off)  # 600s
+    """VO2max 30/30s: sets of 30s @118% / 30s easy, dosed like classic.
+
+    Both the set count and the reps per set are fitted, because a fixed
+    ``4 sets of 10`` could not fit an hour (it settled for 3 sets = 15min) and
+    could not grow past 20min on any longer ride, against classic's 24. The
+    30/30 alternation is the variant's identity and is untouched; only how many
+    of them are prescribed follows the ride.
+    """
+    warmup_max = 600
+    on, off = 30, 30
     set_rest = 180
-    sets = 4
+    target = _classic_dose("vo2max", total_s, profile)
 
-    def used(n: int) -> int:
-        return warmup + n * set_len + max(0, n - 1) * set_rest
+    def used(sets: int, per_set: int, wu: int) -> int:
+        # No recovery after the final rep of a set (see ``_interval_block``).
+        return (wu + sets * (per_set * (on + off) - off)
+                + max(0, sets - 1) * set_rest)
 
-    while sets > 2 and used(sets) + 120 > total_s:
-        sets -= 1
-    while used(sets) + 120 > total_s and warmup > 300:
-        warmup -= 60
+    best = None
+    for wu in range(warmup_max, 179, -60):
+        for sets in range(2, 5):
+            for per_set in range(6, 16):
+                if used(sets, per_set, wu) + 120 > total_s:
+                    continue
+                work = sets * per_set * on
+                # Closest dose first; then the longest warmup that still
+                # delivers it; then the most sets, which keeps each set short
+                # enough to stay a quality 30/30 block.
+                key = (-abs(work - target) if target else work, wu, sets)
+                if best is None or key > best[0]:
+                    best = (key, wu, sets, per_set)
+    if best is None:  # ride too short for even 2 x 6 reps
+        warmup, sets, per_set = 180, 2, 6
+    else:
+        _, warmup, sets, per_set = best
     on_power = vo2_power(1.18, profile)
     s = Session(
         name="VO2max 30/30s",
-        description=(f"{sets} sets of 10 x 30s at {on_power * 100:.0f}% FTP / "
-                     "30s easy."),
+        description=(f"{sets} sets of {per_set} x 30s at "
+                     f"{on_power * 100:.0f}% FTP / 30s easy."),
         workout_type="vo2max",
     )
     s.segments.append(
@@ -851,11 +933,9 @@ def _vo2max_short_short(total_s: int,
                 text="Progressive warmup with a couple of openers.")
     )
     for k in range(sets):
-        s.segments.append(
-            Segment(kind="intervals", duration=set_len, repeat=per_set,
-                    on_duration=on, off_duration=off,
-                    on_power=on_power, off_power=0.55,
-                    text="30s hard / 30s easy - punchy VO2 efforts.")
+        s.segments.extend(
+            _interval_block(per_set, on, off, on_power, 0.55,
+                            text="30s hard / 30s easy - punchy VO2 efforts.")
         )
         if k < sets - 1:
             s.segments.append(
@@ -867,10 +947,16 @@ def _vo2max_short_short(total_s: int,
 
 def _vo2max_long_intervals(total_s: int,
                            profile: Optional["RiderMetrics"] = None) -> Session:
-    """VO2max long intervals: 4 x 5min @108% FTP."""
+    """VO2max long intervals: 5min efforts @108% FTP, dosed like classic.
+
+    The rep count comes from classic's dose for the same ride rather than a
+    fixed 4: classic grows from 5 x 4min to 6 x 4min at 75min and beyond, and
+    a variant stuck at 4 x 5min delivered 83% of it from there on.
+    """
     warmup = 600
     on, off = 300, 240
-    reps = 4
+    target = _classic_dose("vo2max", total_s, profile)
+    reps = max(2, min(8, int(round(target / on)))) if target else 4
     work = reps * (on + off)
     while reps > 3 and warmup + work + 120 > total_s:
         reps -= 1
@@ -903,27 +989,59 @@ def _vo2max_long_intervals(total_s: int,
 
 def _vo2max_descending(total_s: int,
                        profile: Optional["RiderMetrics"] = None) -> Session:
-    """VO2max descending ladder: 5-4-3-2min with equal recoveries."""
-    warmup = 600
-    rungs = [(dur, vo2_power(base, profile)) for dur, base in
-             ((300, 1.10), (240, 1.12), (180, 1.13), (120, 1.14))]
-    # The advertised band describes the ladder's shape, so it is taken from the
-    # full ladder and does not narrow when a short ride drops the last rungs.
+    """VO2max descending ladder with equal recoveries, dosed like classic.
+
+    The ladder is generated rather than hard-coded. The fixed 5-4-3-2min rungs
+    this used to prescribe are 14 minutes of VO2 work at every ride length -
+    58% of classic's 24min, the largest under-dose in the set, and a rider
+    asking for VO2max work got barely half the stimulus.
+
+    What makes the variant a ladder is preserved exactly: rungs step down 60s
+    at a time and the power steps up as they shorten, with a recovery equal to
+    the rung just ridden after every rung but the last. Only the top rung and
+    the number of rungs are fitted, so a longer ride buys a longer ladder
+    (6-5-4-3-2min for classic's 20min dose, 7-6-5-4-3min for its 24min).
+    """
+    warmup_max = 600
+    step = 60
+    rung_floor, rung_ceiling = 120, 420   # 2-7min: still a VO2max effort
+    target = _classic_dose("vo2max", total_s, profile)
+
+    def ladder(top: int, n: int) -> List[int]:
+        return [top - i * step for i in range(n)]
+
+    def used(durs: List[int], wu: int) -> int:
+        # each work rung followed by an equal-length recovery except the last
+        return wu + sum(durs) + sum(durs[:-1])
+
+    best = None
+    for wu in range(warmup_max, 179, -60):
+        for n in range(3, 7):
+            for top in range(rung_ceiling, rung_floor - 1, -step):
+                durs = ladder(top, n)
+                if durs[-1] < rung_floor or used(durs, wu) + 120 > total_s:
+                    continue
+                work = sum(durs)
+                # Closest dose first, then the longest warmup that delivers it,
+                # then the longest ladder (more rungs = more of the descent).
+                key = (-abs(work - target) if target else work, wu, n)
+                if best is None or key > best[0]:
+                    best = (key, wu, top, n)
+    if best is None:  # ride too short for even a 3-rung ladder
+        warmup, top, n = 180, rung_floor + step, 2
+    else:
+        _, warmup, top, n = best
+    durations = ladder(top, n)
+    # Power rises as the rungs shorten - the point of a descending ladder.
+    rungs = [(d, vo2_power(1.10 + 0.04 * i / max(1, n - 1), profile))
+             for i, d in enumerate(durations)]
     powers = [p for _, p in rungs]
-
-    def used(rs) -> int:
-        # each work rung followed by equal-length recovery except the last
-        return warmup + sum(d for d, _ in rs) + sum(d for d, _ in rs[:-1])
-
-    while len(rungs) > 2 and used(rungs) + 120 > total_s:
-        rungs = rungs[:-1]
-    while used(rungs) + 120 > total_s and warmup > 300:
-        warmup -= 60
     lo_pct = min(powers) * 100
     hi_pct = max(powers) * 100
+    shape = "-".join(str(d // 60) for d in durations)
     s = Session(
         name="VO2max Descending Ladder",
-        description=(f"5-4-3-2min VO2 efforts at {lo_pct:.0f}-{hi_pct:.0f}% FTP, "
+        description=(f"{shape}min VO2 efforts at {lo_pct:.0f}-{hi_pct:.0f}% FTP, "
                      "equal recoveries."),
         workout_type="vo2max",
     )
@@ -983,25 +1101,50 @@ def _threshold_two_by_twenty(total_s: int,
 
 def _threshold_over_unders(total_s: int,
                            profile: Optional["RiderMetrics"] = None) -> Session:
-    """Threshold over-unders: blocks alternating 2min@95% / 1min@105%."""
-    warmup = 600
+    """Threshold over-unders, dosed like classic.
+
+    Both the block length and the block count are fitted. The fixed
+    ``3 blocks of 3 cycles`` this used to prescribe is 27 minutes of threshold
+    work on a one-hour ride and still 27 on a four-hour one - the saturation
+    defect already fixed in ``_tempo_progression``, against a classic that
+    delivers 36-39min.
+
+    The alternation is the variant and is untouched: 2min just under threshold,
+    1min just over, repeated. Both halves sit inside the published threshold
+    band, so a cycle counts as three minutes in zone either way.
+    """
+    warmup_max = 600
     under, over = 120, 60
-    cycles = 3  # per block -> 9min block
-    block = cycles * (under + over)
+    cycle = under + over
     rest = 240
-    blocks = 3
-    work = blocks * block
+    target = _classic_dose("threshold", total_s, profile)
 
-    def used(nb: int) -> int:
-        return warmup + nb * block + max(0, nb - 1) * rest
+    def used(blocks: int, cycles: int, wu: int) -> int:
+        return wu + blocks * cycles * cycle + max(0, blocks - 1) * rest
 
-    while blocks > 2 and used(blocks) + 120 > total_s:
-        blocks -= 1
-    while used(blocks) + 120 > total_s and warmup > 300:
-        warmup -= 60
+    best = None
+    for wu in range(warmup_max, 179, -60):
+        for blocks in range(2, 6):
+            for cycles in range(3, 9):
+                if used(blocks, cycles, wu) + 120 > total_s:
+                    continue
+                work = blocks * cycles * cycle
+                # Closest dose first, then the longest warmup that delivers it,
+                # then the block length nearest the canonical 12min over-under
+                # block - a 21min block is a different session.
+                key = (-abs(work - target) if target else work,
+                       wu, -abs(cycles - 4))
+                if best is None or key > best[0]:
+                    best = (key, wu, blocks, cycles)
+    if best is None:  # ride too short for 2 x 3 cycles
+        warmup, blocks, cycles = 180, 2, 3
+    else:
+        _, warmup, blocks, cycles = best
+    block = cycles * cycle
     s = Session(
         name="Threshold Over-Unders",
-        description=f"{blocks} blocks alternating 2min@91% / 1min@101% FTP.",
+        description=(f"{blocks} x {block // 60}min blocks alternating "
+                     "2min@91% / 1min@101% FTP."),
         workout_type="threshold",
     )
     s.segments.append(
@@ -1025,11 +1168,21 @@ def _threshold_over_unders(total_s: int,
 
 def _sweet_spot_long_blocks(total_s: int,
                             profile: Optional["RiderMetrics"] = None) -> Session:
-    """Sweet spot long blocks: 2 long blocks at 88% FTP (scales with duration)."""
+    """Sweet spot long blocks: 2 long blocks at 88% FTP, dosed like classic.
+
+    Block length is set from classic's dose for the same ride, not from a flat
+    40% of ride time. That fraction over-shot on long rides - a two-hour ride
+    hit the 22min cap on both blocks for 44min of sweet spot against classic's
+    36, the only variant in the set prescribing MORE than its classic. A rider
+    picking a variant for variety must not silently get a harder session.
+
+    Two long blocks is the variant; the ride only decides how long they are.
+    """
     warmup = 600
     reps, off = 2, 300
-    on = int(round(0.40 * total_s / reps / 60.0)) * 60
-    on = max(600, min(1320, on))
+    target = _classic_dose("sweet_spot", total_s, profile)
+    on = int(round((target / reps if target else 0.40 * total_s / reps) / 60.0)) * 60
+    on = max(300, min(1500, on))
     work = reps * (on + off)
     while warmup + work + 120 > total_s and on > 300:
         on -= 60
@@ -1054,14 +1207,23 @@ def _sweet_spot_long_blocks(total_s: int,
 
 def _sweet_spot_with_surges(total_s: int,
                             profile: Optional["RiderMetrics"] = None) -> Session:
-    """Sweet spot with controlled surges inside the declared band."""
+    """Sweet spot with controlled surges inside the declared band.
+
+    The block count follows classic's dose for the same ride. It was pinned at
+    2 x 12min = 24min for every ride length, which is classic's dose at 60min
+    but only 67% of the 36min classic prescribes from 75min upwards.
+
+    The surge is the variant and is fixed: a 10s lift every 3min, still inside
+    the published sweet-spot band so it sharpens the block without turning it
+    into a threshold session.
+    """
     warmup = 600
     surges = 4          # per block
     on_seg, surge = 170, 10
     block = surges * (on_seg + surge)  # 720s = 12min
     off = 300
-    reps = 2
-    work = reps * block + (reps - 1) * off
+    target = _classic_dose("sweet_spot", total_s, profile)
+    reps = max(1, min(5, int(round(target / block)))) if target else 2
 
     def used(nb: int) -> int:
         return warmup + nb * block + max(0, nb - 1) * off
