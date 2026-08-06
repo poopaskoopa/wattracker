@@ -49,7 +49,7 @@ from .ble.runner import RideController, flatten_session
 from .ingest import importer
 from .metrics import durability as durabilitymod
 from .metrics import profile_store
-from .metrics.power import is_plausible_ftp
+from .metrics.power import DEFAULT_FTP, is_plausible_ftp
 from .ftp_input import (
     FTP_INPUT_MAX_WATTS,
     FTP_INPUT_MIN_WATTS,
@@ -962,7 +962,7 @@ def create_app() -> FastAPI:
                 setup_candidates=paths.annotated_candidates(),
                 setup_settings=db.get_user_settings(uid),
                 setup_estimate=round(importer.recent_best_effort_ftp(uid), 1),
-                setup_fallback_ftp=200,
+                setup_fallback_ftp=round(DEFAULT_FTP),
                 setup_error=None,
                 setup_message=None,
                 setup_form={},
@@ -995,7 +995,7 @@ def create_app() -> FastAPI:
             setup_candidates=paths.annotated_candidates(),
             setup_settings=settings,
             setup_estimate=round(estimate, 1) if estimate > 0 else None,
-            setup_fallback_ftp=200,
+            setup_fallback_ftp=round(DEFAULT_FTP),
             setup_latest_ftp=latest,
             setup_error=error,
             setup_message=message,
@@ -1131,6 +1131,7 @@ def create_app() -> FastAPI:
             return _setup_closed_json()
         uid = _uid(request)
         choice = (choice or "").strip().lower()
+        source = choice
         if choice == "manual":
             parsed = parse_ftp_input(manual_ftp, confirmed=_checked(confirm_low_ftp))
             if parsed.watts is None:
@@ -1143,21 +1144,28 @@ def create_app() -> FastAPI:
             db.add_ftp_entry(uid, utc_today().isoformat(), watts, "manual")
         elif choice == "estimated":
             watts = importer.recent_best_effort_ftp(uid)
-            if not is_plausible_ftp(watts):
-                # A failed estimate is not a weak one - it must not be written
-                # to FTP history, where it would become a scoring basis (#60).
-                watts = importer.DEFAULT_FTP
             db.set_user_ftp_override(uid, None)
-            db.add_ftp_entry(
-                uid,
-                utc_today().isoformat(),
-                round(watts, 1),
-                "estimated",
-                replace_existing=True,
-            )
+            if is_plausible_ftp(watts):
+                db.add_ftp_entry(
+                    uid,
+                    utc_today().isoformat(),
+                    round(watts, 1),
+                    "estimated",
+                    replace_existing=True,
+                )
+            else:
+                # There is no analysis to record: either no rides at all, or an
+                # estimate that failed the plausibility floor (#60). The
+                # placeholder shown to the rider is NOT written to ftp_history -
+                # a number nobody measured must not be readable later as one
+                # (#55). current_ftp resolves the same placeholder at read time,
+                # and stops doing so the moment a real estimate exists.
+                db.delete_ftp_entry(uid, utc_today().isoformat())
+                watts = DEFAULT_FTP
+                source = "default"
         else:
             return JSONResponse({"error": "Choose an estimated or manual FTP."}, status_code=400)
-        return JSONResponse({"choice": choice, "ftp": round(watts, 1), "source": choice})
+        return JSONResponse({"choice": choice, "ftp": round(watts, 1), "source": source})
 
     @app.post("/setup/complete", response_class=HTMLResponse)
     def setup_complete(
@@ -1190,6 +1198,7 @@ def create_app() -> FastAPI:
                 ), status_code=400
             )
         choice = (ftp_choice or "").strip().lower()
+        analyzed = True
         if choice == "manual":
             parsed = parse_ftp_input(manual_ftp, confirmed=_checked(confirm_low_ftp))
             if parsed.watts is None:
@@ -1203,9 +1212,12 @@ def create_app() -> FastAPI:
         elif choice == "estimated":
             ftp = importer.recent_best_effort_ftp(uid)
             if not is_plausible_ftp(ftp):
-                # See /setup/ftp above: a sub-floor estimate is a failure, and
-                # writing it to ftp_history would make it the scoring basis.
-                ftp = importer.DEFAULT_FTP
+                # See /setup/ftp above: with no analysis to record, nothing is
+                # written to ftp_history and the placeholder is resolved at read
+                # time instead (#55). A sub-floor estimate is a failed one, not
+                # a weak one, and must not become a scoring basis (#60).
+                ftp = DEFAULT_FTP
+                analyzed = False
         else:
             return templates.TemplateResponse(
                 request, "setup.html", _setup_context(
@@ -1265,13 +1277,16 @@ def create_app() -> FastAPI:
         if cred_saved:
             updates["zwift_id"] = rider_id
         db.save_user_settings(uid, updates)
-        db.add_ftp_entry(
-            uid,
-            utc_today().isoformat(),
-            round(ftp, 1),
-            choice,
-            replace_existing=choice == "estimated",
-        )
+        if analyzed:
+            db.add_ftp_entry(
+                uid,
+                utc_today().isoformat(),
+                round(ftp, 1),
+                choice,
+                replace_existing=choice == "estimated",
+            )
+        else:
+            db.delete_ftp_entry(uid, utc_today().isoformat())
         db.complete_onboarding(uid)
         return templates.TemplateResponse(
             request, "setup.html", _setup_context(
