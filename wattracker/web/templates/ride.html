@@ -32,23 +32,43 @@
         </label>
     </div>
     <div id="justRideMode" class="just-ride-layout" hidden>
-        <div class="just-ride-controls"><label>Type:
-            <select id="rideTypeSelect">
-                {% for t in ride_types %}
-                <option value="{{ t.key }}">{{ t.label }} &mdash; {{ t.zone }}</option>
-                {% endfor %}
-            </select>
-        </label><label>Duration:
-            <select id="rideDurationSelect">
-                {% for m in ride_durations %}
-                <option value="{{ m }}" {{ 'selected' if m == 60 else '' }}>
-                    {%- if m >= 60 %}{{ m // 60 }} h{% if m % 60 %} {{ m % 60 }} min{% endif %}
-                    {%- else %}{{ m }} min{% endif -%}
-                </option>
-                {% endfor %}
-            </select>
-        </label></div>
-        <div id="ridePreview" class="ride-preview" aria-live="polite" hidden></div>
+        <div class="just-ride-controls">
+            <label>Type:
+                <select id="rideTypeSelect">
+                    {% for t in ride_types %}
+                    <option value="{{ t.key }}">{{ t.label }} &mdash; {{ t.zone }}</option>
+                    {% endfor %}
+                </select>
+            </label>
+            <label>Duration:
+                <select id="rideDurationSelect">
+                    {% for m in ride_durations %}
+                    <option value="{{ m }}" {{ 'selected' if m == 60 else '' }}>
+                        {%- if m >= 60 %}{{ m // 60 }} h{% if m % 60 %} {{ m % 60 }} min{% endif %}
+                        {%- else %}{{ m }} min{% endif -%}
+                    </option>
+                    {% endfor %}
+                </select>
+            </label>
+            <p class="hint just-ride-controls-hint">
+                Pick a session shape with the same training focus. The curve is
+                the target power over time; exact steps and targets appear below.
+            </p>
+        </div>
+        <div class="just-ride-results">
+            <section id="rideVariantPicker" class="ride-variant-picker" aria-labelledby="rideVariantTitle" hidden>
+                <div class="ride-variant-heading">
+                    <div>
+                        <div class="section-kicker">Same goal, different shape</div>
+                        <h3 id="rideVariantTitle">Choose your ride</h3>
+                    </div>
+                    <p id="rideVariantStatus" class="hint" role="status" aria-live="polite"></p>
+                </div>
+                <div id="rideVariantGrid" class="ride-variant-grid" role="listbox"
+                     aria-label="Workout shape options"></div>
+            </section>
+            <div id="ridePreview" class="ride-preview" aria-live="polite" hidden></div>
+        </div>
     </div>
     <div class="toolbar ride-setup-actions">
         <button type="button" id="scanBtn" aria-busy="false" {{ '' if ble_available else 'disabled' }}>
@@ -650,6 +670,7 @@
         document.getElementById("rideTypeSelect").disabled = controlsLocked;
         document.getElementById("rideDurationSelect").disabled = controlsLocked;
         modeButtons().forEach(function (button) { button.disabled = controlsLocked; });
+        setVariantCardsDisabled(controlsLocked);
     }
     function setButtonBusy(button, busy, busyText, idleText) {
         button.setAttribute("aria-busy", busy ? "true" : "false");
@@ -714,6 +735,165 @@
         row.appendChild(el);
         return el;
     }
+    var selectedVariant = "classic";
+    var latestPreviewData = null;
+    var pendingVariantFocus = null;
+    var VARIANT_GLYPHS = {
+        classic: "—",
+        negative_split: "↗",
+        tempo_finish: "↗",
+        cadence_play: "⌁",
+        short_short: "⋮",
+        long_intervals: "▰",
+        descending: "⌄",
+        two_by_twenty: "▰",
+        over_unders: "⌁",
+        with_surges: "✦",
+        progression: "↗",
+        cadence_wave: "⌁",
+        grouped: "▦",
+        short_recovery: "⋮",
+        recovery_waves: "≋"
+    };
+    function profileSvgNode(profile, duration, ftp, className) {
+        if (!profile || !profile.length || !window.profileSvg) return null;
+        var svgText = window.profileSvg(profile, duration, ftp);
+        if (!svgText) return null;
+        var parsed = new DOMParser().parseFromString(svgText, "image/svg+xml");
+        if (!parsed.documentElement || parsed.documentElement.nodeName.toLowerCase() !== "svg") {
+            return null;
+        }
+        var graph = document.createElement("div");
+        if (className) graph.className = className;
+        else graph.className = "ride-preview-graph";
+        graph.appendChild(document.importNode(parsed.documentElement, true));
+        return graph;
+    }
+    function variantGlyph(key) {
+        return VARIANT_GLYPHS[key] || "⌁";
+    }
+    function variantOptions(data) {
+        var options = data && Array.isArray(data.variants) ? data.variants : [];
+        if (options.length) return options;
+        var profiles = data && data.variant_profiles;
+        var duration = data && data.duration_s != null
+            ? String(Math.round(Number(data.duration_s) / 60)) : "";
+        if (profiles && duration) {
+            return Object.keys(profiles).map(function (key) {
+                var option = profiles[key] && profiles[key][duration];
+                if (!option) return null;
+                return Object.assign({}, option, {
+                    variant: key,
+                    ftp: data.ftp,
+                    type_info: data.type_info
+                });
+            }).filter(Boolean);
+        }
+        return data ? [data] : [];
+    }
+    function setVariantCardsDisabled(disabled) {
+        document.querySelectorAll("#rideVariantGrid .ride-variant-card").forEach(function (card) {
+            card.disabled = disabled;
+        });
+    }
+    function focusVariantCard(key) {
+        if (!key) return;
+        var card = Array.prototype.slice.call(
+            document.querySelectorAll("#rideVariantGrid .ride-variant-card")
+        ).find(function (candidate) { return candidate.dataset.variant === key; });
+        if (card) card.focus();
+    }
+    function chooseVariant(key, preserveFocus) {
+        selectedVariant = key || "classic";
+        if (preserveFocus) pendingVariantFocus = selectedVariant;
+        loadPreview();
+        scheduleConfigReconnect();
+    }
+    function renderVariantPicker(data) {
+        var picker = document.getElementById("rideVariantPicker");
+        var grid = document.getElementById("rideVariantGrid");
+        var status = document.getElementById("rideVariantStatus");
+        var options = variantOptions(data);
+        grid.replaceChildren();
+        if (!options.length || !justRide()) {
+            picker.hidden = true;
+            status.textContent = "";
+            return;
+        }
+        var wanted = data.variant || selectedVariant || "classic";
+        if (!options.some(function (option) { return option.variant === wanted; })) {
+            wanted = options[0].variant || "classic";
+        }
+        selectedVariant = wanted;
+        picker.hidden = false;
+        status.textContent = options.length > 1
+            ? options.length + " shapes keep the " + ((data.type_info || {}).zone || "same training focus") + "."
+            : "This focus has one carefully bounded prescription.";
+        options.forEach(function (option) {
+            var key = option.variant || "classic";
+            var card = document.createElement("button");
+            card.type = "button";
+            card.className = "ride-variant-card";
+            card.dataset.variant = key;
+            card.setAttribute("role", "option");
+            card.tabIndex = key === wanted ? 0 : -1;
+            card.setAttribute("aria-selected", key === wanted ? "true" : "false");
+            card.setAttribute("aria-label", (option.name || key) +
+                (key === wanted ? ", selected" : ""));
+
+            var heading = document.createElement("span");
+            heading.className = "ride-variant-card-heading";
+            var glyph = document.createElement("span");
+            glyph.className = "ride-variant-glyph";
+            glyph.setAttribute("aria-hidden", "true");
+            glyph.textContent = variantGlyph(key);
+            heading.appendChild(glyph);
+            var title = document.createElement("span");
+            title.className = "ride-variant-card-title";
+            title.textContent = option.name || "Workout shape";
+            heading.appendChild(title);
+            card.appendChild(heading);
+
+            var graph = profileSvgNode(option.profile, option.duration_s, option.ftp,
+                "ride-variant-card-graph");
+            if (graph) card.appendChild(graph);
+
+            var meta = document.createElement("span");
+            meta.className = "ride-variant-card-meta";
+            meta.textContent = ((data.type_info || {}).zone || "Training focus") +
+                " · " + fmtClock(option.duration_s) + " · TSS " +
+                (option.estimated_tss == null ? "—" : option.estimated_tss);
+            card.appendChild(meta);
+
+            var note = document.createElement("span");
+            note.className = "ride-variant-card-note";
+            note.textContent = option.description || "A different way to complete the same focus.";
+            card.appendChild(note);
+
+            card.addEventListener("click", function () {
+                if (card.disabled) return;
+                chooseVariant(key, true);
+            });
+            card.addEventListener("keydown", function (event) {
+                var keyName = event.key;
+                var navigation = keyName === "ArrowRight" || keyName === "ArrowDown" ||
+                    keyName === "ArrowLeft" || keyName === "ArrowUp" ||
+                    keyName === "Home" || keyName === "End";
+                if (!navigation || card.disabled) return;
+                event.preventDefault();
+                var cards = Array.prototype.slice.call(
+                    grid.querySelectorAll(".ride-variant-card"));
+                var index = cards.indexOf(card);
+                var next = keyName === "Home" ? 0 : keyName === "End" ? cards.length - 1 :
+                    index + ((keyName === "ArrowLeft" || keyName === "ArrowUp") ? -1 : 1);
+                if (next < 0) next = cards.length - 1;
+                if (next >= cards.length) next = 0;
+                if (cards[next]) chooseVariant(cards[next].dataset.variant, true);
+            });
+            grid.appendChild(card);
+        });
+        setVariantCardsDisabled(rideState !== "idle" && positivePowerSeen);
+    }
     function renderPreview(data) {
         var box = document.getElementById("ridePreview");
         box.replaceChildren();
@@ -741,18 +921,10 @@
 
         // Parse the offline shared SVG helper into a node; retain the table
         // below as a text alternative.
-        if (data.profile && data.profile.length && window.profileSvg) {
-            var graph = document.createElement("div");
-            graph.className = "ride-preview-graph";
-            var svgText = window.profileSvg(data.profile, data.duration_s, data.ftp);
-            if (svgText) {
-                var parsed = new DOMParser().parseFromString(svgText, "image/svg+xml");
-                if (parsed.documentElement && parsed.documentElement.nodeName.toLowerCase() === "svg") {
-                    graph.appendChild(document.importNode(parsed.documentElement, true));
-                    box.appendChild(graph);
-                }
-            }
-        }
+        // The selected detail graph remains the same shared call as before:
+        // window.profileSvg(data.profile, data.duration_s, data.ftp).
+        var graph = profileSvgNode(data.profile, data.duration_s, data.ftp);
+        if (graph) box.appendChild(graph);
 
         if (info.focus || info.structure) {
             var purpose = document.createElement("p");
@@ -813,25 +985,40 @@
         var token = ++previewToken;
         if (!justRide()) {
             document.getElementById("ridePreview").hidden = true;
+            document.getElementById("rideVariantPicker").hidden = true;
+            latestPreviewData = null;
             return;
         }
         var type = document.getElementById("rideTypeSelect").value;
         var minutes = document.getElementById("rideDurationSelect").value;
         fetch("/ride/workout/preview?type=" + encodeURIComponent(type) +
-              "&minutes=" + encodeURIComponent(minutes))
+              "&minutes=" + encodeURIComponent(minutes) +
+              "&variant=" + encodeURIComponent(selectedVariant || "classic"))
             .then(function (resp) { return resp.ok ? resp.json() : null; })
             .then(function (data) {
                 if (token !== previewToken || !justRide()) return;
                 if (!data) {
                     document.getElementById("ridePreview").hidden = true;
+                    document.getElementById("rideVariantPicker").hidden = true;
+                    latestPreviewData = null;
                     return;
                 }
+                latestPreviewData = data;
+                selectedVariant = data.variant || selectedVariant || "classic";
+                renderVariantPicker(data);
                 renderPreview(data);
                 setupWorkout(data);
+                if (pendingVariantFocus) {
+                    var focusKey = pendingVariantFocus;
+                    pendingVariantFocus = null;
+                    focusVariantCard(focusKey);
+                }
             })
             .catch(function () {
                 if (token !== previewToken) return;
                 document.getElementById("ridePreview").hidden = true;
+                document.getElementById("rideVariantPicker").hidden = true;
+                latestPreviewData = null;
             });
     }
     // In plan mode setupWorkout only runs once the ride connects, so until then
@@ -968,6 +1155,7 @@
         if (justRide()) {
             q.push("type=" + encodeURIComponent(document.getElementById("rideTypeSelect").value));
             q.push("minutes=" + encodeURIComponent(document.getElementById("rideDurationSelect").value));
+            q.push("variant=" + encodeURIComponent(selectedVariant || "classic"));
         } else if (wid) {
             q.push("workout_id=" + encodeURIComponent(wid));
         }
@@ -1605,6 +1793,7 @@
     });
     showSelectedWorkoutTitle();
     document.getElementById("rideTypeSelect").addEventListener("change", function () {
+        selectedVariant = "classic";
         loadPreview();
         scheduleConfigReconnect();
     });
