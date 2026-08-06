@@ -1112,6 +1112,88 @@ def insert_activity(user_id: int, record: dict, path: Optional[str] = None) -> O
         conn.close()
 
 
+def _valid_activity_date(value: Optional[str]) -> bool:
+    try:
+        _dt.datetime.fromisoformat(str(value))
+    except (TypeError, ValueError):
+        return False
+    return True
+
+
+def activities_for_ftp_rescore(
+    user_id: int, activity_ids: Sequence[int], path: Optional[str] = None
+) -> Iterator[List[dict]]:
+    """Yield activity summaries in bounded batches with date-effective FTP."""
+    ids = sorted({int(activity_id) for activity_id in activity_ids})
+    if not ids:
+        return
+    conn = connect(path)
+    try:
+        for offset in range(0, len(ids), 500):
+            chunk = ids[offset:offset + 500]
+            placeholders = ",".join("?" for _ in chunk)
+            rows = conn.execute(
+                f"""
+                SELECT
+                  a.id,
+                  a.start_time,
+                  a.duration_s,
+                  a.np,
+                  COALESCE(
+                    (
+                      SELECT h.ftp_watts FROM ftp_history h
+                      WHERE h.user_id = a.user_id
+                        AND h.date <= substr(a.start_time, 1, 10)
+                      ORDER BY h.date DESC LIMIT 1
+                    ),
+                    (
+                      SELECT h.ftp_watts FROM ftp_history h
+                      WHERE h.user_id = a.user_id
+                      ORDER BY h.date ASC LIMIT 1
+                    )
+                  ) AS ftp_watts
+                FROM activities a
+                WHERE a.user_id = ? AND a.id IN ({placeholders})
+                """,
+                (user_id, *chunk),
+            ).fetchall()
+            yield [
+                {
+                    "id": row["id"],
+                    "start_time": row["start_time"],
+                    "duration_s": row["duration_s"],
+                    "np": row["np"],
+                    "ftp_watts": row["ftp_watts"],
+                }
+                for row in rows
+                if _valid_activity_date(row["start_time"])
+            ]
+    finally:
+        conn.close()
+
+
+def update_activity_ftp_metrics(
+    user_id: int, summaries: Sequence[dict], path: Optional[str] = None
+) -> int:
+    """Batch update FTP-dependent stored metrics for owned activities."""
+    rows = [
+        (summary.get("if_"), summary.get("tss"), user_id, int(summary["id"]))
+        for summary in summaries
+    ]
+    if not rows:
+        return 0
+    conn = connect(path)
+    try:
+        cur = conn.executemany(
+            "UPDATE activities SET if_ = ?, tss = ? WHERE user_id = ? AND id = ?",
+            rows,
+        )
+        conn.commit()
+        return cur.rowcount
+    finally:
+        conn.close()
+
+
 def _row_summary(row: sqlite3.Row) -> dict:
     return {
         "id": row["id"],
