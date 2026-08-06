@@ -17,6 +17,7 @@ from contextlib import asynccontextmanager
 from typing import List, Optional
 
 from fastapi import Body, FastAPI, File, Form, Request, UploadFile, WebSocket
+from fastapi import WebSocketDisconnect
 from fastapi.responses import (
     FileResponse,
     HTMLResponse,
@@ -37,9 +38,11 @@ from . import (
     calendarfeed,
     config,
     connectorauth,
+    connectorhub,
     credstore,
     db,
     exporter,
+    rpc,
     power_corrections,
     races,
 )
@@ -351,6 +354,24 @@ _EXEMPT_PREFIXES = ("/static", "/favicon", "/apple-touch-icon")
 # One log line per this many rejected /calendar.ics tokens. Not a limit:
 # nothing is ever refused because of it (see CalendarFeedFailureCounter).
 CALENDAR_TOKEN_FAILURE_THRESHOLD = 10
+
+
+class _ConnectorSocket:
+    """Adapts a Starlette WebSocket to the two methods RpcPeer needs.
+
+    RpcPeer is deliberately transport-agnostic - the connector end wraps a
+    plain client socket with the same two methods - so neither end of the
+    protocol has to import the other's web framework.
+    """
+
+    def __init__(self, websocket: WebSocket) -> None:
+        self._ws = websocket
+
+    async def send_text(self, text: str) -> None:
+        await self._ws.send_text(text)
+
+    async def receive_text(self) -> str:
+        return await self._ws.receive_text()
 
 
 class CalendarFeedFailureCounter:
@@ -709,6 +730,10 @@ def create_app() -> FastAPI:
         if config.auto_scan_enabled():
             task = asyncio.create_task(auto_scan_loop(stop))
         yield
+        # Fail every in-flight connector call before the loop goes away, so a
+        # worker thread blocked on one is told at once instead of sitting on
+        # its full timeout against a loop that will never run again.
+        connectorhub.reset()
         if task is not None:
             stop.set()
             try:
@@ -755,6 +780,12 @@ def create_app() -> FastAPI:
     # because of someone else's guessing - or its own earlier attempts with a
     # rotated token.
     app.state.calendar_failures = CalendarFeedFailureCounter()
+    # Rejected connector tokens, counted the same way and for the same reasons
+    # (see CalendarFeedFailureCounter): a 256-bit token checked one indexed
+    # lookup at a time is not guessable, every client on a home LAN can share
+    # one apparent address, and refusing would only lock out the connector
+    # that is trying to reconnect. Visibility, not enforcement.
+    app.state.connector_failures = CalendarFeedFailureCounter()
     # uvicorn logs the full request target; keep feed tokens out of the log.
     calendarfeed.install_access_log_redaction()
 
@@ -3416,6 +3447,92 @@ def create_app() -> FastAPI:
             }
         payload["variant_profiles"] = all_variants
         return JSONResponse(payload)
+
+    @app.websocket("/connector/ws")
+    async def connector_ws(websocket: WebSocket):
+        """A connector machine attaching itself to this server.
+
+        Authenticated by a per-device bearer token, not a session cookie - the
+        connector is not a browser and has no login. Note this handler is
+        reached without AuthMiddleware running at all: Starlette's
+        BaseHTTPMiddleware only wraps http scopes, so every websocket route in
+        this app does its own auth (the ride socket reads the session; this one
+        reads the header).
+
+        No Origin check here, unlike /ride/ws. That check exists to stop a
+        malicious *web page* from driving a socket with the user's ambient
+        cookie; this endpoint ignores cookies entirely and demands a secret the
+        browser does not have, so an Origin would add nothing - and a native
+        client has no Origin to send in the first place.
+        """
+        header = websocket.headers.get("authorization") or ""
+        scheme, _, token = header.partition(" ")
+        device = None
+        if scheme.lower() == "bearer" and token:
+            device = connectorauth.device_for_token(token.strip())
+        if device is None:
+            count = app.state.connector_failures.record_failure()
+            _log.warning(
+                "rejected connector token (%d rejected since start)", count
+            )
+            # Refused before accept(), so nothing is ever sent to a caller that
+            # did not prove it holds a token. 1008 = policy violation.
+            await websocket.close(code=1008)
+            return
+
+        await websocket.accept()
+        peer = rpc.RpcPeer(_ConnectorSocket(websocket))
+
+        async def _hang_up() -> None:
+            try:
+                await websocket.close(code=1000)
+            except Exception:
+                pass  # already gone; nothing to do
+
+        session = connectorhub.ConnectorSession(
+            user_id=device["user_id"],
+            device_id=device["device_id"],
+            label=device["label"],
+            peer=peer,
+            loop=asyncio.get_running_loop(),
+            closer=_hang_up,
+        )
+        displaced = connectorhub.register(session)
+        _log.info(
+            "connector '%s' attached for user %s%s",
+            session.label, session.user_id,
+            " (replacing an earlier one)" if displaced else "",
+        )
+        try:
+            await websocket.send_json(
+                {"event": "hello", "protocol": rpc.PROTOCOL_VERSION,
+                 "device": session.label}
+            )
+            while True:
+                message = rpc.decode(await websocket.receive_text())
+                if peer.resolve(message):
+                    continue
+                # Connector -> server events. The connector never sends
+                # requests: the server owns the database and therefore owns
+                # every decision. Unknown events are ignored rather than
+                # fatal, so an older server tolerates a newer connector.
+                event = message.get("event")
+                if event:
+                    await _handle_connector_event(session, event, message)
+        except (WebSocketDisconnect, rpc.ProtocolError) as exc:
+            if isinstance(exc, rpc.ProtocolError):
+                _log.warning("connector %s protocol error: %s", session.label, exc)
+        except Exception:
+            _log.warning(
+                "connector %s failed", session.label, exc_info=True
+            )
+        finally:
+            connectorhub.unregister(session)
+            _log.info("connector '%s' detached", session.label)
+
+    async def _handle_connector_event(session, event: str, message: dict) -> None:
+        """Route one connector-originated event. Ride events land here in WP-5."""
+        _log.debug("connector event %s from %s", event, session.label)
 
     @app.get("/ride", response_class=HTMLResponse)
     def ride_page(request: Request, workout_id: Optional[int] = None):

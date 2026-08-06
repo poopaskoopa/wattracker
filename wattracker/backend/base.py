@@ -20,14 +20,15 @@ import abc
 from dataclasses import dataclass, field
 from typing import ContextManager, List, Optional, Tuple
 
-
-class BackendUnavailable(RuntimeError):
-    """The machine this backend speaks for cannot be reached right now.
-
-    Only the remote backend raises it (no connector attached, or it dropped
-    mid-call). Callers should degrade to a clear message rather than a 500 -
-    the browser-download routes remain a working fallback for exports.
-    """
+# The machine this backend speaks for cannot be reached right now: no
+# connector attached, or it dropped mid-call. Only the remote backend raises
+# it. Callers degrade to a clear message rather than a 500 - the in-memory
+# download routes remain a working fallback for exports.
+#
+# Deliberately the *same class* as the transport's, not a parallel one, so
+# `except BackendUnavailable` catches a socket that died mid-call and callers
+# never have to know which layer noticed.
+from ..rpc import ConnectorUnavailable as BackendUnavailable  # noqa: F401
 
 
 @dataclass(frozen=True)
