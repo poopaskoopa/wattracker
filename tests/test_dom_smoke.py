@@ -331,6 +331,43 @@ def test_calendar_workout_click_opens_modal_with_drawn_profile(page, live_server
     _assert_clean(console_errors, "/calendar + workout modal")
 
 
+def test_just_ride_variant_cards_render_and_select(page, live_server,
+                                                   console_errors):
+    """Just Ride shows real duration-specific curves and switches shapes."""
+    page.goto(f"{live_server.base}/ride")
+    page.get_by_role("button", name="Just ride", exact=True).click()
+    page.wait_for_selector("#rideVariantPicker:not([hidden])", timeout=10_000)
+
+    cards = page.locator("#rideVariantGrid .ride-variant-card")
+    assert cards.count() >= 2, "Just Ride rendered no workout variety"
+    page.wait_for_selector("#rideVariantGrid svg.profile-svg", timeout=10_000)
+    geom = _svg_has_geometry(page, "#rideVariantGrid svg.profile-svg")
+    assert geom["ok"], f"Just Ride variant curve has no drawn geometry: {geom}"
+
+    selected_before = page.locator(
+        '#rideVariantGrid .ride-variant-card[aria-selected="true"]'
+    ).get_attribute("data-variant")
+    target = cards.nth(1 if selected_before == cards.nth(0).get_attribute("data-variant") else 0)
+    target_variant = target.get_attribute("data-variant")
+    target.click()
+    page.wait_for_selector(
+        f'#rideVariantGrid .ride-variant-card[data-variant="{target_variant}"]'
+        '[aria-selected="true"]',
+        timeout=10_000,
+    )
+    ordered = [cards.nth(i).get_attribute("data-variant") for i in range(cards.count())]
+    previous_variant = ordered[(ordered.index(target_variant) - 1) % len(ordered)]
+    page.locator(
+        f'#rideVariantGrid .ride-variant-card[data-variant="{target_variant}"]'
+    ).press("ArrowLeft")
+    page.wait_for_selector(
+        f'#rideVariantGrid .ride-variant-card[data-variant="{previous_variant}"]'
+        '[aria-selected="true"]',
+        timeout=10_000,
+    )
+    _assert_clean(console_errors, "/ride Just Ride variants")
+
+
 def test_dashboard_charts_render_without_console_errors(page, live_server,
                                                         console_errors):
     """Both dashboard Chart.js canvases actually paint, and the console is clean."""

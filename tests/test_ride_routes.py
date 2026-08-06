@@ -215,6 +215,8 @@ def test_ride_page_renders_available_when_monkeypatched(client, monkeypatch):
     assert "preferredPower" in r.text
     assert "No HR" in r.text
     assert "No trainer" in r.text
+    assert "No cadence sensor" in r.text
+    assert 'input[data-role="cadence"]:checked' in r.text
     assert 'q.push("prepare=1")' not in r.text
     assert 'ws.send(JSON.stringify({action: "start"}))' not in r.text
     assert "ready — pedal to start" in r.text
@@ -246,7 +248,7 @@ def test_ride_page_renders_available_when_monkeypatched(client, monkeypatch):
     assert 'id="chartPowerValue"' in r.text
     assert 'id="chartCadenceValue"' in r.text
     assert 'id="chartHrValue"' in r.text
-    assert "Cadence (power sensor)" in r.text
+    assert "<span class=\"label\">Cadence</span>" in r.text
     assert "devices.slice().filter" in r.text
     assert 'device.name === "(unknown)"' in r.text
     assert "unnamed device" in r.text
@@ -413,6 +415,15 @@ def test_ride_page_just_ride_controls_preview_and_telemetry_locking(client, monk
     assert 'aria-pressed="false" aria-controls="justRideMode"' in text
     assert 'type="radio"' not in text
     assert 'id="justRideMode" class="just-ride-layout"' in text
+    assert 'id="rideVariantPicker" class="ride-variant-picker"' in text
+    assert 'id="rideVariantGrid" class="ride-variant-grid"' in text
+    assert 'role="listbox"' in text
+    assert 'className = "ride-variant-card"' in text
+    assert "variant_profiles" in text
+    assert 'card.tabIndex = key === wanted ? 0 : -1;' in text
+    assert 'keyName === "ArrowRight"' in text
+    assert 'keyName === "Home"' in text
+    assert 'q.push("variant=" + encodeURIComponent(selectedVariant || "classic"));' in text
     assert 'id="ridePreview" class="ride-preview"' in text
     assert "workout_graph.js" in text
     assert "window.profileSvg(data.profile, data.duration_s, data.ftp)" in text
@@ -611,6 +622,7 @@ def test_ride_chart_device_indicator_styles(client):
     assert '.ride-chart-devices .device-chip[data-role="power"] { --device-color: var(--s-2);' in r.text
     assert '.ride-chart-devices .device-chip[data-role="hr"] { --device-color: var(--s-hr);' in r.text
     assert '.ride-chart-devices .device-chip[data-role="trainer"] { --device-color: var(--ok);' in r.text
+    assert '.ride-chart-devices .device-chip[data-role="cadence"] { --device-color: var(--s-3);' in r.text
     assert ".ride-chart-devices .device-chip.device-lit" in r.text
     assert ".ride-chart-chip.erg-dark, .ride-chart-chip.device-dark" in r.text
     assert ".ride-chart-devices .device-chip[hidden] { display: none; }" in r.text
@@ -624,6 +636,7 @@ def test_ride_page_shows_sensor_indicators_on_the_chart(client, monkeypatch):
     assert 'id="deviceIndicators"' in r.text
     for role in ("power", "hr", "trainer"):
         assert 'data-role="' + role + '"' in r.text
+    assert 'data-role="cadence"' in r.text
     # The chips live inside the chart canvas, opposite the ERG chip.
     assert r.text.index('class="ride-chart-canvas"') < r.text.index('id="deviceIndicators"')
     assert r.text.index('id="deviceIndicators"') < r.text.index('id="rideChart"')
@@ -1183,7 +1196,7 @@ def test_ride_ws_propagates_exact_explicit_sensor_selection(client, monkeypatch)
 
     url = (
         "/ride/ws?selected=1&power=LEFT-UUID&power=RIGHT-UUID"
-        "&power=LEFT-UUID&hr=HR-UUID&trainer=TRAINER-UUID"
+        "&power=LEFT-UUID&hr=HR-UUID&trainer=TRAINER-UUID&cadence=CADENCE-UUID"
     )
     with client.websocket_connect(url) as ws:
         assert _receive_after_workout(ws)["status"] == "connected"
@@ -1192,6 +1205,7 @@ def test_ride_ws_propagates_exact_explicit_sensor_selection(client, monkeypatch)
         "power": ["LEFT-UUID", "RIGHT-UUID"],
         "hr": ["HR-UUID"],
         "trainer": ["TRAINER-UUID"],
+        "cadence": ["CADENCE-UUID"],
     }]
 
 
