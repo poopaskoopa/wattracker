@@ -17,6 +17,7 @@ import numpy as np
 from .. import db
 from ..metrics.power import (
     FTP_PLAUSIBLE_MIN_WATTS,
+    asserted_ftp,
     estimate_ftp,
     intensity_factor,
     is_plausible_ftp,
@@ -199,24 +200,34 @@ def current_ftp(
     gap - a number that is honest about "what could they do today" but is
     physically absurd as a wattage (issue #60 saw 0.64 W). Such a value is not a
     weak measurement, it is a failed one, and it is discarded rather than
-    returned. A rider's own MANUAL override is deliberately not filtered here:
-    that is the rider's assertion, not our estimate, and silently substituting a
-    different number for what they typed would be its own defect.
+    returned.
+
+    A rider's own ASSERTION - a manual override, or a source='manual' history
+    row - is never filtered, however low: that is their statement, not our
+    estimate. It is returned as an ``AssertedFTP`` so that provenance survives
+    the trip to the scorer, which would otherwise see a bare float and cannot
+    tell a rider's stated 40 W from a failed estimate's 0.64 W. Filtering it
+    there would silently score every one of their rides at zero load.
     """
     db.init_db()
     settings = db.get_user_settings(user_id)
-    override = settings.get("ftp")
-    if override and float(override) > 0:
-        return float(override)
+    override = asserted_ftp(settings.get("ftp"))
+    if override is not None:
+        return override
     latest = db.latest_ftp(user_id)
     if latest and latest.get("ftp_watts", 0) > 0:
         stored = float(latest["ftp_watts"])
-        if latest.get("source") != "estimated" or is_plausible_ftp(stored):
+        if latest.get("source") != "estimated":
+            asserted = asserted_ftp(stored)
+            if asserted is not None:
+                return asserted
+        elif is_plausible_ftp(stored):
             return stored
-        _log.warning(
-            "ignoring implausible stored FTP estimate for user %s: %.3f W "
-            "(floor %.0f W)", user_id, stored, FTP_PLAUSIBLE_MIN_WATTS
-        )
+        else:
+            _log.warning(
+                "ignoring implausible stored FTP estimate for user %s: %.3f W "
+                "(floor %.0f W)", user_id, stored, FTP_PLAUSIBLE_MIN_WATTS
+            )
     ftp = _current_estimate(db.full_activities(user_id), now, extra_power)
     if is_plausible_ftp(ftp):
         return ftp
@@ -309,8 +320,15 @@ def _build_record(parsed: Dict, filename: str, ftp: float) -> Dict:
     implausible basis leaves them at 0 rather than storing a number that is
     wrong by orders of magnitude. A row with ``np > 0`` and ``if_ == 0`` is
     therefore identifiable afterwards as "never scored", which is the state
-    issue #62's repair pass needs to find. This is the last rail: it holds even
-    for callers that resolve the FTP themselves and pass it in.
+    issue #62's repair pass needs to find. This is the last rail on the import
+    path: it holds even for callers that resolve the FTP themselves and pass it
+    in. (The rail of last resort is in ``intensity_factor`` /
+    ``training_stress_score`` themselves, which no scorer can bypass.)
+
+    "Plausible" is a test on the basis, not merely on the number: an FTP the
+    rider asserted arrives here as an ``AssertedFTP`` and is honoured however
+    low, because refusing it would silently store zero training load for a rider
+    who told us exactly what their FTP is. Only our own estimates are filtered.
     """
     streams = parsed["streams"]
     power = streams.get("power") or []
