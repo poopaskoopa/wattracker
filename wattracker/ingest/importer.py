@@ -631,10 +631,24 @@ def backfill_duplicate_links(user_id: int) -> int:
 
 
 def _user_activities_dir(user_id: int, backend=None) -> Optional[str]:
+    """The folder this user's scans read from (stored override, else discovery).
+
+    The stored value is re-confined on every read rather than trusted because
+    it is in the database: a row can predate the write-side check, or arrive
+    from a restored backup or a hand-edited DB. A stored value that escapes
+    means NOTHING is scanned for this user (None) - deliberately not "fall back
+    to OS discovery", which would quietly import from a folder the user never
+    configured.
+
+    The confinement goes through the backend because only it knows whose
+    machine the path is on: in a server/client install these are the client's
+    folders and the connector applies the check locally.
+    """
+    backend = backend or get_backend(user_id)
     override = db.get_user_settings(user_id).get("activities_dir")
     if override:
-        return override
-    return (backend or get_backend(user_id)).default_activities_dir()
+        return backend.confine_stored_dir(override)
+    return backend.default_activities_dir()
 
 
 def scan_activities(

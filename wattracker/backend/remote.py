@@ -92,13 +92,36 @@ class RemoteBackend(Backend):
     def validate_dir(
         self, value: str, require_exists: bool = True
     ) -> Tuple[Optional[str], Optional[str]]:
-        # Runs on the connector: these are its folders, and measuring them
-        # against the server's trusted roots would reject every valid answer.
+        # Empty means "unchanged" (the base contract), and answering that
+        # needs no connector. Short-circuit before the RPC: settings_save
+        # validates both folder fields unconditionally, so without this a
+        # server with no connector attached raised ConnectorUnavailable and
+        # turned *every* settings save into a 500 - including saves that only
+        # touched FTP or weight, and including the pairing page you have to
+        # reach to attach a connector in the first place.
+        if not (value or "").strip():
+            return "", None
+        # Otherwise runs on the connector: these are its folders, and measuring
+        # them against the server's trusted roots would reject every valid
+        # answer.
         result = self._call(
             "paths.validate_dir",
             {"value": value, "require_exists": require_exists},
         ) or {}
         return result.get("clean"), result.get("error")
+
+    def confine_stored_dir(self, value: Optional[str]) -> Optional[str]:
+        """Hand the stored value through; the connector is what confines it.
+
+        Deliberately NOT an RPC, and deliberately not measured here. The
+        connector already refuses a server-supplied activities folder that
+        escapes *its* trusted roots, in the one resolver its listing and
+        reading both go through - so the check exists and runs on the machine
+        that owns the path. Re-checking it here against the server's roots
+        would reject every legitimate Windows path, which is the failure this
+        whole backend seam exists to prevent.
+        """
+        return (value or "").strip() or None
 
     # ---------------------------------------------- activity files
 

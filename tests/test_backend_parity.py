@@ -53,7 +53,15 @@ def _fake_parsed(start_time, seconds=1800, watts=200.0):
 
 @pytest.fixture()
 def zwift_home(tmp_path):
-    home = tmp_path / "zwift"
+    """A Zwift-shaped tree the app is actually allowed to read and write.
+
+    Under the sandboxed HOME (``tmp_path/home``), not a sibling of it:
+    activities_dir/workouts_dir are confined to the trusted roots on read as
+    well as on write, so a bare tmp_path sibling is refused and the export
+    silently lands nowhere - which shows up as an inscrutable "the .zwo is not
+    there" rather than as a containment error. See the ``home_dir`` fixture.
+    """
+    home = tmp_path / "home" / "zwift"
     (home / "Activities").mkdir(parents=True)
     (home / "Workouts").mkdir(parents=True)
     return home
@@ -220,3 +228,37 @@ def test_offline_discovery_degrades_for_page_rendering(monkeypatch):
     assert backend.discover(uid, "zwift_id_candidates") == []
     assert backend.discover(uid, "default_activities_dir") is None
     assert backend.discover(uid, "workouts_root") is None
+
+
+@pytest.mark.parametrize("blank", ["", "   "])
+def test_offline_validate_dir_of_empty_matches_local(monkeypatch, blank):
+    """An empty folder field means "unchanged" and must not need a connector.
+
+    Both backends owe the same ("", None) here. The remote one used to ask the
+    connector anyway, so with none attached it raised ConnectorUnavailable.
+    """
+    db.init_db()
+    uid = db.create_user("rider", auth.hash_password("password123"))
+
+    monkeypatch.setenv("WATTRACKER_MODE", "local")
+    assert get_backend(uid).validate_dir(blank) == ("", None)
+
+    monkeypatch.setenv("WATTRACKER_MODE", "server")
+    assert get_backend(uid).validate_dir(blank) == ("", None)
+
+
+def test_offline_settings_save_is_not_a_500(client, monkeypatch):
+    """Saving settings without a connector must work - pairing lives on that page.
+
+    settings_save validates both folder fields unconditionally, so a save that
+    only touches FTP used to 500 in server mode purely because no connector was
+    attached to answer for two fields the user left alone.
+    """
+    client.post("/register", data={"username": "rider", "password": "password123"})
+    uid = db.get_user_by_username("rider")["id"]
+    monkeypatch.setenv("WATTRACKER_MODE", "server")
+
+    response = client.post("/settings", data={"ftp": "250"})
+
+    assert response.status_code == 200
+    assert db.get_user_settings(uid)["ftp"] == 250
