@@ -49,6 +49,7 @@ from .ble.runner import RideController, flatten_session
 from .ingest import importer
 from .metrics import durability as durabilitymod
 from .metrics import profile_store
+from .metrics.power import is_plausible_ftp
 from .prescribe import adapt as adaptmod
 from .prescribe import duration as durationmod
 from .prescribe import goals as goalsmod
@@ -1088,8 +1089,10 @@ def create_app() -> FastAPI:
             db.add_ftp_entry(uid, utc_today().isoformat(), watts, "manual")
         elif choice == "estimated":
             watts = importer.recent_best_effort_ftp(uid)
-            if watts <= 0:
-                watts = 200.0
+            if not is_plausible_ftp(watts):
+                # A failed estimate is not a weak one - it must not be written
+                # to FTP history, where it would become a scoring basis (#60).
+                watts = importer.DEFAULT_FTP
             db.set_user_ftp_override(uid, None)
             db.add_ftp_entry(
                 uid,
@@ -1142,8 +1145,10 @@ def create_app() -> FastAPI:
                 )
         elif choice == "estimated":
             ftp = importer.recent_best_effort_ftp(uid)
-            if ftp <= 0:
-                ftp = 200.0
+            if not is_plausible_ftp(ftp):
+                # See /setup/ftp above: a sub-floor estimate is a failure, and
+                # writing it to ftp_history would make it the scoring basis.
+                ftp = importer.DEFAULT_FTP
         else:
             return templates.TemplateResponse(
                 request, "setup.html", _setup_context(

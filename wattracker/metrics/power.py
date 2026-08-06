@@ -140,9 +140,212 @@ def normalized_power(power: Sequence[float], window: int = 30) -> float:
     return float(np.power(np.mean(np.power(roll, 4)), 0.25))
 
 
+# --- plausibility floor for any FTP used as a scoring basis -------------------
+# TSS is quadratic in 1/FTP, so an FTP that is wrong by a factor of 300 makes a
+# ride's TSS wrong by a factor of ~90,000. A failed estimate therefore does not
+# degrade a ride's score, it destroys it (and every load metric derived from it
+# - see issue #60, where a decayed estimate of 0.64 W produced a TSS of
+# 16,136,334).
+#
+# The floor is set at the lowest wattage a human being could plausibly hold for
+# an hour, not at the lowest FTP this app expects to see - it exists only to
+# separate "an unusually weak rider" from "the estimator returned garbage", and
+# a false reject is much more costly than a slightly permissive floor.
+# Reference points: clinical cardiac-rehab ergometry protocols start at 20-25 W
+# and progress in 25 W steps, so a rider mid-rehab can genuinely sit near 50 W;
+# a deconditioned adult beginning indoor cycling is typically 100-150 W; a
+# child on a trainer is 50-80 W. 50 W is at or below the bottom of every one of
+# those populations, while the failure mode it guards against produced basis
+# values of 0.64-49.9 W across 2,335 stored rows.
+#
+# The number is reasoned from that human range alone. It is NOT calibrated
+# against any observed population of riders, and nothing here should be read as
+# claiming it was: in the deployment where the bug was found, no FTP anywhere
+# between 50 and 100 W exists at all (ftp_history min 141 W, manual overrides
+# 200-250 W), so a 100 W floor would have rejected exactly as little real data
+# as this one. The choice between them rests on which populations a rider could
+# belong to, not on which ones happen to be in a database today - and on a
+# false reject (a real rider's rides silently unscored) being far worse than a
+# false accept (an absurd basis that is still absurd at 60 W, which is why
+# contemporaneous scoring, not this floor, is the real fix - see below).
+FTP_PLAUSIBLE_MIN_WATTS = 50.0
+
+# --- bounds on an ASSERTED basis ---------------------------------------------
+# The floor above filters our estimates; a rider's own statement is admitted
+# below it. That is not a licence for any number at all. "Honour the rider" is
+# an argument about the rider's KNOWLEDGE of their own body, and it stops
+# exactly where the number stops describing a body: an FTP is a wattage a human
+# holds for an hour on a bicycle, so a basis outside the human range is not an
+# unusual assertion, it is a typo, a unit mix-up or a corrupt row - and because
+# TSS is quadratic in 1/FTP, honouring it stores load figures in the millions.
+#
+# These bounds are on the SCORING BASIS and are deliberately independent of
+# what any input route accepts. /settings validates nothing today (issue #64,
+# not fixed here), so this is the layer that has to hold; conversely #64 will
+# want a much tighter, friendlier range, and should not be tempted to reuse
+# these numbers as a UI limit.
+#
+# Lower: 20 W. Clinical cardiac-rehab and deconditioned-patient ergometry
+# protocols begin at 20-25 W and step up by 25 W, so 20 W is the bottom of the
+# lowest workload a supervised human is asked to sustain at all. A rider
+# mid-rehab asserting 40 W - the case this whole provenance path exists to keep
+# working - sits comfortably above it, as does any child or deconditioned
+# beginner. Below 20 W the number no longer describes a person pedalling; the
+# observed failure produced 0.64-3.7 W bases, an order of magnitude under it.
+# Upper: 700 W. The best hour ever ridden by a human is ~440 W (UCI Hour Record
+# aerodynamics aside, no verified hour power approaches 500 W), so 700 W is
+# ~60% above the strongest cyclist alive and cannot reject a real rider, while
+# still catching the fat-finger 2500 that would otherwise store a sixth of the
+# true TSS forever.
+#
+# The window is intentionally wide: a false reject silently zeroes a real
+# rider's training load, which is worse than a false accept of a merely absurd
+# number. It exists to bound the damage, not to referee anyone's fitness.
+FTP_ASSERTION_MIN_WATTS = 20.0
+FTP_ASSERTION_MAX_WATTS = 700.0
+
+# What this floor does NOT fix: the estimator is anchored at wall-clock now, so
+# the deeper defect is that a rider's *historical* rides are scored against a
+# basis decayed to *today*. The floor bounds how wrong that can be, it does not
+# make it right - a 300-day gap still yields a legitimate-looking 73 W estimate
+# and stores IF 2.7 / TSS 750 for a normal hour, and 325 existing rows sit in
+# the 50-100 W band for exactly that reason. Scoring each ride against the FTP
+# effective on its own date is the actual repair and lives in #54/#59; it is
+# deliberately not attempted here. evaluate_ftp likewise still persists a
+# heavily decayed estimate: as an answer to "what could this rider hold today"
+# it is correct and is what a returning rider's dashboard should show, so
+# refusing to record it would break the estimator's legitimate use to paper
+# over a scoring bug that has its own fix.
+
+
+class AssertedFTP(float):
+    """An FTP the rider stated, carrying that provenance with the number.
+
+    The plausibility floor exists to reject a FAILED ESTIMATE, not to overrule
+    the rider. But by the time a wattage reaches the scorer it is just a float,
+    and the scorer cannot tell 0.64 W (the estimator decayed across a three-year
+    gap) from 40 W (a rider mid-rehab who typed it into their settings). Getting
+    that distinction wrong in either direction is a silent data defect: honour
+    everything and TSS lands in the millions; filter everything and a rider who
+    asserted 40 W accrues *zero* training load, with CTL/ATL/TSB reading as
+    untrained.
+
+    This class is a CONVENIENCE, not the answer. It marks the value the
+    importer has just resolved so the rest of that one call chain does not have
+    to re-derive provenance (and so a freshly typed assertion works before it
+    has been written anywhere). The durable answer lives in the database and is
+    resolved by :mod:`wattracker.ftp_provenance` - see ``is_plausible_ftp``.
+    Anything that reads a basis back out of SQLite gets a bare float, and a
+    marker that only exists on one process's stack would be invisible to it.
+
+    It is a float subclass, so it stores, serializes, rounds, compares and does
+    arithmetic exactly like the number it wraps. Arithmetic on it yields a plain
+    float, which is correct: a number *derived* from an assertion is not itself
+    asserted.
+    """
+
+    __slots__ = ()
+
+    def __repr__(self) -> str:  # pragma: no cover - diagnostics only
+        return f"AssertedFTP({float(self)!r})"
+
+
+def _finite(watts) -> "float | None":
+    """``watts`` as a finite float, or None if it is not a usable number."""
+    if watts is None or isinstance(watts, bool):
+        return None
+    try:
+        value = float(watts)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    return value if math.isfinite(value) else None
+
+
+def within_assertion_bounds(watts) -> bool:
+    """Whether ``watts`` is inside the range a rider's FTP could physically be."""
+    value = _finite(watts)
+    if value is None:
+        return False
+    return FTP_ASSERTION_MIN_WATTS <= value <= FTP_ASSERTION_MAX_WATTS
+
+
+def asserted_ftp(watts) -> "AssertedFTP | None":
+    """Mark ``watts`` as a rider assertion, or None if it cannot be one.
+
+    Rejects anything outside the human range (see ``FTP_ASSERTION_MIN_WATTS`` /
+    ``FTP_ASSERTION_MAX_WATTS``): an assertion is honoured because it is the
+    rider's knowledge of their own body, and 0.64 W is not a claim about a body.
+    """
+    value = _finite(watts)
+    if value is None or not within_assertion_bounds(value):
+        return None
+    return AssertedFTP(value)
+
+
+def is_asserted_ftp(value) -> bool:
+    """Whether ``value`` carries rider-asserted provenance in this process."""
+    return isinstance(value, AssertedFTP)
+
+
+def _durably_asserted(value: float) -> bool:
+    """Whether the database records ``value`` as a wattage a rider asserted."""
+    try:
+        from ..ftp_provenance import is_asserted_watts
+
+        return is_asserted_watts(value)
+    except Exception:  # pragma: no cover - a scorer must never fail on this
+        return False
+
+
+def is_plausible_ftp(watts) -> bool:
+    """Whether ``watts`` may be used as a scoring basis.
+
+    The single admission test. False for None, non-numeric, non-finite, and for
+    anything outside the human range entirely.
+
+    Between ``FTP_ASSERTION_MIN_WATTS`` and ``FTP_PLAUSIBLE_MIN_WATTS`` the
+    answer depends on PROVENANCE: the floor filters our own estimates, never a
+    rider's statement of their own FTP. Provenance is taken from the in-process
+    marker when there is one, and otherwise resolved from the database, so a
+    basis read back out of SQLite - by the offline rescore in #59, which never
+    sees an ``AssertedFTP`` - reaches the same verdict as the importer did.
+
+    That database lookup only happens for a sub-floor wattage that is otherwise
+    admissible, i.e. almost never: every ordinary basis is settled by the two
+    numeric comparisons first.
+    """
+    value = _finite(watts)
+    if value is None or value > FTP_ASSERTION_MAX_WATTS:
+        return False
+    if is_asserted_ftp(watts):
+        return value >= FTP_ASSERTION_MIN_WATTS
+    if value >= FTP_PLAUSIBLE_MIN_WATTS:
+        return True
+    if value < FTP_ASSERTION_MIN_WATTS:
+        return False
+    return _durably_asserted(value)
+
+
+# --- the scoring chokepoint --------------------------------------------------
+# Every IF and TSS that is WRITTEN to an activity row is computed by these two
+# functions, so the admission test lives HERE rather than at each call site: a
+# rail that every future caller has to remember to invoke is not a rail. In
+# particular the offline rescore pass in #59 (`ftp_rescore.score_activity`)
+# resolves its own FTP from ftp_history and never touches the importer, so this
+# is the only place a guard can sit that it cannot bypass. An implausible basis
+# yields 0.0 - the same "stored but never scored" state ``_build_record``
+# leaves, identifiable as np > 0 with if_ == 0.
+#
+# It is NOT a single chokepoint on the READ side, and nothing here should be
+# read as claiming so: `races.py` (:379, :638) and `analysis/zones.py`
+# (:143, :178) divide by an FTP by hand when rendering, so a damaged row still
+# displays IF ~317 on the races page. That is pre-existing and belongs with the
+# historical repair (#62); this rail stops new damage being written.
+
+
 def intensity_factor(np_value: float, ftp: float) -> float:
-    """IF = NP / FTP."""
-    if ftp <= 0:
+    """IF = NP / FTP, or 0.0 when ``ftp`` is not an admissible scoring basis."""
+    if not is_plausible_ftp(ftp):
         return 0.0
     return float(np_value) / float(ftp)
 
@@ -152,9 +355,10 @@ def training_stress_score(
 ) -> float:
     """TSS = (duration_s * NP * IF) / (FTP * 3600) * 100.
 
-    One hour at FTP yields exactly 100 TSS.
+    One hour at FTP yields exactly 100 TSS. Returns 0.0 when ``ftp`` is not an
+    admissible scoring basis (see ``is_plausible_ftp``).
     """
-    if ftp <= 0 or duration_seconds <= 0:
+    if duration_seconds <= 0 or not is_plausible_ftp(ftp):
         return 0.0
     intensity = intensity_factor(np_value, ftp)
     return (float(duration_seconds) * float(np_value) * intensity) / (
@@ -165,7 +369,7 @@ def training_stress_score(
 def tss_from_stream(power: Sequence[float], ftp: float) -> float:
     """Convenience: compute TSS directly from a per-second power stream."""
     arr = _clean_power(power)
-    if arr.size == 0 or ftp <= 0:
+    if arr.size == 0 or not is_plausible_ftp(ftp):
         return 0.0
     npw = normalized_power(arr)
     return training_stress_score(arr.size, npw, ftp)

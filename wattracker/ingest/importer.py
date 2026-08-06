@@ -5,6 +5,7 @@ import bisect
 import datetime as _dt
 import glob
 import hashlib
+import logging
 import os
 import tempfile
 import time
@@ -14,9 +15,15 @@ from typing import Callable, Dict, List, Optional
 import numpy as np
 
 from .. import db
+from ..ftp_provenance import is_asserted_source
 from ..metrics.power import (
+    FTP_ASSERTION_MAX_WATTS,
+    FTP_ASSERTION_MIN_WATTS,
+    FTP_PLAUSIBLE_MIN_WATTS,
+    asserted_ftp,
     estimate_ftp,
     intensity_factor,
+    is_plausible_ftp,
     normalized_power,
     training_stress_score,
 )
@@ -25,6 +32,13 @@ from ..paths import activities_dir, confined_stored_dir
 from ..prescribe.plan import HARD_STEADY_POWER
 from ..timeutil import parse_naive, utc_now, utc_today
 from .fit_parser import parse_fit
+
+
+_log = logging.getLogger(__name__)
+
+# Used when no plausible FTP can be resolved for a rider at all. It is a stated
+# placeholder, not a measurement - see current_ftp.
+DEFAULT_FTP = 200.0
 
 
 def dedup_hash(start_time: Optional[str], duration_s: int) -> str:
@@ -172,6 +186,33 @@ def recent_best_effort_ftp(
     return estimate_ftp(recent)
 
 
+def _asserted_override(user_id: int, settings: Optional[Dict] = None):
+    """The rider's stated FTP from settings, as an ``AssertedFTP``, or None.
+
+    ``user_settings.ftp`` is by definition an assertion - it is only ever
+    written when a human types a number in. It is still bounded: /settings
+    validates nothing today (issue #64), so a mistyped 2500 or a 0.64 planted
+    by a bad migration must not become a scoring basis.
+    """
+    if settings is None:
+        settings = db.get_user_settings(user_id)
+    stated = settings.get("ftp")
+    override = asserted_ftp(stated)
+    if override is not None:
+        return override
+    try:
+        number = float(stated)
+    except (TypeError, ValueError, OverflowError):
+        number = 0.0
+    if number > 0:
+        _log.warning(
+            "ignoring FTP override for user %s: %.3f W is outside the "
+            "%.0f-%.0f W range an FTP can physically take",
+            user_id, number, FTP_ASSERTION_MIN_WATTS, FTP_ASSERTION_MAX_WATTS,
+        )
+    return None
+
+
 def current_ftp(
     user_id: int,
     now: Optional[_dt.datetime] = None,
@@ -180,19 +221,60 @@ def current_ftp(
     """Resolve the current FTP for a user.
 
     Precedence: user's FTP override -> latest ftp_history value -> fresh
-    detraining-decayed estimate anchored at `now`. Falls back to a sane default
-    if no power data.
+    detraining-decayed estimate anchored at `now`. Falls back to DEFAULT_FTP
+    when nothing usable is available.
+
+    Every ESTIMATED basis must clear ``is_plausible_ftp`` before it is returned.
+    The estimator is anchored at wall-clock ``now``, so a rider whose newest
+    ride in the database is years old gets an estimate decayed across that whole
+    gap - a number that is honest about "what could they do today" but is
+    physically absurd as a wattage (issue #60 saw 0.64 W). Such a value is not a
+    weak measurement, it is a failed one, and it is discarded rather than
+    returned.
+
+    A rider's own ASSERTION - a manual override, or an ``ftp_history`` row whose
+    source says the rider entered it - is not subject to the estimate floor,
+    however low: that is their statement, not our estimate. It is returned as an
+    ``AssertedFTP`` so the rest of this call chain need not re-derive that; the
+    durable record of the same fact is in the database (see
+    ``wattracker.ftp_provenance``), so a rescorer that reads a basis back out of
+    SQLite reaches the same verdict. An assertion outside the human range is
+    still refused - see ``asserted_ftp``.
     """
     db.init_db()
     settings = db.get_user_settings(user_id)
-    override = settings.get("ftp")
-    if override and float(override) > 0:
-        return float(override)
+    override = _asserted_override(user_id, settings)
+    if override is not None:
+        return override
     latest = db.latest_ftp(user_id)
     if latest and latest.get("ftp_watts", 0) > 0:
-        return float(latest["ftp_watts"])
+        stored = float(latest["ftp_watts"])
+        if is_asserted_source(latest.get("source")):
+            asserted = asserted_ftp(stored)
+            if asserted is not None:
+                return asserted
+            _log.warning(
+                "ignoring asserted FTP history row for user %s: %.3f W is "
+                "outside the %.0f-%.0f W range an FTP can physically take",
+                user_id, stored, FTP_ASSERTION_MIN_WATTS, FTP_ASSERTION_MAX_WATTS,
+            )
+        elif is_plausible_ftp(stored):
+            return stored
+        else:
+            _log.warning(
+                "ignoring implausible stored FTP estimate for user %s: %.3f W "
+                "(floor %.0f W)", user_id, stored, FTP_PLAUSIBLE_MIN_WATTS
+            )
     ftp = _current_estimate(db.full_activities(user_id), now, extra_power)
-    return ftp if ftp > 0 else 200.0
+    if is_plausible_ftp(ftp):
+        return ftp
+    if ftp > 0:
+        _log.warning(
+            "discarding implausible FTP estimate for user %s: %.3f W "
+            "(floor %.0f W); using default %.0f W",
+            user_id, ftp, FTP_PLAUSIBLE_MIN_WATTS, DEFAULT_FTP,
+        )
+    return DEFAULT_FTP
 
 
 # Backwards-compatible alias.
@@ -217,6 +299,29 @@ def ftp_update_due(user_id: int, now: Optional[_dt.datetime] = None) -> bool:
     return (now.date() - last_date).days >= FTP_UPDATE_DAYS
 
 
+def _record_asserted_ftp(
+    user_id: int, watts: float, now: _dt.datetime
+) -> bool:
+    """Make ``ftp_history`` say what the rider asserted, for today.
+
+    Written with source='manual', which is what makes the provenance durable:
+    any reader can then tell this basis from an estimate (see
+    ``wattracker.ftp_provenance``). ``add_ftp_entry`` replaces today's row, so
+    an estimate recorded earlier today stops contradicting the assertion.
+    """
+    today = now.date().isoformat()
+    latest = db.latest_ftp(user_id)
+    if (
+        latest
+        and latest.get("date") == today
+        and is_asserted_source(latest.get("source"))
+        and abs(float(latest.get("ftp_watts") or 0.0) - watts) < 0.05
+    ):
+        return False
+    db.add_ftp_entry(user_id, today, watts, "manual")
+    return True
+
+
 def evaluate_ftp(user_id: int, now: Optional[_dt.datetime] = None) -> bool:
     """Record/refresh the user's estimated FTP so history tracks evaluations.
 
@@ -229,11 +334,35 @@ def evaluate_ftp(user_id: int, now: Optional[_dt.datetime] = None) -> bool:
 
     The estimate is the detraining-decayed value anchored at `now`
     (see _current_estimate). Returns True when a row was appended or refreshed.
+
+    While the rider holds an FTP OVERRIDE, their assertion is recorded instead
+    of the estimate. ``current_ftp`` already ignores the estimate in that case,
+    so writing it to history publishes a second, contradicting record of "this
+    rider's FTP" that every other reader of the database will pick up - and one
+    of them, the offline rescore in #59, re-scores the rider's rides from it.
+    A rider who states 40 W and watches the importer score their rides at IF 5
+    must not have that silently rebased to a 182 W estimate by a background
+    pass. The assertion is what the app is using; the assertion is what history
+    records.
     """
     db.init_db()
     now = now or utc_now()
+    override = _asserted_override(user_id)
+    if override is not None:
+        return _record_asserted_ftp(user_id, float(override), now)
     est = _current_estimate(db.full_activities(user_id), now)
     if est <= 0:
+        return False
+    if not is_plausible_ftp(est):
+        # A failed estimate must never enter FTP history: current_ftp reads the
+        # latest row back as an authoritative basis, so persisting one turns a
+        # single bad evaluation into the scoring basis for every subsequent
+        # import (issue #60 - this is exactly how 0.6-32 W FTPs reached 2,199
+        # activity rows).
+        _log.warning(
+            "refusing to record implausible FTP estimate for user %s: %.3f W "
+            "(floor %.0f W)", user_id, est, FTP_PLAUSIBLE_MIN_WATTS
+        )
         return False
     est = round(est, 1)
     latest = db.latest_ftp(user_id)
@@ -256,6 +385,24 @@ def _mean(vals) -> float:
 
 
 def _build_record(parsed: Dict, filename: str, ftp: float) -> Dict:
+    """Build the stored activity row, scoring it against ``ftp``.
+
+    The ride is scored only against a plausible FTP. NP and average power are
+    measurements and are stored regardless, but IF and TSS are quotients of the
+    FTP basis and are meaningless when it is not a real wattage - so an
+    implausible basis leaves them at 0 rather than storing a number that is
+    wrong by orders of magnitude. A row with ``np > 0`` and ``if_ == 0`` is
+    therefore identifiable afterwards as "never scored", which is the state
+    issue #62's repair pass needs to find. This is the last rail on the import
+    path: it holds even for callers that resolve the FTP themselves and pass it
+    in. (The rail of last resort is in ``intensity_factor`` /
+    ``training_stress_score`` themselves, which no scorer can bypass.)
+
+    "Plausible" is a test on the basis, not merely on the number: an FTP the
+    rider asserted arrives here as an ``AssertedFTP`` and is honoured however
+    low, because refusing it would silently store zero training load for a rider
+    who told us exactly what their FTP is. Only our own estimates are filtered.
+    """
     streams = parsed["streams"]
     power = streams.get("power") or []
     hr = streams.get("heartrate") or []
@@ -263,8 +410,14 @@ def _build_record(parsed: Dict, filename: str, ftp: float) -> Dict:
     duration_s = parsed["duration_s"]
 
     npw = normalized_power(power) if power else 0.0
-    ifv = intensity_factor(npw, ftp) if ftp > 0 else 0.0
-    tss = training_stress_score(duration_s, npw, ftp) if ftp > 0 else 0.0
+    scorable = is_plausible_ftp(ftp)
+    if not scorable and float(ftp or 0.0) > 0:
+        _log.warning(
+            "not scoring %s: FTP basis %.3f W is below the %.0f W plausibility "
+            "floor; IF/TSS left unset", filename, float(ftp), FTP_PLAUSIBLE_MIN_WATTS
+        )
+    ifv = intensity_factor(npw, ftp) if scorable else 0.0
+    tss = training_stress_score(duration_s, npw, ftp) if scorable else 0.0
     dist_m = 0.0
     clean_dist = [d for d in distance if d is not None]
     if clean_dist:
