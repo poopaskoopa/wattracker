@@ -15,7 +15,10 @@ from typing import Callable, Dict, List, Optional
 import numpy as np
 
 from .. import db
+from ..ftp_provenance import is_asserted_source
 from ..metrics.power import (
+    FTP_ASSERTION_MAX_WATTS,
+    FTP_ASSERTION_MIN_WATTS,
     FTP_PLAUSIBLE_MIN_WATTS,
     asserted_ftp,
     estimate_ftp,
@@ -183,6 +186,33 @@ def recent_best_effort_ftp(
     return estimate_ftp(recent)
 
 
+def _asserted_override(user_id: int, settings: Optional[Dict] = None):
+    """The rider's stated FTP from settings, as an ``AssertedFTP``, or None.
+
+    ``user_settings.ftp`` is by definition an assertion - it is only ever
+    written when a human types a number in. It is still bounded: /settings
+    validates nothing today (issue #64), so a mistyped 2500 or a 0.64 planted
+    by a bad migration must not become a scoring basis.
+    """
+    if settings is None:
+        settings = db.get_user_settings(user_id)
+    stated = settings.get("ftp")
+    override = asserted_ftp(stated)
+    if override is not None:
+        return override
+    try:
+        number = float(stated)
+    except (TypeError, ValueError, OverflowError):
+        number = 0.0
+    if number > 0:
+        _log.warning(
+            "ignoring FTP override for user %s: %.3f W is outside the "
+            "%.0f-%.0f W range an FTP can physically take",
+            user_id, number, FTP_ASSERTION_MIN_WATTS, FTP_ASSERTION_MAX_WATTS,
+        )
+    return None
+
+
 def current_ftp(
     user_id: int,
     now: Optional[_dt.datetime] = None,
@@ -202,25 +232,32 @@ def current_ftp(
     weak measurement, it is a failed one, and it is discarded rather than
     returned.
 
-    A rider's own ASSERTION - a manual override, or a source='manual' history
-    row - is never filtered, however low: that is their statement, not our
-    estimate. It is returned as an ``AssertedFTP`` so that provenance survives
-    the trip to the scorer, which would otherwise see a bare float and cannot
-    tell a rider's stated 40 W from a failed estimate's 0.64 W. Filtering it
-    there would silently score every one of their rides at zero load.
+    A rider's own ASSERTION - a manual override, or an ``ftp_history`` row whose
+    source says the rider entered it - is not subject to the estimate floor,
+    however low: that is their statement, not our estimate. It is returned as an
+    ``AssertedFTP`` so the rest of this call chain need not re-derive that; the
+    durable record of the same fact is in the database (see
+    ``wattracker.ftp_provenance``), so a rescorer that reads a basis back out of
+    SQLite reaches the same verdict. An assertion outside the human range is
+    still refused - see ``asserted_ftp``.
     """
     db.init_db()
     settings = db.get_user_settings(user_id)
-    override = asserted_ftp(settings.get("ftp"))
+    override = _asserted_override(user_id, settings)
     if override is not None:
         return override
     latest = db.latest_ftp(user_id)
     if latest and latest.get("ftp_watts", 0) > 0:
         stored = float(latest["ftp_watts"])
-        if latest.get("source") != "estimated":
+        if is_asserted_source(latest.get("source")):
             asserted = asserted_ftp(stored)
             if asserted is not None:
                 return asserted
+            _log.warning(
+                "ignoring asserted FTP history row for user %s: %.3f W is "
+                "outside the %.0f-%.0f W range an FTP can physically take",
+                user_id, stored, FTP_ASSERTION_MIN_WATTS, FTP_ASSERTION_MAX_WATTS,
+            )
         elif is_plausible_ftp(stored):
             return stored
         else:
@@ -262,6 +299,29 @@ def ftp_update_due(user_id: int, now: Optional[_dt.datetime] = None) -> bool:
     return (now.date() - last_date).days >= FTP_UPDATE_DAYS
 
 
+def _record_asserted_ftp(
+    user_id: int, watts: float, now: _dt.datetime
+) -> bool:
+    """Make ``ftp_history`` say what the rider asserted, for today.
+
+    Written with source='manual', which is what makes the provenance durable:
+    any reader can then tell this basis from an estimate (see
+    ``wattracker.ftp_provenance``). ``add_ftp_entry`` replaces today's row, so
+    an estimate recorded earlier today stops contradicting the assertion.
+    """
+    today = now.date().isoformat()
+    latest = db.latest_ftp(user_id)
+    if (
+        latest
+        and latest.get("date") == today
+        and is_asserted_source(latest.get("source"))
+        and abs(float(latest.get("ftp_watts") or 0.0) - watts) < 0.05
+    ):
+        return False
+    db.add_ftp_entry(user_id, today, watts, "manual")
+    return True
+
+
 def evaluate_ftp(user_id: int, now: Optional[_dt.datetime] = None) -> bool:
     """Record/refresh the user's estimated FTP so history tracks evaluations.
 
@@ -274,9 +334,22 @@ def evaluate_ftp(user_id: int, now: Optional[_dt.datetime] = None) -> bool:
 
     The estimate is the detraining-decayed value anchored at `now`
     (see _current_estimate). Returns True when a row was appended or refreshed.
+
+    While the rider holds an FTP OVERRIDE, their assertion is recorded instead
+    of the estimate. ``current_ftp`` already ignores the estimate in that case,
+    so writing it to history publishes a second, contradicting record of "this
+    rider's FTP" that every other reader of the database will pick up - and one
+    of them, the offline rescore in #59, re-scores the rider's rides from it.
+    A rider who states 40 W and watches the importer score their rides at IF 5
+    must not have that silently rebased to a 182 W estimate by a background
+    pass. The assertion is what the app is using; the assertion is what history
+    records.
     """
     db.init_db()
     now = now or utc_now()
+    override = _asserted_override(user_id)
+    if override is not None:
+        return _record_asserted_ftp(user_id, float(override), now)
     est = _current_estimate(db.full_activities(user_id), now)
     if est <= 0:
         return False
