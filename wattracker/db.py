@@ -235,9 +235,14 @@ _MIGRATIONS: Dict[int, Sequence[Union[str, Callable[[sqlite3.Connection], None]]
         # rating (or the next scan) computes one from it.
     ],
     28: [
-        # Existing accounts have already completed the first-hour setup. New
-        # accounts are inserted explicitly as incomplete below.
-        "ALTER TABLE users ADD COLUMN onboarding_complete INTEGER NOT NULL DEFAULT 1",
+        # The column default must match the fresh _SCHEMA (0 = onboarding not
+        # done), because SQLite cannot ALTER a default later: whatever this
+        # ALTER bakes into the users DDL is what a future column-omitting
+        # INSERT would get on every upgraded install. Legacy semantics are
+        # carried by the backfill below, not by the default - existing
+        # accounts have already lived through the first-hour setup.
+        "ALTER TABLE users ADD COLUMN onboarding_complete INTEGER NOT NULL DEFAULT 0",
+        "UPDATE users SET onboarding_complete = 1",
     ],
 }
 
@@ -662,7 +667,14 @@ def init_db(path: Optional[str] = None) -> None:
 
 # ----------------------------------------------------------------- users
 def create_user(username: str, password_hash: str, path: Optional[str] = None) -> Optional[int]:
-    """Create a user. Returns the new id, or None if the username is taken."""
+    """Create a user. Returns the new id, or None if the username is taken.
+
+    onboarding_complete is always named explicitly. Databases upgraded before
+    migration 28 was corrected still carry DEFAULT 1 in their users DDL (SQLite
+    cannot ALTER a default), so an INSERT that omits the column would create a
+    pre-onboarded account there. Every INSERT INTO users must supply it -
+    test_onboarding.py enforces that against the source.
+    """
     conn = connect(path)
     try:
         cur = conn.execute(
