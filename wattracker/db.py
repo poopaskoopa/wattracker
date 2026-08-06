@@ -1852,6 +1852,27 @@ def add_ftp_entry(
         conn.close()
 
 
+def delete_ftp_entry(user_id: int, date: str, path: Optional[str] = None) -> bool:
+    """Remove the FTP history row for (user, date). True if one was removed.
+
+    The counterpart to ``add_ftp_entry(..., replace_existing=True)`` for the
+    onboarding case where the replacement is *nothing*: the rider switched from
+    a manual value to the analysed estimate, and there is no analysis to record
+    (issue #55). Leaving the superseded row would make current_ftp disagree with
+    the choice the rider just made.
+    """
+    conn = connect(path)
+    try:
+        cur = conn.execute(
+            "DELETE FROM ftp_history WHERE user_id = ? AND date = ?",
+            (user_id, date),
+        )
+        conn.commit()
+        return cur.rowcount > 0
+    finally:
+        conn.close()
+
+
 def update_estimated_ftp_entry(
     user_id: int, date: str, ftp_watts: float, path: Optional[str] = None
 ) -> bool:

@@ -70,7 +70,7 @@
                FIT-derived estimate when available, or enter your own number.</p>
             <label class="setup-choice"><input type="radio" name="ftp_choice" value="estimated"
                 required {{ 'checked' if setup_form.ftp_choice == 'estimated' else '' }}>
-                Use FIT-derived estimate <span id="setup-estimate-value">{% if setup_estimate %}({{ setup_estimate }} W){% else %}(no-data fallback: {{ setup_fallback_ftp }} W){% endif %}</span></label>
+                Use FIT-derived estimate <span id="setup-estimate-value">{% if setup_estimate %}({{ setup_estimate }} W){% else %}(no rides analyzed yet &mdash; targets use a {{ setup_fallback_ftp }} W placeholder until one is){% endif %}</span></label>
             <label class="setup-choice"><input type="radio" name="ftp_choice" value="manual"
                 {{ 'checked' if setup_form.ftp_choice == 'manual' else '' }}> Enter manual FTP</label>
             <label for="setup-manual-ftp">Manual FTP in watts ({{ setup_ftp_min }}&ndash;{{ setup_ftp_max }})

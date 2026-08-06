@@ -18,6 +18,7 @@ from .. import db
 from ..ftp_provenance import is_asserted_source
 from ..ftp_rescore import rescore_imported_activities
 from ..metrics.power import (
+    DEFAULT_FTP,
     FTP_ASSERTION_MAX_WATTS,
     FTP_ASSERTION_MIN_WATTS,
     FTP_PLAUSIBLE_MIN_WATTS,
@@ -37,9 +38,10 @@ from .fit_parser import parse_fit
 
 _log = logging.getLogger(__name__)
 
-# Used when no plausible FTP can be resolved for a rider at all. It is a stated
-# placeholder, not a measurement - see current_ftp.
-DEFAULT_FTP = 200.0
+# DEFAULT_FTP is re-exported from metrics.power, which owns the one no-data
+# placeholder in the app (issue #55). It is a stated placeholder, not a
+# measurement, and is resolved at read time by current_ftp - never written to
+# ftp_history.
 
 
 def dedup_hash(start_time: Optional[str], duration_s: int) -> str:
