@@ -13,10 +13,10 @@ from .metrics import profile_store
 from .metrics.power import (
     asserted_ftp,
     intensity_factor,
-    is_asserted_ftp,
     is_plausible_ftp,
     normalized_power,
     training_stress_score,
+    within_assertion_bounds,
 )
 
 _log = logging.getLogger(__name__)
@@ -24,11 +24,6 @@ MAX_CANDIDATES = 200
 NEIGHBOR_SAMPLES = 5
 MAX_TARGET_PREVIEW_SAMPLES = 5
 MAX_SAFE_POWER_WATTS = 1_000_000.0
-# Relative tolerance for recognising a back-solved basis as the rider's asserted
-# FTP. np is stored to 0.1 W and if_ to 1e-3, so np/if_ carries a little
-# rounding error; 2% swallows it while staying far away from any confusion
-# between an asserted 40 W and a failed estimate's 0.64 W.
-BASIS_MATCH_REL_TOL = 0.02
 
 
 class CorrectionError(ValueError):
@@ -183,45 +178,38 @@ def _never_scored(np_value, intensity) -> bool:
     return np_number > 0 and if_number == 0.0
 
 
-def _asserted_watts(user_id: int) -> Optional[float]:
-    """The rider's own stated FTP, if that is what currently resolves for them."""
-    try:
-        current = importer.current_ftp(user_id)
-    except Exception:  # pragma: no cover - defensive; a correction must not 500
-        _log.warning("could not resolve current FTP for user %s", user_id,
-                     exc_info=True)
-        return None
-    return float(current) if is_asserted_ftp(current) else None
-
-
 def _scoring_basis(basis, user_id: int) -> float:
     """Resolve a stored or back-solved basis into one the scorer will accept.
 
     This module deliberately re-scores a corrected ride against the SAME basis
     the row was originally scored against, so a correction changes only what the
     rider asked it to change. That design stands - but it cannot extend to
-    propagating a basis the app has just declared impossible. A sub-floor basis
+    propagating a basis the app has just declared impossible. A basis of 0.6378 W
     recovered from a legacy row is a failed estimate baked into the data (issue
     #60); passing it through unwrapped makes the scorers return 0.0, leaving the
     corrected row unscored rather than minting a brand-new IF of 313 today.
 
-    The one sub-floor basis that is real is one the rider ASSERTED. Provenance
-    cannot be recovered from ``np / if_`` alone, so a sub-floor basis that
-    matches the rider's currently-asserted FTP is re-marked as asserted and
-    scores normally.
+    Between those two cases sits a basis that is BELOW the estimate floor but
+    inside the range a human FTP can take: a rider mid-rehab who stated 40 W and
+    has rows legitimately scored at IF 5. Such a row was scored, and the only
+    basis this app ever scores a row against below the floor is one the rider
+    asserted, so the recovered number is honoured as the assertion it evidences.
+    Note what this does NOT do: it does not consult today's FTP. A rider who has
+    since recovered and updated 40 W to 250 W must not have their old row's
+    valid score destroyed by a correction, and identity with the CURRENT
+    assertion - to any tolerance - is both wrong here and exploitable (setting
+    the current FTP to 0.64 would re-bless a corrupt 0.6378 legacy basis and
+    re-score the ride at TSS 1,633,482). The test is on the number's physical
+    range alone, which no setting can move.
     """
     number = _number(basis)
     if number is None or number <= 0 or is_plausible_ftp(number):
         return number if number is not None else 0.0
-    asserted = _asserted_watts(user_id)
-    if asserted is not None and math.isclose(
-        number, asserted, rel_tol=BASIS_MATCH_REL_TOL
-    ):
+    if within_assertion_bounds(number):
         return asserted_ftp(number) or 0.0
     _log.warning(
         "not re-scoring correction for user %s against recovered basis %.3f W: "
-        "below the plausibility floor and not the rider's asserted FTP",
-        user_id, number,
+        "outside the range an FTP can physically take", user_id, number,
     )
     return number
 
