@@ -7,6 +7,7 @@
 {% if cred_message %}<p class="{{ 'ok' if 'saved (' in cred_message or 'cleared' in cred_message else 'alert' }}">{{ cred_message }}</p>{% endif %}
 {% if backup_message %}<p class="{{ 'alert' if 'failed' in backup_message else 'ok' }}">{{ backup_message }}</p>{% endif %}
 {% if dir_message %}<p class="alert">{{ dir_message }}</p>{% endif %}
+{% if ftp_message %}<p class="alert" role="alert">{{ ftp_message }}</p>{% endif %}
 
 <p class="current-ftp"><strong>Current Training FTP:</strong> {{ current_ftp }} W</p>
 {% set ftp_suggestion_next = '/settings' %}
@@ -20,10 +21,16 @@
    activity windows and models. Setting FTP below records a manual entry for today.</p>
 
 <form method="post" action="/settings" class="settings-form">
-    <label>Training FTP (watts, overrides estimate):
-        <input type="number" step="1" name="ftp"
-               value="{{ settings.ftp if settings.ftp is not none else '' }}">
+    <label>Training FTP ({{ ftp_min }}&ndash;{{ ftp_max }} watts, overrides estimate):
+        <input type="number" step="1" min="{{ ftp_min }}" max="{{ ftp_max }}" name="ftp"
+               value="{{ ftp_form_value }}">
     </label>
+    {% if ftp_confirm_required %}
+    <label class="ftp-confirm">
+        <input type="checkbox" name="confirm_low_ftp" value="on">
+        Yes, my FTP really is that low &mdash; save it as entered.
+    </label>
+    {% endif %}
     <label>Zwift ID:
         <input type="text" name="zwift_id"
                value="{{ settings.zwift_id or '' }}">

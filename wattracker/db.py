@@ -848,21 +848,46 @@ def get_user_settings(user_id: int, path: Optional[str] = None) -> dict:
         conn.close()
 
 
+def _numeric_ftp(value) -> Optional[float]:
+    """``value`` as a finite float, or None if it is not a usable number."""
+    if isinstance(value, bool):
+        return None
+    try:
+        number = float(value)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    return number if math.isfinite(number) else None
+
+
 def save_user_settings(user_id: int, updates: dict, path: Optional[str] = None) -> dict:
     """Merge non-empty updates into a user's settings row (upsert).
 
-    Two keys are filtered here rather than at each caller, because this is the
+    Three keys are filtered here rather than at each caller, because this is the
     single choke point every writer goes through: ``timezone`` (must be a real
-    IANA zone) and ``zwift_id`` (becomes one folder name under the Zwift
-    Workouts root, so it must not be able to traverse out of it). A rejected
-    value leaves the stored one unchanged; routes that can talk to the user
-    also check first, so they can say why.
+    IANA zone), ``zwift_id`` (becomes one folder name under the Zwift Workouts
+    root, so it must not be able to traverse out of it), and ``ftp`` (must be a
+    number). A rejected value leaves the stored one unchanged; routes that can
+    talk to the user also check first, so they can say why.
+
+    The ``ftp`` guard is a TYPE guard, not a range check: ``/settings`` used to
+    pass its form field through untouched, so the string ``'abc'`` landed in a
+    column every FTP consumer treats as a number (issue #64). What range a typed
+    FTP may take is input policy and lives in :mod:`wattracker.ftp_input`; what
+    range may be *scored* is :mod:`wattracker.metrics.power`'s to decide, and it
+    decides it on the way out. Storing an out-of-range number is therefore still
+    allowed here - it is inert, and both readers already refuse it.
     """
     current = get_user_settings(user_id, path=path)
     for key in _SETTING_KEYS:
         if key in updates and updates[key] not in (None, ""):
             value = updates[key]
-            if key == "timezone":
+            if key == "ftp":
+                number = _numeric_ftp(value)
+                if number is None:
+                    _log.warning("refusing to store non-numeric ftp: %r", value)
+                else:
+                    current[key] = number
+            elif key == "timezone":
                 timezone = value.strip() if isinstance(value, str) else value
                 if valid_timezone(timezone):
                     current[key] = timezone

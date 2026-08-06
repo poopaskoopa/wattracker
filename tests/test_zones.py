@@ -297,11 +297,23 @@ def test_profile_ftp_save_validation_reset_and_isolation(client):
     alice = _register(client, "ftp-alice")
     db.add_ftp_entry(alice, "2026-06-01", 240)
 
-    for invalid in ("250.5", "0", "2001", ""):
+    # The bounds are wattracker.ftp_input's, shared with /settings and the setup
+    # wizard (#64); 2001 and 1001 used to be accepted here and by the wizard.
+    for invalid in ("0", "2001", "1001", "", "abc"):
         bad = client.post("/profile/ftp", data={"ftp": invalid, "action": "save"})
         assert bad.status_code == 200
-        assert 'role="alert"' in bad.text and "whole number from 1 to 2000" in bad.text
+        assert 'role="alert"' in bad.text and "from 20 to 700" in bad.text
         assert db.get_user_settings(alice)["ftp"] is None
+
+    # A fractional entry is fine - the app itself displays one-decimal FTPs, so
+    # the field has to accept one back.
+    fractional = client.post(
+        "/profile/ftp", data={"ftp": "250.5", "action": "save"},
+        follow_redirects=False,
+    )
+    assert fractional.status_code == 303
+    assert db.get_user_settings(alice)["ftp"] == pytest.approx(250.5)
+    assert 'value="250.5"' in client.get("/profile").text
 
     saved = client.post(
         "/profile/ftp", data={"ftp": "275", "action": "save"},
