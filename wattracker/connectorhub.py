@@ -20,7 +20,7 @@ import logging
 import threading
 from typing import Any, Dict, Optional
 
-from .rpc import ConnectorUnavailable, RpcPeer
+from .rpc import WS_REPLACED, ConnectorUnavailable, RpcPeer
 
 _log = logging.getLogger(__name__)
 
@@ -92,8 +92,8 @@ class ConnectorSession:
         # only orphan requests the far end is still working on.
         return future.result()
 
-    def close(self, reason: str = "connector disconnected") -> None:
-        """Mark dead, fail in-flight calls, and hang up.
+    def close(self, reason: str = "connector disconnected", code: int = 1000) -> None:
+        """Mark dead, fail in-flight calls, and hang up with ``code``.
 
         Safe from any thread and idempotent: closing a session twice (the
         displacement path and then the socket handler's own finally block)
@@ -107,9 +107,9 @@ class ConnectorSession:
         closer, self._closer = self._closer, None
         try:
             if threading.get_ident() == self._loop_thread_id:
-                self._loop.create_task(closer())
+                self._loop.create_task(closer(code))
             else:
-                asyncio.run_coroutine_threadsafe(closer(), self._loop)
+                asyncio.run_coroutine_threadsafe(closer(code), self._loop)
         except RuntimeError:
             # Loop already stopped - the socket is going away regardless.
             _log.debug("could not close connector socket", exc_info=True)
@@ -128,7 +128,9 @@ def register(session: ConnectorSession) -> "Optional[ConnectorSession]":
         previous = _sessions.get(session.user_id)
         _sessions[session.user_id] = session
     if previous is not None:
-        previous.close("replaced by a newer connector")
+        # A distinct code, so the displaced client stops instead of
+        # reconnecting and evicting this one straight back - see WS_REPLACED.
+        previous.close("replaced by a newer connector", code=WS_REPLACED)
         _log.info(
             "connector for user %s replaced (%s -> %s)",
             session.user_id, previous.label, session.label,

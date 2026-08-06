@@ -3510,9 +3510,9 @@ def create_app() -> FastAPI:
         await websocket.accept()
         peer = rpc.RpcPeer(_ConnectorSocket(websocket))
 
-        async def _hang_up() -> None:
+        async def _hang_up(code: int = 1000) -> None:
             try:
-                await websocket.close(code=1000)
+                await websocket.close(code=code)
             except Exception:
                 pass  # already gone; nothing to do
 

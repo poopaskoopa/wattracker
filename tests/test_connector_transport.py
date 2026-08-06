@@ -121,6 +121,40 @@ def test_a_second_connector_displaces_the_first(client, zwift_home):
             ).exists is True
 
 
+def test_displacement_uses_a_close_code_the_client_can_act_on(client, zwift_home):
+    """Two connectors on one account must not fight forever.
+
+    Displacement closes with WS_REPLACED rather than a normal 1000, because
+    reconnecting is the wrong response to it: each connector would evict the
+    other and be evicted straight back. The client stops on this code and says
+    why - it is a configuration mistake, not a network problem.
+    """
+    uid = _register(client)
+    closed_with = []
+
+    class _Recorder:
+        def __init__(self):
+            self.user_id = uid
+            self.label = "old"
+            self.closed = False
+
+        def close(self, reason="", code=1000):
+            self.closed = True
+            closed_with.append(code)
+
+    old = _Recorder()
+    connectorhub._sessions[uid] = old
+    try:
+        attached, _config = attach_connector(client, uid, zwift_home, label="new")
+        with attached:
+            assert connectorhub.require(uid).label == "new"
+    finally:
+        connectorhub.reset()
+
+    assert closed_with == [rpc.WS_REPLACED]
+    assert old.closed is True
+
+
 def test_closing_a_session_hangs_up_the_socket(client, zwift_home):
     """A closed session must actually close the websocket.
 

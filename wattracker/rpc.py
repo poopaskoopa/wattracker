@@ -40,6 +40,17 @@ MAX_FRAME_BYTES = 72 * 1024 * 1024
 # know better pass their own.
 DEFAULT_TIMEOUT_S = 60.0
 
+# Close code for "another connector took over this account". In the private
+# 4000-4999 range, so it can never collide with a protocol-level code.
+#
+# It exists because reconnecting is the wrong response to it, and the client
+# cannot tell that from a normal close. Two connectors running for one account
+# otherwise displace each other forever - each one reconnects, evicts the
+# other, and gets evicted right back - which is a reconnect storm that looks
+# from either side like a flaky network rather than the configuration mistake
+# it is.
+WS_REPLACED = 4409
+
 
 class RpcError(RuntimeError):
     """The far end reported that it could not do what was asked."""
