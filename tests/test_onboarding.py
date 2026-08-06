@@ -501,6 +501,140 @@ def test_dashboard_still_runs_setup_discovery_while_onboarding_is_incomplete(
     assert "(241.2 W)" in response.text
 
 
+def _setup_post_requests(activities_dir):
+    return (
+        ("/setup/check-directory", {"data": {"activities_dir": str(activities_dir)}}),
+        ("/setup/upload", {
+            "files": [("files", ("ride.fit", b"fit", "application/octet-stream"))]
+        }),
+        ("/setup/ftp", {"data": {"choice": "manual", "manual_ftp": "999"}}),
+        ("/setup/complete", {"data": {
+            "weight_kg": "99", "ftp_choice": "manual", "manual_ftp": "999",
+            "zwiftpower": "no", "activities_dir": str(activities_dir),
+        }}),
+    )
+
+
+def test_setup_page_redirects_to_settings_once_onboarding_is_complete(client):
+    uid = _register(client)
+    assert client.get("/setup").status_code == 200
+
+    db.complete_onboarding(uid)
+    response = client.get("/setup", follow_redirects=False)
+
+    assert response.status_code == 303
+    assert response.headers["location"] == "/settings"
+
+
+def test_setup_posts_are_rejected_without_mutating_after_completion(
+    client, home_dir, monkeypatch
+):
+    uid = _register(client)
+    activities = home_dir / "Activities"
+    activities.mkdir()
+    client.post("/setup/complete", data={
+        "weight_kg": "72", "ftp_choice": "manual", "manual_ftp": "275",
+        "zwiftpower": "no",
+    })
+    assert db.onboarding_complete(uid) is True
+    before = db.get_user_settings(uid)
+    before_ftp = db.latest_ftp(uid)
+
+    monkeypatch.setattr(
+        importer,
+        "ingest_upload",
+        lambda *_a, **_k: pytest.fail("closed setup reached the importer"),
+    )
+    monkeypatch.setattr(
+        credstore,
+        "save_zwift_credentials",
+        lambda *_a, **_k: pytest.fail("closed setup reached the credential store"),
+    )
+
+    for route, kwargs in _setup_post_requests(activities):
+        response = client.post(route, follow_redirects=False, **kwargs)
+        if route == "/setup/complete":
+            assert response.status_code == 303, route
+            assert response.headers["location"] == "/settings"
+        else:
+            assert response.status_code == 409, route
+            assert response.headers["content-type"].startswith("application/json")
+            assert response.json()["error"]
+
+    after = db.get_user_settings(uid)
+    assert after["ftp"] == before["ftp"] == pytest.approx(275)
+    assert after["weight_kg"] == before["weight_kg"] == pytest.approx(72)
+    assert after["activities_dir"] == before["activities_dir"] is None
+    assert after["zwift_id"] == before["zwift_id"]
+    assert db.latest_ftp(uid)["ftp_watts"] == before_ftp["ftp_watts"]
+    assert db.list_activities(uid) == []
+
+
+def test_setup_stays_resumable_for_an_incomplete_rider(client, home_dir, monkeypatch):
+    uid = _register(client)
+    activities = home_dir / "Activities"
+    activities.mkdir()
+    monkeypatch.setattr(
+        importer,
+        "parse_fit",
+        lambda path: {"start_time": "2026-07-01T10:00:00", "duration_s": 60,
+                      "streams": {"power": [200] * 60}},
+    )
+
+    assert client.get("/setup").status_code == 200
+    checked = client.post(
+        "/setup/check-directory", data={"activities_dir": str(activities)}
+    )
+    assert checked.status_code == 202
+    _wait_scan(client)
+    uploaded = client.post(
+        "/setup/upload",
+        files=[("files", ("ride.fit", b"fit", "application/octet-stream"))],
+    )
+    assert uploaded.status_code == 200
+    assert client.post(
+        "/setup/ftp", data={"choice": "manual", "manual_ftp": "255"}
+    ).status_code == 200
+    # Abandon and come back: the wizard is still there and still finishes.
+    assert client.get("/setup").status_code == 200
+    completed = client.post("/setup/complete", data={
+        "weight_kg": "71", "ftp_choice": "manual", "manual_ftp": "265",
+        "zwiftpower": "no",
+    })
+
+    assert completed.status_code == 200
+    assert db.onboarding_complete(uid) is True
+    assert db.get_user_settings(uid)["ftp"] == pytest.approx(265)
+
+
+def test_closed_setup_posts_still_require_authentication(client, home_dir):
+    uid = _register(client)
+    activities = home_dir / "Activities"
+    activities.mkdir()
+    db.complete_onboarding(uid)
+    client.post("/logout")
+
+    for route, kwargs in _setup_post_requests(activities):
+        response = client.post(route, follow_redirects=False, **kwargs)
+        assert response.status_code == 303, route
+        assert response.headers["location"] == "/login", route
+    assert client.get("/setup", follow_redirects=False).headers["location"] == "/login"
+
+
+def test_setup_completion_state_is_read_per_user(client, home_dir):
+    finished = _register(client, "finished")
+    db.complete_onboarding(finished)
+    client.post("/logout")
+    starting = _register(client, "starting")
+
+    assert client.get("/setup").status_code == 200
+    response = client.post("/setup/ftp", data={"choice": "manual", "manual_ftp": "245"})
+
+    assert response.status_code == 200
+    assert db.get_user_settings(starting)["ftp"] == pytest.approx(245)
+    assert db.get_user_settings(finished)["ftp"] is None
+
+
 def test_register_and_root_dashboard_remain_compatible(client):
     response = client.post("/register", data={"username": "compatible", "password": "password123"})
     assert response.status_code == 200
