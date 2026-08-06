@@ -47,7 +47,7 @@ def test_validate_credentials_rejects_overlong_password():
 def test_new_hash_encodes_params_and_verifies():
     h = auth.hash_password("password123")
     # scrypt$<n>$<r>$<p>$<salt>$<hash>
-    assert h.split("$")[:4] == ["scrypt", str(2 ** 17), "8", "1"]
+    assert h.split("$")[:4] == ["scrypt", str(auth._N), "8", "1"]
     assert auth.verify_password("password123", h) is True
     assert auth.verify_password("wrong", h) is False
     assert auth.needs_rehash(h) is False
@@ -59,7 +59,8 @@ def test_legacy_hash_still_verifies_and_needs_rehash():
     import os
 
     salt = os.urandom(16)
-    dk = hashlib.scrypt(b"password123", salt=salt, n=16384, r=8, p=1, dklen=32)
+    dk = hashlib.scrypt(b"password123", salt=salt, n=auth._LEGACY_N, r=8, p=1,
+                        dklen=32)
     legacy = f"scrypt${salt.hex()}${dk.hex()}"
     assert auth.verify_password("password123", legacy) is True
     assert auth.verify_password("nope", legacy) is False
@@ -97,7 +98,8 @@ def test_login_transparently_upgrades_legacy_hash(client):
     import os
 
     salt = os.urandom(16)
-    dk = hashlib.scrypt(b"password123", salt=salt, n=16384, r=8, p=1, dklen=32)
+    dk = hashlib.scrypt(b"password123", salt=salt, n=auth._LEGACY_N, r=8, p=1,
+                        dklen=32)
     legacy = f"scrypt${salt.hex()}${dk.hex()}"
     db.init_db()
     db.create_user("legacyuser", legacy)
@@ -109,7 +111,7 @@ def test_login_transparently_upgrades_legacy_hash(client):
     # The stored hash was upgraded to the current 6-field format on login.
     stored = db.get_user_by_username("legacyuser")["password_hash"]
     assert stored != legacy
-    assert stored.startswith(f"scrypt${2 ** 17}$")
+    assert stored.startswith(f"scrypt${auth._N}$")
     assert auth.verify_password("password123", stored) is True
 
 
