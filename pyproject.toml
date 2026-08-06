@@ -26,7 +26,7 @@ dependencies = [
 # optional: the browser binary is a ~150MB download outside pip
 # (`playwright install chromium`), so machines and CI without it simply skip
 # those tests instead of failing.
-dev = ["pytest>=8.0", "httpx>=0.27", "playwright>=1.47"]
+dev = ["pytest>=8.0", "httpx>=0.27", "playwright>=1.47", "websockets>=13.0"]
 # Real-hardware Bluetooth riding. Not needed for core install or the test suite;
 # requires a Bluetooth adapter + trainer/sensors to actually use.
 ble = ["bleak>=0.22"]
@@ -35,18 +35,24 @@ ble = ["bleak>=0.22"]
 # an unpinned bump can change the shipped binary without any change to this
 # repository. Same pin as .github/workflows/windows-release.yml.
 package = ["pyinstaller==6.16.0"]
+# The connector: the half that runs on the machine where Zwift is installed.
+# Deliberately tiny - it must not pull numpy/pandas/scipy/fastapi, because it
+# gets frozen into a Windows executable (see tests/test_connector_client.py,
+# which enforces exactly that).
+connector = ["websockets>=13.0", "bleak>=0.22"]
 
 [project.scripts]
 wattracker = "wattracker.__main__:main"
 wattracker-restore = "wattracker.restore_backup:main"
 wattracker-ftp-rescore = "wattracker.ftp_backfill:main"
+wattracker-connector = "wattracker_connector.__main__:main"
 
 [build-system]
 requires = ["setuptools>=61.0"]
 build-backend = "setuptools.build_meta"
 
 [tool.setuptools.packages.find]
-include = ["wattracker*"]
+include = ["wattracker*", "wattracker_connector*"]
 
 [tool.setuptools.package-data]
 wattracker = [
