@@ -32,6 +32,10 @@ _BACKOFF_FACTOR = 2.0
 _HELLO_TIMEOUT_S = 20.0
 
 
+class _Replaced(Exception):
+    """The server closed us because another connector took over the account."""
+
+
 class ConnectorStatus:
     """What the tray icon shows. Plain attributes, read from another thread."""
 
@@ -112,6 +116,20 @@ class Connector:
                 backoff = _BACKOFF_START_S  # a clean session resets the clock
             except asyncio.CancelledError:
                 raise
+            except _Replaced as exc:
+                # Another connector took this account over. Reconnecting would
+                # evict it and get us evicted right back, forever - so stop,
+                # and say why, because this is a configuration mistake and not
+                # a network problem.
+                self.status.connected = False
+                self.status.last_error = str(exc)
+                log.error(
+                    "another connector has taken over this account - stopping. "
+                    "Only one connector may run per account; quit the other "
+                    "one, or pair this machine as its own device."
+                )
+                self._stop.set()
+                break
             except Exception as exc:
                 self.status.connected = False
                 self.status.last_error = str(exc)
@@ -135,6 +153,14 @@ class Connector:
 
         url = websocket_url(self.server_url)
         log.info("connecting to %s", url)
+        try:
+            await self._connected_session(websockets, url)
+        except websockets.exceptions.ConnectionClosed as exc:
+            if exc.rcvd is not None and exc.rcvd.code == rpc.WS_REPLACED:
+                raise _Replaced(str(exc)) from exc
+            raise
+
+    async def _connected_session(self, websockets, url: str) -> None:
         async with websockets.connect(
             url,
             additional_headers={"Authorization": f"Bearer {self.token}"},
