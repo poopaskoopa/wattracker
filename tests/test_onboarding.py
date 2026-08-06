@@ -58,6 +58,128 @@ def test_new_user_is_incomplete_and_v26_migration_preserves_user(tmp_path, monke
     assert db.get_user_by_username("legacy", str(old_db))["id"] == 7
 
 
+def _pre_onboarding_db(tmp_path, name="pre28.db"):
+    """A database from before migration 28 added onboarding_complete."""
+    old_db = tmp_path / name
+    conn = sqlite3.connect(old_db)
+    conn.executescript(
+        "CREATE TABLE users (id INTEGER PRIMARY KEY, username TEXT UNIQUE NOT NULL, "
+        "password_hash TEXT NOT NULL, created TEXT NOT NULL, calendar_token_hash TEXT);"
+        "CREATE UNIQUE INDEX idx_users_calendar_token_hash ON users(calendar_token_hash);"
+        "INSERT INTO users VALUES (7, 'legacy', 'hash', '2026-01-01', 'abc123');"
+        "INSERT INTO users VALUES (8, 'legacy2', 'hash', '2026-01-02', NULL);"
+        "INSERT INTO users VALUES (9, 'legacy3', 'hash', '2026-01-03', NULL);"
+        "PRAGMA user_version = 26;"
+    )
+    conn.commit()
+    conn.close()
+    return old_db
+
+
+def _users_ddl(path):
+    conn = sqlite3.connect(path)
+    try:
+        return conn.execute(
+            "SELECT sql FROM sqlite_master WHERE type='table' AND name='users'"
+        ).fetchone()[0]
+    finally:
+        conn.close()
+
+
+def _insert_user_without_onboarding_column(path, username):
+    conn = sqlite3.connect(path)
+    try:
+        cur = conn.execute(
+            "INSERT INTO users (username, password_hash, created) VALUES (?, ?, ?)",
+            (username, "hash", "2026-02-02"),
+        )
+        conn.commit()
+        return cur.lastrowid
+    finally:
+        conn.close()
+
+
+def test_fresh_and_migrated_schemas_default_onboarding_to_incomplete(tmp_path):
+    fresh = tmp_path / "fresh.db"
+    db.init_db(str(fresh))
+    migrated = _pre_onboarding_db(tmp_path)
+    db.init_db(str(migrated))
+
+    for path in (fresh, migrated):
+        assert "onboarding_complete INTEGER NOT NULL DEFAULT 0" in _users_ddl(path)
+        # A future INSERT that forgets the column must not pre-complete setup.
+        uid = _insert_user_without_onboarding_column(path, "omitted")
+        assert db.onboarding_complete(uid, str(path)) is False
+
+
+def test_migration_28_keeps_existing_accounts_onboarded_and_intact(tmp_path):
+    migrated = _pre_onboarding_db(tmp_path)
+
+    db.init_db(str(migrated))
+
+    conn = sqlite3.connect(migrated)
+    conn.row_factory = sqlite3.Row
+    try:
+        rows = {r["id"]: r for r in conn.execute("SELECT * FROM users ORDER BY id")}
+        indexes = {
+            r[0] for r in conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='index' AND tbl_name='users'"
+            )
+        }
+    finally:
+        conn.close()
+    assert set(rows) == {7, 8, 9}
+    assert [rows[i]["onboarding_complete"] for i in (7, 8, 9)] == [1, 1, 1]
+    assert rows[7]["calendar_token_hash"] == "abc123"
+    assert rows[8]["calendar_token_hash"] is None
+    assert rows[9]["calendar_token_hash"] is None
+    assert "idx_users_calendar_token_hash" in indexes
+    # New accounts on a migrated database still start incomplete.
+    new_uid = db.create_user("after-migration", "hash", str(migrated))
+    assert db.onboarding_complete(new_uid, str(migrated)) is False
+
+
+def test_init_db_is_rerunnable_after_the_onboarding_migration(tmp_path):
+    migrated = _pre_onboarding_db(tmp_path)
+    db.init_db(str(migrated))
+    uid = db.create_user("fresh-account", "hash", str(migrated))
+    db.complete_onboarding(7, str(migrated))
+
+    db.init_db(str(migrated))
+
+    conn = sqlite3.connect(migrated)
+    try:
+        version = conn.execute("PRAGMA user_version").fetchone()[0]
+        usernames = [r[0] for r in conn.execute("SELECT username FROM users ORDER BY id")]
+    finally:
+        conn.close()
+    assert version == db.SCHEMA_VERSION
+    assert usernames == ["legacy", "legacy2", "legacy3", "fresh-account"]
+    assert db.onboarding_complete(7, str(migrated)) is True
+    assert db.onboarding_complete(uid, str(migrated)) is False
+
+
+def test_every_user_insert_names_onboarding_complete():
+    """Defends databases migrated while the ALTER still said DEFAULT 1."""
+    source = inspect.getsource(db)
+    statements = [
+        source[hit:hit + 200] for hit in _find_all(source, '"INSERT INTO users')
+    ]
+    assert statements
+    for statement in statements:
+        assert "onboarding_complete" in statement, statement
+
+
+def _find_all(haystack, needle):
+    start = 0
+    while True:
+        found = haystack.find(needle, start)
+        if found < 0:
+            return
+        yield found
+        start = found + len(needle)
+
+
 def test_setup_copy_and_dashboard_include_guidance(client):
     _register(client)
     dashboard = client.get("/").text
