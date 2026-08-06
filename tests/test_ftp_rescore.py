@@ -6,6 +6,17 @@ import pytest
 from wattracker import db
 from wattracker.ingest import importer
 
+pytest.importorskip("httpx")
+from fastapi.testclient import TestClient  # noqa: E402
+
+from wattracker.server import create_app  # noqa: E402
+
+
+@pytest.fixture()
+def upload_client():
+    with TestClient(create_app()) as value:
+        yield value
+
 
 def _parsed_ride(start_time="2026-08-05T10:00:00", watts=263.0, seconds=3600):
     return {
@@ -149,3 +160,33 @@ def test_rescore_processes_imports_in_bounded_batches(user_id, monkeypatch):
 
     assert importer.rescore_imported_activities(user_id, ids) == 1001
     assert batch_sizes == [500, 500, 1]
+
+
+def test_setup_upload_rescores_the_batch_like_a_directory_scan(
+    upload_client, monkeypatch
+):
+    """The wizard's two import routes must agree on the dose they record.
+
+    Both land the same rides; only the route differs. Before this, an upload
+    batch kept the FTP that existed *before* it landed - the 200 W default on a
+    first run - and stored TSS 172.9, while the same rides through
+    scan_activities stored 100.0. A rider's training load depended on which
+    button they pressed, and issue #54 says both paths must be fixed together.
+    """
+    response = upload_client.post(
+        "/register", data={"username": "rescoreup", "password": "password123"}
+    )
+    assert response.status_code == 200
+    uid = db.get_user_by_username("rescoreup")["id"]
+
+    monkeypatch.setattr(importer, "parse_fit", lambda path: _parsed_ride())
+    response = upload_client.post(
+        "/setup/upload",
+        files=[("files", ("ride.fit", b"not-real-fit", "application/octet-stream"))],
+    )
+    assert response.status_code == 200
+    assert response.json()["imported"] == 1
+
+    activity = db.list_activities(uid)[0]
+    assert activity["if_"] == pytest.approx(1.0, abs=0.001)
+    assert activity["tss"] == pytest.approx(100.0, abs=0.2)

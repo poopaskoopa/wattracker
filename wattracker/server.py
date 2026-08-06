@@ -1041,6 +1041,7 @@ def create_app() -> FastAPI:
         imported = 0
         skipped = 0
         failed = 0
+        imported_activity_ids = []
         uid = _uid(request)
         batch_ftp = importer.current_ftp(uid)
         for safe_name, content in staged:
@@ -1055,8 +1056,16 @@ def create_app() -> FastAPI:
                 skipped += 1
             else:
                 imported += 1
+                imported_activity_ids.append(activity_id)
         if imported > 0:
             importer.evaluate_ftp(uid)
+            # The batch was scored against the FTP that existed *before* it
+            # landed - on a first run that is the 200 W default. evaluate_ftp
+            # has just computed the real one, so rescore against the FTP in
+            # effect on each activity's own date. scan_activities does the
+            # same; leaving it out here is what made the wizard's two import
+            # routes disagree (100.0 vs 172.9 TSS for the same rides).
+            importer.rescore_imported_activities(uid, imported_activity_ids)
             importer.match_plan_completions(uid)
             importer.profile_store.refresh(uid)
         estimate = importer.recent_best_effort_ftp(uid)
