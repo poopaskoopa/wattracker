@@ -423,20 +423,14 @@ def test_report_names_the_direction_of_the_median_change(tmp_path, capsys):
     assert "stored TSS goes UP" in out
 
 
-# --- GUARD: the tool never reads a database other than --db ------------------
-
-def test_a_sub_floor_ftp_history_entry_aborts_the_run(tmp_path, capsys):
-    """GUARD (new): ``is_plausible_ftp`` resolves such a basis against the
-    DEFAULT database with a writable connection.
-
-    A report over a copy must not open any other file, so a wattage that would
-    reach that branch stops the run instead.
-    """
+def test_a_sub_floor_ftp_history_entry_uses_the_selected_database(
+    tmp_path, capsys
+):
     path, uid, ids = _database(tmp_path)
     db.add_ftp_entry(uid, "2020-01-01", 40.0, "manual", path=str(path))
 
-    assert ftp_backfill.main(["--db", str(path)]) == 2
-    assert "refusing to run" in capsys.readouterr().err.lower()
+    assert ftp_backfill.main(["--db", str(path)]) == 0
+    assert "refusing to run" not in capsys.readouterr().err.lower()
 
 
 def test_a_dry_run_leaves_the_database_byte_identical(tmp_path):

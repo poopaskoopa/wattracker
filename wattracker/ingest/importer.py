@@ -15,6 +15,7 @@ from typing import Callable, Dict, List, Optional
 import numpy as np
 
 from .. import db
+from ..config import db_path
 from ..ftp_provenance import is_asserted_source
 from ..ftp_rescore import rescore_imported_activities
 from ..metrics.power import (
@@ -725,7 +726,9 @@ def scan_activities(
     completed = 0
     if imported > 0:
         evaluate_ftp(user_id)
-        rescore_imported_activities(user_id, imported_activity_ids)
+        rescore_imported_activities(
+            user_id, imported_activity_ids, path=db_path()
+        )
         completed = match_plan_completions(user_id)
         # New rides move the rider's measured capacities (a new 5s or 5min
         # peak, a new FTP), and every prescription is built on the STORED

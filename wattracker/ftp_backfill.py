@@ -42,7 +42,7 @@ from . import db
 from .config import db_path
 from .ftp_rescore import score_activity
 from .metrics.load import compute_load, daily_tss_series
-from .metrics.power import FTP_ASSERTION_MIN_WATTS, FTP_PLAUSIBLE_MIN_WATTS
+from .metrics.power import FTP_PLAUSIBLE_MIN_WATTS
 
 _STATE_VERSION = 2
 _COUNTED_TABLES = (
@@ -56,13 +56,8 @@ _COUNTED_TABLES = (
 # a wattage this codebase now refuses to score against at all - the #60 damage.
 # The line is the app's own estimate floor rather than a number invented here.
 #
-# It is applied as a plain numeric comparison, NOT via ``is_plausible_ftp``, on
-# purpose: for a basis between FTP_ASSERTION_MIN_WATTS and this floor that
-# function resolves provenance by opening the DEFAULT database, which for an
-# offline report over a copy would be the wrong file and a writable handle on
-# the live one. ``_reject_provenance_dependent_bases`` below makes sure the
-# scoring path cannot reach that branch either. Provenance is in any case
-# unknowable for a basis back-solved out of an old row.
+# It is applied as a plain numeric comparison because provenance is unknowable
+# for a basis back-solved out of an old row.
 CORRUPT_BASIS_MAX_WATTS = FTP_PLAUSIBLE_MIN_WATTS
 
 # An IF this high is not a hard ride, it is a scoring error: 1.0 is threshold,
@@ -480,35 +475,6 @@ def _new_stats() -> Dict[str, _Stats]:
     return {name: _Stats() for name in POPULATIONS}
 
 
-def _reject_provenance_dependent_bases(source: str, read_only: bool) -> None:
-    """Refuse to run if any stored FTP would make the scoring rail query elsewhere.
-
-    ``is_plausible_ftp`` decides a basis between ``FTP_ASSERTION_MIN_WATTS`` and
-    ``FTP_PLAUSIBLE_MIN_WATTS`` by looking up provenance in the *default*
-    database with a writable connection. That is fine on the live import path
-    and wrong here twice over: this tool is usually pointed at a copy, and a
-    dry run must not open the live database at all, let alone for writing. No
-    such value exists in this database today, so refusing outright costs
-    nothing and keeps the guarantee absolute.
-    """
-    conn = db.connect(source, read_only=read_only)
-    try:
-        rows = conn.execute(
-            "SELECT DISTINCT ftp_watts FROM ftp_history "
-            "WHERE ftp_watts >= ? AND ftp_watts < ?",
-            (FTP_ASSERTION_MIN_WATTS, FTP_PLAUSIBLE_MIN_WATTS),
-        ).fetchall()
-    finally:
-        conn.close()
-    if rows:
-        values = ", ".join(f"{float(row[0]):g}" for row in rows)
-        raise RuntimeError(
-            f"ftp_history in {source} contains sub-floor wattages ({values}) "
-            "whose admissibility is resolved against the default database. "
-            "Refusing to run rather than read a database other than --db."
-        )
-
-
 def run(
     source: str,
     *,
@@ -552,8 +518,6 @@ def run(
         raise ValueError("chunk size must be positive")
     if stop_after_chunks is not None and stop_after_chunks <= 0:
         raise ValueError("stop_after_chunks must be positive")
-
-    _reject_provenance_dependent_bases(source, read_only=not write)
 
     state_file = os.path.abspath(state_path or f"{source}.ftp-rescore.json")
     backup_file = None
@@ -614,7 +578,7 @@ def run(
             ):
                 for row in rows:
                     returned.add(int(row["id"]))
-                    scored = score_activity(row)
+                    scored = score_activity(row, path=source)
                     day = _activity_day(row)
                     old_tss = _number(row.get("tss"))
                     if scored is None:
