@@ -498,3 +498,56 @@ def test_only_rejects_an_unknown_population(tmp_path):
         ftp_backfill.run(str(path), only=("typo",))
     with pytest.raises(ValueError, match="at least one"):
         ftp_backfill.run(str(path), only=())
+
+
+def test_a_scoped_run_reports_only_the_load_it_actually_moves(tmp_path):
+    """The load shift must describe the repair being performed, not a bigger one.
+
+    Review caught this against the owner's real database: `--only corrupt
+    --only suspect --write` printed a CTL/ATL/TSB shift identical to a
+    full-scope run, after changing zero rows that enter that sum. Corrupt and
+    suspect rows are excluded from both sides of the load calculation, so the
+    approved scope's true shift is zero - and the shift is exactly the number a
+    live run gets checked against, so overstating it is worse than useless.
+    """
+    path, uid, ids = _database(tmp_path, rows=3)
+    _set(path, uid, ids[0], if_=411.0, tss=900.0, duration_s=6)   # corrupt
+    _set(path, uid, ids[1], if_=3.5, tss=1500.0)                  # suspect
+
+    scoped = ftp_backfill.run(str(path), only=("corrupt", "suspect"))
+    full = ftp_backfill.run(str(path))
+
+    assert scoped["withheld"] == {"ordinary": 1}
+    assert scoped["load_shift"] == {"ctl": 0.0, "atl": 0.0, "tsb": 0.0}
+    # The ordinary row genuinely would move something under full scope, so the
+    # zero above is a real difference rather than an artifact of the fixture.
+    assert full["load_shift"] != scoped["load_shift"]
+
+
+def test_a_resumed_run_refuses_a_different_only_scope(tmp_path):
+    """Scope is part of a run's identity.
+
+    Resuming a `--only corrupt` run without `--only` would apply two different
+    repairs to two halves of the same database, with nothing in the progress
+    file or the report recording that it happened.
+    """
+    path, uid, ids = _database(tmp_path, rows=2)
+    state = tmp_path / "progress.json"
+    backup = tmp_path / "before.db"
+    ftp_backfill.run(
+        str(path), write=True, state_path=str(state), backup_path=str(backup),
+        only=("corrupt",), chunk_size=1, stop_after_chunks=1,
+    )
+    assert json.loads(state.read_text())["only"] == ["corrupt"]
+
+    for scope in (None, ("ordinary",), ("corrupt", "suspect")):
+        with pytest.raises(ValueError, match="only"):
+            ftp_backfill.run(
+                str(path), write=True, state_path=str(state),
+                backup_path=str(backup), only=scope, chunk_size=1,
+            )
+    # The matching scope still resumes.
+    ftp_backfill.run(
+        str(path), write=True, state_path=str(state), backup_path=str(backup),
+        only=("corrupt",), chunk_size=1,
+    )
