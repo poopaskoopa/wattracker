@@ -774,12 +774,32 @@
     }
     function variantOptions(data) {
         var options = data && Array.isArray(data.variants) ? data.variants : [];
-        if (options.length) return options;
+        if (options.length && options.every(function (option) {
+            return option && typeof option === "object" &&
+                option.profile != null && option.duration_s != null;
+        })) {
+            return options.map(function (option) {
+                return Object.assign({}, option, {
+                    ftp: option.ftp != null ? option.ftp : data.ftp,
+                    type_info: option.type_info || data.type_info
+                });
+            });
+        }
         var profiles = data && data.variant_profiles;
         var duration = data && data.duration_s != null
             ? String(Math.round(Number(data.duration_s) / 60)) : "";
-        if (profiles && duration) {
-            return Object.keys(profiles).map(function (key) {
+        var names;
+        if (options.length) {
+            if (!options.every(function (option) {
+                return typeof option === "string" && option.trim();
+            })) return [];
+            names = options;
+        } else {
+            names = data && Array.isArray(data.variant_options)
+                ? data.variant_options : [];
+        }
+        if (profiles && duration && names.length) {
+            return names.map(function (key) {
                 var option = profiles[key] && profiles[key][duration];
                 if (!option) return null;
                 return Object.assign({}, option, {
@@ -789,7 +809,7 @@
                 });
             }).filter(Boolean);
         }
-        return data ? [data] : [];
+        return [];
     }
     function setVariantCardsDisabled(disabled) {
         document.querySelectorAll("#rideVariantGrid .ride-variant-card").forEach(function (card) {
@@ -816,6 +836,8 @@
         var options = variantOptions(data);
         grid.replaceChildren();
         if (!options.length || !justRide()) {
+            // Keep the selected workout preview below, but never manufacture
+            // a shape card from a partial/legacy payload.
             picker.hidden = true;
             status.textContent = "";
             return;
