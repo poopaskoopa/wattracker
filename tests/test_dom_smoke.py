@@ -28,6 +28,7 @@ import httpx  # noqa: E402
 import uvicorn  # noqa: E402
 
 from wattracker import db  # noqa: E402
+from wattracker.prescribe.planner import VARIANTS, WORKOUT_TYPE_KEYS  # noqa: E402
 from wattracker.server import create_app  # noqa: E402
 
 pytestmark = pytest.mark.browser
@@ -333,38 +334,81 @@ def test_calendar_workout_click_opens_modal_with_drawn_profile(page, live_server
 
 def test_just_ride_variant_cards_render_and_select(page, live_server,
                                                    console_errors):
-    """Just Ride shows real duration-specific curves and switches shapes."""
+    """Every Just Ride focus renders all of its accessible, drawn variants."""
     page.goto(f"{live_server.base}/ride")
     page.get_by_role("button", name="Just ride", exact=True).click()
     page.wait_for_selector("#rideVariantPicker:not([hidden])", timeout=10_000)
 
-    cards = page.locator("#rideVariantGrid .ride-variant-card")
-    assert cards.count() >= 2, "Just Ride rendered no workout variety"
-    page.wait_for_selector("#rideVariantGrid svg.profile-svg", timeout=10_000)
-    geom = _svg_has_geometry(page, "#rideVariantGrid svg.profile-svg")
-    assert geom["ok"], f"Just Ride variant curve has no drawn geometry: {geom}"
+    # 240 minutes is both an offered boundary and the duration most likely to
+    # expose a missing long-ride variant profile.
+    page.select_option("#rideDurationSelect", "240")
+    for kind in WORKOUT_TYPE_KEYS:
+        expected = VARIANTS[kind]
+        page.select_option("#rideTypeSelect", kind)
+        page.wait_for_function(
+            """(expected) => {
+                const grid = document.querySelector('#rideVariantGrid');
+                if (!grid || grid.closest('[hidden]')) return false;
+                const actual = Array.from(grid.querySelectorAll(
+                    '.ride-variant-card')).map(card => card.dataset.variant);
+                return JSON.stringify(actual) === JSON.stringify(expected);
+            }""",
+            arg=expected, timeout=10_000,
+        )
 
-    selected_before = page.locator(
-        '#rideVariantGrid .ride-variant-card[aria-selected="true"]'
-    ).get_attribute("data-variant")
-    target = cards.nth(1 if selected_before == cards.nth(0).get_attribute("data-variant") else 0)
-    target_variant = target.get_attribute("data-variant")
-    target.click()
-    page.wait_for_selector(
-        f'#rideVariantGrid .ride-variant-card[data-variant="{target_variant}"]'
-        '[aria-selected="true"]',
-        timeout=10_000,
-    )
-    ordered = [cards.nth(i).get_attribute("data-variant") for i in range(cards.count())]
-    previous_variant = ordered[(ordered.index(target_variant) - 1) % len(ordered)]
-    page.locator(
-        f'#rideVariantGrid .ride-variant-card[data-variant="{target_variant}"]'
-    ).press("ArrowLeft")
-    page.wait_for_selector(
-        f'#rideVariantGrid .ride-variant-card[data-variant="{previous_variant}"]'
-        '[aria-selected="true"]',
-        timeout=10_000,
-    )
+        cards = page.locator("#rideVariantGrid .ride-variant-card")
+        variants = [cards.nth(i).get_attribute("data-variant")
+                    for i in range(cards.count())]
+        assert variants == expected, f"{kind}: unexpected variant cards {variants}"
+        assert len(set(variants)) == len(expected), f"{kind}: duplicate variants"
+        assert page.locator("#rideVariantPicker").is_visible()
+        assert page.locator("#rideVariantGrid").is_visible()
+
+        states = page.evaluate(
+            """() => Array.from(document.querySelectorAll(
+                '#rideVariantGrid .ride-variant-card')).map(card => {
+                const svg = card.querySelector('svg.profile-svg');
+                const paths = svg ? svg.querySelectorAll('path') : [];
+                const lines = svg ? svg.querySelectorAll('line') : [];
+                let dLen = 0;
+                paths.forEach(path => {
+                    dLen = Math.max(dLen, (path.getAttribute('d') || '').length);
+                });
+                const box = svg ? svg.getBoundingClientRect() : {width: 0, height: 0};
+                return {
+                    visible: !!(svg && card.getBoundingClientRect().width > 0 &&
+                        svg.getBoundingClientRect().width > 0),
+                    label: card.getAttribute('aria-label') || '',
+                    content: (card.innerText || '').trim(),
+                    geometry: !!(svg && paths.length && dLen > 20 && lines.length &&
+                        box.width > 10 && box.height > 10),
+                };
+            })"""
+        )
+        assert all(state["visible"] for state in states), f"{kind}: hidden card"
+        assert all(state["label"].strip() and state["content"]
+                   for state in states), f"{kind}: unreadable card"
+        assert all(state["geometry"] for state in states), f"{kind}: undrawn card"
+        selected_cards = page.locator(
+            '#rideVariantGrid .ride-variant-card[aria-selected="true"]'
+        )
+        assert selected_cards.count() == 1
+
+        for index, variant in enumerate(variants):
+            card = page.locator(
+                f'#rideVariantGrid .ride-variant-card[data-variant="{variant}"]'
+            )
+            card.click()
+            page.wait_for_selector(
+                f'#rideVariantGrid .ride-variant-card[data-variant="{variant}"]'
+                '[aria-selected="true"]', timeout=10_000,
+            )
+            next_variant = variants[(index + 1) % len(variants)]
+            card.press("ArrowRight")
+            page.wait_for_selector(
+                f'#rideVariantGrid .ride-variant-card[data-variant="{next_variant}"]'
+                '[aria-selected="true"]', timeout=10_000,
+            )
     _assert_clean(console_errors, "/ride Just Ride variants")
 
 
