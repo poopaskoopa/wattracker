@@ -26,7 +26,9 @@ import pytest
 import wattracker.ingest.importer as importer
 from wattracker import db, power_corrections
 from wattracker.analysis import activity_cache
+from wattracker.config import db_path
 from wattracker.ftp_provenance import is_asserted_source
+from wattracker.ftp_rescore import score_activity
 from wattracker.metrics import profile_store
 from wattracker.metrics.power import (
     FTP_PLAUSIBLE_MIN_WATTS,
@@ -208,6 +210,16 @@ def test_is_plausible_ftp(watts, expected):
     import). It pins the boundary against future drift.
     """
     assert is_plausible_ftp(watts) is expected
+
+
+def test_sub_floor_numeric_predicate_does_not_open_a_database(monkeypatch):
+    import wattracker.db as database
+
+    def fail(*args, **kwargs):
+        raise AssertionError("numeric FTP plausibility must not open SQLite")
+
+    monkeypatch.setattr(database, "connect", fail)
+    assert is_plausible_ftp(40.0) is False
 
 
 def test_manual_override_below_the_floor_is_still_honoured():
@@ -477,9 +489,10 @@ def test_asserted_sub_floor_ftp_survives_a_database_round_trip(tmp_path, monkeyp
     assert is_asserted_source(db.latest_ftp(uid)["source"])
 
     # 2. and a scorer handed that bare float reaches the importer's answer.
-    assert is_plausible_ftp(basis) is True
-    assert intensity_factor(row["np"], basis) == pytest.approx(row["if_"])
-    assert training_stress_score(3600, row["np"], basis) == pytest.approx(row["tss"])
+    path = db_path()
+    assert is_plausible_ftp(basis, path=path) is True
+    assert intensity_factor(row["np"], basis, path=path) == pytest.approx(row["if_"])
+    assert training_stress_score(3600, row["np"], basis, path=path) == pytest.approx(row["tss"])
 
 
 def test_manual_history_row_is_asserted_after_a_round_trip():
@@ -492,12 +505,30 @@ def test_manual_history_row_is_asserted_after_a_round_trip():
     uid = _user()
     db.add_ftp_entry(uid, "2026-06-01", 40.0, "manual")
 
-    assert is_plausible_ftp(40.0) is True
-    assert intensity_factor(200.0, 40.0) == pytest.approx(5.0)
-    assert training_stress_score(3600, 200.0, 40.0) == pytest.approx(2500.0)
+    path = db_path()
+    assert is_plausible_ftp(40.0, path=path) is True
+    assert intensity_factor(200.0, 40.0, path=path) == pytest.approx(5.0)
+    assert training_stress_score(3600, 200.0, 40.0, path=path) == pytest.approx(2500.0)
     # Only that value, and only because the rider stated it.
     assert is_plausible_ftp(41.0) is False
     assert importer.current_ftp(uid) == pytest.approx(40.0)
+
+
+def test_rescore_uses_the_supplied_database_for_sub_floor_provenance(tmp_path):
+    scratch = tmp_path / "scratch.db"
+    db.init_db(str(scratch))
+    uid = db.create_user("scratch", "hash", path=str(scratch))
+    db.add_ftp_entry(uid, "2026-06-01", 40.0, "manual", path=str(scratch))
+
+    row = {
+        "id": 1,
+        "start_time": "2026-07-01T10:00:00",
+        "duration_s": 3600,
+        "np": 200.0,
+        "ftp_watts": 40.0,
+        "has_correction": False,
+    }
+    assert score_activity(row, path=str(scratch))["if_"] == pytest.approx(5.0)
 
 
 def test_an_unknown_history_source_is_not_a_rider_assertion():

@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import datetime
 import math
+from typing import Optional
 from collections.abc import Mapping
 from typing import Iterable, Sequence
 
@@ -256,9 +257,9 @@ class AssertedFTP(float):
     importer has just resolved so the rest of that one call chain does not have
     to re-derive provenance (and so a freshly typed assertion works before it
     has been written anywhere). The durable answer lives in the database and is
-    resolved by :mod:`wattracker.ftp_provenance` - see ``is_plausible_ftp``.
-    Anything that reads a basis back out of SQLite gets a bare float, and a
-    marker that only exists on one process's stack would be invisible to it.
+    resolved by :mod:`wattracker.ftp_provenance` when a caller supplies its
+    database path to ``is_plausible_ftp``. Anything that reads a basis back out
+    of SQLite gets a bare float and must pass that path explicitly.
 
     It is a float subclass, so it stores, serializes, rounds, compares and does
     arithmetic exactly like the number it wraps. Arithmetic on it yields a plain
@@ -309,32 +310,16 @@ def is_asserted_ftp(value) -> bool:
     return isinstance(value, AssertedFTP)
 
 
-def _durably_asserted(value: float) -> bool:
-    """Whether the database records ``value`` as a wattage a rider asserted."""
-    try:
-        from ..ftp_provenance import is_asserted_watts
-
-        return is_asserted_watts(value)
-    except Exception:  # pragma: no cover - a scorer must never fail on this
-        return False
-
-
-def is_plausible_ftp(watts) -> bool:
+def is_plausible_ftp(watts, path: Optional[str] = None) -> bool:
     """Whether ``watts`` may be used as a scoring basis.
 
     The single admission test. False for None, non-numeric, non-finite, and for
     anything outside the human range entirely.
 
-    Between ``FTP_ASSERTION_MIN_WATTS`` and ``FTP_PLAUSIBLE_MIN_WATTS`` the
-    answer depends on PROVENANCE: the floor filters our own estimates, never a
-    rider's statement of their own FTP. Provenance is taken from the in-process
-    marker when there is one, and otherwise resolved from the database, so a
-    basis read back out of SQLite - by the offline rescore in #59, which never
-    sees an ``AssertedFTP`` - reaches the same verdict as the importer did.
-
-    That database lookup only happens for a sub-floor wattage that is otherwise
-    admissible, i.e. almost never: every ordinary basis is settled by the two
-    numeric comparisons first.
+    Between ``FTP_ASSERTION_MIN_WATTS`` and ``FTP_PLAUSIBLE_MIN_WATTS`` a bare
+    value is rejected unless ``path`` explicitly identifies the database whose
+    provenance should be checked. The default path is deliberately pure: this
+    predicate must never open the configured database as a side effect.
     """
     value = _finite(watts)
     if value is None or value > FTP_ASSERTION_MAX_WATTS:
@@ -345,7 +330,11 @@ def is_plausible_ftp(watts) -> bool:
         return True
     if value < FTP_ASSERTION_MIN_WATTS:
         return False
-    return _durably_asserted(value)
+    if path is None:
+        return False
+    from ..ftp_provenance import is_asserted_watts
+
+    return is_asserted_watts(value, path=path)
 
 
 # --- the scoring chokepoint --------------------------------------------------
@@ -365,36 +354,41 @@ def is_plausible_ftp(watts) -> bool:
 # historical repair (#62); this rail stops new damage being written.
 
 
-def intensity_factor(np_value: float, ftp: float) -> float:
+def intensity_factor(
+    np_value: float, ftp: float, path: Optional[str] = None
+) -> float:
     """IF = NP / FTP, or 0.0 when ``ftp`` is not an admissible scoring basis."""
-    if not is_plausible_ftp(ftp):
+    if not is_plausible_ftp(ftp, path=path):
         return 0.0
     return float(np_value) / float(ftp)
 
 
 def training_stress_score(
-    duration_seconds: float, np_value: float, ftp: float
+    duration_seconds: float, np_value: float, ftp: float,
+    path: Optional[str] = None,
 ) -> float:
     """TSS = (duration_s * NP * IF) / (FTP * 3600) * 100.
 
     One hour at FTP yields exactly 100 TSS. Returns 0.0 when ``ftp`` is not an
     admissible scoring basis (see ``is_plausible_ftp``).
     """
-    if duration_seconds <= 0 or not is_plausible_ftp(ftp):
+    if duration_seconds <= 0 or not is_plausible_ftp(ftp, path=path):
         return 0.0
-    intensity = intensity_factor(np_value, ftp)
+    intensity = intensity_factor(np_value, ftp, path=path)
     return (float(duration_seconds) * float(np_value) * intensity) / (
         float(ftp) * 3600.0
     ) * 100.0
 
 
-def tss_from_stream(power: Sequence[float], ftp: float) -> float:
+def tss_from_stream(
+    power: Sequence[float], ftp: float, path: Optional[str] = None
+) -> float:
     """Convenience: compute TSS directly from a per-second power stream."""
     arr = _clean_power(power)
-    if arr.size == 0 or not is_plausible_ftp(ftp):
+    if arr.size == 0 or not is_plausible_ftp(ftp, path=path):
         return 0.0
     npw = normalized_power(arr)
-    return training_stress_score(arr.size, npw, ftp)
+    return training_stress_score(arr.size, npw, ftp, path=path)
 
 
 def best_20min_power(power: Sequence[float]) -> float:
