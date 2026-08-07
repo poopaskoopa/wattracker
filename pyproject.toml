@@ -39,6 +39,7 @@ package = ["pyinstaller==6.16.0"]
 [project.scripts]
 wattracker = "wattracker.__main__:main"
 wattracker-restore = "wattracker.restore_backup:main"
+wattracker-ftp-rescore = "wattracker.ftp_backfill:main"
 
 [build-system]
 requires = ["setuptools>=61.0"]

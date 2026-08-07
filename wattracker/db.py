@@ -13,6 +13,7 @@ import logging
 import math
 import os
 import sqlite3
+import urllib.parse
 import zlib
 from typing import Callable, Dict, Iterator, List, Optional, Sequence, Union
 
@@ -579,17 +580,32 @@ CREATE TABLE IF NOT EXISTS scanned_files (
 """
 
 
-def connect(path: Optional[str] = None) -> sqlite3.Connection:
-    conn = sqlite3.connect(path or db_path(), timeout=10)
+def read_only_uri(path: str) -> str:
+    """The `file:...?mode=ro` URI for ``path``, safe for odd characters."""
+    return "file:" + urllib.parse.quote(os.path.abspath(path), safe="/") + "?mode=ro"
+
+
+def connect(
+    path: Optional[str] = None, *, read_only: bool = False
+) -> sqlite3.Connection:
+    target = path or db_path()
+    if read_only:
+        conn = sqlite3.connect(read_only_uri(target), uri=True, timeout=10)
+    else:
+        conn = sqlite3.connect(target, timeout=10)
     conn.row_factory = sqlite3.Row
     # WAL lets the background scan thread's writes proceed without blocking
     # concurrent reads (dashboard/pipeline) on the same DB file. journal_mode is
-    # persisted in the DB header, but set it on every connect so fresh temp/test
-    # DBs get it too. busy_timeout backs the connect timeout for in-flight locks;
-    # synchronous=NORMAL is the recommended durability pairing with WAL.
-    conn.execute("PRAGMA journal_mode=WAL")
+    # persisted in the DB header, but set it on every writable connect so fresh
+    # temp/test DBs get it too. A read-only caller deliberately skips the PRAGMAs
+    # that would modify the file - the offline repair's dry run must leave the
+    # database byte-identical. busy_timeout backs the connect timeout for
+    # in-flight locks; synchronous=NORMAL is the recommended durability pairing
+    # with WAL.
     conn.execute("PRAGMA busy_timeout=10000")
-    conn.execute("PRAGMA synchronous=NORMAL")
+    if not read_only:
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute("PRAGMA synchronous=NORMAL")
     return conn
 
 
@@ -1146,13 +1162,26 @@ def _valid_activity_date(value: Optional[str]) -> bool:
 
 
 def activities_for_ftp_rescore(
-    user_id: int, activity_ids: Sequence[int], path: Optional[str] = None
+    user_id: int,
+    activity_ids: Sequence[int],
+    path: Optional[str] = None,
+    *,
+    include_streams: bool = False,
+    read_only: bool = False,
 ) -> Iterator[List[dict]]:
-    """Yield activity summaries in bounded batches with date-effective FTP."""
+    """Yield activity summaries in bounded batches with date-effective FTP.
+
+    ``include_streams`` decompresses each row's power stream so the offline
+    repair can check a stored NP against the samples it came from; it is off by
+    default because the import path already trusts its own freshly computed NP.
+    Rows whose ``start_time`` is not a usable date are omitted - a caller that
+    needs to account for them compares the ids it asked for against the ids it
+    got back.
+    """
     ids = sorted({int(activity_id) for activity_id in activity_ids})
     if not ids:
         return
-    conn = connect(path)
+    conn = connect(path, read_only=read_only)
     try:
         for offset in range(0, len(ids), 500):
             chunk = ids[offset:offset + 500]
@@ -1164,6 +1193,15 @@ def activities_for_ftp_rescore(
                   a.start_time,
                   a.duration_s,
                   a.np,
+                  a.if_,
+                  a.tss,
+                  a.duplicate_of,
+                  {"a.streams," if include_streams else ""}
+                  EXISTS(
+                    SELECT 1 FROM power_sample_corrections c
+                    WHERE c.user_id = a.user_id AND c.activity_id = a.id
+                      AND c.undone_at IS NULL
+                  ) AS has_correction,
                   COALESCE(
                     (
                       SELECT h.ftp_watts FROM ftp_history h
@@ -1188,11 +1226,52 @@ def activities_for_ftp_rescore(
                     "start_time": row["start_time"],
                     "duration_s": row["duration_s"],
                     "np": row["np"],
+                    "if_": row["if_"],
+                    "tss": row["tss"],
+                    "duplicate_of": row["duplicate_of"],
+                    "has_correction": bool(row["has_correction"]),
                     "ftp_watts": row["ftp_watts"],
+                    **(
+                        {"streams": _unpack_streams(row["streams"])}
+                        if include_streams else {}
+                    ),
                 }
                 for row in rows
                 if _valid_activity_date(row["start_time"])
             ]
+    finally:
+        conn.close()
+
+
+def activity_ids_after(
+    user_id: int,
+    after_id: int = 0,
+    limit: int = 500,
+    path: Optional[str] = None,
+    *,
+    read_only: bool = False,
+) -> List[int]:
+    """Return owned activity ids after ``after_id`` in stable id order."""
+    if limit <= 0:
+        return []
+    conn = connect(path, read_only=read_only)
+    try:
+        rows = conn.execute(
+            "SELECT id FROM activities WHERE user_id = ? AND id > ? "
+            "ORDER BY id LIMIT ?",
+            (user_id, int(after_id), int(limit)),
+        ).fetchall()
+        return [int(row["id"]) for row in rows]
+    finally:
+        conn.close()
+
+
+def user_ids(path: Optional[str] = None, *, read_only: bool = False) -> List[int]:
+    """Return all user ids in stable order without changing the database."""
+    conn = connect(path, read_only=read_only)
+    try:
+        rows = conn.execute("SELECT id FROM users ORDER BY id").fetchall()
+        return [int(row["id"]) for row in rows]
     finally:
         conn.close()
 
@@ -1299,8 +1378,10 @@ def recent_power_streams(user_id: int, days: int = 90, path: Optional[str] = Non
         conn.close()
 
 
-def daily_tss(user_id: int, path: Optional[str] = None) -> Dict[_dt.date, float]:
-    conn = connect(path)
+def daily_tss(
+    user_id: int, path: Optional[str] = None, *, read_only: bool = False
+) -> Dict[_dt.date, float]:
+    conn = connect(path, read_only=read_only)
     try:
         rows = conn.execute(
             "SELECT start_time, tss FROM activities "
