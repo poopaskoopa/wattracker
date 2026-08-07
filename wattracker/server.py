@@ -49,7 +49,12 @@ from .ble.runner import RideController, flatten_session
 from .ingest import importer
 from .metrics import durability as durabilitymod
 from .metrics import profile_store
-from .metrics.power import is_plausible_ftp
+from .metrics.power import DEFAULT_FTP, is_plausible_ftp
+from .ftp_input import (
+    FTP_INPUT_MAX_WATTS,
+    FTP_INPUT_MIN_WATTS,
+    parse_ftp_input,
+)
 from .prescribe import adapt as adaptmod
 from .prescribe import duration as durationmod
 from .prescribe import goals as goalsmod
@@ -442,8 +447,10 @@ MAX_ONBOARDING_UPLOAD_BYTES = 50 * 1024 * 1024
 MAX_ONBOARDING_UPLOAD_FILES = 200
 ONBOARDING_WEIGHT_MIN_KG = 20.0
 ONBOARDING_WEIGHT_MAX_KG = 300.0
-ONBOARDING_FTP_MIN_WATTS = 1.0
-ONBOARDING_FTP_MAX_WATTS = 1000.0
+# The onboarding wizard's FTP field no longer has bounds of its own: every
+# surface a rider types an FTP into shares one policy (wattracker.ftp_input,
+# issue #64), so the wizard's old 1-1000 W window is gone rather than being one
+# of four.
 
 # WebSocket handshakes are only accepted from same-origin (local) browsers; a
 # cross-site page's Origin will never match, blocking cross-site WS hijacking.
@@ -634,6 +641,33 @@ def _trusted_origin_or_absent(request: Request, allowed_hosts: List[str]) -> boo
     # urlparse strips the brackets from an IPv6 literal; the allowlist carries
     # both spellings.
     return parsed.hostname.lower() in allowed_hosts
+
+
+def _checked(raw: str) -> bool:
+    """Whether a checkbox came back ticked.
+
+    Browsers send an unchecked box as nothing at all and a ticked one as "on",
+    but a fetch() caller may send "1"/"true"; only an explicit falsey spelling
+    is treated as unticked.
+    """
+    return (raw or "").strip().lower() not in ("", "0", "false", "off", "no")
+
+
+def _ftp_field_value(watts) -> str:
+    """A stored FTP as the text to prefill an FTP field with.
+
+    Whole watts render without a decimal point (275, not 275.0); a fractional
+    value renders as it is stored rather than being truncated for display - the
+    app itself produces one-decimal FTPs, so the field has to be able to echo
+    one back honestly.
+    """
+    if watts is None:
+        return ""
+    try:
+        value = float(watts)
+    except (TypeError, ValueError):
+        return ""
+    return str(int(value)) if value == int(value) else f"{value:g}"
 
 
 def _setup_number(raw: str, minimum: float, maximum: float) -> Optional[float]:
@@ -928,10 +962,13 @@ def create_app() -> FastAPI:
                 setup_candidates=paths.annotated_candidates(),
                 setup_settings=db.get_user_settings(uid),
                 setup_estimate=round(importer.recent_best_effort_ftp(uid), 1),
-                setup_fallback_ftp=200,
+                setup_fallback_ftp=round(DEFAULT_FTP),
                 setup_error=None,
                 setup_message=None,
                 setup_form={},
+                setup_ftp_confirm_required=False,
+                setup_ftp_min=round(FTP_INPUT_MIN_WATTS),
+                setup_ftp_max=round(FTP_INPUT_MAX_WATTS),
             )
         return templates.TemplateResponse(
             request,
@@ -947,7 +984,7 @@ def create_app() -> FastAPI:
 
     def _setup_context(
         request: Request, error: Optional[str] = None, message: Optional[str] = None,
-        form: Optional[dict] = None,
+        form: Optional[dict] = None, confirm_required: bool = False,
     ) -> dict:
         uid = _uid(request)
         settings = db.get_user_settings(uid)
@@ -958,11 +995,14 @@ def create_app() -> FastAPI:
             setup_candidates=paths.annotated_candidates(),
             setup_settings=settings,
             setup_estimate=round(estimate, 1) if estimate > 0 else None,
-            setup_fallback_ftp=200,
+            setup_fallback_ftp=round(DEFAULT_FTP),
             setup_latest_ftp=latest,
             setup_error=error,
             setup_message=message,
             setup_form=form or {},
+            setup_ftp_confirm_required=confirm_required,
+            setup_ftp_min=round(FTP_INPUT_MIN_WATTS),
+            setup_ftp_max=round(FTP_INPUT_MAX_WATTS),
         )
 
     def _setup_closed(request: Request) -> bool:
@@ -1083,6 +1123,7 @@ def create_app() -> FastAPI:
         request: Request,
         choice: str = Form(""),
         manual_ftp: str = Form(""),
+        confirm_low_ftp: str = Form(""),
     ):
         if not _same_origin_or_absent(request):
             return JSONResponse({"error": "Cross-origin request rejected."}, status_code=403)
@@ -1090,29 +1131,44 @@ def create_app() -> FastAPI:
             return _setup_closed_json()
         uid = _uid(request)
         choice = (choice or "").strip().lower()
+        source = choice
         if choice == "manual":
-            watts = _setup_number(manual_ftp, ONBOARDING_FTP_MIN_WATTS, ONBOARDING_FTP_MAX_WATTS)
-            if watts is None:
-                return JSONResponse({"error": "Enter FTP from 1 to 1000 watts."}, status_code=400)
+            parsed = parse_ftp_input(manual_ftp, confirmed=_checked(confirm_low_ftp))
+            if parsed.watts is None:
+                return JSONResponse(
+                    {"error": parsed.error, "confirm_required": parsed.needs_confirmation},
+                    status_code=400,
+                )
+            watts = parsed.watts
             db.save_user_settings(uid, {"ftp": watts})
             db.add_ftp_entry(uid, utc_today().isoformat(), watts, "manual")
         elif choice == "estimated":
             watts = importer.recent_best_effort_ftp(uid)
-            if not is_plausible_ftp(watts):
-                # A failed estimate is not a weak one - it must not be written
-                # to FTP history, where it would become a scoring basis (#60).
-                watts = importer.DEFAULT_FTP
             db.set_user_ftp_override(uid, None)
-            db.add_ftp_entry(
-                uid,
-                utc_today().isoformat(),
-                round(watts, 1),
-                "estimated",
-                replace_existing=True,
-            )
+            if is_plausible_ftp(watts):
+                db.add_ftp_entry(
+                    uid,
+                    utc_today().isoformat(),
+                    round(watts, 1),
+                    "estimated",
+                    replace_existing=True,
+                )
+            else:
+                # There is no analysis to record: either no rides at all, or an
+                # estimate that failed the plausibility floor (#60). Nothing is
+                # written - a number nobody measured must not be readable later
+                # as one (#55) - and nothing is deleted either. An earlier row
+                # for today is the rider's own doing: a value they typed, or a
+                # real estimate from a ride they logged. Removing it to make
+                # room for a placeholder would destroy data the wizard did not
+                # create. So report what current_ftp will actually resolve,
+                # which is that row if it exists and DEFAULT_FTP if it does not.
+                watts = importer.current_ftp(uid)
+                latest = db.latest_ftp(uid)
+                source = latest["source"] if latest else "default"
         else:
             return JSONResponse({"error": "Choose an estimated or manual FTP."}, status_code=400)
-        return JSONResponse({"choice": choice, "ftp": round(watts, 1), "source": choice})
+        return JSONResponse({"choice": choice, "ftp": round(watts, 1), "source": source})
 
     @app.post("/setup/complete", response_class=HTMLResponse)
     def setup_complete(
@@ -1125,6 +1181,7 @@ def create_app() -> FastAPI:
         zwift_email: str = Form(""),
         zwift_password: str = Form(""),
         activities_dir: str = Form(""),
+        confirm_low_ftp: str = Form(""),
     ):
         if not _same_origin_or_absent(request):
             return PlainTextResponse("Cross-origin request rejected.", status_code=403)
@@ -1144,20 +1201,26 @@ def create_app() -> FastAPI:
                 ), status_code=400
             )
         choice = (ftp_choice or "").strip().lower()
+        analyzed = True
         if choice == "manual":
-            ftp = _setup_number(manual_ftp, ONBOARDING_FTP_MIN_WATTS, ONBOARDING_FTP_MAX_WATTS)
-            if ftp is None:
+            parsed = parse_ftp_input(manual_ftp, confirmed=_checked(confirm_low_ftp))
+            if parsed.watts is None:
                 return templates.TemplateResponse(
                     request, "setup.html", _setup_context(
-                        request, error="Enter FTP from 1 to 1000 watts.", form=form
+                        request, error=parsed.error, form=form,
+                        confirm_required=parsed.needs_confirmation,
                     ), status_code=400
                 )
+            ftp = parsed.watts
         elif choice == "estimated":
             ftp = importer.recent_best_effort_ftp(uid)
             if not is_plausible_ftp(ftp):
-                # See /setup/ftp above: a sub-floor estimate is a failure, and
-                # writing it to ftp_history would make it the scoring basis.
-                ftp = importer.DEFAULT_FTP
+                # See /setup/ftp above: with no analysis to record, nothing is
+                # written to ftp_history and the placeholder is resolved at read
+                # time instead (#55). A sub-floor estimate is a failed one, not
+                # a weak one, and must not become a scoring basis (#60).
+                ftp = DEFAULT_FTP
+                analyzed = False
         else:
             return templates.TemplateResponse(
                 request, "setup.html", _setup_context(
@@ -1217,13 +1280,16 @@ def create_app() -> FastAPI:
         if cred_saved:
             updates["zwift_id"] = rider_id
         db.save_user_settings(uid, updates)
-        db.add_ftp_entry(
-            uid,
-            utc_today().isoformat(),
-            round(ftp, 1),
-            choice,
-            replace_existing=choice == "estimated",
-        )
+        if analyzed:
+            db.add_ftp_entry(
+                uid,
+                utc_today().isoformat(),
+                round(ftp, 1),
+                choice,
+                replace_existing=choice == "estimated",
+            )
+        # No `else`: with no analysis there is nothing to record, and any
+        # existing row for today belongs to the rider, not to the wizard.
         db.complete_onboarding(uid)
         return templates.TemplateResponse(
             request, "setup.html", _setup_context(
@@ -1260,7 +1326,8 @@ def create_app() -> FastAPI:
             request, "activities.html", _activities_context(request)
         )
 
-    def _profile_response(request: Request, error: Optional[str] = None):
+    def _profile_response(request: Request, error: Optional[str] = None,
+                          confirm_required: bool = False):
         uid = _uid(request)
         settings = db.get_user_settings(uid)
         return templates.TemplateResponse(
@@ -1278,7 +1345,11 @@ def create_app() -> FastAPI:
                     profile_store.computed_at(uid),
                 ),
                 manual_ftp=settings.get("ftp"),
+                manual_ftp_value=_ftp_field_value(settings.get("ftp")),
                 manual_hr_max=settings.get("hr_max"),
+                ftp_min=round(FTP_INPUT_MIN_WATTS),
+                ftp_max=round(FTP_INPUT_MAX_WATTS),
+                ftp_confirm_required=confirm_required,
                 error=error,
                 saved=request.query_params.get("saved"),
             ),
@@ -1369,6 +1440,7 @@ def create_app() -> FastAPI:
         request: Request,
         ftp: str = Form(""),
         action: str = Form("save"),
+        confirm_low_ftp: str = Form(""),
     ):
         uid = _uid(request)
         if action == "reset":
@@ -1378,13 +1450,12 @@ def create_app() -> FastAPI:
             except Exception:
                 _log.warning("profile refresh after FTP reset failed", exc_info=True)
             return RedirectResponse("/profile?saved=ftp", status_code=303)
-        try:
-            value = int(ftp.strip())
-        except (TypeError, ValueError):
-            return _profile_response(request, "FTP must be a whole number from 1 to 2000 W.")
-        if not 1 <= value <= 2000:
-            return _profile_response(request, "FTP must be a whole number from 1 to 2000 W.")
-        db.set_user_ftp_override(uid, value)
+        parsed = parse_ftp_input(ftp, confirmed=_checked(confirm_low_ftp))
+        if parsed.watts is None:
+            return _profile_response(
+                request, parsed.error, confirm_required=parsed.needs_confirmation
+            )
+        db.set_user_ftp_override(uid, parsed.watts)
         try:
             profile_store.refresh(uid)
         except Exception:
@@ -1413,16 +1484,31 @@ def create_app() -> FastAPI:
         )
         if row is None:
             return RedirectResponse(target, status_code=303)
+        outcome = "dismissed"
         if action == "use":
-            value = int(round(float(row["suggested_ftp"])))
-            db.set_user_ftp_override(uid, max(1, min(2000, value)))
-            try:
-                profile_store.refresh(uid)
-            except Exception:
+            # Accepting writes a training FTP, so it goes through the same
+            # policy a typed one does. It used to clamp with
+            # max(1, min(2000, ...)), which would silently store a value the
+            # scoring layer then refuses - the row reads back as the rider's
+            # setting while nothing it touches can be scored. A suggestion the
+            # policy rejects is a bug in the suggester, not something to round
+            # into range, so refuse it and say so.
+            parsed = parse_ftp_input(row["suggested_ftp"])
+            if parsed.watts is None:
                 _log.warning(
-                    "profile refresh after FTP suggestion failed", exc_info=True
+                    "refusing implausible FTP suggestion %s for user %s: %s",
+                    row["suggested_ftp"], uid, parsed.error,
                 )
-        outcome = "used" if action == "use" else "dismissed"
+                outcome = "rejected"
+            else:
+                db.set_user_ftp_override(uid, parsed.watts)
+                outcome = "used"
+                try:
+                    profile_store.refresh(uid)
+                except Exception:
+                    _log.warning(
+                        "profile refresh after FTP suggestion failed", exc_info=True
+                    )
         return RedirectResponse(f"{target}?ftp_suggestion={outcome}", status_code=303)
 
     @app.post("/profile/hr-max", response_class=HTMLResponse)
@@ -2788,11 +2874,25 @@ def create_app() -> FastAPI:
                       backup_message: Optional[str] = None,
                       dir_message: Optional[str] = None,
                       calendar_message: Optional[str] = None,
-                      calendar_feed_url: Optional[str] = None) -> dict:
+                      calendar_feed_url: Optional[str] = None,
+                      ftp_message: Optional[str] = None,
+                      ftp_confirm_required: bool = False,
+                      ftp_form_value: Optional[str] = None) -> dict:
         settings = db.get_user_settings(uid)
         return _ctx(
             request,
             settings=settings,
+            # A rejected FTP is echoed back in the field so the rider can see and
+            # correct what they typed, rather than the stored value silently
+            # replacing it.
+            ftp_form_value=(
+                _ftp_field_value(settings.get("ftp"))
+                if ftp_form_value is None else ftp_form_value
+            ),
+            ftp_message=ftp_message,
+            ftp_confirm_required=ftp_confirm_required,
+            ftp_min=round(FTP_INPUT_MIN_WATTS),
+            ftp_max=round(FTP_INPUT_MAX_WATTS),
             # Whether a link exists is safe to render; the token itself is only
             # ever passed in as calendar_feed_url, by the route that just
             # minted it, and is never read back out of the database.
@@ -2848,8 +2948,22 @@ def create_app() -> FastAPI:
         zwift_password: str = Form(""),
         weight_kg: str = Form(""),
         timezone: str = Form(""),
+        confirm_low_ftp: str = Form(""),
     ):
         uid = _uid(request)
+        # The FTP field is a SCORING BASIS, so it gets the same policy as every
+        # other place a rider types one (wattracker.ftp_input, issue #64). A
+        # rejected value is reported and left unsaved; the rest of the form is
+        # saved regardless, so a typo in one field does not discard the others.
+        ftp_message: Optional[str] = None
+        ftp_confirm_required = False
+        ftp_value: Optional[float] = None
+        if (ftp or "").strip():
+            parsed = parse_ftp_input(ftp, confirmed=_checked(confirm_low_ftp))
+            ftp_value = parsed.watts
+            if parsed.error:
+                ftp_message = "FTP not saved. " + parsed.error
+            ftp_confirm_required = parsed.needs_confirmation
         # A picked player folder (radio) wins over the free-text field.
         chosen_zwift_id = (zwift_id_choice or "").strip() or zwift_id
         weight_val: Optional[float] = None
@@ -2888,7 +3002,7 @@ def create_app() -> FastAPI:
         db.save_user_settings(
             uid,
             {
-                "ftp": ftp,
+                "ftp": ftp_value,
                 "zwift_id": chosen_zwift_id,
                 "activities_dir": clean_activities,
                 "workouts_dir": clean_workouts,
@@ -2897,13 +3011,8 @@ def create_app() -> FastAPI:
             },
         )
         # A manual FTP entry records a source='manual' row for today (per user).
-        if ftp not in (None, ""):
-            try:
-                watts = float(ftp)
-                if watts > 0:
-                    db.add_ftp_entry(uid, utc_today().isoformat(), watts, "manual")
-            except ValueError:
-                pass
+        if ftp_value is not None:
+            db.add_ftp_entry(uid, utc_today().isoformat(), ftp_value, "manual")
         try:
             profile_store.refresh(uid)
         except Exception:
@@ -2934,7 +3043,10 @@ def create_app() -> FastAPI:
         return templates.TemplateResponse(
             request, "settings.html",
             _settings_ctx(request, uid, True, cred_message=cred_message,
-                          dir_message="; ".join(dir_msgs) or None),
+                          dir_message="; ".join(dir_msgs) or None,
+                          ftp_message=ftp_message,
+                          ftp_confirm_required=ftp_confirm_required,
+                          ftp_form_value=ftp if ftp_message else None),
         )
 
     @app.post("/settings/zwift-credentials/clear", response_class=HTMLResponse)

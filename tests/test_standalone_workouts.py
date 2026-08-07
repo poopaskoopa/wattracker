@@ -934,3 +934,42 @@ def test_v27_migration_adds_ftp_suggestions_without_losing_rows(tmp_path):
         "SELECT username FROM users WHERE id=?", (uid,)
     ).fetchone()[0] == "kept"
     conn.close()
+
+
+def test_an_out_of_range_suggestion_is_refused_rather_than_clamped(user_id):
+    """A suggestion the input policy rejects must not become a training FTP.
+
+    Accepting used to clamp with max(1, min(2000, value)), so a suggester bug
+    could store 1 W or 2000 W as the rider's override. The scoring layer then
+    refuses that basis (#60/#67), leaving a number that reads back as the
+    rider's setting while nothing it touches can be scored - the silent,
+    plausible-looking wrongness this codebase keeps having to dig out.
+
+    A suggestion outside the range an FTP can physically take is a bug in the
+    suggester, not a value to round into range.
+    """
+    _manual_evidence(user_id)
+    importer.apply_rpe_ftp_feedback(
+        user_id, dt.datetime.fromisoformat(f"{DATE}T20:00:00")
+    )
+    suggestion = db.pending_ftp_suggestion(user_id)
+    before = db.get_user_settings(user_id)["ftp"]
+    # Force the stored suggestion outside the policy window.
+    with db.connect() as conn:
+        conn.execute(
+            "UPDATE ftp_suggestions SET suggested_ftp = ? WHERE id = ?",
+            (1.0, suggestion["id"]),
+        )
+        conn.commit()
+
+    app = create_app()
+    with TestClient(app) as client:
+        client.post("/login", data={"username": "tester", "password": "password123"})
+        response = client.post("/ftp-suggestion", data={
+            "suggestion_id": suggestion["id"], "action": "use",
+            "next_path": "/settings",
+        })
+        assert response.status_code == 200
+
+    assert db.get_user_settings(user_id)["ftp"] == before
+    assert importer.current_ftp(user_id) != 1.0

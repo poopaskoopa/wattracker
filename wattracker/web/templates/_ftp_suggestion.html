@@ -2,6 +2,10 @@
 <p class="ok" role="status">Training FTP updated to the suggested value.</p>
 {% elif request.query_params.get('ftp_suggestion') == 'dismissed' %}
 <p class="ok" role="status">Suggestion dismissed. Your Training FTP is unchanged.</p>
+{% elif request.query_params.get('ftp_suggestion') == 'rejected' %}
+<p class="alert" role="status">That suggestion was outside the range an FTP can
+take, so your Training FTP is unchanged. Set it yourself in Settings if the
+number looks right to you.</p>
 {% endif %}
 {% if ftp_suggestion %}
 <section class="status-banner status-warn ftp-suggestion" aria-labelledby="ftpSuggestionTitle">
