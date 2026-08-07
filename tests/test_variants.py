@@ -147,6 +147,26 @@ def _tiz_params():
                                    id=f"{kind}-{v}-{minutes}")
 
 
+def test_no_variant_is_exempt_from_the_dose_check():
+    """`_UNREVIEWED_DOSE` must stay empty, and this is what enforces it.
+
+    Entries there xfail a variant out of the dose check. Six lived there from
+    PR #63 until issue #66 fixed them, and while they did, a rider asking for
+    VO2max work could receive 58% of the intended stimulus and the suite stayed
+    green. An exemption is therefore a statement that a variant is knowingly
+    prescribing the wrong training load - never a way to quiet a failure.
+
+    Adding an entry must break this test, so the exemption is a deliberate,
+    reviewed act rather than a silent one. If you are here because you added
+    one: open an issue like #66, put its number in the reason, and change this
+    test in the same commit so the exemption is visible in review.
+    """
+    assert _UNREVIEWED_DOSE == {}, (
+        "variants exempted from the dose check: "
+        f"{sorted(_UNREVIEWED_DOSE)}. See this test's docstring."
+    )
+
+
 @pytest.mark.parametrize("kind,variant,minutes", list(_tiz_params()))
 def test_variant_time_in_zone_tracks_classic(kind, variant, minutes):
     classic = build_workout(kind, minutes, "classic")
