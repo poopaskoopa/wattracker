@@ -6,26 +6,37 @@ set -euo pipefail
 cd "$(dirname "$0")"
 
 PYTHON=".venv/bin/python"
+INSTALLER="scripts/install.sh"
+MARKER=".venv/.wattracker-installed"
 STATE_DIR="${WATTRACKER_HOME:-$HOME/.wattracker}"
 LOG="$STATE_DIR/server.log"
 PIDFILE="$STATE_DIR/server.pid"
 PORT="${WATTRACKER_PORT:-8000}"
 URL="http://127.0.0.1:$PORT"
 
-if [ ! -x "$PYTHON" ]; then
-    echo "No virtualenv at $PWD/$PYTHON" >&2
-    echo "Create one with: python3 -m venv .venv && .venv/bin/pip install -e ." >&2
-    exit 1
+if [ ! -x "$PYTHON" ] || [ ! -f "$MARKER" ] || \
+   [ "$INSTALLER" -nt "$MARKER" ] || [ "pyproject.toml" -nt "$MARKER" ]; then
+    if [ ! -x "$INSTALLER" ]; then
+        echo "Missing installer: $PWD/$INSTALLER" >&2
+        exit 1
+    fi
+    "$INSTALLER"
 fi
 
 mkdir -p "$STATE_DIR"
 
-# The process runs as ".venv/bin/python -m wattracker" with a relative path,
-# so match the module invocation, not an absolute one. The bracket keeps
-# pgrep from matching its own command line.
-PATTERN="[p]ython -m wattracker"
+existing=""
+if [ -f "$PIDFILE" ]; then
+    recorded="$(sed -n '1p' "$PIDFILE" 2>/dev/null || true)"
+    case "$recorded" in
+        ''|*[!0-9]*) recorded="" ;;
+    esac
+    if [ -n "$recorded" ] && kill -0 "$recorded" 2>/dev/null && \
+       lsof -nP -iTCP:"$PORT" -sTCP:LISTEN -a -p "$recorded" >/dev/null 2>&1; then
+        existing="$recorded"
+    fi
+fi
 
-existing="$(pgrep -f "$PATTERN" | head -1 || true)"
 if [ -n "$existing" ]; then
     echo "Already running (pid $existing) at $URL"
     exit 0
