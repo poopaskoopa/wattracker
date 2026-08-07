@@ -245,18 +245,28 @@ The two populations have completely different cost/benefit:
   figure is itself an unvalidated estimate that 16 of 20 users share verbatim,
   the backfill would bake that estimate into five years of history.
 
-Concretely, if the owner wants to proceed:
+## Status of this recommendation
+
+**Accepted.** The owner chose to repair the corrupt and suspect populations only
+and to leave the ordinary population alone. `--only` implements that scope:
+
+```sh
+wattracker-ftp-rescore --db <copy> --only corrupt --only suspect
+```
+
+It narrows what is *rewritten*, never what is *examined* — the report still
+describes every population and names the rows it declined to touch, so a
+narrowed run cannot make the database look healthier than it is. On this
+database it repairs **2,602** rows and withholds **12,874**.
+
+The `--write` path has since been exercised at 520 MB scale against a copy and
+passed. **The live database has deliberately not been touched**: the repair is
+approved in scope but not yet run.
+
+Still open before anything is pointed at the live database:
 
 1. Settle whether 184.9 W is a real estimate or an artifact of the same import
-   path that produced 0.6 W. Until that is answered, "correct" is undefined for
-   the ordinary population.
-2. Run the repair scoped to the corrupt and suspect populations only. The tool
-   does not currently have a `--only` selector; adding one is small and is the
-   right next change if this recommendation is accepted.
-3. Leave the ordinary population alone, or accept the pre-`ftp_history`
-   back-application rule explicitly and in writing first.
-
-If the whole backfill is run anyway, note that the write path has **not** been
-exercised at 520 MB scale since these fixes landed (the instruction for this
-work was dry-run only). Do a `--write` pass against a copy and diff it before
-pointing it at the live database.
+   path that produced 0.6 W. This does not block the corrupt/suspect repair —
+   those rows are wrong under any FTP assumption — but it is the question that
+   decides whether the ordinary population ever gets revisited.
+2. Take a verified backup and diff the copy-run output before the live run.
