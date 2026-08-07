@@ -42,6 +42,17 @@ and optional BLE/ERG riding.
 
 ## Run
 
+For the shortest macOS/Linux setup, see [docs/quickstart.md](docs/quickstart.md)
+or run this from the repository root:
+
+```sh
+./start.sh
+```
+
+The first run creates the local environment and installs the app automatically.
+The manual commands below remain useful when you want to activate the virtual
+environment yourself.
+
 ```sh
 python -m venv .venv && . .venv/bin/activate
 pip install -e .
