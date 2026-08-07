@@ -4,6 +4,7 @@ from __future__ import annotations
 from typing import Optional, Sequence
 
 from . import db
+from .config import db_path
 from .metrics.power import (
     intensity_factor,
     is_plausible_ftp,
@@ -13,7 +14,7 @@ from .metrics.power import (
 from .timeutil import parse_naive
 
 
-def score_activity(row: dict) -> Optional[dict]:
+def score_activity(row: dict, path: Optional[str] = None) -> Optional[dict]:
     """Rebase one row's FTP-dependent metrics, or None if it must be left alone.
 
     Used by the offline repair (:mod:`wattracker.ftp_backfill`). Power itself is
@@ -35,7 +36,7 @@ def score_activity(row: dict) -> Optional[dict]:
         duration_s = float(row.get("duration_s"))
     except (TypeError, ValueError, OverflowError):
         return None
-    if duration_s < 0 or not is_plausible_ftp(ftp):
+    if duration_s < 0 or not is_plausible_ftp(ftp, path=path):
         return None
     try:
         np_value = float(row.get("np") or 0.0)
@@ -48,8 +49,8 @@ def score_activity(row: dict) -> Optional[dict]:
             np_value = normalized_power(power)
     return {
         "id": int(row["id"]),
-        "if_": round(intensity_factor(np_value, ftp), 3),
-        "tss": round(training_stress_score(duration_s, np_value, ftp), 1),
+        "if_": round(intensity_factor(np_value, ftp, path=path), 3),
+        "tss": round(training_stress_score(duration_s, np_value, ftp, path=path), 1),
         "ftp_watts": ftp,
         "np": np_value,
         "has_correction": bool(row.get("has_correction")),
@@ -60,6 +61,7 @@ def rescore_imported_activities(
     user_id: int, activity_ids: Sequence[int], path: Optional[str] = None
 ) -> int:
     """Refresh IF and TSS without retaining the whole import in memory."""
+    path = path or db_path()
     updated = 0
     for rows in db.activities_for_ftp_rescore(user_id, activity_ids, path):
         updates = []
@@ -72,9 +74,14 @@ def rescore_imported_activities(
             ftp_value = float(ftp)
             np_float = float(np_value)
             duration_float = float(duration_s)
-            ifv = intensity_factor(np_float, ftp_value) if ftp_value > 0 else 0.0
+            ifv = (
+                intensity_factor(np_float, ftp_value, path=path)
+                if ftp_value > 0 else 0.0
+            )
             tss = (
-                training_stress_score(duration_float, np_float, ftp_value)
+                training_stress_score(
+                    duration_float, np_float, ftp_value, path=path
+                )
                 if ftp_value > 0 else 0.0
             )
             updates.append({
