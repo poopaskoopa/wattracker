@@ -31,11 +31,41 @@ port_is_listening() {
         "$HOST" "$PORT" >/dev/null 2>&1
 }
 
+process_command_is_wattracker() {
+    local command_line
+    command_line="$(ps -p "$1" -o command= 2>/dev/null || true)"
+    case "$command_line" in
+        *"$PYTHON -m wattracker"*) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
+process_start_time() {
+    ps -p "$1" -o lstart= 2>/dev/null |
+        sed 's/^[[:space:]]*//;s/[[:space:]]*$//'
+}
+
+recorded_process_is_wattracker() {
+    process_command_is_wattracker "$1" || return 1
+    if [ "$#" -ge 2 ] && [ -n "$2" ]; then
+        [ "$(process_start_time "$1")" = "$2" ]
+    fi
+}
+
+log_has_pid_bind() {
+    [ -f "$LOG" ] || return 1
+    grep -F "Started server process [$1]" "$LOG" >/dev/null 2>&1 &&
+        grep -F "Uvicorn running on" "$LOG" |
+        grep -F ":$PORT" >/dev/null 2>&1
+}
+
 port_is_owned_by() {
     if command -v lsof >/dev/null 2>&1; then
         lsof -nP -iTCP:"$PORT" -sTCP:LISTEN -a -p "$1" >/dev/null 2>&1
     else
-        return 1
+        process_command_is_wattracker "$1" &&
+            port_is_listening &&
+            log_has_pid_bind "$1"
     fi
 }
 
@@ -57,10 +87,12 @@ server_is_ready() {
 existing=""
 if [ -f "$PIDFILE" ]; then
     recorded="$(sed -n '1p' "$PIDFILE" 2>/dev/null || true)"
+    recorded_start="$(sed -n '2p' "$PIDFILE" 2>/dev/null || true)"
     case "$recorded" in
         ''|*[!0-9]*) recorded="" ;;
     esac
     if [ -n "$recorded" ] && kill -0 "$recorded" 2>/dev/null && \
+       recorded_process_is_wattracker "$recorded" "$recorded_start" && \
        port_is_owned_by "$recorded"; then
         existing="$recorded"
     fi
@@ -84,7 +116,10 @@ fi
 LOG_OFFSET="$("$PYTHON" -c 'import os, sys; print(os.path.getsize(sys.argv[1]) if os.path.exists(sys.argv[1]) else 0)' "$LOG")"
 nohup "$PYTHON" -m wattracker >>"$LOG" 2>&1 &
 pid=$!
-echo "$pid" >"$PIDFILE"
+{
+    printf '%s\n' "$pid"
+    process_start_time "$pid"
+} >"$PIDFILE"
 
 # The database migrates on startup, which takes a moment on a large one.
 for _ in $(seq 1 60); do
