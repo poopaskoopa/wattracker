@@ -836,6 +836,8 @@
         var options = variantOptions(data);
         grid.replaceChildren();
         if (!options.length || !justRide()) {
+            // Keep the selected workout preview below, but never manufacture
+            // a shape card from a partial/legacy payload.
             picker.hidden = true;
             status.textContent = "";
             return;

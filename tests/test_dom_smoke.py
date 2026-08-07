@@ -339,9 +339,9 @@ def test_just_ride_variant_cards_render_and_select(page, live_server,
     page.get_by_role("button", name="Just ride", exact=True).click()
     page.wait_for_selector("#rideVariantPicker:not([hidden])", timeout=10_000)
 
-    # 240 minutes is both an offered boundary and the duration most likely to
-    # expose a missing long-ride variant profile.
-    page.select_option("#rideDurationSelect", "240")
+    # The reported failure was a 60-minute preview, so exercise that exact
+    # duration across every focus rather than only the long-ride boundary.
+    page.select_option("#rideDurationSelect", "60")
     for kind in WORKOUT_TYPE_KEYS:
         expected = VARIANTS[kind]
         page.select_option("#rideTypeSelect", kind)
@@ -410,6 +410,34 @@ def test_just_ride_variant_cards_render_and_select(page, live_server,
                 '[aria-selected="true"]', timeout=10_000,
             )
     _assert_clean(console_errors, "/ride Just Ride variants")
+
+
+def test_just_ride_incomplete_variant_payload_does_not_make_a_card(
+    page, live_server, console_errors
+):
+    """A stale/partial preview never becomes one card of flattened payload text.
+
+    A server predating the variant payload fields can still return a valid
+    selected workout. The safe result is its normal preview with no shape
+    picker, not a fabricated card whose text is the SVG's concatenated labels.
+    """
+    def strip_variant_fields(route):
+        response = route.fetch()
+        payload = response.json()
+        payload.pop("variant_options", None)
+        payload.pop("variant_profiles", None)
+        route.fulfill(response=response, json=payload)
+
+    page.route("**/ride/workout/preview*", strip_variant_fields)
+    page.goto(f"{live_server.base}/ride")
+    page.get_by_role("button", name="Just ride", exact=True).click()
+    page.wait_for_selector("#ridePreview:not([hidden])", timeout=10_000)
+
+    assert page.locator("#rideVariantPicker").is_hidden()
+    assert page.locator("#rideVariantGrid .ride-variant-card").count() == 0
+    geom = _svg_has_geometry(page, "#ridePreview svg.profile-svg")
+    assert geom["ok"], f"selected preview lost its curve: {geom}"
+    _assert_clean(console_errors, "/ride incomplete variant payload")
 
 
 def test_dashboard_charts_render_without_console_errors(page, live_server,
