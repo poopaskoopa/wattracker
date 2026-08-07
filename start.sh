@@ -11,8 +11,9 @@ MARKER=".venv/.wattracker-installed"
 STATE_DIR="${WATTRACKER_HOME:-$HOME/.wattracker}"
 LOG="$STATE_DIR/server.log"
 PIDFILE="$STATE_DIR/server.pid"
+HOST="${WATTRACKER_HOST:-127.0.0.1}"
 PORT="${WATTRACKER_PORT:-8000}"
-URL="http://127.0.0.1:$PORT"
+URL="http://$HOST:$PORT"
 
 if [ ! -x "$PYTHON" ] || [ ! -f "$MARKER" ] || \
    [ "$INSTALLER" -nt "$MARKER" ] || [ "pyproject.toml" -nt "$MARKER" ]; then
@@ -25,6 +26,19 @@ fi
 
 mkdir -p "$STATE_DIR"
 
+port_is_listening() {
+    "$PYTHON" -c 'import socket, sys; s = socket.create_connection((sys.argv[1], int(sys.argv[2])), timeout=0.2); s.close()' \
+        "$HOST" "$PORT" >/dev/null 2>&1
+}
+
+port_is_owned_by() {
+    if command -v lsof >/dev/null 2>&1; then
+        lsof -nP -iTCP:"$PORT" -sTCP:LISTEN -a -p "$1" >/dev/null 2>&1
+    else
+        port_is_listening
+    fi
+}
+
 existing=""
 if [ -f "$PIDFILE" ]; then
     recorded="$(sed -n '1p' "$PIDFILE" 2>/dev/null || true)"
@@ -32,7 +46,7 @@ if [ -f "$PIDFILE" ]; then
         ''|*[!0-9]*) recorded="" ;;
     esac
     if [ -n "$recorded" ] && kill -0 "$recorded" 2>/dev/null && \
-       lsof -nP -iTCP:"$PORT" -sTCP:LISTEN -a -p "$recorded" >/dev/null 2>&1; then
+       port_is_owned_by "$recorded"; then
         existing="$recorded"
     fi
 fi
@@ -44,9 +58,11 @@ fi
 
 # Only one process can hold the port. Starting a second would burn CPU and
 # quietly fail to bind, so refuse rather than leave a stray behind.
-if lsof -nP -iTCP:"$PORT" -sTCP:LISTEN >/dev/null 2>&1; then
+if port_is_listening; then
     echo "Port $PORT is already in use by something else:" >&2
-    lsof -nP -iTCP:"$PORT" -sTCP:LISTEN >&2
+    if command -v lsof >/dev/null 2>&1; then
+        lsof -nP -iTCP:"$PORT" -sTCP:LISTEN >&2
+    fi
     exit 1
 fi
 
@@ -62,9 +78,9 @@ for _ in $(seq 1 60); do
         rm -f "$PIDFILE"
         exit 1
     fi
-    # Confirm OUR process owns the port, not some other listener that would
-    # make a plain HTTP check look successful.
-    if lsof -nP -iTCP:"$PORT" -sTCP:LISTEN -a -p "$pid" >/dev/null 2>&1; then
+    # Confirm the launched process is alive and the configured local port is
+    # accepting connections. lsof, when available, narrows this to our PID.
+    if port_is_owned_by "$pid"; then
         echo "Started (pid $pid) at $URL"
         echo "Log: $LOG"
         exit 0

@@ -34,7 +34,9 @@ def test_start_bootstraps_missing_or_stale_environment_before_launching():
     assert '"$INSTALLER"' in START
     assert '"pyproject.toml" -nt "$MARKER"' in START
     assert 'recorded="$(sed -n \'1p\' "$PIDFILE"' in START
-    assert 'lsof -nP -iTCP:"$PORT" -sTCP:LISTEN -a -p "$recorded"' in START
+    assert 'port_is_listening()' in START
+    assert 'if command -v lsof' in START
+    assert 'lsof -nP -iTCP:"$PORT" -sTCP:LISTEN -a -p "$1"' in START
     assert 'pgrep -f' not in START
 
 
