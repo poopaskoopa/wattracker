@@ -165,6 +165,23 @@ def test_no_variant_is_exempt_from_the_dose_check():
         "variants exempted from the dose check: "
         f"{sorted(_UNREVIEWED_DOSE)}. See this test's docstring."
     )
+    # An empty dict is not enough on its own. Review found the guard could be
+    # defeated without touching it at all: adding a name to the `continue` in
+    # _tiz_params, or trimming _TIZ_DURATIONS, drops cases silently and the
+    # file still goes green - a one-line change that reads like test tidying.
+    # So pin the generated case set against the full cross-product.
+    expected = {
+        (kind, variant, minutes)
+        for kind, variants in VARIANTS.items()
+        for variant in variants
+        if variant != "classic"
+        for minutes in _TIZ_DURATIONS
+    }
+    actual = {tuple(param.values) for param in _tiz_params()}
+    assert actual == expected, (
+        "the dose check does not cover every variant at every duration; "
+        f"missing {sorted(expected - actual)}, unexpected {sorted(actual - expected)}"
+    )
 
 
 @pytest.mark.parametrize("kind,variant,minutes", list(_tiz_params()))
