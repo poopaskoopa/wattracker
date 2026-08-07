@@ -1155,14 +1155,17 @@ def create_app() -> FastAPI:
                 )
             else:
                 # There is no analysis to record: either no rides at all, or an
-                # estimate that failed the plausibility floor (#60). The
-                # placeholder shown to the rider is NOT written to ftp_history -
-                # a number nobody measured must not be readable later as one
-                # (#55). current_ftp resolves the same placeholder at read time,
-                # and stops doing so the moment a real estimate exists.
-                db.delete_ftp_entry(uid, utc_today().isoformat())
-                watts = DEFAULT_FTP
-                source = "default"
+                # estimate that failed the plausibility floor (#60). Nothing is
+                # written - a number nobody measured must not be readable later
+                # as one (#55) - and nothing is deleted either. An earlier row
+                # for today is the rider's own doing: a value they typed, or a
+                # real estimate from a ride they logged. Removing it to make
+                # room for a placeholder would destroy data the wizard did not
+                # create. So report what current_ftp will actually resolve,
+                # which is that row if it exists and DEFAULT_FTP if it does not.
+                watts = importer.current_ftp(uid)
+                latest = db.latest_ftp(uid)
+                source = latest["source"] if latest else "default"
         else:
             return JSONResponse({"error": "Choose an estimated or manual FTP."}, status_code=400)
         return JSONResponse({"choice": choice, "ftp": round(watts, 1), "source": source})
@@ -1285,8 +1288,8 @@ def create_app() -> FastAPI:
                 choice,
                 replace_existing=choice == "estimated",
             )
-        else:
-            db.delete_ftp_entry(uid, utc_today().isoformat())
+        # No `else`: with no analysis there is nothing to record, and any
+        # existing row for today belongs to the rider, not to the wizard.
         db.complete_onboarding(uid)
         return templates.TemplateResponse(
             request, "setup.html", _setup_context(
@@ -1481,16 +1484,31 @@ def create_app() -> FastAPI:
         )
         if row is None:
             return RedirectResponse(target, status_code=303)
+        outcome = "dismissed"
         if action == "use":
-            value = int(round(float(row["suggested_ftp"])))
-            db.set_user_ftp_override(uid, max(1, min(2000, value)))
-            try:
-                profile_store.refresh(uid)
-            except Exception:
+            # Accepting writes a training FTP, so it goes through the same
+            # policy a typed one does. It used to clamp with
+            # max(1, min(2000, ...)), which would silently store a value the
+            # scoring layer then refuses - the row reads back as the rider's
+            # setting while nothing it touches can be scored. A suggestion the
+            # policy rejects is a bug in the suggester, not something to round
+            # into range, so refuse it and say so.
+            parsed = parse_ftp_input(row["suggested_ftp"])
+            if parsed.watts is None:
                 _log.warning(
-                    "profile refresh after FTP suggestion failed", exc_info=True
+                    "refusing implausible FTP suggestion %s for user %s: %s",
+                    row["suggested_ftp"], uid, parsed.error,
                 )
-        outcome = "used" if action == "use" else "dismissed"
+                outcome = "rejected"
+            else:
+                db.set_user_ftp_override(uid, parsed.watts)
+                outcome = "used"
+                try:
+                    profile_store.refresh(uid)
+                except Exception:
+                    _log.warning(
+                        "profile refresh after FTP suggestion failed", exc_info=True
+                    )
         return RedirectResponse(f"{target}?ftp_suggestion={outcome}", status_code=303)
 
     @app.post("/profile/hr-max", response_class=HTMLResponse)
