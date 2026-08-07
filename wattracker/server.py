@@ -937,6 +937,40 @@ def create_app() -> FastAPI:
         request.session.clear()
         return RedirectResponse("/login", status_code=303)
 
+    def _ftp_values_match(left, right) -> bool:
+        try:
+            return _math.isclose(float(left), float(right), rel_tol=0.0, abs_tol=1e-9)
+        except (TypeError, ValueError, OverflowError):
+            return False
+
+    def _setup_ftp_source(uid: int, resolved, settings=None, latest=None) -> str:
+        """Name the basis that ``current_ftp`` actually resolved."""
+        if settings is None:
+            settings = db.get_user_settings(uid)
+        if latest is None:
+            latest = db.latest_ftp(uid)
+        stated = settings.get("ftp")
+        if stated is not None and _ftp_values_match(stated, resolved):
+            return "manual"
+        if latest and _ftp_values_match(latest.get("ftp_watts"), resolved):
+            return latest.get("source") or "history"
+        if not _ftp_values_match(resolved, DEFAULT_FTP):
+            return "estimated"
+        return "default"
+
+    def _setup_ftp_display(uid: int, settings=None, estimate=None) -> tuple[str, str]:
+        # Choosing the estimated option will persist a plausible recent
+        # estimate, so show that value even before it has a history row. When
+        # there is no such estimate, fall back to the value current_ftp uses.
+        if estimate is not None and is_plausible_ftp(estimate):
+            resolved = estimate
+            source = "estimated"
+        else:
+            resolved = importer.current_ftp(uid)
+            source = _setup_ftp_source(uid, resolved, settings=settings)
+        display = f"{float(resolved):.1f}".rstrip("0").rstrip(".")
+        return display, source
+
     # ------------------------------------------------------------- pages
     @app.get("/", response_class=HTMLResponse)
     def dashboard(request: Request):
@@ -958,11 +992,18 @@ def create_app() -> FastAPI:
         # the normal dashboard off a cost that grows with ride count.
         setup_ctx: dict = {}
         if not complete:
+            setup_settings = db.get_user_settings(uid)
+            setup_estimate = importer.recent_best_effort_ftp(uid)
+            setup_current_ftp, setup_ftp_source = _setup_ftp_display(
+                uid, settings=setup_settings, estimate=round(setup_estimate, 1)
+            )
             setup_ctx = dict(
                 setup_candidates=paths.annotated_candidates(),
-                setup_settings=db.get_user_settings(uid),
-                setup_estimate=round(importer.recent_best_effort_ftp(uid), 1),
+                setup_settings=setup_settings,
+                setup_estimate=round(setup_estimate, 1),
                 setup_fallback_ftp=round(DEFAULT_FTP),
+                setup_current_ftp=setup_current_ftp,
+                setup_ftp_source=setup_ftp_source,
                 setup_error=None,
                 setup_message=None,
                 setup_form={},
@@ -990,12 +1031,17 @@ def create_app() -> FastAPI:
         settings = db.get_user_settings(uid)
         estimate = importer.recent_best_effort_ftp(uid)
         latest = db.latest_ftp(uid)
+        current, source = _setup_ftp_display(
+            uid, settings=settings, estimate=round(estimate, 1)
+        )
         return _ctx(
             request,
             setup_candidates=paths.annotated_candidates(),
             setup_settings=settings,
             setup_estimate=round(estimate, 1) if estimate > 0 else None,
             setup_fallback_ftp=round(DEFAULT_FTP),
+            setup_current_ftp=current,
+            setup_ftp_source=source,
             setup_latest_ftp=latest,
             setup_error=error,
             setup_message=message,
@@ -1167,7 +1213,11 @@ def create_app() -> FastAPI:
                 # which is that row if it exists and DEFAULT_FTP if it does not.
                 watts = importer.current_ftp(uid)
                 latest = db.latest_ftp(uid)
-                source = latest["source"] if latest else "default"
+                source = (
+                    latest["source"]
+                    if latest and _ftp_values_match(latest.get("ftp_watts"), watts)
+                    else "default"
+                )
         else:
             return JSONResponse({"error": "Choose an estimated or manual FTP."}, status_code=400)
         return JSONResponse({"choice": choice, "ftp": round(watts, 1), "source": source})
