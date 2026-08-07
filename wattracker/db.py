@@ -2822,17 +2822,33 @@ def pending_ftp_suggestion(
         conn.close()
 
 
+def pending_ftp_suggestion_by_id(
+    user_id: int, suggestion_id: int, path: Optional[str] = None
+) -> Optional[dict]:
+    """Return one of this rider's still-pending FTP suggestions."""
+    conn = connect(path)
+    try:
+        row = conn.execute(
+            "SELECT * FROM ftp_suggestions WHERE id=? AND user_id=? "
+            "AND status='pending'",
+            (suggestion_id, user_id),
+        ).fetchone()
+        return _suggestion_row(row) if row else None
+    finally:
+        conn.close()
+
+
 def resolve_ftp_suggestion(
     user_id: int, suggestion_id: int, status: str, path: Optional[str] = None
 ) -> Optional[dict]:
-    """Close a pending suggestion as 'accepted' or 'dismissed'.
+    """Close a pending suggestion as accepted, rejected, or dismissed.
 
     Returns the row that was closed (so the caller can act on the number it
     proposed), or None when it was not this user's, or already resolved. The
     evidence stays consumed either way - a dismissed suggestion must not come
     straight back from the same workouts.
     """
-    if status not in ("accepted", "dismissed"):
+    if status not in ("accepted", "rejected", "dismissed"):
         return None
     conn = connect(path)
     try:
