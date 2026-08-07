@@ -15,8 +15,10 @@ server process wiping a migrated live DB).
 
 ## Commit identity — set this in every clone and worktree, first thing
 
-This repo is **public**, and its history was deliberately rewritten once to
-strip the owner's personal identity. The machine's *global* git config still
+This repo is **private**, but its history was deliberately rewritten once to
+strip the owner's personal identity — so treat every commit as if it will be
+published, because making the repo public must not re-expose the address.
+The machine's *global* git config still
 carries a personal address, so any clone that doesn't override it locally
 re-publishes that address in every commit. This has already happened once.
 
