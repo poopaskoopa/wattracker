@@ -5,7 +5,7 @@ set -euo pipefail
 
 cd "$(dirname "$0")"
 
-PYTHON=".venv/bin/python"
+PYTHON="$PWD/.venv/bin/python"
 INSTALLER="scripts/install.sh"
 MARKER=".venv/.wattracker-installed"
 STATE_DIR="${WATTRACKER_HOME:-$HOME/.wattracker}"
@@ -35,7 +35,22 @@ port_is_owned_by() {
     if command -v lsof >/dev/null 2>&1; then
         lsof -nP -iTCP:"$PORT" -sTCP:LISTEN -a -p "$1" >/dev/null 2>&1
     else
-        port_is_listening
+        return 1
+    fi
+}
+
+log_has_fresh_bind() {
+    [ -f "$LOG" ] || return 1
+    tail -c "+$((LOG_OFFSET + 1))" "$LOG" |
+        grep -F "Uvicorn running on" |
+        grep -F ":$PORT" >/dev/null 2>&1
+}
+
+server_is_ready() {
+    if command -v lsof >/dev/null 2>&1; then
+        port_is_owned_by "$1"
+    else
+        log_has_fresh_bind
     fi
 }
 
@@ -66,6 +81,7 @@ if port_is_listening; then
     exit 1
 fi
 
+LOG_OFFSET="$("$PYTHON" -c 'import os, sys; print(os.path.getsize(sys.argv[1]) if os.path.exists(sys.argv[1]) else 0)' "$LOG")"
 nohup "$PYTHON" -m wattracker >>"$LOG" 2>&1 &
 pid=$!
 echo "$pid" >"$PIDFILE"
@@ -79,8 +95,9 @@ for _ in $(seq 1 60); do
         exit 1
     fi
     # Confirm the launched process is alive and the configured local port is
-    # accepting connections. lsof, when available, narrows this to our PID.
-    if port_is_owned_by "$pid"; then
+    # accepting connections. Without lsof, also require a fresh Uvicorn bind
+    # line from this launch, so another listener cannot look healthy.
+    if server_is_ready "$pid"; then
         echo "Started (pid $pid) at $URL"
         echo "Log: $LOG"
         exit 0
