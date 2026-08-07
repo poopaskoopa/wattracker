@@ -447,3 +447,60 @@ def test_a_dry_run_leaves_the_database_byte_identical(tmp_path):
     ftp_backfill.run(str(path))
 
     assert ftp_backfill._file_digest(str(path)) == digest
+
+
+def test_only_repairs_the_named_populations_and_leaves_the_rest_stored(tmp_path):
+    """The owner's decision was 'repair the broken rows, leave the stale ones'.
+
+    The corrupt and suspect rows are wrong under any FTP assumption. The
+    ordinary rows are merely stale - rescoring them swaps one debatable basis
+    for another and moves most rides UP, which is not what a repair was wanted
+    for. ``--only`` must therefore withhold the write, not merely relabel it.
+    """
+    path, uid, ids = _database(tmp_path, rows=3)
+    _set(path, uid, ids[0], if_=411.0, tss=900.0, duration_s=6)   # corrupt
+    _set(path, uid, ids[1], if_=3.5, tss=1500.0)                  # suspect
+    state = tmp_path / "progress.json"
+    backup = tmp_path / "before.db"
+
+    result = ftp_backfill.run(
+        str(path), write=True, state_path=str(state), backup_path=str(backup),
+        only=("corrupt", "suspect"),
+    )
+
+    assert result["repaired_populations"] == ["corrupt", "suspect"]
+    # The ordinary row was examined and reported...
+    assert result["populations"]["ordinary"]["rows"] == 1
+    assert result["withheld"] == {"ordinary": 1}
+    # ...but its stored value is untouched, while the broken two were repaired.
+    assert db.get_activity(uid, ids[2], path=str(path))["tss"] == pytest.approx(
+        STALE_TSS
+    )
+    assert db.get_activity(uid, ids[0], path=str(path))["tss"] != pytest.approx(900.0)
+    assert db.get_activity(uid, ids[1], path=str(path))["tss"] != pytest.approx(1500.0)
+
+
+def test_only_still_reports_every_population(tmp_path, capsys):
+    """GUARD: narrowing the repair must not narrow the picture of what is wrong.
+
+    A tool that hid the rows it declined to touch would let the next reader
+    conclude the database is healthier than it is.
+    """
+    path, uid, ids = _database(tmp_path, rows=2)
+    _set(path, uid, ids[0], if_=411.0, tss=900.0, duration_s=6)
+
+    result = ftp_backfill.run(str(path), only=("corrupt",))
+    ftp_backfill._print_report(result)
+    out = capsys.readouterr().out
+
+    assert result["populations"]["ordinary"]["rows"] == 1
+    assert "SCOPE: rewriting only corrupt" in out
+    assert "NOT rewritten" in out
+
+
+def test_only_rejects_an_unknown_population(tmp_path):
+    path, _uid, _ids = _database(tmp_path)
+    with pytest.raises(ValueError, match="unknown population"):
+        ftp_backfill.run(str(path), only=("typo",))
+    with pytest.raises(ValueError, match="at least one"):
+        ftp_backfill.run(str(path), only=())

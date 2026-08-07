@@ -344,6 +344,19 @@ def _print_report(result: dict) -> None:
         "unscored = if_ of 0, never scored)"
     )
     print()
+    repaired = result.get("repaired_populations") or list(POPULATIONS)
+    withheld = result.get("withheld") or {}
+    if sorted(repaired) != sorted(POPULATIONS):
+        print(f"SCOPE: rewriting only {', '.join(sorted(repaired))}.")
+        if withheld:
+            held = ", ".join(
+                f"{name} {count}" for name, count in sorted(withheld.items())
+            )
+            print(
+                f"  Examined and reported but NOT rewritten: {held}. "
+                "These rows keep their stored values."
+            )
+        print()
     if ordinary["median"] is not None:
         direction = "UP" if ordinary["median"] > 0 else "DOWN"
         print(
@@ -503,14 +516,35 @@ def run(
     state_path: Optional[str] = None,
     backup_path: Optional[str] = None,
     chunk_size: int = 500,
+    only: Optional[Sequence[str]] = None,
     stop_after_chunks: Optional[int] = None,
 ) -> dict:
     """Run a dry report or a resumable repair against ``source``.
+
+    ``only`` restricts which populations are *rewritten*; the report still
+    describes every population, so narrowing the repair cannot quietly narrow
+    the picture of what is wrong. Default is every population.
+
+    The owner's decision on this database was ``only=("corrupt", "suspect")``:
+    those rows are wrong under any FTP assumption and every one moves down,
+    while the ordinary population is *stale* rather than broken - rescoring it
+    swaps one debatable basis (the 200 W default at import time) for another (a
+    2026 estimate back-applied to 2021), and moves five rides in six upward.
 
     ``stop_after_chunks`` is a test/integration hook that simulates an
     interrupted process after a committed checkpoint; it is not exposed by the
     command-line interface.
     """
+    repair = tuple(POPULATIONS) if only is None else tuple(only)
+    unknown = [name for name in repair if name not in POPULATIONS]
+    if unknown:
+        raise ValueError(
+            f"unknown population(s): {', '.join(sorted(unknown))}; "
+            f"choose from {', '.join(POPULATIONS)}"
+        )
+    if not repair:
+        raise ValueError("at least one population must be selected")
+    withheld: dict = {}
     source = os.path.abspath(source)
     if not os.path.isfile(source):
         raise ValueError(f"database not found: {source}")
@@ -607,8 +641,14 @@ def run(
                             and day < boundary
                         ),
                     )
-                    if changed:
+                    if changed and population in repair:
                         updates.append(scored)
+                    elif changed:
+                        # Reported, deliberately not repaired. The report still
+                        # counts it so `--only` cannot quietly shrink the
+                        # picture of what is wrong; it only shrinks what is
+                        # rewritten.
+                        withheld[population] = withheld.get(population, 0) + 1
                     if scored["has_correction"]:
                         manual_corrections.append({
                             "user_id": uid,
@@ -699,6 +739,8 @@ def run(
             ),
         },
         "populations": {n: s.summary() for n, s in totals.items()},
+        "repaired_populations": list(repair),
+        "withheld": withheld,
         "per_user": per_user,
         "skips": skips,
         "manual_corrections": manual_corrections,
@@ -734,6 +776,16 @@ def main(argv: Optional[List[str]] = None) -> int:
     parser.add_argument("--state", help="progress JSON path for --write")
     parser.add_argument("--backup", help="verified SQLite backup path for --write")
     parser.add_argument("--chunk-size", type=int, default=500)
+    parser.add_argument(
+        "--only",
+        action="append",
+        choices=POPULATIONS,
+        help=(
+            "repair only this population (repeatable). The report still "
+            "describes every population; this narrows what is rewritten, not "
+            "what is examined. Default: all."
+        ),
+    )
     parser.add_argument("--json", help="also write the full report as JSON here")
     args = parser.parse_args(sys.argv[1:] if argv is None else argv)
     try:
@@ -743,6 +795,7 @@ def main(argv: Optional[List[str]] = None) -> int:
             state_path=args.state,
             backup_path=args.backup,
             chunk_size=args.chunk_size,
+            only=args.only,
         )
         _print_report(result)
         if args.json:
