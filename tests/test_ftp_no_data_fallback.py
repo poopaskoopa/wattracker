@@ -99,6 +99,18 @@ def test_the_setup_endpoint_calls_a_placeholder_a_placeholder(client):
     assert db.latest_ftp(uid) is None
 
 
+def test_setup_endpoint_does_not_report_a_rejected_history_source(client):
+    """A rejected history row cannot lend its provenance to DEFAULT_FTP."""
+    uid = _register(client)
+    db.add_ftp_entry(uid, utc_today().isoformat(), 0.64, "estimated")
+
+    payload = client.post("/setup/ftp", data={"choice": "estimated"}).json()
+
+    assert payload["ftp"] == pytest.approx(importer.DEFAULT_FTP)
+    assert payload["source"] == "default"
+    assert importer.current_ftp(uid) == pytest.approx(payload["ftp"])
+
+
 def test_a_superseded_manual_row_is_not_replaced_by_an_invention(client):
     """FAILS without the fix: the manual row was replaced by a fabricated
     estimate, so the rider's history showed a measurement they never made.
@@ -148,8 +160,27 @@ def test_current_ftp_and_the_wizard_agree_when_there_is_no_data(client):
     assert page.status_code == 200
     # Deliberately asserted on the NUMBER, not on the wording, so this stays a
     # true either-way guard rather than a test of this commit's copy edit.
-    assert f"{round(importer.current_ftp(uid))} W" in page.text
+    assert f"{float(importer.current_ftp(uid)):g} W" in page.text
     assert "placeholder" in page.text
+
+
+@pytest.mark.parametrize(
+    ("watts", "source", "claim"),
+    [(262.0, "estimated", "262 W"), (275.0, "manual", "manual FTP")],
+)
+def test_setup_wizard_describes_the_ftp_current_ftp_will_use(
+    client, watts, source, claim
+):
+    """The wizard must not call a real current FTP a fallback placeholder."""
+    uid = _register(client, f"wizard-{source}")
+    db.add_ftp_entry(uid, utc_today().isoformat(), watts, source)
+
+    page = client.get("/setup")
+
+    assert page.status_code == 200
+    assert f"{float(importer.current_ftp(uid)):g} W" in page.text
+    assert claim in page.text
+    assert "placeholder" not in page.text
 
 
 # ------------------------------------------- and a real ride is still an estimate
