@@ -15,6 +15,7 @@ Run just these:      pytest -m browser
 Skip them:           pytest -m "not browser"
 """
 import datetime as dt
+import re
 import socket
 import threading
 import time
@@ -552,3 +553,79 @@ def test_ride_stop_ends_the_ride_through_an_in_page_dialog(
 
     assert browser_dialogs == [], f"a browser dialog was used: {browser_dialogs}"
     _assert_clean(console_errors, "/ride stop")
+
+
+def test_workout_graphs_are_real_svg_elements(page, live_server, console_errors):
+    """The graph markup must parse into SVG, not namespace-less unknown nodes.
+
+    profileSvg's output is handed to DOMParser as "image/svg+xml", and XML
+    parsing does NOT infer namespaces the way the HTML parser does. Without an
+    explicit xmlns the root parses with a null namespace, so the browser builds
+    plain Elements instead of SVGSVGElement: nothing renders as a graph, no
+    .profile-svg CSS applies, and the <text>/<title> contents are laid out as
+    ordinary inline HTML. That is what made a Just Ride card read as one run of
+    digits and words at assorted sizes (#72).
+
+    The suite stayed green throughout, because a null-namespace element still
+    has a bounding box and still holds path `d` attributes - so every existing
+    geometry check passed while nothing was drawn. Identity is the assertion
+    that would have caught it.
+    """
+    page.goto(f"{live_server.base}/ride")
+    page.get_by_role("button", name="Just ride", exact=True).click()
+    page.wait_for_selector("#rideVariantGrid .ride-variant-card", timeout=10_000)
+
+    report = page.evaluate(
+        """() => Array.from(document.querySelectorAll('svg.profile-svg')).map(el => ({
+            isSVG: el instanceof SVGSVGElement,
+            ns: el.namespaceURI,
+            drawn: el.getBoundingClientRect().width > 0
+                && el.getBoundingClientRect().height > 0,
+        }))"""
+    )
+    assert report, "no profile graphs on the page"
+    assert all(g["isSVG"] for g in report), f"not real SVG elements: {report}"
+    assert all(g["ns"] == "http://www.w3.org/2000/svg" for g in report), report
+    assert all(g["drawn"] for g in report), f"a graph has no box: {report}"
+    _assert_clean(console_errors, "/ride graph namespaces")
+
+
+def test_just_ride_cards_are_one_per_row_and_legible(page, live_server,
+                                                     console_errors):
+    """Each shape is its own row, with a thumbnail and short readable fields.
+
+    Side-by-side cards at a 148px minimum squeezed the title to an ellipsis and
+    the description to nothing, and the thumbnail's own axis labels collapsed
+    into the card text. The card graph is drawn bare for that reason, so it
+    must contribute no text at all.
+    """
+    page.goto(f"{live_server.base}/ride")
+    page.get_by_role("button", name="Just ride", exact=True).click()
+    page.wait_for_selector("#rideVariantGrid .ride-variant-card", timeout=10_000)
+
+    cards = page.evaluate(
+        """() => Array.from(
+            document.querySelectorAll('#rideVariantGrid .ride-variant-card')
+        ).map(c => {
+            const r = c.getBoundingClientRect();
+            const svg = c.querySelector('svg.profile-svg');
+            const box = svg ? svg.getBoundingClientRect() : null;
+            return {
+                top: Math.round(r.top), left: Math.round(r.left),
+                width: Math.round(r.width),
+                thumb: box ? [Math.round(box.width), Math.round(box.height)] : null,
+                svgText: svg ? (svg.textContent || '').trim() : '',
+                text: (c.innerText || '').trim(),
+            };
+        })"""
+    )
+    assert len(cards) >= 2, cards
+    # One per row: every card starts at the same x and a distinct y.
+    assert len({c["left"] for c in cards}) == 1, f"cards sit side by side: {cards}"
+    assert len({c["top"] for c in cards}) == len(cards), f"cards overlap: {cards}"
+    for card in cards:
+        assert card["thumb"] and card["thumb"][0] > 20 and card["thumb"][1] > 20, card
+        # The bare thumbnail contributes no text, so nothing can run together.
+        assert card["svgText"] == "", f"thumbnail leaked text: {card['svgText']!r}"
+        assert not re.search(r"\d{6,}", card["text"].replace(" ", "")), card["text"]
+    _assert_clean(console_errors, "/ride card layout")
