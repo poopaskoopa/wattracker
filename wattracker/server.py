@@ -1105,7 +1105,9 @@ def create_app() -> FastAPI:
             # effect on each activity's own date. scan_activities does the
             # same; leaving it out here is what made the wizard's two import
             # routes disagree (100.0 vs 172.9 TSS for the same rides).
-            importer.rescore_imported_activities(uid, imported_activity_ids)
+            importer.rescore_imported_activities(
+                uid, imported_activity_ids, path=config.db_path()
+            )
             importer.match_plan_completions(uid)
             importer.profile_store.refresh(uid)
         estimate = importer.recent_best_effort_ftp(uid)
