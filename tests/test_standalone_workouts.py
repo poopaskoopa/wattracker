@@ -973,3 +973,73 @@ def test_an_out_of_range_suggestion_is_refused_rather_than_clamped(user_id):
 
     assert db.get_user_settings(user_id)["ftp"] == before
     assert importer.current_ftp(user_id) != 1.0
+
+
+def test_a_refused_suggestion_is_recorded_as_rejected(user_id):
+    """A refused suggestion must not disappear as an accepted audit row."""
+    _manual_evidence(user_id)
+    importer.apply_rpe_ftp_feedback(
+        user_id, dt.datetime.fromisoformat(f"{DATE}T20:00:00")
+    )
+    suggestion = db.pending_ftp_suggestion(user_id)
+    before = db.get_user_settings(user_id)["ftp"]
+    with db.connect() as conn:
+        conn.execute(
+            "UPDATE ftp_suggestions SET suggested_ftp = ? WHERE id = ?",
+            (1.0, suggestion["id"]),
+        )
+        conn.commit()
+
+    app = create_app()
+    with TestClient(app) as client:
+        client.post("/login", data={"username": "tester", "password": "password123"})
+        response = client.post("/ftp-suggestion", data={
+            "suggestion_id": suggestion["id"], "action": "use",
+            "next_path": "/settings",
+        }, follow_redirects=False)
+        message = client.get(response.headers["location"])
+
+    assert response.status_code == 303
+    assert "ftp_suggestion=rejected" in response.headers["location"]
+    assert "could not be accepted by the FTP" in message.text
+    with db.connect() as conn:
+        status = conn.execute(
+            "SELECT status FROM ftp_suggestions WHERE id = ?",
+            (suggestion["id"],),
+        ).fetchone()[0]
+    assert status == "rejected"
+    assert db.pending_ftp_suggestion(user_id) is None
+    assert db.get_user_settings(user_id)["ftp"] == before
+
+
+def test_using_a_low_suggestion_confirms_it_through_the_shared_policy(user_id):
+    """Use is the rider's confirmation for a 20-50 W suggestion."""
+    _manual_evidence(user_id)
+    importer.apply_rpe_ftp_feedback(
+        user_id, dt.datetime.fromisoformat(f"{DATE}T20:00:00")
+    )
+    suggestion = db.pending_ftp_suggestion(user_id)
+    with db.connect() as conn:
+        conn.execute(
+            "UPDATE ftp_suggestions SET suggested_ftp = ? WHERE id = ?",
+            (40.0, suggestion["id"]),
+        )
+        conn.commit()
+
+    app = create_app()
+    with TestClient(app) as client:
+        client.post("/login", data={"username": "tester", "password": "password123"})
+        response = client.post("/ftp-suggestion", data={
+            "suggestion_id": suggestion["id"], "action": "use",
+            "next_path": "/settings",
+        })
+
+    assert response.status_code == 200
+    assert db.get_user_settings(user_id)["ftp"] == pytest.approx(40.0)
+    assert db.pending_ftp_suggestion(user_id) is None
+    with db.connect() as conn:
+        status = conn.execute(
+            "SELECT status FROM ftp_suggestions WHERE id = ?",
+            (suggestion["id"],),
+        ).fetchone()[0]
+    assert status == "accepted"
