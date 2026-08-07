@@ -154,7 +154,7 @@ def _verify_recorded_backup(state: dict, destination: str) -> str:
     return destination
 
 
-def _load_state(path: str, source: str) -> Optional[dict]:
+def _load_state(path: str, source: str, repair: Sequence[str]) -> Optional[dict]:
     if not os.path.exists(path):
         return None
     with open(path, encoding="utf-8") as handle:
@@ -165,6 +165,21 @@ def _load_state(path: str, source: str) -> Optional[dict]:
         or not isinstance(state.get("users"), dict)
     ):
         raise ValueError("progress file does not belong to this database")
+    # The scope is part of the run's identity. Resuming a --only corrupt run
+    # without --only would apply two different repairs to two halves of the
+    # same database, and nothing in the state file or the report would say so.
+    recorded = state.get("only")
+    if recorded is not None and sorted(recorded) != sorted(repair):
+        raise ValueError(
+            "progress file was written by a run with a different --only scope "
+            f"({', '.join(sorted(recorded))}); finish or delete it before "
+            f"running with {', '.join(sorted(repair))}"
+        )
+    if recorded is None and sorted(repair) != sorted(POPULATIONS):
+        raise ValueError(
+            "progress file was written by a full-scope run; finish or delete "
+            f"it before running with --only {', '.join(sorted(repair))}"
+        )
     return state
 
 
@@ -526,7 +541,7 @@ def run(
         destination = os.path.abspath(
             backup_path or f"{source}.before-ftp-rescore.db"
         )
-        state = _load_state(state_file, source)
+        state = _load_state(state_file, source, repair)
         if state is None:
             backup_file = _create_backup(source, destination)
             state = {
@@ -534,6 +549,7 @@ def run(
                 "db": source,
                 "backup": backup_file,
                 "backup_sha256": _file_digest(backup_file),
+                "only": list(repair),
                 "users": {},
             }
             _save_state(state_file, state)
@@ -634,10 +650,20 @@ def run(
                             # only over rides whose stored value was sane.
                             daily_before[day] = daily_before.get(day, 0.0) - old_tss
                             daily_after[day] = daily_after.get(day, 0.0) - old_tss
-                        else:
+                        elif population in repair:
                             daily_after[day] = (
                                 daily_after.get(day, 0.0) - old_tss + new_tss
                             )
+                        # else: withheld by --only. The row keeps its stored
+                        # value, so it contributes old_tss to both sides and
+                        # nets out. Counting new_tss here would report the load
+                        # shift of a repair that is not being performed - and
+                        # that shift is the number the run gets checked
+                        # against. Under --only corrupt --only suspect this
+                        # correctly leaves the reported shift at zero: those
+                        # two populations are excluded from both sides above,
+                        # so the approved scope moves nothing that the load
+                        # calculation can see.
             skipped_no_date.extend(i for i in ids if i not in returned)
             if write and updates:
                 db.update_activity_ftp_metrics(uid, updates, source)
