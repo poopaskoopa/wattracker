@@ -5,27 +5,99 @@ set -euo pipefail
 
 cd "$(dirname "$0")"
 
-PYTHON=".venv/bin/python"
+PYTHON="$PWD/.venv/bin/python"
+INSTALLER="scripts/install.sh"
+MARKER=".venv/.wattracker-installed"
 STATE_DIR="${WATTRACKER_HOME:-$HOME/.wattracker}"
 LOG="$STATE_DIR/server.log"
 PIDFILE="$STATE_DIR/server.pid"
+HOST="${WATTRACKER_HOST:-127.0.0.1}"
 PORT="${WATTRACKER_PORT:-8000}"
-URL="http://127.0.0.1:$PORT"
+URL="http://$HOST:$PORT"
 
-if [ ! -x "$PYTHON" ]; then
-    echo "No virtualenv at $PWD/$PYTHON" >&2
-    echo "Create one with: python3 -m venv .venv && .venv/bin/pip install -e ." >&2
-    exit 1
+if [ ! -x "$PYTHON" ] || [ ! -f "$MARKER" ] || \
+   [ "$INSTALLER" -nt "$MARKER" ] || [ "pyproject.toml" -nt "$MARKER" ]; then
+    if [ ! -x "$INSTALLER" ]; then
+        echo "Missing installer: $PWD/$INSTALLER" >&2
+        exit 1
+    fi
+    "$INSTALLER"
 fi
 
 mkdir -p "$STATE_DIR"
 
-# The process runs as ".venv/bin/python -m wattracker" with a relative path,
-# so match the module invocation, not an absolute one. The bracket keeps
-# pgrep from matching its own command line.
-PATTERN="[p]ython -m wattracker"
+port_is_listening() {
+    "$PYTHON" -c 'import socket, sys; s = socket.create_connection((sys.argv[1], int(sys.argv[2])), timeout=0.2); s.close()' \
+        "$HOST" "$PORT" >/dev/null 2>&1
+}
 
-existing="$(pgrep -f "$PATTERN" | head -1 || true)"
+process_command_is_wattracker() {
+    local command_line
+    command_line="$(ps -p "$1" -o command= 2>/dev/null || true)"
+    case "$command_line" in
+        *"$PYTHON -m wattracker"*) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
+process_start_time() {
+    ps -p "$1" -o lstart= 2>/dev/null |
+        sed 's/^[[:space:]]*//;s/[[:space:]]*$//'
+}
+
+recorded_process_is_wattracker() {
+    process_command_is_wattracker "$1" || return 1
+    if [ "$#" -ge 2 ] && [ -n "$2" ]; then
+        [ "$(process_start_time "$1")" = "$2" ]
+    fi
+}
+
+log_has_pid_bind() {
+    [ -f "$LOG" ] || return 1
+    grep -F "Started server process [$1]" "$LOG" >/dev/null 2>&1 &&
+        grep -F "Uvicorn running on" "$LOG" |
+        grep -F ":$PORT" >/dev/null 2>&1
+}
+
+port_is_owned_by() {
+    if command -v lsof >/dev/null 2>&1; then
+        lsof -nP -iTCP:"$PORT" -sTCP:LISTEN -a -p "$1" >/dev/null 2>&1
+    else
+        process_command_is_wattracker "$1" &&
+            port_is_listening &&
+            log_has_pid_bind "$1"
+    fi
+}
+
+log_has_fresh_bind() {
+    [ -f "$LOG" ] || return 1
+    tail -c "+$((LOG_OFFSET + 1))" "$LOG" |
+        grep -F "Uvicorn running on" |
+        grep -F ":$PORT" >/dev/null 2>&1
+}
+
+server_is_ready() {
+    if command -v lsof >/dev/null 2>&1; then
+        port_is_owned_by "$1"
+    else
+        log_has_fresh_bind
+    fi
+}
+
+existing=""
+if [ -f "$PIDFILE" ]; then
+    recorded="$(sed -n '1p' "$PIDFILE" 2>/dev/null || true)"
+    recorded_start="$(sed -n '2p' "$PIDFILE" 2>/dev/null || true)"
+    case "$recorded" in
+        ''|*[!0-9]*) recorded="" ;;
+    esac
+    if [ -n "$recorded" ] && kill -0 "$recorded" 2>/dev/null && \
+       recorded_process_is_wattracker "$recorded" "$recorded_start" && \
+       port_is_owned_by "$recorded"; then
+        existing="$recorded"
+    fi
+fi
+
 if [ -n "$existing" ]; then
     echo "Already running (pid $existing) at $URL"
     exit 0
@@ -33,15 +105,21 @@ fi
 
 # Only one process can hold the port. Starting a second would burn CPU and
 # quietly fail to bind, so refuse rather than leave a stray behind.
-if lsof -nP -iTCP:"$PORT" -sTCP:LISTEN >/dev/null 2>&1; then
+if port_is_listening; then
     echo "Port $PORT is already in use by something else:" >&2
-    lsof -nP -iTCP:"$PORT" -sTCP:LISTEN >&2
+    if command -v lsof >/dev/null 2>&1; then
+        lsof -nP -iTCP:"$PORT" -sTCP:LISTEN >&2
+    fi
     exit 1
 fi
 
+LOG_OFFSET="$("$PYTHON" -c 'import os, sys; print(os.path.getsize(sys.argv[1]) if os.path.exists(sys.argv[1]) else 0)' "$LOG")"
 nohup "$PYTHON" -m wattracker >>"$LOG" 2>&1 &
 pid=$!
-echo "$pid" >"$PIDFILE"
+{
+    printf '%s\n' "$pid"
+    process_start_time "$pid"
+} >"$PIDFILE"
 
 # The database migrates on startup, which takes a moment on a large one.
 for _ in $(seq 1 60); do
@@ -51,9 +129,10 @@ for _ in $(seq 1 60); do
         rm -f "$PIDFILE"
         exit 1
     fi
-    # Confirm OUR process owns the port, not some other listener that would
-    # make a plain HTTP check look successful.
-    if lsof -nP -iTCP:"$PORT" -sTCP:LISTEN -a -p "$pid" >/dev/null 2>&1; then
+    # Confirm the launched process is alive and the configured local port is
+    # accepting connections. Without lsof, also require a fresh Uvicorn bind
+    # line from this launch, so another listener cannot look healthy.
+    if server_is_ready "$pid"; then
         echo "Started (pid $pid) at $URL"
         echo "Log: $LOG"
         exit 0
