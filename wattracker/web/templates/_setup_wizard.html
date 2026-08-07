@@ -70,12 +70,17 @@
                FIT-derived estimate when available, or enter your own number.</p>
             <label class="setup-choice"><input type="radio" name="ftp_choice" value="estimated"
                 required {{ 'checked' if setup_form.ftp_choice == 'estimated' else '' }}>
-                Use FIT-derived estimate <span id="setup-estimate-value">{% if setup_estimate %}({{ setup_estimate }} W){% else %}(no-data fallback: {{ setup_fallback_ftp }} W){% endif %}</span></label>
+                Use FIT-derived estimate <span id="setup-estimate-value">{% if setup_estimate %}({{ setup_estimate }} W){% else %}(no rides analyzed yet &mdash; targets use a {{ setup_fallback_ftp }} W placeholder until one is){% endif %}</span></label>
             <label class="setup-choice"><input type="radio" name="ftp_choice" value="manual"
                 {{ 'checked' if setup_form.ftp_choice == 'manual' else '' }}> Enter manual FTP</label>
-            <label for="setup-manual-ftp">Manual FTP in watts
-                <input id="setup-manual-ftp" name="manual_ftp" type="number" min="1" max="1000" step="1"
+            <label for="setup-manual-ftp">Manual FTP in watts ({{ setup_ftp_min }}&ndash;{{ setup_ftp_max }})
+                <input id="setup-manual-ftp" name="manual_ftp" type="number"
+                       min="{{ setup_ftp_min }}" max="{{ setup_ftp_max }}" step="1"
                        value="{{ setup_form.manual_ftp or '' }}">
+            </label>
+            <label class="ftp-confirm" id="setup-confirm-low-ftp" {{ '' if setup_ftp_confirm_required else 'hidden' }}>
+                <input type="checkbox" name="confirm_low_ftp" value="on">
+                Yes, my FTP really is that low &mdash; save it as entered.
             </label>
             <div class="setup-nav">
                 <button type="button" class="button-secondary" data-setup-back>Back</button>

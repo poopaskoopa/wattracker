@@ -135,8 +135,14 @@
     {% include "_ftp_suggestion.html" %}
 
     <form class="ftp-form hrmax-form" method="post" action="/profile/ftp">
-        <label for="manual-ftp">Manual Training FTP override (1–2000 W)</label>
-        <input id="manual-ftp" name="ftp" type="number" min="1" max="2000" step="1" value="{{ manual_ftp|int if manual_ftp is not none else '' }}" inputmode="numeric">
+        <label for="manual-ftp">Manual Training FTP override ({{ ftp_min }}–{{ ftp_max }} W)</label>
+        <input id="manual-ftp" name="ftp" type="number" min="{{ ftp_min }}" max="{{ ftp_max }}" step="1" value="{{ manual_ftp_value }}" inputmode="numeric">
+        {% if ftp_confirm_required %}
+        <label class="ftp-confirm">
+            <input type="checkbox" name="confirm_low_ftp" value="on">
+            Yes, my FTP really is that low &mdash; save it as entered.
+        </label>
+        {% endif %}
         <button type="submit" name="action" value="save">Save FTP</button>
         {% if manual_ftp is not none %}<button class="button-secondary" type="submit" name="action" value="reset">Use FTP history or FIT estimate</button>{% endif %}
     </form>

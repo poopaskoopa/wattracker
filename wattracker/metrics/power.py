@@ -179,11 +179,13 @@ FTP_PLAUSIBLE_MIN_WATTS = 50.0
 # unusual assertion, it is a typo, a unit mix-up or a corrupt row - and because
 # TSS is quadratic in 1/FTP, honouring it stores load figures in the millions.
 #
-# These bounds are on the SCORING BASIS and are deliberately independent of
-# what any input route accepts. /settings validates nothing today (issue #64,
-# not fixed here), so this is the layer that has to hold; conversely #64 will
-# want a much tighter, friendlier range, and should not be tempted to reuse
-# these numbers as a UI limit.
+# These bounds are on the SCORING BASIS and are enforced here regardless of what
+# any input route accepts: this is the layer that has to hold, because a basis
+# also arrives from migrations, imports and rescores that no form ever touched.
+# Issue #64 has since given the input routes one shared policy
+# (wattracker.ftp_input) which admits exactly this window and challenges the
+# sub-plausible part of it - but that is a courtesy to the rider, not this
+# rail's justification, and removing it must not weaken anything here.
 #
 # Lower: 20 W. Clinical cardiac-rehab and deconditioned-patient ergometry
 # protocols begin at 20-25 W and step up by 25 W, so 20 W is the bottom of the
@@ -203,6 +205,26 @@ FTP_PLAUSIBLE_MIN_WATTS = 50.0
 # number. It exists to bound the damage, not to referee anyone's fitness.
 FTP_ASSERTION_MIN_WATTS = 20.0
 FTP_ASSERTION_MAX_WATTS = 700.0
+
+# --- the no-data placeholder --------------------------------------------------
+# What the app uses when it knows NOTHING about a rider: no rides to estimate
+# from, no history, no assertion. It is a stated placeholder so the dashboard
+# and the workout targets have some number to draw, and it is deliberately the
+# ONLY such number in the app - the same literal used to sit inline in
+# importer.current_ftp, in two of server.py's setup contexts and in the wizard
+# template, so the displayed fallback, the stored history and the resolved FTP
+# could drift apart (issue #55).
+#
+# It is NOT a measurement and must never be recorded as one. Writing it into
+# ftp_history as source='estimated' makes an invented number indistinguishable
+# from an analysed one for every later reader - the same class of defect as
+# #44/#54/#60. Nothing writes it to ftp_history; it is resolved at read time by
+# current_ftp when there is genuinely nothing to resolve, which means it also
+# disappears by itself the moment a real ride or a rider assertion exists.
+#
+# 200 W is the conventional mid-range adult cyclist FTP and is only ever a
+# placeholder; no claim is made that it describes any particular rider.
+DEFAULT_FTP = 200.0
 
 # What this floor does NOT fix: the estimator is anchored at wall-clock now, so
 # the deeper defect is that a rider's *historical* rides are scored against a
