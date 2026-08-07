@@ -1477,13 +1477,12 @@ def create_app() -> FastAPI:
         typing it into the FTP field does - so the training FTP still only ever
         moves because the rider said so. Dismissing changes nothing; the
         evidence behind it was consumed when the suggestion was filed, so it
-        does not immediately come back.
+        does not immediately come back. A suggestion the input policy refuses
+        is recorded as rejected rather than falsely accepted.
         """
         uid = _uid(request)
         target = next_path if next_path in ("/settings", "/profile") else "/settings"
-        row = db.resolve_ftp_suggestion(
-            uid, suggestion_id, "accepted" if action == "use" else "dismissed"
-        )
+        row = db.pending_ftp_suggestion_by_id(uid, suggestion_id)
         if row is None:
             return RedirectResponse(target, status_code=303)
         outcome = "dismissed"
@@ -1494,15 +1493,20 @@ def create_app() -> FastAPI:
             # scoring layer then refuses - the row reads back as the rider's
             # setting while nothing it touches can be scored. A suggestion the
             # policy rejects is a bug in the suggester, not something to round
-            # into range, so refuse it and say so.
-            parsed = parse_ftp_input(row["suggested_ftp"])
+            # into range, so refuse it and say so. Clicking Use is the explicit
+            # rider confirmation for the policy's low-but-usable band.
+            parsed = parse_ftp_input(row["suggested_ftp"], confirmed=True)
             if parsed.watts is None:
+                if db.resolve_ftp_suggestion(uid, suggestion_id, "rejected") is None:
+                    return RedirectResponse(target, status_code=303)
                 _log.warning(
                     "refusing implausible FTP suggestion %s for user %s: %s",
                     row["suggested_ftp"], uid, parsed.error,
                 )
                 outcome = "rejected"
             else:
+                if db.resolve_ftp_suggestion(uid, suggestion_id, "accepted") is None:
+                    return RedirectResponse(target, status_code=303)
                 db.set_user_ftp_override(uid, parsed.watts)
                 outcome = "used"
                 try:
@@ -1511,6 +1515,8 @@ def create_app() -> FastAPI:
                     _log.warning(
                         "profile refresh after FTP suggestion failed", exc_info=True
                     )
+        elif db.resolve_ftp_suggestion(uid, suggestion_id, "dismissed") is None:
+            return RedirectResponse(target, status_code=303)
         return RedirectResponse(f"{target}?ftp_suggestion={outcome}", status_code=303)
 
     @app.post("/profile/hr-max", response_class=HTMLResponse)
