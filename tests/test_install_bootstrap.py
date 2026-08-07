@@ -37,6 +37,9 @@ def test_start_bootstraps_missing_or_stale_environment_before_launching():
     assert 'port_is_listening()' in START
     assert 'if command -v lsof' in START
     assert 'lsof -nP -iTCP:"$PORT" -sTCP:LISTEN -a -p "$1"' in START
+    assert 'log_has_fresh_bind()' in START
+    assert 'grep -F "Uvicorn running on"' in START
+    assert 'server_is_ready()' in START
     assert 'pgrep -f' not in START
 
 
