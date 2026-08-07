@@ -91,20 +91,13 @@ def test_variants_comparable_to_classic_at_60min(kind):
 # where the fitting loops actually change shape.
 _TIZ_DURATIONS = (60, 75, 90, 120, 180, 240)
 
-# Variants whose dose already diverges from classic by more than the band.
-# Found by this test when it was written (PR #63 review) and deliberately NOT
-# changed here: whether e.g. over-unders should carry a full threshold dose is
-# a prescription decision, not a defect fix. `strict` xfail means any later
-# change to one of these fails the suite until the entry is removed, so the
-# divergence cannot quietly grow or quietly disappear.
-_UNREVIEWED_DOSE = {
-    ("vo2max", "short_short"): _TIZ_DURATIONS,
-    ("vo2max", "long_intervals"): (75, 90, 120, 180, 240),
-    ("vo2max", "descending"): _TIZ_DURATIONS,
-    ("threshold", "over_unders"): _TIZ_DURATIONS,
-    ("sweet_spot", "long_blocks"): (75, 120, 180, 240),
-    ("sweet_spot", "with_surges"): (75, 90, 120, 180, 240),
-}
+# Variants whose dose diverges from classic by more than the band. Six entries
+# lived here from PR #63 until issue #66 fixed them (short_short, long_intervals
+# and descending on vo2max; over_unders on threshold; long_blocks and
+# with_surges on sweet_spot). Every variant now reads classic's dose for the
+# same ride and fits its own shape to it, so the list is empty and must stay
+# that way: a new entry means a variant is prescribing the wrong training load.
+_UNREVIEWED_DOSE: dict = {}
 
 _BANDS = {info["key"]: (info["low"], info["high"]) for info in WORKOUT_TYPE_INFO}
 
@@ -154,6 +147,26 @@ def _tiz_params():
                                    id=f"{kind}-{v}-{minutes}")
 
 
+def test_no_variant_is_exempt_from_the_dose_check():
+    """`_UNREVIEWED_DOSE` must stay empty, and this is what enforces it.
+
+    Entries there xfail a variant out of the dose check. Six lived there from
+    PR #63 until issue #66 fixed them, and while they did, a rider asking for
+    VO2max work could receive 58% of the intended stimulus and the suite stayed
+    green. An exemption is therefore a statement that a variant is knowingly
+    prescribing the wrong training load - never a way to quiet a failure.
+
+    Adding an entry must break this test, so the exemption is a deliberate,
+    reviewed act rather than a silent one. If you are here because you added
+    one: open an issue like #66, put its number in the reason, and change this
+    test in the same commit so the exemption is visible in review.
+    """
+    assert _UNREVIEWED_DOSE == {}, (
+        "variants exempted from the dose check: "
+        f"{sorted(_UNREVIEWED_DOSE)}. See this test's docstring."
+    )
+
+
 @pytest.mark.parametrize("kind,variant,minutes", list(_tiz_params()))
 def test_variant_time_in_zone_tracks_classic(kind, variant, minutes):
     classic = build_workout(kind, minutes, "classic")
@@ -165,6 +178,24 @@ def test_variant_time_in_zone_tracks_classic(kind, variant, minutes):
         (kind, variant, minutes, v_tiz / 60, c_tiz / 60)
 
 
+def _work_powers(session, kind):
+    """Prescribed powers of the in-band work efforts, in session order.
+
+    A builder may emit its final effort as a plain `steadystate` rather than an
+    `intervals` segment (see `_interval_block`): the last recovery is dropped so
+    it cannot run into the cooldown. Both shapes are the same work effort, so
+    the ramp has to be read across both.
+    """
+    low, high = _BANDS[kind]
+    powers = []
+    for seg in session.segments:
+        p = seg.on_power if seg.kind == "intervals" else (
+            seg.power if seg.kind == "steadystate" else None)
+        if p is not None and low <= p <= high:
+            powers.append(p)
+    return powers
+
+
 def test_tempo_progression_dose_grows_with_the_ride():
     """The dose must scale, not saturate - and the ramp must survive scaling."""
     doses = [_time_in_zone(build_workout("tempo", m, "progression"), "tempo")
@@ -172,12 +203,130 @@ def test_tempo_progression_dose_grows_with_the_ride():
     assert doses[0] < doses[1] < doses[2], doses
     for minutes in (60, 90, 120):
         s = build_workout("tempo", minutes, "progression")
-        powers = [seg.on_power for seg in s.segments if seg.kind == "intervals"]
+        powers = _work_powers(s, "tempo")
         assert len(powers) >= 2 and powers == sorted(powers), (minutes, powers)
         assert powers[0] < powers[-1], (minutes, powers)
         # Still Zone 3 at both ends of the ramp.
         low, high = _BANDS["tempo"]
         assert low <= min(powers) and max(powers) <= high, (minutes, powers)
+
+
+def test_tempo_progression_does_not_end_on_a_recovery():
+    """The top block runs into the cooldown, not into a 2-4min recovery.
+
+    `_interval_block` exists to stop an interval builder ending "easy spin"
+    immediately followed by "cool down easy"; `_tempo_progression` was the one
+    builder added in #63 that did not use it.
+    """
+    for minutes in (60, 90, 120, 180):
+        s = build_workout("tempo", minutes, "progression")
+        work = [seg for seg in s.segments
+                if seg.kind in ("intervals", "steadystate")]
+        last = work[-1]
+        assert last.kind == "steadystate", (minutes, last.kind)
+        low, high = _BANDS["tempo"]
+        assert low <= last.power <= high, (minutes, last.power)
+
+
+@pytest.mark.parametrize("kind,variant", [
+    ("vo2max", "short_short"), ("vo2max", "long_intervals"),
+    ("vo2max", "descending"), ("threshold", "over_unders"),
+    ("sweet_spot", "long_blocks"), ("sweet_spot", "with_surges"),
+])
+def test_fixed_variant_dose_tracks_the_ride_not_a_literal(kind, variant):
+    """The six #66 variants must follow the ride, not saturate or over-dose.
+
+    `test_variant_time_in_zone_tracks_classic` pins each duration against
+    classic; this pins the direction. Five of these carried a hard-coded shape
+    that handed a 4-hour ride exactly the dose of a 1-hour one; the sixth
+    (sweet_spot/long_blocks) took a flat 40% of ride time and ran away past
+    classic on long rides.
+    """
+    at60, at90, at240 = (
+        _time_in_zone(build_workout(kind, m, variant), kind)
+        for m in (60, 90, 240))
+    # A longer ride never buys less time in zone.
+    assert at60 <= at90 <= at240, (kind, variant, at60, at90, at240)
+    # And a long ride lands on classic's dose, not on the 60min shape's.
+    ceiling = _time_in_zone(build_workout(kind, 240, "classic"), kind)
+    assert 0.90 * ceiling <= at240 <= 1.10 * ceiling, \
+        (kind, variant, at240, ceiling)
+
+
+def test_variant_work_efforts_stay_inside_the_published_band():
+    """No variant may lift a work effort out of the band its type publishes.
+
+    The dose fixes reshape six builders; the shapes must not buy their time in
+    zone by prescribing something the picker never advertised.
+    """
+    for kind, variants in VARIANTS.items():
+        if kind in ("sprint", "endurance", "recovery"):
+            continue  # base-heavy kinds: most of the ride is deliberately easy
+        low, high = _BANDS[kind]
+        for v in variants:
+            for minutes in _TIZ_DURATIONS:
+                s = build_workout(kind, minutes, v)
+                for seg in s.segments:
+                    for p in (seg.on_power, seg.off_power, seg.power):
+                        # Work efforts are anything at or above the band floor;
+                        # recoveries and the Zone 2 base sit below it.
+                        if p is not None and p >= low:
+                            assert p <= high, (kind, v, minutes, p)
+
+
+def test_sweet_spot_surge_power_is_pinned():
+    """The surge is a sweet-spot surge, not a threshold rep.
+
+    #63 re-specced this 1.10 -> 0.94 under an unchanged variant key with no
+    test asserting the value, so the session silently changed character for
+    every rider holding a stored `with_surges` row. 0.94 is the top of the
+    published sweet-spot band; anything above it makes this a different type.
+    """
+    low, high = _BANDS["sweet_spot"]
+    for minutes in (60, 90, 180):
+        s = build_workout("sweet_spot", minutes, "with_surges")
+        blocks = [seg for seg in s.segments if seg.kind == "intervals"]
+        assert blocks, minutes
+        for seg in blocks:
+            assert seg.on_power == 0.89, (minutes, seg.on_power)
+            assert seg.off_power == 0.94 == high, (minutes, seg.off_power)
+            assert seg.off_duration == 10 and seg.on_duration == 170
+        assert low <= 0.89
+
+
+def test_endurance_tempo_finish_power_is_pinned():
+    """The finish is upper Zone 2, not tempo.
+
+    #63 re-specced this 0.80 -> 0.74 under an unchanged variant key with no
+    test asserting the value. 0.74 is inside the published endurance band; the
+    old 0.80 was Zone 3, i.e. the workout's own name was wrong.
+    """
+    low, high = _BANDS["endurance"]
+    for minutes in (60, 120, 240):
+        s = build_workout("endurance", minutes, "tempo_finish")
+        finish = [seg for seg in s.segments if seg.kind == "steadystate"][-1]
+        assert finish.power == 0.74, (minutes, finish.power)
+        assert low <= finish.power <= high
+
+
+def test_vo2max_short_short_sets_do_not_end_on_a_recovery():
+    """Each 30/30 set ends on the effort, not on the 30s easy.
+
+    Without `_interval_block` the last set finished with a 30s recovery that ran
+    straight into the cooldown, and every earlier set finished with one running
+    into the 3min set rest - two easy blocks back to back either way.
+    """
+    for minutes in (60, 90, 180):
+        s = build_workout("vo2max", minutes, "short_short")
+        work = [seg for seg in s.segments
+                if seg.kind == "intervals"
+                or (seg.kind == "steadystate" and (seg.power or 0) >= 1.06)]
+        assert work, minutes
+        # An `intervals` set is always closed by its own steadystate effort.
+        for a, b in zip(work, work[1:]):
+            if a.kind == "intervals":
+                assert b.kind == "steadystate", (minutes, a.kind, b.kind)
+        assert work[-1].kind == "steadystate", minutes
 
 
 def test_each_variant_has_distinct_name():
