@@ -124,8 +124,20 @@ def test_a_superseded_manual_row_is_not_replaced_by_an_invention(client):
 
     So nothing is written and nothing is deleted. The rider keeps their own
     most recent assertion, which is a better answer than a generic placeholder
-    when there is genuinely no analysis, and the override is still cleared so
-    the estimate can take over the moment one exists.
+    when there is genuinely no analysis.
+
+    An earlier version of this docstring claimed the cleared override let "the
+    estimate take over the moment one exists". That was wrong: evaluate_ftp
+    appends only when ftp_update_due (21 days) and otherwise refreshes in place
+    only when the latest row's source is 'estimated', so a manual row dated
+    today blocks both branches. Measured - manual 275, choose estimated, import
+    a genuine 250 W hour: recent_best_effort_ftp 237.5, ftp_history unchanged,
+    current_ftp still 275.0.
+
+    That stickiness is the FTP policy working as intended (#77): while a manual
+    FTP is set the training FTP never moves on its own; the app files a
+    suggestion instead. The rider changes it in Settings or via that
+    suggestion, and nothing here should route around them.
     """
     uid = _register(client)
     assert client.post(
@@ -139,7 +151,9 @@ def test_a_superseded_manual_row_is_not_replaced_by_an_invention(client):
     rows = db.ftp_history_list(uid)
     assert [r["source"] for r in rows] == ["manual"]
     assert rows[0]["ftp_watts"] == pytest.approx(275.0)
-    # The override is cleared, so a real estimate will win as soon as one lands.
+    # The override is cleared. That does NOT mean a later estimate overwrites
+    # the row (see the docstring) - it means nothing is pinned in settings, and
+    # the rider's own history row is what current_ftp resolves.
     assert db.get_user_settings(uid)["ftp"] is None
     # And the wizard reports what the rider will actually get.
     assert importer.current_ftp(uid) == pytest.approx(payload["ftp"])
