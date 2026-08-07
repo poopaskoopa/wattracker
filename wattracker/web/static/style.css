@@ -701,13 +701,19 @@ button.danger.link-btn { border: none; color: var(--alert); }
     gap: 0.75rem; margin-bottom: 0.7rem; }
 .ride-variant-heading h3 { margin: 0.2rem 0 0; }
 .ride-variant-heading .hint { margin: 0.2rem 0 0; text-align: right; }
-.ride-variant-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(148px, 1fr));
-    gap: 0.65rem; }
-.ride-variant-card { display: flex; min-width: 0; flex-direction: column; align-items: stretch;
-    gap: 0.4rem; padding: 0.55rem; border: 1px solid var(--surface-border);
+/* One shape per ROW. These were auto-fit columns at a 148px minimum, which put
+   four choices side by side and squeezed every one of them: the title
+   ellipsised, the description clamped to nothing useful, and the thumbnail's
+   own axis labels collapsed into a run of digits. A workout choice is a
+   list item, not a tile - it is read left to right, thumbnail then name. */
+.ride-variant-grid { display: flex; flex-direction: column; gap: 0.5rem; }
+.ride-variant-card { display: flex; min-width: 0; flex-direction: row; align-items: center;
+    gap: 0.7rem; padding: 0.55rem 0.7rem; border: 1px solid var(--surface-border);
     border-radius: var(--r-sm); background: var(--surface-inset); color: var(--text);
     text-align: left; cursor: pointer; transition: border-color 120ms ease, background 120ms ease;
     font: inherit; }
+.ride-variant-card-body { display: flex; min-width: 0; flex: 1 1 auto;
+    flex-direction: column; gap: 0.15rem; }
 .ride-variant-card:hover { border-color: var(--accent); background: var(--surface-2); filter: none; }
 .ride-variant-card:focus-visible { outline: 3px solid var(--accent); outline-offset: 2px; }
 .ride-variant-card[aria-selected="true"] { border-color: var(--accent); background: color-mix(in srgb, var(--accent) 13%, var(--surface-inset));
@@ -720,13 +726,19 @@ button.danger.link-btn { border: none; color: var(--alert); }
     font-size: 1.15rem; line-height: 1; }
 .ride-variant-card-title { overflow: hidden; color: var(--text-bright); font-size: 0.87rem;
     font-weight: 700; text-overflow: ellipsis; white-space: nowrap; }
-.ride-variant-card-graph { overflow: hidden; margin: 0.1rem -0.15rem 0; border-radius: 0.25rem;
-    background: var(--panel); }
-.ride-variant-card-graph .profile-svg { display: block; width: 100%; height: 86px; }
-.ride-variant-card-meta, .ride-variant-card-note { display: block; font-size: 0.72rem; line-height: 1.3; }
-.ride-variant-card-meta { color: var(--accent); font-weight: 700; }
+/* Fixed-width thumbnail beside the text rather than a full-bleed banner above
+   it, so the eye runs shape -> name on one line. */
+.ride-variant-card-graph { flex: 0 0 5.5rem; height: 2.75rem; overflow: hidden;
+    border-radius: 0.25rem; background: var(--panel); }
+/* One step between the two text lines, not two. They were both 0.72rem but sat
+   against a 0.87rem bold title with a 1.15rem glyph, so four sizes stacked in a
+   card narrower than a business card. */
+.ride-variant-card-meta, .ride-variant-card-note { display: block; font-size: 0.74rem;
+    line-height: 1.35; }
+.ride-variant-card-meta { color: var(--muted); font-weight: 600; font-variant-numeric: tabular-nums; }
 .ride-variant-card-note { overflow: hidden; color: var(--muted); display: -webkit-box;
-    -webkit-box-orient: vertical; -webkit-line-clamp: 2; }
+    -webkit-box-orient: vertical; -webkit-line-clamp: 1; }
+.ride-variant-card[aria-selected="true"] .ride-variant-card-meta { color: var(--accent); }
 .ride-preview { background: var(--panel); border-radius: var(--r-md);
     padding: 0.8rem; margin-bottom: 0.8rem; }
 .ride-preview[hidden] { display: none; }
@@ -742,7 +754,8 @@ button.danger.link-btn { border: none; color: var(--alert); }
     .ride-variant-heading .hint { text-align: left; }
 }
 @media (max-width: 420px) {
-    .ride-variant-grid { grid-template-columns: 1fr; }
+    /* The rows already stack; just give the thumbnail less of a narrow screen. */
+    .ride-variant-card-graph { flex-basis: 4rem; }
 }
 .device-list table { margin: 0.5rem 0; }
 .device-address { display: block; color: var(--muted); overflow-wrap: anywhere; }

@@ -755,9 +755,9 @@
         short_recovery: "⋮",
         recovery_waves: "≋"
     };
-    function profileSvgNode(profile, duration, ftp, className) {
+    function profileSvgNode(profile, duration, ftp, className, opts) {
         if (!profile || !profile.length || !window.profileSvg) return null;
-        var svgText = window.profileSvg(profile, duration, ftp);
+        var svgText = window.profileSvg(profile, duration, ftp, opts);
         if (!svgText) return null;
         var parsed = new DOMParser().parseFromString(svgText, "image/svg+xml");
         if (!parsed.documentElement || parsed.documentElement.nodeName.toLowerCase() !== "svg") {
@@ -863,6 +863,19 @@
             card.setAttribute("aria-label", (option.name || key) +
                 (key === wanted ? ", selected" : ""));
 
+            // Shape first, then the words. The thumbnail is drawn bare - no
+            // axes, ticks or captions - because at this size a label is not
+            // small text, it is noise between the other text.
+            var graph = profileSvgNode(option.profile, option.duration_s, option.ftp,
+                "ride-variant-card-graph", {bare: true});
+            if (graph) {
+                graph.setAttribute("aria-hidden", "true");
+                card.appendChild(graph);
+            }
+
+            var body = document.createElement("span");
+            body.className = "ride-variant-card-body";
+
             var heading = document.createElement("span");
             heading.className = "ride-variant-card-heading";
             var glyph = document.createElement("span");
@@ -874,23 +887,21 @@
             title.className = "ride-variant-card-title";
             title.textContent = option.name || "Workout shape";
             heading.appendChild(title);
-            card.appendChild(heading);
-
-            var graph = profileSvgNode(option.profile, option.duration_s, option.ftp,
-                "ride-variant-card-graph");
-            if (graph) card.appendChild(graph);
+            body.appendChild(heading);
 
             var meta = document.createElement("span");
             meta.className = "ride-variant-card-meta";
-            meta.textContent = ((data.type_info || {}).zone || "Training focus") +
-                " · " + fmtClock(option.duration_s) + " · TSS " +
+            meta.textContent = fmtClock(option.duration_s) + " · TSS " +
                 (option.estimated_tss == null ? "—" : option.estimated_tss);
-            card.appendChild(meta);
+            body.appendChild(meta);
 
             var note = document.createElement("span");
             note.className = "ride-variant-card-note";
+            // The zone is already stated once above the picker, so it is not
+            // repeated on every row.
             note.textContent = option.description || "A different way to complete the same focus.";
-            card.appendChild(note);
+            body.appendChild(note);
+            card.appendChild(body);
 
             card.addEventListener("click", function () {
                 if (card.disabled) return;

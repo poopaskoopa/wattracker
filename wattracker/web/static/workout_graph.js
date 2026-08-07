@@ -24,9 +24,26 @@
 
     // Target-power LINE graph over the whole workout (x = time into workout,
     // y = target watts; flat steps for constant blocks, slopes for ramps).
-    function profileSvg(profile, totalS, ftp) {
+    // `opts.bare` draws the SHAPE only - no gridlines, ticks, axis labels or
+    // FTP caption. It is for the thumbnail beside a workout choice, where the
+    // job is "recognise this shape at a glance", not "read a value off it".
+    //
+    // Shrinking the full chart instead does not work: label font sizes are in
+    // viewBox USER UNITS, so they scale with the box. At card width the watt
+    // ticks, the minute ticks and the FTP caption all collapse into each other
+    // and read as one run of digits at assorted sizes. Removing them is the
+    // fix; there is no size at which they are legible in a 150px-wide box.
+    function profileSvg(profile, totalS, ftp, opts) {
         if (!profile || !profile.length || !totalS) return "";
+        var bare = !!(opts && opts.bare);
         var W = 560, H = 200, padL = 46, padR = 12, padT = 12, padB = 26;
+        if (bare) {
+            // Near-zero padding: the shape should fill the thumbnail. A little
+            // vertical room stops a max-effort block clipping at the top edge.
+            // 2:1 so the viewBox matches the thumbnail box exactly and the
+            // shape neither letterboxes nor distorts.
+            W = 240; H = 120; padL = 2; padR = 2; padT = 8; padB = 2;
+        }
         var plotW = W - padL - padR, plotH = H - padT - padB;
         var ftpW = Number(ftp), hasFtp = Number.isFinite(ftpW) && ftpW > 0;
         var maxW = hasFtp ? ftpW : 0;
@@ -41,20 +58,38 @@
         var totalMin = totalS / 60;
         var xStep = [5, 10, 15, 30, 60, 120].find(function (s) { return totalMin / s <= 8; }) || 120;
 
-        var svg = '<svg viewBox="0 0 ' + W + ' ' + H + '" class="profile-svg" role="img" ' +
+        // Size via ATTRIBUTES, not a stylesheet rule. These nodes are parsed
+        // with DOMParser and imported, and the .profile-svg CSS does not reach
+        // them - measured: they compute to display:inline/width:auto. The full
+        // preview happens to get a box from its container anyway; a fixed-size
+        // thumbnail does not, and collapses to 0x0.
+        // The xmlns is REQUIRED. Callers parse this with DOMParser as
+        // "image/svg+xml", and XML parsing does not infer namespaces the way
+        // the HTML parser does: without it the root lands with a null
+        // namespace, so the browser builds plain unknown Elements instead of
+        // SVGSVGElement. Nothing renders as a graph, no .profile-svg CSS
+        // applies, and the <text>/<title> contents get laid out as ordinary
+        // inline HTML - which is what made a workout card read as one run of
+        // digits and words at assorted sizes.
+        var svg = '<svg xmlns="http://www.w3.org/2000/svg" ' +
+                  'viewBox="0 0 ' + W + ' ' + H + '" class="profile-svg' +
+                  (bare ? ' profile-svg-bare" width="100%" height="100%' : '') +
+                  '" role="img" ' +
                   'aria-label="Target power over workout time">';
-        // horizontal gridlines + y labels (watts)
-        for (var w = 0; w <= yMax; w += yStep) {
-            svg += '<line x1="' + padL + '" y1="' + y(w) + '" x2="' + (W - padR) +
-                   '" y2="' + y(w) + '" class="pf-grid"/>' +
-                   '<text x="' + (padL - 5) + '" y="' + y(w) + '" class="pf-ylab">' + w + '</text>';
-        }
-        // x ticks + labels (minutes)
-        for (var mn = 0; mn <= totalMin + 0.001; mn += xStep) {
-            var t = Math.min(mn * 60, totalS);
-            svg += '<line x1="' + x(t) + '" y1="' + (H - padB) + '" x2="' + x(t) +
-                   '" y2="' + (H - padB + 4) + '" class="pf-grid"/>' +
-                   '<text x="' + x(t) + '" y="' + (H - 8) + '" class="pf-xlab">' + Math.round(mn) + 'm</text>';
+        if (!bare) {
+            // horizontal gridlines + y labels (watts)
+            for (var w = 0; w <= yMax; w += yStep) {
+                svg += '<line x1="' + padL + '" y1="' + y(w) + '" x2="' + (W - padR) +
+                       '" y2="' + y(w) + '" class="pf-grid"/>' +
+                       '<text x="' + (padL - 5) + '" y="' + y(w) + '" class="pf-ylab">' + w + '</text>';
+            }
+            // x ticks + labels (minutes)
+            for (var mn = 0; mn <= totalMin + 0.001; mn += xStep) {
+                var t = Math.min(mn * 60, totalS);
+                svg += '<line x1="' + x(t) + '" y1="' + (H - padB) + '" x2="' + x(t) +
+                       '" y2="' + (H - padB + 4) + '" class="pf-grid"/>' +
+                       '<text x="' + x(t) + '" y="' + (H - 8) + '" class="pf-xlab">' + Math.round(mn) + 'm</text>';
+            }
         }
         // One closed fill per prescribed segment, classified by its average
         // target. A missing FTP retains the neutral base fill.
@@ -90,12 +125,16 @@
             });
         });
         if (line) svg += '<path d="' + line.trim() + '" class="pf-line"/>';
-        // dashed FTP reference
+        // dashed FTP reference. The line survives in bare mode - it is what
+        // makes the shape readable as "above/below threshold" - but its caption
+        // does not: the number is already stated in the card's own text.
         if (hasFtp && ftpW <= yMax) {
             svg += '<line x1="' + padL + '" y1="' + y(ftpW) + '" x2="' + (W - padR) +
-                   '" y2="' + y(ftpW) + '" class="pf-ftp"/>' +
-                   '<text x="' + (W - padR - 2) + '" y="' + (parseFloat(y(ftpW)) - 3) +
-                   '" class="pf-ftplab">FTP ' + Math.round(ftpW) + 'W</text>';
+                   '" y2="' + y(ftpW) + '" class="pf-ftp"/>';
+            if (!bare) {
+                svg += '<text x="' + (W - padR - 2) + '" y="' + (parseFloat(y(ftpW)) - 3) +
+                       '" class="pf-ftplab">FTP ' + Math.round(ftpW) + 'W</text>';
+            }
         }
         // Untargeted blocks (sprints) are shaded rather than read as a power
         // step: the plotted watts there are only the resistance the trainer
@@ -106,8 +145,13 @@
                    Math.max(1, (plotW * (b.end - b.start) / totalS)).toFixed(1) +
                    '" height="' + plotH + '" class="pf-free"/>';
         });
-        // hover targets: one transparent rect per block with a native tooltip
-        profile.forEach(function (b) {
+        // hover targets: one transparent rect per block with a native tooltip.
+        // Not in bare mode. These <title> nodes are real text in the accessible
+        // tree, so inside a button they get read out as part of its name and
+        // flattened into its text content - they were a large part of the
+        // run-together string the card used to show. The card's own label and
+        // the full preview below carry this detail.
+        if (!bare) profile.forEach(function (b) {
             var label = fmtDur(b.start) + '–' + fmtDur(b.end) + ' · ' +
                 (b.free
                     ? 'max effort — no target'
