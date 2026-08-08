@@ -55,10 +55,18 @@ class ActivityListing:
     it. ``exists`` distinguishes "no Zwift folder here" from "folder is empty".
 
     ``skipped`` counts files that are present but deliberately not offered -
-    Zwift's in-progress recording buffer, and anything that vanished or turned
-    unreadable between listing and stat. They are filtered on the machine that
-    owns them (so a remote backend never ships them over the wire), but the
-    scan still reports them, so the count has to travel separately.
+    Zwift's in-progress recording buffer, anything that vanished or turned
+    unreadable between listing and stat, and (remote only) a ``.fit`` that
+    resolves out of the folder, which is how a symlinked Activities folder
+    looks. They are filtered on the machine that owns them (so a remote backend
+    never ships them over the wire), but the scan still reports them, so the
+    count has to travel separately.
+
+    It stays separate all the way to the UI, as ``not_offered``: folded into
+    the scan's own ``skipped`` it was rendered as "N duplicate(s) skipped",
+    which tells a rider whose files are symlinks that every one of them is a
+    duplicate. The machine that skipped the file is the only one that knows
+    which file it was, and it says so in its log.
     """
 
     directory: Optional[str]
@@ -135,7 +143,7 @@ class Backend(abc.ABC):
 
     @abc.abstractmethod
     def validate_dir(
-        self, value: str, require_exists: bool = True
+        self, value: str, require_exists: bool = True, scope: str = ""
     ) -> Tuple[Optional[str], Optional[str]]:
         """Validate a user-submitted folder path against the trusted roots.
 
@@ -144,12 +152,21 @@ class Backend(abc.ABC):
         path - validating a client path against the server's roots would be
         meaningless.
 
-        Two separable checks. Containment under a trusted root is the security
-        control and always applies. Existence is a usability check, and the
-        rescan route turns it off (``require_exists=False``) because pointing
-        a scan at a folder that is not there is a normal thing to do by
-        mistake, and it answers that with a "no such folder" status rather
+        Three separable checks. Containment under a trusted root is the
+        security control and always applies. Existence is a usability check,
+        and the rescan route turns it off (``require_exists=False``) because
+        pointing a scan at a folder that is not there is a normal thing to do
+        by mistake, and it answers that with a "no such folder" status rather
         than an error.
+
+        ``scope`` names the settings field the value was typed into
+        (``"activities"`` / ``"workouts"``) and is answered by whatever will
+        later act on that field, so a value cannot be accepted here and ignored
+        there. It changes nothing in local mode, where the rider typed the path
+        on the machine it describes and containment IS the whole rule. It
+        matters in a split install, where the folder must additionally be one
+        the connector will act on for that field - a path that arrived over RPC
+        is confined to the folder it is for, not to the connector's $HOME.
         """
 
     @abc.abstractmethod

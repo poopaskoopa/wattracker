@@ -73,23 +73,61 @@ assuming a well-behaved peer. This is a deliberate decision, not an accident
 of implementation, and it is what the checks in `wattracker_connector/
 handlers.py` are for:
 
-- **Folders the server names** clear this machine's trusted roots before
-  anything acts on them (`paths.confine_storage_dir`, the one rule for a
-  submitted path). Folders the connector discovered under a root it already
-  trusts take the lenient final-component rule (`confine_detected_dir`)
-  instead - that split is by provenance, and a path that arrived over RPC is
-  always *submitted*, never *discovered*.
-- **`activities.read` is not a file-read primitive.** It serves only what
-  `activities.list` offered: a `.fit` sitting directly in the resolved
-  Activities folder, never Zwift's in-progress buffer, symlinks resolved
-  before either test. One predicate (`_in_scope`) is applied by both, so the
-  listing and the read cannot disagree.
-- **`workouts.sync` is a write-and-delete primitive**, so both halves are
-  guarded. A `remove` entry must be a bare filename. A `write` entry's `date`
-  must be a bare `YYYY-MM-DD` - it leads the `.zwo` filename, so an absolute
-  or traversing date was an arbitrary-path write with no `..` required.
-  `zwo.plan_filename` sanitises both halves and `zwo.write_plan_to_zwift`
-  refuses any name that is not one path component, independently of it.
+**A path that arrived over RPC is confined to the folder it is FOR, not to
+`$HOME`.** That is the rule the rest of this section applies, and it is the
+general form of four findings that were first fixed one field at a time.
+`paths.confine_storage_dir` - the whole home directory plus the Zwift roots -
+is the right rule for a folder the rider typed into their own Settings form on
+the machine it describes. It is the wrong rule for a folder an unauthenticated
+peer named, because it treats the entire home directory as one trust domain:
+every field hardened that way is still a primitive over everything else in it.
+Each RPC therefore measures a submitted path against the folders its own
+operation is defined on:
+
+- **Folders the server names** clear this machine's trusted roots
+  (`paths.confine_storage_dir`, the one rule for a submitted path) *and* the
+  scope of the operation - see the two entries below. Folders the connector
+  discovered under a root it already trusts take the lenient final-component
+  rule (`confine_detected_dir`) instead; that split is by provenance, and a
+  path that arrived over RPC is always *submitted*, never *discovered*.
+- **`activities.read` is not a file-read primitive, and `activities.list` is
+  not an oracle.** The folder must be one of this machine's own Activities
+  folders (`handlers.activities_scope`: what the connector was configured
+  with, plus what it discovered), and the file must be one the listing
+  offered - a `.fit` sitting directly in that folder, never Zwift's in-progress
+  buffer, symlinks resolved before either test. One predicate (`_in_scope`) is
+  applied by both, so the listing and the read cannot disagree. Confining the
+  file within the folder while the peer still chose the folder left any `.fit`
+  under `$HOME` readable by naming its parent, and made the listing answer as a
+  directory-existence and symlink-target probe for the rest; an out-of-scope
+  folder now answers identically whether or not it exists.
+
+  The consequence is deliberate: on a split install an Activities folder in an
+  unusual place is configured on the connector (`--activities-dir`), by the
+  person sitting at that machine. The web UI can choose between the folders the
+  connector reports and cannot name one of its own. It says so when a folder is
+  saved rather than accepting one and then quietly scanning nothing -
+  `paths.validate_dir` takes the field name and answers with the rule that
+  field will be judged by in use.
+- **`workouts.sync` is a write-and-delete primitive**, so the folder and both
+  halves are guarded. The folder must be a Zwift Workouts folder
+  (`paths.within_workouts_roots`), not merely somewhere under a trusted root,
+  or the sync is refused as `blocked` - as `$HOME`, `remove` deleted any file
+  the peer named in it and `write`, which creates its target, planted files in
+  folders like `~/.config/autostart` that it brought into being. A `remove`
+  entry must be a bare filename *and* a `.zwo`: inside the Zwift folder that is
+  the rider's own workout data, and "bare filename" alone still empties it of
+  everything else. A `write` entry's `date` must be a bare `YYYY-MM-DD` - it
+  leads the `.zwo` filename, so an absolute or traversing date was an
+  arbitrary-path write with no `..` required. `zwo.plan_filename` sanitises
+  both halves and `zwo.write_plan_to_zwift` refuses any name that is not one
+  path component, independently of it.
+
+The narrow rule stops at the RPC boundary. `LocalBackend` keeps
+`confine_storage_dir` alone, because in a single-machine install there is no
+untrusted peer and the rider is entitled to point the app at their own folders;
+adding the narrower rule there would refuse Zwift layouts this app has always
+supported and protect nothing.
 
 What keeps the same-UID argument behind `confine_detected_dir` intact under
 this architecture: the container never sees the Zwift folder. `docker-compose.

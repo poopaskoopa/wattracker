@@ -716,7 +716,7 @@ def test_poisoned_workouts_dir_blocks_the_plan_export_route(client, escape_dir):
     r = client.post(f"/plan/{plan_id}/export")
 
     assert r.status_code == 200
-    assert "outside your home directory" in r.text
+    assert "will not write to that folder" in r.text
     assert '<a href="/settings">' in r.text
     assert "Exported 1 .zwo" not in r.text  # never claims a bogus success
     assert not os.path.exists(os.path.dirname(escape_dir))
@@ -1111,25 +1111,40 @@ def test_an_upload_cannot_claim_to_be_an_in_app_ride(client, monkeypatch):
     ``db.IN_APP_FILENAME_SQL`` reads that column: 'Ride <date> ...' WITHOUT a
     .fit extension means the ride was recorded in-app. An upload is not, so it
     must not be able to take that shape.
+
+    The invariant is "ends in .fit", and it has to be, because the first fix
+    here required only SOME extension: 'Ride <date> x.gpx' and 'Ride <date> x.'
+    both sailed through it and both classify as in-app, in the SQL and in
+    is_in_app_activity alike. The two classifiers agreed with each other and
+    were both wrong, which is why this asserts on the stored name as well as on
+    what the classifiers make of it.
     """
     from wattracker.ingest import importer
 
-    monkeypatch.setattr(
-        importer, "parse_fit",
-        lambda path: {
-            "start_time": "2026-06-01T10:00:00", "duration_s": 1800,
+    minute = [0]
+
+    def _parsed(path):
+        minute[0] += 1
+        return {
+            "start_time": f"2026-06-01T10:{minute[0]:02d}:00", "duration_s": 1800,
             "streams": {"time": [None] * 1800, "power": [200.0] * 1800},
-        },
-    )
+        }
+
+    monkeypatch.setattr(importer, "parse_fit", _parsed)
     _register(client)
     uid = db.get_user_by_username("tester")["id"]
 
-    activity_id = importer.ingest_upload(uid, "Ride 2026-06-01 09-00-00", b"x")
-    assert activity_id is not None
-    stored = db.get_activity(uid, activity_id)
-    assert stored["filename"].endswith(".fit")
-    # Both classifiers - the Python one and the SQL the migrations run.
-    assert importer.is_in_app_activity(stored["filename"]) is False
+    for uploaded in (
+        "Ride 2026-06-01 09-00-00",    # no extension at all
+        "Ride 2026-06-01 09-00-00.gpx",  # an extension, but not .fit
+        "Ride 2026-06-01 09-00-00.",   # an extension splitext does not see
+    ):
+        activity_id = importer.ingest_upload(uid, uploaded, b"x")
+        assert activity_id is not None, uploaded
+        stored = db.get_activity(uid, activity_id)
+        assert stored["filename"].endswith(".fit"), uploaded
+        # Both classifiers - the Python one and the SQL the migrations run.
+        assert importer.is_in_app_activity(stored["filename"]) is False, uploaded
     conn = db.connect(None)
     try:
         matched = conn.execute(

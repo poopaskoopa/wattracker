@@ -158,6 +158,7 @@ def _start_user_scan(user_id: int, directory: Optional[str]) -> Optional[dict]:
             "processed": 0,
             "imported": 0,
             "skipped": 0,
+            "not_offered": 0,
             "error": None,
             "finished_at": None,
             "ftp_estimate": None,
@@ -181,6 +182,7 @@ def _start_user_scan(user_id: int, directory: Optional[str]) -> Optional[dict]:
                     found=result.get("found", 0),
                     imported=result.get("imported", 0),
                     skipped=result.get("skipped", 0),
+                    not_offered=result.get("not_offered", 0),
                     directory=d,
                     exists=bool(result.get("exists")),
                     ftp_estimate=(
@@ -1841,7 +1843,9 @@ def create_app() -> FastAPI:
             # the scan status ("exists": false), which is the more useful
             # response and what the page already renders. Containment under a
             # trusted root is the part that must not be skippable.
-            clean, error = _validate_dir(posted, uid, require_exists=False)
+            clean, error = _validate_dir(
+                posted, uid, require_exists=False, scope="activities"
+            )
             if error:
                 return JSONResponse({"error": error}, status_code=400)
             posted = clean or posted
@@ -3167,7 +3171,8 @@ def create_app() -> FastAPI:
         )
 
     def _validate_dir(
-        value: str, uid: Optional[int] = None, require_exists: bool = True
+        value: str, uid: Optional[int] = None, require_exists: bool = True,
+        scope: str = "",
     ) -> "tuple[Optional[str], Optional[str]]":
         """Validate a user-supplied folder path against the trusted roots.
 
@@ -3175,8 +3180,15 @@ def create_app() -> FastAPI:
         that owns the path: in a server/client install these are the *client's*
         folders, and measuring them against the container's home directory
         would reject every legitimate answer.
+
+        ``scope`` names the field, so the machine that owns the path answers
+        with the rule that will govern it in use. Without it a split install
+        accepts an activities folder here and then declines to scan it, which
+        is a saved setting that does nothing.
         """
-        return get_backend(uid).validate_dir(value, require_exists=require_exists)
+        return get_backend(uid).validate_dir(
+            value, require_exists=require_exists, scope=scope
+        )
 
     @app.get("/settings", response_class=HTMLResponse)
     def settings_page(request: Request):
@@ -3225,11 +3237,15 @@ def create_app() -> FastAPI:
         # Confine user-supplied folders to existing directories under $HOME; a
         # rejected folder is dropped from the update (existing value kept).
         dir_msgs: List[str] = []
-        clean_activities, act_err = _validate_dir(activities_dir, uid)
+        clean_activities, act_err = _validate_dir(
+            activities_dir, uid, scope="activities"
+        )
         if act_err:
             dir_msgs.append(act_err)
             clean_activities = ""  # don't persist an invalid path
-        clean_workouts, wk_err = _validate_dir(workouts_dir, uid)
+        clean_workouts, wk_err = _validate_dir(
+            workouts_dir, uid, scope="workouts"
+        )
         if wk_err:
             dir_msgs.append(wk_err)
             clean_workouts = ""

@@ -90,7 +90,7 @@ class RemoteBackend(Backend):
         return result.get("directory"), str(result.get("reason") or "missing")
 
     def validate_dir(
-        self, value: str, require_exists: bool = True
+        self, value: str, require_exists: bool = True, scope: str = ""
     ) -> Tuple[Optional[str], Optional[str]]:
         # Empty means "unchanged" (the base contract), and answering that
         # needs no connector. Short-circuit before the RPC: settings_save
@@ -103,11 +103,14 @@ class RemoteBackend(Backend):
             return "", None
         # Otherwise runs on the connector: these are its folders, and measuring
         # them against the server's trusted roots would reject every valid
-        # answer.
+        # answer. ``scope`` travels with it so the connector answers with the
+        # rule it will actually enforce when the folder is used, rather than
+        # accepting a value its own handlers will later refuse.
         try:
             result = self._call(
                 "paths.validate_dir",
-                {"value": value, "require_exists": require_exists},
+                {"value": value, "require_exists": require_exists,
+                 "scope": scope},
             ) or {}
         except ConnectorUnavailable:
             # An offline connector is a *validation* answer, not a server
