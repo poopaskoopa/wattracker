@@ -687,19 +687,22 @@ def scan_activities(
     # value we asked for.
     directory = listing.directory
     if not listing.exists:
-        _report(total=0, processed=0, imported=0, skipped=0)
-        return {"found": 0, "imported": 0, "skipped": 0, "completed": 0,
-                "directory": directory, "exists": False}
+        _report(total=0, processed=0, imported=0, skipped=0, not_offered=0)
+        return {"found": 0, "imported": 0, "skipped": 0, "not_offered": 0,
+                "completed": 0, "directory": directory, "exists": False}
 
     ftp = current_ftp(user_id)
     imported_activity_ids: List[int] = []
 
-    # Files the backend declined to offer (Zwift's in-progress buffer, or one
-    # that vanished mid-listing) still count as found-and-skipped.
+    # Files the backend declined to offer (Zwift's in-progress buffer, one that
+    # vanished mid-listing, a .fit that resolves out of the folder) still count
+    # as found-and-skipped. They are also reported on their own, because they
+    # are not duplicates and saying so is the difference between a rider being
+    # told to look at their connector's log and being told nothing at all.
     found = listing.skipped
     skipped = listing.skipped
     _report(total=len(listing.files) + listing.skipped, processed=found,
-            imported=0, skipped=skipped)
+            imported=0, skipped=skipped, not_offered=listing.skipped)
 
     seen = db.seen_files(user_id)
     for entry in listing.files:
@@ -759,6 +762,9 @@ def scan_activities(
         "found": found,
         "imported": imported,
         "skipped": skipped,
+        # The subset of `skipped` the owning machine declined to offer, so the
+        # UI can stop calling a symlinked .fit a duplicate.
+        "not_offered": listing.skipped,
         "completed": completed,
         "directory": directory,
         # Reported by whoever owns the folder. The server cannot answer this
@@ -844,16 +850,21 @@ def ingest_upload(
     derived-state refresh once after all files have landed.
     """
     base = os.path.basename(filename or "upload.fit")
-    suffix = os.path.splitext(base)[1]
-    if not suffix:
+    if not base.lower().endswith(".fit"):
         # This name is now recorded on the activity row (it used to be the temp
         # file's), and db.IN_APP_FILENAME_SQL classifies on that column: a
         # 'Ride <date> ...' name WITHOUT a .fit extension means the ride was
         # recorded in-app. An upload is not, and the rider chooses this string,
         # so it must not be able to claim that shape.
+        #
+        # The invariant is "ends in .fit", not "has an extension". Requiring
+        # only an extension left the same hole open one character along:
+        # 'Ride 2026-01-01 x.gpx' and 'Ride 2026-01-01 x.' both have one, both
+        # were stored verbatim, and both are classified in-app by
+        # db.IN_APP_FILENAME_SQL and importer.is_in_app_activity alike - the
+        # two classifiers agreed with each other and were both wrong.
         base += ".fit"
-        suffix = ".fit"
-    tmp = tempfile.NamedTemporaryFile(delete=False, suffix=suffix)
+    tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".fit")
     try:
         tmp.write(content)
         tmp.flush()

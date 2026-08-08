@@ -50,7 +50,7 @@ class LocalBackend(Backend):
         return paths.resolve_export_dir(zwift_id, override)
 
     def validate_dir(
-        self, value: str, require_exists: bool = True
+        self, value: str, require_exists: bool = True, scope: str = ""
     ) -> Tuple[Optional[str], Optional[str]]:
         """Validate a user-supplied folder path.
 
@@ -61,6 +61,15 @@ class LocalBackend(Backend):
         returns a plain "not a directory". A submitted path has ONE confinement
         rule and it lives in ``paths``; a second copy of it is a second thing
         to keep in step, which is what this module claims not to be.
+
+        ``scope`` is accepted and ignored on purpose. It exists for the split
+        install, where a folder typed in the web UI is a path the *connector*
+        receives over RPC and must be confined to the folder it is for. Here
+        the rider typed it on the machine it describes, standing in front of
+        it, which is the case ``confine_storage_dir`` is the rule for; adding a
+        second, narrower rule would refuse Zwift installs this app has always
+        supported without protecting anything - there is no untrusted peer in
+        this configuration to protect against.
         """
         return paths.confine_storage_dir(value, must_exist=require_exists)
 

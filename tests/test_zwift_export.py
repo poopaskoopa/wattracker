@@ -241,7 +241,7 @@ def test_plan_export_button_reports_a_refused_folder_with_the_reason(client, tmp
     assert db.get_user_settings(uid)["workouts_dir"] == str(outside)
     r = client.post(f"/plan/{plan_id}/export")
     assert r.status_code == 200
-    assert "outside your home directory" in r.text and "/settings" in r.text
+    assert "will not write to that folder" in r.text and "/settings" in r.text
     assert os.listdir(outside) == []
 
 
@@ -403,7 +403,7 @@ def test_plan_creation_reports_a_refusal_instead_of_500(client, refusing_writer)
     r = client.post("/generate/plan", data=PLAN_FORM)
     assert r.status_code == 200
     assert "Auto-exported" not in r.text
-    assert "outside your home directory" in r.text  # the 'blocked' wording
+    assert "will not write to that folder" in r.text  # the 'blocked' wording
     uid = db.get_user_by_username("rider")["id"]
     assert len(db.list_plans(uid)) == 1
 

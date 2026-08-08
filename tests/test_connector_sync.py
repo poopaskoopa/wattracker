@@ -5,13 +5,14 @@ on top of them behave in server mode - including when no connector is there,
 which is the state a user will actually meet first.
 """
 import os
+import pathlib
 
 import pytest
 
 pytest.importorskip("httpx")
 from fastapi.testclient import TestClient  # noqa: E402
 
-from wattracker import connectorhub, db  # noqa: E402
+from wattracker import connectorhub, db, paths  # noqa: E402
 from wattracker.ingest import importer  # noqa: E402
 from wattracker.prescribe import zwo  # noqa: E402
 from wattracker.server import create_app  # noqa: E402
@@ -194,35 +195,40 @@ def test_reads_follow_the_folder_the_listing_actually_used(
 ):
     """The server's activities_dir override and the connector's own may differ.
 
-    Setting one in the web UI is exactly how they come to differ, and the two
-    RPCs have to agree about what is in scope. They did not: activities.list
-    honoured the server's folder while activities.read only ever checked the
-    connector's, so the listing offered files and then every read of them was
-    refused as "outside the activities folder" - a scan that found the ride and
-    imported nothing.
+    Picking a second Zwift install in the web UI is exactly how they come to
+    differ, and the two RPCs have to agree about what is in scope. They did
+    not: activities.list honoured the server's folder while activities.read
+    only ever checked the connector's, so the listing offered files and then
+    every read of them was refused as "outside the activities folder" - a scan
+    that found the ride and imported nothing.
+
+    The folder here is one the connector DISCOVERED for itself, which is what
+    the server may now choose between; an arbitrary folder under the
+    connector's home directory is a different test below.
     """
     monkeypatch.setenv("WATTRACKER_MODE", "server")
     redirect_home(monkeypatch, str(zwift_home.parent))
     monkeypatch.setattr(importer, "parse_fit", lambda path: _fake_parsed())
 
-    # A real folder on the connector's machine that is *not* its configured
-    # one; trusted because it is inside the home directory above.
-    elsewhere = tmp_path / "elsewhere"
-    elsewhere.mkdir()
-    (elsewhere / "ride.fit").write_bytes(b"dummy")
+    # A real Zwift Activities folder on the connector's machine that is not the
+    # one it was configured with - the second-install case.
+    other = zwift_home.parent / "Documents" / "Zwift" / "Activities"
+    other.mkdir(parents=True)
+    (other / "ride.fit").write_bytes(b"dummy")
 
     uid = _register(client)
     attached, config = attach_connector(client, uid, zwift_home)
-    assert config.activities_dir != str(elsewhere)
+    assert config.activities_dir != str(other)
+    assert str(other) in paths.candidate_activities_dirs()
 
     with attached:
         response = client.post(
-            "/activities/rescan", data={"activities_dir": str(elsewhere)}
+            "/activities/rescan", data={"activities_dir": str(other)}
         )
         assert response.status_code == 202
         status = _wait_done(client)
 
-    assert status["directory"] == str(elsewhere)
+    assert status["directory"] == str(other)
     assert status["exists"] is True
     assert status["imported"] == 1, "listed the file, then refused to read it"
     assert len(db.list_activities(uid)) == 1
@@ -460,3 +466,346 @@ def test_a_remove_filename_cannot_delete_outside_the_workouts_folder(
         resolution="direct", remove=["2026-07-07 Real.zwo"],
     ))
     assert result["removed"] == 1
+
+
+# ----------------------------------------- the folder, not just the filename
+#
+# B-1 and B-2 hardened what a server could name WITHIN a folder. The folder
+# itself was still the server's to choose, confined only to this machine's
+# trusted roots - which is the whole home directory. That is the right rule for
+# a path the rider typed into their own Settings form on the machine it
+# describes, and the wrong one for a path that arrived over a socket: a path
+# that arrived over RPC is confined to the folder it is FOR.
+
+
+def test_a_server_named_folder_cannot_turn_a_sync_into_a_delete_primitive(
+    zwift_home, monkeypatch, tmp_path
+):
+    """``remove`` joined a bare filename onto a folder the peer chose.
+
+    With $HOME as the confinement, that is every file the rider owns, one name
+    at a time - ``.ssh/authorized_keys``, ``.zshrc``, this year's tax return.
+    Sanitising the filename, which is what the previous round did, is worth
+    nothing while the directory it joins onto is the peer's to name.
+    """
+    import asyncio
+
+    from wattracker_connector.handlers import ConnectorConfig, build_handlers
+
+    home = zwift_home.parent
+    redirect_home(monkeypatch, str(home))
+    ssh = home / ".ssh"
+    ssh.mkdir()
+    key = ssh / "authorized_keys"
+    key.write_text("ssh-ed25519 AAAA rider@zwift")
+    taxes_dir = home / "Documents" / "taxes"
+    taxes_dir.mkdir(parents=True)
+    taxes = taxes_dir / "2025.pdf"
+    taxes.write_bytes(b"%PDF-1.7")
+    zshrc = home / ".zshrc"
+    zshrc.write_text("export PATH=...")
+    # A .zwo outside the Zwift folders, so the refusal cannot be the extension
+    # guard standing in for the folder rule.
+    autostart = home / ".config" / "autostart"
+    autostart.mkdir(parents=True)
+    planted = autostart / "pwn.zwo"
+    planted.write_text("<workout_file/>")
+
+    handlers = build_handlers(ConnectorConfig())
+    for folder, name in (
+        (ssh, "authorized_keys"),
+        (taxes_dir, "2025.pdf"),
+        (home, ".zshrc"),
+        (autostart, "pwn.zwo"),
+    ):
+        result = asyncio.run(handlers["workouts.sync"](
+            resolution="direct", override=str(folder), remove=[name],
+        ))
+        assert result["status"] == "blocked", folder
+        assert result["removed"] == 0, folder
+        assert result["directory"] is None, folder
+    assert key.exists() and taxes.exists() and zshrc.exists() and planted.exists()
+
+    # The settings page resolves through the same rule, so it cannot report a
+    # folder the sync would refuse.
+    assert asyncio.run(handlers["paths.resolve_export_dir"](
+        override=str(ssh)
+    )) == {"directory": None, "reason": "blocked"}
+
+
+def test_a_server_named_folder_cannot_be_created_outside_the_zwift_folders(
+    zwift_home, monkeypatch
+):
+    """The write half creates its target, so it reaches folders that do not exist.
+
+    ``write_plan_to_zwift`` makedirs() and the override is confined with
+    ``must_exist=False``, which made a server-named folder a way to plant a
+    file in ``~/.config/autostart`` or ``~/Library/LaunchAgents`` - directories
+    the rider does not have and the peer brings into being.
+    """
+    import asyncio
+
+    from wattracker_connector.handlers import ConnectorConfig, build_handlers
+
+    home = zwift_home.parent
+    redirect_home(monkeypatch, str(home))
+    handlers = build_handlers(ConnectorConfig())
+    workout = {"date": "2026-07-07", "name": "x", "zwo": "<workout_file/>"}
+
+    for folder in (
+        home / ".config" / "autostart",
+        home / "Library" / "LaunchAgents" / "made" / "up" / "tree",
+        home / ".ssh",
+    ):
+        result = asyncio.run(handlers["workouts.sync"](
+            resolution="direct", override=str(folder), write=[workout],
+        ))
+        assert result["status"] == "blocked", folder
+        assert result["exported"] == 0, folder
+        assert not folder.exists(), f"{folder} was created by the refusal"
+
+
+def test_a_zwift_workouts_folder_the_server_names_is_still_honoured(
+    zwift_home, monkeypatch
+):
+    """The guard is a filter, not a wall.
+
+    Choosing between player folders in the web UI is a real thing riders do,
+    and it is the reason the override travels at all. What changes is that the
+    choice is between Zwift Workouts folders rather than between every folder
+    on the machine.
+    """
+    import asyncio
+
+    from wattracker_connector.handlers import ConnectorConfig, build_handlers
+
+    home = zwift_home.parent
+    redirect_home(monkeypatch, str(home))
+    player = pathlib.Path(paths.export_workouts_roots()[0]) / "1234567"
+    player.mkdir(parents=True)
+
+    handlers = build_handlers(ConnectorConfig())
+    result = asyncio.run(handlers["workouts.sync"](
+        resolution="direct", override=str(player),
+        write=[{"date": "2026-07-07", "name": "VO2 5x4", "zwo": "<workout_file/>"}],
+    ))
+    assert result["status"] == "ok"
+    assert result["exported"] == 1
+    assert result["directory"] == str(player)
+    assert (player / "2026-07-07 VO2 5x4.zwo").exists()
+    assert asyncio.run(handlers["paths.resolve_export_dir"](
+        override=str(player)
+    ))["directory"] == str(player)
+
+
+@pytest.mark.skipif(os.name != "posix", reason="POSIX symlinks")
+def test_a_relocated_player_folder_is_still_a_zwift_workouts_folder(
+    zwift_home, monkeypatch
+):
+    """``mklink /J`` onto another drive is a supported Zwift layout.
+
+    So the scope check resolves ancestors and stops at the leaf, exactly as
+    ``confine_detected_dir`` does. Resolving the final component would refuse
+    the rider's own folder - the failure that made a resolver and a writer
+    disagree and reach two routes as a 500.
+    """
+    import asyncio
+
+    from wattracker_connector.handlers import ConnectorConfig, build_handlers
+
+    home = zwift_home.parent
+    redirect_home(monkeypatch, str(home))
+    root = pathlib.Path(paths.export_workouts_roots()[0])
+    elsewhere = home / "zwift-on-the-big-disk"
+    elsewhere.mkdir()
+    (root / "1234567").symlink_to(elsewhere)
+
+    handlers = build_handlers(ConnectorConfig())
+    result = asyncio.run(handlers["workouts.sync"](
+        resolution="direct", override=str(root / "1234567"),
+        write=[{"date": "2026-07-07", "name": "VO2 5x4", "zwo": "<workout_file/>"}],
+    ))
+    assert result["status"] == "ok"
+    assert (elsewhere / "2026-07-07 VO2 5x4.zwo").exists()
+
+
+def test_a_remove_entry_must_be_a_workout_this_sync_could_have_written(
+    zwift_home, monkeypatch
+):
+    """Inside the Workouts folder, the extension is the remaining guard.
+
+    A bare filename is not enough on its own: the folder it lands in is the
+    rider's own Zwift data, and a peer that can name any bare filename in it
+    can empty it of everything that is not a .zwo.
+    """
+    import asyncio
+
+    from wattracker_connector.handlers import ConnectorConfig, build_handlers
+
+    home = zwift_home.parent
+    redirect_home(monkeypatch, str(home))
+    workouts = zwift_home / "Workouts"
+    notes = workouts / "notes.txt"
+    notes.write_text("my intervals")
+    ride = workouts / "backup.fit"
+    ride.write_bytes(b"a real ride")
+    (workouts / "2026-07-07 Real.zwo").write_text("<workout_file/>")
+
+    handlers = build_handlers(ConnectorConfig(workouts_dir=str(workouts)))
+    result = asyncio.run(handlers["workouts.sync"](
+        resolution="direct",
+        # The last two are not filenames at all: one bad entry is an entry to
+        # skip, not a sync that dies and leaves the folder half-synced.
+        remove=["notes.txt", "backup.fit", "2026-07-07 Real", None, {"x": 1}],
+    ))
+    assert result["status"] == "ok"
+    assert result["removed"] == 0
+    assert notes.exists() and ride.exists()
+
+    # The workouts it did write are still removable, in either case.
+    result = asyncio.run(handlers["workouts.sync"](
+        resolution="direct", remove=["2026-07-07 Real.zwo"],
+    ))
+    assert result["removed"] == 1
+
+
+def test_activities_cannot_be_pointed_at_a_folder_the_connector_did_not_choose(
+    zwift_home, monkeypatch
+):
+    """The read side of the same bug: the FOLDER was the peer's to name.
+
+    ``_in_scope`` constrains the file within a folder, so with $HOME as the
+    folder rule any .fit anywhere under the rider's home was reachable by
+    naming its parent - and ``activities.list`` answered as a
+    directory-existence and symlink-target oracle for everything else.
+    """
+    import asyncio
+
+    from wattracker_connector.handlers import ConnectorConfig, build_handlers
+
+    home = zwift_home.parent
+    redirect_home(monkeypatch, str(home))
+    activities = zwift_home / "Activities"
+    (activities / "ride.fit").write_bytes(b"dummy")
+    secret = home / "secret.fit"
+    secret.write_bytes(b"a ride the rider did not put in Zwift")
+
+    handlers = build_handlers(ConnectorConfig(activities_dir=str(activities)))
+    with pytest.raises(ValueError):
+        asyncio.run(handlers["activities.read"](
+            path=str(secret), directory=str(home)
+        ))
+
+    # A folder that exists and one that does not answer identically, so the
+    # listing cannot be used to probe for either.
+    answers = [
+        asyncio.run(handlers["activities.list"](directory=str(probe)))
+        for probe in (home, home / "does-not-exist")
+    ]
+    for answer in answers:
+        assert answer["exists"] is False
+        assert answer["files"] == []
+        assert answer["skipped"] == 0
+
+    # The connector's own folder still works, so this is scope and not refusal.
+    assert [f["name"] for f in asyncio.run(handlers["activities.list"]())["files"]] \
+        == ["ride.fit"]
+
+
+def test_a_second_zwift_install_is_still_selectable(zwift_home, monkeypatch):
+    """What the server MAY name: one of this machine's own Activities folders.
+
+    Two installs on one PC is the case the override exists for, and the
+    candidates come from this machine's own discovery, so honouring them adds
+    nothing the server can reach on its own.
+    """
+    import asyncio
+
+    from wattracker_connector.handlers import ConnectorConfig, build_handlers
+
+    home = zwift_home.parent
+    redirect_home(monkeypatch, str(home))
+    other = home / "Documents" / "Zwift" / "Activities"
+    other.mkdir(parents=True)
+    (other / "other.fit").write_bytes(b"dummy")
+
+    handlers = build_handlers(
+        ConnectorConfig(activities_dir=str(zwift_home / "Activities"))
+    )
+    listing = asyncio.run(handlers["activities.list"](directory=str(other)))
+    assert listing["directory"] == str(other)
+    assert [f["name"] for f in listing["files"]] == ["other.fit"]
+    assert asyncio.run(handlers["activities.read"](
+        path=str(other / "other.fit"), directory=str(other)
+    ))["name"] == "other.fit"
+
+
+def test_the_web_ui_refuses_a_folder_the_connector_will_not_serve(
+    client, zwift_home, monkeypatch
+):
+    """A setting that is accepted and then ignored is worse than a refusal.
+
+    The connector answers the settings form with the rule it will enforce when
+    the folder is used, so a rider whose Zwift install is somewhere unusual is
+    told to configure it on the machine that holds it - which is where, under
+    this trust model, it can be configured at all.
+    """
+    monkeypatch.setenv("WATTRACKER_MODE", "server")
+    home = zwift_home.parent
+    redirect_home(monkeypatch, str(home))
+    elsewhere = home / "elsewhere"
+    elsewhere.mkdir()
+
+    uid = _register(client)
+    attached, _config = attach_connector(client, uid, zwift_home)
+    with attached:
+        rescan = client.post(
+            "/activities/rescan", data={"activities_dir": str(elsewhere)}
+        )
+        assert rescan.status_code == 400
+        assert "connector" in rescan.json()["error"]
+
+        saved = client.post(
+            "/settings",
+            data={"activities_dir": str(elsewhere), "workouts_dir": str(home)},
+        )
+        assert saved.status_code == 200
+        assert "connector" in saved.text
+
+    settings = db.get_user_settings(uid)
+    assert not settings.get("activities_dir")
+    assert not settings.get("workouts_dir")
+
+
+@pytest.mark.skipif(os.name != "posix", reason="POSIX symlinks")
+def test_a_file_the_connector_could_not_offer_is_not_reported_as_a_duplicate(
+    client, zwift_home, monkeypatch, caplog
+):
+    """The skip is deliberate; calling it a duplicate is not.
+
+    ``skipped`` travels to the server as a bare number and the page rendered it
+    as "N duplicate(s) skipped", so a rider whose Activities folder is full of
+    symlinks was told every one of their rides was already imported. The count
+    now travels on its own, and the only machine that knows WHICH file names it
+    in its log.
+    """
+    monkeypatch.setenv("WATTRACKER_MODE", "server")
+    redirect_home(monkeypatch, str(zwift_home.parent))
+    activities = zwift_home / "Activities"
+    secret = zwift_home.parent / "id_ed25519"
+    secret.write_text("PRIVATE KEY MATERIAL")
+    (activities / "sneaky.fit").symlink_to(secret)
+
+    uid = _register(client)
+    attached, _config = attach_connector(client, uid, zwift_home)
+    with attached, caplog.at_level("WARNING"):
+        assert client.post("/activities/rescan").status_code == 202
+        status = _wait_done(client)
+
+    assert status["found"] == 1
+    assert status["imported"] == 0
+    assert status["skipped"] == 1
+    assert status["not_offered"] == 1, "a skipped file read as a duplicate"
+    assert len(db.list_activities(uid)) == 0
+    assert any("sneaky.fit" in r.message for r in caplog.records), \
+        "the machine that skipped it is the only one that can name it"
