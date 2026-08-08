@@ -60,7 +60,8 @@ def test_connector_with_a_bad_token_is_refused(client):
     assert excinfo.value.code == 1008
 
 
-def test_a_revoked_token_stops_working(client):
+def test_a_revoked_token_cannot_open_a_new_connection(client):
+    """Named for what it actually covers. The live socket is the test below."""
     uid = _register(client)
     device_id, token = connectorauth.generate_token(uid, "Zwift PC")
     connectorauth.revoke(uid, device_id)
@@ -69,6 +70,62 @@ def test_a_revoked_token_stops_working(client):
             "/connector/ws", headers={"Authorization": f"Bearer {token}"}
         ) as ws:
             ws.receive_json()
+
+
+def test_revoking_a_device_cuts_the_socket_it_already_has(client, zwift_home):
+    """Revocation has to settle the connection that is open, not just the next.
+
+    Deleting the row stops the token *resolving*, which is everything about
+    the next connection and nothing about this one - and this one is
+    long-lived by design, so a revoked machine kept serving RPC until the
+    server happened to restart. Meanwhile the page told its owner the token no
+    longer worked. Stolen-laptop is the scenario the button exists for, so the
+    gap between what it says and what it does is the whole defect.
+
+    Revoking before connecting (the test above) is why this stayed green.
+    """
+    uid = _register(client)
+    attached, _config = attach_connector(client, uid, zwift_home)
+    with attached:
+        device_id = db.list_connector_devices(uid)[0]["id"]
+        assert connectorhub.is_attached(uid) is True
+
+        response = client.post(f"/settings/connector/{device_id}/revoke")
+        assert response.status_code == 200
+        assert db.list_connector_devices(uid) == []
+
+        # Not merely unable to reconnect - detached, and no longer callable.
+        assert connectorhub.is_attached(uid) is False
+        with pytest.raises(rpc.ConnectorUnavailable):
+            RemoteBackend(uid).default_activities_dir()
+
+
+def test_revoking_one_device_leaves_another_users_connector_attached(
+    client, zwift_home
+):
+    """The close is scoped to the session that IS the revoked device.
+
+    Two things could go wrong once revoke reaches the registry: closing
+    somebody else's connector, or closing this user's *replacement* device
+    because only the user id was matched.
+    """
+    uid = _register(client)
+    other = db.create_user("other", "hash")
+    attached, _config = attach_connector(client, uid, zwift_home)
+    with attached:
+        stale_device_id = connectorauth.generate_token(other, "Their PC")[0]
+        live_device_id = db.list_connector_devices(uid)[0]["id"]
+
+        # Revoking a device that is not the attached one changes nothing.
+        client.post(f"/settings/connector/{stale_device_id}/revoke")
+        assert connectorhub.is_attached(uid) is True
+
+        second_device_id = connectorauth.generate_token(uid, "Laptop")[0]
+        assert connectorhub.close_device(uid, second_device_id) is False
+        assert connectorhub.is_attached(uid) is True
+
+        assert connectorhub.close_device(uid, live_device_id) is True
+        assert connectorhub.is_attached(uid) is False
 
 
 def test_rejections_are_counted_but_never_refuse_a_valid_token(client):

@@ -843,7 +843,16 @@ def ingest_upload(
     ``refresh=False`` is used by callers that ingest a batch and perform the
     derived-state refresh once after all files have landed.
     """
-    suffix = os.path.splitext(filename)[1] or ".fit"
+    base = os.path.basename(filename or "upload.fit")
+    suffix = os.path.splitext(base)[1]
+    if not suffix:
+        # This name is now recorded on the activity row (it used to be the temp
+        # file's), and db.IN_APP_FILENAME_SQL classifies on that column: a
+        # 'Ride <date> ...' name WITHOUT a .fit extension means the ride was
+        # recorded in-app. An upload is not, and the rider chooses this string,
+        # so it must not be able to claim that shape.
+        base += ".fit"
+        suffix = ".fit"
     tmp = tempfile.NamedTemporaryFile(delete=False, suffix=suffix)
     try:
         tmp.write(content)
@@ -851,11 +860,7 @@ def ingest_upload(
         tmp.close()
         # Record the name the rider uploaded, not the temp file's - see
         # ingest_file's ``filename`` argument.
-        result = ingest_file(
-            user_id, tmp.name,
-            ftp=ftp,
-            filename=os.path.basename(filename or "upload.fit"),
-        )
+        result = ingest_file(user_id, tmp.name, ftp=ftp, filename=base)
         if refresh:
             evaluate_ftp(user_id)
             match_plan_completions(user_id)

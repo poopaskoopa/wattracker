@@ -31,7 +31,15 @@ def _parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument("--server", help="Server base URL, e.g. http://192.168.1.10:8000")
-    parser.add_argument("--token", help="Device token from the server's Settings page")
+    parser.add_argument(
+        "--token",
+        help=(
+            "Device token from the server's Settings page. Pass it once with "
+            "--save and omit it afterwards: an argument is visible to every "
+            "process on this machine (ps / Task Manager) and lands in shell "
+            "history, whereas the saved config file is written 0600"
+        ),
+    )
     parser.add_argument("--activities-dir", help="Override the Zwift Activities folder")
     parser.add_argument("--workouts-dir", help="Override the Zwift Workouts folder")
     parser.add_argument(

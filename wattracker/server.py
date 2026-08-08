@@ -3394,6 +3394,12 @@ def create_app() -> FastAPI:
         # someone else's machine. A miss is reported the same as a hit would
         # be if it were someone else's - there is nothing to learn either way.
         revoked = connectorauth.revoke(uid, device_id)
+        if revoked:
+            # Deleting the row settles the next connection; this settles the
+            # one that is open. Without it a revoked machine keeps serving RPC
+            # over its existing socket until the server restarts, while the
+            # page tells the owner the token no longer works.
+            connectorhub.close_device(uid, device_id)
         return templates.TemplateResponse(
             request, "settings.html",
             _settings_ctx(

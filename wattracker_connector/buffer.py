@@ -198,6 +198,25 @@ class RideBuffer:
         }
 
 
+def _no_redirect_opener():
+    """An opener that refuses to follow redirects, so the token stays put.
+
+    urllib replays every header on a redirect - ``Authorization`` included -
+    and does not care whether the new location is even the same host, so a
+    server answering this POST with a 302 elsewhere harvests the device token
+    in plaintext. The paired server has no legitimate reason to redirect an API
+    POST, so a 3xx surfaces as an HTTPError instead: that is a retryable code,
+    which means the buffered ride is kept rather than discarded.
+    """
+    import urllib.request
+
+    class _Refuse(urllib.request.HTTPRedirectHandler):
+        def redirect_request(self, req, fp, code, msg, headers, newurl):
+            return None
+
+    return urllib.request.build_opener(_Refuse)
+
+
 def upload_pending(server_url: str, token: str,
                    buffer: RideBuffer) -> Optional[int]:
     """POST a buffered ride, if there is one. Returns the activity id.
@@ -229,7 +248,7 @@ def upload_pending(server_url: str, token: str,
         method="POST",
     )
     try:
-        with urllib.request.urlopen(request, timeout=60) as response:
+        with _no_redirect_opener().open(request, timeout=60) as response:
             body = json.loads(response.read().decode("utf-8"))
     except urllib.error.HTTPError as exc:
         if 400 <= exc.code < 500 and exc.code != 429:

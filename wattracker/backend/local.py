@@ -54,35 +54,15 @@ class LocalBackend(Backend):
     ) -> Tuple[Optional[str], Optional[str]]:
         """Validate a user-supplied folder path.
 
-        Returns (clean_path, error). A folder is accepted only when its real
-        path remains under the user's home, OS-discovered Documents/Zwift
-        roots, or a process-owner environment override - and, unless
-        ``require_exists`` is False, when it exists and is a directory. This
-        admits redirected Windows Known Folders and OneDrive/UNC roots without
-        permitting arbitrary web-supplied system paths or symlink escapes.
-        Empty means "unchanged" (clean_path="", error=None).
+        Delegated, not reimplemented. This started life as a copy of
+        ``paths.confine_storage_dir`` and had already drifted from it: the copy
+        let ``os.path.realpath`` raise on an embedded NUL, which turned a
+        settings save containing one into a 500 where the single-machine app
+        returns a plain "not a directory". A submitted path has ONE confinement
+        rule and it lives in ``paths``; a second copy of it is a second thing
+        to keep in step, which is what this module claims not to be.
         """
-        raw = (value or "").strip()
-        if not raw:
-            return "", None
-        expanded = os.path.realpath(os.path.abspath(os.path.expanduser(raw)))
-        if require_exists and not os.path.isdir(expanded):
-            return None, f"Folder not found or not a directory: {raw}"
-        allowed = False
-        for root in paths.trusted_storage_roots():
-            resolved_root = os.path.realpath(os.path.abspath(os.path.expanduser(root)))
-            try:
-                if os.path.commonpath([expanded, resolved_root]) == resolved_root:
-                    allowed = True
-                    break
-            except ValueError:
-                continue  # Different Windows drives or UNC shares.
-        if not allowed:
-            return None, (
-                "Folder must be inside your home directory or a configured "
-                f"Zwift data directory: {raw}"
-            )
-        return expanded, None
+        return paths.confine_storage_dir(value, must_exist=require_exists)
 
     def confine_stored_dir(self, value: Optional[str]) -> Optional[str]:
         """These are this machine's folders, so measure them against its roots."""

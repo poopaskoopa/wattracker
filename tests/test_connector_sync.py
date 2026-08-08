@@ -4,6 +4,8 @@ test_backend_parity.py proves the two backends agree; this proves the routes
 on top of them behave in server mode - including when no connector is there,
 which is the state a user will actually meet first.
 """
+import os
+
 import pytest
 
 pytest.importorskip("httpx")
@@ -288,3 +290,173 @@ def test_the_connectors_own_folder_needs_no_blessing_from_trusted_roots(
             path=str(activities / "ride.fit"), directory=directory
         ))
         assert read["path"] == str(activities / "ride.fit")
+
+
+# ------------------------------------------- the connector's trust boundary
+#
+# The server is not authenticated to the connector: it proves nothing, and
+# whatever is attached to the socket is obeyed. The handlers therefore judge
+# what they are asked to do rather than assuming a well-behaved server, and
+# these drive them directly - a route in front would only prove the server is
+# being careful, which is not the case under test.
+
+
+def test_activities_read_only_serves_what_the_listing_offered(
+    zwift_home, monkeypatch, tmp_path
+):
+    """``activities.read`` is not a general file-read primitive.
+
+    It was: the check was containment under this machine's trusted roots,
+    which is $HOME plus the Zwift roots, and it never consulted the ``.fit``
+    filter that lives in the listing. So a server could list ~/.ssh and then
+    read the private key out of it - or read the connector's own config file,
+    which holds the device token in cleartext.
+    """
+    import asyncio
+
+    from wattracker_connector.handlers import ConnectorConfig, build_handlers
+
+    redirect_home(monkeypatch, str(zwift_home.parent))
+    activities = zwift_home / "Activities"
+    (activities / "ride.fit").write_bytes(b"dummy")
+    (activities / "connector.json").write_text('{"token": "s3cret"}')
+    (activities / "inprogressactivity.fit").write_bytes(b"live buffer")
+    nested = activities / "sub"
+    nested.mkdir()
+    (nested / "deep.fit").write_bytes(b"never offered")
+    ssh = zwift_home.parent / ".ssh"
+    ssh.mkdir()
+    (ssh / "id_ed25519").write_text("PRIVATE KEY MATERIAL")
+
+    handlers = build_handlers(ConnectorConfig(activities_dir=str(activities)))
+
+    # The listing offers exactly one file, and the read serves exactly that.
+    listing = asyncio.run(handlers["activities.list"]())
+    assert [f["name"] for f in listing["files"]] == ["ride.fit"]
+
+    for path, directory in (
+        (activities / "connector.json", None),      # not a .fit
+        (activities / "inprogressactivity.fit", None),  # never a finished ride
+        (nested / "deep.fit", None),                # contained, but not offered
+        (ssh / "id_ed25519", str(ssh)),             # a folder the server named
+    ):
+        with pytest.raises(ValueError):
+            asyncio.run(handlers["activities.read"](
+                path=str(path), directory=directory
+            ))
+    # Nothing above leaked, and the legitimate file still reads.
+    assert asyncio.run(handlers["activities.read"](
+        path=str(activities / "ride.fit")
+    ))["name"] == "ride.fit"
+
+
+@pytest.mark.skipif(os.name != "posix", reason="POSIX symlinks")
+def test_a_symlinked_fit_cannot_stand_in_for_another_file(
+    zwift_home, monkeypatch, tmp_path
+):
+    """A link is resolved before it is judged, by BOTH the listing and the read.
+
+    Otherwise the ``.fit`` filter is only a filter on the name, and anything
+    on this machine can be given a .fit name inside the Activities folder.
+    """
+    import asyncio
+
+    from wattracker_connector.handlers import ConnectorConfig, build_handlers
+
+    redirect_home(monkeypatch, str(zwift_home.parent))
+    activities = zwift_home / "Activities"
+    secret = zwift_home.parent / "id_ed25519"
+    secret.write_text("PRIVATE KEY MATERIAL")
+    (activities / "sneaky.fit").symlink_to(secret)
+
+    handlers = build_handlers(ConnectorConfig(activities_dir=str(activities)))
+    listing = asyncio.run(handlers["activities.list"]())
+    assert listing["files"] == []
+    assert listing["skipped"] == 1
+    with pytest.raises(ValueError):
+        asyncio.run(handlers["activities.read"](
+            path=str(activities / "sneaky.fit")
+        ))
+
+
+def test_a_manifest_date_cannot_write_outside_the_workouts_folder(
+    zwift_home, monkeypatch, tmp_path
+):
+    """The date leads the .zwo filename, and it arrives over the wire.
+
+    ``zwo.plan_filename`` interpolated it raw, which was safe only because
+    every caller read it from a plan row. Reachable from a remote manifest it
+    is an arbitrary-path write, and no ``..`` is even needed - an absolute
+    date suffices.
+    """
+    import asyncio
+
+    from wattracker_connector.handlers import ConnectorConfig, build_handlers
+
+    redirect_home(monkeypatch, str(zwift_home.parent))
+    workouts = zwift_home / "Workouts"
+    victim = zwift_home.parent / "victim"
+    victim.mkdir()
+
+    handlers = build_handlers(ConnectorConfig(workouts_dir=str(workouts)))
+    for hostile in (
+        "../../../../.config/autostart/pwn",
+        str(victim / "owned"),
+        "..\\..\\evil",
+        "2026-07-07/../../escape",
+    ):
+        result = asyncio.run(handlers["workouts.sync"](
+            resolution="direct",
+            write=[{"date": hostile, "name": "x", "zwo": "<workout_file/>"}],
+        ))
+        assert result["exported"] == 0, hostile
+        assert result["paths"] == [], hostile
+
+    assert list(victim.iterdir()) == []
+    assert list(workouts.iterdir()) == []
+
+    # A real date still exports, so the guard is a filter and not a wall.
+    ok = asyncio.run(handlers["workouts.sync"](
+        resolution="direct",
+        write=[{"date": "2026-07-07", "name": "VO2 5x4", "zwo": "<workout_file/>"}],
+    ))
+    assert ok["exported"] == 1
+    assert [p.name for p in workouts.iterdir()] == ["2026-07-07 VO2 5x4.zwo"]
+
+
+def test_a_remove_filename_cannot_delete_outside_the_workouts_folder(
+    zwift_home, monkeypatch
+):
+    """The ``remove`` guard, which nothing covered.
+
+    Replacing it with ``if False:`` left the whole suite passing. It is the
+    delete half of the same primitive as the write above, so it gets the same
+    treatment: a name with a separator in it is refused, not joined.
+    """
+    import asyncio
+
+    from wattracker_connector.handlers import ConnectorConfig, build_handlers
+
+    redirect_home(monkeypatch, str(zwift_home.parent))
+    workouts = zwift_home / "Workouts"
+    treasure = zwift_home / "Activities" / "keep.fit"
+    treasure.write_bytes(b"a real ride")
+    (workouts / "2026-07-07 Real.zwo").write_text("<workout_file/>")
+
+    handlers = build_handlers(ConnectorConfig(workouts_dir=str(workouts)))
+    result = asyncio.run(handlers["workouts.sync"](
+        resolution="direct",
+        remove=[
+            "../Activities/keep.fit",
+            "..\\Activities\\keep.fit",
+            str(treasure),
+        ],
+    ))
+    assert result["removed"] == 0
+    assert treasure.exists()
+
+    # A bare name still removes, so the guard is on the shape and not the act.
+    result = asyncio.run(handlers["workouts.sync"](
+        resolution="direct", remove=["2026-07-07 Real.zwo"],
+    ))
+    assert result["removed"] == 1

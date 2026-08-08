@@ -15,6 +15,7 @@ import base64
 import glob
 import logging
 import os
+import re
 from typing import Callable, Dict, List, Optional
 
 from wattracker import paths
@@ -30,6 +31,11 @@ MAX_ACTIVITY_BYTES = 50 * 1024 * 1024
 # collides with the eventual final .fit - filtered here so it is neither
 # transferred nor cached server-side.
 _IN_PROGRESS = "inprogressactivity.fit"
+
+# A plan workout's date, as it leads the exported .zwo filename. Held here as
+# well as in zwo.plan_filename because this end judges the manifest before
+# acting on it, rather than relying on the far end having done so.
+_ISO_DATE_RE = re.compile(r"\A\d{4}-\d{2}-\d{2}\Z")
 
 
 class ConnectorConfig:
@@ -93,6 +99,47 @@ def _within(directory: str, candidate: str) -> bool:
         return False  # different Windows drives, or an unresolvable path
 
 
+def _is_activity_file(name: str) -> bool:
+    """Whether a filename is one this connector will ever hand over.
+
+    A ``.fit``, and never Zwift's live recording buffer. It used to live only
+    inside ``activities.list``'s glob, which meant the read path enforced no
+    such thing: it checked containment and nothing else, so any file at all
+    under a folder the server named came back - an ssh key, or this
+    connector's own config file with the device token in it.
+    """
+    lowered = name.lower()
+    return lowered.endswith(".fit") and lowered != _IN_PROGRESS
+
+
+def _in_scope(directory: str, path: str) -> bool:
+    """Whether ``path`` is an activity file this connector will serve.
+
+    Applied by the listing AND the read, which is the point: the read used to
+    test containment alone, and containment is not the rule. The listing is a
+    non-recursive glob for ``.fit``, so being *somewhere under* the folder is
+    no evidence a file was ever on offer - it has to sit directly in it and be
+    an activity file.
+
+    Symlinks are resolved before both tests, so a ``.fit`` planted in the
+    Activities folder cannot stand in for something else. That does mean a
+    rider whose Activities folder is full of links to files kept elsewhere gets
+    nothing listed; they should point the connector at where the files actually
+    are. Visibly skipping such a file is the better failure - the alternative
+    is a listing and a read that disagree, which is a scan that re-offers the
+    same file and fails on it forever.
+    """
+    try:
+        root = os.path.realpath(os.path.abspath(directory))
+        resolved = os.path.realpath(os.path.abspath(path))
+    except (ValueError, OSError):
+        return False  # different Windows drives, or an unresolvable path
+    return (
+        os.path.dirname(resolved) == root
+        and _is_activity_file(os.path.basename(resolved))
+    )
+
+
 def build_handlers(config: ConnectorConfig) -> Dict[str, Callable]:
     """The method table this connector answers to."""
 
@@ -137,7 +184,7 @@ def build_handlers(config: ConnectorConfig) -> Dict[str, Callable]:
         skipped = 0
         for path in sorted(set(found)):
             name = os.path.basename(path)
-            if name.lower() == _IN_PROGRESS:
+            if not _in_scope(target, path):
                 skipped += 1
                 continue
             try:
@@ -156,14 +203,22 @@ def build_handlers(config: ConnectorConfig) -> Dict[str, Callable]:
                               directory: Optional[str] = None) -> dict:
         """Return one activity file's bytes, base64-encoded.
 
-        Confined to the Activities folder. The server chooses this path from a
-        listing this connector produced, so a path outside it means either a
-        bug or a server that should not be trusted with arbitrary local reads
-        - either way, refuse. ``directory`` is resolved by exactly the rule the
-        listing used, so the two can never disagree about what is in scope.
+        Confined to files the listing offered: an activity file sitting
+        directly in the resolved Activities folder, and nothing else. The
+        server chooses this path from a listing this connector produced, so
+        anything else means either a bug or a server that should not be trusted
+        with arbitrary local reads - either way, refuse. ``directory`` is
+        resolved by exactly the rule the listing used and the file is judged by
+        exactly the predicate the listing used (``_in_scope``), so the two
+        cannot disagree about what is in scope.
+
+        The weaker check this replaces was containment alone, which made this a
+        general file-read primitive over everything the server could name under
+        this machine's trusted roots - ``~/.ssh/id_ed25519`` and this
+        connector's own token file included.
         """
         target = _resolved_activities_dir(config, directory)
-        if not target or not _within(target, path):
+        if not target or not _in_scope(target, path):
             raise ValueError("path is outside the activities folder")
         if not os.path.isfile(path):
             raise FileNotFoundError(f"no such activity file: {path}")
@@ -209,10 +264,28 @@ def build_handlers(config: ConnectorConfig) -> Dict[str, Callable]:
                     "removed": 0, "reason": "missing", "paths": []}
 
         written: List[str] = []
-        if write:
+        # Same principle as the ``remove`` guard below, applied to the side
+        # that creates files rather than deletes them: the server derives each
+        # date from a plan row, but this end must not take that on trust. The
+        # date leads the filename, so a value like "/etc/cron.d/x" or
+        # "../../.config/autostart/pwn" made this an arbitrary-path write.
+        # zwo.plan_filename now sanitises it too - this refuses rather than
+        # quietly writing the mangled name, because a manifest entry that is
+        # not a date is not a workout anybody asked to export.
+        writable: List[dict] = []
+        for entry in write or []:
+            if not isinstance(entry, dict):
+                log.warning("refusing a workout that is not an object")
+            elif not _ISO_DATE_RE.match(str(entry.get("date") or "")):
+                log.warning("refusing a workout with a suspicious date %r",
+                            entry.get("date"))
+            else:
+                writable.append(entry)
+
+        if writable:
             try:
                 result = zwo.write_plan_to_zwift(
-                    write, zwift_id or "", workouts_override=effective_override
+                    writable, zwift_id, workouts_override=effective_override
                 )
             except paths.ExportTargetUnavailable as exc:
                 return {"status": exc.reason, "directory": None, "exported": 0,
@@ -256,25 +329,11 @@ def validate_dir(
 ) -> "tuple[Optional[str], Optional[str]]":
     """Validate a user-supplied folder against this machine's trusted roots.
 
-    Character-for-character the check the single-machine install runs in
-    ``backend/local.py``; it lives here as well because in a server/client
-    install the folders being judged are *these*, and the server's home
-    directory has no bearing on them.
+    The same check the single-machine install runs, because it IS the same
+    check - ``paths.confine_storage_dir``, the one place the rule for a
+    SUBMITTED path lives. It is invoked from here rather than from the server
+    because in a server/client install the folders being judged are *these*,
+    and the server's home directory has no bearing on them; the rule does not
+    change with the machine, only the roots it is measured against do.
     """
-    raw = (value or "").strip()
-    if not raw:
-        return "", None
-    expanded = os.path.realpath(os.path.abspath(os.path.expanduser(raw)))
-    if require_exists and not os.path.isdir(expanded):
-        return None, f"Folder not found or not a directory: {raw}"
-    for root in paths.trusted_storage_roots():
-        resolved_root = os.path.realpath(os.path.abspath(os.path.expanduser(root)))
-        try:
-            if os.path.commonpath([expanded, resolved_root]) == resolved_root:
-                return expanded, None
-        except ValueError:
-            continue  # Different Windows drives or UNC shares.
-    return None, (
-        "Folder must be inside your home directory or a configured "
-        f"Zwift data directory: {raw}"
-    )
+    return paths.confine_storage_dir(value, must_exist=require_exists)

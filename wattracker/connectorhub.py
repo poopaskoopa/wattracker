@@ -157,6 +157,33 @@ def unregister(session: ConnectorSession) -> None:
     session.close()
 
 
+def close_device(
+    user_id: int, device_id: int, reason: str = "device revoked"
+) -> bool:
+    """Detach this user's connector if it is ``device_id``. True if one was.
+
+    Revoking a token stops it *resolving*, which settles every future
+    connection and nothing about the present one: this socket is long-lived by
+    design, so without this the revoked machine kept answering RPC until the
+    server happened to restart. Stolen-laptop is the scenario the button exists
+    for, and "Its token no longer works" has to be true of the device that is
+    attached right now, not only of the next one to dial in.
+
+    Closed with a normal code rather than WS_REPLACED: nothing replaced it, and
+    when it reconnects the handshake refuses the dead token, which is the
+    honest way for that machine to find out.
+    """
+    with _lock:
+        session = _sessions.get(user_id)
+        if session is None or session.device_id != device_id:
+            return False
+        del _sessions[user_id]
+    # Outside the lock, for the reason register() explains.
+    session.close(reason)
+    _log.info("connector for user %s closed: %s", user_id, reason)
+    return True
+
+
 def get(user_id: Optional[int]) -> "Optional[ConnectorSession]":
     if user_id is None:
         return None

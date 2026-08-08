@@ -99,3 +99,76 @@ def test_connector_modules_stay_lightweight(module):
         f"{module} pulled in modules the frozen connector excludes: {leaked}. "
         "Make the offending import lazy (see RideController._save)."
     )
+
+
+# -------------------------------------------- the token must not be forwarded
+def test_the_buffered_ride_upload_does_not_follow_redirects(tmp_path):
+    """urllib replays Authorization on a redirect, to any host it names.
+
+    So a server answering this POST with a 302 elsewhere harvests the device
+    token in plaintext. There is no legitimate reason for the paired server to
+    redirect an API POST, and a 3xx is a retryable code, so refusing to follow
+    keeps the buffered ride rather than discarding it.
+    """
+    import http.server
+    import json
+    import threading
+
+    from wattracker_connector import buffer as buffer_mod
+
+    token = "a" * 43
+    # Every request that carried the token, wherever it landed. A redirect
+    # that is followed shows up here as a second entry on the OTHER server.
+    harvested = []
+
+    def _handler(name):
+        class Handler(http.server.BaseHTTPRequestHandler):
+            def _record_and_reply(self):
+                if self.headers.get("Authorization") == f"Bearer {token}":
+                    harvested.append(name)
+                self.rfile.read(int(self.headers.get("Content-Length") or 0))
+                if name == "server" and self.path.endswith("/api/connector/ride"):
+                    self.send_response(302)
+                    self.send_header("Location", attacker_url[0] + "/harvest")
+                    self.end_headers()
+                    return
+                body = json.dumps({"activity_id": 1}).encode()
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+            do_POST = _record_and_reply
+            do_GET = _record_and_reply
+
+            def log_message(self, *a):
+                pass
+
+        return Handler
+
+    attacker_url = [""]
+    attacker = http.server.HTTPServer(("127.0.0.1", 0), _handler("attacker"))
+    attacker_url[0] = f"http://127.0.0.1:{attacker.server_port}"
+    server = http.server.HTTPServer(("127.0.0.1", 0), _handler("server"))
+    for srv in (attacker, server):
+        threading.Thread(target=srv.serve_forever, daemon=True).start()
+    try:
+        store = buffer_mod.RideBuffer(str(tmp_path / "ride.json"))
+        store.start("2026-06-01T10:00:00", "Ride", 250.0, None)
+        store.append(power=200)
+        store.finish()
+
+        result = buffer_mod.upload_pending(
+            f"http://127.0.0.1:{server.server_port}", token, store
+        )
+    finally:
+        server.shutdown()
+        attacker.shutdown()
+
+    # The token reached the paired server and nowhere else.
+    assert harvested == ["server"]
+    assert "attacker" not in harvested
+    # A 3xx is not a definite answer, so the ride is still there for next time.
+    assert result is None
+    assert store.load() is not None
