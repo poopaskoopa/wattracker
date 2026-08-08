@@ -1,6 +1,6 @@
 import pytest
 
-from wattracker import config
+from wattracker import config, rpc
 import wattracker.__main__ as launcher
 
 
@@ -147,10 +147,17 @@ def test_main_resolves_runtime_config_without_browser(monkeypatch):
     # proxy_headers must stay explicitly off: the app binds loopback, so
     # uvicorn's default trusted-proxy range (127.0.0.1) would cover every
     # caller and let any of them set request.client.host via X-Forwarded-For.
+    #
+    # ws_max_size must be passed too, or uvicorn's own 16 MiB default silently
+    # overrides rpc.MAX_FRAME_BYTES: a .fit over ~12 MiB then closes the
+    # connector socket with 1009 mid-activities.read, and because the file
+    # never reaches scanned_files the next scan fetches and drops it again.
     assert calls["kwargs"] == {
         "host": "localhost", "port": 8123, "reload": False,
-        "proxy_headers": False,
+        "proxy_headers": False, "ws_max_size": rpc.MAX_FRAME_BYTES,
     }
+    # The codec's ceiling has to clear a 50 MiB upload base64-encoded.
+    assert rpc.MAX_FRAME_BYTES > 50 * 1024 * 1024 * 4 / 3
 
 
 def test_main_browser_thread_gets_correct_url(monkeypatch):

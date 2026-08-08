@@ -62,7 +62,12 @@ def plan_export_manifest(user_id: int) -> Optional[ExportManifest]:
             )
 
     return ExportManifest(
-        zwift_id=settings.get("zwift_id") or "me",
+        # No "me" fallback. "me" is a valid bare folder name, so the resolver
+        # takes its zwift_id branch and hands back <Workouts>/me whenever that
+        # folder exists - which is every install upgraded from the version that
+        # created it - and the export reports success into a folder Zwift never
+        # reads (#44). An absent id must fall through to detection.
+        zwift_id=settings.get("zwift_id"),
         override=settings.get("workouts_dir"),
         write=to_write,
         remove=to_remove,
@@ -112,7 +117,7 @@ def remove_plan_exports(user_id: int, plan_id: int) -> Dict:
     """
     settings = db.get_user_settings(user_id)
     manifest = ExportManifest(
-        zwift_id=settings.get("zwift_id") or "me",
+        zwift_id=settings.get("zwift_id"),  # never "me" - see plan_export_manifest
         override=settings.get("workouts_dir"),
         remove=[
             zwo.plan_filename(w["date"], w["name"])

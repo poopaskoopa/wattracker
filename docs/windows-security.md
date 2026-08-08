@@ -59,6 +59,57 @@ requires a separate security design covering TLS, Secure cookies, CSRF and
 Origin validation, trusted hosts/proxies, login throttling, and registration
 policy.
 
+## Server/connector trust boundary
+
+In a split install the server runs in a container and the connector runs on
+the Windows box where Zwift lives. The connector dials out and holds one
+long-lived WebSocket; requests only ever flow server to connector.
+
+**The connector does not trust the server.** The connector authenticates to
+the server with a per-device bearer token; the server does not authenticate
+itself in return, so "the server" is only ever "whatever is attached to this
+socket". Every handler therefore judges what it is asked to do rather than
+assuming a well-behaved peer. This is a deliberate decision, not an accident
+of implementation, and it is what the checks in `wattracker_connector/
+handlers.py` are for:
+
+- **Folders the server names** clear this machine's trusted roots before
+  anything acts on them (`paths.confine_storage_dir`, the one rule for a
+  submitted path). Folders the connector discovered under a root it already
+  trusts take the lenient final-component rule (`confine_detected_dir`)
+  instead - that split is by provenance, and a path that arrived over RPC is
+  always *submitted*, never *discovered*.
+- **`activities.read` is not a file-read primitive.** It serves only what
+  `activities.list` offered: a `.fit` sitting directly in the resolved
+  Activities folder, never Zwift's in-progress buffer, symlinks resolved
+  before either test. One predicate (`_in_scope`) is applied by both, so the
+  listing and the read cannot disagree.
+- **`workouts.sync` is a write-and-delete primitive**, so both halves are
+  guarded. A `remove` entry must be a bare filename. A `write` entry's `date`
+  must be a bare `YYYY-MM-DD` - it leads the `.zwo` filename, so an absolute
+  or traversing date was an arbitrary-path write with no `..` required.
+  `zwo.plan_filename` sanitises both halves and `zwo.write_plan_to_zwift`
+  refuses any name that is not one path component, independently of it.
+
+What keeps the same-UID argument behind `confine_detected_dir` intact under
+this architecture: the container never sees the Zwift folder. `docker-compose.
+yml` mounts only the `wattracker-data` named volume and the image runs as uid
+10001, so all Zwift path resolution happens connector-side, as the rider's own
+user. The split does not put the export path across a privilege boundary.
+
+Revocation covers the live socket, not only the next connection: a connector
+holds its WebSocket for as long as it runs, so `settings_connector_revoke`
+closes the attached session (`connectorhub.close_device`) as well as deleting
+the row. Stolen-laptop is the scenario the button exists for.
+
+Token confidentiality is bounded by the transport. `ws://` without TLS is the
+documented posture for a trusted LAN; a WAN deployment needs TLS. The
+connector never follows an HTTP redirect when uploading a buffered ride,
+because urllib replays `Authorization` across hosts and a redirecting server
+would otherwise harvest the token. Pass `--token` once with `--save` and omit
+it afterwards: an argument is visible to every process on the machine, while
+the saved config file is written 0600.
+
 ## Installer lifecycle and compiler provenance
 
 The per-user installer never requests elevation, adds no firewall rule, and

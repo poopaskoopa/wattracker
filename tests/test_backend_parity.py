@@ -212,7 +212,7 @@ def test_offline_export_degrades_instead_of_raising(monkeypatch):
     uid = db.create_user("rider", auth.hash_password("password123"))
     monkeypatch.setenv("WATTRACKER_MODE", "server")
     result = get_backend(uid).apply_exports(
-        ExportManifest(zwift_id="me", write=[], remove=[])
+        ExportManifest(zwift_id=None, write=[], remove=[])
     )
     assert result["status"] == "offline"
     assert result["exported"] == 0
@@ -262,3 +262,56 @@ def test_offline_settings_save_is_not_a_500(client, monkeypatch):
 
     assert response.status_code == 200
     assert db.get_user_settings(uid)["ftp"] == 250
+
+
+def test_offline_validate_dir_of_a_real_folder_is_an_answer_not_a_500(
+    client, monkeypatch
+):
+    """"The connector is offline" is a validation result, not a server error.
+
+    RemoteBackend.validate_dir short-circuited only the empty string, so any
+    non-empty folder value raised ConnectorUnavailable straight out of the
+    route. That is the first-run order of operations - pair a device, set your
+    folders, then start the connector - which made a 500 the likely first
+    experience of server mode, on both the settings save and the rescan.
+    """
+    client.post("/register", data={"username": "rider", "password": "password123"})
+    uid = db.get_user_by_username("rider")["id"]
+    monkeypatch.setenv("WATTRACKER_MODE", "server")
+
+    clean, error = get_backend(uid).validate_dir("C:/Zwift/Activities")
+    assert clean is None
+    assert "offline" in error.lower()
+
+    response = client.post(
+        "/settings", data={"ftp": "250", "activities_dir": "C:/Zwift/Activities"}
+    )
+    assert response.status_code == 200
+    response = client.post(
+        "/activities/rescan", json={"directory": "C:/Zwift/Activities"}
+    )
+    assert response.status_code < 500
+
+
+@pytest.mark.parametrize("hostile", ["\x00", "/tmp/x\x00y"])
+def test_local_validate_dir_does_not_raise_on_an_unresolvable_path(
+    client, monkeypatch, hostile
+):
+    """LocalBackend.validate_dir is paths.confine_storage_dir, not a copy of it.
+
+    It started as a copy and had already drifted: the copy let realpath raise
+    on an embedded NUL, so POST /settings with one returned 200 on main and
+    500 here. Confinement was never bypassed - but "moved behind an interface,
+    unchanged" has to be true, and one rule for a submitted path means one
+    implementation of it.
+    """
+    client.post("/register", data={"username": "rider", "password": "password123"})
+    uid = db.get_user_by_username("rider")["id"]
+    monkeypatch.setenv("WATTRACKER_MODE", "local")
+
+    clean, error = get_backend(uid).validate_dir(hostile)
+    assert clean is None
+    assert error  # refused with a message, not an exception
+
+    response = client.post("/settings", data={"ftp": "250", "activities_dir": hostile})
+    assert response.status_code == 200

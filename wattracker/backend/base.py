@@ -90,7 +90,11 @@ class ExportManifest:
     verbatim here rather than quietly changed - worth reconciling separately.
     """
 
-    zwift_id: str
+    #: The rider's stored Zwift player id, or None when they have not set one.
+    #: None means "fall through to detection" and MUST NOT be defaulted to a
+    #: placeholder: "me" is a valid folder name, so a placeholder resolves to a
+    #: real directory Zwift never reads and the export reports success (#44).
+    zwift_id: Optional[str]
     override: Optional[str] = None
     write: List[dict] = field(default_factory=list)
     remove: List[str] = field(default_factory=list)

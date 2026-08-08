@@ -4,6 +4,8 @@ The security contract mirrors the calendar feed's (see test_calendar_feed.py):
 only a hash is ever stored, the plaintext is shown exactly once, and every
 failure mode collapses to a single "no".
 """
+import hashlib
+
 import pytest
 
 pytest.importorskip("httpx")
@@ -35,12 +37,34 @@ def test_token_resolves_to_its_owner(user_id):
 
 
 def test_plaintext_token_is_never_stored(user_id):
+    """Asserted against the COLUMN, not the listing.
+
+    The listing was the only thing checked here, and it does not select
+    ``token_hash`` at all - so making ``hash_token`` return its argument, which
+    puts the plaintext straight into the column, left the whole suite green.
+    The digest is also recomputed here rather than through ``hash_token``, so
+    the test does not agree with the code it is checking by construction.
+    """
     _device_id, token = connectorauth.generate_token(user_id, "Zwift PC")
     stored = db.list_connector_devices(user_id)
     assert len(stored) == 1
-    # Neither the token nor anything containing it survives in the row.
+    # Neither the token nor anything containing it survives in the row...
     assert token not in repr(stored[0])
     assert "token_hash" not in stored[0]
+
+    # ...and the column the listing does not select holds a sha256 digest.
+    conn = db.connect(None)
+    try:
+        rows = conn.execute(
+            "SELECT token_hash FROM connector_devices"
+        ).fetchall()
+    finally:
+        conn.close()
+    assert len(rows) == 1
+    at_rest = rows[0]["token_hash"]
+    assert at_rest != token
+    assert token not in at_rest
+    assert at_rest == hashlib.sha256(token.encode("utf-8")).hexdigest()
 
 
 def test_unknown_malformed_and_missing_tokens_all_return_none(user_id):

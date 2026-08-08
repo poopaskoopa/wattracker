@@ -1045,3 +1045,96 @@ def test_shedding_does_not_lock_the_owner_out_through_the_throttle(client):
         follow_redirects=False,
     )
     assert r.status_code == 303
+
+
+# ------------------------- .zwo filenames cannot leave the export folder
+#
+# zwo.plan_filename is byte-identical on main, where it only ever sees dates
+# from _dt.date.fromisoformat. The server/client split is what makes it
+# reachable from a manifest that crossed a network, so the guard lands here -
+# but it hardens the single-machine app in the same move.
+
+
+def test_a_plan_filename_is_always_one_path_component():
+    """The date leads the filename and used to be interpolated raw.
+
+    An absolute date is enough on its own; no ``..`` is required.
+    """
+    import ntpath
+
+    for hostile in (
+        "../../../../.config/autostart/pwn",
+        "/etc/cron.d/x",
+        "..\\..\\evil",
+        "2026-07-07/../../escape",
+        "C:\\Windows\\System32\\x",
+        "",
+        None,
+    ):
+        fname = zwo.plan_filename(hostile, "VO2 5x4")
+        assert os.path.basename(fname) == fname, hostile
+        assert ntpath.basename(fname) == fname, hostile
+        assert not os.path.isabs(fname), hostile
+        assert not ntpath.isabs(fname), hostile
+
+    # A real date is untouched, so the sanitiser is not paying for itself with
+    # mangled names on the path everybody actually uses.
+    assert zwo.plan_filename("2026-07-07", "VO2 5x4") == "2026-07-07 VO2 5x4.zwo"
+
+
+def test_the_writer_refuses_a_filename_that_would_escape(tmp_path, monkeypatch):
+    """The last check before open(..., "w"), asserted with the sanitiser bypassed.
+
+    Confining the DIRECTORY is worth nothing if the name joined onto it can
+    walk back out, so this guard has to hold independently of whatever
+    produced the name.
+    """
+    target = tmp_path / "Workouts"
+    target.mkdir()
+    monkeypatch.setattr(zwo, "plan_filename", lambda d, n: "../escaped.zwo")
+    monkeypatch.setattr(
+        "wattracker.paths.workouts_dir", lambda *a, **k: str(target)
+    )
+
+    with pytest.raises(ValueError):
+        zwo.write_plan_to_zwift(
+            [{"date": "2026-07-07", "name": "x", "zwo": "<workout_file/>"}], None
+        )
+    assert not (tmp_path / "escaped.zwo").exists()
+    assert list(target.iterdir()) == []
+
+
+def test_an_upload_cannot_claim_to_be_an_in_app_ride(client, monkeypatch):
+    """The recorded filename is the rider's string now, and it classifies rides.
+
+    ``ingest_file`` records the uploaded name rather than the temp file's, and
+    ``db.IN_APP_FILENAME_SQL`` reads that column: 'Ride <date> ...' WITHOUT a
+    .fit extension means the ride was recorded in-app. An upload is not, so it
+    must not be able to take that shape.
+    """
+    from wattracker.ingest import importer
+
+    monkeypatch.setattr(
+        importer, "parse_fit",
+        lambda path: {
+            "start_time": "2026-06-01T10:00:00", "duration_s": 1800,
+            "streams": {"time": [None] * 1800, "power": [200.0] * 1800},
+        },
+    )
+    _register(client)
+    uid = db.get_user_by_username("tester")["id"]
+
+    activity_id = importer.ingest_upload(uid, "Ride 2026-06-01 09-00-00", b"x")
+    assert activity_id is not None
+    stored = db.get_activity(uid, activity_id)
+    assert stored["filename"].endswith(".fit")
+    # Both classifiers - the Python one and the SQL the migrations run.
+    assert importer.is_in_app_activity(stored["filename"]) is False
+    conn = db.connect(None)
+    try:
+        matched = conn.execute(
+            f"SELECT COUNT(*) AS n FROM activities WHERE {db.IN_APP_FILENAME_SQL}"
+        ).fetchone()["n"]
+    finally:
+        conn.close()
+    assert matched == 0

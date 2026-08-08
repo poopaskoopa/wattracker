@@ -477,3 +477,66 @@ def test_a_resolved_directory_must_not_be_laundered_through_the_override(
     result = zwomod.write_plan_to_zwift(workout, None, workouts_override=None)
     assert result["directory"] == resolved
     assert len(os.listdir(other_drive)) == 1
+
+
+# ---------------------------------------- no export path manufactures an id
+#
+# The three ExportManifest call sites - the plan-export sweep, the plan-delete
+# prune, and the adapt/reflow re-export - each defaulted the rider's stored
+# zwift_id to the literal "me". That is not a harmless placeholder: it is a
+# valid bare folder name, so safe_zwift_id() passes it, resolve_export_dir()
+# takes its zwift_id branch, and <Workouts>/me comes back as a real directory
+# whenever it exists - which is every install upgraded from the version that
+# created it. The export then reports status 'ok' with a directory, so the UI
+# says success while Zwift never reads the folder. That is issue #44, and it
+# is the DEFAULT local path.
+
+
+def test_the_plan_export_sweep_never_falls_back_to_a_me_folder(client):
+    from wattracker import exporter
+
+    uid, _plan_id = _seed_plan(client)
+    stale = _mk_player_folder("me")
+    real = _mk_player_folder("1234567")
+    assert db.get_user_settings(uid)["zwift_id"] in (None, "")
+
+    manifest = exporter.plan_export_manifest(uid)
+    assert manifest.zwift_id != "me"
+
+    result = exporter.sync_plan_exports(uid)
+    assert result["status"] == "ok"
+    assert result["directory"] == real
+    assert os.listdir(stale) == []
+    assert len(os.listdir(real)) == 1
+
+
+def test_the_plan_delete_prune_never_falls_back_to_a_me_folder(client):
+    from wattracker import exporter
+
+    uid, plan_id = _seed_plan(client)
+    stale = _mk_player_folder("me")
+    real = _mk_player_folder("1234567")
+    exporter.sync_plan_exports(uid)
+    assert len(os.listdir(real)) == 1
+
+    result = exporter.remove_plan_exports(uid, plan_id)
+    assert result["directory"] == real
+    assert os.listdir(real) == []
+    assert os.listdir(stale) == []
+
+
+def test_the_adapt_reexport_never_falls_back_to_a_me_folder(client):
+    from wattracker.prescribe import adapt
+
+    uid, plan_id = _seed_plan(client)
+    stale = _mk_player_folder("me")
+    real = _mk_player_folder("1234567")
+    workout = db.plan_workouts_for_plan(uid, plan_id)[0]
+
+    adapt.reexport_workout(
+        uid, workout["date"], workout["name"], "Renamed", "<workout_file/>"
+    )
+    assert os.listdir(stale) == []
+    assert [n for n in os.listdir(real)] == [
+        f"{workout['date']} Renamed.zwo"
+    ]

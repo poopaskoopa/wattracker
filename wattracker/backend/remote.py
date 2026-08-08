@@ -104,10 +104,22 @@ class RemoteBackend(Backend):
         # Otherwise runs on the connector: these are its folders, and measuring
         # them against the server's trusted roots would reject every valid
         # answer.
-        result = self._call(
-            "paths.validate_dir",
-            {"value": value, "require_exists": require_exists},
-        ) or {}
+        try:
+            result = self._call(
+                "paths.validate_dir",
+                {"value": value, "require_exists": require_exists},
+            ) or {}
+        except ConnectorUnavailable:
+            # An offline connector is a *validation* answer, not a server
+            # error. It is also the first-run order of operations - pair a
+            # device, then set your folders, then start the connector - so
+            # this path 500ing on the settings save and on /activities/rescan
+            # was the most likely first experience of server mode.
+            return None, (
+                "Cannot check that folder: the connector is offline. Start the "
+                "wattracker connector on the machine where Zwift is installed, "
+                "then save again."
+            )
         return result.get("clean"), result.get("error")
 
     def confine_stored_dir(self, value: Optional[str]) -> Optional[str]:

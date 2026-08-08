@@ -122,7 +122,9 @@ def reexport_workout(
         else []
     )
     manifest = ExportManifest(
-        zwift_id=settings.get("zwift_id") or "me",
+        # No "me" fallback: it resolves to a stale <Workouts>/me folder Zwift
+        # never reads. See exporter.plan_export_manifest and paths.workouts_dir.
+        zwift_id=settings.get("zwift_id"),
         override=settings.get("workouts_dir"),
         write=write,
         # Only a rename orphans a file; re-writing under the same name just

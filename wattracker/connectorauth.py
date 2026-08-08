@@ -81,7 +81,13 @@ def list_devices(user_id: int, path: Optional[str] = None) -> List[dict]:
 
 
 def revoke(user_id: int, device_id: int, path: Optional[str] = None) -> bool:
-    """Unpair a machine. Its token stops resolving immediately."""
+    """Unpair a machine. Its token stops resolving immediately.
+
+    That covers every *future* connection and nothing about a socket already
+    open - a connector holds one for as long as it runs. Callers that can
+    reach the live registry must also call ``connectorhub.close_device``; this
+    module deliberately knows nothing about sockets.
+    """
     return db.delete_connector_device(user_id, device_id, path=path)
 
 
