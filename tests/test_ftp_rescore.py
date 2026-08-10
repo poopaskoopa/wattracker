@@ -172,6 +172,14 @@ def test_setup_upload_rescores_the_batch_like_a_directory_scan(
     first run - and stored TSS 172.9, while the same rides through
     scan_activities stored 100.0. A rider's training load depended on which
     button they pressed, and issue #54 says both paths must be fixed together.
+
+    The clock is frozen at the ride's own date, exactly as the scan half of
+    this pair does. Without that this test decayed with wall-clock: estimate_ftp
+    is anchored at *now*, so every day between the hard-coded ride date and the
+    day the suite happens to run decays the effort a little further, the FTP the
+    ride is scored against drops below its own 263 W, and if_/tss climb away
+    from 1.0/100.0. It read as a tolerance that was slightly too tight - it is
+    not, the numbers are moving. Widening abs= only buys time.
     """
     response = upload_client.post(
         "/register", data={"username": "rescoreup", "password": "password123"}
@@ -179,6 +187,7 @@ def test_setup_upload_rescores_the_batch_like_a_directory_scan(
     assert response.status_code == 200
     uid = db.get_user_by_username("rescoreup")["id"]
 
+    monkeypatch.setattr(importer, "utc_now", lambda: dt.datetime(2026, 8, 5, 12, 0))
     monkeypatch.setattr(importer, "parse_fit", lambda path: _parsed_ride())
     response = upload_client.post(
         "/setup/upload",
