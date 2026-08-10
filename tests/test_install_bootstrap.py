@@ -27,15 +27,64 @@ def _free_port():
         return sock.getsockname()[1]
 
 
-def _without_lsof(path):
-    lsof = shutil.which("lsof", path=path)
-    if not lsof:
-        return path
-    lsof_dir = Path(lsof).resolve().parent
-    return os.pathsep.join(
-        entry for entry in path.split(os.pathsep)
-        if Path(entry or os.curdir).resolve() != lsof_dir
-    )
+def _without_lsof(path, shim_root):
+    # Hiding lsof by dropping its whole directory from PATH is wrong: on
+    # usrmerge Linux lsof lives in /usr/bin, and dropping that directory
+    # also removes bash/env/python3, breaking the `#!/usr/bin/env bash`
+    # launcher itself. Instead, rebuild only the offending directory as a
+    # shim that symlinks every entry except lsof.
+    #
+    # A simpler shim (prepend a directory with a fake/non-executable lsof)
+    # also doesn't work: `command -v lsof` (what start.sh uses) skips
+    # non-executable candidates and keeps searching PATH, and an
+    # exit-127 executable shim would make start.sh take the "lsof found"
+    # branch instead of the no-lsof branch under test.
+    entries = path.split(os.pathsep)
+    new_entries = []
+    shim_root.mkdir(parents=True, exist_ok=True)
+    for i, entry in enumerate(entries):
+        entry_dir = Path(entry or os.curdir)
+        candidate = entry_dir / "lsof"
+        if not (candidate.is_file() and os.access(candidate, os.X_OK)):
+            new_entries.append(entry)
+            continue
+        shim_dir = shim_root / f"shim{i}"
+        shim_dir.mkdir(parents=True, exist_ok=True)
+        for other in entry_dir.iterdir():
+            if other.name == "lsof":
+                continue
+            link = shim_dir / other.name
+            if not link.is_symlink():
+                link.symlink_to(other)
+        new_entries.append(str(shim_dir))
+    stripped = os.pathsep.join(new_entries)
+
+    assert shutil.which("lsof", path=stripped) is None
+    assert shutil.which("bash", path=stripped) is not None
+    assert shutil.which("env", path=stripped) is not None
+    return stripped
+
+
+def _make_exe(path):
+    path.write_text("#!/bin/sh\nexit 0\n")
+    path.chmod(0o755)
+
+
+def test_without_lsof_hides_lsof_but_keeps_bash_on_usrmerge_layout(tmp_path):
+    # Regression test for a usrmerge-style layout (e.g. lsof and bash both
+    # live in /usr/bin): dropping the whole directory to hide lsof would
+    # also take bash out, which is exactly the bug this guards against.
+    usrbin = tmp_path / "usr" / "bin"
+    usrbin.mkdir(parents=True)
+    _make_exe(usrbin / "lsof")
+    _make_exe(usrbin / "bash")
+    _make_exe(usrbin / "env")
+
+    stripped = _without_lsof(str(usrbin), tmp_path / "shims")
+
+    assert shutil.which("lsof", path=stripped) is None
+    assert shutil.which("bash", path=stripped) is not None
+    assert shutil.which("env", path=stripped) is not None
 
 
 @contextlib.contextmanager
@@ -69,7 +118,7 @@ def _ready_repo_environment():
 def _launcher_env(tmp_path, without_lsof):
     path = os.environ.get("PATH", os.defpath)
     if without_lsof:
-        path = _without_lsof(path)
+        path = _without_lsof(path, tmp_path / "lsof-shims")
     return {
         **os.environ,
         "PATH": path,
