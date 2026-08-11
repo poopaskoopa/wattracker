@@ -124,6 +124,60 @@
 </form>
 {% endif %}
 
+<h3>Connector devices</h3>
+<p class="hint">A <strong>connector</strong> is the small app you run on the machine
+   where Zwift is installed. It gives this server access to that machine&rsquo;s
+   Zwift folders and Bluetooth trainer, so the two halves can live on different
+   computers. If you run wattracker and Zwift on the same machine, you do not
+   need one.</p>
+<p class="hint"><strong>A device token is a password.</strong> Anyone holding one
+   can read and write your training data. It is stored here only as a hash, so it
+   is shown once and cannot be recovered &mdash; revoke and re-pair if you lose
+   it.</p>
+
+{% if connector_message %}<p class="ok">{{ connector_message }}</p>{% endif %}
+
+{% if connector_new_token %}
+<p><strong>Token for &ldquo;{{ connector_new_label }}&rdquo;</strong> &mdash; paste
+   it into the connector now, it is not shown again:</p>
+<label class="calendar-feed-url">
+    <input type="text" readonly value="{{ connector_new_token }}"
+           autocomplete="off" spellcheck="false"
+           onfocus="this.select()" size="80">
+</label>
+{% endif %}
+
+{% if connector_devices %}
+<table class="connector-devices">
+    <thead>
+        <tr><th>Device</th><th>Paired</th><th>Last seen</th><th></th></tr>
+    </thead>
+    <tbody>
+    {% for d in connector_devices %}
+        <tr>
+            <td>{{ d.label }}</td>
+            <td>{{ d.created[:10] if d.created else '' }}</td>
+            <td>{{ d.last_seen[:16].replace('T', ' ') if d.last_seen else 'never' }}</td>
+            <td>
+                <form method="post" action="/settings/connector/{{ d.id }}/revoke">
+                    <button type="submit" class="danger-btn">Revoke</button>
+                </form>
+            </td>
+        </tr>
+    {% endfor %}
+    </tbody>
+</table>
+{% else %}
+<p class="hint">No connector paired yet.</p>
+{% endif %}
+
+<form method="post" action="/settings/connector" class="connector-form">
+    <label>Device name
+        <input type="text" name="label" placeholder="Zwift PC" maxlength="64">
+    </label>
+    <button type="submit">Pair a new device</button>
+</form>
+
 <h3>Calendar feed</h3>
 <p class="hint">Subscribe your phone&rsquo;s calendar to a read-only feed of your
    scheduled workouts &mdash; 30 days back and 180 days ahead, one all-day entry

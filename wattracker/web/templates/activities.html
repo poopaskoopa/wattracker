@@ -117,9 +117,18 @@
         if (found === 0) {
             return "Scanned " + dir + " — no .fit files found in this folder.";
         }
+        // Files the owning machine declined to offer are NOT duplicates -
+        // a symlinked Activities folder makes every file one of these, and
+        // calling them duplicates sends the rider looking for rides they
+        // already have. Only that machine knows which file it was; it names
+        // them in its log, so point there rather than inventing a reason.
+        var notOffered = s.not_offered || 0;
+        var duplicates = Math.max(0, (s.skipped || 0) - notOffered);
         return "Scanned " + dir + " — " + found + " .fit file(s) found, " +
-               (s.imported || 0) + " imported, " + (s.skipped || 0) +
-               " duplicate(s) skipped.";
+               (s.imported || 0) + " imported, " + duplicates +
+               " duplicate(s) skipped" +
+               (notOffered ? ", " + notOffered + " not read (see the log on " +
+                             "the machine holding the folder)" : "") + ".";
     }
 
     // Set true only once this page has observed a scan actually running, so a

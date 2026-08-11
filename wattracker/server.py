@@ -17,6 +17,7 @@ from contextlib import asynccontextmanager
 from typing import List, Optional
 
 from fastapi import Body, FastAPI, File, Form, Request, UploadFile, WebSocket
+from fastapi import WebSocketDisconnect
 from fastapi.responses import (
     FileResponse,
     HTMLResponse,
@@ -36,14 +37,27 @@ from . import (
     backup,
     calendarfeed,
     config,
+    connectorauth,
+    connectorhub,
     credstore,
     db,
     exporter,
     paths,
+    rpc,
     power_corrections,
     races,
 )
 from .analysis import activity_cache, pipeline, power_profile, zones
+from .backend import (
+    BackendUnavailable,
+    ExportManifest,
+    discover,
+    get_backend,
+    is_offline,
+)
+from .backend import mode as backend_mode
+from .backend import remote_ble
+from .rpc import ConnectorUnavailable
 from .ble import devices as bledevices
 from .ble.runner import RideController, flatten_session
 from .ingest import importer
@@ -88,6 +102,14 @@ RIDE_INACTIVITY_TIMEOUT_S = 300.0
 # retried on the next tick with a full re-arm; only a sustained run of them is
 # treated as "this trainer will not take targets" - and then the rider is told.
 ERG_COMMAND_FAILURE_LIMIT = 5
+
+# How long a ride waits for a connector that has gone quiet before giving up on
+# it. Losing the connector is not losing the ride: the connector holds the
+# trainer, keeps sampling and keeps writing every second to its own buffer, and
+# a reconnect inside this window replays the missed seconds into the controller
+# so the activity comes out whole. Past it, nobody is coming back in time to be
+# worth holding a rider's workout open for.
+CONNECTOR_OFFLINE_TIMEOUT_S = 300.0
 
 
 def _ride_loop_time() -> float:
@@ -136,6 +158,7 @@ def _start_user_scan(user_id: int, directory: Optional[str]) -> Optional[dict]:
             "processed": 0,
             "imported": 0,
             "skipped": 0,
+            "not_offered": 0,
             "error": None,
             "finished_at": None,
             "ftp_estimate": None,
@@ -159,8 +182,9 @@ def _start_user_scan(user_id: int, directory: Optional[str]) -> Optional[dict]:
                     found=result.get("found", 0),
                     imported=result.get("imported", 0),
                     skipped=result.get("skipped", 0),
+                    not_offered=result.get("not_offered", 0),
                     directory=d,
-                    exists=bool(d and os.path.isdir(d)),
+                    exists=bool(result.get("exists")),
                     ftp_estimate=(
                         round(importer.recent_best_effort_ftp(user_id), 1)
                         if result.get("imported", 0) else None
@@ -344,12 +368,36 @@ class NoCacheStaticFiles(StaticFiles):
 # caller itself, from a per-user token, because a subscribing phone calendar
 # app has no cookie jar (see calendarfeed.py). It is an exact match, so the
 # session-protected "/calendar" page above it is untouched.
-_EXEMPT = ("/login", "/register", calendarfeed.FEED_PATH)
+# Paths that authenticate themselves rather than by session cookie. The
+# connector upload carries a bearer token and belongs to a process with no
+# browser, so a redirect to /login would be the wrong answer to a bad
+# credential - it checks its own and returns 401.
+_EXEMPT = (
+    "/login", "/register", calendarfeed.FEED_PATH, "/api/connector/ride",
+)
 _EXEMPT_PREFIXES = ("/static", "/favicon", "/apple-touch-icon")
 
 # One log line per this many rejected /calendar.ics tokens. Not a limit:
 # nothing is ever refused because of it (see CalendarFeedFailureCounter).
 CALENDAR_TOKEN_FAILURE_THRESHOLD = 10
+
+
+class _ConnectorSocket:
+    """Adapts a Starlette WebSocket to the two methods RpcPeer needs.
+
+    RpcPeer is deliberately transport-agnostic - the connector end wraps a
+    plain client socket with the same two methods - so neither end of the
+    protocol has to import the other's web framework.
+    """
+
+    def __init__(self, websocket: WebSocket) -> None:
+        self._ws = websocket
+
+    async def send_text(self, text: str) -> None:
+        await self._ws.send_text(text)
+
+    async def receive_text(self) -> str:
+        return await self._ws.receive_text()
 
 
 class CalendarFeedFailureCounter:
@@ -708,6 +756,10 @@ def create_app() -> FastAPI:
         if config.auto_scan_enabled():
             task = asyncio.create_task(auto_scan_loop(stop))
         yield
+        # Fail every in-flight connector call before the loop goes away, so a
+        # worker thread blocked on one is told at once instead of sitting on
+        # its full timeout against a loop that will never run again.
+        connectorhub.reset()
         if task is not None:
             stop.set()
             try:
@@ -754,6 +806,12 @@ def create_app() -> FastAPI:
     # because of someone else's guessing - or its own earlier attempts with a
     # rotated token.
     app.state.calendar_failures = CalendarFeedFailureCounter()
+    # Rejected connector tokens, counted the same way and for the same reasons
+    # (see CalendarFeedFailureCounter): a 256-bit token checked one indexed
+    # lookup at a time is not guessable, every client on a home LAN can share
+    # one apparent address, and refusing would only lock out the connector
+    # that is trying to reconnect. Visibility, not enforcement.
+    app.state.connector_failures = CalendarFeedFailureCounter()
     # uvicorn logs the full request target; keep feed tokens out of the log.
     calendarfeed.install_access_log_redaction()
 
@@ -766,6 +824,12 @@ def create_app() -> FastAPI:
         secret_key=config.session_secret(),
         session_cookie="wattracker_session",
         same_site="lax",
+        # same_site="lax" is the CSRF control and holds regardless: a
+        # cross-site POST carries no cookie at all. Secure is separate - it
+        # keeps the cookie off a plain-http hop - and defaults off because
+        # this app speaks http. Turn it on the moment TLS is terminated in
+        # front, or the cookie is readable by anyone on the same network.
+        https_only=config.cookie_secure(),
     )
     allowed_hosts = ["localhost", "127.0.0.1", "[::1]", "::1", "testserver"]
     # An optional single extra name, so a reverse proxy on the owner's tailnet
@@ -786,15 +850,19 @@ def create_app() -> FastAPI:
     # anyone who resolves that name, with only the session cookie (and, for the
     # feed, a URL-borne token) in the way. This app is designed as a
     # single-user local server - the CSRF story is a same-origin check, the
-    # session cookie is not Secure, and there is no rate limiting beyond
-    # /login. Do not set this to an internet-facing name.
-    public_host = config.public_host()
-    if public_host:
+    # session cookie is not Secure by default, and there is no rate limiting
+    # beyond /login. Do not set this to an internet-facing name.
+    #
+    # WATTRACKER_PUBLIC_HOSTS takes several, because one server on a LAN is
+    # legitimately reached as an IP, a short hostname and a .local name at the
+    # same time. Each value goes through the identical validator, so the count
+    # widens but what any single entry may be does not.
+    for public_host in config.public_hosts():
         # The value may carry ":port"; strip it with the middleware's own
         # parser so the entry is exactly what _host_only() will produce for an
         # incoming Host header (Starlette compares the host portion only).
         host_only = IPv6TrustedHostMiddleware._host_only(public_host)
-        if host_only:
+        if host_only and host_only not in allowed_hosts:
             allowed_hosts.append(host_only)
     app.add_middleware(
         IPv6TrustedHostMiddleware,
@@ -1354,7 +1422,7 @@ def create_app() -> FastAPI:
     def _activities_context(request: Request, scan: Optional[dict] = None) -> dict:
         uid = _uid(request)
         settings = db.get_user_settings(uid)
-        candidates = paths.annotated_candidates()
+        candidates = discover(uid, "activity_candidates")
         saved = settings.get("activities_dir")
         prefill = saved or (candidates[0]["path"] if candidates else "")
         activities = db.list_activities(uid)
@@ -1639,6 +1707,104 @@ def create_app() -> FastAPI:
             }
         return JSONResponse(detail)
 
+    # Rides recorded by a connector while the link was down. Bounded so a
+    # buggy or hostile client cannot make the server hold an arbitrary amount:
+    # a day of 1 Hz samples is 86400, and no ride is a day long.
+    MAX_BUFFERED_RIDE_SAMPLES = 86400
+
+    @app.post("/api/connector/ride")
+    async def connector_ride_upload(request: Request):
+        """Accept a ride a connector buffered while it could not reach us.
+
+        Bearer-token authenticated like /connector/ws, not session
+        authenticated: this is the connector talking, and it has no cookie. It
+        goes through importer.save_ride_record, the same chain an in-process
+        ride uses, so a ride that happened to span a reconnect lands as exactly
+        the same row as one that did not - including the duplicate-linking that
+        pairs it with Zwift's own .fit for the same ride.
+        """
+        header = request.headers.get("authorization") or ""
+        scheme, _, token = header.partition(" ")
+        device = None
+        if scheme.lower() == "bearer" and token:
+            device = connectorauth.device_for_token(token.strip())
+        if device is None:
+            app.state.connector_failures.record_failure()
+            return JSONResponse({"error": "unauthorized"}, status_code=401)
+
+        try:
+            body = await request.json()
+        except Exception:
+            return JSONResponse({"error": "body must be JSON"}, status_code=400)
+        if not isinstance(body, dict):
+            return JSONResponse({"error": "body must be an object"}, status_code=400)
+
+        samples = body.get("samples") or {}
+        if not isinstance(samples, dict):
+            return JSONResponse({"error": "samples must be an object"},
+                                status_code=400)
+        power = samples.get("power") or []
+        if not isinstance(power, list) or not power:
+            return JSONResponse({"error": "samples.power is required"},
+                                status_code=400)
+        if len(power) > MAX_BUFFERED_RIDE_SAMPLES:
+            return JSONResponse({"error": "ride is too long"}, status_code=413)
+
+        try:
+            started_at = _dt.datetime.fromisoformat(str(body.get("started_at")))
+        except (TypeError, ValueError):
+            return JSONResponse(
+                {"error": "started_at must be an ISO timestamp"}, status_code=400
+            )
+        if started_at.tzinfo is not None:
+            # The app is naive-UTC end to end so an in-app ride and Zwift's
+            # .fit for it land on the same instant; normalise rather than
+            # storing an offset nothing else here understands.
+            started_at = started_at.astimezone(_dt.timezone.utc).replace(tzinfo=None)
+
+        workout_id = body.get("workout_id")
+        if workout_id is not None:
+            try:
+                workout_id = int(workout_id)
+            except (TypeError, ValueError):
+                return JSONResponse({"error": "workout_id must be an integer"},
+                                    status_code=400)
+            # Scoped, so a connector cannot attach a ride to a workout that is
+            # not its own user's.
+            if db.get_plan_workout(device["user_id"], workout_id) is None:
+                workout_id = None
+
+        try:
+            duration_s = int(body.get("duration_s") or len(power))
+        except (TypeError, ValueError):
+            return JSONResponse({"error": "duration_s must be an integer"},
+                                status_code=400)
+
+        activity_id, _record = await asyncio.to_thread(
+            importer.save_ride_record,
+            device["user_id"],
+            started_at,
+            duration_s,
+            {
+                "power": power,
+                "cadence": samples.get("cadence") or [],
+                "heartrate": samples.get("heartrate") or [],
+            },
+            str(body.get("name") or "Ride"),
+            float(body.get("ftp") or importer.current_ftp(device["user_id"])),
+            workout_id,
+        )
+        _log.info(
+            "connector '%s' uploaded a buffered ride -> activity %s",
+            device["label"], activity_id,
+        )
+        # activity_id is None when the ride is already stored - the connector
+        # retries until it gets an answer, so a duplicate upload must read as
+        # success rather than driving another retry.
+        return JSONResponse(
+            {"activity_id": activity_id, "duplicate": activity_id is None}
+        )
+
     @app.post("/api/activity/{activity_id}/rpe")
     def api_activity_rpe(
         request: Request, activity_id: int, rpe: int = Body(..., embed=True)
@@ -1666,21 +1832,25 @@ def create_app() -> FastAPI:
         this user returns 409 with the running status (no second scan starts).
         """
         uid = _uid(request)
-        # Confine the posted folder to the same roots /settings allows. This
-        # endpoint both SCANS the path (reading and parsing every *.fit under
-        # it) and PERSISTS it, so without this it was a way to point the
-        # importer - and every later background scan - at any directory on the
-        # machine, straight past the /settings check. Existence is not required
-        # here: the status panel reports "folder not found" for a path that is
-        # simply not on this machine, and scanning a path that does not exist
-        # reads nothing.
-        clean, err = paths.confine_storage_dir(activities_dir, must_exist=False)
-        if err:
-            return JSONResponse({"error": err}, status_code=400)
-        # Persist a typed directory as the user's activities_dir setting.
-        if clean:
-            db.save_user_settings(uid, {"activities_dir": clean})
-        started = _start_user_scan(uid, directory=clean or None)
+        posted = (activities_dir or "").strip()
+        # Persist a typed directory as the user's activities_dir setting -
+        # but only once it has passed the same containment check POST
+        # /settings applies. This route used to save it unchecked, which meant
+        # the Activities page was a way around the validation on the Settings
+        # page for the very same field.
+        if posted:
+            # require_exists=False: a folder that is not there is answered by
+            # the scan status ("exists": false), which is the more useful
+            # response and what the page already renders. Containment under a
+            # trusted root is the part that must not be skippable.
+            clean, error = _validate_dir(
+                posted, uid, require_exists=False, scope="activities"
+            )
+            if error:
+                return JSONResponse({"error": error}, status_code=400)
+            posted = clean or posted
+            db.save_user_settings(uid, {"activities_dir": posted})
+        started = _start_user_scan(uid, directory=posted or None)
         if started is None:
             return JSONResponse(_scan_status_snapshot(uid), status_code=409)
         return JSONResponse(started, status_code=202)
@@ -2096,32 +2266,33 @@ def create_app() -> FastAPI:
         user at the Settings picker. Never guesses between player folders.
         """
         settings = db.get_user_settings(uid)
-        target, reason = paths.resolve_export_dir(
-            settings.get("zwift_id"), settings.get("workouts_dir")
-        )
+        backend = get_backend(uid)
+        try:
+            target, reason = backend.resolve_export_dir(
+                settings.get("zwift_id"), settings.get("workouts_dir")
+            )
+        except BackendUnavailable:
+            # A new plan is still created and downloadable; only the automatic
+            # write into the Zwift folder is deferred.
+            return {"auto_export": None, "auto_export_reason": "offline"}
         if not target:
             return {
                 "auto_export": None,
-                "auto_export_reason": reason,  # 'choose' | 'missing' | 'blocked'
-                "auto_export_detail": "",
-                "zwift_candidates": paths.candidate_zwift_ids(),
+                "auto_export_reason": reason,  # 'choose' | 'missing'
+                "zwift_candidates": discover(uid, "zwift_id_candidates"),
             }
         workouts = db.plan_workouts_for_plan(uid, plan_id, include_zwo=True)
         try:
-            result = zwo.write_plan_to_zwift(
-                [
-                    {"date": w["date"], "name": w["name"], "zwo": w["zwo_or_segments"]}
-                    for w in workouts
-                ],
-                settings.get("zwift_id"),
-                # The STORED setting, not ``target``. workouts_override is the
-                # untrusted user value; handing a resolved directory back to it
-                # re-labels a folder the app DISCOVERED as one the user
-                # SUBMITTED, and it is then judged by the stricter
-                # submitted-path rule - which is how a relocated (junctioned)
-                # Zwift player folder resolved fine here and was refused one
-                # call later. Same resolver, same inputs, same directory.
-                workouts_override=settings.get("workouts_dir"),
+            result = backend.apply_exports(
+                ExportManifest(
+                    zwift_id=settings.get("zwift_id"),
+                    override=settings.get("workouts_dir"),
+                    write=[
+                        {"date": w["date"], "name": w["name"],
+                         "zwo": w["zwo_or_segments"]}
+                        for w in workouts
+                    ],
+                )
             )
         except paths.ExportTargetUnavailable as e:
             # The plan's rows are already committed at this point, so this may
@@ -2145,9 +2316,13 @@ def create_app() -> FastAPI:
             _log.warning("plan auto-export failed: %s", e)
             return {"auto_export": None, "auto_export_reason": "error",
                     "auto_export_detail": str(e)}
+        if result.get("status") != "ok":
+            return {"auto_export": None,
+                    "auto_export_reason": result["reason"] or result.get("status", "error"),
+                    "auto_export_detail": ""}
         return {
             "auto_export": {
-                "count": result["count"],
+                "count": result["exported"],
                 "directory": result["directory"],
                 "reason": reason,
             },
@@ -2324,23 +2499,23 @@ def create_app() -> FastAPI:
         exported = None
         export_error = None
         if workouts:
-            try:
-                result = zwo.write_plan_to_zwift(
-                    [
+            result = get_backend(uid).apply_exports(
+                ExportManifest(
+                    zwift_id=settings.get("zwift_id"),
+                    override=settings.get("workouts_dir"),
+                    write=[
                         {"date": w["date"], "name": w["name"],
                          "zwo": w["zwo_or_segments"]}
                         for w in workouts
                     ],
-                    settings.get("zwift_id"),
-                    workouts_override=settings.get("workouts_dir"),
+                    resolution="direct",
                 )
-            except paths.ExportTargetUnavailable as e:
-                # Nothing was written or created; the page explains why and
-                # points at Settings rather than claiming a bogus directory.
-                export_error = _export_error(e)
+            )
+            if result.get("status") == "ok":
+                exported = {"count": result["exported"], "directory": result["directory"]}
             else:
-                exported = {"count": result["count"],
-                            "directory": result["directory"]}
+                export_error = {"reason": result["reason"] or result.get("status", "error"),
+                                "detail": ""}
         summary = _plan_summary(uid, plan_id)
         return templates.TemplateResponse(
             request,
@@ -2396,18 +2571,20 @@ def create_app() -> FastAPI:
         summary = None
         if w:
             settings = db.get_user_settings(uid)
-            try:
-                result = zwo.write_plan_to_zwift(
-                    [{"date": w["date"], "name": w["name"],
-                      "zwo": w["zwo_or_segments"]}],
-                    settings.get("zwift_id"),
-                    workouts_override=settings.get("workouts_dir"),
+            result = get_backend(uid).apply_exports(
+                ExportManifest(
+                    zwift_id=settings.get("zwift_id"),
+                    override=settings.get("workouts_dir"),
+                    write=[{"date": w["date"], "name": w["name"],
+                            "zwo": w["zwo_or_segments"]}],
+                    resolution="direct",
                 )
-            except paths.ExportTargetUnavailable as e:
-                export_error = _export_error(e)
+            )
+            if result.get("status") == "ok":
+                exported = {"count": result["exported"], "directory": result["directory"]}
             else:
-                exported = {"count": result["count"],
-                            "directory": result["directory"]}
+                export_error = {"reason": result["reason"] or result.get("status", "error"),
+                                "detail": ""}
             summary = _plan_summary(uid, w["plan_id"])
         return templates.TemplateResponse(
             request,
@@ -2882,21 +3059,21 @@ def create_app() -> FastAPI:
                 status_code=400,
             )
         settings = db.get_user_settings(uid)
-        try:
-            result = zwo.write_plan_to_zwift(
-                [{"date": scheduled, "name": last["name"], "zwo": last["zwo"]}],
-                settings.get("zwift_id"),
-                workouts_override=settings.get("workouts_dir"),
+        result = get_backend(uid).apply_exports(
+            ExportManifest(
+                zwift_id=settings.get("zwift_id"),
+                override=settings.get("workouts_dir"),
+                write=[{"date": scheduled, "name": last["name"], "zwo": last["zwo"]}],
+                resolution="direct",
             )
-        except paths.ExportTargetUnavailable as e:
-            # No file exists, so no standalone_workouts row is recorded either:
-            # that row is what the calendar and the completion matcher treat as
-            # "this workout was exported to Zwift".
+        )
+        if result.get("status") != "ok":
             return templates.TemplateResponse(
                 request,
                 "plan.html",
                 _generate_ctx(request, mode="workout",
-                              export_error=_export_error(e)),
+                              export_error={"reason": result["reason"] or result.get("status", "error"),
+                                            "detail": ""}),
             )
         export_key = hashlib.sha256(
             f"{scheduled}\0{last['name']}\0{last['zwo']}".encode("utf-8")
@@ -2935,7 +3112,10 @@ def create_app() -> FastAPI:
                       calendar_feed_url: Optional[str] = None,
                       ftp_message: Optional[str] = None,
                       ftp_confirm_required: bool = False,
-                      ftp_form_value: Optional[str] = None) -> dict:
+                      ftp_form_value: Optional[str] = None,
+                      connector_message: Optional[str] = None,
+                      connector_new_token: Optional[str] = None,
+                      connector_new_label: Optional[str] = None) -> dict:
         settings = db.get_user_settings(uid)
         return _ctx(
             request,
@@ -2968,8 +3148,19 @@ def create_app() -> FastAPI:
             recent_best_effort_ftp=round(importer.recent_best_effort_ftp(uid), 1),
             api_key_set=config.anthropic_api_key_set(),
             saved=saved,
-            zwift_candidates=paths.candidate_zwift_ids(),
-            watch_default=paths.activities_dir(),
+            zwift_candidates=discover(uid, "zwift_id_candidates"),
+            watch_default=discover(uid, "default_activities_dir"),
+            # Rendered as a banner: the Settings page is where someone goes
+            # to find out why their connector is not working, so it must
+            # load without one.
+            connector_offline=is_offline(uid),
+            # Same contract as the calendar token: the list never contains a
+            # secret, and connector_new_token is only ever passed in by the
+            # route that just minted it - never read back out of the database.
+            connector_devices=connectorauth.list_devices(uid),
+            connector_message=connector_message,
+            connector_new_token=connector_new_token,
+            connector_new_label=connector_new_label,
             zwift_creds_saved=credstore.credentials_saved(uid),
             zwift_cred_backend=credstore.storage_backend(),
             cred_message=cred_message,
@@ -2979,13 +3170,25 @@ def create_app() -> FastAPI:
             restore_cmd=_restore_command(),
         )
 
-    def _validate_dir(value: str) -> "tuple[Optional[str], Optional[str]]":
-        """Confine a user-supplied folder path (must already exist).
+    def _validate_dir(
+        value: str, uid: Optional[int] = None, require_exists: bool = True,
+        scope: str = "",
+    ) -> "tuple[Optional[str], Optional[str]]":
+        """Validate a user-supplied folder path against the trusted roots.
 
-        Thin wrapper over paths.confine_storage_dir so this route and
-        /activities/rescan share one rule; see that function for the policy.
+        Delegated to the backend because the check has to run on the machine
+        that owns the path: in a server/client install these are the *client's*
+        folders, and measuring them against the container's home directory
+        would reject every legitimate answer.
+
+        ``scope`` names the field, so the machine that owns the path answers
+        with the rule that will govern it in use. Without it a split install
+        accepts an activities folder here and then declines to scan it, which
+        is a saved setting that does nothing.
         """
-        return paths.confine_storage_dir(value, must_exist=True)
+        return get_backend(uid).validate_dir(
+            value, require_exists=require_exists, scope=scope
+        )
 
     @app.get("/settings", response_class=HTMLResponse)
     def settings_page(request: Request):
@@ -3034,11 +3237,15 @@ def create_app() -> FastAPI:
         # Confine user-supplied folders to existing directories under $HOME; a
         # rejected folder is dropped from the update (existing value kept).
         dir_msgs: List[str] = []
-        clean_activities, act_err = _validate_dir(activities_dir)
+        clean_activities, act_err = _validate_dir(
+            activities_dir, uid, scope="activities"
+        )
         if act_err:
             dir_msgs.append(act_err)
             clean_activities = ""  # don't persist an invalid path
-        clean_workouts, wk_err = _validate_dir(workouts_dir)
+        clean_workouts, wk_err = _validate_dir(
+            workouts_dir, uid, scope="workouts"
+        )
         if wk_err:
             dir_msgs.append(wk_err)
             clean_workouts = ""
@@ -3157,6 +3364,69 @@ def create_app() -> FastAPI:
         response.headers["Cache-Control"] = "private, no-store"
         return response
 
+    @app.post("/settings/connector", response_class=HTMLResponse)
+    def settings_connector_pair(request: Request, label: str = Form("")):
+        """Pair a new connector machine and show its token exactly once.
+
+        Same shape as the calendar-feed action: session-authenticated,
+        same-origin checked, and the plaintext is rendered into this one
+        response and then discarded - only the hash is stored, so this is the
+        only moment it can be copied.
+        """
+        if not _same_origin_or_absent(request):
+            return PlainTextResponse("Origin not allowed", status_code=403)
+        uid = _uid(request)
+        clean = connectorauth.clean_label(label)
+        minted = connectorauth.generate_token(uid, clean)
+        if minted is None:
+            return templates.TemplateResponse(
+                request, "settings.html",
+                _settings_ctx(request, uid, False,
+                              connector_message="Could not pair the device."),
+                status_code=500,
+            )
+        _device_id, token = minted
+        response = templates.TemplateResponse(
+            request, "settings.html",
+            _settings_ctx(
+                request, uid, False,
+                connector_message=(
+                    "Device paired. Copy the token now - it is not shown again."
+                ),
+                connector_new_token=token,
+                connector_new_label=clean,
+            ),
+        )
+        # This page body contains the plaintext token exactly once.
+        response.headers["Cache-Control"] = "private, no-store"
+        return response
+
+    @app.post("/settings/connector/{device_id}/revoke", response_class=HTMLResponse)
+    def settings_connector_revoke(request: Request, device_id: int):
+        if not _same_origin_or_absent(request):
+            return PlainTextResponse("Origin not allowed", status_code=403)
+        uid = _uid(request)
+        # Scoped by uid inside the delete, so a guessed id cannot unpair
+        # someone else's machine. A miss is reported the same as a hit would
+        # be if it were someone else's - there is nothing to learn either way.
+        revoked = connectorauth.revoke(uid, device_id)
+        if revoked:
+            # Deleting the row settles the next connection; this settles the
+            # one that is open. Without it a revoked machine keeps serving RPC
+            # over its existing socket until the server restarts, while the
+            # page tells the owner the token no longer works.
+            connectorhub.close_device(uid, device_id)
+        return templates.TemplateResponse(
+            request, "settings.html",
+            _settings_ctx(
+                request, uid, False,
+                connector_message=(
+                    "Device revoked. Its token no longer works."
+                    if revoked else "No such device."
+                ),
+            ),
+        )
+
     @app.post("/settings/backup", response_class=HTMLResponse)
     def settings_backup_now(request: Request):
         uid = _uid(request)
@@ -3189,7 +3459,7 @@ def create_app() -> FastAPI:
             weight_kg=data["weight_kg"],
             rider_id=zid if zid.isdigit() else "",
             saved_zwift_id=zid,
-            workouts_root=paths.zwift_workouts_root(),
+            workouts_root=discover(uid, "workouts_root"),
             refreshed=refreshed,
         )
 
@@ -3363,8 +3633,111 @@ def create_app() -> FastAPI:
         payload["variant_profiles"] = all_variants
         return JSONResponse(payload)
 
+    @app.websocket("/connector/ws")
+    async def connector_ws(websocket: WebSocket):
+        """A connector machine attaching itself to this server.
+
+        Authenticated by a per-device bearer token, not a session cookie - the
+        connector is not a browser and has no login. Note this handler is
+        reached without AuthMiddleware running at all: Starlette's
+        BaseHTTPMiddleware only wraps http scopes, so every websocket route in
+        this app does its own auth (the ride socket reads the session; this one
+        reads the header).
+
+        No Origin check here, unlike /ride/ws. That check exists to stop a
+        malicious *web page* from driving a socket with the user's ambient
+        cookie; this endpoint ignores cookies entirely and demands a secret the
+        browser does not have, so an Origin would add nothing - and a native
+        client has no Origin to send in the first place.
+        """
+        header = websocket.headers.get("authorization") or ""
+        scheme, _, token = header.partition(" ")
+        device = None
+        if scheme.lower() == "bearer" and token:
+            device = connectorauth.device_for_token(token.strip())
+        if device is None:
+            count = app.state.connector_failures.record_failure()
+            _log.warning(
+                "rejected connector token (%d rejected since start)", count
+            )
+            # Refused before accept(), so nothing is ever sent to a caller that
+            # did not prove it holds a token. 1008 = policy violation.
+            await websocket.close(code=1008)
+            return
+
+        await websocket.accept()
+        peer = rpc.RpcPeer(_ConnectorSocket(websocket))
+
+        async def _hang_up(code: int = 1000) -> None:
+            try:
+                await websocket.close(code=code)
+            except Exception:
+                pass  # already gone; nothing to do
+
+        session = connectorhub.ConnectorSession(
+            user_id=device["user_id"],
+            device_id=device["device_id"],
+            label=device["label"],
+            peer=peer,
+            loop=asyncio.get_running_loop(),
+            closer=_hang_up,
+        )
+        displaced = connectorhub.register(session)
+        _log.info(
+            "connector '%s' attached for user %s%s",
+            session.label, session.user_id,
+            " (replacing an earlier one)" if displaced else "",
+        )
+        try:
+            await websocket.send_json(
+                {"event": "hello", "protocol": rpc.PROTOCOL_VERSION,
+                 "device": session.label}
+            )
+            while True:
+                message = rpc.decode(await websocket.receive_text())
+                if peer.resolve(message):
+                    continue
+                # Connector -> server events. The connector never sends
+                # requests: the server owns the database and therefore owns
+                # every decision. Unknown events are ignored rather than
+                # fatal, so an older server tolerates a newer connector.
+                event = message.get("event")
+                if event:
+                    await _handle_connector_event(session, event, message)
+        except (WebSocketDisconnect, rpc.ProtocolError) as exc:
+            if isinstance(exc, rpc.ProtocolError):
+                _log.warning("connector %s protocol error: %s", session.label, exc)
+        except Exception:
+            _log.warning(
+                "connector %s failed", session.label, exc_info=True
+            )
+        finally:
+            connectorhub.unregister(session)
+            _log.info("connector '%s' detached", session.label)
+
+    async def _handle_connector_event(session, event: str, message: dict) -> None:
+        """Route one connector-originated event.
+
+        Only ride telemetry so far, and it is fire-and-forget by design: a
+        dropped frame costs one second of a chart, whereas acknowledging every
+        sample would put a round trip in the middle of a 1 Hz loop.
+        """
+        if event == "ble.sample":
+            sink = session.ble_sink
+            if sink is not None:
+                sink.update(
+                    power=message.get("power"),
+                    cadence=message.get("cadence"),
+                    hr=message.get("hr"),
+                    # The connector's own index for this sample. What makes a
+                    # reconnect ask for exactly the seconds it missed.
+                    index=message.get("n"),
+                )
+            return
+        _log.debug("ignoring unknown connector event %s", event)
+
     @app.get("/ride", response_class=HTMLResponse)
-    def ride_page(request: Request, workout_id: Optional[int] = None):
+    async def ride_page(request: Request, workout_id: Optional[int] = None):
         uid = _uid(request)
         selected_workout = None
         if workout_id is not None:
@@ -3378,7 +3751,7 @@ def create_app() -> FastAPI:
             w["id"] == selected_workout["id"] for w in workouts
         ):
             workouts.append(selected_workout)
-        available, reason = bledevices.bluetooth_available()
+        available, reason = await _ble_available(uid)
         return templates.TemplateResponse(
             request,
             "ride.html",
@@ -3396,19 +3769,24 @@ def create_app() -> FastAPI:
         )
 
     @app.get("/ride/status")
-    def ride_status(request: Request):
-        available, reason = bledevices.bluetooth_available()
+    async def ride_status(request: Request):
+        available, reason = await _ble_available(_uid(request))
         return JSONResponse({"available": available, "reason": reason})
 
     @app.post("/ride/scan")
     async def ride_scan(request: Request):
-        available, reason = bledevices.bluetooth_available()
+        uid = _uid(request)
+        available, reason = await _ble_available(uid)
         if not available:
             return JSONResponse(
                 {"available": False, "reason": reason, "devices": []}
             )
         try:
-            found = await bledevices.scan()
+            session = _ble_session(uid)
+            found = (
+                await bledevices.scan() if session is None
+                else await remote_ble.scan(session)
+            )
             if not found:
                 return JSONResponse(
                     {
@@ -3427,10 +3805,33 @@ def create_app() -> FastAPI:
                 {"available": False, "reason": str(e), "devices": []}
             )
 
+    async def _ble_available(uid: Optional[int]) -> "tuple[bool, str]":
+        """Whether a BLE radio is usable, here or on the connector's machine."""
+        if backend_mode() == "local":
+            return bledevices.bluetooth_available()
+        session = connectorhub.get(uid)
+        if session is None:
+            return False, (
+                "No connector is attached. Start the wattracker connector on "
+                "the machine where Zwift and your trainer are."
+            )
+        return await remote_ble.bluetooth_available(session)
+
+    def _ble_session(uid: Optional[int]):
+        """The connector to ride through, or None in local mode."""
+        return None if backend_mode() == "local" else connectorhub.require(uid)
+
     def _ws_origin_ok(websocket: WebSocket) -> bool:
-        """Allow only same-origin (local) browsers; a cross-site page always
-        sends an Origin that won't match. A missing Origin (native BLE/CLI
-        clients that aren't browsers) is allowed."""
+        """Allow only same-origin browsers; a cross-site page always sends an
+        Origin that won't match. A missing Origin (native BLE/CLI clients that
+        aren't browsers) is allowed.
+
+        The configured public hosts count as same-origin: reached over a LAN
+        name, the ride page's own Origin *is* that name, so an allowlist of
+        just localhost would refuse the very page this server served. The
+        names come from the same validated setting that feeds the Host
+        allowlist, so this cannot be widened independently of that.
+        """
         origin = websocket.headers.get("origin")
         if not origin:
             return True
@@ -3438,7 +3839,12 @@ def create_app() -> FastAPI:
             host = _url.urlparse(origin).hostname
         except ValueError:
             return False
-        return host in _ALLOWED_WS_ORIGIN_HOSTS
+        if host in _ALLOWED_WS_ORIGIN_HOSTS:
+            return True
+        return any(
+            host == IPv6TrustedHostMiddleware._host_only(public)
+            for public in config.public_hosts()
+        )
 
     def _selected_ble_addresses(params) -> Optional[dict]:
         """Parse an explicit, bounded sensor selection from WS query params."""
@@ -3540,6 +3946,11 @@ def create_app() -> FastAPI:
                 else:
                     trainer.set_target_power(0)
                     trainer.stop_erg()
+        except ConnectorUnavailable:
+            # Transport failure — do not report as ERG-disabled. Let the
+            # per-tick caller distinguish "we could not ask" from "the trainer
+            # said no" so it skips this tick rather than counting a failure.
+            raise
         except Exception as exc:
             available, current = _connection_erg_state(conn)
             return available, False if enabled else current, str(exc)
@@ -3549,6 +3960,130 @@ def create_app() -> FastAPI:
         if not hasattr(trainer, "erg_enabled"):
             actual = enabled
         return available, actual, None
+
+    def _connector_live(conn: Optional[dict]) -> bool:
+        """Is the machine holding the radio still reachable?
+
+        Always true in local mode, where the radio is this process's own.
+        """
+        if not isinstance(conn, remote_ble.RemoteConnection):
+            return True
+        return conn.live_session is not None
+
+    async def _resume_after_offline(
+        websocket: WebSocket,
+        conn: "remote_ble.RemoteConnection",
+        controller: RideController,
+        offline_s: float,
+    ) -> bool:
+        """Take the ride back over, replaying the seconds we were not here for.
+
+        The connector kept sampling into its own buffer throughout, so the
+        missing seconds exist - they just have not been through the state
+        machine. Ticking them in one at a time is what makes the saved
+        activity identical to one that never dropped: elapsed advances,
+        pause and resume land where the rider actually stopped and started,
+        and the samples go in in order rather than leaving a hole.
+
+        Returns False when there is no ride left to carry on with, because the
+        connector ended it while we were away.
+        """
+        still_riding = True
+        try:
+            rows, still_riding = await remote_ble.resume_ride(conn)
+        except Exception as exc:
+            # Do not fail the ride over a failed catch-up. Riding on with a
+            # gap is strictly better than ending a workout the rider is still
+            # in the middle of.
+            _log.warning("could not replay the missed ride samples: %s", exc)
+            rows = []
+        for power, cadence, hr in rows:
+            controller.tick(
+                power=int(power or 0), cadence=cadence, hr=hr, dt=1
+            )
+        await websocket.send_json({
+            "status": "connector_resumed",
+            "offline_s": round(offline_s, 1),
+            "replayed": len(rows),
+            "riding": still_riding,
+            "message": (
+                f"Connector back after {int(offline_s)}s"
+                + (f"; recovered {len(rows)} seconds of riding." if rows
+                   else ".")
+            ),
+        })
+        return still_riding
+
+    def _connector_is_buffering(conn: Optional[dict]) -> bool:
+        """Has the connector demonstrably been recording this ride?
+
+        Every sample it sends carries its index in its own buffer, so an index
+        having arrived is proof there is a file on the far end holding the
+        ride. If none ever did - the buffer failed to open, or it is an older
+        connector - then handing it the record would hand it to nobody.
+        """
+        return (
+            isinstance(conn, remote_ble.RemoteConnection)
+            and conn.sink.index is not None
+        )
+
+    async def _defer_ride_to_connector(
+        websocket: WebSocket, controller: RideController,
+        conn: Optional[dict], offline_s: float,
+    ) -> bool:
+        """End a ride whose connector is not here, and save nothing.
+
+        The connector still holds the whole ride - every second of it,
+        including the ones this end never saw - and uploads it the moment it
+        can reach us again. Writing our own truncated copy first would not
+        merely be worse data: the dedup hash is over (start, duration), so the
+        short row and the complete one differ and both land, leaving one ride
+        stored as two activities.
+
+        Every way a ride can end while the connector is away goes through
+        here - the wait timing out, the rider pressing stop, and the connector
+        having ended the ride itself - because they would all otherwise
+        produce that second row.
+
+        Returns whether the record was handed over, which callers keep: it is
+        what stops the ``finally`` from telling a connector that reconnects in
+        the meantime to throw the buffer away. That would lose the ride
+        outright - and so, for the same reason, would deferring to a connector
+        that turns out not to be buffering at all.
+        """
+        if not _connector_is_buffering(conn):
+            _log.warning(
+                "the connector never reported buffering this ride; saving "
+                "what reached us rather than deferring to a file that may "
+                "not exist"
+            )
+            await websocket.send_json({
+                "status": "connector_lost",
+                "offline_s": round(offline_s, 1),
+                "buffered": False,
+                "message": (
+                    "The connector is not reachable and never reported "
+                    "recording locally. The ride was saved here, as far as it "
+                    "got."
+                ),
+            })
+            return False
+        controller.autosave = False
+        _log.warning(
+            "ending a ride with no connector attached (away %.0fs); it will "
+            "arrive as a buffered upload when the connector reconnects",
+            offline_s,
+        )
+        await websocket.send_json({
+            "status": "connector_lost",
+            "offline_s": round(offline_s, 1),
+            "buffered": True,
+            "message": (
+                "The connector is not reachable. The ride was recorded on "
+                "your PC and will appear in Activities once it reconnects."
+            ),
+        })
+        return True
 
     @app.websocket("/ride/ws")
     async def ride_ws(websocket: WebSocket):
@@ -3591,7 +4126,7 @@ def create_app() -> FastAPI:
         ftp = importer.current_ftp(uid)
         workout_payload = _ride_workout_payload(session, ftp, ride_name)
         await websocket.send_json({"status": "workout", "workout": workout_payload})
-        available, reason = bledevices.bluetooth_available()
+        available, reason = (False, "") if sim else await _ble_available(uid)
 
         # Without a simulation request and without hardware, report the
         # unavailable state (page still works) and close cleanly.
@@ -3601,8 +4136,14 @@ def create_app() -> FastAPI:
                     "status": "unavailable",
                     "ble_available": available,
                     "reason": reason,
-                    "message": "Bluetooth riding needs an adapter and `pip install "
-                    ".[ble]`. Use Simulate to preview the live screen.",
+                    "message": (
+                        "Bluetooth riding needs a connector running on the "
+                        "machine with your trainer. Use Simulate to preview "
+                        "the live screen."
+                        if backend_mode() == "server" else
+                        "Bluetooth riding needs an adapter and `pip install "
+                        ".[ble]`. Use Simulate to preview the live screen."
+                    ),
                 }
             )
             await websocket.close()
@@ -3617,9 +4158,33 @@ def create_app() -> FastAPI:
             receive_task = None
             action_queue = None
             abnormal_cleanup = False
+            # True once the ride's record has been handed to the connector's
+            # buffer. Keeps the cleanup below from telling it to discard the
+            # only copy.
+            deferred = False
             try:
                 try:
-                    if selected is None:
+                    ble_session = _ble_session(uid)
+                    if ble_session is not None:
+                        conn = await remote_ble.connect_sensors(
+                            ble_session,
+                            selected=selected,
+                            # So a ride survives losing us mid-way: the
+                            # connector keeps recording against this identity
+                            # and uploads it once it can reach us again.
+                            ride={
+                                "started_at": utc_now().isoformat(),
+                                "name": session.name,
+                                "ftp": float(ftp),
+                                "workout_id": selected_workout_id,
+                            },
+                            # By user, not the session object we connected
+                            # through: a connector that drops and comes back
+                            # is a *new* session, and a ride that outlives the
+                            # socket has to find the new one.
+                            resolve_session=lambda: connectorhub.get(uid),
+                        )
+                    elif selected is None:
                         conn = await bledevices.connect_sensors()
                     else:
                         conn = await bledevices.connect_sensors(selected=selected)
@@ -3686,7 +4251,10 @@ def create_app() -> FastAPI:
                             )
                             return None
                         try:
-                            await bledevices.disconnect_sensor(conn, address)
+                            if isinstance(conn, remote_ble.RemoteConnection):
+                                await remote_ble.disconnect_sensor(conn, address)
+                            else:
+                                await bledevices.disconnect_sensor(conn, address)
                             if controller is not None:
                                 controller.update_sources(
                                     trainer=conn.get("trainer"),
@@ -3826,16 +4394,83 @@ def create_app() -> FastAPI:
                         }
                     )
                 inactive_s = 0.0
+                offline_s = 0.0
+                resumed = False
                 while controller.status != "finished":
                     tick_started = _ride_loop_time()
                     if action_queue is not None:
                         while not action_queue.empty():
                             outcome = await _handle_action(action_queue.get_nowait())
                             if outcome == "stop":
+                                if not _connector_live(conn):
+                                    deferred = await _defer_ride_to_connector(
+                                        websocket, controller, conn, offline_s
+                                    )
                                 controller.stop()
                                 break
                     if controller.status == "finished":
                         break
+
+                    # The connector is the radio. Losing it is not the rider
+                    # stopping, so the controller is *frozen* rather than
+                    # polled: ticking it against a silent sink would fabricate
+                    # zero-power seconds, pause the workout and start the
+                    # inactivity clock on a rider who is still pedalling. The
+                    # real seconds are on the connector's disk and get replayed
+                    # when it comes back.
+                    if not _connector_live(conn):
+                        if offline_s == 0.0:
+                            _log.warning(
+                                "connector went away mid-ride for user %s; "
+                                "holding the ride open", uid,
+                            )
+                            await websocket.send_json({
+                                "status": "connector_offline",
+                                "message": (
+                                    "Lost the connector. Your PC is still "
+                                    "recording and the trainer is holding its "
+                                    "target - reconnecting."
+                                ),
+                            })
+                        offline_s += RIDE_POLL_INTERVAL_S
+                        if offline_s >= CONNECTOR_OFFLINE_TIMEOUT_S:
+                            deferred = await _defer_ride_to_connector(
+                                websocket, controller, conn, offline_s
+                            )
+                            controller.stop()
+                            break
+                        await websocket.send_json({
+                            **controller.state(),
+                            "connector_offline": True,
+                            "offline_s": round(offline_s, 1),
+                        })
+                        await _ride_sleep(
+                            max(0.0,
+                                RIDE_POLL_INTERVAL_S
+                                - (_ride_loop_time() - tick_started))
+                        )
+                        continue
+
+                    if offline_s:
+                        still_riding = await _resume_after_offline(
+                            websocket, conn, controller, offline_s
+                        )
+                        if not still_riding:
+                            # The connector gave up on this ride before we
+                            # came back - the rider stopped for long enough
+                            # with nobody driving. Its buffer is the record,
+                            # exactly as when we are the ones who give up.
+                            deferred = await _defer_ride_to_connector(
+                                websocket, controller, conn, offline_s
+                            )
+                            controller.stop()
+                            break
+                        offline_s = 0.0
+                        # The trainer has been holding one target throughout,
+                        # and may well have dropped out of ERG when the FTMS
+                        # writes stopped. Re-arm rather than nudge.
+                        resumed = True
+
                     previous_status = controller.status
                     controller.poll(dt=1)
                     if (
@@ -3843,55 +4478,61 @@ def create_app() -> FastAPI:
                         and controller.status in
                         ("running", "cooldown", "finished")
                     ):
-                        (
-                            command_available,
-                            command_enabled,
-                            command_error,
-                        ) = await _set_connection_erg(
-                            conn,
-                            True,
-                            controller.current_target,
-                            force_rearm=(
-                                # A failed command may have left the trainer out
-                                # of ERG (BleakTrainer clears its own flag before
-                                # re-raising), so a bare target would not put it
-                                # back. Retry with the full arming sequence.
-                                erg_failures > 0
-                                or (previous_status == "paused"
-                                    and controller.status == "running")
-                            ),
-                        )
-                        controller.erg_available = command_available
-                        if not command_error:
-                            erg_failures = 0
-                            controller.set_erg_enabled(
-                                command_enabled, command_trainer=False
+                        try:
+                            (
+                                command_available,
+                                command_enabled,
+                                command_error,
+                            ) = await _set_connection_erg(
+                                conn,
+                                True,
+                                controller.current_target,
+                                force_rearm=(
+                                    erg_failures > 0
+                                    or resumed
+                                    or (previous_status == "paused"
+                                        and controller.status == "running")
+                                ),
                             )
+                        except ConnectorUnavailable:
+                            # Transport failure — skip this tick's ERG command
+                            # so the next iteration's _connector_live check
+                            # transitions to the freeze path. Do not count as
+                            # a trainer refusal and do not touch erg_enabled.
+                            resumed = False
                         else:
-                            erg_failures += 1
-                            # Do NOT mirror the failure into controller.erg_enabled
-                            # while retrying. The per-tick ERG block is gated on
-                            # that flag and nothing outside the block ever sets it
-                            # back, so clearing it here would latch ERG off for the
-                            # rest of the ride on a single transient fault.
-                            if erg_failures >= ERG_COMMAND_FAILURE_LIMIT:
+                            resumed = False
+                            controller.erg_available = command_available
+                            if not command_error:
+                                erg_failures = 0
                                 controller.set_erg_enabled(
-                                    False, command_trainer=False
+                                    command_enabled, command_trainer=False
                                 )
-                                await websocket.send_json(
-                                    {
-                                        "status": "erg",
-                                        "available": command_available,
-                                        "enabled": False,
-                                        "error": command_error,
-                                        "message": (
-                                            "ERG switched off after "
-                                            f"{erg_failures} consecutive failed "
-                                            "trainer commands. Re-enable it to "
-                                            "try again."
-                                        ),
-                                    }
-                                )
+                            else:
+                                erg_failures += 1
+                                # Do NOT mirror the failure into controller.erg_enabled
+                                # while retrying. The per-tick ERG block is gated on
+                                # that flag and nothing outside the block ever sets it
+                                # back, so clearing it here would latch ERG off for the
+                                # rest of the ride on a single transient fault.
+                                if erg_failures >= ERG_COMMAND_FAILURE_LIMIT:
+                                    controller.set_erg_enabled(
+                                        False, command_trainer=False
+                                    )
+                                    await websocket.send_json(
+                                        {
+                                            "status": "erg",
+                                            "available": command_available,
+                                            "enabled": False,
+                                            "error": command_error,
+                                            "message": (
+                                                "ERG switched off after "
+                                                f"{erg_failures} consecutive failed "
+                                                "trainer commands. Re-enable it to "
+                                                "try again."
+                                            ),
+                                        }
+                                    )
                     await websocket.send_json(controller.state())
                     if controller.current_power > 0:
                         inactive_s = 0.0
@@ -3928,6 +4569,15 @@ def create_app() -> FastAPI:
                 # once a ride actually started. An idle controller must not
                 # create a zero-duration activity.
                 try:
+                    if controller is not None and not _connector_live(conn):
+                        # Same reasoning as _defer_ride_to_connector: the
+                        # connector holds a complete copy and will upload it,
+                        # and a truncated row here would land beside it rather
+                        # than dedupe against it. No frame is sent - the socket
+                        # is the thing that just failed.
+                        if _connector_is_buffering(conn):
+                            controller.autosave = False
+                            deferred = True
                     if (
                         controller is not None
                         and controller.has_started
@@ -3954,6 +4604,27 @@ def create_app() -> FastAPI:
                         await client.disconnect()
                     except BaseException:
                         pass
+                if isinstance(conn, remote_ble.RemoteConnection):
+                    # The radio is on the other machine, so releasing it is an
+                    # explicit request rather than a local disconnect. The ride
+                    # page reopens after a short delay expecting a free
+                    # adapter, and with a network hop in the middle that delay
+                    # is no longer enough on its own - so ask, and wait.
+                    #
+                    # Reaching the connector here is also what tells it the
+                    # ride ended cleanly, so it can drop its buffer. If it is
+                    # unreachable this call simply fails, the buffer survives,
+                    # and the ride arrives as an upload instead - which is
+                    # exactly the outcome that case wants.
+                    live = conn.live_session
+                    if live is not None:
+                        try:
+                            live.ble_sink = None
+                            await live.call(
+                                "ble.release", {"discard_buffer": not deferred}
+                            )
+                        except BaseException:
+                            pass
                 try:
                     await websocket.close()
                 except BaseException:

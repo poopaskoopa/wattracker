@@ -7,7 +7,7 @@ import webbrowser
 
 import uvicorn
 
-from . import config
+from . import config, rpc
 
 
 def _open_browser(url: str) -> None:
@@ -40,6 +40,13 @@ def main() -> None:
         port=port,
         reload=False,
         proxy_headers=False,
+        # The connector's frames carry base64 .fit files, so rpc.MAX_FRAME_BYTES
+        # is sized for MAX_UPLOAD_BYTES * 4/3 plus envelope. uvicorn's own
+        # default is 16 MiB, which silently overrode it: a .fit over ~12 MiB
+        # closed the socket with 1009 mid-activities.read, and because the file
+        # never reached scanned_files the next scan fetched and dropped it
+        # again. The codec's limit is the limit; this is what makes it so.
+        ws_max_size=rpc.MAX_FRAME_BYTES,
     )
 
 

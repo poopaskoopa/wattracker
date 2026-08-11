@@ -160,8 +160,96 @@ Runtime variables include `WATTRACKER_DATA_DIR`, `WATTRACKER_DB`,
 local reverse proxy — `tailscale serve` on the owner's tailnet — forwards under:
 it is added to the Host allowlist as that exact name (no wildcards, no suffix
 matching) and is the host calendar subscription links are minted from, with
-`WATTRACKER_PUBLIC_SCHEME` (`https` by default) as their scheme. The bind stays
-loopback-only either way; this must never be pointed at an internet-facing name.
+`WATTRACKER_PUBLIC_SCHEME` (`https` by default) as their scheme.
+`WATTRACKER_PUBLIC_HOSTS` is the comma-separated form, for a server on a LAN
+that is legitimately reached as an IP, a short hostname and a `.local` name at
+once; every entry goes through the same strict validator.
+
+## Server and connector
+
+wattracker can also be split in two: the storage and web UI run as a container
+on a networked server, and a small **connector** runs on the machine where
+Zwift is installed. Only three things actually need to be next to Zwift —
+reading `.fit` files, writing `.zwo` files, and talking BLE to the trainer — so
+that is all the connector does. Everything else stays on the server.
+
+The connector dials *out* to the server and holds one WebSocket, so the Zwift
+machine needs no open ports.
+
+```sh
+# On the server
+docker compose up -d          # or: docker run -v wattracker-data:/data -p 8000:8000 wattracker
+```
+
+Set `WATTRACKER_PUBLIC_HOSTS` to every name you will reach it by — an IP, a
+hostname and a `.local` name are three separate entries — or only `localhost`
+is accepted. Then, in the web UI, open **Settings → Connector devices**, pair a
+device, and copy the token (it is shown once).
+
+```powershell
+# On the Zwift machine
+wattracker-connector --server http://192.168.1.10:8000 --token <TOKEN> --save
+wattracker-connector          # from then on, reusing the saved settings
+```
+
+Only **one connector per account** may run at a time. A second one takes over,
+and the first stops with a message saying so rather than fighting it for the
+connection.
+
+If the connector is not running, the server keeps working: pages load, plans
+generate, and the **Download .zip** / **Download .zwo** buttons still export
+by hand. Only the automatic reads and writes to the Zwift folders wait.
+
+Multi-arch images (x86-64 and ARM, for a Pi or a NAS):
+
+```sh
+# One-off on an x86 host, to register ARM emulation:
+docker run --privileged --rm tonistiigi/binfmt --install arm64
+docker buildx build --platform linux/amd64,linux/arm64 -t wattracker .
+```
+
+The image needs no compiler on either architecture — numpy, pandas and scipy
+all publish manylinux wheels for `aarch64`. **The `linux/amd64` build is the
+one that has actually been run and tested; `linux/arm64` is expected to work
+for that reason but has not been built here.**
+
+The database lives on the `/data` volume in WAL mode, so it must be on **local
+disk** — SQLite in WAL mode corrupts on NFS/SMB. The compose file uses a named
+volume for that reason. To restore a backup, stop the container and run
+`wattracker-restore` in a one-shot container against the same volume:
+
+```sh
+docker compose down
+docker run --rm -it -v wattracker-data:/data wattracker wattracker-restore
+```
+
+Binding beyond loopback needs two variables, not one:
+
+```sh
+WATTRACKER_HOST=0.0.0.0 WATTRACKER_ALLOW_NON_LOOPBACK=1 python -m wattracker
+```
+
+The second is deliberately separate. Every other control here — the Host
+allowlist, the WebSocket origin check, a session cookie with no `Secure` flag,
+no rate limiting beyond `/login` — was written assuming a loopback bind, so
+widening it must be a decision rather than a typo.
+
+**What plain HTTP on a LAN actually exposes.** The session cookie and the
+connector's bearer token both travel in clear text. Anyone who can see traffic
+on that network — or who is on the same wifi — can read them and act as you.
+That is an acceptable trade on a trusted home network and nowhere else. It is
+not safe on shared, guest, or public wifi, and it must never be pointed at an
+internet-facing name.
+
+To remove that exposure, terminate TLS in front and set two more variables:
+
+```sh
+WATTRACKER_COOKIE_SECURE=1
+WATTRACKER_PUBLIC_SCHEME=https
+```
+
+`tailscale serve` is the least-effort option (it does TLS and keeps the server
+off the public internet); Caddy or nginx work equally well.
 
 ## Backup, packages, and Windows validation
 

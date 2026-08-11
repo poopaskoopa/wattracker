@@ -1,6 +1,7 @@
 """Render a Session to Zwift .zwo workout XML and write it to the Zwift folder."""
 from __future__ import annotations
 
+import ntpath
 import os
 import re
 import xml.etree.ElementTree as ET
@@ -9,6 +10,9 @@ from xml.dom import minidom
 from .planner import Segment, Session
 
 _NAME_RE = re.compile(r"(<name>)(.*?)(</name>)", re.DOTALL)
+
+# A plan workout's date. Anything else is not a date, whatever produced it.
+_ISO_DATE_RE = re.compile(r"\A\d{4}-\d{2}-\d{2}\Z")
 
 
 def dated_name_zwo(zwo_str: str, date_iso: str) -> str:
@@ -133,16 +137,56 @@ def _safe_filename(name: str) -> str:
     return (base or "workout") + ".zwo"
 
 
+def _safe_component(value: str) -> str:
+    """Reduce a string to characters that can only ever be part of ONE name.
+
+    Every separator - ``/``, ``\\``, a Windows drive colon - becomes ``_``, so
+    whatever comes out cannot address anything but a file in the directory it
+    is joined onto.
+    """
+    return "".join(c if (c.isalnum() or c in " -_.") else "_" for c in value).strip()
+
+
 def plan_filename(date_iso: str, name: str) -> str:
-    """Date-led, filesystem-safe .zwo filename, e.g. '2026-07-07 VO2 5x4.zwo'."""
-    safe = "".join(c if (c.isalnum() or c in " -_.") else "_" for c in name).strip()
-    safe = safe or "workout"
-    return f"{date_iso} {safe}.zwo"
+    """Date-led, filesystem-safe .zwo filename, e.g. '2026-07-07 VO2 5x4.zwo'.
+
+    BOTH halves are sanitised. The date used to be interpolated raw, which was
+    safe only by accident: every caller read it from a plan row that had been
+    through ``_dt.date.fromisoformat``. It is now also built from an export
+    manifest that crossed a network, where a ``date`` of ``/etc/cron.d/x`` or
+    ``../../../.config/autostart/pwn`` turned a workout export into a write to
+    an arbitrary absolute path - no ``..`` even required. A value that is not a
+    bare ``YYYY-MM-DD`` is not a date, so it goes through the same character
+    filter as the name and stays one path component.
+    """
+    raw_date = str(date_iso or "")
+    date = raw_date if _ISO_DATE_RE.match(raw_date) else (
+        _safe_component(raw_date) or "undated"
+    )
+    safe = _safe_component(str(name or "")) or "workout"
+    return f"{date} {safe}.zwo"
+
+
+def _bare_name(filename: str) -> bool:
+    """True when ``filename`` names a file and cannot leave the folder it joins.
+
+    Checked with BOTH path flavours on purpose: a name that is inert on the OS
+    that produced it must not become traversal on the OS that consumes it, and
+    in a server/client install those are routinely not the same machine.
+    """
+    return (
+        bool(filename)
+        and filename not in (".", "..")
+        and os.path.basename(filename) == filename
+        and ntpath.basename(filename) == filename
+        and not os.path.isabs(filename)
+        and not ntpath.isabs(filename)
+    )
 
 
 def write_plan_to_zwift(
     workouts: "list[dict]",
-    zwift_id: str,
+    zwift_id: "str | None",
     workouts_override: "str | None" = None,
 ) -> dict:
     """Write each plan workout as a date-named .zwo into the Zwift folder.
@@ -173,6 +217,12 @@ def write_plan_to_zwift(
     written: "list[str]" = []
     for w in workouts:
         fname = plan_filename(w["date"], w["name"])
+        # Belt and braces over plan_filename's own sanitising: confining the
+        # DIRECTORY is worth nothing if the filename joined onto it can walk
+        # back out, and this is the last line before open(..., "w"). Whatever a
+        # future filename producer does, nothing leaves target_dir.
+        if not _bare_name(fname):
+            raise ValueError(f"refusing an unsafe workout filename: {fname!r}")
         p = os.path.join(target_dir, fname)
         # Date-prefix the internal <name> too, so Zwift's list shows the date.
         content = dated_name_zwo(w["zwo"], w["date"])

@@ -43,10 +43,10 @@ from __future__ import annotations
 
 import datetime as _dt
 import logging
-import os
 from typing import Dict, List, Optional
 
-from .. import db, paths
+from .. import db
+from ..backend import ExportManifest, get_backend
 from ..ingest.importer import current_ftp
 from ..metrics import profile_store
 from ..timeutil import utc_now
@@ -116,38 +116,29 @@ def reexport_workout(
     Zwift folder in step is a side effect of that, not a reason to fail it.
     """
     settings = db.get_user_settings(uid)
-    target, _reason = paths.resolve_export_dir(
-        settings.get("zwift_id"), settings.get("workouts_dir")
+    write = (
+        [{"date": date, "name": new_name, "zwo": zwo_str}]
+        if new_name is not None and zwo_str is not None
+        else []
     )
-    if not target or not os.path.isdir(target):
-        return
+    manifest = ExportManifest(
+        # No "me" fallback: it resolves to a stale <Workouts>/me folder Zwift
+        # never reads. See exporter.plan_export_manifest and paths.workouts_dir.
+        zwift_id=settings.get("zwift_id"),
+        override=settings.get("workouts_dir"),
+        write=write,
+        # Only a rename orphans a file; re-writing under the same name just
+        # overwrites it.
+        remove=(
+            [zwo.plan_filename(date, old_name)] if old_name != new_name else []
+        ),
+        # Best effort: never conjure a Zwift folder that isn't there.
+        require_existing=True,
+    )
     try:
-        old_path = os.path.join(target, zwo.plan_filename(date, old_name))
-        if old_name != new_name and os.path.exists(old_path):
-            os.unlink(old_path)
-        if new_name is None or zwo_str is None:
-            return
-        zwo.write_plan_to_zwift(
-            [{"date": date, "name": new_name, "zwo": zwo_str}],
-            settings.get("zwift_id"),
-            # The STORED setting, not ``target``: workouts_override is the
-            # untrusted user value, and passing a resolved directory back in
-            # re-labels a DISCOVERED folder as a SUBMITTED one, which is judged
-            # by the stricter rule (see paths.confine_detected_dir).
-            workouts_override=settings.get("workouts_dir"),
-        )
+        get_backend(uid).apply_exports(manifest)
     except OSError as e:
         log.warning("re-export of adapted workout failed: %s", e)
-    except paths.ExportTargetUnavailable as e:
-        # Best effort means best effort. The target came from
-        # resolve_export_dir() a few lines up, so a refusal here means the two
-        # disagree or the folder changed underneath us; either way this is a
-        # side effect of rewriting a plan, not the operation the user asked
-        # for, and it must not abort the rewrite. It is deliberately not an
-        # OSError, so the branch above does not cover it.
-        log.warning(
-            "re-export of adapted workout refused (%s): %s", e.reason, e.detail or e
-        )
 
 
 def race_window(user_id: int, plan_id: int, now: _dt.datetime) -> set:
