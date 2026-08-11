@@ -13,6 +13,8 @@ from wattracker import auth, config, db
 from wattracker.prescribe import zwo
 from wattracker.prescribe.planner import build_workout
 
+from conftest import redirect_home
+
 NOW = dt.datetime(2026, 7, 10, 18, 0)
 
 
@@ -364,8 +366,9 @@ def _fake_parsed(start_time="2026-07-10T08:00:00", seconds=3600, watts=200.0):
 def test_run_auto_scan_imports_and_marks_completions(user_id, tmp_path, monkeypatch):
     # Scanned folders must sit inside a trusted storage root: a stored
     # activities_dir outside them is refused on READ, so point HOME at the
-    # scratch tree (realpath'd - the confinement canonicalises).
-    monkeypatch.setenv("HOME", os.path.realpath(tmp_path))
+    # scratch tree (realpath'd - the confinement canonicalises). Via
+    # redirect_home, not setenv: HOME alone is inert on Windows.
+    redirect_home(monkeypatch, os.path.realpath(tmp_path))
     tmp_path = Path(os.path.realpath(tmp_path))
     watch = tmp_path / "Watch"
     watch.mkdir()
@@ -392,7 +395,7 @@ def test_run_auto_scan_imports_and_marks_completions(user_id, tmp_path, monkeypa
 def test_run_auto_scan_covers_settings_only_users(user_id, tmp_path, monkeypatch):
     # A user id present only via settings/activities (no users row) is still
     # swept - mirrors the live database where per-user rows outlived the row.
-    monkeypatch.setenv("HOME", os.path.realpath(tmp_path))
+    redirect_home(monkeypatch, os.path.realpath(tmp_path))
     tmp_path = Path(os.path.realpath(tmp_path))
     watch = tmp_path / "Watch2"
     watch.mkdir()

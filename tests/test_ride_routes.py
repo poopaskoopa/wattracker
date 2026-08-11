@@ -1412,16 +1412,16 @@ def test_ride_ws_prepared_actions_toggle_erg_and_disconnect_one_device(
 
     monkeypatch.setattr(servermod.bledevices, "bluetooth_available", lambda: (True, "ok"))
     monkeypatch.setattr(servermod.bledevices, "connect_sensors", fake_connect)
-    # Not 0: this test drives the ride loop by sending actions into it, and a
-    # zero interval makes _ride_sleep(0) a bare yield with no wall-clock delay.
-    # The loop then spins through the whole 300-second inactivity budget - power
-    # is pinned at 0, so every iteration adds a simulated second for free - in
-    # the few milliseconds before the client's first action can be handed across
-    # the TestClient's thread boundary into the action queue. The server closes
-    # on the inactivity timeout before it ever sees an action. A real delay
-    # keeps that budget in wall-clock terms and the loop still runs fast enough
-    # for the test to be quick.
+    # Two knobs, and both are needed. The tick loop emits a state frame per
+    # iteration, so a zero poll interval is a firehose this test can never
+    # drain - it only terminated at all because the inactivity timeout cut it
+    # off after 300 frames, which is exactly what made this a race the test
+    # lost on a fast machine: the session timed out mid-test and the next
+    # _next() found a closed socket instead of its frame. A small non-zero
+    # interval paces the frames; a large inactivity timeout removes the race.
+    # Every other websocket test here pins the timeout for the same reason.
     monkeypatch.setattr(servermod, "RIDE_POLL_INTERVAL_S", 0.01)
+    monkeypatch.setattr(servermod, "RIDE_INACTIVITY_TIMEOUT_S", 1e6)
 
     with client.websocket_connect("/ride/ws?prepare=1") as ws:
         connected = _receive_after_workout(ws)

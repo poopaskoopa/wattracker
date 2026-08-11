@@ -130,10 +130,26 @@ def activities_dir(override: Optional[str] = None) -> str:
 
 
 def candidate_workouts_roots() -> List[str]:
-    return _dedupe(
-        [os.path.join(root, "Zwift", "Workouts") for root in candidate_documents_dirs()],
-        windows=sys.platform.startswith("win"),
+    """Per-OS candidate Zwift Workouts roots, in priority order.
+
+    Mirrors candidate_activities_dirs(): a Windows Zwift install can keep its
+    whole data root under %LOCALAPPDATA%\\Zwift rather than Documents\\Zwift,
+    and the two halves of the integration have to agree about that. They did
+    not - activities discovery checked LOCALAPPDATA and this did not - so on
+    such an install the .zwo landed in Documents with the right player-ID
+    folder and the right name, the export reported success, and Zwift never
+    read it. Confirmed on hardware 2026-08-06.
+    """
+    candidates: List[str] = []
+    if sys.platform.startswith("win"):
+        local = os.environ.get("LOCALAPPDATA")
+        if local:
+            candidates.append(os.path.join(local, "Zwift", "Workouts"))
+    candidates.extend(
+        os.path.join(root, "Zwift", "Workouts")
+        for root in candidate_documents_dirs()
     )
+    return _dedupe(candidates, windows=sys.platform.startswith("win"))
 
 
 def trusted_storage_roots() -> List[str]:
@@ -183,6 +199,56 @@ def export_workouts_roots() -> List[str]:
     """
     override = os.environ.get("WATTRACKER_ZWIFT_WORKOUTS_ROOT")
     return [override] if override else candidate_workouts_roots()
+
+
+def _under_root(candidate: str, root: str) -> bool:
+    """True when ``candidate`` is ``root`` or sits inside it (case-folded on NT)."""
+    try:
+        key, root_key = _path_key(candidate), _path_key(root)
+        return os.path.commonpath([key, root_key]) == root_key
+    except (ValueError, OSError):
+        return False
+
+
+def within_workouts_roots(candidate: Optional[str]) -> bool:
+    """True when ``candidate`` is a Zwift Workouts root, or a folder inside one.
+
+    A NARROWER rule than confine_storage_dir(), for a narrower question. That
+    one asks "may this machine's owner store things here", and its answer is
+    the whole home directory, which is correct for a folder somebody typed into
+    their own Settings form. This one asks "is this the folder .zwo export is
+    FOR", and only a Zwift Workouts folder is. The connector applies it to a
+    workouts folder that arrived over RPC, where $HOME is far too much: joined
+    onto that, ``remove`` is a delete primitive over the rider's whole home
+    directory and ``write`` creates folders in it. See
+    docs/windows-security.md, "Server/connector trust boundary".
+
+    Ancestors are resolved and the final component is not, exactly as
+    confine_detected_dir() does and for the same reason: relocating
+    ``...\\Zwift\\Workouts\\<player id>`` onto another drive with ``mklink /J``
+    is a supported Zwift setup, and resolving the leaf would refuse the rider's
+    own folder. Anything deeper is judged fully resolved.
+    """
+    raw = (candidate or "").strip()
+    if not raw:
+        return False
+    try:
+        absolute = os.path.abspath(os.path.expanduser(raw))
+        parent, name = os.path.split(absolute)
+        probes = [os.path.realpath(absolute)]
+        if name and name not in (".", ".."):
+            probes.append(os.path.join(os.path.realpath(parent), name))
+    except (OSError, ValueError):
+        return False  # an embedded NUL, or a path the OS will not canonicalise
+    roots: List[str] = []
+    for root in export_workouts_roots():
+        try:
+            roots.append(
+                os.path.realpath(os.path.abspath(os.path.expanduser(root)))
+            )
+        except (OSError, ValueError):
+            continue
+    return any(_under_root(probe, root) for probe in probes for root in roots)
 
 
 def _within_trusted_roots(candidate: str) -> bool:

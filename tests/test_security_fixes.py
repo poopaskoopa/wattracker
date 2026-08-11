@@ -20,6 +20,7 @@ from wattracker.ingest import fit_parser  # noqa: E402
 from wattracker.prescribe import zwo  # noqa: E402
 from wattracker import server as server_mod  # noqa: E402
 from wattracker.server import create_app  # noqa: E402
+from conftest import redirect_home  # noqa: E402
 
 
 @pytest.fixture()
@@ -118,7 +119,10 @@ def test_settings_rejects_nonexistent_dir(client):
 
 
 def test_settings_accepts_dir_under_home(client, tmp_path, monkeypatch):
-    monkeypatch.setenv("HOME", str(tmp_path))
+    # setenv("HOME") alone is inert on Windows - ntpath.expanduser reads
+    # USERPROFILE - so the sandboxed HOME stayed at tmp_path/home and this
+    # test's sibling folder was (correctly) refused.
+    redirect_home(monkeypatch, tmp_path)
     _register(client)
     good = tmp_path / "acts"
     good.mkdir()
@@ -712,7 +716,7 @@ def test_poisoned_workouts_dir_blocks_the_plan_export_route(client, escape_dir):
     r = client.post(f"/plan/{plan_id}/export")
 
     assert r.status_code == 200
-    assert "outside your home directory" in r.text
+    assert "will not write to that folder" in r.text
     assert '<a href="/settings">' in r.text
     assert "Exported 1 .zwo" not in r.text  # never claims a bogus success
     assert not os.path.exists(os.path.dirname(escape_dir))
@@ -820,7 +824,7 @@ def test_rescan_still_scans_a_folder_inside_the_trusted_roots(client, tmp_path,
     from wattracker.ingest import importer as importer_mod
 
     home = os.path.realpath(tmp_path)
-    monkeypatch.setenv("HOME", home)
+    redirect_home(monkeypatch, home)  # setenv("HOME") alone is inert on Windows
     _register(client)
     act_dir = os.path.join(home, "Rides")
     os.mkdir(act_dir)
@@ -1041,3 +1045,111 @@ def test_shedding_does_not_lock_the_owner_out_through_the_throttle(client):
         follow_redirects=False,
     )
     assert r.status_code == 303
+
+
+# ------------------------- .zwo filenames cannot leave the export folder
+#
+# zwo.plan_filename is byte-identical on main, where it only ever sees dates
+# from _dt.date.fromisoformat. The server/client split is what makes it
+# reachable from a manifest that crossed a network, so the guard lands here -
+# but it hardens the single-machine app in the same move.
+
+
+def test_a_plan_filename_is_always_one_path_component():
+    """The date leads the filename and used to be interpolated raw.
+
+    An absolute date is enough on its own; no ``..`` is required.
+    """
+    import ntpath
+
+    for hostile in (
+        "../../../../.config/autostart/pwn",
+        "/etc/cron.d/x",
+        "..\\..\\evil",
+        "2026-07-07/../../escape",
+        "C:\\Windows\\System32\\x",
+        "",
+        None,
+    ):
+        fname = zwo.plan_filename(hostile, "VO2 5x4")
+        assert os.path.basename(fname) == fname, hostile
+        assert ntpath.basename(fname) == fname, hostile
+        assert not os.path.isabs(fname), hostile
+        assert not ntpath.isabs(fname), hostile
+
+    # A real date is untouched, so the sanitiser is not paying for itself with
+    # mangled names on the path everybody actually uses.
+    assert zwo.plan_filename("2026-07-07", "VO2 5x4") == "2026-07-07 VO2 5x4.zwo"
+
+
+def test_the_writer_refuses_a_filename_that_would_escape(tmp_path, monkeypatch):
+    """The last check before open(..., "w"), asserted with the sanitiser bypassed.
+
+    Confining the DIRECTORY is worth nothing if the name joined onto it can
+    walk back out, so this guard has to hold independently of whatever
+    produced the name.
+    """
+    target = tmp_path / "Workouts"
+    target.mkdir()
+    monkeypatch.setattr(zwo, "plan_filename", lambda d, n: "../escaped.zwo")
+    monkeypatch.setattr(
+        "wattracker.paths.workouts_dir", lambda *a, **k: str(target)
+    )
+
+    with pytest.raises(ValueError):
+        zwo.write_plan_to_zwift(
+            [{"date": "2026-07-07", "name": "x", "zwo": "<workout_file/>"}], None
+        )
+    assert not (tmp_path / "escaped.zwo").exists()
+    assert list(target.iterdir()) == []
+
+
+def test_an_upload_cannot_claim_to_be_an_in_app_ride(client, monkeypatch):
+    """The recorded filename is the rider's string now, and it classifies rides.
+
+    ``ingest_file`` records the uploaded name rather than the temp file's, and
+    ``db.IN_APP_FILENAME_SQL`` reads that column: 'Ride <date> ...' WITHOUT a
+    .fit extension means the ride was recorded in-app. An upload is not, so it
+    must not be able to take that shape.
+
+    The invariant is "ends in .fit", and it has to be, because the first fix
+    here required only SOME extension: 'Ride <date> x.gpx' and 'Ride <date> x.'
+    both sailed through it and both classify as in-app, in the SQL and in
+    is_in_app_activity alike. The two classifiers agreed with each other and
+    were both wrong, which is why this asserts on the stored name as well as on
+    what the classifiers make of it.
+    """
+    from wattracker.ingest import importer
+
+    minute = [0]
+
+    def _parsed(path):
+        minute[0] += 1
+        return {
+            "start_time": f"2026-06-01T10:{minute[0]:02d}:00", "duration_s": 1800,
+            "streams": {"time": [None] * 1800, "power": [200.0] * 1800},
+        }
+
+    monkeypatch.setattr(importer, "parse_fit", _parsed)
+    _register(client)
+    uid = db.get_user_by_username("tester")["id"]
+
+    for uploaded in (
+        "Ride 2026-06-01 09-00-00",    # no extension at all
+        "Ride 2026-06-01 09-00-00.gpx",  # an extension, but not .fit
+        "Ride 2026-06-01 09-00-00.",   # an extension splitext does not see
+    ):
+        activity_id = importer.ingest_upload(uid, uploaded, b"x")
+        assert activity_id is not None, uploaded
+        stored = db.get_activity(uid, activity_id)
+        assert stored["filename"].endswith(".fit"), uploaded
+        # Both classifiers - the Python one and the SQL the migrations run.
+        assert importer.is_in_app_activity(stored["filename"]) is False, uploaded
+    conn = db.connect(None)
+    try:
+        matched = conn.execute(
+            f"SELECT COUNT(*) AS n FROM activities WHERE {db.IN_APP_FILENAME_SQL}"
+        ).fetchone()["n"]
+    finally:
+        conn.close()
+    assert matched == 0

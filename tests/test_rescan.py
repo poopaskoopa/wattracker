@@ -16,6 +16,8 @@ import wattracker.ingest.importer as importer  # noqa: E402
 from wattracker import db, paths  # noqa: E402
 from wattracker.server import create_app  # noqa: E402
 
+from conftest import redirect_home  # noqa: E402
+
 
 def _wait_done(client, timeout=10.0):
     """Poll the status endpoint until the scan finishes; return final status."""
@@ -60,7 +62,7 @@ def home(tmp_path, monkeypatch):
     Realpath'd because the endpoint canonicalises what it stores and reports.
     """
     root = Path(os.path.realpath(tmp_path))
-    monkeypatch.setenv("HOME", str(root))
+    redirect_home(monkeypatch, str(root))
     return root
 
 
@@ -76,7 +78,7 @@ def test_annotated_candidates_have_exists_flag():
         assert isinstance(c["exists"], bool)
 
 
-def test_rescan_explicit_dir_imports_and_reports(client, home, monkeypatch):
+def test_rescan_explicit_dir_imports_and_reports(client, home, monkeypatch): 
     _register(client)
     # A directory with one .fit file (parser mocked, so contents don't matter).
     act_dir = home / "Activities"
@@ -97,7 +99,7 @@ def test_rescan_explicit_dir_imports_and_reports(client, home, monkeypatch):
     assert len(db.list_activities(uid)) == 1
 
 
-def test_rescan_nonexistent_dir_reports_not_found(client, home):
+def test_rescan_nonexistent_dir_reports_not_found(client, home): 
     _register(client)
     missing = home / "does_not_exist"
     r = client.post("/activities/rescan", data={"activities_dir": str(missing)})
@@ -110,7 +112,7 @@ def test_rescan_nonexistent_dir_reports_not_found(client, home):
     assert db.list_activities(uid) == []
 
 
-def test_rescan_empty_dir_reports_zero(client, home, monkeypatch):
+def test_rescan_empty_dir_reports_zero(client, home, monkeypatch): 
     _register(client)
     empty = home / "Empty"
     empty.mkdir()
@@ -121,7 +123,7 @@ def test_rescan_empty_dir_reports_zero(client, home, monkeypatch):
     assert status["found"] == 0
 
 
-def test_rescan_persists_activities_dir_setting(client, home):
+def test_rescan_persists_activities_dir_setting(client, home): 
     _register(client)
     act_dir = home / "MyRides"
     act_dir.mkdir()
@@ -136,7 +138,7 @@ def test_rescan_persists_activities_dir_setting(client, home):
     assert str(act_dir) in client.get("/settings").text
 
 
-def test_scan_status_lifecycle(client, home, monkeypatch):
+def test_scan_status_lifecycle(client, home, monkeypatch): 
     _register(client)
     act_dir = home / "Activities"
     act_dir.mkdir()
@@ -159,12 +161,11 @@ def test_scan_status_lifecycle(client, home, monkeypatch):
     assert final["error"] is None
 
 
-def test_scan_status_conflict_when_running(client, home, monkeypatch):
+def test_scan_status_conflict_when_running(client, home, monkeypatch): 
     _register(client)
     act_dir = home / "Activities"
     act_dir.mkdir()
     (act_dir / "ride.fit").write_bytes(b"dummy")
-
     # Make parsing block so the first scan is still running when we post again.
     import threading
     release = threading.Event()
@@ -200,6 +201,8 @@ def test_connect_enables_wal(tmp_path):
 def test_dashboard_responsive_during_scan(client, home, monkeypatch):
     """A long background rescan must not block dashboard reads. With WAL + a
     per-file GIL yield, GET / returns 200 well before the scan finishes."""
+    # No redirect_home here: the `home` fixture already did it, and did it
+    # realpath'd, which is what the rescan endpoint canonicalises against.
     _register(client)
     act_dir = home / "Activities"
     act_dir.mkdir()
@@ -235,3 +238,46 @@ def test_activities_page_prefills_recommended_when_unset(client):
     # Top recommended candidate appears as helper text / prefill.
     top = paths.candidate_activities_dirs()[0]
     assert top in text
+
+
+def test_rescan_rejects_a_folder_outside_the_trusted_roots(
+    client, tmp_path, monkeypatch
+):
+    """The rescan route must not be a way around the Settings validation.
+
+    Both routes write the same activities_dir setting, so a containment check
+    on only one of them is no check at all.
+    """
+    redirect_home(monkeypatch, str(tmp_path / "home"))
+    (tmp_path / "home").mkdir(exist_ok=True)  # isolated_env already made it
+    outside = tmp_path / "elsewhere"
+    outside.mkdir()
+
+    _register(client)
+    response = client.post(
+        "/activities/rescan", data={"activities_dir": str(outside)}
+    )
+    assert response.status_code == 400
+    assert "must be inside" in response.json()["error"]
+
+    uid = db.get_user_by_username("rider")["id"]
+    assert db.get_user_settings(uid)["activities_dir"] is None
+    assert client.get("/api/scan/status").json()["running"] is False
+
+
+def test_rescan_still_accepts_a_trusted_folder_that_does_not_exist_yet(
+    client, tmp_path, monkeypatch
+):
+    """Containment is the security control; existence is a usability check.
+
+    Pointing a scan at a folder that is not there is an ordinary mistake, and
+    it is answered with a status rather than an error.
+    """
+    redirect_home(monkeypatch, str(tmp_path))
+    _register(client)
+    missing = tmp_path / "Zwift" / "Activities"
+    response = client.post(
+        "/activities/rescan", data={"activities_dir": str(missing)}
+    )
+    assert response.status_code == 202
+    assert _wait_done(client)["exists"] is False

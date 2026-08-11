@@ -24,7 +24,7 @@ from .timeutil import utc_now, valid_timezone
 
 _log = logging.getLogger(__name__)
 
-SCHEMA_VERSION = 29
+SCHEMA_VERSION = 30
 
 
 def _restrict_db_files(path: str) -> None:
@@ -245,9 +245,16 @@ _MIGRATIONS: Dict[int, Sequence[Union[str, Callable[[sqlite3.Connection], None]]
         "ALTER TABLE users ADD COLUMN onboarding_complete INTEGER NOT NULL DEFAULT 0",
         "UPDATE users SET onboarding_complete = 1",
     ],
+    29: [
+        # New table connector_devices is created by _SCHEMA after migrating.
+        # Nothing to backfill: no device has been paired before this version
+        # exists, and an empty table is exactly the right starting state for
+        # every install that upgrades into it.
+    ],
 }
 
 _DROP = """
+DROP TABLE IF EXISTS connector_devices;
 DROP TABLE IF EXISTS ftp_suggestions;
 DROP TABLE IF EXISTS power_sample_corrections;
 DROP TABLE IF EXISTS ftp_feedback_batches;
@@ -577,6 +584,29 @@ CREATE TABLE IF NOT EXISTS scanned_files (
     UNIQUE(user_id, path),
     FOREIGN KEY(user_id) REFERENCES users(id)
 );
+
+-- Machines paired to run a wattracker connector for this user: the Zwift box
+-- reaches the server with one of these bearer tokens instead of a session
+-- cookie. Only the sha256 hex digest is stored, for the same reason as
+-- password_hash and calendar_token_hash - the client keeps the plaintext on
+-- disk, so the database must not be a second copy of it.
+--
+-- One row per machine rather than one per user, so a token can be revoked
+-- without disturbing the others and 'which machine last synced' is answerable.
+-- UNIQUE on token_hash is a plain column constraint here (not a partial index
+-- like the calendar one) because the column is NOT NULL: a device row without
+-- a token would be unusable.
+CREATE TABLE IF NOT EXISTS connector_devices (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id    INTEGER NOT NULL,
+    label      TEXT NOT NULL,
+    token_hash TEXT NOT NULL UNIQUE,
+    created    TEXT NOT NULL,
+    last_seen  TEXT,
+    FOREIGN KEY(user_id) REFERENCES users(id)
+);
+CREATE INDEX IF NOT EXISTS idx_connector_devices_user
+    ON connector_devices(user_id);
 """
 
 
@@ -840,6 +870,102 @@ def user_by_calendar_token_hash(
             (token_hash,),
         ).fetchone()
         return dict(row) if row else None
+    finally:
+        conn.close()
+
+
+# ------------------------------------------------------ connector devices
+# As with calendar tokens, only the sha256 hex digest of a device token is ever
+# stored or accepted here; callers hash the plaintext (see connectorauth.py).
+def add_connector_device(
+    user_id: int, label: str, token_hash: str, path: Optional[str] = None
+) -> Optional[int]:
+    """Register a paired machine. Returns the new row id, or None if unusable."""
+    if not token_hash:
+        raise ValueError("connector token hash must be non-empty")
+    clean = (label or "").strip() or "Connector"
+    conn = connect(path)
+    try:
+        cur = conn.execute(
+            "INSERT INTO connector_devices (user_id, label, token_hash, created) "
+            "VALUES (?, ?, ?, ?)",
+            (user_id, clean, token_hash, utc_now().isoformat()),
+        )
+        conn.commit()
+        return cur.lastrowid
+    except sqlite3.IntegrityError:
+        # Either no such user (FK) or - vanishingly unlikely - a token digest
+        # collision. Either way the caller must not be told it succeeded.
+        return None
+    finally:
+        conn.close()
+
+
+def list_connector_devices(user_id: int, path: Optional[str] = None) -> List[dict]:
+    """A user's paired machines, newest first. Never includes a token hash."""
+    conn = connect(path)
+    try:
+        rows = conn.execute(
+            "SELECT id, label, created, last_seen FROM connector_devices "
+            "WHERE user_id = ? ORDER BY id DESC",
+            (user_id,),
+        ).fetchall()
+        return [dict(r) for r in rows]
+    finally:
+        conn.close()
+
+
+def user_for_connector_token_hash(
+    token_hash: str, path: Optional[str] = None
+) -> Optional[dict]:
+    """Resolve the owning user and device from a token hash, or None.
+
+    An empty hash returns None without querying. The caller must still
+    re-verify the returned hash in constant time.
+    """
+    if not token_hash:
+        return None
+    conn = connect(path)
+    try:
+        row = conn.execute(
+            "SELECT d.id AS device_id, d.label, d.token_hash, "
+            "       u.id AS user_id, u.username "
+            "FROM connector_devices d JOIN users u ON u.id = d.user_id "
+            "WHERE d.token_hash = ?",
+            (token_hash,),
+        ).fetchone()
+        return dict(row) if row else None
+    finally:
+        conn.close()
+
+
+def delete_connector_device(
+    user_id: int, device_id: int, path: Optional[str] = None
+) -> bool:
+    """Revoke one paired machine. Scoped by user_id so ids are not guessable."""
+    conn = connect(path)
+    try:
+        cur = conn.execute(
+            "DELETE FROM connector_devices WHERE id = ? AND user_id = ?",
+            (device_id, user_id),
+        )
+        conn.commit()
+        return cur.rowcount > 0
+    finally:
+        conn.close()
+
+
+def touch_connector_device(device_id: int, path: Optional[str] = None) -> None:
+    """Record that a device just authenticated. Best effort - never raises."""
+    conn = connect(path)
+    try:
+        conn.execute(
+            "UPDATE connector_devices SET last_seen = ? WHERE id = ?",
+            (utc_now().isoformat(), device_id),
+        )
+        conn.commit()
+    except sqlite3.Error:
+        _log.debug("could not update connector last_seen", exc_info=True)
     finally:
         conn.close()
 
