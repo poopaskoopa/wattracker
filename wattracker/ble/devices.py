@@ -245,12 +245,36 @@ class _CrankCadenceTracker:
         return self.cadence
 
 
+def _client_characteristic_uuids(client) -> Optional[Set[str]]:
+    """Every characteristic UUID the connected device exposes, lowercased.
+
+    ``None`` when the client cannot be inspected (no resolved services).
+    """
+    services = getattr(client, "services", None)
+    if services is None:
+        return None
+    try:
+        uuids = {
+            str(char.uuid).lower()
+            for service in services
+            for char in service.characteristics
+        }
+    except Exception:
+        return None
+    return uuids or None
+
+
 class BleakPowerSource(PowerSource):
     """Cycling Power Service power/cadence via bleak notifications.
 
     Instantiating this requires ``bleak`` and a connected ``BleakClient``. It is
     never exercised in the no-hardware test suite.
     """
+
+    # The characteristic this role's notifications carry cadence on, so a
+    # cadence role bound to the same client can share it instead of
+    # subscribing twice (see ``_shared_cadence_provider``).
+    CADENCE_CHARACTERISTIC = CYCLING_POWER_MEASUREMENT
 
     def __init__(self, client, stale_after_s: float = BLE_VALUE_STALE_S) -> None:
         self._client = client
@@ -322,22 +346,7 @@ class BleakCadenceSource(CadenceSource, PowerSource):
         raise RuntimeError(self._no_cadence_message()) from last_error
 
     def _characteristic_uuids(self) -> Optional[Set[str]]:
-        """Every characteristic UUID the connected device exposes, lowercased.
-
-        ``None`` when the client cannot be inspected (no resolved services).
-        """
-        services = getattr(self._client, "services", None)
-        if services is None:
-            return None
-        try:
-            uuids = {
-                str(char.uuid).lower()
-                for service in services
-                for char in service.characteristics
-            }
-        except Exception:
-            return None
-        return uuids or None
+        return _client_characteristic_uuids(self._client)
 
     def _no_cadence_message(self) -> str:
         address = getattr(self._client, "address", None) or "device"
@@ -362,6 +371,70 @@ class BleakCadenceSource(CadenceSource, PowerSource):
 
     def latest_cadence(self) -> Optional[float]:
         return self._cranks.latest(self._stale_after_s)
+
+
+class SharedCadenceSource(CadenceSource, PowerSource):
+    """Cadence borrowed from another role already notifying on the same client.
+
+    A Wahoo KICKR selected for both power and cadence gets one client, and
+    macOS rejects a second ``start_notify`` on the characteristic the power
+    role already subscribed to. This adapter reads that role's cadence instead
+    of opening a duplicate subscription, and keeps ``BleakCadenceSource``'s
+    cadence-only contract: ``latest_power()`` is always ``None``.
+    """
+
+    def __init__(self, source) -> None:
+        self._source = source
+
+    def detach(self) -> None:
+        """Drop the borrowed source; called when its device disconnects."""
+        self._source = None
+
+    def latest_power(self) -> Optional[int]:
+        return None
+
+    def latest_cadence(self) -> Optional[float]:
+        if self._source is None:
+            return None
+        return self._source.latest_cadence()
+
+
+# Preference order BleakCadenceSource.start() subscribes in.
+CADENCE_CHARACTERISTICS = (
+    CYCLING_SPEED_AND_CADENCE_MEASUREMENT,
+    CYCLING_POWER_MEASUREMENT,
+)
+
+
+def _planned_cadence_characteristic(client) -> Optional[str]:
+    """The characteristic ``BleakCadenceSource.start()`` would subscribe to.
+
+    ``None`` when the GATT table cannot be inspected (``start()`` then probes)
+    or when the device exposes no cadence characteristic at all.
+    """
+    available = _client_characteristic_uuids(client)
+    if available is None:
+        return None
+    for uuid in CADENCE_CHARACTERISTICS:
+        if uuid.lower() in available:
+            return uuid
+    return None
+
+
+def _shared_cadence_provider(bound_roles: dict, characteristic: Optional[str]):
+    """An already-bound role on this client reading cadence from ``characteristic``.
+
+    ``None`` when nothing can be shared and the cadence role must subscribe
+    itself.
+    """
+    if not characteristic:
+        return None
+    wanted = characteristic.lower()
+    for source in bound_roles.values():
+        owned = getattr(source, "CADENCE_CHARACTERISTIC", None)
+        if owned and owned.lower() == wanted and hasattr(source, "latest_cadence"):
+            return source
+    return None
 
 
 class BleakHeartRateSource(HeartRateSource):
@@ -779,8 +852,19 @@ async def connect_sensors(
                             addr, {"name": dev["name"], "roles": {}}
                         )["roles"][role] = hr
                     elif role == "cadence":
-                        cadence = BleakCadenceSource(client)
-                        await cadence.start()
+                        bound = out["bindings"].get(addr, {}).get("roles", {})
+                        shared = _shared_cadence_provider(
+                            bound,
+                            _planned_cadence_characteristic(client),
+                        )
+                        if shared is not None:
+                            # Same device already notifying on that
+                            # characteristic for another role: borrow it, since
+                            # a second subscription is rejected by the OS.
+                            cadence = SharedCadenceSource(shared)
+                        else:
+                            cadence = BleakCadenceSource(client)
+                            await cadence.start()
                         cadence_sources.append(cadence)
                         cadence_names.append(dev["name"])
                         out["bindings"].setdefault(
@@ -910,7 +994,11 @@ async def disconnect_sensor(conn: dict, address: str) -> dict:
     except Exception as exc:
         raise RuntimeError(f"Could not disconnect device: {exc}") from exc
     clients_by_address.pop(address, None)
-    conn.get("bindings", {}).pop(address, None)
+    removed = conn.get("bindings", {}).pop(address, None) or {}
+    cadence = removed.get("roles", {}).get("cadence")
+    detach = getattr(cadence, "detach", None)
+    if callable(detach):
+        detach()  # never leave an adapter pointing at a disconnected source
     try:
         conn.get("clients", []).remove(client)
     except ValueError:
