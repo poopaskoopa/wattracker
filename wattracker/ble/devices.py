@@ -210,6 +210,41 @@ class SimulatedTrainer(Trainer):
 
 
 # --------------------------------------------------------- bleak-backed (opt)
+class _CrankCadenceTracker:
+    """Derive rpm from cumulative crank revolutions + last crank event time.
+
+    Shared by the Cycling Power (0x2A63) and CSC (0x2A5B) notification
+    handlers so the two cannot drift apart.
+    """
+
+    def __init__(self) -> None:
+        self.cadence: Optional[float] = None
+        self.updated_at: Optional[float] = None
+        self._prev_revs: Optional[int] = None
+        self._prev_time: Optional[int] = None
+
+    def update(self, revs: Optional[int], event_time: Optional[int]) -> None:
+        if revs is None or event_time is None:
+            return
+        cad = cadence_from_cranks(self._prev_revs, self._prev_time, revs, event_time)
+        if cad is not None:
+            self.cadence = cad
+            self.updated_at = time.monotonic()
+        # A sensor may notify faster than new crank events occur. Repeated
+        # event data is not a zero-rpm observation and must not refresh
+        # cadence freshness.
+        if self._prev_time is None or event_time != self._prev_time:
+            self._prev_revs, self._prev_time = revs, event_time
+
+    def latest(self, stale_after_s: float) -> Optional[float]:
+        if (
+            self.updated_at is None
+            or time.monotonic() - self.updated_at > stale_after_s
+        ):
+            return None
+        return self.cadence
+
+
 class BleakPowerSource(PowerSource):
     """Cycling Power Service power/cadence via bleak notifications.
 
@@ -221,11 +256,8 @@ class BleakPowerSource(PowerSource):
         self._client = client
         self._stale_after_s = float(stale_after_s)
         self._power: Optional[int] = None
-        self._cadence: Optional[float] = None
         self._power_updated_at: Optional[float] = None
-        self._cadence_updated_at: Optional[float] = None
-        self._prev_revs: Optional[int] = None
-        self._prev_time: Optional[int] = None
+        self._cranks = _CrankCadenceTracker()
 
     async def start(self) -> None:
         await self._client.start_notify(CYCLING_POWER_MEASUREMENT, self._on_notify)
@@ -234,19 +266,7 @@ class BleakPowerSource(PowerSource):
         parsed = parse_cycling_power_measurement(bytes(data))
         self._power = parsed["power"]
         self._power_updated_at = time.monotonic()
-        revs, event_time = parsed["crank_revs"], parsed["crank_event_time"]
-        if revs is not None and event_time is not None:
-            cad = cadence_from_cranks(
-                self._prev_revs, self._prev_time, revs, event_time
-            )
-            if cad is not None:
-                self._cadence = cad
-                self._cadence_updated_at = time.monotonic()
-            # A Cycling Power sensor may emit power notifications faster than
-            # new crank events occur. Repeated event data is not a zero-rpm
-            # observation and must not refresh cadence freshness.
-            if self._prev_time is None or event_time != self._prev_time:
-                self._prev_revs, self._prev_time = revs, event_time
+        self._cranks.update(parsed["crank_revs"], parsed["crank_event_time"])
 
     def latest_power(self) -> Optional[int]:
         if (
@@ -257,16 +277,17 @@ class BleakPowerSource(PowerSource):
         return self._power
 
     def latest_cadence(self) -> Optional[float]:
-        if (
-            self._cadence_updated_at is None
-            or time.monotonic() - self._cadence_updated_at > self._stale_after_s
-        ):
-            return None
-        return self._cadence
+        return self._cranks.latest(self._stale_after_s)
 
 
 class BleakCadenceSource(CadenceSource, PowerSource):
-    """CSC cadence via bleak notifications, with no power measurement.
+    """Cadence via bleak notifications, with no power measurement.
+
+    Prefers the CSC measurement (0x2A5B). Devices that report crank
+    revolutions only inside the Cycling Power measurement (0x2A63) -- a Wahoo
+    KICKR, for instance, exposes no CSC service at all -- are read from that
+    characteristic instead. ``latest_power()`` stays ``None`` either way: this
+    class is cadence-only by contract.
 
     It also implements ``PowerSource`` so legacy consumers can use a
     cadence-only connection through ``power_source``.
@@ -275,39 +296,72 @@ class BleakCadenceSource(CadenceSource, PowerSource):
     def __init__(self, client, stale_after_s: float = BLE_VALUE_STALE_S) -> None:
         self._client = client
         self._stale_after_s = float(stale_after_s)
-        self._cadence: Optional[float] = None
-        self._cadence_updated_at: Optional[float] = None
-        self._prev_revs: Optional[int] = None
-        self._prev_time: Optional[int] = None
+        self._cranks = _CrankCadenceTracker()
 
     async def start(self) -> None:
-        await self._client.start_notify(
-            CYCLING_SPEED_AND_CADENCE_MEASUREMENT, self._on_notify
+        candidates = (
+            (CYCLING_SPEED_AND_CADENCE_MEASUREMENT, self._on_notify),
+            (CYCLING_POWER_MEASUREMENT, self._on_power_notify),
+        )
+        available = self._characteristic_uuids()
+        if available is not None:
+            for uuid, handler in candidates:
+                if uuid.lower() in available:
+                    await self._client.start_notify(uuid, handler)
+                    return
+            raise RuntimeError(self._no_cadence_message())
+        # The GATT table could not be inspected: probe the characteristics
+        # instead, so an old bleak still gets the fallback.
+        last_error: Optional[BaseException] = None
+        for uuid, handler in candidates:
+            try:
+                await self._client.start_notify(uuid, handler)
+                return
+            except Exception as exc:
+                last_error = exc
+        raise RuntimeError(self._no_cadence_message()) from last_error
+
+    def _characteristic_uuids(self) -> Optional[Set[str]]:
+        """Every characteristic UUID the connected device exposes, lowercased.
+
+        ``None`` when the client cannot be inspected (no resolved services).
+        """
+        services = getattr(self._client, "services", None)
+        if services is None:
+            return None
+        try:
+            uuids = {
+                str(char.uuid).lower()
+                for service in services
+                for char in service.characteristics
+            }
+        except Exception:
+            return None
+        return uuids or None
+
+    def _no_cadence_message(self) -> str:
+        address = getattr(self._client, "address", None) or "device"
+        return (
+            f"{address} exposes neither Cycling Speed and Cadence 0x2A5B nor "
+            f"Cycling Power 0x2A63 crank data, so wattracker cannot read "
+            f"cadence from it."
         )
 
     def _on_notify(self, _char, data: bytearray) -> None:
         parsed = parse_csc_measurement(bytes(data))
-        revs, event_time = parsed["crank_revs"], parsed["crank_event_time"]
-        if revs is None or event_time is None:
-            return
-        cad = cadence_from_cranks(self._prev_revs, self._prev_time, revs, event_time)
-        if cad is not None:
-            self._cadence = cad
-            self._cadence_updated_at = time.monotonic()
-        # Repeated CSC events are not fresh zero-rpm observations.
-        if self._prev_time is None or event_time != self._prev_time:
-            self._prev_revs, self._prev_time = revs, event_time
+        self._cranks.update(parsed["crank_revs"], parsed["crank_event_time"])
+
+    def _on_power_notify(self, _char, data: bytearray) -> None:
+        """Crank revolutions carried by a Cycling Power measurement; the watts
+        in the same packet are deliberately discarded."""
+        parsed = parse_cycling_power_measurement(bytes(data))
+        self._cranks.update(parsed["crank_revs"], parsed["crank_event_time"])
 
     def latest_power(self) -> Optional[int]:
         return None
 
     def latest_cadence(self) -> Optional[float]:
-        if (
-            self._cadence_updated_at is None
-            or time.monotonic() - self._cadence_updated_at > self._stale_after_s
-        ):
-            return None
-        return self._cadence
+        return self._cranks.latest(self._stale_after_s)
 
 
 class BleakHeartRateSource(HeartRateSource):
