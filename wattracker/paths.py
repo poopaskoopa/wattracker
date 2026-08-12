@@ -225,14 +225,24 @@ def within_workouts_roots(candidate: Optional[str]) -> bool:
 
     The candidate is probed twice and is in scope if EITHER probe lands in a
     root: once fully resolved, and once with its ancestors resolved and the
-    final component left alone. Leaving the leaf alone is what
-    confine_detected_dir() does and for the same reason: relocating
+    final component left alone. Leaving the leaf alone borrows the leniency
+    confine_detected_dir() applies, for the same reason: relocating
     ``...\\Zwift\\Workouts\\<player id>`` onto another drive with ``mklink /J``
     is a supported Zwift setup, and resolving the leaf would refuse the rider's
     own folder. Resolving it as well is what admits naming that folder THROUGH
     a link from somewhere else; that only ever widens the answer, and it is
     safe to widen because the caller acts on the resolved folder either way.
-    Anything deeper is judged fully resolved.
+
+    That leniency is NOT parity with confine_detected_dir(), which gates it two
+    ways this function does not reproduce: there the DIRECT parent must be an
+    export_workouts_roots() entry (anything else falls back to the strict
+    rule), and the entry must already exist. Here the unresolved-leaf probe
+    applies at EVERY depth and nothing has to exist, so a leaf symlink anywhere
+    under a Workouts root is judged by its own name rather than by its target.
+    That is accepted risk rather than oversight - the server can only write and
+    delete ``.zwo`` files, so it cannot plant such a link - but it is the whole
+    of the rule: a caller that acts on the path as given, rather than on a
+    resolved one, must not inherit this function's answer.
     """
     raw = (candidate or "").strip()
     if not raw:
