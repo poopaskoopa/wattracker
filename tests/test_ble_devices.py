@@ -7,9 +7,12 @@ import pytest
 
 from wattracker.ble import devices
 from wattracker.ble.protocol import (
+    CYCLING_POWER_MEASUREMENT,
     CYCLING_POWER_SERVICE,
+    CYCLING_SPEED_AND_CADENCE_MEASUREMENT,
     CYCLING_SPEED_AND_CADENCE_SERVICE,
     FITNESS_MACHINE_SERVICE,
+    HEART_RATE_MEASUREMENT,
     HEART_RATE_SERVICE,
 )
 
@@ -123,6 +126,132 @@ def test_bleak_cadence_handles_wraparound_and_stale_duplicates(monkeypatch):
     source._on_notify(None, measurement(0, 488))
     now[0] = 103.01
     assert source.latest_cadence() is None
+
+
+class _FakeChar:
+    def __init__(self, uuid):
+        self.uuid = uuid
+
+
+class _FakeService:
+    def __init__(self, characteristics):
+        self.characteristics = [_FakeChar(uuid) for uuid in characteristics]
+
+
+class _FakeGattClient:
+    """A connected client whose resolved GATT table can be inspected."""
+
+    def __init__(self, characteristics, address="AA:BB:CC:DD:EE:FF"):
+        self.address = address
+        self.services = [_FakeService(characteristics)]
+        self.notifies = {}
+
+    async def start_notify(self, uuid, handler):
+        self.notifies[uuid] = handler
+
+
+def _csc_measurement(revs, event_time):
+    return bytearray(
+        bytes([0x02])
+        + int(revs).to_bytes(2, "little")
+        + int(event_time).to_bytes(2, "little")
+    )
+
+
+def _power_measurement(power, revs, event_time):
+    return bytearray(
+        b"\x20\x00"
+        + int(power).to_bytes(2, "little", signed=True)
+        + int(revs).to_bytes(2, "little")
+        + int(event_time).to_bytes(2, "little")
+    )
+
+
+def test_cadence_source_uses_csc_when_the_device_exposes_it(monkeypatch):
+    now = [10.0]
+    monkeypatch.setattr(devices.time, "monotonic", lambda: now[0])
+    client = _FakeGattClient(
+        [CYCLING_SPEED_AND_CADENCE_MEASUREMENT, CYCLING_POWER_MEASUREMENT]
+    )
+    source = devices.BleakCadenceSource(client, stale_after_s=3)
+    asyncio.run(source.start())
+
+    assert list(client.notifies) == [CYCLING_SPEED_AND_CADENCE_MEASUREMENT]
+    notify = client.notifies[CYCLING_SPEED_AND_CADENCE_MEASUREMENT]
+    notify(None, _csc_measurement(10, 1000))
+    notify(None, _csc_measurement(11, 2024))
+    assert source.latest_cadence() == pytest.approx(60.0)
+    assert source.latest_power() is None
+
+
+def test_cadence_source_falls_back_to_cycling_power_cranks(monkeypatch):
+    """A KICKR has no CSC service; its cranks ride in the power measurement."""
+    now = [10.0]
+    monkeypatch.setattr(devices.time, "monotonic", lambda: now[0])
+    client = _FakeGattClient([CYCLING_POWER_MEASUREMENT])
+    source = devices.BleakCadenceSource(client, stale_after_s=3)
+    asyncio.run(source.start())
+
+    assert list(client.notifies) == [CYCLING_POWER_MEASUREMENT]
+    notify = client.notifies[CYCLING_POWER_MEASUREMENT]
+    notify(None, _power_measurement(220, 10, 1000))
+    now[0] = 10.5
+    notify(None, _power_measurement(225, 11, 1878))
+    assert source.latest_cadence() == pytest.approx(70.0, abs=0.1)
+    # Cadence-only by contract, even while reading the power characteristic.
+    assert source.latest_power() is None
+
+    # A repeated crank event holds the value without refreshing its freshness.
+    now[0] = 11.0
+    notify(None, _power_measurement(230, 11, 1878))
+    assert source.latest_cadence() == pytest.approx(70.0, abs=0.1)
+    now[0] = 13.51
+    assert source.latest_cadence() is None
+    assert source.latest_power() is None
+
+
+def test_cadence_source_names_the_device_when_no_crank_data_is_available():
+    client = _FakeGattClient([HEART_RATE_MEASUREMENT], address="HR:01")
+    source = devices.BleakCadenceSource(client)
+
+    with pytest.raises(RuntimeError) as excinfo:
+        asyncio.run(source.start())
+
+    message = str(excinfo.value)
+    assert "HR:01" in message
+    assert "0x2A5B" in message and "0x2A63" in message
+    assert "cannot read cadence" in message
+    assert client.notifies == {}
+
+
+def test_cadence_source_probes_when_the_gatt_table_is_not_inspectable():
+    """Without a services collection, fall back by probing each notify."""
+
+    class ProbeClient:
+        address = "PROBE:01"
+
+        def __init__(self, supported):
+            self.supported = supported
+            self.attempted = []
+            self.notifies = {}
+
+        async def start_notify(self, uuid, handler):
+            self.attempted.append(uuid)
+            if uuid not in self.supported:
+                raise Exception(f"Characteristic {uuid} was not found!")
+            self.notifies[uuid] = handler
+
+    client = ProbeClient({CYCLING_POWER_MEASUREMENT})
+    source = devices.BleakCadenceSource(client)
+    asyncio.run(source.start())
+    assert client.attempted == [
+        CYCLING_SPEED_AND_CADENCE_MEASUREMENT, CYCLING_POWER_MEASUREMENT
+    ]
+    assert list(client.notifies) == [CYCLING_POWER_MEASUREMENT]
+
+    barren = ProbeClient(set())
+    with pytest.raises(RuntimeError, match="cannot read cadence"):
+        asyncio.run(devices.BleakCadenceSource(barren).start())
 
 
 def _install_fake_bleak(monkeypatch):
