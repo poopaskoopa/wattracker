@@ -223,11 +223,16 @@ def within_workouts_roots(candidate: Optional[str]) -> bool:
     directory and ``write`` creates folders in it. See
     docs/windows-security.md, "Server/connector trust boundary".
 
-    Ancestors are resolved and the final component is not, exactly as
+    The candidate is probed twice and is in scope if EITHER probe lands in a
+    root: once fully resolved, and once with its ancestors resolved and the
+    final component left alone. Leaving the leaf alone is what
     confine_detected_dir() does and for the same reason: relocating
     ``...\\Zwift\\Workouts\\<player id>`` onto another drive with ``mklink /J``
     is a supported Zwift setup, and resolving the leaf would refuse the rider's
-    own folder. Anything deeper is judged fully resolved.
+    own folder. Resolving it as well is what admits naming that folder THROUGH
+    a link from somewhere else; that only ever widens the answer, and it is
+    safe to widen because the caller acts on the resolved folder either way.
+    Anything deeper is judged fully resolved.
     """
     raw = (candidate or "").strip()
     if not raw:
