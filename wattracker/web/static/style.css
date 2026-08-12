@@ -789,6 +789,19 @@ button.danger.link-btn { border: none; color: var(--alert); }
 @keyframes ride-spin { to { transform: rotate(360deg); } }
 .ride-workout { background: var(--surface-inset); border-left: 3px solid var(--accent);
     border-radius: var(--r-sm); padding: 0.65rem 0.8rem; margin-bottom: 0.8rem; }
+/* Sensors that failed to bind, sitting directly above the readouts they are
+   missing from. Alert-tinted but not modal: the ride behind it is running on
+   the sensors that did bind, so it must never cover or gate anything. */
+.sensor-notice { display: flex; align-items: flex-start; justify-content: space-between;
+    gap: 0.75rem; flex-wrap: wrap; margin: 0.75rem 0; padding: 0.65rem 0.8rem;
+    border-left: 3px solid var(--alert); border-radius: var(--r-sm);
+    background: color-mix(in srgb, var(--alert) 12%, var(--surface-inset));
+    font-size: 0.85rem; }
+.sensor-notice strong { color: var(--text-bright); }
+.sensor-notice-lead { color: var(--muted); }
+.sensor-notice-list { margin: 0.35rem 0 0; padding-left: 1.1rem; }
+.sensor-notice-list li { margin-bottom: 0.2rem; }
+.sensor-notice-dismiss { flex: 0 0 auto; padding: 0.3rem 0.6rem; font-size: 0.78rem; }
 .ride-live-controls { display: flex; align-items: center; gap: 0.75rem; flex-wrap: wrap;
     margin: 0.75rem 0; }
 .ride-live-controls .hint { margin: 0; }

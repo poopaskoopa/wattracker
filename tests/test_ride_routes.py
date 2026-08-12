@@ -1155,6 +1155,101 @@ def test_ride_ws_real_path_degrades_without_trainer(client, monkeypatch):
     assert frames[-1]["status"] == "finished"
 
 
+def test_ride_ws_reports_failed_sensor_roles_without_stopping_the_ride(
+    client, monkeypatch
+):
+    """A role that fails to set up has to reach the rider, in rider language.
+
+    The incident: a KICKR selected in the cadence role failed to bind
+    ("Characteristic 00002a5b-... was not found!"). connect_sensors kept the
+    other roles alive and put that line in conn["errors"], but only the log
+    ever saw it - the ride page showed an empty cadence field and no reason,
+    so the ride was retried six times. The cadence the KICKR does report,
+    through its power role, kept working the whole time.
+    """
+    from wattracker.ble.devices import SimulatedPowerSource
+
+    _register(client)
+    raw = (
+        "Could not set up cadence sensor KICKR CORE "
+        "(7B2A660B-1111-2222-3333-444455556666): "
+        "Characteristic 00002a5b-0000-1000-8000-00805f9b34fb was not found!"
+    )
+
+    async def fake_connect(timeout=6.0, selected=None):
+        return {
+            "trainer": None,
+            "power_source": SimulatedPowerSource(
+                [150, 150, 150, 150] + [0] * 10, cadences=[88] * 14
+            ),
+            "hr_source": None,
+            "cadence_source": None,
+            "clients": [],
+            "names": {"power": "KICKR CORE"},
+            "errors": [raw],
+        }
+
+    monkeypatch.setattr(servermod.bledevices, "bluetooth_available", lambda: (True, "ok"))
+    monkeypatch.setattr(servermod.bledevices, "connect_sensors", fake_connect)
+    monkeypatch.setattr(servermod, "RIDE_POLL_INTERVAL_S", 0)
+
+    frames = []
+    with client.websocket_connect("/ride/ws?type=endurance&minutes=30") as ws:
+        connected = _receive_after_workout(ws)
+        assert connected["status"] == "connected"
+        assert connected["warnings"] == [
+            "Cadence sensor KICKR CORE couldn't be used — it doesn't report "
+            "cadence in a way wattracker can read."
+        ]
+        # Nothing a cyclist cannot act on leaks through.
+        warning = connected["warnings"][0]
+        assert "Characteristic" not in warning
+        assert "00002a5b" not in warning
+        assert "7B2A660B" not in warning
+        try:
+            while True:
+                frames.append(ws.receive_json())
+        except Exception:
+            pass
+
+    # The failed role did not abort the ride, and the cadence the surviving
+    # power role reports still arrives.
+    assert any(f.get("power") == 150 for f in frames)
+    assert any(f.get("cadence") == 88 for f in frames)
+    assert frames[-1]["status"] == "finished"
+
+
+def test_ride_ws_connect_failures_are_translated_per_kind(client, monkeypatch):
+    """Timeouts and connect failures get their own rider-facing wording, and
+    anything connect_sensors did not phrase is passed through untouched."""
+    timed_out = servermod._rider_facing_sensor_warning(
+        "Timed out connecting hr sensor Wahoo TICKR (AA:BB) — it may still be "
+        "held by another app or a previous ride; wait a few seconds and retry."
+    )
+    assert timed_out == (
+        "Heart rate strap Wahoo TICKR didn't answer in time — it may still be "
+        "connected to another app or a previous ride. Wait a few seconds and "
+        "try again."
+    )
+    refused = servermod._rider_facing_sensor_warning(
+        "Could not connect power sensor Assioma (CC:DD): radio refused"
+    )
+    assert refused == (
+        "Power meter Assioma couldn't be connected — check it's awake, in "
+        "range, and not connected to another app."
+    )
+    trainer = servermod._rider_facing_sensor_warning(
+        "Could not set up trainer sensor KICKR (EE:FF): boom"
+    )
+    assert trainer == (
+        "Trainer KICKR couldn't be used — wattracker can't control its "
+        "resistance."
+    )
+    assert servermod._rider_facing_sensor_warning("Bluetooth went away") == (
+        "Bluetooth went away"
+    )
+
+
 def test_ride_ws_real_path_no_devices(client, monkeypatch):
     from wattracker import server as servermod
 
