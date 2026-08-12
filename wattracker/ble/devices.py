@@ -249,8 +249,15 @@ def _client_characteristic_uuids(client) -> Optional[Set[str]]:
     """Every characteristic UUID the connected device exposes, lowercased.
 
     ``None`` when the client cannot be inspected (no resolved services).
+
+    bleak 3.x *raises* from ``.services`` before service discovery has run
+    rather than returning ``None``, so reading it has to be guarded too --
+    an uninspectable client must fall through to probing, never propagate.
     """
-    services = getattr(client, "services", None)
+    try:
+        services = getattr(client, "services", None)
+    except Exception:
+        return None
     if services is None:
         return None
     try:

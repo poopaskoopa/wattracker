@@ -254,6 +254,36 @@ def test_cadence_source_probes_when_the_gatt_table_is_not_inspectable():
         asyncio.run(devices.BleakCadenceSource(barren).start())
 
 
+def test_cadence_source_probes_when_reading_services_raises():
+    """bleak 3.x raises from ``.services`` before discovery; probe anyway.
+
+    Inspection is an optimisation, so a client that refuses to be inspected
+    must fall through to probing rather than propagate out of ``start()``.
+    """
+
+    class UndiscoveredClient:
+        address = "UNDISCOVERED:01"
+
+        def __init__(self):
+            self.notifies = {}
+
+        @property
+        def services(self):
+            raise RuntimeError("Service Discovery has not been performed yet")
+
+        async def start_notify(self, uuid, handler):
+            if uuid != CYCLING_POWER_MEASUREMENT:
+                raise Exception(f"Characteristic {uuid} was not found!")
+            self.notifies[uuid] = handler
+
+    client = UndiscoveredClient()
+    source = devices.BleakCadenceSource(client)
+    asyncio.run(source.start())
+
+    assert list(client.notifies) == [CYCLING_POWER_MEASUREMENT]
+    assert devices._client_characteristic_uuids(client) is None
+
+
 def _install_fake_bleak(monkeypatch):
     module = types.ModuleType("bleak")
 
