@@ -601,6 +601,123 @@ def _inject_connected_frame(page, warnings):
     )
 
 
+# How the notice actually looks to the eye, asked of the rendered page rather
+# than of the stylesheet. Playwright's is_visible() answers a layout question
+# (display / visibility / a box with area) and says nothing about whether a
+# rider could see anything: an element at opacity 0, or one whose styling was
+# dropped so it renders as bare text merged into the page, passes it happily.
+# Both have shipped here before, so this measures perceptibility instead -
+# effective opacity down the ancestor chain, the composited colour behind the
+# element versus the colour behind its parent, its border, and the contrast of
+# its own text. Deliberately no exact colours or lengths: a palette or padding
+# change must not fail, an invisible notice must.
+_PERCEPTIBILITY_JS = """(selector) => {
+    const el = document.querySelector(selector);
+    if (!el) return null;
+    // Computed colours come back as rgb()/rgba(), and - for anything that went
+    // through color-mix() - as "color(srgb r g b / a)" with 0..1 channels.
+    // Reading only the first form silently scores every mixed colour as fully
+    // transparent, which is how an element with a real background can look
+    // like it has none.
+    const parse = (value) => {
+        const text = value || '';
+        let m = text.match(/rgba?\\(([^)]+)\\)/);
+        if (m) {
+            const p = m[1].split(/[\\s,\\/]+/).filter((s) => s !== '')
+                .map((v) => parseFloat(v));
+            return [p[0], p[1], p[2], p.length > 3 ? p[3] : 1];
+        }
+        m = text.match(/color\\(srgb ([^)]+)\\)/);
+        if (m) {
+            const p = m[1].split(/[\\s\\/]+/).filter((s) => s !== '')
+                .map((v) => parseFloat(v));
+            return [p[0] * 255, p[1] * 255, p[2] * 255,
+                    p.length > 3 ? p[3] : 1];
+        }
+        return [0, 0, 0, 0];
+    };
+    const over = (top, bottom) => {
+        const a = top[3];
+        return [
+            top[0] * a + bottom[0] * (1 - a),
+            top[1] * a + bottom[1] * (1 - a),
+            top[2] * a + bottom[2] * (1 - a),
+            1,
+        ];
+    };
+    // Everything painted behind (and including) an element, composited onto
+    // the page's own backdrop - the colour an eye actually receives.
+    const painted = (start) => {
+        const chain = [];
+        for (let e = start; e; e = e.parentElement) chain.push(e);
+        chain.reverse();
+        let acc = parse(getComputedStyle(document.documentElement).backgroundColor);
+        if (acc[3] < 1) acc = over(acc, [255, 255, 255, 1]);
+        for (const e of chain) acc = over(parse(getComputedStyle(e).backgroundColor), acc);
+        return acc;
+    };
+    const luminance = (c) => {
+        const channel = (v) => {
+            const s = v / 255;
+            return s <= 0.03928 ? s / 12.92 : Math.pow((s + 0.055) / 1.055, 2.4);
+        };
+        return 0.2126 * channel(c[0]) + 0.7152 * channel(c[1]) + 0.0722 * channel(c[2]);
+    };
+    const contrast = (a, b) => {
+        const la = luminance(a), lb = luminance(b);
+        return (Math.max(la, lb) + 0.05) / (Math.min(la, lb) + 0.05);
+    };
+    const style = getComputedStyle(el);
+    let opacity = 1;
+    for (let e = el; e; e = e.parentElement) {
+        opacity *= parseFloat(getComputedStyle(e).opacity || '1');
+    }
+    const behind = painted(el.parentElement);
+    const own = painted(el);
+    const border = ['Top', 'Right', 'Bottom', 'Left'].reduce((best, side) => {
+        const width = parseFloat(style['border' + side + 'Width']) || 0;
+        const colour = parse(style['border' + side + 'Color']);
+        const strength = width >= 2 ? colour[3] * contrast(
+            over(colour, behind), behind) : 0;
+        return Math.max(best, strength);
+    }, 0);
+    const box = el.getBoundingClientRect();
+    return {
+        opacity: opacity,
+        area: [box.width, box.height],
+        // How far the element's own surface separates it from the page behind
+        // it, and how strong its most visible border is. Either one is enough
+        // to set a notice apart; neither means it is not there to look at.
+        // The surface is measured as a plain channel distance rather than a
+        // luminance ratio: an alert tint over a dark panel is obvious to the
+        // eye at almost the same luminance.
+        surfaceDelta: Math.max(
+            Math.abs(own[0] - behind[0]),
+            Math.abs(own[1] - behind[1]),
+            Math.abs(own[2] - behind[2])),
+        borderStrength: border,
+        textContrast: contrast(parse(style.color), own),
+    };
+}"""
+
+
+def _perceptibility(page, selector):
+    measured = page.evaluate(_PERCEPTIBILITY_JS, selector)
+    assert measured is not None, f"{selector} is not in the DOM"
+    return measured
+
+
+def _assert_perceptible(measured, what):
+    assert measured["opacity"] > 0.9, f"{what} is painted see-through: {measured}"
+    assert measured["area"][0] > 50 and measured["area"][1] > 20, (
+        f"{what} has no rendered box: {measured}")
+    assert measured["textContrast"] >= 4.5, (
+        f"{what}'s text is unreadable on its own background: {measured}")
+    assert (
+        measured["surfaceDelta"] >= 8 or measured["borderStrength"] >= 1.5
+    ), f"{what} is not set apart from the page behind it: {measured}"
+
+
 def test_ride_sensor_setup_failures_render_a_dismissible_notice(
     page, live_server, console_errors
 ):
@@ -624,6 +741,11 @@ def test_ride_sensor_setup_failures_render_a_dismissible_notice(
     notice = page.locator("#sensorNotice")
     assert notice.is_visible()
     assert warning in notice.inner_text()
+
+    # Visible to the eye, not merely present in the layout.
+    _assert_perceptible(
+        _perceptibility(page, "#sensorNotice"), "the sensor notice"
+    )
 
     # Rendered, next to the readouts, and covering none of them.
     geometry = page.evaluate(

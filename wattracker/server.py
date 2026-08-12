@@ -509,6 +509,9 @@ _ALLOWED_WS_ORIGIN_HOSTS = ("localhost", "127.0.0.1", "::1")
 # other platforms). Bound user-supplied selections without imposing a format.
 _MAX_SELECTED_POWER_SOURCES = 8
 _MAX_BLE_ADDRESS_LENGTH = 256
+# Ceiling on the remembered picker names (all users together). A rider sees a
+# handful of devices; this only has to outlive the trip from scan to ride.
+_MAX_REMEMBERED_SENSOR_NAMES = 512
 
 # Per-sensor failures collected by connect_sensors (local or connector-side)
 # are written for the log: they name the role, the device and the raw BLE
@@ -532,19 +535,41 @@ _SENSOR_ROLE_READING = {
 }
 
 
-def _rider_facing_sensor_warning(message: str) -> str:
+def _friendly_sensor_name(name: str, address: str, names=None) -> str:
+    """The device as the rider knows it, given what the error line carries.
+
+    When a ride is started from an explicit selection, connect_sensors only
+    ever knew the address, so the "name" in its error line *is* the address
+    ("Could not set up cadence sensor 7B2A660B-... (7B2A660B-...)"). A rider
+    cannot match that to anything they own, so it is looked up in the names the
+    picker showed them. Falls back to the address when nothing knows better -
+    an unmatched identifier still beats no device at all.
+    """
+    if name and name != address:
+        return name
+    for key in (address, address.lower(), address.upper()):
+        known = (names or {}).get(key)
+        if known and known != address:
+            return str(known)
+    return name or address
+
+
+def _rider_facing_sensor_warning(message: str, names=None) -> str:
     """One connect_sensors error line, said the way a cyclist would say it.
 
     Anything that does not match the shapes devices.py emits is passed through
     untouched rather than mangled - a wrong translation is worse than a
-    technical one.
+    technical one. ``names`` maps address to the friendly name the rider was
+    shown, for the (usual) case where the error line has only the address.
     """
     match = _SENSOR_ERROR_RE.match(message or "")
     if not match:
         return message
     role = match.group("role")
     label = _SENSOR_ROLE_LABEL[role]
-    name = match.group("name")
+    name = _friendly_sensor_name(
+        match.group("name"), match.group("address"), names
+    )
     kind = match.group("kind")
     if kind == "Timed out connecting":
         return (
@@ -567,14 +592,32 @@ def _rider_facing_sensor_warning(message: str) -> str:
     )
 
 
-def _rider_facing_sensor_warnings(conn) -> List[str]:
+def _sensor_names_by_address(conn, scanned=None) -> dict:
+    """Every address -> friendly name this ride can account for.
+
+    ``conn["bindings"]`` names the devices that did bind; on the connector
+    (RemoteConnection) those are real names, so a KICKR whose cadence role
+    failed while its power role bound is named from its own connection.
+    ``scanned`` is the picker's view - the only source that can name a device
+    that bound nothing at all.
+    """
+    names = dict(scanned or {})
+    for address, binding in ((conn or {}).get("bindings") or {}).items():
+        name = str((binding or {}).get("name") or "")
+        if name and name != str(address):
+            names[str(address)] = name
+    return names
+
+
+def _rider_facing_sensor_warnings(conn, scanned=None) -> List[str]:
     """The rider-facing form of ``conn["errors"]``, for either BLE backend.
 
     RemoteConnection (the Windows connector) fills the same ``errors`` key
     from the connector's own connect_sensors, so both paths translate here.
     """
+    names = _sensor_names_by_address(conn, scanned)
     return [
-        _rider_facing_sensor_warning(str(message))
+        _rider_facing_sensor_warning(str(message), names)
         for message in (conn or {}).get("errors", []) or []
     ]
 
@@ -3856,6 +3899,7 @@ def create_app() -> FastAPI:
                 await bledevices.scan() if session is None
                 else await remote_ble.scan(session)
             )
+            _remember_scanned_names(uid, found)
             if not found:
                 return JSONResponse(
                     {
@@ -3873,6 +3917,34 @@ def create_app() -> FastAPI:
             return JSONResponse(
                 {"available": False, "reason": str(e), "devices": []}
             )
+
+    # The friendly names the device picker last showed, per user and address.
+    # The ride socket only ever receives addresses back, and connect_sensors'
+    # failures name a device by whatever it was given - so this is what turns a
+    # failed selection back into "KICKR CORE" for the rider. Names only, kept
+    # in memory and bounded; nothing here is authoritative for a ride.
+    _scanned_names: dict = {}
+
+    def _remember_scanned_names(uid: Optional[int], devices) -> None:
+        for device in devices or []:
+            if not isinstance(device, dict):
+                continue
+            address = str(device.get("address") or "")
+            name = str(device.get("name") or "")
+            if not address or not name or name == address:
+                continue
+            key = (uid, address)
+            _scanned_names.pop(key, None)
+            _scanned_names[key] = name
+        while len(_scanned_names) > _MAX_REMEMBERED_SENSOR_NAMES:
+            _scanned_names.pop(next(iter(_scanned_names)))
+
+    def _scanned_names_for(uid: Optional[int]) -> dict:
+        return {
+            address: name
+            for (owner, address), name in _scanned_names.items()
+            if owner == uid
+        }
 
     async def _ble_available(uid: Optional[int]) -> "tuple[bool, str]":
         """Whether a BLE radio is usable, here or on the connector's machine."""
@@ -4261,7 +4333,9 @@ def create_app() -> FastAPI:
                     await websocket.send_json({"status": "error", "error": str(e)})
                     return
                 if not _connection_has_power(conn) and not conn["trainer"]:
-                    details = " ".join(_rider_facing_sensor_warnings(conn))
+                    details = " ".join(
+                        _rider_facing_sensor_warnings(conn, _scanned_names_for(uid))
+                    )
                     await websocket.send_json(
                         {
                             "status": "error",
@@ -4282,7 +4356,9 @@ def create_app() -> FastAPI:
                      "erg_enabled": erg_enabled,
                      # Which selected sensors did not bind, in rider language.
                      # The raw BLE reason stays in the log for debugging.
-                     "warnings": _rider_facing_sensor_warnings(conn),
+                     "warnings": _rider_facing_sensor_warnings(
+                         conn, _scanned_names_for(uid)
+                     ),
                      "prepared": False,
                      "workout": workout_payload}
                 )
