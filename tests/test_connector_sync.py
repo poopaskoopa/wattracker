@@ -4,6 +4,7 @@ test_backend_parity.py proves the two backends agree; this proves the routes
 on top of them behave in server mode - including when no connector is there,
 which is the state a user will actually meet first.
 """
+import base64
 import os
 import pathlib
 
@@ -385,6 +386,60 @@ def test_a_symlinked_fit_cannot_stand_in_for_another_file(
         ))
 
 
+@pytest.mark.skipif(os.name != "posix", reason="POSIX symlinks")
+def test_activities_read_opens_the_file_it_judged_not_the_path_it_was_given(
+    zwift_home, monkeypatch
+):
+    """The read works on the RESOLVED path, so the check cannot be raced.
+
+    ``_in_scope`` resolves the path before judging it, and everything after
+    that - isfile, getsize, open - has to use what was judged. Opening the
+    caller's path instead is a TOCTOU even when the two start out identical:
+    a link that pointed at a real ride when it was checked can point at
+    ``~/.ssh/id_ed25519`` by the time it is read, and the guard above becomes
+    a check on a file nobody opens.
+
+    The race is made deterministic by repointing the link from inside
+    ``os.path.getsize``, which the handler calls in the window between the
+    check and the open. ``swapped`` is asserted so this cannot go quiet: if
+    the call ever leaves that window the test fails rather than passing on a
+    race that never happened (issue #87).
+    """
+    import asyncio
+
+    from wattracker_connector.handlers import ConnectorConfig, build_handlers
+
+    redirect_home(monkeypatch, str(zwift_home.parent))
+    activities = zwift_home / "Activities"
+    ride = activities / "ride.fit"
+    ride.write_bytes(b"a real ride")
+    secret = zwift_home.parent / "id_ed25519"
+    secret.write_bytes(b"PRIVATE KEY MATERIAL")
+    link = activities / "offered.fit"
+    link.symlink_to(ride)
+
+    real_getsize = os.path.getsize
+    swapped = []
+
+    def swap_then_size(target):
+        size = real_getsize(target)
+        if not swapped:
+            swapped.append(target)
+            link.unlink()
+            link.symlink_to(secret)
+        return size
+
+    handlers = build_handlers(ConnectorConfig(activities_dir=str(activities)))
+    monkeypatch.setattr(os.path, "getsize", swap_then_size)
+    result = asyncio.run(handlers["activities.read"](path=str(link)))
+    monkeypatch.undo()
+
+    assert swapped, "nothing was swapped: the race window was never entered"
+    assert base64.b64decode(result["content"]) == b"a real ride"
+    # The link now points at the key, and the read must not have followed it.
+    assert os.path.realpath(link) == os.path.realpath(secret)
+
+
 def test_a_manifest_date_cannot_write_outside_the_workouts_folder(
     zwift_home, monkeypatch, tmp_path
 ):
@@ -466,6 +521,65 @@ def test_a_remove_filename_cannot_delete_outside_the_workouts_folder(
         resolution="direct", remove=["2026-07-07 Real.zwo"],
     ))
     assert result["removed"] == 1
+
+
+def test_a_remove_filename_that_clears_the_extension_guard_still_cannot_traverse(
+    zwift_home, monkeypatch
+):
+    """The basename guard, with payloads that actually reach it (issue #87).
+
+    Every entry in the test above is a ``.fit``, so all three die one guard
+    later, at the ``.zwo`` extension check that was added BELOW the basename
+    check after that test was written. None of them ever reaches the basename
+    guard, which is why replacing it with ``if False:`` left the whole suite
+    green while ``os.path.join(target, "../sibling.zwo")`` walked straight out
+    of the resolved target and deleted the rider's workout.
+
+    So every payload here is a ``.zwo``: the extension guard passes them and
+    the basename guard is the only thing left standing between them and the
+    unlink. A guard in a stack needs a payload that clears every OTHER guard,
+    or the test is named for it and is evidence about something else.
+    """
+    import asyncio
+
+    from wattracker_connector.handlers import ConnectorConfig, build_handlers
+
+    home = zwift_home.parent
+    redirect_home(monkeypatch, str(home))
+    workouts = zwift_home / "Workouts"
+    player = workouts / "1234567"
+    player.mkdir()
+    # A real workout one level up from the target: same extension, reachable
+    # only by traversing out of the folder the sync was pointed at.
+    sibling = workouts / "2026-07-07 Sibling.zwo"
+    sibling.write_text("<workout_file/>")
+    # And one outside the Zwift folders entirely, named absolutely.
+    outside = home / "2026-07-07 Outside.zwo"
+    outside.write_text("<workout_file/>")
+    keeper = player / "2026-07-07 Real.zwo"
+    keeper.write_text("<workout_file/>")
+
+    handlers = build_handlers(ConnectorConfig(workouts_dir=str(player)))
+    result = asyncio.run(handlers["workouts.sync"](
+        resolution="direct",
+        remove=[
+            "../2026-07-07 Sibling.zwo",
+            "..\\2026-07-07 Sibling.zwo",  # a separator on Windows
+            str(outside),
+        ],
+    ))
+    assert result["status"] == "ok"
+    assert result["removed"] == 0
+    assert sibling.exists(), "a ../ .zwo escaped the folder the sync was given"
+    assert outside.exists(), "an absolute .zwo escaped the folder the sync was given"
+
+    # A bare .zwo in the folder itself still removes: this is a guard on the
+    # shape of the name, not a wall in front of the delete.
+    result = asyncio.run(handlers["workouts.sync"](
+        resolution="direct", remove=[keeper.name],
+    ))
+    assert result["removed"] == 1
+    assert not keeper.exists()
 
 
 # ----------------------------------------- the folder, not just the filename
@@ -627,6 +741,53 @@ def test_a_relocated_player_folder_is_still_a_zwift_workouts_folder(
     ))
     assert result["status"] == "ok"
     assert (elsewhere / "2026-07-07 VO2 5x4.zwo").exists()
+
+
+@pytest.mark.skipif(os.name != "posix", reason="POSIX symlinks")
+def test_a_link_into_the_workouts_root_is_still_a_zwift_workouts_folder(
+    zwift_home, monkeypatch
+):
+    """The other half of ``within_workouts_roots``' probe pair (issue #87).
+
+    The candidate is judged twice: once fully resolved, and once with its
+    ancestors resolved but the leaf left alone. The test above covers the
+    leaf-unresolved probe - a player folder junctioned OUT of the root, whose
+    real path is elsewhere. This covers the fully-resolved one: a link from
+    somewhere else INTO the root, whose real path is the player folder and
+    whose ancestors are not under any root at all. Only the fully resolved
+    probe can see it, so dropping that probe leaves this refused - and nothing
+    noticed, because the two probes were only ever tested as a pair.
+
+    It widens the predicate rather than narrowing it, which is why the check
+    is safe: the connector still acts on the RESOLVED folder, so a link the
+    server names buys it nothing it could not have had by naming the target.
+    """
+    import asyncio
+
+    from wattracker_connector.handlers import ConnectorConfig, build_handlers
+
+    home = zwift_home.parent
+    redirect_home(monkeypatch, str(home))
+    root = pathlib.Path(paths.export_workouts_roots()[0])
+    player = root / "1234567"
+    player.mkdir(parents=True)
+    shortcut = home / "my-zwift-workouts"
+    shortcut.symlink_to(player)
+
+    # The leaf-unresolved probe is $HOME/my-zwift-workouts, which is under no
+    # Workouts root - so this is the fully-resolved probe's answer alone.
+    assert not paths.within_workouts_roots(str(home / "some-other-folder"))
+    assert paths.within_workouts_roots(str(shortcut))
+
+    handlers = build_handlers(ConnectorConfig())
+    result = asyncio.run(handlers["workouts.sync"](
+        resolution="direct", override=str(shortcut),
+        write=[{"date": "2026-07-07", "name": "VO2 5x4", "zwo": "<workout_file/>"}],
+    ))
+    assert result["status"] == "ok"
+    assert result["exported"] == 1
+    # Acted on where the link really points, not on the name it was given.
+    assert (player / "2026-07-07 VO2 5x4.zwo").exists()
 
 
 def test_a_remove_entry_must_be_a_workout_this_sync_could_have_written(
