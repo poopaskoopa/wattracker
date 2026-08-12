@@ -1155,6 +1155,272 @@ def test_ride_ws_real_path_degrades_without_trainer(client, monkeypatch):
     assert frames[-1]["status"] == "finished"
 
 
+# The address of the KICKR from the incident. Opaque to the rider: it appears
+# nowhere on the device, on its box, or in the picker - only the name does.
+_KICKR_ADDRESS = "7B2A660B-1111-2222-3333-444455556666"
+
+
+def _scan_for_names(client, monkeypatch, name="KICKR CORE",
+                    address=_KICKR_ADDRESS):
+    """Do the scan the rider does before picking sensors.
+
+    This is where the friendly name enters the server at all: the ride socket
+    is handed addresses, and connect_sensors' failures can only name a device
+    by what it was given.
+    """
+    async def fake_scan():
+        return [{
+            "address": address,
+            "name": name,
+            "services": [],
+            "roles": ["power", "cadence"],
+            "rssi": -50,
+        }]
+
+    monkeypatch.setattr(servermod.bledevices, "scan", fake_scan)
+    assert client.post("/ride/scan").status_code == 200
+
+
+def test_ride_ws_reports_failed_sensor_roles_without_stopping_the_ride(
+    client, monkeypatch
+):
+    """A role that fails to set up has to reach the rider, in rider language.
+
+    The incident: a KICKR selected in the cadence role failed to bind
+    ("Characteristic 00002a5b-... was not found!"). connect_sensors kept the
+    other roles alive and put that line in conn["errors"], but only the log
+    ever saw it - the ride page showed an empty cadence field and no reason,
+    so the ride was retried six times. The cadence the KICKR does report,
+    through its power role, kept working the whole time.
+    """
+    from wattracker.ble.devices import SimulatedPowerSource
+
+    _register(client)
+    # What connect_sensors really emits for an explicitly selected device: it
+    # was handed an address and nothing else, so the "name" in its own error
+    # line IS the address. See the end-to-end shape test below.
+    raw = (
+        f"Could not set up cadence sensor {_KICKR_ADDRESS} ({_KICKR_ADDRESS}): "
+        "Characteristic 00002a5b-0000-1000-8000-00805f9b34fb was not found!"
+    )
+
+    async def fake_connect(timeout=6.0, selected=None):
+        return {
+            "trainer": None,
+            "power_source": SimulatedPowerSource(
+                [150, 150, 150, 150] + [0] * 10, cadences=[88] * 14
+            ),
+            "hr_source": None,
+            "cadence_source": None,
+            "clients": [],
+            "names": {"power": "KICKR CORE"},
+            "bindings": {
+                _KICKR_ADDRESS: {"name": _KICKR_ADDRESS, "roles": {"power": object()}}
+            },
+            "errors": [raw],
+        }
+
+    monkeypatch.setattr(servermod.bledevices, "bluetooth_available", lambda: (True, "ok"))
+    _scan_for_names(client, monkeypatch)
+    monkeypatch.setattr(servermod.bledevices, "connect_sensors", fake_connect)
+    monkeypatch.setattr(servermod, "RIDE_POLL_INTERVAL_S", 0)
+
+    frames = []
+    url = (
+        "/ride/ws?type=endurance&minutes=30&selected=1"
+        f"&power={_KICKR_ADDRESS}&cadence={_KICKR_ADDRESS}"
+    )
+    with client.websocket_connect(url) as ws:
+        connected = _receive_after_workout(ws)
+        assert connected["status"] == "connected"
+        # Named the way the rider knows it, not by the address they never saw.
+        assert connected["warnings"] == [
+            "Cadence sensor KICKR CORE couldn't be used — it doesn't report "
+            "cadence in a way wattracker can read."
+        ]
+        # Nothing a cyclist cannot act on leaks through.
+        warning = connected["warnings"][0]
+        assert "Characteristic" not in warning
+        assert "00002a5b" not in warning
+        assert _KICKR_ADDRESS not in warning
+        assert "7B2A660B" not in warning
+        try:
+            while True:
+                frames.append(ws.receive_json())
+        except Exception:
+            pass
+
+    # The failed role did not abort the ride, and the cadence the surviving
+    # power role reports still arrives.
+    assert any(f.get("power") == 150 for f in frames)
+    assert any(f.get("cadence") == 88 for f in frames)
+    assert frames[-1]["status"] == "finished"
+
+
+def test_ride_ws_connect_failures_are_translated_per_kind(client, monkeypatch):
+    """Timeouts and connect failures get their own rider-facing wording, and
+    anything connect_sensors did not phrase is passed through untouched."""
+    timed_out = servermod._rider_facing_sensor_warning(
+        "Timed out connecting hr sensor Wahoo TICKR (AA:BB) — it may still be "
+        "held by another app or a previous ride; wait a few seconds and retry."
+    )
+    assert timed_out == (
+        "Heart rate strap Wahoo TICKR didn't answer in time — it may still be "
+        "connected to another app or a previous ride. Wait a few seconds and "
+        "try again."
+    )
+    refused = servermod._rider_facing_sensor_warning(
+        "Could not connect power sensor Assioma (CC:DD): radio refused"
+    )
+    assert refused == (
+        "Power meter Assioma couldn't be connected — check it's awake, in "
+        "range, and not connected to another app."
+    )
+    trainer = servermod._rider_facing_sensor_warning(
+        "Could not set up trainer sensor KICKR (EE:FF): boom"
+    )
+    assert trainer == (
+        "Trainer KICKR couldn't be used — wattracker can't control its "
+        "resistance."
+    )
+    assert servermod._rider_facing_sensor_warning("Bluetooth went away") == (
+        "Bluetooth went away"
+    )
+
+
+def test_a_selected_sensors_failure_line_names_it_only_by_address(monkeypatch):
+    """The premise the rider-facing name resolution exists for.
+
+    Ties the translation to what devices.connect_sensors actually writes rather
+    than to a hand-typed string: given an explicit selection it knows an
+    address and nothing else, so the device "name" in its error line IS the
+    address. If that ever stops being true this test says so, instead of the
+    ride page quietly going back to showing a UUID.
+    """
+    from test_ble_devices import _install_fake_bleak
+
+    _install_fake_bleak(monkeypatch)
+
+    class FailingCadence:
+        def __init__(self, client):
+            pass
+
+        async def start(self):
+            raise RuntimeError(
+                "Characteristic 00002a5b-0000-1000-8000-00805f9b34fb "
+                "was not found!"
+            )
+
+    monkeypatch.setattr(bledevices, "BleakCadenceSource", FailingCadence)
+    conn = asyncio.run(
+        bledevices.connect_sensors(selected={"cadence": [_KICKR_ADDRESS]})
+    )
+
+    raw = conn["errors"][0]
+    assert raw == (
+        f"Could not set up cadence sensor {_KICKR_ADDRESS} ({_KICKR_ADDRESS}): "
+        "Characteristic 00002a5b-0000-1000-8000-00805f9b34fb was not found!"
+    )
+    # The picker's name is the only thing that can rescue it.
+    assert servermod._rider_facing_sensor_warnings(
+        conn, {_KICKR_ADDRESS: "KICKR CORE"}
+    ) == [
+        "Cadence sensor KICKR CORE couldn't be used — it doesn't report "
+        "cadence in a way wattracker can read."
+    ]
+
+
+def test_an_unnamed_sensor_falls_back_to_its_address(client, monkeypatch):
+    """Nothing knows this device's name, so the address is all there is.
+
+    An unmatched identifier is still better than no device at all when a rider
+    has several sensors: it at least says the failure is about one of them.
+    """
+    raw = f"Could not set up cadence sensor {_KICKR_ADDRESS} ({_KICKR_ADDRESS}): boom"
+
+    assert servermod._rider_facing_sensor_warnings({"errors": [raw]}) == [
+        f"Cadence sensor {_KICKR_ADDRESS} couldn't be used — it doesn't report "
+        "cadence in a way wattracker can read."
+    ]
+
+
+def test_connector_sensor_failures_are_named_from_the_connectors_own_devices():
+    """The Windows connector path names the device without any scan cache.
+
+    Its connect_sensors runs on the other machine and writes the same
+    address-only error lines, but the connection it returns carries the real
+    names of the devices that did bind - which is exactly the KICKR case: the
+    power role bound, the cadence role on the same device did not.
+    """
+    from test_connector_ride import _AnsweringSession
+
+    from wattracker.backend import remote_ble
+
+    raw = (
+        f"Could not set up cadence sensor {_KICKR_ADDRESS} ({_KICKR_ADDRESS}): "
+        "Characteristic 00002a5b-0000-1000-8000-00805f9b34fb was not found!"
+    )
+    session = _AnsweringSession(
+        [{"address": _KICKR_ADDRESS, "name": "KICKR CORE", "roles": ["power"]}],
+        errors=[raw],
+    )
+    conn = asyncio.run(remote_ble.connect_sensors(session))
+
+    assert conn["errors"] == [raw]
+    assert servermod._rider_facing_sensor_warnings(conn) == [
+        "Cadence sensor KICKR CORE couldn't be used — it doesn't report "
+        "cadence in a way wattracker can read."
+    ]
+
+
+def test_ride_ws_refusal_says_which_sensor_failed_and_why(client, monkeypatch):
+    """The ride cannot start, so this frame is the rider's only explanation.
+
+    "No selected power meter or FTMS trainer could be set up." on its own tells
+    a rider nothing they can act on - the reason the selected sensor failed has
+    to travel with it, in the same rider language the notice uses.
+    """
+    _register(client)
+    raw = (
+        f"Could not set up power sensor {_KICKR_ADDRESS} ({_KICKR_ADDRESS}): "
+        "Characteristic 00002a63-0000-1000-8000-00805f9b34fb was not found!"
+    )
+
+    async def fake_connect(timeout=6.0, selected=None):
+        return {
+            "trainer": None,
+            "power_source": None,
+            "hr_source": None,
+            "cadence_source": None,
+            "clients": [],
+            "names": {},
+            "bindings": {},
+            "errors": [raw],
+        }
+
+    monkeypatch.setattr(servermod.bledevices, "bluetooth_available", lambda: (True, "ok"))
+    _scan_for_names(client, monkeypatch)
+    monkeypatch.setattr(servermod.bledevices, "connect_sensors", fake_connect)
+
+    url = (
+        "/ride/ws?type=endurance&minutes=30&selected=1"
+        f"&power={_KICKR_ADDRESS}"
+    )
+    with client.websocket_connect(url) as ws:
+        frame = _receive_after_workout(ws)
+
+    assert frame["status"] == "error"
+    error = frame["error"]
+    assert "No selected power meter or FTMS trainer could be set up." in error
+    # Which one, and why, in words a cyclist can act on.
+    assert (
+        "Power meter KICKR CORE couldn't be used — it doesn't report power "
+        "in a way wattracker can read." in error
+    )
+    assert "Characteristic" not in error
+    assert _KICKR_ADDRESS not in error
+
+
 def test_ride_ws_real_path_no_devices(client, monkeypatch):
     from wattracker import server as servermod
 
