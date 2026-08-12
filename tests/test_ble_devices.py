@@ -781,3 +781,161 @@ def test_scan_raises_when_every_sweep_fails(monkeypatch):
     module.BleakScanner = FakeScanner
     with pytest.raises(RuntimeError, match="every attempt.*powered off"):
         asyncio.run(devices.scan(timeout=0.01))
+
+
+def _install_gatt_bleak(monkeypatch, characteristics, strict=True):
+    """Fake bleak whose clients expose a GATT table and reject re-subscribes.
+
+    ``strict`` mimics macOS CoreBluetooth, which raises when a characteristic
+    is subscribed twice on the same client.
+    """
+    module = types.ModuleType("bleak")
+
+    class GattClient:
+        instances = []
+
+        def __init__(self, address):
+            self.address = address
+            self.services = [_FakeService(characteristics)]
+            self.notifies = {}
+            self.notify_calls = []
+            self.disconnected = False
+            self.__class__.instances.append(self)
+
+        async def connect(self):
+            pass
+
+        async def disconnect(self):
+            self.disconnected = True
+
+        async def start_notify(self, uuid, handler):
+            self.notify_calls.append(uuid)
+            if strict and uuid in self.notifies:
+                raise ValueError("Characteristic notifications already started")
+            self.notifies[uuid] = handler
+
+    GattClient.instances = []
+    module.BleakClient = GattClient
+    monkeypatch.setitem(sys.modules, "bleak", module)
+    return GattClient
+
+
+def test_shared_device_in_power_and_cadence_roles_subscribes_once(monkeypatch):
+    """A KICKR picked for both roles gets one 0x2A63 subscription, shared."""
+    now = [10.0]
+    monkeypatch.setattr(devices.time, "monotonic", lambda: now[0])
+    client_cls = _install_gatt_bleak(monkeypatch, [CYCLING_POWER_MEASUREMENT])
+
+    result = asyncio.run(
+        devices.connect_sensors(
+            selected={"power": ["KICKR"], "cadence": ["KICKR"]}
+        )
+    )
+
+    assert result["errors"] == []
+    client = client_cls.instances[0]
+    assert client.notify_calls == [CYCLING_POWER_MEASUREMENT]
+    cadence_source = result["cadence_source"]
+    assert cadence_source is not None
+    assert result["names"]["cadence"] == "KICKR"
+    assert result["bindings"]["KICKR"]["roles"]["cadence"] is cadence_source
+
+    notify = client.notifies[CYCLING_POWER_MEASUREMENT]
+    notify(None, _power_measurement(220, 10, 1000))
+    now[0] = 10.5
+    notify(None, _power_measurement(225, 11, 1878))
+    assert cadence_source.latest_cadence() == pytest.approx(70.0, abs=0.1)
+    # The cadence role stays cadence-only even while borrowing power's feed.
+    assert cadence_source.latest_power() is None
+    assert result["power_source"].latest_power() == 225
+
+
+def test_shared_device_never_triggers_duplicate_notify_rejection(monkeypatch):
+    """The OS rejection must never be reached, let alone surfaced as an error."""
+    client_cls = _install_gatt_bleak(monkeypatch, [CYCLING_POWER_MEASUREMENT])
+
+    result = asyncio.run(
+        devices.connect_sensors(
+            selected={"power": ["KICKR"], "cadence": ["KICKR"]}
+        )
+    )
+
+    assert result["errors"] == []
+    assert "already started" not in " ".join(result["errors"])
+    assert result["cadence_source"] is not None
+    assert client_cls.instances[0].notify_calls.count(CYCLING_POWER_MEASUREMENT) == 1
+
+
+def test_cadence_only_selection_still_subscribes_itself(monkeypatch):
+    now = [10.0]
+    monkeypatch.setattr(devices.time, "monotonic", lambda: now[0])
+    client_cls = _install_gatt_bleak(monkeypatch, [CYCLING_POWER_MEASUREMENT])
+
+    result = asyncio.run(devices.connect_sensors(selected={"cadence": ["KICKR"]}))
+
+    assert result["errors"] == []
+    client = client_cls.instances[0]
+    assert client.notify_calls == [CYCLING_POWER_MEASUREMENT]
+    cadence_source = result["cadence_source"]
+    assert isinstance(cadence_source, devices.BleakCadenceSource)
+    notify = client.notifies[CYCLING_POWER_MEASUREMENT]
+    notify(None, _power_measurement(220, 10, 1000))
+    now[0] = 10.5
+    notify(None, _power_measurement(225, 11, 1878))
+    assert cadence_source.latest_cadence() == pytest.approx(70.0, abs=0.1)
+
+
+def test_csc_device_in_both_roles_keeps_its_own_subscription(monkeypatch):
+    now = [10.0]
+    monkeypatch.setattr(devices.time, "monotonic", lambda: now[0])
+    client_cls = _install_gatt_bleak(
+        monkeypatch,
+        [CYCLING_POWER_MEASUREMENT, CYCLING_SPEED_AND_CADENCE_MEASUREMENT],
+    )
+
+    result = asyncio.run(
+        devices.connect_sensors(
+            selected={"power": ["COMBO"], "cadence": ["COMBO"]}
+        )
+    )
+
+    assert result["errors"] == []
+    client = client_cls.instances[0]
+    assert client.notify_calls == [
+        CYCLING_POWER_MEASUREMENT, CYCLING_SPEED_AND_CADENCE_MEASUREMENT
+    ]
+    cadence_source = result["cadence_source"]
+    assert isinstance(cadence_source, devices.BleakCadenceSource)
+    csc_notify = client.notifies[CYCLING_SPEED_AND_CADENCE_MEASUREMENT]
+    csc_notify(None, _csc_measurement(10, 1000))
+    csc_notify(None, _csc_measurement(11, 2024))
+    assert cadence_source.latest_cadence() == pytest.approx(60.0)
+
+
+def test_disconnecting_the_shared_device_clears_both_roles(monkeypatch):
+    now = [10.0]
+    monkeypatch.setattr(devices.time, "monotonic", lambda: now[0])
+    client_cls = _install_gatt_bleak(monkeypatch, [CYCLING_POWER_MEASUREMENT])
+
+    result = asyncio.run(
+        devices.connect_sensors(
+            selected={"power": ["KICKR"], "cadence": ["KICKR"]}
+        )
+    )
+    adapter = result["cadence_source"]
+    client = client_cls.instances[0]
+    notify = client.notifies[CYCLING_POWER_MEASUREMENT]
+    notify(None, _power_measurement(220, 10, 1000))
+    now[0] = 10.5
+    notify(None, _power_measurement(225, 11, 1878))
+    assert adapter.latest_cadence() == pytest.approx(70.0, abs=0.1)
+
+    asyncio.run(devices.disconnect_sensor(result, "KICKR"))
+
+    assert client.disconnected is True
+    assert result["cadence_source"] is None
+    assert result["power_source"] is None
+    assert result["bindings"] == {}
+    assert result["names"] == {}
+    # The detached adapter cannot keep reporting the dead device's cadence.
+    assert adapter.latest_cadence() is None
