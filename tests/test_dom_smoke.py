@@ -15,6 +15,7 @@ Run just these:      pytest -m browser
 Skip them:           pytest -m "not browser"
 """
 import datetime as dt
+import json
 import re
 import socket
 import threading
@@ -553,6 +554,151 @@ def test_ride_stop_ends_the_ride_through_an_in_page_dialog(
 
     assert browser_dialogs == [], f"a browser dialog was used: {browser_dialogs}"
     _assert_clean(console_errors, "/ride stop")
+
+
+# The ride socket is the only way a "connected" frame reaches the page, and a
+# simulated ride never produces one. This wraps the real WebSocket so the real
+# ride handler receives a real "connected" frame -- carrying the real workout
+# the server just sent -- with the warnings list under test. Injection is
+# scheduled from the workout frame rather than driven from the test, so it can
+# never land after the simulated ride has closed the socket.
+def _inject_connected_frame(page, warnings):
+    page.add_init_script(
+        """
+        (() => {
+            const WARNINGS = %s;
+            const Native = window.WebSocket;
+            function Tracked(url, protocols) {
+                const socket = protocols === undefined
+                    ? new Native(url) : new Native(url, protocols);
+                socket.addEventListener('message', (event) => {
+                    let frame;
+                    try { frame = JSON.parse(event.data); } catch (e) { return; }
+                    if (frame.status !== 'workout' || window.__injected) return;
+                    window.__injected = true;
+                    window.setTimeout(() => {
+                        socket.onmessage({data: JSON.stringify({
+                            status: 'connected',
+                            devices: {power: 'KICKR CORE', hr: 'TICKR'},
+                            erg: false,
+                            erg_available: false,
+                            erg_enabled: false,
+                            prepared: false,
+                            warnings: WARNINGS,
+                            workout: frame.workout,
+                        })});
+                    }, 0);
+                });
+                return socket;
+            }
+            Tracked.prototype = Native.prototype;
+            ['CONNECTING', 'OPEN', 'CLOSING', 'CLOSED'].forEach(
+                (k) => { Tracked[k] = Native[k]; });
+            window.WebSocket = Tracked;
+        })();
+        """
+        % json.dumps(warnings)
+    )
+
+
+def test_ride_sensor_setup_failures_render_a_dismissible_notice(
+    page, live_server, console_errors
+):
+    """A sensor that fails to bind has to be visible ON THE RIDE PAGE.
+
+    The incident: a KICKR selected in the cadence role failed to set up. The
+    reason went to the server log only; the page showed an empty cadence field
+    and no explanation, so the ride was retried six times. The notice must
+    appear next to the readouts, in rider language, and must not take the ride
+    away -- the roles that did bind keep running behind it.
+    """
+    warning = ("Cadence sensor KICKR CORE couldn't be used — it doesn't report "
+               "cadence in a way wattracker can read.")
+    _inject_connected_frame(page, [warning])
+
+    page.goto(f"{live_server.base}/ride")
+    page.wait_for_load_state("networkidle")
+    page.click("#simBtn")
+    page.wait_for_selector("#sensorNotice", timeout=15_000)
+
+    notice = page.locator("#sensorNotice")
+    assert notice.is_visible()
+    assert warning in notice.inner_text()
+
+    # Rendered, next to the readouts, and covering none of them.
+    geometry = page.evaluate(
+        """() => {
+            const notice = document.getElementById('sensorNotice');
+            const cards = document.querySelector('.ride-live .cards');
+            // Hit-testing only answers for points inside the viewport.
+            notice.scrollIntoView({block: 'center'});
+            const n = notice.getBoundingClientRect();
+            const c = cards.getBoundingClientRect();
+            const readouts = ['rPower', 'rCad', 'rHr'].map((id) => {
+                const el = document.getElementById(id);
+                const box = el.getBoundingClientRect();
+                // Whatever the browser hit-tests at the middle of the number
+                // must be the number or something containing it -- never the
+                // notice sitting on top of it.
+                const hit = document.elementFromPoint(
+                    box.left + box.width / 2, box.top + box.height / 2);
+                return {
+                    id: id,
+                    visible: box.width > 0 && box.height > 0,
+                    hit: hit ? (hit.id || hit.className || hit.tagName) : null,
+                    covered: !hit || !(hit === el || hit.contains(el)),
+                };
+            });
+            return {
+                drawn: n.width > 50 && n.height > 20,
+                above: n.bottom <= c.top + 1,
+                gap: Math.round(c.top - n.bottom),
+                readouts: readouts,
+            };
+        }"""
+    )
+    assert geometry["drawn"], f"notice has no rendered box: {geometry}"
+    assert geometry["above"], f"notice is not beside the readouts: {geometry}"
+    assert geometry["gap"] < 60, f"notice is nowhere near the readouts: {geometry}"
+    for readout in geometry["readouts"]:
+        assert readout["visible"] and not readout["covered"], geometry
+
+    # The ride is live behind the notice: it is a notice, not a blocker.
+    assert page.locator("#stopBtn").is_enabled()
+
+    # Dismissible, and dismissing leaves nothing behind.
+    page.click("#sensorNoticeDismiss")
+    page.wait_for_selector("#sensorNotice", state="detached", timeout=10_000)
+    assert page.locator(".sensor-notice").count() == 0
+    assert page.locator("#rCad").is_visible()
+    assert page.locator("#stopBtn").is_enabled()
+    _assert_clean(console_errors, "/ride sensor failure notice")
+
+
+def test_ride_without_sensor_failures_renders_no_notice_at_all(
+    page, live_server, console_errors
+):
+    """No failures must leave no container: an empty box above the readouts
+    reads as "something is wrong" every ride."""
+    _inject_connected_frame(page, [])
+
+    page.goto(f"{live_server.base}/ride")
+    page.wait_for_load_state("networkidle")
+    page.click("#simBtn")
+    page.wait_for_function(
+        """() => (document.getElementById('connectionStatus').textContent || '')
+                 .indexOf('Connected') !== -1""",
+        timeout=15_000,
+    )
+
+    leftovers = page.evaluate(
+        """() => Array.from(
+            document.querySelectorAll('#sensorNotice, .sensor-notice, #sensorNoticeDismiss')
+        ).map((el) => el.outerHTML)"""
+    )
+    assert leftovers == [], f"an empty notice was left in the DOM: {leftovers}"
+    assert page.locator("#rCad").is_visible()
+    _assert_clean(console_errors, "/ride without sensor failures")
 
 
 def test_workout_graphs_are_real_svg_elements(page, live_server, console_errors):

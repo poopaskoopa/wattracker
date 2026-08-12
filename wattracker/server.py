@@ -9,6 +9,7 @@ import io
 import logging
 import math as _math
 import os
+import re as _rex
 import sys
 import threading
 import urllib.parse as _url
@@ -508,6 +509,74 @@ _ALLOWED_WS_ORIGIN_HOSTS = ("localhost", "127.0.0.1", "::1")
 # other platforms). Bound user-supplied selections without imposing a format.
 _MAX_SELECTED_POWER_SOURCES = 8
 _MAX_BLE_ADDRESS_LENGTH = 256
+
+# Per-sensor failures collected by connect_sensors (local or connector-side)
+# are written for the log: they name the role, the device and the raw BLE
+# error ("Characteristic 00002a5b-... was not found!"). A rider cannot act on
+# that, so the socket carries a translation while the log keeps the original.
+_SENSOR_ERROR_RE = _rex.compile(
+    r"^(?P<kind>Timed out connecting|Could not connect|Could not set up) "
+    r"(?P<role>trainer|power|hr|cadence) sensor "
+    r"(?P<name>.+?) \((?P<address>[^()]*)\)"
+)
+_SENSOR_ROLE_LABEL = {
+    "trainer": "Trainer",
+    "power": "Power meter",
+    "hr": "Heart rate strap",
+    "cadence": "Cadence sensor",
+}
+_SENSOR_ROLE_READING = {
+    "power": "power",
+    "hr": "heart rate",
+    "cadence": "cadence",
+}
+
+
+def _rider_facing_sensor_warning(message: str) -> str:
+    """One connect_sensors error line, said the way a cyclist would say it.
+
+    Anything that does not match the shapes devices.py emits is passed through
+    untouched rather than mangled - a wrong translation is worse than a
+    technical one.
+    """
+    match = _SENSOR_ERROR_RE.match(message or "")
+    if not match:
+        return message
+    role = match.group("role")
+    label = _SENSOR_ROLE_LABEL[role]
+    name = match.group("name")
+    kind = match.group("kind")
+    if kind == "Timed out connecting":
+        return (
+            f"{label} {name} didn't answer in time \u2014 it may still be connected "
+            f"to another app or a previous ride. Wait a few seconds and try again."
+        )
+    if kind == "Could not connect":
+        return (
+            f"{label} {name} couldn't be connected \u2014 check it's awake, in "
+            f"range, and not connected to another app."
+        )
+    if role == "trainer":
+        return (
+            f"Trainer {name} couldn't be used \u2014 wattracker can't control its "
+            f"resistance."
+        )
+    return (
+        f"{label} {name} couldn't be used \u2014 it doesn't report "
+        f"{_SENSOR_ROLE_READING[role]} in a way wattracker can read."
+    )
+
+
+def _rider_facing_sensor_warnings(conn) -> List[str]:
+    """The rider-facing form of ``conn["errors"]``, for either BLE backend.
+
+    RemoteConnection (the Windows connector) fills the same ``errors`` key
+    from the connector's own connect_sensors, so both paths translate here.
+    """
+    return [
+        _rider_facing_sensor_warning(str(message))
+        for message in (conn or {}).get("errors", []) or []
+    ]
 
 
 class IPv6TrustedHostMiddleware(TrustedHostMiddleware):
@@ -4192,7 +4261,7 @@ def create_app() -> FastAPI:
                     await websocket.send_json({"status": "error", "error": str(e)})
                     return
                 if not _connection_has_power(conn) and not conn["trainer"]:
-                    details = " ".join(conn.get("errors", []))
+                    details = " ".join(_rider_facing_sensor_warnings(conn))
                     await websocket.send_json(
                         {
                             "status": "error",
@@ -4211,7 +4280,9 @@ def create_app() -> FastAPI:
                      "erg": erg_available,
                      "erg_available": erg_available,
                      "erg_enabled": erg_enabled,
-                     "warnings": conn.get("errors", []),
+                     # Which selected sensors did not bind, in rider language.
+                     # The raw BLE reason stays in the log for debugging.
+                     "warnings": _rider_facing_sensor_warnings(conn),
                      "prepared": False,
                      "workout": workout_payload}
                 )
