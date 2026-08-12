@@ -1180,6 +1180,8 @@
             return;
         }
         resetConnectedRows();
+        // Last ride's sensor failures say nothing about this one.
+        renderSensorNotice([]);
         ergPending = false;
         applyErgState(false, false);
         var proto = location.protocol === "https:" ? "wss:" : "ws:";
@@ -1311,12 +1313,13 @@
                 if (names.cadence) parts.push("cadence: " + displayName(names.cadence));
                 var message = parts.length ? "Connected — " + parts.join(", ") : "Connected.";
                 message += " Start pedaling to begin the workout.";
-                if (st.warnings && st.warnings.length) {
-                    message += " Warning: " + st.warnings.join(" ");
-                }
-                var hasWarnings = st.warnings && st.warnings.length;
-                setLive(document.getElementById("connectionStatus"), message,
-                    hasWarnings ? "failure" : "success");
+                // A sensor that failed to bind never stops the ride: the roles
+                // that did bind are already running (a KICKR whose cadence role
+                // fails still reports cadence through its power role). So the
+                // connection line stays a success and the failures go into a
+                // notice the rider can read and dismiss.
+                var hasWarnings = renderSensorNotice(st.warnings);
+                setLive(document.getElementById("connectionStatus"), message, "success");
                 document.getElementById("rStatus").textContent = "ready — pedal to start";
                 saveSuccessfulSelection(names);
                 updateConnectedRows(names);
@@ -1408,6 +1411,56 @@
             });
         });
         return result;
+    }
+    // Sensors that failed to set up, shown next to the live readouts they are
+    // missing from. Rebuilt from scratch on every connection and removed
+    // entirely when there is nothing to say, so no empty box is ever left
+    // sitting above the cards. Returns whether anything was rendered.
+    function renderSensorNotice(warnings) {
+        var existing = document.getElementById("sensorNotice");
+        if (existing) existing.remove();
+        var messages = (warnings || []).filter(function (text) {
+            return typeof text === "string" && text.trim() !== "";
+        });
+        if (!messages.length) return false;
+        var cards = document.querySelector(".ride-live .cards");
+        if (!cards) return false;
+
+        var notice = document.createElement("div");
+        notice.id = "sensorNotice";
+        notice.className = "sensor-notice";
+        notice.setAttribute("role", "status");
+
+        var body = document.createElement("div");
+        var heading = document.createElement("strong");
+        heading.textContent = messages.length === 1
+            ? "One sensor couldn't be used."
+            : messages.length + " sensors couldn't be used.";
+        body.appendChild(heading);
+        var lead = document.createElement("span");
+        lead.className = "sensor-notice-lead";
+        lead.textContent = " The ride is running with everything else.";
+        body.appendChild(lead);
+        var list = document.createElement("ul");
+        list.className = "sensor-notice-list";
+        messages.forEach(function (text) {
+            var item = document.createElement("li");
+            item.textContent = text;
+            list.appendChild(item);
+        });
+        body.appendChild(list);
+        notice.appendChild(body);
+
+        var dismiss = document.createElement("button");
+        dismiss.type = "button";
+        dismiss.id = "sensorNoticeDismiss";
+        dismiss.className = "button-secondary sensor-notice-dismiss";
+        dismiss.textContent = "Dismiss";
+        dismiss.addEventListener("click", function () { notice.remove(); });
+        notice.appendChild(dismiss);
+
+        cards.parentNode.insertBefore(notice, cards);
+        return true;
     }
     function updateConnectedRows(devices) {
         connectedAddresses = addressesByRole(devices);
