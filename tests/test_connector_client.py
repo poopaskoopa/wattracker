@@ -6,6 +6,8 @@ in, that executable roughly quadruples and PyInstaller's exclude list silently
 stops holding. Catching it here is much cheaper than catching it on a build
 machine.
 """
+import importlib.util
+import pathlib
 import subprocess
 import sys
 import textwrap
@@ -41,14 +43,23 @@ def test_websocket_url_rejects_unusable_values(bad):
 
 
 # ---------------------------------------------------------- import weight
-# Everything the frozen connector must NOT pull in. PyInstaller's spec excludes
-# these; if an import sneaks back the exclude list stops matching reality and
-# the build either bloats or breaks at runtime.
-FORBIDDEN = [
-    "numpy", "pandas", "scipy", "fastapi", "starlette", "uvicorn",
-    "anthropic", "jinja2", "matplotlib", "fitdecode", "keyring",
-    "wattracker.db", "wattracker.server", "wattracker.ingest",
-]
+# Everything the frozen connector must NOT pull in. packaging/
+# wattracker-connector.spec passes this same list to PyInstaller's excludes; if
+# an import sneaks back, the exclude list stops matching reality and the build
+# either bloats or breaks at runtime.
+#
+# Loaded from the one definition rather than repeated here, and loaded by path
+# because the directory is named "packaging" - so is an installed PyPI
+# distribution, and a plain import would find that one instead.
+_EXCLUDES_PATH = (
+    pathlib.Path(__file__).parents[1] / "packaging" / "_connector_excludes.py"
+)
+_EXCLUDES_SPEC = importlib.util.spec_from_file_location(
+    "_wattracker_connector_excludes", _EXCLUDES_PATH
+)
+_EXCLUDES = importlib.util.module_from_spec(_EXCLUDES_SPEC)
+_EXCLUDES_SPEC.loader.exec_module(_EXCLUDES)
+FORBIDDEN = _EXCLUDES.FORBIDDEN
 
 
 def _import_check(module: str) -> subprocess.CompletedProcess:

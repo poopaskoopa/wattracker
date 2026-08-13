@@ -36,7 +36,12 @@ jobs:
           python -m pip install --disable-pip-version-check --upgrade "pip==25.1.1"
           # The PyInstaller pin lives in pyproject's [package] extra so the
           # Windows and macOS release builds cannot drift apart.
-          python -m pip install --disable-pip-version-check "build==1.2.2.post1" ".[dev,ble,package]"
+          # connector + webview are the frozen connector's own halves: the
+          # websockets client it dials with, and the ctypes WebView binding the
+          # tray's window uses. Both are collected best-effort by the spec, so
+          # missing them here would produce a connector that builds and is
+          # quietly missing a feature.
+          python -m pip install --disable-pip-version-check "build==1.2.2.post1" ".[dev,ble,package,connector,webview]"
 
       - name: Run full test suite
         shell: pwsh
@@ -79,6 +84,30 @@ jobs:
         run: |
           python "packaging\smoke_frozen_ble.py" "dist\wattracker\wattracker.exe"
 
+      # The connector is a second, separate artifact: onefile and windowed,
+      # for the machine where Zwift lives. It is built here rather than in its
+      # own workflow so it cannot drift from the app's toolchain pin, and so
+      # one tag produces both halves of a split install.
+      - name: Build frozen onefile connector
+        shell: pwsh
+        run: |
+          if (-not (Test-Path -LiteralPath "packaging\wattracker-connector.spec")) {
+            throw "packaging/wattracker-connector.spec is required for a signed release"
+          }
+          python -m PyInstaller --clean --noconfirm "packaging\wattracker-connector.spec"
+          if (-not (Test-Path -LiteralPath "dist\WattrackerConnector.exe")) {
+            throw "Frozen connector was not produced"
+          }
+
+      # Unlike the app, the connector serves no UI to smoke-test, so this is
+      # the only thing that proves the binary does anything at all: it must
+      # refuse to run unpaired, connect and answer a request against a stub
+      # server, and still be able to import bleak and webviewpy.
+      - name: Smoke-test frozen connector
+        shell: pwsh
+        run: |
+          python "packaging\smoke_frozen_connector.py" "dist\WattrackerConnector.exe"
+
       - name: Sign and verify every frozen binary
         shell: pwsh
         env:
@@ -92,6 +121,12 @@ jobs:
           & "packaging\sign-windows.ps1" `
             -ArtifactPath "dist\wattracker" `
             -ExpectedThumbprint $env:WATTRACKER_SIGNING_THUMBPRINT
+          # Signed separately: it is one file outside dist\wattracker, and an
+          # unsigned autostarting binary that holds a credential is the last
+          # thing that should slip through on a technicality.
+          & "packaging\sign-windows.ps1" `
+            -ArtifactPath "dist\WattrackerConnector.exe" `
+            -ExpectedThumbprint $env:WATTRACKER_SIGNING_THUMBPRINT
 
       - name: Package verified signed artifact and checksum
         shell: pwsh
@@ -103,6 +138,16 @@ jobs:
           $hash = (Get-FileHash -LiteralPath $archive -Algorithm SHA256).Hash.ToLowerInvariant()
           "$hash  wattracker-windows-x64-signed.zip" | `
             Set-Content -Path "release\wattracker-windows-x64-signed.zip.sha256" -Encoding ascii
+          # The connector ships as the bare .exe, not zipped: the whole point
+          # is that a rider downloads one file and runs it, and a zip would
+          # only add a step. The checksum beside it is how they can tell it is
+          # the file this workflow produced.
+          Copy-Item -LiteralPath "dist\WattrackerConnector.exe" `
+            -Destination "release\WattrackerConnector.exe"
+          $connector = Resolve-Path "release\WattrackerConnector.exe"
+          $connectorHash = (Get-FileHash -LiteralPath $connector -Algorithm SHA256).Hash.ToLowerInvariant()
+          "$connectorHash  WattrackerConnector.exe" | `
+            Set-Content -Path "release\WattrackerConnector.exe.sha256" -Encoding ascii
 
       - name: Upload signed artifact only
         uses: actions/upload-artifact@v4
@@ -111,5 +156,7 @@ jobs:
           path: |
             release/wattracker-windows-x64-signed.zip
             release/wattracker-windows-x64-signed.zip.sha256
+            release/WattrackerConnector.exe
+            release/WattrackerConnector.exe.sha256
           if-no-files-found: error
           retention-days: 30

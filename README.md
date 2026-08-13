@@ -252,6 +252,38 @@ The address after `--server` is the one that must appear in the server's
 `400 Bad Request` before the token is examined, so the symptom — a good token
 that will not connect — points nowhere near the cause.
 
+### The connector as one file (Windows)
+
+The pip install above is the supported path on every OS. On Windows the
+connector also builds as a single portable `WattrackerConnector.exe` — drop it
+anywhere, run it, and it lives in the notification area: the same connector,
+with a tray icon, a "Start with Windows" toggle, and a window onto the server's
+UI that opens already logged in.
+
+It is **not yet published**, because it is not yet signed: the release job that
+builds it stays disabled until a certificate exists (see
+[docs/windows-security.md](docs/windows-security.md)). Until then it comes from
+a local build:
+
+```powershell
+python -m pip install ".[dev,ble,package,connector,webview]"
+python -m PyInstaller --clean --noconfirm packaging\wattracker-connector.spec
+python packaging\smoke_frozen_connector.py dist\WattrackerConnector.exe
+```
+
+Three things worth knowing about the exe specifically:
+
+- **It has no console**, so diagnostics go to `connector.log` beside its config
+  (`%LOCALAPPDATA%\wattracker-connector\`), owner-only. Use the pip console
+  script when you want output in a terminal, or `--headless` to run the frozen
+  build without the tray.
+- **Autostart is one `HKEY_CURRENT_USER` value**, written only when you toggle
+  it on and deleted when you toggle it off. No service, no scheduled task, no
+  elevation, and the application installer is not involved at all.
+- **It is unsigned**, and a self-extracting binary that autostarts and holds a
+  credential is the profile SmartScreen and antivirus heuristics like least.
+  Verify the `.sha256` beside it.
+
 Only **one connector per account** may run at a time. A second one takes over,
 and the first stops with a message saying so rather than fighting it for the
 connection.
