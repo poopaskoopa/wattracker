@@ -8,6 +8,7 @@ from wattracker.cloud.security import (
     CredentialRegistry,
     EnrollmentRegistry,
     MemorySecurityStateBackend,
+    MIN_REPLAY_TTL_SECONDS,
     NonceReplayGuard,
     canonical_request,
     derive_installation_namespace,
@@ -99,6 +100,19 @@ def test_nonce_replay_capacity_is_bounded():
     assert guard.check_and_record(namespace, "a" * 64, "one", now=0)
     assert not guard.check_and_record(namespace, "a" * 64, "two", now=1)
     assert guard.check_and_record(namespace, "a" * 64, "two", now=30)
+
+
+def test_nonce_replay_uses_server_time_and_survives_guard_restart():
+    backend = MemorySecurityStateBackend()
+    namespace = _namespace()
+    credential = "a" * 64
+    first = NonceReplayGuard(backend=backend, clock=lambda: 1_000)
+    assert first._ttl >= MIN_REPLAY_TTL_SECONDS
+    assert first.check_and_record(namespace, credential, "same", now=1_000)
+
+    restarted = NonceReplayGuard(backend=backend, clock=lambda: 1_001)
+    assert not restarted.check_and_record(namespace, credential, "same", now=1_001)
+    assert restarted.check_and_record(namespace, credential, "same", now=1_600)
 
 
 def test_invitations_expire_are_single_use_and_invalid_tokens_are_indistinguishable():

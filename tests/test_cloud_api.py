@@ -7,6 +7,7 @@ from fastapi.testclient import TestClient
 from wattracker.cloud.api import CloudConfig, CloudState, create_cloud_app
 from wattracker.cloud.models import CloudObject, SyncBatch
 from wattracker.cloud.security import (
+    MIN_REPLAY_TTL_SECONDS,
     MemorySecurityStateBackend,
     canonical_request,
     digest_body,
@@ -26,7 +27,6 @@ def cloud():
     config = CloudConfig(
         server_secret=SECRET,
         operator_token="operator-token",
-        require_mtls=True,
         require_apim_proof=False,
         clock=lambda: 1_000,
     )
@@ -40,10 +40,12 @@ def _writer(state, seed: bytes, scope: str = "scope"):
     )
 
 
-def _headers(writer, body: bytes, *, nonce="nonce", revision=1, idem="batch-1"):
+def _headers(
+    writer, body: bytes, *, nonce="nonce", revision=1, idem="batch-1", timestamp=1_000
+):
     namespace = writer.namespace
     canonical = canonical_request(
-        "POST", "/api/v1/sync/batches", namespace, 1_000, nonce,
+        "POST", "/api/v1/sync/batches", namespace, timestamp, nonce,
         digest_body(body), idem, str(revision),
     )
     return {
@@ -51,7 +53,7 @@ def _headers(writer, body: bytes, *, nonce="nonce", revision=1, idem="batch-1"):
         "Ocp-Apim-Subscription-Key": writer.subscription_key.decode(),
         "X-APIM-Client-Certificate-Verified": "true",
         "X-Writer-Credential": writer.credential_id,
-        "X-Writer-Timestamp": "1000",
+        "X-Writer-Timestamp": str(timestamp),
         "X-Writer-Nonce": nonce,
         "X-Writer-Idempotency-Key": idem,
         "X-Writer-Revision": str(revision),
@@ -146,6 +148,42 @@ def test_signature_tampering_replay_and_stale_revision_are_rejected(cloud):
     assert client.post("/api/v1/sync/batches", headers=stale, content=stale_body).status_code == 409
 
 
+def test_replay_pruning_uses_server_clock_for_writers_at_window_edges(cloud):
+    _config, state, client = cloud
+    writer = _writer(state, b"e")
+    body = _batch()
+    first = _headers(writer, body, nonce="same", timestamp=700)
+    second = _headers(writer, body, nonce="same", timestamp=1_300)
+    assert client.post("/api/v1/sync/batches", headers=first, content=body).status_code == 200
+    assert client.post("/api/v1/sync/batches", headers=second, content=body).status_code == 401
+
+
+@pytest.mark.parametrize(
+    "path,headers",
+    [
+        ("/api/v1/context", {"X-APIM-Request-Proof": b"\xff"}),
+        ("/api/v1/enrollment/start", {"X-Operator-Token": b"\xff"}),
+        ("/api/v1/context", {"Authorization": "Bearer token", "X-Verified-Entra-Subject": b"\xff"}),
+    ],
+)
+def test_malformed_non_ascii_auth_headers_fail_closed(path, headers):
+    config = CloudConfig(
+        server_secret=SECRET,
+        operator_token="operator-token",
+        require_apim_proof="X-APIM-Request-Proof" in headers,
+        apim_proof_value="private-proof" if "X-APIM-Request-Proof" in headers else "",
+    )
+    state = CloudState.create(config)
+    token, _ = state.credentials.issue_reader_context(
+        new_installation_id(), "scope", "subject"
+    )
+    if path == "/api/v1/context" and "Authorization" in headers:
+        headers = {**headers, "Authorization": f"Bearer {token}"}
+    with TestClient(create_cloud_app(config, state=state)) as client:
+        response = client.post(path, headers=headers) if "enrollment" in path else client.get(path, headers=headers)
+    assert response.status_code in {401, 404}
+
+
 def test_revoked_context_is_indistinguishable_from_unknown(cloud):
     _config, state, client = cloud
     token, context = state.credentials.issue_reader_context(
@@ -190,7 +228,6 @@ def test_configured_apim_proof_cannot_be_forged_with_boolean_marker():
         server_secret=SECRET,
         operator_token="operator-token",
         apim_proof_value="private-proof",
-        require_mtls=False,
     )
     state = CloudState.create(config)
     token, _ = state.credentials.issue_reader_context(
@@ -204,11 +241,11 @@ def test_configured_apim_proof_cannot_be_forged_with_boolean_marker():
     with TestClient(create_cloud_app(config, state=state)) as client:
         assert client.get(
             "/api/v1/context",
-            headers={**headers, "X-APIM-Request-Verified": "true"},
+            headers={**headers, "X-APIM-Request-Proof": "true"},
         ).status_code == 404
         assert client.get(
             "/api/v1/context",
-            headers={**headers, "X-APIM-Request-Verified": "private-proof"},
+            headers={**headers, "X-APIM-Request-Proof": "private-proof"},
         ).status_code == 200
 
 
@@ -345,3 +382,12 @@ def test_production_state_requires_durable_security_backend():
     config = CloudConfig(server_secret=SECRET, operator_token="operator-token")
     with pytest.raises(RuntimeError, match="durable auth state"):
         CloudState.create(config, require_persistent_security=True)
+
+
+def test_cloud_config_rejects_replay_ttl_shorter_than_freshness_window():
+    with pytest.raises(ValueError, match="replay TTL"):
+        CloudConfig(
+            server_secret=SECRET,
+            operator_token="operator-token",
+            replay_ttl_seconds=MIN_REPLAY_TTL_SECONDS - 1,
+        )

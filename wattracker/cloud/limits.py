@@ -54,7 +54,14 @@ class _Counter:
 
 
 class QuotaManager:
-    """Thread-safe global and per-scope admission controls."""
+    """Best-effort process-local admission controls.
+
+    Production abuse and cost enforcement is the durable APIM policy. These
+    counters remain useful as a local backstop and test seam, but reset on a
+    process restart or replica change by design.
+    """
+
+    durable = False
 
     def __init__(self, policy: Optional[QuotaPolicy] = None, *, clock=time.monotonic):
         self.policy = policy or QuotaPolicy()

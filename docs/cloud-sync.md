@@ -11,11 +11,15 @@ certificate, and secret references are deployment inputs, not repository
 secrets.
 
 The read service serves API routes through APIM; the sync service accepts only
-APIM certificate-authenticated traffic and performs writes. Managed identities, private
-Blob/Table endpoints, and private DNS are required. No storage account key,
+APIM-proofed traffic and performs writes. The Container Apps managed
+environment is internal and both app ingresses are non-external, so their
+private FQDNs are reachable only through the APIM Standard External VNet
+integration in the same VNet. Managed identities, private Blob/Table
+endpoints, and private DNS are required. No storage account key,
 anonymous blob URL, or public storage firewall exception is permitted.
-APIM presents a separate outbound client certificate to both Container Apps;
-the caller certificate is never reused as the backend credential.
+The authentication factors are APIM subscription plus signed writer requests
+for writes, and APIM-validated Entra JWT plus a bound reader context for reads.
+Certificate presence is not an application authentication factor.
 
 ## Public routes and controls
 
@@ -46,16 +50,21 @@ is unavailable.
 The deployed container entrypoint is `python -m wattracker.cloud.runtime`. It
 constructs `AzureTenantStore` with managed identity and private Blob/Table
 endpoints; shared credential/context state is persisted in the separate
-`CloudAuth` table. The in-memory stores are test-only. Images, server secret,
+`CloudAuth` table and replay claims in `CloudReplay`. The in-memory stores are
+test-only. Images, server secret,
 operator token, APIM proof secret, storage account, and exact origin are
 deployment inputs. APIM overwrites a private proof header on every backend
-request; containers reject requests that merely forge a boolean marker.
+request; containers reject requests that merely forge a boolean marker or
+certificate header.
 
 ## Operations and cost
 
-The Bicep budget alerts at 50%, 80%, and 100% actual usage. Operators must also
-alert on APIM 4xx/5xx, auth failures, sync conflicts, queue age, storage
-availability, and Container App restarts. Budgets and quotas reduce surprise
+The Bicep budget alerts at 50%, 80%, and 100% actual usage. APIM's quota and
+rate-limit policies are the durable production request limits. The app-side
+quota counters are best-effort process-local backstops and reset after restart
+or replica replacement. Operators must also alert on APIM 4xx/5xx, auth
+failures, sync conflicts, queue age, storage availability, and Container App
+restarts. Budgets and quotas reduce surprise
 but do not guarantee a zero bill: Azure may charge for provisioned services,
 private endpoints, DNS, egress, monitoring, and usage before an alert fires.
 The 80% action disables new write forwarding; the 100% action disables public
@@ -66,8 +75,9 @@ not a hard billing ceiling.
 ## Acceptance checklist
 
 - [ ] `az deployment group validate` and Bicep build pass with tenant values.
-- [ ] Confirm APIM is reachable over HTTPS and direct Container App ingress
-      rejects requests without the APIM client certificate.
+- [ ] Confirm APIM is reachable over HTTPS, the managed environment is
+      internal, both app ingresses are non-external, and APIM resolves and
+      reaches both private Container App FQDNs.
 - [ ] Confirm storage public network access, anonymous blobs, Shared Key, and
       HTTP are disabled; TLS 1.2 is enforced.
 - [ ] Resolve Blob/Table names through the private DNS zones from both apps.

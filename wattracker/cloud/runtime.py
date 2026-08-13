@@ -57,10 +57,17 @@ def create_runtime_app():
         account_name
     )
     security_backend.verify_access(writable=config.plane in {"all", "read"})
+    replay_backend = None
+    if config.plane in {"sync", "all"}:
+        replay_backend = AzureTableSecurityStateBackend.from_managed_identity(
+            account_name, table_name="CloudReplay"
+        )
+        replay_backend.verify_access(writable=True)
     state = CloudState.create(
         config,
         store=store,
         security_backend=security_backend,
+        replay_backend=replay_backend,
         require_persistent_security=True,
     )
     return create_cloud_app(config, state=state)

@@ -10,25 +10,26 @@ repository defaults.
 
 ## Security invariants
 
-- APIM is the only user-facing boundary. Container App ingress is reachable
-  only with the APIM client certificate; direct requests without that
-  certificate are rejected before the application or Storage is reached.
+- APIM is the only user-facing boundary. The Container Apps managed
+  environment is internal and both app ingresses are non-external; their
+  private FQDNs are reachable by the APIM Standard External VNet integration,
+  while direct public origin requests have no route.
 - Storage has public network access, blob anonymous access, Shared Key access,
   and default network access disabled; HTTPS and TLS 1.2 are mandatory.
 - The read identity has Blob/Table Data Reader access only on the object
   container/table plus a manager role on the separate `CloudAuth` table. The
-  sync identity has custom Blob/Table writer roles with no delete action and
-  read-only access to `CloudAuth`; a separate cleanup identity alone has the
-  built-in contributor roles needed for retention and recovery deletion. No
-  account keys are used.
+  sync identity has custom Blob/Table writer roles with no delete action,
+  read-only access to `CloudAuth`, and a narrowly scoped replay-claim writer
+  role on `CloudReplay`; a separate cleanup identity alone has the built-in
+  contributor roles needed for retention and recovery deletion. No account
+  keys are used.
 - APIM subscriptions require approval, are limited to one per product, and
   enforce quotas/rate limits, explicit CORS, and a deployment kill switch.
 - APIM's managed identity receives only Key Vault Secrets User access to the
   named certificate secret; no storage or database role is granted to APIM.
 - APIM injects a deployment-supplied private proof value into backend requests;
-  the services do not trust a caller-controlled boolean header.
-- The outbound APIM client certificate is a separately installed/rotated
-  certificate referenced by ID in policy; it is not the caller certificate.
+  the services do not trust caller-controlled certificate-verification or
+  boolean headers. The proof is the gateway-to-origin trust factor.
 - The signed container images run `python -m wattracker.cloud.runtime`; the
   runtime constructs `AzureTenantStore` with managed identity. Bicep supplies
   image inputs and injects only the server secret, operator token, and APIM
