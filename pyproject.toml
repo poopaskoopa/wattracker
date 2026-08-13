@@ -30,6 +30,15 @@ dev = ["pytest>=8.0", "httpx>=0.27", "playwright>=1.47", "websockets>=13.0"]
 # Real-hardware Bluetooth riding. Not needed for core install or the test suite;
 # requires a Bluetooth adapter + trainer/sensors to actually use.
 ble = ["bleak>=0.22"]
+# Optional cloud sync support. The local application remains fully functional
+# without this extra; cloud-enabled deployments use Ed25519 public-key
+# enrollment and request signatures.
+cloud = [
+    "cryptography>=42.0",
+    "azure-identity>=1.17",
+    "azure-storage-blob>=12.22",
+    "azure-data-tables>=12.5",
+]
 # Freezing the app for release. Pinned exactly, not floored: PyInstaller's
 # bootloader and its bundled hooks decide what ends up inside the artifact, so
 # an unpinned bump can change the shipped binary without any change to this
