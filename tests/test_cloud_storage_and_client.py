@@ -178,21 +178,23 @@ def test_sync_client_uses_bound_namespace_and_keeps_network_optional():
     assert offline.push(batch).detail.startswith("Cloud sync offline")
 
 
-def test_container_runtime_injects_azure_store(monkeypatch):
+def _configure_container_runtime(monkeypatch, plane):
     from wattracker.cloud import runtime
     from wattracker.cloud.security import MemorySecurityStateBackend
 
     sentinel = object()
     security_backend = MemorySecurityStateBackend()
     security_backend.durable = True
-    security_backend.verify_access = lambda *, writable: None
+    access_checks = []
+    security_backend.verify_access = lambda *, writable: access_checks.append(writable)
+    table_names = []
     monkeypatch.setenv(
         "WATTRACKER_CLOUD_SERVER_SECRET",
         "YWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWE=",
     )
     monkeypatch.setenv("WATTRACKER_CLOUD_OPERATOR_TOKEN", "operator-token")
     monkeypatch.setenv("WATTRACKER_APIM_PROOF_VALUE", "private-apim-proof")
-    monkeypatch.setenv("WATTRACKER_CLOUD_PLANE", "sync")
+    monkeypatch.setenv("WATTRACKER_CLOUD_PLANE", plane)
     monkeypatch.setenv("WATTRACKER_STORAGE_ACCOUNT_NAME", "storageacct")
     monkeypatch.setattr(
         runtime.AzureTenantStore,
@@ -202,14 +204,41 @@ def test_container_runtime_injects_azure_store(monkeypatch):
     monkeypatch.setattr(
         runtime.AzureTableSecurityStateBackend,
         "from_managed_identity",
-        staticmethod(lambda name: security_backend),
+        staticmethod(
+            lambda name, *, table_name="CloudAuth": (
+                table_names.append(table_name) or security_backend
+            )
+        ),
     )
-    app = runtime.create_runtime_app()
+    return runtime.create_runtime_app(), sentinel, security_backend, table_names, access_checks
+
+
+def test_container_runtime_sync_plane_injects_azure_store_and_replay_backend(monkeypatch):
+    app, sentinel, security_backend, table_names, access_checks = _configure_container_runtime(
+        monkeypatch, "sync"
+    )
     assert app.state.cloud.store is sentinel
     assert app.state.cloud.credentials._backend is security_backend
     assert app.state.cloud.enrollments._backend is security_backend
+    assert app.state.cloud.nonces._backend is security_backend
+    assert table_names == ["CloudAuth", "CloudReplay"]
+    assert access_checks == [False, True]
+    assert app.state.cloud.config.apim_proof_value == "private-apim-proof"
     assert app.state.cloud.config.plane == "sync"
     assert app.state.cloud.config.apim_proof_header == "X-APIM-Request-Proof"
+
+
+def test_container_runtime_read_plane_does_not_open_replay_table(monkeypatch):
+    app, sentinel, security_backend, table_names, access_checks = _configure_container_runtime(
+        monkeypatch, "read"
+    )
+    assert app.state.cloud.store is sentinel
+    assert app.state.cloud.credentials._backend is security_backend
+    assert app.state.cloud.enrollments._backend is security_backend
+    assert app.state.cloud.nonces._backend is None
+    assert table_names == ["CloudAuth"]
+    assert access_checks == [True]
+    assert app.state.cloud.config.plane == "read"
 
 
 def test_batch_schema_rejects_paths_urls_commands_and_duplicates():

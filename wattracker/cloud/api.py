@@ -27,6 +27,7 @@ from .security import (
     SecurityStateBackend,
     canonical_request,
     digest_body,
+    MIN_REPLAY_TTL_SECONDS,
     new_installation_id,
     verify_signature,
 )
@@ -44,10 +45,8 @@ class CloudConfig:
     server_secret: bytes
     operator_token: str
     plane: str = "all"  # all | read | sync
-    require_mtls: bool = True
     require_subscription: bool = True
-    mtls_header: str = "X-APIM-Client-Certificate-Verified"
-    apim_proof_header: str = "X-APIM-Request-Verified"
+    apim_proof_header: str = "X-APIM-Request-Proof"
     apim_proof_value: str = field(default="", repr=False)
     require_apim_proof: bool = True
     verified_subject_header: str = "X-Verified-Entra-Subject"
@@ -55,6 +54,7 @@ class CloudConfig:
     allowed_origins: tuple[str, ...] = ()
     max_request_bytes: int = 8 * 1024 * 1024
     max_decompressed_batch_bytes: int = 32 * 1024 * 1024
+    replay_ttl_seconds: float = MIN_REPLAY_TTL_SECONDS
     clock: Callable[[], float] = time.time
 
     def __post_init__(self) -> None:
@@ -66,6 +66,12 @@ class CloudConfig:
             raise ValueError("plane must be all, read, or sync")
         if self.max_request_bytes < 1 or self.max_decompressed_batch_bytes < 1:
             raise ValueError("body limits must be positive")
+        if (
+            isinstance(self.replay_ttl_seconds, bool)
+            or not isinstance(self.replay_ttl_seconds, (int, float))
+            or self.replay_ttl_seconds < MIN_REPLAY_TTL_SECONDS
+        ):
+            raise ValueError("replay TTL must cover the timestamp freshness window")
         if not isinstance(self.apim_proof_value, str) or len(self.apim_proof_value) > 512:
             raise ValueError("apim proof value is invalid")
         if any(
@@ -94,11 +100,22 @@ class CloudState:
         store: Optional[Any] = None,
         quotas: Optional[QuotaManager] = None,
         security_backend: SecurityStateBackend | None = None,
+        replay_backend: SecurityStateBackend | None = None,
         require_persistent_security: bool = False,
     ) -> "CloudState":
+        replay_required = config.plane in {"sync", "all"}
+        if replay_required:
+            replay_backend = replay_backend or security_backend
         if require_persistent_security and (
             security_backend is None
             or not bool(getattr(security_backend, "durable", False))
+            or (
+                replay_required
+                and (
+                    replay_backend is None
+                    or not bool(getattr(replay_backend, "durable", False))
+                )
+            )
         ):
             raise RuntimeError("production cloud runtime requires durable auth state")
         enrollments = EnrollmentRegistry(
@@ -120,7 +137,11 @@ class CloudState:
                     max_decompressed_batch_bytes=config.max_decompressed_batch_bytes,
                 )
             ),
-            nonces=NonceReplayGuard(clock=config.clock),
+            nonces=NonceReplayGuard(
+                ttl_seconds=config.replay_ttl_seconds,
+                clock=config.clock,
+                backend=replay_backend,
+            ),
         )
 
 
@@ -211,23 +232,31 @@ def _writer_header(request: Request, name: str) -> str:
     return value
 
 
+def _safe_compare_text(left: object, right: object) -> bool:
+    """Compare arbitrary header text without ASCII-only compare_digest errors."""
+    if not isinstance(left, str) or not isinstance(right, str):
+        return False
+    try:
+        return hmac.compare_digest(left.encode("utf-8"), right.encode("utf-8"))
+    except (UnicodeEncodeError, TypeError):
+        return False
+
+
 def _apim_proof_valid(state: CloudState, request: Request) -> bool:
     if not state.config.require_apim_proof:
         return True
     marker = request.headers.get(state.config.apim_proof_header.lower(), "")
-    if state.config.apim_proof_value:
-        return hmac.compare_digest(marker, state.config.apim_proof_value)
-    return marker == "true"
+    return bool(state.config.apim_proof_value) and _safe_compare_text(
+        marker, state.config.apim_proof_value
+    )
 
 
 def _writer_auth(state: CloudState, request: Request) -> Any:
-    """Authenticate APIM/mTLS/credential headers without reading the body."""
+    """Authenticate the APIM proof and writer subscription without reading the body."""
     if not state.quotas.public_enabled:
         raise HTTPException(status_code=403, detail="public API disabled")
     if not _apim_proof_valid(state, request):
         raise HTTPException(status_code=401, detail="APIM authorization required")
-    if state.config.require_mtls and request.headers.get(state.config.mtls_header.lower()) != "true":
-        raise HTTPException(status_code=401, detail="client certificate required")
     credential_id = _writer_header(request, "X-Writer-Credential")
     subscription = request.headers.get(state.config.subscription_header.lower(), "")
     if state.config.require_subscription and not subscription:
@@ -270,11 +299,6 @@ def _scope(writer: Any) -> tuple[str, str]:
 def _resolve_reader(state: CloudState, request: Request) -> Any:
     if not _apim_proof_valid(state, request):
         return None
-    if (
-        state.config.require_mtls
-        and request.headers.get(state.config.mtls_header.lower()) != "true"
-    ):
-        return None
     raw = request.headers.get("authorization", "")
     scheme, _, token = raw.partition(" ")
     if scheme.lower() != "bearer" or not token or len(token) > 512:
@@ -286,7 +310,9 @@ def _resolve_reader(state: CloudState, request: Request) -> Any:
     if context is None or not state.quotas.public_enabled:
         return None
     bound_subject = getattr(context, "subject", None)
-    if bound_subject is not None and (not subject or not hmac.compare_digest(bound_subject, subject)):
+    if bound_subject is not None and (
+        not subject or not _safe_compare_text(bound_subject, subject)
+    ):
         return None
     return context
 
@@ -347,7 +373,7 @@ def create_cloud_app(
     if read_enabled():
         @app.post("/api/v1/enrollment/start")
         async def enrollment_start(request: Request) -> Response:
-            if not hmac.compare_digest(
+            if not _safe_compare_text(
                 request.headers.get("x-operator-token", ""), config.operator_token
             ):
                 return _error(404, "not found")
@@ -355,17 +381,15 @@ def create_cloud_app(
                 not _apim_proof_valid(state, request)
             ):
                 return _not_found()
-            if (
-                config.require_mtls
-                and request.headers.get(config.mtls_header.lower()) != "true"
-            ):
-                return _not_found()
             subject = request.headers.get(config.verified_subject_header.lower(), "")
             if not subject or len(subject) > 256:
                 return _not_found()
-            invitation = state.enrollments.create(
-                new_installation_id(), new_installation_id(), subject=subject
-            )
+            try:
+                invitation = state.enrollments.create(
+                    new_installation_id(), new_installation_id(), subject=subject
+                )
+            except (ValueError, RuntimeError):
+                return _not_found()
             return JSONResponse({
                 "invitation": invitation.token,
                 "expires_at": invitation.expires_at,
@@ -377,11 +401,6 @@ def create_cloud_app(
                 not _apim_proof_valid(state, request)
             ):
                 return _error(401, "verified reader authorization required")
-            if (
-                config.require_mtls
-                and request.headers.get(config.mtls_header.lower()) != "true"
-            ):
-                return _error(401, "client certificate required")
             subject = request.headers.get(config.verified_subject_header.lower(), "")
             if not subject:
                 return _error(401, "verified reader authorization required")
@@ -407,9 +426,8 @@ def create_cloud_app(
                 binding = state.enrollments.consume(token, subject=subject)
                 if (
                     binding is None
-                    or not hmac.compare_digest(
-                        (getattr(binding, "subject", None) or "").encode("utf-8"),
-                        subject.encode("utf-8"),
+                    or not _safe_compare_text(
+                        getattr(binding, "subject", None) or "", subject
                     )
                 ):
                     return _not_found()
@@ -523,17 +541,20 @@ def create_cloud_app(
             namespace, scope = _scope(writer)
             raw = await _bounded_body(request, config.max_request_bytes)
             body_hash = digest_body(raw)
-            canonical = canonical_request(
-                request.method, request.url.path, namespace, timestamp, nonce,
-                body_hash, idem, str(revision),
-            )
+            try:
+                canonical = canonical_request(
+                    request.method, request.url.path, namespace, timestamp, nonce,
+                    body_hash, idem, str(revision),
+                )
+            except (TypeError, ValueError, UnicodeError):
+                return _error(401, "writer authorization required")
             if not verify_signature(
                 _credential_key(writer), canonical, signature,
                 algorithm=getattr(writer, "signature_algorithm", ""),
             ):
                 return _error(401, "writer authorization required")
             if not state.nonces.accept(
-                namespace, getattr(writer, "credential_id", ""), nonce, now=timestamp
+                namespace, getattr(writer, "credential_id", ""), nonce, now=now
             ):
                 return _error(401, "writer authorization required")
             decoded = _decompress_bounded(raw, config.max_decompressed_batch_bytes)

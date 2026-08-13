@@ -25,6 +25,7 @@ _BODY_DIGEST_RE: Final = re.compile(r"\A[0-9a-f]{64}\Z")
 _ID_BYTES: Final = 32
 _TOKEN_BYTES: Final = 32
 _DEFAULT_TTL_SECONDS: Final = 300.0
+MIN_REPLAY_TTL_SECONDS: Final = 600.0
 _DEFAULT_CAPACITY: Final = 10_000
 _CANONICAL_DOMAIN: Final = b"wattracker-cloud-request-v1\x00"
 _DUMMY_DIGEST: Final = hashlib.sha256(b"wattracker-cloud-dummy").digest()
@@ -47,6 +48,10 @@ class SecurityStateBackend(Protocol):
     def write(self, kind: str, key: str, value: Mapping[str, Any]) -> None: ...
 
     def consume(self, kind: str, key: str, *, now: float) -> dict[str, Any] | None: ...
+
+    def claim_replay(
+        self, kind: str, key: str, *, expires_at: float, now: float
+    ) -> bool: ...
 
 
 class MemorySecurityStateBackend:
@@ -89,6 +94,17 @@ class MemorySecurityStateBackend:
             consumed["consumed"] = True
             self._records[record_key] = consumed
             return dict(value)
+
+    def claim_replay(
+        self, kind: str, key: str, *, expires_at: float, now: float
+    ) -> bool:
+        record_key = (kind, key)
+        with self._lock:
+            value = self._records.get(record_key)
+            if value is not None and float(value.get("expires_at", 0)) > now:
+                return False
+            self._records[record_key] = {"expires_at": float(expires_at)}
+            return True
 
 
 class AzureTableSecurityStateBackend:
@@ -219,6 +235,57 @@ class AzureTableSecurityStateBackend:
                 return None
             raise
         return value
+
+    def claim_replay(
+        self, kind: str, key: str, *, expires_at: float, now: float
+    ) -> bool:
+        """Atomically claim a replay key, replacing only an expired record."""
+        payload = {"expires_at": float(expires_at)}
+        row_key = self._row_key(kind, key)
+        try:
+            self._table.create_entity({
+                "PartitionKey": _AUTH_PARTITION,
+                "RowKey": row_key,
+                "Payload": self._payload(payload),
+                "Consumed": False,
+            })
+            return True
+        except Exception as exc:
+            if not self._conflict(exc):
+                raise
+
+        entity = self._entity(kind, key)
+        if entity is None:
+            return False
+        try:
+            current = self._decode(entity)
+            if float(current.get("expires_at", 0)) > now:
+                return False
+        except (KeyError, TypeError, ValueError):
+            return False
+        etag = entity.get("etag") or entity.get("odata.etag")
+        if not etag:
+            metadata = getattr(entity, "metadata", None)
+            etag = metadata.get("etag") if isinstance(metadata, Mapping) else None
+        if not etag:
+            raise RuntimeError("Azure security record is missing concurrency metadata")
+        entity["Payload"] = self._payload(payload)
+        entity["Consumed"] = False
+        try:
+            from azure.core import MatchConditions
+            from azure.data.tables import UpdateMode
+
+            self._table.update_entity(
+                entity,
+                mode=UpdateMode.MERGE,
+                etag=etag,
+                match_condition=MatchConditions.IfNotModified,
+            )
+            return True
+        except Exception as exc:
+            if self._conflict(exc):
+                return False
+            raise
 
     def verify_access(self, *, writable: bool) -> None:
         """Fail startup if the managed identity lacks required table access."""
@@ -1402,13 +1469,15 @@ class NonceReplayGuard:
     def __init__(
         self,
         *,
-        ttl_seconds: float = 300.0,
+        ttl_seconds: float = MIN_REPLAY_TTL_SECONDS,
         capacity: int = _DEFAULT_CAPACITY,
-        clock=time.monotonic,
+        clock=time.time,
+        backend: SecurityStateBackend | None = None,
     ) -> None:
         self._ttl = _validate_ttl(ttl_seconds)
         self._capacity = _validate_capacity(capacity)
         self._clock = clock
+        self._backend = backend
         self._lock = threading.Lock()
         self._entries: dict[bytes, float] = {}
 
@@ -1450,6 +1519,10 @@ class NonceReplayGuard:
         except (TypeError, ValueError):
             return False
         current = self._clock() if now is None else float(now)
+        if self._backend is not None:
+            return self._backend.claim_replay(
+                "nonce", key.hex(), expires_at=current + self._ttl, now=current
+            )
         with self._lock:
             self._prune_locked(current)
             if key in self._entries:
@@ -1475,6 +1548,7 @@ __all__ = [
     "EnrollmentInvitation",
     "InvitationBinding",
     "NonceReplayGuard",
+    "MIN_REPLAY_TTL_SECONDS",
     "ReaderContext",
     "WriterCredential",
     "canonical_request",

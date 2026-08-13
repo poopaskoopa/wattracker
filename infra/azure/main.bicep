@@ -30,8 +30,6 @@ param publisherEmail string
 param allowedOrigin string
 @description('Entra API audience/client ID.')
 param apiAudience string
-@description('APIM-installed client certificate ID used for outbound Container App mTLS.')
-param apimBackendCertificateId string
 @description('Billing alert email.')
 param billingEmail string
 @description('Static Web Apps repository URL; static assets never access Storage.')
@@ -76,6 +74,7 @@ resource vnet 'Microsoft.Network/virtualNetworks@2023-11-01' = {
     subnets: [
       { name: 'aca-infrastructure'; properties: { addressPrefix: '10.42.0.0/23'; delegations: [{ name: 'aca'; properties: { serviceName: 'Microsoft.App/environments' } }] } }
       { name: 'private-endpoints'; properties: { addressPrefix: '10.42.2.0/24'; privateEndpointNetworkPolicies: 'Disabled' } }
+      { name: 'apim'; properties: { addressPrefix: '10.42.3.0/24' } }
     ]
   }
 }
@@ -117,6 +116,11 @@ resource objectTable 'Microsoft.Storage/storageAccounts/tableServices/tables@202
 resource authTable 'Microsoft.Storage/storageAccounts/tableServices/tables@2023-05-01' = {
   parent: tableService
   name: 'CloudAuth'
+  properties: {}
+}
+resource replayTable 'Microsoft.Storage/storageAccounts/tableServices/tables@2023-05-01' = {
+  parent: tableService
+  name: 'CloudReplay'
   properties: {}
 }
 
@@ -173,7 +177,7 @@ resource appEnv 'Microsoft.App/managedEnvironments@2023-05-01' = {
   name: envName
   location: location
   properties: {
-    vnetConfiguration: { infrastructureSubnetId: resourceId('Microsoft.Network/virtualNetworks/subnets', vnetName, 'aca-infrastructure'); internal: false }
+    vnetConfiguration: { infrastructureSubnetId: resourceId('Microsoft.Network/virtualNetworks/subnets', vnetName, 'aca-infrastructure'); internal: true }
     workloadProfiles: [{ name: 'consumption'; workloadProfileType: 'Consumption' }]
   }
 }
@@ -190,7 +194,12 @@ resource readApp 'Microsoft.App/containerApps@2023-05-01' = {
         { name: 'operator-token'; value: operatorToken }
         { name: 'apim-proof-secret'; value: apimProofSecret }
       ]
-      ingress: { external: true; targetPort: 8000; transport: 'http'; clientCertificateMode: 'Require' }
+      ingress: {
+        external: false
+        targetPort: 8000
+        transport: 'http'
+        clientCertificateMode: 'Ignore'
+      }
     }
     template: {
       containers: [{
@@ -224,7 +233,12 @@ resource syncApp 'Microsoft.App/containerApps@2023-05-01' = {
         { name: 'operator-token'; value: operatorToken }
         { name: 'apim-proof-secret'; value: apimProofSecret }
       ]
-      ingress: { external: true; targetPort: 8000; transport: 'http'; clientCertificateMode: 'Require' }
+      ingress: {
+        external: false
+        targetPort: 8000
+        transport: 'http'
+        clientCertificateMode: 'Ignore'
+      }
     }
     template: {
       containers: [{
@@ -302,6 +316,20 @@ resource authManagerRoleDefinition 'Microsoft.Authorization/roleDefinitions@2022
     assignableScopes: [storage.id]
   }
 }
+resource replayWriterRoleDefinition 'Microsoft.Authorization/roleDefinitions@2022-04-01' = {
+  name: guid(storage.id, 'wattracker-replay-writer')
+  properties: {
+    roleName: 'Wattracker Cloud Replay Writer'
+    description: 'Create and replace expired nonce replay claims only in CloudReplay.'
+    type: 'CustomRole'
+    permissions: [{ dataActions: [
+      'Microsoft.Storage/storageAccounts/tableServices/tables/entities/read'
+      'Microsoft.Storage/storageAccounts/tableServices/tables/entities/add/action'
+      'Microsoft.Storage/storageAccounts/tableServices/tables/entities/update/action'
+    ] }]
+    assignableScopes: [replayTable.id]
+  }
+}
 resource blobRole 'Microsoft.Authorization/roleAssignments@2022-04-01' = {
   name: guid(storage.id, syncIdentity.id, 'blob-writer')
   scope: objectContainer
@@ -331,6 +359,11 @@ resource syncAuthRole 'Microsoft.Authorization/roleAssignments@2022-04-01' = {
   name: guid(authTable.id, syncIdentity.id, 'auth-reader')
   scope: authTable
   properties: { roleDefinitionId: authReaderRoleDefinition.id; principalId: syncIdentity.properties.principalId; principalType: 'ServicePrincipal' }
+}
+resource syncReplayRole 'Microsoft.Authorization/roleAssignments@2022-04-01' = {
+  name: guid(replayTable.id, syncIdentity.id, 'replay-writer')
+  scope: replayTable
+  properties: { roleDefinitionId: replayWriterRoleDefinition.id; principalId: syncIdentity.properties.principalId; principalType: 'ServicePrincipal' }
 }
 resource cleanupBlobRole 'Microsoft.Authorization/roleAssignments@2022-04-01' = {
   name: guid(storage.id, cleanupIdentity.id, 'blob-cleanup')
@@ -366,9 +399,16 @@ resource apimKeyVault 'Microsoft.KeyVault/vaults@2023-07-01' existing = {
 resource apim 'Microsoft.ApiManagement/service@2023-05-01-preview' = {
   name: apimName
   location: location
-  sku: { name: 'Consumption'; capacity: 0 }
+  sku: { name: 'Standard'; capacity: 1 }
   identity: { type: 'SystemAssigned' }
-  properties: { publisherEmail: publisherEmail; publisherName: 'wattracker'; virtualNetworkType: 'None'; publicNetworkAccess: 'Enabled'; hostnameConfigurations: [{ type: 'Proxy'; hostName: apimHostName; certificateSource: 'KeyVault'; keyVaultId: apimCertificateSecretUri }] }
+  properties: {
+    publisherEmail: publisherEmail
+    publisherName: 'wattracker'
+    virtualNetworkType: 'External'
+    virtualNetworkConfiguration: { subnetResourceId: resourceId('Microsoft.Network/virtualNetworks/subnets', vnetName, 'apim') }
+    publicNetworkAccess: 'Enabled'
+    hostnameConfigurations: [{ type: 'Proxy'; hostName: apimHostName; certificateSource: 'KeyVault'; keyVaultId: apimCertificateSecretUri }]
+  }
 }
 resource apimKeyVaultRole 'Microsoft.Authorization/roleAssignments@2022-04-01' = {
   name: guid(apimKeyVault.id, apim.id, 'key-vault-secrets-user')
@@ -454,7 +494,6 @@ resource syncBatchPolicy 'Microsoft.ApiManagement/service/apis/operations/polici
   <inbound>
     <base />
     <set-backend-service base-url="https://${syncApp.properties.configuration.ingress.fqdn}/api/v1" />
-    <validate-client-certificate validate-revocation="true" />
     <choose>
       <when condition="@('{{writes-enabled}}' != 'true')">
         <return-response><set-status code="403" reason="writes disabled" /></return-response>
@@ -494,10 +533,7 @@ resource corsPolicy 'Microsoft.ApiManagement/service/apis/policies@2023-05-01-pr
         <return-response><set-status code="503" reason="public API disabled" /></return-response>
       </when>
       <when condition="@(context.Request.OriginalUrl.Path.Contains('/sync/'))">
-        <validate-client-certificate validate-revocation="true" />
-        <set-header name="X-APIM-Client-Certificate-Verified" exists-action="override"><value>true</value></set-header>
         <set-header name="X-APIM-Request-Proof" exists-action="override"><value>{{apim-proof-secret}}</value></set-header>
-        <set-header name="X-APIM-Request-Verified" exists-action="override"><value>true</value></set-header>
       </when>
       <otherwise>
         <validate-jwt header-name="Authorization" require-scheme="Bearer" failed-validation-httpcode="404" failed-validation-error-message="not found">
@@ -505,12 +541,9 @@ resource corsPolicy 'Microsoft.ApiManagement/service/apis/policies@2023-05-01-pr
           <audiences><audience>${apiAudience}</audience></audiences>
         </validate-jwt>
         <set-header name="X-Verified-Entra-Subject" exists-action="override"><value>@(context.Request.Headers.GetValueOrDefault("Authorization", "").AsJwt()?.Claims.GetValueOrDefault("sub", "") ?? "")</value></set-header>
-        <set-header name="X-APIM-Client-Certificate-Verified" exists-action="override"><value>true</value></set-header>
         <set-header name="X-APIM-Request-Proof" exists-action="override"><value>{{apim-proof-secret}}</value></set-header>
-        <set-header name="X-APIM-Request-Verified" exists-action="override"><value>true</value></set-header>
       </otherwise>
     </choose>
-    <authentication-certificate certificate-id="${apimBackendCertificateId}" />
     <cors allow-credentials="false">
       <allowed-origins><origin>${allowedOrigin}</origin></allowed-origins>
       <allowed-methods><method>GET</method><method>HEAD</method><method>POST</method></allowed-methods>
