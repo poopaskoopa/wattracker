@@ -158,6 +158,42 @@ def test_replay_pruning_uses_server_clock_for_writers_at_window_edges(cloud):
     assert client.post("/api/v1/sync/batches", headers=second, content=body).status_code == 401
 
 
+def test_future_skewed_nonce_is_not_pruned_early():
+    # A request bearing a far-future timestamp must not become the guard's
+    # notion of "now": doing so would evict an earlier entry that is still
+    # inside its TTL and re-open that nonce for replay.
+    current = [1_000.0]
+    config = CloudConfig(
+        server_secret=SECRET,
+        operator_token="operator-token",
+        require_apim_proof=False,
+        clock=lambda: current[0],
+    )
+    state = CloudState.create(config)
+    writer = _writer(state, b"f")
+    victim_body = _batch(revision=1, batch_id="victim-1")
+    skewed_body = _batch(revision=2, batch_id="skewed-1")
+
+    with TestClient(create_cloud_app(config, state=state)) as client:
+        victim = _headers(writer, victim_body, nonce="victim-nonce",
+                          idem="victim-1", timestamp=1_000)
+        assert client.post(
+            "/api/v1/sync/batches", headers=victim, content=victim_body
+        ).status_code == 200
+        # The victim entry expires at 1_000 + MIN_REPLAY_TTL_SECONDS == 1_600.
+        current[0] = 1_301.0
+        skewed = _headers(writer, skewed_body, nonce="skewed-nonce",
+                          idem="skewed-1", revision=2, timestamp=1_600)
+        assert client.post(
+            "/api/v1/sync/batches", headers=skewed, content=skewed_body
+        ).status_code == 200
+        replay = _headers(writer, victim_body, nonce="victim-nonce",
+                          idem="victim-1", timestamp=1_301)
+        assert client.post(
+            "/api/v1/sync/batches", headers=replay, content=victim_body
+        ).status_code == 401
+
+
 @pytest.mark.parametrize(
     "path,headers",
     [
@@ -247,6 +283,60 @@ def test_configured_apim_proof_cannot_be_forged_with_boolean_marker():
             "/api/v1/context",
             headers={**headers, "X-APIM-Request-Proof": "private-proof"},
         ).status_code == 200
+
+
+def test_empty_apim_proof_configuration_never_accepts_boolean_marker():
+    config = CloudConfig(server_secret=SECRET, operator_token="operator-token")
+    state = CloudState.create(config)
+    token, _ = state.credentials.issue_reader_context(
+        new_installation_id(), "scope", "subject"
+    )
+    with TestClient(create_cloud_app(config, state=state)) as client:
+        response = client.get(
+            "/api/v1/context",
+            headers={
+                "Authorization": f"Bearer {token}",
+                "X-Verified-Entra-Subject": "subject",
+                "X-APIM-Request-Proof": "true",
+            },
+        )
+    assert response.status_code == 404
+
+
+@pytest.mark.parametrize("header", ["X-APIM-Request-Proof", "X-Verified-Entra-Subject"])
+def test_non_ascii_reader_auth_headers_fail_closed(header):
+    config = CloudConfig(
+        server_secret=SECRET,
+        operator_token="operator-token",
+        apim_proof_value="private-proof",
+    )
+    state = CloudState.create(config)
+    token, _ = state.credentials.issue_reader_context(
+        new_installation_id(), "scope", "subject"
+    )
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "X-Verified-Entra-Subject": "subject",
+        "X-APIM-Request-Proof": "private-proof",
+    }
+    headers[header] = b"\xe9"
+    with TestClient(create_cloud_app(config, state=state)) as client:
+        response = client.get("/api/v1/context", headers=headers)
+    assert response.status_code == 404
+
+
+def test_non_ascii_operator_token_header_fails_closed():
+    config = CloudConfig(
+        server_secret=SECRET,
+        operator_token="operator-token",
+        require_apim_proof=False,
+    )
+    with TestClient(create_cloud_app(config)) as client:
+        response = client.post(
+            "/api/v1/enrollment/start",
+            headers={"X-Operator-Token": b"\xe9"},
+        )
+    assert response.status_code == 404
 
 
 def test_limits_and_read_plane_surface(cloud):
