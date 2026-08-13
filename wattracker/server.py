@@ -41,6 +41,7 @@ from . import (
     config,
     connectorauth,
     connectorhub,
+    connectorsession,
     credstore,
     db,
     exporter,
@@ -538,8 +539,13 @@ class NoCacheStaticFiles(StaticFiles):
 # connector upload carries a bearer token and belongs to a process with no
 # browser, so a redirect to /login would be the wrong answer to a bad
 # credential - it checks its own and returns 401.
+# "/api/connector/session" and "/connector/session" are the two halves of the
+# tray window's login: the first is bearer-authenticated like the ride upload
+# above it, and the second authenticates itself from a single-use ticket and
+# then *creates* the session, so requiring one first would be circular.
 _EXEMPT = (
     "/login", "/register", calendarfeed.FEED_PATH, "/api/connector/ride",
+    "/api/connector/session", "/connector/session",
 )
 _EXEMPT_PREFIXES = ("/static", "/favicon", "/apple-touch-icon")
 
@@ -1094,6 +1100,10 @@ def create_app() -> FastAPI:
     # one apparent address, and refusing would only lock out the connector
     # that is trying to reconnect. Visibility, not enforcement.
     app.state.connector_failures = CalendarFeedFailureCounter()
+    # Single-use tickets a connector exchanges its device token for, so the
+    # tray's window opens already logged in. In memory on purpose: one is worth
+    # a session and lives for a minute (see connectorsession).
+    app.state.connector_tickets = connectorsession.TicketStore()
     # uvicorn logs the full request target; keep feed tokens out of the log.
     calendarfeed.install_access_log_redaction()
 
@@ -2136,6 +2146,77 @@ def create_app() -> FastAPI:
         return JSONResponse(
             {"activity_id": activity_id, "duplicate": activity_id is None}
         )
+
+    @app.post("/api/connector/session")
+    async def connector_session_mint(request: Request):
+        """Trade a device token for a single-use ticket that opens a session.
+
+        The tray app shows this server's own web UI in a window. That UI is
+        session-cookie authenticated and the connector holds no cookie, so
+        something has to bridge the two - and it must not be "type your
+        password into a window a tray icon opened", which is a habit worth not
+        teaching.
+
+        Bearer-authenticated exactly like /api/connector/ride above, and for
+        the same reason: this is the connector talking. Deliberately HTTP
+        rather than a call over the open WebSocket, because the connector never
+        sends requests on that socket (see connector_ws) - the server owns
+        every decision, and this route keeps it that way.
+
+        Only the ticket is returned, never a URL. The server has no reliable
+        idea which address reaches it from the connector's machine
+        (_feed_base_url exists because that question is genuinely hard); the
+        connector knows, because it dialled in on it.
+        """
+        header = request.headers.get("authorization") or ""
+        scheme, _, token = header.partition(" ")
+        device = None
+        if scheme.lower() == "bearer" and token:
+            device = connectorauth.device_for_token(token.strip())
+        if device is None:
+            app.state.connector_failures.record_failure()
+            return JSONResponse({"error": "unauthorized"}, status_code=401)
+
+        ticket = app.state.connector_tickets.mint(
+            device["user_id"], device["username"], device["device_id"]
+        )
+        _log.info(
+            "connector '%s' took a session ticket", device["label"]
+        )
+        response = JSONResponse(
+            {"ticket": ticket, "expires_in": connectorsession.TICKET_TTL_S}
+        )
+        # The body is a live credential for the next minute.
+        response.headers["Cache-Control"] = "private, no-store"
+        return response
+
+    @app.get("/connector/session")
+    def connector_session_redeem(request: Request, token: str = ""):
+        """Spend a ticket and become logged in.
+
+        The parameter is named ``token`` on purpose, and renaming it would be a
+        security regression: uvicorn's access logger writes the whole request
+        target, and calendarfeed's redaction filter scrubs query parameters
+        whose name starts with "token". Called anything else, every ticket this
+        route ever receives would be written to the access log in plaintext.
+
+        A bad ticket redirects to /login rather than explaining itself. There
+        is nothing useful to tell a caller who did not have one, and the
+        rider's own failure case - a ticket that sat too long - is fixed by
+        double-clicking again.
+        """
+        claim = app.state.connector_tickets.redeem(token)
+        if claim is None:
+            app.state.connector_failures.record_failure()
+            return RedirectResponse("/login", status_code=303)
+        request.session["user_id"] = claim["user_id"]
+        request.session["username"] = claim["username"]
+        _log.info(
+            "a connector window opened a session for user %s", claim["user_id"]
+        )
+        response = RedirectResponse("/", status_code=303)
+        response.headers["Cache-Control"] = "private, no-store"
+        return response
 
     @app.post("/api/activity/{activity_id}/rpe")
     def api_activity_rpe(
@@ -3863,6 +3944,10 @@ def create_app() -> FastAPI:
             # over its existing socket until the server restarts, while the
             # page tells the owner the token no longer works.
             connectorhub.close_device(uid, device_id)
+            # And this settles a ticket already in flight. Small window - a
+            # minute at most - but "revoked" must not still be able to open a
+            # logged-in window.
+            app.state.connector_tickets.revoke_device(device_id)
         return templates.TemplateResponse(
             request, "settings.html",
             _settings_ctx(
