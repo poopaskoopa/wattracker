@@ -46,6 +46,17 @@ def config_path() -> str:
     return os.path.join(config_dir(), "connector.json")
 
 
+def log_path() -> str:
+    """Where the connector writes its log.
+
+    Beside the config, and for the same reason: the frozen tray build has no
+    stderr to write to, so this file is the only diagnostic a rider - or
+    anyone helping them - can reach. It is owner-only because the connector
+    logs what it is doing with the rider's files.
+    """
+    return os.path.join(config_dir(), "connector.log")
+
+
 def load() -> dict:
     path = config_path()
     if not os.path.exists(path):
