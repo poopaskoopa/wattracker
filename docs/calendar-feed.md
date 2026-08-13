@@ -4,15 +4,34 @@ wattracker can publish your scheduled workouts as a read-only iCalendar feed at
 `/calendar.ics`, so they appear in the phone calendar you already use — 30 days
 back and 180 days ahead, one all-day entry each, completed sessions marked `✓`.
 
-The app binds to loopback and refuses to do anything else, so your phone cannot
-reach it over your home network by design. This guide uses **Tailscale** to
-carry the connection: your devices join a private network, and `tailscale serve`
-puts an HTTPS front end on the Mac that proxies to the loopback port. Nothing is
-exposed to the internet.
+A calendar feed is not the only way a phone sees wattracker — a phone is a
+perfectly ordinary [screen](../README.md#how-it-is-put-together), and on a home
+network it can load the whole app, live ride page included. What a calendar
+subscription adds is the part a browser cannot do: your workouts showing up in
+the calendar you already look at, without opening anything.
+
+The app binds to loopback by default, so out of the box nothing else on your
+network can reach it. There are two ways to change that, and they suit
+different things:
+
+- **A LAN bind** — the app answers on your home network directly. This is the
+  one to use if what you want is the app on your phone; see
+  [Reaching the server from other devices](../README.md#reaching-the-server-from-other-devices).
+  A calendar subscription works over it too, as long as the phone is home when
+  the calendar refreshes.
+- **Tailscale**, which is what this guide uses: your devices join a private
+  network and `tailscale serve` puts an HTTPS front end on the machine that
+  proxies to the loopback port. Nothing is exposed to the internet, it works
+  away from home, and the cookie travels encrypted. The trade-off is the 403 on
+  guarded buttons described under "Known limitations".
 
 If you already have another way to reach the machine (a reverse proxy, a VPN),
 the only wattracker-specific part is step 2 — set `WATTRACKER_PUBLIC_HOST` to
 whatever hostname the phone will use.
+
+Throughout this guide "the Mac" means **the machine running the server**. In a
+split install that is the NAS or container host, not the Zwift machine the
+connector runs on.
 
 ---
 
