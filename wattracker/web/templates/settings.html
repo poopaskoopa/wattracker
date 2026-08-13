@@ -226,10 +226,13 @@
 
 <details class="calendar-setup">
     <summary>How to reach this from your phone (Tailscale)</summary>
-    <p class="hint">wattracker only ever listens on this machine, so a phone
-       cannot reach it directly. Tailscale puts your devices on a private
-       network and fronts this app with HTTPS. Nothing is exposed to the
-       internet. Full version, including troubleshooting, is in
+    <p class="hint">By default wattracker listens only on this machine.
+       Tailscale puts your devices on a private network and fronts this app
+       with HTTPS, so it works away from home and the connection is encrypted.
+       If instead you only want the app on your phone <em>at home</em>, bind it
+       to your network and list the names it answers to &mdash; see
+       &ldquo;Reaching the server from other devices&rdquo; in the README.
+       Full version, including troubleshooting, is in
        <code>docs/calendar-feed.md</code>.</p>
     <ol class="hint calendar-steps">
         <li>Install Tailscale on this machine and your phone, and sign in to
@@ -246,17 +249,21 @@
         <li>Front it with HTTPS: <code>tailscale serve --bg {{ request.url.port or 8000 }}</code>.
             Undo later with <code>tailscale serve reset</code>.</li>
         <li>Come back here <strong>on this machine</strong> and press the button
-            above. Buttons that change something return 403 from a phone
-            browser, so generate and rotate links here. Copy the link
-            immediately &mdash; it is shown once.</li>
+            above. Over the tailnet, buttons that change something return 403
+            &mdash; the HTTPS front end changes the scheme and port the
+            same-origin check compares &mdash; so generate and rotate links
+            here. (On a plain LAN bind there is no mismatch and buttons work
+            from a phone.) Copy the link immediately &mdash; it is shown
+            once.</li>
         <li>On iOS: Settings &rarr; Calendar &rarr; Accounts &rarr; Add Account
             &rarr; Other &rarr; <em>Add Subscribed Calendar</em>, and paste it.
             Send yourself the link the way you would a password.</li>
     </ol>
-    <p class="hint">Two things this does not cover: anyone on your tailnet can
+    <p class="hint">One thing this does not cover: anyone on your tailnet can
        reach this whole app, not just the feed &mdash; Tailscale ACLs are the
-       access control. And the live-ride page will not work over the tailnet;
-       its connection has a separate origin check.</p>
+       access control. The live-ride page does work over the tailnet, and over
+       a LAN name: its origin check reads the same list of names this server
+       answers to.</p>
 </details>
 
 <h3>Backups</h3>

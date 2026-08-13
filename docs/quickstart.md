@@ -1,5 +1,14 @@
 # Quick start
 
+This is the all-in-one path: server, connector and screen on one machine,
+reachable from that machine only. It is the right starting point even if you
+end up elsewhere, because the other two shapes are this one taken apart:
+
+- to run the server on a NAS or in a container with the Zwift machine talking
+  to it, see [Server and connector](../README.md#server-and-connector);
+- to open the app on a phone or another computer, see
+  [Reaching the server from other devices](../README.md#reaching-the-server-from-other-devices).
+
 ## macOS or Linux
 
 Install Python 3.12 or newer and Git, then run:
