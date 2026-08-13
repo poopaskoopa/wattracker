@@ -150,14 +150,24 @@ to sit on the open internet, and `tailscale funnel` would put it there — use
 
 ## Known limitations
 
-- **You cannot rotate the link from a phone.** The same-origin check compares
-  the browser's `Origin` against the URL the server thinks it is serving; with
-  proxy headers deliberately disabled those do not match over the tailnet, so
-  every guarded POST returns 403. Reading the feed is unaffected. Do link
-  generation on the Mac.
-- **The live-ride page will not work over the tailnet.** Its WebSocket has its
-  own separate origin allowlist that this setting does not extend, so the ride
-  screen will not connect from a phone. Ride from the machine itself.
+- **You cannot rotate the link from a phone _over the tailnet_.** The
+  same-origin check compares the browser's `Origin` against the URL the server
+  thinks it is serving; `tailscale serve` speaks https to the phone and plain
+  http to this loopback socket, so the scheme and port differ and every guarded
+  POST returns 403. Reading the feed is unaffected. Do link generation on the
+  Mac.
+
+  This is a property of the proxy, not of the phone: on a **direct LAN bind**
+  the browser and the server agree on scheme, host and port, and buttons work
+  from the phone like anywhere else. See "From a phone on the same network" in
+  the README, and `tests/test_phone_access.py`.
+- **The live-ride page works over the tailnet, and over a LAN name.** This used
+  to say it could not, and that was true when the ride socket's origin
+  allowlist was a separate, narrower list. It is not any more: `_ws_origin_ok`
+  consults the same validated `WATTRACKER_PUBLIC_HOSTS` setting the Host
+  allowlist uses, so the ride screen connects from a phone and shows live watts
+  coming from the connector. Ride actions travel on that socket rather than as
+  POSTs, so the 403 above does not reach them.
 
 ---
 

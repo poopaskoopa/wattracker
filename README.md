@@ -270,6 +270,32 @@ WATTRACKER_PUBLIC_SCHEME=https
 `tailscale serve` is the least-effort option (it does TLS and keeps the server
 off the public internet); Caddy or nginx work equally well.
 
+### From a phone on the same network
+
+With the two variables above set, and the name the phone will use listed in
+`WATTRACKER_PUBLIC_HOSTS`, a phone browser gets the whole app — pages, buttons
+that change things, and the live ride screen showing watts as they arrive from
+the connector on the Zwift machine:
+
+```sh
+WATTRACKER_HOST=0.0.0.0 WATTRACKER_ALLOW_NON_LOOPBACK=1 \
+WATTRACKER_PUBLIC_HOSTS=wattracker.local,192.168.1.10 python -m wattracker
+```
+
+List every name you will actually type — an IP, a short hostname and a `.local`
+name are three separate entries, and a name that is not listed is answered with
+`400 Bad Request` rather than served. Nothing else needs configuring: the
+connector keeps dialling the server, and the phone is just another browser.
+`tests/test_phone_access.py` holds this path down end to end.
+
+Read the exposure note above first. On plain HTTP this puts the session cookie
+on the wifi in clear text, which is a fine trade at home and a bad one
+anywhere else.
+
+Behind an https proxy instead (`tailscale serve`), the ride screen still works
+but buttons that change something return 403 — the proxy changes the scheme and
+port the same-origin check compares. See `docs/calendar-feed.md`.
+
 ## Backup, packages, and Windows validation
 
 Create backups in Settings. Stop the server before running `wattracker-restore`
