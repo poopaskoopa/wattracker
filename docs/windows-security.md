@@ -148,6 +148,56 @@ would otherwise harvest the token. Pass `--token` once with `--save` and omit
 it afterwards: an argument is visible to every process on the machine, while
 the saved config file is written 0600.
 
+## The connector as a portable executable
+
+The connector also ships as one windowed `WattrackerConnector.exe`
+(`packaging/wattracker-connector.spec`), which changes three things about its
+security posture and nothing else.
+
+**A window that opens already logged in.** Double-clicking the tray icon shows
+the server's own web UI. The connector holds a device token, not a cookie, so
+it exchanges the token for a single-use ticket over the same
+bearer-authenticated HTTP path it already uses for buffered ride uploads
+(`POST /api/connector/session`), and the window spends that ticket once
+(`GET /connector/session?token=...`). The ticket is held only as a sha256 in
+memory, expires in 60 seconds, is redeemable once, and is dropped when the
+device is revoked.
+
+State this plainly: **a device token now escalates to a full web session.**
+That session can pair and revoke connector devices, rotate the calendar link,
+change settings and take backups. It cannot change the account password, which
+has no route. This is accepted because the token already grants read/write
+access to the rider's Zwift folders and the ability to upload rides as them,
+and because the alternative — a password prompt in a window a tray icon opened
+— teaches exactly the habit that phishing depends on. The query parameter is
+named `token` rather than `ticket` deliberately: uvicorn logs the full request
+target and `calendarfeed`'s redaction filter only scrubs parameter names
+beginning `token`, so any other name would write live credentials to the
+access log in plaintext. Both ends have tests pinning that name.
+
+**Autostart is HKCU, opt-in, and nothing else.** The tray's "Start with
+Windows" toggle writes one value under
+`HKEY_CURRENT_USER\Software\Microsoft\Windows\CurrentVersion\Run` and deletes
+it when untoggled. Never HKLM, never a Windows service, never Task Scheduler —
+all three would ask for elevation, which is the promise this document makes
+everywhere else. The application installer stays clear of startup entries
+entirely (`tests/test_windows_installer.py` asserts `wattracker.iss` never
+mentions one), so autostart lives in the connector at runtime and the installer
+is untouched.
+
+Autostart is also what makes the trust-boundary work above load-bearing rather
+than theoretical: an unattended connector holds a token across reboots until
+somebody revokes it, so revocation closing the live socket — not merely the
+next connection — is the control that matters.
+
+**Unsigned, self-extracting, and autostarting is the worst profile for
+heuristics.** A onefile build re-extracts to `%TEMP%\_MEIxxxx` on every launch.
+That, plus an autostart entry, plus a held credential, is the shape antivirus
+software dislikes most, and there is no certificate yet
+(`packaging/sign-windows.ps1` is wired into the release job, which remains
+hard-disabled). Until then the artifact comes from a local Windows build and
+should be treated as one: check the `.sha256` published beside it.
+
 ## Installer lifecycle and compiler provenance
 
 The per-user installer never requests elevation, adds no firewall rule, and

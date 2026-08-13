@@ -11,7 +11,7 @@ that must stay identical. Only what genuinely differs per OS is branched:
 * macOS additionally wraps the onedir COLLECT in a BUNDLE so Finder sees a real
   wattracker.app.
 """
-import re
+import importlib.util
 import sys
 from pathlib import Path
 
@@ -22,17 +22,23 @@ IS_WINDOWS = sys.platform.startswith("win")
 IS_MACOS = sys.platform == "darwin"
 
 
-def _project_version() -> str:
-    """version from pyproject.toml, so the bundle cannot drift from the wheel.
+def _load(name):
+    """Load a sibling helper by path.
 
-    Parsed with a regex to keep version extraction independent of the build
-    interpreter's standard-library modules.
+    Never ``import``: this directory is named ``packaging``, and so is a widely
+    installed PyPI distribution, so an import would resolve to that one on most
+    machines. wattracker-connector.spec loads the same helper the same way.
     """
-    text = (root / "pyproject.toml").read_text(encoding="utf-8")
-    match = re.search(r'(?m)^version\s*=\s*"([^"]+)"', text)
-    if not match:
-        raise SystemExit("could not read version from pyproject.toml")
-    return match.group(1)
+    path = Path(SPECPATH) / f"{name}.py"
+    spec = importlib.util.spec_from_file_location(f"_wattracker_{name}", path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def _project_version() -> str:
+    """version from pyproject.toml, so the bundle cannot drift from the wheel."""
+    return _load("_version").project_version(root)
 
 
 hidden = ["wattracker.server"] + collect_submodules("uvicorn")

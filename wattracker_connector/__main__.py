@@ -121,13 +121,55 @@ def _parser() -> argparse.ArgumentParser:
         "--show-config", action="store_true",
         help="Print the saved settings (token redacted) and exit",
     )
+    parser.add_argument(
+        "--headless", action="store_true",
+        help=(
+            "Run without the tray icon even when this is the frozen build. "
+            "The frozen executable otherwise puts itself in the notification "
+            "area; this is how a service manager, a terminal or the packaging "
+            "smoke test drives the same connector without a desktop"
+        ),
+    )
+    parser.add_argument(
+        "--smoke-import", metavar="MODULE",
+        help=(
+            "Import MODULE and exit 0 if it worked, 1 if it did not. For "
+            "packaging/smoke_frozen_connector.py: bleak and webviewpy are both "
+            "resolved at runtime, so PyInstaller cannot see them statically "
+            "and a build that dropped one starts perfectly and is simply "
+            "missing a feature. A frozen windowed binary has no other way to "
+            "be asked a question"
+        ),
+    )
     parser.add_argument("-v", "--verbose", action="store_true")
     return parser
+
+
+# What --smoke-import will import. An allowlist rather than "whatever you
+# named": this flag ships to riders, and an arbitrary-import switch on a
+# binary that autostarts is a gadget worth not handing out. These are exactly
+# the two optional halves the spec collects best-effort.
+_SMOKE_IMPORTABLE = ("bleak", "webviewpy")
 
 
 def main(argv: Optional[List[str]] = None) -> int:
     args = _parser().parse_args(argv)
     _configure_logging(args.verbose)
+
+    if args.smoke_import:
+        name = args.smoke_import
+        if name not in _SMOKE_IMPORTABLE:
+            log.error("--smoke-import only accepts %s", ", ".join(_SMOKE_IMPORTABLE))
+            return 2
+        try:
+            __import__(name)
+        except Exception:
+            # Logged, not printed: the frozen build this exists for is
+            # windowed, so the log file is where the smoke test reads it.
+            log.error("could not import %s", name, exc_info=True)
+            return 1
+        log.info("%s imported successfully", name)
+        return 0
 
     stored = load()
     if args.show_config:
