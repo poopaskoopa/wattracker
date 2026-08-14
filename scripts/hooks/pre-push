@@ -1,0 +1,52 @@
+#!/usr/bin/env bash
+#
+# pre-push — keep two agents from colliding on this repo.
+#
+# GitHub branch protection is a paid feature on a private repo, so these rules
+# are enforced here instead. Client-side hooks are a convention, not a control:
+# `--no-verify` bypasses them. That is acceptable because the failure being
+# prevented is an honest mistake (a rebase onto a stale base, a reflexive
+# force-push), not an adversary.
+#
+# Rules:
+#   1. No direct push to main. Merges happen through a PR, which goes through
+#      the GitHub API and never runs this hook.
+#   2. No `--force` to a shared branch without a lease. A force-push here once
+#      reverted three merged security fixes because the pushing clone had a
+#      22-hour-old view of origin/main.
+#
+# Install in each clone:
+#   cp pre-push .git/hooks/pre-push && chmod +x .git/hooks/pre-push
+
+set -uo pipefail
+
+protected="main"
+zero="0000000000000000000000000000000000000000"
+
+while read -r _local_ref local_sha remote_ref remote_sha; do
+    branch="${remote_ref#refs/heads/}"
+
+    if [ "$branch" = "$protected" ]; then
+        echo "pre-push: refusing to push directly to '$protected'." >&2
+        echo "          Open a PR instead:  gh pr create --base main" >&2
+        echo "          (PR merges go through the API and are unaffected.)" >&2
+        exit 1
+    fi
+
+    # Deleting a remote branch is fine; creating a new one is fine.
+    [ "$local_sha" = "$zero" ] && continue
+    [ "$remote_sha" = "$zero" ] && continue
+
+    # A non-fast-forward push rewrites history someone else may hold.
+    if ! git merge-base --is-ancestor "$remote_sha" "$local_sha" 2>/dev/null; then
+        echo "pre-push: '$branch' would be rewritten (not a fast-forward)." >&2
+        echo "          Remote is at ${remote_sha:0:8}, you are pushing ${local_sha:0:8}." >&2
+        echo "          If that is intended, use an explicit lease:" >&2
+        echo "            git push --force-with-lease=$branch:${remote_sha:0:8}" >&2
+        echo "          Before you do: fetch, and check the remote is not ahead" >&2
+        echo "          of the base you rebased onto." >&2
+        exit 1
+    fi
+done
+
+exit 0
