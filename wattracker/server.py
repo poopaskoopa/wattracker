@@ -3211,14 +3211,16 @@ def create_app() -> FastAPI:
     @app.post("/ooto/{ooto_id}/delete")
     def ooto_delete(request: Request, ooto_id: int):
         uid = _uid(request)
-        # Read the names an adjustment revert is about to undo BEFORE deleting:
-        # afterwards nothing remembers the .zwo the re-dosed session wrote.
-        renames = db.ooto_range_revert_renames(uid, ooto_id)
+        # Read the files the revert is about to orphan BEFORE deleting: a
+        # rescheduled row is deleted and a rebalanced row is renamed back, so
+        # afterwards nothing remembers the .zwo either of them wrote. Pruned
+        # before the sync, which then re-writes the restored plan on top.
+        orphans = db.ooto_range_revert_orphans(uid, ooto_id)
         db.delete_ooto_range(uid, ooto_id)
         try:
-            for renamed in renames:
+            for orphan in orphans:
                 adaptmod.reexport_workout(
-                    uid, renamed["date"], renamed["old_name"], None,
+                    uid, orphan["date"], orphan["name"], None,
                 )
             exporter.sync_plan_exports(uid)  # re-export days that are back in
         except Exception:
