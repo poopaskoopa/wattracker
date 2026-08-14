@@ -264,6 +264,14 @@ def run_daily_maintenance() -> dict:
             _log.warning("rider profile refresh failed for user %s", uid,
                          exc_info=True)
         try:
+            # Hand back any row whose OOTO adjustment has outlived its trip
+            # BEFORE adaptation and reflow read the plan, so the recipe owns it
+            # again in the same sweep rather than a day later.
+            db.retire_elapsed_ooto_adjustments(uid)
+        except Exception:
+            _log.warning("OOTO adjustment retirement failed for user %s", uid,
+                         exc_info=True)
+        try:
             summary = adaptmod.apply_adaptations(uid, state)
             totals["adapted"] += summary.get("adjusted", 0)
             totals["race_skipped"] += summary.get("skipped_raced", 0)
@@ -346,7 +354,61 @@ def _ooto_proposal_for(
         phase_by_date=phase_by_date,
         race_dates=db.list_race_dates(user_id),
         window_days=14,
+        # The rebalance option rebuilds sessions at a higher dose, so it needs
+        # the same measured profile the generator and adaptation prescribe
+        # against - otherwise a confirmed rebalance would write a
+        # population-constant session into a profile-aware plan.
+        profile=profile_store.for_user(user_id),
     )
+
+
+def _plural(count: int, word: str) -> str:
+    return f"{count} {word}{'' if count == 1 else 's'}"
+
+
+def _ooto_option_summary(option: dict) -> str:
+    """One honest sentence per option.
+
+    ``len(actions)`` is a count of proposed EDITS, never of affected workouts:
+    reschedule emits one edit per workout it can place and none for the ones it
+    cannot, and rebalance emits several edits per canceled workout. Reporting
+    the edit count as "N key workouts affected" told a rider "1 key workout
+    affected" directly under a banner saying four workouts fall in the range.
+    So affected and resolved are separate numbers here, and any key workout the
+    option cannot help is NAMED rather than quietly dropped.
+    """
+    kind = str(option.get("kind") or "")
+    affected = int(option.get("affected_keys") or 0)
+    resolved = int(option.get("resolved_keys") or 0)
+    unresolved = option.get("unresolved") or []
+    parts = [f"{_plural(affected, 'key workout')} affected."]
+    if kind == "reschedule":
+        parts.append(f"{resolved} moved to a later day.")
+        delta_min = int(option.get("volume_delta_s") or 0) // 60
+        if resolved and delta_min:
+            direction = "less" if delta_min < 0 else "more"
+            parts.append(
+                f"Planned volume changes by {abs(delta_min)} min {direction} "
+                "than leaving the plan alone."
+            )
+        elif resolved:
+            parts.append("Planned volume is unchanged.")
+    elif kind == "rebalance":
+        parts.append("Nothing moves and no session is lost.")
+        boosted = len(option.get("actions") or [])
+        if boosted:
+            parts.append(
+                f"{_plural(boosted, 'easy session')} step up one dose level at "
+                "the same length, so weekly minutes are unchanged."
+            )
+    if unresolved:
+        named = ", ".join(
+            f"{item.get('type') or 'workout'} on {item.get('date')}"
+            for item in unresolved
+        )
+        verb = "recovered" if kind == "rebalance" else "moved"
+        parts.append(f"Not {verb}: {named}.")
+    return " ".join(parts)
 
 
 def _ooto_adjustment_view(adjustment: Optional[dict]) -> Optional[dict]:
@@ -358,22 +420,16 @@ def _ooto_adjustment_view(adjustment: Optional[dict]) -> Optional[dict]:
     out["affected"] = proposal.get("affected") or []
     labels = {
         "skip": "Keep the workouts skipped",
-        "reschedule": "Reschedule key workouts",
-        "rebalance": "Modify remaining workouts",
+        "reschedule": "Reschedule key workouts to later days",
+        "rebalance": "Keep the calendar, raise the dose",
     }
     options = []
     for raw in proposal.get("options") or []:
         option = dict(raw)
         kind = str(option.get("kind") or "")
-        actions = [dict(action) for action in (option.get("actions") or [])]
+        option["actions"] = [dict(action) for action in (option.get("actions") or [])]
         option["label"] = labels.get(kind, kind.replace("_", " ").title())
-        option["actions"] = actions
-        option["summary"] = (
-            "No replacement workouts."
-            if not actions else
-            f"{len(actions)} key workout{'s' if len(actions) != 1 else ''} "
-            "affected."
-        )
+        option["summary"] = _ooto_option_summary(option)
         options.append(option)
     proposal["options"] = options
     out["proposal"] = proposal
@@ -1209,6 +1265,14 @@ def create_app() -> FastAPI:
         state = pipeline.build_state(uid)
         # Detection is actionable: adapt upcoming plan workouts (idempotent -
         # each workout is only ever adjusted once), then describe it.
+        try:
+            # Hand back any row whose OOTO adjustment has outlived its trip
+            # BEFORE adaptation and reflow read the plan, so the recipe owns it
+            # again in the same sweep rather than a day later.
+            db.retire_elapsed_ooto_adjustments(uid)
+        except Exception:
+            _log.warning("OOTO adjustment retirement failed for user %s", uid,
+                         exc_info=True)
         try:
             summary = adaptmod.apply_adaptations(uid, state)
         except Exception:
@@ -2942,12 +3006,11 @@ def create_app() -> FastAPI:
                 "ooto_canceled", "displaced",
             }
             wd["adjustment_replacement"] = adjustment_state in {
-                "rescheduled", "modified",
+                "rescheduled", "rebalanced",
             }
             wd["skipped"] = (
                 _in_ooto(w["date"])
                 and not w.get("completed_activity_id")
-                and adjustment_state != "modified"
             )
             # Missed: a past-dated workout left uncompleted that wasn't an
             # out-of-office skip (i.e. its day passed without completion).
@@ -3148,8 +3211,15 @@ def create_app() -> FastAPI:
     @app.post("/ooto/{ooto_id}/delete")
     def ooto_delete(request: Request, ooto_id: int):
         uid = _uid(request)
+        # Read the names an adjustment revert is about to undo BEFORE deleting:
+        # afterwards nothing remembers the .zwo the re-dosed session wrote.
+        renames = db.ooto_range_revert_renames(uid, ooto_id)
         db.delete_ooto_range(uid, ooto_id)
         try:
+            for renamed in renames:
+                adaptmod.reexport_workout(
+                    uid, renamed["date"], renamed["old_name"], None,
+                )
             exporter.sync_plan_exports(uid)  # re-export days that are back in
         except Exception:
             _log.warning("export sync after OOTO delete failed", exc_info=True)
@@ -3165,6 +3235,13 @@ def create_app() -> FastAPI:
         )
         if result.get("status") == "applied":
             try:
+                # Prune the .zwo of any session this adjustment renamed BEFORE
+                # the sync writes its replacement: the manifest is built from
+                # stored rows and cannot know the name that just went away.
+                for renamed in result.get("renamed") or ():
+                    adaptmod.reexport_workout(
+                        uid, renamed["date"], renamed["old_name"], None,
+                    )
                 exporter.sync_plan_exports(uid)
             except Exception:
                 _log.warning(
@@ -3173,8 +3250,14 @@ def create_app() -> FastAPI:
             flash = "OOTO adjustment applied."
         elif result.get("status") == "stale":
             flash = "That OOTO adjustment is stale; the plan changed underneath it."
-        elif result.get("status") == "already_applied":
-            flash = "That OOTO adjustment was already applied."
+        elif result.get("status") == "already_resolved":
+            # A double-submit lands here. Deliberately NOT treated as "applied":
+            # re-running the export sync for a row nothing touched is churn, and
+            # telling the rider it just applied would be a lie.
+            flash = (
+                "That OOTO adjustment was already "
+                f"{result.get('resolution') or 'resolved'}."
+            )
         else:
             flash = "The OOTO adjustment could not be applied."
         return RedirectResponse(

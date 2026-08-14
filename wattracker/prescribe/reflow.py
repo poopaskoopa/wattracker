@@ -14,11 +14,11 @@ The regeneration is always WHOLE-plan, never partial: the variant rotation in
 subset would desync every workout after it.
 
 Rows the recipe does not own are never touched: a row is eligible only if it
-is future-dated, not completed, carries ``origin = 'generated'`` and has no
-confirmed OOTO adjustment state. Plans with no recipe (everything created
-before the recipe column existed) are
-refused outright - guessing a recipe would silently rewrite a plan into
-something the user never asked for.
+is future-dated, not completed, carries ``origin = 'generated'`` and is not
+owned by a LIVE OOTO adjustment (one the rider has confirmed and not since
+reverted or outlived). Plans with no recipe (everything created before the
+recipe column existed) are refused outright - guessing a recipe would silently
+rewrite a plan into something the user never asked for.
 
 Races and the rider's measured profile are the INPUTS that are deliberately not
 in the recipe. They live outside it and are read fresh on every reflow, because
@@ -100,14 +100,25 @@ def _not_reflowable(reason: str) -> Dict:
     return {"status": "not_reflowable", "reason": reason}
 
 
-def _eligible(row: dict, today: str, race_window: Optional[set] = None) -> bool:
+def _eligible(row: dict, today: str, race_window: Optional[set] = None,
+              live_adjustments: Optional[set] = None) -> bool:
     """Is this stored row one the recipe owns and may rewrite?
 
     An adapted row is off limits unless a race has an opinion about its date -
     inside a taper or a post-race recovery window the race outranks the
     adaptation (see the module docstring).
+
+    A row an OOTO adjustment owns is off limits for as long as that adjustment
+    is LIVE, which is not the same as forever: reverting the adjustment (the
+    rider deleted the OOTO range) or retiring it (every date it touched is in
+    the past) hands the row straight back to the recipe. ``live_adjustments``
+    None means "no liveness information", which keeps the row locked - the
+    conservative answer for a caller that did not ask the database.
     """
-    if row.get("adjustment_state") is not None:
+    adjustment_id = row.get("adjustment_id")
+    if row.get("adjustment_state") is not None and (
+        live_adjustments is None or adjustment_id in live_adjustments
+    ):
         return False
     if row.get("adapted") is not None and row["date"] not in (race_window or ()):
         return False
@@ -151,6 +162,16 @@ def _by_date(rows: List[dict]) -> tuple:
     something outside the generator wrote there - report it as a conflict and
     leave every row on that date alone rather than guessing which one is ours.
 
+    Rows carrying an ``adjustment_state`` are exempt from that count. A
+    confirmed OOTO reschedule deliberately leaves the displaced original
+    alongside its replacement on one date (that tombstone IS the audit trail),
+    and counting it as a conflict fired the "something outside the generator
+    wrote here" signal on the app's own feature - permanently, since the
+    tombstone never goes away. They still occupy the date, so a conflict-free
+    adjusted day is not mistaken for an empty one and back-filled with a
+    duplicate; a generator-owned row on the same date wins the slot, because
+    that is the row the recipe may still rewrite.
+
     KNOWN LIMITATION: the index is per-plan, so reflowing plan A can insert a
     workout on a date where a DIFFERENT plan already has one. The active-plan
     concept largely mitigates this in practice; a real fix needs a product
@@ -159,9 +180,17 @@ def _by_date(rows: List[dict]) -> tuple:
     index: Dict[str, dict] = {}
     conflicts = set()
     for r in rows:
-        if r["date"] in index:
-            conflicts.add(r["date"])
-        index[r["date"]] = r
+        date = r["date"]
+        owned = r.get("adjustment_state") is None
+        previous = index.get(date)
+        if previous is None:
+            index[date] = r
+            continue
+        if owned and previous.get("adjustment_state") is None:
+            conflicts.add(date)
+            index[date] = r
+        elif owned:
+            index[date] = r
     for d in conflicts:
         index.pop(d, None)
     return index, conflicts
@@ -264,6 +293,8 @@ def reflow_plan(
     stored_by_date, conflicted = _by_date(
         db.plan_workouts_for_plan(user_id, plan_id, include_zwo=True)
     )
+    # Read once: which OOTO adjustments still own their rows (see _eligible).
+    live_adjustments = db.live_ooto_adjustment_ids(user_id)
 
     counts = {"updated": 0, "inserted": 0, "deleted": 0, "skipped_locked": 0,
               "raced_lost": 0, "failed": 0, "conflicts": len(conflicted)}
@@ -279,7 +310,7 @@ def reflow_plan(
         stored = stored_by_date.get(date)
         try:
             _apply_one(user_id, plan_id, date, today, fresh, stored, counts,
-                       race_window, export_ftp)
+                       race_window, export_ftp, live_adjustments)
         except Exception:  # noqa: BLE001 - one bad row must not sink the plan
             counts["failed"] += 1
             log.warning(
@@ -392,7 +423,8 @@ def _record_notice(
 def _apply_one(user_id: int, plan_id: int, date: str, today: str,
                fresh: Optional[dict], stored: Optional[dict],
                counts: Dict, race_window: Optional[set] = None,
-               export_ftp: Optional[float] = None) -> None:
+               export_ftp: Optional[float] = None,
+               live_adjustments: Optional[set] = None) -> None:
     """Apply one date's diff, mutating `counts`. Raises on a write failure."""
     if fresh is not None and stored is None:
         # New training day. Past dates are never back-filled: a workout
@@ -413,7 +445,7 @@ def _apply_one(user_id: int, plan_id: int, date: str, today: str,
 
     if fresh is None and stored is not None:
         # The recipe no longer wants a workout here.
-        if not _eligible(stored, today, race_window):
+        if not _eligible(stored, today, race_window, live_adjustments):
             counts["skipped_locked"] += 1
             return
         if db.delete_generated_plan_workout(user_id, stored["id"], today):
