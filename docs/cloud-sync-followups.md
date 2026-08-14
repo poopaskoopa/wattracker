@@ -3,8 +3,27 @@
 Working document for the remaining work on PR #92 (`agent2/issue59`). Delete this file in the
 commit that closes the last open item.
 
-Baseline: PR head `b90f87b`, rebased onto `main`, `MERGEABLE`/`CLEAN`, suite green at
-**2216 passed / 4 skipped**.
+Baseline: PR head `307b5b3`, in the dedicated `agent2/pr92-readiness` worktree. The PR was
+`MERGEABLE`/`CLEAN` with no reported checks or formal approval.
+
+## Current execution plan
+
+Step 1 is complete: work continues from PR head `307b5b3` in a dedicated worktree. Steps 2--4
+are implemented here; the remaining work is verification and review:
+
+1. Run the cloud-enabled suite, image/runtime checks, Bicep validation, and `git diff --check`.
+2. Request a fresh security review and approval.
+
+For this three-user deployment, do not provision Azure resources or spend time changing
+APIM/VNet-specific infrastructure until the deployment profile is chosen. The preferred
+lean profile should be evaluated before retaining the current enterprise-shaped topology.
+If GitHub Actions billing remains disabled, record the local-only validation gate rather
+than treating a non-running workflow as green.
+
+Local validation so far: all 50 cloud tests pass with `.[cloud]`; the broader suite passes
+`2181` tests with `13` expected skips when the two socket-restricted test files are excluded.
+This host has no Docker or Azure CLI, so the workflow's image import/build and Bicep steps remain
+to be exercised in CI or on a host with those tools.
 
 ## How to work in this repo
 
@@ -47,72 +66,48 @@ version is authoritative. It has been dropped from this branch. **Do not resurre
 
 ---
 
-## Open work, in priority order
+## Completed in this worktree, pending final verification
 
-### 1. CI runs none of this — highest value, do this first
+### Cloud readiness
 
-Nothing verifies this PR except someone running pytest by hand. `gh pr checks 92` reports no
-checks at all.
+- `Dockerfile.cloud` explicitly installs `.[cloud]`, runs the cloud runtime, and has a dependency
+  import health check; the ordinary local-server `Dockerfile` is unchanged.
+- `.github/workflows/cloud.yml` installs `.[dev,cloud]`, runs the full suite, validates Bicep, builds
+  the cloud image, and imports the Azure/cloud runtime inside that image.
+- The restart/enrollment coverage now performs a real Ed25519 `POST /api/v1/sync/batches`; the
+  existing HMAC batch path remains covered separately.
+- If Actions billing remains disabled, the workflow is a declared gate but its local equivalent is
+  still required; a non-running workflow is not evidence of a green check.
 
-- Only `.github/workflows/windows.yml` triggers on `pull_request`.
-- Every workflow installs `.[dev]`, never `.[cloud]`, so `cryptography` is absent.
-- Consequence: `tests/test_cloud_api.py::test_read_enrollment_is_usable_by_restarted_sync_and_read_planes`
-  — the only Ed25519 enrollment test — is **always skipped in CI**.
-- Roughly 40 cloud tests run nowhere.
+### M1 — public-key-to-HMAC credential path removed
 
-Also: every end-to-end `POST /api/v1/sync/batches` test builds its writer via `register_writer(...)`,
-which produces `hmac-sha256`. **No test ever pushes a batch with an Ed25519 credential**, which is
-what `enroll_writer` — the only production path — issues. If `cryptography` is missing from the
-container image, `verify_signature` returns `False` silently (`security.py:418-421`) and every
-write 401s. Fail-closed, but a total outage no test would catch.
+`EnrollmentRegistry.consume` now returns only an `InvitationBinding`. It has no `public_key` branch,
+and the regression test proves the removed call shape cannot manufacture an HMAC writer.
 
-**Do:** add a Linux `pull_request` job installing `.[cloud]` and running the full suite; add one
-end-to-end batch test using an Ed25519 credential.
+### M2 — signed sync status
 
-**Also confirm:** that the `cloud` extra is actually installed in `readImage`/`syncImage`. Nothing
-in this repo enforces it. If it isn't, that is a production outage waiting to happen and is
-higher priority than everything else on this list.
+`GET /api/v1/sync/status` now verifies the writer timestamp, nonce, empty-body digest, canonical
+request signature, and replay claim using the credential's trusted algorithm. Tests cover missing,
+tampered, and replayed status requests.
 
-### 2. M1 — delete the "HMAC secret is a public key" branch
+### M3 — server-generated writer secret
 
-`wattracker/cloud/security.py:882-891`: `EnrollmentRegistry.consume(token, public_key=...)` returns
-a credential with `verification_key = <caller-supplied public key>` and
-`signature_algorithm = "hmac-sha256"`. Anyone who learns that public key can forge signatures.
-This contradicts the `verify_signature` docstring at `security.py:404`.
+Enrollment always takes the random subscription-key path in `CredentialRegistry.enroll_writer`. The
+APIM subscription header is independent and is never copied into the writer credential.
 
-Not reachable over HTTP today — `api.py` calls `consume(token, subject=subject)` without a key and
-never registers the result — but `tests/test_cloud_security.py:110` asserts it succeeds, which
-locks the unsafe shape in.
+### M4 — unused cleanup identity removed
 
-**Do:** remove the `public_key` branch (or make it emit `ed25519`) and invert that test.
+The Bicep deployment no longer creates `cleanupIdentity` or its Blob/Table contributor assignments.
+Retention and recovery deletion remain a separate future cleanup-job feature.
 
-### 3. M2 — `GET /api/v1/sync/status` has no request signature
+### Binary runbook
 
-`_writer_auth` alone: credential id + subscription key digest, no proof of possession, no nonce, no
-timestamp. Returns scope revision and full quota counters. Both factors are bearer values sent on
-every request. It is the one signed-plane route where the signature was dropped.
+The redundant `docs/azure-cloud-sync-secure-deployment-runbook.docx` was removed. Markdown remains
+the reviewable source of truth.
 
-**Do:** sign it (GET with empty-body digest), or document it as a deliberately weaker read.
+## Remaining open work, in priority order
 
-### 4. M3 — the writer's second factor is client-chosen at enrollment
-
-`api.py:418`: whatever the caller sends as `Ocp-Apim-Subscription-Key` at enrollment becomes the
-stored writer secret, making it identical to the APIM subscription key — one leak compromises both
-layers.
-
-**Do:** use the server-generated random key (the `None` branch) unconditionally; treat the APIM key
-as an independent APIM-layer control.
-
-### 5. M4 — standing high-privilege identity with no consumer
-
-`infra/azure/main.bicep:171,335-344`: `cleanupIdentity` holds Storage Blob Data Contributor and
-Table Data Contributor (including delete) and nothing uses it — a dormant principal that can delete
-every tenant's objects.
-
-**Do:** add the cleanup job that owns it, or remove the identity and its role assignments until
-that job exists.
-
-### 6. Smaller items
+### Smaller items
 
 - `api.py:430-432` — comment says `signing_namespace` is "not a storage partition key"; `storage.py:315`
   builds the partition as `f"{namespace}:{local_user_scope}"`. Fix the comment; it misstates the

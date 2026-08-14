@@ -296,6 +296,34 @@ def _scope(writer: Any) -> tuple[str, str]:
     return namespace, local_user_scope
 
 
+def _verify_writer_request(
+    state: CloudState, request: Request, writer: Any, body: bytes
+) -> tuple[str, str, str, int] | None:
+    """Verify the signed request envelope and consume its replay nonce."""
+    try:
+        timestamp, nonce, idem, revision, signature = _writer_signature_fields(request)
+        now = state.config.clock()
+        if abs(now - timestamp) > _MAX_TIMESTAMP:
+            return None
+        namespace, scope = _scope(writer)
+        canonical = canonical_request(
+            request.method, request.url.path, namespace, timestamp, nonce,
+            digest_body(body), idem, str(revision),
+        )
+        if not verify_signature(
+            _credential_key(writer), canonical, signature,
+            algorithm=getattr(writer, "signature_algorithm", ""),
+        ):
+            return None
+        if not state.nonces.accept(
+            namespace, getattr(writer, "credential_id", ""), nonce, now=now
+        ):
+            return None
+        return namespace, scope, idem, revision
+    except (HTTPException, TypeError, ValueError, UnicodeError):
+        return None
+
+
 def _resolve_reader(state: CloudState, request: Request) -> Any:
     if not _apim_proof_valid(state, request):
         return None
@@ -404,9 +432,6 @@ def create_cloud_app(
             subject = request.headers.get(config.verified_subject_header.lower(), "")
             if not subject:
                 return _error(401, "verified reader authorization required")
-            subscription = request.headers.get(config.subscription_header.lower(), "")
-            if len(subscription) > 512:
-                return _error(401, "subscription authorization required")
             # The invitation is the only selector. The body contains a public
             # verification key, never an installation/account selector or a
             # private signing key.
@@ -433,7 +458,6 @@ def create_cloud_app(
                     return _not_found()
                 writer = state.credentials.enroll_writer(
                     binding, signing_key=public_key,
-                    subscription_key=(subscription.encode("utf-8") if subscription else None),
                     enrollment_registry=state.enrollments,
                 )
             except (ValueError, RuntimeError):
@@ -534,29 +558,11 @@ def create_cloud_app(
         @app.post("/api/v1/sync/batches")
         async def sync_batch(request: Request) -> Response:
             writer = _writer_auth(state, request)
-            timestamp, nonce, idem, revision, signature = _writer_signature_fields(request)
-            now = config.clock()
-            if abs(now - timestamp) > _MAX_TIMESTAMP:
-                return _error(401, "writer authorization required")
-            namespace, scope = _scope(writer)
             raw = await _bounded_body(request, config.max_request_bytes)
-            body_hash = digest_body(raw)
-            try:
-                canonical = canonical_request(
-                    request.method, request.url.path, namespace, timestamp, nonce,
-                    body_hash, idem, str(revision),
-                )
-            except (TypeError, ValueError, UnicodeError):
+            verified = _verify_writer_request(state, request, writer, raw)
+            if verified is None:
                 return _error(401, "writer authorization required")
-            if not verify_signature(
-                _credential_key(writer), canonical, signature,
-                algorithm=getattr(writer, "signature_algorithm", ""),
-            ):
-                return _error(401, "writer authorization required")
-            if not state.nonces.accept(
-                namespace, getattr(writer, "credential_id", ""), nonce, now=now
-            ):
-                return _error(401, "writer authorization required")
+            namespace, scope, idem, revision = verified
             decoded = _decompress_bounded(raw, config.max_decompressed_batch_bytes)
             try:
                 payload = json.loads(decoded.decode("utf-8"))
@@ -594,7 +600,10 @@ def create_cloud_app(
         @app.get("/api/v1/sync/status")
         async def sync_status(request: Request) -> Response:
             writer = _writer_auth(state, request)
-            namespace, scope = _scope(writer)
+            verified = _verify_writer_request(state, request, writer, b"")
+            if verified is None:
+                return _error(401, "writer authorization required")
+            namespace, scope, _idem, _revision = verified
             try:
                 state.quotas.admit_read(namespace, scope, response_bytes=0)
                 body = json.dumps({
