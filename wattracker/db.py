@@ -8,6 +8,7 @@ migration chain falls back to a clean drop/recreate.
 from __future__ import annotations
 
 import datetime as _dt
+import hashlib
 import json
 import logging
 import math
@@ -24,7 +25,7 @@ from .timeutil import utc_now, valid_timezone
 
 _log = logging.getLogger(__name__)
 
-SCHEMA_VERSION = 30
+SCHEMA_VERSION = 31
 
 
 def _restrict_db_files(path: str) -> None:
@@ -251,11 +252,20 @@ _MIGRATIONS: Dict[int, Sequence[Union[str, Callable[[sqlite3.Connection], None]]
         # exists, and an empty table is exactly the right starting state for
         # every install that upgrades into it.
     ],
+    30: [
+        # OOTO recovery keeps the original generated row for auditability and
+        # records any replacement/modified row without letting nightly reflow
+        # claim it as ordinary generated content.
+        "ALTER TABLE plan_workouts ADD COLUMN adjustment_id INTEGER",
+        "ALTER TABLE plan_workouts ADD COLUMN adjustment_state TEXT",
+        "ALTER TABLE plan_workouts ADD COLUMN adjustment_source_id INTEGER",
+    ],
 }
 
 _DROP = """
 DROP TABLE IF EXISTS connector_devices;
 DROP TABLE IF EXISTS ftp_suggestions;
+DROP TABLE IF EXISTS ooto_adjustments;
 DROP TABLE IF EXISTS power_sample_corrections;
 DROP TABLE IF EXISTS ftp_feedback_batches;
 DROP TABLE IF EXISTS standalone_workouts;
@@ -415,6 +425,9 @@ CREATE TABLE IF NOT EXISTS plan_workouts (
     feedback_batch_id INTEGER,
     origin            TEXT,
     export_ftp        REAL,
+    adjustment_id     INTEGER,
+    adjustment_state  TEXT,
+    adjustment_source_id INTEGER,
     FOREIGN KEY(plan_id) REFERENCES plans(id),
     FOREIGN KEY(user_id) REFERENCES users(id)
 );
@@ -526,6 +539,28 @@ CREATE TABLE IF NOT EXISTS ooto_ranges (
 );
 CREATE INDEX IF NOT EXISTS idx_ooto_user
     ON ooto_ranges(user_id, start_date);
+
+-- A proposal is created when OOTO affects an active plan. It is deliberately
+-- separate from the OOTO range: adding OOTO is immediate, while changing the
+-- training plan requires an explicit rider confirmation.
+CREATE TABLE IF NOT EXISTS ooto_adjustments (
+    id             INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id        INTEGER NOT NULL,
+    plan_id        INTEGER NOT NULL,
+    ooto_id        INTEGER NOT NULL,
+    start_date     TEXT NOT NULL,
+    end_date       TEXT NOT NULL,
+    status         TEXT NOT NULL DEFAULT 'pending',
+    proposal_json  TEXT NOT NULL,
+    selected_option TEXT,
+    created        TEXT NOT NULL,
+    resolved       TEXT,
+    FOREIGN KEY(user_id) REFERENCES users(id),
+    FOREIGN KEY(plan_id) REFERENCES plans(id),
+    FOREIGN KEY(ooto_id) REFERENCES ooto_ranges(id)
+);
+CREATE INDEX IF NOT EXISTS idx_ooto_adjustments_user_status
+    ON ooto_adjustments(user_id, status, created);
 
 -- Races the rider INTENDS to do: future events the plan bends around (taper,
 -- post-race recovery, no workout on the day itself). Deliberately NOT the same
@@ -2266,6 +2301,10 @@ def add_plan_workout(
     origin: Optional[str] = None,
     export_ftp: Optional[float] = None,
     path: Optional[str] = None,
+    *,
+    adjustment_id: Optional[int] = None,
+    adjustment_state: Optional[str] = None,
+    adjustment_source_id: Optional[int] = None,
 ) -> int:
     conn = connect(path)
     try:
@@ -2273,12 +2312,14 @@ def add_plan_workout(
             """
             INSERT INTO plan_workouts
               (plan_id, user_id, date, name, type, duration_s, tss,
-               zwo_or_segments, variant, origin, export_ftp)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+               zwo_or_segments, variant, origin, export_ftp,
+               adjustment_id, adjustment_state, adjustment_source_id)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (plan_id, user_id, date, name, type, int(duration_s), float(tss),
              zwo_or_segments, variant, origin,
-             float(export_ftp) if export_ftp else None),
+             float(export_ftp) if export_ftp else None,
+             adjustment_id, adjustment_state, adjustment_source_id),
         )
         conn.commit()
         return cur.lastrowid
@@ -2332,6 +2373,9 @@ def _plan_workout_row(r: sqlite3.Row, include_zwo: bool = False) -> dict:
         "feedback_batch_id": r["feedback_batch_id"],
         "origin": r["origin"],
         "export_ftp": r["export_ftp"],
+        "adjustment_id": r["adjustment_id"],
+        "adjustment_state": r["adjustment_state"],
+        "adjustment_source_id": r["adjustment_source_id"],
     }
     if include_zwo:
         d["zwo_or_segments"] = r["zwo_or_segments"]
@@ -3070,10 +3114,14 @@ def adaptable_plan_workouts(
     conn = connect(path)
     try:
         rows = conn.execute(
+            # A row an OOTO adjustment owns is off limits WHILE that adjustment
+            # is live - not for the life of the plan. Once it is reverted,
+            # dismissed or retired the row is an ordinary adaptable row again.
             "SELECT * FROM plan_workouts WHERE user_id = ? AND date > ? "
             "AND date <= ? AND completed_activity_id IS NULL "
-            "AND adapted IS NULL ORDER BY date ASC",
-            (user_id, after_date, up_to_date),
+            "AND adapted IS NULL AND (adjustment_id IS NULL OR adjustment_id "
+            f"NOT IN ({_LIVE_ADJUSTMENT_SQL})) ORDER BY date ASC",
+            (user_id, after_date, up_to_date, user_id),
         ).fetchall()
         return [_plan_workout_row(r, include_zwo=True) for r in rows]
     finally:
@@ -3453,14 +3501,83 @@ def list_ooto_ranges(user_id: int, path: Optional[str] = None) -> List[dict]:
 
 
 def delete_ooto_range(user_id: int, ooto_id: int, path: Optional[str] = None) -> bool:
+    """Delete an OOTO range and UNDO every adjustment it caused.
+
+    A trip that is called off has to leave no trace: an applied adjustment is
+    reverted here, not merely marked historical. Without this the cancelled key
+    workout stayed cancelled and unexported forever, the displaced easy session
+    stayed destroyed, and every affected row was permanently invisible to
+    nightly reflow and to adaptation.
+
+    Runs under ``BEGIN IMMEDIATE`` for the same reason ``apply_ooto_adjustment``
+    does: the revert touches several rows and a half-applied revert is a
+    corrupted plan.
+    """
     conn = connect(path)
     try:
+        conn.execute("BEGIN IMMEDIATE")
+        now = utc_now().isoformat(timespec="seconds")
+        conn.execute(
+            "UPDATE ooto_adjustments SET status = 'stale', resolved = ? "
+            "WHERE user_id = ? AND ooto_id = ? AND status = 'pending'",
+            (now, user_id, ooto_id),
+        )
+        applied = conn.execute(
+            "SELECT id, proposal_json FROM ooto_adjustments "
+            "WHERE user_id = ? AND ooto_id = ? AND status = 'applied'",
+            (user_id, ooto_id),
+        ).fetchall()
+        for row in applied:
+            _revert_ooto_adjustment(conn, user_id, row["id"], row["proposal_json"])
+            conn.execute(
+                "UPDATE ooto_adjustments SET status = 'reverted', resolved = ? "
+                "WHERE user_id = ? AND id = ?",
+                (now, user_id, row["id"]),
+            )
         cur = conn.execute(
             "DELETE FROM ooto_ranges WHERE user_id = ? AND id = ?",
             (user_id, ooto_id),
         )
         conn.commit()
         return cur.rowcount > 0
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+
+def ooto_range_revert_orphans(
+    user_id: int, ooto_id: int, path: Optional[str] = None,
+) -> List[dict]:
+    """The .zwo files ``delete_ooto_range`` is about to orphan, as (date, name).
+
+    MUST be read before the delete, never after. A .zwo is named after
+    date + name, and the export manifest is built from STORED rows, so the
+    moment the revert has run there is nothing left in the database that
+    remembers the file:
+
+    * a ``rescheduled`` row is DELETED by the revert, taking the only record of
+      its filename with it;
+    * a ``rebalanced`` row has its original name restored over the top of the
+      re-dosed one.
+
+    Either way the file survives in the rider's Zwift folder and now
+    contradicts the restored plan - a phantom threshold session sitting on a
+    day the plan says is easy. Both states are covered here deliberately:
+    filtering to one of them is exactly the bug this replaced.
+    """
+    conn = connect(path)
+    try:
+        rows = conn.execute(
+            "SELECT w.date AS date, w.name AS name FROM plan_workouts w "
+            "JOIN ooto_adjustments a ON a.id = w.adjustment_id "
+            "WHERE w.user_id = ? AND a.user_id = ? AND a.ooto_id = ? "
+            "AND a.status = 'applied' "
+            "AND w.adjustment_state IN ('rescheduled', 'rebalanced')",
+            (user_id, user_id, ooto_id),
+        ).fetchall()
+        return [{"date": r["date"], "name": r["name"]} for r in rows]
     finally:
         conn.close()
 
@@ -3475,6 +3592,462 @@ def ooto_covers(user_id: int, date_iso: str, path: Optional[str] = None) -> bool
             (user_id, date_iso, date_iso),
         ).fetchone()
         return row is not None
+    finally:
+        conn.close()
+
+
+def _ooto_adjustment_row(row: sqlite3.Row) -> dict:
+    d = dict(row)
+    try:
+        parsed = json.loads(d.pop("proposal_json") or "{}")
+    except (ValueError, TypeError):
+        parsed = {}
+    d["proposal"] = parsed if isinstance(parsed, dict) else {}
+    return d
+
+
+def create_ooto_adjustment(
+    user_id: int, plan_id: int, ooto_id: int,
+    start_date: str, end_date: str, proposal: dict,
+    path: Optional[str] = None,
+) -> int:
+    """Persist a confirmation-required OOTO adjustment proposal."""
+    conn = connect(path)
+    try:
+        cur = conn.execute(
+            "INSERT INTO ooto_adjustments "
+            "(user_id, plan_id, ooto_id, start_date, end_date, proposal_json, created) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (user_id, plan_id, ooto_id, start_date, end_date,
+             json.dumps(proposal, separators=(",", ":")),
+             utc_now().isoformat(timespec="seconds")),
+        )
+        conn.commit()
+        return cur.lastrowid
+    finally:
+        conn.close()
+
+
+def get_ooto_adjustment(
+    user_id: int, adjustment_id: int, path: Optional[str] = None,
+) -> Optional[dict]:
+    conn = connect(path)
+    try:
+        row = conn.execute(
+            "SELECT * FROM ooto_adjustments WHERE user_id = ? AND id = ?",
+            (user_id, adjustment_id),
+        ).fetchone()
+        return _ooto_adjustment_row(row) if row else None
+    finally:
+        conn.close()
+
+
+def list_pending_ooto_adjustments(
+    user_id: int, path: Optional[str] = None,
+) -> List[dict]:
+    conn = connect(path)
+    try:
+        rows = conn.execute(
+            "SELECT * FROM ooto_adjustments "
+            "WHERE user_id = ? AND status = 'pending' "
+            "ORDER BY created DESC, id DESC",
+            (user_id,),
+        ).fetchall()
+        return [_ooto_adjustment_row(r) for r in rows]
+    finally:
+        conn.close()
+
+
+def set_ooto_adjustment_status(
+    user_id: int, adjustment_id: int, status: str,
+    selected_option: Optional[str] = None,
+    path: Optional[str] = None,
+) -> bool:
+    """Resolve or dismiss a proposal without applying schedule mutations."""
+    if status not in ("pending", "dismissed", "stale"):
+        raise ValueError("invalid OOTO adjustment status")
+    conn = connect(path)
+    try:
+        cur = conn.execute(
+            "UPDATE ooto_adjustments SET status = ?, selected_option = ?, "
+            "resolved = ? WHERE user_id = ? AND id = ? AND status = 'pending'",
+            (status, selected_option,
+             utc_now().isoformat(timespec="seconds") if status != "pending" else None,
+             user_id, adjustment_id),
+        )
+        conn.commit()
+        return cur.rowcount > 0
+    finally:
+        conn.close()
+
+
+def _adjustment_fingerprint(row: sqlite3.Row) -> str:
+    keys = (
+        "id", "plan_id", "date", "name", "type", "duration_s", "tss",
+        "zwo_or_segments", "completed_activity_id", "completed_date", "adapted",
+        "adapted_at", "rpe", "variant", "compliance", "effective_ftp",
+        "feedback_applied", "feedback_batch_id", "origin", "export_ftp",
+        "adjustment_id", "adjustment_state", "adjustment_source_id",
+    )
+    values = dict(row)
+    normalized = {key: values.get(key) for key in keys}
+    normalized["feedback_applied"] = int(bool(normalized["feedback_applied"]))
+    payload = json.dumps(normalized, sort_keys=True, separators=(",", ":"),
+                         default=str)
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+# The rebalance dose rules, re-stated here so the WRITE side enforces them
+# instead of trusting whatever the stored proposal says. Kept byte-identical to
+# prescribe/ooto_adjust.DOSE_STEP / HARD_TYPES; db must not import prescribe
+# (prescribe imports db), and test_ooto_adjust asserts the two never drift.
+_OOTO_DOSE_STEP = {"endurance": "tempo"}
+_OOTO_HARD_TYPES = frozenset({"vo2max", "threshold", "sweet_spot", "sprint"})
+
+
+def _ooto_action_permitted(
+    action: dict, source: sqlite3.Row, target: sqlite3.Row,
+) -> bool:
+    """Does this stored action stay inside the rules the proposal promised?
+
+    The fingerprints prove the ROWS have not changed since the proposal was
+    built; they prove nothing about the proposal itself. Everything the apply
+    is about to write is therefore re-derived from the stored rows here rather
+    than taken on trust, so a proposal that has been tampered with cannot write
+    something ``evaluate_ooto`` would never have produced - a rebalance that
+    turns an endurance ride into a vo2max session, or a reschedule that grows
+    the target week past its budget.
+    """
+    if str(action.get("mode") or "reschedule") == "rebalance":
+        expected = _OOTO_DOSE_STEP.get(str(target["type"] or "").lower())
+        return (
+            expected is not None
+            and expected not in _OOTO_HARD_TYPES
+            and action.get("new_type") == expected
+            and action.get("new_variant") == "classic"
+            and int(action.get("duration_s") or 0) == int(target["duration_s"])
+        )
+    # Reschedule keeps the moved session's own duration, so the target week
+    # changes by (source - target). Anything positive would grow a week past
+    # hours_per_week * 60 - the invariant `_compatible` protects at proposal
+    # time and this protects at write time.
+    return int(source["duration_s"]) <= int(target["duration_s"])
+
+
+_REVERT_KEYS = ("name", "type", "duration_s", "tss", "zwo_or_segments",
+                "variant", "export_ftp", "origin")
+
+
+def _revert_snapshot(row: sqlite3.Row) -> dict:
+    """The fields a revert has to put back, for a row apply overwrites."""
+    values = dict(row)
+    snapshot = {key: values.get(key) for key in _REVERT_KEYS}
+    snapshot["id"] = values.get("id")
+    return snapshot
+
+
+def _revert_ooto_adjustment(
+    conn: sqlite3.Connection, user_id: int, adjustment_id: int,
+    proposal_json: Optional[str],
+) -> None:
+    """Put the plan back the way it was before ``adjustment_id`` was applied.
+
+    Caller owns the transaction. Three row shapes exist and each unwinds
+    differently:
+
+    * ``rescheduled`` rows were INSERTED by the apply, so they are deleted.
+    * ``rebalanced`` rows had their prescription rewritten in place, so the
+      snapshot the apply stored alongside the proposal is written back.
+    * ``ooto_canceled`` / ``displaced`` rows were only tombstoned, so clearing
+      the adjustment columns is the whole revert.
+    """
+    try:
+        proposal = json.loads(proposal_json or "{}")
+    except (ValueError, TypeError):
+        proposal = {}
+    snapshots = proposal.get("applied_revert") if isinstance(proposal, dict) else None
+    for snapshot in snapshots or ():
+        if not isinstance(snapshot, dict) or snapshot.get("id") is None:
+            continue
+        conn.execute(
+            "UPDATE plan_workouts SET name = ?, type = ?, duration_s = ?, "
+            "tss = ?, zwo_or_segments = ?, variant = ?, export_ftp = ?, "
+            "origin = ? WHERE user_id = ? AND id = ? AND adjustment_id = ?",
+            (*(snapshot.get(key) for key in _REVERT_KEYS),
+             user_id, int(snapshot["id"]), adjustment_id),
+        )
+    conn.execute(
+        "DELETE FROM plan_workouts WHERE user_id = ? AND adjustment_id = ? "
+        "AND adjustment_state = 'rescheduled'",
+        (user_id, adjustment_id),
+    )
+    conn.execute(
+        "UPDATE plan_workouts SET adjustment_id = NULL, "
+        "adjustment_state = NULL, adjustment_source_id = NULL "
+        "WHERE user_id = ? AND adjustment_id = ?",
+        (user_id, adjustment_id),
+    )
+
+
+# An adjustment is LIVE while it is applied. Reflow and adaptation step over
+# the rows it owns for exactly that long - not, as before, for the life of the
+# plan. Reverting, dismissing or retiring the adjustment hands the rows straight
+# back to the generator.
+_LIVE_ADJUSTMENT_SQL = (
+    "SELECT id FROM ooto_adjustments WHERE user_id = ? AND status = 'applied'"
+)
+
+
+def live_ooto_adjustment_ids(user_id: int, path: Optional[str] = None) -> set:
+    """Ids of the adjustments whose plan rows are currently off limits."""
+    conn = connect(path)
+    try:
+        return {r["id"] for r in conn.execute(_LIVE_ADJUSTMENT_SQL, (user_id,))}
+    finally:
+        conn.close()
+
+
+def retire_elapsed_ooto_adjustments(
+    user_id: int, today: Optional[str] = None, path: Optional[str] = None,
+) -> int:
+    """Retire applied adjustments whose every touched row is in the past.
+
+    This is what stops the reflow/adaptation exclusion outliving the trip that
+    caused it. Retirement is deliberately not a revert: the rows it touched are
+    history by then and rewriting history would be wrong. It only ends the
+    exclusion, and it waits until no touched row is still upcoming so that no
+    future date can be handed back to the generator while the rider is still
+    counting on the adjustment.
+    """
+    today = today or utc_now().date().isoformat()
+    conn = connect(path)
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        cur = conn.execute(
+            "UPDATE ooto_adjustments SET status = 'retired', resolved = ? "
+            "WHERE user_id = ? AND status = 'applied' AND NOT EXISTS ("
+            "  SELECT 1 FROM plan_workouts w WHERE w.user_id = ooto_adjustments.user_id"
+            "  AND w.adjustment_id = ooto_adjustments.id AND w.date >= ?)",
+            (utc_now().isoformat(timespec="seconds"), user_id, today),
+        )
+        conn.commit()
+        return cur.rowcount
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+
+def apply_ooto_adjustment(
+    user_id: int, adjustment_id: int, option_kind: str,
+    path: Optional[str] = None, now: Optional[_dt.date] = None,
+) -> dict:
+    """Apply one stored proposal atomically, rejecting stale inputs."""
+    conn = connect(path)
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        adjustment = conn.execute(
+            "SELECT * FROM ooto_adjustments WHERE user_id = ? AND id = ?",
+            (user_id, adjustment_id),
+        ).fetchone()
+        if adjustment is None:
+            conn.rollback()
+            return {"status": "not_found"}
+        if adjustment["status"] != "pending":
+            conn.rollback()
+            # Distinct from "applied": a double-submit must not read as a fresh
+            # application, or the caller re-runs the export sync (and tells the
+            # rider it just did something) for a row it did not touch.
+            return {
+                "status": "already_resolved",
+                "resolution": adjustment["status"],
+                "selected_option": adjustment["selected_option"],
+            }
+        ooto = conn.execute(
+            "SELECT 1 FROM ooto_ranges WHERE user_id = ? AND id = ?",
+            (user_id, adjustment["ooto_id"]),
+        ).fetchone()
+        if ooto is None:
+            conn.execute(
+                "UPDATE ooto_adjustments SET status = 'stale', resolved = ? "
+                "WHERE user_id = ? AND id = ?",
+                (utc_now().isoformat(timespec="seconds"), user_id, adjustment_id),
+            )
+            conn.commit()
+            return {"status": "stale"}
+
+        try:
+            proposal = json.loads(adjustment["proposal_json"] or "{}")
+        except (ValueError, TypeError):
+            proposal = {}
+        options = {
+            str(option.get("kind")): option
+            for option in proposal.get("options", [])
+            if isinstance(option, dict) and option.get("kind")
+        }
+        option = options.get(option_kind)
+        if option is None:
+            conn.rollback()
+            return {"status": "invalid_option"}
+
+        actions = option.get("actions") or []
+        rows: dict[int, sqlite3.Row] = {}
+        today = (now or utc_now().date()).isoformat()
+        for action in actions:
+            if not isinstance(action, dict):
+                conn.rollback()
+                return {"status": "invalid_proposal"}
+            for key in ("source_id", "target_id"):
+                try:
+                    row_id = int(action[key])
+                except (KeyError, TypeError, ValueError):
+                    conn.rollback()
+                    return {"status": "invalid_proposal"}
+                if row_id not in rows:
+                    row = conn.execute(
+                        "SELECT * FROM plan_workouts WHERE user_id = ? "
+                        "AND plan_id = ? AND id = ?",
+                        (user_id, adjustment["plan_id"], row_id),
+                    ).fetchone()
+                    if row is None:
+                        conn.rollback()
+                        return {"status": "stale"}
+                    rows[row_id] = row
+            source = rows[int(action["source_id"])]
+            target = rows[int(action["target_id"])]
+            if (_adjustment_fingerprint(source)
+                    != action.get("expected_source_fingerprint")
+                    or _adjustment_fingerprint(target)
+                    != action.get("expected_target_fingerprint")):
+                conn.execute(
+                    "UPDATE ooto_adjustments SET status = 'stale', resolved = ? "
+                    "WHERE user_id = ? AND id = ?",
+                    (utc_now().isoformat(timespec="seconds"), user_id, adjustment_id),
+                )
+                conn.commit()
+                return {"status": "stale"}
+            if any(
+                row["date"] <= today
+                or row["completed_activity_id"] is not None
+                or row["origin"] != "generated"
+                or row["adapted"] is not None
+                or row["adjustment_state"] is not None
+                for row in (source, target)
+            ):
+                conn.execute(
+                    "UPDATE ooto_adjustments SET status = 'stale', resolved = ? "
+                    "WHERE user_id = ? AND id = ?",
+                    (utc_now().isoformat(timespec="seconds"), user_id, adjustment_id),
+                )
+                conn.commit()
+                return {"status": "stale"}
+            target_ooto = conn.execute(
+                "SELECT 1 FROM ooto_ranges WHERE user_id = ? "
+                "AND start_date <= ? AND end_date >= ? LIMIT 1",
+                (user_id, target["date"], target["date"]),
+            ).fetchone()
+            target_race = conn.execute(
+                "SELECT 1 FROM race_dates WHERE user_id = ? AND date = ? LIMIT 1",
+                (user_id, target["date"]),
+            ).fetchone()
+            if target_ooto is not None or target_race is not None:
+                conn.execute(
+                    "UPDATE ooto_adjustments SET status = 'stale', resolved = ? "
+                    "WHERE user_id = ? AND id = ?",
+                    (utc_now().isoformat(timespec="seconds"), user_id, adjustment_id),
+                )
+                conn.commit()
+                return {"status": "stale"}
+            if not _ooto_action_permitted(action, source, target):
+                conn.rollback()
+                return {"status": "invalid_proposal"}
+
+        changed = 0
+        revert: List[dict] = []
+        renamed: List[dict] = []
+        for action in actions:
+            source_id = int(action["source_id"])
+            target_id = int(action["target_id"])
+            source = rows[source_id]
+            target = rows[target_id]
+            mode = str(action.get("mode") or "reschedule")
+            if mode == "rebalance":
+                # Rebalance moves nothing: the canceled key workout is left
+                # exactly where it is (the OOTO range already keeps it out of
+                # the export) and only the surviving easy day's DOSE changes.
+                # duration_s is deliberately absent from this UPDATE - weekly
+                # minutes must come out identical. The validation pass above
+                # has already refused any action that disagreed about it.
+                revert.append(_revert_snapshot(target))
+                if action.get("new_name") != target["name"]:
+                    # The .zwo is named after date+name, so a re-dosed session
+                    # orphans its old file. The manifest is built from stored
+                    # rows and cannot know the name that just went away, so the
+                    # caller is told which files to prune.
+                    renamed.append({"date": target["date"],
+                                    "old_name": target["name"]})
+                conn.execute(
+                    "UPDATE plan_workouts SET name = ?, type = ?, tss = ?, "
+                    "zwo_or_segments = ?, variant = ?, adjustment_id = ?, "
+                    "adjustment_state = 'rebalanced', adjustment_source_id = ? "
+                    "WHERE user_id = ? AND id = ?",
+                    (action.get("new_name"), action.get("new_type"),
+                     action.get("new_tss"), action.get("new_zwo"),
+                     action.get("new_variant"), adjustment_id, source_id,
+                     user_id, target_id),
+                )
+            else:
+                conn.execute(
+                    "UPDATE plan_workouts SET adjustment_id = ?, "
+                    "adjustment_state = 'ooto_canceled' "
+                    "WHERE user_id = ? AND id = ?",
+                    (adjustment_id, user_id, source_id),
+                )
+                conn.execute(
+                    "UPDATE plan_workouts SET adjustment_id = ?, "
+                    "adjustment_state = 'displaced', "
+                    "adjustment_source_id = ? WHERE user_id = ? AND id = ?",
+                    (adjustment_id, source_id, user_id, target_id),
+                )
+                conn.execute(
+                    "INSERT INTO plan_workouts "
+                    "(plan_id, user_id, date, name, type, duration_s, tss, "
+                    "zwo_or_segments, variant, origin, export_ftp, adjustment_id, "
+                    "adjustment_state, adjustment_source_id) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'adjusted', ?, ?, "
+                    "'rescheduled', ?)" ,
+                    (source["plan_id"], user_id, target["date"], source["name"],
+                     source["type"], source["duration_s"], source["tss"],
+                     source["zwo_or_segments"], source["variant"],
+                     source["export_ftp"], adjustment_id, source_id),
+                )
+            changed += 1
+
+        # The snapshot of every row this apply overwrote rides along with the
+        # proposal, so `delete_ooto_range` can put the prescription back
+        # byte-for-byte. It doubles as the audit trail the migration comment
+        # promises: the stored JSON now holds both the before and the after.
+        if revert:
+            proposal["applied_revert"] = revert
+            conn.execute(
+                "UPDATE ooto_adjustments SET proposal_json = ? "
+                "WHERE user_id = ? AND id = ?",
+                (json.dumps(proposal, separators=(",", ":"), default=str),
+                 user_id, adjustment_id),
+            )
+        conn.execute(
+            "UPDATE ooto_adjustments SET status = 'applied', selected_option = ?, "
+            "resolved = ? WHERE user_id = ? AND id = ?",
+            (option_kind, utc_now().isoformat(timespec="seconds"),
+             user_id, adjustment_id),
+        )
+        conn.commit()
+        return {"status": "applied", "changed": changed,
+                "renamed": renamed, "selected_option": option_kind}
+    except Exception:
+        conn.rollback()
+        raise
     finally:
         conn.close()
 

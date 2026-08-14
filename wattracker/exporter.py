@@ -44,10 +44,13 @@ def plan_export_manifest(user_id: int) -> Optional[ExportManifest]:
 
     to_write: List[dict] = []
     to_remove: List[str] = []
+    write_names = set()
     for w in workouts:
+        fname = zwo.plan_filename(w["date"], w["name"])
         skip = (
             bool(w.get("completed_activity_id"))
             or db.ooto_covers(user_id, w["date"])
+            or w.get("adjustment_state") in {"ooto_canceled", "displaced"}
             # On a race day the race IS the session; reflow normally removes
             # the plan row, but a past-dated or otherwise locked row can
             # survive it, and it must still not be exported.
@@ -55,12 +58,18 @@ def plan_export_manifest(user_id: int) -> Optional[ExportManifest]:
         )
         if skip:
             # Completed rides / OOTO / race days should not linger in Zwift.
-            to_remove.append(zwo.plan_filename(w["date"], w["name"]))
+            # A confirmed reschedule may replace a displaced row with a new
+            # workout that happens to have the same filename; never remove
+            # the file that the replacement is about to write.
+            if fname not in write_names:
+                to_remove.append(fname)
         else:
+            write_names.add(fname)
             to_write.append(
                 {"date": w["date"], "name": w["name"], "zwo": w["zwo_or_segments"]}
             )
 
+    to_remove = [fname for fname in to_remove if fname not in write_names]
     return ExportManifest(
         # No "me" fallback. "me" is a valid bare folder name, so the resolver
         # takes its zwift_id branch and hands back <Workouts>/me whenever that
