@@ -628,6 +628,34 @@ def test_quitting_releases_the_trainer_even_mid_ride(tmp_path):
     assert rig.state.conn is None
     assert rig.trainer.calls == [("disable", None)]
     assert rig.state.buffer.load() is not None   # kept, for the next start
+    # And the tray is told it is over. "Not connected" and "not connected and
+    # never again" want different icons, and only this says which one this is.
+    assert connector.status.stopped is True
+
+
+def test_being_displaced_leaves_a_reason_a_rider_can_act_on(tmp_path, monkeypatch):
+    """The one stop that is nobody's decision and needs explaining.
+
+    ``run_forever`` deliberately does not reconnect when another connector
+    takes the account over. The close frame says "4409", the log says the rest,
+    and the tray has no log to read - so the sentence it will show has to be
+    left somewhere it can find.
+    """
+    from wattracker_connector import client as clientmod
+
+    rig = _Rig(1, tmp_path)
+    connector = _connector(tmp_path, rig)
+
+    async def _displaced():
+        raise clientmod._Replaced("sent 4409 (private) keepalive ping timeout")
+
+    monkeypatch.setattr(connector, "_session", _displaced)
+    _run(connector.run_forever())
+
+    assert connector.status.connected is False
+    assert connector.status.stopped is True
+    assert "Only one connector may run per account" in connector.status.stopped_reason
+    assert "4409" not in connector.status.stopped_reason
 
 
 def test_an_unattended_ride_ends_itself_once_the_rider_stops(

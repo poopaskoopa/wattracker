@@ -169,12 +169,54 @@ def _read_exactly(conn, count: int):
 
 
 # ------------------------------------------------------------------ the checks
+def _terminate_tree(process) -> None:
+    """End the process *and its children*, and wait for them.
+
+    A onefile build is two processes: the bootloader that unpacked the payload
+    into %TEMP%\\_MEIxxxx, and the child it started to actually run the
+    connector. Terminating the parent leaves the child alive, still holding the
+    log file, the socket and the temporary directory this script is about to
+    delete - and still holding the pipes, so anything waiting to read them
+    waits forever. taskkill /T is what covers the pair.
+    """
+    subprocess.run(
+        ["taskkill", "/F", "/T", "/PID", str(process.pid)],
+        capture_output=True, text=True,
+    )
+    try:
+        process.wait(timeout=30)
+    except subprocess.TimeoutExpired:
+        process.kill()
+
+
 def _run(executable, args, config_dir, timeout=60):
+    """Run the binary to completion, and turn a hang into a failure.
+
+    Not ``subprocess.run(timeout=...)``: that kills the process it started and
+    then goes on waiting for pipes the surviving child still holds, so a
+    connector that hangs hangs this script too, silently and without output.
+    That is not hypothetical - a ``console=False`` build reports an unhandled
+    exception in a modal dialog, on a machine where by definition nobody is
+    looking at the screen.
+    """
     environment = dict(os.environ)
     environment["WATTRACKER_CONNECTOR_DIR"] = str(config_dir)
-    return subprocess.run(
-        [executable, *args], capture_output=True, text=True,
-        timeout=timeout, env=environment,
+    process = subprocess.Popen(
+        [executable, *args], stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        text=True, env=environment,
+    )
+    try:
+        stdout, stderr = process.communicate(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        _terminate_tree(process)
+        stdout, stderr = process.communicate(timeout=30)
+        stderr = (stderr or "") + (
+            f"\n[smoke] it was still running after {timeout}s and was killed. "
+            "A windowed build with nothing on stdout is usually a fatal-error "
+            "dialog waiting for a click nobody is there to give it."
+        )
+    return subprocess.CompletedProcess(
+        [executable, *args], process.returncode, stdout, stderr
     )
 
 
@@ -219,11 +261,9 @@ def check_connects_and_answers(executable, config_dir) -> bool:
     try:
         server.join(timeout=60)
     finally:
-        process.terminate()
-        try:
-            process.wait(timeout=30)
-        except subprocess.TimeoutExpired:
-            process.kill()
+        # The tree, not the process: the survivor of a half-killed onefile
+        # build keeps the log file open, and this directory is deleted next.
+        _terminate_tree(process)
 
     if server.error is not None:
         print(f"FAIL: stub server errored: {server.error!r}")

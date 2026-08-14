@@ -183,3 +183,65 @@ def test_the_buffered_ride_upload_does_not_follow_redirects(tmp_path):
     # A 3xx is not a definite answer, so the ride is still there for next time.
     assert result is None
     assert store.load() is not None
+
+
+# ----------------------------------------------------- what a session records
+def test_a_connection_records_the_moment_it_started(monkeypatch):
+    """The tray's "Since 14:32" line, and the only place it is ever written.
+
+    ConnectorStatus is the connector's whole public face - one thread writes
+    it, another draws it - so a field nobody fills is a menu line that reads
+    "Since ?" forever, on a machine with no console to ask instead.
+    """
+    import asyncio
+    import json
+
+    from wattracker import rpc
+    from wattracker_connector import client as clientmod
+    from wattracker_connector.handlers import ConnectorConfig
+
+    monkeypatch.setattr(clientmod, "upload_pending", lambda *a, **k: None)
+    connector = clientmod.Connector(
+        server_url="http://server.invalid:8000", token="t",
+        config=ConnectorConfig(activities_dir=None, workouts_dir=None),
+    )
+    during = {}
+
+    class _Connection:
+        greeted = False
+
+        async def send(self, text):
+            pass
+
+        async def recv(self):
+            if not self.greeted:
+                self.greeted = True
+                return json.dumps(
+                    {"event": "hello", "protocol": rpc.PROTOCOL_VERSION}
+                )
+            during["connected"] = connector.status.connected
+            during["since"] = connector.status.last_connected_at
+            raise RuntimeError("the socket went away")
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *exc):
+            return False
+
+    class _Websockets:
+        def connect(self, url, **kwargs):
+            return _Connection()
+
+    with pytest.raises(RuntimeError):
+        asyncio.run(
+            connector._connected_session(_Websockets(), "ws://host:8000/connector/ws")
+        )
+
+    assert during["connected"] is True
+    assert during["since"], "nothing recorded when the connection came up"
+    # An ISO local timestamp: the tray shows the time out of it and nothing else.
+    assert during["since"][:2] == "20" and "T" in during["since"]
+    # And the session ending puts it back, without losing when it started.
+    assert connector.status.connected is False
+    assert connector.status.last_connected_at == during["since"]

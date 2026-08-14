@@ -120,7 +120,10 @@ def _version_resource():
 
 
 a = Analysis(
-    [str(root / "wattracker_connector" / "__main__.py")],
+    # The entry script, never the package's own __main__.py: PyInstaller runs
+    # it as a top-level module with no package, and every relative import in
+    # it fails on the first line. See the entry script's own docstring.
+    [str(root / "packaging" / "wattracker_connector_entry.py")],
     pathex=[str(root)],
     binaries=[],
     datas=[

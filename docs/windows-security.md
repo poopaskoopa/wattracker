@@ -185,6 +185,28 @@ entirely (`tests/test_windows_installer.py` asserts `wattracker.iss` never
 mentions one), so autostart lives in the connector at runtime and the installer
 is untouched.
 
+One qualification to "writes only when toggled": every launch of the packaged
+executable checks whether an entry that already exists still names the file
+now running, and repoints it if not (`autostart.refresh`). It never creates
+one, never touches the key for a rider who has not opted in, and a connector
+running from a Python environment leaves the value alone entirely. Without it,
+moving the exe out of Downloads silently disables autostart — a failure with
+nothing to see anywhere.
+
+Only one connector runs per logon session, held by a `Local\`-scoped named
+mutex; a second launch tells the running icon and exits. `Local\` rather than
+`Global\` on purpose: two riders signed in to one machine are two riders with
+two trainers, and a machine-wide mutex would let either of them deny the other
+a connector. This is distinct from the server's one-connector-per-*account*
+rule, which is enforced at the other end and surfaces in the tray as a stopped
+icon explaining that another connector took the account over.
+
+The window's WebView2 profile is pointed at the connector's own config
+directory (`WEBVIEW2_USER_DATA_FOLDER`), which is already created owner-only.
+The default would be a folder beside the executable — which for a single
+portable file means browser profile data appearing wherever the rider dropped
+it, including a USB stick.
+
 Autostart is also what makes the trust-boundary work above load-bearing rather
 than theoretical: an unattended connector holds a token across reboots until
 somebody revokes it, so revocation closing the live socket — not merely the
