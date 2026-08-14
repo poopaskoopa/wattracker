@@ -3697,6 +3697,43 @@ def _adjustment_fingerprint(row: sqlite3.Row) -> str:
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
 
+# The rebalance dose rules, re-stated here so the WRITE side enforces them
+# instead of trusting whatever the stored proposal says. Kept byte-identical to
+# prescribe/ooto_adjust.DOSE_STEP / HARD_TYPES; db must not import prescribe
+# (prescribe imports db), and test_ooto_adjust asserts the two never drift.
+_OOTO_DOSE_STEP = {"endurance": "tempo"}
+_OOTO_HARD_TYPES = frozenset({"vo2max", "threshold", "sweet_spot", "sprint"})
+
+
+def _ooto_action_permitted(
+    action: dict, source: sqlite3.Row, target: sqlite3.Row,
+) -> bool:
+    """Does this stored action stay inside the rules the proposal promised?
+
+    The fingerprints prove the ROWS have not changed since the proposal was
+    built; they prove nothing about the proposal itself. Everything the apply
+    is about to write is therefore re-derived from the stored rows here rather
+    than taken on trust, so a proposal that has been tampered with cannot write
+    something ``evaluate_ooto`` would never have produced - a rebalance that
+    turns an endurance ride into a vo2max session, or a reschedule that grows
+    the target week past its budget.
+    """
+    if str(action.get("mode") or "reschedule") == "rebalance":
+        expected = _OOTO_DOSE_STEP.get(str(target["type"] or "").lower())
+        return (
+            expected is not None
+            and expected not in _OOTO_HARD_TYPES
+            and action.get("new_type") == expected
+            and action.get("new_variant") == "classic"
+            and int(action.get("duration_s") or 0) == int(target["duration_s"])
+        )
+    # Reschedule keeps the moved session's own duration, so the target week
+    # changes by (source - target). Anything positive would grow a week past
+    # hours_per_week * 60 - the invariant `_compatible` protects at proposal
+    # time and this protects at write time.
+    return int(source["duration_s"]) <= int(target["duration_s"])
+
+
 _REVERT_KEYS = ("name", "type", "duration_s", "tss", "zwo_or_segments",
                 "variant", "export_ftp", "origin")
 
@@ -3922,6 +3959,9 @@ def apply_ooto_adjustment(
                 )
                 conn.commit()
                 return {"status": "stale"}
+            if not _ooto_action_permitted(action, source, target):
+                conn.rollback()
+                return {"status": "invalid_proposal"}
 
         changed = 0
         revert: List[dict] = []
@@ -3937,10 +3977,8 @@ def apply_ooto_adjustment(
                 # exactly where it is (the OOTO range already keeps it out of
                 # the export) and only the surviving easy day's DOSE changes.
                 # duration_s is deliberately absent from this UPDATE - weekly
-                # minutes must come out identical.
-                if int(action.get("duration_s") or 0) != int(target["duration_s"]):
-                    conn.rollback()
-                    return {"status": "invalid_proposal"}
+                # minutes must come out identical. The validation pass above
+                # has already refused any action that disagreed about it.
                 revert.append(_revert_snapshot(target))
                 if action.get("new_name") != target["name"]:
                     # The .zwo is named after date+name, so a re-dosed session
