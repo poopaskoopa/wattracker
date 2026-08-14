@@ -79,6 +79,7 @@ from .prescribe import present
 from .prescribe import reflow
 from .prescribe import zwo
 from .prescribe import llm
+from .prescribe import ooto_adjust
 from .prescribe.planner import (
     JUST_RIDE_DURATIONS,
     WORKOUT_TYPE_INFO,
@@ -327,6 +328,56 @@ def _upcoming_monday(today: Optional[_dt.date] = None) -> _dt.date:
     today = today or utc_today()
     delta = (0 - today.weekday()) % 7  # 0 if today is Monday, else days to next Monday
     return today + _dt.timedelta(days=delta)
+
+
+def _ooto_proposal_for(
+    user_id: int, plan: dict, ooto: dict, today: Optional[_dt.date] = None,
+) -> dict:
+    """Evaluate one OOTO range against the active plan without mutating it."""
+    phase_by_date = goalsmod.phase_by_date(
+        plan["start_date"], plan["weeks"],
+        (plan.get("recipe") or {}).get("goal"),
+    )
+    return ooto_adjust.evaluate_ooto(
+        plan,
+        db.plan_workouts_for_plan(user_id, plan["id"], include_zwo=True),
+        ooto["start_date"], ooto["end_date"],
+        (today or utc_today()).isoformat(),
+        phase_by_date=phase_by_date,
+        race_dates=db.list_race_dates(user_id),
+        window_days=14,
+    )
+
+
+def _ooto_adjustment_view(adjustment: Optional[dict]) -> Optional[dict]:
+    """Add stable, rider-facing labels to a stored proposal."""
+    if not adjustment:
+        return None
+    out = dict(adjustment)
+    proposal = dict(adjustment.get("proposal") or {})
+    out["affected"] = proposal.get("affected") or []
+    labels = {
+        "skip": "Keep the workouts skipped",
+        "reschedule": "Reschedule key workouts",
+        "rebalance": "Modify remaining workouts",
+    }
+    options = []
+    for raw in proposal.get("options") or []:
+        option = dict(raw)
+        kind = str(option.get("kind") or "")
+        actions = [dict(action) for action in (option.get("actions") or [])]
+        option["label"] = labels.get(kind, kind.replace("_", " ").title())
+        option["actions"] = actions
+        option["summary"] = (
+            "No replacement workouts."
+            if not actions else
+            f"{len(actions)} key workout{'s' if len(actions) != 1 else ''} "
+            "affected."
+        )
+        options.append(option)
+    proposal["options"] = options
+    out["proposal"] = proposal
+    return out
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
 _TEMPLATES_DIR = os.path.join(_HERE, "web", "templates")
@@ -2844,6 +2895,7 @@ def create_app() -> FastAPI:
         request: Request,
         year: Optional[int] = None,
         month: Optional[int] = None,
+        adjustment_id: Optional[int] = None,
     ):
         uid = _uid(request)
         today = utc_today()
@@ -2885,7 +2937,18 @@ def create_app() -> FastAPI:
         by_date: dict = {}
         for w in db.plan_workouts_for_month(uid, y, m):
             wd = dict(w)
-            wd["skipped"] = _in_ooto(w["date"]) and not w.get("completed_activity_id")
+            adjustment_state = w.get("adjustment_state")
+            wd["adjustment_cancelled"] = adjustment_state in {
+                "ooto_canceled", "displaced",
+            }
+            wd["adjustment_replacement"] = adjustment_state in {
+                "rescheduled", "modified",
+            }
+            wd["skipped"] = (
+                _in_ooto(w["date"])
+                and not w.get("completed_activity_id")
+                and adjustment_state != "modified"
+            )
             # Missed: a past-dated workout left uncompleted that wasn't an
             # out-of-office skip (i.e. its day passed without completion).
             wd["missed"] = (
@@ -2912,6 +2975,15 @@ def create_app() -> FastAPI:
         # cell can say "build" rather than leaving the rider to count weeks.
         # Empty for a plan with no goal, which is every plan that predates them.
         active = db.get_active_plan(uid) if uid is not None else None
+        adjustment = None
+        if adjustment_id is not None:
+            adjustment = db.get_ooto_adjustment(uid, adjustment_id)
+            if adjustment and adjustment.get("status") != "pending":
+                adjustment = None
+        if adjustment is None:
+            pending = db.list_pending_ooto_adjustments(uid)
+            if pending:
+                adjustment = pending[0]
         phase_by_date = {}
         if active is not None:
             phase_by_date = goalsmod.phase_by_date(
@@ -2962,6 +3034,7 @@ def create_app() -> FastAPI:
                 # behind their back, so it is surfaced until dismissed.
                 reflow_notice=(active or {}).get("reflow_notice"),
                 reflow_notice_plan_id=(active or {}).get("id"),
+                ooto_adjustment=_ooto_adjustment_view(adjustment),
             ),
         )
 
@@ -3036,12 +3109,38 @@ def create_app() -> FastAPI:
             try:
                 _dt.date.fromisoformat(start)
                 _dt.date.fromisoformat(end)
-                db.add_ooto_range(uid, start, end, note.strip() or None)
+                ooto_id = db.add_ooto_range(uid, start, end, note.strip() or None)
+                adjustment_id = None
+                plan = db.get_active_plan(uid)
+                if plan is not None:
+                    ooto = next(
+                        (row for row in db.list_ooto_ranges(uid)
+                         if row["id"] == ooto_id),
+                        None,
+                    )
+                    if ooto is not None:
+                        try:
+                            proposal = _ooto_proposal_for(uid, plan, ooto)
+                            if proposal.get("affected"):
+                                adjustment_id = db.create_ooto_adjustment(
+                                    uid, plan["id"], ooto_id,
+                                    ooto["start_date"], ooto["end_date"], proposal,
+                                )
+                        except Exception:
+                            _log.warning(
+                                "OOTO adjustment proposal failed for user %s",
+                                uid, exc_info=True,
+                            )
                 # Keep the Zwift folder in sync (drop newly-skipped .zwo).
                 try:
                     exporter.sync_plan_exports(uid)
                 except Exception:
                     _log.warning("export sync after OOTO add failed", exc_info=True)
+                if adjustment_id is not None:
+                    return RedirectResponse(
+                        url=f"/calendar?adjustment_id={adjustment_id}",
+                        status_code=303,
+                    )
             except ValueError:
                 pass
         return RedirectResponse(url="/calendar", status_code=303)
@@ -3055,6 +3154,42 @@ def create_app() -> FastAPI:
         except Exception:
             _log.warning("export sync after OOTO delete failed", exc_info=True)
         return RedirectResponse(url="/calendar", status_code=303)
+
+    @app.post("/ooto-adjustment/{adjustment_id}/confirm")
+    def ooto_adjustment_confirm(
+        request: Request, adjustment_id: int, option: str = Form(...),
+    ):
+        uid = _uid(request)
+        result = db.apply_ooto_adjustment(
+            uid, adjustment_id, option, now=utc_today()
+        )
+        if result.get("status") == "applied":
+            try:
+                exporter.sync_plan_exports(uid)
+            except Exception:
+                _log.warning(
+                    "export sync after OOTO adjustment failed", exc_info=True
+                )
+            flash = "OOTO adjustment applied."
+        elif result.get("status") == "stale":
+            flash = "That OOTO adjustment is stale; the plan changed underneath it."
+        elif result.get("status") == "already_applied":
+            flash = "That OOTO adjustment was already applied."
+        else:
+            flash = "The OOTO adjustment could not be applied."
+        return RedirectResponse(
+            url="/calendar?flash=" + _url.quote(flash), status_code=303
+        )
+
+    @app.post("/ooto-adjustment/{adjustment_id}/dismiss")
+    def ooto_adjustment_dismiss(request: Request, adjustment_id: int):
+        uid = _uid(request)
+        db.set_ooto_adjustment_status(uid, adjustment_id, "dismissed")
+        return RedirectResponse(
+            url="/calendar?flash="
+            + _url.quote("OOTO workouts will remain skipped."),
+            status_code=303,
+        )
 
     # ------------------------------------------------------------- races
     def _reflow_for_races(uid: int, lead: str = "Race saved.") -> str:
