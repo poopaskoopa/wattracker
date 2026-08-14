@@ -245,3 +245,34 @@ def test_a_connection_records_the_moment_it_started(monkeypatch):
     # And the session ending puts it back, without losing when it started.
     assert connector.status.connected is False
     assert connector.status.last_connected_at == during["since"]
+
+
+def test_no_test_can_write_into_the_riders_own_connector_directory():
+    """The sandbox that redirecting HOME does not give you.
+
+    ``config_dir`` reads LOCALAPPDATA on Windows, so the suite's HOME redirect
+    misses it entirely and anything the connector stores - the saved token, the
+    log, and above all the ride buffer - lands in the real directory. A ride
+    buffer left there is not inert: the next real connect uploads it as the
+    rider's ride. Asserted here rather than trusted, because the failure is
+    invisible on the platform CI runs on.
+    """
+    import os
+
+    from wattracker_connector import config as connector_config
+
+    directory = connector_config.config_dir()
+    assert os.environ.get("WATTRACKER_CONNECTOR_DIR"), (
+        "tests/conftest.py must sandbox the connector directory for every test"
+    )
+    assert directory == os.environ["WATTRACKER_CONNECTOR_DIR"]
+    # Not "is it under LOCALAPPDATA" - pytest's tmp_path lives there too, and
+    # that assertion would fail a correctly sandboxed run. The question is
+    # whether it is *the* directory a rider's connector uses.
+    if os.name == "nt":
+        root = os.environ.get("LOCALAPPDATA") or os.path.expanduser("~")
+    else:
+        root = os.environ.get("XDG_CONFIG_HOME") or os.path.join(
+            os.path.expanduser("~"), ".config"
+        )
+    assert directory != os.path.join(root, "wattracker-connector")

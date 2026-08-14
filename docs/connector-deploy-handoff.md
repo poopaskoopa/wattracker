@@ -42,13 +42,23 @@ py -m venv .venv
 .venv\Scripts\python -m pytest -q      # never piped: a pipe reports its own exit status
 ```
 
-**Expect 3 failures on Windows, none of them a defect.** Two are
+**Expect 2 failures on Windows, neither of them a defect.** Both are
 `WinError 1314` — `test_paths_windows.py::test_workouts_override_symlink_escape_is_refused`
 and `test_install_bootstrap.py::test_without_lsof_hides_lsof_but_keeps_bash_on_usrmerge_layout`
-both create symlinks, which needs Developer Mode. The third is one of the
-ride-WebSocket tests, which is contention-flaky under parallel load and passes
-on its own; re-run before believing it. The run takes about seven minutes and
-was 2291 passed / 45 skipped on 2026-08-14.
+create symlinks, which needs Developer Mode. The run takes about six minutes
+and was 2294 passed / 45 skipped on 2026-08-14.
+
+Two things about the suite changed that day and are worth knowing before you
+trust a result. `tests/conftest.py` now sandboxes `WATTRACKER_CONNECTOR_DIR`
+for every test: redirecting HOME does not move the connector's directory on
+Windows, where `config_dir` reads `LOCALAPPDATA`, so the ride tests were
+writing a `ride-buffer.jsonl` into the rider's real directory - which the next
+real connect would have uploaded as their ride. And
+`test_ride_ws_erg_action_reports_unavailable_without_trainer` was not
+"contention-flaky under parallel load", it failed roughly two runs in three on
+its own: a zero `RIDE_POLL_INTERVAL_S` against a ride pinned at 0 W spends the
+whole 300 s idle budget in milliseconds. Both are fixed; both were invisible on
+POSIX CI.
 
 Build and check the artifact:
 
