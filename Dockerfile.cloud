@@ -1,0 +1,45 @@
+# Cloud-sync deployment image. Keep this separate from Dockerfile: the local
+# server image must stay small, while the cloud runtime needs the Azure SDK
+# extra explicitly installed.
+
+FROM python:3.12-slim AS builder
+
+ENV PIP_DISABLE_PIP_VERSION_CHECK=1 \
+    PIP_NO_CACHE_DIR=1
+
+WORKDIR /build
+
+COPY pyproject.toml README.md ./
+COPY wattracker ./wattracker
+COPY wattracker_connector ./wattracker_connector
+
+RUN python -m venv /opt/venv \
+    && /opt/venv/bin/pip install --upgrade pip \
+    && /opt/venv/bin/pip install ".[cloud]"
+
+FROM python:3.12-slim AS runtime
+
+RUN apt-get update \
+    && apt-get install --no-install-recommends -y tini \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN useradd --create-home --uid 10001 wattracker
+
+COPY --from=builder /opt/venv /opt/venv
+
+ENV PATH="/opt/venv/bin:$PATH" \
+    PYTHONUNBUFFERED=1 \
+    WATTRACKER_CLOUD_HOST=0.0.0.0 \
+    WATTRACKER_CLOUD_PORT=8000
+
+USER wattracker
+WORKDIR /home/wattracker
+EXPOSE 8000
+
+# This checks the cloud extra at container health-check time without requiring
+# credentials or a live Azure storage account.
+HEALTHCHECK --interval=30s --timeout=5s --start-period=20s --retries=3 \
+    CMD python -c "import wattracker.cloud.runtime" || exit 1
+
+ENTRYPOINT ["/usr/bin/tini", "--"]
+CMD ["python", "-m", "wattracker.cloud.runtime"]

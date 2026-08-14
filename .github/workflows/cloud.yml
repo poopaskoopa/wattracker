@@ -1,0 +1,50 @@
+name: Cloud
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  cloud:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install cloud and development dependencies
+        run: python -m pip install --disable-pip-version-check -e ".[dev,cloud]"
+
+      - name: Verify cloud imports
+        run: |
+          python -c "import azure.data.tables, azure.identity, azure.storage.blob, cryptography"
+          python -c "import wattracker.cloud.runtime"
+
+      - name: Run full test suite
+        env:
+          PYTHONPATH: ${{ github.workspace }}
+        run: python -m pytest -q
+
+      - name: Validate Bicep
+        uses: azure/cli@v2
+        with:
+          inlineScript: az bicep build --file infra/azure/main.bicep
+
+      - name: Build cloud image
+        run: docker build --file Dockerfile.cloud --tag wattracker-cloud:ci .
+
+      - name: Verify cloud imports in image
+        run: >-
+          docker run --rm --entrypoint python wattracker-cloud:ci
+          -c "import azure.data.tables, azure.identity, azure.storage.blob, cryptography; import wattracker.cloud.runtime"
