@@ -43,7 +43,11 @@
                 {% if option.actions %}
                 <span class="ooto-adjustment-actions">
                     {% for action in option.actions %}
+                    {% if action.mode == 'rebalance' %}
+                    {{ action.target_date }} &rarr; {{ action.new_name }} ({{ (action.duration_s // 60) }} min, unchanged){% if not loop.last %}; {% endif %}
+                    {% else %}
                     {{ action.source_date }} &rarr; {{ action.target_date }}{% if not loop.last %}; {% endif %}
+                    {% endif %}
                     {% endfor %}
                 </span>
                 {% endif %}
