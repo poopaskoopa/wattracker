@@ -252,6 +252,72 @@ def test_reflow_leaves_a_live_adjustment_alone(rider):
     assert len(_rows(uid, plan_id)) == len(after)
 
 
+# ------------------------------------------- the apply re-derives the rules
+
+def _store(uid, plan_id, ooto_id, proposal):
+    return db.create_ooto_adjustment(
+        uid, plan_id, ooto_id, "2026-08-09", "2026-08-16", proposal,
+    )
+
+
+def test_apply_refuses_a_dose_step_the_rules_do_not_allow(rider):
+    """Fingerprints prove the ROWS are unchanged, not that the plan is sane.
+
+    A tampered proposal must not be able to write something `evaluate_ooto`
+    would never produce - here, turning an endurance ride into a vo2max
+    session, straight through the "never a hard type" cap.
+    """
+    uid, plan_id = rider
+    ooto_id = db.add_ooto_range(uid, "2026-08-09", "2026-08-16")
+    proposal = _evaluate(uid, plan_id)
+    rebalance = _option(proposal, "rebalance")
+    assert rebalance["actions"]  # there is something to tamper with
+    for action in rebalance["actions"]:
+        action["new_type"] = "vo2max"
+
+    adjustment_id = _store(uid, plan_id, ooto_id, proposal)
+    before = _rows(uid, plan_id)
+    result = db.apply_ooto_adjustment(
+        uid, adjustment_id, "rebalance", now=dt.date(2026, 8, 1),
+    )
+    assert result["status"] == "invalid_proposal"
+    assert _rows(uid, plan_id) == before
+    assert db.get_ooto_adjustment(uid, adjustment_id)["status"] == "pending"
+
+
+def test_apply_refuses_a_move_that_would_grow_the_target_week(rider):
+    """The `source <= target` gate is re-derived at write time, not trusted."""
+    uid, plan_id = rider
+    ooto_id = db.add_ooto_range(uid, "2026-08-09", "2026-08-16")
+    rows = _rows(uid, plan_id)
+    # A 7800 s sweet spot onto a 4020 s easy day: +3780 s on the target week.
+    source = next(r for r in rows if r["date"] == "2026-08-10")
+    target = next(r for r in rows if r["date"] == "2026-08-24")
+    assert source["duration_s"] > target["duration_s"]
+    proposal = {
+        "version": ooto_adjust.VERSION, "affected": [],
+        "options": [{"kind": "reschedule", "affected_keys": 1,
+                     "resolved_keys": 1, "unresolved": [],
+                     "volume_delta_s": 0, "rationale": "",
+                     "actions": [ooto_adjust._action(source, target,
+                                                     "reschedule")]}],
+        "recommended_option": "reschedule", "rationale": "",
+    }
+    adjustment_id = _store(uid, plan_id, ooto_id, proposal)
+    before = _rows(uid, plan_id)
+    result = db.apply_ooto_adjustment(
+        uid, adjustment_id, "reschedule", now=dt.date(2026, 8, 1),
+    )
+    assert result["status"] == "invalid_proposal"
+    assert _rows(uid, plan_id) == before
+
+
+def test_the_write_side_dose_rules_match_the_proposal_side():
+    """db restates these rules because it must not import prescribe."""
+    assert db._OOTO_DOSE_STEP == ooto_adjust.DOSE_STEP
+    assert db._OOTO_HARD_TYPES == ooto_adjust.HARD_TYPES
+
+
 # ------------------------------------------------------------ export folder
 
 def _folder(directory):
