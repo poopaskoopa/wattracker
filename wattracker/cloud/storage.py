@@ -367,6 +367,13 @@ class AzureTenantStore:
             # Injected test doubles do not need an Azure lease implementation.
             yield
             return
+        if not (
+            hasattr(lock_blob, "blob_name") or hasattr(lock_blob, "container_name")
+        ):
+            # A storage-protocol test double is intentionally not an SDK
+            # BlobClient. Real Azure clients expose one of these coordinates.
+            yield
+            return
         lease = BlobLeaseClient(lock_blob)
         lease.acquire(lease_duration=60)
         try:

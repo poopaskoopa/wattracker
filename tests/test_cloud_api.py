@@ -61,6 +61,24 @@ def _headers(
     }
 
 
+def _status_headers(writer, *, nonce="status-nonce", revision=0,
+                    idem="status-1", timestamp=1_000):
+    canonical = canonical_request(
+        "GET", "/api/v1/sync/status", writer.namespace, timestamp, nonce,
+        digest_body(b""), idem, str(revision),
+    )
+    return {
+        "Ocp-Apim-Subscription-Key": writer.subscription_key.decode(),
+        "X-APIM-Client-Certificate-Verified": "true",
+        "X-Writer-Credential": writer.credential_id,
+        "X-Writer-Timestamp": str(timestamp),
+        "X-Writer-Nonce": nonce,
+        "X-Writer-Idempotency-Key": idem,
+        "X-Writer-Revision": str(revision),
+        "X-Writer-Signature": sign_request(writer.signing_key, canonical),
+    }
+
+
 def _batch(*, installation_id="caller-selected", scope="caller-selected", revision=1,
            batch_id=None):
     return json.dumps({
@@ -146,6 +164,23 @@ def test_signature_tampering_replay_and_stale_revision_are_rejected(cloud):
     stale_body = _batch(revision=1, batch_id="batch-stale")
     stale = _headers(writer, stale_body, nonce="three", revision=1, idem="batch-stale")
     assert client.post("/api/v1/sync/batches", headers=stale, content=stale_body).status_code == 409
+
+
+def test_status_requires_a_signed_writer_request_and_rejects_replay(cloud):
+    _config, state, client = cloud
+    writer = _writer(state, b"s")
+    unsigned = {
+        "X-Writer-Credential": writer.credential_id,
+        "Ocp-Apim-Subscription-Key": writer.subscription_key.decode(),
+    }
+    assert client.get("/api/v1/sync/status", headers=unsigned).status_code == 401
+
+    headers = _status_headers(writer)
+    assert client.get("/api/v1/sync/status", headers=headers).status_code == 200
+    tampered = dict(headers)
+    tampered["X-Writer-Signature"] = "0" * 64
+    assert client.get("/api/v1/sync/status", headers=tampered).status_code == 401
+    assert client.get("/api/v1/sync/status", headers=headers).status_code == 401
 
 
 def test_replay_pruning_uses_server_clock_for_writers_at_window_edges(cloud):
@@ -442,7 +477,8 @@ def test_read_enrollment_is_usable_by_restarted_sync_and_read_planes():
         )
     assert completed.status_code == 200
     enrolled = completed.json()
-    assert enrolled["subscription_key"] == "apim-subscription"
+    assert enrolled["subscription_key"]
+    assert enrolled["subscription_key"] != "apim-subscription"
 
     sync_config = CloudConfig(
         server_secret=SECRET,
@@ -453,14 +489,31 @@ def test_read_enrollment_is_usable_by_restarted_sync_and_read_planes():
     )
     sync_state = CloudState.create(sync_config, security_backend=backend)
     writer = sync_state.credentials.authenticate_writer(
-        enrolled["credential"], "apim-subscription"
+        enrolled["credential"], enrolled["subscription_key"]
     )
     assert writer is not None
+    assert writer.signature_algorithm == "ed25519"
+    body = _batch(revision=1, batch_id="restart-batch")
     canonical = canonical_request(
         "POST", "/api/v1/sync/batches", writer.namespace, 1_000, "restart",
-        digest_body(b"{}"), "batch-1", "1",
+        digest_body(body), "restart-batch", "1",
     )
-    assert sign_request_ed25519(private_key, canonical)
+    headers = {
+        "Ocp-Apim-Subscription-Key": enrolled["subscription_key"],
+        "X-APIM-Client-Certificate-Verified": "true",
+        "X-Writer-Credential": enrolled["credential"],
+        "X-Writer-Timestamp": "1000",
+        "X-Writer-Nonce": "restart",
+        "X-Writer-Idempotency-Key": "restart-batch",
+        "X-Writer-Revision": "1",
+        "X-Writer-Signature": sign_request_ed25519(private_key, canonical),
+    }
+    with TestClient(create_cloud_app(sync_config, state=sync_state)) as sync_client:
+        uploaded = sync_client.post(
+            "/api/v1/sync/batches", headers=headers, content=body
+        )
+    assert uploaded.status_code == 200, uploaded.text
+    assert uploaded.json() == {"accepted": 1, "revision": 1, "replayed": False}
 
     restarted_read = CloudState.create(read_config, security_backend=backend)
     assert restarted_read.credentials.resolve_reader(

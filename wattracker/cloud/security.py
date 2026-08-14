@@ -881,11 +881,10 @@ class EnrollmentRegistry:
     def consume(
         self,
         token: str,
-        public_key: bytes | None = None,
         subject: str | None = None,
         *,
         now: float | None = None,
-    ) -> WriterCredential | InvitationBinding | None:
+    ) -> InvitationBinding | None:
         if not isinstance(token, str) or not token or len(token) > 512:
             return None
         current = self._clock() if now is None else float(now)
@@ -923,21 +922,6 @@ class EnrollmentRegistry:
                     record.subject.encode("utf-8"), supplied_subject.encode("utf-8")
                 ):
                     return None
-            if public_key is not None:
-                try:
-                    key = _require_bytes(public_key, "public_key")
-                    subject_text = _require_text(subject, "subject")
-                except ValueError:
-                    return None
-                if record.subject is not None and not hmac.compare_digest(
-                    record.subject.encode("utf-8"), subject_text.encode("utf-8")
-                ):
-                    return None
-                if record.subject is None:
-                    subject_text = subject_text
-            else:
-                key = None
-                subject_text = record.subject
             if self._backend is not None:
                 consumed = self._backend.consume(
                     "invitation", found_digest.hex(), now=current
@@ -946,16 +930,6 @@ class EnrollmentRegistry:
                     return None
             if self._backend is None:
                 del self._records[found_digest]
-            if key is not None:
-                return WriterCredential(
-                    credential_id=_new_id(),
-                    namespace=record.namespace,
-                    local_user_scope=record.local_user_scope,
-                    verification_key=key,
-                    subscription_key=secrets.token_hex(_ID_BYTES).encode("ascii"),
-                    signature_algorithm="hmac-sha256",
-                    subject=subject_text,
-                )
             proof = hmac.new(
                 self._binding_secret,
                 record.invitation_id.encode("ascii")

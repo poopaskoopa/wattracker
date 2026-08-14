@@ -18,8 +18,9 @@ integration in the same VNet. Managed identities, private Blob/Table
 endpoints, and private DNS are required. No storage account key,
 anonymous blob URL, or public storage firewall exception is permitted.
 The authentication factors are APIM subscription plus signed writer requests
-for writes, and APIM-validated Entra JWT plus a bound reader context for reads.
-Certificate presence is not an application authentication factor.
+for writes and sync status, and APIM-validated Entra JWT plus a bound reader
+context for reads. Certificate presence is not an application authentication
+factor.
 
 ## Public routes and controls
 
@@ -30,6 +31,8 @@ contract covers `POST /api/v1/enrollment/start`,
 `GET /api/v1/context/activities/{id}`, `GET /api/v1/context/races`,
 `GET /api/v1/sync/status`, and `POST /api/v1/sync/batches`. Enrollment and
 pairing validate tenant, user/device binding, expiry, nonce, and replay state.
+Enrollment returns a server-generated writer subscription key; the caller's
+APIM subscription key is never reused as the writer credential.
 APIM applies an allow-listed CORS origin, 60 requests/minute and 1,000
 requests/day per subscription. Set the deployment kill switch to return 503
 before emergency maintenance.

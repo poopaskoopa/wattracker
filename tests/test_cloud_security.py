@@ -121,13 +121,15 @@ def test_invitations_expire_are_single_use_and_invalid_tokens_are_indistinguisha
     invitation = registry.create(installation_id, "local-scope", "subject", now=100)
     assert invitation.installation_id == installation_id
     assert invitation.expires_at == 110
-    credential = registry.consume(invitation.token, b"public-key", "subject", now=100)
-    assert credential is not None
-    assert credential.namespace == _namespace()
-    assert registry.consume(invitation.token, b"public-key", "subject", now=100) is None
+    binding = registry.consume(invitation.token, subject="subject", now=100)
+    assert binding is not None
+    assert binding.namespace == _namespace()
+    assert registry.consume(invitation.token, subject="subject", now=100) is None
     expired = registry.create(installation_id, "local-scope", "subject", now=100)
-    assert registry.consume(expired.token, b"public-key", "subject", now=110) is None
-    assert registry.consume("not-a-real-token", b"public-key", "subject", now=100) is None
+    assert registry.consume(expired.token, subject="subject", now=110) is None
+    assert registry.consume("not-a-real-token", subject="subject", now=100) is None
+    with pytest.raises(TypeError):
+        registry.consume(invitation.token, public_key=b"public-key", subject="subject")
 
 
 def test_invitation_token_is_opaque_and_registry_is_bounded():

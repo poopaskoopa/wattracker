@@ -54,8 +54,6 @@ param operatorToken string
 param apimProofSecret string
 @description('Built-in Storage Blob Data Reader role definition ID.')
 param blobReaderRoleDefinitionId string
-@description('Built-in Storage Table Data Contributor role definition ID.')
-param tableContributorRoleDefinitionId string
 
 var vnetName = 'wattracker-vnet'
 var envName = 'wattracker-aca-env'
@@ -172,7 +170,6 @@ resource tableZoneGroup 'Microsoft.Network/privateEndpoints/privateDnsZoneGroups
 
 resource readIdentity 'Microsoft.ManagedIdentity/userAssignedIdentities@2023-01-31' = { name: '${readName}-identity'; location: location }
 resource syncIdentity 'Microsoft.ManagedIdentity/userAssignedIdentities@2023-01-31' = { name: '${syncName}-identity'; location: location }
-resource cleanupIdentity 'Microsoft.ManagedIdentity/userAssignedIdentities@2023-01-31' = { name: 'wattracker-cleanup-identity'; location: location }
 resource appEnv 'Microsoft.App/managedEnvironments@2023-05-01' = {
   name: envName
   location: location
@@ -265,7 +262,7 @@ resource syncBlobWriterRoleDefinition 'Microsoft.Authorization/roleDefinitions@2
   name: guid(storage.id, 'wattracker-sync-blob-writer')
   properties: {
     roleName: 'Wattracker Sync Blob Writer'
-    description: 'Read and write sync objects; physical deletion is cleanup-only.'
+    description: 'Read and write sync objects; physical deletion is not granted to the sync identity.'
     type: 'CustomRole'
     permissions: [{ dataActions: [
       'Microsoft.Storage/storageAccounts/blobServices/containers/blobs/read'
@@ -280,7 +277,7 @@ resource syncTableWriterRoleDefinition 'Microsoft.Authorization/roleDefinitions@
   name: guid(storage.id, 'wattracker-sync-table-writer')
   properties: {
     roleName: 'Wattracker Sync Table Writer'
-    description: 'Read and upsert sync entities; physical deletion is cleanup-only.'
+    description: 'Read and upsert sync entities; physical deletion is not granted to the sync identity.'
     type: 'CustomRole'
     permissions: [{ dataActions: [
       'Microsoft.Storage/storageAccounts/tableServices/tables/entities/read'
@@ -365,17 +362,6 @@ resource syncReplayRole 'Microsoft.Authorization/roleAssignments@2022-04-01' = {
   scope: replayTable
   properties: { roleDefinitionId: replayWriterRoleDefinition.id; principalId: syncIdentity.properties.principalId; principalType: 'ServicePrincipal' }
 }
-resource cleanupBlobRole 'Microsoft.Authorization/roleAssignments@2022-04-01' = {
-  name: guid(storage.id, cleanupIdentity.id, 'blob-cleanup')
-  scope: objectContainer
-  properties: { roleDefinitionId: subscriptionResourceId('Microsoft.Authorization/roleDefinitions', 'ba92f5b4-2d11-453d-a403-e96b0029c9fe'); principalId: cleanupIdentity.properties.principalId; principalType: 'ServicePrincipal' }
-}
-resource cleanupTableRole 'Microsoft.Authorization/roleAssignments@2022-04-01' = {
-  name: guid(storage.id, cleanupIdentity.id, 'table-cleanup')
-  scope: objectTable
-  properties: { roleDefinitionId: subscriptionResourceId('Microsoft.Authorization/roleDefinitions', tableContributorRoleDefinitionId); principalId: cleanupIdentity.properties.principalId; principalType: 'ServicePrincipal' }
-}
-
 resource staticSite 'Microsoft.Web/staticSites@2022-09-01' = if (!empty(staticRepositoryUrl)) {
   name: staticName
   location: location

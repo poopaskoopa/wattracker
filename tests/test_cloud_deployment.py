@@ -35,3 +35,9 @@ def test_production_app_limits_are_documented_as_best_effort_and_apim_is_durable
     assert "best-effort process-local" in RUNBOOK
     assert '<quota-by-key calls="1000" renewal-period="86400"' in BICEP
     assert '<rate-limit-by-key calls="60" renewal-period="60"' in BICEP
+
+
+def test_cleanup_delete_identity_is_not_deployed_without_a_cleanup_job():
+    assert "cleanupIdentity" not in BICEP
+    assert "cleanupBlobRole" not in BICEP
+    assert "cleanupTableRole" not in BICEP
