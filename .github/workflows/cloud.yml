@@ -22,12 +22,24 @@ jobs:
       - name: Check out source
         uses: actions/checkout@v4
 
+      - name: Set up Python
+        # Required, not cosmetic. The runner's bare `python3` is macOS's own
+        # 3.9 (and 3.8 is earlier on PATH), both below this project's
+        # requires-python of 3.10. pip silently filters out every distribution
+        # whose Requires-Python excludes the interpreter, so the failure
+        # surfaces as "No matching distribution found for fastapi>=0.138.2" -
+        # a dependency floor that looks wrong but is not.
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
       - name: Create an isolated virtual environment
         # The runner's Python is the developer's Python. Build the environment
         # inside the workspace so a CI run can never mutate it.
         run: |
-          python3 -m venv .ci-venv
+          python -m venv .ci-venv
           .ci-venv/bin/python -m pip install --disable-pip-version-check --upgrade pip
+          .ci-venv/bin/python -c "import sys; assert sys.version_info >= (3, 10), sys.version; print(sys.version)"
 
       - name: Install cloud and development dependencies
         run: .ci-venv/bin/python -m pip install --disable-pip-version-check -e ".[dev,cloud]"
