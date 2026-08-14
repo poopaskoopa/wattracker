@@ -149,10 +149,17 @@ before the run and compared after; a mismatch fails the smoke test.
 `.github/workflows/macos-release.yml` mirrors `windows-release.yml`: tag-push
 only, protected `macos-code-signing` environment, full test suite, wheel smoke,
 frozen build, sign, smoke the *signed* artifact, DMG + checksum, upload. It is
-hard-disabled with `if: ${{ false }}` for exactly the same reason as every other
-job here - Actions is blocked at the account level and macOS runners are
-billable on a private repo at a 10x multiplier - so the real gate is a local
+hard-disabled with `if: ${{ false }}` for the same reason as every other
+GitHub-hosted job here: hosted minutes are exhausted, and macOS runners are
+billable on a private repo at a 10x multiplier. Actions itself is enabled - the
+constraint is billing, not access - so the real gate is a local
 `packaging/build-macos.sh`.
+
+A self-hosted runner is not billed, which is how the `Cloud` workflow's test
+job runs today. This one has not followed it because signing is the point of
+this workflow: it imports a Developer ID key into a keychain it creates and
+deletes, and a self-hosted runner would be doing that on the developer's own
+machine, next to the login keychain the script is written never to touch.
 
 The Developer ID key is imported in the workflow rather than in
 `sign-macos.sh`, into a dedicated keychain created and deleted on the runner.
