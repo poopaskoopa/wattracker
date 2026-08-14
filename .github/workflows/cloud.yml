@@ -22,35 +22,27 @@ jobs:
       - name: Check out source
         uses: actions/checkout@v4
 
-      - name: Set up Python
-        # Required, not cosmetic. The runner's bare `python3` is macOS's own
-        # 3.9 (and 3.8 is earlier on PATH), both below this project's
-        # requires-python of 3.10. pip silently filters out every distribution
-        # whose Requires-Python excludes the interpreter, so the failure
-        # surfaces as "No matching distribution found for fastapi>=0.138.2" -
-        # a dependency floor that looks wrong but is not.
-        uses: actions/setup-python@v5
-        with:
-          python-version: "3.12"
-        env:
-          # setup-python's macOS installer defaults to
-          # /Users/runner/hostedtoolcache, a path that exists only on GitHub's
-          # hosted runners; a self-hosted Mac gets "mkdir: /Users/runner:
-          # Permission denied". Point it at this runner's own tool cache rather
-          # than hardcoding anyone's home directory. This has to sit on the step
-          # - the `runner` context is not available in job-level `env`.
-          AGENT_TOOLSDIRECTORY: ${{ runner.tool_cache }}
-
-      - name: Create an isolated virtual environment
-        # The runner's Python is the developer's Python. Build the environment
-        # inside the workspace so a CI run can never mutate it.
+      - name: Provision Python and install dependencies
+        # Pinning the interpreter is required, not cosmetic: the runner's bare
+        # `python3` is macOS's own 3.9 (3.8 is even earlier on PATH), both below
+        # this project's requires-python of 3.10. pip silently filters out every
+        # distribution whose Requires-Python excludes the interpreter, so the
+        # failure surfaces as "No matching distribution found for
+        # fastapi>=0.138.2" - a dependency floor that looks wrong but is not.
+        #
+        # uv rather than setup-python: setup-python's macOS installer writes to
+        # /Users/runner/hostedtoolcache, which exists only on GitHub's hosted
+        # runners, and the AGENT_TOOLSDIRECTORY override has to be set on the
+        # runner service's own environment to take effect. uv provisions its own
+        # CPython under its cache and needs no such path.
+        #
+        # The environment is built inside the workspace so a CI run can never
+        # mutate the developer's own venv.
         run: |
-          python -m venv .ci-venv
-          .ci-venv/bin/python -m pip install --disable-pip-version-check --upgrade pip
+          export PATH="$HOME/.local/bin:$PATH"
+          uv venv --python 3.12 .ci-venv
+          uv pip install --python .ci-venv/bin/python -e ".[dev,cloud]"
           .ci-venv/bin/python -c "import sys; assert sys.version_info >= (3, 10), sys.version; print(sys.version)"
-
-      - name: Install cloud and development dependencies
-        run: .ci-venv/bin/python -m pip install --disable-pip-version-check -e ".[dev,cloud]"
 
       - name: Verify cloud imports
         run: |
