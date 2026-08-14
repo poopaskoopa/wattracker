@@ -18,6 +18,52 @@
 </p>
 {% endif %}
 
+{% if ooto_adjustment %}
+<section class="ooto-adjustment alert" aria-labelledby="ooto-adjustment-title">
+    <h3 id="ooto-adjustment-title">Review your OOTO adjustment</h3>
+    <p>
+        {{ ooto_adjustment.affected|length }} upcoming workout{{ '' if ooto_adjustment.affected|length == 1 else 's' }}
+        fall{{ 's' if ooto_adjustment.affected|length == 1 else '' }} inside
+        {{ ooto_adjustment.start_date }}&ndash;{{ ooto_adjustment.end_date }}.
+        Nothing changes until you confirm.
+    </p>
+    <ul class="ooto-adjustment-affected">
+        {% for workout in ooto_adjustment.affected %}
+        <li>{{ workout.date }} &mdash; {{ workout.type }}{% if workout.key %} (key workout){% endif %}</li>
+        {% endfor %}
+    </ul>
+    <form method="post" action="/ooto-adjustment/{{ ooto_adjustment.id }}/confirm">
+        {% for option in ooto_adjustment.proposal.options %}
+        <label class="ooto-adjustment-option">
+            <input type="radio" name="option" value="{{ option.kind }}"
+                   {% if option.kind == ooto_adjustment.proposal.recommended_option %}checked{% endif %}>
+            <span>
+                <strong>{{ option.label }}</strong>
+                <span class="hint">{{ option.summary }} {{ option.rationale }}</span>
+                {% if option.actions %}
+                <span class="ooto-adjustment-actions">
+                    {% for action in option.actions %}
+                    {% if action.mode == 'rebalance' %}
+                    {{ action.target_date }} &rarr; {{ action.new_name }} ({{ (action.duration_s // 60) }} min, unchanged){% if not loop.last %}; {% endif %}
+                    {% else %}
+                    {{ action.source_date }} &rarr; {{ action.target_date }}{% if not loop.last %}; {% endif %}
+                    {% endif %}
+                    {% endfor %}
+                </span>
+                {% endif %}
+            </span>
+        </label>
+        {% endfor %}
+        <div class="ooto-adjustment-buttons">
+            <button type="submit">Confirm adjustment</button>
+        </div>
+    </form>
+    <form method="post" action="/ooto-adjustment/{{ ooto_adjustment.id }}/dismiss">
+        <button type="submit" class="link-btn">Keep workouts skipped</button>
+    </form>
+</section>
+{% endif %}
+
 {% set rating_next = '/calendar' %}
 {% include "_pending_ratings.html" %}
 
@@ -111,13 +157,13 @@
             <td class="cal-cell {{ 'other-month' if not cell.in_month else '' }} {{ 'cal-ooto-day' if cell.ooto else '' }} {{ 'cal-race-day' if cell.race else '' }}">
                 <div class="cal-day">{{ cell.day }}{% if cell.ooto %} <span class="cal-ooto-tag">OOTO</span>{% endif %}{% if cell.race %} {{ race_priority_badge(cell.race) }}{% if cell.race.result %} {{ race_result_badge(cell.race.result) }}{% endif %}{% endif %}{% if cell.phase %} <span class="cal-phase-tag" title="This week is part of your plan's {{ cell.phase }} block">{{ cell.phase }}</span>{% endif %}</div>
                 {% for w in cell.workouts %}
-                    <div class="cal-workout cal-{{ w.type }}{{ ' cal-completed' if w.completed_activity_id else '' }}{{ ' cal-adapted' if w.adapted else '' }}{{ ' cal-skipped' if w.skipped else '' }}{{ ' cal-missed' if w.missed else '' }}"
+                    <div class="cal-workout cal-{{ w.type }}{{ ' cal-completed' if w.completed_activity_id else '' }}{{ ' cal-adapted' if w.adapted else '' }}{{ ' cal-skipped' if w.skipped else '' }}{{ ' cal-missed' if w.missed else '' }}{{ ' cal-adjusted-cancelled' if w.adjustment_cancelled else '' }}{{ ' cal-adjusted-replacement' if w.adjustment_replacement else '' }}"
                          {% if not w.standalone %}
                          data-workout-id="{{ w.id }}"
                          role="button" tabindex="0"
                          {% endif %}
-                         title="{{ w.name }} — {{ (w.duration_s // 60) }} min, {{ w.tss }} TSS.{{ ' Completed.' if w.completed_activity_id else '' }}{{ ' Skipped (out of office).' if w.skipped else '' }}{{ ' Missed (not completed).' if w.missed else '' }}{{ ' Adapted (' ~ w.adapted ~ ').' if w.adapted else '' }}{{ '' if w.standalone else ' Click for power details.' }}">
-                        {% if w.completed_activity_id %}<span class="cal-check" aria-label="completed">&#10003;</span> {% elif w.skipped %}<span class="cal-skip-mark" aria-label="skipped">&#8856;</span> {% elif w.missed %}<span class="cal-miss-mark" aria-label="missed">&#10007;</span> {% endif %}{% if w.adapted %}<span class="cal-adapt-mark" aria-label="adapted ({{ w.adapted }})">&#8635;</span> {% endif %}{{ w.name }}<span class="cal-type">{{ w.type }}</span>{% if w.rpe %}<span class="cal-rpe" title="Perceived exertion {{ w.rpe }}/10">RPE {{ w.rpe }}</span>{% endif %}
+                         title="{{ w.name }} — {{ (w.duration_s // 60) }} min, {{ w.tss }} TSS.{{ ' Completed.' if w.completed_activity_id else '' }}{{ ' Skipped (out of office).' if w.skipped else '' }}{{ ' Missed (not completed).' if w.missed else '' }}{{ ' Canceled by OOTO adjustment.' if w.adjustment_cancelled else '' }}{{ ' Replaced by an OOTO adjustment.' if w.adjustment_replacement else '' }}{{ ' Adapted (' ~ w.adapted ~ ').' if w.adapted else '' }}{{ '' if w.standalone else ' Click for power details.' }}">
+                        {% if w.completed_activity_id %}<span class="cal-check" aria-label="completed">&#10003;</span> {% elif w.skipped %}<span class="cal-skip-mark" aria-label="skipped">&#8856;</span> {% elif w.missed %}<span class="cal-miss-mark" aria-label="missed">&#10007;</span> {% elif w.adjustment_cancelled %}<span class="cal-adjust-cancel-mark" aria-label="canceled by OOTO adjustment">&#8856;</span> {% endif %}{% if w.adapted %}<span class="cal-adapt-mark" aria-label="adapted ({{ w.adapted }})">&#8635;</span> {% endif %}{% if w.adjustment_replacement %}<span class="cal-adjust-mark" aria-label="OOTO adjustment">&#8635;</span> {% endif %}{{ w.name }}<span class="cal-type">{{ w.type }}</span>{% if w.rpe %}<span class="cal-rpe" title="Perceived exertion {{ w.rpe }}/10">RPE {{ w.rpe }}</span>{% endif %}
                     </div>
                 {% endfor %}
             </td>
