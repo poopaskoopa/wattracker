@@ -7,6 +7,7 @@ which is exactly why the duration-equality gate looked harmless: in a real
 affected key workouts. Everything here is built from generator output.
 """
 import datetime as dt
+import json
 
 import pytest
 
@@ -188,3 +189,56 @@ def test_reflow_reports_no_conflict_on_a_rescheduled_date(rider):
     replacements = [r for r in _rows(uid, plan_id)
                     if r["adjustment_state"] == "rescheduled"]
     assert {r["type"] for r in replacements} == {"threshold", "vo2max"}
+
+
+def test_reflow_leaves_a_live_adjustment_alone(rider):
+    """The other half of the liveness rule: LIVE means off limits.
+
+    The revert/retire tests prove the exclusion ends. Nothing proved it applies
+    while the adjustment is live, so deleting the guard from ``_eligible``
+    outright left the whole suite green.
+    """
+    uid, plan_id = rider
+    now = dt.datetime(2026, 8, 1, 12, 0, 0)
+    assert reflow.reflow_plan(uid, plan_id, now=now)["status"] == "ok"
+
+    ooto_id = db.add_ooto_range(uid, "2026-08-09", "2026-08-16")
+    proposal = _evaluate(uid, plan_id)
+    adjustment_id = db.create_ooto_adjustment(
+        uid, plan_id, ooto_id, "2026-08-09", "2026-08-16", proposal,
+    )
+    assert db.apply_ooto_adjustment(
+        uid, adjustment_id, "reschedule", now=dt.date(2026, 8, 1),
+    )["status"] == "applied"
+    assert db.live_ooto_adjustment_ids(uid) == {adjustment_id}
+
+    owned = {r["id"]: dict(r) for r in _rows(uid, plan_id)
+             if r["adjustment_state"] is not None}
+    assert len(owned) == 6  # 2 canceled, 2 displaced, 2 rescheduled
+
+    # Make the recipe genuinely disagree with every stored row, so reflow WANTS
+    # to rewrite them and the only thing stopping it is the live adjustment.
+    conn = db.connect()
+    try:
+        conn.execute(
+            "UPDATE plans SET recipe = ? WHERE id = ?",
+            (json.dumps(reflow.build_recipe(DAYS, 8.0, 2)), plan_id),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    result = reflow.reflow_plan(uid, plan_id, now=now)
+    assert result["status"] == "ok"
+    assert result["updated"] > 0  # it really did rewrite the unowned rows
+
+    after = {r["id"]: dict(r) for r in _rows(uid, plan_id)}
+    for row_id, before in owned.items():
+        assert after[row_id] == before, "a live adjustment's row was rewritten"
+    # Counted as locked, not silently stepped over. (Not one per owned row:
+    # `_apply_one` works per DATE, and a date whose fresh content happens to
+    # match the stored row returns before the eligibility check.)
+    assert result["skipped_locked"] > 0
+    # And nothing was inserted onto or deleted from an adjusted date.
+    assert (result["inserted"], result["deleted"]) == (0, 0)
+    assert len(_rows(uid, plan_id)) == len(after)
