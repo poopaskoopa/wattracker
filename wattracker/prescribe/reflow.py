@@ -460,7 +460,7 @@ def _apply_one(user_id: int, plan_id: int, date: str, today: str,
     zwo_str = zwo.zwo_string(fresh["session"])
     if not _differs(stored, fresh, zwo_str):
         return
-    if not _eligible(stored, today, race_window):
+    if not _eligible(stored, today, race_window, live_adjustments):
         counts["skipped_locked"] += 1
         return
     ok = db.replace_plan_workout_content(
