@@ -10,31 +10,56 @@ permissions:
   contents: read
 
 jobs:
-  cloud:
-    runs-on: ubuntu-latest
+  # Runs on a self-hosted macOS runner. Self-hosted runners are not billed, so
+  # this survives the hosted-minutes outage that hard-disabled the Windows
+  # workflow. Keep this job free of container actions and Docker: a macOS
+  # runner cannot run either, which is why the containerised checks live in
+  # the separate job below.
+  tests:
+    runs-on: [self-hosted, macOS]
     timeout-minutes: 30
     steps:
       - name: Check out source
         uses: actions/checkout@v4
 
-      - name: Set up Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: "3.12"
-          cache: pip
+      - name: Create an isolated virtual environment
+        # The runner's Python is the developer's Python. Build the environment
+        # inside the workspace so a CI run can never mutate it.
+        run: |
+          python3 -m venv .ci-venv
+          .ci-venv/bin/python -m pip install --disable-pip-version-check --upgrade pip
 
       - name: Install cloud and development dependencies
-        run: python -m pip install --disable-pip-version-check -e ".[dev,cloud]"
+        run: .ci-venv/bin/python -m pip install --disable-pip-version-check -e ".[dev,cloud]"
 
       - name: Verify cloud imports
         run: |
-          python -c "import azure.data.tables, azure.identity, azure.storage.blob, cryptography"
-          python -c "import wattracker.cloud.runtime"
+          .ci-venv/bin/python -c "import azure.data.tables, azure.identity, azure.storage.blob, cryptography"
+          .ci-venv/bin/python -c "import wattracker.cloud.runtime"
 
       - name: Run full test suite
         env:
+          # Pin to the workspace. Without it pytest can import a different
+          # checkout's code and silently test the wrong tree.
           PYTHONPATH: ${{ github.workspace }}
-        run: python -m pytest -q
+        run: .ci-venv/bin/python -m pytest -q
+
+  # Bicep validation and the container image build need Linux: azure/cli is a
+  # container action, and Dockerfile.cloud builds a Linux image. Both require
+  # billable hosted runners, so they stay off until hosted minutes are
+  # available again. Drop the `if` to restore them.
+  #
+  # The image check is the one that answers "is the cloud extra actually
+  # installed in readImage/syncImage" - without cryptography, verify_signature
+  # returns False and every write 401s in production. Until this job can run,
+  # that has to be confirmed by hand before any deploy.
+  containerized:
+    if: ${{ false }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
 
       - name: Validate Bicep
         uses: azure/cli@v2
