@@ -2,8 +2,67 @@
 
 Two agents work on this repo concurrently (a Claude Code session and another
 agent in a separate terminal). These rules exist because we have already had
-two incidents from violating them (entangled uncommitted trees, and a stale
-server process wiping a migrated live DB).
+three incidents from violating them: entangled uncommitted trees, a stale
+server process wiping a migrated live DB, and — on 2026-08-13 — a rebase onto
+a stale `origin/main` that force-pushed away three merged security fixes, a
+test file and a tracked document.
+
+The third incident is why the two rules below are stated as loudly as they
+are. Nothing about that work was wrong except its base: `origin/main` in that
+clone was 22 hours old.
+
+## Fetch before you rebase or branch
+
+```sh
+git fetch origin && git rebase origin/main
+```
+
+Not `git rebase origin/main` on its own. A remote-tracking ref is a cache; it
+is only as current as your last fetch. Rebasing onto a stale `origin/main`
+silently replays an old lineage and drops everything that landed in between,
+and the result looks like a clean rebase.
+
+Before pushing a branch someone else may have touched, confirm the remote is
+where you think it is:
+
+```sh
+git fetch origin && git log --oneline origin/<branch> -1
+```
+
+## Branch ownership is exclusive
+
+A branch has exactly one owner: whoever created it. **Nobody else pushes to
+it — including the integrator.**
+
+If the integrator needs to change another agent's branch, they cut their own
+branch from it and open a PR, or they ask the owner. Rewriting someone else's
+branch is how reviewed work gets destroyed: the second agent's own history is
+not visible to the pusher, so a force-push cannot be checked against it.
+
+`--force-with-lease=<branch>:<sha>` against an explicitly stated SHA, never a
+bare `--force`. If the lease fails, stop and look — do not retry harder.
+
+A `pre-push` hook enforcing both of these ships in `scripts/hooks/`. Install it
+in every clone, first thing:
+
+```sh
+scripts/hooks/install.sh
+```
+
+It refuses direct pushes to `main` and non-fast-forward pushes to any branch.
+It is a guardrail against an honest mistake, not a control — `--no-verify`
+bypasses it, and that is fine, because the failure being prevented is a
+reflex, not an adversary. PR merges go through the GitHub API and are
+unaffected.
+
+## Never name a branch after a closed issue
+
+Once an issue's work is merged, its branch is dead. Anything re-derived from
+that branch's original base re-adds commits that already landed, which is how
+`agent2/issue59` produced add/add conflicts against `main` twice while
+carrying a feature that had nothing to do with issue #59.
+
+Name a branch for the work it carries, and cut it from current `main`.
 
 ## Worktrees — never share a checkout
 
@@ -22,13 +81,29 @@ The machine's *global* git config still
 carries a personal address, so any clone that doesn't override it locally
 re-publishes that address in every commit. This has already happened once.
 
+**Use a distinct name per agent, and a noreply address always.** Both agents
+authenticate to GitHub as the same account, so the commit *name* is the only
+thing that says who did the work. When every clone committed as
+`wattrackerboss`, identifying which agent force-pushed a branch required
+finding the other clone's reflog on disk — the account, the PR author and the
+commit metadata were all identical.
+
 Run inside each clone/worktree, before your first commit:
 
 ```sh
+# integrator / primary checkout
 git config user.name  wattrackerboss
 git config user.email wattrackerboss@users.noreply.github.com
-git config user.email   # verify — must print the noreply address
+
+# second agent's clone
+git config user.name  codex
+git config user.email codex@users.noreply.github.com
+
+git config user.email   # verify — must print a noreply address
 ```
+
+The email must always be a `@users.noreply.github.com` address. The name is
+free to differ and should.
 
 Repo-local on purpose; do not touch the global config. Before pushing, check
 your unmerged commits:
