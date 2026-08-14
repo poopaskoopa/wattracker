@@ -81,18 +81,55 @@ def test_constructing_off_windows_says_what_to_do_instead():
     assert "headless" in str(excinfo.value)
 
 
+# szTip + szInfo + szInfoTitle, the only fields declared as inline arrays of
+# characters rather than as pointers or integers.
+_INLINE_WCHARS = 128 + 256 + 64
+
+
 @pytest.mark.skipif(
     ctypes.sizeof(ctypes.c_void_p) != 8, reason="the shipped build is 64-bit"
 )
 def test_the_shell_structure_is_the_size_the_shell_expects():
     """cbSize is how the shell decides which version of the struct it was given.
 
-    A reordered or mistyped field changes this number, and the failure it
-    causes is Shell_NotifyIcon quietly returning false rather than anything
-    that names a field.
+    The failure a wrong layout causes is Shell_NotifyIcon quietly returning
+    false rather than anything that names a field, so the layout is pinned here
+    instead.
+
+    The number checked is the one *Windows* will compute, which is not the one
+    this process measures unless it is running there: ``ctypes.c_wchar`` is two
+    bytes on Windows and four on every other platform ctypes runs on, so the
+    three inline character arrays make the struct 896 bytes wider here than it
+    is on the machine the shell lives on. Derived rather than skipped off
+    Windows, because the CI that actually runs this suite is macOS - and a
+    guard that only runs on the developer's own box is the one that let the
+    literal 976 through in the first place.
+
+    Size alone is a weaker check than it looks: everything here is padded to
+    eight bytes, so widening ``uID`` to a handle or moving ``uFlags`` past
+    ``hIcon`` both leave the total untouched. The offsets below are what
+    actually catch those, and they are literals rather than derived because
+    every field named sits ahead of the first character array, where no
+    ``wchar_t`` has yet been counted and Windows and POSIX still agree.
     """
-    assert ctypes.sizeof(tray_win32._NOTIFYICONDATAW) == 976
+    measured = ctypes.sizeof(tray_win32._NOTIFYICONDATAW)
+    as_windows_sees_it = measured - _INLINE_WCHARS * (
+        ctypes.sizeof(ctypes.c_wchar) - 2
+    )
+    assert as_windows_sees_it == 976
+    # No inline arrays in this one, so its size is the same everywhere.
     assert ctypes.sizeof(tray_win32._WNDCLASSEXW) == 80
+
+    data = tray_win32._NOTIFYICONDATAW
+    assert [
+        (name, getattr(data, name).offset)
+        for name in (
+            "cbSize", "hWnd", "uID", "uFlags", "uCallbackMessage", "hIcon",
+        )
+    ] == [
+        ("cbSize", 0), ("hWnd", 8), ("uID", 16), ("uFlags", 20),
+        ("uCallbackMessage", 24), ("hIcon", 32),
+    ]
 
 
 def test_the_tray_reads_connector_status_and_keeps_no_copy():

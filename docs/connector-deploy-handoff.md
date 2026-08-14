@@ -55,6 +55,19 @@ and `test_install_bootstrap.py::test_without_lsof_hides_lsof_but_keeps_bash_on_u
 create symlinks, which needs Developer Mode. The run takes about six minutes
 and was 2294 passed / 45 skipped on 2026-08-14.
 
+**A green run here is not a green CI.** `.github/workflows/cloud.yml` is the
+only workflow that runs the suite — self-hosted macOS, on every push and pull
+request — and every Windows job is `if: ${{ false }}`. So the suite that gates
+this branch is one this machine cannot run, and a test that is right about
+Windows and wrong about everything else goes red the moment it is pushed, with
+nothing here to have warned you. That is not hypothetical: it is how
+`test_the_shell_structure_is_the_size_the_shell_expects` shipped asserting
+`sizeof(_NOTIFYICONDATAW) == 976`, which is the Windows number —
+`ctypes.c_wchar` is two bytes here and four everywhere else, so the same struct
+measures 1872 on the runner. Before pushing anything that touches a `ctypes`
+layout, a path, an encoding or a clock, either get a POSIX run of it or derive
+the platform-dependent number rather than writing the literal you measured.
+
 Two things about the suite changed that day and are worth knowing before you
 trust a result. `tests/conftest.py` now sandboxes `WATTRACKER_CONNECTOR_DIR`
 for every test: redirecting HOME does not move the connector's directory on
@@ -177,6 +190,13 @@ Windows is green upstream and only fails here. It has now happened with
 Developer Mode, and most recently with `WATTRACKER_CONNECTOR_DIR` — where
 `config_dir` reads `LOCALAPPDATA` and no HOME redirect reaches it. When a
 Windows-only failure appears after a rebase, suspect this before the product.
+
+**And it runs in both directions.** A test that is wrong about POSIX is green
+*here* and only fails upstream — which is the worse half, because upstream is
+the only CI there is (§2) and the Windows job that would have covered it never
+runs. `test_the_shell_structure_is_the_size_the_shell_expects` was the first
+member of that half. Whichever way round it is, the rule is the same: the
+platform you did not run on is the one that decides.
 
 ## 6. What has been verified without a rider
 
