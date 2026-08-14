@@ -482,6 +482,10 @@ class TrayIcon:
         data.szTip = self._tooltip()
         self._added = bool(self._shell32.Shell_NotifyIconW(_NIM_ADD, ctypes.byref(data)))
         if self._added:
+            # Worth a line: the log is the only thing a frozen build can say,
+            # and "did the icon come back" is otherwise answerable only by
+            # somebody looking at the screen.
+            log.info("tray icon added")
             self._drain_balloons()
             return
         # At logon the shell may not have created the notification area yet.
@@ -489,6 +493,10 @@ class TrayIcon:
         # explorer *re*starts - so the first add is retried on the timer.
         self._add_attempts += 1
         if self._add_attempts <= _ADD_ATTEMPTS:
+            log.debug(
+                "the shell would not take the tray icon (attempt %d); retrying",
+                self._add_attempts,
+            )
             self._user32.SetTimer(_HANDLE(self._hwnd), 2, _ADD_RETRY_MS, None)
         else:
             log.error("gave up adding the tray icon after %d attempts",
