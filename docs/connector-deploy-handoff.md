@@ -148,10 +148,13 @@ On the built `dist\WattrackerConnector.exe`, 2026-08-14:
       connection.
 - [x] Quit stops the connector, ends the pump, and the process exits with no
       threads left behind.
-- [x] The icon comes back when `TaskbarCreated` arrives — the same registered
-      broadcast the shell sends, posted to a real window
-      (`test_the_icon_comes_back_when_explorer_restarts`). The honest version
-      is still §7.
+- [x] The icon comes back when `TaskbarCreated` arrives — both the posted
+      version (`test_the_icon_comes_back_when_explorer_restarts`) and the
+      honest one: `taskkill /f /im explorer.exe` against the running exe, after
+      which the log records the broadcast arriving and the shell accepting the
+      icon again 134 ms later. Read it from the log; Windows 11's notification
+      area is not the classic `Shell_TrayWnd` toolbar, so the old trick of
+      enumerating the shell's own buttons reports nothing either way.
 - [x] Autostart's enable/disable/refresh against a real registry key (a
       scratch key under HKCU, removed after each test).
 - [x] No stray folder appeared beside the exe — but no window has been opened
@@ -166,7 +169,8 @@ up and a device paired before any of it (see the trainer session run sheet).
 - [ ] Pair on the server, run the exe, confirm the tray shows connected and a
       rescan works.
 - [ ] Double-click → the window opens **already logged in**. Close and reopen.
-- [ ] `taskkill /f /im explorer.exe` → the icon comes back.
+- [ ] `taskkill /f /im explorer.exe` → the icon comes back *visibly*. The
+      mechanism is confirmed (§6); this is the pair of eyes.
 - [ ] Toggle autostart on, reboot, confirm it reconnects. Toggle off, confirm
       the registry value is gone.
 - [ ] Revoke the device in the web UI while it runs → the socket closes, the
