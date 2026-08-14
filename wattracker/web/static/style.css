@@ -427,6 +427,14 @@ details summary { cursor: pointer; color: var(--accent); margin: 0.5rem 0; }
 .goal-signal { font-size: 0.88rem; margin: 0.3rem 0; }
 .goal-signal.secondary { color: var(--muted); }
 .reflow-notice { font-size: 0.85rem; }
+.ooto-adjustment { font-size: 0.88rem; margin: 0.8rem 0; }
+.ooto-adjustment h3 { margin-top: 0; }
+.ooto-adjustment-affected { margin: 0.35rem 0 0.6rem; }
+.ooto-adjustment-option { display: flex; align-items: flex-start; gap: 0.45rem;
+    margin: 0.45rem 0; }
+.ooto-adjustment-option > span { display: flex; flex-direction: column; gap: 0.1rem; }
+.ooto-adjustment-actions { color: var(--accent); font-size: 0.8rem; }
+.ooto-adjustment-buttons { margin-top: 0.65rem; }
 .plan-form button { grid-column: 1 / -1; justify-self: start; }
 .weekly-table .recovery-week { color: var(--ok); }
 .link-btn { background: none; border: none; color: var(--accent); cursor: pointer; padding: 0; font: inherit; }
@@ -489,6 +497,11 @@ table.calendar th { text-align: center; }
     border-left-style: dashed; opacity: 0.85;
 }
 .cal-miss-mark { color: var(--alert); font-weight: 700; }
+.cal-workout.cal-adjusted-cancelled { opacity: 0.55; text-decoration: line-through;
+    text-decoration-color: var(--accent); border-left-color: var(--accent); }
+.cal-adjust-cancel-mark { color: var(--accent); font-weight: 700; }
+.cal-workout.cal-adjusted-replacement { border-left-style: double; }
+.cal-adjust-mark { color: var(--accent); font-weight: 700; }
 /* Out-of-office day cells: unmistakable tinted background + hatch + top accent. */
 .cal-cell.cal-ooto-day {
     background-color: color-mix(in srgb, var(--alert) 14%, transparent);

@@ -14,8 +14,9 @@ The regeneration is always WHOLE-plan, never partial: the variant rotation in
 subset would desync every workout after it.
 
 Rows the recipe does not own are never touched: a row is eligible only if it
-is future-dated, not completed, and carries ``origin = 'generated'``. Plans
-with no recipe (everything created before the recipe column existed) are
+is future-dated, not completed, carries ``origin = 'generated'`` and has no
+confirmed OOTO adjustment state. Plans with no recipe (everything created
+before the recipe column existed) are
 refused outright - guessing a recipe would silently rewrite a plan into
 something the user never asked for.
 
@@ -106,6 +107,8 @@ def _eligible(row: dict, today: str, race_window: Optional[set] = None) -> bool:
     inside a taper or a post-race recovery window the race outranks the
     adaptation (see the module docstring).
     """
+    if row.get("adjustment_state") is not None:
+        return False
     if row.get("adapted") is not None and row["date"] not in (race_window or ()):
         return False
     return (
