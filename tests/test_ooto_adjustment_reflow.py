@@ -8,14 +8,18 @@ affected key workouts. Everything here is built from generator output.
 """
 import datetime as dt
 import json
+import os
 
 import pytest
 
-from wattracker import db
+from wattracker import db, exporter
 from wattracker.prescribe import ooto_adjust, reflow, zwo
 from wattracker.prescribe.plan import generate_plan
 
 pytest.importorskip("httpx")
+from fastapi.testclient import TestClient  # noqa: E402
+
+from wattracker.server import create_app  # noqa: E402
 
 DAYS = [0, 2, 4, 6]
 HOURS_PER_WEEK = 6.0
@@ -24,10 +28,7 @@ WEEKS = 4
 TODAY = "2026-08-01"
 
 
-@pytest.fixture()
-def rider():
-    db.init_db()
-    uid = db.create_user("rider", "hash")
+def _install_real_plan(uid):
     generated = generate_plan(
         "Real", START, WEEKS, days_of_week=DAYS,
         hours_per_week=HOURS_PER_WEEK, hit_days_per_week=2,
@@ -42,7 +43,14 @@ def rider():
             w["tss"], zwo.zwo_string(w["session"]), variant=w.get("variant"),
             origin="generated",
         )
-    return uid, plan_id
+    return plan_id
+
+
+@pytest.fixture()
+def rider():
+    db.init_db()
+    uid = db.create_user("rider", "hash")
+    return uid, _install_real_plan(uid)
 
 
 def _rows(uid, plan_id):
@@ -242,3 +250,61 @@ def test_reflow_leaves_a_live_adjustment_alone(rider):
     # And nothing was inserted onto or deleted from an adjusted date.
     assert (result["inserted"], result["deleted"]) == (0, 0)
     assert len(_rows(uid, plan_id)) == len(after)
+
+
+# ------------------------------------------------------------ export folder
+
+def _folder(directory):
+    """filename -> bytes, for every .zwo actually on disk."""
+    return {
+        name: (directory / name).read_bytes()
+        for name in os.listdir(directory) if name.endswith(".zwo")
+    }
+
+
+@pytest.fixture()
+def exporting_rider(home_dir):
+    """A registered rider with a real plan and a real Zwift workouts folder."""
+    app = create_app()
+    with TestClient(app) as client:
+        client.post("/register",
+                    data={"username": "rider", "password": "password123"})
+        uid = db.get_user_by_username("rider")["id"]
+        out = home_dir / "zwo"
+        out.mkdir(parents=True)
+        db.save_user_settings(uid, {"workouts_dir": str(out), "zwift_id": "123"})
+        _install_real_plan(uid)
+        assert exporter.sync_plan_exports(uid)["status"] == "ok"
+        yield client, uid, out
+
+
+@pytest.mark.parametrize("option", ["reschedule", "rebalance"])
+def test_reverting_leaves_the_zwift_folder_byte_identical(
+    exporting_rider, monkeypatch, option,
+):
+    """Confirm then revert must leave no file behind, in EITHER mode.
+
+    Asserted at file level on purpose. The database view of a revert looked
+    perfect while the folder still held a phantom threshold .zwo on a day the
+    restored plan calls easy - the export manifest is built from stored rows,
+    and a reverted reschedule deletes the very row that named the file.
+    """
+    import wattracker.server as servermod
+
+    client, uid, out = exporting_rider
+    monkeypatch.setattr(servermod, "utc_today", lambda: dt.date(2026, 8, 1))
+    baseline = _folder(out)
+    assert baseline  # the fixture really did export something
+
+    client.post("/ooto/add",
+                data={"start_date": "2026-08-09", "end_date": "2026-08-16"})
+    adjustment_id = db.list_pending_ooto_adjustments(uid)[0]["id"]
+    client.post(f"/ooto-adjustment/{adjustment_id}/confirm",
+                data={"option": option})
+    assert db.get_ooto_adjustment(uid, adjustment_id)["status"] == "applied"
+    assert _folder(out) != baseline  # the adjustment reached the folder
+
+    ooto_id = db.list_ooto_ranges(uid)[0]["id"]
+    client.post(f"/ooto/{ooto_id}/delete")
+
+    assert _folder(out) == baseline

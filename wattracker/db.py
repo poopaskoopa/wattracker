@@ -3547,25 +3547,37 @@ def delete_ooto_range(user_id: int, ooto_id: int, path: Optional[str] = None) ->
         conn.close()
 
 
-def ooto_range_revert_renames(
+def ooto_range_revert_orphans(
     user_id: int, ooto_id: int, path: Optional[str] = None,
 ) -> List[dict]:
-    """Rows whose NAME ``delete_ooto_range`` would change, as they stand now.
+    """The .zwo files ``delete_ooto_range`` is about to orphan, as (date, name).
 
-    Read before the delete, never after: the .zwo is named after date+name, and
-    once the revert has restored the original name nothing left in the database
-    remembers the file the re-dosed session left behind.
+    MUST be read before the delete, never after. A .zwo is named after
+    date + name, and the export manifest is built from STORED rows, so the
+    moment the revert has run there is nothing left in the database that
+    remembers the file:
+
+    * a ``rescheduled`` row is DELETED by the revert, taking the only record of
+      its filename with it;
+    * a ``rebalanced`` row has its original name restored over the top of the
+      re-dosed one.
+
+    Either way the file survives in the rider's Zwift folder and now
+    contradicts the restored plan - a phantom threshold session sitting on a
+    day the plan says is easy. Both states are covered here deliberately:
+    filtering to one of them is exactly the bug this replaced.
     """
     conn = connect(path)
     try:
         rows = conn.execute(
-            "SELECT w.date AS date, w.name AS old_name FROM plan_workouts w "
+            "SELECT w.date AS date, w.name AS name FROM plan_workouts w "
             "JOIN ooto_adjustments a ON a.id = w.adjustment_id "
             "WHERE w.user_id = ? AND a.user_id = ? AND a.ooto_id = ? "
-            "AND a.status = 'applied' AND w.adjustment_state = 'rebalanced'",
+            "AND a.status = 'applied' "
+            "AND w.adjustment_state IN ('rescheduled', 'rebalanced')",
             (user_id, user_id, ooto_id),
         ).fetchall()
-        return [{"date": r["date"], "old_name": r["old_name"]} for r in rows]
+        return [{"date": r["date"], "name": r["name"]} for r in rows]
     finally:
         conn.close()
 
