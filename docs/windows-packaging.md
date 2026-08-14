@@ -1,0 +1,250 @@
+# Windows packaging
+
+wattracker ships on Windows as a frozen onedir tree, wrapped two ways:
+
+| artifact | what it is | built by |
+|---|---|---|
+| `wattracker-<version>-windows-x64-unsigned-setup.exe` | Inno Setup installer, double-click to install | `windows.yml`, job `package-unsigned` |
+| `wattracker-windows-x64-unsigned.zip` | the same tree, portable, unpack and run | the same job |
+| `wattracker-windows-x64-signed.zip` | the same tree, signed, plus a `.sha256` | `windows-release.yml`, on a `v*` tag |
+
+Note what that table does not contain: **there is no signed installer.**
+`windows-release.yml` signs the frozen binaries and zips them; it never invokes
+the setup compiler. The installer only exists on the unsigned path, and
+`docs/windows-security.md` requires it to be labelled that way. The rules around
+signing itself live in that document; this one is about the packaging.
+
+## What gets built
+
+`packaging/wattracker.spec` is one spec shared by Windows and macOS (see
+`docs/macos-packaging.md` for why the Analysis is deliberately common). On
+Windows it produces a PyInstaller **onedir** tree:
+
+```
+dist\wattracker\wattracker.exe
+dist\wattracker\_internal\...      (CPython, the wheel, templates, static)
+```
+
+PyInstaller is pinned in the `package` extra of `pyproject.toml`
+(`pyinstaller==6.16.0`), which is also what fixes the `_internal\` layout the
+installer relies on.
+
+The installer packages that tree; it does not replace it. Local build:
+
+```powershell
+python -m PyInstaller --clean --noconfirm packaging\wattracker.spec
+$version = python -c "import tomllib; print(tomllib.load(open('pyproject.toml','rb'))['project']['version'])"
+ISCC.exe "/DAppVersion=$version" packaging\wattracker.iss
+```
+
+`ISCC.exe` comes with Inno Setup 6. Nothing assumes it is already on the
+machine: CI installs a pinned compiler itself (see **CI** below).
+
+### Version
+
+`pyproject.toml` is the single source of truth, exactly as it is for the macOS
+bundle version. Inno's preprocessor cannot parse TOML, so the caller reads the
+version and passes it as `/DAppVersion=`. The `.iss` contains no version literal
+at all - it `#error`s if the define is missing, and
+`tests/test_windows_installer.py` asserts the current version string does *not*
+appear in the script - so a caller that forgets fails the compile instead of
+shipping a stale version. `OutputBaseFilename` is built from the same define, so
+the artifact name cannot disagree with `AppVersion` either.
+
+That one field is read in two deliberately different ways:
+
+- **the workflow** uses `python -c "import tomllib; ..."`, because the
+  `package-unsigned` job pins Python 3.13 and can rely on the stdlib parser;
+- **`packaging/wattracker.spec`** (`_project_version`, used for the macOS bundle
+  version) and `tests/test_windows_installer.py` both use a regex instead, and
+  say so in a comment, because the build interpreter and the test interpreter
+  are only required to be `>=3.10` while `tomllib` arrived in 3.11. Importing
+  `tomllib` in the test module broke collection of the whole suite on the
+  declared minimum interpreter.
+
+## Installer choices
+
+- **Inno Setup**, not MSIX and not WiX. MSIX wants a packaged-identity signing
+  chain and a containerised filesystem view that the `~/.wattracker` data
+  directory would have to be redesigned around; WiX is a heavier toolchain for
+  what is a file copy and one shortcut.
+- **Per-user install** to `{localappdata}\Programs\wattracker` with
+  `PrivilegesRequired=lowest` and no elevation override. No UAC prompt, no
+  Program Files ACL problems, and the app only ever writes into the same user's
+  profile anyway.
+- **A Start Menu group holding the app and its uninstaller, and nothing else.**
+  No desktop shortcut, no `[Run]` section, no run-at-startup entry;
+  `DisableProgramGroupPage=yes` because there is one right group name.
+  `tests/test_windows_installer.py` fails if the phrase "run at startup" appears
+  in the script.
+- **The shortcut does not point at `wattracker.exe`.** It runs
+  `scripts\wattracker.ps1 -Action start -OpenBrowser` through
+  `powershell -NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden`, taking its
+  icon from `wattracker.exe`. That launcher is shipped by the installer as a
+  second `[Files]` entry and is what makes the frozen app usable from a
+  double-click: it starts the server hidden with stdout and stderr redirected to
+  `wattracker.log` / `wattracker-error.log` in the data directory, polls
+  `/login` and only opens the browser once it answers 200. `console=True` in the
+  spec is unchanged - running `wattracker.exe` directly still gives you a console
+  and uvicorn's logging - but a user who clicks the Start Menu entry does not get
+  a console window they must leave open.
+- `ArchitecturesAllowed=x64compatible` (and `ArchitecturesInstallIn64BitMode`
+  likewise), which the pinned 6.7.3 compiler supports.
+- No firewall exception is created, ever. `docs/windows-security.md` requires
+  the supported configuration to stay loopback-only, and
+  `tests/test_windows_installer.py` fails if the word `firewall` shows up
+  anywhere in the script. The launcher enforces the other half: it refuses any
+  `WATTRACKER_HOST` that is not `127.0.0.1`, `localhost` or `::1`.
+
+### Stopping the running app is the installer's hardest problem
+
+`CloseApplications=no` and `RestartApplications=no`: the Restart Manager is
+explicitly *not* used. Instead `[Code]` calls the installed launcher -
+`PrepareToInstall` before any file is replaced, `InitializeUninstall` before any
+file is removed - and aborts with a message if it cannot stop the app cleanly.
+
+The reason is that everything else on Windows stops processes by name, port
+owner or window: `taskkill`, `Stop-Process -Name`, `Get-NetTCPConnection`. All of
+those can hit an unrelated process, and `tests/test_windows_installer.py`
+asserts that none of them appear in the script, the smoke test or the workflow.
+The launcher instead records a state file in the data directory
+(`wattracker-process.json`) holding the PID, its creation time, the resolved
+executable path, the port, and a random `--wattracker-managed=<32 hex>` marker it
+put on the child's own command line. Before terminating anything it re-reads the
+live process's creation time, executable path and command line and requires every
+recorded field to match exactly, then kills through the
+`System.Diagnostics.Process` handle it already holds. State that is malformed,
+tampered with, or points at a PID that has been reused fails closed: the
+installer and uninstaller stop, and say so, rather than replacing or deleting
+files. `docs/windows-security.md` states the same contract from the security
+side.
+
+## Data, upgrades and uninstall
+
+The data directory is **not** part of the install. `wattracker.config` resolves
+it as `WATTRACKER_DATA_DIR` if set, otherwise `~/.wattracker` - on Windows,
+`%USERPROFILE%\.wattracker`. It holds `wattracker.db` (rides, plans, goals,
+password hashes, encrypted credential markers), `config.json` (session secret,
+Anthropic API key), `backups/`, and the launcher's `wattracker-process.json` and
+logs.
+
+**Upgrade.** A fixed `AppId` GUID makes a reinstall an upgrade rather than a
+second side-by-side installation, and `[Files]` uses `ignoreversion` so every
+payload file is overwritten regardless of embedded version resources. There is
+no `[InstallDelete]`: a file that existed in an older build and no longer exists
+in the new one is *not* removed from an existing install. For the `_internal\`
+tree that is a real risk - a stale `.pyd` or `.dll` from a different PyInstaller
+build can be left behind - and the mitigation today is the exact PyInstaller pin,
+not the installer. The data directory is untouched either way.
+
+On first launch of the new version, `db.init_db` upgrades the schema **in
+place**: it refuses outright to touch a database whose `user_version` is newer
+than the code's `SCHEMA_VERSION` (currently 31) - running an old wattracker
+against a new database is the failure that has twice wiped tables - and before
+applying any migration it writes a `pre-migration` snapshot through
+`backup.create_backup` and aborts if that snapshot cannot be written. So an
+upgrade that goes wrong has a recovery anchor in `<data dir>\backups\`.
+Downgrades are not supported: the old build will refuse to start against the
+migrated database, by design. In-place migration is only for a version the
+chain actually covers; a database too old to migrate is dropped and recreated,
+which is why the version this ships against matters.
+
+**Uninstall removes what it installed and nothing else.** There is no
+`[UninstallDelete]` and no `[UninstallRun]`, and the script never names the data
+directory or calls `Remove-Item`; the last three are asserted by
+`tests/test_windows_installer.py`. There is deliberately no "also delete your
+data?" prompt: an uninstaller that can delete rides is an uninstaller that will
+eventually delete rides unattended, and `packaging/smoke_installer.ps1` asserts a
+sentinel file in the data directory survives both an upgrade and a full
+uninstall. Removing the data is a manual `rmdir` the user does knowingly.
+
+The counterpart assertion is that uninstall really does clean up what it owns:
+the same smoke test requires `wattracker.exe`, the Start Menu shortcut and the
+`HKCU` uninstall registry key to be gone afterwards, and requires a *blocked*
+uninstall (tampered launcher state) to have removed none of them.
+
+## CI
+
+The installer is built by the `package-unsigned` job in
+`.github/workflows/windows.yml`, on `windows-latest`, in this order:
+
+1. check out, set up Python **3.13** (the interpreter that gives the inline
+   `tomllib` version read), create a separate `.venv` for the lifecycle test;
+2. **install a pinned Inno Setup compiler.** `innosetup-6.7.3.exe` is downloaded
+   from a pinned `github.com/jrsoftware/issrc` release URL, its SHA-256 compared
+   against a literal in the workflow, and its Authenticode signature required to
+   be `Valid` with signer simple name `Pyrsys B.V.` before it is executed. It is
+   then installed `/VERYSILENT /CURRENTUSER` into `$RUNNER_TEMP\Inno Setup 6` and
+   that directory appended to `GITHUB_PATH`. Nothing about the runner image is
+   assumed, and a compromised or substituted compiler fails the job rather than
+   silently building the installer;
+3. `tests\windows\lifecycle.ps1`, the PowerShell launcher-safety test;
+4. build the wheel and smoke the *installed* wheel in its own venv
+   (`packaging/smoke_installed.py`);
+5. freeze the onedir tree and smoke it (`packaging/smoke_frozen.ps1`), then
+   `Compress-Archive` it into the portable zip;
+6. read the version, run `ISCC.exe /DAppVersion=...`, and **throw if the setup
+   file is not on disk** - a compiler that fails quietly must not reach upload;
+7. smoke the installer itself (`packaging/smoke_installer.ps1`): install to a
+   temp directory with spaces in the path, start through the launcher, assert
+   `/login`, `/static/style.css` and `/register`, reinstall over the top,
+   attempt an uninstall with tampered state and require it to fail, then
+   uninstall for real;
+8. upload the wheel, the portable zip and the setup exe, with
+   `if-no-files-found: error`.
+
+The digest and publisher checks in step 2 have their own paragraph in
+`docs/windows-security.md`, and `tests/test_windows_installer.py` pins the
+version, the digest, the hash command and the publisher string so they cannot be
+loosened without a test change.
+
+**Both jobs in `windows.yml`, and `windows-release.yml`, carry
+`if: ${{ false }}`.** The current reason is billing, not access: Actions is
+enabled for this repository - the `Cloud` workflow runs the full test suite on
+every push and pull request - but it does so on a *self-hosted* macOS runner,
+which is not billed. GitHub-hosted minutes are exhausted, and `windows-latest` is
+billable on a private repository, so the Windows jobs stay gated and every
+Windows workflow run is recorded as `skipped`. (The comment in `windows.yml`
+still describes the earlier account-level block that first disabled it.) Until
+hosted minutes are available, the gate for anything in this document is a local
+Windows machine.
+
+## What has never been executed
+
+Be blunt about this. The gate above is not a formality: nothing below has run.
+
+- **`packaging/wattracker.iss` has never been compiled by this repository.**
+  Every Windows workflow run is recorded as skipped, so no `ISCC` invocation
+  exists in any run log, and Inno Setup does not run on macOS, which is where
+  this repository is developed. A syntax error, a directive the pinned 6.7.3
+  rejects, or a Pascal Script typo in `[Code]` would surface on the first
+  compile. Treat it as a debugging session, not a build.
+- **No installer has ever been installed**, and `packaging/smoke_installer.ps1`
+  has never run. The Start Menu shortcut, the upgrade-over-existing-install path
+  and the uninstall path are all unobserved.
+- **The `[Code]` lifecycle has never executed.** `PrepareToInstall`,
+  `InitializeUninstall`, the tampered-state abort and the message boxes are
+  reviewed, not exercised. Every test that covers any of this reads the files as
+  text; `tests/test_windows_installer.py` asserts strings in `.iss`, `.ps1` and
+  `.yml`, and asserts nothing about behaviour.
+- **The pinned-compiler provenance check has never run either.** The URL,
+  digest and publisher are reviewed constants; that the 6.7.3 asset still
+  matches that digest, and that its signer simple name renders exactly as
+  `Pyrsys B.V.`, are unverified assumptions until the job runs once.
+- **The installer is unsigned and there is no path that signs it.** Even after
+  the signing story in `docs/windows-security.md` works, it produces a signed
+  *zip*; SmartScreen judges the thing the user double-clicks, and that is the
+  setup exe. Wrapping signed binaries in an unsigned installer is the worst of
+  both worlds, and it is what would ship today.
+- **SmartScreen reputation is not signing.** A brand-new certificate earns a
+  warning on first downloads regardless; only accumulated reputation (or an EV
+  certificate) removes it.
+- **No icon.** `SetupIconFile` is unset and the spec passes no `icon=`, so setup,
+  the shortcut and the taskbar all show PyInstaller's default rather than
+  anything of wattracker's.
+- **BLE is not covered by the packaging path at all.** `windows-release.yml` has
+  a `smoke_frozen_ble.py` step; the installer job does not, and neither proves a
+  radio works. That is `docs/windows-ble-validation.md`, which is a manual
+  checklist on physical hardware.
+- Like the rest of the workflows, GitHub-authored actions are referenced by
+  moving major tags rather than pinned commit SHAs.
