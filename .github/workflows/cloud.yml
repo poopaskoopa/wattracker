@@ -40,7 +40,13 @@ jobs:
         # mutate the developer's own venv.
         run: |
           export PATH="$HOME/.local/bin:$PATH"
-          uv venv --python 3.12 .ci-venv
+          # only-managed, because a discovered interpreter may be the wrong
+          # architecture: Homebrew's /usr/local/opt/python@3.12 on this machine
+          # is x86_64, which makes uv resolve x86_64 wheels and fall back to
+          # building cryptography from source against a Rust toolchain that has
+          # no x86 std ("can't find crate for `core`"). A managed CPython is
+          # native arm64 and gets prebuilt wheels.
+          uv venv --python 3.12 --python-preference only-managed .ci-venv
           uv pip install --python .ci-venv/bin/python -e ".[dev,cloud]"
           .ci-venv/bin/python -c "import sys; assert sys.version_info >= (3, 10), sys.version; print(sys.version)"
 
