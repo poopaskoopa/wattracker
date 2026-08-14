@@ -335,3 +335,152 @@ def test_an_elapsed_adjustment_stops_locking_its_rows(client, monkeypatch):
     assert all(reflow._eligible(r, "2026-08-01", live_adjustments=live)
                for r in original)
     assert db.adaptable_plan_workouts(uid, "2026-08-01", "2026-08-31")
+
+
+# ------------------------------------- reverting over a row the rider RODE
+#
+# Revert stays unconditional (no fingerprint, no staleness gate: see #97) with
+# exactly one carve-out - a row carrying a completion is never rewritten and
+# never deleted. What the rider actually did outranks the prescription the
+# adjustment displaced, and the adjustment markers still come off so the row
+# stops being locked against reflow and adaptation.
+
+def _completed(uid, workout_id, activity_id=4242, date="2026-08-20"):
+    assert db.mark_plan_workout_completed(
+        uid, workout_id, activity_id, date, compliance=0.97, effective_ftp=250.0,
+    ) is True
+
+
+def _markers(row):
+    return (row["adjustment_id"], row["adjustment_state"],
+            row["adjustment_source_id"])
+
+
+def test_revert_leaves_a_completed_rebalanced_row_exactly_as_ridden(
+    client, monkeypatch,
+):
+    """The #97 case: a re-dosed session the rider rode before the trip died.
+
+    Restoring the Zone 2 prescription under a tempo ride would attach the ride
+    to a session nobody did, and completion matching gates on work/recovery
+    contrast, so the mismatch can mint a wrong effective_ftp.
+    """
+    uid, plan_id, row_ids, adjustment_id = _confirmed(
+        client, monkeypatch, "rebalance",
+    )
+    boosted = next(r for r in db.plan_workouts_for_plan(uid, plan_id)
+                   if r["adjustment_state"] == "rebalanced")
+    ridden = {k: boosted[k] for k in ("date", "name", "type", "duration_s",
+                                      "tss", "variant")}
+    _completed(uid, boosted["id"])
+
+    db.delete_ooto_range(uid, db.list_ooto_ranges(uid)[0]["id"])
+
+    after = db.plan_workouts_for_plan(uid, plan_id)
+    assert [r["id"] for r in after] == row_ids  # nothing deleted
+    row = next(r for r in after if r["id"] == boosted["id"])
+    assert {k: row[k] for k in ridden} == ridden
+    assert row["type"] == "tempo"
+    assert row["completed_activity_id"] == 4242
+    # ...and it is an ordinary row again, not one an adjustment owns.
+    assert _markers(row) == (None, None, None)
+    assert db.get_ooto_adjustment(uid, adjustment_id)["status"] == "reverted"
+    assert db.live_ooto_adjustment_ids(uid) == set()
+
+
+def test_revert_keeps_a_completed_rescheduled_row_instead_of_deleting_it(
+    client, monkeypatch,
+):
+    """Deleting it would leave the rider's ride with no plan row at all."""
+    uid, plan_id, row_ids, adjustment_id = _confirmed(
+        client, monkeypatch, "reschedule",
+    )
+    replacement = next(r for r in db.plan_workouts_for_plan(uid, plan_id)
+                       if r["adjustment_state"] == "rescheduled")
+    ridden = {k: replacement[k] for k in ("date", "name", "type", "duration_s",
+                                          "tss", "variant")}
+    _completed(uid, replacement["id"])
+
+    db.delete_ooto_range(uid, db.list_ooto_ranges(uid)[0]["id"])
+
+    after = db.plan_workouts_for_plan(uid, plan_id)
+    assert sorted(r["id"] for r in after) == sorted(row_ids + [replacement["id"]])
+    row = next(r for r in after if r["id"] == replacement["id"])
+    assert {k: row[k] for k in ridden} == ridden
+    assert row["completed_activity_id"] == 4242
+    assert _markers(row) == (None, None, None)
+    # The rows it was moved off and onto revert normally around it.
+    assert all(_markers(r) == (None, None, None) for r in after)
+    assert db.get_ooto_adjustment(uid, adjustment_id)["status"] == "reverted"
+
+
+def test_revert_keeps_a_completed_ooto_canceled_row_as_ridden(
+    client, monkeypatch,
+):
+    """A cancelled session the rider rode anyway is history, not a hole.
+
+    Cancellation only ever tombstoned the row, so the revert has nothing to
+    write back; this pins that a completion cannot turn a marker-clear into a
+    content rewrite or a delete.
+    """
+    uid, plan_id, row_ids, adjustment_id = _confirmed(
+        client, monkeypatch, "reschedule",
+    )
+    canceled = next(r for r in db.plan_workouts_for_plan(uid, plan_id)
+                    if r["adjustment_state"] == "ooto_canceled")
+    ridden = {k: canceled[k] for k in ("date", "name", "type", "duration_s",
+                                       "tss", "variant", "origin")}
+    _completed(uid, canceled["id"], date=canceled["date"])
+
+    db.delete_ooto_range(uid, db.list_ooto_ranges(uid)[0]["id"])
+
+    after = db.plan_workouts_for_plan(uid, plan_id)
+    assert [r["id"] for r in after] == row_ids  # replacement gone, this stayed
+    row = next(r for r in after if r["id"] == canceled["id"])
+    assert {k: row[k] for k in ridden} == ridden
+    assert row["completed_activity_id"] == 4242
+    assert _markers(row) == (None, None, None)
+    assert db.get_ooto_adjustment(uid, adjustment_id)["status"] == "reverted"
+
+
+def test_revert_keeps_a_completed_displaced_row_as_ridden(client, monkeypatch):
+    """The easy day the replacement landed on top of, ridden regardless."""
+    uid, plan_id, row_ids, adjustment_id = _confirmed(
+        client, monkeypatch, "reschedule",
+    )
+    displaced = next(r for r in db.plan_workouts_for_plan(uid, plan_id)
+                     if r["adjustment_state"] == "displaced")
+    ridden = {k: displaced[k] for k in ("date", "name", "type", "duration_s",
+                                        "tss", "variant", "origin")}
+    _completed(uid, displaced["id"], date=displaced["date"])
+
+    db.delete_ooto_range(uid, db.list_ooto_ranges(uid)[0]["id"])
+
+    after = db.plan_workouts_for_plan(uid, plan_id)
+    assert [r["id"] for r in after] == row_ids
+    row = next(r for r in after if r["id"] == displaced["id"])
+    assert {k: row[k] for k in ridden} == ridden
+    assert row["completed_activity_id"] == 4242
+    assert _markers(row) == (None, None, None)
+    assert db.get_ooto_adjustment(uid, adjustment_id)["status"] == "reverted"
+
+
+def test_a_completed_rows_zwo_is_not_pruned_by_the_revert(client, monkeypatch):
+    """The orphan list drives a file prune, so it must track what survives.
+
+    A completed rebalanced row keeps its date and its re-dosed name through the
+    revert, so its .zwo still describes a session the plan holds; listing it as
+    an orphan would delete a live workout's file.
+    """
+    uid, plan_id, row_ids, adjustment_id = _confirmed(
+        client, monkeypatch, "rebalance",
+    )
+    boosted = next(r for r in db.plan_workouts_for_plan(uid, plan_id)
+                   if r["adjustment_state"] == "rebalanced")
+    ooto_id = db.list_ooto_ranges(uid)[0]["id"]
+    assert db.ooto_range_revert_orphans(uid, ooto_id) == [
+        {"date": boosted["date"], "name": boosted["name"]},
+    ]
+
+    _completed(uid, boosted["id"])
+    assert db.ooto_range_revert_orphans(uid, ooto_id) == []
