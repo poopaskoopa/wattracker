@@ -3566,6 +3566,10 @@ def ooto_range_revert_orphans(
     contradicts the restored plan - a phantom threshold session sitting on a
     day the plan says is easy. Both states are covered here deliberately:
     filtering to one of them is exactly the bug this replaced.
+
+    A COMPLETED row is excluded, because the revert leaves it alone: its row
+    keeps that date and that name, so its .zwo still describes a session the
+    plan holds. Pruning it would delete a live workout's file.
     """
     conn = connect(path)
     try:
@@ -3574,7 +3578,8 @@ def ooto_range_revert_orphans(
             "JOIN ooto_adjustments a ON a.id = w.adjustment_id "
             "WHERE w.user_id = ? AND a.user_id = ? AND a.ooto_id = ? "
             "AND a.status = 'applied' "
-            "AND w.adjustment_state IN ('rescheduled', 'rebalanced')",
+            "AND w.adjustment_state IN ('rescheduled', 'rebalanced') "
+            "AND w.completed_activity_id IS NULL",
             (user_id, user_id, ooto_id),
         ).fetchall()
         return [{"date": r["date"], "name": r["name"]} for r in rows]
@@ -3760,6 +3765,20 @@ def _revert_ooto_adjustment(
       snapshot the apply stored alongside the proposal is written back.
     * ``ooto_canceled`` / ``displaced`` rows were only tombstoned, so clearing
       the adjustment columns is the whole revert.
+
+    ONE ROW IS EXEMPT FROM ALL OF THAT: a row the rider has since RIDDEN. A
+    completed row is a record of what happened, not a prescription that is
+    still up for revision, so the revert never rewrites and never deletes it -
+    it only clears the adjustment columns, which is what hands the row back to
+    reflow and adaptation. Restoring a ``rebalanced`` row's old prescription
+    under its completion would attach a tempo ride to a Zone 2 session that was
+    never done, and completion matching gates on work/recovery contrast, so the
+    mismatch can mint a wrong ``effective_ftp``. Deleting a completed
+    ``rescheduled`` row would be worse still: the rider's activity would lose
+    its plan row outright. This is deliberately NOT a staleness gate - the
+    revert stays unconditional in every other respect (see
+    ``delete_ooto_range``), because refusing to revert leaves the trip deleted
+    and the plan still adjusted.
     """
     try:
         proposal = json.loads(proposal_json or "{}")
@@ -3772,13 +3791,14 @@ def _revert_ooto_adjustment(
         conn.execute(
             "UPDATE plan_workouts SET name = ?, type = ?, duration_s = ?, "
             "tss = ?, zwo_or_segments = ?, variant = ?, export_ftp = ?, "
-            "origin = ? WHERE user_id = ? AND id = ? AND adjustment_id = ?",
+            "origin = ? WHERE user_id = ? AND id = ? AND adjustment_id = ? "
+            "AND completed_activity_id IS NULL",
             (*(snapshot.get(key) for key in _REVERT_KEYS),
              user_id, int(snapshot["id"]), adjustment_id),
         )
     conn.execute(
         "DELETE FROM plan_workouts WHERE user_id = ? AND adjustment_id = ? "
-        "AND adjustment_state = 'rescheduled'",
+        "AND adjustment_state = 'rescheduled' AND completed_activity_id IS NULL",
         (user_id, adjustment_id),
     )
     conn.execute(
