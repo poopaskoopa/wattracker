@@ -3,7 +3,7 @@ name = "wattracker"
 version = "0.1.0"
 description = "Local cross-platform cycling training app for FIT analysis, rider profiling, adaptive workout planning, Zwift export, race/calendar tracking, and optional BLE/ERG riding."
 readme = "README.md"
-requires-python = ">=3.10"
+requires-python = ">=3.12"
 # Minimum versions pin past known-CVE-fixed releases (e.g. jinja2>=3.1.5,
 # python-multipart>=0.0.18) for auditable, reproducible installs.
 dependencies = [

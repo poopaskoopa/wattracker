@@ -25,8 +25,8 @@ IS_MACOS = sys.platform == "darwin"
 def _project_version() -> str:
     """version from pyproject.toml, so the bundle cannot drift from the wheel.
 
-    Parsed with a regex rather than tomllib because the build interpreter is
-    only required to be >=3.10 and tomllib arrived in 3.11.
+    Parsed with a regex to keep version extraction independent of the build
+    interpreter's standard-library modules.
     """
     text = (root / "pyproject.toml").read_text(encoding="utf-8")
     match = re.search(r'(?m)^version\s*=\s*"([^"]+)"', text)
