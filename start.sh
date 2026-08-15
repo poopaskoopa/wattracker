@@ -63,11 +63,21 @@ process_start_time() {
         sed 's/^[[:space:]]*//;s/[[:space:]]*$//'
 }
 
+# The start time is what rules out PID reuse, so a missing one fails closed.
+# The earlier form wrapped the comparison in an `if` with no `else`: a bash
+# function whose last statement is an `if` with a false condition returns 0,
+# so a pidfile carrying only a PID — a legacy file written by a pre-lstart
+# start.sh, or one where `ps -o lstart=` came back empty — skipped the check
+# and passed. Requiring both values costs nothing on upgrade: every successful
+# start rewrites the pidfile with the PID *and* its lstart, so a one-line file
+# self-heals after a single launch.
 recorded_process_is_wattracker() {
+    local actual_start
     process_command_is_wattracker "$1" || return 1
-    if [ "$#" -ge 2 ] && [ -n "$2" ]; then
-        [ "$(process_start_time "$1")" = "$2" ]
-    fi
+    [ "$#" -ge 2 ] && [ -n "$2" ] || return 1
+    actual_start="$(process_start_time "$1")"
+    [ -n "$actual_start" ] || return 1
+    [ "$actual_start" = "$2" ]
 }
 
 log_has_pid_bind() {
