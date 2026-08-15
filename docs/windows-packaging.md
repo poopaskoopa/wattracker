@@ -54,7 +54,7 @@ the artifact name cannot disagree with `AppVersion` either.
 That one field is read in two deliberately different ways:
 
 - **the workflow** uses `python -c "import tomllib; ..."`, because the
-  `package-unsigned` job pins Python 3.13 and can rely on the stdlib parser;
+  `package-unsigned` job pins Python 3.12 and can rely on the stdlib parser;
 - **`packaging/wattracker.spec`** (`_project_version`, used for the macOS bundle
   version) and `tests/test_windows_installer.py` both use a regex instead, and
   say so in a comment. That was forced when the build interpreter and the test
@@ -172,10 +172,12 @@ uninstall (tampered launcher state) to have removed none of them.
 ## CI
 
 The installer is built by the `package-unsigned` job in
-`.github/workflows/windows.yml`, on `windows-latest`, in this order:
+`.github/workflows/windows.yml`, on a **self-hosted Windows runner**
+(`runs-on: [self-hosted, Windows, X64]`), in this order:
 
-1. check out, set up Python **3.13** (the interpreter that gives the inline
-   `tomllib` version read), create a separate `.venv` for the lifecycle test;
+1. check out, set up Python **3.12** (the interpreter that gives the inline
+   `tomllib` version read), assert the runner carries no leftover install state,
+   create a `.venv` **in the workspace** and install everything into it;
 2. **install a pinned Inno Setup compiler.** `innosetup-6.7.3.exe` is downloaded
    from a pinned `github.com/jrsoftware/issrc` release URL, its SHA-256 compared
    against a literal in the workflow, and its Authenticode signature required to
@@ -204,26 +206,91 @@ The digest and publisher checks in step 2 have their own paragraph in
 version, the digest, the hash command and the publisher string so they cannot be
 loosened without a test change.
 
-**Both jobs in `windows.yml`, and `windows-release.yml`, carry
-`if: ${{ false }}`.** The current reason is billing, not access: Actions is
-enabled for this repository - the `Cloud` workflow runs the full test suite on
-every push and pull request - but it does so on a *self-hosted* macOS runner,
-which is not billed. GitHub-hosted minutes are exhausted, and `windows-latest` is
-billable on a private repository, so the Windows jobs stay gated and every
-Windows workflow run is recorded as `skipped`. (The comment in `windows.yml`
-still describes the earlier account-level block that first disabled it.) Until
-hosted minutes are available, the gate for anything in this document is a local
-Windows machine.
+### The runner
+
+GitHub-hosted minutes are exhausted and `windows-latest` is billable on a private
+repository, which is what kept this job gated. Self-hosted runners are not
+billed, which is how the `Cloud` workflow's suite has been running on a
+self-hosted macOS runner all along; `package-unsigned` now takes the same route.
+
+**`windows-release.yml` and the `test` job in `windows.yml` are still gated.**
+The release workflow needs hosted minutes and code-signing secrets, and the suite
+already runs on the macOS runner every push and pull request - duplicating ~6
+minutes of it on the one physical Windows box is not worth the wall time. Only
+the installer job runs here, because it is the only thing that *cannot* run
+anywhere else.
+
+**The runner service runs as a dedicated non-admin local account**
+(`wattracker-ci`), not as the developer's. This is the least obvious decision in
+the setup and the easiest to undo by accident, so: `packaging/smoke_installer.ps1`
+installs to a temp directory via `/DIR=`, but two things it registers cannot be
+redirected anywhere.
+
+- The **Start Menu group name is fixed at compile time.** `wattracker.iss` sets
+  `DisableProgramGroupPage=yes`, and Inno's documentation is explicit that
+  `/GROUP` "is ignored" when it is.
+- The **uninstall key is always `{AppId}_is1`**, and `AppId` is additionally
+  "checked by subsequent installations to determine whether it may append to a
+  particular existing uninstall log."
+
+Both are per-user. Under one account, a real wattracker install on the same
+machine would have its uninstall key repointed at the temp-directory uninstaller
+and then deleted outright when the smoke test uninstalls - silently orphaning it.
+A separate account puts those paths in a different hive entirely. **If you ever
+reconfigure the runner to run as your own account, you re-arm this.**
+
+The job also keeps a pre-flight step that fails if either path already exists.
+That is not the same defence: it catches a run killed *between* install and
+uninstall, whose leftovers would otherwise fail a later run somewhere much harder
+to read.
+
+Two smaller consequences of the runner being a real machine that persists:
+
+- **Everything installs into a workspace `.venv`**, never into the interpreter.
+  On a hosted runner the machine is discarded; here the tool cache outlives the
+  job and pollution would accumulate run over run. `actions/checkout` runs
+  `git clean -ffdx`, so the directory starts empty each time. The path is
+  load-bearing beyond hygiene - `scripts/wattracker.ps1` resolves
+  `<repo>\.venv\Scripts\python.exe` as its last-resort interpreter, which is what
+  lets `tests\windows\lifecycle.ps1` start the app from source.
+- **Runs serialize and are never cancelled.** The workflow sets a `concurrency`
+  group with no `cancel-in-progress`, because cancelling skips
+  `smoke_installer.ps1`'s `finally` block - the thing that uninstalls the product.
+  A queued run is cheaper than a poisoned machine.
+
+### Stopping the runner for a trainer session
+
+The runner shares a machine with the trainer setup, and a service-mode runner
+picks up jobs whenever a pull request opens - including mid-ride. Before a
+session:
+
+```powershell
+Stop-Service "actions.runner.poopaskoopa-wattracker.Windows-TT"
+```
+
+and `Start-Service` the same name afterwards. This is an operational contract,
+not a suggestion: a PyInstaller build and a full install/uninstall cycle are not
+what you want competing for the machine driving a trainer.
+
+The service is named `actions.runner.<owner>-<repo>.<runner name>`, so it follows
+the name the runner registered under rather than the machine's;
+`Get-Service "actions.runner.*"` finds it without guessing. The same object
+confirms the isolation above - `(Get-CimInstance Win32_Service -Filter "Name LIKE
+'actions.runner%'").StartName` must read `.\wattracker-ci`, not
+`NT AUTHORITY\NETWORK SERVICE`.
 
 ## What has never been executed
 
-Be blunt about this. The gate above is not a formality: nothing below has run.
+Be blunt about this. Wiring up the runner did not retroactively verify anything:
+until a run actually completes, everything below is still unobserved. Read this
+as the checklist the first self-hosted run has to clear, and update it against
+observed output rather than against the fact that the job is now enabled.
 
 - **`packaging/wattracker.iss` has never been compiled by this repository.**
-  Every Windows workflow run is recorded as skipped, so no `ISCC` invocation
-  exists in any run log, and Inno Setup does not run on macOS, which is where
-  this repository is developed. A syntax error, a directive the pinned 6.7.3
-  rejects, or a Pascal Script typo in `[Code]` would surface on the first
+  Every Windows workflow run to date is recorded as skipped, so no `ISCC`
+  invocation exists in any run log, and Inno Setup does not run on macOS, which
+  is where this repository is developed. A syntax error, a directive the pinned
+  6.7.3 rejects, or a Pascal Script typo in `[Code]` would surface on the first
   compile. Treat it as a debugging session, not a build.
 - **No installer has ever been installed**, and `packaging/smoke_installer.ps1`
   has never run. The Start Menu shortcut, the upgrade-over-existing-install path

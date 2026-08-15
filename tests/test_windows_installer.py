@@ -83,8 +83,31 @@ def test_launcher_prefers_override_then_frozen_then_source_virtualenv():
     assert "$env:WATTRACKER_EXECUTABLE = $Executable" not in SMOKE
 
 
+def test_workflow_runs_the_installer_job_on_the_self_hosted_runner():
+    """The installer job runs; the suite job does not. Both halves matter.
+
+    `package-unsigned` reverting to a gate would take the only execution of
+    the setup compiler with it - the state this repository was in until the
+    self-hosted runner existed. An ungated `test` job would put a duplicate of
+    the macOS runner's suite on the single physical Windows box.
+    """
+    test_job, package_job = WORKFLOW.split("  package-unsigned:", 1)
+    assert "if: ${{ false }}" in test_job
+    assert "if: ${{ false }}" not in package_job
+    # The `Windows` label is load-bearing: a bare [self-hosted] also matches the
+    # macOS runner that the Cloud workflow uses.
+    assert "runs-on: [self-hosted, Windows, X64]" in package_job
+    # Cancelling mid-job skips smoke_installer.ps1's `finally`, which is what
+    # uninstalls the product - leaving a half-installed application on a runner
+    # that persists between jobs. Serializing is the correct trade.
+    #
+    # Matched as a YAML key, not as a substring: the workflow comment explaining
+    # this decision necessarily contains the word.
+    assert re.search(r"(?m)^\s*concurrency:", WORKFLOW)
+    assert not re.search(r"(?m)^\s*cancel-in-progress\s*:", WORKFLOW)
+
+
 def test_workflow_builds_smokes_and_uploads_portable_and_setup_artifacts():
-    assert 'if: ${{ false }}' in WORKFLOW
     assert "innosetup-6.7.3.exe" in WORKFLOW
     assert "9c73c3bae7ed48d44112a0f48e66742c00090bdb5bef71d9d3c056c66e97b732" in WORKFLOW
     assert "Get-FileHash -LiteralPath $innoInstaller -Algorithm SHA256" in WORKFLOW

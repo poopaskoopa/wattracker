@@ -1,6 +1,8 @@
 """Shared pytest fixtures: isolate config + database in a temp directory."""
+import functools
 import os
 import sys
+import tempfile
 
 import pytest
 
@@ -121,8 +123,40 @@ def cheap_scrypt(monkeypatch):
     )
 
 
+@functools.lru_cache(maxsize=1)
+def symlinks_supported() -> bool:
+    """True when this process is actually allowed to create a symlink.
+
+    Windows gates ``CreateSymbolicLink`` behind SeCreateSymbolicLinkPrivilege,
+    which a standard account only holds with Developer Mode enabled. Without
+    it every ``Path.symlink_to`` raises ``OSError`` WinError 1314, and a test
+    that plants a symlink fails for a reason that has nothing to do with the
+    behaviour it covers.
+
+    This probes rather than branching on ``os.name`` on purpose: the symlink
+    containment checks are worth running on a Windows box that HAS the
+    privilege, and a blanket POSIX-only skip would claim the behaviour is
+    untestable here when it is only unprivileged.
+    """
+    with tempfile.TemporaryDirectory() as probe:
+        link = os.path.join(probe, "link")
+        try:
+            os.symlink(os.path.join(probe, "target"), link, target_is_directory=True)
+        except (OSError, NotImplementedError, AttributeError):
+            return False
+    return True
+
+
+#: Reason string shared by every test skipped for the privilege above, so the
+#: skip report names the machine setting rather than the platform.
+requires_symlinks = pytest.mark.skipif(
+    not symlinks_supported(),
+    reason="creating symlinks needs Developer Mode (SeCreateSymbolicLinkPrivilege) on Windows",
+)
+
+
 def redirect_home(monkeypatch, path) -> None:
-    """Point ``os.path.expanduser("~")`` at *path*, on every platform.
+    r"""Point ``os.path.expanduser("~")`` at *path*, on every platform.
 
     Setting ``HOME`` alone does nothing on Windows: ``ntpath.expanduser``
     reads ``USERPROFILE`` and never consults ``HOME``. A test that redirects
