@@ -31,11 +31,29 @@ port_is_listening() {
         "$HOST" "$PORT" >/dev/null 2>&1
 }
 
+# Match the module invocation, not the exact interpreter path. Framework
+# Python builds (Homebrew python@3.x, the python.org installers) re-exec the
+# interpreter through
+# Python.framework/Versions/X.Y/Resources/Python.app/Contents/MacOS/Python and
+# rewrite argv[0] as they go, so `ps -o command=` reports that path and the
+# venv's "$PYTHON" is nowhere in the command line. Requiring the literal
+# "$PYTHON" here made start.sh unable to recognise its own server on most
+# macOS installs. Do not tighten this back: identity is not established by
+# this function alone. Callers pair it with the pidfile's recorded PID and its
+# recorded `lstart` start time (which is what rules out PID reuse) and with
+# port_is_owned_by; the no-lsof branch of port_is_owned_by additionally
+# requires log_has_pid_bind.
 process_command_is_wattracker() {
-    local command_line
+    local command_line interpreter
     command_line="$(ps -p "$1" -o command= 2>/dev/null || true)"
     case "$command_line" in
         *"$PYTHON -m wattracker"*) return 0 ;;
+        *" -m wattracker"*) ;;
+        *) return 1 ;;
+    esac
+    interpreter="${command_line%% -m wattracker*}"
+    case "${interpreter##*/}" in
+        [Pp]ython|[Pp]ython[0-9]*) return 0 ;;
         *) return 1 ;;
     esac
 }

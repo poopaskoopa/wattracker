@@ -65,6 +65,34 @@ def _without_lsof(path, shim_root):
     return stripped
 
 
+# What `ps -o command=` reports for a venv interpreter on a framework Python
+# build: the process re-execs through the app bundle and rewrites argv[0], so
+# the venv's own path is gone from the command line entirely.
+FRAMEWORK_PYTHON = (
+    "/usr/local/Cellar/python@3.12/3.12.13_4/Frameworks/Python.framework"
+    "/Versions/3.12/Resources/Python.app/Contents/MacOS/Python"
+)
+
+
+def _ps_reporting_framework_python(path, shim_dir):
+    # Prepend a `ps` shim that rewrites the interpreter path of a
+    # "... -m wattracker" command line into the framework form, leaving every
+    # other field (notably `lstart`, which start.sh compares against the
+    # pidfile) untouched. This reproduces on any machine what start.sh sees on
+    # a Homebrew/python.org interpreter.
+    real_ps = shutil.which("ps", path=path)
+    assert real_ps is not None
+    shim_dir.mkdir(parents=True, exist_ok=True)
+    shim = shim_dir / "ps"
+    shim.write_text(
+        "#!/bin/sh\n"
+        f'{real_ps} "$@" | '
+        f"sed 's|[^ ]*/[Pp]ython[0-9.]* -m wattracker|{FRAMEWORK_PYTHON} -m wattracker|'\n"
+    )
+    shim.chmod(0o755)
+    return str(shim_dir) + os.pathsep + path
+
+
 def _make_exe(path):
     path.write_text("#!/bin/sh\nexit 0\n")
     path.chmod(0o755)
@@ -187,7 +215,10 @@ def test_installer_is_local_and_never_escalates_or_installs_globally():
 
 
 def test_installer_checks_python_and_marks_only_success():
-    assert "sys.version_info >= (3, 10)" in INSTALL
+    # Must track pyproject's requires-python, or the installer waves through an
+    # interpreter that pip then rejects with a raw requires-python error.
+    assert "sys.version_info >= (3, 12)" in INSTALL
+    assert "Python 3.12 or newer" in INSTALL
     assert 'if [ -x "$VENV_PYTHON" ]; then' in INSTALL
     pip = INSTALL.index('"$VENV_PYTHON" -m pip install')
     marker = INSTALL.index('> "$MARKER"')
@@ -212,6 +243,10 @@ def test_start_bootstraps_missing_or_stale_environment_before_launching():
     assert 'grep -F "Uvicorn running on"' in START
     assert 'server_is_ready()' in START
     assert 'pgrep -f' not in START
+    # The interpreter-path match must stay tolerant of the framework Python
+    # argv[0] rewrite, and the reason must stay written down next to it.
+    assert "[Pp]ython|[Pp]ython[0-9]*)" in START
+    assert "Python.app/Contents/MacOS/Python" in START
 
 
 def test_quickstart_describes_one_command_first_run_and_current_distribution_limit():
@@ -251,6 +286,58 @@ def test_start_twice_reports_its_own_server_without_starting_a_duplicate(
             _assert_started(first)
             pid = _state_pid(env)
             assert pid is not None
+            second = _run_start(env)
+            output = second.stdout + second.stderr
+            assert second.returncode == 0, output
+            assert "Already running (pid " in output, output
+        finally:
+            if pid is not None:
+                _stop_pid(pid)
+
+
+@pytest.mark.parametrize(
+    "without_lsof",
+    [
+        pytest.param(
+            False,
+            marks=pytest.mark.skipif(
+                shutil.which("lsof") is None,
+                reason="lsof-present behavior requires lsof",
+            ),
+        ),
+        True,
+    ],
+)
+def test_start_recognises_its_own_server_when_ps_reports_framework_python(
+    tmp_path, without_lsof
+):
+    # On a framework Python the interpreter re-execs through
+    # Python.app/Contents/MacOS/Python, so `ps` never shows the venv's
+    # "$PYTHON". Matching that literal path made a second ./start.sh report
+    # "Port N is already in use by something else" and exit 1 instead of
+    # "Already running (pid N)", breaking the "Safe to run twice" contract.
+    with _ready_repo_environment():
+        env = _launcher_env(tmp_path, without_lsof)
+        env["PATH"] = _ps_reporting_framework_python(
+            env["PATH"], tmp_path / "ps-shim"
+        )
+        pid = None
+        try:
+            first = _run_start(env)
+            _assert_started(first)
+            pid = _state_pid(env)
+            assert pid is not None
+
+            shimmed = subprocess.run(
+                ["ps", "-p", str(pid), "-o", "command="],
+                env=env,
+                capture_output=True,
+                text=True,
+                check=True,
+            ).stdout
+            assert FRAMEWORK_PYTHON in shimmed, shimmed
+            assert str(VENV_PYTHON) not in shimmed, shimmed
+
             second = _run_start(env)
             output = second.stdout + second.stderr
             assert second.returncode == 0, output

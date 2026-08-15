@@ -2,7 +2,7 @@
 
 ## macOS or Linux
 
-Install Python 3.10 or newer and Git, then run:
+Install Python 3.12 or newer and Git, then run:
 
 ```sh
 git clone https://github.com/poopaskoopa/wattracker.git
@@ -44,7 +44,7 @@ git pull
 
 ## Windows
 
-The supported source path still requires Python 3.10 or newer and PowerShell:
+The supported source path still requires Python 3.12 or newer and PowerShell:
 
 ```powershell
 git clone https://github.com/poopaskoopa/wattracker.git
