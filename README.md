@@ -91,6 +91,23 @@ candidates. Settings and `WATTRACKER_ACTIVITIES_DIR`,
 On first visit you are redirected to `/login`; create an account at `/register`
 (username + password, min 8 chars). Each account sees only its own data.
 
+### macOS
+
+From the repository root, build the architecture-specific app DMG and SHA-256
+checksum with:
+
+```sh
+packaging/build-macos.sh
+```
+
+The script requires Python 3.12+ and writes
+`release/wattracker-macos-<arch>.dmg` plus its `.sha256` file. Open the DMG and
+copy `wattracker.app` to Applications. Packaging uses the
+`.[dev,ble,package]` extra, which pins PyInstaller 6.16.0. The default ad-hoc
+signing is suitable for local use but does not satisfy Gatekeeper; see
+[the macOS packaging guide](docs/macos-packaging.md) for signing and
+notarization caveats.
+
 ## Test
 
 ```sh

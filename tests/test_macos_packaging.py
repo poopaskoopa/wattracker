@@ -9,12 +9,22 @@ import re
 
 SPEC = Path("packaging/wattracker.spec")
 WORKFLOW = Path(".github/workflows/macos-release.yml")
+MACOS_BUILD = Path("packaging/build-macos.sh")
 
 
 def test_pyinstaller_is_pinned_exactly_in_one_place():
     pyproject = Path("pyproject.toml").read_text()
     pins = re.findall(r'"pyinstaller==([^"]+)"', pyproject)
     assert pins == ["6.16.0"]
+
+
+def test_macos_artifact_architecture_comes_from_build_interpreter():
+    script = MACOS_BUILD.read_text()
+    validation = script.index("sys.version_info >= (3, 12)")
+    architecture = script.index('arch="$("$python_bin" -c')
+    assert architecture > validation
+    assert "import platform; print(platform.machine())" in script
+    assert 'arch="$(uname -m)"' not in script
 
 
 def test_spec_shares_analysis_between_platforms():
@@ -90,6 +100,17 @@ def test_signing_script_fails_closed_without_an_identity_env_var():
     assert 'if [ -n "$identity" ]; then' in script
     assert "do not pass Gatekeeper" in script
     assert "--options runtime --timestamp" in script
+
+
+def test_developer_id_dmg_branch_signs_the_image_without_contents_traversal():
+    script = Path("packaging/sign-macos.sh").read_text()
+    dmg_branch = script.split('if [[ "$target" == *.dmg ]]; then', 1)[1].split(
+        "        return\n", 1
+    )[0]
+    assert 'codesign --force --sign "$identity" --timestamp "$target"' in dmg_branch
+    assert 'codesign --verify --verbose=2 "$target"' in dmg_branch
+    assert "Contents" not in dmg_branch
+    assert "find " not in dmg_branch
 
 
 def test_no_notary_secret_is_ever_passed_on_argv():

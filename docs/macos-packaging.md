@@ -10,7 +10,7 @@ packaging/build-macos.sh
 That creates a throwaway build venv under `build/`, runs the test suite, freezes
 the app, signs it, smoke-tests the signed bundle, and writes
 `release/wattracker-macos-<arch>.dmg` plus a `.sha256`. Set
-`WATTRACKER_BUILD_PYTHON` if `python3` on PATH is older than 3.10 (macOS
+`WATTRACKER_BUILD_PYTHON` if `python3` on PATH is older than 3.12 (macOS
 frequently has a 3.8 in `/Library/Frameworks` ahead of everything else).
 
 ## What gets built
@@ -58,26 +58,30 @@ a proper fix is a menu-bar item or a `/quit` route, neither of which exists yet.
 
 ## Signing
 
-`packaging/sign-macos.sh <path>` has two paths, selected by
+`packaging/sign-macos.sh <path>` accepts the frozen `wattracker.app` or the
+generated DMG. It has two signing paths, selected by
 `WATTRACKER_MACOS_SIGNING_IDENTITY`:
 
 **Ad-hoc (the default, and all this repository can produce today).**
-`codesign -s -` gives the bundle a valid signature bound to no identity. It is
-enough for macOS's exec-time signature validation and for running the app on the
+`codesign -s -` gives the app bundle (and, when the build script signs the
+finished image, the DMG) a valid signature bound to no identity. It is enough
+for macOS's exec-time signature validation and for running the app on the
 machine that built it. It does **not** satisfy Gatekeeper: a user who downloads
 the DMG gets "wattracker is damaged and can't be opened" or a quarantine block,
 and has to clear the quarantine attribute by hand
 (`xattr -d com.apple.quarantine`). Ad-hoc is a build-integrity measure, not a
 distribution measure.
 
-**Developer ID.** Set `WATTRACKER_MACOS_SIGNING_IDENTITY` to the identity name
-and the script signs inside-out (every nested `.dylib`/`.so` first, the bundle
-last) with `--options runtime --timestamp` and
+**Developer ID.** Set `WATTRACKER_MACOS_SIGNING_IDENTITY` to the identity name.
+For the app, the script signs inside-out (every nested `.dylib`/`.so` first,
+the bundle last) with `--options runtime --timestamp` and
 `packaging/macos-entitlements.plist`, verifies with
 `codesign --verify --deep --strict`, and asserts the hardened-runtime flag
-actually landed. It fails closed: an identity that is set but broken aborts
-rather than quietly degrading to ad-hoc, matching `sign-windows.ps1`'s refusal
-to emit an unsigned artifact.
+actually landed. For the DMG, it signs the disk image directly with a secure
+timestamp, verifies it, and then runs the same notarization/stapling flow. It
+fails closed: an identity that is set but broken aborts rather than quietly
+degrading to ad-hoc, matching `sign-windows.ps1`'s refusal to emit an unsigned
+artifact.
 
 The entitlements are the minimum a frozen CPython is known to need -
 `allow-unsigned-executable-memory` for ctypes/libffi trampolines and
@@ -104,12 +108,13 @@ submission. `docs/windows-security.md` holds `sign-windows.ps1` to exactly this
 bar when it refuses to put the PFX password on a child process command line, so
 the macOS script is held to it too.
 
-It archives the bundle with `ditto -c -k --keepParent` (notarytool refuses a
-bare `.app`, and plain `zip` mangles the symlinked framework layout and
-invalidates the signature before Apple ever sees it), runs
-`xcrun notarytool submit --wait`, then staples the ticket into the `.app` so the
-DMG built afterwards carries it, and finally asserts with `stapler validate` and
-`spctl --assess`.
+For the app, it archives the bundle with `ditto -c -k --keepParent` (notarytool
+refuses a bare `.app`, and plain `zip` mangles the symlinked framework layout
+and invalidates the signature before Apple ever sees it), runs
+`xcrun notarytool submit --wait`, then staples the ticket into the `.app` so
+the DMG built afterwards carries it. For the finished DMG, it submits the disk
+image directly, staples its ticket, and finally asserts with `stapler validate`
+and `spctl --assess`.
 
 ## Smoke test
 
