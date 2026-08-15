@@ -52,6 +52,7 @@ or run this from the repository root:
 The first run creates the local environment and installs the app automatically.
 The manual commands below remain useful when you want to activate the virtual
 environment yourself.
+Python 3.12 or newer is required.
 
 ```sh
 python -m venv .venv && . .venv/bin/activate
@@ -61,9 +62,10 @@ python -m wattracker          # serves http://localhost:8000 and opens a browser
 
 ### Windows (native PowerShell)
 
-Windows 10/11 with Python 3.10+ is supported directly; WSL and Docker are not
-required. A packaged installer is under development; the supported setup today
-uses Python and the PowerShell lifecycle script:
+Windows 10/11 with Python 3.12+ is supported directly; WSL and Docker are not
+required. The local unsigned Inno Setup installer definition is
+`packaging/wattracker.iss`; the Python install and PowerShell lifecycle script
+are also available:
 
 ```powershell
 py -m venv .venv
@@ -259,7 +261,7 @@ or `wattracker-restore --restore 1`; a frozen bundle uses
 loopback port.
 
 All GitHub Actions jobs are currently hard-disabled, so the test gate is a
-local `python -m pytest tests` run. The Windows test job targeted Python 3.10,
+local `python -m pytest tests` run. The Windows test job targets Python 3.12,
 matching the project's minimum supported version and the version used in
 development; it is disabled because Actions runs are blocked at the account
 level (failed payment or spending limit) and every run reported a red check
