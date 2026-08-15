@@ -49,6 +49,26 @@ def test_estimate_ftp_recovers_20min_effort():
     assert est == pytest.approx(285.0, abs=1e-6)
 
 
+def test_estimate_ftp_recognizes_zwift_ramp_test():
+    # Five rising one-minute steps after a short warm-up; the final step is
+    # 304W, so Zwift's 75% rule gives 228W.
+    stream = [100.0] * 180 + [w for w in (200.0, 220.0, 240.0, 260.0, 284.0, 304.0) for _ in range(60)]
+    assert power.estimate_ftp([stream]) == pytest.approx(228.0)
+
+
+def test_estimate_ftp_rejects_ordinary_one_minute_intervals():
+    stream = [100.0] * 180 + [w for w in (200.0, 300.0, 200.0, 300.0, 200.0, 300.0) for _ in range(60)]
+    assert power.estimate_ftp([stream]) == 0.0
+
+
+def test_estimate_ftp_rejects_ramp_embedded_in_long_ride():
+    ramp = [100.0] * 180 + [w for w in (200.0, 220.0, 240.0, 260.0, 284.0, 304.0) for _ in range(60)]
+    long_ride = ramp + [120.0] * (45 * 60)
+    assert len(long_ride) > 45 * 60
+    assert power.ramp_test_ftp_candidate(long_ride) == 0.0
+    assert power.estimate_ftp([long_ride]) < 228.0
+
+
 @pytest.mark.parametrize("corrupt", [
     42,
     "300",
