@@ -13,6 +13,8 @@ import uuid
 
 import pytest
 
+from conftest import requires_symlinks
+
 
 ROOT = Path(__file__).resolve().parents[1]
 INSTALL = (ROOT / "scripts" / "install.sh").read_text()
@@ -124,6 +126,7 @@ def _make_exe(path):
     path.chmod(0o755)
 
 
+@requires_symlinks
 def test_without_lsof_hides_lsof_but_keeps_bash_on_usrmerge_layout(tmp_path):
     # Regression test for a usrmerge-style layout (e.g. lsof and bash both
     # live in /usr/bin): dropping the whole directory to hide lsof would

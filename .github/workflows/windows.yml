@@ -7,14 +7,27 @@ on:
 permissions:
   contents: read
 
+# One physical Windows machine backs this workflow, and the installer smoke test
+# below registers per-user state (a Start Menu group, an HKCU uninstall key) that
+# two concurrent jobs would fight over. Serialize per ref.
+#
+# Deliberately no `cancel-in-progress`: packaging/smoke_installer.ps1 uninstalls
+# in a `finally` block, and cancelling a job kills the process before that block
+# runs, leaving a half-installed application behind on a runner that persists
+# between jobs. A queued run is cheaper than a poisoned one.
+concurrency:
+  group: windows-${{ github.ref }}
+
 jobs:
   test:
-    # Hard-disabled: Actions runs are blocked at the account level (failed
-    # payment / spending limit), so every run reported a red "job was not
-    # started" check that could not be distinguished from a real failure.
-    # Windows runners are billable on this private repo, so re-enabling this
-    # needs billing fixed first. Until then the gate is a local run of
-    # `python -m pytest tests`. Drop this `if` to restore the job.
+    # Still gated, but no longer for the original reason. The full suite runs on
+    # every push and pull request in the `Cloud` workflow's self-hosted macOS
+    # job, so duplicating ~6 minutes of it on the single physical Windows box
+    # buys little for the wall time it costs. Windows-specific coverage is a
+    # fair argument for turning this on later; if you do, move it to the
+    # self-hosted runner (`runs-on: [self-hosted, Windows, X64]`) and give it
+    # its own workspace virtual environment the way package-unsigned does,
+    # rather than installing into the runner account's interpreter.
     if: ${{ false }}
     runs-on: windows-latest
     timeout-minutes: 30
@@ -28,8 +41,7 @@ jobs:
       - run: python -m pytest -q
 
   package-unsigned:
-    if: ${{ false }}
-    runs-on: windows-latest
+    runs-on: [self-hosted, Windows, X64]
     timeout-minutes: 45
     steps:
       - uses: actions/checkout@v4
@@ -37,11 +49,45 @@ jobs:
         with:
           python-version: "3.12"
           cache: pip
-      - name: Create lifecycle virtual environment
+
+      # A self-hosted runner keeps whatever the previous job left behind. Two of
+      # the things the installer registers cannot be redirected away from a
+      # shared location: packaging/wattracker.iss sets DisableProgramGroupPage=yes,
+      # which makes Inno ignore /GROUP, so the Start Menu group name is fixed at
+      # compile time; and the uninstall key is always named {AppId}_is1. Both are
+      # per-user, which is why the runner service runs as its own account (see
+      # docs/windows-packaging.md) - that keeps them out of the developer's hive
+      # entirely. What the account cannot prevent is a run that died between
+      # install and uninstall leaving its own state behind, which would then fail
+      # a later run somewhere much harder to read than here.
+      - name: Assert no leftover install state
+        shell: pwsh
+        run: |
+          $leftovers = @(
+            "HKCU:\Software\Microsoft\Windows\CurrentVersion\Uninstall\{63E9478B-5D6D-4D36-9202-E8C7941AD567}_is1"
+            (Join-Path $env:APPDATA "Microsoft\Windows\Start Menu\Programs\wattracker")
+          ) | Where-Object { Test-Path -LiteralPath $_ }
+          if ($leftovers) {
+            $leftovers | ForEach-Object { Write-Host "leftover install state: $_" }
+            throw "A previous run left wattracker install state on this runner. Remove the paths listed above, then re-run."
+          }
+
+      # Everything the job installs goes into a virtual environment inside the
+      # workspace, and nothing is installed into the interpreter itself. On a
+      # hosted runner that distinction does not matter because the whole machine
+      # is discarded; on a self-hosted runner the tool cache outlives the job and
+      # the pollution accumulates run over run. actions/checkout runs
+      # `git clean -ffdx`, so this directory starts empty every time.
+      #
+      # The path is load-bearing beyond hygiene: scripts/wattracker.ps1 resolves
+      # `<repo>\.venv\Scripts\python.exe` as its interpreter of last resort, which
+      # is what lets tests\windows\lifecycle.ps1 start the app from source.
+      - name: Create workspace virtual environment
         shell: pwsh
         run: |
           python -m venv .venv
-          .venv\Scripts\python -m pip install -e ".[dev]"
+          .venv\Scripts\python -m pip install --disable-pip-version-check --upgrade pip
+          .venv\Scripts\python -m pip install --disable-pip-version-check build -e ".[dev,ble,package]"
       - name: Install pinned Inno Setup compiler
         shell: pwsh
         run: |
@@ -79,10 +125,9 @@ jobs:
       - name: Build wheel and installed smoke
         shell: pwsh
         run: |
-          python -m pip install build
-          python -m build --wheel
+          .venv\Scripts\python -m build --wheel
           $smoke = Join-Path $env:RUNNER_TEMP "wheel-smoke"
-          python -m venv $smoke
+          .venv\Scripts\python -m venv $smoke
           & "$smoke\Scripts\python.exe" -m pip install (Get-ChildItem dist\*.whl | Select-Object -First 1).FullName
           Push-Location $env:RUNNER_TEMP
           & "$smoke\Scripts\python.exe" "$env:GITHUB_WORKSPACE\packaging\smoke_installed.py"
@@ -90,11 +135,10 @@ jobs:
       - name: Build onedir and smoke
         shell: pwsh
         run: |
-          python -m pip install ".[ble,package]"
-          pyinstaller --clean --noconfirm packaging\wattracker.spec
+          .venv\Scripts\python -m PyInstaller --clean --noconfirm packaging\wattracker.spec
           powershell -File packaging\smoke_frozen.ps1 -Executable dist\wattracker\wattracker.exe
           Compress-Archive -Path dist\wattracker -DestinationPath dist\wattracker-windows-x64-unsigned.zip
-          $version = python -c "import tomllib; print(tomllib.load(open('pyproject.toml','rb'))['project']['version'])"
+          $version = .venv\Scripts\python -c "import tomllib; print(tomllib.load(open('pyproject.toml','rb'))['project']['version'])"
           ISCC.exe "/DAppVersion=$version" packaging\wattracker.iss
           $setup = "dist\wattracker-$version-windows-x64-unsigned-setup.exe"
           if (-not (Test-Path -LiteralPath $setup)) { throw "Setup compiler produced no artifact" }
