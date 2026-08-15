@@ -88,6 +88,31 @@ def test_update_seeds_first_entry_when_empty(user_id):
     assert db.latest_ftp(user_id)["ftp_watts"] == pytest.approx(285.0, abs=1.5)
 
 
+def test_evaluate_ftp_uses_a_zwift_ramp_test(user_id):
+    now = dt.datetime(2026, 8, 14, 12, 0)
+    stream = [100.0] * 180 + [
+        watts for watts in (200.0, 220.0, 240.0, 260.0, 284.0, 304.0)
+        for _ in range(60)
+    ]
+    db.insert_activity(
+        user_id,
+        {
+            "dedup_hash": "zwift-ramp-test",
+            "filename": "zwift-ramp.fit",
+            "start_time": (now - dt.timedelta(days=1)).isoformat(),
+            "duration_s": len(stream),
+            "avg_power": sum(stream) / len(stream),
+            "np": 0.0,
+            "streams": {"power": stream},
+        },
+    )
+
+    assert importer.evaluate_ftp(user_id, now) is True
+    latest = db.latest_ftp(user_id)
+    assert latest["source"] == "estimated"
+    assert latest["ftp_watts"] == pytest.approx(228.0, abs=0.5)
+
+
 def test_recent_best_effort_ftp_is_undecayed_90_day_estimate(user_id):
     now = dt.datetime(2026, 7, 1, 12, 0)
     _insert_activity(

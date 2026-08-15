@@ -399,6 +399,56 @@ def best_20min_power(power: Sequence[float]) -> float:
     return float(roll.max())
 
 
+def ramp_test_ftp_candidate(power: Sequence[float]) -> float:
+    """Return an FTP candidate from a conservatively recognized ramp test.
+
+    Zwift's ramp result is 75% of the highest one-minute step.  To avoid
+    treating an ordinary sprint, interval, or long-ride hill as a ramp, this
+    recognizes only streams no longer than 45 minutes (the conservative upper
+    bound for a 10-20 minute ramp workout plus cooldown), containing five or
+    more consecutive, non-overlapping 60-second blocks whose power is fairly
+    steady (at most 12 W sample standard deviation), rises by 8-35 W each
+    minute, and has a preceding minute at least 20 W below the first block.
+    The 8-35 W slope range covers normal 10-30 W/min ramps while the preceding
+    low minute requires the short warm-up/ramp transition.
+
+    The block alignment is allowed to move by up to 59 seconds because stored
+    streams need not begin on a step boundary.  A result of 0.0 means that no
+    sufficiently distinctive ramp was found.
+    """
+    arr = _clean_power(power)
+    block = 60
+    if arr.size < 6 * block or arr.size > 45 * 60:
+        return 0.0
+
+    best_step = 0.0
+    # A real stream may start part-way through the warm-up, so inspect every
+    # possible start in the first 15 minutes.  Ramp warm-ups are short; this
+    # bound also prevents a long ride from turning into a quadratic scan.
+    for start in range(min(15 * 60, arr.size - 6 * block) + 1):
+        means = []
+        stable = True
+        pos = start
+        while pos + block <= arr.size:
+            chunk = arr[pos:pos + block]
+            if float(chunk.std()) > 12.0:
+                stable = False
+                break
+            mean = float(chunk.mean())
+            if means and not 8.0 <= mean - means[-1] <= 35.0:
+                break
+            means.append(mean)
+            pos += block
+        if not stable or len(means) < 5:
+            continue
+        # Require the detected run to begin after a clearly lower warm-up
+        # minute.  This rejects a sequence of rising intervals in isolation.
+        if start < block or float(arr[start - block:start].mean()) > means[0] - 20.0:
+            continue
+        best_step = max(best_step, max(means))
+    return best_step * 0.75
+
+
 def _split_activities(activities: Iterable):
     """Split a mixed activity iterable into efforts and the activity calendar.
 
@@ -541,16 +591,20 @@ def estimate_ftp(
     window_days: "int | None" = None,
     now=None,
 ) -> float:
-    """Estimate FTP as best (detraining-weighted) 20-min power * 0.95.
+    """Estimate FTP from dated 20-minute efforts and recognized ramp tests.
 
-    Each dated effort contributes ``best_20min_power * detraining_factor(...)``
-    where the factor is derived from the rider's activity calendar between the
-    effort and ``now`` (see ``detraining_factor`` / ``_idle_active_days``):
-    detraining accrues only during INACTIVITY, so an effort ridden while the
+    Each dated effort contributes the best of ``best_20min_power`` and the
+    raw-equivalent of a recognized ramp candidate (highest one-minute step
+    * 0.75 / 0.95), multiplied by ``detraining_factor(...)`` where the factor is
+    derived from the rider's activity calendar between the effort and ``now``
+    (see ``detraining_factor`` / ``_idle_active_days``). The final 0.95 factor
+    is applied once, after selecting the best decayed raw-equivalent effort, so
+    the established ``0.95 * best_decayed`` invariant remains intact while a
+    ramp result still means exactly 75% of its highest step.
+    Detraining accrues only during INACTIVITY, so an effort ridden while the
     rider kept training barely decays, while an effort followed by a long layoff
-    decays substantially. The estimate is 0.95 * the maximum weighted value, so a
-    recent hard effort dominates and old efforts fade smoothly rather than
-    cliffing to zero.
+    decays substantially. A recent hard effort dominates and old efforts fade
+    smoothly rather than cliffing to zero.
 
     That figure is then floored by ``recent_effort_floor``: a rider who only
     does structured ERG work never rides a maximal 20 minutes, so the decayed
@@ -574,17 +628,19 @@ def estimate_ftp(
     activities = list(activities)
     efforts, activity_days = _split_activities(activities)
 
-    best = 0.0
+    best_decayed = 0.0
     for when, stream, _rpe in efforts:
         b = best_20min_power(stream)
-        if b <= 0:
+        ramp = ramp_test_ftp_candidate(stream)
+        candidate = max(b, ramp / 0.95 if ramp > 0 else 0.0)
+        if candidate <= 0:
             continue
         if now is not None and when is not None:
             idle, active = _idle_active_days(when, now, activity_days)
-            b *= detraining_factor(idle, active)
-        if b > best:
-            best = b
-    decayed = best * 0.95
+            candidate *= detraining_factor(idle, active)
+        if candidate > best_decayed:
+            best_decayed = candidate
+    decayed = best_decayed * 0.95
     if now is None:
         return decayed
     return max(decayed, recent_effort_floor(activities, now))
