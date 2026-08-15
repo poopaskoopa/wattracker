@@ -2,6 +2,7 @@
 import contextlib
 import os
 from pathlib import Path
+import re
 import shutil
 import signal
 import socket
@@ -16,9 +17,33 @@ ROOT = Path(__file__).resolve().parents[1]
 INSTALL = (ROOT / "scripts" / "install.sh").read_text()
 START = (ROOT / "start.sh").read_text()
 QUICKSTART = (ROOT / "docs" / "quickstart.md").read_text()
+PYPROJECT = (ROOT / "pyproject.toml").read_text()
+CLOUD_WORKFLOW = (ROOT / ".github" / "workflows" / "cloud.yml").read_text()
 START_SCRIPT = ROOT / "start.sh"
 VENV_PYTHON = ROOT / ".venv" / "bin" / "python"
 INSTALL_MARKER = ROOT / ".venv" / ".wattracker-installed"
+
+
+def _requires_python_floor():
+    """The (major, minor) floor declared by pyproject's requires-python.
+
+    Read by regex rather than tomllib, matching tests/test_windows_installer.py.
+    """
+    match = re.search(
+        r'^requires-python\s*=\s*"\s*>=\s*(\d+)\.(\d+)', PYPROJECT, re.MULTILINE
+    )
+    assert match, "pyproject.toml has no parsable requires-python floor"
+    return match.group(1), match.group(2)
+
+
+def _version_gates(text):
+    """Every `sys.version_info >= (x, y)` floor asserted in a file."""
+    return set(re.findall(r"sys\.version_info\s*>=\s*\((\d+),\s*(\d+)\)", text))
+
+
+def _prose_floors(text):
+    """Every "Python x.y or newer" floor stated in prose."""
+    return set(re.findall(r"Python (\d+)\.(\d+) or newer", text))
 
 
 def _free_port():
@@ -214,11 +239,29 @@ def test_installer_is_local_and_never_escalates_or_installs_globally():
     assert "global pip install" in INSTALL
 
 
-def test_installer_checks_python_and_marks_only_success():
-    # Must track pyproject's requires-python, or the installer waves through an
-    # interpreter that pip then rejects with a raw requires-python error.
-    assert "sys.version_info >= (3, 12)" in INSTALL
-    assert "Python 3.12 or newer" in INSTALL
+def test_installer_gate_and_messages_track_requires_python():
+    # Derived from pyproject, not hardcoded: this gate has already drifted once
+    # (#104 raised requires-python to >=3.12 and left the installer at 3.10),
+    # which waved a too-old interpreter past the friendly check and into a raw
+    # pip requires-python error. A hardcoded literal here would have stayed
+    # green through exactly that drift. Set equality, not membership, so a
+    # half-finished bump that updates one of the two gates or two of the three
+    # messages fails too.
+    floor = _requires_python_floor()
+    assert _version_gates(INSTALL) == {floor}, INSTALL
+    assert _prose_floors(INSTALL) == {floor}, INSTALL
+
+
+def test_ci_and_quickstart_version_floors_track_requires_python():
+    floor = _requires_python_floor()
+    # A CI gate below requires-python is worse than none: it passes, then the
+    # install resolves nothing and the failure surfaces as a dependency error.
+    assert _version_gates(CLOUD_WORKFLOW) == {floor}, CLOUD_WORKFLOW
+    assert f"requires-python of {floor[0]}.{floor[1]}" in CLOUD_WORKFLOW
+    assert _prose_floors(QUICKSTART) == {floor}, QUICKSTART
+
+
+def test_installer_marks_only_success():
     assert 'if [ -x "$VENV_PYTHON" ]; then' in INSTALL
     pip = INSTALL.index('"$VENV_PYTHON" -m pip install')
     marker = INSTALL.index('> "$MARKER"')
@@ -342,6 +385,55 @@ def test_start_recognises_its_own_server_when_ps_reports_framework_python(
             output = second.stdout + second.stderr
             assert second.returncode == 0, output
             assert "Already running (pid " in output, output
+        finally:
+            if pid is not None:
+                _stop_pid(pid)
+
+
+@pytest.mark.parametrize(
+    "damage", ["mismatched_start_time", "missing_start_time"]
+)
+def test_start_refuses_a_pid_whose_recorded_start_time_does_not_hold(
+    tmp_path, damage
+):
+    # The recorded `lstart` is the compensating control for matching the
+    # command line loosely: after PID reuse the live PID can run something
+    # that looks exactly like our server, and only the start time separates
+    # them. Rewriting the pidfile's second line reproduces that without
+    # waiting for the PID space to wrap — same live PID, same command line,
+    # start time the pidfile cannot vouch for.
+    #
+    # `missing_start_time` is the same guard from the other side: a one-line
+    # pidfile (a legacy file from a pre-lstart start.sh, or one written when
+    # `ps -o lstart=` returned nothing) must fail closed rather than skip the
+    # comparison. It self-heals — the next successful start writes both lines.
+    #
+    # test_start_does_not_trust_a_reused_pid_without_lsof does not cover this:
+    # its stale process runs a different command line, so it is rejected by
+    # the command match before the start time is ever consulted.
+    with _ready_repo_environment():
+        env = _launcher_env(tmp_path, without_lsof=False)
+        pid = None
+        try:
+            _assert_started(_run_start(env))
+            pid = _state_pid(env)
+            assert pid is not None
+            pid_file = Path(env["WATTRACKER_HOME"]) / "server.pid"
+            lines = pid_file.read_text().splitlines()
+            assert len(lines) >= 2 and lines[1].strip(), lines
+            if damage == "mismatched_start_time":
+                pid_file.write_text(f"{pid}\nThu Jan  1 00:00:00 2015\n")
+            else:
+                pid_file.write_text(f"{pid}\n")
+
+            second = _run_start(env)
+            output = second.stdout + second.stderr
+            # Unproven, so start.sh must not claim the process as its own —
+            # and must still refuse to start a duplicate on the held port.
+            assert "Already running (pid " not in output, output
+            assert second.returncode == 1, output
+            assert "already in use by something else" in output, output
+            assert _state_pid(env) == pid, "the pidfile must not be overwritten"
         finally:
             if pid is not None:
                 _stop_pid(pid)
