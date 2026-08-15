@@ -47,6 +47,13 @@ sign_developer_id() {
         echo "missing entitlements file: $entitlements" >&2
         exit 1
     fi
+    if [[ "$target" == *.dmg ]]; then
+        codesign --force --sign "$identity" --timestamp "$target"
+        codesign --verify --verbose=2 "$target"
+        echo "Developer ID signed and verified: $target"
+        notarize "$target"
+        return
+    fi
     # Inside-out: every nested Mach-O first, the bundle itself last. Signing the
     # outer bundle before its contents produces a signature that verifies today
     # and breaks the moment anything nested is touched.
@@ -101,6 +108,14 @@ notarize() {
         echo "NOTE: no notary credentials set; $target is signed but NOT notarized." >&2
         echo "      Gatekeeper will still refuse it on another Mac." >&2
         return 0
+    fi
+    if [[ "$target" == *.dmg ]]; then
+        xcrun notarytool submit "$target" "${creds[@]}" --wait
+        xcrun stapler staple "$target"
+        xcrun stapler validate "$target"
+        spctl --assess --type open --verbose=2 "$target"
+        echo "Notarized and stapled: $target"
+        return
     fi
     # notarytool only accepts a zip, dmg or pkg - never a bare .app directory.
     # ditto -c -k --keepParent is the archiver Apple documents for this; plain

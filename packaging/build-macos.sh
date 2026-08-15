@@ -22,13 +22,13 @@ python_bin="${WATTRACKER_BUILD_PYTHON:-python3}"
 # macOS still ships an ancient python3 in /Library/Frameworks on many machines,
 # and a `python3 -m venv` that silently builds against 3.8 fails much later with
 # an unrecognisable dependency-resolution error. Check it here instead.
-if ! "$python_bin" -c 'import sys; sys.exit(0 if sys.version_info >= (3, 10) else 1)'; then
-    echo "$python_bin is older than 3.10; set WATTRACKER_BUILD_PYTHON to a newer interpreter" >&2
+if ! "$python_bin" -c 'import sys; sys.exit(0 if sys.version_info >= (3, 12) else 1)'; then
+    echo "$python_bin is older than 3.12; set WATTRACKER_BUILD_PYTHON to a newer interpreter" >&2
     exit 1
 fi
 
 venv="$root/build/macos-build-venv"
-arch="$(uname -m)"
+arch="$("$python_bin" -c 'import platform; print(platform.machine())')"
 name="wattracker-macos-$arch"
 
 echo "==> creating build environment ($python_bin)"
