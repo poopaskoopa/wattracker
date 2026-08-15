@@ -22,10 +22,9 @@ def test_installer_is_stable_per_user_and_ships_the_full_payload():
 
 
 def test_version_comes_from_pyproject_compile_define():
-    # Regex rather than tomllib: tomllib arrived in 3.11 and this project
-    # supports >=3.10, so importing it here broke collection of the whole
-    # suite on the declared minimum interpreter. packaging/wattracker.spec
-    # reads the version the same way, for the same reason.
+    # Regex rather than tomllib keeps collection independent of the test
+    # runner's standard-library modules. packaging/wattracker.spec reads the
+    # version the same way.
     match = re.search(
         r'(?m)^version\s*=\s*"([^"]+)"',
         (ROOT / "pyproject.toml").read_text(encoding="utf-8"),
