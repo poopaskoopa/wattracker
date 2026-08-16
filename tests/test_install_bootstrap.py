@@ -2,6 +2,7 @@
 import contextlib
 import os
 from pathlib import Path
+import re
 import shutil
 import signal
 import socket
@@ -16,9 +17,33 @@ ROOT = Path(__file__).resolve().parents[1]
 INSTALL = (ROOT / "scripts" / "install.sh").read_text()
 START = (ROOT / "start.sh").read_text()
 QUICKSTART = (ROOT / "docs" / "quickstart.md").read_text()
+PYPROJECT = (ROOT / "pyproject.toml").read_text()
+CLOUD_WORKFLOW = (ROOT / ".github" / "workflows" / "cloud.yml").read_text()
 START_SCRIPT = ROOT / "start.sh"
 VENV_PYTHON = ROOT / ".venv" / "bin" / "python"
 INSTALL_MARKER = ROOT / ".venv" / ".wattracker-installed"
+
+
+def _requires_python_floor():
+    """The (major, minor) floor declared by pyproject's requires-python.
+
+    Read by regex rather than tomllib, matching tests/test_windows_installer.py.
+    """
+    match = re.search(
+        r'^requires-python\s*=\s*"\s*>=\s*(\d+)\.(\d+)', PYPROJECT, re.MULTILINE
+    )
+    assert match, "pyproject.toml has no parsable requires-python floor"
+    return match.group(1), match.group(2)
+
+
+def _version_gates(text):
+    """Every `sys.version_info >= (x, y)` floor asserted in a file."""
+    return set(re.findall(r"sys\.version_info\s*>=\s*\((\d+),\s*(\d+)\)", text))
+
+
+def _prose_floors(text):
+    """Every "Python x.y or newer" floor stated in prose."""
+    return set(re.findall(r"Python (\d+)\.(\d+) or newer", text))
 
 
 def _free_port():
@@ -63,6 +88,34 @@ def _without_lsof(path, shim_root):
     assert shutil.which("bash", path=stripped) is not None
     assert shutil.which("env", path=stripped) is not None
     return stripped
+
+
+# What `ps -o command=` reports for a venv interpreter on a framework Python
+# build: the process re-execs through the app bundle and rewrites argv[0], so
+# the venv's own path is gone from the command line entirely.
+FRAMEWORK_PYTHON = (
+    "/usr/local/Cellar/python@3.12/3.12.13_4/Frameworks/Python.framework"
+    "/Versions/3.12/Resources/Python.app/Contents/MacOS/Python"
+)
+
+
+def _ps_reporting_framework_python(path, shim_dir):
+    # Prepend a `ps` shim that rewrites the interpreter path of a
+    # "... -m wattracker" command line into the framework form, leaving every
+    # other field (notably `lstart`, which start.sh compares against the
+    # pidfile) untouched. This reproduces on any machine what start.sh sees on
+    # a Homebrew/python.org interpreter.
+    real_ps = shutil.which("ps", path=path)
+    assert real_ps is not None
+    shim_dir.mkdir(parents=True, exist_ok=True)
+    shim = shim_dir / "ps"
+    shim.write_text(
+        "#!/bin/sh\n"
+        f'{real_ps} "$@" | '
+        f"sed 's|[^ ]*/[Pp]ython[0-9.]* -m wattracker|{FRAMEWORK_PYTHON} -m wattracker|'\n"
+    )
+    shim.chmod(0o755)
+    return str(shim_dir) + os.pathsep + path
 
 
 def _make_exe(path):
@@ -186,8 +239,29 @@ def test_installer_is_local_and_never_escalates_or_installs_globally():
     assert "global pip install" in INSTALL
 
 
-def test_installer_checks_python_and_marks_only_success():
-    assert "sys.version_info >= (3, 10)" in INSTALL
+def test_installer_gate_and_messages_track_requires_python():
+    # Derived from pyproject, not hardcoded: this gate has already drifted once
+    # (#104 raised requires-python to >=3.12 and left the installer at 3.10),
+    # which waved a too-old interpreter past the friendly check and into a raw
+    # pip requires-python error. A hardcoded literal here would have stayed
+    # green through exactly that drift. Set equality, not membership, so a
+    # half-finished bump that updates one of the two gates or two of the three
+    # messages fails too.
+    floor = _requires_python_floor()
+    assert _version_gates(INSTALL) == {floor}, INSTALL
+    assert _prose_floors(INSTALL) == {floor}, INSTALL
+
+
+def test_ci_and_quickstart_version_floors_track_requires_python():
+    floor = _requires_python_floor()
+    # A CI gate below requires-python is worse than none: it passes, then the
+    # install resolves nothing and the failure surfaces as a dependency error.
+    assert _version_gates(CLOUD_WORKFLOW) == {floor}, CLOUD_WORKFLOW
+    assert f"requires-python of {floor[0]}.{floor[1]}" in CLOUD_WORKFLOW
+    assert _prose_floors(QUICKSTART) == {floor}, QUICKSTART
+
+
+def test_installer_marks_only_success():
     assert 'if [ -x "$VENV_PYTHON" ]; then' in INSTALL
     pip = INSTALL.index('"$VENV_PYTHON" -m pip install')
     marker = INSTALL.index('> "$MARKER"')
@@ -212,6 +286,10 @@ def test_start_bootstraps_missing_or_stale_environment_before_launching():
     assert 'grep -F "Uvicorn running on"' in START
     assert 'server_is_ready()' in START
     assert 'pgrep -f' not in START
+    # The interpreter-path match must stay tolerant of the framework Python
+    # argv[0] rewrite, and the reason must stay written down next to it.
+    assert "[Pp]ython|[Pp]ython[0-9]*)" in START
+    assert "Python.app/Contents/MacOS/Python" in START
 
 
 def test_quickstart_describes_one_command_first_run_and_current_distribution_limit():
@@ -255,6 +333,107 @@ def test_start_twice_reports_its_own_server_without_starting_a_duplicate(
             output = second.stdout + second.stderr
             assert second.returncode == 0, output
             assert "Already running (pid " in output, output
+        finally:
+            if pid is not None:
+                _stop_pid(pid)
+
+
+@pytest.mark.parametrize(
+    "without_lsof",
+    [
+        pytest.param(
+            False,
+            marks=pytest.mark.skipif(
+                shutil.which("lsof") is None,
+                reason="lsof-present behavior requires lsof",
+            ),
+        ),
+        True,
+    ],
+)
+def test_start_recognises_its_own_server_when_ps_reports_framework_python(
+    tmp_path, without_lsof
+):
+    # On a framework Python the interpreter re-execs through
+    # Python.app/Contents/MacOS/Python, so `ps` never shows the venv's
+    # "$PYTHON". Matching that literal path made a second ./start.sh report
+    # "Port N is already in use by something else" and exit 1 instead of
+    # "Already running (pid N)", breaking the "Safe to run twice" contract.
+    with _ready_repo_environment():
+        env = _launcher_env(tmp_path, without_lsof)
+        env["PATH"] = _ps_reporting_framework_python(
+            env["PATH"], tmp_path / "ps-shim"
+        )
+        pid = None
+        try:
+            first = _run_start(env)
+            _assert_started(first)
+            pid = _state_pid(env)
+            assert pid is not None
+
+            shimmed = subprocess.run(
+                ["ps", "-p", str(pid), "-o", "command="],
+                env=env,
+                capture_output=True,
+                text=True,
+                check=True,
+            ).stdout
+            assert FRAMEWORK_PYTHON in shimmed, shimmed
+            assert str(VENV_PYTHON) not in shimmed, shimmed
+
+            second = _run_start(env)
+            output = second.stdout + second.stderr
+            assert second.returncode == 0, output
+            assert "Already running (pid " in output, output
+        finally:
+            if pid is not None:
+                _stop_pid(pid)
+
+
+@pytest.mark.parametrize(
+    "damage", ["mismatched_start_time", "missing_start_time"]
+)
+def test_start_refuses_a_pid_whose_recorded_start_time_does_not_hold(
+    tmp_path, damage
+):
+    # The recorded `lstart` is the compensating control for matching the
+    # command line loosely: after PID reuse the live PID can run something
+    # that looks exactly like our server, and only the start time separates
+    # them. Rewriting the pidfile's second line reproduces that without
+    # waiting for the PID space to wrap — same live PID, same command line,
+    # start time the pidfile cannot vouch for.
+    #
+    # `missing_start_time` is the same guard from the other side: a one-line
+    # pidfile (a legacy file from a pre-lstart start.sh, or one written when
+    # `ps -o lstart=` returned nothing) must fail closed rather than skip the
+    # comparison. It self-heals — the next successful start writes both lines.
+    #
+    # test_start_does_not_trust_a_reused_pid_without_lsof does not cover this:
+    # its stale process runs a different command line, so it is rejected by
+    # the command match before the start time is ever consulted.
+    with _ready_repo_environment():
+        env = _launcher_env(tmp_path, without_lsof=False)
+        pid = None
+        try:
+            _assert_started(_run_start(env))
+            pid = _state_pid(env)
+            assert pid is not None
+            pid_file = Path(env["WATTRACKER_HOME"]) / "server.pid"
+            lines = pid_file.read_text().splitlines()
+            assert len(lines) >= 2 and lines[1].strip(), lines
+            if damage == "mismatched_start_time":
+                pid_file.write_text(f"{pid}\nThu Jan  1 00:00:00 2015\n")
+            else:
+                pid_file.write_text(f"{pid}\n")
+
+            second = _run_start(env)
+            output = second.stdout + second.stderr
+            # Unproven, so start.sh must not claim the process as its own —
+            # and must still refuse to start a duplicate on the held port.
+            assert "Already running (pid " not in output, output
+            assert second.returncode == 1, output
+            assert "already in use by something else" in output, output
+            assert _state_pid(env) == pid, "the pidfile must not be overwritten"
         finally:
             if pid is not None:
                 _stop_pid(pid)

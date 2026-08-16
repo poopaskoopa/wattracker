@@ -13,19 +13,19 @@ VENV_PYTHON="$VENV/bin/python"
 MARKER="$VENV/.wattracker-installed"
 
 if [ -x "$VENV_PYTHON" ]; then
-    if ! "$VENV_PYTHON" -c 'import sys; sys.exit(0 if sys.version_info >= (3, 10) else 1)'; then
-        echo "The existing environment needs Python 3.10 or newer: $VENV_PYTHON" >&2
+    if ! "$VENV_PYTHON" -c 'import sys; sys.exit(0 if sys.version_info >= (3, 12) else 1)'; then
+        echo "The existing environment needs Python 3.12 or newer: $VENV_PYTHON" >&2
         exit 1
     fi
 else
     if ! command -v "$PYTHON" >/dev/null 2>&1; then
         echo "Python was not found: $PYTHON" >&2
-        echo "Install Python 3.10 or newer, or set WATTRACKER_PYTHON to its path." >&2
+        echo "Install Python 3.12 or newer, or set WATTRACKER_PYTHON to its path." >&2
         exit 1
     fi
 
-    if ! "$PYTHON" -c 'import sys; sys.exit(0 if sys.version_info >= (3, 10) else 1)'; then
-        echo "wattracker requires Python 3.10 or newer: $PYTHON" >&2
+    if ! "$PYTHON" -c 'import sys; sys.exit(0 if sys.version_info >= (3, 12) else 1)'; then
+        echo "wattracker requires Python 3.12 or newer: $PYTHON" >&2
         exit 1
     fi
 

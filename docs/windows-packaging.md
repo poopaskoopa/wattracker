@@ -57,10 +57,16 @@ That one field is read in two deliberately different ways:
   `package-unsigned` job pins Python 3.13 and can rely on the stdlib parser;
 - **`packaging/wattracker.spec`** (`_project_version`, used for the macOS bundle
   version) and `tests/test_windows_installer.py` both use a regex instead, and
-  say so in a comment, because the build interpreter and the test interpreter
-  are only required to be `>=3.10` while `tomllib` arrived in 3.11. Importing
-  `tomllib` in the test module broke collection of the whole suite on the
-  declared minimum interpreter.
+  say so in a comment. That was forced when the build interpreter and the test
+  interpreter were only required to be `>=3.10` while `tomllib` arrived in
+  3.11: importing `tomllib` in the test module broke collection of the whole
+  suite on the declared minimum interpreter.
+
+  That constraint is gone. `requires-python` is `>=3.12`, so `tomllib` is in
+  the stdlib of every interpreter allowed to build or test this project, and
+  the regex is no longer necessary — only harmless. Converting those two call
+  sites (and retiring the comments that justify them) is a follow-up, not part
+  of the change that raised the floor.
 
 ## Installer choices
 

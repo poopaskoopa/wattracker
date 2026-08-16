@@ -25,7 +25,7 @@ jobs:
       - name: Provision Python and install dependencies
         # Pinning the interpreter is required, not cosmetic: the runner's bare
         # `python3` is macOS's own 3.9 (3.8 is even earlier on PATH), both below
-        # this project's requires-python of 3.10. pip silently filters out every
+        # this project's requires-python of 3.12. pip silently filters out every
         # distribution whose Requires-Python excludes the interpreter, so the
         # failure surfaces as "No matching distribution found for
         # fastapi>=0.138.2" - a dependency floor that looks wrong but is not.
@@ -48,7 +48,7 @@ jobs:
           # native arm64 and gets prebuilt wheels.
           uv venv --python 3.12 --python-preference only-managed .ci-venv
           uv pip install --python .ci-venv/bin/python -e ".[dev,cloud]"
-          .ci-venv/bin/python -c "import sys; assert sys.version_info >= (3, 10), sys.version; print(sys.version)"
+          .ci-venv/bin/python -c "import sys; assert sys.version_info >= (3, 12), sys.version; print(sys.version)"
 
       - name: Verify cloud imports
         run: |
