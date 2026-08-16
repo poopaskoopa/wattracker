@@ -31,11 +31,29 @@ port_is_listening() {
         "$HOST" "$PORT" >/dev/null 2>&1
 }
 
+# Match the module invocation, not the exact interpreter path. Framework
+# Python builds (Homebrew python@3.x, the python.org installers) re-exec the
+# interpreter through
+# Python.framework/Versions/X.Y/Resources/Python.app/Contents/MacOS/Python and
+# rewrite argv[0] as they go, so `ps -o command=` reports that path and the
+# venv's "$PYTHON" is nowhere in the command line. Requiring the literal
+# "$PYTHON" here made start.sh unable to recognise its own server on most
+# macOS installs. Do not tighten this back: identity is not established by
+# this function alone. Callers pair it with the pidfile's recorded PID and its
+# recorded `lstart` start time (which is what rules out PID reuse) and with
+# port_is_owned_by; the no-lsof branch of port_is_owned_by additionally
+# requires log_has_pid_bind.
 process_command_is_wattracker() {
-    local command_line
+    local command_line interpreter
     command_line="$(ps -p "$1" -o command= 2>/dev/null || true)"
     case "$command_line" in
         *"$PYTHON -m wattracker"*) return 0 ;;
+        *" -m wattracker"*) ;;
+        *) return 1 ;;
+    esac
+    interpreter="${command_line%% -m wattracker*}"
+    case "${interpreter##*/}" in
+        [Pp]ython|[Pp]ython[0-9]*) return 0 ;;
         *) return 1 ;;
     esac
 }
@@ -45,11 +63,21 @@ process_start_time() {
         sed 's/^[[:space:]]*//;s/[[:space:]]*$//'
 }
 
+# The start time is what rules out PID reuse, so a missing one fails closed.
+# The earlier form wrapped the comparison in an `if` with no `else`: a bash
+# function whose last statement is an `if` with a false condition returns 0,
+# so a pidfile carrying only a PID — a legacy file written by a pre-lstart
+# start.sh, or one where `ps -o lstart=` came back empty — skipped the check
+# and passed. Requiring both values costs nothing on upgrade: every successful
+# start rewrites the pidfile with the PID *and* its lstart, so a one-line file
+# self-heals after a single launch.
 recorded_process_is_wattracker() {
+    local actual_start
     process_command_is_wattracker "$1" || return 1
-    if [ "$#" -ge 2 ] && [ -n "$2" ]; then
-        [ "$(process_start_time "$1")" = "$2" ]
-    fi
+    [ "$#" -ge 2 ] && [ -n "$2" ] || return 1
+    actual_start="$(process_start_time "$1")"
+    [ -n "$actual_start" ] || return 1
+    [ "$actual_start" = "$2" ]
 }
 
 log_has_pid_bind() {
