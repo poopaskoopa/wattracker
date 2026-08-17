@@ -1,7 +1,12 @@
-"""Tests for the CP / W' model fit."""
+"""Tests for the CP / W' model fit and dashboard curve payload."""
+import datetime as dt
+
 import pytest
 
+from wattracker import db
+from wattracker.analysis import pipeline
 from wattracker.metrics import curve
+from wattracker.timeutil import utc_now
 
 
 def test_fit_recovers_planted_cp_wprime():
@@ -118,3 +123,31 @@ def test_mmp_has_a_point_at_every_grid_duration_with_data():
     mmp = curve.mean_maximal_power([stream])
     expected = [d for d in curve.MMP_DURATIONS if d <= 1200]
     assert sorted(mmp.keys()) == expected
+
+
+def test_curve_payload_keeps_90_day_measured_and_adds_effective_variants(user_id):
+    def add(key, when, watts):
+        return db.insert_activity(user_id, {
+            "dedup_hash": key, "filename": f"{key}.fit", "start_time": when.isoformat(),
+            "duration_s": 60, "avg_power": watts, "np": watts, "if_": 1.0,
+            "tss": 10.0, "streams": {"power": [watts] * 60},
+        })
+
+    now = utc_now()
+    add("old", now - dt.timedelta(days=91), 400.0)
+    usable = add("usable", now - dt.timedelta(days=10), 200.0)
+    corrected = add("corrected", now - dt.timedelta(days=2), 500.0)
+    duplicate = add("duplicate", now - dt.timedelta(days=1), 900.0)
+    assert db.set_duplicate_of(user_id, duplicate, usable)
+    assert db.apply_power_correction(
+        user_id, corrected, 0, 59, 250.0, None,
+        {"avg_power": None, "np": None, "if_": None, "tss": 0.0},
+    ) is not None
+
+    payload = pipeline.curve_points(user_id)
+
+    assert payload["measured"] == [{"t": 1, "power": 200.0}, {"t": 5, "power": 200.0},
+                                   {"t": 10, "power": 200.0}, {"t": 15, "power": 200.0},
+                                   {"t": 30, "power": 200.0}, {"t": 60, "power": 200.0}]
+    assert payload["all_time"][0] == {"t": 1, "power": 400.0}
+    assert payload["last_ride"] == payload["measured"]

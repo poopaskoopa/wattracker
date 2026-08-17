@@ -336,15 +336,49 @@ def activity_detail(
 
 
 def curve_points(user_id: int, state: Optional[TrainingState] = None) -> dict:
-    """Power-duration data: measured MMP points + modeled CP/W' curve."""
+    """Power-duration data for dashboard MMP views plus its fixed CP/W' model."""
     if state is None:
         state = build_state(user_id)
-    measured = [
-        {"t": int(t), "power": round(p, 1)} for t, p in sorted(state.mmp.items())
-    ]
+
+    def _points(mmp: Dict[int, float]) -> List[dict]:
+        return [
+            {"t": int(t), "power": round(p, 1)} for t, p in sorted(mmp.items())
+        ]
+
+    def _power_stream(activity: dict) -> List[float]:
+        streams = activity.get("streams")
+        power = streams.get("power") if isinstance(streams, dict) else None
+        return power if isinstance(power, list) else []
+
+    # ``measured`` is deliberately retained as the trailing-90-day curve for
+    # API compatibility and as the sole source for the CP/W' model.
+    measured = _points(state.mmp)
+    # Scan the history once: the same effective streams feed the all-time
+    # aggregate and identify the newest ride with usable power.
+    all_streams = []
+    last_ride_mmp: Dict[int, float] = {}
+    for activity in db.iter_full_activities_desc(user_id):
+        power = _power_stream(activity)
+        if not power:
+            continue
+        all_streams.append(power)
+        if not last_ride_mmp:
+            candidate = mean_maximal_power([power], MMP_DURATIONS)
+            if candidate:
+                last_ride_mmp = candidate
+    all_time = _points(mean_maximal_power(all_streams, MMP_DURATIONS))
+    last_ride = _points(last_ride_mmp)
+
     model = []
     if state.cp is not None and state.wprime is not None:
         for t in sorted(set(list(MMP_DURATIONS) + [int(x["t"]) for x in measured])):
             if t > 0:
                 model.append({"t": t, "power": round(state.cp + state.wprime / t, 1)})
-    return {"measured": measured, "model": model, "cp": state.cp, "wprime": state.wprime}
+    return {
+        "measured": measured,
+        "all_time": all_time,
+        "last_ride": last_ride,
+        "model": model,
+        "cp": state.cp,
+        "wprime": state.wprime,
+    }
