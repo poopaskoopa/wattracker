@@ -265,6 +265,8 @@ def _summary(activity: dict, power: list, ftp: float) -> dict:
 
 def _refresh_user(user_id: int) -> None:
     activity_cache.invalidate(user_id)
+    from .metrics import curve_store
+    curve_store.ensure(user_id)
     try:
         importer.evaluate_ftp(user_id)
     except Exception:

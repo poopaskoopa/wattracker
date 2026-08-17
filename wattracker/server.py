@@ -1451,6 +1451,8 @@ def create_app() -> FastAPI:
             )
             importer.match_plan_completions(uid)
             importer.profile_store.refresh(uid)
+            from .metrics import curve_store
+            curve_store.ensure(uid)
         estimate = importer.recent_best_effort_ftp(uid)
         return JSONResponse({
             "selected": len(staged),

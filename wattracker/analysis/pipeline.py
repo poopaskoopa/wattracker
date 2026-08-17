@@ -16,6 +16,7 @@ from ..metrics.power import (
     FTP_DECAY_TAU_ACTIVE,
 )
 from ..metrics.curve import MMP_DURATIONS, fit_cp_wprime, mean_maximal_power
+from ..metrics import curve_store
 from ..metrics.load import compute_load, daily_tss_series
 from . import activity_cache, zones
 from .detect import evaluate
@@ -345,29 +346,11 @@ def curve_points(user_id: int, state: Optional[TrainingState] = None) -> dict:
             {"t": int(t), "power": round(p, 1)} for t, p in sorted(mmp.items())
         ]
 
-    def _power_stream(activity: dict) -> List[float]:
-        streams = activity.get("streams")
-        power = streams.get("power") if isinstance(streams, dict) else None
-        return power if isinstance(power, list) else []
-
     # ``measured`` is deliberately retained as the trailing-90-day curve for
     # API compatibility and as the sole source for the CP/W' model.
     measured = _points(state.mmp)
-    # Scan the history once: the same effective streams feed the all-time
-    # aggregate and identify the newest ride with usable power.
-    all_streams = []
-    last_ride_mmp: Dict[int, float] = {}
-    for activity in db.iter_full_activities_desc(user_id):
-        power = _power_stream(activity)
-        if not power:
-            continue
-        all_streams.append(power)
-        if not last_ride_mmp:
-            candidate = mean_maximal_power([power], MMP_DURATIONS)
-            if candidate:
-                last_ride_mmp = candidate
-    all_time = _points(mean_maximal_power(all_streams, MMP_DURATIONS))
-    last_ride = _points(last_ride_mmp)
+    all_time = _points(curve_store.all_time(user_id))
+    last_ride = _points(curve_store.last_ride(user_id))
 
     model = []
     if state.cp is not None and state.wprime is not None:
