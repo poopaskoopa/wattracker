@@ -25,7 +25,7 @@ from .timeutil import utc_now, valid_timezone
 
 _log = logging.getLogger(__name__)
 
-SCHEMA_VERSION = 31
+SCHEMA_VERSION = 32
 
 
 def _restrict_db_files(path: str) -> None:
@@ -260,10 +260,14 @@ _MIGRATIONS: Dict[int, Sequence[Union[str, Callable[[sqlite3.Connection], None]]
         "ALTER TABLE plan_workouts ADD COLUMN adjustment_state TEXT",
         "ALTER TABLE plan_workouts ADD COLUMN adjustment_source_id INTEGER",
     ],
+    31: [
+        # New table curve_cache is created by _SCHEMA after migrating.
+    ],
 }
 
 _DROP = """
 DROP TABLE IF EXISTS connector_devices;
+DROP TABLE IF EXISTS curve_cache;
 DROP TABLE IF EXISTS ftp_suggestions;
 DROP TABLE IF EXISTS ooto_adjustments;
 DROP TABLE IF EXISTS power_sample_corrections;
@@ -335,6 +339,13 @@ CREATE INDEX IF NOT EXISTS idx_activities_user_start
     ON activities(user_id, start_time);
 CREATE INDEX IF NOT EXISTS idx_activities_duplicate_of
     ON activities(user_id, duplicate_of);
+
+CREATE TABLE IF NOT EXISTS curve_cache (
+    user_id INTEGER PRIMARY KEY,
+    mmp_json TEXT NOT NULL,
+    dirty    INTEGER NOT NULL DEFAULT 0,
+    FOREIGN KEY(user_id) REFERENCES users(id)
+);
 
 CREATE TABLE IF NOT EXISTS power_sample_corrections (
     id          INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -763,6 +774,17 @@ def create_user(username: str, password_hash: str, path: Optional[str] = None) -
             "VALUES (?, ?, ?, 0)",
             (username, password_hash, utc_now().isoformat()),
         )
+        if cur.rowcount:
+            try:
+                conn.execute(
+                    "INSERT INTO curve_cache (user_id, mmp_json, dirty) VALUES (?, '{}', 0)",
+                    (cur.lastrowid,),
+                )
+            except sqlite3.OperationalError as exc:
+                # A direct create_user call can target a pre-initialization
+                # legacy database. init_db creates the cache table on startup.
+                if "no such table: curve_cache" not in str(exc):
+                    raise
         conn.commit()
         return cur.lastrowid
     except sqlite3.IntegrityError:
@@ -1308,10 +1330,41 @@ def insert_activity(user_id: int, record: dict, path: Optional[str] = None) -> O
                 _pack_streams(record.get("streams", {})),
             ),
         )
+        activity_id = cur.lastrowid if cur.rowcount else None
+        if activity_id is not None:
+            # Local import avoids db <-> curve_store import cycles. Merge the
+            # new stream before committing the activity so readers cannot see
+            # a clean cache that predates an already-visible activity.
+            try:
+                from .metrics import curve_store
+                curve_store.merge_activity_in_transaction(conn, user_id, record)
+            except Exception:  # noqa: BLE001 - cache maintenance must not undo an insert
+                _log.warning(
+                    "all-time curve cache merge failed for user %s",
+                    user_id,
+                    exc_info=True,
+                )
+                try:
+                    _invalidate_curve_cache(conn, user_id)
+                except Exception:  # noqa: BLE001 - the next read can rebuild it
+                    _log.warning(
+                        "could not invalidate all-time curve cache for user %s",
+                        user_id,
+                        exc_info=True,
+                    )
         conn.commit()
-        return cur.lastrowid if cur.rowcount else None
+        return activity_id
     finally:
         conn.close()
+
+
+def _invalidate_curve_cache(conn: sqlite3.Connection, user_id: int) -> None:
+    """Mark a user's all-time MMP cache unsafe to serve within this transaction."""
+    conn.execute(
+        "INSERT INTO curve_cache (user_id, mmp_json, dirty) VALUES (?, '{}', 1) "
+        "ON CONFLICT(user_id) DO UPDATE SET dirty = 1",
+        (user_id,),
+    )
 
 
 def _valid_activity_date(value: Optional[str]) -> bool:
@@ -1865,6 +1918,7 @@ def apply_power_correction(
                 activity_id,
             ),
         )
+        _invalidate_curve_cache(conn, user_id)
         conn.commit()
         return int(cur.lastrowid)
     except sqlite3.Error:
@@ -1928,6 +1982,7 @@ def undo_power_correction(
                 activity_id,
             ),
         )
+        _invalidate_curve_cache(conn, user_id)
         conn.commit()
         return True
     except sqlite3.Error:
@@ -2004,6 +2059,8 @@ def set_duplicate_of(
             (primary_id, user_id, activity_id, user_id, primary_id,
              user_id, activity_id),
         )
+        if cur.rowcount:
+            _invalidate_curve_cache(conn, user_id)
         conn.commit()
         return cur.rowcount > 0
     finally:

@@ -1,7 +1,14 @@
-"""Tests for the CP / W' model fit."""
+"""Tests for the CP / W' model fit and dashboard curve payload."""
+import datetime as dt
+import sqlite3
+
 import pytest
 
+from wattracker import db
+from wattracker.analysis import pipeline
 from wattracker.metrics import curve
+from wattracker.metrics import curve_store
+from wattracker.timeutil import utc_now
 
 
 def test_fit_recovers_planted_cp_wprime():
@@ -118,3 +125,129 @@ def test_mmp_has_a_point_at_every_grid_duration_with_data():
     mmp = curve.mean_maximal_power([stream])
     expected = [d for d in curve.MMP_DURATIONS if d <= 1200]
     assert sorted(mmp.keys()) == expected
+
+
+def test_curve_payload_keeps_90_day_measured_and_adds_effective_variants(user_id):
+    def add(key, when, watts):
+        return db.insert_activity(user_id, {
+            "dedup_hash": key, "filename": f"{key}.fit", "start_time": when.isoformat(),
+            "duration_s": 60, "avg_power": watts, "np": watts, "if_": 1.0,
+            "tss": 10.0, "streams": {"power": [watts] * 60},
+        })
+
+    now = utc_now()
+    add("old", now - dt.timedelta(days=91), 400.0)
+    usable = add("usable", now - dt.timedelta(days=10), 200.0)
+    corrected = add("corrected", now - dt.timedelta(days=2), 500.0)
+    duplicate = add("duplicate", now - dt.timedelta(days=1), 900.0)
+    assert db.set_duplicate_of(user_id, duplicate, usable)
+    assert db.apply_power_correction(
+        user_id, corrected, 0, 59, 250.0, None,
+        {"avg_power": None, "np": None, "if_": None, "tss": 0.0},
+    ) is not None
+
+    payload = pipeline.curve_points(user_id)
+
+    assert payload["measured"] == [{"t": 1, "power": 200.0}, {"t": 5, "power": 200.0},
+                                   {"t": 10, "power": 200.0}, {"t": 15, "power": 200.0},
+                                   {"t": 30, "power": 200.0}, {"t": 60, "power": 200.0}]
+    assert payload["all_time"][0] == {"t": 1, "power": 400.0}
+    assert payload["last_ride"] == payload["measured"]
+
+
+def _add_curve_activity(user_id, key, when, watts, seconds=60):
+    return db.insert_activity(user_id, {
+        "dedup_hash": key, "filename": f"{key}.fit", "start_time": when.isoformat(),
+        "duration_s": seconds, "avg_power": watts, "np": watts, "if_": 1.0,
+        "tss": 10.0, "streams": {"power": [watts] * seconds},
+    })
+
+
+def test_all_time_curve_rebuilds_once_then_reuses_persisted_cache(user_id, monkeypatch):
+    _add_curve_activity(user_id, "cache", utc_now(), 250.0)
+    conn = db.connect()
+    try:
+        conn.execute("DELETE FROM curve_cache WHERE user_id = ?", (user_id,))
+        conn.commit()
+    finally:
+        conn.close()
+
+    assert curve_store.all_time(user_id)[60] == 250.0
+    monkeypatch.setattr(
+        curve_store, "_rebuild_locked",
+        lambda *_args: pytest.fail("clean cache rebuilt again"),
+    )
+    assert curve_store.all_time(user_id)[60] == 250.0
+
+
+def test_clean_curve_cache_merges_new_stronger_ride_without_history_rebuild(user_id, monkeypatch):
+    _add_curve_activity(user_id, "first", utc_now() - dt.timedelta(days=1), 200.0)
+    assert curve_store.all_time(user_id)[60] == 200.0
+    monkeypatch.setattr(
+        curve_store, "_rebuild_locked",
+        lambda *_args: pytest.fail("insert should merge clean cache"),
+    )
+    _add_curve_activity(user_id, "stronger", utc_now(), 300.0)
+    assert curve_store.all_time(user_id)[60] == 300.0
+
+
+def test_activity_insert_merges_curve_cache_before_commit(user_id, monkeypatch):
+    _add_curve_activity(user_id, "first", utc_now() - dt.timedelta(days=1), 200.0)
+    observed = {}
+    merge = curve_store.merge_activity_in_transaction
+
+    def wrapped(conn, uid, record):
+        observed["in_transaction"] = conn.in_transaction
+        return merge(conn, uid, record)
+
+    monkeypatch.setattr(curve_store, "merge_activity_in_transaction", wrapped)
+    _add_curve_activity(user_id, "stronger", utc_now(), 300.0)
+
+    assert observed["in_transaction"]
+    assert curve_store.all_time(user_id)[60] == 300.0
+
+
+def test_duplicate_and_correction_invalidation_rebuild_effective_curve(user_id):
+    now = utc_now()
+    primary = _add_curve_activity(user_id, "primary", now - dt.timedelta(days=2), 200.0)
+    secondary = _add_curve_activity(user_id, "secondary", now - dt.timedelta(days=1), 500.0)
+    assert curve_store.all_time(user_id)[60] == 500.0
+    assert db.set_duplicate_of(user_id, secondary, primary)
+    assert curve_store.all_time(user_id)[60] == 200.0
+    assert db.apply_power_correction(
+        user_id, primary, 0, 59, 200.0, None,
+        {"avg_power": 0.0, "np": 0.0, "if_": 0.0, "tss": 0.0},
+    ) is not None
+    assert curve_store.all_time(user_id) == {}
+
+
+def test_last_ride_skips_newest_unusable_power(user_id):
+    now = utc_now()
+    _add_curve_activity(user_id, "usable", now - dt.timedelta(days=1), 225.0)
+    db.insert_activity(user_id, {
+        "dedup_hash": "empty", "filename": "empty.fit", "start_time": now.isoformat(),
+        "duration_s": 60, "avg_power": 0.0, "np": 0.0, "if_": 0.0,
+        "tss": 0.0, "streams": {"power": [0.0] * 60},
+    })
+    assert curve_store.last_ride(user_id)[60] == 225.0
+
+
+def test_v31_migrates_curve_cache_table_in_place(tmp_path):
+    path = str(tmp_path / "v31.db")
+    db.init_db(path)
+    conn = sqlite3.connect(path)
+    try:
+        conn.execute("DROP TABLE curve_cache")
+        conn.execute("PRAGMA user_version = 31")
+        conn.commit()
+    finally:
+        conn.close()
+    db.init_db(path)
+    conn = sqlite3.connect(path)
+    try:
+        assert conn.execute("PRAGMA user_version").fetchone()[0] == 32
+        assert conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'curve_cache'"
+        ).fetchone() is not None
+    finally:
+        conn.close()
