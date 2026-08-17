@@ -448,6 +448,7 @@ def ingest_file(
     path: str,
     ftp: Optional[float] = None,
     filename: Optional[str] = None,
+    ensure_curve: bool = True,
 ) -> Optional[int]:
     """Parse and store a single .fit file for a user. Returns id or None if dup.
 
@@ -479,6 +480,9 @@ def ingest_file(
     if new_id is not None:
         # The rider may have recorded this same ride in-app at the same time.
         link_duplicate_activity(user_id, new_id)
+        if ensure_curve:
+            from ..metrics import curve_store
+            curve_store.ensure(user_id)
     return new_id
 
 
@@ -627,6 +631,9 @@ def backfill_duplicate_links(user_id: int) -> int:
         if best and _link_pair(user_id, best[1], ride) is not None:
             taken.add(best[1]["id"])
             linked += 1
+    if linked:
+        from ..metrics import curve_store
+        curve_store.ensure(user_id)
     return linked
 
 
@@ -718,7 +725,8 @@ def scan_activities(
         try:
             with backend.readable_activity(entry.path) as local_path:
                 new_id = ingest_file(
-                    user_id, local_path, ftp=ftp, filename=entry.name
+                    user_id, local_path, ftp=ftp, filename=entry.name,
+                    ensure_curve=False,
                 )
         except Exception:
             skipped += 1
@@ -757,6 +765,8 @@ def scan_activities(
         # Deliberately inside the `imported > 0` guard: nothing new landed
         # means nothing derived changed.
         profile_store.refresh(user_id)
+        from ..metrics import curve_store
+        curve_store.ensure(user_id)
 
     return {
         "found": found,
@@ -822,6 +832,8 @@ def save_ride_record(
         link_selected_plan_workout(user_id, workout_id, activity_id)
     if activity_id is not None:
         link_duplicate_activity(user_id, activity_id)
+        from ..metrics import curve_store
+        curve_store.ensure(user_id)
     try:
         maybe_update_ftp(user_id)
     except Exception:
@@ -871,7 +883,9 @@ def ingest_upload(
         tmp.close()
         # Record the name the rider uploaded, not the temp file's - see
         # ingest_file's ``filename`` argument.
-        result = ingest_file(user_id, tmp.name, ftp=ftp, filename=base)
+        result = ingest_file(
+            user_id, tmp.name, ftp=ftp, filename=base, ensure_curve=refresh
+        )
         if refresh:
             evaluate_ftp(user_id)
             match_plan_completions(user_id)
