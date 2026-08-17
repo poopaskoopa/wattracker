@@ -16,6 +16,7 @@ from ..metrics.power import (
     FTP_DECAY_TAU_ACTIVE,
 )
 from ..metrics.curve import MMP_DURATIONS, fit_cp_wprime, mean_maximal_power
+from ..metrics import curve_store
 from ..metrics.load import compute_load, daily_tss_series
 from . import activity_cache, zones
 from .detect import evaluate
@@ -336,15 +337,31 @@ def activity_detail(
 
 
 def curve_points(user_id: int, state: Optional[TrainingState] = None) -> dict:
-    """Power-duration data: measured MMP points + modeled CP/W' curve."""
+    """Power-duration data for dashboard MMP views plus its fixed CP/W' model."""
     if state is None:
         state = build_state(user_id)
-    measured = [
-        {"t": int(t), "power": round(p, 1)} for t, p in sorted(state.mmp.items())
-    ]
+
+    def _points(mmp: Dict[int, float]) -> List[dict]:
+        return [
+            {"t": int(t), "power": round(p, 1)} for t, p in sorted(mmp.items())
+        ]
+
+    # ``measured`` is deliberately retained as the trailing-90-day curve for
+    # API compatibility and as the sole source for the CP/W' model.
+    measured = _points(state.mmp)
+    all_time = _points(curve_store.all_time(user_id))
+    last_ride = _points(curve_store.last_ride(user_id))
+
     model = []
     if state.cp is not None and state.wprime is not None:
         for t in sorted(set(list(MMP_DURATIONS) + [int(x["t"]) for x in measured])):
             if t > 0:
                 model.append({"t": t, "power": round(state.cp + state.wprime / t, 1)})
-    return {"measured": measured, "model": model, "cp": state.cp, "wprime": state.wprime}
+    return {
+        "measured": measured,
+        "all_time": all_time,
+        "last_ride": last_ride,
+        "model": model,
+        "cp": state.cp,
+        "wprime": state.wprime,
+    }

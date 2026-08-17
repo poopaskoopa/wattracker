@@ -79,6 +79,15 @@ def test_authed_pages_and_api(client):
         r.json()
 
 
+def test_dashboard_curve_selector_and_api_variants(client):
+    _register(client)
+    html = client.get("/").text
+    assert 'id="curveSource"' in html
+    assert "Last 90 days" in html and "All time" in html and "Last ride" in html
+    curve = client.get("/api/curve").json()
+    assert {"measured", "all_time", "last_ride"} <= curve.keys()
+
+
 def test_settings_explains_training_and_recent_best_effort_ftp(client):
     _register(client)
     uid = db.get_user_by_username("tester")["id"]
