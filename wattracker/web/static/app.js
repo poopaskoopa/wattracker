@@ -423,8 +423,16 @@ function wrapText(text, maxLen) {
 }
 
 const CURVE_SERIES_DESC = {
-    "Measured MMP": "Your best average power actually recorded for each duration, across all rides in the last 90 days.",
+    "Last 90 days MMP": "Your best average power actually recorded for each duration across rides from the last 90 days.",
+    "All-time MMP": "Your best average power actually recorded for each duration across all rides.",
+    "Last ride MMP": "Your best average power actually recorded for each duration in your most recent ride with usable power data.",
     "CP/W' model": "The fitted curve estimating your sustainable power at any duration (Critical Power plus your anaerobic W' reserve divided by time).",
+};
+
+const CURVE_SOURCE_LABELS = {
+    measured: "Last 90 days MMP",
+    all_time: "All-time MMP",
+    last_ride: "Last ride MMP",
 };
 
 // The rider's Training FTP as a dashed reference on the watts axis: it is the
@@ -463,83 +471,94 @@ async function renderCurveChart() {
     if (!el) return;
     const empty = document.getElementById("curveEmpty");
     const data = await fetchJSON("/api/curve");
-    const measured = ((data && data.measured) || []).map((p) => ({ x: p.t, y: p.power }));
     const model = ((data && data.model) || []).map((p) => ({ x: p.t, y: p.power }));
+    const source = document.getElementById("curveSource");
+    const selectedSource = () => (source && CURVE_SOURCE_LABELS[source.value] ? source.value : "measured");
+    const sourcePoints = () => ((data && data[selectedSource()]) || [])
+        .map((p) => ({ x: p.t, y: p.power }));
 
-    if (curveChart) { curveChart.destroy(); curveChart = null; }
     const legend = document.getElementById("curveLegend");
-    if (legend) legend.innerHTML = "";
+    const renderSelectedCurve = () => {
+        const measured = sourcePoints();
+        const measuredLabel = CURVE_SOURCE_LABELS[selectedSource()];
 
-    if (!measured.length && !model.length) {
-        el.style.display = "none";
-        if (empty) empty.style.display = "block";
-        return;
-    }
-    el.style.display = "block";
-    if (empty) empty.style.display = "none";
+        if (curveChart) { curveChart.destroy(); curveChart = null; }
+        if (legend) legend.innerHTML = "";
 
-    // Axis ticks are exactly the sampled durations, so every tick has its
-    // measured dot and vice versa - but ~12 of them collide on a narrow
-    // viewport, so they are thinned from the long end (the last duration is
-    // always kept; it anchors the axis).
-    const tickDurations = (measured.length ? measured : model).map((p) => p.x);
+        if (!measured.length && !model.length) {
+            el.style.display = "none";
+            if (empty) empty.style.display = "block";
+            return;
+        }
+        el.style.display = "block";
+        if (empty) empty.style.display = "none";
 
-    curveChart = new Chart(el, {
-        type: "scatter",
-        data: {
-            datasets: [
-                { label: "Measured MMP", data: measured, borderColor: cssVar("--s-2"),
-                  backgroundColor: cssVar("--s-2"), showLine: true, pointRadius: 0,
-                  pointHitRadius: 8 },
-                { label: "CP/W' model", data: model, borderColor: cssVar("--s-1"),
-                  showLine: true, pointRadius: 0, pointHitRadius: 8 },
-            ],
-        },
-        options: {
-            responsive: true,
-            plugins: {
-                legend: { display: false }, // custom HTML legend instead
-                tooltip: {
-                    callbacks: {
-                        title: (items) => (items.length ? fmtDuration(items[0].parsed.x) : ""),
-                        label: (item) => item.dataset.label + ": " + item.parsed.y + " W",
-                        footer: (items) =>
-                            items.length
-                                ? wrapText(CURVE_SERIES_DESC[items[0].dataset.label] || "", 44)
-                                : "",
+        // Axis ticks are exactly the sampled durations, so every tick has its
+        // measured dot and vice versa - but ~12 of them collide on a narrow
+        // viewport, so they are thinned from the long end (the last duration is
+        // always kept; it anchors the axis).
+        const tickDurations = (measured.length ? measured : model).map((p) => p.x);
+
+        curveChart = new Chart(el, {
+            type: "scatter",
+            data: {
+                datasets: [
+                    { label: measuredLabel, data: measured, borderColor: cssVar("--s-2"),
+                      backgroundColor: cssVar("--s-2"), showLine: true, pointRadius: 0,
+                      pointHitRadius: 8 },
+                    { label: "CP/W' model", data: model, borderColor: cssVar("--s-1"),
+                      showLine: true, pointRadius: 0, pointHitRadius: 8 },
+                ],
+            },
+            options: {
+                responsive: true,
+                plugins: {
+                    legend: { display: false }, // custom HTML legend instead
+                    tooltip: {
+                        callbacks: {
+                            title: (items) => (items.length ? fmtDuration(items[0].parsed.x) : ""),
+                            label: (item) => item.dataset.label + ": " + item.parsed.y + " W",
+                            footer: (items) =>
+                                items.length
+                                    ? wrapText(CURVE_SERIES_DESC[items[0].dataset.label] || "", 44)
+                                    : "",
+                        },
                     },
                 },
-            },
-            scales: {
-                x: {
-                    type: "logarithmic",
-                    title: { display: true, text: "Duration" },
-                    afterBuildTicks: (axis) => {
-                        const width = (axis.chart && axis.chart.width) || 300;
-                        const room = Math.max(4, Math.floor(width / 90));
-                        const step = Math.max(1, Math.ceil(tickDurations.length / room));
-                        const keep = [];
-                        for (let i = tickDurations.length - 1; i >= 0; i -= step) keep.push(i);
-                        axis.ticks = keep.reverse().map((i) => ({ value: tickDurations[i] }));
+                scales: {
+                    x: {
+                        type: "logarithmic",
+                        title: { display: true, text: "Duration" },
+                        afterBuildTicks: (axis) => {
+                            const width = (axis.chart && axis.chart.width) || 300;
+                            const room = Math.max(4, Math.floor(width / 90));
+                            const step = Math.max(1, Math.ceil(tickDurations.length / room));
+                            const keep = [];
+                            for (let i = tickDurations.length - 1; i >= 0; i -= step) keep.push(i);
+                            axis.ticks = keep.reverse().map((i) => ({ value: tickDurations[i] }));
+                        },
+                        ticks: {
+                            autoSkip: false,
+                            maxRotation: 0,
+                            callback: (value) => fmtDuration(value),
+                        },
                     },
-                    ticks: {
-                        autoSkip: false,
-                        maxRotation: 0,
-                        callback: (value) => fmtDuration(value),
-                    },
+                    y: { title: { display: true, text: "Power (W)" } },
                 },
-                y: { title: { display: true, text: "Power (W)" } },
             },
-        },
-        plugins: [FTP_REFERENCE_PLUGIN],
-    });
+            plugins: [FTP_REFERENCE_PLUGIN],
+        });
 
-    renderLegend("curveLegend", () => [
-        { label: "Measured MMP", chart: curveChart, datasets: [0], token: "--s-2",
-          tip: CURVE_SERIES_DESC["Measured MMP"] },
-        { label: "CP/W' model", chart: curveChart, datasets: [1], token: "--s-1",
-          tip: CURVE_SERIES_DESC["CP/W' model"] },
-    ]);
+        renderLegend("curveLegend", () => [
+            { label: measuredLabel, chart: curveChart, datasets: [0], token: "--s-2",
+              tip: CURVE_SERIES_DESC[measuredLabel] },
+            { label: "CP/W' model", chart: curveChart, datasets: [1], token: "--s-1",
+              tip: CURVE_SERIES_DESC["CP/W' model"] },
+        ]);
+    };
+
+    renderSelectedCurve();
+    if (source) source.onchange = renderSelectedCurve;
 }
 
 function renderDashboard(ftp) {

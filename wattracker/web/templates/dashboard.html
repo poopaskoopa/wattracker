@@ -92,7 +92,16 @@
 </section>
 
 <section class="chart-block">
-    <h3>Power&ndash;Duration Curve</h3>
+    <div class="chart-head">
+        <h3>Power&ndash;Duration Curve</h3>
+        <label for="curveSource">Measured curve
+            <select id="curveSource">
+                <option value="measured" selected>Last 90 days</option>
+                <option value="all_time">All time</option>
+                <option value="last_ride">Last ride</option>
+            </select>
+        </label>
+    </div>
     <div id="curveLegend" class="chart-legend"></div>
     <canvas id="curveChart" height="112"></canvas>
     <p id="curveEmpty" class="hint" style="display:none">No power data yet — upload a ride with a power meter to see your power&ndash;duration curve.</p>
