@@ -429,12 +429,6 @@ const CURVE_SERIES_DESC = {
     "CP/W' model": "The fitted curve estimating your sustainable power at any duration (Critical Power plus your anaerobic W' reserve divided by time).",
 };
 
-const CURVE_SOURCE_LABELS = {
-    measured: "Last 90 days MMP",
-    all_time: "All-time MMP",
-    last_ride: "Last ride MMP",
-};
-
 // The rider's Training FTP as a dashed reference on the watts axis: it is the
 // number every target in the app is derived from, so "where does my curve sit
 // relative to it" is the read this chart is usually opened for.
@@ -471,41 +465,46 @@ async function renderCurveChart() {
     if (!el) return;
     const empty = document.getElementById("curveEmpty");
     const data = await fetchJSON("/api/curve");
+    const series = [
+        { key: "measured", label: "Last 90 days MMP", token: "--s-2" },
+        { key: "all_time", label: "All-time MMP", token: "--s-3" },
+        { key: "last_ride", label: "Last ride MMP", token: "--s-4" },
+    ].map((s) => ({
+        ...s,
+        points: ((data && data[s.key]) || []).map((p) => ({ x: p.t, y: p.power })),
+    }));
     const model = ((data && data.model) || []).map((p) => ({ x: p.t, y: p.power }));
-    const source = document.getElementById("curveSource");
-    const selectedSource = () => (source && CURVE_SOURCE_LABELS[source.value] ? source.value : "measured");
-    const sourcePoints = () => ((data && data[selectedSource()]) || [])
-        .map((p) => ({ x: p.t, y: p.power }));
 
     const legend = document.getElementById("curveLegend");
-    const renderSelectedCurve = () => {
-        const measured = sourcePoints();
-        const measuredLabel = CURVE_SOURCE_LABELS[selectedSource()];
+    if (curveChart) { curveChart.destroy(); curveChart = null; }
+    if (legend) legend.innerHTML = "";
 
-        if (curveChart) { curveChart.destroy(); curveChart = null; }
-        if (legend) legend.innerHTML = "";
+    if (!series.some((s) => s.points.length) && !model.length) {
+        el.style.display = "none";
+        if (empty) empty.style.display = "block";
+        return;
+    }
+    el.style.display = "block";
+    if (empty) empty.style.display = "none";
 
-        if (!measured.length && !model.length) {
-            el.style.display = "none";
-            if (empty) empty.style.display = "block";
-            return;
-        }
-        el.style.display = "block";
-        if (empty) empty.style.display = "none";
+    // Ticks are sorted, unique numeric durations; thinning walks backward so
+    // the longest-duration anchor is always preserved. Model durations are a
+    // safe sorted/unique fallback when no measured duration is available.
+    const sortedUniqueDurations = (points) => [...new Set(points
+        .map((p) => Number(p.x))
+        .filter((duration) => Number.isFinite(duration)))].sort((a, b) => a - b);
+    const measuredTickDurations = sortedUniqueDurations(series.flatMap((s) => s.points));
+    const tickDurations = measuredTickDurations.length
+        ? measuredTickDurations
+        : sortedUniqueDurations(model);
 
-        // Axis ticks are exactly the sampled durations, so every tick has its
-        // measured dot and vice versa - but ~12 of them collide on a narrow
-        // viewport, so they are thinned from the long end (the last duration is
-        // always kept; it anchors the axis).
-        const tickDurations = (measured.length ? measured : model).map((p) => p.x);
-
-        curveChart = new Chart(el, {
+    curveChart = new Chart(el, {
             type: "scatter",
             data: {
                 datasets: [
-                    { label: measuredLabel, data: measured, borderColor: cssVar("--s-2"),
-                      backgroundColor: cssVar("--s-2"), showLine: true, pointRadius: 0,
-                      pointHitRadius: 8 },
+                    ...series.map((s) => ({ label: s.label, data: s.points,
+                      borderColor: cssVar(s.token), backgroundColor: cssVar(s.token),
+                      showLine: true, pointRadius: 0, pointHitRadius: 8 })),
                     { label: "CP/W' model", data: model, borderColor: cssVar("--s-1"),
                       showLine: true, pointRadius: 0, pointHitRadius: 8 },
                 ],
@@ -547,18 +546,14 @@ async function renderCurveChart() {
                 },
             },
             plugins: [FTP_REFERENCE_PLUGIN],
-        });
+    });
 
-        renderLegend("curveLegend", () => [
-            { label: measuredLabel, chart: curveChart, datasets: [0], token: "--s-2",
-              tip: CURVE_SERIES_DESC[measuredLabel] },
-            { label: "CP/W' model", chart: curveChart, datasets: [1], token: "--s-1",
-              tip: CURVE_SERIES_DESC["CP/W' model"] },
-        ]);
-    };
-
-    renderSelectedCurve();
-    if (source) source.onchange = renderSelectedCurve;
+    renderLegend("curveLegend", () => [
+        ...series.map((s, i) => ({ label: s.label, chart: curveChart, datasets: [i],
+            token: s.token, independent: true, tip: CURVE_SERIES_DESC[s.label] })),
+        { label: "CP/W' model", chart: curveChart, datasets: [3], token: "--s-1", independent: true,
+          tip: CURVE_SERIES_DESC["CP/W' model"] },
+    ]);
 }
 
 function renderDashboard(ftp) {
