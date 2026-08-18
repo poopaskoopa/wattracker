@@ -505,7 +505,7 @@ def test_dashboard_curve_series_toggle_independently(page, live_server,
     }""")
     assert state == [False, False, False, True]
 
-    page.get_by_role("button", name="CP/W' model").click()
+    page.get_by_role("button", name="CP/W' model", exact=True).click()
     state = page.evaluate("""() => {
         const chart = Chart.getChart(document.getElementById('curveChart'));
         return chart.data.datasets.map((_, index) => chart.isDatasetVisible(index));
