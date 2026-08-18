@@ -1882,8 +1882,17 @@ def test_ride_ws_erg_action_reports_unavailable_without_trainer(
 
     monkeypatch.setattr(servermod.bledevices, "bluetooth_available", lambda: (True, "ok"))
     monkeypatch.setattr(servermod.bledevices, "connect_sensors", fake_connect)
-    # Zero poll interval: an idle prepared ride otherwise sleeps 1s per tick.
-    monkeypatch.setattr(servermod, "RIDE_POLL_INTERVAL_S", 0.0)
+    # A zero poll interval makes _ride_sleep(0) a bare yield while the loop
+    # still charges a simulated second of inactivity per iteration - and this
+    # test pins power at 0 W, so nothing ever resets the budget. The entire
+    # 300s allowance burns in milliseconds and the socket closes before the
+    # client's set_erg crosses the TestClient thread boundary. A small non-zero
+    # interval paces the frames; a large inactivity timeout removes the race.
+    #
+    # The two sibling tests that still use a zero interval drive a FakeWebSocket
+    # directly - no real socket, no thread boundary - so they are unaffected.
+    monkeypatch.setattr(servermod, "RIDE_POLL_INTERVAL_S", 0.01)
+    monkeypatch.setattr(servermod, "RIDE_INACTIVITY_TIMEOUT_S", 1e6)
 
     with client.websocket_connect("/ride/ws?prepare=1") as ws:
         connected = _receive_after_workout(ws)
