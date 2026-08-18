@@ -1657,6 +1657,22 @@ def create_app() -> FastAPI:
         activities = db.list_activities(uid)
         merged = db.primaries_with_duplicates(uid)
         for a in activities:
+            # A verified completed workout owns the effort rating; an unlinked
+            # activity keeps its own subjective rating. Match the detail API's
+            # verified-link semantics so the list never presents stale activity
+            # feedback for a workout-backed ride.
+            link = db.linked_workout_for_activity(uid, a["id"])
+            if link:
+                if link["kind"] == "plan":
+                    workout = db.get_plan_workout(uid, link["id"])
+                    verified = bool(
+                        workout
+                        and importer.plan_workout_completion_verified(uid, workout)
+                    )
+                else:
+                    verified = True  # standalone links are verified once completed
+                if verified:
+                    a["rpe"] = link["rpe"]
             a["duration_fmt"] = races.format_duration(a.get("duration_s"))
             a["has_duplicate"] = a["id"] in merged
         return _ctx(
