@@ -167,3 +167,35 @@ def test_unlinked_activity_has_no_link(client):
     d = client.get(f"/api/activity/{aid}").json()
     assert "linked_workout" not in d
     assert d["rpe"] is None
+
+
+def test_activities_page_shows_linked_and_activity_rpe(client):
+    uid = _register(client)
+    plan_activity = _insert(uid, seconds=3600, start="2026-06-02T09:00:00")
+    standalone_activity = _insert(uid, seconds=3600, start="2026-06-03T09:00:00")
+    unlinked_activity = _insert(uid, start="2026-06-04T09:00:00")
+    _insert(uid, start="2026-06-05T09:00:00")
+
+    plan_id = db.create_plan(uid, "Base", "2026-06-01", 4)
+    plan_workout = db.add_plan_workout(
+        plan_id, uid, "2026-06-02", "Endurance", "endurance", 3600, 50.0, "<>"
+    )
+    assert db.mark_plan_workout_completed(uid, plan_workout, plan_activity, "2026-06-02")
+    assert db.set_plan_workout_rpe(uid, plan_workout, 6)
+
+    standalone_workout = db.add_standalone_workout(
+        uid, "key-1", "2026-06-03", "Sweet Spot", "sweet_spot",
+        3600, 60.0, "<workout/>", 250.0,
+    )
+    assert db.mark_standalone_completed(
+        uid, standalone_workout, standalone_activity, "2026-06-03", None, None
+    )
+    assert db.set_standalone_rpe(uid, standalone_workout, 7)
+    assert db.set_activity_rpe(uid, unlinked_activity, 4)
+
+    response = client.get("/activities")
+    assert response.status_code == 200
+    assert response.text.count("RPE 6") == 1
+    assert response.text.count("RPE 7") == 1
+    assert response.text.count("RPE 4") == 1
+    assert response.text.count(">Rate</a>") == 1
