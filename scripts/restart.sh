@@ -30,6 +30,40 @@ HEALTH_URL="http://$HOST:$PORT/login"
 
 log() { printf '%s %s\n' "$(date '+%H:%M:%S')" "$*"; }
 
+# --- identify a candidate PID as our server -------------------------------
+# The server is always launched as `"$PYTHON" -m wattracker`, so identity is
+# the module invocation run by a python interpreter — never the bare string
+# "wattracker", which appears in unrelated command lines all the time (a CI
+# checkout under .../_work/wattracker/wattracker/, this script's own pipeline,
+# the connector's `-m wattracker_connector`). Matching that string got those
+# bystanders SIGTERMed and then SIGKILLed.
+#
+# Do not tighten this to the literal "$PYTHON -m wattracker" either: framework
+# Python builds (Homebrew python@3.x, the python.org installers) re-exec
+# through Python.framework/.../Python.app/Contents/MacOS/Python and rewrite
+# argv[0], so `ps -o command=` shows that path and the venv interpreter is
+# nowhere in the command line. Constrain the interpreter by basename instead,
+# exactly as start.sh's process_command_is_wattracker does.
+process_is_wattracker_server() {
+  local pid="$1" command_line interpreter
+  case "$pid" in ''|*[!0-9]*) return 1 ;; esac
+  # never our own shell, its pipeline, or whatever invoked us
+  if [ "$pid" = "$$" ] || [ "$pid" = "${PPID:-}" ]; then return 1; fi
+  command_line="$(ps -p "$pid" -o command= 2>/dev/null || true)"
+  # The module name must end there: `-m wattracker_connector` is a different
+  # process and must not be killed by the app's restart script.
+  case "$command_line" in
+    *" -m wattracker") ;;
+    *" -m wattracker "*) ;;
+    *) return 1 ;;
+  esac
+  interpreter="${command_line%% -m wattracker*}"
+  case "${interpreter##*/}" in
+    [Pp]ython|[Pp]ython[0-9]*) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
 # --- discover running server PIDs -----------------------------------------
 # Match both the recorded PID file and anything listening on the port /
 # running the module, so a stale or externally-started server is still caught.
@@ -43,8 +77,17 @@ server_pids() {
   if command -v lsof >/dev/null 2>&1; then
     pids="$pids $(lsof -ti tcp:"$PORT" -sTCP:LISTEN 2>/dev/null || true)"
   fi
-  # module matches (fallback)
-  pids="$pids $(pgrep -f 'wattracker' 2>/dev/null || true)"
+  # module matches (fallback): catches a stale or externally-started real
+  # server that is neither recorded in the PID file nor holding the port.
+  # pgrep -f is a substring match over the whole command line, so it only
+  # narrows the field — every candidate is confirmed against ps below. The
+  # bracket keeps the pattern from matching this pipeline's own pgrep.
+  local candidate
+  for candidate in $(pgrep -f '[-]m wattracker' 2>/dev/null || true); do
+    if process_is_wattracker_server "$candidate"; then
+      pids="$pids $candidate"
+    fi
+  done
   # dedupe
   printf '%s\n' $pids | sort -u | tr '\n' ' '
 }

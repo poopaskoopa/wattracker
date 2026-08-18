@@ -9,6 +9,7 @@ import socket
 import subprocess
 import sys
 import time
+import uuid
 
 import pytest
 
@@ -462,3 +463,267 @@ def test_start_does_not_trust_a_reused_pid_without_lsof(tmp_path):
                 _stop_pid(started_pid)
             stale.terminate()
             stale.wait(timeout=10)
+
+
+# --- restart.sh process matching -----------------------------------------
+#
+# restart.sh signals every PID it selects, so these tests must never let it
+# see a process they do not own: this machine can be running the real server
+# and a self-hosted CI runner whose working directory is
+# .../_work/wattracker/wattracker/. The sandbox below gives restart.sh its own
+# ROOT (so its PID file is test-owned), its own free port (so lsof finds
+# nothing), and a `pgrep` shim that runs the *real* pgrep — the pattern under
+# test has to behave exactly as it does in production — then keeps only the
+# PIDs this test spawned.
+
+RESTART_SCRIPT = ROOT / "scripts" / "restart.sh"
+RESTART = RESTART_SCRIPT.read_text()
+
+IDLE_PROGRAM = "import time; time.sleep(600)\n"
+
+
+class _RestartSandbox:
+    def __init__(self, root, script, env, token, allow_file):
+        self.root = root
+        self.script = script
+        self.env = env
+        self.token = token
+        self.allow_file = allow_file
+
+    def allow(self, pid):
+        """Let the pgrep shim report this PID even though it lacks the token."""
+        with self.allow_file.open("a") as handle:
+            handle.write(f"{pid}\n")
+
+    def run(self, *args):
+        return subprocess.run(
+            [str(self.script), *args],
+            cwd=str(self.root),
+            env=self.env,
+            capture_output=True,
+            text=True,
+            timeout=120,
+        )
+
+
+def _restart_sandbox(tmp_path, path=None):
+    token = "tok" + uuid.uuid4().hex
+    root = tmp_path / "repo"
+    (root / "scripts").mkdir(parents=True)
+    script = root / "scripts" / "restart.sh"
+    shutil.copy2(RESTART_SCRIPT, script)
+    script.chmod(0o755)
+
+    path = path or os.environ.get("PATH", os.defpath)
+    real_pgrep = shutil.which("pgrep", path=path)
+    real_ps = shutil.which("ps", path=path)
+    assert real_pgrep and real_ps
+
+    allow_file = tmp_path / "allowed-pids"
+    allow_file.write_text("")
+    shim_dir = tmp_path / "pgrep-shim"
+    shim_dir.mkdir()
+    shim = shim_dir / "pgrep"
+    shim.write_text(
+        "#!/bin/sh\n"
+        f'{real_pgrep} "$@" | while IFS= read -r pid; do\n'
+        f'  if grep -Fxq "$pid" "{allow_file}"; then printf "%s\\n" "$pid"; continue; fi\n'
+        f'  case "$({real_ps} -p "$pid" -o command= 2>/dev/null)" in\n'
+        f'    *{token}*) printf "%s\\n" "$pid" ;;\n'
+        "  esac\n"
+        "done\n"
+    )
+    shim.chmod(0o755)
+
+    env = {
+        **os.environ,
+        "PATH": str(shim_dir) + os.pathsep + path,
+        "WATTRACKER_PORT": str(_free_port()),
+        "WATTRACKER_TERM_TIMEOUT": "2",
+    }
+    return _RestartSandbox(root, script, env, token, allow_file)
+
+
+def _spawn(args, cwd=None, env=None):
+    return subprocess.Popen(
+        [str(arg) for arg in args],
+        cwd=str(cwd) if cwd else None,
+        env=env,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+
+
+def _reap(proc):
+    if proc is None:
+        return
+    if proc.poll() is None:
+        proc.kill()
+    with contextlib.suppress(subprocess.TimeoutExpired):
+        proc.wait(timeout=10)
+
+
+def _idle_in(directory, name="idle.py"):
+    directory.mkdir(parents=True, exist_ok=True)
+    script = directory / name
+    script.write_text(IDLE_PROGRAM)
+    return script
+
+
+def test_restart_matches_the_module_invocation_not_the_bare_name():
+    assert "pgrep -f 'wattracker'" not in RESTART
+    assert "pgrep -f '[-]m wattracker'" in RESTART
+    assert "process_is_wattracker_server()" in RESTART
+    assert '*" -m wattracker")' in RESTART
+    assert '*" -m wattracker "*)' in RESTART
+    # The interpreter is constrained by basename, never by "$PYTHON": a
+    # framework Python rewrites argv[0], and the reason must stay written down.
+    assert '*"$PYTHON -m wattracker"*)' not in RESTART
+    assert "[Pp]ython|[Pp]ython[0-9]*)" in RESTART
+    assert "Python.app/Contents/MacOS/Python" in RESTART
+    # The safety ordering is the other half of the contract.
+    assert RESTART.index("kill -TERM") < RESTART.index("kill -KILL")
+    assert "still alive after SIGKILL" in RESTART
+
+
+def test_restart_stop_leaves_a_process_whose_path_merely_contains_the_name(
+    tmp_path,
+):
+    # The self-hosted CI runner works out of
+    # /Users/<user>/actions-runner/_work/wattracker/wattracker/, so every
+    # process it spawns carries "wattracker" in its command line as a path
+    # component. `pgrep -f 'wattracker'` matched those, and stop() SIGTERMed
+    # and then SIGKILLed in-flight CI.
+    box = _restart_sandbox(tmp_path)
+    bystander_dir = tmp_path / box.token / "_work" / "wattracker" / "wattracker"
+    proc = _spawn([sys.executable, _idle_in(bystander_dir)])
+    try:
+        result = box.run("stop")
+        output = result.stdout + result.stderr
+        assert result.returncode == 0, output
+        assert "not running (nothing to stop)" in output, output
+        assert str(proc.pid) not in output, output
+        time.sleep(0.5)
+        assert proc.poll() is None, "restart.sh signalled an unrelated process"
+    finally:
+        _reap(proc)
+
+
+def test_restart_stop_leaves_the_connector_module_alone(tmp_path):
+    # `-m wattracker_connector` is a different process with its own lifecycle;
+    # the app's restart script must not take it down.
+    box = _restart_sandbox(tmp_path)
+    stub = tmp_path / box.token / "stub"
+    _idle_in(stub / "wattracker_connector", name="__main__.py")
+    (stub / "wattracker_connector" / "__init__.py").write_text("")
+    # The trailing argument only carries this sandbox's token, so the pgrep
+    # shim can see the process at all; it is not part of what is matched.
+    proc = _spawn(
+        [sys.executable, "-m", "wattracker_connector", box.token],
+        cwd=stub,
+        env={**os.environ, "PYTHONPATH": str(stub)},
+    )
+    try:
+        result = box.run("stop")
+        output = result.stdout + result.stderr
+        assert result.returncode == 0, output
+        assert "not running (nothing to stop)" in output, output
+        time.sleep(0.5)
+        assert proc.poll() is None, "restart.sh killed the connector"
+    finally:
+        _reap(proc)
+
+
+@pytest.mark.parametrize("framework_python", [False, True])
+def test_restart_stop_still_stops_a_real_module_server(tmp_path, framework_python):
+    # The fallback's legitimate purpose: a real server that is neither in the
+    # PID file nor holding the port restart.sh was asked about. `framework_python`
+    # replays the argv[0] rewrite PR #107 fixed in start.sh — `ps` reports
+    # Python.app/Contents/MacOS/Python, not the venv interpreter.
+    if not VENV_PYTHON.is_file():
+        pytest.skip("behavioral launcher tests need the repository virtualenv")
+    path = os.environ.get("PATH", os.defpath)
+    if framework_python:
+        path = _ps_reporting_framework_python(path, tmp_path / "ps-shim")
+    box = _restart_sandbox(tmp_path, path=path)
+    server = _spawn(
+        [VENV_PYTHON, "-m", "wattracker"],
+        cwd=ROOT,
+        env={
+            **os.environ,
+            "WATTRACKER_HOME": str(tmp_path / "state"),
+            "WATTRACKER_DATA_DIR": str(tmp_path / "data"),
+            # a port of its own: the fallback, not lsof, has to find it
+            "WATTRACKER_PORT": str(_free_port()),
+            "WATTRACKER_OPEN_BROWSER": "0",
+            "WATTRACKER_AUTO_SCAN": "0",
+        },
+    )
+    reported = ""
+    try:
+        box.allow(server.pid)
+        deadline = time.monotonic() + 30
+        while time.monotonic() < deadline and server.poll() is None:
+            reported = subprocess.run(
+                ["ps", "-p", str(server.pid), "-o", "command="],
+                env=box.env,
+                capture_output=True,
+                text=True,
+            ).stdout
+            if " -m wattracker" in reported:
+                break
+            time.sleep(0.2)
+        assert server.poll() is None, "the test server exited before stop"
+        assert " -m wattracker" in reported, reported
+        if framework_python:
+            assert FRAMEWORK_PYTHON in reported, reported
+            assert str(VENV_PYTHON) not in reported, reported
+
+        result = box.run("stop")
+        output = result.stdout + result.stderr
+        assert result.returncode == 0, output
+        assert str(server.pid) in output, output
+        server.wait(timeout=20)
+    finally:
+        _reap(server)
+
+
+def test_restart_stop_does_not_report_a_phantom_from_transient_matches(tmp_path):
+    # Observed live: the PIDs changed between the "stopping PID(s)" line and
+    # the SIGKILL line, because the bare-name pattern kept matching whatever
+    # short-lived process happened to mention the repo — including this
+    # script's own pipeline. stop() then failed with a false
+    # "still alive after SIGKILL" even though the real server was already down.
+    box = _restart_sandbox(tmp_path)
+    churn_dir = tmp_path / box.token / "_work" / "wattracker" / "wattracker"
+    churn_dir.mkdir(parents=True)
+    # Short-lived shells that mention the repo path and ignore SIGTERM: a
+    # stand-in for the invoking pipeline and for whatever CI is running out of
+    # that directory at the moment restart.sh looks.
+    churner_src = tmp_path / "churn.py"
+    churner_src.write_text(
+        "import os, subprocess, time\n"
+        "arg0 = os.environ['CHURN_ARG0']\n"
+        "while True:\n"
+        "    subprocess.Popen(['/bin/sh', '-c', 'trap \"\" TERM; sleep 3', arg0])\n"
+        "    time.sleep(0.3)\n"
+    )
+    # The churner's own command line carries neither the token nor the name —
+    # the child's $0 comes in through the environment — so only its
+    # short-lived children are ever visible to the shim, and the churn keeps
+    # producing fresh matches for as long as restart.sh keeps looking.
+    churner = _spawn(
+        [sys.executable, churner_src],
+        env={**os.environ, "CHURN_ARG0": str(churn_dir / "run.sh")},
+    )
+    try:
+        time.sleep(1)
+        result = box.run("stop")
+        output = result.stdout + result.stderr
+        assert "still alive after SIGKILL" not in output, output
+        assert result.returncode == 0, output
+        assert "not running (nothing to stop)" in output, output
+    finally:
+        _reap(churner)
+        # the children ignore SIGTERM by design; they exit on their own
+        time.sleep(3.2)
