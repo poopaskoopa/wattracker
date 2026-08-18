@@ -487,11 +487,16 @@ async function renderCurveChart() {
     el.style.display = "block";
     if (empty) empty.style.display = "none";
 
-    // Axis ticks cover every measured duration, with model durations as a
-    // fallback when no measured data is available.
-    const tickDurations = (series.flatMap((s) => s.points).length
-        ? series.flatMap((s) => s.points)
-        : model).map((p) => p.x);
+    // Ticks are sorted, unique numeric durations; thinning walks backward so
+    // the longest-duration anchor is always preserved. Model durations are a
+    // safe sorted/unique fallback when no measured duration is available.
+    const sortedUniqueDurations = (points) => [...new Set(points
+        .map((p) => Number(p.x))
+        .filter((duration) => Number.isFinite(duration)))].sort((a, b) => a - b);
+    const measuredTickDurations = sortedUniqueDurations(series.flatMap((s) => s.points));
+    const tickDurations = measuredTickDurations.length
+        ? measuredTickDurations
+        : sortedUniqueDurations(model);
 
     curveChart = new Chart(el, {
             type: "scatter",
