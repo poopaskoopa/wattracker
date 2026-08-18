@@ -1055,7 +1055,7 @@ body.ride-chart-fullscreen-open { overflow: hidden; }
 .activities-table td:first-child .hint { display: block; margin-top: .25rem; }
 .activities-table .cal-rpe { display: inline-flex; align-items: center; min-height: 1.7rem; padding: .15rem .5rem;
     border: 1px solid color-mix(in srgb, var(--accent) 45%, var(--surface-border)); border-radius: var(--r-pill);
-    color: var(--accent); font: 600 var(--fs-sm)/1 var(--font-mono); white-space: nowrap; }
+    color: var(--on-accent); font: 600 var(--fs-sm)/1 var(--font-mono); white-space: nowrap; }
 .activities-table .button { white-space: nowrap; }
 .activities-table tbody tr:hover td { box-shadow: inset 0 1px color-mix(in srgb, var(--accent) 20%, transparent),
     inset 0 -1px color-mix(in srgb, var(--accent) 20%, transparent); }
