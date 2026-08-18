@@ -465,12 +465,19 @@ def test_dashboard_curve_series_toggle_independently(page, live_server,
         return {
             labels: chart.data.datasets.map((dataset) => dataset.label),
             visible: chart.data.datasets.map((_, index) => chart.isDatasetVisible(index)),
+            tick_values: chart.scales.x.ticks.map((tick) => Number(tick.value)),
         };
     }""")
     assert state["labels"] == [
         "Last 90 days MMP", "All-time MMP", "Last ride MMP", "CP/W' model",
     ]
     assert state["visible"] == [True, True, True, True]
+    assert len(state["tick_values"]) == len(set(state["tick_values"])), \
+        f"curve x-axis ticks contain duplicates: {state['tick_values']}"
+    assert all(
+        earlier < later
+        for earlier, later in zip(state["tick_values"], state["tick_values"][1:])
+    ), f"curve x-axis ticks are not strictly increasing: {state['tick_values']}"
 
     page.get_by_role("button", name=re.compile("Last 90 days MMP")).click()
     state = page.evaluate("""() => {
@@ -498,7 +505,7 @@ def test_dashboard_curve_series_toggle_independently(page, live_server,
     }""")
     assert state == [False, False, False, True]
 
-    page.get_by_role("button", name=re.compile("CP/W' model")).click()
+    page.get_by_role("button", name="CP/W' model").click()
     state = page.evaluate("""() => {
         const chart = Chart.getChart(document.getElementById('curveChart'));
         return chart.data.datasets.map((_, index) => chart.isDatasetVisible(index));
