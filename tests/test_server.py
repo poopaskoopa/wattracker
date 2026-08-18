@@ -79,11 +79,15 @@ def test_authed_pages_and_api(client):
         r.json()
 
 
-def test_dashboard_curve_selector_and_api_variants(client):
+def test_dashboard_curve_legend_and_api_variants(client):
     _register(client)
     html = client.get("/").text
-    assert 'id="curveSource"' in html
-    assert "Last 90 days" in html and "All time" in html and "Last ride" in html
+    assert 'id="curveLegend"' in html
+    assert 'id="curveSource"' not in html
+    app_js = client.get("/static/app.js").text
+    for label in ("Last 90 days MMP", "All-time MMP", "Last ride MMP", "CP/W' model"):
+        assert label in app_js
+    assert "independent: true" in app_js
     curve = client.get("/api/curve").json()
     assert {"measured", "all_time", "last_ride"} <= curve.keys()
 

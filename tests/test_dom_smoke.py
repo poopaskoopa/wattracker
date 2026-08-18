@@ -455,6 +455,65 @@ def test_dashboard_charts_render_without_console_errors(page, live_server,
     _assert_clean(console_errors, "dashboard")
 
 
+def test_dashboard_curve_series_toggle_independently(page, live_server,
+                                                     console_errors):
+    page.goto(f"{live_server.base}/")
+    _wait_for_charts(page, "mainChart", "curveChart")
+
+    state = page.evaluate("""() => {
+        const chart = Chart.getChart(document.getElementById('curveChart'));
+        return {
+            labels: chart.data.datasets.map((dataset) => dataset.label),
+            visible: chart.data.datasets.map((_, index) => chart.isDatasetVisible(index)),
+            tick_values: chart.scales.x.ticks.map((tick) => Number(tick.value)),
+        };
+    }""")
+    assert state["labels"] == [
+        "Last 90 days MMP", "All-time MMP", "Last ride MMP", "CP/W' model",
+    ]
+    assert state["visible"] == [True, True, True, True]
+    assert len(state["tick_values"]) == len(set(state["tick_values"])), \
+        f"curve x-axis ticks contain duplicates: {state['tick_values']}"
+    assert all(
+        earlier < later
+        for earlier, later in zip(state["tick_values"], state["tick_values"][1:])
+    ), f"curve x-axis ticks are not strictly increasing: {state['tick_values']}"
+
+    page.get_by_role("button", name=re.compile("Last 90 days MMP")).click()
+    state = page.evaluate("""() => {
+        const chart = Chart.getChart(document.getElementById('curveChart'));
+        return {
+            visible: chart.data.datasets.map((_, index) => chart.isDatasetVisible(index)),
+            pressed: [...document.querySelectorAll('#curveLegend .legend-item')]
+                .map((item) => item.getAttribute('aria-pressed')),
+        };
+    }""")
+    assert state["visible"] == [False, True, True, True]
+    assert state["pressed"] == ["false", "true", "true", "true"]
+
+    page.get_by_role("button", name=re.compile("All-time MMP")).click()
+    state = page.evaluate("""() => {
+        const chart = Chart.getChart(document.getElementById('curveChart'));
+        return chart.data.datasets.map((_, index) => chart.isDatasetVisible(index));
+    }""")
+    assert state == [False, False, True, True]
+
+    page.get_by_role("button", name=re.compile("Last ride MMP")).click()
+    state = page.evaluate("""() => {
+        const chart = Chart.getChart(document.getElementById('curveChart'));
+        return chart.data.datasets.map((_, index) => chart.isDatasetVisible(index));
+    }""")
+    assert state == [False, False, False, True]
+
+    page.get_by_role("button", name="CP/W' model", exact=True).click()
+    state = page.evaluate("""() => {
+        const chart = Chart.getChart(document.getElementById('curveChart'));
+        return chart.data.datasets.map((_, index) => chart.isDatasetVisible(index));
+    }""")
+    assert state == [False, False, False, False]
+    _assert_clean(console_errors, "dashboard curve series toggle")
+
+
 def test_plan_graph_button_expands_row_with_drawn_svg(page, live_server,
                                                       console_errors):
     """The per-workout 'graph' toggle expands its row and draws a real SVG."""
