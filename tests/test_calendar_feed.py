@@ -16,11 +16,31 @@ pytest.importorskip("httpx")
 from fastapi.testclient import TestClient  # noqa: E402
 
 import wattracker.server as servermod  # noqa: E402
-from wattracker import auth, calendarfeed, config, db  # noqa: E402
+from wattracker import auth, calendarfeed, config, db, timeutil  # noqa: E402
 from wattracker.server import create_app  # noqa: E402
 
 
 TODAY = dt.date(2026, 7, 27)
+# Noon UTC on TODAY: far enough from either midnight that a plain UTC reader
+# sees TODAY, while the timezone test below can still move the instant.
+TODAY_UTC_NOON = dt.datetime(2026, 7, 27, 12, 0, 0)
+
+
+@pytest.fixture(autouse=True)
+def _pin_feed_clock(monkeypatch):
+    """Pin the clock the feed window is measured from.
+
+    `build_ics` defaults its window to `local_today(tz)`, i.e. TODAY-30 ..
+    TODAY+180 around whatever `timeutil.utc_now()` says. The rows here are
+    seeded at the hardcoded `TODAY`, so as real time advances they slide out of
+    that window and the assertions below start passing vacuously against an
+    empty calendar. Pinning the clock keeps the window over the seeded rows.
+
+    Both names are pinned: `calendarfeed` imported `utc_now` by value, so its
+    binding is independent of `timeutil`'s and either one could feed a date.
+    """
+    monkeypatch.setattr(timeutil, "utc_now", lambda: TODAY_UTC_NOON)
+    monkeypatch.setattr(calendarfeed, "utc_now", lambda: TODAY_UTC_NOON)
 
 
 @pytest.fixture()
@@ -587,12 +607,21 @@ def test_range_queries_are_user_scoped():
 def test_window_follows_the_users_timezone(monkeypatch):
     uid = _user()
     db.save_user_settings(uid, {"timezone": "Pacific/Kiritimati"})  # UTC+14
-    monkeypatch.setattr(
-        calendarfeed, "utc_now", lambda: dt.datetime(2026, 7, 27, 23, 0, 0)
-    )
-    _plan_workout(uid, date="2026-07-28", name="TomorrowInUtc")
-    ics = calendarfeed.build_ics(uid)
-    assert "TomorrowInUtc" in _unfold(ics)
+    # Patch the clock `local_today` actually reads. Patching
+    # `calendarfeed.utc_now` looks right but is a no-op for the window: that
+    # name is only used for DTSTAMP, while the window comes from
+    # `local_today()`, which resolves `utc_now` from timeutil's own globals.
+    evening = dt.datetime(2026, 7, 27, 23, 0, 0)
+    monkeypatch.setattr(timeutil, "utc_now", lambda: evening)
+    monkeypatch.setattr(calendarfeed, "utc_now", lambda: evening)
+    # 23:00 UTC on the 27th is already the 28th at UTC+14, so the user's local
+    # today -- and therefore the far edge of the window -- is a day ahead.
+    assert timeutil.local_today("Pacific/Kiritimati") == dt.date(2026, 7, 28)
+    far_edge = (dt.date(2026, 7, 28)
+                + dt.timedelta(days=calendarfeed.FEED_FUTURE_DAYS)).isoformat()
+    _plan_workout(uid, date=far_edge, name="LastDayInLocalWindow")
+    ics = _unfold(calendarfeed.build_ics(uid))
+    assert "LastDayInLocalWindow" in ics
 
 
 # ------------------------------------------------------------ settings UI
