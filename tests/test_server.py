@@ -92,7 +92,14 @@ def test_dashboard_curve_legend_and_api_variants(client):
     assert {"measured", "all_time", "last_ride"} <= curve.keys()
 
 
-def test_settings_explains_training_and_recent_best_effort_ftp(client):
+def test_settings_explains_training_and_recent_best_effort_ftp(client, monkeypatch):
+    # The settings page reports a trailing-90-day best effort, measured from a
+    # clock `recent_best_effort_ftp` resolves for itself. The activity below is
+    # seeded at a hardcoded date, so once real time passes 90 days after it the
+    # ride drops out of the window and the "285.0 W" assertion goes stale.
+    from wattracker.ingest import importer
+
+    monkeypatch.setattr(importer, "utc_now", lambda: dt.datetime(2026, 6, 2, 12))
     _register(client)
     uid = db.get_user_by_username("tester")["id"]
     _seed_activity(uid, watts=300.0)

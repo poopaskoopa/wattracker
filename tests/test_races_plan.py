@@ -574,7 +574,12 @@ def _register(client, username="rider"):
     return db.get_user_by_username(username)["id"]
 
 
-def test_race_routes_add_reflow_and_delete(client):
+def test_race_routes_add_reflow_and_delete(client, monkeypatch):
+    # The route cannot be handed a `now`, so pin the clock reflow resolves for
+    # itself. Without this the assertions below decay as real time passes the
+    # seeded dates: reflow only rewrites the future, so the changed-count
+    # shrinks towards zero and the flash text silently changes.
+    monkeypatch.setattr(reflow, "utc_now", lambda: NOW)
     uid = _register(client)
     plan_id = _seed_plan(uid)
     before = _rows(uid, plan_id)
@@ -583,7 +588,10 @@ def test_race_routes_add_reflow_and_delete(client):
         "date": "2026-08-17", "priority": "A", "name": "Nationals",
         "duration_min": "120"}, follow_redirects=False)
     assert resp.status_code == 303
-    assert "workouts%20changed" in resp.headers["location"]
+    # Exact, not a substring: with the clock pinned the count is deterministic,
+    # so a changed-count or wording regression has nowhere to hide.
+    assert resp.headers["location"] == (
+        "/calendar?flash=Race%20saved.%2011%20workouts%20changed.")
     races = db.list_race_dates(uid)
     assert len(races) == 1 and races[0]["priority"] == "A"
     assert _rows(uid, plan_id) != before
