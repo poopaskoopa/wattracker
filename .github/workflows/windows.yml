@@ -167,17 +167,32 @@ jobs:
         run: |
           .venv\Scripts\python -m PyInstaller --clean --noconfirm packaging\wattracker.spec
           powershell -File packaging\smoke_frozen.ps1 -Executable dist\wattracker\wattracker.exe
-          Compress-Archive -Path dist\wattracker -DestinationPath dist\wattracker-windows-x64-unsigned.zip
           $version = .venv\Scripts\python -c "import tomllib; print(tomllib.load(open('pyproject.toml','rb'))['project']['version'])"
           ISCC.exe "/DAppVersion=$version" packaging\wattracker.iss
           $setup = "dist\wattracker-$version-windows-x64-unsigned-setup.exe"
           if (-not (Test-Path -LiteralPath $setup)) { throw "Setup compiler produced no artifact" }
           powershell -File packaging\smoke_installer.ps1 -Installer $setup
+      # 106.8 MB per run (44.4 MB setup exe + 61.8 MB portable zip + wheel)
+      # against a free account's 500 MB of shared storage is roughly four runs
+      # before this step starts failing with "Artifact storage quota has been
+      # hit" - which is how 45 stale July artifacts reached 2693 MB and blocked
+      # the job outright. Two changes keep it inside the budget.
+      #
+      # The portable zip is no longer built or uploaded. It was the largest
+      # single file and it duplicated the installer's payload: the same onedir
+      # tree, wrapped differently. The portable form still ships where it is
+      # actually consumed - windows-release.yml builds and signs its own zip on
+      # a `v*` tag. What is lost is a per-commit portable copy, which nothing
+      # downstream reads.
+      #
+      # And retention drops from the 90-day default to 7. These are unsigned
+      # builds used to check a commit, not releases; the signed release
+      # artifacts keep their own 30 days in windows-release.yml.
       - uses: actions/upload-artifact@v4
         with:
           name: wattracker-windows-x64-unsigned
           path: |
             dist/*.whl
-            dist/wattracker-windows-x64-unsigned.zip
             dist/*-unsigned-setup.exe
           if-no-files-found: error
+          retention-days: 7

@@ -5,7 +5,6 @@ wattracker ships on Windows as a frozen onedir tree, wrapped two ways:
 | artifact | what it is | built by |
 |---|---|---|
 | `wattracker-<version>-windows-x64-unsigned-setup.exe` | Inno Setup installer, double-click to install | `windows.yml`, job `package-unsigned` |
-| `wattracker-windows-x64-unsigned.zip` | the same tree, portable, unpack and run | the same job |
 | `wattracker-windows-x64-signed.zip` | the same tree, signed, plus a `.sha256` | `windows-release.yml`, on a `v*` tag |
 
 Note what that table does not contain: **there is no signed installer.**
@@ -190,8 +189,7 @@ The installer is built by the `package-unsigned` job in
 3. `tests\windows\lifecycle.ps1`, the PowerShell launcher-safety test;
 4. build the wheel and smoke the *installed* wheel in its own venv
    (`packaging/smoke_installed.py`);
-5. freeze the onedir tree and smoke it (`packaging/smoke_frozen.ps1`), then
-   `Compress-Archive` it into the portable zip;
+5. freeze the onedir tree and smoke it (`packaging/smoke_frozen.ps1`);
 6. read the version, run `ISCC.exe /DAppVersion=...`, and **throw if the setup
    file is not on disk** - a compiler that fails quietly must not reach upload;
 7. smoke the installer itself (`packaging/smoke_installer.ps1`): install to a
@@ -199,13 +197,30 @@ The installer is built by the `package-unsigned` job in
    `/login`, `/static/style.css` and `/register`, reinstall over the top,
    attempt an uninstall with tampered state and require it to fail, then
    uninstall for real;
-8. upload the wheel, the portable zip and the setup exe, with
-   `if-no-files-found: error`.
+8. upload the wheel and the setup exe, with `if-no-files-found: error`
+   and `retention-days: 7`.
 
 The digest and publisher checks in step 2 have their own paragraph in
 `docs/windows-security.md`, and `tests/test_windows_installer.py` pins the
 version, the digest, the hash command and the publisher string so they cannot be
 loosened without a test change.
+
+**Why step 8 no longer uploads a portable zip.** Self-hosted runners are not
+billed for minutes, but artifacts still consume the *account*'s shared storage,
+and a free account has 500 MB of it. A run used to upload 106.8 MB - a 44.4 MB
+setup exe, a 61.8 MB portable zip and the wheel - at the 90-day default
+retention, so roughly four runs filled the quota and `upload-artifact` began
+failing with `Artifact storage quota has been hit`. That is how 45 stale
+artifacts reached 2693 MB and blocked the job outright.
+
+The zip was the cheapest thing to drop, because it duplicated the installer's
+payload: the same onedir tree, wrapped differently rather than built
+differently. Nothing downstream consumed it, and the portable form still ships
+where it is actually used - `windows-release.yml` builds and signs its own on a
+`v*` tag. Retention on what remains is 7 days, since these are unsigned builds
+that exist to check a commit; the signed release artifacts keep their own 30.
+`tests/test_windows_installer.py` asserts both the retention value and the zip's
+absence, so re-adding a `Compress-Archive` here fails the suite.
 
 ### The runner
 
