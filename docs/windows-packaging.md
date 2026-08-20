@@ -213,6 +213,42 @@ repository, which is what kept this job gated. Self-hosted runners are not
 billed, which is how the `Cloud` workflow's suite has been running on a
 self-hosted macOS runner all along; `package-unsigned` now takes the same route.
 
+**A self-hosted Windows box is not `windows-latest`, and the job assumes two
+things a hosted image ships and a bare machine does not.** Both surfaced on the
+first run, in the setup step, before anything interesting could be reached.
+
+- **PowerShell 7.** Five steps declare `shell: pwsh`, which is PowerShell Core,
+  not the `powershell.exe` 5.1 that Windows ships. It is preinstalled on
+  `windows-latest`; on a fresh runner `pwsh` is simply not found. Install it
+  machine-wide - `winget install --id Microsoft.PowerShell --scope machine` from
+  an elevated shell - rather than rewriting the steps to `shell: powershell`.
+  The scripts would *mostly* survive 5.1, but the Inno Setup step appends to
+  `$env:GITHUB_PATH` with `Out-File -Encoding utf8`, and 5.1 writes a BOM there
+  while 7 does not. A BOM in `GITHUB_PATH` corrupts the entry it prefixes, and
+  the symptom - `ISCC.exe` not found, two steps later - points nowhere near the
+  cause. Matching the hosted image is also the point of the exercise.
+- **A script execution policy the runner account can use.** Windows client
+  defaults to `Restricted` with every scope `Undefined`, and
+  `actions/setup-python` runs its own `setup.ps1` through a `powershell` call
+  that does *not* pass `-ExecutionPolicy`, so it dies with
+  `UnauthorizedAccess`. The runner passes `-ExecutionPolicy Unrestricted` when
+  it launches a step's own script, which is why our steps look fine and this
+  still fails; the same gap bites `powershell -File packaging\smoke_installer.ps1`
+  and `smoke_frozen.ps1`, which spawn fresh processes from inside a step.
+  Set it for the runner account only, not `LocalMachine` - the CI account's hive
+  is loaded whenever the service is running:
+
+  ```powershell
+  $sid = (Get-LocalUser wattracker-ci).SID.Value
+  $key = "Registry::HKEY_USERS\$sid\Software\Microsoft\PowerShell\1\ShellIds\Microsoft.PowerShell"
+  New-Item -Path $key -Force | Out-Null
+  Set-ItemProperty -Path $key -Name ExecutionPolicy -Value RemoteSigned
+  ```
+
+  `RemoteSigned`, not `Bypass`: everything the job runs is either in the checkout
+  or written by a step, so nothing needs the weaker setting, and a downloaded
+  script still has to be signed to run.
+
 **`windows-release.yml` and the `test` job in `windows.yml` are still gated.**
 The release workflow needs hosted minutes and code-signing secrets, and the suite
 already runs on the macOS runner every push and pull request - duplicating ~6
