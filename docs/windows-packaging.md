@@ -54,7 +54,8 @@ the artifact name cannot disagree with `AppVersion` either.
 That one field is read in two deliberately different ways:
 
 - **the workflow** uses `python -c "import tomllib; ..."`, because the
-  `package-unsigned` job pins Python 3.12 and can rely on the stdlib parser;
+  `package-unsigned` job runs on Python 3.12 - asserted in the job, see **The
+  runner** - and can rely on the stdlib parser;
 - **`packaging/wattracker.spec`** (`_project_version`, used for the macOS bundle
   version) and `tests/test_windows_installer.py` both use a regex instead, and
   say so in a comment. That was forced when the build interpreter and the test
@@ -213,9 +214,12 @@ repository, which is what kept this job gated. Self-hosted runners are not
 billed, which is how the `Cloud` workflow's suite has been running on a
 self-hosted macOS runner all along; `package-unsigned` now takes the same route.
 
-**A self-hosted Windows box is not `windows-latest`, and the job assumes two
-things a hosted image ships and a bare machine does not.** Both surfaced on the
-first run, in the setup step, before anything interesting could be reached.
+**A self-hosted Windows box is not `windows-latest`.** Three things the hosted
+image provides had to be provided here instead, and every one of them surfaced
+in the first two runs' setup steps, before anything the installer job exists to
+verify could be reached. They share a shape worth naming: the hosted image runs
+jobs as an administrator with a fully provisioned toolchain, and this runner
+deliberately does neither.
 
 - **PowerShell 7, installed from the MSI.** Five steps declare `shell: pwsh`,
   which is PowerShell Core, not the `powershell.exe` 5.1 that Windows ships. It
@@ -244,6 +248,31 @@ first run, in the setup step, before anything interesting could be reached.
   BOM in `GITHUB_PATH` corrupts the entry it prefixes, and the symptom -
   `ISCC.exe` not found, two steps later - points nowhere near the cause. Matching
   the hosted image is also the point of the exercise.
+- **Python 3.12, installed machine-wide, and no `actions/setup-python`.** The
+  action's Windows path is not the tool-cache unpack it looks like:
+  `installers/win-setup-template.ps1` in `actions/python-versions` runs the
+  official installer with `InstallAllUsers=1` (or `ALLUSERS=1` for the MSI) and
+  first clears keys under
+  `HKLM\...\Installer\UserData\S-1-5-18\Products`. It requires administrator,
+  full stop - on the hosted image that is free because the runner account is one.
+  Here it is not, and it must not become one: admin on this account is exactly
+  the isolation the installer smoke test relies on. So the job dropped the action
+  and the runner carries a machine-wide CPython 3.12 instead
+  (`winget install Python.Python.3.12 --scope machine`), which is on the system
+  PATH and therefore visible to the service account.
+
+  Machine-wide, not per-user. A per-user install under
+  `%LOCALAPPDATA%\Programs\Python` belongs to the account that ran it and is
+  invisible to `wattracker-ci` - the same trap as the MSIX PowerShell above,
+  and worth stating twice because it is the single most repeated mistake in
+  setting this machine up.
+
+  The trade is that the interpreter is now a property of the box rather than
+  something `windows.yml` pins, which is why the job's first step asserts the
+  version and prints what it found. `tests/test_windows_installer.py` pins both
+  halves - that the action is absent, and that the assertion is present - so
+  neither can be quietly dropped.
+
 - **A script execution policy the runner account can use.** Windows client
   defaults to `Restricted` with every scope `Undefined`, and
   `actions/setup-python` runs its own `setup.ps1` through a `powershell` call
