@@ -128,17 +128,37 @@ def test_installer_job_uses_the_runners_machine_wide_python():
     assert "sys.version_info[:2] == (3, 12)" in package_job
 
 
-def test_workflow_builds_smokes_and_uploads_portable_and_setup_artifacts():
+def test_workflow_builds_smokes_and_uploads_the_wheel_and_setup_artifacts():
     assert "innosetup-6.7.3.exe" in WORKFLOW
     assert "9c73c3bae7ed48d44112a0f48e66742c00090bdb5bef71d9d3c056c66e97b732" in WORKFLOW
     assert "Get-FileHash -LiteralPath $innoInstaller -Algorithm SHA256" in WORKFLOW
     assert '$publisher -cne "Pyrsys B.V."' in WORKFLOW
     assert "packaging\\smoke_frozen.ps1" in WORKFLOW
-    assert "Compress-Archive -Path dist\\wattracker" in WORKFLOW
     assert "packaging\\wattracker.iss" in WORKFLOW
     assert "packaging\\smoke_installer.ps1" in WORKFLOW
+    assert "dist/*.whl" in WORKFLOW
     assert "dist/*-unsigned-setup.exe" in WORKFLOW
-    assert "dist/wattracker-windows-x64-unsigned.zip" in WORKFLOW
+
+
+def test_workflow_keeps_ci_artifacts_inside_the_storage_quota():
+    """The two things that stop this job re-hitting the artifact quota.
+
+    A run's payload was 106.8 MB - a 44.4 MB setup exe, a 61.8 MB portable zip
+    and the wheel - and the upload took the 90-day default retention. On a free
+    account's 500 MB of shared storage that is about four runs before
+    `upload-artifact` fails with "Artifact storage quota has been hit", which is
+    how 45 stale artifacts reached 2693 MB and blocked the job outright.
+
+    The zip is the half worth pinning. It duplicated the installer's payload -
+    the same onedir tree, wrapped differently - so dropping it cost no coverage,
+    and the portable form still ships from windows-release.yml, which builds and
+    signs its own on a `v*` tag. Reintroducing it here would put 61.8 MB per run
+    back and quietly restart the countdown, so assert its absence rather than
+    trusting a reviewer to notice a re-added Compress-Archive.
+    """
+    assert re.search(r"(?m)^\s*retention-days:\s*7\s*$", WORKFLOW)
+    assert "Compress-Archive" not in WORKFLOW
+    assert "wattracker-windows-x64-unsigned.zip" not in WORKFLOW
 
 
 def test_frozen_restore_dispatch_contract_is_unchanged():
