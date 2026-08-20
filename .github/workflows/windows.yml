@@ -1,7 +1,19 @@
 name: Windows
 
+# A bare `push:` alongside `pull_request:` runs this twice for every commit on a
+# branch with an open PR - and with one physical runner the second run queues
+# behind the first rather than running beside it, so it is pure wall time. Runs
+# 32386196713 and 32386202547 were the same commit, 10m45s of wall for 5m30s of
+# work.
+#
+# Filtering push to `main` gives exactly one run per commit: a PR run while the
+# work is in review, a push run once it merges. The trade is that a branch with
+# no PR open gets no Windows run, so packaging breakage surfaces when the PR
+# opens rather than on the push - which is the right moment for a job that takes
+# six minutes of a machine shared with the trainer.
 on:
   push:
+    branches: [main]
   pull_request:
 
 permissions:
@@ -192,37 +204,32 @@ jobs:
           $setup = "dist\wattracker-$version-windows-x64-unsigned-setup.exe"
           if (-not (Test-Path -LiteralPath $setup)) { throw "Setup compiler produced no artifact" }
           powershell -File packaging\smoke_installer.ps1 -Installer $setup
-      # 106.8 MB per run (44.4 MB setup exe + 61.8 MB portable zip + wheel)
-      # against a free account's 500 MB of shared storage is roughly four runs
-      # before this step starts failing with "Artifact storage quota has been
-      # hit" - which is how 45 stale July artifacts reached 2693 MB and blocked
-      # the job outright. Two changes keep it inside the budget.
+      # The portable zip is deliberately not built or uploaded. It was the
+      # largest single file at 61.8 MB and it duplicated the installer's
+      # payload: the same onedir tree, wrapped differently rather than built
+      # differently. The portable form still ships where it is actually
+      # consumed - windows-release.yml builds and signs its own zip on a `v*`
+      # tag - so what is lost is a per-commit portable copy that nothing
+      # downstream reads. A run's payload is ~45 MB without it.
+      # Build on every PR commit, upload only on a merge to main.
       #
-      # The portable zip is no longer built or uploaded. It was the largest
-      # single file and it duplicated the installer's payload: the same onedir
-      # tree, wrapped differently. The portable form still ships where it is
-      # actually consumed - windows-release.yml builds and signs its own zip on
-      # a `v*` tag. What is lost is a per-commit portable copy, which nothing
-      # downstream reads.
+      # The account's shared storage is 500 MB and this step is the only thing
+      # in the repo that consumes it (cloud.yml uploads nothing; the release
+      # workflows fire only on `v*` tags). Uploading on every push does not fit:
+      # at ~93 triggers a week, 45 MB a run needs several gigabytes. Merges to
+      # main run ~8.75 times a week, so ~394 MB at 7-day retention - which fits,
+      # but leaves too little for a busy week. Five days holds it near 280 MB.
       #
-      # And retention drops from the 90-day default to 7. These are unsigned
-      # builds used to check a commit, not releases; the signed release
-      # artifacts keep their own 30 days in windows-release.yml.
-      # GATED, pending a decision on artifact storage. The account's shared
-      # storage is exhausted and this step is the only thing in the repo that
-      # consumes it, so it fails every run - the build above is green and only
-      # the upload is red, which makes the whole job unreadable at a glance.
+      # Nothing is lost by not uploading on PR commits. The job still proves the
+      # ISCC compile, the frozen smoke and the full install/upgrade/tampered-
+      # uninstall/uninstall on every one of them; the artifact is a
+      # downloadable convenience, and nothing downstream reads it -
+      # windows-release.yml builds its own signed artifacts on a tag.
       #
-      # Everything this job exists to prove still runs: the ISCC compile, the
-      # frozen smoke, and install/upgrade/tampered-uninstall/uninstall. What is
-      # lost while gated is only the downloadable copy, and nothing downstream
-      # consumes it - windows-release.yml builds its own signed artifacts on a
-      # `v*` tag and does not read this one.
-      #
-      # Ungating is a one-line change once the quota is resolved and the scope
-      # question is settled (upload on every push, on main only, or on tags and
-      # workflow_dispatch). See docs/windows-packaging.md.
-      - if: ${{ false }}
+      # The ref test is redundant while push is filtered to main above, and is
+      # kept deliberately: it is what stops a later re-broadening of the trigger
+      # from silently turning the upload back on for every branch.
+      - if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
         uses: actions/upload-artifact@v4
         with:
           name: wattracker-windows-x64-unsigned
@@ -230,4 +237,4 @@ jobs:
             dist/*.whl
             dist/*-unsigned-setup.exe
           if-no-files-found: error
-          retention-days: 7
+          retention-days: 5

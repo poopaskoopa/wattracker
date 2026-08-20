@@ -164,6 +164,21 @@ def test_heavy_steps_yield_the_box_to_a_hardware_session():
     assert len(drops) == 3
 
 
+def test_push_is_filtered_to_main_so_a_commit_runs_once():
+    """One physical runner means a duplicate run is queued, not parallel.
+
+    A bare `push:` beside `pull_request:` fires twice for every commit on a
+    branch with an open PR, and the second waits for the first: runs
+    32386196713 and 32386202547 were one commit, 10m45s of wall for 5m30s of
+    work. Filtering push to main gives a PR run while the work is in review and
+    a push run when it merges - which is also what the upload keys off.
+    """
+    on = WORKFLOW.split("permissions:", 1)[0]
+    assert re.search(r"(?m)^  push:$", on)
+    assert re.search(r"(?m)^    branches: \[main\]$", on)
+    assert re.search(r"(?m)^  pull_request:$", on)
+
+
 def test_workflow_keeps_ci_artifacts_inside_the_storage_quota():
     """The two things that stop this job re-hitting the artifact quota.
 
@@ -180,18 +195,20 @@ def test_workflow_keeps_ci_artifacts_inside_the_storage_quota():
     back and quietly restart the countdown, so assert its absence rather than
     trusting a reviewer to notice a re-added Compress-Archive.
     """
-    assert re.search(r"(?m)^\s*retention-days:\s*7\s*$", WORKFLOW)
+    assert re.search(r"(?m)^\s*retention-days:\s*5\s*$", WORKFLOW)
     assert "Compress-Archive" not in WORKFLOW
     assert "wattracker-windows-x64-unsigned.zip" not in WORKFLOW
 
-    # Gated while the storage question is open, so the job reports the build
-    # honestly instead of going red on a step that cannot succeed. The gate is
-    # on the step; the job itself stays ungated, which the test above pins.
+    # Upload on a merge to main, not on every PR commit - the difference
+    # between ~8.75 uploads a week and ~93. The condition sits on the step, so
+    # every PR commit still runs the whole build; only the artifact is skipped.
     body = WORKFLOW.splitlines()
     at = next(
         n for n, line in enumerate(body) if "uses: actions/upload-artifact" in line
     )
-    assert body[at - 1].strip() == "- if: ${{ false }}"
+    gate = body[at - 1].strip()
+    assert "github.event_name == 'push'" in gate
+    assert "github.ref == 'refs/heads/main'" in gate
 
 
 def test_frozen_restore_dispatch_contract_is_unchanged():
