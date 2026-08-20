@@ -107,6 +107,27 @@ def test_workflow_runs_the_installer_job_on_the_self_hosted_runner():
     assert not re.search(r"(?m)^\s*cancel-in-progress\s*:", WORKFLOW)
 
 
+def test_installer_job_uses_the_runners_machine_wide_python():
+    """No setup-python on this job, and the interpreter is asserted instead.
+
+    actions/setup-python is not a tool-cache unpack on Windows: the setup
+    script in actions/python-versions runs the official installer with
+    InstallAllUsers=1 and clears keys under HKLM, so it needs administrator.
+    The runner's service account deliberately is not one, and handing it admin
+    would remove the account isolation the installer smoke test depends on -
+    so reintroducing the action would either fail the job or undo that.
+
+    The cost is that the interpreter becomes a property of the machine rather
+    than of this file. Asserting the version is what buys it back: a drifted
+    runner fails on a line that names what it found.
+    """
+    _, package_job = WORKFLOW.split("  package-unsigned:", 1)
+    # Matched as a `uses:` line, not as a substring: the comment in the workflow
+    # explaining why the action is absent necessarily names it.
+    assert not re.search(r"(?m)^\s*-?\s*uses:\s*actions/setup-python", package_job)
+    assert "sys.version_info[:2] == (3, 12)" in package_job
+
+
 def test_workflow_builds_smokes_and_uploads_portable_and_setup_artifacts():
     assert "innosetup-6.7.3.exe" in WORKFLOW
     assert "9c73c3bae7ed48d44112a0f48e66742c00090bdb5bef71d9d3c056c66e97b732" in WORKFLOW

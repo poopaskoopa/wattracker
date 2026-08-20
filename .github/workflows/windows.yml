@@ -45,10 +45,30 @@ jobs:
     timeout-minutes: 45
     steps:
       - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
-        with:
-          python-version: "3.12"
-          cache: pip
+
+      # Deliberately no actions/setup-python. Its Windows path is not a
+      # tool-cache unpack: installers/win-setup-template.ps1 in
+      # actions/python-versions runs the official installer with
+      # InstallAllUsers=1 and clears keys under
+      # HKLM\...\Installer\UserData\S-1-5-18\Products, so it requires
+      # administrator. This runner's service account deliberately is not one,
+      # and granting it admin would remove the isolation the installer smoke
+      # test depends on - see docs/windows-packaging.md. Python 3.12 is
+      # installed machine-wide on the runner instead.
+      #
+      # That makes the interpreter a property of the machine rather than
+      # something this file pins, so assert the version here instead of
+      # trusting it. A drifted box fails on this line, naming the version it
+      # found, rather than somewhere inside a PyInstaller build. The same
+      # reasoning as cloud.yml's `assert sys.version_info >= (3, 12)`.
+      #
+      # Losing setup-python also loses `cache: pip`, which costs nothing here:
+      # pip's own cache in the runner account's profile persists between jobs
+      # on a machine that is not discarded.
+      - name: Assert the runner's machine-wide Python
+        shell: pwsh
+        run: |
+          python -c "import sys; assert sys.version_info[:2] == (3, 12), sys.version; print(sys.version)"
 
       # A self-hosted runner keeps whatever the previous job left behind. Two of
       # the things the installer registers cannot be redirected away from a
