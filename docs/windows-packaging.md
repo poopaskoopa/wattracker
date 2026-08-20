@@ -361,31 +361,49 @@ confirms the isolation above - `(Get-CimInstance Win32_Service -Filter "Name LIK
 'actions.runner%'").StartName` must read `.\wattracker-ci`, not
 `NT AUTHORITY\NETWORK SERVICE`.
 
-## What has never been executed
+## What the first run observed
 
-Be blunt about this. Wiring up the runner did not retroactively verify anything:
-until a run actually completes, everything below is still unobserved. Read this
-as the checklist the first self-hosted run has to clear, and update it against
-observed output rather than against the fact that the job is now enabled.
+Run
+[32332933878](https://github.com/poopaskoopa/wattracker/actions/runs/32332933878),
+on the self-hosted runner, is the first time any of this executed. Recorded
+here as observations, with what was actually seen - not as "the job is enabled
+now".
 
-- **`packaging/wattracker.iss` has never been compiled by this repository.**
-  Every Windows workflow run to date is recorded as skipped, so no `ISCC`
-  invocation exists in any run log, and Inno Setup does not run on macOS, which
-  is where this repository is developed. A syntax error, a directive the pinned
-  6.7.3 rejects, or a Pascal Script typo in `[Code]` would surface on the first
-  compile. Treat it as a debugging session, not a build.
-- **No installer has ever been installed**, and `packaging/smoke_installer.ps1`
-  has never run. The Start Menu shortcut, the upgrade-over-existing-install path
-  and the uninstall path are all unobserved.
-- **The `[Code]` lifecycle has never executed.** `PrepareToInstall`,
-  `InitializeUninstall`, the tampered-state abort and the message boxes are
-  reviewed, not exercised. Every test that covers any of this reads the files as
-  text; `tests/test_windows_installer.py` asserts strings in `.iss`, `.ps1` and
-  `.yml`, and asserts nothing about behaviour.
-- **The pinned-compiler provenance check has never run either.** The URL,
-  digest and publisher are reviewed constants; that the 6.7.3 asset still
-  matches that digest, and that its signer simple name renders exactly as
-  `Pyrsys B.V.`, are unverified assumptions until the job runs once.
+- **`packaging/wattracker.iss` compiled.** `ISCC.exe` reported
+  `Compiler engine version: Inno Setup 6.7.3`, then
+  `Successful compile (28.094 sec)`, producing
+  `dist\wattracker-0.1.0-windows-x64-unsigned-setup.exe`. No syntax error, and
+  `ArchitecturesAllowed=x64compatible` was accepted rather than rejected - it
+  had been valid-in-6.7.3-but-unverified until this run.
+- **The `[Code]` section compiled.** `Reading [Code] section` is followed by
+  `Compiling [Code] section` with no diagnostic between them, so the Pascal
+  Script parses. Note what this does and does not establish: the section
+  *compiles*. `PrepareToInstall` and `InitializeUninstall` running is evidenced
+  by the smoke test below, not by these lines.
+- **The installer installed, upgraded over itself, refused a tampered
+  uninstall, and uninstalled.** `packaging/smoke_installer.ps1` ran to
+  completion and the step exited 0, which means its whole sequence passed - the
+  log shows the app answering at `http://127.0.0.1:50792/login` twice under
+  different PIDs, the second being the reinstall over the top.
+- **The pinned-compiler provenance check ran and passed.** The 6.7.3 asset still
+  matches the pinned SHA-256 `9c73c3ba...97b732`, and the Authenticode signer's
+  simple name still renders exactly `Pyrsys B.V.` - both are `-cne` comparisons,
+  so passing means byte-exact, not merely similar. The step now prints both
+  observed values rather than proving them by silence, so a future run answers
+  the question directly instead of leaving it to be inferred from a green tick.
+- **The account isolation held.** After the run, the developer account had no
+  `HKCU` uninstall key and no Start Menu group, and `~/.wattracker/wattracker.db`
+  was byte-identical to the pre-run capture (4096 bytes, SHA-256
+  `42F67CDE...6302`). Checked, not assumed - the same standard
+  `docs/macos-packaging.md` holds its smoke test to.
+
+Still unobserved, and unchanged by the above:
+
+- **The artifact has never been uploaded.** `actions/upload-artifact` matched
+  all three files and then failed on `Artifact storage quota has been hit` -
+  the same account-level billing wall that gated this workflow to begin with.
+  The build products exist and are correct; nothing has retrieved them from the
+  runner.
 - **The installer is unsigned and there is no path that signs it.** Even after
   the signing story in `docs/windows-security.md` works, it produces a signed
   *zip*; SmartScreen judges the thing the user double-clicks, and that is the

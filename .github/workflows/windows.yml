@@ -119,15 +119,25 @@ jobs:
             -Uri "https://github.com/jrsoftware/issrc/releases/download/is-6_7_3/innosetup-6.7.3.exe" `
             -OutFile $innoInstaller
           $actualInnoSha256 = (Get-FileHash -LiteralPath $innoInstaller -Algorithm SHA256).Hash.ToLowerInvariant()
-          if ($actualInnoSha256 -cne $expectedInnoSha256) {
-            throw "Inno Setup compiler SHA-256 verification failed"
-          }
           $signature = Get-AuthenticodeSignature -FilePath $innoInstaller
           $publisher = if ($signature.SignerCertificate) {
             $signature.SignerCertificate.GetNameInfo(
               [System.Security.Cryptography.X509Certificates.X509NameType]::SimpleName,
               $false
             )
+          }
+          # Print what was observed before asserting on it. A step that proves
+          # its result only by not throwing leaves the run log unable to answer
+          # "what did the digest and publisher actually say" - which is the
+          # question this pinned check exists to answer. Printing first also
+          # means a failing run shows the value it got, not just that it
+          # differed.
+          Write-Host "Inno Setup $innoVersion digest (observed): $actualInnoSha256"
+          Write-Host "Inno Setup $innoVersion digest (pinned):   $expectedInnoSha256"
+          Write-Host "Authenticode status:    $($signature.Status)"
+          Write-Host "Authenticode publisher: $publisher"
+          if ($actualInnoSha256 -cne $expectedInnoSha256) {
+            throw "Inno Setup compiler SHA-256 verification failed"
           }
           if ($signature.Status -ne "Valid" -or $publisher -cne "Pyrsys B.V.") {
             throw "Inno Setup compiler signature verification failed"
