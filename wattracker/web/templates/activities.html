@@ -60,7 +60,7 @@
                 {% endif %}
             </td>
             <td class="num">{{ a.duration_fmt or '—' }}</td>
-            <td class="num">{{ '%.1f'|format((a.distance_m or 0) / 1000) }} km</td>
+            <td class="num">{{ ('%.1f'|format(a.distance_m / 1000)) ~ ' km' if a.distance_m else '—' }}</td>
             <td class="num">{{ '%.0f'|format(a.avg_power or 0) }} W</td>
             <td class="num">{{ '%.0f'|format(a.np or 0) }} W</td>
             <td class="num">{{ '%.2f'|format(a.if_ or 0) }}</td>
