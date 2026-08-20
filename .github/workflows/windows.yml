@@ -102,9 +102,27 @@ jobs:
       # The path is load-bearing beyond hygiene: scripts/wattracker.ps1 resolves
       # `<repo>\.venv\Scripts\python.exe` as its interpreter of last resort, which
       # is what lets tests\windows\lifecycle.ps1 start the app from source.
+      # This runner shares a physical box with the trainer and Zwift, so a build
+      # can land in the middle of a hardware session. Nothing here touches
+      # Bluetooth, and every script binds a dynamically chosen free loopback
+      # port rather than a fixed one, so neither the trainer link nor a live
+      # session's server is contended. What is contended is the CPU: the
+      # PyInstaller freeze and the Inno Setup LZMA compress each saturate every
+      # core for minutes.
+      #
+      # Dropping the shell to BelowNormal lets Zwift preempt them; the build's
+      # own children (pip, PyInstaller, ISCC) inherit it. BelowNormal and not
+      # Idle deliberately - at Idle the runner's heartbeat can starve under
+      # sustained load and the job gets reported lost.
+      #
+      # Note this does NOT lower I/O priority, which is a separate axis on
+      # Windows and cannot be set on another process from outside it. A build
+      # still competes for the disk. Add the same line to any new step that does
+      # heavy work; the three that do today each carry it.
       - name: Create workspace virtual environment
         shell: pwsh
         run: |
+          (Get-Process -Id $PID).PriorityClass = 'BelowNormal'
           python -m venv .venv
           .venv\Scripts\python -m pip install --disable-pip-version-check --upgrade pip
           .venv\Scripts\python -m pip install --disable-pip-version-check build -e ".[dev,ble,package]"
@@ -155,6 +173,7 @@ jobs:
       - name: Build wheel and installed smoke
         shell: pwsh
         run: |
+          (Get-Process -Id $PID).PriorityClass = 'BelowNormal'
           .venv\Scripts\python -m build --wheel
           $smoke = Join-Path $env:RUNNER_TEMP "wheel-smoke"
           .venv\Scripts\python -m venv $smoke
@@ -165,6 +184,7 @@ jobs:
       - name: Build onedir and smoke
         shell: pwsh
         run: |
+          (Get-Process -Id $PID).PriorityClass = 'BelowNormal'
           .venv\Scripts\python -m PyInstaller --clean --noconfirm packaging\wattracker.spec
           powershell -File packaging\smoke_frozen.ps1 -Executable dist\wattracker\wattracker.exe
           $version = .venv\Scripts\python -c "import tomllib; print(tomllib.load(open('pyproject.toml','rb'))['project']['version'])"
@@ -188,7 +208,22 @@ jobs:
       # And retention drops from the 90-day default to 7. These are unsigned
       # builds used to check a commit, not releases; the signed release
       # artifacts keep their own 30 days in windows-release.yml.
-      - uses: actions/upload-artifact@v4
+      # GATED, pending a decision on artifact storage. The account's shared
+      # storage is exhausted and this step is the only thing in the repo that
+      # consumes it, so it fails every run - the build above is green and only
+      # the upload is red, which makes the whole job unreadable at a glance.
+      #
+      # Everything this job exists to prove still runs: the ISCC compile, the
+      # frozen smoke, and install/upgrade/tampered-uninstall/uninstall. What is
+      # lost while gated is only the downloadable copy, and nothing downstream
+      # consumes it - windows-release.yml builds its own signed artifacts on a
+      # `v*` tag and does not read this one.
+      #
+      # Ungating is a one-line change once the quota is resolved and the scope
+      # question is settled (upload on every push, on main only, or on tags and
+      # workflow_dispatch). See docs/windows-packaging.md.
+      - if: ${{ false }}
+        uses: actions/upload-artifact@v4
         with:
           name: wattracker-windows-x64-unsigned
           path: |
