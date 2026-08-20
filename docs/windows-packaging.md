@@ -198,7 +198,7 @@ The installer is built by the `package-unsigned` job in
    attempt an uninstall with tampered state and require it to fail, then
    uninstall for real;
 8. upload the wheel and the setup exe, with `if-no-files-found: error`
-   and `retention-days: 7` - **currently gated off**, see below.
+   and `retention-days: 5` - **only on a merge to `main`**, see below.
 
 The digest and publisher checks in step 2 have their own paragraph in
 `docs/windows-security.md`, and `tests/test_windows_installer.py` pins the
@@ -222,32 +222,50 @@ that exist to check a commit; the signed release artifacts keep their own 30.
 `tests/test_windows_installer.py` asserts both the retention value and the zip's
 absence, so re-adding a `Compress-Archive` here fails the suite.
 
-### The upload is gated off
+### The upload runs only on merges to main
 
-The upload step carries `if: ${{ false }}`. The account's shared storage is
-exhausted, this step is the only thing in the repo that consumes it, and it
-therefore fails on every run - leaving a job whose build is entirely green
-reported as a failure, which trains people to ignore the red.
+Every PR commit builds; only a merge to `main` uploads. The step carries
 
-Nothing the job exists to prove is lost while it is gated. The `ISCC` compile,
-the frozen smoke and the full install / upgrade / tampered-uninstall / uninstall
-sequence all still run, and all still fail the job if they break. What is
-unavailable is the downloadable copy, which nothing downstream consumes:
-`windows-release.yml` builds its own signed artifacts on a `v*` tag and never
-reads this one.
+```yaml
+if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
+```
 
-Ungating is a one-line change, and it waits on two questions:
+and the `push` trigger is itself filtered to `main`, so the two agree by
+construction. The ref test is redundant today and kept anyway: it is what stops
+a later re-broadening of the trigger from silently turning the upload back on
+for every branch.
 
-1. **The quota.** Deleting artifacts cleared 2693 MB and the repo now reports
-   `total_count: 0`, but the block outlasted GitHub's stated 6-12 hour
-   recalculation window. No other consumer exists - `cloud.yml` uploads nothing,
-   no workflow pushes to a registry, and neither release workflow has ever run -
-   so the remaining explanation is GitHub-side, visible only on the owner's
-   billing page.
-2. **The scope.** At the volume this job will see once ungated for every branch,
-   ~45 MB a run does not fit in 500 MB even at 7-day retention. Uploading on
-   `main` only, or on tags and `workflow_dispatch`, are the alternatives to
-   uploading on every push.
+**Why not every push.** The account's shared storage is 500 MB, and this step is
+the only thing in the repo that consumes it - `cloud.yml` uploads nothing, no
+workflow pushes to a registry, and the two release workflows fire only on `v*`
+tags. At the ~93 triggers a week this workflow sees, 45 MB a run needs several
+gigabytes. Merges to `main` run about 8.75 times a week (40 push events in the
+32 days to 2026-08-21), which is ~394 MB at 7-day retention: it fits, but leaves
+too little slack for a busy week, so retention is 5 and the steady state is
+nearer 280 MB.
+
+**Nothing is lost on the PR commits that do not upload.** They still run the
+`ISCC` compile, the frozen smoke and the full install / upgrade /
+tampered-uninstall / uninstall, and still fail the job if any of it breaks. The
+artifact is a downloadable convenience; nothing downstream reads it, and
+`windows-release.yml` builds its own signed artifacts on a tag.
+
+**One run per commit.** A bare `push:` beside `pull_request:` fired this
+workflow twice for every commit on a branch with an open PR, and with a single
+physical runner the second run queues behind the first rather than running
+beside it - runs `32386196713` and `32386202547` were the same commit, 10m45s of
+wall time for 5m30s of work. Filtering push to `main` gives a PR run while the
+work is in review and a push run when it merges. The trade is that a branch with
+no PR open gets no Windows run at all, so packaging breakage surfaces when the
+PR opens rather than on the push.
+
+**The quota block is separate and may still be in force.** Deleting 2693 MB of
+stale artifacts left `total_count: 0`, but uploads continued to fail with
+`Artifact storage quota has been hit` well past GitHub's stated 6-12 hour
+recalculation window. Nothing visible accounts for it; `taksmon` cannot read
+`settings/billing` (that needs the `user` scope), so the owner's billing page is
+the only remaining place to look. Until it clears, expect a red upload on merges
+to `main` while every PR run stays green.
 
 ### Yielding the box to a hardware session
 
