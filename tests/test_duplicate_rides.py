@@ -332,10 +332,14 @@ def test_a_secondary_with_its_own_distance_is_not_overwritten(user_id):
 
 
 def test_a_primary_without_a_distance_leaves_the_secondary_alone(user_id):
-    in_app, fit = _seed_real_pair(user_id)
+    # The primary (.fit) has no distance of its own, but the secondary
+    # (in-app) already carries a real one - a guard-less copy would clobber
+    # it with the primary's falsy value.
+    in_app = _insert(user_id, *IN_APP, distance_m=12345.0)
+    fit = _insert(user_id, *FIT, distance_m=0.0)
 
     assert importer.link_duplicate_activity(user_id, fit) == in_app
-    assert not db.get_activity(user_id, in_app)["distance_m"]
+    assert db.get_activity(user_id, in_app)["distance_m"] == pytest.approx(12345.0)
 
 
 # ------------------------------------------------------------- aggregations
