@@ -198,7 +198,7 @@ The installer is built by the `package-unsigned` job in
    attempt an uninstall with tampered state and require it to fail, then
    uninstall for real;
 8. upload the wheel and the setup exe, with `if-no-files-found: error`
-   and `retention-days: 7`.
+   and `retention-days: 7` - **currently gated off**, see below.
 
 The digest and publisher checks in step 2 have their own paragraph in
 `docs/windows-security.md`, and `tests/test_windows_installer.py` pins the
@@ -221,6 +221,69 @@ where it is actually used - `windows-release.yml` builds and signs its own on a
 that exist to check a commit; the signed release artifacts keep their own 30.
 `tests/test_windows_installer.py` asserts both the retention value and the zip's
 absence, so re-adding a `Compress-Archive` here fails the suite.
+
+### The upload is gated off
+
+The upload step carries `if: ${{ false }}`. The account's shared storage is
+exhausted, this step is the only thing in the repo that consumes it, and it
+therefore fails on every run - leaving a job whose build is entirely green
+reported as a failure, which trains people to ignore the red.
+
+Nothing the job exists to prove is lost while it is gated. The `ISCC` compile,
+the frozen smoke and the full install / upgrade / tampered-uninstall / uninstall
+sequence all still run, and all still fail the job if they break. What is
+unavailable is the downloadable copy, which nothing downstream consumes:
+`windows-release.yml` builds its own signed artifacts on a `v*` tag and never
+reads this one.
+
+Ungating is a one-line change, and it waits on two questions:
+
+1. **The quota.** Deleting artifacts cleared 2693 MB and the repo now reports
+   `total_count: 0`, but the block outlasted GitHub's stated 6-12 hour
+   recalculation window. No other consumer exists - `cloud.yml` uploads nothing,
+   no workflow pushes to a registry, and neither release workflow has ever run -
+   so the remaining explanation is GitHub-side, visible only on the owner's
+   billing page.
+2. **The scope.** At the volume this job will see once ungated for every branch,
+   ~45 MB a run does not fit in 500 MB even at 7-day retention. Uploading on
+   `main` only, or on tags and `workflow_dispatch`, are the alternatives to
+   uploading on every push.
+
+### Yielding the box to a hardware session
+
+The runner shares a physical machine with the trainer and Zwift, so a build can
+begin in the middle of a ride. Three steps - the dependency install, the wheel
+build, and the freeze plus installer compile - therefore start with
+
+```powershell
+(Get-Process -Id $PID).PriorityClass = 'BelowNormal'
+```
+
+so that PyInstaller and the Inno Setup LZMA compress, which each saturate every
+core for minutes, yield to Zwift. Children inherit the class, so the whole build
+tree is covered. `BelowNormal` rather than `Idle` is deliberate: at `Idle` the
+runner's heartbeat can starve under sustained load and the job is reported lost.
+
+This does **not** lower I/O priority, which is a separate axis on Windows and
+cannot be set on another process from outside it, so a build still competes for
+the disk.
+
+**It does not replace stopping the runner** - see "Stopping the runner for a
+trainer session" below, which remains the operational contract and is the only
+thing that removes the contention rather than merely deprioritizing it. The
+priority drop is what limits the damage on the ride where somebody forgets, and
+for a session where ERG latency is being measured rather than merely ridden,
+forgetting is still a spoiled measurement.
+
+Nothing in the job touches Bluetooth, so the trainer link itself is never
+contended, and every script binds a dynamically chosen free loopback port rather
+than a fixed one, so a live session's server is never collided with either.
+
+The three packaging smokes also set `WATTRACKER_AUTO_SCAN=0`;
+`tests/windows/lifecycle.ps1` does not, and does not need to. That flag governs
+the daily *activity-file* scan rather than a BLE scan, and lifecycle runs against
+a throwaway `WATTRACKER_DATA_DIR` with no Zwift folder configured, so the scan
+has nothing to walk.
 
 ### The runner
 

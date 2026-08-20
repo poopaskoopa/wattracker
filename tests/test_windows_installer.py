@@ -93,7 +93,11 @@ def test_workflow_runs_the_installer_job_on_the_self_hosted_runner():
     """
     test_job, package_job = WORKFLOW.split("  package-unsigned:", 1)
     assert "if: ${{ false }}" in test_job
-    assert "if: ${{ false }}" not in package_job
+    # Matched at job indentation, not anywhere in the job. A *step* inside
+    # package-unsigned may legitimately be gated - the upload is, while the
+    # storage question is open - and that must not read as the job reverting to
+    # a gate, which is the thing this asserts against.
+    assert not re.search(r"(?m)^    if:", package_job)
     # The `Windows` label is load-bearing: a bare [self-hosted] also matches the
     # macOS runner that the Cloud workflow uses.
     assert "runs-on: [self-hosted, Windows, X64]" in package_job
@@ -140,6 +144,26 @@ def test_workflow_builds_smokes_and_uploads_the_wheel_and_setup_artifacts():
     assert "dist/*-unsigned-setup.exe" in WORKFLOW
 
 
+def test_heavy_steps_yield_the_box_to_a_hardware_session():
+    """The runner shares a machine with the trainer and Zwift.
+
+    Nothing in the job touches Bluetooth, so the trainer link is never
+    contended - but the PyInstaller freeze and the Inno Setup compress each
+    saturate every core for minutes, and a build can start in the middle of a
+    session. Dropping the shell lets Zwift preempt it; children inherit.
+
+    BelowNormal rather than Idle is the load-bearing half: at Idle the runner's
+    heartbeat can starve under sustained load and the job is reported lost.
+    """
+    _, package_job = WORKFLOW.split("  package-unsigned:", 1)
+    drops = re.findall(r"PriorityClass = '(\w+)'", package_job)
+    assert drops, "no step lowers its priority"
+    assert set(drops) == {"BelowNormal"}
+    # The three steps that do real work: dependency install, wheel build, and
+    # the freeze plus installer compile.
+    assert len(drops) == 3
+
+
 def test_workflow_keeps_ci_artifacts_inside_the_storage_quota():
     """The two things that stop this job re-hitting the artifact quota.
 
@@ -159,6 +183,15 @@ def test_workflow_keeps_ci_artifacts_inside_the_storage_quota():
     assert re.search(r"(?m)^\s*retention-days:\s*7\s*$", WORKFLOW)
     assert "Compress-Archive" not in WORKFLOW
     assert "wattracker-windows-x64-unsigned.zip" not in WORKFLOW
+
+    # Gated while the storage question is open, so the job reports the build
+    # honestly instead of going red on a step that cannot succeed. The gate is
+    # on the step; the job itself stays ungated, which the test above pins.
+    body = WORKFLOW.splitlines()
+    at = next(
+        n for n, line in enumerate(body) if "uses: actions/upload-artifact" in line
+    )
+    assert body[at - 1].strip() == "- if: ${{ false }}"
 
 
 def test_frozen_restore_dispatch_contract_is_unchanged():
