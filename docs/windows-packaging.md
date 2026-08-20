@@ -217,16 +217,33 @@ self-hosted macOS runner all along; `package-unsigned` now takes the same route.
 things a hosted image ships and a bare machine does not.** Both surfaced on the
 first run, in the setup step, before anything interesting could be reached.
 
-- **PowerShell 7.** Five steps declare `shell: pwsh`, which is PowerShell Core,
-  not the `powershell.exe` 5.1 that Windows ships. It is preinstalled on
-  `windows-latest`; on a fresh runner `pwsh` is simply not found. Install it
-  machine-wide - `winget install --id Microsoft.PowerShell --scope machine` from
-  an elevated shell - rather than rewriting the steps to `shell: powershell`.
-  The scripts would *mostly* survive 5.1, but the Inno Setup step appends to
-  `$env:GITHUB_PATH` with `Out-File -Encoding utf8`, and 5.1 writes a BOM there
-  while 7 does not. A BOM in `GITHUB_PATH` corrupts the entry it prefixes, and
-  the symptom - `ISCC.exe` not found, two steps later - points nowhere near the
-  cause. Matching the hosted image is also the point of the exercise.
+- **PowerShell 7, installed from the MSI.** Five steps declare `shell: pwsh`,
+  which is PowerShell Core, not the `powershell.exe` 5.1 that Windows ships. It
+  is preinstalled on `windows-latest`; on a fresh runner `pwsh` is simply not
+  found. Install it machine-wide from an elevated shell:
+
+  ```powershell
+  winget install --id Microsoft.PowerShell --installer-type wix --scope machine
+  ```
+
+  `--installer-type wix` is load-bearing and not obvious. Without it winget
+  selects the *MSIX bundle* and `--scope machine` becomes a provisioning
+  operation, which fails `0x80070005` even elevated. More to the point it would
+  be the wrong build if it succeeded: the packaged version surfaces `pwsh.exe`
+  through a per-user App Execution Alias under
+  `%LOCALAPPDATA%\Microsoft\WindowsApps`, so the runner account would still not
+  find it on PATH - the same trap as this machine's per-user Python 3.12, which
+  is invisible to `wattracker-ci` for exactly the same reason. The `wix` entry is
+  the machine-wide MSI, which installs to `C:\Program Files\PowerShell\7` and
+  edits the *system* PATH. **Restart the runner service afterwards**: a service
+  inherits its environment at start, so `pwsh` stays not-found until it does.
+
+  Do not answer this by rewriting the steps to `shell: powershell`. They would
+  *mostly* survive 5.1, but the Inno Setup step appends to `$env:GITHUB_PATH`
+  with `Out-File -Encoding utf8`, and 5.1 writes a BOM there while 7 does not. A
+  BOM in `GITHUB_PATH` corrupts the entry it prefixes, and the symptom -
+  `ISCC.exe` not found, two steps later - points nowhere near the cause. Matching
+  the hosted image is also the point of the exercise.
 - **A script execution policy the runner account can use.** Windows client
   defaults to `Restricted` with every scope `Undefined`, and
   `actions/setup-python` runs its own `setup.ps1` through a `powershell` call
