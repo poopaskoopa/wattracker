@@ -11,7 +11,7 @@
     <div class="card"><span class="label">Duration</span>
         <span class="value">{{ activity.duration_fmt or '—' }}</span></div>
     <div class="card"><span class="label">Distance</span>
-        <span class="value">{{ '%.1f'|format((activity.distance_m or 0) / 1000) }} km</span></div>
+        <span class="value">{{ ('%.1f'|format(activity.distance_m / 1000)) ~ ' km' if activity.distance_m else '—' }}</span></div>
     <div class="card"><span class="label">Avg Power</span>
         <span class="value">{{ '%.0f'|format(activity.avg_power or 0) }} W</span></div>
     <div class="card"><span class="label">NP</span>

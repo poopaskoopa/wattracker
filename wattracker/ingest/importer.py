@@ -546,8 +546,27 @@ def _link_pair(user_id: int, primary: dict, secondary: dict) -> Optional[int]:
         return None
     if not primary.get("rpe") and secondary.get("rpe"):
         db.set_activity_rpe(user_id, primary["id"], int(secondary["rpe"]))
+    _carry_distance(user_id, primary, secondary)
     db.repoint_completed_activity(user_id, secondary["id"], primary["id"])
     return secondary["id"]
+
+
+def _carry_distance(user_id: int, primary: dict, secondary: dict) -> bool:
+    """Give the secondary the primary's distance when it has none of its own.
+
+    An in-app ride records no distance at all (the trainer reports power, not
+    wheel travel), so its row reads 0 km - wrong for a ride that really covered
+    ground, and visible wherever the secondary is opened directly. The .fit's
+    distance is the same ride's, so it is the right number to show.
+
+    Only ever fills an empty value; a real distance on either side is left
+    exactly as it is.
+    """
+    if secondary.get("distance_m") or not primary.get("distance_m"):
+        return False
+    return db.set_activity_distance(
+        user_id, secondary["id"], float(primary["distance_m"])
+    )
 
 
 def find_duplicate_activity(user_id: int, activity: dict) -> Optional[dict]:
@@ -592,6 +611,23 @@ def link_duplicate_activity(user_id: int, activity_id: int) -> Optional[int]:
     return _link_pair(user_id, activity, other)
 
 
+def _repair_linked_distances(user_id: int, rows: list) -> int:
+    """Carry distances onto pairs that were linked before the carry-over existed.
+
+    ``backfill_duplicate_links`` only visits unlinked rows, so an in-app ride
+    already marked a duplicate would keep its 0 km forever. Runs off the
+    summaries that pass already loaded (no streams) and only fills empty
+    values, so it is safe to re-run: the second pass finds nothing to do.
+    """
+    by_id = {r["id"]: r for r in rows}
+    fixed = 0
+    for row in rows:
+        primary = by_id.get(row.get("duplicate_of"))
+        if primary is not None and _carry_distance(user_id, primary, row):
+            fixed += 1
+    return fixed
+
+
 def backfill_duplicate_links(user_id: int) -> int:
     """Link every historical cross-source pair for a user. Safe to re-run.
 
@@ -601,6 +637,7 @@ def backfill_duplicate_links(user_id: int) -> int:
     """
     db.init_db()
     rows = db.activities_for_matching(user_id)
+    _repair_linked_distances(user_id, rows)
     fresh = [r for r in rows if r.get("duplicate_of") is None]
     imported = sorted(
         (r for r in fresh if not is_in_app_activity(r.get("filename"))),
