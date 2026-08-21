@@ -415,16 +415,22 @@ or `wattracker-restore --restore 1`; a frozen bundle uses
 `wattracker.exe restore [--restore N]`. Restore safety follows the configured
 loopback port.
 
-All GitHub Actions jobs are currently hard-disabled, so the test gate is a
-local `python -m pytest tests` run. The Windows test job targets Python 3.12,
-matching the project's minimum supported version and the version used in
-development; it is disabled because Actions runs are blocked at the account
-level (failed payment or spending limit) and every run reported a red check
-that could not be told apart from a real failure. Windows packaging and
-signed-release jobs were already disabled to avoid consuming hosted-runner
-minutes, which are billable on this private repo. The retained workflow
-definitions must be explicitly re-enabled by a later code change, and the test
-job additionally needs billing resolved. Windows executables must be built on
+CI runs on self-hosted runners, which are not billed and so survived the
+account-level block on hosted minutes. The suite runs on a macOS runner
+(`cloud.yml`) on every push and pull request, and a Windows runner
+(`windows.yml`) builds and smoke-tests the packaged artifacts on every pull
+request: the wheel, the frozen application, the Inno Setup installer through a
+full install/upgrade/uninstall, and the frozen connector. A merge to `main`
+uploads the wheel, the installer and the connector, best-effort — the account's
+artifact storage is full, so that step may go yellow on an otherwise green
+build.
+
+What stays disabled needs something CI cannot supply. The Windows *test* job is
+gated to keep a duplicate of the suite off the single physical box; the
+signed-release workflows (`windows-release.yml`, `macos-release.yml`) fire only
+on a `v*` tag and are gated for want of a code-signing certificate, so every
+shipped binary is still an unsigned local build. The containerized cloud
+checks need billable Linux minutes. Windows executables must be built on
 Windows. Real BLE hardware and production signing cannot be verified here; use
 [the Windows BLE checklist](docs/windows-ble-validation.md).
 

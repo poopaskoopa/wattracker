@@ -1,10 +1,17 @@
 """Guards on the connector's frozen build.
 
-Nothing here can build the artifact - the release job is hard-disabled and the
-runners are the wrong OS anyway - so these assert from the checkout, in the
-same style and for the same reason as test_windows_installer.py and
-test_macos_packaging.py: the invariants that would otherwise be noticed only by
-shipping a broken binary.
+These assert from the checkout, in the same style and for the same reason as
+test_windows_installer.py and test_macos_packaging.py: the invariants that
+would otherwise be noticed only by shipping a broken binary.
+
+That used to be all there was, because nothing could build the artifact. It no
+longer is: the self-hosted Windows runner added in #114 freezes the connector
+and runs packaging/smoke_frozen_connector.py against it on every pull request,
+so the executable's own behaviour is now covered by something that runs. What
+stays here is what a checkout can answer and a build cannot - that the spec
+still says onefile and windowed, that autostart still touches only HKCU, and
+that the workflows still wire the whole gate up. The last of those is the
+section at the end, and it now covers both workflows.
 
 The tray and autostart guards the plan called for (WP-B, WP-C) landed with the
 code they describe, which is the section at the end. What came first covers
@@ -100,6 +107,10 @@ SMOKE = (ROOT / "packaging" / "smoke_frozen_connector.py").read_text(encoding="u
 WORKFLOW = (
     ROOT / ".github" / "workflows" / "windows-release.yml"
 ).read_text(encoding="utf-8")
+# The per-commit job. Distinct from WORKFLOW above in the way that matters
+# most here: that one is hard-disabled and fires on a tag, this one actually
+# runs, on every pull request, on the self-hosted Windows box.
+CI_WORKFLOW = (ROOT / ".github" / "workflows" / "windows.yml").read_text(encoding="utf-8")
 ISS = (ROOT / "packaging" / "wattracker.iss").read_text(encoding="utf-8")
 
 
@@ -276,6 +287,29 @@ def test_the_workflow_builds_smokes_and_signs_the_connector():
     assert '-ArtifactPath "dist\\WattrackerConnector.exe"' in WORKFLOW
     # Uploaded with a checksum beside it, like the app.
     assert "WattrackerConnector.exe.sha256" in WORKFLOW
+
+
+def test_ci_builds_and_smokes_the_connector_on_every_commit():
+    """The gate that actually runs, as opposed to the one waiting on a cert.
+
+    windows-release.yml is the workflow that signs and ships, and it is
+    hard-disabled. Until a certificate exists, every bit of proof that the
+    connector still freezes into a working binary comes from this job - so it
+    must build the spec, and it must run the smoke against what it built. A
+    build with no smoke would be worse than nothing: onefile PyInstaller
+    failures are quiet by nature, and a spec that silently stopped collecting
+    bleak still produces an executable that starts.
+    """
+    _, package_job = CI_WORKFLOW.split("  package-unsigned:", 1)
+    assert "packaging\\wattracker-connector.spec" in package_job
+    assert "smoke_frozen_connector.py" in package_job
+    # Both optional halves must be installed for the spec to collect them.
+    # Without these the freeze still succeeds and the smoke's import check is
+    # what fails - later, and further from the cause.
+    assert '".[dev,ble,package,connector,webview]"' in package_job
+    # The connector is uploaded too: it is the only artifact of this branch a
+    # rider can be handed, and windows-release.yml cannot hand them one.
+    assert "dist/WattrackerConnector.exe" in package_job
 
 
 # ------------------------------------------------- the tray and the autostart
