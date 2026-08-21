@@ -2852,6 +2852,27 @@ def set_standalone_rpe(
         conn.close()
 
 
+def set_activity_distance(
+    user_id: int, activity_id: int, distance_m: float, path: Optional[str] = None,
+) -> bool:
+    """Set an activity's distance.
+
+    Used to carry a distance onto a ride recorded in-app, which has no distance
+    of its own: the BLE trainer reports power, not wheel travel. Scoped to the
+    user; returns True when a row was updated.
+    """
+    conn = connect(path)
+    try:
+        cur = conn.execute(
+            "UPDATE activities SET distance_m=? WHERE user_id=? AND id=?",
+            (float(distance_m), user_id, activity_id),
+        )
+        conn.commit()
+        return cur.rowcount > 0
+    finally:
+        conn.close()
+
+
 def set_activity_rpe(
     user_id: int, activity_id: int, rpe: int, path: Optional[str] = None,
 ) -> bool:
