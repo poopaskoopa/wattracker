@@ -16,6 +16,18 @@ jobs:
   # runner cannot run either, which is why the containerised checks live in
   # the separate job below.
   tests:
+    # The repository is public and this runner is a physical machine that is not
+    # torn down between jobs, so a pull request from a fork must never reach it:
+    # the install step below executes the PR's own build backend and pytest
+    # executes its conftest.py, both as the runner's user account. GitHub's
+    # first-time-contributor approval prompt is not a substitute - approving a
+    # contributor once exempts every later PR from that account.
+    #
+    # The consequence is that a fork PR gets no CI at all: the containerised job
+    # below is disabled, so this is the only job that would have run. Review a
+    # fork PR by pushing its head to a branch in this repository, which is also
+    # the point at which a human has read the diff.
+    if: github.event_name == 'push' || github.event.pull_request.head.repo.full_name == github.repository
     runs-on: [self-hosted, macOS]
     timeout-minutes: 30
     steps:
