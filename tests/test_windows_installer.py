@@ -180,6 +180,10 @@ def test_a_full_storage_quota_cannot_red_check_a_green_build():
     # would mean a build that produced nothing still reported success.
     assert re.search(r'(?m)^\s+if \(\$whl\.Count -eq 0\) \{ throw ', WORKFLOW)
     assert re.search(r'(?m)^\s+if \(\$exe\.Count -eq 0\) \{ throw ', WORKFLOW)
+    # The connector ships in the same upload and needs the same signal: it is
+    # the one artifact here that no other file duplicates, so a freeze that
+    # silently produced nothing would otherwise be invisible.
+    assert re.search(r'(?m)^\s+if \(\$connector\.Count -eq 0\) \{ throw ', WORKFLOW)
 
 
 def test_heavy_steps_yield_the_box_to_a_hardware_session():
@@ -197,9 +201,11 @@ def test_heavy_steps_yield_the_box_to_a_hardware_session():
     drops = re.findall(r"PriorityClass = '(\w+)'", package_job)
     assert drops, "no step lowers its priority"
     assert set(drops) == {"BelowNormal"}
-    # The three steps that do real work: dependency install, wheel build, and
-    # the freeze plus installer compile.
-    assert len(drops) == 3
+    # The four steps that do real work: dependency install, wheel build, the
+    # app's freeze plus installer compile, and the connector's freeze. Counted
+    # rather than merely checked for presence, so that a new heavy step added
+    # without the drop fails here instead of quietly competing with a ride.
+    assert len(drops) == 4
 
 
 def test_push_is_filtered_to_main_so_a_commit_runs_once():

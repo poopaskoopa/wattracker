@@ -1,9 +1,17 @@
 """Assert the frozen connector actually works, on the machine that built it.
 
-CI cannot build this - the release job is hard-disabled until a certificate
-exists - so this is the only thing between a spec change and a rider being
-handed a binary that does nothing. tests/test_connector_packaging.py asserts
-what the *checkout* says; this asserts what the *executable* does.
+CI runs this. The self-hosted Windows runner freezes the connector and calls
+this script against the result on every pull request, which makes it the only
+thing between a spec change and a rider being handed a binary that does
+nothing - windows-release.yml would sign such a binary quite happily, and it is
+hard-disabled until a certificate exists anyway.
+tests/test_connector_packaging.py asserts what the *checkout* says; this
+asserts what the *executable* does.
+
+Everything here is safe to run on a runner that persists between jobs and
+shares its box with a trainer: each check gets its own temporary
+WATTRACKER_CONNECTOR_DIR, the stub server binds a free loopback port, and
+nothing touches Bluetooth, the registry, or the autostart key.
 
 Three checks, in the order they can fail:
 
@@ -20,7 +28,7 @@ Three checks, in the order they can fail:
    exactly the argument smoke_frozen_ble.py makes, and for the same reason -
    a build whose backend failed to package starts fine and simply never works.
 
-    python packaging/smoke_frozen_connector.py dist/WattrackerConnector.exe
+    python packaging\\smoke_frozen_connector.py dist\\WattrackerConnector.exe
 
 Stdlib only, like its siblings: it runs against whatever python is available,
 not necessarily the project venv. WATTRACKER_CONNECTOR_DIR is pointed at a
@@ -307,6 +315,13 @@ def main(argv) -> int:
     if not pathlib.Path(executable).exists():
         print(f"FAIL: no such executable: {executable}")
         return 1
+    # Resolved before it is ever handed to CreateProcess, which does not accept
+    # a relative path spelled with forward slashes - it fails with a bare
+    # WinError 2 that reads as "the build is missing" rather than "the argument
+    # is punctuated wrong". pathlib accepts that spelling happily, so the check
+    # above passes and the confusion lands several frames later, inside Popen.
+    # This script's own usage line used to be written that way.
+    executable = str(pathlib.Path(executable).resolve())
 
     failures = 0
     for check in (

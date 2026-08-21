@@ -248,8 +248,18 @@ heuristics.** A onefile build re-extracts to `%TEMP%\_MEIxxxx` on every launch.
 That, plus an autostart entry, plus a held credential, is the shape antivirus
 software dislikes most, and there is no certificate yet
 (`packaging/sign-windows.ps1` is wired into the release job, which remains
-hard-disabled). Until then the artifact comes from a local Windows build and
-should be treated as one: check the `.sha256` published beside it.
+hard-disabled). Until then every connector binary in existence is unsigned, and
+comes from one of two places.
+
+A **local Windows build** should be treated as one: check the `.sha256`
+published beside it. A **CI artifact**, uploaded by `windows.yml` on a merge to
+`main`, has no checksum beside it and deliberately so — it would be generated
+by the same run that built the binary and travel in the same archive, which
+proves nothing a tampered run could not also forge. What stands in for it is
+the run itself: the artifact names the workflow run that produced it, that run
+names the commit, and the log shows the freeze and all four smoke checks. That
+is provenance rather than integrity, and it is not a substitute for signing.
+Neither source should be handed to anyone outside the people testing this.
 
 ## Installer lifecycle and compiler provenance
 

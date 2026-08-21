@@ -55,9 +55,10 @@ and `test_install_bootstrap.py::test_without_lsof_hides_lsof_but_keeps_bash_on_u
 create symlinks, which needs Developer Mode. The run takes about six minutes
 and was 2294 passed / 45 skipped on 2026-08-14.
 
-**A green run here is not a green CI.** `.github/workflows/cloud.yml` is the
-only workflow that runs the suite — self-hosted macOS, on every push and pull
-request — and every Windows job is `if: ${{ false }}`. So the suite that gates
+**A green run here is not a green CI.** `.github/workflows/cloud.yml` is still
+the only workflow that runs the *suite* — self-hosted macOS, on every push and
+pull request; `windows.yml`'s `test` job remains `if: ${{ false }}` so the box
+is not asked to run six minutes of duplicate tests. So the suite that gates
 this branch is one this machine cannot run, and a test that is right about
 Windows and wrong about everything else goes red the moment it is pushed, with
 nothing here to have warned you. That is not hypothetical: it is how
@@ -91,6 +92,23 @@ Build and check the artifact:
 Both were run on 2026-08-14 and all four smoke checks pass. If the build
 refuses with `PermissionError` on `dist\WattrackerConnector.exe`, a copy is
 still running — `taskkill /F /T /IM WattrackerConnector.exe`.
+
+**CI now does both of those too.** `windows.yml`'s `package-unsigned` job runs
+on the self-hosted Windows runner (#114) and, as of this branch, freezes the
+connector and runs `smoke_frozen_connector.py` against it on every pull
+request. Two things follow. The first is that a spec change that breaks the
+freeze, or quietly stops collecting `bleak` or `webviewpy`, now fails a check
+instead of waiting to be discovered by a rider. The second is that a merge to
+`main` uploads `WattrackerConnector.exe` as a build artifact, so a rider can be
+handed a binary without a Windows checkout and a toolchain — which until now
+was the only way to get one, because `windows-release.yml` is hard-disabled for
+want of a signing certificate.
+
+That upload is best-effort on purpose: the account's artifact storage is full
+and `upload-artifact` is `continue-on-error`, so the step can go yellow while
+the build is genuinely green. If no artifact appears on a merge, read the step,
+not the job — and see the sizing note in the workflow before adding anything
+else to the payload.
 
 ## 3. What is where
 
