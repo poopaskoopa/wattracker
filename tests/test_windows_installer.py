@@ -144,6 +144,29 @@ def test_workflow_builds_smokes_and_uploads_the_wheel_and_setup_artifacts():
     assert "dist/*-unsigned-setup.exe" in WORKFLOW
 
 
+def test_a_full_storage_quota_cannot_red_check_a_green_build():
+    """The build's own signal must not ride on GitHub's storage accounting.
+
+    Run 32477527515 - this job's first on main - compiled the installer and
+    passed every smoke, then failed on `Artifact storage quota has been hit`.
+    The account's 500 MB is committed elsewhere (this repo holds no artifacts)
+    and usage recalculates only every 6-12 hours, so the wall is neither ours
+    to clear nor short-lived. The upload is therefore best-effort, and the
+    question it used to answer - did the build actually produce an installer? -
+    is answered against the filesystem instead.
+    """
+    # Anchored to the start of a line, not a bare substring: `# continue-on-
+    # error: true` still contains the substring, so an `in WORKFLOW` check
+    # passes against a commented-out setting and pins nothing. Every assertion
+    # here was mutation-checked by commenting the real line out.
+    assert re.search(r"(?m)^\s+continue-on-error: true$", WORKFLOW)
+    assert re.search(r"(?m)^\s+if-no-files-found: warn$", WORKFLOW)
+    # The replacement signal. Without these the upload's continue-on-error
+    # would mean a build that produced nothing still reported success.
+    assert re.search(r'(?m)^\s+if \(\$whl\.Count -eq 0\) \{ throw ', WORKFLOW)
+    assert re.search(r'(?m)^\s+if \(\$exe\.Count -eq 0\) \{ throw ', WORKFLOW)
+
+
 def test_heavy_steps_yield_the_box_to_a_hardware_session():
     """The runner shares a machine with the trainer and Zwift.
 
