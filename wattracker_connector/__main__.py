@@ -28,6 +28,7 @@ import logging
 import logging.handlers
 import os
 import queue
+import re
 import sys
 import threading
 from typing import Callable, List, Optional
@@ -44,6 +45,105 @@ log = logging.getLogger(__name__)
 # history that makes a flaky link diagnosable.
 _LOG_MAX_BYTES = 512 * 1024
 _LOG_BACKUPS = 2
+
+# Exact secret values to scrub from every log line, registered at startup by
+# whoever learns one. Written once in main() before any thread starts and only
+# read afterwards, which is why it needs no lock.
+_SECRETS: "set[str]" = set()
+
+# Below this, a "secret" is a substring of ordinary words and scrubbing it would
+# shred the log rather than protect anything. Real device tokens are 43 chars
+# (secrets.token_urlsafe(32)), so nothing legitimate is turned away.
+_MIN_SECRET_LEN = 16
+
+
+def redact_secret(value: object) -> None:
+    """Register a credential so it never appears in the log in any spelling.
+
+    The ``Bearer`` pattern below only catches a token spelled the way an HTTP
+    header spells it. Register the value itself and a bare one - in a settings
+    dump, a dict repr, an exception message - is caught too.
+    """
+    if isinstance(value, str) and len(value) >= _MIN_SECRET_LEN:
+        _SECRETS.add(value)
+
+
+def forget_secrets() -> None:
+    """Drop the registry. For tests; the connector registers once and runs."""
+    _SECRETS.clear()
+
+
+class _SecretRedactingFilter(logging.Filter):
+    """Keep the device token out of the connector log.
+
+    Why this exists: ``-v`` sets the root logger to DEBUG, and ``websockets``
+    logs every handshake header at that level - ``"> Authorization: Bearer
+    <token>"``, one line per connection attempt. That used to be transient
+    stderr on a developer's console. It now lands in a rotating file the rider
+    is asked for whenever the link misbehaves, so "send me your connector.log"
+    would hand over a live credential; on this branch that credential opens a
+    web session, so it would hand over the account.
+
+    Redacting rather than silencing ``websockets`` on purpose. The handshake
+    lines are exactly what ``-v`` is for - a wrong Host or a 403 from the
+    server is diagnosed from them - and a level cut would take the diagnosis
+    away along with the leak. Only the credential is removed; the header is
+    still visibly there.
+
+    This is installed on the HANDLERS, never on a logger. A filter on the
+    connector's root logger would not see this record at all: logger filters
+    run only for records logged through that logger, and ``websockets.client``
+    is a different logger that merely propagates to the same handlers.
+    """
+
+    # Anchored on the scheme name so it cannot chew through unrelated text, and
+    # bounded to the character set a credential can actually use (RFC 6750
+    # token68 plus the base64url alphabet token_urlsafe emits). The floor of 8
+    # is deliberately low enough to over-match the odd line of prose - "bearer
+    # authentication failed" comes out redacted - because the two errors are
+    # not symmetrical: over-matching costs a word in a log, under-matching
+    # writes a live credential to a file the rider is asked to email.
+    _BEARER = re.compile(r"(?i:bearer)\s+[A-Za-z0-9._~+/=-]{8,}")
+
+    @classmethod
+    def redact(cls, value: str) -> str:
+        text = cls._BEARER.sub("Bearer [REDACTED]", value)
+        for secret in _SECRETS:
+            if secret in text:
+                text = text.replace(secret, "[REDACTED]")
+        return text
+
+    def _scrub(self, value: object) -> object:
+        # Non-strings are rendered by the formatter, so they have to be
+        # rendered here too or a token inside a dict/repr walks straight past.
+        # Only a value that actually changed is replaced, so "%d" and friends
+        # keep their argument's type on the overwhelmingly common path.
+        if isinstance(value, str):
+            return self.redact(value)
+        try:
+            text = str(value)
+        except Exception:
+            # It cannot be rendered here, so it cannot be rendered into the log
+            # either - nothing can leak through a __str__ that raises.
+            return value
+        cleaned = self.redact(text)
+        return cleaned if cleaned != text else value
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        try:
+            if isinstance(record.msg, str):
+                record.msg = self.redact(record.msg)
+            if isinstance(record.args, tuple):
+                record.args = tuple(self._scrub(a) for a in record.args)
+            elif isinstance(record.args, dict):
+                record.args = {k: self._scrub(v) for k, v in record.args.items()}
+        except Exception:
+            # Logging must never be what breaks the connector, and a record
+            # that could not be scrubbed is still better dropped than emitted:
+            # blank the message rather than let an unredacted one through.
+            record.msg = "a log line could not be redacted and was dropped"
+            record.args = ()
+        return True
 
 
 class _ConnectorHandler:
@@ -81,6 +181,11 @@ def _configure_logging(verbose: bool) -> None:
 
     Calling this twice replaces its own handlers rather than stacking a second
     copy of each, so a second call cannot start double-logging every line.
+
+    Every handler installed here carries _SecretRedactingFilter. ``verbose``
+    turns on DEBUG for the whole process, which is what makes ``websockets``
+    print the Authorization header of each handshake; the filter is what keeps
+    that switch from writing the device token into a file that persists.
     """
     root = logging.getLogger()
     for existing in [h for h in root.handlers if isinstance(h, _ConnectorHandler)]:
@@ -102,10 +207,12 @@ def _configure_logging(verbose: bool) -> None:
         print("could not open the connector log file", file=sys.stderr)
     if handler is not None:
         handler.setFormatter(formatter)
+        handler.addFilter(_SecretRedactingFilter())
         root.addHandler(handler)
     if sys.stderr is not None:
         stream = _ConnectorStreamHandler()
         stream.setFormatter(formatter)
+        stream.addFilter(_SecretRedactingFilter())
         root.addHandler(stream)
 
 
@@ -478,6 +585,9 @@ def _run_with_tray(connector: Connector, settings: dict) -> int:
 def main(argv: Optional[List[str]] = None) -> int:
     args = _parser().parse_args(argv)
     _configure_logging(args.verbose)
+    # Registered as early as each one is known, not once at the end: a token is
+    # only protected from the lines logged after it is registered.
+    redact_secret(args.token)
 
     if args.smoke_import:
         name = args.smoke_import
@@ -495,6 +605,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         return 0
 
     stored = load()
+    redact_secret(stored.get("token"))
     if args.show_config:
         from .config import describe
 

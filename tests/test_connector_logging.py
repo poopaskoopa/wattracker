@@ -15,9 +15,13 @@ import pytest
 
 from wattracker_connector import config as connector_config
 from wattracker_connector.__main__ import (
+    _ConnectorHandler,
     _ConnectorStreamHandler,
+    _SecretRedactingFilter,
     _configure_logging,
+    forget_secrets,
     main,
+    redact_secret,
 )
 
 TOKEN = "s3cret-device-token-value-that-is-long-enough-abc"
@@ -31,12 +35,15 @@ def connector_dir(tmp_path, monkeypatch):
     root = logging.getLogger()
     before = list(root.handlers)
     level = root.level
+    forget_secrets()
     yield directory
     for handler in [h for h in root.handlers if h not in before]:
         root.removeHandler(handler)
         handler.close()
     root.handlers[:] = before
     root.setLevel(level)
+    # A secret registered by one test must not make the next one pass for free.
+    forget_secrets()
 
 
 def _log_text(directory) -> str:
@@ -162,3 +169,133 @@ def test_a_token_passed_on_the_command_line_is_not_logged(connector_dir, capsys)
 
     assert TOKEN not in _log_text(connector_dir)
     assert TOKEN not in capsys.readouterr().out
+
+
+# ------------------------------------------------------------- -v
+# The PR #93 review's third finding. --show-config and --save were pinned above
+# and -v was not, so this file read as covering the credential when the one
+# switch that actually writes it went untested.
+#
+# The exact line, from a real run with -v:
+#   DEBUG websockets.client: > Authorization: Bearer FnI9DQ...
+# websockets/client.py logs `"> %s: %s"` once per request header during the
+# handshake, and this PR gave that output a persistent home (512 KiB x 3).
+# "Send me your connector.log" then becomes "send me your device token", and
+# with the escalation this branch adds, that is account takeover.
+_HANDSHAKE_HEADER = "> %s: %s"
+
+
+def _verbose_websockets_handshake(token=TOKEN):
+    """Replay the handshake logging websockets does, at its own logger."""
+    log = logging.getLogger("websockets.client")
+    log.debug("> GET %s HTTP/1.1", "/ws/connector")
+    log.debug(_HANDSHAKE_HEADER, "Host", "192.168.1.10:8000")
+    log.debug(_HANDSHAKE_HEADER, "Authorization", f"Bearer {token}")
+
+
+def test_verbose_does_not_write_the_bearer_token_to_the_log(connector_dir):
+    _configure_logging(True)
+    _verbose_websockets_handshake()
+
+    text = _log_text(connector_dir)
+    assert TOKEN not in text
+    assert "Bearer [REDACTED]" in text
+
+
+def test_verbose_does_not_write_the_bearer_token_to_stderr_either(
+    connector_dir, capsys
+):
+    """The console script logs to both, and both outlive the moment."""
+    _configure_logging(True)
+    _verbose_websockets_handshake()
+
+    err = capsys.readouterr().err
+    assert TOKEN not in err
+    assert "Bearer [REDACTED]" in err
+
+
+def test_verbose_still_records_the_handshake_it_is_for(connector_dir):
+    """Redaction must not be a level cut in disguise.
+
+    -v exists so a rider with a flaky link can send a log that shows the
+    handshake failing. Everything except the credential still has to be in it,
+    including the other headers - a wrong Host is a real diagnosis.
+    """
+    _configure_logging(True)
+    _verbose_websockets_handshake()
+
+    text = _log_text(connector_dir)
+    assert "> GET /ws/connector HTTP/1.1" in text
+    assert "> Host: 192.168.1.10:8000" in text
+    assert "> Authorization: " in text, "the header's presence is diagnostic"
+
+
+def test_a_run_without_verbose_is_unchanged(connector_dir):
+    """DEBUG stays off without -v; this fix must not turn it on."""
+    _configure_logging(False)
+    _verbose_websockets_handshake()
+
+    assert "/ws/connector" not in _log_text(connector_dir)
+
+
+def test_a_registered_token_is_redacted_in_any_shape(connector_dir):
+    """Belt and braces: the scheme prefix is not the only way one gets out.
+
+    The Bearer pattern only catches a credential that arrives spelled the way
+    the header spells it. Anything that logs the configured settings, or a
+    repr of the headers dict, prints the bare value - so the connector also
+    registers its own token as a literal to scrub.
+    """
+    redact_secret(TOKEN)
+    _configure_logging(True)
+
+    logging.getLogger("wattracker_connector.test").debug(
+        "connecting with %s", {"token": TOKEN}
+    )
+    text = _log_text(connector_dir)
+    assert TOKEN not in text
+    assert "[REDACTED]" in text
+
+
+def test_registering_a_short_value_is_refused(connector_dir):
+    """A one-character "secret" would redact the whole log into uselessness."""
+    redact_secret("abc")
+    _configure_logging(True)
+
+    logging.getLogger("wattracker_connector.test").info("abcdefg is fine")
+    assert "abcdefg is fine" in _log_text(connector_dir)
+
+
+def test_the_filter_never_breaks_a_log_call(connector_dir):
+    """Logging that raises is worse than logging that leaks."""
+    class Explodes:
+        def __str__(self):
+            raise RuntimeError("no")
+
+    redact_secret(TOKEN)
+    record = logging.LogRecord(
+        "x", logging.DEBUG, __file__, 0, "%s", (Explodes(),), None
+    )
+    assert _SecretRedactingFilter().filter(record) is True
+
+
+def test_a_verbose_run_installs_the_redaction_on_every_handler(connector_dir):
+    """Handler-level, not logger-level, and that distinction is the whole fix.
+
+    A filter on the connector's root *logger* would never see this record:
+    logger filters run only for records logged through that logger, and
+    ``websockets.client`` is a different logger that merely propagates to the
+    same handlers. Attaching to the handlers is what puts the filter in the
+    path of every library the connector pulls in.
+    """
+    _configure_logging(True)
+
+    ours = [
+        h for h in logging.getLogger().handlers
+        if isinstance(h, _ConnectorHandler)
+    ]
+    assert ours, "this run should have installed at least the file handler"
+    for handler in ours:
+        assert any(
+            isinstance(f, _SecretRedactingFilter) for f in handler.filters
+        ), handler

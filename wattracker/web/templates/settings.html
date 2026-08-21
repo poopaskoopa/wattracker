@@ -4,6 +4,9 @@
 <h2>Settings</h2>
 
 {% if saved %}<p class="ok">Settings saved.</p>{% endif %}
+{# Refused because of what this session is, not because of what was typed:
+   a window opened by a connector device may not issue credentials. #}
+{% if refusal_message %}<p class="alert" role="alert">{{ refusal_message }}</p>{% endif %}
 {% if cred_message %}<p class="{{ 'ok' if 'saved (' in cred_message or 'cleared' in cred_message else 'alert' }}">{{ cred_message }}</p>{% endif %}
 {% if backup_message %}<p class="{{ 'alert' if 'failed' in backup_message else 'ok' }}">{{ backup_message }}</p>{% endif %}
 {% if dir_message %}<p class="alert">{{ dir_message }}</p>{% endif %}
