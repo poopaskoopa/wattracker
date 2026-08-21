@@ -1,5 +1,6 @@
 """Route tests for Plan mode, calendar view, and plan export."""
 import datetime as dt
+import pathlib
 
 import pytest
 
@@ -11,6 +12,7 @@ from wattracker.ingest import importer  # noqa: E402
 from wattracker.prescribe import zwo  # noqa: E402
 from wattracker.prescribe.planner import build_workout  # noqa: E402
 from wattracker.server import create_app  # noqa: E402
+from wattracker.timeutil import utc_today  # noqa: E402
 
 
 @pytest.fixture()
@@ -764,6 +766,79 @@ def test_calendar_shows_rpe_badge(client):
     text = client.get(f"/calendar?year={y}&month={m}").text
     assert "cal-rpe" in text
     assert "RPE 6" in text
+
+
+def _adapted_calendar(client, keep_snapshot=True):
+    """Adapt one future workout and return that month's calendar markup."""
+    _register(client)
+    uid = db.get_user_by_username("rider")["id"]
+    date = (utc_today() + dt.timedelta(days=3)).isoformat()
+    plan_id = db.create_plan(uid, "P", date, 1)
+    wid = db.add_plan_workout(plan_id, uid, date, "Sweet Spot 2x20", "threshold",
+                              3600, 65.0, "<x/>")
+    assert db.update_plan_workout_content(
+        uid, wid, "Recovery Spin", "recovery", 2700, 25.0, "<new/>",
+        "stimulus", f"{date}T09:00:00",
+    )
+    if not keep_snapshot:
+        # Rows adapted before the snapshot columns existed: adapted is set but
+        # prev_* is NULL, and there is no backfill. Nothing writes this state
+        # any more, so the test has to manufacture it.
+        conn = db.connect()
+        conn.execute(
+            "UPDATE plan_workouts SET prev_name = NULL, prev_type = NULL, "
+            "prev_duration_s = NULL, prev_tss = NULL WHERE id = ?", (wid,)
+        )
+        conn.commit()
+        conn.close()
+    return client.get(f"/calendar?year={date[:4]}&month={int(date[5:7])}").text
+
+
+def test_calendar_adapted_workout_shows_the_swap(client):
+    text = _adapted_calendar(client)
+
+    assert "cal-adapted" in text
+    assert '<span class="cal-was" aria-hidden="true">Sweet Spot 2x20</span>' in text
+    assert '<span class="cal-was-arrow" aria-hidden="true">&#8595;</span>' in text
+    assert "was Sweet Spot 2x20, changed to" in text
+    assert "Recovery Spin" in text
+    assert "Adapted (stimulus): was Sweet Spot 2x20, 60 min, 65.0 TSS." in text
+
+
+def test_calendar_legacy_adapted_workout_has_no_swap_markup(client):
+    text = _adapted_calendar(client, keep_snapshot=False)
+
+    # Still visibly adapted...
+    assert "cal-adapted" in text and "cal-adapt-mark" in text
+    assert "Adapted (stimulus)." in text
+    # ...but with no snapshot there is nothing to strike through or point at.
+    assert "cal-was" not in text
+    assert "&#8595;" not in text
+    assert "changed to" not in text
+    assert "Sweet Spot 2x20" not in text
+
+
+def test_calendar_unadapted_workout_has_no_swap_markup(client):
+    _register(client)
+    client.post("/generate/plan", data=PLAN_FORM)
+
+    text = client.get("/calendar?year=2026&month=8").text
+
+    assert "cal-workout" in text
+    assert "cal-adapted" not in text
+    assert "cal-was" not in text
+    assert "&#8595;" not in text
+
+
+def test_calendar_adaptation_and_ooto_adjustment_use_distinct_glyphs(client):
+    template = pathlib.Path("wattracker/web/templates/calendar.html").read_text()
+
+    adapt_mark = template.split('class="cal-adapt-mark"', 1)[1].split("</span>", 1)[0]
+    adjust_mark = template.split('class="cal-adjust-mark"', 1)[1].split("</span>", 1)[0]
+
+    assert "&#8635;" in adapt_mark
+    assert "&#8635;" not in adjust_mark
+    assert "&#8644;" in adjust_mark
 
 
 def test_calendar_isolated_between_users(client):

@@ -245,7 +245,7 @@ def test_v31_migrates_curve_cache_table_in_place(tmp_path):
     db.init_db(path)
     conn = sqlite3.connect(path)
     try:
-        assert conn.execute("PRAGMA user_version").fetchone()[0] == 32
+        assert conn.execute("PRAGMA user_version").fetchone()[0] == db.SCHEMA_VERSION
         assert conn.execute(
             "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'curve_cache'"
         ).fetchone() is not None
