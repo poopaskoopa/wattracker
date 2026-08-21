@@ -4,6 +4,14 @@
 <div class="activities-page">
 <h2 class="page-title activities-page-title">Activities</h2>
 
+{% if request.query_params.get('dropped') or request.query_params.get('drop') == 'deleted' %}
+<p class="ok flash">Activity dropped from the calendar.</p>
+{% elif request.query_params.get('drop') == 'linked' %}
+<p class="alert flash">This activity is linked to a workout and cannot be dropped.</p>
+{% elif request.query_params.get('drop') == 'not_found' or request.query_params.get('drop_error') or request.query_params.get('error') %}
+<p class="alert flash">{{ request.query_params.get('drop_error') or request.query_params.get('error') or 'Activity could not be dropped.' }}</p>
+{% endif %}
+
 <p id="scanStatus" class="hint" style="display:none"></p>
 
 <section class="scan-panel activities-scan-panel" aria-labelledby="activitiesImportTitle">
@@ -69,7 +77,17 @@
                 {% if a.rpe %}<span class="cal-rpe">RPE {{ a.rpe }}</span>
                 {% else %}<a class="hint" href="/activity/{{ a.id }}">Rate</a>{% endif %}
             </td>
-            <td><a class="button" href="/activity/{{ a.id }}">View graphs</a></td>
+            <td>
+                <a class="button" href="/activity/{{ a.id }}">View graphs</a>
+                {% if a.linked_workout %}
+                <span class="hint activity-drop-note">Linked to {{ a.linked_workout.name or 'a workout' }}; cannot drop.</span>
+                {% else %}
+                <form method="post" action="/activity/{{ a.id }}/drop" style="display:inline"
+                      onsubmit="return confirm('Drop this activity from the calendar?');">
+                    <button type="submit" class="link-btn activity-drop">Drop</button>
+                </form>
+                {% endif %}
+            </td>
         </tr>
     {% endfor %}
     </tbody>
