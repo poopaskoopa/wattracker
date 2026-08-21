@@ -12,6 +12,7 @@ import os
 import re as _rex
 import sys
 import threading
+import time as _time
 import urllib.parse as _url
 import zipfile
 from contextlib import asynccontextmanager
@@ -134,6 +135,53 @@ _log = logging.getLogger(__name__)
 # verbatim as JSON by GET /api/scan/status.
 _scan_lock = threading.Lock()
 _scan_status: dict = {}
+# Every rescan thread currently running, so shutdown can wait them out (see
+# wait_for_scans). Guarded by _scan_lock, like the status dict beside it.
+_scan_threads: "set[threading.Thread]" = set()
+
+# How long shutdown waits for in-flight rescans before giving up on them. A
+# scan is bounded by the size of the activities folder, not by anything a user
+# is sitting in front of, so this is generous; overrunning it is logged rather
+# than passed over in silence.
+SCAN_SHUTDOWN_TIMEOUT_S = 30.0
+
+
+def live_scan_threads() -> "list[threading.Thread]":
+    """The rescan threads still running. Empty once shutdown has joined them."""
+    with _scan_lock:
+        return [t for t in _scan_threads if t.is_alive()]
+
+
+def wait_for_scans(timeout: float = SCAN_SHUTDOWN_TIMEOUT_S) -> bool:
+    """Join every in-flight rescan. True if they all finished in time.
+
+    A scan resolves the database and the data directory from the environment on
+    every call it makes, so a thread that outlives the app it was started from
+    does not stop working - it starts working on whatever configuration the
+    process has moved on to. That is a real bug in two places. Under the test
+    suite, where each test re-points WATTRACKER_DB and WATTRACKER_DATA_DIR at
+    its own temp directory, a straggler writes into the NEXT test's sandbox:
+    CI saw a pre-migration backup land in a test that never migrated anything,
+    and a test's own tables dropped out from under it mid-run. In a real
+    install it is the same contract one step milder - shutdown must not abandon
+    a half-finished import.
+
+    Called after connectorhub.reset() so a scan blocked on a connector call is
+    already failing rather than sitting on its full timeout.
+    """
+    deadline = _time.monotonic() + max(0.0, timeout)
+    while True:
+        pending = live_scan_threads()
+        if not pending:
+            return True
+        remaining = deadline - _time.monotonic()
+        if remaining <= 0:
+            _log.warning(
+                "%d activity scan(s) still running after %.0fs; giving up on "
+                "the wait", len(pending), timeout,
+            )
+            return False
+        pending[0].join(min(remaining, 0.5))
 
 
 def _scan_status_snapshot(user_id: Optional[int]) -> Optional[dict]:
@@ -199,13 +247,23 @@ def _start_user_scan(user_id: int, directory: Optional[str]) -> Optional[dict]:
                          exc_info=True)
         finally:
             with _scan_lock:
+                # Deregistered first: whatever happens to the status row, a
+                # finished thread must not be left for shutdown to wait on.
+                _scan_threads.discard(threading.current_thread())
                 st = _scan_status[user_id]
                 st["running"] = False
                 st["finished_at"] = utc_now().isoformat(
                     timespec="seconds"
                 )
 
-    threading.Thread(target=_run, daemon=True).start()
+    thread = threading.Thread(
+        target=_run, daemon=True, name=f"wattracker-scan-{user_id}"
+    )
+    # Registered BEFORE start(), or a scan that finishes immediately could
+    # remove itself from the set before it was ever put in it.
+    with _scan_lock:
+        _scan_threads.add(thread)
+    thread.start()
     return snapshot
 
 
@@ -979,6 +1037,11 @@ def create_app() -> FastAPI:
         # worker thread blocked on one is told at once instead of sitting on
         # its full timeout against a loop that will never run again.
         connectorhub.reset()
+        # Rescans are started per request in their own threads, so stopping the
+        # sweep task above does not account for them. They have to be waited
+        # out here or they keep writing against configuration this app no
+        # longer owns - see wait_for_scans.
+        wait_for_scans()
         if task is not None:
             stop.set()
             try:

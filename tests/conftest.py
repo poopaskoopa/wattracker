@@ -71,6 +71,23 @@ def isolated_env(tmp_path, monkeypatch):
     ):
         monkeypatch.delenv(key, raising=False)
     yield
+    # Nothing this fixture sets is scoped to a thread: WATTRACKER_DB and
+    # WATTRACKER_DATA_DIR are process-global, and a rescan re-reads both on
+    # every database call it makes. So a scan thread that outlives its test
+    # does not stop - it starts writing into the NEXT test's sandbox, and CI
+    # duly produced a pre-migration backup inside a test that never migrated
+    # anything, plus tables vanishing mid-test. create_app()'s shutdown now
+    # joins those threads (server.wait_for_scans); this fails the test that
+    # leaked one instead of letting the damage land on an innocent test later
+    # in the run.
+    server = sys.modules.get("wattracker.server")
+    if server is not None:
+        stragglers = [t.name for t in server.live_scan_threads()]
+        assert not stragglers, (
+            f"activity scan(s) still running after the test: {stragglers}. "
+            "Drive the scan to completion (poll /api/scan/status) or let the "
+            "app's TestClient close before the test ends."
+        )
 
 
 @pytest.fixture()

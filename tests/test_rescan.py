@@ -281,3 +281,39 @@ def test_rescan_still_accepts_a_trusted_folder_that_does_not_exist_yet(
     )
     assert response.status_code == 202
     assert _wait_done(client)["exists"] is False
+
+
+def test_closing_the_app_waits_for_a_running_rescan(home, monkeypatch):
+    """A rescan must not outlive the app that started it.
+
+    A scan resolves WATTRACKER_DB and WATTRACKER_DATA_DIR from the environment
+    on every database call it makes, so a thread still running after its app is
+    gone does not stop working - it starts working against whatever
+    configuration replaced it. In the suite that means one test's scan writing
+    into the next test's sandbox, which is how CI produced a pre-migration
+    backup inside a test that never migrated anything.
+
+    Deliberately not asserted through /api/scan/status: the point is the
+    THREAD, not the status row it happens to update on its way out.
+    """
+    import wattracker.server as servermod
+
+    act_dir = home / "Activities"
+    act_dir.mkdir()
+    for i in range(5):
+        (act_dir / f"ride{i}.fit").write_bytes(b"dummy")
+
+    def slow_parse(path):
+        time.sleep(0.1)
+        return _fake_parsed(start_time=f"2026-06-{int(path[-5]) + 1:02d}T10:00:00")
+
+    monkeypatch.setattr(importer, "parse_fit", slow_parse)
+
+    with TestClient(create_app()) as c:
+        _register(c)
+        assert c.post(
+            "/activities/rescan", data={"activities_dir": str(act_dir)}
+        ).status_code == 202
+        assert servermod.live_scan_threads(), "scan should still be running"
+
+    assert servermod.live_scan_threads() == []
