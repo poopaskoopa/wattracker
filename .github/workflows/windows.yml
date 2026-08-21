@@ -229,12 +229,42 @@ jobs:
       # The ref test is redundant while push is filtered to main above, and is
       # kept deliberately: it is what stops a later re-broadening of the trigger
       # from silently turning the upload back on for every branch.
+      # The upload used to carry the "did the build produce anything?" signal via
+      # if-no-files-found: error. It cannot any more: the first run of this job
+      # on main (32477527515) built and smoked everything successfully and then
+      # failed on `Artifact storage quota has been hit`, turning a green build
+      # into a red check on main. The sizing above is sound but assumes the
+      # account's 500 MB is available, and it is not - this repo holds zero
+      # artifacts, so the storage is committed elsewhere and cannot be reclaimed
+      # from here. GitHub also recalculates usage only every 6-12 hours, so the
+      # wall outlasts whatever frees it.
+      #
+      # So the signal moves off the upload and onto the step below, which reads
+      # the filesystem this job just wrote. A missing installer still fails the
+      # job, loudly and on the line that names it; a full quota no longer can.
+      - if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
+        name: Assert the build produced an installer and a wheel
+        shell: pwsh
+        run: |
+          $whl = @(Get-ChildItem dist\*.whl -ErrorAction SilentlyContinue)
+          $exe = @(Get-ChildItem dist\*-unsigned-setup.exe -ErrorAction SilentlyContinue)
+          Write-Host "wheel(s): $($whl.Count), installer(s): $($exe.Count)"
+          if ($whl.Count -eq 0) { throw "no wheel in dist\ - the build did not produce one" }
+          if ($exe.Count -eq 0) { throw "no *-unsigned-setup.exe in dist\ - ISCC did not produce an installer" }
+
+      # continue-on-error, not `|| true`: a quota failure stays visible as a
+      # yellow step you can click into, rather than being swallowed. The job and
+      # the check on main go green because the build genuinely passed.
+      # if-no-files-found drops to `warn` because the assert above now owns that
+      # failure - leaving it at `error` would just reintroduce a red step for a
+      # condition already covered.
       - if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
         uses: actions/upload-artifact@v4
+        continue-on-error: true
         with:
           name: wattracker-windows-x64-unsigned
           path: |
             dist/*.whl
             dist/*-unsigned-setup.exe
-          if-no-files-found: error
+          if-no-files-found: warn
           retention-days: 5
