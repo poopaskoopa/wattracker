@@ -154,6 +154,9 @@ def test_calendar_does_not_add_display_or_hidden_contracts():
     assert display_selectors == {
         ".cal-head",
         ".cal-workout .cal-type",
+        # The adapted-day swap: old name and arrow each own a line.
+        ".cal-was",
+        ".cal-was-arrow",
         ".cal-rpe",
         ".rpe-buttons",
         ".cal-layout",

@@ -140,6 +140,83 @@ def test_adaptation_reexports_zwo_when_configured(user_id, home_dir):
     assert zwomod.plan_filename(w0["date"], w0["name"]) not in files  # replaced
 
 
+# ------------------------------------------------- pre-adaptation snapshot
+def test_never_adapted_workout_has_no_snapshot(user_id):
+    wid = _workout(user_id, 2, type_="vo2max", duration_s=3600)
+    w = db.get_plan_workout(user_id, wid)
+    assert (w["prev_name"], w["prev_type"]) == (None, None)
+    assert (w["prev_duration_s"], w["prev_tss"]) == (None, None)
+
+
+def test_adaptation_snapshots_the_outgoing_prescription(user_id):
+    wid = _workout(user_id, 2, type_="vo2max", duration_s=3600)
+    before = db.get_plan_workout(user_id, wid)
+
+    ok = db.update_plan_workout_content(
+        user_id, wid, "Recovery Spin", "recovery", 2700, 25.0, "<new/>",
+        "recovery", "2026-07-10T09:00:00",
+    )
+    assert ok
+
+    after = db.get_plan_workout(user_id, wid)
+    # Live columns hold the new prescription...
+    assert (after["name"], after["type"]) == ("Recovery Spin", "recovery")
+    assert (after["duration_s"], after["tss"]) == (2700, 25.0)
+    # ...and prev_* holds exactly what the row said an instant earlier.
+    assert after["prev_name"] == before["name"]
+    assert after["prev_type"] == before["type"]
+    assert after["prev_duration_s"] == before["duration_s"]
+    assert after["prev_tss"] == before["tss"]
+
+
+def test_blocked_second_adaptation_leaves_the_first_snapshot_intact(user_id):
+    # The `adapted IS NULL` guard makes adaptation once-only; the snapshot must
+    # inherit that, or a second attempt would record "was <the first
+    # adaptation>" and lose the prescription the rider was actually given.
+    wid = _workout(user_id, 2, type_="vo2max", duration_s=3600)
+    assert db.update_plan_workout_content(
+        user_id, wid, "Recovery Spin", "recovery", 2700, 25.0, "<new/>",
+        "recovery", "2026-07-10T09:00:00",
+    )
+    first = db.get_plan_workout(user_id, wid)
+
+    blocked = db.update_plan_workout_content(
+        user_id, wid, "Threshold 2x20", "threshold", 4800, 90.0, "<newer/>",
+        "plateau", "2026-07-11T09:00:00",
+    )
+    assert blocked is False
+
+    still = db.get_plan_workout(user_id, wid)
+    assert still["prev_name"] == "Vo2Max"
+    assert still["prev_type"] == "vo2max"
+    assert still["prev_duration_s"] == 3600
+    assert still["prev_tss"] == 60.0
+    assert still["name"] == first["name"]  # live content untouched too
+
+
+def test_reflow_clears_the_snapshot_with_the_adaptation(user_id):
+    date = (NOW.date() + dt.timedelta(days=5)).isoformat()
+    plan_id = db.create_plan(user_id, "P", date, 1)
+    wid = db.add_plan_workout(plan_id, user_id, date, "Vo2Max", "vo2max",
+                              3600, 60.0, "<x/>", origin="generated")
+    assert db.update_plan_workout_content(
+        user_id, wid, "Recovery Spin", "recovery", 2700, 25.0, "<new/>",
+        "recovery", "2026-07-10T09:00:00",
+    )
+    assert db.get_plan_workout(user_id, wid)["prev_name"] == "Vo2Max"
+
+    # A whole-plan reflow hands the adaptation budget back; the snapshot goes
+    # with it, since the new content never replaced the prescription it names.
+    assert db.replace_plan_workout_content(
+        user_id, wid, "Endurance 90", "endurance", 5400, 70.0, "<reflow/>",
+        NOW.date().isoformat(),
+    )
+    w = db.get_plan_workout(user_id, wid)
+    assert w["adapted"] is None and w["adapted_at"] is None
+    assert (w["prev_name"], w["prev_type"]) == (None, None)
+    assert (w["prev_duration_s"], w["prev_tss"]) == (None, None)
+
+
 # ---------------------------------------------------------------- banner
 def test_banner_levels_and_adaptation_text(user_id):
     _workout(user_id, 2, type_="vo2max")
