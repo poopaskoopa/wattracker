@@ -25,7 +25,7 @@ from .timeutil import utc_now, valid_timezone
 
 _log = logging.getLogger(__name__)
 
-SCHEMA_VERSION = 32
+SCHEMA_VERSION = 33
 
 
 def _restrict_db_files(path: str) -> None:
@@ -263,6 +263,18 @@ _MIGRATIONS: Dict[int, Sequence[Union[str, Callable[[sqlite3.Connection], None]]
     31: [
         # New table curve_cache is created by _SCHEMA after migrating.
     ],
+    32: [
+        # What the prescription was immediately before adapt.py rewrote it, so
+        # the calendar can show "old workout -> new workout" on an adapted day.
+        # Nothing to backfill: adaptation overwrote the row in place, so rows
+        # adapted before this version have no recoverable previous content and
+        # stay NULL forever (consumers read that as "we don't know what it
+        # was", not as "it was nothing").
+        "ALTER TABLE plan_workouts ADD COLUMN prev_name TEXT",
+        "ALTER TABLE plan_workouts ADD COLUMN prev_type TEXT",
+        "ALTER TABLE plan_workouts ADD COLUMN prev_duration_s INTEGER",
+        "ALTER TABLE plan_workouts ADD COLUMN prev_tss REAL",
+    ],
 }
 
 _DROP = """
@@ -428,6 +440,13 @@ CREATE TABLE IF NOT EXISTS plan_workouts (
     completed_date    TEXT,
     adapted           TEXT,
     adapted_at        TEXT,
+    -- The prescription as it stood immediately before adaptation, snapshotted
+    -- by update_plan_workout_content so the calendar can render "was X, now Y".
+    -- NULL means never adapted, or adapted before this snapshot existed.
+    prev_name         TEXT,
+    prev_type         TEXT,
+    prev_duration_s   INTEGER,
+    prev_tss          REAL,
     rpe               INTEGER,
     variant           TEXT,
     compliance        REAL,
@@ -2422,6 +2441,10 @@ def _plan_workout_row(r: sqlite3.Row, include_zwo: bool = False) -> dict:
         "completed_date": r["completed_date"],
         "adapted": r["adapted"],
         "adapted_at": r["adapted_at"],
+        "prev_name": r["prev_name"],
+        "prev_type": r["prev_type"],
+        "prev_duration_s": r["prev_duration_s"],
+        "prev_tss": r["prev_tss"],
         "rpe": r["rpe"],
         "variant": r["variant"],
         "compliance": r["compliance"],
@@ -3210,11 +3233,20 @@ def update_plan_workout_content(
     fractions were written for, so leaving the old one behind would leave the
     completion matcher checking fitted wattage against an FTP that no longer
     belongs to the prescription stored beside it.
+
+    The ``prev_*`` snapshot is what lets the calendar say "was X, now Y" about
+    an adapted day, since the adaptation overwrites the prescription in place.
     """
     conn = connect(path)
     try:
         cur = conn.execute(
-            "UPDATE plan_workouts SET name = ?, type = ?, duration_s = ?, "
+            # SQLite evaluates every right-hand side against the pre-update
+            # row, so prev_* captures the outgoing prescription in the same
+            # statement that replaces it - no SELECT-then-UPDATE race window
+            # where a concurrent writer could land between the two.
+            "UPDATE plan_workouts SET prev_name = name, prev_type = type, "
+            "prev_duration_s = duration_s, prev_tss = tss, "
+            "name = ?, type = ?, duration_s = ?, "
             "tss = ?, zwo_or_segments = ?, adapted = ?, adapted_at = ?, "
             "variant = ?, export_ftp = ? "
             "WHERE user_id = ? AND id = ? AND adapted IS NULL",
@@ -3248,9 +3280,11 @@ def replace_plan_workout_content(
     the recipe and therefore safe to run any number of times. The guard here is
     about ownership (generated + future + not ridden), not about a budget.
 
-    Claiming a row CLEARS ``adapted``/``adapted_at`` - the recomputed content
-    replaces whatever adapt.py had put there, and the row's one-shot adaptation
-    budget is handed back. See prescribe/reflow.py for why.
+    Claiming a row CLEARS ``adapted``/``adapted_at`` and the ``prev_*``
+    snapshot - the recomputed content replaces whatever adapt.py had put there,
+    and the row's one-shot adaptation budget is handed back. Leaving the
+    snapshot behind would leave the calendar pointing a "was..." arrow at a
+    prescription this content never replaced. See prescribe/reflow.py for why.
 
     ``export_ftp`` is restamped with the content, for the same reason as in
     ``update_plan_workout_content``: it must keep describing the fractions it
@@ -3261,7 +3295,8 @@ def replace_plan_workout_content(
         cur = conn.execute(
             "UPDATE plan_workouts SET name = ?, type = ?, duration_s = ?, "
             "tss = ?, zwo_or_segments = ?, variant = ?, export_ftp = ?, "
-            "adapted = NULL, adapted_at = NULL "
+            "adapted = NULL, adapted_at = NULL, prev_name = NULL, "
+            "prev_type = NULL, prev_duration_s = NULL, prev_tss = NULL "
             "WHERE user_id = ? AND id = ? AND origin = 'generated' "
             "AND completed_activity_id IS NULL AND date > ?",
             (name, type, int(duration_s), float(tss), zwo_or_segments, variant,

@@ -474,6 +474,17 @@ table.calendar th { text-align: center; }
 .cal-check { color: var(--ok); font-weight: 700; }
 .cal-workout.cal-adapted { border-left-style: dashed; }
 .cal-adapt-mark { color: var(--accent); font-weight: 700; }
+/* The swap, spelled out: what the day used to be, struck through, with an
+   arrow down to what it is now. Both lines are held to the secondary
+   cell-text scale with line-height 1 to keep the cost down, but it is still
+   two lines (~20px, ~30px when a long old name wraps) and the 90px on
+   .cal-cell is a td minimum, not a cap - so an adapted day DOES grow its
+   week row. That is deliberate: the row growing is what keeps the new name
+   visible. Don't "fix" it with overflow: hidden or a max-height, which would
+   clip the new name and defeat the point of showing the swap at all. */
+.cal-was { display: block; font-size: 0.65rem; line-height: 1; color: var(--muted);
+    text-decoration: line-through; text-decoration-color: var(--muted); }
+.cal-was-arrow { display: block; font-size: 0.6rem; line-height: 1; color: var(--muted); }
 .cal-rpe { display: inline-block; margin-left: var(--sp-1); font-size: 0.6rem; font-weight: 700;
     letter-spacing: 0.02em; color: var(--on-accent); background: var(--accent);
 }
