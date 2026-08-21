@@ -164,12 +164,43 @@ memory, expires in 60 seconds, is redeemable once, and is dropped when the
 device is revoked.
 
 State this plainly: **a device token now escalates to a full web session.**
-That session can pair and revoke connector devices, rotate the calendar link,
-change settings and take backups. It cannot change the account password, which
-has no route. This is accepted because the token already grants read/write
-access to the rider's Zwift folders and the ability to upload rides as them,
-and because the alternative — a password prompt in a window a tray icon opened
-— teaches exactly the habit that phishing depends on. The query parameter is
+That session can read the rider's whole history, change settings, revoke
+connector devices and take backups. It cannot change the account password,
+which has no route.
+
+Be precise about why that is accepted, because the obvious justification is
+wrong. The token grants read/write to the rider's Zwift folders **on its own
+machine**; the session's reach is wider. `wattracker/backend/remote.py` resolves
+the connector by `user_id` alone, and nothing about escalating requires an
+attached socket — so a token off a laptop that has been in a drawer for a year
+escalates to a session that drives whichever connector is attached *now*. The
+pre-merge review of PR #93 executed exactly that: a never-connected device
+enumerated a `.fit` file on a different machine's filesystem. The same session
+can also clear or overwrite the stored Zwift credentials.
+
+What makes the widening defensible is not that it grants nothing new — it does
+— but that it grants nothing **durable**, and that the alternative (a password
+prompt in a window a tray icon opened) teaches exactly the habit phishing
+depends on. A connector-derived session is stamped `via=connector` in the
+signed session cookie at redemption, and three routes refuse it: pairing
+another device (`POST /settings/connector`), rotating the calendar link
+(`POST /settings/calendar-feed`), and replacing the app-global — not per-user —
+Anthropic API key (the `anthropic_api_key` field of `POST /settings`). Each
+would otherwise leave behind a credential that revoking the device does not
+reach. Revoking is deliberately still allowed: it is the way out, and the rider
+who has lost a laptop may well be looking at the tray window of the machine
+still in front of them. Signing in with the password inside that window lifts
+the restriction, because a device token can neither obtain nor change a
+password.
+
+Revocation reaches the session as well as the token. A session cookie is a
+signed blob with no server-side record, so `settings_connector_revoke` has
+nothing to delete; instead the cookie carries the `device_id` it came from and
+`AuthMiddleware` ends any connector session whose device is gone. Without that,
+revoking would kill the token and leave the window it opened working for the
+fortnight the cookie is valid.
+
+The query parameter is
 named `token` rather than `ticket` deliberately: uvicorn logs the full request
 target and `calendarfeed`'s redaction filter only scrubs parameter names
 beginning `token`, so any other name would write live credentials to the

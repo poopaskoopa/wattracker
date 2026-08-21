@@ -179,9 +179,14 @@ Removing that would leave a trainer held in ERG by a process that has gone.
 - **Do not run ad-hoc scripts against the real database.** Only pytest
   redirects `HOME`; a script run by hand writes to the live
   `~/.wattracker/wattracker.db`.
-- **`-v` writes the device token into the log in cleartext** (B-3 in the older
-  handoff, still open). The plain log is enough to read handshakes, drops and
-  reconnects.
+- **`-v` no longer writes the device token into the log** (B-3 in the older
+  handoff; closed here). It used to: `-v` sets DEBUG process-wide, `websockets`
+  logs every handshake header, and this PR gave that output a persistent home.
+  `_SecretRedactingFilter` now sits on the connector's log handlers — handlers,
+  not loggers, because `websockets.client` only propagates to them — and
+  redacts `Bearer <...>` plus the connector's own token wherever it appears.
+  The handshake lines themselves are untouched, because a wrong Host or a 403
+  from the server is exactly what `-v` is asked for.
 
 **The recurring family.** `main`'s CI is POSIX, so a test that is wrong about
 Windows is green upstream and only fails here. It has now happened with
