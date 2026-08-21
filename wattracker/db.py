@@ -1550,6 +1550,74 @@ def list_activities(user_id: int, path: Optional[str] = None) -> List[dict]:
         conn.close()
 
 
+def activities_for_month_unlinked(
+    user_id: int, year: int, month: int, path: Optional[str] = None,
+) -> List[dict]:
+    """Effective activities in a month which are not completion evidence."""
+    prefix = f"{int(year):04d}-{int(month):02d}"
+    conn = connect(path)
+    try:
+        rows = conn.execute(
+            "SELECT a.* FROM activities a "
+            "WHERE a.user_id=? AND a.duplicate_of IS NULL "
+            "AND a.start_time IS NOT NULL AND date(a.start_time) IS NOT NULL "
+            "AND strftime('%Y-%m', a.start_time)=? "
+            "AND NOT EXISTS (SELECT 1 FROM plan_workouts p "
+            "                WHERE p.user_id=a.user_id AND p.completed_activity_id=a.id) "
+            "AND NOT EXISTS (SELECT 1 FROM standalone_workouts s "
+            "                WHERE s.user_id=a.user_id AND s.completed_activity_id=a.id) "
+            "ORDER BY a.start_time ASC, a.id ASC",
+            (user_id, prefix),
+        ).fetchall()
+        return [_row_summary(r) for r in rows]
+    finally:
+        conn.close()
+
+
+def delete_activity(
+    user_id: int, activity_id: int, path: Optional[str] = None,
+) -> str:
+    """Delete an owned activity, returning ``deleted``, ``linked``, or ``not_found``."""
+    conn = connect(path)
+    try:
+        row = conn.execute(
+            "SELECT id FROM activities WHERE user_id=? AND id=?",
+            (user_id, activity_id),
+        ).fetchone()
+        if row is None:
+            return "not_found"
+        linked = conn.execute(
+            "SELECT 1 FROM plan_workouts WHERE user_id=? AND completed_activity_id=? "
+            "UNION ALL SELECT 1 FROM standalone_workouts "
+            "WHERE user_id=? AND completed_activity_id=? LIMIT 1",
+            (user_id, activity_id, user_id, activity_id),
+        ).fetchone()
+        if linked is not None:
+            return "linked"
+        # Release hidden duplicate children before removing a primary. They
+        # become ordinary effective activities again.
+        conn.execute(
+            "UPDATE activities SET duplicate_of=NULL "
+            "WHERE user_id=? AND duplicate_of=?",
+            (user_id, activity_id),
+        )
+        conn.execute(
+            "DELETE FROM power_sample_corrections WHERE user_id=? AND activity_id=?",
+            (user_id, activity_id),
+        )
+        # Race evidence survives, but no longer points at a missing activity.
+        conn.execute(
+            "UPDATE race_results SET activity_id=NULL WHERE user_id=? AND activity_id=?",
+            (user_id, activity_id),
+        )
+        conn.execute("DELETE FROM activities WHERE user_id=? AND id=?", (user_id, activity_id))
+        _invalidate_curve_cache(conn, user_id)
+        conn.commit()
+        return "deleted"
+    finally:
+        conn.close()
+
+
 def get_activity(user_id: int, activity_id: int, path: Optional[str] = None) -> Optional[dict]:
     conn = connect(path)
     try:
@@ -2634,6 +2702,36 @@ def mark_plan_workout_completed(
         )
         conn.commit()
         return cur.rowcount > 0
+    finally:
+        conn.close()
+
+
+def set_plan_workout_completion(
+    user_id: int, workout_id: int, completed: bool,
+    path: Optional[str] = None,
+) -> str:
+    """Set completion state; incomplete clears all completion evidence."""
+    workout = get_plan_workout(user_id, workout_id, path)
+    if workout is None:
+        return "not_found"
+    if completed:
+        if workout.get("completed_activity_id") is not None:
+            return "already_completed"
+        return "incomplete"
+    if workout.get("completed_activity_id") is None:
+        return "already_incomplete"
+    if workout.get("feedback_batch_id") is not None:
+        rollback_feedback_for_workout(user_id, "plan", workout_id, path)
+    conn = connect(path)
+    try:
+        cur = conn.execute(
+            "UPDATE plan_workouts SET completed_activity_id=NULL, completed_date=NULL, "
+            "compliance=NULL, effective_ftp=NULL, rpe=NULL, feedback_applied=0, "
+            "feedback_batch_id=NULL WHERE user_id=? AND id=?",
+            (user_id, workout_id),
+        )
+        conn.commit()
+        return "incomplete" if cur.rowcount else "conflict"
     finally:
         conn.close()
 

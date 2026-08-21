@@ -157,6 +157,12 @@
             <td class="cal-cell {{ 'other-month' if not cell.in_month else '' }} {{ 'cal-ooto-day' if cell.ooto else '' }} {{ 'cal-race-day' if cell.race else '' }}">
                 <div class="cal-day">{{ cell.day }}{% if cell.ooto %} <span class="cal-ooto-tag">OOTO</span>{% endif %}{% if cell.race %} {{ race_priority_badge(cell.race) }}{% if cell.race.result %} {{ race_result_badge(cell.race.result) }}{% endif %}{% endif %}{% if cell.phase %} <span class="cal-phase-tag" title="This week is part of your plan's {{ cell.phase }} block">{{ cell.phase }}</span>{% endif %}</div>
                 {% for w in cell.workouts %}
+                    {% if w.activity %}
+                    <a class="cal-workout cal-activity" href="/activity/{{ w.activity_id }}"
+                       title="{{ w.name }} — {{ (w.duration_s // 60) }} min, actual activity">
+                        {{ w.name }}<span class="cal-type">Actual activity · {{ (w.duration_s // 60) }} min{% if w.tss is not none %} · {{ w.tss }} TSS{% endif %}</span>
+                    </a>
+                    {% else %}
                     <div class="cal-workout cal-{{ w.type }}{{ ' cal-completed' if w.completed_activity_id else '' }}{{ ' cal-adapted' if w.adapted else '' }}{{ ' cal-skipped' if w.skipped else '' }}{{ ' cal-missed' if w.missed else '' }}{{ ' cal-adjusted-cancelled' if w.adjustment_cancelled else '' }}{{ ' cal-adjusted-replacement' if w.adjustment_replacement else '' }}"
                          {% if not w.standalone %}
                          data-workout-id="{{ w.id }}"
@@ -165,6 +171,14 @@
                          title="{{ w.name }} — {{ (w.duration_s // 60) }} min, {{ w.tss }} TSS.{{ ' Completed.' if w.completed_activity_id else '' }}{{ ' Skipped (out of office).' if w.skipped else '' }}{{ ' Missed (not completed).' if w.missed else '' }}{{ ' Canceled by OOTO adjustment.' if w.adjustment_cancelled else '' }}{{ ' Replaced by an OOTO adjustment.' if w.adjustment_replacement else '' }}{{ ' Adapted (' ~ w.adapted ~ ').' if w.adapted else '' }}{{ '' if w.standalone else ' Click for power details.' }}">
                         {% if w.completed_activity_id %}<span class="cal-check" aria-label="completed">&#10003;</span> {% elif w.skipped %}<span class="cal-skip-mark" aria-label="skipped">&#8856;</span> {% elif w.missed %}<span class="cal-miss-mark" aria-label="missed">&#10007;</span> {% elif w.adjustment_cancelled %}<span class="cal-adjust-cancel-mark" aria-label="canceled by OOTO adjustment">&#8856;</span> {% endif %}{% if w.adapted %}<span class="cal-adapt-mark" aria-label="adapted ({{ w.adapted }})">&#8635;</span> {% endif %}{% if w.adjustment_replacement %}<span class="cal-adjust-mark" aria-label="OOTO adjustment">&#8635;</span> {% endif %}{{ w.name }}<span class="cal-type">{{ w.type }}</span>{% if w.rpe %}<span class="cal-rpe" title="Perceived exertion {{ w.rpe }}/10">RPE {{ w.rpe }}</span>{% endif %}
                     </div>
+                    {% endif %}
+                {% endfor %}
+                {% for a in cell.activities %}
+                    <a class="cal-workout cal-activity"
+                       href="/activity/{{ a.activity_id or a.id }}"
+                       title="{{ a.name or 'Actual activity' }} — {{ (a.duration_s // 60) }} min, actual activity">
+                        {{ a.name or 'Actual activity' }}<span class="cal-type">Actual activity · {{ (a.duration_s // 60) }} min{% if a.tss is not none %} · {{ a.tss }} TSS{% endif %}</span>
+                    </a>
                 {% endfor %}
             </td>
         {% endfor %}
@@ -257,7 +271,7 @@
         </p>
         <div id="wmComplete" hidden>
             <button type="button" id="wmCompleteButton">Mark complete</button>
-            <span class="hint">Links the closest-duration activity recorded on this workout&rsquo;s scheduled date.</span>
+            <span class="hint" id="wmCompleteHint">Links the closest-duration activity recorded on this workout&rsquo;s scheduled date.</span>
         </div>
         <div class="profile-wrap" id="wmProfile" hidden></div>
         <p class="hint" id="wmDesc"></p>
@@ -419,29 +433,37 @@
         } else {
             matchStatus.textContent = "";
         }
-        $("wmComplete").hidden = !detail.can_mark_complete;
+        var canToggle = detail.can_toggle_completion === true;
+        $("wmComplete").hidden = !canToggle;
+        $("wmCompleteButton").textContent = detail.completed ? "Mark incomplete" : "Mark complete";
+        $("wmCompleteHint").textContent = detail.completed
+            ? "Unlinks this workout from its completed activity."
+            : "Links the closest-duration activity recorded on this workout’s scheduled date.";
         $("wmCompleteButton").onclick = async function () {
             var button = $("wmCompleteButton");
             button.disabled = true;
-            matchStatus.textContent = "Marking complete…";
+            var completed = !detail.completed;
+            matchStatus.textContent = completed ? "Marking complete…" : "Marking incomplete…";
             try {
                 var response = await fetch(
-                    "/api/plan/workout/" + detail.id + "/complete",
-                    { method: "POST", headers: { "Accept": "application/json" } }
+                    "/api/plan/workout/" + detail.id + "/completion",
+                    { method: "POST", headers: { "Accept": "application/json", "Content-Type": "application/json" },
+                      body: JSON.stringify({ completed: completed }) }
                 );
                 var result = await response.json();
                 if (!response.ok) {
-                    matchStatus.textContent = result.error || "Could not mark this workout complete.";
+                    matchStatus.textContent = result.error || "Could not update this workout’s completion.";
                     button.disabled = false;
                     return;
                 }
-                detail.completed = true;
-                detail.can_mark_complete = false;
+                detail.completed = result.completed === true;
+                detail.can_toggle_completion = true;
                 detail.completion_verified = false;
                 detail.rpe_eligible = false;
-                matchStatus.textContent =
-                    "Marked complete using an activity from the scheduled date. Effort rating may remain unavailable if the power profile cannot be verified.";
-                $("wmComplete").hidden = true;
+                matchStatus.textContent = detail.completed
+                    ? "Marked complete using an activity from the scheduled date. Effort rating may remain unavailable if the power profile cannot be verified."
+                    : "Marked incomplete and unlinked from its activity.";
+                button.textContent = detail.completed ? "Mark incomplete" : "Mark complete";
                 renderRpe(detail);
                 window.location.reload();
             } catch (e) {
