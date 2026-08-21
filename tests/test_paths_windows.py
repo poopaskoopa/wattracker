@@ -3,6 +3,7 @@ import os
 
 import pytest
 
+from conftest import requires_symlinks
 from wattracker import paths
 
 
@@ -190,6 +191,7 @@ def test_workouts_override_outside_trusted_roots_is_refused(monkeypatch, tmp_pat
     assert os.listdir(env_root) == []  # and no substitute folder was created
 
 
+@requires_symlinks
 def test_workouts_override_symlink_escape_is_refused(tmp_path, home_dir):
     """Containment is checked on the realpath, so a symlink out is refused.
 

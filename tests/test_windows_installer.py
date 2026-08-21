@@ -83,18 +83,132 @@ def test_launcher_prefers_override_then_frozen_then_source_virtualenv():
     assert "$env:WATTRACKER_EXECUTABLE = $Executable" not in SMOKE
 
 
-def test_workflow_builds_smokes_and_uploads_portable_and_setup_artifacts():
-    assert 'if: ${{ false }}' in WORKFLOW
+def test_workflow_runs_the_installer_job_on_the_self_hosted_runner():
+    """The installer job runs; the suite job does not. Both halves matter.
+
+    `package-unsigned` reverting to a gate would take the only execution of
+    the setup compiler with it - the state this repository was in until the
+    self-hosted runner existed. An ungated `test` job would put a duplicate of
+    the macOS runner's suite on the single physical Windows box.
+    """
+    test_job, package_job = WORKFLOW.split("  package-unsigned:", 1)
+    assert "if: ${{ false }}" in test_job
+    # Matched at job indentation, not anywhere in the job. A *step* inside
+    # package-unsigned may legitimately be gated - the upload is, while the
+    # storage question is open - and that must not read as the job reverting to
+    # a gate, which is the thing this asserts against.
+    assert not re.search(r"(?m)^    if:", package_job)
+    # The `Windows` label is load-bearing: a bare [self-hosted] also matches the
+    # macOS runner that the Cloud workflow uses.
+    assert "runs-on: [self-hosted, Windows, X64]" in package_job
+    # Cancelling mid-job skips smoke_installer.ps1's `finally`, which is what
+    # uninstalls the product - leaving a half-installed application on a runner
+    # that persists between jobs. Serializing is the correct trade.
+    #
+    # Matched as a YAML key, not as a substring: the workflow comment explaining
+    # this decision necessarily contains the word.
+    assert re.search(r"(?m)^\s*concurrency:", WORKFLOW)
+    assert not re.search(r"(?m)^\s*cancel-in-progress\s*:", WORKFLOW)
+
+
+def test_installer_job_uses_the_runners_machine_wide_python():
+    """No setup-python on this job, and the interpreter is asserted instead.
+
+    actions/setup-python is not a tool-cache unpack on Windows: the setup
+    script in actions/python-versions runs the official installer with
+    InstallAllUsers=1 and clears keys under HKLM, so it needs administrator.
+    The runner's service account deliberately is not one, and handing it admin
+    would remove the account isolation the installer smoke test depends on -
+    so reintroducing the action would either fail the job or undo that.
+
+    The cost is that the interpreter becomes a property of the machine rather
+    than of this file. Asserting the version is what buys it back: a drifted
+    runner fails on a line that names what it found.
+    """
+    _, package_job = WORKFLOW.split("  package-unsigned:", 1)
+    # Matched as a `uses:` line, not as a substring: the comment in the workflow
+    # explaining why the action is absent necessarily names it.
+    assert not re.search(r"(?m)^\s*-?\s*uses:\s*actions/setup-python", package_job)
+    assert "sys.version_info[:2] == (3, 12)" in package_job
+
+
+def test_workflow_builds_smokes_and_uploads_the_wheel_and_setup_artifacts():
     assert "innosetup-6.7.3.exe" in WORKFLOW
     assert "9c73c3bae7ed48d44112a0f48e66742c00090bdb5bef71d9d3c056c66e97b732" in WORKFLOW
     assert "Get-FileHash -LiteralPath $innoInstaller -Algorithm SHA256" in WORKFLOW
     assert '$publisher -cne "Pyrsys B.V."' in WORKFLOW
     assert "packaging\\smoke_frozen.ps1" in WORKFLOW
-    assert "Compress-Archive -Path dist\\wattracker" in WORKFLOW
     assert "packaging\\wattracker.iss" in WORKFLOW
     assert "packaging\\smoke_installer.ps1" in WORKFLOW
+    assert "dist/*.whl" in WORKFLOW
     assert "dist/*-unsigned-setup.exe" in WORKFLOW
-    assert "dist/wattracker-windows-x64-unsigned.zip" in WORKFLOW
+
+
+def test_heavy_steps_yield_the_box_to_a_hardware_session():
+    """The runner shares a machine with the trainer and Zwift.
+
+    Nothing in the job touches Bluetooth, so the trainer link is never
+    contended - but the PyInstaller freeze and the Inno Setup compress each
+    saturate every core for minutes, and a build can start in the middle of a
+    session. Dropping the shell lets Zwift preempt it; children inherit.
+
+    BelowNormal rather than Idle is the load-bearing half: at Idle the runner's
+    heartbeat can starve under sustained load and the job is reported lost.
+    """
+    _, package_job = WORKFLOW.split("  package-unsigned:", 1)
+    drops = re.findall(r"PriorityClass = '(\w+)'", package_job)
+    assert drops, "no step lowers its priority"
+    assert set(drops) == {"BelowNormal"}
+    # The three steps that do real work: dependency install, wheel build, and
+    # the freeze plus installer compile.
+    assert len(drops) == 3
+
+
+def test_push_is_filtered_to_main_so_a_commit_runs_once():
+    """One physical runner means a duplicate run is queued, not parallel.
+
+    A bare `push:` beside `pull_request:` fires twice for every commit on a
+    branch with an open PR, and the second waits for the first: runs
+    32386196713 and 32386202547 were one commit, 10m45s of wall for 5m30s of
+    work. Filtering push to main gives a PR run while the work is in review and
+    a push run when it merges - which is also what the upload keys off.
+    """
+    on = WORKFLOW.split("permissions:", 1)[0]
+    assert re.search(r"(?m)^  push:$", on)
+    assert re.search(r"(?m)^    branches: \[main\]$", on)
+    assert re.search(r"(?m)^  pull_request:$", on)
+
+
+def test_workflow_keeps_ci_artifacts_inside_the_storage_quota():
+    """The two things that stop this job re-hitting the artifact quota.
+
+    A run's payload was 106.8 MB - a 44.4 MB setup exe, a 61.8 MB portable zip
+    and the wheel - and the upload took the 90-day default retention. On a free
+    account's 500 MB of shared storage that is about four runs before
+    `upload-artifact` fails with "Artifact storage quota has been hit", which is
+    how 45 stale artifacts reached 2693 MB and blocked the job outright.
+
+    The zip is the half worth pinning. It duplicated the installer's payload -
+    the same onedir tree, wrapped differently - so dropping it cost no coverage,
+    and the portable form still ships from windows-release.yml, which builds and
+    signs its own on a `v*` tag. Reintroducing it here would put 61.8 MB per run
+    back and quietly restart the countdown, so assert its absence rather than
+    trusting a reviewer to notice a re-added Compress-Archive.
+    """
+    assert re.search(r"(?m)^\s*retention-days:\s*5\s*$", WORKFLOW)
+    assert "Compress-Archive" not in WORKFLOW
+    assert "wattracker-windows-x64-unsigned.zip" not in WORKFLOW
+
+    # Upload on a merge to main, not on every PR commit - the difference
+    # between ~8.75 uploads a week and ~93. The condition sits on the step, so
+    # every PR commit still runs the whole build; only the artifact is skipped.
+    body = WORKFLOW.splitlines()
+    at = next(
+        n for n, line in enumerate(body) if "uses: actions/upload-artifact" in line
+    )
+    gate = body[at - 1].strip()
+    assert "github.event_name == 'push'" in gate
+    assert "github.ref == 'refs/heads/main'" in gate
 
 
 def test_frozen_restore_dispatch_contract_is_unchanged():
