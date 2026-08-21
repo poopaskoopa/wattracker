@@ -8,6 +8,14 @@ LAUNCHER = (ROOT / "scripts" / "wattracker.ps1").read_text(encoding="utf-8")
 SMOKE = (ROOT / "packaging" / "smoke_installer.ps1").read_text(encoding="utf-8")
 WORKFLOW = (ROOT / ".github" / "workflows" / "windows.yml").read_text(encoding="utf-8")
 
+# The one job-level gate the self-hosted jobs are allowed to carry. Duplicated
+# in tests/test_workflow_security.py rather than shared: tests/ is not a
+# package, and a security invariant is worth asserting from both directions.
+FORK_GATE = (
+    "github.event_name == 'push' "
+    "|| github.event.pull_request.head.repo.full_name == github.repository"
+)
+
 
 def test_installer_is_stable_per_user_and_ships_the_full_payload():
     assert re.search(r"(?m)^AppId=\{\{[0-9A-F-]{36}\}$", ISS)
@@ -97,7 +105,14 @@ def test_workflow_runs_the_installer_job_on_the_self_hosted_runner():
     # package-unsigned may legitimately be gated - the upload is, while the
     # storage question is open - and that must not read as the job reverting to
     # a gate, which is the thing this asserts against.
-    assert not re.search(r"(?m)^    if:", package_job)
+    #
+    # Exactly one job-level gate is allowed, and only this one: the fork
+    # exclusion. It is not the failure mode above - it still runs for every
+    # push to main and every pull request raised from a branch in this
+    # repository, so installer coverage is intact. Anything else at this
+    # indentation is the reversion this test exists to catch.
+    job_gates = re.findall(r"(?m)^    if: (.+)$", package_job)
+    assert job_gates == [FORK_GATE]
     # The `Windows` label is load-bearing: a bare [self-hosted] also matches the
     # macOS runner that the Cloud workflow uses.
     assert "runs-on: [self-hosted, Windows, X64]" in package_job

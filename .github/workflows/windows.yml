@@ -53,6 +53,13 @@ jobs:
       - run: python -m pytest -q
 
   package-unsigned:
+    # See the same gate in cloud.yml. This job is the sharper of the two: the
+    # PyInstaller spec, the Inno Setup script and smoke_installer.ps1 all come
+    # from the checked-out branch, and the smoke test installs and runs the
+    # installer it just built. On a public repository that is arbitrary code
+    # execution on the physical box that also runs the trainer, so fork PRs are
+    # excluded and only branches pushed to this repository reach the runner.
+    if: github.event_name == 'push' || github.event.pull_request.head.repo.full_name == github.repository
     runs-on: [self-hosted, Windows, X64]
     timeout-minutes: 45
     steps:
