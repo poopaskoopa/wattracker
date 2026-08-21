@@ -726,8 +726,13 @@ def init_db(path: Optional[str] = None) -> None:
       crash, never "fix" a database from the future.
     - Anything else (fresh db, unmigratable older version): clean drop/recreate.
     """
+    # Resolved ONCE. db_path() reads WATTRACKER_DB every time it is called, so
+    # re-resolving it per use lets a caller connect to one database, back up a
+    # second and lock down a third if the environment moves underneath the
+    # call - which is exactly how a pre-migration backup ended up filed against
+    # a database it was not taken from.
     resolved = path or db_path()
-    conn = connect(path)
+    conn = connect(resolved)
     try:
         version = conn.execute("PRAGMA user_version").fetchone()[0]
         if version > SCHEMA_VERSION:
@@ -746,7 +751,7 @@ def init_db(path: Optional[str] = None) -> None:
             # cannot be written, abort - never migrate an unbacked database.
             from . import backup as _backup
 
-            _backup.create_backup("pre-migration", src_path=path or db_path())
+            _backup.create_backup("pre-migration", src_path=resolved)
             for v in range(version, SCHEMA_VERSION):
                 for stmt in _MIGRATIONS[v]:
                     try:
