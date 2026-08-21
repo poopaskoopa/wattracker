@@ -342,9 +342,29 @@ def test_a_primary_without_a_distance_leaves_the_secondary_alone(user_id):
     assert db.get_activity(user_id, in_app)["distance_m"] == pytest.approx(12345.0)
 
 
+def test_a_null_primary_distance_does_not_crash_the_link(user_id):
+    # Both rows here have a genuinely NULL distance_m, not 0.0 - a value that
+    # is falsy either way, so the previous test above (both 0.0) never
+    # exercised the "or not primary.get('distance_m')" clause specifically:
+    # dropping that clause and calling float(None) still passed it, because
+    # the secondary-has-a-distance clause alone already returned early. Only
+    # a NULL primary paired with a NULL secondary forces execution past both
+    # clauses and into float(primary["distance_m"]), which is where a
+    # guard-less primary check blows up with a TypeError.
+    in_app = _insert(user_id, *IN_APP, distance_m=None)
+    fit = _insert(user_id, *FIT, distance_m=None)
+    assert db.get_activity(user_id, in_app)["distance_m"] is None
+    assert db.get_activity(user_id, fit)["distance_m"] is None
+
+    assert importer.link_duplicate_activity(user_id, fit) == in_app
+    assert db.get_activity(user_id, in_app)["distance_m"] is None
+    assert db.get_activity(user_id, fit)["distance_m"] is None
+
+
 # ------------------------------------------------------------- aggregations
 def test_linked_duplicate_is_counted_once_everywhere(user_id):
-    in_app, fit = _seed_real_pair(user_id)
+    in_app = _insert(user_id, *IN_APP)
+    fit = _insert(user_id, *FIT, distance_m=41250.0)
     importer.link_duplicate_activity(user_id, fit)
 
     day = dt.date(2026, 7, 24)
@@ -353,6 +373,9 @@ def test_linked_duplicate_is_counted_once_everywhere(user_id):
     assert len(weeks) == 1
     assert weeks[0]["tss"] == pytest.approx(64.7)
     assert weeks[0]["hours"] == pytest.approx(5401 / 3600.0, abs=0.01)
+    # The .fit's distance carries onto the primary; the pair's kilometers
+    # must be counted once, not doubled across the linked rows.
+    assert weeks[0]["distance_km"] == pytest.approx(41.2, abs=0.01)
     assert [a["id"] for a in db.full_activities(user_id)] == [fit]
     assert [a["id"] for a in db.list_activities(user_id)] == [fit]
     assert [a["id"] for a in db.activities_on_date(user_id, "2026-07-24")] == [fit]
