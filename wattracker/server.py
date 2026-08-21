@@ -33,6 +33,7 @@ from fastapi.templating import Jinja2Templates
 from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.middleware.sessions import SessionMiddleware
 from starlette.middleware.trustedhost import TrustedHostMiddleware
+from starlette.requests import HTTPConnection
 
 from . import (
     auth,
@@ -857,37 +858,62 @@ VIA_CONNECTOR = "connector"
 SESSION_DEVICE_ID = "device_id"
 
 
-def _from_connector(request: Request) -> bool:
-    """Whether this session was opened by a device token rather than a password."""
-    return request.session.get(SESSION_VIA) == VIA_CONNECTOR
+def _from_connector(conn: HTTPConnection) -> bool:
+    """Whether this session was opened by a device token rather than a password.
+
+    Typed on HTTPConnection, not Request: a WebSocket is one too, and the ride
+    socket has to ask this question for itself because no middleware can ask it
+    on the socket's behalf (see _connector_session_still_paired).
+    """
+    return conn.session.get(SESSION_VIA) == VIA_CONNECTOR
 
 
 def _promote_to_password_session(request: Request) -> None:
     """Drop any connector provenance, because a password has just been proven.
 
-    Called from /login and /register, which are the only two places a password
-    is verified. A rider who signs in inside the tray's own window is a rider
-    who knows the password, and a device token can neither obtain nor change
-    one (every writer of password_hash goes through db.set_password_hash, whose
-    only route callers are these two). Without this the restriction would be
-    permanent for that window, which is a UI that quietly stops working rather
-    than a security control.
+    Called from /login and /register. The reasoning is airtight for /login: a
+    rider who signs in inside the tray's own window is a rider who knows the
+    password, and a device token can neither obtain nor change one (every
+    writer of password_hash goes through db.set_password_hash, whose only route
+    callers are these two). Without this the restriction would be permanent for
+    that window, which is a UI that quietly stops working rather than a
+    security control.
+
+    It is NOT airtight for /register, and the difference is worth stating
+    rather than leaving for the next reader to find. The password proven there
+    is a brand-new account's, chosen by whoever is registering - so a connector
+    session can register a throwaway user and shed the marker without ever
+    knowing the rider's password. What that buys is bounded: pairing and the
+    calendar feed are per-user, and the new account is a different uid. The
+    app-global Anthropic key is the exception, and it is the reason this is
+    documented in docs/windows-security.md instead of being waved through.
+    Since registration is unauthenticated anyway, closing it here would not
+    close the hole - anyone who can reach the port can register regardless.
     """
     request.session.pop(SESSION_VIA, None)
     request.session.pop(SESSION_DEVICE_ID, None)
 
 
-def _connector_session_still_paired(request: Request) -> bool:
+def _connector_session_still_paired(conn: HTTPConnection) -> bool:
     """False only for a connector session whose device has been revoked.
 
     A password session is never charged the lookup, so this costs nothing on
     the ordinary path.
+
+    Every caller has to invoke this itself, and there is no way to arrange
+    otherwise. AuthMiddleware is a BaseHTTPMiddleware, whose __call__ hands any
+    scope that is not "http" straight to the app - so a websocket route is
+    never dispatched through it and cannot inherit this check. That is why the
+    parameter is an HTTPConnection: the ride socket calls it directly. A new
+    websocket route that authenticates on the session and forgets to is a
+    revocation bypass, which is exactly the hole this function was written to
+    close and exactly the hole it had for one commit.
     """
-    if not _from_connector(request):
+    if not _from_connector(conn):
         return True
     try:
         return connectorauth.device_exists(
-            request.session.get("user_id"), request.session.get(SESSION_DEVICE_ID)
+            conn.session.get("user_id"), conn.session.get(SESSION_DEVICE_ID)
         )
     except Exception:
         # An authorization check that cannot answer has to say no. The cost of
@@ -3942,9 +3968,16 @@ def create_app() -> FastAPI:
         # revoking the device would not undo it. The rest of this route stays
         # open on purpose; pointing the app at the right folders is exactly
         # what the tray window exists for. See _CONNECTOR_REFUSAL.
-        refusal = None
+        refusal = False
         if anthropic_api_key and _from_connector(request):
-            refusal = _CONNECTOR_REFUSAL
+            # Answered below with the same 403 the other two refusals use, and
+            # deliberately not by falling through to the ordinary "Settings
+            # saved." render: a page that says both that it saved and that it
+            # refused describes neither outcome, and 200 tells a script the
+            # write went through. The other fields on this form are still
+            # written first - pointing the app at the right folders is what the
+            # tray window is for, and only the app-global key is off limits.
+            refusal = True
         elif anthropic_api_key:
             config.set_anthropic_api_key(anthropic_api_key)
         # Zwift account credentials: only saved when both fields are supplied;
@@ -3969,12 +4002,13 @@ def create_app() -> FastAPI:
                             "password are needed.")
         return templates.TemplateResponse(
             request, "settings.html",
-            _settings_ctx(request, uid, True, cred_message=cred_message,
+            _settings_ctx(request, uid, not refusal, cred_message=cred_message,
                           dir_message="; ".join(dir_msgs) or None,
                           ftp_message=ftp_message,
                           ftp_confirm_required=ftp_confirm_required,
                           ftp_form_value=ftp if ftp_message else None,
-                          refusal_message=refusal),
+                          refusal_message=_CONNECTOR_REFUSAL if refusal else None),
+            status_code=403 if refusal else 200,
         )
 
     @app.post("/settings/zwift-credentials/clear", response_class=HTMLResponse)
@@ -4807,6 +4841,20 @@ def create_app() -> FastAPI:
         except Exception:
             uid = None
         if not uid:
+            await websocket.send_json({"status": "error", "error": "not authenticated"})
+            await websocket.close()
+            return
+        # Revocation has to be enforced here, not upstream. AuthMiddleware
+        # terminates a revoked connector session on every HTTP request, but it
+        # is a BaseHTTPMiddleware and never runs for a websocket scope, so
+        # without this line a revoked laptop keeps a working ride socket after
+        # the browser half has been cut off - and drives whichever connector is
+        # attached now, because _ble_session resolves by user_id alone. The
+        # session cannot be cleared from here the way the middleware clears it
+        # (there is no response to carry a new cookie), so the socket simply
+        # refuses; the next HTTP request is what empties the cookie.
+        if not _connector_session_still_paired(websocket):
+            _log.info("a ride socket was refused because its device was revoked")
             await websocket.send_json({"status": "error", "error": "not authenticated"})
             await websocket.close()
             return

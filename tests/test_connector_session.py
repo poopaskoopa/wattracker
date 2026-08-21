@@ -340,6 +340,13 @@ def test_a_connector_session_cannot_replace_the_shared_anthropic_key(client):
     at an account the attacker owns, which hands them the prompt contents too.
     The rest of POST /settings still has to work - configuring folders is what
     the tray window is *for* - so only this one field is refused.
+
+    The status is 403, matching the other two refusals. It was 200 for one
+    commit, because the route set a message and then fell through to the
+    ordinary "Settings saved." render; the key was never written, but the page
+    said both things at once and the status told a script the write had gone
+    through. The fields that are allowed are still written on the way past,
+    which is what the ftp assertion below holds onto.
     """
     from wattracker import config
 
@@ -350,9 +357,9 @@ def test_a_connector_session_cannot_replace_the_shared_anthropic_key(client):
             "/settings", data={"ftp": "250", "anthropic_api_key": "sk-ant-attacker"}
         )
 
-    assert response.status_code == 200, "the rest of the page must still save"
+    assert response.status_code == 403
     assert not config.anthropic_api_key_set()
-    assert db.get_user_settings(uid)["ftp"] == 250
+    assert db.get_user_settings(uid)["ftp"] == 250, "the rest of the page must still save"
 
 
 def test_a_connector_session_can_still_revoke(client):
@@ -467,3 +474,84 @@ def test_revoking_the_device_leaves_no_working_credential(client):
             "/settings", follow_redirects=False
         ).headers["location"] == "/login"
     assert connectorauth.list_devices(uid) == []
+
+
+def test_a_revoked_device_cannot_keep_riding_over_the_websocket(client):
+    """The hole the independent re-check of the first fix found.
+
+    AuthMiddleware is a BaseHTTPMiddleware, and Starlette hands any scope that
+    is not "http" straight past it - so terminating the session there closed
+    the browser half and left the ride socket wide open. A revoked laptop could
+    still open /ride/ws on the same cookie and drive whichever connector is
+    attached now, because _ble_session resolves by user_id alone. That is
+    precisely the harm revoking is supposed to stop, reached through a
+    different door.
+
+    Both halves are asserted: the HTTP half must still terminate, and the
+    socket must refuse. Asserting only the socket would pass against a build
+    that had broken the middleware instead of fixing the socket.
+    """
+    uid, token = _paired(client)
+    device_id = connectorauth.list_devices(uid)[0]["id"]
+
+    with _connector_window(client, token) as window:
+        # Paired, the window rides: without this the test would also pass if
+        # the socket refused everyone.
+        with window.websocket_connect(
+            "/ride/ws?sim=1&type=endurance&minutes=30"
+        ) as ws:
+            assert ws.receive_json()["status"] != "error"
+
+        client.post(f"/settings/connector/{device_id}/revoke")
+
+        # The socket goes FIRST, and the order is the whole test. AuthMiddleware
+        # clears the cookie when it terminates a revoked session, so an HTTP
+        # request here would empty the session and leave the socket with no
+        # user_id at all - which refuses the connection for the wrong reason and
+        # passes just as happily against the bypass. Asked while the cookie is
+        # still intact, this fails unless the socket checks for itself.
+        with window.websocket_connect(
+            "/ride/ws?sim=1&type=endurance&minutes=30"
+        ) as ws:
+            assert ws.receive_json() == {
+                "status": "error", "error": "not authenticated"
+            }
+
+        # And only then the HTTP half, which must still terminate.
+        assert window.get(
+            "/settings", follow_redirects=False
+        ).headers["location"] == "/login"
+
+
+def test_a_password_session_still_rides(client):
+    """The other side of the check above: it must cost an ordinary rider nothing.
+
+    A password session carries no device_id, so _connector_session_still_paired
+    returns True without a lookup. If this ever fails, the socket has started
+    charging every rider for a check that exists for one case.
+    """
+    _register(client)
+    client.post("/login", data={"username": "rider", "password": PASSWORD})
+
+    with client.websocket_connect("/ride/ws?sim=1&type=endurance&minutes=30") as ws:
+        assert ws.receive_json()["status"] != "error"
+
+
+def test_the_refused_api_key_says_only_that_it_refused(client):
+    """The refusal must not also claim to have saved.
+
+    The key was never written - that half always held - but the route fell
+    through to the ordinary render, so the page came back 200 with "Settings
+    saved." above the refusal. Two contradictory statements about one request,
+    and a status code that tells a script the write went through.
+    """
+    uid, token = _paired(client)
+
+    with _connector_window(client, token) as window:
+        response = window.post(
+            "/settings", data={"anthropic_api_key": "sk-attacker"}
+        )
+
+    assert response.status_code == 403
+    assert "Sign in with your password first." in response.text
+    assert "Settings saved." not in response.text

@@ -193,12 +193,38 @@ still in front of them. Signing in with the password inside that window lifts
 the restriction, because a device token can neither obtain nor change a
 password.
 
-Revocation reaches the session as well as the token. A session cookie is a
-signed blob with no server-side record, so `settings_connector_revoke` has
-nothing to delete; instead the cookie carries the `device_id` it came from and
-`AuthMiddleware` ends any connector session whose device is gone. Without that,
-revoking would kill the token and leave the window it opened working for the
-fortnight the cookie is valid.
+**The API-key refusal does not hold against `/register`, and that is a known
+gap.** Registration is unauthenticated by design — this is a single-user local
+app that has to let its first user in — and a successful registration drops the
+`via=connector` marker, because proving a password is what the marker exists to
+wait for. But the password proved at `/register` is a *new account's*, chosen by
+whoever is registering, not the rider's. So a connector session can register a
+throwaway account and, as that account, write the Anthropic key: the key is
+app-global rather than per-user, so it is the one setting a different `uid` can
+still reach. Device pairing and calendar-feed rotation are not reachable this
+way — both are per-user, and the new account is a different user.
+
+The mitigating half is that anyone who can reach the port can already register
+without a device token at all, so this is a pre-existing property of open
+registration rather than something the connector introduced. It is recorded
+here because the refusal above would otherwise read as stronger than it is. If
+open registration is ever closed, close this with it.
+
+Revocation reaches the session as well as the token, over **both** protocols.
+A session cookie is a signed blob with no server-side record, so
+`settings_connector_revoke` has nothing to delete; instead the cookie carries
+the `device_id` it came from and `AuthMiddleware` ends any connector session
+whose device is gone. Without that, revoking would kill the token and leave the
+window it opened working for the fortnight the cookie is valid.
+
+`AuthMiddleware` alone is not enough, and the reason generalises. It is a
+`BaseHTTPMiddleware`, and Starlette hands any scope that is not `http` straight
+to the application — so **no websocket route is dispatched through it**. For one
+commit that left `/ride/ws` authenticating on `user_id` alone: revoking cut the
+browser half and left the thief riding, driving whichever connector was
+attached at the time. The ride socket now runs the pairing check itself. Any
+new websocket route that authenticates on the session must do the same; there
+is no arrangement of middleware that will do it for them.
 
 The query parameter is
 named `token` rather than `ticket` deliberately: uvicorn logs the full request
