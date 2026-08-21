@@ -299,3 +299,86 @@ def test_a_verbose_run_installs_the_redaction_on_every_handler(connector_dir):
         assert any(
             isinstance(f, _SecretRedactingFilter) for f in handler.filters
         ), handler
+
+
+def test_a_traceback_carrying_the_credential_is_redacted(connector_dir):
+    """The formatter renders exc_info long after the filter has run.
+
+    Scrubbing msg and args does not touch a traceback: the formatter builds it
+    from exc_info afterwards and appends it to the line. So a library that
+    raises with the handshake header in the exception message writes the live
+    credential into the file the rider is asked to email - past a filter that
+    reports itself as covering the log.
+    """
+    redact_secret(TOKEN)
+    _configure_logging(True)
+
+    try:
+        raise RuntimeError(f"handshake failed: Authorization: Bearer {TOKEN}")
+    except RuntimeError:
+        logging.getLogger("wattracker_connector.test").debug(
+            "connection attempt failed", exc_info=True
+        )
+
+    text = _log_text(connector_dir)
+    assert TOKEN not in text
+    assert "[REDACTED]" in text
+    # The diagnosis itself must survive: redacting by dropping the traceback
+    # would take away the reason -v exists.
+    assert "RuntimeError" in text
+
+
+def test_a_non_string_message_is_redacted_like_an_argument(connector_dir):
+    """``getMessage()`` renders a non-string msg with ``str()``.
+
+    The guard used to be ``isinstance(record.msg, str)``, so a dict logged as
+    the message itself walked straight past - while the very same dict passed
+    as an *argument* was scrubbed, because the argument path already rendered
+    non-strings. One rule for both is the fix.
+    """
+    redact_secret(TOKEN)
+    _configure_logging(True)
+
+    logging.getLogger("wattracker_connector.test").debug(
+        {"authorization": f"Bearer {TOKEN}"}
+    )
+
+    text = _log_text(connector_dir)
+    assert TOKEN not in text
+    assert "[REDACTED]" in text
+
+
+def test_a_record_that_cannot_be_scrubbed_loses_its_traceback_too(
+    connector_dir, monkeypatch
+):
+    """The drop path must drop the traceback, not just the message.
+
+    A record whose scrubbing raised is precisely the one most likely to be
+    carrying something. Blanking the message while leaving exc_info for the
+    formatter to render would defeat the point of blanking it.
+
+    Redaction is made to fail outright rather than fed an awkward value: every
+    natural candidate is already handled (_scrub catches a __str__ that raises,
+    and a non-tuple, non-dict args matches neither branch), so the only honest
+    way to reach the except is to break the thing the try block calls.
+    """
+    redact_secret(TOKEN)
+
+    def explode(_value):
+        raise RuntimeError("redaction itself failed")
+
+    monkeypatch.setattr(_SecretRedactingFilter, "redact", staticmethod(explode))
+
+    try:
+        raise RuntimeError(f"Bearer {TOKEN}")
+    except RuntimeError:
+        record = logging.LogRecord(
+            "x", logging.DEBUG, __file__, 0, "a message", (), sys.exc_info()
+        )
+
+    assert _SecretRedactingFilter().filter(record) is True
+    assert record.exc_info is None
+    assert not record.exc_text
+    rendered = logging.Formatter().format(record)
+    assert TOKEN not in rendered
+    assert "could not be redacted" in rendered

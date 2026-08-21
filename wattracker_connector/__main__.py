@@ -131,18 +131,46 @@ class _SecretRedactingFilter(logging.Filter):
 
     def filter(self, record: logging.LogRecord) -> bool:
         try:
-            if isinstance(record.msg, str):
-                record.msg = self.redact(record.msg)
+            # _scrub, not an isinstance(str) guard: getMessage() renders a
+            # non-string msg with str(), so a dict or an object whose repr
+            # carries the header used to walk straight past a check that only
+            # looked at strings - while the same value passed as an *argument*
+            # was scrubbed. One rule for both.
+            record.msg = self._scrub(record.msg)
             if isinstance(record.args, tuple):
                 record.args = tuple(self._scrub(a) for a in record.args)
             elif isinstance(record.args, dict):
                 record.args = {k: self._scrub(v) for k, v in record.args.items()}
+            # Exceptions are rendered by the formatter, from exc_info, long
+            # after this filter has run - so scrubbing msg and args does not
+            # touch them. A library that raises with the header in the message
+            # (or attaches the request to the exception) would write the
+            # credential to the file verbatim. Render the traceback here and
+            # hand the formatter the redacted text instead: logging caches
+            # exc_text and will not re-render it.
+            if record.exc_info:
+                if record.exc_text is None:
+                    record.exc_text = logging.Formatter().formatException(
+                        record.exc_info
+                    )
+                record.exc_text = self.redact(record.exc_text)
+                record.exc_info = None
+            elif record.exc_text:
+                record.exc_text = self.redact(record.exc_text)
+            if record.stack_info:
+                record.stack_info = self.redact(record.stack_info)
         except Exception:
             # Logging must never be what breaks the connector, and a record
             # that could not be scrubbed is still better dropped than emitted:
             # blank the message rather than let an unredacted one through.
             record.msg = "a log line could not be redacted and was dropped"
             record.args = ()
+            # Dropped means dropped: a traceback that survived the failure
+            # above is exactly the thing most likely to be carrying the
+            # credential.
+            record.exc_info = None
+            record.exc_text = None
+            record.stack_info = None
         return True
 
 
