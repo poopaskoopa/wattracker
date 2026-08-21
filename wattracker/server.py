@@ -1662,6 +1662,7 @@ def create_app() -> FastAPI:
             # verified-link semantics so the list never presents stale activity
             # feedback for a workout-backed ride.
             link = db.linked_workout_for_activity(uid, a["id"])
+            a["linked_workout"] = link
             if link:
                 if link["kind"] == "plan":
                     workout = db.get_plan_workout(uid, link["id"])
@@ -1690,6 +1691,29 @@ def create_app() -> FastAPI:
         return templates.TemplateResponse(
             request, "activities.html", _activities_context(request)
         )
+
+    @app.post("/activity/{activity_id}/drop", response_class=HTMLResponse)
+    @app.post("/activities/{activity_id}/drop", response_class=HTMLResponse)
+    def drop_activity(request: Request, activity_id: int):
+        result = db.delete_activity(_uid(request), activity_id)
+        if result == "not_found":
+            return RedirectResponse("/activities?drop=not_found", status_code=303)
+        if result == "linked":
+            return RedirectResponse("/activities?drop=linked", status_code=303)
+        return RedirectResponse("/activities?drop=deleted", status_code=303)
+
+    @app.post("/api/activity/{activity_id}/drop")
+    @app.delete("/api/activity/{activity_id}")
+    def api_drop_activity(request: Request, activity_id: int):
+        result = db.delete_activity(_uid(request), activity_id)
+        if result == "not_found":
+            return JSONResponse({"error": "activity not found"}, status_code=404)
+        if result == "linked":
+            return JSONResponse(
+                {"error": "linked activities must be uncompleted first"},
+                status_code=409,
+            )
+        return JSONResponse({"id": activity_id, "status": "deleted"})
 
     def _profile_response(request: Request, error: Optional[str] = None,
                           confirm_required: bool = False):
@@ -3017,6 +3041,7 @@ def create_app() -> FastAPI:
 
         today_iso = today.isoformat()
         by_date: dict = {}
+        activities_by_date: dict = {}
         for w in db.plan_workouts_for_month(uid, y, m):
             wd = dict(w)
             adjustment_state = w.get("adjustment_state")
@@ -3051,6 +3076,14 @@ def create_app() -> FastAPI:
                 ),
             })
             by_date.setdefault(w["scheduled_date"], []).append(wd)
+        for activity in db.activities_for_month_unlinked(uid, y, m):
+            activity = dict(activity)
+            activity.update({
+                "date": activity["start_time"][:10],
+                "activity": True,
+                "url": f"/activity/{activity['id']}",
+            })
+            activities_by_date.setdefault(activity["date"], []).append(activity)
 
         # Which block of the active plan's arc each day belongs to, so a day
         # cell can say "build" rather than leaving the rider to count weeks.
@@ -3086,6 +3119,7 @@ def create_app() -> FastAPI:
                         "ooto": _in_ooto(iso),
                         "race": races_by_date.get(iso),
                         "workouts": by_date.get(iso, []),
+                        "activities": activities_by_date.get(iso, []),
                         "phase": phase_by_date.get(iso),
                     }
                 )
@@ -5091,14 +5125,28 @@ def create_app() -> FastAPI:
             }
         )
 
+    @app.post("/api/plan/workout/{workout_id}/completion")
     @app.post("/api/plan/workout/{workout_id}/complete")
-    def api_plan_workout_complete(request: Request, workout_id: int):
+    def api_plan_workout_complete(
+        request: Request, workout_id: int, completed: Optional[bool] = Body(None, embed=True)
+    ):
         """Manually link the best same-day, unused activity to a workout.
 
         Repeating the action for an already completed workout is an idempotent
         success and returns its existing activity link.
         """
         uid = _uid(request)
+        if completed is False:
+            result = db.set_plan_workout_completion(uid, workout_id, False)
+            if result == "not_found":
+                return JSONResponse({"error": "workout not found"}, status_code=404)
+            workout = db.get_plan_workout(uid, workout_id)
+            return JSONResponse({
+                "id": workout_id,
+                "status": "incomplete",
+                "completed": False,
+                "activity_id": workout.get("completed_activity_id") if workout else None,
+            })
         result = importer.manually_complete_plan_workout(uid, workout_id)
         if result == "not_found":
             return JSONResponse({"error": "workout not found"}, status_code=404)
@@ -5127,6 +5175,7 @@ def create_app() -> FastAPI:
             {
                 "id": workout_id,
                 "status": result,
+                "completed": bool(workout and workout.get("completed_activity_id")),
                 "activity_id": (
                     workout.get("completed_activity_id") if workout else None
                 ),
@@ -5179,6 +5228,7 @@ def create_app() -> FastAPI:
                 row["free"] = True
             profile.append(row)
 
+        completed = w.get("completed_activity_id") is not None
         return JSONResponse(
             {
                 "id": w["id"],
@@ -5192,12 +5242,16 @@ def create_app() -> FastAPI:
                 "rpe": w.get("rpe"),
                 "too_hard": w.get("rpe") == 10,
                 "ftp_feedback_applied": bool(w.get("feedback_applied")),
-                "completed": w.get("completed_activity_id") is not None,
+                "completed": completed,
                 "completion_verified": completion_verified,
                 "rpe_eligible": completion_verified,
                 "can_mark_complete": (
-                    w.get("completed_activity_id") is None
+                    not completed
                     and w["date"] <= utc_today().isoformat()
+                ),
+                "can_toggle_completion": (
+                    completed
+                    or w["date"] <= utc_today().isoformat()
                 ),
                 "ftp": round(ftp, 1),
                 "description": session.description,
