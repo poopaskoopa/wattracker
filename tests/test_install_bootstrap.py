@@ -13,6 +13,8 @@ import uuid
 
 import pytest
 
+from conftest import requires_symlinks
+
 
 ROOT = Path(__file__).resolve().parents[1]
 INSTALL = (ROOT / "scripts" / "install.sh").read_text()
@@ -124,6 +126,7 @@ def _make_exe(path):
     path.chmod(0o755)
 
 
+@requires_symlinks
 def test_without_lsof_hides_lsof_but_keeps_bash_on_usrmerge_layout(tmp_path):
     # Regression test for a usrmerge-style layout (e.g. lsof and bash both
     # live in /usr/bin): dropping the whole directory to hide lsof would
@@ -507,17 +510,23 @@ class _RestartSandbox:
 
 
 def _restart_sandbox(tmp_path, path=None):
+    # restart.sh is a POSIX shell script, and this sandbox drives it through
+    # /bin/sh shims that wrap pgrep and ps. Windows has none of the three, so
+    # skip the way the sibling launcher tests already do rather than failing on
+    # a missing tool - VENV_PYTHON is .venv/bin/python, which is why those skip
+    # here without anyone having written a platform check.
+    path = path or os.environ.get("PATH", os.defpath)
+    real_pgrep = shutil.which("pgrep", path=path)
+    real_ps = shutil.which("ps", path=path)
+    if not (real_pgrep and real_ps):
+        pytest.skip("restart.sh's stop() is exercised through pgrep and ps shims")
+
     token = "tok" + uuid.uuid4().hex
     root = tmp_path / "repo"
     (root / "scripts").mkdir(parents=True)
     script = root / "scripts" / "restart.sh"
     shutil.copy2(RESTART_SCRIPT, script)
     script.chmod(0o755)
-
-    path = path or os.environ.get("PATH", os.defpath)
-    real_pgrep = shutil.which("pgrep", path=path)
-    real_ps = shutil.which("ps", path=path)
-    assert real_pgrep and real_ps
 
     allow_file = tmp_path / "allowed-pids"
     allow_file.write_text("")

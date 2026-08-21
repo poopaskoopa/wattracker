@@ -5,7 +5,6 @@ wattracker ships on Windows as a frozen onedir tree, wrapped two ways:
 | artifact | what it is | built by |
 |---|---|---|
 | `wattracker-<version>-windows-x64-unsigned-setup.exe` | Inno Setup installer, double-click to install | `windows.yml`, job `package-unsigned` |
-| `wattracker-windows-x64-unsigned.zip` | the same tree, portable, unpack and run | the same job |
 | `wattracker-windows-x64-signed.zip` | the same tree, signed, plus a `.sha256` | `windows-release.yml`, on a `v*` tag |
 
 Note what that table does not contain: **there is no signed installer.**
@@ -54,7 +53,8 @@ the artifact name cannot disagree with `AppVersion` either.
 That one field is read in two deliberately different ways:
 
 - **the workflow** uses `python -c "import tomllib; ..."`, because the
-  `package-unsigned` job pins Python 3.13 and can rely on the stdlib parser;
+  `package-unsigned` job runs on Python 3.12 - asserted in the job, see **The
+  runner** - and can rely on the stdlib parser;
 - **`packaging/wattracker.spec`** (`_project_version`, used for the macOS bundle
   version) and `tests/test_windows_installer.py` both use a regex instead, and
   say so in a comment. That was forced when the build interpreter and the test
@@ -172,10 +172,12 @@ uninstall (tampered launcher state) to have removed none of them.
 ## CI
 
 The installer is built by the `package-unsigned` job in
-`.github/workflows/windows.yml`, on `windows-latest`, in this order:
+`.github/workflows/windows.yml`, on a **self-hosted Windows runner**
+(`runs-on: [self-hosted, Windows, X64]`), in this order:
 
-1. check out, set up Python **3.13** (the interpreter that gives the inline
-   `tomllib` version read), create a separate `.venv` for the lifecycle test;
+1. check out, set up Python **3.12** (the interpreter that gives the inline
+   `tomllib` version read), assert the runner carries no leftover install state,
+   create a `.venv` **in the workspace** and install everything into it;
 2. **install a pinned Inno Setup compiler.** `innosetup-6.7.3.exe` is downloaded
    from a pinned `github.com/jrsoftware/issrc` release URL, its SHA-256 compared
    against a literal in the workflow, and its Authenticode signature required to
@@ -187,8 +189,7 @@ The installer is built by the `package-unsigned` job in
 3. `tests\windows\lifecycle.ps1`, the PowerShell launcher-safety test;
 4. build the wheel and smoke the *installed* wheel in its own venv
    (`packaging/smoke_installed.py`);
-5. freeze the onedir tree and smoke it (`packaging/smoke_frozen.ps1`), then
-   `Compress-Archive` it into the portable zip;
+5. freeze the onedir tree and smoke it (`packaging/smoke_frozen.ps1`);
 6. read the version, run `ISCC.exe /DAppVersion=...`, and **throw if the setup
    file is not on disk** - a compiler that fails quietly must not reach upload;
 7. smoke the installer itself (`packaging/smoke_installer.ps1`): install to a
@@ -196,47 +197,309 @@ The installer is built by the `package-unsigned` job in
    `/login`, `/static/style.css` and `/register`, reinstall over the top,
    attempt an uninstall with tampered state and require it to fail, then
    uninstall for real;
-8. upload the wheel, the portable zip and the setup exe, with
-   `if-no-files-found: error`.
+8. upload the wheel and the setup exe, with `if-no-files-found: error`
+   and `retention-days: 5` - **only on a merge to `main`**, see below.
 
 The digest and publisher checks in step 2 have their own paragraph in
 `docs/windows-security.md`, and `tests/test_windows_installer.py` pins the
 version, the digest, the hash command and the publisher string so they cannot be
 loosened without a test change.
 
-**Both jobs in `windows.yml`, and `windows-release.yml`, carry
-`if: ${{ false }}`.** The current reason is billing, not access: Actions is
-enabled for this repository - the `Cloud` workflow runs the full test suite on
-every push and pull request - but it does so on a *self-hosted* macOS runner,
-which is not billed. GitHub-hosted minutes are exhausted, and `windows-latest` is
-billable on a private repository, so the Windows jobs stay gated and every
-Windows workflow run is recorded as `skipped`. (The comment in `windows.yml`
-still describes the earlier account-level block that first disabled it.) Until
-hosted minutes are available, the gate for anything in this document is a local
-Windows machine.
+**Why step 8 no longer uploads a portable zip.** Self-hosted runners are not
+billed for minutes, but artifacts still consume the *account*'s shared storage,
+and a free account has 500 MB of it. A run used to upload 106.8 MB - a 44.4 MB
+setup exe, a 61.8 MB portable zip and the wheel - at the 90-day default
+retention, so roughly four runs filled the quota and `upload-artifact` began
+failing with `Artifact storage quota has been hit`. That is how 45 stale
+artifacts reached 2693 MB and blocked the job outright.
 
-## What has never been executed
+The zip was the cheapest thing to drop, because it duplicated the installer's
+payload: the same onedir tree, wrapped differently rather than built
+differently. Nothing downstream consumed it, and the portable form still ships
+where it is actually used - `windows-release.yml` builds and signs its own on a
+`v*` tag. Retention on what remains is 7 days, since these are unsigned builds
+that exist to check a commit; the signed release artifacts keep their own 30.
+`tests/test_windows_installer.py` asserts both the retention value and the zip's
+absence, so re-adding a `Compress-Archive` here fails the suite.
 
-Be blunt about this. The gate above is not a formality: nothing below has run.
+### The upload runs only on merges to main
 
-- **`packaging/wattracker.iss` has never been compiled by this repository.**
-  Every Windows workflow run is recorded as skipped, so no `ISCC` invocation
-  exists in any run log, and Inno Setup does not run on macOS, which is where
-  this repository is developed. A syntax error, a directive the pinned 6.7.3
-  rejects, or a Pascal Script typo in `[Code]` would surface on the first
-  compile. Treat it as a debugging session, not a build.
-- **No installer has ever been installed**, and `packaging/smoke_installer.ps1`
-  has never run. The Start Menu shortcut, the upgrade-over-existing-install path
-  and the uninstall path are all unobserved.
-- **The `[Code]` lifecycle has never executed.** `PrepareToInstall`,
-  `InitializeUninstall`, the tampered-state abort and the message boxes are
-  reviewed, not exercised. Every test that covers any of this reads the files as
-  text; `tests/test_windows_installer.py` asserts strings in `.iss`, `.ps1` and
-  `.yml`, and asserts nothing about behaviour.
-- **The pinned-compiler provenance check has never run either.** The URL,
-  digest and publisher are reviewed constants; that the 6.7.3 asset still
-  matches that digest, and that its signer simple name renders exactly as
-  `Pyrsys B.V.`, are unverified assumptions until the job runs once.
+Every PR commit builds; only a merge to `main` uploads. The step carries
+
+```yaml
+if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
+```
+
+and the `push` trigger is itself filtered to `main`, so the two agree by
+construction. The ref test is redundant today and kept anyway: it is what stops
+a later re-broadening of the trigger from silently turning the upload back on
+for every branch.
+
+**Why not every push.** The account's shared storage is 500 MB, and this step is
+the only thing in the repo that consumes it - `cloud.yml` uploads nothing, no
+workflow pushes to a registry, and the two release workflows fire only on `v*`
+tags. At the ~93 triggers a week this workflow sees, 45 MB a run needs several
+gigabytes. Merges to `main` run about 8.75 times a week (40 push events in the
+32 days to 2026-08-21), which is ~394 MB at 7-day retention: it fits, but leaves
+too little slack for a busy week, so retention is 5 and the steady state is
+nearer 280 MB.
+
+**Nothing is lost on the PR commits that do not upload.** They still run the
+`ISCC` compile, the frozen smoke and the full install / upgrade /
+tampered-uninstall / uninstall, and still fail the job if any of it breaks. The
+artifact is a downloadable convenience; nothing downstream reads it, and
+`windows-release.yml` builds its own signed artifacts on a tag.
+
+**One run per commit.** A bare `push:` beside `pull_request:` fired this
+workflow twice for every commit on a branch with an open PR, and with a single
+physical runner the second run queues behind the first rather than running
+beside it - runs `32386196713` and `32386202547` were the same commit, 10m45s of
+wall time for 5m30s of work. Filtering push to `main` gives a PR run while the
+work is in review and a push run when it merges. The trade is that a branch with
+no PR open gets no Windows run at all, so packaging breakage surfaces when the
+PR opens rather than on the push.
+
+**The quota block is separate and may still be in force.** Deleting 2693 MB of
+stale artifacts left `total_count: 0`, but uploads continued to fail with
+`Artifact storage quota has been hit` well past GitHub's stated 6-12 hour
+recalculation window. Nothing visible accounts for it; `taksmon` cannot read
+`settings/billing` (that needs the `user` scope), so the owner's billing page is
+the only remaining place to look. Until it clears, expect a red upload on merges
+to `main` while every PR run stays green.
+
+### Yielding the box to a hardware session
+
+The runner shares a physical machine with the trainer and Zwift, so a build can
+begin in the middle of a ride. Three steps - the dependency install, the wheel
+build, and the freeze plus installer compile - therefore start with
+
+```powershell
+(Get-Process -Id $PID).PriorityClass = 'BelowNormal'
+```
+
+so that PyInstaller and the Inno Setup LZMA compress, which each saturate every
+core for minutes, yield to Zwift. Children inherit the class, so the whole build
+tree is covered. `BelowNormal` rather than `Idle` is deliberate: at `Idle` the
+runner's heartbeat can starve under sustained load and the job is reported lost.
+
+This does **not** lower I/O priority, which is a separate axis on Windows and
+cannot be set on another process from outside it, so a build still competes for
+the disk.
+
+**It does not replace stopping the runner** - see "Stopping the runner for a
+trainer session" below, which remains the operational contract and is the only
+thing that removes the contention rather than merely deprioritizing it. The
+priority drop is what limits the damage on the ride where somebody forgets, and
+for a session where ERG latency is being measured rather than merely ridden,
+forgetting is still a spoiled measurement.
+
+Nothing in the job touches Bluetooth, so the trainer link itself is never
+contended, and every script binds a dynamically chosen free loopback port rather
+than a fixed one, so a live session's server is never collided with either.
+
+The three packaging smokes also set `WATTRACKER_AUTO_SCAN=0`;
+`tests/windows/lifecycle.ps1` does not, and does not need to. That flag governs
+the daily *activity-file* scan rather than a BLE scan, and lifecycle runs against
+a throwaway `WATTRACKER_DATA_DIR` with no Zwift folder configured, so the scan
+has nothing to walk.
+
+### The runner
+
+GitHub-hosted minutes are exhausted and `windows-latest` is billable on a private
+repository, which is what kept this job gated. Self-hosted runners are not
+billed, which is how the `Cloud` workflow's suite has been running on a
+self-hosted macOS runner all along; `package-unsigned` now takes the same route.
+
+**A self-hosted Windows box is not `windows-latest`.** Three things the hosted
+image provides had to be provided here instead, and every one of them surfaced
+in the first two runs' setup steps, before anything the installer job exists to
+verify could be reached. They share a shape worth naming: the hosted image runs
+jobs as an administrator with a fully provisioned toolchain, and this runner
+deliberately does neither.
+
+- **PowerShell 7, installed from the MSI.** Five steps declare `shell: pwsh`,
+  which is PowerShell Core, not the `powershell.exe` 5.1 that Windows ships. It
+  is preinstalled on `windows-latest`; on a fresh runner `pwsh` is simply not
+  found. Install it machine-wide from an elevated shell:
+
+  ```powershell
+  winget install --id Microsoft.PowerShell --installer-type wix --scope machine
+  ```
+
+  `--installer-type wix` is load-bearing and not obvious. Without it winget
+  selects the *MSIX bundle* and `--scope machine` becomes a provisioning
+  operation, which fails `0x80070005` even elevated. More to the point it would
+  be the wrong build if it succeeded: the packaged version surfaces `pwsh.exe`
+  through a per-user App Execution Alias under
+  `%LOCALAPPDATA%\Microsoft\WindowsApps`, so the runner account would still not
+  find it on PATH - the same trap as this machine's per-user Python 3.12, which
+  is invisible to `wattracker-ci` for exactly the same reason. The `wix` entry is
+  the machine-wide MSI, which installs to `C:\Program Files\PowerShell\7` and
+  edits the *system* PATH. **Restart the runner service afterwards**: a service
+  inherits its environment at start, so `pwsh` stays not-found until it does.
+
+  Do not answer this by rewriting the steps to `shell: powershell`. They would
+  *mostly* survive 5.1, but the Inno Setup step appends to `$env:GITHUB_PATH`
+  with `Out-File -Encoding utf8`, and 5.1 writes a BOM there while 7 does not. A
+  BOM in `GITHUB_PATH` corrupts the entry it prefixes, and the symptom -
+  `ISCC.exe` not found, two steps later - points nowhere near the cause. Matching
+  the hosted image is also the point of the exercise.
+- **Python 3.12, installed machine-wide, and no `actions/setup-python`.** The
+  action's Windows path is not the tool-cache unpack it looks like:
+  `installers/win-setup-template.ps1` in `actions/python-versions` runs the
+  official installer with `InstallAllUsers=1` (or `ALLUSERS=1` for the MSI) and
+  first clears keys under
+  `HKLM\...\Installer\UserData\S-1-5-18\Products`. It requires administrator,
+  full stop - on the hosted image that is free because the runner account is one.
+  Here it is not, and it must not become one: admin on this account is exactly
+  the isolation the installer smoke test relies on. So the job dropped the action
+  and the runner carries a machine-wide CPython 3.12 instead
+  (`winget install Python.Python.3.12 --scope machine`), which is on the system
+  PATH and therefore visible to the service account.
+
+  Machine-wide, not per-user. A per-user install under
+  `%LOCALAPPDATA%\Programs\Python` belongs to the account that ran it and is
+  invisible to `wattracker-ci` - the same trap as the MSIX PowerShell above,
+  and worth stating twice because it is the single most repeated mistake in
+  setting this machine up.
+
+  The trade is that the interpreter is now a property of the box rather than
+  something `windows.yml` pins, which is why the job's first step asserts the
+  version and prints what it found. `tests/test_windows_installer.py` pins both
+  halves - that the action is absent, and that the assertion is present - so
+  neither can be quietly dropped.
+
+- **A script execution policy the runner account can use.** Windows client
+  defaults to `Restricted` with every scope `Undefined`, and
+  `actions/setup-python` runs its own `setup.ps1` through a `powershell` call
+  that does *not* pass `-ExecutionPolicy`, so it dies with
+  `UnauthorizedAccess`. The runner passes `-ExecutionPolicy Unrestricted` when
+  it launches a step's own script, which is why our steps look fine and this
+  still fails; the same gap bites `powershell -File packaging\smoke_installer.ps1`
+  and `smoke_frozen.ps1`, which spawn fresh processes from inside a step.
+  Set it for the runner account only, not `LocalMachine` - the CI account's hive
+  is loaded whenever the service is running:
+
+  ```powershell
+  $sid = (Get-LocalUser wattracker-ci).SID.Value
+  $key = "Registry::HKEY_USERS\$sid\Software\Microsoft\PowerShell\1\ShellIds\Microsoft.PowerShell"
+  New-Item -Path $key -Force | Out-Null
+  Set-ItemProperty -Path $key -Name ExecutionPolicy -Value RemoteSigned
+  ```
+
+  `RemoteSigned`, not `Bypass`: everything the job runs is either in the checkout
+  or written by a step, so nothing needs the weaker setting, and a downloaded
+  script still has to be signed to run.
+
+**`windows-release.yml` and the `test` job in `windows.yml` are still gated.**
+The release workflow needs hosted minutes and code-signing secrets, and the suite
+already runs on the macOS runner every push and pull request - duplicating ~6
+minutes of it on the one physical Windows box is not worth the wall time. Only
+the installer job runs here, because it is the only thing that *cannot* run
+anywhere else.
+
+**The runner service runs as a dedicated non-admin local account**
+(`wattracker-ci`), not as the developer's. This is the least obvious decision in
+the setup and the easiest to undo by accident, so: `packaging/smoke_installer.ps1`
+installs to a temp directory via `/DIR=`, but two things it registers cannot be
+redirected anywhere.
+
+- The **Start Menu group name is fixed at compile time.** `wattracker.iss` sets
+  `DisableProgramGroupPage=yes`, and Inno's documentation is explicit that
+  `/GROUP` "is ignored" when it is.
+- The **uninstall key is always `{AppId}_is1`**, and `AppId` is additionally
+  "checked by subsequent installations to determine whether it may append to a
+  particular existing uninstall log."
+
+Both are per-user. Under one account, a real wattracker install on the same
+machine would have its uninstall key repointed at the temp-directory uninstaller
+and then deleted outright when the smoke test uninstalls - silently orphaning it.
+A separate account puts those paths in a different hive entirely. **If you ever
+reconfigure the runner to run as your own account, you re-arm this.**
+
+The job also keeps a pre-flight step that fails if either path already exists.
+That is not the same defence: it catches a run killed *between* install and
+uninstall, whose leftovers would otherwise fail a later run somewhere much harder
+to read.
+
+Two smaller consequences of the runner being a real machine that persists:
+
+- **Everything installs into a workspace `.venv`**, never into the interpreter.
+  On a hosted runner the machine is discarded; here the tool cache outlives the
+  job and pollution would accumulate run over run. `actions/checkout` runs
+  `git clean -ffdx`, so the directory starts empty each time. The path is
+  load-bearing beyond hygiene - `scripts/wattracker.ps1` resolves
+  `<repo>\.venv\Scripts\python.exe` as its last-resort interpreter, which is what
+  lets `tests\windows\lifecycle.ps1` start the app from source.
+- **Runs serialize and are never cancelled.** The workflow sets a `concurrency`
+  group with no `cancel-in-progress`, because cancelling skips
+  `smoke_installer.ps1`'s `finally` block - the thing that uninstalls the product.
+  A queued run is cheaper than a poisoned machine.
+
+### Stopping the runner for a trainer session
+
+The runner shares a machine with the trainer setup, and a service-mode runner
+picks up jobs whenever a pull request opens - including mid-ride. Before a
+session:
+
+```powershell
+Stop-Service "actions.runner.poopaskoopa-wattracker.Windows-TT"
+```
+
+and `Start-Service` the same name afterwards. This is an operational contract,
+not a suggestion: a PyInstaller build and a full install/uninstall cycle are not
+what you want competing for the machine driving a trainer.
+
+The service is named `actions.runner.<owner>-<repo>.<runner name>`, so it follows
+the name the runner registered under rather than the machine's;
+`Get-Service "actions.runner.*"` finds it without guessing. The same object
+confirms the isolation above - `(Get-CimInstance Win32_Service -Filter "Name LIKE
+'actions.runner%'").StartName` must read `.\wattracker-ci`, not
+`NT AUTHORITY\NETWORK SERVICE`.
+
+## What the first run observed
+
+Run
+[32332933878](https://github.com/poopaskoopa/wattracker/actions/runs/32332933878),
+on the self-hosted runner, is the first time any of this executed. Recorded
+here as observations, with what was actually seen - not as "the job is enabled
+now".
+
+- **`packaging/wattracker.iss` compiled.** `ISCC.exe` reported
+  `Compiler engine version: Inno Setup 6.7.3`, then
+  `Successful compile (28.094 sec)`, producing
+  `dist\wattracker-0.1.0-windows-x64-unsigned-setup.exe`. No syntax error, and
+  `ArchitecturesAllowed=x64compatible` was accepted rather than rejected - it
+  had been valid-in-6.7.3-but-unverified until this run.
+- **The `[Code]` section compiled.** `Reading [Code] section` is followed by
+  `Compiling [Code] section` with no diagnostic between them, so the Pascal
+  Script parses. Note what this does and does not establish: the section
+  *compiles*. `PrepareToInstall` and `InitializeUninstall` running is evidenced
+  by the smoke test below, not by these lines.
+- **The installer installed, upgraded over itself, refused a tampered
+  uninstall, and uninstalled.** `packaging/smoke_installer.ps1` ran to
+  completion and the step exited 0, which means its whole sequence passed - the
+  log shows the app answering at `http://127.0.0.1:50792/login` twice under
+  different PIDs, the second being the reinstall over the top.
+- **The pinned-compiler provenance check ran and passed.** The 6.7.3 asset still
+  matches the pinned SHA-256 `9c73c3ba...97b732`, and the Authenticode signer's
+  simple name still renders exactly `Pyrsys B.V.` - both are `-cne` comparisons,
+  so passing means byte-exact, not merely similar. The step now prints both
+  observed values rather than proving them by silence, so a future run answers
+  the question directly instead of leaving it to be inferred from a green tick.
+- **The account isolation held.** After the run, the developer account had no
+  `HKCU` uninstall key and no Start Menu group, and `~/.wattracker/wattracker.db`
+  was byte-identical to the pre-run capture (4096 bytes, SHA-256
+  `42F67CDE...6302`). Checked, not assumed - the same standard
+  `docs/macos-packaging.md` holds its smoke test to.
+
+Still unobserved, and unchanged by the above:
+
+- **The artifact has never been uploaded.** `actions/upload-artifact` matched
+  all three files and then failed on `Artifact storage quota has been hit` -
+  the same account-level billing wall that gated this workflow to begin with.
+  The build products exist and are correct; nothing has retrieved them from the
+  runner.
 - **The installer is unsigned and there is no path that signs it.** Even after
   the signing story in `docs/windows-security.md` works, it produces a signed
   *zip*; SmartScreen judges the thing the user double-clicks, and that is the
