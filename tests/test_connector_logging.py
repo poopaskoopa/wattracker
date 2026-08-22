@@ -451,6 +451,11 @@ def test_a_cancelled_setup_window_exits_without_a_second_dialog(
 
     monkeypatch.setattr(os, "name", "nt")
     monkeypatch.setattr(setup_win32, "prompt_for_settings", lambda initial: None)
+    # The mutex is per-process and held for its lifetime, so a second main()
+    # in one test session would be turned away before it ever paired.
+    monkeypatch.setattr(
+        "wattracker_connector.__main__._claim_or_signal", lambda: True
+    )
 
     assert main(["--tray"]) == 2
     log = _log_text(connector_dir)
@@ -469,6 +474,9 @@ def test_a_setup_window_that_cannot_open_falls_back_to_the_instructions(
 
     monkeypatch.setattr(os, "name", "nt")
     monkeypatch.setattr(setup_win32, "prompt_for_settings", _refuse)
+    monkeypatch.setattr(
+        "wattracker_connector.__main__._claim_or_signal", lambda: True
+    )
 
     assert main(["--tray"]) == 2
     log = _log_text(connector_dir)
@@ -516,6 +524,9 @@ def test_a_pairing_from_the_window_is_saved_and_redacted(connector_dir, monkeypa
         "wattracker_connector.__main__._run_with_tray",
         lambda connector, settings: 0,
     )
+    monkeypatch.setattr(
+        "wattracker_connector.__main__._claim_or_signal", lambda: True
+    )
 
     assert main([]) == 0
     saved = connector_config.load()
@@ -523,3 +534,31 @@ def test_a_pairing_from_the_window_is_saved_and_redacted(connector_dir, monkeypa
     assert saved["token"] == TOKEN
     # Registered on the way through, so the log never carries it.
     assert TOKEN not in _log_text(connector_dir)
+
+
+def test_a_second_launch_is_turned_away_before_it_asks_for_a_pairing(
+    connector_dir, monkeypatch
+):
+    """The mutex decides first, so two double-clicks are not two dialogs.
+
+    A desktop shortcut plus a hurried second click is the ordinary way a
+    second launch happens. Asking first and checking afterwards puts two
+    identical windows on the screen wanting the same token, one of which
+    exits whatever is typed into it.
+    """
+    from wattracker_connector import setup_win32
+
+    asked = []
+    monkeypatch.setattr(os, "name", "nt")
+    monkeypatch.setattr(
+        setup_win32, "prompt_for_settings",
+        lambda initial: asked.append(initial) or {"server": "http://s:8000",
+                                                  "token": TOKEN},
+    )
+    monkeypatch.setattr(
+        "wattracker_connector.__main__._claim_or_signal", lambda: False
+    )
+
+    assert main(["--tray"]) == 0
+    assert asked == []          # never got as far as a window
+    assert connector_config.load() == {}   # and never wrote anything

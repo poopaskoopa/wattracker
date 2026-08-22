@@ -302,6 +302,32 @@ def test_a_server_that_comes_back_and_goes_again_is_announced_twice(tray):
     assert len(tray._balloons) == 2
 
 
+# ------------------------------------------------------- one window at a time
+def test_two_opens_in_flight_mint_only_one_ticket():
+    """The gap present() cannot cover, which is where the ticket dies.
+
+    Minting is a network round trip and _window is only set at the far end of
+    it, so two Opens close together both see present() False, both mint, and
+    TicketStore.mint replaces the first ticket with the second. Window one
+    then redeems a dead ticket and lands on the login page - the exact outcome
+    the ticket exists to prevent, produced by double-clicking.
+    """
+    loop = _WindowLoop(notify=lambda *a, **k: None)
+
+    assert loop.claim() is True     # first worker takes it
+    assert loop.claim() is False    # second worker, still before any window
+    assert loop.present() is False  # and no window exists yet, which is the gap
+
+
+def test_a_failed_attempt_gives_the_claim_back():
+    """A mint that raised must not wedge the tray's Open for the session."""
+    loop = _WindowLoop(notify=lambda *a, **k: None)
+
+    assert loop.claim() is True
+    loop.release()
+    assert loop.claim() is True
+
+
 # ------------------------------------------------------------------- pairing
 def test_the_setup_window_imports_anywhere_and_refuses_elsewhere(monkeypatch):
     """Same bargain the tray strikes: importable on the suite's CI, refuses there."""

@@ -321,9 +321,10 @@ _MUTEX_NAME = r"Local\wattracker-connector"
 
 _ERROR_ALREADY_EXISTS = 183
 
-# MB_OK | MB_ICONERROR, plus the two flags that stop the dialog opening behind
-# whatever the rider was looking at when they double-clicked us.
-_MB_STARTUP_ERROR = 0x0 | 0x10 | 0x10000 | 0x40000
+# MB_ICONERROR, plus the two flags that stop the dialog opening behind
+# whatever the rider was looking at when they double-clicked us. MB_OK is 0x0
+# and is left out rather than written as a term that changes nothing.
+_MB_STARTUP_ERROR = 0x10 | 0x10000 | 0x40000
 
 
 def _fatal(message: str) -> None:
@@ -340,8 +341,12 @@ def _fatal(message: str) -> None:
     stream to read and must not be left waiting on a modal dialog.
     """
     log.error("%s", message)
-    print(message, file=sys.stderr)
-    if sys.stderr is not None or os.name != "nt":
+    if sys.stderr is not None:
+        print(message, file=sys.stderr)
+        return
+    # print(..., file=None) means sys.stdout, not "nowhere", so the guard above
+    # is what keeps the two destinations from being decided by accident.
+    if os.name != "nt":
         return
     try:
         import ctypes
@@ -450,6 +455,31 @@ def _claim_single_instance(name: str = _MUTEX_NAME):
     return True, handle
 
 
+def _claim_or_signal() -> bool:
+    """Take the single-instance mutex, or give the running connector the click.
+
+    Called before the pairing window rather than on the way into the tray, and
+    that ordering is the whole point. A desktop shortcut and a hurried second
+    double-click is the ordinary way a second launch happens - the mutex
+    comment says so - and on a never-paired exe the old ordering put a setup
+    dialog on the screen first and discovered the redundancy afterwards. Two
+    identical windows asking for the same token, one of which is about to
+    exit whatever the rider types into it.
+    """
+    global _instance_handle
+
+    from . import tray_win32
+
+    may_run, _instance_handle = _claim_single_instance()
+    if may_run:
+        return True
+    # Distinct from the server's one-per-account rule: this one is about two
+    # copies on one desktop, and the running one is perfectly good.
+    log.info("a connector is already running in this session; exiting")
+    tray_win32.signal_existing_instance()
+    return False
+
+
 class _ConnectorThread:
     """The connector's thread, and a stop that actually stops it.
 
@@ -532,6 +562,9 @@ class _WindowLoop:
         self._requests: "queue.Queue" = queue.Queue()
         self._lock = threading.Lock()
         self._window = None
+        # Held between "a worker decided to open a window" and "that window is
+        # up or has failed". present() alone cannot cover that gap - see claim().
+        self._opening = False
         self._notify = notify
 
     def open(self, url: str) -> None:
@@ -541,6 +574,33 @@ class _WindowLoop:
         """Whether a window is up. Safe from any thread."""
         with self._lock:
             return self._window is not None
+
+    def claim(self) -> bool:
+        """Take the right to open the one window. False if someone has it.
+
+        present() is not enough on its own, and the gap is not theoretical.
+        Minting a ticket is a network round trip, and _window is only set at
+        the far end of it, inside _show on the main thread. Two Opens close
+        together - two double-clicks, which is what a tray icon invites - both
+        see present() False, and both mint. TicketStore.mint replaces a
+        device's outstanding ticket, so the first ticket is dead before its
+        window ever redeems it: window one lands on the login page, and window
+        two only appears once window one is closed. That is precisely the
+        outcome the ticket exists to prevent, produced by clicking twice.
+
+        So the claim is taken *before* the mint, and released by whoever
+        finishes the attempt.
+        """
+        with self._lock:
+            if self._window is not None or self._opening:
+                return False
+            self._opening = True
+            return True
+
+    def release(self) -> None:
+        """Give the claim back after an attempt that never reached a window."""
+        with self._lock:
+            self._opening = False
 
     def focus(self) -> None:
         """Bring the open window forward, best effort, from any thread.
@@ -595,16 +655,20 @@ class _WindowLoop:
             # the rider's own browser is the same credential in a different
             # window, not a wider one.
             log.warning("opening a window failed: %s", exc)
+            with self._lock:
+                self._opening = False
             self._notify("wattracker", f"{exc} Opening your browser instead.")
             window_module.open_in_browser(url)
             return
         with self._lock:
             self._window = window
+            self._opening = False
         try:
             window.run()
         finally:
             with self._lock:
                 self._window = None
+                self._opening = False
             try:
                 window.destroy()
             except Exception:
@@ -612,27 +676,32 @@ class _WindowLoop:
 
 
 def _run_with_tray(connector: Connector, settings: dict) -> int:
-    """Start the three threads, and take them down in the right order."""
-    global _instance_handle
-    from . import autostart, tray_win32, webview as window_module
+    """Start the three threads, and take them down in the right order.
 
-    may_run, _instance_handle = _claim_single_instance()
-    if not may_run:
-        # Distinct from the server's one-per-account rule: this one is about
-        # two copies on one desktop, and the running one is perfectly good.
-        log.info("a connector is already running in this session; exiting")
-        tray_win32.signal_existing_instance()
-        return 0
+    The single-instance mutex is *not* claimed here; main() has already done
+    it, before any window went on the screen. See _claim_or_signal.
+    """
+    from . import autostart, tray_win32, webview as window_module
 
     # Only ever repoints an entry the rider already asked for, at the one path
     # that is known to be right: the executable currently running.
     autostart.refresh()
 
-    windows = _WindowLoop(notify=lambda *a, **k: tray.notify(*a, **k))
+    # Bound before the callables that close over them. Both of these used to be
+    # assigned below their own uses - legal, because nothing calls a tray
+    # callback until the pump is running, but it makes the construction order
+    # load-bearing and silent about it: reorder two lines and the failure is a
+    # NameError inside a tray worker, nowhere near the edit. The one remaining
+    # forward reference is `windows`, which is genuine - the tray's callbacks
+    # need it and it needs the tray's notify - and it is bound two lines later.
+    connector_thread = _ConnectorThread(connector)
 
     def _open_window() -> None:
         """The tray's Open, on one of its workers, so it may take its time."""
-        if windows.present():
+        if not windows.claim():
+            # Either a window is up or another worker is already minting for
+            # one. Both mean this click is answered by the window that is
+            # coming, and no second ticket is spent invalidating the first.
             windows.focus()
             return
         try:
@@ -641,6 +710,7 @@ def _run_with_tray(connector: Connector, settings: dict) -> int:
             # A revoked device and an unreachable server are different
             # problems with different fixes, and the message already says
             # which one this is. Showing it is the whole point of a tray.
+            windows.release()
             log.warning("could not open a session: %s", exc)
             tray.notify("wattracker", str(exc), level="warning")
             return
@@ -655,7 +725,7 @@ def _run_with_tray(connector: Connector, settings: dict) -> int:
     tray = tray_win32.TrayIcon(
         status=connector.status, on_open=_open_window, on_quit=_quit
     )
-    connector_thread = _ConnectorThread(connector)
+    windows = _WindowLoop(notify=tray.notify)
 
     def _pump() -> None:
         try:
@@ -737,6 +807,13 @@ def main(argv: Optional[List[str]] = None) -> int:
         "activities_dir": args.activities_dir or stored.get("activities_dir"),
         "workouts_dir": args.workouts_dir or stored.get("workouts_dir"),
     }
+    if _tray_wanted(args):
+        if os.name != "nt":
+            _fatal("--tray needs Windows; run with --headless on this machine.")
+            return 2
+        if not _claim_or_signal():
+            return 0
+
     missing = [k for k in ("server", "token") if not settings[k]]
     if missing and _setup_wanted(args):
         paired, asked = _pair_interactively(settings)
@@ -776,9 +853,8 @@ def main(argv: Optional[List[str]] = None) -> int:
         status=ConnectorStatus(),
     )
     if _tray_wanted(args):
-        if os.name != "nt":
-            _fatal("--tray needs Windows; run with --headless on this machine.")
-            return 2
+        # Windows-ness and the single instance were both settled above, before
+        # anything was drawn on the screen.
         return _run_with_tray(connector, settings)
 
     try:
