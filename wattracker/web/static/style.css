@@ -447,7 +447,7 @@ details summary { cursor: pointer; color: var(--accent); margin: 0.5rem 0; }
 .cal-head { display: flex; align-items: center; justify-content: space-between; gap: var(--sp-4); }
 table.calendar { table-layout: fixed; }
 table.calendar th { text-align: center; }
-.cal-cell { height: 90px; vertical-align: top; border: 1px solid var(--surface-border);
+.cal-cell { height: 110px; vertical-align: top; border: 1px solid var(--surface-border);
     padding: calc(var(--sp-1) * .75); }
 .cal-cell.other-month { opacity: 0.4; }
 .cal-day { font-size: 0.75rem; color: var(--muted); }
@@ -480,7 +480,7 @@ table.calendar th { text-align: center; }
 /* The swap, spelled out: what the day used to be, struck through, with an
    arrow down to what it is now. Both lines are held to the secondary
    cell-text scale with line-height 1 to keep the cost down, but it is still
-   two lines (~20px, ~30px when a long old name wraps) and the 90px on
+   two lines (~20px, ~30px when a long old name wraps) and the 110px on
    .cal-cell is a td minimum, not a cap - so an adapted day DOES grow its
    week row. That is deliberate: the row growing is what keeps the new name
    visible. Don't "fix" it with overflow: hidden or a max-height, which would
