@@ -271,12 +271,21 @@ python -m PyInstaller --clean --noconfirm packaging\wattracker-connector.spec
 python packaging\smoke_frozen_connector.py dist\WattrackerConnector.exe
 ```
 
-Three things worth knowing about the exe specifically:
+Four things worth knowing about the exe specifically:
 
+- **It asks for the pairing itself.** A copy that has never been paired opens a
+  small window for the server address and the token instead of the command line
+  above — that one is for the pip install, and the exe is a file people
+  double-click. Cancel it and nothing is saved. `--headless` skips the window
+  and keeps the old behaviour of exiting 2 with the instructions, which is what
+  the packaging smoke test drives.
 - **It has no console**, so diagnostics go to `connector.log` beside its config
   (`%LOCALAPPDATA%\wattracker-connector\`), owner-only. Use the pip console
   script when you want output in a terminal, or `--headless` to run the frozen
-  build without the tray.
+  build without the tray. Note that `%LOCALAPPDATA%` is per-process: pair the
+  exe from a normal shell or from Explorer, because a terminal running inside a
+  packaged app (an MSIX container) writes its config into that app's private
+  `LocalCache` and no ordinary launch will ever find it again.
 - **Autostart is one `HKEY_CURRENT_USER` value**, written only when you toggle
   it on and deleted when you toggle it off. No service, no scheduled task, no
   elevation, and the application installer is not involved at all.

@@ -17,6 +17,8 @@ from wattracker_connector import config as connector_config
 from wattracker_connector.__main__ import (
     _ConnectorHandler,
     _ConnectorStreamHandler,
+    _fatal,
+    _pair_interactively,
     _SecretRedactingFilter,
     _configure_logging,
     forget_secrets,
@@ -382,3 +384,142 @@ def test_a_record_that_cannot_be_scrubbed_loses_its_traceback_too(
     rendered = logging.Formatter().format(record)
     assert TOKEN not in rendered
     assert "could not be redacted" in rendered
+
+
+# --------------------------------------------- failing where it can be seen
+def test_a_startup_failure_with_no_stderr_is_shown_in_a_dialog(
+    connector_dir, monkeypatch
+):
+    """The windowed build's only way to say anything before the tray exists.
+
+    Found the hard way: a frozen connector whose config file was somewhere it
+    could not see printed to a stderr that was None, logged to a file nobody
+    had been told about, and exited 2. What the rider saw was an executable
+    that flashes and vanishes.
+    """
+    _configure_logging(False)
+    monkeypatch.setattr(sys, "stderr", None)
+    monkeypatch.setattr(os, "name", "nt")
+
+    shown = []
+
+    class _FakeUser32:
+        def MessageBoxW(self, hwnd, text, caption, flags):
+            shown.append((text, caption, flags))
+            return 1
+
+    import ctypes
+
+    monkeypatch.setattr(ctypes, "WinDLL", lambda *a, **k: _FakeUser32(),
+                        raising=False)
+
+    _fatal("Missing: server, token.")
+
+    assert shown and shown[0][0] == "Missing: server, token."
+    # And the log still gets it, because that is what a rider gets asked for.
+    assert "Missing: server, token." in _log_text(connector_dir)
+
+
+def test_a_startup_failure_with_a_stderr_shows_no_dialog(connector_dir, capsys):
+    """A console run and the packaging smoke test must never block on a modal.
+
+    smoke_frozen_connector.py drives the same binary with pipes attached and
+    reads the exit code; a dialog there is a hang, which is the failure mode
+    this whole file exists to keep out of the frozen build.
+    """
+    _configure_logging(False)
+
+    import ctypes
+
+    def _refuse(*_args, **_kwargs):
+        raise AssertionError("no dialog when there is a stream to print to")
+
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(ctypes, "WinDLL", _refuse, raising=False)
+        _fatal("Missing: server, token.")
+
+    assert "Missing: server, token." in capsys.readouterr().err
+    assert "Missing: server, token." in _log_text(connector_dir)
+
+
+# ------------------------------------------------- the unpaired frozen build
+def test_a_cancelled_setup_window_exits_without_a_second_dialog(
+    connector_dir, monkeypatch
+):
+    """They just closed the window that asked. Saying it again is nagging."""
+    from wattracker_connector import setup_win32
+
+    monkeypatch.setattr(os, "name", "nt")
+    monkeypatch.setattr(setup_win32, "prompt_for_settings", lambda initial: None)
+
+    assert main(["--tray"]) == 2
+    log = _log_text(connector_dir)
+    assert "cancelled" in log
+    assert "Missing" not in log
+
+
+def test_a_setup_window_that_cannot_open_falls_back_to_the_instructions(
+    connector_dir, monkeypatch
+):
+    """No window means the rider has been told nothing at all yet."""
+    from wattracker_connector import setup_win32
+
+    def _refuse(_initial):
+        raise setup_win32.SetupUnavailable("no desktop")
+
+    monkeypatch.setattr(os, "name", "nt")
+    monkeypatch.setattr(setup_win32, "prompt_for_settings", _refuse)
+
+    assert main(["--tray"]) == 2
+    log = _log_text(connector_dir)
+    assert "Missing: server, token" in log
+
+
+def test_a_setup_window_that_raises_is_not_what_kills_the_connector(
+    connector_dir, monkeypatch
+):
+    """A broken dialog must degrade to the old behaviour, not to a traceback."""
+    from wattracker_connector import setup_win32
+
+    def _explode(_initial):
+        raise RuntimeError("CreateWindowExW said no")
+
+    monkeypatch.setattr(setup_win32, "prompt_for_settings", _explode)
+    _configure_logging(False)
+
+    assert _pair_interactively({}) == (None, False)
+    assert "the setup window failed" in _log_text(connector_dir)
+
+
+def test_a_pairing_from_the_window_is_saved_and_redacted(connector_dir, monkeypatch):
+    """What the window returns has to survive a restart, and not land in the log."""
+    from wattracker_connector import setup_win32
+
+    # "nt" so main() reaches the tray branch rather than refusing it; the ACL
+    # helper underneath save() is a best-effort icacls that is simply absent
+    # off Windows, and swallows its own OSError.
+    monkeypatch.setattr(os, "name", "nt")
+    monkeypatch.setattr(
+        setup_win32, "prompt_for_settings",
+        lambda initial: {"server": "http://192.168.1.9:8000", "token": TOKEN},
+    )
+    # Stop main() before it dials out; pairing is all this test is about.
+    monkeypatch.setattr(
+        "wattracker_connector.__main__._tray_wanted",
+        lambda args: True,
+    )
+    monkeypatch.setattr(
+        "wattracker_connector.__main__._setup_wanted",
+        lambda args: True,
+    )
+    monkeypatch.setattr(
+        "wattracker_connector.__main__._run_with_tray",
+        lambda connector, settings: 0,
+    )
+
+    assert main([]) == 0
+    saved = connector_config.load()
+    assert saved["server"] == "http://192.168.1.9:8000"
+    assert saved["token"] == TOKEN
+    # Registered on the way through, so the log never carries it.
+    assert TOKEN not in _log_text(connector_dir)
