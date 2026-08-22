@@ -36,7 +36,7 @@ def test_calendar_status_colors_are_derived_from_tokens():
 def test_calendar_rhythm_uses_tokens_without_changing_footprint():
     css = _calendar_css()
 
-    assert "height: 90px" in _rule(css, ".cal-cell")
+    assert "height: 110px" in _rule(css, ".cal-cell")
     assert "grid-template-columns: minmax(0, 1fr) 280px" in css
     assert ".cal-main { min-width: 0; overflow-x: auto; }" in css
     assert "padding: calc(var(--sp-1) * .75)" in _rule(css, ".cal-cell")
