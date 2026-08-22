@@ -28,12 +28,13 @@ import types
 
 import pytest
 
-from wattracker_connector import tray_win32, webview
+from wattracker_connector import setup_win32, tray_win32, webview
 from wattracker_connector.__main__ import (
     _MUTEX_NAME,
     _claim_single_instance,
     _ConnectorThread,
     _parser,
+    _setup_wanted,
     _tray_wanted,
     _WindowLoop,
 )
@@ -252,6 +253,30 @@ def test_a_reconnect_does_not_balloon_every_time(tray):
         tray._refresh()
 
     assert not tray._balloons
+
+
+# ------------------------------------------------------------------- pairing
+def test_the_setup_window_imports_anywhere_and_refuses_elsewhere(monkeypatch):
+    """Same bargain the tray strikes: importable on the suite's CI, refuses there."""
+    monkeypatch.setattr(os, "name", "posix")
+    with pytest.raises(setup_win32.SetupUnavailable):
+        setup_win32.prompt_for_settings({})
+
+
+def test_headless_never_opens_the_setup_window():
+    """A dialog here would hang packaging/smoke_frozen_connector.py.
+
+    That script runs an unpaired binary with --headless and reads its exit
+    code; a modal window waiting for a click is exactly the hang it exists to
+    turn into a failure, and it would be doing it to itself.
+    """
+    assert _setup_wanted(_parser().parse_args(["--headless"])) is False
+    assert _setup_wanted(_parser().parse_args(["--headless", "--tray"])) is False
+
+
+@windows_only
+def test_an_explicit_tray_run_may_ask_for_the_pairing():
+    assert _setup_wanted(_parser().parse_args(["--tray"])) is True
 
 
 # -------------------------------------------------------------------- the menu

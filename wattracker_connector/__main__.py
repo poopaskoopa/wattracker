@@ -314,7 +314,41 @@ _SMOKE_IMPORTABLE = ("bleak", "webviewpy")
 # riders with two trainers. The server's one-connector-per-*account* rule is a
 # different rule, enforced at the other end, and shows up here as _Replaced.
 _MUTEX_NAME = r"Local\wattracker-connector"
+
 _ERROR_ALREADY_EXISTS = 183
+
+# MB_OK | MB_ICONERROR, plus the two flags that stop the dialog opening behind
+# whatever the rider was looking at when they double-clicked us.
+_MB_STARTUP_ERROR = 0x0 | 0x10 | 0x10000 | 0x40000
+
+
+def _fatal(message: str) -> None:
+    """Say why we are not starting, somewhere the rider can actually see it.
+
+    The frozen build is windowed, so ``print`` to a stderr that is None is a
+    silent no-op and the log file is somewhere they have to be told about -
+    by an icon that, in exactly this situation, never appears. The result is
+    an executable that flashes and vanishes, which reads as a broken download
+    rather than as a connector that has not been paired yet.
+
+    So: the log always, stderr when there is one, and a message box only when
+    there is not - a console run and the packaging smoke test both have a
+    stream to read and must not be left waiting on a modal dialog.
+    """
+    log.error("%s", message)
+    print(message, file=sys.stderr)
+    if sys.stderr is not None or os.name != "nt":
+        return
+    try:
+        import ctypes
+
+        user32 = ctypes.WinDLL("user32", use_last_error=True)
+        user32.MessageBoxW(None, message, "wattracker connector",
+                           _MB_STARTUP_ERROR)
+    except Exception:
+        # A connector that cannot even complain is still allowed to exit.
+        log.warning("could not show the startup error", exc_info=True)
+
 
 # How long the connector is given to notice a stop before it is cancelled, and
 # how long the whole shutdown may take. Both are short: this is a rider who has
@@ -343,6 +377,42 @@ def _tray_wanted(args) -> bool:
     if args.tray:
         return True
     return bool(getattr(sys, "frozen", False))
+
+
+def _setup_wanted(args) -> bool:
+    """Whether an unpaired run may ask for the pairing, rather than explain it.
+
+    The same test as the tray, and for the same reason: this is the build that
+    a rider double-clicks, so it is the build with a desktop to ask on and no
+    console to be told on. ``--headless`` excludes itself, which is what keeps
+    packaging/smoke_frozen_connector.py's unpaired check reading an exit code
+    instead of waiting on a dialog nobody is there to dismiss.
+    """
+    return _tray_wanted(args) and os.name == "nt"
+
+
+def _pair_interactively(settings: dict):
+    """Run the setup window. Returns ``(settings_or_None, was_asked)``.
+
+    The second half of that pair is what separates a rider who closed the
+    window from a desktop that could not show one, and they want opposite
+    endings: the first has just been told what the connector needs and chose
+    not to give it, so telling them again in a second dialog is nagging; the
+    second has been told nothing at all, and falls back to the message an
+    unpaired connector has always printed.
+
+    Never fatal on its own either way. A window that will not open is a reason
+    to explain, not a reason to crash.
+    """
+    from . import setup_win32
+
+    try:
+        return setup_win32.prompt_for_settings(settings), True
+    except setup_win32.SetupUnavailable as exc:
+        log.warning("could not open the setup window: %s", exc)
+    except Exception:
+        log.exception("the setup window failed")
+    return None, False
 
 
 def _claim_single_instance(name: str = _MUTEX_NAME):
@@ -649,6 +719,18 @@ def main(argv: Optional[List[str]] = None) -> int:
         "workouts_dir": args.workouts_dir or stored.get("workouts_dir"),
     }
     missing = [k for k in ("server", "token") if not settings[k]]
+    if missing and _setup_wanted(args):
+        paired, asked = _pair_interactively(settings)
+        if paired:
+            settings.update(paired)
+            redact_secret(settings["token"])
+            save(settings)
+            log.info("paired from the setup window; saved to %s", config_path())
+            missing = []
+        elif asked:
+            # They saw the two questions and closed the window. Nothing to add.
+            log.info("the setup window was cancelled; nothing was saved")
+            return 2
     if missing:
         # Named explicitly rather than "invalid configuration": the first-run
         # experience is someone pasting a token, and they should be told which
@@ -658,11 +740,7 @@ def main(argv: Optional[List[str]] = None) -> int:
             "Settings page, then run:\n"
             "  wattracker-connector --server http://SERVER:8000 --token TOKEN --save"
         )
-        print(message, file=sys.stderr)
-        # Logged as well as printed, because the build this matters most for
-        # is the windowed one, where ``print`` to a stream that is None is a
-        # silent no-op and the log file is the only place anyone can read it.
-        log.error("%s", message)
+        _fatal(message)
         return 2
 
     if args.save:
@@ -680,10 +758,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     )
     if _tray_wanted(args):
         if os.name != "nt":
-            print(
-                "--tray needs Windows; run with --headless on this machine.",
-                file=sys.stderr,
-            )
+            _fatal("--tray needs Windows; run with --headless on this machine.")
             return 2
         return _run_with_tray(connector, settings)
 
