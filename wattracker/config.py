@@ -36,6 +36,13 @@ def _restrict_windows_acl(path: str, is_dir: bool) -> None:
     argv is passed as a list (no ``shell=True``) so a data-dir path containing
     spaces stays a single argument and nothing is shell-interpreted. Best-effort:
     it must never crash the app, mirroring the chmod-can-fail contract.
+
+    CREATE_NO_WINDOW because the connector's frozen build is windowed and has
+    no console of its own: without it Windows gives every ``icacls`` child a
+    brand new console, and the rider watches half a dozen of them flash open
+    and shut each time the tray starts. Fetched with ``getattr`` because the
+    flag exists only on Windows, and the tests reach this function by
+    monkeypatching ``os.name`` on machines where it does not.
     """
     try:
         user = getpass.getuser()
@@ -51,6 +58,7 @@ def _restrict_windows_acl(path: str, is_dir: bool) -> None:
             ["icacls", path, "/inheritance:r", "/grant:r", grant],
             check=True,
             capture_output=True,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
         )
     except (subprocess.SubprocessError, OSError, ImportError):
         _log.debug("could not set owner-only ACL on %s", path, exc_info=True)
