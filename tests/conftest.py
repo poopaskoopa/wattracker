@@ -47,6 +47,17 @@ def isolated_env(tmp_path, monkeypatch):
         monkeypatch.setenv("PLAYWRIGHT_BROWSERS_PATH", _PLAYWRIGHT_CACHE)
     monkeypatch.setenv("WATTRACKER_DATA_DIR", str(data_dir))
     monkeypatch.setenv("WATTRACKER_DB", str(tmp_path / "test.db"))
+    # The connector keeps its own directory, and redirecting HOME does not
+    # move it on Windows: wattracker_connector.config.config_dir reads
+    # LOCALAPPDATA there, which nothing above touches. So a test that starts a
+    # ride through the connector's real handlers - conftest_connector's
+    # attach_connector builds a BleState with the default buffer - wrote its
+    # ride-buffer.jsonl into the rider's own directory, where the next real
+    # connect would find it and upload it as their ride. On POSIX the same
+    # path lands under the redirected HOME, which is why CI never saw it.
+    monkeypatch.setenv(
+        "WATTRACKER_CONNECTOR_DIR", str(tmp_path / "connector-config")
+    )
     # Ensure no ambient config leaks in.
     monkeypatch.setenv("WATTRACKER_SECRET", "test-secret-key")
     # Keep the suite deterministic: no background scan task, and Zwift

@@ -9,6 +9,7 @@ up exactly where the last one stopped.
 from __future__ import annotations
 
 import asyncio
+import datetime
 import logging
 import random
 from typing import Callable, Dict, Optional
@@ -69,6 +70,15 @@ class ConnectorStatus:
         self.last_error: Optional[str] = None
         self.last_connected_at: Optional[str] = None
         self.server_url: Optional[str] = None
+        # Set once ``run_forever`` has returned, which it only does when
+        # nothing further will be attempted. The distinction the tray draws is
+        # between "not connected, trying" and "not connected, and that is the
+        # end of it" - two states that look identical from ``connected`` alone
+        # and want very different icons.
+        self.stopped = False
+        # Filled in only when stopping was not the rider's own doing, with
+        # something they can act on. None after a quit.
+        self.stopped_reason: Optional[str] = None
 
 
 def websocket_url(server_url: str) -> str:
@@ -159,6 +169,14 @@ class Connector:
                 # a network problem.
                 self.status.connected = False
                 self.status.last_error = str(exc)
+                # The close frame's own text says "4409" and nothing a rider
+                # can use, and the tray has no log to read - so the sentence
+                # that explains this is put where the tray will find it.
+                self.status.stopped_reason = (
+                    "Another connector has taken this account over. Only one "
+                    "connector may run per account: quit the other one, or "
+                    "pair this machine as its own device."
+                )
                 log.error(
                     "another connector has taken over this account - stopping. "
                     "Only one connector may run per account; quit the other "
@@ -187,6 +205,9 @@ class Connector:
         # back even if a ride was in progress: nothing is going to pick it up.
         # The buffer survives, and goes up the next time this starts.
         await self.ble.teardown()
+        # Definitive is exactly what the tray needs to know: until this, a
+        # disconnected connector is one that is still trying.
+        self.status.stopped = True
 
     async def _session(self) -> None:
         # Imported here, not at module scope, so the rest of this package
@@ -228,6 +249,12 @@ class Connector:
                     )
                 self.status.connected = True
                 self.status.last_error = None
+                # Local time, and a string rather than a timestamp: its only
+                # consumer is a tray menu line, and formatting it here keeps
+                # the reader on the other thread doing nothing but reading.
+                self.status.last_connected_at = datetime.datetime.now().isoformat(
+                    timespec="seconds"
+                )
                 log.info("connected")
                 # First thing after every connect, before serving anything: a
                 # ride buffered while we were away is the most perishable

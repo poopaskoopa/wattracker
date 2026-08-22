@@ -67,6 +67,43 @@ def test_windows_file_builds_owner_only_icacls_argv(tmp_path, monkeypatch):
     assert calls[0][2].get("shell", False) is False
 
 
+def test_windows_icacls_gets_no_console_of_its_own(tmp_path, monkeypatch):
+    """The connector's frozen build is windowed, so an icacls child would flash.
+
+    A GUI process has no console to lend, so Windows gives each console child a
+    brand new one. _restrict runs on every config_dir() call, so the rider sees
+    a burst of console windows open and shut on each launch - which reads as a
+    crash, and is how a silently-exiting connector was misdiagnosed for a
+    session. CREATE_NO_WINDOW is the whole fix.
+    """
+    monkeypatch.setattr(os, "name", "nt")
+    monkeypatch.setattr(subprocess, "CREATE_NO_WINDOW", 0x08000000, raising=False)
+    calls = _capture_run(monkeypatch)
+
+    f = tmp_path / "connector.json"
+    f.write_text("{}")
+    config._restrict(str(f), 0o600, is_dir=False)
+
+    assert calls[0][2].get("creationflags") == 0x08000000
+
+
+def test_windows_icacls_creationflags_survive_a_missing_flag(tmp_path, monkeypatch):
+    """The flag is Windows-only, and these tests fake Windows on POSIX.
+
+    Reading it off the module with getattr rather than naming it directly is
+    what keeps this file runnable on the machines most of the suite runs on.
+    """
+    monkeypatch.setattr(os, "name", "nt")
+    monkeypatch.delattr(subprocess, "CREATE_NO_WINDOW", raising=False)
+    calls = _capture_run(monkeypatch)
+
+    f = tmp_path / "connector.json"
+    f.write_text("{}")
+    config._restrict(str(f), 0o600, is_dir=False)
+
+    assert calls[0][2].get("creationflags") == 0
+
+
 def test_windows_dir_gets_inheritable_owner_only_grant(tmp_path, monkeypatch):
     monkeypatch.setattr(os, "name", "nt")
     calls = _capture_run(monkeypatch)

@@ -80,6 +80,30 @@ def list_devices(user_id: int, path: Optional[str] = None) -> List[dict]:
     return db.list_connector_devices(user_id, path=path)
 
 
+def device_exists(
+    user_id: object, device_id: object, path: Optional[str] = None
+) -> bool:
+    """Whether this user still has that paired machine.
+
+    The session layer's question, not the connector's: a browser session opened
+    by a connector ticket is only as alive as the device that opened it, and a
+    signed session cookie has no server-side record for ``revoke`` to reach
+    into. See ``AuthMiddleware`` - without this check, revoking a stolen laptop
+    kills its token and leaves the window that token opened working for the
+    fortnight the cookie is valid.
+
+    Reads the same list the Settings page shows rather than adding a query: a
+    rider has a handful of machines, and a second source of truth about what
+    "paired" means is how the two answers come apart later.
+    """
+    try:
+        wanted = int(device_id)
+        owner = int(user_id)
+    except (TypeError, ValueError):
+        return False
+    return any(row.get("id") == wanted for row in list_devices(owner, path=path))
+
+
 def revoke(user_id: int, device_id: int, path: Optional[str] = None) -> bool:
     """Unpair a machine. Its token stops resolving immediately.
 

@@ -1,5 +1,6 @@
 """Platform-neutral unit tests for the Windows DPAPI wrapper."""
 import hashlib
+import re
 from pathlib import Path
 
 import pytest
@@ -89,7 +90,17 @@ def test_release_workflow_scopes_signing_secrets_to_sign_step():
     # The release build must install the BLE extra (so the shipped binary can
     # talk to hardware) and the [package] extra, which is where the PyInstaller
     # pin lives - inlining a version here would let Windows and macOS drift.
-    assert '".[dev,ble,package]"' in workflow
+    # The extras are checked individually rather than as one exact string: this
+    # job now builds the connector as well as the app, so the set grows, and a
+    # literal match would fail for the wrong reason every time it does.
+    extras = re.search(r'pip install [^\n]*"\.\[([^\]]+)\]"', workflow)
+    assert extras, "release build must install the project with extras"
+    installed = set(extras.group(1).split(","))
+    assert {"dev", "ble", "package"} <= installed, installed
+    # The connector's own halves: the websockets client it dials with, and the
+    # WebView binding its tray window uses. Both are collected best-effort by
+    # the spec, so a build without them installed silently loses a feature.
+    assert {"connector", "webview"} <= installed, installed
     assert "pyinstaller==" not in workflow
 
 

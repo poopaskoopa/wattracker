@@ -6,6 +6,8 @@ in, that executable roughly quadruples and PyInstaller's exclude list silently
 stops holding. Catching it here is much cheaper than catching it on a build
 machine.
 """
+import importlib.util
+import pathlib
 import subprocess
 import sys
 import textwrap
@@ -41,14 +43,23 @@ def test_websocket_url_rejects_unusable_values(bad):
 
 
 # ---------------------------------------------------------- import weight
-# Everything the frozen connector must NOT pull in. PyInstaller's spec excludes
-# these; if an import sneaks back the exclude list stops matching reality and
-# the build either bloats or breaks at runtime.
-FORBIDDEN = [
-    "numpy", "pandas", "scipy", "fastapi", "starlette", "uvicorn",
-    "anthropic", "jinja2", "matplotlib", "fitdecode", "keyring",
-    "wattracker.db", "wattracker.server", "wattracker.ingest",
-]
+# Everything the frozen connector must NOT pull in. packaging/
+# wattracker-connector.spec passes this same list to PyInstaller's excludes; if
+# an import sneaks back, the exclude list stops matching reality and the build
+# either bloats or breaks at runtime.
+#
+# Loaded from the one definition rather than repeated here, and loaded by path
+# because the directory is named "packaging" - so is an installed PyPI
+# distribution, and a plain import would find that one instead.
+_EXCLUDES_PATH = (
+    pathlib.Path(__file__).parents[1] / "packaging" / "_connector_excludes.py"
+)
+_EXCLUDES_SPEC = importlib.util.spec_from_file_location(
+    "_wattracker_connector_excludes", _EXCLUDES_PATH
+)
+_EXCLUDES = importlib.util.module_from_spec(_EXCLUDES_SPEC)
+_EXCLUDES_SPEC.loader.exec_module(_EXCLUDES)
+FORBIDDEN = _EXCLUDES.FORBIDDEN
 
 
 def _import_check(module: str) -> subprocess.CompletedProcess:
@@ -172,3 +183,96 @@ def test_the_buffered_ride_upload_does_not_follow_redirects(tmp_path):
     # A 3xx is not a definite answer, so the ride is still there for next time.
     assert result is None
     assert store.load() is not None
+
+
+# ----------------------------------------------------- what a session records
+def test_a_connection_records_the_moment_it_started(monkeypatch):
+    """The tray's "Since 14:32" line, and the only place it is ever written.
+
+    ConnectorStatus is the connector's whole public face - one thread writes
+    it, another draws it - so a field nobody fills is a menu line that reads
+    "Since ?" forever, on a machine with no console to ask instead.
+    """
+    import asyncio
+    import json
+
+    from wattracker import rpc
+    from wattracker_connector import client as clientmod
+    from wattracker_connector.handlers import ConnectorConfig
+
+    monkeypatch.setattr(clientmod, "upload_pending", lambda *a, **k: None)
+    connector = clientmod.Connector(
+        server_url="http://server.invalid:8000", token="t",
+        config=ConnectorConfig(activities_dir=None, workouts_dir=None),
+    )
+    during = {}
+
+    class _Connection:
+        greeted = False
+
+        async def send(self, text):
+            pass
+
+        async def recv(self):
+            if not self.greeted:
+                self.greeted = True
+                return json.dumps(
+                    {"event": "hello", "protocol": rpc.PROTOCOL_VERSION}
+                )
+            during["connected"] = connector.status.connected
+            during["since"] = connector.status.last_connected_at
+            raise RuntimeError("the socket went away")
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *exc):
+            return False
+
+    class _Websockets:
+        def connect(self, url, **kwargs):
+            return _Connection()
+
+    with pytest.raises(RuntimeError):
+        asyncio.run(
+            connector._connected_session(_Websockets(), "ws://host:8000/connector/ws")
+        )
+
+    assert during["connected"] is True
+    assert during["since"], "nothing recorded when the connection came up"
+    # An ISO local timestamp: the tray shows the time out of it and nothing else.
+    assert during["since"][:2] == "20" and "T" in during["since"]
+    # And the session ending puts it back, without losing when it started.
+    assert connector.status.connected is False
+    assert connector.status.last_connected_at == during["since"]
+
+
+def test_no_test_can_write_into_the_riders_own_connector_directory():
+    """The sandbox that redirecting HOME does not give you.
+
+    ``config_dir`` reads LOCALAPPDATA on Windows, so the suite's HOME redirect
+    misses it entirely and anything the connector stores - the saved token, the
+    log, and above all the ride buffer - lands in the real directory. A ride
+    buffer left there is not inert: the next real connect uploads it as the
+    rider's ride. Asserted here rather than trusted, because the failure is
+    invisible on the platform CI runs on.
+    """
+    import os
+
+    from wattracker_connector import config as connector_config
+
+    directory = connector_config.config_dir()
+    assert os.environ.get("WATTRACKER_CONNECTOR_DIR"), (
+        "tests/conftest.py must sandbox the connector directory for every test"
+    )
+    assert directory == os.environ["WATTRACKER_CONNECTOR_DIR"]
+    # Not "is it under LOCALAPPDATA" - pytest's tmp_path lives there too, and
+    # that assertion would fail a correctly sandboxed run. The question is
+    # whether it is *the* directory a rider's connector uses.
+    if os.name == "nt":
+        root = os.environ.get("LOCALAPPDATA") or os.path.expanduser("~")
+    else:
+        root = os.environ.get("XDG_CONFIG_HOME") or os.path.join(
+            os.path.expanduser("~"), ".config"
+        )
+    assert directory != os.path.join(root, "wattracker-connector")

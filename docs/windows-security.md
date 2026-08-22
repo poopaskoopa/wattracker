@@ -148,6 +148,145 @@ would otherwise harvest the token. Pass `--token` once with `--save` and omit
 it afterwards: an argument is visible to every process on the machine, while
 the saved config file is written 0600.
 
+## The connector as a portable executable
+
+The connector also ships as one windowed `WattrackerConnector.exe`
+(`packaging/wattracker-connector.spec`), which changes three things about its
+security posture and nothing else.
+
+**A window that opens already logged in.** Double-clicking the tray icon shows
+the server's own web UI. The connector holds a device token, not a cookie, so
+it exchanges the token for a single-use ticket over the same
+bearer-authenticated HTTP path it already uses for buffered ride uploads
+(`POST /api/connector/session`), and the window spends that ticket once
+(`GET /connector/session?token=...`). The ticket is held only as a sha256 in
+memory, expires in 60 seconds, is redeemable once, and is dropped when the
+device is revoked.
+
+State this plainly: **a device token now escalates to a full web session.**
+That session can read the rider's whole history, change settings, revoke
+connector devices and take backups. It cannot change the account password,
+which has no route.
+
+Be precise about why that is accepted, because the obvious justification is
+wrong. The token grants read/write to the rider's Zwift folders **on its own
+machine**; the session's reach is wider. `wattracker/backend/remote.py` resolves
+the connector by `user_id` alone, and nothing about escalating requires an
+attached socket — so a token off a laptop that has been in a drawer for a year
+escalates to a session that drives whichever connector is attached *now*. The
+pre-merge review of PR #93 executed exactly that: a never-connected device
+enumerated a `.fit` file on a different machine's filesystem. The same session
+can also clear or overwrite the stored Zwift credentials.
+
+What makes the widening defensible is not that it grants nothing new — it does
+— but that it grants nothing **durable**, and that the alternative (a password
+prompt in a window a tray icon opened) teaches exactly the habit phishing
+depends on. A connector-derived session is stamped `via=connector` in the
+signed session cookie at redemption, and three routes refuse it: pairing
+another device (`POST /settings/connector`), rotating the calendar link
+(`POST /settings/calendar-feed`), and replacing the app-global — not per-user —
+Anthropic API key (the `anthropic_api_key` field of `POST /settings`). Each
+would otherwise leave behind a credential that revoking the device does not
+reach. Revoking is deliberately still allowed: it is the way out, and the rider
+who has lost a laptop may well be looking at the tray window of the machine
+still in front of them. Signing in with the password inside that window lifts
+the restriction, because a device token can neither obtain nor change a
+password.
+
+**The API-key refusal does not hold against `/register`, and that is a known
+gap.** Registration is unauthenticated by design — this is a single-user local
+app that has to let its first user in — and a successful registration drops the
+`via=connector` marker, because proving a password is what the marker exists to
+wait for. But the password proved at `/register` is a *new account's*, chosen by
+whoever is registering, not the rider's. So a connector session can register a
+throwaway account and, as that account, write the Anthropic key: the key is
+app-global rather than per-user, so it is the one setting a different `uid` can
+still reach. Device pairing and calendar-feed rotation are not reachable this
+way — both are per-user, and the new account is a different user.
+
+The mitigating half is that anyone who can reach the port can already register
+without a device token at all, so this is a pre-existing property of open
+registration rather than something the connector introduced. It is recorded
+here because the refusal above would otherwise read as stronger than it is. If
+open registration is ever closed, close this with it.
+
+Revocation reaches the session as well as the token, over **both** protocols.
+A session cookie is a signed blob with no server-side record, so
+`settings_connector_revoke` has nothing to delete; instead the cookie carries
+the `device_id` it came from and `AuthMiddleware` ends any connector session
+whose device is gone. Without that, revoking would kill the token and leave the
+window it opened working for the fortnight the cookie is valid.
+
+`AuthMiddleware` alone is not enough, and the reason generalises. It is a
+`BaseHTTPMiddleware`, and Starlette hands any scope that is not `http` straight
+to the application — so **no websocket route is dispatched through it**. For one
+commit that left `/ride/ws` authenticating on `user_id` alone: revoking cut the
+browser half and left the thief riding, driving whichever connector was
+attached at the time. The ride socket now runs the pairing check itself. Any
+new websocket route that authenticates on the session must do the same; there
+is no arrangement of middleware that will do it for them.
+
+The query parameter is
+named `token` rather than `ticket` deliberately: uvicorn logs the full request
+target and `calendarfeed`'s redaction filter only scrubs parameter names
+beginning `token`, so any other name would write live credentials to the
+access log in plaintext. Both ends have tests pinning that name.
+
+**Autostart is HKCU, opt-in, and nothing else.** The tray's "Start with
+Windows" toggle writes one value under
+`HKEY_CURRENT_USER\Software\Microsoft\Windows\CurrentVersion\Run` and deletes
+it when untoggled. Never HKLM, never a Windows service, never Task Scheduler —
+all three would ask for elevation, which is the promise this document makes
+everywhere else. The application installer stays clear of startup entries
+entirely (`tests/test_windows_installer.py` asserts `wattracker.iss` never
+mentions one), so autostart lives in the connector at runtime and the installer
+is untouched.
+
+One qualification to "writes only when toggled": every launch of the packaged
+executable checks whether an entry that already exists still names the file
+now running, and repoints it if not (`autostart.refresh`). It never creates
+one, never touches the key for a rider who has not opted in, and a connector
+running from a Python environment leaves the value alone entirely. Without it,
+moving the exe out of Downloads silently disables autostart — a failure with
+nothing to see anywhere.
+
+Only one connector runs per logon session, held by a `Local\`-scoped named
+mutex; a second launch tells the running icon and exits. `Local\` rather than
+`Global\` on purpose: two riders signed in to one machine are two riders with
+two trainers, and a machine-wide mutex would let either of them deny the other
+a connector. This is distinct from the server's one-connector-per-*account*
+rule, which is enforced at the other end and surfaces in the tray as a stopped
+icon explaining that another connector took the account over.
+
+The window's WebView2 profile is pointed at the connector's own config
+directory (`WEBVIEW2_USER_DATA_FOLDER`), which is already created owner-only.
+The default would be a folder beside the executable — which for a single
+portable file means browser profile data appearing wherever the rider dropped
+it, including a USB stick.
+
+Autostart is also what makes the trust-boundary work above load-bearing rather
+than theoretical: an unattended connector holds a token across reboots until
+somebody revokes it, so revocation closing the live socket — not merely the
+next connection — is the control that matters.
+
+**Unsigned, self-extracting, and autostarting is the worst profile for
+heuristics.** A onefile build re-extracts to `%TEMP%\_MEIxxxx` on every launch.
+That, plus an autostart entry, plus a held credential, is the shape antivirus
+software dislikes most, and there is no certificate yet
+(`packaging/sign-windows.ps1` is wired into the release job, which remains
+hard-disabled). Until then every connector binary in existence is unsigned, and
+comes from one of two places.
+
+A **local Windows build** should be treated as one: check the `.sha256`
+published beside it. A **CI artifact**, uploaded by `windows.yml` on a merge to
+`main`, has no checksum beside it and deliberately so — it would be generated
+by the same run that built the binary and travel in the same archive, which
+proves nothing a tampered run could not also forge. What stands in for it is
+the run itself: the artifact names the workflow run that produced it, that run
+names the commit, and the log shows the freeze and all four smoke checks. That
+is provenance rather than integrity, and it is not a substitute for signing.
+Neither source should be handed to anyone outside the people testing this.
+
 ## Installer lifecycle and compiler provenance
 
 The per-user installer never requests elevation, adds no firewall rule, and

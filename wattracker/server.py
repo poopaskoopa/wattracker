@@ -33,6 +33,7 @@ from fastapi.templating import Jinja2Templates
 from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.middleware.sessions import SessionMiddleware
 from starlette.middleware.trustedhost import TrustedHostMiddleware
+from starlette.requests import HTTPConnection
 
 from . import (
     auth,
@@ -41,6 +42,7 @@ from . import (
     config,
     connectorauth,
     connectorhub,
+    connectorsession,
     credstore,
     db,
     exporter,
@@ -538,8 +540,13 @@ class NoCacheStaticFiles(StaticFiles):
 # connector upload carries a bearer token and belongs to a process with no
 # browser, so a redirect to /login would be the wrong answer to a bad
 # credential - it checks its own and returns 401.
+# "/api/connector/session" and "/connector/session" are the two halves of the
+# tray window's login: the first is bearer-authenticated like the ride upload
+# above it, and the second authenticates itself from a single-use ticket and
+# then *creates* the session, so requiring one first would be circular.
 _EXEMPT = (
     "/login", "/register", calendarfeed.FEED_PATH, "/api/connector/ride",
+    "/api/connector/session", "/connector/session",
 )
 _EXEMPT_PREFIXES = ("/static", "/favicon", "/apple-touch-icon")
 
@@ -835,6 +842,89 @@ class IPv6TrustedHostMiddleware(TrustedHostMiddleware):
         )
 
 
+# How a session came to exist. Only connector_session_redeem sets it, so a
+# session carrying it is one a device token opened rather than one somebody
+# typed a password into - and the two are not entitled to the same things.
+#
+# The marker is not forgeable: SessionMiddleware base64s the session and signs
+# it with config.session_secret() (256 bits) through itsdangerous, so the
+# payload is readable by its holder but any edit invalidates the signature and
+# an unsigned cookie is not a session at all. Readable is fine; there is
+# nothing secret about the word "connector".
+SESSION_VIA = "via"
+VIA_CONNECTOR = "connector"
+# The device whose token opened the session, so revoking that device can end
+# the session too (see _connector_session_still_paired).
+SESSION_DEVICE_ID = "device_id"
+
+
+def _from_connector(conn: HTTPConnection) -> bool:
+    """Whether this session was opened by a device token rather than a password.
+
+    Typed on HTTPConnection, not Request: a WebSocket is one too, and the ride
+    socket has to ask this question for itself because no middleware can ask it
+    on the socket's behalf (see _connector_session_still_paired).
+    """
+    return conn.session.get(SESSION_VIA) == VIA_CONNECTOR
+
+
+def _promote_to_password_session(request: Request) -> None:
+    """Drop any connector provenance, because a password has just been proven.
+
+    Called from /login and /register. The reasoning is airtight for /login: a
+    rider who signs in inside the tray's own window is a rider who knows the
+    password, and a device token can neither obtain nor change one (every
+    writer of password_hash goes through db.set_password_hash, whose only route
+    callers are these two). Without this the restriction would be permanent for
+    that window, which is a UI that quietly stops working rather than a
+    security control.
+
+    It is NOT airtight for /register, and the difference is worth stating
+    rather than leaving for the next reader to find. The password proven there
+    is a brand-new account's, chosen by whoever is registering - so a connector
+    session can register a throwaway user and shed the marker without ever
+    knowing the rider's password. What that buys is bounded: pairing and the
+    calendar feed are per-user, and the new account is a different uid. The
+    app-global Anthropic key is the exception, and it is the reason this is
+    documented in docs/windows-security.md instead of being waved through.
+    Since registration is unauthenticated anyway, closing it here would not
+    close the hole - anyone who can reach the port can register regardless.
+    """
+    request.session.pop(SESSION_VIA, None)
+    request.session.pop(SESSION_DEVICE_ID, None)
+
+
+def _connector_session_still_paired(conn: HTTPConnection) -> bool:
+    """False only for a connector session whose device has been revoked.
+
+    A password session is never charged the lookup, so this costs nothing on
+    the ordinary path.
+
+    Every caller has to invoke this itself, and there is no way to arrange
+    otherwise. AuthMiddleware is a BaseHTTPMiddleware, whose __call__ hands any
+    scope that is not "http" straight to the app - so a websocket route is
+    never dispatched through it and cannot inherit this check. That is why the
+    parameter is an HTTPConnection: the ride socket calls it directly. A new
+    websocket route that authenticates on the session and forgets to is a
+    revocation bypass, which is exactly the hole this function was written to
+    close and exactly the hole it had for one commit.
+    """
+    if not _from_connector(conn):
+        return True
+    try:
+        return connectorauth.device_exists(
+            conn.session.get("user_id"), conn.session.get(SESSION_DEVICE_ID)
+        )
+    except Exception:
+        # An authorization check that cannot answer has to say no. The cost of
+        # being wrong here is one re-login; the cost of the other default is a
+        # revoked device keeping its session through a transient database error.
+        _log.warning(
+            "could not confirm the connector device behind a session", exc_info=True
+        )
+        return False
+
+
 class AuthMiddleware(BaseHTTPMiddleware):
     """Redirect unauthenticated requests to /login (except exempt paths)."""
 
@@ -842,6 +932,18 @@ class AuthMiddleware(BaseHTTPMiddleware):
         path = request.url.path
         exempt = path in _EXEMPT or any(path.startswith(p) for p in _EXEMPT_PREFIXES)
         if not exempt and not request.session.get("user_id"):
+            return RedirectResponse("/login", status_code=303)
+        if not exempt and not _connector_session_still_paired(request):
+            # The device that opened this window is gone. Clearing the session
+            # here is the only way revocation can reach it: the cookie is a
+            # signed blob with no server-side record, so settings_connector_
+            # revoke has nothing to delete. Without this, the Settings page
+            # tells the owner the token no longer works while the thief's
+            # window keeps reading their history - and keeps driving whichever
+            # connector is attached NOW, because RemoteBackend resolves by
+            # user_id alone, not by the device that asked.
+            _log.info("a connector session ended because its device was revoked")
+            request.session.clear()
             return RedirectResponse("/login", status_code=303)
         return await call_next(request)
 
@@ -1094,6 +1196,10 @@ def create_app() -> FastAPI:
     # one apparent address, and refusing would only lock out the connector
     # that is trying to reconnect. Visibility, not enforcement.
     app.state.connector_failures = CalendarFeedFailureCounter()
+    # Single-use tickets a connector exchanges its device token for, so the
+    # tray's window opens already logged in. In memory on purpose: one is worth
+    # a session and lives for a minute (see connectorsession).
+    app.state.connector_tickets = connectorsession.TicketStore()
     # uvicorn logs the full request target; keep feed tokens out of the log.
     calendarfeed.install_access_log_redaction()
 
@@ -1205,6 +1311,7 @@ def create_app() -> FastAPI:
             return templates.TemplateResponse(
                 request, "register.html", {"request": request, "error": err}
             )
+        _promote_to_password_session(request)
         request.session["user_id"] = user_id
         request.session["username"] = username
         return RedirectResponse("/", status_code=303)
@@ -1278,6 +1385,7 @@ def create_app() -> FastAPI:
                 _log.info("password rehash skipped: hashing at capacity")
             except Exception:
                 _log.warning("password rehash on login failed", exc_info=True)
+        _promote_to_password_session(request)
         request.session["user_id"] = user["id"]
         request.session["username"] = user["username"]
         return RedirectResponse("/", status_code=303)
@@ -2136,6 +2244,86 @@ def create_app() -> FastAPI:
         return JSONResponse(
             {"activity_id": activity_id, "duplicate": activity_id is None}
         )
+
+    @app.post("/api/connector/session")
+    async def connector_session_mint(request: Request):
+        """Trade a device token for a single-use ticket that opens a session.
+
+        The tray app shows this server's own web UI in a window. That UI is
+        session-cookie authenticated and the connector holds no cookie, so
+        something has to bridge the two - and it must not be "type your
+        password into a window a tray icon opened", which is a habit worth not
+        teaching.
+
+        Bearer-authenticated exactly like /api/connector/ride above, and for
+        the same reason: this is the connector talking. Deliberately HTTP
+        rather than a call over the open WebSocket, because the connector never
+        sends requests on that socket (see connector_ws) - the server owns
+        every decision, and this route keeps it that way.
+
+        Only the ticket is returned, never a URL. The server has no reliable
+        idea which address reaches it from the connector's machine
+        (_feed_base_url exists because that question is genuinely hard); the
+        connector knows, because it dialled in on it.
+        """
+        header = request.headers.get("authorization") or ""
+        scheme, _, token = header.partition(" ")
+        device = None
+        if scheme.lower() == "bearer" and token:
+            device = connectorauth.device_for_token(token.strip())
+        if device is None:
+            app.state.connector_failures.record_failure()
+            return JSONResponse({"error": "unauthorized"}, status_code=401)
+
+        ticket = app.state.connector_tickets.mint(
+            device["user_id"], device["username"], device["device_id"]
+        )
+        _log.info(
+            "connector '%s' took a session ticket", device["label"]
+        )
+        response = JSONResponse(
+            {"ticket": ticket, "expires_in": connectorsession.TICKET_TTL_S}
+        )
+        # The body is a live credential for the next minute.
+        response.headers["Cache-Control"] = "private, no-store"
+        return response
+
+    @app.get("/connector/session")
+    def connector_session_redeem(request: Request, token: str = ""):
+        """Spend a ticket and become logged in.
+
+        The parameter is named ``token`` on purpose, and renaming it would be a
+        security regression: uvicorn's access logger writes the whole request
+        target, and calendarfeed's redaction filter scrubs query parameters
+        whose name starts with "token". Called anything else, every ticket this
+        route ever receives would be written to the access log in plaintext.
+
+        A bad ticket redirects to /login rather than explaining itself. There
+        is nothing useful to tell a caller who did not have one, and the
+        rider's own failure case - a ticket that sat too long - is fixed by
+        double-clicking again.
+
+        The session is stamped with where it came from, and that stamp is what
+        keeps this route from being an escalation with no way back. A device
+        token is accepted as already compromised - that is the whole premise of
+        the Revoke button - so the session it opens must not be able to mint a
+        credential that outlives the device. See _from_connector and the
+        settings routes that consult it.
+        """
+        claim = app.state.connector_tickets.redeem(token)
+        if claim is None:
+            app.state.connector_failures.record_failure()
+            return RedirectResponse("/login", status_code=303)
+        request.session["user_id"] = claim["user_id"]
+        request.session["username"] = claim["username"]
+        request.session[SESSION_VIA] = VIA_CONNECTOR
+        request.session[SESSION_DEVICE_ID] = claim["device_id"]
+        _log.info(
+            "a connector window opened a session for user %s", claim["user_id"]
+        )
+        response = RedirectResponse("/", status_code=303)
+        response.headers["Cache-Control"] = "private, no-store"
+        return response
 
     @app.post("/api/activity/{activity_id}/rpe")
     def api_activity_rpe(
@@ -3562,7 +3750,8 @@ def create_app() -> FastAPI:
                       ftp_form_value: Optional[str] = None,
                       connector_message: Optional[str] = None,
                       connector_new_token: Optional[str] = None,
-                      connector_new_label: Optional[str] = None) -> dict:
+                      connector_new_label: Optional[str] = None,
+                      refusal_message: Optional[str] = None) -> dict:
         settings = db.get_user_settings(uid)
         return _ctx(
             request,
@@ -3608,6 +3797,10 @@ def create_app() -> FastAPI:
             connector_message=connector_message,
             connector_new_token=connector_new_token,
             connector_new_label=connector_new_label,
+            # Rendered as an alert at the top of the page, separately from the
+            # per-section messages: this one is about the session, not about
+            # the field the rider filled in.
+            refusal_message=refusal_message,
             zwift_creds_saved=credstore.credentials_saved(uid),
             zwift_cred_backend=credstore.storage_backend(),
             cred_message=cred_message,
@@ -3615,6 +3808,45 @@ def create_app() -> FastAPI:
             backup_message=backup_message,
             dir_message=dir_message,
             restore_cmd=_restore_command(),
+        )
+
+    # What a connector-opened session is refused, and why it is exactly this
+    # list. A device token is the credential this design accepts as already
+    # compromised - docs/windows-security.md points at the Revoke button as the
+    # answer to a stolen laptop - so the session it opens must not be able to
+    # leave a NEW credential behind that revoking the device does not reach.
+    # Three routes could:
+    #
+    #   POST /settings/connector       a second device token, of the attacker's
+    #                                  own, surviving revocation of the first
+    #   POST /settings/calendar-feed   the whole training calendar re-pointed at
+    #                                  a URL only the attacker holds
+    #   POST /settings (api key field) the Anthropic key, which is app-global
+    #                                  rather than per-user, so swapping it
+    #                                  sends every coaching request - prompts
+    #                                  included - to an account someone else owns
+    #
+    # Revoking is deliberately NOT on the list: it is the way out, and the rider
+    # who has lost a laptop may well be looking at the tray window of the
+    # machine still in front of them. Nor is the rest of POST /settings -
+    # pointing the app at the right folders is what the window is for.
+    _CONNECTOR_REFUSAL = (
+        "This window was opened by a connector device, so it cannot issue or "
+        "replace credentials. Sign in with your password first."
+    )
+
+    def _refuse_connector_session(request: Request, uid: int) -> Response:
+        """The refusal, rendered as the page the rider was already looking at.
+
+        403 rather than a redirect or a bare error: the caller asked for
+        something this session is not allowed to do, and the page says what to
+        do instead. A 500 would be the wrong answer to a request that is
+        perfectly well formed.
+        """
+        return templates.TemplateResponse(
+            request, "settings.html",
+            _settings_ctx(request, uid, False, refusal_message=_CONNECTOR_REFUSAL),
+            status_code=403,
         )
 
     def _validate_dir(
@@ -3729,8 +3961,24 @@ def create_app() -> FastAPI:
             profile_store.refresh(uid)
         except Exception:
             _log.warning("profile refresh after settings save failed", exc_info=True)
-        # The Anthropic API key is app-level (shared).
-        if anthropic_api_key:
+        # The Anthropic API key is app-level (shared), which is what makes it
+        # worth refusing here specifically: a connector-opened session that
+        # swapped it would point every coaching request this server makes,
+        # prompt contents and all, at an account somebody else owns - and
+        # revoking the device would not undo it. The rest of this route stays
+        # open on purpose; pointing the app at the right folders is exactly
+        # what the tray window exists for. See _CONNECTOR_REFUSAL.
+        refusal = False
+        if anthropic_api_key and _from_connector(request):
+            # Answered below with the same 403 the other two refusals use, and
+            # deliberately not by falling through to the ordinary "Settings
+            # saved." render: a page that says both that it saved and that it
+            # refused describes neither outcome, and 200 tells a script the
+            # write went through. The other fields on this form are still
+            # written first - pointing the app at the right folders is what the
+            # tray window is for, and only the app-global key is off limits.
+            refusal = True
+        elif anthropic_api_key:
             config.set_anthropic_api_key(anthropic_api_key)
         # Zwift account credentials: only saved when both fields are supplied;
         # the password is never redisplayed. Saving re-arms authenticated
@@ -3754,11 +4002,13 @@ def create_app() -> FastAPI:
                             "password are needed.")
         return templates.TemplateResponse(
             request, "settings.html",
-            _settings_ctx(request, uid, True, cred_message=cred_message,
+            _settings_ctx(request, uid, not refusal, cred_message=cred_message,
                           dir_message="; ".join(dir_msgs) or None,
                           ftp_message=ftp_message,
                           ftp_confirm_required=ftp_confirm_required,
-                          ftp_form_value=ftp if ftp_message else None),
+                          ftp_form_value=ftp if ftp_message else None,
+                          refusal_message=_CONNECTOR_REFUSAL if refusal else None),
+            status_code=403 if refusal else 200,
         )
 
     @app.post("/settings/zwift-credentials/clear", response_class=HTMLResponse)
@@ -3783,6 +4033,11 @@ def create_app() -> FastAPI:
         if not _same_origin_or_absent(request):
             return PlainTextResponse("Origin not allowed", status_code=403)
         uid = _uid(request)
+        if _from_connector(request):
+            # Rotating from here would hand the attacker the only copy of the
+            # new link and leave the rider's calendar app silently stale - a
+            # compromise that looks like a sync bug. See _CONNECTOR_REFUSAL.
+            return _refuse_connector_session(request, uid)
         rotated = calendarfeed.token_is_set(uid)
         token = calendarfeed.generate_token(uid)
         if token is None:
@@ -3823,6 +4078,13 @@ def create_app() -> FastAPI:
         if not _same_origin_or_absent(request):
             return PlainTextResponse("Origin not allowed", status_code=403)
         uid = _uid(request)
+        if _from_connector(request):
+            # The blocker the pre-merge review of this branch found. Pairing
+            # from inside a connector-opened window mints a token that survives
+            # revoking the device that opened the window, so the owner does the
+            # one thing the docs tell them to do about a stolen laptop and the
+            # thief keeps a permanent credential - under a label they chose.
+            return _refuse_connector_session(request, uid)
         clean = connectorauth.clean_label(label)
         minted = connectorauth.generate_token(uid, clean)
         if minted is None:
@@ -3863,6 +4125,10 @@ def create_app() -> FastAPI:
             # over its existing socket until the server restarts, while the
             # page tells the owner the token no longer works.
             connectorhub.close_device(uid, device_id)
+            # And this settles a ticket already in flight. Small window - a
+            # minute at most - but "revoked" must not still be able to open a
+            # logged-in window.
+            app.state.connector_tickets.revoke_device(device_id)
         return templates.TemplateResponse(
             request, "settings.html",
             _settings_ctx(
@@ -4575,6 +4841,20 @@ def create_app() -> FastAPI:
         except Exception:
             uid = None
         if not uid:
+            await websocket.send_json({"status": "error", "error": "not authenticated"})
+            await websocket.close()
+            return
+        # Revocation has to be enforced here, not upstream. AuthMiddleware
+        # terminates a revoked connector session on every HTTP request, but it
+        # is a BaseHTTPMiddleware and never runs for a websocket scope, so
+        # without this line a revoked laptop keeps a working ride socket after
+        # the browser half has been cut off - and drives whichever connector is
+        # attached now, because _ble_session resolves by user_id alone. The
+        # session cannot be cleared from here the way the middleware clears it
+        # (there is no response to carry a new cookie), so the socket simply
+        # refuses; the next HTTP request is what empties the cookie.
+        if not _connector_session_still_paired(websocket):
+            _log.info("a ride socket was refused because its device was revoked")
             await websocket.send_json({"status": "error", "error": "not authenticated"})
             await websocket.close()
             return
