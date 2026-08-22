@@ -142,18 +142,30 @@ def enable() -> None:
 
 
 def disable() -> None:
-    """Remove the entry. Idempotent: absent is the desired state either way."""
+    """Remove the entry. Idempotent, but only about the entry being absent.
+
+    "Already gone" is exactly FileNotFoundError, and only that. A bare OSError
+    also covers the failures that mean the opposite - access denied, a hive
+    held by another process, a policy-locked Run key - and swallowing those
+    made the tray lie: _toggle_autostart shows the warning balloon by catching
+    what this raises, so with nothing ever raised the rider was told "It will
+    no longer start with Windows." over an entry that was still there and
+    would still run at the next logon. A toggle that fails silently in the
+    direction of *more* startup is the failure this module exists to prevent.
+
+    AutostartUnavailable is still swallowed, because that one really is the
+    idempotent case: a machine that cannot autostart at all has nothing to
+    remove.
+    """
     try:
         winreg, key = _open_run_key(write=True)
     except AutostartUnavailable:
         return
-    except OSError:
-        return
     try:
         with key:
             winreg.DeleteValue(key, VALUE_NAME)
-    except OSError:
-        return  # already gone
+    except FileNotFoundError:
+        return  # no such value: already in the desired state
     log.info("removed %s from the Windows startup entries", VALUE_NAME)
 
 

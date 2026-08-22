@@ -171,6 +171,34 @@ def test_disabling_something_that_was_never_enabled_is_quiet(registry, frozen):
 
 
 @windows_only
+def test_a_delete_that_really_failed_is_not_reported_as_success(
+    registry, frozen, monkeypatch
+):
+    """The tray shows its warning by catching what disable() raises.
+
+    So a swallowed OSError is not a quiet success, it is a lie: the rider is
+    told "It will no longer start with Windows." while the entry survives and
+    runs again at the next logon. Only FileNotFoundError means "already gone";
+    access denied and a locked hive are the opposite and must reach the tray.
+    """
+    import winreg
+
+    autostart.enable()
+    real_delete = winreg.DeleteValue
+
+    def _denied(key, name):
+        raise PermissionError(5, "Access is denied")
+
+    monkeypatch.setattr(winreg, "DeleteValue", _denied)
+    with pytest.raises(OSError):
+        autostart.disable()
+
+    monkeypatch.setattr(winreg, "DeleteValue", real_delete)
+    # And the entry really is still there, which is what made it a lie.
+    assert autostart.enabled() is True
+
+
+@windows_only
 def test_a_moved_executable_is_repointed_at_where_it_now_is(
     registry, frozen, monkeypatch, tmp_path
 ):
