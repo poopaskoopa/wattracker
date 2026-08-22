@@ -331,6 +331,9 @@ class TrayIcon:
         self._icons: dict = {}
         self._class_atom = None
         self._state: Optional[str] = None
+        # One balloon per outage, not one per poll. Cleared again by a
+        # successful connection, so the *next* outage is announced too.
+        self._warned_unreachable = False
         self._added = False
         self._add_attempts = 0
         self._quitting = False
@@ -549,7 +552,18 @@ class TrayIcon:
 
     def _refresh(self, force: bool = False) -> None:
         """Re-read the status and repaint the icon if it changed."""
-        state = self._snapshot()[0]
+        state, _server, error, _since, _reason = self._snapshot()
+        # Checked before the unchanged-state return below, and deliberately:
+        # a connector that cannot reach its server sits in OFFLINE from its
+        # first poll to its last, so the state never *changes* and an
+        # announcement hung off a transition would never fire. What changes is
+        # last_error, which is set once the first attempt has actually failed -
+        # which is why this cannot simply run when the icon is added.
+        if state == _STATE_CONNECTED:
+            self._warned_unreachable = False
+        elif state == _STATE_OFFLINE and error and not self._warned_unreachable:
+            self._warned_unreachable = True
+            self._balloon_unreachable(error)
         if state == self._state and not force:
             return
         previous, self._state = self._state, state
@@ -560,6 +574,26 @@ class TrayIcon:
             self._shell32.Shell_NotifyIconW(_NIM_MODIFY, ctypes.byref(data))
         if state == _STATE_STOPPED and previous not in (None, _STATE_STOPPED):
             self._balloon_stopped()
+
+    def _balloon_unreachable(self, error: str) -> None:
+        """Say the server is not answering, once, and keep trying anyway.
+
+        A server that is rebooting, a laptop that has just woken and a server
+        that has been switched off for good all look identical from here, and
+        only the last one wants the rider's attention. So this says it once and
+        the connector carries on reconnecting: the icon and its tooltip are
+        what report the state after that, and a balloon per retry would be a
+        notification every few seconds all night.
+        """
+        if self._quitting:
+            return
+        server = self._snapshot()[1]
+        self.notify(
+            "wattracker connector",
+            f"Cannot reach {server}: {error}. Still trying - check that the "
+            "server is running and on the same network.",
+            level="warning",
+        )
 
     def _balloon_stopped(self) -> None:
         """Say why we stopped, because a dead icon explains nothing.

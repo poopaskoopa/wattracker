@@ -255,6 +255,53 @@ def test_a_reconnect_does_not_balloon_every_time(tray):
     assert not tray._balloons
 
 
+@windows_only
+def test_an_unreachable_server_balloons_once_and_keeps_trying(tray):
+    """The server being switched off is the case the tooltip alone cannot carry.
+
+    A rider whose server has gone sees an icon that looks exactly like an icon
+    that is still starting up. Saying it once is the difference; saying it on
+    every poll would be a notification every two seconds all night.
+    """
+    tray._status.connected = False
+    tray._status.last_error = "timed out during opening handshake"
+    for _ in range(5):
+        tray._refresh()
+
+    assert len(tray._balloons) == 1
+    _title, text, level = tray._balloons.pop()
+    assert level == "warning"
+    assert "192.168.1.10:8000" in text
+    assert "timed out" in text
+    # Still trying is the promise the text makes; the state has to match it.
+    assert tray._state == "offline"
+
+
+@windows_only
+def test_the_first_poll_before_any_attempt_says_nothing(tray):
+    """Offline with no error yet is a connector that has only just started."""
+    tray._status.connected = False
+    tray._refresh(force=True)
+
+    assert not tray._balloons
+
+
+@windows_only
+def test_a_server_that_comes_back_and_goes_again_is_announced_twice(tray):
+    """One balloon per outage, not one per process."""
+    tray._status.connected = False
+    tray._status.last_error = "connection refused"
+    tray._refresh()
+    assert len(tray._balloons) == 1
+
+    tray._status.connected = True
+    tray._refresh()
+    tray._status.connected = False
+    tray._refresh()
+
+    assert len(tray._balloons) == 2
+
+
 # ------------------------------------------------------------------- pairing
 def test_the_setup_window_imports_anywhere_and_refuses_elsewhere(monkeypatch):
     """Same bargain the tray strikes: importable on the suite's CI, refuses there."""
