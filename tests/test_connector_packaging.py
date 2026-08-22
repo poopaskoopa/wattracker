@@ -442,10 +442,20 @@ def test_a_webviewpy_whose_native_never_loaded_fails_the_smoke_check(monkeypatch
     so a build that lost the DLL imports green, opens a browser tab for every
     window, and blames the machine. This is the check that would catch it.
     """
+    import logging
     import sys
     import types
 
     from wattracker_connector.__main__ import main
+
+    # main() configures the root logger and leaves it configured - it is an
+    # entry point, and that is its job. This is the only test outside
+    # test_connector_logging.py that calls it, so it is also the only one
+    # without that module's autouse fixture to put the root back; without
+    # this, the INFO level leaks forward and the next module's caplog sees
+    # records it never asked for.
+    root = logging.getLogger()
+    before, level = list(root.handlers), root.level
 
     broken = types.ModuleType("webviewpy")
     broken.is_webviewlibrary_load_ok = False
@@ -456,3 +466,9 @@ def test_a_webviewpy_whose_native_never_loaded_fails_the_smoke_check(monkeypatch
     working.is_webviewlibrary_load_ok = True
     monkeypatch.setitem(sys.modules, "webviewpy", working)
     assert main(["--smoke-import", "webviewpy"]) == 0
+
+    for handler in [h for h in root.handlers if h not in before]:
+        root.removeHandler(handler)
+        handler.close()
+    root.handlers[:] = before
+    root.setLevel(level)
