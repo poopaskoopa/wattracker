@@ -262,8 +262,10 @@ UI that opens already logged in.
 
 It is **not yet published**, because it is not yet signed: the release job that
 builds it stays disabled until a certificate exists (see
-[docs/windows-security.md](docs/windows-security.md)). Until then it comes from
-a local build:
+[docs/windows-security.md](docs/windows-security.md)). Until then it comes
+either from the unsigned artifact `windows.yml` uploads on merges to `main` —
+which carries provenance, not integrity, and is not a substitute for signing —
+or from a local build:
 
 ```powershell
 python -m pip install ".[dev,ble,package,connector,webview]"

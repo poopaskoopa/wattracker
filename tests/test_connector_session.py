@@ -216,6 +216,7 @@ def test_a_ticket_carries_only_its_own_users_session(client):
     """Two riders, two connectors: a ticket must not cross between them."""
     _one, token_one = _paired(client, "one", "PC one")
     uid_two, _token_two = _paired(client, "two", "PC two")
+    assert uid_two != _one  # two accounts, which is the premise of the test
 
     ticket = _mint(client, token_one).json()["ticket"]
     with TestClient(client.app) as window:
@@ -224,7 +225,6 @@ def test_a_ticket_carries_only_its_own_users_session(client):
         page = window.get("/settings")
         assert "PC two" not in page.text
         assert "PC one" in page.text
-    assert uid_two != _one
 
 
 def test_a_revoked_device_cannot_mint(client):

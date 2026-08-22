@@ -283,7 +283,7 @@ published beside it. A **CI artifact**, uploaded by `windows.yml` on a merge to
 by the same run that built the binary and travel in the same archive, which
 proves nothing a tampered run could not also forge. What stands in for it is
 the run itself: the artifact names the workflow run that produced it, that run
-names the commit, and the log shows the freeze and all four smoke checks. That
+names the commit, and the log shows the freeze and every smoke check. That
 is provenance rather than integrity, and it is not a substitute for signing.
 Neither source should be handed to anyone outside the people testing this.
 

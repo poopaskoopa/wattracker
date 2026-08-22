@@ -329,7 +329,6 @@ class TrayIcon:
         self._balloons: deque = deque()
         self._hwnd: Optional[int] = None
         self._icons: dict = {}
-        self._class_atom = None
         self._state: Optional[str] = None
         # One balloon per outage, not one per poll. Cleared again by a
         # successful connection, so the *next* outage is announced too.
@@ -337,8 +336,9 @@ class TrayIcon:
         self._added = False
         self._add_attempts = 0
         self._quitting = False
-        # How many times a second launch has announced itself. Kept because it
-        # is the only externally visible trace of that message being handled.
+        # How many times a second launch has announced itself. A test hook -
+        # read by tests/test_connector_tray.py - because posting a registered
+        # message to another process leaves nothing else to assert on.
         self._shown = 0
         self._taskbar_created = self._user32.RegisterWindowMessageW(_TASKBAR_CREATED)
         self._show_message = self._user32.RegisterWindowMessageW(SHOW_MESSAGE)
@@ -423,7 +423,6 @@ class TrayIcon:
         # Already registered is success: a class belongs to the process, not to
         # the window, so a tray taken down and put back up again in one process
         # finds its own class still there.
-        self._class_atom = atom
 
     def _create_window(self) -> None:
         # Top-level and never shown, rather than HWND_MESSAGE: only a

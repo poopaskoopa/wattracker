@@ -150,6 +150,6 @@ class TicketStore:
 
     @property
     def outstanding(self) -> int:
-        """How many tickets are held. For tests and logging."""
+        """How many tickets are held. For tests; nothing logs it."""
         with self._lock:
             return len(self._tickets)
