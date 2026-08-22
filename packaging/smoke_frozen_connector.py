@@ -23,10 +23,16 @@ Three checks, in the order they can fail:
    speaks just enough of the protocol - the hello, one request, one response -
    the connector must attach and answer ``paths.default_activities_dir``. That
    is the whole client half exercised through the real transport.
-3. **Its optional halves survived the freeze.** ``bleak`` and ``webviewpy``
-   must be importable inside the frozen process. Availability, not hardware:
-   exactly the argument smoke_frozen_ble.py makes, and for the same reason -
-   a build whose backend failed to package starts fine and simply never works.
+3. **Its optional halves survived the freeze.** *Packaged*, not *working*.
+   That is weaker than smoke_frozen_ble.py, which drives /ride/scan through a
+   running frozen app and proves the backend is not merely importable; doing
+   the same here would need a radio the runner does not have, and the working
+   proof stays in docs/windows-ble-validation.md. What this asserts is that
+   the halves the spec collects best-effort are in the binary at all - and,
+   for the two that can be *absent while still importing*, that they load:
+   bleak resolves its backend in the constructors rather than at import, and
+   webviewpy imports perfectly happily with its native library missing
+   entirely, so the top-level import alone is green in both broken builds.
 
     python packaging\\smoke_frozen_connector.py dist\\WattrackerConnector.exe
 
@@ -296,7 +302,14 @@ def check_optional_halves_survived(executable, config_dir) -> bool:
     window - with nothing to say so.
     """
     ok = True
-    for module, what in (("bleak", "Bluetooth"), ("webviewpy", "the tray window")):
+    for module, what in (
+        ("bleak", "Bluetooth"),
+        # The backend, not just the package: bleak resolves it in the
+        # constructors, so a build that lost the winrt projections imports
+        # bleak perfectly and simply never sees a trainer.
+        ("bleak.backends.winrt.client", "the Bluetooth backend"),
+        ("webviewpy", "the tray window"),
+    ):
         result = _run(executable, ["--smoke-import", module], config_dir, timeout=60)
         if result.returncode != 0:
             print(f"FAIL: {module} did not survive the freeze, so {what} is gone")

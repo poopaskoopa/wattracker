@@ -71,9 +71,25 @@ except Exception:
     pass
 
 # The tray's window. webviewpy ships its own PyInstaller hook, which copies the
-# native webview.dll in as data, so hookspath is all that is needed here - and
-# the hook is the authority on where that DLL lives, which a hand-written datas
-# entry would duplicate and then get wrong on the next release.
+# native webview.dll in as data, and the hook is the authority on where that
+# DLL lives - a hand-written datas entry would duplicate it and then get it
+# wrong on the next release. The hookspath below is belt and braces rather
+# than load-bearing: webviewpy also advertises the same directory through its
+# "pyinstaller40" entry point, so PyInstaller finds the hook with or without
+# this line. Removing it does not drop the DLL from the build.
+#
+# The hook puts it at the *bundle root*, while webviewpy at runtime asks for
+# <its package dir>/platform/<sys.platform>/<arch>/webview.dll, which the
+# bundle does not contain. That mismatch looks like a bug and is not: the
+# loader hook PyInstaller injects replaces ctypes.CDLL with one whose
+# _frozen_name() retries any path that is not a file as
+# sys._MEIPASS/<basename> - which is exactly where the hook put it. Root
+# placement is correct *because* of that shim, and moving the DLL to the path
+# webviewpy computes would be the change that breaks nothing and helps nothing.
+# Written down because the chain is four layers deep and reads, from any one
+# of them, like a packaging error. smoke_frozen_connector.py now proves the
+# library actually loads inside the frozen process, so a future release that
+# invalidates any layer of this fails a check rather than a rider's window.
 hookspath = []
 try:
     import webviewpy

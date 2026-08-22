@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import importlib
 import logging
 import logging.handlers
 import os
@@ -305,9 +306,12 @@ def _parser() -> argparse.ArgumentParser:
 
 # What --smoke-import will import. An allowlist rather than "whatever you
 # named": this flag ships to riders, and an arbitrary-import switch on a
-# binary that autostarts is a gadget worth not handing out. These are exactly
-# the two optional halves the spec collects best-effort.
-_SMOKE_IMPORTABLE = ("bleak", "webviewpy")
+# binary that autostarts is a gadget worth not handing out. These are the
+# optional halves the spec collects best-effort, plus the one module that
+# distinguishes "bleak is packaged" from "bleak can reach a radio": bleak
+# resolves its backend in the constructors, not at import, so the top-level
+# package imports perfectly in a build whose winrt backend never made it in.
+_SMOKE_IMPORTABLE = ("bleak", "bleak.backends.winrt.client", "webviewpy")
 
 # One connector per logon session. "Local\" is the right scope and "Global\"
 # would be the wrong one: two riders signed in to the same machine are two
@@ -693,11 +697,26 @@ def main(argv: Optional[List[str]] = None) -> int:
             log.error("--smoke-import only accepts %s", ", ".join(_SMOKE_IMPORTABLE))
             return 2
         try:
-            __import__(name)
+            module = importlib.import_module(name)
         except Exception:
             # Logged, not printed: the frozen build this exists for is
             # windowed, so the log file is where the smoke test reads it.
             log.error("could not import %s", name, exc_info=True)
+            return 1
+        if name == "webviewpy" and not getattr(
+            module, "is_webviewlibrary_load_ok", False
+        ):
+            # Importing webviewpy proves nothing about the window. Its module
+            # level declare_library_path(None, False) swallows a failed CDLL
+            # and only sets this flag; the first Webview() then raises
+            # "webview library not loaded", which webview.py reports to the
+            # rider as a missing WebView2 runtime. So a build that packaged
+            # the DLL to the wrong path imports green here and opens a browser
+            # tab for every window, blaming the machine. Ask the flag.
+            log.error(
+                "%s imported but its native library did not load; the frozen "
+                "build has webview.dll somewhere it does not look", name,
+            )
             return 1
         log.info("%s imported successfully", name)
         return 0

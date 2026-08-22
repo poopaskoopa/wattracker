@@ -227,7 +227,17 @@ def test_optional_halves_are_collected_best_effort():
     """
     assert 'collect_submodules("bleak.backends.winrt")' in SPEC
     assert "import webviewpy" in SPEC
-    assert SPEC.count("except Exception:") >= 3
+    # Each collector individually wrapped, rather than "at least three try
+    # blocks exist somewhere in the file": a count says nothing about *which*
+    # lines are guarded, and drifts the moment a fourth best-effort block is
+    # added or one of these is reformatted.
+    for collected in ('collect_submodules("bleak.backends.winrt")',
+                      "import webviewpy"):
+        at = SPEC.index(collected)
+        before = SPEC[:at].splitlines()[-4:]
+        after = SPEC[at:].splitlines()[:8]
+        assert any(line.strip() == "try:" for line in before), collected
+        assert any(line.strip() == "except Exception:" for line in after), collected
 
 
 def test_the_tray_icon_is_the_apps_own_favicon():
@@ -257,6 +267,10 @@ def test_the_smoke_script_checks_what_the_spec_collects_best_effort():
     """The two things a frozen build can silently lose."""
     assert '("bleak", "Bluetooth")' in SMOKE
     assert '("webviewpy", "the tray window")' in SMOKE
+    # The two that import green while broken, so the import alone proves
+    # nothing: bleak resolves its backend in the constructors, and webviewpy
+    # swallows a failed CDLL at module level.
+    assert '("bleak.backends.winrt.client", "the Bluetooth backend")' in SMOKE
 
 
 def test_the_entry_point_answers_what_the_smoke_script_asks():
@@ -266,9 +280,13 @@ def test_the_entry_point_answers_what_the_smoke_script_asks():
     options = _parser()._option_string_actions
     assert "--smoke-import" in options
     assert "--headless" in options
-    assert "--smoke-import" in SMOKE or "--headless" in SMOKE
+    # and, not or: the script uses both, and a disjunction passes while
+    # either one silently disappears - the exact drift this pins.
+    assert "--smoke-import" in SMOKE and "--headless" in SMOKE
     # Not an arbitrary-import gadget on a binary that autostarts.
-    assert set(_SMOKE_IMPORTABLE) == {"bleak", "webviewpy"}
+    assert set(_SMOKE_IMPORTABLE) == {
+        "bleak", "bleak.backends.winrt.client", "webviewpy",
+    }
 
 
 # --------------------------------------------------------------- the workflow
@@ -412,3 +430,29 @@ def test_the_app_installer_still_has_no_startup_entry():
     """
     assert "run at startup" not in ISS.lower()
     assert "WattrackerConnector" not in ISS
+
+
+def test_a_webviewpy_whose_native_never_loaded_fails_the_smoke_check(monkeypatch):
+    """Importing webviewpy proves nothing about the window, so ask the flag.
+
+    declare_library_path(None, False) runs at webviewpy's module level and
+    swallows a failed CDLL, setting is_webviewlibrary_load_ok False rather
+    than raising. The first Webview() then reports "webview library not
+    loaded", which webview.py hands the rider as a missing WebView2 runtime -
+    so a build that lost the DLL imports green, opens a browser tab for every
+    window, and blames the machine. This is the check that would catch it.
+    """
+    import sys
+    import types
+
+    from wattracker_connector.__main__ import main
+
+    broken = types.ModuleType("webviewpy")
+    broken.is_webviewlibrary_load_ok = False
+    monkeypatch.setitem(sys.modules, "webviewpy", broken)
+    assert main(["--smoke-import", "webviewpy"]) == 1
+
+    working = types.ModuleType("webviewpy")
+    working.is_webviewlibrary_load_ok = True
+    monkeypatch.setitem(sys.modules, "webviewpy", working)
+    assert main(["--smoke-import", "webviewpy"]) == 0
