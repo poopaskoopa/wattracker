@@ -325,12 +325,13 @@ function pctChange(current, previous) {
 }
 
 function renderSummary(all) {
-    const el = document.getElementById("volumeSummary");
-    if (!el) return;
+    const section = document.getElementById("volumeSummary");
+    const el = document.getElementById("volumeSummaryCards");
+    if (!section || !el) return;
     const last4 = all.slice(-4);
     const prev4 = all.slice(-8, -4);
     if (last4.length < 1) return;
-    el.style.display = "";
+    section.style.display = "";
     el.innerHTML = "";
     SUMMARY_METRICS.forEach((m) => {
         const cur = sumOver(last4, m.key);

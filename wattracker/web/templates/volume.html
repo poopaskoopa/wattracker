@@ -3,7 +3,14 @@
 {% block content %}
 <h2>Training Volume</h2>
 
-<section id="volumeSummary" class="cards" style="display:none"></section>
+<section id="volumeSummary" class="volume-summary" aria-labelledby="volumeSummaryTitle" style="display:none">
+    <div class="volume-summary-head">
+        <h3 id="volumeSummaryTitle">Training volume summary</h3>
+        <span class="volume-summary-period">Latest 4 weeks</span>
+    </div>
+    <div id="volumeSummaryCards" class="cards"></div>
+    <p class="volume-summary-note">Totals are summed across the latest four weekly buckets; changes compare with the preceding four.</p>
+</section>
 
 <p id="volumeEmpty" class="hint" style="display:none">No training data yet — import or upload activities to see your weekly volume.</p>
 

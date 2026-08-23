@@ -146,6 +146,16 @@ main a:hover { color: var(--accent); text-decoration: underline; }
 .card .value { font-size: 1.4rem; font-weight: 600; color: var(--accent); }
 .card[title] { cursor: help; }
 .card[title]:hover { outline: 1px solid var(--accent); }
+.volume-summary { margin: 1rem 0; }
+.volume-summary-head { display: flex; align-items: center; gap: 0.65rem; flex-wrap: wrap; margin-bottom: 0.65rem; }
+.volume-summary-head h3 { margin: 0; font-size: 1rem; }
+.volume-summary-period {
+    background: var(--surface-inset); border: 1px solid var(--surface-border);
+    border-radius: var(--r-md); color: var(--accent); font-size: 0.75rem;
+    font-weight: 600; padding: 0.25rem 0.55rem;
+}
+.volume-summary .cards { margin: 0; }
+.volume-summary-note { color: var(--muted); font-size: 0.8rem; margin: 0.55rem 0 0; }
 
 /* Shared surface definition. Every panel used to be a borderless fill on a --bg
    only ~7% darker, so the page read as one undifferentiated dark field. One

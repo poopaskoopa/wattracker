@@ -140,6 +140,8 @@ def test_volume_page_renders(client):
     r = client.get("/volume")
     assert r.status_code == 200
     assert "Training Volume" in r.text
+    assert "Latest 4 weeks" in r.text
+    assert "preceding four" in r.text
     assert "volume.js?v=" in r.text
 
 
