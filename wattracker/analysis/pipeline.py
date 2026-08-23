@@ -7,7 +7,7 @@ from typing import Dict, List, Optional, Tuple
 import bisect
 
 from .. import db
-from ..timeutil import parse_naive, utc_now
+from ..timeutil import parse_naive, to_user_timezone, utc_now
 from ..ingest.importer import current_ftp
 from ..metrics.power import (
     detraining_factor,
@@ -313,6 +313,16 @@ def activity_detail(
     }
     t = _downsample(minutes, max_points)
     have = {k: any(v is not None for v in vals) for k, vals in series.items()}
+    # The weight the ride happened at, with its provenance: resolved on the
+    # ride's LOCAL calendar date (a 23:30 UTC ride is the next day west of
+    # Greenwich), never the UTC date or a single "current" setting.
+    settings = db.get_user_settings(user_id)
+    parsed_start = parse_naive(act.get("start_time"))
+    local_date = (
+        to_user_timezone(parsed_start, settings.get("timezone")).date().isoformat()
+        if parsed_start is not None else None
+    )
+    weight = db.weight_resolution(user_id, local_date)
     return {
         "id": act["id"],
         "filename": act.get("filename"),
@@ -325,6 +335,9 @@ def activity_detail(
         "if_": act.get("if_"),
         "tss": act.get("tss"),
         "rpe": act.get("rpe"),
+        "weight_kg": weight["weight_kg"] if weight else None,
+        "weight_source": weight["source"] if weight else None,
+        "weight_date": weight["date"] if weight else None,
         "t": t,
         "power": series["power"],
         "heartrate": series["heartrate"],

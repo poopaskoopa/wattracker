@@ -33,7 +33,7 @@ import urllib.request
 from typing import Dict, List, Optional
 
 from . import db
-from .timeutil import utc_now, utc_today
+from .timeutil import local_today, utc_now, utc_today
 from .metrics.curve import best_rolling_power
 
 log = logging.getLogger(__name__)
@@ -361,10 +361,14 @@ def refresh_race_results(
         remote_error = ("no numeric Zwift rider ID configured and no Zwift "
                         "credentials saved")
 
-    # Weight (for W/kg display): Zwift profile is primary, ZwiftPower rows
-    # secondary; refreshed on every successful authenticated refresh.
+    # Weight (for W/kg): the Zwift profile weight, logged as a dated
+    # zwift_profile row for the rider's local today. The priority rule in
+    # record_weight keeps it from ever replacing a manual log for the same
+    # day, and the scalar re-sync there keeps the legacy reader current.
     if weight_kg:
-        db.save_user_settings(user_id, {"weight_kg": weight_kg})
+        tz = db.get_user_settings(user_id).get("timezone")
+        db.record_weight(user_id, local_today(tz).isoformat(), weight_kg,
+                         "zwift_profile")
 
     if source == "zwiftpower":
         # Resolve each race to the local ride of that date so the row links to
@@ -397,6 +401,14 @@ def refresh_race_results(
         count = db.replace_race_results(user_id, "zwiftpower", results)
         # Real results supersede the heuristic ones: purge them for good.
         db.delete_race_results(user_id, "local")
+        # The weight each race was actually ridden at (the rider's Zwift
+        # profile at the time), per event date. Re-runs are safe: a row is
+        # only replaced by an equal-or-higher-rank source, so a manual log
+        # for that date survives every refresh.
+        for r in results:
+            if r.get("weight_kg"):
+                db.record_weight(user_id, r["event_date"], r["weight_kg"],
+                                 "zwift_ride")
     elif db.count_race_results(user_id, "zwiftpower") > 0:
         # Refresh failed but real results are cached: keep them (stale)
         # rather than fabricating heuristic rows next to real races.
@@ -636,6 +648,11 @@ def race_page_data(user_id: int) -> Dict:
             ftp = db.ftp_as_of(user_id, r["event_date"])
             if ftp and ftp > 0:
                 r["if_"] = round(r["np"] / ftp, 2)
+        # What the race was actually run at: the row's own Zwift weight unless
+        # the rider logged a manual value for that date (manual wins), and for
+        # locally-derived rows the rider's weight as of the date instead of
+        # nothing. The W/kg toggle divides each row by its own number.
+        r["resolved_weight_kg"] = db.weight_as_of(user_id, r["event_date"])
         r["place"] = _place_int(r.get("position"))
         r["duration_fmt"] = format_duration(r.get("duration_s"))
     weight = db.get_user_settings(user_id).get("weight_kg")

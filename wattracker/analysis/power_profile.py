@@ -11,12 +11,12 @@ from __future__ import annotations
 import datetime as _dt
 import math
 from collections.abc import Mapping
-from typing import Iterable, Optional
+from typing import Callable, Iterable, Optional
 
 import numpy as np
 
 from .. import db
-from ..timeutil import utc_now
+from ..timeutil import parse_naive, to_user_timezone, utc_now
 
 
 DURATIONS = (
@@ -368,16 +368,39 @@ def classify_with_recency(
     )
 
 
+def _weight_for(
+    weight_fn: Optional[Callable[[Optional[str]], Optional[float]]],
+    start_time: Optional[str],
+    fallback: Optional[float],
+) -> Optional[float]:
+    """The W/kg divisor for one record: the weight as of the ride itself when
+    a resolver is available (and resolves something), else the flat scalar."""
+    if weight_fn is not None and start_time is not None:
+        value = _weight(weight_fn(start_time))
+        if value is not None:
+            return value
+    return fallback
+
+
 def compute(
     activities: Iterable[dict],
     weight_kg=None,
     now: Optional[_dt.datetime] = None,
+    weight_fn: Optional[Callable[[Optional[str]], Optional[float]]] = None,
 ) -> dict:
-    """Compute all-time and trailing-60-day record power presentation data."""
+    """Compute all-time and trailing-60-day record power presentation data.
+
+    ``weight_fn`` resolves a ride's W/kg divisor from the ride's own UTC
+    ``start_time`` (so each record is divided by the rider's weight at the
+    time it was set). Without it, or when it resolves nothing, the flat
+    ``weight_kg`` scalar is the divisor - exactly the pre-history behaviour.
+    """
     reference = _utc_naive(now or utc_now())
     cutoff = reference - _dt.timedelta(days=60)
-    all_best: dict[int, float] = {}
-    recent_best: dict[int, float] = {}
+    # (value, start_time) pairs: the W/kg of a record belongs to the ride that
+    # set it, which is only knowable while keeping the start_time with the max.
+    all_best: dict[int, tuple[float, Optional[str]]] = {}
+    recent_best: dict[int, tuple[float, Optional[str]]] = {}
     all_counts = {duration: 0 for duration, _ in DURATIONS}
     recent_counts = {duration: 0 for duration, _ in DURATIONS}
     records: list[tuple] = []
@@ -391,16 +414,22 @@ def compute(
         recent = _is_recent(start_time, cutoff, reference)
         for duration, value in maxima.items():
             all_counts[duration] += 1
-            all_best[duration] = max(value, all_best.get(duration, 0.0))
+            current = all_best.get(duration)
+            if current is None or value >= current[0]:
+                all_best[duration] = (value, start_time)
             if recent:
                 recent_counts[duration] += 1
-                recent_best[duration] = max(value, recent_best.get(duration, 0.0))
+                current = recent_best.get(duration)
+                if current is None or value >= current[0]:
+                    recent_best[duration] = (value, start_time)
 
     rider_weight = _weight(weight_kg)
     rows = []
     for duration, label in DURATIONS:
-        all_value = all_best.get(duration)
-        recent_value = recent_best.get(duration)
+        all_entry = all_best.get(duration)
+        recent_entry = recent_best.get(duration)
+        all_value = all_entry[0] if all_entry is not None else None
+        recent_value = recent_entry[0] if recent_entry is not None else None
         all_watts = round(all_value) if all_value is not None else None
         recent_watts = round(recent_value) if recent_value is not None else None
         percent = (
@@ -408,16 +437,21 @@ def compute(
             if all_value and recent_value is not None
             else None
         )
+        all_divisor = _weight_for(weight_fn, all_entry[1] if all_entry else None,
+                                  rider_weight)
+        recent_divisor = _weight_for(weight_fn,
+                                     recent_entry[1] if recent_entry else None,
+                                     rider_weight)
         rows.append({
             "duration": duration,
             "label": label,
             "all_time": all_watts,
             "recent_60d": recent_watts,
             "recent_percent": percent,
-            "all_time_wkg": round(all_value / rider_weight, 2)
-            if all_value is not None and rider_weight else None,
-            "recent_60d_wkg": round(recent_value / rider_weight, 2)
-            if recent_value is not None and rider_weight else None,
+            "all_time_wkg": round(all_value / all_divisor, 2)
+            if all_value is not None and all_divisor else None,
+            "recent_60d_wkg": round(recent_value / recent_divisor, 2)
+            if recent_value is not None and recent_divisor else None,
             "all_time_rides": all_counts[duration],
             "recent_60d_rides": recent_counts[duration],
             "available": all_value is not None,
@@ -454,10 +488,29 @@ def compute(
 
 
 def for_user(user_id: int, now: Optional[_dt.datetime] = None) -> dict:
-    """Build a profile from one user's nonduplicate, inflated activities."""
+    """Build a profile from one user's nonduplicate, inflated activities.
+
+    W/kg is resolved per record: each ride's best is divided by the weight
+    effective on the ride's local calendar date (manual log first, then the
+    Zwift-derived rows, then the settings scalar - the order
+    ``db.weight_as_of`` already enforces), not by a single "current" number.
+    """
     settings = db.get_user_settings(user_id)
+    tz = settings.get("timezone")
+    by_date: dict[str, Optional[float]] = {}
+
+    def weight_for_start_time(start_time: Optional[str]) -> Optional[float]:
+        parsed = parse_naive(start_time)
+        if parsed is None:
+            return None
+        local_date = to_user_timezone(parsed, tz).date().isoformat()
+        if local_date not in by_date:
+            by_date[local_date] = db.weight_as_of(user_id, local_date)
+        return by_date[local_date]
+
     return compute(
         db.full_activities(user_id),
         weight_kg=settings.get("weight_kg"),
         now=now,
+        weight_fn=weight_for_start_time,
     )
