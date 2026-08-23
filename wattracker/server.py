@@ -668,6 +668,13 @@ MAX_ONBOARDING_UPLOAD_BYTES = 50 * 1024 * 1024
 MAX_ONBOARDING_UPLOAD_FILES = 200
 ONBOARDING_WEIGHT_MIN_KG = 20.0
 ONBOARDING_WEIGHT_MAX_KG = 300.0
+# Said when the connector goes away mid-wizard. Matches the wording
+# RemoteBackend.validate_dir uses for the same condition, so a rider who
+# retries does not get two different accounts of one problem.
+_CONNECTOR_OFFLINE_CHECK = (
+    "Cannot check that folder: the connector is offline. Start the wattracker "
+    "connector on the machine where Zwift is installed, then try again."
+)
 # The onboarding wizard's FTP field no longer has bounds of its own: every
 # surface a rider types an FTP into shares one policy (wattracker.ftp_input,
 # issue #64), so the wizard's old 1-1000 W window is gone rather than being one
@@ -1452,10 +1459,11 @@ def create_app() -> FastAPI:
                        "adjusted": 0, "upcoming": {}}
         banner = adaptmod.banner_for(state, summary)
         complete = db.onboarding_complete(uid)
-        # Candidate discovery scans the filesystem and the FTP estimate
-        # decompresses the whole activity history; both only feed the setup
-        # wizard, which a completed rider never renders. Skipping them keeps
-        # the normal dashboard off a cost that grows with ride count.
+        # Candidate discovery walks a filesystem - the connector's, in a
+        # split install - and the FTP estimate decompresses the whole activity
+        # history; both only feed the setup wizard, which a completed rider
+        # never renders. Skipping them keeps the normal dashboard off a cost
+        # that grows with ride count, and off a round trip to another machine.
         setup_ctx: dict = {}
         if not complete:
             setup_settings = db.get_user_settings(uid)
@@ -1464,7 +1472,8 @@ def create_app() -> FastAPI:
                 uid, settings=setup_settings, estimate=round(setup_estimate, 1)
             )
             setup_ctx = dict(
-                setup_candidates=paths.annotated_candidates(),
+                setup_candidates=discover(uid, "activity_candidates"),
+                setup_connector_offline=is_offline(uid),
                 setup_settings=setup_settings,
                 setup_estimate=round(setup_estimate, 1),
                 setup_fallback_ftp=round(DEFAULT_FTP),
@@ -1502,7 +1511,8 @@ def create_app() -> FastAPI:
         )
         return _ctx(
             request,
-            setup_candidates=paths.annotated_candidates(),
+            setup_candidates=discover(uid, "activity_candidates"),
+            setup_connector_offline=is_offline(uid),
             setup_settings=settings,
             setup_estimate=round(estimate, 1) if estimate > 0 else None,
             setup_fallback_ftp=round(DEFAULT_FTP),
@@ -1540,19 +1550,29 @@ def create_app() -> FastAPI:
         if _setup_closed(request):
             return _setup_closed_json()
         uid = _uid(request)
-        clean, error = paths.confine_storage_dir(activities_dir, must_exist=True)
+        # Through the backend, not `paths`: in a split install this folder is
+        # on the rider's machine, and the wizard is the FIRST thing a new
+        # account sees. Checked here, every real Zwift path failed as "not
+        # found or not a directory" - the container has no Zwift install and
+        # never will - which made onboarding unfinishable in server mode.
+        clean, error = _validate_dir(activities_dir, uid, scope="activities")
         if error:
             return JSONResponse({"error": error, "exists": False, "fit_count": 0}, status_code=400)
         if not clean:
             return JSONResponse({"error": "Choose or enter an Activities folder.",
                                  "exists": False, "fit_count": 0}, status_code=400)
         try:
-            fit_count = sum(
-                1 for entry in os.scandir(clean)
-                if entry.is_file() and entry.name.lower().endswith(".fit")
+            listing = get_backend(uid).list_activities(clean)
+        except BackendUnavailable:
+            # The connector answered validate_dir and dropped before this one.
+            return JSONResponse(
+                {"error": _CONNECTOR_OFFLINE_CHECK, "exists": False, "fit_count": 0},
+                status_code=400,
             )
-        except OSError:
-            fit_count = 0
+        # The offered files, so the count is what a scan will actually import:
+        # the in-progress recording buffer is filtered by the machine that owns
+        # the folder and must not be advertised here as a ride to be found.
+        fit_count = len(listing.files)
         db.save_user_settings(uid, {"activities_dir": clean})
         started = _start_user_scan(uid, directory=clean)
         if started is None:
@@ -1561,7 +1581,7 @@ def create_app() -> FastAPI:
             status = started
         return JSONResponse({
             "path": clean,
-            "exists": True,
+            "exists": bool(listing.exists),
             "fit_count": fit_count,
             "status": "files-found" if fit_count else "no-files",
             "scan": status,
@@ -1749,8 +1769,8 @@ def create_app() -> FastAPI:
             )
         clean_dir = None
         if activities_dir.strip():
-            clean_dir, dir_error = paths.confine_storage_dir(
-                activities_dir, must_exist=True
+            clean_dir, dir_error = _validate_dir(
+                activities_dir, uid, scope="activities"
             )
             if dir_error:
                 return templates.TemplateResponse(

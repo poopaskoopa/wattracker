@@ -120,7 +120,13 @@ class Backend(abc.ABC):
 
     @abc.abstractmethod
     def activity_candidates(self) -> List[dict]:
-        """``[{"path": str, "exists": bool}]`` for the Activities folder UI."""
+        """``[{"path": str, "exists": bool, "fit_count": int}]`` for the UI.
+
+        ``fit_count`` is part of the contract because the setup wizard offers
+        the candidates as a choice and the count is what makes one of them
+        obviously right. Counting is the owning machine's job - in a split
+        install the server cannot see the folder to count it.
+        """
 
     @abc.abstractmethod
     def zwift_id_candidates(self) -> List[dict]:
