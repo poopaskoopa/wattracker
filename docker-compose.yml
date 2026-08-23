@@ -17,7 +17,15 @@ services:
       # on a server.
       WATTRACKER_PUBLIC_HOSTS: "${WATTRACKER_PUBLIC_HOSTS:-}"
       # Optional: LLM refinement of coaching text. The app is fully functional
-      # without it.
+      # without it. LLM_ENDPOINT takes 'anthropic' (default), 'openai',
+      # 'openrouter', or the base URL of any OpenAI-compatible server. The
+      # endpoint is shared and changeable by ANY authenticated user on a
+      # multi-user deploy (see README Configuration) - trust your users'
+      # network access accordingly.
+      API_KEY: "${API_KEY:-}"
+      LLM_ENDPOINT: "${LLM_ENDPOINT:-}"
+      LLM_MODEL: "${LLM_MODEL:-}"
+      # Legacy name for API_KEY; existing .env files keep working.
       ANTHROPIC_API_KEY: "${ANTHROPIC_API_KEY:-}"
       # Set both of these once something terminates TLS in front (tailscale
       # serve, Caddy). Until then the session cookie and the connector token

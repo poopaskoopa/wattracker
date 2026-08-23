@@ -8,6 +8,7 @@
 {% if backup_message %}<p class="{{ 'alert' if 'failed' in backup_message else 'ok' }}">{{ backup_message }}</p>{% endif %}
 {% if dir_message %}<p class="alert">{{ dir_message }}</p>{% endif %}
 {% if ftp_message %}<p class="alert" role="alert">{{ ftp_message }}</p>{% endif %}
+{% if llm_message %}<p class="alert" role="alert">{{ llm_message }}</p>{% endif %}
 
 <p class="current-ftp"><strong>Current Training FTP:</strong> {{ current_ftp }} W</p>
 {% set ftp_suggestion_next = '/settings' %}
@@ -110,11 +111,40 @@
                    placeholder="{{ 'leave blank to keep' if zwift_creds_saved else '' }}">
         </label>
     </fieldset>
-    <label>Anthropic API key (app-level, shared)
-        {% if api_key_set %}(currently set){% endif %}:
-        <input type="password" name="anthropic_api_key"
-               placeholder="{{ 'leave blank to keep' if api_key_set else 'sk-ant-...' }}">
-    </label>
+    <fieldset class="llm-settings">
+        <legend>LLM (coaching text refinement)</legend>
+        <p class="hint">Optional &mdash; refines workout names, descriptions and
+            segment coaching text. The app is fully functional without it.</p>
+        <label>Provider:
+            <select name="llm_endpoint">
+                <option value="anthropic"
+                    {{ 'selected' if llm_endpoint == 'anthropic' else '' }}>anthropic</option>
+                <option value="openai"
+                    {{ 'selected' if llm_endpoint == 'openai' else '' }}>openai</option>
+                <option value="openrouter"
+                    {{ 'selected' if llm_endpoint == 'openrouter' else '' }}>openrouter</option>
+                <option value="custom"
+                    {{ 'selected' if llm_endpoint == 'custom' else '' }}>custom (OpenAI-compatible URL)</option>
+            </select>
+        </label>
+        <label>Custom base URL (used when the provider is custom):
+            <input type="text" name="llm_custom_url" autocomplete="off"
+                   placeholder="http://localhost:11434/v1"
+                   value="{{ llm_custom_url or '' }}">
+        </label>
+        <label>Model:
+            <input type="text" name="llm_model" autocomplete="off"
+                   placeholder="blank = per-provider default"
+                   value="{{ llm_model or '' }}">
+            <span class="hint">Blank uses the provider default (required for a
+                custom endpoint). Leaving a saved model blank clears it.</span>
+        </label>
+        <label>API key (app-level, shared)
+            {% if api_key_set %}(currently set){% endif %}:
+            <input type="password" name="api_key" autocomplete="off"
+                   placeholder="{{ 'leave blank to keep' if api_key_set else 'sk-...' }}">
+        </label>
+    </fieldset>
     <button type="submit">Save</button>
 </form>
 
@@ -298,8 +328,10 @@
    to restore backup number <code>N</code>.</p>
 
 <p class="hint">FTP, Zwift ID, and folder paths are private to your account.
-   The Anthropic API key is app-level (shared) and the app is fully functional
-   without one &mdash; LLM refinement is optional. Environment variables
-   (<code>ANTHROPIC_API_KEY</code>, <code>WATTRACKER_SECRET</code>) override
-   stored values.</p>
+    The LLM settings (provider, model, API key) are app-level (shared) and the
+    app is fully functional without them &mdash; LLM refinement is optional.
+    Environment variables (<code>API_KEY</code>, <code>LLM_ENDPOINT</code>,
+    <code>LLM_MODEL</code>, <code>WATTRACKER_SECRET</code>) override stored
+    values; <code>ANTHROPIC_API_KEY</code> is the legacy name for
+    <code>API_KEY</code>.</p>
 {% endblock %}

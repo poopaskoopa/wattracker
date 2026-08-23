@@ -46,7 +46,7 @@ def test_websocket_url_rejects_unusable_values(bad):
 # the build either bloats or breaks at runtime.
 FORBIDDEN = [
     "numpy", "pandas", "scipy", "fastapi", "starlette", "uvicorn",
-    "anthropic", "jinja2", "matplotlib", "fitdecode", "keyring",
+    "anthropic", "openai", "jinja2", "matplotlib", "fitdecode", "keyring",
     "wattracker.db", "wattracker.server", "wattracker.ingest",
 ]
 

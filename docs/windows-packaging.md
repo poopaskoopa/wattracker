@@ -131,7 +131,7 @@ The data directory is **not** part of the install. `wattracker.config` resolves
 it as `WATTRACKER_DATA_DIR` if set, otherwise `~/.wattracker` - on Windows,
 `%USERPROFILE%\.wattracker`. It holds `wattracker.db` (rides, plans, goals,
 password hashes, encrypted credential markers), `config.json` (session secret,
-Anthropic API key), `backups/`, and the launcher's `wattracker-process.json` and
+LLM API key), `backups/`, and the launcher's `wattracker-process.json` and
 logs.
 
 **Upgrade.** A fixed `AppId` GUID makes a reinstall an upgrade rather than a

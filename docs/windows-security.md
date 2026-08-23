@@ -23,7 +23,7 @@ not protect secrets from malware already running as the same Windows user.
 ## Data directory permissions
 
 The data directory and every sensitive file inside it (`config.json`, which holds
-the session secret and Anthropic API key; `wattracker.db` and its `-wal`/`-shm`
+the session secret and LLM API key; `wattracker.db` and its `-wal`/`-shm`
 sidecars and `backups/`, which hold password hashes and encrypted credential
 markers) are locked to the current Windows user with an explicit owner-only ACL.
 
