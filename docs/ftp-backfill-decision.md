@@ -1,11 +1,17 @@
 # Historical TSS backfill — the numbers for the decision (#62)
 
-Nothing has been written to the live database. Every figure below comes from a
-`.backup()` copy of `~/.wattracker/wattracker.db` (520,843,264 bytes,
-17,231 activities, 20 users, 26 `ftp_history` rows) taken through a
-`file:...?mode=ro` handle, and from a dry run of `wattracker-ftp-rescore`
-against that copy. The copy's md5 was identical before and after the dry run
-(`da474528f7c8c3e60f8ab5d56b1627f4`). **The repair has not been run.**
+> **The repair has since been run.** The corrupt and suspect populations were
+> repaired on the live database around 2026-08-06/07 (#60 and #62 closed on
+> those dates). Everything from here to "Status of this recommendation" is the
+> **pre-repair analysis that informed the decision**, preserved unchanged as
+> the record of why the scope was chosen. For what actually happened, and the
+> verification of it, skip to [Outcome](#outcome).
+
+The figures below come from a `.backup()` copy of `~/.wattracker/wattracker.db`
+(520,843,264 bytes, 17,231 activities, 20 users, 26 `ftp_history` rows) taken
+through a `file:...?mode=ro` handle, and from a dry run of
+`wattracker-ftp-rescore` against that copy. The copy's md5 was identical before
+and after the dry run (`da474528f7c8c3e60f8ab5d56b1627f4`).
 
 Reproduce with:
 
@@ -259,14 +265,49 @@ describes every population and names the rows it declined to touch, so a
 narrowed run cannot make the database look healthier than it is. On this
 database it repairs **2,602** rows and withholds **12,874**.
 
-The `--write` path has since been exercised at 520 MB scale against a copy and
-passed. **The live database has deliberately not been touched**: the repair is
-approved in scope but not yet run.
+The `--write` path was exercised at 520 MB scale against a copy and passed
+before being pointed at the live database.
 
-Still open before anything is pointed at the live database:
+## Outcome
 
-1. Settle whether 184.9 W is a real estimate or an artifact of the same import
-   path that produced 0.6 W. This does not block the corrupt/suspect repair —
-   those rows are wrong under any FTP assumption — but it is the question that
-   decides whether the ordinary population ever gets revisited.
-2. Take a verified backup and diff the copy-run output before the live run.
+**Repaired.** The corrupt and suspect populations were rewritten on the live
+database around 2026-08-06/07; #54, #60, #62 and #67 are all closed. The
+ordinary population was withheld, as decided.
+
+Verified 2026-08-23 against the live database through a `file:...?mode=ro`
+handle (17,455 activities, 527,265,792 bytes — both larger than the figures
+above, because riding continued after the repair):
+
+| Check | Before | Now |
+|---|---|---|
+| Rows with implied basis < 50 W (`corrupt`) | 2,335 | **0** |
+| Rows 50–70 W basis with IF > 2.0 (`suspect`) | 267 | **0** |
+| Rows with TSS > 1000 | 2,199 | **0** |
+| Maximum TSS in the database | 16,136,143 | **716.7** |
+| Maximum IF in the database | 279–330 were visible on the races page | **1.998** |
+
+**The `--only` scope held.** Implied scoring bases for rides predating
+2026-07 still cluster on their *original* values — 200 W ×9,844, 250 W ×2,499,
+141 W ×1,690 — so the ordinary population was not rescored. The 183–187 W band
+holds 2,593 rows, which is the repaired population (2,602 approved) rescored
+onto the earliest recorded FTP. Had the backfill run whole, most of those
+16,920 rows would sit in that band instead of 2,593 of them.
+
+### The 184.9 W question resolved itself
+
+Open item 1 above asked whether 184.9 W was a real estimate or an artifact of
+the import path that produced 0.6 W. It no longer turns on that. `ftp_history`
+has grown from 26 rows to **121**, and all 20 users now have more than one
+entry (16 of 20 previously had exactly one, all reading `184.9, estimated`).
+The distribution is now 250.0 W ×50, 209.0 W ×17, 200.0 W ×16, 184.7 W ×13,
+184.4 W ×10, 184.5 W ×6, 184.9 W ×5 — real per-user history rather than one
+estimate shared verbatim by most of the database.
+
+### The ordinary population stays withheld
+
+Nothing here reopens that. The objection was never really 184.9 W's
+provenance; it is that back-applying any 2026 measurement to a 2021 ride makes
+the data differently-assumed rather than more true. Riders now accumulate
+genuine FTP history going forward, so new rides score correctly on their own
+and the stale population matters less each month. Revisit only if someone
+produces a reason beyond staleness.
