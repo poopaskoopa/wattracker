@@ -558,6 +558,13 @@ def test_volume_tiles_select_the_metric_the_hero_chart_plots(
             Chart.getChart(document.getElementById('volumeChart')).scales)"""
     )
     assert sorted(axes) == ["x", "y"], f"hero chart must be single-y-axis: {axes}"
+    initial_scale = page.evaluate(
+        """() => {
+            const chart = Chart.getChart(document.getElementById('volumeChart'));
+            return {key: chart.$volumeMetric.key, min: chart.scales.y.min};
+        }"""
+    )
+    assert initial_scale == {"key": "hours", "min": 0}
 
     # The head above the row: it names the period the tiles quote and says the
     # tiles are the chart's selector. Rendering the tiles must not eat it --
@@ -634,6 +641,25 @@ def test_volume_tiles_select_the_metric_the_hero_chart_plots(
     )
     state = _canvas_is_painted(page, "volumeChart")
     assert state["ok"], f"#volumeChart blank after switching metric: {state}"
+
+    for key in ("tss", "distance_km"):
+        page.locator(f'#volumeSummary .metric-tile[data-key="{key}"]').click()
+        page.wait_for_timeout(100)
+        scale = page.evaluate(
+            """() => {
+                const chart = Chart.getChart(document.getElementById('volumeChart'));
+                return {key: chart.$volumeMetric.key, min: chart.scales.y.min};
+            }"""
+        )
+        assert scale == {"key": key, "min": 0}
+
+    page.locator('#volumeSummary .metric-tile[data-key="calories"]').click()
+    page.wait_for_timeout(100)
+    assert page.evaluate("""() => {
+        const chart = Chart.getChart(document.getElementById('volumeChart'));
+        return chart.$volumeMetric.key === 'calories' &&
+            chart.canvas.width > 0 && chart.canvas.height > 0;
+    }""")
 
     _assert_clean(console_errors, "/volume")
 

@@ -280,6 +280,7 @@ function makeChart() {
                 },
                 y: {
                     beginAtZero: true,
+                    ...(spec.key === "calories" ? {} : { min: 0 }),
                     // Headroom for the direct label above the tallest bar.
                     grace: "12%",
                     ticks: { maxTicksLimit: 5 },
@@ -355,6 +356,7 @@ function repaint() {
     // The tick formatter closes over the label array, so a new window needs a
     // new closure or the ticks name the old dates.
     chart.options.scales.x.ticks.callback = monthYearTicks(labels);
+    chart.options.scales.y.min = spec.key === "calories" ? undefined : 0;
     chart.options.scales.y.title.text = spec.label;
     chart.update("none");
     applying = false;
