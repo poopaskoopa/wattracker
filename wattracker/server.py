@@ -73,6 +73,11 @@ from .ftp_input import (
     FTP_INPUT_MIN_WATTS,
     parse_ftp_input,
 )
+from .weight_input import (
+    WEIGHT_INPUT_MAX_KG,
+    WEIGHT_INPUT_MIN_KG,
+    parse_weight_input,
+)
 from .prescribe import adapt as adaptmod
 from .prescribe import duration as durationmod
 from .prescribe import goals as goalsmod
@@ -93,7 +98,14 @@ from .prescribe.planner import (
     workout_type_info,
     validate_variant,
 )
-from .timeutil import local_today, utc_now, utc_today, valid_timezone
+from .timeutil import (
+    local_today,
+    parse_naive,
+    to_user_timezone,
+    utc_now,
+    utc_today,
+    valid_timezone,
+)
 
 DAY_LABELS = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
 
@@ -666,8 +678,11 @@ MAX_UPLOAD_BYTES = 50 * 1024 * 1024
 # bounded before importing any member, even when a browser omits file sizes.
 MAX_ONBOARDING_UPLOAD_BYTES = 50 * 1024 * 1024
 MAX_ONBOARDING_UPLOAD_FILES = 200
-ONBOARDING_WEIGHT_MIN_KG = 20.0
-ONBOARDING_WEIGHT_MAX_KG = 300.0
+# Body weight shares one input policy (wattracker.weight_input) the way FTP
+# does (wattracker.ftp_input, issue #64); these exist only so the onboarding
+# template and the wizard keep a stable pair of names to import.
+ONBOARDING_WEIGHT_MIN_KG = WEIGHT_INPUT_MIN_KG
+ONBOARDING_WEIGHT_MAX_KG = WEIGHT_INPUT_MAX_KG
 # Said when the connector goes away mid-wizard. Matches the wording
 # RemoteBackend.validate_dir uses for the same condition, so a rider who
 # retries does not get two different accounts of one problem.
@@ -1156,6 +1171,19 @@ def _ftp_field_value(watts) -> str:
     return str(int(value)) if value == int(value) else f"{value:g}"
 
 
+def _weight_field_value(kg) -> str:
+    """A stored weight as the text to prefill a weight field with (see
+    _ftp_field_value: whole kilos render without a decimal point, fractions
+    render as stored)."""
+    if kg is None:
+        return ""
+    try:
+        value = float(kg)
+    except (TypeError, ValueError):
+        return ""
+    return str(int(value)) if value == int(value) else f"{value:g}"
+
+
 def _setup_number(raw: str, minimum: float, maximum: float) -> Optional[float]:
     try:
         value = float((raw or "").strip())
@@ -1164,6 +1192,25 @@ def _setup_number(raw: str, minimum: float, maximum: float) -> Optional[float]:
     if not _math.isfinite(value) or value < minimum or value > maximum:
         return None
     return value
+
+
+def _weight_log_date(
+    raw: Optional[str], timezone: Optional[str]
+) -> tuple[Optional[str], Optional[str]]:
+    """A typed weigh-in date as ISO, or an error message.
+
+    It must be a real calendar date and not after the rider's local today: a
+    future weigh-in is a mistake, and a future-dated row would skew every
+    "latest known weight on or before" resolution for present records.
+    """
+    text = (raw or "").strip()
+    try:
+        parsed = _dt.date.fromisoformat(text)
+    except (TypeError, ValueError):
+        return None, "Enter the weigh-in date as YYYY-MM-DD."
+    if parsed > local_today(timezone):
+        return None, "The weigh-in date cannot be in the future."
+    return parsed.isoformat(), None
 
 
 def _feed_base_url(request: Request) -> str:
@@ -1614,6 +1661,13 @@ def create_app() -> FastAPI:
                 setup_ftp_min=round(FTP_INPUT_MIN_WATTS),
                 setup_ftp_max=round(FTP_INPUT_MAX_WATTS),
             )
+        # Body weight card: the value effective on the rider's local today
+        # (their own log, then a Zwift-derived row, then the settings scalar);
+        # hidden when nothing is known at all.
+        weight_settings = db.get_user_settings(uid)
+        body_weight = db.weight_resolution(
+            uid, local_today(weight_settings.get("timezone")).isoformat()
+        )
         return templates.TemplateResponse(
             request,
             "dashboard.html",
@@ -1622,6 +1676,7 @@ def create_app() -> FastAPI:
                 state=state.to_dict(),
                 banner=banner,
                 onboarding_complete=complete,
+                body_weight=body_weight,
                 **setup_ctx,
             ),
         )
@@ -1935,7 +1990,7 @@ def create_app() -> FastAPI:
             backend = None
             cred_saved = False
             rider_id = ""
-        updates = {"weight_kg": weight}
+        updates: dict = {}
         if clean_dir:
             updates["activities_dir"] = clean_dir
         if choice == "manual":
@@ -1948,6 +2003,11 @@ def create_app() -> FastAPI:
         if cred_saved:
             updates["zwift_id"] = rider_id
         db.save_user_settings(uid, updates)
+        # The onboarding weight is a measurement like any other: a manual log
+        # for the rider's local today, not the legacy scalar (record_weight
+        # re-syncs the scalar for the readers that still use it).
+        tz = db.get_user_settings(uid).get("timezone")
+        db.record_weight(uid, local_today(tz).isoformat(), weight, "manual")
         if analyzed:
             db.add_ftp_entry(
                 uid,
@@ -2057,6 +2117,17 @@ def create_app() -> FastAPI:
                 manual_hr_max=settings.get("hr_max"),
                 ftp_min=round(FTP_INPUT_MIN_WATTS),
                 ftp_max=round(FTP_INPUT_MAX_WATTS),
+                # Body weight: the full dated history for the log table and
+                # chart, and the value effective on the rider's local today
+                # for the "current" card and the log form's default.
+                weight_entries=db.weight_history_list(uid),
+                weight_now=db.weight_resolution(
+                    uid, local_today(settings.get("timezone")).isoformat()
+                ),
+                # The log form's date default: the rider's local today.
+                weight_today=local_today(settings.get("timezone")).isoformat(),
+                weight_min=round(WEIGHT_INPUT_MIN_KG),
+                weight_max=round(WEIGHT_INPUT_MAX_KG),
                 ftp_confirm_required=confirm_required,
                 error=error,
                 saved=request.query_params.get("saved"),
@@ -2252,6 +2323,39 @@ def create_app() -> FastAPI:
             _log.warning("profile refresh after HRmax save failed", exc_info=True)
         return RedirectResponse("/profile?saved=1", status_code=303)
 
+    @app.post("/weight", response_class=HTMLResponse)
+    def weight_log(
+        request: Request,
+        date: str = Form(""),
+        weight_kg: str = Form(""),
+    ):
+        """Log a manual weigh-in for a date (default: the rider's local today)."""
+        uid = _uid(request)
+        tz = db.get_user_settings(uid).get("timezone")
+        parsed = parse_weight_input(weight_kg)
+        if (date or "").strip() == "":
+            date_iso = local_today(tz).isoformat()
+        else:
+            date_iso, date_error = _weight_log_date(date, tz)
+            if date_error:
+                return _profile_response(request, date_error)
+        if parsed.kg is None:
+            return _profile_response(request, parsed.error or "Weight not saved.")
+        db.record_weight(uid, date_iso, parsed.kg, "manual")
+        return RedirectResponse("/profile?saved=weight", status_code=303)
+
+    @app.post("/weight/delete", response_class=HTMLResponse)
+    def weight_delete(request: Request, date: str = Form("")):
+        """Remove one dated entry. Deleting a Zwift-derived row is fine: the
+        next refresh re-derives it from the ride record."""
+        uid = _uid(request)
+        text = (date or "").strip()
+        if not db.delete_weight_entry(uid, text):
+            return _profile_response(
+                request, "No weight is logged for that date."
+            )
+        return RedirectResponse("/profile?saved=weight", status_code=303)
+
     @app.get("/activity/{activity_id}", response_class=HTMLResponse)
     def activity_detail_page(request: Request, activity_id: int):
         uid = _uid(request)
@@ -2262,7 +2366,8 @@ def create_app() -> FastAPI:
         # arrays load from the JSON endpoint so the HTML stays small.
         summary = {k: detail[k] for k in (
             "id", "filename", "start_time", "duration_s", "distance_m",
-            "avg_power", "avg_hr", "np", "if_", "tss", "have", "points")}
+            "avg_power", "avg_hr", "np", "if_", "tss", "rpe", "have", "points",
+            "weight_kg", "weight_source", "weight_date")}
         summary["duration_fmt"] = races.format_duration(summary.get("duration_s"))
         return templates.TemplateResponse(
             request, "activity_detail.html", _ctx(request, activity=summary)
@@ -2490,6 +2595,48 @@ def create_app() -> FastAPI:
         if not db.set_activity_rpe(uid, activity_id, rpe_val):
             return JSONResponse({"error": "activity not found"}, status_code=404)
         return JSONResponse({"id": activity_id, "rpe": rpe_val})
+
+    @app.post("/api/activity/{activity_id}/weight")
+    def api_activity_weight(
+        request: Request,
+        activity_id: int,
+        weight_kg: object = Body(None, embed=True),
+        date: Optional[str] = Body(None, embed=True),
+    ):
+        """Store a manual weigh-in; defaults to the ride's own local date.
+
+        The date is the ride's local calendar day unless the rider posts one
+        explicitly - the same "weight as of that day" resolution then applies
+        to every record on that date, not just this activity.
+        """
+        uid = _uid(request)
+        act = db.get_activity(uid, activity_id)
+        if act is None:
+            return JSONResponse({"error": "activity not found"}, status_code=404)
+        parsed = parse_weight_input(weight_kg)
+        if parsed.kg is None:
+            return JSONResponse(
+                {"error": parsed.error or "weight not saved"}, status_code=400
+            )
+        settings = db.get_user_settings(uid)
+        tz = settings.get("timezone")
+        if date in (None, ""):
+            start = parse_naive(act.get("start_time"))
+            date_iso = (
+                to_user_timezone(start, tz).date().isoformat()
+                if start is not None
+                else local_today(tz).isoformat()
+            )
+        else:
+            date_iso, date_error = _weight_log_date(date, tz)
+            if date_error:
+                return JSONResponse({"error": date_error}, status_code=400)
+        db.record_weight(uid, date_iso, parsed.kg, "manual")
+        return JSONResponse(
+            {"date": date_iso, "weight_kg": parsed.kg, "source": "manual"}
+        )
+
+
 
     @app.post("/activities/rescan")
     def rescan(request: Request, activities_dir: str = Form("")):
@@ -3896,6 +4043,8 @@ def create_app() -> FastAPI:
                       ftp_message: Optional[str] = None,
                       ftp_confirm_required: bool = False,
                       ftp_form_value: Optional[str] = None,
+                      weight_message: Optional[str] = None,
+                      weight_form_value: Optional[str] = None,
                       connector_message: Optional[str] = None,
                       connector_new_token: Optional[str] = None,
                       connector_new_label: Optional[str] = None,
@@ -3931,6 +4080,16 @@ def create_app() -> FastAPI:
             ftp_confirm_required=ftp_confirm_required,
             ftp_min=round(FTP_INPUT_MIN_WATTS),
             ftp_max=round(FTP_INPUT_MAX_WATTS),
+            # A refused weight is echoed back in the field, the FTP way: the
+            # rider sees and corrects what they typed rather than the stored
+            # value silently replacing it.
+            weight_message=weight_message,
+            weight_form_value=(
+                _weight_field_value(settings.get("weight_kg"))
+                if weight_form_value is None else weight_form_value
+            ),
+            weight_min=round(WEIGHT_INPUT_MIN_KG),
+            weight_max=round(WEIGHT_INPUT_MAX_KG),
             # Whether a link exists is safe to render; the token itself is only
             # ever passed in as calendar_feed_url, by the route that just
             # minted it, and is never read back out of the database.
@@ -4083,13 +4242,17 @@ def create_app() -> FastAPI:
             ftp_confirm_required = parsed.needs_confirmation
         # A picked player folder (radio) wins over the free-text field.
         chosen_zwift_id = (zwift_id_choice or "").strip() or zwift_id
+        # Weight follows the same single-policy shape as FTP: parse_weight_input
+        # is the only gate, a rejected value is reported and left unsaved, and
+        # the rest of the form is saved regardless. An accepted value becomes a
+        # manual log for the rider's local today, not the legacy scalar.
+        weight_message: Optional[str] = None
         weight_val: Optional[float] = None
-        try:
-            weight_val = float(weight_kg) if weight_kg.strip() else None
-            if weight_val is not None and weight_val <= 0:
-                weight_val = None
-        except ValueError:
-            weight_val = None
+        if (weight_kg or "").strip():
+            parsed_weight = parse_weight_input(weight_kg)
+            weight_val = parsed_weight.kg
+            if parsed_weight.error:
+                weight_message = "Weight not saved. " + parsed_weight.error
         # Confine user-supplied folders to existing directories under $HOME; a
         # rejected folder is dropped from the update (existing value kept).
         dir_msgs: List[str] = []
@@ -4127,13 +4290,19 @@ def create_app() -> FastAPI:
                 "zwift_id": chosen_zwift_id,
                 "activities_dir": clean_activities,
                 "workouts_dir": clean_workouts,
-                "weight_kg": weight_val,
                 "timezone": clean_timezone,
             },
         )
         # A manual FTP entry records a source='manual' row for today (per user).
         if ftp_value is not None:
             db.add_ftp_entry(uid, utc_today().isoformat(), ftp_value, "manual")
+        # A typed weight is a measurement: a manual log for the rider's local
+        # today. record_weight re-syncs the legacy scalar to it (a fresh manual
+        # log is always the latest-dated row), so scalar readers stay current.
+        if weight_val is not None:
+            tz = db.get_user_settings(uid).get("timezone")
+            db.record_weight(uid, local_today(tz).isoformat(), weight_val,
+                             "manual")
         try:
             profile_store.refresh(uid)
         except Exception:
@@ -4273,6 +4442,8 @@ def create_app() -> FastAPI:
                           ftp_message=ftp_message,
                           ftp_confirm_required=ftp_confirm_required,
                           ftp_form_value=ftp if ftp_message else None,
+                          weight_message=weight_message,
+                          weight_form_value=weight_kg if weight_message else None,
                           refusal_message=_CONNECTOR_REFUSAL if refusal else None,
                           llm_message="; ".join(llm_msgs) or None),
             status_code=403 if refusal else 200,

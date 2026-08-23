@@ -13,13 +13,37 @@
     <div class="card"><span class="label">Distance</span>
         <span class="value">{{ ('%.1f'|format(activity.distance_m / 1000)) ~ ' km' if activity.distance_m else '—' }}</span></div>
     <div class="card"><span class="label">Avg Power</span>
-        <span class="value">{{ '%.0f'|format(activity.avg_power or 0) }} W</span></div>
+        <span class="value">{{ '%.0f'|format(activity.avg_power or 0) }} W</span>
+        {% if activity.avg_power and activity.weight_kg %}
+        <span class="sub">{{ '%.2f'|format(activity.avg_power / activity.weight_kg) }} W/kg</span>
+        {% endif %}</div>
     <div class="card"><span class="label">NP</span>
         <span class="value">{{ '%.0f'|format(activity.np or 0) }} W</span></div>
     <div class="card"><span class="label">IF</span>
         <span class="value">{{ '%.2f'|format(activity.if_ or 0) }}</span></div>
     <div class="card"><span class="label">TSS</span>
         <span class="value">{{ '%.0f'|format(activity.tss or 0) }}</span></div>
+    <div class="card" id="weightCard"
+         title="Body weight for this ride's date - what its W/kg divides by. The latest dated log wins: your own weigh-in, then the weight the Zwift ride was ridden at, then a Zwift profile sync, then your profile setting.">
+        <span class="label">Weight</span>
+        <span class="value" id="weightValue">{{ '%.1f'|format(activity.weight_kg) ~ ' kg' if activity.weight_kg else '—' }}</span>
+        <span class="sub" id="weightSub"><span id="weightSubText">{% if activity.weight_kg %}{% if activity.weight_source == 'manual' %}you logged{% elif activity.weight_source == 'zwift_ride' %}from the Zwift ride{% elif activity.weight_source == 'zwift_profile' %}from a Zwift profile sync{% elif activity.weight_source == 'settings' %}from your profile setting{% endif %} · {{ activity.weight_date }}{% endif %}</span>
+            <a href="#" id="weightEditLink" role="button">log&hellip;</a></span></div>
+</section>
+
+<section class="weight-log-section" id="weightLogSection" hidden
+         aria-label="Log a weight for this ride's date">
+    <form class="hrmax-form" id="weightLogForm">
+        <label for="weightLogDate">Date (the ride's local date, or the weigh-in's)</label>
+        <input id="weightLogDate" name="date" type="date"
+               value="{{ activity.weight_date or '' }}">
+        <label for="weightLogKg">Weight (20&ndash;300 kg)</label>
+        <input id="weightLogKg" name="weight_kg" type="number" step="0.1"
+               min="20" max="300" inputmode="decimal"
+               value="{{ '%.1f'|format(activity.weight_kg) if activity.weight_kg else '' }}">
+        <button type="submit">Save weight</button>
+    </form>
+    <p class="hint" id="weightLogStatus" role="status"></p>
 </section>
 
 <section class="rpe-section" id="rpeSection" hidden aria-labelledby="rpeTitle">

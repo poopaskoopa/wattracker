@@ -4,7 +4,8 @@
 <h2>Rider profile</h2>
 <p><a href="/profile/power-corrections">Correct power data</a> — find and reversibly mask anomalous full-resolution samples.</p>
 {% if saved == 'ftp' %}<p class="ok" role="status">Training FTP setting saved.</p>
-{% elif saved == '1' %}<p class="ok" role="status">Heart-rate setting saved.</p>{% endif %}
+{% elif saved == '1' %}<p class="ok" role="status">Heart-rate setting saved.</p>
+{% elif saved == 'weight' %}<p class="ok" role="status">Weight saved.</p>{% endif %}
 {% if error %}<p class="alert" role="alert">{{ error }}</p>{% endif %}
 
 <section class="profile-section" aria-labelledby="targets-title">
@@ -113,6 +114,74 @@
     {% endif %}
 </section>
 
+<section class="profile-section body-weight" aria-labelledby="body-weight-title">
+    <h3 id="body-weight-title">Body weight</h3>
+    {% set weight_sources = {
+        'manual': 'you logged',
+        'zwift_ride': 'from the Zwift ride',
+        'zwift_profile': 'from a Zwift profile sync',
+        'settings': 'from your profile setting'
+    } %}
+    {% set table_sources = {
+        'manual': 'you logged',
+        'zwift_ride': 'Zwift ride',
+        'zwift_profile': 'Zwift profile sync',
+        'settings': 'profile setting'
+    } %}
+    <p>
+        <strong>{% if weight_now and weight_now.weight_kg is not none %}{{ '%.1f'|format(weight_now.weight_kg) }} kg{% else %}—{% endif %}</strong>
+        {% if weight_now %}<span class="hint"> as of {{ weight_now.date }} ·
+        {{ weight_sources.get(weight_now.source, weight_now.source) }}</span>{% endif %}
+    </p>
+    <p class="hint">Each record is labelled with the weight logged for its date:
+        weigh-ins you log take precedence for that date, Zwift fills the dates
+        its rides and profile syncs cover, and the rest steps back to your
+        oldest known entry.</p>
+    {% if weight_entries %}
+    <canvas id="bodyWeightChart" height="210" role="img"
+            aria-label="Body weight over time, kilograms by date"></canvas>
+    {% endif %}
+    <form class="hrmax-form" method="post" action="/weight">
+        <label for="weight-log-date">Date (a weigh-in cannot be in the future)</label>
+        <input id="weight-log-date" name="date" type="date"
+               max="{{ weight_today }}" value="{{ weight_today }}">
+        <label for="weight-log-kg">Weight ({{ weight_min }}&ndash;{{ weight_max }} kg)</label>
+        <input id="weight-log-kg" name="weight_kg" type="number" step="0.1"
+               min="{{ weight_min }}" max="{{ weight_max }}" inputmode="decimal"
+               value="{{ '%.1f'|format(weight_now.weight_kg) if weight_now and weight_now.weight_kg is not none else '' }}">
+        <button type="submit">Log weight</button>
+    </form>
+    {% if weight_entries %}
+    <div class="table-scroll">
+    <table class="zone-table">
+        <caption class="sr-only">Weight log, newest first</caption>
+        <thead><tr>
+            <th scope="col">Date</th>
+            <th scope="col">Weight</th>
+            <th scope="col">Source</th>
+            <th scope="col"><span class="sr-only">Delete</span></th>
+        </tr></thead>
+        <tbody>{% for entry in weight_entries|reverse %}
+        <tr>
+            <th scope="row">{{ entry.date }}</th>
+            <td class="num">{{ '%.1f'|format(entry.weight_kg) }} kg</td>
+            <td>{{ table_sources.get(entry.source, entry.source) }}</td>
+            <td>
+                <form method="post" action="/weight/delete">
+                    <input type="hidden" name="date" value="{{ entry.date }}">
+                    <button type="submit" class="button-secondary">Delete</button>
+                </form>
+            </td>
+        </tr>
+        {% endfor %}</tbody>
+    </table>
+    </div>
+    {% else %}
+    <p class="hint">No weigh-ins yet &mdash; log one above, or refresh Zwift to
+        import each ride's recorded weight.</p>
+    {% endif %}
+</section>
+
 <section class="profile-section" aria-labelledby="power-zone-title">
     <h3 id="power-zone-title">Power zones</h3>
     {% if profile.power.available %}
@@ -177,10 +246,16 @@
 {% if power_profile.available %}
 <script id="powerProfileData" type="application/json">{{ power_profile.chart|tojson }}</script>
 {% endif %}
+{% if weight_entries %}
+<script id="bodyWeightData" type="application/json">{{ weight_entries|tojson }}</script>
+{% endif %}
 {% endblock %}
 
 {% block scripts %}
 {% if power_profile.available %}
 <script src="{{ static_url('power_profile.js') }}"></script>
+{% endif %}
+{% if weight_entries %}
+<script src="{{ static_url('body_weight.js') }}"></script>
 {% endif %}
 {% endblock %}
