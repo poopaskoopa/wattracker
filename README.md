@@ -179,6 +179,15 @@ layer is disabled with a warning. A custom URL may be keyless (local
 servers); the three named providers require `API_KEY`. `ANTHROPIC_API_KEY` is
 the legacy name for `API_KEY` and still works as a fallback.
 
+The refinement call is one chat-completion request: a 60 second timeout and a
+2000-token output budget (`max_tokens`), made without retries. For a custom
+endpoint, use a non-reasoning (instruct) model. Reasoning models spend the
+output budget on thinking tokens first, so the JSON answer can come back with
+zero content tokens, and thinking can also overrun the 60 second window, in
+which case the request is dropped (visible as a canceled request in the
+server's log). Either way the layer degrades to the unrefined formula plan, so
+a thinking model costs latency and refinement quality, not correctness.
+
 Like the key, the endpoint and model are **app-level and shared**: any
 authenticated user of the installation can change them from Settings, and the
 prompt sent to a custom URL contains the requesting rider's training state

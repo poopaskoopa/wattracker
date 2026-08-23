@@ -93,7 +93,10 @@ def main() -> None:
             f"UNCHANGED after {elapsed:.1f}s - the call failed or returned "
             "no refinements; the WARNING line above (if any) says why. "
             "If the error names response_format or the model, the provider "
-            "rejected something the retry could not recover from."
+            "rejected something the retry could not recover from. A timeout "
+            "or an empty reply at ~60s smells like a reasoning model: its "
+            "thinking consumes the 2000-token budget and/or overruns the "
+            "60s window, so use a non-reasoning (instruct) model."
         )
         sys.exit(2)
     print(f"CHANGED after {elapsed:.1f}s - the live endpoint refined the plan.")
