@@ -9,8 +9,18 @@ the branch. Without a gate, opening a pull request is remote code execution on
 someone's desk.
 
 GitHub's first-time-contributor approval prompt does not cover this: approving
-a contributor once exempts every later pull request from that account. The gate
-in the workflow is the control, so it is asserted here.
+a contributor once exempts every later pull request from that account. The
+repository is therefore set to require approval for *all* external
+contributors, and that setting is the actual control.
+
+The gate asserted below is defence in depth, not a boundary. For
+`pull_request` events GitHub runs the workflow file from the pull request's
+own head ref, not from the base branch, so a fork PR can edit or delete the
+very `if:` condition these tests check. The gate stops an unmodified workflow
+from reaching a runner; it cannot stop one that rewrites it. These tests exist
+to catch the gate being dropped by accident - a refactor, a merge, a careless
+edit - not by an attacker. Do not treat a passing run here as evidence that
+fork PRs cannot reach the runners.
 """
 
 from pathlib import Path
