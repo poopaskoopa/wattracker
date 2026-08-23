@@ -3,19 +3,23 @@
 {% block content %}
 <h2>Training Volume</h2>
 
+{# The tile row is both the at-a-glance view of all four metrics and the
+   selector for the chart below: each tile carries its 4-week total, its change
+   against the previous four, and a sparkline of the whole history, and
+   pressing one plots that metric. Built by volume.js (it needs the series to
+   draw the sparklines), so this is deliberately empty markup. #}
 <section id="volumeSummary" class="cards" style="display:none"></section>
 
 <p id="volumeEmpty" class="hint" style="display:none">No training data yet — import or upload activities to see your weekly volume.</p>
 
-{# Small multiples: four metrics, four panels, ONE x axis. Four separate blocks
-   each redrawing the same dates was four copies of the same information. Only
-   the bottom panel draws the date labels; the other three keep their gridlines
-   and are held in column by alignPanels(). Each panel keeps its own y scale -
-   hours, TSS, km and kcal are four units, which is exactly why this is four
-   panels and not four series. Panel heights come from CSS (.volume-panels) so
-   that the bottom panel can carry a fixed +18px for its tick labels and leave
-   all four plot areas the same height - a canvas `height` attribute can only
-   express a ratio, which would have made that strip grow with the viewport. #}
+{# One chart, one metric, one y axis. Hours, TSS, km and kcal are the same
+   rides measured four ways, so four stacked panels spent four charts' worth of
+   page on one chart's worth of information - every panel drew the same shape.
+   The metric comes from the pressed tile above; the bars are the weekly value
+   and the line is its trailing 4-week mean, sharing the single y scale because
+   they share a unit. Height is CSS (.volume-chart) rather than a canvas
+   `height` ratio, so the plot keeps a sane desktop height instead of growing
+   with the viewport. #}
 <section id="volumeBlock" class="chart-block" style="display:none">
     <div class="chart-head">
         <h3>Weekly volume</h3>
@@ -29,13 +33,10 @@
             <button type="button" id="volResetZoom">Reset zoom</button>
         </div>
     </div>
-    <div id="volumePanels" class="chart-panels volume-panels">
-        <div class="volume-panel"><canvas id="hoursChart"></canvas></div>
-        <div class="volume-panel"><canvas id="tssChart"></canvas></div>
-        <div class="volume-panel"><canvas id="distanceChart"></canvas></div>
-        <div class="volume-panel volume-panel--x"><canvas id="caloriesChart"></canvas></div>
+    <div class="chart-panels volume-chart">
+        <canvas id="volumeChart"></canvas>
     </div>
-    <p class="hint">Tip: drag horizontally across any panel to zoom all four into that date range.</p>
+    <p class="hint">Tip: pick a metric above, and drag horizontally across the chart to zoom into a date range.</p>
 </section>
 {% endblock %}
 

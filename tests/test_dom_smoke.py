@@ -536,16 +536,195 @@ def test_plan_graph_button_expands_row_with_drawn_svg(page, live_server,
     _assert_clean(console_errors, "/plan graph toggle")
 
 
-def test_volume_page_renders_all_four_charts(page, live_server, console_errors):
-    """All four weekly-volume canvases paint with data."""
-    page.goto(f"{live_server.base}/volume")
-    _wait_for_charts(page, "hoursChart", "tssChart", "distanceChart", "caloriesChart")
+def test_volume_tiles_select_the_metric_the_hero_chart_plots(
+        page, live_server, console_errors):
+    """The tile row is the selector and the one chart follows it.
 
-    for canvas_id in ("hoursChart", "tssChart", "distanceChart", "caloriesChart"):
-        state = _canvas_is_painted(page, canvas_id)
-        assert state["ok"], f"#{canvas_id} did not render: {state}"
+    The page used to stack four full-width bar panels that all drew the same
+    shape. Now the four metrics live as sparkline tiles and exactly one of them
+    is plotted below, so the test that matters is no longer "four canvases
+    painted" but "the tiles are real toggles and pressing one repaints the one
+    chart with the metric it names".
+    """
+    page.goto(f"{live_server.base}/volume")
+    _wait_for_charts(page, "volumeChart")
+
+    state = _canvas_is_painted(page, "volumeChart")
+    assert state["ok"], f"#volumeChart did not render: {state}"
+    # Weekly bars plus the trailing mean, on one y axis.
+    assert state["datasets"] == 2, f"expected bars + mean line, got {state}"
+    axes = page.evaluate(
+        """() => Object.keys(
+            Chart.getChart(document.getElementById('volumeChart')).scales)"""
+    )
+    assert sorted(axes) == ["x", "y"], f"hero chart must be single-y-axis: {axes}"
+
+    tiles = page.locator("#volumeSummary .metric-tile")
+    assert tiles.count() == 4, f"expected four metric tiles, got {tiles.count()}"
+    pressed = page.locator('#volumeSummary .metric-tile[aria-pressed="true"]')
+    assert pressed.count() == 1, "exactly one tile must be pressed at a time"
+
+    # Every tile carries a drawn sparkline, not an empty <svg></svg>.
+    sparks = page.evaluate(
+        """() => Array.from(
+            document.querySelectorAll('#volumeSummary .metric-tile')
+        ).map(tile => {
+            const svg = tile.querySelector('svg.sparkline');
+            if (!svg) return {ok: false, why: 'tile has no sparkline'};
+            const poly = svg.querySelector('polyline');
+            const path = svg.querySelector('path');
+            const box = svg.getBoundingClientRect();
+            const pts = poly ? (poly.getAttribute('points') || '') : '';
+            const d = path ? (path.getAttribute('d') || '') : '';
+            return {
+                ok: pts.split(' ').length > 1 && d.length > 20
+                    && box.width > 10 && box.height > 5,
+                key: tile.dataset.key, points: pts.length, d: d.length,
+                w: box.width, h: box.height,
+            };
+        })"""
+    )
+    for spark in sparks:
+        assert spark["ok"], f"tile sparkline not drawn: {spark}"
+
+    # Pressing an unpressed tile moves the selection AND repaints the chart.
+    before = page.evaluate(
+        """() => Chart.getChart(
+            document.getElementById('volumeChart')).options.scales.y.title.text"""
+    )
+    # Resolve the target by key before clicking: a locator on
+    # [aria-pressed="false"] re-queries after the click and would silently
+    # point at a different tile.
+    other_key = page.locator(
+        '#volumeSummary .metric-tile[aria-pressed="false"]'
+    ).first.get_attribute("data-key")
+    other = page.locator(f'#volumeSummary .metric-tile[data-key="{other_key}"]')
+    other.click()
+    page.wait_for_timeout(150)
+
+    assert other.get_attribute("aria-pressed") == "true"
+    assert page.locator(
+        '#volumeSummary .metric-tile[aria-pressed="true"]'
+    ).count() == 1
+    after = page.evaluate(
+        """() => Chart.getChart(
+            document.getElementById('volumeChart')).options.scales.y.title.text"""
+    )
+    assert after != before, (
+        f"clicking the {other_key} tile left the chart on {before}"
+    )
+    state = _canvas_is_painted(page, "volumeChart")
+    assert state["ok"], f"#volumeChart blank after switching metric: {state}"
 
     _assert_clean(console_errors, "/volume")
+
+
+def test_volume_hero_chart_ignores_a_near_zero_drag(
+        page, live_server, console_errors):
+    """A ~0px drag on the chart is a click, not a range selection.
+
+    Below the 2-bucket floor `onDragZoom` must leave winStart/winEnd (and the
+    preset highlight) untouched AND cancel the zoom plugin's own transform --
+    otherwise the chart sits visually zoomed to a state the module's window
+    disagrees with, recoverable only via Reset zoom or a preset.
+    """
+    page.goto(f"{live_server.base}/volume")
+    _wait_for_charts(page, "volumeChart")
+
+    canvas = page.locator("#volumeChart")
+    box = canvas.bounding_box()
+    mid_y = box["y"] + box["height"] / 2
+    start_x = box["x"] + box["width"] / 2
+
+    before = page.evaluate(
+        """() => Chart.getChart(document.getElementById('volumeChart'))
+            .data.labels.slice()"""
+    )
+    active_before = page.locator(
+        '#volumeControls .range-btn.active'
+    ).count()
+
+    # A near-0px drag: down, move 1px, up.
+    page.mouse.move(start_x, mid_y)
+    page.mouse.down()
+    page.mouse.move(start_x + 1, mid_y)
+    page.mouse.up()
+    page.wait_for_timeout(150)
+
+    after = page.evaluate(
+        """() => Chart.getChart(document.getElementById('volumeChart'))
+            .data.labels.slice()"""
+    )
+    assert after == before, "a near-0px drag re-windowed the chart"
+    # Not left in a visually-zoomed state either: the x scale should still
+    # span the whole label set, not a sliver of it.
+    scale_span = page.evaluate(
+        """() => {
+            const s = Chart.getChart(document.getElementById('volumeChart'))
+                .scales.x;
+            return s.max - s.min;
+        }"""
+    )
+    assert scale_span >= before.__len__() - 1.5, (
+        f"chart left visually zoomed after a near-0px drag: span={scale_span}"
+    )
+    assert page.locator('#volumeControls .range-btn.active').count() == \
+        active_before
+
+    # A genuine drag still re-windows as before.
+    page.mouse.move(start_x, mid_y)
+    page.mouse.down()
+    page.mouse.move(start_x + box["width"] / 3, mid_y)
+    page.mouse.up()
+    page.wait_for_timeout(150)
+
+    zoomed = page.evaluate(
+        """() => Chart.getChart(document.getElementById('volumeChart'))
+            .data.labels.slice()"""
+    )
+    assert len(zoomed) < len(before), (
+        f"a genuine drag did not re-window: before={len(before)} "
+        f"after={len(zoomed)}"
+    )
+
+    _assert_clean(console_errors, "/volume drag-zoom")
+
+
+def test_volume_tile_reports_no_baseline_for_all_zero_history(
+        page, live_server, console_errors):
+    """An all-zero history must not claim '0% vs prev 4' -- that percentage
+    (0/0) is undefined, not zero.
+    """
+    weeks = []
+    monday = dt.date(2026, 1, 5)
+    for i in range(8):
+        d = monday + dt.timedelta(weeks=i)
+        weeks.append({
+            "week_start": d.isoformat(),
+            "hours": 0, "tss": 0, "distance_km": 0, "calories": 0,
+        })
+    page.route(
+        "**/api/volume",
+        lambda route: route.fulfill(
+            status=200,
+            content_type="application/json",
+            body=json.dumps({"weeks": weeks}),
+        ),
+    )
+    page.goto(f"{live_server.base}/volume")
+    _wait_for_charts(page, "volumeChart")
+
+    tiles = page.locator("#volumeSummary .metric-tile")
+    assert tiles.count() == 4
+    for i in range(tiles.count()):
+        text = tiles.nth(i).inner_text().lower()
+        assert "0%" not in text, f"all-zero history reported a percentage: {text}"
+        assert "vs prev 4" not in text, (
+            f"all-zero history still compared against a zero baseline: {text}"
+        )
+        assert "no baseline" in text, f"tile did not explain the zero baseline: {text}"
+
+    _assert_clean(console_errors, "/volume all-zero history")
 
 
 def test_every_nav_page_loads_clean(page, live_server, console_errors):
