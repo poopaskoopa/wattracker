@@ -141,6 +141,16 @@ def test_volume_page_renders(client):
     assert r.status_code == 200
     assert "Training Volume" in r.text
     assert "volume.js?v=" in r.text
+    # The summary head is server-rendered (the tiles below it are not), so the
+    # period the tiles quote and the fact that they are controls are on the
+    # page before any JS runs.
+    assert 'id="volumeSummaryHeading"' in r.text
+    assert 'aria-labelledby="volumeSummaryHeading"' in r.text
+    assert "Latest 4 weeks" in r.text
+    assert "Totals sum the latest four weekly buckets" in r.text
+    assert "compare them against the preceding four" in r.text
+    assert "Choose a tile to plot that metric in the chart below" in r.text
+    assert 'id="volumeSummaryTiles"' in r.text
 
 
 def test_nav_has_volume_link(client):

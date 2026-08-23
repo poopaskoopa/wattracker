@@ -461,14 +461,23 @@ function pctChange(current, previous) {
     return ((current - previous) / previous) * 100;
 }
 
+// The head (heading, period pill, note) is markup, not state, so it lives in
+// the template and only the cards are rewritten here - `el` is the section,
+// `cards` the container inside it. Clearing the section itself would delete the
+// head the first time the tiles were drawn.
 function renderSummary(all) {
     const el = document.getElementById("volumeSummary");
-    if (!el) return;
+    const cards = document.getElementById("volumeSummaryTiles");
+    if (!el || !cards) return;
     const last4 = all.slice(-4);
     const prev4 = all.slice(-8, -4);
     if (last4.length < 1) return;
     el.style.display = "";
-    el.innerHTML = "";
+    cards.innerHTML = "";
+    // Whether any tile ended up with a real percentage. If none did, the note
+    // must not claim a comparison against the preceding four that the tiles are
+    // simultaneously denying with "no prior" / "no baseline".
+    let compared = false;
     METRICS.forEach((m) => {
         const cur = sumOver(last4, m.key);
         const prev = sumOver(prev4, m.key);
@@ -484,6 +493,7 @@ function renderSummary(all) {
                 deltaHtml = '<span class="label">last 4 wks (no baseline)</span>';
             }
         } else {
+            compared = true;
             const arrow = pct > 0 ? "▲" : (pct < 0 ? "▼" : "▬");
             const sign = pct > 0 ? "+" : "";
             deltaHtml = '<span class="label">' + arrow + " " + sign +
@@ -501,8 +511,10 @@ function renderSummary(all) {
             '<span class="value">' + cur.toFixed(m.digits) + "</span>" +
             sparklineSvg(all.map((w) => w[m.key] || 0), m.token) +
             deltaHtml;
-        el.appendChild(tile);
+        cards.appendChild(tile);
     });
+    const compare = document.getElementById("volumeSummaryCompare");
+    if (compare) compare.style.display = compared ? "" : "none";
 }
 
 function wireControls() {
@@ -513,7 +525,10 @@ function wireControls() {
     if (apply) apply.addEventListener("click", applyCustom);
     const reset = document.getElementById("volResetZoom");
     if (reset) reset.addEventListener("click", () => applyPreset("all"));
-    // Delegated, so the tiles can be re-rendered without re-wiring them.
+    // Delegated from the SECTION, not from the cards container, so the tiles
+    // can be re-rendered (container contents and all) without re-wiring them.
+    // The head is inside this element too, but it holds no .metric-tile, so a
+    // click on the heading or the pill resolves to null and does nothing.
     const tiles = document.getElementById("volumeSummary");
     if (tiles) {
         tiles.addEventListener("click", (e) => {
