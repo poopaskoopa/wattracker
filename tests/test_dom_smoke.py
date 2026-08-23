@@ -559,8 +559,27 @@ def test_volume_tiles_select_the_metric_the_hero_chart_plots(
     )
     assert sorted(axes) == ["x", "y"], f"hero chart must be single-y-axis: {axes}"
 
+    # The head above the row: it names the period the tiles quote and says the
+    # tiles are the chart's selector. Rendering the tiles must not eat it --
+    # renderSummary clears the inner container, never the section.
+    assert page.locator("#volumeSummary .summary-head h3").is_visible()
+    # .lower(): the pill is uppercased in CSS, like every other .label.
+    assert page.locator(
+        "#volumeSummary .summary-period"
+    ).inner_text().strip().lower() == "latest 4 weeks"
+    note = page.locator("#volumeSummary .summary-note").inner_text().lower()
+    # The half that is true whatever the history holds. (The comparison half is
+    # conditional -- this fixture only seeds ~4 weeks, so there is no preceding
+    # window to compare against; see the 12-week test below.)
+    assert "totals sum the latest four weekly buckets" in note, note
+    assert "plot that metric in the chart below" in note, (
+        f"note does not say the tiles are the selector: {note}"
+    )
+
     tiles = page.locator("#volumeSummary .metric-tile")
     assert tiles.count() == 4, f"expected four metric tiles, got {tiles.count()}"
+    # And they live inside the cards container, not loose in the section.
+    assert page.locator("#volumeSummaryTiles .metric-tile").count() == 4
     pressed = page.locator('#volumeSummary .metric-tile[aria-pressed="true"]')
     assert pressed.count() == 1, "exactly one tile must be pressed at a time"
 
@@ -690,6 +709,48 @@ def test_volume_hero_chart_ignores_a_near_zero_drag(
     _assert_clean(console_errors, "/volume drag-zoom")
 
 
+def _stub_volume_weeks(page, weeks):
+    page.route(
+        "**/api/volume",
+        lambda route: route.fulfill(
+            status=200,
+            content_type="application/json",
+            body=json.dumps({"weeks": weeks}),
+        ),
+    )
+
+
+def test_volume_summary_note_states_the_comparison_when_one_was_made(
+        page, live_server, console_errors):
+    """With a full preceding window the note owns the comparison the tiles make.
+
+    The tiles quote a period ("vs prev 4") the page otherwise never names, so
+    the head has to name it -- but only when it is true.
+    """
+    weeks = []
+    monday = dt.date(2026, 1, 5)
+    for i in range(12):
+        d = monday + dt.timedelta(weeks=i)
+        weeks.append({
+            "week_start": d.isoformat(),
+            "hours": 5 + i, "tss": 300 + i * 10,
+            "distance_km": 120 + i * 5, "calories": 2000 + i * 50,
+        })
+    _stub_volume_weeks(page, weeks)
+    page.goto(f"{live_server.base}/volume")
+    _wait_for_charts(page, "volumeChart")
+
+    note = page.locator("#volumeSummary .summary-note").inner_text().lower()
+    assert "preceding four" in note, f"note does not state the baseline: {note}"
+    assert "plot that metric in the chart below" in note, note
+    # ...and the tiles really are quoting that comparison.
+    assert "vs prev 4" in page.locator(
+        "#volumeSummary .metric-tile"
+    ).first.inner_text().lower()
+
+    _assert_clean(console_errors, "/volume 12-week history")
+
+
 def test_volume_tile_reports_no_baseline_for_all_zero_history(
         page, live_server, console_errors):
     """An all-zero history must not claim '0% vs prev 4' -- that percentage
@@ -724,7 +785,36 @@ def test_volume_tile_reports_no_baseline_for_all_zero_history(
         )
         assert "no baseline" in text, f"tile did not explain the zero baseline: {text}"
 
+    # ...and the note must not assert the comparison the tiles just denied,
+    # while still saying what a tile does.
+    note = page.locator("#volumeSummary .summary-note").inner_text().lower()
+    assert "preceding four" not in note, (
+        f"note claimed a comparison no tile could make: {note}"
+    )
+    assert "totals sum the latest four weekly buckets." in note, (
+        f"suppressing the comparison left an ungrammatical note: {note}"
+    )
+    assert "plot that metric in the chart below" in note
+
     _assert_clean(console_errors, "/volume all-zero history")
+
+
+
+def test_volume_empty_history_keeps_the_summary_head_hidden(
+        page, live_server, console_errors):
+    """No weeks at all: the empty hint shows and the summary stays down.
+
+    The section is no longer empty markup -- it now ships a heading, a period
+    pill and a note -- so "renderSummary never ran" has to mean an invisible
+    section, not a head floating above no tiles.
+    """
+    _stub_volume_weeks(page, [])
+    page.goto(f"{live_server.base}/volume")
+    page.wait_for_timeout(800)
+    assert page.locator("#volumeEmpty").is_visible()
+    assert not page.locator("#volumeSummary").is_visible()
+    assert not page.locator("#volumeBlock").is_visible()
+    _assert_clean(console_errors, "/volume empty history")
 
 
 def test_every_nav_page_loads_clean(page, live_server, console_errors):

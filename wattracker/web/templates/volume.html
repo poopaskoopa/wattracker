@@ -6,9 +6,29 @@
 {# The tile row is both the at-a-glance view of all four metrics and the
    selector for the chart below: each tile carries its 4-week total, its change
    against the previous four, and a sparkline of the whole history, and
-   pressing one plots that metric. Built by volume.js (it needs the series to
-   draw the sparklines), so this is deliberately empty markup. #}
-<section id="volumeSummary" class="cards" style="display:none"></section>
+   pressing one plots that metric.
+
+   The head is server-rendered because none of it depends on the data: the
+   tiles quote a period ("vs prev 4") the page otherwise never names, and
+   nothing about a row of cards says the cards are controls. The tiles
+   themselves still come from volume.js (it needs the series to draw the
+   sparklines) and land in #volumeSummaryTiles, so a re-render replaces the
+   cards without touching the head above them.
+
+   The comparison clause is a span rather than plain text because it is the one
+   half of the note that can be false: with no earlier four-week window, or one
+   that logged nothing, every tile reads "no prior"/"no baseline" and no
+   comparison happened. volume.js hides the span in that case, which leaves the
+   remaining sentence grammatical on its own. #}
+<section id="volumeSummary" class="volume-summary" style="display:none"
+         aria-labelledby="volumeSummaryHeading">
+    <div class="summary-head">
+        <h3 id="volumeSummaryHeading">At a glance</h3>
+        <span class="summary-period">Latest 4 weeks</span>
+    </div>
+    <p class="hint summary-note">Totals sum the latest four weekly buckets<span id="volumeSummaryCompare">, and changes compare them against the preceding four where there is one</span>. Choose a tile to plot that metric in the chart below.</p>
+    <div id="volumeSummaryTiles" class="cards"></div>
+</section>
 
 <p id="volumeEmpty" class="hint" style="display:none">No training data yet — import or upload activities to see your weekly volume.</p>
 

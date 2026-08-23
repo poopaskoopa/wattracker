@@ -249,6 +249,25 @@ main a:hover { color: var(--accent); text-decoration: underline; }
 .volume-chart { position: relative; height: clamp(240px, 24vw, 360px); }
 .volume-chart canvas { width: 100% !important; height: 100% !important; }
 
+/* The summary section is a block wrapping a head and the tile row; `.cards`
+   (the flex row) moved inside it, so the section itself only stacks. */
+.volume-summary { margin: 1rem 0; }
+.summary-head { display: flex; align-items: baseline; gap: var(--sp-3);
+    flex-wrap: wrap; }
+.summary-head h3 { margin: 0; }
+/* The period the tiles quote but never name. Text, not a control: it selects
+   nothing, so it gets no hover, no focus ring and no button affordance. Gold
+   on the inset surface measures 9.05:1, which carries it at this size; the
+   pill encodes no series, which is why chrome gold is allowed to be here. */
+.summary-period { background: var(--surface-inset); color: var(--accent);
+    border: 1px solid var(--surface-border); border-radius: var(--r-pill);
+    padding: var(--sp-1) var(--sp-3); font-size: var(--fs-xs);
+    font-weight: 600; text-transform: uppercase; letter-spacing: .04em; }
+/* Sits under the head and above the row it explains, close enough to read as
+   the head's second line rather than as loose page prose. */
+.summary-note { margin: var(--sp-2) 0 0; max-width: 68ch; }
+.volume-summary .cards { margin-top: var(--sp-3); }
+
 /* The metric tiles are the chart's selector, so they are real buttons and have
    to shed the UA button styling that `.card` does not cover (font, alignment,
    centring). `flex: 1 1 200px` spreads the four across the row and lets them
