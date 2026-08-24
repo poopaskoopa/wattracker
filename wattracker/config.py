@@ -1,4 +1,4 @@
-"""App-level configuration: session secret and ANTHROPIC_API_KEY.
+"""App-level configuration: session secret and LLM settings.
 
 Per-user settings (FTP override, ZwiftID, folder paths) live in the database,
 scoped by user - see ``db.get_user_settings`` / ``db.save_user_settings``.
@@ -17,6 +17,7 @@ import secrets
 import subprocess
 from dataclasses import dataclass
 from typing import Optional
+from urllib.parse import urlsplit
 
 _log = logging.getLogger(__name__)
 
@@ -28,7 +29,7 @@ def _restrict_windows_acl(path: str, is_dir: bool) -> None:
     attribute and sets no ACL. So when the data dir is relocated off the user
     profile (WATTRACKER_DATA_DIR / WATTRACKER_DB) onto a volume whose inherited
     ACL grants e.g. ``Users:(R)``, another local standard account could read the
-    session secret, Anthropic key and password hashes. Reset inheritance and
+    session secret, LLM API key and password hashes. Reset inheritance and
     grant full control to the current user only.
 
     Done via ``icacls`` (shipped with every supported Windows; no extra
@@ -110,14 +111,16 @@ def db_path() -> str:
 class Config:
     """App-level (not per-user) configuration."""
 
-    anthropic_api_key: Optional[str] = None
+    api_key: Optional[str] = None
+    llm_endpoint: Optional[str] = None
+    llm_model: Optional[str] = None
 
 
 def _load_json() -> dict:
     path = config_path()
     if os.path.exists(path):
         # Self-heal permissions on installs created before perms were tightened:
-        # config.json can hold the session secret and Anthropic key.
+        # config.json can hold the session secret and LLM API key.
         _restrict(path, 0o600)
         try:
             with open(path, "r", encoding="utf-8") as f:
@@ -131,31 +134,240 @@ def _save_json(data: dict) -> None:
     path = config_path()
     with open(path, "w", encoding="utf-8") as f:
         json.dump(data, f, indent=2)
-    # config.json can hold the session secret and the Anthropic API key - keep
+    # config.json can hold the session secret and the LLM API key - keep
     # it owner-only.
     _restrict(path, 0o600)
 
 
+#: config.json fields already reported as malformed, so a hand-edited junk
+#: value warns once per process instead of on every request.
+_warned_malformed: set = set()
+
+
+def _as_optional_str(value, field: str) -> Optional[str]:
+    """A config.json value that must be a string; anything else is absent.
+
+    Hand-editing is the only source of a non-string (every writer stores
+    strings), and a junk value must degrade to "unset", never crash a
+    request: llm_settings() runs on every /generate, so a bare number under
+    llm_endpoint would 500 the whole planner without this.
+    """
+    if isinstance(value, str) and value:
+        return value
+    if value is not None:
+        if field not in _warned_malformed:
+            _warned_malformed.add(field)
+            _log.warning(
+                "ignoring malformed %s in config.json (expected a string, "
+                "got %s)", field, type(value).__name__,
+            )
+    return None
+
+
 def load_config() -> Config:
-    """Load app-level config, env overriding the JSON file."""
+    """Load app-level config, env overriding the JSON file, per field.
+
+    The key resolves API_KEY -> config.json api_key -> ANTHROPIC_API_KEY ->
+    config.json anthropic_api_key (the legacy name, kept as a lowest-priority
+    fallback so existing installs work unchanged).
+    """
     data = _load_json()
     return Config(
-        anthropic_api_key=os.environ.get("ANTHROPIC_API_KEY")
-        or data.get("anthropic_api_key"),
+        api_key=os.environ.get("API_KEY")
+        or _as_optional_str(data.get("api_key"), "api_key")
+        or os.environ.get("ANTHROPIC_API_KEY")
+        or _as_optional_str(data.get("anthropic_api_key"), "anthropic_api_key"),
+        llm_endpoint=os.environ.get("LLM_ENDPOINT")
+        or _as_optional_str(data.get("llm_endpoint"), "llm_endpoint"),
+        llm_model=os.environ.get("LLM_MODEL")
+        or _as_optional_str(data.get("llm_model"), "llm_model"),
     )
 
 
-def set_anthropic_api_key(key: str) -> None:
-    """Persist an app-level Anthropic API key to config.json."""
-    if not key:
-        return
+#: Default model per named LLM endpoint. A custom base URL has no default:
+#: the model is required, and without one the LLM layer is disabled.
+LLM_DEFAULT_MODELS = {
+    "anthropic": "claude-sonnet-5",
+    "openai": "gpt-5.6-luna",
+    "openrouter": "google/gemini-3.7-flash",
+}
+
+#: The one named OpenAI-compatible endpoint whose host differs from the openai
+#: SDK's built-in default (https://api.openai.com/v1).
+OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
+
+
+def _normalize_llm_url(raw: str) -> Optional[str]:
+    """Strictly validate a custom OpenAI-compatible base URL, or return None.
+
+    http:// or https:// with a host; no credentials, whitespace or fragment -
+    the same refuse-don't-sanitise posture as ``public_host()``. A bare
+    host[:port] gets ``/v1`` appended (the vLLM / LM Studio / OpenRouter
+    convention; Ollama accepts either), and a trailing slash is stripped from
+    a URL that has a path, which is used as-is.
+    """
+    if any(ch.isspace() for ch in raw):
+        return None
+    parts = urlsplit(raw)
+    if parts.scheme not in ("http", "https"):
+        return None
+    if not parts.hostname:
+        return None
+    if parts.username is not None or parts.password is not None:
+        return None
+    if parts.fragment:
+        return None
+    try:
+        port = parts.port
+    except ValueError:
+        return None
+    if port is not None and not 1 <= port <= 65535:
+        return None
+    path = parts.path.rstrip("/")
+    if not path:
+        path = "/v1"
+    url = f"{parts.scheme}://{parts.netloc}{path}"
+    if parts.query:
+        url += f"?{parts.query}"
+    return url
+
+
+def normalize_llm_endpoint(raw: str) -> Optional[str]:
+    """Validate an LLM_ENDPOINT / config.json ``llm_endpoint`` value.
+
+    Returns the lowercased endpoint keyword for the named providers, the
+    normalised base URL for a custom OpenAI-compatible server, or None when
+    the value is unusable. The literal ``custom`` is NOT a value: the selector
+    holds the URL itself, and a hand-edited config.json with it is treated as
+    invalid (the LLM layer is disabled with a warning).
+    """
+    value = (raw or "").strip()
+    lowered = value.lower()
+    if lowered in LLM_DEFAULT_MODELS:
+        return lowered
+    if lowered == "custom":
+        return None
+    return _normalize_llm_url(value)
+
+
+@dataclass
+class LlmSettings:
+    """The resolved LLM configuration for one call, when the layer runs.
+
+    ``endpoint`` is the keyword for a named provider or the normalised base
+    URL for a custom one; ``base_url`` is what the OpenAI-compatible client
+    is pointed at (None for openai: the SDK default already is the right URL).
+    """
+
+    endpoint: str
+    base_url: Optional[str]
+    api_key: Optional[str]
+    model: Optional[str]
+
+
+def llm_settings() -> Optional[LlmSettings]:
+    """Resolve the effective LLM settings, or None when the layer is skipped.
+
+    None exactly when one of these holds: the endpoint value is invalid (not
+    a keyword, not a valid http/https URL - including the literal "custom");
+    no model resolves (a custom URL without LLM_MODEL / a stored model -
+    named endpoints always have a default); or a named endpoint has no API
+    key. A custom URL may go keyless (local servers). In every other case the
+    LLM layer is attempted, and any failure mid-call degrades to the plan
+    returned unchanged.
+    """
+    cfg = load_config()
+    endpoint = normalize_llm_endpoint(cfg.llm_endpoint or "anthropic")
+    if endpoint is None:
+        _log.warning(
+            "LLM refinement disabled: unusable LLM_ENDPOINT %r (expected "
+            "'anthropic', 'openai', 'openrouter', or an http/https base URL)",
+            cfg.llm_endpoint,
+        )
+        return None
+    model = (cfg.llm_model or "").strip() or LLM_DEFAULT_MODELS.get(endpoint)
+    if not model:
+        _log.warning(
+            "LLM refinement disabled: no model configured for custom endpoint "
+            "%s (set LLM_MODEL)", endpoint,
+        )
+        return None
+    api_key = cfg.api_key
+    if endpoint in LLM_DEFAULT_MODELS and not api_key:
+        return None
+    if endpoint == "openrouter":
+        base_url = OPENROUTER_BASE_URL
+    elif endpoint in LLM_DEFAULT_MODELS:
+        base_url = None
+    else:
+        base_url = endpoint
+    return LlmSettings(
+        endpoint=endpoint, base_url=base_url, api_key=api_key, model=model
+    )
+
+
+def set_llm_settings(
+    endpoint: Optional[str] = None,
+    custom_url: Optional[str] = None,
+    model: Optional[str] = None,
+    api_key: Optional[str] = None,
+    clear_model: bool = False,
+) -> None:
+    """Persist LLM settings to config.json.
+
+    Whichever non-empty values are given are written under ``llm_endpoint`` /
+    ``llm_model`` / ``api_key``; a custom base URL is stored *in*
+    ``llm_endpoint`` (the field holds the URL when the provider is custom -
+    the same value the LLM_ENDPOINT env var holds). Plain empty values are
+    skipped, so a partial save never clobbers the other fields. An empty model
+    plus ``clear_model`` deletes the stored ``llm_model`` (the model then
+    falls back to the per-endpoint default at runtime). Writing ``api_key``
+    removes the legacy ``anthropic_api_key`` entry.
+    """
+    endpoint = (endpoint or "").strip().lower() or None
+    if endpoint == "custom":
+        # The literal is not a value; without a URL there is nothing to store.
+        endpoint = None
+    custom_url = (custom_url or "").strip() or None
+    model = (model or "").strip()
+    api_key = (api_key or "").strip() or None
     data = _load_json()
-    data["anthropic_api_key"] = key
-    _save_json(data)
+    changed = False
+    if endpoint or custom_url:
+        new_value = custom_url or endpoint
+        old_value = data.get("llm_endpoint")
+        if old_value != new_value:
+            # App-level and shared: any authenticated user can re-point
+            # EVERY user's LLM traffic, and a stored URL/key is invisible
+            # after the fact - so the change is logged loudly.
+            _log.warning(
+                "LLM endpoint changed from %r to %r (app-level setting, "
+                "shared across all users)", old_value, new_value,
+            )
+        data["llm_endpoint"] = new_value
+        changed = True
+    if model:
+        data["llm_model"] = model
+        changed = True
+    elif clear_model and "llm_model" in data:
+        del data["llm_model"]
+        changed = True
+    if api_key:
+        data["api_key"] = api_key
+        data.pop("anthropic_api_key", None)
+        changed = True
+    if changed:
+        _save_json(data)
+
+
+def set_anthropic_api_key(key: str) -> None:
+    """Deprecated alias for ``set_llm_settings(api_key=key)``."""
+    set_llm_settings(api_key=key)
 
 
 def anthropic_api_key_set() -> bool:
-    return bool(load_config().anthropic_api_key)
+    """Deprecated alias: whether the effective LLM API key is set."""
+    return bool(load_config().api_key)
 
 
 def auto_scan_enabled() -> bool:

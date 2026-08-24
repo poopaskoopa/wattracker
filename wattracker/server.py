@@ -892,8 +892,10 @@ def _promote_to_password_session(request: Request) -> None:
     session can register a throwaway user and shed the marker without ever
     knowing the rider's password. What that buys is bounded: pairing and the
     calendar feed are per-user, and the new account is a different uid. The
-    app-global Anthropic key is the exception, and it is the reason this is
-    documented in docs/windows-security.md instead of being waved through.
+    app-global LLM settings are the exception - the key, and since the provider
+    became settable the endpoint that decides who receives it - and they are
+    the reason this is documented in docs/windows-security.md instead of being
+    waved through.
     Since registration is unauthenticated anyway, closing it here would not
     close the hole - anyone who can reach the port can register regardless.
     """
@@ -3771,8 +3773,24 @@ def create_app() -> FastAPI:
                       connector_message: Optional[str] = None,
                       connector_new_token: Optional[str] = None,
                       connector_new_label: Optional[str] = None,
-                      refusal_message: Optional[str] = None) -> dict:
+                      refusal_message: Optional[str] = None,
+                      llm_message: Optional[str] = None) -> dict:
         settings = db.get_user_settings(uid)
+        # LLM refinement (app-level). The page shows the EFFECTIVE endpoint
+        # (an env var wins silently) and the STORED model: blank falls back to
+        # the per-provider default at runtime, so echoing the effective model
+        # here would re-store it and make "clear the saved model" unreachable.
+        llm_cfg = config.load_config()
+        llm_endpoint_raw = (llm_cfg.llm_endpoint or "").strip() or "anthropic"
+        llm_endpoint_norm = config.normalize_llm_endpoint(llm_endpoint_raw)
+        if llm_endpoint_norm in config.LLM_DEFAULT_MODELS:
+            llm_endpoint_display, llm_custom_url_display = llm_endpoint_norm, ""
+        else:
+            # A URL (valid or not): the custom option, with the raw value in
+            # the URL field so a broken one is visible and fixable.
+            llm_endpoint_display, llm_custom_url_display = (
+                "custom", llm_endpoint_raw,
+            )
         return _ctx(
             request,
             settings=settings,
@@ -3802,7 +3820,11 @@ def create_app() -> FastAPI:
             calendar_public_scheme=config.public_scheme(),
             current_ftp=round(importer.current_ftp(uid), 1),
             recent_best_effort_ftp=round(importer.recent_best_effort_ftp(uid), 1),
-            api_key_set=config.anthropic_api_key_set(),
+            api_key_set=bool(llm_cfg.api_key),
+            llm_endpoint=llm_endpoint_display,
+            llm_custom_url=llm_custom_url_display,
+            llm_model=(llm_cfg.llm_model or "").strip(),
+            llm_message=llm_message,
             saved=saved,
             zwift_candidates=discover(uid, "zwift_id_candidates"),
             watch_default=discover(uid, "default_activities_dir"),
@@ -3841,10 +3863,14 @@ def create_app() -> FastAPI:
     #                                  own, surviving revocation of the first
     #   POST /settings/calendar-feed   the whole training calendar re-pointed at
     #                                  a URL only the attacker holds
-    #   POST /settings (api key field) the Anthropic key, which is app-global
-    #                                  rather than per-user, so swapping it
-    #                                  sends every coaching request - prompts
-    #                                  included - to an account someone else owns
+    #   POST /settings (LLM fields)    the app-global - not per-user - LLM
+    #                                  settings: swapping the KEY sends every
+    #                                  coaching request, prompts included, to
+    #                                  an account someone else owns, and
+    #                                  repointing the ENDPOINT at a base URL
+    #                                  the attacker runs hands them that key
+    #                                  and those prompts without their ever
+    #                                  having to know either
     #
     # Revoking is deliberately NOT on the list: it is the way out, and the rider
     # who has lost a laptop may well be looking at the tray window of the
@@ -3852,7 +3878,8 @@ def create_app() -> FastAPI:
     # pointing the app at the right folders is what the window is for.
     _CONNECTOR_REFUSAL = (
         "This window was opened by a connector device, so it cannot issue or "
-        "replace credentials. Sign in with your password first."
+        "replace credentials, or change the app-wide LLM settings. Sign in "
+        "with your password first."
     )
 
     def _refuse_connector_session(request: Request, uid: int) -> Response:
@@ -3903,12 +3930,16 @@ def create_app() -> FastAPI:
         zwift_id_choice: str = Form(""),
         activities_dir: str = Form(""),
         workouts_dir: str = Form(""),
-        anthropic_api_key: str = Form(""),
         zwift_email: str = Form(""),
         zwift_password: str = Form(""),
         weight_kg: str = Form(""),
         timezone: str = Form(""),
         confirm_low_ftp: str = Form(""),
+        llm_endpoint: str = Form(""),
+        llm_custom_url: str = Form(""),
+        llm_model: str = Form(""),
+        api_key: str = Form(""),
+        anthropic_api_key: str = Form(""),
     ):
         uid = _uid(request)
         # The FTP field is a SCORING BASIS, so it gets the same policy as every
@@ -3981,25 +4012,114 @@ def create_app() -> FastAPI:
             profile_store.refresh(uid)
         except Exception:
             _log.warning("profile refresh after settings save failed", exc_info=True)
-        # The Anthropic API key is app-level (shared), which is what makes it
-        # worth refusing here specifically: a connector-opened session that
-        # swapped it would point every coaching request this server makes,
-        # prompt contents and all, at an account somebody else owns - and
-        # revoking the device would not undo it. The rest of this route stays
-        # open on purpose; pointing the app at the right folders is exactly
-        # what the tray window exists for. See _CONNECTOR_REFUSAL.
+        # LLM refinement settings are app-level (shared). The key is blank =
+        # keep (it is never displayed); the model is blank = clear the stored
+        # value (it is always shown, and blank falls back to the provider
+        # default at runtime). Environment variables (API_KEY, LLM_ENDPOINT,
+        # LLM_MODEL) still override stored values; a conflict resolves
+        # silently in their favour, exactly as WATTRACKER_SECRET does.
+        llm_msgs: List[str] = []
+        endpoint_choice = (llm_endpoint or "").strip().lower()
+        custom_url = (llm_custom_url or "").strip()
+        endpoint_to_save: Optional[str] = None
+        url_to_save: Optional[str] = None
+        endpoint_ok = False
+        if endpoint_choice == "custom":
+            # The selector holds the URL itself when custom: the URL is
+            # required and validated; named providers ignore the field.
+            url_to_save = config.normalize_llm_endpoint(custom_url)
+            if url_to_save is None:
+                llm_msgs.append(
+                    "Custom LLM endpoint needs a valid http:// or https:// "
+                    "base URL (e.g. http://localhost:11434/v1)."
+                )
+                url_to_save = None
+            else:
+                endpoint_ok = True
+        elif endpoint_choice:
+            if endpoint_choice in ("anthropic", "openai", "openrouter"):
+                endpoint_to_save = endpoint_choice
+                endpoint_ok = True
+            else:
+                llm_msgs.append(
+                    f"Unknown LLM provider '{llm_endpoint.strip()}' - use "
+                    "anthropic, openai, openrouter, or custom."
+                )
+        model_val = (llm_model or "").strip()
+        model_rejected = len(model_val) > 200
+        if model_rejected:
+            llm_msgs.append("LLM model must be at most 200 characters.")
+            model_val = ""
+        # api_key wins over the legacy alias if both are posted.
+        key_val = (api_key or "").strip() or (anthropic_api_key or "").strip()
+        # The model field is always part of the form, but blank clears the
+        # stored value (falling back to the provider default) only when this
+        # save actually carried an endpoint selection and the field was
+        # genuinely blank - a REJECTED model must be reported and left
+        # unsaved, not treated as a clear that wipes the previously working
+        # model.
+        clear_model = endpoint_ok and not model_val and not model_rejected
+        # Shared is also what makes this whole group - endpoint, custom URL,
+        # model and key alike - the part of this route a connector-opened
+        # session may not touch. A session that swapped the KEY would point
+        # every coaching request this server makes, prompt contents and all,
+        # at an account somebody else owns, and revoking the device would not
+        # undo it. A settable ENDPOINT is the same threat, larger: a base URL
+        # the attacker controls is handed the shared key on the first
+        # refinement call and every rider's prompt payload after that, by a
+        # server that otherwise looks like it is working, and revoking the
+        # device does not undo that either. The model comes with them because
+        # it is written by the same call and decides whether the layer runs at
+        # all. The rest of this route stays open on purpose; pointing the app
+        # at the right folders is exactly what the tray window exists for.
+        # See _CONNECTOR_REFUSAL.
+        #
+        # Refused means asked to CHANGE the group, not merely to post it: the
+        # LLM fields share one form with the folders, so a connector window
+        # sends back the provider and model this page just rendered on every
+        # save. Reading that echo as an attempt would 403 the folder save the
+        # window exists for while preventing nothing. A connector session
+        # writes none of this group either way - the write below is skipped
+        # whether or not anything differed - so the only question here is
+        # whether the rider gets told, and a save that asked for something
+        # other than what it was shown has to be told.
         refusal = False
-        if anthropic_api_key and _from_connector(request):
+        if _from_connector(request):
             # Answered below with the same 403 the other two refusals use, and
             # deliberately not by falling through to the ordinary "Settings
             # saved." render: a page that says both that it saved and that it
             # refused describes neither outcome, and 200 tells a script the
             # write went through. The other fields on this form are still
-            # written first - pointing the app at the right folders is what the
-            # tray window is for, and only the app-global key is off limits.
-            refusal = True
-        elif anthropic_api_key:
-            config.set_anthropic_api_key(anthropic_api_key)
+            # written first - only the app-global LLM group is off limits. The
+            # per-field LLM complaints go with it: this request was refused,
+            # not evaluated, and one answer beats two.
+            stored = config.load_config()
+            stored_endpoint = (stored.llm_endpoint or "").strip() or "anthropic"
+            stored_model = (stored.llm_model or "").strip()
+            # What set_llm_settings would put in llm_endpoint (None = leave
+            # it alone), compared against what the page rendered - which is
+            # the effective endpoint, so an unset one reads as "anthropic".
+            endpoint_to_write = url_to_save or endpoint_to_save
+            refusal = (
+                # A rejected value is still an attempt to change the group.
+                bool(llm_msgs)
+                # Blank = keep, so any key at all was typed into this window.
+                or bool(key_val)
+                or (endpoint_to_write is not None
+                    and endpoint_to_write != stored_endpoint)
+                or (bool(model_val) and model_val != stored_model)
+                or (clear_model and bool(stored_model))
+            )
+            if refusal:
+                llm_msgs = []
+        elif endpoint_to_save or url_to_save or model_val or key_val:
+            config.set_llm_settings(
+                endpoint=endpoint_to_save,
+                custom_url=url_to_save,
+                model=model_val or None,
+                api_key=key_val or None,
+                clear_model=clear_model,
+            )
         # Zwift account credentials: only saved when both fields are supplied;
         # the password is never redisplayed. Saving re-arms authenticated
         # race fetching after a previous login failure.
@@ -4027,7 +4147,8 @@ def create_app() -> FastAPI:
                           ftp_message=ftp_message,
                           ftp_confirm_required=ftp_confirm_required,
                           ftp_form_value=ftp if ftp_message else None,
-                          refusal_message=_CONNECTOR_REFUSAL if refusal else None),
+                          refusal_message=_CONNECTOR_REFUSAL if refusal else None,
+                          llm_message="; ".join(llm_msgs) or None),
             status_code=403 if refusal else 200,
         )
 

@@ -80,6 +80,12 @@ def isolated_env(tmp_path, monkeypatch):
         # under test.
         "WATTRACKER_PUBLIC_HOST",
         "WATTRACKER_PUBLIC_SCHEME",
+        # LLM settings: a developer's real keys/endpoints must never leak in
+        # and call a live provider from a test.
+        "API_KEY",
+        "LLM_ENDPOINT",
+        "LLM_MODEL",
+        # Kept for the legacy-fallback tests, which set it deliberately.
         "ANTHROPIC_API_KEY",
     ):
         monkeypatch.delenv(key, raising=False)

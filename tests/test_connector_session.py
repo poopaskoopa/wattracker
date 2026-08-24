@@ -362,6 +362,86 @@ def test_a_connector_session_cannot_replace_the_shared_anthropic_key(client):
     assert db.get_user_settings(uid)["ftp"] == 250, "the rest of the page must still save"
 
 
+def test_a_connector_session_cannot_repoint_the_llm_endpoint(client):
+    """The endpoint is the larger half of the same threat as the key.
+
+    Once the provider is settable, a connector session that points it at a
+    base URL the attacker controls is handed the shared key on the first
+    refinement call and every rider's prompt payload after that - without ever
+    posting a key, and without anything looking broken. Revoking the device
+    does not undo it, which is the test the whole refusal list is built on.
+    """
+    from wattracker import config
+
+    uid, token = _paired(client)
+    config.set_llm_settings(endpoint="anthropic", model="m", api_key="rider-key")
+
+    with _connector_window(client, token) as window:
+        response = window.post(
+            "/settings",
+            data={"ftp": "250", "llm_endpoint": "custom",
+                  "llm_custom_url": "http://attacker.example/v1"},
+        )
+
+    assert response.status_code == 403
+    assert "Sign in with your password first." in response.text
+    assert "Settings saved." not in response.text
+    # Nothing about the group moved, key included.
+    assert config.load_config().llm_endpoint == "anthropic"
+    assert config.load_config().api_key == "rider-key"
+    assert db.get_user_settings(uid)["ftp"] == 250, "the rest of the page must still save"
+
+
+def test_a_connector_session_cannot_clear_the_stored_llm_model(client):
+    """Clearing the model is a change to the group, so it is refused too.
+
+    Blanking the model field is the form's way of saying "use the provider
+    default", which for a custom endpoint disables the LLM layer outright. It
+    writes app-level state either way, so it belongs inside the refusal rather
+    than beside it.
+    """
+    from wattracker import config
+
+    _uid, token = _paired(client)
+    config.set_llm_settings(endpoint="openrouter", model="pinned", api_key="k")
+
+    with _connector_window(client, token) as window:
+        response = window.post(
+            "/settings", data={"llm_endpoint": "openrouter", "llm_model": ""},
+        )
+
+    assert response.status_code == 403
+    assert config.load_config().llm_model == "pinned"
+
+
+def test_a_connector_session_still_saves_folders_with_the_llm_form_echoed(client):
+    """The refusal is about changing the group, not about posting it.
+
+    The LLM fields live in the same form as the folders, so the tray window
+    sends the provider and model the page just rendered back with every save.
+    If that echo counted as an attempt, the folder save this window exists for
+    would 403 every time while preventing nothing - so an unchanged group is
+    an ordinary save, and still writes none of the app-level LLM settings.
+    """
+    from wattracker import config
+
+    uid, token = _paired(client)
+    config.set_llm_settings(endpoint="openrouter", model="pinned", api_key="k")
+
+    with _connector_window(client, token) as window:
+        response = window.post(
+            "/settings",
+            data={"ftp": "250", "llm_endpoint": "openrouter",
+                  "llm_model": "pinned", "api_key": ""},
+        )
+
+    assert response.status_code == 200
+    assert "Settings saved." in response.text
+    assert "Sign in with your password first." not in response.text
+    assert db.get_user_settings(uid)["ftp"] == 250
+    assert config.load_config().llm_model == "pinned"
+
+
 def test_a_connector_session_can_still_revoke(client):
     """Revoking is the way out, so it must never be the thing that is blocked.
 

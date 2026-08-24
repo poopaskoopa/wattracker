@@ -131,7 +131,7 @@ The data directory is **not** part of the install. `wattracker.config` resolves
 it as `WATTRACKER_DATA_DIR` if set, otherwise `~/.wattracker` - on Windows,
 `%USERPROFILE%\.wattracker`. It holds `wattracker.db` (rides, plans, goals,
 password hashes, encrypted credential markers), `config.json` (session secret,
-Anthropic API key), `backups/`, and the launcher's `wattracker-process.json` and
+LLM API key), `backups/`, and the launcher's `wattracker-process.json` and
 logs.
 
 **Upgrade.** A fixed `AppId` GUID makes a reinstall an upgrade rather than a
@@ -262,9 +262,9 @@ PR opens rather than on the push.
 **The quota block is separate and may still be in force.** Deleting 2693 MB of
 stale artifacts left `total_count: 0`, but uploads continued to fail with
 `Artifact storage quota has been hit` well past GitHub's stated 6-12 hour
-recalculation window. Nothing visible accounts for it; `taksmon` cannot read
-`settings/billing` (that needs the `user` scope), so the owner's billing page is
-the only remaining place to look. Until it clears, expect a red upload on merges
+recalculation window. Nothing visible accounts for it; the workflow token
+cannot read `settings/billing` (that needs the `user` scope), so the owner's
+billing page is the only remaining place to look. Until it clears, expect a red upload on merges
 to `main` while every PR run stays green.
 
 ### Yielding the box to a hardware session

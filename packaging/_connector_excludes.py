@@ -25,6 +25,6 @@ from __future__ import annotations
 
 FORBIDDEN = [
     "numpy", "pandas", "scipy", "fastapi", "starlette", "uvicorn",
-    "anthropic", "jinja2", "matplotlib", "fitdecode", "keyring",
+    "anthropic", "openai", "jinja2", "matplotlib", "fitdecode", "keyring",
     "wattracker.db", "wattracker.server", "wattracker.ingest",
 ]

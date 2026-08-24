@@ -207,6 +207,11 @@ def test_nothing_quietly_falls_off_the_exclude_list():
     # The server's own halves. wattracker.db in particular would put schema
     # migrations inside a process that must never touch the database.
     assert {"wattracker.db", "wattracker.server", "wattracker.ingest"} <= forbidden
+    # Both LLM SDKs. The connector never refines anything, and openai is a
+    # real dependency now that the provider is configurable - so it can be
+    # pulled in transitively by anything the connector imports, which is
+    # exactly the drift the list is here to catch.
+    assert {"anthropic", "openai"} <= forbidden
 
 
 def test_the_version_helper_is_shared_with_the_app_spec():

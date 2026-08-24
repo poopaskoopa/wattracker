@@ -23,7 +23,7 @@ not protect secrets from malware already running as the same Windows user.
 ## Data directory permissions
 
 The data directory and every sensitive file inside it (`config.json`, which holds
-the session secret and Anthropic API key; `wattracker.db` and its `-wal`/`-shm`
+the session secret and LLM API key; `wattracker.db` and its `-wal`/`-shm`
 sidecars and `backups/`, which hold password hashes and encrypted credential
 markers) are locked to the current Windows user with an explicit owner-only ACL.
 
@@ -184,24 +184,42 @@ prompt in a window a tray icon opened) teaches exactly the habit phishing
 depends on. A connector-derived session is stamped `via=connector` in the
 signed session cookie at redemption, and three routes refuse it: pairing
 another device (`POST /settings/connector`), rotating the calendar link
-(`POST /settings/calendar-feed`), and replacing the app-global — not per-user —
-Anthropic API key (the `anthropic_api_key` field of `POST /settings`). Each
-would otherwise leave behind a credential that revoking the device does not
-reach. Revoking is deliberately still allowed: it is the way out, and the rider
-who has lost a laptop may well be looking at the tray window of the machine
-still in front of them. Signing in with the password inside that window lifts
+(`POST /settings/calendar-feed`), and changing the app-global — not per-user —
+LLM settings (the `llm_endpoint`, `llm_custom_url`, `llm_model`, `api_key` and
+legacy `anthropic_api_key` fields of `POST /settings`). Each would otherwise
+leave behind a credential that revoking the device does not reach.
+
+The third one covers the whole LLM group, not just the key, because the
+provider endpoint became settable in the UI (PR #126) and that is the same
+threat one size larger: a connector session that repoints `llm_endpoint` at a
+base URL it controls is handed the shared API key on the first refinement call
+and every rider's prompt payload after that, from a server that otherwise looks
+like it is working — and revoking the device does not undo it, exactly as with
+a swapped key. The model travels with them because the same write decides
+whether the layer runs at all. Refusal means asking to *change* the group: the
+LLM fields sit in the same form as the folder settings, so the tray window
+echoes the provider and model the page just rendered on every ordinary save,
+and treating that echo as an attempt would 403 the folder save the window
+exists for while preventing nothing. A connector session writes none of these
+settings either way.
+
+Revoking is deliberately still allowed: it is the way out, and the rider who
+has lost a laptop may well be looking at the tray window of the machine still
+in front of them. Signing in with the password inside that window lifts
 the restriction, because a device token can neither obtain nor change a
 password.
 
-**The API-key refusal does not hold against `/register`, and that is a known
-gap.** Registration is unauthenticated by design — this is a single-user local
-app that has to let its first user in — and a successful registration drops the
+**The LLM-settings refusal does not hold against `/register`, and that is a
+known gap.** Registration is unauthenticated by design — this is a single-user
+local app that has to let its first user in — and a successful registration drops the
 `via=connector` marker, because proving a password is what the marker exists to
 wait for. But the password proved at `/register` is a *new account's*, chosen by
 whoever is registering, not the rider's. So a connector session can register a
-throwaway account and, as that account, write the Anthropic key: the key is
-app-global rather than per-user, so it is the one setting a different `uid` can
-still reach. Device pairing and calendar-feed rotation are not reachable this
+throwaway account and, as that account, write the LLM settings: they are
+app-global rather than per-user, so they are the settings a different `uid` can
+still reach — and since #126 that includes the endpoint, so the throwaway
+account can capture the rider's existing key and prompts without ever seeing
+either. Device pairing and calendar-feed rotation are not reachable this
 way — both are per-user, and the new account is a different user.
 
 The mitigating half is that anyone who can reach the port can already register
