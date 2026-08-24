@@ -1,6 +1,34 @@
 {% extends "base.html" %}
 {% block title %}Register &mdash; wattracker{% endblock %}
 {% block content %}
+{#- Two states. `registration_closed` is the policy refusal (HTTP 403): this
+    server already has an account and WATTRACKER_ALLOW_REGISTRATION is not set.
+    The wording is about the POLICY only - it never says how many accounts
+    exist or names one, because an unauthenticated visitor should learn nothing
+    from this page beyond "not accepting new accounts", which any refusal
+    necessarily implies. -#}
+{% if registration_closed %}
+<h2>Registration is closed</h2>
+
+<p class="alert">This server is not accepting new accounts.</p>
+
+<p>
+    Registration is open only while the server has no account at all, so that a
+    new install can be set up. After that it stays closed unless it is turned
+    on deliberately &mdash; an account here can change the app-wide AI provider
+    settings, so an open sign-up page on a network is a way in.
+</p>
+
+<p>
+    If this is your server and you want to add another account, start it with
+    <code>WATTRACKER_ALLOW_REGISTRATION=1</code> set in the environment, create
+    the account, then restart without it. For example:
+</p>
+
+<pre><code>WATTRACKER_ALLOW_REGISTRATION=1 python -m wattracker</code></pre>
+
+<p>Already have an account? <a href="/login">Log in</a>.</p>
+{% else %}
 <h2>Create account</h2>
 
 {% if error %}<p class="alert">{{ error }}</p>{% endif %}
@@ -17,4 +45,5 @@
 </form>
 
 <p>Already have an account? <a href="/login">Log in</a>.</p>
+{% endif %}
 {% endblock %}

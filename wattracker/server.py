@@ -896,8 +896,15 @@ def _promote_to_password_session(request: Request) -> None:
     became settable the endpoint that decides who receives it - and they are
     the reason this is documented in docs/windows-security.md instead of being
     waved through.
-    Since registration is unauthenticated anyway, closing it here would not
-    close the hole - anyone who can reach the port can register regardless.
+
+    That shed is now bounded at its source rather than here. /register no
+    longer creates an account once one exists unless
+    WATTRACKER_ALLOW_REGISTRATION says so (config.allow_registration), so a
+    connector session can only reach this line at all on a server that has
+    deliberately opened registration or has no accounts yet. Clearing the
+    marker here is still the right thing to do when it IS reached - the
+    password just proven is real - and this function is deliberately not the
+    place that judges whether the account should have existed.
     """
     request.session.pop(SESSION_VIA, None)
     request.session.pop(SESSION_DEVICE_ID, None)
@@ -1234,6 +1241,12 @@ def create_app() -> FastAPI:
     # can open a socket to this port, and the per-username throttle bounds
     # neither of them in memory terms.
     app.state.hash_limiter = auth.PasswordHashLimiter()
+    # Serializes the "is this the bootstrap account?" test with the INSERT that
+    # answers it. Sync route handlers run in a threadpool, so without this two
+    # simultaneous POSTs to an empty database could both read "no users yet"
+    # and both be admitted as the first account. A plain Lock is the right
+    # size for the same reason the scan-progress dict is: one process.
+    app.state.registration_lock = threading.Lock()
     # Refused /login attempts: a single unkeyed count, not a throttle.
     app.state.login_failures = LoginAttemptCounter()
     # Rejected /calendar.ics tokens: a single unkeyed count, not a throttle.
@@ -1314,12 +1327,67 @@ def create_app() -> FastAPI:
     app.state.allowed_hosts = allowed_hosts
 
     # -------------------------------------------------------------- auth
+    def _registration_open() -> bool:
+        """Whether /register may create an account right now.
+
+        Two ways to be open, and only two. An empty database is open because
+        every install bootstraps through this route and there is nothing to
+        protect yet. After that it takes WATTRACKER_ALLOW_REGISTRATION, for
+        the reasons written out in config.allow_registration - in short, an
+        account on this app can repoint the APP-GLOBAL LLM endpoint at a host
+        it controls (harvesting the rider's stored key and every prompt) and
+        can launder a connector session past the /settings refusal.
+
+        The env var is checked FIRST so the ordinary multi-account case costs
+        no query at all, and so a rider who has opted in is never refused
+        because the database is momentarily unhappy.
+
+        A database that cannot answer refuses. This is an authorization
+        decision, and the same reasoning as _connector_session_still_paired
+        applies: the cost of being wrong this way is that a rider who wanted a
+        second account retries; the cost of the other default is that a broken
+        query silently reopens registration on a populated server.
+        """
+        if config.allow_registration():
+            return True
+        try:
+            return not db.user_ids()
+        except Exception:
+            _log.warning(
+                "could not determine whether any account exists; "
+                "refusing registration", exc_info=True
+            )
+            return False
+
+    def _registration_closed_response(request: Request):
+        """The refusal: a real page that says how to turn registration on.
+
+        Deliberately about POLICY, not about inventory. It never says how many
+        accounts exist or names one - an unauthenticated caller learns only
+        that this server does not accept new accounts, which is the minimum the
+        refusal has to imply in order to be a refusal at all.
+
+        A rendered page rather than a bare status: the rider who hits this is
+        usually the owner adding a second account on their own machine, and
+        telling them the variable to set is the difference between a working
+        feature and a bug report.
+        """
+        return templates.TemplateResponse(
+            request,
+            "register.html",
+            {"request": request, "error": None, "registration_closed": True},
+            status_code=403,
+        )
+
     @app.get("/register", response_class=HTMLResponse)
     def register_form(request: Request):
         if _uid(request):
             return RedirectResponse("/", status_code=303)
+        if not _registration_open():
+            return _registration_closed_response(request)
         return templates.TemplateResponse(
-            request, "register.html", {"request": request, "error": None}
+            request, "register.html",
+            {"request": request, "error": None, "registration_closed": False},
         )
 
     def _hash_capacity_response(request: Request, template: str):
@@ -1348,6 +1416,11 @@ def create_app() -> FastAPI:
         # cheapest attack is simply to point the flood at this route instead.
         if not _trusted_origin_or_absent(request, app.state.allowed_hosts):
             return PlainTextResponse("Origin not allowed", status_code=403)
+        # Refused BEFORE the ~128 MiB scrypt, not after: a closed server must
+        # not be a free way to burn the hash limiter, and refusing costs one
+        # environment read plus (only when the var is unset) one indexed query.
+        if not _registration_open():
+            return _registration_closed_response(request)
         username = (username or "").strip()
         err = auth.validate_credentials(username, password)
         if not err:
@@ -1356,12 +1429,22 @@ def create_app() -> FastAPI:
                     password_hash = auth.hash_password(password)
             except auth.HashCapacityExceeded:
                 return _hash_capacity_response(request, "register.html")
-            user_id = db.create_user(username, password_hash)
+            # Re-asked under the lock, and this is the test that actually
+            # decides. The check above sheds cheaply; hashing took a quarter of
+            # a second during which another request may have become the first
+            # account, and "the database was empty when we started" is not a
+            # policy. Held across the INSERT only - never across the hash.
+            with app.state.registration_lock:
+                if not _registration_open():
+                    return _registration_closed_response(request)
+                user_id = db.create_user(username, password_hash)
             if user_id is None:
                 err = "That username is already taken."
         if err:
             return templates.TemplateResponse(
-                request, "register.html", {"request": request, "error": err}
+                request, "register.html",
+                {"request": request, "error": err,
+                 "registration_closed": False},
             )
         _promote_to_password_session(request)
         request.session["user_id"] = user_id

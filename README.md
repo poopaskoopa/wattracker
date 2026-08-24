@@ -237,6 +237,13 @@ Runtime variables include `WATTRACKER_DATA_DIR`, `WATTRACKER_DB`,
 `localhost`, or `::1`; port must be 1–65535. Browser values accept
 `1/true/yes/on` and `0/false/no/off`. IPv6 URLs are bracketed correctly.
 
+`WATTRACKER_ALLOW_REGISTRATION` (unset by default) decides whether `/register`
+may create an **additional** account. The first one is always allowed — an
+install has to start somewhere — and after that sign-up is closed until this is
+set, because any account can change the shared AI settings above. Parsed exactly
+like `WATTRACKER_ALLOW_NON_LOOPBACK` (`1/true/yes/on`); see
+[Reaching the server from other devices](#reaching-the-server-from-other-devices).
+
 `WATTRACKER_PUBLIC_HOST` (unset by default) names the one external hostname a
 local reverse proxy — `tailscale serve` on the owner's tailnet — forwards under:
 it is added to the Host allowlist as that exact name (no wildcards, no suffix
@@ -362,7 +369,7 @@ its own machine and nowhere else. Opening it up is what lets the connector on
 another box dial in, and what lets a phone or a laptop act as a
 [screen](#how-it-is-put-together).
 
-Two things have to be true, and they are separate on purpose.
+Three things have to be true, and they are separate on purpose.
 
 **1. Bind an interface the network can reach.** Two variables, not one:
 
@@ -402,6 +409,30 @@ to set up per device and no device is identified by MAC, IP, or hostname
 (`proxy_headers=False` in `wattracker/__main__.py` exists to keep it that way).
 A phone with a randomized MAC and a fresh DHCP lease is simply a browser, and
 pairing a connector stores only the label you typed.
+
+**3. Decide who may create an account.** Once the port is reachable from the
+network, `/register` is reachable from the network, and it is the one page that
+does not ask who you are — it cannot, because it is how the first account gets
+made. So it closes itself as soon as there is something to protect:
+
+- **No accounts yet** → registration is open. That is how you set the server
+  up, and nothing else works until you have.
+- **At least one account** → registration is refused unless you say otherwise:
+
+```sh
+WATTRACKER_ALLOW_REGISTRATION=1 python -m wattracker
+```
+
+Add the second rider, then restart without it. The refusal is a page that names
+this variable, so nobody has to go looking for it.
+
+Why this matters on a LAN and not on loopback: an account here is not just a
+private history. The AI provider settings — endpoint, model, and the `API_KEY`
+behind them — are **app-level and shared** (see above), so anyone who can make
+an account can point every rider's LLM traffic at a URL they control and be
+handed the stored key. Leaving sign-up open is handing that to whoever else is
+on the wifi. Same reasoning as the bind flag: the safe default, and one explicit
+variable to change it.
 
 `tests/test_phone_access.py` holds this path down end to end: a browser on a
 LAN name registers, loads pages, presses buttons that change things, and reads

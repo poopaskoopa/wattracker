@@ -65,11 +65,34 @@ failure removes only the staged slot, so even an unreadable legacy
 
 ## Network boundary
 
-The supported Windows configuration is loopback-only. The installer and
-launcher must not create a Windows Firewall exception. LAN/public binding
-requires a separate security design covering TLS, Secure cookies, CSRF and
-Origin validation, trusted hosts/proxies, login throttling, and registration
-policy.
+**The default and recommended Windows configuration is loopback-only**, and the
+installer and launcher must not create a Windows Firewall exception. Nothing
+here opens a port to the network on its own: binding beyond loopback takes
+`WATTRACKER_ALLOW_NON_LOOPBACK` *and* a non-loopback `WATTRACKER_HOST`, two
+variables kept separate so it cannot happen by fat-fingering a host.
+
+A LAN bind is nevertheless a supported, documented configuration — the README's
+[Reaching the server from other devices](../README.md#reaching-the-server-from-other-devices)
+walks it, because it is how a connector on another box and a phone acting as a
+ride screen both work. This section used to say a LAN bind "requires a separate
+security design", listing TLS, Secure cookies, CSRF and Origin validation,
+trusted hosts/proxies, login throttling, and registration policy. That list is
+now either built or explicitly the operator's decision, and it is worth being
+precise about which is which, because the README and this file previously
+disagreed:
+
+| Prerequisite | Where it stands |
+| --- | --- |
+| CSRF / Origin validation | Built. `same_site="lax"` on the session cookie, plus an explicit same-origin check on state-changing posts and on the WebSocket handshake. |
+| Trusted hosts | Built. Host allowlist; extra names only via the strictly validated `WATTRACKER_PUBLIC_HOST(S)` — no wildcards, no suffix matching. |
+| Login throttling | Built. Per-username throttle on `/login`, plus a process-wide cap on concurrent password hashes shared with `/register`. |
+| **Registration policy** | **Built** (this was the gap). The first account is always allowed, since an install has to bootstrap; after that `/register` refuses unless `WATTRACKER_ALLOW_REGISTRATION` is set. See `config.allow_registration` and `tests/test_registration_policy.py`. |
+| TLS + Secure cookies | **Operator's decision, not a default.** On a plain-http LAN bind the session cookie and the connector's bearer token travel in clear text; anyone on that network can read them and act as the rider. Terminate TLS in front and set `WATTRACKER_COOKIE_SECURE=1`. |
+
+So the honest statement of the boundary is the README's: a LAN bind is for **a
+trusted home network and nowhere else**, never shared, guest, or public wifi,
+and never an internet-facing name. What changed is that "registration policy"
+is no longer an unbuilt prerequisite standing between the two documents.
 
 ## Server/connector trust boundary
 
@@ -221,24 +244,35 @@ in front of them. Signing in with the password inside that window lifts
 the restriction, because a device token can neither obtain nor change a
 password.
 
-**The LLM-settings refusal does not hold against `/register`, and that is a
-known gap.** Registration is unauthenticated by design — this is a single-user
-local app that has to let its first user in — and a successful registration drops the
-`via=connector` marker, because proving a password is what the marker exists to
-wait for. But the password proved at `/register` is a *new account's*, chosen by
-whoever is registering, not the rider's. So a connector session can register a
-throwaway account and, as that account, write the LLM settings: they are
-app-global rather than per-user, so they are the settings a different `uid` can
-still reach — and since #126 that includes the endpoint, so the throwaway
-account can capture the rider's existing key and prompts without ever seeing
-either. Device pairing and calendar-feed rotation are not reachable this
-way — both are per-user, and the new account is a different user.
+**The LLM-settings refusal used to be walkable via `/register`.** A successful
+registration drops the `via=connector` marker, because proving a password is
+what the marker exists to wait for — but the password proved at `/register` is a
+*new account's*, chosen by whoever is registering, not the rider's. So a
+connector session could register a throwaway account and, as that account,
+write the LLM settings: they are app-global rather than per-user, so they are
+the settings a different `uid` can still reach — and since #126 that includes
+the endpoint, so the throwaway account captured the rider's existing key and
+prompts without ever seeing either. Device pairing and calendar-feed rotation
+were never reachable this way — both are per-user, and the new account is a
+different user.
 
-The mitigating half is that anyone who can reach the port can already register
+**That is closed, and it was closed at the source rather than at the marker.**
+The old note here said "anyone who can reach the port can already register
 without a device token at all, so this is a pre-existing property of open
-registration rather than something the connector introduced. It is recorded
-here because the refusal above would otherwise read as stronger than it is. If
-open registration is ever closed, close this with it.
+registration" and ended "if open registration is ever closed, close this with
+it." Open registration is now closed: once an account exists, `/register`
+refuses unless `WATTRACKER_ALLOW_REGISTRATION` is set (see **Network
+boundary**), so there is no anonymous way to manufacture the password the
+promotion waits for. `tests/test_registration_policy.py` walks the full chain —
+token, ticket, session, `POST /register` — and asserts the LLM endpoint and
+stored key are still the rider's afterwards.
+
+The residue, stated so nobody enables the flag uninformed: **with
+`WATTRACKER_ALLOW_REGISTRATION` set, this path is open again.** That is inherent
+in allowing anonymous sign-up at all, and is the reason the capability is a flag
+rather than the route simply being reopened. Turn it on to add a rider, then
+restart without it. The same test file pins that behaviour too, so it is a known
+property rather than a later surprise.
 
 Revocation reaches the session as well as the token, over **both** protocols.
 A session cookie is a signed blob with no server-side record, so

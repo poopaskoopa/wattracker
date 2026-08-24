@@ -428,6 +428,36 @@ def allow_non_loopback() -> bool:
     return raw in ("1", "true", "yes", "on")
 
 
+def allow_registration() -> bool:
+    """Whether ``POST /register`` may create an ADDITIONAL account.
+
+    The first account is not governed by this: every install bootstraps by
+    registering, and a server with no users has nothing to protect yet. Once a
+    user exists, an open /register is a hole rather than a feature, because
+    registration is unauthenticated and an account is not a harmless thing to
+    hold on this app:
+
+    * the LLM settings are app-global, not per-user, so any account can point
+      the endpoint at a host it controls and collect the rider's stored API key
+      and every prompt payload sent afterwards; and
+    * ``_promote_to_password_session`` clears the ``via=connector`` marker when
+      a password is proven, so a connector session that registers a throwaway
+      account sheds the marker and walks past the /settings refusal that exists
+      to stop exactly that.
+
+    Neither is reachable from outside while the server is bound to loopback,
+    which is why this was survivable until LAN binding became a documented
+    option. docs/windows-security.md has listed "registration policy" as an
+    unbuilt prerequisite for that bind since it was written; this is it.
+
+    Deliberately the same shape as ``allow_non_loopback``: a separate explicit
+    variable, off by default, parsed identically, so a rider who has learned
+    one has learned both and neither can be turned on by accident.
+    """
+    raw = os.environ.get("WATTRACKER_ALLOW_REGISTRATION", "").strip().lower()
+    return raw in ("1", "true", "yes", "on")
+
+
 def server_host() -> str:
     """Validated bind host. Loopback-only unless explicitly opted out of."""
     raw = os.environ.get("WATTRACKER_HOST", "127.0.0.1").strip()
