@@ -202,6 +202,20 @@ def wait_for_scans(timeout: float = SCAN_SHUTDOWN_TIMEOUT_S) -> bool:
         pending[0].join(min(remaining, 0.5))
 
 
+def reset_scan_status() -> None:
+    """Forget every recorded scan result. For the test suite.
+
+    ``_scan_status`` is keyed by user id and lives as long as the process,
+    while tests reuse the low ids against a fresh database each time - so one
+    test's finished scan is visible to the next one, which then reads a status
+    belonging to a scan of a folder that no longer exists. Only the status is
+    dropped; the thread registry behind it is left alone, because shutdown
+    still has to be able to join anything genuinely running.
+    """
+    with _scan_lock:
+        _scan_status.clear()
+
+
 def _scan_status_snapshot(user_id: Optional[int]) -> Optional[dict]:
     with _scan_lock:
         st = _scan_status.get(user_id)
@@ -283,6 +297,109 @@ def _start_user_scan(user_id: int, directory: Optional[str]) -> Optional[dict]:
         _scan_threads.add(thread)
     thread.start()
     return snapshot
+
+
+# The shortest gap between two pieces of work nobody asked for. The connector
+# reports real changes only, so this is not a throttle on ordinary use - it
+# bounds what a *misbehaving* connector can cost, and there are two ways to
+# misbehave: a crash loop reconnects (and flushes its pending change) every few
+# seconds, and a bug could report a file that never settles. The Rescan button
+# is exempt on purpose: a rider who presses it is entitled to a scan.
+AUTO_SCAN_MIN_INTERVAL_S = 60.0
+# The same idea for the export sync an attaching connector triggers. Longer,
+# because nothing about a reconnect makes the plan newer - the run that matters
+# is the first one after the connector becomes reachable.
+ATTACH_EXPORT_MIN_INTERVAL_S = 300.0
+
+_auto_work_lock = threading.Lock()
+_auto_work_at: "dict[tuple, float]" = {}
+
+
+def reset_auto_work_limits() -> None:
+    """Forget when each user last had unrequested work done for them.
+
+    For the test suite, which reuses low user ids across tests inside one
+    process: without this, one test triggering a connector scan would suppress
+    the next test's, and the failure would look like the event never arrived.
+    """
+    with _auto_work_lock:
+        _auto_work_at.clear()
+
+
+def _claim_auto_slot(kind: str, user_id: int, interval_s: float) -> bool:
+    """Whether unrequested work of this kind may run for this user now.
+
+    Claiming is the same act as asking: a caller that is told yes has consumed
+    the slot whether or not it goes on to do anything useful. The point is to
+    bound how often we are willing to be asked, not how often we succeed.
+    """
+    now = _time.monotonic()
+    with _auto_work_lock:
+        last = _auto_work_at.get((kind, user_id))
+        if last is not None and (now - last) < interval_s:
+            _log.debug(
+                "skipping %s for user %s: the last one was %.0fs ago",
+                kind, user_id, now - last,
+            )
+            return False
+        _auto_work_at[(kind, user_id)] = now
+    return True
+
+
+def _start_auto_scan(user_id: int, reason: str) -> bool:
+    """Start a scan the rider did not ask for. True if one actually started."""
+    if not _claim_auto_slot("scan", user_id, AUTO_SCAN_MIN_INTERVAL_S):
+        return False
+    if _start_user_scan(user_id, directory=None) is None:
+        _log.debug(
+            "%s for user %s: a scan is already running", reason, user_id
+        )
+        return False
+    _log.info("scanning for user %s (%s)", user_id, reason)
+    return True
+
+
+# Strong references to the attach-triggered export tasks. asyncio keeps only
+# weak ones, so a task nothing else refers to can be collected mid-await.
+_attach_tasks: "set[asyncio.Task]" = set()
+
+
+def _start_attach_exports(session) -> None:
+    """Push the plan's .zwo files now that the connector is reachable again.
+
+    The export has exactly the dependency the scan has and had exactly the same
+    bug: it runs on the daily sweep, it needs a connector attached to write
+    anything, and when there was none it reported 'offline' and did not try
+    again for 24 hours - so a rider whose connector was down at sweep time
+    found tomorrow's workout missing from Zwift.
+
+    Unlike the scan there is nothing the connector can notice for itself: the
+    trigger is "the plan changed", which only this end knows. So this stays on
+    the server, and attaching is the moment it becomes possible.
+    """
+    if not _claim_auto_slot("exports", session.user_id, ATTACH_EXPORT_MIN_INTERVAL_S):
+        return
+    task = asyncio.create_task(_sync_exports_on_attach(session))
+    _attach_tasks.add(task)
+    task.add_done_callback(_attach_tasks.discard)
+
+
+async def _sync_exports_on_attach(session) -> None:
+    """One export sync, off the event loop and unable to break the session."""
+    try:
+        result = await asyncio.to_thread(
+            exporter.sync_plan_exports, session.user_id
+        )
+    except Exception:
+        _log.warning(
+            "export sync on attach failed for user %s", session.user_id,
+            exc_info=True,
+        )
+        return
+    if result.get("exported") or result.get("removed"):
+        _log.info(
+            "export sync on attach for user %s: %s", session.user_id, result
+        )
 
 
 def run_daily_maintenance() -> dict:
@@ -4994,6 +5111,11 @@ def create_app() -> FastAPI:
                 {"event": "hello", "protocol": rpc.PROTOCOL_VERSION,
                  "device": session.label}
             )
+            # Strictly after the greeting: the connector reads the first frame
+            # expecting 'hello' and drops the connection on anything else, so
+            # a request racing ahead of it would refuse every connector this
+            # server accepted.
+            _start_attach_exports(session)
             while True:
                 message = rpc.decode(await websocket.receive_text())
                 if peer.resolve(message):
@@ -5019,10 +5141,21 @@ def create_app() -> FastAPI:
     async def _handle_connector_event(session, event: str, message: dict) -> None:
         """Route one connector-originated event.
 
-        Only ride telemetry so far, and it is fire-and-forget by design: a
-        dropped frame costs one second of a chart, whereas acknowledging every
-        sample would put a round trip in the middle of a 1 Hz loop.
+        Fire-and-forget by design: a dropped telemetry frame costs one second
+        of a chart, whereas acknowledging every sample would put a round trip
+        in the middle of a 1 Hz loop. ``activities.changed`` accepts the same
+        bargain - a lost one costs a ride its promptness, and the daily sweep
+        is still there to catch it.
         """
+        if event == "activities.changed":
+            # The connector has seen a new .fit finish being written. It says
+            # nothing about WHICH file or WHERE, and is not asked to: the
+            # folder is the server's own setting to resolve (see
+            # _resolved_activities_dir on why a path arriving over this socket
+            # is not a path to trust). All this carries is "there is something
+            # to find" - the scan does the finding.
+            _start_auto_scan(session.user_id, "the connector reported new files")
+            return
         if event == "ble.sample":
             sink = session.ble_sink
             if sink is not None:

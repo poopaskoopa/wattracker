@@ -99,6 +99,18 @@ def isolated_env(tmp_path, monkeypatch):
         "ANTHROPIC_API_KEY",
     ):
         monkeypatch.delenv(key, raising=False)
+    # Per-user rate limits on unrequested work (connector-triggered scans, the
+    # export sync on attach) are keyed by user id and live for the life of the
+    # process. Tests reuse the low ids, so without this one test's connector
+    # scan silently suppresses the next test's and the failure reads as "the
+    # event never arrived".
+    # The same applies to the recorded scan status, which is keyed by user id
+    # and outlives the database it describes: without this a test reads the
+    # previous test's finished scan and believes it was its own.
+    _server = sys.modules.get("wattracker.server")
+    if _server is not None:
+        _server.reset_auto_work_limits()
+        _server.reset_scan_status()
     yield
     # Nothing this fixture sets is scoped to a thread: WATTRACKER_DB and
     # WATTRACKER_DATA_DIR are process-global, and a rescan re-reads both on

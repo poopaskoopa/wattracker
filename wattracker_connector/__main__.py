@@ -266,6 +266,17 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--activities-dir", help="Override the Zwift Activities folder")
     parser.add_argument("--workouts-dir", help="Override the Zwift Workouts folder")
     parser.add_argument(
+        "--scan-interval", type=float, metavar="SECONDS",
+        help=(
+            "How often to check the Activities folder for a finished ride, in "
+            "seconds (default 60, minimum 5). The server is told as soon as a "
+            "new .fit stops being written to, so a ride appears within about "
+            "two of these rather than on the server's daily sweep. Use 0 to "
+            "stop watching, which leaves that sweep as the only thing that "
+            "imports rides"
+        ),
+    )
+    parser.add_argument(
         "--save", action="store_true",
         help="Write these settings to the config file and use them from now on",
     )
@@ -806,6 +817,13 @@ def main(argv: Optional[List[str]] = None) -> int:
         "token": args.token or stored.get("token"),
         "activities_dir": args.activities_dir or stored.get("activities_dir"),
         "workouts_dir": args.workouts_dir or stored.get("workouts_dir"),
+        # `is not None`, not `or`: 0 is the value that turns the watcher off,
+        # and `or` would read it as "unset" and hand back the stored interval -
+        # so --scan-interval 0 --save would appear to work and change nothing.
+        "scan_interval": (
+            args.scan_interval if args.scan_interval is not None
+            else stored.get("scan_interval")
+        ),
     }
     if _tray_wanted(args):
         if os.name != "nt":
@@ -851,6 +869,7 @@ def main(argv: Optional[List[str]] = None) -> int:
             workouts_dir=settings["workouts_dir"],
         ),
         status=ConnectorStatus(),
+        scan_interval=settings["scan_interval"],
     )
     if _tray_wanted(args):
         # Windows-ness and the single instance were both settled above, before

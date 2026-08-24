@@ -17,6 +17,7 @@ from urllib.parse import urlsplit, urlunsplit
 
 from wattracker import rpc
 
+from . import watcher
 from .ble_handlers import BleState, build_ble_handlers
 from .buffer import upload_pending
 from .handlers import ConnectorConfig, build_handlers
@@ -122,6 +123,7 @@ class Connector:
         config: ConnectorConfig,
         status: Optional[ConnectorStatus] = None,
         extra_handlers: Optional[Dict[str, Callable]] = None,
+        scan_interval: Optional[float] = None,
     ) -> None:
         self.server_url = server_url
         self.token = token
@@ -138,6 +140,18 @@ class Connector:
             self._handlers.update(extra_handlers)
         self._peer: Optional[rpc.RpcPeer] = None
         self._stop = asyncio.Event()
+        # Watches the Zwift folder so a finished ride reaches the server in
+        # about a minute instead of on the server's daily sweep. The interval
+        # is settable (and 0 turns it off) because it is the one thing here a
+        # rider might reasonably want to trade: promptness against a folder
+        # read they can feel on a slow or spun-down disk.
+        self.scan_interval = watcher.normalize_interval(scan_interval)
+        self._watcher = watcher.ActivityWatcher(config)
+        # Set when the folder has changed and the server has not been told
+        # yet. Survives a disconnect: the change happened whether or not there
+        # was a socket to report it on, and the flush is the first thing the
+        # next connection does - the same contract as the buffered ride.
+        self._activities_dirty = False
         # Strong references to the in-flight request tasks. The loop holds
         # only weak ones, so a task nothing else refers to may be collected
         # mid-await - see _serve.
@@ -160,50 +174,57 @@ class Connector:
     async def run_forever(self) -> None:
         """Connect, serve, and reconnect until stopped."""
         backoff = _BACKOFF_START_S
-        while not self._stop.is_set():
-            try:
-                await self._session()
-                backoff = _BACKOFF_START_S  # a clean session resets the clock
-            except asyncio.CancelledError:
-                raise
-            except _Replaced as exc:
-                # Another connector took this account over. Reconnecting would
-                # evict it and get us evicted right back, forever - so stop,
-                # and say why, because this is a configuration mistake and not
-                # a network problem.
-                self.status.connected = False
-                self.status.last_error = str(exc)
-                # The close frame's own text says "4409" and nothing a rider
-                # can use, and the tray has no log to read - so the sentence
-                # that explains this is put where the tray will find it.
-                self.status.stopped_reason = (
-                    "Another connector has taken this account over. Only one "
-                    "connector may run per account: quit the other one, or "
-                    "pair this machine as its own device."
-                )
-                log.error(
-                    "another connector has taken over this account - stopping. "
-                    "Only one connector may run per account; quit the other "
-                    "one, or pair this machine as its own device."
-                )
-                self._stop.set()
-                break
-            except Exception as exc:
-                self.status.connected = False
-                self.status.last_error = str(exc)
-                log.warning("connector session ended: %s", exc)
-            if self._stop.is_set():
-                break
-            # Jitter so a fleet of connectors does not stampede a server that
-            # just came back up.
-            ceiling = _RIDE_BACKOFF_MAX_S if self.ble.riding else _BACKOFF_MAX_S
-            delay = min(backoff, ceiling) * (0.5 + random.random())
-            log.info("reconnecting in %.1fs", delay)
-            try:
-                await asyncio.wait_for(self._stop.wait(), timeout=delay)
-            except asyncio.TimeoutError:
-                pass
-            backoff = min(backoff * _BACKOFF_FACTOR, _BACKOFF_MAX_S)
+        # Started here, not inside a session: the folder has to keep
+        # being watched while the socket is down, or a ride finished
+        # during a server restart goes unnoticed until the next one.
+        watch = self._start_activity_watch()
+        try:
+            while not self._stop.is_set():
+                try:
+                    await self._session()
+                    backoff = _BACKOFF_START_S  # a clean session resets the clock
+                except asyncio.CancelledError:
+                    raise
+                except _Replaced as exc:
+                    # Another connector took this account over. Reconnecting would
+                    # evict it and get us evicted right back, forever - so stop,
+                    # and say why, because this is a configuration mistake and not
+                    # a network problem.
+                    self.status.connected = False
+                    self.status.last_error = str(exc)
+                    # The close frame's own text says "4409" and nothing a rider
+                    # can use, and the tray has no log to read - so the sentence
+                    # that explains this is put where the tray will find it.
+                    self.status.stopped_reason = (
+                        "Another connector has taken this account over. Only one "
+                        "connector may run per account: quit the other one, or "
+                        "pair this machine as its own device."
+                    )
+                    log.error(
+                        "another connector has taken over this account - stopping. "
+                        "Only one connector may run per account; quit the other "
+                        "one, or pair this machine as its own device."
+                    )
+                    self._stop.set()
+                    break
+                except Exception as exc:
+                    self.status.connected = False
+                    self.status.last_error = str(exc)
+                    log.warning("connector session ended: %s", exc)
+                if self._stop.is_set():
+                    break
+                # Jitter so a fleet of connectors does not stampede a server that
+                # just came back up.
+                ceiling = _RIDE_BACKOFF_MAX_S if self.ble.riding else _BACKOFF_MAX_S
+                delay = min(backoff, ceiling) * (0.5 + random.random())
+                log.info("reconnecting in %.1fs", delay)
+                try:
+                    await asyncio.wait_for(self._stop.wait(), timeout=delay)
+                except asyncio.TimeoutError:
+                    pass
+                backoff = min(backoff * _BACKOFF_FACTOR, _BACKOFF_MAX_S)
+        finally:
+            await _cancel(watch)
         # Leaving the loop is definitive - Ctrl-C, the tray quitting, or being
         # displaced by another connector - not a reconnect. So the radio goes
         # back even if a ride was in progress: nothing is going to pick it up.
@@ -265,6 +286,11 @@ class Connector:
                 # thing this process holds, and there is no reason to make it
                 # wait behind a scan.
                 await self._flush_buffered_ride()
+                # Then anything the folder gained while we were away. A ride
+                # ridden during a server restart is noticed by the watcher at
+                # the time and reported here, which is what makes a connector
+                # start (or a reconnect) the cold-start trigger for a scan.
+                await self._flush_activity_signal()
                 claim = self._start_claim_watchdog()
                 try:
                     await self._serve(socket, peer)
@@ -326,6 +352,68 @@ class Connector:
             # Never let this stop the session starting - the buffer keeps the
             # ride and the next reconnect tries again.
             log.warning("could not upload the buffered ride", exc_info=True)
+
+    # ------------------------------------------------- watching the folder
+    def _start_activity_watch(self) -> Optional[asyncio.Task]:
+        """The folder-watching task, or None if the rider turned it off."""
+        if self.scan_interval <= 0:
+            log.info(
+                "not watching the Zwift folder (scan interval is 0); the "
+                "server's own sweep is what will pick rides up"
+            )
+            return None
+        log.info(
+            "watching %s every %.0fs",
+            ", ".join(self._watcher.folders()) or "(no Zwift folder yet)",
+            self.scan_interval,
+        )
+        return asyncio.create_task(self._watch_activities())
+
+    async def _watch_activities(self) -> None:
+        """Poll the Activities folders forever, reporting what settles.
+
+        Deliberately unkillable by its own failures: a folder that cannot be
+        read is a reason to try again next minute, not a reason to stop
+        watching for the rest of the session.
+        """
+        while not self._stop.is_set():
+            try:
+                await asyncio.wait_for(
+                    self._stop.wait(), timeout=self.scan_interval
+                )
+                return  # stopping
+            except asyncio.TimeoutError:
+                pass
+            try:
+                # os.scandir on a spun-down or networked disk can block for
+                # long enough to matter, and this loop shares the event loop
+                # with a ride's 1 Hz telemetry.
+                if await asyncio.to_thread(self._watcher.poll):
+                    self._activities_dirty = True
+            except Exception:
+                log.warning("could not check the Zwift folder", exc_info=True)
+            await self._flush_activity_signal()
+
+    async def _flush_activity_signal(self) -> None:
+        """Tell the server the folder changed, if it changed and we can.
+
+        The flag is cleared only on a successful send. An event is
+        fire-and-forget with no acknowledgement, so this is the one chance to
+        notice the socket was gone - and holding the flag means the news goes
+        out on the next connection rather than waiting for the next ride to
+        overwrite it.
+        """
+        if not self._activities_dirty:
+            return
+        try:
+            await self._send_event("activities.changed")
+        except Exception:
+            # Includes the ordinary "not connected": nothing to do but keep
+            # the flag. Debug rather than warning - an offline connector
+            # noticing a ride is expected, not a fault.
+            log.debug("could not report the folder change yet", exc_info=True)
+            return
+        self._activities_dirty = False
 
     async def _serve(self, socket, peer: rpc.RpcPeer) -> None:
         """Answer requests until the socket closes or we are told to stop."""
