@@ -163,11 +163,40 @@ verified against actual equipment** — it cannot be exercised in CI.
 ## Configuration
 
 FTP override, ZwiftID, and folder paths are **per-user** settings stored in the
-database. App-level config — the `ANTHROPIC_API_KEY` and the session secret —
-is read from environment variables (`ANTHROPIC_API_KEY`, `WATTRACKER_SECRET`)
-first, then an optional `config.json` in `~/.wattracker/` (the session secret is
-generated and persisted there on first run). The app is fully functional without
-an API key — LLM refinement is an optional layer over the pure-formula planner.
+database. App-level config — the LLM settings and the session secret — is read
+from environment variables first, then an optional `config.json` in
+`~/.wattracker/` (the session secret is generated and persisted there on first
+run). The app is fully functional without any of these — LLM refinement is an
+optional layer over the pure-formula planner.
+
+LLM refinement uses `API_KEY` plus `LLM_ENDPOINT`, which takes `anthropic`
+(the default; model `claude-sonnet-5`), `openai` (model `gpt-5.6-luna`), or
+`openrouter` (model `google/gemini-3.7-flash`) — or the base URL of any other
+OpenAI-compatible server (vLLM, LM Studio, Ollama: a bare host like
+`http://localhost:11434` gets `/v1` appended). `LLM_MODEL` overrides the
+per-provider default and is required for a custom URL; without it the LLM
+layer is disabled with a warning. A custom URL may be keyless (local
+servers); the three named providers require `API_KEY`. `ANTHROPIC_API_KEY` is
+the legacy name for `API_KEY` and still works as a fallback.
+
+The refinement call is one chat-completion request: a 60 second timeout and a
+2000-token output budget (`max_tokens`), made without retries. For a custom
+endpoint, use a non-reasoning (instruct) model. Reasoning models spend the
+output budget on thinking tokens first, so the JSON answer can come back with
+zero content tokens, and thinking can also overrun the 60 second window, in
+which case the request is dropped (visible as a canceled request in the
+server's log). Either way the layer degrades to the unrefined formula plan, so
+a thinking model costs latency and refinement quality, not correctness.
+
+Like the key, the endpoint and model are **app-level and shared**: any
+authenticated user of the installation can change them from Settings, and the
+prompt sent to a custom URL contains the requesting rider's training state
+and planned workout. On a single-user, loopback install this is a
+non-issue; on a shared or networked deployment (docker compose,
+`WATTRACKER_ALLOW_NON_LOOPBACK`) treat the endpoint like the key — only run
+it with people you would also hand the `API_KEY`, since any of them can
+redirect every user's LLM traffic to a URL they control. Endpoint changes are
+logged to the server log.
 
 Runtime variables include `WATTRACKER_DATA_DIR`, `WATTRACKER_DB`,
 `WATTRACKER_HOST`, `WATTRACKER_PORT`, `WATTRACKER_OPEN_BROWSER`, and

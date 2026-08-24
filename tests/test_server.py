@@ -234,3 +234,130 @@ def test_frozen_windows_settings_uses_embedded_restore_command(client, monkeypat
     assert response.status_code == 200
     assert "wattracker.exe restore" in response.text
     assert "wattracker-restore" not in response.text
+
+
+# ------------------------------------------------------------- LLM settings
+def _read_config_json():
+    import json
+    import os
+
+    from wattracker import config
+
+    path = config.config_path()
+    if not os.path.exists(path):
+        return {}
+    with open(path, "r", encoding="utf-8") as f:
+        return json.load(f) or {}
+
+
+def test_settings_saves_llm_settings(client):
+    _register(client)
+    response = client.post(
+        "/settings",
+        data={"llm_endpoint": "openrouter", "llm_model": "x", "api_key": "k"},
+    )
+    assert response.status_code == 200
+    assert "(currently set)" in response.text
+    data = _read_config_json()
+    assert data["llm_endpoint"] == "openrouter"
+    assert data["llm_model"] == "x"
+    assert data["api_key"] == "k"
+    # The page preselects the saved provider afterwards.
+    import re
+
+    collapsed = re.sub(r"\s+", " ", client.get("/settings").text)
+    assert 'value="openrouter" selected' in collapsed
+
+
+def test_settings_legacy_anthropic_api_key_alias_still_accepted(client):
+    _register(client)
+    response = client.post(
+        "/settings",
+        data={"llm_endpoint": "anthropic", "anthropic_api_key": "legacy-k"},
+    )
+    assert response.status_code == 200
+    data = _read_config_json()
+    assert data["api_key"] == "legacy-k"
+    assert "anthropic_api_key" not in data
+
+
+def test_settings_api_key_field_wins_over_alias(client):
+    _register(client)
+    client.post(
+        "/settings",
+        data={"llm_endpoint": "anthropic", "api_key": "new-k",
+              "anthropic_api_key": "legacy-k"},
+    )
+    data = _read_config_json()
+    assert data["api_key"] == "new-k"
+
+
+def test_settings_custom_endpoint_requires_valid_url(client):
+    _register(client)
+    client.post(
+        "/settings",
+        data={"llm_endpoint": "custom", "llm_custom_url": "http://h:1/v1",
+              "llm_model": "m", "api_key": "k"},
+    )
+    data = _read_config_json()
+    assert data["llm_endpoint"] == "http://h:1/v1"
+    assert data["llm_model"] == "m"
+
+    response = client.post(
+        "/settings",
+        data={"llm_endpoint": "custom", "llm_custom_url": "not a url",
+              "llm_model": "m"},
+    )
+    assert response.status_code == 200
+    assert "needs a valid" in response.text
+    # Rejected: the stored values are untouched, and the model was NOT wiped.
+    data = _read_config_json()
+    assert data["llm_endpoint"] == "http://h:1/v1"
+    assert data["llm_model"] == "m"
+
+
+def test_settings_overlong_model_does_not_wipe_stored_model(client):
+    from wattracker import config
+
+    _register(client)
+    client.post(
+        "/settings",
+        data={"llm_endpoint": "custom", "llm_custom_url": "http://h:1/v1",
+              "llm_model": "good-model"},
+    )
+    assert config.llm_settings().model == "good-model"
+    # A model over 200 chars is rejected and reported - it must NOT be
+    # treated as a blank that clears the stored model (which has no default
+    # for custom endpoints; the wipe would silently disable the LLM layer).
+    response = client.post(
+        "/settings",
+        data={"llm_endpoint": "custom", "llm_custom_url": "http://h:1/v1",
+              "llm_model": "x" * 201},
+    )
+    assert response.status_code == 200
+    assert "at most 200 characters" in response.text
+    data = _read_config_json()
+    assert data["llm_model"] == "good-model"
+    assert config.llm_settings().model == "good-model"
+
+
+def test_settings_blank_model_clears_stored_model(client):
+    from wattracker import config
+
+    _register(client)
+    client.post(
+        "/settings",
+        data={"llm_endpoint": "openrouter", "llm_model": "x", "api_key": "k"},
+    )
+    assert config.llm_settings().model == "x"
+    # A second save with the model left blank clears it (the key is blank =
+    # keep, not clear).
+    client.post(
+        "/settings",
+        data={"llm_endpoint": "openrouter", "llm_model": ""},
+    )
+    data = _read_config_json()
+    assert "llm_model" not in data
+    assert data["api_key"] == "k"
+    # The resolver now reports the provider default.
+    assert config.llm_settings().model == "google/gemini-3.7-flash"
