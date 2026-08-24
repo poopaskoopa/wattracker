@@ -22,6 +22,36 @@ from urllib.parse import urlsplit
 _log = logging.getLogger(__name__)
 
 
+def _icacls_path() -> str:
+    r"""Absolute path to the system ``icacls.exe``.
+
+    WHY absolute, and why this is a security control rather than a tidiness
+    preference: ``subprocess.run`` with a list and no ``shell=True`` reaches
+    ``CreateProcessW`` with ``lpApplicationName=NULL``, and in that mode
+    Windows resolves a bare program name through a documented search order
+    that begins with **the directory of the calling executable and then the
+    current working directory - both BEFORE System32**. The connector ships as
+    a portable .exe a rider drops in Downloads or on a USB stick, and
+    ``_restrict`` is on the very first code path its ``__main__`` reaches, so
+    an ``icacls.exe`` planted next to that .exe (or in whatever directory the
+    process happens to be started from) would be executed as the rider on
+    every launch, every config save and every log rotation. ``CREATE_NO_WINDOW``
+    plus ``capture_output=True`` means the rider would never see it run. That
+    is arbitrary code execution obtained by dropping one file beside a
+    download - no elevation, no exploit.
+
+    Naming the full path removes the search entirely: ``CreateProcessW`` opens
+    exactly that file or fails. ``%SystemRoot%`` is read from the environment
+    (Windows always sets it) with ``C:\Windows`` as the fallback for the
+    pathological case where it is missing or empty - a wrong guess there
+    degrades to the same best-effort no-op as a missing icacls, which the
+    caller already swallows, whereas trusting a bare name degrades to running
+    an attacker's binary.
+    """
+    system_root = os.environ.get("SystemRoot") or r"C:\Windows"
+    return os.path.join(system_root, "System32", "icacls.exe")
+
+
 def _restrict_windows_acl(path: str, is_dir: bool) -> None:
     """Best-effort owner-only NTFS ACL on Windows.
 
@@ -44,6 +74,9 @@ def _restrict_windows_acl(path: str, is_dir: bool) -> None:
     and shut each time the tray starts. Fetched with ``getattr`` because the
     flag exists only on Windows, and the tests reach this function by
     monkeypatching ``os.name`` on machines where it does not.
+
+    The executable is named by ABSOLUTE path, and that is a security control
+    rather than tidiness - see ``_icacls_path``.
     """
     try:
         user = getpass.getuser()
@@ -56,7 +89,7 @@ def _restrict_windows_acl(path: str, is_dir: bool) -> None:
     grant = f"{user}:(OI)(CI)F" if is_dir else f"{user}:F"
     try:
         subprocess.run(
-            ["icacls", path, "/inheritance:r", "/grant:r", grant],
+            [_icacls_path(), path, "/inheritance:r", "/grant:r", grant],
             check=True,
             capture_output=True,
             creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),

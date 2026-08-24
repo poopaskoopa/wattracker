@@ -42,6 +42,18 @@ the relocated-directory gap.
 The lockdown is best-effort and never crashes the app: if `icacls` is missing or
 fails (e.g. a filesystem that does not support ACLs), the failure is logged at
 debug and startup continues, mirroring the existing chmod-can-fail contract.
+
+`icacls.exe` is named by **absolute path**, built from `%SystemRoot%`
+(`config._icacls_path`). Passing a list to `subprocess.run` reaches
+`CreateProcessW` with `lpApplicationName=NULL`, and Windows then resolves a
+bare program name starting from the calling executable's own directory and the
+current working directory, **both ahead of System32**. The connector ships as a
+portable `.exe` a rider drops in Downloads, and `_restrict` is on the first code
+path its `__main__` reaches — so a bare `"icacls"` meant an `icacls.exe` planted
+beside that download ran as the rider on every launch, every config save and
+every log rotation, invisibly (`CREATE_NO_WINDOW` + `capture_output`). The
+absolute path removes the search entirely. `tests/test_windows_acl.py` asserts
+the property, not just the string: any relative spelling fails.
 This is defense against another local account reading an at-rest copy; it does
 not protect secrets from malware already running as the same Windows user.
 

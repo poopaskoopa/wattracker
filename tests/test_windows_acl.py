@@ -1,4 +1,4 @@
-"""Windows owner-only ACL enforcement in ``config._restrict``.
+r"""Windows owner-only ACL enforcement in ``config._restrict``.
 
 POSIX ``chmod`` is inert on Windows (it only flips the read-only bit and sets no
 ACL), so a data dir relocated onto a volume whose inherited ACL grants other
@@ -6,16 +6,45 @@ local accounts read access would leak the session secret and password hashes.
 ``config._restrict`` therefore applies an owner-only ACL via ``icacls`` on
 Windows. These tests are platform-neutral: the Windows branch is exercised on
 macOS/Linux by monkeypatching ``os.name`` and the ``icacls`` subprocess call.
+
+The argv[0] assertions below are a security control, not a formatting
+preference. ``subprocess.run`` with a list and no ``shell=True`` reaches
+``CreateProcessW`` with ``lpApplicationName=NULL``, and Windows then resolves a
+bare program name starting from the calling executable's own directory and the
+current working directory - BOTH ahead of System32. The connector is a portable
+.exe, and ``_restrict`` runs on its very first code path, so a bare "icacls"
+would execute an ``icacls.exe`` planted beside that download, silently
+(CREATE_NO_WINDOW + capture_output), on every launch and every config save. The
+absolute ``%SystemRoot%\System32\icacls.exe`` skips the search entirely. If a
+future edit reverts to the bare name these tests must fail, which is what
+``test_windows_icacls_is_never_a_bare_or_relative_name`` exists to guarantee
+even if the exact-argv assertions are ever loosened.
 """
 import getpass
+import ntpath
 import os
 import subprocess
 
 from wattracker import config
 
+#: Stand-in for a real Windows %SystemRoot%. Set explicitly in the tests rather
+#: than relied on from the environment, because the machines this suite runs on
+#: do not have one.
+FAKE_SYSTEM_ROOT = r"C:\Windows"
+
+
+def _expected_icacls() -> str:
+    """The absolute path _restrict_windows_acl must invoke.
+
+    Built with the same os.path.join the implementation uses, so this stays
+    honest on POSIX (where the separator differs) without hardcoding a
+    platform-specific literal.
+    """
+    return os.path.join(FAKE_SYSTEM_ROOT, "System32", "icacls.exe")
+
 
 def _capture_run(monkeypatch):
-    """Patch getpass + subprocess.run; return the list that records run() argv."""
+    """Patch getpass + subprocess.run + %SystemRoot%; return the recorded argv."""
     calls = []
 
     def fake_run(argv, *args, **kwargs):
@@ -24,6 +53,7 @@ def _capture_run(monkeypatch):
 
     monkeypatch.setattr(getpass, "getuser", lambda: "alice")
     monkeypatch.setattr(subprocess, "run", fake_run)
+    monkeypatch.setenv("SystemRoot", FAKE_SYSTEM_ROOT)
     return calls
 
 
@@ -62,7 +92,9 @@ def test_windows_file_builds_owner_only_icacls_argv(tmp_path, monkeypatch):
 
     assert len(calls) == 1
     argv = calls[0][0]
-    assert argv == ["icacls", str(f), "/inheritance:r", "/grant:r", "alice:F"]
+    assert argv == [
+        _expected_icacls(), str(f), "/inheritance:r", "/grant:r", "alice:F"
+    ]
     # never shell=True
     assert calls[0][2].get("shell", False) is False
 
@@ -114,7 +146,7 @@ def test_windows_dir_gets_inheritable_owner_only_grant(tmp_path, monkeypatch):
 
     argv = calls[0][0]
     assert argv == [
-        "icacls",
+        _expected_icacls(),
         str(d),
         "/inheritance:r",
         "/grant:r",
@@ -152,6 +184,86 @@ def test_windows_path_with_spaces_stays_one_argv_element(tmp_path, monkeypatch):
     assert argv[1] == str(f)
     assert " " in argv[1]
     assert len(argv) == 5
+
+
+# ------------------------------------------ argv[0] must not be searched for
+def test_windows_icacls_is_never_a_bare_or_relative_name(tmp_path, monkeypatch):
+    """The binary-planting regression guard, stated as a property.
+
+    With ``lpApplicationName=NULL`` - which is what passing a list to
+    subprocess.run gives you - CreateProcessW searches the calling
+    executable's directory and the current working directory BEFORE System32.
+    The connector is a portable .exe and _restrict is the first thing its
+    __main__ reaches, so a bare "icacls" means an attacker-supplied
+    ``icacls.exe`` dropped next to the download runs as the rider on every
+    launch, every config save and every log rotation - invisibly, because the
+    call is CREATE_NO_WINDOW with capture_output.
+
+    Asserted as a property rather than an exact string so that ANY relative
+    form (``icacls``, ``icacls.exe``, ``.\\icacls.exe``, ``System32\\icacls.exe``)
+    fails, not only the one that was there before.
+    """
+    monkeypatch.setattr(os, "name", "nt")
+    calls = _capture_run(monkeypatch)
+
+    d = tmp_path / "datadir"
+    d.mkdir()
+    f = tmp_path / "wattracker.db"
+    f.write_text("x")
+    config._restrict(str(d), 0o700, is_dir=True)
+    config._restrict(str(f), 0o600, is_dir=False)
+
+    assert len(calls) == 2
+    for argv, _args, _kwargs in calls:
+        program = argv[0]
+        # Not the bare name, under any spelling.
+        assert os.path.basename(program) == "icacls.exe"
+        assert program != "icacls"
+        assert program != "icacls.exe"
+        # Absolute, so no search happens at all. ntpath is used explicitly:
+        # this asserts what WINDOWS would consider absolute, and these tests
+        # run on POSIX where "C:\\Windows\\..." is just a relative filename.
+        assert ntpath.isabs(program.replace("/", "\\")), program
+        # And rooted in the system directory, not in whatever the process's
+        # own directory or CWD happens to be.
+        assert program.startswith(FAKE_SYSTEM_ROOT)
+
+
+def test_windows_icacls_path_follows_systemroot(tmp_path, monkeypatch):
+    """A relocated Windows install (%SystemRoot% is not always C:\\Windows).
+
+    Reading the environment rather than hardcoding C:\\Windows keeps the fix
+    from becoming a broken no-op on such a machine, which would silently
+    reinstate the unrestricted-ACL finding the whole function exists to close.
+    """
+    monkeypatch.setattr(os, "name", "nt")
+    calls = _capture_run(monkeypatch)
+    monkeypatch.setenv("SystemRoot", r"D:\WinNT")
+
+    f = tmp_path / "wattracker.db"
+    f.write_text("x")
+    config._restrict(str(f), 0o600, is_dir=False)
+
+    assert calls[0][0][0] == os.path.join(r"D:\WinNT", "System32", "icacls.exe")
+
+
+def test_windows_icacls_path_falls_back_when_systemroot_is_missing(monkeypatch):
+    """Windows always sets %SystemRoot%; be defined anyway if it is absent.
+
+    An empty or missing value must still produce an ABSOLUTE path. Guessing
+    C:\\Windows wrongly degrades to the same best-effort no-op a missing
+    icacls already gives (the caller swallows it); falling back to the bare
+    name would degrade to running the planted binary.
+    """
+    monkeypatch.delenv("SystemRoot", raising=False)
+    assert config._icacls_path() == os.path.join(
+        r"C:\Windows", "System32", "icacls.exe"
+    )
+
+    monkeypatch.setenv("SystemRoot", "")
+    assert config._icacls_path() == os.path.join(
+        r"C:\Windows", "System32", "icacls.exe"
+    )
 
 
 # -------------------------------------------------------- failure is swallowed
