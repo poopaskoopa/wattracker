@@ -256,6 +256,23 @@ attached at the time. The ride socket now runs the pairing check itself. Any
 new websocket route that authenticates on the session must do the same; there
 is no arrangement of middleware that will do it for them.
 
+**And it runs that check every tick, not only at the handshake.** Checking once
+is enough for a request and not enough for a socket that stays open for an
+hour: a `/ride/ws` opened a second before Revoke was pressed simply kept
+streaming, and kept steering the trainer through whichever connector is
+attached now. The pre-merge review reproduced it and counted three frames
+delivered after a revoke that had already emptied the device list. Both ride
+loops — simulated and real hardware — now re-ask
+`_connector_session_still_paired` each iteration and close cleanly the moment
+the answer changes,
+stopping the ride (a started ride is still saved; an idle one still writes
+nothing) and sending a refusal frame rather than raising. The revoke handler
+was left alone on purpose: making revocation reach out to sockets by device
+would only cover the socket types someone remembered to register, whereas a
+check inside the loop cannot be forgotten by a future revoke path.
+`tests/test_connector_session.py` covers both loops with the socket opened
+*before* the revoke, which is the ordering the earlier test did not have.
+
 The query parameter is
 named `token` rather than `ticket` deliberately: uvicorn logs the full request
 target and `calendarfeed`'s redaction filter only scrubs parameter names

@@ -934,6 +934,49 @@ def _connector_session_still_paired(conn: HTTPConnection) -> bool:
         return False
 
 
+async def _end_revoked_ride(websocket, controller) -> None:
+    """Wind up a ride whose device was revoked while it was already running.
+
+    The handshake check is necessary but not sufficient: it runs once, and a
+    ride socket is long-lived, so a socket opened a second before Revoke was
+    pressed went on streaming - and, in server mode, went on driving whichever
+    connector is attached now, because _ble_session resolves by user_id alone.
+    That is the same harm the handshake check closes, reached by opening the
+    door first and revoking second. So the ride loops re-ask each tick and call
+    this the moment the answer changes.
+
+    Stopping the controller here rather than abandoning it is deliberate: the
+    seconds already ridden are the RIDER'S data, streamed while the device was
+    still trusted, and _finish() only writes an activity when the ride actually
+    started - so this saves a real partial ride and never fabricates an empty
+    one. What must not survive is the socket, not the workout.
+
+    The refusal is an ordinary frame followed by the caller's ordinary close,
+    never an exception: revocation is something the owner deliberately did from
+    the Settings page, and a traceback in the log for it would train whoever
+    reads that log to ignore it. Both sends are guarded because the peer may
+    have gone away first.
+    """
+    try:
+        if controller is not None:
+            controller.stop()
+    except Exception:
+        _log.debug("could not stop a revoked ride cleanly", exc_info=True)
+    try:
+        await websocket.send_json(
+            {
+                "status": "error",
+                "error": "not authenticated",
+                "message": (
+                    "This device was unpaired. The ride has been stopped."
+                ),
+            }
+        )
+    except Exception:
+        _log.debug("could not tell a revoked ride socket why it closed",
+                   exc_info=True)
+
+
 class AuthMiddleware(BaseHTTPMiddleware):
     """Redirect unauthenticated requests to /login (except exempt paths)."""
 
@@ -5299,7 +5342,21 @@ def create_app() -> FastAPI:
                 inactive_s = 0.0
                 offline_s = 0.0
                 resumed = False
+                revoked = False
                 while controller.status != "finished":
+                    # Re-asked every tick, not just at the handshake. See
+                    # _end_revoked_ride: without this a socket opened one
+                    # second before Revoke keeps riding, and keeps driving
+                    # whichever connector is attached now. ~1 Hz is the
+                    # cadence this loop already runs at, and the lookup is
+                    # skipped entirely for a password session.
+                    if not _connector_session_still_paired(websocket):
+                        _log.info(
+                            "a live ride socket was closed because its device "
+                            "was revoked"
+                        )
+                        revoked = True
+                        break
                     tick_started = _ride_loop_time()
                     if action_queue is not None:
                         while not action_queue.empty():
@@ -5465,7 +5522,13 @@ def create_app() -> FastAPI:
                     await _ride_sleep(
                         max(0.0, RIDE_POLL_INTERVAL_S - tick_elapsed)
                     )
-                await websocket.send_json(controller.state())
+                if revoked:
+                    # No closing state frame: a revoked socket gets the
+                    # refusal and nothing else. The finally block below
+                    # releases the radio and closes.
+                    await _end_revoked_ride(websocket, controller)
+                else:
+                    await websocket.send_json(controller.state())
             except BaseException as exc:
                 abnormal_cleanup = True
                 # Client closed the socket or BLE failed mid-ride: stop cleanly
@@ -5553,6 +5616,17 @@ def create_app() -> FastAPI:
                 controller.status not in ("cooldown", "finished")
                 and frames < max_frames
             ):
+                # The same per-tick revocation check the hardware loop makes,
+                # and it has to be here too: /ride/ws?sim=1 is reachable on the
+                # same session, streams from the same route, and is what the
+                # reviewer used to receive frames after a successful revoke.
+                if not _connector_session_still_paired(websocket):
+                    _log.info(
+                        "a live ride socket was closed because its device "
+                        "was revoked"
+                    )
+                    await _end_revoked_ride(websocket, controller)
+                    return
                 controller.tick(power=pedal, dt=step_dt)
                 await websocket.send_json(controller.state())
                 frames += 1

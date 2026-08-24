@@ -603,6 +603,184 @@ def test_a_revoked_device_cannot_keep_riding_over_the_websocket(client):
         ).headers["location"] == "/login"
 
 
+#: How many ride frames a drain will read before giving up. Comfortably more
+#: than either loop below produces, so hitting it means the socket never
+#: refused - which is the bug, not a slow machine.
+_DRAIN_LIMIT = 2000
+
+
+def _drain_until_refused(ws, *, what):
+    """Read ride frames until the socket refuses; fail loudly if it never does.
+
+    Written as a drain rather than "the very next frame" on purpose. Both ride
+    loops are producing into the TestClient's queue while the revoke POST is in
+    flight on another thread, so WHICH tick notices the revocation is a race -
+    but THAT one notices, before the ride runs to its natural end, is not. A
+    socket that streams to completion and then closes normally is exactly the
+    bug, and shows up here as WebSocketDisconnect with the message below.
+    """
+    from starlette.websockets import WebSocketDisconnect
+
+    frames = 0
+    for _ in range(_DRAIN_LIMIT):
+        try:
+            message = ws.receive_json()
+        except WebSocketDisconnect:
+            raise AssertionError(
+                f"the {what} ride socket ran to completion and closed after "
+                f"{frames} frames without ever noticing the revocation - a "
+                "revoked device kept riding"
+            )
+        frames += 1
+        if message.get("status") == "error":
+            return message, frames
+    raise AssertionError(
+        f"the {what} ride socket sent {frames} frames without refusing"
+    )
+
+
+def test_revoking_closes_a_sim_ride_socket_that_is_already_open(client):
+    """Revocation has to reach a socket that was ALREADY open, not just the next one.
+
+    The sibling test above closes the socket before revoking, so it only ever
+    proved the reconnect case: a NEW /ride/ws is refused at the handshake. The
+    handshake check runs exactly once, and a ride socket is long-lived, so a
+    socket opened one second before the owner pressed Revoke went on streaming
+    - and in server mode went on driving whichever connector is attached now,
+    since _ble_session resolves by user_id alone. The pre-merge review
+    reproduced it and counted three frames delivered after a revoke that had
+    already emptied the device list.
+
+    So: open, ride, revoke while it is still open, and require the socket to
+    refuse. The ride is long enough (90 simulated minutes) that a build without
+    the per-tick re-check has to stream to completion to escape this test, and
+    _drain_until_refused turns that into an explicit failure rather than a hang.
+    """
+    uid, token = _paired(client)
+    device_id = connectorauth.list_devices(uid)[0]["id"]
+
+    with _connector_window(client, token) as window:
+        with window.websocket_connect(
+            "/ride/ws?sim=1&type=endurance&minutes=90"
+        ) as ws:
+            assert ws.receive_json()["status"] == "workout"
+            # Riding for real before the revoke, so this cannot pass against a
+            # build that simply refuses everyone.
+            assert ws.receive_json()["status"] != "error"
+
+            revoke = client.post(f"/settings/connector/{device_id}/revoke")
+            assert revoke.status_code == 200
+            assert connectorauth.list_devices(uid) == [], (
+                "the revoke must have actually landed, or this proves nothing"
+            )
+
+            refusal, _frames = _drain_until_refused(ws, what="simulated")
+            assert refusal["error"] == "not authenticated"
+
+
+def test_revoking_closes_a_hardware_ride_socket_that_is_already_open(
+    client, monkeypatch
+):
+    """The same guarantee on the path that actually drives a trainer.
+
+    sim=1 and the hardware loop are two different loops in the same route, so
+    fixing one says nothing about the other - and the hardware loop is the one
+    with the real consequence, because the revoked laptop is steering an FTMS
+    trainer through whichever connector is attached.
+
+    The radio is faked (no adapter on a CI box) and the loop is paced fast;
+    inactivity is pushed out of reach so the only thing that can end this ride
+    is the revocation.
+    """
+    from wattracker import server as servermod
+    from wattracker.ble.devices import SimulatedPowerSource, SimulatedTrainer
+
+    uid, token = _paired(client)
+    device_id = connectorauth.list_devices(uid)[0]["id"]
+
+    async def fake_connect(timeout=6.0, selected=None):
+        return {
+            "trainer": SimulatedTrainer(),
+            "power_source": SimulatedPowerSource([180]),
+            "cadence_source": None,
+            "hr_source": None,
+            "clients": [],
+            "clients_by_address": {},
+            "bindings": {},
+            "names": {"power": "Trainer"},
+            "errors": [],
+        }
+
+    monkeypatch.setattr(
+        servermod.bledevices, "bluetooth_available", lambda: (True, "ok")
+    )
+    monkeypatch.setattr(servermod.bledevices, "connect_sensors", fake_connect)
+    monkeypatch.setattr(servermod, "RIDE_POLL_INTERVAL_S", 0.01)
+    # Nothing but the revocation may end this ride.
+    monkeypatch.setattr(servermod, "RIDE_INACTIVITY_TIMEOUT_S", 1e6)
+
+    with _connector_window(client, token) as window:
+        with window.websocket_connect(
+            "/ride/ws?type=endurance&minutes=90"
+        ) as ws:
+            assert ws.receive_json()["status"] == "workout"
+            assert ws.receive_json()["status"] == "connected"
+
+            revoke = client.post(f"/settings/connector/{device_id}/revoke")
+            assert revoke.status_code == 200
+            assert connectorauth.list_devices(uid) == []
+
+            refusal, _frames = _drain_until_refused(ws, what="hardware")
+            assert refusal["error"] == "not authenticated"
+
+
+def test_a_revoked_ride_closes_cleanly_and_quietly(client, caplog):
+    """Closing the socket must be a close, not an exception that lands in the log.
+
+    Revoking is something the owner deliberately did from their own Settings
+    page. A traceback for it teaches whoever reads these logs that tracebacks
+    here are noise, which is how the next real one gets skipped.
+    """
+    uid, token = _paired(client)
+    device_id = connectorauth.list_devices(uid)[0]["id"]
+
+    with caplog.at_level(logging.ERROR):
+        with _connector_window(client, token) as window:
+            with window.websocket_connect(
+                "/ride/ws?sim=1&type=endurance&minutes=90"
+            ) as ws:
+                assert ws.receive_json()["status"] == "workout"
+                client.post(f"/settings/connector/{device_id}/revoke")
+                _drain_until_refused(ws, what="simulated")
+
+    assert not [r for r in caplog.records if r.levelno >= logging.ERROR], [
+        r.getMessage() for r in caplog.records if r.levelno >= logging.ERROR
+    ]
+
+
+def test_a_password_session_still_rides_for_the_whole_ride(client):
+    """The per-tick re-check must not end an ordinary rider's ride.
+
+    A password session carries no device_id, so _connector_session_still_paired
+    short-circuits without a lookup - but the check now runs once per tick
+    rather than once per socket, so getting that wrong would cut every ride
+    short rather than costing one connection. Riding to "finished" is the
+    assertion.
+    """
+    _register(client)
+    client.post("/login", data={"username": "rider", "password": PASSWORD})
+
+    with client.websocket_connect("/ride/ws?sim=1&type=endurance&minutes=30") as ws:
+        last = None
+        for _ in range(_DRAIN_LIMIT):
+            message = ws.receive_json()
+            assert message.get("status") != "error", message
+            last = message
+            if message.get("status") == "finished":
+                break
+        assert last["status"] == "finished"
+
+
 def test_a_password_session_still_rides(client):
     """The other side of the check above: it must cost an ordinary rider nothing.
 
