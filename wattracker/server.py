@@ -314,6 +314,22 @@ ATTACH_EXPORT_MIN_INTERVAL_S = 300.0
 _auto_work_lock = threading.Lock()
 _auto_work_at: "dict[tuple, float]" = {}
 
+# A scan that was asked for and refused. The limit is there to bound how often
+# a scan RUNS; dropping the REQUEST is a different thing, and a costly one.
+# The connector mentions a finished file exactly once - the watcher records it
+# in _reported and never raises it again - and an event is fire-and-forget, so
+# a refusal reaches nobody who could retry it. Drop it and that ride waits for
+# the daily sweep, which is the failure this whole feature exists to remove.
+#
+# So a refusal records what is owed and one timer per user replays it when the
+# window is up. One timer rather than one per event, because "scan this user's
+# folder" is the same request however many times it arrives inside a window -
+# the scan finds whatever has landed by the time it runs.
+_auto_scan_owed: "dict[int, str]" = {}
+# And the strong reference that keeps a sleeping replay alive, asyncio holding
+# only a weak one - the same reason _attach_tasks below exists.
+_auto_scan_replays: "dict[int, asyncio.Task]" = {}
+
 
 def reset_auto_work_limits() -> None:
     """Forget when each user last had unrequested work done for them.
@@ -321,9 +337,22 @@ def reset_auto_work_limits() -> None:
     For the test suite, which reuses low user ids across tests inside one
     process: without this, one test triggering a connector scan would suppress
     the next test's, and the failure would look like the event never arrived.
+
+    Pending replays go with them. Cancelling is best-effort - by teardown the
+    loop they were scheduled on is usually already closed - and it does not
+    need to succeed: a replay that wakes to find nothing owed does nothing,
+    which is exactly the state clearing the dict leaves it in.
     """
     with _auto_work_lock:
         _auto_work_at.clear()
+        _auto_scan_owed.clear()
+        replays = list(_auto_scan_replays.values())
+        _auto_scan_replays.clear()
+    for task in replays:
+        try:
+            task.cancel()
+        except Exception:  # pragma: no cover - a closed loop is not a failure
+            pass
 
 
 def _claim_auto_slot(kind: str, user_id: int, interval_s: float) -> bool:
@@ -346,15 +375,75 @@ def _claim_auto_slot(kind: str, user_id: int, interval_s: float) -> bool:
     return True
 
 
+def _defer_auto_scan(user_id: int, reason: str) -> None:
+    """Remember a refused scan and arrange to run it once the window is up.
+
+    Only ever reached from the connector's event loop, since
+    _handle_connector_event is _start_auto_scan's only caller, so there is a
+    running loop to schedule on. If that ever stops being true the news is
+    still recorded, and the next event that does get through runs a scan that
+    finds it - degraded to the old behaviour rather than broken.
+    """
+    now = _time.monotonic()
+    with _auto_work_lock:
+        _auto_scan_owed[user_id] = reason
+        if user_id in _auto_scan_replays:
+            # One is already pending; it will pick this up when it wakes.
+            return
+        last = _auto_work_at.get(("scan", user_id))
+        delay = AUTO_SCAN_MIN_INTERVAL_S
+        if last is not None:
+            delay = max(0.0, AUTO_SCAN_MIN_INTERVAL_S - (now - last))
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            # Asked for outside the event loop. The news is recorded, so the
+            # next event that gets through still runs a scan that finds it.
+            _log.debug("no event loop to hold a scan for user %s", user_id)
+            return
+        _auto_scan_replays[user_id] = loop.create_task(
+            _replay_owed_scan(user_id, delay)
+        )
+    _log.debug("holding a scan for user %s for %.0fs (%s)", user_id, delay, reason)
+
+
+async def _replay_owed_scan(user_id: int, delay: float) -> None:
+    """Run the scan a limit refused, once its window has passed."""
+    try:
+        await asyncio.sleep(delay)
+    except asyncio.CancelledError:
+        return
+    # Both dropped before the retry, so that a refusal inside it can schedule
+    # a fresh replay - _defer_auto_scan bails out while one is registered.
+    with _auto_work_lock:
+        reason = _auto_scan_owed.pop(user_id, None)
+        _auto_scan_replays.pop(user_id, None)
+    if reason is None:
+        return
+    _start_auto_scan(user_id, reason)
+
+
 def _start_auto_scan(user_id: int, reason: str) -> bool:
-    """Start a scan the rider did not ask for. True if one actually started."""
+    """Start a scan the rider did not ask for. True if one actually started.
+
+    False is not a refusal to do the work, only a refusal to do it NOW: both
+    ways of saying no hand it to _defer_auto_scan instead.
+    """
     if not _claim_auto_slot("scan", user_id, AUTO_SCAN_MIN_INTERVAL_S):
+        _defer_auto_scan(user_id, reason)
         return False
     if _start_user_scan(user_id, directory=None) is None:
+        # The slot is spent either way, so without deferring this news would
+        # be lost exactly as a rate-limited one is - and a scan already
+        # running was started before this file landed, so it need not see it.
         _log.debug(
             "%s for user %s: a scan is already running", reason, user_id
         )
+        _defer_auto_scan(user_id, reason)
         return False
+    with _auto_work_lock:
+        # Whatever was owed, the scan starting now is what finds it.
+        _auto_scan_owed.pop(user_id, None)
     _log.info("scanning for user %s (%s)", user_id, reason)
     return True
 

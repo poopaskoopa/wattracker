@@ -100,6 +100,69 @@ def test_files_the_listing_would_not_offer_are_never_reported(activities):
     assert watch.poll() is False
 
 
+def test_a_symlink_pointing_out_of_the_folder_is_never_reported(
+    activities, tmp_path
+):
+    """The name is only half the listing's predicate, and half is not enough.
+
+    The listing also resolves the path and requires the target to sit directly
+    in the folder (handlers._in_scope), so a link to a .fit kept elsewhere is
+    skipped there - while a watcher testing the name alone reports it on every
+    settle. That is the cries-wolf case reached through the half that was not
+    shared. handlers.py documents a link-filled Activities folder as
+    supported-but-degraded, so it is reachable rather than theoretical.
+    """
+    outside = tmp_path / "elsewhere"
+    outside.mkdir()
+    target = _write(outside / "real.fit")
+    try:
+        os.symlink(target, activities / "linked.fit")
+    except (OSError, NotImplementedError):
+        pytest.skip("this platform will not create symlinks unprivileged")
+
+    watch = _watcher(activities)
+    watch.poll()  # cold pass; always reports
+
+    # Settle the target repeatedly. None of it is news, because none of it
+    # could ever be imported.
+    for size in (128, 256, 512):
+        _write(target, size=size)
+        watch.poll()                 # sees the change, not settled yet
+        assert watch.poll() is False, \
+            "a symlink out of the folder was reported as news"
+
+    # And the rule is not simply "never report": a real file still is.
+    _write(activities / "ride.fit")
+    watch.poll()
+    assert watch.poll() is True
+
+
+def test_the_watcher_asks_the_listing_whether_a_file_is_in_scope(
+    activities, monkeypatch
+):
+    """The containment half, asserted without needing symlink privileges.
+
+    Windows will not create a symlink unprivileged, so the test above skips on
+    the machine this feature actually runs on. This one states the same
+    property directly: whatever _in_scope refuses, the watcher does not report.
+    """
+    _write(activities / "ride.fit")
+    watch = _watcher(activities)
+    watch.poll()  # cold pass
+
+    asked = []
+
+    def refuse(directory, path):
+        asked.append(path)
+        return False
+
+    monkeypatch.setattr(watchmod, "_in_scope", refuse)
+    _write(activities / "ride2.fit")
+    assert watch.poll() is False
+    assert watch.poll() is False
+    assert asked, "the watcher never consulted the listing's scope test"
+
+
 def test_a_removed_file_is_not_news_but_is_forgotten(activities):
     """Nothing to import in a deletion - but the name must be reusable."""
     watch = _watcher(activities)
@@ -366,13 +429,71 @@ def test_a_second_event_straight_away_does_not_start_a_second_scan(
                   what="the first ride to be imported")
         _wait_idle(client)
 
-        # A second ride lands, but the limit has not elapsed: the event is
-        # dropped, and the file waits for the next one (or the daily sweep).
+        # A second ride lands, but the limit has not elapsed. The scan does
+        # not RUN now, which is all the limit promises. The news is not lost
+        # either - see the test below for that half.
         (zwift_home / "Activities" / "ride2.fit").write_bytes(b"dummy2")
         connector.send_event("activities.changed")
         time.sleep(0.3)
-        assert len(db.list_activities(uid)) == 1,             "a second scan ran inside the rate limit"
+        assert len(db.list_activities(uid)) == 1, \
+            "a second scan ran inside the rate limit"
         _wait_idle(client)
+
+
+def test_an_event_the_limit_refused_still_gets_its_scan(
+    client, zwift_home, monkeypatch
+):
+    """The limit bounds how often a scan RUNS, not whether the news survives.
+
+    The connector names a finished file exactly once - the watcher records it
+    in _reported and never raises it again - and an event is fire-and-forget,
+    so a refusal reaches nobody who could resend it. Drop the request and that
+    ride waits for the daily sweep, which is the failure this whole feature
+    exists to remove.
+
+    Nor is it a rare window. The connect-time flush is off the poll grid, so
+    any disconnect/reconnect lands an event seconds after the previous one,
+    and under the README's own --scan-interval 30 roughly every second genuine
+    event would arrive inside the limit.
+    """
+    monkeypatch.setattr(servermod, "AUTO_SCAN_MIN_INTERVAL_S", 0.5)
+    uid = _rider_with_a_ride(client, zwift_home, monkeypatch)
+
+    attached, _config = attach_connector(client, uid, zwift_home)
+    with attached as connector:
+        connector.send_event("activities.changed")
+        _wait_for(lambda: len(db.list_activities(uid)) == 1,
+                  what="the first ride to be imported")
+        _wait_idle(client)
+
+        (zwift_home / "Activities" / "ride2.fit").write_bytes(b"dummy2")
+        connector.send_event("activities.changed")
+
+        # No second event and no Rescan: the deferred replay is the only
+        # thing that can import this, which is what makes the test honest.
+        _wait_for(lambda: len(db.list_activities(uid)) == 2,
+                  what="the deferred scan to import the second ride")
+        _wait_idle(client)
+
+
+def test_news_arriving_during_a_running_scan_is_owed_not_lost(monkeypatch):
+    """The slot is spent before we discover a scan is already running.
+
+    Without deferring, this news is destroyed exactly as a rate-limited event
+    is - and the scan already running was started before this file landed, so
+    it is not the one that is going to find it.
+    """
+    servermod.reset_auto_work_limits()
+    monkeypatch.setattr(servermod, "_start_user_scan", lambda *a, **k: None)
+    try:
+        started = servermod._start_auto_scan(
+            4242, "the connector reported new files"
+        )
+        assert started is False
+        assert 4242 in servermod._auto_scan_owed, \
+            "news arriving during a running scan was dropped"
+    finally:
+        servermod.reset_auto_work_limits()
 
 
 def test_the_rescan_button_is_never_rate_limited(

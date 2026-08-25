@@ -37,7 +37,12 @@ import logging
 import os
 from typing import Dict, List, Optional, Tuple
 
-from .handlers import ConnectorConfig, activities_scope, is_activity_file
+from .handlers import (
+    ConnectorConfig,
+    _in_scope,
+    activities_scope,
+    is_activity_file,
+)
 
 log = logging.getLogger(__name__)
 
@@ -150,7 +155,17 @@ class ActivityWatcher:
                 # restated: a watcher that reported a file the listing will
                 # not offer would trigger a scan that imports nothing, every
                 # single pass, forever.
+                #
+                # Both halves of it. The name is the cheap one and only a
+                # prefilter - the listing also resolves the path and requires
+                # the target to sit directly in this folder, so a symlink
+                # pointing out of it is precisely the file that would be
+                # reported here and skipped there. handlers.py:210 documents a
+                # link-filled Activities folder as supported-but-degraded, so
+                # this is reachable rather than theoretical.
                 if not is_activity_file(entry.name):
+                    continue
+                if not _in_scope(directory, entry.path):
                     continue
                 try:
                     if not entry.is_file():
