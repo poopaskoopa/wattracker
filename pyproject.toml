@@ -50,6 +50,13 @@ package = ["pyinstaller==6.16.0"]
 # gets frozen into a Windows executable (see tests/test_connector_client.py,
 # which enforces exactly that).
 connector = ["websockets>=13.0", "bleak>=0.22"]
+# The tray's window onto the server's web UI. A ctypes binding over the
+# webview/webview C library, so it costs one ~220KB native and no Python
+# dependencies at all - which is why it is this and not pywebview, whose
+# Windows path reaches WebView2 through pythonnet and a .NET bridge. Optional
+# and imported lazily: a headless connector never loads it, and the test suite
+# does not need it installed (see wattracker_connector/webview.py).
+webview = ["webviewpy>=1.5"]
 
 [project.scripts]
 wattracker = "wattracker.__main__:main"

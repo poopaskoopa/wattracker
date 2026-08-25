@@ -42,6 +42,18 @@ the relocated-directory gap.
 The lockdown is best-effort and never crashes the app: if `icacls` is missing or
 fails (e.g. a filesystem that does not support ACLs), the failure is logged at
 debug and startup continues, mirroring the existing chmod-can-fail contract.
+
+`icacls.exe` is named by **absolute path**, built from `%SystemRoot%`
+(`config._icacls_path`). Passing a list to `subprocess.run` reaches
+`CreateProcessW` with `lpApplicationName=NULL`, and Windows then resolves a
+bare program name starting from the calling executable's own directory and the
+current working directory, **both ahead of System32**. The connector ships as a
+portable `.exe` a rider drops in Downloads, and `_restrict` is on the first code
+path its `__main__` reaches — so a bare `"icacls"` meant an `icacls.exe` planted
+beside that download ran as the rider on every launch, every config save and
+every log rotation, invisibly (`CREATE_NO_WINDOW` + `capture_output`). The
+absolute path removes the search entirely. `tests/test_windows_acl.py` asserts
+the property, not just the string: any relative spelling fails.
 This is defense against another local account reading an at-rest copy; it does
 not protect secrets from malware already running as the same Windows user.
 
@@ -53,11 +65,34 @@ failure removes only the staged slot, so even an unreadable legacy
 
 ## Network boundary
 
-The supported Windows configuration is loopback-only. The installer and
-launcher must not create a Windows Firewall exception. LAN/public binding
-requires a separate security design covering TLS, Secure cookies, CSRF and
-Origin validation, trusted hosts/proxies, login throttling, and registration
-policy.
+**The default and recommended Windows configuration is loopback-only**, and the
+installer and launcher must not create a Windows Firewall exception. Nothing
+here opens a port to the network on its own: binding beyond loopback takes
+`WATTRACKER_ALLOW_NON_LOOPBACK` *and* a non-loopback `WATTRACKER_HOST`, two
+variables kept separate so it cannot happen by fat-fingering a host.
+
+A LAN bind is nevertheless a supported, documented configuration — the README's
+[Reaching the server from other devices](../README.md#reaching-the-server-from-other-devices)
+walks it, because it is how a connector on another box and a phone acting as a
+ride screen both work. This section used to say a LAN bind "requires a separate
+security design", listing TLS, Secure cookies, CSRF and Origin validation,
+trusted hosts/proxies, login throttling, and registration policy. That list is
+now either built or explicitly the operator's decision, and it is worth being
+precise about which is which, because the README and this file previously
+disagreed:
+
+| Prerequisite | Where it stands |
+| --- | --- |
+| CSRF / Origin validation | Built. `same_site="lax"` on the session cookie, plus an explicit same-origin check on state-changing posts and on the WebSocket handshake. |
+| Trusted hosts | Built. Host allowlist; extra names only via the strictly validated `WATTRACKER_PUBLIC_HOST(S)` — no wildcards, no suffix matching. |
+| Login throttling | Built. Per-username throttle on `/login`, plus a process-wide cap on concurrent password hashes shared with `/register`. |
+| **Registration policy** | **Built** (this was the gap). The first account is always allowed, since an install has to bootstrap; after that `/register` refuses unless `WATTRACKER_ALLOW_REGISTRATION` is set. See `config.allow_registration` and `tests/test_registration_policy.py`. |
+| TLS + Secure cookies | **Operator's decision, not a default.** On a plain-http LAN bind the session cookie and the connector's bearer token travel in clear text; anyone on that network can read them and act as the rider. Terminate TLS in front and set `WATTRACKER_COOKIE_SECURE=1`. |
+
+So the honest statement of the boundary is the README's: a LAN bind is for **a
+trusted home network and nowhere else**, never shared, guest, or public wifi,
+and never an internet-facing name. What changed is that "registration policy"
+is no longer an unbuilt prerequisite standing between the two documents.
 
 ## Server/connector trust boundary
 
@@ -147,6 +182,191 @@ because urllib replays `Authorization` across hosts and a redirecting server
 would otherwise harvest the token. Pass `--token` once with `--save` and omit
 it afterwards: an argument is visible to every process on the machine, while
 the saved config file is written 0600.
+
+## The connector as a portable executable
+
+The connector also ships as one windowed `WattrackerConnector.exe`
+(`packaging/wattracker-connector.spec`), which changes three things about its
+security posture and nothing else.
+
+**A window that opens already logged in.** Double-clicking the tray icon shows
+the server's own web UI. The connector holds a device token, not a cookie, so
+it exchanges the token for a single-use ticket over the same
+bearer-authenticated HTTP path it already uses for buffered ride uploads
+(`POST /api/connector/session`), and the window spends that ticket once
+(`GET /connector/session?token=...`). The ticket is held only as a sha256 in
+memory, expires in 60 seconds, is redeemable once, and is dropped when the
+device is revoked.
+
+State this plainly: **a device token now escalates to a full web session.**
+That session can read the rider's whole history, change settings, revoke
+connector devices and take backups. It cannot change the account password,
+which has no route.
+
+Be precise about why that is accepted, because the obvious justification is
+wrong. The token grants read/write to the rider's Zwift folders **on its own
+machine**; the session's reach is wider. `wattracker/backend/remote.py` resolves
+the connector by `user_id` alone, and nothing about escalating requires an
+attached socket — so a token off a laptop that has been in a drawer for a year
+escalates to a session that drives whichever connector is attached *now*. The
+pre-merge review of PR #93 executed exactly that: a never-connected device
+enumerated a `.fit` file on a different machine's filesystem. The same session
+can also clear or overwrite the stored Zwift credentials.
+
+What makes the widening defensible is not that it grants nothing new — it does
+— but that it grants nothing **durable**, and that the alternative (a password
+prompt in a window a tray icon opened) teaches exactly the habit phishing
+depends on. A connector-derived session is stamped `via=connector` in the
+signed session cookie at redemption, and three routes refuse it: pairing
+another device (`POST /settings/connector`), rotating the calendar link
+(`POST /settings/calendar-feed`), and changing the app-global — not per-user —
+LLM settings (the `llm_endpoint`, `llm_custom_url`, `llm_model`, `api_key` and
+legacy `anthropic_api_key` fields of `POST /settings`). Each would otherwise
+leave behind a credential that revoking the device does not reach.
+
+The third one covers the whole LLM group, not just the key, because the
+provider endpoint became settable in the UI (PR #126) and that is the same
+threat one size larger: a connector session that repoints `llm_endpoint` at a
+base URL it controls is handed the shared API key on the first refinement call
+and every rider's prompt payload after that, from a server that otherwise looks
+like it is working — and revoking the device does not undo it, exactly as with
+a swapped key. The model travels with them because the same write decides
+whether the layer runs at all. Refusal means asking to *change* the group: the
+LLM fields sit in the same form as the folder settings, so the tray window
+echoes the provider and model the page just rendered on every ordinary save,
+and treating that echo as an attempt would 403 the folder save the window
+exists for while preventing nothing. A connector session writes none of these
+settings either way.
+
+Revoking is deliberately still allowed: it is the way out, and the rider who
+has lost a laptop may well be looking at the tray window of the machine still
+in front of them. Signing in with the password inside that window lifts
+the restriction, because a device token can neither obtain nor change a
+password.
+
+**The LLM-settings refusal used to be walkable via `/register`.** A successful
+registration drops the `via=connector` marker, because proving a password is
+what the marker exists to wait for — but the password proved at `/register` is a
+*new account's*, chosen by whoever is registering, not the rider's. So a
+connector session could register a throwaway account and, as that account,
+write the LLM settings: they are app-global rather than per-user, so they are
+the settings a different `uid` can still reach — and since #126 that includes
+the endpoint, so the throwaway account captured the rider's existing key and
+prompts without ever seeing either. Device pairing and calendar-feed rotation
+were never reachable this way — both are per-user, and the new account is a
+different user.
+
+**That is closed, and it was closed at the source rather than at the marker.**
+The old note here said "anyone who can reach the port can already register
+without a device token at all, so this is a pre-existing property of open
+registration" and ended "if open registration is ever closed, close this with
+it." Open registration is now closed: once an account exists, `/register`
+refuses unless `WATTRACKER_ALLOW_REGISTRATION` is set (see **Network
+boundary**), so there is no anonymous way to manufacture the password the
+promotion waits for. `tests/test_registration_policy.py` walks the full chain —
+token, ticket, session, `POST /register` — and asserts the LLM endpoint and
+stored key are still the rider's afterwards.
+
+The residue, stated so nobody enables the flag uninformed: **with
+`WATTRACKER_ALLOW_REGISTRATION` set, this path is open again.** That is inherent
+in allowing anonymous sign-up at all, and is the reason the capability is a flag
+rather than the route simply being reopened. Turn it on to add a rider, then
+restart without it. The same test file pins that behaviour too, so it is a known
+property rather than a later surprise.
+
+Revocation reaches the session as well as the token, over **both** protocols.
+A session cookie is a signed blob with no server-side record, so
+`settings_connector_revoke` has nothing to delete; instead the cookie carries
+the `device_id` it came from and `AuthMiddleware` ends any connector session
+whose device is gone. Without that, revoking would kill the token and leave the
+window it opened working for the fortnight the cookie is valid.
+
+`AuthMiddleware` alone is not enough, and the reason generalises. It is a
+`BaseHTTPMiddleware`, and Starlette hands any scope that is not `http` straight
+to the application — so **no websocket route is dispatched through it**. For one
+commit that left `/ride/ws` authenticating on `user_id` alone: revoking cut the
+browser half and left the thief riding, driving whichever connector was
+attached at the time. The ride socket now runs the pairing check itself. Any
+new websocket route that authenticates on the session must do the same; there
+is no arrangement of middleware that will do it for them.
+
+**And it runs that check every tick, not only at the handshake.** Checking once
+is enough for a request and not enough for a socket that stays open for an
+hour: a `/ride/ws` opened a second before Revoke was pressed simply kept
+streaming, and kept steering the trainer through whichever connector is
+attached now. The pre-merge review reproduced it and counted three frames
+delivered after a revoke that had already emptied the device list. Both ride
+loops — simulated and real hardware — now re-ask
+`_connector_session_still_paired` each iteration and close cleanly the moment
+the answer changes,
+stopping the ride (a started ride is still saved; an idle one still writes
+nothing) and sending a refusal frame rather than raising. The revoke handler
+was left alone on purpose: making revocation reach out to sockets by device
+would only cover the socket types someone remembered to register, whereas a
+check inside the loop cannot be forgotten by a future revoke path.
+`tests/test_connector_session.py` covers both loops with the socket opened
+*before* the revoke, which is the ordering the earlier test did not have.
+
+The query parameter is
+named `token` rather than `ticket` deliberately: uvicorn logs the full request
+target and `calendarfeed`'s redaction filter only scrubs parameter names
+beginning `token`, so any other name would write live credentials to the
+access log in plaintext. Both ends have tests pinning that name.
+
+**Autostart is HKCU, opt-in, and nothing else.** The tray's "Start with
+Windows" toggle writes one value under
+`HKEY_CURRENT_USER\Software\Microsoft\Windows\CurrentVersion\Run` and deletes
+it when untoggled. Never HKLM, never a Windows service, never Task Scheduler —
+all three would ask for elevation, which is the promise this document makes
+everywhere else. The application installer stays clear of startup entries
+entirely (`tests/test_windows_installer.py` asserts `wattracker.iss` never
+mentions one), so autostart lives in the connector at runtime and the installer
+is untouched.
+
+One qualification to "writes only when toggled": every launch of the packaged
+executable checks whether an entry that already exists still names the file
+now running, and repoints it if not (`autostart.refresh`). It never creates
+one, never touches the key for a rider who has not opted in, and a connector
+running from a Python environment leaves the value alone entirely. Without it,
+moving the exe out of Downloads silently disables autostart — a failure with
+nothing to see anywhere.
+
+Only one connector runs per logon session, held by a `Local\`-scoped named
+mutex; a second launch tells the running icon and exits. `Local\` rather than
+`Global\` on purpose: two riders signed in to one machine are two riders with
+two trainers, and a machine-wide mutex would let either of them deny the other
+a connector. This is distinct from the server's one-connector-per-*account*
+rule, which is enforced at the other end and surfaces in the tray as a stopped
+icon explaining that another connector took the account over.
+
+The window's WebView2 profile is pointed at the connector's own config
+directory (`WEBVIEW2_USER_DATA_FOLDER`), which is already created owner-only.
+The default would be a folder beside the executable — which for a single
+portable file means browser profile data appearing wherever the rider dropped
+it, including a USB stick.
+
+Autostart is also what makes the trust-boundary work above load-bearing rather
+than theoretical: an unattended connector holds a token across reboots until
+somebody revokes it, so revocation closing the live socket — not merely the
+next connection — is the control that matters.
+
+**Unsigned, self-extracting, and autostarting is the worst profile for
+heuristics.** A onefile build re-extracts to `%TEMP%\_MEIxxxx` on every launch.
+That, plus an autostart entry, plus a held credential, is the shape antivirus
+software dislikes most, and there is no certificate yet
+(`packaging/sign-windows.ps1` is wired into the release job, which remains
+hard-disabled). Until then every connector binary in existence is unsigned, and
+comes from one of two places.
+
+A **local Windows build** should be treated as one: check the `.sha256`
+published beside it. A **CI artifact**, uploaded by `windows.yml` on a merge to
+`main`, has no checksum beside it and deliberately so — it would be generated
+by the same run that built the binary and travel in the same archive, which
+proves nothing a tampered run could not also forge. What stands in for it is
+the run itself: the artifact names the workflow run that produced it, that run
+names the commit, and the log shows the freeze and every smoke check. That
+is provenance rather than integrity, and it is not a substitute for signing.
+Neither source should be handed to anyone outside the people testing this.
 
 ## Installer lifecycle and compiler provenance
 

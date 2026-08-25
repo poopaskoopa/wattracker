@@ -10,7 +10,7 @@ import pytest
 pytest.importorskip("httpx")
 from fastapi.testclient import TestClient  # noqa: E402
 
-from wattracker import config  # noqa: E402
+from wattracker import config, connectorauth, db  # noqa: E402
 from wattracker.server import create_app  # noqa: E402
 
 
@@ -99,6 +99,53 @@ def test_a_configured_host_is_accepted_and_others_are_not(monkeypatch):
         assert ok.status_code == 200
         bad = client.get("/login", headers={"Host": "evil.example"})
         assert bad.status_code == 400
+
+
+def test_a_connector_cannot_dial_a_name_the_server_does_not_answer_to(monkeypatch):
+    """The trap behind "I paired it and it still will not connect".
+
+    A connector dials ``ws://<server>:8000/connector/ws``, and that handshake
+    carries the address it dialled as its ``Host``. The Host allowlist covers
+    websocket scopes as well as http ones, so an unlisted address is refused
+    *before* the bearer token is looked at - a perfectly valid token, refused
+    for a reason that has nothing to do with the token. Pairing stores only a
+    label, so nothing about this can be fixed from the pairing page.
+    """
+    monkeypatch.delenv("WATTRACKER_PUBLIC_HOSTS", raising=False)
+    monkeypatch.delenv("WATTRACKER_PUBLIC_HOST", raising=False)
+    with TestClient(create_app()) as client:
+        client.post(
+            "/register", data={"username": "rider", "password": "password123"}
+        )
+        uid = db.get_user_by_username("rider")["id"]
+        _device_id, token = connectorauth.generate_token(uid, "Zwift PC")
+
+        with pytest.raises(Exception) as excinfo:
+            with client.websocket_connect(
+                "/connector/ws",
+                headers={"Authorization": f"Bearer {token}",
+                         "Host": "192.168.1.10:8000"},
+            ) as ws:
+                ws.receive_json()
+        assert "WebSocketDenial" in type(excinfo.value).__name__
+
+
+def test_naming_the_server_is_what_lets_that_same_token_in(monkeypatch):
+    """Same token, same Host, one entry added: the connector attaches."""
+    monkeypatch.setenv("WATTRACKER_PUBLIC_HOSTS", "192.168.1.10")
+    with TestClient(create_app()) as client:
+        client.post(
+            "/register", data={"username": "rider", "password": "password123"}
+        )
+        uid = db.get_user_by_username("rider")["id"]
+        _device_id, token = connectorauth.generate_token(uid, "Zwift PC")
+
+        with client.websocket_connect(
+            "/connector/ws",
+            headers={"Authorization": f"Bearer {token}",
+                     "Host": "192.168.1.10:8000"},
+        ) as ws:
+            assert ws.receive_json()["event"] == "hello"
 
 
 def test_the_ride_socket_accepts_its_own_page_over_a_lan_name(monkeypatch):

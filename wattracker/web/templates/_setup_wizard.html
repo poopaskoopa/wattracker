@@ -40,7 +40,7 @@
                     {% else %}<span class="muted">not found</span>{% endif %}
                     <button type="button" class="button-link setup-use-path" data-path="{{ candidate.path }}">Use this path</button>
                 </li>
-                {% else %}<li class="muted">No standard candidate was found on this computer.</li>{% endfor %}
+                {% else %}<li class="muted">{% if setup_connector_offline %}Your connector is not attached, so this list is empty. Start the wattracker connector on the machine where Zwift is installed, then reload this page.{% else %}No standard candidate was found on this computer.{% endif %}</li>{% endfor %}
             </ul>
             <label for="setup-directory">Known or typed Activities folder path
                 <input id="setup-directory" name="activities_dir" type="text" autocomplete="off"

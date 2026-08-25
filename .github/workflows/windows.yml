@@ -137,14 +137,20 @@ jobs:
       # Note this does NOT lower I/O priority, which is a separate axis on
       # Windows and cannot be set on another process from outside it. A build
       # still competes for the disk. Add the same line to any new step that does
-      # heavy work; the three that do today each carry it.
+      # heavy work; the four that do today each carry it.
       - name: Create workspace virtual environment
         shell: pwsh
         run: |
           (Get-Process -Id $PID).PriorityClass = 'BelowNormal'
           python -m venv .venv
           .venv\Scripts\python -m pip install --disable-pip-version-check --upgrade pip
-          .venv\Scripts\python -m pip install --disable-pip-version-check build -e ".[dev,ble,package]"
+          # connector and webview are the frozen connector's own halves: the
+          # websockets client it dials the server with, and the ctypes WebView
+          # binding its tray window uses. The connector spec collects both
+          # best-effort, so leaving them out here does not fail the build - it
+          # produces a connector that is quietly missing the radio or the
+          # window, which is exactly what the smoke below exists to catch.
+          .venv\Scripts\python -m pip install --disable-pip-version-check build -e ".[dev,ble,package,connector,webview]"
       - name: Install pinned Inno Setup compiler
         shell: pwsh
         run: |
@@ -211,13 +217,58 @@ jobs:
           $setup = "dist\wattracker-$version-windows-x64-unsigned-setup.exe"
           if (-not (Test-Path -LiteralPath $setup)) { throw "Setup compiler produced no artifact" }
           powershell -File packaging\smoke_installer.ps1 -Installer $setup
+      # The connector is the other half of a split install: the piece that runs
+      # on the machine where Zwift is, frozen onefile and windowed rather than
+      # onedir. It is built here because this is the only job in the repository
+      # that can freeze a Windows binary at all - windows-release.yml also
+      # builds it, but that workflow fires on a `v*` tag and stays hard-disabled
+      # until a signing certificate exists. Until then, this step is the whole
+      # of the connector's build coverage.
+      #
+      # PyInstaller saturates every core, so this carries the same priority drop
+      # as the three steps above it that do real work.
+      #
+      # The smoke is not dressing. The connector serves no UI to request, so
+      # nothing else proves the binary does anything at all: it must refuse to
+      # run unpaired and say why, connect and answer a request against a stub
+      # server, and still import bleak and webviewpy inside the frozen process.
+      # The last of those is what catches a spec whose best-effort collection
+      # quietly stopped collecting.
+      #
+      # Safe on a runner that persists and shares a box with the trainer: every
+      # check points WATTRACKER_CONNECTOR_DIR at its own temporary directory, so
+      # it cannot read or write a real connector configuration, and the stub
+      # server binds a free loopback port rather than a fixed one. Nothing here
+      # touches Bluetooth, the registry, or the autostart key.
+      - name: Build frozen connector and smoke
+        shell: pwsh
+        run: |
+          (Get-Process -Id $PID).PriorityClass = 'BelowNormal'
+          .venv\Scripts\python -m PyInstaller --clean --noconfirm packaging\wattracker-connector.spec
+          if (-not (Test-Path -LiteralPath "dist\WattrackerConnector.exe")) {
+            throw "Frozen connector was not produced"
+          }
+          .venv\Scripts\python packaging\smoke_frozen_connector.py dist\WattrackerConnector.exe
       # The portable zip is deliberately not built or uploaded. It was the
       # largest single file at 61.8 MB and it duplicated the installer's
       # payload: the same onedir tree, wrapped differently rather than built
       # differently. The portable form still ships where it is actually
       # consumed - windows-release.yml builds and signs its own zip on a `v*`
       # tag - so what is lost is a per-commit portable copy that nothing
-      # downstream reads. A run's payload is ~45 MB without it.
+      # downstream reads. A run's payload is ~45 MB without it, plus the
+      # connector.
+      #
+      # The connector is the one addition that is not a duplicate: it is a
+      # separate onefile binary for a separate machine, and no other artifact
+      # contains it. It is also, while windows-release.yml stays hard-disabled,
+      # the only way anyone gets a built connector without a Windows checkout
+      # and a toolchain - which is what a rider testing a ride needs.
+      #
+      # It weighs 12.3 MB, measured off a real freeze of this tree on
+      # 2026-08-22 rather than estimated: the excludes in
+      # packaging/_connector_excludes.py keep numpy, pandas, scipy and fastapi
+      # out, which is most of why a binary carrying bleak, websockets and a
+      # WebView binding is a quarter of the installer's size.
       # Build on every PR commit, upload only on a merge to main.
       #
       # The account's shared storage is 500 MB and this step is the only thing
@@ -225,13 +276,19 @@ jobs:
       # workflows fire only on `v*` tags). Uploading on every push does not fit:
       # at ~93 triggers a week, 45 MB a run needs several gigabytes. Merges to
       # main run ~8.75 times a week, so ~394 MB at 7-day retention - which fits,
-      # but leaves too little for a busy week. Five days holds it near 280 MB.
+      # but leaves too little for a busy week. Five days holds ~6.25 runs, so
+      # ~280 MB for the app's payload and ~77 MB for the connector beside it:
+      # ~358 MB against a 500 MB ceiling. That fits, and the headroom is real
+      # but not large. If it tightens, the retention window is the dial to turn
+      # first - it costs only how far back a downloadable copy reaches, and
+      # nothing downstream reaches back at all.
       #
       # Nothing is lost by not uploading on PR commits. The job still proves the
-      # ISCC compile, the frozen smoke and the full install/upgrade/tampered-
-      # uninstall/uninstall on every one of them; the artifact is a
-      # downloadable convenience, and nothing downstream reads it -
-      # windows-release.yml builds its own signed artifacts on a tag.
+      # ISCC compile, the frozen smoke, the full install/upgrade/tampered-
+      # uninstall/uninstall, and the connector's own freeze and smoke on every
+      # one of them; the artifact is a downloadable convenience, and nothing
+      # downstream reads it - windows-release.yml builds its own signed
+      # artifacts on a tag.
       #
       # The ref test is redundant while push is filtered to main above, and is
       # kept deliberately: it is what stops a later re-broadening of the trigger
@@ -250,14 +307,16 @@ jobs:
       # the filesystem this job just wrote. A missing installer still fails the
       # job, loudly and on the line that names it; a full quota no longer can.
       - if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
-        name: Assert the build produced an installer and a wheel
+        name: Assert the build produced a wheel, an installer and a connector
         shell: pwsh
         run: |
           $whl = @(Get-ChildItem dist\*.whl -ErrorAction SilentlyContinue)
           $exe = @(Get-ChildItem dist\*-unsigned-setup.exe -ErrorAction SilentlyContinue)
-          Write-Host "wheel(s): $($whl.Count), installer(s): $($exe.Count)"
+          $connector = @(Get-ChildItem dist\WattrackerConnector.exe -ErrorAction SilentlyContinue)
+          Write-Host "wheel(s): $($whl.Count), installer(s): $($exe.Count), connector(s): $($connector.Count)"
           if ($whl.Count -eq 0) { throw "no wheel in dist\ - the build did not produce one" }
           if ($exe.Count -eq 0) { throw "no *-unsigned-setup.exe in dist\ - ISCC did not produce an installer" }
+          if ($connector.Count -eq 0) { throw "no WattrackerConnector.exe in dist\ - the connector freeze did not produce one" }
 
       # continue-on-error, not `|| true`: a quota failure stays visible as a
       # yellow step you can click into, rather than being swallowed. The job and
@@ -273,5 +332,6 @@ jobs:
           path: |
             dist/*.whl
             dist/*-unsigned-setup.exe
+            dist/WattrackerConnector.exe
           if-no-files-found: warn
           retention-days: 5

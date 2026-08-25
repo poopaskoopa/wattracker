@@ -57,7 +57,11 @@ class RemoteBackend(Backend):
     def activity_candidates(self) -> List[dict]:
         rows = self._call("paths.activity_candidates") or []
         return [
-            {"path": str(r.get("path", "")), "exists": bool(r.get("exists"))}
+            {
+                "path": str(r.get("path", "")),
+                "exists": bool(r.get("exists")),
+                "fit_count": int(r.get("fit_count") or 0),
+            }
             for r in rows
             if isinstance(r, dict)
         ]

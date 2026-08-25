@@ -33,6 +33,7 @@ from fastapi.templating import Jinja2Templates
 from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.middleware.sessions import SessionMiddleware
 from starlette.middleware.trustedhost import TrustedHostMiddleware
+from starlette.requests import HTTPConnection
 
 from . import (
     auth,
@@ -41,6 +42,7 @@ from . import (
     config,
     connectorauth,
     connectorhub,
+    connectorsession,
     credstore,
     db,
     exporter,
@@ -538,8 +540,13 @@ class NoCacheStaticFiles(StaticFiles):
 # connector upload carries a bearer token and belongs to a process with no
 # browser, so a redirect to /login would be the wrong answer to a bad
 # credential - it checks its own and returns 401.
+# "/api/connector/session" and "/connector/session" are the two halves of the
+# tray window's login: the first is bearer-authenticated like the ride upload
+# above it, and the second authenticates itself from a single-use ticket and
+# then *creates* the session, so requiring one first would be circular.
 _EXEMPT = (
     "/login", "/register", calendarfeed.FEED_PATH, "/api/connector/ride",
+    "/api/connector/session", "/connector/session",
 )
 _EXEMPT_PREFIXES = ("/static", "/favicon", "/apple-touch-icon")
 
@@ -661,6 +668,13 @@ MAX_ONBOARDING_UPLOAD_BYTES = 50 * 1024 * 1024
 MAX_ONBOARDING_UPLOAD_FILES = 200
 ONBOARDING_WEIGHT_MIN_KG = 20.0
 ONBOARDING_WEIGHT_MAX_KG = 300.0
+# Said when the connector goes away mid-wizard. Matches the wording
+# RemoteBackend.validate_dir uses for the same condition, so a rider who
+# retries does not get two different accounts of one problem.
+_CONNECTOR_OFFLINE_CHECK = (
+    "Cannot check that folder: the connector is offline. Start the wattracker "
+    "connector on the machine where Zwift is installed, then try again."
+)
 # The onboarding wizard's FTP field no longer has bounds of its own: every
 # surface a rider types an FTP into shares one policy (wattracker.ftp_input,
 # issue #64), so the wizard's old 1-1000 W window is gone rather than being one
@@ -835,6 +849,141 @@ class IPv6TrustedHostMiddleware(TrustedHostMiddleware):
         )
 
 
+# How a session came to exist. Only connector_session_redeem sets it, so a
+# session carrying it is one a device token opened rather than one somebody
+# typed a password into - and the two are not entitled to the same things.
+#
+# The marker is not forgeable: SessionMiddleware base64s the session and signs
+# it with config.session_secret() (256 bits) through itsdangerous, so the
+# payload is readable by its holder but any edit invalidates the signature and
+# an unsigned cookie is not a session at all. Readable is fine; there is
+# nothing secret about the word "connector".
+SESSION_VIA = "via"
+VIA_CONNECTOR = "connector"
+# The device whose token opened the session, so revoking that device can end
+# the session too (see _connector_session_still_paired).
+SESSION_DEVICE_ID = "device_id"
+
+
+def _from_connector(conn: HTTPConnection) -> bool:
+    """Whether this session was opened by a device token rather than a password.
+
+    Typed on HTTPConnection, not Request: a WebSocket is one too, and the ride
+    socket has to ask this question for itself because no middleware can ask it
+    on the socket's behalf (see _connector_session_still_paired).
+    """
+    return conn.session.get(SESSION_VIA) == VIA_CONNECTOR
+
+
+def _promote_to_password_session(request: Request) -> None:
+    """Drop any connector provenance, because a password has just been proven.
+
+    Called from /login and /register. The reasoning is airtight for /login: a
+    rider who signs in inside the tray's own window is a rider who knows the
+    password, and a device token can neither obtain nor change one (every
+    writer of password_hash goes through db.set_password_hash, whose only route
+    callers are these two). Without this the restriction would be permanent for
+    that window, which is a UI that quietly stops working rather than a
+    security control.
+
+    It is NOT airtight for /register, and the difference is worth stating
+    rather than leaving for the next reader to find. The password proven there
+    is a brand-new account's, chosen by whoever is registering - so a connector
+    session can register a throwaway user and shed the marker without ever
+    knowing the rider's password. What that buys is bounded: pairing and the
+    calendar feed are per-user, and the new account is a different uid. The
+    app-global LLM settings are the exception - the key, and since the provider
+    became settable the endpoint that decides who receives it - and they are
+    the reason this is documented in docs/windows-security.md instead of being
+    waved through.
+
+    That shed is now bounded at its source rather than here. /register no
+    longer creates an account once one exists unless
+    WATTRACKER_ALLOW_REGISTRATION says so (config.allow_registration), so a
+    connector session can only reach this line at all on a server that has
+    deliberately opened registration or has no accounts yet. Clearing the
+    marker here is still the right thing to do when it IS reached - the
+    password just proven is real - and this function is deliberately not the
+    place that judges whether the account should have existed.
+    """
+    request.session.pop(SESSION_VIA, None)
+    request.session.pop(SESSION_DEVICE_ID, None)
+
+
+def _connector_session_still_paired(conn: HTTPConnection) -> bool:
+    """False only for a connector session whose device has been revoked.
+
+    A password session is never charged the lookup, so this costs nothing on
+    the ordinary path.
+
+    Every caller has to invoke this itself, and there is no way to arrange
+    otherwise. AuthMiddleware is a BaseHTTPMiddleware, whose __call__ hands any
+    scope that is not "http" straight to the app - so a websocket route is
+    never dispatched through it and cannot inherit this check. That is why the
+    parameter is an HTTPConnection: the ride socket calls it directly. A new
+    websocket route that authenticates on the session and forgets to is a
+    revocation bypass, which is exactly the hole this function was written to
+    close and exactly the hole it had for one commit.
+    """
+    if not _from_connector(conn):
+        return True
+    try:
+        return connectorauth.device_exists(
+            conn.session.get("user_id"), conn.session.get(SESSION_DEVICE_ID)
+        )
+    except Exception:
+        # An authorization check that cannot answer has to say no. The cost of
+        # being wrong here is one re-login; the cost of the other default is a
+        # revoked device keeping its session through a transient database error.
+        _log.warning(
+            "could not confirm the connector device behind a session", exc_info=True
+        )
+        return False
+
+
+async def _end_revoked_ride(websocket, controller) -> None:
+    """Wind up a ride whose device was revoked while it was already running.
+
+    The handshake check is necessary but not sufficient: it runs once, and a
+    ride socket is long-lived, so a socket opened a second before Revoke was
+    pressed went on streaming - and, in server mode, went on driving whichever
+    connector is attached now, because _ble_session resolves by user_id alone.
+    That is the same harm the handshake check closes, reached by opening the
+    door first and revoking second. So the ride loops re-ask each tick and call
+    this the moment the answer changes.
+
+    Stopping the controller here rather than abandoning it is deliberate: the
+    seconds already ridden are the RIDER'S data, streamed while the device was
+    still trusted, and _finish() only writes an activity when the ride actually
+    started - so this saves a real partial ride and never fabricates an empty
+    one. What must not survive is the socket, not the workout.
+
+    The refusal is an ordinary frame followed by the caller's ordinary close,
+    never an exception: revocation is something the owner deliberately did from
+    the Settings page, and a traceback in the log for it would train whoever
+    reads that log to ignore it. Both sends are guarded because the peer may
+    have gone away first.
+    """
+    try:
+        if controller is not None:
+            controller.stop()
+    except Exception:
+        _log.debug("could not stop a revoked ride cleanly", exc_info=True)
+    try:
+        await websocket.send_json(
+            {
+                "status": "error",
+                "error": "not authenticated",
+                "message": (
+                    "This device was unpaired. The ride has been stopped."
+                ),
+            }
+        )
+    except Exception:
+        _log.debug("could not tell a revoked ride socket why it closed",
+                   exc_info=True)
+
+
 class AuthMiddleware(BaseHTTPMiddleware):
     """Redirect unauthenticated requests to /login (except exempt paths)."""
 
@@ -842,6 +991,18 @@ class AuthMiddleware(BaseHTTPMiddleware):
         path = request.url.path
         exempt = path in _EXEMPT or any(path.startswith(p) for p in _EXEMPT_PREFIXES)
         if not exempt and not request.session.get("user_id"):
+            return RedirectResponse("/login", status_code=303)
+        if not exempt and not _connector_session_still_paired(request):
+            # The device that opened this window is gone. Clearing the session
+            # here is the only way revocation can reach it: the cookie is a
+            # signed blob with no server-side record, so settings_connector_
+            # revoke has nothing to delete. Without this, the Settings page
+            # tells the owner the token no longer works while the thief's
+            # window keeps reading their history - and keeps driving whichever
+            # connector is attached NOW, because RemoteBackend resolves by
+            # user_id alone, not by the device that asked.
+            _log.info("a connector session ended because its device was revoked")
+            request.session.clear()
             return RedirectResponse("/login", status_code=303)
         return await call_next(request)
 
@@ -1080,6 +1241,12 @@ def create_app() -> FastAPI:
     # can open a socket to this port, and the per-username throttle bounds
     # neither of them in memory terms.
     app.state.hash_limiter = auth.PasswordHashLimiter()
+    # Serializes the "is this the bootstrap account?" test with the INSERT that
+    # answers it. Sync route handlers run in a threadpool, so without this two
+    # simultaneous POSTs to an empty database could both read "no users yet"
+    # and both be admitted as the first account. A plain Lock is the right
+    # size for the same reason the scan-progress dict is: one process.
+    app.state.registration_lock = threading.Lock()
     # Refused /login attempts: a single unkeyed count, not a throttle.
     app.state.login_failures = LoginAttemptCounter()
     # Rejected /calendar.ics tokens: a single unkeyed count, not a throttle.
@@ -1094,6 +1261,10 @@ def create_app() -> FastAPI:
     # one apparent address, and refusing would only lock out the connector
     # that is trying to reconnect. Visibility, not enforcement.
     app.state.connector_failures = CalendarFeedFailureCounter()
+    # Single-use tickets a connector exchanges its device token for, so the
+    # tray's window opens already logged in. In memory on purpose: one is worth
+    # a session and lives for a minute (see connectorsession).
+    app.state.connector_tickets = connectorsession.TicketStore()
     # uvicorn logs the full request target; keep feed tokens out of the log.
     calendarfeed.install_access_log_redaction()
 
@@ -1156,12 +1327,67 @@ def create_app() -> FastAPI:
     app.state.allowed_hosts = allowed_hosts
 
     # -------------------------------------------------------------- auth
+    def _registration_open() -> bool:
+        """Whether /register may create an account right now.
+
+        Two ways to be open, and only two. An empty database is open because
+        every install bootstraps through this route and there is nothing to
+        protect yet. After that it takes WATTRACKER_ALLOW_REGISTRATION, for
+        the reasons written out in config.allow_registration - in short, an
+        account on this app can repoint the APP-GLOBAL LLM endpoint at a host
+        it controls (harvesting the rider's stored key and every prompt) and
+        can launder a connector session past the /settings refusal.
+
+        The env var is checked FIRST so the ordinary multi-account case costs
+        no query at all, and so a rider who has opted in is never refused
+        because the database is momentarily unhappy.
+
+        A database that cannot answer refuses. This is an authorization
+        decision, and the same reasoning as _connector_session_still_paired
+        applies: the cost of being wrong this way is that a rider who wanted a
+        second account retries; the cost of the other default is that a broken
+        query silently reopens registration on a populated server.
+        """
+        if config.allow_registration():
+            return True
+        try:
+            return not db.user_ids()
+        except Exception:
+            _log.warning(
+                "could not determine whether any account exists; "
+                "refusing registration", exc_info=True
+            )
+            return False
+
+    def _registration_closed_response(request: Request):
+        """The refusal: a real page that says how to turn registration on.
+
+        Deliberately about POLICY, not about inventory. It never says how many
+        accounts exist or names one - an unauthenticated caller learns only
+        that this server does not accept new accounts, which is the minimum the
+        refusal has to imply in order to be a refusal at all.
+
+        A rendered page rather than a bare status: the rider who hits this is
+        usually the owner adding a second account on their own machine, and
+        telling them the variable to set is the difference between a working
+        feature and a bug report.
+        """
+        return templates.TemplateResponse(
+            request,
+            "register.html",
+            {"request": request, "error": None, "registration_closed": True},
+            status_code=403,
+        )
+
     @app.get("/register", response_class=HTMLResponse)
     def register_form(request: Request):
         if _uid(request):
             return RedirectResponse("/", status_code=303)
+        if not _registration_open():
+            return _registration_closed_response(request)
         return templates.TemplateResponse(
-            request, "register.html", {"request": request, "error": None}
+            request, "register.html",
+            {"request": request, "error": None, "registration_closed": False},
         )
 
     def _hash_capacity_response(request: Request, template: str):
@@ -1190,6 +1416,11 @@ def create_app() -> FastAPI:
         # cheapest attack is simply to point the flood at this route instead.
         if not _trusted_origin_or_absent(request, app.state.allowed_hosts):
             return PlainTextResponse("Origin not allowed", status_code=403)
+        # Refused BEFORE the ~128 MiB scrypt, not after: a closed server must
+        # not be a free way to burn the hash limiter, and refusing costs one
+        # environment read plus (only when the var is unset) one indexed query.
+        if not _registration_open():
+            return _registration_closed_response(request)
         username = (username or "").strip()
         err = auth.validate_credentials(username, password)
         if not err:
@@ -1198,13 +1429,24 @@ def create_app() -> FastAPI:
                     password_hash = auth.hash_password(password)
             except auth.HashCapacityExceeded:
                 return _hash_capacity_response(request, "register.html")
-            user_id = db.create_user(username, password_hash)
+            # Re-asked under the lock, and this is the test that actually
+            # decides. The check above sheds cheaply; hashing took a quarter of
+            # a second during which another request may have become the first
+            # account, and "the database was empty when we started" is not a
+            # policy. Held across the INSERT only - never across the hash.
+            with app.state.registration_lock:
+                if not _registration_open():
+                    return _registration_closed_response(request)
+                user_id = db.create_user(username, password_hash)
             if user_id is None:
                 err = "That username is already taken."
         if err:
             return templates.TemplateResponse(
-                request, "register.html", {"request": request, "error": err}
+                request, "register.html",
+                {"request": request, "error": err,
+                 "registration_closed": False},
             )
+        _promote_to_password_session(request)
         request.session["user_id"] = user_id
         request.session["username"] = username
         return RedirectResponse("/", status_code=303)
@@ -1278,6 +1520,7 @@ def create_app() -> FastAPI:
                 _log.info("password rehash skipped: hashing at capacity")
             except Exception:
                 _log.warning("password rehash on login failed", exc_info=True)
+        _promote_to_password_session(request)
         request.session["user_id"] = user["id"]
         request.session["username"] = user["username"]
         return RedirectResponse("/", status_code=303)
@@ -1344,10 +1587,11 @@ def create_app() -> FastAPI:
                        "adjusted": 0, "upcoming": {}}
         banner = adaptmod.banner_for(state, summary)
         complete = db.onboarding_complete(uid)
-        # Candidate discovery scans the filesystem and the FTP estimate
-        # decompresses the whole activity history; both only feed the setup
-        # wizard, which a completed rider never renders. Skipping them keeps
-        # the normal dashboard off a cost that grows with ride count.
+        # Candidate discovery walks a filesystem - the connector's, in a
+        # split install - and the FTP estimate decompresses the whole activity
+        # history; both only feed the setup wizard, which a completed rider
+        # never renders. Skipping them keeps the normal dashboard off a cost
+        # that grows with ride count, and off a round trip to another machine.
         setup_ctx: dict = {}
         if not complete:
             setup_settings = db.get_user_settings(uid)
@@ -1356,7 +1600,8 @@ def create_app() -> FastAPI:
                 uid, settings=setup_settings, estimate=round(setup_estimate, 1)
             )
             setup_ctx = dict(
-                setup_candidates=paths.annotated_candidates(),
+                setup_candidates=discover(uid, "activity_candidates"),
+                setup_connector_offline=is_offline(uid),
                 setup_settings=setup_settings,
                 setup_estimate=round(setup_estimate, 1),
                 setup_fallback_ftp=round(DEFAULT_FTP),
@@ -1394,7 +1639,8 @@ def create_app() -> FastAPI:
         )
         return _ctx(
             request,
-            setup_candidates=paths.annotated_candidates(),
+            setup_candidates=discover(uid, "activity_candidates"),
+            setup_connector_offline=is_offline(uid),
             setup_settings=settings,
             setup_estimate=round(estimate, 1) if estimate > 0 else None,
             setup_fallback_ftp=round(DEFAULT_FTP),
@@ -1432,19 +1678,29 @@ def create_app() -> FastAPI:
         if _setup_closed(request):
             return _setup_closed_json()
         uid = _uid(request)
-        clean, error = paths.confine_storage_dir(activities_dir, must_exist=True)
+        # Through the backend, not `paths`: in a split install this folder is
+        # on the rider's machine, and the wizard is the FIRST thing a new
+        # account sees. Checked here, every real Zwift path failed as "not
+        # found or not a directory" - the container has no Zwift install and
+        # never will - which made onboarding unfinishable in server mode.
+        clean, error = _validate_dir(activities_dir, uid, scope="activities")
         if error:
             return JSONResponse({"error": error, "exists": False, "fit_count": 0}, status_code=400)
         if not clean:
             return JSONResponse({"error": "Choose or enter an Activities folder.",
                                  "exists": False, "fit_count": 0}, status_code=400)
         try:
-            fit_count = sum(
-                1 for entry in os.scandir(clean)
-                if entry.is_file() and entry.name.lower().endswith(".fit")
+            listing = get_backend(uid).list_activities(clean)
+        except BackendUnavailable:
+            # The connector answered validate_dir and dropped before this one.
+            return JSONResponse(
+                {"error": _CONNECTOR_OFFLINE_CHECK, "exists": False, "fit_count": 0},
+                status_code=400,
             )
-        except OSError:
-            fit_count = 0
+        # The offered files, so the count is what a scan will actually import:
+        # the in-progress recording buffer is filtered by the machine that owns
+        # the folder and must not be advertised here as a ride to be found.
+        fit_count = len(listing.files)
         db.save_user_settings(uid, {"activities_dir": clean})
         started = _start_user_scan(uid, directory=clean)
         if started is None:
@@ -1453,7 +1709,7 @@ def create_app() -> FastAPI:
             status = started
         return JSONResponse({
             "path": clean,
-            "exists": True,
+            "exists": bool(listing.exists),
             "fit_count": fit_count,
             "status": "files-found" if fit_count else "no-files",
             "scan": status,
@@ -1641,8 +1897,8 @@ def create_app() -> FastAPI:
             )
         clean_dir = None
         if activities_dir.strip():
-            clean_dir, dir_error = paths.confine_storage_dir(
-                activities_dir, must_exist=True
+            clean_dir, dir_error = _validate_dir(
+                activities_dir, uid, scope="activities"
             )
             if dir_error:
                 return templates.TemplateResponse(
@@ -2136,6 +2392,86 @@ def create_app() -> FastAPI:
         return JSONResponse(
             {"activity_id": activity_id, "duplicate": activity_id is None}
         )
+
+    @app.post("/api/connector/session")
+    async def connector_session_mint(request: Request):
+        """Trade a device token for a single-use ticket that opens a session.
+
+        The tray app shows this server's own web UI in a window. That UI is
+        session-cookie authenticated and the connector holds no cookie, so
+        something has to bridge the two - and it must not be "type your
+        password into a window a tray icon opened", which is a habit worth not
+        teaching.
+
+        Bearer-authenticated exactly like /api/connector/ride above, and for
+        the same reason: this is the connector talking. Deliberately HTTP
+        rather than a call over the open WebSocket, because the connector never
+        sends requests on that socket (see connector_ws) - the server owns
+        every decision, and this route keeps it that way.
+
+        Only the ticket is returned, never a URL. The server has no reliable
+        idea which address reaches it from the connector's machine
+        (_feed_base_url exists because that question is genuinely hard); the
+        connector knows, because it dialled in on it.
+        """
+        header = request.headers.get("authorization") or ""
+        scheme, _, token = header.partition(" ")
+        device = None
+        if scheme.lower() == "bearer" and token:
+            device = connectorauth.device_for_token(token.strip())
+        if device is None:
+            app.state.connector_failures.record_failure()
+            return JSONResponse({"error": "unauthorized"}, status_code=401)
+
+        ticket = app.state.connector_tickets.mint(
+            device["user_id"], device["username"], device["device_id"]
+        )
+        _log.info(
+            "connector '%s' took a session ticket", device["label"]
+        )
+        response = JSONResponse(
+            {"ticket": ticket, "expires_in": connectorsession.TICKET_TTL_S}
+        )
+        # The body is a live credential for the next minute.
+        response.headers["Cache-Control"] = "private, no-store"
+        return response
+
+    @app.get("/connector/session")
+    def connector_session_redeem(request: Request, token: str = ""):
+        """Spend a ticket and become logged in.
+
+        The parameter is named ``token`` on purpose, and renaming it would be a
+        security regression: uvicorn's access logger writes the whole request
+        target, and calendarfeed's redaction filter scrubs query parameters
+        whose name starts with "token". Called anything else, every ticket this
+        route ever receives would be written to the access log in plaintext.
+
+        A bad ticket redirects to /login rather than explaining itself. There
+        is nothing useful to tell a caller who did not have one, and the
+        rider's own failure case - a ticket that sat too long - is fixed by
+        double-clicking again.
+
+        The session is stamped with where it came from, and that stamp is what
+        keeps this route from being an escalation with no way back. A device
+        token is accepted as already compromised - that is the whole premise of
+        the Revoke button - so the session it opens must not be able to mint a
+        credential that outlives the device. See _from_connector and the
+        settings routes that consult it.
+        """
+        claim = app.state.connector_tickets.redeem(token)
+        if claim is None:
+            app.state.connector_failures.record_failure()
+            return RedirectResponse("/login", status_code=303)
+        request.session["user_id"] = claim["user_id"]
+        request.session["username"] = claim["username"]
+        request.session[SESSION_VIA] = VIA_CONNECTOR
+        request.session[SESSION_DEVICE_ID] = claim["device_id"]
+        _log.info(
+            "a connector window opened a session for user %s", claim["user_id"]
+        )
+        response = RedirectResponse("/", status_code=303)
+        response.headers["Cache-Control"] = "private, no-store"
+        return response
 
     @app.post("/api/activity/{activity_id}/rpe")
     def api_activity_rpe(
@@ -3560,10 +3896,11 @@ def create_app() -> FastAPI:
                       ftp_message: Optional[str] = None,
                       ftp_confirm_required: bool = False,
                       ftp_form_value: Optional[str] = None,
-                       connector_message: Optional[str] = None,
-                       connector_new_token: Optional[str] = None,
-                       connector_new_label: Optional[str] = None,
-                       llm_message: Optional[str] = None) -> dict:
+                      connector_message: Optional[str] = None,
+                      connector_new_token: Optional[str] = None,
+                      connector_new_label: Optional[str] = None,
+                      refusal_message: Optional[str] = None,
+                      llm_message: Optional[str] = None) -> dict:
         settings = db.get_user_settings(uid)
         # LLM refinement (app-level). The page shows the EFFECTIVE endpoint
         # (an env var wins silently) and the STORED model: blank falls back to
@@ -3628,6 +3965,10 @@ def create_app() -> FastAPI:
             connector_message=connector_message,
             connector_new_token=connector_new_token,
             connector_new_label=connector_new_label,
+            # Rendered as an alert at the top of the page, separately from the
+            # per-section messages: this one is about the session, not about
+            # the field the rider filled in.
+            refusal_message=refusal_message,
             zwift_creds_saved=credstore.credentials_saved(uid),
             zwift_cred_backend=credstore.storage_backend(),
             cred_message=cred_message,
@@ -3635,6 +3976,50 @@ def create_app() -> FastAPI:
             backup_message=backup_message,
             dir_message=dir_message,
             restore_cmd=_restore_command(),
+        )
+
+    # What a connector-opened session is refused, and why it is exactly this
+    # list. A device token is the credential this design accepts as already
+    # compromised - docs/windows-security.md points at the Revoke button as the
+    # answer to a stolen laptop - so the session it opens must not be able to
+    # leave a NEW credential behind that revoking the device does not reach.
+    # Three routes could:
+    #
+    #   POST /settings/connector       a second device token, of the attacker's
+    #                                  own, surviving revocation of the first
+    #   POST /settings/calendar-feed   the whole training calendar re-pointed at
+    #                                  a URL only the attacker holds
+    #   POST /settings (LLM fields)    the app-global - not per-user - LLM
+    #                                  settings: swapping the KEY sends every
+    #                                  coaching request, prompts included, to
+    #                                  an account someone else owns, and
+    #                                  repointing the ENDPOINT at a base URL
+    #                                  the attacker runs hands them that key
+    #                                  and those prompts without their ever
+    #                                  having to know either
+    #
+    # Revoking is deliberately NOT on the list: it is the way out, and the rider
+    # who has lost a laptop may well be looking at the tray window of the
+    # machine still in front of them. Nor is the rest of POST /settings -
+    # pointing the app at the right folders is what the window is for.
+    _CONNECTOR_REFUSAL = (
+        "This window was opened by a connector device, so it cannot issue or "
+        "replace credentials, or change the app-wide LLM settings. Sign in "
+        "with your password first."
+    )
+
+    def _refuse_connector_session(request: Request, uid: int) -> Response:
+        """The refusal, rendered as the page the rider was already looking at.
+
+        403 rather than a redirect or a bare error: the caller asked for
+        something this session is not allowed to do, and the page says what to
+        do instead. A 500 would be the wrong answer to a request that is
+        perfectly well formed.
+        """
+        return templates.TemplateResponse(
+            request, "settings.html",
+            _settings_ctx(request, uid, False, refusal_message=_CONNECTOR_REFUSAL),
+            status_code=403,
         )
 
     def _validate_dir(
@@ -3793,19 +4178,73 @@ def create_app() -> FastAPI:
             model_val = ""
         # api_key wins over the legacy alias if both are posted.
         key_val = (api_key or "").strip() or (anthropic_api_key or "").strip()
-        if endpoint_to_save or url_to_save or model_val or key_val:
+        # The model field is always part of the form, but blank clears the
+        # stored value (falling back to the provider default) only when this
+        # save actually carried an endpoint selection and the field was
+        # genuinely blank - a REJECTED model must be reported and left
+        # unsaved, not treated as a clear that wipes the previously working
+        # model.
+        clear_model = endpoint_ok and not model_val and not model_rejected
+        # Shared is also what makes this whole group - endpoint, custom URL,
+        # model and key alike - the part of this route a connector-opened
+        # session may not touch. A session that swapped the KEY would point
+        # every coaching request this server makes, prompt contents and all,
+        # at an account somebody else owns, and revoking the device would not
+        # undo it. A settable ENDPOINT is the same threat, larger: a base URL
+        # the attacker controls is handed the shared key on the first
+        # refinement call and every rider's prompt payload after that, by a
+        # server that otherwise looks like it is working, and revoking the
+        # device does not undo that either. The model comes with them because
+        # it is written by the same call and decides whether the layer runs at
+        # all. The rest of this route stays open on purpose; pointing the app
+        # at the right folders is exactly what the tray window exists for.
+        # See _CONNECTOR_REFUSAL.
+        #
+        # Refused means asked to CHANGE the group, not merely to post it: the
+        # LLM fields share one form with the folders, so a connector window
+        # sends back the provider and model this page just rendered on every
+        # save. Reading that echo as an attempt would 403 the folder save the
+        # window exists for while preventing nothing. A connector session
+        # writes none of this group either way - the write below is skipped
+        # whether or not anything differed - so the only question here is
+        # whether the rider gets told, and a save that asked for something
+        # other than what it was shown has to be told.
+        refusal = False
+        if _from_connector(request):
+            # Answered below with the same 403 the other two refusals use, and
+            # deliberately not by falling through to the ordinary "Settings
+            # saved." render: a page that says both that it saved and that it
+            # refused describes neither outcome, and 200 tells a script the
+            # write went through. The other fields on this form are still
+            # written first - only the app-global LLM group is off limits. The
+            # per-field LLM complaints go with it: this request was refused,
+            # not evaluated, and one answer beats two.
+            stored = config.load_config()
+            stored_endpoint = (stored.llm_endpoint or "").strip() or "anthropic"
+            stored_model = (stored.llm_model or "").strip()
+            # What set_llm_settings would put in llm_endpoint (None = leave
+            # it alone), compared against what the page rendered - which is
+            # the effective endpoint, so an unset one reads as "anthropic".
+            endpoint_to_write = url_to_save or endpoint_to_save
+            refusal = (
+                # A rejected value is still an attempt to change the group.
+                bool(llm_msgs)
+                # Blank = keep, so any key at all was typed into this window.
+                or bool(key_val)
+                or (endpoint_to_write is not None
+                    and endpoint_to_write != stored_endpoint)
+                or (bool(model_val) and model_val != stored_model)
+                or (clear_model and bool(stored_model))
+            )
+            if refusal:
+                llm_msgs = []
+        elif endpoint_to_save or url_to_save or model_val or key_val:
             config.set_llm_settings(
                 endpoint=endpoint_to_save,
                 custom_url=url_to_save,
                 model=model_val or None,
                 api_key=key_val or None,
-                # The model field is always part of the form, but blank
-                # clears the stored value (falling back to the provider
-                # default) only when this save actually carried an endpoint
-                # selection and the field was genuinely blank - a REJECTED
-                # model must be reported and left unsaved, not treated as a
-                # clear that wipes the previously working model.
-                clear_model=endpoint_ok and not model_val and not model_rejected,
+                clear_model=clear_model,
             )
         # Zwift account credentials: only saved when both fields are supplied;
         # the password is never redisplayed. Saving re-arms authenticated
@@ -3829,12 +4268,14 @@ def create_app() -> FastAPI:
                             "password are needed.")
         return templates.TemplateResponse(
             request, "settings.html",
-            _settings_ctx(request, uid, True, cred_message=cred_message,
+            _settings_ctx(request, uid, not refusal, cred_message=cred_message,
                           dir_message="; ".join(dir_msgs) or None,
                           ftp_message=ftp_message,
                           ftp_confirm_required=ftp_confirm_required,
                           ftp_form_value=ftp if ftp_message else None,
+                          refusal_message=_CONNECTOR_REFUSAL if refusal else None,
                           llm_message="; ".join(llm_msgs) or None),
+            status_code=403 if refusal else 200,
         )
 
     @app.post("/settings/zwift-credentials/clear", response_class=HTMLResponse)
@@ -3859,6 +4300,11 @@ def create_app() -> FastAPI:
         if not _same_origin_or_absent(request):
             return PlainTextResponse("Origin not allowed", status_code=403)
         uid = _uid(request)
+        if _from_connector(request):
+            # Rotating from here would hand the attacker the only copy of the
+            # new link and leave the rider's calendar app silently stale - a
+            # compromise that looks like a sync bug. See _CONNECTOR_REFUSAL.
+            return _refuse_connector_session(request, uid)
         rotated = calendarfeed.token_is_set(uid)
         token = calendarfeed.generate_token(uid)
         if token is None:
@@ -3899,6 +4345,13 @@ def create_app() -> FastAPI:
         if not _same_origin_or_absent(request):
             return PlainTextResponse("Origin not allowed", status_code=403)
         uid = _uid(request)
+        if _from_connector(request):
+            # The blocker the pre-merge review of this branch found. Pairing
+            # from inside a connector-opened window mints a token that survives
+            # revoking the device that opened the window, so the owner does the
+            # one thing the docs tell them to do about a stolen laptop and the
+            # thief keeps a permanent credential - under a label they chose.
+            return _refuse_connector_session(request, uid)
         clean = connectorauth.clean_label(label)
         minted = connectorauth.generate_token(uid, clean)
         if minted is None:
@@ -3939,6 +4392,10 @@ def create_app() -> FastAPI:
             # over its existing socket until the server restarts, while the
             # page tells the owner the token no longer works.
             connectorhub.close_device(uid, device_id)
+            # And this settles a ticket already in flight. Small window - a
+            # minute at most - but "revoked" must not still be able to open a
+            # logged-in window.
+            app.state.connector_tickets.revoke_device(device_id)
         return templates.TemplateResponse(
             request, "settings.html",
             _settings_ctx(
@@ -4654,6 +5111,20 @@ def create_app() -> FastAPI:
             await websocket.send_json({"status": "error", "error": "not authenticated"})
             await websocket.close()
             return
+        # Revocation has to be enforced here, not upstream. AuthMiddleware
+        # terminates a revoked connector session on every HTTP request, but it
+        # is a BaseHTTPMiddleware and never runs for a websocket scope, so
+        # without this line a revoked laptop keeps a working ride socket after
+        # the browser half has been cut off - and drives whichever connector is
+        # attached now, because _ble_session resolves by user_id alone. The
+        # session cannot be cleared from here the way the middleware clears it
+        # (there is no response to carry a new cookie), so the socket simply
+        # refuses; the next HTTP request is what empties the cookie.
+        if not _connector_session_still_paired(websocket):
+            _log.info("a ride socket was refused because its device was revoked")
+            await websocket.send_json({"status": "error", "error": "not authenticated"})
+            await websocket.close()
+            return
 
         params = websocket.query_params
         sim = params.get("sim")
@@ -4954,7 +5425,21 @@ def create_app() -> FastAPI:
                 inactive_s = 0.0
                 offline_s = 0.0
                 resumed = False
+                revoked = False
                 while controller.status != "finished":
+                    # Re-asked every tick, not just at the handshake. See
+                    # _end_revoked_ride: without this a socket opened one
+                    # second before Revoke keeps riding, and keeps driving
+                    # whichever connector is attached now. ~1 Hz is the
+                    # cadence this loop already runs at, and the lookup is
+                    # skipped entirely for a password session.
+                    if not _connector_session_still_paired(websocket):
+                        _log.info(
+                            "a live ride socket was closed because its device "
+                            "was revoked"
+                        )
+                        revoked = True
+                        break
                     tick_started = _ride_loop_time()
                     if action_queue is not None:
                         while not action_queue.empty():
@@ -5120,7 +5605,13 @@ def create_app() -> FastAPI:
                     await _ride_sleep(
                         max(0.0, RIDE_POLL_INTERVAL_S - tick_elapsed)
                     )
-                await websocket.send_json(controller.state())
+                if revoked:
+                    # No closing state frame: a revoked socket gets the
+                    # refusal and nothing else. The finally block below
+                    # releases the radio and closes.
+                    await _end_revoked_ride(websocket, controller)
+                else:
+                    await websocket.send_json(controller.state())
             except BaseException as exc:
                 abnormal_cleanup = True
                 # Client closed the socket or BLE failed mid-ride: stop cleanly
@@ -5208,6 +5699,17 @@ def create_app() -> FastAPI:
                 controller.status not in ("cooldown", "finished")
                 and frames < max_frames
             ):
+                # The same per-tick revocation check the hardware loop makes,
+                # and it has to be here too: /ride/ws?sim=1 is reachable on the
+                # same session, streams from the same route, and is what the
+                # reviewer used to receive frames after a successful revoke.
+                if not _connector_session_still_paired(websocket):
+                    _log.info(
+                        "a live ride socket was closed because its device "
+                        "was revoked"
+                    )
+                    await _end_revoked_ride(websocket, controller)
+                    return
                 controller.tick(power=pedal, dt=step_dt)
                 await websocket.send_json(controller.state())
                 frames += 1

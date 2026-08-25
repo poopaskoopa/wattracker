@@ -15,8 +15,12 @@ from fastapi.testclient import TestClient
 
 from conftest import redirect_home
 
+from conftest_connector import attach_connector
+
 import wattracker
-from wattracker import auth, db, paths
+from wattracker import auth, connectorhub, db, paths
+from wattracker import backend as backend_mod
+from wattracker.backend import remote as remote_backend
 import wattracker.credstore as credstore
 import wattracker.ingest.importer as importer
 import wattracker.server as server_mod
@@ -927,3 +931,126 @@ def test_register_and_root_dashboard_remain_compatible(client):
     assert response.status_code == 200
     assert "Dashboard" in response.text
     assert client.get("/").status_code == 200
+
+
+# --------------------------------------------------------------- server mode
+# The wizard is the first surface a new account sees, and in a split install
+# every folder question in it is about the RIDER's machine. Asked on the
+# server - a Linux container with no Zwift install - the candidate list came
+# back empty and every typed path failed as "not found or not a directory",
+# which made onboarding unfinishable. These hold the questions on the machine
+# that can answer them.
+
+
+@pytest.fixture()
+def _hub_reset():
+    connectorhub.reset()
+    yield
+    connectorhub.reset()
+
+
+def _rpc_trace(monkeypatch):
+    """Record every method the server asks the connector for."""
+    calls = []
+    original = remote_backend.RemoteBackend._call
+
+    def recording(self, method, params=None, **kwargs):
+        calls.append(method)
+        return original(self, method, params, **kwargs)
+
+    monkeypatch.setattr(remote_backend.RemoteBackend, "_call", recording)
+    return calls
+
+
+def test_wizard_asks_the_connector_for_its_folders(
+    client, home_dir, monkeypatch, _hub_reset
+):
+    monkeypatch.setenv("WATTRACKER_MODE", "server")
+    # Under the sandboxed HOME: the connector confines a submitted folder to
+    # its own trusted roots, and it is right to - a tmp_path sibling is a
+    # folder it would refuse in production too.
+    zwift_home = home_dir / "zwift"
+    (zwift_home / "Activities").mkdir(parents=True)
+    (zwift_home / "Workouts").mkdir(parents=True)
+    uid = _register(client)
+    assert db.onboarding_complete(uid) is False
+
+    calls = _rpc_trace(monkeypatch)
+    attached, config = attach_connector(client, uid, zwift_home)
+    with attached:
+        wizard = client.get("/setup")
+        assert wizard.status_code == 200
+        assert "paths.activity_candidates" in calls, (
+            "the wizard listed candidates without asking the connector, so it "
+            "was reading the server's own filesystem"
+        )
+        calls.clear()
+
+        # A folder that only the connector's machine can see.
+        checked = client.post(
+            "/setup/check-directory",
+            data={"activities_dir": config.activities_dir},
+        )
+        assert checked.status_code == 202, checked.json()
+        assert "paths.validate_dir" in calls
+        assert db.get_user_settings(uid)["activities_dir"] == config.activities_dir
+        _wait_scan(client)
+
+        # And the same folder survives the form that finishes onboarding.
+        completed = client.post("/setup/complete", data={
+            "weight_kg": "72", "ftp_choice": "manual", "manual_ftp": "275",
+            "zwiftpower": "no", "activities_dir": config.activities_dir,
+        })
+        assert completed.status_code == 200
+        assert db.onboarding_complete(uid) is True
+        assert db.get_user_settings(uid)["activities_dir"] == config.activities_dir
+
+
+def test_wizard_candidates_keep_the_fit_count_over_the_wire(
+    client, monkeypatch, _hub_reset
+):
+    """The count is what makes one candidate obviously the right one.
+
+    Answered at the transport, not by a real connector: in-process the two
+    sides share one ``paths`` module, so a candidate list built from it would
+    look identical whether or not the RPC layer preserved the field. Here the
+    count can only reach the page by surviving RemoteBackend's parsing.
+    """
+    monkeypatch.setenv("WATTRACKER_MODE", "server")
+    uid = _register(client)
+
+    def canned(self, method, params=None, **kwargs):
+        assert method == "paths.activity_candidates", method
+        return [{"path": r"C:\Zwift\Activities", "exists": True, "fit_count": 7}]
+
+    monkeypatch.setattr(remote_backend.RemoteBackend, "_call", canned)
+    monkeypatch.setattr(backend_mod, "is_offline", lambda user_id=None: False)
+    page = client.get("/setup")
+
+    assert page.status_code == 200
+    assert r"C:\Zwift\Activities" in page.text
+    assert "7 FIT files" in page.text
+    assert db.onboarding_complete(uid) is False
+
+
+def test_wizard_names_an_offline_connector_instead_of_showing_nothing(
+    client, monkeypatch, _hub_reset
+):
+    monkeypatch.setenv("WATTRACKER_MODE", "server")
+    uid = _register(client)
+    assert db.onboarding_complete(uid) is False
+
+    page = client.get("/setup")
+    assert page.status_code == 200
+    assert "connector is not attached" in page.text
+    assert "No standard candidate was found" not in page.text
+
+    # Not a 500: an offline connector is a validation answer, and the rider is
+    # one page away from the pairing screen that fixes it.
+    checked = client.post(
+        "/setup/check-directory",
+        data={"activities_dir": r"C:\Zwift\Activities"},
+    )
+    assert checked.status_code == 400
+    assert "connector is offline" in checked.json()["error"]
+    assert db.get_user_settings(uid).get("activities_dir") in (None, "")

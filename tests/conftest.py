@@ -47,12 +47,33 @@ def isolated_env(tmp_path, monkeypatch):
         monkeypatch.setenv("PLAYWRIGHT_BROWSERS_PATH", _PLAYWRIGHT_CACHE)
     monkeypatch.setenv("WATTRACKER_DATA_DIR", str(data_dir))
     monkeypatch.setenv("WATTRACKER_DB", str(tmp_path / "test.db"))
+    # The connector keeps its own directory, and redirecting HOME does not
+    # move it on Windows: wattracker_connector.config.config_dir reads
+    # LOCALAPPDATA there, which nothing above touches. So a test that starts a
+    # ride through the connector's real handlers - conftest_connector's
+    # attach_connector builds a BleState with the default buffer - wrote its
+    # ride-buffer.jsonl into the rider's own directory, where the next real
+    # connect would find it and upload it as their ride. On POSIX the same
+    # path lands under the redirected HOME, which is why CI never saw it.
+    monkeypatch.setenv(
+        "WATTRACKER_CONNECTOR_DIR", str(tmp_path / "connector-config")
+    )
     # Ensure no ambient config leaks in.
     monkeypatch.setenv("WATTRACKER_SECRET", "test-secret-key")
     # Keep the suite deterministic: no background scan task, and Zwift
     # player-folder detection looks at an isolated (empty) root, never the
     # machine's real Zwift install.
     monkeypatch.setenv("WATTRACKER_AUTO_SCAN", "0")
+    # Registration policy: the first account is always allowed, but a SECOND
+    # one now needs WATTRACKER_ALLOW_REGISTRATION (config.allow_registration).
+    # A large number of tests legitimately register a second rider through the
+    # route to exercise per-user scoping - "bob" in test_backup_route.py, the
+    # second accounts in test_auth.py and test_security_fixes.py - and their
+    # subject is isolation between accounts, not the sign-up policy. Opting in
+    # here keeps that intent intact and keeps the policy in ONE place, so the
+    # tests that DO cover it (test_registration_policy.py) are the ones that
+    # opt back out with monkeypatch.delenv.
+    monkeypatch.setenv("WATTRACKER_ALLOW_REGISTRATION", "1")
     zwift_root = tmp_path / "ZwiftWorkouts"
     zwift_root.mkdir()
     monkeypatch.setenv("WATTRACKER_ZWIFT_WORKOUTS_ROOT", str(zwift_root))

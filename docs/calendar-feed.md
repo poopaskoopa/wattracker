@@ -4,15 +4,34 @@ wattracker can publish your scheduled workouts as a read-only iCalendar feed at
 `/calendar.ics`, so they appear in the phone calendar you already use — 30 days
 back and 180 days ahead, one all-day entry each, completed sessions marked `✓`.
 
-The app binds to loopback and refuses to do anything else, so your phone cannot
-reach it over your home network by design. This guide uses **Tailscale** to
-carry the connection: your devices join a private network, and `tailscale serve`
-puts an HTTPS front end on the Mac that proxies to the loopback port. Nothing is
-exposed to the internet.
+A calendar feed is not the only way a phone sees wattracker — a phone is a
+perfectly ordinary [screen](../README.md#how-it-is-put-together), and on a home
+network it can load the whole app, live ride page included. What a calendar
+subscription adds is the part a browser cannot do: your workouts showing up in
+the calendar you already look at, without opening anything.
+
+The app binds to loopback by default, so out of the box nothing else on your
+network can reach it. There are two ways to change that, and they suit
+different things:
+
+- **A LAN bind** — the app answers on your home network directly. This is the
+  one to use if what you want is the app on your phone; see
+  [Reaching the server from other devices](../README.md#reaching-the-server-from-other-devices).
+  A calendar subscription works over it too, as long as the phone is home when
+  the calendar refreshes.
+- **Tailscale**, which is what this guide uses: your devices join a private
+  network and `tailscale serve` puts an HTTPS front end on the machine that
+  proxies to the loopback port. Nothing is exposed to the internet, it works
+  away from home, and the cookie travels encrypted. The trade-off is the 403 on
+  guarded buttons described under "Known limitations".
 
 If you already have another way to reach the machine (a reverse proxy, a VPN),
 the only wattracker-specific part is step 2 — set `WATTRACKER_PUBLIC_HOST` to
 whatever hostname the phone will use.
+
+Throughout this guide "the Mac" means **the machine running the server**. In a
+split install that is the NAS or container host, not the Zwift machine the
+connector runs on.
 
 ---
 
@@ -150,14 +169,24 @@ to sit on the open internet, and `tailscale funnel` would put it there — use
 
 ## Known limitations
 
-- **You cannot rotate the link from a phone.** The same-origin check compares
-  the browser's `Origin` against the URL the server thinks it is serving; with
-  proxy headers deliberately disabled those do not match over the tailnet, so
-  every guarded POST returns 403. Reading the feed is unaffected. Do link
-  generation on the Mac.
-- **The live-ride page will not work over the tailnet.** Its WebSocket has its
-  own separate origin allowlist that this setting does not extend, so the ride
-  screen will not connect from a phone. Ride from the machine itself.
+- **You cannot rotate the link from a phone _over the tailnet_.** The
+  same-origin check compares the browser's `Origin` against the URL the server
+  thinks it is serving; `tailscale serve` speaks https to the phone and plain
+  http to this loopback socket, so the scheme and port differ and every guarded
+  POST returns 403. Reading the feed is unaffected. Do link generation on the
+  Mac.
+
+  This is a property of the proxy, not of the phone: on a **direct LAN bind**
+  the browser and the server agree on scheme, host and port, and buttons work
+  from the phone like anywhere else. See "From a phone on the same network" in
+  the README, and `tests/test_phone_access.py`.
+- **The live-ride page works over the tailnet, and over a LAN name.** This used
+  to say it could not, and that was true when the ride socket's origin
+  allowlist was a separate, narrower list. It is not any more: `_ws_origin_ok`
+  consults the same validated `WATTRACKER_PUBLIC_HOSTS` setting the Host
+  allowlist uses, so the ride screen connects from a phone and shows live watts
+  coming from the connector. Ride actions travel on that socket rather than as
+  POSTs, so the 403 above does not reach them.
 
 ---
 
