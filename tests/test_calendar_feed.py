@@ -8,6 +8,7 @@ break out of an iCalendar TEXT value.
 import datetime as dt
 import logging
 import sqlite3
+import statistics
 import time
 
 import pytest
@@ -797,32 +798,101 @@ def test_redaction_is_linear_on_adversarial_input(payload):
     assert elapsed < REDACTION_BUDGET_S, f"{elapsed:.3f}s for {len(payload)} chars"
 
 
+# Growth is sampled at three sizes, each a doubling of the last, so the test
+# asserts the shape of the whole curve rather than one pair of numbers that a
+# single noisy measurement can invert. The largest lands at
+# REDACTION_ADVERSARIAL_LEN, the biggest line the server accepts and logs, so
+# the sizes measured here are ones a request can really arrive at.
+_GROWTH_BASE_TOKENS = 2_700              # a ~16KB request line
+_GROWTH_STEPS = (1, 2, 4)
+# Each measurement times a BATCH of calls, not one call. A single redact at the
+# base size costs ~100us, which a loaded box cannot time reliably - and since
+# the smallest measurement is the divisor, that noise multiplies the reported
+# ratio rather than nudging it. Batching to ~10ms per timed span lifts every
+# number far above the noise floor. Calls per batch shrink as the input grows,
+# so all three spans cover the same number of bytes and take about equally long.
+_GROWTH_BATCH_CALLS = 80                 # at the base size; 40 and 20 above it
+_GROWTH_ROUNDS = 15
+# Linear predicts 2.0 per doubling and 4.0 across the range; the quadratic
+# version predicted 4 and 16. Both limits sit clear of linear and well under
+# quadratic, so neither can be met by a slow machine, only by a worse pattern.
+_GROWTH_MAX_PER_DOUBLING = 3.0
+_GROWTH_MAX_OVER_RANGE = 6.0
+
+
+def _growth_ratios(fn, inputs):
+    """Cost ratios between consecutive inputs, and across the whole range.
+
+    Every round measures every input, and the ratios are formed WITHIN a round,
+    from measurements taken back to back. CPU contention does not arrive as an
+    even tax: measure the sizes in separate passes and one pass can land in a
+    quiet window while another does not, so the ratio ends up comparing a clean
+    measurement against a contended one and says nothing about the algorithm.
+    Sized against its own round, a busy stretch slows numerator and denominator
+    alike and cancels out.
+
+    The median across rounds is then what a typical round saw, so the handful of
+    rounds that a spike does land unevenly on cannot decide the result.
+    """
+    per_round = []
+    for _ in range(_GROWTH_ROUNDS):
+        costs = []
+        for arg, calls in inputs:
+            start = time.perf_counter()
+            for _ in range(calls):
+                fn(arg)
+            costs.append((time.perf_counter() - start) / calls)
+        per_round.append(costs)
+
+    doublings = [
+        statistics.median(c[i + 1] / c[i] for c in per_round)
+        for i in range(len(inputs) - 1)
+    ]
+    over_range = statistics.median(c[-1] / c[0] for c in per_round)
+    typical = [statistics.median(c[i] for c in per_round)
+               for i in range(len(inputs))]
+    return doublings, over_range, typical
+
+
 def test_redaction_stays_linear_as_input_grows():
     """Quadratic growth is the signature; assert it is absent directly.
 
-    A 4x longer input took 16x longer before the fix. Allowing 6x here leaves
-    room for timer noise on a busy machine while still catching any return to
-    quadratic (which would need ~16x).
+    A 4x longer input took 16x longer before the fix. Sampling three sizes means
+    a return to quadratic has to survive two independent doubling checks as well
+    as the end-to-end one.
     """
     flt = calendarfeed._TokenRedactingFilter()
+    inputs = [
+        ("/calendar.ics" + "?token" * (_GROWTH_BASE_TOKENS * step),
+         _GROWTH_BATCH_CALLS // step)
+        for step in _GROWTH_STEPS
+    ]
 
-    def cost(n):
-        line = "/calendar.ics" + "?token" * n
-        best = min(
-            _elapsed(flt.redact, line) for _ in range(5)
-        )
-        return best
-
-    small = cost(2_700)
-    large = cost(10_800)  # 4x the length
-    floor = 1e-5  # don't divide by a timer-resolution artifact
-    assert large < max(small, floor) * 6, f"{small:.6f}s -> {large:.6f}s"
-
-
-def _elapsed(fn, *args):
+    # One call on the largest input before the timing loop. This is the same
+    # check (and budget) as test_redaction_is_linear_on_adversarial_input at the
+    # same length, and it is here to bound the damage: a quadratic pattern costs
+    # ~2s per call at this size, which the loop below would multiply by 20 calls
+    # and 15 rounds into a suite that looks hung rather than red.
     start = time.perf_counter()
-    fn(*args)
-    return time.perf_counter() - start
+    flt.redact(inputs[-1][0])
+    probe = time.perf_counter() - start
+    assert probe < REDACTION_BUDGET_S, (
+        f"{probe:.3f}s for a single {len(inputs[-1][0])}-char line; "
+        f"skipping the growth measurement because it would take all day"
+    )
+
+    doublings, over_range, typical = _growth_ratios(flt.redact, inputs)
+
+    curve = " -> ".join(f"{c * 1e6:.1f}us" for c in typical)
+    for ratio in doublings:
+        assert ratio < _GROWTH_MAX_PER_DOUBLING, (
+            f"cost {ratio:.2f}x per doubling, over the "
+            f"{_GROWTH_MAX_PER_DOUBLING}x limit: {curve}"
+        )
+    assert over_range < _GROWTH_MAX_OVER_RANGE, (
+        f"cost {over_range:.2f}x over a {_GROWTH_STEPS[-1]}x input range, over "
+        f"the {_GROWTH_MAX_OVER_RANGE}x limit: {curve}"
+    )
 
 
 # -------------------------------------------------------------- migration
