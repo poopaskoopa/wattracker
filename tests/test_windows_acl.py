@@ -21,6 +21,7 @@ future edit reverts to the bare name these tests must fail, which is what
 even if the exact-argv assertions are ever loosened.
 """
 import getpass
+import logging
 import ntpath
 import os
 import subprocess
@@ -57,6 +58,20 @@ def _capture_run(monkeypatch):
     return calls
 
 
+def _grants(calls):
+    """Just the owner-only grant calls.
+
+    Each _restrict spawns two icacls: a /reset that drops explicit aces, then
+    the grant. Tests about WHAT is granted want the second one; picking it by
+    flag rather than by index keeps them readable and order-independent.
+    """
+    return [c for c in calls if "/grant:r" in c[0]]
+
+
+def _resets(calls):
+    return [c for c in calls if c[0][-1] == "/reset"]
+
+
 # ----------------------------------------------------------------- POSIX branch
 def test_posix_uses_chmod_and_never_touches_acl(tmp_path, monkeypatch):
     """On non-Windows, _restrict chmods and never spawns icacls / the ACL helper."""
@@ -90,13 +105,13 @@ def test_windows_file_builds_owner_only_icacls_argv(tmp_path, monkeypatch):
     f.write_text("x")
     config._restrict(str(f), 0o600, is_dir=False)
 
-    assert len(calls) == 1
-    argv = calls[0][0]
-    assert argv == [
+    assert len(calls) == 2  # the /reset, then the grant
+    assert calls[0][0] == [_expected_icacls(), str(f), "/reset"]
+    assert calls[1][0] == [
         _expected_icacls(), str(f), "/inheritance:r", "/grant:r", "alice:F"
     ]
-    # never shell=True
-    assert calls[0][2].get("shell", False) is False
+    # never shell=True, on either call
+    assert all(c[2].get("shell", False) is False for c in calls)
 
 
 def test_windows_icacls_gets_no_console_of_its_own(tmp_path, monkeypatch):
@@ -116,7 +131,8 @@ def test_windows_icacls_gets_no_console_of_its_own(tmp_path, monkeypatch):
     f.write_text("{}")
     config._restrict(str(f), 0o600, is_dir=False)
 
-    assert calls[0][2].get("creationflags") == 0x08000000
+    # Both spawns, or the reset is the one that flashes a console.
+    assert [c[2].get("creationflags") for c in calls] == [0x08000000] * 2
 
 
 def test_windows_icacls_creationflags_survive_a_missing_flag(tmp_path, monkeypatch):
@@ -133,7 +149,7 @@ def test_windows_icacls_creationflags_survive_a_missing_flag(tmp_path, monkeypat
     f.write_text("{}")
     config._restrict(str(f), 0o600, is_dir=False)
 
-    assert calls[0][2].get("creationflags") == 0
+    assert [c[2].get("creationflags") for c in calls] == [0] * 2
 
 
 def test_windows_dir_gets_inheritable_owner_only_grant(tmp_path, monkeypatch):
@@ -144,7 +160,7 @@ def test_windows_dir_gets_inheritable_owner_only_grant(tmp_path, monkeypatch):
     d.mkdir()
     config._restrict(str(d), 0o700, is_dir=True)
 
-    argv = calls[0][0]
+    argv = _grants(calls)[0][0]
     assert argv == [
         _expected_icacls(),
         str(d),
@@ -166,8 +182,9 @@ def test_windows_infers_dir_vs_file_from_path(tmp_path, monkeypatch):
     config._restrict(str(d), 0o700)  # is_dir omitted -> inferred True
     config._restrict(str(f), 0o600)  # is_dir omitted -> inferred False
 
-    assert calls[0][0][-1] == "alice:(OI)(CI)F"
-    assert calls[1][0][-1] == "alice:F"
+    grants = _grants(calls)
+    assert grants[0][0][-1] == "alice:(OI)(CI)F"
+    assert grants[1][0][-1] == "alice:F"
 
 
 def test_windows_path_with_spaces_stays_one_argv_element(tmp_path, monkeypatch):
@@ -179,11 +196,14 @@ def test_windows_path_with_spaces_stays_one_argv_element(tmp_path, monkeypatch):
     f.write_text("{}")
     config._restrict(str(f), 0o600, is_dir=False)
 
-    argv = calls[0][0]
-    # The path must be a single argument, not shell-split on the spaces.
-    assert argv[1] == str(f)
-    assert " " in argv[1]
-    assert len(argv) == 5
+    # The path must be a single argument, not shell-split on the spaces - on
+    # both spawns, since either one taking it as two would touch the wrong
+    # file (or fail and leave the real one untouched).
+    for argv, _a, _k in calls:
+        assert argv[1] == str(f)
+        assert " " in argv[1]
+    assert len(_grants(calls)[0][0]) == 5
+    assert len(_resets(calls)[0][0]) == 3
 
 
 # ------------------------------------------ argv[0] must not be searched for
@@ -213,7 +233,7 @@ def test_windows_icacls_is_never_a_bare_or_relative_name(tmp_path, monkeypatch):
     config._restrict(str(d), 0o700, is_dir=True)
     config._restrict(str(f), 0o600, is_dir=False)
 
-    assert len(calls) == 2
+    assert len(calls) == 4  # a /reset and a grant for each of the two paths
     for argv, _args, _kwargs in calls:
         program = argv[0]
         # Not the bare name, under any spelling.
@@ -244,7 +264,8 @@ def test_windows_icacls_path_follows_systemroot(tmp_path, monkeypatch):
     f.write_text("x")
     config._restrict(str(f), 0o600, is_dir=False)
 
-    assert calls[0][0][0] == os.path.join(r"D:\WinNT", "System32", "icacls.exe")
+    expected = os.path.join(r"D:\WinNT", "System32", "icacls.exe")
+    assert [c[0][0] for c in calls] == [expected] * 2
 
 
 def test_windows_icacls_path_falls_back_when_systemroot_is_missing(monkeypatch):
@@ -295,6 +316,125 @@ def test_windows_icacls_missing_swallowed(tmp_path, monkeypatch):
     config._restrict(str(f), 0o600, is_dir=False)  # must not raise
 
 
+def test_windows_clears_explicit_aces_before_granting(tmp_path, monkeypatch):
+    r"""/inheritance:r and /grant:r together cannot produce an owner-only acl.
+
+    ``/inheritance:r`` removes only INHERITED aces, and ``/grant:r`` replaces
+    aces only for the user it names, so an explicit ace belonging to anyone
+    else survives both. Confirmed on Windows 11: a directory carrying an
+    explicit ``BUILTIN\Users:(OI)(CI)(R)`` still carried it afterwards, and
+    the ``wattracker.db`` created inside then inherited it as
+    ``Users:(I)(R)`` - every local standard account able to read the session
+    secret, LLM api key and password hashes, which is the exact exposure this
+    function exists to close.
+
+    ``/reset`` drops the explicit aces, and it has to be its own spawn:
+    icacls rejects it alongside ``/inheritance:r`` ("Invalid parameter").
+    Order is the property under test - a reset AFTER the grant undoes it.
+    """
+    monkeypatch.setattr(os, "name", "nt")
+    calls = _capture_run(monkeypatch)
+
+    d = tmp_path / "datadir"
+    d.mkdir()
+    config._restrict(str(d), 0o700, is_dir=True)
+
+    assert [c[0][2:] for c in calls] == [
+        ["/reset"],
+        ["/inheritance:r", "/grant:r", "alice:(OI)(CI)F"],
+    ]
+
+
+def test_windows_grant_still_runs_when_the_reset_fails(tmp_path, monkeypatch):
+    """A failed reset must not cost us the grant.
+
+    Without the reset this function is exactly what it was before, and that
+    was not nothing: inherited aces still get severed and the owner still
+    gets full control. Skipping the grant because the reset failed would
+    trade a partial fix for no fix.
+    """
+    monkeypatch.setattr(os, "name", "nt")
+    monkeypatch.setattr(getpass, "getuser", lambda: "alice")
+    monkeypatch.setenv("SystemRoot", FAKE_SYSTEM_ROOT)
+
+    seen = []
+
+    def fake_run(argv, *a, **k):
+        seen.append(argv)
+        if argv[-1] == "/reset":
+            raise subprocess.CalledProcessError(1, argv)
+        return subprocess.CompletedProcess(argv, 0)
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+
+    f = tmp_path / "wattracker.db"
+    f.write_text("x")
+    config._restrict(str(f), 0o600, is_dir=False)  # must not raise
+
+    assert [argv[2:] for argv in seen] == [
+        ["/reset"],
+        ["/inheritance:r", "/grant:r", "alice:F"],
+    ]
+
+
+def test_windows_warns_when_the_reset_outlives_the_grant(
+    tmp_path, monkeypatch, caplog
+):
+    """The one ordering that ends WIDER than it started.
+
+    /reset restores the inherited default and the grant is what narrows it
+    again, so a reset that lands followed by a grant that does not leaves the
+    path carrying whatever its parent grants - worse than never having been
+    touched. Every other failure here is best-effort and debug-level. This one
+    is not: a silent no-op is precisely how the original unrestricted-acl
+    finding survived long enough to need a security review.
+    """
+    monkeypatch.setattr(os, "name", "nt")
+    monkeypatch.setattr(getpass, "getuser", lambda: "alice")
+    monkeypatch.setenv("SystemRoot", FAKE_SYSTEM_ROOT)
+
+    def fake_run(argv, *a, **k):
+        if argv[-1] == "/reset":
+            return subprocess.CompletedProcess(argv, 0)
+        raise subprocess.CalledProcessError(1, argv)
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+
+    d = tmp_path / "datadir"
+    d.mkdir()
+    with caplog.at_level(logging.WARNING, logger=config._log.name):
+        config._restrict(str(d), 0o700, is_dir=True)  # must not raise
+
+    assert [r.levelname for r in caplog.records] == ["WARNING"]
+    assert str(d) in caplog.records[0].getMessage()
+
+
+def test_windows_a_failure_that_changed_nothing_stays_quiet(
+    tmp_path, monkeypatch, caplog
+):
+    """Both spawns failing is the ordinary no-op, not the loud one.
+
+    A missing icacls or a path already gone fails both calls and leaves the
+    acl exactly as it was found. Warning about that would teach the reader to
+    ignore the warning that does mean something.
+    """
+    monkeypatch.setattr(os, "name", "nt")
+    monkeypatch.setattr(getpass, "getuser", lambda: "alice")
+    monkeypatch.setenv("SystemRoot", FAKE_SYSTEM_ROOT)
+
+    def missing(argv, *a, **k):
+        raise FileNotFoundError("icacls not found")
+
+    monkeypatch.setattr(subprocess, "run", missing)
+
+    d = tmp_path / "datadir"
+    d.mkdir()
+    with caplog.at_level(logging.WARNING, logger=config._log.name):
+        config._restrict(str(d), 0o700, is_dir=True)  # must not raise
+
+    assert caplog.records == []
+
+
 def test_windows_no_username_skips_icacls(tmp_path, monkeypatch):
     monkeypatch.setattr(os, "name", "nt")
     monkeypatch.setattr(getpass, "getuser", lambda: "")
@@ -331,4 +471,6 @@ def test_windows_db_sidecars_all_locked_via_restrict_db_files(tmp_path, monkeypa
         str(base) + "-shm",
     }
     # sidecars are files -> plain full-control grant, not the dir (OI)(CI) form
-    assert all(c[0][-1] == "alice:F" for c in calls)
+    assert all(c[0][-1] == "alice:F" for c in _grants(calls))
+    # and each of the three got its explicit aces cleared first
+    assert {c[0][1] for c in _resets(calls)} == locked

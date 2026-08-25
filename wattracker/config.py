@@ -57,10 +57,25 @@ def _restrict_windows_acl(path: str, is_dir: bool) -> None:
 
     POSIX modes are inert on Windows: ``os.chmod`` only toggles the read-only
     attribute and sets no ACL. So when the data dir is relocated off the user
-    profile (WATTRACKER_DATA_DIR / WATTRACKER_DB) onto a volume whose inherited
-    ACL grants e.g. ``Users:(R)``, another local standard account could read the
-    session secret, LLM API key and password hashes. Reset inheritance and
-    grant full control to the current user only.
+    profile (WATTRACKER_DATA_DIR / WATTRACKER_DB) onto a volume whose ACL grants
+    e.g. ``Users:(R)``, another local standard account could read the session
+    secret, LLM API key and password hashes. Reset inheritance and grant full
+    control to the current user only.
+
+    Two icacls calls, because one cannot do it and icacls rejects the flags
+    together. ``/inheritance:r`` removes only INHERITED aces, and ``/grant:r``
+    replaces aces only for the user it names, so an EXPLICIT ace for anyone
+    else survives both - verified on Windows 11, where a directory carrying an
+    explicit ``Users:(OI)(CI)(R)`` kept it, and the ``wattracker.db`` created
+    afterwards inherited it as ``Users:(I)(R)``. That is the exposure this
+    function exists to close, so ``/reset`` drops the explicit aces first and
+    the grant then re-narrows what /reset widened.
+
+    Which is why the ORDER of the two failures is not symmetric. Between the
+    calls the path carries whatever its parent grants; a failed reset leaves
+    the old behavior intact and is unremarkable, but a reset that succeeds
+    followed by a grant that does not ends WIDER than it started, and that one
+    is worth saying out loud.
 
     Done via ``icacls`` (shipped with every supported Windows; no extra
     dependency, and cleaner than hand-building a SID/DACL through ctypes). The
@@ -87,15 +102,33 @@ def _restrict_windows_acl(path: str, is_dir: bool) -> None:
     # Dirs get object+container inheritance so new children (db, -wal, -shm,
     # backups) are owner-only too; files just get full control.
     grant = f"{user}:(OI)(CI)F" if is_dir else f"{user}:F"
+    icacls = _icacls_path()
+    spawn = {
+        "check": True,
+        "capture_output": True,
+        "creationflags": getattr(subprocess, "CREATE_NO_WINDOW", 0),
+    }
+    reset = False
+    try:
+        subprocess.run([icacls, path, "/reset"], **spawn)
+        reset = True
+    except (subprocess.SubprocessError, OSError, ImportError):
+        # Nothing is lost by carrying on: without the reset this is exactly
+        # what the function did before, so the grant is still worth trying.
+        _log.debug("could not clear explicit aces on %s", path, exc_info=True)
     try:
         subprocess.run(
-            [_icacls_path(), path, "/inheritance:r", "/grant:r", grant],
-            check=True,
-            capture_output=True,
-            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+            [icacls, path, "/inheritance:r", "/grant:r", grant], **spawn
         )
     except (subprocess.SubprocessError, OSError, ImportError):
-        _log.debug("could not set owner-only ACL on %s", path, exc_info=True)
+        if reset:
+            _log.warning(
+                "cleared the acl on %s but could not re-apply the owner-only "
+                "grant - it now carries whatever its parent grants", path,
+                exc_info=True,
+            )
+        else:
+            _log.debug("could not set owner-only ACL on %s", path, exc_info=True)
 
 
 def _restrict(path: str, mode: int, *, is_dir: Optional[bool] = None) -> None:
