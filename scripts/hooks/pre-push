@@ -11,12 +11,18 @@
 # Rules:
 #   1. No direct push to main. Merges happen through a PR, which goes through
 #      the GitHub API and never runs this hook.
-#   2. No `--force` to a shared branch without a lease. A force-push here once
-#      reverted three merged security fixes because the pushing clone had a
-#      22-hour-old view of origin/main.
+#   2. No rewrite of a shared branch that would drop commits this clone has
+#      never seen. A force-push here once reverted three merged security fixes
+#      because the pushing clone had a 22-hour-old view of origin/main.
+#
+# Rule 2 is about losing work, not about rewriting history. A rebase rewrites
+# history and loses nothing, and rebasing onto merged main is routine here. A
+# pre-push hook is handed only ref names and shas on stdin, so it cannot see
+# whether `--force-with-lease` was passed and cannot enforce that it was; it
+# judges the shas themselves instead, and lets a clean rebase through.
 #
 # Install in each clone:
-#   cp pre-push .git/hooks/pre-push && chmod +x .git/hooks/pre-push
+#   scripts/hooks/install.sh
 
 set -uo pipefail
 
@@ -37,16 +43,46 @@ while read -r _local_ref local_sha remote_ref remote_sha; do
     [ "$local_sha" = "$zero" ] && continue
     [ "$remote_sha" = "$zero" ] && continue
 
-    # A non-fast-forward push rewrites history someone else may hold.
-    if ! git merge-base --is-ancestor "$remote_sha" "$local_sha" 2>/dev/null; then
-        echo "pre-push: '$branch' would be rewritten (not a fast-forward)." >&2
-        echo "          Remote is at ${remote_sha:0:8}, you are pushing ${local_sha:0:8}." >&2
-        echo "          If that is intended, use an explicit lease:" >&2
-        echo "            git push --force-with-lease=$branch:${remote_sha:0:8}" >&2
-        echo "          Before you do: fetch, and check the remote is not ahead" >&2
-        echo "          of the base you rebased onto." >&2
+    # A fast-forward can strand nothing. Nothing to weigh.
+    git merge-base --is-ancestor "$remote_sha" "$local_sha" 2>/dev/null && continue
+
+    # Past here the push rewrites the remote branch. The question is only
+    # whether the rewrite discards work.
+
+    # A remote sha this clone cannot read means its view of origin predates the
+    # push it is about to overwrite. Never guess from that position.
+    if ! git cat-file -e "${remote_sha}^{commit}" 2>/dev/null; then
+        echo "pre-push: '$branch' on the remote is at ${remote_sha:0:8}, a commit this" >&2
+        echo "          clone does not have, so what the push would drop cannot be" >&2
+        echo "          checked. Fetch first:" >&2
+        echo "            git fetch origin $branch" >&2
         exit 1
     fi
+
+    # --cherry-pick drops the remote commits that have a patch-identical
+    # counterpart on our side; --right-only keeps only the remote's. Whatever
+    # prints exists solely on the remote, and this push would erase it.
+    #
+    # Merge commits have no patch id, so they never match and would always
+    # print. A rebase legitimately drops them, and the commits they merged in
+    # are judged on their own, so leave them out. That forgives a conflict
+    # resolution recorded in a merge commit and nothing else — the deliberate
+    # price of letting an ordinary rebase land.
+    lost="$(git log --cherry-pick --right-only --no-merges \
+                --format='%h %s' "${local_sha}...${remote_sha}" 2>/dev/null)"
+
+    if [ -n "$lost" ]; then
+        echo "pre-push: '$branch' would drop commits that exist only on the remote:" >&2
+        echo "$lost" | sed 's/^/            /' >&2
+        echo "          This clone does not hold that work, so a rewrite destroys it." >&2
+        echo "          Fetch and replay onto the remote before pushing:" >&2
+        echo "            git fetch origin && git rebase origin/$branch" >&2
+        echo "          If it really should go, re-run with --no-verify." >&2
+        exit 1
+    fi
+
+    echo "pre-push: rewriting '$branch' (${remote_sha:0:8} -> ${local_sha:0:8})." >&2
+    echo "          Every commit on the remote has a counterpart here; none lost." >&2
 done
 
 exit 0
