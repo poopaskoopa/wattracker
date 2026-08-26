@@ -50,9 +50,16 @@ scripts/hooks/install.sh
 ```
 
 It refuses direct pushes to `main`, and it refuses a rewrite of a shared
-branch that would drop commits the pushing clone has never seen — naming the
+branch that would drop remote work with no counterpart here — naming the
 commits it would have stranded. A rebase is not such a rewrite: replaying your
 own commits onto merged `main` loses nothing, and the hook lets it through.
+
+It judges by patch content, and that is not the same as identity. It can miss
+a remote commit whose changes exist here under a different author or message,
+and it does not look inside merge commits, so a conflict resolution recorded
+only in one is not seen. In the other direction, an amend or a squash of your
+own commits will trip it; read the list it prints, and if the work is already
+in what you are pushing, `--no-verify` is the intended answer.
 
 The hook cannot check the lease. Git hands `pre-push` only ref names and
 shas on stdin, never the command line, so `--force-with-lease` is invisible to

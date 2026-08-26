@@ -65,11 +65,21 @@ while read -r _local_ref local_sha remote_ref remote_sha; do
     #
     # Merge commits have no patch id, so they never match and would always
     # print. A rebase legitimately drops them, and the commits they merged in
-    # are judged on their own, so leave them out. That forgives a conflict
-    # resolution recorded in a merge commit and nothing else — the deliberate
-    # price of letting an ordinary rebase land.
-    lost="$(git log --cherry-pick --right-only --no-merges \
-                --format='%h %s' "${local_sha}...${remote_sha}" 2>/dev/null)"
+    # are judged on their own, so leave them out. The price: content that
+    # exists ONLY in a merge commit — a hand-written conflict resolution, or
+    # an evil merge — has no representative to compare and is not flagged.
+    # That is the deliberate cost of letting an ordinary rebase land.
+    #
+    # The comparison itself must never fail open: an unreadable object or a
+    # broken git config would otherwise yield an empty answer, which reads
+    # exactly like "nothing would be lost" and waves the clobber through.
+    if ! lost="$(git log --cherry-pick --right-only --no-merges \
+                --format='%h %s' "${local_sha}...${remote_sha}")"; then
+        echo "pre-push: could not compare '$branch' against the remote, so what" >&2
+        echo "          the push would drop cannot be checked. Refusing." >&2
+        echo "          Check 'git log ${local_sha:0:8}...${remote_sha:0:8}' by hand." >&2
+        exit 1
+    fi
 
     if [ -n "$lost" ]; then
         echo "pre-push: '$branch' would drop commits that exist only on the remote:" >&2
@@ -77,12 +87,14 @@ while read -r _local_ref local_sha remote_ref remote_sha; do
         echo "          This clone does not hold that work, so a rewrite destroys it." >&2
         echo "          Fetch and replay onto the remote before pushing:" >&2
         echo "            git fetch origin && git rebase origin/$branch" >&2
-        echo "          If it really should go, re-run with --no-verify." >&2
+        echo "          If you amended or squashed YOUR OWN commits above and the" >&2
+        echo "          listed work is already in what you are pushing, that is what" >&2
+        echo "          --no-verify is for. Read the list first." >&2
         exit 1
     fi
 
     echo "pre-push: rewriting '$branch' (${remote_sha:0:8} -> ${local_sha:0:8})." >&2
-    echo "          Every commit on the remote has a counterpart here; none lost." >&2
+    echo "          Every remote commit has a patch-identical counterpart here." >&2
 done
 
 exit 0
