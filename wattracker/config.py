@@ -52,21 +52,159 @@ def _icacls_path() -> str:
     return os.path.join(system_root, "System32", "icacls.exe")
 
 
+#: Well-known SIDs whose presence in a path's DACL means the path is ALREADY
+#: reachable by principals other than its owner, in the numerical ``*``-prefixed
+#: form icacls documents. Numerical and not friendly names because the friendly
+#: names are LOCALISED (``BUILTIN\Users`` is ``VORDEFINIERT\Benutzer`` on a
+#: German install) and this app ships to whatever Windows a rider owns.
+_FOREIGN_SIDS = (
+    "*S-1-5-32-545",  # BUILTIN\Users
+    "*S-1-1-0",       # Everyone
+    "*S-1-5-11",      # NT AUTHORITY\Authenticated Users
+)
+
+#: Seconds any single icacls spawn may take before it is killed.
+#:
+#: WHY a timeout at all: db.py supports a WATTRACKER_DB on a network mount, and
+#: icacls on a stalled mount blocks forever. Without this a hang in the SECOND
+#: spawn leaves the path at its parent's inherited ACL PERMANENTLY and says
+#: nothing, because the only warning lives in an ``except`` branch that a hang
+#: never reaches. ``subprocess.TimeoutExpired`` subclasses ``SubprocessError``
+#: (checked against this interpreter, not assumed), so the handlers already
+#: written below route a timeout to exactly the same place a non-zero exit goes.
+#: 15s is far past any local-disk icacls and far short of a mount's own timeout.
+_ACL_SPAWN_TIMEOUT = 15
+
+
+def _acl_needs_reset(icacls: str, path: str, spawn: dict) -> bool:
+    r"""Does ``path`` already carry a DACL ace for a foreign principal?
+
+    WHY this gate exists. ``/reset`` replaces the ACL with the parent's default
+    INHERITED one, so between the reset spawn and the grant spawn the path is
+    exactly as permissive as its parent. Windows evaluates a DACL once, at
+    ``CreateFile`` time, so a handle another local account opens inside that
+    window keeps its access for as long as it holds the handle - re-locking the
+    path afterwards does not revoke it. For ``~/.wattracker`` that window is
+    harmless (the parent is the user profile, owner-only already), and so is it
+    for the db/-wal/-shm under a data dir ``app_data_dir()`` has just locked.
+    But ``db_path()`` returns a ``WATTRACKER_DB`` override VERBATIM and never
+    calls ``app_data_dir()``, and nothing restricts that override's parent: for
+    ``WATTRACKER_DB=D:\shared\wt.db`` the file and its two sidecars would each
+    take that volume's inheritable default - plausibly ``Users:(RX)`` and
+    ``Authenticated Users:(M)`` on a stock non-system NTFS root - at every
+    single app start. Those files were never widened before the reset landed,
+    so an unconditional reset is a straight regression on the one deployment
+    shape this whole function exists to protect.
+
+    Probing first removes that. The reset now only ever runs on a path that is
+    ALREADY exposed to one of ``_FOREIGN_SIDS``, so the window it opens can
+    only re-expose what was exposed anyway, and on the clean path - which is
+    every install that has not been relocated - the reset stops running at all.
+
+    COST, stated plainly because it is paid on every call: a clean path spends
+    one spawn per SID (three, all missing) plus the grant; an exposed one stops
+    at the first hit and adds the reset. That is more spawns than the two this
+    function used, and ``_restrict`` runs on every ``app_data_dir()``. A single
+    ``/findsid`` naming all three SIDs would collapse it, but the reference's
+    grammar admits only one ``/findsid Sid`` per invocation and an undocumented
+    repetition that silently kept just the last SID would be a false negative -
+    the one direction this must not fail in - so the SIDs are walked separately
+    until a real Windows box says otherwise.
+
+    WHAT SIGNAL IS READ, and why not the exit code. ``/findsid`` is a REPORTING
+    verb, in the same syntax group as ``/save`` and ``/verify``: the reference
+    defines it as "finds all matching files that contain a DACL explicitly
+    mentioning the specified SID", and finding none is not a failure - nothing
+    failed to process - so icacls exits 0 whether or not the SID is there. A
+    returncode-only check would therefore make the reset either NEVER run or
+    ALWAYS run, which is the single most likely way to get this wrong. The
+    answer is on STDOUT: a match prints the matching path on its own line ahead
+    of the "Successfully processed N files" summary, a miss prints the summary
+    alone. So the read is "did stdout say anything beyond one summary line".
+
+    Deliberately NOT matched against the summary's wording: that string is
+    localised (a known source of false failures in other tools that parse it),
+    while a path echoed back is not. Two independent tells are OR'd, because
+    each covers the other's blind spot - the line COUNT survives a mojibake
+    decode of a non-ASCII path, and the path ECHO survives a summary line that
+    is missing or wraps. Only stdout of exactly one non-blank line that does not
+    name the path is read as a clean miss.
+
+    FAIL TOWARD RESETTING. Every other outcome - a raise, a timeout, a non-zero
+    exit, anything on stderr, output of an unexpected shape, stdout that was not
+    captured at all - returns True. A probe that cannot answer must never be the
+    reason the explicit foreign ace this function exists to clear is left in
+    place; resetting is what the code did before the probe, so True is never
+    worse than the status quo. Probing stops at the first SID answering True.
+
+    NOT VERIFIED ON WINDOWS: everything above about icacls's output and exit
+    code is reasoned from Microsoft's icacls reference and its documented
+    grammar. This was written on macOS and no icacls has been executed. Note in
+    particular that the reference's grammar admits exactly ONE ``/findsid Sid``
+    per invocation, which is why this walks the SIDs in separate spawns instead
+    of naming all three at once; if a repeated ``/findsid`` is ever confirmed to
+    OR them, this collapses to a single spawn. No ``/T``: only this path.
+    """
+    for sid in _FOREIGN_SIDS:
+        try:
+            proc = subprocess.run([icacls, path, "/findsid", sid], **spawn)
+        except (subprocess.SubprocessError, OSError, ImportError):
+            _log.debug("could not probe the acl on %s", path, exc_info=True)
+            return True
+        out = getattr(proc, "stdout", None)
+        err = getattr(proc, "stderr", None)
+        if not isinstance(out, str) or err:
+            return True  # nothing readable, or icacls complained: inconclusive
+        lines = [ln for ln in out.splitlines() if ln.strip()]
+        if len(lines) != 1:
+            return True  # not the one-summary-line shape a clean miss has
+        if path.casefold() in lines[0].casefold():
+            return True  # the path was echoed back: this sid is on its DACL
+    return False
+
+
 def _restrict_windows_acl(path: str, is_dir: bool) -> None:
     """Best-effort owner-only NTFS ACL on Windows.
 
     POSIX modes are inert on Windows: ``os.chmod`` only toggles the read-only
     attribute and sets no ACL. So when the data dir is relocated off the user
-    profile (WATTRACKER_DATA_DIR / WATTRACKER_DB) onto a volume whose inherited
-    ACL grants e.g. ``Users:(R)``, another local standard account could read the
-    session secret, LLM API key and password hashes. Reset inheritance and
-    grant full control to the current user only.
+    profile (WATTRACKER_DATA_DIR / WATTRACKER_DB) onto a volume whose ACL grants
+    e.g. ``Users:(R)``, another local standard account could read the session
+    secret, LLM API key and password hashes. Reset inheritance and grant full
+    control to the current user only.
+
+    Two icacls calls, because one cannot do it and icacls rejects the flags
+    together. ``/inheritance:r`` removes only INHERITED aces, and ``/grant:r``
+    replaces aces only for the user it names, so an EXPLICIT ace for anyone
+    else survives both - verified on Windows 11, where a directory carrying an
+    explicit ``Users:(OI)(CI)(R)`` kept it, and the ``wattracker.db`` created
+    afterwards inherited it as ``Users:(I)(R)``. That is the exposure this
+    function exists to close, so ``/reset`` drops the explicit aces first and
+    the grant then re-narrows what /reset widened.
+
+    The reset is GATED on a probe, and the gate is a security control rather
+    than an optimisation: an unconditional ``/reset`` briefly restores the
+    parent's ACL on a path whose parent nothing else restricts, which is a
+    regression on a relocated ``WATTRACKER_DB``. ``_acl_needs_reset`` carries
+    the whole argument, the stdout signal it reads, and the rule that a probe
+    which cannot answer resets anyway.
+
+    Which is why the ORDER of the two failures is not symmetric. Between the
+    calls the path carries whatever its parent grants; a failed reset leaves
+    the old behavior intact and is unremarkable, but a reset that succeeds
+    followed by a grant that does not ends WIDER than it started, and that one
+    is worth saying out loud. ``check=True`` is what makes that warning
+    reachable at all: without it a non-zero grant raises nothing, the reset
+    stands unnarrowed, and the path is left open in silence.
 
     Done via ``icacls`` (shipped with every supported Windows; no extra
     dependency, and cleaner than hand-building a SID/DACL through ctypes). The
     argv is passed as a list (no ``shell=True``) so a data-dir path containing
     spaces stays a single argument and nothing is shell-interpreted. Best-effort:
     it must never crash the app, mirroring the chmod-can-fail contract.
+
+    Every spawn carries ``timeout=`` - see ``_ACL_SPAWN_TIMEOUT`` for why a hang
+    is the one failure the warning below could not otherwise reach.
 
     CREATE_NO_WINDOW because the connector's frozen build is windowed and has
     no console of its own: without it Windows gives every ``icacls`` child a
@@ -87,15 +225,40 @@ def _restrict_windows_acl(path: str, is_dir: bool) -> None:
     # Dirs get object+container inheritance so new children (db, -wal, -shm,
     # backups) are owner-only too; files just get full control.
     grant = f"{user}:(OI)(CI)F" if is_dir else f"{user}:F"
+    icacls = _icacls_path()
+    spawn = {
+        "check": True,
+        "capture_output": True,
+        "text": True,
+        # A non-ASCII path under a mismatched console codepage must degrade to
+        # replacement characters, never to a UnicodeDecodeError that would read
+        # as a probe failure for the wrong reason.
+        "errors": "replace",
+        "timeout": _ACL_SPAWN_TIMEOUT,
+        "creationflags": getattr(subprocess, "CREATE_NO_WINDOW", 0),
+    }
+    reset = False
+    if _acl_needs_reset(icacls, path, spawn):
+        try:
+            subprocess.run([icacls, path, "/reset"], **spawn)
+            reset = True
+        except (subprocess.SubprocessError, OSError, ImportError):
+            # Nothing is lost by carrying on: without the reset this is exactly
+            # what the function did before, so the grant is still worth trying.
+            _log.debug("could not clear explicit aces on %s", path, exc_info=True)
     try:
         subprocess.run(
-            [_icacls_path(), path, "/inheritance:r", "/grant:r", grant],
-            check=True,
-            capture_output=True,
-            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+            [icacls, path, "/inheritance:r", "/grant:r", grant], **spawn
         )
     except (subprocess.SubprocessError, OSError, ImportError):
-        _log.debug("could not set owner-only ACL on %s", path, exc_info=True)
+        if reset:
+            _log.warning(
+                "cleared the acl on %s but could not re-apply the owner-only "
+                "grant - it now carries whatever its parent grants", path,
+                exc_info=True,
+            )
+        else:
+            _log.debug("could not set owner-only ACL on %s", path, exc_info=True)
 
 
 def _restrict(path: str, mode: int, *, is_dir: Optional[bool] = None) -> None:
