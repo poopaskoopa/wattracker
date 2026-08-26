@@ -55,8 +55,15 @@ async def _cancel(task: "Optional[asyncio.Task]") -> None:
     task.cancel()
     try:
         await task
-    except (asyncio.CancelledError, Exception):
+    except asyncio.CancelledError:
         pass
+    except Exception:
+        # Not the cancellation we asked for: this task died on its own, before
+        # anyone came to stop it. Swallowing it silently is how a crashed
+        # folder watcher becomes a connector that looks healthy and never
+        # reports another ride - the exact failure this module exists to
+        # prevent - so it is said out loud even though shutdown continues.
+        log.warning("a background connector task failed", exc_info=True)
 
 
 class _Replaced(Exception):
@@ -149,8 +156,21 @@ class Connector:
         self._watcher = watcher.ActivityWatcher(config)
         # Set when the folder has changed and the server has not been told
         # yet. Survives a disconnect: the change happened whether or not there
-        # was a socket to report it on, and the flush is the first thing the
-        # next connection does - the same contract as the buffered ride.
+        # was a socket to report it on, and the flush is the second thing the
+        # next connection does, right behind the buffered ride.
+        #
+        # Deliberately weaker than the buffered ride, and worth being precise
+        # about because the two sit one line apart. The ride is a JSONL file on
+        # disk, discarded only on a definite HTTP answer, so it survives this
+        # process dying. This flag is a bool in memory, cleared on a
+        # fire-and-forget send_event that nothing acknowledges. So it
+        # guarantees exactly one thing: news noticed while the socket was down
+        # is not forgotten while this process lives. A frame that reaches the
+        # socket but not the server clears the flag anyway, and the watcher's
+        # _reported already holds that file, so it is never raised again - the
+        # ride then waits for a restart, a Rescan, or the daily sweep. That is
+        # the bargain the event protocol makes everywhere (see
+        # _handle_connector_event), with the sweep as the backstop.
         self._activities_dirty = False
         # Strong references to the in-flight request tasks. The loop holds
         # only weak ones, so a task nothing else refers to may be collected

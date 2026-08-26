@@ -302,9 +302,13 @@ wattracker-connector --scan-interval 0  --save   # stop watching
 ```
 
 The check is a directory listing on the Zwift machine, so it costs nothing when
-nothing has changed and the server is contacted only when there is something to
-find. With it turned off — or if the connector is not running — rides are still
-imported by the server's daily sweep, and **Rescan** still works at any time.
+nothing has changed: after the first pass the server is contacted only when a
+file has actually settled. The first pass after the connector starts always
+reports — even when the Zwift folder is empty or does not exist yet — because a
+ride may have been ridden while the connector was down, and that one report is
+what makes starting the connector the cold-start trigger for a scan. With it
+turned off — or if the connector is not running — rides are still imported by
+the server's daily sweep, and **Rescan** still works at any time.
 
 ### The connector as one file (Windows)
 

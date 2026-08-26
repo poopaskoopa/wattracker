@@ -74,14 +74,30 @@ def test_a_new_file_is_not_reported_until_it_stops_changing(activities):
 
 
 def test_zwifts_in_progress_buffer_is_never_reported(activities):
-    """It changes every second of every ride, and is never offered anyway."""
-    watch = _watcher(activities)
-    watch.poll()
+    """It is excluded by NAME, which only the settled case can show.
 
-    buffer = activities / "inprogressactivity.fit"
-    for size in (10, 20, 20, 30, 30):
-        _write(buffer, size=size)
-        assert watch.poll() is False, "the live recording buffer was reported"
+    Rewriting the buffer before every poll - which is what this test used to
+    do - proves nothing about the name: (mtime, size) never repeats, so the
+    settle rule alone refuses it and the identical loop passes for an
+    ordinary ride. So the buffer is allowed to settle here exactly as a real
+    file would, with a real .fit going through the same polls as the control.
+    Zwift does pause between writes, so a settled buffer is the real case.
+    """
+    watch = _watcher(activities)
+    watch.poll()  # cold pass
+
+    buffer = _write(activities / "inprogressactivity.fit", size=64)
+    assert watch.poll() is False, "reported a file first seen this pass"
+    # Unchanged between two passes: settled, and still not reported.
+    assert watch.poll() is False, "the live recording buffer was reported"
+    assert watch.poll() is False
+    assert str(buffer) not in str(watch._reported)
+
+    # The control, on the same watcher and the same polls: a file that differs
+    # only in its name does get through, so the refusal above is the name.
+    _write(activities / "ride.fit", size=64)
+    watch.poll()
+    assert watch.poll() is True
 
 
 def test_files_the_listing_would_not_offer_are_never_reported(activities):
@@ -164,22 +180,48 @@ def test_the_watcher_asks_the_listing_whether_a_file_is_in_scope(
 
 
 def test_a_removed_file_is_not_news_but_is_forgotten(activities):
-    """Nothing to import in a deletion - but the name must be reusable."""
+    """Nothing to import in a deletion - but the bookkeeping must let go.
+
+    The "forgotten" half is asserted on ``_reported`` directly, because
+    recreating the file cannot show it: the new copy gets a fresh mtime, so it
+    is news whether or not the old entry was ever dropped. Without the purge
+    ``_reported`` grows forever on a folder that is regularly archived out,
+    and that is what is checked here.
+    """
     watch = _watcher(activities)
     watch.poll()
     ride = _write(activities / "ride.fit", size=64)
     watch.poll()
     assert watch.poll() is True  # settled and reported
+    assert len(watch._reported) == 1, "nothing was recorded as reported"
 
     ride.unlink()
     assert watch.poll() is False, "a deletion asked the server to scan"
+    assert watch._reported == {}, "a file that went away is still remembered"
     assert watch.poll() is False
 
-    # Same name, same size, back again: news a second time, because the
-    # bookkeeping let go of it when it went away.
+    # Same name back again: news a second time.
     _write(ride, size=64)
     watch.poll()
     assert watch.poll() is True
+
+
+def test_a_directory_named_like_a_ride_is_never_reported(activities):
+    """The name predicate says yes to anything ending .fit, directory or not.
+
+    ``entry.is_file()`` is the only thing between a folder called
+    ``2026-01-01.fit`` - an archive a rider unpacked in place, or a Zwift
+    install that keeps one - and a settled report on every pass, since a
+    directory's size and mtime sit still. The listing would never offer it,
+    so every scan it triggered would import nothing.
+    """
+    watch = _watcher(activities)
+    watch.poll()  # cold pass
+
+    (activities / "2026-01-01.fit").mkdir()
+    assert watch.poll() is False, "reported a directory first seen this pass"
+    assert watch.poll() is False, "a directory named *.fit was reported"
+    assert watch.poll() is False
 
 
 def test_a_folder_that_is_not_there_yet_is_not_an_error(tmp_path):
@@ -294,6 +336,144 @@ def test_a_send_that_fails_keeps_the_news_for_next_time(activities):
     connector._peer = _BrokenPeer()
     _run(connector._flush_activity_signal())
     assert connector._activities_dirty is True
+
+
+def test_the_news_goes_out_when_the_session_itself_connects(
+    activities, monkeypatch
+):
+    """The wiring, not just the method the wiring calls.
+
+    ``_flush_activity_signal`` is well covered above, but every one of those
+    tests calls it by hand. Deleting the single line in ``_connected_session``
+    that calls it leaves them all green while a ride noticed offline is never
+    reported again - so this drives a real session over a fake socket and
+    watches the frame leave. The order matters too: a buffered ride is the
+    more perishable thing and goes first.
+    """
+    import asyncio
+    import json
+
+    from wattracker import rpc
+    from wattracker_connector import client as clientmod
+
+    order = []
+    # Runs in a worker thread via to_thread; the session awaits it, so the
+    # append is ordered against the socket writes regardless.
+    monkeypatch.setattr(
+        clientmod, "upload_pending",
+        lambda *a, **k: order.append("the buffered ride"),
+    )
+    connector = clientmod.Connector(
+        server_url="http://server.invalid:8000", token="t",
+        config=ConnectorConfig(activities_dir=str(activities), workouts_dir=None),
+    )
+    # As if the watcher had noticed a ride land while the socket was down.
+    connector._activities_dirty = True
+
+    class _Connection:
+        greeted = False
+
+        async def send(self, text):
+            order.append(json.loads(text).get("event"))
+
+        async def recv(self):
+            if not self.greeted:
+                self.greeted = True
+                return json.dumps(
+                    {"event": "hello", "protocol": rpc.PROTOCOL_VERSION}
+                )
+            raise RuntimeError("the socket went away")
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *exc):
+            return False
+
+    class _Websockets:
+        def connect(self, url, **kwargs):
+            return _Connection()
+
+    with pytest.raises(RuntimeError):
+        asyncio.run(
+            connector._connected_session(
+                _Websockets(), "ws://host:8000/connector/ws"
+            )
+        )
+
+    assert order == ["the buffered ride", "activities.changed"], order
+    assert connector._activities_dirty is False
+
+
+def test_the_folder_watcher_stops_when_the_connector_does(
+    activities, monkeypatch
+):
+    """A watcher left running after run_forever returns is a leaked task.
+
+    Nothing else notices: the tray quits, the loop is torn down, and the
+    orphan is cancelled by the interpreter on its way out - which is why
+    removing the cancel breaks no other test. It matters where the loop
+    outlives the connector (the tray restarts one after a re-pair), where a
+    second watcher would then be polling the same folder.
+    """
+    from wattracker_connector import client as clientmod
+
+    connector = clientmod.Connector(
+        server_url="http://server.invalid:8000", token="t",
+        config=ConnectorConfig(activities_dir=str(activities), workouts_dir=None),
+        scan_interval=60,
+    )
+    started = []
+    real_start = connector._start_activity_watch
+
+    def _spy():
+        task = real_start()
+        started.append(task)
+        return task
+
+    connector._start_activity_watch = _spy
+
+    async def _one_session():
+        connector.stop()
+
+    monkeypatch.setattr(connector, "_session", _one_session)
+
+    async def _drive():
+        await connector.run_forever()
+        # Asked before the loop is torn down: asyncio.run cancels stragglers
+        # itself on the way out, so asking afterwards would pass either way.
+        return started[0].cancelled()
+
+    assert _run(_drive()) is True, "the folder watcher outlived the connector"
+
+
+def test_a_background_task_that_died_on_its_own_says_so(caplog):
+    """Shutdown swallowing a crash is how a dead watcher looks healthy.
+
+    ``_cancel`` has to tolerate the CancelledError it just caused, but the
+    same except was catching every other exception too - so a watcher that
+    fell over hours ago produced not one line anywhere, and the connector went
+    on reporting nothing with a green tray icon.
+    """
+    import asyncio
+
+    from wattracker_connector import client as clientmod
+
+    async def _drive():
+        async def _boom():
+            raise RuntimeError("the folder watcher fell over")
+
+        task = asyncio.create_task(_boom())
+        await asyncio.sleep(0)   # let it fail before anyone cancels it
+        await clientmod._cancel(task)
+
+    with caplog.at_level("WARNING", logger="wattracker_connector.client"):
+        _run(_drive())
+
+    assert any(
+        "background connector task failed" in record.getMessage()
+        for record in caplog.records
+    ), "a crashed background task was swallowed in silence"
 
 
 # ------------------------------------------------- the server acting on it
@@ -494,6 +674,117 @@ def test_news_arriving_during_a_running_scan_is_owed_not_lost(monkeypatch):
             "news arriving during a running scan was dropped"
     finally:
         servermod.reset_auto_work_limits()
+
+
+def test_the_event_scans_the_socket_s_own_account_and_no_other(
+    client, zwift_home, monkeypatch, tmp_path
+):
+    """What binds the scan to a user is the socket, not the payload.
+
+    The event carries no user, and must not start doing so by accident: this
+    is the one connector-originated message that starts work against a
+    database row. A payload naming somebody else has to be inert - not merely
+    tolerated because it arrived on an authenticated socket, which is what
+    every other test here would still show if the handler read the id off the
+    wire.
+    """
+    monkeypatch.setenv("WATTRACKER_MODE", "server")
+    redirect_home(monkeypatch, str(zwift_home.parent))
+    monkeypatch.setattr(importer, "parse_fit", _distinct_parser())
+
+    victim_home = tmp_path / "victim"
+    (victim_home / "Activities").mkdir(parents=True)
+    (victim_home / "Activities" / "victim.fit").write_bytes(b"secret")
+    victim = _register(client, "victim")
+    db.save_user_settings(
+        victim, {"activities_dir": str(victim_home / "Activities")}
+    )
+    client.post("/logout")
+
+    attacker = _register(client, "attacker")
+    # Both accounts really exist and really differ, or the whole test is
+    # vacuous - it would "pass" against a victim that was never there.
+    assert attacker and victim and attacker != victim
+    db.save_user_settings(
+        attacker, {"activities_dir": str(zwift_home / "Activities")}
+    )
+    (zwift_home / "Activities" / "ride.fit").write_bytes(b"dummy")
+
+    attached, _config = attach_connector(client, attacker, zwift_home)
+    with attached as connector:
+        connector.send_event(
+            "activities.changed", user_id=victim, uid=victim,
+            directory=str(victim_home / "Activities"),
+        )
+        # It is accepted, and it scans the account that owns the socket - so
+        # the assertions below are about WHOSE scan ran, not about the event
+        # having been dropped for some other reason.
+        _wait_for(lambda: len(db.list_activities(attacker)) == 1,
+                  what="the attacker's own scan")
+        _wait_idle(client)
+        time.sleep(0.3)
+
+    assert db.list_activities(victim) == [], "the event scanned another account"
+    assert ("scan", victim) not in servermod._auto_work_at, \
+        "the event spent another account's rate-limit slot"
+    assert victim not in servermod._scan_status, \
+        "the event started a scan recorded against another account"
+
+
+def test_a_refused_scan_does_not_push_the_window_forward():
+    """Being told no must not cost the same as being told yes.
+
+    Recording the time on the refusal branch too would mean a connector asking
+    faster than the window never gets another slot at all - its own user
+    starved by its own asking, permanently. The same invariant the password
+    hash limiter holds, and the same shape of bug.
+    """
+    servermod.reset_auto_work_limits()
+    try:
+        interval = 0.4
+        granted = 0
+        start = time.monotonic()
+        while time.monotonic() - start < 3 * interval:
+            if servermod._claim_auto_slot("scan", 9191, interval):
+                granted += 1
+            time.sleep(interval / 20)
+        assert granted >= 3, (
+            f"only {granted} slot(s) granted over 3 windows: a refused claim "
+            "moved the window"
+        )
+    finally:
+        servermod.reset_auto_work_limits()
+
+
+def test_a_burst_of_refused_events_holds_one_scan_not_hundreds():
+    """The deferral is one task per user, and counting tasks is the only proof.
+
+    ``_auto_scan_replays`` is keyed by user id, so the dict stays size 1 even
+    if the early return goes: what multiplies is the tasks, one per frame, all
+    sleeping on the same window and all waking to run a scan. A connector in a
+    reconnect loop is exactly the peer that produces the burst.
+    """
+    import asyncio
+
+    async def _drive():
+        servermod.reset_auto_work_limits()
+        # A slot already spent, so every defer below is a genuine refusal.
+        servermod._auto_work_at[("scan", 5150)] = time.monotonic()
+        for _ in range(200):
+            servermod._defer_auto_scan(5150, "the connector reported new files")
+        pending = [
+            task for task in asyncio.all_tasks()
+            if "_replay_owed_scan" in repr(task.get_coro())
+        ]
+        for task in pending:
+            task.cancel()
+        return len(pending)
+
+    try:
+        made = asyncio.run(_drive())
+    finally:
+        servermod.reset_auto_work_limits()
+    assert made <= 1, f"{made} replay tasks created for 200 events"
 
 
 def test_the_rescan_button_is_never_rate_limited(

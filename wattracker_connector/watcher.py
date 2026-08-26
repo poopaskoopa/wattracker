@@ -30,6 +30,16 @@ now" every minute would move the clock across the wire and change nothing: the
 server would still make an ``activities.list`` round trip per tick. Reporting
 only differences means an idle connector costs nothing at all, and a finished
 ride costs exactly one frame.
+
+One consequence of both decisions, stated here so it is not mistaken for a
+bug: the cold-start report is not instant. ``poll`` reports unconditionally on
+its first pass, but the loop that calls it sleeps *before* polling, so a
+connector that has just started tells the server nothing for one whole
+interval - a minute by default. Worse, a connector crash-looping faster than
+that never completes a first poll at all, and so never reports anything; the
+rides it should have announced wait for the server's daily sweep. That is the
+intended fallback rather than a second mechanism here, because a connector
+that cannot stay up for a minute has a problem this module cannot fix.
 """
 from __future__ import annotations
 
