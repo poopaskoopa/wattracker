@@ -42,14 +42,30 @@ not visible to the pusher, so a force-push cannot be checked against it.
 `--force-with-lease=<branch>:<sha>` against an explicitly stated SHA, never a
 bare `--force`. If the lease fails, stop and look — do not retry harder.
 
-A `pre-push` hook enforcing both of these ships in `scripts/hooks/`. Install it
-in every clone, first thing:
+A `pre-push` hook backing this up ships in `scripts/hooks/`. Install it in
+every clone, first thing:
 
 ```sh
 scripts/hooks/install.sh
 ```
 
-It refuses direct pushes to `main` and non-fast-forward pushes to any branch.
+It refuses direct pushes to `main`, and it refuses a rewrite of a shared
+branch that would drop remote work with no counterpart here — naming the
+commits it would have stranded. A rebase is not such a rewrite: replaying your
+own commits onto merged `main` loses nothing, and the hook lets it through.
+
+It judges by patch content, and that is not the same as identity. It can miss
+a remote commit whose changes exist here under a different author or message,
+and it does not look inside merge commits, so a conflict resolution recorded
+only in one is not seen. In the other direction, an amend or a squash of your
+own commits will trip it; read the list it prints, and if the work is already
+in what you are pushing, `--no-verify` is the intended answer.
+
+The hook cannot check the lease. Git hands `pre-push` only ref names and
+shas on stdin, never the command line, so `--force-with-lease` is invisible to
+it and stays a convention you keep rather than a rule it enforces. It judges
+the shas instead, which catches the same mistake from the other end.
+
 It is a guardrail against an honest mistake, not a control — `--no-verify`
 bypasses it, and that is fine, because the failure being prevented is a
 reflex, not an adversary. PR merges go through the GitHub API and are
