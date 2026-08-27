@@ -149,6 +149,12 @@ class RideController:
         self.started_at = started_at
         self.activity_id: Optional[int] = None
         self.saved_record: Optional[dict] = None
+        # ``tick`` is deterministic for simulations and replay. Live polling
+        # can additionally provide the monotonic time at which a sample was
+        # read, so a slow event-loop iteration cannot make the workout clock
+        # lose time.
+        self._poll_clock: Optional[float] = None
+        self._poll_power_positive = False
 
     # ---------------------------------------------------------- targets
     def target_fraction(self, t: float) -> float:
@@ -272,8 +278,25 @@ class RideController:
                     self._finish()
         return self.state()
 
-    def poll(self, dt: float = 1.0) -> dict:
-        """Read the attached sources (advancing simulated ones), then tick."""
+    def poll(
+        self,
+        dt: float = 1.0,
+        *,
+        now: Optional[float] = None,
+        minimum_dt: float = 0.0,
+        maximum_dt: Optional[float] = None,
+    ) -> dict:
+        """Read the attached sources (advancing simulated ones), then tick.
+
+        When ``now`` is supplied it is a monotonic timestamp. The elapsed
+        interval is measured between polls rather than assumed to be one
+        second. ``minimum_dt`` preserves the old one-sample-per-second
+        fallback for callers that intentionally run the loop faster than real
+        time. ``maximum_dt`` bounds it from the other side: a poll that
+        arrives after a stall did not observe the gap, so the gap is not
+        charged to the workout. Idle and paused gaps are never charged to the
+        workout when the first positive sample arrives.
+        """
         advanced = set()
         for src in (self.power_source, self.cadence_source, self.hr_source):
             if src is None or id(src) in advanced:
@@ -287,7 +310,65 @@ class RideController:
         if cad is None and self.cadence_source is not None:
             cad = self.cadence_source.latest_cadence()
         hr = self.hr_source.latest_hr() if self.hr_source else None
-        return self.tick(power=int(p or 0), cadence=cad, hr=hr, dt=dt)
+        p = int(p or 0)
+        if now is None:
+            # An explicit-dt poll is deterministic just like a direct tick.
+            # Clear any previous wall-clock baseline so switching back to
+            # deterministic replay cannot charge its elapsed time.
+            self._poll_clock = None
+            self._poll_power_positive = p > 0
+            poll_dt = dt
+        else:
+            now = float(now)
+            previous_positive = self._poll_power_positive
+            if self._poll_clock is None:
+                wall_dt = 0.0
+            else:
+                wall_dt = max(0.0, now - self._poll_clock)
+            self._poll_clock = now
+            self._poll_power_positive = p > 0
+
+            floor_dt = max(0.0, float(minimum_dt))
+            if maximum_dt is None:
+                # Live callers pass their loop cadence; without one, allow a
+                # couple of seconds of ordinary lateness but always stay
+                # under the grace, so that no single poll can run the
+                # zero-power timer out and end a ride by itself. The
+                # protection comes from what is charged when the ceiling is
+                # crossed (one ordinary sample, below), not from its value.
+                ceiling_dt = min(2.0, self.zero_grace_s * 0.9)
+            else:
+                ceiling_dt = float(maximum_dt)
+            ceiling_dt = max(ceiling_dt, floor_dt)
+            elapsed_dt = max(wall_dt, floor_dt)
+            if elapsed_dt > ceiling_dt:
+                # Nothing was measured across the gap, so charge one ordinary
+                # sample instead of the whole stall. Never charge nothing:
+                # ``elapsed`` has to keep step with the one-per-poll sample
+                # stream the ride file is built from.
+                elapsed_dt = floor_dt or ceiling_dt or wall_dt
+                _log.warning(
+                    "ride poll stalled for %.3fs; charging %.3fs to the "
+                    "workout clock",
+                    wall_dt, elapsed_dt,
+                )
+            if p > 0 and (
+                (self.status in (IDLE, STARTING) and not previous_positive)
+                or self.status == PAUSED
+            ):
+                # There is no way to know how long the rider had been
+                # pedalling before this sample, or how long they were paused.
+                # Count only the normal sample floor on the transition, never
+                # the entire idle/paused wall-clock gap.
+                poll_dt = floor_dt
+            else:
+                poll_dt = elapsed_dt
+        return self.tick(power=p, cadence=cad, hr=hr, dt=poll_dt)
+
+    def sync_poll_clock(self, now: Optional[float] = None) -> None:
+        """Reset the wall-clock polling baseline after an out-of-band replay."""
+        self._poll_clock = None if now is None else float(now)
+        self._poll_power_positive = self.current_power > 0
 
     def stop(self) -> dict:
         """Manual stop/finish."""

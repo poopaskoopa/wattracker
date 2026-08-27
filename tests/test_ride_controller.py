@@ -176,6 +176,60 @@ def test_poll_drives_from_simulated_sources():
     assert c.status == "paused"           # zeros after start -> pause, not finish
 
 
+def test_poll_uses_monotonic_intervals_for_live_samples():
+    c = RideController(
+        _two_block_session(), 200,
+        power_source=SimulatedPowerSource([120, 120, 120]),
+        start_grace_s=0,
+        autosave=False,
+    )
+
+    assert c.poll(now=10.0)["elapsed"] == 0
+    assert c.poll(now=11.5)["elapsed"] == 1.5
+    # A 2.5-second gap is past the default stall ceiling, so this poll says
+    # explicitly that it was measured rather than stalled.
+    assert c.poll(now=14.0, maximum_dt=5.0)["elapsed"] == 4.0
+
+
+def test_poll_does_not_charge_idle_or_paused_wall_clock_gaps():
+    c = RideController(
+        _two_block_session(), 200,
+        power_source=SimulatedPowerSource(
+            [0, 120, 120, 120, 120, 120, 0, 0, 120, 120]
+        ),
+        start_grace_s=3,
+        zero_grace_s=3,
+        autosave=False,
+    )
+
+    c.poll(now=0.0)       # idle
+    c.poll(now=100.0)     # first pedal sample: no 100-second start gate
+    c.poll(now=101.0)
+    c.poll(now=102.0)
+    assert c.poll(now=103.0)["status"] == "running"
+    assert c.poll(now=104.0)["elapsed"] == 1.0
+
+    c.poll(now=105.0)
+    assert c.poll(now=107.0)["status"] == "paused"
+    c.poll(now=207.0)     # resume: no 100-second paused interval
+    assert c.poll(now=208.0)["elapsed"] == 2.0
+
+
+def test_sync_poll_clock_excludes_time_spent_replaying_samples():
+    c = RideController(
+        _two_block_session(), 200,
+        power_source=SimulatedPowerSource([120, 120]),
+        start_grace_s=0,
+        autosave=False,
+    )
+
+    c.poll(now=10.0)
+    c.tick(power=120, dt=5.0)  # connector replay, not wall-clock time
+    c.sync_poll_clock(now=100.0)
+
+    assert c.poll(now=101.0)["elapsed"] == 6.0
+
+
 def test_poll_uses_standalone_cadence_when_power_source_has_none():
     class CadenceOnly:
         def __init__(self, cadence):
@@ -664,3 +718,141 @@ def test_cooldown_never_returns_to_running_or_paused():
     assert c.status == "cooldown"
     c.tick(power=120, dt=1)
     assert c.status == "cooldown"
+
+
+def _polled_to_cooldown(user_id=None, autosave=False, zero_grace_s=3.0):
+    """A controller polled on a live clock that is now spinning down."""
+    c = RideController(
+        _two_block_session(), 200, user_id=user_id,
+        power_source=SimulatedPowerSource([150] * 20 + [0] * 60),
+        start_grace_s=0, zero_grace_s=zero_grace_s, autosave=autosave,
+    )
+    now = 0.0
+    while c.status != "cooldown":
+        now += 1.0
+        c.poll(now=now, minimum_dt=1.0)
+        assert now < 60.0, "never reached cooldown"
+    return c, now
+
+
+def _polled_to_running(zero_grace_s=3.0, keep_pedalling=True,
+                       minimum_dt=1.0):
+    """A controller three live polls into a ride, still pedalling."""
+    tail = [150] * 60 if keep_pedalling else [0] * 60
+    c = RideController(
+        _two_block_session(), 200,
+        power_source=SimulatedPowerSource([150] * 3 + tail),
+        start_grace_s=0, zero_grace_s=zero_grace_s, autosave=False,
+    )
+    now = 0.0
+    for _ in range(3):
+        now += 1.0
+        c.poll(now=now, minimum_dt=minimum_dt)
+    assert c.status == "running"
+    return c, now
+
+
+@pytest.mark.parametrize("gap", [3.0, 5.0, 30.0, 600.0])
+def test_one_stalled_poll_never_ends_a_cooldown_ride(user_id, gap):
+    c, now = _polled_to_cooldown(user_id=user_id, autosave=True)
+    elapsed = c.elapsed
+
+    state = c.poll(now=now + gap, minimum_dt=1.0)
+
+    assert state["status"] == "cooldown"
+    assert c.activity_id is None
+    assert db.list_activities(user_id) == []
+    assert c.elapsed == elapsed  # zero power never clocks ride time anyway
+    assert c.state()["no_power_s"] == 1.0  # the sample floor, not the stall
+
+
+@pytest.mark.parametrize("gap", [3.0, 5.0, 30.0, 600.0])
+def test_one_stalled_poll_never_pauses_a_running_ride(gap):
+    c, now = _polled_to_running(keep_pedalling=False)
+
+    assert c.poll(now=now + gap, minimum_dt=1.0)["status"] == "running"
+
+
+def test_repeated_stalled_polls_still_finish_the_ride(user_id):
+    # A stalled sample is charged the ordinary floor, not dropped: three
+    # zero-power seconds still end the ride, they just take three polls.
+    c, now = _polled_to_cooldown(user_id=user_id, autosave=True)
+    for _ in range(2):
+        now += 30.0
+        assert c.poll(now=now, minimum_dt=1.0)["status"] == "cooldown"
+    assert c.poll(now=now + 30.0, minimum_dt=1.0)["status"] == "finished"
+    assert c.activity_id is not None
+    assert len(db.list_activities(user_id)) == 1
+
+
+def test_stall_ceiling_stays_under_a_short_zero_grace():
+    # The default ceiling is two seconds of ordinary lateness, but never so
+    # much that one poll could spend a shorter grace than that.
+    c, now = _polled_to_running(zero_grace_s=2.0, minimum_dt=0.5)
+    elapsed = c.elapsed
+
+    # Inside the ceiling (0.9 * 2.0 = 1.8s), lateness is real ride time...
+    assert c.poll(now=now + 1.5, minimum_dt=0.5)["elapsed"] == elapsed + 1.5
+    # ...beyond it the gap is an unobserved stall worth one sample.
+    assert c.poll(now=now + 1.5 + 2.0, minimum_dt=0.5)["elapsed"] == (
+        elapsed + 2.0
+    )
+
+
+def test_a_clamped_poll_never_freezes_the_workout_clock():
+    # With no declared sample floor the clamp still has to charge something:
+    # the ride file is built one sample per poll, so a charge of zero would
+    # drift ``elapsed`` behind the samples it is the duration of.
+    c, now = _polled_to_running()
+    elapsed = c.elapsed
+
+    assert c.poll(now=now + 30.0)["elapsed"] == elapsed + 2.0
+
+
+def test_stalled_poll_ceiling_is_overridable_by_the_caller():
+    c, now = _polled_to_running()
+    elapsed = c.elapsed
+
+    assert c.poll(now=now + 2.5, minimum_dt=1.0, maximum_dt=5.0)["elapsed"] == (
+        elapsed + 2.5
+    )
+
+
+def test_poll_floor_charges_a_full_second_to_a_faster_than_real_time_loop():
+    # Production polls with ``minimum_dt=1.0``; a loop iterating faster than
+    # once a second still clocks one workout second per sample.
+    c, now = _polled_to_running()
+    elapsed = c.elapsed
+    for i in range(1, 4):
+        assert c.poll(now=now + i * 0.05, minimum_dt=1.0)["elapsed"] == (
+            elapsed + i
+        )
+
+
+def test_ordinary_late_ticks_still_clock_their_real_elapsed_time():
+    # The clock-drift fix: a loop running 1.2s behind must charge 1.2s, not
+    # 1.0s. The stall ceiling must not quietly clamp that back.
+    c, now = _polled_to_running()
+    elapsed = c.elapsed
+    for i in range(1, 6):
+        state = c.poll(now=now + i * 1.2, minimum_dt=1.0)
+    assert state["elapsed"] == pytest.approx(elapsed + 6.0)
+
+
+def test_resuming_from_paused_charges_only_one_sample_not_the_gap():
+    # The idle/paused transition guard, exercised with a gap the stall
+    # ceiling never touches: resuming after 1.2s must charge the ordinary
+    # sample, not the interval the rider spent stopped.
+    c = RideController(
+        _two_block_session(), 200,
+        power_source=SimulatedPowerSource([150, 0, 0, 0, 150, 150]),
+        start_grace_s=0, zero_grace_s=3.0, autosave=False,
+    )
+    now = 0.0
+    for _ in range(4):
+        now += 1.0
+        c.poll(now=now, minimum_dt=1.0)
+    assert c.status == "paused"
+    elapsed = c.elapsed
+
+    assert c.poll(now=now + 1.2, minimum_dt=1.0)["elapsed"] == elapsed + 1.0
