@@ -58,13 +58,14 @@
 {% endif %}
 
 {% if results or bests %}
-<div class="unit-toggle" data-weight="{{ weight_kg or '' }}">
+<div class="unit-toggle" data-weight="{{ weight_kg or '' }}"
+     data-can-wkg="{{ '1' if can_show_wkg else '' }}">
     <span class="hint">Units:</span>
     <button type="button" id="unitW" class="unit-btn active">W</button>
     <button type="button" id="unitWkg" class="unit-btn"
-            {{ 'disabled' if not weight_kg else '' }}>W/kg</button>
-    {% if weight_kg %}
-    <span class="hint">(at {{ weight_kg }} kg)</span>
+            {{ 'disabled' if not can_show_wkg else '' }}>W/kg</button>
+    {% if can_show_wkg %}
+    <span class="hint">(each race at the weight it was ridden at)</span>
     {% else %}
     <span class="hint">W/kg needs your weight &mdash; refresh results with
         Zwift credentials or set it in <a href="/settings">Settings</a>.</span>
@@ -156,11 +157,15 @@
     var toggle = document.querySelector(".unit-toggle");
     if (!toggle) return;
     var weight = parseFloat(toggle.dataset.weight);
+    // Rows carry their own divisor, so W/kg is offerable even with no
+    // page-level current weight; `weight` stays the fallback for rows that
+    // have none (the all-time bests row).
+    var canWkg = toggle.dataset.canWkg === "1";
     var btnW = document.getElementById("unitW");
     var btnWkg = document.getElementById("unitWkg");
 
     function apply(mode) {
-        var wkg = mode === "wkg" && weight > 0;
+        var wkg = mode === "wkg" && canWkg;
         document.querySelectorAll(".pw").forEach(function (el) {
             var w = parseFloat(el.dataset.w);
             // Each race row is divided by its own resolved weight (the weight
@@ -183,7 +188,7 @@
 
     var saved = "w";
     try { saved = localStorage.getItem("tr_power_unit") || "w"; } catch (e) {}
-    if (saved === "wkg" && weight > 0) apply("wkg");
+    if (saved === "wkg" && canWkg) apply("wkg");
 })();
 
 // -------- sortable race table (vanilla JS; sorts by data-sort keys) --------

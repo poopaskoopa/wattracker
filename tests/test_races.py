@@ -817,7 +817,10 @@ def test_toggle_enabled_with_weight_and_settings_override(client):
     client.post("/races/refresh", data={"rider_id": ""})
     text = client.get("/races").text
     assert 'data-weight="68.0"' in text
-    assert "(at 68.0 kg)" in text
+    # The header no longer claims one weight for the whole table: each row is
+    # divided by the weight it was ridden at.
+    assert "(each race at the weight it was ridden at)" in text
+    assert "(at 68.0 kg)" not in text
     # Enabled toggle: the W/kg button carries no disabled attribute.
     import re
 

@@ -21,7 +21,13 @@ from typing import Callable, Dict, Iterator, List, Optional, Sequence, Union
 from .config import db_path
 from .config import _restrict
 from .paths import safe_zwift_id
-from .timeutil import utc_now, valid_timezone
+from .timeutil import (
+    local_today,
+    parse_naive,
+    to_user_timezone,
+    utc_now,
+    valid_timezone,
+)
 
 _log = logging.getLogger(__name__)
 
@@ -119,6 +125,64 @@ CREATE TABLE IF NOT EXISTS weight_history (
 """
 
 
+def _user_timezones(conn: sqlite3.Connection) -> Dict[int, Optional[str]]:
+    """Each user's saved IANA timezone, for migrations that date rows locally.
+
+    Missing column/table (a database old enough to predate either) yields an
+    empty map, and every caller then falls back to UTC - a migration must
+    still complete on such a database rather than abort the upgrade.
+    """
+    try:
+        rows = conn.execute(
+            "SELECT user_id, timezone FROM user_settings"
+        ).fetchall()
+    except sqlite3.OperationalError:
+        return {}
+    return {r["user_id"]: r["timezone"] for r in rows}
+
+
+def _promote_weight_scalar(conn: sqlite3.Connection) -> None:
+    """v33 -> v34: file the rider's typed weight as a manual weigh-in today.
+
+    ``user_settings.weight_kg`` is the number the rider typed, and before this
+    version it WAS the divisor for every W/kg on the site. Left as a bare
+    scalar it would be shadowed the moment any history row existed
+    (``weight_resolution`` prefers history), so an archived race weight would
+    become the divisor for today's rides and today's numbers would silently
+    change at upgrade. Promoting it to a dated row keeps it the latest word:
+    it is dated the rider's local upgrade day, so it wins for current rides,
+    and it is ``manual``, so no Zwift-derived write can ever displace it.
+
+    Runs BEFORE _backfill_weight_history: both insert with ON CONFLICT DO
+    NOTHING, so writing the manual row first is what makes it win the upgrade
+    day against a race ridden the same day - which is the precedence
+    record_weight enforces everywhere else (manual > zwift_ride). A row that
+    somehow already exists for that date is left alone. A missing, unusable or
+    non-positive scalar promotes nothing: there is no measurement to file.
+    """
+    conn.execute(_WEIGHT_HISTORY_DDL)
+    zones = _user_timezones(conn)
+    try:
+        rows = conn.execute(
+            "SELECT user_id, weight_kg FROM user_settings "
+            "WHERE weight_kg IS NOT NULL"
+        ).fetchall()
+    except sqlite3.OperationalError:
+        return
+    now = utc_now()
+    for row in rows:
+        weight = _positive_finite(row["weight_kg"])
+        if weight is None:
+            continue
+        date = local_today(zones.get(row["user_id"]), now).isoformat()
+        conn.execute(
+            "INSERT INTO weight_history (user_id, date, weight_kg, source) "
+            "VALUES (?, ?, ?, 'manual') "
+            "ON CONFLICT(user_id, date) DO NOTHING",
+            (row["user_id"], date, weight),
+        )
+
+
 def _backfill_weight_history(conn: sqlite3.Connection) -> None:
     """v33 -> v34: seed weight_history from the per-ride Zwift weights.
 
@@ -129,19 +193,50 @@ def _backfill_weight_history(conn: sqlite3.Connection) -> None:
     backfill). Running it here is what makes the upgrade keep data.
 
     Each Zwift race already carried the rider's weight for its own date, so
-    reusing those values as the first history rows re-uses a measurement
-    Zwift actually reported, one per date (ON CONFLICT keeps one). The
-    settings scalar is deliberately NOT promoted to a dated row: that would
-    fabricate a measurement on a date with no evidence for it and could
-    regress a value the rider typed more recently.
+    reusing those values as the first history rows re-uses a measurement Zwift
+    actually reported, one per date (ON CONFLICT keeps one).
+
+    The dates need converting: ``race_results.event_date`` is a UTC date while
+    this table is keyed on the rider's LOCAL date, so a race ridden at 05:30Z
+    west of Greenwich would be filed a day late and disagree with the ride
+    page. A date alone cannot be converted - only an instant can - so the
+    matching imported ride supplies the time of day and the conversion is the
+    same one pipeline.py and power_profile.py do. A race with no imported ride
+    keeps its own date: there is no instant to convert, and no other page
+    resolves that ride, so nothing can disagree about it.
+
+    Rows are taken oldest first, so when two UTC dates collapse onto one local
+    date the earlier race wins deterministically; the rider's own typed weight
+    is filed first (see _promote_weight_scalar) and outranks all of this.
     """
     conn.execute(_WEIGHT_HISTORY_DDL)
-    conn.execute(
-        "INSERT INTO weight_history (user_id, date, weight_kg, source) "
-        "SELECT user_id, event_date, weight_kg, 'zwift_ride' "
-        "FROM race_results WHERE weight_kg IS NOT NULL "
-        "ON CONFLICT(user_id, date) DO NOTHING"
-    )
+    zones = _user_timezones(conn)
+    rows = conn.execute(
+        "SELECT user_id, event_date, weight_kg, duration_s FROM race_results "
+        "WHERE weight_kg IS NOT NULL ORDER BY event_date ASC, rowid ASC"
+    ).fetchall()
+    for row in rows:
+        date = row["event_date"]
+        if not date:
+            continue
+        ride = conn.execute(
+            "SELECT start_time FROM activities WHERE user_id = ? "
+            "AND start_time LIKE ? "
+            "ORDER BY ABS(COALESCE(duration_s, 0) - ?) ASC, start_time ASC "
+            "LIMIT 1",
+            (row["user_id"], date + "%", row["duration_s"] or 0),
+        ).fetchone()
+        started = parse_naive(ride["start_time"]) if ride is not None else None
+        if started is not None:
+            date = to_user_timezone(
+                started, zones.get(row["user_id"])
+            ).date().isoformat()
+        conn.execute(
+            "INSERT INTO weight_history (user_id, date, weight_kg, source) "
+            "VALUES (?, ?, ?, 'zwift_ride') "
+            "ON CONFLICT(user_id, date) DO NOTHING",
+            (row["user_id"], date, row["weight_kg"]),
+        )
 
 
 # In-place migrations: version N -> N+1 statement lists. A database whose
@@ -318,9 +413,12 @@ _MIGRATIONS: Dict[int, Sequence[Union[str, Callable[[sqlite3.Connection], None]]
         "ALTER TABLE plan_workouts ADD COLUMN prev_tss REAL",
     ],
     33: [
-        # New table weight_history (created by the callable, which also seeds
+        # New table weight_history (created by the callables, which also seed
         # it - see _backfill_weight_history for why the DDL cannot wait for
-        # _SCHEMA).
+        # _SCHEMA). Order matters: the rider's typed scalar is filed as a
+        # manual weigh-in first so it wins the upgrade day, then the historical
+        # race weights fill the dates it does not cover.
+        _promote_weight_scalar,
         _backfill_weight_history,
     ],
 }
@@ -2413,9 +2511,11 @@ def record_weight(
     After a successful write the legacy scalar is re-synced to the invariant
     "user_settings.weight_kg is the weight of the latest-dated row", so
     consumers that still read the scalar (durability, the settings echo, the
-    rider-profile snapshot) never diverge from the history. When no row exists
-    at all the scalar is left alone: a value the rider typed in Settings is
-    still a fallback, not a discarded measurement.
+    rider-profile snapshot) never diverge from the history. That re-sync is
+    safe to apply unconditionally because the scalar is no longer a value only
+    the scalar holds: the v34 migration files any typed weight as a manual
+    weigh-in of its own (_promote_weight_scalar), so nothing is lost when a
+    backfilled historical row later becomes the latest one.
     """
     weight = _positive_finite(weight_kg)
     if weight is None:
@@ -3526,6 +3626,25 @@ def rollback_feedback_for_workout(
         )
         conn.commit()
         return True
+    finally:
+        conn.close()
+
+
+def activity_start_time(
+    user_id: int, activity_id: int, path: Optional[str] = None
+) -> Optional[str]:
+    """One activity's stored (UTC) start_time, without loading its streams.
+
+    Callers that only need the ride's instant - to convert it to the rider's
+    local date, say - would otherwise pay for the whole activity row.
+    """
+    conn = connect(path)
+    try:
+        row = conn.execute(
+            "SELECT start_time FROM activities WHERE user_id = ? AND id = ?",
+            (user_id, activity_id),
+        ).fetchone()
+        return row["start_time"] if row is not None else None
     finally:
         conn.close()
 

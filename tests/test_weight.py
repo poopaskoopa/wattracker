@@ -9,8 +9,9 @@ sync (local today) - and resolves "what did this ride happen at" per record.
 
 Two invariants this module pins:
 
-1. The v33 -> v34 migration backfills from ``race_results`` and leaves a
-   rider's typed scalar untouched.
+1. The v33 -> v34 migration backfills from ``race_results`` and promotes a
+   rider's typed scalar to a manual weigh-in for the upgrade day, so it stays
+   the latest word rather than being shadowed by an archived ride weight.
 2. ``record_weight`` is the only writer that arbitrates source priority, and
    a skipped write changes nothing.
 """
@@ -94,12 +95,14 @@ def test_the_onboarding_constants_are_the_input_policy():
 
 def test_v33_migrates_weight_history_in_place_and_backfills(tmp_path):
     """The v33 -> v34 step: the table appears, per-date rows are backfilled
-    from race_results, and a typed scalar is left untouched.
+    from race_results, and the typed scalar is filed as a manual weigh-in for
+    the upgrade day (and still readable as the scalar).
 
     A typed scalar is a measurement the rider made recently; the backfill is a
-    one-time import of historical ride weights. Letting the import regress the
-    scalar would replace "what I weighed myself at" with "what Zwift thought"
-    for a date the rider did not pick.
+    one-time import of historical ride weights. Promoting the scalar to a
+    dated row is what keeps it the rider's latest word: without it an archived
+    ride weight would become the divisor for today's rides the moment history
+    existed, and today's W/kg would change at upgrade.
     """
     path = str(tmp_path / "v33.db")
     db.init_db(path)
@@ -134,9 +137,11 @@ def test_v33_migrates_weight_history_in_place_and_backfills(tmp_path):
         ).fetchall()
     finally:
         conn.close()
+    today = local_today(db.get_user_settings(uid, path).get("timezone")).isoformat()
     assert rows == [
         ("2026-05-01", 73.0, "zwift_ride"),
         ("2026-06-01", 71.0, "zwift_ride"),
+        (today, 66.0, "manual"),
     ]
     assert db.get_user_settings(uid, path)["weight_kg"] == 66.0
 
@@ -631,3 +636,225 @@ def test_dashboard_weight_card_follows_the_resolution(client):
     body = client.get("/").text
     assert "Body Weight" in body
     assert "72.0 kg" in body
+
+
+# ------------------------- the resolution date is LOCAL, everywhere it is used
+
+def _race_activity(uid, key, start, seconds=1800, watts=250):
+    """A ride that reads as a race effort (IF and duration inside the window)."""
+    return db.insert_activity(uid, {
+        "dedup_hash": key,
+        "filename": f"{key}.fit",
+        "start_time": start,
+        "duration_s": seconds,
+        "distance_m": 20000,
+        "avg_power": watts,
+        "avg_hr": 150.0,
+        "np": watts,
+        "if_": 0.95,
+        "tss": 45,
+        "streams": {"power": [watts] * seconds, "time": []},
+    })
+
+
+def test_every_reader_divides_one_ride_by_one_weight_across_the_date_line(client):
+    """The ride page, the power profile and the races page must agree.
+
+    A 05:30Z ride from Los Angeles is UTC June 2 but LOCAL June 1. The races
+    page used to resolve on ``race_results.event_date`` (UTC), so the same
+    ride was divided by two different weights on two pages - exactly the drift
+    dated weigh-ins exist to remove.
+    """
+    from wattracker import races
+    from wattracker.analysis import pipeline, power_profile
+
+    uid = _register(client)
+    db.save_user_settings(uid, {"timezone": "America/Los_Angeles"})
+    aid = _race_activity(uid, "boundary-ride", "2026-06-02T05:30:00")
+    db.record_weight(uid, "2026-06-01", 70.0, "manual")
+    db.record_weight(uid, "2026-06-02", 80.0, "manual")
+
+    races.refresh_race_results(uid, "")
+    result = races.race_page_data(uid)["results"][0]
+    detail = pipeline.activity_detail(uid, aid)
+    profile_row = power_profile.for_user(uid)["rows"][0]
+
+    # The row is still filed on its UTC event date - only the weight lookup
+    # converts - so this pins the boundary the bug lived on.
+    assert result["event_date"] == "2026-06-02"
+    assert detail["weight_kg"] == 70.0
+    assert result["resolved_weight_kg"] == 70.0
+    assert profile_row["all_time_wkg"] == round(
+        profile_row["all_time"] / 70.0, 2
+    )
+
+
+def test_a_zwift_race_weight_is_filed_on_the_local_date(client, monkeypatch):
+    """A UTC-evening race writes the LOCAL day's row, not the UTC day's.
+
+    ``weight_history`` is keyed on local dates; ZwiftPower reports a UTC
+    instant. Filing 23:30Z on the UTC date puts a rider at UTC+12 a day behind
+    every other weigh-in they make.
+    """
+    from wattracker import races
+
+    uid = _register(client)
+    db.save_user_settings(uid, {"timezone": "Pacific/Auckland"})
+    _race_activity(uid, "evening-ride", "2026-06-01T23:30:00")
+    doc = {"data": [{
+        "event_date": int(
+            dt.datetime(2026, 6, 1, 23, 30, tzinfo=dt.timezone.utc).timestamp()
+        ),
+        "event_title": "Late Race", "f_t": "TYPE_RACE",
+        "time": 1800, "weight": 71.5,
+    }]}
+    monkeypatch.setattr(
+        races, "fetch_zwiftpower_results",
+        lambda rider_id: races.parse_zwiftpower_profile(doc),
+    )
+
+    races.refresh_race_results(uid, "1234567")
+
+    # 23:30 UTC on June 1 is 11:30 on June 2 at UTC+12.
+    assert db.weight_entry(uid, "2026-06-02") == {
+        "date": "2026-06-02", "weight_kg": 71.5, "source": "zwift_ride",
+    }
+    assert db.weight_entry(uid, "2026-06-01") is None
+
+
+# ------------------------ the typed scalar becomes a dated weigh-in at upgrade
+
+def _v33_database(tmp_path, name="v33.db", scalar=None, race=None, timezone=None):
+    """A v33 database with an optional typed scalar and one weighted race."""
+    path = str(tmp_path / name)
+    db.init_db(path)
+    uid = db.create_user("migrator", "password123", path)
+    settings = {}
+    if scalar is not None:
+        settings["weight_kg"] = scalar
+    if timezone is not None:
+        settings["timezone"] = timezone
+    if settings:
+        db.save_user_settings(uid, settings, path)
+    conn = sqlite3.connect(path)
+    try:
+        if race is not None:
+            conn.execute(
+                "INSERT INTO race_results (user_id, source, event_date,"
+                " event_title, weight_kg, fetched_at) VALUES (?, 'zwiftpower',"
+                " ?, 'Race', ?, '2026-06-02')",
+                (uid, race[0], race[1]),
+            )
+        conn.execute("DROP TABLE weight_history")
+        conn.execute("PRAGMA user_version = 33")
+        conn.commit()
+    finally:
+        conn.close()
+    return path, uid
+
+
+def _history(path, uid):
+    conn = sqlite3.connect(path)
+    try:
+        return conn.execute(
+            "SELECT date, weight_kg, source FROM weight_history"
+            " WHERE user_id = ? ORDER BY date",
+            (uid,),
+        ).fetchall()
+    finally:
+        conn.close()
+
+
+def test_the_upgrade_files_the_typed_scalar_as_todays_manual_weigh_in(tmp_path):
+    """The rider typed 70; an old race says 80. Today must still be 70.
+
+    History outranks the scalar, so leaving the scalar as a scalar would hand
+    every current ride the archived race weight - today's W/kg would change
+    the moment the rider upgraded, which is the opposite of what dated
+    weigh-ins are for.
+    """
+    path, uid = _v33_database(tmp_path, scalar=70.0, race=("2026-01-15", 80.0))
+
+    db.init_db(path)
+
+    today = local_today(db.get_user_settings(uid, path).get("timezone")).isoformat()
+    assert _history(path, uid) == [
+        ("2026-01-15", 80.0, "zwift_ride"),
+        (today, 70.0, "manual"),
+    ]
+    assert db.weight_as_of(uid, today, path) == 70.0
+    assert db.weight_as_of(uid, "2026-01-15", path) == 80.0
+    # Manual, so a later Zwift-derived write cannot take the day back.
+    assert db.record_weight(uid, today, 80.0, "zwift_ride", path) is False
+    assert db.weight_as_of(uid, today, path) == 70.0
+
+
+def test_the_promoted_weigh_in_wins_a_race_ridden_the_same_day(tmp_path):
+    """Collision on the upgrade day: manual beats zwift_ride, as everywhere."""
+    today = local_today(None).isoformat()
+    path, uid = _v33_database(tmp_path, scalar=70.0, race=(today, 80.0))
+
+    db.init_db(path)
+
+    assert _history(path, uid) == [(today, 70.0, "manual")]
+
+
+def test_upgrading_again_adds_nothing(tmp_path):
+    path, uid = _v33_database(tmp_path, scalar=70.0, race=("2026-01-15", 80.0))
+
+    db.init_db(path)
+    before = _history(path, uid)
+    for _ in range(3):
+        db.init_db(path)
+
+    assert _history(path, uid) == before
+
+
+@pytest.mark.parametrize("scalar", [None, 0.0])
+def test_no_usable_scalar_promotes_no_row(tmp_path, scalar):
+    """Nothing to promote is not a reason to invent an empty weigh-in."""
+    path, uid = _v33_database(tmp_path, scalar=scalar)
+
+    db.init_db(path)
+
+    assert _history(path, uid) == []
+
+
+def test_the_promoted_weigh_in_is_dated_the_riders_local_day(tmp_path):
+    """The table is local-dated, so the upgrade day is the rider's, not UTC."""
+    path, uid = _v33_database(tmp_path, scalar=70.0, timezone="Pacific/Kiritimati")
+
+    db.init_db(path)
+
+    rows = _history(path, uid)
+    assert [(r[1], r[2]) for r in rows] == [(70.0, "manual")]
+    assert rows[0][0] == local_today("Pacific/Kiritimati").isoformat()
+
+
+def test_the_backfill_files_a_race_on_its_local_date(tmp_path):
+    """The backfill inherits the same UTC/local skew, via race_results.
+
+    A date cannot be converted on its own, so the matching imported ride
+    supplies the instant; a race with no local ride keeps its own date.
+    """
+    path, uid = _v33_database(
+        tmp_path, scalar=None, race=("2026-06-02", 80.0),
+        timezone="America/Los_Angeles",
+    )
+    db.insert_activity(uid, {
+        "dedup_hash": "backfill-ride",
+        "filename": "backfill-ride.fit",
+        "start_time": "2026-06-02T05:30:00",
+        "duration_s": 1800,
+        "distance_m": 20000,
+        "avg_power": 250,
+        "avg_hr": 150.0,
+        "np": 250,
+        "if_": 0.95,
+        "tss": 45,
+        "streams": {"power": [250] * 60, "time": []},
+    }, path)
+
+    db.init_db(path)
+
+    assert _history(path, uid) == [("2026-06-01", 80.0, "zwift_ride")]

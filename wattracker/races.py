@@ -33,7 +33,13 @@ import urllib.request
 from typing import Dict, List, Optional
 
 from . import db
-from .timeutil import local_today, utc_now, utc_today
+from .timeutil import (
+    local_today,
+    parse_naive,
+    to_user_timezone,
+    utc_now,
+    utc_today,
+)
 from .metrics.curve import best_rolling_power
 
 log = logging.getLogger(__name__)
@@ -402,13 +408,15 @@ def refresh_race_results(
         # Real results supersede the heuristic ones: purge them for good.
         db.delete_race_results(user_id, "local")
         # The weight each race was actually ridden at (the rider's Zwift
-        # profile at the time), per event date. Re-runs are safe: a row is
-        # only replaced by an equal-or-higher-rank source, so a manual log
-        # for that date survives every refresh.
+        # profile at the time), filed on the rider's LOCAL date for the race
+        # (the table is local-dated; event_date is UTC). Re-runs are safe: a
+        # row is only replaced by an equal-or-higher-rank source, so a manual
+        # log for that date survives every refresh.
+        tz = db.get_user_settings(user_id).get("timezone")
         for r in results:
             if r.get("weight_kg"):
-                db.record_weight(user_id, r["event_date"], r["weight_kg"],
-                                 "zwift_ride")
+                db.record_weight(user_id, _weight_date(user_id, r, tz),
+                                 r["weight_kg"], "zwift_ride")
     elif db.count_race_results(user_id, "zwiftpower") > 0:
         # Refresh failed but real results are cached: keep them (stale)
         # rather than fabricating heuristic rows next to real races.
@@ -424,6 +432,31 @@ def refresh_race_results(
     )
     return {"source": source, "count": count, "error": remote_error,
             "auth_failed": auth_failed}
+
+
+def _weight_date(user_id: int, r: dict, tz, act: Optional[dict] = None) -> str:
+    """The rider's LOCAL calendar date to resolve a race row's weight on.
+
+    ``weight_history`` is keyed on local dates while ``event_date`` is a UTC
+    date in both of its producers (the ZwiftPower epoch and an activity's UTC
+    ``start_time`` prefix). A race ridden at 05:30Z from Los Angeles is a UTC
+    2026-06-02 row for a ride the rider did on 2026-06-01, so resolving on
+    ``event_date`` would divide by a different weight than the ride page and
+    the power profile do for the very same ride.
+
+    A date has no time of day to convert, so the instant comes from the
+    matching imported ride and is converted exactly the way pipeline.py and
+    power_profile.py convert it. A race with no local ride keeps its own date:
+    there is nothing to convert, and no other page renders that ride, so
+    nothing can disagree about it.
+    """
+    start_time = (act or {}).get("start_time")
+    if start_time is None and r.get("activity_id"):
+        start_time = db.activity_start_time(user_id, r["activity_id"])
+    started = parse_naive(start_time)
+    if started is None:
+        return r["event_date"]
+    return to_user_timezone(started, tz).date().isoformat()
 
 
 def _matching_activity(
@@ -620,6 +653,8 @@ def race_page_data(user_id: int) -> Dict:
     # rows exist, heuristic rows are hidden (and purged at next refresh).
     if any(r["source"] == "zwiftpower" for r in results):
         results = [r for r in results if r["source"] == "zwiftpower"]
+    settings = db.get_user_settings(user_id)
+    tz = settings.get("timezone")
     # Lazily backfill fields for rows cached before this logic existed:
     #  - activity_id so each race links to its detail graphs;
     #  - IF (= NP / FTP as-of the race date) which ZwiftPower never provides.
@@ -651,11 +686,15 @@ def race_page_data(user_id: int) -> Dict:
         # What the race was actually run at: the row's own Zwift weight unless
         # the rider logged a manual value for that date (manual wins), and for
         # locally-derived rows the rider's weight as of the date instead of
-        # nothing. The W/kg toggle divides each row by its own number.
-        r["resolved_weight_kg"] = db.weight_as_of(user_id, r["event_date"])
+        # nothing. Resolved on the ride's LOCAL date so this page and the ride
+        # page never divide the same ride by two different weights.
+        # The W/kg toggle divides each row by its own number.
+        r["resolved_weight_kg"] = db.weight_as_of(
+            user_id, _weight_date(user_id, r, tz, act)
+        )
         r["place"] = _place_int(r.get("position"))
         r["duration_fmt"] = format_duration(r.get("duration_s"))
-    weight = db.get_user_settings(user_id).get("weight_kg")
+    weight = settings.get("weight_kg")
     return {
         "sync": sync,
         "results": results,
@@ -665,4 +704,10 @@ def race_page_data(user_id: int) -> Dict:
         "profile_durations": [str(d) for d in PROFILE_DURATIONS],
         "profile_labels": [DURATION_LABELS[d] for d in PROFILE_DURATIONS],
         "weight_kg": float(weight) if weight else None,
+        # The W/kg toggle is offerable as soon as ANY divisor exists: each row
+        # carries the weight it was ridden at, so the page is useful even for
+        # a rider who never typed a current weight.
+        "can_show_wkg": bool(
+            weight or any(r.get("resolved_weight_kg") for r in results)
+        ),
     }

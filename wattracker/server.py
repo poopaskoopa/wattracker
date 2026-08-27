@@ -4608,6 +4608,7 @@ def create_app() -> FastAPI:
             profile_durations=data["profile_durations"],
             profile_labels=data["profile_labels"],
             weight_kg=data["weight_kg"],
+            can_show_wkg=data["can_show_wkg"],
             rider_id=zid if zid.isdigit() else "",
             saved_zwift_id=zid,
             workouts_root=discover(uid, "workouts_root"),
