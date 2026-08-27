@@ -693,6 +693,59 @@ function renderActivityRpe(activityId, detail) {
     paint();
 }
 
+// Inline weight log for the activity detail page. The card value itself is
+// server-rendered (the resolution for the ride's local date); this only owns
+// the toggle link and the form, which POSTs to the activity weight API and
+// repaints the card in place on success.
+function renderActivityWeight(activityId) {
+    const section = document.getElementById("weightLogSection");
+    const form = document.getElementById("weightLogForm");
+    const link = document.getElementById("weightEditLink");
+    if (!section || !form) return;
+    const status = document.getElementById("weightLogStatus");
+
+    if (link) {
+        link.addEventListener("click", function (e) {
+            e.preventDefault();
+            section.hidden = !section.hidden;
+            if (!section.hidden) {
+                const kg = document.getElementById("weightLogKg");
+                if (kg) kg.focus();
+            }
+        });
+    }
+
+    form.addEventListener("submit", async function (e) {
+        e.preventDefault();
+        const date = document.getElementById("weightLogDate").value;
+        const kgRaw = document.getElementById("weightLogKg").value;
+        status.textContent = "Saving…";
+        try {
+            const resp = await fetch("/api/activity/" + activityId + "/weight", {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({
+                    weight_kg: kgRaw === "" ? null : Number(kgRaw),
+                    date: date || null,
+                }),
+            });
+            const body = await resp.json().catch(() => ({}));
+            if (!resp.ok) {
+                status.textContent = body.error || "Could not save weight.";
+                return;
+            }
+            document.getElementById("weightValue").textContent =
+                Number(body.weight_kg).toFixed(1) + " kg";
+            const subText = document.getElementById("weightSubText");
+            if (subText) subText.textContent = "you logged · " + body.date + " ";
+            section.hidden = true;
+            status.textContent = "";
+        } catch (err) {
+            status.textContent = "Could not save weight: " + err.message;
+        }
+    });
+}
+
 async function renderActivityDetail(activityId) {
     const canvas = document.getElementById("detailChart");
     if (!canvas) return;
@@ -712,6 +765,7 @@ async function renderActivityDetail(activityId) {
     if (!data) { showEmpty(); return; }
 
     renderActivityRpe(activityId, data);
+    renderActivityWeight(activityId);
     renderZoneSummary("powerZoneSummary", data.zones && data.zones.power, "W");
     renderZoneSummary("hrZoneSummary", data.zones && data.zones.heart_rate, "bpm");
 

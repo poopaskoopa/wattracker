@@ -58,13 +58,14 @@
 {% endif %}
 
 {% if results or bests %}
-<div class="unit-toggle" data-weight="{{ weight_kg or '' }}">
+<div class="unit-toggle" data-weight="{{ weight_kg or '' }}"
+     data-can-wkg="{{ '1' if can_show_wkg else '' }}">
     <span class="hint">Units:</span>
     <button type="button" id="unitW" class="unit-btn active">W</button>
     <button type="button" id="unitWkg" class="unit-btn"
-            {{ 'disabled' if not weight_kg else '' }}>W/kg</button>
-    {% if weight_kg %}
-    <span class="hint">(at {{ weight_kg }} kg)</span>
+            {{ 'disabled' if not can_show_wkg else '' }}>W/kg</button>
+    {% if can_show_wkg %}
+    <span class="hint">(each race at the weight it was ridden at)</span>
     {% else %}
     <span class="hint">W/kg needs your weight &mdash; refresh results with
         Zwift credentials or set it in <a href="/settings">Settings</a>.</span>
@@ -101,7 +102,7 @@
         <th class="sortable num" data-type="num">IF</th><th></th></tr></thead>
     <tbody>
     {% for r in results %}
-        <tr>
+        <tr data-row-weight="{{ r.resolved_weight_kg or '' }}">
             <td class="nowrap num" data-sort="{{ r.event_date }}">{% if r.zp_event_id %}<a href="https://zwiftpower.com/events.php?zid={{ r.zp_event_id }}" target="_blank" rel="noopener">{{ r.event_date }}</a>{% else %}{{ r.event_date }}{% endif %}</td>
             <td class="nowrap" data-sort="{{ r.event_title }}">
                 {% if r.activity_id %}<a href="/activity/{{ r.activity_id }}">{{ r.event_title }}</a>
@@ -113,7 +114,7 @@
             <td class="nowrap num" data-sort="{{ r.distance_km if r.distance_km else '' }}">{{ ('%g'|format(r.distance_km|round(1))) ~ ' km' if r.distance_km else '—' }}</td>
             <td class="nowrap num" data-sort="{{ r.avg_hr if r.avg_hr is not none else '' }}">{{ (r.avg_hr|round(0)|int) ~ ' bpm' if r.avg_hr is not none else '—' }}</td>
             <td class="nowrap num" data-sort="{{ r.max_hr if r.max_hr is not none else '' }}">{{ (r.max_hr|round(0)|int) ~ ' bpm' if r.max_hr is not none else '—' }}</td>
-            <td class="nowrap num" data-sort="{{ r.weight_kg if r.weight_kg is not none else '' }}">{{ ('%.1f'|format(r.weight_kg)) ~ ' kg' if r.weight_kg is not none else '—' }}</td>
+            <td class="nowrap num" data-sort="{{ r.resolved_weight_kg if r.resolved_weight_kg is not none else '' }}">{{ ('%.1f'|format(r.resolved_weight_kg)) ~ ' kg' if r.resolved_weight_kg is not none else '—' }}</td>
             <td class="num" data-sort="{{ r.avg_power|round(0)|int if r.avg_power else '' }}">{% if r.avg_power %}<span class="pw" data-w="{{ r.avg_power|round(0)|int }}">{{ r.avg_power|round(0)|int }}</span>{% else %}—{% endif %}</td>
             <td class="num" data-sort="{{ r.np|round(0)|int if r.np else '' }}">{% if r.np %}<span class="pw" data-w="{{ r.np|round(0)|int }}">{{ r.np|round(0)|int }}</span>{% else %}—{% endif %}</td>
             {% for d in durations %}
@@ -156,14 +157,24 @@
     var toggle = document.querySelector(".unit-toggle");
     if (!toggle) return;
     var weight = parseFloat(toggle.dataset.weight);
+    // Rows carry their own divisor, so W/kg is offerable even with no
+    // page-level current weight; `weight` stays the fallback for rows that
+    // have none (the all-time bests row).
+    var canWkg = toggle.dataset.canWkg === "1";
     var btnW = document.getElementById("unitW");
     var btnWkg = document.getElementById("unitWkg");
 
     function apply(mode) {
-        var wkg = mode === "wkg" && weight > 0;
+        var wkg = mode === "wkg" && canWkg;
         document.querySelectorAll(".pw").forEach(function (el) {
             var w = parseFloat(el.dataset.w);
-            el.textContent = wkg ? (w / weight).toFixed(2) : Math.round(w);
+            // Each race row is divided by its own resolved weight (the weight
+            // it was run at); rows without one - including the all-time bests
+            // row - fall back to the page-level current weight.
+            var row = el.closest("tr");
+            var rowWeight = row ? parseFloat(row.dataset.rowWeight) : NaN;
+            var divisor = (rowWeight > 0) ? rowWeight : weight;
+            el.textContent = wkg && divisor > 0 ? (w / divisor).toFixed(2) : Math.round(w);
         });
         document.querySelectorAll(".unit-label").forEach(function (el) {
             el.textContent = wkg ? "W/kg" : "W";
@@ -177,7 +188,7 @@
 
     var saved = "w";
     try { saved = localStorage.getItem("tr_power_unit") || "w"; } catch (e) {}
-    if (saved === "wkg" && weight > 0) apply("wkg");
+    if (saved === "wkg" && canWkg) apply("wkg");
 })();
 
 // -------- sortable race table (vanilla JS; sorts by data-sort keys) --------

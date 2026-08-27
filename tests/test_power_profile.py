@@ -147,6 +147,63 @@ def test_weight_and_chart_nulls():
     )["rows"][0]["all_time_wkg"] is None
 
 
+def test_weight_fn_resolves_each_record_by_its_own_weight():
+    """A 3-year-old 300 W best set at 80 kg and a recent 280 W best set at
+    70 kg are 3.75 and 4.00 W/kg - one flat "current weight" divisor (say 70)
+    would have labelled the older record 4.29, a number the ride never had.
+    """
+    by_date = {"2023-07-01": 80.0, "2026-07-01": 70.0}
+
+    def weight_fn(start_time):
+        return by_date.get(start_time[:10]) if start_time else None
+
+    result = power_profile.compute(
+        [
+            _ride("2023-07-01T10:00:00", [300] * 60),
+            _ride("2026-07-01T10:00:00", [280] * 60),
+        ],
+        weight_kg=70,
+        weight_fn=weight_fn,
+        now=dt.datetime(2026, 7, 25),
+    )
+    row = _row(result, 60)
+    assert row["all_time"] == 300 and row["all_time_wkg"] == 3.75
+    assert row["recent_60d"] == 280 and row["recent_60d_wkg"] == 4.0
+
+
+def test_weight_fn_that_resolves_nothing_keeps_the_flat_scalar():
+    """When the resolver returns nothing - or is absent entirely - every
+    record divides by the flat scalar, exactly as before weight history."""
+    activities = [
+        _ride("2023-07-01T10:00:00", [300] * 60),
+        _ride("2026-07-01T10:00:00", [280] * 60),
+    ]
+    resolved = power_profile.compute(
+        activities, weight_kg=70, weight_fn=lambda s: None,
+        now=dt.datetime(2026, 7, 25),
+    )
+    plain = power_profile.compute(
+        activities, weight_kg=70, now=dt.datetime(2026, 7, 25)
+    )
+    assert resolved["rows"] == plain["rows"]
+    row = _row(plain, 60)
+    assert row["all_time_wkg"] == round(300 / 70, 2)
+    assert row["recent_60d_wkg"] == 4.0
+
+
+def test_for_user_resolves_weights_from_the_rider_history(user_id):
+    """End to end: the profile divides each record by the weight as of the
+    ride's own date, not by whatever the scalar currently holds."""
+    db.save_user_settings(user_id, {"weight_kg": 99.0})
+    db.record_weight(user_id, "2026-07-01", 75.0, "manual")
+    _insert(user_id, "wkg-1", "2026-07-01T10:00:00", [300] * 60)
+
+    result = power_profile.for_user(user_id, now=dt.datetime(2026, 7, 25))
+    row = _row(result, 60)
+    assert row["all_time"] == 300
+    assert row["all_time_wkg"] == 4.0  # 300 / 75, not 300 / 99
+
+
 @pytest.mark.parametrize(("curve", "expected"), [
     ({1: 1300, 15: 900, 30: 780, 60: 500, 120: 450, 300: 390,
       1200: 300, 2400: 260}, "Sprinter"),

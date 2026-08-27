@@ -12,6 +12,7 @@
 {% if dir_message %}<p class="alert">{{ dir_message }}</p>{% endif %}
 {% if ftp_message %}<p class="alert" role="alert">{{ ftp_message }}</p>{% endif %}
 {% if llm_message %}<p class="alert" role="alert">{{ llm_message }}</p>{% endif %}
+{% if weight_message %}<p class="alert" role="alert">{{ weight_message }}</p>{% endif %}
 
 <p class="current-ftp"><strong>Current Training FTP:</strong> {{ current_ftp }} W</p>
 {% set ftp_suggestion_next = '/settings' %}
@@ -39,10 +40,12 @@
         <input type="text" name="zwift_id"
                value="{{ settings.zwift_id or '' }}">
     </label>
-    <label>Weight (kg) &mdash; used for W/kg on the Races page; auto-updated
-        from your Zwift profile whenever race results are refreshed:
-        <input type="number" step="0.1" min="20" max="200" name="weight_kg"
-               value="{{ settings.weight_kg if settings.weight_kg else '' }}">
+    <label>Weight (kg) &mdash; used for W/kg everywhere:
+        <input type="number" step="0.1" min="{{ weight_min }}" max="{{ weight_max }}"
+               name="weight_kg" value="{{ weight_form_value }}">
+        <span class="hint">Saving records a dated log for today. Dated
+            weigh-ins logged on the Profile page take precedence per date, and
+            Zwift fills dates you have not logged.</span>
     </label>
     <label>Time zone (IANA name):
         <input type="text" name="timezone" autocomplete="off"

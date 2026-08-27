@@ -27,6 +27,10 @@
         <span class="label">Readiness</span><span class="value">{{ state.readiness }}/100</span></div>
     <div class="card" title="Aerobic decoupling — the % drift of heart-rate-to-power from the first to second half of a long steady ride; lower is more aerobically durable.">
         <span class="label">Decoupling</span><span class="value">{{ state.decoupling if state.decoupling is not none else '&mdash;'|safe }}%</span></div>
+    {% if body_weight %}
+    <div class="card" title="Body weight — the latest weigh-in known on or before today (your own log, a Zwift ride's recorded weight, a profile sync, or your profile setting). W/kg labels divide each record by the weight of that record's date.">
+        <span class="label">Body Weight</span><span class="value">{{ '%.1f'|format(body_weight.weight_kg) }} kg</span></div>
+    {% endif %}
 </section>
 
 <section class="status-banner status-{{ banner.level }}" role="status">

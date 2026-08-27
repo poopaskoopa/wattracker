@@ -315,6 +315,39 @@ def test_race_table_renders_sortable_hr_weight_and_missing_values(client, monkey
     assert 'data-weight="72.0"' in text  # existing current-weight W/kg toggle
 
 
+def test_race_page_renders_resolved_weight_per_row(client, monkeypatch):
+    """Each row carries the weight it was run at; a manual log for that date
+    beats the weight the race was recorded with, and the W/kg toggle divides
+    each row by its own number (with the page-level weight as fallback)."""
+    from wattracker import credstore, zwiftauth
+
+    _register(client)
+    uid = db.get_user_by_username("rider")["id"]
+    doc = {"data": [{
+        "event_date": int(dt.datetime(2026, 6, 1, 10).timestamp()),
+        "event_title": "Ridden", "f_t": "TYPE_RACE", "weight": [70.5, 0],
+    }]}
+    credstore.save_zwift_credentials(uid, "a@b.com", "pw")
+    monkeypatch.setattr(
+        zwiftauth, "fetch_results_authenticated",
+        lambda email, password, rider_id=None: (doc, "1234567", 72.0),
+    )
+    client.post("/races/refresh", data={"rider_id": "1234567"})
+
+    # The rider logs their own value for the race date: the page shows it,
+    # not the 70.5 the ride was recorded with.
+    db.record_weight(uid, "2026-06-01", 69.0, "manual")
+    text = client.get("/races").text
+    row = re.search(
+        r"<tr[^>]*data-row-weight=\"69\.0\".*?</tr>", text, flags=re.DOTALL
+    ).group(0)
+    assert "69.0 kg" in row
+    assert "70.5" not in row
+    # The page-level toggle weight is still the scalar (the profile number
+    # from the refresh, which post-dates the race row).
+    assert 'data-weight="72.0"' in text
+
+
 def test_race_links_to_matching_ride_and_none_when_absent(user_id, monkeypatch):
     doc = {"data": [
         {"event_date": int(dt.datetime(2026, 6, 1, 10).timestamp()),
@@ -481,7 +514,98 @@ def test_place_int_parsing():
     assert races._place_int(None) is None
 
 
-# ------------------------------------------------------------- distance
+# ---------------------------------------------------------------- weight
+def _weighted_doc(today_epoch):
+    return {"data": [
+        {"event_date": today_epoch, "event_title": "Today Race",
+         "f_t": "TYPE_RACE", "weight": [70.25, 0]},
+        {"event_date": int(dt.datetime(2026, 6, 1, 10).timestamp()),
+         "event_title": "Ridden", "f_t": "TYPE_RACE", "weight": [70.5, 0]},
+        {"event_date": int(dt.datetime(2026, 5, 1, 10).timestamp()),
+         "event_title": "No Weight", "f_t": "TYPE_RACE"},
+    ]}
+
+
+def test_refresh_never_overrides_a_manual_weight_log(user_id, monkeypatch):
+    """The core constraint, driven through the real refresh path.
+
+    The rider's own log for a date survives every refresh: neither the Zwift
+    profile weight nor the weight a race was ridden at may replace it, and no
+    row landing for that date means the scalar is left exactly as it was.
+    """
+    from wattracker import credstore, zwiftauth
+    from wattracker.timeutil import local_today
+
+    today = local_today(db.get_user_settings(user_id).get("timezone")).isoformat()
+    db.save_user_settings(user_id, {"weight_kg": 71.5})
+    db.record_weight(user_id, today, 71.5, "manual")
+    doc = _weighted_doc(int(dt.datetime.now(dt.timezone.utc).timestamp()))
+    credstore.save_zwift_credentials(user_id, "a@b.com", "pw")
+    monkeypatch.setattr(
+        zwiftauth, "fetch_results_authenticated",
+        lambda email, password, rider_id=None: (doc, "1234567", 72.0),
+    )
+    races.refresh_race_results(user_id, "1234567")
+
+    assert db.weight_entry(user_id, today) == {
+        "date": today, "weight_kg": 71.5, "source": "manual"}
+    # Other dates pick up what those races were ridden at.
+    assert db.weight_entry(user_id, "2026-06-01") == {
+        "date": "2026-06-01", "weight_kg": 70.5, "source": "zwift_ride"}
+    assert db.weight_entry(user_id, "2026-05-01") is None  # no weight published
+    assert db.get_user_settings(user_id)["weight_kg"] == 71.5
+
+
+def test_refresh_with_no_manual_row_logs_profile_and_ride_weights(
+        user_id, monkeypatch):
+    """Without a competing log for today: the profile weight lands on today,
+    the same-day ride weight supersedes it (higher rank), and the scalar
+    follows the latest row."""
+    from wattracker import credstore, zwiftauth
+    from wattracker.timeutil import local_today
+
+    today = local_today(db.get_user_settings(user_id).get("timezone")).isoformat()
+    doc = _weighted_doc(int(dt.datetime.now(dt.timezone.utc).timestamp()))
+    credstore.save_zwift_credentials(user_id, "a@b.com", "pw")
+    monkeypatch.setattr(
+        zwiftauth, "fetch_results_authenticated",
+        lambda email, password, rider_id=None: (doc, "1234567", 72.0),
+    )
+    races.refresh_race_results(user_id, "1234567")
+
+    entry = db.weight_entry(user_id, today)
+    assert entry["source"] == "zwift_ride" and entry["weight_kg"] == 70.25
+    assert db.weight_entry(user_id, "2026-06-01")["source"] == "zwift_ride"
+    assert db.weight_entry(user_id, "2026-05-01") is None
+    # The scalar is the latest row's weight (today's ride), not the profile
+    # number the fetch happened to carry.
+    assert db.get_user_settings(user_id)["weight_kg"] == 70.25
+
+
+def test_refresh_rerun_of_ride_weights_is_idempotent(user_id, monkeypatch):
+    """replace_race_results DELETEs and re-INSERTs every refresh, so the
+    zwift_ride writes re-run on every sync. They must be idempotent under the
+    priority rule: re-syncing the same data changes nothing."""
+    from wattracker import credstore, zwiftauth
+
+    doc = _weighted_doc(int(dt.datetime(2026, 4, 1, 10).timestamp()))
+    credstore.save_zwift_credentials(user_id, "a@b.com", "pw")
+    monkeypatch.setattr(
+        zwiftauth, "fetch_results_authenticated",
+        lambda email, password, rider_id=None: (doc, "1234567", 72.0),
+    )
+    races.refresh_race_results(user_id, "1234567")
+    first = db.weight_history_list(user_id)
+    races.refresh_race_results(user_id, "1234567")
+    assert db.weight_history_list(user_id) == first
+    # And a manual log placed in between survives the third sync.
+    date_ = first[0]["date"]
+    db.record_weight(user_id, date_, 71.0, "manual")
+    races.refresh_race_results(user_id, "1234567")
+    assert db.weight_entry(user_id, date_)["source"] == "manual"
+
+
+# ---------------------------------------------------------------- distance
 def test_distance_parsed_from_zwiftpower_km(user_id, monkeypatch):
     doc = {"data": [{
         "event_date": int(dt.datetime(2026, 6, 1, 10).timestamp()),
@@ -610,6 +734,42 @@ def test_races_page_prefills_numeric_zwift_id(client):
     assert "not numeric" in text
 
 
+def test_races_page_enables_wkg_toggle_from_a_race_weight_alone(client):
+    """A rider with no typed weight (``user_settings.weight_kg`` unset) still
+    gets an enabled W/kg toggle when a race row carries its own
+    ``resolved_weight_kg`` - each row divides by the weight it was ridden at,
+    so the page is useful even before the rider ever types a weight.
+    """
+    _register(client)
+    uid = db.get_user_by_username("rider")["id"]
+    assert db.get_user_settings(uid).get("weight_kg") is None
+    db.replace_race_results(uid, "zwiftpower", [{
+        "event_date": "2026-06-01", "event_title": "R", "fetched_at": "t0",
+        "power": {}, "weight_kg": 72.0,
+    }])
+    # race_page_data resolves each row's weight from weight_history (keyed on
+    # the ride's LOCAL date) - as filed by the v34 backfill migration, which
+    # (unlike db.record_weight) inserts history rows directly without ever
+    # touching user_settings.weight_kg, since there is no typed scalar to
+    # keep in sync. That is the real path that leaves resolved_weight_kg set
+    # with the scalar still None.
+    from wattracker.config import db_path
+    conn = sqlite3.connect(db_path())
+    try:
+        conn.execute(
+            "INSERT INTO weight_history (user_id, date, weight_kg, source) "
+            "VALUES (?, '2026-06-01', 72.0, 'zwift_ride')",
+            (uid,),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+    assert db.get_user_settings(uid).get("weight_kg") is None
+    text = client.get("/races").text
+    assert 'id="unitWkg"' in text
+    assert re.search(r'id="unitWkg"[^>]*disabled', text) is None
+
+
 def test_races_refresh_route_persists_id_and_shows_results(client, monkeypatch):
     monkeypatch.setattr(
         races, "_http_get_json",
@@ -693,7 +853,10 @@ def test_toggle_enabled_with_weight_and_settings_override(client):
     client.post("/races/refresh", data={"rider_id": ""})
     text = client.get("/races").text
     assert 'data-weight="68.0"' in text
-    assert "(at 68.0 kg)" in text
+    # The header no longer claims one weight for the whole table: each row is
+    # divided by the weight it was ridden at.
+    assert "(each race at the weight it was ridden at)" in text
+    assert "(at 68.0 kg)" not in text
     # Enabled toggle: the W/kg button carries no disabled attribute.
     import re
 
