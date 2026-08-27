@@ -4,7 +4,7 @@ A rider's weight changes; a single ``user_settings.weight_kg`` scalar turns
 every W/kg label into a statement about a weight the rider no longer has. This
 feature stores weight per date, in ``weight_history``, with three capture
 sources - manual (highest), the weight a Zwift ride was ridden at
-(``race_results.weight_kg``, per event date), and the weight of a profile
+(``race_results.weight_kg``, per LOCAL date), and the weight of a profile
 sync (local today) - and resolves "what did this ride happen at" per record.
 
 Two invariants this module pins:
@@ -858,3 +858,78 @@ def test_the_backfill_files_a_race_on_its_local_date(tmp_path):
     db.init_db(path)
 
     assert _history(path, uid) == [("2026-06-01", 80.0, "zwift_ride")]
+
+
+def test_the_backfill_follows_activity_id_like_the_runtime_resolver(tmp_path):
+    """When a race row carries ``activity_id``, the backfill must match the
+    same ride the runtime resolver (``races._weight_date``) would pick -
+    never a different one merely because its duration is closer.
+
+    Two rides land on the same UTC date: 05:30Z for 1800s, and 20:00Z for
+    3600s. The race's ``duration_s`` (1800) is closest to the FIRST ride, but
+    its ``activity_id`` points at the SECOND. The runtime resolver always
+    prefers activity_id, so the backfill must follow it too, or the seeded
+    history row and the resolver disagree about the date.
+    """
+    from wattracker import races
+
+    path = str(tmp_path / "v33.db")
+    db.init_db(path)
+    uid = db.create_user("migrator", "password123", path)
+    db.save_user_settings(uid, {"timezone": "America/Denver"}, path)
+
+    early_id = db.insert_activity(uid, {
+        "dedup_hash": "early-ride",
+        "filename": "early-ride.fit",
+        "start_time": "2026-06-02T05:30:00",
+        "duration_s": 1800,
+        "distance_m": 20000,
+        "avg_power": 250,
+        "avg_hr": 150.0,
+        "np": 250,
+        "if_": 0.95,
+        "tss": 45,
+        "streams": {"power": [250] * 60, "time": []},
+    }, path)
+    late_id = db.insert_activity(uid, {
+        "dedup_hash": "late-ride",
+        "filename": "late-ride.fit",
+        "start_time": "2026-06-02T20:00:00",
+        "duration_s": 3600,
+        "distance_m": 40000,
+        "avg_power": 220,
+        "avg_hr": 140.0,
+        "np": 220,
+        "if_": 0.9,
+        "tss": 60,
+        "streams": {"power": [220] * 60, "time": []},
+    }, path)
+
+    conn = sqlite3.connect(path)
+    try:
+        conn.execute(
+            "INSERT INTO race_results (user_id, source, event_date,"
+            " event_title, weight_kg, duration_s, activity_id, fetched_at)"
+            " VALUES (?, 'zwiftpower', '2026-06-02', 'Race', 80.0, 1800, ?,"
+            " '2026-06-02')",
+            (uid, late_id),
+        )
+        conn.execute("DROP TABLE weight_history")
+        conn.execute("PRAGMA user_version = 33")
+        conn.commit()
+    finally:
+        conn.close()
+
+    db.init_db(path)
+
+    backfilled = _history(path, uid)
+    assert len(backfilled) == 1
+    backfilled_date = backfilled[0][0]
+
+    r = {"event_date": "2026-06-02", "activity_id": None}
+    resolved_date = races._weight_date(uid, r, "America/Denver", act={
+        "start_time": db.activity_start_time(uid, late_id, path)
+    })
+
+    assert backfilled_date == resolved_date == "2026-06-02"
+    assert early_id != late_id

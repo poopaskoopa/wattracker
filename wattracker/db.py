@@ -112,11 +112,15 @@ def _backfill_inapp_utc(conn: sqlite3.Connection) -> None:
 # number there (manual | zwift_ride | zwift_profile) and ``record_weight``
 # enforces the write priority, so the row that exists is the winner for that
 # date; consumers never re-arbitrate. Dates are the rider's LOCAL dates while
-# activity timestamps stay UTC - see timeutil.to_user_timezone.
+# activity timestamps stay UTC - see timeutil.to_user_timezone - EXCEPT that a
+# race with no matching imported ride has no instant to convert, so both
+# _weight_date and _backfill_weight_history deliberately file it under its
+# UTC event_date instead.
 _WEIGHT_HISTORY_DDL = """
 CREATE TABLE IF NOT EXISTS weight_history (
     user_id    INTEGER NOT NULL,
-    date       TEXT NOT NULL,          -- user's LOCAL calendar date (YYYY-MM-DD)
+    date       TEXT NOT NULL,          -- user's LOCAL calendar date (YYYY-MM-DD),
+                                        -- or the UTC event_date when no ride matched
     weight_kg  REAL NOT NULL,
     source     TEXT NOT NULL DEFAULT 'manual',
     PRIMARY KEY(user_id, date),
@@ -208,24 +212,53 @@ def _backfill_weight_history(conn: sqlite3.Connection) -> None:
     Rows are taken oldest first, so when two UTC dates collapse onto one local
     date the earlier race wins deterministically; the rider's own typed weight
     is filed first (see _promote_weight_scalar) and outranks all of this.
+
+    Matching the ride must follow the same precedence the runtime resolver
+    (``races._weight_date``) uses, or the two can disagree about which ride a
+    race belongs to: when the race row carries ``activity_id``, that specific
+    activity is used (if it still exists and has a parseable start_time);
+    only when it is unset or does not resolve does this fall back to the
+    duration-closest match on the event date.
     """
     conn.execute(_WEIGHT_HISTORY_DDL)
     zones = _user_timezones(conn)
-    rows = conn.execute(
-        "SELECT user_id, event_date, weight_kg, duration_s FROM race_results "
-        "WHERE weight_kg IS NOT NULL ORDER BY event_date ASC, rowid ASC"
-    ).fetchall()
+    try:
+        rows = conn.execute(
+            "SELECT user_id, event_date, weight_kg, duration_s, activity_id "
+            "FROM race_results WHERE weight_kg IS NOT NULL "
+            "ORDER BY event_date ASC, rowid ASC"
+        ).fetchall()
+    except sqlite3.OperationalError:
+        rows = conn.execute(
+            "SELECT user_id, event_date, weight_kg, duration_s FROM race_results "
+            "WHERE weight_kg IS NOT NULL ORDER BY event_date ASC, rowid ASC"
+        ).fetchall()
     for row in rows:
         date = row["event_date"]
         if not date:
             continue
-        ride = conn.execute(
-            "SELECT start_time FROM activities WHERE user_id = ? "
-            "AND start_time LIKE ? "
-            "ORDER BY ABS(COALESCE(duration_s, 0) - ?) ASC, start_time ASC "
-            "LIMIT 1",
-            (row["user_id"], date + "%", row["duration_s"] or 0),
-        ).fetchone()
+        ride = None
+        activity_id = row["activity_id"] if "activity_id" in row.keys() else None
+        if activity_id:
+            try:
+                ride = conn.execute(
+                    "SELECT start_time FROM activities WHERE user_id = ? "
+                    "AND id = ?",
+                    (row["user_id"], activity_id),
+                ).fetchone()
+            except sqlite3.OperationalError:
+                ride = None
+        if ride is None or ride["start_time"] is None:
+            try:
+                ride = conn.execute(
+                    "SELECT start_time FROM activities WHERE user_id = ? "
+                    "AND start_time LIKE ? "
+                    "ORDER BY ABS(COALESCE(duration_s, 0) - ?) ASC, start_time ASC "
+                    "LIMIT 1",
+                    (row["user_id"], date + "%", row["duration_s"] or 0),
+                ).fetchone()
+            except sqlite3.OperationalError:
+                ride = None
         started = parse_naive(ride["start_time"]) if ride is not None else None
         if started is not None:
             date = to_user_timezone(

@@ -734,6 +734,42 @@ def test_races_page_prefills_numeric_zwift_id(client):
     assert "not numeric" in text
 
 
+def test_races_page_enables_wkg_toggle_from_a_race_weight_alone(client):
+    """A rider with no typed weight (``user_settings.weight_kg`` unset) still
+    gets an enabled W/kg toggle when a race row carries its own
+    ``resolved_weight_kg`` - each row divides by the weight it was ridden at,
+    so the page is useful even before the rider ever types a weight.
+    """
+    _register(client)
+    uid = db.get_user_by_username("rider")["id"]
+    assert db.get_user_settings(uid).get("weight_kg") is None
+    db.replace_race_results(uid, "zwiftpower", [{
+        "event_date": "2026-06-01", "event_title": "R", "fetched_at": "t0",
+        "power": {}, "weight_kg": 72.0,
+    }])
+    # race_page_data resolves each row's weight from weight_history (keyed on
+    # the ride's LOCAL date) - as filed by the v34 backfill migration, which
+    # (unlike db.record_weight) inserts history rows directly without ever
+    # touching user_settings.weight_kg, since there is no typed scalar to
+    # keep in sync. That is the real path that leaves resolved_weight_kg set
+    # with the scalar still None.
+    from wattracker.config import db_path
+    conn = sqlite3.connect(db_path())
+    try:
+        conn.execute(
+            "INSERT INTO weight_history (user_id, date, weight_kg, source) "
+            "VALUES (?, '2026-06-01', 72.0, 'zwift_ride')",
+            (uid,),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+    assert db.get_user_settings(uid).get("weight_kg") is None
+    text = client.get("/races").text
+    assert 'id="unitWkg"' in text
+    assert re.search(r'id="unitWkg"[^>]*disabled', text) is None
+
+
 def test_races_refresh_route_persists_id_and_shows_results(client, monkeypatch):
     monkeypatch.setattr(
         races, "_http_get_json",
