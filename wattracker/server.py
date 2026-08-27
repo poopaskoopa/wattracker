@@ -5441,6 +5441,7 @@ def create_app() -> FastAPI:
                         revoked = True
                         break
                     tick_started = _ride_loop_time()
+                    poll_now = tick_started
                     if action_queue is not None:
                         while not action_queue.empty():
                             outcome = await _handle_action(action_queue.get_nowait())
@@ -5512,10 +5513,15 @@ def create_app() -> FastAPI:
                         # The trainer has been holding one target throughout,
                         # and may well have dropped out of ERG when the FTMS
                         # writes stopped. Re-arm rather than nudge.
+                        # The replay advanced the controller using recorded
+                        # one-second samples; start a fresh live-clock interval
+                        # so the outage is not counted a second time.
+                        poll_now = _ride_loop_time()
+                        controller.sync_poll_clock(poll_now)
                         resumed = True
 
                     previous_status = controller.status
-                    controller.poll(dt=1)
+                    controller.poll(now=poll_now, minimum_dt=1.0)
                     if (
                         controller.erg_enabled
                         and controller.status in
@@ -5681,8 +5687,8 @@ def create_app() -> FastAPI:
             return
 
         # Simulated ride: pedal at a steady wattage, compressing time so the
-        # whole session streams quickly. (Real hardware ticks at dt=1 in real
-        # time from a connected power source.)
+        # whole session streams quickly. (Real hardware uses monotonic loop
+        # intervals; connector replay uses one-second recorded samples.)
         trainer = bledevices.SimulatedTrainer()
         controller = RideController(
             session, ftp, trainer=trainer, user_id=uid,

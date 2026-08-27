@@ -176,6 +176,58 @@ def test_poll_drives_from_simulated_sources():
     assert c.status == "paused"           # zeros after start -> pause, not finish
 
 
+def test_poll_uses_monotonic_intervals_for_live_samples():
+    c = RideController(
+        _two_block_session(), 200,
+        power_source=SimulatedPowerSource([120, 120, 120]),
+        start_grace_s=0,
+        autosave=False,
+    )
+
+    assert c.poll(now=10.0)["elapsed"] == 0
+    assert c.poll(now=11.5)["elapsed"] == 1.5
+    assert c.poll(now=14.0)["elapsed"] == 4.0
+
+
+def test_poll_does_not_charge_idle_or_paused_wall_clock_gaps():
+    c = RideController(
+        _two_block_session(), 200,
+        power_source=SimulatedPowerSource(
+            [0, 120, 120, 120, 120, 120, 0, 0, 120, 120]
+        ),
+        start_grace_s=3,
+        zero_grace_s=3,
+        autosave=False,
+    )
+
+    c.poll(now=0.0)       # idle
+    c.poll(now=100.0)     # first pedal sample: no 100-second start gate
+    c.poll(now=101.0)
+    c.poll(now=102.0)
+    assert c.poll(now=103.0)["status"] == "running"
+    assert c.poll(now=104.0)["elapsed"] == 1.0
+
+    c.poll(now=105.0)
+    assert c.poll(now=107.0)["status"] == "paused"
+    c.poll(now=207.0)     # resume: no 100-second paused interval
+    assert c.poll(now=208.0)["elapsed"] == 2.0
+
+
+def test_sync_poll_clock_excludes_time_spent_replaying_samples():
+    c = RideController(
+        _two_block_session(), 200,
+        power_source=SimulatedPowerSource([120, 120]),
+        start_grace_s=0,
+        autosave=False,
+    )
+
+    c.poll(now=10.0)
+    c.tick(power=120, dt=5.0)  # connector replay, not wall-clock time
+    c.sync_poll_clock(now=100.0)
+
+    assert c.poll(now=101.0)["elapsed"] == 6.0
+
+
 def test_poll_uses_standalone_cadence_when_power_source_has_none():
     class CadenceOnly:
         def __init__(self, cadence):
