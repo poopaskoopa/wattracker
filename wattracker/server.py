@@ -5521,7 +5521,13 @@ def create_app() -> FastAPI:
                         resumed = True
 
                     previous_status = controller.status
-                    controller.poll(now=poll_now, minimum_dt=1.0)
+                    controller.poll(
+                        now=poll_now,
+                        minimum_dt=1.0,
+                        # One late tick is ordinary; a gap of more than
+                        # two cadences is a stall nobody measured.
+                        maximum_dt=2.0 * RIDE_POLL_INTERVAL_S,
+                    )
                     if (
                         controller.erg_enabled
                         and controller.status in

@@ -870,6 +870,61 @@ def test_ride_ws_real_path_erg_drives_trainer(client, monkeypatch):
     assert len(db.list_activities(uid)) == 1
 
 
+def test_ride_ws_survives_a_stalled_tick_without_pausing_the_ride(
+    client, monkeypatch
+):
+    """A single slow loop iteration must not spend the zero-power grace.
+
+    The live loop reads its monotonic clock at the top of the tick, so a slow
+    trainer command lands in the NEXT tick's measured interval. Charging that
+    whole gap would pause (or, in cooldown, end) a ride the rider never left.
+    """
+    from wattracker import server as servermod
+    from wattracker.ble.devices import SimulatedTrainer
+
+    _register(client)
+    trainer = SimulatedTrainer()
+    _patch_real_ride(monkeypatch, trainer, [150, 150, 150, 150] + [0] * 10)
+
+    stalled_tick = 5
+    clock_calls = 0
+
+    def fake_ride_time():
+        nonlocal clock_calls
+        tick = clock_calls // 2
+        processing = 0.02 if clock_calls % 2 else 0.0
+        clock_calls += 1
+        # One iteration hangs for 30 seconds on a trainer command.
+        stall = 30.0 if tick >= stalled_tick else 0.0
+        return float(tick) + stall + processing
+
+    monkeypatch.setattr(servermod, "_ride_loop_time", fake_ride_time)
+
+    frames = []
+    with client.websocket_connect("/ride/ws?type=endurance&minutes=30") as ws:
+        assert _receive_after_workout(ws)["status"] == "connected"
+        try:
+            while True:
+                frames.append(ws.receive_json())
+        except Exception:
+            pass
+
+    assert clock_calls // 2 > stalled_tick  # the stall really happened
+    statuses = [f.get("status") for f in frames if "elapsed" in f]
+    # Zero power starts at tick 4, so the stalled tick 5 has seen exactly two
+    # zero-power seconds: it must charge one more, not the whole 30-second
+    # gap, and the ride only pauses on the third zero tick.
+    assert statuses[stalled_tick] == "running"
+    assert statuses[stalled_tick + 1] == "paused"
+    # The 30-second gap was never observed, so it is not ride time either.
+    elapsed = [f["elapsed"] for f in frames if "elapsed" in f]
+    assert elapsed and max(elapsed) <= 2.0
+    assert any(f.get("status") == "inactivity_timeout" and f["saved"]
+               for f in frames)
+    uid = db.get_user_by_username("rider")["id"]
+    assert len(db.list_activities(uid)) == 1
+
+
 def test_ride_ws_awaits_ftms_commands_and_stops_before_disconnect(
     client, monkeypatch
 ):

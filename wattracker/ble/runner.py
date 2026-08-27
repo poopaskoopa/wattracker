@@ -284,6 +284,7 @@ class RideController:
         *,
         now: Optional[float] = None,
         minimum_dt: float = 0.0,
+        maximum_dt: Optional[float] = None,
     ) -> dict:
         """Read the attached sources (advancing simulated ones), then tick.
 
@@ -291,8 +292,10 @@ class RideController:
         interval is measured between polls rather than assumed to be one
         second. ``minimum_dt`` preserves the old one-sample-per-second
         fallback for callers that intentionally run the loop faster than real
-        time. Idle and paused gaps are never charged to the workout when the
-        first positive sample arrives.
+        time. ``maximum_dt`` bounds it from the other side: a poll that
+        arrives after a stall did not observe the gap, so the gap is not
+        charged to the workout. Idle and paused gaps are never charged to the
+        workout when the first positive sample arrives.
         """
         advanced = set()
         for src in (self.power_source, self.cadence_source, self.hr_source):
@@ -326,7 +329,29 @@ class RideController:
             self._poll_power_positive = p > 0
 
             floor_dt = max(0.0, float(minimum_dt))
+            if maximum_dt is None:
+                # Live callers pass their loop cadence; without one, allow a
+                # couple of seconds of ordinary lateness but always stay
+                # under the grace, so that no single poll can run the
+                # zero-power timer out and end a ride by itself. The
+                # protection comes from what is charged when the ceiling is
+                # crossed (one ordinary sample, below), not from its value.
+                ceiling_dt = min(2.0, self.zero_grace_s * 0.9)
+            else:
+                ceiling_dt = float(maximum_dt)
+            ceiling_dt = max(ceiling_dt, floor_dt)
             elapsed_dt = max(wall_dt, floor_dt)
+            if elapsed_dt > ceiling_dt:
+                # Nothing was measured across the gap, so charge one ordinary
+                # sample instead of the whole stall. Never charge nothing:
+                # ``elapsed`` has to keep step with the one-per-poll sample
+                # stream the ride file is built from.
+                elapsed_dt = floor_dt or ceiling_dt or wall_dt
+                _log.warning(
+                    "ride poll stalled for %.3fs; charging %.3fs to the "
+                    "workout clock",
+                    wall_dt, elapsed_dt,
+                )
             if p > 0 and (
                 (self.status in (IDLE, STARTING) and not previous_positive)
                 or self.status == PAUSED
