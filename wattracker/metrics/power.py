@@ -407,10 +407,25 @@ def ramp_test_ftp_candidate(power: Sequence[float]) -> float:
     recognizes only streams no longer than 45 minutes (the conservative upper
     bound for a 10-20 minute ramp workout plus cooldown), containing five or
     more consecutive, non-overlapping 60-second blocks whose power is fairly
-    steady (at most 12 W sample standard deviation), rises by 8-35 W each
-    minute, and has a preceding minute at least 20 W below the first block.
-    The 8-35 W slope range covers normal 10-30 W/min ramps while the preceding
-    low minute requires the short warm-up/ramp transition.
+    steady, rises by 8-35 W each minute, and has a preceding minute at least
+    20 W below the first block.  The 8-35 W slope range covers normal
+    10-30 W/min ramps while the preceding low minute requires the short
+    warm-up/ramp transition.
+
+    "Fairly steady" means a standard deviation no greater than 12 W or 7% of
+    the block's own power, whichever is larger.  A rider's steps get noisier as
+    a ramp gets hard - cadence surges, out-of-saddle efforts, a struggling last
+    minute - so a flat watt bound would demand the most composure exactly where
+    real ramps have the least.  An unsteady block, or the unsteady cooldown
+    that follows a ramp, ends the run at that point; it does not discard the
+    rising steps already recognized.
+
+    The run must also end in a collapse - some minute within the three that
+    follow it at most half the final step - unless it runs to the end of the
+    stream.  A ramp test ends in failure; a climb or a progressive ride tapers
+    or carries on.  Without it the warm-up guard has little force, since in a
+    20 W/min ramp every step is itself 20 W below the next and so qualifies as
+    the "clearly lower" minute for the step after it.
 
     The block alignment is allowed to move by up to 59 seconds because stored
     streams need not begin on a step boundary.  A result of 0.0 means that no
@@ -427,23 +442,39 @@ def ramp_test_ftp_candidate(power: Sequence[float]) -> float:
     # bound also prevents a long ride from turning into a quadratic scan.
     for start in range(min(15 * 60, arr.size - 6 * block) + 1):
         means = []
-        stable = True
         pos = start
         while pos + block <= arr.size:
             chunk = arr[pos:pos + block]
-            if float(chunk.std()) > 12.0:
-                stable = False
-                break
             mean = float(chunk.mean())
+            # An unsteady block ends the run rather than voiding it: what came
+            # before it was still a ramp.  The bound scales with the step's own
+            # power because a rider holds 300 W less exactly, in watts, than
+            # they hold 120 W; below 171 W the flat 12 W bound still governs.
+            if float(chunk.std()) > max(12.0, 0.07 * mean):
+                break
             if means and not 8.0 <= mean - means[-1] <= 35.0:
                 break
             means.append(mean)
             pos += block
-        if not stable or len(means) < 5:
+        if len(means) < 5:
             continue
         # Require the detected run to begin after a clearly lower warm-up
         # minute.  This rejects a sequence of rising intervals in isolation.
         if start < block or float(arr[start - block:start].mean()) > means[0] - 20.0:
+            continue
+        # Require the run to end in a collapse.  That is what a ramp test
+        # physically is: the rider cannot hold the next step and power falls
+        # away.  A climb, a group ride or a progressive workout tapers, or
+        # simply carries on, so demand that some minute in the three that
+        # follow is at most half the final step.  This is the guard that the
+        # warm-up minute cannot supply on its own, because in a ramp of 20 W a
+        # minute every step is itself "clearly lower" than the next.  A run
+        # reaching the end of the stream is exempt: a recording may stop at the
+        # moment of failure, leaving no cooldown to inspect.
+        tail = arr[pos:pos + 3 * block]
+        if tail.size >= block and float(
+            rolling_mean(tail, block).min()
+        ) > 0.5 * means[-1]:
             continue
         best_step = max(best_step, max(means))
     return best_step * 0.75
