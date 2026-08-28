@@ -248,8 +248,10 @@
     var chartMaxX = 0;
     var connectedAddresses = {};
     // One shared level makes every cue audible without changing its timing,
-    // frequency, or existing exponential fade-out.
-    var CUE_GAIN = 0.12;
+    // frequency, or existing exponential fade-out. The settings-page slider
+    // stores this same linear gain in the browser for the ride page to read.
+    var CUE_GAIN = 0.24;
+    var AUDIO_CUE_VOLUME_KEY = "wattracker.audioCueVolume";
     var positivePowerSeen = false;
     var configReconnectTimer = null;
     var CONFIG_RECONNECT_DEBOUNCE_MS = 250;
@@ -312,12 +314,27 @@
             return ctx;
         } catch (e) { return null; }
     }
+    function getCueGain() {
+        try {
+            var stored = localStorage.getItem(AUDIO_CUE_VOLUME_KEY);
+            if (stored !== null && stored.trim() !== "") {
+                var volume = Number(stored);
+                if (isFinite(volume) && volume >= 0 && volume <= 1) return volume;
+            }
+        } catch (e) {}
+        return CUE_GAIN;
+    }
     function playTone(ctx, frequency, delay, duration) {
         var osc = ctx.createOscillator(), gain = ctx.createGain();
         var start = ctx.currentTime + delay;
+        var cueGain = getCueGain();
         osc.frequency.value = frequency;
-        gain.gain.setValueAtTime(CUE_GAIN, start);
-        gain.gain.exponentialRampToValueAtTime(0.001, start + duration);
+        gain.gain.setValueAtTime(cueGain, start);
+        if (cueGain > 0) {
+            gain.gain.exponentialRampToValueAtTime(0.001, start + duration);
+        } else {
+            gain.gain.setValueAtTime(0, start + duration);
+        }
         osc.connect(gain); gain.connect(ctx.destination);
         osc.start(start); osc.stop(start + duration);
     }

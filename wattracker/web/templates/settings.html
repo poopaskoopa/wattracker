@@ -54,6 +54,16 @@
         <span class="hint">Used to decide which dated workouts are available
             on the Ride page. Timestamps remain stored in UTC.</span>
     </label>
+    <fieldset class="audio-settings">
+        <legend>Audio cues</legend>
+        <label for="audioCueVolume">Volume
+            <output id="audioCueVolumeValue" for="audioCueVolume">24%</output>
+            <input type="range" id="audioCueVolume" min="0" max="1" step="0.01"
+                   value="0.24" aria-describedby="audioCueVolumeHint">
+        </label>
+        <p id="audioCueVolumeHint" class="hint">Controls ride sound effects and
+            audio cues in this browser. Changes apply immediately.</p>
+    </fieldset>
     {% if zwift_candidates %}
     {#
       With nothing saved and exactly ONE folder detected, pre-check it: that is
@@ -347,4 +357,36 @@
     <code>LLM_MODEL</code>, <code>WATTRACKER_SECRET</code>) override stored
     values; <code>ANTHROPIC_API_KEY</code> is the legacy name for
     <code>API_KEY</code>.</p>
+{% endblock %}
+
+{% block scripts %}
+<script>
+(function () {
+    var DEFAULT_AUDIO_VOLUME = 0.24;
+    var AUDIO_CUE_VOLUME_KEY = "wattracker.audioCueVolume";
+    var slider = document.getElementById("audioCueVolume");
+    var output = document.getElementById("audioCueVolumeValue");
+    if (!slider || !output) return;
+
+    function parseVolume(raw) {
+        if (raw === null || String(raw).trim() === "") return null;
+        var volume = Number(raw);
+        return isFinite(volume) && volume >= 0 && volume <= 1 ? volume : null;
+    }
+    function setVolume(raw, persist) {
+        var volume = parseVolume(raw);
+        if (volume === null) volume = DEFAULT_AUDIO_VOLUME;
+        slider.value = volume.toFixed(2);
+        output.textContent = Math.round(volume * 100) + "%";
+        if (persist) {
+            try { localStorage.setItem(AUDIO_CUE_VOLUME_KEY, slider.value); } catch (e) {}
+        }
+    }
+
+    var saved = null;
+    try { saved = parseVolume(localStorage.getItem(AUDIO_CUE_VOLUME_KEY)); } catch (e) {}
+    setVolume(saved === null ? DEFAULT_AUDIO_VOLUME : saved, saved === null);
+    slider.addEventListener("input", function () { setVolume(slider.value, true); });
+})();
+</script>
 {% endblock %}
