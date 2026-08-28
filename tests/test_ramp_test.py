@@ -442,7 +442,7 @@ def test_accepting_reads_the_ride_at_the_rate_it_was_recorded(client):
         if r.status_code == 400:
             continue                          # refused is fine; silently wrong is not
         body = r.json()
-        assert body["ftp"] == pytest.approx(at_one_hz["ftp"], rel=0.02), (
+        assert body["ftp"] == pytest.approx(at_one_hz["ftp"], abs=1.0), (
             tick, body["ftp"], at_one_hz["ftp"]
         )
 
@@ -493,6 +493,99 @@ def test_an_accepted_result_survives_the_next_evaluation_window(client):
 
     assert db.latest_ftp(uid)["source"] == "ramp_test"
     assert importer.current_ftp(uid, now=later) == pytest.approx(measured, abs=0.5)
+
+
+def test_a_manual_row_is_still_superseded_when_the_clock_fires(client):
+    """Protecting a MEASURED result must not freeze a typed one.
+
+    /profile's "use FTP history or FIT estimate" clears user_settings.ftp but
+    leaves behind the manual ftp_history row an earlier sweep wrote. Guarding
+    every asserted source here turned that button into a permanent no-op: the
+    rider asked to go back to automatic and trained on their old typed number
+    forever, with nothing to notice.
+    """
+    import datetime as dt
+
+    uid = _register(client, "rider_manual_thaws")
+    importer.save_ride_record(
+        user_id=uid,
+        started_at=dt.datetime.combine(_test_day(), dt.time(7, 0, 0)),
+        duration_s=3600,
+        samples={"power": [220] * 3600, "cadence": [], "heartrate": []},
+        session_name="Endurance",
+        ftp=209,
+    )
+    db.save_user_settings(uid, {"ftp": 150.0})
+    importer.evaluate_ftp(uid)                      # writes the manual row
+    assert db.latest_ftp(uid)["source"] == "manual"
+
+    db.set_user_ftp_override(uid, None)             # the reset button
+    importer.evaluate_ftp(uid, now=utc_now() + dt.timedelta(days=30))
+
+    assert db.latest_ftp(uid)["source"] == "estimated"
+
+
+def test_an_unusable_asserted_row_does_not_freeze_history(client):
+    """current_ftp ignores a row outside the assertable range and estimates
+    instead; blocking on one would leave history and the live basis disagreeing
+    forever - and ftp_rescore reads its basis out of history."""
+    import datetime as dt
+
+    uid = _register(client, "rider_bad_row")
+    db.save_user_settings(uid, {"ftp": None})
+    importer.save_ride_record(
+        user_id=uid,
+        started_at=dt.datetime.combine(_test_day(), dt.time(7, 0, 0)),
+        duration_s=3600,
+        samples={"power": [220] * 3600, "cadence": [], "heartrate": []},
+        session_name="Endurance",
+        ftp=209,
+    )
+    db.add_ftp_entry(uid, _test_day().isoformat(), 3.0, ramp_test.SOURCE,
+                     replace_existing=True)
+
+    importer.evaluate_ftp(uid, now=utc_now() + dt.timedelta(days=30))
+    assert db.latest_ftp(uid)["source"] == "estimated"
+
+
+def test_a_measured_rider_still_gets_told_their_ftp_looks_stale(client):
+    """Accepting clears the settings override, so keying the feedback path on
+    that setting alone left a measured rider with no moving FTP and no
+    suggestion either - silence in both directions."""
+    import datetime as dt
+    from wattracker.prescribe import zwo
+
+    uid = _register(client, "rider_measured_suggestion")
+    db.save_user_settings(uid, {"ftp": None})
+    activity_id, _ = _record_ramp_test(uid)
+    client.post("/api/ftp/ramp-test/accept", json={"activity_id": activity_id})
+    assert db.latest_ftp(uid)["source"] == ramp_test.SOURCE
+    measured = float(db.latest_ftp(uid)["ftp_watts"])
+
+    # Threshold sessions that keep coming back far easier than prescribed.
+    day = _test_day().isoformat()
+    for key in ("easy-1", "easy-2"):
+        session = build_workout("threshold", 60)
+        workout_id = db.add_standalone_workout(
+            uid, key, day, session.name, "threshold",
+            session.total_duration(), session.estimated_tss,
+            zwo.zwo_string(session), measured,
+        )
+        assert db.mark_standalone_completed(
+            uid, workout_id, 10_000 + workout_id, day, 0.95, measured + 45
+        )
+        assert db.set_standalone_rpe(uid, workout_id, 3)
+
+    applied = importer.apply_rpe_ftp_feedback(
+        uid, dt.datetime.combine(_test_day(), dt.time(20, 0, 0))
+    )
+
+    # The measurement still stands - it is the rider's own number, not ours...
+    assert applied is None
+    assert db.latest_ftp(uid)["source"] == ramp_test.SOURCE
+    assert float(db.latest_ftp(uid)["ftp_watts"]) == pytest.approx(measured)
+    # ...but they are no longer told nothing.
+    assert db.pending_ftp_suggestion(uid) is not None
 
 
 def test_accepting_clears_a_typed_settings_override(client):

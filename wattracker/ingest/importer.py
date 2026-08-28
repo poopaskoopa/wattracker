@@ -32,7 +32,7 @@ from ..metrics.power import (
 )
 from ..metrics import profile_store
 from ..prescribe.plan import HARD_STEADY_POWER
-from ..ramp_test import is_declared_ftp_test
+from ..ramp_test import SOURCE as RAMP_TEST_SOURCE, is_declared_ftp_test
 from ..timeutil import parse_naive, utc_now, utc_today
 from .fit_parser import parse_fit
 
@@ -381,14 +381,26 @@ def evaluate_ftp(user_id: int, now: Optional[_dt.datetime] = None) -> bool:
     override = _asserted_override(user_id)
     if override is not None:
         return _record_asserted_ftp(user_id, float(override), now)
-    # An asserted row already standing is the rider's own answer, and a passive
-    # estimate must not walk over it when the update clock next comes round.
-    # ``current_ftp`` reads the LATEST row regardless of source, so appending
-    # here would have quietly restored the stale-low estimate a measured ramp
-    # test had just replaced - three weeks after the rider measured it, with
-    # nothing to notice. A rider who wants a different number states one.
-    latest = db.latest_ftp(user_id)
-    if latest is not None and is_asserted_source(latest.get("source")):
+    # A MEASURED result standing as the latest row is not something a passive
+    # estimate may walk over when the update clock comes round. ``current_ftp``
+    # reads the latest row regardless of source, so appending here quietly
+    # restored the stale-low estimate a ramp test had just replaced, three
+    # weeks after the rider measured themselves, with nothing to notice.
+    #
+    # Deliberately NOT every asserted source. A ``manual`` row is respected
+    # until the clock fires and then superseded, and that is load-bearing
+    # elsewhere: /profile's "use FTP history or FIT estimate" clears
+    # ``user_settings.ftp`` but leaves the manual row it already wrote, so
+    # freezing manual rows here would turn that button into a permanent no-op
+    # and strand the rider on a number they asked to stop using.
+    #
+    # The value must also be one ``current_ftp`` would actually use. A row
+    # outside the assertable range is ignored there in favour of a fresh
+    # estimate, so blocking on it would leave history and the live basis
+    # disagreeing forever - and ftp_rescore reads its basis out of history.
+    latest = db.latest_ftp(user_id) or {}
+    if (latest.get("source") == RAMP_TEST_SOURCE
+            and asserted_ftp(latest.get("ftp_watts")) is not None):
         return False
     est = _current_estimate(passive_ftp_evidence(user_id), now)
     if est <= 0:
@@ -1598,12 +1610,20 @@ def apply_rpe_ftp_feedback(
     """
     now = now or utc_now()
     settings = db.get_user_settings(user_id)
-    manual = bool(settings.get("ftp") and float(settings["ftp"]) > 0)
     latest = db.latest_ftp(user_id)
-    if manual:
+    # A measured ramp test is the rider's own number just as a typed one is,
+    # and accepting one deliberately clears ``user_settings.ftp`` - so keying
+    # this on the setting alone dropped that rider into a gap where the
+    # training FTP could not move AND no suggestion was ever filed. They would
+    # be told nothing while their evidence drifted away from the measurement.
+    measured = (latest or {}).get("source") == RAMP_TEST_SOURCE
+    manual = bool(settings.get("ftp") and float(settings["ftp"]) > 0)
+    if manual or measured:
         # Judge the evidence against the FTP the rider actually trained at -
         # their manual value - not against a shadow estimate they never used.
-        current = float(settings["ftp"])
+        current = (
+            float(settings["ftp"]) if manual else float(latest["ftp_watts"])
+        )
         ftp_date = (latest or {}).get("date") or now.date().isoformat()
     else:
         if not latest or latest.get("source") != "estimated":
@@ -1652,10 +1672,12 @@ def apply_rpe_ftp_feedback(
     updated = max(50.0, min(600.0, current + max(-limit, min(limit, desired - current))))
     updated = round(updated, 1)
     delta = round(updated - current, 1)
-    if manual:
-        # Consume the evidence either way: a suggestion the rider dismisses
-        # must not reappear from the same workouts, and evidence that implies
-        # no change has still been used up.
+    if manual or measured:
+        # A stated number and a measured one are both the rider's own, and
+        # neither moves on its own - but the evidence is filed as a suggestion
+        # rather than thrown away. Consume it either way: a suggestion the
+        # rider dismisses must not reappear from the same workouts, and
+        # evidence that implies no change has still been used up.
         db.record_ftp_suggestion(
             user_id, ftp_date, current, updated, chosen,
             summary=[_evidence_summary(e) for e in chosen],
