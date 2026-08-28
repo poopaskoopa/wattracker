@@ -936,6 +936,26 @@ button.danger.link-btn { border: none; color: var(--alert); }
     background: var(--surface-border); }
 .ride-chart-chip.erg-dark, .ride-chart-chip.device-dark { opacity: 0.45;
     filter: saturate(0.4); color: var(--muted); }
+/* Intensity nudge. Only rendered when the rider has moved off the
+   prescription, so it can afford to be loud: the accent reads at a glance
+   from a bike, and the chart twin repeats it because full screen hides the
+   cards row. */
+.intensity-badge { margin-left: 0.4rem; padding: 0.1rem 0.35rem; border-radius: var(--r-sm);
+    border: 1px solid var(--accent); color: var(--accent);
+    background: color-mix(in srgb, var(--accent) 12%, transparent);
+    font-size: 0.72rem; font-weight: 700; letter-spacing: 0.04em;
+    font-variant-numeric: tabular-nums; vertical-align: middle; }
+.intensity-badge[hidden] { display: none; }
+/* The refusal note replaces the percentage in the same chip, so it drops the
+   loud tabular-number treatment and reads as a sentence. */
+.intensity-badge.intensity-note { font-weight: 600; letter-spacing: 0.01em;
+    text-transform: none; font-variant-numeric: normal; }
+.ride-chart-intensity { position: absolute; z-index: 2; left: 0.35rem; top: 0.35rem;
+    opacity: 1; border-color: var(--accent); color: var(--accent);
+    background: color-mix(in srgb, var(--surface-inset) 88%, transparent);
+    font-variant-numeric: tabular-nums;
+    box-shadow: 0 0 10px color-mix(in srgb, var(--accent) 30%, transparent); }
+.ride-chart-intensity[hidden] { display: none; }
 .ride-chart-erg { position: absolute; z-index: 2; left: 0.35rem; bottom: 0.35rem; }
 .ride-chart-erg.erg-lit { opacity: 1; border-color: var(--ok); color: var(--ok);
     box-shadow: 0 0 10px color-mix(in srgb, var(--ok) 35%, transparent); }

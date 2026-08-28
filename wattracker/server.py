@@ -5661,6 +5661,29 @@ def create_app() -> FastAPI:
                             }
                         )
                         return None
+                    if action == "adjust_intensity":
+                        delta = message.get("delta")
+                        if type(delta) is not int or not (-50 <= delta <= 50):
+                            await websocket.send_json(
+                                {
+                                    "status": "error",
+                                    "error": "Invalid intensity delta.",
+                                }
+                            )
+                            return None
+                        # A ramp test refuses the nudge outright (the protocol
+                        # IS the measurement). Say so, so the page can explain
+                        # the dead key instead of showing a stuck +0%.
+                        locked = bool(getattr(controller, "intensity_locked", False))
+                        bias = controller.adjust_intensity_bias(delta)
+                        # Answer at once: the badge should track the key, not
+                        # wait for the next 1 Hz state frame. The trainer
+                        # setpoint follows on the next poll tick.
+                        reply = {"status": "intensity", "bias": bias}
+                        if locked:
+                            reply["locked"] = True
+                        await websocket.send_json(reply)
+                        return None
                     await websocket.send_json(
                         {"status": "error", "error": "Unknown ride action."}
                     )

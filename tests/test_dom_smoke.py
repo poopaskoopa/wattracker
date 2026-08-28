@@ -1225,3 +1225,448 @@ def test_just_ride_cards_are_one_per_row_and_legible(page, live_server,
         assert card["svgText"] == "", f"thumbnail leaked text: {card['svgText']!r}"
         assert not re.search(r"\d{6,}", card["text"].replace(" ", "")), card["text"]
     _assert_clean(console_errors, "/ride card layout")
+
+
+# The simulated ride is the only in-browser ride, and its server side never
+# reads the socket, so the server's half of the exchange has to come from here.
+# This records every outbound frame and then behaves as the ride handler does:
+# it clamps and answers a nudge immediately, and it carries the bias on every
+# subsequent state frame -- which matters, because a state frame that still
+# said 1.0 would wipe the badge a tick later.
+def _record_sends_and_answer_intensity(page):
+    page.add_init_script(
+        """
+        (() => {
+            window.__sent = [];
+            window.__bias = 1;
+            const Native = window.WebSocket;
+            function Tracked(url, protocols) {
+                const socket = protocols === undefined
+                    ? new Native(url) : new Native(url, protocols);
+                let handler = null;
+                Object.defineProperty(socket, 'onmessage', {
+                    configurable: true,
+                    get() { return handler; },
+                    set(fn) { handler = fn; },
+                });
+                // The demo ride compresses ~45 minutes into ~1 second, then
+                // finishes and closes: the page drops out of full screen (as
+                // it should, when a ride really ends) and onclose nulls the
+                // socket, so the keys would be inert for reasons that have
+                // nothing to do with riding. The two lines below and the
+                // dropped 'finished' frame keep the ride live for the length
+                // of the test; everything the page renders still came from the
+                // real ride frames.
+                Object.defineProperty(socket, 'readyState', {
+                    configurable: true, get: () => Native.OPEN,
+                });
+                Object.defineProperty(socket, 'onclose', {
+                    configurable: true, get() { return null; }, set(fn) {},
+                });
+                socket.__deliver = (frame) => {
+                    if (handler) handler({data: JSON.stringify(frame)});
+                };
+                socket.addEventListener('message', (event) => {
+                    if (!handler) return;
+                    let frame = null;
+                    try { frame = JSON.parse(event.data); } catch (e) { frame = null; }
+                    if (frame && frame.status === 'finished') return;
+                    if (frame && 'intensity_bias' in frame) {
+                        frame.intensity_bias = window.__bias;
+                        socket.__deliver(frame);
+                        return;
+                    }
+                    handler(event);
+                });
+                const nativeSend = socket.send.bind(socket);
+                socket.send = (data) => {
+                    window.__sent.push(data);
+                    let frame = null;
+                    try { frame = JSON.parse(data); } catch (e) { frame = null; }
+                    if (frame && frame.action === 'adjust_intensity') {
+                        const next = Math.round(
+                            (window.__bias + frame.delta / 100) * 100) / 100;
+                        window.__bias = Math.min(1.5, Math.max(0.5, next));
+                        const bias = window.__bias;
+                        window.setTimeout(
+                            () => socket.__deliver({status: 'intensity', bias: bias}), 0);
+                        return;
+                    }
+                    return nativeSend(data);
+                };
+                return socket;
+            }
+            Tracked.prototype = Native.prototype;
+            ['CONNECTING', 'OPEN', 'CLOSING', 'CLOSED'].forEach(
+                (k) => { Tracked[k] = Native[k]; });
+            window.WebSocket = Tracked;
+        })();
+        """
+    )
+
+
+# Both badges, as the rider sees them: the text of each, or None when it does
+# not render at all. Read in one page-side pass, because a hidden attribute
+# toggling under a live ride makes two separate Playwright queries disagree.
+_BADGE_STATE_JS = """() => {
+    const read = (id) => {
+        const el = document.getElementById(id);
+        if (!el || el.hidden) return null;
+        const style = getComputedStyle(el);
+        const box = el.getBoundingClientRect();
+        if (style.display === 'none' || style.visibility === 'hidden') return null;
+        if (Number(style.opacity) === 0 || box.width <= 0 || box.height <= 0) return null;
+        return el.textContent;
+    };
+    return {chart: read('rIntensityBiasChart'), card: read('rIntensityBias')};
+}"""
+
+
+def _record_sends_and_answer_intensity_isolatable(page):
+    """Same harness as `_record_sends_and_answer_intensity`, but exposes the
+    live socket as `window.__socket` (for injecting a raw frame directly), a
+    `window.__lockIntensity` toggle that answers a nudge the way a ramp test
+    does (refused, bias unmoved, `locked: true`), and a
+    `window.__suppressRunningFrames` toggle that drops real inbound ride
+    ticks entirely -- letting a test isolate the synthesized `status:
+    "intensity"` reply from the per-tick state frame, since both otherwise
+    render the same badge and mask each other's removal."""
+    page.add_init_script(
+        """
+        (() => {
+            window.__sent = [];
+            window.__bias = 1;
+            window.__lockIntensity = false;
+            window.__suppressRunningFrames = false;
+            const Native = window.WebSocket;
+            function Tracked(url, protocols) {
+                const socket = protocols === undefined
+                    ? new Native(url) : new Native(url, protocols);
+                window.__socket = socket;
+                let handler = null;
+                Object.defineProperty(socket, 'onmessage', {
+                    configurable: true,
+                    get() { return handler; },
+                    set(fn) { handler = fn; },
+                });
+                Object.defineProperty(socket, 'readyState', {
+                    configurable: true, get: () => Native.OPEN,
+                });
+                Object.defineProperty(socket, 'onclose', {
+                    configurable: true, get() { return null; }, set(fn) {},
+                });
+                socket.__deliver = (frame) => {
+                    if (handler) handler({data: JSON.stringify(frame)});
+                };
+                socket.addEventListener('message', (event) => {
+                    if (!handler) return;
+                    let frame = null;
+                    try { frame = JSON.parse(event.data); } catch (e) { frame = null; }
+                    if (frame && frame.status === 'finished') return;
+                    if (window.__suppressRunningFrames && frame &&
+                        (frame.status === 'running' || frame.status === 'starting' ||
+                         frame.status === 'paused' || frame.status === 'cooldown')) {
+                        return;
+                    }
+                    if (frame && 'intensity_bias' in frame) {
+                        frame.intensity_bias = window.__bias;
+                        socket.__deliver(frame);
+                        return;
+                    }
+                    handler(event);
+                });
+                const nativeSend = socket.send.bind(socket);
+                socket.send = (data) => {
+                    window.__sent.push(data);
+                    let frame = null;
+                    try { frame = JSON.parse(data); } catch (e) { frame = null; }
+                    if (frame && frame.action === 'adjust_intensity') {
+                        if (window.__lockIntensity) {
+                            window.setTimeout(() => socket.__deliver(
+                                {status: 'intensity', bias: window.__bias,
+                                 locked: true}), 0);
+                            return;
+                        }
+                        const next = Math.round(
+                            (window.__bias + frame.delta / 100) * 100) / 100;
+                        window.__bias = Math.min(1.5, Math.max(0.5, next));
+                        const bias = window.__bias;
+                        window.setTimeout(
+                            () => socket.__deliver({status: 'intensity', bias: bias}), 0);
+                        return;
+                    }
+                    return nativeSend(data);
+                };
+                return socket;
+            }
+            Tracked.prototype = Native.prototype;
+            ['CONNECTING', 'OPEN', 'CLOSING', 'CLOSED'].forEach(
+                (k) => { Tracked[k] = Native[k]; });
+            window.WebSocket = Tracked;
+        })();
+        """
+    )
+
+
+def _badge_state(page):
+    return page.evaluate(_BADGE_STATE_JS)
+
+
+def _wait_for(page, expression, timeout=10_000):
+    # Timer polling, not rAF: the chart panel's animation frames are not a
+    # reliable clock while it is full screen.
+    page.wait_for_function("() => " + expression, timeout=timeout, polling=100)
+
+
+def _wait_for_badge(page, text, timeout=10_000):
+    """Wait until BOTH badges render exactly `text` and are really visible."""
+    page.wait_for_function(
+        "(want) => { const s = (" + _BADGE_STATE_JS + ")();"
+        " return s.chart === want && s.card === want; }",
+        arg=text, timeout=timeout, polling=100)
+
+
+def test_ride_fullscreen_plus_minus_nudges_intensity_and_badges_it(
+    page, live_server, console_errors
+):
+    """+/- in full screen is the only way to change intensity mid-ride.
+
+    Full screen hides the cards row, so the badge is asserted where the rider
+    actually is -- on the chart chip -- and the keys are asserted to be inert
+    before full screen, where they would otherwise fight ordinary page use.
+    """
+    _record_sends_and_answer_intensity(page)
+    page.goto(f"{live_server.base}/ride")
+    page.wait_for_load_state("networkidle")
+    page.click("#simBtn")
+    page.wait_for_selector("#stopBtn:not([disabled])", timeout=15_000)
+
+    # Not in full screen: the keys do nothing at all.
+    page.keyboard.press("+")
+    page.keyboard.press("-")
+    assert page.evaluate("window.__sent.filter("
+                         "(d) => d.indexOf('adjust_intensity') >= 0)") == []
+    assert _badge_state(page) == {"chart": None, "card": None}
+
+    page.click("#chartFullscreenBtn")
+    _wait_for(page, "document.getElementById('chartFullscreenBtn')"
+                    ".getAttribute('aria-pressed') === 'true'")
+
+    for _ in range(3):
+        page.keyboard.press("+")
+    _wait_for_badge(page, "+3%")
+    sent = [json.loads(d) for d in page.evaluate("window.__sent")]
+    nudges = [f for f in sent if f.get("action") == "adjust_intensity"]
+    assert nudges == [{"action": "adjust_intensity", "delta": 1}] * 3
+
+    # Down through neutral: the badge disappears at 0% and comes back negative.
+    for _ in range(3):
+        page.keyboard.press("-")
+    _wait_for(page, "document.getElementById('rIntensityBiasChart').hidden")
+    assert _badge_state(page) == {"chart": None, "card": None}
+
+    page.keyboard.press("-")
+    _wait_for_badge(page, "-1%")
+
+    # Back out of full screen: the badge the rider set is still on the card.
+    page.keyboard.press("Escape")
+    _wait_for(page, "document.getElementById('chartFullscreenBtn')"
+                    ".getAttribute('aria-pressed') === 'false'")
+    assert _badge_state(page)["card"] == "-1%"
+
+    _assert_clean(console_errors, "/ride intensity nudge")
+
+
+def test_ride_fullscreen_equals_and_underscore_are_aliases_for_plus_minus(
+    page, live_server, console_errors
+):
+    """'=' and '_' (the unshifted/shifted keys sharing +/- on a US keyboard)
+    must drive the same nudge, so a rider does not have to hit Shift."""
+    _record_sends_and_answer_intensity(page)
+    page.goto(f"{live_server.base}/ride")
+    page.wait_for_load_state("networkidle")
+    page.click("#simBtn")
+    page.wait_for_selector("#stopBtn:not([disabled])", timeout=15_000)
+    page.click("#chartFullscreenBtn")
+    _wait_for(page, "document.getElementById('chartFullscreenBtn')"
+                    ".getAttribute('aria-pressed') === 'true'")
+
+    for _ in range(3):
+        page.keyboard.press("=")
+    _wait_for_badge(page, "+3%")
+    sent = [json.loads(d) for d in page.evaluate("window.__sent")]
+    nudges = [f for f in sent if f.get("action") == "adjust_intensity"]
+    assert nudges == [{"action": "adjust_intensity", "delta": 1}] * 3
+
+    for _ in range(4):
+        page.keyboard.press("_")
+    _wait_for_badge(page, "-1%")
+
+    _assert_clean(console_errors, "/ride intensity nudge alias keys")
+
+
+def test_ride_fullscreen_intensity_key_prevents_default_only_for_itself(
+    page, live_server, console_errors
+):
+    _record_sends_and_answer_intensity(page)
+    page.goto(f"{live_server.base}/ride")
+    page.wait_for_load_state("networkidle")
+    page.click("#simBtn")
+    page.wait_for_selector("#stopBtn:not([disabled])", timeout=15_000)
+    page.click("#chartFullscreenBtn")
+    _wait_for(page, "document.getElementById('chartFullscreenBtn')"
+                    ".getAttribute('aria-pressed') === 'true'")
+
+    page.evaluate(
+        """() => {
+            window.__lastPrevented = {};
+            document.addEventListener('keydown', (event) => {
+                window.__lastPrevented[event.key] = event.defaultPrevented;
+            }, {capture: false});
+        }"""
+    )
+    page.keyboard.press("+")
+    page.keyboard.press("a")
+    prevented = page.evaluate("window.__lastPrevented")
+    assert prevented["+"] is True
+    assert prevented["a"] is False
+
+    _assert_clean(console_errors, "/ride intensity nudge preventDefault")
+
+
+def test_ride_fullscreen_intensity_keys_are_inert_while_typing(
+    page, live_server, console_errors
+):
+    """A focused form control inside the chart panel absorbs +/- as normal
+    text input instead of nudging the ride."""
+    _record_sends_and_answer_intensity(page)
+    page.goto(f"{live_server.base}/ride")
+    page.wait_for_load_state("networkidle")
+    page.click("#simBtn")
+    page.wait_for_selector("#stopBtn:not([disabled])", timeout=15_000)
+    page.click("#chartFullscreenBtn")
+    _wait_for(page, "document.getElementById('chartFullscreenBtn')"
+                    ".getAttribute('aria-pressed') === 'true'")
+
+    page.evaluate(
+        """() => {
+            const input = document.createElement('input');
+            input.type = 'text';
+            input.id = 'probeTypingInput';
+            document.getElementById('rideChartPanel').appendChild(input);
+            input.focus();
+        }"""
+    )
+    page.keyboard.press("+")
+    page.keyboard.press("-")
+    assert page.evaluate("window.__sent.filter("
+                         "(d) => d.indexOf('adjust_intensity') >= 0)") == []
+    assert _badge_state(page) == {"chart": None, "card": None}
+    assert page.evaluate(
+        "document.getElementById('probeTypingInput').value"
+    ) == "+-"
+
+    _assert_clean(console_errors, "/ride intensity nudge typing gate")
+
+
+def test_ride_fullscreen_intensity_badge_renders_from_the_status_reply_alone(
+    page, live_server, console_errors
+):
+    """renderIntensityBias is called from two places (the per-tick state
+    frame and the synthesized "intensity" status reply); with real ride
+    ticks suppressed, only the reply path can be driving the badge here."""
+    _record_sends_and_answer_intensity_isolatable(page)
+    page.goto(f"{live_server.base}/ride")
+    page.wait_for_load_state("networkidle")
+    page.click("#simBtn")
+    page.wait_for_selector("#stopBtn:not([disabled])", timeout=15_000)
+    page.click("#chartFullscreenBtn")
+    _wait_for(page, "document.getElementById('chartFullscreenBtn')"
+                    ".getAttribute('aria-pressed') === 'true'")
+
+    page.evaluate("window.__suppressRunningFrames = true")
+    page.keyboard.press("+")
+    page.keyboard.press("+")
+    _wait_for_badge(page, "+2%")
+
+    _assert_clean(console_errors, "/ride intensity badge from reply alone")
+
+
+def test_ride_fullscreen_intensity_badge_renders_from_a_state_frame_alone(
+    page, live_server, console_errors
+):
+    """A raw state frame carrying intensity_bias, delivered without ever
+    going through the adjust_intensity action/reply, must still badge it --
+    proving the per-tick render() path (not the "intensity" reply) is what
+    rendered it."""
+    _record_sends_and_answer_intensity_isolatable(page)
+    page.goto(f"{live_server.base}/ride")
+    page.wait_for_load_state("networkidle")
+    page.click("#simBtn")
+    page.wait_for_selector("#stopBtn:not([disabled])", timeout=15_000)
+    page.click("#chartFullscreenBtn")
+    _wait_for(page, "document.getElementById('chartFullscreenBtn')"
+                    ".getAttribute('aria-pressed') === 'true'")
+
+    # Bypass the send/reply machinery entirely: hand the socket a synthetic
+    # running frame with a bias no keypress ever requested.
+    page.evaluate(
+        """() => {
+            window.__socket.__deliver({
+                status: 'running', intensity_bias: 1.07, target_watts: 150,
+                power: 150, cadence: 90, hr: null, elapsed: 10,
+                segment_index: 0, segment_count: 1, progress: 0.5
+            });
+        }"""
+    )
+    _wait_for_badge(page, "+7%")
+
+    _assert_clean(console_errors, "/ride intensity badge from state frame alone")
+
+
+_LOCK_NOTE = "Intensity locked during a ramp test"
+
+
+def test_ride_fullscreen_intensity_locked_reply_shows_a_note_not_a_percentage(
+    page, live_server, console_errors
+):
+    """A ramp test refuses the nudge, so the chip must explain the dead key.
+
+    A `+0%` badge would be the wrong answer twice over: it reads as a bias the
+    rider set, and 0% is precisely the state the chip is meant to be absent
+    for. The note is transient -- the 1 Hz state frames must not wipe it the
+    instant it appears, and it must not sit there for the rest of the ride.
+    """
+    _record_sends_and_answer_intensity_isolatable(page)
+    page.goto(f"{live_server.base}/ride")
+    page.wait_for_load_state("networkidle")
+    page.click("#simBtn")
+    page.wait_for_selector("#stopBtn:not([disabled])", timeout=15_000)
+    page.click("#chartFullscreenBtn")
+    _wait_for(page, "document.getElementById('chartFullscreenBtn')"
+                    ".getAttribute('aria-pressed') === 'true'")
+
+    # Nothing is badged on an ordinary ride at 0%, before any key is pressed.
+    assert _badge_state(page) == {"chart": None, "card": None}
+
+    page.evaluate("window.__lockIntensity = true")
+    page.keyboard.press("+")
+    _wait_for_badge(page, _LOCK_NOTE)
+
+    # It survives the state frames arriving underneath it...
+    page.wait_for_timeout(1_500)
+    shown = _badge_state(page)
+    assert shown["chart"] == shown["card"] == _LOCK_NOTE
+    assert "%" not in shown["chart"]
+
+    # ...and then clears itself, back to the no-badge state of an unbiased ride.
+    _wait_for(page, "document.getElementById('rIntensityBiasChart').hidden",
+              timeout=15_000)
+    assert _badge_state(page) == {"chart": None, "card": None}
+
+    # The keys are not broken by the refusal: an unlocked ride still nudges.
+    page.evaluate("window.__lockIntensity = false")
+    page.keyboard.press("+")
+    _wait_for_badge(page, "+1%")
+
+    _assert_clean(console_errors, "/ride intensity locked note")

@@ -35,6 +35,20 @@ def _receive_after_workout(ws):
     return ws.receive_json()
 
 
+def _receive_until(ws, predicate, description, cap=200):
+    """Receive JSON frames until `predicate` matches one, or fail cleanly.
+
+    A regression that stops a code path from ever sending the awaited frame
+    would otherwise hang the loop (and the test run) forever, since the
+    websocket has no server-side timeout here.
+    """
+    for _ in range(cap):
+        message = ws.receive_json()
+        if predicate(message):
+            return message
+    pytest.fail(f"never received {description} after {cap} frames")
+
+
 def _force_bt_unavailable(monkeypatch):
     # Force the "no Bluetooth" branch regardless of whether the [ble] extra
     # (bleak) is installed in the test environment, so the suite is deterministic
@@ -2350,3 +2364,180 @@ def test_ride_ws_ends_a_ramp_test_on_failure_and_offers_the_result(
     )
     assert accepted.status_code == 200, accepted.text
     assert accepted.json()["ftp"] == pytest.approx(result["ftp"], abs=0.1)
+
+
+def test_ride_ws_intensity_nudge_raises_the_target_and_survives_bad_input(
+    client, monkeypatch
+):
+    """+/- in full screen must move the number the TRAINER is commanded.
+
+    The setpoint is issued server-side from ``controller.current_target``, so a
+    client-only tweak would change the readout and leave the trainer holding
+    the prescription. The bias therefore lives on the controller, and the reply
+    frame exists only so the badge can track the key rather than the 1 Hz state
+    frame.
+    """
+    from wattracker import server as servermod
+    from wattracker.ble.devices import SimulatedPowerSource, SimulatedTrainer
+    from wattracker.prescribe.planner import Segment, Session
+
+    _register(client)
+
+    def flat_workout(*args, **kwargs):
+        # A single constant block makes the expected target arithmetic, not a
+        # guess about where on a ramp a given state frame landed.
+        return Session(
+            name="Flat",
+            description="",
+            workout_type="custom",
+            segments=[Segment(kind="steadystate", duration=600, power=1.0)],
+        )
+
+    monkeypatch.setattr(servermod, "build_workout", flat_workout)
+
+    trainer = SimulatedTrainer()
+    trainer.start_erg()
+    conn = {
+        "trainer": trainer,
+        "power_source": SimulatedPowerSource([150]),
+        "hr_source": None,
+        "clients": [],
+        "clients_by_address": {},
+        "bindings": {},
+        "names": {"trainer": "Kickr"},
+        "errors": [],
+    }
+
+    async def fake_connect(timeout=6.0, selected=None):
+        return conn
+
+    monkeypatch.setattr(
+        servermod.bledevices, "bluetooth_available", lambda: (True, "ok")
+    )
+    monkeypatch.setattr(servermod.bledevices, "connect_sensors", fake_connect)
+    monkeypatch.setattr(servermod, "RIDE_POLL_INTERVAL_S", 0.01)
+    monkeypatch.setattr(servermod, "RIDE_INACTIVITY_TIMEOUT_S", 1e6)
+
+    def _next(ws, status):
+        return _receive_until(
+            ws, lambda m: m.get("status") == status, f"a {status!r} frame"
+        )
+
+    with client.websocket_connect("/ride/ws") as ws:
+        connected = _receive_after_workout(ws)
+        assert connected["status"] == "connected"
+        running = _next(ws, "running")
+        ftp = running["ftp"]
+        assert running["target_watts"] == round(ftp)
+        assert running["intensity_bias"] == 1.0
+
+        ws.send_json({"action": "adjust_intensity", "delta": 1})
+        assert _next(ws, "intensity") == {"status": "intensity", "bias": 1.01}
+
+        raised = _receive_until(
+            ws, lambda m: m.get("intensity_bias") == 1.01,
+            "a state frame with intensity_bias == 1.01",
+        )
+        assert raised["target_watts"] == round(ftp * 1.01)
+        assert trainer.last_target == round(ftp * 1.01)
+
+        # Anything that is not a whole percent in range is refused outright,
+        # and the bias the rider already set stays exactly where it was.
+        for bad in ({"delta": True}, {"delta": 1.5}, {"delta": 51},
+                    {"delta": -51}, {"delta": "1"}, {}):
+            ws.send_json(dict({"action": "adjust_intensity"}, **bad))
+            assert _next(ws, "error") == {
+                "status": "error", "error": "Invalid intensity delta."
+            }
+
+        ws.send_json({"action": "adjust_intensity", "delta": -2})
+        assert _next(ws, "intensity") == {"status": "intensity", "bias": 0.99}
+
+        lowered = _receive_until(
+            ws, lambda m: m.get("intensity_bias") == 0.99,
+            "a state frame with intensity_bias == 0.99",
+        )
+        assert lowered["target_watts"] == round(ftp * 0.99)
+
+        ws.send_json({"action": "stop"})
+
+
+def test_ride_ws_intensity_nudge_is_refused_during_a_ramp_test(client, monkeypatch):
+    """A ramp test is a measurement, so the rider cannot shift its targets.
+
+    The refusal lives on the controller, so a client that sends the action
+    regardless -- as this test does -- moves neither the reported target nor
+    the watts the trainer is actually commanded. The reply says so, so the page
+    can explain the dead key instead of badging a stuck +0%.
+
+    The sibling test above rides an ordinary session in this same file and its
+    nudges still land, which is what keeps this lockout from being universal.
+    """
+    from wattracker import server as servermod
+    from wattracker.ble.devices import SimulatedPowerSource, SimulatedTrainer
+    from wattracker.ble.runner import RideController
+    from wattracker.prescribe.planner import build_workout
+
+    _register(client)
+
+    trainer = SimulatedTrainer()
+    trainer.start_erg()
+    conn = {
+        "trainer": trainer,
+        "power_source": SimulatedPowerSource([150]),
+        "hr_source": None,
+        "clients": [],
+        "clients_by_address": {},
+        "bindings": {},
+        "names": {"trainer": "Kickr"},
+        "errors": [],
+    }
+
+    async def fake_connect(timeout=6.0, selected=None):
+        return conn
+
+    monkeypatch.setattr(
+        servermod.bledevices, "bluetooth_available", lambda: (True, "ok")
+    )
+    monkeypatch.setattr(servermod.bledevices, "connect_sensors", fake_connect)
+    monkeypatch.setattr(servermod, "RIDE_POLL_INTERVAL_S", 0.01)
+    monkeypatch.setattr(servermod, "RIDE_INACTIVITY_TIMEOUT_S", 1e6)
+
+    def _next(ws, status):
+        return _receive_until(
+            ws, lambda m: m.get("status") == status, f"a {status!r} frame"
+        )
+
+    with client.websocket_connect("/ride/ws?type=ramp_test&minutes=30") as ws:
+        assert _receive_after_workout(ws)["status"] == "connected"
+        running = _next(ws, "running")
+        ftp = running["ftp"]
+        # The prescription as written, to compare every later frame against.
+        reference = RideController(
+            build_workout("ramp_test", 30), ftp, autosave=False
+        )
+        assert running["intensity_bias"] == 1.0
+
+        for delta in (5, -5, 1):
+            ws.send_json({"action": "adjust_intensity", "delta": delta})
+            assert _next(ws, "intensity") == {
+                "status": "intensity", "bias": 1.0, "locked": True
+            }
+
+        elapsed = 0.0
+        for _ in range(5):
+            frame = _next(ws, "running")
+            elapsed = frame["elapsed"]
+            assert frame["intensity_bias"] == 1.0
+            # Exactly the prescribed watts for that second of the ramp test.
+            assert frame["target_watts"] == reference.target_watts(elapsed)
+
+        # ...and that is what the trainer was actually commanded. The window
+        # absorbs the tick the poll loop may have taken since the last frame;
+        # the warm-up ramp rises ~0.15 W/s, so a 5% bias would still be far
+        # outside it.
+        assert trainer.last_target in {
+            reference.target_watts(elapsed + d) for d in (-2, -1, 0, 1, 2)
+        }
+
+        ws.send_json({"action": "stop"})
