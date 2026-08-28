@@ -888,3 +888,199 @@ def test_a_failed_ramp_test_is_saved_rather_than_left_paused(user_id):
     assert saved["streams"]["power"] == c.recorded_power()
     assert len(saved["streams"]["power"]) == ridden
     assert trainer.commands[-1] == "stop"
+
+
+# ------------------------------------------------- rider intensity bias
+def _ramp_and_const_session():
+    """A 10s ramp 50%->100% FTP followed by a 10s block at 100% FTP."""
+    return Session(
+        name="Bias Ride",
+        description="",
+        workout_type="custom",
+        segments=[
+            Segment(kind="warmup", duration=10, power_low=0.5, power_high=1.0),
+            Segment(kind="steadystate", duration=10, power=1.0),
+        ],
+    )
+
+
+def test_intensity_bias_starts_neutral_and_is_reported_in_state():
+    c = RideController(_two_block_session(), 200, autosave=False)
+    assert c.intensity_bias == 1.0
+    assert c.state()["intensity_bias"] == 1.0
+    c.adjust_intensity_bias(3)
+    assert c.state()["intensity_bias"] == 1.03
+
+
+def test_intensity_bias_nudges_accumulate_without_compounding():
+    # Three +1% presses are +3% of the ORIGINAL prescription, not 1.01^3.
+    c = RideController(_two_block_session(), 200, autosave=False)
+    for _ in range(3):
+        c.adjust_intensity_bias(1)
+    assert c.intensity_bias == 1.03
+    # 50% of 200 W, raised by 3% of the original: 100 -> 103, not 103.03.
+    assert c.target_watts(0) == 103
+    # The prescription itself is untouched, so it stays separately readable.
+    assert c.target_fraction(0) == 0.5
+
+
+def test_intensity_bias_nudges_do_not_compound_over_many_presses():
+    # NOTE: at delta=1 (the literal keyboard step), bias is always quantized
+    # to a whole cent in [1.00, 1.50], so bias * 0.01 always lands within
+    # half a cent of the additive step and rounds to the identical value at
+    # every press, all the way to the clamp -- round(1.01**20, 2) == 1.22 is
+    # only true if the 20 multiplications are done in one unrounded shot;
+    # replaying it one press at a time (as adjust_intensity_bias actually
+    # does, re-quantizing to 2dp after every call) gives 1.20 either way, so
+    # +1 presses alone cannot distinguish add-per-press from multiply-per-
+    # press. Using a larger per-press step (2%) makes the per-step rounding
+    # error compound into a visible difference well before either side
+    # clamps, while still exercising the exact same adjust_intensity_bias
+    # call the keyboard handler uses.
+    c = RideController(_two_block_session(), 200, autosave=False)
+    for _ in range(20):
+        c.adjust_intensity_bias(2)
+    assert c.intensity_bias == 1.40  # compounding (bias *= 1.02) gives 1.47
+
+    c2 = RideController(_two_block_session(), 200, autosave=False)
+    for _ in range(20):
+        c2.adjust_intensity_bias(-2)
+    assert c2.intensity_bias == 0.60  # compounding (bias *= 0.98) gives 0.67
+
+
+def test_intensity_bias_clamps_at_both_ends():
+    c = RideController(_two_block_session(), 200, autosave=False)
+    for _ in range(80):
+        c.adjust_intensity_bias(1)
+    assert c.intensity_bias == 1.5
+    assert c.target_watts(0) == 150
+    for _ in range(200):
+        c.adjust_intensity_bias(-1)
+    assert c.intensity_bias == 0.5
+    assert c.target_watts(0) == 50
+
+
+def test_set_intensity_bias_quantizes_to_whole_percent_steps():
+    c = RideController(_two_block_session(), 200, autosave=False)
+    assert c.set_intensity_bias(1.0149) == 1.01
+    assert c.set_intensity_bias(0.9876) == 0.99
+
+
+def test_invalid_intensity_bias_leaves_the_ride_alone():
+    c = RideController(_two_block_session(), 200, autosave=False)
+    c.set_intensity_bias(1.2)
+    for bad in (None, "hot", float("nan"), float("inf"), object()):
+        assert c.set_intensity_bias(bad) == 1.2
+        assert c.intensity_bias == 1.2
+    assert c.adjust_intensity_bias("two") == 1.2
+
+
+def test_intensity_bias_scales_a_ramp_and_a_constant_block():
+    c = RideController(_ramp_and_const_session(), 200, autosave=False)
+    plain = [c.target_watts(t) for t in (0, 5, 10, 15)]
+    assert plain == [100, 150, 200, 200]
+    c.adjust_intensity_bias(10)
+    assert [c.target_watts(t) for t in (0, 5, 10, 15)] == [110, 165, 220, 220]
+
+
+def test_intensity_bias_reaches_the_trainer_target():
+    trainer = SimulatedTrainer()
+    c = RideController(_two_block_session(), 200, trainer=trainer, autosave=False)
+    c.set_intensity_bias(1.2)
+    for _ in range(4):
+        c.tick(power=120)
+    assert c.status == "running"
+    # 50% of 200 W at +20%: the trainer is commanded the raised number.
+    assert trainer.last_target == 120
+    assert c.state()["target_watts"] == 120
+
+
+def _ramp_free_const_session():
+    """A warm-up ramp, a MAX (untargeted) effort, then a steady block."""
+    return Session(
+        name="Sprint Set",
+        description="",
+        workout_type="custom",
+        segments=[
+            Segment(kind="warmup", duration=10, power_low=0.5, power_high=1.0),
+            Segment(kind="freeride", duration=10),
+            Segment(kind="steadystate", duration=10, power=1.0),
+        ],
+    )
+
+
+def test_intensity_bias_leaves_a_free_block_alone_and_still_applies_after_it():
+    """A MAX block shows no number, so the bias must not move its resistance.
+
+    The free block's fraction is ERG resistance to push against rather than a
+    prescription, and the page renders it as "MAX": scaling it would shift the
+    flywheel with nothing on screen accounting for it. The bias is suppressed
+    inside the block, NOT cleared -- the steady block after the effort is still
+    ridden at the intensity the rider chose.
+    """
+    from wattracker.ble.runner import FREERIDE_ERG_FRACTION
+
+    c = RideController(_ramp_free_const_session(), 200, autosave=False)
+    free_watts = round(FREERIDE_ERG_FRACTION * 200)
+    assert [c.target_watts(t) for t in (10, 15, 19)] == [free_watts] * 3
+
+    c.adjust_intensity_bias(13)
+    assert c.intensity_bias == 1.13
+    assert [c.target_watts(t) for t in (10, 15, 19)] == [free_watts] * 3
+    assert c.target_watts(0) == 113   # the ramp before it is biased
+    assert c.target_watts(20) == 226  # and so is the block after it
+
+
+def test_intensity_bias_survives_riding_through_a_free_block():
+    """The trainer-facing version of the same rule, over a real ride.
+
+    Riding THROUGH the free effort is what separates "suppressed in the block"
+    from "cleared when the block arrives": only a ride that comes out the other
+    side can tell them apart.
+    """
+    from wattracker.ble.runner import FREERIDE_ERG_FRACTION
+
+    trainer = SimulatedTrainer()
+    c = RideController(
+        _ramp_free_const_session(), 200, trainer=trainer, autosave=False
+    )
+    c.set_intensity_bias(1.13)
+    for _ in range(3):  # clear the start gate
+        c.tick(power=150)
+    assert c.status == "running"
+
+    in_free = []
+    while c.elapsed < 20:
+        c.tick(power=150)
+        if 10 <= c.elapsed < 20:
+            in_free.append(trainer.last_target)
+    assert in_free and set(in_free) == {round(FREERIDE_ERG_FRACTION * 200)}
+
+    c.tick(power=150)  # first second of the steady block after the effort
+    assert c.intensity_bias == 1.13
+    assert trainer.last_target == 226
+
+
+def test_intensity_nudges_are_refused_during_a_ramp_test():
+    """A biased ramp measures something other than the protocol.
+
+    The controller is the authority, not the page: a client that sends the
+    action anyway must move nothing.
+    """
+    from wattracker.prescribe.planner import build_workout
+
+    c = RideController(build_workout("ramp_test", 30), 209, autosave=False)
+    assert c.failure_window is not None
+    baseline = [c.target_watts(t) for t in (0, 300, 600, 1200)]
+
+    assert c.adjust_intensity_bias(5) == 1.0
+    assert c.set_intensity_bias(1.2) == 1.0
+    assert c.adjust_intensity_bias(-5) == 1.0
+    assert c.intensity_bias == 1.0
+    assert [c.target_watts(t) for t in (0, 300, 600, 1200)] == baseline
+    assert c.state()["intensity_bias"] == 1.0
+
+    # ...and the lockout is a ramp-test rule, not a universal one.
+    ordinary = RideController(_two_block_session(), 209, autosave=False)
+    assert ordinary.failure_window is None
+    assert ordinary.adjust_intensity_bias(5) == 1.05

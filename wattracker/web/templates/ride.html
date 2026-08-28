@@ -111,7 +111,7 @@
     </div>
     <div class="cards">
         <div class="card"><span class="label">Status</span><span class="value" id="rStatus">idle</span></div>
-        <div class="card"><span class="label">Target</span><span class="value"><span id="rTarget">0</span><span class="unit" id="rTargetUnit"> W</span></span></div>
+        <div class="card"><span class="label">Target</span><span class="value"><span id="rTarget">0</span><span class="unit" id="rTargetUnit"> W</span><span id="rIntensityBias" class="intensity-badge" hidden></span></span></div>
         <div class="card"><span class="label">Power</span><span class="value"><span id="rPower">0</span> W</span></div>
         <div class="card"><span class="label">Cadence</span><span class="value"><span id="rCad">&mdash;</span> rpm</span></div>
         <div class="card"><span class="label">HR</span><span class="value"><span id="rHr">&mdash;</span> bpm</span></div>
@@ -141,6 +141,8 @@
                 <span><strong id="clockBlock">0:00</strong><small>Block left</small></span>
                 <span><strong id="clockTotal">0:00</strong><small>Workout left</small></span>
             </div>
+            <div id="rIntensityBiasChart"
+                 class="ride-chart-chip ride-chart-intensity" aria-hidden="true" hidden></div>
             <div id="ergIndicator" class="ride-chart-chip ride-chart-erg erg-dark"
                  aria-hidden="true">
                 <span class="erg-led"></span><span class="erg-label">ERG</span>
@@ -474,6 +476,43 @@
         document.getElementById("chartCadenceValue").textContent = metricText(st.cadence);
         document.getElementById("chartHrValue").textContent = metricText(st.hr);
     }
+    // The rider's intensity nudge. Shown twice because full screen hides the
+    // cards row: the card badge sits by the target, the chip rides the chart.
+    // Hidden at 0% - "riding it as written" is the absence of a badge.
+    var intensityBias = 1;
+    var intensityNoteTimer = null;
+    function renderIntensityBias(bias) {
+        intensityBias = finiteNumber(bias) == null ? 1 : Number(bias);
+        // A transient note owns the chip while it shows: 1 Hz state frames
+        // must not wipe it a fraction of a second after the key press.
+        if (intensityNoteTimer) return;
+        var pct = Math.round(intensityBias * 100 - 100);
+        var text = (pct > 0 ? "+" : "") + pct + "%";
+        ["rIntensityBias", "rIntensityBiasChart"].forEach(function (id) {
+            var el = document.getElementById(id);
+            if (!el) return;
+            el.textContent = text;
+            el.classList.remove("intensity-note");
+            el.hidden = pct === 0;
+        });
+    }
+    // The server refuses a nudge during a ramp test - the protocol IS the
+    // measurement. Explain the dead key briefly rather than flashing a +0%
+    // badge, then hand the chip back to the ordinary bias rendering.
+    function showIntensityLocked() {
+        ["rIntensityBias", "rIntensityBiasChart"].forEach(function (id) {
+            var el = document.getElementById(id);
+            if (!el) return;
+            el.textContent = "Intensity locked during a ramp test";
+            el.classList.add("intensity-note");
+            el.hidden = false;
+        });
+        if (intensityNoteTimer) window.clearTimeout(intensityNoteTimer);
+        intensityNoteTimer = window.setTimeout(function () {
+            intensityNoteTimer = null;
+            renderIntensityBias(intensityBias);
+        }, 4000);
+    }
     function fmtHms(sec) {
         sec = Math.max(0, Math.round(Number(sec) || 0));
         var h = Math.floor(sec / 3600), m = Math.floor((sec % 3600) / 60), s = sec % 60;
@@ -573,6 +612,8 @@
             rideChart = null;
         }
         updateChartMetrics({power: null, cadence: null, hr: null});
+        // A bias belongs to one ride, so setting up the next one clears it.
+        renderIntensityBias(1);
         document.getElementById("rideChartSummary").textContent = "";
         rideChart = new Chart(document.getElementById("rideChart"), {
             type: "line", data: {datasets: [
@@ -1146,6 +1187,7 @@
         document.getElementById("rTarget").textContent =
             st.target_free ? "MAX" : st.target_watts;
         document.getElementById("rTargetUnit").hidden = !!st.target_free;
+        renderIntensityBias(st.intensity_bias);
         document.getElementById("rPower").textContent = st.power;
         document.getElementById("rCad").textContent = st.cadence == null ? "—" : st.cadence;
         document.getElementById("rHr").textContent = st.hr == null ? "—" : st.hr;
@@ -1318,6 +1360,14 @@
                     playCue("success");
                 }
                 applyErgState(Boolean(st.erg_available), Boolean(st.erg_enabled));
+                return;
+            }
+            if (st.status === "intensity") {
+                if (st.locked) {
+                    showIntensityLocked();
+                } else {
+                    renderIntensityBias(st.bias);
+                }
                 return;
             }
             if (st.status === "erg") {
@@ -1960,8 +2010,40 @@
     });
     document.addEventListener("fullscreenchange", updateChartFullscreenState);
     document.addEventListener("webkitfullscreenchange", updateChartFullscreenState);
+    function isTypingTarget(node) {
+        if (!node || node.nodeType !== 1) return false;
+        if (node.isContentEditable) return true;
+        var tag = (node.tagName || "").toLowerCase();
+        return tag === "input" || tag === "textarea" || tag === "select";
+    }
+    // Full screen is the riding view - there is nothing else to type into, so
+    // +/- there mean "make this harder/easier" for the rest of the ride. Key
+    // repeat is deliberately left alone: holding the key ramps, and the
+    // server's clamp bounds it.
+    function intensityDeltaFor(key) {
+        if (key === "+" || key === "=" || key === "Add") return 1;
+        if (key === "-" || key === "_" || key === "Subtract") return -1;
+        return 0;
+    }
     document.addEventListener("keydown", function (event) {
-        if (event.key === "Escape" && chartIsFullscreen()) exitChartFullscreen();
+        if (event.key === "Escape" && chartIsFullscreen()) {
+            exitChartFullscreen();
+            return;
+        }
+        if (!chartIsFullscreen()) return;
+        if (isTypingTarget(event.target)) return;
+        var delta = intensityDeltaFor(event.key);
+        if (!delta) return;
+        // Swallow the key whatever happens next: in full screen +/- mean this
+        // and nothing else, including when the socket is gone or the server
+        // refuses the nudge.
+        event.preventDefault();
+        if (!ws || ws.readyState !== WebSocket.OPEN) return;
+        try {
+            ws.send(JSON.stringify({action: "adjust_intensity", delta: delta}));
+        } catch (e) {
+            return;
+        }
     });
     // Ask the server to finalize rather than just dropping the socket. The
     // server does save a started ride when the connection breaks, but that is

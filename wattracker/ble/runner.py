@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import datetime as _dt
 import logging
+import math
 from typing import List, Optional, Tuple
 
 from ..prescribe.planner import Session, ramp_test_window
@@ -42,6 +43,12 @@ _DEFAULT_ZERO_GRACE_S = 3.0
 # feels continuous and the rider has something to push against without the
 # machine trying to hold them at any particular sprint wattage.
 FREERIDE_ERG_FRACTION = 0.55
+
+# Bounds on the rider's ride-wide intensity nudge. Half the prescription is
+# already an easy spin and half again is a different workout, so anything past
+# these is a stuck key rather than an intention.
+INTENSITY_BIAS_MIN = 0.5
+INTENSITY_BIAS_MAX = 1.5
 
 
 def _flatten(session: Session) -> Tuple[List[tuple], int]:
@@ -155,6 +162,12 @@ class RideController:
         self.current_cadence: Optional[float] = None
         self.current_hr: Optional[int] = None
         self.current_target = 0
+        # A rider-set multiplier on the prescription for the rest of the ride.
+        # 1.0 is "ride it as written". It multiplies the ORIGINAL fraction
+        # every tick rather than the previously applied watts, so repeated
+        # nudges add up linearly instead of compounding, and the prescription
+        # itself stays readable through target_fraction.
+        self.intensity_bias: float = 1.0
 
         self._samples = {"power": [], "cadence": [], "heartrate": []}
         self.started_at = started_at
@@ -182,7 +195,58 @@ class RideController:
         return 0.0
 
     def target_watts(self, t: float) -> int:
-        return int(round(self.target_fraction(t) * self.ftp))
+        # A free block's fraction is ERG resistance to push against, not a
+        # prescribed target: the UI shows MAX and no number, so biasing it
+        # would move the flywheel with nothing on screen to account for it.
+        # The bias is SUPPRESSED here, not cleared - it still applies to every
+        # targeted block after the effort.
+        bias = self.intensity_bias
+        if bias != 1.0 and self.target_is_free(t):
+            bias = 1.0
+        return int(round(self.target_fraction(t) * self.ftp * bias))
+
+    @property
+    def intensity_locked(self) -> bool:
+        """Is the rider barred from biasing this session's targets?
+
+        True only for a ramp test, which ``failure_window`` already identifies.
+        """
+        return self.failure_window is not None
+
+    def set_intensity_bias(self, value: float) -> float:
+        """Set the ride-wide intensity multiplier, clamped to [0.5, 1.5].
+
+        Anything that is not a finite number leaves the bias untouched: a
+        malformed client message must not silently move the trainer.
+
+        A ramp test refuses outright: the protocol is the measurement, so a
+        biased ramp would measure something else. The controller is the
+        authority - a client that sends the action anyway moves nothing.
+        """
+        if self.intensity_locked:
+            return self.intensity_bias
+        try:
+            bias = float(value)
+        except (TypeError, ValueError):
+            return self.intensity_bias
+        if not math.isfinite(bias):
+            return self.intensity_bias
+        bias = round(bias, 2)
+        self.intensity_bias = min(INTENSITY_BIAS_MAX, max(INTENSITY_BIAS_MIN, bias))
+        return self.intensity_bias
+
+    def adjust_intensity_bias(self, delta_percent: int) -> float:
+        """Nudge the bias by `delta_percent` percentage points of the original.
+
+        Refused on a ramp test, like ``set_intensity_bias``.
+        """
+        if self.intensity_locked:
+            return self.intensity_bias
+        try:
+            step = float(delta_percent) / 100.0
+        except (TypeError, ValueError):
+            return self.intensity_bias
+        return self.set_intensity_bias(self.intensity_bias + step)
 
     def target_is_free(self, t: float) -> bool:
         """Is second ``t`` inside an untargeted (maximal-effort) block?"""
@@ -512,6 +576,8 @@ class RideController:
             "segment_index": self._block_index(clamped),
             "segment_count": len(self.blocks),
             "target_watts": self.current_target,
+            # The rider's ride-wide intensity nudge, so the client can badge it.
+            "intensity_bias": round(self.intensity_bias, 2),
             # True while the rider is inside an untargeted (maximal-effort)
             # block. target_watts still carries the ERG resistance the trainer
             # is holding, because the trainer needs a number - but the UI must
