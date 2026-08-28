@@ -2271,3 +2271,82 @@ def test_ride_page_treats_the_cooldown_as_an_active_ride(client, monkeypatch):
     assert 'document.getElementById("rStatus").textContent = statusText(st);' in r.text
 
 
+
+
+def test_ride_ws_ends_a_ramp_test_on_failure_and_offers_the_result(
+    client, monkeypatch
+):
+    """The defining behaviour of a test: blowing up finishes it, with the data.
+
+    An ordinary workout pauses on three no-power seconds and waits. A ramp
+    test cannot: the rider has already given their answer. The ride finishes,
+    the activity is saved, and the computed FTP comes back on the closing
+    frame as an OFFER - nothing is written until they accept it.
+    """
+    from wattracker.ble.devices import SimulatedTrainer
+    from wattracker.ble.runner import RideController
+    from wattracker.prescribe.planner import (
+        RAMP_TEST_STEPS, RAMP_TEST_STEP_S, RAMP_TEST_WARMUP_S, build_workout,
+    )
+
+    _register(client)
+    uid = db.get_user_by_username("rider")["id"]
+    db.save_user_settings(uid, {"ftp": 209})
+
+    # Ride every prescribed target through the warm-up and five steps, then
+    # stop dead - the rider cannot hold the sixth.
+    steps_ridden = 5
+    reference = RideController(build_workout("ramp_test", 30), 209, autosave=False)
+    ridden = RAMP_TEST_WARMUP_S + steps_ridden * RAMP_TEST_STEP_S
+    # Three priming samples clear the start gate without being recorded.
+    script = ([60] * 3
+              + [reference.target_watts(t) for t in range(ridden)]
+              + [0] * 10)
+    _patch_real_ride(monkeypatch, SimulatedTrainer(), script)
+
+    frames = []
+    with client.websocket_connect("/ride/ws?type=ramp_test&minutes=30") as ws:
+        assert _receive_after_workout(ws)["status"] == "connected"
+        try:
+            while True:
+                frames.append(ws.receive_json())
+        except Exception:
+            pass
+
+    states = [f for f in frames if "elapsed" in f]
+    assert states[-1]["status"] == "finished"
+    # It FINISHED on the zero power; it never sat in paused waiting.
+    assert "paused" not in [f["status"] for f in states]
+    assert states[-1]["elapsed"] == pytest.approx(ridden, abs=1.0)
+
+    result = states[-1]["ramp_test"]
+    assert result["offer"] is True
+    # The PRESCRIBED window, not one inferred from where the recording stops:
+    # the rider declared the test, so the ramp's position is already known.
+    assert result["window"] == [
+        RAMP_TEST_WARMUP_S, RAMP_TEST_WARMUP_S + RAMP_TEST_STEPS * RAMP_TEST_STEP_S
+    ]
+    # 75% of the best minute of the ramp, which is the last full step.
+    best_step = round((0.50 + (steps_ridden - 1) * 0.05) * 209)
+    assert result["ftp"] == pytest.approx(best_step * 0.75, abs=1.0)
+    assert result["disagreement"] is False
+
+    # The ride was kept, and nothing was written to the rider's FTP history.
+    activities = db.list_activities(uid)
+    assert len(activities) == 1
+    assert activities[0]["filename"].endswith("Ramp Test")
+    conn = db.connect()
+    try:
+        assert conn.execute(
+            "SELECT COUNT(*) FROM ftp_history WHERE user_id = ? AND source = ?",
+            (uid, "ramp_test"),
+        ).fetchone()[0] == 0
+    finally:
+        conn.close()
+
+    # ...and accepting it is what writes the row.
+    accepted = client.post(
+        "/api/ftp/ramp-test/accept", json={"activity_id": activities[0]["id"]}
+    )
+    assert accepted.status_code == 200, accepted.text
+    assert accepted.json()["ftp"] == pytest.approx(result["ftp"], abs=0.1)

@@ -534,19 +534,30 @@ def test_rescore_uses_the_supplied_database_for_sub_floor_provenance(tmp_path):
 def test_an_unknown_history_source_is_not_a_rider_assertion():
     """FAILS against 1e27b9f: the predicate was ``source != "estimated"``.
 
-    Only 'manual' and 'estimated' are written today, so this was latent - but it
-    is fail-OPEN: the first ``add_ftp_entry(..., "ramp_test")`` anyone adds would
-    have its output honoured as an unbounded rider assertion and walk straight
-    back into #60. An unrecognised source is our number, not the rider's.
+    The predicate was fail-OPEN: any new estimator writing
+    ``add_ftp_entry(..., "some_new_source")`` would have had its output honoured
+    as an unbounded rider assertion and walked straight back into #60. An
+    unrecognised source is our number, not the rider's.
+
+    ``ramp_test`` was this test's original stand-in for "unrecognised" and has
+    since opted in deliberately (its row is only written after a human confirms
+    the number). The opt-in is asserted below alongside the bound that still
+    holds it: recognising a source admits it, it does not unbound it.
     """
     uid = _user()
-    db.add_ftp_entry(uid, "2026-06-01", 3.7, "ramp_test")
+    db.add_ftp_entry(uid, "2026-06-01", 3.7, "some_new_estimator")
 
-    assert is_asserted_source("ramp_test") is False
+    assert is_asserted_source("some_new_estimator") is False
+    assert is_asserted_source("ramp_test") is True
     assert is_asserted_source("manual") is True
     assert is_asserted_source("MANUAL ") is True
     assert is_asserted_source(None) is False
     assert is_plausible_ftp(3.7) is False
+    assert importer.current_ftp(uid) == importer.DEFAULT_FTP
+
+    # ...and the same 3.7 W under the now-RECOGNISED source is still refused,
+    # because an assertion is bounded by the range a human body can produce.
+    db.add_ftp_entry(uid, "2026-06-02", 3.7, "ramp_test", replace_existing=True)
     assert importer.current_ftp(uid) == importer.DEFAULT_FTP
 
 

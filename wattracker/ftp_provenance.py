@@ -44,7 +44,13 @@ _log = logging.getLogger(__name__)
 # machine-produced number would silently be honoured as a rider assertion and
 # reopen issue #60. An unrecognised source is treated as an estimate, so a new
 # writer has to opt in here explicitly.
-ASSERTED_FTP_SOURCES = frozenset({"manual"})
+# ``ramp_test`` is that opt-in, taken deliberately. It qualifies on the same
+# ground "manual" does: the row is only ever written after a human is shown the
+# number and confirms it (see ``wattracker.ramp_test``). Nothing writes it as a
+# side effect of an import or a scan, and the value is bounded by
+# ``is_plausible_ftp`` before it is ever offered - so the unbounded
+# machine-produced number this comment warns about cannot reach the column.
+ASSERTED_FTP_SOURCES = frozenset({"manual", "ramp_test"})
 
 # Wattages are compared as stored IEEE doubles - a basis read back out of the
 # same column is bit-identical, so this is an equality test with only enough

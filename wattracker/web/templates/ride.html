@@ -194,6 +194,24 @@
     </form>
 </dialog>
 
+<!-- The result of a declared FTP test. It is shown, never applied: nothing is
+     written to ftp_history until the rider presses Use this FTP. That
+     confirmation is what makes the number a rider assertion rather than a
+     machine estimate, and it is the condition ftp_provenance sets for letting
+     "ramp_test" into ASSERTED_FTP_SOURCES at all. -->
+<dialog id="rampTestDialog" class="ride-confirm ramp-result"
+        aria-labelledby="rampTestTitle">
+    <h3 id="rampTestTitle">Ramp test complete</h3>
+    <p class="ramp-result-value"><strong id="rampTestFtp">0</strong> W</p>
+    <p id="rampTestDetail" class="hint"></p>
+    <p id="rampTestWarning" class="alert" hidden></p>
+    <p id="rampTestStatus" role="status" aria-live="polite" hidden></p>
+    <div class="toolbar ride-confirm-actions">
+        <button type="button" id="rampTestDismissBtn" class="button-secondary">Not now</button>
+        <button type="button" id="rampTestAcceptBtn">Use this FTP</button>
+    </div>
+</dialog>
+
 <script src="{{ static_url('workout_graph.js') }}"></script>
 <script>
 (function () {
@@ -205,6 +223,8 @@
     var scannedDevices = {};
     var rideState = "idle";
     var endRideDialog = document.getElementById("endRideDialog");
+    var rampTestDialog = document.getElementById("rampTestDialog");
+    var rampTestActivityId = null;
     var bleAvailable = !document.getElementById("scanBtn").disabled;
     var cacheKey = {{ ble_cache_key|tojson }};
     var cache = readCache();
@@ -941,7 +961,12 @@
         // work == null means the type prescribes no power target at all
         // (sprints): advertise the effort, never a wattage.
         var untargeted = info.work == null;
-        var pct = untargeted
+        // A type whose band fields cannot honestly describe it publishes its
+        // own line. A ramp test has a target every minute - it just never
+        // stops raising it - so "no target" would be simply wrong.
+        var pct = info.target_note
+            ? info.target_note
+            : untargeted
             ? "maximal effort — no target"
             : info.high == null
             ? ">" + Math.round(info.low * 100) + "% FTP"
@@ -1111,7 +1136,10 @@
         document.getElementById("rSegCount").textContent = st.segment_count;
         document.getElementById("rProgress").style.width = ((st.progress || 0) * 100) + "%";
         appendCharts(st);
-        if (st.status === "finished") setRideState("idle");
+        if (st.status === "finished") {
+            setRideState("idle");
+            if (st.ramp_test) showRampTestResult(st.ramp_test);
+        }
         else if (["starting", "running", "paused", "cooldown"].indexOf(st.status) !== -1) setRideState("running");
     }
     function openRide(sim) {
@@ -1988,6 +2016,82 @@
             if (rideState === "idle") return;  // ride ended while we asked
             stopRide();
         });
+    }
+    function showRampTestResult(result) {
+        // The chart overlay is fixed and would sit over the dialog.
+        exitChartFullscreen();
+        rampTestActivityId = result.activity_id;
+        document.getElementById("rampTestFtp").textContent =
+            result.offer ? Math.round(result.ftp) : "\u2014";
+        document.getElementById("rampTestDetail").textContent = result.message || "";
+        var warning = document.getElementById("rampTestWarning");
+        // Only a real disagreement is a warning. A cross-check that could not
+        // run - most often because the ramp's slope in watts falls outside the
+        // band a shape detector recognizes - is not the two methods
+        // disagreeing, and saying so would tell the rider their valid test is
+        // suspect. That case is already explained in the detail line.
+        warning.hidden = !result.disagreement;
+        warning.textContent = result.disagreement
+            ? "The two readings disagree. Check the ride before accepting."
+            : "";
+        var status = document.getElementById("rampTestStatus");
+        status.hidden = true;
+        status.textContent = "";
+        var accept = document.getElementById("rampTestAcceptBtn");
+        // Nothing to accept when the measurement failed or the activity was
+        // never saved.
+        accept.hidden = !result.offer || rampTestActivityId == null;
+        accept.disabled = accept.hidden;
+        if (!rampTestDialog) return;
+        if (typeof rampTestDialog.showModal === "function") {
+            if (!rampTestDialog.open) rampTestDialog.showModal();
+        } else {
+            // No modal support. Show it inline rather than leaving the rider
+            // with a result they were never told about.
+            rampTestDialog.setAttribute("open", "");
+        }
+    }
+    async function acceptRampTestFtp() {
+        var accept = document.getElementById("rampTestAcceptBtn");
+        var status = document.getElementById("rampTestStatus");
+        if (rampTestActivityId == null) return;
+        accept.disabled = true;
+        setLive(status, "Saving\u2026", "working");
+        status.hidden = false;
+        try {
+            var resp = await fetch("/api/ftp/ramp-test/accept", {
+                method: "POST",
+                headers: {"Content-Type": "application/json"},
+                body: JSON.stringify({activity_id: rampTestActivityId})
+            });
+            var data = await resp.json();
+            if (!resp.ok) {
+                setLive(status, data.error || "Could not save the new FTP.", "failure");
+                accept.disabled = false;
+                return;
+            }
+            var saved = "FTP set to " + Math.round(data.ftp) + " W on " + data.date + ".";
+            if (data.settings_override) {
+                saved += " Your Settings still override it at "
+                    + Math.round(data.effective_ftp) + " W \u2014 clear it there to use this.";
+            }
+            setLive(status, saved, "success");
+            rampTestActivityId = null;
+            accept.hidden = true;
+        } catch (error) {
+            setLive(status, "Could not save the new FTP.", "failure");
+            accept.disabled = false;
+        }
+    }
+    if (rampTestDialog) {
+        document.getElementById("rampTestAcceptBtn")
+            .addEventListener("click", acceptRampTestFtp);
+        document.getElementById("rampTestDismissBtn")
+            .addEventListener("click", function () {
+                // close() only exists where showModal() did.
+                if (typeof rampTestDialog.close === "function") rampTestDialog.close();
+                else rampTestDialog.removeAttribute("open");
+            });
     }
     document.getElementById("stopBtn").addEventListener("click", requestEndRide);
     document.getElementById("endWorkoutBtn").addEventListener("click", requestEndRide);

@@ -399,6 +399,57 @@ def best_20min_power(power: Sequence[float]) -> float:
     return float(roll.max())
 
 
+# Zwift's rule, and the one this module has always used: a ramp test's FTP is
+# 75% of the best one-minute step.
+RAMP_TEST_FTP_FRACTION = 0.75
+
+# The per-minute rise, in watts, that ``ramp_test_ftp_candidate`` will accept as
+# a ramp. Named because a caller has to be able to ask whether a ramp it
+# PRESCRIBED falls inside the band before reading anything into a 0.0: a slope
+# expressed as a fraction of FTP leaves the band at the low end (a 120 W rider
+# at 5%/min rises 6 W a minute), and that is the detector being out of range,
+# not a disagreement about the result.
+RAMP_DETECTOR_MIN_SLOPE_W = 8.0
+RAMP_DETECTOR_MAX_SLOPE_W = 35.0
+
+
+def best_rolling_power(power: Sequence[float], window_s: int,
+                       start_s: int = 0, end_s: Optional[int] = None) -> float:
+    """Best ``window_s`` rolling mean power within [start_s, end_s).
+
+    Seconds are indices into a one-sample-per-second stream. A window shorter
+    than ``window_s`` yields 0.0 rather than a mean over fewer seconds: a
+    partial minute is not a minute.
+    """
+    arr = _clean_power(power)
+    lo = max(0, int(start_s))
+    hi = arr.size if end_s is None else min(arr.size, int(end_s))
+    if hi - lo < int(window_s) or window_s <= 0:
+        return 0.0
+    roll = rolling_mean(arr[lo:hi], int(window_s))
+    if roll.size == 0:
+        return 0.0
+    return float(roll.max())
+
+
+def ramp_test_ftp_in_window(power: Sequence[float], start_s: int,
+                            end_s: int) -> float:
+    """FTP from a ramp whose position in the stream is already KNOWN.
+
+    75% of the best minute of ACTUAL recorded power inside the window. Actual
+    rather than prescribed, because a rider who fails 20 seconds into a step
+    rode that step's target for 20 seconds and their own power for the other
+    40; the target would credit them with a minute they did not complete.
+
+    This is the primary measurement for a test the rider DECLARED by selecting
+    it. ``ramp_test_ftp_candidate`` answers a different question - "was this a
+    ramp, and where?" - for a file that arrived with no context, and on the
+    declared path there is no such question to ask.
+    """
+    best = best_rolling_power(power, 60, start_s, end_s)
+    return best * RAMP_TEST_FTP_FRACTION
+
+
 def ramp_test_ftp_candidate(power: Sequence[float]) -> float:
     """Return an FTP candidate from a conservatively recognized ramp test.
 
@@ -452,7 +503,11 @@ def ramp_test_ftp_candidate(power: Sequence[float]) -> float:
             # they hold 120 W; below 171 W the flat 12 W bound still governs.
             if float(chunk.std()) > max(12.0, 0.07 * mean):
                 break
-            if means and not 8.0 <= mean - means[-1] <= 35.0:
+            if means and not (
+                RAMP_DETECTOR_MIN_SLOPE_W
+                <= mean - means[-1]
+                <= RAMP_DETECTOR_MAX_SLOPE_W
+            ):
                 break
             means.append(mean)
             pos += block
@@ -477,7 +532,7 @@ def ramp_test_ftp_candidate(power: Sequence[float]) -> float:
         ) > 0.5 * means[-1]:
             continue
         best_step = max(best_step, max(means))
-    return best_step * 0.75
+    return best_step * RAMP_TEST_FTP_FRACTION
 
 
 def _split_activities(activities: Iterable):
