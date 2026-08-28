@@ -13,7 +13,8 @@ Two defects found in a real 60-minute threshold session:
 import pytest
 
 from wattracker.prescribe import zwo
-from wattracker.prescribe.planner import VARIANTS, build_workout
+from wattracker.prescribe.planner import (
+    MEASUREMENT_TYPES, RAMP_TEST_TOTAL_S, VARIANTS, build_workout)
 
 
 def _kinds_and_durations(session):
@@ -158,5 +159,12 @@ def test_every_builder_sums_to_the_requested_duration(seconds):
     for kind, variants in VARIANTS.items():
         for variant in variants:
             s = build_workout(kind, seconds // 60, variant)
-            assert s.total_duration() == seconds, (kind, variant)
+            if kind in MEASUREMENT_TYPES:
+                # A measurement protocol IGNORES the requested duration: its
+                # length is fixed by the protocol, and truncating it would
+                # lower the ceiling the rider is measured against. It is
+                # longer than the shortest menu choice, deliberately.
+                assert s.total_duration() == RAMP_TEST_TOTAL_S, (kind, variant)
+            else:
+                assert s.total_duration() == seconds, (kind, variant)
             assert all(seg.duration > 0 for seg in s.segments), (kind, variant)

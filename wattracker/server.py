@@ -50,6 +50,7 @@ from . import (
     rpc,
     power_corrections,
     races,
+    ramp_test as ramp_test_mod,
 )
 from .analysis import activity_cache, pipeline, power_profile, zones
 from .backend import (
@@ -90,11 +91,14 @@ from .prescribe import llm
 from .prescribe import ooto_adjust
 from .prescribe.planner import (
     JUST_RIDE_DURATIONS,
+    RAMP_TEST_NAME,
     WORKOUT_TYPE_INFO,
     WORKOUT_TYPE_KEYS,
     VARIANTS,
     build_workout,
     plan_workout,
+    ramp_test_window,
+    ramp_test_prescribed_window,
     workout_type_info,
     validate_variant,
 )
@@ -2578,6 +2582,93 @@ def create_app() -> FastAPI:
         response.headers["Cache-Control"] = "private, no-store"
         return response
 
+    @app.post("/api/ftp/ramp-test/accept")
+    def api_ramp_test_accept(
+        request: Request, activity_id: int = Body(..., embed=True)
+    ):
+        """Make an accepted ramp-test result the rider's FTP.
+
+        The number is RECOMPUTED here from the stored ride rather than taken
+        from the request. The client is not the authority on a value that
+        becomes a scoring basis, and recomputing costs one read of a stream we
+        already have.
+
+        This deliberately does NOT rescore prior activities.
+        ``ftp_history`` is dated, so a row dated the test day changes nothing
+        that came before it, and that default stands: rewriting a rider's
+        recorded IF/TSS is a separate, explicit action
+        (``ftp_rescore.rescore_imported_activities``), never a side effect of
+        accepting a test.
+        """
+        uid = _uid(request)
+        act = db.get_activity(uid, activity_id)
+        if act is None:
+            return JSONResponse({"error": "activity not found"}, status_code=404)
+        # Routing, not authorization: the session's name is how a stored ride
+        # is recognized as the declared test, and it keeps this route from
+        # computing a "best minute x 0.75" out of an ordinary ride. It is not a
+        # trust boundary and is not relied on as one - what gates the write is
+        # the rider pressing accept on a value ``is_plausible_ftp`` admitted.
+        # (Uploads are forced onto their .fit filename and in-app rides are
+        # named by the planner, so the name is not freely chosen in practice.)
+        if not ramp_test_mod.is_declared_ftp_test(act):
+            return JSONResponse(
+                {"error": "that ride was not a ramp test"}, status_code=400
+            )
+        streams = act.get("streams") or {}
+        power = streams.get("power") or []
+        result = ramp_test_mod.evaluate(
+            power,
+            # The PRESCRIBED window in workout seconds. Passing a sample
+            # count here read the wrong part of any ride not recorded at
+            # exactly 1 Hz - and the live loop's floor makes that the
+            # normal case, so an accepted FTP came out below the one the
+            # rider had just been shown.
+            ramp_test_prescribed_window(),
+            importer.current_ftp(uid),
+            act.get("duration_s"),
+            path=config.db_path(),
+        )
+        if not result["offer"]:
+            return JSONResponse(
+                {"error": result["message"], "result": result}, status_code=400
+            )
+        # The ride is named by its UTC date (see importer.save_ride_record), so
+        # the entry is dated the same day the ride is filed under. Anything
+        # else would put the test and its result on different days.
+        started = parse_naive(act.get("start_time"))
+        date_iso = (started or utc_now()).date().isoformat()
+        # replace_existing: an estimate written for that date (ftp_backfill
+        # fills every date) would otherwise make this an INSERT OR IGNORE that
+        # silently does nothing. A confirmed test outranks whatever is already
+        # sitting on that date - including a manual entry, which is why the
+        # row being replaced is reported back rather than quietly dropped.
+        replaced = db.ftp_entry_on(uid, date_iso, path=config.db_path())
+        db.add_ftp_entry(uid, date_iso, result["ftp"], source=ramp_test_mod.SOURCE,
+                         path=config.db_path(), replace_existing=True)
+        # user_settings.ftp outranks ftp_history in current_ftp(), so leaving a
+        # typed override in place would accept the test and change nothing the
+        # rider can see. Accepting a measured FTP is the rider replacing their
+        # own earlier statement, so the statement goes.
+        previous_override = db.get_user_settings(uid).get("ftp")
+        if previous_override is not None:
+            db.set_user_ftp_override(uid, None, path=config.db_path())
+        importer.profile_store.refresh(uid)
+        effective = importer.current_ftp(uid)
+        return JSONResponse({
+            "ftp": result["ftp"],
+            "date": date_iso,
+            "source": ramp_test_mod.SOURCE,
+            "activity_id": activity_id,
+            "effective_ftp": round(float(effective), 1),
+            "completed_ramp": result["completed_ramp"],
+            "cleared_override": (
+                round(float(previous_override), 1)
+                if previous_override is not None else None
+            ),
+            "replaced": replaced,
+        })
+
     @app.post("/api/activity/{activity_id}/rpe")
     def api_activity_rpe(
         request: Request, activity_id: int, rpe: int = Body(..., embed=True)
@@ -4737,6 +4828,34 @@ def create_app() -> FastAPI:
             "profile": profile,
         }
 
+    def _ramp_test_result(controller) -> Optional[dict]:
+        """The ramp-test result for a finished ride, or None if it was not one.
+
+        The window comes from the PRESCRIBED session, not from the shape of
+        the recording: the rider declared the test by selecting it, so there is
+        nothing to detect. Returns None for every other kind of ride, and for a
+        test that recorded nothing.
+        """
+        window = ramp_test_window(controller.session)
+        if window is None or not controller.has_started:
+            return None
+        power = controller.recorded_power()
+        if not power:
+            return None
+        try:
+            result = ramp_test_mod.evaluate(
+                power, window, controller.ftp, int(controller.elapsed),
+                path=config.db_path(),
+            )
+        except Exception:
+            # Offering a result must never be what breaks the end of a ride.
+            # The ride is already saved; the rider can accept from the stored
+            # activity, which recomputes this same number.
+            _log.warning("could not compute a ramp-test result", exc_info=True)
+            return None
+        result["activity_id"] = controller.activity_id
+        return result
+
     def _watts(fraction, ftp: float) -> Optional[int]:
         return present.watts(fraction, ftp)
 
@@ -4773,8 +4892,13 @@ def create_app() -> FastAPI:
         for option in VARIANTS[kind]:
             candidate = build_workout(kind, mins, option, profile=rider_profile)
             candidate_payload = _ride_workout_payload(candidate, ftp)
+            # Keyed by the candidate's OWN length, not the length asked for:
+            # the client looks this up by the duration it was served
+            # (duration_s / 60), and a measurement protocol is emitted at the
+            # protocol's length rather than the requested one. For every
+            # training type the two are the same number.
             all_variants[option] = {
-                str(mins): {
+                str(round(candidate_payload["duration_s"] / 60)): {
                     "name": candidate.name,
                     "description": candidate.description,
                     "estimated_tss": candidate.estimated_tss,
@@ -5795,7 +5919,16 @@ def create_app() -> FastAPI:
                     # releases the radio and closes.
                     await _end_revoked_ride(websocket, controller)
                 else:
-                    await websocket.send_json(controller.state())
+                    final_state = controller.state()
+                    # The one place a ramp test's result can be delivered: the
+                    # rider is still on the bike and the number is about to
+                    # decide every workout they are prescribed from here on.
+                    # It is only ever OFFERED - see the accept route, which is
+                    # the only thing that writes.
+                    ramp_result = _ramp_test_result(controller)
+                    if ramp_result is not None:
+                        final_state["ramp_test"] = ramp_result
+                    await websocket.send_json(final_state)
             except BaseException as exc:
                 abnormal_cleanup = True
                 # Client closed the socket or BLE failed mid-ride: stop cleanly
@@ -5900,6 +6033,9 @@ def create_app() -> FastAPI:
                 await asyncio.sleep(0.01)
             if controller.status != "finished":
                 controller.stop()
+            # No ramp-test result here, deliberately. Simulate is a preview of
+            # the ride screen at a fixed wattage; a number produced by nobody
+            # pedalling must never be put in front of the rider as their FTP.
             await websocket.send_json(controller.state())
         except Exception:
             pass

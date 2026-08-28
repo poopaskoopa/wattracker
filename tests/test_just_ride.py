@@ -7,6 +7,8 @@ from wattracker.ble.runner import flatten_session
 from wattracker.prescribe.planner import (
     JUST_RIDE_DURATIONS,
     MAX_COOLDOWN_S,
+    MEASUREMENT_TYPES,
+    RAMP_TEST_TOTAL_S,
     WORKOUT_BUILDERS,
     WORKOUT_TYPE_INFO,
     WORKOUT_TYPE_KEYS,
@@ -81,12 +83,18 @@ def test_workout_type_info_order_and_zones():
     keys = [info["key"] for info in WORKOUT_TYPE_INFO]
     assert keys == [
         "endurance", "tempo", "sweet_spot", "threshold", "vo2max",
-        "sprint", "recovery",
+        "sprint", "recovery", "ramp_test",
     ]
     assert workout_type_info("tempo")["zone"] == "Zone 3"
     assert workout_type_info("tempo")["low"] == 0.76
     assert workout_type_info("tempo")["high"] == 0.90
     assert workout_type_info("sprint")["high"] is None
+    # The ramp test walks past FTP until the rider fails, so it publishes no
+    # ceiling and no single work target - only the first step it starts from.
+    ramp = workout_type_info("ramp_test")
+    assert ramp["low"] == 0.50
+    assert ramp["high"] is None and ramp["work"] is None
+    assert ramp["target_note"]
     assert workout_type_info("nope") is None
 
 
@@ -171,6 +179,17 @@ def test_ride_page_offers_just_ride(client):
     assert "innerHTML" not in text
 
 # ------------------------------------------------- every type, key durations
+# A measurement protocol's length is decided by the protocol, not by a duration
+# the rider picked off a menu: for those kinds the requested duration is an
+# upper bound only. Every assertion below that reads "the session fills the
+# duration you asked for" therefore exempts them by name.
+_PROTOCOL = (
+    "a measurement protocol is emitted at its own length, IGNORING the "
+    "duration the rider picked: truncating it would lower the ceiling "
+    "they are measured against"
+)
+
+
 @pytest.mark.parametrize("kind", WORKOUT_TYPE_KEYS)
 @pytest.mark.parametrize("minutes", [30, 60, 120, 240])
 def test_every_type_builds_at_key_durations(kind, minutes):
@@ -178,7 +197,10 @@ def test_every_type_builds_at_key_durations(kind, minutes):
     # JUST_RIDE_DURATIONS ladder adds no builder branch not covered here.
     s = build_workout(kind, minutes)
     assert s.workout_type == kind
-    assert s.total_duration() == minutes * 60
+    if kind in MEASUREMENT_TYPES:
+        assert s.total_duration() == RAMP_TEST_TOTAL_S, _PROTOCOL
+    else:
+        assert s.total_duration() == minutes * 60
     assert s.estimated_tss > 0
 
 
@@ -191,18 +213,25 @@ def test_preview_every_type_at_extremes(client, kind, minutes):
     assert r.status_code == 200, r.text
     data = r.json()
     assert data["workout_type"] == kind
-    assert data["duration_s"] == minutes * 60
-    assert sum(s["duration_s"] for s in data["segments"]) == minutes * 60
+    if kind in MEASUREMENT_TYPES:
+        assert data["duration_s"] == RAMP_TEST_TOTAL_S, _PROTOCOL
+    else:
+        assert data["duration_s"] == minutes * 60
+    assert sum(s["duration_s"] for s in data["segments"]) == data["duration_s"]
     info = workout_type_info(kind)
     if kind == "sprint":
         # Prescribed as a maximal effort with no power target, so its work
         # blocks deliberately carry no watts to compare against the band.
         assert any(s["watts_high"] is None for s in data["segments"])
         return
+    # `watts` as well as `watts_on`/`watts_high`: a ramp test's work is a run
+    # of plain steadystate steps, so its peak lives in the field a steady block
+    # writes. Including it can only raise the peak, never lower it.
     peak = max(
         w for w in (
             [s["watts_on"] for s in data["segments"] if s["watts_on"] is not None]
             + [s["watts_high"] for s in data["segments"] if s["watts_high"] is not None]
+            + [s["watts"] for s in data["segments"] if s["watts"] is not None]
         )
     )
     assert peak >= round(info["low"] * data["ftp"])
@@ -239,7 +268,10 @@ def test_long_just_rides_are_not_mostly_cooldown(client, kind):
         f"/ride/workout/preview?type={kind}&minutes={minutes}"
     ).json()
     segs = data["segments"]
-    assert sum(s["duration_s"] for s in segs) == minutes * 60
+    if kind in MEASUREMENT_TYPES:
+        assert sum(s["duration_s"] for s in segs) <= minutes * 60, _PROTOCOL
+    else:
+        assert sum(s["duration_s"] for s in segs) == minutes * 60
     cooldown = sum(s["duration_s"] for s in segs if s["label"] == "Cooldown")
     assert cooldown <= MAX_COOLDOWN_S, f"{kind} @{minutes}: {cooldown}s cooldown"
     # ...and the cooldown is never the biggest thing in the ride.
@@ -254,7 +286,10 @@ def test_long_just_rides_via_the_session_builder_end_short(client, kind):
         msg = ws.receive_json()
     assert msg["status"] == "workout"
     profile = msg["workout"]["profile"]
-    assert msg["workout"]["duration_s"] == 240 * 60
+    if kind in MEASUREMENT_TYPES:
+        assert 0 < msg["workout"]["duration_s"] <= 240 * 60, _PROTOCOL
+    else:
+        assert msg["workout"]["duration_s"] == 240 * 60
     tail = profile[-1]
     assert tail["end"] - tail["start"] <= MAX_COOLDOWN_S
 

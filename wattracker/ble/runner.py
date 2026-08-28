@@ -10,6 +10,11 @@ clock and recording keep going while the rider spins down, and three continuous
 no-power seconds finish it. Long-inactivity disconnect policy belongs to the
 WebSocket owner. On finish the controller records the ride as an activity for
 the user.
+
+One session type reads the same silence differently. A ramp test ends when the
+rider cannot hold the next step, so inside the ramp those three no-power
+seconds FINISH the ride with its data instead of pausing it - blowing up is the
+result, not an abandoned workout. See ``failure_window``.
 """
 from __future__ import annotations
 
@@ -17,7 +22,7 @@ import datetime as _dt
 import logging
 from typing import List, Optional, Tuple
 
-from ..prescribe.planner import Session
+from ..prescribe.planner import Session, ramp_test_window
 from ..timeutil import utc_now
 
 _log = logging.getLogger(__name__)
@@ -124,6 +129,12 @@ class RideController:
         self.manage_trainer_commands = bool(manage_trainer_commands)
 
         self.blocks, self.total_s = _flatten(session)
+        # Seconds during which the rider stopping is the RESULT rather than a
+        # pause. A ramp test ends when the rider cannot hold the next step:
+        # the ride has to FINISH, with its samples, because the last minute
+        # they completed is the measurement. None for every other session, so
+        # nothing else changes behaviour.
+        self.failure_window = ramp_test_window(session)
         self.status = IDLE
         self.elapsed = 0.0
         self._positive_run = 0.0
@@ -179,6 +190,20 @@ class RideController:
             if s <= t < e:
                 return kind == "free"
         return False
+
+    def _failed(self) -> bool:
+        """Is a stop right now the rider failing a test rather than pausing?
+
+        Only INSIDE the ramp. Before it the rider is warming up and has
+        answered nothing; after it they have already ridden every step, and a
+        stop during the prescribed cooldown is an ordinary pause.
+        """
+        window = self.failure_window
+        return window is not None and window[0] <= self.elapsed < window[1]
+
+    def recorded_power(self) -> List[int]:
+        """The power samples recorded so far, one per second of ride time."""
+        return list(self._samples["power"])
 
     def _block_index(self, t: float) -> int:
         for i, (s, e, _k, _v) in enumerate(self.blocks):
@@ -269,7 +294,14 @@ class RideController:
             if self.status == RUNNING:
                 self._zero_run += dt
                 if self._zero_run >= self.zero_grace_s:
-                    self.status = PAUSED
+                    if self._failed():
+                        # Same grace, third meaning: during a test, stopping
+                        # ends the ride and keeps everything recorded so far.
+                        # Pausing would leave the measurement waiting for a
+                        # rider who has already given their answer.
+                        self._finish()
+                    else:
+                        self.status = PAUSED
             elif self.status == COOLDOWN:
                 # Same zero-power grace, opposite meaning: after the workout,
                 # stopping ends the ride rather than pausing it.

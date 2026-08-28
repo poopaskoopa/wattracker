@@ -884,6 +884,10 @@ button.danger.link-btn { border: none; color: var(--alert); }
 .ride-confirm h3 { margin: 0 0 0.5rem; }
 .ride-confirm p { margin: 0 0 1rem; color: var(--muted); }
 .ride-confirm-actions { justify-content: flex-end; }
+.ramp-result { max-width: 32rem; }
+.ramp-result .ramp-result-value { font-size: 3rem; line-height: 1.1;
+    color: var(--text); margin: 0 0 0.75rem; }
+.ramp-result .ramp-result-value strong { font-weight: 700; }
 /* Grow with the page width: at a 1440px main a fixed 260px box is a 5:1 letter
    slot the traces have no room to move in. Clamped at both ends so a phone
    keeps the old height and a wide desktop stops before the chart eats the fold.

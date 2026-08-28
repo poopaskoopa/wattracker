@@ -2456,6 +2456,30 @@ def latest_ftp(user_id: int, path: Optional[str] = None) -> Optional[dict]:
         conn.close()
 
 
+def ftp_entry_on(
+    user_id: int, date_iso: str, path: Optional[str] = None
+) -> Optional[dict]:
+    """The ftp_history row stored for exactly this date, or None.
+
+    A writer that passes ``replace_existing`` is overwriting whatever is on
+    that date, which may be the rider's own manual entry; this lets it say so
+    instead of destroying the value silently.
+    """
+    conn = connect(path)
+    try:
+        row = conn.execute(
+            "SELECT date, ftp_watts, source FROM ftp_history "
+            "WHERE user_id = ? AND date = ?",
+            (user_id, date_iso),
+        ).fetchone()
+        if not row:
+            return None
+        return {"date": row["date"], "ftp_watts": row["ftp_watts"],
+                "source": row["source"]}
+    finally:
+        conn.close()
+
+
 def ftp_as_of(
     user_id: int, date_iso: str, path: Optional[str] = None
 ) -> Optional[float]:

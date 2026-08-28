@@ -856,3 +856,35 @@ def test_resuming_from_paused_charges_only_one_sample_not_the_gap():
     elapsed = c.elapsed
 
     assert c.poll(now=now + 1.2, minimum_dt=1.0)["elapsed"] == elapsed + 1.0
+
+
+def test_a_failed_ramp_test_is_saved_rather_than_left_paused(user_id):
+    """The rider blows up, and that is the result: the ride ends and is kept.
+
+    The same three no-power seconds that pause an ordinary workout finish a
+    test, because inside the ramp there is nothing left to wait for. Data has
+    to survive that, since the last minute they held IS the measurement.
+    """
+    from wattracker.prescribe.planner import (
+        RAMP_TEST_STEP_S, RAMP_TEST_WARMUP_S, build_workout,
+    )
+
+    trainer = SimulatedTrainer()
+    session = build_workout("ramp_test", 30)
+    c = RideController(
+        session, 209, trainer=trainer, user_id=user_id, autosave=True
+    )
+    for t in range(RAMP_TEST_WARMUP_S + 4 * RAMP_TEST_STEP_S):
+        c.tick(power=c.target_watts(t))
+    assert c.status == "running"
+    ridden = len(c.recorded_power())
+
+    for _ in range(3):
+        c.tick(power=0)
+
+    assert c.status == "finished"
+    assert c.activity_id is not None
+    saved = db.get_activity(user_id, c.activity_id)
+    assert saved["streams"]["power"] == c.recorded_power()
+    assert len(saved["streams"]["power"]) == ridden
+    assert trainer.commands[-1] == "stop"

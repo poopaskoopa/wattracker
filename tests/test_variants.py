@@ -13,7 +13,7 @@ import pytest
 from wattracker import db
 from wattracker.prescribe import zwo
 from wattracker.prescribe.planner import (
-    VARIANTS, WORKOUT_TYPE_INFO, build_workout)
+    MEASUREMENT_TYPES, VARIANTS, WORKOUT_TYPE_INFO, build_workout)
 
 
 def _if(session):
@@ -72,6 +72,10 @@ def test_classic_golden_segments_unchanged():
 # --------------------------------------------------- IF / TSS comparability
 @pytest.mark.parametrize("kind", list(VARIANTS))
 def test_variants_comparable_to_classic_at_60min(kind):
+    if kind in MEASUREMENT_TYPES:
+        # A test measures the rider; it has no training load to be comparable
+        # to, and it is emitted at its own length rather than the one asked for.
+        pytest.skip("measurement protocol, not a training dose")
     classic = build_workout(kind, 60, "classic")
     c_tss, c_if = classic.estimated_tss, _if(classic)
     for v in VARIANTS[kind]:
@@ -279,6 +283,10 @@ def test_variant_work_efforts_stay_inside_the_published_band():
     for kind, variants in VARIANTS.items():
         if kind in ("sprint", "endurance", "recovery"):
             continue  # base-heavy kinds: most of the ride is deliberately easy
+        if kind in MEASUREMENT_TYPES:
+            # A ramp deliberately walks OUT of any band; its published `high`
+            # is None for that reason, so there is no ceiling to check.
+            continue
         low, high = _BANDS[kind]
         for v in variants:
             for minutes in _TIZ_DURATIONS:
@@ -358,6 +366,8 @@ def test_variants_fit_across_plan_durations():
               # Just Ride kinds: offered from the 30min minimum upwards.
               "tempo": (30, 181), "sprint": (30, 181)}
     for kind, variants in VARIANTS.items():
+        if kind in MEASUREMENT_TYPES:
+            continue  # emitted at the protocol's length, not the requested one
         lo, hi = ranges[kind]
         for v in variants:
             for d in range(lo, hi, 5):

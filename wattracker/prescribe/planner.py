@@ -18,7 +18,7 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, List, Optional
+from typing import TYPE_CHECKING, List, Optional, Tuple
 
 if TYPE_CHECKING:  # import for typing only - this module stays dependency-free
     from ..metrics.rider import RiderMetrics
@@ -1363,6 +1363,161 @@ def _endurance_cadence_play(total_s: int,
     return _finish(s, total_s, cooldown_low=0.45, cooldown_high=0.55)
 
 
+# ---------------------------------------------------------------- ramp test
+# The declared FTP test. Everything about its shape is a MEASUREMENT PROTOCOL
+# rather than a training dose, which is why it is a named exception to several
+# invariants every other kind holds (see ``MEASUREMENT_TYPES`` below).
+#
+# Slope. The owner asked for 10 W/min rather than Zwift's 20, so that aerobic
+# limitation bites before the final minute instead of the rider's anaerobic
+# reserve carrying one more step. A fixed watt slope only produces that
+# intent at the FTP it was chosen against: both ends of a ramp scale with
+# fitness, so at 10 W/min a 380 W rider ramps for ~41 minutes and the test
+# measures endurance instead. The slope is therefore a FRACTION OF FTP per
+# minute, which holds the ramp near ~20 minutes at any fitness. At the
+# owner's 209 W FTP, 5%/min is 10.5 W/min - the number they asked for.
+#
+# Starting power is anchored to the rider's current FTP, which is the very
+# number the test exists to correct. That self-reference is standard (Zwift
+# does the same) and was explicitly accepted rather than designed around.
+RAMP_TEST_KEY = "ramp_test"
+RAMP_TEST_NAME = "Ramp Test"
+RAMP_TEST_STEP_S = 60
+RAMP_TEST_SLOPE_FRACTION = 0.05   # of FTP, added at every step
+RAMP_TEST_START_FRACTION = 0.50   # first step
+# 26 steps ends at 1.75 x FTP. The ceiling has to sit ABOVE the maximal
+# aerobic power of a rider whose recorded FTP is stale-LOW, because that is the
+# rider the test exists for: MAP is about 1.33x a rider's TRUE FTP, so a stored
+# FTP 30% below the truth needs 1.33 x 1.30 = 1.73x the stored number before
+# the ramp runs out of steps. A ceiling the rider reaches is not a measurement,
+# it is a floor - at 1.45x, the owner's own case (stored 209, true 215-225,
+# MAP ~1.33x true) terminates on the last step or completes the ramp and
+# under-reports. Steps past the rider's failure are never ridden, so the extra
+# headroom costs nothing but prescribed length.
+RAMP_TEST_STEPS = 26
+RAMP_TEST_WARMUP_S = 300
+RAMP_TEST_COOLDOWN_S = 240
+RAMP_TEST_WARMUP_LOW = 0.25
+RAMP_TEST_WARMUP_HIGH = 0.35
+#: The protocol's own length. A measurement session IGNORES the duration the
+#: rider picked off the menu (see ``_ramp_test``), so this is what it always
+#: emits - longer than the shortest menu choice, and deliberately so.
+RAMP_TEST_TOTAL_S = (
+    RAMP_TEST_WARMUP_S + RAMP_TEST_STEPS * RAMP_TEST_STEP_S + RAMP_TEST_COOLDOWN_S
+)
+
+# Kinds that measure the rider instead of training them. Their shape is fixed
+# by the protocol, so three invariants every training session holds are simply
+# not claims these make: that the session is the length the rider picked (the
+# requested duration is IGNORED - see ``_ramp_test``), that its load is
+# comparable to other sessions of the same length, and that its efforts stay
+# inside one published %FTP band. Tests exempt these kinds by name rather than
+# by a literal, so adding a second protocol lands in one place.
+MEASUREMENT_TYPES = frozenset({RAMP_TEST_KEY})
+
+
+def _ramp_test(total_s: int,
+               profile: Optional["RiderMetrics"] = None) -> Session:
+    """The FTP ramp test: 1-minute steps rising 5% of FTP until failure.
+
+    ``total_s`` IS IGNORED. Every other kind fills the duration the rider
+    picked off the menu; a test cannot, because its length is decided by the
+    minute the rider fails. The prescription is 35 minutes only in the sense
+    that it stops offering steps there - the ramp is expected to end around
+    minute 17-18 of the steps, and everything past the failure is never
+    ridden. Truncating the prescription to fit a shorter menu choice would
+    instead lower the ceiling, and a rider who reaches the ceiling gets a
+    floor rather than a measurement.
+
+    35 minutes is also comfortably inside the 45-minute stream cap that
+    ``ramp_test_ftp_candidate`` applies, so the cross-check stays available.
+
+    The steps are discrete ``steadystate`` segments, deliberately NOT a
+    ``ramp``/``warmup`` segment: those are linearly interpolated by
+    ``ble.runner._flatten`` into a smooth rise, and a smooth rise has no
+    one-minute step to take 75% of.
+    """
+    steps = RAMP_TEST_STEPS
+    top = RAMP_TEST_START_FRACTION + (steps - 1) * RAMP_TEST_SLOPE_FRACTION
+    s = Session(
+        name=RAMP_TEST_NAME,
+        description=(
+            f"FTP test. Easy warm-up, then {steps} one-minute steps starting "
+            f"at {round(RAMP_TEST_START_FRACTION * 100)}% of your current FTP "
+            f"and rising {round(RAMP_TEST_SLOPE_FRACTION * 100)}% of FTP every "
+            f"minute to {round(top * 100)}%. Hold each step for as long as you "
+            "can; the test ends when you cannot hold the next one, and that is "
+            "the result, not an abandoned ride. Your new FTP is 75% of your "
+            "best minute."
+        ),
+        workout_type=RAMP_TEST_KEY,
+    )
+    s.segments.append(
+        Segment(kind="warmup", duration=RAMP_TEST_WARMUP_S,
+                power_low=RAMP_TEST_WARMUP_LOW,
+                power_high=RAMP_TEST_WARMUP_HIGH,
+                text="Easy spin. Stay well under the first step.")
+    )
+    for i in range(steps):
+        power = RAMP_TEST_START_FRACTION + i * RAMP_TEST_SLOPE_FRACTION
+        s.segments.append(
+            Segment(kind="steadystate", duration=RAMP_TEST_STEP_S,
+                    power=round(power, 4),
+                    text=f"Step {i + 1} of {steps}.")
+        )
+    s.segments.append(
+        Segment(kind="cooldown", duration=RAMP_TEST_COOLDOWN_S,
+                power_low=RAMP_TEST_WARMUP_HIGH,
+                power_high=RAMP_TEST_WARMUP_LOW,
+                text="Spin it out.")
+    )
+    s.compute_tss()
+    return s
+
+
+def ramp_test_window(session: Session) -> Optional[Tuple[int, int]]:
+    """(start, end) seconds of the stepped ramp inside a ramp-test session.
+
+    This is what makes the result STRUCTURAL: the rider declared the test by
+    selecting it, so the ramp's position is known and nothing has to infer it
+    from the shape of the recorded stream. Returns None for every other kind.
+
+    The bounds are workout seconds, which are also indices into the recorded
+    sample stream: the controller advances its clock and appends exactly one
+    sample per second of positive power, so the two run together.
+    """
+    if getattr(session, "workout_type", None) != RAMP_TEST_KEY:
+        return None
+    t = 0
+    start = end = None
+    for seg in session.segments:
+        if seg.kind == "steadystate" and seg.duration == RAMP_TEST_STEP_S:
+            if start is None:
+                start = t
+            end = t + seg.duration
+        t += seg.duration
+    if start is None or end is None or end <= start:
+        return None
+    return (start, end)
+
+
+def ramp_test_prescribed_window() -> Tuple[int, int]:
+    """The (start, end) WORKOUT SECONDS of the ramp the protocol prescribes.
+
+    Used where the Session that was ridden is no longer in hand: the accept
+    route re-derives the result from the stored activity rather than trusting
+    a number posted back to it. The protocol is fixed, so the window is too.
+
+    Deliberately NOT clamped to the recording. A ramp test ends AT the failure,
+    so the stream stops inside the window - and clamping the end to what was
+    recorded makes "did the rider ride every step?" trivially true for every
+    ride, which is precisely the question ``evaluate``'s ``completed_ramp``
+    exists to answer. ``best_rolling_power`` already bounds its read by the
+    array it was given, so the clamp bought nothing and cost that.
+    """
+    return (RAMP_TEST_WARMUP_S, RAMP_TEST_WARMUP_S + RAMP_TEST_STEPS * RAMP_TEST_STEP_S)
+
+
 # variant name -> builder, per kind. "classic" is the original builder.
 _VARIANT_BUILDERS = {
     "vo2max": {
@@ -1398,6 +1553,9 @@ _VARIANT_BUILDERS = {
     "recovery": {
         "classic": _easy_endurance,
         "progression": _recovery_progression,
+    },
+    RAMP_TEST_KEY: {
+        "classic": _ramp_test,
     },
 }
 
@@ -1499,6 +1657,36 @@ WORKOUT_TYPE_INFO: List[dict] = [
         "structure": "Very easy warmup, a comfortable steady block at ~65% FTP "
                      "and an easy cooldown - nothing above low Zone 2, ridden on "
                      "a Zone 2 base when the ride is long.",
+    },
+    {
+        "key": RAMP_TEST_KEY,
+        "label": RAMP_TEST_NAME,
+        "zone": "Test",
+        # A ramp test has no band. Its whole purpose is to walk PAST FTP until
+        # the rider fails, so there is no ceiling to publish - `high` is None
+        # for exactly the reason the sprint level's is, an open-ended top. And
+        # there is no single work target either, so `work` is None: filling it
+        # with a number would advertise a wattage this session never asks the
+        # rider to hold. `low` stays a real number because it is a real claim -
+        # the first step - and it is the floor the builder is checked against.
+        "low": RAMP_TEST_START_FRACTION,
+        "high": None,
+        "work": None,
+        # `work is None` otherwise renders as "maximal effort - no target",
+        # which is what a sprint is and not what this is: a ramp test has a
+        # target every single minute, it just never stops raising it. This is
+        # the escape hatch the band fields cannot express.
+        "target_note": (
+            f"{round(RAMP_TEST_START_FRACTION * 100)}% FTP rising "
+            f"{round(RAMP_TEST_SLOPE_FRACTION * 100)}% FTP per minute "
+            "until you fail"
+        ),
+        "focus": "Measures your FTP. The result can replace the number every "
+                 "other workout is prescribed from.",
+        "structure": "Easy warm-up, then one-minute steps that keep rising "
+                     "until you cannot hold the next one. Stopping is the "
+                     "result, not an abandoned ride: your FTP is 75% of your "
+                     "best minute.",
     },
 ]
 
