@@ -133,6 +133,23 @@ def test_settings_timezone_persists_and_invalid_value_is_safe(client):
     assert db.get_user_settings(uid)["timezone"] == "Europe/Paris"
 
 
+def test_settings_page_has_audio_cue_volume_control(client):
+    _register(client)
+
+    text = client.get("/settings").text
+
+    assert '<fieldset class="audio-settings">' in text
+    assert "Audio cues" in text
+    assert re.search(
+        r'<input type="range" id="audioCueVolume"[^>]*'
+        r'min="0" max="1" step="0\.01"\s+value="0\.24"',
+        text,
+    )
+    assert 'id="audioCueVolumeValue"' in text
+    assert 'var AUDIO_CUE_VOLUME_KEY = "wattracker.audioCueVolume";' in text
+    assert "localStorage.setItem(AUDIO_CUE_VOLUME_KEY, slider.value);" in text
+
+
 def test_ride_page_deep_link_includes_past_workout(client):
     _register(client)
     workout_id = _add_plan_workout(client, "2000-01-02", "Past workout")
@@ -373,8 +390,11 @@ def test_ride_page_plays_countdown_cues_before_block_and_workout_ends(client, mo
     assert r.status_code == 200
     # New cue kinds ride on the existing playCue/primeAudio path.
     assert "function playTone(ctx, frequency, delay, duration)" in r.text
-    assert "var CUE_GAIN = 0.12;" in r.text
-    assert "gain.gain.setValueAtTime(CUE_GAIN, start);" in r.text
+    assert "var CUE_GAIN = 0.24;" in r.text
+    assert 'var AUDIO_CUE_VOLUME_KEY = "wattracker.audioCueVolume";' in r.text
+    assert "function getCueGain()" in r.text
+    assert "gain.gain.setValueAtTime(cueGain, start);" in r.text
+    assert "if (cueGain > 0)" in r.text
     assert "gain.gain.exponentialRampToValueAtTime(0.001, start + duration);" in r.text
     assert 'if (kind === "countdown") { playTone(ctx, 660, 0, 0.1); return; }' in r.text
     assert 'if (kind === "blockChange") { playTone(ctx, 1046, 0, 0.4); return; }' in r.text
@@ -2269,8 +2289,6 @@ def test_ride_page_treats_the_cooldown_as_an_active_ride(client, monkeypatch):
     assert '"cooldown — stop pedalling to finish"' in r.text
     assert '"cooldown — finishing in " + left + "s"' in r.text
     assert 'document.getElementById("rStatus").textContent = statusText(st);' in r.text
-
-
 
 
 def test_ride_ws_ends_a_ramp_test_on_failure_and_offers_the_result(

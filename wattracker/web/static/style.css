@@ -669,6 +669,10 @@ table.calendar th { text-align: center; }
 .zwift-account { border: 1px solid var(--surface-border); border-radius: var(--r-md);
     padding: 0.5rem 0.75rem; max-width: 520px; margin: 0.6rem 0; }
 .zwift-account legend { color: var(--muted); font-size: 0.8rem; }
+.audio-settings { border: 1px solid var(--surface-border); border-radius: var(--r-md);
+    padding: 0.5rem 0.75rem; max-width: 520px; margin: 0.6rem 0; }
+.audio-settings legend { color: var(--muted); font-size: 0.8rem; }
+.audio-settings output { color: var(--accent); font-weight: 600; }
 .clear-creds-form { margin-top: 0.5rem; }
 .danger-btn { background: none; border: 1px solid var(--alert); color: var(--alert); }
 .danger-btn:hover { background: rgba(224, 82, 82, 0.15); filter: none; }
