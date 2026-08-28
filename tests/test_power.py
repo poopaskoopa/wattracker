@@ -437,3 +437,169 @@ def test_split_activities_carries_rpe_through():
         [_act(now, 1, 200.0, 60, rpe=7), _act(now, 2, 200.0, 60), [1.0, 2.0]]
     )
     assert [e[2] for e in efforts] == [7, None, None]
+
+
+def _synth_minutes(minutes, seed=20260814):
+    """Build a per-second stream from (mean, sample sd) pairs, one per minute.
+
+    The noise is centred and rescaled so every minute carries exactly the
+    requested mean and sample standard deviation, which keeps the fixtures
+    deterministic without embedding anyone's real power samples.  Samples are
+    clipped at zero, so a minute whose sd reaches below zero watts (a soft
+    warm-up or a coasting cooldown) ends up marginally tamer than requested.
+
+    Note that these fixtures are harder than the rides they model: a real ramp
+    rises within the minute, so a block straddling two steps still looks like a
+    step, whereas here the flat per-minute means make a straddling block look
+    unsteady.  The real activity behind ``_REAL_RAMP_SHAPE`` is recognized from
+    a 6% steadiness allowance; the fixture needs the full 7%.
+    """
+    rng = np.random.default_rng(seed)
+    stream = []
+    for mean, sd in minutes:
+        noise = rng.standard_normal(60)
+        noise -= noise.mean()
+        if sd > 0:
+            noise *= sd / noise.std(ddof=1)
+        stream.extend(np.clip(mean + noise, 0.0, None).tolist())
+    return stream
+
+
+# The shape of a real 26.9-minute Zwift ramp test: a soft warm-up, ten rising
+# one-minute steps that get noisier as they get hard, then a ragged cooldown.
+_REAL_RAMP_SHAPE = [
+    (42.5, 23.4), (49.1, 9.5), (44.0, 5.0), (43.0, 45.1), (35.7, 13.7),
+    (93.9, 16.4),
+    (120.7, 7.6), (138.8, 7.4), (158.1, 7.8), (177.7, 10.0), (197.4, 8.6),
+    (217.2, 11.6), (237.7, 16.2), (256.6, 10.7), (278.1, 10.3), (297.6, 13.7),
+    (46.0, 89.3),
+] + [(70.0, 5.0)] * 9
+
+
+def test_ramp_candidate_survives_noisy_late_steps_and_a_cooldown():
+    # Regression: the steps at 237.7 W (sd 16.2) and 297.6 W (sd 13.7) exceed a
+    # flat 12 W bound, and the cooldown is wild, yet this is unambiguously a
+    # ramp test.  The candidate is 75% of the top step, 297.6 W.
+    stream = _synth_minutes(_REAL_RAMP_SHAPE)
+    assert len(stream) == 26 * 60
+    assert power.ramp_test_ftp_candidate(stream) == pytest.approx(223.2, abs=0.1)
+    assert power.estimate_ftp([stream]) == pytest.approx(223.2, abs=0.1)
+
+
+def test_ramp_candidate_recognized_when_followed_by_a_cooldown():
+    stream = _synth_minutes(
+        [(100.0, 4.0)] * 3
+        + [(200.0, 6.0), (220.0, 6.0), (240.0, 6.0), (260.0, 6.0),
+           (284.0, 6.0), (304.0, 6.0)]
+        + [(80.0, 40.0)] * 8
+    )
+    assert power.ramp_test_ftp_candidate(stream) == pytest.approx(228.0, abs=0.5)
+
+
+def test_ramp_candidate_tolerates_noise_at_the_start_of_the_run():
+    # Noise early rather than late: the first two steps of the ramp are the
+    # ragged ones, both well over the flat 12 W bound.
+    stream = _synth_minutes(
+        [(120.0, 5.0)] * 3
+        + [(250.0, 15.0), (275.0, 15.0), (300.0, 8.0), (325.0, 8.0),
+           (350.0, 8.0)]
+        + [(75.0, 30.0)] * 6
+    )
+    assert power.ramp_test_ftp_candidate(stream) == pytest.approx(262.5, abs=0.5)
+
+
+# --- Negatives.  Each is annotated with the guard that holds it, because a
+# --- fixture rejected by the slope band pins nothing about the others.
+
+def test_ramp_candidate_rejects_a_climb_over_a_col_then_a_descent():
+    # Held by the steadiness bound alone.  Everything else about this looks
+    # like a ramp: six rising 25 W steps from a lower lead-in, then a descent
+    # that collapses the power.  Only the ragged 300 W step (sd 22.5, 7.5% of
+    # its own power) rejects it, so loosening the bound past 7% accepts it.
+    stream = _synth_minutes(
+        [(175.0, 8.0)] * 4
+        + [(200.0, 8.0), (225.0, 8.0), (250.0, 8.0), (275.0, 8.0),
+           (300.0, 22.5), (325.0, 8.0)]
+        + [(60.0, 20.0)] * 10
+    )
+    assert power.ramp_test_ftp_candidate(stream) == 0.0
+
+
+def test_ramp_candidate_rejects_group_ride_surges_then_sitting_up():
+    # Held by the steadiness bound alone, at a lower power than the col above,
+    # so the two together pin the bound's slope and not just one point on it.
+    stream = _synth_minutes(
+        [(120.0, 6.0)] * 4
+        + [(160.0, 9.0), (180.0, 9.0), (200.0, 9.0), (220.0, 9.0),
+           (240.0, 18.0), (260.0, 9.0)]
+        + [(90.0, 25.0)] * 10
+    )
+    assert power.ramp_test_ftp_candidate(stream) == 0.0
+
+
+def test_ramp_candidate_rejects_a_soft_pedal_before_a_climb():
+    # Held by the collapse rule.  A rider who soft-pedals at 140 W and then
+    # climbs at 12 W/min - inside the ramp slope band - clears the warm-up
+    # guard by 2 W.  What separates them is the end: this rider returns to ride
+    # pace, where a ramp tester's power falls off a cliff.
+    stream = _synth_minutes(
+        [(140.0, 14.0)] * 12
+        + [(150.0 + 12.0 * i, 10.0 + 0.4 * i) for i in range(1, 9)]
+        + [(150.0, 14.0)] * 20
+    )
+    assert power.ramp_test_ftp_candidate(stream) == 0.0
+
+
+def test_ramp_candidate_rejects_a_ramp_shaped_workout_with_no_warm_up():
+    # Held by the collapse rule.  In a 20 W/min ramp every step is itself 20 W
+    # below the next, so each one satisfies the "clearly lower warm-up minute"
+    # for the step after it and the warm-up guard has almost no force.  This
+    # stream has no warm-up at all and still has to be rejected.
+    stream = _synth_minutes(
+        [(196.0, 6.0)] * 3
+        + [(200.0 + 20.0 * i, 7.0) for i in range(8)]
+        + [(200.0, 8.0)] * 10
+    )
+    assert power.ramp_test_ftp_candidate(stream) == 0.0
+
+
+def test_ramp_candidate_rejects_a_pyramid():
+    # Held by the collapse rule, and the sharpest false positive of the lot:
+    # the ride is under 20 minutes, so best_20min_power is 0.0 and the whole
+    # FTP estimate would come from misreading this as a ramp.
+    stream = _synth_minutes(
+        [(120.0, 6.0)] * 2
+        + [(200.0 + 20.0 * i, 8.0) for i in range(8)]
+        + [(340.0 - 20.0 * i, 8.0) for i in range(1, 8)]
+    )
+    assert power.best_20min_power(stream) == 0.0
+    assert power.ramp_test_ftp_candidate(stream) == 0.0
+    assert power.estimate_ftp([stream]) == 0.0
+
+
+def test_ramp_candidate_rejects_a_rising_interval_set():
+    # Held by the slope band: three-minute intervals at rising intensity with
+    # recoveries between them climb overall but never minute on minute.
+    stream = _synth_minutes(
+        [(110.0, 6.0)] * 3
+        + [(200.0, 12.0)] * 3 + [(110.0, 20.0)] * 2
+        + [(240.0, 14.0)] * 3 + [(110.0, 20.0)] * 2
+        + [(280.0, 15.0)] * 3 + [(110.0, 20.0)] * 2
+        + [(90.0, 8.0)] * 5
+    )
+    assert power.ramp_test_ftp_candidate(stream) == 0.0
+
+
+def test_ramp_candidate_rejects_a_sprint_in_a_steady_ride():
+    # Held by the slope band.
+    stream = _synth_minutes([(180.0, 15.0)] * 30)
+    sprint_at = 12 * 60
+    for i in range(sprint_at, sprint_at + 20):
+        stream[i] = 700.0
+    assert power.ramp_test_ftp_candidate(stream) == 0.0
+
+
+def test_ramp_candidate_rejects_a_noisy_steady_ride():
+    # Held by the slope band: noise on its own must never build a ramp.
+    stream = _synth_minutes([(210.0, 14.0)] * 35)
+    assert power.ramp_test_ftp_candidate(stream) == 0.0
