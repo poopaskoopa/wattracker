@@ -98,7 +98,7 @@ from .prescribe.planner import (
     build_workout,
     plan_workout,
     ramp_test_window,
-    ramp_test_window_for_samples,
+    ramp_test_prescribed_window,
     workout_type_info,
     validate_variant,
 )
@@ -2619,7 +2619,12 @@ def create_app() -> FastAPI:
         power = streams.get("power") or []
         result = ramp_test_mod.evaluate(
             power,
-            ramp_test_window_for_samples(len(power)),
+            # The PRESCRIBED window in workout seconds. Passing a sample
+            # count here read the wrong part of any ride not recorded at
+            # exactly 1 Hz - and the live loop's floor makes that the
+            # normal case, so an accepted FTP came out below the one the
+            # rider had just been shown.
+            ramp_test_prescribed_window(),
             importer.current_ftp(uid),
             act.get("duration_s"),
             path=config.db_path(),

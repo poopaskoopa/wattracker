@@ -21,7 +21,7 @@ from wattracker.prescribe.planner import (
     RAMP_TEST_WARMUP_S,
     build_workout,
     ramp_test_window,
-    ramp_test_window_for_samples,
+    ramp_test_prescribed_window,
 )
 
 pytest.importorskip("httpx")
@@ -257,7 +257,7 @@ def test_the_recorded_window_matches_the_prescribed_one():
     """The accept route re-derives the window without the Session in hand."""
     stream = _ridden_stream(209, steps_completed=13)
     prescribed = ramp_test_window(build_workout("ramp_test", 30))
-    recorded = ramp_test_window_for_samples(len(stream))
+    recorded = ramp_test_prescribed_window()
     assert recorded[0] == prescribed[0]
     assert ramp_test.evaluate(stream, recorded, 209, len(stream))["ftp"] == \
         ramp_test.evaluate(stream, prescribed, 209, len(stream))["ftp"]
@@ -397,6 +397,102 @@ def test_accepting_replaces_an_entry_already_dated_that_day(client):
         "/api/ftp/ramp-test/accept", json={"activity_id": activity_id}
     ).status_code == 200
     assert db.latest_ftp(uid)["source"] == "ramp_test"
+
+
+def test_accepting_reads_the_ride_at_the_rate_it_was_recorded(client):
+    """The live loop floors its poll at a second, so samples < seconds is NORMAL.
+
+    Deriving the ramp window from the SAMPLE COUNT therefore read the wrong
+    part of every real ride: at a 1.25s average tick the accept route wrote
+    144 W after the ride screen had just shown the rider 172 W, silently, with
+    a 200 and a row in ftp_history. The window is workout seconds; the stream's
+    own rate is what maps them onto samples.
+    """
+    import datetime as dt
+
+    ftp, steps = 209, 13
+    stream = _ridden_stream(ftp, steps_completed=steps)
+    at_one_hz = ramp_test.evaluate(
+        stream, ramp_test_prescribed_window(), ftp, len(stream),
+    )
+    assert at_one_hz["offer"]
+
+    for tick in (1.02, 1.10, 1.25, 2.0):
+        uid = _register(client, f"rider_tick_{int(tick * 100)}")
+        db.save_user_settings(uid, {"ftp": None})
+        # Same ride, same wall clock, fewer samples: one per tick spread across
+        # the WHOLE ride. Truncating instead would drop the hardest steps and
+        # lower the result honestly, which is not the bug under test.
+        sampled = [
+            stream[min(len(stream) - 1, int(i * tick))]
+            for i in range(int(len(stream) / tick))
+        ]
+        activity_id, _ = importer.save_ride_record(
+            user_id=uid,
+            started_at=dt.datetime.combine(_test_day(), dt.time(10, 0, 0)),
+            duration_s=len(stream),          # the ride really lasted this long
+            samples={"power": sampled, "cadence": [], "heartrate": []},
+            session_name=RAMP_TEST_NAME,
+            ftp=ftp,
+        )
+        r = client.post(
+            "/api/ftp/ramp-test/accept", json={"activity_id": activity_id}
+        )
+        assert r.status_code in (200, 400), (tick, r.text)
+        if r.status_code == 400:
+            continue                          # refused is fine; silently wrong is not
+        body = r.json()
+        assert body["ftp"] == pytest.approx(at_one_hz["ftp"], rel=0.02), (
+            tick, body["ftp"], at_one_hz["ftp"]
+        )
+
+
+def test_the_accept_route_knows_a_rider_failed_before_the_last_step(client):
+    """`completed_ramp` was trivially True: the window end was clamped to the
+    recording, so every ride had "ridden every step there was"."""
+    uid = _register(client, "rider_not_completed")
+    db.save_user_settings(uid, {"ftp": None})
+    activity_id, _ = _record_ramp_test(uid, steps_completed=13)
+    body = client.post(
+        "/api/ftp/ramp-test/accept", json={"activity_id": activity_id}
+    ).json()
+    assert body["completed_ramp"] is False
+
+
+def test_an_accepted_result_survives_the_next_evaluation_window(client):
+    """21 days later the update clock fires; the measurement must still stand.
+
+    `current_ftp` reads the LATEST row whatever its source, so an appended
+    'estimated' row would silently put an ERG-only rider back on the stale-low
+    passive number three weeks after they measured themselves - undoing the
+    one thing this feature exists to do.
+    """
+    import datetime as dt
+
+    uid = _register(client, "rider_durable")
+    db.save_user_settings(uid, {"ftp": None})
+    # An ordinary ride to estimate FROM: without one the passive estimator has
+    # no evidence at all (it excludes the test), returns 0 and appends nothing,
+    # and the test would pass whether or not the measurement is protected.
+    importer.save_ride_record(
+        user_id=uid,
+        started_at=dt.datetime.combine(_test_day(), dt.time(7, 0, 0)),
+        duration_s=3600,
+        samples={"power": [150] * 3600, "cadence": [], "heartrate": []},
+        session_name="Endurance",
+        ftp=209,
+    )
+    activity_id, _ = _record_ramp_test(uid)
+    body = client.post(
+        "/api/ftp/ramp-test/accept", json={"activity_id": activity_id}
+    ).json()
+    measured = body["ftp"]
+
+    later = utc_now() + dt.timedelta(days=22)
+    importer.evaluate_ftp(uid, now=later)
+
+    assert db.latest_ftp(uid)["source"] == "ramp_test"
+    assert importer.current_ftp(uid, now=later) == pytest.approx(measured, abs=0.5)
 
 
 def test_accepting_clears_a_typed_settings_override(client):

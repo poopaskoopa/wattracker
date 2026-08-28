@@ -1501,19 +1501,21 @@ def ramp_test_window(session: Session) -> Optional[Tuple[int, int]]:
     return (start, end)
 
 
-def ramp_test_window_for_samples(sample_count: int) -> Tuple[int, int]:
-    """The ramp window for a recorded ramp test of ``sample_count`` seconds.
+def ramp_test_prescribed_window() -> Tuple[int, int]:
+    """The (start, end) WORKOUT SECONDS of the ramp the protocol prescribes.
 
-    Used where the Session that was ridden is no longer in hand (the accept
+    Used where the Session that was ridden is no longer in hand: the accept
     route re-derives the result from the stored activity rather than trusting
-    a number posted back to it). The warm-up is a protocol constant, and the
-    end is clamped to the recording: a ramp test ends AT the failure, so the
-    stream stops inside the window and the clamp is what the session's own
-    window would have given anyway.
+    a number posted back to it. The protocol is fixed, so the window is too.
+
+    Deliberately NOT clamped to the recording. A ramp test ends AT the failure,
+    so the stream stops inside the window - and clamping the end to what was
+    recorded makes "did the rider ride every step?" trivially true for every
+    ride, which is precisely the question ``evaluate``'s ``completed_ramp``
+    exists to answer. ``best_rolling_power`` already bounds its read by the
+    array it was given, so the clamp bought nothing and cost that.
     """
-    count = max(0, int(sample_count))
-    end = min(count, RAMP_TEST_WARMUP_S + RAMP_TEST_STEPS * RAMP_TEST_STEP_S)
-    return (RAMP_TEST_WARMUP_S, end)
+    return (RAMP_TEST_WARMUP_S, RAMP_TEST_WARMUP_S + RAMP_TEST_STEPS * RAMP_TEST_STEP_S)
 
 
 # variant name -> builder, per kind. "classic" is the original builder.

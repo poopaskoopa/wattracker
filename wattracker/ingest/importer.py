@@ -381,6 +381,15 @@ def evaluate_ftp(user_id: int, now: Optional[_dt.datetime] = None) -> bool:
     override = _asserted_override(user_id)
     if override is not None:
         return _record_asserted_ftp(user_id, float(override), now)
+    # An asserted row already standing is the rider's own answer, and a passive
+    # estimate must not walk over it when the update clock next comes round.
+    # ``current_ftp`` reads the LATEST row regardless of source, so appending
+    # here would have quietly restored the stale-low estimate a measured ramp
+    # test had just replaced - three weeks after the rider measured it, with
+    # nothing to notice. A rider who wants a different number states one.
+    latest = db.latest_ftp(user_id)
+    if latest is not None and is_asserted_source(latest.get("source")):
+        return False
     est = _current_estimate(passive_ftp_evidence(user_id), now)
     if est <= 0:
         return False
