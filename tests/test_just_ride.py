@@ -8,6 +8,7 @@ from wattracker.prescribe.planner import (
     JUST_RIDE_DURATIONS,
     MAX_COOLDOWN_S,
     MEASUREMENT_TYPES,
+    RAMP_TEST_TOTAL_S,
     WORKOUT_BUILDERS,
     WORKOUT_TYPE_INFO,
     WORKOUT_TYPE_KEYS,
@@ -182,7 +183,11 @@ def test_ride_page_offers_just_ride(client):
 # the rider picked off a menu: for those kinds the requested duration is an
 # upper bound only. Every assertion below that reads "the session fills the
 # duration you asked for" therefore exempts them by name.
-_PROTOCOL = "a measurement protocol is emitted at its own length"
+_PROTOCOL = (
+    "a measurement protocol is emitted at its own length, IGNORING the "
+    "duration the rider picked: truncating it would lower the ceiling "
+    "they are measured against"
+)
 
 
 @pytest.mark.parametrize("kind", WORKOUT_TYPE_KEYS)
@@ -193,7 +198,7 @@ def test_every_type_builds_at_key_durations(kind, minutes):
     s = build_workout(kind, minutes)
     assert s.workout_type == kind
     if kind in MEASUREMENT_TYPES:
-        assert 0 < s.total_duration() <= minutes * 60, _PROTOCOL
+        assert s.total_duration() == RAMP_TEST_TOTAL_S, _PROTOCOL
     else:
         assert s.total_duration() == minutes * 60
     assert s.estimated_tss > 0
@@ -209,7 +214,7 @@ def test_preview_every_type_at_extremes(client, kind, minutes):
     data = r.json()
     assert data["workout_type"] == kind
     if kind in MEASUREMENT_TYPES:
-        assert 0 < data["duration_s"] <= minutes * 60, _PROTOCOL
+        assert data["duration_s"] == RAMP_TEST_TOTAL_S, _PROTOCOL
     else:
         assert data["duration_s"] == minutes * 60
     assert sum(s["duration_s"] for s in data["segments"]) == data["duration_s"]

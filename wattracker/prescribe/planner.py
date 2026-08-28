@@ -1385,51 +1385,59 @@ RAMP_TEST_NAME = "Ramp Test"
 RAMP_TEST_STEP_S = 60
 RAMP_TEST_SLOPE_FRACTION = 0.05   # of FTP, added at every step
 RAMP_TEST_START_FRACTION = 0.50   # first step
-# 20 steps ends at 1.45 x FTP. A rider still turning the pedals at 145% of
-# their recorded FTP does not have a stale FTP, they have a wrong one, and no
-# number of further steps fixes the anchor the ramp started from.
-RAMP_TEST_STEPS = 20
-# The detector needs five consecutive steps to recognize a ramp at all, and
-# below five steps there is no ramp to measure either.
-RAMP_TEST_MIN_STEPS = 5
+# 26 steps ends at 1.75 x FTP. The ceiling has to sit ABOVE the maximal
+# aerobic power of a rider whose recorded FTP is stale-LOW, because that is the
+# rider the test exists for: MAP is about 1.33x a rider's TRUE FTP, so a stored
+# FTP 30% below the truth needs 1.33 x 1.30 = 1.73x the stored number before
+# the ramp runs out of steps. A ceiling the rider reaches is not a measurement,
+# it is a floor - at 1.45x, the owner's own case (stored 209, true 215-225,
+# MAP ~1.33x true) terminates on the last step or completes the ramp and
+# under-reports. Steps past the rider's failure are never ridden, so the extra
+# headroom costs nothing but prescribed length.
+RAMP_TEST_STEPS = 26
 RAMP_TEST_WARMUP_S = 300
 RAMP_TEST_COOLDOWN_S = 240
 RAMP_TEST_WARMUP_LOW = 0.25
 RAMP_TEST_WARMUP_HIGH = 0.35
+#: The protocol's own length. A measurement session IGNORES the duration the
+#: rider picked off the menu (see ``_ramp_test``), so this is what it always
+#: emits - longer than the shortest menu choice, and deliberately so.
+RAMP_TEST_TOTAL_S = (
+    RAMP_TEST_WARMUP_S + RAMP_TEST_STEPS * RAMP_TEST_STEP_S + RAMP_TEST_COOLDOWN_S
+)
 
 # Kinds that measure the rider instead of training them. Their shape is fixed
 # by the protocol, so three invariants every training session holds are simply
-# not claims these make: that the session fills the duration the rider picked,
-# that its load is comparable to other sessions of the same length, and that
-# its efforts stay inside one published %FTP band. Tests exempt these kinds by
-# name rather than by a literal, so adding a second protocol lands in one place.
+# not claims these make: that the session is the length the rider picked (the
+# requested duration is IGNORED - see ``_ramp_test``), that its load is
+# comparable to other sessions of the same length, and that its efforts stay
+# inside one published %FTP band. Tests exempt these kinds by name rather than
+# by a literal, so adding a second protocol lands in one place.
 MEASUREMENT_TYPES = frozenset({RAMP_TEST_KEY})
-
-
-def ramp_test_steps(total_s: int) -> int:
-    """How many one-minute steps fit in ``total_s``, within the protocol."""
-    room = (int(total_s) - RAMP_TEST_WARMUP_S - RAMP_TEST_COOLDOWN_S)
-    fits = room // RAMP_TEST_STEP_S
-    return max(RAMP_TEST_MIN_STEPS, min(RAMP_TEST_STEPS, int(fits)))
 
 
 def _ramp_test(total_s: int,
                profile: Optional["RiderMetrics"] = None) -> Session:
     """The FTP ramp test: 1-minute steps rising 5% of FTP until failure.
 
-    ``total_s`` BOUNDS the session rather than setting it. A ramp test's
-    length is decided by when the rider fails, not by a duration they picked
-    off a menu, so the protocol is emitted at its own length and the requested
-    duration only ever truncates it. The full protocol is 29 minutes, which
-    fits inside the shortest duration the picker offers, so in practice it
-    never truncates at all.
+    ``total_s`` IS IGNORED. Every other kind fills the duration the rider
+    picked off the menu; a test cannot, because its length is decided by the
+    minute the rider fails. The prescription is 35 minutes only in the sense
+    that it stops offering steps there - the ramp is expected to end around
+    minute 17-18 of the steps, and everything past the failure is never
+    ridden. Truncating the prescription to fit a shorter menu choice would
+    instead lower the ceiling, and a rider who reaches the ceiling gets a
+    floor rather than a measurement.
+
+    35 minutes is also comfortably inside the 45-minute stream cap that
+    ``ramp_test_ftp_candidate`` applies, so the cross-check stays available.
 
     The steps are discrete ``steadystate`` segments, deliberately NOT a
     ``ramp``/``warmup`` segment: those are linearly interpolated by
     ``ble.runner._flatten`` into a smooth rise, and a smooth rise has no
     one-minute step to take 75% of.
     """
-    steps = ramp_test_steps(total_s)
+    steps = RAMP_TEST_STEPS
     top = RAMP_TEST_START_FRACTION + (steps - 1) * RAMP_TEST_SLOPE_FRACTION
     s = Session(
         name=RAMP_TEST_NAME,

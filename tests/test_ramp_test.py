@@ -42,7 +42,8 @@ def _register(client, username="rider"):
     return db.get_user_by_username(username)["id"]
 
 
-def _ridden_stream(ftp, steps_completed, extra_seconds=0):
+def _ridden_stream(ftp, steps_completed, extra_seconds=0, dt=1.0):
+    """See below; ``dt`` records at a cadence other than one sample a second."""
     """The power a rider records who holds every target, then fails.
 
     Built from the real prescription through the real flattening, so the
@@ -54,7 +55,8 @@ def _ridden_stream(ftp, steps_completed, extra_seconds=0):
     session = build_workout("ramp_test", 30)
     controller = RideController(session, ftp, autosave=False)
     end = RAMP_TEST_WARMUP_S + steps_completed * RAMP_TEST_STEP_S + extra_seconds
-    return [controller.target_watts(t) for t in range(end)]
+    count = int(round(end / dt))
+    return [controller.target_watts(i * dt) for i in range(count)]
 
 
 # --------------------------------------------------------------- the builder
@@ -89,19 +91,27 @@ def test_step_size_scales_with_the_riders_ftp(ftp, expected_step_w):
     assert watts[0] == round(RAMP_TEST_START_FRACTION * ftp)
     rises = [b - a for a, b in zip(watts, watts[1:])]
     assert all(r == pytest.approx(expected_step_w, abs=1.0) for r in rises)
-    # ~20 minutes of ramping for both riders, and a session that fits inside
-    # the shortest duration the picker offers.
     assert (end - start) == RAMP_TEST_STEPS * RAMP_TEST_STEP_S
-    assert session.total_duration() <= 30 * 60
+    # The ceiling must sit above the MAP of a rider whose recorded FTP is
+    # stale-LOW, since that is the rider being tested: MAP is ~1.33x TRUE FTP,
+    # so a stored FTP 30% low needs ~1.73x the stored number before the ramp
+    # runs out of steps.
+    assert watts[-1] >= round(1.73 * ftp)
+    # ...and the whole prescription still fits inside the 45-minute stream cap
+    # ramp_test_ftp_candidate applies, so the cross-check stays available.
+    assert session.total_duration() < 45 * 60
 
 
-def test_requested_duration_only_bounds_the_protocol():
-    """A ramp test ends when the rider fails, not when a menu says it does."""
-    full = build_workout("ramp_test", 30).total_duration()
-    assert build_workout("ramp_test", 240).total_duration() == full
-    # A duration too short for the whole protocol truncates it instead.
-    short = build_workout("ramp_test", 15)
-    assert short.total_duration() < full
+def test_the_requested_duration_is_ignored():
+    """A ramp test ends when the rider fails, not when a menu says it does.
+
+    Truncating the prescription to a shorter menu choice would lower the
+    ceiling, and a lowered ceiling is what turns a measurement into a floor.
+    """
+    lengths = {build_workout("ramp_test", m).total_duration()
+               for m in (15, 30, 60, 240)}
+    assert lengths == {RAMP_TEST_WARMUP_S + RAMP_TEST_STEPS * RAMP_TEST_STEP_S
+                       + build_workout("ramp_test", 30).segments[-1].duration}
 
 
 def test_ramp_window_is_the_run_of_steps_and_is_none_for_other_kinds():
@@ -163,7 +173,7 @@ def test_result_is_the_best_actual_minute_of_the_known_window():
     """
     stream = _ridden_stream(209, steps_completed=13, extra_seconds=25)
     window = ramp_test_window(build_workout("ramp_test", 30))
-    result = ramp_test.evaluate(stream, window, 209)
+    result = ramp_test.evaluate(stream, window, 209, len(stream))
 
     step13 = round(1.10 * 209)
     step14 = round(1.15 * 209)
@@ -177,7 +187,7 @@ def test_result_is_the_best_actual_minute_of_the_known_window():
 def test_the_detector_agrees_on_a_clean_test():
     stream = _ridden_stream(209, steps_completed=13)
     window = ramp_test_window(build_workout("ramp_test", 30))
-    result = ramp_test.evaluate(stream, window, 209)
+    result = ramp_test.evaluate(stream, window, 209, len(stream))
     assert result["cross_check_status"] == ramp_test.AGREES
     assert result["disagreement"] is False
     assert result["cross_check_ftp"] == pytest.approx(result["ftp"], rel=0.05)
@@ -194,7 +204,7 @@ def test_a_low_ftp_rider_is_out_of_the_detectors_range_not_in_disagreement():
     """
     stream = _ridden_stream(120, steps_completed=13)
     window = ramp_test_window(build_workout("ramp_test", 30))
-    result = ramp_test.evaluate(stream, window, 120)
+    result = ramp_test.evaluate(stream, window, 120, len(stream))
 
     assert powermod.ramp_test_ftp_candidate(stream) == 0.0
     assert result["cross_check_status"] == ramp_test.OUT_OF_RANGE
@@ -207,13 +217,20 @@ def test_a_low_ftp_rider_is_out_of_the_detectors_range_not_in_disagreement():
 
 
 def test_a_material_disagreement_is_reported():
+    """A rider who empties themselves into the last step splits the two methods.
+
+    The structural measure takes the best rolling minute, which straddles the
+    step boundary and catches the surge; the detector only ever compares whole
+    aligned blocks and reports the last complete step. That is a real
+    difference about a real ride, and the rider is told rather than having one
+    of the two picked for them.
+    """
     stream = _ridden_stream(209, steps_completed=13)
+    surge = round(1.6 * stream[-1])
+    stream = stream + [surge] * 45
     window = ramp_test_window(build_workout("ramp_test", 30))
-    # The window is known, so shrinking it changes only the structural
-    # measurement; the detector still reads the whole stream.
-    result = ramp_test.evaluate(
-        stream, (window[0], window[0] + 6 * RAMP_TEST_STEP_S), 209
-    )
+    result = ramp_test.evaluate(stream, window, 209, len(stream))
+    assert result["completed_ramp"] is False
     assert result["cross_check_status"] == ramp_test.DIFFERS
     assert result["disagreement"] is True
     assert "disagree" in result["message"]
@@ -222,7 +239,7 @@ def test_a_material_disagreement_is_reported():
 def test_a_test_with_no_full_minute_is_never_offered():
     stream = _ridden_stream(209, steps_completed=0, extra_seconds=20)
     window = ramp_test_window(build_workout("ramp_test", 30))
-    result = ramp_test.evaluate(stream, window, 209)
+    result = ramp_test.evaluate(stream, window, 209, len(stream))
     assert result["ftp"] == 0.0
     assert result["offer"] is False
 
@@ -230,7 +247,7 @@ def test_a_test_with_no_full_minute_is_never_offered():
 def test_an_implausible_result_is_never_offered():
     """A 40 W best minute reads 30 W, below the floor a basis may take."""
     window = (0, 120)
-    result = ramp_test.evaluate([40] * 120, window, 209)
+    result = ramp_test.evaluate([40] * 120, window, 209, 120)
     assert result["ftp"] == 30.0
     assert result["offer"] is False
     assert "Nothing has been saved" in result["message"]
@@ -242,8 +259,8 @@ def test_the_recorded_window_matches_the_prescribed_one():
     prescribed = ramp_test_window(build_workout("ramp_test", 30))
     recorded = ramp_test_window_for_samples(len(stream))
     assert recorded[0] == prescribed[0]
-    assert ramp_test.evaluate(stream, recorded, 209)["ftp"] == \
-        ramp_test.evaluate(stream, prescribed, 209)["ftp"]
+    assert ramp_test.evaluate(stream, recorded, 209, len(stream))["ftp"] == \
+        ramp_test.evaluate(stream, prescribed, 209, len(stream))["ftp"]
 
 
 # ------------------------------------------------------------- the opt-in
@@ -285,13 +302,68 @@ def _record_ramp_test(uid, ftp=209, steps_completed=13, name=RAMP_TEST_NAME):
     return activity_id, stream
 
 
+def _all_ftp_rows(uid):
+    conn = db.connect()
+    try:
+        rows = conn.execute(
+            "SELECT date, ftp_watts, source FROM ftp_history "
+            "WHERE user_id = ? ORDER BY date",
+            (uid,),
+        ).fetchall()
+    finally:
+        conn.close()
+    return [dict(r) for r in rows]
+
+
 def test_nothing_is_written_before_the_rider_accepts(client):
+    """Not just no ramp_test row - no NEW row of any source, and no change in
+    what the app is prescribing from.
+
+    ``save_ride_record`` calls ``evaluate_ftp``, and ``estimate_ftp`` runs the
+    ramp detector over every stream it is given, so before the passive
+    estimator learned to skip a declared test, finishing one wrote its own
+    result back as an 'estimated' row seconds later and ``current_ftp`` moved
+    to it - defeating the confirmation gate entirely while a query for
+    ``source='ramp_test'`` still came back empty.
+    """
     uid = _register(client, "rider_offer")
     db.save_user_settings(uid, {"ftp": None})
     db.add_ftp_entry(uid, "2026-08-01", 209.0, "manual")
+    before_rows = _all_ftp_rows(uid)
+    before_ftp = importer.current_ftp(uid)
+    assert before_ftp == pytest.approx(209.0)
+
     _record_ramp_test(uid)
-    # Recording the ride is not accepting its result.
-    assert _ramp_rows(uid) == []
+
+    assert _all_ftp_rows(uid) == before_rows
+    assert importer.current_ftp(uid) == pytest.approx(before_ftp)
+
+
+def test_an_ordinary_ride_still_feeds_the_passive_estimator(client):
+    """The exclusion is scoped to the declared test, not to in-app rides."""
+    import datetime as dt
+
+    uid = _register(client, "rider_passive")
+    db.save_user_settings(uid, {"ftp": None})
+    importer.save_ride_record(
+        user_id=uid,
+        started_at=dt.datetime.combine(_test_day(), dt.time(9, 0, 0)),
+        duration_s=3600,
+        samples={"power": [150] * 3600, "cadence": [], "heartrate": []},
+        session_name="Endurance",
+        ftp=209,
+    )
+    rows = _all_ftp_rows(uid)
+    assert [r["source"] for r in rows] == ["estimated"]
+    assert rows[0]["ftp_watts"] == pytest.approx(150.0, abs=1.0)
+
+
+def test_an_undeclared_ramp_in_an_imported_ride_is_still_recognized():
+    """Only the DECLARED test is skipped; #138/#140's behaviour is untouched."""
+    stream = _ridden_stream(209, steps_completed=13)
+    assert powermod.ramp_test_ftp_candidate(stream) > 0
+    assert ramp_test.is_declared_ftp_test({"filename": "Ride 2026-08-26 Ramp Test"})
+    assert not ramp_test.is_declared_ftp_test({"filename": "zwift_ramp.fit"})
 
 
 def test_accepting_writes_a_ramp_test_row_dated_the_test_day(client):
@@ -325,6 +397,56 @@ def test_accepting_replaces_an_entry_already_dated_that_day(client):
         "/api/ftp/ramp-test/accept", json={"activity_id": activity_id}
     ).status_code == 200
     assert db.latest_ftp(uid)["source"] == "ramp_test"
+
+
+def test_accepting_clears_a_typed_settings_override(client):
+    """user_settings.ftp outranks ftp_history, so leaving it would change nothing.
+
+    A rider who once typed an FTP into Settings would otherwise accept a
+    measured result and see every prescription carry on from the old number.
+    Accepting a measurement IS the rider replacing their own earlier
+    statement, so the statement goes and the response says it went.
+    """
+    uid = _register(client, "rider_override")
+    db.save_user_settings(uid, {"ftp": 209.0})
+    activity_id, _ = _record_ramp_test(uid)
+    assert db.get_user_settings(uid).get("ftp") == pytest.approx(209.0)
+
+    r = client.post("/api/ftp/ramp-test/accept", json={"activity_id": activity_id})
+    assert r.status_code == 200, r.text
+    body = r.json()
+
+    assert body["cleared_override"] == pytest.approx(209.0)
+    assert db.get_user_settings(uid).get("ftp") is None
+    # The tested value is what everything is prescribed from now, not the 209.
+    assert importer.current_ftp(uid) == pytest.approx(body["ftp"], abs=0.5)
+    assert body["effective_ftp"] == pytest.approx(body["ftp"], abs=0.5)
+
+
+def test_accepting_reports_the_entry_it_replaced(client):
+    """Replacing a rider's own manual entry is disclosed, never silent."""
+    uid = _register(client, "rider_replace_manual")
+    db.save_user_settings(uid, {"ftp": None})
+    db.add_ftp_entry(uid, _test_day().isoformat(), 250.0, "manual")
+    activity_id, _ = _record_ramp_test(uid)
+
+    body = client.post(
+        "/api/ftp/ramp-test/accept", json={"activity_id": activity_id}
+    ).json()
+    assert body["replaced"] is not None
+    assert body["replaced"]["source"] == "manual"
+    assert float(body["replaced"]["ftp_watts"]) == pytest.approx(250.0)
+
+
+def test_accepting_with_nothing_to_replace_says_so(client):
+    uid = _register(client, "rider_replace_none")
+    db.save_user_settings(uid, {"ftp": None})
+    activity_id, _ = _record_ramp_test(uid)
+    body = client.post(
+        "/api/ftp/ramp-test/accept", json={"activity_id": activity_id}
+    ).json()
+    assert body["replaced"] is None
+    assert body["cleared_override"] is None
 
 
 def test_a_ride_that_was_not_a_ramp_test_is_refused(client):
@@ -410,7 +532,7 @@ def test_the_picker_states_the_ramp_rather_than_a_band(client):
     # says what the session actually does instead of "no target".
     assert info["high_watts"] is None and info["work_watts"] is None
     assert "rising" in info["target_note"]
-    assert data["duration_s"] == 1740
+    assert data["duration_s"] == build_workout("ramp_test", 30).total_duration()
 
 
 def test_variant_profiles_are_keyed_by_the_duration_actually_served(client):
@@ -429,3 +551,100 @@ def test_variant_profiles_are_keyed_by_the_duration_actually_served(client):
         for variant, by_duration in data["variant_profiles"].items():
             for key, entry in by_duration.items():
                 assert key == str(round(entry["duration_s"] / 60)), (kind, variant)
+
+
+# ------------------------------------------------- the ceiling and the floor
+def test_completing_every_step_is_reported_as_a_floor_not_a_measurement():
+    """A rider who never failed did not find their limit; the ramp ran out.
+
+    Reporting a cross-check "agreement" here would read as confirmation of a
+    measurement that never happened.
+    """
+    stream = _ridden_stream(209, steps_completed=RAMP_TEST_STEPS)
+    window = ramp_test_window(build_workout("ramp_test", 30))
+    result = ramp_test.evaluate(stream, window, 209, len(stream))
+    assert result["completed_ramp"] is True
+    assert result["offer"] is True          # a floor is still worth accepting
+    assert "FLOOR" in result["message"]
+    assert "agrees at" not in result["message"]
+
+
+def test_a_rider_who_fails_has_not_completed_the_ramp():
+    stream = _ridden_stream(209, steps_completed=13)
+    window = ramp_test_window(build_workout("ramp_test", 30))
+    assert ramp_test.evaluate(
+        stream, window, 209, len(stream)
+    )["completed_ramp"] is False
+
+
+def test_the_ceiling_clears_the_map_of_a_stale_low_ftp():
+    """The arithmetic the step count exists to satisfy, stated once.
+
+    MAP is about 1.33x a rider's TRUE FTP. The test is for a rider whose
+    RECORDED FTP has gone stale-low, so the ramp has to keep climbing past
+    1.33x the truth while it is anchored to the stale number. At 1.45x (20
+    steps) the owner's own case - stored 209, true 215-225 - reaches the
+    ceiling and gets a floor instead of a result.
+    """
+    session = build_workout("ramp_test", 30)
+    steps = [seg for seg in session.segments if seg.kind == "steadystate"]
+    top = steps[-1].power
+    for staleness in (1.00, 1.10, 1.20, 1.30):
+        map_fraction = 1.33 * staleness
+        assert top > map_fraction, (staleness, top, map_fraction)
+
+
+# ------------------------------------------------ the one-sample-per-second law
+def test_a_stream_recorded_faster_than_one_hz_is_not_silently_misread():
+    """index == second holds only while dt == 1, and nothing guaranteed that.
+
+    Driving the controller at dt=0.5 stores twice as many samples as workout
+    seconds. Read as 1 Hz, the "window" covers the first half of the ride and
+    reports 133.5 W instead of 227.2 - a 41% under-report with offer=True. The
+    rate is measured from the ride's own duration and sample count instead.
+    """
+    fast = _ridden_stream(209, steps_completed=13, dt=0.5)
+    honest = _ridden_stream(209, steps_completed=13)
+    window = ramp_test_window(build_workout("ramp_test", 30))
+    duration_s = RAMP_TEST_WARMUP_S + 13 * RAMP_TEST_STEP_S
+    assert len(fast) == 2 * duration_s
+
+    result = ramp_test.evaluate(fast, window, 209, duration_s)
+    reference = ramp_test.evaluate(honest, window, 209, duration_s)
+    assert result["sample_rate"] == pytest.approx(2.0)
+    assert result["ftp"] == pytest.approx(reference["ftp"], abs=0.5)
+    # The 1 Hz shape detector cannot read 2 Hz blocks as minutes, so it is
+    # reported unavailable rather than treated as a rival answer.
+    assert result["cross_check_status"] == ramp_test.NOT_ONE_HZ
+    assert result["disagreement"] is False
+
+
+def test_a_stream_at_a_hopeless_sample_rate_is_refused_not_guessed():
+    stream = _ridden_stream(209, steps_completed=13)
+    window = ramp_test_window(build_workout("ramp_test", 30))
+    # Ten samples a second: far outside any cadence the ride loop produces, so
+    # there is no defensible mapping from workout seconds to indices.
+    result = ramp_test.evaluate(stream, window, 209, len(stream) / 10.0)
+    assert result["offer"] is False
+    assert result["ftp"] == 0.0
+    assert "not one sample a second" in result["message"]
+
+
+def test_a_ride_with_no_recorded_duration_is_refused():
+    stream = _ridden_stream(209, steps_completed=13)
+    window = ramp_test_window(build_workout("ramp_test", 30))
+    for duration in (0, None, "nonsense"):
+        result = ramp_test.evaluate(stream, window, 209, duration)
+        assert result["offer"] is False, duration
+
+
+def test_mild_wall_clock_drift_still_measures_the_right_part_of_the_ride():
+    """The live loop's real cadence is near, not exactly, one sample a second."""
+    drifted = _ridden_stream(209, steps_completed=13, dt=1.15)
+    honest = _ridden_stream(209, steps_completed=13)
+    window = ramp_test_window(build_workout("ramp_test", 30))
+    duration_s = RAMP_TEST_WARMUP_S + 13 * RAMP_TEST_STEP_S
+    result = ramp_test.evaluate(drifted, window, 209, duration_s)
+    reference = ramp_test.evaluate(honest, window, 209, duration_s)
+    assert result["offer"] is True
+    assert result["ftp"] == pytest.approx(reference["ftp"], rel=0.02)

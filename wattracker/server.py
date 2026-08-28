@@ -2604,11 +2604,14 @@ def create_app() -> FastAPI:
         act = db.get_activity(uid, activity_id)
         if act is None:
             return JSONResponse({"error": "activity not found"}, status_code=404)
-        # The activity is named for the session that produced it. That name is
-        # the only durable mark that this ride was the declared test, and
-        # without it this route would happily compute a "best minute x 0.75"
-        # from any ride at all and offer it as an FTP.
-        if not str(act.get("filename") or "").endswith(RAMP_TEST_NAME):
+        # Routing, not authorization: the session's name is how a stored ride
+        # is recognized as the declared test, and it keeps this route from
+        # computing a "best minute x 0.75" out of an ordinary ride. It is not a
+        # trust boundary and is not relied on as one - what gates the write is
+        # the rider pressing accept on a value ``is_plausible_ftp`` admitted.
+        # (Uploads are forced onto their .fit filename and in-app rides are
+        # named by the planner, so the name is not freely chosen in practice.)
+        if not ramp_test_mod.is_declared_ftp_test(act):
             return JSONResponse(
                 {"error": "that ride was not a ramp test"}, status_code=400
             )
@@ -2618,6 +2621,7 @@ def create_app() -> FastAPI:
             power,
             ramp_test_window_for_samples(len(power)),
             importer.current_ftp(uid),
+            act.get("duration_s"),
             path=config.db_path(),
         )
         if not result["offer"]:
@@ -2629,12 +2633,21 @@ def create_app() -> FastAPI:
         # else would put the test and its result on different days.
         started = parse_naive(act.get("start_time"))
         date_iso = (started or utc_now()).date().isoformat()
-        # replace_existing: an estimate written for today (ftp_backfill fills
-        # every date) would otherwise make this an INSERT OR IGNORE that
+        # replace_existing: an estimate written for that date (ftp_backfill
+        # fills every date) would otherwise make this an INSERT OR IGNORE that
         # silently does nothing. A confirmed test outranks whatever is already
-        # sitting on that date.
+        # sitting on that date - including a manual entry, which is why the
+        # row being replaced is reported back rather than quietly dropped.
+        replaced = db.ftp_entry_on(uid, date_iso, path=config.db_path())
         db.add_ftp_entry(uid, date_iso, result["ftp"], source=ramp_test_mod.SOURCE,
                          path=config.db_path(), replace_existing=True)
+        # user_settings.ftp outranks ftp_history in current_ftp(), so leaving a
+        # typed override in place would accept the test and change nothing the
+        # rider can see. Accepting a measured FTP is the rider replacing their
+        # own earlier statement, so the statement goes.
+        previous_override = db.get_user_settings(uid).get("ftp")
+        if previous_override is not None:
+            db.set_user_ftp_override(uid, None, path=config.db_path())
         importer.profile_store.refresh(uid)
         effective = importer.current_ftp(uid)
         return JSONResponse({
@@ -2643,10 +2656,12 @@ def create_app() -> FastAPI:
             "source": ramp_test_mod.SOURCE,
             "activity_id": activity_id,
             "effective_ftp": round(float(effective), 1),
-            # user_settings.ftp outranks ftp_history in current_ftp(), so a
-            # rider who once typed a number into Settings would otherwise see
-            # the test accepted and nothing change. Say so instead.
-            "settings_override": abs(float(effective) - result["ftp"]) > 0.05,
+            "completed_ramp": result["completed_ramp"],
+            "cleared_override": (
+                round(float(previous_override), 1)
+                if previous_override is not None else None
+            ),
+            "replaced": replaced,
         })
 
     @app.post("/api/activity/{activity_id}/rpe")
@@ -4824,7 +4839,8 @@ def create_app() -> FastAPI:
             return None
         try:
             result = ramp_test_mod.evaluate(
-                power, window, controller.ftp, path=config.db_path()
+                power, window, controller.ftp, int(controller.elapsed),
+                path=config.db_path(),
             )
         except Exception:
             # Offering a result must never be what breaks the end of a ride.

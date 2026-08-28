@@ -413,27 +413,47 @@ RAMP_DETECTOR_MIN_SLOPE_W = 8.0
 RAMP_DETECTOR_MAX_SLOPE_W = 35.0
 
 
-def best_rolling_power(power: Sequence[float], window_s: int,
-                       start_s: int = 0, end_s: Optional[int] = None) -> float:
-    """Best ``window_s`` rolling mean power within [start_s, end_s).
+# A stream's samples-per-second may drift from 1.0 without the reading being
+# wrong, but far enough from it and there is no longer a defensible mapping
+# from workout seconds to sample indices. Outside this band the caller is told
+# the window cannot be located rather than being handed a number computed over
+# the wrong part of the ride.
+RAMP_SAMPLE_RATE_MIN = 0.5
+RAMP_SAMPLE_RATE_MAX = 2.0
 
-    Seconds are indices into a one-sample-per-second stream. A window shorter
-    than ``window_s`` yields 0.0 rather than a mean over fewer seconds: a
-    partial minute is not a minute.
+
+def best_rolling_power(power: Sequence[float], window_s: float,
+                       start_s: float = 0.0, end_s: Optional[float] = None,
+                       samples_per_second: float = 1.0) -> float:
+    """Best ``window_s``-long rolling mean power within [start_s, end_s).
+
+    All three bounds are WORKOUT SECONDS. They are converted to sample indices
+    with ``samples_per_second``, which is the one assumption this function
+    makes and therefore the one its callers must supply rather than inherit: a
+    stream recorded at two samples a second has its 300-second mark at index
+    600, and reading index 300 silently measures the wrong half of the ride.
+
+    A span shorter than ``window_s`` yields 0.0 rather than a mean over fewer
+    seconds: a partial minute is not a minute.
     """
-    arr = _clean_power(power)
-    lo = max(0, int(start_s))
-    hi = arr.size if end_s is None else min(arr.size, int(end_s))
-    if hi - lo < int(window_s) or window_s <= 0:
+    rate = float(samples_per_second)
+    if not (rate > 0.0) or window_s <= 0:
         return 0.0
-    roll = rolling_mean(arr[lo:hi], int(window_s))
+    arr = _clean_power(power)
+    lo = max(0, int(round(float(start_s) * rate)))
+    hi = arr.size if end_s is None else min(arr.size, int(round(float(end_s) * rate)))
+    span = int(round(float(window_s) * rate))
+    if span <= 0 or hi - lo < span:
+        return 0.0
+    roll = rolling_mean(arr[lo:hi], span)
     if roll.size == 0:
         return 0.0
     return float(roll.max())
 
 
-def ramp_test_ftp_in_window(power: Sequence[float], start_s: int,
-                            end_s: int) -> float:
+def ramp_test_ftp_in_window(power: Sequence[float], start_s: float,
+                            end_s: float,
+                            samples_per_second: float = 1.0) -> float:
     """FTP from a ramp whose position in the stream is already KNOWN.
 
     75% of the best minute of ACTUAL recorded power inside the window. Actual
@@ -446,7 +466,7 @@ def ramp_test_ftp_in_window(power: Sequence[float], start_s: int,
     ramp, and where?" - for a file that arrived with no context, and on the
     declared path there is no such question to ask.
     """
-    best = best_rolling_power(power, 60, start_s, end_s)
+    best = best_rolling_power(power, 60, start_s, end_s, samples_per_second)
     return best * RAMP_TEST_FTP_FRACTION
 
 

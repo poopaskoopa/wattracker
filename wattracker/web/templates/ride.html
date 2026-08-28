@@ -202,7 +202,8 @@
 <dialog id="rampTestDialog" class="ride-confirm ramp-result"
         aria-labelledby="rampTestTitle">
     <h3 id="rampTestTitle">Ramp test complete</h3>
-    <p class="ramp-result-value"><strong id="rampTestFtp">0</strong> W</p>
+    <p class="ramp-result-value"><strong id="rampTestFtp">0</strong> W<span
+        id="rampTestFloor" hidden> or more</span></p>
     <p id="rampTestDetail" class="hint"></p>
     <p id="rampTestWarning" class="alert" hidden></p>
     <p id="rampTestStatus" role="status" aria-live="polite" hidden></p>
@@ -2023,6 +2024,11 @@
         rampTestActivityId = result.activity_id;
         document.getElementById("rampTestFtp").textContent =
             result.offer ? Math.round(result.ftp) : "\u2014";
+        // A rider who rode every step never failed, so the number is a lower
+        // bound. Saying so next to the number matters more than saying it in
+        // the paragraph underneath, which is where a big figure gets believed.
+        document.getElementById("rampTestFloor").hidden =
+            !(result.offer && result.completed_ramp);
         document.getElementById("rampTestDetail").textContent = result.message || "";
         var warning = document.getElementById("rampTestWarning");
         // Only a real disagreement is a warning. A cross-check that could not
@@ -2071,9 +2077,16 @@
                 return;
             }
             var saved = "FTP set to " + Math.round(data.ftp) + " W on " + data.date + ".";
-            if (data.settings_override) {
-                saved += " Your Settings still override it at "
-                    + Math.round(data.effective_ftp) + " W \u2014 clear it there to use this.";
+            if (data.cleared_override != null) {
+                saved += " Your typed Settings FTP of "
+                    + Math.round(data.cleared_override)
+                    + " W was cleared so this one takes effect.";
+            }
+            // Accepting overwrites whatever was already dated that day. If
+            // that was the rider's own entry, they get told which value went.
+            if (data.replaced && data.replaced.source !== "ramp_test") {
+                saved += " It replaced the " + data.replaced.source + " entry of "
+                    + Math.round(data.replaced.ftp_watts) + " W on that date.";
             }
             setLive(status, saved, "success");
             rampTestActivityId = null;

@@ -14,7 +14,7 @@ import pytest
 
 from wattracker.prescribe import zwo
 from wattracker.prescribe.planner import (
-    MEASUREMENT_TYPES, VARIANTS, build_workout)
+    MEASUREMENT_TYPES, RAMP_TEST_TOTAL_S, VARIANTS, build_workout)
 
 
 def _kinds_and_durations(session):
@@ -160,9 +160,11 @@ def test_every_builder_sums_to_the_requested_duration(seconds):
         for variant in variants:
             s = build_workout(kind, seconds // 60, variant)
             if kind in MEASUREMENT_TYPES:
-                # The requested duration bounds a measurement protocol rather
-                # than setting it: a ramp test ends when the rider fails.
-                assert 0 < s.total_duration() <= seconds, (kind, variant)
+                # A measurement protocol IGNORES the requested duration: its
+                # length is fixed by the protocol, and truncating it would
+                # lower the ceiling the rider is measured against. It is
+                # longer than the shortest menu choice, deliberately.
+                assert s.total_duration() == RAMP_TEST_TOTAL_S, (kind, variant)
             else:
                 assert s.total_duration() == seconds, (kind, variant)
             assert all(seg.duration > 0 for seg in s.segments), (kind, variant)

@@ -192,9 +192,14 @@ class RideController:
         return False
 
     def _failed(self) -> bool:
-        """Is a stop right now the rider failing a test rather than pausing?"""
+        """Is a stop right now the rider failing a test rather than pausing?
+
+        Only INSIDE the ramp. Before it the rider is warming up and has
+        answered nothing; after it they have already ridden every step, and a
+        stop during the prescribed cooldown is an ordinary pause.
+        """
         window = self.failure_window
-        return window is not None and self.elapsed >= window[0]
+        return window is not None and window[0] <= self.elapsed < window[1]
 
     def recorded_power(self) -> List[int]:
         """The power samples recorded so far, one per second of ride time."""

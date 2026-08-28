@@ -32,6 +32,7 @@ from ..metrics.power import (
 )
 from ..metrics import profile_store
 from ..prescribe.plan import HARD_STEADY_POWER
+from ..ramp_test import is_declared_ftp_test
 from ..timeutil import parse_naive, utc_now, utc_today
 from .fit_parser import parse_fit
 
@@ -176,6 +177,31 @@ def _current_estimate(
     return estimate_ftp(streams, now=now)
 
 
+def passive_ftp_evidence(user_id: int) -> List[dict]:
+    """The activities the PASSIVE estimator is allowed to learn from.
+
+    A DECLARED ramp test is excluded, and this is what makes the confirmation
+    gate real rather than decorative. ``estimate_ftp`` runs
+    ``ramp_test_ftp_candidate`` over every stream it is handed, and
+    ``save_ride_record`` calls ``evaluate_ftp`` the moment a ride is stored -
+    so with the test left in, finishing one wrote its own result into
+    ``ftp_history`` as an 'estimated' row seconds later, and ``current_ftp``
+    moved to it, whether or not the rider ever accepted. Nothing about that
+    row is wrong except that nobody agreed to it.
+
+    The test still reaches history: through ``add_ftp_entry`` with a
+    ``ramp_test`` source, when a human presses accept. That is the only door.
+
+    An UNDECLARED ramp in an imported .fit is untouched by this - it is not
+    named as a test, the passive path is the only thing that will ever see it,
+    and recognizing it there is the behaviour issue #138/#140 built.
+    """
+    return [
+        activity for activity in db.full_activities(user_id)
+        if not is_declared_ftp_test(activity)
+    ]
+
+
 def recent_best_effort_ftp(
     user_id: int, now: Optional[_dt.datetime] = None
 ) -> float:
@@ -184,7 +210,7 @@ def recent_best_effort_ftp(
     now = now or utc_now()
     cutoff = now - _dt.timedelta(days=90)
     recent = []
-    for activity in db.full_activities(user_id):
+    for activity in passive_ftp_evidence(user_id):
         when = parse_naive(activity.get("start_time"))
         if when is not None and cutoff <= when <= now:
             recent.append(activity)
@@ -270,7 +296,7 @@ def current_ftp(
                 "ignoring implausible stored FTP estimate for user %s: %.3f W "
                 "(floor %.0f W)", user_id, stored, FTP_PLAUSIBLE_MIN_WATTS
             )
-    ftp = _current_estimate(db.full_activities(user_id), now, extra_power)
+    ftp = _current_estimate(passive_ftp_evidence(user_id), now, extra_power)
     if is_plausible_ftp(ftp):
         return ftp
     if ftp > 0:
@@ -355,7 +381,7 @@ def evaluate_ftp(user_id: int, now: Optional[_dt.datetime] = None) -> bool:
     override = _asserted_override(user_id)
     if override is not None:
         return _record_asserted_ftp(user_id, float(override), now)
-    est = _current_estimate(db.full_activities(user_id), now)
+    est = _current_estimate(passive_ftp_evidence(user_id), now)
     if est <= 0:
         return False
     if not is_plausible_ftp(est):
