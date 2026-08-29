@@ -1,5 +1,7 @@
 """Static contracts for the source-install bootstrap path."""
+import ast
 import contextlib
+import importlib.util
 import io
 import os
 from pathlib import Path
@@ -377,6 +379,91 @@ def test_start_says_nothing_about_a_setup_token_when_none_was_printed():
 
     assert found.returncode == 0, found.stderr
     assert found.stdout == ""
+
+
+def _load_packaging_helper(name):
+    """Load a packaging helper by path, the way the spec files do.
+
+    Never by import: the directory is called "packaging" and so is an installed
+    PyPI distribution. Same helper, same reason, as test_connector_packaging.
+    """
+    path = ROOT / "packaging" / f"{name}.py"
+    spec = importlib.util.spec_from_file_location(f"_test_{name}", path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def test_the_packaging_smoke_lifts_the_setup_token_out_of_real_server_output(
+    tmp_path, enforce_setup_token
+):
+    """A packaged build has to be registrable, and that now takes the token.
+
+    The smoke tests are the only thing that runs a real installed or frozen
+    build end to end, and their first account is a genuine first account: it
+    needs the one-time token the server prints at startup. So the harness has
+    to do what an operator does - read the printed output - and this is that
+    parser, fed the banner wattracker.setuptoken actually emits rather than a
+    hand-copied imitation, so a reworded banner fails here instead of failing a
+    release build.
+    """
+    from wattracker.setuptoken import SetupToken
+
+    smoke_http = _load_packaging_helper("smoke_http")
+    token = SetupToken()
+    banner = io.StringIO()
+    token.announce(banner)
+    captured = tmp_path / "server-output.txt"
+    captured.write_text(
+        "INFO:     Waiting for application startup.\n"
+        + banner.getvalue()
+        + "INFO:     Uvicorn running on http://127.0.0.1:8000\n"
+    )
+
+    assert smoke_http.read_setup_token(captured) == token.value
+
+
+def test_the_packaging_smoke_fails_loudly_when_no_token_was_printed(tmp_path):
+    """Silence must not degrade into registering with an empty token.
+
+    That would come back as a 403 from inside register_user with nothing saying
+    why, which is exactly the shape of failure this parser exists to prevent.
+    """
+    smoke_http = _load_packaging_helper("smoke_http")
+    captured = tmp_path / "server-output.txt"
+    captured.write_text("INFO:     Uvicorn running on http://127.0.0.1:8000\n")
+
+    assert smoke_http.setup_token_from(captured.read_text()) is None
+    with pytest.raises(RuntimeError, match="setup token"):
+        smoke_http.read_setup_token(captured, timeout=0.2)
+
+
+def test_every_packaging_smoke_registers_with_a_setup_token():
+    """No caller may drift back to the two-argument form.
+
+    This is a real regression rather than a hypothetical one: the first version
+    of the setup token shipped with three smoke scripts still posting username
+    and password alone, and CI found it as an HTTP 403 several minutes into a
+    packaging job. An argument count is checked here so the next one is found
+    in the unit suite instead.
+    """
+    calls = 0
+    for script in sorted((ROOT / "packaging").glob("smoke_*.py")):
+        tree = ast.parse(script.read_text(encoding="utf-8"))
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Call):
+                continue
+            function = node.func
+            name = getattr(function, "attr", None) or getattr(function, "id", None)
+            if name != "register_user" or isinstance(node, ast.FunctionDef):
+                continue
+            calls += 1
+            passed = len(node.args) + len(node.keywords)
+            assert passed >= 3, (
+                f"{script.name} calls register_user with {passed} argument(s); "
+                "the first account on a packaged build needs the setup token"
+            )
+    assert calls >= 3, "expected every smoke script to register an account"
 
 
 def test_quickstart_tells_a_fresh_install_where_its_setup_token_is():

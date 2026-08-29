@@ -96,8 +96,86 @@ def assert_ui_renders(opener, base) -> None:
         raise AssertionError("register page did not render its form")
 
 
-def register_user(opener, base, username="smokeuser", password="password123") -> None:
-    request(opener, base + "/register", {"username": username, "password": password})
+# The heading of the banner wattracker.setuptoken prints at startup. The token
+# itself is the first non-empty line after it - the same rule start.sh applies
+# to the log it captures, and the same rule an operator applies by eye.
+SETUP_TOKEN_BANNER = "wattracker setup token"
+
+
+def setup_token_from(text: str):
+    """The setup token in captured server output, or None."""
+    lines = (text or "").splitlines()
+    for index, line in enumerate(lines):
+        if SETUP_TOKEN_BANNER in line:
+            for candidate in lines[index + 1:]:
+                candidate = candidate.strip()
+                if candidate:
+                    return candidate
+    return None
+
+
+def read_setup_token(stream_path, timeout=30, still_running=None) -> str:
+    """Wait for the first-account setup token in the server's captured stdout.
+
+    A smoke test has to do what an operator does: the first account on an
+    install must present the one-time token the server prints while its
+    database is empty (wattracker/setuptoken.py), so a build that cannot be
+    registered against is a build whose first run does not work. Reading it out
+    of the process's own output - rather than reaching into the app for it - is
+    what makes that a real end-to-end check rather than a rehearsal.
+
+    Polled rather than read once, even though the banner is printed during
+    lifespan startup and therefore before the socket accepts anything: the
+    caller redirected the child's stdout to a file, and waiting a moment for
+    bytes to land is cheaper than a flaky smoke run. ``still_running`` aborts
+    early on a process that has already died, exactly as wait_until_serving
+    does.
+    """
+    deadline = time.time() + timeout
+    while True:
+        try:
+            with open(stream_path, "r", encoding="utf-8", errors="replace") as handle:
+                token = setup_token_from(handle.read())
+        except OSError:
+            token = None
+        if token:
+            return token
+        if still_running is not None and not still_running():
+            raise RuntimeError(
+                "the application exited before printing a setup token"
+            )
+        if time.time() >= deadline:
+            raise RuntimeError(
+                f"no setup token appeared in {stream_path} within {timeout}s; "
+                "a fresh install prints one at startup and cannot be "
+                "registered against without it"
+            )
+        time.sleep(0.25)
+
+
+def register_user(
+    opener, base, setup_token, username="smokeuser", password="password123"
+) -> None:
+    """Create the FIRST account on a freshly packaged install.
+
+    ``setup_token`` is required rather than optional on purpose. Every caller
+    here is registering into an empty database, which is precisely the case the
+    token governs, and a default of "" would turn a caller that forgot it into
+    a 403 at run time in CI instead of a missing argument at the call site.
+
+    The body is checked, not just the status: a validation failure re-renders
+    the form with 200, so "it did not raise" is not "an account exists".
+    """
+    body = request(
+        opener,
+        base + "/register",
+        {"username": username, "password": password, "setup_token": setup_token},
+    ).read().decode("utf-8", "replace")
+    if 'action="/register"' in body:
+        raise AssertionError(
+            "registration came back as the sign-up form again, so no account "
+            "was created"
+        )
 
 
 def assert_credential_backend(opener, base, expected) -> None:

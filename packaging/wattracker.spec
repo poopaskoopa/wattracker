@@ -87,8 +87,16 @@ if IS_MACOS:
     # console=True above is deliberate and applies to the bundled binary too:
     # dist/wattracker/wattracker stays a usable CLI, and inside the .app macOS
     # simply discards stdout when Finder launches it with no terminal attached.
-    # wattracker only prints its URL and then serves, so nothing depends on a
-    # readable console.
+    #
+    # That discard used to be free, because wattracker only printed its URL and
+    # then served. It is not free any more: on an install with no account the
+    # app prints a one-time setup token which the first registration has to
+    # present (wattracker/setuptoken.py), so a Finder-launched .app cannot
+    # complete its own first run. docs/macos-packaging.md ("First run") carries
+    # the workaround - launch once from a terminal, or via `open --stdout` - and
+    # lists the gap. Do not "fix" it by writing the token to disk or by
+    # weakening the check: the token's whole value is that it travels only where
+    # the operator can see it.
     #
     # LSUIElement=True: this process runs a uvicorn server and hands the user
     # off to their browser. It has no Cocoa event loop, so a regular Dock icon

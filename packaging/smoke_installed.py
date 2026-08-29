@@ -28,20 +28,45 @@ with tempfile.TemporaryDirectory() as temporary:
     port = smoke_http.free_loopback_port()
     env = os.environ.copy()
     env.update(WATTRACKER_DATA_DIR=str(temp / "data"), WATTRACKER_PORT=str(port), WATTRACKER_OPEN_BROWSER="0", WATTRACKER_AUTO_SCAN="0")
-    proc = subprocess.Popen([sys.executable, "-m", "wattracker"], cwd=temp, env=env)
+    # The child's output is captured to a file rather than inherited, because
+    # the first account on a fresh install has to present the one-time setup
+    # token the server prints at startup (wattracker/setuptoken.py), and this
+    # script is the operator here: it has to read what an operator would read.
+    # The file is echoed at the end so the CI log keeps everything it had when
+    # stdout went straight through - including that banner, which is what shows
+    # a packaged build prints the token at all.
+    output_path = temp / "server-output.txt"
+    proc = None
     base = f"http://127.0.0.1:{port}"
     opener = smoke_http.build_opener()
     try:
+        with open(output_path, "wb") as captured:
+            proc = subprocess.Popen(
+                [sys.executable, "-m", "wattracker"],
+                cwd=temp,
+                env=env,
+                stdout=captured,
+                stderr=subprocess.STDOUT,
+            )
         smoke_http.wait_until_serving(
             opener, base, timeout=20, still_running=lambda: proc.poll() is None
         )
         smoke_http.assert_ui_renders(opener, base)
-        smoke_http.register_user(opener, base)
+        token = smoke_http.read_setup_token(
+            output_path, still_running=lambda: proc.poll() is None
+        )
+        smoke_http.register_user(opener, base, token)
         assert smoke_http.request(opener, base + "/settings/backup", {"smoke": "1"}).status == 200
     finally:
-        proc.terminate()
+        if proc is not None:
+            proc.terminate()
+            try:
+                proc.wait(timeout=10)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                proc.wait()
+        print("=== installed wattracker output ===")
         try:
-            proc.wait(timeout=10)
-        except subprocess.TimeoutExpired:
-            proc.kill()
-            proc.wait()
+            print(output_path.read_text(errors="replace") or "<empty>")
+        except OSError as exc:
+            print(f"<unavailable: {exc}>")

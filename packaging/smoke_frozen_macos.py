@@ -83,14 +83,27 @@ def sandbox_env(home: Path, port: int) -> dict:
     return env
 
 
-def check_ui(port: int, still_running=None) -> None:
+def check_ui(port: int, output_path: Path, still_running=None) -> None:
+    """Drive the frozen app's UI the way its first operator would.
+
+    ``output_path`` is the file this launch's stdout was redirected to, and it
+    is not optional: the first account on a fresh install must present the
+    one-time setup token the app prints at startup (wattracker/setuptoken.py),
+    so registering means reading that output first. Both launch modes below
+    redirect stdout to a file for exactly this reason - see the note in
+    run_via_launchservices about what that does NOT prove.
+    """
     base = f"http://127.0.0.1:{port}"
     opener = smoke_http.build_opener()
     smoke_http.wait_until_serving(
         opener, base, timeout=READY_TIMEOUT, still_running=still_running
     )
     smoke_http.assert_ui_renders(opener, base)
-    smoke_http.register_user(opener, base)
+    smoke_http.register_user(
+        opener,
+        base,
+        smoke_http.read_setup_token(output_path, still_running=still_running),
+    )
     smoke_http.assert_credential_backend(opener, base, EXPECTED_BACKEND)
     # bleak is an optional extra, so its absence is reported rather than fatal -
     # but when the build was made with [ble], "Bluetooth unavailable" in a
@@ -132,7 +145,7 @@ def run_direct(executable: Path) -> None:
                 stdin=subprocess.DEVNULL,
             )
         try:
-            check_ui(port, still_running=lambda: proc.poll() is None)
+            check_ui(port, stdout_path, still_running=lambda: proc.poll() is None)
             dump("stdout", stdout_path)
         except BaseException:
             dump("stdout", stdout_path)
@@ -162,7 +175,16 @@ def bundle_pids(executable: Path) -> "list[int]":
 
 
 def run_via_launchservices(executable: Path, bundle: Path) -> None:
-    """Launch the .app the way Finder does, with no tty and no shell env."""
+    """Launch the .app the way Finder does, with no tty and no shell env.
+
+    With ONE difference that matters since the first-account setup token
+    exists: ``open --stdout`` redirects the app's output to a file, and a real
+    double-click does not. A Finder-launched .app on a fresh install prints its
+    setup token into a discarded stdout (see the console note in
+    packaging/wattracker.spec), so this check proves the token is printed but
+    not that a Finder user could read it. docs/macos-packaging.md carries the
+    first-run instruction that follows from that.
+    """
     if bundle_pids(executable):
         raise SystemExit("an instance of this bundle is already running; stop it first")
     with tempfile.TemporaryDirectory(prefix="wattracker-frozen-") as temporary:
@@ -179,7 +201,7 @@ def run_via_launchservices(executable: Path, bundle: Path) -> None:
         print(f"[launchservices] open {bundle} on port {port}")
         subprocess.run(command, check=True, env=env)
         try:
-            check_ui(port)
+            check_ui(port, stdout_path)
             dump("stdout", stdout_path)
         except BaseException:
             dump("stdout", stdout_path)

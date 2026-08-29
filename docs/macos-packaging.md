@@ -44,11 +44,42 @@ PyInstaller is pinned in the `package` extra of `pyproject.toml`
   with `console=True`.
 - `console=True` is kept for macOS as well. It is what makes
   `dist/wattracker/wattracker` a usable CLI, and inside the `.app` macOS simply
-  discards stdout when there is no terminal. The app only prints its URL before
-  serving, so nothing depends on a readable console.
+  discards stdout when there is no terminal. That used to cost nothing, because
+  the app only printed its URL before serving. **It costs something now:** a
+  fresh install prints a one-time setup token that the first account has to
+  present (`wattracker/setuptoken.py`), and a Finder double-click throws it
+  away. See "First run" below.
 - `NSBluetoothAlwaysUsageDescription` is set. Without a purpose string macOS
   terminates the process the instant CoreBluetooth is touched, so the ride page
   would kill the app rather than prompt.
+
+### First run
+
+The first account on a fresh install must present the one-time setup token the
+server prints at startup (`wattracker/setuptoken.py`: it exists so the account
+that owns an install can only be claimed by whoever can see the server's own
+output, rather than by whoever reaches `/register` first). A Finder-launched
+`.app` has no terminal and macOS discards its stdout, so **the token is printed
+into nothing and the app cannot be set up by double-clicking it.**
+
+Do the first launch from a terminal instead, either with the inner binary:
+
+```sh
+/Applications/wattracker.app/Contents/MacOS/wattracker
+```
+
+or by asking LaunchServices to keep the output:
+
+```sh
+open -n --stdout /tmp/wattracker-setup.log /Applications/wattracker.app
+grep -A2 "wattracker setup token" /tmp/wattracker-setup.log
+```
+
+Register the account, then quit and use the app normally: the token is only
+ever consulted while the database has no account, so this is once per install.
+It is a real rough edge of the bundle rather than of the token - the same
+`console=True` note above is what makes it unavoidable today - and it is listed
+under "Known gaps".
 
 ### Quitting
 
@@ -208,6 +239,15 @@ and *was* fixable, has been moved off argv entirely.
 - **No icon.** `icon=None`, so the app gets the generic macOS placeholder. It is
   `LSUIElement`, so this is only visible in Finder and Activity Monitor.
 - **No quit affordance.** See "Quitting" above.
+- **The first run cannot be done from Finder.** A double-clicked `.app` has no
+  terminal, macOS discards its stdout, and the setup token the first account
+  needs goes with it. The workaround is in "First run" above (launch once from a
+  terminal, or with `open --stdout`). The real fix is to give the bundle
+  somewhere to say it - the same missing affordance as "No quit affordance" -
+  and until there is one, this is the only supported launch path where the
+  operator cannot simply read the token off the screen. Note that the
+  LaunchServices half of the smoke test passes `open --stdout`, so it proves the
+  token is printed, not that a Finder user could read it.
 - **Bluetooth permission is unverified.** The purpose string is set, but the TCC
   prompt and an actual trainer connection from inside the `.app` have not been
   exercised - the smoke test only proves bleak and its CoreBluetooth backend

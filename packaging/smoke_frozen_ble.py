@@ -84,7 +84,18 @@ def main(argv) -> int:
                 opener, base, timeout=120,
                 still_running=lambda: process.poll() is None,
             )
-            smoke_http.register_user(opener, base)
+            # The frozen build's own stdout is already being captured above,
+            # which is exactly where a first-run operator reads the one-time
+            # setup token from (wattracker/setuptoken.py). Registering without
+            # it is refused, so this doubles as a check that a packaged build
+            # still prints it.
+            smoke_http.register_user(
+                opener,
+                base,
+                smoke_http.read_setup_token(
+                    stdout_path, still_running=lambda: process.poll() is None
+                ),
+            )
 
             status = json.loads(smoke_http.get_text(opener, base + "/ride/status"))
             print(f"/ride/status -> {status}")
