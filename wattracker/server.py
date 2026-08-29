@@ -792,8 +792,8 @@ class NoCacheStaticFiles(StaticFiles):
 # above it, and the second authenticates itself from a single-use ticket and
 # then *creates* the session, so requiring one first would be circular.
 _EXEMPT = (
-    "/login", "/register", calendarfeed.FEED_PATH, "/api/connector/ride",
-    "/api/connector/session", "/connector/session",
+    "/login", "/register", "/welcome", calendarfeed.FEED_PATH,
+    "/api/connector/ride", "/api/connector/session", "/connector/session",
 )
 _EXEMPT_PREFIXES = ("/static", "/favicon", "/apple-touch-icon")
 
@@ -1128,7 +1128,8 @@ def _from_connector(conn: HTTPConnection) -> bool:
 def _promote_to_password_session(request: Request) -> None:
     """Drop any connector provenance, because a password has just been proven.
 
-    Called from /login and /register. The reasoning is airtight for /login: a
+    Called from /login, /register and /welcome. The reasoning is airtight
+    for /login: a
     rider who signs in inside the tray's own window is a rider who knows the
     password, and a device token can neither obtain nor change one (every
     writer of password_hash goes through db.set_password_hash, whose only route
@@ -1234,6 +1235,31 @@ async def _end_revoked_ride(websocket, controller) -> None:
                    exc_info=True)
 
 
+def _unauthenticated_destination() -> str:
+    """Where a signed-out visitor is sent: /welcome on a fresh install, else /login.
+
+    A server with no account at all cannot be signed in to, so /login is a dead
+    end there - the page asks for a username that does not exist yet, and the
+    way out of it is a "Create one" link the first-time rider has no reason to
+    read as "start here". /welcome is that same journey with the account step
+    first, and it flows straight on into the setup wizard, so a fresh install
+    is one continuous first run rather than three pages to find in order.
+
+    This is a routing convenience, not a trust boundary. It creates nothing and
+    admits nobody; /welcome itself re-decides whether it may create an account,
+    twice, the second time under the registration lock. And when the query
+    cannot be answered the fallback is /login, which is the page that exists on
+    every install - guessing "fresh" on a broken read would show the sign-up
+    step to a server that already has an owner.
+    """
+    try:
+        return "/login" if db.user_ids() else "/welcome"
+    except Exception:
+        _log.warning("could not tell whether this install has an account; "
+                     "sending the visitor to /login", exc_info=True)
+        return "/login"
+
+
 class AuthMiddleware(BaseHTTPMiddleware):
     """Redirect unauthenticated requests to /login (except exempt paths)."""
 
@@ -1241,7 +1267,7 @@ class AuthMiddleware(BaseHTTPMiddleware):
         path = request.url.path
         exempt = path in _EXEMPT or any(path.startswith(p) for p in _EXEMPT_PREFIXES)
         if not exempt and not request.session.get("user_id"):
-            return RedirectResponse("/login", status_code=303)
+            return RedirectResponse(_unauthenticated_destination(), status_code=303)
         if not exempt and not _connector_session_still_paired(request):
             # The device that opened this window is gone. Clearing the session
             # here is the only way revocation can reach it: the cookie is a
@@ -1687,6 +1713,50 @@ def create_app() -> FastAPI:
             headers={"Retry-After": "5"},
         )
 
+    def _admit_account(request: Request, username: str, password: str,
+                       gate, closed_response, template: str):
+        """Create an account, or explain why not. Shared by /register and /welcome.
+
+        Both routes are auth-exempt and both spend ~128 MiB of scrypt, so both
+        have to observe the same order, and that order is the whole point of
+        this being one function instead of two similar ones that drift:
+
+          1. the policy gate, BEFORE any hashing - a server that will not
+             create an account must not be a free way to fill the hash limiter;
+          2. credential validation, also before hashing, so a too-short
+             password costs nothing;
+          3. the hash, inside a limiter reservation, shed with a 503 if the
+             limiter is full. Shedding happens ahead of the hash and records no
+             failure anywhere: a flood that made the server count failures
+             would lock the owner out of their own app, which is the outcome
+             the limiter exists to prevent;
+          4. the gate AGAIN, under the registration lock, held across the
+             INSERT and never across the hash. The first check sheds cheaply;
+             this one decides. Hashing takes a quarter of a second, and
+             "the database was empty when we started" is not a policy.
+
+        Returns (user_id, error_message, response). Exactly one is meaningful:
+        a response is ready to return as-is, an error is for the caller to
+        render in its own template, and a user_id means the account exists.
+        """
+        if not gate():
+            return None, None, closed_response()
+        err = auth.validate_credentials(username, password)
+        if err:
+            return None, err, None
+        try:
+            with app.state.hash_limiter.reserve():
+                password_hash = auth.hash_password(password)
+        except auth.HashCapacityExceeded:
+            return None, None, _hash_capacity_response(request, template)
+        with app.state.registration_lock:
+            if not gate():
+                return None, None, closed_response()
+            user_id = db.create_user(username, password_hash)
+        if user_id is None:
+            return None, "That username is already taken.", None
+        return user_id, None, None
+
     @app.post("/register", response_class=HTMLResponse)
     def register_submit(
         request: Request,
@@ -1698,30 +1768,15 @@ def create_app() -> FastAPI:
         # cheapest attack is simply to point the flood at this route instead.
         if not _trusted_origin_or_absent(request, app.state.allowed_hosts):
             return PlainTextResponse("Origin not allowed", status_code=403)
-        # Refused BEFORE the ~128 MiB scrypt, not after: a closed server must
-        # not be a free way to burn the hash limiter, and refusing costs one
-        # environment read plus (only when the var is unset) one indexed query.
-        if not _registration_open():
-            return _registration_closed_response(request)
         username = (username or "").strip()
-        err = auth.validate_credentials(username, password)
-        if not err:
-            try:
-                with app.state.hash_limiter.reserve():
-                    password_hash = auth.hash_password(password)
-            except auth.HashCapacityExceeded:
-                return _hash_capacity_response(request, "register.html")
-            # Re-asked under the lock, and this is the test that actually
-            # decides. The check above sheds cheaply; hashing took a quarter of
-            # a second during which another request may have become the first
-            # account, and "the database was empty when we started" is not a
-            # policy. Held across the INSERT only - never across the hash.
-            with app.state.registration_lock:
-                if not _registration_open():
-                    return _registration_closed_response(request)
-                user_id = db.create_user(username, password_hash)
-            if user_id is None:
-                err = "That username is already taken."
+        user_id, err, response = _admit_account(
+            request, username, password,
+            _registration_open,
+            lambda: _registration_closed_response(request),
+            "register.html",
+        )
+        if response is not None:
+            return response
         if err:
             return templates.TemplateResponse(
                 request, "register.html",
@@ -1733,12 +1788,105 @@ def create_app() -> FastAPI:
         request.session["username"] = username
         return RedirectResponse("/", status_code=303)
 
+    # ------------------------------------------------------- first run
+    def _first_run() -> bool:
+        """True only while this install has no account at all.
+
+        Deliberately NOT _registration_open. That gate also opens for
+        WATTRACKER_ALLOW_REGISTRATION, which is the owner deciding to add a
+        second account - a decision that belongs to /register, where the page
+        says so and the policy is documented. /welcome is the first-run
+        journey and nothing else, so it asks the narrower question and the
+        second-account policy is left exactly where it already lives.
+
+        A database that cannot answer says no, for the same reason
+        _registration_open does: a failed read must never be the thing that
+        reopens account creation on a populated server.
+        """
+        try:
+            return not db.user_ids()
+        except Exception:
+            _log.warning("could not determine whether any account exists; "
+                         "refusing the first-run wizard", exc_info=True)
+            return False
+
+    def _welcome_taken_response(request: Request):
+        """Somebody already claimed this install while this form was open.
+
+        A real page rather than a bare redirect, because the honest thing to
+        say is short and the rider needs to know their submission did not
+        create anything. Like the /register refusal it describes the situation
+        only - it never names the account or says how many exist.
+        """
+        return templates.TemplateResponse(
+            request, "welcome.html",
+            {"request": request, "error": None, "already_claimed": True},
+            status_code=409,
+        )
+
+    @app.get("/welcome", response_class=HTMLResponse)
+    def welcome_form(request: Request):
+        if _uid(request):
+            return RedirectResponse("/", status_code=303)
+        if not _first_run():
+            # This install has an owner. There is no first run left to walk
+            # through, so the only useful page is the one that signs them in.
+            return RedirectResponse("/login", status_code=303)
+        return templates.TemplateResponse(
+            request, "welcome.html",
+            {"request": request, "error": None, "already_claimed": False},
+        )
+
+    @app.post("/welcome", response_class=HTMLResponse)
+    def welcome_submit(
+        request: Request,
+        username: str = Form(...),
+        password: str = Form(...),
+    ):
+        # Same two guards as /login and /register, in the same order: this
+        # route is auth-exempt and it hashes, so leaving either off would just
+        # make it the cheapest of the three to point a flood at. Everything
+        # after the origin check is _admit_account's documented ordering.
+        if not _trusted_origin_or_absent(request, app.state.allowed_hosts):
+            return PlainTextResponse("Origin not allowed", status_code=403)
+        username = (username or "").strip()
+        user_id, err, response = _admit_account(
+            request, username, password,
+            _first_run,
+            lambda: _welcome_taken_response(request),
+            "welcome.html",
+        )
+        if response is not None:
+            return response
+        if err:
+            return templates.TemplateResponse(
+                request, "welcome.html",
+                {"request": request, "error": err, "already_claimed": False},
+                status_code=400,
+            )
+        _promote_to_password_session(request)
+        request.session["user_id"] = user_id
+        request.session["username"] = username
+        # The point of the wizard: the account that was just created is signed
+        # in here, so the rider goes straight on to the remaining setup steps
+        # instead of being handed back to a login form to type the password
+        # they chose ten seconds ago. This flag only changes how the wizard
+        # NUMBERS itself from here on (see _setup_step_offset) - it grants
+        # nothing and is read by no authorization decision.
+        request.session["first_run_wizard"] = True
+        return RedirectResponse("/setup", status_code=303)
+
     @app.get("/login", response_class=HTMLResponse)
     def login_form(request: Request):
         if _uid(request):
             return RedirectResponse("/", status_code=303)
+        # A fresh install has nothing to sign in to. The page still renders -
+        # a redirect here would change the status of a URL that plenty of
+        # things (the trusted-host checks, bookmarks, the tray window) expect
+        # to answer 200 - but it says where the rider should actually start.
         return templates.TemplateResponse(
-            request, "login.html", {"request": request, "error": None}
+            request, "login.html",
+            {"request": request, "error": None, "first_run": _first_run()},
         )
 
     @app.post("/login", response_class=HTMLResponse)
@@ -1895,6 +2043,7 @@ def create_app() -> FastAPI:
                 setup_ftp_confirm_required=False,
                 setup_ftp_min=round(FTP_INPUT_MIN_WATTS),
                 setup_ftp_max=round(FTP_INPUT_MAX_WATTS),
+                setup_step_offset=_setup_step_offset(request),
             )
         # Body weight card: the value effective on the rider's local today
         # (their own log, then a Zwift-derived row, then the settings scalar);
@@ -1915,6 +2064,23 @@ def create_app() -> FastAPI:
                 **setup_ctx,
             ),
         )
+
+    def _setup_step_offset(request: Request) -> int:
+        """How many wizard steps happened before this page: 1 after /welcome.
+
+        A rider who arrived through the first-run wizard already answered a
+        step - they created the account - so the remaining steps read "2 of 5"
+        through "5 of 5". A second account created at /register never saw that
+        step, and its wizard is honestly "1 of 4". The difference is only ever
+        the numbering; the steps themselves, and every check around them, are
+        identical either way.
+
+        The session flag is set by /welcome and outlives the redirect, so it
+        survives a reload, a back button, and a validation error mid-wizard -
+        all of which re-render this page and would otherwise renumber it under
+        the rider. It is cleared when setup completes.
+        """
+        return 1 if request.session.get("first_run_wizard") else 0
 
     def _setup_context(
         request: Request, error: Optional[str] = None, message: Optional[str] = None,
@@ -1943,6 +2109,7 @@ def create_app() -> FastAPI:
             setup_ftp_confirm_required=confirm_required,
             setup_ftp_min=round(FTP_INPUT_MIN_WATTS),
             setup_ftp_max=round(FTP_INPUT_MAX_WATTS),
+            setup_step_offset=_setup_step_offset(request),
         )
 
     def _setup_closed(request: Request) -> bool:
@@ -2254,6 +2421,10 @@ def create_app() -> FastAPI:
         # No `else`: with no analysis there is nothing to record, and any
         # existing row for today belongs to the rider, not to the wizard.
         db.complete_onboarding(uid)
+        # The first run is over, so stop numbering as though it were still
+        # going. Popped before the context is built so the confirmation page
+        # is the first one rendered without the offset.
+        request.session.pop("first_run_wizard", None)
         return templates.TemplateResponse(
             request, "setup.html", _setup_context(
                 request,

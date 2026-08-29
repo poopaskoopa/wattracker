@@ -1,9 +1,24 @@
+{#- `setup_step_offset` is 1 for a rider who came through /welcome, where
+    creating the account was step 1 of this same wizard, and 0 for anyone else
+    (a second account made at /register, or an existing account returning to
+    finish setup). It shifts the printed numbers and nothing else - the steps,
+    the form, and every check behind them are identical either way. See
+    _setup_step_offset in server.py. -#}
+{%- set step_offset = setup_step_offset or 0 %}
 <section class="setup-wizard" aria-labelledby="setup-heading">
     <div class="setup-intro">
         <h3 id="setup-heading">Make your dashboard useful</h3>
+        {% if step_offset %}
+        <p>Your account is created and you are signed in &mdash; that was step 1.
+           The remaining four steps are what the dashboard needs in order to say
+           anything useful: weight enables W/kg and weight-to-power ratio
+           metrics, and FTP drives workout targets. Nothing here is final; you
+           can change all of it later in Settings.</p>
+        {% else %}
         <p>Work through these steps in order. Weight enables W/kg and weight-to-power
            ratio metrics; FTP drives workout targets. You can return to this page
            until setup is complete.</p>
+        {% endif %}
     </div>
     {% if setup_error %}<p class="alert" role="alert">{{ setup_error }}</p>{% endif %}
     {% if setup_message %}
@@ -16,10 +31,11 @@
     </div>
     {% else %}
     <form id="setup-form" method="post" action="/setup/complete" class="setup-form"
-          data-has-error="{{ 'true' if setup_error else 'false' }}">
+          data-has-error="{{ 'true' if setup_error else 'false' }}"
+          data-step-offset="{{ step_offset }}">
         <p id="setup-progress" class="setup-progress hint" role="status" aria-live="polite"></p>
         <section class="setup-step" data-setup-step="1">
-            <h4><span>1</span> Body weight</h4>
+            <h4><span>{{ 1 + step_offset }}</span> Body weight</h4>
             <label for="setup-weight">Weight in kilograms
                 <input id="setup-weight" name="weight_kg" type="number" min="20" max="300"
                        step="0.1" required value="{{ setup_form.weight_kg or setup_settings.weight_kg or '' }}">
@@ -29,7 +45,7 @@
         </section>
 
         <section class="setup-step" data-setup-step="2">
-            <h4><span>2</span> Find your Zwift Activities</h4>
+            <h4><span>{{ 2 + step_offset }}</span> Find your Zwift Activities</h4>
             <p>Zwift stores completed rides as FIT files. On Windows, macOS, or
                Linux, look for Zwift&rsquo;s <code>Activities</code> folder. Imported
                FIT rides populate the <a href="/activities">Activities</a> page.</p>
@@ -65,7 +81,7 @@
         </section>
 
         <section class="setup-step" data-setup-step="3">
-            <h4><span>3</span> Choose your FTP</h4>
+            <h4><span>{{ 3 + step_offset }}</span> Choose your FTP</h4>
             <p>FTP is the baseline that drives workout targets. Use the analyzed
                FIT-derived estimate when available, or enter your own number.</p>
             <label class="setup-choice"><input type="radio" name="ftp_choice" value="estimated"
@@ -89,7 +105,7 @@
         </section>
 
         <section class="setup-step" data-setup-step="4">
-            <h4><span>4</span> ZwiftPower and races</h4>
+            <h4><span>{{ 4 + step_offset }}</span> ZwiftPower and races</h4>
             <p>Races can use FIT-derived heuristics without ZwiftPower. If you
                have a ZwiftPower profile, saving it enables and populates the
                <a href="/races">Races</a> section. The numeric rider ID is in
@@ -135,6 +151,11 @@
     const estimateValue = document.getElementById('setup-estimate-value');
     const progress = document.getElementById('setup-progress');
     const steps = Array.from(form.querySelectorAll('[data-setup-step]'));
+    // Set by the server when the account step at /welcome came first, so the
+    // live progress line agrees with the numbers printed on the headings
+    // ("Step 2 of 5" over a heading that reads "2") instead of restarting the
+    // count at 1 halfway through one continuous first run.
+    const stepOffset = Number(form.dataset.stepOffset || 0) || 0;
     const countFits = files => Array.from(files || []).filter(f =>
         (f.name || '').toLowerCase().endsWith('.fit'));
     const postForm = (url, data) => fetch(url, {
@@ -151,7 +172,8 @@
             step.hidden = !hasServerError && position !== index;
         });
         if (progress && !hasServerError) {
-            progress.textContent = `Step ${index + 1} of ${steps.length}`;
+            progress.textContent =
+                `Step ${index + 1 + stepOffset} of ${steps.length + stepOffset}`;
         }
     };
     let currentStep = 0;

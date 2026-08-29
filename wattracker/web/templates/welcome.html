@@ -1,0 +1,68 @@
+{% extends "base.html" %}
+{% block title %}Welcome &mdash; wattracker{% endblock %}
+{% block content %}
+{#- The first page of a fresh install. It is deliberately built from the same
+    .setup-wizard / .setup-step furniture as _setup_wizard.html, and numbered
+    "Step 1 of 5", because it IS the first step of that wizard: submitting this
+    form signs the new account in and continues straight on to step 2. The
+    rider should not be able to tell that a route boundary was crossed.
+
+    `already_claimed` is the narrow race: this form was open while some other
+    request created the account. The wording is about the situation only - it
+    never names the account or says how many exist. -#}
+<section class="setup-page">
+{% if already_claimed %}
+    <h2>This install already has an account</h2>
+
+    <p class="alert">Nothing was created just now.</p>
+
+    <p>
+        Someone finished setting this server up while this page was open, so
+        the account you typed here was not created. If that was you in another
+        window, sign in with the details you chose there.
+    </p>
+
+    <p><a class="button" href="/login">Go to the log in page</a></p>
+{% else %}
+    <h2>Welcome to wattracker</h2>
+
+    <section class="setup-wizard" aria-labelledby="welcome-heading">
+        <div class="setup-intro">
+            <h3 id="welcome-heading">Set up this install</h3>
+            <p>This server is new &mdash; nothing has been set up on it yet.
+               Five short steps: an account to sign in with, then your weight,
+               your Zwift activity folder, your FTP, and ZwiftPower if you use
+               it. You will not have to log in again in between.</p>
+        </div>
+
+        {% if error %}<p class="alert" role="alert">{{ error }}</p>{% endif %}
+
+        <form method="post" action="/welcome" class="setup-form auth-form">
+            <p class="setup-progress hint" role="status">Step 1 of 5</p>
+            <section class="setup-step" data-welcome-step="1">
+                <h4><span>1</span> Create your account</h4>
+                <p>Your training data lives on this machine and is only
+                   reachable through this account, so the app needs one before
+                   it can show you anything. Nothing is sent anywhere and there
+                   is no email to confirm &mdash; pick a name and a password you
+                   will remember.</p>
+                <label for="welcome-username">Username
+                    <input id="welcome-username" type="text" name="username"
+                           autocomplete="username" required autofocus>
+                </label>
+                <label for="welcome-password">Password (at least 8 characters)
+                    <input id="welcome-password" type="password" name="password"
+                           autocomplete="new-password" minlength="8" required>
+                </label>
+                <p class="hint">There is no password reset. If you lose this
+                   one you would have to start the database again, so write it
+                   down somewhere you trust.</p>
+                <div class="setup-nav">
+                    <button type="submit">Create account and continue</button>
+                </div>
+            </section>
+        </form>
+    </section>
+{% endif %}
+</section>
+{% endblock %}

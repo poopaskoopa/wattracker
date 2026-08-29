@@ -44,13 +44,22 @@ def _seed_activity(user_id, start_time="2026-06-01T10:00:00", watts=300.0, secon
 
 
 # ------------------------------------------------------------- auth guard
+# Both of these log the account back out first. The guard's destination depends
+# on whether the install has an account at all - a server with none sends the
+# visitor to the first-run wizard instead, which tests/test_first_run.py covers
+# - so registering here is what makes these tests about the guard rather than
+# about which of the two destinations a fresh database happens to produce.
 def test_unauthenticated_root_redirects_to_login(client):
+    _register(client)
+    client.post("/logout")
     r = client.get("/", follow_redirects=False)
     assert r.status_code == 303
     assert r.headers["location"] == "/login"
 
 
 def test_unauthenticated_api_redirects_to_login(client):
+    _register(client)
+    client.post("/logout")
     r = client.get("/api/state", follow_redirects=False)
     assert r.status_code == 303
     assert r.headers["location"] == "/login"
