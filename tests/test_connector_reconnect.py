@@ -39,6 +39,8 @@ from wattracker_connector import ble_handlers as blemod  # noqa: E402
 from wattracker_connector.ble_handlers import BleState, build_ble_handlers  # noqa: E402
 from wattracker_connector.buffer import RideBuffer  # noqa: E402
 
+from conftest import _receive_until  # noqa: E402
+
 
 @pytest.fixture()
 def client():
@@ -381,14 +383,25 @@ def _drive_ride(client, monkeypatch, rig, offline_frames=6):
 
     frames = []
     with client.websocket_connect("/ride/ws?type=endurance&minutes=30") as ws:
-        while True:
-            try:
-                message = ws.receive_json()
-            except Exception:
-                raise AssertionError(f"closed early; frames={frames}")
-            frames.append(message)
-            if message.get("status") == "connected":
-                break
+        # Every wait below is bounded via `_receive_until`: a regression that
+        # stops a frame from ever arriving must fail this test, not hang the
+        # whole run. `_appending` folds each received frame into `frames` (the
+        # assertions after this helper inspect the full stream) while still
+        # deferring to `_receive_until`'s cap-and-fail behaviour.
+        def _appending(predicate):
+            def wrapped(message):
+                frames.append(message)
+                return predicate(message)
+            return wrapped
+
+        try:
+            _receive_until(
+                ws,
+                _appending(lambda m: m.get("status") == "connected"),
+                "a 'connected' frame",
+            )
+        except Exception:
+            raise AssertionError(f"closed early; frames={frames}")
 
         # ERG does not auto-engage at ride start (pre-existing behaviour, and
         # not something the split caused), so ask for it - the point here is
@@ -397,28 +410,37 @@ def _drive_ride(client, monkeypatch, rig, offline_frames=6):
 
         # Ride normally for a moment so the connector's buffer has samples the
         # server has already seen - the ones it must NOT replay.
-        while len([f for f in frames if f.get("status") == "running"]) < 5:
-            frames.append(ws.receive_json())
+        _receive_until(
+            ws,
+            _appending(
+                lambda m: len([f for f in frames if f.get("status") == "running"]) >= 5
+            ),
+            "5 'running' frames",
+        )
 
         rig.detach()
 
         seen_offline = 0
-        while seen_offline < offline_frames:
-            message = ws.receive_json()
-            frames.append(message)
-            if (
-                message.get("status") == "connector_offline"
-                or message.get("connector_offline")
+
+        def _offline_predicate(message):
+            nonlocal seen_offline
+            if message.get("status") == "connector_offline" or message.get(
+                "connector_offline"
             ):
                 seen_offline += 1
+            return seen_offline >= offline_frames
+
+        _receive_until(
+            ws, _appending(_offline_predicate), f"{offline_frames} connector_offline frames"
+        )
 
         rig.attach()
 
-        while True:
-            message = ws.receive_json()
-            frames.append(message)
-            if message.get("status") in ("connector_resumed", "connector_lost"):
-                break
+        _receive_until(
+            ws,
+            _appending(lambda m: m.get("status") in ("connector_resumed", "connector_lost")),
+            "a 'connector_resumed' or 'connector_lost' frame",
+        )
         # Everything the trainer was told up to and including the recovery.
         # The deliberate stop at the end of the ride comes after this point.
         rig.calls_through_recovery = list(rig.trainer.calls)
@@ -586,8 +608,7 @@ def test_a_ride_the_connector_already_ended_is_not_carried_on(
 
     lost = None
     with client.websocket_connect("/ride/ws?type=endurance&minutes=30") as ws:
-        while ws.receive_json().get("status") != "connected":
-            pass
+        _receive_until(ws, lambda m: m.get("status") == "connected", "a 'connected' frame")
         for _ in range(8):
             ws.receive_json()
         rig.detach()
@@ -708,8 +729,7 @@ def test_giving_up_on_a_connector_saves_nothing_here(client, tmp_path, monkeypat
 
     lost = None
     with client.websocket_connect("/ride/ws?type=endurance&minutes=30") as ws:
-        while ws.receive_json().get("status") != "connected":
-            pass
+        _receive_until(ws, lambda m: m.get("status") == "connected", "a 'connected' frame")
         for _ in range(8):
             ws.receive_json()
         rig.detach()
@@ -745,8 +765,7 @@ def test_a_connector_that_never_buffered_gets_saved_for_rather_than_trusted(
 
     lost = None
     with client.websocket_connect("/ride/ws?type=endurance&minutes=30") as ws:
-        while ws.receive_json().get("status") != "connected":
-            pass
+        _receive_until(ws, lambda m: m.get("status") == "connected", "a 'connected' frame")
         for _ in range(10):
             ws.receive_json()
         rig.detach()
@@ -779,8 +798,7 @@ def test_stopping_a_ride_while_the_connector_is_away_saves_nothing_either(
 
     lost = None
     with client.websocket_connect("/ride/ws?type=endurance&minutes=30") as ws:
-        while ws.receive_json().get("status") != "connected":
-            pass
+        _receive_until(ws, lambda m: m.get("status") == "connected", "a 'connected' frame")
         for _ in range(8):
             ws.receive_json()
         rig.detach()
@@ -843,8 +861,7 @@ def test_connector_unavailable_during_erg_does_not_latch_erg_off(
 
     erg_frames = []
     with client.websocket_connect("/ride/ws?type=endurance&minutes=30") as ws:
-        while ws.receive_json().get("status") != "connected":
-            pass
+        _receive_until(ws, lambda m: m.get("status") == "connected", "a 'connected' frame")
 
         ws.send_json({"action": "set_erg", "enabled": True})
         for _ in range(5):

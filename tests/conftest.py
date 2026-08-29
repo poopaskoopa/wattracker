@@ -214,3 +214,35 @@ def redirect_home(monkeypatch, path) -> None:
     path = str(path)
     monkeypatch.setenv("HOME", path)
     monkeypatch.setenv("USERPROFILE", path)
+
+
+def _receive_until(ws, predicate, description, cap=200):
+    """Receive JSON frames until `predicate` matches one, or fail cleanly.
+
+    A regression that stops a code path from ever sending the awaited frame
+    would otherwise hang the loop (and the test run) forever, since the
+    websocket has no server-side timeout here. Shared across test modules
+    that drive `/ride/ws` (and other websocket endpoints) so every wait-for-
+    a-frame loop in the suite gets the same bounded behaviour.
+    """
+    for _ in range(cap):
+        message = ws.receive_json()
+        if predicate(message):
+            return message
+    pytest.fail(f"never received {description} after {cap} frames")
+
+
+def _drain_until_close(ws, cap=2000):
+    """Collect frames until the server closes the socket, or fail cleanly.
+
+    Mirrors `_receive_until`'s reasoning: without a cap, a regression that
+    stops the server from ever closing the socket would hang this loop (and
+    the test run) forever instead of failing the one test that hit it.
+    """
+    frames = []
+    for _ in range(cap):
+        try:
+            frames.append(ws.receive_json())
+        except Exception:
+            return frames
+    pytest.fail(f"socket never closed after {cap} frames")
