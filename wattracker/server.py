@@ -517,6 +517,25 @@ _STATIC_DIR = os.path.join(_HERE, "web", "static")
 
 templates = Jinja2Templates(directory=_TEMPLATES_DIR)
 
+# Default level for ride audio cues, as the linear gain fed straight into a
+# WebAudio GainNode (0 = silent, 1 = full scale).
+#
+# WHY this lives here and not as a literal in the templates: the ride page and
+# the settings page both need it - the ride page as the fallback it uses when
+# the rider has never touched the slider, the settings page as both the
+# <input type=range> starting position and the value its JS falls back to when
+# localStorage holds nothing usable. It first shipped as three separate `0.24`
+# literals across two templates, which is three places to remember and two
+# chances to forget: change one and the settings page would show a number the
+# ride page does not actually play at, with nothing failing to say so. Defining
+# it once in Python and rendering it into both templates makes disagreement
+# impossible by construction, and `test_audio_cue_volume_default.py` fails if
+# anyone reintroduces a hardcoded literal that drifts from this value.
+#
+# 0.24 is the level PR #142 settled on: audible over a trainer and a fan
+# without being startling through headphones.
+DEFAULT_AUDIO_CUE_VOLUME = 0.24
+
 
 def static_url(path: str) -> str:
     """Return /static/<path>?v=<mtime> for cache-busting; no v param if file is missing."""
@@ -529,6 +548,12 @@ def static_url(path: str) -> str:
 
 
 templates.env.globals["static_url"] = static_url
+# Exposed as a Jinja global rather than pushed through each route's context
+# dict: settings.html is rendered from a dozen different handlers (every
+# save/validation branch re-renders it) and ride.html from another, so a
+# per-context key would be a dozen places to forget it. This mirrors how
+# `static_url` is published to every template.
+templates.env.globals["default_audio_cue_volume"] = DEFAULT_AUDIO_CUE_VOLUME
 
 
 def _restore_command() -> str:

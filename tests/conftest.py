@@ -232,17 +232,47 @@ def _receive_until(ws, predicate, description, cap=200):
     pytest.fail(f"never received {description} after {cap} frames")
 
 
+try:  # pragma: no cover - starlette ships with fastapi, so this always binds
+    from starlette.websockets import WebSocketDisconnect as _WebSocketDisconnect
+except ImportError:  # pragma: no cover - suite is skipped wholesale without it
+    _WebSocketDisconnect = None
+
+# What starlette's TestClient actually raises out of `receive_json()` when the
+# server closes the socket. Determined empirically against the installed
+# starlette (1.6.0) by draining a real `/ride/ws` simulation to completion and
+# printing the exception's MRO, not read off the docs: `receive_json()` calls
+# `_raise_on_close()`, which turns a `websocket.close` ASGI message into
+# `WebSocketDisconnect` - and nothing else surfaced.
+#
+# WHY this is worth narrowing from the bare `except Exception` it shipped as:
+# with `raise_server_exceptions=True` (the default our TestClient fixtures use)
+# an unhandled exception inside the endpoint propagates out of this very call.
+# A bare `except Exception` swallowed it and returned the frames collected so
+# far, so a ride handler that crashed halfway looked exactly like one that
+# finished and closed cleanly - the crash was invisible and the test went
+# green on a truncated frame list. Naming the disconnect explicitly means a
+# server-side crash now escapes this helper and fails the test that caused it.
+#
+# A tuple (rather than the bare class) so a future starlette that raises an
+# additional close-path exception can be accommodated by extending it here,
+# once, rather than by widening the catch back out at the call site.
+_WS_CLOSED = (_WebSocketDisconnect,) if _WebSocketDisconnect is not None else ()
+
+
 def _drain_until_close(ws, cap=2000):
     """Collect frames until the server closes the socket, or fail cleanly.
 
     Mirrors `_receive_until`'s reasoning: without a cap, a regression that
     stops the server from ever closing the socket would hang this loop (and
     the test run) forever instead of failing the one test that hit it.
+
+    Only the close is caught (see `_WS_CLOSED`); anything else the endpoint
+    raises propagates so a crashed handler cannot masquerade as a clean close.
     """
     frames = []
     for _ in range(cap):
         try:
             frames.append(ws.receive_json())
-        except Exception:
+        except _WS_CLOSED:
             return frames
     pytest.fail(f"socket never closed after {cap} frames")

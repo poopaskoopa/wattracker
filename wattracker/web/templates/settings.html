@@ -57,9 +57,16 @@
     <fieldset class="audio-settings">
         <legend>Audio cues</legend>
         <label for="audioCueVolume">Volume
-            <output id="audioCueVolumeValue" for="audioCueVolume">24%</output>
+            {# Both the readout and the slider position start at the server's
+               one default (server.DEFAULT_AUDIO_CUE_VOLUME) so a page with JS
+               disabled, or one caught mid-load, still shows the level the ride
+               page will actually play at. The JS below overwrites both as soon
+               as it runs, from either the same default or the rider's stored
+               choice. #}
+            <output id="audioCueVolumeValue" for="audioCueVolume">{{ (default_audio_cue_volume * 100)|round|int }}%</output>
             <input type="range" id="audioCueVolume" min="0" max="1" step="0.01"
-                   value="0.24" aria-describedby="audioCueVolumeHint">
+                   value="{{ "%.2f"|format(default_audio_cue_volume) }}"
+                   aria-describedby="audioCueVolumeHint">
         </label>
         <p id="audioCueVolumeHint" class="hint">Controls ride sound effects and
             audio cues in this browser. Changes apply immediately.</p>
@@ -362,7 +369,7 @@
 {% block scripts %}
 <script>
 (function () {
-    var DEFAULT_AUDIO_VOLUME = 0.24;
+    var DEFAULT_AUDIO_VOLUME = {{ default_audio_cue_volume|tojson }};
     var AUDIO_CUE_VOLUME_KEY = "wattracker.audioCueVolume";
     var slider = document.getElementById("audioCueVolume");
     var output = document.getElementById("audioCueVolumeValue");
@@ -385,7 +392,18 @@
 
     var saved = null;
     try { saved = parseVolume(localStorage.getItem(AUDIO_CUE_VOLUME_KEY)); } catch (e) {}
-    setVolume(saved === null ? DEFAULT_AUDIO_VOLUME : saved, saved === null);
+    // Display the default without persisting it. Merely opening this page used
+    // to write the default straight into localStorage, which quietly converted
+    // "this rider has no preference" into "this rider explicitly chose the
+    // current default" - and from then on the rider was pinned to whatever
+    // that default happened to be the day they first loaded Settings, having
+    // never touched the control. Any later change to
+    // server.DEFAULT_AUDIO_CUE_VOLUME would then reach new riders and silently
+    // skip everyone who had ever glanced at this page. Absent means absent: the
+    // key is written only by the `input` handler below, i.e. only when the
+    // rider actually moves the slider, so an untouched setting keeps tracking
+    // the server default forever.
+    setVolume(saved === null ? DEFAULT_AUDIO_VOLUME : saved, false);
     slider.addEventListener("input", function () { setVolume(slider.value, true); });
 })();
 </script>
