@@ -31,7 +31,7 @@ import uvicorn  # noqa: E402
 
 from wattracker import db  # noqa: E402
 from wattracker.prescribe.planner import VARIANTS, WORKOUT_TYPE_KEYS  # noqa: E402
-from wattracker.server import create_app  # noqa: E402
+from wattracker.server import DEFAULT_AUDIO_CUE_VOLUME, create_app  # noqa: E402
 
 pytestmark = pytest.mark.browser
 
@@ -1670,3 +1670,213 @@ def test_ride_fullscreen_intensity_locked_reply_shows_a_note_not_a_percentage(
     _wait_for_badge(page, "+1%")
 
     _assert_clean(console_errors, "/ride intensity locked note")
+
+
+# ------------------------------------------------------- audio cue volume
+AUDIO_CUE_VOLUME_KEY = "wattracker.audioCueVolume"
+
+# Replaces WebAudio with a recorder BEFORE any page script runs, so the gain
+# the ride page actually programs onto its GainNode is observable.
+#
+# WHAT THIS PROVES: that the number the volume control stores is the number
+# the ride page feeds to `GainNode.gain.setValueAtTime()` for a real cue,
+# through the page's real `playCue`/`playTone`/`getCueGain` code, in a real
+# browser, after a real navigation. That is the whole chain from the slider to
+# the audio graph.
+#
+# WHAT IT DOES NOT PROVE: that any sound leaves the speakers, that the level is
+# perceptually right, or that Chromium's real AudioContext honours the value -
+# headless Chromium has no audio device, and no DOM API reports rendered
+# loudness. The last hop (a genuine GainNode multiplying a genuine oscillator
+# by the value it was handed) is WebAudio's own contract, not ours. Everything
+# on our side of that contract is exercised here.
+_AUDIO_RECORDER_JS = """
+(() => {
+  window.__cueGains = [];
+  window.__cueRamps = [];
+  function FakeAudioContext() {
+    this.state = 'running';
+    this.currentTime = 0;
+    this.destination = {};
+  }
+  FakeAudioContext.prototype.resume = function () {};
+  FakeAudioContext.prototype.createOscillator = function () {
+    return {frequency: {}, connect() {}, start() {}, stop() {}};
+  };
+  FakeAudioContext.prototype.createGain = function () {
+    return {
+      gain: {
+        setValueAtTime(value) { window.__cueGains.push(value); },
+        exponentialRampToValueAtTime(value) { window.__cueRamps.push(value); },
+      },
+      connect() {},
+    };
+  };
+  window.AudioContext = FakeAudioContext;
+  window.webkitAudioContext = FakeAudioContext;
+})();
+"""
+
+
+def _fire_a_ride_cue(page, live_server):
+    """Navigate to /ride and make it play one cue; return the gain it used.
+
+    The Scan button is the shortest real path into `playCue()` that needs no
+    hardware and no running ride: its click handler sounds the "scan" cue
+    before it does anything else. The button is rendered disabled on a machine
+    with no Bluetooth adapter (which is every CI box and this fixture), so it
+    is re-enabled first - the handler itself has no availability guard - and
+    the scan request is stubbed so nothing here depends on the BLE stack.
+    """
+    page.route(
+        "**/ride/scan",
+        lambda route: route.fulfill(
+            status=200,
+            content_type="application/json",
+            body=json.dumps({"available": True, "devices": []}),
+        ),
+    )
+    page.goto(f"{live_server.base}/ride")
+    page.wait_for_load_state("networkidle")
+    page.evaluate(
+        "() => { const b = document.getElementById('scanBtn');"
+        " b.disabled = false; b.click(); }"
+    )
+    _wait_for(page, "window.__cueGains.length > 0")
+    # The first programmed value is the cue's level; playTone may follow it
+    # with the fade-out's target, which is not the volume under test.
+    return page.evaluate("() => window.__cueGains[0]")
+
+
+def test_settings_persists_the_audio_volume_only_when_the_rider_moves_it(
+        page, live_server, console_errors):
+    """Opening Settings must write nothing; moving the slider must write.
+
+    Merely rendering the page used to store the default, which silently turned
+    "no preference" into a pinned choice: every rider who had ever opened
+    Settings stopped tracking the app's default, so raising or lowering that
+    default later reached new riders only. An unset value has to stay unset.
+    """
+    page.goto(f"{live_server.base}/settings")
+    page.wait_for_load_state("networkidle")
+
+    stored = page.evaluate(
+        "(key) => localStorage.getItem(key)", AUDIO_CUE_VOLUME_KEY)
+    assert stored is None, (
+        f"opening /settings wrote {stored!r} to localStorage; an untouched "
+        "control must leave the rider tracking the server default")
+    # The control still shows the default it declined to persist.
+    assert float(page.input_value("#audioCueVolume")) == pytest.approx(
+        DEFAULT_AUDIO_CUE_VOLUME)
+
+    # A second visit is no different - this is not a first-load-only quirk.
+    page.reload()
+    page.wait_for_load_state("networkidle")
+    assert page.evaluate(
+        "(key) => localStorage.getItem(key)", AUDIO_CUE_VOLUME_KEY) is None
+
+    # Now actually move it. Arrow keys on a focused range input are a genuine
+    # user gesture: they change the value and fire `input`, exactly as dragging
+    # does, and they step by the input's own `step`, so the result is exact.
+    before = float(page.input_value("#audioCueVolume"))
+    page.focus("#audioCueVolume")
+    page.keyboard.press("ArrowRight")
+    _wait_for(page, f"localStorage.getItem({AUDIO_CUE_VOLUME_KEY!r}) !== null")
+
+    written = float(page.evaluate(
+        "(key) => localStorage.getItem(key)", AUDIO_CUE_VOLUME_KEY))
+    assert written > before, "moving the slider up must store a higher level"
+    assert written == pytest.approx(float(page.input_value("#audioCueVolume")))
+    # The readout the rider sees agrees with what was stored.
+    assert page.text_content("#audioCueVolumeValue").strip() == \
+        f"{round(written * 100)}%"
+
+    _assert_clean(console_errors, "/settings audio volume persistence")
+
+
+def test_ride_cue_gain_falls_back_to_the_server_default_when_unset(
+        page, live_server, console_errors):
+    """With nothing stored, a real cue is programmed at the server's default.
+
+    This is the half the old source-string assertions could never see:
+    `"var CUE_GAIN = 0.24;" in r.text` stays true even if `getCueGain()` stops
+    being called, if `playTone` programs a different value, or if the constant
+    is shadowed. Here the number is read back off the audio graph the page
+    actually built.
+    """
+    page.add_init_script(_AUDIO_RECORDER_JS)
+    page.goto(f"{live_server.base}/ride")
+    page.evaluate("(key) => localStorage.removeItem(key)", AUDIO_CUE_VOLUME_KEY)
+
+    gain = _fire_a_ride_cue(page, live_server)
+    assert gain == pytest.approx(DEFAULT_AUDIO_CUE_VOLUME), (
+        f"a ride cue was programmed at gain {gain}, not the server default "
+        f"{DEFAULT_AUDIO_CUE_VOLUME}")
+
+    _assert_clean(console_errors, "/ride default cue gain")
+
+
+def test_settings_slider_actually_drives_the_ride_cue_gain(
+        page, live_server, console_errors):
+    """End to end: move the control on /settings, hear it on /ride.
+
+    Deliberately goes through the real slider rather than writing localStorage
+    directly. Poking the storage key would test the ride page against a value
+    no UI ever produced; driving the control proves the settings page and the
+    ride page agree on the key, on the units (linear gain, not a percentage),
+    and on the formatting - the three ways this wiring can silently come apart.
+    """
+    page.add_init_script(_AUDIO_RECORDER_JS)
+
+    page.goto(f"{live_server.base}/settings")
+    page.wait_for_load_state("networkidle")
+    page.focus("#audioCueVolume")
+    # Several steps, so the result cannot coincide with the default and let a
+    # test that is in fact reading the fallback pass.
+    for _ in range(12):
+        page.keyboard.press("ArrowRight")
+    _wait_for(page, f"localStorage.getItem({AUDIO_CUE_VOLUME_KEY!r}) !== null")
+    chosen = float(page.evaluate(
+        "(key) => localStorage.getItem(key)", AUDIO_CUE_VOLUME_KEY))
+    assert chosen != pytest.approx(DEFAULT_AUDIO_CUE_VOLUME)
+
+    gain = _fire_a_ride_cue(page, live_server)
+    assert gain == pytest.approx(chosen), (
+        f"the rider set the volume to {chosen} but the ride page programmed "
+        f"its cue at {gain}")
+
+    _assert_clean(console_errors, "/ride cue gain from the settings slider")
+
+
+def test_muting_the_slider_programs_silence_without_an_illegal_ramp(
+        page, live_server, console_errors):
+    """Volume 0 must mute the cue AND skip the exponential fade-out.
+
+    Not a nitpick: `exponentialRampToValueAtTime` is undefined for a curve that
+    starts at zero, and a real WebAudio implementation throws on it. The ride
+    page therefore branches on `cueGain > 0` and sets a flat 0 instead. That
+    branch was previously "covered" by asserting the string `if (cueGain > 0)`
+    appeared in the template, which would have stayed green had the branch
+    been inverted, dead, or reading a different variable. Here the mute is
+    driven from the real control and the audio graph is inspected for whether
+    the illegal call was made.
+    """
+    page.add_init_script(_AUDIO_RECORDER_JS)
+
+    page.goto(f"{live_server.base}/settings")
+    page.wait_for_load_state("networkidle")
+    page.focus("#audioCueVolume")
+    page.keyboard.press("Home")  # a range input's Home key jumps to its min
+    _wait_for(page, f"localStorage.getItem({AUDIO_CUE_VOLUME_KEY!r}) !== null")
+    assert float(page.evaluate(
+        "(key) => localStorage.getItem(key)", AUDIO_CUE_VOLUME_KEY)) == 0.0
+
+    gain = _fire_a_ride_cue(page, live_server)
+    assert gain == 0.0, f"a muted rider still got a cue at gain {gain}"
+    ramps = page.evaluate("() => window.__cueRamps")
+    assert ramps == [], (
+        "a muted cue still scheduled an exponential ramp "
+        f"({ramps}); WebAudio rejects a ramp from zero, so the cue would "
+        "throw rather than be silent")
+
+    _assert_clean(console_errors, "/ride muted cue gain")

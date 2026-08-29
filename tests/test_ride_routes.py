@@ -391,12 +391,19 @@ def test_ride_page_plays_countdown_cues_before_block_and_workout_ends(client, mo
     assert r.status_code == 200
     # New cue kinds ride on the existing playCue/primeAudio path.
     assert "function playTone(ctx, frequency, delay, duration)" in r.text
-    assert "var CUE_GAIN = 0.24;" in r.text
-    assert 'var AUDIO_CUE_VOLUME_KEY = "wattracker.audioCueVolume";' in r.text
-    assert "function getCueGain()" in r.text
-    assert "gain.gain.setValueAtTime(cueGain, start);" in r.text
-    assert "if (cueGain > 0)" in r.text
-    assert "gain.gain.exponentialRampToValueAtTime(0.001, start + duration);" in r.text
+    # The cue VOLUME plumbing used to be asserted here as a handful of source
+    # substrings - the CUE_GAIN literal, "function getCueGain()", the
+    # setValueAtTime call, and so on. Those were deleted rather than updated:
+    # a substring being present in a template says nothing about what the
+    # browser does with it, and each of them would have stayed green if
+    # getCueGain() had stopped being called, if the gain node had been
+    # programmed from a different variable, or if the settings page and this
+    # page had drifted onto different defaults. tests/test_dom_smoke.py now
+    # reads the gain back off the audio graph a real Chromium builds, and
+    # tests/test_audio_cue_volume_default.py pins the default to one source of
+    # truth - between them they fail for all three. What is left below is
+    # about cue TIMING and the cue motifs, which really are properties of this
+    # template's structure.
     assert 'if (kind === "countdown") { playTone(ctx, 660, 0, 0.1); return; }' in r.text
     assert 'if (kind === "blockChange") { playTone(ctx, 1046, 0, 0.4); return; }' in r.text
     assert 'if (kind === "workoutEnd") {' in r.text

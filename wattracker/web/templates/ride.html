@@ -252,7 +252,9 @@
     // One shared level makes every cue audible without changing its timing,
     // frequency, or existing exponential fade-out. The settings-page slider
     // stores this same linear gain in the browser for the ride page to read.
-    var CUE_GAIN = 0.24;
+    // Rendered from server.DEFAULT_AUDIO_CUE_VOLUME so this page and the
+    // settings page cannot drift apart - see the comment on that constant.
+    var CUE_GAIN = {{ default_audio_cue_volume|tojson }};
     var AUDIO_CUE_VOLUME_KEY = "wattracker.audioCueVolume";
     var positivePowerSeen = false;
     var configReconnectTimer = null;
