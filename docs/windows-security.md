@@ -86,7 +86,8 @@ disagreed:
 | CSRF / Origin validation | Built. `same_site="lax"` on the session cookie, plus an explicit same-origin check on state-changing posts and on the WebSocket handshake. |
 | Trusted hosts | Built. Host allowlist; extra names only via the strictly validated `WATTRACKER_PUBLIC_HOST(S)` — no wildcards, no suffix matching. |
 | Login throttling | Built. Per-username throttle on `/login`, plus a process-wide cap on concurrent password hashes shared with `/register`. |
-| **Registration policy** | **Built** (this was the gap). The first account is always allowed, since an install has to bootstrap; after that `/register` refuses unless `WATTRACKER_ALLOW_REGISTRATION` is set. See `config.allow_registration` and `tests/test_registration_policy.py`. |
+| **Registration policy** | **Built** (this was the gap). After the first account, `/register` refuses unless `WATTRACKER_ALLOW_REGISTRATION` is set. See `config.allow_registration` and `tests/test_registration_policy.py`. |
+| **First-account claim** | **Built** (issue #132, item 4 — the second half of the gap above). The bootstrap registration cannot be refused outright, so it is gated instead: the server prints a one-time **setup token** at startup while the database is empty, and the first `/register` must present it. Without it, a LAN-bound fresh install belongs to whoever loads `/register` first. Regenerated per start, never written to disk, refused once an account exists, and independent of `WATTRACKER_ALLOW_REGISTRATION`. See `wattracker/setuptoken.py` and `tests/test_setup_token.py`. |
 | TLS + Secure cookies | **Operator's decision, not a default.** On a plain-http LAN bind the session cookie and the connector's bearer token travel in clear text; anyone on that network can read them and act as the rider. Terminate TLS in front and set `WATTRACKER_COOKIE_SECURE=1`. |
 
 So the honest statement of the boundary is the README's: a LAN bind is for **a

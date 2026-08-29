@@ -1,5 +1,6 @@
 """Static contracts for the source-install bootstrap path."""
 import contextlib
+import io
 import os
 from pathlib import Path
 import re
@@ -294,6 +295,98 @@ def test_start_bootstraps_missing_or_stale_environment_before_launching():
     # argv[0] rewrite, and the reason must stay written down next to it.
     assert "[Pp]ython|[Pp]ython[0-9]*)" in START
     assert "Python.app/Contents/MacOS/Python" in START
+
+
+def _setup_token_awk_program():
+    """The awk program start.sh uses to lift the setup token out of the log.
+
+    Pulled out of the script text rather than duplicated here, so this test
+    breaks if the parser changes shape - which is the point: the launcher runs
+    the server under nohup with its output appended to a log, so this parser is
+    the only thing standing between the operator and hunting through that file
+    for the token their first account needs.
+    """
+    function = re.search(
+        r"setup_token_from_log\(\)\s*\{(.*?)\n\}", START, re.S
+    )
+    assert function, "start.sh no longer defines setup_token_from_log"
+    program = re.search(r"awk '\n(.*?)\n\s*'", function.group(1), re.S)
+    assert program, "setup_token_from_log no longer parses the log with awk"
+    return program.group(1), function.group(1)
+
+
+def test_start_reads_the_setup_token_only_from_this_launch_section():
+    """A token from an earlier start is a DEAD token (setuptoken.py).
+
+    It is regenerated on every start, so the banner sitting in the log from
+    yesterday's launch cannot work. Reading from LOG_OFFSET - the same window
+    log_has_fresh_bind uses - is what keeps the launcher from offering one.
+    """
+    _program, body = _setup_token_awk_program()
+
+    assert 'tail -c "+$((LOG_OFFSET + 1))" "$LOG"' in body
+    # Called where a non-zero status cannot abort the launcher: the server has
+    # started successfully by then, and `set -e` plus `pipefail` would turn a
+    # missing log into a failed launch.
+    assert 'token="$(setup_token_from_log || true)"' in START
+    assert "Setup token for the first" in START
+
+
+def test_start_lifts_the_setup_token_out_of_the_banner_the_server_prints(
+    enforce_setup_token,
+):
+    """The parser, run against the real banner rather than a hand-copied one.
+
+    Fabricating the log text here would let the two drift: a reworded banner
+    would leave this passing and the launcher silently printing nothing. The
+    input is what wattracker.setuptoken actually emits, wrapped in the noise a
+    real server log carries around it. ``enforce_setup_token`` is what puts the
+    real ``announce`` back - conftest silences it for the rest of the suite.
+    """
+    from wattracker.setuptoken import SetupToken
+
+    token = SetupToken()
+    banner = io.StringIO()
+    token.announce(banner)
+    log = (
+        "INFO:     Started server process [1234]\n"
+        + banner.getvalue()
+        + "INFO:     Uvicorn running on http://127.0.0.1:8000\n"
+    )
+    program, _body = _setup_token_awk_program()
+
+    found = subprocess.run(
+        ["awk", program], input=log, capture_output=True, text=True, timeout=30
+    )
+
+    assert found.returncode == 0, found.stderr
+    assert found.stdout.strip() == token.value
+
+
+def test_start_says_nothing_about_a_setup_token_when_none_was_printed():
+    """An install that already has an account prints no banner, so no line."""
+    program, _body = _setup_token_awk_program()
+    log = (
+        "INFO:     Started server process [1234]\n"
+        "INFO:     Uvicorn running on http://127.0.0.1:8000\n"
+    )
+
+    found = subprocess.run(
+        ["awk", program], input=log, capture_output=True, text=True, timeout=30
+    )
+
+    assert found.returncode == 0, found.stderr
+    assert found.stdout == ""
+
+
+def test_quickstart_tells_a_fresh_install_where_its_setup_token_is():
+    """The one-command path has to survive the token, or it is not one command.
+
+    The launcher backgrounds the server, so "it is printed on startup" is only
+    true of a file the reader has to be told about.
+    """
+    assert "setup token" in QUICKSTART.lower()
+    assert "server.log" in QUICKSTART
 
 
 def test_quickstart_describes_one_command_first_run_and_current_distribution_limit():

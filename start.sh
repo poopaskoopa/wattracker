@@ -112,6 +112,29 @@ server_is_ready() {
     fi
 }
 
+# The one-time token the first account has to present (wattracker/setuptoken.py).
+# The server prints it only while the database has no account, so on an install
+# that is already set up this finds nothing and the caller says nothing.
+#
+# Read ONLY from the section of the log this launch appended (LOG_OFFSET), for
+# the same reason log_has_fresh_bind does: the token is regenerated on every
+# start, so an older banner still sitting in the log is a dead token, and
+# offering it as the current one would send the owner round a loop of pasting
+# something that cannot work. The banner puts the token alone on the first
+# non-empty line after its heading.
+#
+# awk reads to the end rather than exiting on the match on purpose: exiting
+# early closes the pipe under tail, which raises the pipeline's status through
+# `pipefail` and would abort the whole launcher via `set -e` at the one moment
+# the server has actually started successfully.
+setup_token_from_log() {
+    [ -f "$LOG" ] || return 0
+    tail -c "+$((LOG_OFFSET + 1))" "$LOG" 2>/dev/null | awk '
+        /wattracker setup token/ { seen = 1; next }
+        seen && NF && !found { print $1; found = 1 }
+    '
+}
+
 existing=""
 if [ -f "$PIDFILE" ]; then
     recorded="$(sed -n '1p' "$PIDFILE" 2>/dev/null || true)"
@@ -163,6 +186,17 @@ for _ in $(seq 1 60); do
     if server_is_ready "$pid"; then
         echo "Started (pid $pid) at $URL"
         echo "Log: $LOG"
+        # Only ever non-empty on an install with no account yet. Printed here
+        # rather than left in the log because this is the terminal the operator
+        # is already looking at, and the token's whole job is to be visible to
+        # them and to nobody on the network.
+        token="$(setup_token_from_log || true)"
+        if [ -n "$token" ]; then
+            echo
+            echo "This install has no account yet. Setup token for the first"
+            echo "account (this run only): $token"
+            echo "Enter it at $URL/register"
+        fi
         exit 0
     fi
     sleep 1

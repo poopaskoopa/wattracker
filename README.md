@@ -124,6 +124,15 @@ candidates. Settings and `WATTRACKER_ACTIVITIES_DIR`,
 On first visit you are redirected to `/login`; create an account at `/register`
 (username + password, min 8 chars). Each account sees only its own data.
 
+The **first** account also needs the one-time **setup token** the server prints
+when it starts with an empty database — the line beginning `wattracker setup
+token` in the terminal, or in `~/.wattracker/server.log` if you started it with
+`./start.sh`. It exists so that the account which owns the install can only be
+claimed by whoever can see the server's own output, rather than by whoever
+reaches `/register` first on the network. It is never written to disk, it stops
+working the moment that first account exists, and restarting before then prints
+a new one.
+
 ### macOS
 
 From the repository root, build the architecture-specific app DMG and SHA-256
@@ -238,10 +247,14 @@ Runtime variables include `WATTRACKER_DATA_DIR`, `WATTRACKER_DB`,
 `1/true/yes/on` and `0/false/no/off`. IPv6 URLs are bracketed correctly.
 
 `WATTRACKER_ALLOW_REGISTRATION` (unset by default) decides whether `/register`
-may create an **additional** account. The first one is always allowed — an
-install has to start somewhere — and after that sign-up is closed until this is
-set, because any account can change the shared AI settings above. Parsed exactly
-like `WATTRACKER_ALLOW_NON_LOOPBACK` (`1/true/yes/on`); see
+may create an **additional** account. The first one is allowed by this rule —
+an install has to start somewhere — but not unguarded: it takes the one-time
+setup token printed at startup (above). After that sign-up is closed until this
+variable is set, because any account can change the shared AI settings above.
+Parsed exactly like `WATTRACKER_ALLOW_NON_LOOPBACK` (`1/true/yes/on`). It has no
+effect on the setup token: the two answer different questions — "may there be
+another account?" and "who owns this install?" — so turning it on does not
+reopen the first account. See
 [Reaching the server from other devices](#reaching-the-server-from-other-devices).
 
 `WATTRACKER_PUBLIC_HOST` (unset by default) names the one external hostname a
@@ -415,8 +428,14 @@ network, `/register` is reachable from the network, and it is the one page that
 does not ask who you are — it cannot, because it is how the first account gets
 made. So it closes itself as soon as there is something to protect:
 
-- **No accounts yet** → registration is open. That is how you set the server
-  up, and nothing else works until you have.
+- **No accounts yet** → registration is open to whoever holds the **setup
+  token** the server printed when it started (the `wattracker setup token`
+  banner; with `./start.sh` it is in `~/.wattracker/server.log`). That is how
+  you set the server up, and nothing else works until you have. The token is
+  what stops "open" meaning "open to the rest of the wifi": on a LAN-bound
+  fresh install the account that owns the instance would otherwise go to
+  whoever loaded `/register` first. It is not written to disk, it is refused
+  once the first account exists, and a restart before then prints a new one.
 - **At least one account** → registration is refused unless you say otherwise:
 
 ```sh

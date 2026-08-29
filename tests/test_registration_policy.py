@@ -17,17 +17,30 @@ written. Two concrete harms sit behind an extra account on this app:
   registered a throwaway account, and walked past the /settings refusal that
   exists to stop precisely that.
 
-The policy: the first account is always allowed (nothing to protect yet, and
-every install bootstraps this way); after that it takes
-``WATTRACKER_ALLOW_REGISTRATION``, parsed exactly like
-``WATTRACKER_ALLOW_NON_LOOPBACK``.
+The policy: the first account is allowed by THIS rule (every install bootstraps
+this way); after that it takes ``WATTRACKER_ALLOW_REGISTRATION``, parsed exactly
+like ``WATTRACKER_ALLOW_NON_LOOPBACK``.
 
-NOTE ON THE FIXTURE: tests/conftest.py sets WATTRACKER_ALLOW_REGISTRATION=1 for
-the whole suite, because dozens of tests register a second rider to exercise
-per-user scoping and their subject is isolation, not sign-up policy. This
-module is where the policy itself lives, so almost every test here begins by
-deleting that variable again - which is also why ``closed`` is a fixture rather
-than a line repeated by hand.
+"Allowed by this rule" is not "unguarded", and that is the one thing that has
+changed since this module was written. The bootstrap registration used to be
+open to anyone who could reach the port, which on a LAN-bound fresh install
+means whoever gets there first owns the instance - issue #132 item 4, the land
+grab. It now also has to present the one-time token the server prints at
+startup (``wattracker/setuptoken.py``). The two gates are deliberately
+independent - ``WATTRACKER_ALLOW_REGISTRATION`` governs ADDITIONAL accounts and
+must not be a way to hand the install away - and they are tested apart:
+everything about the token lives in tests/test_setup_token.py, and this module
+keeps its subject, which is who may hold an account at all.
+
+NOTE ON THE FIXTURES: tests/conftest.py sets WATTRACKER_ALLOW_REGISTRATION=1
+for the whole suite, because dozens of tests register a second rider to
+exercise per-user scoping and their subject is isolation, not sign-up policy.
+This module is where the policy itself lives, so almost every test here begins
+by deleting that variable again - which is also why ``closed`` is a fixture
+rather than a line repeated by hand. conftest relaxes the setup-token check the
+same way and for the same kind of reason (``bootstrap_setup_token``), so the
+registrations below are testing the policy in isolation; the one test here that
+cares asks for ``enforce_setup_token`` and gets the real check back.
 """
 import contextlib
 
@@ -90,12 +103,15 @@ def test_the_flag_is_off_when_unset(closed):
     assert config.allow_registration() is False
 
 
-# ------------------------------------------------------ bootstrap is open
-def test_the_first_account_is_always_allowed(closed, client):
+# --------------------------------------------- bootstrap is open to policy
+def test_the_first_account_is_allowed_by_this_policy(closed, client):
     """Every install starts here, and it must work with nothing configured.
 
     If this ever fails the app cannot be set up at all - a fresh database has
-    no account to log in with and no way to make one.
+    no account to log in with and no way to make one. What "allowed" means here
+    is only that THIS rule steps aside; the setup token still has to be
+    presented, which the suite-wide fixture is standing in for (see the module
+    docstring, and the next test).
     """
     assert db.user_ids() == []
 
@@ -105,6 +121,31 @@ def test_the_first_account_is_always_allowed(closed, client):
     assert db.get_user_by_username("rider") is not None
     # Registered AND signed in, exactly as before the policy existed.
     assert client.get("/", follow_redirects=False).status_code == 200
+
+
+def test_the_bootstrap_account_still_needs_the_setup_token(
+    closed, client, enforce_setup_token
+):
+    """The two gates are independent, and both of them apply.
+
+    Here for the same reason ``test_the_shed_still_works_when_the_owner_has
+    _opted_in`` is here: this module's other tests pass under a fixture that
+    relaxes the token, and without one test running the real check that could
+    be read as "the policy is the only thing standing there". It is not - and
+    on a fresh LAN-bound install the policy is precisely the gate that is NOT
+    standing there, which is what the token was added for.
+    """
+    assert _register(client, "intruder").status_code == 403
+    assert db.list_usernames() == []
+
+    token = client.app.state.setup_token.value
+    admitted = client.post(
+        "/register",
+        data={"username": "rider", "password": PASSWORD, "setup_token": token},
+    )
+
+    assert admitted.status_code == 200
+    assert db.list_usernames() == ["rider"]
 
 
 def test_the_registration_form_is_served_on_an_empty_database(closed, client):

@@ -594,11 +594,21 @@ def allow_non_loopback() -> bool:
 def allow_registration() -> bool:
     """Whether ``POST /register`` may create an ADDITIONAL account.
 
-    The first account is not governed by this: every install bootstraps by
-    registering, and a server with no users has nothing to protect yet. Once a
-    user exists, an open /register is a hole rather than a feature, because
-    registration is unauthenticated and an account is not a harmless thing to
-    hold on this app:
+    The first account is not governed by this, and it is not unguarded either.
+    Every install bootstraps by registering, so that request cannot be refused
+    outright - but "a server with no users has nothing to protect yet" was only
+    ever true on loopback. Bound to a LAN (which this app supports, so a phone
+    can be a ride screen), an empty install is worth taking: whoever reaches
+    /register first owns it, including the app-global LLM settings below. So
+    the bootstrap registration now has its own gate, unrelated to this
+    variable - the one-time setup token printed at startup, in
+    ``wattracker.setuptoken`` (issue #132, item 4). The two are deliberately
+    independent: opting into a second rider must not also reopen the land grab,
+    and this variable must not be a way to claim an install.
+
+    Once a user exists, an open /register is a hole rather than a feature,
+    because registration is unauthenticated and an account is not a harmless
+    thing to hold on this app:
 
     * the LLM settings are app-global, not per-user, so any account can point
       the endpoint at a host it controls and collect the rider's stored API key

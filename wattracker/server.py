@@ -51,6 +51,7 @@ from . import (
     power_corrections,
     races,
     ramp_test as ramp_test_mod,
+    setuptoken,
 )
 from .analysis import activity_cache, pipeline, power_profile, zones
 from .backend import (
@@ -666,6 +667,13 @@ class CalendarFeedFailureCounter:
 # One log line per this many refused /login attempts. Not a limit: like the
 # calendar counter it refuses nothing (see LoginAttemptCounter).
 LOGIN_FAILURE_LOG_THRESHOLD = 25
+# Same idea for the bootstrap setup token, but a much lower threshold, because
+# the two shapes it catches are different from each other and both are worth
+# hearing about early. One refusal is nearly always the owner mistyping the
+# token they were shown; a run of them on a server that has never had an
+# account is somebody else trying to guess their way to it. The first line goes
+# out on refusal number one for that reason (see _setup_token_refusal).
+SETUP_TOKEN_REFUSAL_LOG_THRESHOLD = 10
 
 
 class LoginAttemptCounter:
@@ -1265,6 +1273,26 @@ def create_app() -> FastAPI:
     @asynccontextmanager
     async def lifespan(_app: FastAPI):
         db.init_db()
+        # The bootstrap setup token is printed here, and only while this
+        # install has no account: after init_db (the table has to exist before
+        # it can be asked) and before the socket is listening, so the operator
+        # cannot reach /register earlier than the token they need for it.
+        #
+        # A database that cannot answer prints the token anyway. The
+        # registration route fails CLOSED on the same question - it demands the
+        # token when it cannot tell whether an account exists - and a token
+        # that is demanded but was never printed is a lockout, which is the one
+        # outcome this feature must not produce.
+        try:
+            claimed = bool(db.user_ids())
+        except Exception:
+            _log.warning(
+                "could not tell whether this install already has an account; "
+                "printing the setup token anyway", exc_info=True,
+            )
+            claimed = False
+        if not claimed:
+            _app.state.setup_token.announce()
         stop = asyncio.Event()
         task: Optional[asyncio.Task] = None
         if config.auto_scan_enabled():
@@ -1323,6 +1351,12 @@ def create_app() -> FastAPI:
     # and both be admitted as the first account. A plain Lock is the right
     # size for the same reason the scan-progress dict is: one process.
     app.state.registration_lock = threading.Lock()
+    # The one-time token that authorizes the FIRST account on this install
+    # (wattracker.setuptoken has the whole argument, including why it is
+    # regenerated on every start rather than persisted). Per app instance, not
+    # a process global: the token belongs to the process that printed it, and
+    # an app that is thrown away takes its token with it.
+    app.state.setup_token = setuptoken.SetupToken()
     # Refused /login attempts: a single unkeyed count, not a throttle.
     app.state.login_failures = LoginAttemptCounter()
     # Rejected /calendar.ics tokens: a single unkeyed count, not a throttle.
@@ -1403,37 +1437,76 @@ def create_app() -> FastAPI:
     app.state.allowed_hosts = allowed_hosts
 
     # -------------------------------------------------------------- auth
-    def _registration_open() -> bool:
+    def _account_exists() -> Optional[bool]:
+        """Whether this install already has at least one account.
+
+        ``None`` means the database would not say. It is returned rather than
+        resolved here because the two decisions built on this question fail in
+        OPPOSITE directions, and each of them owns its own answer:
+
+        * ``_registration_open`` refuses - a broken query must not silently
+          reopen sign-up on a populated server; and
+        * ``_setup_token_required`` demands the token - a broken query must not
+          silently hand the bootstrap account to whoever asked.
+
+        Both are the closed answer for their own question, which only reads as
+        consistent when the question is asked once and interpreted twice.
+        """
+        try:
+            return bool(db.user_ids())
+        except Exception:
+            _log.warning(
+                "could not determine whether any account exists", exc_info=True
+            )
+            return None
+
+    def _registration_open(exists: Optional[bool]) -> bool:
         """Whether /register may create an account right now.
 
         Two ways to be open, and only two. An empty database is open because
-        every install bootstraps through this route and there is nothing to
-        protect yet. After that it takes WATTRACKER_ALLOW_REGISTRATION, for
-        the reasons written out in config.allow_registration - in short, an
-        account on this app can repoint the APP-GLOBAL LLM endpoint at a host
-        it controls (harvesting the rider's stored key and every prompt) and
-        can launder a connector session past the /settings refusal.
+        every install bootstraps through this route - though since the
+        first-account setup token exists, "open" no longer means "unguarded":
+        see _setup_token_required. After that it takes
+        WATTRACKER_ALLOW_REGISTRATION, for the reasons written out in
+        config.allow_registration - in short, an account on this app can
+        repoint the APP-GLOBAL LLM endpoint at a host it controls (harvesting
+        the rider's stored key and every prompt) and can launder a connector
+        session past the /settings refusal.
 
-        The env var is checked FIRST so the ordinary multi-account case costs
-        no query at all, and so a rider who has opted in is never refused
-        because the database is momentarily unhappy.
+        ``exists`` comes from _account_exists and is passed in rather than
+        looked up here. This used to check the env var first so that the
+        ordinary multi-account case cost no query at all; that saving is gone
+        on purpose, because the setup-token gate needs to know whether THIS
+        would be the first account no matter how the policy answers, and one
+        indexed lookup answering both questions beats two answering one each.
 
-        A database that cannot answer refuses. This is an authorization
-        decision, and the same reasoning as _connector_session_still_paired
-        applies: the cost of being wrong this way is that a rider who wanted a
-        second account retries; the cost of the other default is that a broken
-        query silently reopens registration on a populated server.
+        A database that cannot answer (``exists is None``) refuses. Same
+        reasoning as _connector_session_still_paired: the cost of being wrong
+        this way is that a rider who wanted a second account retries; the cost
+        of the other default is that a broken query reopens registration on a
+        populated server.
         """
         if config.allow_registration():
             return True
-        try:
-            return not db.user_ids()
-        except Exception:
-            _log.warning(
-                "could not determine whether any account exists; "
-                "refusing registration", exc_info=True
-            )
-            return False
+        return exists is False
+
+    def _setup_token_required(exists: Optional[bool]) -> bool:
+        """Whether this registration must present the one-time setup token.
+
+        True exactly when the account being created would be the FIRST one -
+        the moment the old policy gave away for free, and the one an unrelated
+        device on the same network could take on a fresh LAN-bound install
+        (issue #132, item 4). Deliberately INDEPENDENT of
+        WATTRACKER_ALLOW_REGISTRATION: that variable governs additional
+        accounts and says nothing about who may claim the install, so opting
+        into a second rider must not also reopen the land grab.
+
+        ``None`` - the database would not say whether an account exists -
+        requires the token, and the startup banner is printed under the same
+        uncertainty (see the lifespan) so the token being demanded is one the
+        operator has actually been shown.
+        """
+        return exists is not True
 
     def _registration_closed_response(request: Request):
         """The refusal: a real page that says how to turn registration on.
@@ -1455,15 +1528,63 @@ def create_app() -> FastAPI:
             status_code=403,
         )
 
+    def _setup_token_refusal(request: Request):
+        """Refuse a first registration that did not carry the setup token.
+
+        403 with the form still on the page, because the person who hits this
+        is nearly always the owner who mistyped or pasted a stale one, and they
+        need somewhere to try again. The wording says only WHERE the token
+        comes from - the terminal this server is running in. It says nothing
+        about the token itself: not its length, not a prefix, not whether the
+        submitted value got any of it right, and not whether one has been
+        printed at all. A caller who cannot see that output learns nothing from
+        this page that they did not already know.
+
+        Nothing here throttles or locks out, and that is a decision rather than
+        an omission: refusing future attempts on the strength of wrong tokens
+        would let anyone who can reach the port stop the owner completing
+        setup, which is a cheaper version of the attack the token exists to
+        stop. The count is visibility only (see SetupToken.record_refusal).
+        """
+        token = app.state.setup_token
+        total = token.record_refusal()
+        if total == 1 or total % SETUP_TOKEN_REFUSAL_LOG_THRESHOLD == 0:
+            _log.warning(
+                "%d registration attempt(s) refused for a missing or wrong "
+                "setup token", total,
+            )
+        # Fallback printing, for the one case the startup banner cannot cover:
+        # a server that started WITH an account and no longer has one is now
+        # demanding a token nobody was ever shown. announce() prints at most
+        # once per process, so a flood cannot turn this into a way to spam the
+        # operator - and it can only ever print where the operator already is.
+        token.announce()
+        return templates.TemplateResponse(
+            request,
+            "register.html",
+            {"request": request,
+             "error": "That setup token is not correct. Copy the token this "
+                      "server printed when it started.",
+             "registration_closed": False,
+             "setup_required": True},
+            status_code=403,
+        )
+
     @app.get("/register", response_class=HTMLResponse)
     def register_form(request: Request):
         if _uid(request):
             return RedirectResponse("/", status_code=303)
-        if not _registration_open():
+        exists = _account_exists()
+        if not _registration_open(exists):
             return _registration_closed_response(request)
         return templates.TemplateResponse(
             request, "register.html",
-            {"request": request, "error": None, "registration_closed": False},
+            {"request": request, "error": None, "registration_closed": False,
+             # Only the bootstrap registration asks for a token, so only the
+             # bootstrap registration shows the field. A rider adding a second
+             # account under WATTRACKER_ALLOW_REGISTRATION must not be shown a
+             # box they have nothing to put in.
+             "setup_required": _setup_token_required(exists)},
         )
 
     def _hash_capacity_response(request: Request, template: str):
@@ -1486,6 +1607,7 @@ def create_app() -> FastAPI:
         request: Request,
         username: str = Form(...),
         password: str = Form(...),
+        setup_token: str = Form(""),
     ):
         # /register hashes a password too (same ~128 MiB), and is exempt from
         # auth as well, so it gets the same two guards as /login - otherwise the
@@ -1494,9 +1616,21 @@ def create_app() -> FastAPI:
             return PlainTextResponse("Origin not allowed", status_code=403)
         # Refused BEFORE the ~128 MiB scrypt, not after: a closed server must
         # not be a free way to burn the hash limiter, and refusing costs one
-        # environment read plus (only when the var is unset) one indexed query.
-        if not _registration_open():
+        # indexed query, whose answer the setup-token gate below reuses.
+        exists = _account_exists()
+        if not _registration_open(exists):
             return _registration_closed_response(request)
+        # The bootstrap gate, and it is HERE for the same reason: no scrypt has
+        # run yet, the hash limiter has not been touched, and no throttle has
+        # been told anything. A wrong token must be the cheapest possible
+        # refusal on this route - both so that guessing buys no memory pressure
+        # against the shared limiter that /login depends on, and so that a
+        # flood of wrong tokens cannot lock the owner out of the setup they are
+        # in the middle of.
+        if _setup_token_required(exists) and not app.state.setup_token.matches(
+            setup_token
+        ):
+            return _setup_token_refusal(request)
         username = (username or "").strip()
         err = auth.validate_credentials(username, password)
         if not err:
@@ -1510,17 +1644,43 @@ def create_app() -> FastAPI:
             # a second during which another request may have become the first
             # account, and "the database was empty when we started" is not a
             # policy. Held across the INSERT only - never across the hash.
+            #
+            # The setup token is re-checked and then SPENT inside the same
+            # lock, which is what makes it single-use against concurrency
+            # rather than only against sequence. Two requests carrying the same
+            # valid token can both clear the cheap gate above and both finish
+            # hashing; here they serialize, the first creates the account and
+            # burns the token, and the second finds either a populated database
+            # (refused by policy) or a spent token (refused by the gate). There
+            # is no interleaving in which both are admitted as the first
+            # account - which is the property the lock was introduced for, now
+            # covering the token as well as the row count.
             with app.state.registration_lock:
-                if not _registration_open():
+                exists = _account_exists()
+                if not _registration_open(exists):
                     return _registration_closed_response(request)
+                bootstrap = _setup_token_required(exists)
+                if bootstrap and not app.state.setup_token.matches(setup_token):
+                    return _setup_token_refusal(request)
                 user_id = db.create_user(username, password_hash)
+                # Spent only on success, and only for the account that actually
+                # claimed the install. A registration that lost a username race
+                # leaves the token alive so the owner can simply try again with
+                # a different name.
+                if bootstrap and user_id is not None:
+                    app.state.setup_token.spend()
             if user_id is None:
                 err = "That username is already taken."
         if err:
             return templates.TemplateResponse(
                 request, "register.html",
                 {"request": request, "error": err,
-                 "registration_closed": False},
+                 "registration_closed": False,
+                 # Re-rendering the form after a bad username or password must
+                 # keep the token field, or a rider whose password was too
+                 # short loses the box they already filled in and gets refused
+                 # for a second, unrelated reason on the retry.
+                 "setup_required": _setup_token_required(exists)},
             )
         _promote_to_password_session(request)
         request.session["user_id"] = user_id

@@ -64,8 +64,9 @@ def isolated_env(tmp_path, monkeypatch):
     # player-folder detection looks at an isolated (empty) root, never the
     # machine's real Zwift install.
     monkeypatch.setenv("WATTRACKER_AUTO_SCAN", "0")
-    # Registration policy: the first account is always allowed, but a SECOND
-    # one now needs WATTRACKER_ALLOW_REGISTRATION (config.allow_registration).
+    # Registration policy: the first account is allowed by this rule (it has
+    # its own gate - see bootstrap_setup_token below), but a SECOND one needs
+    # WATTRACKER_ALLOW_REGISTRATION (config.allow_registration).
     # A large number of tests legitimately register a second rider through the
     # route to exercise per-user scoping - "bob" in test_backup_route.py, the
     # second accounts in test_auth.py and test_security_fixes.py - and their
@@ -164,6 +165,68 @@ def cheap_scrypt(monkeypatch):
         auth_module,
         "_DUMMY_HASH",
         auth_module.hash_password("wattracker::no-such-user"),
+    )
+
+
+#: The genuine implementations, captured at import time so the fixture below
+#: can hand them back to the tests whose subject they are.
+from wattracker import setuptoken as _setuptoken  # noqa: E402
+
+_REAL_SETUP_TOKEN_MATCHES = _setuptoken.SetupToken.matches
+_REAL_SETUP_TOKEN_ANNOUNCE = _setuptoken.SetupToken.announce
+
+
+@pytest.fixture(autouse=True)
+def bootstrap_setup_token(monkeypatch):
+    """Let the whole suite create its FIRST account without the setup token.
+
+    The shipped policy is that the first account on an install must present the
+    one-time token the server printed at startup (wattracker.setuptoken, issue
+    #132 item 4). Some fifty test modules bootstrap a rider through the real
+    ``POST /register`` before getting to their actual subject - power curves,
+    calendars, connector pairing - and none of them can know that token, since
+    it is generated per app instance and only ever printed.
+
+    So this is the same bargain conftest already strikes twice: ``cheap_scrypt``
+    relaxes the hashing COST for everyone because the cost is not what those
+    tests are about, and ``WATTRACKER_ALLOW_REGISTRATION=1`` above relaxes the
+    second-account POLICY for everyone for the same reason. Here the token
+    check is relaxed for everyone, and the tests whose subject IS the token -
+    tests/test_setup_token.py, plus the bootstrap section of
+    tests/test_registration_policy.py - ask for ``enforce_setup_token`` and get
+    the real thing back.
+
+    It is a TEST-ONLY relaxation on purpose: there is no environment variable
+    or configuration switch that disables the token in a shipped build, because
+    a documented way to turn the check off is a documented way for an attacker
+    who can reach the port to hope the owner used it. Patching the method from
+    conftest keeps the escape hatch entirely inside the test process.
+
+    ``announce`` is silenced along with it so that ~2700 tests, most of which
+    start an app against an empty database, do not each print a token banner
+    into the captured output of a failure report.
+    """
+    monkeypatch.setattr(
+        _setuptoken.SetupToken, "matches", lambda self, candidate: True
+    )
+    monkeypatch.setattr(
+        _setuptoken.SetupToken, "announce", lambda self, out=None: False
+    )
+
+
+@pytest.fixture()
+def enforce_setup_token(monkeypatch):
+    """Opt back into the real first-account setup token check.
+
+    Autouse fixtures are set up before the non-autouse fixtures of the same
+    scope, so this reverses ``bootstrap_setup_token`` for the test that asks
+    for it - and monkeypatch undoes both in the right order afterwards.
+    """
+    monkeypatch.setattr(
+        _setuptoken.SetupToken, "matches", _REAL_SETUP_TOKEN_MATCHES
+    )
+    monkeypatch.setattr(
+        _setuptoken.SetupToken, "announce", _REAL_SETUP_TOKEN_ANNOUNCE
     )
 
 

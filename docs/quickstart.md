@@ -24,9 +24,23 @@ there. It does not use `sudo`, modify system Python, or write application data
 into the repository. Later launches reuse that environment; if `pyproject.toml`
 or the installer changes, dependencies are refreshed automatically.
 
+`./start.sh` runs the server in the background and prints the **setup token**
+for a fresh install — a one-time code the first account has to present, so that
+the account owning this install can only be claimed by whoever can see the
+server's own output rather than by whoever reaches `/register` first on the
+network. If you missed it, it is in the log the launcher named:
+
+```sh
+grep -A2 "wattracker setup token" ~/.wattracker/server.log | tail -3
+```
+
+The token is never written to disk by the app, it stops working as soon as the
+first account exists, and restarting before then prints a new one and
+invalidates the old — so always use the newest.
+
 Open the reported local URL, normally `http://127.0.0.1:8000`. On first visit:
 
-1. Register a local account.
+1. Register a local account, pasting in the setup token above.
 2. Select your Zwift `Activities` folder or upload `.fit` files.
 3. Choose an estimated or manual FTP.
 

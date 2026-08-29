@@ -13,10 +13,12 @@
 <p class="alert">This server is not accepting new accounts.</p>
 
 <p>
-    Registration is open only while the server has no account at all, so that a
-    new install can be set up. After that it stays closed unless it is turned
-    on deliberately &mdash; an account here can change the app-wide AI provider
-    settings, so an open sign-up page on a network is a way in.
+    Registration is open only while the server has no account at all &mdash;
+    and even then it takes the one-time setup token the server prints when it
+    starts &mdash; so that a new install can be set up by whoever started it.
+    After that it stays closed unless it is turned on deliberately &mdash; an
+    account here can change the app-wide AI provider settings, so an open
+    sign-up page on a network is a way in.
 </p>
 
 <p>
@@ -29,13 +31,45 @@
 
 <p>Already have an account? <a href="/login">Log in</a>.</p>
 {% else %}
-<h2>Create account</h2>
+{#- `setup_required` is the BOOTSTRAP state: this install has no account yet,
+    so this form is the one that claims it, and the server printed a one-time
+    setup token when it started that has to be pasted in below. It is shown
+    only in that state - a rider adding a second account under
+    WATTRACKER_ALLOW_REGISTRATION has no token and must not be shown a box they
+    cannot fill. The token itself is NEVER rendered here: the whole point is
+    that it travels via the server's own output, which only whoever started the
+    server can see. -#}
+<h2>{% if setup_required %}Set up this server{% else %}Create account{% endif %}</h2>
 
 {% if error %}<p class="alert">{{ error }}</p>{% endif %}
 
+{% if setup_required %}
+<p>
+    This server has no account yet. It printed a one-time
+    <strong>setup token</strong> when it started &mdash; paste that below to
+    claim the account. Without it, registration is refused, so nobody else who
+    can reach this server can take the account first.
+</p>
+{% endif %}
+
 <form method="post" action="/register" class="auth-form">
+    {% if setup_required %}
+    <label>Setup token
+        <input type="text" name="setup_token" required autofocus
+               autocomplete="off" autocapitalize="off" autocorrect="off"
+               spellcheck="false">
+    </label>
+    <p class="hint">
+        Printed in the terminal running the server. Started with
+        <code>./start.sh</code>? It is in
+        <code>~/.wattracker/server.log</code>. In a container, it is in
+        <code>docker logs</code>. Restarting the server before the account
+        exists prints a new token and invalidates the old one.
+    </p>
+    {% endif %}
     <label>Username
-        <input type="text" name="username" autocomplete="username" required autofocus>
+        <input type="text" name="username" autocomplete="username" required
+               {% if not setup_required %}autofocus{% endif %}>
     </label>
     <label>Password (min 8 characters)
         <input type="password" name="password" autocomplete="new-password"
