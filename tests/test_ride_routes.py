@@ -13,6 +13,7 @@ from wattracker import db  # noqa: E402
 from wattracker.ble import devices as bledevices  # noqa: E402
 from wattracker.server import create_app  # noqa: E402
 from wattracker import server as servermod  # noqa: E402
+from conftest import _receive_until, _drain_until_close  # noqa: E402
 
 
 @pytest.fixture()
@@ -33,20 +34,6 @@ def _receive_after_workout(ws):
     assert workout["workout"]["duration_s"] > 0
     assert workout["workout"]["profile"]
     return ws.receive_json()
-
-
-def _receive_until(ws, predicate, description, cap=200):
-    """Receive JSON frames until `predicate` matches one, or fail cleanly.
-
-    A regression that stops a code path from ever sending the awaited frame
-    would otherwise hang the loop (and the test run) forever, since the
-    websocket has no server-side timeout here.
-    """
-    for _ in range(cap):
-        message = ws.receive_json()
-        if predicate(message):
-            return message
-    pytest.fail(f"never received {description} after {cap} frames")
 
 
 def _force_bt_unavailable(monkeypatch):
@@ -743,13 +730,8 @@ def test_ride_requires_auth(client):
 
 def test_ride_ws_simulation_streams_and_saves(client):
     _register(client)
-    frames = []
     with client.websocket_connect("/ride/ws?sim=1&type=endurance&minutes=30") as ws:
-        try:
-            while True:
-                frames.append(ws.receive_json())
-        except Exception:
-            pass
+        frames = _drain_until_close(ws)
     assert frames, "expected streamed frames"
     assert frames[-1]["status"] == "finished"
     assert any(f.get("target_watts", 0) > 0 for f in frames)
@@ -773,17 +755,12 @@ def test_ride_ws_selected_plan_workout_links_saved_activity(client):
         "<workout_file/>",
     )
 
-    frames = []
     with client.websocket_connect(
         f"/ride/ws?sim=1&workout_id={workout_id}"
     ) as ws:
         first = ws.receive_json()
         assert first["status"] == "workout"
-        try:
-            while True:
-                frames.append(ws.receive_json())
-        except Exception:
-            pass
+        frames = _drain_until_close(ws)
 
     assert frames[-1]["status"] == "finished"
     assert frames[-1]["workout_id"] == workout_id
@@ -878,17 +855,12 @@ def test_ride_ws_real_path_erg_drives_trainer(client, monkeypatch):
     # shortened inactivity timeout finalizes.
     _patch_real_ride(monkeypatch, trainer, [150, 150, 150, 150] + [0] * 10)
 
-    frames = []
     with client.websocket_connect("/ride/ws?type=endurance&minutes=30") as ws:
         first = _receive_after_workout(ws)
         assert first["status"] == "connected"
         assert first["erg"] is True
         assert first["devices"]["trainer"] == "FakeKickr"
-        try:
-            while True:
-                frames.append(ws.receive_json())
-        except Exception:
-            pass
+        frames = _drain_until_close(ws)
     assert frames and frames[-1]["status"] == "finished"
     assert any(f.get("status") == "inactivity_timeout" and f["saved"] for f in frames)
     # ERG lifecycle: Request Control + Start at ride start, Stop at the end,
@@ -934,14 +906,9 @@ def test_ride_ws_survives_a_stalled_tick_without_pausing_the_ride(
 
     monkeypatch.setattr(servermod, "_ride_loop_time", fake_ride_time)
 
-    frames = []
     with client.websocket_connect("/ride/ws?type=endurance&minutes=30") as ws:
         assert _receive_after_workout(ws)["status"] == "connected"
-        try:
-            while True:
-                frames.append(ws.receive_json())
-        except Exception:
-            pass
+        frames = _drain_until_close(ws)
 
     assert clock_calls // 2 > stalled_tick  # the stall really happened
     statuses = [f.get("status") for f in frames if "elapsed" in f]
@@ -1011,11 +978,7 @@ def test_ride_ws_awaits_ftms_commands_and_stops_before_disconnect(
 
     with client.websocket_connect("/ride/ws") as ws:
         assert _receive_after_workout(ws)["status"] == "connected"
-        try:
-            while True:
-                ws.receive_json()
-        except Exception:
-            pass
+        _drain_until_close(ws)
 
     trainer = connected_trainers[0]
     stop_index = max(
@@ -1069,14 +1032,9 @@ def test_ride_ws_target_rejection_reports_erg_off_without_aborting(
     monkeypatch.setattr(servermod, "RIDE_POLL_INTERVAL_S", 0)
     monkeypatch.setattr(servermod, "RIDE_INACTIVITY_TIMEOUT_S", 5)
 
-    frames = []
     with client.websocket_connect("/ride/ws") as ws:
         assert _receive_after_workout(ws)["status"] == "connected"
-        try:
-            while True:
-                frames.append(ws.receive_json())
-        except Exception:
-            pass
+        frames = _drain_until_close(ws)
 
     failure = next(frame for frame in frames if frame.get("status") == "erg")
     assert failure["enabled"] is False
@@ -1135,14 +1093,9 @@ def _run_erg_failure_ride(client, monkeypatch, hardware, powers):
     monkeypatch.setattr(servermod, "RIDE_POLL_INTERVAL_S", 0)
     monkeypatch.setattr(servermod, "RIDE_INACTIVITY_TIMEOUT_S", 5)
 
-    frames = []
     with client.websocket_connect("/ride/ws") as ws:
         assert _receive_after_workout(ws)["status"] == "connected"
-        try:
-            while True:
-                frames.append(ws.receive_json())
-        except Exception:
-            pass
+        frames = _drain_until_close(ws)
     return frames
 
 
@@ -1229,16 +1182,11 @@ def test_ride_ws_real_path_degrades_without_trainer(client, monkeypatch):
     _register(client)
     _patch_real_ride(monkeypatch, None, [150, 150, 150, 150] + [0] * 10)
 
-    frames = []
     with client.websocket_connect("/ride/ws?type=endurance&minutes=30") as ws:
         first = _receive_after_workout(ws)
         assert first["status"] == "connected"
         assert first["erg"] is False  # no FTMS trainer: read-only ride
-        try:
-            while True:
-                frames.append(ws.receive_json())
-        except Exception:
-            pass
+        frames = _drain_until_close(ws)
     # Power display still works without a controllable trainer.
     assert any(f["power"] == 150 for f in frames)
     assert frames[-1]["status"] == "finished"
@@ -1314,7 +1262,6 @@ def test_ride_ws_reports_failed_sensor_roles_without_stopping_the_ride(
     monkeypatch.setattr(servermod.bledevices, "connect_sensors", fake_connect)
     monkeypatch.setattr(servermod, "RIDE_POLL_INTERVAL_S", 0)
 
-    frames = []
     url = (
         "/ride/ws?type=endurance&minutes=30&selected=1"
         f"&power={_KICKR_ADDRESS}&cadence={_KICKR_ADDRESS}"
@@ -1333,11 +1280,7 @@ def test_ride_ws_reports_failed_sensor_roles_without_stopping_the_ride(
         assert "00002a5b" not in warning
         assert _KICKR_ADDRESS not in warning
         assert "7B2A660B" not in warning
-        try:
-            while True:
-                frames.append(ws.receive_json())
-        except Exception:
-            pass
+        frames = _drain_until_close(ws)
 
     # The failed role did not abort the ride, and the cadence the surviving
     # power role reports still arrives.
@@ -1603,17 +1546,12 @@ def test_ride_ws_prepare_streams_and_auto_starts_on_power(client, monkeypatch):
     monkeypatch.setattr(servermod, "RIDE_INACTIVITY_TIMEOUT_S", 5)
 
     uid = db.get_user_by_username("rider")["id"]
-    frames = []
     with client.websocket_connect("/ride/ws?prepare=1") as ws:
         connected = _receive_after_workout(ws)
         assert connected["status"] == "connected"
         # Both connect buttons stream immediately; nothing is "prepared" anymore.
         assert connected["prepared"] is False
-        try:
-            while True:
-                frames.append(ws.receive_json())
-        except Exception:
-            pass
+        frames = _drain_until_close(ws)
 
     # Auto-started on power (3s gate) without any explicit start action.
     assert any(f.get("status") == "running" for f in frames)
@@ -1729,10 +1667,9 @@ def test_ride_ws_prepared_actions_toggle_erg_and_disconnect_one_device(
     right = SimulatedPowerSource([0])
 
     def _next(ws, status):
-        message = ws.receive_json()
-        while message.get("status") != status:
-            message = ws.receive_json()
-        return message
+        return _receive_until(
+            ws, lambda m: m.get("status") == status, f"a frame with status={status!r}"
+        )
 
     class FakeClient:
         def __init__(self, address):
@@ -1927,24 +1864,16 @@ def test_ride_ws_active_actions_toggle_erg_and_validate_disconnect(
     with client.websocket_connect("/ride/ws") as ws:
         assert _receive_after_workout(ws)["status"] == "connected"
         ws.send_json({"action": "set_erg", "enabled": False})
-        messages = []
-        while not any(message.get("status") == "erg" for message in messages):
-            messages.append(ws.receive_json())
-        result = next(message for message in messages if message.get("status") == "erg")
+        result = _receive_until(
+            ws, lambda m: m.get("status") == "erg", "an 'erg' status frame"
+        )
         assert result["enabled"] is False
 
         ws.send_json({"action": "disconnect", "address": 123})
-        messages = []
-        while not any(
-            message.get("status") == "error"
-            and message.get("action") == "disconnect"
-            for message in messages
-        ):
-            messages.append(ws.receive_json())
-        error = next(
-            message for message in messages
-            if message.get("status") == "error"
-            and message.get("action") == "disconnect"
+        error = _receive_until(
+            ws,
+            lambda m: m.get("status") == "error" and m.get("action") == "disconnect",
+            "an error/disconnect frame",
         )
         assert error["error"] == "Invalid device address."
 
@@ -1988,9 +1917,9 @@ def test_ride_ws_erg_action_reports_unavailable_without_trainer(
         assert connected["erg_available"] is False
         assert connected["erg_enabled"] is False
         ws.send_json({"action": "set_erg", "enabled": True})
-        response = ws.receive_json()
-        while response.get("status") != "erg":
-            response = ws.receive_json()
+        response = _receive_until(
+            ws, lambda m: m.get("status") == "erg", "an 'erg' status frame"
+        )
         assert response["available"] is False
         assert response["enabled"] is False
         assert "No controllable FTMS trainer" in response["error"]
@@ -2073,9 +2002,11 @@ def test_ride_ws_inactivity_disconnects_without_saving_never_started_ride(
 
     with client.websocket_connect("/ride/ws" + ("?prepare=1" if prepare else "")) as ws:
         assert _receive_after_workout(ws)["status"] == "connected"
-        timeout = ws.receive_json()
-        while timeout["status"] != "inactivity_timeout":
-            timeout = ws.receive_json()
+        timeout = _receive_until(
+            ws,
+            lambda m: m["status"] == "inactivity_timeout",
+            "an 'inactivity_timeout' status frame",
+        )
 
     assert timeout["status"] == "inactivity_timeout"
     assert timeout["saved"] is False
@@ -2259,14 +2190,9 @@ def test_ride_ws_keeps_streaming_after_the_workout_then_finishes_on_stop_pedalli
     # 3s start gate, then long enough to finish the 60s workout and spin down.
     _patch_real_ride(monkeypatch, trainer, [150] * 90 + [0] * 5)
 
-    frames = []
     with client.websocket_connect(f"/ride/ws?workout_id={workout_id}") as ws:
         assert _receive_after_workout(ws)["status"] == "connected"
-        try:
-            while True:
-                frames.append(ws.receive_json())
-        except Exception:
-            pass
+        frames = _drain_until_close(ws)
 
     states = [f for f in frames if "status" in f and "elapsed" in f]
     cooldown = [f for f in states if f["status"] == "cooldown"]
@@ -2336,14 +2262,9 @@ def test_ride_ws_ends_a_ramp_test_on_failure_and_offers_the_result(
               + [0] * 10)
     _patch_real_ride(monkeypatch, SimulatedTrainer(), script)
 
-    frames = []
     with client.websocket_connect("/ride/ws?type=ramp_test&minutes=30") as ws:
         assert _receive_after_workout(ws)["status"] == "connected"
-        try:
-            while True:
-                frames.append(ws.receive_json())
-        except Exception:
-            pass
+        frames = _drain_until_close(ws)
 
     states = [f for f in frames if "elapsed" in f]
     assert states[-1]["status"] == "finished"

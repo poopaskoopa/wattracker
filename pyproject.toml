@@ -27,7 +27,7 @@ dependencies = [
 # optional: the browser binary is a ~150MB download outside pip
 # (`playwright install chromium`), so machines and CI without it simply skip
 # those tests instead of failing.
-dev = ["pytest>=8.0", "httpx>=0.27", "playwright>=1.47", "websockets>=13.0"]
+dev = ["pytest>=8.0", "httpx>=0.27", "playwright>=1.47", "websockets>=13.0", "pytest-timeout>=2.3"]
 # Real-hardware Bluetooth riding. Not needed for core install or the test suite;
 # requires a Bluetooth adapter + trainer/sensors to actually use.
 ble = ["bleak>=0.22"]
@@ -90,3 +90,11 @@ markers = [
     # Only these:  pytest -m browser      Everything else:  pytest -m "not browser"
     "browser: drives the app in a real Chromium via playwright",
 ]
+# Backstop for websocket tests: if a regression stops the server from ever
+# sending an awaited frame, or from ever closing the socket, a receive loop
+# must report as a failing test rather than hanging the whole run. signal
+# method is used instead of the default thread method because thread mode
+# kills the entire pytest process on timeout instead of failing just the one
+# test.
+timeout = 60
+timeout_method = "signal"

@@ -27,6 +27,7 @@ from wattracker.server import create_app  # noqa: E402
 from wattracker_connector import ble_handlers as blemod  # noqa: E402
 
 from conftest_connector import FakeRadio, attach_connector  # noqa: E402
+from conftest import _receive_until  # noqa: E402
 
 # The name the phone would use, and the Host/Origin pair a browser sends with
 # it. The port matters: _same_origin_or_absent compares it, and a Host header
@@ -117,17 +118,20 @@ def test_a_phone_watches_a_ride_the_connector_is_actually_riding(
         with client.websocket_connect(
             "/ride/ws?type=endurance&minutes=30", headers=PHONE,
         ) as ws:
-            while True:
-                message = ws.receive_json()
+            def _received(message):
                 frames.append(message)
                 status = message.get("status")
-                if status == "connected":
-                    break
                 assert status not in ("error", "unavailable"), message
-            while len(running) < 3:
-                message = ws.receive_json()
+                return status == "connected"
+
+            _receive_until(ws, _received, "a 'connected' frame")
+
+            def _running(message):
                 if message.get("status") == "running":
                     running.append(message)
+                return len(running) >= 3
+
+            _receive_until(ws, _running, "3 'running' frames")
 
     assert frames[0]["status"] == "workout"
     # Live, and from the connector: these are the fake radio's readings.
