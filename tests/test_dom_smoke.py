@@ -884,6 +884,71 @@ def test_ride_stop_ends_the_ride_through_an_in_page_dialog(
     _assert_clean(console_errors, "/ride stop")
 
 
+def test_ride_ramp_test_accept_dismisses_the_result_dialog(
+    page, live_server, console_errors
+):
+    """Accepting a valid result saves it and dismisses the modal."""
+    page.add_init_script(
+        """
+        (() => {
+            const NativeWebSocket = window.WebSocket;
+            function Tracked(url, protocols) {
+                const socket = protocols === undefined
+                    ? new NativeWebSocket(url) : new NativeWebSocket(url, protocols);
+                let handler = null;
+                Object.defineProperty(socket, 'onmessage', {
+                    configurable: true,
+                    get() { return handler; },
+                    set(fn) { handler = fn; },
+                });
+                socket.__deliver = (frame) => {
+                    if (handler) handler({data: JSON.stringify(frame)});
+                };
+                window.__rampSocket = socket;
+                return socket;
+            }
+            Tracked.prototype = NativeWebSocket.prototype;
+            ['CONNECTING', 'OPEN', 'CLOSING', 'CLOSED'].forEach(
+                (key) => { Tracked[key] = NativeWebSocket[key]; });
+            window.WebSocket = Tracked;
+
+            const nativeFetch = window.fetch;
+            window.__rampAcceptRequests = [];
+            window.fetch = (input, init) => {
+                if (input === '/api/ftp/ramp-test/accept') {
+                    window.__rampAcceptRequests.push(JSON.parse(init.body));
+                    return Promise.resolve(new Response(JSON.stringify({
+                        ftp: 211.5, date: '2026-08-29',
+                    }), {status: 200, headers: {'Content-Type': 'application/json'}}));
+                }
+                return nativeFetch(input, init);
+            };
+        })();
+        """
+    )
+    page.goto(f"{live_server.base}/ride")
+    page.wait_for_load_state("networkidle")
+    page.click("#simBtn")
+    page.wait_for_function("() => window.__rampSocket && window.__rampSocket.__deliver")
+    page.evaluate(
+        """() => window.__rampSocket.__deliver({
+            status: 'finished', elapsed: 120, power: 0, target_watts: 0,
+            cadence: null, hr: null, progress: 1, segment_index: 0,
+            segment_count: 1,
+            ramp_test: {offer: true, ftp: 211.5, activity_id: 42,
+                        completed_ramp: true, disagreement: false,
+                        message: 'Ramp test complete.'}
+        })"""
+    )
+    page.wait_for_selector("#rampTestDialog[open]")
+    page.click("#rampTestAcceptBtn")
+    page.wait_for_selector("#rampTestDialog:not([open])", state="attached")
+    assert page.evaluate("window.__rampAcceptRequests") == [{"activity_id": 42}]
+    assert page.locator("#rampTestStatus").inner_text() == "FTP set to 212 W on 2026-08-29."
+    assert page.locator("#rampTestAcceptBtn").is_hidden()
+    _assert_clean(console_errors, "/ride ramp test accept")
+
+
 # The ride socket is the only way a "connected" frame reaches the page, and a
 # simulated ride never produces one. This wraps the real WebSocket so the real
 # ride handler receives a real "connected" frame -- carrying the real workout
