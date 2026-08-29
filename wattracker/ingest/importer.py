@@ -33,6 +33,7 @@ from ..metrics.power import (
 from ..metrics import profile_store
 from ..prescribe.plan import HARD_STEADY_POWER
 from ..ramp_test import SOURCE as RAMP_TEST_SOURCE, is_declared_ftp_test
+from ..rpc import ConnectorUnavailable
 from ..timeutil import parse_naive, utc_now, utc_today
 from .fit_parser import parse_fit
 
@@ -1736,7 +1737,7 @@ def run_auto_scan(now: Optional[_dt.datetime] = None) -> Dict[str, int]:
     and matches plan-workout completions. Safe to call repeatedly (idempotent).
     """
     db.init_db()
-    totals = {"users": 0, "imported": 0, "completed": 0}
+    totals = {"users": 0, "imported": 0, "completed": 0, "unreachable": 0}
     for uid in db.all_user_ids():
         totals["users"] += 1
         try:
@@ -1757,6 +1758,23 @@ def run_auto_scan(now: Optional[_dt.datetime] = None) -> Dict[str, int]:
             # completion was still unverified. Runs after evaluate_ftp so the
             # step lands on the row that re-evaluation just settled.
             apply_rpe_ftp_feedback(uid, now)
+        except ConnectorUnavailable:
+            # Expected in server mode, and the reason this sweep is a backstop
+            # rather than the mechanism: the rider's machine is asleep, or the
+            # connector is not running. Said out loud, because "imported 0" and
+            # "could not look" are different facts and this used to report them
+            # identically - a connector that happened to be down at sweep time
+            # was indistinguishable from a Zwift folder with nothing new in it,
+            # for a further 24 hours.
+            totals["unreachable"] += 1
+            _log.info(
+                "sweep skipped user %s: no connector attached to read their "
+                "Zwift folder", uid,
+            )
         except Exception:
-            pass  # a broken folder for one user must not stop the sweep
+            # Still swallowed per user: a broken folder for one rider must not
+            # stop the sweep for the rest. But no longer in silence.
+            _log.warning(
+                "the daily sweep failed for user %s", uid, exc_info=True
+            )
     return totals

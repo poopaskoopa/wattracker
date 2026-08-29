@@ -59,6 +59,15 @@ class FakeConnector:
             if "method" in message:
                 await peer.serve(message, self._handlers)
 
+    def send_event(self, event: str, **fields) -> None:
+        """Push a connector -> server event, the way the real client does.
+
+        Written straight onto the session rather than through RpcPeer, because
+        that is what an event IS on this wire: one frame, no id, no reply. The
+        server's routing is the thing under test.
+        """
+        self._session.send_text(rpc.encode({"event": event, **fields}))
+
     def stop(self) -> None:
         self._stop.set()
 

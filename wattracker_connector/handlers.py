@@ -181,7 +181,7 @@ def _within(directory: str, candidate: str) -> bool:
         return False  # different Windows drives, or an unresolvable path
 
 
-def _is_activity_file(name: str) -> bool:
+def is_activity_file(name: str) -> bool:
     """Whether a filename is one this connector will ever hand over.
 
     A ``.fit``, and never Zwift's live recording buffer. It used to live only
@@ -189,6 +189,10 @@ def _is_activity_file(name: str) -> bool:
     such thing: it checked containment and nothing else, so any file at all
     under a folder the server named came back - an ssh key, or this
     connector's own config file with the device token in it.
+
+    Public because ``watcher`` applies it too, and must apply exactly this one:
+    a watcher that reported a file the listing would refuse to offer would ask
+    the server to scan for something it can never import.
     """
     lowered = name.lower()
     return lowered.endswith(".fit") and lowered != _IN_PROGRESS
@@ -218,7 +222,7 @@ def _in_scope(directory: str, path: str) -> bool:
         return False  # different Windows drives, or an unresolvable path
     return (
         os.path.dirname(resolved) == root
-        and _is_activity_file(os.path.basename(resolved))
+        and is_activity_file(os.path.basename(resolved))
     )
 
 

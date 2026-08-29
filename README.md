@@ -288,6 +288,28 @@ The address after `--server` is the one that must appear in the server's
 `400 Bad Request` before the token is examined, so the symptom — a good token
 that will not connect — points nowhere near the cause.
 
+#### How a finished ride reaches the server
+
+The connector watches the Zwift Activities folder and tells the server when a
+new `.fit` has finished being written, so a ride appears under Activities a
+minute or two after you save it — without anyone pressing **Rescan**. A file is
+reported only once its size has stopped changing, so a `.fit` Zwift is still
+writing is left alone, and Zwift's live recording buffer is ignored entirely.
+
+```powershell
+wattracker-connector --scan-interval 30 --save   # check every 30s (default 60)
+wattracker-connector --scan-interval 0  --save   # stop watching
+```
+
+The check is a directory listing on the Zwift machine, so it costs nothing when
+nothing has changed: after the first pass the server is contacted only when a
+file has actually settled. The first pass after the connector starts always
+reports — even when the Zwift folder is empty or does not exist yet — because a
+ride may have been ridden while the connector was down, and that one report is
+what makes starting the connector the cold-start trigger for a scan. With it
+turned off — or if the connector is not running — rides are still imported by
+the server's daily sweep, and **Rescan** still works at any time.
+
 ### The connector as one file (Windows)
 
 The pip install above is the supported path on every OS. On Windows the
