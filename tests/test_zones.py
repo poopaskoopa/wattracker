@@ -130,7 +130,15 @@ def test_hrmax_default_now_uses_utc_naive_fit_clock(monkeypatch):
     assert result["value"] == 188
 
 
-def test_manual_hrmax_precedes_fit_estimate_and_can_be_cleared(user_id):
+def test_manual_hrmax_precedes_fit_estimate_and_can_be_cleared(
+        user_id, monkeypatch):
+    # The rides below are pinned to absolute dates and resolve_hr_max is called
+    # without a `now`, so it windows them against the real clock: the HRmax
+    # evidence window is 365 days, and on 2027-06-01 the 2026-06-01 ride ages
+    # out and the fit estimate silently becomes None. Pin the clock the same
+    # way test_hrmax_default_now_uses_utc_naive_fit_clock does, rather than let
+    # the assertion below depend on the day the suite happens to run.
+    monkeypatch.setattr(zones, "utc_now", lambda: dt.datetime(2026, 7, 1, 12))
     _activity(user_id, "a", "2026-06-01T10:00:00", hr=[185] * 1800)
     _activity(user_id, "b", "2026-06-10T10:00:00", hr=[187] * 1800)
     db.set_user_hr_max(user_id, 195)
