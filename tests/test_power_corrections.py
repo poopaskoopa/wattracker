@@ -105,7 +105,13 @@ def test_finder_uses_full_resolution_and_shows_exact_neighbors(user_id):
     assert candidate["after"][5]["value"] is None
 
 
-def test_finder_skips_malformed_and_overflow_streams_without_500(user_id):
+def test_finder_skips_malformed_and_overflow_streams_without_500(
+        user_id, monkeypatch):
+    # recent_power_streams(days=365) cuts off relative to the real clock while
+    # the rides below are pinned to absolute dates, so on 2027-07-02 the
+    # 2026-07-02 ride falls out of the window and the stream assertion below
+    # starts comparing against an empty list. Pin the clock instead.
+    monkeypatch.setattr(db, "utc_now", lambda: dt.datetime(2026, 7, 3, 12))
     db.insert_activity(user_id, {
         "dedup_hash": "top-level-list",
         "filename": "legacy.fit",
@@ -190,7 +196,14 @@ def test_apply_masks_only_power_preserves_blob_alignment_and_refreshes_summary(u
     assert row["avg_hr"] == 145.0
 
 
-def test_all_stream_consumers_profile_graph_and_cache_see_mask(user_id):
+def test_all_stream_consumers_profile_graph_and_cache_see_mask(
+        user_id, monkeypatch):
+    # Two of the consumers asserted below (recent_full_activities and
+    # recent_power_streams) are 365-day windows resolved against the real
+    # clock, while _activity seeds at a fixed 2026-07-01. On 2027-07-01 both
+    # return nothing and the [0] indexing raises IndexError. Pin the clock so
+    # this keeps testing that every consumer sees the mask.
+    monkeypatch.setattr(db, "utc_now", lambda: dt.datetime(2026, 7, 2, 12))
     power = [200.0] * 1500
     power[0:5] = [2000.0] * 5
     activity_id = _activity(user_id, power)

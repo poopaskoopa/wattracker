@@ -15,6 +15,7 @@ from wattracker.timeutil import (
 )
 from wattracker import db
 from wattracker.analysis import pipeline
+from wattracker.ingest import importer
 
 
 def test_parse_naive_strips_tzinfo():
@@ -52,7 +53,7 @@ def test_invalid_timezone_is_rejected_and_falls_back_to_utc():
     assert local_today(123, instant) == dt.date(2026, 1, 2)
 
 
-def test_build_state_with_tz_aware_activity(tmp_path):
+def test_build_state_with_tz_aware_activity(tmp_path, monkeypatch):
     dbfile = str(tmp_path / "t.db")
     db.init_db(dbfile)
     uid = db.create_user("u", "h", path=dbfile)
@@ -71,6 +72,15 @@ def test_build_state_with_tz_aware_activity(tmp_path):
         },
         path=dbfile,
     )
+    # Two seams, both anchored at wall-clock now, both needed:
+    #  - db's, because build_state windows through recent_power_streams(90) /
+    #    recent_full_activities, which is what keeps the ride above in range;
+    #  - importer's, because current_ftp() anchors the detraining decay there,
+    #    and once the ride is far enough back the estimate decays into
+    #    implausibility, gets discarded, and DEFAULT_FTP (200) is returned.
+    frozen = dt.datetime(2026, 6, 26, 12)
+    monkeypatch.setattr(db, "utc_now", lambda: frozen)
+    monkeypatch.setattr(importer, "utc_now", lambda: frozen)
     # build_state used to raise TypeError in _window_power / estimate_ftp.
     state = pipeline.build_state(uid, path=dbfile) if _accepts_path() else None
     if state is None:
@@ -79,10 +89,14 @@ def test_build_state_with_tz_aware_activity(tmp_path):
 
         os.environ["WATTRACKER_DB"] = dbfile
         state = pipeline.build_state(uid)
-    # The estimate is now anchored at wall-clock now() and detraining-decayed,
-    # so the exact value drifts with the real date; the regression here is that
-    # a tz-aware start_time no longer crashes. Best-20 of 200W -> 190 undecayed,
-    # decay only reduces it, so assert a positive value not exceeding 190.
+    # The estimate is anchored at wall-clock now() and detraining-decayed, so
+    # the value drifts with the real date. Left unpinned that drift is not
+    # merely cosmetic: on 2027-05-25 the 2026-06-25 ride falls out of the FTP
+    # window entirely, the estimate stops being derived from it at all, and
+    # `<= 190.0` fails against the undecayed 200. Pin the clock just after the
+    # ride so the window is a fixed one. Best-20 of 200W -> 190 undecayed, and
+    # decay only reduces it, so a positive value not exceeding 190 is the
+    # regression being guarded: a tz-aware start_time no longer crashes.
     assert 0.0 < state.ftp <= 190.0
 
 
