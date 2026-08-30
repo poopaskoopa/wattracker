@@ -22,13 +22,18 @@ from .limits import QuotaExceeded, QuotaManager, QuotaPolicy
 from .models import ModelError, SyncBatch
 from .security import (
     CredentialRegistry,
+    DEFAULT_DEVICE_CAPABILITIES,
+    DEVICE_SIGNATURE_ALGORITHMS,
     EnrollmentRegistry,
     NonceReplayGuard,
+    PublicKeyUnavailable,
+    READER_CONTEXT_TTL_SECONDS,
     SecurityStateBackend,
     canonical_request,
     digest_body,
     MIN_REPLAY_TTL_SECONDS,
     new_installation_id,
+    validate_public_key_shape,
     verify_signature,
 )
 from .storage import MemoryTenantStore, StorageConflict, StaleRevision
@@ -36,6 +41,14 @@ from .storage import MemoryTenantStore, StorageConflict, StaleRevision
 _NOT_FOUND_BODY = {"detail": "not found"}
 _MAX_TIMESTAMP = 60 * 5
 _MAX_QUERY_LIMIT = 100
+# The refresh envelope carries no body and no idempotent effect, so both
+# fields are fixed constants rather than caller-chosen values.  The nonce is
+# what makes each signed refresh unique and single-use.
+_REFRESH_IDEMPOTENCY_KEY = "context-refresh"
+_REFRESH_REVISION = ""
+_MAX_REFRESH_BODY_BYTES = 4 * 1024
+# A device public key is at most a 65-byte uncompressed P-256 point.
+_MAX_DEVICE_KEY_HEX = 130
 
 
 @dataclass
@@ -103,7 +116,12 @@ class CloudState:
         replay_backend: SecurityStateBackend | None = None,
         require_persistent_security: bool = False,
     ) -> "CloudState":
-        replay_required = config.plane in {"sync", "all"}
+        # Every plane now consumes replay nonces: the read plane verifies
+        # signed device refresh requests, so a process-local guard there would
+        # re-open a captured refresh across a cold start.  The read identity
+        # can write its own auth table, so the shared security backend is a
+        # valid replay store when a dedicated one is not supplied.
+        replay_required = config.plane in {"read", "sync", "all"}
         if replay_required:
             replay_backend = replay_backend or security_backend
         if require_persistent_security and (
@@ -251,8 +269,27 @@ def _apim_proof_valid(state: CloudState, request: Request) -> bool:
     )
 
 
-def _writer_auth(state: CloudState, request: Request) -> Any:
-    """Authenticate the APIM proof and writer subscription without reading the body."""
+def _has_capability(credential: Any, capability: str) -> bool:
+    """Fail closed unless the stored credential carries ``capability``.
+
+    Capability is read from credential state only.  A credential type that
+    does not declare capabilities is never granted one by default.
+    """
+    granted = getattr(credential, "capabilities", None)
+    if not isinstance(granted, (frozenset, set)):
+        return False
+    return capability in granted
+
+
+def _writer_auth(state: CloudState, request: Request, *, capability: str) -> Any:
+    """Authenticate a signing credential and assert one required capability.
+
+    Both writer and paired-device credentials are resolvable here, and both
+    must satisfy the same APIM subscription factor.  What separates them is
+    ``capability``: a device issued read-only is refused by a route that
+    asserts ``"write"``, and widening it later is a capability grant, not a
+    change to this function.
+    """
     if not state.quotas.public_enabled:
         raise HTTPException(status_code=403, detail="public API disabled")
     if not _apim_proof_valid(state, request):
@@ -261,10 +298,12 @@ def _writer_auth(state: CloudState, request: Request) -> Any:
     subscription = request.headers.get(state.config.subscription_header.lower(), "")
     if state.config.require_subscription and not subscription:
         raise HTTPException(status_code=401, detail="subscription authorization required")
-    writer = state.credentials.authenticate_writer(credential_id, subscription)
-    if writer is None:
+    credential = state.credentials.authenticate_writer(credential_id, subscription)
+    if credential is None:
+        credential = state.credentials.authenticate_device(credential_id, subscription)
+    if credential is None or not _has_capability(credential, capability):
         raise HTTPException(status_code=401, detail="writer authorization required")
-    return writer
+    return credential
 
 
 def _writer_signature_fields(request: Request) -> tuple[int, str, str, int, str]:
@@ -322,6 +361,59 @@ def _verify_writer_request(
         return namespace, scope, idem, revision
     except (HTTPException, TypeError, ValueError, UnicodeError):
         return None
+
+
+def _device_signature_fields(request: Request) -> tuple[int, str, str]:
+    timestamp_raw = _writer_header(request, "X-Device-Timestamp")
+    nonce = _writer_header(request, "X-Device-Nonce")
+    signature = _writer_header(request, "X-Device-Signature")
+    try:
+        timestamp = int(timestamp_raw)
+    except ValueError as exc:
+        raise HTTPException(status_code=401, detail="device authorization required") from exc
+    return timestamp, nonce, signature
+
+
+def _resolve_device(state: CloudState, request: Request) -> Any:
+    """Resolve an active paired device; unknown and revoked are both ``None``."""
+    credential_id = request.headers.get("x-device-credential", "")
+    if not credential_id or len(credential_id) > 512:
+        return None
+    if not state.quotas.public_enabled:
+        return None
+    return state.credentials.resolve_device(credential_id)
+
+
+def _verify_device_request(
+    state: CloudState, request: Request, device: Any, body: bytes
+) -> bool:
+    """Verify a signed device envelope and consume its replay nonce.
+
+    Identical framing, freshness window, and replay guard to the writer path;
+    the algorithm still comes from the stored credential, never the request.
+    """
+    try:
+        timestamp, nonce, signature = _device_signature_fields(request)
+        now = state.config.clock()
+        if abs(now - timestamp) > _MAX_TIMESTAMP:
+            return False
+        namespace, _local_scope = _scope(device)
+        canonical = canonical_request(
+            request.method, request.url.path, namespace, timestamp, nonce,
+            digest_body(body), _REFRESH_IDEMPOTENCY_KEY, _REFRESH_REVISION,
+        )
+        if not verify_signature(
+            _credential_key(device), canonical, signature,
+            algorithm=getattr(device, "signature_algorithm", ""),
+        ):
+            return False
+        return bool(
+            state.nonces.accept(
+                namespace, getattr(device, "credential_id", ""), nonce, now=now
+            )
+        )
+    except (HTTPException, TypeError, ValueError, UnicodeError):
+        return False
 
 
 def _resolve_reader(state: CloudState, request: Request) -> Any:
@@ -389,6 +481,8 @@ def create_cloud_app(
                 "Authorization", "Content-Type", config.subscription_header,
                 "X-Writer-Credential", "X-Writer-Timestamp", "X-Writer-Nonce",
                 "X-Writer-Idempotency-Key", "X-Writer-Revision", "X-Writer-Signature",
+                "X-Device-Credential", "X-Device-Timestamp", "X-Device-Nonce",
+                "X-Device-Signature",
             ],
         )
 
@@ -445,6 +539,27 @@ def create_cloud_app(
                 public_key = bytes.fromhex(public_key_hex)
                 if len(public_key) != 32:
                     raise ValueError
+                # Optional: pair a rider device in the same operator-gated
+                # exchange.  The algorithm here selects how a *new* key is
+                # stored; it is never consulted when verifying a signature.
+                device_key_hex = payload.get("device_public_key")
+                device_algorithm = payload.get(
+                    "device_signature_algorithm", "ed25519"
+                )
+                device_key: bytes | None = None
+                if device_key_hex is not None:
+                    if (
+                        not isinstance(device_key_hex, str)
+                        or len(device_key_hex) > _MAX_DEVICE_KEY_HEX
+                        or not isinstance(device_algorithm, str)
+                        or device_algorithm not in DEVICE_SIGNATURE_ALGORITHMS
+                    ):
+                        raise ValueError
+                    # Shape-checked here, before the one-time invitation is
+                    # spent, so a wrong encoding costs a 400 and not a token.
+                    device_key = validate_public_key_shape(
+                        device_algorithm, bytes.fromhex(device_key_hex)
+                    )
             except (ValueError, TypeError, UnicodeDecodeError, json.JSONDecodeError, RecursionError):
                 return _error(400, "invalid enrollment request")
             try:
@@ -460,12 +575,25 @@ def create_cloud_app(
                     binding, signing_key=public_key,
                     enrollment_registry=state.enrollments,
                 )
-            except (ValueError, RuntimeError):
+                device = None
+                if device_key is not None:
+                    # Issued with the read capability only.  This is the one
+                    # place the initial grant is decided; no route infers
+                    # read-only from the credential's type.
+                    device = state.credentials.register_device_for_scope(
+                        writer.namespace,
+                        writer.local_user_scope,
+                        device_key,
+                        signature_algorithm=device_algorithm,
+                        capabilities=DEFAULT_DEVICE_CAPABILITIES,
+                        subject=subject,
+                    )
+            except (ValueError, RuntimeError, PublicKeyUnavailable):
                 return _not_found()
             context_token, _context = state.credentials.issue_reader_context_for_scope(
                 writer.namespace, writer.local_user_scope, subject
             )
-            return JSONResponse({
+            enrolled: dict[str, Any] = {
                 "credential": writer.credential_id,
                 "subscription_key": writer.subscription_key.decode("ascii"),
                 "signature_algorithm": writer.signature_algorithm,
@@ -474,6 +602,73 @@ def create_cloud_app(
                 # sign it but cannot choose or alter it.
                 "signing_namespace": writer.namespace,
                 "reader_context": context_token,
+            }
+            if device is not None:
+                enrolled.update({
+                    "device_credential": device.credential_id,
+                    "device_subscription_key": device.subscription_key.decode("ascii"),
+                    "device_signature_algorithm": device.signature_algorithm,
+                    "device_capabilities": sorted(device.capabilities),
+                })
+            return JSONResponse(enrolled, headers={"Cache-Control": "no-store"})
+
+        @app.post("/api/v1/context/refresh")
+        async def context_refresh(request: Request) -> Response:
+            """Trade a durable device credential for a fresh reader context.
+
+            Every authentication rejection -- unknown device, revoked device,
+            bad signature, stale timestamp, replayed nonce, wrong subject,
+            missing capability -- returns the identical 404 body and headers
+            as an unknown reader context, so nothing about credential state is
+            observable from the response.  The one non-404 outcome, a quota
+            refusal, is reachable only after the caller has already proven
+            possession of the device key.
+            """
+            if not _apim_proof_valid(state, request):
+                return _not_found()
+            subject = request.headers.get(config.verified_subject_header.lower(), "")
+            if not subject or len(subject) > 256:
+                return _not_found()
+            try:
+                body = await _bounded_body(request, _MAX_REFRESH_BODY_BYTES)
+            except HTTPException:
+                return _not_found()
+            device = _resolve_device(state, request)
+            if device is None:
+                return _not_found()
+            # Proof of possession first: capability and subject outcomes are
+            # only reachable by a caller that already holds the private key.
+            if not _verify_device_request(state, request, device, body):
+                return _not_found()
+            bound_subject = getattr(device, "subject", None)
+            if bound_subject is not None and not _safe_compare_text(
+                bound_subject, subject
+            ):
+                return _not_found()
+            if not _has_capability(device, "read"):
+                return _not_found()
+            try:
+                namespace, scope = _context_scope(device)
+            except ValueError:
+                return _not_found()
+            try:
+                # Each refresh persists a context record, so it is metered
+                # like any other read rather than being free.
+                state.quotas.admit_read(namespace, scope, response_bytes=0)
+            except QuotaExceeded as exc:
+                return _error(
+                    exc.status_code, "read quota exceeded", retry_after=exc.retry_after
+                )
+            try:
+                token, _context = state.credentials.issue_reader_context_for_scope(
+                    namespace, scope, bound_subject
+                )
+            except (ValueError, RuntimeError):
+                return _not_found()
+            return JSONResponse({
+                "reader_context": token,
+                "expires_in": READER_CONTEXT_TTL_SECONDS,
+                "capabilities": sorted(getattr(device, "capabilities", ())),
             }, headers={"Cache-Control": "no-store"})
 
         @app.get("/api/v1/context")
@@ -557,7 +752,9 @@ def create_cloud_app(
     if sync_enabled():
         @app.post("/api/v1/sync/batches")
         async def sync_batch(request: Request) -> Response:
-            writer = _writer_auth(state, request)
+            # The sync plane is a write route: capability is asserted, never
+            # inferred from which registry the credential came from.
+            writer = _writer_auth(state, request, capability="write")
             raw = await _bounded_body(request, config.max_request_bytes)
             verified = _verify_writer_request(state, request, writer, raw)
             if verified is None:
@@ -599,7 +796,9 @@ def create_cloud_app(
 
         @app.get("/api/v1/sync/status")
         async def sync_status(request: Request) -> Response:
-            writer = _writer_auth(state, request)
+            # The sync plane is a write route: capability is asserted, never
+            # inferred from which registry the credential came from.
+            writer = _writer_auth(state, request, capability="write")
             verified = _verify_writer_request(state, request, writer, b"")
             if verified is None:
                 return _error(401, "writer authorization required")

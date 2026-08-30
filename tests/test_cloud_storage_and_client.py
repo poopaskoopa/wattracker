@@ -235,7 +235,12 @@ def test_container_runtime_read_plane_does_not_open_replay_table(monkeypatch):
     assert app.state.cloud.store is sentinel
     assert app.state.cloud.credentials._backend is security_backend
     assert app.state.cloud.enrollments._backend is security_backend
-    assert app.state.cloud.nonces._backend is None
+    # The read plane still never opens CloudReplay -- its managed identity has
+    # no role there.  It does now claim replay nonces, because
+    # POST /api/v1/context/refresh is a signed route, and a process-local
+    # guard would re-open a captured refresh across a scale-to-zero restart.
+    # Those claims go to the CloudAuth table the read identity already writes.
+    assert app.state.cloud.nonces._backend is security_backend
     assert table_names == ["CloudAuth"]
     assert access_checks == [True]
     assert app.state.cloud.config.plane == "read"
