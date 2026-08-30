@@ -18,6 +18,12 @@ def client():
 
 
 def test_backup_route_requires_auth(client):
+    # Registered and logged straight back out: with no account at all the
+    # guard sends the visitor to the first-run wizard instead, which is a
+    # different assertion (tests/test_first_run.py). What this test is about
+    # is that the route refuses an unauthenticated caller.
+    client.post("/register", data={"username": "alice", "password": "password123"})
+    client.post("/logout")
     r = client.post("/settings/backup", follow_redirects=False)
     assert r.status_code == 303
     assert r.headers["location"] == "/login"

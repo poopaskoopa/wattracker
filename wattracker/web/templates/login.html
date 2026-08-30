@@ -3,6 +3,18 @@
 {% block content %}
 <h2>Log in</h2>
 
+{#- A fresh install has no account to log in to, so this form cannot work yet.
+    Rather than let the rider guess at the "Create one" link below, say plainly
+    that setup has not happened and point at the wizard that does it. The page
+    still renders (and still answers 200) because the URL is reached by more
+    than first-time riders - bookmarks, the tray window, the trusted-host
+    checks - and a redirect would change what all of those see. -#}
+{% if first_run %}
+<p>This install has not been set up yet, so there is no account to sign in
+   with. <a href="/welcome">Start here</a> and the wizard will create one and
+   take you through the rest.</p>
+{% endif %}
+
 {% if error %}<p class="alert">{{ error }}</p>{% endif %}
 
 <form method="post" action="/login" class="auth-form">

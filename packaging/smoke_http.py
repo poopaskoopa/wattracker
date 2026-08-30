@@ -95,6 +95,18 @@ def assert_ui_renders(opener, base) -> None:
     if 'name="password"' not in register:
         raise AssertionError("register page did not render its form")
 
+    # The first-run wizard, checked here because this is the only smoke that
+    # ever sees an install with no account - every caller registers one on the
+    # next line. It is what a new user actually opens, so a welcome.html left
+    # out of the frozen template tree would break the whole first five minutes
+    # while /login and /register both kept answering 200.
+    welcome = get_text(opener, base + "/welcome")
+    for marker in ('<form method="post" action="/welcome"', 'name="username"'):
+        if marker not in welcome:
+            raise AssertionError(
+                f"first-run wizard did not render expected markup: {marker!r}"
+            )
+
 
 def register_user(opener, base, username="smokeuser", password="password123") -> None:
     request(opener, base + "/register", {"username": username, "password": password})

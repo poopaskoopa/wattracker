@@ -1880,3 +1880,153 @@ def test_muting_the_slider_programs_silence_without_an_illegal_ramp(
         "throw rather than be silent")
 
     _assert_clean(console_errors, "/ride muted cue gain")
+
+
+# ------------------------------------------------------------- first run
+# The one journey in the app that a new user cannot be helped through: they are
+# alone with whatever the browser renders. It is also the journey the rest of
+# this module cannot exercise, because every other fixture here begins by
+# creating an account over HTTP - so a wizard that rendered but did not
+# actually advance, or a form that silently failed to sign anyone in, would
+# leave the whole suite green. These drive it the way a person would.
+
+
+@pytest.fixture()
+def fresh_server():
+    """The app on a real port with an EMPTY database - a just-installed server.
+
+    Deliberately not a variant of `live_server`: that fixture registers an
+    account through /register before yielding, which is exactly the state this
+    is testing the absence of.
+    """
+    db.init_db()
+    app = create_app()
+    port = _free_port()
+    config = uvicorn.Config(app, host="127.0.0.1", port=port, log_level="warning")
+    server = uvicorn.Server(config)
+    thread = threading.Thread(target=server.run, daemon=True)
+    thread.start()
+    deadline = time.time() + 20
+    while not server.started:
+        if time.time() > deadline:
+            raise RuntimeError("uvicorn did not start")
+        time.sleep(0.05)
+    try:
+        yield f"http://127.0.0.1:{port}"
+    finally:
+        server.should_exit = True
+        thread.join(timeout=10)
+
+
+@pytest.fixture()
+def anonymous_page(browser, fresh_server):
+    """A browser that has never logged in, pointed at a fresh install."""
+    context = browser.new_context(viewport={"width": 1400, "height": 1000})
+    pg = context.new_page()
+    errors = []
+    pg._wt_errors = errors
+    pg.on("console", lambda m: errors.append(f"console.{m.type}: {m.text}")
+          if m.type == "error" else None)
+    pg.on("pageerror", lambda e: errors.append(f"pageerror: {e}"))
+    pg.on("requestfailed",
+          lambda r: errors.append(f"requestfailed: {r.url} {r.failure}"))
+    try:
+        yield pg
+    finally:
+        context.close()
+
+
+def test_a_fresh_install_walks_a_real_browser_through_creating_an_account(
+    anonymous_page, fresh_server
+):
+    """Open the app, end up signed in and inside the setup wizard.
+
+    Asserted end to end in the browser because every intermediate step is one
+    a person has to survive unaided: the redirect off "/", the form, the
+    session that must already exist on the next page, and the wizard picking up
+    at step 2 instead of restarting the count.
+    """
+    page = anonymous_page
+    page.goto(fresh_server + "/")
+    page.wait_for_load_state("networkidle")
+
+    # Landed in the wizard, not on a login form that cannot work yet.
+    assert page.url.endswith("/welcome"), page.url
+    assert page.locator("text=Step 1 of 5").is_visible()
+
+    page.fill("input[name=username]", "firstrider")
+    page.fill("input[name=password]", "password123")
+    page.click("button[type=submit]")
+    page.wait_for_load_state("networkidle")
+
+    # Straight on into the existing wizard, already signed in: no second login,
+    # and the nav (which only renders for a session with a username) is there.
+    assert page.url.endswith("/setup"), page.url
+    assert "/login" not in page.url
+    assert page.locator("nav .user").inner_text() == "firstrider"
+
+    # One continuous run: the account was step 1, so weight is step 2 of 5.
+    assert page.locator("#setup-progress").inner_text() == "Step 2 of 5"
+    assert page.locator('[data-setup-step="1"] h4 span').inner_text() == "2"
+
+    _assert_clean(anonymous_page._wt_errors, "/welcome -> /setup")
+
+
+def test_the_first_run_wizard_actually_advances_in_the_browser(
+    anonymous_page, fresh_server
+):
+    """The steps really are steps: one shows at a time and Continue moves on.
+
+    Asserted on what the browser does - which section is visible, what the
+    progress line says - rather than on the template source, because the step
+    JS is the part of this that a source-string test cannot see failing.
+    """
+    page = anonymous_page
+    page.goto(fresh_server + "/welcome")
+    page.fill("input[name=username]", "firstrider")
+    page.fill("input[name=password]", "password123")
+    page.click("button[type=submit]")
+    page.wait_for_load_state("networkidle")
+
+    weight = page.locator('[data-setup-step="1"]')
+    folder = page.locator('[data-setup-step="2"]')
+    assert weight.is_visible()
+    assert folder.is_hidden(), "two wizard steps were on screen at once"
+
+    page.fill("#setup-weight", "72")
+    page.locator('[data-setup-step="1"] [data-setup-next]').click()
+
+    assert folder.is_visible()
+    assert weight.is_hidden()
+    # Numbering stays on the first-run scale after the step change, which is
+    # where a naive `index + 1` progress line would silently disagree with the
+    # heading beside it.
+    assert page.locator("#setup-progress").inner_text() == "Step 3 of 5"
+    assert page.locator('[data-setup-step="2"] h4 span').inner_text() == "3"
+
+    _assert_clean(anonymous_page._wt_errors, "first-run wizard step change")
+
+
+def test_the_wizard_is_gone_once_the_install_has_an_account(
+    anonymous_page, fresh_server
+):
+    """Second visitor, same server: ordinary login, no interception.
+
+    The same browser that was walked through setup above gets the plain login
+    page here, because the difference is the state of the install and not
+    anything remembered about the client.
+    """
+    page = anonymous_page
+    page.goto(fresh_server + "/welcome")
+    page.fill("input[name=username]", "firstrider")
+    page.fill("input[name=password]", "password123")
+    page.click("button[type=submit]")
+    page.wait_for_load_state("networkidle")
+
+    page.context.clear_cookies()  # the same browser, now with no session
+    page.goto(fresh_server + "/")
+    page.wait_for_load_state("networkidle")
+
+    assert page.url.endswith("/login"), page.url
+    assert page.locator("input[name=password]").is_visible()
+    assert "has not been set up yet" not in page.content()

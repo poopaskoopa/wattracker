@@ -125,6 +125,11 @@ def _register(client, username="rider", password="password123"):
 
 
 def test_volume_page_auth_gated(client):
+    # Registered and logged straight back out: on an install with no account at
+    # all the guard sends the visitor to the first-run wizard instead
+    # (tests/test_first_run.py). What this asserts is that the page is gated.
+    _register(client)
+    client.post("/logout")
     r = client.get("/volume", follow_redirects=False)
     assert r.status_code == 303
     assert r.headers["location"] == "/login"

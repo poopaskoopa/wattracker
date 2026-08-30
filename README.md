@@ -121,8 +121,16 @@ Windows Documents, OneDrive consumer/commercial Documents,
 candidates. Settings and `WATTRACKER_ACTIVITIES_DIR`,
 `WATTRACKER_WORKOUTS_DIR`, or `WATTRACKER_ZWIFT_WORKOUTS_ROOT` override discovery.
 
-On first visit you are redirected to `/login`; create an account at `/register`
-(username + password, min 8 chars). Each account sees only its own data.
+On the first visit to a new install there is no account yet, so you are taken
+to the setup wizard at `/welcome`. It asks for a username and password (min 8
+chars), signs you in with that same submission, and carries straight on into
+the rest of setup — weight, your Zwift Activities folder, FTP, and ZwiftPower
+if you use it. There is no second log in and nothing to copy from a console.
+
+After that first account exists the wizard stops appearing: `/login` signs you
+in, and `/register` adds further accounts only when
+`WATTRACKER_ALLOW_REGISTRATION` says so (see below). Each account sees only its
+own data.
 
 ### macOS
 
@@ -433,12 +441,18 @@ A phone with a randomized MAC and a fresh DHCP lease is simply a browser, and
 pairing a connector stores only the label you typed.
 
 **3. Decide who may create an account.** Once the port is reachable from the
-network, `/register` is reachable from the network, and it is the one page that
-does not ask who you are — it cannot, because it is how the first account gets
-made. So it closes itself as soon as there is something to protect:
+network, so are `/welcome` and `/register` — the two pages that cannot ask who
+you are, because between them they are how the first account gets made. They
+close themselves as soon as there is something to protect:
 
-- **No accounts yet** → registration is open. That is how you set the server
-  up, and nothing else works until you have.
+- **No accounts yet** → the first-run wizard at `/welcome` is open, and so is
+  `/register`. That is how you set the server up, and nothing else works until
+  you have. Set the first account up before you expose the port: on a LAN-bound
+  install with no account, whoever reaches it first can claim it. A default
+  install binds loopback only, so this is a decision you make deliberately by
+  setting `WATTRACKER_ALLOW_NON_LOOPBACK`, not something that happens to you.
+- **An account exists** → `/welcome` is gone entirely; it is the first-run
+  route, not a sign-up route.
 - **At least one account** → registration is refused unless you say otherwise:
 
 ```sh

@@ -116,6 +116,21 @@ the DMG built afterwards carries it. For the finished DMG, it submits the disk
 image directly, staples its ticket, and finally asserts with `stapler validate`
 and `spctl --assess`.
 
+## First run
+
+A freshly installed app has no account, so the first thing a new user sees is
+the setup wizard at `/welcome`: it creates the account, signs them in with the
+same request, and continues into the existing weight/folder/FTP/ZwiftPower
+steps. Once an account exists nothing intercepts - `/login` signs in and
+`/register` is governed by `WATTRACKER_ALLOW_REGISTRATION` as before.
+
+**Everything the first run needs is in the browser page.** That is a packaging
+constraint, not a UI preference: a Finder-launched `.app` has no terminal, and
+macOS discards its stdout. Nothing printed to the console on first start can be
+assumed to have been read - not an instruction, not a warning, not a value the
+user is expected to copy. Anything a first-time user must act on has to reach
+them through a page they can already see.
+
 ## Smoke test
 
 `packaging/smoke_frozen_macos.py` is the macOS counterpart of
@@ -212,6 +227,18 @@ and *was* fixable, has been moved off argv entirely.
   prompt and an actual trainer connection from inside the `.app` have not been
   exercised - the smoke test only proves bleak and its CoreBluetooth backend
   import.
+- **A Finder launch has no readable console, and the smoke test hides it.**
+  `packaging/smoke_frozen_macos.py` starts the bundle with `open --stdout`,
+  which redirects exactly the output a double-click throws away - so a green
+  macOS smoke run proves nothing about what a user launching from Finder can
+  actually see. Any first-run affordance whose correctness depends on being
+  read is therefore untested by that job, which is why the first run is
+  entirely in-browser (see "First run" above).
+- **How a Finder-launched app tells the user its URL is unresolved.** With
+  stdout discarded there is currently no in-app path from a double-click to
+  "open http://127.0.0.1:8000". This predates the first-run wizard and is not
+  addressed by it; it is recorded here so it is not rediscovered as a wizard
+  bug.
 - **The `open --env` isolation is macOS-version dependent.** It works on current
   macOS; on an older release without that flag the LaunchServices half of the
   smoke test would run against the real `HOME`, which is why it must never be

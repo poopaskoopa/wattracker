@@ -670,6 +670,12 @@ def test_rotating_from_the_ui_kills_the_old_url(client):
 
 
 def test_feed_generation_requires_a_session(client):
+    # Registered and logged straight back out: with no account at all the
+    # guard sends the visitor to the first-run wizard instead, which is a
+    # different assertion (tests/test_first_run.py). What this test is about
+    # is that the route refuses an unauthenticated caller.
+    _register(client)
+    client.post("/logout")
     r = client.post("/settings/calendar-feed", follow_redirects=False)
     assert r.status_code == 303
     assert r.headers["location"] == "/login"

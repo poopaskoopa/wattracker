@@ -149,6 +149,12 @@ def test_revoke_via_the_settings_page(client):
 
 def test_pairing_requires_a_session(client):
     # No login: AuthMiddleware redirects rather than pairing anything.
+    # Registered and logged straight back out: with no account at all the
+    # guard sends the visitor to the first-run wizard instead, which is a
+    # different assertion (tests/test_first_run.py). What this test is about
+    # is that the route refuses an unauthenticated caller.
+    _register(client)
+    client.post("/logout")
     response = client.post(
         "/settings/connector", data={"label": "Zwift PC"}, follow_redirects=False
     )
