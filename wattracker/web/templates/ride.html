@@ -2192,6 +2192,10 @@
             setLive(status, saved, "success");
             rampTestActivityId = null;
             accept.hidden = true;
+            if (rampTestDialog) {
+                if (typeof rampTestDialog.close === "function") rampTestDialog.close();
+                else rampTestDialog.removeAttribute("open");
+            }
         } catch (error) {
             setLive(status, "Could not save the new FTP.", "failure");
             accept.disabled = false;
