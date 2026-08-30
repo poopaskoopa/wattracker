@@ -10,11 +10,25 @@ from pathlib import Path
 from typing import Iterator, Optional
 from urllib.parse import quote
 
-from .models import CloudObject, MAX_BATCH_OBJECTS, SyncBatch
+from ..db import _correction_ranges, _effective_stream_mapping
+from .models import CloudObject, MAX_BATCH_OBJECTS, ModelError, SyncBatch
 
 
 class SnapshotError(RuntimeError):
     """The local database could not be opened as a read-only snapshot."""
+
+
+def _reject_json_constant(value: str) -> None:
+    raise ValueError(f"non-standard JSON constant: {value}")
+
+
+def _correction_schema_available(conn: sqlite3.Connection) -> bool:
+    required = {"activity_id", "user_id", "start_index", "end_index", "undone_at"}
+    columns = {
+        row["name"]
+        for row in conn.execute("PRAGMA table_info(power_sample_corrections)")
+    }
+    return required <= columns
 
 
 @contextmanager
@@ -78,12 +92,23 @@ def snapshot_objects(
         raise ValueError("limit is out of bounds")
     result: list[CloudObject] = []
     with readonly_connection(path) as conn:
+        activity_columns = {
+            row["name"] for row in conn.execute("PRAGMA table_info(activities)")
+        }
+        duplicate_filter = (
+            " AND duplicate_of IS NULL" if "duplicate_of" in activity_columns else ""
+        )
         rows = conn.execute(
             "SELECT id, start_time, duration_s, distance_m, avg_power, avg_hr, "
             "np, if_, tss, rpe, streams FROM activities "
-            "WHERE user_id = ? ORDER BY id LIMIT ?",
+            f"WHERE user_id = ?{duplicate_filter} ORDER BY id LIMIT ?",
             (user_id, limit),
         ).fetchall()
+        ranges = {}
+        if include_streams and _correction_schema_available(conn):
+            ranges = _correction_ranges(
+                conn, user_id, [int(row["id"]) for row in rows]
+            )
         for row in rows:
             data = {
                 key: row[key]
@@ -124,19 +149,39 @@ def snapshot_objects(
                     ):
                         raise ValueError("stream snapshot is invalid or too large")
                     decoded = b"".join(decoded_parts)
-                    stream_data = json.loads(decoded.decode("utf-8"))
-                    if len(json.dumps(stream_data, separators=(",", ":")).encode()) <= 512 * 1024:
+                    stream_data = json.loads(
+                        decoded.decode("utf-8"), parse_constant=_reject_json_constant
+                    )
+                    if isinstance(stream_data, dict):
+                        stream_data = _effective_stream_mapping(
+                            stream_data, ranges.get(int(row["id"]), [])
+                        )
+                    if len(
+                        json.dumps(stream_data, separators=(",", ":")).encode()
+                    ) <= 512 * 1024:
                         data["streams"] = stream_data
-                except (TypeError, ValueError, UnicodeDecodeError, zlib.error, RecursionError):
+                except (
+                    TypeError, ValueError, UnicodeDecodeError, zlib.error, RecursionError
+                ):
                     pass
-            result.append(
-                CloudObject(
+            try:
+                obj = CloudObject(
                     object_id=f"activity-{int(row['id'])}",
                     kind="activity",
                     revision=max(1, int(row["id"])),
                     data=data,
                 )
-            )
+            except ModelError:
+                if "streams" not in data:
+                    raise
+                data.pop("streams")
+                obj = CloudObject(
+                    object_id=f"activity-{int(row['id'])}",
+                    kind="activity",
+                    revision=max(1, int(row["id"])),
+                    data=data,
+                )
+            result.append(obj)
     return result
 
 

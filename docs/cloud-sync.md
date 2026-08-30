@@ -111,6 +111,19 @@ are unaffected.` and never blocks local rides, planning, import, or export.
 Pairing is explicit and revocable; local data is not deleted because cloud sync
 is unavailable.
 
+Publisher audit: activity summary fields (`start_time`, duration, distance,
+power/heart-rate summaries, NP, IF, TSS, and activity RPE) match the local
+activity read summary; hidden duplicate rides are excluded; stream power uses
+the active correction ranges used by local activity reads; and no weight is
+published (weight is resolved at read time for display/scaling only). Filename,
+local IDs, and other local-only fields are intentionally excluded from the
+cloud payload. History cutoffs and dirty/republish tracking remain out of
+scope for #173 (#172 and #157).
+Legacy read-only snapshots without `duplicate_of` retain all activities, and
+snapshots without a complete correction table publish streams without masking.
+The payload validator permits up to 16,384 array items for realistic long
+streams; the existing 512 KiB object and decompression limits still apply.
+
 The deployed container entrypoint is `python -m wattracker.cloud.runtime`. It
 constructs `AzureTenantStore` with managed identity and private Blob/Table
 endpoints; shared credential/context state is persisted in the separate

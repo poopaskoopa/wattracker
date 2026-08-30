@@ -1447,11 +1447,10 @@ def _correction_ranges(
     return grouped
 
 
-def _effective_streams(blob: Optional[bytes], ranges: Sequence[tuple]) -> Dict[str, list]:
-    """Inflate streams and mask corrected power samples without mutating storage."""
-    streams = _unpack_streams(blob)
-    if not isinstance(streams, dict):
-        return streams
+def _effective_stream_mapping(
+    streams: Dict[str, list], ranges: Sequence[tuple]
+) -> Dict[str, list]:
+    """Mask corrected power samples in decoded streams without mutating storage."""
     power = streams.get("power")
     if not isinstance(power, list) or not ranges:
         return streams
@@ -1463,6 +1462,16 @@ def _effective_streams(blob: Optional[bytes], ranges: Sequence[tuple]) -> Dict[s
             masked[lo:hi + 1] = [None] * (hi - lo + 1)
     streams["power"] = masked
     return streams
+
+
+def _effective_streams(
+    blob: Optional[bytes], ranges: Sequence[tuple]
+) -> Dict[str, list]:
+    """Inflate streams and mask corrected power samples without mutating storage."""
+    streams = _unpack_streams(blob)
+    if not isinstance(streams, dict):
+        return streams
+    return _effective_stream_mapping(streams, ranges)
 
 
 def _activity_correction_ranges(
