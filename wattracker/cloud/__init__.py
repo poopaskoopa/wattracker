@@ -24,6 +24,19 @@ from .security import (
     MemorySecurityStateBackend,
     SecurityStateUnavailable,
 )
+# The operator surface for the budget kill switch.  #169's CLI is the intended
+# caller; these take a state backend rather than a running app so the switch
+# can be thrown and cleared while every replica is scaled to zero.
+from .limits import (
+    KILL_SWITCH_TTL_SECONDS,
+    KillSwitchState,
+    KillSwitchUnavailable,
+    clear_kill_switch,
+    disable_public_api,
+    disable_writes,
+    read_kill_switch,
+    set_kill_switch,
+)
 
 __all__ = [
     "CloudConfig",
@@ -37,10 +50,18 @@ __all__ = [
     "SyncBatch",
     "SyncCredentials",
     "SyncResult",
+    "clear_kill_switch",
     "create_cloud_app",
+    "disable_public_api",
+    "disable_writes",
     "https_transport",
     "KeyringBackend",
+    "KILL_SWITCH_TTL_SECONDS",
+    "KillSwitchState",
+    "KillSwitchUnavailable",
     "MemorySecurityStateBackend",
+    "read_kill_switch",
+    "set_kill_switch",
     "profile_batch",
     "profile_object",
     "SecurityStateUnavailable",
