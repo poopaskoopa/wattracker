@@ -22,7 +22,14 @@ from ..metrics.decoupling import aerobic_decoupling
 from ..metrics.load import compute_load, daily_tss_series
 from ..prescribe import goals
 from ..timeutil import parse_naive, to_user_timezone, utc_now
-from .models import CloudObject, MAX_BATCH_OBJECTS, ModelError, SyncBatch
+from .models import (
+    MAX_BATCH_OBJECTS,
+    MAX_PAYLOAD_ARRAY_ITEMS,
+    MAX_PAYLOAD_BYTES,
+    CloudObject,
+    ModelError,
+    SyncBatch,
+)
 
 DETAIL_MAX_POINTS = 1500
 MAX_STREAM_DECODED = 512 * 1024
@@ -178,13 +185,14 @@ def _downsample(values: Any, target: int = DETAIL_MAX_POINTS) -> list:
 
 def _activity_rows(
     conn: sqlite3.Connection, user_id: int, settings: Mapping[str, Any],
-    *, decode: bool,
+    *, decode: bool, chronological: bool,
 ) -> list[dict]:
     columns = {row["name"] for row in conn.execute("PRAGMA table_info(activities)")}
     duplicate_filter = " AND duplicate_of IS NULL" if "duplicate_of" in columns else ""
+    order_by = "start_time ASC, id ASC" if chronological else "id ASC"
     rows = conn.execute(
         "SELECT * FROM activities WHERE user_id = ?"
-        f"{duplicate_filter} ORDER BY start_time ASC, id ASC",
+        f"{duplicate_filter} ORDER BY {order_by}",
         (user_id,),
     ).fetchall()
     ids = [int(row["id"]) for row in rows]
@@ -565,6 +573,91 @@ def _standalone_payload(row: sqlite3.Row) -> dict:
         }
 
 
+def _calendar_day_objects(
+    day: str,
+    workouts: Sequence[Mapping[str, Any]],
+    activities: Sequence[Mapping[str, Any]],
+    race: Optional[Mapping[str, Any]],
+    in_ooto: bool,
+    phase: Optional[str],
+) -> list[CloudObject]:
+    """Build one day, splitting unusually high-cardinality days safely."""
+    base = {
+        "date": day,
+        "race": race,
+        "ooto": in_ooto,
+        "phase": phase,
+    }
+    chunks: list[tuple[list[dict], list[dict]]] = []
+    current_workouts: list[dict] = []
+    current_activities: list[dict] = []
+
+    def _json_size(value: Any) -> int:
+        return len(json.dumps(
+            value, separators=(",", ":"), ensure_ascii=False, allow_nan=False
+        ).encode("utf-8"))
+
+    # Size is additive because the two variable fields are JSON arrays. Keep a
+    # small reserve for the part metadata added when a day is split.
+    current_size = _json_size({
+        **base, "workouts": [], "activities": [],
+    })
+
+    for key, item in (
+        [("workouts", value) for value in workouts]
+        + [("activities", value) for value in activities]
+    ):
+        item = _safe_data(dict(item))
+        target = current_workouts if key == "workouts" else current_activities
+        increment = _json_size(item) + (1 if target else 0)
+        if (
+            (current_workouts or current_activities)
+            and (
+                current_size + increment > MAX_PAYLOAD_BYTES - 128
+                or len(target) >= MAX_PAYLOAD_ARRAY_ITEMS
+            )
+        ):
+            chunks.append((current_workouts, current_activities))
+            current_workouts = []
+            current_activities = []
+            current_size = _json_size({
+                **base, "workouts": [], "activities": [],
+            })
+            target = current_workouts if key == "workouts" else current_activities
+            increment = _json_size(item)
+        target.append(item)
+        current_size += increment
+
+    if current_workouts or current_activities or not chunks:
+        chunks.append((current_workouts, current_activities))
+
+    total = len(chunks)
+    objects = []
+    for index, (day_workouts, day_activities) in enumerate(chunks, start=1):
+        data = {
+            **base,
+            "workouts": day_workouts,
+            "activities": day_activities,
+        }
+        if total > 1:
+            data["part"] = index
+            data["parts"] = total
+        object_id = (
+            f"calendar-day-{day}"
+            if total == 1
+            else f"calendar-day-{day}-part-{index}"
+        )
+        objects.append(
+            CloudObject(
+                object_id=object_id,
+                kind="calendar_day",
+                revision=1,
+                data=_safe_data(data),
+            )
+        )
+    return objects
+
+
 def _calendar_objects(
     conn: sqlite3.Connection,
     user_id: int,
@@ -711,23 +804,14 @@ def _calendar_objects(
 
     objects = []
     for day in sorted(dates):
-        in_ooto = any(
-            item.get("start_date", "") <= day <= item.get("end_date", "")
-            for item in ooto
-        )
-        objects.append(
-            CloudObject(
-                object_id=f"calendar-day-{day}",
-                kind="calendar_day",
-                revision=1,
-                data=_safe_data({
-                    "date": day,
-                    "workouts": workouts_by_date.get(day, []),
-                    "activities": activities_by_date.get(day, []),
-                    "race": races.get(day),
-                    "ooto": in_ooto,
-                    "phase": phase_by_date.get(day),
-                }),
+        objects.extend(
+            _calendar_day_objects(
+                day,
+                workouts_by_date.get(day, []),
+                activities_by_date.get(day, []),
+                races.get(day),
+                _in_ooto(day),
+                phase_by_date.get(day),
             )
         )
     return objects
@@ -957,6 +1041,7 @@ def snapshot_objects(
         records = _activity_rows(
             conn, user_id, _settings(conn, user_id),
             decode=(include_streams or derived_enabled),
+            chronological=derived_enabled,
         )
         derived_objects: list[CloudObject] = []
         if derived_enabled:

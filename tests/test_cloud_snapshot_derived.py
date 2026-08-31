@@ -2,10 +2,16 @@
 
 import datetime as dt
 import json
+import sqlite3
 
 from wattracker import db
 from wattracker.cloud.models import SyncBatch
-from wattracker.cloud.snapshot import DETAIL_MAX_POINTS, snapshot_batch, snapshot_objects
+from wattracker.cloud.snapshot import (
+    DETAIL_MAX_POINTS,
+    _calendar_day_objects,
+    snapshot_batch,
+    snapshot_objects,
+)
 
 
 def _activity(path, user_id, number, start_time, seconds=3000):
@@ -154,6 +160,25 @@ def test_snapshot_publishes_newest_activity_first(tmp_path):
     assert [obj.object_id for obj in activities] == ["activity-2", "activity-1"]
 
 
+def test_legacy_snapshot_preserves_activity_id_order(tmp_path):
+    path, user_id = _fixture_db(tmp_path)
+    conn = db.connect(str(path))
+    try:
+        conn.execute(
+            "UPDATE activities SET start_time = CASE id "
+            "WHEN 1 THEN '2026-08-22T10:00:00' "
+            "WHEN 2 THEN '2026-08-20T10:00:00' END "
+            "WHERE user_id = ? AND id IN (1, 2)",
+            (user_id,),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    objects = snapshot_objects(path, user_id, include_derived=False)
+    assert [obj.object_id for obj in objects] == ["activity-1", "activity-2"]
+
+
 def test_stream_objects_publish_effective_corrected_samples(tmp_path):
     path, user_id = _fixture_db(tmp_path)
     activity_id = _activity(path, user_id, 3, "2026-08-22T10:00:00", seconds=10)
@@ -194,4 +219,48 @@ def test_activity_detail_uses_stored_date_for_ftp_history(tmp_path):
     assert detail.data["zones"]["power"]["anchor"] == 200.0
     assert detail.data["zones"]["power"]["source"] == (
         "Training FTP as of 2026-01-01"
+    )
+
+
+def test_high_cardinality_calendar_day_is_chunked(tmp_path):
+    path = tmp_path / "dense.db"
+    db.init_db(str(path))
+    user_id = db.create_user("dense", "not-a-password", path=str(path))
+    db.save_user_settings(user_id, {"ftp": 240}, path=str(path))
+    conn = sqlite3.connect(path)
+    conn.executemany(
+        "INSERT INTO activities "
+        "(user_id, dedup_hash, filename, start_time, duration_s, "
+        "distance_m, avg_power, avg_hr, np, if_, tss, streams) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        [
+            (user_id, f"dense-{index}", "dense.fit", "2026-08-01T10:00:00",
+             60, 1000, 100, 120, 100, 0.4, 1, None)
+            for index in range(6000)
+        ],
+    )
+    conn.commit()
+    conn.close()
+
+    first_page = snapshot_objects(path, user_id, limit=1)
+    assert [obj.object_id for obj in first_page] == ["activity-6000"]
+    derived_page = snapshot_objects(path, user_id, limit=1000, offset=12000)
+    calendars = [obj for obj in derived_page if obj.kind == "calendar_day"]
+    assert len(calendars) > 1
+    assert all(
+        len(json.dumps(obj.data, separators=(",", ":")).encode()) <= 512 * 1024
+        for obj in calendars
+    )
+
+
+def test_calendar_chunking_checks_combined_workouts_and_activities_size():
+    workouts = [{"name": "x" * 32_750} for _ in range(16)]
+    activities = [{"id": 1, "activity": True}]
+    objects = _calendar_day_objects(
+        "2026-08-01", workouts, activities, None, False, None,
+    )
+    assert len(objects) > 1
+    assert all(
+        len(json.dumps(obj.data, separators=(",", ":")).encode()) <= 512 * 1024
+        for obj in objects
     )
