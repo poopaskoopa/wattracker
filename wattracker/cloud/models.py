@@ -17,6 +17,9 @@ MAX_KIND_LENGTH = 64
 MAX_BATCH_ID_LENGTH = 128
 MAX_PAYLOAD_BYTES = 512 * 1024
 MAX_BATCH_REVISION = (1 << 63) - 1
+# The derived snapshot stream object is downsampled to 1,500 points. Keep the
+# larger bound for the pre-existing opt-in raw-stream snapshot API, whose
+# callers still need to round-trip effective legacy streams unchanged.
 MAX_PAYLOAD_ARRAY_ITEMS = 16_384
 
 _OPAQUE_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._~-]{0,127}$")
