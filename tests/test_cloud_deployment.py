@@ -29,10 +29,22 @@ def test_apim_uses_vnet_and_does_not_claim_client_certificate_authentication():
     assert "X-APIM-Request-Proof" in BICEP
 
 
-def test_production_app_limits_are_documented_as_best_effort_and_apim_is_durable():
+def test_production_app_limits_are_documented_as_durable_not_best_effort():
+    """The app's daily counters are the cost control, not a backstop.
+
+    #164 removes the gateway whose `quota-by-key` policy used to be the only
+    durable limit, so the runbook must not still tell an operator that the
+    app-side counters reset on every replica change -- they do not, and an
+    operator who believes they do has no reason to trust any of them.
+    """
+
     assert "name: 'CloudReplay'" in BICEP
     assert "replay-writer" in BICEP
-    assert "best-effort process-local" in RUNBOOK
+    assert "best-effort" not in RUNBOOK
+    assert "**The app-side daily quota counters are durable.**" in RUNBOOK
+    assert "refuses a non-durable quota manager at boot" in RUNBOOK
+    # The gateway policies stay documented while the gateway exists; what
+    # changed is that the app no longer depends on them.
     assert '<quota-by-key calls="1000" renewal-period="86400"' in BICEP
     assert '<rate-limit-by-key calls="60" renewal-period="60"' in BICEP
 
