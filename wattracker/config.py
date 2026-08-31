@@ -111,24 +111,22 @@ def _acl_needs_reset(icacls: str, path: str, spawn: dict) -> bool:
     the one direction this must not fail in - so the SIDs are walked separately
     until a real Windows box says otherwise.
 
-    WHAT SIGNAL IS READ, and why not the exit code. ``/findsid`` is a REPORTING
-    verb, in the same syntax group as ``/save`` and ``/verify``: the reference
-    defines it as "finds all matching files that contain a DACL explicitly
-    mentioning the specified SID", and finding none is not a failure - nothing
-    failed to process - so icacls exits 0 whether or not the SID is there. A
-    returncode-only check would therefore make the reset either NEVER run or
-    ALWAYS run, which is the single most likely way to get this wrong. The
-    answer is on STDOUT: a match prints the matching path on its own line ahead
-    of the "Successfully processed N files" summary, a miss prints the summary
-    alone. So the read is "did stdout say anything beyond one summary line".
+    WHAT SIGNAL IS READ, and why not the exit code. ``/findsid`` is a
+    REPORTING verb: finding nothing is not a failure, so icacls exits 0 either
+    way. The answer is on stdout.
 
-    Deliberately NOT matched against the summary's wording: that string is
-    localised (a known source of false failures in other tools that parse it),
-    while a path echoed back is not. Two independent tells are OR'd, because
-    each covers the other's blind spot - the line COUNT survives a mojibake
-    decode of a non-ASCII path, and the path ECHO survives a summary line that
-    is missing or wraps. Only stdout of exactly one non-blank line that does not
-    name the path is read as a clean miss.
+    MEASURED on Windows 11 build 26100, because this shape was reasoned wrong
+    once and the gate it feeds never fired: a hit and a miss BOTH print two
+    non-blank lines - "SID Found: <path>." or "No files with a matching SID was
+    found", each above the summary. So the line count separates nothing and the
+    echoed path is the only tell; a count outside 1-2 lines is a shape this
+    probe has never seen, and resets.
+
+    The echo is read rather than the miss wording, which is localised. It is
+    trusted only for an ASCII path: icacls writes the OEM codepage and
+    ``text=True`` decodes the ANSI one, so outside ASCII a mangled echo would
+    read as a clean miss - the one direction this must not fail in. A
+    non-ASCII path resets without probing.
 
     FAIL TOWARD RESETTING. Every other outcome - a raise, a timeout, a non-zero
     exit, anything on stderr, output of an unexpected shape, stdout that was not
@@ -137,14 +135,17 @@ def _acl_needs_reset(icacls: str, path: str, spawn: dict) -> bool:
     place; resetting is what the code did before the probe, so True is never
     worse than the status quo. Probing stops at the first SID answering True.
 
-    NOT VERIFIED ON WINDOWS: everything above about icacls's output and exit
-    code is reasoned from Microsoft's icacls reference and its documented
-    grammar. This was written on macOS and no icacls has been executed. Note in
-    particular that the reference's grammar admits exactly ONE ``/findsid Sid``
-    per invocation, which is why this walks the SIDs in separate spawns instead
-    of naming all three at once; if a repeated ``/findsid`` is ever confirmed to
-    OR them, this collapses to a single spawn. No ``/T``: only this path.
+    VERIFIED ON WINDOWS 11 (build 26100): the two shapes above, exit 0 and an
+    empty stderr for both, and that ``/findsid`` matches an INHERITED ace as
+    well as an explicit one - so a relocated db under a permissive parent
+    probes as exposed, which is what the reset is for. The SIDs are still
+    walked in separate spawns: the reference admits one ``/findsid Sid`` per
+    invocation. No ``/T``: only this path.
     """
+    if not path.isascii():
+        # The echo is the only tell and it is unreadable across the OEM/ANSI
+        # codepage gap. Reset rather than misread a mangled one as clean.
+        return True
     for sid in _FOREIGN_SIDS:
         try:
             proc = subprocess.run([icacls, path, "/findsid", sid], **spawn)
@@ -156,9 +157,9 @@ def _acl_needs_reset(icacls: str, path: str, spawn: dict) -> bool:
         if not isinstance(out, str) or err:
             return True  # nothing readable, or icacls complained: inconclusive
         lines = [ln for ln in out.splitlines() if ln.strip()]
-        if len(lines) != 1:
-            return True  # not the one-summary-line shape a clean miss has
-        if path.casefold() in lines[0].casefold():
+        if not 1 <= len(lines) <= 2:
+            return True  # not a shape this probe has ever seen
+        if any(path.casefold() in ln.casefold() for ln in lines):
             return True  # the path was echoed back: this sid is on its DACL
     return False
 
