@@ -40,7 +40,30 @@ def isolated_env(tmp_path, monkeypatch):
     home.mkdir()
     monkeypatch.setenv("HOME", str(home))
     monkeypatch.setenv("USERPROFILE", str(home))
-    monkeypatch.delenv("ONEDRIVE", raising=False)
+    # HOME is not the whole home on Windows, and the two pieces it misses are
+    # exactly the ones Zwift discovery is built on. %LOCALAPPDATA% never reads
+    # HOME, and Documents is resolved through a Win32 known-folder call that no
+    # environment variable can move. So paths.candidate_activities_dirs() kept
+    # naming the rider's REAL folders under a redirect that looked complete.
+    #
+    # That is a data-safety hole and not only a wrong assertion: the connector
+    # watcher polls the whole activities scope on every pass, so the suite read
+    # the rider's live .fit files, and test_connector_watch's deletion test
+    # asserted against their ride history instead of its own tmp_path.
+    local_appdata = home / "AppData" / "Local"
+    local_appdata.mkdir(parents=True)
+    monkeypatch.setenv("LOCALAPPDATA", str(local_appdata))
+    # Resolved through expanduser rather than pinned, so a test that moves HOME
+    # again (conftest.redirect_home) moves Documents with it, the way a real
+    # Windows profile does.
+    monkeypatch.setattr(
+        "wattracker.paths._windows_documents_known_folder",
+        lambda: os.path.join(os.path.expanduser("~"), "Documents"),
+    )
+    # A OneDrive-redirected Documents is a candidate root of its own, and only
+    # the first of these three was being cleared.
+    for name in ("ONEDRIVE", "OneDriveConsumer", "OneDriveCommercial"):
+        monkeypatch.delenv(name, raising=False)
     # Redirecting HOME also hides playwright's browser cache from it; point at
     # the real one so the DOM smoke tests keep running rather than skipping.
     if not os.environ.get("PLAYWRIGHT_BROWSERS_PATH"):

@@ -244,6 +244,38 @@ def test_the_same_folder_named_twice_is_watched_once(activities, monkeypatch):
     assert watch.folders() == [str(activities)]
 
 
+def test_no_test_here_can_read_the_riders_own_activities_folder(
+    activities, tmp_path
+):
+    r"""The sandbox the whole file is written against, asserted once.
+
+    Every other test here hands the watcher a ``tmp_path`` folder and reads
+    that as "this is the only folder in play". It is not: the watcher polls
+    the whole ``activities_scope``, so an incomplete HOME redirect adds the
+    rider's real ``%LOCALAPPDATA%\Zwift\Activities`` to the folders under
+    test without failing anything. That is how the deletion test above came to
+    count the machine's whole ride history instead of its own one file - and
+    reading a rider's ride files at all is the worse half of it.
+
+    Both halves are stated here, on the folders AND on what a pass recorded,
+    so weakening the sandbox in ``conftest.isolated_env`` fails loudly and in
+    one place rather than as an odd count somewhere else.
+    """
+    root = os.path.normcase(os.path.abspath(str(tmp_path)))
+
+    def inside(path):
+        resolved = os.path.normcase(os.path.abspath(path))
+        return resolved == root or resolved.startswith(root + os.sep)
+
+    watch = _watcher(activities)
+    watch.poll()
+
+    stray = [folder for folder in watch.folders() if not inside(folder)]
+    assert stray == [], f"the watcher polls folders outside the sandbox: {stray}"
+    read = [path for path in watch._reported if not inside(path)]
+    assert read == [], f"the watcher read files outside the sandbox: {read[:3]}"
+
+
 # ------------------------------------------------------------- the interval
 @pytest.mark.parametrize(
     "given,expected",
