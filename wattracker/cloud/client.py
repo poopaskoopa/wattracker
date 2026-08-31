@@ -184,7 +184,9 @@ def build_snapshot_batch(
     revision: int,
     limit: int = 1_000,
     include_streams: bool = False,
-) -> SyncBatch:
+    include_derived: bool = True,
+    offset: int = 0,
+) -> Optional[SyncBatch]:
     """Convenience seam used by an opt-in background sync worker."""
     return snapshot_batch(
         path,
@@ -193,4 +195,6 @@ def build_snapshot_batch(
         revision=revision,
         limit=limit,
         include_streams=include_streams,
+        include_derived=include_derived,
+        offset=offset,
     )
