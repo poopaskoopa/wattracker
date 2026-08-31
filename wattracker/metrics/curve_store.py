@@ -61,11 +61,19 @@ def _rebuild_locked(conn: sqlite3.Connection, user_id: int) -> Dict[int, float]:
     # second copy made by mean_maximal_power) in memory.
     mmp: Dict[int, float] = {}
     rows = conn.execute(
-        "SELECT id, streams FROM activities "
+        "SELECT id, start_time, streams FROM activities "
         "WHERE user_id = ? AND duplicate_of IS NULL",
         (user_id,),
     )
+    settings = conn.execute(
+        "SELECT timezone, history_start_date FROM user_settings WHERE user_id = ?",
+        (user_id,),
+    ).fetchone()
+    cutoff = settings["history_start_date"] if settings else None
+    timezone = settings["timezone"] if settings else None
     for row in rows:
+        if not db._activity_is_visible(row, cutoff, timezone):
+            continue
         effective = db._effective_streams(
             row["streams"],
             db._activity_correction_ranges(conn, user_id, int(row["id"])),

@@ -32,7 +32,7 @@ HR_ZONES = (
     ("Z5", "Maximum", 0.90, None, "90–100%+"),
 )
 
-_auto_hr_cache: dict[int, tuple[tuple[str, int, int, str], dict]] = {}
+_auto_hr_cache: dict[int, tuple[tuple, dict]] = {}
 _cache_lock = threading.Lock()
 
 
@@ -268,7 +268,7 @@ def estimate_hr_max(activities: list[dict], now: Optional[_dt.datetime] = None) 
     }
 
 
-def _activity_fingerprint(user_id: int) -> tuple[str, int, int, int]:
+def _activity_fingerprint(user_id: int) -> tuple:
     conn = db.connect()
     try:
         database = conn.execute("PRAGMA database_list").fetchone()["file"]
@@ -279,7 +279,13 @@ def _activity_fingerprint(user_id: int) -> tuple[str, int, int, int]:
         ).fetchone()
         # Linking a duplicate removes a ride from full_activities without
         # changing the count or max id, so it belongs in the fingerprint.
-        return str(database), int(row["c"]), int(row["m"]), int(row["d"] or 0)
+        settings = db.get_user_settings(user_id)
+        # History visibility is part of the evidence set. Timezone matters
+        # because the cutoff is defined by the rider's local activity date.
+        return (
+            str(database), int(row["c"]), int(row["m"]), int(row["d"] or 0),
+            settings.get("history_start_date"), settings.get("timezone"),
+        )
     finally:
         conn.close()
 

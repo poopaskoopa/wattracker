@@ -186,6 +186,8 @@ def build_snapshot_batch(
     include_streams: bool = False,
     include_derived: bool = True,
     offset: int = 0,
+    previously_published: Optional[Mapping[str, Mapping[str, object]]] = None,
+    complete: Optional[bool] = None,
 ) -> Optional[SyncBatch]:
     """Convenience seam used by an opt-in background sync worker."""
     return snapshot_batch(
@@ -197,4 +199,6 @@ def build_snapshot_batch(
         include_streams=include_streams,
         include_derived=include_derived,
         offset=offset,
+        previously_published=previously_published,
+        complete=complete,
     )

@@ -508,6 +508,8 @@ def ingest_file(
     """
     db.init_db()
     parsed = parse_fit(path)
+    if not db.activity_is_visible(user_id, parsed.get("start_time")):
+        return None
     h = dedup_hash(parsed["start_time"], parsed["duration_s"])
     if db.activity_exists(user_id, h):
         return None
@@ -814,6 +816,19 @@ def scan_activities(
                     ensure_curve=False,
                 )
         except Exception:
+            # A listed file that was parsed but rejected (for example because
+            # its activity date is before the rider's cutoff) is safe to cache
+            # by its stable listing metadata. Files omitted by the backend,
+            # including Zwift's in-progress buffer, never enter this loop and
+            # therefore retain their retry-on-next-scan behavior.
+            if entry.mtime is not None and entry.size is not None:
+                try:
+                    db.record_scanned_file(
+                        user_id, entry.path, entry.mtime, entry.size
+                    )
+                except Exception:
+                    log.debug("could not record skipped file %s", entry.path,
+                              exc_info=True)
             skipped += 1
             _report(processed=found, imported=imported, skipped=skipped)
             continue
