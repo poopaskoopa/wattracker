@@ -150,10 +150,24 @@ enrollments mean two riders.
 See `docs/cloud-sync.md`, "Pairing a second device, and the same-namespace-per-rider rule", for
 the flow, the indistinguishability rules, and the 60-bit code entropy arithmetic.
 
+Pairing deliberately depends on nothing a gateway provides. `POST /api/v1/devices/pair` does
+not require a verified subject: the code is the authorization, and requiring an identity provider
+on the phone would defeat the point of a code read off the desktop. Where a gateway does attest a
+subject it is applied as an additional binding on top of the code — and
+`CloudState.create(..., require_persistent_security=True)` now refuses to boot if a deployment
+claims `require_verified_subject` while nothing attests one, so removing the gateway is a
+configuration change rather than a silent downgrade.
+
 Still open in the same area, and deliberately not in #152's scope:
 
 - APIM does not declare the `/devices/*` operations, so neither route is reachable through the
   gateway until #165 adds them. Both are exercised end to end against the ASGI app.
+- **If #164 removes the gateway, `enrollment/start` and `enrollment/complete` still require a
+  verified-subject header unconditionally, and no JWT is validated to produce it.** Those routes
+  are operator-token gated and their real secret is the one-time invitation, so this is not an
+  open hole, but the subject check there becomes decorative and should be either removed or
+  re-anchored in the same change. Pairing, reads, and refresh already handle a gateway-less
+  deployment.
 - There is still no revocation route, so a lost paired device is revoked only by
   `CredentialRegistry.revoke_device` in library code (#153).
 

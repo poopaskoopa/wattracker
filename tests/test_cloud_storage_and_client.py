@@ -453,14 +453,13 @@ def test_snapshot_omits_valid_oversized_stream_but_keeps_activity(tmp_path):
 _ISOLATION_SECRET = b"cloud-test-server-secret-32-bytes-long"
 
 
-def _pairing_mint_headers(writer, nonce, subject):
+def _pairing_mint_headers(writer, nonce):
     canonical = canonical_request(
         "POST", "/api/v1/devices/pairing-codes", writer.namespace, 1_000, nonce,
         digest_body(b""), "device-pairing-code", "0",
     )
     return {
         "Ocp-Apim-Subscription-Key": writer.subscription_key.decode(),
-        "X-Verified-Entra-Subject": subject,
         "X-Writer-Credential": writer.credential_id,
         "X-Writer-Timestamp": "1000",
         "X-Writer-Nonce": nonce,
@@ -470,17 +469,20 @@ def _pairing_mint_headers(writer, nonce, subject):
     }
 
 
-def _pair_a_device(client, writer, nonce, subject):
-    """Mint a code as the desktop, redeem it as a phone, return the response."""
+def _pair_a_device(client, writer, nonce):
+    """Mint a code as the desktop, redeem it as a phone, return the response.
+
+    No subject header is sent anywhere in this flow: the namespace binding has
+    to come from the code alone.
+    """
     minted = client.post(
         "/api/v1/devices/pairing-codes",
-        headers=_pairing_mint_headers(writer, nonce, subject),
+        headers=_pairing_mint_headers(writer, nonce),
     )
     assert minted.status_code == 200, minted.text
     _private, public_key = generate_signing_keypair()
-    paired = client.post("/api/v1/devices/pair", headers={
-        "X-Verified-Entra-Subject": subject,
-    }, json={"code": minted.json()["pairing_code"], "public_key": public_key.hex()})
+    paired = client.post("/api/v1/devices/pair", json={
+        "code": minted.json()["pairing_code"], "public_key": public_key.hex()})
     assert paired.status_code == 200, paired.text
     return paired.json()
 
@@ -493,6 +495,12 @@ def test_paired_devices_are_isolated_across_installations_sharing_a_scope_name()
     under two namespaces is two partitions; what #152 has to prove is that
     pairing cannot collapse them -- both of one rider's devices land in that
     rider's namespace, and neither can read across.
+
+    Run with no identity provider and no subject header anywhere, which is the
+    configuration that survives the gateway being removed.  The point is that
+    the namespace binding comes from the pairing code and from nothing else:
+    there is no subject here to carry it, and no header for a device to
+    influence it with.
     """
     pytest.importorskip("cryptography")
     store = MemoryTenantStore()
@@ -500,6 +508,7 @@ def test_paired_devices_are_isolated_across_installations_sharing_a_scope_name()
         server_secret=_ISOLATION_SECRET,
         operator_token="operator-token",
         require_apim_proof=False,
+        require_verified_subject=False,
         clock=lambda: 1_000,
     )
     state = CloudState.create(config, store=store)
@@ -512,7 +521,7 @@ def test_paired_devices_are_isolated_across_installations_sharing_a_scope_name()
         )
         store.apply(writer.namespace, "same-scope", _batch(object_id=object_id))
         devices = [
-            _pair_a_device(client, writer, f"{name}-{index}", f"rider-{name}")
+            _pair_a_device(client, writer, f"{name}-{index}")
             for index in ("phone", "tablet")
         ]
         riders[name] = (writer, object_id, devices)
@@ -532,6 +541,9 @@ def test_paired_devices_are_isolated_across_installations_sharing_a_scope_name()
             credential = state.credentials.resolve_device(issued["device_credential"])
             assert credential.namespace == writer.namespace
             assert credential.local_user_scope == "same-scope"
+            # Nothing attests a subject, so no device carries one to be
+            # checked against a header nobody vouches for.
+            assert credential.subject is None
     credential_ids = {
         issued["device_credential"] for issued in devices_a + devices_b
     }
@@ -539,15 +551,14 @@ def test_paired_devices_are_isolated_across_installations_sharing_a_scope_name()
 
     # Each device sees exactly its own rider's object and nothing else.
     audience = (
-        [("rider-a", device, object_a, object_b) for device in devices_a]
-        + [("rider-b", device, object_b, object_a) for device in devices_b]
+        [(device, object_a, object_b) for device in devices_a]
+        + [(device, object_b, object_a) for device in devices_b]
     )
     assert len(audience) == 4
-    for subject, issued, mine, theirs in audience:
-        headers = {
-            "Authorization": "Bearer " + issued["reader_context"],
-            "X-Verified-Entra-Subject": subject,
-        }
+    for issued, mine, theirs in audience:
+        # The bearer context and nothing else.  No subject header is sent, so
+        # the scope these reads resolve to can only have come from the code.
+        headers = {"Authorization": "Bearer " + issued["reader_context"]}
         listed = client.get("/api/v1/context/activities", headers=headers)
         assert listed.status_code == 200, listed.text
         assert [item["id"] for item in listed.json()["items"]] == [mine]

@@ -1148,14 +1148,36 @@ def _mint(client, credential, **kwargs):
 
 
 def _pair(client, code, public_key, *, subject="entra-user", algorithm="ed25519",
-          extra=None):
+          extra=None, headers=None):
+    """Redeem a code.  ``subject=None`` sends no subject header at all."""
     payload = {"code": code, "public_key": public_key.hex(),
                "signature_algorithm": algorithm}
     payload.update(extra or {})
-    return client.post(
-        PAIR_PATH, headers={**PAIR_HEADERS, "X-Verified-Entra-Subject": subject},
-        json=payload,
+    sent = dict(PAIR_HEADERS if headers is None else headers)
+    sent.pop("X-Verified-Entra-Subject", None)
+    if subject is not None:
+        sent["X-Verified-Entra-Subject"] = subject
+    return client.post(PAIR_PATH, headers=sent, json=payload)
+
+
+@pytest.fixture()
+def attested_cloud():
+    """A deployment with a real gateway: proof configured, subject attested.
+
+    The plain ``cloud`` fixture turns the proof off, which is fine for routes
+    that do not depend on the subject -- but production refuses to boot with a
+    subject requirement and no gateway, so anything testing subject trust says
+    so explicitly here.
+    """
+    config = CloudConfig(
+        server_secret=SECRET,
+        operator_token="operator-token",
+        apim_proof_value="proof-value",
+        clock=lambda: 1_000,
     )
+    assert config.gateway_attests_subject
+    state = CloudState.create(config)
+    return config, state, TestClient(create_cloud_app(config, state=state))
 
 
 def _subject_writer(state, seed, *, scope="scope", subject="entra-user"):
@@ -1318,49 +1340,65 @@ def test_unknown_expired_and_consumed_pairing_codes_are_indistinguishable(cloud)
     assert _pair(client, wrong_subject_code, public_key).status_code == 200
 
 
-def test_a_pairing_code_is_bound_to_the_minting_rider_s_verified_subject(cloud):
-    """A code shown on screen is not redeemable by a different Entra account.
+def test_where_a_gateway_attests_a_subject_the_code_carries_it(attested_cloud):
+    """The subject is an additional binding on the code, never a substitute.
 
-    A writer enrolled through Entra carries the subject verified then, and the
-    gateway supplies the subject signed in now; they must agree, and the code
-    inherits it.  A writer registered without a subject -- the HMAC path,
-    which never saw Entra -- has nothing to compare against, so the code takes
-    the subject presented at mint time instead.  Either way the code carries
-    one, so it is useless to a second account.
+    Where a gateway attests one, the code inherits it and the redeeming device
+    must present a match.  Crucially the *code* is what demands it, not the
+    route: omitting the header cannot bypass a binding that exists.  Where
+    nothing attests a subject the code carries none and no header is read at
+    all -- see ``test_pairing_needs_no_identity_provider_at_all``.
     """
     pytest.importorskip("cryptography")
-    _config, state, client = cloud
+    _config, state, client = attested_cloud
+    proof = {"X-APIM-Request-Proof": "proof-value"}
     subject_writer = _subject_writer(state, b"s", subject="rider@example.invalid")
     _private, public_key = generate_signing_keypair()
 
     # The signed-in subject must match the one bound at enrollment.
-    assert _mint(
-        client, subject_writer, nonce="hijack", subject="thief"
-    ).status_code == 401
-    code = _mint(
-        client, subject_writer, nonce="bound", subject="rider@example.invalid"
-    ).json()["pairing_code"]
-    assert _pair(client, code, public_key, subject="thief").status_code == 404
-    paired = _pair(client, code, public_key, subject="rider@example.invalid")
+    assert client.post(MINT_PATH, headers={
+        **_mint_headers(subject_writer, nonce="hijack", subject="thief"), **proof,
+    }).status_code == 401
+    minted = client.post(MINT_PATH, headers={
+        **_mint_headers(
+            subject_writer, nonce="bound", subject="rider@example.invalid"),
+        **proof,
+    })
+    assert minted.status_code == 200, minted.text
+    code = minted.json()["pairing_code"]
+
+    payload = {"code": code, "public_key": public_key.hex()}
+    # Wrong subject, and no subject at all, are the same 404: a bound subject
+    # is not bypassable by leaving the header off.
+    wrong = client.post(PAIR_PATH, headers={
+        **proof, "X-Verified-Entra-Subject": "thief"}, json=payload)
+    omitted = client.post(PAIR_PATH, headers=proof, json=payload)
+    assert wrong.status_code == omitted.status_code == 404
+    assert wrong.json() == omitted.json() == {"detail": "not found"}
+    # Neither attempt spent it.
+    paired = client.post(PAIR_PATH, headers={
+        **proof, "X-Verified-Entra-Subject": "rider@example.invalid"}, json=payload)
     assert paired.status_code == 200, paired.text
     device = state.credentials.resolve_device(paired.json()["device_credential"])
     assert device.subject == "rider@example.invalid"
 
-    # Subject-less writer: the code still binds the subject seen at mint time.
+    # A writer with no stored subject takes the attested one at mint time.
     plain_writer = _writer(state, b"p")
-    plain_code = _mint(
-        client, plain_writer, nonce="plain", subject="whoever"
-    ).json()["pairing_code"]
+    plain = client.post(MINT_PATH, headers={
+        **_mint_headers(plain_writer, nonce="plain", subject="whoever"), **proof,
+    })
     _other_private, other_public = generate_signing_keypair()
-    assert _pair(
-        client, plain_code, other_public, subject="someone-else"
-    ).status_code == 404
-    plain_paired = _pair(client, plain_code, other_public, subject="whoever")
+    plain_payload = {
+        "code": plain.json()["pairing_code"], "public_key": other_public.hex()}
+    assert client.post(PAIR_PATH, headers={
+        **proof, "X-Verified-Entra-Subject": "someone-else"},
+        json=plain_payload).status_code == 404
+    plain_paired = client.post(PAIR_PATH, headers={
+        **proof, "X-Verified-Entra-Subject": "whoever"}, json=plain_payload)
     assert plain_paired.status_code == 200, plain_paired.text
-    plain_device = state.credentials.resolve_device(
+    assert state.credentials.resolve_device(
         plain_paired.json()["device_credential"]
-    )
-    assert plain_device.subject == "whoever"
+    ).subject == "whoever"
 
 
 def test_pairing_code_cannot_be_redeemed_into_another_namespace(cloud):
@@ -1550,7 +1588,7 @@ def test_a_deployment_without_the_crypto_extra_refuses_without_spending(
     assert retried.status_code == 200, retried.text
 
 
-def test_pairing_requires_the_apim_proof_and_a_verified_subject():
+def test_pairing_still_requires_the_gateway_proof_where_one_is_configured():
     pytest.importorskip("cryptography")
     config = CloudConfig(
         server_secret=SECRET,
@@ -1574,9 +1612,7 @@ def test_pairing_requires_the_apim_proof_and_a_verified_subject():
         PAIR_PATH, headers={"X-Verified-Entra-Subject": "entra-user"}, json=payload
     )
     assert unproofed.status_code == 404
-    anonymous = client.post(PAIR_PATH, headers=proof, json=payload)
-    assert anonymous.status_code == 404
-    # Neither attempt spent it.
+    # It did not spend the code.
     accepted = client.post(PAIR_PATH, headers={
         **proof, "X-Verified-Entra-Subject": "entra-user"}, json=payload)
     assert accepted.status_code == 200, accepted.text
@@ -1654,3 +1690,267 @@ def test_the_kill_switch_disables_pairing(cloud):
     ).status_code == 403
     state.quotas.set_public_enabled(True)
     assert _pair(client, code, public_key).status_code == 200
+
+
+class _DurableMemoryBackend(MemorySecurityStateBackend):
+    """A shared-process backend that claims durability, for boot-check tests."""
+
+    durable = True
+
+
+def test_production_refuses_to_trust_a_subject_header_with_no_gateway():
+    """Removing the gateway must be a config change, not a silent downgrade.
+
+    A verified-subject header is worth exactly as much as the gateway that
+    overwrites it.  The failure mode being designed out is a header that is
+    trustworthy in one deployment and forgeable in another, with nothing at
+    startup telling the two apart -- so production refuses to boot in the
+    combination that would serve the second while looking like the first.
+    """
+    backend = _DurableMemoryBackend()
+
+    def _config(**overrides):
+        return CloudConfig(
+            server_secret=SECRET, operator_token="operator-token", **overrides
+        )
+
+    ungated = _config(require_apim_proof=False)
+    assert ungated.require_verified_subject
+    assert not ungated.gateway_attests_subject
+    with pytest.raises(RuntimeError, match="verified-subject header requires a gateway"):
+        CloudState.create(
+            ungated, security_backend=backend, require_persistent_security=True
+        )
+
+    # Demanding the proof header without configuring a value is not a gateway
+    # either: `_apim_proof_valid` fails closed on an empty value, so nothing
+    # would ever have overwritten the subject.
+    hollow = _config(apim_proof_value="")
+    assert not hollow.gateway_attests_subject
+    with pytest.raises(RuntimeError, match="verified-subject header requires a gateway"):
+        CloudState.create(
+            hollow, security_backend=backend, require_persistent_security=True
+        )
+
+    # Declaring the truth boots, and so does keeping a real gateway.
+    declared = _config(require_apim_proof=False, require_verified_subject=False)
+    assert CloudState.create(
+        declared, security_backend=backend, require_persistent_security=True
+    ) is not None
+    gated = _config(apim_proof_value="proof-value")
+    assert gated.gateway_attests_subject
+    assert CloudState.create(
+        gated, security_backend=backend, require_persistent_security=True
+    ) is not None
+
+
+def test_pairing_needs_no_identity_provider_at_all():
+    """The configuration #164 produces: no gateway, no Entra, no subject header.
+
+    The pairing code *is* the authorization -- 60 bits, single use, at most
+    900 seconds, and mintable only by a writer-signed request from the rider's
+    own desktop.  Nothing in this test sends a subject header, because on a
+    phone there is nobody to get one from, and nothing would vouch for it if
+    there were.
+    """
+    pytest.importorskip("cryptography")
+    config = CloudConfig(
+        server_secret=SECRET,
+        operator_token="operator-token",
+        require_apim_proof=False,
+        require_verified_subject=False,
+        clock=lambda: 1_000,
+    )
+    state = CloudState.create(config)
+    client = TestClient(create_cloud_app(config, state=state))
+    # The writer still carries a subject left over from an enrollment that ran
+    # while a gateway existed.  It must not be bound into the code: nothing
+    # can check it later, and a device pinned to a string it cannot obtain is
+    # a device that cannot read.
+    writer = _subject_writer(state, b"a", subject="left-over-from-entra")
+    body = _batch()
+    assert client.post(
+        "/api/v1/sync/batches", headers=_headers(writer, body), content=body
+    ).status_code == 200
+
+    minted = client.post(
+        MINT_PATH, headers=_mint_headers(writer, nonce="no-idp", subject=None)
+    )
+    assert minted.status_code == 200, minted.text
+
+    device_private, device_public = generate_signing_keypair()
+    paired = _pair(
+        client, minted.json()["pairing_code"], device_public, subject=None, headers={}
+    )
+    assert paired.status_code == 200, paired.text
+    device = state.credentials.resolve_device(paired.json()["device_credential"])
+    assert device.namespace == writer.namespace
+    assert device.local_user_scope == writer.local_user_scope
+    assert device.subject is None
+
+    # The context it was handed reads, with no subject header.
+    listed = client.get("/api/v1/context/activities", headers={
+        "Authorization": "Bearer " + paired.json()["reader_context"]})
+    assert listed.status_code == 200, listed.text
+    assert [item["id"] for item in listed.json()["items"]] == ["activity-1"]
+
+    # And the device refreshes its own context, still with no subject header.
+    refresh_headers = {
+        name: value
+        for name, value in _refresh_headers(
+            device, device_private, nonce="no-idp-refresh"
+        ).items()
+        if name != "X-Verified-Entra-Subject"
+    }
+    refreshed = client.post("/api/v1/context/refresh", headers=refresh_headers)
+    assert refreshed.status_code == 200, refreshed.text
+    second = client.get("/api/v1/context/activities", headers={
+        "Authorization": "Bearer " + refreshed.json()["reader_context"]})
+    assert [item["id"] for item in second.json()["items"]] == ["activity-1"]
+
+
+def test_an_ungated_deployment_never_reads_the_subject_header():
+    """Where nothing attests a subject, a supplied one changes nothing.
+
+    Otherwise the header would be a control in appearance only: present it and
+    something happens, forge it and the same thing happens.
+    """
+    pytest.importorskip("cryptography")
+    config = CloudConfig(
+        server_secret=SECRET,
+        operator_token="operator-token",
+        require_apim_proof=False,
+        require_verified_subject=False,
+        clock=lambda: 1_000,
+    )
+    state = CloudState.create(config)
+    client = TestClient(create_cloud_app(config, state=state))
+    writer = _subject_writer(state, b"a", subject="left-over-from-entra")
+    _private, public_key = generate_signing_keypair()
+
+    # Minting while claiming somebody else's identity is neither refused nor
+    # believed -- the header is simply not read.
+    minted = client.post(
+        MINT_PATH, headers=_mint_headers(writer, nonce="ignored", subject="thief")
+    )
+    assert minted.status_code == 200, minted.text
+    paired = _pair(
+        client, minted.json()["pairing_code"], public_key, subject="someone-else"
+    )
+    assert paired.status_code == 200, paired.text
+    device = state.credentials.resolve_device(paired.json()["device_credential"])
+    assert device.subject is None
+    assert device.namespace == writer.namespace
+
+
+def test_the_code_demands_a_subject_not_the_route(attested_cloud):
+    """Even where one is attested, the route itself never demands a subject.
+
+    Mint always binds one in an attested deployment, so this constructs the
+    case the API cannot currently reach -- a subject-less code where a gateway
+    exists -- to pin the property directly.  It matters because the route must
+    stay correct if anything ever mints a code without a subject: the demand
+    has to come from the stored record, so that it exists exactly when there
+    is something to enforce.
+    """
+    pytest.importorskip("cryptography")
+    _config, state, client = attested_cloud
+    writer = _writer(state, b"a")
+    _private, public_key = generate_signing_keypair()
+    minted = state.pairings.create(writer.namespace, writer.local_user_scope)
+    assert minted.subject is None
+
+    paired = client.post(PAIR_PATH, headers={"X-APIM-Request-Proof": "proof-value"},
+                         json={"code": minted.code, "public_key": public_key.hex()})
+    assert paired.status_code == 200, paired.text
+    device = state.credentials.resolve_device(paired.json()["device_credential"])
+    assert device.namespace == writer.namespace
+    assert device.subject is None
+
+
+def test_credentials_outliving_their_gateway_still_resolve():
+    """A subject bound while a gateway existed must not lock a rider out.
+
+    When the gateway goes, contexts and devices issued before it went still
+    carry a subject.  Nothing can attest one any more, so the check is
+    skipped rather than failed -- the bearer context token and the device's
+    private key remain the whole authorization, which is what they always
+    actually were.
+    """
+    pytest.importorskip("cryptography")
+    config = CloudConfig(
+        server_secret=SECRET,
+        operator_token="operator-token",
+        require_apim_proof=False,
+        require_verified_subject=False,
+        clock=lambda: 1_000,
+    )
+    state = CloudState.create(config)
+    client = TestClient(create_cloud_app(config, state=state))
+    writer = _writer(state, b"a")
+    body = _batch()
+    assert client.post(
+        "/api/v1/sync/batches", headers=_headers(writer, body), content=body
+    ).status_code == 200
+
+    # Issued back when a gateway attested "old-rider".
+    token, context = state.credentials.issue_reader_context_for_scope(
+        writer.namespace, writer.local_user_scope, "old-rider"
+    )
+    assert context.subject == "old-rider"
+    listed = client.get(
+        "/api/v1/context/activities", headers={"Authorization": f"Bearer {token}"}
+    )
+    assert listed.status_code == 200, listed.text
+    assert [item["id"] for item in listed.json()["items"]] == ["activity-1"]
+
+    device, device_key = _device(
+        state, scope=writer.local_user_scope, subject="old-rider",
+    )
+    refresh_headers = {
+        name: value
+        for name, value in _refresh_headers(
+            device, device_key, nonce="outlived"
+        ).items()
+        if name != "X-Verified-Entra-Subject"
+    }
+    refreshed = client.post("/api/v1/context/refresh", headers=refresh_headers)
+    assert refreshed.status_code == 200, refreshed.text
+
+
+def test_a_code_bound_to_an_identity_is_refused_once_nothing_attests_it():
+    """Fail closed on a code that outlived its issuer.
+
+    A code minted seconds before the gateway was removed still carries the
+    subject that gateway attested.  Afterwards nothing can verify that
+    subject, so the code is refused rather than redeemed on the strength of a
+    header the caller wrote -- otherwise anyone who knows the rider's account
+    name could spend it.  The rider mints another; it costs 15 seconds.
+    """
+    pytest.importorskip("cryptography")
+    config = CloudConfig(
+        server_secret=SECRET,
+        operator_token="operator-token",
+        require_apim_proof=False,
+        require_verified_subject=False,
+        clock=lambda: 1_000,
+    )
+    state = CloudState.create(config)
+    client = TestClient(create_cloud_app(config, state=state))
+    writer = _writer(state, b"a")
+    _private, public_key = generate_signing_keypair()
+    stale = state.pairings.create(
+        writer.namespace, writer.local_user_scope, subject="old-rider"
+    )
+
+    # Even presenting exactly the right subject does not redeem it: the header
+    # is not read, because nothing vouches for it.
+    for subject in ("old-rider", "anyone-else", None):
+        refused = _pair(client, stale.code, public_key, subject=subject, headers={})
+        assert refused.status_code == 404, refused.text
+        assert refused.json() == {"detail": "not found"}
+
+    # A code minted now, under the deployment that actually exists, works.
+    fresh = state.pairings.create(writer.namespace, writer.local_user_scope)
+    accepted = _pair(client, fresh.code, public_key, subject=None, headers={})
+    assert accepted.status_code == 200, accepted.text

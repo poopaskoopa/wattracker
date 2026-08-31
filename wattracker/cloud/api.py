@@ -71,6 +71,12 @@ class CloudConfig:
     apim_proof_value: str = field(default="", repr=False)
     require_apim_proof: bool = True
     verified_subject_header: str = "X-Verified-Entra-Subject"
+    # A verified-subject header is worth exactly as much as the gateway that
+    # overwrites it.  Deployments without such a gateway must set this False,
+    # and then no route reads the header at all: a header that is trusted in
+    # one deployment and forgeable in another, with nothing at startup telling
+    # them apart, is the failure mode this flag exists to remove.
+    require_verified_subject: bool = True
     subscription_header: str = "Ocp-Apim-Subscription-Key"
     allowed_origins: tuple[str, ...] = ()
     max_request_bytes: int = 8 * 1024 * 1024
@@ -95,11 +101,24 @@ class CloudConfig:
             raise ValueError("replay TTL must cover the timestamp freshness window")
         if not isinstance(self.apim_proof_value, str) or len(self.apim_proof_value) > 512:
             raise ValueError("apim proof value is invalid")
+        if not isinstance(self.require_verified_subject, bool):
+            raise ValueError("require_verified_subject must be a boolean")
         if any(
             not isinstance(origin, str) or not origin or "*" in origin
             for origin in self.allowed_origins
         ):
             raise ValueError("allowed_origins must be exact non-wildcard origins")
+
+    @property
+    def gateway_attests_subject(self) -> bool:
+        """Whether some gateway actually vouches for the subject header.
+
+        The header is only meaningful when a proof-carrying gateway sits in
+        front and overwrites it on every request.  Without the proof, the
+        header is whatever the caller typed.
+        """
+
+        return bool(self.require_apim_proof and self.apim_proof_value)
 
 
 @dataclass
@@ -145,6 +164,22 @@ class CloudState:
             )
         ):
             raise RuntimeError("production cloud runtime requires durable auth state")
+        # A deployment must not be able to claim it enforces a verified
+        # subject while nothing issues one.  Without a proof-carrying gateway
+        # the header is attacker-supplied, so trusting it would be a control
+        # in name only -- refuse to start rather than serve one.  Removing the
+        # gateway is therefore a deliberate configuration change here, not a
+        # silent downgrade of every subject check in the app.
+        if (
+            require_persistent_security
+            and config.require_verified_subject
+            and not config.gateway_attests_subject
+        ):
+            raise RuntimeError(
+                "a verified-subject header requires a gateway that proves "
+                "itself and overwrites it; configure the gateway proof or set "
+                "require_verified_subject=False"
+            )
         enrollments = EnrollmentRegistry(
             config.server_secret, backend=security_backend, clock=config.clock
         )
@@ -284,6 +319,38 @@ def _apim_proof_valid(state: CloudState, request: Request) -> bool:
     return bool(state.config.apim_proof_value) and _safe_compare_text(
         marker, state.config.apim_proof_value
     )
+
+
+def _attested_subject(state: CloudState, request: Request) -> str | None:
+    """The subject some gateway vouches for, or ``None`` when nothing does.
+
+    Where the deployment attests no subject the header is not read at all:
+    reading a header nobody vouches for is worse than not having one, because
+    it looks like a check.  This never fails a request -- a missing header is
+    simply no subject, and a caller that needs one says so itself.
+    """
+
+    if not state.config.require_verified_subject:
+        return None
+    subject = request.headers.get(state.config.verified_subject_header.lower(), "")
+    if not subject or len(subject) > 256:
+        return None
+    return subject
+
+
+def _subject_binding(state: CloudState, request: Request) -> tuple[bool, str | None]:
+    """``(ok, subject)`` for routes that demand a subject wherever one exists.
+
+    ``ok`` is False only when the deployment attests a subject and the request
+    did not carry a usable one.  Routes whose own secret is sufficient
+    authorization use :func:`_attested_subject` instead and let the stored
+    record decide whether a subject is needed.
+    """
+
+    if not state.config.require_verified_subject:
+        return True, None
+    subject = _attested_subject(state, request)
+    return subject is not None, subject
 
 
 def _has_capability(credential: Any, capability: str) -> bool:
@@ -440,15 +507,21 @@ def _resolve_reader(state: CloudState, request: Request) -> Any:
     scheme, _, token = raw.partition(" ")
     if scheme.lower() != "bearer" or not token or len(token) > 512:
         return None
-    subject = request.headers.get(state.config.verified_subject_header.lower(), "")
-    if not subject or len(subject) > 256:
+    ok, subject = _subject_binding(state, request)
+    if not ok:
         return None
     context = state.credentials.resolve_reader(token)
     if context is None or not state.quotas.public_enabled:
         return None
     bound_subject = getattr(context, "subject", None)
-    if bound_subject is not None and (
-        not subject or not _safe_compare_text(bound_subject, subject)
+    # A bound subject is only checkable where one is attested.  Where it is
+    # not, the bearer context token -- 32 bytes of server-generated secret --
+    # is the whole authorization, and comparing it against a header the caller
+    # wrote would add nothing but the appearance of a second factor.
+    if (
+        bound_subject is not None
+        and subject is not None
+        and not _safe_compare_text(bound_subject, subject)
     ):
         return None
     return context
@@ -653,8 +726,8 @@ def create_cloud_app(
             """
             if not _apim_proof_valid(state, request):
                 return _not_found()
-            subject = request.headers.get(config.verified_subject_header.lower(), "")
-            if not subject or len(subject) > 256:
+            ok, subject = _subject_binding(state, request)
+            if not ok:
                 return _not_found()
             try:
                 body = await _bounded_body(request, _MAX_REFRESH_BODY_BYTES)
@@ -668,8 +741,10 @@ def create_cloud_app(
             if not _verify_device_request(state, request, device, body):
                 return _not_found()
             bound_subject = getattr(device, "subject", None)
-            if bound_subject is not None and not _safe_compare_text(
-                bound_subject, subject
+            if (
+                bound_subject is not None
+                and subject is not None
+                and not _safe_compare_text(bound_subject, subject)
             ):
                 return _not_found()
             if not _has_capability(device, "read"):
@@ -720,10 +795,15 @@ def create_cloud_app(
 
             This route lives on the read plane because minting persists a
             record in ``CloudAuth``, and only the read plane's managed
-            identity may write that table.  Like every other read-plane
-            route it also requires the gateway-verified Entra subject, so
-            minting takes both the writer's signature and a live rider
-            sign-in, and the minted code inherits that identity.
+            identity may write that table.
+
+            Minting stays strict, and it can afford to: a writer-signed
+            request is real authentication that does not borrow anything from
+            a gateway.  Where a gateway does attest a subject, that subject is
+            required here and must match the one bound into the writer at
+            enrollment, and the code inherits it.  Where none is attested the
+            header is not read and the code binds no subject -- see
+            :func:`_subject_binding`.
             """
             writer = _writer_auth(state, request, capability="write")
             try:
@@ -741,23 +821,29 @@ def create_cloud_app(
                 return _error(401, "writer authorization required")
             # Subject outcomes are only reachable once the caller has proven
             # possession of the writer key.
-            verified_subject = request.headers.get(
-                config.verified_subject_header.lower(), ""
-            )
-            if not verified_subject or len(verified_subject) > 256:
+            ok, verified_subject = _subject_binding(state, request)
+            if not ok:
                 return _error(401, "writer authorization required")
-            # A writer enrolled through Entra carries the subject that was
-            # verified then; it must still be the one signed in now.  A writer
-            # registered without one -- the HMAC path, which never saw Entra --
-            # has nothing to compare against, so the code takes the subject
-            # presented at mint time.  Either way the code carries a subject,
-            # so a code read off a screen is useless to a different account.
+            # A writer enrolled through an attesting gateway carries the
+            # subject verified then; it must still be the one signed in now.
+            # A writer registered without one -- the HMAC path, which never
+            # saw an identity provider -- has nothing to compare against, so
+            # the code takes the subject presented at mint time.
             stored_subject = getattr(writer, "subject", None)
-            if stored_subject is not None and not _safe_compare_text(
-                stored_subject, verified_subject
+            if (
+                stored_subject is not None
+                and verified_subject is not None
+                and not _safe_compare_text(stored_subject, verified_subject)
             ):
                 return _error(401, "writer authorization required")
-            subject = stored_subject or verified_subject
+            # Where nothing attests a subject, the code carries none.  Binding
+            # one anyway would put a value on the device credential that every
+            # later request compares against an unauthenticated header: no
+            # security, and a paired phone that cannot read because it has no
+            # identity provider to get that string from.
+            subject = (
+                None if verified_subject is None else (stored_subject or verified_subject)
+            )
             try:
                 # Minting persists a record, so it is metered like a read
                 # rather than being free.  A refusal here is safe: nothing has
@@ -788,21 +874,35 @@ def create_cloud_app(
             discards.  A body field named ``namespace``, ``local_user_scope``
             or ``installation_id`` is simply not read.
 
+            **The code is the authorization.**  Redeeming deliberately does
+            not require a verified subject: 60 bits, single-use, at most 900
+            seconds, and mintable only by a writer-signed request from the
+            rider's own desktop is sufficient proof to issue a read-only
+            credential.  Demanding an identity provider here would mean the
+            rider signing in to one on the phone before pairing, which is the
+            thing the code exists to avoid -- and a subject header is only
+            worth anything behind a gateway that overwrites it, which this
+            deployment may not have.  Where one is attested it is applied as
+            an additional binding on top of the code, never instead of it.
+
             Every code failure -- unknown, malformed, expired, already
-            consumed, or redeemed by the wrong verified subject -- returns the
-            identical 404 body and headers as an unknown reader context.  A
-            400 is reachable only for a request that is malformed
-            independently of the code (bad JSON, a missing or unusable public
-            key), which reveals nothing secret because the wire format is
-            public.
+            consumed, or (where a subject is attested) redeemed by the wrong
+            one -- returns the identical 404 body and headers as an unknown
+            reader context.  A 400 is reachable only for a request that is
+            malformed independently of the code (bad JSON, a missing or
+            unusable public key), which reveals nothing secret because the
+            wire format is public.
             """
             if not _apim_proof_valid(state, request):
                 return _not_found()
             if not state.quotas.public_enabled:
                 return _not_found()
-            subject = request.headers.get(config.verified_subject_header.lower(), "")
-            if not subject or len(subject) > 256:
-                return _not_found()
+            # Never demanded here.  ``consume`` enforces a subject if and only
+            # if the code carries one, which can only have happened in a
+            # deployment that attests one -- so the demand comes from the
+            # code, never from the route, and omitting the header cannot
+            # bypass a binding that exists.
+            subject = _attested_subject(state, request)
             try:
                 body = await _bounded_body(request, _MAX_PAIRING_BODY_BYTES)
             except HTTPException:
@@ -852,10 +952,10 @@ def create_cloud_app(
                     # enrollment.  Widening one is a capability grant on the
                     # stored record, never an inference from its type.
                     capabilities=DEFAULT_DEVICE_CAPABILITIES,
-                    # The mint route always binds a subject, so this is the
-                    # code's; the fallback keeps the device pinned to its
-                    # redeemer rather than to nobody if that ever changes.
-                    subject=binding.subject or subject,
+                    # The subject, if any, comes from the code's binding and
+                    # never from this request.  A device paired where nothing
+                    # attests a subject simply carries none, so no later
+                    # request is checked against a header nobody vouches for.
                 )
                 token, _context = state.credentials.issue_reader_context_for_scope(
                     device.namespace, device.local_user_scope, device.subject
