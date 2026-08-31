@@ -385,27 +385,17 @@ def _validate_verification_key(algorithm: str, key: bytes) -> None:
         raise ValueError("P-256 public key is invalid")
 
 
-def validate_public_key_shape(algorithm: str, key: bytes) -> bytes:
-    """Check only encoding and length; never needs the optional crypto extra.
-
-    Callers use this to reject a malformed key *before* spending a one-time
-    invitation, so a client that got its encoding wrong does not burn its
-    pairing token.  It is not sufficient on its own -- the on-curve proof in
-    :func:`validate_public_key` still runs before anything is stored.
-    """
-
-    algorithm_text = _require_signature_algorithm(algorithm, SIGNATURE_ALGORITHMS)
-    key_bytes = _require_bytes(key, "public_key")
-    _validate_verification_key(algorithm_text, key_bytes)
-    return key_bytes
-
-
 def validate_public_key(algorithm: str, key: bytes) -> bytes:
     """Validate an externally supplied verification key before it is stored.
 
     Structural checks run always; the P-256 point is additionally proven to be
-    on the curve here, at the one place an attacker-supplied key enters, so
-    an unusable credential is never persisted.
+    on the curve here.  Callers must run this *before* spending any one-time
+    enrollment state, because a key rejected afterwards leaves the exchange
+    half finished with the invitation already consumed.
+
+    Raises :class:`ValueError` for a bad key and :class:`PublicKeyUnavailable`
+    when the deployment cannot check a P-256 point at all -- the two are
+    deliberately distinct, because only the first is the caller's fault.
     """
 
     algorithm_text = _require_signature_algorithm(algorithm, SIGNATURE_ALGORITHMS)
@@ -610,10 +600,30 @@ def verify_signature(
             # Raw 64-byte r||s only.  There is deliberately no DER parser at
             # this trust boundary: the two integers are range-checked here and
             # re-encoded by the library, so no attacker-chosen ASN.1 is parsed.
+            #
+            # Note the length: a raw P-256 signature is exactly 128 hexadecimal
+            # characters, and so is an Ed25519 signature.  Length distinguishes
+            # nothing between the two schemes.  Selecting ``algorithm`` from
+            # stored credential state is therefore load-bearing twice over --
+            # against the classic public-key-as-HMAC-secret downgrade, and
+            # against substituting one public-key scheme for the other.  Do not
+            # reintroduce any inference from the signature itself.
             if _RAW_SIGNATURE_RE.fullmatch(supplied) is None:
                 return False
             r = int(supplied[:64], 16)
             s = int(supplied[64:], 16)
+            # ECDSA signatures are malleable and this is ACCEPTED here: low-s
+            # is not enforced, so (r, n-s) verifies wherever (r, s) does.  That
+            # is safe only because nothing in this system treats a signature as
+            # an identity.  Freshness comes from NonceReplayGuard, which keys on
+            # (namespace, credential_id, nonce) -- never on signature bytes --
+            # so a malleated copy of a spent nonce is refused exactly like the
+            # original.  Enforcing low-s instead would break real clients:
+            # CryptoKit and the Secure Enclave emit high-s roughly half the
+            # time, and rejecting those would fail half of all iOS refreshes.
+            # If a signature is ever used as a cache key, a dedup key, or an
+            # audit identifier, that assumption breaks and low-s (or a digest
+            # of the canonical request) must be enforced first.
             if not (1 <= r < _P256_ORDER and 1 <= s < _P256_ORDER):
                 return False
             try:
@@ -2052,6 +2062,5 @@ __all__ = [
     "sign_request_ecdsa_p256",
     "sign_request_ed25519",
     "validate_public_key",
-    "validate_public_key_shape",
     "verify_signature",
 ]

@@ -725,6 +725,59 @@ def test_device_refresh_rejects_tampered_stale_and_replayed_envelopes(cloud):
     assert client.post("/api/v1/context/refresh", headers=replayed).status_code == 404
 
 
+def test_device_without_the_read_capability_cannot_refresh(cloud):
+    """The refresh route's capability assertion must be a live control.
+
+    Nothing issues a device without "read" today, so this constructs one
+    directly through the registry.  Without it the assertion at the route is
+    unreachable and would read as a control while enforcing nothing -- the
+    same standard the write-side assertion is already held to.
+    """
+    _config, state, client = cloud
+    device, private_key = _device(state, capabilities=("write",))
+    assert not device.has_capability("read")
+    refused = client.post(
+        "/api/v1/context/refresh",
+        headers=_refresh_headers(device, private_key, nonce="no-read"),
+    )
+    assert refused.status_code == 404
+    assert refused.json() == {"detail": "not found"}
+
+    # The same device, granted "read", is accepted by the same code path.
+    allowed_device, allowed_key = _device(state, capabilities=("read", "write"))
+    assert client.post(
+        "/api/v1/context/refresh",
+        headers=_refresh_headers(allowed_device, allowed_key, nonce="with-read"),
+    ).status_code == 200
+
+
+def test_malleated_signature_cannot_replay_a_spent_nonce(cloud):
+    """Pin the reason ECDSA malleability is safe here, not the malleability.
+
+    Low-s is deliberately not enforced, because CryptoKit and the Secure
+    Enclave emit high-s about half the time.  That is only safe because
+    freshness keys on the nonce and never on signature bytes.  If someone
+    later makes a signature an identity, this test is what should break.
+    """
+    pytest.importorskip("cryptography")
+    _config, state, client = cloud
+    device, private_key = _device(state, algorithm="ecdsa-p256-sha256")
+    headers = _refresh_headers(device, private_key, nonce="malleable")
+    assert client.post("/api/v1/context/refresh", headers=headers).status_code == 200
+
+    order = 0xFFFFFFFF00000000FFFFFFFFFFFFFFFFBCE6FAADA7179E84F3B9CAC2FC632551
+    signature = headers["X-Device-Signature"]
+    r, s = int(signature[:64], 16), int(signature[64:], 16)
+    malleated = f"{r:064x}{order - s:064x}"
+    assert malleated != signature
+    replayed = {**headers, "X-Device-Signature": malleated}
+    # A distinct, still-valid signature over the same canonical request --
+    # and it buys nothing, because the nonce is already spent.
+    assert client.post(
+        "/api/v1/context/refresh", headers=replayed
+    ).status_code == 404
+
+
 def test_device_refresh_binds_the_apim_verified_subject(cloud):
     _config, state, client = cloud
     device, private_key = _device(state, subject="entra-user")
@@ -914,6 +967,62 @@ def test_enrollment_pairs_a_device_and_the_device_refreshes_after_restart(algori
     assert restarted.credentials.resolve_reader(
         refreshed.json()["reader_context"], now=1_001
     ) is not None
+
+
+def test_unpairable_device_key_never_spends_the_invitation(cloud, monkeypatch):
+    """A rejected device key must not strand the rider mid-enrollment.
+
+    Device-key validation runs before the one-time invitation is consumed.  If
+    it ran after, a deployment missing the crypto extra would spend the
+    invitation, create a writer, fail on the device, and leave the rider with
+    no way to retry short of a new operator-issued token.
+    """
+    pytest.importorskip("cryptography")
+    from wattracker.cloud import security
+
+    _config, state, client = cloud
+    _writer_private, writer_public = generate_signing_keypair()
+    _device_private, device_public = generate_p256_keypair()
+    started = client.post(
+        "/api/v1/enrollment/start",
+        headers={
+            "X-Operator-Token": "operator-token",
+            "X-Verified-Entra-Subject": "entra-user",
+            "X-APIM-Client-Certificate-Verified": "true",
+        },
+    )
+    invitation = started.json()["invitation"]
+
+    def _unavailable(algorithm, key):
+        raise security.PublicKeyUnavailable("cloud extra is not installed")
+
+    complete_headers = {
+        "X-Verified-Entra-Subject": "entra-user",
+        "X-APIM-Client-Certificate-Verified": "true",
+    }
+    payload = {
+        "invitation": invitation,
+        "public_key": writer_public.hex(),
+        "device_public_key": device_public.hex(),
+        "device_signature_algorithm": "ecdsa-p256-sha256",
+    }
+    monkeypatch.setattr(
+        "wattracker.cloud.api.validate_public_key", _unavailable
+    )
+    stranded = client.post(
+        "/api/v1/enrollment/complete", headers=complete_headers, json=payload
+    )
+    assert stranded.status_code == 404
+    assert stranded.json() == {"detail": "not found"}
+
+    # Nothing was created and nothing was spent: the same invitation still
+    # works once the deployment is fixed.
+    monkeypatch.undo()
+    retried = client.post(
+        "/api/v1/enrollment/complete", headers=complete_headers, json=payload
+    )
+    assert retried.status_code == 200, retried.text
+    assert retried.json()["device_credential"]
 
 
 def test_enrollment_rejects_a_device_key_that_does_not_match_its_algorithm(cloud):

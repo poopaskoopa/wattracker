@@ -33,7 +33,7 @@ from .security import (
     digest_body,
     MIN_REPLAY_TTL_SECONDS,
     new_installation_id,
-    validate_public_key_shape,
+    validate_public_key,
     verify_signature,
 )
 from .storage import MemoryTenantStore, StorageConflict, StaleRevision
@@ -555,13 +555,23 @@ def create_cloud_app(
                         or device_algorithm not in DEVICE_SIGNATURE_ALGORITHMS
                     ):
                         raise ValueError
-                    # Shape-checked here, before the one-time invitation is
-                    # spent, so a wrong encoding costs a 400 and not a token.
-                    device_key = validate_public_key_shape(
-                        device_algorithm, bytes.fromhex(device_key_hex)
-                    )
+                    device_key = bytes.fromhex(device_key_hex)
             except (ValueError, TypeError, UnicodeDecodeError, json.JSONDecodeError, RecursionError):
                 return _error(400, "invalid enrollment request")
+            if device_key is not None:
+                # The device key is fully validated -- encoding, length, and
+                # the on-curve proof -- before the one-time invitation is
+                # spent.  Validating it afterwards would leave the rider with
+                # a consumed invitation and a writer credential but no device,
+                # and no way to retry without a new operator-issued token.
+                try:
+                    validate_public_key(device_algorithm, device_key)
+                except ValueError:
+                    return _error(400, "invalid enrollment request")
+                except PublicKeyUnavailable:
+                    # The deployment is missing the crypto extra.  Refuse
+                    # without spending the invitation, and without saying so.
+                    return _not_found()
             try:
                 binding = state.enrollments.consume(token, subject=subject)
                 if (
