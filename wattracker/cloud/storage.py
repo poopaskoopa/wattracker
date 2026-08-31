@@ -148,21 +148,73 @@ class MemoryTenantStore:
         kinds: Optional[Iterable[str]] = None,
         limit: int = 100,
         include_deleted: bool = False,
+        after: Optional[str] = None,
+        min_revision: Optional[int] = None,
     ) -> list[CloudObject]:
-        if limit < 1 or limit > 100:
-            raise ValueError("limit must be between 1 and 100")
+        if limit < 1 or limit > 101:
+            raise ValueError("limit must be between 1 and 101")
         scope = self._scope(namespace, local_user_scope)
         allowed = set(kinds) if kinds is not None else None
         with self._lock:
-            rows = self._scopes.get(scope, {})
-            values = [row.value for row in rows.values()]
-            values.sort(key=lambda item: item.object_id)
-            return [
-                value
-                for value in values
-                if (allowed is None or value.kind in allowed)
-                and (include_deleted or not value.deleted)
-            ][:limit]
+            return self._list_objects_locked(
+                scope,
+                allowed=allowed,
+                limit=limit,
+                include_deleted=include_deleted,
+                after=after,
+                min_revision=min_revision,
+            )
+
+    def list_objects_with_revision(
+        self,
+        namespace: str,
+        local_user_scope: str,
+        *,
+        kinds: Optional[Iterable[str]] = None,
+        limit: int = 100,
+        include_deleted: bool = False,
+        after: Optional[str] = None,
+        min_revision: Optional[int] = None,
+    ) -> tuple[int, list[CloudObject]]:
+        """Read a page and its checkpoint from one locked scope snapshot."""
+        if limit < 1 or limit > 101:
+            raise ValueError("limit must be between 1 and 101")
+        scope = self._scope(namespace, local_user_scope)
+        allowed = set(kinds) if kinds is not None else None
+        with self._lock:
+            return (
+                self._revisions.get(scope, 0),
+                self._list_objects_locked(
+                    scope,
+                    allowed=allowed,
+                    limit=limit,
+                    include_deleted=include_deleted,
+                    after=after,
+                    min_revision=min_revision,
+                ),
+            )
+
+    def _list_objects_locked(
+        self,
+        scope: tuple[str, str],
+        *,
+        allowed: Optional[set[str]],
+        limit: int,
+        include_deleted: bool,
+        after: Optional[str],
+        min_revision: Optional[int],
+    ) -> list[CloudObject]:
+        rows = self._scopes.get(scope, {})
+        values = [row.value for row in rows.values()]
+        values.sort(key=lambda item: item.object_id)
+        return [
+            value
+            for value in values
+            if (allowed is None or value.kind in allowed)
+            and (after is None or value.object_id > after)
+            and (min_revision is None or value.revision > min_revision)
+            and (include_deleted or not value.deleted)
+        ][:limit]
 
     def usage(self, namespace: str, local_user_scope: str) -> int:
         scope = self._scope(namespace, local_user_scope)
@@ -509,9 +561,11 @@ class AzureTenantStore:
         kinds: Optional[Iterable[str]] = None,
         limit: int = 100,
         include_deleted: bool = False,
+        after: Optional[str] = None,
+        min_revision: Optional[int] = None,
     ) -> list[CloudObject]:
-        if limit < 1 or limit > 100:
-            raise ValueError("limit must be between 1 and 100")
+        if limit < 1 or limit > 101:
+            raise ValueError("limit must be between 1 and 101")
         partition = self._partition(namespace, local_user_scope)
         allowed = set(kinds) if kinds is not None else None
         entities = self._table.query_entities(
@@ -526,16 +580,47 @@ class AzureTenantStore:
                 continue
             if allowed is not None and entity.get("Kind") not in allowed:
                 continue
+            object_id = row_key[len("object:"):]
+            if after is not None and object_id <= after:
+                continue
             value = self.get(
-                namespace, local_user_scope, row_key[len("object:"):],
+                namespace, local_user_scope, object_id,
                 include_deleted=include_deleted,
             )
             if value is not None:
-                result.append(value)
-            if len(result) >= limit:
-                break
+                if min_revision is None or value.revision > min_revision:
+                    result.append(value)
         result.sort(key=lambda value: value.object_id)
-        return result
+        return result[:limit]
+
+    def list_objects_with_revision(
+        self,
+        namespace: str,
+        local_user_scope: str,
+        *,
+        kinds: Optional[Iterable[str]] = None,
+        limit: int = 100,
+        include_deleted: bool = False,
+        after: Optional[str] = None,
+        min_revision: Optional[int] = None,
+    ) -> tuple[int, list[CloudObject]]:
+        """Read a page and its checkpoint while holding the scope lease."""
+        if limit < 1 or limit > 101:
+            raise ValueError("limit must be between 1 and 101")
+        partition = self._partition(namespace, local_user_scope)
+        with self._scope_lock(partition):
+            return (
+                self.revision(namespace, local_user_scope),
+                self.list_objects(
+                    namespace,
+                    local_user_scope,
+                    kinds=kinds,
+                    limit=limit,
+                    include_deleted=include_deleted,
+                    after=after,
+                    min_revision=min_revision,
+                ),
+            )
 
     def usage(self, namespace: str, local_user_scope: str) -> int:
         partition = self._partition(namespace, local_user_scope)

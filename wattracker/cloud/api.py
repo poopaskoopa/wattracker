@@ -6,6 +6,7 @@ changes local startup, routes, SQLite migrations, or request paths.
 """
 from __future__ import annotations
 
+import base64
 import hashlib
 import hmac
 import json
@@ -643,6 +644,68 @@ def _reader_payload(items: list[Any]) -> bytes:
     ).encode("utf-8")
 
 
+_CONTEXT_KINDS = {
+    "dashboard": {"profile", "training_state", "load_point", "curve"},
+    "volume": {"volume_week"},
+    "curve": {"curve"},
+}
+
+
+def _safe_since(raw: Optional[str]) -> Optional[int]:
+    if raw is None or raw == "":
+        return None
+    try:
+        value = int(raw)
+    except (TypeError, ValueError):
+        raise HTTPException(status_code=400, detail="invalid since")
+    if value < 0:
+        raise HTTPException(status_code=400, detail="invalid since")
+    return value
+
+
+def _cursor_key(secret: bytes, namespace: str, scope: str) -> bytes:
+    return hmac.new(
+        secret, b"context-cursor\0" + namespace.encode() + b"\0" + scope.encode(),
+        hashlib.sha256,
+    ).digest()
+
+
+def _encode_cursor(secret: bytes, namespace: str, scope: str, route: str,
+                   since: Optional[int], after: str) -> str:
+    payload = json.dumps(
+        {"route": route, "since": since, "after": after},
+        separators=(",", ":"), sort_keys=True,
+    ).encode()
+    mac = hmac.new(_cursor_key(secret, namespace, scope), payload, hashlib.sha256).digest()
+    return base64.urlsafe_b64encode(payload + mac).decode().rstrip("=")
+
+
+def _decode_cursor(secret: bytes, namespace: str, scope: str, route: str,
+                   since: Optional[int], raw: Optional[str]) -> Optional[str]:
+    if raw is None:
+        return None
+    try:
+        encoded = raw.encode("ascii")
+        encoded += b"=" * (-len(encoded) % 4)
+        value = base64.urlsafe_b64decode(encoded)
+        payload, mac = value[:-32], value[-32:]
+        expected = hmac.new(
+            _cursor_key(secret, namespace, scope), payload, hashlib.sha256,
+        ).digest()
+        if not hmac.compare_digest(mac, expected):
+            raise ValueError
+        decoded = json.loads(payload.decode())
+        if not isinstance(decoded, dict):
+            raise ValueError
+        if (decoded.get("route") != route or decoded.get("since") != since
+                or not isinstance(decoded.get("after"), str)):
+            raise ValueError
+        return decoded["after"]
+    except (AttributeError, ValueError, TypeError, UnicodeError, json.JSONDecodeError,
+            base64.binascii.Error):
+        raise HTTPException(status_code=400, detail="invalid cursor")
+
+
 def create_cloud_app(
     config: CloudConfig,
     *,
@@ -1119,6 +1182,9 @@ def create_cloud_app(
                     "calendar": True,
                     "profile": True,
                     "races": True,
+                    "dashboard": True,
+                    "volume": True,
+                    "curve": True,
                 },
                 "revision": revision,
             }, separators=(",", ":")).encode()
@@ -1130,17 +1196,49 @@ def create_cloud_app(
                             headers={"Cache-Control": "private, no-store",
                                      "ETag": _etag(namespace, scope, body)})
 
-        async def collection(request: Request, kinds: set[str]) -> Response:
+        async def collection(request: Request, kinds: set[str], *, route: str,
+                             mobile: bool = False) -> Response:
             context_value = _resolve_reader(state, request)
             if context_value is None:
                 return _not_found()
             namespace, scope = _context_scope(context_value)
             limit = _safe_limit(request.query_params.get("limit"))
+            since = _safe_since(request.query_params.get("since")) if mobile else None
+            after = (_decode_cursor(
+                state.config.server_secret, namespace, scope, route, since,
+                request.query_params.get("cursor"),
+            ) if mobile else None)
+            include_deleted = mobile and since is not None
             try:
                 state.quotas.admit_read(namespace, scope, response_bytes=0)
                 with state.quotas.backend_slot():
-                    items = state.store.list_objects(namespace, scope, kinds=kinds, limit=limit)
-                body = _reader_payload(items)
+                    if mobile:
+                        current_revision, items = state.store.list_objects_with_revision(
+                            namespace, scope, kinds=kinds, limit=limit + 1,
+                            include_deleted=include_deleted, after=after,
+                            min_revision=since,
+                        )
+                    else:
+                        current_revision = None
+                        items = state.store.list_objects(
+                            namespace, scope, kinds=kinds, limit=limit,
+                        )
+                has_more = len(items) > limit
+                items = items[:limit]
+                next_cursor = (
+                    _encode_cursor(
+                        state.config.server_secret, namespace, scope, route,
+                        since, items[-1].object_id,
+                    ) if has_more and items else None
+                )
+                if mobile:
+                    body = json.dumps(
+                        {"items": [item.wire(include_deleted=include_deleted) for item in items],
+                         "revision": current_revision, "next_cursor": next_cursor},
+                        sort_keys=True, separators=(",", ":"), ensure_ascii=False,
+                    ).encode("utf-8")
+                else:
+                    body = _reader_payload(items)
                 # Count exact returned bytes without charging a second request.
                 state.quotas.record_read_bytes(namespace, scope, len(body))
             except QuotaExceeded as exc:
@@ -1152,11 +1250,11 @@ def create_cloud_app(
 
         @app.get("/api/v1/context/calendar")
         async def calendar(request: Request) -> Response:
-            return await collection(request, {"calendar", "scheduled_workout"})
+            return await collection(request, {"calendar", "scheduled_workout"}, route="calendar")
 
         @app.get("/api/v1/context/activities")
         async def activities(request: Request) -> Response:
-            return await collection(request, {"activity"})
+            return await collection(request, {"activity"}, route="activities")
 
         @app.get("/api/v1/context/profile")
         async def profile(request: Request) -> Response:
@@ -1166,7 +1264,7 @@ def create_cloud_app(
             # one so that nothing here has to decide what an absent profile
             # looks like: a rider who has published no FTP gets an empty
             # ``items`` array, which is a fact, not an error.
-            return await collection(request, {"profile"})
+            return await collection(request, {"profile"}, route="profile")
 
         @app.get("/api/v1/context/activities/{object_id}")
         async def activity_detail(request: Request, object_id: str) -> Response:
@@ -1192,7 +1290,19 @@ def create_cloud_app(
 
         @app.get("/api/v1/context/races")
         async def races(request: Request) -> Response:
-            return await collection(request, {"race"})
+            return await collection(request, {"race"}, route="races")
+
+        @app.get("/api/v1/context/dashboard")
+        async def dashboard(request: Request) -> Response:
+            return await collection(request, _CONTEXT_KINDS["dashboard"], route="dashboard", mobile=True)
+
+        @app.get("/api/v1/context/volume")
+        async def volume(request: Request) -> Response:
+            return await collection(request, _CONTEXT_KINDS["volume"], route="volume", mobile=True)
+
+        @app.get("/api/v1/context/curve")
+        async def curve(request: Request) -> Response:
+            return await collection(request, _CONTEXT_KINDS["curve"], route="curve", mobile=True)
 
     if sync_enabled():
         @app.post("/api/v1/sync/batches")

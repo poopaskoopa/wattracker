@@ -42,8 +42,31 @@ contract is:
 | `GET /api/v1/context/activities` | read | reader context | — |
 | `GET /api/v1/context/activities/{id}` | read | reader context | — |
 | `GET /api/v1/context/races` | read | reader context | — |
+| `GET /api/v1/context/dashboard` | read | reader context | — |
+| `GET /api/v1/context/volume` | read | reader context | — |
+| `GET /api/v1/context/curve` | read | reader context | — |
 | `POST /api/v1/sync/batches` | sync | APIM subscription + signed request | `write` |
 | `GET /api/v1/sync/status` | sync | APIM subscription + signed request | `write` |
+
+### Mobile read context
+
+The dashboard route returns object kinds `profile`, `training_state`,
+`load_point`, and `curve`; `volume` returns `volume_week`; and `curve` returns
+`curve`. Each route returns an envelope containing `items`, the current scope
+`revision`, and `next_cursor` (or `null`):
+
+```json
+{"items":[{"id":"...","kind":"...","revision":7,"data":{}}],
+ "revision":7,"next_cursor":null}
+```
+
+`?since=N` returns only objects whose object revision is greater than `N`;
+delta responses also include matching tombstones (`"deleted":true`), while
+full reads omit tombstones. A client checkpoints the returned `revision` only
+after consuming all pages. `?limit=` is bounded to 100 and a non-null
+`next_cursor` is passed as `?cursor=` for the next page. Cursors are opaque,
+deterministic, scope-bound, and bound to the route and `since` value; they
+cannot be reused across scopes or to change ordering/filter semantics.
 
 Every "verified subject" above is conditional on
 `CloudConfig.require_verified_subject`, which a deployment may only set while a

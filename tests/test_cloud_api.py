@@ -154,6 +154,205 @@ def test_writer_scope_ignores_caller_installation_and_partition_fields(cloud):
     ).json()["items"] == []
 
 
+def _mobile_reader(state, *, scope="mobile-scope"):
+    token, context = state.credentials.issue_reader_context(
+        new_installation_id(), scope, "entra-user"
+    )
+    return token, context
+
+
+def _mobile_headers(token):
+    return {
+        **READER_HEADERS,
+        "Authorization": f"Bearer {token}",
+    }
+
+
+def _apply_mobile_batch(state, namespace, scope, batch_id, revision, objects):
+    return state.store.apply(
+        namespace,
+        scope,
+        SyncBatch(batch_id=batch_id, revision=revision, objects=tuple(objects)),
+    )
+
+
+def test_mobile_read_surface_routes_filter_kinds_and_expose_revision(cloud):
+    _config, state, client = cloud
+    token, context = _mobile_reader(state)
+    _apply_mobile_batch(
+        state,
+        context.namespace,
+        context.local_user_scope,
+        "mobile-kinds",
+        7,
+        [
+            CloudObject("profile", "profile", 1, {"ftp": 250}),
+            CloudObject("state", "training_state", 2, {"ctl": 42}),
+            CloudObject("load", "load_point", 3, {"date": "2026-08-31"}),
+            CloudObject("curve", "curve", 4, {"points": [1, 2]}),
+            CloudObject("week", "volume_week", 5, {"tss": 300}),
+            CloudObject("activity", "activity", 6, {"duration_s": 60}),
+        ],
+    )
+    headers = _mobile_headers(token)
+
+    dashboard = client.get("/api/v1/context/dashboard", headers=headers)
+    assert dashboard.status_code == 200, dashboard.text
+    dashboard_body = dashboard.json()
+    assert dashboard_body["revision"] == 7
+    assert dashboard_body["next_cursor"] is None
+    assert {item["kind"] for item in dashboard_body["items"]} == {
+        "profile", "training_state", "load_point", "curve",
+    }
+    assert client.get("/api/v1/context/volume", headers=headers).json() == {
+        "items": [{
+            "id": "week", "kind": "volume_week", "revision": 5,
+            "data": {"tss": 300},
+        }],
+        "revision": 7,
+        "next_cursor": None,
+    }
+    assert client.get("/api/v1/context/curve", headers=headers).json()["items"] == [{
+        "id": "curve", "kind": "curve", "revision": 4,
+        "data": {"points": [1, 2]},
+    }]
+    context_response = client.get("/api/v1/context", headers=headers)
+    assert context_response.status_code == 200
+    capabilities = context_response.json()["capabilities"]
+    assert all(capabilities[name] for name in ("dashboard", "volume", "curve"))
+    assert dashboard.headers["cache-control"] == "private, no-store"
+    assert dashboard.headers["etag"]
+
+
+def test_mobile_read_surface_since_returns_tombstones_and_is_scope_local(cloud):
+    _config, state, client = cloud
+    token, context = _mobile_reader(state, scope="first-scope")
+    headers = _mobile_headers(token)
+    _apply_mobile_batch(
+        state,
+        context.namespace,
+        context.local_user_scope,
+        "mobile-before",
+        1,
+        [
+            CloudObject("profile", "profile", 1, {"ftp": 240}),
+            CloudObject("state", "training_state", 1, {"ctl": 30}),
+        ],
+    )
+    full_before = client.get("/api/v1/context/dashboard", headers=headers)
+    assert full_before.json()["revision"] == 1
+    _apply_mobile_batch(
+        state,
+        context.namespace,
+        context.local_user_scope,
+        "mobile-after",
+        2,
+        [
+            CloudObject("profile", "profile", 2, {"ftp": 250}),
+            CloudObject("state", "training_state", 2, {}, deleted=True),
+        ],
+    )
+
+    delta = client.get(
+        "/api/v1/context/dashboard?since=1", headers=headers
+    )
+    assert delta.status_code == 200, delta.text
+    delta_body = delta.json()
+    assert delta_body["revision"] == 2
+    assert [(item["id"], item.get("deleted", False)) for item in delta_body["items"]] == [
+        ("profile", False), ("state", True),
+    ]
+    assert delta_body["items"][0]["data"] == {"ftp": 250}
+
+    # Replaying from an old checkpoint yields the current active state after
+    # applying tombstones, exactly as a full fetch does.
+    replay = client.get(
+        "/api/v1/context/dashboard?since=0", headers=headers
+    ).json()
+    replayed = {}
+    for item in replay["items"]:
+        if item.get("deleted"):
+            replayed.pop(item["id"], None)
+        else:
+            replayed[item["id"]] = item
+    full_now = client.get("/api/v1/context/dashboard", headers=headers).json()
+    assert replayed == {item["id"]: item for item in full_now["items"]}
+    assert client.get(
+        "/api/v1/context/dashboard?since=2", headers=headers
+    ).json() == {"items": [], "revision": 2, "next_cursor": None}
+
+    # A revision from another namespace is not a global clock and cannot
+    # expose or suppress objects in this one.
+    other_token, other_context = _mobile_reader(state, scope="other-scope")
+    _apply_mobile_batch(
+        state,
+        other_context.namespace,
+        other_context.local_user_scope,
+        "other-mobile",
+        99,
+        [CloudObject("other", "profile", 99, {"ftp": 999})],
+    )
+    assert client.get(
+        "/api/v1/context/dashboard?since=99", headers=headers
+    ).json() == {"items": [], "revision": 2, "next_cursor": None}
+    assert [item["id"] for item in client.get(
+        "/api/v1/context/dashboard?since=0",
+        headers=_mobile_headers(other_token),
+    ).json()["items"]] == ["other"]
+
+
+def test_mobile_read_surface_cursor_pagination_is_stable_and_bound_to_query(cloud):
+    _config, state, client = cloud
+    token, context = _mobile_reader(state)
+    _apply_mobile_batch(
+        state,
+        context.namespace,
+        context.local_user_scope,
+        "mobile-pages",
+        1,
+        [
+            CloudObject("a", "profile", 1, {"ftp": 240}),
+            CloudObject("b", "profile", 1, {"ftp": 250}),
+            CloudObject("c", "profile", 1, {"ftp": 260}),
+        ],
+    )
+    headers = _mobile_headers(token)
+    first = client.get(
+        "/api/v1/context/dashboard?limit=1", headers=headers
+    ).json()
+    assert [item["id"] for item in first["items"]] == ["a"]
+    assert first["next_cursor"]
+    second = client.get(
+        "/api/v1/context/dashboard?limit=1&cursor=" + first["next_cursor"],
+        headers=headers,
+    ).json()
+    assert [item["id"] for item in second["items"]] == ["b"]
+    assert second["next_cursor"]
+    third = client.get(
+        "/api/v1/context/dashboard?limit=1&cursor=" + second["next_cursor"],
+        headers=headers,
+    ).json()
+    assert [item["id"] for item in third["items"]] == ["c"]
+    assert third["next_cursor"] is None
+
+    # The cursor is opaque and cannot be replayed against another route or
+    # revision query, nor can malformed signed payloads crash the route.
+    assert client.get(
+        "/api/v1/context/curve?limit=1&cursor=" + first["next_cursor"],
+        headers=headers,
+    ).status_code == 400
+    assert client.get(
+        "/api/v1/context/dashboard?since=0&cursor=" + first["next_cursor"],
+        headers=headers,
+    ).status_code == 400
+    assert client.get(
+        "/api/v1/context/dashboard?cursor=not-a-cursor", headers=headers
+    ).status_code == 400
+    assert client.get(
+        "/api/v1/context/dashboard?cursor=" + first["next_cursor"],
+    ).status_code == 404
+
+
 def test_signature_tampering_replay_and_stale_revision_are_rejected(cloud):
     _config, state, client = cloud
     writer = _writer(state, b"c")

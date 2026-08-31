@@ -153,6 +153,60 @@ def test_azure_store_uses_verified_coordinates_and_recovers_idempotently():
         store.get(namespace, "../other", "a1")
 
 
+@pytest.mark.parametrize("store_factory", [
+    MemoryTenantStore,
+    lambda: AzureTenantStore(_FakeBlobService(), _FakeTableService()),
+])
+def test_tenant_stores_page_revision_deltas_after_a_stable_object_cursor(store_factory):
+    store = store_factory()
+    namespace = "a" * 64
+    store.apply(
+        namespace,
+        "scope",
+        SyncBatch(
+            batch_id="delta-before",
+            revision=1,
+            objects=(
+                CloudObject("a", "profile", 1, {"ftp": 240}),
+                CloudObject("b", "profile", 1, {"ftp": 250}),
+            ),
+        ),
+    )
+    store.apply(
+        namespace,
+        "scope",
+        SyncBatch(
+            batch_id="delta-after",
+            revision=2,
+            objects=(
+                CloudObject("b", "profile", 2, {}, deleted=True),
+                CloudObject("c", "profile", 2, {"ftp": 260}),
+            ),
+        ),
+    )
+
+    first = store.list_objects(
+        namespace,
+        "scope",
+        kinds={"profile"},
+        limit=1,
+        include_deleted=True,
+        min_revision=1,
+        after="a",
+    )
+    second = store.list_objects(
+        namespace,
+        "scope",
+        kinds={"profile"},
+        limit=1,
+        include_deleted=True,
+        min_revision=1,
+        after=first[-1].object_id,
+    )
+    assert [(item.object_id, item.deleted) for item in first] == [("b", True)]
+    assert [(item.object_id, item.deleted) for item in second] == [("c", False)]
+
+
 def test_store_idempotency_and_revision_conflicts_are_atomic():
     store = MemoryTenantStore()
     namespace = "a" * 64
