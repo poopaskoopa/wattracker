@@ -24,6 +24,7 @@ from .security import (
     CredentialRegistry,
     DEFAULT_DEVICE_CAPABILITIES,
     DEVICE_SIGNATURE_ALGORITHMS,
+    DevicePairingRegistry,
     EnrollmentRegistry,
     NonceReplayGuard,
     PublicKeyUnavailable,
@@ -49,6 +50,13 @@ _REFRESH_REVISION = ""
 _MAX_REFRESH_BODY_BYTES = 4 * 1024
 # A device public key is at most a 65-byte uncompressed P-256 point.
 _MAX_DEVICE_KEY_HEX = 130
+# Minting a pairing code carries no body and no idempotent effect either, so
+# the same fixed-envelope treatment applies.  The request path is already part
+# of the canonical request, so this does not add cross-route replay protection
+# -- it only keeps the signed envelope canonical and unambiguous.
+_PAIRING_IDEMPOTENCY_KEY = "device-pairing-code"
+_PAIRING_REVISION = 0
+_MAX_PAIRING_BODY_BYTES = 4 * 1024
 
 
 @dataclass
@@ -104,6 +112,7 @@ class CloudState:
     store: Any
     quotas: QuotaManager
     nonces: NonceReplayGuard
+    pairings: DevicePairingRegistry
 
     @classmethod
     def create(
@@ -139,15 +148,23 @@ class CloudState:
         enrollments = EnrollmentRegistry(
             config.server_secret, backend=security_backend, clock=config.clock
         )
+        # Pairing codes live in the same durable auth state as invitations but
+        # in their own record kind and their own digest space, so neither
+        # registry can ever spend the other's token.
+        pairings = DevicePairingRegistry(
+            config.server_secret, backend=security_backend, clock=config.clock
+        )
         return cls(
             config=config,
             credentials=CredentialRegistry(
                 config.server_secret,
                 enrollment_registry=enrollments,
+                pairing_registry=pairings,
                 backend=security_backend,
                 clock=config.clock,
             ),
             enrollments=enrollments,
+            pairings=pairings,
             store=store if store is not None else MemoryTenantStore(),
             quotas=quotas or QuotaManager(
                 QuotaPolicy(
@@ -680,6 +697,198 @@ def create_cloud_app(
                 "expires_in": READER_CONTEXT_TTL_SECONDS,
                 "capabilities": sorted(getattr(device, "capabilities", ())),
             }, headers={"Cache-Control": "no-store"})
+
+        @app.post("/api/v1/devices/pairing-codes")
+        async def mint_pairing_code(request: Request) -> Response:
+            """Mint a single-use pairing code for the caller's own scope.
+
+            The rider's desktop install is the identity authority here: it
+            already holds a writer credential bound to
+            ``(namespace, local_user_scope)``, and this route binds a code to
+            exactly that pair.  Nothing in the request names a namespace, a
+            scope, an installation, or a subject, so a compromised or curious
+            caller can only ever mint a code into the account it already
+            controls.
+
+            Capability is ``"write"`` rather than a new ``"pair"``
+            capability.  Pairing authority *is* installation authority, and
+            every writer credential already carries ``"write"``, whereas a new
+            capability would need a migration of stored records before any
+            existing desktop could pair its phone.  The practical consequence
+            is the one that matters: a read-only paired device cannot mint a
+            code for another device.
+
+            This route lives on the read plane because minting persists a
+            record in ``CloudAuth``, and only the read plane's managed
+            identity may write that table.  Like every other read-plane
+            route it also requires the gateway-verified Entra subject, so
+            minting takes both the writer's signature and a live rider
+            sign-in, and the minted code inherits that identity.
+            """
+            writer = _writer_auth(state, request, capability="write")
+            try:
+                body = await _bounded_body(request, _MAX_PAIRING_BODY_BYTES)
+            except HTTPException:
+                return _error(400, "invalid pairing request")
+            verified = _verify_writer_request(state, request, writer, body)
+            if verified is None:
+                return _error(401, "writer authorization required")
+            namespace, scope, idem, revision = verified
+            # A fixed envelope: there is nothing for the caller to choose.
+            if not _safe_compare_text(idem, _PAIRING_IDEMPOTENCY_KEY) or (
+                revision != _PAIRING_REVISION
+            ):
+                return _error(401, "writer authorization required")
+            # Subject outcomes are only reachable once the caller has proven
+            # possession of the writer key.
+            verified_subject = request.headers.get(
+                config.verified_subject_header.lower(), ""
+            )
+            if not verified_subject or len(verified_subject) > 256:
+                return _error(401, "writer authorization required")
+            # A writer enrolled through Entra carries the subject that was
+            # verified then; it must still be the one signed in now.  A writer
+            # registered without one -- the HMAC path, which never saw Entra --
+            # has nothing to compare against, so the code takes the subject
+            # presented at mint time.  Either way the code carries a subject,
+            # so a code read off a screen is useless to a different account.
+            stored_subject = getattr(writer, "subject", None)
+            if stored_subject is not None and not _safe_compare_text(
+                stored_subject, verified_subject
+            ):
+                return _error(401, "writer authorization required")
+            subject = stored_subject or verified_subject
+            try:
+                # Minting persists a record, so it is metered like a read
+                # rather than being free.  A refusal here is safe: nothing has
+                # been created and the caller can retry.
+                state.quotas.admit_read(namespace, scope, response_bytes=0)
+            except QuotaExceeded as exc:
+                return _error(
+                    exc.status_code, "read quota exceeded", retry_after=exc.retry_after
+                )
+            try:
+                minted = state.pairings.create(namespace, scope, subject=subject)
+            except (ValueError, RuntimeError):
+                return _error(503, "pairing unavailable")
+            return JSONResponse({
+                "pairing_code": minted.code,
+                "expires_at": minted.expires_at,
+                "expires_in": state.pairings.ttl_seconds,
+            }, headers={"Cache-Control": "no-store"})
+
+        @app.post("/api/v1/devices/pair")
+        async def pair_device(request: Request) -> Response:
+            """Redeem a pairing code for a durable device credential.
+
+            The device supplies a public key and a code, and nothing else it
+            sends is trusted.  The namespace and local scope come from the
+            code's binding -- the same treatment ``SyncBatch.from_wire`` gives
+            a client-supplied ``installation_id``, which it parses and
+            discards.  A body field named ``namespace``, ``local_user_scope``
+            or ``installation_id`` is simply not read.
+
+            Every code failure -- unknown, malformed, expired, already
+            consumed, or redeemed by the wrong verified subject -- returns the
+            identical 404 body and headers as an unknown reader context.  A
+            400 is reachable only for a request that is malformed
+            independently of the code (bad JSON, a missing or unusable public
+            key), which reveals nothing secret because the wire format is
+            public.
+            """
+            if not _apim_proof_valid(state, request):
+                return _not_found()
+            if not state.quotas.public_enabled:
+                return _not_found()
+            subject = request.headers.get(config.verified_subject_header.lower(), "")
+            if not subject or len(subject) > 256:
+                return _not_found()
+            try:
+                body = await _bounded_body(request, _MAX_PAIRING_BODY_BYTES)
+            except HTTPException:
+                return _error(400, "invalid pairing request")
+            try:
+                payload = json.loads(body.decode("utf-8"))
+                if not isinstance(payload, dict):
+                    raise ValueError
+                code = payload.get("code")
+                public_key_hex = payload.get("public_key")
+                algorithm = payload.get("signature_algorithm", "ed25519")
+                if (
+                    not isinstance(code, str)
+                    or not isinstance(public_key_hex, str)
+                    or len(public_key_hex) > _MAX_DEVICE_KEY_HEX
+                    or not isinstance(algorithm, str)
+                    or algorithm not in DEVICE_SIGNATURE_ALGORITHMS
+                ):
+                    raise ValueError
+                public_key = bytes.fromhex(public_key_hex)
+            except (
+                ValueError, TypeError, UnicodeDecodeError, json.JSONDecodeError,
+                RecursionError,
+            ):
+                return _error(400, "invalid pairing request")
+            # The key is fully validated -- encoding, length, and the on-curve
+            # proof -- before the single-use code is spent, for the same
+            # reason enrollment does it in that order: a key rejected
+            # afterwards would burn the rider's code and leave no device.
+            try:
+                validate_public_key(algorithm, public_key)
+            except ValueError:
+                return _error(400, "invalid pairing request")
+            except PublicKeyUnavailable:
+                # The deployment lacks the crypto extra.  Refuse without
+                # spending the code, and without saying why.
+                return _not_found()
+            binding = state.pairings.consume(code, subject)
+            if binding is None:
+                return _not_found()
+            try:
+                device = state.credentials.pair_device(
+                    binding,
+                    public_key,
+                    signature_algorithm=algorithm,
+                    # Devices are issued read-only here, exactly as at
+                    # enrollment.  Widening one is a capability grant on the
+                    # stored record, never an inference from its type.
+                    capabilities=DEFAULT_DEVICE_CAPABILITIES,
+                    # The mint route always binds a subject, so this is the
+                    # code's; the fallback keeps the device pinned to its
+                    # redeemer rather than to nobody if that ever changes.
+                    subject=binding.subject or subject,
+                )
+                token, _context = state.credentials.issue_reader_context_for_scope(
+                    device.namespace, device.local_user_scope, device.subject
+                )
+            except (ValueError, RuntimeError, PublicKeyUnavailable):
+                return _not_found()
+            paired = {
+                "device_credential": device.credential_id,
+                "device_subscription_key": device.subscription_key.decode("ascii"),
+                "device_signature_algorithm": device.signature_algorithm,
+                "device_capabilities": sorted(device.capabilities),
+                # The opaque signing context the device must reproduce in the
+                # canonical request when it refreshes.  It is a signing
+                # namespace, not something the device chose or may change.
+                "signing_namespace": device.namespace,
+                "reader_context": token,
+                "expires_in": READER_CONTEXT_TTL_SECONDS,
+            }
+            body_bytes = json.dumps(paired, separators=(",", ":")).encode()
+            try:
+                # Metered after the fact rather than admitted before: a quota
+                # refusal here would strand a rider holding a spent code and a
+                # credential they never received.
+                state.quotas.record_read_bytes(
+                    device.namespace, device.local_user_scope, len(body_bytes)
+                )
+            except QuotaExceeded:
+                pass
+            return Response(
+                body_bytes,
+                media_type="application/json",
+                headers={"Cache-Control": "no-store"},
+            )
 
         @app.get("/api/v1/context")
         async def context(request: Request) -> Response:

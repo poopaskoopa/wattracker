@@ -4,8 +4,11 @@
 
 APIM is the sole public HTTPS boundary. Clients use an approved APIM
 subscription and tenant-issued enrollment/pairing token. Registration is not
-open: an operator creates or approves an enrollment, binds the device to the
-tenant/user, and issues a short-lived one-time pairing token. Tokens are
+open: an operator creates or approves the *first* enrollment for a rider,
+binds it to the tenant/user, and issues a short-lived one-time pairing token.
+Every device that rider adds afterwards is paired by their own desktop
+install, which is the identity authority for its namespace, with a one-time
+code and no operator credentials — see the pairing section below. Tokens are
 revocable and never logged. The exact Entra tenant, issuer, audience, scopes,
 certificate, and secret references are deployment inputs, not repository
 secrets.
@@ -32,6 +35,8 @@ contract is:
 | `POST /api/v1/enrollment/start` | read | operator token + APIM proof + verified subject | — |
 | `POST /api/v1/enrollment/complete` | read | one-time invitation + APIM proof + verified subject | — |
 | `POST /api/v1/context/refresh` | read | signed device credential + APIM proof + verified subject | `read` |
+| `POST /api/v1/devices/pairing-codes` | read | APIM subscription + signed writer request + APIM proof + verified subject | `write` |
+| `POST /api/v1/devices/pair` | read | one-time pairing code + APIM proof + verified subject | — |
 | `GET /api/v1/context` | read | reader context + APIM proof + verified subject | — |
 | `GET /api/v1/context/calendar` | read | reader context | — |
 | `GET /api/v1/context/activities` | read | reader context | — |
@@ -100,6 +105,148 @@ revocation route yet.
 
 Both Container Apps use `minReplicas=0` and `maxReplicas=1`; cold starts and
 single-instance throughput are accepted operational tradeoffs.
+
+## Pairing a second device, and the same-namespace-per-rider rule
+
+**Rule: one rider, one namespace.** Every device a rider pairs — the desktop,
+the iPhone, the iPad — reads and writes the same
+`(namespace, local_user_scope)` pair. A namespace is
+`HMAC(server_secret, installation_id)` and an `installation_id` is minted once,
+at the desktop's operator-gated enrollment. Nothing after that mints another
+one. A second device does not enroll; it *pairs into* the namespace the
+desktop already owns. This is what stops the iPad opening an empty account,
+which is exactly what a second `enrollment/start` used to produce.
+
+The rider's desktop install is the identity authority. Operator credentials
+bootstrap the *first* install and are never needed again.
+
+```
+operator token ──► enrollment, once ──► installation_id ──► namespace
+                                                              │
+desktop, holding a writer credential bound to (namespace, scope)
+   │
+   ├─► POST /api/v1/devices/pairing-codes
+   │      signed with the writer key; no request field names a namespace
+   │   ◄── ABCD-EFGH-JKMN   single use, <= 900 s   shown on screen or as a QR
+   │
+   │   (the rider carries the code to the phone)
+   ▼
+phone, holding no credential at all
+   │
+   └─► POST /api/v1/devices/pair  { code, public_key }
+       ◄── device credential + its own subscription key + reader context,
+           in the SAME namespace and scope as the desktop
+```
+
+### Minting
+
+`POST /api/v1/devices/pairing-codes` takes the writer's ordinary signed
+envelope — `X-Writer-Credential`, `-Timestamp`, `-Nonce`,
+`-Idempotency-Key`, `-Revision`, `-Signature` over the same
+`canonical_request` framing, the same 300-second freshness window, and the
+same nonce-replay claim — plus the APIM subscription and the
+gateway-verified Entra subject. The idempotency key is the fixed string
+`device-pairing-code` and the revision is `0`, because there is nothing here
+for a caller to choose.
+
+The code is bound to the `(namespace, local_user_scope)` **of the
+authenticated credential**, and to a subject. No request field names a
+namespace, a scope, an installation, or an account; a caller can only ever
+mint into the account it already controls. A writer enrolled through Entra
+carries the subject verified at enrollment and the signed-in subject must
+still match it; a writer registered without one (the HMAC path, which never
+saw Entra) has nothing to compare against, so the code takes the subject
+presented at mint time. Either way the code carries a subject, so a code read
+off somebody's screen is useless to a different account.
+
+Capability is `write`. Pairing authority *is* installation authority, and a
+read-only paired device therefore cannot mint codes for further devices.
+Both routes live on the **read plane**: minting persists a record in
+`CloudAuth`, and only the read plane's managed identity may write that table.
+
+### Redeeming
+
+`POST /api/v1/devices/pair` takes `{code, public_key}` and an optional
+`signature_algorithm` (`ed25519` or `ecdsa-p256-sha256`; a device keeps its
+private half in hardware, so a symmetric algorithm is refused). It returns
+`device_credential`, `device_subscription_key`, `device_signature_algorithm`,
+`device_capabilities`, `signing_namespace`, an initial `reader_context`, and
+`expires_in`.
+
+**The device never chooses its namespace or scope.** Both come from the
+code's binding, the same way `SyncBatch.from_wire` parses and discards a
+client-supplied `installation_id`. A `namespace`, `local_user_scope`,
+`installation_id` or `capabilities` field in the pair body is simply not
+read. Devices are issued `capabilities = {"read"}` here, as at enrollment.
+
+The public key is fully validated — encoding, length, and the on-curve proof
+— *before* the single-use code is spent, so a rejected key never strands a
+rider holding a burnt code and no device.
+
+Every code failure — unknown, malformed, expired, already consumed, or
+redeemed by the wrong verified subject — returns the identical 404 body and
+headers as an unknown reader context. A subject mismatch deliberately does
+not spend the code: a rider redeeming on the wrong account should not lose
+it, and the response says nothing either way. A 400 is reachable only for a
+request malformed independently of the code, which reveals nothing because
+the wire format is public.
+
+A cross-namespace read is a 404, never a 403: a 403 would confirm that an
+object exists somewhere.
+
+### Code shape and entropy
+
+The code is 12 symbols of Crockford Base32 shown as `XXXX-XXXX-XXXX`.
+Crockford's alphabet is 32 symbols with `I`, `L`, `O` and `U` removed, so
+there is no 1/I/l or 0/O confusion; typed input is uppercased, hyphens and
+spaces are dropped, and `I`/`L` fold to `1` and `O` to `0`. Generated codes
+never contain the folded letters, so folding cannot merge two codes or shrink
+the space. `U` is not a legal symbol at all.
+
+Fourteen characters of `A–Z`, `0–9` and `-` are all inside QR alphanumeric
+mode, so the code encodes as a version-2 QR at error-correction level H
+(25×25 modules) — the smallest practical symbol, scannable from a laptop
+screen at arm's length — and stays short enough to type on a phone in
+landscape.
+
+The entropy arithmetic, because the number is the control:
+
+| Quantity | Value |
+|---|---|
+| Alphabet | 32 symbols → 5 bits/symbol |
+| Length | 12 symbols → **60 bits** |
+| Code space | 2^60 = 1,152,921,504,606,846,976 ≈ 1.15 × 10^18 |
+| TTL ceiling | 900 s (default 600 s) |
+| APIM limits | 60 requests/minute and 1,000/day per subscription key |
+
+Inside the 900-second ceiling one subscription key buys at most
+15 × 60 = **900** guesses — below the 1,000/day cap, so the per-minute limit
+is what binds. One key therefore succeeds with probability
+900 / 2^60 = 7.8 × 10^-16.
+
+Sizing it from the other direction: to keep an attacker holding 1,000
+subscription keys — each spending a full daily budget inside one code's
+lifetime, so 9 × 10^5 guesses — below a 2^-32 chance, the code needs
+2^b ≥ 9 × 10^5 × 2^32 ≈ 3.9 × 10^15, i.e. **b ≥ 52 bits**. Sixty bits clears
+that floor by 8 bits, a factor of 256. The APIM product issues one
+subscription per approved account (`approvalRequired: true`,
+`subscriptionsLimit: 1`), so 1,000 keys is already a generous overestimate of
+a real attacker; the limits are keyed on
+`context.Subscription?.Id ?? context.Request.IpAddress`.
+
+The TTL ceiling is enforced in `DevicePairingRegistry`, not left to callers,
+because the whole argument above is stated against a bounded window.
+
+### Not yet reachable through the gateway
+
+`main.bicep` enumerates APIM operations explicitly and does not yet declare
+`/devices/pairing-codes` or `/devices/pair`, so both are unreachable through
+APIM until #165 adds them. Note when it does: APIM's API-level policy
+requires a validated Entra JWT for every path that does not contain `/sync/`,
+which is what supplies `X-Verified-Entra-Subject` to both routes — the
+desktop needs a live rider sign-in to mint, not only its writer credential.
+APIM's `allowed-headers` CORS list also still lacks the `x-device-*` headers
+the app's own CORS middleware already permits.
 
 ## Local offline contract
 

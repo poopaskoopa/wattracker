@@ -59,6 +59,33 @@ _MAX_CAPABILITIES: Final = 16
 DEFAULT_DEVICE_CAPABILITIES: Final = frozenset({"read"})
 DEFAULT_WRITER_CAPABILITIES: Final = frozenset({"read", "write"})
 
+# ---------------------------------------------------------------------------
+# Device pairing codes
+# ---------------------------------------------------------------------------
+# A pairing code is read aloud, typed on a phone in landscape, or scanned from
+# a QR image, so its alphabet is Crockford Base32: 32 symbols with I, L, O and
+# U removed, which kills the 1/I/l and 0/O confusions and makes accidental
+# words unlikely.  Every symbol therefore carries exactly 5 bits.
+_PAIRING_ALPHABET: Final = "0123456789ABCDEFGHJKMNPQRSTVWXYZ"
+_PAIRING_SYMBOLS: Final = 12
+_PAIRING_GROUP: Final = 4
+# 12 symbols x 5 bits.  The arithmetic that justifies this number against the
+# APIM rate limit lives in docs/cloud-sync.md and in the entropy test.
+DEVICE_PAIRING_CODE_BITS: Final = _PAIRING_SYMBOLS * 5
+# Typed input is normalized before it is digested.  Generated codes never
+# contain I, L or O, so folding them onto 1 and 0 cannot merge two distinct
+# codes and cannot shrink the 2**60 code space.  U is not folded: it is simply
+# not a legal symbol.
+_PAIRING_FOLD: Final = {"I": "1", "L": "1", "O": "0"}
+_PAIRING_STRIP: Final = frozenset("- \t")
+_MAX_PAIRING_INPUT: Final = 64
+DEFAULT_DEVICE_PAIRING_TTL_SECONDS: Final = 600.0
+# Hard ceiling.  A pairing code is a bearer secret displayed on a screen; its
+# window is deliberately shorter than an operator invitation's.
+MAX_DEVICE_PAIRING_TTL_SECONDS: Final = 900.0
+_PAIRING_CODE_DOMAIN: Final = b"wattracker-cloud-device-pairing-code-v1\x00"
+_PAIRING_RECORD_KIND: Final = "device-pairing"
+
 
 class SecurityStateUnavailable(RuntimeError):
     """The durable authorization backend is unavailable."""
@@ -1297,6 +1324,363 @@ class EnrollmentRegistry:
         return hmac.compare_digest(expected, binding._proof)
 
 
+def _validate_pairing_ttl(ttl_seconds: object) -> float:
+    """Validate a pairing TTL against the hard 900-second ceiling.
+
+    The ceiling is a security control, not a preference: the whole
+    brute-force argument for a 60-bit code is stated against a bounded
+    window, so a caller must not be able to widen it.
+    """
+
+    ttl = _validate_ttl(ttl_seconds)
+    if ttl > MAX_DEVICE_PAIRING_TTL_SECONDS:
+        raise ValueError("pairing ttl_seconds exceeds the maximum")
+    return ttl
+
+
+@dataclass(frozen=True)
+class DevicePairingCode:
+    """A freshly minted, single-use pairing code and what it is bound to.
+
+    The desktop displays :attr:`code`; the server keeps only its digest.  The
+    namespace and scope are carried here for the minting installation's own
+    benefit -- they are never echoed to the device that redeems the code.
+    """
+
+    code: str = field(repr=False)
+    namespace: str = field(repr=False)
+    local_user_scope: str = field(repr=False)
+    expires_at: float
+    subject: str | None = field(default=None, repr=False)
+
+    def __post_init__(self) -> None:
+        if normalize_pairing_code(self.code) is None:
+            raise ValueError("pairing code is invalid")
+        _require_namespace(self.namespace)
+        _require_local_scope(self.local_user_scope)
+        if self.subject is not None:
+            _require_text(self.subject, "subject")
+
+
+@dataclass(frozen=True)
+class DevicePairingBinding:
+    """The non-secret binding returned after a valid pairing code is spent."""
+
+    namespace: str = field(repr=False)
+    local_user_scope: str = field(repr=False)
+    pairing_id: str = field(repr=False)
+    _proof: bytes = field(repr=False, compare=False)
+    subject: str | None = field(default=None, repr=False, compare=False)
+
+    def __post_init__(self) -> None:
+        _require_namespace(self.namespace)
+        _require_local_scope(self.local_user_scope)
+        _require_opaque_id(self.pairing_id, "pairing_id")
+        _require_bytes(self._proof, "pairing proof")
+        if self.subject is not None:
+            _require_text(self.subject, "subject")
+
+
+@dataclass(frozen=True)
+class _PairingRecord:
+    pairing_id: str
+    namespace: str
+    local_user_scope: str
+    subject: str | None
+    expires_at: float
+
+
+def _pairing_value(record: _PairingRecord) -> dict[str, Any]:
+    return {
+        "pairing_id": record.pairing_id,
+        "namespace": record.namespace,
+        "local_user_scope": record.local_user_scope,
+        "subject": record.subject,
+        "expires_at": record.expires_at,
+    }
+
+
+def _pairing_from_value(value: Mapping[str, Any]) -> _PairingRecord:
+    subject = value.get("subject")
+    return _PairingRecord(
+        _require_opaque_id(value["pairing_id"], "pairing_id"),
+        _require_namespace(value["namespace"]),
+        _require_local_scope(value["local_user_scope"]),
+        None if subject is None else _require_text(subject, "subject"),
+        float(value["expires_at"]),
+    )
+
+
+def generate_pairing_code() -> str:
+    """Return a fresh 60-bit pairing code in grouped display form.
+
+    ``secrets.choice`` draws each symbol from a 32-character alphabet through
+    ``randbelow``, so every symbol is uniform and independent and the code
+    carries the full :data:`DEVICE_PAIRING_CODE_BITS`.
+    """
+
+    symbols = [secrets.choice(_PAIRING_ALPHABET) for _ in range(_PAIRING_SYMBOLS)]
+    return "-".join(
+        "".join(symbols[start : start + _PAIRING_GROUP])
+        for start in range(0, _PAIRING_SYMBOLS, _PAIRING_GROUP)
+    )
+
+
+def normalize_pairing_code(value: object) -> str | None:
+    """Return the canonical ungrouped code, or ``None`` if it is not one.
+
+    Only hyphens and spaces are removed and only I/L/O are folded.  Anything
+    else -- a wrong length, a symbol outside the alphabet, a ``U`` -- is not a
+    code, and the caller must treat that exactly like an unknown code.
+    """
+
+    if not isinstance(value, str) or not value or len(value) > _MAX_PAIRING_INPUT:
+        return None
+    symbols: list[str] = []
+    for character in value.upper():
+        if character in _PAIRING_STRIP:
+            continue
+        folded = _PAIRING_FOLD.get(character, character)
+        if folded not in _PAIRING_ALPHABET:
+            return None
+        symbols.append(folded)
+    if len(symbols) != _PAIRING_SYMBOLS:
+        return None
+    return "".join(symbols)
+
+
+def format_pairing_code(code: str) -> str:
+    """Return the grouped display form of a canonical code."""
+
+    canonical = normalize_pairing_code(code)
+    if canonical is None:
+        raise ValueError("pairing code is invalid")
+    return "-".join(
+        canonical[start : start + _PAIRING_GROUP]
+        for start in range(0, _PAIRING_SYMBOLS, _PAIRING_GROUP)
+    )
+
+
+def _digest_pairing_code(canonical: str) -> bytes:
+    # Domain-separated from every other token digest in this module.  A
+    # pairing code and an enrollment invitation are stored under different
+    # record kinds *and* hash into different spaces, so neither registry can
+    # be made to spend the other's token -- which matters because an
+    # enrollment token buys a writer credential and a pairing code must only
+    # ever buy a read-only device.
+    return hashlib.sha256(_PAIRING_CODE_DOMAIN + canonical.encode("ascii")).digest()
+
+
+class DevicePairingRegistry:
+    """Bounded, single-use registry of desktop-minted device pairing codes.
+
+    Deliberately a sibling of :class:`EnrollmentRegistry` rather than a method
+    on it.  The two share their one-time/expiring/indistinguishable semantics
+    but must never share a token space: an enrollment invitation mints a
+    *writer*, a pairing code mints a read-only *device*, and letting one be
+    redeemed at the other's route would be a privilege escalation.
+
+    Only code digests are retained.  ``consume`` returns ``None`` for every
+    invalid, unknown, expired, already-consumed, and subject-mismatched code.
+    """
+
+    def __init__(
+        self,
+        server_secret: bytes,
+        *,
+        ttl_seconds: float = DEFAULT_DEVICE_PAIRING_TTL_SECONDS,
+        capacity: int = _DEFAULT_CAPACITY,
+        binding_secret: bytes | None = None,
+        backend: SecurityStateBackend | None = None,
+        clock=time.time,
+    ) -> None:
+        self._server_secret = _require_bytes(server_secret, "server_secret")
+        self._ttl = _validate_pairing_ttl(ttl_seconds)
+        self._capacity = _validate_capacity(capacity)
+        self._binding_secret = (
+            _require_bytes(binding_secret, "binding_secret")
+            if binding_secret is not None
+            else hmac.new(
+                self._server_secret,
+                b"wattracker-cloud-device-pairing-binding-v1\x00",
+                hashlib.sha256,
+            ).digest()
+        )
+        self._backend = backend
+        self._clock = clock
+        self._lock = threading.RLock()
+        self._records: dict[bytes, _PairingRecord] = {}
+
+    @property
+    def ttl_seconds(self) -> float:
+        return self._ttl
+
+    def _prune_locked(self, now: float) -> None:
+        for digest, record in tuple(self._records.items()):
+            if record.expires_at <= now:
+                del self._records[digest]
+
+    def _store_record(self, digest: bytes, record: _PairingRecord) -> bool:
+        if self._backend is not None:
+            return bool(
+                self._backend.create(
+                    _PAIRING_RECORD_KIND, digest.hex(), _pairing_value(record)
+                )
+            )
+        if len(self._records) >= self._capacity:
+            raise RuntimeError("pairing capacity is full")
+        if digest in self._records:
+            return False
+        self._records[digest] = record
+        return True
+
+    def create(
+        self,
+        namespace: str,
+        local_user_scope: str,
+        *,
+        subject: str | None = None,
+        ttl_seconds: float | None = None,
+        now: float | None = None,
+    ) -> DevicePairingCode:
+        """Mint a code bound to an already server-derived namespace and scope.
+
+        The caller must have authenticated the installation that owns
+        ``namespace``; this registry binds what it is given and enforces only
+        expiry and one-time consumption.
+        """
+
+        namespace_text = _require_namespace(namespace)
+        scope_text = _require_local_scope(local_user_scope)
+        subject_text = None if subject is None else _require_text(subject, "subject")
+        ttl = self._ttl if ttl_seconds is None else _validate_pairing_ttl(ttl_seconds)
+        current = self._clock() if now is None else float(now)
+        expires_at = current + ttl
+        with self._lock:
+            self._prune_locked(current)
+            # A 60-bit collision with a live code is vanishingly unlikely, but
+            # a consumed row keeps its key forever, so retry rather than hand
+            # the rider a failure.
+            for _attempt in range(4):
+                code = generate_pairing_code()
+                canonical = normalize_pairing_code(code)
+                if canonical is None:  # defensive: the generator emits legal codes
+                    raise RuntimeError("pairing code generation failed")
+                record = _PairingRecord(
+                    _new_id(), namespace_text, scope_text, subject_text, expires_at
+                )
+                if self._store_record(_digest_pairing_code(canonical), record):
+                    return DevicePairingCode(
+                        code, namespace_text, scope_text, expires_at, subject_text
+                    )
+        raise RuntimeError("pairing code collision")
+
+    def consume(
+        self,
+        code: object,
+        subject: str | None = None,
+        *,
+        now: float | None = None,
+    ) -> DevicePairingBinding | None:
+        """Spend a pairing code once, or return ``None`` indistinguishably.
+
+        A subject mismatch deliberately does *not* spend the code: a rider who
+        redeems on the wrong account should not lose it, and the response is
+        identical either way, so nothing is observable.
+        """
+
+        canonical = normalize_pairing_code(code)
+        current = self._clock() if now is None else float(now)
+        if canonical is None:
+            hmac.compare_digest(_DUMMY_DIGEST, _DUMMY_DIGEST)
+            return None
+        supplied = _digest_pairing_code(canonical)
+        with self._lock:
+            record: _PairingRecord | None = None
+            if self._backend is not None:
+                value = self._backend.read(_PAIRING_RECORD_KIND, supplied.hex())
+                if value is None:
+                    hmac.compare_digest(supplied, _DUMMY_DIGEST)
+                    return None
+                try:
+                    record = _pairing_from_value(value)
+                except (KeyError, TypeError, ValueError):
+                    return None
+                if record.expires_at <= current:
+                    hmac.compare_digest(supplied, _DUMMY_DIGEST)
+                    return None
+            else:
+                self._prune_locked(current)
+                for stored_digest, candidate in self._records.items():
+                    if hmac.compare_digest(supplied, stored_digest):
+                        record = candidate
+                        break
+                if record is None or record.expires_at <= current:
+                    hmac.compare_digest(supplied, _DUMMY_DIGEST)
+                    return None
+            if record.subject is not None:
+                try:
+                    supplied_subject = _require_text(subject, "subject")
+                except ValueError:
+                    return None
+                if not hmac.compare_digest(
+                    record.subject.encode("utf-8"), supplied_subject.encode("utf-8")
+                ):
+                    return None
+            if self._backend is not None:
+                if self._backend.consume(
+                    _PAIRING_RECORD_KIND, supplied.hex(), now=current
+                ) is None:
+                    return None
+            else:
+                del self._records[supplied]
+            proof = self._proof_for(
+                record.pairing_id,
+                record.namespace,
+                record.local_user_scope,
+                record.subject,
+            )
+            return DevicePairingBinding(
+                record.namespace,
+                record.local_user_scope,
+                record.pairing_id,
+                proof,
+                record.subject,
+            )
+
+    def _proof_for(
+        self,
+        pairing_id: str,
+        namespace: str,
+        local_user_scope: str,
+        subject: str | None,
+    ) -> bytes:
+        return hmac.new(
+            self._binding_secret,
+            pairing_id.encode("ascii")
+            + namespace.encode("ascii")
+            + local_user_scope.encode("utf-8")
+            + (subject or "").encode("utf-8"),
+            hashlib.sha256,
+        ).digest()
+
+    def verify_binding(self, binding: DevicePairingBinding) -> bool:
+        """Prove a binding came from this registry and was not assembled."""
+
+        if not isinstance(binding, DevicePairingBinding):
+            return False
+        try:
+            expected = self._proof_for(
+                binding.pairing_id,
+                binding.namespace,
+                binding.local_user_scope,
+                binding.subject,
+            )
+        except (AttributeError, UnicodeEncodeError):
+            return False
+        return hmac.compare_digest(expected, binding._proof)
+
+
 class CredentialRegistry:
     """Writer and reader registry with optional shared durable persistence."""
 
@@ -1305,6 +1689,7 @@ class CredentialRegistry:
         server_secret: bytes,
         *,
         enrollment_registry: EnrollmentRegistry | None = None,
+        pairing_registry: DevicePairingRegistry | None = None,
         capacity: int = _DEFAULT_CAPACITY,
         context_capacity: int = _DEFAULT_CAPACITY,
         backend: SecurityStateBackend | None = None,
@@ -1314,6 +1699,7 @@ class CredentialRegistry:
         self._capacity = _validate_capacity(capacity)
         self._context_capacity = _validate_capacity(context_capacity)
         self._enrollment_registry = enrollment_registry
+        self._pairing_registry = pairing_registry
         self._backend = backend
         self._clock = clock
         self._lock = threading.RLock()
@@ -1649,6 +2035,42 @@ class CredentialRegistry:
             capabilities=capabilities,
             subscription_key=subscription_key,
             subject=subject,
+        )
+
+    def pair_device(
+        self,
+        binding: DevicePairingBinding,
+        public_key: bytes,
+        *,
+        signature_algorithm: str = "ed25519",
+        capabilities: object = DEFAULT_DEVICE_CAPABILITIES,
+        subscription_key: bytes | None = None,
+        subject: str | None = None,
+        pairing_registry: "DevicePairingRegistry | None" = None,
+    ) -> DeviceCredential:
+        """Register a device into the namespace a spent pairing code named.
+
+        The namespace and scope come from ``binding`` and nowhere else, and
+        the binding's HMAC proof is re-verified here so a caller that
+        assembled a :class:`DevicePairingBinding` by hand -- rather than
+        obtaining one from :meth:`DevicePairingRegistry.consume` -- cannot
+        name a namespace it never proved ownership of.  This mirrors
+        :meth:`enroll_writer`.
+        """
+
+        if not isinstance(binding, DevicePairingBinding):
+            raise ValueError("invalid pairing binding")
+        registry = pairing_registry or self._pairing_registry
+        if registry is not None and not registry.verify_binding(binding):
+            raise ValueError("invalid pairing binding")
+        return self.register_device_for_scope(
+            binding.namespace,
+            binding.local_user_scope,
+            public_key,
+            signature_algorithm=signature_algorithm,
+            capabilities=capabilities,
+            subscription_key=subscription_key,
+            subject=binding.subject if subject is None else subject,
         )
 
     def lookup_device(self, credential_id: str) -> DeviceCredential | None:
@@ -2048,6 +2470,15 @@ __all__ = [
     "AzureTableSecurityStateBackend",
     "EnrollmentInvitation",
     "InvitationBinding",
+    "DEVICE_PAIRING_CODE_BITS",
+    "DEFAULT_DEVICE_PAIRING_TTL_SECONDS",
+    "MAX_DEVICE_PAIRING_TTL_SECONDS",
+    "DevicePairingBinding",
+    "DevicePairingCode",
+    "DevicePairingRegistry",
+    "format_pairing_code",
+    "generate_pairing_code",
+    "normalize_pairing_code",
     "NonceReplayGuard",
     "MIN_REPLAY_TTL_SECONDS",
     "ReaderContext",

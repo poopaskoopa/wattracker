@@ -3,7 +3,9 @@ import sqlite3
 import zlib
 
 import pytest
+from fastapi.testclient import TestClient
 
+from wattracker.cloud.api import CloudConfig, CloudState, create_cloud_app
 from wattracker.cloud.client import CloudSyncClient, SyncCredentials, SyncResult
 from wattracker.cloud.models import (
     MAX_PAYLOAD_ARRAY_ITEMS,
@@ -11,7 +13,13 @@ from wattracker.cloud.models import (
     ModelError,
     SyncBatch,
 )
-from wattracker.cloud.security import new_installation_id
+from wattracker.cloud.security import (
+    canonical_request,
+    digest_body,
+    generate_signing_keypair,
+    new_installation_id,
+    sign_request,
+)
 from wattracker.cloud.storage import (
     AzureTenantStore,
     MemoryTenantStore,
@@ -436,3 +444,118 @@ def test_snapshot_omits_valid_oversized_stream_but_keeps_activity(tmp_path):
     objects = snapshot_objects(path, 7, include_streams=True)
     assert objects[0].data["avg_power"] == 1
     assert "streams" not in objects[0].data
+
+
+# ---------------------------------------------------------------------------
+# Two riders, two devices each, one colliding local scope name (#152)
+# ---------------------------------------------------------------------------
+
+_ISOLATION_SECRET = b"cloud-test-server-secret-32-bytes-long"
+
+
+def _pairing_mint_headers(writer, nonce, subject):
+    canonical = canonical_request(
+        "POST", "/api/v1/devices/pairing-codes", writer.namespace, 1_000, nonce,
+        digest_body(b""), "device-pairing-code", "0",
+    )
+    return {
+        "Ocp-Apim-Subscription-Key": writer.subscription_key.decode(),
+        "X-Verified-Entra-Subject": subject,
+        "X-Writer-Credential": writer.credential_id,
+        "X-Writer-Timestamp": "1000",
+        "X-Writer-Nonce": nonce,
+        "X-Writer-Idempotency-Key": "device-pairing-code",
+        "X-Writer-Revision": "0",
+        "X-Writer-Signature": sign_request(writer.signing_key, canonical),
+    }
+
+
+def _pair_a_device(client, writer, nonce, subject):
+    """Mint a code as the desktop, redeem it as a phone, return the response."""
+    minted = client.post(
+        "/api/v1/devices/pairing-codes",
+        headers=_pairing_mint_headers(writer, nonce, subject),
+    )
+    assert minted.status_code == 200, minted.text
+    _private, public_key = generate_signing_keypair()
+    paired = client.post("/api/v1/devices/pair", headers={
+        "X-Verified-Entra-Subject": subject,
+    }, json={"code": minted.json()["pairing_code"], "public_key": public_key.hex()})
+    assert paired.status_code == 200, paired.text
+    return paired.json()
+
+
+def test_paired_devices_are_isolated_across_installations_sharing_a_scope_name():
+    """Two riders, the same local scope name, two devices each.
+
+    This is the colliding-scope invariant above carried all the way to the
+    read plane.  ``MemoryTenantStore`` already proves that ``"same-scope"``
+    under two namespaces is two partitions; what #152 has to prove is that
+    pairing cannot collapse them -- both of one rider's devices land in that
+    rider's namespace, and neither can read across.
+    """
+    pytest.importorskip("cryptography")
+    store = MemoryTenantStore()
+    config = CloudConfig(
+        server_secret=_ISOLATION_SECRET,
+        operator_token="operator-token",
+        require_apim_proof=False,
+        clock=lambda: 1_000,
+    )
+    state = CloudState.create(config, store=store)
+    client = TestClient(create_cloud_app(config, state=state))
+
+    riders = {}
+    for name, seed, object_id in (("a", b"a", "ride-a"), ("b", b"b", "ride-b")):
+        writer = state.credentials.register_writer(
+            new_installation_id(), "same-scope", seed * 32, seed[::-1] * 32
+        )
+        store.apply(writer.namespace, "same-scope", _batch(object_id=object_id))
+        devices = [
+            _pair_a_device(client, writer, f"{name}-{index}", f"rider-{name}")
+            for index in ("phone", "tablet")
+        ]
+        riders[name] = (writer, object_id, devices)
+
+    writer_a, object_a, devices_a = riders["a"]
+    writer_b, object_b, devices_b = riders["b"]
+    assert writer_a.namespace != writer_b.namespace
+    assert writer_a.local_user_scope == writer_b.local_user_scope == "same-scope"
+
+    # Both of a rider's devices share that rider's namespace, and no device
+    # was ever issued the other rider's.
+    for writer, _object_id, devices in riders.values():
+        assert {issued["signing_namespace"] for issued in devices} == {
+            writer.namespace
+        }
+        for issued in devices:
+            credential = state.credentials.resolve_device(issued["device_credential"])
+            assert credential.namespace == writer.namespace
+            assert credential.local_user_scope == "same-scope"
+    credential_ids = {
+        issued["device_credential"] for issued in devices_a + devices_b
+    }
+    assert len(credential_ids) == 4
+
+    # Each device sees exactly its own rider's object and nothing else.
+    audience = (
+        [("rider-a", device, object_a, object_b) for device in devices_a]
+        + [("rider-b", device, object_b, object_a) for device in devices_b]
+    )
+    assert len(audience) == 4
+    for subject, issued, mine, theirs in audience:
+        headers = {
+            "Authorization": "Bearer " + issued["reader_context"],
+            "X-Verified-Entra-Subject": subject,
+        }
+        listed = client.get("/api/v1/context/activities", headers=headers)
+        assert listed.status_code == 200, listed.text
+        assert [item["id"] for item in listed.json()["items"]] == [mine]
+
+        # A cross-namespace read is a miss, never a refusal: 403 would confirm
+        # the object exists somewhere.
+        own = client.get(f"/api/v1/context/activities/{mine}", headers=headers)
+        crossed = client.get(f"/api/v1/context/activities/{theirs}", headers=headers)
+        assert own.status_code == 200
+        assert crossed.status_code == 404
+        assert crossed.json() == {"detail": "not found"}

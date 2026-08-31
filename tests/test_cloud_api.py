@@ -7,11 +7,14 @@ from fastapi.testclient import TestClient
 from wattracker.cloud.api import CloudConfig, CloudState, create_cloud_app
 from wattracker.cloud.models import CloudObject, SyncBatch
 from wattracker.cloud.security import (
+    DEVICE_PAIRING_CODE_BITS,
+    MAX_DEVICE_PAIRING_TTL_SECONDS,
     MIN_REPLAY_TTL_SECONDS,
     MemorySecurityStateBackend,
     canonical_request,
     digest_body,
     generate_p256_keypair,
+    generate_pairing_code,
     generate_signing_keypair,
     new_installation_id,
     sign_request,
@@ -1088,3 +1091,566 @@ def test_enrollment_rejects_a_device_key_that_does_not_match_its_algorithm(cloud
     )
     assert accepted.status_code == 200, accepted.text
     assert accepted.json()["device_signature_algorithm"] == "ecdsa-p256-sha256"
+
+
+# ---------------------------------------------------------------------------
+# Desktop-minted device pairing (#152)
+# ---------------------------------------------------------------------------
+
+MINT_PATH = "/api/v1/devices/pairing-codes"
+PAIR_PATH = "/api/v1/devices/pair"
+PAIR_HEADERS = {
+    "X-Verified-Entra-Subject": "entra-user",
+    "X-APIM-Request-Verified": "true",
+    "X-APIM-Client-Certificate-Verified": "true",
+}
+
+
+class _MovableClock:
+    """A deployment clock the test can advance.
+
+    The registries capture ``config.clock`` at construction, so reassigning
+    the attribute afterwards would not move their clocks.
+    """
+
+    def __init__(self, value: float) -> None:
+        self.value = float(value)
+
+    def __call__(self) -> float:
+        return self.value
+
+
+def _mint_headers(credential, *, nonce="mint-1", timestamp=1_000,
+                  idem="device-pairing-code", revision=0, namespace=None,
+                  signer=None, subject="entra-user"):
+    canonical = canonical_request(
+        "POST", MINT_PATH, namespace or credential.namespace, timestamp, nonce,
+        digest_body(b""), idem, str(revision),
+    )
+    sign = signer or (lambda material: sign_request(credential.signing_key, material))
+    headers = {
+        "Ocp-Apim-Subscription-Key": credential.subscription_key.decode(),
+        "X-APIM-Client-Certificate-Verified": "true",
+        "X-Writer-Credential": credential.credential_id,
+        "X-Writer-Timestamp": str(timestamp),
+        "X-Writer-Nonce": nonce,
+        "X-Writer-Idempotency-Key": idem,
+        "X-Writer-Revision": str(revision),
+        "X-Writer-Signature": sign(canonical),
+    }
+    if subject is not None:
+        headers["X-Verified-Entra-Subject"] = subject
+    return headers
+
+
+def _mint(client, credential, **kwargs):
+    return client.post(MINT_PATH, headers=_mint_headers(credential, **kwargs))
+
+
+def _pair(client, code, public_key, *, subject="entra-user", algorithm="ed25519",
+          extra=None):
+    payload = {"code": code, "public_key": public_key.hex(),
+               "signature_algorithm": algorithm}
+    payload.update(extra or {})
+    return client.post(
+        PAIR_PATH, headers={**PAIR_HEADERS, "X-Verified-Entra-Subject": subject},
+        json=payload,
+    )
+
+
+def _subject_writer(state, seed, *, scope="scope", subject="entra-user"):
+    """A writer carrying a verified subject, as ``enrollment/complete`` mints."""
+    writer = _writer(state, seed, scope=scope)
+    assert state.credentials.set_writer_subject(writer.credential_id, subject)
+    resolved = state.credentials.resolve_writer(writer.credential_id)
+    assert resolved.subject == subject
+    return resolved
+
+
+def _paired_device(state, client, writer, *, nonce="mint-1", subject="entra-user"):
+    """Mint a code as the desktop and redeem it as a phone."""
+    private_key, public_key = generate_signing_keypair()
+    minted = _mint(client, writer, nonce=nonce)
+    assert minted.status_code == 200, minted.text
+    paired = _pair(client, minted.json()["pairing_code"], public_key, subject=subject)
+    assert paired.status_code == 200, paired.text
+    device = state.credentials.resolve_device(paired.json()["device_credential"])
+    assert device is not None
+    return device, private_key, paired.json()
+
+
+def test_desktop_pairs_two_devices_into_its_own_single_namespace(cloud):
+    """The iPhone and the iPad land in the same namespace and scope.
+
+    This is the whole point of #152: before it, a second enrollment derived a
+    fresh installation id and therefore a different storage partition, so the
+    second device opened an empty account.
+    """
+    pytest.importorskip("cryptography")
+    _config, state, client = cloud
+    writer = _writer(state, b"a")
+    body = _batch()
+    assert client.post(
+        "/api/v1/sync/batches", headers=_headers(writer, body), content=body
+    ).status_code == 200
+
+    phone, phone_key, phone_body = _paired_device(state, client, writer, nonce="phone")
+    tablet, tablet_key, tablet_body = _paired_device(
+        state, client, writer, nonce="tablet"
+    )
+
+    assert phone.credential_id != tablet.credential_id
+    assert phone.subscription_key != tablet.subscription_key
+    assert phone.namespace == tablet.namespace == writer.namespace
+    assert phone.local_user_scope == tablet.local_user_scope == writer.local_user_scope
+    assert phone_body["device_capabilities"] == ["read"]
+    assert phone_body["signing_namespace"] == writer.namespace
+    assert (
+        phone_body["device_subscription_key"]
+        != tablet_body["device_subscription_key"]
+    )
+
+    # Both devices read the desktop's data through their initial contexts...
+    for issued in (phone_body, tablet_body):
+        listed = client.get("/api/v1/context/activities", headers={
+            **READER_HEADERS, "Authorization": "Bearer " + issued["reader_context"],
+        })
+        assert listed.status_code == 200
+        assert [item["id"] for item in listed.json()["items"]] == ["activity-1"]
+
+    # ...and each keeps reading after its own signed refresh.
+    for device, key, nonce in (
+        (phone, phone_key, "r-phone"), (tablet, tablet_key, "r-tablet"),
+    ):
+        refreshed = client.post(
+            "/api/v1/context/refresh",
+            headers=_refresh_headers(device, key, nonce=nonce),
+        )
+        assert refreshed.status_code == 200, refreshed.text
+        listed = client.get("/api/v1/context/activities", headers={
+            **READER_HEADERS,
+            "Authorization": "Bearer " + refreshed.json()["reader_context"],
+        })
+        assert [item["id"] for item in listed.json()["items"]] == ["activity-1"]
+
+
+def test_pairing_code_is_single_use(cloud):
+    pytest.importorskip("cryptography")
+    _config, state, client = cloud
+    writer = _writer(state, b"a")
+    _first_private, first_public = generate_signing_keypair()
+    _second_private, second_public = generate_signing_keypair()
+
+    code = _mint(client, writer, nonce="once").json()["pairing_code"]
+    assert _pair(client, code, first_public).status_code == 200
+    replayed = _pair(client, code, second_public)
+    assert replayed.status_code == 404
+    assert replayed.json() == {"detail": "not found"}
+    # And the second device's key was never registered anywhere.
+    assert all(
+        credential.verification_key != second_public
+        for credential in state.credentials._devices.values()
+    )
+
+
+def test_pairing_code_expires_against_the_deployment_clock():
+    pytest.importorskip("cryptography")
+    clock = _MovableClock(1_000)
+    config = CloudConfig(
+        server_secret=SECRET, operator_token="operator-token",
+        require_apim_proof=False, clock=clock,
+    )
+    state = CloudState.create(config)
+    client = TestClient(create_cloud_app(config, state=state))
+    writer = _writer(state, b"a")
+    _private, public_key = generate_signing_keypair()
+
+    code = _mint(client, writer, nonce="expiring").json()["pairing_code"]
+    # One second before the 600-second default TTL elapses it still works;
+    # the caller's own clock never enters the decision.
+    clock.value = 1_000 + 599
+    still_live = client.post(PAIR_PATH, headers=PAIR_HEADERS, json={
+        "code": code, "public_key": public_key.hex()})
+    assert still_live.status_code == 200, still_live.text
+
+    later = _mint(client, writer, nonce="later", timestamp=int(clock.value))
+    clock.value += 600
+    expired = client.post(PAIR_PATH, headers=PAIR_HEADERS, json={
+        "code": later.json()["pairing_code"], "public_key": public_key.hex()})
+    assert expired.status_code == 404
+    assert expired.json() == {"detail": "not found"}
+
+
+def test_unknown_expired_and_consumed_pairing_codes_are_indistinguishable(cloud):
+    pytest.importorskip("cryptography")
+    _config, state, client = cloud
+    writer = _writer(state, b"a")
+    _private, public_key = generate_signing_keypair()
+
+    subject_writer = _subject_writer(state, b"s")
+
+    spent = _mint(client, writer, nonce="spent").json()["pairing_code"]
+    assert _pair(client, spent, public_key).status_code == 200
+    consumed = _pair(client, spent, public_key)
+    unknown = _pair(client, generate_pairing_code(), public_key)
+    malformed = _pair(client, "ZZZZ-ZZZZ", public_key)
+    wrong_subject_code = _mint(
+        client, subject_writer, nonce="subject", subject="entra-user"
+    ).json()["pairing_code"]
+    wrong_subject = _pair(
+        client, wrong_subject_code, public_key, subject="someone-else"
+    )
+    missing_context = client.get(
+        "/api/v1/context",
+        headers={**READER_HEADERS, "Authorization": "Bearer " + "x" * 40},
+    )
+
+    responses = [consumed, unknown, malformed, wrong_subject, missing_context]
+    assert {response.status_code for response in responses} == {404}
+    assert {json.dumps(response.json()) for response in responses} == {
+        '{"detail": "not found"}'
+    }
+    assert {response.headers["cache-control"] for response in responses} == {"no-store"}
+
+    # The rejected-subject attempt did not spend the code.  A rider redeeming
+    # on the wrong account must not lose it, and the response says nothing
+    # either way.
+    assert _pair(client, wrong_subject_code, public_key).status_code == 200
+
+
+def test_a_pairing_code_is_bound_to_the_minting_rider_s_verified_subject(cloud):
+    """A code shown on screen is not redeemable by a different Entra account.
+
+    A writer enrolled through Entra carries the subject verified then, and the
+    gateway supplies the subject signed in now; they must agree, and the code
+    inherits it.  A writer registered without a subject -- the HMAC path,
+    which never saw Entra -- has nothing to compare against, so the code takes
+    the subject presented at mint time instead.  Either way the code carries
+    one, so it is useless to a second account.
+    """
+    pytest.importorskip("cryptography")
+    _config, state, client = cloud
+    subject_writer = _subject_writer(state, b"s", subject="rider@example.invalid")
+    _private, public_key = generate_signing_keypair()
+
+    # The signed-in subject must match the one bound at enrollment.
+    assert _mint(
+        client, subject_writer, nonce="hijack", subject="thief"
+    ).status_code == 401
+    code = _mint(
+        client, subject_writer, nonce="bound", subject="rider@example.invalid"
+    ).json()["pairing_code"]
+    assert _pair(client, code, public_key, subject="thief").status_code == 404
+    paired = _pair(client, code, public_key, subject="rider@example.invalid")
+    assert paired.status_code == 200, paired.text
+    device = state.credentials.resolve_device(paired.json()["device_credential"])
+    assert device.subject == "rider@example.invalid"
+
+    # Subject-less writer: the code still binds the subject seen at mint time.
+    plain_writer = _writer(state, b"p")
+    plain_code = _mint(
+        client, plain_writer, nonce="plain", subject="whoever"
+    ).json()["pairing_code"]
+    _other_private, other_public = generate_signing_keypair()
+    assert _pair(
+        client, plain_code, other_public, subject="someone-else"
+    ).status_code == 404
+    plain_paired = _pair(client, plain_code, other_public, subject="whoever")
+    assert plain_paired.status_code == 200, plain_paired.text
+    plain_device = state.credentials.resolve_device(
+        plain_paired.json()["device_credential"]
+    )
+    assert plain_device.subject == "whoever"
+
+
+def test_pairing_code_cannot_be_redeemed_into_another_namespace(cloud):
+    pytest.importorskip("cryptography")
+    _config, state, client = cloud
+    rider_a = _writer(state, b"a", scope="scope-a")
+    rider_b = _writer(state, b"b", scope="scope-b")
+    _private, public_key = generate_signing_keypair()
+
+    code = _mint(client, rider_a, nonce="cross").json()["pairing_code"]
+    # Every field a device could use to name a partition is supplied, and
+    # every one is ignored -- the same treatment SyncBatch.from_wire gives a
+    # client-supplied installation_id.
+    paired = _pair(client, code, public_key, extra={
+        "namespace": rider_b.namespace,
+        "local_user_scope": rider_b.local_user_scope,
+        "installation_id": new_installation_id(),
+        "capabilities": ["read", "write"],
+    })
+    assert paired.status_code == 200, paired.text
+    device = state.credentials.resolve_device(paired.json()["device_credential"])
+    assert device.namespace == rider_a.namespace
+    assert device.namespace != rider_b.namespace
+    assert device.local_user_scope == "scope-a"
+    assert device.capabilities == frozenset({"read"})
+    assert paired.json()["device_capabilities"] == ["read"]
+    assert paired.json()["signing_namespace"] == rider_a.namespace
+
+    # Nor can rider A mint into rider B's namespace by claiming it in the
+    # signed envelope: the server signs against the credential's namespace.
+    forged = _mint(client, rider_a, nonce="forged", namespace=rider_b.namespace)
+    assert forged.status_code == 401
+
+
+def test_pairing_codes_cannot_be_brute_forced_inside_their_ttl(cloud):
+    """The code space, not the endpoint, is what defeats guessing.
+
+    APIM allows 60 requests/minute and 1,000/day per subscription key, so the
+    most guesses one key can spend inside the 900-second TTL ceiling is
+    15 * 60 == 900 -- under the daily cap, so the per-minute limit binds.
+    Against 2**60 codes that is a 7.8e-16 chance.  The endpoint is hammered
+    here only to prove a wrong guess is refused identically and never
+    consumes the outstanding real code.
+    """
+    pytest.importorskip("cryptography")
+    _config, state, client = cloud
+    writer = _writer(state, b"a")
+    _private, public_key = generate_signing_keypair()
+    real = _mint(client, writer, nonce="brute").json()["pairing_code"]
+
+    guesses_per_key = int(MAX_DEVICE_PAIRING_TTL_SECONDS / 60) * 60
+    assert guesses_per_key == 900 and guesses_per_key <= 1_000
+    assert guesses_per_key / 2 ** DEVICE_PAIRING_CODE_BITS < 2 ** -32
+    # Even 1,000 subscription keys, each spending a full daily budget inside
+    # one code's lifetime, stay far below a 2**-32 chance.
+    assert (1_000 * guesses_per_key) / 2 ** DEVICE_PAIRING_CODE_BITS < 2 ** -32
+
+    for _attempt in range(64):
+        guess = generate_pairing_code()
+        assert guess != real
+        response = _pair(client, guess, public_key)
+        assert response.status_code == 404
+        assert response.json() == {"detail": "not found"}
+    # None of that touched the live code.
+    assert _pair(client, real, public_key).status_code == 200
+
+
+def test_only_a_write_capable_credential_can_mint_a_pairing_code(cloud):
+    """Pairing authority is installation authority.
+
+    A read-only paired device holds a valid signing credential and a valid
+    subscription key for the same namespace; the only thing it lacks is
+    "write", and that is what stops it minting codes for further devices.
+    """
+    pytest.importorskip("cryptography")
+    _config, state, client = cloud
+    writer = _writer(state, b"a")
+    device, device_key, _body = _paired_device(state, client, writer, nonce="authority")
+    assert device.capabilities == frozenset({"read"})
+
+    refused = client.post(MINT_PATH, headers=_mint_headers(
+        device, nonce="device-mint",
+        signer=lambda canonical: _sign(device, device_key, canonical),
+    ))
+    assert refused.status_code == 401
+    assert refused.json() == {"detail": "writer authorization required"}
+
+    granted, granted_key = _device(state, capabilities=("read", "write"))
+    allowed = client.post(MINT_PATH, headers=_mint_headers(
+        granted, nonce="granted-mint",
+        signer=lambda canonical: _sign(granted, granted_key, canonical),
+    ))
+    assert allowed.status_code == 200, allowed.text
+
+
+def test_minting_requires_a_fresh_untampered_signed_envelope(cloud):
+    _config, state, client = cloud
+    writer = _writer(state, b"a")
+
+    assert client.post(MINT_PATH).status_code == 401
+    tampered = _mint_headers(writer, nonce="tamper")
+    tampered["X-Writer-Signature"] = "0" * 64
+    assert client.post(MINT_PATH, headers=tampered).status_code == 401
+    wrong_subscription = _mint_headers(writer, nonce="sub")
+    wrong_subscription["Ocp-Apim-Subscription-Key"] = "not-the-key"
+    assert client.post(MINT_PATH, headers=wrong_subscription).status_code == 401
+    stale = _mint_headers(writer, nonce="stale", timestamp=1_000 - 301)
+    assert client.post(MINT_PATH, headers=stale).status_code == 401
+    # The envelope is fixed: neither field is the caller's to choose.
+    assert client.post(
+        MINT_PATH, headers=_mint_headers(writer, nonce="idem", idem="batch-1")
+    ).status_code == 401
+    assert client.post(
+        MINT_PATH, headers=_mint_headers(writer, nonce="rev", revision=7)
+    ).status_code == 401
+    # A body is covered by the signed digest, so one cannot be smuggled in.
+    assert client.post(
+        MINT_PATH, headers=_mint_headers(writer, nonce="bodied"), content=b"{}"
+    ).status_code == 401
+    # Every read-plane route needs the gateway-verified subject; this one is
+    # no exception, and the check sits behind proof of possession.
+    assert client.post(
+        MINT_PATH, headers=_mint_headers(writer, nonce="no-subject", subject=None)
+    ).status_code == 401
+    assert client.post(
+        MINT_PATH, headers=_mint_headers(writer, nonce="long", subject="s" * 257)
+    ).status_code == 401
+
+    replayed = _mint_headers(writer, nonce="once")
+    assert client.post(MINT_PATH, headers=replayed).status_code == 200
+    assert client.post(MINT_PATH, headers=replayed).status_code == 401
+
+
+def test_pairing_rejects_unusable_keys_without_spending_the_code(cloud):
+    pytest.importorskip("cryptography")
+    _config, state, client = cloud
+    writer = _writer(state, b"a")
+    code = _mint(client, writer, nonce="keys").json()["pairing_code"]
+    _private, ed_public = generate_signing_keypair()
+    _p256_private, p256_public = generate_p256_keypair()
+
+    # An Ed25519 key declared as a P-256 point.
+    assert _pair(
+        client, code, ed_public, algorithm="ecdsa-p256-sha256"
+    ).status_code == 400
+    # A symmetric algorithm is not a device algorithm at all: a device keeps
+    # its private half in hardware.
+    assert _pair(client, code, ed_public, algorithm="hmac-sha256").status_code == 400
+    assert client.post(
+        PAIR_PATH, headers=PAIR_HEADERS, content=b"not json"
+    ).status_code == 400
+    assert client.post(PAIR_PATH, headers=PAIR_HEADERS, json={
+        "code": code, "public_key": "zz"}).status_code == 400
+    assert client.post(PAIR_PATH, headers=PAIR_HEADERS, json={
+        "public_key": ed_public.hex()}).status_code == 400
+    assert client.post(PAIR_PATH, headers=PAIR_HEADERS, json=[
+        "code", ed_public.hex()]).status_code == 400
+
+    # None of those spent the code.
+    accepted = _pair(client, code, p256_public, algorithm="ecdsa-p256-sha256")
+    assert accepted.status_code == 200, accepted.text
+    assert accepted.json()["device_signature_algorithm"] == "ecdsa-p256-sha256"
+
+
+def test_a_deployment_without_the_crypto_extra_refuses_without_spending(
+    cloud, monkeypatch
+):
+    """A P-256 pairing on a crypto-less deployment must not burn the code."""
+    pytest.importorskip("cryptography")
+    from wattracker.cloud import security
+
+    _config, state, client = cloud
+    writer = _writer(state, b"a")
+    code = _mint(client, writer, nonce="unavailable").json()["pairing_code"]
+    _private, public_key = generate_p256_keypair()
+
+    def _unavailable(algorithm, key):
+        raise security.PublicKeyUnavailable("cloud extra is not installed")
+
+    monkeypatch.setattr("wattracker.cloud.api.validate_public_key", _unavailable)
+    stranded = _pair(client, code, public_key, algorithm="ecdsa-p256-sha256")
+    assert stranded.status_code == 404
+    assert stranded.json() == {"detail": "not found"}
+
+    monkeypatch.undo()
+    retried = _pair(client, code, public_key, algorithm="ecdsa-p256-sha256")
+    assert retried.status_code == 200, retried.text
+
+
+def test_pairing_requires_the_apim_proof_and_a_verified_subject():
+    pytest.importorskip("cryptography")
+    config = CloudConfig(
+        server_secret=SECRET,
+        operator_token="operator-token",
+        apim_proof_value="proof-value",
+        clock=lambda: 1_000,
+    )
+    state = CloudState.create(config)
+    client = TestClient(create_cloud_app(config, state=state))
+    writer = _writer(state, b"a")
+    _private, public_key = generate_signing_keypair()
+    proof = {"X-APIM-Request-Proof": "proof-value"}
+
+    minted = client.post(
+        MINT_PATH, headers={**_mint_headers(writer, nonce="proofed"), **proof}
+    )
+    assert minted.status_code == 200, minted.text
+    payload = {"code": minted.json()["pairing_code"], "public_key": public_key.hex()}
+
+    unproofed = client.post(
+        PAIR_PATH, headers={"X-Verified-Entra-Subject": "entra-user"}, json=payload
+    )
+    assert unproofed.status_code == 404
+    anonymous = client.post(PAIR_PATH, headers=proof, json=payload)
+    assert anonymous.status_code == 404
+    # Neither attempt spent it.
+    accepted = client.post(PAIR_PATH, headers={
+        **proof, "X-Verified-Entra-Subject": "entra-user"}, json=payload)
+    assert accepted.status_code == 200, accepted.text
+    # Minting without the proof header is refused too.
+    assert client.post(
+        MINT_PATH, headers=_mint_headers(writer, nonce="unproofed")
+    ).status_code == 401
+
+
+def test_pairing_routes_are_absent_from_the_sync_plane():
+    """Both routes live on the read plane.
+
+    Minting persists a record in ``CloudAuth`` and only the read plane's
+    managed identity may write that table (``infra/azure/main.bicep``), so
+    the sync plane could not honour a mint even if it exposed one.
+    """
+    sync_app = create_cloud_app(CloudConfig(
+        server_secret=SECRET, operator_token="operator-token", plane="sync"
+    ))
+    read_app = create_cloud_app(CloudConfig(
+        server_secret=SECRET, operator_token="operator-token", plane="read"
+    ))
+    sync_paths = {route.path for route in sync_app.routes}
+    read_paths = {route.path for route in read_app.routes}
+    assert not {MINT_PATH, PAIR_PATH} & sync_paths
+    assert {MINT_PATH, PAIR_PATH} <= read_paths
+
+
+def test_pairing_survives_a_read_plane_restart():
+    """The phone can be paired by one replica and refresh against another."""
+    pytest.importorskip("cryptography")
+    backend = MemorySecurityStateBackend()
+    config = CloudConfig(
+        server_secret=SECRET,
+        operator_token="operator-token",
+        plane="read",
+        require_apim_proof=False,
+        clock=lambda: 1_000,
+    )
+    state = CloudState.create(config, security_backend=backend)
+    writer = _writer(state, b"a")
+    device_private, device_public = generate_signing_keypair()
+
+    with TestClient(create_cloud_app(config, state=state)) as client:
+        code = _mint(client, writer, nonce="restart").json()["pairing_code"]
+
+    restarted = CloudState.create(config, security_backend=backend)
+    with TestClient(create_cloud_app(config, state=restarted)) as client:
+        paired = _pair(client, code, device_public)
+        assert paired.status_code == 200, paired.text
+        # Single-use holds across the restart boundary too.
+        assert _pair(client, code, device_public).status_code == 404
+
+    device = restarted.credentials.resolve_device(paired.json()["device_credential"])
+    assert device is not None
+    assert device.namespace == writer.namespace
+    with TestClient(create_cloud_app(config, state=restarted)) as client:
+        refreshed = client.post(
+            "/api/v1/context/refresh",
+            headers=_refresh_headers(device, device_private, nonce="post-restart"),
+        )
+    assert refreshed.status_code == 200, refreshed.text
+
+
+def test_the_kill_switch_disables_pairing(cloud):
+    pytest.importorskip("cryptography")
+    _config, state, client = cloud
+    writer = _writer(state, b"a")
+    _private, public_key = generate_signing_keypair()
+    code = _mint(client, writer, nonce="kill").json()["pairing_code"]
+    state.quotas.set_public_enabled(False)
+    assert _pair(client, code, public_key).status_code == 404
+    assert client.post(
+        MINT_PATH, headers=_mint_headers(writer, nonce="kill-mint")
+    ).status_code == 403
+    state.quotas.set_public_enabled(True)
+    assert _pair(client, code, public_key).status_code == 200
