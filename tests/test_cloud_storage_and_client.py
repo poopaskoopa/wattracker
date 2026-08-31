@@ -5,7 +5,12 @@ import zlib
 import pytest
 
 from wattracker.cloud.client import CloudSyncClient, SyncCredentials, SyncResult
-from wattracker.cloud.models import CloudObject, ModelError, SyncBatch
+from wattracker.cloud.models import (
+    MAX_PAYLOAD_ARRAY_ITEMS,
+    CloudObject,
+    ModelError,
+    SyncBatch,
+)
 from wattracker.cloud.security import new_installation_id
 from wattracker.cloud.storage import (
     AzureTenantStore,
@@ -13,7 +18,7 @@ from wattracker.cloud.storage import (
     StorageConflict,
     StaleRevision,
 )
-from wattracker.cloud.snapshot import snapshot_objects
+from wattracker.cloud.snapshot import snapshot_digest, snapshot_objects
 
 
 def _batch(batch_id="b1", revision=1, object_id="a1", deleted=False):
@@ -260,8 +265,96 @@ def test_batch_schema_rejects_paths_urls_commands_and_duplicates():
         })
 
 
+def test_payload_array_bound_allows_realistic_streams_but_stays_bounded():
+    CloudObject("a", "activity", 1, {"samples": [0] * MAX_PAYLOAD_ARRAY_ITEMS})
+    with pytest.raises(ModelError):
+        CloudObject("a", "activity", 1, {"samples": [0] * (MAX_PAYLOAD_ARRAY_ITEMS + 1)})
+
+
 def test_readonly_snapshot_bounds_stream_decompression(tmp_path):
     path = tmp_path / "local.db"
+    conn = sqlite3.connect(path)
+    conn.execute(
+        "CREATE TABLE activities (id INTEGER, user_id INTEGER, start_time TEXT, "
+        "duration_s INTEGER, distance_m REAL, avg_power REAL, avg_hr REAL, "
+        "np REAL, if_ REAL, tss REAL, rpe INTEGER, duplicate_of INTEGER, streams BLOB)"
+    )
+    conn.execute(
+        "CREATE TABLE power_sample_corrections (activity_id INTEGER, user_id INTEGER, "
+        "start_index INTEGER, end_index INTEGER, undone_at TEXT)"
+    )
+    conn.execute(
+        "INSERT INTO activities VALUES (1, 7, '2026-01-01', 1, 0, 1, 1, 1, 1, 1, 1, NULL, ?)",
+        (zlib.compress(json.dumps({"power": [1] * 900_000}).encode()),),
+    )
+    conn.commit()
+    conn.close()
+    objects = snapshot_objects(path, 7, include_streams=True)
+    assert objects[0].data.get("streams") is None
+
+
+def test_snapshot_publishes_effective_power_and_digest_changes(tmp_path):
+    path = tmp_path / "local.db"
+    conn = sqlite3.connect(path)
+    conn.execute(
+        "CREATE TABLE activities (id INTEGER, user_id INTEGER, start_time TEXT, "
+        "duration_s INTEGER, distance_m REAL, avg_power REAL, avg_hr REAL, "
+        "np REAL, if_ REAL, tss REAL, rpe INTEGER, duplicate_of INTEGER, streams BLOB)"
+    )
+    conn.execute(
+        "CREATE TABLE power_sample_corrections (activity_id INTEGER, user_id INTEGER, "
+        "start_index INTEGER, end_index INTEGER, undone_at TEXT)"
+    )
+    power = [100] * 4473
+    power[4471:4473] = [2000, 2000]
+    conn.execute(
+        "INSERT INTO activities VALUES (749, 7, '2026-01-01', 4473, 0, 100, 1, "
+        "100, 1, 1, 5, NULL, ?)",
+        (zlib.compress(json.dumps({"power": power}).encode()),),
+    )
+    conn.execute(
+        "INSERT INTO power_sample_corrections VALUES (749, 7, 4471, 4472, NULL)"
+    )
+    conn.commit()
+    conn.close()
+
+    objects = snapshot_objects(path, 7, include_streams=True)
+    effective = objects[0].data["streams"]["power"]
+    assert effective[4471:4473] == [None, None]
+    assert 2000 not in effective
+
+    before = snapshot_digest(objects)
+    conn = sqlite3.connect(path)
+    conn.execute(
+        "UPDATE power_sample_corrections SET undone_at = '2026-01-02' "
+        "WHERE activity_id = 749"
+    )
+    conn.commit()
+    conn.close()
+    after = snapshot_digest(snapshot_objects(path, 7, include_streams=True))
+    assert before != after
+
+
+def test_snapshot_excludes_hidden_duplicate_activities(tmp_path):
+    path = tmp_path / "local.db"
+    conn = sqlite3.connect(path)
+    conn.execute(
+        "CREATE TABLE activities (id INTEGER, user_id INTEGER, start_time TEXT, "
+        "duration_s INTEGER, distance_m REAL, avg_power REAL, avg_hr REAL, "
+        "np REAL, if_ REAL, tss REAL, rpe INTEGER, duplicate_of INTEGER, streams BLOB)"
+    )
+    values = (1, 7, "2026-01-01", 1, 0, 1, 1, 1, 1, 1, 1, None, None)
+    conn.executemany(
+        "INSERT INTO activities VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        (values, (*values[:1], 7, *values[2:11], 1, None)),
+    )
+    conn.commit()
+    conn.close()
+    assert [obj.object_id for obj in snapshot_objects(path, 7)] == ["activity-1"]
+
+
+def test_snapshot_accepts_legacy_schema_without_duplicate_column(tmp_path):
+    path = tmp_path / "legacy.db"
     conn = sqlite3.connect(path)
     conn.execute(
         "CREATE TABLE activities (id INTEGER, user_id INTEGER, start_time TEXT, "
@@ -270,9 +363,76 @@ def test_readonly_snapshot_bounds_stream_decompression(tmp_path):
     )
     conn.execute(
         "INSERT INTO activities VALUES (1, 7, '2026-01-01', 1, 0, 1, 1, 1, 1, 1, 1, ?)",
-        (zlib.compress(json.dumps({"power": [1] * 900_000}).encode()),),
+        (zlib.compress(json.dumps({"power": [2000]}).encode()),),
+    )
+    conn.execute(
+        "INSERT INTO activities VALUES (2, 7, '2026-01-01', 1, 0, 1, 1, 1, 1, 1, 1, ?)",
+        (zlib.compress(json.dumps([2000]).encode()),),
     )
     conn.commit()
     conn.close()
     objects = snapshot_objects(path, 7, include_streams=True)
-    assert objects[0].data.get("streams") is None
+    assert objects[0].data["streams"] == {"power": [2000]}
+    assert objects[1].data["streams"] == [2000]
+
+
+def test_snapshot_treats_incomplete_corrections_as_absent_and_omits_bad_json(tmp_path):
+    path = tmp_path / "incomplete.db"
+    conn = sqlite3.connect(path)
+    conn.execute(
+        "CREATE TABLE activities (id INTEGER, user_id INTEGER, start_time TEXT, "
+        "duration_s INTEGER, distance_m REAL, avg_power REAL, avg_hr REAL, "
+        "np REAL, if_ REAL, tss REAL, rpe INTEGER, streams BLOB)"
+    )
+    conn.execute(
+        "CREATE TABLE power_sample_corrections (activity_id INTEGER, user_id INTEGER, "
+        "start_index INTEGER, end_index INTEGER)"
+    )
+    conn.executemany(
+        "INSERT INTO activities VALUES (?, 7, '2026-01-01', 1, 0, 1, 1, 1, 1, 1, 1, ?)",
+        (
+            (1, zlib.compress(json.dumps({"power": [2000]}).encode())),
+            (2, zlib.compress(b"not json")),
+        ),
+    )
+    conn.commit()
+    conn.close()
+    objects = snapshot_objects(path, 7, include_streams=True)
+    assert objects[0].data["streams"] == {"power": [2000]}
+    assert "streams" not in objects[1].data
+
+
+def test_snapshot_omits_nonfinite_json_streams(tmp_path):
+    path = tmp_path / "nonfinite.db"
+    conn = sqlite3.connect(path)
+    conn.execute(
+        "CREATE TABLE activities (id INTEGER, user_id INTEGER, start_time TEXT, "
+        "duration_s INTEGER, distance_m REAL, avg_power REAL, avg_hr REAL, "
+        "np REAL, if_ REAL, tss REAL, rpe INTEGER, streams BLOB)"
+    )
+    conn.execute(
+        "INSERT INTO activities VALUES (1, 7, '2026-01-01', 1, 0, 1, 1, 1, 1, 1, 1, ?)",
+        (zlib.compress(b'{"power":[NaN, Infinity, -Infinity]}'),),
+    )
+    conn.commit()
+    conn.close()
+    assert "streams" not in snapshot_objects(path, 7, include_streams=True)[0].data
+
+
+def test_snapshot_omits_valid_oversized_stream_but_keeps_activity(tmp_path):
+    path = tmp_path / "oversized.db"
+    conn = sqlite3.connect(path)
+    conn.execute(
+        "CREATE TABLE activities (id INTEGER, user_id INTEGER, start_time TEXT, "
+        "duration_s INTEGER, distance_m REAL, avg_power REAL, avg_hr REAL, "
+        "np REAL, if_ REAL, tss REAL, rpe INTEGER, streams BLOB)"
+    )
+    conn.execute(
+        "INSERT INTO activities VALUES (1, 7, '2026-01-01', 1, 0, 1, 1, 1, 1, 1, 1, ?)",
+        (zlib.compress(json.dumps({"power": [100] * 16_385}).encode()),),
+    )
+    conn.commit()
+    conn.close()
+    objects = snapshot_objects(path, 7, include_streams=True)
+    assert objects[0].data["avg_power"] == 1
+    assert "streams" not in objects[0].data

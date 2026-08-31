@@ -17,6 +17,7 @@ MAX_KIND_LENGTH = 64
 MAX_BATCH_ID_LENGTH = 128
 MAX_PAYLOAD_BYTES = 512 * 1024
 MAX_BATCH_REVISION = (1 << 63) - 1
+MAX_PAYLOAD_ARRAY_ITEMS = 16_384
 
 _OPAQUE_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._~-]{0,127}$")
 _KIND = re.compile(r"^[a-z][a-z0-9_.-]{0,63}$")
@@ -92,7 +93,7 @@ def _walk_payload(value: Any, *, key: Optional[str] = None, depth: int = 0) -> N
             _walk_payload(child_value, key=child_key, depth=depth + 1)
         return
     if isinstance(value, Sequence) and not isinstance(value, (bytes, bytearray)):
-        if len(value) > 4_096:
+        if len(value) > MAX_PAYLOAD_ARRAY_ITEMS:
             raise ModelError("payload array is too large")
         for child in value:
             _walk_payload(child, depth=depth + 1)
