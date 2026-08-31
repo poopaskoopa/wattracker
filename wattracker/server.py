@@ -4115,10 +4115,18 @@ def create_app() -> FastAPI:
                 ),
             })
             by_date.setdefault(w["scheduled_date"], []).append(wd)
+        calendar_settings = db.get_user_settings(uid)
         for activity in db.activities_for_month_unlinked(uid, y, m):
             activity = dict(activity)
+            activity_date = activity["start_time"][:10]
+            if calendar_settings.get("history_start_date"):
+                started = parse_naive(activity.get("start_time"))
+                if started is not None:
+                    activity_date = to_user_timezone(
+                        started, calendar_settings.get("timezone")
+                    ).date().isoformat()
             activity.update({
-                "date": activity["start_time"][:10],
+                "date": activity_date,
                 "activity": True,
                 "url": f"/activity/{activity['id']}",
             })

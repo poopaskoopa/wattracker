@@ -1834,6 +1834,36 @@ def activities_for_month_unlinked(
     prefix = f"{int(year):04d}-{int(month):02d}"
     conn = connect(path)
     try:
+        settings = conn.execute(
+            "SELECT timezone, history_start_date FROM user_settings WHERE user_id = ?",
+            (user_id,),
+        ).fetchone()
+        cutoff = settings["history_start_date"] if settings else None
+        if cutoff:
+            # The cutoff is defined by the rider's local date. Query the
+            # candidate rows first, then bucket by local date so a ride near
+            # midnight cannot land in the wrong calendar month.
+            rows = conn.execute(
+                "SELECT a.* FROM activities a "
+                "WHERE a.user_id=? AND a.duplicate_of IS NULL "
+                "AND a.start_time IS NOT NULL "
+                "AND NOT EXISTS (SELECT 1 FROM plan_workouts p "
+                "                WHERE p.user_id=a.user_id AND p.completed_activity_id=a.id) "
+                "AND NOT EXISTS (SELECT 1 FROM standalone_workouts s "
+                "                WHERE s.user_id=a.user_id AND s.completed_activity_id=a.id) "
+                "ORDER BY a.start_time ASC, a.id ASC",
+                (user_id,),
+            ).fetchall()
+            visible = _visible_rows(conn, user_id, rows)
+            timezone = settings["timezone"] if settings else None
+            return [
+                _row_summary(row) for row in visible
+                if (
+                    (started := parse_naive(row["start_time"])) is not None
+                    and to_user_timezone(started, timezone).date().isoformat()[:7]
+                    == prefix
+                )
+            ]
         rows = conn.execute(
             "SELECT a.* FROM activities a "
             "WHERE a.user_id=? AND a.duplicate_of IS NULL "

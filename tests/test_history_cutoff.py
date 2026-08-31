@@ -30,6 +30,21 @@ def test_cutoff_is_inclusive_and_reversible_across_aggregates(tmp_path):
     assert len(db.list_activities(uid, path)) == 2
 
 
+def test_cutoff_calendar_month_uses_rider_local_date(tmp_path):
+    path = str(tmp_path / "history.db")
+    db.init_db(path)
+    uid = db.create_user("rider", "hash", path)
+    activity_id = _activity(path, uid, "2026-01-01T02:00:00", "local-december")
+    db.save_user_settings(uid, {
+        "timezone": "America/New_York",
+        "history_start_date": "2025-12-31",
+    }, path)
+    assert [a["id"] for a in db.activities_for_month_unlinked(
+        uid, 2025, 12, path
+    )] == [activity_id]
+    assert db.activities_for_month_unlinked(uid, 2026, 1, path) == []
+
+
 def test_cutoff_changes_analysis_fingerprint_and_curve(tmp_path):
     path = str(tmp_path / "history.db")
     db.init_db(path)
