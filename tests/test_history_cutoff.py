@@ -196,9 +196,10 @@ def test_cloud_snapshot_filters_and_explicitly_converges_with_tombstones(tmp_pat
     kept = _activity(path, uid, "2026-02-01T12:00:00", "kept")
     db.save_user_settings(uid, {"history_start_date": "2026-02-01"}, path)
     objects = snapshot_objects(path, uid)
-    assert [o.object_id for o in objects] == [f"activity-{kept}"]
+    activity_objects = [o for o in objects if o.kind == "activity"]
+    assert [o.object_id for o in activity_objects] == [f"activity-{kept}"]
     prior = {"activity-1": {"kind": "activity", "revision": 3},
-             objects[0].object_id: {"kind": "activity", "revision": 4}}
+             activity_objects[0].object_id: {"kind": "activity", "revision": 4}}
     converged = snapshot_convergence(prior, objects, complete=True)
     deleted = [o for o in converged if o.deleted]
     assert len(deleted) == 1
@@ -225,7 +226,11 @@ def test_cloud_snapshot_does_not_tombstone_a_partial_page_or_raise_on_noop(tmp_p
         for obj in snapshot_convergence(prior, current)
     )
     db.save_user_settings(uid, {"history_start_date": "2027-01-01"}, path)
-    assert snapshot_batch(
+    batch = snapshot_batch(
         path, uid, batch_id="empty", revision=1,
         previously_published={},
-    ) is None
+    )
+    # Derived objects (profile, curve, ...) are user-scoped, not
+    # activity-scoped, so they still publish once every activity is cut
+    # off; only the activity family disappears.
+    assert not any(obj.kind == "activity" for obj in batch.objects)
