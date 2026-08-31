@@ -1954,3 +1954,30 @@ def test_a_code_bound_to_an_identity_is_refused_once_nothing_attests_it():
     fresh = state.pairings.create(writer.namespace, writer.local_user_scope)
     accepted = _pair(client, fresh.code, public_key, subject=None, headers={})
     assert accepted.status_code == 200, accepted.text
+
+
+def test_a_placeholder_proof_value_cannot_claim_a_gateway():
+    """`gateway_attests_subject` must not be satisfiable by a placeholder.
+
+    The flag is what licenses every route to trust the verified-subject
+    header, so a whitespace or trivially short proof value would let a
+    deployment claim a gateway vouches for the subject while the "secret"
+    guarding it is guessable -- and whoever guessed it could then dictate
+    the subject.  An empty value is still allowed and still means exactly
+    "no gateway"; it is the non-empty placeholder that is refused.
+    """
+
+    def _cfg(**overrides):
+        return CloudConfig(
+            server_secret=SECRET, operator_token="operator-token", **overrides
+        )
+
+    for placeholder in (" ", "\t", "  \n ", "0", "proof", "1234567"):
+        with pytest.raises(ValueError, match="must be a secret"):
+            _cfg(apim_proof_value=placeholder)
+
+    # An empty value remains legal: it is how a gateway-less deployment
+    # declares itself, and CloudState.create refuses to serve a verified
+    # subject on top of it.
+    assert not _cfg(apim_proof_value="").gateway_attests_subject
+    assert _cfg(apim_proof_value="proof-value").gateway_attests_subject

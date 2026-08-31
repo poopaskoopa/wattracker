@@ -101,6 +101,16 @@ class CloudConfig:
             raise ValueError("replay TTL must cover the timestamp freshness window")
         if not isinstance(self.apim_proof_value, str) or len(self.apim_proof_value) > 512:
             raise ValueError("apim proof value is invalid")
+        if self.require_apim_proof and self.apim_proof_value:
+            # An empty value deliberately means "no gateway", and
+            # `gateway_attests_subject` reads False for it.  A *non-empty*
+            # value reads True, and that is what licenses every route to trust
+            # the verified-subject header -- so a blank or trivially short one
+            # claims a gateway while being guessable, and whoever guesses it
+            # then dictates the subject.  Refuse the claim rather than let it
+            # stand on a placeholder.
+            if not self.apim_proof_value.strip() or len(self.apim_proof_value) < 8:
+                raise ValueError("apim proof value must be a secret, not a placeholder")
         if not isinstance(self.require_verified_subject, bool):
             raise ValueError("require_verified_subject must be a boolean")
         if any(
