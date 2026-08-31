@@ -1985,6 +1985,12 @@ def daily_tss(
         rows = _visible_rows(conn, user_id, rows)
         settings = get_user_settings(user_id, path)
         out: Dict[_dt.date, float] = {}
+        cutoff = settings.get("history_start_date")
+        if cutoff:
+            try:
+                out[_dt.date.fromisoformat(cutoff)] = 0.0
+            except (TypeError, ValueError):
+                pass
         for r in rows:
             try:
                 started = parse_naive(r["start_time"])

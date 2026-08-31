@@ -1,7 +1,12 @@
+import datetime as dt
+
+import pytest
+
 from wattracker import db
 from wattracker.cloud.snapshot import snapshot_batch, snapshot_convergence, snapshot_objects
 from wattracker.cloud.models import CloudObject
 from wattracker.metrics import curve_store
+from wattracker.metrics.load import compute_load, daily_tss_series
 
 
 def _activity(path, uid, start, ident, power=None):
@@ -43,6 +48,35 @@ def test_cutoff_calendar_month_uses_rider_local_date(tmp_path):
         uid, 2025, 12, path
     )] == [activity_id]
     assert db.activities_for_month_unlinked(uid, 2026, 1, path) == []
+
+
+def test_cutoff_load_starts_at_zero_and_ramps_visible_days(tmp_path):
+    path = str(tmp_path / "history.db")
+    db.init_db(path)
+    uid = db.create_user("rider", "hash", path)
+    _activity(path, uid, "2025-12-01T12:00:00", "hidden")
+    _activity(path, uid, "2026-02-01T12:00:00", "first-visible")
+    _activity(path, uid, "2026-02-02T12:00:00", "next-visible")
+    db.save_user_settings(uid, {
+        "timezone": "UTC",
+        "history_start_date": "2026-01-01",
+    }, path)
+
+    daily = db.daily_tss(uid, path)
+    assert daily[dt.date(2026, 1, 1)] == 0.0
+    assert list(daily) == [dt.date(2026, 1, 1),
+                           dt.date(2026, 2, 1), dt.date(2026, 2, 2)]
+    load = compute_load(daily_tss_series(daily))
+    assert load[0] == {
+        "date": "2026-01-01", "tss": 0.0,
+        "ctl": 0.0, "atl": 0.0, "tsb": 0.0,
+    }
+    assert load[31]["date"] == "2026-02-01"
+    assert load[31]["ctl"] == pytest.approx(64 / 42, abs=0.01)
+    assert load[31]["atl"] == pytest.approx(64 / 7, abs=0.01)
+    assert load[32]["date"] == "2026-02-02"
+    assert load[32]["ctl"] > load[31]["ctl"]
+    assert load[32]["atl"] > load[31]["atl"]
 
 
 def test_cutoff_changes_analysis_fingerprint_and_curve(tmp_path):
