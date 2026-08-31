@@ -332,7 +332,8 @@ streams; the existing 512 KiB object and decompression limits still apply.
 The deployed container entrypoint is `python -m wattracker.cloud.runtime`. It
 constructs `AzureTenantStore` with managed identity and private Blob/Table
 endpoints; shared credential/context state is persisted in the separate
-`CloudAuth` table and replay claims in `CloudReplay`. The in-memory stores are
+`CloudAuth` table, and replay claims plus daily quota counters in `CloudReplay`
+on the sync plane and in `CloudAuth` on the read plane. The in-memory stores are
 test-only. Images, server secret,
 operator token, APIM proof secret, storage account, and exact origin are
 deployment inputs. APIM overwrites a private proof header on every backend
@@ -341,10 +342,45 @@ certificate header.
 
 ## Operations and cost
 
-The Bicep budget alerts at 50%, 80%, and 100% actual usage. APIM's quota and
-rate-limit policies are the durable production request limits. The app-side
-quota counters are best-effort process-local backstops and reset after restart
-or replica replacement. Operators must also alert on APIM 4xx/5xx, auth
+The Bicep budget alerts at 50%, 80%, and 100% actual usage.
+
+**The app-side daily quota counters are durable.** Uploaded bytes, stored
+objects, read bytes, and read requests are each counted per rider scope *and*
+per installation in a shared table row, charged with the same etag-guarded
+compare-and-swap that `claim_replay` uses for nonce claims. A counter therefore
+survives a process restart and is shared by every replica charging it, which is
+what makes it a real limit here: the container apps run at `minReplicas: 0` and
+cycle constantly, so a process-local counter is reset by the platform several
+times a day and enforces nothing. `CloudState.create(...,
+require_persistent_security=True)` refuses a non-durable quota manager at boot,
+the same way it refuses an in-memory auth backend. The process-local manager
+remains for tests and local development.
+
+Counters are addressed by `(namespace, scope-or-installation, metric)` and
+carry their UTC day inside the row; the first charge of a new day reclaims that
+row in place and discards yesterday's total. Nothing is deleted, because no
+managed identity holds a table `entities/delete` action, and nothing
+accumulates: the row count is bounded by the number of (subject, metric) pairs,
+not by elapsed days. Counter rows live in the same table each plane already
+writes for replay claims — `CloudAuth` for the read plane, `CloudReplay` for
+the sync plane — so no new table and no new role is required. The two planes
+therefore count into separate tables, which bounds a rider's worst case at one
+daily allowance per plane rather than one per replica or per restart.
+
+`max_stored_bytes_per_scope` is a level rather than a daily counter: it is
+asserted against the object store's own usage, which is already durable, and it
+is checked before anything is charged so a scope over its storage cap does not
+also burn its daily upload allowance.
+
+Two app-side limits stay deliberately process-local, because they shape one
+replica's instantaneous load rather than a day's spend: the
+100-request-per-second global window and the two-slot backend concurrency
+semaphore. The budget kill switch (`writes_enabled` / `public_enabled`) is also
+still process-local and is tracked as a followup. APIM's `quota-by-key` and
+`rate-limit-by-key` policies remain configured while the gateway exists, but
+the daily budgets no longer depend on them.
+
+Operators must also alert on APIM 4xx/5xx, auth
 failures, sync conflicts, queue age, storage availability, and Container App
 restarts. Budgets and quotas reduce surprise
 but do not guarantee a zero bill: Azure may charge for provisioned services,

@@ -27,6 +27,12 @@ _TOKEN_BYTES: Final = 32
 _DEFAULT_TTL_SECONDS: Final = 300.0
 READER_CONTEXT_TTL_SECONDS: Final = _DEFAULT_TTL_SECONDS
 MIN_REPLAY_TTL_SECONDS: Final = 600.0
+# A contended counter row retries its compare-and-swap this many times
+# before the charge is reported as unavailable.  Every retry is a lost
+# race against another replica, not an error: the losing caller re-reads
+# and re-applies, exactly as ``claim_replay`` re-reads before replacing.
+_COUNTER_CAS_ATTEMPTS: Final = 5
+_COUNTER_DAY_RE: Final = re.compile(r"\A\d{4}-\d{2}-\d{2}\Z")
 _DEFAULT_CAPACITY: Final = 10_000
 _CANONICAL_DOMAIN: Final = b"wattracker-cloud-request-v1\x00"
 _DUMMY_DIGEST: Final = hashlib.sha256(b"wattracker-cloud-dummy").digest()
@@ -91,6 +97,57 @@ class SecurityStateUnavailable(RuntimeError):
     """The durable authorization backend is unavailable."""
 
 
+def _validate_counter_charge(day: object, amount: object, ceiling: object) -> None:
+    """Reject a charge a backend must never persist.
+
+    A malformed day, a non-positive amount, or a non-positive ceiling all
+    describe a counter that would either never expire or never refuse, so
+    they are refused at the boundary rather than stored.
+    """
+
+    if not isinstance(day, str) or _COUNTER_DAY_RE.fullmatch(day) is None:
+        raise ValueError("counter day must be an ISO UTC date")
+    for name, value in (("amount", amount), ("ceiling", ceiling)):
+        if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+            raise ValueError(f"counter {name} must be a positive integer")
+
+
+def _counter_next(
+    record: object, *, day: str, amount: int, expires_at: float, now: float
+) -> tuple[int, str, float]:
+    """Fold one charge into a stored counter record.
+
+    A record whose own day has ended is *reclaimed in place*: the same row
+    becomes the new day's counter.  That is what keeps the table bounded by
+    the number of (subject, metric) pairs rather than one row per day
+    forever, and it needs no delete action -- which no deployed managed
+    identity holds.
+
+    A live record carrying a *different* day can only come from a replica
+    whose clock runs ahead.  Its charge joins that record instead of
+    resetting it, so the day a counter belongs to only ever moves forward
+    and a lagging replica can never zero a counter already in force.
+
+    An unreadable or negative record is treated as expired: resetting it
+    counts the current request and lets the counter heal, where trusting it
+    would hand out free quota and refusing forever would strand the rider.
+    """
+
+    if not isinstance(record, Mapping):
+        return int(amount), day, float(expires_at)
+    try:
+        stored_day = str(record["day"])
+        stored_value = int(record["value"])
+        stored_expiry = float(record["expires_at"])
+        if stored_value < 0 or _COUNTER_DAY_RE.fullmatch(stored_day) is None:
+            raise ValueError("counter record is invalid")
+    except (KeyError, TypeError, ValueError):
+        return int(amount), day, float(expires_at)
+    if stored_expiry <= now:
+        return int(amount), day, float(expires_at)
+    return stored_value + int(amount), stored_day, stored_expiry
+
+
 class SecurityStateBackend(Protocol):
     """Minimal shared persistence contract for cloud authorization state."""
 
@@ -107,6 +164,18 @@ class SecurityStateBackend(Protocol):
     def claim_replay(
         self, kind: str, key: str, *, expires_at: float, now: float
     ) -> bool: ...
+
+    def charge_counter(
+        self,
+        kind: str,
+        key: str,
+        *,
+        day: str,
+        amount: int,
+        ceiling: int,
+        expires_at: float,
+        now: float,
+    ) -> int | None: ...
 
 
 class MemorySecurityStateBackend:
@@ -161,6 +230,46 @@ class MemorySecurityStateBackend:
             self._records[record_key] = {"expires_at": float(expires_at)}
             return True
 
+    def charge_counter(
+        self,
+        kind: str,
+        key: str,
+        *,
+        day: str,
+        amount: int,
+        ceiling: int,
+        expires_at: float,
+        now: float,
+    ) -> int | None:
+        """Add to a daily counter, refusing to cross ``ceiling``.
+
+        The check and the increment are one atomic step, as the claim in
+        ``claim_replay`` is: a ceiling read in one round trip and applied
+        in another stops being a ceiling the moment two callers run at
+        once.
+        """
+
+        _validate_counter_charge(day, amount, ceiling)
+        if amount > ceiling:
+            return None
+        record_key = (kind, key)
+        with self._lock:
+            total, stored_day, stored_expiry = _counter_next(
+                self._records.get(record_key),
+                day=day,
+                amount=amount,
+                expires_at=expires_at,
+                now=now,
+            )
+            if total > ceiling:
+                return None
+            self._records[record_key] = {
+                "day": stored_day,
+                "value": total,
+                "expires_at": stored_expiry,
+            }
+            return total
+
 
 class AzureTableSecurityStateBackend:
     """Azure Table implementation shared by the read and sync Container Apps.
@@ -202,6 +311,23 @@ class AzureTableSecurityStateBackend:
         if not re.fullmatch(r"[0-9a-f]{64}", key):
             raise ValueError("security record key is invalid")
         return f"{kind}:{key}"
+
+    @staticmethod
+    def _require_etag(entity: object) -> str:
+        """The concurrency token every compare-and-swap here depends on.
+
+        A missing etag is refused rather than defaulted: an unconditional
+        update would silently become a last-writer-wins overwrite, which is
+        precisely the lost update these paths exist to prevent.
+        """
+
+        etag = entity.get("etag") or entity.get("odata.etag")
+        if not etag:
+            metadata = getattr(entity, "metadata", None)
+            etag = metadata.get("etag") if isinstance(metadata, Mapping) else None
+        if not etag:
+            raise RuntimeError("Azure security record is missing concurrency metadata")
+        return str(etag)
 
     @staticmethod
     def _not_found(exc: Exception) -> bool:
@@ -268,12 +394,7 @@ class AzureTableSecurityStateBackend:
         value = self._decode(entity)
         if float(value.get("expires_at", 0)) <= now:
             return None
-        etag = entity.get("etag") or entity.get("odata.etag")
-        if not etag:
-            metadata = getattr(entity, "metadata", None)
-            etag = metadata.get("etag") if isinstance(metadata, Mapping) else None
-        if not etag:
-            raise RuntimeError("Azure security record is missing concurrency metadata")
+        etag = self._require_etag(entity)
         try:
             from azure.core import MatchConditions
             from azure.data.tables import UpdateMode
@@ -318,12 +439,7 @@ class AzureTableSecurityStateBackend:
                 return False
         except (KeyError, TypeError, ValueError):
             return False
-        etag = entity.get("etag") or entity.get("odata.etag")
-        if not etag:
-            metadata = getattr(entity, "metadata", None)
-            etag = metadata.get("etag") if isinstance(metadata, Mapping) else None
-        if not etag:
-            raise RuntimeError("Azure security record is missing concurrency metadata")
+        etag = self._require_etag(entity)
         entity["Payload"] = self._payload(payload)
         entity["Consumed"] = False
         try:
@@ -341,6 +457,97 @@ class AzureTableSecurityStateBackend:
             if self._conflict(exc):
                 return False
             raise
+
+    def charge_counter(
+        self,
+        kind: str,
+        key: str,
+        *,
+        day: str,
+        amount: int,
+        ceiling: int,
+        expires_at: float,
+        now: float,
+    ) -> int | None:
+        """Atomically add to a daily counter, refusing to cross a ceiling.
+
+        Same shape as ``claim_replay``: try to create the row, and on the
+        conflict that means somebody got there first, re-read and replace
+        it under its etag.  The difference is what a lost race means.  A
+        lost replay claim is a replay and ends the call; a lost counter
+        race only means another replica charged the same row first, so the
+        charge is re-applied to the value that won rather than dropped --
+        dropping it is exactly the lost increment this must not have.
+        """
+
+        _validate_counter_charge(day, amount, ceiling)
+        if amount > ceiling:
+            # One charge larger than the whole day is refused without a
+            # write: creating the row would persist a total already past
+            # the ceiling, and the next charge would inherit it.
+            return None
+        row_key = self._row_key(kind, key)
+
+        def _entity_for(total: int, counter_day: str, expiry: float) -> dict:
+            return {
+                "PartitionKey": _AUTH_PARTITION,
+                "RowKey": row_key,
+                "Payload": self._payload({
+                    "day": counter_day,
+                    "value": int(total),
+                    "expires_at": float(expiry),
+                }),
+                "Consumed": False,
+            }
+
+        try:
+            self._table.create_entity(_entity_for(amount, day, expires_at))
+            return int(amount)
+        except Exception as exc:
+            if not self._conflict(exc):
+                raise
+
+        for _attempt in range(_COUNTER_CAS_ATTEMPTS):
+            entity = self._entity(kind, key)
+            if entity is None:
+                try:
+                    self._table.create_entity(_entity_for(amount, day, expires_at))
+                    return int(amount)
+                except Exception as exc:
+                    if not self._conflict(exc):
+                        raise
+                    continue
+            try:
+                current: object = self._decode(entity)
+            except (KeyError, TypeError, ValueError):
+                current = None
+            total, stored_day, stored_expiry = _counter_next(
+                current, day=day, amount=amount, expires_at=expires_at, now=now
+            )
+            if total > ceiling:
+                return None
+            etag = self._require_etag(entity)
+            updated = _entity_for(total, stored_day, stored_expiry)
+            entity["Payload"] = updated["Payload"]
+            entity["Consumed"] = False
+            try:
+                from azure.core import MatchConditions
+                from azure.data.tables import UpdateMode
+
+                self._table.update_entity(
+                    entity,
+                    mode=UpdateMode.MERGE,
+                    etag=etag,
+                    match_condition=MatchConditions.IfNotModified,
+                )
+                return total
+            except Exception as exc:
+                if not self._conflict(exc):
+                    raise
+        # Out of attempts is not "admitted": the caller turns this into a
+        # refusal, because a charge that was never persisted must not buy
+        # the resource it was meant to pay for.
+        raise SecurityStateUnavailable("quota counter is too contended to charge")
 
     def verify_access(self, *, writable: bool) -> None:
         """Fail startup if the managed identity lacks required table access."""

@@ -52,7 +52,7 @@ All five blockers from the security review are fixed and verified in `6431b82` (
 | B1 | Replay guard used the client's `X-Writer-Timestamp` as its clock; pruning was global, so one writer could expire another's nonce | `now=now` at the `nonces.accept` call site; `MIN_REPLAY_TTL_SECONDS = 600`; `CloudConfig.replay_ttl_seconds` validated against the freshness window; durable `claim_replay` on a `CloudReplay` table with etag-guarded compare-and-swap |
 | B2 | Public container ingress; "mTLS" was a forgeable `x-apim-client-certificate-verified` header | `require_mtls`/`mtls_header` deleted outright; ACA environment `internal: true`, `external: false` on both apps |
 | B3 | `validate-client-certificate` bound no identity | Policy and the cert-as-auth-factor claim removed; APIM on Standard SKU with `virtualNetworkType: 'External'` |
-| B4 | Daily quotas were per-process dicts under `minReplicas: 0` | `QuotaManager.durable = False`, documented as a best-effort backstop with APIM `quota-by-key` as the durable control |
+| B4 | Daily quotas were per-process dicts under `minReplicas: 0` | Closed by #179: counters are durable, charged with an etag-guarded compare-and-swap, and `require_persistent_security=True` refuses a process-local manager. APIM `quota-by-key` is no longer the control the app depends on |
 | B5 | `hmac.compare_digest` raised `TypeError` on non-ASCII latin-1 headers, including a pre-auth site on every request | `_safe_compare_text` at all three sites; the `marker == "true"` fallback in `_apim_proof_valid` also removed |
 
 Regression coverage for B1/B5 lives in `tests/test_cloud_api.py`
@@ -197,7 +197,24 @@ Still open in the same area, and deliberately not in #152's scope:
 - `main.bicep:354` — `stagingEnvironmentPolicy: 'Enabled'` creates publicly reachable PR preview
   environments.
 - Expired invitation/context rows in `CloudAuth` are never deleted (no role has a delete action);
-  the table grows monotonically.
+  the table grows monotonically. Daily quota counters (#179) deliberately do *not* add to this:
+  their row address omits the day and the first charge of a new day reclaims the row in place, so
+  they are bounded by the number of (subject, metric) pairs. If a cleanup job with a delete role
+  ever exists, quota rows need nothing from it.
+- The budget kill switch is still process-local. `set_writes_enabled` / `set_public_enabled` live in
+  one `QuotaManager` instance, so the 80%/100% budget actions stop only the replicas that were
+  running when they fired; the next cold start comes up enabled. #179 made the daily *counters*
+  durable and deliberately did not widen its scope to the switch. It wants the same treatment: a
+  durable flag row read on the admission path, cheaply cached.
+- The per-second global window (`global_requests_per_second`) and the backend concurrency semaphore
+  are process-local by design, so N replicas allow N times the configured rate. That is correct for
+  a load shaper and wrong for anyone reading it as a global limit; with APIM removed (#164) it is
+  the only rate limit left, so the number should be revisited against replica count.
+- Read-plane and sync-plane counters live in different tables (`CloudAuth` and `CloudReplay`),
+  because the sync identity holds only read access to `CloudAuth`. Read metrics charged by the sync
+  plane's `/api/v1/sync/status` therefore do not share a counter with the read plane's. Worst case
+  is one daily allowance per plane. Folding both onto one `CloudQuota` table is a Bicep change
+  (#164/#165 own that file), not an app change.
 
 ### 7. Drop the binary runbook
 

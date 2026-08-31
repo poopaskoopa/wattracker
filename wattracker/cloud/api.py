@@ -18,7 +18,12 @@ from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, Response
 
-from .limits import QuotaExceeded, QuotaManager, QuotaPolicy
+from .limits import (
+    DurableQuotaCounters,
+    QuotaExceeded,
+    QuotaManager,
+    QuotaPolicy,
+)
 from .models import ModelError, SyncBatch
 from .security import (
     CredentialRegistry,
@@ -131,6 +136,32 @@ class CloudConfig:
         return bool(self.require_apim_proof and self.apim_proof_value)
 
 
+def _build_quota_manager(
+    config: "CloudConfig", quota_backend: SecurityStateBackend | None
+) -> QuotaManager:
+    """Build the daily-counter manager, durable wherever it can be.
+
+    A durable backend is used whenever one is available, including in
+    tests, so the durable path is the one that is exercised rather than a
+    production-only branch nobody runs until it fails.
+    """
+
+    policy = QuotaPolicy(
+        max_request_bytes=config.max_request_bytes,
+        max_decompressed_batch_bytes=config.max_decompressed_batch_bytes,
+    )
+    if quota_backend is not None and bool(getattr(quota_backend, "durable", False)):
+        try:
+            return QuotaManager(policy, counters=DurableQuotaCounters(quota_backend))
+        except ValueError:
+            # A durable backend that cannot charge counters is a backend
+            # from an older contract.  Fall back to the process-local
+            # counters, which `require_persistent_security` then refuses
+            # rather than letting a deployment believe it is metered.
+            pass
+    return QuotaManager(policy)
+
+
 @dataclass
 class CloudState:
     """Dependency-injection seam for the API and its tests."""
@@ -152,6 +183,7 @@ class CloudState:
         quotas: Optional[QuotaManager] = None,
         security_backend: SecurityStateBackend | None = None,
         replay_backend: SecurityStateBackend | None = None,
+        quota_backend: SecurityStateBackend | None = None,
         require_persistent_security: bool = False,
     ) -> "CloudState":
         # Every plane now consumes replay nonces: the read plane verifies
@@ -162,6 +194,13 @@ class CloudState:
         replay_required = config.plane in {"read", "sync", "all"}
         if replay_required:
             replay_backend = replay_backend or security_backend
+        # Daily quota counters need a table this identity may *write*.  The
+        # replay backend is that table on every plane: the read plane claims
+        # nonces in CloudAuth, which it writes, and the sync plane claims
+        # them in CloudReplay, which it writes while holding only read
+        # access to CloudAuth.  Following the replay backend therefore needs
+        # no new table and no new role, and #164 owns the Bicep.
+        quota_backend = quota_backend or replay_backend or security_backend
         if require_persistent_security and (
             security_backend is None
             or not bool(getattr(security_backend, "durable", False))
@@ -174,6 +213,17 @@ class CloudState:
             )
         ):
             raise RuntimeError("production cloud runtime requires durable auth state")
+        if quotas is None:
+            quotas = _build_quota_manager(config, quota_backend)
+        # A process-local counter resets on every replica change, and these
+        # containers scale to zero, so in production it is not a weaker
+        # control -- it is no control.  Refuse it the same way an in-memory
+        # auth backend is refused, rather than booting something that will
+        # report quotas it never enforced.
+        if require_persistent_security and not quotas.durable:
+            raise RuntimeError(
+                "production cloud runtime requires durable quota counters"
+            )
         # A deployment must not be able to claim it enforces a verified
         # subject while nothing issues one.  Without a proof-carrying gateway
         # the header is attacker-supplied, so trusting it would be a control
@@ -211,12 +261,7 @@ class CloudState:
             enrollments=enrollments,
             pairings=pairings,
             store=store if store is not None else MemoryTenantStore(),
-            quotas=quotas or QuotaManager(
-                QuotaPolicy(
-                    max_request_bytes=config.max_request_bytes,
-                    max_decompressed_batch_bytes=config.max_decompressed_batch_bytes,
-                )
-            ),
+            quotas=quotas,
             nonces=NonceReplayGuard(
                 ttl_seconds=config.replay_ttl_seconds,
                 clock=config.clock,
