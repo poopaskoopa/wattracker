@@ -54,3 +54,18 @@ tmp/
 
 # local agent/editor tooling settings (may contain machine-specific paths)
 .claude/settings.local.json
+
+# Xcode (ios/)
+# xcuserdata holds per-developer window state, breakpoints and the non-shared
+# schemes; the shared scheme in xcshareddata IS committed, because xcodebuild
+# needs it. DerivedData and build products never are.
+DerivedData/
+*.xcuserstate
+*.xcuserdatad/
+xcuserdata/
+*.xcworkspace/xcuserdata/
+*.moved-aside
+*.hmap
+*.ipa
+*.dSYM.zip
+*.dSYM

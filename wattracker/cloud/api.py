@@ -1012,6 +1012,7 @@ def create_cloud_app(
                     "activities": True,
                     "activity_details": True,
                     "calendar": True,
+                    "profile": True,
                     "races": True,
                 },
                 "revision": revision,
@@ -1051,6 +1052,16 @@ def create_cloud_app(
         @app.get("/api/v1/context/activities")
         async def activities(request: Request) -> Response:
             return await collection(request, {"activity"})
+
+        @app.get("/api/v1/context/profile")
+        async def profile(request: Request) -> Response:
+            # One object, served through the same reader-context path,
+            # quota accounting and 404-for-everything policy as every other
+            # collection.  It is a collection route rather than a singleton
+            # one so that nothing here has to decide what an absent profile
+            # looks like: a rider who has published no FTP gets an empty
+            # ``items`` array, which is a fact, not an error.
+            return await collection(request, {"profile"})
 
         @app.get("/api/v1/context/activities/{object_id}")
         async def activity_detail(request: Request, object_id: str) -> Response:

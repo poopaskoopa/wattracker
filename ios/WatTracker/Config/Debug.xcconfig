@@ -1,0 +1,30 @@
+#include "Base.xcconfig"
+
+// Points at a server on the developer's own machine. The simulator shares the
+// host's network stack, so localhost is the host Mac. Start one with:
+//
+//   python scripts/walking_skeleton_server.py
+//
+WATTRACKER_API_SCHEME = http
+WATTRACKER_API_HOST = localhost:8765
+
+// WATTRACKER_SOFTWARE_KEYS_ALLOWED compiles in the keychain fallback for the
+// device signing key. The simulator has no Secure Enclave, so without it the
+// app cannot generate a key there at all and the walking skeleton has nowhere
+// to run.
+//
+// It is a COMPILE-TIME condition, set only in this file, and
+// ios/WatTracker/WatTracker/Cloud/DeviceKey.swift refuses to compile if it is
+// ever seen in a non-DEBUG build. There is deliberately no runtime flag, no
+// environment variable and no plist key that can turn it on: shipping a
+// software key has to be a build failure, not a mistake somebody could make
+// at runtime.
+SWIFT_ACTIVE_COMPILATION_CONDITIONS = DEBUG WATTRACKER_SOFTWARE_KEYS_ALLOWED
+
+SWIFT_OPTIMIZATION_LEVEL = -Onone
+SWIFT_COMPILATION_MODE = singlefile
+GCC_OPTIMIZATION_LEVEL = 0
+ONLY_ACTIVE_ARCH = YES
+ENABLE_TESTABILITY = YES
+DEBUG_INFORMATION_FORMAT = dwarf
+MTL_ENABLE_DEBUG_INFO = INCLUDE_SOURCE

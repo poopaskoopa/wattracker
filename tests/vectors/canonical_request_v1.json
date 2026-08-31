@@ -1,0 +1,240 @@
+{
+  "version": 1,
+  "generated_by": "scripts/generate_canonical_vectors.py",
+  "purpose": "Byte-for-byte interop vectors for canonical_request. Both the Python suite (tests/test_canonical_request_vectors.py) and the Swift suite (ios/WatTracker/WatTrackerTests) assert against this one file. Regenerate only when the wire format deliberately changes; a regeneration that is not accompanied by a client change is a break.",
+  "domain_separator_base64": "d2F0dHJhY2tlci1jbG91ZC1yZXF1ZXN0LXYxAA==",
+  "field_order": [
+    "method",
+    "path",
+    "namespace",
+    "timestamp",
+    "nonce",
+    "body_digest",
+    "idempotency_key",
+    "revision"
+  ],
+  "framing": "The domain separator, then for each field in field_order a 4-byte big-endian length of its UTF-8 bytes followed by those bytes. The method is upper-cased first; the timestamp is decimal text; the body digest is lowercase hex SHA-256 of the body.",
+  "body_digests": [
+    {
+      "name": "empty",
+      "body_base64": "",
+      "digest": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "name": "ascii-json",
+      "body_base64": "eyJiYXRjaF9pZCI6ImJhdGNoLTEiLCJvYmplY3RzIjpbXSwicmV2aXNpb24iOjF9",
+      "digest": "fa95d898b7cff6a5148952f8f89a9cdb0582402d57b72257cbd734e6276e3c48"
+    },
+    {
+      "name": "utf8-multibyte",
+      "body_base64": "44OQ44OD44OBLfCfmrQ=",
+      "digest": "773bcca5cacb4d35b85880aa2eb17c8f533e251bdfcb825d260a6fd93638621b"
+    },
+    {
+      "name": "nul-and-newline",
+      "body_base64": "AA0KIGJpbmFyeSD//g==",
+      "digest": "4ff28b69543a8acb6c7837bbf5fda3e5cd94fb967d5271e037dc3cce0122081f"
+    }
+  ],
+  "canonical_requests": [
+    {
+      "name": "empty-body-refresh",
+      "why": "The device refresh envelope: no body, fixed idempotency key, and an EMPTY revision string. The empty field still gets a 4-byte length prefix of zero, which is the field a naive implementation drops.",
+      "method": "POST",
+      "path": "/api/v1/context/refresh",
+      "namespace": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "timestamp": 1000,
+      "nonce": "refresh-1",
+      "body_base64": "",
+      "body_digest": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "idempotency_key": "context-refresh",
+      "revision": "",
+      "canonical_base64": "d2F0dHJhY2tlci1jbG91ZC1yZXF1ZXN0LXYxAAAAAARQT1NUAAAAFy9hcGkvdjEvY29udGV4dC9yZWZyZXNoAAAAQGFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWEAAAAEMTAwMAAAAAlyZWZyZXNoLTEAAABAZTNiMGM0NDI5OGZjMWMxNDlhZmJmNGM4OTk2ZmI5MjQyN2FlNDFlNDY0OWI5MzRjYTQ5NTk5MWI3ODUyYjg1NQAAAA9jb250ZXh0LXJlZnJlc2gAAAAA",
+      "canonical_sha256": "4c43c1346fa29e919632ef579545c24523a32200ef97e9e6ff9038ee90560ebc",
+      "canonical_length": 243
+    },
+    {
+      "name": "sync-batch-json-body",
+      "why": "A real sync push: non-empty body, numeric revision as text.",
+      "method": "POST",
+      "path": "/api/v1/sync/batches",
+      "namespace": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+      "timestamp": 1735689600,
+      "nonce": "3nQ4Xk9v-Zt2Lp7Rw0Ma",
+      "body_base64": "eyJiYXRjaF9pZCI6ImJhdGNoLTEiLCJvYmplY3RzIjpbXSwicmV2aXNpb24iOjF9",
+      "body_digest": "fa95d898b7cff6a5148952f8f89a9cdb0582402d57b72257cbd734e6276e3c48",
+      "idempotency_key": "batch-1",
+      "revision": "1",
+      "canonical_base64": "d2F0dHJhY2tlci1jbG91ZC1yZXF1ZXN0LXYxAAAAAARQT1NUAAAAFC9hcGkvdjEvc3luYy9iYXRjaGVzAAAAQDAxMjM0NTY3ODlhYmNkZWYwMTIzNDU2Nzg5YWJjZGVmMDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODlhYmNkZWYAAAAKMTczNTY4OTYwMAAAABQzblE0WGs5di1adDJMcDdSdzBNYQAAAEBmYTk1ZDg5OGI3Y2ZmNmE1MTQ4OTUyZjhmODlhOWNkYjA1ODI0MDJkNTdiNzIyNTdjYmQ3MzRlNjI3NmUzYzQ4AAAAB2JhdGNoLTEAAAABMQ==",
+      "canonical_sha256": "a05c2b94d95449346d682a9ce72081f6675ccece6f8ab16a8c1098edf433da34",
+      "canonical_length": 250
+    },
+    {
+      "name": "unicode-idempotency-key",
+      "why": "Length framing counts UTF-8 BYTES, not characters. The accented letters and the astral-plane emoji make a UTF-16 count or a grapheme count produce a different prefix, which is exactly how a Swift client goes wrong.",
+      "method": "POST",
+      "path": "/api/v1/sync/batches",
+      "namespace": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "timestamp": 1000,
+      "nonce": "nonce",
+      "body_base64": "",
+      "body_digest": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "idempotency_key": "café-🚴-バッチ",
+      "revision": "1",
+      "canonical_base64": "d2F0dHJhY2tlci1jbG91ZC1yZXF1ZXN0LXYxAAAAAARQT1NUAAAAFC9hcGkvdjEvc3luYy9iYXRjaGVzAAAAQGFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWEAAAAEMTAwMAAAAAVub25jZQAAAEBlM2IwYzQ0Mjk4ZmMxYzE0OWFmYmY0Yzg5OTZmYjkyNDI3YWU0MWU0NjQ5YjkzNGNhNDk1OTkxYjc4NTJiODU1AAAAFGNhZsOpLfCfmrQt44OQ44OD44OBAAAAATE=",
+      "canonical_sha256": "3a1ffc269b8ca0b8bd3fb41884a8ec278e028a45be8e394d4936571ae4c74dc5",
+      "canonical_length": 242
+    },
+    {
+      "name": "unicode-path",
+      "why": "The path is UTF-8 encoded, not percent-encoded, before framing.",
+      "method": "GET",
+      "path": "/api/v1/context/プロフィール",
+      "namespace": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+      "timestamp": "1000",
+      "nonce": "ünicode-nonce-åäö",
+      "body_base64": "",
+      "body_digest": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "idempotency_key": "profile",
+      "revision": "",
+      "canonical_base64": "d2F0dHJhY2tlci1jbG91ZC1yZXF1ZXN0LXYxAAAAAANHRVQAAAAiL2FwaS92MS9jb250ZXh0L+ODl+ODreODleOCo+ODvOODqwAAAEAwMTIzNDU2Nzg5YWJjZGVmMDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODlhYmNkZWYwMTIzNDU2Nzg5YWJjZGVmAAAABDEwMDAAAAAVw7xuaWNvZGUtbm9uY2Utw6XDpMO2AAAAQGUzYjBjNDQyOThmYzFjMTQ5YWZiZjRjODk5NmZiOTI0MjdhZTQxZTQ2NDliOTM0Y2E0OTU5OTFiNzg1MmI4NTUAAAAHcHJvZmlsZQAAAAA=",
+      "canonical_sha256": "06a19e08138b2bdcf4393861001046fe1fb03a50e02f49d779eb388774e46d27",
+      "canonical_length": 257
+    },
+    {
+      "name": "boundary-timestamp-1-nonce-23",
+      "why": "Half of a field-boundary pair. Without length framing this serializes identically to boundary-timestamp-12-nonce-3.",
+      "method": "POST",
+      "path": "/api/v1/context/refresh",
+      "namespace": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "timestamp": "1",
+      "nonce": "23",
+      "body_base64": "",
+      "body_digest": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "idempotency_key": "context-refresh",
+      "revision": "",
+      "canonical_base64": "d2F0dHJhY2tlci1jbG91ZC1yZXF1ZXN0LXYxAAAAAARQT1NUAAAAFy9hcGkvdjEvY29udGV4dC9yZWZyZXNoAAAAQGFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWEAAAABMQAAAAIyMwAAAEBlM2IwYzQ0Mjk4ZmMxYzE0OWFmYmY0Yzg5OTZmYjkyNDI3YWU0MWU0NjQ5YjkzNGNhNDk1OTkxYjc4NTJiODU1AAAAD2NvbnRleHQtcmVmcmVzaAAAAAA=",
+      "canonical_sha256": "70657ee9a2e3a9472d8e8e19313b068e0a277f6507156eda3f9741bda3b2e308",
+      "canonical_length": 233
+    },
+    {
+      "name": "boundary-timestamp-12-nonce-3",
+      "why": "The other half of the timestamp/nonce boundary pair.",
+      "method": "POST",
+      "path": "/api/v1/context/refresh",
+      "namespace": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "timestamp": "12",
+      "nonce": "3",
+      "body_base64": "",
+      "body_digest": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "idempotency_key": "context-refresh",
+      "revision": "",
+      "canonical_base64": "d2F0dHJhY2tlci1jbG91ZC1yZXF1ZXN0LXYxAAAAAARQT1NUAAAAFy9hcGkvdjEvY29udGV4dC9yZWZyZXNoAAAAQGFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWEAAAACMTIAAAABMwAAAEBlM2IwYzQ0Mjk4ZmMxYzE0OWFmYmY0Yzg5OTZmYjkyNDI3YWU0MWU0NjQ5YjkzNGNhNDk1OTkxYjc4NTJiODU1AAAAD2NvbnRleHQtcmVmcmVzaAAAAAA=",
+      "canonical_sha256": "73a8de6ea6731b8c67d073475d76f1cb7642d5ecfa4d4a9962b6d4794c6133e2",
+      "canonical_length": 233
+    },
+    {
+      "name": "boundary-idem-batch-1-revision-empty",
+      "why": "The idempotency/revision boundary, and the one a real client hits: 'batch-1' + '' and 'batch-' + '1' are the same bytes unframed.",
+      "method": "POST",
+      "path": "/api/v1/sync/batches",
+      "namespace": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "timestamp": 1000,
+      "nonce": "nonce",
+      "body_base64": "",
+      "body_digest": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "idempotency_key": "batch-1",
+      "revision": "",
+      "canonical_base64": "d2F0dHJhY2tlci1jbG91ZC1yZXF1ZXN0LXYxAAAAAARQT1NUAAAAFC9hcGkvdjEvc3luYy9iYXRjaGVzAAAAQGFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWEAAAAEMTAwMAAAAAVub25jZQAAAEBlM2IwYzQ0Mjk4ZmMxYzE0OWFmYmY0Yzg5OTZmYjkyNDI3YWU0MWU0NjQ5YjkzNGNhNDk1OTkxYjc4NTJiODU1AAAAB2JhdGNoLTEAAAAA",
+      "canonical_sha256": "7f34233603390d2d86ea20293dcdeb295800287b5b1935d9328d5e421dd82fdf",
+      "canonical_length": 228
+    },
+    {
+      "name": "boundary-idem-batch-revision-1",
+      "why": "The other half of the idempotency/revision boundary pair.",
+      "method": "POST",
+      "path": "/api/v1/sync/batches",
+      "namespace": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "timestamp": 1000,
+      "nonce": "nonce",
+      "body_base64": "",
+      "body_digest": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "idempotency_key": "batch-",
+      "revision": "1",
+      "canonical_base64": "d2F0dHJhY2tlci1jbG91ZC1yZXF1ZXN0LXYxAAAAAARQT1NUAAAAFC9hcGkvdjEvc3luYy9iYXRjaGVzAAAAQGFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWEAAAAEMTAwMAAAAAVub25jZQAAAEBlM2IwYzQ0Mjk4ZmMxYzE0OWFmYmY0Yzg5OTZmYjkyNDI3YWU0MWU0NjQ5YjkzNGNhNDk1OTkxYjc4NTJiODU1AAAABmJhdGNoLQAAAAEx",
+      "canonical_sha256": "601115135abd012d01933f1302ab27393daa4dd3c8ed23e1abd1ab5aba347a4e",
+      "canonical_length": 228
+    },
+    {
+      "name": "lowercase-method-is-uppercased",
+      "why": "canonical_request upper-cases the method itself. A client that signs 'get' and sends 'GET' must still match.",
+      "method": "get",
+      "path": "/api/v1/context/profile",
+      "namespace": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+      "timestamp": 1000,
+      "nonce": "profile-1",
+      "body_base64": "",
+      "body_digest": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "idempotency_key": "profile",
+      "revision": "",
+      "canonical_base64": "d2F0dHJhY2tlci1jbG91ZC1yZXF1ZXN0LXYxAAAAAANHRVQAAAAXL2FwaS92MS9jb250ZXh0L3Byb2ZpbGUAAABAMDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODlhYmNkZWYwMTIzNDU2Nzg5YWJjZGVmMDEyMzQ1Njc4OWFiY2RlZgAAAAQxMDAwAAAACXByb2ZpbGUtMQAAAEBlM2IwYzQ0Mjk4ZmMxYzE0OWFmYmY0Yzg5OTZmYjkyNDI3YWU0MWU0NjQ5YjkzNGNhNDk1OTkxYjc4NTJiODU1AAAAB3Byb2ZpbGUAAAAA",
+      "canonical_sha256": "876a672e4ed8eff12b4505e6aa79340913676d291b6d69439a4731c564f5d391",
+      "canonical_length": 234
+    },
+    {
+      "name": "long-nonce-256-bytes",
+      "why": "A nonce long enough that a 1-byte or varint length prefix breaks.",
+      "method": "POST",
+      "path": "/api/v1/context/refresh",
+      "namespace": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "timestamp": 1000,
+      "nonce": "nnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnn",
+      "body_base64": "",
+      "body_digest": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "idempotency_key": "context-refresh",
+      "revision": "",
+      "canonical_base64": "d2F0dHJhY2tlci1jbG91ZC1yZXF1ZXN0LXYxAAAAAARQT1NUAAAAFy9hcGkvdjEvY29udGV4dC9yZWZyZXNoAAAAQGFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWEAAAAEMTAwMAAAAQBubm5ubm5ubm5ubm5ubm5ubm5ubm5ubm5ubm5ubm5ubm5ubm5ubm5ubm5ubm5ubm5ubm5ubm5ubm5ubm5ubm5ubm5ubm5ubm5ubm5ubm5ubm5ubm5ubm5ubm5ubm5ubm5ubm5ubm5ubm5ubm5ubm5ubm5ubm5ubm5ubm5ubm5ubm5ubm5ubm5ubm5ubm5ubm5ubm5ubm5ubm5ubm5ubm5ubm5ubm5ubm5ubm5ubm5ubm5ubm5ubm5ubm5ubm5ubm5ubm5ubm5ubm5ubm5ubm5ubm5ubm5ubm5ubm5ubm5ubm5ubm5ubm5ubm5ubm5ubm5ubm5ubm5ubm5ubm5ubm5uAAAAQGUzYjBjNDQyOThmYzFjMTQ5YWZiZjRjODk5NmZiOTI0MjdhZTQxZTQ2NDliOTM0Y2E0OTU5OTFiNzg1MmI4NTUAAAAPY29udGV4dC1yZWZyZXNoAAAAAA==",
+      "canonical_sha256": "25b3b54efaf8c45bbe95264218a5121b9ec281de190ce5fc6e00b3333f4112eb",
+      "canonical_length": 490
+    }
+  ],
+  "distinct_pairs": [
+    [
+      "boundary-timestamp-1-nonce-23",
+      "boundary-timestamp-12-nonce-3"
+    ],
+    [
+      "boundary-idem-batch-1-revision-empty",
+      "boundary-idem-batch-revision-1"
+    ]
+  ],
+  "signature_vectors": {
+    "algorithm": "ecdsa-p256-sha256",
+    "canonical_vector": "empty-body-refresh",
+    "public_key_x963_hex": "046f5a5259d501629ae2fe0efaa88249e68c6547886b7405e3bc1a976b9a671be5773f2e2644dd9d3951bef5d0650442ca855bbff90e48bdc02ed8f51411c04849",
+    "must_verify": [
+      {
+        "name": "low-s",
+        "why": "The ordinary case.",
+        "signature_hex": "6aba0049bc6dd44130fbc3ba8f43537d740d6d7acd4c199a1407066593f576e00d598f4e16fac643fadaf1f11e5985d73ce04e4a2ff080d3bb51746ea4e7ea65"
+      },
+      {
+        "name": "high-s",
+        "why": "ECDSA is malleable and the server accepts that on purpose (see verify_signature). A client must NOT normalise s: the Secure Enclave emits high-s about half the time, and a normalising client would be sending something other than what it signed.",
+        "signature_hex": "6aba0049bc6dd44130fbc3ba8f43537d740d6d7acd4c199a1407066593f576e0f2a670b0e90539bd05250e0ee1a67a288006ac6377271db138685654577b3aec"
+      }
+    ],
+    "must_not_verify": [
+      {
+        "name": "tampered-s",
+        "why": "s+1 is neither the signature nor its malleable twin.",
+        "signature_hex": "6aba0049bc6dd44130fbc3ba8f43537d740d6d7acd4c199a1407066593f576e00d598f4e16fac643fadaf1f11e5985d73ce04e4a2ff080d3bb51746ea4e7ea66"
+      },
+      {
+        "name": "zero-s",
+        "why": "s = 0 is outside [1, n-1] and must be refused before any curve arithmetic happens.",
+        "signature_hex": "6aba0049bc6dd44130fbc3ba8f43537d740d6d7acd4c199a1407066593f576e00000000000000000000000000000000000000000000000000000000000000000"
+      }
+    ]
+  }
+}
