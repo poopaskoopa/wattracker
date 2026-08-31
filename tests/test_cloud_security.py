@@ -13,8 +13,13 @@ from wattracker.cloud.security import (
     canonical_request,
     derive_installation_namespace,
     digest_body,
+    generate_p256_keypair,
+    generate_signing_keypair,
     new_installation_id,
     sign_request,
+    sign_request_ecdsa_p256,
+    sign_request_ed25519,
+    validate_public_key,
     verify_signature,
 )
 
@@ -254,3 +259,288 @@ def test_ed25519_credential_rejects_public_key_hmac_downgrade():
     assert not verify_signature(
         public_key, canonical, forged, algorithm="ed25519"
     )
+
+
+# ---------------------------------------------------------------------------
+# Signature algorithms
+#
+# Ed25519 and raw P-256 signatures are both exactly 128 hexadecimal
+# characters.  Length therefore proves nothing, and every case below depends
+# on the algorithm coming from stored credential state rather than the wire.
+# ---------------------------------------------------------------------------
+
+
+def _p256_keypair():
+    pytest.importorskip("cryptography")
+    return generate_p256_keypair()
+
+
+def test_p256_public_keys_are_uncompressed_sec1_points():
+    private_key, public_key = _p256_keypair()
+    assert len(private_key) == 32
+    assert len(public_key) == 65
+    assert public_key[0] == 0x04
+
+
+def test_p256_signatures_are_raw_r_s_and_detect_tampering():
+    private_key, public_key = _p256_keypair()
+    canonical = canonical_request(
+        "POST", "/api/v1/context/refresh", _namespace(), 1700000000, "nonce-1",
+        digest_body(b""), "context-refresh",
+    )
+    signature = sign_request_ecdsa_p256(private_key, canonical)
+    assert len(signature) == 128
+    assert all(char in "0123456789abcdef" for char in signature)
+    assert verify_signature(
+        public_key, canonical, signature, algorithm="ecdsa-p256-sha256"
+    )
+    assert not verify_signature(
+        public_key, canonical + b"x", signature, algorithm="ecdsa-p256-sha256"
+    )
+    flipped = ("1" if signature[0] == "0" else "0") + signature[1:]
+    assert not verify_signature(
+        public_key, canonical, flipped, algorithm="ecdsa-p256-sha256"
+    )
+    _other_private, other_public = _p256_keypair()
+    assert not verify_signature(
+        other_public, canonical, signature, algorithm="ecdsa-p256-sha256"
+    )
+
+
+def test_p256_verification_rejects_der_and_out_of_range_scalars():
+    # There is deliberately no DER parser at this boundary: a well-formed DER
+    # signature is simply not 128 hexadecimal characters and is refused on
+    # shape alone, before any ASN.1 is looked at.
+    pytest.importorskip("cryptography")
+    from cryptography.hazmat.primitives import hashes
+    from cryptography.hazmat.primitives.asymmetric import ec
+
+    private_key, public_key = _p256_keypair()
+    canonical = b"signed request"
+    signature = sign_request_ecdsa_p256(private_key, canonical)
+    der = ec.derive_private_key(
+        int.from_bytes(private_key, "big"), ec.SECP256R1()
+    ).sign(canonical, ec.ECDSA(hashes.SHA256()))
+    assert not verify_signature(
+        public_key, canonical, der.hex(), algorithm="ecdsa-p256-sha256"
+    )
+    order = "ffffffff00000000ffffffffffffffffbce6faada7179e84f3b9cac2fc632551"
+    for bad in (
+        "0" * 128,                                 # r = s = 0
+        "0" * 64 + signature[64:],                 # r = 0
+        signature[:64] + "0" * 64,                 # s = 0
+        order + signature[64:],                    # r = n
+        signature[:64] + order,                    # s = n
+        signature[:127],                           # too short
+        signature + "0",                           # too long
+        signature.upper(),                         # not lowercase hex
+        "",                                        # empty
+    ):
+        assert not verify_signature(
+            public_key, canonical, bad, algorithm="ecdsa-p256-sha256"
+        )
+
+
+def test_stored_algorithm_cannot_be_downgraded_between_the_three_schemes():
+    pytest.importorskip("cryptography")
+    canonical = b"signed request"
+    p256_private, p256_public = _p256_keypair()
+    ed_private, ed_public = generate_signing_keypair()
+    p256_signature = sign_request_ecdsa_p256(p256_private, canonical)
+    ed_signature = sign_request_ed25519(ed_private, canonical)
+
+    # Each credential verifies only under its own stored algorithm.
+    assert verify_signature(p256_public, canonical, p256_signature,
+                            algorithm="ecdsa-p256-sha256")
+    assert verify_signature(ed_public, canonical, ed_signature,
+                            algorithm="ed25519")
+
+    # Ed25519 credential presented as P-256, and the reverse.  Both signatures
+    # are 128 hex characters, so only the stored algorithm separates them.
+    assert not verify_signature(ed_public, canonical, ed_signature,
+                                algorithm="ecdsa-p256-sha256")
+    assert not verify_signature(p256_public, canonical, p256_signature,
+                                algorithm="ed25519")
+    assert not verify_signature(ed_public, canonical, p256_signature,
+                                algorithm="ed25519")
+    assert not verify_signature(p256_public, canonical, ed_signature,
+                                algorithm="ecdsa-p256-sha256")
+
+    # Neither public key may be re-used as an HMAC secret, in either direction.
+    assert not verify_signature(p256_public, canonical,
+                                sign_request(p256_public, canonical),
+                                algorithm="ecdsa-p256-sha256")
+    assert not verify_signature(ed_public, canonical,
+                                sign_request(ed_public, canonical),
+                                algorithm="ed25519")
+    assert not verify_signature(p256_public, canonical, p256_signature,
+                                algorithm="hmac-sha256")
+    assert not verify_signature(ed_public, canonical, ed_signature,
+                                algorithm="hmac-sha256")
+
+    # An HMAC credential is not verifiable as either public-key scheme.
+    hmac_signature = sign_request(b"shared secret", canonical)
+    assert verify_signature(b"shared secret", canonical, hmac_signature,
+                            algorithm="hmac-sha256")
+    assert not verify_signature(b"shared secret", canonical, hmac_signature,
+                                algorithm="ed25519")
+    assert not verify_signature(b"shared secret", canonical, hmac_signature,
+                                algorithm="ecdsa-p256-sha256")
+
+    # An unrecognized or empty algorithm never verifies.
+    assert not verify_signature(ed_public, canonical, ed_signature,
+                                algorithm="ecdsa-p384-sha384")
+    assert not verify_signature(ed_public, canonical, ed_signature, algorithm="")
+
+
+def test_public_key_validation_binds_encoding_to_the_stored_algorithm():
+    pytest.importorskip("cryptography")
+    _p256_private, p256_public = _p256_keypair()
+    _ed_private, ed_public = generate_signing_keypair()
+    assert validate_public_key("ed25519", ed_public) == ed_public
+    assert validate_public_key("ecdsa-p256-sha256", p256_public) == p256_public
+    with pytest.raises(ValueError):
+        validate_public_key("ed25519", p256_public)
+    with pytest.raises(ValueError):
+        validate_public_key("ecdsa-p256-sha256", ed_public)
+    with pytest.raises(ValueError):
+        # Compressed SEC1 is a valid encoding but is deliberately not accepted;
+        # one encoding keeps the parser at the boundary trivial.
+        validate_public_key("ecdsa-p256-sha256", b"\x02" + p256_public[1:33])
+    with pytest.raises(ValueError):
+        # Right length and prefix, but not a point on the curve.
+        validate_public_key("ecdsa-p256-sha256", b"\x04" + b"\xff" * 64)
+    with pytest.raises(ValueError):
+        validate_public_key("ecdsa-p384-sha384", p256_public)
+
+
+# ---------------------------------------------------------------------------
+# Device credentials
+# ---------------------------------------------------------------------------
+
+
+def test_device_credential_binds_scope_capabilities_and_algorithm():
+    credentials = CredentialRegistry(b"server secret")
+    device = credentials.register_device(
+        _installation(), "rider-scope", b"p" * 32, subject="subject"
+    )
+    assert device.namespace == _namespace()
+    assert device.local_user_scope == "rider-scope"
+    assert device.signature_algorithm == "ed25519"
+    assert device.capabilities == frozenset({"read"})
+    assert device.has_capability("read")
+    assert not device.has_capability("write")
+    assert len(device.credential_id) == 64
+    assert device.subscription_key and device.subscription_key.decode("ascii")
+    # Neither the public key nor the one-time secret appears in repr.
+    assert device.subscription_key.decode("ascii") not in repr(device)
+    assert device.credential_id not in repr(device)
+
+
+def test_device_credential_capabilities_are_data_not_a_hardcoded_default():
+    credentials = CredentialRegistry(b"server secret")
+    granted = credentials.register_device(
+        _installation(), "rider-scope", b"p" * 32, capabilities=("read", "write")
+    )
+    assert granted.capabilities == frozenset({"read", "write"})
+    assert granted.has_capability("write")
+    for invalid in ((), ("",), ("READ",), ("read write",), (1,), "read",
+                    tuple(f"cap{index}" for index in range(17))):
+        with pytest.raises(ValueError):
+            credentials.register_device(
+                _installation(), "rider-scope", b"p" * 32, capabilities=invalid
+            )
+
+
+def test_device_credential_refuses_symmetric_and_mismatched_keys():
+    credentials = CredentialRegistry(b"server secret")
+    with pytest.raises(ValueError):
+        # A device's private half lives in hardware; a shared secret the
+        # server could also sign with is never a device verification key.
+        credentials.register_device(
+            _installation(), "scope", b"shared secret",
+            signature_algorithm="hmac-sha256",
+        )
+    with pytest.raises(ValueError):
+        credentials.register_device(_installation(), "scope", b"p" * 31)
+    with pytest.raises(ValueError):
+        credentials.register_device(
+            _installation(), "scope", b"p" * 32,
+            signature_algorithm="ecdsa-p256-sha256",
+        )
+
+
+def test_device_lookup_resolution_namespace_binding_and_revocation():
+    credentials = CredentialRegistry(b"server secret")
+    device = credentials.register_device(_installation(), "scope", b"p" * 32)
+    namespace = _namespace()
+    assert credentials.lookup_device(device.credential_id) == device
+    assert credentials.resolve_device(device.credential_id, namespace) == device
+    # A device is invisible outside the namespace it was paired into.
+    assert credentials.resolve_device(
+        device.credential_id, _namespace(b"z" * 32)
+    ) is None
+    # Unknown identifiers resolve exactly as revoked ones do: to None.
+    assert credentials.resolve_device("f" * 64) is None
+    assert credentials.resolve_device("not-an-id") is None
+    assert credentials.lookup_device("f" * 64) is None
+    assert credentials.revoke_device(device.credential_id)
+    assert not credentials.revoke_device(device.credential_id)
+    assert credentials.resolve_device(device.credential_id) is None
+    assert credentials.resolve_device("f" * 64) is None
+    revoked = credentials.lookup_device(device.credential_id)
+    assert revoked is not None and revoked.revoked and not revoked.active
+    # Devices and writers are separate registries and never cross-resolve.
+    writer = credentials.register_writer(
+        _installation(), "scope", b"signing", b"subscription"
+    )
+    assert credentials.resolve_device(writer.credential_id) is None
+    assert credentials.resolve_writer(device.credential_id) is None
+
+
+def test_device_subscription_key_is_server_generated_and_compared_by_digest():
+    credentials = CredentialRegistry(b"server secret")
+    device = credentials.register_device(_installation(), "scope", b"p" * 32)
+    subscription = device.subscription_key.decode("ascii")
+    assert credentials.authenticate_device(
+        device.credential_id, subscription
+    ) == device
+    assert credentials.authenticate_device(device.credential_id, "wrong") is None
+    assert credentials.authenticate_device(device.credential_id, "") is None
+    assert credentials.authenticate_device("f" * 64, subscription) is None
+    credentials.revoke_device(device.credential_id)
+    assert credentials.authenticate_device(device.credential_id, subscription) is None
+
+
+def test_device_credentials_survive_restart_and_propagate_revocation():
+    backend = MemorySecurityStateBackend()
+    first = CredentialRegistry(b"server secret", backend=backend)
+    device = first.register_device(
+        _installation(), "scope", b"p" * 32, capabilities=("read",), subject="subject"
+    )
+    subscription = device.subscription_key.decode("ascii")
+
+    restarted = CredentialRegistry(b"server secret", backend=backend)
+    loaded = restarted.authenticate_device(device.credential_id, subscription)
+    assert loaded is not None
+    assert loaded.verification_key == b"p" * 32
+    assert loaded.capabilities == frozenset({"read"})
+    assert loaded.subject == "subject"
+    # Only the verifier is persisted; the one-time secret is not recoverable.
+    assert loaded.subscription_key == b""
+
+    assert restarted.revoke_device(device.credential_id)
+    assert first.resolve_device(device.credential_id) is None
+
+
+def test_persisted_device_without_capabilities_is_rejected_not_defaulted():
+    backend = MemorySecurityStateBackend()
+    credentials = CredentialRegistry(b"server secret", backend=backend)
+    device = credentials.register_device(_installation(), "scope", b"p" * 32)
+    digest = hashlib.sha256(device.credential_id.encode("utf-8")).digest()
+    stored = backend.read("device", digest.hex())
+    assert stored is not None
+    del stored["capabilities"]
+    backend.write("device", digest.hex(), stored)
+    reloaded = CredentialRegistry(b"server secret", backend=backend)
+    assert reloaded.resolve_device(device.credential_id) is None

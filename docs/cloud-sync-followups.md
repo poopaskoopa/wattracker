@@ -105,6 +105,28 @@ Retention and recovery deletion remain a separate future cleanup-job feature.
 The redundant `docs/azure-cloud-sync-secure-deployment-runbook.docx` was removed. Markdown remains
 the reviewable source of truth.
 
+### Reader-context refresh — closed by #151
+
+Reader contexts still expire in 300 s, but re-issuance no longer requires the operator token. A
+paired device holds a durable `DeviceCredential` (public key bound to `(namespace,
+local_user_scope)` plus an explicit `capabilities` set) and trades it for a fresh context at
+`POST /api/v1/context/refresh`, signed with the existing `canonical_request` framing and guarded by
+the same 300 s freshness window and nonce-replay claim as the writer path. The TTL was deliberately
+**not** widened and tokens are still never shared: the fix was to make re-issuance cheap, not to
+make the token long-lived.
+
+Two consequences worth knowing:
+
+- The read plane now consumes replay nonces, so `CloudState.create` requires a replay backend on
+  every plane. The read plane's claims go to `CloudAuth`, which its managed identity already
+  writes; it still never opens `CloudReplay`, for which it holds no role. No Bicep change was
+  needed. `test_container_runtime_read_plane_does_not_open_replay_table` still pins the
+  no-`CloudReplay` invariant; only its incidental "no replay backend at all" assertion moved.
+- `ecdsa-p256-sha256` joins `hmac-sha256` and `ed25519`, because the Secure Enclave is P-256 only.
+  Signatures are raw `r || s` as exactly 128 hex characters and the algorithm is still selected
+  from stored credential state, never from the wire. Ed25519 signatures are the same length, so
+  that selection is now load-bearing in a second way, not just against HMAC downgrade.
+
 ## Remaining open work, in priority order
 
 ### Smaller items
@@ -112,13 +134,15 @@ the reviewable source of truth.
 - `api.py:430-432` — comment says `signing_namespace` is "not a storage partition key"; `storage.py:315`
   builds the partition as `f"{namespace}:{local_user_scope}"`. Fix the comment; it misstates the
   trust model.
-- Reader contexts expire in 300 s with **no refresh endpoint** (`security.py:27`, `api.py:423`);
-  re-issuance requires the operator token, so the read plane is unusable past five minutes. Add
-  refresh before someone widens the TTL or starts sharing tokens.
 - No revocation route exists in `create_cloud_app` despite `docs/cloud-sync.md` claiming tokens are
-  revocable. `revoke_writer`/`revoke_reader` are library-only, and the sync identity's CloudAuth
-  RBAC is read-only (`main.bicep:330-334`), so it could not persist a revocation anyway. Either
-  wire it up or correct the doc.
+  revocable. `revoke_writer`/`revoke_reader`/`revoke_device` are library-only, and the sync
+  identity's CloudAuth RBAC is read-only (`main.bicep:330-334`), so it could not persist a
+  revocation anyway. Either wire it up or correct the doc. The read identity *can* write CloudAuth,
+  so a revocation route on the read plane is the cheap version of this.
+- Replay-nonce rows written by the read plane land in `CloudAuth` and, like expired
+  invitation/context rows, are never deleted. A device refreshing every four minutes adds roughly
+  360 rows a day. Harmless at three users; fold it into whatever cleanup job the row-growth item
+  below gets.
 - `storage.py:301,305` — `_is_conflict`/`_not_found` substring-match `str(exc).lower()`; a 403 whose
   message contains "not found" silently becomes a missing object.
 - `api.py:210,148` — `HTTPException` responses skip the `Cache-Control: no-store` header that

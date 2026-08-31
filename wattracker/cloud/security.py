@@ -25,11 +25,39 @@ _BODY_DIGEST_RE: Final = re.compile(r"\A[0-9a-f]{64}\Z")
 _ID_BYTES: Final = 32
 _TOKEN_BYTES: Final = 32
 _DEFAULT_TTL_SECONDS: Final = 300.0
+READER_CONTEXT_TTL_SECONDS: Final = _DEFAULT_TTL_SECONDS
 MIN_REPLAY_TTL_SECONDS: Final = 600.0
 _DEFAULT_CAPACITY: Final = 10_000
 _CANONICAL_DOMAIN: Final = b"wattracker-cloud-request-v1\x00"
 _DUMMY_DIGEST: Final = hashlib.sha256(b"wattracker-cloud-dummy").digest()
 _AUTH_PARTITION: Final = "__wattracker_auth_v1__"
+
+# Signature algorithms are a property of stored credential state, never of a
+# request.  ``ecdsa-p256-sha256`` exists because Apple's Secure Enclave only
+# generates P-256 keys.  Its raw ``r || s`` signature is the same 128
+# hexadecimal characters as an Ed25519 signature, which is precisely why the
+# algorithm must come from the credential and never from the wire.
+SIGNATURE_ALGORITHMS: Final = frozenset(
+    {"hmac-sha256", "ed25519", "ecdsa-p256-sha256"}
+)
+# A device keeps its private half in hardware, so a device credential is
+# always asymmetric.  A symmetric secret -- which the server would also be
+# able to sign with -- is never accepted as a device verification key.
+DEVICE_SIGNATURE_ALGORITHMS: Final = frozenset({"ed25519", "ecdsa-p256-sha256"})
+_ED25519_PUBLIC_KEY_BYTES: Final = 32
+_P256_POINT_BYTES: Final = 65
+_P256_ORDER: Final = (
+    0xFFFFFFFF00000000FFFFFFFFFFFFFFFFBCE6FAADA7179E84F3B9CAC2FC632551
+)
+_RAW_SIGNATURE_RE: Final = re.compile(r"\A[0-9a-f]{128}\Z")
+_HMAC_SIGNATURE_RE: Final = re.compile(r"\A[0-9a-f]{64}\Z")
+_CAPABILITY_RE: Final = re.compile(r"\A[a-z][a-z0-9_-]{0,31}\Z")
+_MAX_CAPABILITIES: Final = 16
+# Capabilities are data carried on the credential.  Nothing downstream may
+# assume a device is read-only: granting a device "write" later is a data
+# change plus the route assertion that already exists, not a redesign.
+DEFAULT_DEVICE_CAPABILITIES: Final = frozenset({"read"})
+DEFAULT_WRITER_CAPABILITIES: Final = frozenset({"read", "write"})
 
 
 class SecurityStateUnavailable(RuntimeError):
@@ -332,6 +360,78 @@ def _require_local_scope(value: object) -> str:
     return scope
 
 
+def _require_signature_algorithm(value: object, allowed: frozenset[str]) -> str:
+    algorithm = _require_text(value, "signature_algorithm")
+    if algorithm not in allowed:
+        raise ValueError("signature algorithm is invalid")
+    return algorithm
+
+
+def _validate_verification_key(algorithm: str, key: bytes) -> None:
+    """Structurally bind a stored public key to its stored algorithm.
+
+    Length alone separates the two asymmetric encodings (32 raw Ed25519 bytes
+    versus a 65-byte uncompressed SEC1 P-256 point), so a key enrolled under
+    one algorithm cannot later be reinterpreted under the other.
+    """
+
+    if algorithm == "ed25519" and len(key) != _ED25519_PUBLIC_KEY_BYTES:
+        raise ValueError("Ed25519 public key is invalid")
+    if algorithm == "ecdsa-p256-sha256" and (
+        len(key) != _P256_POINT_BYTES or key[0] != 0x04
+    ):
+        # Uncompressed SEC1 only: this is what Secure Enclave export produces,
+        # and one accepted encoding keeps the parser at the boundary trivial.
+        raise ValueError("P-256 public key is invalid")
+
+
+def validate_public_key(algorithm: str, key: bytes) -> bytes:
+    """Validate an externally supplied verification key before it is stored.
+
+    Structural checks run always; the P-256 point is additionally proven to be
+    on the curve here.  Callers must run this *before* spending any one-time
+    enrollment state, because a key rejected afterwards leaves the exchange
+    half finished with the invitation already consumed.
+
+    Raises :class:`ValueError` for a bad key and :class:`PublicKeyUnavailable`
+    when the deployment cannot check a P-256 point at all -- the two are
+    deliberately distinct, because only the first is the caller's fault.
+    """
+
+    algorithm_text = _require_signature_algorithm(algorithm, SIGNATURE_ALGORITHMS)
+    key_bytes = _require_bytes(key, "public_key")
+    _validate_verification_key(algorithm_text, key_bytes)
+    if algorithm_text == "ecdsa-p256-sha256":
+        try:
+            from cryptography.hazmat.primitives.asymmetric import ec
+        except ImportError as exc:
+            raise PublicKeyUnavailable(
+                "install the cloud extra for P-256 enrollment"
+            ) from exc
+        try:
+            ec.EllipticCurvePublicKey.from_encoded_point(ec.SECP256R1(), key_bytes)
+        except (ValueError, TypeError) as exc:
+            raise ValueError("P-256 public key is invalid") from exc
+    return key_bytes
+
+
+def _normalize_capabilities(value: object) -> frozenset[str]:
+    if isinstance(value, (str, bytes)):
+        raise ValueError("capabilities must be a collection")
+    try:
+        supplied = tuple(value)  # type: ignore[arg-type]
+    except TypeError as exc:
+        raise ValueError("capabilities must be a collection") from exc
+    if not supplied or len(supplied) > _MAX_CAPABILITIES:
+        raise ValueError("capabilities are invalid")
+    normalized: set[str] = set()
+    for entry in supplied:
+        if not isinstance(entry, str) or _CAPABILITY_RE.fullmatch(entry) is None:
+            raise ValueError("capabilities are invalid")
+        normalized.add(entry)
+    return frozenset(normalized)
+
+
 def _normalize_timestamp(value: object) -> str:
     if isinstance(value, bool):
         raise ValueError("timestamp is invalid")
@@ -472,13 +572,15 @@ def verify_signature(
     """Verify using the algorithm bound into trusted credential state.
 
     The algorithm is never inferred from attacker-controlled signature length,
-    so an Ed25519 public key cannot be reused as an HMAC secret.
+    so an Ed25519 public key cannot be reused as an HMAC secret, and an
+    Ed25519 and a raw P-256 signature -- identical in length -- cannot be
+    substituted for one another.
     """
 
     try:
         supplied = _require_text(signature, "signature")
         if algorithm == "ed25519":
-            if not re.fullmatch(r"[0-9a-f]{128}", supplied):
+            if _RAW_SIGNATURE_RE.fullmatch(supplied) is None:
                 return False
             try:
                 from cryptography.exceptions import InvalidSignature
@@ -494,9 +596,60 @@ def verify_signature(
                 return True
             except (InvalidSignature, ValueError, TypeError):
                 return False
+        if algorithm == "ecdsa-p256-sha256":
+            # Raw 64-byte r||s only.  There is deliberately no DER parser at
+            # this trust boundary: the two integers are range-checked here and
+            # re-encoded by the library, so no attacker-chosen ASN.1 is parsed.
+            #
+            # Note the length: a raw P-256 signature is exactly 128 hexadecimal
+            # characters, and so is an Ed25519 signature.  Length distinguishes
+            # nothing between the two schemes.  Selecting ``algorithm`` from
+            # stored credential state is therefore load-bearing twice over --
+            # against the classic public-key-as-HMAC-secret downgrade, and
+            # against substituting one public-key scheme for the other.  Do not
+            # reintroduce any inference from the signature itself.
+            if _RAW_SIGNATURE_RE.fullmatch(supplied) is None:
+                return False
+            r = int(supplied[:64], 16)
+            s = int(supplied[64:], 16)
+            # ECDSA signatures are malleable and this is ACCEPTED here: low-s
+            # is not enforced, so (r, n-s) verifies wherever (r, s) does.  That
+            # is safe only because nothing in this system treats a signature as
+            # an identity.  Freshness comes from NonceReplayGuard, which keys on
+            # (namespace, credential_id, nonce) -- never on signature bytes --
+            # so a malleated copy of a spent nonce is refused exactly like the
+            # original.  Enforcing low-s instead would break real clients:
+            # CryptoKit and the Secure Enclave emit high-s roughly half the
+            # time, and rejecting those would fail half of all iOS refreshes.
+            # If a signature is ever used as a cache key, a dedup key, or an
+            # audit identifier, that assumption breaks and low-s (or a digest
+            # of the canonical request) must be enforced first.
+            if not (1 <= r < _P256_ORDER and 1 <= s < _P256_ORDER):
+                return False
+            try:
+                from cryptography.exceptions import InvalidSignature
+                from cryptography.hazmat.primitives import hashes
+                from cryptography.hazmat.primitives.asymmetric import ec
+                from cryptography.hazmat.primitives.asymmetric.utils import (
+                    encode_dss_signature,
+                )
+            except ImportError:
+                return False
+            try:
+                public_key = ec.EllipticCurvePublicKey.from_encoded_point(
+                    ec.SECP256R1(), signing_key
+                )
+                public_key.verify(
+                    encode_dss_signature(r, s),
+                    canonical,
+                    ec.ECDSA(hashes.SHA256()),
+                )
+                return True
+            except (InvalidSignature, ValueError, TypeError):
+                return False
         if algorithm != "hmac-sha256":
             return False
-        if not re.fullmatch(r"[0-9a-f]{64}", supplied):
+        if _HMAC_SIGNATURE_RE.fullmatch(supplied) is None:
             return False
         expected = sign_request(signing_key, canonical)
     except (TypeError, ValueError):
@@ -531,6 +684,63 @@ def sign_request_ed25519(private_key: bytes, canonical: bytes) -> str:
         return key.sign(_require_bytes(canonical, "canonical", nonempty=False)).hex()
     except ValueError as exc:
         raise ValueError("private_key is invalid") from exc
+
+
+def generate_p256_keypair() -> tuple[bytes, bytes]:
+    """Generate ``(private_scalar, uncompressed_point)`` on NIST P-256.
+
+    Client-side helper.  Real devices generate the private half inside the
+    Secure Enclave and only ever export the uncompressed public point.
+    """
+
+    try:
+        from cryptography.hazmat.primitives.asymmetric import ec
+        from cryptography.hazmat.primitives.serialization import (
+            Encoding,
+            PublicFormat,
+        )
+    except ImportError as exc:
+        raise PublicKeyUnavailable(
+            "install the cloud extra for P-256 enrollment"
+        ) from exc
+    private = ec.generate_private_key(ec.SECP256R1())
+    scalar = private.private_numbers().private_value.to_bytes(32, "big")
+    point = private.public_key().public_bytes(
+        Encoding.X962, PublicFormat.UncompressedPoint
+    )
+    return scalar, point
+
+
+def sign_request_ecdsa_p256(private_key: bytes, canonical: bytes) -> str:
+    """Sign canonical request bytes as raw ``r || s`` hexadecimal.
+
+    Client-side helper; the wire encoding is fixed-width raw so the verifier
+    never has to parse DER.
+    """
+
+    try:
+        from cryptography.hazmat.primitives import hashes
+        from cryptography.hazmat.primitives.asymmetric import ec
+        from cryptography.hazmat.primitives.asymmetric.utils import (
+            decode_dss_signature,
+        )
+    except ImportError as exc:
+        raise PublicKeyUnavailable(
+            "install the cloud extra for P-256 request signing"
+        ) from exc
+    scalar = _require_bytes(private_key, "private_key")
+    if len(scalar) != 32:
+        raise ValueError("private_key is invalid")
+    try:
+        key = ec.derive_private_key(int.from_bytes(scalar, "big"), ec.SECP256R1())
+    except ValueError as exc:
+        raise ValueError("private_key is invalid") from exc
+    signature = key.sign(
+        _require_bytes(canonical, "canonical", nonempty=False),
+        ec.ECDSA(hashes.SHA256()),
+    )
+    r, s = decode_dss_signature(signature)
+    return f"{r:064x}{s:064x}"
 
 
 @dataclass(frozen=True)
@@ -572,6 +782,7 @@ class WriterCredential:
     active: bool = True
     revoked: bool = False
     subject: str | None = field(default=None, repr=False, compare=False)
+    capabilities: frozenset[str] = DEFAULT_WRITER_CAPABILITIES
 
     def __post_init__(self) -> None:
         _require_opaque_id(self.credential_id, "credential_id")
@@ -586,14 +797,22 @@ class WriterCredential:
             object.__setattr__(
                 self, "subscription_verifier", _subscription_digest(self.subscription_key)
             )
-        if self.signature_algorithm not in {"ed25519", "hmac-sha256"}:
-            raise ValueError("signature algorithm is invalid")
-        if self.signature_algorithm == "ed25519" and len(self.verification_key) != 32:
-            raise ValueError("Ed25519 public key is invalid")
+        _require_signature_algorithm(
+            self.signature_algorithm, SIGNATURE_ALGORITHMS
+        )
+        _validate_verification_key(self.signature_algorithm, self.verification_key)
+        object.__setattr__(
+            self, "capabilities", _normalize_capabilities(self.capabilities)
+        )
         if self.subject is not None:
             _require_text(self.subject, "subject")
         if self.active == self.revoked:
             raise ValueError("credential status is invalid")
+
+    def has_capability(self, capability: str) -> bool:
+        """Return whether this credential carries ``capability``."""
+
+        return isinstance(capability, str) and capability in self.capabilities
 
     @property
     def public_key(self) -> bytes:
@@ -604,6 +823,76 @@ class WriterCredential:
     @property
     def signing_key(self) -> bytes:
         """Legacy alias; this value is a public verification key on servers."""
+
+        return self.verification_key
+
+
+@dataclass(frozen=True)
+class DeviceCredential:
+    """A paired rider device, its public key, and what it is allowed to do.
+
+    A device credential is durable: it is the thing a phone keeps so that it
+    can mint a fresh short-lived reader context without the operator token.
+    What it may do is carried in ``capabilities`` rather than implied by the
+    type, so widening a device to writes later is a data change plus the
+    capability assertion the routes already make.
+    """
+
+    credential_id: str = field(repr=False)
+    namespace: str = field(repr=False)
+    local_user_scope: str = field(repr=False)
+    verification_key: bytes = field(repr=False, compare=False)
+    subscription_key: bytes = field(repr=False, compare=False, default=b"")
+    subscription_verifier: bytes = field(repr=False, compare=False, default=b"")
+    signature_algorithm: str = "ed25519"
+    capabilities: frozenset[str] = DEFAULT_DEVICE_CAPABILITIES
+    active: bool = True
+    revoked: bool = False
+    subject: str | None = field(default=None, repr=False, compare=False)
+
+    def __post_init__(self) -> None:
+        _require_opaque_id(self.credential_id, "credential_id")
+        _require_namespace(self.namespace)
+        _require_local_scope(self.local_user_scope)
+        _require_bytes(self.verification_key, "verification_key")
+        _require_bytes(self.subscription_key, "subscription_key", nonempty=False)
+        _require_bytes(
+            self.subscription_verifier, "subscription_verifier", nonempty=False
+        )
+        if not self.subscription_key and not self.subscription_verifier:
+            raise ValueError("subscription verifier is required")
+        if not self.subscription_verifier:
+            object.__setattr__(
+                self,
+                "subscription_verifier",
+                _subscription_digest(self.subscription_key),
+            )
+        _require_signature_algorithm(
+            self.signature_algorithm, DEVICE_SIGNATURE_ALGORITHMS
+        )
+        _validate_verification_key(self.signature_algorithm, self.verification_key)
+        object.__setattr__(
+            self, "capabilities", _normalize_capabilities(self.capabilities)
+        )
+        if self.subject is not None:
+            _require_text(self.subject, "subject")
+        if self.active == self.revoked:
+            raise ValueError("credential status is invalid")
+
+    def has_capability(self, capability: str) -> bool:
+        """Return whether this device was granted ``capability``."""
+
+        return isinstance(capability, str) and capability in self.capabilities
+
+    @property
+    def public_key(self) -> bytes:
+        """The key presented when the device was paired."""
+
+        return self.verification_key
+
+    @property
+    def signing_key(self) -> bytes:
+        """Alias matching :class:`WriterCredential`; a public key on servers."""
 
         return self.verification_key
 
@@ -693,6 +982,7 @@ def _writer_value(credential: WriterCredential) -> dict[str, Any]:
         "verification_key": _encode_bytes(credential.verification_key),
         "subscription_verifier": _encode_bytes(verifier),
         "signature_algorithm": credential.signature_algorithm,
+        "capabilities": sorted(credential.capabilities),
         "active": credential.active,
         "revoked": credential.revoked,
         "subject": credential.subject,
@@ -703,6 +993,7 @@ def _writer_from_value(
     credential_id: str, value: Mapping[str, Any]
 ) -> WriterCredential:
     subject = value.get("subject")
+    capabilities = value.get("capabilities")
     return WriterCredential(
         credential_id=_require_opaque_id(credential_id, "credential_id"),
         namespace=_require_namespace(value["namespace"]),
@@ -712,6 +1003,50 @@ def _writer_from_value(
         signature_algorithm=_require_text(
             value["signature_algorithm"], "signature_algorithm"
         ),
+        capabilities=(
+            DEFAULT_WRITER_CAPABILITIES
+            if capabilities is None
+            else _normalize_capabilities(capabilities)
+        ),
+        active=bool(value["active"]),
+        revoked=bool(value["revoked"]),
+        subject=None if subject is None else _require_text(subject, "subject"),
+    )
+
+
+def _device_value(credential: DeviceCredential) -> dict[str, Any]:
+    verifier = credential.subscription_verifier or _subscription_digest(
+        credential.subscription_key
+    )
+    return {
+        "namespace": credential.namespace,
+        "local_user_scope": credential.local_user_scope,
+        "verification_key": _encode_bytes(credential.verification_key),
+        "subscription_verifier": _encode_bytes(verifier),
+        "signature_algorithm": credential.signature_algorithm,
+        "capabilities": sorted(credential.capabilities),
+        "active": credential.active,
+        "revoked": credential.revoked,
+        "subject": credential.subject,
+    }
+
+
+def _device_from_value(
+    credential_id: str, value: Mapping[str, Any]
+) -> DeviceCredential:
+    subject = value.get("subject")
+    # A persisted record without an explicit capability set is not assumed to
+    # be anything; it is rejected rather than silently granted a default.
+    return DeviceCredential(
+        credential_id=_require_opaque_id(credential_id, "credential_id"),
+        namespace=_require_namespace(value["namespace"]),
+        local_user_scope=_require_local_scope(value["local_user_scope"]),
+        verification_key=_decode_bytes(value["verification_key"]),
+        subscription_verifier=_decode_bytes(value["subscription_verifier"]),
+        signature_algorithm=_require_signature_algorithm(
+            value["signature_algorithm"], DEVICE_SIGNATURE_ALGORITHMS
+        ),
+        capabilities=_normalize_capabilities(value["capabilities"]),
         active=bool(value["active"]),
         revoked=bool(value["revoked"]),
         subject=None if subject is None else _require_text(subject, "subject"),
@@ -983,6 +1318,7 @@ class CredentialRegistry:
         self._clock = clock
         self._lock = threading.RLock()
         self._writers: dict[bytes, WriterCredential] = {}
+        self._devices: dict[bytes, DeviceCredential] = {}
         self._contexts: dict[bytes, _ContextRecord] = {}
         self._contexts_by_id: dict[bytes, bytes] = {}
 
@@ -1204,6 +1540,191 @@ class CredentialRegistry:
             return True
 
     revoke = revoke_writer
+
+    # ------------------------------------------------------------------
+    # Paired rider devices
+    # ------------------------------------------------------------------
+
+    def _find_device_locked(self, credential_id: str) -> DeviceCredential | None:
+        supplied = self._credential_digest(credential_id)
+        if self._backend is not None:
+            value = self._backend.read("device", supplied.hex())
+            if value is None:
+                return None
+            try:
+                found = _device_from_value(credential_id, value)
+            except (KeyError, TypeError, ValueError):
+                return None
+            self._devices[supplied] = found
+            return found
+        found_device: DeviceCredential | None = None
+        for stored_digest, credential in self._devices.items():
+            if hmac.compare_digest(supplied, stored_digest):
+                found_device = credential
+        return found_device
+
+    def _store_device_locked(self, credential: DeviceCredential) -> None:
+        digest = self._credential_digest(credential.credential_id)
+        if len(self._devices) >= self._capacity and digest not in self._devices:
+            raise RuntimeError("credential capacity is full")
+        if self._backend is not None:
+            if not self._backend.create(
+                "device", digest.hex(), _device_value(credential)
+            ):
+                raise RuntimeError("credential identifier collision")
+        self._devices[digest] = credential
+
+    def _write_device_locked(self, credential: DeviceCredential) -> None:
+        digest = self._credential_digest(credential.credential_id)
+        if self._backend is not None:
+            self._backend.write("device", digest.hex(), _device_value(credential))
+        self._devices[digest] = credential
+
+    def register_device_for_scope(
+        self,
+        namespace: str,
+        local_user_scope: str,
+        public_key: bytes,
+        *,
+        signature_algorithm: str = "ed25519",
+        capabilities: object = DEFAULT_DEVICE_CAPABILITIES,
+        subscription_key: bytes | None = None,
+        subject: str | None = None,
+    ) -> DeviceCredential:
+        """Pair a device against an already server-derived namespace.
+
+        The caller supplies only a public key.  The subscription secret is
+        generated here so an APIM subscription key presented by the caller is
+        never promoted into the credential.
+        """
+
+        namespace_text = _require_namespace(namespace)
+        scope_text = _require_local_scope(local_user_scope)
+        algorithm = _require_signature_algorithm(
+            signature_algorithm, DEVICE_SIGNATURE_ALGORITHMS
+        )
+        key = validate_public_key(algorithm, public_key)
+        subscription = (
+            _require_bytes(subscription_key, "subscription_key")
+            if subscription_key is not None
+            else secrets.token_hex(_ID_BYTES).encode("ascii")
+        )
+        subject_text = None if subject is None else _require_text(subject, "subject")
+        credential = DeviceCredential(
+            credential_id=_new_id(),
+            namespace=namespace_text,
+            local_user_scope=scope_text,
+            verification_key=key,
+            subscription_key=subscription,
+            signature_algorithm=algorithm,
+            capabilities=_normalize_capabilities(capabilities),
+            subject=subject_text,
+        )
+        with self._lock:
+            self._store_device_locked(credential)
+        return credential
+
+    def register_device(
+        self,
+        installation_id: str,
+        local_user_scope: str,
+        public_key: bytes,
+        *,
+        signature_algorithm: str = "ed25519",
+        capabilities: object = DEFAULT_DEVICE_CAPABILITIES,
+        subscription_key: bytes | None = None,
+        subject: str | None = None,
+    ) -> DeviceCredential:
+        """Pair a device, deriving the namespace from the installation id."""
+
+        _require_opaque_id(installation_id, "installation_id")
+        namespace = derive_installation_namespace(
+            self._server_secret, installation_id
+        )
+        return self.register_device_for_scope(
+            namespace,
+            local_user_scope,
+            public_key,
+            signature_algorithm=signature_algorithm,
+            capabilities=capabilities,
+            subscription_key=subscription_key,
+            subject=subject,
+        )
+
+    def lookup_device(self, credential_id: str) -> DeviceCredential | None:
+        """Resolve a device regardless of status; used by revocation tooling."""
+
+        if (
+            not isinstance(credential_id, str)
+            or _HEX_ID_RE.fullmatch(credential_id) is None
+        ):
+            return None
+        with self._lock:
+            return self._find_device_locked(credential_id)
+
+    def resolve_device(
+        self, credential_id: str, namespace: str | None = None
+    ) -> DeviceCredential | None:
+        """Resolve only active devices; unknown and revoked are both ``None``."""
+
+        if (
+            not isinstance(credential_id, str)
+            or _HEX_ID_RE.fullmatch(credential_id) is None
+        ):
+            return None
+        if namespace is not None:
+            try:
+                namespace = _require_namespace(namespace)
+            except ValueError:
+                return None
+        with self._lock:
+            credential = self._find_device_locked(credential_id)
+            if (
+                credential is None
+                or not credential.active
+                or credential.revoked
+                or (namespace is not None and credential.namespace != namespace)
+            ):
+                return None
+            return credential
+
+    def authenticate_device(
+        self, credential_id: str, subscription_key: str | bytes
+    ) -> DeviceCredential | None:
+        """Resolve a device and compare its APIM subscription key."""
+
+        credential = self.resolve_device(credential_id)
+        if credential is None:
+            return None
+        try:
+            supplied = (
+                subscription_key
+                if isinstance(subscription_key, bytes)
+                else _require_text(subscription_key, "subscription_key").encode("utf-8")
+            )
+        except ValueError:
+            return None
+        expected = credential.subscription_verifier or _subscription_digest(
+            credential.subscription_key
+        )
+        if not hmac.compare_digest(expected, _subscription_digest(supplied)):
+            return None
+        return credential
+
+    def revoke_device(self, credential_id: str) -> bool:
+        if (
+            not isinstance(credential_id, str)
+            or _HEX_ID_RE.fullmatch(credential_id) is None
+        ):
+            return False
+        with self._lock:
+            credential = self._find_device_locked(credential_id)
+            if credential is None or credential.revoked:
+                return False
+            self._write_device_locked(
+                replace(credential, active=False, revoked=True)
+            )
+            return True
 
     def _prune_contexts_locked(self, now: float) -> None:
         for token_digest, record in tuple(self._contexts.items()):
@@ -1512,8 +2033,14 @@ class NonceReplayGuard:
 
 __all__ = [
     "INSTALLATION_ID_BYTES",
+    "DEFAULT_DEVICE_CAPABILITIES",
+    "DEFAULT_WRITER_CAPABILITIES",
+    "DEVICE_SIGNATURE_ALGORITHMS",
+    "SIGNATURE_ALGORITHMS",
+    "READER_CONTEXT_TTL_SECONDS",
     "PublicKeyUnavailable",
     "CredentialRegistry",
+    "DeviceCredential",
     "EnrollmentRegistry",
     "SecurityStateBackend",
     "SecurityStateUnavailable",
@@ -1529,8 +2056,11 @@ __all__ = [
     "derive_installation_namespace",
     "digest_body",
     "new_installation_id",
+    "generate_p256_keypair",
     "generate_signing_keypair",
     "sign_request",
+    "sign_request_ecdsa_p256",
     "sign_request_ed25519",
+    "validate_public_key",
     "verify_signature",
 ]
