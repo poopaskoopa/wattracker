@@ -11,8 +11,11 @@ from .credentials import CloudCredentialStore, KeyringBackend
 from .models import CloudObject, SyncBatch
 from .storage import AzureTenantStore, MemoryTenantStore
 from .snapshot import (
+    clear_snapshot_publication,
+    commit_snapshot_batch,
     profile_batch,
     profile_object,
+    reset_snapshot_publication,
     snapshot_batch,
     snapshot_convergence,
     snapshot_counts,
@@ -54,6 +57,8 @@ __all__ = [
     "create_cloud_app",
     "disable_public_api",
     "disable_writes",
+    "clear_snapshot_publication",
+    "commit_snapshot_batch",
     "https_transport",
     "KeyringBackend",
     "KILL_SWITCH_TTL_SECONDS",
@@ -64,6 +69,7 @@ __all__ = [
     "set_kill_switch",
     "profile_batch",
     "profile_object",
+    "reset_snapshot_publication",
     "SecurityStateUnavailable",
     "snapshot_batch",
     "snapshot_convergence",

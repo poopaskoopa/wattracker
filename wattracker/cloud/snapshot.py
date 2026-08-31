@@ -1,4 +1,4 @@
-"""Read-only local SQLite snapshots for optional cloud synchronization."""
+"""Local SQLite snapshots and durable publication state for cloud sync."""
 from __future__ import annotations
 
 import datetime as _dt
@@ -33,6 +33,11 @@ from .models import (
 
 DETAIL_MAX_POINTS = 1500
 MAX_STREAM_DECODED = 512 * 1024
+# Keep generated request bodies below the cloud API's default QuotaPolicy and
+# CloudConfig request ceiling. Object validation alone is not enough: dozens
+# of valid 512 KiB objects can still form an invalid request.
+MAX_SYNC_REQUEST_BYTES = 8 * 1024 * 1024
+_AUTO_BATCH_ID_PLACEHOLDER = "snapshot-" + ("0" * 64)
 
 _DANGEROUS_KEYS = {
     "account_id", "azure_account", "blob_path", "command", "file", "filename",
@@ -1113,50 +1118,538 @@ def snapshot_digest(objects: list[CloudObject]) -> str:
     return hashlib.sha256(material).hexdigest()
 
 
+_PUBLICATION_LEDGER_COLUMNS = {
+    "user_id", "kind", "object_id", "published_revision", "content_digest",
+    "deleted", "published_at",
+}
+_PUBLICATION_PENDING_COLUMNS = {
+    "user_id", "batch_id", "revision", "options_digest", "objects_json",
+    "created",
+}
+_PUBLICATION_STATE_COLUMNS = {"user_id", "last_revision"}
+
+
+def _publication_schema_available(conn: sqlite3.Connection) -> bool:
+    tables = {
+        row["name"]
+        for row in conn.execute(
+            "SELECT name FROM sqlite_master WHERE type = 'table'"
+        )
+    }
+    if not {
+        "cloud_publication_ledger", "cloud_publication_pending",
+    } <= tables:
+        return False
+    for table, required in (
+        ("cloud_publication_ledger", _PUBLICATION_LEDGER_COLUMNS),
+        ("cloud_publication_pending", _PUBLICATION_PENDING_COLUMNS),
+        ("cloud_publication_state", _PUBLICATION_STATE_COLUMNS),
+    ):
+        columns = {
+            row["name"] for row in conn.execute(f"PRAGMA table_info({table})")
+        }
+        if not required <= columns:
+            return False
+    return True
+
+
+def _content_digest(obj: CloudObject) -> str:
+    material = {
+        "id": obj.object_id,
+        "kind": obj.kind,
+        "data": dict(obj.data),
+        "deleted": obj.deleted,
+    }
+    encoded = json.dumps(
+        material, sort_keys=True, separators=(",", ":"),
+        ensure_ascii=False, allow_nan=False,
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def _snapshot_options_digest(
+    *, include_streams: bool, include_derived: bool, limit: int, offset: int,
+) -> str:
+    material = json.dumps(
+        {
+            "include_derived": bool(include_derived),
+            "include_streams": bool(include_streams),
+            "limit": limit,
+            "offset": offset,
+            "version": 1,
+        },
+        sort_keys=True, separators=(",", ":"),
+    ).encode("utf-8")
+    return hashlib.sha256(material).hexdigest()
+
+
+def _batch_identifier(
+    objects: Sequence[CloudObject], revision: int, options_digest: str,
+) -> str:
+    material = json.dumps(
+        {
+            "objects": [
+                {
+                    "digest": _content_digest(obj),
+                    "id": obj.object_id,
+                    "kind": obj.kind,
+                }
+                for obj in sorted(objects, key=lambda item: (item.kind, item.object_id))
+            ],
+            "options": options_digest,
+            "revision": revision,
+            "version": 1,
+        },
+        sort_keys=True, separators=(",", ":"),
+    ).encode("utf-8")
+    return "snapshot-" + hashlib.sha256(material).hexdigest()
+
+
+def _all_snapshot_objects(
+    path: str | os.PathLike[str], user_id: int, *,
+    include_streams: bool, include_derived: bool,
+) -> list[CloudObject]:
+    """Read the complete deterministic snapshot through bounded pages."""
+    objects: list[CloudObject] = []
+    offset = 0
+    while True:
+        page = snapshot_objects(
+            path, user_id, limit=MAX_BATCH_OBJECTS,
+            include_streams=include_streams,
+            include_derived=include_derived,
+            offset=offset,
+        )
+        if not page:
+            return objects
+        objects.extend(page)
+        offset += len(page)
+
+
+def _pending_to_batch(row: sqlite3.Row) -> SyncBatch:
+    raw_objects = json.loads(row["objects_json"])
+    objects = tuple(
+        CloudObject(
+            object_id=raw["id"],
+            kind=raw["kind"],
+            revision=raw["revision"],
+            data=raw.get("data", {}),
+            deleted=raw.get("deleted", False),
+        )
+        for raw in raw_objects
+    )
+    return SyncBatch(
+        batch_id=row["batch_id"], revision=int(row["revision"]), objects=objects,
+    )
+
+
+def _batch_objects_json(objects: Sequence[CloudObject]) -> str:
+    return json.dumps(
+        [obj.wire() for obj in objects],
+        sort_keys=True, separators=(",", ":"),
+        ensure_ascii=False, allow_nan=False,
+    )
+
+
+def _batch_wire_size(
+    batch_id: str, revision: int, objects: Sequence[CloudObject],
+) -> int:
+    return len(json.dumps(
+        {
+            "batch_id": batch_id,
+            "revision": revision,
+            "objects": [obj.wire() for obj in objects],
+        },
+        sort_keys=True, separators=(",", ":"), ensure_ascii=False,
+    ).encode("utf-8"))
+
+
+def _object_wire_size(obj: CloudObject) -> int:
+    return len(json.dumps(
+        obj.wire(), sort_keys=True, separators=(",", ":"), ensure_ascii=False,
+    ).encode("utf-8"))
+
+
+@contextmanager
+def _publication_connection(path: str | os.PathLike[str]) -> Iterator[sqlite3.Connection]:
+    conn = db.connect(str(path))
+    try:
+        yield conn
+    finally:
+        conn.close()
+
+
 def snapshot_batch(
     path: str | os.PathLike[str],
     user_id: int,
     *,
-    batch_id: str,
-    revision: int,
+    batch_id: Optional[str] = None,
+    revision: Optional[int] = None,
     limit: int = MAX_BATCH_OBJECTS,
     include_streams: bool = False,
     include_derived: bool = True,
     offset: int = 0,
     previously_published: Optional[Mapping[str, Mapping[str, object]]] = None,
     complete: Optional[bool] = None,
+    republish: bool = False,
 ) -> Optional[SyncBatch]:
-    """Build one bounded sync batch without mutating the local database."""
-    objects = snapshot_objects(
-        path, user_id, limit=limit, include_streams=include_streams,
-        include_derived=include_derived, offset=offset,
-    )
-    if previously_published is not None:
-        if complete is None:
-            # A short page is only provably the whole snapshot when it is
-            # also the first page: this call pages the flattened snapshot by
-            # `offset`, and a short *trailing* page after `offset > 0` does
-            # not mean every earlier page's objects are gone. Only an
-            # unpaged (offset == 0) short page may be auto-treated as
-            # complete; a caller that knows better still passes
-            # complete=True explicitly.
-            complete = offset == 0 and len(objects) < limit
-        objects = snapshot_convergence(previously_published, objects, complete=complete)
-    if not objects:
-        return None
-    if revision < 1 or revision > (1 << 63) - 1:
+    """Prepare one resumable changed-object batch.
+
+    A prepared batch is kept in the local pending table until the caller
+    confirms a successful server response with :func:`commit_snapshot_batch`.
+    That makes a lost response retry the exact same idempotency key and
+    payload. ``republish`` bypasses the ledger for an explicit full snapshot;
+    the high-level client clears the ledger once and then uses normal delta
+    paging so committed pages are not sent again.
+    """
+    if isinstance(user_id, bool) or not isinstance(user_id, int) or user_id < 1:
+        raise ValueError("user_id must be positive")
+    if limit < 1 or limit > MAX_BATCH_OBJECTS:
+        raise ValueError("limit is out of bounds")
+    if isinstance(offset, bool) or not isinstance(offset, int) or offset < 0:
+        raise ValueError("offset is out of bounds")
+    if (batch_id is None) != (revision is None):
+        raise ValueError("batch_id and revision must be supplied together")
+    if revision is not None and (revision < 1 or revision > (1 << 63) - 1):
         raise ValueError("revision is out of bounds")
-    if len(objects) > MAX_BATCH_OBJECTS:
-        raise ValueError("complete snapshot exceeds one sync batch; paginate before convergence")
-    # One batch revision is stamped across every object -- including
-    # tombstones -- because the wire's ordering signal is the batch
-    # revision, not any per-object revision.
-    versioned = tuple(replace(obj, revision=revision) for obj in objects)
-    return SyncBatch(
-        batch_id=batch_id,
-        revision=revision,
-        objects=versioned,
+
+    # Preserve the caller-owned convergence API used by the history-cutoff
+    # publisher. It deliberately remains a pure read, while automatic delta
+    # publication below owns its durable local ledger.
+    if previously_published is not None:
+        if batch_id is None or revision is None:
+            raise ValueError(
+                "batch_id and revision are required with previously_published"
+            )
+        objects = snapshot_objects(
+            path, user_id, limit=limit, include_streams=include_streams,
+            include_derived=include_derived, offset=offset,
+        )
+        if complete is None:
+            complete = offset == 0 and len(objects) < limit
+        objects = snapshot_convergence(
+            previously_published, objects, complete=complete,
+        )
+        if not objects:
+            return None
+        if len(objects) > MAX_BATCH_OBJECTS:
+            raise ValueError(
+                "complete snapshot exceeds one sync batch; paginate before convergence"
+            )
+        versioned = tuple(replace(obj, revision=revision) for obj in objects)
+        return SyncBatch(
+            batch_id=batch_id, revision=revision, objects=versioned,
+        )
+
+    current = _all_snapshot_objects(
+        path, user_id, include_streams=include_streams,
+        include_derived=include_derived,
     )
+    current_by_key = {(obj.kind, obj.object_id): obj for obj in current}
+    options_digest = _snapshot_options_digest(
+        include_streams=include_streams, include_derived=include_derived,
+        limit=limit, offset=offset,
+    )
+
+    # A hand-built legacy fixture may not have the current schema. Preserve
+    # the old pure-read behavior there; initialized application databases have
+    # the ledger through migration 35.
+    with _publication_connection(path) as conn:
+        if not _publication_schema_available(conn):
+            objects = current[offset : offset + limit]
+            if not objects:
+                return None
+            resolved_revision = revision if revision is not None else 1
+            resolved_batch_id = batch_id or _batch_identifier(
+                objects, resolved_revision, options_digest,
+            )
+            versioned = tuple(
+                replace(obj, revision=resolved_revision) for obj in objects
+            )
+            return SyncBatch(
+                batch_id=resolved_batch_id,
+                revision=resolved_revision,
+                objects=versioned,
+            )
+
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            if republish:
+                pending = conn.execute(
+                    "SELECT batch_id FROM cloud_publication_pending "
+                    "WHERE user_id = ? LIMIT 1",
+                    (user_id,),
+                ).fetchone()
+                if pending is not None:
+                    raise SnapshotError(
+                        "another publication batch is still pending"
+                    )
+            else:
+                if batch_id is not None:
+                    pending = conn.execute(
+                        "SELECT * FROM cloud_publication_pending "
+                        "WHERE user_id = ? AND batch_id = ?",
+                        (user_id, batch_id),
+                    ).fetchone()
+                    if pending is None:
+                        other_pending = conn.execute(
+                            "SELECT batch_id FROM cloud_publication_pending "
+                            "WHERE user_id = ? LIMIT 1",
+                            (user_id,),
+                        ).fetchone()
+                        if other_pending is not None:
+                            raise SnapshotError(
+                                "another publication batch is still pending"
+                            )
+                else:
+                    pending = conn.execute(
+                        "SELECT * FROM cloud_publication_pending "
+                        "WHERE user_id = ? "
+                        "ORDER BY revision ASC LIMIT 1",
+                        (user_id,),
+                    ).fetchone()
+                if pending is not None:
+                    if (
+                        revision is not None
+                        and int(pending["revision"]) != revision
+                    ):
+                        raise SnapshotError("pending batch revision does not match")
+                    batch = _pending_to_batch(pending)
+                    conn.rollback()
+                    return batch
+
+            ledger_rows = conn.execute(
+                "SELECT * FROM cloud_publication_ledger WHERE user_id = ?",
+                (user_id,),
+            ).fetchall()
+            ledger = {
+                (row["kind"], row["object_id"]): row for row in ledger_rows
+            }
+            candidates = []
+            for key, obj in current_by_key.items():
+                prior = ledger.get(key)
+                if (
+                    republish
+                    or prior is None
+                    or prior["content_digest"] != _content_digest(obj)
+                ):
+                    candidates.append(obj)
+            if not republish:
+                for key, prior in ledger.items():
+                    if key not in current_by_key and not bool(prior["deleted"]):
+                        candidates.append(
+                            CloudObject(
+                                object_id=prior["object_id"],
+                                kind=prior["kind"],
+                                revision=max(1, int(prior["published_revision"])),
+                                data={},
+                                deleted=True,
+                            )
+                        )
+            max_revision = max(
+                [int(row["published_revision"]) for row in ledger_rows]
+                + [
+                    int(row["revision"])
+                    for row in conn.execute(
+                        "SELECT revision FROM cloud_publication_pending "
+                        "WHERE user_id = ?", (user_id,),
+                    ).fetchall()
+                ]
+                + [
+                    int(state["last_revision"])
+                    for state in conn.execute(
+                        "SELECT last_revision FROM cloud_publication_state "
+                        "WHERE user_id = ?", (user_id,),
+                    ).fetchall()
+                ]
+                + [0]
+            )
+            resolved_revision = revision if revision is not None else max_revision + 1
+            if revision is None and resolved_revision <= max_revision:
+                raise ValueError("revision is not newer than the publication ledger")
+            if revision is not None and resolved_revision <= max_revision:
+                raise ValueError("revision is not newer than the publication ledger")
+
+            candidates.sort(key=lambda obj: (obj.kind, obj.object_id))
+            versioned_candidates = tuple(
+                obj if obj.revision == resolved_revision
+                else replace(obj, revision=resolved_revision)
+                for obj in candidates
+            )
+            wire_batch_id = batch_id or _AUTO_BATCH_ID_PLACEHOLDER
+            wire_size = _batch_wire_size(wire_batch_id, resolved_revision, ())
+            objects = []
+            for candidate in versioned_candidates[offset:]:
+                if len(objects) >= limit:
+                    break
+                next_wire_size = wire_size + _object_wire_size(candidate)
+                if objects:
+                    next_wire_size += 1  # comma between JSON array entries
+                if next_wire_size >= MAX_SYNC_REQUEST_BYTES:
+                    if not objects:
+                        raise SnapshotError("one snapshot object exceeds request limit")
+                    break
+                objects.append(candidate)
+                wire_size = next_wire_size
+            if not objects:
+                conn.rollback()
+                return None
+            resolved_batch_id = batch_id or _batch_identifier(
+                tuple(objects),
+                resolved_revision, options_digest,
+            )
+            existing = conn.execute(
+                "SELECT * FROM cloud_publication_pending "
+                "WHERE user_id = ? AND batch_id = ?",
+                (user_id, resolved_batch_id),
+            ).fetchone()
+            if existing is not None:
+                batch = _pending_to_batch(existing)
+                conn.rollback()
+                return batch
+
+            versioned = tuple(objects)
+            batch = SyncBatch(
+                batch_id=resolved_batch_id,
+                revision=resolved_revision,
+                objects=versioned,
+            )
+            conn.execute(
+                "INSERT INTO cloud_publication_state (user_id, last_revision) "
+                "VALUES (?, ?) ON CONFLICT(user_id) DO UPDATE SET "
+                "last_revision = MAX(last_revision, excluded.last_revision)",
+                (user_id, resolved_revision),
+            )
+            conn.execute(
+                "INSERT INTO cloud_publication_pending "
+                "(user_id, batch_id, revision, options_digest, objects_json, created) "
+                "VALUES (?, ?, ?, ?, ?, ?)",
+                (
+                    user_id, resolved_batch_id, resolved_revision, options_digest,
+                    _batch_objects_json(versioned), utc_now().isoformat(),
+                ),
+            )
+            conn.commit()
+            return batch
+        except Exception:
+            conn.rollback()
+            raise
+
+
+def commit_snapshot_batch(
+    path: str | os.PathLike[str], user_id: int, batch: SyncBatch,
+) -> None:
+    """Acknowledge a successfully uploaded batch in the local ledger."""
+    if isinstance(user_id, bool) or not isinstance(user_id, int) or user_id < 1:
+        raise ValueError("user_id must be positive")
+    if not isinstance(batch, SyncBatch):
+        raise TypeError("batch must be a SyncBatch")
+    with _publication_connection(path) as conn:
+        if not _publication_schema_available(conn):
+            raise SnapshotError("publication ledger is unavailable")
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            pending = conn.execute(
+                "SELECT * FROM cloud_publication_pending "
+                "WHERE user_id = ? AND batch_id = ?",
+                (user_id, batch.batch_id),
+            ).fetchone()
+            expected = _batch_objects_json(batch.objects)
+            if pending is not None:
+                if (
+                    int(pending["revision"]) != batch.revision
+                    or pending["objects_json"] != expected
+                ):
+                    raise SnapshotError("prepared batch payload does not match")
+            else:
+                for obj in batch.objects:
+                    prior = conn.execute(
+                        "SELECT published_revision, content_digest, deleted "
+                        "FROM cloud_publication_ledger WHERE user_id = ? "
+                        "AND kind = ? AND object_id = ?",
+                        (user_id, obj.kind, obj.object_id),
+                    ).fetchone()
+                    if (
+                        prior is None
+                        or int(prior["published_revision"]) != batch.revision
+                        or prior["content_digest"] != _content_digest(obj)
+                    ):
+                        raise SnapshotError("batch was not prepared")
+                conn.rollback()
+                return
+
+            now = utc_now().isoformat()
+            for obj in batch.objects:
+                digest = _content_digest(obj)
+                prior = conn.execute(
+                    "SELECT published_revision, content_digest FROM "
+                    "cloud_publication_ledger WHERE user_id = ? AND kind = ? "
+                    "AND object_id = ?",
+                    (user_id, obj.kind, obj.object_id),
+                ).fetchone()
+                if prior is not None:
+                    old_revision = int(prior["published_revision"])
+                    if old_revision > batch.revision:
+                        raise SnapshotError("publication revision moved backwards")
+                    if (
+                        old_revision == batch.revision
+                        and prior["content_digest"] != digest
+                    ):
+                        raise SnapshotError("publication revision has another payload")
+                conn.execute(
+                    "INSERT INTO cloud_publication_ledger "
+                    "(user_id, kind, object_id, published_revision, "
+                    "content_digest, deleted, published_at) VALUES (?, ?, ?, ?, ?, ?, ?) "
+                    "ON CONFLICT(user_id, kind, object_id) DO UPDATE SET "
+                    "published_revision = excluded.published_revision, "
+                    "content_digest = excluded.content_digest, "
+                    "deleted = excluded.deleted, published_at = excluded.published_at",
+                    (
+                        user_id, obj.kind, obj.object_id, batch.revision, digest,
+                        int(obj.deleted), now,
+                    ),
+                )
+            conn.execute(
+                "DELETE FROM cloud_publication_pending "
+                "WHERE user_id = ? AND batch_id = ?",
+                (user_id, batch.batch_id),
+            )
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+
+
+def clear_snapshot_publication(
+    path: str | os.PathLike[str], user_id: int, *, reject_pending: bool = False,
+) -> None:
+    """Forget object acknowledgements while retaining the revision high-water mark."""
+    if isinstance(user_id, bool) or not isinstance(user_id, int) or user_id < 1:
+        raise ValueError("user_id must be positive")
+    with _publication_connection(path) as conn:
+        if not _publication_schema_available(conn):
+            raise SnapshotError("publication ledger is unavailable")
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            if reject_pending and conn.execute(
+                "SELECT 1 FROM cloud_publication_pending WHERE user_id = ? LIMIT 1",
+                (user_id,),
+            ).fetchone() is not None:
+                raise SnapshotError("another publication batch is still pending")
+            conn.execute(
+                "DELETE FROM cloud_publication_pending WHERE user_id = ?",
+                (user_id,),
+            )
+            conn.execute(
+                "DELETE FROM cloud_publication_ledger WHERE user_id = ?",
+                (user_id,),
+            )
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+
+
+reset_snapshot_publication = clear_snapshot_publication
 
 
 def snapshot_convergence(

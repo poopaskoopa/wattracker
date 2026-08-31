@@ -4,7 +4,8 @@ The client is deliberately transport-injected.  A normal Wattracker process
 can keep using its local SQLite database without importing this module or
 opening a socket.  When enabled, callers provide a private key obtained from
 the OS secure store and a read-only snapshot path; the client never persists
-that key or exposes storage credentials.
+that key or exposes storage credentials. Snapshot publication acknowledgements
+are kept in the local database so failed pushes can resume safely.
 """
 from __future__ import annotations
 
@@ -20,7 +21,13 @@ from urllib.request import Request, urlopen
 
 from .models import SyncBatch
 from .security import canonical_request, digest_body, sign_request, sign_request_ed25519
-from .snapshot import snapshot_batch, snapshot_counts
+from .snapshot import (
+    clear_snapshot_publication,
+    commit_snapshot_batch,
+    snapshot_batch,
+    snapshot_counts,
+    SnapshotError,
+)
 
 SYNC_PATH = "/api/v1/sync/batches"
 OFFLINE_MESSAGE = "Cloud sync offline — local data and features are unaffected."
@@ -168,6 +175,42 @@ class CloudSyncClient:
         return SyncResult(False, status, OFFLINE_MESSAGE)
 
 
+    def push_snapshot(
+        self,
+        path: str,
+        user_id: int,
+        *,
+        limit: int = 1_000,
+        include_streams: bool = False,
+        include_derived: bool = True,
+        republish: bool = False,
+    ) -> list[SyncResult]:
+        """Upload resumable local deltas, acknowledging each successful page."""
+        if republish:
+            if self.transport is None:
+                return [SyncResult(False, None, OFFLINE_MESSAGE)]
+            try:
+                clear_snapshot_publication(
+                    path, user_id, reject_pending=True,
+                )
+            except SnapshotError as exc:
+                return [SyncResult(False, None, str(exc))]
+        results: list[SyncResult] = []
+        while True:
+            batch = build_snapshot_batch(
+                path, user_id, limit=limit,
+                include_streams=include_streams,
+                include_derived=include_derived,
+            )
+            if batch is None:
+                return results
+            result = self.push(batch)
+            results.append(result)
+            if not result.ok:
+                return results
+            commit_snapshot_batch(path, user_id, batch)
+
+
 def local_snapshot_status(path: str, user_id: int) -> dict[str, Any]:
     """Read integrity counts without taking a write connection or changing DB state."""
     try:
@@ -180,14 +223,15 @@ def build_snapshot_batch(
     path: str,
     user_id: int,
     *,
-    batch_id: str,
-    revision: int,
+    batch_id: Optional[str] = None,
+    revision: Optional[int] = None,
     limit: int = 1_000,
     include_streams: bool = False,
     include_derived: bool = True,
     offset: int = 0,
     previously_published: Optional[Mapping[str, Mapping[str, object]]] = None,
     complete: Optional[bool] = None,
+    republish: bool = False,
 ) -> Optional[SyncBatch]:
     """Convenience seam used by an opt-in background sync worker."""
     return snapshot_batch(
@@ -201,4 +245,5 @@ def build_snapshot_batch(
         offset=offset,
         previously_published=previously_published,
         complete=complete,
+        republish=republish,
     )
