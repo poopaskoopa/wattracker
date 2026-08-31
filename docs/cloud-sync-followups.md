@@ -201,11 +201,15 @@ Still open in the same area, and deliberately not in #152's scope:
   their row address omits the day and the first charge of a new day reclaims the row in place, so
   they are bounded by the number of (subject, metric) pairs. If a cleanup job with a delete role
   ever exists, quota rows need nothing from it.
-- The budget kill switch is still process-local. `set_writes_enabled` / `set_public_enabled` live in
-  one `QuotaManager` instance, so the 80%/100% budget actions stop only the replicas that were
-  running when they fired; the next cold start comes up enabled. #179 made the daily *counters*
-  durable and deliberately did not widen its scope to the switch. It wants the same treatment: a
-  durable flag row read on the admission path, cheaply cached.
+- ~~The budget kill switch is still process-local.~~ Fixed in #181: the two levels live in one
+  `kill-switch` row in `CloudAuth`, read on the admission path with a 30-second staleness window,
+  failing closed on an unreadable state. Two things it deliberately left alone. First, the switch
+  is written with the backend's plain upsert rather than an etag-guarded compare-and-swap: it is a
+  level an operator declares outright, not an increment, so last-writer-wins is the intended
+  semantics — but that means two operators racing at the same second get one of the two states,
+  not a merge. Second, the row is in `CloudAuth`, so the sync identity can read it and not write
+  it; if a future budget hook ever runs as the sync identity, it will need read/write on
+  `CloudAuth` or its own table, which is a Bicep change (#164 owns that file).
 - The per-second global window (`global_requests_per_second`) and the backend concurrency semaphore
   are process-local by design, so N replicas allow N times the configured rate. That is correct for
   a load shaper and wrong for anyone reading it as a global limit; with APIM removed (#164) it is

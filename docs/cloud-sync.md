@@ -375,10 +375,74 @@ also burn its daily upload allowance.
 Two app-side limits stay deliberately process-local, because they shape one
 replica's instantaneous load rather than a day's spend: the
 100-request-per-second global window and the two-slot backend concurrency
-semaphore. The budget kill switch (`writes_enabled` / `public_enabled`) is also
-still process-local and is tracked as a followup. APIM's `quota-by-key` and
-`rate-limit-by-key` policies remain configured while the gateway exists, but
-the daily budgets no longer depend on them.
+semaphore. APIM's `quota-by-key` and `rate-limit-by-key` policies remain
+configured while the gateway exists, but the daily budgets no longer depend on
+them.
+
+**The budget kill switch is durable.** It is the last line of cost protection,
+so it is not a boolean in a replica that scales to zero — it is one row in the
+shared `CloudAuth` table, read on the admission path of every request.
+
+*Two levels, matching the two budget thresholds.* `public_enabled` is the wider
+one: every route, read or write, checks it, so clearing it stops the
+deployment. `writes_enabled` stops only the sync plane's admissions. They are
+stored independently, because the 80% and 100% actions fire independently and
+may arrive in either order.
+
+*It lives in `CloudAuth`, not in the plane's own quota table.* The counters
+split by plane because each identity may write only its own table; a kill
+switch that split the same way would be two switches, and throwing one would
+leave the other plane serving. Every plane can *read* `CloudAuth`, so every
+plane obeys the switch; only the read identity and an operator can write it,
+so the sync plane cannot touch the switch it obeys.
+
+*Staleness window: 30 seconds.* A replica caches what it read for 30 seconds
+and no longer — `KILL_SWITCH_TTL_SECONDS`, capped at 60 by
+`KILL_SWITCH_MAX_TTL_SECONDS`, which is refused at construction rather than
+left to review. The window is a ceiling, not a hint: the cache is replaced,
+never extended, so a cached "enabled" cannot outlive it, and a refresh that
+fails drops the cache instead of falling back to it. The bound is chosen
+between two costs. A switch that takes an hour to bite is a log entry, not a
+kill switch; a read per request puts a table transaction in front of every
+admission on a deployment whose whole bill is a few dollars a month. At 30
+seconds a replica reads at most twice a minute regardless of traffic, and the
+worst case after the switch is thrown is 30 seconds of continued service on
+replicas that were already warm. A replica that starts *after* the switch was
+thrown has no cache at all and reads the row on its first request, which is the
+property the process-local flag never had.
+
+*It fails closed.* An unreadable or unintelligible kill state refuses the
+request — 503 with `Retry-After: 30` — on every route that admits traffic. This
+is deliberately the opposite of what the quota paths do with a damaged row:
+there, an unparseable counter is reset and healed, because refusing forever
+would strand a rider and the ceiling immediately re-applies. The kill switch
+has no such bound. It is thrown precisely when spending has already gone wrong,
+so reading "carry on" out of an error is the exact failure it exists to
+prevent. An absent row is the one reading of "enabled" that is not a guess: a
+row is created the first time the switch is set and is never removed.
+
+*Clearing it is an update, never a delete.* No deployed managed identity holds
+a table `entities/delete` action, so clearing writes both levels enabled back
+into the same row — the same constraint that made the quota counters reclaim
+their row in place.
+
+*Operator path.* `wattracker.cloud` exports `read_kill_switch`,
+`set_kill_switch`, `disable_writes` (the 80% action), `disable_public_api` (the
+100% action), and `clear_kill_switch`. They take a state backend rather than a
+running app, so the switch can be thrown and cleared while every replica is
+scaled to zero. `set_kill_switch` requires both levels: a partial update would
+have to read the level it is not changing, and a read that fails during an
+incident is exactly when the write most needs to land. `disable_writes` does
+read first, so a late 80% action cannot re-enable a public API that 100%
+already disabled, and it raises rather than guessing when that read fails;
+`disable_public_api` reads nothing, because it only ever removes capability and
+must work when nothing can be read. The operator CLI in #169 is the intended
+caller of all five.
+
+`CloudState.create(..., require_persistent_security=True)` refuses a
+process-local kill switch at boot, for the same reason it refuses non-durable
+quota counters: in a scale-to-zero deployment a process-local switch does not
+merely forget, it re-enables.
 
 Operators must also alert on APIM 4xx/5xx, auth
 failures, sync conflicts, queue age, storage availability, and Container App
@@ -404,6 +468,9 @@ not a hard billing ceiling.
       are one-time, expiring, revocable, and absent from logs.
 - [ ] Exercise read, push, status, CORS, subscription quota/rate limits, and
       the 503 kill switch.
+- [ ] Drill the kill switch against a *cold* deployment: throw it, scale every
+      replica to zero, and confirm the next request is still refused. A drill
+      against a warm replica proves only that the cache was invalidated.
 - [ ] Test offline queueing, restart/retry, idempotent replay, and conflict
       reporting without blocking local use.
 - [ ] Trigger budget thresholds in a non-production subscription and confirm

@@ -19,6 +19,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, Response
 
 from .limits import (
+    DurableKillSwitch,
     DurableQuotaCounters,
     QuotaExceeded,
     QuotaManager,
@@ -137,9 +138,11 @@ class CloudConfig:
 
 
 def _build_quota_manager(
-    config: "CloudConfig", quota_backend: SecurityStateBackend | None
+    config: "CloudConfig",
+    quota_backend: SecurityStateBackend | None,
+    kill_backend: SecurityStateBackend | None = None,
 ) -> QuotaManager:
-    """Build the daily-counter manager, durable wherever it can be.
+    """Build the daily-counter manager and kill switch, durable wherever they can be.
 
     A durable backend is used whenever one is available, including in
     tests, so the durable path is the one that is exercised rather than a
@@ -150,16 +153,23 @@ def _build_quota_manager(
         max_request_bytes=config.max_request_bytes,
         max_decompressed_batch_bytes=config.max_decompressed_batch_bytes,
     )
+    counters = None
     if quota_backend is not None and bool(getattr(quota_backend, "durable", False)):
         try:
-            return QuotaManager(policy, counters=DurableQuotaCounters(quota_backend))
+            counters = DurableQuotaCounters(quota_backend)
         except ValueError:
             # A durable backend that cannot charge counters is a backend
             # from an older contract.  Fall back to the process-local
             # counters, which `require_persistent_security` then refuses
             # rather than letting a deployment believe it is metered.
-            pass
-    return QuotaManager(policy)
+            counters = None
+    kill_switch = None
+    if kill_backend is not None and bool(getattr(kill_backend, "durable", False)):
+        try:
+            kill_switch = DurableKillSwitch(kill_backend)
+        except ValueError:
+            kill_switch = None
+    return QuotaManager(policy, counters=counters, kill_switch=kill_switch)
 
 
 @dataclass
@@ -184,6 +194,7 @@ class CloudState:
         security_backend: SecurityStateBackend | None = None,
         replay_backend: SecurityStateBackend | None = None,
         quota_backend: SecurityStateBackend | None = None,
+        kill_backend: SecurityStateBackend | None = None,
         require_persistent_security: bool = False,
     ) -> "CloudState":
         # Every plane now consumes replay nonces: the read plane verifies
@@ -201,6 +212,16 @@ class CloudState:
         # access to CloudAuth.  Following the replay backend therefore needs
         # no new table and no new role, and #164 owns the Bicep.
         quota_backend = quota_backend or replay_backend or security_backend
+        # The kill switch deliberately does *not* follow the quota backend.
+        # The counters split by plane (the read plane counts in ``CloudAuth``,
+        # the sync plane in ``CloudReplay``) because each identity may write
+        # only its own table.  A kill switch that split the same way would be
+        # two switches: throwing it would stop one plane and leave the other
+        # serving.  It therefore lives in the shared auth table, which every
+        # plane can *read*.  Only the read identity and an operator can write
+        # it, which is the right asymmetry -- the sync plane obeys the switch
+        # and cannot touch it.
+        kill_backend = kill_backend or security_backend
         if require_persistent_security and (
             security_backend is None
             or not bool(getattr(security_backend, "durable", False))
@@ -214,7 +235,7 @@ class CloudState:
         ):
             raise RuntimeError("production cloud runtime requires durable auth state")
         if quotas is None:
-            quotas = _build_quota_manager(config, quota_backend)
+            quotas = _build_quota_manager(config, quota_backend, kill_backend)
         # A process-local counter resets on every replica change, and these
         # containers scale to zero, so in production it is not a weaker
         # control -- it is no control.  Refuse it the same way an in-memory
@@ -223,6 +244,15 @@ class CloudState:
         if require_persistent_security and not quotas.durable:
             raise RuntimeError(
                 "production cloud runtime requires durable quota counters"
+            )
+        # And the same argument, one step further: a process-local kill switch
+        # in a scale-to-zero deployment does not merely forget, it re-enables.
+        # The budget action would stop the replicas that were up and the next
+        # cold start would come back serving, so the switch would disable
+        # spending and undo itself minutes later.  Refuse to boot instead.
+        if require_persistent_security and not quotas.kill_switch_durable:
+            raise RuntimeError(
+                "production cloud runtime requires a durable kill switch"
             )
         # A deployment must not be able to claim it enforces a verified
         # subject while nothing issues one.  Without a proof-carrying gateway
@@ -429,8 +459,10 @@ def _writer_auth(state: CloudState, request: Request, *, capability: str) -> Any
     asserts ``"write"``, and widening it later is a capability grant, not a
     change to this function.
     """
-    if not state.quotas.public_enabled:
-        raise HTTPException(status_code=403, detail="public API disabled")
+    # The durable kill state, read here rather than trusted from a boolean
+    # this replica set for itself.  Disabled raises 403; unreadable raises
+    # 503, and neither is a request this route may serve.
+    state.quotas.require_public_enabled()
     if not _apim_proof_valid(state, request):
         raise HTTPException(status_code=401, detail="APIM authorization required")
     credential_id = _writer_header(request, "X-Writer-Credential")
@@ -515,10 +547,16 @@ def _device_signature_fields(request: Request) -> tuple[int, str, str]:
 
 def _resolve_device(state: CloudState, request: Request) -> Any:
     """Resolve an active paired device; unknown and revoked are both ``None``."""
+    # A disabled public API keeps this route's uniform 404, which says nothing
+    # about the credential.  An unreadable kill state does not: it raises, and
+    # the refusal is a 503.  That distinction is deliberate -- a global outage
+    # is not credential-dependent so a 503 leaks nothing, while answering 404
+    # would tell a healthy device its credential is gone and invite it to
+    # re-pair exactly when the backend is sick.
     credential_id = request.headers.get("x-device-credential", "")
     if not credential_id or len(credential_id) > 512:
         return None
-    if not state.quotas.public_enabled:
+    if not state.quotas.kill_state().public_enabled:
         return None
     return state.credentials.resolve_device(credential_id)
 
@@ -556,6 +594,12 @@ def _verify_device_request(
 
 
 def _resolve_reader(state: CloudState, request: Request) -> Any:
+    # Read the kill state first and unconditionally.  Folding it into the
+    # `context is None` test below would let a short circuit skip it: an
+    # unreadable kill state on an unknown token would answer 404 instead of
+    # refusing, and the one flag that must never be bypassed would be bypassed
+    # by whichever caller guessed wrong.
+    public_enabled = state.quotas.kill_state().public_enabled
     if not _apim_proof_valid(state, request):
         return None
     raw = request.headers.get("authorization", "")
@@ -566,7 +610,7 @@ def _resolve_reader(state: CloudState, request: Request) -> Any:
     if not ok:
         return None
     context = state.credentials.resolve_reader(token)
-    if context is None or not state.quotas.public_enabled:
+    if context is None or not public_enabled:
         return None
     bound_subject = getattr(context, "subject", None)
     # A bound subject is only checkable where one is attested.  Where it is
@@ -616,6 +660,20 @@ def create_cloud_app(
         openapi_url=None,
     )
     app.state.cloud = state
+
+    @app.exception_handler(QuotaExceeded)
+    async def _refused(_request: Request, exc: QuotaExceeded) -> Response:
+        """Turn an admission refusal raised outside a route body into a response.
+
+        The kill state is now read inside the credential-resolution helpers,
+        which have no response to return -- they answer ``None``.  Registering
+        the refusal here means a helper cannot accidentally turn a kill-switch
+        or unreadable-state refusal into a served request by forgetting to
+        catch it: the only way past this handler is not to raise.
+        """
+
+        return _error(exc.status_code, exc.reason, retry_after=exc.retry_after)
+
     if config.allowed_origins:
         app.add_middleware(
             CORSMiddleware,
@@ -950,7 +1008,9 @@ def create_cloud_app(
             """
             if not _apim_proof_valid(state, request):
                 return _not_found()
-            if not state.quotas.public_enabled:
+            # Disabled keeps this route's uniform 404; unreadable raises and
+            # becomes a 503, before the single-use code is spent.
+            if not state.quotas.kill_state().public_enabled:
                 return _not_found()
             # Never demanded here.  ``consume`` enforces a subject if and only
             # if the code carries one, which can only have happened in a
