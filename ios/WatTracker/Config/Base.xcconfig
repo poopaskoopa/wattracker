@@ -1,0 +1,40 @@
+// Settings shared by every configuration.
+//
+// Everything deployment-shaped lives here or in the per-configuration files
+// next to it, and nothing deployment-shaped lives in Swift. Beware: `//`
+// starts a comment in an xcconfig, which is why the API base URL is split
+// into a scheme and a host rather than written as one URL.
+
+PRODUCT_NAME = WatTracker
+PRODUCT_BUNDLE_IDENTIFIER = com.wattracker.ios
+
+// iOS 17 is the floor because Observation and Swift Charts are both worth it
+// and the rider's devices are current.
+IPHONEOS_DEPLOYMENT_TARGET = 17.0
+// 1 = iPhone, 2 = iPad. Universal, landscape only on both.
+TARGETED_DEVICE_FAMILY = 1,2
+SWIFT_VERSION = 5.0
+DEVELOPMENT_LANGUAGE = en
+
+SDKROOT = iphoneos
+SUPPORTED_PLATFORMS = iphoneos iphonesimulator
+// Ad-hoc signing, which is all a simulator build needs and all this
+// repository can honestly provide: a development team id is an account
+// identifier and does not belong in a public repository. A device or
+// TestFlight build sets DEVELOPMENT_TEAM and CODE_SIGN_STYLE locally.
+CODE_SIGN_STYLE = Manual
+CODE_SIGN_IDENTITY = -
+CODE_SIGNING_REQUIRED = NO
+DEVELOPMENT_TEAM =
+
+CLANG_ENABLE_MODULES = YES
+CLANG_ENABLE_OBJC_ARC = YES
+ENABLE_STRICT_OBJC_MSGSEND = YES
+GCC_NO_COMMON_BLOCKS = YES
+SWIFT_EMIT_LOC_STRINGS = YES
+ENABLE_USER_SCRIPT_SANDBOXING = YES
+ALWAYS_SEARCH_USER_PATHS = NO
+
+// The production API. A moved host is an edit here plus a rebuild.
+WATTRACKER_API_SCHEME = https
+WATTRACKER_API_HOST = api.wattracker.com

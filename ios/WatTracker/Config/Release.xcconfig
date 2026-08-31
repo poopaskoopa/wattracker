@@ -1,0 +1,16 @@
+#include "Base.xcconfig"
+
+// Nothing overrides the production scheme and host from Base.xcconfig here.
+
+// Note what is absent: WATTRACKER_SOFTWARE_KEYS_ALLOWED. A release build has
+// no software-key path compiled into it at all, so a device without a Secure
+// Enclave gets a clear error instead of a private key stored as bytes.
+SWIFT_ACTIVE_COMPILATION_CONDITIONS =
+
+SWIFT_OPTIMIZATION_LEVEL = -O
+SWIFT_COMPILATION_MODE = wholemodule
+GCC_OPTIMIZATION_LEVEL = s
+ENABLE_NS_ASSERTIONS = NO
+VALIDATE_PRODUCT = YES
+DEBUG_INFORMATION_FORMAT = dwarf-with-dsym
+MTL_ENABLE_DEBUG_INFO = NO

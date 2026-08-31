@@ -1,0 +1,75 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>CFBundleDevelopmentRegion</key>
+	<string>$(DEVELOPMENT_LANGUAGE)</string>
+	<key>CFBundleDisplayName</key>
+	<string>WatTracker</string>
+	<key>CFBundleExecutable</key>
+	<string>$(EXECUTABLE_NAME)</string>
+	<key>CFBundleIdentifier</key>
+	<string>$(PRODUCT_BUNDLE_IDENTIFIER)</string>
+	<key>CFBundleInfoDictionaryVersion</key>
+	<string>6.0</string>
+	<key>CFBundleName</key>
+	<string>$(PRODUCT_NAME)</string>
+	<key>CFBundlePackageType</key>
+	<string>APPL</string>
+	<key>CFBundleShortVersionString</key>
+	<string>0.1</string>
+	<key>CFBundleVersion</key>
+	<string>1</string>
+	<key>LSRequiresIPhoneOS</key>
+	<true/>
+	<key>UILaunchScreen</key>
+	<dict>
+		<key>UIColorName</key>
+		<string></string>
+	</dict>
+	<!-- Landscape only, on both idioms. The rider uses this next to a
+	     trainer, in landscape, on an iPhone and on an iPad; every layout in
+	     this app is designed for a wide, short viewport, so portrait is not
+	     an orientation it degrades into but one it does not have. -->
+	<key>UISupportedInterfaceOrientations</key>
+	<array>
+		<string>UIInterfaceOrientationLandscapeLeft</string>
+		<string>UIInterfaceOrientationLandscapeRight</string>
+	</array>
+	<key>UISupportedInterfaceOrientations~ipad</key>
+	<array>
+		<string>UIInterfaceOrientationLandscapeLeft</string>
+		<string>UIInterfaceOrientationLandscapeRight</string>
+	</array>
+	<!-- Without this, iPadOS treats the app as multitasking-capable and
+	     ignores the orientation list above entirely. -->
+	<key>UIRequiresFullScreen</key>
+	<true/>
+	<key>UIApplicationSupportsIndirectInputEvents</key>
+	<true/>
+	<!-- The only ATS relaxation in this app, and it cannot reach the public
+	     internet: loopback and local-network hosts only, so a debug build can
+	     talk to a server on the developer's own machine over http. Requests to
+	     api.wattracker.com stay under full App Transport Security. -->
+	<key>NSAppTransportSecurity</key>
+	<dict>
+		<key>NSAllowsLocalNetworking</key>
+		<true/>
+		<key>NSExceptionDomains</key>
+		<dict>
+			<key>localhost</key>
+			<dict>
+				<key>NSExceptionAllowsInsecureHTTPLoads</key>
+				<true/>
+			</dict>
+		</dict>
+	</dict>
+	<!-- Supplied by Config/*.xcconfig, never written as a literal in the
+	     client: the app ships to TestFlight and a moved host must be a
+	     configuration change and a rebuild, not a code change. -->
+	<key>WATTRACKERAPIScheme</key>
+	<string>$(WATTRACKER_API_SCHEME)</string>
+	<key>WATTRACKERAPIHost</key>
+	<string>$(WATTRACKER_API_HOST)</string>
+</dict>
+</plist>

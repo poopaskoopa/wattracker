@@ -10,7 +10,14 @@ from .client import CloudSyncClient, SyncCredentials, SyncResult, https_transpor
 from .credentials import CloudCredentialStore, KeyringBackend
 from .models import CloudObject, SyncBatch
 from .storage import AzureTenantStore, MemoryTenantStore
-from .snapshot import snapshot_batch, snapshot_counts, snapshot_digest, snapshot_objects
+from .snapshot import (
+    profile_batch,
+    profile_object,
+    snapshot_batch,
+    snapshot_counts,
+    snapshot_digest,
+    snapshot_objects,
+)
 from .security import (
     AzureTableSecurityStateBackend,
     MemorySecurityStateBackend,
@@ -33,6 +40,8 @@ __all__ = [
     "https_transport",
     "KeyringBackend",
     "MemorySecurityStateBackend",
+    "profile_batch",
+    "profile_object",
     "SecurityStateUnavailable",
     "snapshot_batch",
     "snapshot_counts",

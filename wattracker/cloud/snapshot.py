@@ -215,3 +215,117 @@ def snapshot_batch(
             )
         ),
     )
+
+
+# ---------------------------------------------------------------------------
+# The ``profile`` object kind
+# ---------------------------------------------------------------------------
+# One object, one field: the rider's current FTP.  It exists so the walking
+# skeleton (#171) has something real to carry end to end, and it is
+# deliberately the smallest thing that can be.  Issue #154 owns the full
+# object model, and a richer ``profile`` invented here would collide with it.
+#
+# Nothing else about the rider goes in.  Weight, heart-rate maxima, zones and
+# provenance are all things #154 gets to shape; a number the phone renders is
+# not.
+PROFILE_OBJECT_ID = "profile"
+PROFILE_KIND = "profile"
+
+
+def _finite_positive(value: object) -> Optional[float]:
+    """``value`` as a usable wattage, or ``None``.
+
+    A NaN or an infinity would be refused by the wire model later, after the
+    caller had already built a batch around it; a non-positive number is not
+    an FTP.  Both are filtered here, at the read.
+    """
+
+    if isinstance(value, bool):
+        return None
+    try:
+        number = float(value)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    if number != number or number in (float("inf"), float("-inf")) or number <= 0:
+        return None
+    return number
+
+
+def _current_ftp_watts(conn: sqlite3.Connection, user_id: int) -> Optional[float]:
+    """The FTP the desktop would show, read on a read-only connection.
+
+    Precedence mirrors :func:`wattracker.ingest.importer.current_ftp` for its
+    first two steps -- the rider's manual override, then the newest
+    ``ftp_history`` row -- and deliberately stops there.  The third step is a
+    live detraining-decayed *estimate*, which needs ``init_db()`` and a write
+    connection, and an estimate is not a fact about the rider worth publishing
+    to another device as though it were one.  A rider with neither a stated
+    nor a recorded FTP publishes no profile at all, rather than a default that
+    would arrive on the phone looking like a measurement.
+    """
+
+    try:
+        row = conn.execute(
+            "SELECT ftp FROM user_settings WHERE user_id = ?", (user_id,)
+        ).fetchone()
+    except sqlite3.Error:
+        row = None
+    if row is not None and row["ftp"] is not None:
+        override = _finite_positive(row["ftp"])
+        if override is not None:
+            return override
+    try:
+        row = conn.execute(
+            "SELECT ftp_watts FROM ftp_history WHERE user_id = ? "
+            "ORDER BY date DESC LIMIT 1",
+            (user_id,),
+        ).fetchone()
+    except sqlite3.Error:
+        return None
+    if row is None:
+        return None
+    return _finite_positive(row["ftp_watts"])
+
+
+def profile_object(
+    path: str | os.PathLike[str], user_id: int, *, revision: int = 1
+) -> Optional[CloudObject]:
+    """The rider's ``profile`` object, or ``None`` when there is no FTP.
+
+    ``revision`` is the publisher's counter, not a database row id: the
+    profile is a single mutable object, so there is no local row whose
+    identity could supply a version.  Callers publishing it in a batch pass
+    the batch revision, which is monotonic by construction.
+    """
+
+    if isinstance(user_id, bool) or not isinstance(user_id, int) or user_id < 1:
+        raise ValueError("user_id must be positive")
+    with readonly_connection(path) as conn:
+        ftp_watts = _current_ftp_watts(conn, user_id)
+    if ftp_watts is None:
+        return None
+    return CloudObject(
+        object_id=PROFILE_OBJECT_ID,
+        kind=PROFILE_KIND,
+        revision=revision,
+        data={"ftp_watts": ftp_watts},
+    )
+
+
+def profile_batch(
+    path: str | os.PathLike[str],
+    user_id: int,
+    *,
+    batch_id: str,
+    revision: int,
+) -> Optional[SyncBatch]:
+    """One batch carrying only the profile object.
+
+    ``None`` when there is nothing to publish: a batch with no objects is
+    invalid by model, so the absence is returned rather than an empty batch.
+    """
+
+    obj = profile_object(path, user_id, revision=revision)
+    if obj is None:
+        return None
+    return SyncBatch(batch_id=batch_id, revision=revision, objects=(obj,))
