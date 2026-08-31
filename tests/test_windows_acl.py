@@ -46,15 +46,26 @@ def _expected_icacls() -> str:
     return os.path.join(FAKE_SYSTEM_ROOT, "System32", "icacls.exe")
 
 
-#: What icacls prints for a /findsid that matched nothing: the summary line
-#: alone, no file named. Reasoned from the icacls reference (see
-#: ``config._acl_needs_reset``), not captured from a real Windows box.
-FINDSID_NO_MATCH = "Successfully processed 0 files; Failed processing 0 files\n"
+#: What icacls prints for a /findsid that matched nothing. CAPTURED from
+#: Windows 11 build 26100, not reasoned: the miss carries its own line ABOVE
+#: the summary, so a miss is TWO lines and not one. Reading it as one is what
+#: left the gate in ``config._acl_needs_reset`` resetting every path.
+FINDSID_NO_MATCH = (
+    "No files with a matching SID was found\n"
+    "Successfully processed 1 files; Failed processing 0 files\n"
+)
 
 
 def _findsid_match(path):
-    """What icacls prints for a /findsid that DID match: the path, then the summary."""
-    return f"{path}\nSuccessfully processed 1 files; Failed processing 0 files\n"
+    """What icacls prints for a /findsid that DID match. Captured, as above.
+
+    The path is echoed behind a "SID Found: " label and carries a trailing
+    period, so a substring test reads it and an equality test would not.
+    """
+    return (
+        f"SID Found: {path}.\n"
+        "Successfully processed 1 files; Failed processing 0 files\n"
+    )
 
 
 def _capture_run(monkeypatch, stdout=None, stderr=None):
@@ -538,8 +549,8 @@ def test_windows_db_sidecars_all_locked_via_restrict_db_files(tmp_path, monkeypa
 #
 # The probe reads STDOUT, not the return code: /findsid is a reporting verb and
 # exits 0 whether or not it matched, so a returncode-only check would make the
-# reset either never or always run. Everything asserted here about icacls's
-# output is reasoned from Microsoft's reference; no icacls has been executed.
+# reset either never or always run. The shapes asserted here were captured on
+# Windows 11 build 26100; the earlier reasoned ones were wrong.
 
 
 def test_windows_probe_finding_a_foreign_ace_runs_the_reset(tmp_path, monkeypatch):
@@ -911,3 +922,41 @@ def test_windows_warns_when_an_oserror_kills_the_grant_after_a_reset(
 
     assert [r.levelname for r in caplog.records] == ["WARNING"]
     assert str(d) in caplog.records[0].getMessage()
+
+
+def test_windows_probe_reads_the_real_two_line_miss_as_clean(
+    tmp_path, monkeypatch
+):
+    """The defect the captured fixtures caught, pinned as its own test.
+
+    Both answers are two lines, so a reader that requires exactly one calls
+    every path inconclusive and resets unconditionally - reinstating the
+    window this gate exists to close, on every app start.
+    """
+    monkeypatch.setattr(os, "name", "nt")
+    calls = _capture_run(monkeypatch, stdout=FINDSID_NO_MATCH)
+    f = tmp_path / "wattracker.db"
+    f.write_text("x")
+
+    assert config._acl_needs_reset(_expected_icacls(), str(f), {}) is False
+    assert len(_probes(calls)) == 3  # all three sids walked, none matched
+
+
+def test_windows_probe_resets_a_non_ascii_path_without_probing(
+    tmp_path, monkeypatch
+):
+    """Outside ASCII the echo cannot be trusted, so the path resets.
+
+    icacls writes the OEM codepage and text mode decodes the ANSI one. A
+    mangled echo would read as a clean miss, which is the one direction this
+    must not fail in.
+    """
+    monkeypatch.setattr(os, "name", "nt")
+    calls = _capture_run(monkeypatch, stdout=FINDSID_NO_MATCH)
+    f = tmp_path / "ライド.db"
+    f.write_text("x")
+
+    config._restrict(str(f), 0o600, is_dir=False)
+
+    assert _probes(calls) == []  # not probed: the answer could not be read
+    assert len(_resets(calls)) == 1
