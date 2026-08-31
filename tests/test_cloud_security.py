@@ -4,8 +4,12 @@ import hmac
 import pytest
 
 from wattracker.cloud.security import (
+    DEVICE_PAIRING_CODE_BITS,
     INSTALLATION_ID_BYTES,
+    MAX_DEVICE_PAIRING_TTL_SECONDS,
     CredentialRegistry,
+    DevicePairingBinding,
+    DevicePairingRegistry,
     EnrollmentRegistry,
     MemorySecurityStateBackend,
     MIN_REPLAY_TTL_SECONDS,
@@ -19,9 +23,13 @@ from wattracker.cloud.security import (
     sign_request,
     sign_request_ecdsa_p256,
     sign_request_ed25519,
+    format_pairing_code,
+    generate_pairing_code,
+    normalize_pairing_code,
     validate_public_key,
     verify_signature,
 )
+from wattracker.cloud.security import _PAIRING_ALPHABET
 
 
 def _namespace(seed: bytes = b"installation") -> str:
@@ -544,3 +552,191 @@ def test_persisted_device_without_capabilities_is_rejected_not_defaulted():
     backend.write("device", digest.hex(), stored)
     reloaded = CredentialRegistry(b"server secret", backend=backend)
     assert reloaded.resolve_device(device.credential_id) is None
+
+
+# ---------------------------------------------------------------------------
+# Desktop-minted device pairing codes (#152)
+# ---------------------------------------------------------------------------
+
+
+def test_pairing_codes_are_single_use_expire_and_are_indistinguishable():
+    registry = DevicePairingRegistry(b"server secret", ttl_seconds=900, clock=lambda: 100)
+    minted = registry.create(_namespace(), "local-scope", subject="subject", now=100)
+    assert minted.expires_at == 1_000
+
+    binding = registry.consume(minted.code, "subject", now=500)
+    assert binding is not None
+    assert binding.namespace == _namespace()
+    assert binding.local_user_scope == "local-scope"
+
+    # Consumed, expired, and never-issued are the same observable outcome.
+    consumed = registry.consume(minted.code, "subject", now=500)
+    expired_code = registry.create(_namespace(), "local-scope", subject="subject", now=100)
+    expired = registry.consume(expired_code.code, "subject", now=1_000)
+    unknown = registry.consume(generate_pairing_code(), "subject", now=500)
+    malformed = registry.consume("not-a-pairing-code", "subject", now=500)
+    assert consumed is expired is unknown is malformed is None
+
+
+def test_pairing_code_is_bound_to_the_minting_scope_and_subject():
+    registry = DevicePairingRegistry(b"server secret", clock=lambda: 100)
+    minted = registry.create(_namespace(b"rider-a"), "scope-a", subject="rider-a")
+
+    # A different verified subject cannot redeem it -- and does not burn it,
+    # so the rider who mistypes an account does not lose the code.
+    assert registry.consume(minted.code, "rider-b") is None
+    assert registry.consume(minted.code, None) is None
+    binding = registry.consume(minted.code, "rider-a")
+    assert binding is not None
+    assert binding.namespace == _namespace(b"rider-a")
+    assert binding.namespace != _namespace(b"rider-b")
+
+
+def test_pairing_binding_cannot_be_forged_or_redirected():
+    registry = DevicePairingRegistry(b"server secret", clock=lambda: 100)
+    credentials = CredentialRegistry(b"server secret", pairing_registry=registry)
+    # A raw 32-byte Ed25519 key: this test is about the binding proof, so it
+    # must run whether or not the optional crypto extra is installed.
+    public_key = b"k" * 32
+    minted = registry.create(_namespace(b"rider-a"), "scope-a")
+    binding = registry.consume(minted.code)
+    assert binding is not None
+    assert registry.verify_binding(binding)
+
+    # A hand-assembled binding naming somebody else's namespace has no proof.
+    forged = DevicePairingBinding(
+        _namespace(b"rider-b"), "scope-a", binding.pairing_id, b"forged-proof"
+    )
+    assert not registry.verify_binding(forged)
+    with pytest.raises(ValueError):
+        credentials.pair_device(forged, public_key)
+
+    # Reusing a real proof under a swapped namespace fails the same way: the
+    # namespace is inside the HMAC.
+    redirected = DevicePairingBinding(
+        _namespace(b"rider-b"), "scope-a", binding.pairing_id, binding._proof
+    )
+    assert not registry.verify_binding(redirected)
+    with pytest.raises(ValueError):
+        credentials.pair_device(redirected, public_key)
+
+    device = credentials.pair_device(binding, public_key)
+    assert device.namespace == _namespace(b"rider-a")
+    assert device.local_user_scope == "scope-a"
+    assert device.capabilities == frozenset({"read"})
+
+
+def test_pairing_ttl_is_capped_at_fifteen_minutes():
+    # The brute-force argument for a 60-bit code is stated against a bounded
+    # window, so no caller may widen it.
+    with pytest.raises(ValueError):
+        DevicePairingRegistry(b"server secret", ttl_seconds=901)
+    registry = DevicePairingRegistry(b"server secret", ttl_seconds=900)
+    assert registry.ttl_seconds == MAX_DEVICE_PAIRING_TTL_SECONDS
+    with pytest.raises(ValueError):
+        registry.create(_namespace(), "scope", ttl_seconds=86_400)
+    with pytest.raises(ValueError):
+        registry.create(_namespace(), "scope", ttl_seconds=0)
+
+
+def test_pairing_code_shape_normalization_and_entropy():
+    """The code must survive being typed, and survive being guessed.
+
+    Entropy budget, spelled out because the number is the control:
+
+    * alphabet: Crockford Base32, 32 symbols -> 5 bits per symbol
+    * length: 12 symbols -> 60 bits -> 2**60 == 1.15e18 codes
+    * TTL ceiling: 900 s
+    * APIM: 60 requests/minute and 1000/day per subscription key, so one key
+      buys at most 15 * 60 == 900 guesses inside a code's whole lifetime
+      (under the 1000/day cap, so the per-minute limit is what binds)
+
+    One key therefore succeeds with probability 900 / 2**60 = 7.8e-16.  The
+    floor asserted below is stated against a far richer attacker: 1000
+    subscription keys, each spending its entire daily budget on one 15-minute
+    window, must still stay under 2**-32.
+    """
+
+    assert len(set(_PAIRING_ALPHABET)) == 32
+    assert not set("ILOU") & set(_PAIRING_ALPHABET)
+    assert DEVICE_PAIRING_CODE_BITS == 60
+
+    codes = [generate_pairing_code() for _ in range(500)]
+    assert len(set(codes)) == 500
+    for code in codes:
+        assert len(code) == 14 and code.count("-") == 2
+        canonical = normalize_pairing_code(code)
+        assert canonical is not None and len(canonical) == 12
+        assert set(canonical) <= set(_PAIRING_ALPHABET)
+        # QR alphanumeric mode covers 0-9, A-Z and '-', so the display form
+        # encodes without falling back to byte mode.
+        assert set(code) <= set("0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ-")
+
+    guesses_per_key = int(MAX_DEVICE_PAIRING_TTL_SECONDS / 60) * 60
+    assert guesses_per_key == 900 and guesses_per_key <= 1_000
+    assert guesses_per_key / 2 ** DEVICE_PAIRING_CODE_BITS < 2 ** -32
+    assert (1_000 * guesses_per_key) / 2 ** DEVICE_PAIRING_CODE_BITS < 2 ** -32
+
+    # Typing tolerance: case, grouping, spaces, and the Crockford I/L/O folds
+    # all reach the same code.  Nothing else does.
+    canonical = normalize_pairing_code("ABCD-EFGH-JKMN")
+    assert normalize_pairing_code("abcd efgh jkmn") == canonical
+    assert normalize_pairing_code("ABCDEFGHJKMN") == canonical
+    assert normalize_pairing_code("0LOI") is None  # folds, but too short
+    assert normalize_pairing_code("0110-EFGH-JKMN") == normalize_pairing_code(
+        "OIIO-EFGH-JKMN"
+    )
+    assert normalize_pairing_code("UUUU-EFGH-JKMN") is None
+    assert normalize_pairing_code("ABCD-EFGH-JKM") is None
+    assert normalize_pairing_code("ABCD-EFGH-JKMNP") is None
+    assert normalize_pairing_code("ABCD-EFGH-JK.N") is None
+    assert normalize_pairing_code(None) is None
+    assert normalize_pairing_code(b"ABCDEFGHJKMN") is None
+    assert normalize_pairing_code("A" * 65) is None
+
+    assert format_pairing_code("abcdefghjkmn") == "ABCD-EFGH-JKMN"
+    with pytest.raises(ValueError):
+        format_pairing_code("nope")
+
+
+def test_pairing_codes_and_enrollment_invitations_are_separate_token_spaces():
+    """An enrollment token buys a writer; a pairing code must not.
+
+    The two registries share their one-time semantics but never a token
+    space, so neither can be made to spend the other's secret.
+    """
+
+    backend = MemorySecurityStateBackend()
+    enrollments = EnrollmentRegistry(b"server secret", backend=backend)
+    pairings = DevicePairingRegistry(b"server secret", backend=backend)
+    invitation = enrollments.create(_installation(), "scope")
+    minted = pairings.create(_namespace(), "scope")
+
+    assert pairings.consume(invitation.token) is None
+    # Both the display form and the canonical form: the enrollment registry
+    # digests what it is handed, so the separation has to hold for either.
+    assert enrollments.consume(minted.code) is None
+    assert enrollments.consume(normalize_pairing_code(minted.code)) is None
+    # Each still works in its own registry afterwards.
+    assert enrollments.consume(invitation.token) is not None
+    assert pairings.consume(minted.code) is not None
+
+
+def test_pairing_codes_survive_a_restart_and_stay_single_use():
+    backend = MemorySecurityStateBackend()
+    minted = DevicePairingRegistry(
+        b"server secret", backend=backend, clock=lambda: 100
+    ).create(_namespace(), "scope", subject="rider")
+    restarted = DevicePairingRegistry(
+        b"server secret", backend=backend, clock=lambda: 200
+    )
+    assert restarted.consume(minted.code, "rider") is not None
+    again = DevicePairingRegistry(b"server secret", backend=backend, clock=lambda: 300)
+    assert again.consume(minted.code, "rider") is None
+    stale = DevicePairingRegistry(
+        b"server secret", backend=backend, clock=lambda: 100
+    ).create(_namespace(), "scope", subject="rider")
+    expired = DevicePairingRegistry(
+        b"server secret", backend=backend, clock=lambda: 1_000
+    )
+    assert expired.consume(stale.code, "rider") is None

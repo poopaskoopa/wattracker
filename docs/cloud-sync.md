@@ -4,8 +4,11 @@
 
 APIM is the sole public HTTPS boundary. Clients use an approved APIM
 subscription and tenant-issued enrollment/pairing token. Registration is not
-open: an operator creates or approves an enrollment, binds the device to the
-tenant/user, and issues a short-lived one-time pairing token. Tokens are
+open: an operator creates or approves the *first* enrollment for a rider,
+binds it to the tenant/user, and issues a short-lived one-time pairing token.
+Every device that rider adds afterwards is paired by their own desktop
+install, which is the identity authority for its namespace, with a one-time
+code and no operator credentials — see the pairing section below. Tokens are
 revocable and never logged. The exact Entra tenant, issuer, audience, scopes,
 certificate, and secret references are deployment inputs, not repository
 secrets.
@@ -32,6 +35,8 @@ contract is:
 | `POST /api/v1/enrollment/start` | read | operator token + APIM proof + verified subject | — |
 | `POST /api/v1/enrollment/complete` | read | one-time invitation + APIM proof + verified subject | — |
 | `POST /api/v1/context/refresh` | read | signed device credential + APIM proof + verified subject | `read` |
+| `POST /api/v1/devices/pairing-codes` | read | APIM subscription + signed writer request + APIM proof + verified subject | `write` |
+| `POST /api/v1/devices/pair` | read | one-time pairing code + APIM proof | — |
 | `GET /api/v1/context` | read | reader context + APIM proof + verified subject | — |
 | `GET /api/v1/context/calendar` | read | reader context | — |
 | `GET /api/v1/context/activities` | read | reader context | — |
@@ -39,6 +44,12 @@ contract is:
 | `GET /api/v1/context/races` | read | reader context | — |
 | `POST /api/v1/sync/batches` | sync | APIM subscription + signed request | `write` |
 | `GET /api/v1/sync/status` | sync | APIM subscription + signed request | `write` |
+
+Every "verified subject" above is conditional on
+`CloudConfig.require_verified_subject`, which a deployment may only set while a
+gateway actually attests one — see "The subject is an optional binding" below.
+`POST /api/v1/devices/pair` is the one route that never requires a subject at
+all: the pairing code is the authorization.
 
 Enrollment and pairing validate tenant, user/device binding, expiry, nonce, and
 replay state. Enrollment returns a server-generated writer subscription key;
@@ -100,6 +111,200 @@ revocation route yet.
 
 Both Container Apps use `minReplicas=0` and `maxReplicas=1`; cold starts and
 single-instance throughput are accepted operational tradeoffs.
+
+## Pairing a second device, and the same-namespace-per-rider rule
+
+**Rule: one rider, one namespace.** Every device a rider pairs — the desktop,
+the iPhone, the iPad — reads and writes the same
+`(namespace, local_user_scope)` pair. A namespace is
+`HMAC(server_secret, installation_id)` and an `installation_id` is minted once,
+at the desktop's operator-gated enrollment. Nothing after that mints another
+one. A second device does not enroll; it *pairs into* the namespace the
+desktop already owns. This is what stops the iPad opening an empty account,
+which is exactly what a second `enrollment/start` used to produce.
+
+The rider's desktop install is the identity authority. Operator credentials
+bootstrap the *first* install and are never needed again.
+
+```
+operator token ──► enrollment, once ──► installation_id ──► namespace
+                                                              │
+desktop, holding a writer credential bound to (namespace, scope)
+   │
+   ├─► POST /api/v1/devices/pairing-codes
+   │      signed with the writer key; no request field names a namespace
+   │   ◄── ABCD-EFGH-JKMN   single use, <= 900 s   shown on screen or as a QR
+   │
+   │   (the rider carries the code to the phone)
+   ▼
+phone, holding no credential at all
+   │
+   └─► POST /api/v1/devices/pair  { code, public_key }
+       ◄── device credential + its own subscription key + reader context,
+           in the SAME namespace and scope as the desktop
+```
+
+### Minting
+
+`POST /api/v1/devices/pairing-codes` takes the writer's ordinary signed
+envelope — `X-Writer-Credential`, `-Timestamp`, `-Nonce`,
+`-Idempotency-Key`, `-Revision`, `-Signature` over the same
+`canonical_request` framing, the same 300-second freshness window, and the
+same nonce-replay claim — plus the APIM subscription and the
+gateway-verified Entra subject. The idempotency key is the fixed string
+`device-pairing-code` and the revision is `0`, because there is nothing here
+for a caller to choose.
+
+The code is bound to the `(namespace, local_user_scope)` **of the
+authenticated credential**. No request field names a namespace, a scope, an
+installation, or an account; a caller can only ever mint into the account it
+already controls.
+
+Minting stays strict, and it can afford to: a writer-signed request is real
+authentication that borrows nothing from a gateway. Where a gateway attests a
+subject, the mint route requires it, matches it against the subject bound into
+the writer at enrollment, and the code inherits it. Where none is attested the
+header is not read and the code binds no subject.
+
+Capability is `write`. Pairing authority *is* installation authority, and a
+read-only paired device therefore cannot mint codes for further devices.
+Both routes live on the **read plane**: minting persists a record in
+`CloudAuth`, and only the read plane's managed identity may write that table.
+
+### Redeeming
+
+`POST /api/v1/devices/pair` takes `{code, public_key}` and an optional
+`signature_algorithm` (`ed25519` or `ecdsa-p256-sha256`; a device keeps its
+private half in hardware, so a symmetric algorithm is refused). It returns
+`device_credential`, `device_subscription_key`, `device_signature_algorithm`,
+`device_capabilities`, `signing_namespace`, an initial `reader_context`, and
+`expires_in`.
+
+**The device never chooses its namespace or scope.** Both come from the
+code's binding, the same way `SyncBatch.from_wire` parses and discards a
+client-supplied `installation_id`. A `namespace`, `local_user_scope`,
+`installation_id` or `capabilities` field in the pair body is simply not
+read. Devices are issued `capabilities = {"read"}` here, as at enrollment.
+
+The public key is fully validated — encoding, length, and the on-curve proof
+— *before* the single-use code is spent, so a rejected key never strands a
+rider holding a burnt code and no device.
+
+Every code failure — unknown, malformed, expired, already consumed, or
+(where a subject is attested) redeemed by the wrong one — returns the identical
+404 body and headers as an unknown reader context. A subject mismatch
+deliberately does not spend the code: a rider redeeming on the wrong account
+should not lose it, and the response says nothing either way. A 400 is
+reachable only for a request malformed independently of the code, which reveals
+nothing because the wire format is public.
+
+A cross-namespace read is a 404, never a 403: a 403 would confirm that an
+object exists somewhere.
+
+### The subject is an optional binding, never the authorization
+
+`POST /api/v1/devices/pair` deliberately does **not** require a verified
+subject. Demanding one would mean the rider signing in to an identity provider
+on the phone before pairing, which is the thing the code exists to avoid — the
+whole point is that there is no password in the cloud and no IdP on the device,
+just a code read off the desktop. It is the same shape as pairing a TV app.
+
+A subject header is also worth exactly as much as the gateway that overwrites
+it. With a gateway in front, it is attested. Without one it is whatever the
+caller typed, and the gateway proof secret degrades into a static shared
+secret. So:
+
+- `CloudConfig.require_verified_subject` declares whether this deployment has
+  an issuer. When it is false **no route reads the header at all** — reading a
+  header nobody vouches for is worse than not having one, because it looks
+  like a check.
+- `CloudConfig.gateway_attests_subject` is true only when the proof is both
+  required and configured.
+- `CloudState.create(..., require_persistent_security=True)` — which is how
+  the container entrypoint builds the app — **refuses to boot** when a
+  deployment claims `require_verified_subject` while no gateway attests one.
+  Removing the gateway is therefore a deliberate configuration change, not a
+  silent downgrade of every subject check in the app.
+
+Where a subject *is* attested it is applied as an additional binding on top of
+the code, never instead of it: the mint route requires it and matches it
+against the subject bound into the writer at enrollment, and the code inherits
+it. At redeem, the demand then comes from **the code, not the route** — the
+stored record enforces a subject if and only if it carries one, so omitting the
+header cannot bypass a binding that exists, and a code that carries no subject
+needs no header.
+
+Where nothing is attested, the code binds no subject and the paired device
+carries none. That is deliberate rather than incidental: a subject on the
+device credential is compared on every later request, so pinning one that
+nothing can verify would add no security and would leave a phone unable to read,
+holding a string it has no way to obtain.
+
+### Code shape and entropy
+
+The code is 12 symbols of Crockford Base32 shown as `XXXX-XXXX-XXXX`.
+Crockford's alphabet is 32 symbols with `I`, `L`, `O` and `U` removed, so
+there is no 1/I/l or 0/O confusion; typed input is uppercased, hyphens and
+spaces are dropped, and `I`/`L` fold to `1` and `O` to `0`. Generated codes
+never contain the folded letters, so folding cannot merge two codes or shrink
+the space. `U` is not a legal symbol at all.
+
+Fourteen characters of `A–Z`, `0–9` and `-` are all inside QR alphanumeric
+mode, so the code encodes as a version-2 QR at error-correction level H
+(25×25 modules) — the smallest practical symbol, scannable from a laptop
+screen at arm's length — and stays short enough to type on a phone in
+landscape.
+
+The entropy arithmetic, because the number is the control:
+
+| Quantity | Value |
+|---|---|
+| Alphabet | 32 symbols → 5 bits/symbol |
+| Length | 12 symbols → **60 bits** |
+| Code space | 2^60 = 1,152,921,504,606,846,976 ≈ 1.15 × 10^18 |
+| TTL ceiling | 900 s (default 600 s) |
+| APIM limits | 60 requests/minute and 1,000/day per subscription key |
+
+Inside the 900-second ceiling one subscription key buys at most
+15 × 60 = **900** guesses — below the 1,000/day cap, so the per-minute limit
+is what binds. One key therefore succeeds with probability
+900 / 2^60 = 7.8 × 10^-16.
+
+Sizing it from the other direction: to keep an attacker holding 1,000
+subscription keys — each spending a full daily budget inside one code's
+lifetime, so 9 × 10^5 guesses — below a 2^-32 chance, the code needs
+2^b ≥ 9 × 10^5 × 2^32 ≈ 3.9 × 10^15, i.e. **b ≥ 52 bits**. Sixty bits clears
+that floor by 8 bits, a factor of 256. The APIM product issues one
+subscription per approved account (`approvalRequired: true`,
+`subscriptionsLimit: 1`), so 1,000 keys is already a generous overestimate of
+a real attacker; the limits are keyed on
+`context.Subscription?.Id ?? context.Request.IpAddress`.
+
+The TTL ceiling is enforced in `DevicePairingRegistry`, not left to callers,
+because the whole argument above is stated against a bounded window.
+
+### Not yet reachable through the gateway
+
+`main.bicep` enumerates APIM operations explicitly and does not yet declare
+`/devices/pairing-codes` or `/devices/pair`, so neither is reachable through
+APIM until #165 adds them.
+
+If the gateway survives, note that APIM's API-level policy requires a validated
+Entra JWT for every path not containing `/sync/`, which is what supplies
+`X-Verified-Entra-Subject`; the desktop would then need a live rider sign-in to
+mint, not only its writer credential. APIM's `allowed-headers` CORS list also
+still lacks the `x-device-*` headers the app's own CORS middleware permits.
+
+If it does not — #164 is weighing the gateway's $330–700/month against a
+$2–5/month deployment — then the replacement deployment sets
+`require_verified_subject=False` and pairing continues to work untouched,
+because the code was never leaning on the gateway for anything. What that
+deployment still owes is a replacement for the parts that *do* lean on it:
+`enrollment/start` and `enrollment/complete` still require a subject header
+unconditionally, and the operator token plus the one-time invitation are the
+only real secrets on those routes once no JWT is validated. That is bootstrap,
+it is operator-driven, and it is out of scope here — but it must not be
+forgotten when the gateway goes.
 
 ## Local offline contract
 

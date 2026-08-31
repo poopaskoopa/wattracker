@@ -127,6 +127,50 @@ Two consequences worth knowing:
   from stored credential state, never from the wire. Ed25519 signatures are the same length, so
   that selection is now load-bearing in a second way, not just against HMAC downgrade.
 
+### Disjoint namespaces per enrollment — decided by #152
+
+**Decision: one rider, one namespace, and `installation_id` reuse is never the mechanism.**
+
+Each `enrollment/start` still mints a fresh random installation id, and a namespace is still
+`HMAC(server_secret, installation_id)` — that derivation is unchanged and must stay unchanged.
+The pressure this item predicted, to reuse installation ids so a rider's second device lands in
+the first one's namespace, is refused: reusing an id would make the namespace a function of a
+value that has, at some point, been outside the server, and would turn a leaked or guessed id
+into an account selector.
+
+Instead, a second device never enrolls at all. The desktop, which already holds a writer
+credential bound to `(namespace, local_user_scope)`, mints a single-use pairing code bound to
+*its own* binding (`POST /api/v1/devices/pairing-codes`), and the device redeems it
+(`POST /api/v1/devices/pair`) for a `DeviceCredential` in that same namespace and scope. The
+device supplies only a public key; every partition-naming field it might send is ignored, the
+way `SyncBatch.from_wire` ignores a client-supplied `installation_id`. Two enrollments still
+produce two disjoint namespaces — that is now correct rather than a wart, because two
+enrollments mean two riders.
+
+See `docs/cloud-sync.md`, "Pairing a second device, and the same-namespace-per-rider rule", for
+the flow, the indistinguishability rules, and the 60-bit code entropy arithmetic.
+
+Pairing deliberately depends on nothing a gateway provides. `POST /api/v1/devices/pair` does
+not require a verified subject: the code is the authorization, and requiring an identity provider
+on the phone would defeat the point of a code read off the desktop. Where a gateway does attest a
+subject it is applied as an additional binding on top of the code — and
+`CloudState.create(..., require_persistent_security=True)` now refuses to boot if a deployment
+claims `require_verified_subject` while nothing attests one, so removing the gateway is a
+configuration change rather than a silent downgrade.
+
+Still open in the same area, and deliberately not in #152's scope:
+
+- APIM does not declare the `/devices/*` operations, so neither route is reachable through the
+  gateway until #165 adds them. Both are exercised end to end against the ASGI app.
+- **If #164 removes the gateway, `enrollment/start` and `enrollment/complete` still require a
+  verified-subject header unconditionally, and no JWT is validated to produce it.** Those routes
+  are operator-token gated and their real secret is the one-time invitation, so this is not an
+  open hole, but the subject check there becomes decorative and should be either removed or
+  re-anchored in the same change. Pairing, reads, and refresh already handle a gateway-less
+  deployment.
+- There is still no revocation route, so a lost paired device is revoked only by
+  `CredentialRegistry.revoke_device` in library code (#153).
+
 ## Remaining open work, in priority order
 
 ### Smaller items
@@ -152,10 +196,6 @@ Two consequences worth knowing:
 - `api.py:63` — `operator_token` minimum length is 8 characters.
 - `main.bicep:354` — `stagingEnvironmentPolicy: 'Enabled'` creates publicly reachable PR preview
   environments.
-- Each `enrollment/start` mints a fresh random installation id (`api.py:367`), so the same Entra
-  subject enrolling twice gets two disjoint namespaces with no shared data. Expect pressure to
-  reuse installation ids, which would collapse the namespace derivation — decide the intended
-  behaviour now.
 - Expired invitation/context rows in `CloudAuth` are never deleted (no role has a delete action);
   the table grows monotonically.
 

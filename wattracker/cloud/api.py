@@ -24,6 +24,7 @@ from .security import (
     CredentialRegistry,
     DEFAULT_DEVICE_CAPABILITIES,
     DEVICE_SIGNATURE_ALGORITHMS,
+    DevicePairingRegistry,
     EnrollmentRegistry,
     NonceReplayGuard,
     PublicKeyUnavailable,
@@ -49,6 +50,13 @@ _REFRESH_REVISION = ""
 _MAX_REFRESH_BODY_BYTES = 4 * 1024
 # A device public key is at most a 65-byte uncompressed P-256 point.
 _MAX_DEVICE_KEY_HEX = 130
+# Minting a pairing code carries no body and no idempotent effect either, so
+# the same fixed-envelope treatment applies.  The request path is already part
+# of the canonical request, so this does not add cross-route replay protection
+# -- it only keeps the signed envelope canonical and unambiguous.
+_PAIRING_IDEMPOTENCY_KEY = "device-pairing-code"
+_PAIRING_REVISION = 0
+_MAX_PAIRING_BODY_BYTES = 4 * 1024
 
 
 @dataclass
@@ -63,6 +71,12 @@ class CloudConfig:
     apim_proof_value: str = field(default="", repr=False)
     require_apim_proof: bool = True
     verified_subject_header: str = "X-Verified-Entra-Subject"
+    # A verified-subject header is worth exactly as much as the gateway that
+    # overwrites it.  Deployments without such a gateway must set this False,
+    # and then no route reads the header at all: a header that is trusted in
+    # one deployment and forgeable in another, with nothing at startup telling
+    # them apart, is the failure mode this flag exists to remove.
+    require_verified_subject: bool = True
     subscription_header: str = "Ocp-Apim-Subscription-Key"
     allowed_origins: tuple[str, ...] = ()
     max_request_bytes: int = 8 * 1024 * 1024
@@ -87,11 +101,34 @@ class CloudConfig:
             raise ValueError("replay TTL must cover the timestamp freshness window")
         if not isinstance(self.apim_proof_value, str) or len(self.apim_proof_value) > 512:
             raise ValueError("apim proof value is invalid")
+        if self.require_apim_proof and self.apim_proof_value:
+            # An empty value deliberately means "no gateway", and
+            # `gateway_attests_subject` reads False for it.  A *non-empty*
+            # value reads True, and that is what licenses every route to trust
+            # the verified-subject header -- so a blank or trivially short one
+            # claims a gateway while being guessable, and whoever guesses it
+            # then dictates the subject.  Refuse the claim rather than let it
+            # stand on a placeholder.
+            if not self.apim_proof_value.strip() or len(self.apim_proof_value) < 8:
+                raise ValueError("apim proof value must be a secret, not a placeholder")
+        if not isinstance(self.require_verified_subject, bool):
+            raise ValueError("require_verified_subject must be a boolean")
         if any(
             not isinstance(origin, str) or not origin or "*" in origin
             for origin in self.allowed_origins
         ):
             raise ValueError("allowed_origins must be exact non-wildcard origins")
+
+    @property
+    def gateway_attests_subject(self) -> bool:
+        """Whether some gateway actually vouches for the subject header.
+
+        The header is only meaningful when a proof-carrying gateway sits in
+        front and overwrites it on every request.  Without the proof, the
+        header is whatever the caller typed.
+        """
+
+        return bool(self.require_apim_proof and self.apim_proof_value)
 
 
 @dataclass
@@ -104,6 +141,7 @@ class CloudState:
     store: Any
     quotas: QuotaManager
     nonces: NonceReplayGuard
+    pairings: DevicePairingRegistry
 
     @classmethod
     def create(
@@ -136,7 +174,29 @@ class CloudState:
             )
         ):
             raise RuntimeError("production cloud runtime requires durable auth state")
+        # A deployment must not be able to claim it enforces a verified
+        # subject while nothing issues one.  Without a proof-carrying gateway
+        # the header is attacker-supplied, so trusting it would be a control
+        # in name only -- refuse to start rather than serve one.  Removing the
+        # gateway is therefore a deliberate configuration change here, not a
+        # silent downgrade of every subject check in the app.
+        if (
+            require_persistent_security
+            and config.require_verified_subject
+            and not config.gateway_attests_subject
+        ):
+            raise RuntimeError(
+                "a verified-subject header requires a gateway that proves "
+                "itself and overwrites it; configure the gateway proof or set "
+                "require_verified_subject=False"
+            )
         enrollments = EnrollmentRegistry(
+            config.server_secret, backend=security_backend, clock=config.clock
+        )
+        # Pairing codes live in the same durable auth state as invitations but
+        # in their own record kind and their own digest space, so neither
+        # registry can ever spend the other's token.
+        pairings = DevicePairingRegistry(
             config.server_secret, backend=security_backend, clock=config.clock
         )
         return cls(
@@ -144,10 +204,12 @@ class CloudState:
             credentials=CredentialRegistry(
                 config.server_secret,
                 enrollment_registry=enrollments,
+                pairing_registry=pairings,
                 backend=security_backend,
                 clock=config.clock,
             ),
             enrollments=enrollments,
+            pairings=pairings,
             store=store if store is not None else MemoryTenantStore(),
             quotas=quotas or QuotaManager(
                 QuotaPolicy(
@@ -267,6 +329,38 @@ def _apim_proof_valid(state: CloudState, request: Request) -> bool:
     return bool(state.config.apim_proof_value) and _safe_compare_text(
         marker, state.config.apim_proof_value
     )
+
+
+def _attested_subject(state: CloudState, request: Request) -> str | None:
+    """The subject some gateway vouches for, or ``None`` when nothing does.
+
+    Where the deployment attests no subject the header is not read at all:
+    reading a header nobody vouches for is worse than not having one, because
+    it looks like a check.  This never fails a request -- a missing header is
+    simply no subject, and a caller that needs one says so itself.
+    """
+
+    if not state.config.require_verified_subject:
+        return None
+    subject = request.headers.get(state.config.verified_subject_header.lower(), "")
+    if not subject or len(subject) > 256:
+        return None
+    return subject
+
+
+def _subject_binding(state: CloudState, request: Request) -> tuple[bool, str | None]:
+    """``(ok, subject)`` for routes that demand a subject wherever one exists.
+
+    ``ok`` is False only when the deployment attests a subject and the request
+    did not carry a usable one.  Routes whose own secret is sufficient
+    authorization use :func:`_attested_subject` instead and let the stored
+    record decide whether a subject is needed.
+    """
+
+    if not state.config.require_verified_subject:
+        return True, None
+    subject = _attested_subject(state, request)
+    return subject is not None, subject
 
 
 def _has_capability(credential: Any, capability: str) -> bool:
@@ -423,15 +517,21 @@ def _resolve_reader(state: CloudState, request: Request) -> Any:
     scheme, _, token = raw.partition(" ")
     if scheme.lower() != "bearer" or not token or len(token) > 512:
         return None
-    subject = request.headers.get(state.config.verified_subject_header.lower(), "")
-    if not subject or len(subject) > 256:
+    ok, subject = _subject_binding(state, request)
+    if not ok:
         return None
     context = state.credentials.resolve_reader(token)
     if context is None or not state.quotas.public_enabled:
         return None
     bound_subject = getattr(context, "subject", None)
-    if bound_subject is not None and (
-        not subject or not _safe_compare_text(bound_subject, subject)
+    # A bound subject is only checkable where one is attested.  Where it is
+    # not, the bearer context token -- 32 bytes of server-generated secret --
+    # is the whole authorization, and comparing it against a header the caller
+    # wrote would add nothing but the appearance of a second factor.
+    if (
+        bound_subject is not None
+        and subject is not None
+        and not _safe_compare_text(bound_subject, subject)
     ):
         return None
     return context
@@ -636,8 +736,8 @@ def create_cloud_app(
             """
             if not _apim_proof_valid(state, request):
                 return _not_found()
-            subject = request.headers.get(config.verified_subject_header.lower(), "")
-            if not subject or len(subject) > 256:
+            ok, subject = _subject_binding(state, request)
+            if not ok:
                 return _not_found()
             try:
                 body = await _bounded_body(request, _MAX_REFRESH_BODY_BYTES)
@@ -651,8 +751,10 @@ def create_cloud_app(
             if not _verify_device_request(state, request, device, body):
                 return _not_found()
             bound_subject = getattr(device, "subject", None)
-            if bound_subject is not None and not _safe_compare_text(
-                bound_subject, subject
+            if (
+                bound_subject is not None
+                and subject is not None
+                and not _safe_compare_text(bound_subject, subject)
             ):
                 return _not_found()
             if not _has_capability(device, "read"):
@@ -680,6 +782,223 @@ def create_cloud_app(
                 "expires_in": READER_CONTEXT_TTL_SECONDS,
                 "capabilities": sorted(getattr(device, "capabilities", ())),
             }, headers={"Cache-Control": "no-store"})
+
+        @app.post("/api/v1/devices/pairing-codes")
+        async def mint_pairing_code(request: Request) -> Response:
+            """Mint a single-use pairing code for the caller's own scope.
+
+            The rider's desktop install is the identity authority here: it
+            already holds a writer credential bound to
+            ``(namespace, local_user_scope)``, and this route binds a code to
+            exactly that pair.  Nothing in the request names a namespace, a
+            scope, an installation, or a subject, so a compromised or curious
+            caller can only ever mint a code into the account it already
+            controls.
+
+            Capability is ``"write"`` rather than a new ``"pair"``
+            capability.  Pairing authority *is* installation authority, and
+            every writer credential already carries ``"write"``, whereas a new
+            capability would need a migration of stored records before any
+            existing desktop could pair its phone.  The practical consequence
+            is the one that matters: a read-only paired device cannot mint a
+            code for another device.
+
+            This route lives on the read plane because minting persists a
+            record in ``CloudAuth``, and only the read plane's managed
+            identity may write that table.
+
+            Minting stays strict, and it can afford to: a writer-signed
+            request is real authentication that does not borrow anything from
+            a gateway.  Where a gateway does attest a subject, that subject is
+            required here and must match the one bound into the writer at
+            enrollment, and the code inherits it.  Where none is attested the
+            header is not read and the code binds no subject -- see
+            :func:`_subject_binding`.
+            """
+            writer = _writer_auth(state, request, capability="write")
+            try:
+                body = await _bounded_body(request, _MAX_PAIRING_BODY_BYTES)
+            except HTTPException:
+                return _error(400, "invalid pairing request")
+            verified = _verify_writer_request(state, request, writer, body)
+            if verified is None:
+                return _error(401, "writer authorization required")
+            namespace, scope, idem, revision = verified
+            # A fixed envelope: there is nothing for the caller to choose.
+            if not _safe_compare_text(idem, _PAIRING_IDEMPOTENCY_KEY) or (
+                revision != _PAIRING_REVISION
+            ):
+                return _error(401, "writer authorization required")
+            # Subject outcomes are only reachable once the caller has proven
+            # possession of the writer key.
+            ok, verified_subject = _subject_binding(state, request)
+            if not ok:
+                return _error(401, "writer authorization required")
+            # A writer enrolled through an attesting gateway carries the
+            # subject verified then; it must still be the one signed in now.
+            # A writer registered without one -- the HMAC path, which never
+            # saw an identity provider -- has nothing to compare against, so
+            # the code takes the subject presented at mint time.
+            stored_subject = getattr(writer, "subject", None)
+            if (
+                stored_subject is not None
+                and verified_subject is not None
+                and not _safe_compare_text(stored_subject, verified_subject)
+            ):
+                return _error(401, "writer authorization required")
+            # Where nothing attests a subject, the code carries none.  Binding
+            # one anyway would put a value on the device credential that every
+            # later request compares against an unauthenticated header: no
+            # security, and a paired phone that cannot read because it has no
+            # identity provider to get that string from.
+            subject = (
+                None if verified_subject is None else (stored_subject or verified_subject)
+            )
+            try:
+                # Minting persists a record, so it is metered like a read
+                # rather than being free.  A refusal here is safe: nothing has
+                # been created and the caller can retry.
+                state.quotas.admit_read(namespace, scope, response_bytes=0)
+            except QuotaExceeded as exc:
+                return _error(
+                    exc.status_code, "read quota exceeded", retry_after=exc.retry_after
+                )
+            try:
+                minted = state.pairings.create(namespace, scope, subject=subject)
+            except (ValueError, RuntimeError):
+                return _error(503, "pairing unavailable")
+            return JSONResponse({
+                "pairing_code": minted.code,
+                "expires_at": minted.expires_at,
+                "expires_in": state.pairings.ttl_seconds,
+            }, headers={"Cache-Control": "no-store"})
+
+        @app.post("/api/v1/devices/pair")
+        async def pair_device(request: Request) -> Response:
+            """Redeem a pairing code for a durable device credential.
+
+            The device supplies a public key and a code, and nothing else it
+            sends is trusted.  The namespace and local scope come from the
+            code's binding -- the same treatment ``SyncBatch.from_wire`` gives
+            a client-supplied ``installation_id``, which it parses and
+            discards.  A body field named ``namespace``, ``local_user_scope``
+            or ``installation_id`` is simply not read.
+
+            **The code is the authorization.**  Redeeming deliberately does
+            not require a verified subject: 60 bits, single-use, at most 900
+            seconds, and mintable only by a writer-signed request from the
+            rider's own desktop is sufficient proof to issue a read-only
+            credential.  Demanding an identity provider here would mean the
+            rider signing in to one on the phone before pairing, which is the
+            thing the code exists to avoid -- and a subject header is only
+            worth anything behind a gateway that overwrites it, which this
+            deployment may not have.  Where one is attested it is applied as
+            an additional binding on top of the code, never instead of it.
+
+            Every code failure -- unknown, malformed, expired, already
+            consumed, or (where a subject is attested) redeemed by the wrong
+            one -- returns the identical 404 body and headers as an unknown
+            reader context.  A 400 is reachable only for a request that is
+            malformed independently of the code (bad JSON, a missing or
+            unusable public key), which reveals nothing secret because the
+            wire format is public.
+            """
+            if not _apim_proof_valid(state, request):
+                return _not_found()
+            if not state.quotas.public_enabled:
+                return _not_found()
+            # Never demanded here.  ``consume`` enforces a subject if and only
+            # if the code carries one, which can only have happened in a
+            # deployment that attests one -- so the demand comes from the
+            # code, never from the route, and omitting the header cannot
+            # bypass a binding that exists.
+            subject = _attested_subject(state, request)
+            try:
+                body = await _bounded_body(request, _MAX_PAIRING_BODY_BYTES)
+            except HTTPException:
+                return _error(400, "invalid pairing request")
+            try:
+                payload = json.loads(body.decode("utf-8"))
+                if not isinstance(payload, dict):
+                    raise ValueError
+                code = payload.get("code")
+                public_key_hex = payload.get("public_key")
+                algorithm = payload.get("signature_algorithm", "ed25519")
+                if (
+                    not isinstance(code, str)
+                    or not isinstance(public_key_hex, str)
+                    or len(public_key_hex) > _MAX_DEVICE_KEY_HEX
+                    or not isinstance(algorithm, str)
+                    or algorithm not in DEVICE_SIGNATURE_ALGORITHMS
+                ):
+                    raise ValueError
+                public_key = bytes.fromhex(public_key_hex)
+            except (
+                ValueError, TypeError, UnicodeDecodeError, json.JSONDecodeError,
+                RecursionError,
+            ):
+                return _error(400, "invalid pairing request")
+            # The key is fully validated -- encoding, length, and the on-curve
+            # proof -- before the single-use code is spent, for the same
+            # reason enrollment does it in that order: a key rejected
+            # afterwards would burn the rider's code and leave no device.
+            try:
+                validate_public_key(algorithm, public_key)
+            except ValueError:
+                return _error(400, "invalid pairing request")
+            except PublicKeyUnavailable:
+                # The deployment lacks the crypto extra.  Refuse without
+                # spending the code, and without saying why.
+                return _not_found()
+            binding = state.pairings.consume(code, subject)
+            if binding is None:
+                return _not_found()
+            try:
+                device = state.credentials.pair_device(
+                    binding,
+                    public_key,
+                    signature_algorithm=algorithm,
+                    # Devices are issued read-only here, exactly as at
+                    # enrollment.  Widening one is a capability grant on the
+                    # stored record, never an inference from its type.
+                    capabilities=DEFAULT_DEVICE_CAPABILITIES,
+                    # The subject, if any, comes from the code's binding and
+                    # never from this request.  A device paired where nothing
+                    # attests a subject simply carries none, so no later
+                    # request is checked against a header nobody vouches for.
+                )
+                token, _context = state.credentials.issue_reader_context_for_scope(
+                    device.namespace, device.local_user_scope, device.subject
+                )
+            except (ValueError, RuntimeError, PublicKeyUnavailable):
+                return _not_found()
+            paired = {
+                "device_credential": device.credential_id,
+                "device_subscription_key": device.subscription_key.decode("ascii"),
+                "device_signature_algorithm": device.signature_algorithm,
+                "device_capabilities": sorted(device.capabilities),
+                # The opaque signing context the device must reproduce in the
+                # canonical request when it refreshes.  It is a signing
+                # namespace, not something the device chose or may change.
+                "signing_namespace": device.namespace,
+                "reader_context": token,
+                "expires_in": READER_CONTEXT_TTL_SECONDS,
+            }
+            body_bytes = json.dumps(paired, separators=(",", ":")).encode()
+            try:
+                # Metered after the fact rather than admitted before: a quota
+                # refusal here would strand a rider holding a spent code and a
+                # credential they never received.
+                state.quotas.record_read_bytes(
+                    device.namespace, device.local_user_scope, len(body_bytes)
+                )
+            except QuotaExceeded:
+                pass
+            return Response(
+                body_bytes,
+                media_type="application/json",
+                headers={"Cache-Control": "no-store"},
+            )
 
         @app.get("/api/v1/context")
         async def context(request: Request) -> Response:
