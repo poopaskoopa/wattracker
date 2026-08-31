@@ -31,7 +31,7 @@ from .timeutil import (
 
 _log = logging.getLogger(__name__)
 
-SCHEMA_VERSION = 34
+SCHEMA_VERSION = 35
 
 
 def _restrict_db_files(path: str) -> None:
@@ -454,6 +454,9 @@ _MIGRATIONS: Dict[int, Sequence[Union[str, Callable[[sqlite3.Connection], None]]
         _promote_weight_scalar,
         _backfill_weight_history,
     ],
+    34: [
+        "ALTER TABLE user_settings ADD COLUMN history_start_date TEXT",
+    ],
 }
 
 _DROP = """
@@ -505,6 +508,7 @@ CREATE TABLE IF NOT EXISTS user_settings (
     weight_kg          REAL,
     hr_max             INTEGER,
     timezone           TEXT,
+    history_start_date TEXT,
     FOREIGN KEY(user_id) REFERENCES users(id)
 );
 
@@ -1234,7 +1238,8 @@ def touch_connector_device(device_id: int, path: Optional[str] = None) -> None:
 
 # -------------------------------------------------------------- settings
 _SETTING_KEYS = ("ftp", "zwift_id", "activities_dir", "workouts_dir",
-                 "zwift_email", "weight_kg", "hr_max", "timezone")
+                 "zwift_email", "weight_kg", "hr_max", "timezone",
+                 "history_start_date")
 
 
 def get_user_settings(user_id: int, path: Optional[str] = None) -> dict:
@@ -1242,7 +1247,7 @@ def get_user_settings(user_id: int, path: Optional[str] = None) -> dict:
     try:
         row = conn.execute(
             "SELECT ftp, zwift_id, activities_dir, workouts_dir, zwift_email, "
-            "weight_kg, hr_max, timezone FROM user_settings WHERE user_id = ?",
+            "weight_kg, hr_max, timezone, history_start_date FROM user_settings WHERE user_id = ?",
             (user_id,),
         ).fetchone()
         if not row:
@@ -1282,8 +1287,12 @@ def save_user_settings(user_id: int, updates: dict, path: Optional[str] = None) 
     allowed here - it is inert, and both readers already refuse it.
     """
     current = get_user_settings(user_id, path=path)
+    previous_cutoff = current.get("history_start_date")
+    previous_timezone = current.get("timezone")
     for key in _SETTING_KEYS:
-        if key in updates and updates[key] not in (None, ""):
+        if key == "history_start_date" and key in updates and updates[key] in (None, ""):
+            current[key] = None
+        elif key in updates and updates[key] not in (None, ""):
             value = updates[key]
             if key == "ftp":
                 number = _numeric_ftp(value)
@@ -1295,6 +1304,11 @@ def save_user_settings(user_id: int, updates: dict, path: Optional[str] = None) 
                 timezone = value.strip() if isinstance(value, str) else value
                 if valid_timezone(timezone):
                     current[key] = timezone
+            elif key == "history_start_date":
+                try:
+                    current[key] = _dt.date.fromisoformat(str(value)).isoformat()
+                except (TypeError, ValueError):
+                    _log.warning("refusing invalid history_start_date: %r", value)
             elif key == "zwift_id":
                 safe = safe_zwift_id(str(value))
                 if safe:
@@ -1309,8 +1323,8 @@ def save_user_settings(user_id: int, updates: dict, path: Optional[str] = None) 
             """
             INSERT INTO user_settings
                 (user_id, ftp, zwift_id, activities_dir, workouts_dir,
-                 zwift_email, weight_kg, hr_max, timezone)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                 zwift_email, weight_kg, hr_max, timezone, history_start_date)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(user_id) DO UPDATE SET
                 ftp=excluded.ftp,
                 zwift_id=excluded.zwift_id,
@@ -1319,7 +1333,8 @@ def save_user_settings(user_id: int, updates: dict, path: Optional[str] = None) 
                 zwift_email=excluded.zwift_email,
                 weight_kg=excluded.weight_kg,
                 hr_max=excluded.hr_max,
-                timezone=excluded.timezone
+                timezone=excluded.timezone,
+                history_start_date=excluded.history_start_date
             """,
             (
                 user_id,
@@ -1331,8 +1346,25 @@ def save_user_settings(user_id: int, updates: dict, path: Optional[str] = None) 
                 current["weight_kg"],
                 current["hr_max"],
                 current["timezone"],
+                current["history_start_date"],
             ),
         )
+        history_changed = current["history_start_date"] != previous_cutoff
+        if (history_changed or current["timezone"] != previous_timezone):
+            try:
+                _invalidate_curve_cache(conn, user_id)
+            except sqlite3.OperationalError as exc:
+                if "no such table" not in str(exc).lower():
+                    raise
+        if history_changed:
+            # A cutoff rejection is cached as a scanned file so ordinary
+            # rescans stay cheap. Invalidate that cache when the window moves
+            # so clearing or widening the cutoff can restore those files.
+            try:
+                conn.execute("DELETE FROM scanned_files WHERE user_id = ?", (user_id,))
+            except sqlite3.OperationalError as exc:
+                if "no such table" not in str(exc).lower():
+                    raise
         conn.commit()
         return current
     finally:
@@ -1648,6 +1680,7 @@ def activities_for_ftp_rescore(
                 """,
                 (user_id, *chunk),
             ).fetchall()
+            rows = _visible_rows(conn, user_id, rows)
             yield [
                 {
                     "id": row["id"],
@@ -1685,11 +1718,11 @@ def activity_ids_after(
     conn = connect(path, read_only=read_only)
     try:
         rows = conn.execute(
-            "SELECT id FROM activities WHERE user_id = ? AND id > ? "
-            "ORDER BY id LIMIT ?",
-            (user_id, int(after_id), int(limit)),
+            "SELECT * FROM activities WHERE user_id = ? AND id > ? "
+            "ORDER BY id",
+            (user_id, int(after_id)),
         ).fetchall()
-        return [int(row["id"]) for row in rows]
+        return [int(row["id"]) for row in _visible_rows(conn, user_id, rows)[:limit]]
     finally:
         conn.close()
 
@@ -1747,6 +1780,36 @@ def _row_summary(row: sqlite3.Row) -> dict:
 # secondary carries duplicate_of = <primary id> and must never be listed or
 # summed a second time. Every aggregation over activities filters on this.
 _NOT_DUPLICATE = "duplicate_of IS NULL"
+
+
+def _activity_is_visible(row, cutoff: Optional[str], timezone: Optional[str]) -> bool:
+    """Visibility rule for every local activity consumer.
+
+    The cutoff is inclusive and deliberately starts CTL/ATL at zero: consumers
+    receive no pre-cutoff load, and the load series begins at the cutoff date.
+    Invalid or absent timestamps cannot be assigned a rider-local activity date.
+    """
+    if not cutoff:
+        return True
+    when = parse_naive(row["start_time"] if hasattr(row, "keys") else row.get("start_time"))
+    if when is None:
+        return False
+    return to_user_timezone(when, timezone).date().isoformat() >= cutoff
+
+
+def activity_is_visible(user_id: int, start_time: Optional[str], path: Optional[str] = None) -> bool:
+    settings = get_user_settings(user_id, path)
+    return _activity_is_visible({"start_time": start_time}, settings.get("history_start_date"), settings.get("timezone"))
+
+
+def _visible_rows(conn, user_id: int, rows):
+    settings = conn.execute(
+        "SELECT timezone, history_start_date FROM user_settings WHERE user_id = ?",
+        (user_id,),
+    ).fetchone()
+    cutoff = settings["history_start_date"] if settings else None
+    timezone = settings["timezone"] if settings else None
+    return [r for r in rows if _activity_is_visible(r, cutoff, timezone)]
 POWER_CORRECTION_MAX_SAMPLES = 3600
 POWER_CORRECTION_REASON_MAX_LENGTH = 500
 
@@ -1759,7 +1822,7 @@ def list_activities(user_id: int, path: Optional[str] = None) -> List[dict]:
             "ORDER BY start_time DESC",
             (user_id,),
         ).fetchall()
-        return [_row_summary(r) for r in rows]
+        return [_row_summary(r) for r in _visible_rows(conn, user_id, rows)]
     finally:
         conn.close()
 
@@ -1771,6 +1834,36 @@ def activities_for_month_unlinked(
     prefix = f"{int(year):04d}-{int(month):02d}"
     conn = connect(path)
     try:
+        settings = conn.execute(
+            "SELECT timezone, history_start_date FROM user_settings WHERE user_id = ?",
+            (user_id,),
+        ).fetchone()
+        cutoff = settings["history_start_date"] if settings else None
+        if cutoff:
+            # The cutoff is defined by the rider's local date. Query the
+            # candidate rows first, then bucket by local date so a ride near
+            # midnight cannot land in the wrong calendar month.
+            rows = conn.execute(
+                "SELECT a.* FROM activities a "
+                "WHERE a.user_id=? AND a.duplicate_of IS NULL "
+                "AND a.start_time IS NOT NULL "
+                "AND NOT EXISTS (SELECT 1 FROM plan_workouts p "
+                "                WHERE p.user_id=a.user_id AND p.completed_activity_id=a.id) "
+                "AND NOT EXISTS (SELECT 1 FROM standalone_workouts s "
+                "                WHERE s.user_id=a.user_id AND s.completed_activity_id=a.id) "
+                "ORDER BY a.start_time ASC, a.id ASC",
+                (user_id,),
+            ).fetchall()
+            visible = _visible_rows(conn, user_id, rows)
+            timezone = settings["timezone"] if settings else None
+            return [
+                _row_summary(row) for row in visible
+                if (
+                    (started := parse_naive(row["start_time"])) is not None
+                    and to_user_timezone(started, timezone).date().isoformat()[:7]
+                    == prefix
+                )
+            ]
         rows = conn.execute(
             "SELECT a.* FROM activities a "
             "WHERE a.user_id=? AND a.duplicate_of IS NULL "
@@ -1783,7 +1876,7 @@ def activities_for_month_unlinked(
             "ORDER BY a.start_time ASC, a.id ASC",
             (user_id, prefix),
         ).fetchall()
-        return [_row_summary(r) for r in rows]
+        return [_row_summary(r) for r in _visible_rows(conn, user_id, rows)]
     finally:
         conn.close()
 
@@ -1841,6 +1934,9 @@ def get_activity(user_id: int, activity_id: int, path: Optional[str] = None) -> 
         ).fetchone()
         if not row:
             return None
+        settings = get_user_settings(user_id, path)
+        if not _activity_is_visible(row, settings.get("history_start_date"), settings.get("timezone")):
+            return None
         d = _row_summary(row)
         ranges = _correction_ranges(conn, user_id, [activity_id]).get(activity_id, [])
         d["streams"] = _effective_streams(row["streams"], ranges)
@@ -1860,7 +1956,9 @@ def recent_power_streams(user_id: int, days: int = 90, path: Optional[str] = Non
             (user_id, cutoff),
         ).fetchall()
         out: List[List[float]] = []
+        rows = _visible_rows(conn, user_id, rows)
         ranges = _correction_ranges(conn, user_id, [int(r["id"]) for r in rows])
+        rows = _visible_rows(conn, user_id, rows)
         for r in rows:
             streams = _effective_streams(
                 r["streams"], ranges.get(int(r["id"]), [])
@@ -1884,10 +1982,22 @@ def daily_tss(
             f"WHERE user_id = ? AND start_time IS NOT NULL AND {_NOT_DUPLICATE}",
             (user_id,),
         ).fetchall()
+        rows = _visible_rows(conn, user_id, rows)
+        settings = get_user_settings(user_id, path)
         out: Dict[_dt.date, float] = {}
+        cutoff = settings.get("history_start_date")
+        if cutoff:
+            try:
+                out[_dt.date.fromisoformat(cutoff)] = 0.0
+            except (TypeError, ValueError):
+                pass
         for r in rows:
             try:
-                day = _dt.datetime.fromisoformat(r["start_time"]).date()
+                started = parse_naive(r["start_time"])
+                if started is None:
+                    continue
+                day = (to_user_timezone(started, settings.get("timezone")).date()
+                        if settings.get("history_start_date") else started.date())
             except (ValueError, TypeError):
                 continue
             out[day] = out.get(day, 0.0) + float(r["tss"] or 0.0)
@@ -1913,32 +2023,29 @@ def weekly_volume(user_id: int, path: Optional[str] = None) -> List[dict]:
     conn = connect(path)
     try:
         rows = conn.execute(
-            """
-            SELECT date(start_time, 'weekday 0', '-6 days') AS week_start,
-                   SUM(COALESCE(duration_s, 0)) / 3600.0        AS hours,
-                   SUM(COALESCE(tss, 0))                        AS tss,
-                   SUM(COALESCE(distance_m, 0)) / 1000.0        AS distance_km,
-                   SUM(CASE WHEN avg_power IS NOT NULL
-                            THEN avg_power * COALESCE(duration_s, 0) / 1000.0
-                            ELSE 0 END)                          AS calories
-            FROM activities
-            WHERE user_id = ? AND start_time IS NOT NULL
-              AND duplicate_of IS NULL
-            GROUP BY week_start
-            ORDER BY week_start ASC
-            """,
+            "SELECT * FROM activities WHERE user_id = ? AND start_time IS NOT NULL "
+            "AND duplicate_of IS NULL ORDER BY start_time ASC",
             (user_id,),
         ).fetchall()
-        return [
-            {
-                "week_start": r["week_start"],
-                "hours": round(float(r["hours"] or 0.0), 2),
-                "tss": round(float(r["tss"] or 0.0), 1),
-                "distance_km": round(float(r["distance_km"] or 0.0), 1),
-                "calories": round(float(r["calories"] or 0.0)),
-            }
-            for r in rows
-        ]
+        rows = _visible_rows(conn, user_id, rows)
+        totals = {}
+        settings = get_user_settings(user_id, path)
+        timezone = settings.get("timezone") if settings.get("history_start_date") else None
+        for r in rows:
+            started = parse_naive(r["start_time"])
+            if started is None:
+                continue
+            day = to_user_timezone(started, timezone).date()
+            monday = day - _dt.timedelta(days=day.weekday())
+            item = totals.setdefault(monday.isoformat(), [0.0] * 4)
+            item[0] += float(r["duration_s"] or 0) / 3600
+            item[1] += float(r["tss"] or 0)
+            item[2] += float(r["distance_m"] or 0) / 1000
+            if r["avg_power"] is not None:
+                item[3] += float(r["avg_power"]) * float(r["duration_s"] or 0) / 1000
+        return [{"week_start": k, "hours": round(v[0], 2), "tss": round(v[1], 1),
+                 "distance_km": round(v[2], 1), "calories": round(v[3])}
+                for k, v in sorted(totals.items())]
     finally:
         conn.close()
 
@@ -1951,6 +2058,7 @@ def full_activities(user_id: int, path: Optional[str] = None) -> List[dict]:
             "ORDER BY start_time",
             (user_id,),
         ).fetchall()
+        rows = _visible_rows(conn, user_id, rows)
         ranges = _correction_ranges(conn, user_id, [int(r["id"]) for r in rows])
         out = []
         for r in rows:
@@ -1975,6 +2083,7 @@ def iter_full_activities_desc(
             "ORDER BY start_time DESC",
             (user_id,),
         )
+        rows = _visible_rows(conn, user_id, rows)
         for row in rows:
             activity_id = int(row["id"])
             activity = _row_summary(row)
@@ -2006,6 +2115,7 @@ def recent_full_activities(
             "ORDER BY start_time",
             (user_id, cutoff),
         ).fetchall()
+        rows = _visible_rows(conn, user_id, rows)
         ranges = _correction_ranges(conn, user_id, [int(r["id"]) for r in rows])
         out = []
         for r in rows:
@@ -2034,7 +2144,10 @@ def list_power_corrections(
             f"WHERE c.user_id = ?{active_sql} ORDER BY c.created DESC, c.id DESC",
             (user_id,),
         ).fetchall()
-        return [dict(row) for row in rows]
+        settings = get_user_settings(user_id, path)
+        return [dict(row) for row in rows
+                if _activity_is_visible(row, settings.get("history_start_date"),
+                                        settings.get("timezone"))]
     finally:
         conn.close()
 
@@ -2050,6 +2163,10 @@ def power_correction_activity(
             (user_id, activity_id),
         ).fetchone()
         if row is None:
+            return None
+        settings = get_user_settings(user_id, path)
+        if not _activity_is_visible(row, settings.get("history_start_date"),
+                                    settings.get("timezone")):
             return None
         result = _row_summary(row)
         result["raw_streams"] = _unpack_streams(row["streams"])
@@ -2314,7 +2431,7 @@ def activities_for_matching(
     conn = connect(path)
     try:
         rows = conn.execute(sql + " ORDER BY start_time ASC", args).fetchall()
-        return [_row_summary(r) for r in rows]
+        return [_row_summary(r) for r in _visible_rows(conn, user_id, rows)]
     finally:
         conn.close()
 
@@ -2453,10 +2570,12 @@ def update_estimated_ftp_entry(
 def latest_ftp(user_id: int, path: Optional[str] = None) -> Optional[dict]:
     conn = connect(path)
     try:
+        cutoff = get_user_settings(user_id, path).get("history_start_date")
         row = conn.execute(
             "SELECT date, ftp_watts, source FROM ftp_history "
-            "WHERE user_id = ? ORDER BY date DESC LIMIT 1",
-            (user_id,),
+            "WHERE user_id = ? " + ("AND date >= ? " if cutoff else "") +
+            "ORDER BY date DESC LIMIT 1",
+            (user_id, cutoff) if cutoff else (user_id,),
         ).fetchone()
         if not row:
             return None
@@ -2497,16 +2616,19 @@ def ftp_as_of(
     sensible FTP). Returns watts, or None when there is no history at all."""
     conn = connect(path)
     try:
+        cutoff = get_user_settings(user_id, path).get("history_start_date")
         row = conn.execute(
             "SELECT ftp_watts FROM ftp_history WHERE user_id = ? AND date <= ? "
+            + ("AND date >= ? " if cutoff else "") +
             "ORDER BY date DESC LIMIT 1",
-            (user_id, date_iso),
+            (user_id, date_iso, cutoff) if cutoff else (user_id, date_iso),
         ).fetchone()
         if row is None:
             row = conn.execute(
                 "SELECT ftp_watts FROM ftp_history WHERE user_id = ? "
+                + ("AND date >= ? " if cutoff else "") +
                 "ORDER BY date ASC LIMIT 1",
-                (user_id,),
+                (user_id, cutoff) if cutoff else (user_id,),
             ).fetchone()
         return float(row["ftp_watts"]) if row and row["ftp_watts"] else None
     finally:
@@ -2516,10 +2638,11 @@ def ftp_as_of(
 def ftp_history_list(user_id: int, path: Optional[str] = None) -> List[dict]:
     conn = connect(path)
     try:
+        cutoff = get_user_settings(user_id, path).get("history_start_date")
         rows = conn.execute(
             "SELECT date, ftp_watts, source FROM ftp_history "
-            "WHERE user_id = ? ORDER BY date ASC",
-            (user_id,),
+            "WHERE user_id = ? " + ("AND date >= ? " if cutoff else "") + "ORDER BY date ASC",
+            (user_id, cutoff) if cutoff else (user_id,),
         ).fetchall()
         return [
             {"date": r["date"], "ftp_watts": r["ftp_watts"], "source": r["source"]}
@@ -3710,7 +3833,9 @@ def activity_start_time(
             "SELECT start_time FROM activities WHERE user_id = ? AND id = ?",
             (user_id, activity_id),
         ).fetchone()
-        return row["start_time"] if row is not None else None
+        if row is None:
+            return None
+        return row["start_time"] if activity_is_visible(user_id, row["start_time"], path) else None
     finally:
         conn.close()
 
@@ -3722,11 +3847,23 @@ def activities_on_date(
     conn = connect(path)
     try:
         rows = conn.execute(
-            f"SELECT * FROM activities WHERE user_id = ? AND start_time LIKE ? "
-            f"AND {_NOT_DUPLICATE} ORDER BY start_time ASC",
-            (user_id, date_iso + "%"),
+            f"SELECT * FROM activities WHERE user_id = ? AND {_NOT_DUPLICATE} "
+            "ORDER BY start_time ASC", (user_id,)
         ).fetchall()
-        return [_row_summary(r) for r in rows]
+        settings = get_user_settings(user_id, path)
+        if not settings.get("history_start_date"):
+            return [
+                _row_summary(r) for r in rows
+                if isinstance(r["start_time"], str)
+                and r["start_time"].startswith(date_iso)
+            ]
+        visible = _visible_rows(conn, user_id, rows)
+        return [
+            _row_summary(r) for r in visible
+            if (parse_naive(r["start_time"]) is not None and
+                to_user_timezone(parse_naive(r["start_time"]), settings.get("timezone"))
+                .date().isoformat() == date_iso)
+        ]
     finally:
         conn.close()
 
@@ -3977,6 +4114,8 @@ def list_race_results(user_id: int, path: Optional[str] = None) -> List[dict]:
         ).fetchall()
         out = []
         for r in rows:
+            if r["activity_id"] and activity_start_time(user_id, r["activity_id"], path) is None:
+                continue
             d = dict(r)
             try:
                 d["power"] = json.loads(d.pop("power_json") or "{}")

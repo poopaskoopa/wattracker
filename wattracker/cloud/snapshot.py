@@ -997,17 +997,26 @@ def snapshot_counts(path: str | os.PathLike[str], user_id: int) -> dict[str, int
     if isinstance(user_id, bool) or not isinstance(user_id, int) or user_id < 1:
         raise ValueError("user_id must be positive")
     with readonly_connection(path) as conn:
+        settings = _settings(conn, user_id)
         result: dict[str, int] = {}
         for table in ("activities", "streams", "race_results", "plan_workouts"):
             try:
-                row = conn.execute(
-                    f"SELECT COUNT(*) AS n FROM {table} WHERE user_id = ?",  # table is constant
-                    (user_id,),
-                ).fetchone()
+                if table == "activities":
+                    rows = conn.execute(
+                        "SELECT start_time FROM activities WHERE user_id = ?",
+                        (user_id,),
+                    ).fetchall()
+                    result[table] = sum(
+                        1 for row in rows if _visible_activity(row, settings)
+                    )
+                else:
+                    row = conn.execute(
+                        f"SELECT COUNT(*) AS n FROM {table} WHERE user_id = ?",  # table is constant
+                        (user_id,),
+                    ).fetchone()
+                    result[table] = int(row["n"] if row else 0)
             except sqlite3.Error:
                 result[table] = 0
-            else:
-                result[table] = int(row["n"] if row else 0)
         return result
 
 
@@ -1114,22 +1123,78 @@ def snapshot_batch(
     include_streams: bool = False,
     include_derived: bool = True,
     offset: int = 0,
+    previously_published: Optional[Mapping[str, Mapping[str, object]]] = None,
+    complete: Optional[bool] = None,
 ) -> Optional[SyncBatch]:
     """Build one bounded sync batch without mutating the local database."""
     objects = snapshot_objects(
         path, user_id, limit=limit, include_streams=include_streams,
         include_derived=include_derived, offset=offset,
     )
+    if previously_published is not None:
+        if complete is None:
+            # A short page is only provably the whole snapshot when it is
+            # also the first page: this call pages the flattened snapshot by
+            # `offset`, and a short *trailing* page after `offset > 0` does
+            # not mean every earlier page's objects are gone. Only an
+            # unpaged (offset == 0) short page may be auto-treated as
+            # complete; a caller that knows better still passes
+            # complete=True explicitly.
+            complete = offset == 0 and len(objects) < limit
+        objects = snapshot_convergence(previously_published, objects, complete=complete)
     if not objects:
         return None
     if revision < 1 or revision > (1 << 63) - 1:
         raise ValueError("revision is out of bounds")
+    if len(objects) > MAX_BATCH_OBJECTS:
+        raise ValueError("complete snapshot exceeds one sync batch; paginate before convergence")
+    # One batch revision is stamped across every object -- including
+    # tombstones -- because the wire's ordering signal is the batch
+    # revision, not any per-object revision.
     versioned = tuple(replace(obj, revision=revision) for obj in objects)
     return SyncBatch(
         batch_id=batch_id,
         revision=revision,
         objects=versioned,
     )
+
+
+def snapshot_convergence(
+    previously_published: Mapping[str, Mapping[str, object]],
+    current: list[CloudObject],
+    *,
+    complete: bool = False,
+) -> list[CloudObject]:
+    """Add explicit tombstones for objects absent from a new safe snapshot.
+
+    The caller supplies its publication state because this branch has no local
+    publication ledger. A tombstone is a convergence request, not a claim that
+    the cloud API has deleted stored data; the existing API must apply it. The
+    caller must assert that ``current`` contains the complete snapshot; a
+    partial page is returned unchanged so it cannot create false tombstones.
+    """
+    if not isinstance(complete, bool):
+        raise TypeError("complete must be a bool")
+    if not complete:
+        return list(current)
+    current_ids = {obj.object_id for obj in current}
+    tombstones = []
+    for object_id, state in previously_published.items():
+        if object_id in current_ids:
+            continue
+        if not isinstance(state, Mapping):
+            raise ValueError("published state must contain kind and revision")
+        kind = state.get("kind")
+        revision = state.get("revision")
+        if not isinstance(kind, str) or not isinstance(revision, int) or isinstance(revision, bool):
+            raise ValueError("published state must contain kind and revision")
+        if revision < 1:
+            raise ValueError("published revision must be positive")
+        tombstones.append(
+            CloudObject(object_id=object_id, kind=kind, revision=revision + 1,
+                        data={}, deleted=True)
+        )
+    return [*current, *tombstones]
 
 
 # ---------------------------------------------------------------------------

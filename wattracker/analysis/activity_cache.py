@@ -90,11 +90,14 @@ def _fingerprint(user_id: int) -> Tuple[int, ...]:
         # Linking a duplicate drops a ride out of the digest without changing
         # the count or max id (the backfill links historical rows), so the
         # number of links is part of the fingerprint.
+        settings = db.get_user_settings(user_id)
         return (
             int(row["c"]),
             int(row["m"]),
             int(row["d"] or 0),
             *db.power_correction_fingerprint(user_id),
+            settings.get("history_start_date"),
+            settings.get("timezone"),
         )
     finally:
         conn.close()

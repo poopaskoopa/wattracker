@@ -54,6 +54,12 @@
         <span class="hint">Used to decide which dated workouts are available
             on the Ride page. Timestamps remain stored in UTC.</span>
     </label>
+    <label>Hide rides before this date (optional):
+        <input type="date" name="history_start_date"
+               value="{{ settings.history_start_date or '' }}">
+        <span class="hint">Rides before this date are hidden everywhere and are
+            not synced. The date is inclusive. Clear the field to show them again.</span>
+    </label>
     <fieldset class="audio-settings">
         <legend>Audio cues</legend>
         <label for="audioCueVolume">Volume

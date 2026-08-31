@@ -4115,10 +4115,18 @@ def create_app() -> FastAPI:
                 ),
             })
             by_date.setdefault(w["scheduled_date"], []).append(wd)
+        calendar_settings = db.get_user_settings(uid)
         for activity in db.activities_for_month_unlinked(uid, y, m):
             activity = dict(activity)
+            activity_date = activity["start_time"][:10]
+            if calendar_settings.get("history_start_date"):
+                started = parse_naive(activity.get("start_time"))
+                if started is not None:
+                    activity_date = to_user_timezone(
+                        started, calendar_settings.get("timezone")
+                    ).date().isoformat()
             activity.update({
-                "date": activity["start_time"][:10],
+                "date": activity_date,
                 "activity": True,
                 "url": f"/activity/{activity['id']}",
             })
@@ -4712,6 +4720,7 @@ def create_app() -> FastAPI:
         zwift_password: str = Form(""),
         weight_kg: str = Form(""),
         timezone: str = Form(""),
+        history_start_date: str = Form(""),
         confirm_low_ftp: str = Form(""),
         llm_endpoint: str = Form(""),
         llm_custom_url: str = Form(""),
@@ -4765,6 +4774,14 @@ def create_app() -> FastAPI:
         if clean_timezone and not valid_timezone(clean_timezone):
             dir_msgs.append("Invalid IANA time zone.")
             clean_timezone = ""
+        clean_history_start = (history_start_date or "").strip()
+        history_start_update = clean_history_start
+        if clean_history_start:
+            try:
+                clean_history_start = _dt.date.fromisoformat(clean_history_start).isoformat()
+            except ValueError:
+                dir_msgs.append("History start date must be a valid date (YYYY-MM-DD).")
+                history_start_update = None
         # The Zwift player id is a FOLDER NAME under the Zwift Workouts root
         # (paths.workouts_dir joins it, and the exporters makedirs() the
         # result), so it gets confined exactly like the folders above rather
@@ -4786,6 +4803,8 @@ def create_app() -> FastAPI:
                 "timezone": clean_timezone,
             },
         )
+        if history_start_update is not None:
+            db.save_user_settings(uid, {"history_start_date": clean_history_start})
         # A manual FTP entry records a source='manual' row for today (per user).
         if ftp_value is not None:
             db.add_ftp_entry(uid, utc_today().isoformat(), ftp_value, "manual")
