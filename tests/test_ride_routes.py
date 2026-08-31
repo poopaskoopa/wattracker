@@ -36,6 +36,13 @@ def _receive_after_workout(ws):
     return ws.receive_json()
 
 
+# Ride-loop cadence for tests that exchange messages with the loop mid-ride.
+# It has to stay above the platform clock granularity (15.625 ms on Windows):
+# a shorter asyncio.sleep on a busy loop returns at once and paces nothing, so
+# the loop free-runs and the client reads frames hundreds of ticks stale.
+_ROUND_TRIP_POLL_INTERVAL_S = 0.05
+
+
 def _force_bt_unavailable(monkeypatch):
     # Force the "no Bluetooth" branch regardless of whether the [ble] extra
     # (bleak) is installed in the test environment, so the suite is deterministic
@@ -2361,7 +2368,9 @@ def test_ride_ws_intensity_nudge_raises_the_target_and_survives_bad_input(
         servermod.bledevices, "bluetooth_available", lambda: (True, "ok")
     )
     monkeypatch.setattr(servermod.bledevices, "connect_sensors", fake_connect)
-    monkeypatch.setattr(servermod, "RIDE_POLL_INTERVAL_S", 0.01)
+    monkeypatch.setattr(
+        servermod, "RIDE_POLL_INTERVAL_S", _ROUND_TRIP_POLL_INTERVAL_S
+    )
     monkeypatch.setattr(servermod, "RIDE_INACTIVITY_TIMEOUT_S", 1e6)
 
     def _next(ws, status):
@@ -2446,7 +2455,9 @@ def test_ride_ws_intensity_nudge_is_refused_during_a_ramp_test(client, monkeypat
         servermod.bledevices, "bluetooth_available", lambda: (True, "ok")
     )
     monkeypatch.setattr(servermod.bledevices, "connect_sensors", fake_connect)
-    monkeypatch.setattr(servermod, "RIDE_POLL_INTERVAL_S", 0.01)
+    monkeypatch.setattr(
+        servermod, "RIDE_POLL_INTERVAL_S", _ROUND_TRIP_POLL_INTERVAL_S
+    )
     monkeypatch.setattr(servermod, "RIDE_INACTIVITY_TIMEOUT_S", 1e6)
 
     def _next(ws, status):
