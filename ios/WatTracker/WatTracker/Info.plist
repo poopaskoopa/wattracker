@@ -27,10 +27,21 @@
 		<key>UIColorName</key>
 		<string></string>
 	</dict>
-	<!-- Landscape only, on both idioms. The rider uses this next to a
-	     trainer, in landscape, on an iPhone and on an iPad; every layout in
-	     this app is designed for a wide, short viewport, so portrait is not
-	     an orientation it degrades into but one it does not have. -->
+	<!-- Orientation is split by idiom, and the split is not cosmetic.
+
+	     iPhone: landscape only, and the system enforces it. Every layout in
+	     this app is designed for a wide, short viewport (~874x402pt on an
+	     iPhone 17 Pro), so portrait is an orientation the phone does not have.
+
+	     iPad: all four, because as of iPadOS 26 the choice is not ours. An app
+	     built against the iOS 26 SDK joins the new iPad windowing system, where
+	     a window is resizable and this list no longer locks it; issue #171
+	     measured a landscape-only list plus UIRequiresFullScreen plus a runtime
+	     requestGeometryUpdate all failing to stop a portrait iPad window.
+	     Declaring all four states what actually happens instead of asking for a
+	     guarantee the platform stopped providing. The standing requirement that
+	     comes with it: every iPad layout must be correct in portrait -- not
+	     necessarily optimal, but never broken. See ios/README.md and #158. -->
 	<key>UISupportedInterfaceOrientations</key>
 	<array>
 		<string>UIInterfaceOrientationLandscapeLeft</string>
@@ -38,13 +49,15 @@
 	</array>
 	<key>UISupportedInterfaceOrientations~ipad</key>
 	<array>
+		<string>UIInterfaceOrientationPortrait</string>
+		<string>UIInterfaceOrientationPortraitUpsideDown</string>
 		<string>UIInterfaceOrientationLandscapeLeft</string>
 		<string>UIInterfaceOrientationLandscapeRight</string>
 	</array>
-	<!-- Without this, iPadOS treats the app as multitasking-capable and
-	     ignores the orientation list above entirely. -->
-	<key>UIRequiresFullScreen</key>
-	<true/>
+	<!-- UIRequiresFullScreen is deliberately absent. It was here to make the
+	     orientation list stick on iPad; #171 measured that it does not do that
+	     on iPadOS 26, and all it still does is opt the app out of multitasking
+	     for no benefit we are getting. -->
 	<key>UIApplicationSupportsIndirectInputEvents</key>
 	<true/>
 	<!-- The only ATS relaxation in this app, and it cannot reach the public
