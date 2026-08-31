@@ -71,7 +71,9 @@ Nothing below is an oversight. Each is a decision to keep the skeleton thin.
 - **No cache and no offline handling.** No screen renders without a server.
 - **No other screens.** No tab bar, no sidebar, no navigation, no charts. The
   five destinations #158 describes are not stubbed here; the shell is a
-  separate piece of work and this slice had no use for it.
+  separate piece of work and this slice had no use for it. *(#158 has since
+  built that shell around this screen, which is now reached from Settings as
+  "Debug: FTP round-trip".)*
 - **No styling pass.** Black background, white number, legible. That is the
   whole design.
 - **No desktop integration.** `scripts/walking_skeleton_server.py` is a
@@ -91,9 +93,17 @@ Nothing below is an oversight. Each is a decision to keep the skeleton thin.
   in place, the app still lays out portrait on a portrait iPad simulator
   running iPadOS 26.4 — `docs/images/171-ipad-framebuffer.png` is that run, the
   same FTP rendered in a portrait window. iPhone is unaffected and enforces
-  landscape. #158's "landscape only on both idioms" needs a decision: either
+  landscape. #158's "landscape only on both idioms" needed a decision: either
   every iPad layout survives a portrait window, or the app stops building
   against the iOS 26 SDK.
+
+  **Decided in #158: the iPad adapts.** It declares all four orientations,
+  `UIRequiresFullScreen` is gone, and every iPad layout must be correct in
+  portrait — not necessarily optimal, but never broken. Dropping to an older
+  SDK was rejected because #166 ships this to TestFlight and App Store
+  submission requires a current SDK, which would trade a layout problem for a
+  distribution blocker. iPhone stays landscape-locked, so the two idioms now
+  declare different orientation sets on purpose. See `ios/README.md`.
 - **`simctl io screenshot` always writes the display's native framebuffer.**
   A landscape app on a portrait iPhone captures as a portrait image with the
   content rotated. `docs/images/171-iphone-framebuffer.png` is the untouched
