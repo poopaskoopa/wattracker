@@ -235,6 +235,30 @@ job overrides all four settings on the `xcodebuild` command line from the
 build sets `DEVELOPMENT_TEAM` in a local, uncommitted xcconfig or in Xcode's
 signing pane.
 
+**A device or App Store build needs an Apple Distribution certificate, and
+nothing creates one for you.** It is easy to assume `-allowProvisioningUpdates`
+with an App Store Connect API key covers this — that assumption is what stalled
+the first version of the release pipeline. That combination registers App IDs
+and creates and downloads provisioning profiles; it does not issue
+certificates, and it cannot, because a certificate is a private key Apple never
+sees. Without one, automatic signing falls back to the account's development
+certificates and an archive fails with either "conflicting provisioning
+settings" or "has entitlements that require signing with a development
+certificate". `scripts/ios_distribution_cert.py` creates the certificate once
+against the API; `docs/ios-testflight.md` has the procedure, the expiry and the
+rotation order.
+
+**The release job signs manually, not automatically**, and that is deliberate
+rather than legacy. Xcode picks development-vs-distribution for *automatic*
+signing from the target's `ProvisioningStyle` attribute in the `.pbxproj`, and
+this project has none — keeping every signing setting in the xcconfig is what
+lets a credential-less clone build. With nothing to read, automatic signing
+resolves to development however the certificate situation looks, so the job
+names the identity and the profile
+(`PROVISIONING_PROFILE_SPECIFIER="WatTracker App Store"`) instead. If you ever
+switch the archive back to `CODE_SIGN_STYLE=Automatic`, expect those two errors
+back.
+
 ## Release: shipping to TestFlight
 
 **`docs/ios-testflight.md` is the runbook.** The short version:
@@ -257,14 +281,22 @@ app record in App Store Connect (My Apps → **+** → New App → iOS, bundle i
 including why the order matters and what the first run does if you skip the
 first half, are in `docs/ios-testflight.md`.
 
-**Credentials.** Four secrets in the `ios-code-signing` GitHub *environment* —
+**Credentials.** Six secrets in the `ios-code-signing` GitHub *environment* —
 `APPLE_TEAM_ID`, `APP_STORE_CONNECT_KEY_ID`, `APP_STORE_CONNECT_ISSUER_ID`,
-`APP_STORE_CONNECT_PRIVATE_KEY`. An environment rather than repository secrets
-so that only a job declaring `environment: ios-code-signing` can read them.
-None of their values appears anywhere in this repository, and none may. The
-`.p8` is written to `$RUNNER_TEMP` under `umask 077` at run time and removed by
-an `if: always()` step; it never touches the workspace, `DerivedData`, or an
-artifact. Rotation is written up in `docs/ios-testflight.md`.
+`APP_STORE_CONNECT_PRIVATE_KEY`, and the distribution certificate itself as
+`IOS_DIST_P12_B64` plus `IOS_DIST_P12_PASSWORD`. An environment rather than
+repository secrets so that only a job declaring `environment: ios-code-signing`
+can read them. None of their values appears anywhere in this repository, and
+none may. The `.p8` is written to `$RUNNER_TEMP` under `umask 077` at run time;
+the `.p12` is decoded there, imported into a keychain created for that one job,
+and deleted in the same step. An `if: always()` step deletes the keychain and
+the key and fails the job if either survives — the macOS runner is a physical
+machine that is not discarded between jobs. Nothing signing-related touches the
+workspace, `DerivedData`, or an artifact.
+
+**The distribution certificate expires one year after issue** and nothing
+renews it. Creation, the expiry date, and the rotate-then-revoke order are in
+`docs/ios-testflight.md`.
 
 **Versioning.** `CFBundleShortVersionString` comes from the tag (`ios-v0.1.0` →
 `0.1.0`); `CFBundleVersion` is `<run_number>.<run_attempt>`. Both are build
