@@ -2425,11 +2425,20 @@ def test_mobile_concurrent_reads_do_not_conflict_on_the_writer_lease(cloud):
         with lock:
             results.append((response.status_code, response.json()))
 
-    threads = [threading.Thread(target=_read) for _ in range(6)]
+    # daemon=True so a thread that wedges inside TestClient cannot outlive
+    # this test.  A non-daemon thread abandoned by a join timeout stays alive
+    # for the rest of the pytest process, competing with every test that runs
+    # after it -- including the browser suite, whose Playwright waits are on a
+    # real-time budget.
+    threads = [threading.Thread(target=_read, daemon=True) for _ in range(6)]
     for thread in threads:
         thread.start()
     for thread in threads:
         thread.join(timeout=20)
+    # Assert the joins actually completed.  Without this a wedged thread is
+    # silently abandoned and the failure surfaces somewhere unrelated later.
+    stuck = [thread for thread in threads if thread.is_alive()]
+    assert not stuck, f"{len(stuck)} reader thread(s) did not finish"
     assert [status for status, _ in results] == [200] * 6
     for _status, body in results:
         assert [item["id"] for item in body["items"]] == ["k0", "k1"]
