@@ -13,7 +13,7 @@ import pytest
 pytest.importorskip("httpx")
 from fastapi.testclient import TestClient  # noqa: E402
 
-from wattracker import connectorhub, db, paths  # noqa: E402
+from wattracker import connectorhub, db, paths, server as servermod  # noqa: E402
 from wattracker.ingest import importer  # noqa: E402
 from wattracker.prescribe import zwo  # noqa: E402
 from wattracker.server import create_app  # noqa: E402
@@ -162,6 +162,10 @@ def test_workout_prune_rules_travel_over_the_connector(
 ):
     """OOTO days must prune the .zwo on the connector's machine, not ours."""
     monkeypatch.setenv("WATTRACKER_MODE", "server")
+    # This test owns the explicit sync sequence below. The attach hook starts
+    # another sync asynchronously, and letting it race the OOTO mutation can
+    # consume the removal before the assertion gets to it.
+    monkeypatch.setattr(servermod, "_start_attach_exports", lambda _session: None)
     # As in the sibling tests: workouts_dir is confined to the trusted roots on
     # read, so the Zwift tree has to sit under HOME or the export is refused
     # and this reads as "prune did nothing" instead of "the folder was blocked".
@@ -182,6 +186,7 @@ def test_workout_prune_rules_travel_over_the_connector(
     with attached:
         result = exporter.sync_plan_exports(uid)
         assert result["status"] == "ok", result
+        assert result["exported"] == 1, result
         assert written.exists()
 
         # Mark the day out-of-office: the file must be pruned remotely.
