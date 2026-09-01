@@ -38,3 +38,7 @@ ALWAYS_SEARCH_USER_PATHS = NO
 // The production API. A moved host is an edit here plus a rebuild.
 WATTRACKER_API_SCHEME = https
 WATTRACKER_API_HOST = api.wattracker.com
+
+// The app icon lives in Assets.xcassets (added with #166 for TestFlight).
+ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon
+ASSETCATALOG_COMPILER_GLOBAL_ACCENT_COLOR_NAME = AccentColor
