@@ -456,10 +456,16 @@ _MIGRATIONS: Dict[int, Sequence[Union[str, Callable[[sqlite3.Connection], None]]
     ],
     34: [
         "ALTER TABLE user_settings ADD COLUMN history_start_date TEXT",
+        # New cloud publication ledger and pending-batch tables are created by
+        # _SCHEMA after migrating. They contain no local source data to
+        # backfill; an empty ledger means the first opt-in push is a full one.
     ],
 }
 
 _DROP = """
+DROP TABLE IF EXISTS cloud_publication_state;
+DROP TABLE IF EXISTS cloud_publication_pending;
+DROP TABLE IF EXISTS cloud_publication_ledger;
 DROP TABLE IF EXISTS weight_history;
 DROP TABLE IF EXISTS connector_devices;
 DROP TABLE IF EXISTS curve_cache;
@@ -857,6 +863,47 @@ CREATE TABLE IF NOT EXISTS connector_devices (
 CREATE INDEX IF NOT EXISTS idx_connector_devices_user
     ON connector_devices(user_id);
 {_WEIGHT_HISTORY_DDL}
+
+-- The desktop's durable acknowledgement of what the cloud has received. The
+-- key is deliberately the cloud object coordinate, not a local row id alone:
+-- derived objects and tombstones have no activity row behind them.
+CREATE TABLE IF NOT EXISTS cloud_publication_ledger (
+    user_id            INTEGER NOT NULL,
+    kind               TEXT NOT NULL,
+    object_id          TEXT NOT NULL,
+    published_revision INTEGER NOT NULL,
+    content_digest     TEXT NOT NULL,
+    deleted            INTEGER NOT NULL DEFAULT 0,
+    published_at       TEXT NOT NULL,
+    PRIMARY KEY (user_id, kind, object_id),
+    FOREIGN KEY(user_id) REFERENCES users(id)
+);
+CREATE INDEX IF NOT EXISTS idx_cloud_publication_ledger_user
+    ON cloud_publication_ledger(user_id, kind, object_id);
+
+-- A prepared batch remains resumable until its server response is known to
+-- have been accepted locally. Keeping the exact payload makes a retry safe
+-- even if the source database changed while the network was unavailable.
+CREATE TABLE IF NOT EXISTS cloud_publication_pending (
+    user_id       INTEGER NOT NULL,
+    batch_id      TEXT NOT NULL,
+    revision      INTEGER NOT NULL,
+    options_digest TEXT NOT NULL,
+    objects_json  TEXT NOT NULL,
+    created       TEXT NOT NULL,
+    PRIMARY KEY (user_id, batch_id),
+    FOREIGN KEY(user_id) REFERENCES users(id)
+);
+CREATE INDEX IF NOT EXISTS idx_cloud_publication_pending_user
+    ON cloud_publication_pending(user_id, revision);
+
+-- Batch revisions are monotonic for the server scope, including after the
+-- local object ledger is deliberately cleared for a republish.
+CREATE TABLE IF NOT EXISTS cloud_publication_state (
+    user_id       INTEGER PRIMARY KEY,
+    last_revision INTEGER NOT NULL,
+    FOREIGN KEY(user_id) REFERENCES users(id)
+);
 """
 
 
