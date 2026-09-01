@@ -746,3 +746,84 @@ def test_a_connector_that_dies_on_its_own_is_reported_as_stopped():
     thread.stop()
 
     assert connector.status.stopped is True
+
+
+# ------------------------------------------------------------ leaving for good
+_REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+_WEDGE = """
+import asyncio
+import os
+import sys
+import threading
+import time
+
+sys.path.insert(0, {repo!r})
+from wattracker_connector import __main__ as connector_main
+
+connector_main._configure_logging(False)
+parked = threading.Event()          # nothing will ever set it
+
+
+async def _park():
+    # What a connector mid-read leaves behind: a pool thread inside a blocking
+    # call. The thread is not a daemon, so interpreter shutdown joins it.
+    await asyncio.to_thread(parked.wait)
+
+
+threading.Thread(target=lambda: asyncio.run(_park()), daemon=True).start()
+time.sleep(0.5)
+if "--watchdog" in sys.argv:
+    connector_main._arm_exit_watchdog(2.0)
+print("teardown done", flush=True)
+"""
+
+
+def _wedged_process(tmp_path, *args):
+    return subprocess.Popen(
+        [sys.executable, "-c", _WEDGE.format(repo=str(_REPO_ROOT)), *args],
+        env={**os.environ, "WATTRACKER_CONNECTOR_DIR": str(tmp_path)},
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+    )
+
+
+def test_a_pool_thread_parked_in_a_read_keeps_the_process_alive(tmp_path):
+    """The bug, reproduced: main() returns and the process is still here.
+
+    Interpreter shutdown joins the pool threads asyncio.to_thread borrowed,
+    with no timeout - and nothing is logged, which is why a wedged connector
+    looks identical to one that has gone. Asserted so the watchdog below is
+    tested against the real thing rather than a stand-in.
+    """
+    process = _wedged_process(tmp_path)
+    try:
+        with pytest.raises(subprocess.TimeoutExpired):
+            process.wait(timeout=5)
+    finally:
+        process.kill()
+        process.wait(timeout=30)
+
+
+def test_the_watchdog_ends_a_quit_that_wedges_and_says_where(tmp_path):
+    """A tray icon that will not go away is the symptom; this is the cure.
+
+    And it has to leave the stacks behind: forcing the exit hides the wedge
+    from the rider, so the log is the only place it can still be found.
+    """
+    process = _wedged_process(tmp_path, "--watchdog")
+    try:
+        assert process.wait(timeout=60) == 0
+    finally:
+        if process.poll() is None:
+            process.kill()
+            process.wait(timeout=30)
+
+    written = open(
+        os.path.join(str(tmp_path), "connector.log"), encoding="utf-8"
+    ).read()
+    assert "forcing the exit" in written
+    assert "threads:" in written
+    # faulthandler's own heading, and the point of the exercise: the thread
+    # that was holding the process is named with a stack under it.
+    assert "Thread 0x" in written
+    assert "in wait" in written, "the parked thread was not in the dump"
