@@ -20,10 +20,12 @@ neither is:
 dependency, and this package deliberately has almost none - it freezes into a
 small executable and every import is weight in it (see ``rpc``'s note on
 staying stdlib-only). A ``scandir`` of one folder costs microseconds, so the
-saving is imaginary. The interval also *is* the settle window: Zwift writes a
-.fit over some seconds, and a file is reported only once its size has stopped
-changing between two passes. An event API would deliver the first write
-immediately and leave the debounce to be built by hand.
+saving is imaginary. An event API would deliver the first write immediately
+and leave the debounce to be built by hand, and the debounce is the hard
+part: Zwift creates the *finished* file's name at ride start and appends to
+it for the whole ride, so "this file stopped changing" and "this ride ended"
+are different statements. ``SETTLE_WINDOW_S`` and ``fit_is_complete`` are how
+they are told apart.
 
 **Change-gated, not a heartbeat.** A timer that simply told the server "rescan
 now" every minute would move the clock across the wire and change nothing: the
@@ -45,7 +47,8 @@ from __future__ import annotations
 
 import logging
 import os
-from typing import Dict, List, Optional, Tuple
+import time
+from typing import Callable, Dict, List, Tuple
 
 from .handlers import (
     ConnectorConfig,
@@ -64,13 +67,71 @@ DEFAULT_INTERVAL_S = 60.0
 
 # The floor a configured interval is held to. Not a performance guard - the
 # poll is far too cheap for that - but a typo guard: ``--scan-interval 0.01``
-# should be a busy folder read, not a busy loop.
+# should be a busy folder read, not a busy loop. It no longer decides when a
+# file counts as finished - SETTLE_WINDOW_S does - so a short interval only
+# makes a genuine answer arrive sooner.
 MIN_INTERVAL_S = 5.0
+
+# How long a file must sit completely still before it can be reported. Wall
+# clock, deliberately: the rule used to be "identical in two consecutive
+# passes", which meant whatever the interval happened to be - two minutes at
+# the default, ten seconds at the floor above.
+#
+# Ten seconds is not stillness. Measured on hardware 2026-09-01, Zwift flushes
+# a ride to the final file in 4096-byte blocks 35-40s apart, so at
+# --scan-interval 5 every single flush "settled" and every one asked the
+# server to import a truncated file - five useless scans per ride, each one
+# spending the server's own once-a-minute slot so that the real report at the
+# end arrived rate-limited.
+SETTLE_WINDOW_S = 60.0
 
 # What a file looks like to us. Mtime and size together, which is the same
 # pair the server's own ``scanned_files`` cache is keyed on, so the two agree
 # about what "unchanged" means.
 _Reading = Dict[str, Tuple[float, int]]
+
+
+def fit_is_complete(path: str) -> bool:
+    """Whether the file on disk is a whole FIT, rather than one being written.
+
+    The structural half of the settle rule, and the half that does not depend
+    on timing at all. A FIT starts with a header carrying the byte length of
+    the data that follows it; an encoder writes that field as a placeholder,
+    streams the records, then seeks back to fill it in and appends the
+    two-byte CRC when the ride is saved. A file mid-ride therefore disagrees
+    with its own header, and a saved one agrees with it exactly. Confirmed
+    against this machine's own folders: all 221 finished Zwift rides match to
+    the byte, and the one file refused is a ride Zwift abandoned - 1102 bytes
+    carrying data_size 0, which is the shape of a live ride's first flush, and
+    which fitdecode refuses as "not a FIT file @ 16". That file is also what
+    the old rule reported on every cold start.
+
+    FITs may be chained - several concatenated in one file - so the lengths
+    are walked rather than checked once. Anything unreadable, empty, or not a
+    FIT is "not complete": the server could not import it either, and the
+    daily sweep stays the backstop for whatever this cannot make sense of.
+    """
+    try:
+        with open(path, "rb") as handle:
+            size = handle.seek(0, os.SEEK_END)
+            offset = 0
+            while offset < size:
+                handle.seek(offset)
+                header = handle.read(14)
+                if len(header) < 12 or header[8:12] != b".FIT":
+                    return False
+                header_size = header[0]
+                if header_size < 12:
+                    return False
+                data_size = int.from_bytes(header[4:8], "little")
+                # At least 14 a step, so this cannot fail to terminate.
+                offset += header_size + data_size + 2
+            return size > 0 and offset == size
+    except OSError:
+        # Being written with an exclusive handle, gone since the scandir, on a
+        # disk that just went away: all the same answer, and all worth another
+        # look next pass rather than a log line.
+        return False
 
 
 def normalize_interval(value: object) -> float:
@@ -117,14 +178,25 @@ class ActivityWatcher:
     files written between calls, with no event loop and no socket in the way.
     """
 
-    def __init__(self, config: ConnectorConfig) -> None:
+    def __init__(
+        self,
+        config: ConnectorConfig,
+        clock: Callable[[], float] = time.monotonic,
+    ) -> None:
         self._config = config
-        # The previous pass, used only to decide whether a file has stopped
-        # changing. None until the first pass has run.
-        self._previous: Optional[_Reading] = None
+        # Monotonic, so a clock correction mid-ride cannot make a file look
+        # still for an hour. Injectable only so the tests can hold it.
+        self._clock = clock
+        # Per file, its current reading and the moment that reading was first
+        # seen. That timestamp is the whole settle rule: stillness measured in
+        # seconds instead of in passes.
+        self._since: Dict[str, Tuple[Tuple[float, int], float]] = {}
+        # Whether any pass has run at all. Not inferable from ``_since``: an
+        # empty folder is a perfectly good reading.
+        self._started = False
         # Everything the server has already been told about. Kept separately
-        # from ``_previous`` because they answer different questions: one is
-        # "did this file settle?", the other "is this news?".
+        # because it answers a different question: one is "has this file
+        # stopped changing?", the other "is this news?".
         self._reported: _Reading = {}
 
     # ------------------------------------------------------------- reading
@@ -198,31 +270,48 @@ class ActivityWatcher:
         restart the cold-start trigger, rather than needing a second mechanism
         on the server for it.
 
-        Afterwards a file is reported only once it has stopped changing: it
-        must read identically in two consecutive passes before it counts. A
-        .fit that Zwift is still writing therefore waits, instead of being
-        offered half-written and failing to parse on the other side.
+        Afterwards a file must pass two tests, because Zwift's ride file
+        passes neither one alone. It creates the file under its FINAL name at
+        ride *start* and appends to it for the whole ride, in 4096-byte blocks
+        35-40s apart, so the pair (mtime, size) stands still for most of the
+        ride and the old "identical in two consecutive passes" rule reported
+        every flush.
+
+        So: the reading must have been unchanged for ``SETTLE_WINDOW_S``
+        seconds of wall clock - stillness that does not shrink when the rider
+        asks for a faster interval - and the file must agree with its own FIT
+        header, which a half-written one does not. The timing test alone
+        cannot see a rider who pauses; the structural test alone trusts that
+        Zwift never flushes a self-consistent file mid-ride. Together the
+        server is asked to import only what it can actually parse.
 
         Deletions never report. The server's scan only ever imports, so a file
         going away gives it nothing to do - but it is forgotten here, so that
         the same name appearing again is news a second time.
         """
+        now = self._clock()
         current = self._read()
 
-        if self._previous is None:
-            self._previous = current
+        # Carry each file's first-seen timestamp forward for as long as its
+        # reading is unchanged; a changed file starts its wait again.
+        since: Dict[str, Tuple[Tuple[float, int], float]] = {}
+        for path, value in current.items():
+            was = self._since.get(path)
+            since[path] = (value, was[1] if was and was[0] == value else now)
+        self._since = since
+
+        if not self._started:
+            self._started = True
             self._reported = dict(current)
             return True
 
-        settled = {
-            path: value for path, value in current.items()
-            if self._previous.get(path) == value
-        }
-        self._previous = current
-
         fresh = {
-            path: value for path, value in settled.items()
-            if self._reported.get(path) != value
+            path: value for path, value in current.items()
+            if now - since[path][1] >= SETTLE_WINDOW_S
+            and self._reported.get(path) != value
+            # Last, and only for the few files that got this far: it opens the
+            # file, where everything above is arithmetic on the scandir.
+            and fit_is_complete(path)
         }
         # Drop what is no longer on disk before adding what is new, so the
         # bookkeeping cannot grow without bound on a folder that is regularly
