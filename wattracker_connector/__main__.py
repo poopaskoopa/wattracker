@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import contextlib
 import importlib
 import logging
 import logging.handlers
@@ -32,6 +33,7 @@ import queue
 import re
 import sys
 import threading
+import time
 from typing import Callable, List, Optional
 
 from wattracker.config import _restrict
@@ -376,6 +378,10 @@ def _fatal(message: str) -> None:
 _STOP_GRACE_S = 3.0
 _JOIN_TIMEOUT_S = 10.0
 _TRAY_JOIN_TIMEOUT_S = 5.0
+# Longer than the whole teardown can legitimately take (3s grace, then the two
+# joins above), and short enough that a rider who clicked Quit is not still
+# looking at the icon.
+_EXIT_DEADLINE_S = 20.0
 
 # Held for the life of the process: Windows releases a named mutex when its
 # last handle closes, so a garbage-collected handle would make every launch
@@ -491,6 +497,72 @@ def _claim_or_signal() -> bool:
     return False
 
 
+_exit_armed = threading.Event()
+
+
+def _dump_stacks(note: str) -> None:
+    """Write every thread's stack to the log, locks or no locks.
+
+    faulthandler rather than traceback: it prints threads parked inside a
+    blocking C call - exactly the ones worth naming here - and it writes down
+    the file descriptor. Nothing in this function goes through the logging
+    API, deliberately: a handler lock held by a thread that is itself stuck
+    would take the dump with it, and the dump is the whole point.
+    """
+    import faulthandler
+
+    stream = None
+    for handler in logging.getLogger().handlers:
+        if isinstance(handler, _OwnerOnlyRotatingFileHandler):
+            with contextlib.suppress(Exception):
+                handler.flush()
+                stream = handler.stream
+            break
+    if stream is None:
+        stream = sys.stderr
+    if stream is None:  # the windowed build, and no log file either
+        return
+    with contextlib.suppress(Exception):
+        # The idents faulthandler prints mean nothing without this line.
+        names = ", ".join(f"{t.name}=0x{t.ident:x}" for t in threading.enumerate())
+        print(time.strftime("%Y-%m-%d %H:%M:%S"), note, file=stream)
+        print("threads:", names, file=stream)
+        faulthandler.dump_traceback(file=stream, all_threads=True)
+        stream.flush()
+
+
+def _arm_exit_watchdog(deadline: float = _EXIT_DEADLINE_S) -> None:
+    """Once Quit has been asked for, make sure the process actually goes.
+
+    Every wait in the teardown below is bounded except interpreter shutdown
+    itself. ``asyncio.to_thread`` borrows pool threads that are not daemons,
+    and one still parked in a blocking read is joined after main() returns -
+    with no timeout, and no log line to say so. What the rider gets is a tray
+    icon that will not go away and a relaunch that silently does nothing,
+    because the wedged process still holds the single-instance mutex.
+
+    So the last word is taken here. The stacks are written first: a wedge that
+    kills itself after twenty seconds is still a bug, and this is the only
+    chance anyone gets to see which thread was holding it.
+    """
+    if _exit_armed.is_set():
+        return
+    _exit_armed.set()
+
+    def _watch() -> None:
+        time.sleep(deadline)
+        _dump_stacks(
+            f"ERROR: still running {deadline:.0f}s after the quit; "
+            "forcing the exit"
+        )
+        # Not sys.exit: this is a daemon thread, where that raises into itself
+        # and changes nothing. Zero because the rider asked to quit and the
+        # radio was released on the way out - the failure is in the leaving.
+        os._exit(0)
+
+    threading.Thread(target=_watch, name="exit-watchdog", daemon=True).start()
+
+
 class _ConnectorThread:
     """The connector's thread, and a stop that actually stops it.
 
@@ -547,6 +619,10 @@ class _ConnectorThread:
             runner.cancel()
             await asyncio.gather(runner, return_exceptions=True)
             await self._connector.ble.teardown()
+            # The quit used to go quiet between the line above and the tray
+            # pump's own last line, which left the whole teardown as one
+            # unlit stretch to hang in.
+            log.info("the connector loop is down and the radio is back")
             return
         try:
             failure = runner.exception()
@@ -730,7 +806,9 @@ def _run_with_tray(connector: Connector, settings: dict) -> int:
     def _quit() -> None:
         """The order in the plan: connector, then the window, then the pump."""
         log.info("quit requested from the tray")
+        _arm_exit_watchdog()
         connector_thread.stop()
+        log.info("the connector is down; closing the window loop")
         windows.quit()
 
     tray = tray_win32.TrayIcon(
@@ -758,10 +836,14 @@ def _run_with_tray(connector: Connector, settings: dict) -> int:
         # Unconditional, and idempotent: Quit has already done this, but a tray
         # that died on its own has not, and the connector thread parks a worker
         # on that event. Interpreter shutdown joins pool threads, so leaving one
-        # blocked here is a process that quits and then does not exit.
+        # blocked here is a process that quits and then does not exit - which
+        # is what the watchdog is here to end rather than only warn about.
+        _arm_exit_watchdog()
         connector_thread.stop()
         tray.stop()
         tray_thread.join(timeout=_TRAY_JOIN_TIMEOUT_S)
+        if tray_thread.is_alive():
+            log.warning("the tray pump did not finish; exiting anyway")
     return 0
 
 
