@@ -338,9 +338,14 @@ def test_trusted_roots_include_redirects_and_process_overrides(monkeypatch):
     assert os.path.normpath(r"\\nas\rider\Workouts\123") in roots
 
 
+@pytest.mark.skipif(os.name != "nt", reason="the real known-folder call is Win32")
 def test_real_windows_known_folder_smoke():
-    if not paths.sys.platform.startswith("win"):
-        return
+    """Off Windows this must SKIP, not return.
+
+    An early return reports PASSED having asserted nothing, so on macOS this
+    read as coverage of the real shell32 call for as long as it existed. The
+    genuinely unmocked version lives in test_windows_real.py.
+    """
     candidates = paths.candidate_documents_dirs()
     assert candidates
     assert all(isinstance(path, str) and path for path in candidates)

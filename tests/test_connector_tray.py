@@ -44,6 +44,39 @@ WINDOWS = os.name == "nt"
 windows_only = pytest.mark.skipif(not WINDOWS, reason="Win32 lives on Windows")
 
 
+def _has_an_interactive_desktop():
+    """Is this process in a session that owns a notification area?
+
+    Session 0 is the services session and has no shell, so Shell_NotifyIcon
+    has nowhere to put an icon and refuses. The self-hosted CI runner is a
+    service account and lands there, where the three tests below fail on an
+    environment that cannot host a tray icon rather than on anything about the
+    tray. A developer's session, and a runner configured to log on
+    interactively, are non-zero and run them for real.
+
+    Session id rather than FindWindowW("Shell_TrayWnd"): a packaged terminal
+    cannot see windows owned by processes outside its container, so the window
+    lookup reports no shell in sessions where the icon demonstrably works.
+    """
+    if not WINDOWS:
+        return False
+    from ctypes import wintypes
+
+    kernel32 = ctypes.windll.kernel32
+    session = wintypes.DWORD()
+    if not kernel32.ProcessIdToSessionId(
+        kernel32.GetCurrentProcessId(), ctypes.byref(session)
+    ):
+        return False
+    return session.value != 0
+
+
+needs_notification_area = pytest.mark.skipif(
+    not _has_an_interactive_desktop(),
+    reason="session 0 has no shell, so there is no notification area",
+)
+
+
 def _status(**fields) -> ConnectorStatus:
     status = ConnectorStatus()
     status.server_url = "http://192.168.1.10:8000"
@@ -431,6 +464,7 @@ def test_a_disconnected_menu_shows_the_last_error(tray):
 
 # -------------------------------------------------------- a real icon, pumping
 @windows_only
+@needs_notification_area
 def test_the_icon_actually_goes_into_the_notification_area():
     """The end-to-end Win32 path: class, window, icon, pump, and back out.
 
@@ -459,6 +493,7 @@ def test_the_icon_actually_goes_into_the_notification_area():
 
 
 @windows_only
+@needs_notification_area
 def test_the_icon_comes_back_when_explorer_restarts():
     """The message really is sent to us, and we really do re-add the icon.
 
@@ -497,6 +532,7 @@ def test_the_icon_comes_back_when_explorer_restarts():
 
 
 @windows_only
+@needs_notification_area
 def test_a_second_launch_is_told_where_the_first_one_is():
     """The single-instance path, end to end: find the window, post the message."""
     tray = tray_win32.TrayIcon(

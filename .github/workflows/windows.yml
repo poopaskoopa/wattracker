@@ -52,6 +52,56 @@ jobs:
       - run: python -m pip install -e ".[dev]"
       - run: python -m pytest -q
 
+  windows-real:
+    # The assertions no other platform can make: real icacls, real DPAPI, the
+    # real shell32 known-folder call, the registry and the Win32 tray. The rest
+    # of the suite runs on the Cloud workflow's macOS job, so this deliberately
+    # does NOT duplicate it - the `test` job above stays gated for that reason.
+    #
+    # What it buys: tests/test_connector_autostart.py and
+    # tests/test_connector_tray.py are marked windows_only, so macOS skips them
+    # and nothing else runs them - 24 tests that execute nowhere today. And
+    # tests/test_windows_real.py exists because a mock cannot catch a wrong
+    # belief about the platform: test_windows_acl.py encoded the wrong icacls
+    # output shape for weeks while every one of its tests passed.
+    #
+    # Same fork guard as package-unsigned: only branches pushed to this
+    # repository reach the physical box that also runs the trainer.
+    if: github.event_name == 'push' || github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: [self-hosted, Windows, X64]
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      # No actions/setup-python, for the reason package-unsigned gives at
+      # length: its Windows path needs administrator, and this runner's service
+      # account deliberately is not one. Assert the machine-wide version rather
+      # than trusting it.
+      - name: Assert the runner's machine-wide Python
+        shell: pwsh
+        run: |
+          python -c "import sys; assert sys.version_info[:2] == (3, 12), sys.version; print(sys.version)"
+
+      # Into a workspace venv, never the runner's interpreter: the tool cache
+      # outlives the job on a self-hosted runner and the pollution accumulates.
+      - name: Create workspace virtual environment
+        shell: pwsh
+        run: |
+          python -m venv .venv
+          .venv\Scripts\python -m pip install --disable-pip-version-check --upgrade pip
+          .venv\Scripts\python -m pip install --disable-pip-version-check -e ".[dev,ble,connector,webview]"
+
+      - name: Real Windows APIs
+        shell: pwsh
+        run: .venv\Scripts\python -m pytest tests/test_windows_real.py -q
+
+      # Separate step so a failure here is legible: these drive real Win32
+      # windows and HKCU, and the runner's service account has no interactive
+      # desktop, which is a difference from a developer's session.
+      - name: Registry and tray
+        shell: pwsh
+        run: .venv\Scripts\python -m pytest tests/test_connector_autostart.py tests/test_connector_tray.py -q
+
   package-unsigned:
     # See the same gate in cloud.yml. This job is the sharper of the two: the
     # PyInstaller spec, the Inno Setup script and smoke_installer.ps1 all come

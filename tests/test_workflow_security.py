@@ -76,7 +76,11 @@ def test_every_self_hosted_job_excludes_fork_pull_requests():
 
     # A refactor that renames the jobs or restructures the workflows must not
     # quietly reduce this to asserting nothing at all.
-    assert sorted(checked) == ["cloud.yml:tests", "windows.yml:package-unsigned"]
+    assert sorted(checked) == [
+        "cloud.yml:tests",
+        "windows.yml:package-unsigned",
+        "windows.yml:windows-real",
+    ]
 
 
 def test_no_workflow_uses_pull_request_target():

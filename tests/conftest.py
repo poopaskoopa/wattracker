@@ -1,6 +1,7 @@
 """Shared pytest fixtures: isolate config + database in a temp directory."""
 import functools
 import os
+import signal
 import sys
 import tempfile
 
@@ -18,6 +19,25 @@ elif sys.platform.startswith("win"):
     _PLAYWRIGHT_CACHE = os.path.join(_REAL_HOME, "AppData", "Local", "ms-playwright")
 else:
     _PLAYWRIGHT_CACHE = os.path.join(_REAL_HOME, ".cache", "ms-playwright")
+
+
+def pytest_configure(config):
+    """Use the thread timeout method where SIGALRM does not exist.
+
+    pyproject pins ``timeout_method = "signal"`` on purpose: a signal timeout
+    fails the one test, while thread mode kills the whole pytest process. But
+    SIGALRM is POSIX-only, so on Windows pytest-timeout raises INTERNALERROR
+    before the first test runs - with pytest-timeout installed the suite could
+    not start there at all, which is a harder blocker to running any of this on
+    Windows than any individual test failure.
+
+    Thread mode is the only method Windows has, so take it there and keep the
+    hang backstop. POSIX is untouched and keeps the better behaviour.
+    """
+    if hasattr(signal, "SIGALRM") or not config.pluginmanager.hasplugin("timeout"):
+        return
+    if getattr(config.option, "timeout_method", None) in (None, "signal"):
+        config.option.timeout_method = "thread"
 
 
 @pytest.fixture(autouse=True)
