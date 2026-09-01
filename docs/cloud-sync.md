@@ -42,8 +42,64 @@ contract is:
 | `GET /api/v1/context/activities` | read | reader context | — |
 | `GET /api/v1/context/activities/{id}` | read | reader context | — |
 | `GET /api/v1/context/races` | read | reader context | — |
+| `GET /api/v1/context/dashboard` | read | reader context | — |
+| `GET /api/v1/context/volume` | read | reader context | — |
+| `GET /api/v1/context/curve` | read | reader context | — |
 | `POST /api/v1/sync/batches` | sync | APIM subscription + signed request | `write` |
 | `GET /api/v1/sync/status` | sync | APIM subscription + signed request | `write` |
+
+### Mobile read context
+
+The dashboard route returns object kinds `profile`, `training_state`,
+`load_point`, and `curve`; `volume` returns `volume_week`; and `curve` returns
+`curve`. Each route returns an envelope containing `items`, a scope
+`revision` to checkpoint (see "Checkpointing" below), and `next_cursor` (or
+`null`):
+
+```json
+{"items":[{"id":"...","kind":"...","revision":7,"data":{}}],
+ "revision":7,"next_cursor":null}
+```
+
+`?since=N` returns only objects whose object revision is greater than `N`;
+delta responses also include matching tombstones (`"deleted":true`), while
+full reads omit tombstones. `?limit=` is bounded to 100 and a non-null
+`next_cursor` is passed as `?cursor=` for the next page. Cursors are opaque,
+deterministic, scope-bound, and bound to the route and `since` value; they
+cannot be reused across scopes or to change ordering/filter semantics.
+
+**Checkpointing.** The `revision` in the envelope is *pinned when pagination
+starts*: the first request of a walk (the one with no `?cursor=`) reads the
+scope revision, and every subsequent page of that walk returns the same value,
+carried inside the signed cursor. A client checkpoints that `revision` only
+after consuming all pages -- and because it is pinned, every page of a walk
+reports the identical number, so a client that checkpoints early is merely
+redundant rather than wrong.
+
+The pin is what makes the checkpoint safe. Pages are ordered by object id and
+a cursor only moves forward, so an object delivered on an early page sorts
+*behind* the cursor and no later page can carry it. If a write changed that
+object mid-walk, a checkpoint recomputed on the last page would sit *past* the
+change while the client never received it -- the object would be silently
+dropped from every future delta. Pinning holds the checkpoint at the value
+observed before the walk began, so any write that lands during pagination has
+a higher revision and is simply re-delivered on the next poll.
+
+The consequence to design the client around is that this feed is
+**at-least-once, never at-most-once**: an object may arrive again on a later
+poll even though nothing about it changed since the client last saw it.
+Applying an object is therefore required to be idempotent -- compare the
+per-object `revision` and ignore one that is not newer than the stored copy.
+The same property holds inside a single page: the server reads the scope
+revision *before* reading the page, so the checkpoint is a floor for that
+page, not a claim that the page reflects it.
+
+A cursor must carry its pinned revision. A cursor without that field, or with
+a non-integer or negative one, is rejected with `400 invalid cursor` rather
+than being given a fresh revision -- silently defaulting it would reintroduce
+the drop described above. The field is inside the HMAC-signed payload, so a
+client cannot move its own checkpoint by editing it; the scope binding stays
+in the signing key, so a cursor still cannot be replayed into another scope.
 
 Every "verified subject" above is conditional on
 `CloudConfig.require_verified_subject`, which a deployment may only set while a

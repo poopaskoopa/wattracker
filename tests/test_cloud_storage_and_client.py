@@ -153,6 +153,60 @@ def test_azure_store_uses_verified_coordinates_and_recovers_idempotently():
         store.get(namespace, "../other", "a1")
 
 
+@pytest.mark.parametrize("store_factory", [
+    MemoryTenantStore,
+    lambda: AzureTenantStore(_FakeBlobService(), _FakeTableService()),
+])
+def test_tenant_stores_page_revision_deltas_after_a_stable_object_cursor(store_factory):
+    store = store_factory()
+    namespace = "a" * 64
+    store.apply(
+        namespace,
+        "scope",
+        SyncBatch(
+            batch_id="delta-before",
+            revision=1,
+            objects=(
+                CloudObject("a", "profile", 1, {"ftp": 240}),
+                CloudObject("b", "profile", 1, {"ftp": 250}),
+            ),
+        ),
+    )
+    store.apply(
+        namespace,
+        "scope",
+        SyncBatch(
+            batch_id="delta-after",
+            revision=2,
+            objects=(
+                CloudObject("b", "profile", 2, {}, deleted=True),
+                CloudObject("c", "profile", 2, {"ftp": 260}),
+            ),
+        ),
+    )
+
+    first = store.list_objects(
+        namespace,
+        "scope",
+        kinds={"profile"},
+        limit=1,
+        include_deleted=True,
+        min_revision=1,
+        after="a",
+    )
+    second = store.list_objects(
+        namespace,
+        "scope",
+        kinds={"profile"},
+        limit=1,
+        include_deleted=True,
+        min_revision=1,
+        after=first[-1].object_id,
+    )
+    assert [(item.object_id, item.deleted) for item in first] == [("b", True)]
+    assert [(item.object_id, item.deleted) for item in second] == [("c", False)]
+
+
 def test_store_idempotency_and_revision_conflicts_are_atomic():
     store = MemoryTenantStore()
     namespace = "a" * 64
@@ -570,3 +624,205 @@ def test_paired_devices_are_isolated_across_installations_sharing_a_scope_name()
         assert own.status_code == 200
         assert crossed.status_code == 404
         assert crossed.json() == {"detail": "not found"}
+
+
+class _CountingBlob(_FakeBlob):
+    def download_blob(self, **kwargs):
+        self.container.downloads.append(self.name)
+        return super().download_blob(**kwargs)
+
+
+class _CountingContainer(_FakeContainer):
+    """A container that records every blob download, the way the cost
+    regression on the mobile read path was actually measured."""
+
+    def __init__(self):
+        super().__init__()
+        self.downloads = []
+
+    def get_blob_client(self, name):
+        return _CountingBlob(self, name)
+
+
+class _CountingBlobService:
+    def __init__(self):
+        self.container = _CountingContainer()
+
+    def get_container_client(self, _name):
+        return self.container
+
+
+def _azure_scope_with_objects(count, *, kind="load_point", revision=1):
+    blobs = _CountingBlobService()
+    tables = _FakeTableService()
+    store = AzureTenantStore(blobs, tables)
+    namespace = "d" * 64
+    scope = "azure-scope"
+    if count == 0:
+        return store, blobs.container, namespace, scope
+    store.apply(namespace, scope, SyncBatch(
+        batch_id="seed",
+        revision=revision,
+        objects=tuple(
+            CloudObject(f"o{index:03d}", kind, revision, {"tss": index})
+            for index in range(count)
+        ),
+    ))
+    blobs.container.downloads.clear()
+    return store, blobs.container, namespace, scope
+
+
+def test_azure_list_objects_downloads_at_most_one_blob_per_returned_item():
+    store, container, namespace, scope = _azure_scope_with_objects(300)
+
+    page = store.list_objects(namespace, scope, kinds={"load_point"}, limit=1)
+    assert [value.object_id for value in page] == ["o000"]
+    # Before the fix this downloaded every object in the scope to return one.
+    assert len(container.downloads) == 1
+
+    container.downloads.clear()
+    page = store.list_objects(namespace, scope, kinds={"load_point"}, limit=10)
+    assert [value.object_id for value in page] == [f"o{i:03d}" for i in range(10)]
+    assert len(container.downloads) == 10
+
+    # A caught-up delta poll matches nothing, so it must download nothing:
+    # the ``min_revision`` filter comes off the table entity's ``Revision``,
+    # which ``_put_object`` writes beside the blob.
+    container.downloads.clear()
+    assert store.list_objects(
+        namespace, scope, kinds={"load_point"}, limit=100, min_revision=1
+    ) == []
+    assert container.downloads == []
+
+    # Cursor position is also an entity-level filter.
+    container.downloads.clear()
+    page = store.list_objects(
+        namespace, scope, kinds={"load_point"}, limit=2, after="o100"
+    )
+    assert [value.object_id for value in page] == ["o101", "o102"]
+    assert len(container.downloads) == 2
+
+    # A kind that matches nothing costs nothing.
+    container.downloads.clear()
+    assert store.list_objects(namespace, scope, kinds={"activity"}, limit=100) == []
+    assert container.downloads == []
+
+
+def test_azure_list_objects_pages_in_object_id_order_from_an_unordered_table():
+    """The early exit must not depend on the order the table yields rows.
+
+    ``_FakeTable`` returns a partition in insertion order, and nothing in
+    ``AzureTenantStore`` enforces RowKey ordering, so the page boundary is
+    established by sorting candidates -- not by trusting the stream.
+    """
+    store, container, namespace, scope = _azure_scope_with_objects(0)
+    store.apply(namespace, scope, SyncBatch(
+        batch_id="unordered",
+        revision=2,
+        objects=tuple(
+            CloudObject(object_id, "load_point", 2, {})
+            for object_id in ("z", "m", "a", "q", "b")
+        ),
+    ))
+    container.downloads.clear()
+    page = store.list_objects(namespace, scope, kinds={"load_point"}, limit=2)
+    assert [value.object_id for value in page] == ["a", "b"]
+    assert len(container.downloads) == 2
+    revision, page = store.list_objects_with_revision(
+        namespace, scope, kinds={"load_point"}, limit=3, after="b"
+    )
+    assert revision == 2
+    assert [value.object_id for value in page] == ["m", "q", "z"]
+
+
+def test_azure_mobile_read_never_takes_the_writer_scope_lease():
+    """A read must not be able to block, or be blocked by, a write.
+
+    ``_scope_lock`` is an exclusive 60-second blob lease.  On the read path it
+    charged every poll an extra blob PUT, turned a second concurrent read into
+    a bare 500 (``BlobLeaseClient.acquire`` fails fast on a leased blob), and
+    let a read-only phone credential stall desktop writes for the lease
+    duration if the reading process died mid-read.
+    """
+    import threading
+    from contextlib import contextmanager
+
+    store, _container, namespace, scope = _azure_scope_with_objects(5)
+    held = threading.Lock()
+    taken = []
+    real_scope_lock = store._scope_lock
+
+    @contextmanager
+    def _exclusive(partition):
+        # Model the real client: acquiring an already-held lease fails fast
+        # rather than waiting.
+        if not held.acquire(blocking=False):
+            raise RuntimeError("lease conflict")
+        taken.append(partition)
+        try:
+            with real_scope_lock(partition):
+                yield
+        finally:
+            held.release()
+
+    store._scope_lock = _exclusive
+
+    # Two overlapping reads, and a read taken while a write holds the lease.
+    with _exclusive(store._partition(namespace, scope)):
+        taken.clear()
+        revision, items = store.list_objects_with_revision(
+            namespace, scope, kinds={"load_point"}, limit=3
+        )
+    assert [value.object_id for value in items] == ["o000", "o001", "o002"]
+    assert revision == 1
+    assert taken == [], "the read path took the writer's exclusive lease"
+
+    # The writer still holds it.
+    store.apply(namespace, scope, SyncBatch(
+        batch_id="after-read",
+        revision=2,
+        objects=(CloudObject("o000", "load_point", 2, {"tss": 99}),),
+    ))
+    assert taken == [store._partition(namespace, scope)]
+
+
+def test_azure_list_objects_with_revision_reads_the_checkpoint_before_the_page():
+    """The floor guarantee: a write racing the listing must not be checkpointed.
+
+    Reading the revision first means a concurrent write lands with a revision
+    greater than the one returned, so the client's checkpoint stays behind it
+    and the change is simply re-delivered.  The reverse order would let the
+    checkpoint advance past a change the page did not carry.
+    """
+    store, _container, namespace, scope = _azure_scope_with_objects(3)
+    order = []
+    real_revision = store.revision
+    real_list = store.list_objects
+
+    def _revision(*args, **kwargs):
+        order.append("revision")
+        return real_revision(*args, **kwargs)
+
+    def _list(*args, **kwargs):
+        order.append("list")
+        # A write lands mid-listing.
+        store.apply(namespace, scope, SyncBatch(
+            batch_id="racing",
+            revision=9,
+            objects=(CloudObject("o000", "load_point", 9, {"tss": 1}),),
+        ))
+        return real_list(*args, **kwargs)
+
+    store.revision = _revision
+    store.list_objects = _list
+    revision, _items = store.list_objects_with_revision(
+        namespace, scope, kinds={"load_point"}, limit=10
+    )
+    assert order == ["revision", "list"]
+    # The checkpoint is the pre-write floor, so o000@9 is offered next poll.
+    assert revision == 1
+    store.revision = real_revision
+    store.list_objects = real_list
+    assert [value.object_id for value in store.list_objects(
+        namespace, scope, kinds={"load_point"}, limit=10, min_revision=revision
+    )] == ["o000"]
