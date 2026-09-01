@@ -20,6 +20,16 @@ from .models import MAX_PAYLOAD_BYTES, CloudObject, SyncBatch
 
 RECOVERY_RETENTION = timedelta(days=7)
 
+#: The largest ``?limit=`` the read API will accept.  ``wattracker.cloud.api``
+#: re-exports this as its own bound; storage owns it because storage cannot
+#: import the API without a cycle.
+MAX_QUERY_LIMIT = 100
+#: Callers ask for one row beyond the page so they can tell whether a further
+#: page exists without a second query, so the store accepts exactly one more
+#: than the API bound.  Deriving it keeps raising ``MAX_QUERY_LIMIT`` from
+#: turning every read into a ``ValueError`` -- that is, a 500.
+_MAX_LIST_LIMIT = MAX_QUERY_LIMIT + 1
+
 
 class StorageConflict(RuntimeError):
     """A batch id or object revision conflicts with an existing write."""
@@ -151,8 +161,8 @@ class MemoryTenantStore:
         after: Optional[str] = None,
         min_revision: Optional[int] = None,
     ) -> list[CloudObject]:
-        if limit < 1 or limit > 101:
-            raise ValueError("limit must be between 1 and 101")
+        if limit < 1 or limit > _MAX_LIST_LIMIT:
+            raise ValueError(f"limit must be between 1 and {_MAX_LIST_LIMIT}")
         scope = self._scope(namespace, local_user_scope)
         allowed = set(kinds) if kinds is not None else None
         with self._lock:
@@ -177,8 +187,8 @@ class MemoryTenantStore:
         min_revision: Optional[int] = None,
     ) -> tuple[int, list[CloudObject]]:
         """Read a page and its checkpoint from one locked scope snapshot."""
-        if limit < 1 or limit > 101:
-            raise ValueError("limit must be between 1 and 101")
+        if limit < 1 or limit > _MAX_LIST_LIMIT:
+            raise ValueError(f"limit must be between 1 and {_MAX_LIST_LIMIT}")
         scope = self._scope(namespace, local_user_scope)
         allowed = set(kinds) if kinds is not None else None
         with self._lock:
@@ -564,14 +574,21 @@ class AzureTenantStore:
         after: Optional[str] = None,
         min_revision: Optional[int] = None,
     ) -> list[CloudObject]:
-        if limit < 1 or limit > 101:
-            raise ValueError("limit must be between 1 and 101")
+        if limit < 1 or limit > _MAX_LIST_LIMIT:
+            raise ValueError(f"limit must be between 1 and {_MAX_LIST_LIMIT}")
         partition = self._partition(namespace, local_user_scope)
         allowed = set(kinds) if kinds is not None else None
         entities = self._table.query_entities(
             query_filter=f"PartitionKey eq '{partition}'"
         )
-        result: list[CloudObject] = []
+        # Two passes, and the split is the whole point.  The table query is
+        # one cheap round trip; ``self.get`` is a blob download per object.
+        # Selecting candidates from the *entity* -- kind, tombstone, cursor
+        # position and ``Revision`` (written next to the blob by
+        # ``_put_object``) -- means a delta poll that matches nothing
+        # downloads nothing, and ``limit=1`` downloads one blob, not one per
+        # object in the scope.
+        candidates: list[str] = []
         for entity in entities:
             row_key = str(entity.get("RowKey", ""))
             if not row_key.startswith("object:"):
@@ -583,13 +600,29 @@ class AzureTenantStore:
             object_id = row_key[len("object:"):]
             if after is not None and object_id <= after:
                 continue
+            if min_revision is not None and int(entity.get("Revision", 0)) <= min_revision:
+                continue
+            candidates.append(object_id)
+        # Sorting the candidate ids -- rather than trusting the order the
+        # table happened to yield -- is what makes the early exit below safe.
+        # Azure Tables does return a partition ordered by RowKey, but nothing
+        # in this class enforces that and the injected test doubles do not
+        # provide it, so the page boundary is established here instead of
+        # assumed.  Stopping on an unsorted stream would silently truncate a
+        # rider's data.
+        candidates.sort()
+        result: list[CloudObject] = []
+        for object_id in candidates:
+            if len(result) >= limit:
+                break
             value = self.get(
                 namespace, local_user_scope, object_id,
                 include_deleted=include_deleted,
             )
+            # A blob that is missing, oversized or unparseable is skipped and
+            # the next candidate fills its slot, exactly as before.
             if value is not None:
-                if min_revision is None or value.revision > min_revision:
-                    result.append(value)
+                result.append(value)
         result.sort(key=lambda value: value.object_id)
         return result[:limit]
 
@@ -604,23 +637,41 @@ class AzureTenantStore:
         after: Optional[str] = None,
         min_revision: Optional[int] = None,
     ) -> tuple[int, list[CloudObject]]:
-        """Read a page and its checkpoint while holding the scope lease."""
-        if limit < 1 or limit > 101:
-            raise ValueError("limit must be between 1 and 101")
-        partition = self._partition(namespace, local_user_scope)
-        with self._scope_lock(partition):
-            return (
-                self.revision(namespace, local_user_scope),
-                self.list_objects(
-                    namespace,
-                    local_user_scope,
-                    kinds=kinds,
-                    limit=limit,
-                    include_deleted=include_deleted,
-                    after=after,
-                    min_revision=min_revision,
-                ),
-            )
+        """Read a page and a checkpoint that is a safe floor for it.
+
+        Deliberately lock-free.  ``_scope_lock`` is the *writer's* exclusive
+        blob lease: taking it here would charge every phone read an extra blob
+        PUT plus a lease acquire/release, turn a second concurrent read (or a
+        read overlapping ``apply``) into a lease-conflict 500, and -- worst --
+        let a read-only credential stall desktop writes for the full 60s lease
+        if the reading process died mid-read.  A read must never be able to
+        block a write.
+
+        The ordering below is the substitute for that lock and is not
+        incidental: the revision is read **before** the listing.  Any write
+        that lands during or after the listing therefore carries a revision
+        greater than the one returned, so the client's checkpoint stays behind
+        it and the changed objects are simply re-delivered on the next poll.
+        Reading the revision *after* the listing would invert this and let the
+        checkpoint advance past a change the page did not contain -- silent
+        data loss.  This yields at-least-once delivery, which is what a delta
+        feed wants; a duplicate is free, a dropped object is not.
+        """
+        if limit < 1 or limit > _MAX_LIST_LIMIT:
+            raise ValueError(f"limit must be between 1 and {_MAX_LIST_LIMIT}")
+        revision = self.revision(namespace, local_user_scope)
+        return (
+            revision,
+            self.list_objects(
+                namespace,
+                local_user_scope,
+                kinds=kinds,
+                limit=limit,
+                include_deleted=include_deleted,
+                after=after,
+                min_revision=min_revision,
+            ),
+        )
 
     def usage(self, namespace: str, local_user_scope: str) -> int:
         partition = self._partition(namespace, local_user_scope)

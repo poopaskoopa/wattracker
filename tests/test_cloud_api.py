@@ -1,10 +1,17 @@
+import base64
 import hashlib
+import hmac
 import json
 
 import pytest
 from fastapi.testclient import TestClient
 
-from wattracker.cloud.api import CloudConfig, CloudState, create_cloud_app
+from wattracker.cloud.api import (
+    CloudConfig,
+    CloudState,
+    _cursor_key,
+    create_cloud_app,
+)
 from wattracker.cloud.models import CloudObject, SyncBatch
 from wattracker.cloud.security import (
     DEVICE_PAIRING_CODE_BITS,
@@ -2180,3 +2187,250 @@ def test_a_placeholder_proof_value_cannot_claim_a_gateway():
     # subject on top of it.
     assert not _cfg(apim_proof_value="").gateway_attests_subject
     assert _cfg(apim_proof_value="proof-value").gateway_attests_subject
+
+
+def _load_points(revision, ids):
+    return [CloudObject(oid, "load_point", revision, {"tss": 10}) for oid in ids]
+
+
+def test_mobile_delta_checkpoint_is_pinned_at_page_one_so_midpagination_edits_survive(cloud):
+    """A mid-pagination mutation must never be skipped by the next poll.
+
+    ``docs/cloud-sync.md`` tells the client to checkpoint the envelope
+    ``revision`` only after consuming every page.  If each page recomputed
+    that revision, an object delivered on an early page and then mutated
+    before the last page would sit *behind* the cursor (excluded by
+    ``object_id > after``) while the checkpoint advanced *past* its new
+    revision -- the client would checkpoint a revision it never actually saw
+    that object at, and never be offered it again.
+    """
+    _config, state, client = cloud
+    token, context = _mobile_reader(state)
+    namespace, scope = context.namespace, context.local_user_scope
+    ids = ["c000", "c001", "c002", "c003", "c004", "c005"]
+    # The phone is caught up at scope revision 10.
+    _apply_mobile_batch(state, namespace, scope, "seed", 10, _load_points(10, ids))
+    headers = _mobile_headers(token)
+    assert client.get(
+        "/api/v1/context/dashboard?since=10", headers=headers
+    ).json()["items"] == []
+
+    # Everything is bumped to 11; the phone starts paging the delta.
+    _apply_mobile_batch(state, namespace, scope, "bump", 11, _load_points(11, ids))
+    page = client.get(
+        "/api/v1/context/dashboard?since=10&limit=2", headers=headers
+    ).json()
+    assert [item["id"] for item in page["items"]] == ["c000", "c001"]
+    pinned = page["revision"]
+    assert pinned == 11
+
+    # c000 is mutated after it was already delivered on page 1.  It now sorts
+    # BEFORE the cursor, so no later page can carry it.
+    _apply_mobile_batch(state, namespace, scope, "mutate", 12,
+                        _load_points(12, ["c000"]))
+
+    delivered = [item["id"] for item in page["items"]]
+    while page["next_cursor"]:
+        page = client.get(
+            "/api/v1/context/dashboard?since=10&limit=2&cursor=" + page["next_cursor"],
+            headers=headers,
+        ).json()
+        delivered.extend(item["id"] for item in page["items"])
+        # Every page carries the checkpoint pinned when page 1 was read.
+        assert page["revision"] == pinned, (
+            "checkpoint advanced mid-pagination past an object already delivered"
+        )
+    assert delivered == ids
+
+    # The client checkpoints the last page's revision and polls again.  The
+    # mid-pagination edit to c000 must still be delivered.
+    checkpoint = page["revision"]
+    follow_up = client.get(
+        f"/api/v1/context/dashboard?since={checkpoint}", headers=headers
+    ).json()
+    assert [item["id"] for item in follow_up["items"]] == ["c000"], (
+        "c000 was mutated to revision 12 mid-pagination and is now unreachable"
+    )
+
+
+def _mint_cursor(state, namespace, scope, payload):
+    """Sign an arbitrary cursor payload with the server's real cursor key.
+
+    This is the strongest attacker a cursor faces short of the server secret:
+    someone who can present any *validly signed* payload.  The pinned revision
+    must be enforced by the decoder, not merely by what the encoder happens to
+    emit.
+    """
+    body = json.dumps(payload, separators=(",", ":"), sort_keys=True).encode()
+    mac = hmac.new(
+        _cursor_key(state.config.server_secret, namespace, scope),
+        body, hashlib.sha256,
+    ).digest()
+    return base64.urlsafe_b64encode(body + mac).decode().rstrip("=")
+
+
+def _paged_scope(state, client, scope="mobile-scope"):
+    token, context = _mobile_reader(state, scope=scope)
+    _apply_mobile_batch(
+        state, context.namespace, context.local_user_scope, "pages", 4,
+        _load_points(4, ["p0", "p1", "p2"]),
+    )
+    headers = _mobile_headers(token)
+    first = client.get(
+        "/api/v1/context/dashboard?limit=1", headers=headers
+    ).json()
+    assert first["next_cursor"]
+    return context, headers, first
+
+
+def test_mobile_cursor_without_a_pinned_revision_is_rejected(cloud):
+    """A fieldless cursor is invalid, not silently defaulted.
+
+    Defaulting a missing pin to the freshly read scope revision would restore
+    exactly the per-page checkpoint recomputation that loses objects mutated
+    mid-pagination.  No mobile client has shipped, so there is nothing to keep
+    compatible.
+    """
+    _config, state, client = cloud
+    context, headers, first = _paged_scope(state, client)
+    legacy = _mint_cursor(
+        state, context.namespace, context.local_user_scope,
+        {"route": "dashboard", "since": None, "after": "p0"},
+    )
+    response = client.get(
+        "/api/v1/context/dashboard?limit=1&cursor=" + legacy, headers=headers
+    )
+    assert response.status_code == 400
+    assert response.json()["detail"] == "invalid cursor"
+
+    # Neither a null, a bool (an ``int`` subclass in Python), a float, a
+    # string, nor a negative revision may stand in for the pin.
+    for bad in (None, True, False, 1.5, "4", -1):
+        forged = _mint_cursor(
+            state, context.namespace, context.local_user_scope,
+            {"route": "dashboard", "since": None, "after": "p0", "revision": bad},
+        )
+        assert client.get(
+            "/api/v1/context/dashboard?limit=1&cursor=" + forged, headers=headers
+        ).status_code == 400, bad
+
+    # The genuine cursor still works, so the rejection is about the field and
+    # not about the minting helper.
+    assert client.get(
+        "/api/v1/context/dashboard?limit=1&cursor=" + first["next_cursor"],
+        headers=headers,
+    ).status_code == 200
+
+
+def test_mobile_cursor_with_a_tampered_pinned_revision_fails_the_mac(cloud):
+    """The pin is inside the signed payload, so editing it breaks the MAC."""
+    _config, state, client = cloud
+    context, headers, first = _paged_scope(state, client)
+    raw = first["next_cursor"]
+    encoded = raw.encode("ascii")
+    encoded += b"=" * (-len(encoded) % 4)
+    value = base64.urlsafe_b64decode(encoded)
+    payload, mac = value[:-32], value[-32:]
+    decoded = json.loads(payload.decode())
+    assert decoded["revision"] == 4
+    # Re-encode with a bumped pin but the original MAC.
+    decoded["revision"] = 9_999
+    forged = json.dumps(decoded, separators=(",", ":"), sort_keys=True).encode()
+    tampered = base64.urlsafe_b64encode(forged + mac).decode().rstrip("=")
+    assert tampered != raw
+    response = client.get(
+        "/api/v1/context/dashboard?limit=1&cursor=" + tampered, headers=headers
+    )
+    assert response.status_code == 400
+    assert response.json()["detail"] == "invalid cursor"
+
+
+def test_mobile_cursor_cannot_be_replayed_across_scopes(cloud):
+    """Scope binding lives in the HMAC key, so another scope cannot verify it."""
+    _config, state, client = cloud
+    context_a, headers_a, first_a = _paged_scope(state, client, scope="scope-a")
+    context_b, headers_b, _first_b = _paged_scope(state, client, scope="scope-b")
+    assert context_a.local_user_scope != context_b.local_user_scope
+    assert client.get(
+        "/api/v1/context/dashboard?limit=1&cursor=" + first_a["next_cursor"],
+        headers=headers_b,
+    ).status_code == 400
+    # A cursor forged against scope B's key still cannot be used in scope A.
+    cross = _mint_cursor(
+        state, context_b.namespace, context_b.local_user_scope,
+        {"route": "dashboard", "since": None, "after": "p0", "revision": 4},
+    )
+    assert client.get(
+        "/api/v1/context/dashboard?limit=1&cursor=" + cross, headers=headers_a
+    ).status_code == 400
+    # ...and the owning scope is unaffected.
+    assert client.get(
+        "/api/v1/context/dashboard?limit=1&cursor=" + first_a["next_cursor"],
+        headers=headers_a,
+    ).status_code == 200
+
+
+def test_mobile_pinned_checkpoint_never_exceeds_the_scope_revision(cloud):
+    """The pin only ever holds the checkpoint back, never pushes it forward.
+
+    A cursor is signed, so its pin cannot be attacker-chosen, but it can be
+    genuinely stale (an abandoned walk resumed later).  A stale pin must still
+    be a floor: it is reported verbatim, so the client re-reads rather than
+    skipping anything.
+    """
+    _config, state, client = cloud
+    context, headers, first = _paged_scope(state, client)
+    assert first["revision"] == 4
+    _apply_mobile_batch(
+        state, context.namespace, context.local_user_scope, "later", 40,
+        _load_points(40, ["p1"]),
+    )
+    later = client.get(
+        "/api/v1/context/dashboard?limit=1&cursor=" + first["next_cursor"],
+        headers=headers,
+    ).json()
+    assert later["revision"] == 4 < state.store.revision(
+        context.namespace, context.local_user_scope
+    )
+    # A fresh walk with no cursor sees the current scope revision.
+    assert client.get(
+        "/api/v1/context/dashboard?limit=1", headers=headers
+    ).json()["revision"] == 40
+
+
+def test_mobile_concurrent_reads_do_not_conflict_on_the_writer_lease(cloud):
+    """Overlapping phone reads must both succeed.
+
+    The read path used to take the writer's exclusive blob lease, and
+    ``collection`` catches only ``QuotaExceeded``, so a lease conflict
+    surfaced as a bare 500.  This drives real concurrent requests through the
+    route and asserts none of them fails.
+    """
+    import threading
+
+    _config, state, client = cloud
+    token, context = _mobile_reader(state)
+    _apply_mobile_batch(
+        state, context.namespace, context.local_user_scope, "concurrent", 3,
+        _load_points(3, [f"k{index}" for index in range(8)]),
+    )
+    headers = _mobile_headers(token)
+    barrier = threading.Barrier(6)
+    results = []
+    lock = threading.Lock()
+
+    def _read():
+        barrier.wait(timeout=10)
+        response = client.get("/api/v1/context/dashboard?limit=2", headers=headers)
+        with lock:
+            results.append((response.status_code, response.json()))
+
+    threads = [threading.Thread(target=_read) for _ in range(6)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=20)
+    assert [status for status, _ in results] == [200] * 6
+    for _status, body in results:
+        assert [item["id"] for item in body["items"]] == ["k0", "k1"]
+        assert body["revision"] == 3

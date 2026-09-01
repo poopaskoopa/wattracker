@@ -44,11 +44,13 @@ from .security import (
     validate_public_key,
     verify_signature,
 )
-from .storage import MemoryTenantStore, StorageConflict, StaleRevision
+from .storage import MAX_QUERY_LIMIT, MemoryTenantStore, StorageConflict, StaleRevision
 
 _NOT_FOUND_BODY = {"detail": "not found"}
 _MAX_TIMESTAMP = 60 * 5
-_MAX_QUERY_LIMIT = 100
+# The API bound and the store's accepted range are one fact, defined in
+# storage (which cannot import this module without a cycle).
+_MAX_QUERY_LIMIT = MAX_QUERY_LIMIT
 # The refresh envelope carries no body and no idempotent effect, so both
 # fields are fixed constants rather than caller-chosen values.  The nonce is
 # what makes each signed refresh unique and single-use.
@@ -320,7 +322,7 @@ def _error(status: int, detail: str, *, retry_after: Optional[int] = None) -> JS
 
 def _safe_limit(raw: Optional[str]) -> int:
     try:
-        value = int(raw or "100")
+        value = int(raw) if raw else _MAX_QUERY_LIMIT
     except (TypeError, ValueError):
         raise HTTPException(status_code=400, detail="invalid limit")
     if value < 1 or value > _MAX_QUERY_LIMIT:
@@ -671,9 +673,17 @@ def _cursor_key(secret: bytes, namespace: str, scope: str) -> bytes:
 
 
 def _encode_cursor(secret: bytes, namespace: str, scope: str, route: str,
-                   since: Optional[int], after: str) -> str:
+                   since: Optional[int], after: str, revision: int) -> str:
+    """Sign one page position plus the checkpoint pinned when paging began.
+
+    ``revision`` travels inside the signed payload rather than as a query
+    parameter so a client cannot move its own checkpoint forward: it is a
+    server fact about when this pagination started, not caller input.  The
+    scope binding deliberately stays in the HMAC *key* (see ``_cursor_key``)
+    so a cursor minted for one scope cannot verify under another.
+    """
     payload = json.dumps(
-        {"route": route, "since": since, "after": after},
+        {"route": route, "since": since, "after": after, "revision": revision},
         separators=(",", ":"), sort_keys=True,
     ).encode()
     mac = hmac.new(_cursor_key(secret, namespace, scope), payload, hashlib.sha256).digest()
@@ -681,7 +691,17 @@ def _encode_cursor(secret: bytes, namespace: str, scope: str, route: str,
 
 
 def _decode_cursor(secret: bytes, namespace: str, scope: str, route: str,
-                   since: Optional[int], raw: Optional[str]) -> Optional[str]:
+                   since: Optional[int], raw: Optional[str],
+                   ) -> Optional[tuple[str, int]]:
+    """Verify a cursor and return ``(after, pinned_revision)``.
+
+    The pinned revision is validated exactly as strictly as ``route`` and
+    ``since``: a cursor without it, or with a non-``int``/negative one, is
+    rejected rather than defaulted.  Silently substituting a fresh scope
+    revision for a missing field would reintroduce the checkpoint-advance
+    data loss this field exists to prevent, so there is no lenient path.
+    No mobile client has shipped, so there is no old cursor to accommodate.
+    """
     if raw is None:
         return None
     try:
@@ -697,10 +717,15 @@ def _decode_cursor(secret: bytes, namespace: str, scope: str, route: str,
         decoded = json.loads(payload.decode())
         if not isinstance(decoded, dict):
             raise ValueError
+        pinned = decoded.get("revision")
         if (decoded.get("route") != route or decoded.get("since") != since
-                or not isinstance(decoded.get("after"), str)):
+                or not isinstance(decoded.get("after"), str)
+                # ``bool`` is an ``int`` subclass in Python; a JSON ``true``
+                # must not pass for a revision.
+                or isinstance(pinned, bool) or not isinstance(pinned, int)
+                or pinned < 0):
             raise ValueError
-        return decoded["after"]
+        return decoded["after"], pinned
     except (AttributeError, ValueError, TypeError, UnicodeError, json.JSONDecodeError,
             base64.binascii.Error):
         raise HTTPException(status_code=400, detail="invalid cursor")
@@ -1204,19 +1229,35 @@ def create_cloud_app(
             namespace, scope = _context_scope(context_value)
             limit = _safe_limit(request.query_params.get("limit"))
             since = _safe_since(request.query_params.get("since")) if mobile else None
-            after = (_decode_cursor(
+            cursor_state = (_decode_cursor(
                 state.config.server_secret, namespace, scope, route, since,
                 request.query_params.get("cursor"),
             ) if mobile else None)
+            after = cursor_state[0] if cursor_state is not None else None
+            pinned_revision = cursor_state[1] if cursor_state is not None else None
             include_deleted = mobile and since is not None
             try:
                 state.quotas.admit_read(namespace, scope, response_bytes=0)
                 with state.quotas.backend_slot():
                     if mobile:
-                        current_revision, items = state.store.list_objects_with_revision(
+                        scope_revision, items = state.store.list_objects_with_revision(
                             namespace, scope, kinds=kinds, limit=limit + 1,
                             include_deleted=include_deleted, after=after,
                             min_revision=since,
+                        )
+                        # The checkpoint is pinned when pagination starts and
+                        # then carried in the signed cursor, so every page of
+                        # one walk reports the same revision.  Recomputing it
+                        # per page loses data: an object delivered on an early
+                        # page can be mutated afterwards, and it sorts *before*
+                        # the cursor, so no later page can carry it -- yet a
+                        # recomputed checkpoint would advance past its new
+                        # revision and the client would never ask for it again.
+                        # Pinning instead makes such an edit simply reappear on
+                        # the next poll (at-least-once, never at-most-once).
+                        current_revision = (
+                            scope_revision if pinned_revision is None
+                            else pinned_revision
                         )
                     else:
                         current_revision = None
@@ -1228,7 +1269,7 @@ def create_cloud_app(
                 next_cursor = (
                     _encode_cursor(
                         state.config.server_secret, namespace, scope, route,
-                        since, items[-1].object_id,
+                        since, items[-1].object_id, current_revision,
                     ) if has_more and items else None
                 )
                 if mobile:
