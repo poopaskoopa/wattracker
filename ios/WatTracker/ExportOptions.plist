@@ -1,0 +1,70 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!-- Export options for the TestFlight release job.
+
+     NOTE THE KEY THAT IS NOT HERE: teamID.
+
+     A team identifier is an Apple account identifier and this repository is
+     public, so it is not committed. Of the two ways to supply it, this file
+     takes the templating one: .github/workflows/ios-release.yml copies this
+     file into $RUNNER_TEMP and inserts teamID there from the APPLE_TEAM_ID
+     secret, and hands xcodebuild the copy.
+
+     Templating rather than a command-line override because there is no
+     command-line override to use: -exportArchive reads its configuration only
+     from -exportOptionsPlist, and there is no flag that overrides an
+     individual key in it. (Passing DEVELOPMENT_TEAM=... as a build setting
+     configures a build, not an export.)
+
+     A temp copy rather than an in-place edit of this file because the
+     workspace copy must stay clean: the checkout is the thing a later step
+     could archive, diff, or upload, and a file that gains a real team id
+     mid-job is exactly how an identifier ends up somewhere nobody was looking.
+     The temp copy is deleted by the job's if: always() cleanup.
+
+     Omitting teamID entirely would also work - xcodebuild documents it as
+     defaulting to the team the archive was built with, which the release job
+     sets explicitly - but relying on that default puts the failure at the end
+     of a ten-minute archive if it ever stops holding. Templating states it. -->
+<plist version="1.0">
+<dict>
+	<!-- app-store-connect, not app-store. Xcode 26's own
+	     `xcodebuild -help` lists app-store-connect as the current name and
+	     app-store as deprecated; older documentation and most examples on the
+	     web still say app-store. -->
+	<key>method</key>
+	<string>app-store-connect</string>
+
+	<!-- Produce a .ipa on disk and stop. The alternative, `upload`, makes
+	     xcodebuild deliver to App Store Connect itself, which would put the
+	     delivery inside the same invocation as the export and give one
+	     failure to read for two very different problems. The job uploads in a
+	     separate step with altool. `export` is also the documented default;
+	     it is written out so a change of default cannot silently turn this
+	     into an outward-facing upload. -->
+	<key>destination</key>
+	<string>export</string>
+
+	<!-- The archive is signed automatically by the release job under
+	     -allowProvisioningUpdates, so the export follows it. Stated rather
+	     than inherited: the project's own CODE_SIGN_STYLE is Manual (ad-hoc,
+	     for unsigned local builds), and an export that quietly picked that up
+	     would look for a manual profile that does not exist. -->
+	<key>signingStyle</key>
+	<string>automatic</string>
+
+	<!-- Upload the dSYMs with the build so App Store Connect can symbolicate
+	     crash reports from testers. The dSYMs are debug symbols for our own
+	     code; they carry no signing material. -->
+	<key>uploadSymbols</key>
+	<true/>
+
+	<!-- Xcode must NOT rewrite the version or build number during export. The
+	     release job sets MARKETING_VERSION and CURRENT_PROJECT_VERSION
+	     deterministically from the tag and the run, and letting Xcode
+	     renumber on top of that would mean the build number in App Store
+	     Connect no longer maps to the run that produced it. -->
+	<key>manageAppVersionAndBuildNumber</key>
+	<false/>
+</dict>
+</plist>
