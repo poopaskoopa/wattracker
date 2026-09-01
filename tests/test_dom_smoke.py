@@ -1497,6 +1497,23 @@ def _wait_for_badge(page, text, timeout=10_000):
         arg=text, timeout=timeout, polling=100)
 
 
+_RIDE_WAIT_TIMEOUT = 30_000
+
+
+def _wait_for_ride_start(page):
+    """Allow the shared browser runner more time to start a simulated ride."""
+    page.wait_for_selector("#stopBtn:not([disabled])", timeout=_RIDE_WAIT_TIMEOUT)
+
+
+def _wait_for_ride(page, expression):
+    """Allow ride UI transitions to absorb scheduling delays on the CI host."""
+    _wait_for(page, expression, timeout=_RIDE_WAIT_TIMEOUT)
+
+
+def _wait_for_ride_badge(page, text):
+    _wait_for_badge(page, text, timeout=_RIDE_WAIT_TIMEOUT)
+
+
 def test_ride_fullscreen_plus_minus_nudges_intensity_and_badges_it(
     page, live_server, console_errors
 ):
@@ -1510,7 +1527,7 @@ def test_ride_fullscreen_plus_minus_nudges_intensity_and_badges_it(
     page.goto(f"{live_server.base}/ride")
     page.wait_for_load_state("networkidle")
     page.click("#simBtn")
-    page.wait_for_selector("#stopBtn:not([disabled])", timeout=15_000)
+    _wait_for_ride_start(page)
 
     # Not in full screen: the keys do nothing at all.
     page.keyboard.press("+")
@@ -1520,12 +1537,12 @@ def test_ride_fullscreen_plus_minus_nudges_intensity_and_badges_it(
     assert _badge_state(page) == {"chart": None, "card": None}
 
     page.click("#chartFullscreenBtn")
-    _wait_for(page, "document.getElementById('chartFullscreenBtn')"
-                    ".getAttribute('aria-pressed') === 'true'")
+    _wait_for_ride(page, "document.getElementById('chartFullscreenBtn')"
+                       ".getAttribute('aria-pressed') === 'true'")
 
     for _ in range(3):
         page.keyboard.press("+")
-    _wait_for_badge(page, "+3%")
+    _wait_for_ride_badge(page, "+3%")
     sent = [json.loads(d) for d in page.evaluate("window.__sent")]
     nudges = [f for f in sent if f.get("action") == "adjust_intensity"]
     assert nudges == [{"action": "adjust_intensity", "delta": 1}] * 3
@@ -1533,16 +1550,16 @@ def test_ride_fullscreen_plus_minus_nudges_intensity_and_badges_it(
     # Down through neutral: the badge disappears at 0% and comes back negative.
     for _ in range(3):
         page.keyboard.press("-")
-    _wait_for(page, "document.getElementById('rIntensityBiasChart').hidden")
+    _wait_for_ride(page, "document.getElementById('rIntensityBiasChart').hidden")
     assert _badge_state(page) == {"chart": None, "card": None}
 
     page.keyboard.press("-")
-    _wait_for_badge(page, "-1%")
+    _wait_for_ride_badge(page, "-1%")
 
     # Back out of full screen: the badge the rider set is still on the card.
     page.keyboard.press("Escape")
-    _wait_for(page, "document.getElementById('chartFullscreenBtn')"
-                    ".getAttribute('aria-pressed') === 'false'")
+    _wait_for_ride(page, "document.getElementById('chartFullscreenBtn')"
+                       ".getAttribute('aria-pressed') === 'false'")
     assert _badge_state(page)["card"] == "-1%"
 
     _assert_clean(console_errors, "/ride intensity nudge")
@@ -1557,21 +1574,21 @@ def test_ride_fullscreen_equals_and_underscore_are_aliases_for_plus_minus(
     page.goto(f"{live_server.base}/ride")
     page.wait_for_load_state("networkidle")
     page.click("#simBtn")
-    page.wait_for_selector("#stopBtn:not([disabled])", timeout=15_000)
+    _wait_for_ride_start(page)
     page.click("#chartFullscreenBtn")
-    _wait_for(page, "document.getElementById('chartFullscreenBtn')"
-                    ".getAttribute('aria-pressed') === 'true'")
+    _wait_for_ride(page, "document.getElementById('chartFullscreenBtn')"
+                       ".getAttribute('aria-pressed') === 'true'")
 
     for _ in range(3):
         page.keyboard.press("=")
-    _wait_for_badge(page, "+3%")
+    _wait_for_ride_badge(page, "+3%")
     sent = [json.loads(d) for d in page.evaluate("window.__sent")]
     nudges = [f for f in sent if f.get("action") == "adjust_intensity"]
     assert nudges == [{"action": "adjust_intensity", "delta": 1}] * 3
 
     for _ in range(4):
         page.keyboard.press("_")
-    _wait_for_badge(page, "-1%")
+    _wait_for_ride_badge(page, "-1%")
 
     _assert_clean(console_errors, "/ride intensity nudge alias keys")
 
@@ -1583,10 +1600,10 @@ def test_ride_fullscreen_intensity_key_prevents_default_only_for_itself(
     page.goto(f"{live_server.base}/ride")
     page.wait_for_load_state("networkidle")
     page.click("#simBtn")
-    page.wait_for_selector("#stopBtn:not([disabled])", timeout=15_000)
+    _wait_for_ride_start(page)
     page.click("#chartFullscreenBtn")
-    _wait_for(page, "document.getElementById('chartFullscreenBtn')"
-                    ".getAttribute('aria-pressed') === 'true'")
+    _wait_for_ride(page, "document.getElementById('chartFullscreenBtn')"
+                       ".getAttribute('aria-pressed') === 'true'")
 
     page.evaluate(
         """() => {
@@ -1614,10 +1631,10 @@ def test_ride_fullscreen_intensity_keys_are_inert_while_typing(
     page.goto(f"{live_server.base}/ride")
     page.wait_for_load_state("networkidle")
     page.click("#simBtn")
-    page.wait_for_selector("#stopBtn:not([disabled])", timeout=15_000)
+    _wait_for_ride_start(page)
     page.click("#chartFullscreenBtn")
-    _wait_for(page, "document.getElementById('chartFullscreenBtn')"
-                    ".getAttribute('aria-pressed') === 'true'")
+    _wait_for_ride(page, "document.getElementById('chartFullscreenBtn')"
+                       ".getAttribute('aria-pressed') === 'true'")
 
     page.evaluate(
         """() => {
@@ -1650,15 +1667,15 @@ def test_ride_fullscreen_intensity_badge_renders_from_the_status_reply_alone(
     page.goto(f"{live_server.base}/ride")
     page.wait_for_load_state("networkidle")
     page.click("#simBtn")
-    page.wait_for_selector("#stopBtn:not([disabled])", timeout=15_000)
+    _wait_for_ride_start(page)
     page.click("#chartFullscreenBtn")
-    _wait_for(page, "document.getElementById('chartFullscreenBtn')"
-                    ".getAttribute('aria-pressed') === 'true'")
+    _wait_for_ride(page, "document.getElementById('chartFullscreenBtn')"
+                       ".getAttribute('aria-pressed') === 'true'")
 
     page.evaluate("window.__suppressRunningFrames = true")
     page.keyboard.press("+")
     page.keyboard.press("+")
-    _wait_for_badge(page, "+2%")
+    _wait_for_ride_badge(page, "+2%")
 
     _assert_clean(console_errors, "/ride intensity badge from reply alone")
 
@@ -1674,10 +1691,10 @@ def test_ride_fullscreen_intensity_badge_renders_from_a_state_frame_alone(
     page.goto(f"{live_server.base}/ride")
     page.wait_for_load_state("networkidle")
     page.click("#simBtn")
-    page.wait_for_selector("#stopBtn:not([disabled])", timeout=15_000)
+    _wait_for_ride_start(page)
     page.click("#chartFullscreenBtn")
-    _wait_for(page, "document.getElementById('chartFullscreenBtn')"
-                    ".getAttribute('aria-pressed') === 'true'")
+    _wait_for_ride(page, "document.getElementById('chartFullscreenBtn')"
+                       ".getAttribute('aria-pressed') === 'true'")
 
     # Bypass the send/reply machinery entirely: hand the socket a synthetic
     # running frame with a bias no keypress ever requested.
@@ -1690,7 +1707,7 @@ def test_ride_fullscreen_intensity_badge_renders_from_a_state_frame_alone(
             });
         }"""
     )
-    _wait_for_badge(page, "+7%")
+    _wait_for_ride_badge(page, "+7%")
 
     _assert_clean(console_errors, "/ride intensity badge from state frame alone")
 
@@ -1712,17 +1729,17 @@ def test_ride_fullscreen_intensity_locked_reply_shows_a_note_not_a_percentage(
     page.goto(f"{live_server.base}/ride")
     page.wait_for_load_state("networkidle")
     page.click("#simBtn")
-    page.wait_for_selector("#stopBtn:not([disabled])", timeout=15_000)
+    _wait_for_ride_start(page)
     page.click("#chartFullscreenBtn")
-    _wait_for(page, "document.getElementById('chartFullscreenBtn')"
-                    ".getAttribute('aria-pressed') === 'true'")
+    _wait_for_ride(page, "document.getElementById('chartFullscreenBtn')"
+                       ".getAttribute('aria-pressed') === 'true'")
 
     # Nothing is badged on an ordinary ride at 0%, before any key is pressed.
     assert _badge_state(page) == {"chart": None, "card": None}
 
     page.evaluate("window.__lockIntensity = true")
     page.keyboard.press("+")
-    _wait_for_badge(page, _LOCK_NOTE)
+    _wait_for_ride_badge(page, _LOCK_NOTE)
 
     # It survives the state frames arriving underneath it...
     page.wait_for_timeout(1_500)
@@ -1731,14 +1748,13 @@ def test_ride_fullscreen_intensity_locked_reply_shows_a_note_not_a_percentage(
     assert "%" not in shown["chart"]
 
     # ...and then clears itself, back to the no-badge state of an unbiased ride.
-    _wait_for(page, "document.getElementById('rIntensityBiasChart').hidden",
-              timeout=15_000)
+    _wait_for_ride(page, "document.getElementById('rIntensityBiasChart').hidden")
     assert _badge_state(page) == {"chart": None, "card": None}
 
     # The keys are not broken by the refusal: an unlocked ride still nudges.
     page.evaluate("window.__lockIntensity = false")
     page.keyboard.press("+")
-    _wait_for_badge(page, "+1%")
+    _wait_for_ride_badge(page, "+1%")
 
     _assert_clean(console_errors, "/ride intensity locked note")
 
