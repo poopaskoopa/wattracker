@@ -302,8 +302,11 @@ that will not connect — points nowhere near the cause.
 The connector watches the Zwift Activities folder and tells the server when a
 new `.fit` has finished being written, so a ride appears under Activities a
 minute or two after you save it — without anyone pressing **Rescan**. A file is
-reported only once its size has stopped changing, so a `.fit` Zwift is still
-writing is left alone, and Zwift's live recording buffer is ignored entirely.
+reported once it has sat unchanged for a minute *and* the `.fit` on disk
+agrees with its own header, so a ride Zwift is still writing is left alone.
+Both tests are needed: Zwift creates the finished file under its final name at
+ride *start* and appends to it for the whole ride, pausing long enough between
+writes to look finished. Zwift's live recording buffer is ignored entirely.
 
 ```powershell
 wattracker-connector --scan-interval 30 --save   # check every 30s (default 60)
@@ -312,10 +315,12 @@ wattracker-connector --scan-interval 0  --save   # stop watching
 
 The check is a directory listing on the Zwift machine, so it costs nothing when
 nothing has changed: after the first pass the server is contacted only when a
-file has actually settled. The first pass after the connector starts always
-reports — even when the Zwift folder is empty or does not exist yet — because a
-ride may have been ridden while the connector was down, and that one report is
-what makes starting the connector the cold-start trigger for a scan. With it
+file has actually settled. A shorter interval makes that news arrive sooner;
+it does not make a file count as finished sooner. The first pass after the
+connector starts always reports — even when the Zwift folder is empty or does
+not exist yet — because a ride may have been ridden while the connector was
+down, and that one report is what makes starting the connector the cold-start
+trigger for a scan. With it
 turned off — or if the connector is not running — rides are still imported by
 the server's daily sweep, and **Rescan** still works at any time.
 

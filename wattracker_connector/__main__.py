@@ -269,11 +269,11 @@ def _parser() -> argparse.ArgumentParser:
         "--scan-interval", type=float, metavar="SECONDS",
         help=(
             "How often to check the Activities folder for a finished ride, in "
-            "seconds (default 60, minimum 5). The server is told as soon as a "
-            "new .fit stops being written to, so a ride appears within about "
-            "two of these rather than on the server's daily sweep. Use 0 to "
-            "stop watching, which leaves that sweep as the only thing that "
-            "imports rides"
+            "seconds (default 60, minimum 5). A .fit has to sit unchanged for "
+            "a minute before it counts as finished, so a shorter interval "
+            "brings the report forward but does not shorten that minute. Use "
+            "0 to stop watching, which leaves the server's daily sweep as the "
+            "only thing that imports rides"
         ),
     )
     parser.add_argument(

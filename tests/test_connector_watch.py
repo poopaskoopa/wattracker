@@ -31,15 +31,78 @@ def activities(tmp_path):
     return folder
 
 
+class _Clock:
+    """A hand-wound clock, because the settle rule is a duration now.
+
+    It used to be "identical in two consecutive passes", which a test
+    satisfied by calling poll twice. Stillness is now measured in seconds, so
+    a test has to say how many went by - and a real minute of sleep per test
+    is not an option.
+    """
+
+    def __init__(self, now=1000.0):
+        self.now = now
+
+    def __call__(self):
+        return self.now
+
+    def wait(self, seconds):
+        self.now += seconds
+
+
 def _watcher(activities):
     return watchmod.ActivityWatcher(
-        ConnectorConfig(activities_dir=str(activities), workouts_dir=None)
+        ConnectorConfig(activities_dir=str(activities), workouts_dir=None),
+        clock=_Clock(),
+    )
+
+
+def _fit_header(data_size):
+    """A 14-byte FIT header declaring ``data_size`` bytes of records."""
+    return (
+        bytes([14, 32]) + (2078).to_bytes(2, "little")
+        + int(data_size).to_bytes(4, "little") + b".FIT" + b"\x00\x00"
     )
 
 
 def _write(path, size=64):
-    path.write_bytes(b"x" * size)
+    """A saved ride: the header agrees with the length, and a CRC follows.
+
+    Every file here has to be a real enough FIT to pass the structural half
+    of the settle rule, since a rider's Activities folder holds nothing else.
+    ``_write_unfinished`` is the one that stands for a ride still being
+    ridden. The file ends up ``size + 16`` bytes long.
+    """
+    body = b"x" * size
+    path.write_bytes(_fit_header(len(body)) + body + b"\x00\x00")
     return path
+
+
+def _write_unfinished(path, size):
+    """A ride Zwift is still appending to: placeholder header, no CRC yet.
+
+    Exactly ``size`` bytes, so the measured trace below can be replayed.
+    """
+    header = _fit_header(0)
+    path.write_bytes(header + b"x" * (size - len(header)))
+    return path
+
+
+def _settled(watch):
+    """One pass, then the wait the rule asks for, then the pass that counts."""
+    watch.poll()
+    watch._clock.wait(watchmod.SETTLE_WINDOW_S)
+    return watch.poll()
+
+
+def _poll_for(watch, seconds, step=watchmod.MIN_INTERVAL_S):
+    """Poll on a fixed cadence for a while. Returns how often it reported."""
+    reports = 0
+    for _ in range(int(seconds / step)):
+        watch._clock.wait(step)
+        if watch.poll():
+            reports += 1
+    return reports
 
 
 # --------------------------------------------------------- the settle rule
@@ -67,10 +130,82 @@ def test_a_new_file_is_not_reported_until_it_stops_changing(activities):
     _write(ride, size=200)
     assert watch.poll() is False, "reported a file that was still growing"
 
-    # Unchanged between two passes: now it counts.
+    # Still, and now for long enough.
+    watch._clock.wait(watchmod.SETTLE_WINDOW_S)
     assert watch.poll() is True
     # Reported once, not once per pass thereafter.
     assert watch.poll() is False
+
+
+def test_the_ride_zwift_is_writing_is_reported_once_at_the_end(activities):
+    """The misfire this rule exists for, replayed from the measurement.
+
+    Sampled every 200ms across a whole ride on hardware, 2026-09-01: Zwift
+    creates the file under its FINAL name at ride START and appends to it for
+    the whole ride, in 4096-byte blocks 35-40s apart. Each of those pauses is
+    far longer than the two passes the old rule asked for, so at the 5s
+    interval floor the connector reported six times for one ride: five of them
+    a truncated file the server can only fail to parse, and each one spending
+    the server's once-a-minute scan slot, so the one real report at the end
+    arrived rate limited and had to be replayed.
+
+    The sizes and gaps below are the measured ones.
+    """
+    watch = _watcher(activities)
+    watch.poll()  # cold pass, folder empty
+
+    ride = activities / "2026-09-01-21-27-20.fit"
+    # (bytes on disk, seconds of stillness that followed)
+    trace = [(1102, 22.1), (1896, 40.3), (5992, 35.2),
+             (10088, 40.3), (14184, 10.9)]
+    for size, quiet in trace:
+        _write_unfinished(ride, size)
+        assert _poll_for(watch, quiet) == 0, \
+            f"asked the server to import a ride at {size} bytes"
+
+    # 21:29:49.717 - the save. The header is filled in and the CRC appended.
+    _write(ride, size=15747 - 16)
+    assert _poll_for(watch, 3 * watchmod.SETTLE_WINDOW_S) == 1, \
+        "the finished ride was not reported exactly once"
+    assert _poll_for(watch, 5 * watchmod.SETTLE_WINDOW_S) == 0, \
+        "the finished ride was reported again"
+
+
+def test_a_half_written_fit_is_refused_however_long_it_sits_still(activities):
+    """The structural half, alone: stillness is not evidence of a save.
+
+    A rider who pauses - or a trainer that drops out mid-ride - leaves the
+    file untouched for as long as they like, and no settle window can be long
+    enough for that. What settles it is the file disagreeing with its own
+    header, which is true of every FIT still being written.
+    """
+    watch = _watcher(activities)
+    watch.poll()
+
+    ride = _write_unfinished(activities / "ride.fit", 8192)
+    assert _poll_for(watch, 30 * watchmod.SETTLE_WINDOW_S) == 0, \
+        "a half-written ride was reported once it stopped growing"
+
+    # And the refusal is the file's shape, not the file: saving it reports.
+    _write(ride, size=9000)
+    assert _settled(watch) is True
+
+
+def test_the_settle_window_does_not_shrink_with_the_poll_interval(activities):
+    """The timing half, alone, and the reason it is not counted in passes.
+
+    A poll-count rule means whatever the interval happens to be - two minutes
+    at the default, ten seconds at the --scan-interval floor. Polling faster
+    is a request for the news sooner, not a request to call a file finished
+    sooner, so no number of passes inside the window may report.
+    """
+    watch = _watcher(activities)
+    watch.poll()
+
+    _write(activities / "ride.fit", size=64)
+    assert _poll_for(watch, watchmod.SETTLE_WINDOW_S - 10, step=0.5) == 0, \
+        "a burst of fast passes settled a file inside the window"
+    assert _poll_for(watch, 20, step=0.5) == 1
 
 
 def test_zwifts_in_progress_buffer_is_never_reported(activities):
@@ -81,23 +216,25 @@ def test_zwifts_in_progress_buffer_is_never_reported(activities):
     settle rule alone refuses it and the identical loop passes for an
     ordinary ride. So the buffer is allowed to settle here exactly as a real
     file would, with a real .fit going through the same polls as the control.
-    Zwift does pause between writes, so a settled buffer is the real case.
+    Zwift does pause between writes, so a settled buffer is the real case -
+    and it is a whole FIT while the ride runs, complete header and all
+    (checked on this machine's own folder), which is the other thing that
+    could have let it through.
     """
     watch = _watcher(activities)
     watch.poll()  # cold pass
 
     buffer = _write(activities / "inprogressactivity.fit", size=64)
     assert watch.poll() is False, "reported a file first seen this pass"
-    # Unchanged between two passes: settled, and still not reported.
-    assert watch.poll() is False, "the live recording buffer was reported"
-    assert watch.poll() is False
+    # Still for the whole window: settled, and still not reported.
+    assert _poll_for(watch, 3 * watchmod.SETTLE_WINDOW_S) == 0, \
+        "the live recording buffer was reported"
     assert str(buffer) not in str(watch._reported)
 
     # The control, on the same watcher and the same polls: a file that differs
     # only in its name does get through, so the refusal above is the name.
     _write(activities / "ride.fit", size=64)
-    watch.poll()
-    assert watch.poll() is True
+    assert _settled(watch) is True
 
 
 def test_files_the_listing_would_not_offer_are_never_reported(activities):
@@ -112,8 +249,7 @@ def test_files_the_listing_would_not_offer_are_never_reported(activities):
 
     for name in ("notes.txt", "id_ed25519", "connector.json"):
         _write(activities / name)
-    assert watch.poll() is False
-    assert watch.poll() is False
+    assert _poll_for(watch, 3 * watchmod.SETTLE_WINDOW_S) == 0
 
 
 def test_a_symlink_pointing_out_of_the_folder_is_never_reported(
@@ -143,14 +279,12 @@ def test_a_symlink_pointing_out_of_the_folder_is_never_reported(
     # could ever be imported.
     for size in (128, 256, 512):
         _write(target, size=size)
-        watch.poll()                 # sees the change, not settled yet
-        assert watch.poll() is False, \
+        assert _poll_for(watch, 2 * watchmod.SETTLE_WINDOW_S) == 0, \
             "a symlink out of the folder was reported as news"
 
     # And the rule is not simply "never report": a real file still is.
     _write(activities / "ride.fit")
-    watch.poll()
-    assert watch.poll() is True
+    assert _settled(watch) is True
 
 
 def test_the_watcher_asks_the_listing_whether_a_file_is_in_scope(
@@ -174,8 +308,7 @@ def test_the_watcher_asks_the_listing_whether_a_file_is_in_scope(
 
     monkeypatch.setattr(watchmod, "_in_scope", refuse)
     _write(activities / "ride2.fit")
-    assert watch.poll() is False
-    assert watch.poll() is False
+    assert _poll_for(watch, 2 * watchmod.SETTLE_WINDOW_S) == 0
     assert asked, "the watcher never consulted the listing's scope test"
 
 
@@ -191,8 +324,7 @@ def test_a_removed_file_is_not_news_but_is_forgotten(activities):
     watch = _watcher(activities)
     watch.poll()
     ride = _write(activities / "ride.fit", size=64)
-    watch.poll()
-    assert watch.poll() is True  # settled and reported
+    assert _settled(watch) is True  # settled and reported
     assert len(watch._reported) == 1, "nothing was recorded as reported"
 
     ride.unlink()
@@ -202,8 +334,7 @@ def test_a_removed_file_is_not_news_but_is_forgotten(activities):
 
     # Same name back again: news a second time.
     _write(ride, size=64)
-    watch.poll()
-    assert watch.poll() is True
+    assert _settled(watch) is True
 
 
 def test_a_directory_named_like_a_ride_is_never_reported(activities):
@@ -217,11 +348,64 @@ def test_a_directory_named_like_a_ride_is_never_reported(activities):
     """
     watch = _watcher(activities)
     watch.poll()  # cold pass
-
     (activities / "2026-01-01.fit").mkdir()
     assert watch.poll() is False, "reported a directory first seen this pass"
-    assert watch.poll() is False, "a directory named *.fit was reported"
-    assert watch.poll() is False
+    assert _poll_for(watch, 3 * watchmod.SETTLE_WINDOW_S) == 0, \
+        "a directory named *.fit was reported"
+
+
+# ------------------------------------------------- is the file whole at all
+def test_a_saved_ride_agrees_with_its_own_header(activities):
+    """What ``fit_is_complete`` is actually asserting, stated once.
+
+    A FIT header carries the byte length of the records that follow it. An
+    encoder writes that field as a placeholder, streams the ride, then seeks
+    back to fill it in and appends the two-byte CRC on save - so agreement is
+    the difference between a ride that ended and a ride in progress.
+    """
+    saved = _write(activities / "saved.fit", size=500)
+    assert watchmod.fit_is_complete(str(saved)) is True
+
+    # A chain - several FITs concatenated - is a whole file too.
+    chained = activities / "chained.fit"
+    chained.write_bytes(saved.read_bytes() * 3)
+    assert watchmod.fit_is_complete(str(chained)) is True
+
+
+@pytest.mark.parametrize("name,content", [
+    ("empty.fit", b""),
+    ("stub.fit", b"\x0e"),
+    ("notfit.fit", b"PK\x03\x04" + b"x" * 200),
+    # Saved, then something appended: the lengths no longer add up.
+    ("trailing.fit", None),
+    # The placeholder header a ride still being written carries.
+    ("growing.fit", None),
+])
+def test_anything_that_is_not_a_whole_fit_is_refused(activities, name, content):
+    """All of it fails the same way, because all of it fails to import.
+
+    The daily sweep stays the backstop for a file this cannot make sense of,
+    which is the right trade: reporting one asks the server to import it on
+    every pass, forever, and it can never succeed.
+    """
+    path = activities / name
+    if name == "trailing.fit":
+        _write(path, size=100)
+        path.write_bytes(path.read_bytes() + b"junk")
+    elif name == "growing.fit":
+        _write_unfinished(path, 4096)
+    else:
+        path.write_bytes(content)
+    assert watchmod.fit_is_complete(str(path)) is False
+
+
+def test_a_file_that_cannot_be_opened_is_not_a_finished_ride(activities):
+    """Locked by the writer, gone since the scandir, disk pulled: same answer.
+
+    Not an exception and not a log line - a reason to look again next pass.
+    """
+    assert watchmod.fit_is_complete(str(activities / "gone.fit")) is False
+    assert watchmod.fit_is_complete(str(activities)) is False
 
 
 def test_a_folder_that_is_not_there_yet_is_not_an_error(tmp_path):
