@@ -45,13 +45,41 @@
 	<key>destination</key>
 	<string>export</string>
 
-	<!-- The archive is signed automatically by the release job under
-	     -allowProvisioningUpdates, so the export follows it. Stated rather
-	     than inherited: the project's own CODE_SIGN_STYLE is Manual (ad-hoc,
-	     for unsigned local builds), and an export that quietly picked that up
-	     would look for a manual profile that does not exist. -->
+	<!-- Manual, and it has to be: the archive is signed manually too.
+	     -exportArchive re-signs, so its signing style must agree with the
+	     archive's or it resolves a different identity than the one the
+	     archive was built with.
+
+	     Automatic was tried first and does not work for this project, for a
+	     reason worth writing down. Xcode's automatic signing picks
+	     "development" or "distribution" from the target's ProvisioningStyle
+	     attribute in the .pbxproj, and this project has none - every signing
+	     setting lives in Config/Base.xcconfig so that a credential-less clone
+	     still builds. With no attribute to read, automatic signing resolves
+	     to development, and an archive then fails one of two ways: with
+	     CODE_SIGN_IDENTITY="Apple Distribution" it reports "conflicting
+	     provisioning settings ... automatically signed for development", and
+	     without it, '"WatTracker" has entitlements that require signing with
+	     a development certificate' - the get-task-allow that a development
+	     profile carries. Manual signing with a named profile sidesteps the
+	     guess entirely, and is what a CI job wants anyway: the profile is an
+	     input, not something Xcode decides. -->
 	<key>signingStyle</key>
-	<string>automatic</string>
+	<string>manual</string>
+
+	<!-- The App Store profile, by name. It is created once against the
+	     bundle identifier and the distribution certificate (see
+	     docs/ios-testflight.md) and xcodebuild downloads it from the
+	     developer portal under -allowProvisioningUpdates, so it does not have
+	     to be installed on the runner or carried as a secret.
+
+	     Neither the bundle identifier nor the profile name is an account
+	     identifier, so unlike teamID both can be committed. -->
+	<key>provisioningProfiles</key>
+	<dict>
+		<key>com.wattracker.ios</key>
+		<string>WatTracker App Store</string>
+	</dict>
 
 	<!-- Upload the dSYMs with the build so App Store Connect can symbolicate
 	     crash reports from testers. The dSYMs are debug symbols for our own
