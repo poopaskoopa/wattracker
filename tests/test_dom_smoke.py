@@ -8,8 +8,8 @@ assert on rendered geometry plus a clean JS console.
 
 Requires the optional `playwright` package AND its chromium binary
 (`playwright install chromium`, a ~150MB download outside pip). Both are
-checked below; when either is missing the whole module SKIPS, so CI and
-machines without the browser still go green.
+checked below; when either is missing the whole module SKIPS, so local
+machines without the browser still go green. CI installs Chromium explicitly.
 
 Run just these:      pytest -m browser
 Skip them:           pytest -m "not browser"
@@ -191,9 +191,10 @@ def live_server(tmp_path):
                 },
             },
         )
-        # Anchor the plan inside the currently displayed calendar month: the
-        # Monday on/before the 8th always falls in this month.
-        start = dt.date(today.year, today.month, 8)
+        # Start on the next Monday so the plan always has a future workout,
+        # including when today is after the eighth or at a month boundary. The
+        # calendar request below follows the plan into its month explicitly.
+        start = today + dt.timedelta(days=7 - today.weekday())
         r = c.post(
             "/generate/plan",
             data={
@@ -211,6 +212,8 @@ def live_server(tmp_path):
     try:
         yield type("Server", (), {"__str__": lambda self: base,
                                   "base": base, "plan_id": plan_id,
+                                  "plan_year": start.year,
+                                  "plan_month": start.month,
                                   "uid": uid,
                                   "detail_activity_id": detail_activity_id})()
     finally:
@@ -316,7 +319,10 @@ def test_activity_detail_combines_and_independently_toggles_series(
 def test_calendar_workout_click_opens_modal_with_drawn_profile(page, live_server,
                                                                console_errors):
     """Calendar renders clickable workout cells; the modal draws a real SVG."""
-    page.goto(f"{live_server.base}/calendar")
+    page.goto(
+        f"{live_server.base}/calendar?year={live_server.plan_year}"
+        f"&month={live_server.plan_month}"
+    )
     page.wait_for_load_state("networkidle")
 
     cells = page.locator(".cal-workout[data-workout-id]")

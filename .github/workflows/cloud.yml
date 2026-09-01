@@ -67,6 +67,13 @@ jobs:
           .ci-venv/bin/python -c "import azure.data.tables, azure.identity, azure.storage.blob, cryptography"
           .ci-venv/bin/python -c "import wattracker.cloud.runtime"
 
+      - name: Install Playwright Chromium
+        # The DOM smoke tests are intentionally optional for local checkouts,
+        # but this runner is the repository's browser gate. Install the exact
+        # browser required by the Playwright package in the venv above so a
+        # missing cache cannot silently turn UI coverage into skips.
+        run: .ci-venv/bin/python -m playwright install chromium
+
       - name: Run full test suite
         env:
           # Pin to the workspace. Without it pytest can import a different

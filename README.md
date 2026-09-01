@@ -169,7 +169,8 @@ They need a browser binary that pip does not install:
 playwright install chromium   # ~150MB, one-off
 ```
 
-Without it (CI, fresh checkouts) the whole module **skips** — it never fails.
+Without it on a local checkout the whole module **skips** — it never fails;
+the Cloud CI job installs Chromium before running the suite.
 They run by default and add roughly 15s. To select or exclude them:
 
 ```sh
