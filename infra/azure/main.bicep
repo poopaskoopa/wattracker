@@ -242,7 +242,7 @@ resource readApp 'Microsoft.App/containerApps@2023-05-01' = {
           }
         ]
         resources: {
-          cpu: 0.5
+          cpu: any('0.5')
           memory: '1Gi'
         }
       }]
@@ -316,7 +316,7 @@ resource syncApp 'Microsoft.App/containerApps@2023-05-01' = {
           }
         ]
         resources: {
-          cpu: 0.5
+          cpu: any('0.5')
           memory: '1Gi'
         }
       }]
@@ -601,6 +601,7 @@ resource budget 'Microsoft.Consumption/budgets@2023-05-01' = {
   name: 'wattracker-monthly-budget'
   properties: {
     amount: 10
+    category: 'Cost'
     timeGrain: 'Monthly'
     timePeriod: {
       startDate: budgetStartDate
