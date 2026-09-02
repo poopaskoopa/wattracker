@@ -37,6 +37,8 @@ contract is:
 | `POST /api/v1/context/refresh` | read | signed device credential + APIM proof + verified subject | `read` |
 | `POST /api/v1/devices/pairing-codes` | read | APIM subscription + signed writer request + APIM proof + verified subject | `write` |
 | `POST /api/v1/devices/pair` | read | one-time pairing code + APIM proof | — |
+| `GET /api/v1/devices` | read | APIM subscription + signed writer-or-device request + APIM proof + verified subject | `read` |
+| `POST /api/v1/devices/{credential_id}/revoke` | read | APIM subscription + signed writer-or-device request + APIM proof + verified subject | `read` |
 | `GET /api/v1/context` | read | reader context + APIM proof + verified subject | — |
 | `GET /api/v1/context/calendar` | read | reader context | — |
 | `GET /api/v1/context/activities` | read | reader context | — |
@@ -161,9 +163,8 @@ same 404 body and headers as an unknown reader context.
 Because refresh consumes replay nonces, the read plane now claims them
 durably. It writes those claims to the `CloudAuth` table its managed identity
 already writes; it still never touches `CloudReplay`, for which it holds no
-role. Revocation of a device is `CredentialRegistry.revoke_device`, which is
-library-only for the same reason writer and reader revocation is: there is no
-revocation route yet.
+role. Revocation of a device is reachable over HTTP — see "Revoking a lost
+device" below. Writer and reader revocation remain library-only.
 
 Both Container Apps use `minReplicas=0` and `maxReplicas=1`; cold starts and
 single-instance throughput are accepted operational tradeoffs.
@@ -362,6 +363,146 @@ only real secrets on those routes once no JWT is validated. That is bootstrap,
 it is operator-driven, and it is out of scope here — but it must not be
 forgotten when the gateway goes.
 
+## Revoking a lost device
+
+A phone goes missing. The rider does not have to be at the desktop, and they
+must not have to wait for a credential to expire — a device credential is
+durable by design, which is exactly what makes revoking it the only way to end
+its access.
+
+```
+GET  /api/v1/devices                          list this rider's devices
+POST /api/v1/devices/{credential_id}/revoke   end one device's access
+```
+
+Both live on the **read plane**, because both write `CloudAuth` and the read
+plane's managed identity is the only one that may. Both are signed with the
+writer envelope (`X-Writer-*`, the same `canonical_request` framing, freshness
+window and replay guard as every other signed route), and `_writer_auth`
+resolves a writer credential *or* a paired device from it. The capability
+asserted is `read`, which every writer and every device carries.
+
+**The scope is the caller's, always.** It is `(namespace,
+local_user_scope)` taken from the authenticated credential. No request field,
+path segment or header names a namespace, a scope, an installation or another
+rider, and nothing reads one if it does.
+
+**Who may revoke.** Any credential in the same scope: the desktop writer,
+another paired device, or the target device revoking itself. Requiring the
+desktop would mean the revocation waits until the rider gets home, with the
+lost phone reading their data in the meantime. The cost is that a stolen phone
+can revoke its siblings — bounded on purpose, because only *device*
+credentials can be revoked here. The desktop's writer credential cannot, so a
+stolen device can force a re-pair and nothing more; it can never cut the rider
+off from their own sync plane.
+
+**Cross-namespace is 404, never 403.** An id in another rider's namespace, an
+id in another local scope, an unknown id, a malformed id, and an id that names
+a writer credential, a quota counter or the kill-switch row all return the
+identical body, status and headers as every other not-found in this API. A 403
+would confirm that a credential exists somewhere the caller cannot see, which
+is the whole attack. Revocation is idempotent for the same reason: revoking an
+already-revoked device answers exactly as revoking a live one does, so a retry
+after a timeout is safe and the status code carries no state either.
+
+**A revoked device fails the way an unknown one does.** `resolve_device`
+returns `None` for revoked and unknown alike, so refresh answers the same 404
+either way.
+
+**And it fails immediately, not in five minutes.** A reader context is a
+bearer token with a 300-second life, so a revocation that only stopped
+*refresh* would leave the lost phone reading for up to five minutes — a delay,
+not a revocation. Every context minted for a device therefore records the
+device that minted it, and `read_context_token` re-resolves that device on
+each use: revoked or unknown, the context stops resolving and the read answers
+the same 404 as an unknown token. Contexts minted at enrollment record no
+device and are unaffected. The cost is one extra table read per read request
+on a deployment whose whole monthly bill is a few dollars.
+
+**A quota refusal never blocks a revocation.** The call is metered after the
+fact rather than admitted before it, as pairing already is: a rider who has
+spent the day's read allowance must still be able to revoke a lost phone. The
+budget kill switch does stop it, deliberately — that is a deployment-wide
+decision, not a per-rider one.
+
+**The listing carries no key material.** Each entry is `credential_id`,
+`label`, `capabilities`, `created_at`, `last_seen_at`, `revoked` and `self`,
+built by naming those fields rather than by filtering a stored record, so a
+field added to `DeviceCredential` later cannot appear here by default. No
+verification key, no subscription key, not even a digest of one, no signature
+algorithm, no namespace and no local scope. Revoked devices stay listed and
+flagged: "did the revocation stick?" is the question the rider asks next.
+
+`label` is the optional name a device gives itself at pairing (bounded, no
+control characters, validated *before* the single-use code is spent).
+`last_seen_at` is written on each successful refresh into a row of its own —
+never onto the credential record. Rewriting the credential on the refresh path
+would race a concurrent revocation and could write the pre-revocation record
+back, silently resurrecting the device the rider just revoked.
+
+A device row now carries its own `credential_id` alongside the digest that
+addresses it, because a digest cannot be inverted and a rider who cannot see
+an id cannot revoke it. The stored id is re-hashed and checked against its own
+row key before it is used, so an edited payload describes a row that is
+skipped rather than a device that appears in someone else's listing. Devices
+paired before this change carry no id in their row and are not listed; they
+remain revocable by id.
+
+### The expired-row sweep
+
+`CloudAuth` accumulates rows that nothing will ever read again: a reader
+context and its index per refresh, a replay claim per signed request, spent
+invitations and spent pairing codes. Azure Tables has no TTL, so until now the
+table grew without bound — nothing could delete a row, because no managed
+identity held a table `entities/delete` action.
+
+`readAuthSweepRole` grants the read identity one, through
+`authSweeperRoleDefinition`: a custom role whose only data action is
+`entities/delete`, assignable only to the `CloudAuth` table. It is a separate
+role rather than a fourth action on `authManagerRoleDefinition` so the grant
+that removes rows is legible and assignable on its own. The sync identity is
+unchanged and holds read-only on `CloudAuth`.
+
+`ExpiredRecordSweeper` runs the sweep opportunistically, on routes that have
+already written: a pass bounded twice over — 200 rows examined per record
+kind and at most 200 deleted in total — at most once every 900 seconds per
+replica, logged and swallowed on failure, after the request's real work is
+durable. Both bounds are latency somebody's refresh is paying for, and both
+are set against the write rate they must keep up with: four devices refreshing
+every five minutes write roughly 3,500 expiring rows a day, about 36 per
+quarter-hour, so a steady-state pass is short and a backlog drains over a few
+hours instead of in one long request. A retention rule with no enforcement was
+the alternative and was rejected — there is no operator CLI and no cleanup job,
+so a documented rule would have bounded nothing.
+
+**It cannot delete the kill switch.** Azure table roles cannot be conditioned
+on a row key, so the grant itself reaches every row in `CloudAuth`. Three
+things in the application stand between it and the two rows that matter:
+
+- **An allowlist of record kinds.** A row is a candidate only because its kind
+  is named in `SWEEPABLE_RECORD_KINDS` (`context`, `context-index`,
+  `invitation`, `device-pairing`, `nonce`), never because a scope or expiry
+  test happened to match it.
+- **A denylist, checked at construction and again on every pass.**
+  `NEVER_SWEEP_RECORD_KINDS` names `kill-switch`, `quota-counter`, `writer`,
+  `device`, `device-seen` and `health`. Constructing a sweeper over any of
+  them raises.
+- **Expiry.** Only a row already past its own `expires_at` plus a 300-second
+  grace window is removed. The kill-switch and counter rows carry no
+  `expires_at` at all, so even inside the allowlist they would never qualify;
+  and a row whose payload will not decode is treated as live and left alone.
+
+An absent kill-switch row reads as *enabled*. Deleting one would therefore
+re-enable spending on a deployment somebody deliberately killed — no error, no
+log, and the next `state()` refresh inside the 30-second TTL reporting a
+healthy deployment. `tests/test_cloud_security.py` sets the switch, runs the
+sweep and asserts `read_kill_switch(backend)` still reports it disabled.
+
+Deleting an *expired* replay claim cannot re-open a replay: a request carrying
+that nonce is outside the 300-second timestamp-freshness window long before
+its claim expires at 600 seconds. Deleting an unexpired one could, which is
+why expiry is the whole test.
+
 ## Local offline contract
 
 The desktop app remains the source of truth while offline. The opt-in client
@@ -414,10 +555,11 @@ remains for tests and local development.
 
 Counters are addressed by `(namespace, scope-or-installation, metric)` and
 carry their UTC day inside the row; the first charge of a new day reclaims that
-row in place and discards yesterday's total. Nothing is deleted, because no
-managed identity holds a table `entities/delete` action, and nothing
-accumulates: the row count is bounded by the number of (subject, metric) pairs,
-not by elapsed days. Counter rows live in the same table each plane already
+row in place and discards yesterday's total. A counter row is never deleted —
+`quota-counter` is one of the record kinds the expired-row sweep is forbidden
+to touch, and it carries no expiry to qualify on — and nothing accumulates: the
+row count is bounded by the number of (subject, metric) pairs, not by elapsed
+days. Counter rows live in the same table each plane already
 writes for replay claims — `CloudAuth` for the read plane, `CloudReplay` for
 the sync plane — so no new table and no new role is required. The two planes
 therefore count into separate tables, which bounds a rider's worst case at one
@@ -477,10 +619,14 @@ so reading "carry on" out of an error is the exact failure it exists to
 prevent. An absent row is the one reading of "enabled" that is not a guess: a
 row is created the first time the switch is set and is never removed.
 
-*Clearing it is an update, never a delete.* No deployed managed identity holds
-a table `entities/delete` action, so clearing writes both levels enabled back
-into the same row — the same constraint that made the quota counters reclaim
-their row in place.
+*Clearing it is an update, never a delete.* Clearing writes both levels
+enabled back into the same row — the same shape that makes the quota counters
+reclaim their row in place. Since #153 the read identity does hold a table
+`entities/delete` action on `CloudAuth`, for the expired-row sweep, so this is
+no longer guaranteed by RBAC alone: `kill-switch` is named in
+`NEVER_SWEEP_RECORD_KINDS`, it carries no `expires_at` to qualify on, and
+`tests/test_cloud_kill_switch.py` fails the build if any kill-switch path
+reaches for a delete. See "The expired-row sweep" above.
 
 *Operator path.* `wattracker.cloud` exports `read_kill_switch`,
 `set_kill_switch`, `disable_writes` (the 80% action), `disable_public_api` (the
@@ -519,7 +665,13 @@ not a hard billing ceiling.
 - [ ] Confirm storage public network access, anonymous blobs, Shared Key, and
       HTTP are disabled; TLS 1.2 is enforced.
 - [ ] Resolve Blob/Table names through the private DNS zones from both apps.
-- [ ] Verify each managed identity has only its documented data-plane role.
+- [ ] Verify each managed identity has only its documented data-plane role —
+      in particular that `entities/delete` on `CloudAuth` is held by the read
+      identity alone, through `authSweeperRoleDefinition` and nothing else.
+- [ ] Throw the kill switch, let the read plane sweep, and confirm the switch
+      still reads disabled. An absent row reads as enabled.
+- [ ] Revoke a device and confirm its refresh and its reads both fail exactly
+      as an unknown device's do, across a replica restart.
 - [ ] Verify enrollment rejects an unapproved tenant/device and pairing tokens
       are one-time, expiring, revocable, and absent from logs.
 - [ ] Exercise read, push, status, CORS, subscription quota/rate limits, and

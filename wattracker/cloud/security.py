@@ -11,12 +11,16 @@ import hashlib
 import hmac
 import base64
 import json
+import logging
 import re
 import secrets
 import threading
 import time
 from dataclasses import dataclass, field, replace
 from typing import Any, Final, Mapping, Protocol
+
+
+_log = logging.getLogger(__name__)
 
 
 INSTALLATION_ID_BYTES: Final = 32
@@ -91,6 +95,67 @@ DEFAULT_DEVICE_PAIRING_TTL_SECONDS: Final = 600.0
 MAX_DEVICE_PAIRING_TTL_SECONDS: Final = 900.0
 _PAIRING_CODE_DOMAIN: Final = b"wattracker-cloud-device-pairing-code-v1\x00"
 _PAIRING_RECORD_KIND: Final = "device-pairing"
+
+# ---------------------------------------------------------------------------
+# Record kinds, and which of them the expired-row sweep may remove
+# ---------------------------------------------------------------------------
+# The shared auth table holds several unrelated kinds of row, and exactly two
+# of them are *state a deployment cannot lose*: the budget kill switch and the
+# daily quota counters.  Neither carries an expiry, and an absent kill-switch
+# row reads as ENABLED -- so deleting one would silently re-enable spending on
+# a deployment somebody deliberately killed, with no error and no log.
+#
+# The sweep is therefore an allowlist, not a filter: a kind is swept only
+# because it is named here, never because a scope or expiry test happened to
+# match it.  ``NEVER_SWEEP_RECORD_KINDS`` restates the exclusion by name so a
+# future kind added to the allowlist by mistake is refused at construction
+# rather than deleted in production.  The two sets are asserted disjoint.
+#
+# The kill switch and counter kinds are spelled literally here because
+# ``limits`` imports *this* module; ``tests/test_cloud_security.py`` imports
+# both and asserts the constants agree.
+DEVICE_SEEN_RECORD_KIND: Final = "device-seen"
+SWEEPABLE_RECORD_KINDS: Final = frozenset({
+    "context",        # reader contexts, one per refresh
+    "context-index",  # their id -> token-digest index, one per context
+    "invitation",     # operator enrollment invitations
+    "device-pairing", # single-use pairing codes
+    "nonce",          # replay claims; the read plane claims these in CloudAuth
+})
+NEVER_SWEEP_RECORD_KINDS: Final = frozenset({
+    "kill-switch",    # absent reads as ENABLED -- deleting re-enables spending
+    "quota-counter",  # absent reads as zero -- deleting hands out free quota
+    "writer",         # durable credentials; revocation is an update, not a delete
+    "device",
+    DEVICE_SEEN_RECORD_KIND,
+    "health",         # the startup access probe
+})
+if SWEEPABLE_RECORD_KINDS & NEVER_SWEEP_RECORD_KINDS:  # pragma: no cover
+    raise RuntimeError("a sweepable record kind is also marked never-sweep")
+
+# How far past its own expiry a row must be before it is deleted.  Replicas do
+# not share a clock, so a row deleted the instant it expires here may still be
+# live over there; five minutes is longer than any skew these containers see
+# and costs nothing but a handful of rows.
+SWEEP_GRACE_SECONDS: Final = 300.0
+# Sweeping is opportunistic work attached to a request, so a pass is bounded
+# twice over -- how many rows it will look at per kind, and how many it will
+# delete in total -- because both are latency somebody's refresh is paying
+# for.  Anything a pass does not reach is reached by the next one.
+#
+# The numbers are set against the write rate they have to keep up with: four
+# devices refreshing every five minutes write roughly 3,500 expiring rows a
+# day, which is about 36 per quarter-hour.  A 200-row deletion budget every
+# 900 seconds is five times that, so a pass is short in the steady state and
+# a backlog drains over a few hours rather than in one long request.
+SWEEP_BATCH_LIMIT: Final = 200
+SWEEP_DELETE_LIMIT: Final = 200
+SWEEP_INTERVAL_SECONDS: Final = 900.0
+
+_MAX_DEVICE_LABEL: Final = 48
+# Two riders, four devices.  The ceiling exists so a listing is bounded by
+# something other than what happens to be in the table.
+MAX_DEVICE_LISTING: Final = 64
 
 
 class SecurityStateUnavailable(RuntimeError):
@@ -176,6 +241,12 @@ class SecurityStateBackend(Protocol):
         expires_at: float,
         now: float,
     ) -> int | None: ...
+
+    def delete(self, kind: str, key: str) -> bool: ...
+
+    def iter_records(
+        self, kind: str, *, limit: int
+    ) -> list[tuple[str, dict[str, Any] | None]]: ...
 
 
 class MemorySecurityStateBackend:
@@ -270,6 +341,30 @@ class MemorySecurityStateBackend:
             }
             return total
 
+    def delete(self, kind: str, key: str) -> bool:
+        with self._lock:
+            return self._records.pop((kind, key), None) is not None
+
+    def iter_records(
+        self, kind: str, *, limit: int
+    ) -> list[tuple[str, dict[str, Any] | None]]:
+        """Return up to ``limit`` stored rows of one kind, as ``(key, value)``.
+
+        Consumed rows are included: "consumed" is not "gone", and the sweep
+        decides on the record's own expiry rather than on its consumption.
+        """
+
+        bound = _validate_capacity(limit)
+        found: list[tuple[str, dict[str, Any] | None]] = []
+        with self._lock:
+            for (stored_kind, stored_key), value in self._records.items():
+                if stored_kind != kind:
+                    continue
+                found.append((stored_key, dict(value)))
+                if len(found) >= bound:
+                    break
+        return found
+
 
 class AzureTableSecurityStateBackend:
     """Azure Table implementation shared by the read and sync Container Apps.
@@ -305,9 +400,14 @@ class AzureTableSecurityStateBackend:
         return cls(service.get_table_client(table_name))
 
     @staticmethod
-    def _row_key(kind: str, key: str) -> str:
-        if not re.fullmatch(r"[a-z-]{1,32}", kind):
+    def _require_kind(kind: str) -> str:
+        if not isinstance(kind, str) or not re.fullmatch(r"[a-z-]{1,32}", kind):
             raise ValueError("security record kind is invalid")
+        return kind
+
+    @classmethod
+    def _row_key(cls, kind: str, key: str) -> str:
+        cls._require_kind(kind)
         if not re.fullmatch(r"[0-9a-f]{64}", key):
             raise ValueError("security record key is invalid")
         return f"{kind}:{key}"
@@ -549,6 +649,69 @@ class AzureTableSecurityStateBackend:
         # the resource it was meant to pay for.
         raise SecurityStateUnavailable("quota counter is too contended to charge")
 
+    def delete(self, kind: str, key: str) -> bool:
+        """Remove one row, addressed exactly as every other method addresses it.
+
+        This is the only delete in the package, and it is reachable only
+        through :class:`ExpiredRecordSweeper`, which will not name a kind
+        outside :data:`SWEEPABLE_RECORD_KINDS`.  ``_row_key`` validates the
+        kind and key here as well, so a caller cannot address a row this
+        table has no other way to reach.
+        """
+
+        row_key = self._row_key(kind, key)
+        try:
+            self._table.delete_entity(
+                partition_key=_AUTH_PARTITION, row_key=row_key
+            )
+            return True
+        except Exception as exc:
+            if self._not_found(exc):
+                return False
+            raise
+
+    def iter_records(
+        self, kind: str, *, limit: int
+    ) -> list[tuple[str, dict[str, Any] | None]]:
+        """Return up to ``limit`` rows of one kind, as ``(key, value)``.
+
+        Row keys are ``"<kind>:<64 hex>"``, so one kind is a contiguous range
+        of the partition: everything from ``"<kind>:"`` up to ``"<kind>:g"``,
+        because ``g`` is the first character past the hexadecimal alphabet.
+        The bound matters for correctness as well as cost -- ``"context"`` and
+        ``"context-index"`` share a prefix, and ``-`` sorts before ``:``, so
+        the index rows fall outside the ``context`` range rather than being
+        returned as malformed members of it.
+
+        A row whose payload will not decode is returned with a ``None`` value
+        rather than skipped or repaired.  The sweep treats that as "not
+        expired" and leaves it alone, which is the safe direction: a row
+        nobody can read is not a row anybody may delete.
+        """
+
+        kind_text = self._require_kind(kind)
+        bound = _validate_capacity(limit)
+        low = f"{kind_text}:"
+        high = f"{kind_text}:g"
+        query = (
+            f"PartitionKey eq '{_AUTH_PARTITION}' "
+            f"and RowKey ge '{low}' and RowKey lt '{high}'"
+        )
+        found: list[tuple[str, dict[str, Any] | None]] = []
+        for entity in self._table.query_entities(query_filter=query):
+            row_key = str(entity["RowKey"])
+            stored_kind, _, stored_key = row_key.partition(":")
+            if stored_kind != kind_text or not re.fullmatch(r"[0-9a-f]{64}", stored_key):
+                continue
+            try:
+                value: dict[str, Any] | None = self._decode(entity)
+            except (KeyError, TypeError, ValueError, json.JSONDecodeError):
+                value = None
+            found.append((stored_key, value))
+            if len(found) >= bound:
+                break
+        return found
+
     def verify_access(self, *, writable: bool) -> None:
         """Fail startup if the managed identity lacks required table access."""
         probe_key = hashlib.sha256(b"wattracker-cloud-auth-access-probe").hexdigest()
@@ -557,6 +720,139 @@ class AzureTableSecurityStateBackend:
         value = self.read("health", probe_key)
         if writable and value != {"ready": True}:
             raise RuntimeError("durable cloud auth registry is not writable")
+
+
+def _record_has_expired(value: object, horizon: float) -> bool:
+    """Whether a stored row's *own* expiry is already behind ``horizon``.
+
+    Nothing else makes a row deletable.  A row with no expiry, a non-numeric
+    one, a boolean one (``bool`` is an ``int`` in Python, and a JSON ``true``
+    must not read as the epoch), or a payload that would not decode at all is
+    reported as live and is left where it is.
+    """
+
+    if not isinstance(value, Mapping):
+        return False
+    expires_at = value.get("expires_at")
+    if isinstance(expires_at, bool) or not isinstance(expires_at, (int, float)):
+        return False
+    try:
+        return float(expires_at) <= horizon
+    except (OverflowError, ValueError):
+        return False
+
+
+class ExpiredRecordSweeper:
+    """Delete auth rows whose own expiry has passed, and nothing else.
+
+    Reader contexts, their id index, invitations, pairing codes and replay
+    claims all accumulate for as long as the deployment runs: a phone
+    refreshing every five minutes writes three rows an hour that nothing ever
+    reads again.  Azure Tables has no TTL, so somebody has to remove them.
+
+    Three properties make that safe to attach to a request:
+
+    * **An allowlist of kinds.**  A row is a candidate only because its kind
+      is named in :data:`SWEEPABLE_RECORD_KINDS`.  The budget kill switch and
+      the quota counters are excluded *by kind*, explicitly and twice -- not
+      by relying on a scope or expiry test to miss them.  Deleting the
+      kill-switch row would re-enable spending on a deployment somebody
+      deliberately killed, and ``DurableKillSwitch`` would report the
+      deployment healthy within one 30-second TTL, with no error and no log.
+    * **Expiry, plus a grace window.**  Only a row already past
+      ``expires_at + grace`` goes.  Deleting an *unexpired* replay claim would
+      re-open a captured request to replay, so expiry is the whole test and
+      the grace window absorbs clock skew between replicas.  Deleting an
+      expired one cannot: a request carrying that nonce is outside the
+      300-second freshness window long before its claim expires at 600.
+    * **Bounded and best-effort.**  A pass touches at most ``batch_limit``
+      rows per kind and runs at most once per ``interval_seconds`` per
+      process.  A failure is logged and swallowed: a request must never fail
+      because housekeeping did.
+    """
+
+    def __init__(
+        self,
+        backend: SecurityStateBackend,
+        *,
+        kinds: object = SWEEPABLE_RECORD_KINDS,
+        grace_seconds: float = SWEEP_GRACE_SECONDS,
+        batch_limit: int = SWEEP_BATCH_LIMIT,
+        delete_limit: int = SWEEP_DELETE_LIMIT,
+        interval_seconds: float = SWEEP_INTERVAL_SECONDS,
+        clock=time.time,
+    ) -> None:
+        if backend is None:
+            raise ValueError("a state backend is required")
+        for name in ("delete", "iter_records"):
+            if not callable(getattr(backend, name, None)):
+                raise ValueError("backend cannot sweep expired records")
+        selected = frozenset(kinds)  # type: ignore[arg-type]
+        forbidden = selected & NEVER_SWEEP_RECORD_KINDS
+        if forbidden:
+            raise ValueError(
+                "these record kinds must never be swept: "
+                + ", ".join(sorted(forbidden))
+            )
+        if not selected or not selected <= SWEEPABLE_RECORD_KINDS:
+            raise ValueError("only expiring record kinds may be swept")
+        if (
+            isinstance(grace_seconds, bool)
+            or not isinstance(grace_seconds, (int, float))
+            or grace_seconds < 0
+        ):
+            raise ValueError("grace_seconds must not be negative")
+        self._backend = backend
+        self._kinds = tuple(sorted(selected))
+        self._grace = float(grace_seconds)
+        self._batch_limit = _validate_capacity(batch_limit)
+        self._delete_limit = _validate_capacity(delete_limit)
+        self._interval = _validate_ttl(interval_seconds)
+        self._clock = clock
+        self._lock = threading.Lock()
+        self._next_sweep: float | None = None
+
+    @property
+    def kinds(self) -> tuple[str, ...]:
+        return self._kinds
+
+    def sweep(self, *, now: float | None = None) -> int:
+        """Run one bounded pass and return how many rows were removed."""
+
+        current = self._clock() if now is None else float(now)
+        horizon = current - self._grace
+        removed = 0
+        for kind in self._kinds:
+            # Re-asserted per pass rather than trusted from construction: this
+            # is the check that must hold even if the allowlist is edited.
+            if kind in NEVER_SWEEP_RECORD_KINDS or kind not in SWEEPABLE_RECORD_KINDS:
+                continue
+            for key, value in self._backend.iter_records(
+                kind, limit=self._batch_limit
+            ):
+                if removed >= self._delete_limit:
+                    return removed
+                if not _record_has_expired(value, horizon):
+                    continue
+                if self._backend.delete(kind, key):
+                    removed += 1
+        return removed
+
+    def maybe_sweep(self, *, now: float | None = None) -> int:
+        """Sweep at most once per interval; never raise into a request path."""
+
+        current = self._clock() if now is None else float(now)
+        with self._lock:
+            if self._next_sweep is not None and current < self._next_sweep:
+                return 0
+            # Booked before the pass, not after, so a slow or failing sweep
+            # cannot be retried on every request.
+            self._next_sweep = current + self._interval
+        try:
+            return self.sweep(now=current)
+        except Exception:  # pragma: no cover - defensive
+            _log.warning("expired cloud auth record sweep failed", exc_info=True)
+            return 0
 
 
 class PublicKeyUnavailable(RuntimeError):
@@ -592,6 +888,45 @@ def _require_local_scope(value: object) -> str:
     if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._~-]{0,255}", scope):
         raise ValueError("local_user_scope is too long")
     return scope
+
+
+def _require_device_label(value: object) -> str:
+    """Validate the human name a rider gives a device before it is stored.
+
+    A label exists so the rider can tell "the phone I lost" from "the iPad on
+    the desk" in the listing, which is the whole point of listing devices
+    before revoking one.  It is caller-supplied text that is stored and later
+    echoed back, so it is bounded and stripped of every control character
+    here rather than wherever it is eventually rendered.
+    """
+
+    text = _require_text(value, "device label")
+    if len(text) > _MAX_DEVICE_LABEL:
+        raise ValueError("device label is too long")
+    if any(ord(char) < 0x20 or ord(char) == 0x7F for char in text):
+        raise ValueError("device label must not contain control characters")
+    if not text.strip():
+        raise ValueError("device label must not be blank")
+    return text
+
+
+def validate_device_label(value: object) -> str:
+    """Validate an externally supplied device label at the trust boundary.
+
+    Public because the pairing route must reject a bad label *before* it
+    spends the single-use code, exactly as it validates the public key first.
+    """
+
+    return _require_device_label(value)
+
+
+def _require_timestamp_value(value: object, name: str) -> float:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise ValueError(f"{name} is invalid")
+    number = float(value)
+    if number < 0:
+        raise ValueError(f"{name} is invalid")
+    return number
 
 
 def _require_signature_algorithm(value: object, allowed: frozenset[str]) -> str:
@@ -1083,6 +1418,11 @@ class DeviceCredential:
     active: bool = True
     revoked: bool = False
     subject: str | None = field(default=None, repr=False, compare=False)
+    # Listing metadata.  Neither is authorization state: nothing reads them to
+    # decide anything, and ``last seen`` deliberately lives in its own row
+    # rather than here (see ``CredentialRegistry.record_device_seen``).
+    label: str | None = field(default=None, repr=False, compare=False)
+    created_at: float = field(default=0.0, repr=False, compare=False)
 
     def __post_init__(self) -> None:
         _require_opaque_id(self.credential_id, "credential_id")
@@ -1092,6 +1432,11 @@ class DeviceCredential:
         _require_bytes(self.subscription_key, "subscription_key", nonempty=False)
         _require_bytes(
             self.subscription_verifier, "subscription_verifier", nonempty=False
+        )
+        if self.label is not None:
+            object.__setattr__(self, "label", _require_device_label(self.label))
+        object.__setattr__(
+            self, "created_at", _require_timestamp_value(self.created_at, "created_at")
         )
         if not self.subscription_key and not self.subscription_verifier:
             raise ValueError("subscription verifier is required")
@@ -1167,6 +1512,12 @@ class _ContextRecord:
     context: ReaderContext
     token_digest: bytes
     expires_at: float
+    # The device that minted this context, when a device did.  A reader
+    # context is a bearer token with a 300-second life, so without this a
+    # revoked phone keeps reading for up to five minutes after the rider
+    # revokes it -- which is not a revocation, it is a delay.  Contexts minted
+    # at enrollment carry no device and are unaffected.
+    device_credential_id: str | None = None
 
 
 def _encode_bytes(value: bytes) -> str:
@@ -1253,6 +1604,17 @@ def _device_value(credential: DeviceCredential) -> dict[str, Any]:
         credential.subscription_key
     )
     return {
+        # The row is *addressed* by the digest of this id, as every row here
+        # is.  Carrying the id in the payload as well is what makes a device
+        # listable at all -- a digest cannot be inverted, and a rider who
+        # cannot see an id cannot revoke it.  It costs nothing: a credential
+        # id authenticates nothing on its own (the signature and the
+        # subscription key do), it is handed to the client at pairing, and
+        # only the stored *digest* of the subscription key is here.
+        # ``_device_id_from_value`` re-derives the digest before trusting it.
+        "credential_id": credential.credential_id,
+        "label": credential.label,
+        "created_at": credential.created_at,
         "namespace": credential.namespace,
         "local_user_scope": credential.local_user_scope,
         "verification_key": _encode_bytes(credential.verification_key),
@@ -1265,10 +1627,33 @@ def _device_value(credential: DeviceCredential) -> dict[str, Any]:
     }
 
 
+def _device_id_from_value(row_key: str, value: Mapping[str, Any]) -> str | None:
+    """The credential id a device row claims, proven against its own address.
+
+    A row is addressed by ``sha256(credential_id)``.  Re-deriving that digest
+    from the stored id and comparing it to the row key means a payload edited
+    to name a different credential describes a row that is simply skipped,
+    rather than a device that appears in some other rider's listing.
+    """
+
+    stored = value.get("credential_id")
+    if not isinstance(stored, str) or _HEX_ID_RE.fullmatch(stored) is None:
+        return None
+    try:
+        expected = bytes.fromhex(row_key)
+    except (TypeError, ValueError):
+        return None
+    if not hmac.compare_digest(_digest_token(stored), expected):
+        return None
+    return stored
+
+
 def _device_from_value(
     credential_id: str, value: Mapping[str, Any]
 ) -> DeviceCredential:
     subject = value.get("subject")
+    label = value.get("label")
+    created_at = value.get("created_at", 0.0)
     # A persisted record without an explicit capability set is not assumed to
     # be anything; it is rejected rather than silently granted a default.
     return DeviceCredential(
@@ -1284,6 +1669,11 @@ def _device_from_value(
         active=bool(value["active"]),
         revoked=bool(value["revoked"]),
         subject=None if subject is None else _require_text(subject, "subject"),
+        label=None if label is None else _require_device_label(label),
+        created_at=(
+            0.0 if created_at is None
+            else _require_timestamp_value(created_at, "created_at")
+        ),
     )
 
 
@@ -1297,11 +1687,13 @@ def _context_value(record: _ContextRecord) -> dict[str, Any]:
         "revoked": context.revoked,
         "subject": context.subject,
         "expires_at": record.expires_at,
+        "device_credential_id": record.device_credential_id,
     }
 
 
 def _context_from_value(value: Mapping[str, Any]) -> _ContextRecord:
     subject = value.get("subject")
+    device_credential_id = value.get("device_credential_id")
     context = ReaderContext(
         context_id=_require_opaque_id(value["context_id"], "context_id"),
         namespace=_require_namespace(value["namespace"]),
@@ -1310,7 +1702,15 @@ def _context_from_value(value: Mapping[str, Any]) -> _ContextRecord:
         revoked=bool(value["revoked"]),
         subject=None if subject is None else _require_text(subject, "subject"),
     )
-    return _ContextRecord(context, b"", float(value["expires_at"]))
+    return _ContextRecord(
+        context,
+        b"",
+        float(value["expires_at"]),
+        device_credential_id=(
+            None if device_credential_id is None
+            else _require_opaque_id(device_credential_id, "device_credential_id")
+        ),
+    )
 
 
 @dataclass(frozen=True)
@@ -1912,6 +2312,7 @@ class CredentialRegistry:
         self._lock = threading.RLock()
         self._writers: dict[bytes, WriterCredential] = {}
         self._devices: dict[bytes, DeviceCredential] = {}
+        self._device_seen: dict[bytes, float] = {}
         self._contexts: dict[bytes, _ContextRecord] = {}
         self._contexts_by_id: dict[bytes, bytes] = {}
 
@@ -2183,6 +2584,7 @@ class CredentialRegistry:
         capabilities: object = DEFAULT_DEVICE_CAPABILITIES,
         subscription_key: bytes | None = None,
         subject: str | None = None,
+        label: object = None,
     ) -> DeviceCredential:
         """Pair a device against an already server-derived namespace.
 
@@ -2203,6 +2605,7 @@ class CredentialRegistry:
             else secrets.token_hex(_ID_BYTES).encode("ascii")
         )
         subject_text = None if subject is None else _require_text(subject, "subject")
+        label_text = None if label is None else _require_device_label(label)
         credential = DeviceCredential(
             credential_id=_new_id(),
             namespace=namespace_text,
@@ -2212,6 +2615,8 @@ class CredentialRegistry:
             signature_algorithm=algorithm,
             capabilities=_normalize_capabilities(capabilities),
             subject=subject_text,
+            label=label_text,
+            created_at=float(self._clock()),
         )
         with self._lock:
             self._store_device_locked(credential)
@@ -2227,6 +2632,7 @@ class CredentialRegistry:
         capabilities: object = DEFAULT_DEVICE_CAPABILITIES,
         subscription_key: bytes | None = None,
         subject: str | None = None,
+        label: object = None,
     ) -> DeviceCredential:
         """Pair a device, deriving the namespace from the installation id."""
 
@@ -2242,6 +2648,7 @@ class CredentialRegistry:
             capabilities=capabilities,
             subscription_key=subscription_key,
             subject=subject,
+            label=label,
         )
 
     def pair_device(
@@ -2253,6 +2660,7 @@ class CredentialRegistry:
         capabilities: object = DEFAULT_DEVICE_CAPABILITIES,
         subscription_key: bytes | None = None,
         subject: str | None = None,
+        label: object = None,
         pairing_registry: "DevicePairingRegistry | None" = None,
     ) -> DeviceCredential:
         """Register a device into the namespace a spent pairing code named.
@@ -2278,6 +2686,7 @@ class CredentialRegistry:
             capabilities=capabilities,
             subscription_key=subscription_key,
             subject=binding.subject if subject is None else subject,
+            label=label,
         )
 
     def lookup_device(self, credential_id: str) -> DeviceCredential | None:
@@ -2355,6 +2764,168 @@ class CredentialRegistry:
             )
             return True
 
+    def revoke_device_in_scope(
+        self, credential_id: str, namespace: str, local_user_scope: str
+    ) -> bool | None:
+        """Revoke a device that belongs to exactly this namespace and scope.
+
+        ``None`` means "this scope has no such device", and it is deliberately
+        the *same* answer for a malformed id, an unknown id, an id that names
+        a device in another rider's namespace, an id in another local scope,
+        and an id that names a writer credential or any other row kind rather
+        than a device.  The route turns all of them into one 404, so an error
+        can never confirm that a credential exists somewhere the caller cannot
+        see.  ``True`` and ``False`` mean revoked now and revoked already; the
+        route answers both identically, so a retry is safe and nothing about
+        the caller's own scope is inferred from a status code either.
+
+        The whole decision -- read, scope comparison, write -- happens under
+        the registry lock, so a device cannot change hands between the check
+        and the write.  A credential's namespace and scope are immutable
+        anyway; this is belt and braces.
+        """
+
+        if (
+            not isinstance(credential_id, str)
+            or _HEX_ID_RE.fullmatch(credential_id) is None
+        ):
+            return None
+        try:
+            namespace_text = _require_namespace(namespace)
+            scope_text = _require_local_scope(local_user_scope)
+        except (TypeError, ValueError):
+            return None
+        with self._lock:
+            credential = self._find_device_locked(credential_id)
+            if credential is None:
+                return None
+            if not hmac.compare_digest(
+                credential.namespace, namespace_text
+            ) or not hmac.compare_digest(
+                credential.local_user_scope, scope_text
+            ):
+                return None
+            if credential.revoked or not credential.active:
+                return False
+            self._write_device_locked(
+                replace(credential, active=False, revoked=True)
+            )
+            return True
+
+    def list_devices_for_scope(
+        self,
+        namespace: str,
+        local_user_scope: str,
+        *,
+        limit: int = MAX_DEVICE_LISTING,
+    ) -> tuple[DeviceCredential, ...]:
+        """Every device paired into one ``(namespace, local_user_scope)``.
+
+        The scope is the caller's own, derived from its authenticated
+        credential; no route passes a caller-supplied one.  Filtering happens
+        here rather than in the route so a device belonging to another rider
+        is never handed to a response builder in the first place.
+
+        A row that will not decode, or whose stored id does not hash to its
+        own row key, is skipped rather than guessed at.  Rows written before
+        device listing existed carry no id and are skipped for the same
+        reason -- they remain revocable by id, which is what actually matters.
+        """
+
+        namespace_text = _require_namespace(namespace)
+        scope_text = _require_local_scope(local_user_scope)
+        bound = _validate_capacity(limit)
+        found: list[DeviceCredential] = []
+        with self._lock:
+            if self._backend is not None:
+                for row_key, value in self._backend.iter_records(
+                    "device", limit=self._capacity
+                ):
+                    if not isinstance(value, Mapping):
+                        continue
+                    stored_id = _device_id_from_value(row_key, value)
+                    if stored_id is None:
+                        continue
+                    try:
+                        credential = _device_from_value(stored_id, value)
+                    except (KeyError, TypeError, ValueError):
+                        continue
+                    if self._matches_scope(credential, namespace_text, scope_text):
+                        found.append(credential)
+                        if len(found) >= bound:
+                            break
+            else:
+                for credential in self._devices.values():
+                    if self._matches_scope(credential, namespace_text, scope_text):
+                        found.append(credential)
+                        if len(found) >= bound:
+                            break
+        found.sort(key=lambda item: (item.created_at, item.credential_id))
+        return tuple(found)
+
+    @staticmethod
+    def _matches_scope(
+        credential: DeviceCredential, namespace: str, local_user_scope: str
+    ) -> bool:
+        return hmac.compare_digest(
+            credential.namespace, namespace
+        ) and hmac.compare_digest(credential.local_user_scope, local_user_scope)
+
+    # ------------------------------------------------------------------
+    # "Last seen", deliberately not on the credential
+    # ------------------------------------------------------------------
+    # A rider identifies the lost phone by when it last called home, so the
+    # timestamp has to be written on the refresh path -- the hottest path
+    # there is.  Writing it onto the credential row would mean a read-modify-
+    # write of authorization state on every refresh, and a refresh already in
+    # flight when the rider revokes that device would write the pre-revocation
+    # record back and *resurrect* it.  Its own row cannot: nothing reads it to
+    # authorize anything, and a lost race only misdates a display value.
+
+    def record_device_seen(self, credential_id: str, *, now: float | None = None) -> bool:
+        """Note that a device authenticated, in a row of its own."""
+
+        if (
+            not isinstance(credential_id, str)
+            or _HEX_ID_RE.fullmatch(credential_id) is None
+        ):
+            return False
+        current = self._clock() if now is None else float(now)
+        digest = self._credential_digest(credential_id)
+        with self._lock:
+            if self._backend is not None:
+                self._backend.write(
+                    DEVICE_SEEN_RECORD_KIND,
+                    digest.hex(),
+                    {"last_seen_at": float(current)},
+                )
+            self._device_seen[digest] = float(current)
+        return True
+
+    def device_last_seen(self, credential_id: str) -> float | None:
+        """When this device last authenticated, or ``None`` if never."""
+
+        if (
+            not isinstance(credential_id, str)
+            or _HEX_ID_RE.fullmatch(credential_id) is None
+        ):
+            return None
+        digest = self._credential_digest(credential_id)
+        with self._lock:
+            if self._backend is not None:
+                value = self._backend.read(DEVICE_SEEN_RECORD_KIND, digest.hex())
+                if not isinstance(value, Mapping):
+                    return self._device_seen.get(digest)
+                try:
+                    seen = _require_timestamp_value(
+                        value.get("last_seen_at"), "last_seen_at"
+                    )
+                except ValueError:
+                    return None
+                self._device_seen[digest] = seen
+                return seen
+            return self._device_seen.get(digest)
+
     def _prune_contexts_locked(self, now: float) -> None:
         for token_digest, record in tuple(self._contexts.items()):
             if record.expires_at <= now:
@@ -2375,7 +2946,15 @@ class CredentialRegistry:
             if not self._backend.create(
                 "context-index",
                 context_id_digest.hex(),
-                {"token_digest": token_digest.hex()},
+                # The expiry is carried here only so the sweep can remove the
+                # index when the context it points at is gone.  Nothing reads
+                # it to decide whether a context is live -- that is the
+                # context row's own ``expires_at``, checked in
+                # ``read_context_token``.
+                {
+                    "token_digest": token_digest.hex(),
+                    "expires_at": float(record.expires_at),
+                },
             ):
                 raise RuntimeError("context identifier collision")
         self._contexts[token_digest] = record
@@ -2441,17 +3020,30 @@ class CredentialRegistry:
         *,
         ttl_seconds: float = _DEFAULT_TTL_SECONDS,
         now: float | None = None,
+        device_credential_id: str | None = None,
     ) -> tuple[str, ReaderContext]:
-        """Issue a context after enrollment when only the derived namespace remains."""
+        """Issue a context after enrollment when only the derived namespace remains.
+
+        ``device_credential_id`` binds the context to the device that minted
+        it, so revoking that device ends this context too -- see
+        :meth:`read_context_token`.  Callers that mint on behalf of a device
+        must pass it; enrollment mints without one.
+        """
         namespace_text = _require_namespace(namespace)
         scope_text = _require_local_scope(local_user_scope)
         subject_text = None if subject is None else _require_text(subject, "subject")
+        device_id = (
+            None if device_credential_id is None
+            else _require_opaque_id(device_credential_id, "device_credential_id")
+        )
         ttl = _validate_ttl(ttl_seconds)
         current = self._clock() if now is None else float(now)
         token = secrets.token_urlsafe(_TOKEN_BYTES)
         token_digest = _digest_token(token)
         context = ReaderContext(_new_id(), namespace_text, scope_text, subject=subject_text)
-        record = _ContextRecord(context, token_digest, current + ttl)
+        record = _ContextRecord(
+            context, token_digest, current + ttl, device_credential_id=device_id
+        )
         with self._lock:
             self._prune_contexts_locked(current)
             self._store_context_locked(token_digest, record)
@@ -2516,6 +3108,27 @@ class CredentialRegistry:
             ):
                 hmac.compare_digest(supplied, _DUMMY_DIGEST)
                 return None
+            # A context minted by a device is only as alive as that device.
+            # Without this, revoking a lost phone would leave every context it
+            # already holds serving reads until it expires -- up to five
+            # minutes of exactly the access the rider just tried to end.  A
+            # revoked or unknown device fails identically here, and the
+            # response is the same 404 as an unknown token.
+            if record.device_credential_id is not None:
+                issuer = self._find_device_locked(record.device_credential_id)
+                if (
+                    issuer is None
+                    or not issuer.active
+                    or issuer.revoked
+                    or not hmac.compare_digest(
+                        issuer.namespace, record.context.namespace
+                    )
+                    or not hmac.compare_digest(
+                        issuer.local_user_scope, record.context.local_user_scope
+                    )
+                ):
+                    hmac.compare_digest(supplied, _DUMMY_DIGEST)
+                    return None
             return record.context
 
     resolve_reader = read_context_token
@@ -2662,6 +3275,15 @@ class NonceReplayGuard:
 
 __all__ = [
     "INSTALLATION_ID_BYTES",
+    "DEVICE_SEEN_RECORD_KIND",
+    "ExpiredRecordSweeper",
+    "MAX_DEVICE_LISTING",
+    "NEVER_SWEEP_RECORD_KINDS",
+    "SWEEPABLE_RECORD_KINDS",
+    "SWEEP_BATCH_LIMIT",
+    "SWEEP_DELETE_LIMIT",
+    "SWEEP_GRACE_SECONDS",
+    "SWEEP_INTERVAL_SECONDS",
     "DEFAULT_DEVICE_CAPABILITIES",
     "DEFAULT_WRITER_CAPABILITIES",
     "DEVICE_SIGNATURE_ALGORITHMS",
@@ -2699,6 +3321,7 @@ __all__ = [
     "sign_request",
     "sign_request_ecdsa_p256",
     "sign_request_ed25519",
+    "validate_device_label",
     "validate_public_key",
     "verify_signature",
 ]

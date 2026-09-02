@@ -33,6 +33,7 @@ from .security import (
     DEVICE_SIGNATURE_ALGORITHMS,
     DevicePairingRegistry,
     EnrollmentRegistry,
+    ExpiredRecordSweeper,
     NonceReplayGuard,
     PublicKeyUnavailable,
     READER_CONTEXT_TTL_SECONDS,
@@ -41,6 +42,7 @@ from .security import (
     digest_body,
     MIN_REPLAY_TTL_SECONDS,
     new_installation_id,
+    validate_device_label,
     validate_public_key,
     verify_signature,
 )
@@ -66,6 +68,20 @@ _MAX_DEVICE_KEY_HEX = 130
 _PAIRING_IDEMPOTENCY_KEY = "device-pairing-code"
 _PAIRING_REVISION = 0
 _MAX_PAIRING_BODY_BYTES = 4 * 1024
+# Listing and revoking devices carry no body worth choosing and no idempotent
+# effect, so they get the same fixed envelope as minting.  What separates one
+# signed revoke from another is the *path*, which carries the target
+# credential id and is part of the canonical request: a request signed to
+# revoke one device cannot be re-aimed at another, and the replay guard stops
+# it being sent twice.
+_DEVICE_LIST_IDEMPOTENCY_KEY = "device-list"
+_DEVICE_LIST_REVISION = 0
+_DEVICE_REVOKE_IDEMPOTENCY_KEY = "device-revoke"
+_DEVICE_REVOKE_REVISION = 0
+_MAX_DEVICE_ADMIN_BODY_BYTES = 4 * 1024
+# A credential id is 32 bytes of hex.  The path parameter is bounded before it
+# reaches the registry so an enormous path cannot be used to probe anything.
+_MAX_CREDENTIAL_ID_CHARS = 64
 
 
 @dataclass
@@ -186,6 +202,10 @@ class CloudState:
     quotas: QuotaManager
     nonces: NonceReplayGuard
     pairings: DevicePairingRegistry
+    # Housekeeping, not authorization.  ``None`` on any plane that must not
+    # delete from the shared auth table -- which is every plane but the read
+    # one, whose managed identity is the only one holding the delete action.
+    sweeper: Any = None
 
     @classmethod
     def create(
@@ -282,6 +302,22 @@ class CloudState:
         pairings = DevicePairingRegistry(
             config.server_secret, backend=security_backend, clock=config.clock
         )
+        # Contexts, their index, invitations, pairing codes and replay claims
+        # all accumulate in ``CloudAuth`` and nothing ever reads an expired
+        # one again.  The read plane is the only identity that may delete from
+        # that table, so it is the only plane that sweeps; the sync plane holds
+        # read access there and would only ever get a 403.
+        sweeper = None
+        if security_backend is not None and config.plane in {"all", "read"}:
+            try:
+                sweeper = ExpiredRecordSweeper(
+                    security_backend, clock=config.clock
+                )
+            except ValueError:
+                # A backend from an older contract cannot enumerate or delete.
+                # Rows accumulating is a cost problem, never a correctness or
+                # authorization one, so this is not a reason to refuse to boot.
+                sweeper = None
         return cls(
             config=config,
             credentials=CredentialRegistry(
@@ -300,6 +336,7 @@ class CloudState:
                 clock=config.clock,
                 backend=replay_backend,
             ),
+            sweeper=sweeper,
         )
 
 
@@ -478,6 +515,95 @@ def _writer_auth(state: CloudState, request: Request, *, capability: str) -> Any
     if credential is None or not _has_capability(credential, capability):
         raise HTTPException(status_code=401, detail="writer authorization required")
     return credential
+
+
+def _sweep_expired_auth_state(state: CloudState) -> None:
+    """Opportunistic housekeeping, attached to a route that already wrote.
+
+    Bounded, rate-limited and best-effort inside the sweeper; wrapped again
+    here because no request may fail because a delete did.
+    """
+
+    sweeper = getattr(state, "sweeper", None)
+    if sweeper is None:
+        return
+    try:
+        sweeper.maybe_sweep()
+    except Exception:  # pragma: no cover - the sweeper already swallows
+        pass
+
+
+def _verified_scope(
+    state: CloudState,
+    request: Request,
+    credential: Any,
+    body: bytes,
+    *,
+    idempotency_key: str,
+    revision: int,
+) -> tuple[str, str] | None:
+    """Verify a fixed signed envelope and return the credential's own scope.
+
+    The scope comes from the stored credential and from nowhere else -- no
+    route below reads a namespace, scope, installation or subject from a
+    parameter, a body field or a header.  A writer credential and a paired
+    device are both acceptable signers, which is what lets the rider's
+    remaining phone revoke the lost one without the desktop; the capability
+    ``_writer_auth`` asserted is what decides, and it is read from stored
+    credential state.
+
+    Returns ``None`` for every envelope failure -- bad signature, stale
+    timestamp, replayed nonce, wrong fixed envelope, missing or mismatched
+    attested subject -- so the caller answers all of them identically.
+    """
+
+    verified = _verify_writer_request(state, request, credential, body)
+    if verified is None:
+        return None
+    namespace, scope, idem, sent_revision = verified
+    if not _safe_compare_text(idem, idempotency_key) or sent_revision != revision:
+        return None
+    # Subject outcomes are only reachable once the caller has already proven
+    # possession of the credential's private key.
+    ok, verified_subject = _subject_binding(state, request)
+    if not ok:
+        return None
+    stored_subject = getattr(credential, "subject", None)
+    if (
+        stored_subject is not None
+        and verified_subject is not None
+        and not _safe_compare_text(stored_subject, verified_subject)
+    ):
+        return None
+    return namespace, scope
+
+
+def _device_listing_entry(
+    state: CloudState, device: Any, caller_credential_id: object
+) -> dict[str, Any]:
+    """The only shape a device is ever described in over the wire.
+
+    Built by naming every field explicitly rather than by filtering a stored
+    record, because a field added to ``DeviceCredential`` later must not
+    appear here by default.  Nothing key-shaped is listed: no verification
+    key, no subscription key, not even the digest of one, and no signature
+    algorithm -- none of it helps a rider decide which phone to revoke, and
+    the response is the one place device state leaves the deployment.  The
+    namespace and local scope are omitted for the same reason every other
+    route omits them.
+    """
+
+    credential_id = device.credential_id
+    return {
+        "credential_id": credential_id,
+        "label": device.label,
+        "capabilities": sorted(getattr(device, "capabilities", ())),
+        "created_at": device.created_at or None,
+        "last_seen_at": state.credentials.device_last_seen(credential_id),
+        "revoked": bool(getattr(device, "revoked", False)),
+        # So a client can grey out "this is the device you are holding".
+        "self": _safe_compare_text(credential_id, caller_credential_id),
+    }
 
 
 def _writer_signature_fields(request: Request) -> tuple[int, str, str, int, str]:
@@ -964,10 +1090,28 @@ def create_cloud_app(
                 )
             try:
                 token, _context = state.credentials.issue_reader_context_for_scope(
-                    namespace, scope, bound_subject
+                    namespace, scope, bound_subject,
+                    # Bound to this device, so revoking it ends every context
+                    # it holds at once rather than in five minutes' time.
+                    device_credential_id=getattr(device, "credential_id", None),
                 )
             except (ValueError, RuntimeError):
                 return _not_found()
+            # "Last seen" is how the rider tells the lost phone from the one
+            # in their hand, so it is recorded on the one path a device is
+            # certain to take.  It goes into a row of its own, never onto the
+            # credential: rewriting the credential record here would race a
+            # concurrent revocation and could write the pre-revocation record
+            # back.  A failure to note it is not a failure to refresh.
+            try:
+                state.credentials.record_device_seen(
+                    getattr(device, "credential_id", "")
+                )
+            except Exception:  # pragma: no cover - display metadata only
+                pass
+            # Every refresh persists two rows that nothing will read again
+            # once they expire; this is the write the sweep rides along on.
+            _sweep_expired_auth_state(state)
             return JSONResponse({
                 "reader_context": token,
                 "expires_in": READER_CONTEXT_TTL_SECONDS,
@@ -1117,14 +1261,22 @@ def create_cloud_app(
                 code = payload.get("code")
                 public_key_hex = payload.get("public_key")
                 algorithm = payload.get("signature_algorithm", "ed25519")
+                # A name the rider will read back in the device listing.  It
+                # is validated -- bounded, no control characters -- here,
+                # before the single-use code is spent, exactly as the public
+                # key is: a label rejected afterwards would burn the code.
+                label = payload.get("label")
                 if (
                     not isinstance(code, str)
                     or not isinstance(public_key_hex, str)
                     or len(public_key_hex) > _MAX_DEVICE_KEY_HEX
                     or not isinstance(algorithm, str)
                     or algorithm not in DEVICE_SIGNATURE_ALGORITHMS
+                    or (label is not None and not isinstance(label, str))
                 ):
                     raise ValueError
+                if label is not None:
+                    validate_device_label(label)
                 public_key = bytes.fromhex(public_key_hex)
             except (
                 ValueError, TypeError, UnicodeDecodeError, json.JSONDecodeError,
@@ -1151,6 +1303,7 @@ def create_cloud_app(
                     binding,
                     public_key,
                     signature_algorithm=algorithm,
+                    label=label,
                     # Devices are issued read-only here, exactly as at
                     # enrollment.  Widening one is a capability grant on the
                     # stored record, never an inference from its type.
@@ -1161,7 +1314,8 @@ def create_cloud_app(
                     # request is checked against a header nobody vouches for.
                 )
                 token, _context = state.credentials.issue_reader_context_for_scope(
-                    device.namespace, device.local_user_scope, device.subject
+                    device.namespace, device.local_user_scope, device.subject,
+                    device_credential_id=device.credential_id,
                 )
             except (ValueError, RuntimeError, PublicKeyUnavailable):
                 return _not_found()
@@ -1187,6 +1341,131 @@ def create_cloud_app(
                 )
             except QuotaExceeded:
                 pass
+            _sweep_expired_auth_state(state)
+            return Response(
+                body_bytes,
+                media_type="application/json",
+                headers={"Cache-Control": "no-store"},
+            )
+
+        @app.get("/api/v1/devices")
+        async def list_devices(request: Request) -> Response:
+            """List the devices paired into the caller's own scope.
+
+            The scope is derived from the authenticated credential, never
+            from a parameter, so there is nothing here to point at another
+            rider: a request cannot ask for a namespace, and the registry
+            filters before a response is built.
+
+            Signed with the writer envelope (``X-Writer-*``), which a paired
+            device may also use -- ``_writer_auth`` resolves both -- so the
+            phone can list the rider's devices without the desktop.  The
+            capability asserted is ``"read"``, which every writer and every
+            device carries.
+
+            Revoked devices are listed, flagged, and kept: "did the
+            revocation stick?" is the question the rider asks next, and a
+            listing that silently drops the entry answers it ambiguously.
+            """
+
+            credential = _writer_auth(state, request, capability="read")
+            verified = _verified_scope(
+                state, request, credential, b"",
+                idempotency_key=_DEVICE_LIST_IDEMPOTENCY_KEY,
+                revision=_DEVICE_LIST_REVISION,
+            )
+            if verified is None:
+                return _error(401, "writer authorization required")
+            namespace, scope = verified
+            try:
+                devices = state.credentials.list_devices_for_scope(namespace, scope)
+            except (ValueError, RuntimeError):
+                return _error(503, "device listing unavailable")
+            caller_id = getattr(credential, "credential_id", "")
+            body = json.dumps(
+                {"devices": [
+                    _device_listing_entry(state, device, caller_id)
+                    for device in devices
+                ]},
+                sort_keys=True, separators=(",", ":"), ensure_ascii=False,
+            ).encode("utf-8")
+            try:
+                state.quotas.admit_read(namespace, scope, response_bytes=len(body))
+            except QuotaExceeded as exc:
+                return _error(
+                    exc.status_code, "read quota exceeded", retry_after=exc.retry_after
+                )
+            return Response(body, media_type="application/json",
+                            headers={"Cache-Control": "no-store"})
+
+        @app.post("/api/v1/devices/{credential_id}/revoke")
+        async def revoke_device(request: Request, credential_id: str) -> Response:
+            """Revoke one device in the caller's own scope, durably.
+
+            **Who may call.**  Any credential in the same
+            ``(namespace, local_user_scope)`` that can sign: the desktop
+            writer, another paired device, or the target device revoking
+            itself.  That is deliberate -- the rider whose phone is gone has
+            the iPad in their hand, and requiring the desktop would mean the
+            revocation waits until they get home.  The cost is that a stolen
+            phone can revoke its siblings.  It is bounded on purpose: only
+            *device* credentials can be revoked here, never the desktop's
+            writer credential, so the worst a stolen device achieves is
+            forcing a re-pair it could already force by other means, and it
+            can never cut the rider off from their own sync plane.
+
+            **Cross-namespace is 404, never 403.**  An id belonging to
+            another rider, an unknown id, a malformed id, and an id that
+            names some other kind of record all return the identical body,
+            status and headers as every other not-found in this API.  A 403
+            would confirm that a credential exists in a namespace the caller
+            cannot see, and confirming that is the whole attack.
+
+            **Idempotent.**  Revoking an already-revoked device answers
+            exactly as revoking a live one does, so a retry after a timeout
+            is safe and the status code carries no state either way.
+            """
+
+            # Authentication and the kill state first, body second: nothing
+            # unauthenticated gets to hand this route bytes to buffer.
+            credential = _writer_auth(state, request, capability="read")
+            try:
+                body = await _bounded_body(request, _MAX_DEVICE_ADMIN_BODY_BYTES)
+            except HTTPException:
+                return _error(400, "invalid revocation request")
+            verified = _verified_scope(
+                state, request, credential, body,
+                idempotency_key=_DEVICE_REVOKE_IDEMPOTENCY_KEY,
+                revision=_DEVICE_REVOKE_REVISION,
+            )
+            if verified is None:
+                return _error(401, "writer authorization required")
+            namespace, scope = verified
+            if not credential_id or len(credential_id) > _MAX_CREDENTIAL_ID_CHARS:
+                return _not_found()
+            try:
+                outcome = state.credentials.revoke_device_in_scope(
+                    credential_id, namespace, scope
+                )
+            except (ValueError, RuntimeError):
+                return _error(503, "revocation unavailable")
+            if outcome is None:
+                # Unknown, malformed, another rider's namespace, another local
+                # scope, or not a device at all -- one answer for all of them.
+                return _not_found()
+            body_bytes = json.dumps(
+                {"revoked": True}, separators=(",", ":")
+            ).encode()
+            # Metered after the fact, never admitted before -- as pairing is.
+            # A rider who has spent the day's read allowance must still be
+            # able to revoke a lost device: refusing this call is a security
+            # failure, whereas counting it late is a rounding error.
+            try:
+                state.quotas.record_read_bytes(namespace, scope, len(body_bytes))
+            except QuotaExceeded:
+                pass
+            # The revocation is already durable; housekeeping comes after it.
+            _sweep_expired_auth_state(state)
             return Response(
                 body_bytes,
                 media_type="application/json",
