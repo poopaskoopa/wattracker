@@ -485,10 +485,11 @@ def disable_writes(
 ) -> KillSwitchState:
     """The 80% budget action: stop writes, leave the public API as it is.
 
-    It reads first so that an 80% action arriving after a 100% one cannot
-    re-enable the public API, and it raises rather than guessing if that read
-    fails.  ``disable_public_api`` is the action that needs no read, which is
-    the right way round: the more severe the action, the fewer preconditions.
+    It reads first and then uses an etag-guarded update, so an 80% action
+    delayed behind a concurrent 100% action cannot re-enable the public API.
+    It raises rather than guessing if the read or update fails.
+    ``disable_public_api`` is the action that needs no read, which is the right
+    way round: the more severe the action, the fewer preconditions.
     """
 
     switch = DurableKillSwitch(backend, **kwargs)

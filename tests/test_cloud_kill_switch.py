@@ -138,8 +138,11 @@ class _NoDeleteTable:
     the delete here is a tripwire rather than a stub.
     """
 
-    def __init__(self) -> None:
+    def __init__(self, *, missing: bool = False) -> None:
         self.entities: dict = {}
+        self.missing = missing
+        self.query_calls: list[dict] = []
+        self.query_iterations = 0
 
     def create_entity(self, entity):
         key = (entity["PartitionKey"], entity["RowKey"])
@@ -157,6 +160,17 @@ class _NoDeleteTable:
     def upsert_entity(self, entity):
         key = (entity["PartitionKey"], entity["RowKey"])
         self.entities[key] = dict(entity, etag='W/"2"')
+
+    def query_entities(self, **kwargs):
+        self.query_calls.append(kwargs)
+
+        def _lazy_rows():
+            self.query_iterations += 1
+            if self.missing:
+                raise _StorageError(404)
+            yield from (dict(entity) for entity in self.entities.values())
+
+        return _lazy_rows()
 
     def delete_entity(self, *args, **kwargs):  # pragma: no cover - a tripwire
         raise AssertionError("no deployed managed identity holds a table delete")
@@ -937,6 +951,30 @@ def test_the_kill_switch_row_address_is_one_the_azure_table_accepts():
     # Its own kind: a kill-switch row can never be addressed as a counter, and
     # no counter can be addressed as the switch.
     assert KILL_SWITCH_RECORD_KIND != QUOTA_RECORD_KIND
+
+
+def test_read_only_access_verification_accepts_an_existing_empty_table():
+    table = _NoDeleteTable()
+    backend = AzureTableSecurityStateBackend(table)
+
+    backend.verify_access(writable=False)
+
+    assert table.query_calls == [{
+        "query_filter": "PartitionKey eq '__wattracker_auth_v1__'",
+        "results_per_page": 1,
+    }]
+    assert table.query_iterations == 1
+
+
+def test_read_only_access_verification_refuses_a_missing_table_even_when_query_is_lazy():
+    table = _NoDeleteTable(missing=True)
+    backend = AzureTableSecurityStateBackend(table)
+
+    with pytest.raises(RuntimeError, match="security state table is missing"):
+        backend.verify_access(writable=False)
+
+    assert len(table.query_calls) == 1
+    assert table.query_iterations == 1
 
 
 # ---------------------------------------------------------------------------

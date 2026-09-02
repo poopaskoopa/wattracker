@@ -793,9 +793,26 @@ class AzureTableSecurityStateBackend:
         probe_key = hashlib.sha256(b"wattracker-cloud-auth-access-probe").hexdigest()
         if writable:
             self.write("health", probe_key, {"ready": True})
-        value = self.read("health", probe_key)
-        if writable and value != {"ready": True}:
-            raise RuntimeError("durable cloud auth registry is not writable")
+            value = self.read("health", probe_key)
+            if value != {"ready": True}:
+                raise RuntimeError("durable cloud auth registry is not writable")
+            return
+
+        # ``query_entities`` returns a lazy ItemPaged iterator.  Calling it
+        # alone does not make a request, so consume its first item to make a
+        # missing table (404) distinct from an existing empty table.  This is
+        # read-only and uses the same entity-read permission as the runtime
+        # paths; the control identity has no add, update, or delete grant.
+        try:
+            entities = self._table.query_entities(
+                query_filter=f"PartitionKey eq '{_AUTH_PARTITION}'",
+                results_per_page=1,
+            )
+            next(iter(entities), None)
+        except Exception as exc:
+            if self._not_found(exc):
+                raise RuntimeError("durable cloud security state table is missing") from exc
+            raise
 
 
 def _record_has_expired(value: object, horizon: float) -> bool:
