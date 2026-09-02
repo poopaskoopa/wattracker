@@ -53,34 +53,34 @@ resource budgetHookApp 'Microsoft.Web/sites@2022-09-01' existing = {
   name: budgetHookFunctionAppName
 }
 var budgetHookDefaultKey = listKeys('${budgetHookApp.id}/host/default', '2022-03-01').functionKeys.default
-var writeShutdownWebhookUri = 'https://${budgetHookHost}/api/budget/disable-writes?code=${budgetHookDefaultKey}'
-var publicShutdownWebhookUri = 'https://${budgetHookHost}/api/budget/disable-public-api?code=${budgetHookDefaultKey}'
+var writeShutdownWebhookUri = 'https://${budgetHookHost}/budget/disable-writes?code=${budgetHookDefaultKey}'
+var publicShutdownWebhookUri = 'https://${budgetHookHost}/budget/disable-public-api?code=${budgetHookDefaultKey}'
 
 resource vnet 'Microsoft.Network/virtualNetworks@2023-11-01' = {
   name: vnetName
   location: location
   properties: {
     addressSpace: { addressPrefixes: [ '10.42.0.0/16' ] }
-    subnets: [
+  }
+}
+
+resource acaSubnet 'Microsoft.Network/virtualNetworks/subnets@2023-11-01' = {
+  parent: vnet
+  name: 'aca-infrastructure'
+  properties: {
+    addressPrefix: '10.42.0.0/23'
+    delegations: [
       {
-        name: 'aca-infrastructure'
+        name: 'aca'
         properties: {
-          addressPrefix: '10.42.0.0/23'
-          delegations: [
-            {
-              name: 'aca'
-              properties: {
-                serviceName: 'Microsoft.App/environments'
-              }
-            }
-          ]
-          serviceEndpoints: [
-            {
-              service: 'Microsoft.Storage'
-              locations: [location]
-            }
-          ]
+          serviceName: 'Microsoft.App/environments'
         }
+      }
+    ]
+    serviceEndpoints: [
+      {
+        service: 'Microsoft.Storage'
+        locations: [location]
       }
     ]
   }
@@ -104,9 +104,15 @@ resource storage 'Microsoft.Storage/storageAccounts@2023-05-01' = {
         value: address
         action: 'Allow'
       }]
+      resourceAccessRules: [
+        {
+          tenantId: subscription().tenantId
+          resourceId: budgetHookApp.id
+        }
+      ]
       virtualNetworkRules: [
         {
-          id: resourceId('Microsoft.Network/virtualNetworks/subnets', vnetName, 'aca-infrastructure')
+          id: acaSubnet.id
           action: 'Allow'
         }
       ]
@@ -167,7 +173,7 @@ resource appEnv 'Microsoft.App/managedEnvironments@2023-05-01' = {
   location: location
   properties: {
     vnetConfiguration: {
-      infrastructureSubnetId: resourceId('Microsoft.Network/virtualNetworks/subnets', vnetName, 'aca-infrastructure')
+      infrastructureSubnetId: acaSubnet.id
       internal: false
     }
     workloadProfiles: [

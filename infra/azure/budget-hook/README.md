@@ -4,8 +4,21 @@ This Azure Functions Consumption app hosts the authenticated budget callbacks
 that remain reachable when the Container Apps public API is disabled or scaled
 to zero.
 
-Deploy from the repository checkout so the `-e ../../../` requirement can
-install the Wattracker package. Set these application settings:
+Stage the Function project from the repository root before publishing. Azure
+Functions publishes the contents of the Function project only, so the staging
+helper copies the exact cloud package used by the hook into a self-contained
+directory:
+
+```sh
+python scripts/package_budget_hook.py
+cd build/azure-budget-hook
+func azure functionapp publish APP_NAME
+```
+
+The default Core Tools publish performs the remote dependency build from that
+staging directory. Do not publish `infra/azure/budget-hook` directly: it does
+not contain the repository package until it has been staged. Set these
+application settings:
 
 - `WATTRACKER_STORAGE_ACCOUNT_NAME`: the Azure Storage account name.
 - `WATTRACKER_BUDGET_HOOK_TOKEN`: the deployment-only app-level token used by
@@ -15,14 +28,15 @@ Enable a system-assigned managed identity on the Function App and pass its
 object ID to the main Bicep deployment as `budgetHookPrincipalId`. The hook
 uses that identity for the `CloudControl` Table data plane; it does not use an
 account key or SAS token. Keep the Function's complete possible outbound IPv4
-list in the main deployment's `budgetHookIpRules` parameter so the storage
-firewall can admit the hook.
+list in the main deployment's `budgetHookIpRules` parameter. The Storage
+firewall also has a same-tenant resource-instance rule for this Function App;
+the IP list remains an explicit defense-in-depth deployment input.
 
 The fixed POST endpoints are:
 
-- `/api/budget/disable-writes` — budget 80%; keeps the public API enabled.
-- `/api/budget/disable-public-api` — budget 100%; disables both levels.
-- `/api/budget/clear` — operator recovery; requires the Function host key and
+- `/budget/disable-writes` — budget 80%; keeps the public API enabled.
+- `/budget/disable-public-api` — budget 100%; disables both levels.
+- `/budget/clear` — operator recovery; requires the Function host key and
   the `X-Wattracker-Budget-Token` app-level header.
 
 Azure Function authentication is `FUNCTION`; Azure Action Groups should use

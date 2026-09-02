@@ -1,3 +1,5 @@
+import importlib.util
+import json
 import re
 from pathlib import Path
 
@@ -5,8 +7,13 @@ from pathlib import Path
 ROOT = Path(__file__).parents[1]
 BICEP = (ROOT / "infra" / "azure" / "main.bicep").read_text()
 RUNBOOK = (ROOT / "docs" / "cloud-sync.md").read_text()
-BUDGET_HOOK = (ROOT / "infra" / "azure" / "budget-hook" / "function_app.py").read_text()
+BUDGET_HOOK_ROOT = ROOT / "infra" / "azure" / "budget-hook"
+BUDGET_HOOK = (BUDGET_HOOK_ROOT / "function_app.py").read_text()
 BUDGET_HOOK_IMPL = (ROOT / "wattracker" / "cloud" / "budget_hook.py").read_text()
+BUDGET_HOOK_REQUIREMENTS = (BUDGET_HOOK_ROOT / "requirements.txt").read_text()
+BUDGET_HOOK_README = (BUDGET_HOOK_ROOT / "README.md").read_text()
+BUDGET_HOOK_HOST = json.loads((BUDGET_HOOK_ROOT / "host.json").read_text())
+PACKAGE_HELPER = (ROOT / "scripts" / "package_budget_hook.py").read_text()
 
 
 def test_public_container_apps_are_tls_terminated_and_authenticate_at_the_app():
@@ -33,7 +40,17 @@ def test_storage_uses_service_endpoints_and_a_deny_by_default_firewall():
     assert "service: 'Microsoft.Storage'" in BICEP
     assert "budgetHookIpRules" in BICEP
     assert "ipRules:" in BICEP
+    assert "resourceAccessRules:" in BICEP
+    assert re.search(
+        r"resourceAccessRules:\s*\[\s*\{\s*tenantId:\s*subscription\(\)\.tenantId\s*"
+        r"resourceId:\s*budgetHookApp\.id",
+        BICEP,
+    )
     assert "virtualNetworkRules:" in BICEP
+    assert "resource acaSubnet 'Microsoft.Network/virtualNetworks/subnets@2023-11-01'" in BICEP
+    assert "id: acaSubnet.id" in BICEP
+    assert "infrastructureSubnetId: acaSubnet.id" in BICEP
+    assert "resourceId('Microsoft.Network/virtualNetworks/subnets', vnetName" not in BICEP
     assert "Microsoft.Network/privateEndpoints" not in BICEP
     assert "Microsoft.Network/privateDnsZones" not in BICEP
     assert "storage firewall" in RUNBOOK
@@ -55,11 +72,11 @@ def test_budget_actions_target_authenticated_durable_kill_switch_handlers():
     assert "readControlRole" in BICEP
     assert "syncControlRole" in BICEP
     assert re.search(
-        r"var writeShutdownWebhookUri = 'https://\$\{budgetHookHost\}/api/budget/disable-writes\?code=",
+        r"var writeShutdownWebhookUri = 'https://\$\{budgetHookHost\}/budget/disable-writes\?code=",
         BICEP,
     )
     assert re.search(
-        r"var publicShutdownWebhookUri = 'https://\$\{budgetHookHost\}/api/budget/disable-public-api\?code=",
+        r"var publicShutdownWebhookUri = 'https://\$\{budgetHookHost\}/budget/disable-public-api\?code=",
         BICEP,
     )
     assert re.search(
@@ -80,7 +97,10 @@ def test_budget_actions_target_authenticated_durable_kill_switch_handlers():
     assert "platform_authenticated=True" in BUDGET_HOOK
     assert "create_budget_hook_app" in BUDGET_HOOK
     assert "from_managed_identity" in BUDGET_HOOK
-    assert "entities/delete" not in BICEP
+    budget_role = BICEP.split(
+        "resource budgetHookRoleDefinition 'Microsoft.Authorization/roleDefinitions"
+    )[1].split("resource replayWriterRoleDefinition")[0]
+    assert "entities/delete" not in budget_role
     for notification, threshold in (("actual50", 50), ("actual80", 80), ("actual100", 100)):
         assert re.search(
             rf"resource budget[\s\S]*?properties:\s*\{{\s*amount:\s*10"
@@ -97,6 +117,40 @@ def test_budget_actions_target_authenticated_durable_kill_switch_handlers():
     assert "Azure Function" in RUNBOOK
     assert "budget 80%" in RUNBOOK
     assert "budget 100%" in RUNBOOK
+
+
+def test_budget_hook_project_has_a_root_host_and_no_parent_checkout_requirement():
+    assert BUDGET_HOOK_HOST == {
+        "version": "2.0",
+        "extensions": {"http": {"routePrefix": ""}},
+    }
+    assert "-e ../../../" not in BUDGET_HOOK_REQUIREMENTS
+    assert ".." not in BUDGET_HOOK_REQUIREMENTS
+    assert "python scripts/package_budget_hook.py" in BUDGET_HOOK_README
+    assert "func azure functionapp publish APP_NAME" in BUDGET_HOOK_README
+    assert "shutil.copytree" in PACKAGE_HELPER
+    assert "wattracker" in PACKAGE_HELPER
+    assert "/budget/disable-writes" in BUDGET_HOOK_README
+    assert "/budget/disable-public-api" in BUDGET_HOOK_README
+    assert "/api/budget" not in BUDGET_HOOK_README
+
+
+def test_budget_hook_stager_copies_the_cloud_package_without_installing_the_repo(tmp_path):
+    helper_path = ROOT / "scripts" / "package_budget_hook.py"
+    spec = importlib.util.spec_from_file_location("package_budget_hook", helper_path)
+    assert spec is not None and spec.loader is not None
+    helper = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(helper)
+
+    # pytest supplies an isolated temp directory; the helper must not mutate
+    # the tracked Function project or require the repository parent at publish
+    # time.
+    staged = helper.stage_budget_hook(tmp_path / "budget-hook")
+    assert (staged / "host.json").is_file()
+    assert (staged / "requirements.txt").is_file()
+    assert (staged / "wattracker" / "cloud" / "budget_hook.py").is_file()
+    assert (staged / "wattracker" / "cloud" / "limits.py").is_file()
+    assert (staged / "wattracker" / "cloud" / "security.py").is_file()
 
 
 def test_apim_and_private_endpoint_parameters_are_removed_from_the_template():

@@ -15,9 +15,11 @@ revocable and never logged. The gateway decision and pricing evidence are in
 The Container Apps environment remains VNet-integrated but is public so
 clients can reach it directly. Storage uses the `Microsoft.Storage` service
 endpoint from the ACA subnet with a deny-by-default firewall; the external
-budget Function is admitted by its explicitly supplied possible outbound IPs.
+budget Function is admitted by a same-tenant resource-instance rule and its
+explicitly supplied possible outbound IPs.
 Shared keys, anonymous blobs, private endpoints, and private DNS are not used.
-The storage firewall admits only the ACA subnet and those Function egress IPs.
+The storage firewall admits only the ACA subnet, the budget Function resource
+instance, and those explicitly supplied Function egress IPs.
 Managed identities and Azure RBAC remain required. Production deployment
 inputs require a high-entropy operator token of at least 32 characters.
 Certificate presence and caller-controlled gateway headers are not application

@@ -54,9 +54,10 @@ and its tier requirement in the [Front Door FAQ](https://learn.microsoft.com/en-
 - Storage uses the [Microsoft.Storage service endpoint](https://learn.microsoft.com/en-us/azure/virtual-network/virtual-network-service-endpoints-overview)
   from the ACA subnet. Its public endpoint is enabled because service endpoints
   use it, but the [storage firewall](https://learn.microsoft.com/en-us/azure/storage/common/storage-network-security-virtual-networks)
-  is deny-by-default and allows only that subnet plus the external Function's
-  explicitly supplied possible outbound IPs. Shared keys and anonymous blobs
-  remain disabled; HTTPS and TLS 1.2 remain mandatory.
+  is deny-by-default and allows only that subnet, the same-tenant external
+  Function resource instance, and its explicitly supplied possible outbound
+  IPs. Shared keys and anonymous blobs remain disabled; HTTPS and TLS 1.2
+  remain mandatory.
 - The budget callback is an externally deployed Azure Function on Consumption,
   because the handler must remain alive when the apps are scaled to zero. The
   classic Consumption plan has no VNet integration, so Bicep accepts the
@@ -78,8 +79,8 @@ roughly `$2–5` rather than the former `$50` budget. Notifications are:
 | Threshold | Action |
 |---:|---|
 | 50% of amount | Billing notification |
-| 80% of amount | `POST /api/budget/disable-writes`, persists `writes_enabled=false`, reason `budget 80%` |
-| 100% of amount | `POST /api/budget/disable-public-api`, persists both levels disabled, reason `budget 100%` |
+| 80% of amount | `POST /budget/disable-writes`, persists `writes_enabled=false`, reason `budget 80%` |
+| 100% of amount | `POST /budget/disable-public-api`, persists both levels disabled, reason `budget 100%` |
 
 The budget callbacks accept only their fixed route action. They reject
 unauthenticated calls, do not select an action or reason from the alert body,

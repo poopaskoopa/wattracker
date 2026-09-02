@@ -27,7 +27,8 @@ assumptions are recorded in [`docs/azure-gateway-decision.md`](../../docs/azure-
 - The VNet has an ACA infrastructure subnet using the `Microsoft.Storage`
   service endpoint. Storage keeps its public endpoint enabled because service
   endpoints use it, but its firewall is deny by default and allows only that
-  subnet plus the explicitly supplied Function egress IPs.
+  subnet, the same-tenant budget Function resource instance, and the explicitly
+  supplied Function egress IPs.
 - Storage uses managed identity and Azure RBAC only. Shared keys, anonymous
   blobs, TLS below 1.2, private endpoints, and private DNS are not part of this
   profile. The read identity, sync identity, and budget-hook identity have
@@ -39,9 +40,20 @@ Provision the external Azure Functions Consumption app before applying this
 template. The classic Consumption plan has no VNet integration, so obtain all
 possible outbound IPv4 addresses from the Function resource and pass them as
 `budgetHookIpRules`. Keep that list synchronized when the Function's hosting
-resource changes. Deploy `infra/azure/budget-hook` with a system-assigned
-managed identity and these settings; see [Azure Functions networking
+resource changes. Stage and deploy `infra/azure/budget-hook` with a
+system-assigned managed identity and these settings; see [Azure Functions networking
 options](https://learn.microsoft.com/en-us/azure/azure-functions/functions-networking-options):
+
+```sh
+python scripts/package_budget_hook.py
+cd build/azure-budget-hook
+func azure functionapp publish APP_NAME
+```
+
+The staging command copies the repository's cloud package into the Function
+project. A raw publish from `infra/azure/budget-hook` cannot resolve a parent
+checkout, and the Function project intentionally has no editable parent
+requirement.
 
 - `WATTRACKER_STORAGE_ACCOUNT_NAME`: the storage account name.
 - `WATTRACKER_BUDGET_HOOK_TOKEN`: a separate app-level token for the
@@ -57,19 +69,20 @@ route-specific URLs, and appends the `code` query parameter. The deployment
 principal therefore needs permission to list host keys for that Function App;
 the key is never passed as a Bicep parameter. Rotate it with the Function
 deployment and redeploy this template. Pass the Function's complete
-possible outbound IP list as `budgetHookIpRules`; the storage firewall's
-`bypass` remains `None`. The fixed routes are:
+possible outbound IP list as `budgetHookIpRules`; the Storage firewall also
+allows the same-tenant Function resource instance, while its `bypass` remains
+`None`. The fixed routes are:
 
 Set `budgetStartDate` to the first day of the current budget period and
 `budgetEndDate` to its end date explicitly on every deployment. These are
 required parameters so a redeploy cannot silently reuse an obsolete period or
 reset the budget window to the date the template was authored.
 
-- `/api/budget/disable-writes`: at the 80% alert, persistently disables
+- `/budget/disable-writes`: at the 80% alert, persistently disables
   writes and leaves reads enabled, with reason `budget 80%`.
-- `/api/budget/disable-public-api`: at the 100% alert, persistently
+- `/budget/disable-public-api`: at the 100% alert, persistently
   disables the public API and writes, with reason `budget 100%`.
-- `/api/budget/clear`: operator recovery; requires the Function host key and
+- `/budget/clear`: operator recovery; requires the Function host key and
   the `X-Wattracker-Budget-Token` app-level header and restores both levels.
 
 The hook runs outside Container Apps so it remains callable when the public
@@ -82,8 +95,9 @@ explicit operator action that writes both levels enabled.
 - [ ] Images are signed and the cloud runtime imports successfully.
 - [ ] Both Container Apps have external HTTPS ingress and application-level
       credentials/signature checks; no gateway headers are trusted.
-- [ ] Storage firewall rules contain only the ACA subnet and current budget-hook
-      Function egress IPs; shared-key and anonymous-blob access remain disabled.
+- [ ] Storage firewall rules contain only the ACA subnet, the same-tenant
+      budget-hook Function resource instance, and current Function egress IPs;
+      shared-key and anonymous-blob access remain disabled.
 - [ ] The Function's managed identity object ID is passed to Bicep, its full
       possible egress-IP list is current, and both callback URLs use the
       current default host key resolved by Bicep.
