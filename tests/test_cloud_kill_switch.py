@@ -79,6 +79,19 @@ class _DurableMemoryBackend(MemorySecurityStateBackend):
     durable = True
 
 
+class _DelayedKillUpdateBackend(_DurableMemoryBackend):
+    def __init__(self) -> None:
+        super().__init__()
+        self.update_started = threading.Event()
+        self.allow_update = threading.Event()
+
+    def update(self, kind, key, transform):
+        self.update_started.set()
+        if not self.allow_update.wait(timeout=2):
+            raise RuntimeError("test update timed out")
+        return super().update(kind, key, transform)
+
+
 class _KillStateDown(_DurableMemoryBackend):
     """Every record kind works except the kill switch, whose read fails.
 
@@ -162,7 +175,7 @@ def _config(plane="all"):
         server_secret=SECRET,
         operator_token="operator-token",
         plane=plane,
-        require_apim_proof=False,
+        require_gateway_proof=False,
         clock=lambda: 1_000,
     )
 
@@ -794,6 +807,30 @@ def test_a_late_eighty_percent_action_cannot_re_enable_the_public_api():
     )
 
 
+def test_a_concurrent_eighty_percent_action_cannot_re_enable_the_public_api():
+    backend = _DelayedKillUpdateBackend()
+    errors = []
+
+    def apply_eighty_percent_action():
+        try:
+            disable_writes(backend, reason="budget-80")
+        except Exception as exc:  # pragma: no cover - assertion below reports it
+            errors.append(exc)
+
+    thread = threading.Thread(target=apply_eighty_percent_action)
+    thread.start()
+    assert backend.update_started.wait(timeout=2)
+    disable_public_api(backend, reason="budget-100")
+    backend.allow_update.set()
+    thread.join(timeout=2)
+
+    assert not thread.is_alive()
+    assert not errors
+    state = read_kill_switch(backend)
+    assert state.writes_enabled is False
+    assert state.public_enabled is False
+
+
 def test_the_severest_action_needs_no_readable_state():
     """The more severe the action, the fewer preconditions it has.
 
@@ -911,7 +948,7 @@ def test_production_refuses_a_process_local_kill_switch():
     backend = _DurableMemoryBackend()
     config = CloudConfig(
         server_secret=SECRET, operator_token="operator-token",
-        require_verified_subject=False, apim_proof_value="proof-value",
+        require_verified_subject=False, gateway_proof_value="proof-value",
     )
     with pytest.raises(RuntimeError, match="durable kill switch"):
         CloudState.create(

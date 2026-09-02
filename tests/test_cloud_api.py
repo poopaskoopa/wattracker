@@ -39,7 +39,7 @@ def cloud():
     config = CloudConfig(
         server_secret=SECRET,
         operator_token="operator-token",
-        require_apim_proof=False,
+        require_gateway_proof=False,
         clock=lambda: 1_000,
     )
     state = CloudState.create(config)
@@ -412,7 +412,7 @@ def test_future_skewed_nonce_is_not_pruned_early():
     config = CloudConfig(
         server_secret=SECRET,
         operator_token="operator-token",
-        require_apim_proof=False,
+        require_gateway_proof=False,
         clock=lambda: current[0],
     )
     state = CloudState.create(config)
@@ -443,7 +443,7 @@ def test_future_skewed_nonce_is_not_pruned_early():
 @pytest.mark.parametrize(
     "path,headers",
     [
-        ("/api/v1/context", {"X-APIM-Request-Proof": b"\xff"}),
+        ("/api/v1/context", {"X-Gateway-Request-Proof": b"\xff"}),
         ("/api/v1/enrollment/start", {"X-Operator-Token": b"\xff"}),
         ("/api/v1/context", {"Authorization": "Bearer token", "X-Verified-Entra-Subject": b"\xff"}),
     ],
@@ -452,8 +452,8 @@ def test_malformed_non_ascii_auth_headers_fail_closed(path, headers):
     config = CloudConfig(
         server_secret=SECRET,
         operator_token="operator-token",
-        require_apim_proof="X-APIM-Request-Proof" in headers,
-        apim_proof_value="private-proof" if "X-APIM-Request-Proof" in headers else "",
+        require_gateway_proof="X-Gateway-Request-Proof" in headers,
+        gateway_proof_value="private-proof" if "X-Gateway-Request-Proof" in headers else "",
     )
     state = CloudState.create(config)
     token, _ = state.credentials.issue_reader_context(
@@ -505,11 +505,11 @@ def test_reader_context_requires_the_apim_verified_subject_proof_by_default():
     assert response.status_code == 404
 
 
-def test_configured_apim_proof_cannot_be_forged_with_boolean_marker():
+def test_configured_gateway_proof_cannot_be_forged_with_boolean_marker():
     config = CloudConfig(
         server_secret=SECRET,
         operator_token="operator-token",
-        apim_proof_value="private-proof",
+        gateway_proof_value="private-proof",
     )
     state = CloudState.create(config)
     token, _ = state.credentials.issue_reader_context(
@@ -523,15 +523,15 @@ def test_configured_apim_proof_cannot_be_forged_with_boolean_marker():
     with TestClient(create_cloud_app(config, state=state)) as client:
         assert client.get(
             "/api/v1/context",
-            headers={**headers, "X-APIM-Request-Proof": "true"},
+            headers={**headers, "X-Gateway-Request-Proof": "true"},
         ).status_code == 404
         assert client.get(
             "/api/v1/context",
-            headers={**headers, "X-APIM-Request-Proof": "private-proof"},
+            headers={**headers, "X-Gateway-Request-Proof": "private-proof"},
         ).status_code == 200
 
 
-def test_empty_apim_proof_configuration_never_accepts_boolean_marker():
+def test_empty_gateway_proof_configuration_never_accepts_boolean_marker():
     config = CloudConfig(server_secret=SECRET, operator_token="operator-token")
     state = CloudState.create(config)
     token, _ = state.credentials.issue_reader_context(
@@ -543,18 +543,18 @@ def test_empty_apim_proof_configuration_never_accepts_boolean_marker():
             headers={
                 "Authorization": f"Bearer {token}",
                 "X-Verified-Entra-Subject": "subject",
-                "X-APIM-Request-Proof": "true",
+                "X-Gateway-Request-Proof": "true",
             },
         )
     assert response.status_code == 404
 
 
-@pytest.mark.parametrize("header", ["X-APIM-Request-Proof", "X-Verified-Entra-Subject"])
+@pytest.mark.parametrize("header", ["X-Gateway-Request-Proof", "X-Verified-Entra-Subject"])
 def test_non_ascii_reader_auth_headers_fail_closed(header):
     config = CloudConfig(
         server_secret=SECRET,
         operator_token="operator-token",
-        apim_proof_value="private-proof",
+        gateway_proof_value="private-proof",
     )
     state = CloudState.create(config)
     token, _ = state.credentials.issue_reader_context(
@@ -563,7 +563,7 @@ def test_non_ascii_reader_auth_headers_fail_closed(header):
     headers = {
         "Authorization": f"Bearer {token}",
         "X-Verified-Entra-Subject": "subject",
-        "X-APIM-Request-Proof": "private-proof",
+        "X-Gateway-Request-Proof": "private-proof",
     }
     headers[header] = b"\xe9"
     with TestClient(create_cloud_app(config, state=state)) as client:
@@ -575,7 +575,7 @@ def test_non_ascii_operator_token_header_fails_closed():
     config = CloudConfig(
         server_secret=SECRET,
         operator_token="operator-token",
-        require_apim_proof=False,
+        require_gateway_proof=False,
     )
     with TestClient(create_cloud_app(config)) as client:
         response = client.post(
@@ -653,6 +653,35 @@ def test_enrollment_is_operator_only_one_time_and_returns_opaque_credentials(clo
     ).status_code == 404
 
 
+def test_enrollment_works_without_a_gateway_and_ignores_subject_headers():
+    config = CloudConfig(
+        server_secret=SECRET,
+        operator_token="operator-token",
+        require_gateway_proof=False,
+        require_verified_subject=False,
+        clock=lambda: 1_000,
+    )
+    state = CloudState.create(config)
+    with TestClient(create_cloud_app(config, state=state)) as client:
+        started = client.post(
+            "/api/v1/enrollment/start",
+            headers={
+                "X-Operator-Token": "operator-token",
+                "X-Verified-Entra-Subject": "attacker-chosen-subject",
+            },
+        )
+        assert started.status_code == 200, started.text
+        completed = client.post(
+            "/api/v1/enrollment/complete",
+            headers={"X-Verified-Entra-Subject": "different-attacker-subject"},
+            json={
+                "invitation": started.json()["invitation"],
+                "public_key": (b"e" * 32).hex(),
+            },
+        )
+    assert completed.status_code == 200, completed.text
+
+
 def test_read_enrollment_is_usable_by_restarted_sync_and_read_planes():
     pytest.importorskip("cryptography")
     backend = MemorySecurityStateBackend()
@@ -660,7 +689,7 @@ def test_read_enrollment_is_usable_by_restarted_sync_and_read_planes():
         server_secret=SECRET,
         operator_token="operator-token",
         plane="read",
-        require_apim_proof=False,
+        require_gateway_proof=False,
         clock=lambda: 1_000,
     )
     read_state = CloudState.create(read_config, security_backend=backend)
@@ -695,7 +724,7 @@ def test_read_enrollment_is_usable_by_restarted_sync_and_read_planes():
         server_secret=SECRET,
         operator_token="operator-token",
         plane="sync",
-        require_apim_proof=False,
+        require_gateway_proof=False,
         clock=lambda: 1_000,
     )
     sync_state = CloudState.create(sync_config, security_backend=backend)
@@ -1122,7 +1151,7 @@ def test_enrollment_pairs_a_device_and_the_device_refreshes_after_restart(algori
         server_secret=SECRET,
         operator_token="operator-token",
         plane="read",
-        require_apim_proof=False,
+        require_gateway_proof=False,
         clock=lambda: 1_000,
     )
     read_state = CloudState.create(read_config, security_backend=backend)
@@ -1378,7 +1407,7 @@ def attested_cloud():
     config = CloudConfig(
         server_secret=SECRET,
         operator_token="operator-token",
-        apim_proof_value="proof-value",
+        gateway_proof_value="proof-value",
         clock=lambda: 1_000,
     )
     assert config.gateway_attests_subject
@@ -1486,7 +1515,7 @@ def test_pairing_code_expires_against_the_deployment_clock():
     clock = _MovableClock(1_000)
     config = CloudConfig(
         server_secret=SECRET, operator_token="operator-token",
-        require_apim_proof=False, clock=clock,
+        require_gateway_proof=False, clock=clock,
     )
     state = CloudState.create(config)
     client = TestClient(create_cloud_app(config, state=state))
@@ -1557,7 +1586,7 @@ def test_where_a_gateway_attests_a_subject_the_code_carries_it(attested_cloud):
     """
     pytest.importorskip("cryptography")
     _config, state, client = attested_cloud
-    proof = {"X-APIM-Request-Proof": "proof-value"}
+    proof = {"X-Gateway-Request-Proof": "proof-value"}
     subject_writer = _subject_writer(state, b"s", subject="rider@example.invalid")
     _private, public_key = generate_signing_keypair()
 
@@ -1799,14 +1828,14 @@ def test_pairing_still_requires_the_gateway_proof_where_one_is_configured():
     config = CloudConfig(
         server_secret=SECRET,
         operator_token="operator-token",
-        apim_proof_value="proof-value",
+        gateway_proof_value="proof-value",
         clock=lambda: 1_000,
     )
     state = CloudState.create(config)
     client = TestClient(create_cloud_app(config, state=state))
     writer = _writer(state, b"a")
     _private, public_key = generate_signing_keypair()
-    proof = {"X-APIM-Request-Proof": "proof-value"}
+    proof = {"X-Gateway-Request-Proof": "proof-value"}
 
     minted = client.post(
         MINT_PATH, headers={**_mint_headers(writer, nonce="proofed"), **proof}
@@ -1855,7 +1884,7 @@ def test_pairing_survives_a_read_plane_restart():
         server_secret=SECRET,
         operator_token="operator-token",
         plane="read",
-        require_apim_proof=False,
+        require_gateway_proof=False,
         clock=lambda: 1_000,
     )
     state = CloudState.create(config, security_backend=backend)
@@ -1920,7 +1949,7 @@ def test_production_refuses_to_trust_a_subject_header_with_no_gateway():
             server_secret=SECRET, operator_token="operator-token", **overrides
         )
 
-    ungated = _config(require_apim_proof=False)
+    ungated = _config(require_gateway_proof=False)
     assert ungated.require_verified_subject
     assert not ungated.gateway_attests_subject
     with pytest.raises(RuntimeError, match="verified-subject header requires a gateway"):
@@ -1929,9 +1958,9 @@ def test_production_refuses_to_trust_a_subject_header_with_no_gateway():
         )
 
     # Demanding the proof header without configuring a value is not a gateway
-    # either: `_apim_proof_valid` fails closed on an empty value, so nothing
+    # either: `_gateway_proof_valid` fails closed on an empty value, so nothing
     # would ever have overwritten the subject.
-    hollow = _config(apim_proof_value="")
+    hollow = _config(gateway_proof_value="")
     assert not hollow.gateway_attests_subject
     with pytest.raises(RuntimeError, match="verified-subject header requires a gateway"):
         CloudState.create(
@@ -1939,11 +1968,11 @@ def test_production_refuses_to_trust_a_subject_header_with_no_gateway():
         )
 
     # Declaring the truth boots, and so does keeping a real gateway.
-    declared = _config(require_apim_proof=False, require_verified_subject=False)
+    declared = _config(require_gateway_proof=False, require_verified_subject=False)
     assert CloudState.create(
         declared, security_backend=backend, require_persistent_security=True
     ) is not None
-    gated = _config(apim_proof_value="proof-value")
+    gated = _config(gateway_proof_value="proof-value")
     assert gated.gateway_attests_subject
     assert CloudState.create(
         gated, security_backend=backend, require_persistent_security=True
@@ -1963,7 +1992,7 @@ def test_pairing_needs_no_identity_provider_at_all():
     config = CloudConfig(
         server_secret=SECRET,
         operator_token="operator-token",
-        require_apim_proof=False,
+        require_gateway_proof=False,
         require_verified_subject=False,
         clock=lambda: 1_000,
     )
@@ -2025,7 +2054,7 @@ def test_an_ungated_deployment_never_reads_the_subject_header():
     config = CloudConfig(
         server_secret=SECRET,
         operator_token="operator-token",
-        require_apim_proof=False,
+        require_gateway_proof=False,
         require_verified_subject=False,
         clock=lambda: 1_000,
     )
@@ -2066,7 +2095,7 @@ def test_the_code_demands_a_subject_not_the_route(attested_cloud):
     minted = state.pairings.create(writer.namespace, writer.local_user_scope)
     assert minted.subject is None
 
-    paired = client.post(PAIR_PATH, headers={"X-APIM-Request-Proof": "proof-value"},
+    paired = client.post(PAIR_PATH, headers={"X-Gateway-Request-Proof": "proof-value"},
                          json={"code": minted.code, "public_key": public_key.hex()})
     assert paired.status_code == 200, paired.text
     device = state.credentials.resolve_device(paired.json()["device_credential"])
@@ -2087,7 +2116,7 @@ def test_credentials_outliving_their_gateway_still_resolve():
     config = CloudConfig(
         server_secret=SECRET,
         operator_token="operator-token",
-        require_apim_proof=False,
+        require_gateway_proof=False,
         require_verified_subject=False,
         clock=lambda: 1_000,
     )
@@ -2137,7 +2166,7 @@ def test_a_code_bound_to_an_identity_is_refused_once_nothing_attests_it():
     config = CloudConfig(
         server_secret=SECRET,
         operator_token="operator-token",
-        require_apim_proof=False,
+        require_gateway_proof=False,
         require_verified_subject=False,
         clock=lambda: 1_000,
     )
@@ -2180,13 +2209,13 @@ def test_a_placeholder_proof_value_cannot_claim_a_gateway():
 
     for placeholder in (" ", "\t", "  \n ", "0", "proof", "1234567"):
         with pytest.raises(ValueError, match="must be a secret"):
-            _cfg(apim_proof_value=placeholder)
+            _cfg(gateway_proof_value=placeholder)
 
     # An empty value remains legal: it is how a gateway-less deployment
     # declares itself, and CloudState.create refuses to serve a verified
     # subject on top of it.
-    assert not _cfg(apim_proof_value="").gateway_attests_subject
-    assert _cfg(apim_proof_value="proof-value").gateway_attests_subject
+    assert not _cfg(gateway_proof_value="").gateway_attests_subject
+    assert _cfg(gateway_proof_value="proof-value").gateway_attests_subject
 
 
 def _load_points(revision, ids):

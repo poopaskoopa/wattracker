@@ -174,6 +174,22 @@ def azure_backend(azure_sdk_enums):
     return AzureTableSecurityStateBackend(table), table
 
 
+def test_azure_backend_update_uses_an_etag_guarded_entity_update(azure_backend):
+    backend, table = azure_backend
+    key = counter_key(SCOPE_SUBJECT, NAMESPACE, "scope", METRIC_READ_REQUESTS)
+
+    assert backend.update(
+        QUOTA_RECORD_KIND, key, lambda current: {"value": 1}
+    ) == {"value": 1}
+    assert backend.update(
+        QUOTA_RECORD_KIND,
+        key,
+        lambda current: {"value": current["value"] + 1},
+    ) == {"value": 2}
+    assert table.updates == 1
+    assert table.conflicts == 0
+
+
 # ---------------------------------------------------------------------------
 # Surviving a restart and a replica change
 # ---------------------------------------------------------------------------
@@ -235,7 +251,7 @@ def test_the_read_plane_stays_exhausted_across_a_restart_over_http():
     backend = _DurableMemoryBackend()
     config = CloudConfig(
         server_secret=SECRET, operator_token="operator-token", plane="read",
-        require_apim_proof=False, clock=lambda: 1_000,
+        require_gateway_proof=False, clock=lambda: 1_000,
     )
     policy = QuotaPolicy(max_read_requests_per_day=2)
 
@@ -411,7 +427,7 @@ def test_several_cloud_states_share_one_durable_counter():
     backend = _DurableMemoryBackend()
     config = CloudConfig(
         server_secret=SECRET, operator_token="operator-token",
-        require_apim_proof=False, clock=lambda: 1_000,
+        require_gateway_proof=False, clock=lambda: 1_000,
     )
     policy = QuotaPolicy(max_read_bytes_per_day=100_000)
     states = [
@@ -588,7 +604,7 @@ def test_a_sync_write_is_refused_rather_than_stored_uncounted():
     backend = _BrokenCounterBackend()
     config = CloudConfig(
         server_secret=SECRET, operator_token="operator-token", plane="sync",
-        require_apim_proof=False, clock=lambda: 1_000,
+        require_gateway_proof=False, clock=lambda: 1_000,
     )
     state = CloudState.create(
         config,
@@ -643,7 +659,7 @@ def test_metering_after_the_fact_never_strands_a_rider():
     backend = _DurableMemoryBackend()
     config = CloudConfig(
         server_secret=SECRET, operator_token="operator-token", plane="read",
-        require_apim_proof=False, require_verified_subject=False,
+        require_gateway_proof=False, require_verified_subject=False,
         clock=lambda: 1_000,
     )
     state = CloudState.create(config, security_backend=backend)
@@ -718,7 +734,7 @@ def test_production_refuses_a_process_local_quota_manager():
     backend = _DurableMemoryBackend()
     config = CloudConfig(
         server_secret=SECRET, operator_token="operator-token",
-        require_verified_subject=False, apim_proof_value="proof-value",
+        require_verified_subject=False, gateway_proof_value="proof-value",
     )
     with pytest.raises(RuntimeError, match="durable quota counters"):
         CloudState.create(

@@ -83,12 +83,12 @@ class LocalServer:
             operator_token=secrets.token_urlsafe(24),
             plane="all",
             require_subscription=True,
-            # No APIM in front of a loopback server, so no proof to demand and
+            # No gateway in front of a loopback server, so no proof to demand and
             # -- crucially -- no verified-subject header to trust. Both flags
             # off together is the honest configuration: a deployment that
             # claimed to enforce a subject with nothing issuing one would be a
             # control in name only, and CloudState refuses to start that way.
-            require_apim_proof=False,
+            require_gateway_proof=False,
             require_verified_subject=False,
             allowed_origins=(),
         )

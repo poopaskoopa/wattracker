@@ -1,29 +1,26 @@
 # Cloud sync — security review follow-ups
 
-Working document for the remaining work on PR #92 (`agent2/issue59`). Delete this file in the
-commit that closes the last open item.
+Historical security-review notes retained as an audit trail. Current deployment
+decisions are recorded in [`docs/azure-gateway-decision.md`](azure-gateway-decision.md)
+and the implementation contract in [`infra/azure/README.md`](../infra/azure/README.md).
 
 Baseline: PR head `307b5b3`, in the dedicated `agent2/pr92-readiness` worktree. The PR was
 `MERGEABLE`/`CLEAN` with no reported checks or formal approval.
 
-## Current execution plan
+## Current #164 status
 
-Step 1 is complete: work continues from PR head `307b5b3` in a dedicated worktree. Steps 2--4
-are implemented here; the remaining work is verification and review:
+The managed gateway decision is complete: APIM and private storage endpoints
+are removed, Container Apps use public HTTPS ingress, and Storage uses service
+endpoints plus a deny-by-default firewall. #179 durable quotas and #181's
+durable kill switch are hard dependencies and are present on the base branch.
+Budget alerts now call the authenticated external Function described in the
+decision record; the Function is outside Container Apps so it remains callable
+when the API is disabled or scaled to zero.
 
-1. Run the cloud-enabled suite, image/runtime checks, Bicep validation, and `git diff --check`.
-2. Request a fresh security review and approval.
-
-For this three-user deployment, do not provision Azure resources or spend time changing
-APIM/VNet-specific infrastructure until the deployment profile is chosen. The preferred
-lean profile should be evaluated before retaining the current enterprise-shaped topology.
-If GitHub Actions billing remains disabled, record the local-only validation gate rather
-than treating a non-running workflow as green.
-
-Local validation so far: all 50 cloud tests pass with `.[cloud]`; the broader suite passes
-`2181` tests with `13` expected skips when the two socket-restricted test files are excluded.
-This host has no Docker or Azure CLI, so the workflow's image import/build and Bicep steps remain
-to be exercised in CI or on a host with those tools.
+Validation still required before merge: cloud-enabled tests, Bicep build,
+Function packaging/import checks, `git diff --check`, a budget drill, and a
+fresh security review. A non-running CI workflow is not evidence of a green
+check.
 
 ## How to work in this repo
 
@@ -50,10 +47,10 @@ All five blockers from the security review are fixed and verified in `6431b82` (
 | ID | Finding | Resolution |
 |----|---------|-----------|
 | B1 | Replay guard used the client's `X-Writer-Timestamp` as its clock; pruning was global, so one writer could expire another's nonce | `now=now` at the `nonces.accept` call site; `MIN_REPLAY_TTL_SECONDS = 600`; `CloudConfig.replay_ttl_seconds` validated against the freshness window; durable `claim_replay` on a `CloudReplay` table with etag-guarded compare-and-swap |
-| B2 | Public container ingress; "mTLS" was a forgeable `x-apim-client-certificate-verified` header | `require_mtls`/`mtls_header` deleted outright; ACA environment `internal: true`, `external: false` on both apps |
-| B3 | `validate-client-certificate` bound no identity | Policy and the cert-as-auth-factor claim removed; APIM on Standard SKU with `virtualNetworkType: 'External'` |
+| B2 | Public container ingress; "mTLS" was a forgeable `x-apim-client-certificate-verified` header | The certificate header and trust claim were deleted. #164 deliberately uses public ACA HTTPS ingress with application credentials and signatures as the compensating controls. |
+| B3 | `validate-client-certificate` bound no identity | No managed gateway or certificate proxy is provisioned. The public-origin tradeoff and compensating controls are recorded in `docs/azure-gateway-decision.md`. |
 | B4 | Daily quotas were per-process dicts under `minReplicas: 0` | Closed by #179: counters are durable, charged with an etag-guarded compare-and-swap, and `require_persistent_security=True` refuses a process-local manager. APIM `quota-by-key` is no longer the control the app depends on |
-| B5 | `hmac.compare_digest` raised `TypeError` on non-ASCII latin-1 headers, including a pre-auth site on every request | `_safe_compare_text` at all three sites; the `marker == "true"` fallback in `_apim_proof_valid` also removed |
+| B5 | `hmac.compare_digest` raised `TypeError` on non-ASCII latin-1 headers, including a pre-auth site on every request | `_safe_compare_text` at all three sites; the `marker == "true"` fallback in `_gateway_proof_valid` also removed |
 
 Regression coverage for B1/B5 lives in `tests/test_cloud_api.py`
 (`test_future_skewed_nonce_is_not_pruned_early` and the non-ASCII header tests) and
@@ -158,16 +155,15 @@ subject it is applied as an additional binding on top of the code — and
 claims `require_verified_subject` while nothing attests one, so removing the gateway is a
 configuration change rather than a silent downgrade.
 
-Still open in the same area, and deliberately not in #152's scope:
+Resolved by #164:
 
-- APIM does not declare the `/devices/*` operations, so neither route is reachable through the
-  gateway until #165 adds them. Both are exercised end to end against the ASGI app.
-- **If #164 removes the gateway, `enrollment/start` and `enrollment/complete` still require a
-  verified-subject header unconditionally, and no JWT is validated to produce it.** Those routes
-  are operator-token gated and their real secret is the one-time invitation, so this is not an
-  open hole, but the subject check there becomes decorative and should be either removed or
-  re-anchored in the same change. Pairing, reads, and refresh already handle a gateway-less
-  deployment.
+- The `/devices/*` routes are reached through the public Container App HTTPS ingress; there is
+  no gateway operation inventory or #165 APIM exposure work remaining.
+- `enrollment/start` and `enrollment/complete` use the operator token, one-time invitation, and
+  writer public key in a gateway-less deployment. Subject binding is conditional and an
+  identity-bound invitation cannot be redeemed without the attestation that created it.
+- The durable budget hook runs outside Container Apps, writes the dedicated shared `CloudControl` kill-switch
+  row with its least-privilege managed identity, and is addressed by the two budget Action Groups.
 - There is still no revocation route, so a lost paired device is revoked only by
   `CredentialRegistry.revoke_device` in library code (#153).
 
@@ -193,7 +189,9 @@ Still open in the same area, and deliberately not in #152's scope:
   `_error`/`_not_found` set.
 - `limits.py:69` + `api.py:469,497,559` — global `max_backend_concurrency: 2`; two slow backend
   calls 429 every other tenant.
-- `api.py:63` — `operator_token` minimum length is 8 characters.
+- `CloudConfig` keeps an 8-character floor for local/test dependency injection; the production
+  Bicep parameter and `cloud.runtime` require at least 32 characters. Entropy, rotation, and
+  secret storage remain deployment-operator responsibilities.
 - `main.bicep:354` — `stagingEnvironmentPolicy: 'Enabled'` creates publicly reachable PR preview
   environments.
 - Expired invitation/context rows in `CloudAuth` are never deleted (no role has a delete action);
@@ -201,19 +199,17 @@ Still open in the same area, and deliberately not in #152's scope:
   their row address omits the day and the first charge of a new day reclaims the row in place, so
   they are bounded by the number of (subject, metric) pairs. If a cleanup job with a delete role
   ever exists, quota rows need nothing from it.
-- ~~The budget kill switch is still process-local.~~ Fixed in #181: the two levels live in one
-  `kill-switch` row in `CloudAuth`, read on the admission path with a 30-second staleness window,
-  failing closed on an unreadable state. Two things it deliberately left alone. First, the switch
-  is written with the backend's plain upsert rather than an etag-guarded compare-and-swap: it is a
-  level an operator declares outright, not an increment, so last-writer-wins is the intended
-  semantics — but that means two operators racing at the same second get one of the two states,
-  not a merge. Second, the row is in `CloudAuth`, so the sync identity can read it and not write
-  it; if a future budget hook ever runs as the sync identity, it will need read/write on
-  `CloudAuth` or its own table, which is a Bicep change (#164 owns that file).
+- ~~The budget kill switch is still process-local.~~ Fixed in #181 and wired by #164: the two
+  levels live in one `kill-switch` row in `CloudControl`, read on the admission path with a 30-second
+  staleness window, failing closed on an unreadable state. The external budget Function receives
+  the narrowly scoped read/add/update role it needs on `CloudControl`; it does not use a Container App
+  identity and remains available when those apps are scaled to zero. Full operator declarations use
+  plain upsert, while the 80% and 100% partial level actions use etag-guarded updates so a delayed
+  80% notification cannot re-enable a public API already disabled at 100%.
 - The per-second global window (`global_requests_per_second`) and the backend concurrency semaphore
   are process-local by design, so N replicas allow N times the configured rate. That is correct for
-  a load shaper and wrong for anyone reading it as a global limit; with APIM removed (#164) it is
-  the only rate limit left, so the number should be revisited against replica count.
+  a load shaper and wrong for anyone reading it as a global limit; with no managed gateway in #164,
+  durable application quotas, not this window, are the cost control.
 - Read-plane and sync-plane counters live in different tables (`CloudAuth` and `CloudReplay`),
   because the sync identity holds only read access to `CloudAuth`. Read metrics charged by the sync
   plane's `/api/v1/sync/status` therefore do not share a counter with the read plane's. Worst case
@@ -248,6 +244,8 @@ Probed specifically during review; do not spend time re-auditing these without n
 - **Decompression.** A 400 MiB gzip bomb is refused with 413 at 64 MiB peak allocation.
 - **Secrets.** No hardcoded credentials, no logging in `wattracker/cloud/`, no secret or exception
   text in any response body.
-- **Storage account posture.** Public network access disabled, shared key disabled, HTTPS-only,
-  TLS 1.2 minimum, deny-by-default network ACLs with `bypass: 'None'`, private endpoints and DNS
-  for blob and table, least-privilege custom data-plane roles without delete for the sync identity.
+- **Storage account posture.** Public network access is enabled only because service endpoints
+  use the public service hostname; shared keys and anonymous blobs remain disabled, HTTPS-only and
+  TLS 1.2 minimum remain enforced, and deny-by-default network ACLs with `bypass: 'None'` admit only
+  the ACA subnet and the explicitly supplied budget-Function egress IPs. Private endpoints and DNS
+  are intentionally not provisioned; custom data-plane roles still omit delete for the sync identity.

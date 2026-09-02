@@ -1,52 +1,109 @@
+import re
 from pathlib import Path
 
 
 ROOT = Path(__file__).parents[1]
 BICEP = (ROOT / "infra" / "azure" / "main.bicep").read_text()
 RUNBOOK = (ROOT / "docs" / "cloud-sync.md").read_text()
+BUDGET_HOOK = (ROOT / "infra" / "azure" / "budget-hook" / "function_app.py").read_text()
+BUDGET_HOOK_IMPL = (ROOT / "wattracker" / "cloud" / "budget_hook.py").read_text()
 
 
-def test_container_origins_are_private_to_the_internal_environment():
+def test_public_container_apps_are_tls_terminated_and_authenticate_at_the_app():
     assert "vnetConfiguration:" in BICEP
-    assert "internal: true" in BICEP
-    assert BICEP.count("external: false") == 2
-    assert "ipSecurityRestrictions" not in BICEP
-    assert "apimBackendIpRanges" not in BICEP
+    assert "internal: false" in BICEP
+    assert BICEP.count("external: true") == 2
+    assert BICEP.count("allowInsecure: false") == 2
     assert BICEP.count("clientCertificateMode: 'Ignore'") == 2
-    assert "environment is internal" in RUNBOOK
-    assert "both app ingresses are non-external" in RUNBOOK
-    assert "private Container App FQDNs" in RUNBOOK
+    assert "readIdentity.properties.clientId" in BICEP
+    assert "syncIdentity.properties.clientId" in BICEP
+    assert "Microsoft.ApiManagement" not in BICEP
+    assert "X-APIM-Request-Proof" not in BICEP
+    assert "public HTTPS ingress" in RUNBOOK
+    assert "application enforces" in RUNBOOK
 
 
-def test_apim_uses_vnet_and_does_not_claim_client_certificate_authentication():
-    assert "sku: { name: 'Standard'; capacity: 1 }" in BICEP
-    assert "virtualNetworkType: 'External'" in BICEP
-    assert "virtualNetworkConfiguration:" in BICEP
-    assert "subnetResourceId: resourceId('Microsoft.Network/virtualNetworks/subnets', vnetName, 'apim')" in BICEP
-    assert "<validate-client-certificate" not in BICEP
-    assert "X-APIM-Client-Certificate-Verified" not in BICEP
-    assert "authentication-certificate" not in BICEP
-    assert "X-APIM-Request-Proof" in BICEP
+def test_storage_uses_service_endpoints_and_a_deny_by_default_firewall():
+    assert "publicNetworkAccess: 'Enabled'" in BICEP
+    assert "allowBlobPublicAccess: false" in BICEP
+    assert "allowSharedKeyAccess: false" in BICEP
+    assert "defaultAction: 'Deny'" in BICEP
+    assert "bypass: 'None'" in BICEP
+    assert "serviceEndpoints:" in BICEP
+    assert "service: 'Microsoft.Storage'" in BICEP
+    assert "budgetHookIpRules" in BICEP
+    assert "ipRules:" in BICEP
+    assert "virtualNetworkRules:" in BICEP
+    assert "Microsoft.Network/privateEndpoints" not in BICEP
+    assert "Microsoft.Network/privateDnsZones" not in BICEP
+    assert "storage firewall" in RUNBOOK
+    assert "anonymous blobs" in RUNBOOK
 
 
-def test_production_app_limits_are_documented_as_durable_not_best_effort():
-    """The app's daily counters are the cost control, not a backstop.
+def test_budget_actions_target_authenticated_durable_kill_switch_handlers():
+    assert "budgetHookRoleDefinition" in BICEP
+    assert "budgetHookPrincipalId" in BICEP
+    assert "budgetHookHost" in BICEP
+    assert "budgetHookFunctionKey" in BICEP
+    assert "name: 'CloudAuth'" in BICEP
+    assert "name: 'CloudControl'" in BICEP
+    assert "controlReaderRoleDefinition" in BICEP
+    assert "assignableScopes: [controlTable.id]" in BICEP
+    assert "readControlRole" in BICEP
+    assert "syncControlRole" in BICEP
+    assert re.search(
+        r"var writeShutdownWebhookUri = 'https://\$\{budgetHookHost\}/api/budget/disable-writes\?code=",
+        BICEP,
+    )
+    assert re.search(
+        r"var publicShutdownWebhookUri = 'https://\$\{budgetHookHost\}/api/budget/disable-public-api\?code=",
+        BICEP,
+    )
+    assert re.search(
+        r"resource writeShutdownActionGroup[\s\S]*?serviceUri: writeShutdownWebhookUri",
+        BICEP,
+    )
+    assert re.search(
+        r"resource publicShutdownActionGroup[\s\S]*?serviceUri: publicShutdownWebhookUri",
+        BICEP,
+    )
+    assert '"/budget/disable-writes"' in BUDGET_HOOK_IMPL
+    assert '"/budget/disable-public-api"' in BUDGET_HOOK_IMPL
+    assert "disable_writes" in BUDGET_HOOK_IMPL
+    assert "disable_public_api" in BUDGET_HOOK_IMPL
+    assert "AuthLevel.FUNCTION" in BUDGET_HOOK
+    assert "create_budget_hook_app" in BUDGET_HOOK
+    assert "from_managed_identity" in BUDGET_HOOK
+    assert "entities/delete" not in BICEP
+    assert "amount: 10" in BICEP
+    assert "threshold: 8" in BICEP
+    assert "threshold: 10" in BICEP
+    assert "param budgetStartDate string" in BICEP
+    assert "param budgetEndDate string" in BICEP
+    assert "@minLength(32)" in BICEP
+    assert "startDate: budgetStartDate" in BICEP
+    assert "endDate: budgetEndDate" in BICEP
+    assert "startDate: '2026-01-01'" not in BICEP
+    assert "Azure Function" in RUNBOOK
+    assert "budget 80%" in RUNBOOK
+    assert "budget 100%" in RUNBOOK
 
-    #164 removes the gateway whose `quota-by-key` policy used to be the only
-    durable limit, so the runbook must not still tell an operator that the
-    app-side counters reset on every replica change -- they do not, and an
-    operator who believes they do has no reason to trust any of them.
-    """
 
-    assert "name: 'CloudReplay'" in BICEP
-    assert "replay-writer" in BICEP
-    assert "best-effort" not in RUNBOOK
-    assert "**The app-side daily quota counters are durable.**" in RUNBOOK
-    assert "refuses a non-durable quota manager at boot" in RUNBOOK
-    # The gateway policies stay documented while the gateway exists; what
-    # changed is that the app no longer depends on them.
-    assert '<quota-by-key calls="1000" renewal-period="86400"' in BICEP
-    assert '<rate-limit-by-key calls="60" renewal-period="60"' in BICEP
+def test_apim_and_private_endpoint_parameters_are_removed_from_the_template():
+    for legacy in (
+        "param publicApiEnabled",
+        "param writesEnabled",
+        "param tenantId",
+        "param apimKeyVaultName",
+        "param apimCertificateSecretUri",
+        "param apimHostName",
+        "param publisherEmail",
+        "param apiAudience",
+        "param apimProofSecret",
+        "virtualNetworkType:",
+        "apim-proof-secret",
+    ):
+        assert legacy not in BICEP
 
 
 def test_cleanup_delete_identity_is_not_deployed_without_a_cleanup_job():

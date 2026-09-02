@@ -2,44 +2,42 @@
 
 ## Boundary and identities
 
-APIM is the sole public HTTPS boundary. Clients use an approved APIM
-subscription and tenant-issued enrollment/pairing token. Registration is not
-open: an operator creates or approves the *first* enrollment for a rider,
-binds it to the tenant/user, and issues a short-lived one-time pairing token.
-Every device that rider adds afterwards is paired by their own desktop
-install, which is the identity authority for its namespace, with a one-time
-code and no operator credentials — see the pairing section below. Tokens are
-revocable and never logged. The exact Entra tenant, issuer, audience, scopes,
-certificate, and secret references are deployment inputs, not repository
-secrets.
+The selected deployment has no managed API gateway. The read and sync
+Container Apps expose public HTTPS ingress, while the application enforces
+server-issued credentials, signed request envelopes, durable quotas, and the
+durable kill switch. Registration is not open: an operator creates the first
+enrollment for a rider and issues a short-lived one-time invitation. Every
+device added afterwards is paired by the rider's desktop with a one-time code
+and no operator credentials — see the pairing section below. Tokens are
+revocable and never logged. The gateway decision and pricing evidence are in
+[`docs/azure-gateway-decision.md`](azure-gateway-decision.md).
 
-The read service serves API routes through APIM; the sync service accepts only
-APIM-proofed traffic and performs writes. The Container Apps managed
-environment is internal and both app ingresses are non-external, so their
-private FQDNs are reachable only through the APIM Standard External VNet
-integration in the same VNet. Managed identities, private Blob/Table
-endpoints, and private DNS are required. No storage account key,
-anonymous blob URL, or public storage firewall exception is permitted.
-The authentication factors are APIM subscription plus signed writer requests
-for writes and sync status, and APIM-validated Entra JWT plus a bound reader
-context for reads. Certificate presence is not an application authentication
-factor.
+The Container Apps environment remains VNet-integrated but is public so
+clients can reach it directly. Storage uses the `Microsoft.Storage` service
+endpoint from the ACA subnet with a deny-by-default firewall; the external
+budget Function is admitted by its explicitly supplied possible outbound IPs.
+Shared keys, anonymous blobs, private endpoints, and private DNS are not used.
+The storage firewall admits only the ACA subnet and those Function egress IPs.
+Managed identities and Azure RBAC remain required. Production deployment
+inputs require a high-entropy operator token of at least 32 characters.
+Certificate presence and caller-controlled gateway headers are not application
+authentication factors.
 
 ## Public routes and controls
 
-The published API is HTTPS-only and subscription-protected. The versioned
+The published API is HTTPS-only and application-authenticated. The versioned
 contract is:
 
 | Route | Plane | Authentication | Capability |
 |---|---|---|---|
-| `POST /api/v1/enrollment/start` | read | operator token + APIM proof + verified subject | — |
-| `POST /api/v1/enrollment/complete` | read | one-time invitation + APIM proof + verified subject | — |
-| `POST /api/v1/context/refresh` | read | signed device credential + APIM proof + verified subject | `read` |
-| `POST /api/v1/devices/pairing-codes` | read | APIM subscription + signed writer request + APIM proof + verified subject | `write` |
-| `POST /api/v1/devices/pair` | read | one-time pairing code + APIM proof | — |
-| `GET /api/v1/devices` | read | APIM subscription + signed writer-or-device request + APIM proof + verified subject | `read` |
-| `POST /api/v1/devices/{credential_id}/revoke` | read | APIM subscription + signed writer-or-device request + APIM proof + verified subject | `read` |
-| `GET /api/v1/context` | read | reader context + APIM proof + verified subject | — |
+| `POST /api/v1/enrollment/start` | read | operator token + conditional attested subject | — |
+| `POST /api/v1/enrollment/complete` | read | one-time invitation + writer public key + conditional attested subject | — |
+| `POST /api/v1/context/refresh` | read | signed device credential + conditional attested subject | `read` |
+| `POST /api/v1/devices/pairing-codes` | read | server-issued writer credential + signed request + conditional attested subject | `write` |
+| `POST /api/v1/devices/pair` | read | one-time pairing code | — |
+| `GET /api/v1/devices` | read | signed writer-or-device request + conditional attested subject | `read` |
+| `POST /api/v1/devices/{credential_id}/revoke` | read | signed writer-or-device request + conditional attested subject | `read` |
+| `GET /api/v1/context` | read | reader context + conditional attested subject | — |
 | `GET /api/v1/context/calendar` | read | reader context | — |
 | `GET /api/v1/context/activities` | read | reader context | — |
 | `GET /api/v1/context/activities/{id}` | read | reader context | — |
@@ -47,8 +45,8 @@ contract is:
 | `GET /api/v1/context/dashboard` | read | reader context | — |
 | `GET /api/v1/context/volume` | read | reader context | — |
 | `GET /api/v1/context/curve` | read | reader context | — |
-| `POST /api/v1/sync/batches` | sync | APIM subscription + signed request | `write` |
-| `GET /api/v1/sync/status` | sync | APIM subscription + signed request | `write` |
+| `POST /api/v1/sync/batches` | sync | server-issued writer credential + signed request | `write` |
+| `GET /api/v1/sync/status` | sync | server-issued writer credential + signed request | `write` |
 
 ### Mobile read context
 
@@ -103,18 +101,19 @@ the drop described above. The field is inside the HMAC-signed payload, so a
 client cannot move its own checkpoint by editing it; the scope binding stays
 in the signing key, so a cursor still cannot be replayed into another scope.
 
-Every "verified subject" above is conditional on
+Every "attested subject" above is conditional on
 `CloudConfig.require_verified_subject`, which a deployment may only set while a
 gateway actually attests one — see "The subject is an optional binding" below.
 `POST /api/v1/devices/pair` is the one route that never requires a subject at
 all: the pairing code is the authorization.
 
-Enrollment and pairing validate tenant, user/device binding, expiry, nonce, and
-replay state. Enrollment returns a server-generated writer subscription key;
-the caller's APIM subscription key is never reused as the writer credential.
-APIM applies an allow-listed CORS origin, 60 requests/minute and 1,000
-requests/day per subscription. Set the deployment kill switch to return 503
-before emergency maintenance.
+Enrollment and pairing validate device binding, expiry, nonce, and replay state.
+Enrollment returns a server-generated writer subscription key; it is an app
+credential, not a gateway subscription, and is never copied from a caller.
+CORS is limited to the exact configured PWA origin. Durable application quotas
+and the kill switch are authoritative; the process-local per-second window is
+only a per-replica load shaper. Set the kill switch to return 503 before
+emergency maintenance.
 
 ## Paired devices, capabilities, and reader-context refresh
 
@@ -207,8 +206,7 @@ phone, holding no credential at all
 envelope — `X-Writer-Credential`, `-Timestamp`, `-Nonce`,
 `-Idempotency-Key`, `-Revision`, `-Signature` over the same
 `canonical_request` framing, the same 300-second freshness window, and the
-same nonce-replay claim — plus the APIM subscription and the
-gateway-verified Entra subject. The idempotency key is the fixed string
+same nonce-replay claim. The idempotency key is the fixed string
 `device-pairing-code` and the revision is `0`, because there is nothing here
 for a caller to choose.
 
@@ -320,48 +318,35 @@ The entropy arithmetic, because the number is the control:
 | Length | 12 symbols → **60 bits** |
 | Code space | 2^60 = 1,152,921,504,606,846,976 ≈ 1.15 × 10^18 |
 | TTL ceiling | 900 s (default 600 s) |
-| APIM limits | 60 requests/minute and 1,000/day per subscription key |
+| Deployment shaping | 100 requests/second and two backend slots per warm replica; not a global quota |
 
-Inside the 900-second ceiling one subscription key buys at most
-15 × 60 = **900** guesses — below the 1,000/day cap, so the per-minute limit
-is what binds. One key therefore succeeds with probability
-900 / 2^60 = 7.8 × 10^-16.
-
-Sizing it from the other direction: to keep an attacker holding 1,000
-subscription keys — each spending a full daily budget inside one code's
-lifetime, so 9 × 10^5 guesses — below a 2^-32 chance, the code needs
-2^b ≥ 9 × 10^5 × 2^32 ≈ 3.9 × 10^15, i.e. **b ≥ 52 bits**. Sixty bits clears
-that floor by 8 bits, a factor of 256. The APIM product issues one
-subscription per approved account (`approvalRequired: true`,
-`subscriptionsLimit: 1`), so 1,000 keys is already a generous overestimate of
-a real attacker; the limits are keyed on
-`context.Subscription?.Id ?? context.Request.IpAddress`.
+The selected profile has no provider per-key quota in front of the pairing
+route. The 60-bit, single-use code and 900-second ceiling are therefore the
+guessing bound; the process-local request window is only load shaping and may
+multiply with replicas. A failed guess does not reveal whether a code exists
+and does not spend a valid code. Durable application quotas protect
+authenticated scopes after a credential or code establishes one. An
+unauthenticated pairing probe necessarily performs one bounded credential-table
+lookup before a rider scope exists; edge/durable anonymous rate limiting is an
+explicit follow-up rather than a control this deployment claims to provide.
 
 The TTL ceiling is enforced in `DevicePairingRegistry`, not left to callers,
 because the whole argument above is stated against a bounded window.
 
-### Not yet reachable through the gateway
+### Direct public ingress
 
-`main.bicep` enumerates APIM operations explicitly and does not yet declare
-`/devices/pairing-codes` or `/devices/pair`, so neither is reachable through
-APIM until #165 adds them.
+The selected deployment reaches `/api/v1/devices/*`, enrollment, reads, and
+sync directly through the public Container App HTTPS endpoints; there is no
+gateway operation inventory to keep in sync. The app's exact-origin CORS
+middleware and route-level credentials apply to every route.
 
-If the gateway survives, note that APIM's API-level policy requires a validated
-Entra JWT for every path not containing `/sync/`, which is what supplies
-`X-Verified-Entra-Subject`; the desktop would then need a live rider sign-in to
-mint, not only its writer credential. APIM's `allowed-headers` CORS list also
-still lacks the `x-device-*` headers the app's own CORS middleware permits.
-
-If it does not — #164 is weighing the gateway's $330–700/month against a
-$2–5/month deployment — then the replacement deployment sets
-`require_verified_subject=False` and pairing continues to work untouched,
-because the code was never leaning on the gateway for anything. What that
-deployment still owes is a replacement for the parts that *do* lean on it:
-`enrollment/start` and `enrollment/complete` still require a subject header
-unconditionally, and the operator token plus the one-time invitation are the
-only real secrets on those routes once no JWT is validated. That is bootstrap,
-it is operator-driven, and it is out of scope here — but it must not be
-forgotten when the gateway goes.
+`require_verified_subject=False` is explicit in the production runtime.
+Enrollment start therefore uses the operator token alone, enrollment complete
+uses the one-time invitation and public key, and both routes ignore any
+caller-supplied subject header. A subject remains an optional additional
+binding only for a separately configured proxy deployment; an invitation bound
+to a subject cannot be redeemed when that attestation is absent. Pairing and
+refresh continue to work without an identity provider on the device.
 
 ## Revoking a lost device
 
@@ -527,19 +512,29 @@ The payload validator permits up to 16,384 array items for realistic long
 streams; the existing 512 KiB object and decompression limits still apply.
 
 The deployed container entrypoint is `python -m wattracker.cloud.runtime`. It
-constructs `AzureTenantStore` with managed identity and private Blob/Table
+constructs `AzureTenantStore` with managed identity and Storage service
 endpoints; shared credential/context state is persisted in the separate
 `CloudAuth` table, and replay claims plus daily quota counters in `CloudReplay`
-on the sync plane and in `CloudAuth` on the read plane. The in-memory stores are
+on the sync plane and in `CloudAuth` on the read plane. The `CloudControl` table
+holds the kill switch and is read by both planes. The in-memory stores are
 test-only. Images, server secret,
-operator token, APIM proof secret, storage account, and exact origin are
-deployment inputs. APIM overwrites a private proof header on every backend
-request; containers reject requests that merely forge a boolean marker or
+operator token, storage account, and exact origin are deployment inputs. The
+production runtime disables gateway proof and verified-subject compatibility
+gates; containers reject requests that merely forge a boolean marker or
 certificate header.
 
 ## Operations and cost
 
-The Bicep budget alerts at 50%, 80%, and 100% actual usage.
+The Bicep monthly budget is `$10`, with actual-dollar alerts at `$5` (50%), `$8`
+(80%), and `$10` (100%). The 80% and 100% notifications invoke authenticated
+Azure Function routes outside Container Apps: `disable-writes` persists the
+80% state with reason `budget 80%`, and `disable-public-api` persists the 100%
+state with reason `budget 100%`. The Function is a separately deployed
+Consumption app; keep its possible outbound IP list synchronized in
+`budgetHookIpRules`. See
+[`docs/azure-gateway-decision.md`](azure-gateway-decision.md) for the deployment
+contract and drill. Supply `budgetStartDate` and `budgetEndDate` explicitly so
+the budget period is current and is not inherited from a stale template date.
 
 **The app-side daily quota counters are durable.** Uploaded bytes, stored
 objects, read bytes, and read requests are each counted per rider scope *and*
@@ -573,13 +568,13 @@ also burn its daily upload allowance.
 Two app-side limits stay deliberately process-local, because they shape one
 replica's instantaneous load rather than a day's spend: the
 100-request-per-second global window and the two-slot backend concurrency
-semaphore. APIM's `quota-by-key` and `rate-limit-by-key` policies remain
-configured while the gateway exists, but the daily budgets no longer depend on
-them.
+semaphore. They are load shapers, not global security or billing quotas; the
+durable application counters are the authoritative daily limits.
 
 **The budget kill switch is durable.** It is the last line of cost protection,
 so it is not a boolean in a replica that scales to zero — it is one row in the
-shared `CloudAuth` table, read on the admission path of every request.
+dedicated shared `CloudControl` table, read on the admission path of every
+request.
 
 *Two levels, matching the two budget thresholds.* `public_enabled` is the wider
 one: every route, read or write, checks it, so clearing it stops the
@@ -587,12 +582,12 @@ deployment. `writes_enabled` stops only the sync plane's admissions. They are
 stored independently, because the 80% and 100% actions fire independently and
 may arrive in either order.
 
-*It lives in `CloudAuth`, not in the plane's own quota table.* The counters
+*It lives in `CloudControl`, not in the plane's own quota table.* The counters
 split by plane because each identity may write only its own table; a kill
 switch that split the same way would be two switches, and throwing one would
-leave the other plane serving. Every plane can *read* `CloudAuth`, so every
-plane obeys the switch; only the read identity and an operator can write it,
-so the sync plane cannot touch the switch it obeys.
+leave the other plane serving. Every plane can *read* `CloudControl`, so every
+plane obeys the switch; only the external budget Function can write it, so the
+Container App identities cannot mutate the switch they obey.
 
 *Staleness window: 30 seconds.* A replica caches what it read for 30 seconds
 and no longer — `KILL_SWITCH_TTL_SECONDS`, capped at 60 by
@@ -634,52 +629,57 @@ reaches for a delete. See "The expired-row sweep" above.
 running app, so the switch can be thrown and cleared while every replica is
 scaled to zero. `set_kill_switch` requires both levels: a partial update would
 have to read the level it is not changing, and a read that fails during an
-incident is exactly when the write most needs to land. `disable_writes` does
-read first, so a late 80% action cannot re-enable a public API that 100%
-already disabled, and it raises rather than guessing when that read fails;
-`disable_public_api` reads nothing, because it only ever removes capability and
-must work when nothing can be read. The operator CLI in #169 is the intended
-caller of all five.
+incident is exactly when the write most needs to land. `disable_writes` uses an
+etag-guarded partial update, preserving a concurrent 100% shutdown rather than
+allowing a delayed 80% notification to re-enable the public API. It still
+checks availability first and raises rather than guessing when that read
+fails. `disable_public_api` uses a monotonic full declaration that only ever
+removes capability and therefore needs no readable prior state. The operator
+CLI in #169 is the intended caller of all five.
 
 `CloudState.create(..., require_persistent_security=True)` refuses a
 process-local kill switch at boot, for the same reason it refuses non-durable
 quota counters: in a scale-to-zero deployment a process-local switch does not
 merely forget, it re-enables.
 
-Operators must also alert on APIM 4xx/5xx, auth
-failures, sync conflicts, queue age, storage availability, and Container App
-restarts. Budgets and quotas reduce surprise
-but do not guarantee a zero bill: Azure may charge for provisioned services,
-private endpoints, DNS, egress, monitoring, and usage before an alert fires.
-The 80% action disables new write forwarding; the 100% action disables public
-APIs. The action endpoint is a deployment-supplied, authenticated automation
-hook and must be exercised before production. A budget notification alone is
-not a hard billing ceiling.
+Operators must also alert on auth failures, sync conflicts, queue age, storage
+availability, Function failures, and Container App restarts. Budgets and
+quotas reduce surprise but do not guarantee a zero bill: Azure may charge for
+provisioned services, egress, monitoring, Functions, and usage before an alert
+fires. The 80% action disables new writes; the 100% action disables public APIs.
+The external Function is a deployment-supplied authenticated automation hook
+and must be exercised before production. A budget notification alone is not a
+hard billing ceiling.
 
 ## Acceptance checklist
 
 - [ ] `az deployment group validate` and Bicep build pass with tenant values.
-- [ ] Confirm APIM is reachable over HTTPS, the managed environment is
-      internal, both app ingresses are non-external, and APIM resolves and
-      reaches both private Container App FQDNs.
-- [ ] Confirm storage public network access, anonymous blobs, Shared Key, and
-      HTTP are disabled; TLS 1.2 is enforced.
-- [ ] Resolve Blob/Table names through the private DNS zones from both apps.
+- [ ] Confirm both Container Apps expose HTTPS ingress with `allowInsecure:
+      false`, and all route credentials/signature checks work without gateway
+      headers.
+- [ ] Confirm storage public network access is enabled only for service-endpoint
+      routing; anonymous blobs, Shared Key, and HTTP are disabled; TLS 1.2 is
+      enforced; the firewall is deny-by-default.
+- [ ] Resolve Blob/Table names from the ACA service-endpoint subnet and the
+      budget Function resource instance and current egress IPs; verify the
+      firewall admits only those sources.
 - [ ] Verify each managed identity has only its documented data-plane role —
-      in particular that `entities/delete` on `CloudAuth` is held by the read
-      identity alone, through `authSweeperRoleDefinition` and nothing else.
+      in particular, `entities/delete` on `CloudAuth` is held by the read
+      identity alone through `authSweeperRoleDefinition`.
 - [ ] Throw the kill switch, let the read plane sweep, and confirm the switch
-      still reads disabled. An absent row reads as enabled.
+      still reads disabled. An absent row is enabled; a missing table refuses
+      startup.
 - [ ] Revoke a device and confirm its refresh and its reads both fail exactly
       as an unknown device's do, across a replica restart.
-- [ ] Verify enrollment rejects an unapproved tenant/device and pairing tokens
+- [ ] Verify enrollment rejects an unapproved operator/device and pairing tokens
       are one-time, expiring, revocable, and absent from logs.
-- [ ] Exercise read, push, status, CORS, subscription quota/rate limits, and
-      the 503 kill switch.
+- [ ] Exercise read, push, status, exact-origin CORS, durable application
+      quotas, and the 503 kill switch.
 - [ ] Drill the kill switch against a *cold* deployment: throw it, scale every
       replica to zero, and confirm the next request is still refused. A drill
       against a warm replica proves only that the cache was invalidated.
 - [ ] Test offline queueing, restart/retry, idempotent replay, and conflict
       reporting without blocking local use.
-- [ ] Trigger budget thresholds in a non-production subscription and confirm
-      billing/on-call delivery; document real monthly estimates.
+- [ ] Trigger the `$5`, `$8`, and `$10` budget thresholds in a non-production
+      subscription; confirm the Function hook persists both kill-switch levels,
+      survives app restart, and can be cleared explicitly.
