@@ -922,7 +922,7 @@ def create_cloud_app(
             if not _safe_compare_text(
                 request.headers.get("x-operator-token", ""), config.operator_token
             ):
-                return _error(404, "not found")
+                return _not_found()
             if (
                 not _gateway_proof_valid(state, request)
             ):

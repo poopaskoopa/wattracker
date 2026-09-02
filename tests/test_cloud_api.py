@@ -1941,6 +1941,24 @@ def test_the_kill_switch_disables_enrollment_start_before_auth_or_write(cloud):
     assert state.enrollments._records == before
 
 
+def test_enrollment_start_does_not_reveal_public_kill_state(cloud):
+    _config, state, client = cloud
+    invalid_token = client.post(
+        "/api/v1/enrollment/start",
+        headers={"X-Operator-Token": "wrong-token"},
+    )
+
+    state.quotas.set_public_enabled(False)
+    disabled = client.post(
+        "/api/v1/enrollment/start",
+        headers={"X-Operator-Token": "operator-token"},
+    )
+
+    assert disabled.status_code == invalid_token.status_code == 404
+    assert disabled.content == invalid_token.content
+    assert dict(disabled.headers) == dict(invalid_token.headers)
+
+
 def test_the_kill_switch_disables_enrollment_complete_before_auth_or_write(cloud):
     _config, state, client = cloud
     started = client.post(
