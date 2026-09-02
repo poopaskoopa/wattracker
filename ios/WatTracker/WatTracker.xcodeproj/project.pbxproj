@@ -54,6 +54,7 @@
 		1A0000000000000000000031 /* FTPScreen.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = FTPScreen.swift; sourceTree = "<group>"; };
 		1A00000000000000000000A0 /* Assets.xcassets */ = {isa = PBXFileReference; lastKnownFileType = folder.assetcatalog; path = Assets.xcassets; sourceTree = "<group>"; };
 		1A0000000000000000000032 /* Info.plist */ = {isa = PBXFileReference; lastKnownFileType = text.plist.xml; path = Info.plist; sourceTree = "<group>"; };
+		1A00000000000000000001A0 /* Info-Debug.plist */ = {isa = PBXFileReference; lastKnownFileType = text.plist.xml; path = "Info-Debug.plist"; sourceTree = "<group>"; };
 		1A0000000000000000000033 /* AppConfiguration.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AppConfiguration.swift; sourceTree = "<group>"; };
 		1A0000000000000000000034 /* CanonicalRequest.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = CanonicalRequest.swift; sourceTree = "<group>"; };
 		1A0000000000000000000035 /* CloudClient.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = CloudClient.swift; sourceTree = "<group>"; };
@@ -134,6 +135,7 @@
 				1A0000000000000000000041 /* Cloud */,
 				1A00000000000000000000A0 /* Assets.xcassets */,
 				1A0000000000000000000032 /* Info.plist */,
+				1A00000000000000000001A0 /* Info-Debug.plist */,
 			);
 			path = WatTracker;
 			sourceTree = "<group>";
@@ -381,7 +383,7 @@
 			isa = XCBuildConfiguration;
 			buildSettings = {
 				GENERATE_INFOPLIST_FILE = NO;
-				INFOPLIST_FILE = WatTracker/Info.plist;
+				INFOPLIST_FILE = "WatTracker/Info-Debug.plist";
 				LD_RUNPATH_SEARCH_PATHS = (
 					"$(inherited)",
 					"@executable_path/Frameworks",

@@ -65,12 +65,28 @@
 	     for no benefit we are getting. -->
 	<key>UIApplicationSupportsIndirectInputEvents</key>
 	<true/>
-	<!-- No NSAppTransportSecurity key: a Release build gets ATS's default of
-	     zero exceptions, matching the issue's Done list. The localhost
-	     relaxation a debug build needs to reach a server on the developer's
-	     own machine lives in Info-Debug.plist instead, which
-	     Config/Debug.xcconfig's INFOPLIST_FILE selects only for Debug -- it
-	     cannot end up in a Release build by way of this file. -->
+	<!-- Debug-only relaxation, and it cannot reach the public internet:
+	     loopback and local-network hosts only, so a simulator build can talk
+	     to a server on the developer's own machine over http (see
+	     Config/Debug.xcconfig, which points WATTRACKER_API_HOST at
+	     localhost:8765). This file is never the one that ships: Release uses
+	     Info.plist, which carries no NSAppTransportSecurity key at all, so a
+	     Release build gets ATS's default of no exceptions rather than
+	     inheriting this one. INFOPLIST_FILE is what picks between the two, set
+	     per configuration in the Xcode project. -->
+	<key>NSAppTransportSecurity</key>
+	<dict>
+		<key>NSAllowsLocalNetworking</key>
+		<true/>
+		<key>NSExceptionDomains</key>
+		<dict>
+			<key>localhost</key>
+			<dict>
+				<key>NSExceptionAllowsInsecureHTTPLoads</key>
+				<true/>
+			</dict>
+		</dict>
+	</dict>
 	<!-- Supplied by Config/*.xcconfig, never written as a literal in the
 	     client: the app ships to TestFlight and a moved host must be a
 	     configuration change and a rebuild, not a code change. -->

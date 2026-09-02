@@ -25,6 +25,13 @@ struct CloudClient: Sendable {
         case http(status: Int, path: String, retryAfter: TimeInterval?, serverDate: Date?)
         case malformedResponse(String)
         case noProfilePublished
+        /// `SecRandomCopyBytes` refused to fill the nonce. Signing and sending
+        /// anyway is the alternative this exists to rule out: the fallback
+        /// value is 24 zero bytes, a repeated nonce trips the server's replay
+        /// guard, and that 404 is indistinguishable from a rejected credential
+        /// -- a strike toward removal for a reason that had nothing to do with
+        /// this device's standing.
+        case nonceUnavailable(OSStatus)
 
         var description: String {
             switch self {
@@ -39,6 +46,8 @@ struct CloudClient: Sendable {
                 return "Malformed response: \(detail)"
             case .noProfilePublished:
                 return "The desktop has not published a profile yet"
+            case let .nonceUnavailable(status):
+                return "Could not generate a signing nonce (OSStatus \(status))"
             }
         }
     }
@@ -94,7 +103,7 @@ struct CloudClient: Sendable {
     func refreshReaderContext(for device: PairedDevice) async throws -> RefreshOutcome {
         let path = "/api/v1/context/refresh"
         let timestamp = String(Int(clock().timeIntervalSince1970))
-        let nonce = Self.freshNonce()
+        let nonce = try Self.freshNonce()
         let canonical = try CanonicalRequest.bytes(
             method: "POST",
             path: path,
@@ -234,10 +243,13 @@ struct CloudClient: Sendable {
     /// A nonce the replay guard has not seen.  Freshness comes from this, not
     /// from the signature: the server keys its replay guard on
     /// (namespace, credential, nonce) and never on signature bytes, which is
-    /// what makes accepting a malleable signature safe.
-    static func freshNonce() -> String {
+    /// what makes accepting a malleable signature safe.  The status is
+    /// checked, not discarded: a failed fill left as 24 zero bytes would
+    /// still get signed and sent, and a zero nonce is only ever fresh once.
+    static func freshNonce() throws -> String {
         var bytes = [UInt8](repeating: 0, count: 24)
-        _ = SecRandomCopyBytes(kSecRandomDefault, bytes.count, &bytes)
+        let status = SecRandomCopyBytes(kSecRandomDefault, bytes.count, &bytes)
+        guard status == errSecSuccess else { throw Failure.nonceUnavailable(status) }
         return Data(bytes).base64EncodedString()
             .replacingOccurrences(of: "+", with: "-")
             .replacingOccurrences(of: "/", with: "_")

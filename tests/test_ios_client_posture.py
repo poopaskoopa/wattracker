@@ -24,7 +24,16 @@ from pathlib import Path
 import pytest
 
 IOS = Path(__file__).resolve().parents[1] / "ios" / "WatTracker"
+# The plist a real device runs: INFOPLIST_FILE names it for Release, and it is
+# the only variant a build that does not say otherwise would pick up.
 INFO_PLIST = IOS / "WatTracker" / "Info.plist"
+# The plist INFOPLIST_FILE names for Debug only -- the one allowed to carry
+# the localhost ATS exception a simulator build needs to reach a server on
+# the developer's own machine. See test_the_debug_and_release_configurations_
+# use_different_info_plists, which is what makes "only for Debug" a checked
+# fact rather than a filename that happens to suggest it.
+INFO_PLIST_DEBUG = IOS / "WatTracker" / "Info-Debug.plist"
+PBXPROJ = IOS / "WatTracker.xcodeproj" / "project.pbxproj"
 CONFIG = IOS / "Config"
 SOURCES = sorted((IOS / "WatTracker").rglob("*.swift"))
 CLOUD_SOURCES = sorted((IOS / "WatTracker" / "Cloud").rglob("*.swift"))
@@ -35,13 +44,22 @@ ALL_SWIFT = sorted(IOS.rglob("*.swift"))
 PRODUCTION_HOST = "api.wattracker.com"
 
 
-@pytest.fixture(scope="module")
-def info() -> dict:
+def _plist(path: Path) -> dict:
     # The comments are stripped first because this plist's prose contains
     # ``--``, which Xcode accepts inside an XML comment and a conforming XML
     # parser does not. The comments are the most valuable thing in that file
     # and are not being reformatted to suit a test; the test reads the data.
-    return plistlib.loads(re.sub(rb"<!--.*?-->", b"", INFO_PLIST.read_bytes(), flags=re.S))
+    return plistlib.loads(re.sub(rb"<!--.*?-->", b"", path.read_bytes(), flags=re.S))
+
+
+@pytest.fixture(scope="module")
+def info() -> dict:
+    return _plist(INFO_PLIST)
+
+
+@pytest.fixture(scope="module")
+def info_debug() -> dict:
+    return _plist(INFO_PLIST_DEBUG)
 
 
 def _uncommented(text: str) -> str:
@@ -66,18 +84,32 @@ def _config(name: str) -> str:
 
 
 # --------------------------------------------------------- transport security
-def test_app_transport_security_has_no_global_relaxation(info):
-    ats = info.get("NSAppTransportSecurity", {})
-    for key in (
-        "NSAllowsArbitraryLoads",
-        "NSAllowsArbitraryLoadsInWebContent",
-        "NSAllowsArbitraryLoadsForMedia",
-    ):
-        assert not ats.get(key), f"{key} disables certificate validation app-wide"
+def test_app_transport_security_has_no_global_relaxation(info, info_debug):
+    for plist in (info, info_debug):
+        ats = plist.get("NSAppTransportSecurity", {})
+        for key in (
+            "NSAllowsArbitraryLoads",
+            "NSAllowsArbitraryLoadsInWebContent",
+            "NSAllowsArbitraryLoadsForMedia",
+        ):
+            assert not ats.get(key), f"{key} disables certificate validation app-wide"
 
 
-def test_the_only_ats_exception_is_loopback(info):
-    ats = info.get("NSAppTransportSecurity", {})
+def test_the_shipping_plist_carries_no_ats_exception(info):
+    # Info.plist is what ships: Release names it, and so does any build that
+    # does not say otherwise. It must carry no NSAppTransportSecurity key at
+    # all -- not "only localhost", nothing -- which is a stronger guarantee
+    # than pinning the exception list, and one a stray edit to this file
+    # cannot regress into naming a real host by way of an exception domain.
+    # The localhost affordance a Debug build needs lives in Info-Debug.plist
+    # instead; see test_the_debug_only_ats_exception_is_loopback.
+    assert "NSAppTransportSecurity" not in info, (
+        "the shipping Info.plist must carry no ATS exception at all"
+    )
+
+
+def test_the_debug_only_ats_exception_is_loopback(info_debug):
+    ats = info_debug.get("NSAppTransportSecurity", {})
     domains = ats.get("NSExceptionDomains", {})
     # Local networking is the developer affordance and cannot reach the public
     # internet; a named exception domain can, so the list is pinned exactly.
@@ -90,6 +122,37 @@ def test_the_only_ats_exception_is_loopback(info):
         "subdomains of localhost are not the developer's own machine"
     )
     assert PRODUCTION_HOST not in repr(ats)
+
+
+def test_the_debug_and_release_configurations_use_different_info_plists():
+    # A plist that exists but is named by neither configuration fixes
+    # nothing, and one named by both fixes nothing either -- this is what
+    # makes "Debug-only" a checked fact about the project file Xcode actually
+    # builds with, rather than a filename that merely suggests it.
+    pbxproj = PBXPROJ.read_text(encoding="utf-8")
+    # GENERATE_INFOPLIST_FILE = NO scopes each block to the app target: the
+    # test target's Info.plist is synthesized and carries no INFOPLIST_FILE.
+    blocks = re.findall(
+        r"buildSettings = \{([^{}]*?GENERATE_INFOPLIST_FILE = NO;[^{}]*?)\};"
+        r"\s*name = (Debug|Release);",
+        pbxproj,
+        re.S,
+    )
+    by_config = {}
+    for settings, name in blocks:
+        # The negative lookbehind matters: "GENERATE_INFOPLIST_FILE = NO;"
+        # itself contains the substring "INFOPLIST_FILE = NO;", which an
+        # unanchored search happily matches first.
+        match = re.search(r'(?<!GENERATE_)INFOPLIST_FILE = "?([^";]+)"?;', settings)
+        assert match, f"the {name} app-target configuration has no INFOPLIST_FILE"
+        by_config[name] = match.group(1)
+    assert by_config == {
+        "Debug": "WatTracker/Info-Debug.plist",
+        "Release": "WatTracker/Info.plist",
+    }, (
+        "Debug must build with the plist carrying the localhost ATS "
+        "exception, Release with the one carrying none"
+    )
 
 
 def test_the_production_scheme_is_https():

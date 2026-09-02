@@ -341,6 +341,97 @@ final class CloudSessionTests: XCTestCase {
         XCTAssertNotNil(rig.credentials.load())
     }
 
+    /// A 404 with no server clock reference at all -- the header was simply
+    /// absent -- cannot rule out a skewed device clock any more than a 404
+    /// that says the clock is wrong can. Counting it anyway is exactly the
+    /// bug: a phone an hour off the server, hitting a 404 that happens to
+    /// carry no `Date`, would otherwise reach `removed` on its very next
+    /// attempt instead of ever being told about the skew.
+    func testAFourOhFourWithNoDateHeaderNeverCountsTowardRemoval() async throws {
+        let clock = TestClock()
+        let rig = harness(clock: clock) { _, _ in
+            .refused(404)  // no serverDate at all
+        }
+
+        for _ in 0..<6 {
+            do {
+                _ = try await rig.session.readerContext()
+                XCTFail("a 404 must not mint a context")
+            } catch let failure as CloudSession.Failure {
+                guard case .server = failure else {
+                    return XCTFail(
+                        "expected a bare refusal with no clock reference, got \(failure)"
+                    )
+                }
+            }
+            clock.advance(600)  // well past any backoff this can set
+        }
+
+        let state = await rig.session.deviceState
+        XCTAssertEqual(
+            state, .paired,
+            "a 404 that cannot rule out clock skew must never be banked as a strike"
+        )
+        XCTAssertNotNil(rig.credentials.load())
+    }
+
+    /// `HTTPHeaderDates` reduces both obsolete `Date` spellings RFC 9110 still
+    /// requires a recipient tolerate -- RFC 850 and asctime -- to the same
+    /// "absent" signal a missing header produces. That is what makes them
+    /// covered by the no-`Date` case above rather than needing one of their
+    /// own in `CloudSession`: either arrives at `refusal(_:)` as
+    /// `serverDate == nil`, indistinguishable from the header never having
+    /// been sent.
+    func testObsoleteDateHeaderFormatsAreTreatedAsAbsentNotParsed() {
+        XCTAssertNil(HTTPHeaderDates.date("Sunday, 06-Nov-94 08:49:37 GMT"), "RFC 850")
+        XCTAssertNil(HTTPHeaderDates.date("Sun Nov  6 08:49:37 1994"), "asctime")
+        XCTAssertNotNil(
+            HTTPHeaderDates.date("Sun, 06 Nov 1994 08:49:37 GMT"),
+            "IMF-fixdate is the one format this client does read"
+        )
+    }
+
+    /// The gap `noteFailure` enforces between the two 404s two-strike removal
+    /// counts has to outlast something real, not just an instant -- a rider
+    /// pulling to refresh twice, a deployment mid-restart. Two attempts two
+    /// seconds apart is exactly what a repeated pull-to-refresh looks like: it
+    /// must be throttled, not read as the corroborating second strike.
+    func testTwoFourOhFoursTwoSecondsApartAreThrottledNotRemoved() async throws {
+        let clock = TestClock()
+        let rig = harness(clock: clock) { _, _ in
+            .refused(404, serverDate: clock.now)
+        }
+
+        do {
+            _ = try await rig.session.readerContext()
+            XCTFail("a single 404 must not mint a context")
+        } catch let failure as CloudSession.Failure {
+            guard case .server = failure else {
+                return XCTFail("expected a bare refusal, got \(failure)")
+            }
+        }
+
+        clock.advance(2)  // a rider pulling to refresh again, moments later
+        do {
+            _ = try await rig.session.readerContext()
+            XCTFail("still inside the backoff the first refusal set")
+        } catch let failure as CloudSession.Failure {
+            guard case .throttled = failure else {
+                return XCTFail("expected throttling, not a second strike, got \(failure)")
+            }
+        }
+
+        XCTAssertEqual(
+            rig.transport.requestCount, 1,
+            "the throttled attempt must not even reach the server"
+        )
+        let state = await rig.session.deviceState
+        XCTAssertEqual(
+            state, .paired, "two attempts two seconds apart must not unpair the device"
+        )
+        XCTAssertNotNil(rig.credentials.load())
+    }
+
     func testAQuotaRefusalNeverRemovesTheDevice() async throws {
         let clock = TestClock()
         let rig = harness(clock: clock) { _, _ in

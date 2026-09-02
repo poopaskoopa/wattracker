@@ -95,9 +95,12 @@ struct URLSessionCloudTransport: CloudTransport {
 enum HTTPHeaderDates {
     /// RFC 9110's preferred `IMF-fixdate`, which is what every one of these
     /// servers emits.  The two obsolete formats are not parsed: a header this
-    /// fails to read is treated as absent, the client's own backoff takes over,
-    /// and a clock check simply does not happen -- the safe direction to be
-    /// wrong in for both.
+    /// fails to read is treated as absent.  An absent `Date` is not "safe to
+    /// ignore" on its own -- it is `CloudSession.refusal(_:)` that makes it
+    /// safe, by treating a 404 with no clock reference as unable to rule out a
+    /// skewed device clock and never letting that rejection count toward
+    /// removal.  Skipping the clock check here while the caller still banked
+    /// the refusal underneath it would be exactly backwards.
     ///
     /// Shared, and never mutated after construction: `DateFormatter` is
     /// documented thread-safe for formatting and parsing on iOS 7 and later,

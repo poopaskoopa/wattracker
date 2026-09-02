@@ -81,13 +81,21 @@ actor CloudSession {
     /// device's own clock is the likeliest reason a signed request is refused,
     /// and telling the rider their device was removed would be a lie.
     static let clockSkewTolerance: TimeInterval = 240
-    /// Backoff bounds for a refusal the server put no `Retry-After` on.
-    static let baseBackoff: TimeInterval = 2
+    /// Backoff bounds for a refusal the server put no `Retry-After` on. The
+    /// floor is not decorative: it is also the shortest gap `noteFailure` can
+    /// ever leave between the two 404s two-strike removal counts, so it has
+    /// to be wide enough that a deployment restart -- the false positive this
+    /// scheme exists to absorb -- has plausibly finished before the second
+    /// attempt is allowed. A couple of seconds, which is what this used to be,
+    /// outlasts nothing.
+    static let baseBackoff: TimeInterval = 30
     static let maximumBackoff: TimeInterval = 300
     /// A signed refresh must be refused twice, with a backoff between, before
     /// the device declares itself removed. One 404 is also what a deployment
     /// mid-restart produces, and the action taken on removal -- wiping the
     /// cache and the credential -- is not one to take on a single sample.
+    /// That protection is only as real as the gap enforced between the two
+    /// attempts; see `baseBackoff`.
     static let rejectionsBeforeRemoval = 2
     /// Cursor pages per collection read. Far above any real scope, and here so
     /// that a server answering with a cursor that never terminates costs a
@@ -405,31 +413,49 @@ actor CloudSession {
     ///   credential, and treating either as revocation would wipe a working
     ///   device over a billing threshold.
     /// - **Twice, with a backoff between.** A single 404 is also what a
-    ///   deployment mid-restart or a flipped kill switch produces.
-    /// - **Never while the clock is suspect.** A device more than four minutes
-    ///   off the server's clock has its signed timestamp refused on every
-    ///   attempt, forever, and would otherwise conclude it had been revoked.
-    ///   The server's `Date` header arrives on the 404 itself, so ruling this
-    ///   out costs no extra request.
+    ///   deployment mid-restart or a flipped kill switch produces, and the gap
+    ///   `noteFailure` enforces before the second attempt is sized to outlast
+    ///   one -- at least half of `baseBackoff` (15s), scaling with repeated
+    ///   failures. A rider pulling to refresh twice inside that window gets
+    ///   throttled, not unpaired.
+    /// - **Never while the clock is suspect -- including when that cannot be
+    ///   checked.** A device more than four minutes off the server's clock has
+    ///   its signed timestamp refused on every attempt, forever, and would
+    ///   otherwise conclude it had been revoked. The server's `Date` header
+    ///   arrives on the 404 itself, so ruling this out costs no extra request
+    ///   -- but a `Date` that is missing, or in one of the two obsolete
+    ///   formats `HTTPHeaderDates` does not parse, means skew cannot be ruled
+    ///   out either. That rejection is never counted: the alternative treats
+    ///   "cannot tell" as "clock is fine", which is the opposite of what a
+    ///   fail-safe reading of an unreadable clock means.
     ///
     /// The residual false positive is the kill switch: a deployment that turns
-    /// the public API off for long enough unpairs these phones and the rider
-    /// pairs again when it returns. That is the direction to be wrong in. The
-    /// opposite -- a revoked phone still showing the rider's training data
-    /// because the client would rather not be hasty -- is the outcome
-    /// revocation exists to prevent.
+    /// the public API off for longer than the backoff window unpairs these
+    /// phones and the rider pairs again when it returns. That is the
+    /// direction to be wrong in. The opposite -- a revoked phone still
+    /// showing the rider's training data because the client would rather not
+    /// be hasty -- is the outcome revocation exists to prevent.
     private func refusal(_ failure: CloudClient.Failure) -> Failure {
         guard case let .http(status, _, retryAfter, serverDate) = failure else {
             noteFailure(retryAfter: nil)
             return .server(failure)
         }
         if status == 404 {
-            if let serverDate {
-                let skew = serverDate.timeIntervalSince(clock())
-                if abs(skew) > Self.clockSkewTolerance {
-                    noteFailure(retryAfter: nil)
-                    return .clockSkew(seconds: skew)
-                }
+            guard let serverDate else {
+                // No clock reference on this response -- the header was
+                // absent, or it was in one of the two obsolete formats
+                // `HTTPHeaderDates` refuses to parse -- so a skewed device
+                // clock cannot be ruled out. Counting this rejection anyway
+                // would misdiagnose that skew as revocation the first time a
+                // 404 happens to arrive with no readable `Date`; failing safe
+                // means this sample is simply thrown away rather than banked.
+                noteFailure(retryAfter: nil)
+                return .server(failure)
+            }
+            let skew = serverDate.timeIntervalSince(clock())
+            if abs(skew) > Self.clockSkewTolerance {
+                noteFailure(retryAfter: nil)
+                return .clockSkew(seconds: skew)
             }
             consecutiveRejections += 1
             if consecutiveRejections >= Self.rejectionsBeforeRemoval {
@@ -473,7 +499,14 @@ actor CloudSession {
             let ceiling = Swift.min(
                 Self.maximumBackoff, Self.baseBackoff * pow(2, Double(exponent - 1))
             )
-            delay = Double.random(in: 1...Swift.max(1, ceiling))
+            // Equal jitter, not full jitter: the floor is half the ceiling,
+            // not one second. Full jitter's near-zero tail let a second
+            // pull-to-refresh land on the elapsed side of the gate almost
+            // immediately, which made two-strike removal a coin flip rather
+            // than a guarantee that a plausible outage had time to pass.
+            // Halving the range still spreads retries wide enough to avoid a
+            // thundering herd; it just never collapses to nothing.
+            delay = Double.random(in: (ceiling / 2)...ceiling)
         }
         nextAttemptAllowedAt = clock().addingTimeInterval(delay)
     }
