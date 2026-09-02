@@ -32,7 +32,9 @@ assumptions are recorded in [`docs/azure-gateway-decision.md`](../../docs/azure-
 - Storage uses managed identity and Azure RBAC only. Shared keys, anonymous
   blobs, TLS below 1.2, private endpoints, and private DNS are not part of this
   profile. The read identity, sync identity, and budget-hook identity have
-  separate least-privilege roles; no role grants table or blob deletion.
+  separate least-privilege roles. Only the read-plane expired-row sweep can
+  delete table entities, and that grant is scoped to `CloudAuth`; no role
+  grants blob deletion.
 
 ## Budget hook deployment contract
 
