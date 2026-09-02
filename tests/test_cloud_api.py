@@ -1927,6 +1927,57 @@ def test_the_kill_switch_disables_pairing(cloud):
     assert _pair(client, code, public_key).status_code == 200
 
 
+def test_the_kill_switch_disables_enrollment_start_before_auth_or_write(cloud):
+    _config, state, client = cloud
+    before = dict(state.enrollments._records)
+    state.quotas.set_public_enabled(False)
+
+    refused = client.post(
+        "/api/v1/enrollment/start",
+        headers={"X-Operator-Token": "wrong-token"},
+    )
+
+    assert refused.status_code == 404
+    assert state.enrollments._records == before
+
+
+def test_the_kill_switch_disables_enrollment_complete_before_auth_or_write(cloud):
+    _config, state, client = cloud
+    started = client.post(
+        "/api/v1/enrollment/start",
+        headers={
+            "X-Operator-Token": "operator-token",
+            "X-Verified-Entra-Subject": "entra-user",
+            "X-APIM-Client-Certificate-Verified": "true",
+        },
+    )
+    assert started.status_code == 200
+    before_invitations = dict(state.enrollments._records)
+    before_writers = dict(state.credentials._writers)
+    before_contexts = dict(state.credentials._contexts)
+    before_context_ids = dict(state.credentials._contexts_by_id)
+    state.quotas.set_public_enabled(False)
+
+    refused = client.post(
+        "/api/v1/enrollment/complete",
+        headers={
+            "X-Verified-Entra-Subject": "entra-user",
+            "X-APIM-Request-Verified": "true",
+            "X-APIM-Client-Certificate-Verified": "true",
+        },
+        json={
+            "invitation": started.json()["invitation"],
+            "public_key": (b"e" * 32).hex(),
+        },
+    )
+
+    assert refused.status_code == 404
+    assert state.enrollments._records == before_invitations
+    assert state.credentials._writers == before_writers
+    assert state.credentials._contexts == before_contexts
+    assert state.credentials._contexts_by_id == before_context_ids
+
+
 class _DurableMemoryBackend(MemorySecurityStateBackend):
     """A shared-process backend that claims durability, for boot-check tests."""
 

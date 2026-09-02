@@ -914,6 +914,11 @@ def create_cloud_app(
     if read_enabled():
         @app.post("/api/v1/enrollment/start")
         async def enrollment_start(request: Request) -> Response:
+            # Disabled keeps enrollment's refusal uniform and, critically,
+            # happens before operator or gateway authentication and invitation
+            # creation.
+            if not state.quotas.kill_state().public_enabled:
+                return _not_found()
             if not _safe_compare_text(
                 request.headers.get("x-operator-token", ""), config.operator_token
             ):
@@ -938,6 +943,10 @@ def create_cloud_app(
 
         @app.post("/api/v1/enrollment/complete")
         async def enrollment_complete(request: Request) -> Response:
+            # Refuse before authentication, invitation consumption, or any
+            # credential/context write when the public API is disabled.
+            if not state.quotas.kill_state().public_enabled:
+                return _not_found()
             if (
                 not _gateway_proof_valid(state, request)
             ):
