@@ -7,9 +7,9 @@ param storageName string
 @description('DNS hostname of the external budget-hook Function App, without a scheme, path, or query string; Bicep always constructs HTTPS URLs.')
 @minLength(1)
 param budgetHookHost string
-@secure()
-@description('Function key used to authenticate both budget-hook routes.')
-param budgetHookFunctionKey string
+@description('Name of the external budget-hook Function App in this resource group; Bicep resolves its default host key at deployment time.')
+@minLength(1)
+param budgetHookFunctionAppName string
 @description('Exact allowed PWA origin; wildcard origins are not accepted.')
 param allowedOrigin string
 @description('Billing alert email.')
@@ -49,8 +49,12 @@ var envName = 'wattracker-aca-env'
 var readName = 'wattracker-read'
 var syncName = 'wattracker-sync'
 var staticName = 'wattracker-pwa'
-var writeShutdownWebhookUri = 'https://${budgetHookHost}/api/budget/disable-writes?code=${budgetHookFunctionKey}'
-var publicShutdownWebhookUri = 'https://${budgetHookHost}/api/budget/disable-public-api?code=${budgetHookFunctionKey}'
+resource budgetHookApp 'Microsoft.Web/sites@2022-09-01' existing = {
+  name: budgetHookFunctionAppName
+}
+var budgetHookDefaultKey = listKeys('${budgetHookApp.id}/host/default', '2022-03-01').functionKeys.default
+var writeShutdownWebhookUri = 'https://${budgetHookHost}/api/budget/disable-writes?code=${budgetHookDefaultKey}'
+var publicShutdownWebhookUri = 'https://${budgetHookHost}/api/budget/disable-public-api?code=${budgetHookDefaultKey}'
 
 resource vnet 'Microsoft.Network/virtualNetworks@2023-11-01' = {
   name: vnetName
@@ -433,5 +437,5 @@ resource publicShutdownActionGroup 'Microsoft.Insights/actionGroups@2023-01-01' 
 
 resource budget 'Microsoft.Consumption/budgets@2023-05-01' = {
   name: 'wattracker-monthly-budget'
-  properties: { amount: 10; timeGrain: 'Monthly'; timePeriod: { startDate: budgetStartDate; endDate: budgetEndDate }; notifications: { actual50: { enabled: true; operator: 'GreaterThan'; threshold: 5; thresholdType: 'Actual'; contactEmails: [billingEmail] }; actual80: { enabled: true; operator: 'GreaterThan'; threshold: 8; thresholdType: 'Actual'; contactEmails: [billingEmail]; contactGroups: [writeShutdownActionGroup.id] }; actual100: { enabled: true; operator: 'GreaterThan'; threshold: 10; thresholdType: 'Actual'; contactEmails: [billingEmail]; contactGroups: [publicShutdownActionGroup.id] } } }
+  properties: { amount: 10; timeGrain: 'Monthly'; timePeriod: { startDate: budgetStartDate; endDate: budgetEndDate }; notifications: { actual50: { enabled: true; operator: 'GreaterThan'; threshold: 50; thresholdType: 'Actual'; contactEmails: [billingEmail] }; actual80: { enabled: true; operator: 'GreaterThan'; threshold: 80; thresholdType: 'Actual'; contactEmails: [billingEmail]; contactGroups: [writeShutdownActionGroup.id] }; actual100: { enabled: true; operator: 'GreaterThan'; threshold: 100; thresholdType: 'Actual'; contactEmails: [billingEmail]; contactGroups: [publicShutdownActionGroup.id] } } }
 }

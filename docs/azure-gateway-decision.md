@@ -62,7 +62,8 @@ and its tier requirement in the [Front Door FAQ](https://learn.microsoft.com/en-
   classic Consumption plan has no VNet integration, so Bicep accepts the
   Function's possible outbound IPs as `budgetHookIpRules` and keeps the storage
   firewall deny-by-default. Bicep derives each Azure Monitor Action Group URL
-  from the Function hostname and a function key; Bicep constructs HTTPS URLs;
+  from the Function hostname and its existing default host key via `listKeys`;
+  Bicep constructs HTTPS URLs;
   the hook uses managed identity
   plus the least-privilege `CloudControl` role from Bicep. The [Functions pricing
   page](https://azure.microsoft.com/en-us/pricing/details/functions/)
@@ -76,9 +77,9 @@ roughly `$2–5` rather than the former `$50` budget. Notifications are:
 
 | Threshold | Action |
 |---:|---|
-| `$5` (50%) | Billing notification |
-| `$8` (80%) | `POST /api/budget/disable-writes`, persists `writes_enabled=false`, reason `budget 80%` |
-| `$10` (100%) | `POST /api/budget/disable-public-api`, persists both levels disabled, reason `budget 100%` |
+| 50% of amount | Billing notification |
+| 80% of amount | `POST /api/budget/disable-writes`, persists `writes_enabled=false`, reason `budget 80%` |
+| 100% of amount | `POST /api/budget/disable-public-api`, persists both levels disabled, reason `budget 100%` |
 
 The hook accepts only its fixed route action. It rejects unauthenticated calls,
 does not select an action or reason from the alert body, and returns a generic

@@ -44,15 +44,19 @@ managed identity and these settings; see [Azure Functions networking
 options](https://learn.microsoft.com/en-us/azure/azure-functions/functions-networking-options):
 
 - `WATTRACKER_STORAGE_ACCOUNT_NAME`: the storage account name.
-- `WATTRACKER_BUDGET_HOOK_TOKEN`: the function key used in both callback URLs.
+- `WATTRACKER_BUDGET_HOOK_TOKEN`: a separate app-level token for the
+  non-Functions test/operator seam; it is not the Azure Function key.
 
 Pass the Function identity's object ID as `budgetHookPrincipalId`. Bicep injects
 each Container App's user-assigned `AZURE_CLIENT_ID`; the budget Function uses
-its system-assigned identity by default. Pass its hostname (without a scheme,
-path, or query string) as `budgetHookHost` and its function key as the secure
-`budgetHookFunctionKey`; Bicep constructs the two HTTPS route-specific URLs and
-appends the `code` query parameter. Never commit or log the key, and rotate it
-with the Function deployment. Pass the Function's complete
+its system-assigned identity by default. Pass its resource name as
+`budgetHookFunctionAppName` and its hostname (without a scheme, path, or query
+string) as `budgetHookHost`. Bicep resolves the existing Function App's default
+host key with `listKeys` at deployment time, constructs the two HTTPS
+route-specific URLs, and appends the `code` query parameter. The deployment
+principal therefore needs permission to list host keys for that Function App;
+the key is never passed as a Bicep parameter. Rotate it with the Function
+deployment and redeploy this template. Pass the Function's complete
 possible outbound IP list as `budgetHookIpRules`; the storage firewall's
 `bypass` remains `None`. The fixed routes are:
 
@@ -61,9 +65,9 @@ Set `budgetStartDate` to the first day of the current budget period and
 required parameters so a redeploy cannot silently reuse an obsolete period or
 reset the budget window to the date the template was authored.
 
-- `/api/budget/disable-writes`: at the `$8` (80%) alert, persistently disables
+- `/api/budget/disable-writes`: at the 80% alert, persistently disables
   writes and leaves reads enabled, with reason `budget 80%`.
-- `/api/budget/disable-public-api`: at the `$10` (100%) alert, persistently
+- `/api/budget/disable-public-api`: at the 100% alert, persistently
   disables the public API and writes, with reason `budget 100%`.
 
 The hook runs outside Container Apps so it remains callable when the public
@@ -79,7 +83,7 @@ explicit operator action that writes both levels enabled.
 - [ ] Storage firewall rules contain only the ACA subnet and current budget-hook
       Function egress IPs; shared-key and anonymous-blob access remain disabled.
 - [ ] The Function's managed identity object ID is passed to Bicep, its full
-      possible egress-IP list is current, and both callback URLs use rotated
-      function keys.
+      possible egress-IP list is current, and both callback URLs use the
+      current default host key resolved by Bicep.
 - [ ] A non-production budget drill confirms the 80% and 100% routes persist in
       `CloudControl`, survive an app restart, and are cleared explicitly.

@@ -318,17 +318,18 @@ The entropy arithmetic, because the number is the control:
 | Length | 12 symbols → **60 bits** |
 | Code space | 2^60 = 1,152,921,504,606,846,976 ≈ 1.15 × 10^18 |
 | TTL ceiling | 900 s (default 600 s) |
-| Deployment shaping | 100 requests/second and two backend slots per warm replica; not a global quota |
+| Deployment shaping | 100 requests/second pre-auth admission and two backend slots per warm replica; not a global quota |
 
 The selected profile has no provider per-key quota in front of the pairing
 route. The 60-bit, single-use code and 900-second ceiling are therefore the
 guessing bound; the process-local request window is only load shaping and may
-multiply with replicas. A failed guess does not reveal whether a code exists
-and does not spend a valid code. Durable application quotas protect
-authenticated scopes after a credential or code establishes one. An
-unauthenticated pairing probe necessarily performs one bounded credential-table
-lookup before a rider scope exists; edge/durable anonymous rate limiting is an
-explicit follow-up rather than a control this deployment claims to provide.
+multiply with replicas. A pre-auth global admission window limits anonymous
+work on each warm replica, but it is not a durable or deployment-wide rate
+policy. A failed guess does not reveal whether a code exists and does not
+spend a valid code. Durable application quotas protect authenticated scopes
+after a credential or code establishes one. An unauthenticated pairing probe
+still performs one bounded credential-table lookup before a rider scope exists;
+there is no provider or durable anonymous rate limiter in this deployment.
 
 The TTL ceiling is enforced in `DevicePairingRegistry`, not left to callers,
 because the whole argument above is stated against a bounded window.
@@ -525,8 +526,8 @@ certificate header.
 
 ## Operations and cost
 
-The Bicep monthly budget is `$10`, with actual-dollar alerts at `$5` (50%), `$8`
-(80%), and `$10` (100%). The 80% and 100% notifications invoke authenticated
+The Bicep monthly budget is `$10`, with percentage alerts at 50%, 80%, and
+100% of that amount. The 80% and 100% notifications invoke authenticated
 Azure Function routes outside Container Apps: `disable-writes` persists the
 80% state with reason `budget 80%`, and `disable-public-api` persists the 100%
 state with reason `budget 100%`. The Function is a separately deployed
@@ -547,6 +548,13 @@ times a day and enforces nothing. `CloudState.create(...,
 require_persistent_security=True)` refuses a non-durable quota manager at boot,
 the same way it refuses an in-memory auth backend. The process-local manager
 remains for tests and local development.
+
+The unauthenticated admission guard is a process-local load shaper for each
+replica; it is not a durable gateway rate policy. Durable daily counters apply
+after the request has passed the relevant authentication boundary, and
+exact-origin CORS constrains browsers but does not constrain non-browser
+callers. These controls must not be described as equivalent to the gateway
+rate policy that was removed.
 
 Counters are addressed by `(namespace, scope-or-installation, metric)` and
 carry their UTC day inside the row; the first charge of a new day reclaims that
@@ -680,6 +688,6 @@ hard billing ceiling.
       against a warm replica proves only that the cache was invalidated.
 - [ ] Test offline queueing, restart/retry, idempotent replay, and conflict
       reporting without blocking local use.
-- [ ] Trigger the `$5`, `$8`, and `$10` budget thresholds in a non-production
+- [ ] Trigger the 50%, 80%, and 100% budget thresholds in a non-production
       subscription; confirm the Function hook persists both kill-switch levels,
       survives app restart, and can be cleared explicitly.

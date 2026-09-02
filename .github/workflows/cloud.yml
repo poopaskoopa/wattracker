@@ -81,10 +81,22 @@ jobs:
           PYTHONPATH: ${{ github.workspace }}
         run: .ci-venv/bin/python -m pytest -q
 
-  # Bicep validation and the container image build need Linux: azure/cli is a
-  # container action, and Dockerfile.cloud builds a Linux image. Both require
-  # billable hosted runners, so they stay off until hosted minutes are
-  # available again. Drop the `if` to restore them.
+  # Bicep is declarative and has no access to deployment secrets, so validate it
+  # for every pull request, including fork requests. Keep the cloud image build
+  # in the separately gated job below because it needs Docker and hosted Linux
+  # minutes.
+  bicep-validation:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Validate Bicep
+        uses: azure/cli@v2
+        with:
+          inlineScript: az bicep build --file infra/azure/main.bicep --stdout > /dev/null
+
   #
   # The image check is the one that answers "is the cloud extra actually
   # installed in readImage/syncImage" - without cryptography, verify_signature
@@ -97,11 +109,6 @@ jobs:
     steps:
       - name: Check out source
         uses: actions/checkout@v4
-
-      - name: Validate Bicep
-        uses: azure/cli@v2
-        with:
-          inlineScript: az bicep build --file infra/azure/main.bicep
 
       - name: Build cloud image
         run: docker build --file Dockerfile.cloud --tag wattracker-cloud:ci .

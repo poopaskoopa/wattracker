@@ -44,7 +44,10 @@ def test_budget_actions_target_authenticated_durable_kill_switch_handlers():
     assert "budgetHookRoleDefinition" in BICEP
     assert "budgetHookPrincipalId" in BICEP
     assert "budgetHookHost" in BICEP
-    assert "budgetHookFunctionKey" in BICEP
+    assert "budgetHookFunctionAppName" in BICEP
+    assert "param budgetHookFunctionKey" not in BICEP
+    assert "resource budgetHookApp 'Microsoft.Web/sites@2022-09-01' existing" in BICEP
+    assert "listKeys('${budgetHookApp.id}/host/default', '2022-03-01').functionKeys.default" in BICEP
     assert "name: 'CloudAuth'" in BICEP
     assert "name: 'CloudControl'" in BICEP
     assert "controlReaderRoleDefinition" in BICEP
@@ -75,9 +78,12 @@ def test_budget_actions_target_authenticated_durable_kill_switch_handlers():
     assert "create_budget_hook_app" in BUDGET_HOOK
     assert "from_managed_identity" in BUDGET_HOOK
     assert "entities/delete" not in BICEP
-    assert "amount: 10" in BICEP
-    assert "threshold: 8" in BICEP
-    assert "threshold: 10" in BICEP
+    for notification, threshold in (("actual50", 50), ("actual80", 80), ("actual100", 100)):
+        assert re.search(
+            rf"properties: \{{ amount: 10;[\s\S]*?notifications: \{{[\s\S]*?"
+            rf"{notification}: \{{[^}}]*threshold: {threshold};[^}}]*thresholdType: 'Actual'",
+            BICEP,
+        )
     assert "param budgetStartDate string" in BICEP
     assert "param budgetEndDate string" in BICEP
     assert "@minLength(32)" in BICEP
