@@ -18,10 +18,33 @@ DEVELOPMENT_LANGUAGE = en
 
 SDKROOT = iphoneos
 SUPPORTED_PLATFORMS = iphoneos iphonesimulator
+
+// Version numbers. Both are indirected through build settings rather than
+// written into Info.plist as literals, because the TestFlight release job has
+// to set them per run: App Store Connect rejects a build whose
+// CFBundleVersion it has already seen for this CFBundleShortVersionString, so
+// the build number cannot be a constant in the repository. The values here are
+// what a local build gets; .github/workflows/ios-release.yml overrides both on
+// the xcodebuild command line and nothing on disk changes.
+MARKETING_VERSION = 0.1
+CURRENT_PROJECT_VERSION = 1
+
 // Ad-hoc signing, which is all a simulator build needs and all this
-// repository can honestly provide: a development team id is an account
-// identifier and does not belong in a public repository. A device or
-// TestFlight build sets DEVELOPMENT_TEAM and CODE_SIGN_STYLE locally.
+// repository can honestly provide.
+//
+// DEVELOPMENT_TEAM is deliberately empty and deliberately not committed. This
+// repository is PUBLIC: a team identifier is an Apple account identifier, and
+// once it is in a git history on github.com it is public permanently and
+// cannot be rotated the way a key can. It reaches a build exactly once, from
+// the APPLE_TEAM_ID secret in the `ios-code-signing` GitHub environment, on
+// the xcodebuild command line in the release job. Nothing in this tree - no
+// xcconfig, no plist, no comment, no example - may name it.
+//
+// Keeping these three lines as they are is what lets somebody clone the
+// repository with no Apple credentials at all and still build and run the app
+// on a simulator. The release job overrides all three on the command line
+// (command-line build settings beat an xcconfig), so device signing is a
+// property of that one job rather than of the project.
 CODE_SIGN_STYLE = Manual
 CODE_SIGN_IDENTITY = -
 CODE_SIGNING_REQUIRED = NO
@@ -38,3 +61,7 @@ ALWAYS_SEARCH_USER_PATHS = NO
 // The production API. A moved host is an edit here plus a rebuild.
 WATTRACKER_API_SCHEME = https
 WATTRACKER_API_HOST = api.wattracker.com
+
+// The app icon lives in Assets.xcassets (added with #166 for TestFlight).
+ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon
+ASSETCATALOG_COMPILER_GLOBAL_ACCENT_COLOR_NAME = AccentColor

@@ -16,10 +16,15 @@
 	<string>$(PRODUCT_NAME)</string>
 	<key>CFBundlePackageType</key>
 	<string>APPL</string>
+	<!-- Both come from build settings (Config/Base.xcconfig holds the local
+	     defaults) rather than being literals, because the TestFlight release
+	     job must set them per run: App Store Connect rejects a build number it
+	     has already accepted for a given version string. See
+	     .github/workflows/ios-release.yml. -->
 	<key>CFBundleShortVersionString</key>
-	<string>0.1</string>
+	<string>$(MARKETING_VERSION)</string>
 	<key>CFBundleVersion</key>
-	<string>1</string>
+	<string>$(CURRENT_PROJECT_VERSION)</string>
 	<key>LSRequiresIPhoneOS</key>
 	<true/>
 	<key>UILaunchScreen</key>

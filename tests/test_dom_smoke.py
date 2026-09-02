@@ -1501,8 +1501,20 @@ _RIDE_WAIT_TIMEOUT = 30_000
 
 
 def _wait_for_ride_start(page):
-    """Allow the shared browser runner more time to start a simulated ride."""
-    page.wait_for_selector("#stopBtn:not([disabled])", timeout=_RIDE_WAIT_TIMEOUT)
+    """Wait until the ride handshake, not just its cancel button, is ready.
+
+    ``setRideState("connecting")`` enables Stop before the simulated ride's
+    ``workout`` frame arrives. Acting on that button alone lets a test send a
+    synthetic reply while ``setupWorkout`` is still pending; the later frame
+    resets the intensity badge to neutral.
+    """
+    page.wait_for_function(
+        "() => !document.getElementById('stopBtn').disabled && "
+        "(document.getElementById('workoutDetails').textContent || '')"
+        ".indexOf('Select Connect selected sensors to load the workout.') === -1",
+        timeout=_RIDE_WAIT_TIMEOUT,
+        polling=100,
+    )
 
 
 def _wait_for_ride(page, expression):
@@ -1698,6 +1710,7 @@ def test_ride_fullscreen_intensity_badge_renders_from_a_state_frame_alone(
 
     # Bypass the send/reply machinery entirely: hand the socket a synthetic
     # running frame with a bias no keypress ever requested.
+    page.evaluate("window.__suppressRunningFrames = true")
     page.evaluate(
         """() => {
             window.__socket.__deliver({

@@ -1,0 +1,545 @@
+name: iOS TestFlight release
+
+# Fires on an `ios-v*` tag, deliberately a different prefix from the `v*` that
+# macos-release.yml and windows-release.yml both use. The desktop app and the
+# iOS app version independently, and a shared `v*` prefix would mean every
+# desktop release tag also fired an iOS archive (and vice versa) - three
+# release workflows racing for one physical runner over a tag that concerned
+# one of them.
+#
+# FORK SAFETY. This repository is public and the job below both reads
+# code-signing secrets and runs on a self-hosted runner that is a physical
+# machine, not a discarded VM. Neither may ever be reachable from a fork.
+#
+# A `push` trigger restricted to tags is inherently safe from that, and it is
+# worth saying why rather than leaving it as folklore: a fork's tags live in
+# the fork's repository and fire that fork's workflows using that fork's
+# secrets - `push` events from a fork do not run here at all. That is a
+# stronger guarantee than cloud.yml's and windows.yml's
+# `github.event.pull_request.head.repo.full_name == github.repository` guard,
+# which those files need only because they also trigger on `pull_request`.
+# This workflow has no `pull_request` trigger and must not gain one: adding it
+# would expose both the secrets and the runner to any fork's diff, and the
+# `if:` below is not a substitute for the trigger being right.
+#
+# The `if:` on the job is a second, narrower thing: it stops the job doing
+# anything if the repository is ever forked WITH its tags and the fork's owner
+# adds their own credentials, which would otherwise archive and upload our
+# bundle identifier from someone else's account.
+on:
+  push:
+    tags:
+      - "ios-v*"
+  # Manual runs exist so the signing path can be exercised without
+  # spending a tag. A dispatch run archives and exports but does not
+  # upload, so it can never publish a build to App Store Connect.
+  workflow_dispatch:
+    inputs:
+      diagnose_signing:
+        description: "Print keychain contents after import (no key material)"
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+# One physical macOS runner backs this, and it is the same machine that runs
+# the Cloud workflow's test job. A second release archive running beside the
+# first would contend for every core, two exports would fight over the
+# provisioning profiles that -allowProvisioningUpdates installs into the
+# runner user's shared profile directory, and both would be rewriting the
+# user keychain search list under each other. Serialize, and do not cancel in
+# progress: the cleanup step is an `if: always()` step, and cancelling a job
+# can kill it before that step runs, which would leave TWO private keys on a
+# machine that is not discarded - the App Store Connect key in $RUNNER_TEMP
+# and the distribution key in the job's keychain - plus a search list pointing
+# at a keychain nothing owns.
+concurrency:
+  group: ios-release
+
+jobs:
+  archive-export-upload:
+    # See the fork-safety note above: this is the "forked with tags, then given
+    # its own credentials" case, not the fork-PR case, which the trigger
+    # already excludes.
+    if: github.repository == 'poopaskoopa/wattracker'
+    runs-on: [self-hosted, macOS]
+    # NOT macos-latest. macos-release.yml is hard-disabled with `if: ${{ false }}`
+    # because GitHub-hosted runners are blocked at the account level; the
+    # self-hosted macOS runner is the only machine in this project that can
+    # build for Apple platforms at all.
+    environment: ios-code-signing
+    timeout-minutes: 60
+
+    steps:
+      - name: Check out the tagged source
+        uses: actions/checkout@v4
+        with:
+          # The repository convention, and it matters more here than usual: a
+          # persisted credential would sit in .git/config on a runner that is
+          # not torn down between jobs.
+          persist-credentials: false
+
+      # Nothing secret in this step, deliberately, so it can fail loudly and
+      # early on a malformed tag before any credential is written to disk.
+      #
+      # THE BUILD NUMBER. App Store Connect rejects an upload whose
+      # CFBundleVersion it has already accepted for this
+      # CFBundleShortVersionString - it does not overwrite, it refuses, and it
+      # refuses after the whole archive, export and upload have run. So the
+      # build number has to be unique per delivery without anyone remembering
+      # to bump it.
+      #
+      # `run_number.run_attempt` is that. run_number increases by one for every
+      # run of this workflow and never repeats; run_attempt distinguishes the
+      # re-runs of a single run, which is the failure mode worth naming: a job
+      # that dies in the upload step and is re-run from the Actions UI keeps
+      # its run_number, so a bare run_number would send Apple the exact build
+      # number it just rejected, and the re-run would fail for a reason that
+      # has nothing to do with why the first one did. CFBundleVersion accepts
+      # up to three dot-separated integers and compares them component-wise, so
+      # 41.1 < 41.2 < 42.1 orders the way it reads.
+      #
+      # The consequence to know: the build number is a property of CI, not of
+      # the tag. Re-tagging the same commit produces a different build number,
+      # which is correct - Apple is being told "this is a different delivery",
+      # and it is.
+      - name: Derive the version and build number
+        env:
+          # $GITHUB_REF_NAME rather than ${{ github.ref_name }}: a tag name is
+          # attacker-supplied text as far as this shell is concerned, and
+          # interpolating it into the script body would let a tag containing
+          # shell metacharacters execute on the runner. Only someone who can
+          # push to this repository can create a tag, but a guard that costs
+          # one line does not need to argue about that.
+          RUN_NUMBER: ${{ github.run_number }}
+          RUN_ATTEMPT: ${{ github.run_attempt }}
+        run: |
+          set -euo pipefail
+          version="${GITHUB_REF_NAME#ios-v}"
+          if [ "$version" = "$GITHUB_REF_NAME" ]; then
+            echo "Tag '$GITHUB_REF_NAME' does not start with ios-v" >&2
+            exit 1
+          fi
+          # CFBundleShortVersionString: one to three non-negative integers.
+          # Anything else is rejected by App Store Connect, and it is far
+          # cheaper to say so here than after the archive.
+          if ! printf '%s' "$version" | grep -Eq '^[0-9]+(\.[0-9]+){0,2}$'; then
+            echo "Tag '$GITHUB_REF_NAME' does not carry a 1-3 component numeric version" >&2
+            exit 1
+          fi
+          echo "MARKETING_VERSION=$version" >> "$GITHUB_ENV"
+          echo "BUILD_NUMBER=${RUN_NUMBER}.${RUN_ATTEMPT}" >> "$GITHUB_ENV"
+          echo "Building version $version build ${RUN_NUMBER}.${RUN_ATTEMPT}"
+
+      # Before anything is signed, because a failing test should cost nothing
+      # but time. The iOS 26.5 simulator runtime matching Xcode 26.6's SDK is
+      # installed on this runner, so a destination-based build resolves here;
+      # ios/README.md describes the by-SDK fallback for a machine where it does
+      # not.
+      - name: Run the Swift test suite
+        run: |
+          set -euo pipefail
+          xcodebuild test \
+            -project ios/WatTracker/WatTracker.xcodeproj \
+            -scheme WatTracker \
+            -destination 'platform=iOS Simulator,name=iPhone 17 Pro' \
+            -derivedDataPath "$RUNNER_TEMP/ios-test-dd"
+
+      # The App Store Connect API key, written to a file because that is the
+      # only way any of the three tools that need it will take it - xcodebuild
+      # wants -authenticationKeyPath, altool wants --p8-file-path, and neither
+      # reads a key from stdin or an environment variable.
+      #
+      # Where it goes matters. $RUNNER_TEMP, never the workspace: the workspace
+      # is what gets archived, exported and (in other workflows) uploaded, and
+      # a key in it is one `path: dist/**` away from being published. It is
+      # also not written to ~/.appstoreconnect/private_keys, which altool
+      # searches by default - that directory belongs to the human who owns this
+      # machine, a real key already lives in it, and a CI job has no business
+      # writing to or deleting from it.
+      #
+      # umask 077 before the redirection, not chmod after: chmod after leaves a
+      # window in which the file exists world-readable. The explicit chmod
+      # below is belt and braces on top of that, not the mechanism.
+      #
+      # No `set -x` here or in any step below. The key is written by a shell
+      # redirection from an environment variable, and tracing would print the
+      # expansion.
+      - name: Write the App Store Connect API key
+        env:
+          ASC_KEY_ID: ${{ secrets.APP_STORE_CONNECT_KEY_ID }}
+          ASC_PRIVATE_KEY: ${{ secrets.APP_STORE_CONNECT_PRIVATE_KEY }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        run: |
+          set -euo pipefail
+          if [ -z "${ASC_KEY_ID:-}" ] || [ -z "${ASC_PRIVATE_KEY:-}" ] || [ -z "${APPLE_TEAM_ID:-}" ]; then
+            echo "The ios-code-signing environment did not supply the signing credentials." >&2
+            echo "Check that this job declares 'environment: ios-code-signing'." >&2
+            exit 1
+          fi
+          key_dir="$RUNNER_TEMP/asc"
+          key_path="$key_dir/AuthKey_${ASC_KEY_ID}.p8"
+          (umask 077; mkdir -p "$key_dir")
+          (umask 077; printf '%s' "$ASC_PRIVATE_KEY" > "$key_path")
+          chmod 600 "$key_path"
+          # Prove the secret decoded into a usable key before spending ten
+          # minutes on an archive that will fail at the last step. -noout, and
+          # stderr discarded: a parse failure must report "the key did not
+          # parse" and nothing about the key.
+          if ! openssl pkey -in "$key_path" -noout >/dev/null 2>&1; then
+            echo "APP_STORE_CONNECT_PRIVATE_KEY did not parse as a private key." >&2
+            echo "It must be the full PEM contents of the .p8, newlines included." >&2
+            exit 1
+          fi
+          echo "ASC_KEY_PATH=$key_path" >> "$GITHUB_ENV"
+
+          # The export options, templated here rather than committed: teamID is
+          # an Apple account identifier and this repository is public. See the
+          # long note at the top of ios/WatTracker/ExportOptions.plist for why
+          # this is a copy in $RUNNER_TEMP and not an edit in place.
+          export_options="$RUNNER_TEMP/ExportOptions.plist"
+          cp ios/WatTracker/ExportOptions.plist "$export_options"
+          /usr/libexec/PlistBuddy -c "Add :teamID string $APPLE_TEAM_ID" "$export_options" >/dev/null
+          echo "EXPORT_OPTIONS_PLIST=$export_options" >> "$GITHUB_ENV"
+
+      # THE DISTRIBUTION CERTIFICATE, and the correction of an assumption this
+      # workflow was originally written on.
+      #
+      # -allowProvisioningUpdates plus an App Store Connect API key does NOT
+      # issue a distribution certificate. It registers App IDs and it creates
+      # and downloads provisioning profiles, but certificate issuance is not
+      # something it will do: a certificate is a private key that Apple never
+      # sees, so somebody has to generate the key and the CSR, and xcodebuild
+      # will not do that on a whim. Left to itself, automatic signing finds
+      # only the development certificates in the account and resolves to
+      # development, and the archive then fails with either "conflicting
+      # provisioning settings" or "has entitlements that require signing with
+      # a development certificate" depending on which flags it is given. Both
+      # messages mean "there is no distribution identity here".
+      #
+      # So the certificate is created once, deliberately, against
+      # POST /v1/certificates, and its private key is carried to this job as a
+      # .p12 in IOS_DIST_P12_B64. docs/ios-testflight.md has the creation and
+      # rotation procedure; it expires a year after issue and nothing here
+      # renews it.
+      #
+      # A dedicated keychain, not the runner user's login keychain. This
+      # runner is a physical machine that persists between jobs, so an
+      # identity added to a permanent keychain would stay there, usable by
+      # every later job on the box. The keychain below exists for one job and
+      # is deleted by the if: always() step at the bottom.
+      #
+      # KNOWN RESIDUAL, the same one macos-release.yml documents: `security
+      # import` takes the p12 passphrase only via -P, its sole alternative
+      # being an interactive GUI prompt that a headless runner cannot answer,
+      # so that one argv is unavoidable and any process on the runner could
+      # read it for the length of the call. It is worse here than on the
+      # ephemeral macOS VM that workflow describes, because this runner is not
+      # discarded: the mitigation is that the p12 it unlocks is deleted in the
+      # same step and the keychain it unlocks into is deleted at the end of
+      # the job. Closing it properly means hosted signing or a hardware token.
+      #
+      # No `set -x`, here or anywhere below: the passphrase, the keychain
+      # password and the decoded p12 all pass through this shell.
+      - name: Import the distribution certificate into a temporary keychain
+        env:
+          IOS_DIST_P12_B64: ${{ secrets.IOS_DIST_P12_B64 }}
+          IOS_DIST_P12_PASSWORD: ${{ secrets.IOS_DIST_P12_PASSWORD }}
+          DIAGNOSE_SIGNING: ${{ inputs.diagnose_signing }}
+        run: |
+          set -euo pipefail
+          if [ -z "${IOS_DIST_P12_B64:-}" ] || [ -z "${IOS_DIST_P12_PASSWORD:-}" ]; then
+            echo "The ios-code-signing environment did not supply the distribution certificate." >&2
+            echo "IOS_DIST_P12_B64 and IOS_DIST_P12_PASSWORD are both required; see" >&2
+            echo "docs/ios-testflight.md for how they are produced." >&2
+            exit 1
+          fi
+          keychain="$RUNNER_TEMP/wattracker-ios-signing.keychain-db"
+          keychain_password="$(openssl rand -hex 32)"
+          p12="$RUNNER_TEMP/wattracker-ios-signing.p12"
+          # umask before the redirection, not chmod after: the p12 must never
+          # exist world-readable, not even for the instant between the two.
+          (umask 077; printf '%s' "$IOS_DIST_P12_B64" | base64 --decode > "$p12")
+          security create-keychain -p "$keychain_password" "$keychain"
+          security set-keychain-settings -lut 3600 "$keychain"
+          security unlock-keychain -p "$keychain_password" "$keychain"
+          # -x: the imported private key is not extractable, so nothing later
+          # in this job (or a later job, if the delete below ever failed) can
+          # read it back out of the keychain.
+          security import "$p12" -k "$keychain" \
+            -P "$IOS_DIST_P12_PASSWORD" \
+            -T /usr/bin/codesign -x
+          # Without this, codesign blocks on a GUI prompt the runner cannot
+          # answer - and blocks until the job's timeout, with no error.
+          security set-key-partition-list -S apple-tool:,apple: \
+            -k "$keychain_password" "$keychain" > /dev/null
+          security list-keychains -d user -s "$keychain" login.keychain-db
+          rm -f "$p12"
+          # Assert the identity is actually there before spending ten minutes
+          # on an archive that would fail at the codesign step. `grep -c`
+          # exits 1 on no match, hence the `|| true`, and the default covers
+          # find-identity itself failing under `set -o pipefail`. The count is
+          # all that is printed - never the identity hashes.
+          # Diagnostics, opt-in. `find-identity -v` lists only VALID
+          # identities, so a count of zero cannot distinguish "nothing
+          # imported" from "imported, but the chain does not resolve here".
+          # Without -v lists them regardless of validity, which separates the
+          # two. Certificate subjects and identity names only - never a key.
+          if [ "${DIAGNOSE_SIGNING:-false}" = "true" ]; then
+            echo "--- identities in the keychain, valid only ---"
+            security find-identity -v -p codesigning "$keychain" || true
+            echo "--- identities in the keychain, including invalid ---"
+            security find-identity -p codesigning "$keychain" || true
+            echo "--- certificates in the keychain ---"
+            security find-certificate -a "$keychain" \
+              | grep -E '"labl"|"subj"' || true
+            echo "--- is an Apple root trusted for this account? ---"
+            security find-certificate -a -c "Apple Root CA" \
+              /System/Library/Keychains/SystemRootCertificates.keychain \
+              | grep -c '"labl"' || true
+            echo "--- end diagnostics ---"
+          fi
+          identities="$(security find-identity -v -p codesigning "$keychain" | grep -c 'Apple Distribution' || true)"
+          if [ "${identities:-0}" -lt 1 ]; then
+            echo "No Apple Distribution identity landed in the signing keychain." >&2
+            echo "IOS_DIST_P12_B64 decoded, but it does not contain one." >&2
+            exit 1
+          fi
+          echo "IOS_SIGNING_KEYCHAIN=$keychain" >> "$GITHUB_ENV"
+          echo "Imported the distribution identity into a job-scoped keychain."
+
+      # The archive. Four groups of arguments are doing distinct work:
+      #
+      # 1. The signing overrides. Config/Base.xcconfig ad-hoc signs
+      #    (CODE_SIGN_IDENTITY = -, CODE_SIGNING_REQUIRED = NO,
+      #    CODE_SIGN_STYLE = Manual) so that a clone with no Apple credentials
+      #    still builds for a simulator. A device archive needs the opposite of
+      #    two of those three. Command-line build settings beat an xcconfig, so
+      #    they are overridden here and nowhere on disk changes - which is the
+      #    point: the team identifier exists only in this process's argument
+      #    list, for the length of this step.
+      #
+      # 2. MANUAL signing with a named profile, and this is the part that was
+      #    wrong before. CODE_SIGN_STYLE=Automatic does not work for this
+      #    project: Xcode decides development-vs-distribution for automatic
+      #    signing from the target's ProvisioningStyle attribute in the
+      #    .pbxproj, and this project deliberately has no such attribute -
+      #    every signing setting lives in the xcconfig so that a
+      #    credential-less clone still builds. With nothing to read, automatic
+      #    signing resolves to development and the archive fails; both of the
+      #    failure messages are quoted in the certificate-import step above.
+      #
+      #    Manual signing removes the guess. PROVISIONING_PROFILE_SPECIFIER
+      #    names the App Store profile by name; -allowProvisioningUpdates below
+      #    downloads it from the developer portal, so it is neither installed
+      #    on the runner nor carried as a secret. It has to already exist in
+      #    the account - docs/ios-testflight.md has the one-time creation.
+      #
+      #    OTHER_CODE_SIGN_FLAGS pins codesign to the job's own keychain. It is
+      #    first in the search list anyway, but this runner is a physical
+      #    machine whose other keychains are outside this job's control, and an
+      #    archive that silently signed with some other identity that happened
+      #    to be on the box is exactly the failure that is hardest to notice.
+      #
+      # 3. -allowProvisioningUpdates plus the three -authenticationKey* flags.
+      #    Together these let xcodebuild talk to the developer portal as the
+      #    API key, to register the App ID for com.wattracker.ios if it does
+      #    not exist and to download the App Store provisioning profile. Note
+      #    what is NOT in that list: it does not issue the distribution
+      #    certificate. See the import step above. Without the key flags,
+      #    -allowProvisioningUpdates falls back to an Apple account configured
+      #    in Xcode's own Accounts pane, which a CI job does not have.
+      #
+      # 4. The version numbers, from the step above.
+      #
+      # -destination 'generic/platform=iOS' rather than a concrete device: an
+      # archive is built for the device family, not for one device.
+      #
+      # No -verbose. The verbose log echoes the full compiler and codesign
+      # invocations, which include -authenticationKeyPath; the path is not
+      # itself secret, but a log that names it invites the next person to paste
+      # it somewhere. -quiet is not used either - the default is the level at
+      # which a signing failure is readable.
+      - name: Archive for the App Store
+        env:
+          ASC_KEY_ID: ${{ secrets.APP_STORE_CONNECT_KEY_ID }}
+          ASC_ISSUER_ID: ${{ secrets.APP_STORE_CONNECT_ISSUER_ID }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        run: |
+          set -euo pipefail
+          xcodebuild archive \
+            -project ios/WatTracker/WatTracker.xcodeproj \
+            -scheme WatTracker \
+            -configuration Release \
+            -destination 'generic/platform=iOS' \
+            -archivePath "$RUNNER_TEMP/WatTracker.xcarchive" \
+            -derivedDataPath "$RUNNER_TEMP/ios-archive-dd" \
+            -allowProvisioningUpdates \
+            -authenticationKeyPath "$ASC_KEY_PATH" \
+            -authenticationKeyID "$ASC_KEY_ID" \
+            -authenticationKeyIssuerID "$ASC_ISSUER_ID" \
+            DEVELOPMENT_TEAM="$APPLE_TEAM_ID" \
+            CODE_SIGN_STYLE=Manual \
+            CODE_SIGN_IDENTITY="Apple Distribution" \
+            PROVISIONING_PROFILE_SPECIFIER="WatTracker App Store" \
+            OTHER_CODE_SIGN_FLAGS="--keychain $IOS_SIGNING_KEYCHAIN" \
+            CODE_SIGNING_REQUIRED=YES \
+            CODE_SIGNING_ALLOWED=YES \
+            MARKETING_VERSION="$MARKETING_VERSION" \
+            CURRENT_PROJECT_VERSION="$BUILD_NUMBER"
+
+      # -exportArchive re-signs the archived app for distribution, so it needs
+      # the portal credentials too - this is the step that downloads the App
+      # Store profile if the archive step only just created it.
+      #
+      # It also needs the signing keychain, which is why the cleanup that
+      # deletes it is at the bottom of the job and not immediately after the
+      # archive. -exportArchive takes no build settings, so there is no
+      # --keychain to pass here: it resolves the identity through the keychain
+      # search list, which the import step put the job's keychain at the front
+      # of. ios/WatTracker/ExportOptions.plist names the same profile the
+      # archive was signed with; a mismatch there re-signs with something else
+      # and is not caught until Apple rejects the upload.
+      - name: Export the signed .ipa
+        env:
+          ASC_KEY_ID: ${{ secrets.APP_STORE_CONNECT_KEY_ID }}
+          ASC_ISSUER_ID: ${{ secrets.APP_STORE_CONNECT_ISSUER_ID }}
+        run: |
+          set -euo pipefail
+          xcodebuild -exportArchive \
+            -archivePath "$RUNNER_TEMP/WatTracker.xcarchive" \
+            -exportPath "$RUNNER_TEMP/export" \
+            -exportOptionsPlist "$EXPORT_OPTIONS_PLIST" \
+            -allowProvisioningUpdates \
+            -authenticationKeyPath "$ASC_KEY_PATH" \
+            -authenticationKeyID "$ASC_KEY_ID" \
+            -authenticationKeyIssuerID "$ASC_ISSUER_ID"
+          ipa="$(find "$RUNNER_TEMP/export" -maxdepth 1 -name '*.ipa' -print -quit)"
+          if [ -z "$ipa" ]; then
+            echo "Export produced no .ipa" >&2
+            exit 1
+          fi
+          echo "IPA_PATH=$ipa" >> "$GITHUB_ENV"
+          echo "Exported $(basename "$ipa")"
+          # The key must not have been copied anywhere by the export. Cheap
+          # assertion, and the thing it guards against - a .p8 inside the
+          # payload - would otherwise ship to Apple and to every tester.
+          if find "$RUNNER_TEMP/export" "$RUNNER_TEMP/WatTracker.xcarchive" -name '*.p8' | grep -q .; then
+            echo "A .p8 was found inside the archive or export. Refusing to upload." >&2
+            exit 1
+          fi
+
+      # altool, and it is present: `xcrun --find altool` resolves on this
+      # runner under Xcode 26.6 (altool 26.40.1), and --upload-app with
+      # --api-key/--api-issuer is still its documented App Store delivery path.
+      # notarytool is NOT the alternative - it submits macOS software for
+      # notarization and cannot deliver an iOS build to App Store Connect.
+      #
+      # --p8-file-path rather than altool's search path. altool otherwise looks
+      # for AuthKey_<id>.p8 in ./private_keys, ~/private_keys, ~/.private_keys
+      # and ~/.appstoreconnect/private_keys, and on this runner the last of
+      # those is a real human's home directory with a real key in it. A search
+      # path would let this job silently authenticate with a machine-local
+      # credential nobody declared - and appear to work while the secret it is
+      # supposed to be testing was wrong. An explicit path cannot do that.
+      #
+      # --validate-app first: it runs Apple's own checks on the package and,
+      # importantly, is where a missing App Store Connect app record surfaces -
+      # in seconds, with a message that names the problem, instead of after a
+      # full upload. See docs/ios-testflight.md for the one-time record
+      # creation, which no API can do for us.
+      #
+      # The key id and issuer id are on the argument list here and in the two
+      # xcodebuild steps above, where any process on the runner could read them
+      # for the duration of the call. They are identifiers, not the credential:
+      # neither is usable without the .p8, which stays in a 0600 file. altool
+      # offers no way to pass them off argv. macos-release.yml documents the
+      # same residual for `security import`.
+      - name: Validate and upload to TestFlight
+        # Tag runs only. A manual dispatch is for exercising the signing
+        # and archive path; it must never be able to publish a build to
+        # App Store Connect, where a bad build number cannot be reused.
+        if: startsWith(github.ref, 'refs/tags/ios-v')
+        env:
+          ASC_KEY_ID: ${{ secrets.APP_STORE_CONNECT_KEY_ID }}
+          ASC_ISSUER_ID: ${{ secrets.APP_STORE_CONNECT_ISSUER_ID }}
+        run: |
+          set -euo pipefail
+          xcrun altool --validate-app \
+            --file "$IPA_PATH" \
+            --type ios \
+            --api-key "$ASC_KEY_ID" \
+            --api-issuer "$ASC_ISSUER_ID" \
+            --p8-file-path "$ASC_KEY_PATH"
+          xcrun altool --upload-app \
+            --file "$IPA_PATH" \
+            --type ios \
+            --api-key "$ASC_KEY_ID" \
+            --api-issuer "$ASC_ISSUER_ID" \
+            --p8-file-path "$ASC_KEY_PATH"
+          echo "Uploaded build $BUILD_NUMBER of version $MARKETING_VERSION."
+          echo "App Store Connect processes it asynchronously; it appears in"
+          echo "TestFlight once processing finishes."
+
+      # THERE IS DELIBERATELY NO ARTIFACT UPLOAD.
+      #
+      # The .p8 is not the reason - the step above asserts it is not in the
+      # payload. The reason is the team identifier. A distribution-signed .ipa
+      # embeds embedded.mobileprovision, whose TeamIdentifier is the team id,
+      # and the signing certificate's subject carries it too. Artifacts on a
+      # public repository are downloadable by anyone, so uploading the .ipa
+      # would publish the one identifier this whole workflow goes out of its
+      # way to keep out of the tree. None of that is secret to Apple or to a
+      # tester who installs the app - it is secret to the internet, which is a
+      # different question, and the artifact store is the internet.
+      #
+      # Nothing needs the .ipa anyway: the build's destination is TestFlight,
+      # and testers install it from there. (The account's Actions artifact
+      # storage is also full - see the long note in windows.yml - so an upload
+      # would turn a green release into a red one.)
+
+      # Unconditional, and it is the only thing standing between a private key
+      # and a machine that persists between jobs. It must not depend on any
+      # earlier step succeeding, must not fail the job if the paths are already
+      # gone, and must not print what it is removing beyond the fact that it
+      # ran.
+      - name: Remove the signing material
+        if: always()
+        run: |
+          set -euo pipefail
+          # The keychain first: it holds the distribution private key, and it
+          # is the one piece of this that would still be usable tomorrow. The
+          # search list is put back before the keychain is deleted so that a
+          # failure to delete does not also leave the runner pointing at a
+          # keychain that is gone.
+          #
+          # `-s login.keychain-db` resets the list to the default rather than
+          # to whatever it was, which is what macos-release.yml does and is
+          # worth naming as a difference: that job runs on a VM nobody else
+          # uses, and this one does not. If the ci-runner account is ever
+          # given extra keychains of its own, this line drops them from its
+          # search list and they have to be added back.
+          security list-keychains -d user -s login.keychain-db || true
+          if [ -n "${IOS_SIGNING_KEYCHAIN:-}" ]; then
+            security delete-keychain "$IOS_SIGNING_KEYCHAIN" || true
+          fi
+          rm -f "$RUNNER_TEMP/wattracker-ios-signing.p12" || true
+          rm -rf "$RUNNER_TEMP/asc" || true
+          rm -f "$RUNNER_TEMP/ExportOptions.plist" || true
+          # The archive and the export both carry the team identifier in the
+          # embedded provisioning profile, and DerivedData holds a copy of
+          # everything that was built. On a runner that is discarded this would
+          # not matter; this one is not discarded.
+          rm -rf "$RUNNER_TEMP/WatTracker.xcarchive" "$RUNNER_TEMP/export" || true
+          rm -rf "$RUNNER_TEMP/ios-archive-dd" "$RUNNER_TEMP/ios-test-dd" || true
+          if [ -e "$RUNNER_TEMP/asc" ]; then
+            echo "The App Store Connect key directory could not be removed." >&2
+            exit 1
+          fi
+          if [ -n "${IOS_SIGNING_KEYCHAIN:-}" ] && [ -e "$IOS_SIGNING_KEYCHAIN" ]; then
+            echo "The signing keychain could not be removed. It holds the" >&2
+            echo "distribution private key and this runner is not discarded." >&2
+            exit 1
+          fi
+          echo "Signing material removed."
