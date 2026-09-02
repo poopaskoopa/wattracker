@@ -15,6 +15,7 @@
 		1A0000000000000000000055 /* DeviceKey.swift in Sources */ = {isa = PBXBuildFile; fileRef = 1A0000000000000000000036 /* DeviceKey.swift */; };
 		1A0000000000000000000056 /* CanonicalRequestVectorTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 1A0000000000000000000037 /* CanonicalRequestVectorTests.swift */; };
 		1A0000000000000000000057 /* CanonicalRequest.swift in Sources */ = {isa = PBXBuildFile; fileRef = 1A0000000000000000000034 /* CanonicalRequest.swift */; };
+		1A00000000000000000000B0 /* Assets.xcassets in Resources */ = {isa = PBXBuildFile; fileRef = 1A00000000000000000000A0 /* Assets.xcassets */; };
 		1A0000000000000000000058 /* canonical_request_v1.json in Resources */ = {isa = PBXBuildFile; fileRef = 1A0000000000000000000038 /* canonical_request_v1.json */; };
 		1A0000000000000000000190 /* RootView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 1A0000000000000000000090 /* RootView.swift */; };
 		1A0000000000000000000191 /* Destination.swift in Sources */ = {isa = PBXBuildFile; fileRef = 1A0000000000000000000091 /* Destination.swift */; };
@@ -33,6 +34,7 @@
 		1A0000000000000000000021 /* WatTrackerTests.xctest */ = {isa = PBXFileReference; explicitFileType = wrapper.cfbundle; includeInIndex = 0; path = WatTrackerTests.xctest; sourceTree = BUILT_PRODUCTS_DIR; };
 		1A0000000000000000000030 /* WatTrackerApp.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = WatTrackerApp.swift; sourceTree = "<group>"; };
 		1A0000000000000000000031 /* FTPScreen.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = FTPScreen.swift; sourceTree = "<group>"; };
+		1A00000000000000000000A0 /* Assets.xcassets */ = {isa = PBXFileReference; lastKnownFileType = folder.assetcatalog; path = Assets.xcassets; sourceTree = "<group>"; };
 		1A0000000000000000000032 /* Info.plist */ = {isa = PBXFileReference; lastKnownFileType = text.plist.xml; path = Info.plist; sourceTree = "<group>"; };
 		1A0000000000000000000033 /* AppConfiguration.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AppConfiguration.swift; sourceTree = "<group>"; };
 		1A0000000000000000000034 /* CanonicalRequest.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = CanonicalRequest.swift; sourceTree = "<group>"; };
@@ -102,6 +104,7 @@
 				1A0000000000000000000047 /* Theme */,
 				1A0000000000000000000031 /* FTPScreen.swift */,
 				1A0000000000000000000041 /* Cloud */,
+				1A00000000000000000000A0 /* Assets.xcassets */,
 				1A0000000000000000000032 /* Info.plist */,
 			);
 			path = WatTracker;
@@ -254,6 +257,7 @@
 			isa = PBXResourcesBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
+				1A00000000000000000000B0 /* Assets.xcassets in Resources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};

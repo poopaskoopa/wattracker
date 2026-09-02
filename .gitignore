@@ -31,6 +31,19 @@ credentials.key
 *.key
 *.pem
 
+# Apple code-signing material. scripts/ios_distribution_cert.py writes all of
+# this to ~/.appstoreconnect and refuses to write into a git work tree at all,
+# so these lines should never fire - they are here for the run that passes
+# --out-dir . by mistake, or the .cer somebody downloads from the portal into
+# the repository root. A distribution private key committed to a PUBLIC
+# repository is a key you have to revoke, not a mistake you can amend away.
+*.p12
+*.p8
+*.cer
+*.csr
+*.certSigningRequest
+*.mobileprovision
+
 # OS / editor
 .DS_Store
 .idea/
