@@ -740,3 +740,343 @@ def test_pairing_codes_survive_a_restart_and_stay_single_use():
         b"server secret", backend=backend, clock=lambda: 1_000
     )
     assert expired.consume(stale.code, "rider") is None
+
+
+# ---------------------------------------------------------------------------
+# The expired-row sweep (#153)
+#
+# `CloudAuth` holds reader contexts, their index, invitations, pairing codes
+# and replay claims -- all of which accumulate -- in the same table as the
+# budget kill switch and the daily quota counters, which must never be
+# removed.  An absent kill-switch row reads as ENABLED, so deleting one
+# re-enables spending on a deployment somebody deliberately killed, with no
+# error and no log.
+# ---------------------------------------------------------------------------
+
+import json as _json
+
+from wattracker.cloud.limits import (
+    KILL_SWITCH_KEY,
+    KILL_SWITCH_RECORD_KIND,
+    QUOTA_RECORD_KIND,
+    disable_public_api,
+    read_kill_switch,
+)
+from wattracker.cloud.security import (
+    AzureTableSecurityStateBackend,
+    DEVICE_SEEN_RECORD_KIND,
+    ExpiredRecordSweeper,
+    NEVER_SWEEP_RECORD_KINDS,
+    SWEEPABLE_RECORD_KINDS,
+)
+
+
+class _SweepClock:
+    def __init__(self, value: float) -> None:
+        self.value = float(value)
+
+    def __call__(self) -> float:
+        return self.value
+
+
+class _DurableMemoryBackend(MemorySecurityStateBackend):
+    """A shared-process backend that claims durability.
+
+    The kill switch refuses a non-durable one at construction, deliberately:
+    a process-local switch in a scale-to-zero deployment re-enables itself.
+    """
+
+    durable = True
+
+
+def _expiring(backend, kind, seed, expires_at, **extra):
+    key = hashlib.sha256(seed).hexdigest()
+    backend.write(kind, key, {"expires_at": float(expires_at), **extra})
+    return key
+
+
+def test_the_sweep_never_removes_the_kill_switch_row():
+    """Throw the switch, sweep, and read it back: still disabled.
+
+    Asserted on ``read_kill_switch``, not on the row's presence, because the
+    row's presence is not what a deployment depends on -- the *reading* is.
+    An absent row reads as enabled, so a sweep that deleted it would leave
+    every later request admitted while the operator believes spending is
+    stopped.
+    """
+
+    clock = _SweepClock(100_000.0)
+    backend = _DurableMemoryBackend()
+    disable_public_api(backend, reason="budget-100")
+    assert read_kill_switch(backend).public_enabled is False
+
+    # Plenty for the sweep to actually do, so this is not a no-op pass.
+    for index in range(5):
+        _expiring(backend, "context", b"ctx-%d" % index, clock.value - 10_000)
+        _expiring(backend, "nonce", b"nonce-%d" % index, clock.value - 10_000)
+
+    swept = ExpiredRecordSweeper(backend, clock=clock).sweep()
+    assert swept == 10
+
+    state = read_kill_switch(backend)
+    assert state.public_enabled is False
+    assert state.writes_enabled is False
+    assert state.reason == "budget-100"
+
+
+def test_a_kill_switch_row_that_looks_expired_is_still_never_swept():
+    """Kind is the test, not the payload.
+
+    The real kill-switch payload has no ``expires_at``, so an expiry test
+    alone would already miss it.  That is not what protects it: a row is
+    reached only because its *kind* is on the allowlist.  Writing an expiry
+    into the row proves the difference.
+    """
+
+    clock = _SweepClock(100_000.0)
+    backend = _DurableMemoryBackend()
+    disable_public_api(backend, reason="budget-100")
+    poisoned = dict(backend.read(KILL_SWITCH_RECORD_KIND, KILL_SWITCH_KEY))
+    poisoned["expires_at"] = clock.value - 100_000
+    backend.write(KILL_SWITCH_RECORD_KIND, KILL_SWITCH_KEY, poisoned)
+
+    ExpiredRecordSweeper(backend, clock=clock).sweep()
+
+    assert read_kill_switch(backend).public_enabled is False
+
+
+def test_the_sweep_leaves_counters_credentials_and_live_rows_alone():
+    pytest.importorskip("cryptography")
+    clock = _SweepClock(100_000.0)
+    backend = MemorySecurityStateBackend()
+    registry = CredentialRegistry(
+        b"server secret", backend=backend, clock=clock
+    )
+    namespace = _namespace()
+    writer = registry.register_writer(
+        new_installation_id(), "scope", b"w" * 32, b"s" * 32
+    )
+    _private, public_key = generate_signing_keypair()
+    device = registry.register_device_for_scope(
+        namespace, "scope", public_key, label="phone"
+    )
+    backend.charge_counter(
+        QUOTA_RECORD_KIND, hashlib.sha256(b"counter").hexdigest(),
+        day="2026-08-31", amount=5, ceiling=100,
+        expires_at=clock.value - 50_000, now=clock.value,
+    )
+    registry.record_device_seen(device.credential_id)
+    live = _expiring(backend, "context", b"live", clock.value + 10_000)
+    stale = _expiring(backend, "context", b"stale", clock.value - 10_000)
+    # Inside the grace window: expired, but not yet by enough.
+    recent = _expiring(backend, "context", b"recent", clock.value - 10)
+
+    assert ExpiredRecordSweeper(backend, clock=clock).sweep() == 1
+
+    assert backend.read("context", stale) is None
+    assert backend.read("context", live) is not None
+    assert backend.read("context", recent) is not None
+    assert registry.resolve_writer(writer.credential_id) is not None
+    assert registry.resolve_device(device.credential_id) is not None
+    assert registry.device_last_seen(device.credential_id) == clock.value
+    assert backend.read(
+        QUOTA_RECORD_KIND, hashlib.sha256(b"counter").hexdigest()
+    )["value"] == 5
+
+
+def test_the_sweep_leaves_a_row_it_cannot_read_where_it_is():
+    """A row nobody can parse is not a row anybody may delete."""
+
+    clock = _SweepClock(100_000.0)
+    backend = MemorySecurityStateBackend()
+    key = hashlib.sha256(b"corrupt").hexdigest()
+    backend.write("context", key, {"expires_at": "not-a-number"})
+    other = hashlib.sha256(b"no-expiry").hexdigest()
+    backend.write("context", other, {"token_digest": "00"})
+    boolean = hashlib.sha256(b"boolean").hexdigest()
+    backend.write("context", boolean, {"expires_at": True})
+
+    assert ExpiredRecordSweeper(backend, clock=clock).sweep() == 0
+    assert backend.read("context", key) is not None
+    assert backend.read("context", other) is not None
+    assert backend.read("context", boolean) is not None
+
+
+def test_a_sweeper_cannot_be_pointed_at_a_protected_record_kind():
+    backend = MemorySecurityStateBackend()
+    for kind in sorted(NEVER_SWEEP_RECORD_KINDS):
+        with pytest.raises(ValueError):
+            ExpiredRecordSweeper(backend, kinds={kind})
+    with pytest.raises(ValueError):
+        ExpiredRecordSweeper(backend, kinds={"context", KILL_SWITCH_RECORD_KIND})
+    with pytest.raises(ValueError):
+        ExpiredRecordSweeper(backend, kinds=set())
+    with pytest.raises(ValueError):
+        ExpiredRecordSweeper(backend, kinds={"something-else"})
+
+
+def test_the_protected_kinds_are_the_ones_limits_actually_writes():
+    """The exclusion is spelled literally in ``security``; this links it.
+
+    ``limits`` imports ``security``, so the constants cannot be imported the
+    other way round.  A rename on either side has to fail somewhere, and this
+    is where.
+    """
+
+    assert KILL_SWITCH_RECORD_KIND in NEVER_SWEEP_RECORD_KINDS
+    assert QUOTA_RECORD_KIND in NEVER_SWEEP_RECORD_KINDS
+    assert DEVICE_SEEN_RECORD_KIND in NEVER_SWEEP_RECORD_KINDS
+    assert not (SWEEPABLE_RECORD_KINDS & NEVER_SWEEP_RECORD_KINDS)
+
+
+def test_maybe_sweep_runs_once_per_interval_and_swallows_failure():
+    clock = _SweepClock(100_000.0)
+    backend = MemorySecurityStateBackend()
+    _expiring(backend, "context", b"one", clock.value - 10_000)
+    sweeper = ExpiredRecordSweeper(backend, clock=clock, interval_seconds=3_600)
+    assert sweeper.maybe_sweep() == 1
+    _expiring(backend, "context", b"two", clock.value - 10_000)
+    assert sweeper.maybe_sweep() == 0
+    clock.value += 3_601
+    assert sweeper.maybe_sweep() == 1
+
+    class _Broken(MemorySecurityStateBackend):
+        def iter_records(self, kind, *, limit):
+            raise RuntimeError("table unavailable")
+
+    broken = ExpiredRecordSweeper(_Broken(), clock=clock)
+    assert broken.maybe_sweep() == 0
+
+
+# ---------------------------------------------------------------------------
+# The Azure row shape the sweep depends on
+# ---------------------------------------------------------------------------
+
+
+class _RangeTable:
+    """An Azure table stand-in that honours the RowKey range a scan uses."""
+
+    def __init__(self) -> None:
+        self.entities: dict = {}
+        self.deleted: list = []
+
+    def create_entity(self, entity):
+        key = (entity["PartitionKey"], entity["RowKey"])
+        if key in self.entities:
+            raise _SweepStorageError(409)
+        self.entities[key] = dict(entity, etag='W/"1"')
+
+    def upsert_entity(self, entity):
+        self.entities[(entity["PartitionKey"], entity["RowKey"])] = dict(
+            entity, etag='W/"1"'
+        )
+
+    def get_entity(self, *, partition_key, row_key):
+        try:
+            return dict(self.entities[(partition_key, row_key)])
+        except KeyError as exc:
+            raise _SweepStorageError(404) from exc
+
+    def delete_entity(self, *, partition_key, row_key):
+        try:
+            del self.entities[(partition_key, row_key)]
+        except KeyError as exc:
+            raise _SweepStorageError(404) from exc
+        self.deleted.append(row_key)
+
+    def query_entities(self, *, query_filter):
+        # Only the shape this module emits is understood; anything else is a
+        # test that has drifted from the query it means to exercise.
+        parts = query_filter.split("'")
+        partition, low, high = parts[1], parts[3], parts[5]
+        return [
+            dict(entity)
+            for (entity_partition, row_key), entity in sorted(self.entities.items())
+            if entity_partition == partition and low <= row_key < high
+        ]
+
+
+class _SweepStorageError(Exception):
+    def __init__(self, status_code):
+        super().__init__(str(status_code))
+        self.status_code = status_code
+
+
+def test_azure_scan_separates_kinds_that_share_a_prefix():
+    """``context`` and ``context-index`` are one range apart, not one prefix."""
+
+    table = _RangeTable()
+    backend = AzureTableSecurityStateBackend(table)
+    context_key = hashlib.sha256(b"context").hexdigest()
+    index_key = hashlib.sha256(b"index").hexdigest()
+    device_key = hashlib.sha256(b"device").hexdigest()
+    seen_key = hashlib.sha256(b"seen").hexdigest()
+    backend.write("context", context_key, {"expires_at": 1.0})
+    backend.write("context-index", index_key, {"expires_at": 1.0})
+    backend.write("device", device_key, {"namespace": "n"})
+    backend.write(DEVICE_SEEN_RECORD_KIND, seen_key, {"last_seen_at": 1.0})
+
+    assert backend.iter_records("context", limit=10) == [
+        (context_key, {"expires_at": 1.0})
+    ]
+    assert backend.iter_records("context-index", limit=10) == [
+        (index_key, {"expires_at": 1.0})
+    ]
+    assert backend.iter_records("device", limit=10) == [
+        (device_key, {"namespace": "n"})
+    ]
+    assert backend.iter_records(DEVICE_SEEN_RECORD_KIND, limit=10) == [
+        (seen_key, {"last_seen_at": 1.0})
+    ]
+
+
+def test_azure_sweep_deletes_only_expired_rows_of_swept_kinds():
+    clock = _SweepClock(100_000.0)
+    table = _RangeTable()
+    backend = AzureTableSecurityStateBackend(table)
+    disable_public_api(backend, reason="budget-100")
+    stale = hashlib.sha256(b"stale").hexdigest()
+    live = hashlib.sha256(b"live").hexdigest()
+    backend.write("nonce", stale, {"expires_at": clock.value - 10_000})
+    backend.write("nonce", live, {"expires_at": clock.value + 10_000})
+
+    assert ExpiredRecordSweeper(backend, clock=clock).sweep() == 1
+    assert table.deleted == [f"nonce:{stale}"]
+    assert read_kill_switch(backend).public_enabled is False
+    assert backend.read("nonce", live) is not None
+
+
+def test_azure_backend_refuses_to_delete_an_unaddressable_row():
+    table = _RangeTable()
+    backend = AzureTableSecurityStateBackend(table)
+    with pytest.raises(ValueError):
+        backend.delete("Kill-Switch", KILL_SWITCH_KEY)
+    with pytest.raises(ValueError):
+        backend.delete("nonce", "not-a-digest")
+    with pytest.raises(ValueError):
+        backend.iter_records("NONCE", limit=10)
+    assert backend.delete("nonce", hashlib.sha256(b"absent").hexdigest()) is False
+    assert table.deleted == []
+    assert _json is not None
+
+
+def test_a_pass_stops_at_its_deletion_budget_and_resumes_next_time():
+    """A pass is latency on somebody's refresh, so it is bounded in rows too.
+
+    A backlog therefore drains across several passes rather than in one long
+    request, and the budget is what stops the first pass after a deploy from
+    trying to delete a year of accumulated rows inline.
+    """
+
+    clock = _SweepClock(100_000.0)
+    backend = MemorySecurityStateBackend()
+    for index in range(25):
+        _expiring(backend, "nonce", b"old-%d" % index, clock.value - 10_000)
+
+    sweeper = ExpiredRecordSweeper(backend, clock=clock, delete_limit=10)
+    assert sweeper.sweep() == 10
+    assert len(backend.iter_records("nonce", limit=100)) == 15
+    assert sweeper.sweep() == 10
+    assert sweeper.sweep() == 5
+    assert sweeper.sweep() == 0
+    assert backend.iter_records("nonce", limit=100) == []

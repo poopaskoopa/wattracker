@@ -313,6 +313,36 @@ resource authManagerRoleDefinition 'Microsoft.Authorization/roleDefinitions@2022
     assignableScopes: [storage.id]
   }
 }
+// The read plane serves GET /api/v1/devices and POST
+// /api/v1/devices/{id}/revoke, so it needs to *write* CloudAuth -- which
+// `authManagerRoleDefinition` above already grants it (read, add, update).
+// What it did not have, and what the expired-row sweep needs, is a delete.
+//
+// It is a separate role rather than a fourth action on the manager role, so
+// the grant that removes rows is legible on its own, is assignable on its own,
+// and is scoped to the CloudAuth table alone -- the same shape
+// `replayWriterRoleDefinition` uses for CloudReplay. The sync identity keeps
+// `authReaderRoleDefinition` and holds no delete anywhere.
+//
+// Azure table roles cannot be conditioned on a row key, so this action reaches
+// every row in CloudAuth including the budget kill switch. What keeps the
+// switch safe is in the application: `ExpiredRecordSweeper` deletes only the
+// record kinds named in `SWEEPABLE_RECORD_KINDS`, only past their own
+// `expires_at`, and refuses at construction to be pointed at
+// `NEVER_SWEEP_RECORD_KINDS` -- which names the kill switch and the quota
+// counters, neither of which carries an expiry at all.
+resource authSweeperRoleDefinition 'Microsoft.Authorization/roleDefinitions@2022-04-01' = {
+  name: guid(authTable.id, 'wattracker-auth-sweeper')
+  properties: {
+    roleName: 'Wattracker Cloud Auth Sweeper'
+    description: 'Delete expired context, invitation, pairing and replay rows in CloudAuth. The kill switch and quota counter rows carry no expiry and are excluded by record kind in the app.'
+    type: 'CustomRole'
+    permissions: [{ dataActions: [
+      'Microsoft.Storage/storageAccounts/tableServices/tables/entities/delete'
+    ] }]
+    assignableScopes: [authTable.id]
+  }
+}
 resource replayWriterRoleDefinition 'Microsoft.Authorization/roleDefinitions@2022-04-01' = {
   name: guid(storage.id, 'wattracker-replay-writer')
   properties: {
@@ -356,6 +386,11 @@ resource syncAuthRole 'Microsoft.Authorization/roleAssignments@2022-04-01' = {
   name: guid(authTable.id, syncIdentity.id, 'auth-reader')
   scope: authTable
   properties: { roleDefinitionId: authReaderRoleDefinition.id; principalId: syncIdentity.properties.principalId; principalType: 'ServicePrincipal' }
+}
+resource readAuthSweepRole 'Microsoft.Authorization/roleAssignments@2022-04-01' = {
+  name: guid(authTable.id, readIdentity.id, 'auth-sweeper')
+  scope: authTable
+  properties: { roleDefinitionId: authSweeperRoleDefinition.id; principalId: readIdentity.properties.principalId; principalType: 'ServicePrincipal' }
 }
 resource syncReplayRole 'Microsoft.Authorization/roleAssignments@2022-04-01' = {
   name: guid(replayTable.id, syncIdentity.id, 'replay-writer')
