@@ -81,12 +81,13 @@ roughly `$2–5` rather than the former `$50` budget. Notifications are:
 | 80% of amount | `POST /api/budget/disable-writes`, persists `writes_enabled=false`, reason `budget 80%` |
 | 100% of amount | `POST /api/budget/disable-public-api`, persists both levels disabled, reason `budget 100%` |
 
-The hook accepts only its fixed route action. It rejects unauthenticated calls,
-does not select an action or reason from the alert body, and returns a generic
-503 when durable state cannot be written. Clearing is a separate operator
-action that writes both levels enabled. A deployment drill must verify the
-state through `read_kill_switch`, restart an app, and verify that the state
-still holds.
+The budget callbacks accept only their fixed route action. They reject
+unauthenticated calls, do not select an action or reason from the alert body,
+and return a generic 503 when durable state cannot be written. Clearing is a
+separate operator route that requires the Function host key and the
+app-level `X-Wattracker-Budget-Token` header, then writes both levels enabled.
+A deployment drill must verify the state through `read_kill_switch`, restart an
+app, and verify that the state still holds.
 
 ## Subject and enrollment inventory
 

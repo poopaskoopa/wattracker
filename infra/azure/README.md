@@ -69,6 +69,8 @@ reset the budget window to the date the template was authored.
   writes and leaves reads enabled, with reason `budget 80%`.
 - `/api/budget/disable-public-api`: at the 100% alert, persistently
   disables the public API and writes, with reason `budget 100%`.
+- `/api/budget/clear`: operator recovery; requires the Function host key and
+  the `X-Wattracker-Budget-Token` app-level header and restores both levels.
 
 The hook runs outside Container Apps so it remains callable when the public
 API is disabled or scaled to zero. Its managed identity can read and upsert

@@ -72,9 +72,12 @@ def test_budget_actions_target_authenticated_durable_kill_switch_handlers():
     )
     assert '"/budget/disable-writes"' in BUDGET_HOOK_IMPL
     assert '"/budget/disable-public-api"' in BUDGET_HOOK_IMPL
+    assert '"/budget/clear"' in BUDGET_HOOK_IMPL
     assert "disable_writes" in BUDGET_HOOK_IMPL
     assert "disable_public_api" in BUDGET_HOOK_IMPL
+    assert "clear_kill_switch" in BUDGET_HOOK_IMPL
     assert "AuthLevel.FUNCTION" in BUDGET_HOOK
+    assert "platform_authenticated=True" in BUDGET_HOOK
     assert "create_budget_hook_app" in BUDGET_HOOK
     assert "from_managed_identity" in BUDGET_HOOK
     assert "entities/delete" not in BICEP

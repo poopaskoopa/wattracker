@@ -22,6 +22,8 @@ The fixed POST endpoints are:
 
 - `/api/budget/disable-writes` — budget 80%; keeps the public API enabled.
 - `/api/budget/disable-public-api` — budget 100%; disables both levels.
+- `/api/budget/clear` — operator recovery; requires the Function host key and
+  the `X-Wattracker-Budget-Token` app-level header.
 
 Azure Function authentication is `FUNCTION`; Azure Action Groups should use
 the complete function URL with its `code` query parameter. The main Bicep
