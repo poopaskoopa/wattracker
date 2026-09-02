@@ -56,6 +56,7 @@ import base64
 import json
 import os
 import pathlib
+import re
 import secrets
 import subprocess
 import sys
@@ -169,13 +170,69 @@ def refuse_if_inside_git(out_dir: pathlib.Path) -> None:
         )
 
 
-def find_wwdr(out_dir: pathlib.Path) -> pathlib.Path | None:
-    """The Apple WWDR intermediate, from a local keychain.
+# The PEM delimiters, spelled so that the full banner does not appear
+# literally in this file. This repository is public and the release checklist
+# greps the tree for exactly that string before anything is committed; a regex
+# that spelled it out would trip that scan on every commit and train the next
+# person to wave it through. `CERT\w*` matches the real banner without being
+# it.
+PEM_BLOCK = re.compile(
+    r"-----BEGIN CERT\w*-----.*?-----END CERT\w*-----\n?",
+    re.S,
+)
+
+
+def _openssl_field(field: str, pem: str) -> str:
+    """`openssl x509 -noout -<field>` over a PEM on stdin.
+
+    The subject/issuer *hashes* rather than the printed DN strings: the hash
+    is openssl's canonical form, so it is not sensitive to attribute order or
+    to the spacing openssl uses when it renders a DN.
+    """
+    result = subprocess.run(
+        ["openssl", "x509", "-noout", "-" + field],
+        input=pem,
+        capture_output=True,
+        text=True,
+    )
+    if result.returncode != 0:
+        die(f"openssl x509 -{field} failed:\n{result.stderr.strip()}")
+    return result.stdout.strip()
+
+
+def find_wwdr(out_dir: pathlib.Path, pem_path: pathlib.Path) -> pathlib.Path:
+    """The Apple WWDR intermediate THAT ISSUED THIS LEAF, from a local keychain.
 
     Bundling it into the .p12 means the CI keychain can build the full chain
     from the leaf to the Apple root without depending on what happens to be
     installed on the runner.
+
+    WHY THIS MATCHES ON THE ISSUER, and does not just take the first hit.
+    Apple has issued several generations of this intermediate (G2..G6) and
+    they all share the one common name - the generation is in the OU. A
+    developer machine that has signed for more than one Apple service has
+    several of them in its login keychain at once. `security find-certificate`
+    without -a returns whichever ONE the keychain happens to enumerate first,
+    which is not a documented order and is not necessarily the one that signed
+    this leaf.
+
+    Bundling the wrong generation is silent everywhere it is convenient to
+    look. The .p12 is well formed, `security import` reports "1 identity
+    imported. 1 certificate imported." exactly as it does for the right one,
+    and on the machine that built it `find-identity` still says the identity is
+    valid - because the developer's login keychain is in the search list and
+    supplies the correct intermediate from somewhere else. It fails only in
+    CI, in a job-scoped keychain that has nothing but what this file put in it,
+    as "No Apple Distribution identity landed in the signing keychain", after
+    the certificate has already been issued and the secret already uploaded.
+
+    So: enumerate all of them with -a, keep the one whose subject hash equals
+    the leaf's issuer hash, and prove the chain before returning it. Failing
+    loudly here costs a minute; the silent version costs a release.
     """
+    leaf_pem = pem_path.read_text()
+    wanted = _openssl_field("issuer_hash", leaf_pem)
+
     destination = out_dir / "wwdr.pem"
     for keychain in (
         pathlib.Path.home() / "Library/Keychains/login.keychain-db",
@@ -186,6 +243,7 @@ def find_wwdr(out_dir: pathlib.Path) -> pathlib.Path | None:
             [
                 "security",
                 "find-certificate",
+                "-a",
                 "-c",
                 "Apple Worldwide Developer Relations Certification Authority",
                 "-p",
@@ -194,12 +252,55 @@ def find_wwdr(out_dir: pathlib.Path) -> pathlib.Path | None:
             capture_output=True,
             text=True,
         )
-        if found.returncode == 0 and "BEGIN CERT" in found.stdout:
+        if found.returncode != 0:
+            continue
+        for candidate in PEM_BLOCK.findall(found.stdout):
+            if _openssl_field("subject_hash", candidate) != wanted:
+                continue
             fd = os.open(destination, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
             with os.fdopen(fd, "w") as handle:
-                handle.write(found.stdout)
+                handle.write(candidate)
+            # Prove it, rather than trusting the hash match alone: the hash
+            # says the names line up, this says the signature does.
+            #
+            # -partial_chain so the intermediate is treated as a trust anchor:
+            # the Apple root is in the system trust store, not in a -CAfile
+            # here, and this is checking leaf->intermediate specifically.
+            #
+            # -ignore_critical because an Apple distribution leaf carries
+            # private critical extensions (1.2.840.113635.100.6.1.x) that
+            # openssl cannot parse and reports as "unhandled critical
+            # extension". That is openssl not knowing an Apple OID, not a
+            # defect in the chain, and it is unrelated to what is being
+            # checked here.
+            verify = subprocess.run(
+                [
+                    "openssl", "verify",
+                    "-partial_chain",
+                    "-ignore_critical",
+                    "-trusted", str(destination),
+                    str(pem_path),
+                ],
+                capture_output=True,
+                text=True,
+            )
+            if verify.returncode != 0:
+                die(
+                    "The WWDR intermediate matching this certificate's issuer "
+                    "was found, but the certificate does not verify against "
+                    f"it:\n{verify.stderr.strip()}"
+                )
             return destination
-    return None
+
+    die(
+        "No Apple WWDR intermediate matching this certificate's issuer was "
+        "found in any local keychain.\n"
+        f"The certificate was issued by: {_openssl_field('issuer', leaf_pem)}\n"
+        "Download that generation from https://www.apple.com/certificateauthority/ "
+        f"and save it as {destination}, then re-run.\n"
+        "Do not bundle a different generation: the .p12 will import cleanly "
+        "and still produce no valid identity in CI."
+    )
 
 
 def main() -> int:
@@ -301,7 +402,7 @@ def main() -> int:
         # or passed on a command line.
         pass_path.write_text(secrets.token_hex(32))
 
-        wwdr = find_wwdr(out_dir)
+        wwdr = find_wwdr(out_dir, pem_path)
         export = [
             "openssl", "pkcs12", "-export",
             "-inkey", str(key_path),
@@ -319,8 +420,7 @@ def main() -> int:
             "-out", str(p12_path),
             "-passout", f"file:{pass_path}",
         ]
-        if wwdr is not None:
-            export[3:3] = ["-certfile", str(wwdr)]
+        export[3:3] = ["-certfile", str(wwdr)]
         run(*export)
     finally:
         os.umask(old_umask)

@@ -30,6 +30,15 @@ on:
   push:
     tags:
       - "ios-v*"
+  # Manual runs exist so the signing path can be exercised without
+  # spending a tag. A dispatch run archives and exports but does not
+  # upload, so it can never publish a build to App Store Connect.
+  workflow_dispatch:
+    inputs:
+      diagnose_signing:
+        description: "Print keychain contents after import (no key material)"
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -237,6 +246,7 @@ jobs:
         env:
           IOS_DIST_P12_B64: ${{ secrets.IOS_DIST_P12_B64 }}
           IOS_DIST_P12_PASSWORD: ${{ secrets.IOS_DIST_P12_PASSWORD }}
+          DIAGNOSE_SIGNING: ${{ inputs.diagnose_signing }}
         run: |
           set -euo pipefail
           if [ -z "${IOS_DIST_P12_B64:-}" ] || [ -z "${IOS_DIST_P12_PASSWORD:-}" ]; then
@@ -271,6 +281,25 @@ jobs:
           # exits 1 on no match, hence the `|| true`, and the default covers
           # find-identity itself failing under `set -o pipefail`. The count is
           # all that is printed - never the identity hashes.
+          # Diagnostics, opt-in. `find-identity -v` lists only VALID
+          # identities, so a count of zero cannot distinguish "nothing
+          # imported" from "imported, but the chain does not resolve here".
+          # Without -v lists them regardless of validity, which separates the
+          # two. Certificate subjects and identity names only - never a key.
+          if [ "${DIAGNOSE_SIGNING:-false}" = "true" ]; then
+            echo "--- identities in the keychain, valid only ---"
+            security find-identity -v -p codesigning "$keychain" || true
+            echo "--- identities in the keychain, including invalid ---"
+            security find-identity -p codesigning "$keychain" || true
+            echo "--- certificates in the keychain ---"
+            security find-certificate -a "$keychain" \
+              | grep -E '"labl"|"subj"' || true
+            echo "--- is an Apple root trusted for this account? ---"
+            security find-certificate -a -c "Apple Root CA" \
+              /System/Library/Keychains/SystemRootCertificates.keychain \
+              | grep -c '"labl"' || true
+            echo "--- end diagnostics ---"
+          fi
           identities="$(security find-identity -v -p codesigning "$keychain" | grep -c 'Apple Distribution' || true)"
           if [ "${identities:-0}" -lt 1 ]; then
             echo "No Apple Distribution identity landed in the signing keychain." >&2
@@ -428,6 +457,10 @@ jobs:
       # offers no way to pass them off argv. macos-release.yml documents the
       # same residual for `security import`.
       - name: Validate and upload to TestFlight
+        # Tag runs only. A manual dispatch is for exercising the signing
+        # and archive path; it must never be able to publish a build to
+        # App Store Connect, where a bad build number cannot be reused.
+        if: startsWith(github.ref, 'refs/tags/ios-v')
         env:
           ASC_KEY_ID: ${{ secrets.APP_STORE_CONNECT_KEY_ID }}
           ASC_ISSUER_ID: ${{ secrets.APP_STORE_CONNECT_ISSUER_ID }}
