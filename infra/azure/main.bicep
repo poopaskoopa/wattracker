@@ -516,7 +516,11 @@ resource syncAuthRole 'Microsoft.Authorization/roleAssignments@2022-04-01' = {
 resource readAuthSweepRole 'Microsoft.Authorization/roleAssignments@2022-04-01' = {
   name: guid(authTable.id, readIdentity.id, 'auth-sweeper')
   scope: authTable
-  properties: { roleDefinitionId: authSweeperRoleDefinition.id; principalId: readIdentity.properties.principalId; principalType: 'ServicePrincipal' }
+  properties: {
+    roleDefinitionId: authSweeperRoleDefinition.id
+    principalId: readIdentity.properties.principalId
+    principalType: 'ServicePrincipal'
+  }
 }
 resource readControlRole 'Microsoft.Authorization/roleAssignments@2022-04-01' = {
   name: guid(controlTable.id, readIdentity.id, 'control-reader')
