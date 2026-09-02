@@ -83,8 +83,9 @@ def test_budget_actions_target_authenticated_durable_kill_switch_handlers():
     assert "entities/delete" not in BICEP
     for notification, threshold in (("actual50", 50), ("actual80", 80), ("actual100", 100)):
         assert re.search(
-            rf"properties: \{{ amount: 10;[\s\S]*?notifications: \{{[\s\S]*?"
-            rf"{notification}: \{{[^}}]*threshold: {threshold};[^}}]*thresholdType: 'Actual'",
+            rf"resource budget[\s\S]*?properties:\s*\{{\s*amount:\s*10"
+            rf"[\s\S]*?{notification}:\s*\{{[\s\S]*?threshold:\s*{threshold}"
+            rf"\s+thresholdType:\s*'Actual'",
             BICEP,
         )
     assert "param budgetStartDate string" in BICEP

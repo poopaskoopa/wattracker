@@ -66,8 +66,20 @@ resource vnet 'Microsoft.Network/virtualNetworks@2023-11-01' = {
         name: 'aca-infrastructure'
         properties: {
           addressPrefix: '10.42.0.0/23'
-          delegations: [{ name: 'aca'; properties: { serviceName: 'Microsoft.App/environments' } }]
-          serviceEndpoints: [{ service: 'Microsoft.Storage'; locations: [location] }]
+          delegations: [
+            {
+              name: 'aca'
+              properties: {
+                serviceName: 'Microsoft.App/environments'
+              }
+            }
+          ]
+          serviceEndpoints: [
+            {
+              service: 'Microsoft.Storage'
+              locations: [location]
+            }
+          ]
         }
       }
     ]
@@ -88,9 +100,15 @@ resource storage 'Microsoft.Storage/storageAccounts@2023-05-01' = {
     networkAcls: {
       defaultAction: 'Deny'
       bypass: 'None'
-      ipRules: [for address in budgetHookIpRules: { value: address; action: 'Allow' }]
+      ipRules: [for address in budgetHookIpRules: {
+        value: address
+        action: 'Allow'
+      }]
       virtualNetworkRules: [
-        { id: resourceId('Microsoft.Network/virtualNetworks/subnets', vnetName, 'aca-infrastructure'); action: 'Allow' }
+        {
+          id: resourceId('Microsoft.Network/virtualNetworks/subnets', vnetName, 'aca-infrastructure')
+          action: 'Allow'
+        }
       ]
     }
   }
@@ -99,7 +117,12 @@ resource storage 'Microsoft.Storage/storageAccounts@2023-05-01' = {
 resource blobService 'Microsoft.Storage/storageAccounts/blobServices@2023-05-01' = {
   parent: storage
   name: 'default'
-  properties: { deleteRetentionPolicy: { enabled: true; days: 7 } }
+  properties: {
+    deleteRetentionPolicy: {
+      enabled: true
+      days: 7
+    }
+  }
 }
 resource tableService 'Microsoft.Storage/storageAccounts/tableServices@2023-05-01' = {
   parent: storage
@@ -131,27 +154,52 @@ resource replayTable 'Microsoft.Storage/storageAccounts/tableServices/tables@202
   properties: {}
 }
 
-resource readIdentity 'Microsoft.ManagedIdentity/userAssignedIdentities@2023-01-31' = { name: '${readName}-identity'; location: location }
-resource syncIdentity 'Microsoft.ManagedIdentity/userAssignedIdentities@2023-01-31' = { name: '${syncName}-identity'; location: location }
+resource readIdentity 'Microsoft.ManagedIdentity/userAssignedIdentities@2023-01-31' = {
+  name: '${readName}-identity'
+  location: location
+}
+resource syncIdentity 'Microsoft.ManagedIdentity/userAssignedIdentities@2023-01-31' = {
+  name: '${syncName}-identity'
+  location: location
+}
 resource appEnv 'Microsoft.App/managedEnvironments@2023-05-01' = {
   name: envName
   location: location
   properties: {
-    vnetConfiguration: { infrastructureSubnetId: resourceId('Microsoft.Network/virtualNetworks/subnets', vnetName, 'aca-infrastructure'); internal: false }
-    workloadProfiles: [{ name: 'consumption'; workloadProfileType: 'Consumption' }]
+    vnetConfiguration: {
+      infrastructureSubnetId: resourceId('Microsoft.Network/virtualNetworks/subnets', vnetName, 'aca-infrastructure')
+      internal: false
+    }
+    workloadProfiles: [
+      {
+        name: 'consumption'
+        workloadProfileType: 'Consumption'
+      }
+    ]
   }
 }
 
 resource readApp 'Microsoft.App/containerApps@2023-05-01' = {
   name: readName
   location: location
-  identity: { type: 'UserAssigned'; userAssignedIdentities: { '${readIdentity.id}': {} } }
+  identity: {
+    type: 'UserAssigned'
+    userAssignedIdentities: {
+      '${readIdentity.id}': {}
+    }
+  }
   properties: {
     managedEnvironmentId: appEnv.id
     configuration: {
       secrets: [
-        { name: 'cloud-server-secret'; value: cloudServerSecret }
-        { name: 'operator-token'; value: operatorToken }
+        {
+          name: 'cloud-server-secret'
+          value: cloudServerSecret
+        }
+        {
+          name: 'operator-token'
+          value: operatorToken
+        }
       ]
       ingress: {
         external: true
@@ -168,29 +216,64 @@ resource readApp 'Microsoft.App/containerApps@2023-05-01' = {
         command: ['python']
         args: ['-m', 'wattracker.cloud.runtime']
         env: [
-          { name: 'WATTRACKER_CLOUD_PLANE'; value: 'read' }
-          { name: 'WATTRACKER_STORAGE_ACCOUNT_NAME'; value: storage.name }
-          { name: 'AZURE_CLIENT_ID'; value: readIdentity.properties.clientId }
-          { name: 'WATTRACKER_ALLOWED_ORIGINS'; value: allowedOrigin }
-          { name: 'WATTRACKER_CLOUD_SERVER_SECRET'; secretRef: 'cloud-server-secret' }
-          { name: 'WATTRACKER_CLOUD_OPERATOR_TOKEN'; secretRef: 'operator-token' }
+          {
+            name: 'WATTRACKER_CLOUD_PLANE'
+            value: 'read'
+          }
+          {
+            name: 'WATTRACKER_STORAGE_ACCOUNT_NAME'
+            value: storage.name
+          }
+          {
+            name: 'AZURE_CLIENT_ID'
+            value: readIdentity.properties.clientId
+          }
+          {
+            name: 'WATTRACKER_ALLOWED_ORIGINS'
+            value: allowedOrigin
+          }
+          {
+            name: 'WATTRACKER_CLOUD_SERVER_SECRET'
+            secretRef: 'cloud-server-secret'
+          }
+          {
+            name: 'WATTRACKER_CLOUD_OPERATOR_TOKEN'
+            secretRef: 'operator-token'
+          }
         ]
-        resources: { cpu: 0.5; memory: '1Gi' }
+        resources: {
+          cpu: 0.5
+          memory: '1Gi'
+        }
       }]
-      scale: { minReplicas: 0; maxReplicas: 1 }
+      scale: {
+        minReplicas: 0
+        maxReplicas: 1
+      }
     }
   }
 }
 resource syncApp 'Microsoft.App/containerApps@2023-05-01' = {
   name: syncName
   location: location
-  identity: { type: 'UserAssigned'; userAssignedIdentities: { '${syncIdentity.id}': {} } }
+  identity: {
+    type: 'UserAssigned'
+    userAssignedIdentities: {
+      '${syncIdentity.id}': {}
+    }
+  }
   properties: {
     managedEnvironmentId: appEnv.id
     configuration: {
       secrets: [
-        { name: 'cloud-server-secret'; value: cloudServerSecret }
-        { name: 'operator-token'; value: operatorToken }
+        {
+          name: 'cloud-server-secret'
+          value: cloudServerSecret
+        }
+        {
+          name: 'operator-token'
+          value: operatorToken
+        }
       ]
       ingress: {
         external: true
@@ -207,16 +290,40 @@ resource syncApp 'Microsoft.App/containerApps@2023-05-01' = {
         command: ['python']
         args: ['-m', 'wattracker.cloud.runtime']
         env: [
-          { name: 'WATTRACKER_CLOUD_PLANE'; value: 'sync' }
-          { name: 'WATTRACKER_STORAGE_ACCOUNT_NAME'; value: storage.name }
-          { name: 'AZURE_CLIENT_ID'; value: syncIdentity.properties.clientId }
-          { name: 'WATTRACKER_ALLOWED_ORIGINS'; value: allowedOrigin }
-          { name: 'WATTRACKER_CLOUD_SERVER_SECRET'; secretRef: 'cloud-server-secret' }
-          { name: 'WATTRACKER_CLOUD_OPERATOR_TOKEN'; secretRef: 'operator-token' }
+          {
+            name: 'WATTRACKER_CLOUD_PLANE'
+            value: 'sync'
+          }
+          {
+            name: 'WATTRACKER_STORAGE_ACCOUNT_NAME'
+            value: storage.name
+          }
+          {
+            name: 'AZURE_CLIENT_ID'
+            value: syncIdentity.properties.clientId
+          }
+          {
+            name: 'WATTRACKER_ALLOWED_ORIGINS'
+            value: allowedOrigin
+          }
+          {
+            name: 'WATTRACKER_CLOUD_SERVER_SECRET'
+            secretRef: 'cloud-server-secret'
+          }
+          {
+            name: 'WATTRACKER_CLOUD_OPERATOR_TOKEN'
+            secretRef: 'operator-token'
+          }
         ]
-        resources: { cpu: 0.5; memory: '1Gi' }
+        resources: {
+          cpu: 0.5
+          memory: '1Gi'
+        }
       }]
-      scale: { minReplicas: 0; maxReplicas: 1 }
+      scale: {
+        minReplicas: 0
+        maxReplicas: 1
+      }
     }
   }
 }
@@ -349,32 +456,56 @@ resource replayWriterRoleDefinition 'Microsoft.Authorization/roleDefinitions@202
 resource blobRole 'Microsoft.Authorization/roleAssignments@2022-04-01' = {
   name: guid(storage.id, syncIdentity.id, 'blob-writer')
   scope: objectContainer
-  properties: { roleDefinitionId: syncBlobWriterRoleDefinition.id; principalId: syncIdentity.properties.principalId; principalType: 'ServicePrincipal' }
+  properties: {
+    roleDefinitionId: syncBlobWriterRoleDefinition.id
+    principalId: syncIdentity.properties.principalId
+    principalType: 'ServicePrincipal'
+  }
 }
 resource tableRole 'Microsoft.Authorization/roleAssignments@2022-04-01' = {
   name: guid(storage.id, readIdentity.id, 'table-reader')
   scope: objectTable
-  properties: { roleDefinitionId: subscriptionResourceId('Microsoft.Authorization/roleDefinitions', '76199698-9eea-4c19-bc75-cec2138a0c8f'); principalId: readIdentity.properties.principalId; principalType: 'ServicePrincipal' }
+  properties: {
+    roleDefinitionId: subscriptionResourceId('Microsoft.Authorization/roleDefinitions', '76199698-9eea-4c19-bc75-cec2138a0c8f')
+    principalId: readIdentity.properties.principalId
+    principalType: 'ServicePrincipal'
+  }
 }
 resource readBlobRole 'Microsoft.Authorization/roleAssignments@2022-04-01' = {
   name: guid(storage.id, readIdentity.id, 'blob-reader')
   scope: objectContainer
-  properties: { roleDefinitionId: subscriptionResourceId('Microsoft.Authorization/roleDefinitions', blobReaderRoleDefinitionId); principalId: readIdentity.properties.principalId; principalType: 'ServicePrincipal' }
+  properties: {
+    roleDefinitionId: subscriptionResourceId('Microsoft.Authorization/roleDefinitions', blobReaderRoleDefinitionId)
+    principalId: readIdentity.properties.principalId
+    principalType: 'ServicePrincipal'
+  }
 }
 resource syncTableRole 'Microsoft.Authorization/roleAssignments@2022-04-01' = {
   name: guid(storage.id, syncIdentity.id, 'table-contributor')
   scope: objectTable
-  properties: { roleDefinitionId: syncTableWriterRoleDefinition.id; principalId: syncIdentity.properties.principalId; principalType: 'ServicePrincipal' }
+  properties: {
+    roleDefinitionId: syncTableWriterRoleDefinition.id
+    principalId: syncIdentity.properties.principalId
+    principalType: 'ServicePrincipal'
+  }
 }
 resource readAuthRole 'Microsoft.Authorization/roleAssignments@2022-04-01' = {
   name: guid(authTable.id, readIdentity.id, 'auth-manager')
   scope: authTable
-  properties: { roleDefinitionId: authManagerRoleDefinition.id; principalId: readIdentity.properties.principalId; principalType: 'ServicePrincipal' }
+  properties: {
+    roleDefinitionId: authManagerRoleDefinition.id
+    principalId: readIdentity.properties.principalId
+    principalType: 'ServicePrincipal'
+  }
 }
 resource syncAuthRole 'Microsoft.Authorization/roleAssignments@2022-04-01' = {
   name: guid(authTable.id, syncIdentity.id, 'auth-reader')
   scope: authTable
-  properties: { roleDefinitionId: authReaderRoleDefinition.id; principalId: syncIdentity.properties.principalId; principalType: 'ServicePrincipal' }
+  properties: {
+    roleDefinitionId: authReaderRoleDefinition.id
+    principalId: syncIdentity.properties.principalId
+    principalType: 'ServicePrincipal'
+  }
 }
 resource readAuthSweepRole 'Microsoft.Authorization/roleAssignments@2022-04-01' = {
   name: guid(authTable.id, readIdentity.id, 'auth-sweeper')
@@ -384,27 +515,46 @@ resource readAuthSweepRole 'Microsoft.Authorization/roleAssignments@2022-04-01' 
 resource readControlRole 'Microsoft.Authorization/roleAssignments@2022-04-01' = {
   name: guid(controlTable.id, readIdentity.id, 'control-reader')
   scope: controlTable
-  properties: { roleDefinitionId: controlReaderRoleDefinition.id; principalId: readIdentity.properties.principalId; principalType: 'ServicePrincipal' }
+  properties: {
+    roleDefinitionId: controlReaderRoleDefinition.id
+    principalId: readIdentity.properties.principalId
+    principalType: 'ServicePrincipal'
+  }
 }
 resource syncControlRole 'Microsoft.Authorization/roleAssignments@2022-04-01' = {
   name: guid(controlTable.id, syncIdentity.id, 'control-reader')
   scope: controlTable
-  properties: { roleDefinitionId: controlReaderRoleDefinition.id; principalId: syncIdentity.properties.principalId; principalType: 'ServicePrincipal' }
+  properties: {
+    roleDefinitionId: controlReaderRoleDefinition.id
+    principalId: syncIdentity.properties.principalId
+    principalType: 'ServicePrincipal'
+  }
 }
 resource syncReplayRole 'Microsoft.Authorization/roleAssignments@2022-04-01' = {
   name: guid(replayTable.id, syncIdentity.id, 'replay-writer')
   scope: replayTable
-  properties: { roleDefinitionId: replayWriterRoleDefinition.id; principalId: syncIdentity.properties.principalId; principalType: 'ServicePrincipal' }
+  properties: {
+    roleDefinitionId: replayWriterRoleDefinition.id
+    principalId: syncIdentity.properties.principalId
+    principalType: 'ServicePrincipal'
+  }
 }
 resource budgetHookRole 'Microsoft.Authorization/roleAssignments@2022-04-01' = {
   name: guid(controlTable.id, budgetHookPrincipalId, 'budget-hook-writer')
   scope: controlTable
-  properties: { roleDefinitionId: budgetHookRoleDefinition.id; principalId: budgetHookPrincipalId; principalType: 'ServicePrincipal' }
+  properties: {
+    roleDefinitionId: budgetHookRoleDefinition.id
+    principalId: budgetHookPrincipalId
+    principalType: 'ServicePrincipal'
+  }
 }
 resource staticSite 'Microsoft.Web/staticSites@2022-09-01' = if (!empty(staticRepositoryUrl)) {
   name: staticName
   location: location
-  sku: { name: 'Free'; tier: 'Free' }
+  sku: {
+    name: 'Free'
+    tier: 'Free'
+  }
   properties: {
     repositoryUrl: staticRepositoryUrl
     branch: staticBranch
@@ -422,7 +572,13 @@ resource writeShutdownActionGroup 'Microsoft.Insights/actionGroups@2023-01-01' =
   properties: {
     groupShortName: 'wtrstop'
     enabled: true
-    webhookReceivers: [{ name: 'budget-hook-write'; serviceUri: writeShutdownWebhookUri; useCommonAlertSchema: true }]
+    webhookReceivers: [
+      {
+        name: 'budget-hook-write'
+        serviceUri: writeShutdownWebhookUri
+        useCommonAlertSchema: true
+      }
+    ]
   }
 }
 resource publicShutdownActionGroup 'Microsoft.Insights/actionGroups@2023-01-01' = {
@@ -431,11 +587,49 @@ resource publicShutdownActionGroup 'Microsoft.Insights/actionGroups@2023-01-01' 
   properties: {
     groupShortName: 'wtrpub'
     enabled: true
-    webhookReceivers: [{ name: 'budget-hook-public'; serviceUri: publicShutdownWebhookUri; useCommonAlertSchema: true }]
+    webhookReceivers: [
+      {
+        name: 'budget-hook-public'
+        serviceUri: publicShutdownWebhookUri
+        useCommonAlertSchema: true
+      }
+    ]
   }
 }
 
 resource budget 'Microsoft.Consumption/budgets@2023-05-01' = {
   name: 'wattracker-monthly-budget'
-  properties: { amount: 10; timeGrain: 'Monthly'; timePeriod: { startDate: budgetStartDate; endDate: budgetEndDate }; notifications: { actual50: { enabled: true; operator: 'GreaterThan'; threshold: 50; thresholdType: 'Actual'; contactEmails: [billingEmail] }; actual80: { enabled: true; operator: 'GreaterThan'; threshold: 80; thresholdType: 'Actual'; contactEmails: [billingEmail]; contactGroups: [writeShutdownActionGroup.id] }; actual100: { enabled: true; operator: 'GreaterThan'; threshold: 100; thresholdType: 'Actual'; contactEmails: [billingEmail]; contactGroups: [publicShutdownActionGroup.id] } } }
+  properties: {
+    amount: 10
+    timeGrain: 'Monthly'
+    timePeriod: {
+      startDate: budgetStartDate
+      endDate: budgetEndDate
+    }
+    notifications: {
+      actual50: {
+        enabled: true
+        operator: 'GreaterThan'
+        threshold: 50
+        thresholdType: 'Actual'
+        contactEmails: [billingEmail]
+      }
+      actual80: {
+        enabled: true
+        operator: 'GreaterThan'
+        threshold: 80
+        thresholdType: 'Actual'
+        contactEmails: [billingEmail]
+        contactGroups: [writeShutdownActionGroup.id]
+      }
+      actual100: {
+        enabled: true
+        operator: 'GreaterThan'
+        threshold: 100
+        thresholdType: 'Actual'
+        contactEmails: [billingEmail]
+        contactGroups: [publicShutdownActionGroup.id]
+      }
+    }
+  }
 }
