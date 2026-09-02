@@ -346,9 +346,38 @@ keeps out of the tree. Nothing needs it: the build's destination is TestFlight.
   legacy PKCS#12 algorithms; rebuild with `-keypbe PBE-SHA1-3DES -certpbe
   PBE-SHA1-3DES -macalg sha1`, which is what `scripts/ios_distribution_cert.py`
   does. `MAC verification failed` is also what a trailing newline in
-  `IOS_DIST_P12_PASSWORD` looks like.
+  `IOS_DIST_P12_PASSWORD` looks like. `Unknown format in import` has one other
+  cause worth knowing when reproducing this by hand: `security import` picks
+  its format from the file *extension*, so a `.p12` saved under any other
+  suffix is rejected unmodified. The workflow always writes `.p12`.
 - `No Apple Distribution identity landed in the signing keychain` — the `.p12`
-  decoded but holds something else, most likely a development certificate.
+  decoded, but no identity in it chains to a trusted root inside the job's
+  keychain. `find-identity -v` lists only *valid* identities, and validity
+  needs the whole chain.
+
+  Check the bundled intermediate before you suspect the certificate itself.
+  Apple has issued several generations of the WWDR intermediate (G2..G6) that
+  all share one common name and differ only in the OU, and bundling the wrong
+  generation fails exactly here: the import step still reports `1 identity
+  imported. 1 certificate imported.`, and the identity is still invalid because
+  nothing in the keychain issued it.
+
+  This is invisible on a developer machine. A local check passes because
+  `login.keychain-db` is in the search list and already holds every generation
+  the machine has ever used, so the chain resolves from there rather than from
+  the `.p12`. To reproduce what CI sees, take the login keychain out of the
+  search list — `security list-keychains -d user -s "$keychain"` with nothing
+  else — and restore the full previous list afterwards, which on a real
+  workstation is usually more than just `login.keychain-db`.
+
+      openssl x509 -in ~/.appstoreconnect/wattracker-dist.pem -noout -issuer
+
+  names the generation that must be in the `.p12`;
+  `scripts/ios_distribution_cert.py` now selects on that issuer and refuses to
+  build a `.p12` around any other one.
+
+  A development certificate in the `.p12` produces the same message, but it is
+  the rarer cause.
 - `conflicting provisioning settings` or `has entitlements that require signing
   with a development certificate` at the archive — the signing settings drifted
   back to `CODE_SIGN_STYLE=Automatic`. See step 6 above; automatic signing
