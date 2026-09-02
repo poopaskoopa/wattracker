@@ -21,7 +21,9 @@ backend = AzureTableSecurityStateBackend.from_managed_identity(
 )
 app = func.AsgiFunctionApp(
     app=create_budget_hook_app(
-        backend, expected_token=_required("WATTRACKER_BUDGET_HOOK_TOKEN")
+        backend,
+        expected_token=_required("WATTRACKER_BUDGET_HOOK_TOKEN"),
+        platform_authenticated=True,
     ),
     http_auth_level=func.AuthLevel.FUNCTION,
 )

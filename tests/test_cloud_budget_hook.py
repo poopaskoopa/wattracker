@@ -7,6 +7,7 @@ from wattracker.cloud.budget_hook import create_budget_hook_app
 from wattracker.cloud.limits import (
     clear_kill_switch,
     KILL_SWITCH_ENABLED,
+    KillSwitchState,
     disable_public_api,
     read_kill_switch,
 )
@@ -24,10 +25,20 @@ def _client(backend):
     return TestClient(create_budget_hook_app(backend, expected_token=TOKEN))
 
 
+def _functions_client(backend):
+    return TestClient(
+        create_budget_hook_app(
+            backend, expected_token=TOKEN, platform_authenticated=True
+        )
+    )
+
+
 def test_80_percent_disables_writes_and_persists_in_shared_backend():
     backend = DurableMemoryBackend()
     response = _client(backend).post(
-        "/budget/disable-writes?code=" + TOKEN, json={"action": "disable-public-api"}
+        "/budget/disable-writes",
+        headers={"X-Wattracker-Budget-Token": TOKEN},
+        json={"action": "disable-public-api"},
     )
     assert response.status_code == 200
     assert read_kill_switch(backend).writes_enabled is False
@@ -66,15 +77,23 @@ def test_invalid_or_missing_auth_does_not_touch_backend():
     assert read_kill_switch(backend) == KILL_SWITCH_ENABLED
 
 
-def test_conflicting_query_and_header_tokens_are_rejected_without_touching_backend():
+def test_query_code_is_not_app_auth_and_valid_header_is_the_direct_host_seam():
     backend = DurableMemoryBackend()
     client = _client(backend)
-    response = client.post(
-        "/budget/disable-public-api?code=" + TOKEN,
-        headers={"X-Wattracker-Budget-Token": "different-token"},
+    assert client.post("/budget/disable-public-api?code=" + TOKEN).status_code == 401
+    assert client.post(
+        "/budget/disable-public-api?code=function-host-key",
+        headers={"X-Wattracker-Budget-Token": TOKEN},
+    ).status_code == 200
+
+
+def test_functions_host_authentication_allows_host_key_query_without_app_header():
+    backend = DurableMemoryBackend()
+    response = _functions_client(backend).post(
+        "/budget/disable-public-api?code=function-host-key"
     )
-    assert response.status_code == 401
-    assert read_kill_switch(backend) == KILL_SWITCH_ENABLED
+    assert response.status_code == 200
+    assert read_kill_switch(backend).public_enabled is False
 
 
 @pytest.mark.parametrize(
@@ -92,6 +111,25 @@ def test_non_ascii_query_or_header_tokens_return_401(path, headers):
     response = _client(backend).post(path, headers=headers)
     assert response.status_code == 401
     assert read_kill_switch(backend) == KILL_SWITCH_ENABLED
+
+
+def test_clear_requires_operator_header_even_after_functions_host_auth():
+    backend = DurableMemoryBackend()
+    disable_public_api(backend)
+    client = _functions_client(backend)
+
+    assert client.post("/budget/clear?code=function-host-key").status_code == 401
+    assert read_kill_switch(backend).public_enabled is False
+    assert client.post(
+        "/budget/clear?code=function-host-key",
+        headers={"X-Wattracker-Budget-Token": TOKEN},
+    ).status_code == 200
+    assert read_kill_switch(backend) == KillSwitchState(
+        writes_enabled=True,
+        public_enabled=True,
+        reason="operator clear",
+        updated_at=read_kill_switch(backend).updated_at,
+    )
 
 
 def test_route_and_body_cannot_select_another_action():
