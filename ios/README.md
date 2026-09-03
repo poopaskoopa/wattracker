@@ -12,6 +12,12 @@ planes. `docs/ios-walking-skeleton.md` says exactly what that does and does not
 prove. It is kept because it is the only on-device evidence those planes work
 end to end; #161 can retire it once the Dashboard reads the same data properly.
 
+Underneath both sits the signed API client from issue #159: Secure Enclave
+keys, a coalesced reader-token refresh, `Codable` models for every published
+kind, an offline cache keyed by revision, and a "this device was removed" state
+that clears it. No screen consumes it yet — that is #161, #162 and #163 — but
+it is finished, tested and documented below.
+
 No third-party dependencies. No package resolution step. `URLSession`,
 `CryptoKit`, `Security`, SwiftUI.
 
@@ -47,10 +53,20 @@ ios/WatTracker/
     Cloud/
       AppConfiguration.swift     the base URL, from the build configuration
       CanonicalRequest.swift     the Swift half of canonical_request
-      CloudClient.swift          pair, refresh, one GET
+      CloudClient.swift          one request each, typed, remembering nothing
+      CloudModels.swift          Codable models for every published kind
+      CloudSession.swift         token lifecycle, cache, revocation
+      CloudTransport.swift       the one place a request leaves the app
+      DeviceCredentialStore.swift  the durable credential, in the keychain
       DeviceKey.swift            P-256 key: Secure Enclave, or a gated fallback
+      JSONValue.swift            what carries a kind this build cannot model
+      SnapshotCache.swift        last-known data, protected and unbacked-up
   WatTrackerTests/
     CanonicalRequestVectorTests.swift
+    CloudModelsTests.swift       the envelope, and the two decoding rules
+    CloudSessionTests.swift      expiry, coalescing, 429, revocation, offline
+    CloudTestSupport.swift       a scripted transport and a clock tests move
+    SnapshotCacheTests.swift     protection class, backup exclusion, clearing
 ```
 
 ## The shell, and why it differs per idiom
@@ -197,6 +213,101 @@ rebuild, not a grep through the source.
 It is two settings rather than one because `//` starts a comment in an xcconfig
 file, so a full URL cannot be written there without an escaping trick.
 
+## The signed API client
+
+Three layers, kept apart so each can be read and tested without the others.
+
+**`CloudClient`** builds one request each and remembers nothing: no token, no
+retry, no idea when the last request failed. **`CloudSession`** is an actor
+holding everything that *is* remembered. **`CloudTransport`** is the single
+point where a request leaves the app, and a protocol so the whole lifecycle can
+be driven from a script with no network and no waiting.
+
+### The reader context
+
+It lives 300 seconds (`READER_CONTEXT_TTL_SECONDS`). The session refreshes 60
+seconds ahead of expiry and refuses to hand out a token with less than 15
+seconds left, so a caller is never given one that dies mid-request.
+
+**Exactly one refresh is ever in flight.** A caller arriving while one is
+running awaits that `Task` rather than signing a second envelope; the task
+publishes its result and clears its own slot, so a joiner that wakes first sees
+a settled session. When a *read* is refused, the retry asks for a token newer
+than the one that failed, expressed as a mint counter rather than a timestamp —
+two mints inside one clock tick are indistinguishable by time, and a caller
+would either accept the dead token back or spin.
+
+**Backoff.** A server `Retry-After` is honoured exactly; only where the server
+said nothing does the client invent a delay, exponentially with full jitter.
+One gate covers the whole session: a `Retry-After` on a read is the same
+deployment saying the same thing as one on a refresh.
+
+### 404 is the authentication failure
+
+The read plane answers **404 to every authentication failure** — unknown
+credential, revoked credential, bad signature, stale timestamp, replayed nonce,
+missing capability, kill switch — so nothing about credential state leaks. A
+client waiting for a 401 waits forever.
+
+So "this device was removed" is *inferred*, and conservatively, because acting
+on it wipes the credential and the cache:
+
+- **only a 404 on the signed refresh counts** — a 403 there is a quota refusal,
+  reachable only after the signature verified, and a 401 can only come from a
+  gateway;
+- **twice, with a backoff between** — one 404 is also a deployment restarting;
+- **never while the clock is suspect** — a device more than four minutes off
+  the server's clock has every signed request refused forever and would
+  otherwise conclude it had been revoked. The server's `Date` header arrives on
+  the 404 itself, so ruling this out costs no request.
+
+The residual false positive is the kill switch: a deployment that turns the
+public API off for long enough unpairs these phones and the rider pairs again.
+That is the direction to be wrong in. A revoked phone still showing the rider's
+data because the client would rather not be hasty is the outcome revocation
+exists to prevent.
+
+Since #153 a reader context is bound to the device that minted it and
+re-resolved on every use, so revocation is immediate rather than eventual: a
+revoked phone's next *read* is refused too, not just its next refresh. The
+client converges on that in two attempts — the read's forced refresh is the
+first refusal, the next `load` is the second — and then wipes.
+
+### The cache, and where things are stored
+
+| What | Where | Why |
+| --- | --- | --- |
+| Signing key | Secure Enclave, handle in the keychain | never extractable |
+| Device credential | keychain, `AfterFirstUnlockThisDeviceOnly` | not restorable to a second phone |
+| Reader context | memory only | a five-minute bearer token has no business on disk |
+| Objects + revision | one protected file per route | too large for the keychain, too sensitive for defaults |
+
+Nothing goes in `UserDefaults` — not "no secrets in defaults", nothing at all.
+A defaults plist has no protection class and is in every backup; keeping the
+file from existing beats judging each value somebody adds to it. The cache is
+`completeUntilFirstUserAuthentication`, the same class as the key, and excluded
+from backups: the credential is `ThisDeviceOnly`, so a cache that *did* restore
+would put the rider's data on a phone with no credential to refresh it and no
+way to be told the old one was revoked.
+
+`load()` never throws while there is a cache to serve. Airplane mode, a 429, a
+token that cannot be refreshed and a server that is down all produce
+last-known data marked `.cache`. The one exception is a removed device.
+
+### The delta
+
+`dashboard`, `volume` and `curve` are the routes `api.py` marks `mobile=True`:
+they read `since=`, return a `revision`, page with a signed `cursor`, and carry
+tombstones. Nothing else does, and asking anywhere else would be asking a
+question the route does not answer.
+
+The checkpoint is the server's, copied back verbatim and never computed here. A
+truncated walk deliberately does *not* advance it: `since=` never resends, so
+advancing past objects that were never stored would skip them permanently. For
+the same reason an object of a kind this build does not model is kept as JSON
+and written back out rather than dropped — otherwise a rider who updates the
+app finds a hole where it used to be.
+
 ## Signing keys, and the fallback that cannot ship
 
 The device signs requests with a P-256 key. On hardware that has a Secure
@@ -316,6 +427,18 @@ a fresh 90 days.
 The Swift suite asserts against `tests/vectors/canonical_request_v1.json` — the
 same file the Python suite reads, referenced from the repository rather than
 copied, so the two cannot drift.
+
+`CloudSessionTests` drives the token lifecycle through `ScriptedTransport`
+rather than a network: a test says what the fourth request gets back and
+asserts what the fifth one was, at whatever instant it chooses through
+`TestClock`. Nothing there sleeps, and nothing depends on real timing.
+
+Three of #159's requirements are properties of the whole target rather than of
+any function — certificate validation always on, nothing in `UserDefaults`,
+nothing sensitive logged — so they are pinned from the Python side, in
+`tests/test_ios_client_posture.py`, which reads the plist, the xcconfigs and
+every Swift file. One added `NSExceptionDomains` entry or one `print` in a
+catch block undoes any of them, in a file nobody thought to look at.
 
 `xcodebuild test` needs a resolvable simulator destination. On a machine where
 `xcodebuild -showdestinations` lists none — which happens when the installed

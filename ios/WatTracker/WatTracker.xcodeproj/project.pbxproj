@@ -15,6 +15,24 @@
 		1A0000000000000000000055 /* DeviceKey.swift in Sources */ = {isa = PBXBuildFile; fileRef = 1A0000000000000000000036 /* DeviceKey.swift */; };
 		1A0000000000000000000056 /* CanonicalRequestVectorTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 1A0000000000000000000037 /* CanonicalRequestVectorTests.swift */; };
 		1A0000000000000000000057 /* CanonicalRequest.swift in Sources */ = {isa = PBXBuildFile; fileRef = 1A0000000000000000000034 /* CanonicalRequest.swift */; };
+		1A0000000000000000000120 /* JSONValue.swift in Sources */ = {isa = PBXBuildFile; fileRef = 1A0000000000000000000100 /* JSONValue.swift */; };
+		1A0000000000000000000121 /* CloudModels.swift in Sources */ = {isa = PBXBuildFile; fileRef = 1A0000000000000000000101 /* CloudModels.swift */; };
+		1A0000000000000000000122 /* CloudTransport.swift in Sources */ = {isa = PBXBuildFile; fileRef = 1A0000000000000000000102 /* CloudTransport.swift */; };
+		1A0000000000000000000123 /* DeviceCredentialStore.swift in Sources */ = {isa = PBXBuildFile; fileRef = 1A0000000000000000000103 /* DeviceCredentialStore.swift */; };
+		1A0000000000000000000124 /* SnapshotCache.swift in Sources */ = {isa = PBXBuildFile; fileRef = 1A0000000000000000000104 /* SnapshotCache.swift */; };
+		1A0000000000000000000125 /* CloudSession.swift in Sources */ = {isa = PBXBuildFile; fileRef = 1A0000000000000000000105 /* CloudSession.swift */; };
+		1A0000000000000000000140 /* CloudTestSupport.swift in Sources */ = {isa = PBXBuildFile; fileRef = 1A0000000000000000000110 /* CloudTestSupport.swift */; };
+		1A0000000000000000000141 /* CloudSessionTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 1A0000000000000000000111 /* CloudSessionTests.swift */; };
+		1A0000000000000000000142 /* CloudModelsTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 1A0000000000000000000112 /* CloudModelsTests.swift */; };
+		1A0000000000000000000143 /* SnapshotCacheTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 1A0000000000000000000113 /* SnapshotCacheTests.swift */; };
+		1A0000000000000000000150 /* CloudClient.swift in Sources */ = {isa = PBXBuildFile; fileRef = 1A0000000000000000000035 /* CloudClient.swift */; };
+		1A0000000000000000000151 /* DeviceKey.swift in Sources */ = {isa = PBXBuildFile; fileRef = 1A0000000000000000000036 /* DeviceKey.swift */; };
+		1A0000000000000000000152 /* JSONValue.swift in Sources */ = {isa = PBXBuildFile; fileRef = 1A0000000000000000000100 /* JSONValue.swift */; };
+		1A0000000000000000000153 /* CloudModels.swift in Sources */ = {isa = PBXBuildFile; fileRef = 1A0000000000000000000101 /* CloudModels.swift */; };
+		1A0000000000000000000154 /* CloudTransport.swift in Sources */ = {isa = PBXBuildFile; fileRef = 1A0000000000000000000102 /* CloudTransport.swift */; };
+		1A0000000000000000000155 /* DeviceCredentialStore.swift in Sources */ = {isa = PBXBuildFile; fileRef = 1A0000000000000000000103 /* DeviceCredentialStore.swift */; };
+		1A0000000000000000000156 /* SnapshotCache.swift in Sources */ = {isa = PBXBuildFile; fileRef = 1A0000000000000000000104 /* SnapshotCache.swift */; };
+		1A0000000000000000000157 /* CloudSession.swift in Sources */ = {isa = PBXBuildFile; fileRef = 1A0000000000000000000105 /* CloudSession.swift */; };
 		1A00000000000000000000B0 /* Assets.xcassets in Resources */ = {isa = PBXBuildFile; fileRef = 1A00000000000000000000A0 /* Assets.xcassets */; };
 		1A0000000000000000000058 /* canonical_request_v1.json in Resources */ = {isa = PBXBuildFile; fileRef = 1A0000000000000000000038 /* canonical_request_v1.json */; };
 		1A0000000000000000000190 /* RootView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 1A0000000000000000000090 /* RootView.swift */; };
@@ -36,11 +54,22 @@
 		1A0000000000000000000031 /* FTPScreen.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = FTPScreen.swift; sourceTree = "<group>"; };
 		1A00000000000000000000A0 /* Assets.xcassets */ = {isa = PBXFileReference; lastKnownFileType = folder.assetcatalog; path = Assets.xcassets; sourceTree = "<group>"; };
 		1A0000000000000000000032 /* Info.plist */ = {isa = PBXFileReference; lastKnownFileType = text.plist.xml; path = Info.plist; sourceTree = "<group>"; };
+		1A00000000000000000001A0 /* Info-Debug.plist */ = {isa = PBXFileReference; lastKnownFileType = text.plist.xml; path = "Info-Debug.plist"; sourceTree = "<group>"; };
 		1A0000000000000000000033 /* AppConfiguration.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AppConfiguration.swift; sourceTree = "<group>"; };
 		1A0000000000000000000034 /* CanonicalRequest.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = CanonicalRequest.swift; sourceTree = "<group>"; };
 		1A0000000000000000000035 /* CloudClient.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = CloudClient.swift; sourceTree = "<group>"; };
 		1A0000000000000000000036 /* DeviceKey.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DeviceKey.swift; sourceTree = "<group>"; };
 		1A0000000000000000000037 /* CanonicalRequestVectorTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = CanonicalRequestVectorTests.swift; sourceTree = "<group>"; };
+		1A0000000000000000000100 /* JSONValue.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = JSONValue.swift; sourceTree = "<group>"; };
+		1A0000000000000000000101 /* CloudModels.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = CloudModels.swift; sourceTree = "<group>"; };
+		1A0000000000000000000102 /* CloudTransport.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = CloudTransport.swift; sourceTree = "<group>"; };
+		1A0000000000000000000103 /* DeviceCredentialStore.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DeviceCredentialStore.swift; sourceTree = "<group>"; };
+		1A0000000000000000000104 /* SnapshotCache.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SnapshotCache.swift; sourceTree = "<group>"; };
+		1A0000000000000000000105 /* CloudSession.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = CloudSession.swift; sourceTree = "<group>"; };
+		1A0000000000000000000110 /* CloudTestSupport.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = CloudTestSupport.swift; sourceTree = "<group>"; };
+		1A0000000000000000000111 /* CloudSessionTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = CloudSessionTests.swift; sourceTree = "<group>"; };
+		1A0000000000000000000112 /* CloudModelsTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = CloudModelsTests.swift; sourceTree = "<group>"; };
+		1A0000000000000000000113 /* SnapshotCacheTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SnapshotCacheTests.swift; sourceTree = "<group>"; };
 		1A0000000000000000000038 /* canonical_request_v1.json */ = {isa = PBXFileReference; lastKnownFileType = text.json; name = canonical_request_v1.json; path = ../../tests/vectors/canonical_request_v1.json; sourceTree = SOURCE_ROOT; };
 		1A0000000000000000000039 /* Base.xcconfig */ = {isa = PBXFileReference; lastKnownFileType = text.xcconfig; path = Base.xcconfig; sourceTree = "<group>"; };
 		1A000000000000000000003A /* Debug.xcconfig */ = {isa = PBXFileReference; lastKnownFileType = text.xcconfig; path = Debug.xcconfig; sourceTree = "<group>"; };
@@ -106,6 +135,7 @@
 				1A0000000000000000000041 /* Cloud */,
 				1A00000000000000000000A0 /* Assets.xcassets */,
 				1A0000000000000000000032 /* Info.plist */,
+				1A00000000000000000001A0 /* Info-Debug.plist */,
 			);
 			path = WatTracker;
 			sourceTree = "<group>";
@@ -117,6 +147,12 @@
 				1A0000000000000000000034 /* CanonicalRequest.swift */,
 				1A0000000000000000000035 /* CloudClient.swift */,
 				1A0000000000000000000036 /* DeviceKey.swift */,
+				1A0000000000000000000100 /* JSONValue.swift */,
+				1A0000000000000000000101 /* CloudModels.swift */,
+				1A0000000000000000000102 /* CloudTransport.swift */,
+				1A0000000000000000000103 /* DeviceCredentialStore.swift */,
+				1A0000000000000000000104 /* SnapshotCache.swift */,
+				1A0000000000000000000105 /* CloudSession.swift */,
 			);
 			path = Cloud;
 			sourceTree = "<group>";
@@ -125,6 +161,10 @@
 			isa = PBXGroup;
 			children = (
 				1A0000000000000000000037 /* CanonicalRequestVectorTests.swift */,
+				1A0000000000000000000110 /* CloudTestSupport.swift */,
+				1A0000000000000000000111 /* CloudSessionTests.swift */,
+				1A0000000000000000000112 /* CloudModelsTests.swift */,
+				1A0000000000000000000113 /* SnapshotCacheTests.swift */,
 			);
 			path = WatTrackerTests;
 			sourceTree = "<group>";
@@ -282,6 +322,12 @@
 				1A0000000000000000000053 /* CanonicalRequest.swift in Sources */,
 				1A0000000000000000000054 /* CloudClient.swift in Sources */,
 				1A0000000000000000000055 /* DeviceKey.swift in Sources */,
+				1A0000000000000000000120 /* JSONValue.swift in Sources */,
+				1A0000000000000000000121 /* CloudModels.swift in Sources */,
+				1A0000000000000000000122 /* CloudTransport.swift in Sources */,
+				1A0000000000000000000123 /* DeviceCredentialStore.swift in Sources */,
+				1A0000000000000000000124 /* SnapshotCache.swift in Sources */,
+				1A0000000000000000000125 /* CloudSession.swift in Sources */,
 				1A0000000000000000000190 /* RootView.swift in Sources */,
 				1A0000000000000000000191 /* Destination.swift in Sources */,
 				1A0000000000000000000192 /* SideRail.swift in Sources */,
@@ -301,6 +347,18 @@
 			files = (
 				1A0000000000000000000056 /* CanonicalRequestVectorTests.swift in Sources */,
 				1A0000000000000000000057 /* CanonicalRequest.swift in Sources */,
+				1A0000000000000000000140 /* CloudTestSupport.swift in Sources */,
+				1A0000000000000000000141 /* CloudSessionTests.swift in Sources */,
+				1A0000000000000000000142 /* CloudModelsTests.swift in Sources */,
+				1A0000000000000000000143 /* SnapshotCacheTests.swift in Sources */,
+				1A0000000000000000000150 /* CloudClient.swift in Sources */,
+				1A0000000000000000000151 /* DeviceKey.swift in Sources */,
+				1A0000000000000000000152 /* JSONValue.swift in Sources */,
+				1A0000000000000000000153 /* CloudModels.swift in Sources */,
+				1A0000000000000000000154 /* CloudTransport.swift in Sources */,
+				1A0000000000000000000155 /* DeviceCredentialStore.swift in Sources */,
+				1A0000000000000000000156 /* SnapshotCache.swift in Sources */,
+				1A0000000000000000000157 /* CloudSession.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -325,7 +383,7 @@
 			isa = XCBuildConfiguration;
 			buildSettings = {
 				GENERATE_INFOPLIST_FILE = NO;
-				INFOPLIST_FILE = WatTracker/Info.plist;
+				INFOPLIST_FILE = "WatTracker/Info-Debug.plist";
 				LD_RUNPATH_SEARCH_PATHS = (
 					"$(inherited)",
 					"@executable_path/Frameworks",

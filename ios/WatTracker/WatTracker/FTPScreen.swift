@@ -155,17 +155,17 @@ final class FTPModel {
         let client = CloudClient(baseURL: AppConfiguration.apiBaseURL, signer: signer)
         do {
             state = .working("Pairing")
-            let device = try await client.pair(code: code)
+            let paired = try await client.pair(code: code)
             // The context handed back by pairing would already work. Refresh
             // anyway: signing a request is the integration this whole
             // skeleton exists to test, and doing it here means a broken
             // canonical request fails loudly on the first run rather than
             // five minutes later when the first context expires.
             state = .working("Signing a refresh")
-            let context = try await client.refreshReaderContext(for: device)
+            let refreshed = try await client.refreshReaderContext(for: paired.device)
             state = .working("Reading the profile")
             let watts = try await client.fetchFTPWatts(
-                readerContext: context, device: device
+                readerContext: refreshed.readerContext, device: paired.device
             )
             state = .ftp(watts)
         } catch {

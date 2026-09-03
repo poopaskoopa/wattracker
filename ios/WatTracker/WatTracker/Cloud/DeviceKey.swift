@@ -17,7 +17,7 @@ this error, something has put it into a Release build.
 /// The private half is a P-256 key because the Secure Enclave generates
 /// nothing else, which is also why the server carries an
 /// `ecdsa-p256-sha256` algorithm at all (see `security.py`).
-protocol DeviceSigner {
+protocol DeviceSigner: Sendable {
     /// Uncompressed SEC1 / X9.63: `0x04 || X || Y`, 65 bytes.  The only
     /// encoding `validate_public_key` accepts.
     var publicKeyX963: Data { get }
