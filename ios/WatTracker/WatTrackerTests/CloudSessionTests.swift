@@ -49,6 +49,16 @@ final class CloudSessionTests: XCTestCase {
         .json(CloudFixtures.collection(items: items, revision: revision))
     }
 
+    private static func differentPairingBody(
+        context: String, expiresIn: Int = 300
+    ) -> String {
+        CloudFixtures.pairingBody(context: context)
+            .replacingOccurrences(of: "credential-1", with: "credential-2")
+            .replacingOccurrences(of: "subscription-1", with: "subscription-2")
+            .replacingOccurrences(of: CloudFixtures.namespace, with: String(repeating: "b", count: 64))
+            .replacingOccurrences(of: "\"expires_in\":300", with: "\"expires_in\":\(expiresIn)")
+    }
+
     // MARK: - Expiry
 
     func testATokenNearingExpiryIsReplacedBeforeItIsUsed() async throws {
@@ -145,12 +155,7 @@ final class CloudSessionTests: XCTestCase {
             return collected
         }
 
-        var spins = 0
-        while spins < 1_000 {
-            if await gate.arrived > 0 { break }
-            await Task.yield()
-            spins += 1
-        }
+        await gate.waitUntilArrived()
         await gate.openGate()
 
         let values = try await tokens
@@ -263,6 +268,344 @@ final class CloudSessionTests: XCTestCase {
         XCTAssertEqual(rig.transport.requestCount, before)
     }
 
+    // MARK: - Lifecycle races
+
+    func testARefreshSuspendedAcrossSignOutAndPairCannotPublishTheOldToken() async throws {
+        let refreshGate = RequestGate()
+        let rig = harness { request, index in
+            if index == 0 {
+                await refreshGate.wait()
+                return .json(CloudFixtures.refreshBody(context: "context-old"))
+            }
+            if request.url?.path == "/api/v1/devices/pair" {
+                return .json(Self.differentPairingBody(context: "context-new"))
+            }
+            return Self.dashboard(
+                [CloudFixtures.profileItem(revision: 1, ftp: 250)], revision: 1
+            )
+        }
+
+        let oldRead = Task { () -> String in
+            do {
+                return try await rig.session.readerContext()
+            } catch let failure as CloudSession.Failure {
+                return failure.description
+            } catch {
+                return "unexpected error"
+            }
+        }
+        await refreshGate.waitUntilArrived()
+        let refreshArrived = await refreshGate.arrived
+        XCTAssertEqual(refreshArrived, 1)
+
+        await rig.session.signOut()
+        _ = try await rig.session.pair(code: "ABCD-EFGH-JKLM")
+        await refreshGate.openGate()
+
+        let oldReadResult = await oldRead.value
+        XCTAssertEqual(oldReadResult, "This device is not paired yet")
+
+        let snapshot = try await rig.session.load(.dashboard)
+        XCTAssertEqual(snapshot.source, .network)
+        let read = try XCTUnwrap(
+            rig.transport.requests(matching: "/api/v1/context/dashboard").last
+        )
+        XCTAssertEqual(read.bearerToken, "context-new")
+        XCTAssertEqual(
+            read.value(forHTTPHeaderField: "Ocp-Apim-Subscription-Key"),
+            "subscription-2"
+        )
+    }
+
+    func testAnObsoleteRefreshCannotClearAReplacementRefreshTask() async throws {
+        let oldGate = RequestGate()
+        let replacementGate = RequestGate()
+        let rig = harness { request, index in
+            if index == 0 {
+                await oldGate.wait()
+                return .json(CloudFixtures.refreshBody(context: "context-old"))
+            }
+            if request.url?.path == "/api/v1/devices/pair" {
+                return .json(
+                    Self.differentPairingBody(context: "context-paired", expiresIn: 10)
+                )
+            }
+            if index == 2 {
+                await replacementGate.wait()
+                return .json(CloudFixtures.refreshBody(context: "context-replacement"))
+            }
+            if request.httpMethod == "POST" {
+                return .json(CloudFixtures.refreshBody(context: "context-unexpected"))
+            }
+            return Self.dashboard([], revision: 1)
+        }
+
+        let oldRead = Task { () -> String in
+            do {
+                return try await rig.session.readerContext()
+            } catch let failure as CloudSession.Failure {
+                return failure.description
+            } catch {
+                return "unexpected error"
+            }
+        }
+        await oldGate.waitUntilArrived()
+        let oldRefreshArrived = await oldGate.arrived
+        XCTAssertEqual(oldRefreshArrived, 1)
+
+        await rig.session.signOut()
+        _ = try await rig.session.pair(code: "ABCD-EFGH-JKLM")
+
+        let replacement = Task { () -> String in
+            try await rig.session.readerContext()
+        }
+        await replacementGate.waitUntilArrived()
+        let replacementArrived = await replacementGate.arrived
+        XCTAssertEqual(replacementArrived, 1)
+
+        let joiner = Task { () -> String in
+            try await rig.session.readerContext()
+        }
+        for _ in 0..<1_000 { await Task.yield() }
+
+        await oldGate.openGate()
+        let oldReadResult = await oldRead.value
+        XCTAssertEqual(oldReadResult, "This device is not paired yet")
+        let replacementStillWaiting = await replacementGate.arrived
+        XCTAssertEqual(replacementStillWaiting, 1)
+
+        await replacementGate.openGate()
+        let replacementResult = try await replacement.value
+        XCTAssertEqual(replacementResult, "context-replacement")
+        let joinerResult = try await joiner.value
+        XCTAssertEqual(joinerResult, "context-replacement")
+        XCTAssertEqual(
+            rig.transport.requests(matching: "/api/v1/context/refresh").count,
+            2,
+            "the obsolete task must not cause a replacement refresh"
+        )
+    }
+
+    func testAnInFlightReadCannotReturnOrRestoreDataAfterSigningOut() async throws {
+        let gate = RequestGate()
+        let cache = MemorySnapshotCache()
+        cache.store(
+            CachedCollection(
+                revision: 4,
+                items: [CloudFixtures.item(
+                    id: "profile", kind: "profile", revision: 4, data: #"{"ftp":230}"#
+                )],
+                storedAt: Date()
+            ),
+            for: .dashboard
+        )
+        let rig = harness(cache: cache) { request, index in
+            if index == 1 {
+                await gate.wait()
+                return Self.dashboard(
+                    [CloudFixtures.profileItem(revision: 5, ftp: 240)], revision: 5
+                )
+            }
+            if request.httpMethod == "POST" {
+                return .json(CloudFixtures.refreshBody(context: "context-1"))
+            }
+            return Self.dashboard([], revision: 5)
+        }
+
+        let read = Task { () -> String in
+            do {
+                _ = try await rig.session.load(.dashboard)
+                return "success"
+            } catch let failure as CloudSession.Failure {
+                return failure.description
+            } catch {
+                return "unexpected error"
+            }
+        }
+        await gate.waitUntilArrived()
+        let arrived = await gate.arrived
+        XCTAssertEqual(arrived, 1)
+
+        await rig.session.signOut()
+        XCTAssertNil(rig.cache.load(.dashboard))
+        await gate.openGate()
+
+        let result = await read.value
+        XCTAssertEqual(result, "This device is not paired yet")
+        XCTAssertNil(rig.cache.load(.dashboard), "late data must not restore cache")
+    }
+
+    func testAnInFlightReadCannotReturnDataAfterPairingADifferentDevice() async throws {
+        let gate = RequestGate()
+        let cache = MemorySnapshotCache()
+        cache.store(
+            CachedCollection(
+                revision: 4,
+                items: [CloudFixtures.item(
+                    id: "profile", kind: "profile", revision: 4, data: #"{"ftp":230}"#
+                )],
+                storedAt: Date()
+            ),
+            for: .dashboard
+        )
+        let rig = harness(cache: cache) { request, index in
+            if index == 1 {
+                await gate.wait()
+                return Self.dashboard(
+                    [CloudFixtures.profileItem(revision: 5, ftp: 240)], revision: 5
+                )
+            }
+            if request.url?.path == "/api/v1/devices/pair" {
+                let body = CloudFixtures.pairingBody(context: "context-new")
+                    .replacingOccurrences(of: "credential-1", with: "credential-2")
+                    .replacingOccurrences(of: "subscription-1", with: "subscription-2")
+                return .json(body)
+            }
+            if request.httpMethod == "POST" {
+                return .json(CloudFixtures.refreshBody(context: "context-1"))
+            }
+            return Self.dashboard([], revision: 5)
+        }
+
+        let read = Task { () -> String in
+            do {
+                _ = try await rig.session.load(.dashboard)
+                return "success"
+            } catch let failure as CloudSession.Failure {
+                return failure.description
+            } catch {
+                return "unexpected error"
+            }
+        }
+        await gate.waitUntilArrived()
+        let arrived = await gate.arrived
+        XCTAssertEqual(arrived, 1)
+
+        _ = try await rig.session.pair(code: "ABCD-EFGH-JKLM")
+        XCTAssertNil(rig.cache.load(.dashboard))
+        await gate.openGate()
+
+        let result = await read.value
+        XCTAssertEqual(result, "This device is not paired yet")
+        XCTAssertNil(rig.cache.load(.dashboard), "late data must not restore cache")
+    }
+
+    func testAnInFlightReadCannotReturnAfterRePairingTheSameDevice() async throws {
+        let gate = RequestGate()
+        let rig = harness { request, index in
+            if index == 1 {
+                await gate.wait()
+                return Self.dashboard(
+                    [CloudFixtures.profileItem(revision: 5, ftp: 240)], revision: 5
+                )
+            }
+            if request.url?.path == "/api/v1/devices/pair" {
+                return .json(CloudFixtures.pairingBody(context: "context-new"))
+            }
+            if request.httpMethod == "POST" {
+                return .json(CloudFixtures.refreshBody(context: "context-old"))
+            }
+            return Self.dashboard([], revision: 5)
+        }
+
+        let read = Task { () -> String in
+            do {
+                _ = try await rig.session.load(.dashboard)
+                return "success"
+            } catch let failure as CloudSession.Failure {
+                return failure.description
+            } catch {
+                return "unexpected error"
+            }
+        }
+        await gate.waitUntilArrived()
+        let arrived = await gate.arrived
+        XCTAssertEqual(arrived, 1)
+
+        await rig.session.signOut()
+        _ = try await rig.session.pair(code: "ABCD-EFGH-JKLM")
+        XCTAssertNil(rig.cache.load(.dashboard))
+        await gate.openGate()
+
+        let result = await read.value
+        XCTAssertEqual(result, "This device is not paired yet")
+        XCTAssertNil(rig.cache.load(.dashboard), "late data must not restore cache")
+
+        let snapshot = try await rig.session.load(.dashboard)
+        XCTAssertEqual(snapshot.source, .network)
+        let postPairRead = try XCTUnwrap(
+            rig.transport.requests(matching: "/api/v1/context/dashboard").last
+        )
+        XCTAssertEqual(postPairRead.bearerToken, "context-new")
+    }
+
+    func testAnInFlightReadCannotReturnOrRestoreDataAfterRemoval() async throws {
+        let clock = TestClock()
+        let gate = RequestGate()
+        let cache = MemorySnapshotCache()
+        cache.store(
+            CachedCollection(
+                revision: 4,
+                items: [CloudFixtures.item(
+                    id: "profile", kind: "profile", revision: 4, data: #"{"ftp":230}"#
+                )],
+                storedAt: clock.now
+            ),
+            for: .dashboard
+        )
+        let rig = harness(cache: cache, clock: clock) { request, index in
+            if index == 1 {
+                await gate.wait()
+                return Self.dashboard(
+                    [CloudFixtures.profileItem(revision: 5, ftp: 240)], revision: 5
+                )
+            }
+            if request.httpMethod == "POST" {
+                return index == 0
+                    ? .json(CloudFixtures.refreshBody(context: "context-0"))
+                    : .refused(404, serverDate: clock.now)
+            }
+            if index == 2 || index == 4 {
+                return .refused(404, serverDate: clock.now)
+            }
+            return Self.dashboard([], revision: 5)
+        }
+
+        let read = Task { () -> String in
+            do {
+                _ = try await rig.session.load(.dashboard)
+                return "success"
+            } catch let failure as CloudSession.Failure {
+                return failure.description
+            } catch {
+                return "unexpected error"
+            }
+        }
+        await gate.waitUntilArrived()
+        let arrived = await gate.arrived
+        XCTAssertEqual(arrived, 1)
+
+        // The two later refusals remove the device while the original page is
+        // still suspended. The original response is deliberately successful.
+        _ = try await rig.session.load(.dashboard)
+        clock.advance(60)
+        do {
+            _ = try await rig.session.load(.dashboard)
+            XCTFail("the second refused refresh must remove the device")
+        } catch let failure as CloudSession.Failure {
+            guard case .deviceRemoved = failure else {
+                return XCTFail("expected removal, got \(failure)")
+            }
+        }
+
+        XCTAssertNil(rig.cache.load(.dashboard))
+        await gate.openGate()
+
+        let result = await read.value
+        XCTAssertEqual(result, "This device was removed")
+        XCTAssertNil(rig.cache.load(.dashboard), "late data must not restore cache")
+    }
+
     /// The caller that joined somebody else's refresh must hear the same
     /// answer, not the backoff that refusal also set. It resumes into a session
     /// the refresh has already removed, and "we were removed" is the fact it
@@ -300,12 +643,7 @@ final class CloudSessionTests: XCTestCase {
             return collected
         }
 
-        var spins = 0
-        while spins < 1_000 {
-            if await gate.arrived > 0 { break }
-            await Task.yield()
-            spins += 1
-        }
+        await gate.waitUntilArrived()
         await gate.openGate()
 
         let values = await outcomes

@@ -111,13 +111,22 @@ struct StubSigner: DeviceSigner {
 /// one in-flight request at the same time.
 actor RequestGate {
     private var waiting: [CheckedContinuation<Void, Never>] = []
+    private var arrivalWaiters: [CheckedContinuation<Void, Never>] = []
     private var open = false
     private(set) var arrived = 0
 
     func wait() async {
         arrived += 1
+        let pendingArrivalWaiters = arrivalWaiters
+        arrivalWaiters = []
+        for continuation in pendingArrivalWaiters { continuation.resume() }
         if open { return }
         await withCheckedContinuation { waiting.append($0) }
+    }
+
+    func waitUntilArrived() async {
+        if arrived > 0 { return }
+        await withCheckedContinuation { arrivalWaiters.append($0) }
     }
 
     func openGate() {
