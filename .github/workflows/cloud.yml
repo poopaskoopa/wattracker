@@ -34,6 +34,27 @@ jobs:
       - name: Check out source
         uses: actions/checkout@v4
 
+      # This runner is a laptop. It accepts a job from a maintenance wake and
+      # can sleep again mid-run, which kills the job with no failing test and
+      # no uploaded logs -- seen 2026-09-03 on both `main` and a PR, each
+      # dying at exactly 10m00s and each green on re-run. caffeinate is bound
+      # to the Runner.Worker PID with -w, so the assertion covers exactly this
+      # job and is released when the worker exits, including on a cancel:
+      # nothing is left holding the machine awake afterwards.
+      #
+      # -i is the one that matters here, because the observed failures were on
+      # battery and -s is honoured only on AC. Neither survives the lid being
+      # closed; clamshell sleep still ends the job.
+      - name: Hold a sleep assertion for the duration of this job
+        run: |
+          worker=$(pgrep -x Runner.Worker | head -1)
+          if [ -n "$worker" ]; then
+            caffeinate -i -s -w "$worker" &
+            echo "holding a sleep assertion against Runner.Worker $worker"
+          else
+            echo "::warning::no Runner.Worker found; this job can be killed by sleep"
+          fi
+
       - name: Provision Python and install dependencies
         # Pinning the interpreter is required, not cosmetic: the runner's bare
         # `python3` is macOS's own 3.9 (3.8 is even earlier on PATH), both below
