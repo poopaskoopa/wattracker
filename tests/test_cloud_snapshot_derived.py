@@ -222,6 +222,27 @@ def test_activity_detail_uses_stored_date_for_ftp_history(tmp_path):
     )
 
 
+def test_calendar_day_uses_rider_local_date_but_activity_detail_keeps_utc_date(tmp_path):
+    path, user_id = _fixture_db(tmp_path)
+    db.save_user_settings(
+        user_id, {"timezone": "America/New_York"}, path=str(path),
+    )
+    activity_id = _activity(
+        path, user_id, 5, "2026-09-03T00:30:00", seconds=10,
+    )
+
+    objects = snapshot_objects(path, user_id)
+    calendar = next(
+        obj for obj in objects
+        if obj.kind == "calendar_day" and obj.object_id == "calendar-day-2026-09-02"
+    )
+    assert [item["id"] for item in calendar.data["activities"]] == [activity_id]
+    detail = next(
+        obj for obj in objects if obj.object_id == f"activity-detail-{activity_id}"
+    )
+    assert detail.data["id"] == activity_id
+
+
 def test_high_cardinality_calendar_day_is_chunked(tmp_path):
     path = tmp_path / "dense.db"
     db.init_db(str(path))

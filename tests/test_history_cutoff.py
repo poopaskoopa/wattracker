@@ -50,6 +50,21 @@ def test_cutoff_calendar_month_uses_rider_local_date(tmp_path):
     assert db.activities_for_month_unlinked(uid, 2026, 1, path) == []
 
 
+def test_calendar_month_uses_rider_local_date_without_cutoff(tmp_path):
+    path = str(tmp_path / "history.db")
+    db.init_db(path)
+    uid = db.create_user("rider", "hash", path)
+    activity_id = _activity(path, uid, "2026-09-01T00:30:00", "local-august")
+    db.save_user_settings(uid, {"timezone": "America/New_York"}, path)
+
+    assert [a["id"] for a in db.activities_for_month_unlinked(
+        uid, 2026, 8, path
+    )] == [activity_id]
+    assert [a["id"] for a in db.activities_for_month_unlinked(
+        uid, 2026, 9, path
+    )] == []
+
+
 def test_cutoff_load_starts_at_zero_and_ramps_visible_days(tmp_path):
     path = str(tmp_path / "history.db")
     db.init_db(path)
