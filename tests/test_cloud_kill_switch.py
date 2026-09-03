@@ -79,6 +79,19 @@ class _DurableMemoryBackend(MemorySecurityStateBackend):
     durable = True
 
 
+class _DelayedKillUpdateBackend(_DurableMemoryBackend):
+    def __init__(self) -> None:
+        super().__init__()
+        self.update_started = threading.Event()
+        self.allow_update = threading.Event()
+
+    def update(self, kind, key, transform):
+        self.update_started.set()
+        if not self.allow_update.wait(timeout=2):
+            raise RuntimeError("test update timed out")
+        return super().update(kind, key, transform)
+
+
 class _KillStateDown(_DurableMemoryBackend):
     """Every record kind works except the kill switch, whose read fails.
 
@@ -125,8 +138,11 @@ class _NoDeleteTable:
     the delete here is a tripwire rather than a stub.
     """
 
-    def __init__(self) -> None:
+    def __init__(self, *, missing: bool = False) -> None:
         self.entities: dict = {}
+        self.missing = missing
+        self.query_calls: list[dict] = []
+        self.query_iterations = 0
 
     def create_entity(self, entity):
         key = (entity["PartitionKey"], entity["RowKey"])
@@ -145,6 +161,17 @@ class _NoDeleteTable:
         key = (entity["PartitionKey"], entity["RowKey"])
         self.entities[key] = dict(entity, etag='W/"2"')
 
+    def query_entities(self, **kwargs):
+        self.query_calls.append(kwargs)
+
+        def _lazy_rows():
+            self.query_iterations += 1
+            if self.missing:
+                raise _StorageError(404)
+            yield from (dict(entity) for entity in self.entities.values())
+
+        return _lazy_rows()
+
     def delete_entity(self, *args, **kwargs):  # pragma: no cover - a tripwire
         raise AssertionError("no deployed managed identity holds a table delete")
 
@@ -162,7 +189,7 @@ def _config(plane="all"):
         server_secret=SECRET,
         operator_token="operator-token",
         plane=plane,
-        require_apim_proof=False,
+        require_gateway_proof=False,
         clock=lambda: 1_000,
     )
 
@@ -794,6 +821,30 @@ def test_a_late_eighty_percent_action_cannot_re_enable_the_public_api():
     )
 
 
+def test_a_concurrent_eighty_percent_action_cannot_re_enable_the_public_api():
+    backend = _DelayedKillUpdateBackend()
+    errors = []
+
+    def apply_eighty_percent_action():
+        try:
+            disable_writes(backend, reason="budget-80")
+        except Exception as exc:  # pragma: no cover - assertion below reports it
+            errors.append(exc)
+
+    thread = threading.Thread(target=apply_eighty_percent_action)
+    thread.start()
+    assert backend.update_started.wait(timeout=2)
+    disable_public_api(backend, reason="budget-100")
+    backend.allow_update.set()
+    thread.join(timeout=2)
+
+    assert not thread.is_alive()
+    assert not errors
+    state = read_kill_switch(backend)
+    assert state.writes_enabled is False
+    assert state.public_enabled is False
+
+
 def test_the_severest_action_needs_no_readable_state():
     """The more severe the action, the fewer preconditions it has.
 
@@ -902,6 +953,30 @@ def test_the_kill_switch_row_address_is_one_the_azure_table_accepts():
     assert KILL_SWITCH_RECORD_KIND != QUOTA_RECORD_KIND
 
 
+def test_read_only_access_verification_accepts_an_existing_empty_table():
+    table = _NoDeleteTable()
+    backend = AzureTableSecurityStateBackend(table)
+
+    backend.verify_access(writable=False)
+
+    assert table.query_calls == [{
+        "query_filter": "PartitionKey eq '__wattracker_auth_v1__'",
+        "results_per_page": 1,
+    }]
+    assert table.query_iterations == 1
+
+
+def test_read_only_access_verification_refuses_a_missing_table_even_when_query_is_lazy():
+    table = _NoDeleteTable(missing=True)
+    backend = AzureTableSecurityStateBackend(table)
+
+    with pytest.raises(RuntimeError, match="security state table is missing"):
+        backend.verify_access(writable=False)
+
+    assert len(table.query_calls) == 1
+    assert table.query_iterations == 1
+
+
 # ---------------------------------------------------------------------------
 # Production refuses a switch that does not survive it
 # ---------------------------------------------------------------------------
@@ -911,7 +986,7 @@ def test_production_refuses_a_process_local_kill_switch():
     backend = _DurableMemoryBackend()
     config = CloudConfig(
         server_secret=SECRET, operator_token="operator-token",
-        require_verified_subject=False, apim_proof_value="proof-value",
+        require_verified_subject=False, gateway_proof_value="proof-value",
     )
     with pytest.raises(RuntimeError, match="durable kill switch"):
         CloudState.create(

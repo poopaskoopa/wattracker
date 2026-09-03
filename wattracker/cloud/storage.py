@@ -330,11 +330,13 @@ class AzureTenantStore:
         *,
         container_name: str = "wattracker-objects",
         table_name: str = "CloudObjects",
+        client_id: str | None = None,
     ) -> "AzureTenantStore":
         """Construct clients without account keys, SAS, or public storage access."""
         try:
             from azure.data.tables import TableServiceClient
             from azure.identity import DefaultAzureCredential
+            from azure.identity import ManagedIdentityCredential
             from azure.storage.blob import BlobServiceClient
         except ImportError as exc:
             raise AzureDependencyUnavailable(
@@ -342,7 +344,15 @@ class AzureTenantStore:
             ) from exc
         if not isinstance(storage_account_name, str) or not storage_account_name:
             raise ValueError("storage account name is required")
-        credential = DefaultAzureCredential(exclude_interactive_browser_credential=True)
+        if client_id is not None and (
+            not isinstance(client_id, str) or not client_id
+        ):
+            raise ValueError("managed identity client id is invalid")
+        credential = (
+            ManagedIdentityCredential(client_id=client_id)
+            if client_id is not None
+            else DefaultAzureCredential(exclude_interactive_browser_credential=True)
+        )
         blob_service = BlobServiceClient(
             account_url=f"https://{storage_account_name}.blob.core.windows.net",
             credential=credential,

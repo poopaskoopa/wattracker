@@ -22,6 +22,13 @@ def _required(name: str) -> str:
     return value
 
 
+def _required_secret(name: str, *, minimum_length: int = 32) -> str:
+    value = _required(name)
+    if len(value) < minimum_length:
+        raise RuntimeError(f"{name} must contain at least {minimum_length} characters")
+    return value
+
+
 def _server_secret() -> bytes:
     encoded = _required("WATTRACKER_CLOUD_SERVER_SECRET")
     try:
@@ -45,28 +52,39 @@ def create_runtime_app():
     """Build the production app with persistent Azure-backed object storage."""
     config = CloudConfig(
         server_secret=_server_secret(),
-        operator_token=_required("WATTRACKER_CLOUD_OPERATOR_TOKEN"),
+        operator_token=_required_secret("WATTRACKER_CLOUD_OPERATOR_TOKEN"),
         plane=os.environ.get("WATTRACKER_CLOUD_PLANE", "read"),
         allowed_origins=_origins(),
-        apim_proof_header="X-APIM-Request-Proof",
-        apim_proof_value=_required("WATTRACKER_APIM_PROOF_VALUE"),
+        # The production deployment has no gateway that can overwrite and
+        # attest identity headers.  Authentication is therefore performed by
+        # the durable application credentials and signatures themselves.
+        require_gateway_proof=False,
+        require_verified_subject=False,
     )
     account_name = _required("WATTRACKER_STORAGE_ACCOUNT_NAME")
-    store = AzureTenantStore.from_managed_identity(account_name)
+    client_id = _required("AZURE_CLIENT_ID")
+    store = AzureTenantStore.from_managed_identity(
+        account_name, client_id=client_id
+    )
     security_backend = AzureTableSecurityStateBackend.from_managed_identity(
-        account_name
+        account_name, client_id=client_id
     )
     security_backend.verify_access(writable=config.plane in {"all", "read"})
+    kill_backend = AzureTableSecurityStateBackend.from_managed_identity(
+        account_name, table_name="CloudControl", client_id=client_id
+    )
+    kill_backend.verify_access(writable=False)
     replay_backend = None
     if config.plane in {"sync", "all"}:
         replay_backend = AzureTableSecurityStateBackend.from_managed_identity(
-            account_name, table_name="CloudReplay"
+            account_name, table_name="CloudReplay", client_id=client_id
         )
         replay_backend.verify_access(writable=True)
     state = CloudState.create(
         config,
         store=store,
         security_backend=security_backend,
+        kill_backend=kill_backend,
         replay_backend=replay_backend,
         require_persistent_security=True,
     )

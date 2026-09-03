@@ -145,6 +145,23 @@ def test_invitations_expire_are_single_use_and_invalid_tokens_are_indistinguisha
         registry.consume(invitation.token, public_key=b"public-key", subject="subject")
 
 
+@pytest.mark.parametrize("use_backend", [False, True])
+def test_subject_bound_invitation_requires_matching_subject_without_consuming(
+    use_backend,
+):
+    backend = MemorySecurityStateBackend() if use_backend else None
+    registry = EnrollmentRegistry(b"server secret", backend=backend)
+    invitation = registry.create(
+        _installation(), "local-scope", "subject", now=100
+    )
+
+    assert registry.consume(invitation.token, now=100) is None
+    assert registry.consume(invitation.token, subject="wrong", now=100) is None
+    binding = registry.consume(invitation.token, subject="subject", now=100)
+    assert binding is not None
+    assert registry.consume(invitation.token, subject="subject", now=100) is None
+
+
 def test_invitation_token_is_opaque_and_registry_is_bounded():
     registry = EnrollmentRegistry(b"server secret", capacity=1)
     token = registry.create(_installation(), "scope").token
@@ -230,7 +247,10 @@ def test_shared_backend_survives_registry_restart_and_propagates_revocation():
     )
 
     restarted_enrollments = EnrollmentRegistry(b"server secret", backend=backend)
-    binding = restarted_enrollments.consume(invitation.token, now=101)
+    assert restarted_enrollments.consume(invitation.token, now=101) is None
+    binding = restarted_enrollments.consume(
+        invitation.token, subject="subject", now=101
+    )
     assert binding is not None
     assert restarted_enrollments.consume(invitation.token, now=101) is None
 
@@ -647,14 +667,13 @@ def test_pairing_code_shape_normalization_and_entropy():
     * alphabet: Crockford Base32, 32 symbols -> 5 bits per symbol
     * length: 12 symbols -> 60 bits -> 2**60 == 1.15e18 codes
     * TTL ceiling: 900 s
-    * APIM: 60 requests/minute and 1000/day per subscription key, so one key
-      buys at most 15 * 60 == 900 guesses inside a code's whole lifetime
-      (under the 1000/day cap, so the per-minute limit is what binds)
+    * The deployment has no provider per-key quota in front of this route; the
+      60-bit code and hard 900-second TTL are therefore the security bound.
 
-    One key therefore succeeds with probability 900 / 2**60 = 7.8e-16.  The
-    floor asserted below is stated against a far richer attacker: 1000
-    subscription keys, each spending its entire daily budget on one 15-minute
-    window, must still stay under 2**-32.
+    The probability calculations below are illustrative entropy checks, not a
+    claim about a gateway policy: even 900 guesses against one code are only
+    900 / 2**60 = 7.8e-16, and a much richer 1000-key attacker remains below
+    2**-32.
     """
 
     assert len(set(_PAIRING_ALPHABET)) == 32
