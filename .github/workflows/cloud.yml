@@ -114,9 +114,21 @@ jobs:
       - name: Check out source
         uses: actions/checkout@v4
 
-      # Keep the laptop awake so simulator tests are not interrupted by sleep.
+      # Keep the laptop awake so simulator tests are not interrupted by sleep;
+      # a booted simulator plus xcodebuild sits well inside the window where
+      # this runner sleeping kills a job (#225). Guarded the same way the
+      # `tests` job is: backgrounding the command means a failed pgrep would
+      # otherwise leave the step exiting 0 with no assertion held at all, which
+      # looks exactly like success.
       - name: Hold a sleep assertion for the duration of this job
-        run: caffeinate -i -s -w "$(pgrep -x Runner.Worker | head -1)" &
+        run: |
+          worker=$(pgrep -x Runner.Worker | head -1)
+          if [ -n "$worker" ]; then
+            caffeinate -i -s -w "$worker" &
+            echo "holding a sleep assertion against Runner.Worker $worker"
+          else
+            echo "::warning::no Runner.Worker found; this job can be killed by sleep"
+          fi
 
       - name: Run iOS tests
         run: >-
