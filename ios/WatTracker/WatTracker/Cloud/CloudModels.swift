@@ -467,3 +467,41 @@ struct PairingResponse: Decodable, Sendable {
         case expiresIn = "expires_in"
     }
 }
+
+struct CloudDevice: Decodable, Sendable, Equatable {
+    let credentialID: String
+    let label: String?
+    let capabilities: [String]
+    let createdAt: Double?
+    let lastSeenAt: Double?
+    let revoked: Bool
+    let isSelf: Bool
+
+    private enum CodingKeys: String, CodingKey {
+        case credentialID = "credential_id"
+        case label, capabilities
+        case createdAt = "created_at"
+        case lastSeenAt = "last_seen_at"
+        case revoked
+        case isSelf = "self"
+    }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        credentialID = try container.decode(String.self, forKey: .credentialID)
+        label = try container.decodeIfPresent(String.self, forKey: .label)
+        capabilities = try container.decodeIfPresent([String].self, forKey: .capabilities) ?? []
+        createdAt = try container.decodeIfPresent(Double.self, forKey: .createdAt)
+        lastSeenAt = try container.decodeIfPresent(Double.self, forKey: .lastSeenAt)
+        revoked = try container.decodeIfPresent(Bool.self, forKey: .revoked) ?? false
+        isSelf = try container.decodeIfPresent(Bool.self, forKey: .isSelf) ?? false
+    }
+}
+
+struct DeviceListResponse: Decodable, Sendable {
+    let devices: [CloudDevice]
+}
+
+struct DeviceRevokeResponse: Decodable, Sendable {
+    let revoked: Bool
+}

@@ -151,6 +151,8 @@ enum CloudFixtures {
         """
     }
 
+    static let devicesBody = #"{"devices":[{"credential_id":"credential-1","label":"Phone","capabilities":["read"],"created_at":1735689600.0,"last_seen_at":1735689660.0,"revoked":false,"self":true}]}"#
+
     static func refreshBody(context: String, expiresIn: Int = 300) -> String {
         """
         {"reader_context":"\(context)","expires_in":\(expiresIn),\

@@ -616,6 +616,126 @@ final class CloudSessionTests: XCTestCase {
         XCTAssertEqual(state, .unpaired)
     }
 
+    func testPairingIncludesLabelAndOmitsNilLabel() async throws {
+        let labeled = harness(paired: false) { _, _ in
+            .json(CloudFixtures.pairingBody())
+        }
+        _ = try await labeled.session.pair(code: "CODE", label: "Bike")
+        let labeledBody = try XCTUnwrap(labeled.transport.requests.first?.httpBody)
+        let labeledJSON = try XCTUnwrap(JSONSerialization.jsonObject(with: labeledBody) as? [String: Any])
+        XCTAssertEqual(labeledJSON["label"] as? String, "Bike")
+
+        let unlabeled = harness(paired: false) { _, _ in
+            .json(CloudFixtures.pairingBody())
+        }
+        _ = try await unlabeled.session.pair(code: "CODE")
+        let unlabeledBody = try XCTUnwrap(unlabeled.transport.requests.first?.httpBody)
+        let unlabeledJSON = try XCTUnwrap(JSONSerialization.jsonObject(with: unlabeledBody) as? [String: Any])
+        XCTAssertNil(unlabeledJSON["label"])
+    }
+
+    func testPairingSuspendedAcrossSignOutCannotRestoreTheCredential() async throws {
+        let gate = RequestGate()
+        let rig = harness(paired: false) { _, _ in
+            await gate.wait()
+            return .json(CloudFixtures.pairingBody())
+        }
+        let pairing = Task { () -> String in
+            do {
+                _ = try await rig.session.pair(code: "CODE")
+                return "paired"
+            } catch let failure as CloudSession.Failure {
+                return failure.description
+            } catch {
+                return "unexpected error"
+            }
+        }
+
+        var spins = 0
+        while await gate.arrived == 0 && spins < 1_000 {
+            await Task.yield()
+            spins += 1
+        }
+        let arrived = await gate.arrived
+        XCTAssertEqual(arrived, 1)
+        await rig.session.signOut()
+        await gate.openGate()
+
+        let result = await pairing.value
+        XCTAssertEqual(result, "This device is not paired yet")
+        XCTAssertNil(rig.credentials.load())
+        let state = await rig.session.deviceState
+        XCTAssertEqual(state, .unpaired)
+    }
+
+    func testDevicesListingAndRevokeUseFixedSignedWriterEnvelopes() async throws {
+        let rig = harness { request, _ in
+            switch request.url?.path {
+            case "/api/v1/devices": return .json(CloudFixtures.devicesBody)
+            case "/api/v1/devices/credential-1/revoke": return .json(#"{"revoked":true}"#)
+            default: return .refused(404)
+            }
+        }
+        let devices = try await rig.session.devices()
+        XCTAssertEqual(devices.first?.label, "Phone")
+        XCTAssertEqual(devices.first?.lastSeenAt, 1_735_689_660)
+        try await rig.session.removeDevice()
+
+        let list = try XCTUnwrap(rig.transport.requests.first)
+        XCTAssertEqual(list.httpMethod, "GET")
+        XCTAssertEqual(list.value(forHTTPHeaderField: "X-Writer-Credential"), "credential-1")
+        XCTAssertEqual(list.value(forHTTPHeaderField: "X-Writer-Idempotency-Key"), "device-list")
+        XCTAssertEqual(list.value(forHTTPHeaderField: "X-Writer-Revision"), "0")
+        let revoke = try XCTUnwrap(rig.transport.requests.last)
+        XCTAssertEqual(revoke.url?.path, "/api/v1/devices/credential-1/revoke")
+        XCTAssertEqual(revoke.value(forHTTPHeaderField: "X-Writer-Idempotency-Key"), "device-revoke")
+        XCTAssertEqual(revoke.value(forHTTPHeaderField: "X-Writer-Revision"), "0")
+        let state = await rig.session.deviceState
+        XCTAssertEqual(state, .unpaired)
+        XCTAssertNil(rig.credentials.load())
+    }
+
+    func testFailedRevokePreservesPairedStateAndLocalData() async throws {
+        let cache = MemorySnapshotCache()
+        cache.store(CachedCollection(revision: 1, items: [], storedAt: Date()), for: .dashboard)
+        let rig = harness(cache: cache) { _, _ in .refused(503) }
+        do {
+            try await rig.session.removeDevice()
+            XCTFail("revoke should fail")
+        } catch { }
+        let state = await rig.session.deviceState
+        XCTAssertEqual(state, .paired)
+        XCTAssertEqual(rig.credentials.load(), CloudFixtures.device)
+        XCTAssertNotNil(rig.cache.load(.dashboard))
+    }
+
+    func testReadSuspendedAcrossRemoveCannotReturnOrRestoreCache() async throws {
+        let gate = RequestGate()
+        let cache = MemorySnapshotCache()
+        let rig = harness(cache: cache) { request, _ in
+            if request.url?.path == "/api/v1/context/refresh" {
+                return .json(CloudFixtures.refreshBody(context: "context-0"))
+            }
+            if request.url?.path == "/api/v1/context/dashboard" {
+                await gate.wait()
+                return Self.dashboard([CloudFixtures.profileItem(revision: 2, ftp: 250)], revision: 2)
+            }
+            if request.url?.path == "/api/v1/devices/credential-1/revoke" {
+                return .json(#"{"revoked":true}"#)
+            }
+            return .refused(404)
+        }
+        let read = Task { try await rig.session.load(.dashboard) }
+        while await gate.arrived == 0 { await Task.yield() }
+        try await rig.session.removeDevice()
+        await gate.openGate()
+        do {
+            _ = try await read.value
+            XCTFail("stale read must not escape")
+        } catch { }
+        XCTAssertNil(rig.cache.load(.dashboard))
+    }
+
     func testAnUnpairedSessionAsksForNothing() async throws {
         let rig = harness(paired: false) { _, _ in .refused(404) }
         do {

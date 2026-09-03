@@ -160,11 +160,14 @@ actor CloudSession {
     private var device: PairedDevice?
     private var token: ReaderToken?
     private var state: DeviceState
+    private var lifecycleGeneration = 0
 
     private var mintCount = 0
     /// The one refresh allowed to be in flight. Every caller that arrives
     /// while it is set awaits it instead of signing a second one.
     private var refreshTask: Task<ReaderToken, Error>?
+    private var refreshTaskID: Int?
+    private var nextRefreshTaskID = 0
     /// One gate for the whole session. A `Retry-After` on a read is the same
     /// deployment saying the same thing as a `Retry-After` on a refresh, and
     /// honouring it on one route while hammering another is not backing off.
@@ -219,12 +222,16 @@ actor CloudSession {
     /// left over from the credential being replaced would be wrong from the
     /// first request onward.
     @discardableResult
-    func pair(code: String) async throws -> PairedDevice {
+    func pair(code: String, label: String? = nil) async throws -> PairedDevice {
+        let pairingGeneration = lifecycleGeneration
         let result: PairingResult
         do {
-            result = try await client.pair(code: code)
+            result = try await client.pair(code: code, label: label)
         } catch {
             throw classify(error)
+        }
+        guard lifecycleGeneration == pairingGeneration else {
+            throw lifecycleFailure()
         }
         // Cache first, credential second, and the order is not arbitrary: a
         // crash between them must not leave the new credential paired with the
@@ -234,6 +241,9 @@ actor CloudSession {
         // loss.
         cache.removeAll()
         try credentials.save(result.device)
+        lifecycleGeneration += 1
+        refreshTask = nil
+        refreshTaskID = nil
         device = result.device
         state = .paired
         mintCount += 1
@@ -256,15 +266,42 @@ actor CloudSession {
     /// device's access on the server is the rider revoking it (#153); this is
     /// only the local half.
     func signOut() {
+        lifecycleGeneration += 1
         credentials.clear()
         cache.removeAll()
         device = nil
         token = nil
         state = .unpaired
         refreshTask = nil
+        refreshTaskID = nil
         consecutiveFailures = 0
         consecutiveRejections = 0
         nextAttemptAllowedAt = nil
+    }
+
+    func devices() async throws -> [CloudDevice] {
+        guard state != .removed else { throw Failure.deviceRemoved }
+        guard state == .paired, let device else { throw Failure.notPaired }
+        do {
+            return try await client.devices(for: device)
+        } catch {
+            throw classify(error)
+        }
+    }
+
+    func removeDevice() async throws {
+        guard state != .removed else { throw Failure.deviceRemoved }
+        guard state == .paired, let activeDevice = device else { throw Failure.notPaired }
+        let generation = lifecycleGeneration
+        do {
+            try await client.revoke(credentialID: activeDevice.credentialID, for: activeDevice)
+        } catch {
+            throw classify(error)
+        }
+        guard state == .paired, device == activeDevice, lifecycleGeneration == generation else {
+            throw lifecycleFailure()
+        }
+        signOut()
     }
 
     /// A route's objects, reconciled with the server where that is possible.
@@ -276,10 +313,16 @@ actor CloudSession {
     /// one exception is a removed device, where continuing to show the rider's
     /// data is the outcome being prevented.
     func load(_ route: CloudRoute) async throws -> CloudSnapshot {
-        if state == .removed { throw Failure.deviceRemoved }
+        let readDevice = try activeDevice()
+        let readLifecycleGeneration = lifecycleGeneration
         let cached = cache.load(route)
         do {
-            return try await reconcile(route, cached: cached)
+            let snapshot = try await reconcile(
+                route, cached: cached, device: readDevice,
+                lifecycleGeneration: readLifecycleGeneration
+            )
+            try validate(readDevice, lifecycleGeneration: readLifecycleGeneration)
+            return snapshot
         } catch Failure.deviceRemoved {
             throw Failure.deviceRemoved
         } catch Failure.notPaired {
@@ -289,7 +332,11 @@ actor CloudSession {
             // old credential was revoked.
             throw Failure.notPaired
         } catch {
-            guard let cached else { throw error }
+            guard let cached else {
+                try validate(readDevice, lifecycleGeneration: readLifecycleGeneration)
+                throw error
+            }
+            try validate(readDevice, lifecycleGeneration: readLifecycleGeneration)
             return CloudSnapshot(
                 route: route,
                 revision: cached.revision,
@@ -298,6 +345,18 @@ actor CloudSession {
                 asOf: cached.storedAt
             )
         }
+    }
+
+    private func activeDevice() throws -> PairedDevice {
+        guard state != .removed else { throw Failure.deviceRemoved }
+        guard state == .paired, let device else { throw Failure.notPaired }
+        return device
+    }
+
+    private func validate(_ readDevice: PairedDevice, lifecycleGeneration: Int) throws {
+        guard state != .removed else { throw Failure.deviceRemoved }
+        guard state == .paired, device == readDevice,
+              self.lifecycleGeneration == lifecycleGeneration else { throw Failure.notPaired }
     }
 
     // MARK: - The token
@@ -344,19 +403,35 @@ actor CloudSession {
             if let allowed = nextAttemptAllowedAt, allowed > now {
                 throw Failure.throttled(retryAfter: allowed.timeIntervalSince(now))
             }
-            // The task publishes its own result and clears its own slot, so
-            // that a caller joining it observes a settled session the moment
-            // it resumes. Leaving either to the starter's continuation would
-            // let a joiner wake first, see a task that has already finished,
-            // and await it again.
+            guard let refreshDevice = device else { throw Failure.notPaired }
+            let refreshGeneration = lifecycleGeneration
+            nextRefreshTaskID += 1
+            let refreshID = nextRefreshTaskID
             let task = Task { () throws -> ReaderToken in
-                defer { self.refreshTask = nil }
-                let fresh = try await self.performRefresh()
+                defer {
+                    if self.refreshTaskID == refreshID {
+                        self.refreshTask = nil
+                        self.refreshTaskID = nil
+                    }
+                }
+                let fresh = try await self.performRefresh(
+                    for: refreshDevice, lifecycleGeneration: refreshGeneration
+                )
+                guard self.isCurrent(
+                    device: refreshDevice, lifecycleGeneration: refreshGeneration
+                ), self.refreshTaskID == refreshID else {
+                    throw self.lifecycleFailure()
+                }
                 self.token = fresh
                 return fresh
             }
             refreshTask = task
-            return try await task.value
+            refreshTaskID = refreshID
+            let fresh = try await task.value
+            guard isCurrent(
+                device: refreshDevice, lifecycleGeneration: refreshGeneration
+            ) else { throw lifecycleFailure() }
+            return fresh
         }
         throw Failure.throttled(retryAfter: Self.baseBackoff)
     }
@@ -367,10 +442,17 @@ actor CloudSession {
     }
 
     /// One signed refresh, and everything that follows from how it went.
-    private func performRefresh() async throws -> ReaderToken {
-        guard let device else { throw Failure.notPaired }
+    private func performRefresh(
+        for device: PairedDevice, lifecycleGeneration: Int
+    ) async throws -> ReaderToken {
+        guard isCurrent(device: device, lifecycleGeneration: lifecycleGeneration) else {
+            throw lifecycleFailure()
+        }
         do {
             let outcome = try await client.refreshReaderContext(for: device)
+            guard isCurrent(device: device, lifecycleGeneration: lifecycleGeneration) else {
+                throw lifecycleFailure()
+            }
             consecutiveFailures = 0
             consecutiveRejections = 0
             nextAttemptAllowedAt = nil
@@ -382,15 +464,32 @@ actor CloudSession {
                     Swift.min(outcome.expiresIn, Self.maximumContextLifetime)
                 )
             )
+        } catch let failure as Failure {
+            throw failure
         } catch let failure as CloudClient.Failure {
+            guard isCurrent(device: device, lifecycleGeneration: lifecycleGeneration) else {
+                throw lifecycleFailure()
+            }
             throw refusal(failure)
         } catch {
+            guard isCurrent(device: device, lifecycleGeneration: lifecycleGeneration) else {
+                throw lifecycleFailure()
+            }
             // A transport error is the network, not the credential: it must
             // never move this device toward `removed`, or a week in a valley
             // would unpair the rider's phone.
             noteFailure(retryAfter: nil)
             throw Failure.offline
         }
+    }
+
+    private func isCurrent(device: PairedDevice, lifecycleGeneration: Int) -> Bool {
+        state == .paired && self.device == device
+            && self.lifecycleGeneration == lifecycleGeneration
+    }
+
+    private func lifecycleFailure() -> Failure {
+        state == .removed ? .deviceRemoved : .notPaired
     }
 
     /// What a refused refresh means, which is the sharpest question this
@@ -474,9 +573,12 @@ actor CloudSession {
 
     /// The device is gone. Leave nothing behind that could still be read.
     private func markRemoved() {
+        lifecycleGeneration += 1
         state = .removed
         token = nil
         device = nil
+        refreshTask = nil
+        refreshTaskID = nil
         credentials.clear()
         cache.removeAll()
     }
@@ -526,9 +628,9 @@ actor CloudSession {
     // MARK: - Reading a collection
 
     private func reconcile(
-        _ route: CloudRoute, cached: CachedCollection?
+        _ route: CloudRoute, cached: CachedCollection?, device: PairedDevice,
+        lifecycleGeneration: Int
     ) async throws -> CloudSnapshot {
-        guard let device else { throw Failure.notPaired }
         if let allowed = nextAttemptAllowedAt, allowed > clock() {
             throw Failure.throttled(retryAfter: allowed.timeIntervalSince(clock()))
         }
@@ -546,6 +648,7 @@ actor CloudSession {
             let response = try await page(
                 route, device: device, since: since, cursor: cursor
             )
+            try validate(device, lifecycleGeneration: lifecycleGeneration)
             received.append(contentsOf: response.items)
             // Every page of one walk reports the checkpoint pinned when paging
             // began -- the server carries it inside the signed cursor -- so
@@ -563,11 +666,13 @@ actor CloudSession {
         let complete = cursor == nil
         let now = clock()
         if complete {
+            try validate(device, lifecycleGeneration: lifecycleGeneration)
             cache.store(
                 CachedCollection(revision: revision, items: merged, storedAt: now),
                 for: route
             )
         }
+        try validate(device, lifecycleGeneration: lifecycleGeneration)
         return CloudSnapshot(
             route: route,
             revision: complete ? revision : (cached?.revision ?? revision),
