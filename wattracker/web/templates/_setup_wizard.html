@@ -21,6 +21,7 @@
         {% endif %}
     </div>
     {% if setup_error %}<p class="alert" role="alert">{{ setup_error }}</p>{% endif %}
+    {% if setup_timezone_message %}<p class="alert" role="alert">{{ setup_timezone_message }}</p>{% endif %}
     {% if setup_message %}
     <div class="setup-complete" role="status">
         <strong>{{ setup_message }}</strong>
@@ -32,7 +33,8 @@
     {% else %}
     <form id="setup-form" method="post" action="/setup/complete" class="setup-form"
           data-has-error="{{ 'true' if setup_error else 'false' }}"
-          data-step-offset="{{ step_offset }}">
+          data-step-offset="{{ step_offset }}"
+          data-timezone-auto-detect="{{ 'true' if setup_timezone_auto_detect else 'false' }}">
         <p id="setup-progress" class="setup-progress hint" role="status" aria-live="polite"></p>
         <section class="setup-step" data-setup-step="1">
             <h4><span>{{ 1 + step_offset }}</span> Body weight</h4>
@@ -41,6 +43,22 @@
                        step="0.1" required value="{{ setup_form.weight_kg or setup_settings.weight_kg or '' }}">
             </label>
             <p class="hint">This enables W/kg and weight-to-power ratio metrics.</p>
+            <fieldset class="setup-timezone">
+                <legend>Time zone</legend>
+                <label for="setup-timezone">Where you ride
+                    <select id="setup-timezone" name="timezone" required
+                            aria-describedby="setup-timezone-status">
+                        {% for zone, label in setup_timezone_choices %}
+                        <option value="{{ zone }}"
+                            {{ 'selected' if zone == setup_timezone else '' }}>{{ label }}</option>
+                        {% endfor %}
+                    </select>
+                </label>
+                <p id="setup-timezone-status" class="hint" role="status" aria-live="polite">
+                    UTC is selected as the safe fallback. Your browser may suggest a
+                    zone; confirm it or choose another one. Dates remain stored in UTC.
+                </p>
+            </fieldset>
             <div class="setup-nav"><button type="button" data-setup-next>Continue</button></div>
         </section>
 
@@ -148,6 +166,8 @@
     const filesInput = document.getElementById('setup-fit-files');
     const selectedStatus = document.getElementById('setup-selected-status');
     const uploadStatus = document.getElementById('setup-upload-status');
+    const timezone = document.getElementById('setup-timezone');
+    const timezoneStatus = document.getElementById('setup-timezone-status');
     const estimateValue = document.getElementById('setup-estimate-value');
     const progress = document.getElementById('setup-progress');
     const steps = Array.from(form.querySelectorAll('[data-setup-step]'));
@@ -180,6 +200,30 @@
     if (!hasServerError) {
         form.classList.add('setup-js');
         showStep(currentStep);
+    }
+    if (timezone && timezoneStatus && form.dataset.timezoneAutoDetect === 'true') {
+        let detectedTimezone = '';
+        try {
+            if (typeof Intl !== 'undefined' && Intl.DateTimeFormat) {
+                detectedTimezone = Intl.DateTimeFormat().resolvedOptions().timeZone || '';
+            }
+        } catch (_) {
+            detectedTimezone = '';
+        }
+        detectedTimezone = String(detectedTimezone).trim();
+        if (detectedTimezone) {
+            let option = Array.from(timezone.options).find(item =>
+                item.value === detectedTimezone);
+            if (!option) {
+                option = document.createElement('option');
+                option.value = detectedTimezone;
+                option.textContent = `(detected) ${detectedTimezone}`;
+                timezone.appendChild(option);
+            }
+            option.selected = true;
+            timezoneStatus.textContent =
+                `Your browser detected ${detectedTimezone}. Confirm it or choose another time zone. Dates remain stored in UTC.`;
+        }
     }
     form.querySelectorAll('[data-setup-next]').forEach(button => {
         button.addEventListener('click', () => {
