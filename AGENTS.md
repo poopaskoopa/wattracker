@@ -160,6 +160,79 @@ If any commit shows a personal address, fix it *before* it reaches `main` —
   the DB before), then start from pushed `main` only — never from a tree with
   uncommitted schema changes.
 
+## The work queue — take the top unblocked item
+
+Pick work from this list, top down. Do not pick by interest, and do not start
+something not on it without saying so first. The order is not arbitrary:
+each entry says what it unblocks, and taking them out of order produces
+branches that cannot be verified or merged.
+
+The list gives the **order**. GitHub gives the **state** — always
+`gh issue view <n>` before starting, because an issue's body gets amended
+(#234's scope grew a whole section after it was filed) and its labels move.
+If the two disagree, GitHub wins and the queue is stale; say so.
+
+1. **#233 — iOS pairing plumbing.** Device label through `CloudClient.pair`,
+   a `devices()` listing, `revoke` + `CloudSession.removeDevice()`. No UI, no
+   camera, no simulator; every part is unit-testable against the existing
+   `CloudTestSupport` fakes in the `ios-tests` job. This is first because it
+   unblocks the longest chain in the repo: #234 needs it, #228 needs #234, and
+   #161's on-real-data criterion needs #228.
+2. **#217 — build and verify the cloud container image.** Independent of
+   everything iOS. Offline, no Azure subscription. Read the note under
+   "when an issue's premise has gone stale" before starting: most of this
+   issue's body describes a CI state that no longer exists.
+3. **#162 — iOS Activities list and ride detail.** *Not before #234 has
+   merged.* See below.
+4. **#163 — iOS Calendar and Volume screens.** Same condition as #162.
+
+**Do not start #161.** Its work is done and sitting in PR #228, which is held
+open on purpose pending #234. Starting it again re-implements a screen that
+already exists.
+
+**Do not start #167 or #169** without asking. #169 is `blocked`. #167 is real
+but large, and it wants scoping first.
+
+### Why #162 and #163 wait for pairing
+
+Nothing in the app target currently calls `CloudSession.pair(code:)`, so the
+keychain is never written and every screen that reads cloud data renders its
+empty state on a device. That is exactly why #228 cannot be merged despite
+being correct and green. Building two more screens against that gap produces
+two more PRs in the same position: reviewable, passing CI, and impossible to
+verify against real data. One of those is a known cost; three is a backlog.
+
+Once #234 lands, the app can pair against `scripts/walking_skeleton_server.py`
+and these become checkable on a device.
+
+### When an issue's premise has gone stale
+
+Issue bodies are written at a point in time and `main` moves. #217 says the
+`containerized` job is `parked at if: ${{ false }}` and that
+`Dockerfile.cloud` "has never been built anywhere" — both were true when it
+was filed and neither is true now: that job runs on `ubuntu-latest` on every
+PR and already builds the image and verifies the `cloud` extra imports inside
+it. #102 argues at length against an APIM cost that #213 removed from
+`main.bicep` entirely.
+
+So: **check the claims an issue rests on before implementing against them.**
+When one has gone stale, say so in the PR description and scope to what is
+actually left. Do not silently redo work that has landed, and do not invent
+replacement scope to fill the gap — a smaller PR that says why it is smaller
+is the right outcome.
+
+### Finishing an item
+
+- Report **"ready to merge"** and stop. Only the integrator merges, and only
+  the integrator pushes to `main`.
+- Say plainly what you could not verify. "Simulator execution unavailable in
+  this environment" on #228 was the right disclosure and it is what let the
+  review catch that the screen is unreachable on a device.
+- If the PR does not close its issue, say so in the description and why —
+  #219 did this correctly against #217.
+- Do not start the next item while your PR is unreviewed *if* the next item
+  touches the same files. Otherwise carry on; note the dependency in the PR.
+
 ## Scope
 
 - Partition by feature, not by file. Cross-branch edits to shared modules
