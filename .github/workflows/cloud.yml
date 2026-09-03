@@ -23,10 +23,12 @@ jobs:
     # first-time-contributor approval prompt is not a substitute - approving a
     # contributor once exempts every later PR from that account.
     #
-    # The consequence is that a fork PR gets no CI at all: the containerised job
-    # below is disabled, so this is the only job that would have run. Review a
-    # fork PR by pushing its head to a branch in this repository, which is also
-    # the point at which a human has read the diff.
+    # The consequence is that a fork PR gets no CI from this job. It still gets
+    # bicep-validation and, since 2026-09-03, containerized: both run on a
+    # hosted ubuntu-latest runner with no secrets exposed to a Docker build,
+    # so they are safe to run unreviewed. Full self-hosted coverage still
+    # needs a human: push the fork's head to a branch in this repository,
+    # which is also the point at which someone has read the diff.
     if: github.event_name == 'push' || github.event.pull_request.head.repo.full_name == github.repository
     runs-on: [self-hosted, macOS]
     timeout-minutes: 30
@@ -118,13 +120,15 @@ jobs:
         with:
           inlineScript: az bicep build --file infra/azure/main.bicep --stdout > /dev/null
 
-  #
-  # The image check is the one that answers "is the cloud extra actually
-  # installed in readImage/syncImage" - without cryptography, verify_signature
-  # returns False and every write 401s in production. Until this job can run,
-  # that has to be confirmed by hand before any deploy.
+  # The image check answers "is the cloud extra actually installed in
+  # readImage/syncImage" - without cryptography, verify_signature returns
+  # False and every write 401s in production. Enabled 2026-09-03: this repo
+  # is public, so GitHub-hosted standard runners (ubuntu-latest, native
+  # linux/amd64, Docker preinstalled) are free here - the "needs hosted
+  # Linux minutes" reason this job was parked for no longer holds, and
+  # bicep-validation below has been running on ubuntu-latest on every PR
+  # the whole time.
   containerized:
-    if: ${{ false }}
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
