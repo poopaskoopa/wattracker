@@ -1588,7 +1588,9 @@ def create_cloud_app(
 
         @app.get("/api/v1/context/activities")
         async def activities(request: Request) -> Response:
-            return await collection(request, {"activity"}, route="activities")
+            return await collection(
+                request, {"activity"}, route="activities", mobile=True
+            )
 
         @app.get("/api/v1/context/profile")
         async def profile(request: Request) -> Response:
