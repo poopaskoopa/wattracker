@@ -95,10 +95,13 @@ def test_cloud_ios_tests_job_has_required_security_and_test_configuration():
     assert "runs-on: [self-hosted, macOS]" in ios_job
     assert not re.search(r"(?m)^\s*continue-on-error:\s*true\s*$", ios_job)
     assert not re.search(r"\|\|\s*true\b", ios_job)
-    assert re.search(
-        r"caffeinate -i -s -w .*Runner\.Worker",
-        ios_job,
-    )
+    # The sleep assertion must be bound to the worker's PID with -w, so it is
+    # released when the job ends. Backgrounding it means a failed `pgrep` would
+    # leave the step exiting 0 with nothing held, so the guard is pinned too:
+    # without it, "no assertion at all" is indistinguishable from success.
+    assert re.search(r"pgrep -x Runner\.Worker", ios_job)
+    assert re.search(r'caffeinate -i -s -w "\$worker"', ios_job)
+    assert re.search(r'if \[ -n "\$worker" \]', ios_job)
     assert "xcodebuild test" in ios_job
     assert "-project ios/WatTracker/WatTracker.xcodeproj" in ios_job
     assert "-scheme WatTracker" in ios_job
