@@ -11,7 +11,7 @@ from __future__ import annotations
 
 import datetime as _dt
 from typing import List, Optional, Tuple
-from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError, available_timezones
 
 
 DEFAULT_TIMEZONE = "UTC"
@@ -151,3 +151,78 @@ def local_offset_ranges(
             ranges.append((hi.replace(microsecond=0), offset))
         cur = nxt
     return ranges
+
+
+# Zone names that are canonical "Area/Location" IANA keys. available_timezones()
+# also returns ~200 legacy aliases (``US/Eastern``, ``EST5EDT``, ``Etc/GMT+5``,
+# bare ``Japan``); they resolve fine but triple the length of a picker without
+# naming a single zone the canonical keys below do not already cover, and
+# ``Etc/GMT+5`` reads as UTC+5 while actually meaning UTC-5. So the picker
+# offers canonical keys only. Anything already stored - alias included - is
+# still valid and is added back as an option by the caller (see
+# ``timezone_choices``), so no saved value is ever silently rewritten.
+_PICKER_AREAS = (
+    "Africa",
+    "America",
+    "Antarctica",
+    "Arctic",
+    "Asia",
+    "Atlantic",
+    "Australia",
+    "Europe",
+    "Indian",
+    "Pacific",
+)
+
+
+def timezone_offset_label(timezone_name: str, now: _dt.datetime) -> str:
+    """The UTC offset *timezone_name* is on at instant ``now``, as ``UTC-04:00``.
+
+    DISPLAY ONLY, AND ONLY FOR "NOW". What gets stored is the IANA zone name,
+    never this offset: ZoneInfo applies the right offset per instant, so a
+    January ride and a July ride each bucket with the offset actually in force
+    then. This string is a hint that helps a rider recognise their zone in the
+    picker, and it is therefore correct only for the instant passed in. Compute
+    it per request; caching it in a module-level constant would freeze the
+    label at import time and show every rider the wrong offset from the next
+    DST transition onwards.
+    """
+    offset = to_user_timezone(now, timezone_name).utcoffset() or _dt.timedelta(0)
+    total_minutes = int(offset.total_seconds() // 60)
+    sign = "-" if total_minutes < 0 else "+"
+    hours, minutes = divmod(abs(total_minutes), 60)
+    return f"UTC{sign}{hours:02d}:{minutes:02d}"
+
+
+def timezone_choices(
+    now: Optional[_dt.datetime] = None, extra: object = None
+) -> List[Tuple[str, str]]:
+    """Picker options as ``(zone_name, label)``, sorted by current offset.
+
+    ``extra`` is a value already stored for the user: if it is a usable zone
+    that the canonical list omits (a legacy alias, or a key this Python's tzdata
+    lacks), it is included so saving the form cannot rewrite it.
+
+    Sorted by offset then name because a rider looks up their zone by "I am five
+    hours behind London", not alphabetically; the offsets are the ones in force
+    at ``now``, so ordering shifts across a DST transition exactly as the labels
+    do.
+    """
+    instant = now or utc_now()
+    names = {
+        name
+        for name in available_timezones()
+        if name.split("/", 1)[0] in _PICKER_AREAS
+    }
+    names.add(DEFAULT_TIMEZONE)
+    if isinstance(extra, str) and extra.strip() and valid_timezone(extra):
+        names.add(extra.strip())
+    decorated = []
+    for name in names:
+        offset = to_user_timezone(instant, name).utcoffset() or _dt.timedelta(0)
+        decorated.append((offset, name))
+    decorated.sort(key=lambda item: (item[0], item[1]))
+    return [
+        (name, f"({timezone_offset_label(name, instant)}) {name}")
+        for _offset, name in decorated
+    ]
