@@ -11,6 +11,7 @@
 {% if backup_message %}<p class="{{ 'alert' if 'failed' in backup_message else 'ok' }}">{{ backup_message }}</p>{% endif %}
 {% if dir_message %}<p class="alert">{{ dir_message }}</p>{% endif %}
 {% if ftp_message %}<p class="alert" role="alert">{{ ftp_message }}</p>{% endif %}
+{% if timezone_message %}<p class="alert" role="alert">{{ timezone_message }}</p>{% endif %}
 {% if llm_message %}<p class="alert" role="alert">{{ llm_message }}</p>{% endif %}
 {% if weight_message %}<p class="alert" role="alert">{{ weight_message }}</p>{% endif %}
 
@@ -47,12 +48,21 @@
             weigh-ins logged on the Profile page take precedence per date, and
             Zwift fills dates you have not logged.</span>
     </label>
-    <label>Time zone (IANA name):
-        <input type="text" name="timezone" autocomplete="off"
-               placeholder="America/New_York"
-               value="{{ settings.timezone or 'UTC' }}">
+    {# The option labels carry each zone's offset AS OF THIS REQUEST - the
+       context builds the list per request for exactly that reason. What is
+       submitted and stored is the zone NAME, so ZoneInfo keeps applying the
+       right offset per instant and DST needs no action from the rider; the
+       offset here is a recognition hint for today, nothing more. #}
+    <label>Time zone:
+        <select name="timezone">
+            {% for zone, label in timezone_choices %}
+            <option value="{{ zone }}"
+                {{ 'selected' if zone == (settings.timezone or 'UTC') else '' }}>{{ label }}</option>
+            {% endfor %}
+        </select>
         <span class="hint">Used to decide which dated workouts are available
-            on the Ride page. Timestamps remain stored in UTC.</span>
+            on the Ride page. Timestamps remain stored in UTC. Daylight saving
+            is handled automatically &mdash; the offset shown is today's.</span>
     </label>
     <label>Hide rides before this date (optional):
         <input type="date" name="history_start_date"
