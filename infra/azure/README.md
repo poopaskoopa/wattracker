@@ -1,10 +1,13 @@
 # Azure cloud-sync contract
 
+For the full end-to-end, phased (unverified) deployment procedure, see
+[DEPLOY.md](DEPLOY.md).
+
 From the repository root, build the cloud runtime image with the cloud
 dependency extra enabled:
 
 ```sh
-docker build -f Dockerfile.cloud -t wattracker-cloud .
+docker buildx build --platform linux/amd64 --load -f Dockerfile.cloud -t wattracker-cloud .
 ```
 
 This Bicep is a review skeleton, not a zero-cost guarantee. Azure billing can
