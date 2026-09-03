@@ -28,7 +28,7 @@
 
 <form method="post" action="/settings" class="settings-form">
     <label>Training FTP ({{ ftp_min }}&ndash;{{ ftp_max }} watts, overrides estimate):
-        <input type="number" step="1" min="{{ ftp_min }}" max="{{ ftp_max }}" name="ftp"
+        <input type="number" step="any" min="{{ ftp_min }}" max="{{ ftp_max }}" name="ftp"
                value="{{ ftp_form_value }}">
     </label>
     {% if ftp_confirm_required %}
