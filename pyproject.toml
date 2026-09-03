@@ -27,7 +27,7 @@ dependencies = [
 # optional: the browser binary is a ~150MB download outside pip
 # (`playwright install chromium`), so machines and CI without it simply skip
 # those tests instead of failing.
-dev = ["pytest>=8.0", "httpx>=0.27", "playwright>=1.47", "websockets>=13.0", "pytest-timeout>=2.3"]
+dev = ["pytest>=8.0", "httpx>=0.27", "playwright>=1.47", "websockets>=13.0", "pytest-timeout>=2.3", "pytest-xdist>=3.6"]
 # Real-hardware Bluetooth riding. Not needed for core install or the test suite;
 # requires a Bluetooth adapter + trainer/sensors to actually use.
 ble = ["bleak>=0.22"]

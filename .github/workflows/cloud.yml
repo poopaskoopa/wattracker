@@ -102,7 +102,22 @@ jobs:
           # Pin to the workspace. Without it pytest can import a different
           # checkout's code and silently test the wrong tree.
           PYTHONPATH: ${{ github.workspace }}
-        run: .ci-venv/bin/python -m pytest -q
+        # -n auto (pytest-xdist) because this runner is a laptop and the job
+        # has a 30-minute budget it has already lost once to sleep. Every test
+        # is already process-independent - conftest's autouse isolated_env
+        # gives each one its own tmp_path HOME/data dir/DB, and the browser
+        # tests bind an ephemeral port - so distribution needs no new
+        # isolation.
+        #
+        # worksteal, not the default `load` scheduler, and the difference is
+        # not marginal: 2m38s vs 1m03s. This suite is 3004 fast tests (~0.06s
+        # each) plus 36 playwright tests that cost ~4s apiece, and `load`
+        # hands out a fixed slice per worker up front - whichever workers draw
+        # the browser tests still grind through them long after the rest have
+        # gone idle. worksteal lets an idle worker take work back off a busy
+        # one, which is exactly the imbalance this suite has. Measured on the
+        # runner class: 4m37s serial -> 49s, same 3041 passed / 94 skipped.
+        run: .ci-venv/bin/python -m pytest -q -n auto --dist worksteal
 
   # Keep iOS coverage on the trusted self-hosted Mac; the guard prevents
   # untrusted fork code from executing on that runner.
