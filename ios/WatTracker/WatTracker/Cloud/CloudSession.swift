@@ -2,12 +2,12 @@ import Foundation
 
 /// The read-plane routes, and which of them serve deltas.
 ///
-/// `api.py` marks `dashboard`, `volume` and `curve` `mobile=True`; only those
-/// three read `since=`, return a `revision`, page with a signed `cursor`, and
-/// include tombstones.  The rest answer `{"items": [...]}` and nothing else,
-/// so there is no checkpoint to cache against and asking for one would be
-/// asking a question the route does not answer.  That is a fact about the
-/// route, kept here, rather than something inferred from a response -- an
+/// `api.py` marks `dashboard`, `volume`, `curve` and `activities` `mobile=True`;
+/// only those four read `since=`, return a `revision`, page with a signed
+/// `cursor`, and include tombstones. The rest answer `{"items": [...]}` and
+/// nothing else, so there is no checkpoint to cache against and asking for one
+/// would be asking a question the route does not answer. That is a fact about
+/// the route, kept here, rather than something inferred from a response -- an
 /// absent `revision` also describes a truncated body.
 enum CloudRoute: String, Sendable, Equatable, CaseIterable {
     case dashboard
@@ -22,8 +22,8 @@ enum CloudRoute: String, Sendable, Equatable, CaseIterable {
 
     var servesDeltas: Bool {
         switch self {
-        case .dashboard, .volume, .curve: return true
-        case .profile, .activities, .calendar, .races: return false
+        case .dashboard, .volume, .curve, .activities: return true
+        case .profile, .calendar, .races: return false
         }
     }
 
@@ -165,12 +165,26 @@ actor CloudSession {
     /// The one refresh allowed to be in flight. Every caller that arrives
     /// while it is set awaits it instead of signing a second one.
     private var refreshTask: Task<ReaderToken, Error>?
+    /// Identifies the task occupying `refreshTask`; an old task must not clear
+    /// a newer task's slot after sign-out or replacement pairing.
+    private var refreshTaskID: Int?
+    private var nextRefreshTaskID = 0
     /// One gate for the whole session. A `Retry-After` on a read is the same
     /// deployment saying the same thing as a `Retry-After` on a refresh, and
     /// honouring it on one route while hammering another is not backing off.
     private var nextAttemptAllowedAt: Date?
     private var consecutiveFailures = 0
     private var consecutiveRejections = 0
+    /// Changes whenever the local device identity changes. Network reads
+    /// capture it before suspending and validate it before publishing data, so
+    /// a response belonging to the previous rider cannot cross a sign-out or
+    /// replacement pairing.
+    private var sessionGeneration = 0
+    /// Heavy ride objects opened in this app session. They are intentionally
+    /// memory-only: the collection cache already supplies the immediate
+    /// summary, and retaining at most the rides the rider actually opened
+    /// avoids turning a rider-year list into a multi-megabyte eager cache.
+    private var activityObjects: [String: CloudItem] = [:]
 
     init(
         client: CloudClient,
@@ -232,7 +246,10 @@ actor CloudSession {
         // revisions from a scope this device has never read. Losing the cache
         // and not the credential is a cold start; the reverse is silent data
         // loss.
+        sessionGeneration += 1
         cache.removeAll()
+        refreshTask = nil
+        refreshTaskID = nil
         try credentials.save(result.device)
         device = result.device
         state = .paired
@@ -247,6 +264,7 @@ actor CloudSession {
         consecutiveFailures = 0
         consecutiveRejections = 0
         nextAttemptAllowedAt = nil
+        activityObjects.removeAll()
         return result.device
     }
 
@@ -256,15 +274,18 @@ actor CloudSession {
     /// device's access on the server is the rider revoking it (#153); this is
     /// only the local half.
     func signOut() {
+        sessionGeneration += 1
         credentials.clear()
         cache.removeAll()
         device = nil
         token = nil
         state = .unpaired
         refreshTask = nil
+        refreshTaskID = nil
         consecutiveFailures = 0
         consecutiveRejections = 0
         nextAttemptAllowedAt = nil
+        activityObjects.removeAll()
     }
 
     /// A route's objects, reconciled with the server where that is possible.
@@ -277,6 +298,7 @@ actor CloudSession {
     /// data is the outcome being prevented.
     func load(_ route: CloudRoute) async throws -> CloudSnapshot {
         if state == .removed { throw Failure.deviceRemoved }
+        let generation = sessionGeneration
         let cached = cache.load(route)
         do {
             return try await reconcile(route, cached: cached)
@@ -289,6 +311,7 @@ actor CloudSession {
             // old credential was revoked.
             throw Failure.notPaired
         } catch {
+            try validateSessionGeneration(generation)
             guard let cached else { throw error }
             return CloudSnapshot(
                 route: route,
@@ -298,6 +321,40 @@ actor CloudSession {
                 asOf: cached.storedAt
             )
         }
+    }
+
+    /// Fetch the detail lazily, retaining opened rides for this session.
+    func activityDetail(_ activityID: Int) async throws -> ActivityDetail {
+        let objectID = "activity-detail-\(activityID)"
+        let item = try await activityObject(
+            objectID: objectID,
+            read: { client, context, device in
+                try await client.activityDetail(
+                    activityID: activityID, readerContext: context, device: device
+                )
+            }
+        )
+        guard case let .activityDetail(detail) = item.payload else {
+            throw Failure.server(.malformedResponse("\(objectID) has the wrong payload"))
+        }
+        return detail
+    }
+
+    /// Fetch the bounded, downsampled stream payload only after detail opens.
+    func activityStreams(_ activityID: Int) async throws -> ActivityStreams {
+        let objectID = "stream-\(activityID)"
+        let item = try await activityObject(
+            objectID: objectID,
+            read: { client, context, device in
+                try await client.activityStreams(
+                    activityID: activityID, readerContext: context, device: device
+                )
+            }
+        )
+        guard case let .stream(streams) = item.payload else {
+            throw Failure.server(.malformedResponse("\(objectID) has the wrong payload"))
+        }
+        return streams
     }
 
     // MARK: - The token
@@ -349,13 +406,25 @@ actor CloudSession {
             // it resumes. Leaving either to the starter's continuation would
             // let a joiner wake first, see a task that has already finished,
             // and await it again.
+            let identityGeneration = sessionGeneration
+            nextRefreshTaskID += 1
+            let refreshTaskID = nextRefreshTaskID
             let task = Task { () throws -> ReaderToken in
-                defer { self.refreshTask = nil }
-                let fresh = try await self.performRefresh()
+                defer {
+                    if self.refreshTaskID == refreshTaskID {
+                        self.refreshTask = nil
+                        self.refreshTaskID = nil
+                    }
+                }
+                let fresh = try await self.performRefresh(
+                    for: identityGeneration
+                )
+                try self.validateSessionGeneration(identityGeneration)
                 self.token = fresh
                 return fresh
             }
             refreshTask = task
+            self.refreshTaskID = refreshTaskID
             return try await task.value
         }
         throw Failure.throttled(retryAfter: Self.baseBackoff)
@@ -367,30 +436,35 @@ actor CloudSession {
     }
 
     /// One signed refresh, and everything that follows from how it went.
-    private func performRefresh() async throws -> ReaderToken {
+    private func performRefresh(for identityGeneration: Int) async throws -> ReaderToken {
+        try validateSessionGeneration(identityGeneration)
         guard let device else { throw Failure.notPaired }
+        let outcome: CloudClient.RefreshOutcome
         do {
-            let outcome = try await client.refreshReaderContext(for: device)
-            consecutiveFailures = 0
-            consecutiveRejections = 0
-            nextAttemptAllowedAt = nil
-            mintCount += 1
-            return ReaderToken(
-                value: outcome.readerContext,
-                generation: mintCount,
-                expiresAt: clock().addingTimeInterval(
-                    Swift.min(outcome.expiresIn, Self.maximumContextLifetime)
-                )
-            )
+            outcome = try await client.refreshReaderContext(for: device)
         } catch let failure as CloudClient.Failure {
+            try validateSessionGeneration(identityGeneration)
             throw refusal(failure)
         } catch {
+            try validateSessionGeneration(identityGeneration)
             // A transport error is the network, not the credential: it must
             // never move this device toward `removed`, or a week in a valley
             // would unpair the rider's phone.
             noteFailure(retryAfter: nil)
             throw Failure.offline
         }
+        try validateSessionGeneration(identityGeneration)
+        consecutiveFailures = 0
+        consecutiveRejections = 0
+        nextAttemptAllowedAt = nil
+        mintCount += 1
+        return ReaderToken(
+            value: outcome.readerContext,
+            generation: mintCount,
+            expiresAt: clock().addingTimeInterval(
+                Swift.min(outcome.expiresIn, Self.maximumContextLifetime)
+            )
+        )
     }
 
     /// What a refused refresh means, which is the sharpest question this
@@ -474,11 +548,15 @@ actor CloudSession {
 
     /// The device is gone. Leave nothing behind that could still be read.
     private func markRemoved() {
+        sessionGeneration += 1
         state = .removed
         token = nil
         device = nil
+        refreshTask = nil
+        refreshTaskID = nil
         credentials.clear()
         cache.removeAll()
+        activityObjects.removeAll()
     }
 
     /// Push the next attempt out.
@@ -529,6 +607,7 @@ actor CloudSession {
         _ route: CloudRoute, cached: CachedCollection?
     ) async throws -> CloudSnapshot {
         guard let device else { throw Failure.notPaired }
+        let generation = sessionGeneration
         if let allowed = nextAttemptAllowedAt, allowed > clock() {
             throw Failure.throttled(retryAfter: allowed.timeIntervalSince(clock()))
         }
@@ -546,6 +625,7 @@ actor CloudSession {
             let response = try await page(
                 route, device: device, since: since, cursor: cursor
             )
+            try validateSessionGeneration(generation)
             received.append(contentsOf: response.items)
             // Every page of one walk reports the checkpoint pinned when paging
             // began -- the server carries it inside the signed cursor -- so
@@ -563,6 +643,7 @@ actor CloudSession {
         let complete = cursor == nil
         let now = clock()
         if complete {
+            try validateSessionGeneration(generation)
             cache.store(
                 CachedCollection(revision: revision, items: merged, storedAt: now),
                 for: route
@@ -623,6 +704,65 @@ actor CloudSession {
             }
         } catch {
             throw classify(error)
+        }
+    }
+
+    /// One object read with the same token replacement and error
+    /// classification as a collection page.
+    private func activityObject(
+        objectID: String,
+        read: (CloudClient, String, PairedDevice) async throws -> CloudItem
+    ) async throws -> CloudItem {
+        if state == .removed { throw Failure.deviceRemoved }
+        guard let device else { throw Failure.notPaired }
+        let generation = sessionGeneration
+        try validateSessionGeneration(generation)
+        if let cached = activityObjects[objectID] { return cached }
+        if let allowed = nextAttemptAllowedAt, allowed > clock() {
+            throw Failure.throttled(retryAfter: allowed.timeIntervalSince(clock()))
+        }
+
+        let attempt: ReaderToken
+        do {
+            attempt = try await context(after: nil)
+        } catch {
+            throw classify(error)
+        }
+        do {
+            let item = try await read(client, attempt.value, device)
+            try validateSessionGeneration(generation)
+            activityObjects[objectID] = item
+            return item
+        } catch let failure as CloudClient.Failure {
+            guard case let .http(status, _, retryAfter, _) = failure else {
+                throw Failure.server(failure)
+            }
+            if status == 429 || status == 503 {
+                noteFailure(retryAfter: retryAfter)
+                throw Failure.throttled(retryAfter: retryAfter ?? pendingDelay())
+            }
+            guard status == 404 else { throw Failure.server(failure) }
+            let renewed = try await context(after: attempt.generation)
+            do {
+                let item = try await read(client, renewed.value, device)
+                try validateSessionGeneration(generation)
+                activityObjects[objectID] = item
+                return item
+            } catch let retried as CloudClient.Failure {
+                throw Failure.server(retried)
+            }
+        } catch {
+            throw classify(error)
+        }
+    }
+
+    /// A request may resume after sign-out or a new pairing. Never allow data
+    /// fetched under the old credential to enter the new session's cache (or
+    /// escape to its caller).
+    private func validateSessionGeneration(_ generation: Int) throws {
+        if state == .removed { throw Failure.deviceRemoved }
+        guard state == .paired, sessionGeneration == generation else {
+            throw Failure.notPaired
         }
     }
 

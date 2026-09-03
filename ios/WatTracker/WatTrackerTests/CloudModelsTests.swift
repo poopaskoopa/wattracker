@@ -164,13 +164,13 @@ final class CloudModelsTests: XCTestCase {
     }
 
     func testTheRoutesThatServeDeltasAreExactlyTheMobileOnes() {
-        // `api.py` passes `mobile: True` for these three and nothing else.
+        // `api.py` passes `mobile: True` for these four and nothing else.
         // Sending `since=` anywhere else would be asking a question the route
         // does not answer, and reading a checkpoint out of the reply would
         // mistake a truncation for one.
         XCTAssertEqual(
             Set(CloudRoute.allCases.filter(\.servesDeltas)),
-            [.dashboard, .volume, .curve]
+            [.dashboard, .volume, .curve, .activities]
         )
         XCTAssertEqual(CloudRoute.dashboard.path, "/api/v1/context/dashboard")
     }

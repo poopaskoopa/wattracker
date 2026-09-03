@@ -231,6 +231,89 @@ def test_mobile_read_surface_routes_filter_kinds_and_expose_revision(cloud):
     assert dashboard.headers["etag"]
 
 
+def test_activities_collection_pages_with_cursor_and_revision(cloud):
+    _config, state, client = cloud
+    token, context = _mobile_reader(state)
+    _apply_mobile_batch(
+        state,
+        context.namespace,
+        context.local_user_scope,
+        "activity-pages",
+        5,
+        [
+            CloudObject(f"activity-{index}", "activity", 5, {"index": index})
+            for index in range(5)
+        ],
+    )
+    headers = _mobile_headers(token)
+
+    first = client.get(
+        "/api/v1/context/activities?limit=2", headers=headers
+    ).json()
+    assert [item["id"] for item in first["items"]] == [
+        "activity-0", "activity-1",
+    ]
+    assert first["revision"] == 5
+    assert first["next_cursor"]
+
+    second = client.get(
+        "/api/v1/context/activities?limit=2&cursor=" + first["next_cursor"],
+        headers=headers,
+    ).json()
+    assert [item["id"] for item in second["items"]] == [
+        "activity-2", "activity-3",
+    ]
+    assert second["revision"] == 5
+    assert second["next_cursor"]
+
+    final = client.get(
+        "/api/v1/context/activities?limit=2&cursor=" + second["next_cursor"],
+        headers=headers,
+    ).json()
+    assert [item["id"] for item in final["items"]] == ["activity-4"]
+    assert final["revision"] == 5
+    assert final["next_cursor"] is None
+
+
+def test_activities_collection_since_returns_tombstones(cloud):
+    _config, state, client = cloud
+    token, context = _mobile_reader(state)
+    namespace = context.namespace
+    scope = context.local_user_scope
+    _apply_mobile_batch(
+        state,
+        namespace,
+        scope,
+        "activity-before",
+        1,
+        [CloudObject("activity-1", "activity", 1, {"duration_s": 60})],
+    )
+    _apply_mobile_batch(
+        state,
+        namespace,
+        scope,
+        "activity-delete",
+        2,
+        [CloudObject("activity-1", "activity", 2, {}, deleted=True)],
+    )
+
+    response = client.get(
+        "/api/v1/context/activities?since=1", headers=_mobile_headers(token)
+    )
+    assert response.status_code == 200, response.text
+    assert response.json() == {
+        "items": [{
+            "id": "activity-1",
+            "kind": "activity",
+            "revision": 2,
+            "data": {},
+            "deleted": True,
+        }],
+        "revision": 2,
+        "next_cursor": None,
+    }
+
+
 def test_mobile_read_surface_since_returns_tombstones_and_is_scope_local(cloud):
     _config, state, client = cloud
     token, context = _mobile_reader(state, scope="first-scope")
