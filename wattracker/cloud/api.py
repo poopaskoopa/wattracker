@@ -92,9 +92,9 @@ class CloudConfig:
     operator_token: str
     plane: str = "all"  # all | read | sync
     require_subscription: bool = True
-    apim_proof_header: str = "X-APIM-Request-Proof"
-    apim_proof_value: str = field(default="", repr=False)
-    require_apim_proof: bool = True
+    gateway_proof_header: str = "X-Gateway-Request-Proof"
+    gateway_proof_value: str = field(default="", repr=False)
+    require_gateway_proof: bool = True
     verified_subject_header: str = "X-Verified-Entra-Subject"
     # A verified-subject header is worth exactly as much as the gateway that
     # overwrites it.  Deployments without such a gateway must set this False,
@@ -124,9 +124,11 @@ class CloudConfig:
             or self.replay_ttl_seconds < MIN_REPLAY_TTL_SECONDS
         ):
             raise ValueError("replay TTL must cover the timestamp freshness window")
-        if not isinstance(self.apim_proof_value, str) or len(self.apim_proof_value) > 512:
-            raise ValueError("apim proof value is invalid")
-        if self.require_apim_proof and self.apim_proof_value:
+        if not isinstance(self.gateway_proof_header, str) or not self.gateway_proof_header:
+            raise ValueError("gateway proof header is invalid")
+        if not isinstance(self.gateway_proof_value, str) or len(self.gateway_proof_value) > 512:
+            raise ValueError("gateway proof value is invalid")
+        if self.require_gateway_proof and self.gateway_proof_value:
             # An empty value deliberately means "no gateway", and
             # `gateway_attests_subject` reads False for it.  A *non-empty*
             # value reads True, and that is what licenses every route to trust
@@ -134,8 +136,8 @@ class CloudConfig:
             # claims a gateway while being guessable, and whoever guesses it
             # then dictates the subject.  Refuse the claim rather than let it
             # stand on a placeholder.
-            if not self.apim_proof_value.strip() or len(self.apim_proof_value) < 8:
-                raise ValueError("apim proof value must be a secret, not a placeholder")
+            if not self.gateway_proof_value.strip() or len(self.gateway_proof_value) < 8:
+                raise ValueError("gateway proof value must be a secret, not a placeholder")
         if not isinstance(self.require_verified_subject, bool):
             raise ValueError("require_verified_subject must be a boolean")
         if any(
@@ -153,7 +155,7 @@ class CloudConfig:
         header is whatever the caller typed.
         """
 
-        return bool(self.require_apim_proof and self.apim_proof_value)
+        return bool(self.require_gateway_proof and self.gateway_proof_value)
 
 
 def _build_quota_manager(
@@ -240,10 +242,10 @@ class CloudState:
         # the sync plane in ``CloudReplay``) because each identity may write
         # only its own table.  A kill switch that split the same way would be
         # two switches: throwing it would stop one plane and leave the other
-        # serving.  It therefore lives in the shared auth table, which every
-        # plane can *read*.  Only the read identity and an operator can write
-        # it, which is the right asymmetry -- the sync plane obeys the switch
-        # and cannot touch it.
+        # serving.  Production gives it its own ``CloudControl`` table, which
+        # every plane can read while the external budget hook is the only
+        # deployment identity that can write it.  The fallback keeps the
+        # dependency-injection seam useful for tests and local development.
         kill_backend = kill_backend or security_backend
         if require_persistent_security and (
             security_backend is None
@@ -437,12 +439,12 @@ def _safe_compare_text(left: object, right: object) -> bool:
         return False
 
 
-def _apim_proof_valid(state: CloudState, request: Request) -> bool:
-    if not state.config.require_apim_proof:
+def _gateway_proof_valid(state: CloudState, request: Request) -> bool:
+    if not state.config.require_gateway_proof:
         return True
-    marker = request.headers.get(state.config.apim_proof_header.lower(), "")
-    return bool(state.config.apim_proof_value) and _safe_compare_text(
-        marker, state.config.apim_proof_value
+    marker = request.headers.get(state.config.gateway_proof_header.lower(), "")
+    return bool(state.config.gateway_proof_value) and _safe_compare_text(
+        marker, state.config.gateway_proof_value
     )
 
 
@@ -494,7 +496,7 @@ def _writer_auth(state: CloudState, request: Request, *, capability: str) -> Any
     """Authenticate a signing credential and assert one required capability.
 
     Both writer and paired-device credentials are resolvable here, and both
-    must satisfy the same APIM subscription factor.  What separates them is
+    must satisfy the same app-issued subscription factor.  What separates them is
     ``capability``: a device issued read-only is refused by a route that
     asserts ``"write"``, and widening it later is a capability grant, not a
     change to this function.
@@ -503,8 +505,8 @@ def _writer_auth(state: CloudState, request: Request, *, capability: str) -> Any
     # this replica set for itself.  Disabled raises 403; unreadable raises
     # 503, and neither is a request this route may serve.
     state.quotas.require_public_enabled()
-    if not _apim_proof_valid(state, request):
-        raise HTTPException(status_code=401, detail="APIM authorization required")
+    if not _gateway_proof_valid(state, request):
+        raise HTTPException(status_code=401, detail="gateway authorization required")
     credential_id = _writer_header(request, "X-Writer-Credential")
     subscription = request.headers.get(state.config.subscription_header.lower(), "")
     if state.config.require_subscription and not subscription:
@@ -729,7 +731,7 @@ def _resolve_reader(state: CloudState, request: Request) -> Any:
     # refusing, and the one flag that must never be bypassed would be bypassed
     # by whichever caller guessed wrong.
     public_enabled = state.quotas.kill_state().public_enabled
-    if not _apim_proof_valid(state, request):
+    if not _gateway_proof_valid(state, request):
         return None
     raw = request.headers.get("authorization", "")
     scheme, _, token = raw.partition(" ")
@@ -912,16 +914,21 @@ def create_cloud_app(
     if read_enabled():
         @app.post("/api/v1/enrollment/start")
         async def enrollment_start(request: Request) -> Response:
+            # Disabled keeps enrollment's refusal uniform and, critically,
+            # happens before operator or gateway authentication and invitation
+            # creation.
+            if not state.quotas.kill_state().public_enabled:
+                return _not_found()
             if not _safe_compare_text(
                 request.headers.get("x-operator-token", ""), config.operator_token
             ):
-                return _error(404, "not found")
+                return _not_found()
             if (
-                not _apim_proof_valid(state, request)
+                not _gateway_proof_valid(state, request)
             ):
                 return _not_found()
-            subject = request.headers.get(config.verified_subject_header.lower(), "")
-            if not subject or len(subject) > 256:
+            ok, subject = _subject_binding(state, request)
+            if not ok:
                 return _not_found()
             try:
                 invitation = state.enrollments.create(
@@ -936,12 +943,16 @@ def create_cloud_app(
 
         @app.post("/api/v1/enrollment/complete")
         async def enrollment_complete(request: Request) -> Response:
+            # Refuse before authentication, invitation consumption, or any
+            # credential/context write when the public API is disabled.
+            if not state.quotas.kill_state().public_enabled:
+                return _not_found()
             if (
-                not _apim_proof_valid(state, request)
+                not _gateway_proof_valid(state, request)
             ):
-                return _error(401, "verified reader authorization required")
-            subject = request.headers.get(config.verified_subject_header.lower(), "")
-            if not subject:
+                return _not_found()
+            ok, subject = _subject_binding(state, request)
+            if not ok:
                 return _error(401, "verified reader authorization required")
             # The invitation is the only selector. The body contains a public
             # verification key, never an installation/account selector or a
@@ -993,8 +1004,11 @@ def create_cloud_app(
                 binding = state.enrollments.consume(token, subject=subject)
                 if (
                     binding is None
-                    or not _safe_compare_text(
-                        getattr(binding, "subject", None) or "", subject
+                    or (
+                        subject is not None
+                        and not _safe_compare_text(
+                            getattr(binding, "subject", None) or "", subject
+                        )
                     )
                 ):
                     return _not_found()
@@ -1051,7 +1065,7 @@ def create_cloud_app(
             refusal, is reachable only after the caller has already proven
             possession of the device key.
             """
-            if not _apim_proof_valid(state, request):
+            if not _gateway_proof_valid(state, request):
                 return _not_found()
             ok, subject = _subject_binding(state, request)
             if not ok:
@@ -1238,7 +1252,7 @@ def create_cloud_app(
             unusable public key), which reveals nothing secret because the
             wire format is public.
             """
-            if not _apim_proof_valid(state, request):
+            if not _gateway_proof_valid(state, request):
                 return _not_found()
             # Disabled keeps this route's uniform 404; unreadable raises and
             # becomes a 503, before the single-use code is spent.

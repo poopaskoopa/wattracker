@@ -394,6 +394,56 @@ label { display: block; margin: 0.6rem 0; }
 .settings-form label, .generate-form label { max-width: 520px; }
 .settings-form input, .generate-form input { width: 100%; margin-top: 0.25rem; }
 
+/* Settings save bar. The Save button was the last element of a form roughly 130
+   template lines tall, and visually identical to the five other buttons below
+   it, so a rider who changed a field near the top had no visible way to commit
+   it - the reported symptom was "I don't see any way to save my choice".
+   Pinning it to the viewport keeps the affordance on screen from any scroll
+   position, and it is deliberately larger than every other button on the page
+   so it reads as THE primary action rather than one more of six. The five
+   others are left exactly as they were; the contrast comes from size and from
+   the bar's own chrome, not from demoting them.
+
+   --save-bar-h is the clearance the fixed bar needs from the flow beneath it.
+   It is not a design token - it is this component's own height, kept on :root
+   only because `main` and `footer` (siblings, both outside this component) have
+   to reserve it. */
+:root { --save-bar-h: 5.25rem; }
+
+.settings-save-bar {
+    position: fixed; left: 0; right: 0; bottom: 0; z-index: 20;
+    background: var(--panel); border-top: 1px solid var(--surface-border);
+    box-shadow: 0 -2px 10px rgba(0, 0, 0, 0.35);
+    padding: 0.75rem 1.5rem;
+    /* Clear the home indicator on a phone; 0 everywhere else. */
+    padding-bottom: calc(0.75rem + env(safe-area-inset-bottom, 0px));
+}
+.settings-save-bar-inner {
+    max-width: 1440px; margin: 0 auto;
+    display: flex; align-items: center; justify-content: flex-end;
+    gap: 1rem; flex-wrap: wrap;
+}
+/* Shown only when a field was rejected. The message itself renders at the top
+   of the page; this is the pointer to it for a rider sitting at the bottom. */
+.settings-save-note {
+    flex: 1 1 14rem; min-width: 0;
+    color: var(--alert); font-size: 0.85rem;
+}
+.settings-save-btn {
+    font-size: 1.05rem; padding: 0.7rem 2rem; min-height: 3rem;
+}
+/* Reserve the bar's height so nothing sits permanently underneath it: `main`
+   for the last form controls, `footer` because it trails main outside it. */
+main.has-save-bar { padding-bottom: var(--save-bar-h); }
+main.has-save-bar ~ footer { padding-bottom: calc(2rem + var(--save-bar-h)); }
+
+@media (max-width: 600px) {
+    /* The note wraps onto its own line here, so the bar is taller. */
+    :root { --save-bar-h: 7.5rem; }
+    .settings-save-bar { padding-left: 1rem; padding-right: 1rem; }
+    .settings-save-btn { flex: 1 1 auto; }
+}
+
 pre {
     background: #0b0f14; padding: 1rem; border-radius: var(--r-md); overflow-x: auto;
     font-size: 0.8rem; line-height: 1.4;

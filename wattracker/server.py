@@ -105,6 +105,7 @@ from .prescribe.planner import (
 from .timeutil import (
     local_today,
     parse_naive,
+    timezone_choices,
     to_user_timezone,
     utc_now,
     utc_today,
@@ -4119,12 +4120,11 @@ def create_app() -> FastAPI:
         for activity in db.activities_for_month_unlinked(uid, y, m):
             activity = dict(activity)
             activity_date = activity["start_time"][:10]
-            if calendar_settings.get("history_start_date"):
-                started = parse_naive(activity.get("start_time"))
-                if started is not None:
-                    activity_date = to_user_timezone(
-                        started, calendar_settings.get("timezone")
-                    ).date().isoformat()
+            started = parse_naive(activity.get("start_time"))
+            if started is not None:
+                activity_date = to_user_timezone(
+                    started, calendar_settings.get("timezone")
+                ).date().isoformat()
             activity.update({
                 "date": activity_date,
                 "activity": True,
@@ -4550,7 +4550,8 @@ def create_app() -> FastAPI:
                       connector_new_token: Optional[str] = None,
                       connector_new_label: Optional[str] = None,
                       refusal_message: Optional[str] = None,
-                      llm_message: Optional[str] = None) -> dict:
+                      llm_message: Optional[str] = None,
+                      timezone_message: Optional[str] = None) -> dict:
         settings = db.get_user_settings(uid)
         # LLM refinement (app-level). The page shows the EFFECTIVE endpoint
         # (an env var wins silently) and the STORED model: blank falls back to
@@ -4579,6 +4580,18 @@ def create_app() -> FastAPI:
             ),
             ftp_message=ftp_message,
             ftp_confirm_required=ftp_confirm_required,
+            # Built HERE, per request, and never at import time: the label on
+            # each option carries the offset that zone is on *right now*, so a
+            # list built once would show every rider a stale offset from the
+            # next DST transition onwards. What the form stores is the zone
+            # NAME, so DST keeps being applied per instant by ZoneInfo.
+            # The stored value is passed in so a zone the canonical list omits
+            # (a legacy alias like US/Eastern) stays selectable and is never
+            # silently rewritten by saving the form.
+            timezone_choices=timezone_choices(
+                utc_now(), settings.get("timezone")
+            ),
+            timezone_message=timezone_message,
             ftp_min=round(FTP_INPUT_MIN_WATTS),
             ftp_max=round(FTP_INPUT_MAX_WATTS),
             # A refused weight is echoed back in the field, the FTP way: the
@@ -4770,9 +4783,13 @@ def create_app() -> FastAPI:
         if wk_err:
             dir_msgs.append(wk_err)
             clean_workouts = ""
+        # Same per-field policy as FTP and weight: a rejected zone is reported
+        # and left unsaved (db.save_user_settings ignores the blank), and the
+        # rest of the form still saves.
+        timezone_message: Optional[str] = None
         clean_timezone = (timezone or "").strip()
         if clean_timezone and not valid_timezone(clean_timezone):
-            dir_msgs.append("Invalid IANA time zone.")
+            timezone_message = "Time zone not saved. Invalid IANA time zone."
             clean_timezone = ""
         clean_history_start = (history_start_date or "").strip()
         history_start_update = clean_history_start
@@ -4956,6 +4973,7 @@ def create_app() -> FastAPI:
                           ftp_form_value=ftp if ftp_message else None,
                           weight_message=weight_message,
                           weight_form_value=weight_kg if weight_message else None,
+                          timezone_message=timezone_message,
                           refusal_message=_CONNECTOR_REFUSAL if refusal else None,
                           llm_message="; ".join(llm_msgs) or None),
             status_code=403 if refusal else 200,

@@ -1,5 +1,7 @@
 import json
 import sqlite3
+import sys
+from types import ModuleType
 import zlib
 
 import pytest
@@ -14,6 +16,7 @@ from wattracker.cloud.models import (
     SyncBatch,
 )
 from wattracker.cloud.security import (
+    AzureTableSecurityStateBackend,
     canonical_request,
     digest_body,
     generate_signing_keypair,
@@ -153,6 +156,78 @@ def test_azure_store_uses_verified_coordinates_and_recovers_idempotently():
         store.get(namespace, "../other", "a1")
 
 
+def _install_azure_credential_fakes(monkeypatch, created):
+    azure = ModuleType("azure")
+    azure.__path__ = []
+    data = ModuleType("azure.data")
+    data.__path__ = []
+    tables = ModuleType("azure.data.tables")
+    identity = ModuleType("azure.identity")
+    storage = ModuleType("azure.storage")
+    storage.__path__ = []
+    blob = ModuleType("azure.storage.blob")
+
+    class ManagedIdentityCredential:
+        def __init__(self, **kwargs):
+            created.append(("managed", kwargs))
+
+    class DefaultAzureCredential:
+        def __init__(self, **kwargs):
+            created.append(("default", kwargs))
+
+    class TableServiceClient:
+        def __init__(self, **kwargs):
+            self.kwargs = kwargs
+
+        def get_table_client(self, _name):
+            return _FakeTable()
+
+    class BlobServiceClient:
+        def __init__(self, **kwargs):
+            self.kwargs = kwargs
+
+        def get_container_client(self, _name):
+            return _FakeContainer()
+
+    tables.TableServiceClient = TableServiceClient
+    identity.ManagedIdentityCredential = ManagedIdentityCredential
+    identity.DefaultAzureCredential = DefaultAzureCredential
+    blob.BlobServiceClient = BlobServiceClient
+    for name, module in {
+        "azure": azure,
+        "azure.data": data,
+        "azure.data.tables": tables,
+        "azure.identity": identity,
+        "azure.storage": storage,
+        "azure.storage.blob": blob,
+    }.items():
+        monkeypatch.setitem(sys.modules, name, module)
+
+
+def test_azure_factories_select_explicit_or_default_identity(monkeypatch):
+    created = []
+    _install_azure_credential_fakes(monkeypatch, created)
+
+    AzureTableSecurityStateBackend.from_managed_identity(
+        "storageacct", client_id="aca-identity"
+    )
+    AzureTenantStore.from_managed_identity(
+        "storageacct", client_id="aca-identity"
+    )
+    assert created == [
+        ("managed", {"client_id": "aca-identity"}),
+        ("managed", {"client_id": "aca-identity"}),
+    ]
+
+    created.clear()
+    AzureTableSecurityStateBackend.from_managed_identity("storageacct")
+    AzureTenantStore.from_managed_identity("storageacct")
+    assert created == [
+        ("managed", {}),
+        ("default", {"exclude_interactive_browser_credential": True}),
+    ]
+
+
 @pytest.mark.parametrize("store_factory", [
     MemoryTenantStore,
     lambda: AzureTenantStore(_FakeBlobService(), _FakeTableService()),
@@ -252,51 +327,68 @@ def _configure_container_runtime(monkeypatch, plane):
     sentinel = object()
     security_backend = MemorySecurityStateBackend()
     security_backend.durable = True
+    control_backend = MemorySecurityStateBackend()
+    control_backend.durable = True
     access_checks = []
     security_backend.verify_access = lambda *, writable: access_checks.append(writable)
+    control_backend.verify_access = lambda *, writable: access_checks.append(writable)
     table_names = []
     monkeypatch.setenv(
         "WATTRACKER_CLOUD_SERVER_SECRET",
         "YWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWE=",
     )
-    monkeypatch.setenv("WATTRACKER_CLOUD_OPERATOR_TOKEN", "operator-token")
-    monkeypatch.setenv("WATTRACKER_APIM_PROOF_VALUE", "private-apim-proof")
+    monkeypatch.setenv(
+        "WATTRACKER_CLOUD_OPERATOR_TOKEN",
+        "operator-token-0123456789abcdef0123456789",
+    )
     monkeypatch.setenv("WATTRACKER_CLOUD_PLANE", plane)
     monkeypatch.setenv("WATTRACKER_STORAGE_ACCOUNT_NAME", "storageacct")
+    monkeypatch.setenv("AZURE_CLIENT_ID", "user-assigned-client-id")
     monkeypatch.setattr(
         runtime.AzureTenantStore,
         "from_managed_identity",
-        staticmethod(lambda name: sentinel),
+        staticmethod(lambda name, *, client_id: sentinel),
     )
     monkeypatch.setattr(
         runtime.AzureTableSecurityStateBackend,
         "from_managed_identity",
         staticmethod(
-            lambda name, *, table_name="CloudAuth": (
-                table_names.append(table_name) or security_backend
+            lambda name, *, table_name="CloudAuth", client_id: (
+                table_names.append(table_name)
+                or (control_backend if table_name == "CloudControl" else security_backend)
             )
         ),
     )
-    return runtime.create_runtime_app(), sentinel, security_backend, table_names, access_checks
+    return (
+        runtime.create_runtime_app(),
+        sentinel,
+        security_backend,
+        control_backend,
+        table_names,
+        access_checks,
+    )
 
 
 def test_container_runtime_sync_plane_injects_azure_store_and_replay_backend(monkeypatch):
-    app, sentinel, security_backend, table_names, access_checks = _configure_container_runtime(
+    app, sentinel, security_backend, control_backend, table_names, access_checks = _configure_container_runtime(
         monkeypatch, "sync"
     )
     assert app.state.cloud.store is sentinel
     assert app.state.cloud.credentials._backend is security_backend
     assert app.state.cloud.enrollments._backend is security_backend
     assert app.state.cloud.nonces._backend is security_backend
-    assert table_names == ["CloudAuth", "CloudReplay"]
-    assert access_checks == [False, True]
-    assert app.state.cloud.config.apim_proof_value == "private-apim-proof"
+    assert app.state.cloud.quotas.kill_switch._backend is control_backend
+    assert table_names == ["CloudAuth", "CloudControl", "CloudReplay"]
+    assert access_checks == [False, False, True]
+    assert app.state.cloud.config.gateway_proof_value == ""
     assert app.state.cloud.config.plane == "sync"
-    assert app.state.cloud.config.apim_proof_header == "X-APIM-Request-Proof"
+    assert app.state.cloud.config.gateway_proof_header == "X-Gateway-Request-Proof"
+    assert app.state.cloud.config.require_gateway_proof is False
+    assert app.state.cloud.config.require_verified_subject is False
 
 
 def test_container_runtime_read_plane_does_not_open_replay_table(monkeypatch):
-    app, sentinel, security_backend, table_names, access_checks = _configure_container_runtime(
+    app, sentinel, security_backend, control_backend, table_names, access_checks = _configure_container_runtime(
         monkeypatch, "read"
     )
     assert app.state.cloud.store is sentinel
@@ -308,8 +400,9 @@ def test_container_runtime_read_plane_does_not_open_replay_table(monkeypatch):
     # guard would re-open a captured refresh across a scale-to-zero restart.
     # Those claims go to the CloudAuth table the read identity already writes.
     assert app.state.cloud.nonces._backend is security_backend
-    assert table_names == ["CloudAuth"]
-    assert access_checks == [True]
+    assert app.state.cloud.quotas.kill_switch._backend is control_backend
+    assert table_names == ["CloudAuth", "CloudControl"]
+    assert access_checks == [True, False]
     assert app.state.cloud.config.plane == "read"
 
 
@@ -561,7 +654,7 @@ def test_paired_devices_are_isolated_across_installations_sharing_a_scope_name()
     config = CloudConfig(
         server_secret=_ISOLATION_SECRET,
         operator_token="operator-token",
-        require_apim_proof=False,
+        require_gateway_proof=False,
         require_verified_subject=False,
         clock=lambda: 1_000,
     )

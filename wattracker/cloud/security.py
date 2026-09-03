@@ -17,7 +17,7 @@ import secrets
 import threading
 import time
 from dataclasses import dataclass, field, replace
-from typing import Any, Final, Mapping, Protocol
+from typing import Any, Callable, Final, Mapping, Protocol
 
 
 _log = logging.getLogger(__name__)
@@ -79,8 +79,8 @@ DEFAULT_WRITER_CAPABILITIES: Final = frozenset({"read", "write"})
 _PAIRING_ALPHABET: Final = "0123456789ABCDEFGHJKMNPQRSTVWXYZ"
 _PAIRING_SYMBOLS: Final = 12
 _PAIRING_GROUP: Final = 4
-# 12 symbols x 5 bits.  The arithmetic that justifies this number against the
-# APIM rate limit lives in docs/cloud-sync.md and in the entropy test.
+# 12 symbols x 5 bits.  The selected deployment has no gateway rate limit, so
+# the code's entropy and hard TTL are the security bound.
 DEVICE_PAIRING_CODE_BITS: Final = _PAIRING_SYMBOLS * 5
 # Typed input is normalized before it is digested.  Generated codes never
 # contain I, L or O, so folding them onto 1 and 0 cannot merge two distinct
@@ -224,6 +224,13 @@ class SecurityStateBackend(Protocol):
 
     def write(self, kind: str, key: str, value: Mapping[str, Any]) -> None: ...
 
+    def update(
+        self,
+        kind: str,
+        key: str,
+        transform: Callable[[Mapping[str, Any] | None], Mapping[str, Any]],
+    ) -> dict[str, Any]: ...
+
     def consume(self, kind: str, key: str, *, now: float) -> dict[str, Any] | None: ...
 
     def claim_replay(
@@ -274,6 +281,21 @@ class MemorySecurityStateBackend:
     def write(self, kind: str, key: str, value: Mapping[str, Any]) -> None:
         with self._lock:
             self._records[(kind, key)] = dict(value)
+
+    def update(
+        self,
+        kind: str,
+        key: str,
+        transform: Callable[[Mapping[str, Any] | None], Mapping[str, Any]],
+    ) -> dict[str, Any]:
+        with self._lock:
+            current = self._records.get((kind, key))
+            value = transform(None if current is None else dict(current))
+            if not isinstance(value, Mapping):
+                raise ValueError("security record update must return a mapping")
+            stored = dict(value)
+            self._records[(kind, key)] = stored
+            return dict(stored)
 
     def consume(self, kind: str, key: str, *, now: float) -> dict[str, Any] | None:
         record_key = (kind, key)
@@ -371,7 +393,7 @@ class AzureTableSecurityStateBackend:
 
     Tokens and credentials are addressed only by SHA-256 digests. Values are
     serialized into one authenticated service-side table entity; Azure RBAC
-    and private endpoints remain the storage trust boundary.
+    and the storage firewall remain the storage trust boundary.
     """
 
     durable = True
@@ -381,18 +403,30 @@ class AzureTableSecurityStateBackend:
 
     @classmethod
     def from_managed_identity(
-        cls, storage_account_name: str, *, table_name: str = "CloudAuth"
+        cls,
+        storage_account_name: str,
+        *,
+        table_name: str = "CloudAuth",
+        client_id: str | None = None,
     ) -> "AzureTableSecurityStateBackend":
         try:
             from azure.data.tables import TableServiceClient
-            from azure.identity import DefaultAzureCredential
+            from azure.identity import ManagedIdentityCredential
         except ImportError as exc:
             raise SecurityStateUnavailable(
                 "install the cloud Azure storage dependencies"
             ) from exc
         if not isinstance(storage_account_name, str) or not storage_account_name:
             raise ValueError("storage account name is required")
-        credential = DefaultAzureCredential(exclude_interactive_browser_credential=True)
+        if client_id is not None and (
+            not isinstance(client_id, str) or not client_id
+        ):
+            raise ValueError("managed identity client id is invalid")
+        credential = (
+            ManagedIdentityCredential(client_id=client_id)
+            if client_id is not None
+            else ManagedIdentityCredential()
+        )
         service = TableServiceClient(
             endpoint=f"https://{storage_account_name}.table.core.windows.net",
             credential=credential,
@@ -486,6 +520,48 @@ class AzureTableSecurityStateBackend:
             "Payload": self._payload(value),
             "Consumed": False,
         })
+
+    def update(
+        self,
+        kind: str,
+        key: str,
+        transform: Callable[[Mapping[str, Any] | None], Mapping[str, Any]],
+    ) -> dict[str, Any]:
+        """Apply a read/modify/write transform under an Azure Table etag."""
+        row_key = self._row_key(kind, key)
+        for _attempt in range(_COUNTER_CAS_ATTEMPTS):
+            entity = self._entity(kind, key)
+            current = None if entity is None else self._decode(entity)
+            value = transform(current)
+            if not isinstance(value, Mapping):
+                raise ValueError("security record update must return a mapping")
+            updated = {
+                "PartitionKey": _AUTH_PARTITION,
+                "RowKey": row_key,
+                "Payload": self._payload(value),
+                "Consumed": False,
+            }
+            try:
+                if entity is None:
+                    self._table.create_entity(updated)
+                else:
+                    etag = self._require_etag(entity)
+                    entity["Payload"] = updated["Payload"]
+                    entity["Consumed"] = False
+                    from azure.core import MatchConditions
+                    from azure.data.tables import UpdateMode
+
+                    self._table.update_entity(
+                        entity,
+                        mode=UpdateMode.MERGE,
+                        etag=etag,
+                        match_condition=MatchConditions.IfNotModified,
+                    )
+                return dict(value)
+            except Exception as exc:
+                if not self._conflict(exc):
+                    raise
+        raise SecurityStateUnavailable("security record is too contended to update")
 
     def consume(self, kind: str, key: str, *, now: float) -> dict[str, Any] | None:
         entity = self._entity(kind, key)
@@ -717,9 +793,26 @@ class AzureTableSecurityStateBackend:
         probe_key = hashlib.sha256(b"wattracker-cloud-auth-access-probe").hexdigest()
         if writable:
             self.write("health", probe_key, {"ready": True})
-        value = self.read("health", probe_key)
-        if writable and value != {"ready": True}:
-            raise RuntimeError("durable cloud auth registry is not writable")
+            value = self.read("health", probe_key)
+            if value != {"ready": True}:
+                raise RuntimeError("durable cloud auth registry is not writable")
+            return
+
+        # ``query_entities`` returns a lazy ItemPaged iterator.  Calling it
+        # alone does not make a request, so consume its first item to make a
+        # missing table (404) distinct from an existing empty table.  This is
+        # read-only and uses the same entity-read permission as the runtime
+        # paths; the control identity has no add, update, or delete grant.
+        try:
+            entities = self._table.query_entities(
+                query_filter=f"PartitionKey eq '{_AUTH_PARTITION}'",
+                results_per_page=1,
+            )
+            next(iter(entities), None)
+        except Exception as exc:
+            if self._not_found(exc):
+                raise RuntimeError("durable cloud security state table is missing") from exc
+            raise
 
 
 def _record_has_expired(value: object, horizon: float) -> bool:
@@ -1887,10 +1980,13 @@ class EnrollmentRegistry:
                     supplied_subject = _require_text(subject, "subject")
                 except ValueError:
                     return None
-                if record.subject is None or not hmac.compare_digest(
+            if record.subject is not None:
+                if supplied_subject is None or not hmac.compare_digest(
                     record.subject.encode("utf-8"), supplied_subject.encode("utf-8")
                 ):
                     return None
+            elif supplied_subject is not None:
+                return None
             if self._backend is not None:
                 consumed = self._backend.consume(
                     "invitation", found_digest.hex(), now=current
@@ -2446,7 +2542,7 @@ class CredentialRegistry:
     def authenticate_writer(
         self, credential_id: str, subscription_key: str | bytes
     ) -> WriterCredential | None:
-        """Resolve a writer and compare its APIM subscription key."""
+        """Resolve a writer and compare its app-issued subscription key."""
         credential = self.resolve_writer(credential_id)
         if credential is None:
             return None
@@ -2589,7 +2685,7 @@ class CredentialRegistry:
         """Pair a device against an already server-derived namespace.
 
         The caller supplies only a public key.  The subscription secret is
-        generated here so an APIM subscription key presented by the caller is
+        generated here so a caller-provided subscription key is
         never promoted into the credential.
         """
 
@@ -2729,7 +2825,7 @@ class CredentialRegistry:
     def authenticate_device(
         self, credential_id: str, subscription_key: str | bytes
     ) -> DeviceCredential | None:
-        """Resolve a device and compare its APIM subscription key."""
+        """Resolve a device and compare its app-issued subscription key."""
 
         credential = self.resolve_device(credential_id)
         if credential is None:

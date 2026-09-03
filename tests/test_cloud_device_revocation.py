@@ -72,7 +72,7 @@ def deployment():
         server_secret=SECRET,
         operator_token="operator-token",
         plane="read",
-        require_apim_proof=False,
+        require_gateway_proof=False,
         clock=clock,
     )
     state = CloudState.create(config, security_backend=backend)
@@ -647,11 +647,11 @@ def test_the_sweep_runs_on_the_read_plane_and_never_on_the_sync_plane():
     backend = _DurableMemoryBackend()
     read_config = CloudConfig(
         server_secret=SECRET, operator_token="operator-token", plane="read",
-        require_apim_proof=False, clock=lambda: 1_000,
+        require_gateway_proof=False, clock=lambda: 1_000,
     )
     sync_config = CloudConfig(
         server_secret=SECRET, operator_token="operator-token", plane="sync",
-        require_apim_proof=False, clock=lambda: 1_000,
+        require_gateway_proof=False, clock=lambda: 1_000,
     )
     read_state = CloudState.create(read_config, security_backend=backend)
     sync_state = CloudState.create(sync_config, security_backend=backend)
@@ -713,7 +713,7 @@ def test_sweeping_never_removes_a_live_credential_or_the_kill_switch(deployment)
 def test_the_device_routes_are_absent_from_the_sync_plane():
     config = CloudConfig(
         server_secret=SECRET, operator_token="operator-token", plane="sync",
-        require_apim_proof=False, clock=lambda: 1_000,
+        require_gateway_proof=False, clock=lambda: 1_000,
     )
     state = CloudState.create(config)
     with TestClient(create_cloud_app(config, state=state)) as client:
@@ -736,7 +736,7 @@ def test_an_exhausted_read_quota_still_lets_a_rider_revoke():
     backend = _DurableMemoryBackend()
     config = CloudConfig(
         server_secret=SECRET, operator_token="operator-token", plane="read",
-        require_apim_proof=False, clock=_Clock(1_000.0),
+        require_gateway_proof=False, clock=_Clock(1_000.0),
     )
     state = CloudState.create(
         config,

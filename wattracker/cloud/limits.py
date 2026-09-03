@@ -12,11 +12,11 @@ durable counters use the same etag-guarded compare-and-swap against one table
 row that :meth:`SecurityStateBackend.claim_replay` uses for nonce claims, so
 this package has one concurrency story rather than two.
 
-The budget kill switch is durable for the same reason and lives on the same
-backend.  It is the last line of cost protection, so it is read on the
-admission path with a short staleness window rather than latched at startup,
-and -- unlike every quota path here -- it fails *closed* when it cannot be
-read.
+The budget kill switch is durable for the same reason and lives in its own
+deployment-wide control backend. It is the last line of cost protection, so it
+is read on the admission path with a short staleness window rather than latched
+at startup, and -- unlike every quota path here -- it fails *closed* when it
+cannot be read.
 """
 from __future__ import annotations
 
@@ -196,6 +196,14 @@ class KillSwitch(Protocol):
         self, *, writes_enabled: bool, public_enabled: bool, reason: str = ""
     ) -> KillSwitchState: ...
 
+    def set_writes_enabled(
+        self, enabled: bool, *, reason: str = ""
+    ) -> KillSwitchState: ...
+
+    def set_public_enabled(
+        self, enabled: bool, *, reason: str = ""
+    ) -> KillSwitchState: ...
+
 
 class ProcessKillSwitch:
     """A kill switch in one process, for tests and local development.
@@ -228,6 +236,34 @@ class ProcessKillSwitch:
             self._state = state
         return state
 
+    def set_writes_enabled(
+        self, enabled: bool, *, reason: str = ""
+    ) -> KillSwitchState:
+        with self._lock:
+            current = self._state
+            state = KillSwitchState(
+                writes_enabled=bool(enabled),
+                public_enabled=current.public_enabled,
+                reason=_kill_switch_reason(reason),
+                updated_at=float(self._wallclock()),
+            )
+            self._state = state
+            return state
+
+    def set_public_enabled(
+        self, enabled: bool, *, reason: str = ""
+    ) -> KillSwitchState:
+        with self._lock:
+            current = self._state
+            state = KillSwitchState(
+                writes_enabled=current.writes_enabled,
+                public_enabled=bool(enabled),
+                reason=_kill_switch_reason(reason),
+                updated_at=float(self._wallclock()),
+            )
+            self._state = state
+            return state
+
 
 class DurableKillSwitch:
     """The kill state in a shared backend row, read on the admission path.
@@ -240,15 +276,13 @@ class DurableKillSwitch:
       A cached "enabled" cannot outlive :data:`KILL_SWITCH_TTL_SECONDS`, and a
       failed refresh drops the cache instead of falling back to it.
 
-    Writing uses the backend's plain upsert rather than a compare-and-swap.
-    That is a deliberate difference from ``charge_counter``: a counter is an
-    increment, where a lost update loses a charge, while the kill state is a
-    level the operator declares outright, so last-writer-wins is the intended
-    semantics.  It is also why clearing the switch is an *update* that stores
-    both levels enabled and never a delete -- no deployed managed identity
-    holds a table ``entities/delete`` action (``main.bicep`` grants read, add
-    and update only), the same constraint that shaped #179's reclaim-in-place
-    counters.
+    Explicit operator declarations use the backend's plain upsert. Partial
+    level changes use an etag-guarded update so a delayed 80% action cannot
+    restore a public API already disabled at 100%. Clearing the switch is an
+    *update* that stores both levels enabled and never a delete -- no deployed
+    managed identity holds a table ``entities/delete`` action (``main.bicep``
+    grants read, add and update only), the same constraint that shaped #179's
+    reclaim-in-place counters.
     """
 
     durable = True
@@ -341,6 +375,65 @@ class DurableKillSwitch:
             self._cached = None
         return state
 
+    def _update_level(self, *, writes_enabled: bool | None = None,
+                      public_enabled: bool | None = None,
+                      reason: str = "") -> KillSwitchState:
+        reason_text = _kill_switch_reason(reason)
+        updated_at = float(self._wallclock())
+        # Check availability before attempting the transform. The update below
+        # is the atomic source of truth, but this read keeps an unavailable
+        # control table from being mistaken for a successful state transition.
+        self._load()
+
+        def transform(current: Mapping[str, object] | None) -> Mapping[str, object]:
+            previous = (
+                KILL_SWITCH_ENABLED
+                if current is None
+                else _kill_switch_from_record(current)
+            )
+            return _kill_switch_payload(KillSwitchState(
+                writes_enabled=(
+                    previous.writes_enabled
+                    if writes_enabled is None
+                    else bool(writes_enabled)
+                ),
+                public_enabled=(
+                    previous.public_enabled
+                    if public_enabled is None
+                    else bool(public_enabled)
+                ),
+                reason=reason_text,
+                updated_at=updated_at,
+            ))
+
+        update = getattr(self._backend, "update", None)
+        if not callable(update):
+            raise KillSwitchUnavailable(
+                "kill switch backend cannot perform atomic updates"
+            )
+        try:
+            value = update(self._kind, self._key, transform)
+            state = _kill_switch_from_record(value)
+        except KillSwitchUnavailable:
+            raise
+        except Exception as exc:
+            raise KillSwitchUnavailable(
+                "kill switch state could not be updated"
+            ) from exc
+        with self._lock:
+            self._cached = None
+        return state
+
+    def set_writes_enabled(
+        self, enabled: bool, *, reason: str = ""
+    ) -> KillSwitchState:
+        return self._update_level(writes_enabled=bool(enabled), reason=reason)
+
+    def set_public_enabled(
+        self, enabled: bool, *, reason: str = ""
+    ) -> KillSwitchState:
+        return self._update_level(public_enabled=bool(enabled), reason=reason)
+
 
 # ---------------------------------------------------------------------------
 # Operator entry points
@@ -392,19 +485,15 @@ def disable_writes(
 ) -> KillSwitchState:
     """The 80% budget action: stop writes, leave the public API as it is.
 
-    It reads first so that an 80% action arriving after a 100% one cannot
-    re-enable the public API, and it raises rather than guessing if that read
-    fails.  ``disable_public_api`` is the action that needs no read, which is
-    the right way round: the more severe the action, the fewer preconditions.
+    It reads first and then uses an etag-guarded update, so an 80% action
+    delayed behind a concurrent 100% action cannot re-enable the public API.
+    It raises rather than guessing if the read or update fails.
+    ``disable_public_api`` is the action that needs no read, which is the right
+    way round: the more severe the action, the fewer preconditions.
     """
 
     switch = DurableKillSwitch(backend, **kwargs)
-    current = switch.state()
-    return switch.set(
-        writes_enabled=False,
-        public_enabled=current.public_enabled,
-        reason=reason,
-    )
+    return switch.set_writes_enabled(False, reason=reason)
 
 
 def disable_public_api(
@@ -772,12 +861,12 @@ class QuotaManager:
         declare both levels outright with :func:`set_kill_switch`.
         """
 
-        current = self.kill_state()
-        self._kill.set(
-            writes_enabled=bool(enabled),
-            public_enabled=current.public_enabled,
-            reason=reason,
-        )
+        try:
+            self._kill.set_writes_enabled(bool(enabled), reason=reason)
+        except KillSwitchUnavailable as exc:
+            raise QuotaExceeded(
+                "kill state unavailable", status_code=503, retry_after=30
+            ) from exc
 
     def set_public_enabled(self, enabled: bool, *, reason: str = "") -> None:
         """Move only the public level, leaving the write level as it stands.
@@ -788,12 +877,12 @@ class QuotaManager:
         before.
         """
 
-        current = self.kill_state()
-        self._kill.set(
-            writes_enabled=current.writes_enabled,
-            public_enabled=bool(enabled),
-            reason=reason,
-        )
+        try:
+            self._kill.set_public_enabled(bool(enabled), reason=reason)
+        except KillSwitchUnavailable as exc:
+            raise QuotaExceeded(
+                "kill state unavailable", status_code=503, retry_after=30
+            ) from exc
 
     def _global_admit(self) -> None:
         now = self._clock()

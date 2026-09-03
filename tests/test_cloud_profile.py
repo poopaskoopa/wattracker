@@ -146,7 +146,7 @@ def cloud():
     config = CloudConfig(
         server_secret=SECRET,
         operator_token="operator-token",
-        require_apim_proof=False,
+        require_gateway_proof=False,
         clock=lambda: 1_000,
     )
     state = CloudState.create(config)
