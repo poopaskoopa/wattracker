@@ -155,12 +155,7 @@ final class CloudSessionTests: XCTestCase {
             return collected
         }
 
-        var spins = 0
-        while spins < 1_000 {
-            if await gate.arrived > 0 { break }
-            await Task.yield()
-            spins += 1
-        }
+        await gate.waitUntilArrived()
         await gate.openGate()
 
         let values = try await tokens
@@ -299,11 +294,7 @@ final class CloudSessionTests: XCTestCase {
                 return "unexpected error"
             }
         }
-        var spins = 0
-        while await refreshGate.arrived == 0 && spins < 1_000 {
-            await Task.yield()
-            spins += 1
-        }
+        await refreshGate.waitUntilArrived()
         let refreshArrived = await refreshGate.arrived
         XCTAssertEqual(refreshArrived, 1)
 
@@ -358,11 +349,7 @@ final class CloudSessionTests: XCTestCase {
                 return "unexpected error"
             }
         }
-        var spins = 0
-        while await oldGate.arrived == 0 && spins < 1_000 {
-            await Task.yield()
-            spins += 1
-        }
+        await oldGate.waitUntilArrived()
         let oldRefreshArrived = await oldGate.arrived
         XCTAssertEqual(oldRefreshArrived, 1)
 
@@ -372,11 +359,7 @@ final class CloudSessionTests: XCTestCase {
         let replacement = Task { () -> String in
             try await rig.session.readerContext()
         }
-        spins = 0
-        while await replacementGate.arrived == 0 && spins < 1_000 {
-            await Task.yield()
-            spins += 1
-        }
+        await replacementGate.waitUntilArrived()
         let replacementArrived = await replacementGate.arrived
         XCTAssertEqual(replacementArrived, 1)
 
@@ -439,11 +422,7 @@ final class CloudSessionTests: XCTestCase {
                 return "unexpected error"
             }
         }
-        var spins = 0
-        while await gate.arrived == 0 && spins < 1_000 {
-            await Task.yield()
-            spins += 1
-        }
+        await gate.waitUntilArrived()
         let arrived = await gate.arrived
         XCTAssertEqual(arrived, 1)
 
@@ -498,11 +477,7 @@ final class CloudSessionTests: XCTestCase {
                 return "unexpected error"
             }
         }
-        var spins = 0
-        while await gate.arrived == 0 && spins < 1_000 {
-            await Task.yield()
-            spins += 1
-        }
+        await gate.waitUntilArrived()
         let arrived = await gate.arrived
         XCTAssertEqual(arrived, 1)
 
@@ -543,11 +518,7 @@ final class CloudSessionTests: XCTestCase {
                 return "unexpected error"
             }
         }
-        var spins = 0
-        while await gate.arrived == 0 && spins < 1_000 {
-            await Task.yield()
-            spins += 1
-        }
+        await gate.waitUntilArrived()
         let arrived = await gate.arrived
         XCTAssertEqual(arrived, 1)
 
@@ -672,12 +643,7 @@ final class CloudSessionTests: XCTestCase {
             return collected
         }
 
-        var spins = 0
-        while spins < 1_000 {
-            if await gate.arrived > 0 { break }
-            await Task.yield()
-            spins += 1
-        }
+        await gate.waitUntilArrived()
         await gate.openGate()
 
         let values = await outcomes
