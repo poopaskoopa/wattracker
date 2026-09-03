@@ -8,6 +8,8 @@ import pytest
 
 ROOT = Path(__file__).parents[1]
 BICEP = (ROOT / "infra" / "azure" / "main.bicep").read_text()
+PARAMS = (ROOT / "infra" / "azure" / "main.bicepparam").read_text()
+DEPLOY_RUNBOOK = (ROOT / "infra" / "azure" / "DEPLOY.md").read_text()
 RUNBOOK = (ROOT / "docs" / "cloud-sync.md").read_text()
 BUDGET_HOOK_ROOT = ROOT / "infra" / "azure" / "budget-hook"
 BUDGET_HOOK = (BUDGET_HOOK_ROOT / "function_app.py").read_text()
@@ -17,6 +19,24 @@ BUDGET_HOOK_README = (BUDGET_HOOK_ROOT / "README.md").read_text()
 AZURE_README = (ROOT / "infra" / "azure" / "README.md").read_text()
 BUDGET_HOOK_HOST = json.loads((BUDGET_HOOK_ROOT / "host.json").read_text())
 PACKAGE_HELPER = (ROOT / "scripts" / "package_budget_hook.py").read_text()
+
+
+def test_builtin_storage_data_role_ids_match_their_assignments():
+    assert (
+        "roleDefinitionId: subscriptionResourceId("
+        "'Microsoft.Authorization/roleDefinitions', "
+        "'76199698-9eea-4c19-bc75-cec21354c6b6')"
+    ) in BICEP
+    assert (
+        "param blobReaderRoleDefinitionId = "
+        "'2a2b9908-6ea1-4ae2-8e65-a410df84e7d1'"
+    ) in PARAMS
+
+
+def test_budget_drill_targets_the_source_kill_switch_row():
+    assert 'b"wattracker-cloud-kill-switch-v1\\x00deployment"' in DEPLOY_RUNBOOK
+    assert "--partition-key '__wattracker_auth_v1__'" in DEPLOY_RUNBOOK
+    assert '--row-key "$WATTRACKER_KILL_SWITCH_ROW_KEY"' in DEPLOY_RUNBOOK
 
 
 def test_public_container_apps_are_tls_terminated_and_authenticate_at_the_app():

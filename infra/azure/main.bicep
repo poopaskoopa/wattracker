@@ -476,7 +476,8 @@ resource tableRole 'Microsoft.Authorization/roleAssignments@2022-04-01' = {
   name: guid(storage.id, readIdentity.id, 'table-reader')
   scope: objectTable
   properties: {
-    roleDefinitionId: subscriptionResourceId('Microsoft.Authorization/roleDefinitions', '76199698-9eea-4c19-bc75-cec2138a0c8f')
+    // Storage Table Data Reader built-in role.
+    roleDefinitionId: subscriptionResourceId('Microsoft.Authorization/roleDefinitions', '76199698-9eea-4c19-bc75-cec21354c6b6')
     principalId: readIdentity.properties.principalId
     principalType: 'ServicePrincipal'
   }
