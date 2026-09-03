@@ -526,6 +526,80 @@ production runtime disables gateway proof and verified-subject compatibility
 gates; containers reject requests that merely forge a boolean marker or
 certificate header.
 
+### Reproducible cloud-image verification
+
+Run these commands from the repository root on a Docker host with Buildx. They
+build the same `linux/amd64` target used for deployment and deliberately name
+the local candidate so all subsequent commands inspect the image that was
+built. Docker and Azure tooling are not prerequisites for editing this document;
+when either is unavailable, record the command below as **unverified** rather
+than inferring its result.
+
+```sh
+WATTRACKER_CLOUD_IMAGE=wattracker-cloud-verify:local
+docker buildx build --platform linux/amd64 --load --tag "$WATTRACKER_CLOUD_IMAGE" -f Dockerfile.cloud .
+docker run --rm --platform linux/amd64 --entrypoint python "$WATTRACKER_CLOUD_IMAGE" -c \
+  'import cryptography, azure.identity, azure.storage.blob, azure.data.tables; import wattracker.cloud.api, wattracker.cloud.runtime'
+docker image inspect "$WATTRACKER_CLOUD_IMAGE" --format 'image={{.Id}} size_bytes={{.Size}}'
+docker buildx imagetools inspect python:3.12-slim
+```
+
+The import command verifies the Azure Identity, Blob Storage, and Tables
+dependencies, plus both cloud application modules. `docker image inspect`
+prints the actual local image size in bytes. `imagetools inspect` resolves the
+base-image manifest and its `linux/amd64` digest; retain that output as the
+base-image provenance. The final PR must report the actual image size and
+base-image provenance from these command outputs, not estimates or tag names
+alone.
+
+The Dockerfile `HEALTHCHECK` is deliberately only an import check for
+`wattracker.cloud.runtime`; it does not start the web app, authenticate to
+Azure, or prove HTTP readiness. The production entrypoint requires real,
+managed deployment configuration: a base64 server secret of at least 32 bytes,
+an operator token of at least 32 characters, storage-account name, Azure client
+ID, and a usable managed identity with the required storage/table access. Do
+not put those values in a command, shell history, CI log, or committed env file.
+
+Only when a real deployment environment makes those values and managed identity
+available, start the candidate with a non-committed, permission-restricted env
+file and then check the unauthenticated root refusal:
+
+```sh
+WATTRACKER_CLOUD_IMAGE=wattracker-cloud-verify:local
+set -e
+cleanup() {
+  docker rm --force wattracker-cloud-verify >/dev/null 2>&1 || true
+  rm -f /tmp/wattracker-cloud-root.txt
+}
+trap cleanup EXIT
+docker run --detach --name wattracker-cloud-verify --platform linux/amd64 \
+  --env-file .cloud-runtime.env --publish 127.0.0.1:8000:8000 "$WATTRACKER_CLOUD_IMAGE"
+WATTRACKER_HTTP_STATUS=$(curl --retry 20 --retry-connrefused --retry-delay 1 --silent --show-error \
+  --output /tmp/wattracker-cloud-root.txt \
+  --write-out '%{http_code}' http://127.0.0.1:8000/ || true)
+docker logs wattracker-cloud-verify
+test "$WATTRACKER_HTTP_STATUS" = 404
+test -f /tmp/wattracker-cloud-root.txt
+! rg --fixed-strings 'Traceback' /tmp/wattracker-cloud-root.txt
+```
+
+`GET /` is intentionally not a health endpoint or API route: an unauthenticated
+request to it returns `404`. The check above verifies that refusal has no
+traceback; it must not be substituted with an invented root or health route.
+If the runtime cannot be started against real Azure configuration, the run and
+HTTP checks are unverified locally. The `EXIT` trap cleans up the temporary
+container and response file after either a successful or failed attempt; if
+startup fails, use `docker logs wattracker-cloud-verify` before exit.
+
+CI enforcement options: a PR job can run the build, imports, and image/base
+inspection without Azure credentials, which catches Dockerfile and dependency
+regressions but cannot prove runtime Azure access or HTTP behavior. A separate
+manual or protected-environment deployment smoke test can run the startup and
+`GET /` refusal check with managed identity, but it adds cloud cost, credential
+scope, and environment coordination. Keep the currently disabled containerized
+job in `.github/workflows/cloud.yml` unchanged until one of those tradeoffs is
+explicitly accepted.
+
 ## Operations and cost
 
 The Bicep monthly budget is `$10`, with percentage alerts at 50%, 80%, and
