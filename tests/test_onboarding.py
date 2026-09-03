@@ -682,6 +682,82 @@ def test_completion_no_profile_sets_flag_and_saves_settings(client):
     assert settings["ftp"] == pytest.approx(250)
 
 
+def test_setup_timezone_can_be_confirmed_and_is_stored(client):
+    uid = _register(client)
+    page = client.get("/setup").text
+
+    assert '<select id="setup-timezone" name="timezone" required' in page
+    assert "Intl.DateTimeFormat().resolvedOptions().timeZone" in page
+    assert 'data-timezone-auto-detect="true"' in page
+
+    response = client.post("/setup/complete", data={
+        "weight_kg": "72.5", "ftp_choice": "manual", "manual_ftp": "250",
+        "zwiftpower": "no", "timezone": "America/New_York",
+    })
+
+    assert response.status_code == 200
+    assert db.onboarding_complete(uid)
+    assert db.get_user_settings(uid)["timezone"] == "America/New_York"
+
+
+def test_invalid_detected_timezone_falls_back_without_blocking_setup(client):
+    uid = _register(client)
+
+    response = client.post("/setup/complete", data={
+        "weight_kg": "72.5", "ftp_choice": "manual", "manual_ftp": "250",
+        "zwiftpower": "no", "timezone": "Not/AZone",
+    })
+
+    assert response.status_code == 200
+    assert db.onboarding_complete(uid)
+    assert db.get_user_settings(uid)["timezone"] == "UTC"
+    assert "Time zone not saved. Invalid IANA time zone." in response.text
+
+
+def test_setup_without_javascript_completes_with_utc(client):
+    uid = _register(client)
+    page = client.get("/setup").text
+
+    assert re.search(r'<option value="UTC"\s+selected', page)
+
+    # A no-JS browser submits the server's safe default without a detected
+    # value. Omitting the field also pins the route's defensive fallback.
+    response = client.post("/setup/complete", data={
+        "weight_kg": "72.5", "ftp_choice": "manual", "manual_ftp": "250",
+        "zwiftpower": "no",
+    })
+
+    assert response.status_code == 200
+    assert db.onboarding_complete(uid)
+    assert db.get_user_settings(uid)["timezone"] == "UTC"
+
+
+def test_setup_preserves_an_existing_timezone_and_does_not_backfill_completed_users(
+    client,
+):
+    uid = _register(client)
+    db.save_user_settings(uid, {"timezone": "Europe/Paris"})
+    page = client.get("/setup").text
+
+    assert 'data-timezone-auto-detect="false"' in page
+    assert re.search(r'<option value="Europe/Paris"\s+selected', page)
+
+    response = client.post("/setup/complete", data={
+        "weight_kg": "72.5", "ftp_choice": "manual", "manual_ftp": "250",
+        "zwiftpower": "no",
+    })
+
+    assert response.status_code == 200
+    assert db.get_user_settings(uid)["timezone"] == "Europe/Paris"
+
+    with TestClient(client.app) as completed_client:
+        untouched = _register(completed_client, "already-complete")
+        db.complete_onboarding(untouched)
+        redirected = completed_client.get("/setup", follow_redirects=False)
+    assert redirected.status_code == 303
+    assert db.get_user_settings(untouched)["timezone"] is None
+
+
 def test_completion_yes_profile_saves_credentials_without_password_in_response(client, monkeypatch):
     uid = _register(client)
     saved = {}

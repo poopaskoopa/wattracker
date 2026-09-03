@@ -103,6 +103,7 @@ from .prescribe.planner import (
     validate_variant,
 )
 from .timeutil import (
+    DEFAULT_TIMEZONE,
     local_today,
     parse_naive,
     timezone_choices,
@@ -2044,6 +2045,15 @@ def create_app() -> FastAPI:
                 setup_ftp_confirm_required=False,
                 setup_ftp_min=round(FTP_INPUT_MIN_WATTS),
                 setup_ftp_max=round(FTP_INPUT_MAX_WATTS),
+                setup_timezone_choices=timezone_choices(
+                    utc_now(), setup_settings.get("timezone")
+                ),
+                setup_timezone=(
+                    setup_settings.get("timezone")
+                    if valid_timezone(setup_settings.get("timezone"))
+                    else DEFAULT_TIMEZONE
+                ),
+                setup_timezone_auto_detect=not setup_settings.get("timezone"),
                 setup_step_offset=_setup_step_offset(request),
             )
         # Body weight card: the value effective on the rider's local today
@@ -2086,9 +2096,19 @@ def create_app() -> FastAPI:
     def _setup_context(
         request: Request, error: Optional[str] = None, message: Optional[str] = None,
         form: Optional[dict] = None, confirm_required: bool = False,
+        timezone_message: Optional[str] = None,
     ) -> dict:
         uid = _uid(request)
         settings = db.get_user_settings(uid)
+        form_values = form or {}
+        form_timezone = form_values.get("timezone")
+        saved_timezone = settings.get("timezone")
+        if valid_timezone(form_timezone):
+            selected_timezone = form_timezone.strip()
+        elif valid_timezone(saved_timezone):
+            selected_timezone = saved_timezone.strip()
+        else:
+            selected_timezone = DEFAULT_TIMEZONE
         estimate = importer.recent_best_effort_ftp(uid)
         latest = db.latest_ftp(uid)
         current, source = _setup_ftp_display(
@@ -2106,10 +2126,14 @@ def create_app() -> FastAPI:
             setup_latest_ftp=latest,
             setup_error=error,
             setup_message=message,
-            setup_form=form or {},
+            setup_form=form_values,
             setup_ftp_confirm_required=confirm_required,
             setup_ftp_min=round(FTP_INPUT_MIN_WATTS),
             setup_ftp_max=round(FTP_INPUT_MAX_WATTS),
+            setup_timezone_choices=timezone_choices(utc_now(), saved_timezone),
+            setup_timezone=selected_timezone,
+            setup_timezone_auto_detect=not form_timezone and not saved_timezone,
+            setup_timezone_message=timezone_message,
             setup_step_offset=_setup_step_offset(request),
         )
 
@@ -2307,6 +2331,7 @@ def create_app() -> FastAPI:
         zwift_email: str = Form(""),
         zwift_password: str = Form(""),
         activities_dir: str = Form(""),
+        timezone: str = Form(""),
         confirm_low_ftp: str = Form(""),
     ):
         if not _same_origin_or_absent(request):
@@ -2319,7 +2344,7 @@ def create_app() -> FastAPI:
         form = {"weight_kg": weight_kg, "ftp_choice": ftp_choice,
                 "manual_ftp": manual_ftp, "zwiftpower": zwiftpower,
                 "zwift_id": zwift_id, "zwift_email": zwift_email,
-                "activities_dir": activities_dir}
+                "activities_dir": activities_dir, "timezone": timezone}
         if weight is None:
             return templates.TemplateResponse(
                 request, "setup.html", _setup_context(
@@ -2393,7 +2418,20 @@ def create_app() -> FastAPI:
             backend = None
             cred_saved = False
             rider_id = ""
+        timezone_message: Optional[str] = None
+        clean_timezone = (timezone or "").strip()
+        saved_timezone = db.get_user_settings(uid).get("timezone")
+        if not clean_timezone:
+            clean_timezone = (
+                saved_timezone if valid_timezone(saved_timezone) else DEFAULT_TIMEZONE
+            )
+        elif not valid_timezone(clean_timezone):
+            timezone_message = "Time zone not saved. Invalid IANA time zone."
+            clean_timezone = (
+                saved_timezone if valid_timezone(saved_timezone) else DEFAULT_TIMEZONE
+            )
         updates: dict = {}
+        updates["timezone"] = clean_timezone
         if clean_dir:
             updates["activities_dir"] = clean_dir
         if choice == "manual":
@@ -2431,6 +2469,7 @@ def create_app() -> FastAPI:
                 request,
                 message=("Setup complete. " + (f"Credentials saved in the {backend}." if backend else "")),
                 form={"completed": True},
+                timezone_message=timezone_message,
             )
         )
 
