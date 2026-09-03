@@ -950,7 +950,7 @@ def create_cloud_app(
             if (
                 not _gateway_proof_valid(state, request)
             ):
-                return _error(401, "verified reader authorization required")
+                return _not_found()
             ok, subject = _subject_binding(state, request)
             if not ok:
                 return _error(401, "verified reader authorization required")

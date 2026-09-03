@@ -3,6 +3,8 @@ import json
 import re
 from pathlib import Path
 
+import pytest
+
 
 ROOT = Path(__file__).parents[1]
 BICEP = (ROOT / "infra" / "azure" / "main.bicep").read_text()
@@ -12,6 +14,7 @@ BUDGET_HOOK = (BUDGET_HOOK_ROOT / "function_app.py").read_text()
 BUDGET_HOOK_IMPL = (ROOT / "wattracker" / "cloud" / "budget_hook.py").read_text()
 BUDGET_HOOK_REQUIREMENTS = (BUDGET_HOOK_ROOT / "requirements.txt").read_text()
 BUDGET_HOOK_README = (BUDGET_HOOK_ROOT / "README.md").read_text()
+AZURE_README = (ROOT / "infra" / "azure" / "README.md").read_text()
 BUDGET_HOOK_HOST = json.loads((BUDGET_HOOK_ROOT / "host.json").read_text())
 PACKAGE_HELPER = (ROOT / "scripts" / "package_budget_hook.py").read_text()
 
@@ -119,6 +122,29 @@ def test_budget_actions_target_authenticated_durable_kill_switch_handlers():
     assert "budget 100%" in RUNBOOK
 
 
+def test_table_upsert_roles_include_insert_or_merge_write_and_keep_table_scopes():
+    write_action = "Microsoft.Storage/storageAccounts/tableServices/tables/entities/write"
+    assert BICEP.count(write_action) == 3
+    role_scopes = {
+        "authManagerRoleDefinition": "storage.id",
+        "budgetHookRoleDefinition": "controlTable.id",
+        "replayWriterRoleDefinition": "replayTable.id",
+    }
+    for role_name, table_id in role_scopes.items():
+        role = BICEP.split(f"resource {role_name} ", 1)[1].split("\nresource ", 1)[0]
+        assert write_action in role
+        assert f"assignableScopes: [{table_id}]" in role
+
+    assignments = {
+        "readAuthRole": "authTable",
+        "budgetHookRole": "controlTable",
+        "syncReplayRole": "replayTable",
+    }
+    for assignment_name, table_name in assignments.items():
+        assignment = BICEP.split(f"resource {assignment_name} ", 1)[1].split("\nresource ", 1)[0]
+        assert f"scope: {table_name}" in assignment
+
+
 def test_budget_hook_project_has_a_root_host_and_no_parent_checkout_requirement():
     assert BUDGET_HOOK_HOST == {
         "version": "2.0",
@@ -128,6 +154,10 @@ def test_budget_hook_project_has_a_root_host_and_no_parent_checkout_requirement(
     assert ".." not in BUDGET_HOOK_REQUIREMENTS
     assert "python scripts/package_budget_hook.py" in BUDGET_HOOK_README
     assert "func azure functionapp publish APP_NAME" in BUDGET_HOOK_README
+    assert "refuses to overwrite" in BUDGET_HOOK_README
+    assert "rm -rf -- build/azure-budget-hook" in BUDGET_HOOK_README
+    assert "refuses to overwrite" in AZURE_README
+    assert "rm -rf -- build/azure-budget-hook" in AZURE_README
     assert "shutil.copytree" in PACKAGE_HELPER
     assert "wattracker" in PACKAGE_HELPER
     assert "/budget/disable-writes" in BUDGET_HOOK_README
@@ -151,6 +181,19 @@ def test_budget_hook_stager_copies_the_cloud_package_without_installing_the_repo
     assert (staged / "wattracker" / "cloud" / "budget_hook.py").is_file()
     assert (staged / "wattracker" / "cloud" / "limits.py").is_file()
     assert (staged / "wattracker" / "cloud" / "security.py").is_file()
+
+
+def test_budget_hook_stager_refuses_to_overwrite_existing_output(tmp_path):
+    helper_path = ROOT / "scripts" / "package_budget_hook.py"
+    spec = importlib.util.spec_from_file_location("package_budget_hook", helper_path)
+    assert spec is not None and spec.loader is not None
+    helper = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(helper)
+
+    output = tmp_path / "budget-hook"
+    output.mkdir()
+    with pytest.raises(FileExistsError, match="output already exists"):
+        helper.stage_budget_hook(output)
 
 
 def test_apim_and_private_endpoint_parameters_are_removed_from_the_template():
@@ -251,6 +294,8 @@ def test_the_runbook_says_the_sweep_cannot_remove_the_kill_switch():
     assert "**It cannot delete the kill switch.**" in RUNBOOK
     assert "NEVER_SWEEP_RECORD_KINDS" in RUNBOOK
     assert "authSweeperRoleDefinition" in RUNBOOK
+    assert "cannot reach the budget kill switch in\n// CloudControl" in BICEP
+    assert "including the budget kill switch" not in BICEP
     # The old absolute -- "no managed identity holds a table entities/delete
     # action" -- is no longer true anywhere in the runbook.
     assert "no\nmanaged identity holds a table `entities/delete`" not in RUNBOOK

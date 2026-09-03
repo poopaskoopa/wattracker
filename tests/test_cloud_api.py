@@ -1959,6 +1959,38 @@ def test_enrollment_start_does_not_reveal_public_kill_state(cloud):
     assert dict(disabled.headers) == dict(invalid_token.headers)
 
 
+@pytest.mark.parametrize("public_enabled", [True, False])
+def test_enrollment_complete_invalid_gateway_proof_matches_start(public_enabled):
+    config = CloudConfig(
+        server_secret=SECRET,
+        operator_token="operator-token",
+        gateway_proof_value="proof-value",
+        clock=lambda: 1_000,
+    )
+    state = CloudState.create(config)
+    if not public_enabled:
+        state.quotas.set_public_enabled(False)
+
+    with TestClient(create_cloud_app(config, state=state)) as client:
+        start = client.post(
+            "/api/v1/enrollment/start",
+            headers={
+                "X-Operator-Token": "operator-token",
+                "X-Gateway-Request-Proof": "invalid-proof",
+            },
+        )
+        complete = client.post(
+            "/api/v1/enrollment/complete",
+            headers={"X-Gateway-Request-Proof": "invalid-proof"},
+            json={"invitation": "unused", "public_key": (b"e" * 32).hex()},
+        )
+
+    assert complete.status_code == start.status_code == 404
+    assert complete.content == start.content
+    assert complete.headers["cache-control"] == start.headers["cache-control"] == "no-store"
+    assert complete.headers["pragma"] == start.headers["pragma"] == "no-cache"
+
+
 def test_the_kill_switch_disables_enrollment_complete_before_auth_or_write(cloud):
     _config, state, client = cloud
     started = client.post(

@@ -53,9 +53,18 @@ func azure functionapp publish APP_NAME
 ```
 
 The staging command copies the repository's cloud package into the Function
-project. A raw publish from `infra/azure/budget-hook` cannot resolve a parent
-checkout, and the Function project intentionally has no editable parent
-requirement.
+project and refuses to overwrite an existing output directory. For a
+redeploy, remove only the generated staging directory before restaging:
+
+```sh
+rm -rf -- build/azure-budget-hook
+python scripts/package_budget_hook.py
+cd build/azure-budget-hook
+func azure functionapp publish APP_NAME
+```
+
+A raw publish from `infra/azure/budget-hook` cannot resolve a parent checkout,
+and the Function project intentionally has no editable parent requirement.
 
 - `WATTRACKER_STORAGE_ACCOUNT_NAME`: the storage account name.
 - `WATTRACKER_BUDGET_HOOK_TOKEN`: a separate app-level token for the

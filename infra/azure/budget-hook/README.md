@@ -15,6 +15,16 @@ cd build/azure-budget-hook
 func azure functionapp publish APP_NAME
 ```
 
+The staging helper refuses to overwrite an existing output directory. For a
+redeploy, remove only the generated staging directory before restaging:
+
+```sh
+rm -rf -- build/azure-budget-hook
+python scripts/package_budget_hook.py
+cd build/azure-budget-hook
+func azure functionapp publish APP_NAME
+```
+
 The default Core Tools publish performs the remote dependency build from that
 staging directory. Do not publish `infra/azure/budget-hook` directly: it does
 not contain the repository package until it has been staged. Set these

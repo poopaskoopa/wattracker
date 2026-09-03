@@ -385,13 +385,15 @@ resource authManagerRoleDefinition 'Microsoft.Authorization/roleDefinitions@2022
       'Microsoft.Storage/storageAccounts/tableServices/tables/entities/read'
       'Microsoft.Storage/storageAccounts/tableServices/tables/entities/add/action'
       'Microsoft.Storage/storageAccounts/tableServices/tables/entities/update/action'
+      'Microsoft.Storage/storageAccounts/tableServices/tables/entities/write'
     ] }]
     assignableScopes: [storage.id]
   }
 }
 // The read plane serves GET /api/v1/devices and POST
 // /api/v1/devices/{id}/revoke, so it needs to *write* CloudAuth -- which
-// `authManagerRoleDefinition` above already grants it (read, add, update).
+// `authManagerRoleDefinition` above already grants it (read, add, update, and
+// insert-or-merge write).
 // What it did not have, and what the expired-row sweep needs, is a delete.
 //
 // It is a separate role rather than a fourth action on the manager role, so
@@ -401,17 +403,17 @@ resource authManagerRoleDefinition 'Microsoft.Authorization/roleDefinitions@2022
 // `authReaderRoleDefinition` and holds no delete anywhere.
 //
 // Azure table roles cannot be conditioned on a row key, so this action reaches
-// every row in CloudAuth including the budget kill switch. What keeps the
-// switch safe is in the application: `ExpiredRecordSweeper` deletes only the
-// record kinds named in `SWEEPABLE_RECORD_KINDS`, only past their own
-// `expires_at`, and refuses at construction to be pointed at
-// `NEVER_SWEEP_RECORD_KINDS` -- which names the kill switch and the quota
-// counters, neither of which carries an expiry at all.
+// every row in CloudAuth, but cannot reach the budget kill switch in
+// CloudControl. What keeps the remaining protected rows safe is in the
+// application: `ExpiredRecordSweeper` deletes only the record kinds named in
+// `SWEEPABLE_RECORD_KINDS`, only past their own `expires_at`, and refuses at
+// construction to be pointed at `NEVER_SWEEP_RECORD_KINDS` -- which names the
+// quota counters, neither of which carries an expiry at all.
 resource authSweeperRoleDefinition 'Microsoft.Authorization/roleDefinitions@2022-04-01' = {
   name: guid(authTable.id, 'wattracker-auth-sweeper')
   properties: {
     roleName: 'Wattracker Cloud Auth Sweeper'
-    description: 'Delete expired context, invitation, pairing and replay rows in CloudAuth. The kill switch and quota counter rows carry no expiry and are excluded by record kind in the app.'
+    description: 'Delete expired context, invitation, pairing and replay rows in CloudAuth. Quota counter rows carry no expiry and are excluded by record kind in the app; the kill switch is in CloudControl.'
     type: 'CustomRole'
     permissions: [{ dataActions: [
       'Microsoft.Storage/storageAccounts/tableServices/tables/entities/delete'
@@ -441,6 +443,7 @@ resource budgetHookRoleDefinition 'Microsoft.Authorization/roleDefinitions@2022-
       'Microsoft.Storage/storageAccounts/tableServices/tables/entities/read'
       'Microsoft.Storage/storageAccounts/tableServices/tables/entities/add/action'
       'Microsoft.Storage/storageAccounts/tableServices/tables/entities/update/action'
+      'Microsoft.Storage/storageAccounts/tableServices/tables/entities/write'
     ] }]
     assignableScopes: [controlTable.id]
   }
@@ -455,6 +458,7 @@ resource replayWriterRoleDefinition 'Microsoft.Authorization/roleDefinitions@202
       'Microsoft.Storage/storageAccounts/tableServices/tables/entities/read'
       'Microsoft.Storage/storageAccounts/tableServices/tables/entities/add/action'
       'Microsoft.Storage/storageAccounts/tableServices/tables/entities/update/action'
+      'Microsoft.Storage/storageAccounts/tableServices/tables/entities/write'
     ] }]
     assignableScopes: [replayTable.id]
   }
