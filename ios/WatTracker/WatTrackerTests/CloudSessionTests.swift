@@ -610,11 +610,7 @@ final class CloudSessionTests: XCTestCase {
                 return "unexpected error"
             }
         }
-        var spins = 0
-        while await gate.arrived == 0 && spins < 1_000 {
-            await Task.yield()
-            spins += 1
-        }
+        await gate.waitUntilArrived()
         let arrived = await gate.arrived
         XCTAssertEqual(arrived, 1)
 
