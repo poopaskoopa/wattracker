@@ -1848,6 +1848,103 @@ def _fire_a_ride_cue(page, live_server):
     return page.evaluate("() => window.__cueGains[0]")
 
 
+def test_settings_save_bar_stays_on_screen_and_covers_nothing(
+        page, live_server, console_errors):
+    """The Save control is reachable from the top of Settings, and the last
+    button on the page is still clickable underneath it.
+
+    The button used to be the final element of a form several screens tall, so
+    a rider who changed the first field saw no way to commit it. Pinning it is
+    only half the fix: a fixed bar also overlaps whatever it is pinned over, so
+    the flow has to reserve its height or the page's last control becomes
+    permanently unclickable - trading one dead end for another.
+    """
+    page.goto(f"{live_server.base}/settings")
+    page.wait_for_load_state("networkidle")
+
+    viewport = page.viewport_size["height"]
+    bar = page.locator(".settings-save-bar")
+    save = page.locator("#settings-save")
+
+    # On screen from the top of the page, without scrolling.
+    box = bar.bounding_box()
+    assert box is not None and box["y"] + box["height"] <= viewport + 1, (
+        f"the save bar is not pinned to the viewport: {box}")
+    assert save.is_visible()
+
+    # Bigger than the page's other buttons - that is what makes it read as the
+    # one action that commits the form rather than a sixth identical button.
+    save_box = save.bounding_box()
+    others = page.locator(
+        "form:not(.settings-form) button[type=submit]")
+    assert others.count() >= 1
+    for i in range(others.count()):
+        other = others.nth(i).bounding_box()
+        if other is None:
+            continue
+        assert save_box["height"] > other["height"], (
+            "the sticky Save is no taller than a secondary button")
+
+    # Still pinned after scrolling to the very bottom.
+    page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
+    box = bar.bounding_box()
+    assert box["y"] + box["height"] <= viewport + 1
+
+    # And the last button on the page is reachable, not buried under the bar.
+    last = page.locator(".backup-form button[type=submit]")
+    last.scroll_into_view_if_needed()
+    last_box = last.bounding_box()
+    assert last_box["y"] + last_box["height"] <= bar.bounding_box()["y"] + 1, (
+        "the last button on the page sits under the fixed save bar")
+
+    _assert_clean(console_errors, "/settings save bar")
+
+
+def test_settings_sticky_save_submits_the_form_from_the_top_of_the_page(
+        page, live_server, console_errors):
+    """Pressing the pinned Save without ever scrolling actually saves."""
+    page.goto(f"{live_server.base}/settings")
+    page.wait_for_load_state("networkidle")
+
+    page.select_option("select[name=timezone]", "Asia/Tokyo")
+    page.click("#settings-save")
+    page.wait_for_load_state("networkidle")
+
+    assert page.locator(
+        "select[name=timezone]").input_value() == "Asia/Tokyo"
+    _assert_clean(console_errors, "/settings sticky save submit")
+
+
+def test_a_rejected_setting_scrolls_its_message_into_view(
+        page, live_server, console_errors):
+    """Submitting from the bottom must not leave the reason off-screen above.
+
+    The per-field alerts render at the top of a page several screens tall. A
+    rider who hits the pinned Save while scrolled to the bottom and has a value
+    rejected would otherwise watch the page reload with no visible explanation
+    - the exact hole the FTP field put them in.
+    """
+    page.goto(f"{live_server.base}/settings")
+    page.wait_for_load_state("networkidle")
+    # 30 W passes the input's own min/max (so the browser really submits) and
+    # is rejected server-side as implausible without a confirmation tick.
+    page.fill("input[name=ftp]", "30")
+    page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
+    page.click("#settings-save")
+    page.wait_for_load_state("networkidle")
+
+    alert = page.locator("#settings-alerts .alert").first
+    box = alert.bounding_box()
+    assert box is not None, "the rejection produced no visible message"
+    assert 0 <= box["y"] <= page.viewport_size["height"], (
+        f"the rejection message is off-screen at y={box['y']}")
+    # The bar says so too, for the no-JavaScript case.
+    assert page.locator('.settings-save-bar a[href="#settings-alerts"]'
+                        ).is_visible()
+
+    _assert_clean(console_errors, "/settings rejected value")
+
+
 def test_settings_persists_the_audio_volume_only_when_the_rider_moves_it(
         page, live_server, console_errors):
     """Opening Settings must write nothing; moving the slider must write.
