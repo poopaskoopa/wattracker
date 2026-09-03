@@ -54,16 +54,20 @@ NAV_PAGES = [
 
 
 # --------------------------------------------------------------- browser
-@pytest.fixture()
+@pytest.fixture(scope="module")
 def browser():
-    """A Chromium for one test. Skips (never errors) if the binary is absent.
+    """One Chromium shared by every test in this module. Skips if absent.
 
-    Deliberately function-scoped, not session-scoped: playwright's sync API
+    Deliberately module-scoped, NOT session-scoped: playwright's sync API
     keeps an asyncio loop marked *running* in the main thread for as long as
     its context manager is open, which makes every later `asyncio.run()` in
     the suite (tests/test_ride_routes.py) blow up with "cannot be called from
-    a running event loop". Entering and exiting per test keeps the leak
-    contained; a launch costs a few hundred ms.
+    a running event loop". Session scope would hold that context manager open
+    across the whole test run and leak into every other module; module scope
+    still closes it -- once, when this module's last test finishes -- which
+    contains the leak exactly the way function scope did, it just amortizes
+    one Chromium launch across all of this module's tests instead of paying
+    for it 36 times.
     """
     with sync_playwright() as pw:
         try:
@@ -84,8 +88,19 @@ def console_errors(page):
 
 @pytest.fixture()
 def page(browser, live_server):
-    """A logged-in page that records console errors and uncaught exceptions."""
+    """A logged-in page that records console errors and uncaught exceptions.
+
+    Signed in by injecting the session cookie `live_server` already captured
+    from its httpx registration call, not by driving the login form -- that
+    real-browser login path has exactly one owner now:
+    test_login_through_the_real_form_signs_the_rider_in.
+    """
     context = browser.new_context(viewport={"width": 1400, "height": 1000})
+    context.add_cookies([{
+        "name": "wattracker_session",
+        "value": live_server.session_cookie,
+        "url": live_server.base,
+    }])
     pg = context.new_page()
     errors = []
     pg._wt_errors = errors
@@ -94,16 +109,6 @@ def page(browser, live_server):
     pg.on("pageerror", lambda e: errors.append(f"pageerror: {e}"))
     pg.on("requestfailed",
           lambda r: errors.append(f"requestfailed: {r.url} {r.failure}"))
-
-    pg.goto(f"{live_server}/login")
-    pg.fill("input[name=username]", USERNAME)
-    pg.fill("input[name=password]", PASSWORD)
-    pg.click("button[type=submit]")
-    pg.wait_for_load_state("networkidle")
-    assert "/login" not in pg.url, "login through the real form failed"
-    # Login lands on the dashboard; don't let its noise be attributed to
-    # whatever page the test itself visits.
-    del errors[:]
     try:
         yield pg
     finally:
@@ -168,6 +173,7 @@ def live_server(tmp_path):
     with httpx.Client(base_url=base, follow_redirects=True, timeout=30) as c:
         r = c.post("/register", data={"username": USERNAME, "password": PASSWORD})
         assert r.status_code == 200, r.text
+        session_cookie = c.cookies["wattracker_session"]
         uid = db.get_user_by_username(USERNAME)["id"]
         _seed_activities(uid, today)
         detail_activity_id = db.insert_activity(
@@ -215,7 +221,8 @@ def live_server(tmp_path):
                                   "plan_year": start.year,
                                   "plan_month": start.month,
                                   "uid": uid,
-                                  "detail_activity_id": detail_activity_id})()
+                                  "detail_activity_id": detail_activity_id,
+                                  "session_cookie": session_cookie})()
     finally:
         server.should_exit = True
         thread.join(timeout=10)
@@ -286,6 +293,27 @@ def _canvas_is_painted(page, canvas_id):
 
 
 # ------------------------------------------------------------------ tests
+def test_login_through_the_real_form_signs_the_rider_in(browser, live_server):
+    """Sole owner of real-browser login-form coverage.
+
+    Every other test's `page` fixture signs in by injecting the session
+    cookie `live_server` captured over HTTP, not by driving the form. This
+    is the one test left that actually fills in and submits the login form
+    in a real browser and asserts it lands the rider off /login.
+    """
+    context = browser.new_context(viewport={"width": 1400, "height": 1000})
+    try:
+        pg = context.new_page()
+        pg.goto(f"{live_server.base}/login")
+        pg.fill("input[name=username]", USERNAME)
+        pg.fill("input[name=password]", PASSWORD)
+        pg.click("button[type=submit]")
+        pg.wait_for_load_state("networkidle")
+        assert "/login" not in pg.url, "login through the real form failed"
+    finally:
+        context.close()
+
+
 def test_activity_detail_combines_and_independently_toggles_series(
         page, live_server, console_errors):
     page.goto(f"{live_server.base}/activity/{live_server.detail_activity_id}")
