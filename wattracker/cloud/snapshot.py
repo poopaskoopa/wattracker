@@ -725,7 +725,7 @@ def _calendar_objects(
     for record in records:
         if int(record["summary"]["id"]) in linked_activity_ids:
             continue
-        day = _utc_date(record["row"]["start_time"])
+        day = _local_date(record["row"]["start_time"], settings)
         if day is None:
             continue
         dates.add(day)

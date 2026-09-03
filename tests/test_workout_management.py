@@ -1,5 +1,7 @@
 """Backend regressions for activity lifecycle and calendar completion state."""
 
+import re
+
 import pytest
 
 pytest.importorskip("httpx")
@@ -90,3 +92,24 @@ def test_calendar_has_unlinked_month_activity_but_not_linked_one(client):
     assert f"/activity/{linked}" not in calendar.text
     assert db.activities_for_month_unlinked(uid, 2026, 8)[0]["id"] == free
     assert linked not in {a["id"] for a in db.activities_for_month_unlinked(uid, 2026, 8)}
+
+
+def test_calendar_places_utc_midnight_crossing_on_local_day_without_cutoff(client):
+    uid = _register(client)
+    activity = db.insert_activity(uid, {
+        "dedup_hash": "local-midnight", "filename": "local-midnight.fit",
+        "start_time": "2026-09-03T00:30:00", "duration_s": 3600,
+        "distance_m": 1, "avg_power": 180, "avg_hr": 120,
+        "np": 180, "if_": .8, "tss": 40, "streams": {"power": [180]},
+    })
+    db.save_user_settings(uid, {"timezone": "America/New_York"})
+
+    html = client.get("/calendar?year=2026&month=9")
+    assert html.status_code == 200
+    cell = re.search(
+        rf'<td class="cal-cell[^>]*>.*?cal-activity.*?/activity/{activity}.*?</td>',
+        html.text,
+        re.S,
+    )
+    assert cell is not None
+    assert re.search(r'<div class="cal-day">2</div>', cell.group(0))
