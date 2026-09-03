@@ -77,10 +77,33 @@ def test_every_self_hosted_job_excludes_fork_pull_requests():
     # A refactor that renames the jobs or restructures the workflows must not
     # quietly reduce this to asserting nothing at all.
     assert sorted(checked) == [
+        "cloud.yml:ios-tests",
         "cloud.yml:tests",
         "windows.yml:package-unsigned",
         "windows.yml:windows-real",
     ]
+
+
+def test_cloud_ios_tests_job_has_required_security_and_test_configuration():
+    text = (WORKFLOW_DIR / "cloud.yml").read_text(encoding="utf-8")
+    jobs = dict(_jobs(text))
+    assert "ios-tests" in jobs
+    ios_job = jobs["ios-tests"]
+
+    assert re.search(r"(?m)^  pull_request:$", text)
+    assert f"if: {FORK_GATE}" in ios_job
+    assert "runs-on: [self-hosted, macOS]" in ios_job
+    assert not re.search(r"(?m)^\s*continue-on-error:\s*true\s*$", ios_job)
+    assert not re.search(r"\|\|\s*true\b", ios_job)
+    assert re.search(
+        r"caffeinate -i -s -w .*Runner\.Worker",
+        ios_job,
+    )
+    assert "xcodebuild test" in ios_job
+    assert "-project ios/WatTracker/WatTracker.xcodeproj" in ios_job
+    assert "-scheme WatTracker" in ios_job
+    assert "-destination 'platform=iOS Simulator,name=iPhone 17 Pro'" in ios_job
+    assert '-derivedDataPath "$RUNNER_TEMP/ios-test-dd"' in ios_job
 
 
 def test_no_workflow_uses_pull_request_target():

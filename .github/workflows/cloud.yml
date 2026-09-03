@@ -104,6 +104,28 @@ jobs:
           PYTHONPATH: ${{ github.workspace }}
         run: .ci-venv/bin/python -m pytest -q
 
+  # Keep iOS coverage on the trusted self-hosted Mac; the guard prevents
+  # untrusted fork code from executing on that runner.
+  ios-tests:
+    if: github.event_name == 'push' || github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: [self-hosted, macOS]
+    timeout-minutes: 30
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      # Keep the laptop awake so simulator tests are not interrupted by sleep.
+      - name: Hold a sleep assertion for the duration of this job
+        run: caffeinate -i -s -w "$(pgrep -x Runner.Worker | head -1)" &
+
+      - name: Run iOS tests
+        run: >-
+          xcodebuild test
+          -project ios/WatTracker/WatTracker.xcodeproj
+          -scheme WatTracker
+          -destination 'platform=iOS Simulator,name=iPhone 17 Pro'
+          -derivedDataPath "$RUNNER_TEMP/ios-test-dd"
+
   # Bicep is declarative and has no access to deployment secrets, so validate it
   # for every pull request, including fork requests. Keep the cloud image build
   # in the separately gated job below because it needs Docker and hosted Linux
