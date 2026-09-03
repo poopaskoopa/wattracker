@@ -523,7 +523,7 @@ final class CloudSessionTests: XCTestCase {
         XCTAssertEqual(second.queryItems["since"], "7")
     }
 
-    func testARouteThatServesNoDeltaIsNeverAskedForOne() async throws {
+    func testActivitiesUseTheirDeltaCheckpointAndRemoveTombstones() async throws {
         let cache = MemorySnapshotCache()
         cache.store(
             CachedCollection(
@@ -536,15 +536,132 @@ final class CloudSessionTests: XCTestCase {
             for: .activities
         )
         let rig = harness(cache: cache) { request, _ in
-            request.url?.path == "/api/v1/context/refresh"
-                ? .json(CloudFixtures.refreshBody(context: "context-1"))
-                : .json(#"{"items":[]}"#)
+            if request.url?.path == "/api/v1/context/refresh" {
+                return .json(CloudFixtures.refreshBody(context: "context-1"))
+            }
+            return .json(CloudFixtures.collection(
+                items: [CloudFixtures.tombstone(
+                    id: "activity-1", kind: "activity", revision: 4
+                )],
+                revision: 4
+            ))
         }
 
         let snapshot = try await rig.session.load(.activities)
         let read = try XCTUnwrap(rig.transport.requests(matching: "/api/v1/context/activities").first)
-        XCTAssertNil(read.queryItems["since"], "activities is not a mobile delta route")
-        XCTAssertTrue(snapshot.items.isEmpty, "a full read replaces rather than merges")
+        XCTAssertEqual(read.queryItems["since"], "3")
+        XCTAssertTrue(snapshot.items.isEmpty, "the activity tombstone removes the cached ride")
+        XCTAssertEqual(snapshot.revision, 4)
+    }
+
+    func testActivityDetailAndStreamsUseObjectRoutesDecodeAndCachePerSession() async throws {
+        let rig = harness { request, _ in
+            switch request.url?.path {
+            case "/api/v1/context/refresh":
+                return .json(CloudFixtures.refreshBody(context: "context-1"))
+            case "/api/v1/context/activities/activity-detail-17":
+                return .json("""
+                {"id":"activity-detail-17","kind":"activity_detail","revision":17,"data":{
+                  "id":17,"start_time":"2026-01-02T18:04:00Z","duration_s":3600,
+                  "distance_m":32100.5,"avg_power":211,"np":225,"if_":0.9,
+                  "tss":81,"rpe":6,"zones":{"power":{"zones":[]}}}}
+                """)
+            case "/api/v1/context/activities/stream-17":
+                return .json("""
+                {"id":"stream-17","kind":"stream","revision":17,"data":{
+                  "streams":{"time":[0,1,2],"power":[180,null,205],
+                             "heartrate":[120,121,123],"altitude":[10,11,12]}}}
+                """)
+            default:
+                return .refused(404)
+            }
+        }
+
+        let detail = try await rig.session.activityDetail(17)
+        XCTAssertEqual(detail.id, 17)
+        XCTAssertEqual(detail.distanceM, 32_100.5)
+        XCTAssertEqual(detail.intensityFactor, 0.9)
+
+        let streams = try await rig.session.activityStreams(17)
+        XCTAssertEqual(streams.streams.power?.count, 3)
+        XCTAssertNil(streams.streams.power?[1])
+        XCTAssertNil(streams.streams.cadence)
+
+        _ = try await rig.session.activityDetail(17)
+        _ = try await rig.session.activityStreams(17)
+        let detailRequests = rig.transport.requests(
+            matching: "/api/v1/context/activities/activity-detail-17"
+        )
+        let streamRequests = rig.transport.requests(
+            matching: "/api/v1/context/activities/stream-17"
+        )
+        XCTAssertEqual(detailRequests.count, 1, "an opened detail stays in the session cache")
+        XCTAssertEqual(streamRequests.count, 1, "an opened stream stays in the session cache")
+        XCTAssertEqual(detailRequests.first?.httpMethod, "GET")
+        XCTAssertEqual(detailRequests.first?.bearerToken, "context-1")
+        XCTAssertEqual(streamRequests.first?.bearerToken, "context-1")
+        XCTAssertEqual(
+            detailRequests.first?.value(forHTTPHeaderField: "Ocp-Apim-Subscription-Key"),
+            CloudFixtures.device.subscriptionKey
+        )
+    }
+
+    func testARejectedContextRetriesAnActivityObjectOnceWithANewToken() async throws {
+        let rig = harness { request, index in
+            if request.url?.path == "/api/v1/context/refresh" {
+                return .json(CloudFixtures.refreshBody(context: "context-\(index)"))
+            }
+            return index == 1 ? .refused(404) : .json("""
+            {"id":"activity-detail-8","kind":"activity_detail","revision":8,
+             "data":{"id":8,"duration_s":1200}}
+            """)
+        }
+
+        let detail = try await rig.session.activityDetail(8)
+        XCTAssertEqual(detail.id, 8)
+        let reads = rig.transport.requests(
+            matching: "/api/v1/context/activities/activity-detail-8"
+        )
+        XCTAssertEqual(reads.count, 2)
+        XCTAssertEqual(reads.first?.bearerToken, "context-0")
+        XCTAssertEqual(reads.last?.bearerToken, "context-2")
+    }
+
+    func testAnInFlightRefreshCannotRestoreAnOldIdentityAfterRePairing() async throws {
+        let gate = RequestGate()
+        let rig = harness { request, _ in
+            switch request.url?.path {
+            case "/api/v1/context/refresh":
+                await gate.wait()
+                return .json(CloudFixtures.refreshBody(context: "context-A"))
+            case "/api/v1/devices/pair":
+                return .json(CloudFixtures.pairingBody(context: "context-B"))
+            default:
+                return .refused(404)
+            }
+        }
+
+        let staleRefresh = Task { try? await rig.session.readerContext() }
+        for _ in 0..<100 {
+            if await gate.arrived > 0 { break }
+            try await Task.sleep(nanoseconds: 1_000_000)
+        }
+        let arrivals = await gate.arrived
+        XCTAssertEqual(arrivals, 1)
+
+        await rig.session.signOut()
+        try await rig.session.pair(code: "NEW-CODE")
+        await gate.openGate()
+
+        let staleContext = await staleRefresh.value
+        XCTAssertNil(staleContext)
+        let currentContext = try await rig.session.readerContext()
+        XCTAssertEqual(currentContext, "context-B")
+        XCTAssertEqual(
+            rig.transport.requests(matching: "/api/v1/context/refresh").count,
+            1,
+            "the new identity keeps the token returned by pairing"
+        )
     }
 
     // MARK: - Offline

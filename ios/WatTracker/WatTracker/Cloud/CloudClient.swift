@@ -167,6 +167,47 @@ struct CloudClient: Sendable {
         return try await send(request, path: route.path)
     }
 
+    /// One activity-owned object. These objects deliberately stay out of the
+    /// activities collection: the summary list remains small, while detail
+    /// and stream payloads are fetched only after the rider opens a ride.
+    func activityDetail(
+        activityID: Int, readerContext: String, device: PairedDevice
+    ) async throws -> CloudItem {
+        try await activityObject(
+            named: "activity-detail-\(activityID)", expectedKind: .activityDetail,
+            readerContext: readerContext, device: device
+        )
+    }
+
+    func activityStreams(
+        activityID: Int, readerContext: String, device: PairedDevice
+    ) async throws -> CloudItem {
+        try await activityObject(
+            named: "stream-\(activityID)", expectedKind: .stream,
+            readerContext: readerContext, device: device
+        )
+    }
+
+    private func activityObject(
+        named objectID: String,
+        expectedKind: CloudKind,
+        readerContext: String,
+        device: PairedDevice
+    ) async throws -> CloudItem {
+        let path = "/api/v1/context/activities/\(objectID)"
+        var request = URLRequest(url: try endpoint(path))
+        request.httpMethod = "GET"
+        request.setValue("Bearer \(readerContext)", forHTTPHeaderField: "Authorization")
+        request.setValue(
+            device.subscriptionKey, forHTTPHeaderField: "Ocp-Apim-Subscription-Key"
+        )
+        let item: CloudItem = try await send(request, path: path)
+        guard item.id == objectID, item.kind == expectedKind else {
+            throw Failure.malformedResponse("\(path) returned the wrong object")
+        }
+        return item
+    }
+
     /// The rider's FTP, as published by their desktop install.
     ///
     /// Kept for #171's on-device round-trip, which is the only evidence the

@@ -411,10 +411,11 @@ struct ActivityStreams: Codable, Sendable, Equatable {
 
 /// What every collection route returns.
 ///
-/// `revision` and `next_cursor` are present only on the three routes that
-/// serve deltas -- `dashboard`, `volume`, `curve`, the ones `api.py` marks
-/// `mobile=True`.  On the others the response is `{"items": [...]}` and there
-/// is no checkpoint to cache against, which is why `CloudRoute` carries that
+/// `revision` and `next_cursor` are present only on the four routes that
+/// serve deltas -- `dashboard`, `volume`, `curve`, `activities`, the ones
+/// `api.py` marks `mobile=True`.  On the others the response is
+/// `{"items": [...]}` and there is no checkpoint to cache against, which is
+/// why `CloudRoute` carries that
 /// distinction as a fact about the route rather than inferring it from a
 /// response that might merely have been truncated.
 struct CollectionResponse: Decodable, Sendable {
