@@ -1,19 +1,31 @@
 {% extends "base.html" %}
 {% block title %}Settings &mdash; wattracker{% endblock %}
+{% block main_class %}has-save-bar{% endblock %}
 {% block content %}
 <h2>Settings</h2>
 
+{# Every per-field rejection renders HERE, at the top of a page that is several
+   screens tall. The Save control is pinned to the bottom of the viewport, so a
+   rider can submit from anywhere - including from far below this block. The
+   wrapper gives that message a name the save bar can link to, and the script
+   at the bottom of this template scrolls it into view when one is present. #}
+{% set cred_is_alert = cred_message and not ('saved (' in cred_message or 'cleared' in cred_message) %}
+{% set settings_alert = refusal_message or cred_is_alert or dir_message
+                        or ftp_message or timezone_message or llm_message
+                        or weight_message %}
+<div id="settings-alerts">
 {% if saved %}<p class="ok">Settings saved.</p>{% endif %}
 {# Refused because of what this session is, not because of what was typed:
    a window opened by a connector device may not issue credentials. #}
 {% if refusal_message %}<p class="alert" role="alert">{{ refusal_message }}</p>{% endif %}
-{% if cred_message %}<p class="{{ 'ok' if 'saved (' in cred_message or 'cleared' in cred_message else 'alert' }}">{{ cred_message }}</p>{% endif %}
+{% if cred_message %}<p class="{{ 'alert' if cred_is_alert else 'ok' }}">{{ cred_message }}</p>{% endif %}
 {% if backup_message %}<p class="{{ 'alert' if 'failed' in backup_message else 'ok' }}">{{ backup_message }}</p>{% endif %}
 {% if dir_message %}<p class="alert">{{ dir_message }}</p>{% endif %}
 {% if ftp_message %}<p class="alert" role="alert">{{ ftp_message }}</p>{% endif %}
 {% if timezone_message %}<p class="alert" role="alert">{{ timezone_message }}</p>{% endif %}
 {% if llm_message %}<p class="alert" role="alert">{{ llm_message }}</p>{% endif %}
 {% if weight_message %}<p class="alert" role="alert">{{ weight_message }}</p>{% endif %}
+</div>
 
 <p class="current-ftp"><strong>Current Training FTP:</strong> {{ current_ftp }} W</p>
 {% set ftp_suggestion_next = '/settings' %}
@@ -26,7 +38,7 @@
    inactivity. External and zFTP estimates may differ because they use different
    activity windows and models. Setting FTP below records a manual entry for today.</p>
 
-<form method="post" action="/settings" class="settings-form">
+<form method="post" action="/settings" class="settings-form" id="settings-form">
     <label>Training FTP ({{ ftp_min }}&ndash;{{ ftp_max }} watts, overrides estimate):
         <input type="number" step="1" min="{{ ftp_min }}" max="{{ ftp_max }}" name="ftp"
                value="{{ ftp_form_value }}">
@@ -184,7 +196,19 @@
                    placeholder="{{ 'leave blank to keep' if api_key_set else 'sk-...' }}">
         </label>
     </fieldset>
-    <button type="submit">Save</button>
+    {# Pinned to the viewport bottom: this commits the whole form, and it is the
+       only control on the page that does, so it must never be the thing the
+       rider has to go looking for. Still a plain nested submit button - the
+       POST and the fields are exactly what they were. #}
+    <div class="settings-save-bar">
+        <div class="settings-save-bar-inner">
+            {% if settings_alert %}
+            <a class="settings-save-note" href="#settings-alerts">Something
+                you entered was not saved &mdash; read the message at the top of the page.</a>
+            {% endif %}
+            <button type="submit" id="settings-save" class="settings-save-btn">Save settings</button>
+        </div>
+    </div>
 </form>
 
 {% if zwift_creds_saved %}
@@ -383,6 +407,20 @@
 {% endblock %}
 
 {% block scripts %}
+<script>
+// The save bar is pinned to the bottom of the viewport, so the form can be
+// submitted from a point several screens below the alerts block that reports a
+// rejected field. Carry the rider back to the message rather than leaving them
+// to guess why nothing appeared to happen. Purely a scroll: submission itself
+// is the plain HTML POST, unchanged, and the bar also links to #settings-alerts
+// so this still works with scripting off.
+(function () {
+    var alerts = document.getElementById("settings-alerts");
+    if (alerts && alerts.querySelector(".alert")) {
+        alerts.scrollIntoView({ block: "start" });
+    }
+})();
+</script>
 <script>
 (function () {
     var DEFAULT_AUDIO_VOLUME = {{ default_audio_cue_volume|tojson }};
