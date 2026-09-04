@@ -57,6 +57,10 @@
 		1A00000000000000000001C9 /* SessionGateTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 1A00000000000000000001B6 /* SessionGateTests.swift */; };
 		1A00000000000000000001CA /* PairingTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 1A00000000000000000001B7 /* PairingTests.swift */; };
 		1A00000000000000000001CB /* AppConfiguration.swift in Sources */ = {isa = PBXBuildFile; fileRef = 1A0000000000000000000033 /* AppConfiguration.swift */; };
+		1A00000000000000000001CC /* PairingScreen.swift in Sources */ = {isa = PBXBuildFile; fileRef = 1A00000000000000000001B2 /* PairingScreen.swift */; };
+		1A00000000000000000001CD /* QRCodeScanner.swift in Sources */ = {isa = PBXBuildFile; fileRef = 1A00000000000000000001B3 /* QRCodeScanner.swift */; };
+		1A00000000000000000001CE /* Palette.swift in Sources */ = {isa = PBXBuildFile; fileRef = 1A0000000000000000000098 /* Palette.swift */; };
+		1A00000000000000000001CF /* Panel.swift in Sources */ = {isa = PBXBuildFile; fileRef = 1A0000000000000000000099 /* Panel.swift */; };
 /* End PBXBuildFile section */
 
 /* Begin PBXFileReference section */
@@ -399,6 +403,10 @@
 				1A00000000000000000001C9 /* SessionGateTests.swift in Sources */,
 				1A00000000000000000001CA /* PairingTests.swift in Sources */,
 				1A00000000000000000001CB /* AppConfiguration.swift in Sources */,
+				1A00000000000000000001CC /* PairingScreen.swift in Sources */,
+				1A00000000000000000001CD /* QRCodeScanner.swift in Sources */,
+				1A00000000000000000001CE /* Palette.swift in Sources */,
+				1A00000000000000000001CF /* Panel.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};

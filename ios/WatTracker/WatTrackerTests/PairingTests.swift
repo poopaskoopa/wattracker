@@ -106,4 +106,51 @@ final class PairingTests: XCTestCase {
         XCTAssertNotEqual(skewed, PairingFailureMessage.codeRefused)
         XCTAssertTrue(skewed.contains("600"))
     }
+
+    // MARK: - What the camera says when it is not looking at a code
+
+    @MainActor
+    func testABarcodeThatIsNotAPairingCodeSaysSoRatherThanNothing() {
+        let model = PairingModel()
+
+        model.scanned("WIFI:S=router;T=WPA;P=hunter2;;", gate: PairingTests.gate())
+
+        XCTAssertNotNil(
+            model.scanHint,
+            "a scan that is dropped without feedback looks like a broken scanner"
+        )
+        // The hint is about the barcode in front of the camera, never about a
+        // code's fate on the server: nothing was sent, so there is nothing to
+        // leak, and it must not be mistaken for a verdict either.
+        XCTAssertNil(model.message)
+        XCTAssertEqual(model.code, "")
+    }
+
+    @MainActor
+    func testAWellShapedScanClearsTheHintAndIsAccepted() {
+        let model = PairingModel()
+        model.scanned("not-a-code", gate: PairingTests.gate())
+        XCTAssertNotNil(model.scanHint)
+
+        model.scanned("abcd-efgh-jkmn", gate: PairingTests.gate())
+
+        XCTAssertNil(model.scanHint)
+        XCTAssertEqual(model.code, "ABCD-EFGH-JKMN")
+    }
+
+    @MainActor
+    private static func gate() -> SessionGate {
+        SessionGate(makeSession: { CloudSession(
+            client: CloudClient(
+                baseURL: URL(string: "https://api.example.invalid")!,
+                signer: StubSigner(),
+                transport: ScriptedTransport { _, _ in
+                    throw URLError(.notConnectedToInternet)
+                }
+            ),
+            credentials: MemoryDeviceCredentialStore(device: nil),
+            cache: MemorySnapshotCache()
+        ) })
+    }
 }
+

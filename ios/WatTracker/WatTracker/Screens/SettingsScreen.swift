@@ -114,10 +114,7 @@ struct SettingsScreen: View {
                         .foregroundStyle(Palette.muted)
                 } else {
                     ForEach(devices, id: \.credentialID) { device in
-                        row(
-                            device.label ?? "Unnamed device",
-                            SettingsModel.lastSeen(device.lastSeenAt)
-                        )
+                        deviceRow(device)
                     }
                 }
             }
@@ -185,7 +182,31 @@ struct SettingsScreen: View {
         }
     }
 
-    private func row(_ label: String, _ value: String, monospaced: Bool = false) -> some View {
+    /// One device, and whether it still has access.
+    ///
+    /// The revoked flag is rendered rather than dropped because the server
+    /// goes out of its way to send it: `/api/v1/devices` lists revoked
+    /// credentials on purpose and flags them, so that "did the revocation
+    /// stick?" -- the question the rider asks immediately after revoking
+    /// something -- has an answer on screen. Showing a revoked phone in the
+    /// same style as a live one answers it wrongly, on the one screen where
+    /// being wrong about who has access matters.
+    @ViewBuilder
+    private func deviceRow(_ device: CloudDevice) -> some View {
+        let name = device.label ?? "Unnamed device"
+        if device.revoked {
+            row(name, "Removed \u{2014} no longer has access", style: Palette.muted)
+        } else {
+            row(name, SettingsModel.lastSeen(device.lastSeenAt))
+        }
+    }
+
+    private func row(
+        _ label: String,
+        _ value: String,
+        monospaced: Bool = false,
+        style: Color? = nil
+    ) -> some View {
         // Not a `Grid`: the value column is the one that has to wrap on a
         // narrow iPad window, and a grid would either clip it or force the
         // label column wider than it needs to be.
@@ -196,7 +217,7 @@ struct SettingsScreen: View {
                 .frame(width: 96, alignment: .leading)
             Text(value)
                 .font(monospaced ? .caption.monospaced() : .callout)
-                .foregroundStyle(Palette.text)
+                .foregroundStyle(style ?? Palette.text)
                 .frame(maxWidth: .infinity, alignment: .leading)
                 .fixedSize(horizontal: false, vertical: true)
         }
