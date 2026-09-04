@@ -185,9 +185,17 @@ jobs:
         uses: actions/checkout@v4
 
       - name: Build cloud image
-        run: docker build --file Dockerfile.cloud --tag wattracker-cloud:ci .
+        run: docker buildx build --platform linux/amd64 --load --file Dockerfile.cloud --tag wattracker-cloud:ci .
 
       - name: Verify cloud imports in image
         run: >-
           docker run --rm --entrypoint python wattracker-cloud:ci
-          -c "import azure.data.tables, azure.identity, azure.storage.blob, cryptography; import wattracker.cloud.runtime"
+          -c "import azure.data.tables, azure.identity, azure.storage.blob, cryptography; import wattracker.cloud.api; import wattracker.cloud.runtime"
+
+      - name: Inspect cloud image
+        run: >-
+          docker image inspect wattracker-cloud:ci
+          --format 'image={{.Id}} size_bytes={{.Size}}'
+
+      - name: Inspect base image provenance
+        run: docker buildx imagetools inspect python:3.12-slim

@@ -542,8 +542,10 @@ What stays disabled needs something CI cannot supply. The Windows *test* job is
 gated to keep a duplicate of the suite off the single physical box; the
 signed-release workflows (`windows-release.yml`, `macos-release.yml`) fire only
 on a `v*` tag and are gated for want of a code-signing certificate, so every
-shipped binary is still an unsigned local build. The containerized cloud
-checks need billable Linux minutes. Windows executables must be built on
+shipped binary is still an unsigned local build. The containerized cloud checks
+run on hosted ubuntu-latest Linux and build the linux/amd64 image, verify its
+cloud imports, and report image/base provenance; Azure-backed startup still
+needs a protected deployment environment. Windows executables must be built on
 Windows. Real BLE hardware and production signing cannot be verified here; use
 [the Windows BLE checklist](docs/windows-ble-validation.md).
 

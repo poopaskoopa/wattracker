@@ -591,14 +591,19 @@ HTTP checks are unverified locally. The `EXIT` trap cleans up the temporary
 container and response file after either a successful or failed attempt; if
 startup fails, use `docker logs wattracker-cloud-verify` before exit.
 
-CI enforcement options: a PR job can run the build, imports, and image/base
-inspection without Azure credentials, which catches Dockerfile and dependency
-regressions but cannot prove runtime Azure access or HTTP behavior. A separate
-manual or protected-environment deployment smoke test can run the startup and
-`GET /` refusal check with managed identity, but it adds cloud cost, credential
-scope, and environment coordination. Keep the currently disabled containerized
-job in `.github/workflows/cloud.yml` unchanged until one of those tradeoffs is
-explicitly accepted.
+The enabled `containerized` PR job runs this build explicitly for
+`linux/amd64`, verifies the in-image cloud imports, and prints the built image's
+ID and size plus the `python:3.12-slim` base-image manifest/provenance. It does
+not have Azure credentials or managed identity, so it cannot prove
+Azure-backed startup or the unauthenticated `GET /` refusal. Those checks
+remain unverified locally unless run in a real deployment environment.
+
+CI enforcement options: the PR job provides hosted, credential-free coverage
+for Dockerfile, dependency, image-size, and base-provenance regressions. A
+separate manual or protected-environment deployment smoke test can run the
+startup and `GET /` refusal check with managed identity, but it adds cloud cost,
+credential scope, and environment coordination. Keep that runtime smoke test
+separate from the PR job unless one of those tradeoffs is explicitly accepted.
 
 ## Operations and cost
 
