@@ -55,7 +55,7 @@ from wattracker.cloud.security import (  # noqa: E402
     generate_signing_keypair,
     sign_request_ed25519,
 )
-from wattracker.cloud.snapshot import profile_batch  # noqa: E402
+from wattracker.cloud.snapshot import SnapshotError, snapshot_publish_pages  # noqa: E402
 
 OPERATOR_SUBJECT = "walking-skeleton-operator"
 
@@ -193,38 +193,66 @@ def signed_headers(
     }
 
 
-def publish_profile(server: LocalServer, enrolled: dict, private_key: bytes,
-                    db_path: Path, user_id: int) -> float:
-    batch = profile_batch(
-        db_path, user_id, batch_id="walking-skeleton-profile", revision=1
+def publish_snapshot(server: LocalServer, enrolled: dict, private_key: bytes,
+                     db_path: Path, user_id: int) -> float:
+    # A rider with enough activities pushes the derived objects (profile,
+    # training_state, load_point, curve, ...) past a single page: those
+    # objects come after every activity/activity-detail object in
+    # ``snapshot_objects``'s fixed, offset-addressable order. Paging here
+    # keeps them from being silently truncated off a one-batch publish.
+    try:
+        batches = snapshot_publish_pages(
+            db_path, user_id, batch_id="walking-skeleton-snapshot", revision=1,
+        )
+    except SnapshotError as exc:
+        raise SystemExit(
+            f"could not page the snapshot for user {user_id} in {db_path}: {exc}"
+        )
+
+    # Resolve FTP, and refuse to publish anything, before posting a single
+    # batch: the iOS FTP round-trip debug screen reads it off the ``profile``
+    # object (CloudClient.fetchFTPWatts), so this is the same value the rider
+    # will see on the device, and a partial publish followed by "nothing to
+    # publish" would be a worse failure than not publishing at all.
+    ftp_watts = next(
+        (
+            obj.data["ftp"]
+            for batch in batches
+            for obj in batch.objects
+            if obj.kind == "profile" and obj.data.get("ftp") is not None
+        ),
+        None,
     )
-    if batch is None:
+    if ftp_watts is None:
         raise SystemExit(
             f"user {user_id} has no FTP in {db_path}: nothing to publish. "
             "Set one on the desktop, or pass --user-id for a rider who has."
         )
-    body = json.dumps(
-        {
-            "batch_id": batch.batch_id,
-            "revision": batch.revision,
-            "objects": [item.wire() for item in batch.objects],
-        },
-        sort_keys=True,
-        separators=(",", ":"),
-        ensure_ascii=False,
-    ).encode("utf-8")
-    result = post(
-        f"{server.base_url}/api/v1/sync/batches",
-        signed_headers(
-            enrolled, private_key,
-            method="POST", path="/api/v1/sync/batches", body=body,
-            idempotency_key=batch.batch_id, revision=str(batch.revision),
-        ),
-        body,
-    )
-    if result.get("accepted") != 1:
-        raise SystemExit(f"the server did not accept the profile: {result}")
-    return float(batch.objects[0].data["ftp_watts"])
+
+    for batch in batches:
+        body = json.dumps(
+            {
+                "batch_id": batch.batch_id,
+                "revision": batch.revision,
+                "objects": [item.wire() for item in batch.objects],
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=False,
+        ).encode("utf-8")
+        result = post(
+            f"{server.base_url}/api/v1/sync/batches",
+            signed_headers(
+                enrolled, private_key,
+                method="POST", path="/api/v1/sync/batches", body=body,
+                idempotency_key=batch.batch_id, revision=str(batch.revision),
+            ),
+            body,
+        )
+        if result.get("accepted") != len(batch.objects):
+            raise SystemExit(f"the server did not accept the snapshot: {result}")
+
+    return float(ftp_watts)
 
 
 def mint_pairing_code(server: LocalServer, enrolled: dict, private_key: bytes) -> dict:
@@ -257,7 +285,7 @@ def main() -> int:
     server = LocalServer(args.host, args.port)
     server.start()
     enrolled, private_key = enroll_writer(server)
-    ftp_watts = publish_profile(
+    ftp_watts = publish_snapshot(
         server, enrolled, private_key, args.db, args.user_id
     )
     codes = [
