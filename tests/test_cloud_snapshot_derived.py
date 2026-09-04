@@ -4,13 +4,17 @@ import datetime as dt
 import json
 import sqlite3
 
+import pytest
+
 from wattracker import db
 from wattracker.cloud.models import SyncBatch
 from wattracker.cloud.snapshot import (
     DETAIL_MAX_POINTS,
+    SnapshotError,
     _calendar_day_objects,
     snapshot_batch,
     snapshot_objects,
+    snapshot_publish_pages,
 )
 
 
@@ -122,6 +126,53 @@ def test_derived_snapshot_round_trips_all_kinds_and_keeps_streams_opt_in(tmp_pat
     assert [obj.object_id for obj in round_tripped.objects] == [
         obj.object_id for obj in objects
     ]
+
+
+def test_snapshot_publish_pages_keeps_derived_objects_past_one_page(tmp_path):
+    # A small ``limit`` forces multiple pages off the same two-activity
+    # fixture, exercising the paging logic without a slow 500-activity
+    # database: activity + activity-detail objects alone already outrun it.
+    path, user_id = _fixture_db(tmp_path)
+
+    batches = snapshot_publish_pages(
+        path, user_id, batch_id="paged", revision=1, limit=3,
+    )
+
+    assert len(batches) > 1
+    assert all(len(batch.objects) <= 3 for batch in batches)
+    assert [batch.batch_id for batch in batches] == [
+        f"paged-{index}" for index in range(1, len(batches) + 1)
+    ]
+    assert [batch.revision for batch in batches] == list(
+        range(1, len(batches) + 1)
+    )
+    kinds = {obj.kind for batch in batches for obj in batch.objects}
+    assert {"profile", "training_state", "load_point", "curve"} <= kinds
+    object_ids = [obj.object_id for batch in batches for obj in batch.objects]
+    assert len(object_ids) == len(set(object_ids))
+
+
+def test_snapshot_publish_pages_bounds_a_pathological_walk(tmp_path):
+    path, user_id = _fixture_db(tmp_path)
+
+    with pytest.raises(SnapshotError):
+        snapshot_publish_pages(
+            path, user_id, batch_id="paged", revision=1, limit=1, max_pages=2,
+        )
+
+
+def test_snapshot_publish_pages_allows_an_exact_page_boundary(tmp_path):
+    # A snapshot that ends exactly on the last allowed page is complete, not
+    # runaway. Paging it must succeed rather than raise on the bound.
+    path, user_id = _fixture_db(tmp_path)
+    total = len(snapshot_objects(path, user_id))
+
+    batches = snapshot_publish_pages(
+        path, user_id, batch_id="paged", revision=1, limit=1, max_pages=total,
+    )
+
+    assert len(batches) == total
+    assert sum(len(batch.objects) for batch in batches) == total
 
 
 def test_snapshot_pages_flattened_derived_objects_without_duplicates(tmp_path):
