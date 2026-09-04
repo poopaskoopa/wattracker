@@ -59,13 +59,15 @@ struct CloudClient: Sendable {
     /// The code is the authorization: this request carries no signature,
     /// because there is not yet a credential to sign with.  What it does carry
     /// is the public half of the key every later request is signed with.
-    func pair(code: String) async throws -> PairingResult {
+    func pair(code: String, label: String? = nil) async throws -> PairingResult {
         let path = "/api/v1/devices/pair"
-        let body = try JSONSerialization.data(withJSONObject: [
+        var bodyObject: [String: Any] = [
             "code": code,
             "public_key": signer.publicKeyX963.hexString,
             "signature_algorithm": "ecdsa-p256-sha256",
-        ])
+        ]
+        if let label { bodyObject["label"] = label }
+        let body = try JSONSerialization.data(withJSONObject: bodyObject)
         var request = URLRequest(url: try endpoint(path))
         request.httpMethod = "POST"
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
@@ -85,7 +87,53 @@ struct CloudClient: Sendable {
         )
     }
 
-    // MARK: - POST /api/v1/context/refresh
+    func devices(for device: PairedDevice) async throws -> [CloudDevice] {
+        let path = "/api/v1/devices"
+        let request = try signedWriterRequest(
+            method: "GET", path: path, device: device, idempotencyKey: "device-list"
+        )
+        let response: DeviceListResponse = try await sendReturningResponse(
+            request, path: path
+        ).0
+        return response.devices
+    }
+
+    func revoke(credentialID: String, for device: PairedDevice) async throws {
+        let path = "/api/v1/devices/\(credentialID)/revoke"
+        let request = try signedWriterRequest(
+            method: "POST", path: path, device: device, idempotencyKey: "device-revoke"
+        )
+        let response: DeviceRevokeResponse = try await sendReturningResponse(
+            request, path: path
+        ).0
+        guard response.revoked else {
+            throw Failure.malformedResponse("\(path) did not revoke the device")
+        }
+    }
+
+    // MARK: - Signed device administration
+
+    private func signedWriterRequest(
+        method: String, path: String, device: PairedDevice, idempotencyKey: String
+    ) throws -> URLRequest {
+        let timestamp = String(Int(clock().timeIntervalSince1970))
+        let nonce = try Self.freshNonce()
+        let canonical = try CanonicalRequest.bytes(
+            method: method, path: path, namespace: device.signingNamespace,
+            timestamp: timestamp, nonce: nonce, bodyDigest: CanonicalRequest.digestBody(Data()),
+            idempotencyKey: idempotencyKey, revision: "0"
+        )
+        var request = URLRequest(url: try endpoint(path))
+        request.httpMethod = method
+        request.setValue(device.credentialID, forHTTPHeaderField: "X-Writer-Credential")
+        request.setValue(timestamp, forHTTPHeaderField: "X-Writer-Timestamp")
+        request.setValue(nonce, forHTTPHeaderField: "X-Writer-Nonce")
+        request.setValue(idempotencyKey, forHTTPHeaderField: "X-Writer-Idempotency-Key")
+        request.setValue("0", forHTTPHeaderField: "X-Writer-Revision")
+        request.setValue(try signer.signature(over: canonical).hexString, forHTTPHeaderField: "X-Writer-Signature")
+        request.setValue(device.subscriptionKey, forHTTPHeaderField: "Ocp-Apim-Subscription-Key")
+        return request
+    }
 
     /// What a refresh produced, and what the server's clock said while doing it.
     struct RefreshOutcome: Sendable {
@@ -96,8 +144,9 @@ struct CloudClient: Sendable {
 
     /// Trade the device credential for a fresh reader context.
     ///
-    /// This is the only request the client signs, and the reason the canonical
-    /// request has to be byte-exact.  Its envelope is fixed by the server:
+    /// The refresh envelope is fixed by the server, as are the device-list and
+    /// revoke envelopes above. Every canonical request has to be byte-exact.
+    /// Refresh carries:
     /// no body, the idempotency key `context-refresh`, and an EMPTY revision
     /// string that still contributes a zero length to the framing.
     func refreshReaderContext(for device: PairedDevice) async throws -> RefreshOutcome {
