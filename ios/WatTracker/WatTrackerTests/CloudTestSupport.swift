@@ -113,9 +113,13 @@ actor RequestGate {
     private var waiting: [CheckedContinuation<Void, Never>] = []
     private var open = false
     private(set) var arrived = 0
+    private var arrivalWaiters: [CheckedContinuation<Void, Never>] = []
 
     func wait() async {
         arrived += 1
+        let pending = arrivalWaiters
+        arrivalWaiters = []
+        for continuation in pending { continuation.resume() }
         if open { return }
         await withCheckedContinuation { waiting.append($0) }
     }
@@ -125,6 +129,39 @@ actor RequestGate {
         let pending = waiting
         waiting = []
         for continuation in pending { continuation.resume() }
+    }
+
+    private func signalArrival() async {
+        if arrived > 0 { return }
+        await withCheckedContinuation { arrivalWaiters.append($0) }
+    }
+
+    /// `withCheckedContinuation` is not cancellation-aware, so cancelling the
+    /// losing side of the race in `waitForArrival` cannot unstick a suspended
+    /// `signalArrival()` call on its own -- this drains and resumes whatever
+    /// is still pending so that side can actually finish. Take-then-clear,
+    /// same as `wait()`, so a continuation is never resumed twice.
+    private func releaseArrivalWaiters() {
+        let pending = arrivalWaiters
+        arrivalWaiters = []
+        for continuation in pending { continuation.resume() }
+    }
+
+    /// Deterministic replacement for spin-polling `arrived`: suspends until a
+    /// request reaches this gate, or returns `false` if none does within
+    /// `timeout`.
+    nonisolated func waitForArrival(timeout: TimeInterval = 5) async -> Bool {
+        await withTaskGroup(of: Bool.self) { group in
+            group.addTask { await self.signalArrival(); return true }
+            group.addTask {
+                try? await Task.sleep(nanoseconds: UInt64(timeout * 1_000_000_000))
+                return false
+            }
+            let arrived = await group.next() ?? false
+            group.cancelAll()
+            await self.releaseArrivalWaiters()
+            return arrived
+        }
     }
 }
 

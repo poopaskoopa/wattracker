@@ -149,12 +149,8 @@ final class CloudSessionTests: XCTestCase {
             return collected
         }
 
-        var spins = 0
-        while spins < 1_000 {
-            if await gate.arrived > 0 { break }
-            await Task.yield()
-            spins += 1
-        }
+        let arrived = await gate.waitForArrival()
+        XCTAssertTrue(arrived, "no readerContext call reached the gate")
         await gate.openGate()
 
         let values = try await tokens
@@ -304,12 +300,8 @@ final class CloudSessionTests: XCTestCase {
             return collected
         }
 
-        var spins = 0
-        while spins < 1_000 {
-            if await gate.arrived > 0 { break }
-            await Task.yield()
-            spins += 1
-        }
+        let arrived = await gate.waitForArrival()
+        XCTAssertTrue(arrived, "no readerContext call reached the gate")
         await gate.openGate()
 
         let values = await outcomes
@@ -655,13 +647,10 @@ final class CloudSessionTests: XCTestCase {
             }
         }
 
-        var spins = 0
-        while await gate.arrived == 0 && spins < 1_000 {
-            await Task.yield()
-            spins += 1
-        }
-        let arrived = await gate.arrived
-        XCTAssertEqual(arrived, 1)
+        let arrived = await gate.waitForArrival()
+        XCTAssertTrue(arrived, "pairing request did not reach its gate")
+        let arrivalCount = await gate.arrived
+        XCTAssertEqual(arrivalCount, 1)
         await rig.session.signOut()
         await gate.openGate()
 
@@ -770,30 +759,24 @@ final class CloudSessionTests: XCTestCase {
             return .refused(404)
         }
         let read = Task { try await rig.session.load(.dashboard) }
-        var spins = 0
-        while await readGate.arrived == 0 && spins < 1_000 {
-            await Task.yield()
-            spins += 1
-        }
-        guard await readGate.arrived == 1 else {
+        guard await readGate.waitForArrival() else {
             XCTFail("dashboard read did not reach its gate")
             await readGate.openGate()
             return
         }
+        let readArrivalCount = await readGate.arrived
+        XCTAssertEqual(readArrivalCount, 1)
 
         let removal = Task { try await rig.session.removeDevice() }
-        spins = 0
-        while await revokeGate.arrived == 0 && spins < 1_000 {
-            await Task.yield()
-            spins += 1
-        }
-        guard await revokeGate.arrived == 1 else {
+        guard await revokeGate.waitForArrival() else {
             XCTFail("revoke did not reach its gate")
             await revokeGate.openGate()
             await readGate.openGate()
             _ = try? await removal.value
             return
         }
+        let revokeArrivalCount = await revokeGate.arrived
+        XCTAssertEqual(revokeArrivalCount, 1)
 
         await readGate.openGate()
         do {
