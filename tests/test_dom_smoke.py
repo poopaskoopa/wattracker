@@ -368,6 +368,38 @@ def test_calendar_workout_click_opens_modal_with_drawn_profile(page, live_server
     _assert_clean(console_errors, "/calendar + workout modal")
 
 
+def test_plan_workout_preview_hides_just_ride_controls(page, live_server,
+                                                        console_errors):
+    """Plan mode previews its selected workout without exposing Just Ride inputs."""
+    page.goto(f"{live_server.base}/ride")
+    page.wait_for_load_state("networkidle")
+
+    assert page.locator("#justRideMode").is_hidden()
+    assert page.locator("#rideTypeSelect").is_hidden()
+    assert page.locator("#rideDurationSelect").is_hidden()
+
+    options = page.locator('#workoutSelect option[value]:not([value=""])')
+    assert options.count() > 0, "live plan rendered no selectable workouts"
+    workout_id = options.first.get_attribute("value")
+    page.select_option("#workoutSelect", workout_id)
+    page.wait_for_selector("#planPreview:not([hidden])", timeout=10_000)
+    page.wait_for_selector("#planPreview svg.profile-svg", timeout=10_000)
+
+    geom = _svg_has_geometry(page, "#planPreview svg.profile-svg")
+    assert geom["ok"], f"planned workout preview has no drawn geometry: {geom}"
+    preview_text = page.locator("#planPreview").inner_text()
+    assert "Duration" in preview_text
+    assert "Intensity" in preview_text
+    assert "TSS" in preview_text
+
+    page.get_by_role("button", name="Just ride", exact=True).click()
+    page.wait_for_selector("#justRideMode:not([hidden])", timeout=10_000)
+    assert page.locator("#rideTypeSelect").is_visible()
+    assert page.locator("#rideDurationSelect").is_visible()
+    assert page.locator("#planPreview").is_hidden()
+    _assert_clean(console_errors, "/ride Plan workout preview")
+
+
 def test_just_ride_variant_cards_render_and_select(page, live_server,
                                                    console_errors):
     """Every Just Ride focus renders all of its accessible, drawn variants."""

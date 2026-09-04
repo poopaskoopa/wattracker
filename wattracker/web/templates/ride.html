@@ -30,6 +30,8 @@
                 {% endfor %}
             </select>
         </label>
+        <div id="planPreview" class="ride-preview plan-workout-preview"
+             aria-live="polite" hidden></div>
     </div>
     <div id="justRideMode" class="just-ride-layout" hidden>
         <div class="just-ride-controls">
@@ -1094,6 +1096,88 @@
         wrap.appendChild(table);
         box.appendChild(wrap);
     }
+    function renderPlanPreview(data) {
+        var box = document.getElementById("planPreview");
+        box.replaceChildren();
+        box.hidden = false;
+
+        var title = document.createElement("h3");
+        title.textContent = data.name || "Planned workout";
+        box.appendChild(title);
+
+        var meta = document.createElement("p");
+        meta.className = "ride-preview-meta";
+        var intensity = data.type
+            ? String(data.type).replace(/[_-]+/g, " ")
+            : "planned workout";
+        var tss = data.tss == null ? "—" : data.tss;
+        var ftp = data.ftp == null ? "—" : data.ftp;
+        meta.textContent = "Duration " + fmtClock(data.duration_s) + " · Intensity " +
+            intensity + " · " + tss + " TSS · FTP " + ftp + " W";
+        box.appendChild(meta);
+
+        var graph = profileSvgNode(data.profile, data.duration_s, data.ftp);
+        if (graph) box.appendChild(graph);
+
+        if (data.description) {
+            var description = document.createElement("p");
+            description.className = "ride-preview-this";
+            description.textContent = data.description;
+            box.appendChild(description);
+        }
+
+        var wrap = document.createElement("div");
+        wrap.className = "table-scroll";
+        var table = document.createElement("table");
+        var head = document.createElement("thead");
+        var headerRow = document.createElement("tr");
+        ["Segment", "Duration", "Watts"].forEach(function (label) {
+            cell(headerRow, label, "th");
+        });
+        head.appendChild(headerRow);
+        table.appendChild(head);
+        var body = document.createElement("tbody");
+        (data.segments || []).forEach(function (seg) {
+            var row = document.createElement("tr");
+            cell(row, seg.label);
+            cell(row, fmtClock(seg.duration_s));
+            cell(row, seg.free
+                ? "max effort"
+                : seg.watts_on != null
+                ? seg.watts_on + " W on / " + seg.watts_off + " W easy"
+                : seg.watts != null
+                ? seg.watts + " W"
+                : wattRange(seg.watts_low, seg.watts_high));
+            body.appendChild(row);
+        });
+        table.appendChild(body);
+        wrap.appendChild(table);
+        box.appendChild(wrap);
+    }
+    function clearPlanPreview() {
+        var box = document.getElementById("planPreview");
+        box.replaceChildren();
+        box.hidden = true;
+    }
+    var planPreviewToken = 0;
+    function loadPlanPreview() {
+        var token = ++planPreviewToken;
+        var workoutID = document.getElementById("workoutSelect").value;
+        if (justRide() || !workoutID) {
+            clearPlanPreview();
+            return;
+        }
+        clearPlanPreview();
+        fetch("/api/plan/workout/" + encodeURIComponent(workoutID))
+            .then(function (resp) { return resp.ok ? resp.json() : null; })
+            .then(function (data) {
+                if (token !== planPreviewToken || justRide()) return;
+                if (data) renderPlanPreview(data);
+            })
+            .catch(function () {
+                if (token === planPreviewToken) clearPlanPreview();
+            });
+    }
     // Every call invalidates the requests before it. The fetch is async but
     // setupWorkout is destructive — it retitles the heading and rebuilds the
     // chart — so a response that lands after the rider switched back to Plan
@@ -1160,6 +1244,7 @@
         var just = justRide();
         document.getElementById("planMode").hidden = just;
         document.getElementById("justRideMode").hidden = !just;
+        loadPlanPreview();
         loadPreview();
         showSelectedWorkoutTitle();
         scheduleConfigReconnect();
@@ -1973,9 +2058,11 @@
     });
     document.getElementById("workoutSelect").addEventListener("change", function () {
         showSelectedWorkoutTitle();
+        loadPlanPreview();
         scheduleConfigReconnect();
     });
     showSelectedWorkoutTitle();
+    loadPlanPreview();
     document.getElementById("rideTypeSelect").addEventListener("change", function () {
         selectedVariant = "classic";
         loadPreview();

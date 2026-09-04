@@ -449,6 +449,8 @@ def test_ride_page_just_ride_controls_preview_and_telemetry_locking(client, monk
     assert 'aria-pressed="true" aria-controls="planMode"' in text
     assert 'aria-pressed="false" aria-controls="justRideMode"' in text
     assert 'type="radio"' not in text
+    assert 'id="planPreview" class="ride-preview plan-workout-preview"' in text
+    assert 'id="justRideMode" class="just-ride-layout" hidden' in text
     assert 'id="justRideMode" class="just-ride-layout"' in text
     assert 'id="rideVariantPicker" class="ride-variant-picker"' in text
     assert 'id="rideVariantGrid" class="ride-variant-grid"' in text
@@ -465,6 +467,9 @@ def test_ride_page_just_ride_controls_preview_and_telemetry_locking(client, monk
     assert "document.importNode(parsed.documentElement, true)" in text
     assert 'className = "ride-preview-graph"' in text
     assert 'className = "table-scroll"' in text
+    assert "function renderPlanPreview(data)" in text
+    assert "function loadPlanPreview()" in text
+    assert 'fetch("/api/plan/workout/" + encodeURIComponent(workoutID))' in text
 
     # Connected/zero-power leaves setup controls available; first positive
     # telemetry frame locks them for the remainder of the active ride.
