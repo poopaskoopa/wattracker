@@ -280,10 +280,12 @@ actor CloudSession {
     }
 
     func devices() async throws -> [CloudDevice] {
-        guard state != .removed else { throw Failure.deviceRemoved }
-        guard state == .paired, let device else { throw Failure.notPaired }
+        let readDevice = try activeDevice()
+        let readLifecycleGeneration = lifecycleGeneration
         do {
-            return try await client.devices(for: device)
+            let devices = try await client.devices(for: readDevice)
+            try validate(readDevice, lifecycleGeneration: readLifecycleGeneration)
+            return devices
         } catch {
             throw classify(error)
         }

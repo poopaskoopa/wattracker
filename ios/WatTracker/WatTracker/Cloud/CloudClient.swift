@@ -111,10 +111,6 @@ struct CloudClient: Sendable {
         }
     }
 
-    func revoke(credentialID: String, device: PairedDevice) async throws {
-        try await revoke(credentialID: credentialID, for: device)
-    }
-
     // MARK: - Signed device administration
 
     private func signedWriterRequest(
