@@ -804,6 +804,7 @@ button.danger.link-btn { border: none; color: var(--alert); }
 .ride-mode-button:disabled { opacity: 0.55; cursor: not-allowed; }
 .just-ride-layout { display: grid; grid-template-columns: minmax(180px, 0.7fr) minmax(300px, 1.3fr);
     gap: 1rem; align-items: start; }
+.just-ride-layout[hidden] { display: none; }
 .just-ride-controls { display: flex; flex-direction: column; gap: 0.65rem; }
 .just-ride-results { min-width: 0; }
 .just-ride-controls-hint { margin: 0.15rem 0 0; line-height: var(--lh-base); }
