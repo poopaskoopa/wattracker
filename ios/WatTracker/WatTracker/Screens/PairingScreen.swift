@@ -127,9 +127,14 @@ struct PairingScreen: View {
                     .aspectRatio(4 / 3, contentMode: .fit)
                     .frame(maxWidth: .infinity)
                     .clipShape(.rect(cornerRadius: 10))
-                    Text("Hold the code shown on your computer inside the frame.")
-                        .font(.caption)
-                        .foregroundStyle(Palette.muted)
+                    Text(
+                        model.scanHint
+                            ?? "Hold the code shown on your computer inside the frame."
+                    )
+                    .font(.caption)
+                    .foregroundStyle(model.scanHint == nil ? Palette.muted : Palette.accent)
+                    .fixedSize(horizontal: false, vertical: true)
+                    .accessibilityIdentifier("pairing-scan-hint")
                 case .undetermined:
                     Text(
                         "WatTracker can read the pairing code with the camera so you do not "
@@ -189,6 +194,14 @@ final class PairingModel {
     var code: String = ""
     private(set) var isWorking = false
     private(set) var message: String?
+    /// What the camera is seeing, when that is not a pairing code.
+    ///
+    /// Kept apart from `message` deliberately. `message` is what came back
+    /// from an attempt; this is a statement about a barcode that was never
+    /// sent anywhere, so it can say exactly what happened without being an
+    /// oracle for anything. Merging the two would put a local observation in
+    /// the place the rider has learned to read server verdicts.
+    private(set) var scanHint: String?
     private(set) var cameraAccess: CameraAccess = .undetermined
 
     var canSubmit: Bool {
@@ -218,10 +231,20 @@ final class PairingModel {
     /// client-side rule that drifted from the server's would refuse a code the
     /// server would have taken, and the rider would have no way to tell that
     /// apart from a rejected one.
+    /// A barcode that cannot be a pairing code is not silently discarded:
+    /// with no feedback, a rider pointing the camera at the wrong thing sees
+    /// a live preview and nothing happening, which looks like a broken
+    /// scanner rather than a wrong barcode. Saying so costs nothing here --
+    /// this code never reached the server, so there is no outcome to leak.
     func scanned(_ value: String, gate: SessionGate) {
         guard !isWorking else { return }
         let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard let grouped = PairingCode.grouped(trimmed) else { return }
+        guard let grouped = PairingCode.grouped(trimmed) else {
+            scanHint = "That barcode is not a WatTracker pairing code. "
+                + "Point the camera at the code shown on your computer."
+            return
+        }
+        scanHint = nil
         code = grouped
         Task { await pair(gate: gate) }
     }
