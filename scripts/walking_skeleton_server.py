@@ -3,12 +3,17 @@
 
 What this does, in order:
 
-1. Reads the rider's FTP out of the local database, READ-ONLY, and builds one
-   ``profile`` object from it.
+1. Reads a full object snapshot out of the local database, READ-ONLY, and
+   pages it into publishable batches.  Not just the ``profile`` object it
+   built when #171 only needed one FTP number: the iOS Dashboard reads
+   ``training_state``, ``load_point`` and ``curve`` as well, and against a
+   profile-only harness a paired app lands on the Dashboard's ``.noData``
+   state, so "renders on real data" could not be checked at all (#234).
 2. Starts the real cloud app on ``127.0.0.1`` with an in-memory store.
 3. Enrolls a writer through the real enrollment routes, with a real Ed25519
    keypair generated in this process and never written anywhere.
-4. Pushes the profile through the real, signed ``/api/v1/sync/batches``.
+4. Pushes every page through the real, signed ``/api/v1/sync/batches``, in
+   order, each as its own batch.
 5. Mints a pairing code through the real, writer-signed pairing route.
 6. Prints the code and waits, so the iOS app can redeem it.
 
@@ -37,6 +42,7 @@ import sys
 import threading
 import time
 from pathlib import Path
+from typing import NamedTuple
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
@@ -193,8 +199,22 @@ def signed_headers(
     }
 
 
+class Published(NamedTuple):
+    """What one publish put on the server, for the operator to read back.
+
+    The object and batch counts are here because the whole point of the
+    harness is checking what reached the device: "published 1 object" and
+    "published 340 objects in 2 batches" are the difference between a
+    Dashboard that renders and one stuck on ``.noData``.
+    """
+
+    ftp_watts: float
+    objects: int
+    batches: int
+
+
 def publish_snapshot(server: LocalServer, enrolled: dict, private_key: bytes,
-                     db_path: Path, user_id: int) -> float:
+                     db_path: Path, user_id: int) -> Published:
     # A rider with enough activities pushes the derived objects (profile,
     # training_state, load_point, curve, ...) past a single page: those
     # objects come after every activity/activity-detail object in
@@ -252,7 +272,11 @@ def publish_snapshot(server: LocalServer, enrolled: dict, private_key: bytes,
         if result.get("accepted") != len(batch.objects):
             raise SystemExit(f"the server did not accept the snapshot: {result}")
 
-    return float(ftp_watts)
+    return Published(
+        ftp_watts=float(ftp_watts),
+        objects=sum(len(batch.objects) for batch in batches),
+        batches=len(batches),
+    )
 
 
 def mint_pairing_code(server: LocalServer, enrolled: dict, private_key: bytes) -> dict:
@@ -285,9 +309,10 @@ def main() -> int:
     server = LocalServer(args.host, args.port)
     server.start()
     enrolled, private_key = enroll_writer(server)
-    ftp_watts = publish_snapshot(
+    published = publish_snapshot(
         server, enrolled, private_key, args.db, args.user_id
     )
+    ftp_watts = published.ftp_watts
     codes = [
         mint_pairing_code(server, enrolled, private_key)["pairing_code"]
         for _ in range(max(1, args.codes))
@@ -305,7 +330,8 @@ def main() -> int:
 
     print(f"serving      {server.base_url}")
     print(f"database     {args.db} (read-only)")
-    print(f"published    profile ftp_watts = {ftp_watts}")
+    print(f"published    {published.objects} objects in "
+          f"{published.batches} batch(es); profile ftp = {ftp_watts}")
     for code in codes:
         print(f"pairing code {code}")
     print("Ctrl-C to stop.")
