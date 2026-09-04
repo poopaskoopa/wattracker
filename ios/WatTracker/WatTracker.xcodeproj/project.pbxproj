@@ -45,6 +45,18 @@
 		1A0000000000000000000197 /* SettingsScreen.swift in Sources */ = {isa = PBXBuildFile; fileRef = 1A0000000000000000000097 /* SettingsScreen.swift */; };
 		1A0000000000000000000198 /* Palette.swift in Sources */ = {isa = PBXBuildFile; fileRef = 1A0000000000000000000098 /* Palette.swift */; };
 		1A0000000000000000000199 /* Panel.swift in Sources */ = {isa = PBXBuildFile; fileRef = 1A0000000000000000000099 /* Panel.swift */; };
+		1A00000000000000000001C0 /* SessionGate.swift in Sources */ = {isa = PBXBuildFile; fileRef = 1A00000000000000000001B0 /* SessionGate.swift */; };
+		1A00000000000000000001C1 /* AppGate.swift in Sources */ = {isa = PBXBuildFile; fileRef = 1A00000000000000000001B1 /* AppGate.swift */; };
+		1A00000000000000000001C2 /* PairingScreen.swift in Sources */ = {isa = PBXBuildFile; fileRef = 1A00000000000000000001B2 /* PairingScreen.swift */; };
+		1A00000000000000000001C3 /* QRCodeScanner.swift in Sources */ = {isa = PBXBuildFile; fileRef = 1A00000000000000000001B3 /* QRCodeScanner.swift */; };
+		1A00000000000000000001C4 /* PairingFailureMessage.swift in Sources */ = {isa = PBXBuildFile; fileRef = 1A00000000000000000001B4 /* PairingFailureMessage.swift */; };
+		1A00000000000000000001C5 /* PairingCode.swift in Sources */ = {isa = PBXBuildFile; fileRef = 1A00000000000000000001B5 /* PairingCode.swift */; };
+		1A00000000000000000001C6 /* SessionGate.swift in Sources */ = {isa = PBXBuildFile; fileRef = 1A00000000000000000001B0 /* SessionGate.swift */; };
+		1A00000000000000000001C7 /* PairingFailureMessage.swift in Sources */ = {isa = PBXBuildFile; fileRef = 1A00000000000000000001B4 /* PairingFailureMessage.swift */; };
+		1A00000000000000000001C8 /* PairingCode.swift in Sources */ = {isa = PBXBuildFile; fileRef = 1A00000000000000000001B5 /* PairingCode.swift */; };
+		1A00000000000000000001C9 /* SessionGateTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 1A00000000000000000001B6 /* SessionGateTests.swift */; };
+		1A00000000000000000001CA /* PairingTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 1A00000000000000000001B7 /* PairingTests.swift */; };
+		1A00000000000000000001CB /* AppConfiguration.swift in Sources */ = {isa = PBXBuildFile; fileRef = 1A0000000000000000000033 /* AppConfiguration.swift */; };
 /* End PBXBuildFile section */
 
 /* Begin PBXFileReference section */
@@ -84,6 +96,14 @@
 		1A0000000000000000000097 /* SettingsScreen.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SettingsScreen.swift; sourceTree = "<group>"; };
 		1A0000000000000000000098 /* Palette.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Palette.swift; sourceTree = "<group>"; };
 		1A0000000000000000000099 /* Panel.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Panel.swift; sourceTree = "<group>"; };
+		1A00000000000000000001B0 /* SessionGate.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SessionGate.swift; sourceTree = "<group>"; };
+		1A00000000000000000001B1 /* AppGate.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AppGate.swift; sourceTree = "<group>"; };
+		1A00000000000000000001B2 /* PairingScreen.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PairingScreen.swift; sourceTree = "<group>"; };
+		1A00000000000000000001B3 /* QRCodeScanner.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = QRCodeScanner.swift; sourceTree = "<group>"; };
+		1A00000000000000000001B4 /* PairingFailureMessage.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PairingFailureMessage.swift; sourceTree = "<group>"; };
+		1A00000000000000000001B5 /* PairingCode.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PairingCode.swift; sourceTree = "<group>"; };
+		1A00000000000000000001B6 /* SessionGateTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SessionGateTests.swift; sourceTree = "<group>"; };
+		1A00000000000000000001B7 /* PairingTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PairingTests.swift; sourceTree = "<group>"; };
 /* End PBXFileReference section */
 
 /* Begin PBXFrameworksBuildPhase section */
@@ -153,6 +173,7 @@
 				1A0000000000000000000103 /* DeviceCredentialStore.swift */,
 				1A0000000000000000000104 /* SnapshotCache.swift */,
 				1A0000000000000000000105 /* CloudSession.swift */,
+				1A00000000000000000001B5 /* PairingCode.swift */,
 			);
 			path = Cloud;
 			sourceTree = "<group>";
@@ -165,6 +186,8 @@
 				1A0000000000000000000111 /* CloudSessionTests.swift */,
 				1A0000000000000000000112 /* CloudModelsTests.swift */,
 				1A0000000000000000000113 /* SnapshotCacheTests.swift */,
+				1A00000000000000000001B6 /* SessionGateTests.swift */,
+				1A00000000000000000001B7 /* PairingTests.swift */,
 			);
 			path = WatTrackerTests;
 			sourceTree = "<group>";
@@ -193,6 +216,8 @@
 				1A0000000000000000000090 /* RootView.swift */,
 				1A0000000000000000000091 /* Destination.swift */,
 				1A0000000000000000000092 /* SideRail.swift */,
+				1A00000000000000000001B0 /* SessionGate.swift */,
+				1A00000000000000000001B1 /* AppGate.swift */,
 			);
 			path = Shell;
 			sourceTree = "<group>";
@@ -205,6 +230,9 @@
 				1A0000000000000000000095 /* CalendarScreen.swift */,
 				1A0000000000000000000096 /* VolumeScreen.swift */,
 				1A0000000000000000000097 /* SettingsScreen.swift */,
+				1A00000000000000000001B2 /* PairingScreen.swift */,
+				1A00000000000000000001B3 /* QRCodeScanner.swift */,
+				1A00000000000000000001B4 /* PairingFailureMessage.swift */,
 			);
 			path = Screens;
 			sourceTree = "<group>";
@@ -338,6 +366,12 @@
 				1A0000000000000000000197 /* SettingsScreen.swift in Sources */,
 				1A0000000000000000000198 /* Palette.swift in Sources */,
 				1A0000000000000000000199 /* Panel.swift in Sources */,
+				1A00000000000000000001C0 /* SessionGate.swift in Sources */,
+				1A00000000000000000001C1 /* AppGate.swift in Sources */,
+				1A00000000000000000001C2 /* PairingScreen.swift in Sources */,
+				1A00000000000000000001C3 /* QRCodeScanner.swift in Sources */,
+				1A00000000000000000001C4 /* PairingFailureMessage.swift in Sources */,
+				1A00000000000000000001C5 /* PairingCode.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -359,6 +393,12 @@
 				1A0000000000000000000155 /* DeviceCredentialStore.swift in Sources */,
 				1A0000000000000000000156 /* SnapshotCache.swift in Sources */,
 				1A0000000000000000000157 /* CloudSession.swift in Sources */,
+				1A00000000000000000001C6 /* SessionGate.swift in Sources */,
+				1A00000000000000000001C7 /* PairingFailureMessage.swift in Sources */,
+				1A00000000000000000001C8 /* PairingCode.swift in Sources */,
+				1A00000000000000000001C9 /* SessionGateTests.swift in Sources */,
+				1A00000000000000000001CA /* PairingTests.swift in Sources */,
+				1A00000000000000000001CB /* AppConfiguration.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
