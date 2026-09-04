@@ -292,6 +292,9 @@ actor CloudSession {
     func removeDevice() async throws {
         guard state != .removed else { throw Failure.deviceRemoved }
         guard state == .paired, let activeDevice = device else { throw Failure.notPaired }
+        lifecycleGeneration += 1
+        refreshTask = nil
+        refreshTaskID = nil
         let generation = lifecycleGeneration
         do {
             try await client.revoke(credentialID: activeDevice.credentialID, for: activeDevice)

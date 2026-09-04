@@ -1,4 +1,5 @@
 import XCTest
+import CryptoKit
 
 /// The token lifecycle, exercised at the moments it is hard to reason about.
 ///
@@ -15,6 +16,7 @@ final class CloudSessionTests: XCTestCase {
         let clock: TestClock
         let credentials: MemoryDeviceCredentialStore
         let cache: MemorySnapshotCache
+        let signer: StubSigner
     }
 
     private func harness(
@@ -27,9 +29,10 @@ final class CloudSessionTests: XCTestCase {
         let credentials = MemoryDeviceCredentialStore(
             device: paired ? CloudFixtures.device : nil
         )
+        let signer = StubSigner()
         let client = CloudClient(
             baseURL: baseURL,
-            signer: StubSigner(),
+            signer: signer,
             transport: transport,
             clock: clock.reader
         )
@@ -41,7 +44,8 @@ final class CloudSessionTests: XCTestCase {
             transport: transport,
             clock: clock,
             credentials: credentials,
-            cache: cache
+            cache: cache,
+            signer: signer
         )
     }
 
@@ -690,6 +694,44 @@ final class CloudSessionTests: XCTestCase {
         XCTAssertEqual(revoke.url?.path, "/api/v1/devices/credential-1/revoke")
         XCTAssertEqual(revoke.value(forHTTPHeaderField: "X-Writer-Idempotency-Key"), "device-revoke")
         XCTAssertEqual(revoke.value(forHTTPHeaderField: "X-Writer-Revision"), "0")
+
+        let publicKey = try P256.Signing.PublicKey(x963Representation: rig.signer.publicKeyX963)
+        for (request, method, path, idempotencyKey) in [
+            (list, "GET", "/api/v1/devices", "device-list"),
+            (revoke, "POST", "/api/v1/devices/credential-1/revoke", "device-revoke"),
+        ] {
+            let timestamp = try XCTUnwrap(
+                request.value(forHTTPHeaderField: "X-Writer-Timestamp"),
+                "missing timestamp for \(method) \(path)"
+            )
+            let nonce = try XCTUnwrap(
+                request.value(forHTTPHeaderField: "X-Writer-Nonce"),
+                "missing nonce for \(method) \(path)"
+            )
+            let signatureHex = try XCTUnwrap(
+                request.value(forHTTPHeaderField: "X-Writer-Signature"),
+                "missing signature for \(method) \(path)"
+            )
+            let signatureData = try XCTUnwrap(
+                Data(hex: signatureHex),
+                "invalid signature encoding for \(method) \(path)"
+            )
+            let signature = try P256.Signing.ECDSASignature(rawRepresentation: signatureData)
+            let canonical = try CanonicalRequest.bytes(
+                method: method,
+                path: path,
+                namespace: CloudFixtures.device.signingNamespace,
+                timestamp: timestamp,
+                nonce: nonce,
+                bodyDigest: CanonicalRequest.digestBody(Data()),
+                idempotencyKey: idempotencyKey,
+                revision: "0"
+            )
+            XCTAssertTrue(
+                publicKey.isValidSignature(signature, for: canonical),
+                "invalid writer signature for \(method) \(path); timestamp=\(timestamp), nonce=\(nonce), idempotency=\(idempotencyKey), revision=0"
+            )
+        }
         let state = await rig.session.deviceState
         XCTAssertEqual(state, .unpaired)
         XCTAssertNil(rig.credentials.load())
@@ -710,30 +752,70 @@ final class CloudSessionTests: XCTestCase {
     }
 
     func testReadSuspendedAcrossRemoveCannotReturnOrRestoreCache() async throws {
-        let gate = RequestGate()
+        let readGate = RequestGate()
+        let revokeGate = RequestGate()
         let cache = MemorySnapshotCache()
         let rig = harness(cache: cache) { request, _ in
             if request.url?.path == "/api/v1/context/refresh" {
                 return .json(CloudFixtures.refreshBody(context: "context-0"))
             }
             if request.url?.path == "/api/v1/context/dashboard" {
-                await gate.wait()
+                await readGate.wait()
                 return Self.dashboard([CloudFixtures.profileItem(revision: 2, ftp: 250)], revision: 2)
             }
             if request.url?.path == "/api/v1/devices/credential-1/revoke" {
+                await revokeGate.wait()
                 return .json(#"{"revoked":true}"#)
             }
             return .refused(404)
         }
         let read = Task { try await rig.session.load(.dashboard) }
-        while await gate.arrived == 0 { await Task.yield() }
-        try await rig.session.removeDevice()
-        await gate.openGate()
+        var spins = 0
+        while await readGate.arrived == 0 && spins < 1_000 {
+            await Task.yield()
+            spins += 1
+        }
+        guard await readGate.arrived == 1 else {
+            XCTFail("dashboard read did not reach its gate")
+            await readGate.openGate()
+            return
+        }
+
+        let removal = Task { try await rig.session.removeDevice() }
+        spins = 0
+        while await revokeGate.arrived == 0 && spins < 1_000 {
+            await Task.yield()
+            spins += 1
+        }
+        guard await revokeGate.arrived == 1 else {
+            XCTFail("revoke did not reach its gate")
+            await revokeGate.openGate()
+            await readGate.openGate()
+            _ = try? await removal.value
+            return
+        }
+
+        await readGate.openGate()
         do {
             _ = try await read.value
             XCTFail("stale read must not escape")
-        } catch { }
+        } catch let failure as CloudSession.Failure {
+            if case .notPaired = failure {
+                // Expected: removeDevice invalidates the read before revoke returns.
+            } else {
+                XCTFail("expected lifecycle invalidation, got \(failure)")
+            }
+        } catch {
+            XCTFail("expected CloudSession.Failure.notPaired, got \(error)")
+        }
         XCTAssertNil(rig.cache.load(.dashboard))
+        let stateWhileRevokeIsHeld = await rig.session.deviceState
+        XCTAssertEqual(stateWhileRevokeIsHeld, .paired)
+
+        await revokeGate.openGate()
+        try await removal.value
+        let state = await rig.session.deviceState
+        XCTAssertEqual(state, .unpaired)
     }
 
     func testAnUnpairedSessionAsksForNothing() async throws {
