@@ -172,26 +172,49 @@ The list gives the **order**. GitHub gives the **state** — always
 (#234's scope grew a whole section after it was filed) and its labels move.
 If the two disagree, GitHub wins and the queue is stale; say so.
 
-1. **#233 — iOS pairing plumbing.** Device label through `CloudClient.pair`,
-   a `devices()` listing, `revoke` + `CloudSession.removeDevice()`. No UI, no
-   camera, no simulator; every part is unit-testable against the existing
-   `CloudTestSupport` fakes in the `ios-tests` job. This is first because it
-   unblocks the longest chain in the repo: #234 needs it, #228 needs #234, and
-   #161's on-real-data criterion needs #228.
-2. **#217 — build and verify the cloud container image.** Independent of
-   everything iOS. Offline, no Azure subscription. Read the note under
-   "when an issue's premise has gone stale" before starting: most of this
-   issue's body describes a CI state that no longer exists.
-3. **#162 — iOS Activities list and ride detail.** *Not before #234 has
-   merged.* See below.
-4. **#163 — iOS Calendar and Volume screens.** Same condition as #162.
+1. **#167 — prove rider isolation and the mobile contract.** The top item and
+   the only one not waiting on something. **Rescoped 2026-09-05**: the cost
+   measurement that made it look deployment-shaped moved to #242, so what is
+   left is provable offline, in-process against `create_cloud_app`, with no
+   Azure subscription and no credentials. Two riders, two devices each; prove B
+   cannot reach A's objects by id, revision, `since=` replay, header
+   manipulation, or A's subscription key with B's signature; 404 not 403;
+   revocation durable across a restart; read-only capability holds against a
+   signed `POST /api/v1/sync/batches`; and a Swift/Python contract test from
+   shared fixtures. Build it on `tests/test_cloud_api.py`, which already
+   exercises the app in-process — do not stand up a new harness.
+2. **#162 — iOS Activities list and ride detail.** *Not before #234 has
+   merged.* PR #235 already exists and is **not** simply rebasable — see below.
+3. **#163 — iOS Calendar and Volume screens.** Same condition as #162.
+
+**Done since this list was last written:** #233 landed in PR #238. #217's
+credential-free half landed in PR #239 — its remainder is the Azure
+protected-environment smoke test, which needs a real deployment and so is
+gated on #102; do not pick #217 up expecting startable work.
 
 **Do not start #161.** Its work is done and sitting in PR #228, which is held
 open on purpose pending #234. Starting it again re-implements a screen that
 already exists.
 
-**Do not start #167 or #169** without asking. #169 is `blocked`. #167 is real
-but large, and it wants scoping first.
+**Do not start #169** without asking; it is `blocked`. #242 is `blocked` on
+#102 and is a measurement of a live deployment, not code.
+
+### Before starting any iOS issue that already has a PR
+
+Diff the existing PR's files against `main` **two-dot** (`git diff
+origin/main <ref>`), not three-dot. A three-dot diff measures from the merge
+base, so on a stale branch it presents already-merged work as new. PR #235 was
+opened carrying an `api.py` change and 83 test lines that had merged three and
+a half hours earlier as PR #237 (`9e1b3d2`); a two-dot diff against `main` is
+empty for those files and would have caught it immediately.
+
+PR #235 also re-implements the actor-reentrancy fix that PR #228 already
+contains, under a different name — `sessionGeneration` against #228's
+`lifecycleGeneration`, each with its own `refreshTaskID`. The two conflict on
+`CloudSession.swift` and it is not a rebase conflict: whichever lands second
+must drop its own counter and adopt the other's, then re-verify its reads.
+Keep #228's, which was reviewed line by line. Two generation counters guarding
+one actor is not a merge, it is a bug.
 
 ### Why #162 and #163 wait for pairing
 
