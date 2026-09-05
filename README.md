@@ -545,7 +545,9 @@ on a `v*` tag and are gated for want of a code-signing certificate, so every
 shipped binary is still an unsigned local build. The containerized cloud
 checks need billable Linux minutes. Windows executables must be built on
 Windows. Real BLE hardware and production signing cannot be verified here; use
-[the Windows BLE checklist](docs/windows-ble-validation.md).
+[the Windows BLE checklist](docs/windows-ble-validation.md). The iOS camera,
+Secure Enclave, permission prompts and per-idiom layout are equally out of
+CI's reach; use [the iOS device checklist](docs/ios-device-validation.md).
 
 macOS ships as a `wattracker.app` inside a DMG, built end to end by
 `packaging/build-macos.sh` (the same `packaging/wattracker.spec` serves both
