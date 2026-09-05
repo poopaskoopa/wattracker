@@ -8,6 +8,13 @@
 WATTRACKER_API_SCHEME = http
 WATTRACKER_API_HOST = localhost:8765
 
+// A device run needs the Mac's LAN address instead, and that changes with the
+// network, so it cannot live in a tracked file. `--lan` writes Local.xcconfig
+// with today's address; the `?` makes the include optional, so a checkout
+// without that file still builds. It must stay AFTER the assignment above -
+// last definition wins (#234).
+#include? "Local.xcconfig"
+
 // WATTRACKER_SOFTWARE_KEYS_ALLOWED compiles in the keychain fallback for the
 // device signing key. The simulator has no Secure Enclave, so without it the
 // app cannot generate a key there at all and the walking skeleton has nowhere

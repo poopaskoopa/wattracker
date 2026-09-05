@@ -9,7 +9,10 @@ What this does, in order:
    ``training_state``, ``load_point`` and ``curve`` as well, and against a
    profile-only harness a paired app lands on the Dashboard's ``.noData``
    state, so "renders on real data" could not be checked at all (#234).
-2. Starts the real cloud app on ``127.0.0.1`` with an in-memory store.
+2. Starts the real cloud app with an in-memory store: on ``127.0.0.1`` by
+   default, or, with ``--lan``, on every interface with the address this Mac
+   actually reaches the network from, so a phone on the same wifi or hotspot
+   can talk to it.
 3. Enrolls a writer through the real enrollment routes, with a real Ed25519
    keypair generated in this process and never written anywhere.
 4. Pushes every page through the real, signed ``/api/v1/sync/batches``, in
@@ -31,6 +34,7 @@ Usage:
     python scripts/walking_skeleton_server.py            # user 1, default DB
     python scripts/walking_skeleton_server.py --user-id 5
     python scripts/walking_skeleton_server.py --db /path/to/copy.db --port 8765
+    python scripts/walking_skeleton_server.py --lan       # reachable from a phone
 """
 from __future__ import annotations
 
@@ -38,6 +42,7 @@ import argparse
 import json
 import os
 import secrets
+import socket
 import sys
 import threading
 import time
@@ -65,6 +70,59 @@ from wattracker.cloud.snapshot import SnapshotError, snapshot_publish_pages  # n
 
 OPERATOR_SUBJECT = "walking-skeleton-operator"
 
+# Untracked, gitignored override for ios/WatTracker/Config/Debug.xcconfig,
+# which optionally includes it. The serving address changes every time the Mac
+# changes network (a phone hotspot puts it on 172.20.10.x), so the committed
+# default cannot be right for a device run, and hand-editing a tracked file
+# before every run meant remembering to revert it afterwards (#234).
+LOCAL_XCCONFIG = ROOT / "ios" / "WatTracker" / "Config" / "Local.xcconfig"
+
+
+class LanAddressError(RuntimeError):
+    """This machine has no usable LAN address to advertise."""
+
+
+def detect_lan_address() -> str:
+    """The IPv4 address this Mac reaches the network from.
+
+    Asking a UDP socket which local address it would use to reach a public
+    host sends no packet and needs no reachability, and it is interface-name
+    agnostic: wifi, ethernet and a tethered phone all answer correctly, where
+    ``ipconfig getifaddr en0`` answers for one interface and guesses wrong on
+    the others.
+
+    Raises rather than falling back to loopback: an unreachable server that
+    claims to be reachable fails later, on the phone, as what looks like a
+    pairing error rather than a networking one.
+    """
+    probe = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        probe.connect(("8.8.8.8", 80))
+        address = probe.getsockname()[0]
+    except OSError as exc:
+        raise LanAddressError(f"could not determine this machine's LAN address: {exc}")
+    finally:
+        probe.close()
+    if not address or address.startswith("127."):
+        raise LanAddressError(
+            "this machine has no non-loopback IPv4 address; join a network "
+            "(or tether to the phone) before serving with --lan"
+        )
+    return address
+
+
+def write_local_xcconfig(host: str, port: int, path: Path = LOCAL_XCCONFIG) -> Path:
+    """Point the iOS Debug build at ``host:port`` without touching a tracked file."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        "// Written by scripts/walking_skeleton_server.py --lan. Gitignored,\n"
+        "// and optionally included by Debug.xcconfig, so pointing the app at\n"
+        "// today's address is never an edit to a tracked file.\n"
+        f"WATTRACKER_API_HOST = {host}:{port}\n",
+        encoding="utf-8",
+    )
+    return path
+
 
 def default_db_path() -> Path:
     override = os.environ.get("WATTRACKER_DB")
@@ -74,12 +132,20 @@ def default_db_path() -> Path:
 
 
 class LocalServer:
-    """The cloud app on a loopback port, in a thread."""
+    """The cloud app on a local port, in a thread.
 
-    def __init__(self, host: str, port: int) -> None:
+    Two addresses, deliberately kept apart: ``internal_url`` is what this
+    process calls itself on (enrollment, publish, minting) and is always a
+    loopback address, while ``advertised_url`` is what the phone is told to
+    use. Binding ``0.0.0.0`` makes a fine listener and a useless URL.
+    """
+
+    def __init__(self, bind_host: str, port: int,
+                 advertise_host: str | None = None) -> None:
         import uvicorn
 
-        self.host = host
+        self.bind_host = bind_host
+        self.advertise_host = advertise_host or bind_host
         self.port = port
         self.config = CloudConfig(
             server_secret=secrets.token_bytes(32),
@@ -103,13 +169,27 @@ class LocalServer:
         )
         app = create_cloud_app(self.config, state=self.state)
         self._server = uvicorn.Server(
-            uvicorn.Config(app, host=host, port=port, log_level="warning")
+            uvicorn.Config(app, host=bind_host, port=port, log_level="warning")
         )
         self._thread = threading.Thread(target=self._server.run, daemon=True)
 
     @property
-    def base_url(self) -> str:
-        return f"http://{self.host}:{self.port}"
+    def internal_url(self) -> str:
+        """Where this process calls itself. Never a wildcard bind address."""
+        host = self.bind_host
+        if host in ("0.0.0.0", "::", "localhost", ""):
+            host = "127.0.0.1"
+        return f"http://{host}:{self.port}"
+
+    @property
+    def advertised_url(self) -> str:
+        """Where the phone should be pointed."""
+        return f"http://{self.advertise_host}:{self.port}"
+
+    @property
+    def reachable_off_box(self) -> bool:
+        return not self.advertise_host.startswith("127.") and \
+            self.advertise_host not in ("localhost", "::1")
 
     def start(self, timeout: float = 15.0) -> None:
         self._thread.start()
@@ -141,7 +221,7 @@ def enroll_writer(server: LocalServer) -> tuple[dict, bytes]:
     """Take the desktop install through the real enrollment exchange."""
     private_key, public_key = generate_signing_keypair()
     invitation = post(
-        f"{server.base_url}/api/v1/enrollment/start",
+        f"{server.internal_url}/api/v1/enrollment/start",
         {
             "Content-Type": "application/json",
             "X-Operator-Token": server.config.operator_token,
@@ -150,7 +230,7 @@ def enroll_writer(server: LocalServer) -> tuple[dict, bytes]:
         b"{}",
     )
     enrolled = post(
-        f"{server.base_url}/api/v1/enrollment/complete",
+        f"{server.internal_url}/api/v1/enrollment/complete",
         {
             "Content-Type": "application/json",
             server.config.verified_subject_header: OPERATOR_SUBJECT,
@@ -261,7 +341,7 @@ def publish_snapshot(server: LocalServer, enrolled: dict, private_key: bytes,
             ensure_ascii=False,
         ).encode("utf-8")
         result = post(
-            f"{server.base_url}/api/v1/sync/batches",
+            f"{server.internal_url}/api/v1/sync/batches",
             signed_headers(
                 enrolled, private_key,
                 method="POST", path="/api/v1/sync/batches", body=body,
@@ -282,7 +362,7 @@ def publish_snapshot(server: LocalServer, enrolled: dict, private_key: bytes,
 def mint_pairing_code(server: LocalServer, enrolled: dict, private_key: bytes) -> dict:
     path = "/api/v1/devices/pairing-codes"
     return post(
-        f"{server.base_url}{path}",
+        f"{server.internal_url}{path}",
         signed_headers(
             enrolled, private_key,
             method="POST", path=path, body=b"",
@@ -299,6 +379,12 @@ def main() -> int:
                         help="local database to READ (never written)")
     parser.add_argument("--user-id", type=int, default=1)
     parser.add_argument("--host", default="127.0.0.1")
+    parser.add_argument("--lan", action="store_true",
+                        help="bind every interface and advertise this machine's "
+                             "LAN address, so a phone can reach the server")
+    parser.add_argument("--no-xcconfig", action="store_true",
+                        help="with --lan, do not write ios/WatTracker/Config/"
+                             "Local.xcconfig")
     parser.add_argument("--port", type=int, default=8765)
     parser.add_argument("--codes", type=int, default=1,
                         help="how many single-use pairing codes to mint")
@@ -306,7 +392,19 @@ def main() -> int:
                         help="also write the run's facts to this file")
     args = parser.parse_args()
 
-    server = LocalServer(args.host, args.port)
+    if args.lan:
+        try:
+            advertise_host = detect_lan_address()
+        except LanAddressError as exc:
+            raise SystemExit(str(exc))
+        server = LocalServer("0.0.0.0", args.port, advertise_host=advertise_host)
+    else:
+        server = LocalServer(args.host, args.port)
+
+    xcconfig = None
+    if args.lan and not args.no_xcconfig:
+        xcconfig = write_local_xcconfig(server.advertise_host, args.port)
+
     server.start()
     enrolled, private_key = enroll_writer(server)
     published = publish_snapshot(
@@ -319,7 +417,7 @@ def main() -> int:
     ]
 
     facts = {
-        "base_url": server.base_url,
+        "base_url": server.advertised_url,
         "database": str(args.db),
         "user_id": args.user_id,
         "ftp_watts": ftp_watts,
@@ -328,7 +426,12 @@ def main() -> int:
     if args.json is not None:
         args.json.write_text(json.dumps(facts, indent=2) + "\n", encoding="utf-8")
 
-    print(f"serving      {server.base_url}")
+    print(f"serving      {server.advertised_url}")
+    if not server.reachable_off_box:
+        print("             loopback only - no phone can reach this. "
+              "Re-run with --lan for a device run.")
+    if xcconfig is not None:
+        print(f"xcconfig     {xcconfig} (gitignored; rebuild Debug to pick it up)")
     print(f"database     {args.db} (read-only)")
     print(f"published    {published.objects} objects in "
           f"{published.batches} batch(es); profile ftp = {ftp_watts}")
