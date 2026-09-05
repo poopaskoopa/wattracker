@@ -10,9 +10,10 @@ What this does, in order:
    profile-only harness a paired app lands on the Dashboard's ``.noData``
    state, so "renders on real data" could not be checked at all (#234).
 2. Starts the real cloud app with an in-memory store: on ``127.0.0.1`` by
-   default, or, with ``--lan``, on every interface with the address this Mac
-   actually reaches the network from, so a phone on the same wifi or hotspot
-   can talk to it.
+   default, or, with ``--lan``, on every interface, advertising the address a
+   phone on the same wifi or hotspot can reach this Mac at.  Deliberately not
+   the default route's address, which on a machine with a VPN up belongs to
+   the tunnel and is reachable from nothing (#234).
 3. Enrolls a writer through the real enrollment routes, with a real Ed25519
    keypair generated in this process and never written anywhere.
 4. Pushes every page through the real, signed ``/api/v1/sync/batches``, in
@@ -39,10 +40,12 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import ipaddress
 import json
 import os
+import re
 import secrets
-import socket
+import subprocess
 import sys
 import threading
 import time
@@ -82,33 +85,133 @@ class LanAddressError(RuntimeError):
     """This machine has no usable LAN address to advertise."""
 
 
-def detect_lan_address() -> str:
-    """The IPv4 address this Mac reaches the network from.
+# Interfaces a phone on the same wifi cannot reach, whatever address they
+# carry: VPN and other tunnels (utun/tun/tap/ipsec/ppp) and Apple's
+# peer-to-peer radios (awdl is AirDrop, llw is low-latency WLAN).
+TUNNEL_PREFIXES = ("utun", "tun", "tap", "ipsec", "ppp", "awdl", "llw")
 
-    Asking a UDP socket which local address it would use to reach a public
-    host sends no packet and needs no reachability, and it is interface-name
-    agnostic: wifi, ethernet and a tethered phone all answer correctly, where
-    ``ipconfig getifaddr en0`` answers for one interface and guesses wrong on
-    the others.
+# 10/8, 172.16/12 and 192.168/16. The middle one is why this is a mask test
+# and not a string prefix test: an iPhone Personal Hotspot hands out
+# 172.20.10.x, which is inside 172.16/12 and which "172.16." would reject.
+PRIVATE_V4_NETWORKS = (
+    ipaddress.ip_network("10.0.0.0/8"),
+    ipaddress.ip_network("172.16.0.0/12"),
+    ipaddress.ip_network("192.168.0.0/16"),
+)
 
-    Raises rather than falling back to loopback: an unreachable server that
-    claims to be reachable fails later, on the phone, as what looks like a
-    pairing error rather than a networking one.
-    """
-    probe = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+
+class Interface(NamedTuple):
+    name: str
+    address: str
+
+
+def is_private_ipv4(address: str) -> bool:
     try:
-        probe.connect(("8.8.8.8", 80))
-        address = probe.getsockname()[0]
-    except OSError as exc:
-        raise LanAddressError(f"could not determine this machine's LAN address: {exc}")
-    finally:
-        probe.close()
-    if not address or address.startswith("127."):
+        parsed = ipaddress.ip_address(address)
+    except ValueError:
+        return False
+    return any(parsed in network for network in PRIVATE_V4_NETWORKS)
+
+
+def is_tunnel(name: str) -> bool:
+    return name.startswith(TUNNEL_PREFIXES)
+
+
+def ipv4_interfaces() -> list[Interface]:
+    """Every UP interface with an IPv4 address, in ``ifconfig`` order.
+
+    ``ifconfig`` rather than a library: it is in the base system, it is the
+    only enumeration that reports flags and addresses together, and adding a
+    dependency to a development harness to read a network address would be a
+    poor trade.
+    """
+    try:
+        listing = subprocess.run(
+            ["ifconfig", "-a"], capture_output=True, text=True, timeout=10, check=True
+        ).stdout
+    except (OSError, subprocess.SubprocessError) as exc:
+        raise LanAddressError(f"could not enumerate network interfaces: {exc}")
+
+    interfaces: list[Interface] = []
+    name = ""
+    up = False
+    for line in listing.splitlines():
+        header = re.match(r"^(\S+): flags=\d+<([^>]*)>", line)
+        if header is not None:
+            name, up = header.group(1), "UP" in header.group(2).split(",")
+            continue
+        address = re.match(r"^\s+inet (\d+\.\d+\.\d+\.\d+)", line)
+        if address is not None and name and up:
+            interfaces.append(Interface(name, address.group(1)))
+    return interfaces
+
+
+def default_route_interface() -> str | None:
+    """Whichever interface holds the default route, or None if that is unreadable."""
+    try:
+        route = subprocess.run(
+            ["route", "-n", "get", "default"],
+            capture_output=True, text=True, timeout=10,
+        ).stdout
+    except (OSError, subprocess.SubprocessError):
+        return None
+    match = re.search(r"^\s*interface:\s*(\S+)", route, re.MULTILINE)
+    return match.group(1) if match is not None else None
+
+
+def _interface_sort_key(interface: Interface) -> tuple[int, str, int]:
+    # en0 before en4 before bridge0: physical wifi/ethernet is where a phone
+    # is, and the trailing number sorts numerically, not lexically.
+    digits = re.search(r"(\d+)$", interface.name)
+    return (
+        0 if interface.name.startswith("en") else 1,
+        re.sub(r"\d+$", "", interface.name),
+        int(digits.group(1)) if digits else 0,
+    )
+
+
+def detect_lan_address(report=print) -> str:
+    """The IPv4 address a phone on the same network can reach this Mac at.
+
+    NOT the default route's address. Measured on the author's Mac: a VPN on
+    ``utun5`` held the default route with ``10.5.0.2``, while the phone was on
+    the hotspot with the Mac at ``172.20.10.11`` on ``en0``. The obvious probe
+    -- asking a UDP socket which source address it would use for a public host
+    -- follows the default route and answers ``10.5.0.2``, which no phone can
+    reach. A VPN is the normal state of this machine, so that answer is wrong
+    most of the time, and wrong in exactly the way this flag exists to prevent:
+    a server that looks up and fails on the device as a pairing error.
+
+    So: enumerate, drop tunnels and non-private addresses, prefer the default
+    route only when it is itself a physical interface, and say out loud when
+    more than one candidate survives rather than guessing in silence.
+    """
+    interfaces = ipv4_interfaces()
+    candidates = [
+        interface for interface in interfaces
+        if not is_tunnel(interface.name)
+        and not interface.address.startswith("127.")
+        and is_private_ipv4(interface.address)
+    ]
+    if not candidates:
+        seen = ", ".join(f"{i.name} {i.address}" for i in interfaces) or "none"
         raise LanAddressError(
-            "this machine has no non-loopback IPv4 address; join a network "
-            "(or tether to the phone) before serving with --lan"
+            "no physical interface has a private IPv4 address, so nothing here "
+            f"is reachable from a phone (found: {seen}). Join a wifi network or "
+            "tether to the phone, or pass --host explicitly."
         )
-    return address
+
+    candidates.sort(key=_interface_sort_key)
+    default_interface = default_route_interface()
+    chosen = next(
+        (item for item in candidates if item.name == default_interface),
+        candidates[0],
+    )
+    if len(candidates) > 1:
+        others = ", ".join(f"{i.name} {i.address}" for i in candidates if i != chosen)
+        report(f"note         several reachable addresses; also saw {others}. "
+               "Pass --host to override.")
+    return chosen.address
 
 
 def write_local_xcconfig(host: str, port: int, path: Path = LOCAL_XCCONFIG) -> Path:

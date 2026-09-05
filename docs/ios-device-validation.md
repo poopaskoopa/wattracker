@@ -17,6 +17,10 @@ Enclave branch never executes.
   changes with the network (a phone hotspot puts the Mac on `172.20.10.x`),
   and a stale one fails as what looks like a pairing error rather than a
   networking one. `Local.xcconfig` is gitignored; `--no-xcconfig` skips it.
+- Check the address it prints against the network the phone is on. Detection
+  skips tunnels (`utun`, `ipsec`, …), so a VPN does not hijack it, but with
+  several live interfaces it says so and you pick: pass `--host <address>`, or
+  disconnect the VPN and re-run.
 - Rebuild after starting the server — Xcode reads xcconfig at build time, so a
   build made before the harness wrote the file still carries the old host.
 - Build the **Debug** configuration. Debug uses `Info-Debug.plist`, which
