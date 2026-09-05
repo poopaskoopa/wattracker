@@ -547,7 +547,9 @@ run on hosted ubuntu-latest Linux and build the linux/amd64 image, verify its
 cloud imports, and report image/base provenance; Azure-backed startup still
 needs a protected deployment environment. Windows executables must be built on
 Windows. Real BLE hardware and production signing cannot be verified here; use
-[the Windows BLE checklist](docs/windows-ble-validation.md).
+[the Windows BLE checklist](docs/windows-ble-validation.md). The iOS camera,
+Secure Enclave, permission prompts and per-idiom layout are equally out of
+CI's reach; use [the iOS device checklist](docs/ios-device-validation.md).
 
 macOS ships as a `wattracker.app` inside a DMG, built end to end by
 `packaging/build-macos.sh` (the same `packaging/wattracker.spec` serves both

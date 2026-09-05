@@ -63,6 +63,16 @@
 	     orientation list stick on iPad; #171 measured that it does not do that
 	     on iPadOS 26, and all it still does is opt the app out of multitasking
 	     for no benefit we are getting. -->
+	<!-- Asked for exactly once, on the pairing screen, and only when the rider
+	     taps "Use the camera". The purpose string names the single thing the
+	     camera is used for because that is all it is used for: reading the QR
+	     form of a pairing code. Nothing in this app records, stores or uploads
+	     an image -- the capture session's only output is an
+	     AVCaptureMetadataOutput restricted to .qr. Refusing is supported
+	     rather than tolerated: the code can always be typed instead, so a
+	     denied camera costs the rider twelve keystrokes and nothing else. -->
+	<key>NSCameraUsageDescription</key>
+	<string>WatTracker uses the camera to scan the pairing code shown by the WatTracker app on your computer. You can also type the code instead.</string>
 	<key>UIApplicationSupportsIndirectInputEvents</key>
 	<true/>
 	<!-- Debug-only relaxation, and it cannot reach the public internet:
