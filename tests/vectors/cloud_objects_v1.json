@@ -1,0 +1,127 @@
+{
+  "version": 1,
+  "kinds": [
+    "activity",
+    "activity_detail",
+    "calendar_day",
+    "curve",
+    "ftp_history",
+    "load_point",
+    "profile",
+    "stream",
+    "training_state",
+    "volume_week"
+  ],
+  "items": [
+    {
+      "id": "profile",
+      "kind": "profile",
+      "revision": 4,
+      "data": {
+        "display_name": "rider",
+        "ftp": 248.0,
+        "power": {
+          "available": true,
+          "value": 248.0,
+          "source": "Manual Training FTP setting",
+          "zones": [
+            {"label": "Z1", "name": "Active Recovery", "pct": 0.55, "min": 0, "max": 136, "range": "0-136"},
+            {"label": "Z6", "name": "Anaerobic", "pct": 1.2, "min": 298, "max": null, "range": "≥298"}
+          ]
+        },
+        "heart_rate": {
+          "available": false,
+          "value": null,
+          "source": "Insufficient FIT heart-rate data",
+          "zones": []
+        },
+        "weight_kg": null,
+        "weight_date": null,
+        "weight_source": null
+      }
+    },
+    {
+      "id": "training-state",
+      "kind": "training_state",
+      "revision": 4,
+      "data": {"ftp": 248.0, "cp": null, "wprime": null, "ctl": 42.5, "atl": 38, "tsb": 4.5, "decoupling": null}
+    },
+    {
+      "id": "ftp-history-2025-12-01",
+      "kind": "ftp_history",
+      "revision": 4,
+      "data": {"date": "2025-12-01", "ftp_watts": 240.0, "source": "ramp test"}
+    },
+    {
+      "id": "load-point-2026-01-02",
+      "kind": "load_point",
+      "revision": 4,
+      "data": {"date": "2026-01-02", "tss": 95.0, "ctl": 42.5, "atl": 38.0, "tsb": 4.5}
+    },
+    {
+      "id": "curve",
+      "kind": "curve",
+      "revision": 4,
+      "data": {
+        "measured": [{"t": 60, "power": 410.0}],
+        "all_time": [{"t": 60, "power": 455.0}],
+        "last_ride": [],
+        "model": [{"t": 60, "power": 402.1}],
+        "cp": 268.0,
+        "wprime": 18000.0
+      }
+    },
+    {
+      "id": "volume-week-2026-01-05",
+      "kind": "volume_week",
+      "revision": 4,
+      "data": {"week_start": "2026-01-05", "hours": 8.25, "tss": 540.5, "distance_km": 210.4, "calories": 6100}
+    },
+    {
+      "id": "calendar-day-2026-01-02",
+      "kind": "calendar_day",
+      "revision": 4,
+      "data": {
+        "date": "2026-01-02",
+        "race": null,
+        "ooto": false,
+        "phase": "Build",
+        "workouts": [{"id": 9, "title": "Sweet spot", "anything": "else"}],
+        "activities": []
+      }
+    },
+    {
+      "id": "activity-17",
+      "kind": "activity",
+      "revision": 17,
+      "data": {"id": 17, "start_time": "2026-01-02T18:04:00", "duration_s": 3600, "distance_m": 32100.5, "avg_power": 211, "avg_hr": 142, "np": 225, "if_": 0.9, "tss": 81.0, "rpe": 6}
+    },
+    {
+      "id": "activity-detail-17",
+      "kind": "activity_detail",
+      "revision": 17,
+      "data": {
+        "id": 17,
+        "start_time": "2026-01-02T18:04:00",
+        "duration_s": 3600,
+        "distance_m": 32100.5,
+        "avg_power": 211,
+        "avg_hr": 142,
+        "np": 225,
+        "if_": 0.9,
+        "tss": 81.0,
+        "rpe": 6,
+        "weight_kg": 72.0,
+        "weight_source": "settings",
+        "weight_date": "2026-01-01",
+        "zones": {"power": [{"label": "Z2", "seconds": 1800}]}
+      }
+    },
+    {
+      "id": "stream-17",
+      "kind": "stream",
+      "revision": 17,
+      "data": {"streams": {"time": [0, 1, 2], "power": [180, null, 205], "heartrate": [120, 121, 123]}}
+    }
+  ]
+}

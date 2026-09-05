@@ -1,93 +1,68 @@
 import XCTest
 
-/// The envelope, and the two decoding rules that are not stylistic.
-///
-/// A wrong model here is not a crash: it is a screen that renders nothing for a
-/// rider whose snapshot is perfectly good, or -- worse -- an object silently
-/// dropped from a delta the server will never send again.
 final class CloudModelsTests: XCTestCase {
+    private struct SharedFixture: Decodable {
+        let version: Int
+        let kinds: [String]
+        let items: [CloudItem]
+
+        private enum CodingKeys: String, CodingKey {
+            case version, kinds, items
+        }
+    }
+
+    private func sharedFixture() throws -> SharedFixture {
+        let bundle = Bundle(for: type(of: self))
+        let url = try XCTUnwrap(
+            bundle.url(forResource: "cloud_objects_v1", withExtension: "json"),
+            "The shared cloud object fixture is not in the test bundle."
+        )
+        return try JSONDecoder().decode(SharedFixture.self, from: Data(contentsOf: url))
+    }
+
     private func decode(_ text: String) throws -> CollectionResponse {
         try JSONDecoder().decode(CollectionResponse.self, from: Data(text.utf8))
     }
 
     func testEveryPublishedKindDecodesFromTheShapeTheServerSends() throws {
-        // These are the shapes `wattracker/cloud/snapshot.py` builds, with the
-        // nulls it really emits: `_safe_data` turns every non-finite float into
-        // one, and a rider with no FTP, no HR data and no weight history gets
-        // them everywhere.
-        let response = try decode("""
-        {"items":[
-          {"id":"profile","kind":"profile","revision":4,"data":{
-            "display_name":"rider","ftp":248.0,
-            "power":{"available":true,"value":248.0,"source":"Manual Training FTP setting",
-                     "zones":[{"label":"Z1","name":"Active Recovery","pct":0.55,
-                               "min":0,"max":136,"range":"0-136"},
-                              {"label":"Z6","name":"Anaerobic","pct":1.2,
-                               "min":298,"max":null,"range":"\u{2265}298"}]},
-            "heart_rate":{"available":false,"value":null,
-                          "source":"Insufficient FIT heart-rate data","zones":[]},
-            "weight_kg":null,"weight_date":null,"weight_source":null}},
-          {"id":"training-state","kind":"training_state","revision":4,"data":{
-            "ftp":248.0,"cp":null,"wprime":null,"ctl":42.5,"atl":38,"tsb":4.5,
-            "decoupling":null}},
-          {"id":"load-point-2026-01-02","kind":"load_point","revision":4,"data":{
-            "date":"2026-01-02","tss":95.0,"ctl":42.5,"atl":38.0,"tsb":4.5}},
-          {"id":"curve","kind":"curve","revision":4,"data":{
-            "measured":[{"t":60,"power":410.0}],"all_time":[{"t":60,"power":455.0}],
-            "last_ride":[],"model":[{"t":60,"power":402.1}],"cp":268.0,"wprime":18000.0}},
-          {"id":"volume-week-2026-01-05","kind":"volume_week","revision":4,"data":{
-            "week_start":"2026-01-05","hours":8.25,"tss":540.5,"distance_km":210.4,
-            "calories":6100}},
-          {"id":"ftp-history-2025-12-01","kind":"ftp_history","revision":4,"data":{
-            "date":"2025-12-01","ftp_watts":240.0,"source":"ramp test"}},
-          {"id":"activity-17","kind":"activity","revision":17,"data":{
-            "id":17,"start_time":"2026-01-02T18:04:00","duration_s":3600,
-            "distance_m":32100.5,"avg_power":211,"avg_hr":142,"np":225,
-            "if_":0.9,"tss":81.0,"rpe":6}},
-          {"id":"activity-detail-17","kind":"activity_detail","revision":17,"data":{
-            "id":17,"start_time":"2026-01-02T18:04:00","duration_s":3600,
-            "weight_kg":72.0,"weight_source":"settings","weight_date":"2026-01-01",
-            "zones":{"power":[{"label":"Z2","seconds":1800}]}}},
-          {"id":"stream-17","kind":"stream","revision":17,"data":{
-            "streams":{"time":[0,1,2],"power":[180,null,205],"heartrate":[120,121,123]}}},
-          {"id":"calendar-day-2026-01-02","kind":"calendar_day","revision":4,"data":{
-            "date":"2026-01-02","race":null,"ooto":false,"phase":"Build",
-            "workouts":[{"id":9,"title":"Sweet spot","anything":"else"}],
-            "activities":[]}}
-        ],"revision":4,"next_cursor":null}
-        """)
-
-        XCTAssertEqual(response.items.count, 10)
-        XCTAssertEqual(response.revision, 4)
-        XCTAssertNil(response.nextCursor)
+        let fixture = try sharedFixture()
+        XCTAssertEqual(fixture.version, 1)
+        XCTAssertEqual(fixture.kinds, fixture.kinds.sorted())
+        XCTAssertEqual(fixture.kinds.count, 10)
+        XCTAssertEqual(Set(fixture.kinds).count, fixture.kinds.count)
+        XCTAssertEqual(fixture.items.count, fixture.kinds.count)
+        XCTAssertEqual(Set(fixture.items.map { $0.kind.wire }), Set(fixture.kinds))
         XCTAssertEqual(
-            response.items.map(\.kind),
-            [.profile, .trainingState, .loadPoint, .curve, .volumeWeek, .ftpHistory,
-             .activity, .activityDetail, .stream, .calendarDay]
+            Dictionary(grouping: fixture.items, by: { $0.kind.wire }).mapValues(\.count),
+            Dictionary(uniqueKeysWithValues: fixture.kinds.map { ($0, 1) })
         )
+        for item in fixture.items {
+            if case .other = item.payload {
+                XCTFail("published kind decoded as .other: \(item.kind.wire)")
+            }
+            XCTAssertGreaterThan(item.revision, 0)
+            XCTAssertFalse(item.deleted)
+        }
 
-        guard case let .profile(profile) = response.items[0].payload else {
+        let profile = try XCTUnwrap(fixture.items.first { $0.kind == .profile })
+        guard case let .profile(profilePayload) = profile.payload else {
             return XCTFail("profile did not decode as one")
         }
-        XCTAssertEqual(profile.resolvedFTP, 248)
-        XCTAssertEqual(profile.power?.zones?.count, 2)
-        // The open-ended top zone has no maximum, and that is a value rather
-        // than a missing field: a model demanding it would fail every rider.
-        XCTAssertNil(profile.power?.zones?[1].max)
-        XCTAssertEqual(profile.heartRate?.available, false)
+        XCTAssertEqual(profilePayload.resolvedFTP, 248)
+        XCTAssertEqual(profilePayload.power?.zones?.count, 2)
+        XCTAssertNil(profilePayload.power?.zones?[1].max)
+        XCTAssertEqual(profilePayload.heartRate?.available, false)
 
-        guard case let .stream(stream) = response.items[8].payload else {
+        let stream = try XCTUnwrap(fixture.items.first { $0.kind == .stream })
+        guard case let .stream(streamPayload) = stream.payload else {
             return XCTFail("stream did not decode as one")
         }
-        let power = try XCTUnwrap(stream.streams.power)
+        let power = try XCTUnwrap(streamPayload.streams.power)
         XCTAssertEqual(power.count, 3)
         XCTAssertNil(power[1], "a recording gap stays a gap")
-        XCTAssertNil(stream.streams.cadence, "an unrecorded channel is absent, not empty")
+        XCTAssertNil(streamPayload.streams.cadence, "an unrecorded channel is absent, not empty")
     }
 
-    /// The walking skeleton's publisher writes `ftp_watts`; the derived
-    /// snapshot writes `ftp`. One type reads both, so the debug round-trip and
-    /// the dashboard cannot disagree about what a profile is.
     func testBothProfilePublishersAreUnderstood() throws {
         let skeleton = try decode(
             #"{"items":[{"id":"profile","kind":"profile","revision":1,"data":{"ftp_watts":211.4}}]}"#
@@ -100,9 +75,6 @@ final class CloudModelsTests: XCTestCase {
     }
 
     func testAnUnknownKindSurvivesADecodeAndEncodeUnchanged() throws {
-        // The delta never resends. An object this build cannot model has to
-        // come back out of the cache byte-equivalent, or a rider who updates
-        // the app finds a hole where it used to be.
         let text = """
         {"id":"gadget-1","kind":"gadget","revision":6,\
         "data":{"nested":{"list":[1,2,3],"flag":true,"nothing":null},"name":"x"}}
@@ -113,7 +85,6 @@ final class CloudModelsTests: XCTestCase {
             return XCTFail("an unknown kind must keep its data")
         }
         XCTAssertEqual(value["name"]?.stringValue, "x")
-
         let round = try JSONDecoder().decode(
             CloudItem.self, from: try JSONEncoder().encode(item)
         )
@@ -132,8 +103,6 @@ final class CloudModelsTests: XCTestCase {
     }
 
     func testATombstoneCarriesNoPayloadAndIsNotMistakenForAnObject() throws {
-        // The server sends `data: {}` on a deletion. Decoding that as a
-        // profile would throw on the first required field.
         let response = try decode("""
         {"items":[{"id":"training-state","kind":"training_state","revision":9,
                    "data":{},"deleted":true}],"revision":9,"next_cursor":null}
@@ -148,12 +117,8 @@ final class CloudModelsTests: XCTestCase {
         let original = CachedCollection(
             revision: 12,
             items: [
-                CloudFixtures.item(
-                    id: "profile", kind: "profile", revision: 12, data: #"{"ftp":244}"#
-                ),
-                CloudFixtures.item(
-                    id: "gadget-1", kind: "gadget", revision: 12, data: #"{"a":[1,null]}"#
-                ),
+                CloudFixtures.item(id: "profile", kind: "profile", revision: 12, data: #"{"ftp":244}"#),
+                CloudFixtures.item(id: "gadget-1", kind: "gadget", revision: 12, data: #"{"a":[1,null]}"#),
             ],
             storedAt: Date(timeIntervalSince1970: 1_735_689_600)
         )
@@ -164,10 +129,6 @@ final class CloudModelsTests: XCTestCase {
     }
 
     func testTheRoutesThatServeDeltasAreExactlyTheMobileOnes() {
-        // `api.py` passes `mobile: True` for these three and nothing else.
-        // Sending `since=` anywhere else would be asking a question the route
-        // does not answer, and reading a checkpoint out of the reply would
-        // mistake a truncation for one.
         XCTAssertEqual(
             Set(CloudRoute.allCases.filter(\.servesDeltas)),
             [.dashboard, .volume, .curve]

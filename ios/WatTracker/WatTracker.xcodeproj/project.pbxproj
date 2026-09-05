@@ -35,6 +35,7 @@
 		1A0000000000000000000157 /* CloudSession.swift in Sources */ = {isa = PBXBuildFile; fileRef = 1A0000000000000000000105 /* CloudSession.swift */; };
 		1A00000000000000000000B0 /* Assets.xcassets in Resources */ = {isa = PBXBuildFile; fileRef = 1A00000000000000000000A0 /* Assets.xcassets */; };
 		1A0000000000000000000058 /* canonical_request_v1.json in Resources */ = {isa = PBXBuildFile; fileRef = 1A0000000000000000000038 /* canonical_request_v1.json */; };
+		1A0000000000000000000059 /* cloud_objects_v1.json in Resources */ = {isa = PBXBuildFile; fileRef = 1A000000000000000000003F /* cloud_objects_v1.json */; };
 		1A0000000000000000000190 /* RootView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 1A0000000000000000000090 /* RootView.swift */; };
 		1A0000000000000000000191 /* Destination.swift in Sources */ = {isa = PBXBuildFile; fileRef = 1A0000000000000000000091 /* Destination.swift */; };
 		1A0000000000000000000192 /* SideRail.swift in Sources */ = {isa = PBXBuildFile; fileRef = 1A0000000000000000000092 /* SideRail.swift */; };
@@ -71,6 +72,7 @@
 		1A0000000000000000000112 /* CloudModelsTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = CloudModelsTests.swift; sourceTree = "<group>"; };
 		1A0000000000000000000113 /* SnapshotCacheTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SnapshotCacheTests.swift; sourceTree = "<group>"; };
 		1A0000000000000000000038 /* canonical_request_v1.json */ = {isa = PBXFileReference; lastKnownFileType = text.json; name = canonical_request_v1.json; path = ../../tests/vectors/canonical_request_v1.json; sourceTree = SOURCE_ROOT; };
+		1A000000000000000000003F /* cloud_objects_v1.json */ = {isa = PBXFileReference; lastKnownFileType = text.json; name = cloud_objects_v1.json; path = ../../tests/vectors/cloud_objects_v1.json; sourceTree = SOURCE_ROOT; };
 		1A0000000000000000000039 /* Base.xcconfig */ = {isa = PBXFileReference; lastKnownFileType = text.xcconfig; path = Base.xcconfig; sourceTree = "<group>"; };
 		1A000000000000000000003A /* Debug.xcconfig */ = {isa = PBXFileReference; lastKnownFileType = text.xcconfig; path = Debug.xcconfig; sourceTree = "<group>"; };
 		1A000000000000000000003B /* Release.xcconfig */ = {isa = PBXFileReference; lastKnownFileType = text.xcconfig; path = Release.xcconfig; sourceTree = "<group>"; };
@@ -183,6 +185,7 @@
 			isa = PBXGroup;
 			children = (
 				1A0000000000000000000038 /* canonical_request_v1.json */,
+				1A000000000000000000003F /* cloud_objects_v1.json */,
 			);
 			name = "Shared vectors";
 			sourceTree = "<group>";
@@ -306,6 +309,7 @@
 			buildActionMask = 2147483647;
 			files = (
 				1A0000000000000000000058 /* canonical_request_v1.json in Resources */,
+				1A0000000000000000000059 /* cloud_objects_v1.json in Resources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};

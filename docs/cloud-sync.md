@@ -436,6 +436,27 @@ skipped rather than a device that appears in someone else's listing. Devices
 paired before this change carry no id in their row and are not listed; they
 remain revocable by id.
 
+### Offline end-to-end proof
+
+`tests/test_cloud_api.py` exercises this contract entirely through
+`create_cloud_app` and `TestClient`. One fixture creates two installations and
+two riders, uploads distinct objects, pairs two read-only devices per rider,
+and proves that each reader sees only its own object and scope revision. It
+also tries an object-id read, a `since=` replay, forged namespace/installation/
+scope/credential headers, a cross-rider revoke, and rider A's subscription key
+with rider B's signature. Cross-scope object and revoke targets are identical
+404s, never 403s; the mixed credential is rejected as an authentication
+failure. A correctly signed, well-formed device batch is rejected without
+changing the writer's revision.
+
+A second test revokes a device, checks its already-issued context immediately,
+then recreates the app over the same durable test backend and checks both that
+context and signed refresh again. `tests/vectors/cloud_objects_v1.json` is
+loaded by the Python and Swift suites so every published object kind is
+decoded from one fixture. These proofs are local and require no deployment,
+Azure subscription, credentials, or spend measurement; real cost measurement
+is tracked separately in issue #242.
+
 ### The expired-row sweep
 
 `CloudAuth` accumulates rows that nothing will ever read again: a reader
