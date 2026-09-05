@@ -5,7 +5,7 @@ import json
 import sqlite3
 
 from wattracker import db
-from wattracker.cloud.models import SyncBatch
+from wattracker.cloud.models import PUBLISHED_OBJECT_KINDS, SyncBatch
 from wattracker.cloud.snapshot import (
     DETAIL_MAX_POINTS,
     _calendar_day_objects,
@@ -96,10 +96,11 @@ def test_derived_snapshot_round_trips_all_kinds_and_keeps_streams_opt_in(tmp_pat
 
     objects = snapshot_objects(path, user_id, include_streams=True)
     kinds = {obj.kind for obj in objects}
-    assert {
-        "profile", "training_state", "ftp_history", "load_point", "curve",
-        "volume_week", "calendar_day", "activity", "activity_detail", "stream",
-    } <= kinds
+    # Equality, not a subset. PUBLISHED_OBJECT_KINDS is the publisher/model
+    # contract the Swift decoder is generated against, so a kind emitted here
+    # and absent there is exactly the silent drift the contract exists to
+    # prevent - and a subset check cannot see it.
+    assert kinds == PUBLISHED_OBJECT_KINDS
     assert all(
         len(values) <= DETAIL_MAX_POINTS
         for obj in objects

@@ -442,9 +442,18 @@ remain revocable by id.
 `create_cloud_app` and `TestClient`. One fixture creates two installations and
 two riders, uploads distinct objects, pairs two read-only devices per rider,
 and proves that each reader sees only its own object and scope revision. It
-also tries an object-id read, a `since=` replay, forged namespace/installation/
-scope/credential headers, a cross-rider revoke, and rider A's subscription key
-with rider B's signature. Cross-scope object and revoke targets are identical
+also tries an object-id read, a `since=` replay, a cross-rider revoke, and
+rider A's subscription key with rider B's signature.
+
+Header manipulation is proven elsewhere, and deliberately not by the two-rider
+fixture. That fixture sends forged namespace, installation, scope and
+credential headers, but the reader plane does not read any of those names, so
+the assertion would hold with plain valid headers too; it is kept only as a
+guard against someone later introducing header-based scope selection. The
+headers the reader plane actually reads are covered by
+`test_reader_context_requires_the_apim_verified_subject_proof_by_default`,
+`test_non_ascii_reader_auth_headers_fail_closed` and
+`test_configured_gateway_proof_cannot_be_forged_with_boolean_marker`. Cross-scope object and revoke targets are identical
 404s, never 403s; the mixed credential is rejected as an authentication
 failure. A correctly signed, well-formed device batch is rejected without
 changing the writer's revision.

@@ -1672,8 +1672,15 @@ def test_two_riders_are_isolated_across_objects_revisions_headers_and_capabiliti
         "items": [], "revision": 3, "next_cursor": None,
     }
 
-    # Namespace, installation, scope, and credential headers are not selectors;
-    # the bearer context remains bound to rider B.
+    # A forward-looking guard, NOT evidence of header hardening. None of these
+    # names is read by the reader plane today: _resolve_reader reads only
+    # `authorization`, the gateway-proof header and the verified-subject
+    # header, so this block passes just as well with plain valid headers and
+    # proves nothing on its own. It is kept so that adding header-based scope
+    # selection later fails here first. The headers the reader plane really
+    # does read are covered by test_reader_context_requires_the_apim_verified_
+    # subject_proof_by_default, test_non_ascii_reader_auth_headers_fail_closed
+    # and test_configured_gateway_proof_cannot_be_forged_with_boolean_marker.
     forged_headers = {
         **_mobile_headers(b_token),
         "X-Namespace": rider_a.namespace,
