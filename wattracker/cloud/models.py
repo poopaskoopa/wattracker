@@ -22,6 +22,22 @@ MAX_BATCH_REVISION = (1 << 63) - 1
 # callers still need to round-trip effective legacy streams unchanged.
 MAX_PAYLOAD_ARRAY_ITEMS = 16_384
 
+# The object kinds emitted by ``cloud.snapshot`` and decoded by the mobile
+# client.  CloudObject remains forward-compatible with unknown kinds; this
+# set is the explicit publisher/model contract exercised by both test suites.
+PUBLISHED_OBJECT_KINDS = frozenset({
+    "profile",
+    "training_state",
+    "ftp_history",
+    "load_point",
+    "curve",
+    "volume_week",
+    "calendar_day",
+    "activity",
+    "activity_detail",
+    "stream",
+})
+
 _OPAQUE_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._~-]{0,127}$")
 _KIND = re.compile(r"^[a-z][a-z0-9_.-]{0,63}$")
 _DANGEROUS_KEYS = {

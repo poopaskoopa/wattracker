@@ -2,6 +2,7 @@ import base64
 import hashlib
 import hmac
 import json
+from pathlib import Path
 
 import pytest
 from fastapi.testclient import TestClient
@@ -12,7 +13,11 @@ from wattracker.cloud.api import (
     _cursor_key,
     create_cloud_app,
 )
-from wattracker.cloud.models import CloudObject, SyncBatch
+from wattracker.cloud.models import (
+    PUBLISHED_OBJECT_KINDS,
+    CloudObject,
+    SyncBatch,
+)
 from wattracker.cloud.security import (
     DEVICE_PAIRING_CODE_BITS,
     MAX_DEVICE_PAIRING_TTL_SECONDS,
@@ -32,6 +37,7 @@ from wattracker.cloud.storage import MemoryTenantStore
 
 
 SECRET = b"cloud-test-server-secret-32-bytes-long"
+CLOUD_OBJECT_VECTOR = Path(__file__).parent / "vectors" / "cloud_objects_v1.json"
 
 
 @pytest.fixture()
@@ -104,6 +110,24 @@ def _batch(*, installation_id="caller-selected", scope="caller-selected", revisi
             "kind": "activity",
             "revision": revision,
             "data": {"duration_s": 10, "watts": 250},
+        }],
+    }, separators=(",", ":")).encode()
+
+
+def _rider_batch(*, object_id, rider, revision):
+    return json.dumps({
+        "batch_id": f"{rider}-batch-{revision}",
+        "revision": revision,
+        "installation_id": f"{rider}-caller-installation",
+        "local_user_scope": f"{rider}-caller-scope",
+        "objects": [{
+            "id": object_id,
+            "kind": "activity",
+            "revision": revision,
+            "data": {
+                "duration_s": 10,
+                "rider_marker": rider,
+            },
         }],
     }, separators=(",", ":")).encode()
 
@@ -926,6 +950,35 @@ def _device_sync_headers(device, private_key, body, *, nonce="device-nonce",
     }
 
 
+def _admin_headers(credential, signer, *, method, path, nonce, idem,
+                   subscription=None, timestamp=1_000, revision=0):
+    canonical = canonical_request(
+        method, path, credential.namespace, timestamp, nonce,
+        digest_body(b""), idem, str(revision),
+    )
+    return {
+        "Ocp-Apim-Subscription-Key": (
+            subscription
+            if subscription is not None
+            else credential.subscription_key.decode("ascii")
+        ),
+        "X-APIM-Client-Certificate-Verified": "true",
+        "X-Writer-Credential": credential.credential_id,
+        "X-Writer-Timestamp": str(timestamp),
+        "X-Writer-Nonce": nonce,
+        "X-Writer-Idempotency-Key": idem,
+        "X-Writer-Revision": str(revision),
+        "X-Writer-Signature": signer(canonical),
+        "X-Verified-Entra-Subject": "entra-user",
+    }
+
+
+def _assert_not_found(response):
+    assert response.status_code == 404, response.text
+    assert response.json() == {"detail": "not found"}
+    assert response.headers["cache-control"] == "no-store"
+
+
 @pytest.mark.parametrize("algorithm", ["ed25519", "ecdsa-p256-sha256"])
 def test_device_refresh_returns_a_usable_reader_context(cloud, algorithm):
     _config, state, client = cloud
@@ -1517,6 +1570,297 @@ def _paired_device(state, client, writer, *, nonce="mint-1", subject="entra-user
     device = state.credentials.resolve_device(paired.json()["device_credential"])
     assert device is not None
     return device, private_key, paired.json()
+
+
+def test_two_riders_are_isolated_across_objects_revisions_headers_and_capabilities(
+    cloud,
+):
+    """Exercise the whole client-side boundary with two independent riders."""
+    pytest.importorskip("cryptography")
+    _config, state, client = cloud
+    rider_a = _writer(state, b"a", scope="rider-a")
+    rider_b = _writer(state, b"b", scope="rider-b")
+    object_a = "activity-rider-a"
+    object_b = "activity-rider-b"
+    body_a = _rider_batch(object_id=object_a, rider="rider-a", revision=7)
+    body_b = _rider_batch(object_id=object_b, rider="rider-b", revision=3)
+
+    assert rider_a.namespace != rider_b.namespace
+    assert client.post(
+        "/api/v1/sync/batches",
+        headers=_headers(
+            rider_a, body_a, nonce="upload-a", revision=7,
+            idem="rider-a-batch-7",
+        ),
+        content=body_a,
+    ).status_code == 200
+    assert client.post(
+        "/api/v1/sync/batches",
+        headers=_headers(
+            rider_b, body_b, nonce="upload-b", revision=3,
+            idem="rider-b-batch-3",
+        ),
+        content=body_b,
+    ).status_code == 200
+
+    a_phone, a_phone_key, a_phone_body = _paired_device(
+        state, client, rider_a, nonce="a-phone"
+    )
+    a_tablet, _a_tablet_key, a_tablet_body = _paired_device(
+        state, client, rider_a, nonce="a-tablet"
+    )
+    b_phone, b_phone_key, b_phone_body = _paired_device(
+        state, client, rider_b, nonce="b-phone"
+    )
+    b_tablet, _b_tablet_key, b_tablet_body = _paired_device(
+        state, client, rider_b, nonce="b-tablet"
+    )
+    assert {
+        a_phone.namespace, a_tablet.namespace,
+        b_phone.namespace, b_tablet.namespace,
+    } == {rider_a.namespace, rider_b.namespace}
+    assert {
+        a_phone.local_user_scope, a_tablet.local_user_scope,
+        b_phone.local_user_scope, b_tablet.local_user_scope,
+    } == {"rider-a", "rider-b"}
+    assert len({
+        a_phone.credential_id, a_tablet.credential_id,
+        b_phone.credential_id, b_tablet.credential_id,
+    }) == 4
+
+    a_token = a_phone_body["reader_context"]
+    b_token = b_phone_body["reader_context"]
+    a_items = client.get(
+        "/api/v1/context/activities?since=0",
+        headers=_mobile_headers(a_token),
+    )
+    b_items = client.get(
+        "/api/v1/context/activities?since=0",
+        headers=_mobile_headers(b_token),
+    )
+    assert a_items.status_code == b_items.status_code == 200
+    assert [item["id"] for item in a_items.json()["items"]] == [object_a]
+    assert [item["id"] for item in b_items.json()["items"]] == [object_b]
+    assert a_items.json()["items"][0]["data"]["rider_marker"] == "rider-a"
+    assert b_items.json()["items"][0]["data"]["rider_marker"] == "rider-b"
+
+    assert client.get(
+        f"/api/v1/context/activities/{object_a}",
+        headers=_mobile_headers(a_token),
+    ).status_code == 200
+    _assert_not_found(client.get(
+        f"/api/v1/context/activities/{object_a}",
+        headers=_mobile_headers(b_token),
+    ))
+
+    # A scope revision is not a global clock.  Asking rider B to replay past
+    # rider A's checkpoint returns B's checkpoint and no object from A.
+    a_context = client.get(
+        "/api/v1/context", headers=_mobile_headers(a_token)
+    )
+    b_context = client.get(
+        "/api/v1/context", headers=_mobile_headers(b_token)
+    )
+    assert a_context.json()["revision"] == 7
+    assert b_context.json()["revision"] == 3
+    cross_replay = client.get(
+        f"/api/v1/context/activities?since={a_context.json()['revision']}",
+        headers=_mobile_headers(b_token),
+    )
+    assert cross_replay.status_code == 200
+    assert cross_replay.json() == {
+        "items": [], "revision": 3, "next_cursor": None,
+    }
+
+    # Namespace, installation, scope, and credential headers are not selectors;
+    # the bearer context remains bound to rider B.
+    forged_headers = {
+        **_mobile_headers(b_token),
+        "X-Namespace": rider_a.namespace,
+        "X-Installation-ID": "a" * 32,
+        "X-Local-User-Scope": rider_a.local_user_scope,
+        "X-Device-Credential": a_phone.credential_id,
+        "X-Writer-Credential": rider_a.credential_id,
+        "Ocp-Apim-Subscription-Key": rider_a.subscription_key.decode("ascii"),
+    }
+    _assert_not_found(client.get(
+        f"/api/v1/context/activities/{object_a}", headers=forged_headers
+    ))
+    forged_replay = client.get(
+        "/api/v1/context/activities?since=0", headers=forged_headers
+    )
+    assert [item["id"] for item in forged_replay.json()["items"]] == [object_b]
+
+    # A valid B signature carrying A's subscription key cannot reach B's
+    # device listing, and in particular never turns into a cross-rider 403.
+    wrong_subscription = client.get(
+        "/api/v1/devices",
+        headers=_admin_headers(
+            b_phone,
+            lambda material: _sign(b_phone, b_phone_key, material),
+            method="GET",
+            path="/api/v1/devices",
+            nonce="b-list-wrong-key",
+            idem="device-list",
+            subscription=rider_a.subscription_key.decode("ascii"),
+        ),
+    )
+    assert wrong_subscription.status_code == 401
+    assert wrong_subscription.status_code != 403
+
+    for writer, expected in (
+        (rider_a, {a_phone.credential_id, a_tablet.credential_id}),
+        (rider_b, {b_phone.credential_id, b_tablet.credential_id}),
+    ):
+        listing = client.get(
+            "/api/v1/devices",
+            headers=_admin_headers(
+                writer,
+                lambda material, writer=writer: sign_request(
+                    writer.signing_key, material
+                ),
+                method="GET",
+                path="/api/v1/devices",
+                nonce=f"{writer.local_user_scope}-list",
+                idem="device-list",
+            ),
+        )
+        assert listing.status_code == 200, listing.text
+        assert {
+            entry["credential_id"] for entry in listing.json()["devices"]
+        } == expected
+
+    # A well-formed, correctly signed batch still cannot be written by a
+    # read-only device credential.
+    forbidden_body = _rider_batch(
+        object_id="activity-forbidden", rider="rider-a", revision=8
+    )
+    forbidden = client.post(
+        "/api/v1/sync/batches",
+        headers=_device_sync_headers(
+            a_phone, a_phone_key, forbidden_body,
+            nonce="a-forbidden-write", revision=8,
+            idem="rider-a-batch-8",
+        ),
+        content=forbidden_body,
+    )
+    assert forbidden.status_code == 401
+    assert state.store.revision(rider_a.namespace, rider_a.local_user_scope) == 7
+    assert state.store.get(
+        rider_a.namespace, rider_a.local_user_scope, "activity-forbidden"
+    ) is None
+
+    # An authenticated B device may not revoke an A device by knowing its id.
+    cross_revoke = client.post(
+        f"/api/v1/devices/{a_phone.credential_id}/revoke",
+        headers=_admin_headers(
+            b_phone,
+            lambda material: _sign(b_phone, b_phone_key, material),
+            method="POST",
+            path=f"/api/v1/devices/{a_phone.credential_id}/revoke",
+            nonce="b-cross-revoke",
+            idem="device-revoke",
+        ),
+    )
+    _assert_not_found(cross_revoke)
+    assert state.credentials.resolve_device(a_phone.credential_id) is not None
+    assert a_tablet_body["device_credential"] != a_phone_body["device_credential"]
+    assert b_tablet_body["device_credential"] != b_phone_body["device_credential"]
+
+
+def test_revoked_device_loses_existing_context_immediately_and_after_restart():
+    pytest.importorskip("cryptography")
+    backend = _DurableMemoryBackend()
+    config = CloudConfig(
+        server_secret=SECRET,
+        operator_token="operator-token",
+        require_gateway_proof=False,
+        clock=lambda: 1_000,
+    )
+    store = MemoryTenantStore()
+    state = CloudState.create(config, security_backend=backend, store=store)
+
+    with TestClient(create_cloud_app(config, state=state)) as client:
+        writer = _writer(state, b"r", scope="revocation-rider")
+        device, private_key, paired = _paired_device(
+            state, client, writer, nonce="revocation-phone"
+        )
+        reader_headers = _mobile_headers(paired["reader_context"])
+        assert client.get(
+            "/api/v1/context/activities", headers=reader_headers
+        ).status_code == 200
+
+        revoked = client.post(
+            f"/api/v1/devices/{device.credential_id}/revoke",
+            headers=_admin_headers(
+                writer,
+                lambda material: sign_request(writer.signing_key, material),
+                method="POST",
+                path=f"/api/v1/devices/{device.credential_id}/revoke",
+                nonce="revoke-phone",
+                idem="device-revoke",
+            ),
+        )
+        assert revoked.status_code == 200, revoked.text
+        assert revoked.json() == {"revoked": True}
+        _assert_not_found(client.get(
+            "/api/v1/context/activities", headers=reader_headers
+        ))
+
+    restarted = CloudState.create(
+        config, security_backend=backend, store=store
+    )
+    revoked_device = restarted.credentials.lookup_device(device.credential_id)
+    assert revoked_device is not None
+    assert revoked_device.revoked and not revoked_device.active
+
+    with TestClient(create_cloud_app(config, state=restarted)) as client:
+        _assert_not_found(client.get(
+            "/api/v1/context/activities", headers=reader_headers
+        ))
+        _assert_not_found(client.post(
+            "/api/v1/context/refresh",
+            headers=_refresh_headers(
+                revoked_device, private_key, nonce="revoked-after-restart"
+            ),
+        ))
+        listing = client.get(
+            "/api/v1/devices",
+            headers=_admin_headers(
+                writer,
+                lambda material: sign_request(writer.signing_key, material),
+                method="GET",
+                path="/api/v1/devices",
+                nonce="list-after-restart",
+                idem="device-list",
+            ),
+        )
+        assert listing.status_code == 200, listing.text
+        entry = next(
+            item for item in listing.json()["devices"]
+            if item["credential_id"] == device.credential_id
+        )
+        assert entry["revoked"] is True
+
+
+def test_shared_cloud_object_fixture_matches_python_published_kinds():
+    fixture = json.loads(CLOUD_OBJECT_VECTOR.read_text(encoding="utf-8"))
+    assert fixture["version"] == 1
+    assert fixture["kinds"] == sorted(PUBLISHED_OBJECT_KINDS)
+    assert len(fixture["items"]) == len(PUBLISHED_OBJECT_KINDS)
+    assert {
+        item["kind"] for item in fixture["items"]
+    } == PUBLISHED_OBJECT_KINDS
+
+    for raw in fixture["items"]:
+        parsed = CloudObject(
+            object_id=raw["id"],
+            kind=raw["kind"],
+            revision=raw["revision"],
+            data=raw.get("data", {}),
+            deleted=raw.get("deleted", False),
+        )
+        assert parsed.wire() == raw
 
 
 def test_desktop_pairs_two_devices_into_its_own_single_namespace(cloud):
