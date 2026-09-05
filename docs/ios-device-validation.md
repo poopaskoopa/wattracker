@@ -8,18 +8,22 @@ Enclave branch never executes.
 
 ## Point the app at a server first
 
-- Start a server. For the local harness:
-  `./.venv/bin/python scripts/walking_skeleton_server.py`, which enrols a
-  writer, pushes a real profile, and prints a writer-signed pairing code.
-- Set `WATTRACKER_API_HOST` in `ios/WatTracker/Config/Debug.xcconfig` to the
-  serving machine's address and port. **Re-check it immediately before every
-  run** with `ipconfig getifaddr en0` — the address changes with the network
-  (a phone hotspot puts the Mac on `172.20.10.x`), and a stale one fails as
-  what looks like a pairing error rather than a networking one.
+- Start the local harness with `--lan`:
+  `./.venv/bin/python scripts/walking_skeleton_server.py --lan`. It enrols a
+  writer, pushes a real snapshot, prints a writer-signed pairing code, and —
+  the part that matters for a device — detects the Mac's own LAN address,
+  binds every interface, and writes it to `ios/WatTracker/Config/Local.xcconfig`,
+  which `Debug.xcconfig` optionally includes. Never hardcode an address: it
+  changes with the network (a phone hotspot puts the Mac on `172.20.10.x`),
+  and a stale one fails as what looks like a pairing error rather than a
+  networking one. `Local.xcconfig` is gitignored; `--no-xcconfig` skips it.
+- Rebuild after starting the server — Xcode reads xcconfig at build time, so a
+  build made before the harness wrote the file still carries the old host.
 - Build the **Debug** configuration. Debug uses `Info-Debug.plist`, which
   carries `NSAllowsLocalNetworking`; Release has no ATS exception at all and
   every request to a plain-HTTP LAN address fails silently.
-- Do not commit the edited xcconfig. `git checkout --` it when finished.
+- Phone and Mac must be on the same network, and the Mac's firewall must allow
+  incoming connections for the Python binary.
 
 ## Checklist
 
