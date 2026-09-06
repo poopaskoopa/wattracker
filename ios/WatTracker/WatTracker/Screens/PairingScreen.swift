@@ -59,7 +59,7 @@ struct PairingScreen: View {
                 Text("Pair this device")
                     .font(.title2.weight(.semibold))
                     .foregroundStyle(Palette.textBright)
-                Text("Open WatTracker on your computer and ask it for a pairing code.")
+                Text("Open wattracker on your computer and ask it for a pairing code.")
                     .font(.subheadline)
                     .foregroundStyle(Palette.muted)
             }
@@ -137,7 +137,7 @@ struct PairingScreen: View {
                     .accessibilityIdentifier("pairing-scan-hint")
                 case .undetermined:
                     Text(
-                        "WatTracker can read the pairing code with the camera so you do not "
+                        "wattracker can read the pairing code with the camera so you do not "
                         + "have to type it."
                     )
                     .font(.caption)
@@ -147,9 +147,9 @@ struct PairingScreen: View {
                         .tint(Palette.accent)
                 case .denied:
                     Text(
-                        "WatTracker does not have access to the camera. To scan instead of "
+                        "wattracker does not have access to the camera. To scan instead of "
                         + "typing, open Settings > Privacy & Security > Camera and turn "
-                        + "WatTracker on."
+                        + "wattracker on."
                     )
                     .font(.caption)
                     .foregroundStyle(Palette.muted)
@@ -240,7 +240,7 @@ final class PairingModel {
         guard !isWorking else { return }
         let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
         guard let grouped = PairingCode.grouped(trimmed) else {
-            scanHint = "That barcode is not a WatTracker pairing code. "
+            scanHint = "That barcode is not a wattracker pairing code. "
                 + "Point the camera at the code shown on your computer."
             return
         }

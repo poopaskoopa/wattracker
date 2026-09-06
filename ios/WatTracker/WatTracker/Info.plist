@@ -5,7 +5,7 @@
 	<key>CFBundleDevelopmentRegion</key>
 	<string>$(DEVELOPMENT_LANGUAGE)</string>
 	<key>CFBundleDisplayName</key>
-	<string>WatTracker</string>
+	<string>wattracker</string>
 	<key>CFBundleExecutable</key>
 	<string>$(EXECUTABLE_NAME)</string>
 	<key>CFBundleIdentifier</key>
@@ -72,7 +72,7 @@
 	     rather than tolerated: the code can always be typed instead, so a
 	     denied camera costs the rider twelve keystrokes and nothing else. -->
 	<key>NSCameraUsageDescription</key>
-	<string>WatTracker uses the camera to scan the pairing code shown by the WatTracker app on your computer. You can also type the code instead.</string>
+	<string>wattracker uses the camera to scan the pairing code shown by the wattracker app on your computer. You can also type the code instead.</string>
 	<key>UIApplicationSupportsIndirectInputEvents</key>
 	<true/>
 	<!-- No NSAppTransportSecurity key: a Release build gets ATS's default of

@@ -129,7 +129,7 @@ struct SettingsScreen: View {
                     .foregroundStyle(Palette.textBright)
                 Text(
                     "Revokes this device's access on the server and deletes everything it has "
-                    + "stored. You will need a new pairing code to use WatTracker here again."
+                    + "stored. You will need a new pairing code to use wattracker here again."
                 )
                 .font(.caption)
                 .foregroundStyle(Palette.muted)

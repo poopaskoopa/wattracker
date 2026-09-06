@@ -74,7 +74,7 @@ struct RootView: View {
             .listStyle(.sidebar)
             .scrollContentBackground(.hidden)
             .background(Palette.bg)
-            .navigationTitle("WatTracker")
+            .navigationTitle("wattracker")
         } detail: {
             NavigationStack {
                 screen(for: selection ?? .dashboard)

@@ -35,7 +35,7 @@ struct AppGate: View {
         Group {
             switch gate.phase {
             case .starting:
-                GateMessage(title: "WatTracker", detail: nil, showsProgress: true)
+                GateMessage(title: "wattracker", detail: nil, showsProgress: true)
             case .unpaired:
                 PairingScreen()
             case .paired:
@@ -46,7 +46,7 @@ struct AppGate: View {
             case let .unusable(reason):
                 GateMessage(
                     title: "This device cannot be paired",
-                    detail: "WatTracker could not create a signing key on this device, so "
+                    detail: "wattracker could not create a signing key on this device, so "
                         + "nothing it sends can be accepted.\n\n\(reason)",
                     showsProgress: false
                 )
@@ -81,7 +81,7 @@ private struct RemovedScreen: View {
             title: "This device was removed",
             detail: "Its access to your training data has been revoked and everything it had "
                 + "stored has been deleted. Pair again with a new code from the desktop app "
-                + "to use WatTracker on this device.",
+                + "to use wattracker on this device.",
             showsProgress: false
         ) {
             Button("Pair again") { Task { await gate.startOver() } }
