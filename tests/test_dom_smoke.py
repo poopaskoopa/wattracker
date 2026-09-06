@@ -883,6 +883,107 @@ def test_volume_empty_history_keeps_the_summary_head_hidden(
     _assert_clean(console_errors, "/volume empty history")
 
 
+def test_volume_hero_chart_y_axis_floors_at_zero_and_keeps_top_headroom(
+        page, live_server, console_errors):
+    """No metric may render a sub-zero band, and every metric keeps headroom.
+
+    Hours, TSS, distance and calories are all non-negative, so plot area below
+    zero is area every bar is shortened by. It went missing for real: on a
+    290-week history the axis drew -5..10 for hours and -100..300 for distance,
+    while calories looked fine. The three that broke are the three the API
+    reports with decimals; rollingMean's running sum leaves a float residue
+    (-1.1e-16) where those decimals cancel across a stretch of zero weeks, and
+    a data minimum a hair below zero slips past both `beginAtZero` (which only
+    clamps a strictly positive minimum) and `_addGrace` (which only spares a
+    minimum of exactly 0). `grace` then takes 6% of the range off it and
+    `bounds: "ticks"` rounds that down a whole tick step. Calories was never
+    correct-by-design - it is reported as a whole number, so its sums cancel
+    exactly and it never grew the residue.
+
+    The series below reproduce that shape: decimals for the three, integers for
+    calories, each with a run of zero weeks after real ones. The floor is
+    asserted on all four, calories included - it is the one nothing else
+    watches.
+
+    The headroom half is not decoration: LATEST_LABEL_PLUGIN writes the latest
+    week's value above its own bar and clamps it into the space `grace` leaves.
+    Flooring the axis by deleting the grace would pass the first assertion and
+    put that label on top of the tallest bar, so the top margin is pinned here
+    too. Each series peaks on a value that is already a whole tick step (10 /
+    500 / 200 / 5000), so tick rounding alone cannot manufacture that headroom.
+    """
+    series = {
+        "hours": [7.86, 7.78, 7.14, 4.34, 7.77, 2.11, 7.33, 4.54, 5.72,
+                  0.0, 0.0, 0.0, 0.0, 0.0, 10.0],
+        "tss": [0.0, 0.0, 90.5, 180.5, 89.0, 398.1, 348.2, 68.0, 472.3,
+                0.0, 0.0, 0.0, 0.0, 0.0, 500.0],
+        "distance_km": [75.5, 120.5, 53.2, 59.7, 70.0, 20.8, 34.4, 131.3, 89.2,
+                        0.0, 0.0, 0.0, 0.0, 0.0, 200.0],
+        "calories": [0, 3200, 1800, 4100, 900, 2600, 3900, 4400, 2100,
+                     0, 0, 0, 0, 0, 5000],
+    }
+    monday = dt.date(2025, 1, 6)
+    weeks = [
+        dict({"week_start": (monday + dt.timedelta(weeks=i)).isoformat()},
+             **{key: values[i] for key, values in series.items()})
+        for i in range(len(series["hours"]))
+    ]
+    _stub_volume_weeks(page, weeks)
+    page.goto(f"{live_server.base}/volume")
+    _wait_for_charts(page, "volumeChart")
+
+    # The trailing mean is a mean of non-negative weeks, so it cannot be
+    # negative -- and "-0.0" in a tooltip is the visible half of the same bug.
+    worst_mean = page.evaluate(
+        """() => Math.min.apply(null, Object.values(means).flat())"""
+    )
+    assert worst_mean >= 0, (
+        f"rolling mean went negative (float residue): {worst_mean!r}"
+    )
+
+    for key in ["hours", "tss", "distance_km", "calories"]:
+        page.locator(f'#volumeSummary .metric-tile[data-key="{key}"]').click()
+        page.wait_for_timeout(150)
+        axis = page.evaluate(
+            """() => {
+                const c = Chart.getChart(document.getElementById('volumeChart'));
+                const y = c.scales.y;
+                const values = c.data.datasets
+                    .flatMap(d => d.data).filter(v => v != null);
+                return {
+                    min: y.min, max: y.max,
+                    firstTick: y.ticks.length ? y.ticks[0].value : null,
+                    dataMax: Math.max.apply(null, values),
+                };
+            }"""
+        )
+        assert axis["min"] == 0, f"{key} y axis dips below zero: {axis}"
+        assert axis["firstTick"] >= 0, (
+            f"{key} y axis draws a negative tick: {axis}"
+        )
+        assert axis["max"] >= axis["dataMax"] * 1.05, (
+            f"{key} y axis left no headroom for the latest-value label: {axis}"
+        )
+
+    # ...and the floor must not depend on the data being pristine. Feed the
+    # live chart the residue rollingMean no longer produces: the axis is the
+    # last line of defence and has to hold on its own.
+    forced = page.evaluate(
+        """() => {
+            const c = Chart.getChart(document.getElementById('volumeChart'));
+            c.data.datasets[1].data[0] = -1.1e-16;
+            c.update('none');
+            const y = c.scales.y;
+            return {min: y.min, firstTick: y.ticks[0].value};
+        }"""
+    )
+    assert forced["min"] == 0 and forced["firstTick"] >= 0, (
+        f"a -1.1e-16 data point reopened the sub-zero band: {forced}"
+    )
+
+    _assert_clean(console_errors, "/volume y-axis floor")
+
+
 def test_every_nav_page_loads_clean(page, live_server, console_errors):
     """Every top-level nav page: HTTP 200, expected heading, zero JS errors."""
     failures = []
