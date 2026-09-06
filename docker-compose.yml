@@ -1,7 +1,8 @@
 services:
   wattracker:
     build: .
-    image: wattracker:latest
+    # Built image tag. Set WATTRACKER_IMAGE in .env for a custom tag.
+    image: "${WATTRACKER_IMAGE:-wattracker:latest}"
     container_name: wattracker
     restart: unless-stopped
     ports:
