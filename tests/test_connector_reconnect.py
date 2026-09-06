@@ -681,6 +681,167 @@ def test_being_displaced_leaves_a_reason_a_rider_can_act_on(tmp_path, monkeypatc
     assert "4409" not in connector.status.stopped_reason
 
 
+def test_a_revoked_device_is_terminal_and_says_so(tmp_path, monkeypatch):
+    """The 403 at the handshake is not a network failure.
+
+    Backing off and redialling the same revoked token forever is exactly what
+    the rider should not see: it looks like an unreachable server, so someone
+    who does not open the log chases a network problem. The correct shape is
+    "not connected, and that is the end of it" - stop retrying, and leave the
+    sentence the tray will show where the tray can find it.
+    """
+    from wattracker_connector import client as clientmod
+
+    # Instant backoff: if the revoked path ever falls through to the generic
+    # failure handler, a retrying loop would make many attempts in the sleep
+    # below. The one it must make is the last.
+    monkeypatch.setattr(clientmod, "_BACKOFF_START_S", 0.01)
+    monkeypatch.setattr(clientmod, "_BACKOFF_MAX_S", 0.01)
+
+    rig = _Rig(1, tmp_path)
+    connector = _connector(tmp_path, rig)
+
+    attempts = []
+
+    async def _revoked():
+        attempts.append(1)
+        raise clientmod._Revoked("server rejected WebSocket connection: HTTP 403")
+
+    monkeypatch.setattr(connector, "_session", _revoked)
+
+    thread = threading.Thread(
+        target=lambda: _run(connector.run_forever()), daemon=True
+    )
+    thread.start()
+    deadline = time.monotonic() + 10
+    while time.monotonic() < deadline and not attempts:
+        time.sleep(0.01)
+    assert attempts, "the first attempt never happened"
+
+    # It went idle waiting to be re-paired, it did not retry.
+    time.sleep(0.3)
+    assert attempts == [1], f"a revoked token was retried: {attempts}"
+    assert connector.status.connected is False
+    # "Stopped" to the tray, not "offline and still trying" - and the reason
+    # the rider can act on is left where the tray will read it.
+    assert connector.status.stopped is True
+    assert "revoked" in connector.status.stopped_reason.lower()
+    assert "Pair..." in connector.status.stopped_reason
+
+    # A quit is the other way out of the idle wait, and it must actually end.
+    connector._loop.call_soon_threadsafe(connector.stop)
+    thread.join(timeout=10)
+    assert not thread.is_alive(), "the loop did not exit after the stop"
+    assert connector.status.stopped is True
+
+
+def test_repair_after_revocation_reconnects_with_the_new_token(tmp_path, monkeypatch):
+    """Re-pairing is what un-sticks a revoked device, so the two must compose.
+
+    The 403 path goes idle rather than ending the loop on purpose: reconnect()
+    posts into the loop that is running run_forever, and a loop that has
+    returned cannot be woken - its _loop is None and the repair is a no-op. So
+    a revoked connector has to be sitting in the run loop when the tray's
+    Pair... item saves a fresh token, or the repair never reaches a handshake.
+    """
+    from wattracker_connector import client as clientmod
+
+    monkeypatch.setattr(clientmod, "_BACKOFF_START_S", 0.01)
+    monkeypatch.setattr(clientmod, "_BACKOFF_MAX_S", 0.01)
+
+    rig = _Rig(1, tmp_path)
+    connector = _connector(tmp_path, rig)
+
+    attempts = []
+
+    async def _session():
+        attempts.append(connector.token)
+        if len(attempts) == 1:
+            raise clientmod._Revoked(
+                "server rejected WebSocket connection: HTTP 403"
+            )
+        # A fresh token proves itself: stay connected until we are told to stop.
+        await connector._stop.wait()
+
+    monkeypatch.setattr(connector, "_session", _session)
+
+    thread = threading.Thread(
+        target=lambda: _run(connector.run_forever()), daemon=True
+    )
+    thread.start()
+    deadline = time.monotonic() + 10
+    while time.monotonic() < deadline and not attempts:
+        time.sleep(0.01)
+    assert attempts == ["t"], "the first (revoked) attempt never happened"
+
+    # Gone idle on the revoked token, not retrying it.
+    time.sleep(0.3)
+    assert attempts == ["t"], "a revoked token was retried instead of going idle"
+
+    # The rider re-pairs: the token on the object is new, and the loop dials
+    # with it - no process restart, no backoff to wait out.
+    connector.token = "new-token"
+    connector.reconnect()
+
+    deadline = time.monotonic() + 10
+    while time.monotonic() < deadline and len(attempts) < 2:
+        time.sleep(0.01)
+    connector._loop.call_soon_threadsafe(connector.stop)
+    thread.join(timeout=10)
+    assert not thread.is_alive(), "the loop did not exit after the stop"
+    assert attempts == ["t", "new-token"], (
+        f"the repair after revocation did not redial with the new token: "
+        f"{attempts}"
+    )
+    assert connector.status.stopped is True
+
+
+def test_a_403_at_the_handshake_is_a_revocation_not_a_blip(tmp_path, monkeypatch):
+    """The wire to _Revoked, pinned to the one answer it is.
+
+    The server refuses a revoked token before accept(); uvicorn turns that into
+    an HTTP 403 on the raw socket, and websockets surfaces it as
+    InvalidStatus - "server rejected WebSocket connection: HTTP 403", the line
+    from the issue. A 403 is the refused-credential answer and becomes the
+    terminal _Revoked; any other status is a transport failure left for the
+    ordinary retry path.
+    """
+    import websockets
+
+    from websockets.exceptions import InvalidStatus
+    from wattracker_connector import client as clientmod
+
+    rig = _Rig(1, tmp_path)
+    connector = _connector(tmp_path, rig)
+
+    def _refuse(status_code):
+        from types import SimpleNamespace
+
+        # websockets.connect is used as ``async with ... as connection``, so
+        # the fake has to hand back an async context manager, not a coroutine;
+        # the refusal lands in __aenter__, the way a real handshake fails.
+        class _Rejecting:
+            async def __aenter__(self):
+                # All InvalidStatus.__str__ and the client read is status_code.
+                raise InvalidStatus(SimpleNamespace(status_code=status_code))
+
+            async def __aexit__(self, *_exc):
+                return False
+
+        def _connect(*_args, **_kwargs):
+            return _Rejecting()
+
+        monkeypatch.setattr(websockets, "connect", _connect)
+
+    _refuse(403)
+    with pytest.raises(clientmod._Revoked):
+        _run(connector._session())
+
+    _refuse(500)
+    with pytest.raises(InvalidStatus):
+        _run(connector._session())
+
+
 def test_repair_drops_the_serving_session_and_dials_with_the_new_token(
     tmp_path, monkeypatch
 ):

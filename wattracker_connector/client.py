@@ -70,6 +70,10 @@ class _Replaced(Exception):
     """The server closed us because another connector took over the account."""
 
 
+class _Revoked(Exception):
+    """The server refused our token: the device has been revoked."""
+
+
 class ConnectorStatus:
     """What the tray icon shows. Plain attributes, read from another thread."""
 
@@ -259,6 +263,54 @@ class Connector:
                     )
                     self._stop.set()
                     break
+                except _Revoked as exc:
+                    # A revoked token is a refusal, not a blip. Backing off and
+                    # redialling the same token forever is what the issue is
+                    # about: it looks exactly like an unreachable server, so a
+                    # rider who does not open the log chases a network problem.
+                    # Stop retrying and say why. Unlike _Replaced this is
+                    # recoverable without restarting the process - the tray's
+                    # Pair... item saves a fresh token and wakes this wait - so
+                    # the loop goes idle here rather than ending.
+                    self.status.connected = False
+                    self.status.last_error = str(exc)
+                    self.status.stopped_reason = (
+                        "Use Pair... to re-pair this device: it was revoked, "
+                        "so the server no longer accepts its token."
+                    )
+                    # The tray reads stopped to draw "not reconnecting" instead
+                    # of the retrying spinner, and to hold off the once-per-
+                    # outage "cannot reach" balloon that would misname this.
+                    self.status.stopped = True
+                    log.error(
+                        "the server refused this device's token (HTTP 403); it "
+                        "has been revoked and dialling it again will not help - "
+                        "not retrying. Re-pair the device to reconnect."
+                    )
+                    # Await the only two things that change the outcome, not a
+                    # backoff: a re-pair saves a new token, a quit ends the
+                    # process. Neither runs on the backoff's schedule, so there
+                    # is nothing to time out.
+                    stop_wait = asyncio.ensure_future(self._stop.wait())
+                    reconnect_wait = asyncio.ensure_future(
+                        self._reconnect.wait()
+                    )
+                    try:
+                        await asyncio.wait(
+                            {stop_wait, reconnect_wait},
+                            return_when=asyncio.FIRST_COMPLETED,
+                        )
+                    finally:
+                        stop_wait.cancel()
+                        reconnect_wait.cancel()
+                    if self._stop.is_set():
+                        break
+                    # A new pairing was saved: the token on this object is now
+                    # the fresh one, so the revoked state is over and the next
+                    # dial proves it.
+                    self.status.stopped = False
+                    self.status.stopped_reason = None
+                    continue
                 except Exception as exc:
                     self.status.connected = False
                     self.status.last_error = str(exc)
@@ -311,6 +363,15 @@ class Connector:
         log.info("connecting to %s", url)
         try:
             await self._connected_session(websockets, url)
+        except websockets.exceptions.InvalidStatus as exc:
+            # The handshake got an HTTP answer instead of a 101 - the server
+            # refused us before a socket ever existed. A 403 is a refused
+            # credential: the device has been revoked, and dialling the same
+            # token again is never going to be different. (Any other status is
+            # a transport failure and stays retryable.)
+            if exc.response.status_code == 403:
+                raise _Revoked(str(exc)) from exc
+            raise
         except websockets.exceptions.ConnectionClosed as exc:
             if exc.rcvd is not None and exc.rcvd.code == rpc.WS_REPLACED:
                 raise _Replaced(str(exc)) from exc
