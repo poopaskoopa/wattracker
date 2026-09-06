@@ -303,22 +303,43 @@ class Connector:
                     self.status.connected = False
                     self.status.last_error = str(exc)
                     self.status.stopped_reason = (
-                        "Use Pair... to re-pair this device: it was revoked, "
-                        "so the server no longer accepts its token."
+                        "The server will not accept this device's token - "
+                        "most likely it was revoked. Use Pair... to re-pair "
+                        "this device."
                     )
                     # The tray reads stopped to draw "not reconnecting" instead
                     # of the retrying spinner, and to hold off the once-per-
                     # outage "cannot reach" balloon that would misname this.
                     self.status.stopped = True
+                    # Hedged deliberately: in this app a 403 on the upgrade
+                    # is only ever an unrecognised token, but an authenticating
+                    # proxy in front of the server answers the same way, and
+                    # naming a cause that confidently sends the wrong reader
+                    # looking for a revocation that never happened.
                     log.error(
-                        "the server refused this device's token (HTTP 403); it "
-                        "has been revoked and dialling it again will not help - "
-                        "not retrying. Re-pair the device to reconnect."
+                        "the server refused this device's token (HTTP 403) - "
+                        "most likely it was revoked. Dialling it again will "
+                        "not help, so not retrying; re-pair the device to "
+                        "reconnect. If it was not revoked, check whatever sits "
+                        "in front of the server."
                     )
-                    # Await the only two things that change the outcome, not a
-                    # backoff: a re-pair saves a new token, a quit ends the
-                    # process. Neither runs on the backoff's schedule, so there
-                    # is nothing to time out.
+                    # The radio goes back, for the same reason it goes back
+                    # when the loop ends: nothing is going to pick this ride
+                    # up. A dropped socket keeps the trainer because a server
+                    # is expected back within the backoff; a refusal is that
+                    # server saying it is not coming. This is exactly the case
+                    # _abandon_unclaimed_ride exists for, and it cannot help
+                    # here - it only ever arms inside a session, and the next
+                    # session is on the far side of a re-pair that may be
+                    # hours away. Without this a rider goes on pushing against
+                    # an ERG target no server is managing, while the tray says
+                    # the connector has stopped. The buffer survives teardown
+                    # and goes up on the next connection.
+                    await self.ble.teardown()
+                    # Then wait on the only two things that change the
+                    # outcome, not a backoff: a re-pair saves a new token, a
+                    # quit ends the process. Neither runs on the backoff's
+                    # schedule, so there is nothing to time out.
                     await self._wait_for_repair_or_stop()
                     if self._stop.is_set():
                         break

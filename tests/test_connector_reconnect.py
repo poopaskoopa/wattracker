@@ -963,6 +963,67 @@ def test_repair_while_offline_wakes_the_backoff_instead_of_earning_it(
     assert connector.status.stopped is True
 
 
+def test_a_revocation_mid_ride_gives_the_trainer_back(tmp_path, monkeypatch):
+    """The terminal state has to release the radio, like every other one.
+
+    A dropped socket deliberately keeps the trainer, the sampler and the
+    buffer: a server is expected back within the backoff, and a wifi stutter
+    must not end a workout. A refusal is the opposite - it is that server
+    saying it is not coming - and the safety net that would normally catch
+    this, _abandon_unclaimed_ride, only ever arms *inside* a session. There is
+    no next session until someone re-pairs, which may be hours away.
+
+    Without this the rider is left pushing against an ERG target no server is
+    managing, while the tray reports that the connector has stopped.
+    """
+    from wattracker_connector import client as clientmod
+
+    rig = _Rig(1, tmp_path)
+    connector = _connector(tmp_path, rig)
+
+    # A ride in progress, with the trainer held in ERG.
+    trainer = _Trainer()
+    trainer.erg_enabled = True
+    rig.state.conn = {"trainer": trainer, "clients": [_FakeClient(rig.devices)]}
+    rig.state.ride = {"started_at": "2026-08-01T10:00:00", "name": "VO2"}
+    rig.state.buffer.start("2026-08-01T10:00:00", "VO2", 250.0, None)
+    assert rig.state.riding
+
+    async def _revoked():
+        raise clientmod._Revoked("server rejected WebSocket connection: HTTP 403")
+
+    monkeypatch.setattr(connector, "_session", _revoked)
+
+    thread = threading.Thread(
+        target=lambda: _run(connector.run_forever()), daemon=True
+    )
+    thread.start()
+    deadline = time.monotonic() + 10
+    while time.monotonic() < deadline and not connector.status.stopped:
+        time.sleep(0.01)
+    assert connector.status.stopped, "never reached the terminal state"
+
+    # The radio goes back on the way into the idle wait, not on the way out of
+    # the process: a rider is not going to quit a connector they believe has
+    # already stopped.
+    deadline = time.monotonic() + 10
+    while time.monotonic() < deadline and rig.state.conn is not None:
+        time.sleep(0.01)
+    assert rig.state.conn is None, "the trainer was still held after a revocation"
+    assert rig.state.riding is False
+    assert trainer.erg_enabled is False
+    assert ("disable", None) in trainer.calls, (
+        f"the trainer was never released: {trainer.calls}"
+    )
+
+    # And it is still the recoverable terminal state rather than a quit: the
+    # loop is sitting in the idle wait, where a re-pair can still reach it.
+    assert connector._loop is not None
+    connector._loop.call_soon_threadsafe(connector.stop)
+    thread.join(timeout=10)
+    assert not thread.is_alive(), "the loop did not exit after the stop"
+
+
 def test_a_repair_is_not_charged_an_outages_backoff(tmp_path, monkeypatch):
     """Re-pairing must not make the *next* real outage wait longer.
 
