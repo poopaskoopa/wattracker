@@ -297,6 +297,30 @@ The address after `--server` is the one that must appear in the server's
 `400 Bad Request` before the token is examined, so the symptom — a good token
 that will not connect — points nowhere near the cause.
 
+#### When the server refuses the token
+
+A `403` at the handshake means the server does not recognise the token: the
+device was revoked under **Settings → Connector devices**, or the token is not
+one this server issued. Retrying cannot fix either, and a connector that backs
+off and redials forever is indistinguishable from one that cannot reach the
+server — so it stops dialling and says which it is. On Windows, **Pair…** in
+the tray menu takes a fresh token without a restart and without hand-editing
+`connector.json`; elsewhere, re-run with `--token <NEW> --save`. The connector
+picks up from there without being restarted.
+
+A ride in progress ends when this happens. The trainer is released rather than
+left holding an ERG target no server is managing — a dropped socket keeps the
+trainer, because a server is expected back, but a refusal is that server
+saying it is not coming. Whatever was recorded stays buffered and is uploaded
+on the next successful connection.
+
+One caveat if anything sits in front of the server: *any* `403` on the
+WebSocket upgrade is read as a refused token, and an authenticating proxy
+answers with the same status — a Cloudflare Access policy, a WAF rule, or an
+upgrade the proxy will not forward. The tray will then report a revoked device
+when the token is fine. If re-pairing does not help, check the proxy before
+you check the pairing.
+
 #### How a finished ride reaches the server
 
 The connector watches the Zwift Activities folder and tells the server when a
@@ -387,6 +411,14 @@ The image needs no compiler on either architecture — numpy, pandas and scipy
 all publish manylinux wheels for `aarch64`. **The `linux/amd64` build is the
 one that has actually been run and tested; `linux/arm64` is expected to work
 for that reason but has not been built here.**
+
+`docker compose` builds and runs `wattracker:latest`. Set `WATTRACKER_IMAGE` in
+`.env` to tag it something else — a registry path to push to a NAS or a Pi, or
+a version you want to be able to roll back to:
+
+```sh
+WATTRACKER_IMAGE=ghcr.io/you/wattracker:v2
+```
 
 The database lives on the `/data` volume in WAL mode, so it must be on **local
 disk** — SQLite in WAL mode corrupts on NFS/SMB. The compose file uses a named
