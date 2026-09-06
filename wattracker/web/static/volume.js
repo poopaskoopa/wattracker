@@ -98,13 +98,24 @@ function fillWeeks(weeks) {
 //
 // The first weeks average what exists rather than sitting at null; a gap at
 // the left edge of the line reads as missing data, which it is not.
+//
+// The running sum is what makes this O(n) instead of O(n*window), and it is
+// also the one thing that can hand back a negative training load: adding and
+// later subtracting the same fractional weeks does not cancel exactly in
+// binary floating point, so a stretch of zero weeks after real ones leaves a
+// residue rather than a clean 0. Measured on a real 290-week history: hours
+// sat at -1.1e-16 for six weeks of 2023 and distance at -8.5e-14 for three
+// weeks of 2026. Invisible as ink, but not as data - the tooltip formatted it
+// as "-0.0", and the y scale read a negative minimum off it and opened a
+// sub-zero band under the whole plot. Every input here is non-negative, so a
+// sum below zero is always that residue and never a real value; clamp it.
 function rollingMean(values, window) {
     const out = [];
     let sum = 0;
     for (let i = 0; i < values.length; i++) {
         sum += values[i] || 0;
         if (i >= window) sum -= values[i - window] || 0;
-        out.push(sum / Math.min(i + 1, window));
+        out.push(Math.max(0, sum) / Math.min(i + 1, window));
     }
     return out;
 }
@@ -279,8 +290,27 @@ function makeChart() {
                     },
                 },
                 y: {
+                    // Hours, TSS, distance and calories are all non-negative,
+                    // so plot area below zero is dead space that shortens every
+                    // bar. `beginAtZero` does NOT guarantee its absence: it
+                    // clamps the minimum to 0 only when the data minimum is
+                    // strictly positive, and `_addGrace` refuses to lower a
+                    // minimum only when it is exactly 0. A data minimum a hair
+                    // BELOW zero slips past both, and then `grace` (symmetric -
+                    // it takes 6% of the range off the bottom for every 6% it
+                    // adds to the top) plus the default `bounds: "ticks"`
+                    // rounds that hair down to a whole tick step. Measured on a
+                    // real 290-week history, where the rolling mean carried a
+                    // -1.1e-16 float residue: the hours axis drew -5..10 and
+                    // distance drew -100..300, a quarter to a third of the plot
+                    // under the baseline. rollingMean no longer emits that
+                    // residue, but the floor should not depend on the data
+                    // being pristine - state it here so it holds regardless.
+                    min: 0,
                     beginAtZero: true,
-                    // Headroom for the direct label above the tallest bar.
+                    // Headroom for the direct label above the tallest bar. A
+                    // fixed `min` constrains only the bottom, so the grace
+                    // still applies to the max.
                     grace: "12%",
                     ticks: { maxTicksLimit: 5 },
                     title: { display: true, text: spec.label },
