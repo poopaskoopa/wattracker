@@ -97,6 +97,23 @@ final class ScannerViewController: UIViewController {
     private var previewLayer: AVCaptureVideoPreviewLayer?
     private var configured = false
 
+    /// Keeps the preview the right way up.
+    ///
+    /// A preview layer's connection starts in portrait and stays there unless
+    /// something says otherwise. The phone build is landscape-only, so left
+    /// alone the picture is drawn a quarter turn out: a rider aiming at a QR
+    /// code sees the world lying on its side. Found on device during the #234
+    /// validation run -- nothing automated could have, because the metadata
+    /// output reports codes at any angle, so scanning kept working and only
+    /// the image was wrong.
+    ///
+    /// `RotationCoordinator` is asked for the angle rather than deriving it
+    /// from the interface orientation here, because the mapping between
+    /// interface orientation and video rotation is easy to write backwards and
+    /// the failure looks exactly like this bug.
+    private var rotationCoordinator: AVCaptureDevice.RotationCoordinator?
+    private var rotationObservation: NSKeyValueObservation?
+
     override func viewDidLoad() {
         super.viewDidLoad()
         view.backgroundColor = .black
@@ -144,6 +161,10 @@ final class ScannerViewController: UIViewController {
            let input = try? AVCaptureDeviceInput(device: camera),
            session.canAddInput(input) {
             session.addInput(input)
+            // On the main queue because it touches the preview layer, and
+            // because `RotationCoordinator` reports through KVO into the
+            // layer's connection.
+            DispatchQueue.main.async { [weak self] in self?.trackRotation(of: camera) }
             let output = AVCaptureMetadataOutput()
             if session.canAddOutput(output) {
                 session.addOutput(output)
@@ -165,5 +186,32 @@ final class ScannerViewController: UIViewController {
         guard usable else { return }
         configured = true
         session.startRunning()
+    }
+
+    /// Follow the device's idea of level and keep the connection matching it.
+    ///
+    /// The angle is applied once up front as well as on every change: the
+    /// coordinator only reports when something moves, and a scanner opened in
+    /// a stationary landscape phone never moves.
+    private func trackRotation(of camera: AVCaptureDevice) {
+        let coordinator = AVCaptureDevice.RotationCoordinator(
+            device: camera,
+            previewLayer: previewLayer
+        )
+        rotationCoordinator = coordinator
+        apply(angle: coordinator.videoRotationAngleForHorizonLevelPreview)
+        rotationObservation = coordinator.observe(
+            \.videoRotationAngleForHorizonLevelPreview,
+            options: [.new]
+        ) { [weak self] _, change in
+            guard let angle = change.newValue else { return }
+            DispatchQueue.main.async { self?.apply(angle: angle) }
+        }
+    }
+
+    private func apply(angle: CGFloat) {
+        guard let connection = previewLayer?.connection,
+              connection.isVideoRotationAngleSupported(angle) else { return }
+        connection.videoRotationAngle = angle
     }
 }
