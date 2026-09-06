@@ -37,6 +37,8 @@ ios/WatTracker/
     Info.plist                   versions come from build settings, not literals
     Assets.xcassets/             AppIcon (1024) and AccentColor
     Shell/
+      AppGate.swift              unpaired / paired / removed; owns the session
+      SessionGate.swift          the observable mirror of CloudSession's state
       RootView.swift             picks the shell for the idiom; the rationale
       Destination.swift          the five destinations, the whole nav model
       SideRail.swift             the iPhone-landscape leading icon rail
@@ -45,7 +47,10 @@ ios/WatTracker/
       ActivitiesScreen.swift     stub - #162
       CalendarScreen.swift       stub - #163
       VolumeScreen.swift         stub - #163
-      SettingsScreen.swift       stub - #160, plus the debug FTP round-trip
+      SettingsScreen.swift       the pairing, the device list, removal, #171
+      PairingScreen.swift        type the code or scan the QR - #234
+      PairingFailureMessage.swift  one message for wrong/expired/already used
+      QRCodeScanner.swift        AVFoundation QR capture and camera permission
     Theme/
       Palette.swift              the desktop palette, ported
       Panel.swift                panel, screen scaffold, stub placeholder
@@ -56,6 +61,7 @@ ios/WatTracker/
       CloudClient.swift          one request each, typed, remembering nothing
       CloudModels.swift          Codable models for every published kind
       CloudSession.swift         token lifecycle, cache, revocation
+      PairingCode.swift          the code's alphabet and shape, from security.py
       CloudTransport.swift       the one place a request leaves the app
       DeviceCredentialStore.swift  the durable credential, in the keychain
       DeviceKey.swift            P-256 key: Secure Enclave, or a gated fallback
@@ -65,6 +71,8 @@ ios/WatTracker/
     CanonicalRequestVectorTests.swift
     CloudModelsTests.swift       the envelope, and the two decoding rules
     CloudSessionTests.swift      expiry, coalescing, 429, revocation, offline
+    SessionGateTests.swift       the gate's states and the transitions between
+    PairingTests.swift           the code's shape, and one message per refusal
     CloudTestSupport.swift       a scripted transport and a clock tests move
     SnapshotCacheTests.swift     protection class, backup exclusion, clearing
 ```
