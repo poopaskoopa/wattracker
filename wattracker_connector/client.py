@@ -217,9 +217,18 @@ class Connector:
         reads the new values.
         """
         loop = self._loop
-        if loop is None or loop.is_closed():
+        if loop is None:
             return
-        loop.call_soon_threadsafe(self._reconnect.set)
+        try:
+            loop.call_soon_threadsafe(self._reconnect.set)
+        except RuntimeError:
+            # The loop closed between the read above and this call - there is
+            # no atomic way to ask. Same case as _loop being None already: the
+            # session holding the old credential is gone, so there is nothing
+            # to drop, and the next start reads the new values. Letting this
+            # out would pop a warning balloon at a rider whose re-pair was in
+            # fact saved.
+            pass
 
     async def _wait_for_repair_or_stop(
         self, timeout: Optional[float] = None
