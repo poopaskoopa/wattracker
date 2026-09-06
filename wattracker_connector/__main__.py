@@ -811,8 +811,50 @@ def _run_with_tray(connector: Connector, settings: dict) -> int:
         log.info("the connector is down; closing the window loop")
         windows.quit()
 
+    def _pair() -> None:
+        """The tray's Pair...: the pairing window again, prefilled.
+
+        On a worker, next to the open one, because the window pumps its own
+        message loop until the rider closes it. What is prefilled is exactly
+        what is saved and in use now; until Save and connect is clicked,
+        neither the config file nor the running connector has changed. That is
+        the whole point of a second pairing after a revocation: no hand edit
+        of connector.json and no --token on a command line.
+        """
+        from . import setup_win32
+
+        try:
+            paired = setup_win32.prompt_for_settings(
+                {"server": settings["server"], "token": settings["token"]}
+            )
+        except setup_win32.SetupUnavailable as exc:
+            log.warning("could not open the pairing window: %s", exc)
+            tray.notify("wattracker connector", str(exc), level="warning")
+            return
+        except Exception:
+            log.exception("the pairing window failed")
+            return
+        if not paired:
+            # Cancelled. The saved token and the one in use are exactly what
+            # they were before the window opened - nothing was written.
+            log.info("the pairing window was cancelled; nothing was saved")
+            return
+        settings.update(paired)
+        redact_secret(paired["token"])
+        save(settings)
+        log.info("repaired from the tray; saved to %s", config_path())
+        # The in-memory half of the save. The session that is serving (if
+        # there is one) was handed the old credential; reconnect() drops it
+        # and dials again with these.
+        connector.token = paired["token"]
+        connector.server_url = paired["server"]
+        connector.status.server_url = paired["server"]
+        connector.reconnect()
+        tray.notify("wattracker connector", "Pairing saved; reconnecting.")
+
     tray = tray_win32.TrayIcon(
-        status=connector.status, on_open=_open_window, on_quit=_quit
+        status=connector.status, on_open=_open_window, on_quit=_quit,
+        on_pair=_pair,
     )
     windows = _WindowLoop(notify=tray.notify)
 

@@ -147,6 +147,16 @@ class Connector:
             self._handlers.update(extra_handlers)
         self._peer: Optional[rpc.RpcPeer] = None
         self._stop = asyncio.Event()
+        # Set when the token (or the server) changed while this object is
+        # running: the session being served was handed the old credential,
+        # and the new one has to prove itself on a fresh handshake. The loop
+        # consumes it once per session it ends because of it - see
+        # run_forever and _serve.
+        self._reconnect = asyncio.Event()
+        # The loop run_forever is running on, held for its life. reconnect()
+        # comes from whatever thread a re-pair happens on, and
+        # call_soon_threadsafe is the only door into the loop.
+        self._loop: Optional[asyncio.AbstractEventLoop] = None
         # Watches the Zwift folder so a finished ride reaches the server in
         # about a minute instead of on the server's daily sweep. The interval
         # is settable (and 0 turns it off) because it is the one thing here a
@@ -191,8 +201,25 @@ class Connector:
     def stop(self) -> None:
         self._stop.set()
 
+    def reconnect(self) -> None:
+        """Drop the current session and reconnect with the current settings.
+
+        The re-pair path: the token and the server have just been reassigned
+        on this object from another thread, and the session being served - if
+        there is one - was handed the old ones. The request is posted to the
+        loop that is running ``run_forever``. Before it has started, or after
+        it has ended, there is no session holding the old credential, so a
+        request then is a no-op rather than an error: the next start already
+        reads the new values.
+        """
+        loop = self._loop
+        if loop is None or loop.is_closed():
+            return
+        loop.call_soon_threadsafe(self._reconnect.set)
+
     async def run_forever(self) -> None:
         """Connect, serve, and reconnect until stopped."""
+        self._loop = asyncio.get_running_loop()
         backoff = _BACKOFF_START_S
         # Started here, not inside a session: the folder has to keep
         # being watched while the socket is down, or a ride finished
@@ -200,6 +227,11 @@ class Connector:
         watch = self._start_activity_watch()
         try:
             while not self._stop.is_set():
+                # The credential the next session will use is whatever the
+                # object holds right now, so any earlier request to reconnect
+                # with a new one has been answered by the session this
+                # iteration is about to start.
+                self._reconnect.clear()
                 try:
                     await self._session()
                     backoff = _BACKOFF_START_S  # a clean session resets the clock
@@ -233,17 +265,33 @@ class Connector:
                     log.warning("connector session ended: %s", exc)
                 if self._stop.is_set():
                     break
+                # A repair, not a failure: the session that just ended was
+                # dropped on purpose because the token changed, so the new
+                # handshake goes out now rather than after the backoff a real
+                # outage would have earned.
+                if self._reconnect.is_set():
+                    continue
                 # Jitter so a fleet of connectors does not stampede a server that
                 # just came back up.
                 ceiling = _RIDE_BACKOFF_MAX_S if self.ble.riding else _BACKOFF_MAX_S
                 delay = min(backoff, ceiling) * (0.5 + random.random())
                 log.info("reconnecting in %.1fs", delay)
+                # The wait has to hear two things: a stop, which ends the loop,
+                # and a repair, which makes the retry land now rather than
+                # whenever the backoff happens to run out.
+                stop_wait = asyncio.ensure_future(self._stop.wait())
+                reconnect_wait = asyncio.ensure_future(self._reconnect.wait())
                 try:
-                    await asyncio.wait_for(self._stop.wait(), timeout=delay)
-                except asyncio.TimeoutError:
-                    pass
+                    await asyncio.wait(
+                        {stop_wait, reconnect_wait}, timeout=delay,
+                        return_when=asyncio.FIRST_COMPLETED,
+                    )
+                finally:
+                    stop_wait.cancel()
+                    reconnect_wait.cancel()
                 backoff = min(backoff * _BACKOFF_FACTOR, _BACKOFF_MAX_S)
         finally:
+            self._loop = None
             await _cancel(watch)
         # Leaving the loop is definitive - Ctrl-C, the tray quitting, or being
         # displaced by another connector - not a reconnect. So the radio goes
@@ -436,9 +484,27 @@ class Connector:
         self._activities_dirty = False
 
     async def _serve(self, socket, peer: rpc.RpcPeer) -> None:
-        """Answer requests until the socket closes or we are told to stop."""
+        """Answer requests until the socket closes or we are told to stop.
+
+        A repair ends the session too: it means the token this session was
+        handed is being replaced, and the new one proves itself on the next
+        handshake, not on this one.
+        """
         while not self._stop.is_set():
-            message = rpc.decode(await socket.receive_text())
+            receive = asyncio.ensure_future(socket.receive_text())
+            reconnect = asyncio.ensure_future(self._reconnect.wait())
+            done, _pending = await asyncio.wait(
+                {receive, reconnect}, return_when=asyncio.FIRST_COMPLETED
+            )
+            if receive not in done:
+                # The token changed while this session was serving the old
+                # one. End it and let run_forever dial again - the next
+                # session reads the new value.
+                receive.cancel()
+                log.info("settings changed; reconnecting with the new token")
+                break
+            reconnect.cancel()
+            message = rpc.decode(receive.result())
             if peer.resolve(message):
                 continue
             if "method" in message:

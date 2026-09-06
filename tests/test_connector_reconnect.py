@@ -24,6 +24,8 @@ session being replaced by a different one.
 from __future__ import annotations
 
 import asyncio
+import threading
+import time
 
 import pytest
 
@@ -677,6 +679,127 @@ def test_being_displaced_leaves_a_reason_a_rider_can_act_on(tmp_path, monkeypatc
     assert connector.status.stopped is True
     assert "Only one connector may run per account" in connector.status.stopped_reason
     assert "4409" not in connector.status.stopped_reason
+
+
+def test_repair_drops_the_serving_session_and_dials_with_the_new_token(
+    tmp_path, monkeypatch
+):
+    """A saved re-pair must not keep serving on the token it replaced.
+
+    The socket stays open - a server that revoked the token has already closed
+    this one, but the code cannot assume which it is - and the old credential
+    keeps working on a session that was already accepted. The only way the new
+    token is used at all is a fresh handshake, so the session that is serving
+    has to go when the pairing changes, without waiting for the link to drop.
+    """
+    from websockets.exceptions import ConnectionClosedOK
+
+    rig = _Rig(1, tmp_path)
+    connector = _connector(tmp_path, rig)
+
+    sessions = []
+
+    class _Socket:
+        def __init__(self, connector) -> None:
+            self._connector = connector
+
+        async def send_text(self, _text):
+            pass
+
+        async def receive_text(self):
+            # No frame is coming. When the test stops the connector, close the
+            # way a real socket would, so _serve has its ordinary exit.
+            await self._connector._stop.wait()
+            raise ConnectionClosedOK(None, None)
+
+    class _Peer:
+        def resolve(self, _message):
+            return False
+
+        async def serve(self, *args, **kwargs):
+            pass
+
+    async def _serving_session():
+        sessions.append(connector.token)
+        peer = _Peer()
+        connector._peer = peer
+        await connector._serve(_Socket(connector), peer)
+
+    monkeypatch.setattr(connector, "_session", _serving_session)
+
+    thread = threading.Thread(
+        target=lambda: _run(connector.run_forever()), daemon=True
+    )
+    thread.start()
+    deadline = time.monotonic() + 10
+    while time.monotonic() < deadline and len(sessions) != 1:
+        time.sleep(0.01)
+    assert sessions == ["t"], "the first session never started serving"
+
+    connector.token = "new-token"
+    connector.reconnect()
+
+    deadline = time.monotonic() + 10
+    while time.monotonic() < deadline and len(sessions) != 2:
+        time.sleep(0.01)
+    # stop() is a loop-thread call (the _ConnectorThread is what the tray
+    # uses), so the request is posted the same way reconnect() posts its own.
+    connector._loop.call_soon_threadsafe(connector.stop)
+    thread.join(timeout=10)
+    assert not thread.is_alive(), "the loop did not exit after the stop"
+    assert sessions == ["t", "new-token"], (
+        f"the second session did not go out with the new token: {sessions}"
+    )
+    assert connector.status.stopped is True
+
+
+def test_repair_while_offline_wakes_the_backoff_instead_of_earning_it(
+    tmp_path, monkeypatch
+):
+    """A saved re-pair is not an outage, and must not wait out one.
+
+    The backoff is sized for a server that is rebooting or switched off - a
+    ceiling of minutes, where a rider who just pasted a fresh token wants the
+    answer now.
+    """
+    from wattracker_connector import client as clientmod
+
+    monkeypatch.setattr(clientmod, "_BACKOFF_START_S", 1000.0)
+    monkeypatch.setattr(clientmod, "_BACKOFF_MAX_S", 1000.0)
+
+    rig = _Rig(1, tmp_path)
+    connector = _connector(tmp_path, rig)
+
+    attempts = []
+
+    async def _always_down():
+        attempts.append(time.monotonic())
+        raise ConnectionRefusedError("server down")
+
+    monkeypatch.setattr(connector, "_session", _always_down)
+
+    thread = threading.Thread(
+        target=lambda: _run(connector.run_forever()), daemon=True
+    )
+    thread.start()
+    deadline = time.monotonic() + 10
+    while time.monotonic() < deadline and not attempts:
+        time.sleep(0.01)
+    assert attempts, "the first attempt never happened"
+
+    connector.reconnect()
+
+    deadline = time.monotonic() + 10
+    while time.monotonic() < deadline and len(attempts) < 2:
+        time.sleep(0.01)
+    connector._loop.call_soon_threadsafe(connector.stop)
+    thread.join(timeout=10)
+    assert len(attempts) == 2, "the repair never produced a retry"
+    assert attempts[1] - attempts[0] < 2.0, (
+        f"the retry waited out the backoff instead of landing on the repair: "
+        f"{attempts[1] - attempts[0]:.1f}s"
+    )
+    assert connector.status.stopped is True
 
 
 def test_an_unattended_ride_ends_itself_once_the_rider_stops(
