@@ -221,6 +221,34 @@ class Connector:
             return
         loop.call_soon_threadsafe(self._reconnect.set)
 
+    async def _wait_for_repair_or_stop(
+        self, timeout: Optional[float] = None
+    ) -> bool:
+        """Sleep until a re-pair, a quit, or ``timeout`` seconds (or forever).
+
+        Every wait in the run loop has to hear both Events rather than only
+        counting down: a quit ends the loop, and a re-pair makes whatever this
+        wait was for pointless. Both are set from other threads, so neither
+        arrives on the schedule the timeout was sized for.
+
+        Returns whether something woke it - True for a re-pair or a quit,
+        False for a timeout that ran its full course. The caller needs the
+        difference: only a delay that was actually served says anything about
+        how unreachable the server is.
+        """
+        stop_wait = asyncio.ensure_future(self._stop.wait())
+        reconnect_wait = asyncio.ensure_future(self._reconnect.wait())
+        try:
+            done, _pending = await asyncio.wait(
+                {stop_wait, reconnect_wait},
+                timeout=timeout,
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+            return bool(done)
+        finally:
+            stop_wait.cancel()
+            reconnect_wait.cancel()
+
     async def run_forever(self) -> None:
         """Connect, serve, and reconnect until stopped."""
         self._loop = asyncio.get_running_loop()
@@ -291,18 +319,7 @@ class Connector:
                     # backoff: a re-pair saves a new token, a quit ends the
                     # process. Neither runs on the backoff's schedule, so there
                     # is nothing to time out.
-                    stop_wait = asyncio.ensure_future(self._stop.wait())
-                    reconnect_wait = asyncio.ensure_future(
-                        self._reconnect.wait()
-                    )
-                    try:
-                        await asyncio.wait(
-                            {stop_wait, reconnect_wait},
-                            return_when=asyncio.FIRST_COMPLETED,
-                        )
-                    finally:
-                        stop_wait.cancel()
-                        reconnect_wait.cancel()
+                    await self._wait_for_repair_or_stop()
                     if self._stop.is_set():
                         break
                     # A new pairing was saved: the token on this object is now
@@ -317,10 +334,9 @@ class Connector:
                     log.warning("connector session ended: %s", exc)
                 if self._stop.is_set():
                     break
-                # A repair, not a failure: the session that just ended was
-                # dropped on purpose because the token changed, so the new
-                # handshake goes out now rather than after the backoff a real
-                # outage would have earned.
+                # A repair that landed while the session was still up. The
+                # dial goes out now, and no delay is announced that is not
+                # going to be served.
                 if self._reconnect.is_set():
                     continue
                 # Jitter so a fleet of connectors does not stampede a server that
@@ -328,19 +344,14 @@ class Connector:
                 ceiling = _RIDE_BACKOFF_MAX_S if self.ble.riding else _BACKOFF_MAX_S
                 delay = min(backoff, ceiling) * (0.5 + random.random())
                 log.info("reconnecting in %.1fs", delay)
-                # The wait has to hear two things: a stop, which ends the loop,
-                # and a repair, which makes the retry land now rather than
-                # whenever the backoff happens to run out.
-                stop_wait = asyncio.ensure_future(self._stop.wait())
-                reconnect_wait = asyncio.ensure_future(self._reconnect.wait())
-                try:
-                    await asyncio.wait(
-                        {stop_wait, reconnect_wait}, timeout=delay,
-                        return_when=asyncio.FIRST_COMPLETED,
-                    )
-                finally:
-                    stop_wait.cancel()
-                    reconnect_wait.cancel()
+                if await self._wait_for_repair_or_stop(timeout=delay):
+                    # Woken rather than timed out: a quit, which the top of the
+                    # loop answers, or a re-pair. Only a delay that actually ran
+                    # out is evidence the server is still unreachable and the
+                    # next one should be longer - a rider pasting a token is
+                    # not, and three re-pairs must not talk the connector into
+                    # a three-times-longer wait for the outage after them.
+                    continue
                 backoff = min(backoff * _BACKOFF_FACTOR, _BACKOFF_MAX_S)
         finally:
             self._loop = None
