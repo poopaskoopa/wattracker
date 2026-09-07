@@ -84,6 +84,14 @@ wattracker = [
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+# Test the checkout pytest was started in, not the one `pip install -e .` was
+# run in. That install writes a finder holding the absolute path of its own
+# checkout, and it answers `import wattracker` from anywhere -- so a run inside
+# a git worktree silently exercised the main checkout and reported the result
+# as though it were about the branch under test. The editable finder is
+# appended to sys.meta_path, so the stdlib path finder is consulted first and
+# this entry wins. tests/test_tree_under_test.py fails loudly if it is removed.
+pythonpath = ["."]
 markers = [
     # Real-browser DOM tests. They run by default (they add only a few
     # seconds) and skip themselves when playwright/chromium is absent.
