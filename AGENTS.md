@@ -172,29 +172,42 @@ The list gives the **order**. GitHub gives the **state** — always
 (#234's scope grew a whole section after it was filed) and its labels move.
 If the two disagree, GitHub wins and the queue is stale; say so.
 
-1. **#167 — prove rider isolation and the mobile contract.** The top item and
-   the only one not waiting on something. **Rescoped 2026-09-05**: the cost
-   measurement that made it look deployment-shaped moved to #242, so what is
-   left is provable offline, in-process against `create_cloud_app`, with no
-   Azure subscription and no credentials. Two riders, two devices each; prove B
-   cannot reach A's objects by id, revision, `since=` replay, header
-   manipulation, or A's subscription key with B's signature; 404 not 403;
-   revocation durable across a restart; read-only capability holds against a
-   signed `POST /api/v1/sync/batches`; and a Swift/Python contract test from
-   shared fixtures. Build it on `tests/test_cloud_api.py`, which already
-   exercises the app in-process — do not stand up a new harness.
-2. **#162 — iOS Activities list and ride detail.** *Not before #234 has
-   merged.* PR #235 already exists and is **not** simply rebasable — see below.
-3. **#163 — iOS Calendar and Volume screens.** Same condition as #162.
+1. **#249 — rotating full-suite test flakes.** The top item and the only one
+   that makes every other item's green run trustworthy. 1 to 4 failures per
+   full run, a *different* test each time, each one green in isolation **and**
+   under heavy synthetic CPU load — so it is not a timing race. It reads as
+   cross-test state leaking between short, synchronous server/HTTP tests. One
+   instance is already root-caused and fixed in `fedcd2b`;
+   `tests/test_onboarding.py::test_setup_timezone_can_be_confirmed_and_is_stored`
+   is the open one. Fully local, no hardware, no deployment.
+2. **#163 — iOS Calendar and Volume screens.** Unblocked: #234 merged
+   2026-09-06 as PR #240 (`ebd010e`). Preferred over #162 because it carries no
+   existing PR to reconcile.
+3. **#162 — iOS Activities list and ride detail.** Also unblocked, but PR #235
+   already exists and is **not** simply rebasable — see below. Do not rebase it
+   and merge; the conflict is semantic, not textual.
 
-**Done since this list was last written:** #233 landed in PR #238. #217's
-credential-free half landed in PR #239 — its remainder is the Azure
-protected-environment smoke test, which needs a real deployment and so is
-gated on #102; do not pick #217 up expecting startable work.
+**Done since this list was last written:** #234 merged as PR #240 on
+2026-09-06, after an on-device validation run on an iPhone. #233 landed in PR
+#238. #217's credential-free half landed in PR #239 — its remainder is the
+Azure protected-environment smoke test, which needs a real deployment and so is
+gated on #102; do not pick #217 up expecting startable work. **#167 was closed
+2026-09-05** and is no longer the top item.
 
-**Do not start #161.** Its work is done and sitting in PR #228, which is held
-open on purpose pending #234. Starting it again re-implements a screen that
-already exists.
+**The iOS app can now be run against a real server on a device.**
+`scripts/walking_skeleton_server.py --lan` enrols a writer, publishes a full
+snapshot, mints pairing codes and writes the Mac's LAN address to
+`ios/WatTracker/Config/Local.xcconfig`. `docs/ios-device-validation.md` is the
+checklist and carries the traps — a 900-second code, and remints that wipe the
+in-memory store along with the revoked-device record. A screen built for #162
+or #163 can be checked on real data now, which was the whole reason those two
+waited.
+
+**Do not start #161.** Its work is done and sitting in PR #228. #234 has
+merged, so #228 is unblocked, but it is still unmerged pending its own
+on-real-data check — its body says `Closes #161`, and merging it on green CI
+would close the issue that tracks doing that check. Starting #161 re-implements
+a screen that already exists.
 
 **Do not start #169** without asking; it is `blocked`. #242 is `blocked` on
 #102 and is a measurement of a live deployment, not code.
@@ -225,8 +238,11 @@ being correct and green. Building two more screens against that gap produces
 two more PRs in the same position: reviewable, passing CI, and impossible to
 verify against real data. One of those is a known cost; three is a backlog.
 
-Once #234 lands, the app can pair against `scripts/walking_skeleton_server.py`
-and these become checkable on a device.
+#234 has now landed, so the app pairs against
+`scripts/walking_skeleton_server.py` and these are checkable on a device. That
+removes the reason to hold iOS screens back — and it also removes the excuse
+for shipping one unverified. If you build a screen, say whether you ran it on a
+device or only in CI.
 
 ### When an issue's premise has gone stale
 
