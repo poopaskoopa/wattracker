@@ -22,8 +22,8 @@ enum CloudRoute: String, Sendable, Equatable, CaseIterable {
 
     var servesDeltas: Bool {
         switch self {
-        case .dashboard, .volume, .curve: return true
-        case .profile, .activities, .calendar, .races: return false
+        case .dashboard, .volume, .curve, .activities: return true
+        case .profile, .calendar, .races: return false
         }
     }
 
@@ -162,6 +162,12 @@ actor CloudSession {
     private var state: DeviceState
     private var lifecycleGeneration = 0
 
+    /// Activity detail and stream payloads, kept out of the snapshot cache on
+    /// purpose: the activities collection stays small and these are fetched
+    /// only once a rider opens a ride. Cleared wherever `cache` is, because a
+    /// ride opened under one credential must never be served to the next.
+    private var activityObjects: [String: CloudItem] = [:]
+
     private var mintCount = 0
     /// The one refresh allowed to be in flight. Every caller that arrives
     /// while it is set awaits it instead of signing a second one.
@@ -240,6 +246,7 @@ actor CloudSession {
         // and not the credential is a cold start; the reverse is silent data
         // loss.
         cache.removeAll()
+        activityObjects.removeAll()
         try credentials.save(result.device)
         lifecycleGeneration += 1
         refreshTask = nil
@@ -269,6 +276,7 @@ actor CloudSession {
         lifecycleGeneration += 1
         credentials.clear()
         cache.removeAll()
+        activityObjects.removeAll()
         device = nil
         token = nil
         state = .unpaired
@@ -356,6 +364,97 @@ actor CloudSession {
         guard state != .removed else { throw Failure.deviceRemoved }
         guard state == .paired, let device else { throw Failure.notPaired }
         return device
+    }
+
+    // MARK: - Activity-owned objects
+
+    /// One ride's detail, fetched on demand and remembered for the session.
+    func activityDetail(_ activityID: Int) async throws -> ActivityDetail {
+        let objectID = "activity-detail-\(activityID)"
+        let item = try await activityObject(
+            objectID: objectID,
+            read: { client, context, device in
+                try await client.activityDetail(
+                    activityID: activityID, readerContext: context, device: device
+                )
+            }
+        )
+        guard case let .activityDetail(detail) = item.payload else {
+            throw Failure.server(.malformedResponse("\(objectID) has the wrong payload"))
+        }
+        return detail
+    }
+
+    /// The bounded, downsampled streams, fetched only after detail opens.
+    func activityStreams(_ activityID: Int) async throws -> ActivityStreams {
+        let objectID = "stream-\(activityID)"
+        let item = try await activityObject(
+            objectID: objectID,
+            read: { client, context, device in
+                try await client.activityStreams(
+                    activityID: activityID, readerContext: context, device: device
+                )
+            }
+        )
+        guard case let .stream(streams) = item.payload else {
+            throw Failure.server(.malformedResponse("\(objectID) has the wrong payload"))
+        }
+        return streams
+    }
+
+    /// Ported from PR #235 onto `lifecycleGeneration`. That PR carried its own
+    /// `sessionGeneration` doing the same job, written before #233 landed this
+    /// one; two counters guarding one actor is worse than either alone, so the
+    /// counter here is main's and only the read is new.
+    ///
+    /// A 404 is retried once against a freshly minted context, because the
+    /// likeliest cause is a context that expired between the mint and the read
+    /// rather than an object that is genuinely absent.
+    private func activityObject(
+        objectID: String,
+        read: (CloudClient, String, PairedDevice) async throws -> CloudItem
+    ) async throws -> CloudItem {
+        if state == .removed { throw Failure.deviceRemoved }
+        guard let device else { throw Failure.notPaired }
+        let generation = lifecycleGeneration
+        try validate(device, lifecycleGeneration: generation)
+        if let cached = activityObjects[objectID] { return cached }
+        if let allowed = nextAttemptAllowedAt, allowed > clock() {
+            throw Failure.throttled(retryAfter: allowed.timeIntervalSince(clock()))
+        }
+
+        let attempt: ReaderToken
+        do {
+            attempt = try await context(after: nil)
+        } catch {
+            throw classify(error)
+        }
+        do {
+            let item = try await read(client, attempt.value, device)
+            try validate(device, lifecycleGeneration: generation)
+            activityObjects[objectID] = item
+            return item
+        } catch let failure as CloudClient.Failure {
+            guard case let .http(status, _, retryAfter, _) = failure else {
+                throw Failure.server(failure)
+            }
+            if status == 429 || status == 503 {
+                noteFailure(retryAfter: retryAfter)
+                throw Failure.throttled(retryAfter: retryAfter ?? pendingDelay())
+            }
+            guard status == 404 else { throw Failure.server(failure) }
+            let renewed = try await context(after: attempt.generation)
+            do {
+                let item = try await read(client, renewed.value, device)
+                try validate(device, lifecycleGeneration: generation)
+                activityObjects[objectID] = item
+                return item
+            } catch let retried as CloudClient.Failure {
+                throw Failure.server(retried)
+            }
+        } catch {
+            throw classify(error)
+        }
     }
 
     private func validate(_ readDevice: PairedDevice, lifecycleGeneration: Int) throws {
@@ -586,6 +685,7 @@ actor CloudSession {
         refreshTaskID = nil
         credentials.clear()
         cache.removeAll()
+        activityObjects.removeAll()
     }
 
     /// Push the next attempt out.
