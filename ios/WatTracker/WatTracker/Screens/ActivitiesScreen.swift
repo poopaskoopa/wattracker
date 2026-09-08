@@ -3,20 +3,9 @@ import SwiftUI
 
 struct ActivitiesScreen: View {
     /// The one session, owned by `SessionGate` and injected by `AppGate`.
-    ///
-    /// This screen used to build its own when none was passed in. That
-    /// predates the gate: two sessions over one keychain credential means a
-    /// sign-out or a revoke performed in Settings leaves this screen holding
-    /// one that still believes it is paired, listing a signed-out rider's
-    /// rides. The signing-key failure the old initialiser reported as
-    /// `startupError` is the gate's to report now -- it never gets as far as
-    /// showing this screen.
     @Environment(\.cloudSession) private var session
     @Environment(\.horizontalSizeClass) private var horizontalSizeClass
-    @State private var snapshot: CloudSnapshot?
-    @State private var selectedID: String?
-    @State private var errorMessage: String?
-    @State private var isLoading = false
+    @State private var model = ActivitiesModel()
 
     var body: some View {
         Group {
@@ -27,7 +16,7 @@ struct ActivitiesScreen: View {
                     Divider().overlay(Palette.surfaceBorder)
                     detailPane
                         .frame(maxWidth: .infinity, maxHeight: .infinity)
-                        .id(selectedID)
+                        .id(model.selectedID)
                 }
             } else {
                 NavigationStack {
@@ -42,10 +31,10 @@ struct ActivitiesScreen: View {
             }
         }
         .background(Palette.bg)
-        .task { await refresh() }
+        .task { await model.refresh(session: session) }
         .onChange(of: rides.map(\.id)) { _, ids in
-            if selectedID == nil || !ids.contains(selectedID ?? "") {
-                selectedID = ids.first
+            if model.selectedID == nil || !ids.contains(model.selectedID ?? "") {
+                model.selectedID = ids.first
             }
         }
     }
@@ -54,15 +43,11 @@ struct ActivitiesScreen: View {
         horizontalSizeClass == .regular && UIDevice.current.userInterfaceIdiom == .pad
     }
 
-    private var rides: [RideSummary] {
-        (snapshot?.items ?? []).compactMap(RideSummary.init(item:)).sorted {
-            if $0.startedAt != $1.startedAt { return $0.startedAt > $1.startedAt }
-            return $0.id > $1.id
-        }
-    }
+    private var rides: [RideSummary] { model.rides }
 
     @ViewBuilder private var detailPane: some View {
-        if let selectedID, let ride = rides.first(where: { $0.id == selectedID }),
+        if let selectedID = model.selectedID,
+           let ride = rides.first(where: { $0.id == selectedID }),
            let session {
             ActivityDetailScreen(ride: ride, session: session)
         } else {
@@ -78,31 +63,48 @@ struct ActivitiesScreen: View {
         VStack(alignment: .leading, spacing: 0) {
             header
             List {
-                if let message = errorMessage, rides.isEmpty {
+                switch model.availability {
+                case .unpaired:
                     ContentUnavailableView(
-                        "Activities unavailable", systemImage: "wifi.exclamationmark",
-                        description: Text(message)
+                        "Pair your desktop", systemImage: "link.badge.plus",
+                        description: Text("Pair this device to see your rides.")
                     )
                     .listRowBackground(Palette.bg)
-                } else if rides.isEmpty, !isLoading {
+                case .removed:
                     ContentUnavailableView(
-                        "No activities", systemImage: "bicycle",
-                        description: Text("Recorded rides appear after the desktop syncs.")
+                        "Device removed", systemImage: "lock.slash",
+                        description: Text(
+                            "Pair this device again from the desktop to continue."
+                        )
                     )
                     .listRowBackground(Palette.bg)
-                } else {
-                    ForEach(rides) { ride in
-                        if selectionEnabled {
-                            Button { selectedID = ride.id } label: {
-                                ActivityRow(ride: ride)
+                case .available:
+                    if let message = model.errorMessage, rides.isEmpty {
+                        ContentUnavailableView(
+                            "Activities unavailable", systemImage: "wifi.exclamationmark",
+                            description: Text(message)
+                        )
+                        .listRowBackground(Palette.bg)
+                    } else if rides.isEmpty, !model.isLoading {
+                        ContentUnavailableView(
+                            "No activities", systemImage: "bicycle",
+                            description: Text("Recorded rides appear after the desktop syncs.")
+                        )
+                        .listRowBackground(Palette.bg)
+                    } else {
+                        ForEach(rides) { ride in
+                            if selectionEnabled {
+                                Button { model.selectedID = ride.id } label: {
+                                    ActivityRow(ride: ride)
+                                }
+                                .buttonStyle(.plain)
+                                .listRowBackground(
+                                    model.selectedID == ride.id ? Palette.surface2 : Palette.bg
+                                )
+                            } else {
+                                NavigationLink(value: ride.id) { ActivityRow(ride: ride) }
+                                    .listRowBackground(Palette.bg)
                             }
-                            .buttonStyle(.plain)
-                            .listRowBackground(
-                                selectedID == ride.id ? Palette.surface2 : Palette.bg
-                            )
-                        } else {
-                            NavigationLink(value: ride.id) { ActivityRow(ride: ride) }
-                                .listRowBackground(Palette.bg)
                         }
                     }
                 }
@@ -110,9 +112,9 @@ struct ActivitiesScreen: View {
             .listStyle(.plain)
             .scrollContentBackground(.hidden)
             .overlay {
-                if isLoading, snapshot == nil { ProgressView().tint(Palette.accent) }
+                if model.isLoading, model.snapshot == nil { ProgressView().tint(Palette.accent) }
             }
-            .refreshable { await refresh() }
+            .refreshable { await model.refresh(session: session) }
         }
         .background(Palette.bg)
     }
@@ -123,36 +125,19 @@ struct ActivitiesScreen: View {
                 Text("Activities").font(.title2.weight(.semibold))
                     .foregroundStyle(Palette.textBright)
                 Spacer()
-                if snapshot?.source == .cache {
+                if model.snapshot?.source == .cache {
                     Label("Offline", systemImage: "icloud.slash")
                         .font(.caption.weight(.medium)).foregroundStyle(Palette.muted)
                 }
             }
-            Text(snapshot.map { "Newest first · updated \(RideFormatting.relative($0.asOf))" }
+            Text(model.snapshot.map { "Newest first · updated \(RideFormatting.relative($0.asOf))" }
                 ?? "Every recorded ride")
                 .font(.subheadline).foregroundStyle(Palette.muted)
-            if let errorMessage, !rides.isEmpty {
+            if let errorMessage = model.errorMessage, !rides.isEmpty {
                 Text(errorMessage).font(.caption).foregroundStyle(Palette.alert).lineLimit(1)
             }
         }
         .padding(16)
-    }
-
-    @MainActor private func refresh() async {
-        guard let session else { return }
-        // First paint from cache before the network, the way the Dashboard
-        // does it. In `init` previously; the injected session is not readable
-        // there.
-        if snapshot == nil { snapshot = session.cached(.activities) }
-        isLoading = true
-        defer { isLoading = false }
-        do {
-            snapshot = try await session.load(.activities)
-            errorMessage = nil
-            if selectedID == nil { selectedID = rides.first?.id }
-        } catch {
-            errorMessage = String(describing: error)
-        }
     }
 }
 
@@ -345,24 +330,6 @@ private struct ZoneSection: View {
                 }
             }
         }
-    }
-}
-
-struct RideSummary: Identifiable {
-    let id: String
-    let activityID: Int
-    let summary: ActivitySummary
-    let startedAt: String
-
-    init?(item: CloudItem) {
-        guard !item.deleted, case let .activity(summary) = item.payload else { return nil }
-        let numericID = summary.id.map(Int.init)
-            ?? Int(item.id.split(separator: "-").last ?? "")
-        guard let numericID else { return nil }
-        id = item.id
-        activityID = numericID
-        self.summary = summary
-        startedAt = summary.startTime ?? ""
     }
 }
 
