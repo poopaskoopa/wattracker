@@ -146,8 +146,13 @@ toolchain:
 
 - `.\gradlew.bat <task>` for build/assemble (the wrapper pins the Gradle
   version, so this is reproducible off-IDE).
-- `adb` for install/start/logcat/screenshot (`adb -s <serial> exec-out
-  screencap -p > out.png`).
+- `adb` for install/start/logcat and UI inspection. For a **visual
+  screenshot** on this machine use the IDE's emulator capture (the on-disk
+  `screencap` paths return a stale lock frame — see the note above). For a
+  **scriptable, per-device** UI check that needs no surface capture, dump the
+  hierarchy: `adb -s <serial> shell uiautomator dump /sdcard/ui.xml` then
+  `adb -s <serial> pull /sdcard/ui.xml out.xml` and parse the `node` bounds.
+  `adb logcat -d` for logs.
 
 If the Android Studio AI assistant is used, it runs in bring-your-own-key
 mode against the same shell: it reads `gradlew` output and `adb` output, not

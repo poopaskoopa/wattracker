@@ -15,11 +15,8 @@ Pre-push hook installed. **Next: Step 2 — Cloud API client + local client
 **Revised 2026-09-06.** Re-verified against `main` at `8c75eba`. What changed
 since the 2026-09-01 draft:
 
-1. **Tooling (owner decision 2026-09-06):** no MCP servers at all — no
-   community Android MCP tooling, no IDE MCP bridge, no `.kilo` MCP
-   registration (the 2026-09-01 draft's approach is dropped entirely). The
-   dev agent is Android Studio 4's **built-in Agent mode with BYOK**
-   (bring-your-own-key).
+1. **Tooling (owner decision 2026-09-06):** The dev agent is Android Studio 4's
+   **built-in Agent mode with BYOK** (bring-your-own-key).
    `./gradlew` + `adb` remain the authoritative path — nothing in any Done
    criterion depends on the agent.
 2. **Cloud device revocation has landed** (#153): `GET /api/v1/devices` and
@@ -444,11 +441,13 @@ install**; consequently there is no `.kilo/kilo.json` MCP block either
    carry this clone's noreply identity).
 3. **The terminal stays the floor.** Every thing the IDE agent can do has a
    `gradlew` + `adb` equivalent (`\.\gradlew.bat :app:assembleDebug`, `adb
-   install`, `adb shell am start`, `adb exec-out screencap -p > shot.png`,
-   `adb shell uiautomator dump`, `adb shell input`, `adb logcat`,
-   `adb emu console`), and nothing in the validation plan requires the IDE
-   agent. This is what CI runs. If Agent mode is unavailable or misbehaves,
-   the whole plan still executes from the terminal.
+   install`, `adb shell am start`, `adb shell uiautomator dump` (hierarchy —
+   the reliable per-device UI check on this machine; on-disk `screencap` is
+   broken here, see "How to inspect / capture the UI" in the Step 1 notes),
+   `adb shell input`, `adb logcat`, `adb emu console`), and nothing in the
+   validation plan requires the IDE agent. This is what CI runs. If Agent
+   mode is unavailable or misbehaves, the whole plan still executes from the
+   terminal.
 4. **Verify the whole loop before any Step 1 work:**
    - Android Studio has the (future) `android/` project, or a scratch Compose
      project, open; the model picker shows an enabled BYOK model; Agent mode
@@ -456,8 +455,8 @@ install**; consequently there is no `.kilo/kilo.json` MCP block either
    - Instruct the agent to build + deploy the scratch app to `wt-phone`,
      pull a screenshot, and read a few logcat lines. Do the same three things
      once from the bare terminal (`\.\gradlew.bat :app:installDebug`, `adb
-     exec-out screencap -p > shot.png`, `adb logcat -d`) so both paths are
-     known-good.
+     shell uiautomator dump` (the UI check), `adb logcat -d`) so both paths
+     are known-good.
    - `adb devices` shows the booted emulator, independent of the IDE.
 
 ### 0.5 Repo hygiene (AGENTS.md)
@@ -523,6 +522,39 @@ lock frame even with `isKeyguardShowing=false` and the lock screen disabled — 
 AEHD/Hyper-V surface-capture quirk, not an app problem. The IDE's capture of
 the emulator window is the reliable path (and what the PR images come from).
 Documented in `android/README.md`. The `dumpsys` measurements are unaffected.
+
+**How to inspect / capture the UI on this machine (learned in session 3 —
+every Step-2+ Done criterion that asks for a screenshot or UI check uses
+these paths):**
+
+- **Visual screenshot (to eyeball layout / a PR image):** the IDE's
+  `take_screenshot` tool, or the agent's `ui_state` tool (returns a PNG of the
+  focused window plus the XML hierarchy). This reads the emulator *window*
+  directly, so it shows the live app. **Do not** use `adb exec-out screencap`,
+  `adb shell screencap`+`pull`, or `android screen capture` for a visual shot
+  here — all return the stale lock frame. The IDE capture is ephemeral
+  (not saved to disk) and, being `gh`-PR-incompatible, the owner attaches the
+  PR images manually.
+- **UI hierarchy (the reliable, per-device, scriptable path):**
+  `adb -s <serial> shell uiautomator dump /sdcard/ui.xml` then
+  `adb -s <serial> pull /sdcard/ui.xml out.xml`, and parse the XML (each
+  `node` has `text`, `content-desc`, `class`, `bounds`, `clickable`). This
+  works per-serial (unlike `ui_state`, which only sees the IDE-attached
+  device), needs no surface capture, and is how the portrait bottom-bar vs.
+  landscape rail was verified (bounds of the five nav labels: one horizontal
+  row at high Y = bottom bar; stacked at low X = left rail).
+- **Config measurement (swdp / orientation / rotation):**
+  `adb -s <serial> shell dumpsys activity <package>` → `mCurrentConfig`
+  (`smallestScreenWidthDp`, `orient=`, `ROTATION_`), and
+  `dumpsys input` → `mCurrentOrientation`. This is unaffected by the
+  screenshot quirk — use it for the numbers, not pixels.
+- **Forcing orientation:** `adb -s <serial> shell settings put system
+  accelerometer_rotation 0` then `settings put system user_rotation <N>`.
+  Phone: `0`=portrait, `1`=landscape. Tablet (natural = landscape): `0`=
+  landscape, `1`=portrait. Then `am start -n <pkg>/.MainActivity` to re-apply.
+- **Keeping the screen awake** (for repeated captures): `adb -s <serial>
+  shell "settings put system screen_off_timeout 1800000; svc power stayon
+  true"`.
 
 **The rest of this section is retained for the next steps** — the BOM API
 pitfalls (do not re-derive) and the toolchain state on this machine.
