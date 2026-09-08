@@ -663,11 +663,6 @@ colour is introduced by pairing (#195).
   deviation notes above). The orphaned `wt-phone.avd`/`wt-tablet.avd` dirs
   from the old `avdmanager` attempts can be deleted from `~/.android/avd`
   (harmless either way).
-- Web tooling this session: the SearXNG MCP server is broken (its
-  `pageno`/`time_range` params get mangled: "Expected Number, but 0 is
-  String" / "Value 'null' is not a valid enum value"), and the built-in web
-  search is user-disallowed; `web_url_read` with direct URLs works fine. If
-  the skill debugging needs web access, use that.
 - Scratch copies of the downloaded artifacts (cmdtools zips, the resolved
   AARs, javap'd jars) live in this conversation's artifacts `scratch/`
   directory — ephemeral, re-download if gone (URLs above).
