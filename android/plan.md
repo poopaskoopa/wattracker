@@ -637,6 +637,40 @@ not re-derive:**
 5. **Room cache (2.x):** revision-keyed cloud cache + last-payload local
    cache (~10 small tables, KSP codegen).
 
+> [!CAUTION]
+> **Two decisions to settle before Step 2 code lands (flagged in the #193
+> review; not yet resolved — address in the next session):**
+>
+> 1. **No Android CI exists.** `.github/workflows/` has cloud, ios-release,
+>    macos-release, windows-release and windows — none compiles `android/`.
+>    Nothing in the repo verifies the module builds, and the only test is the
+>    (small) `DestinationTest`. Add an `:app:assembleDebug` +
+>    `:app:testDebugUnitTest` job (windows runner or the `macos-ci` self-hosted
+>    one — the latter must have SDK Platform 37 provisioned; see the
+>    `compileSdk 37` / build-tools 36 note in the review). A Compose
+>    `createComposeRule` test that asserts rail @ sw411/landscape, bottom bar
+>    @ sw411/portrait, drawer @ sw800 (config-override driven, no AVDs) is the
+>    high-value addition, but it needs the `ui-test` deps that the review
+>    cleanup removed for size — a deliberate add-back, not a regression.
+>
+> 2. **The local-backend transport (2.3) hand-rolls HTTP over a raw socket to
+>    bypass `NetworkSecurityPolicy`.** The stated goal (cleartext only to the
+>    host the rider typed) is real, but the mechanism routes around the
+>    platform's enforcement point, so no NSC audit tells the truth about the
+>    app's network use; ~150 lines of hand-written HTTP (chunked decoding,
+>    header folding, `Content-Length`/chunked disagreement, response
+>    splitting) is a meaningful attack surface for a client carrying a device
+>    bearer token in cleartext over the LAN; and it forfeits pooling, timeouts,
+>    redirects and proxy support. Two better options to put to the owner first:
+>    (a) keep the platform gate and use a release `domain-config` allowlist
+>    scoped via `NetworkSecurityPolicy.isCleartextTrafficPermittedForHost`, or
+>    (b) have the local desktop server present a **self-signed cert pinned at
+>    pairing time** (the pairing flow already exchanges a secret, so
+>    trust-on-first-use is free) — strictly better than cleartext for a
+>    token-bearing connection and it removes the whole question. Cheaper to
+>    redirect before the transport exists. See the callout on the 2.3
+>    `LocalClient` transport bullet.
+
 Nothing in Step 2 touches the shell or the theme — `RootScreen.kt`, the
 `Destination` enum and `Palette.kt` are stable unless a new destination or
 colour is introduced by pairing (#195).
@@ -918,6 +952,16 @@ Port the iOS decisions, keeping the constants and their *names* in sync with
     fall back to a release `domain-config` allowlist for specific LAN
     hostnames the rider builds with, and record the trade in the README — but
     do not flip `usesCleartextTraffic` on app-wide in release.*
+    > [!CAUTION]
+    > **DECISION NEEDED before implementing this bullet (owner, next session).**
+    > The #193 review flagged that hand-rolling HTTP here defeats the platform
+    > cleartext gate by construction, adds ~150 lines of HTTP-parsing attack
+    > surface to a token-bearing LAN connection, and forfeits pooling /
+    > timeouts / redirects / proxy support. The review's preferred fix is a
+    > self-signed local cert pinned at pairing time (option (b) in the
+    > "Two decisions to settle before Step 2" callout in "What comes next") —
+    > strictly better than cleartext. Do not build the raw-socket path until
+    > this is resolved.
   - Read endpoints per the local API list; the adapter (Step 4) pins the
     shapes from `curl`-captured fixtures.
 
