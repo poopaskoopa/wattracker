@@ -149,7 +149,7 @@ def test_download_routes_work_without_a_connector(client, monkeypatch):
     uid = _register(client)
     plan_id = db.create_plan(uid, "Test", "2026-08-01", 1, 8, {})
     db.add_plan_workout(
-        uid, plan_id, "2026-08-01", "VO2 5x4", "vo2max", 3600, 80.0,
+        plan_id, uid, "2026-08-01", "VO2 5x4", "vo2max", 3600, 80.0,
         "<workout_file><name>VO2 5x4</name></workout_file>",
     )
     response = client.get(f"/plan/{plan_id}/download.zip")
@@ -176,7 +176,7 @@ def test_workout_prune_rules_travel_over_the_connector(
                                 "workouts_dir": str(workouts)})
     plan_id = db.create_plan(uid, "Test", "2026-08-01", 1, 8, {})
     db.add_plan_workout(
-        uid, plan_id, "2026-08-01", "VO2 5x4", "vo2max", 3600, 80.0,
+        plan_id, uid, "2026-08-01", "VO2 5x4", "vo2max", 3600, 80.0,
         "<workout_file><name>VO2 5x4</name></workout_file>",
     )
     from wattracker import exporter
