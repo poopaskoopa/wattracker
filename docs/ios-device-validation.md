@@ -65,12 +65,15 @@ Enclave branch never executes.
 
 ## Not on this branch
 
-The Dashboard is a stub here, as are Activities, Calendar and Volume; Settings
-is the only screen with anything behind it. "The Dashboard renders real data
-rather than `.noData`" therefore belongs to PR #228's run, not this one -- the
-harness publishes a full snapshot so that check *can* be made, but the screen
-that would consume it is unmerged. Do not record it as a pass or a failure
-here.
+Activities is still a stub. Dashboard, Calendar and Volume now consume the
+shared session and cache, but no physical-device run is recorded on this
+branch. After pairing against the LAN harness, open Calendar in every iPad
+orientation and in a narrow Stage Manager/Split View window; verify month
+navigation, day detail, planned/completed rows and the ride-detail link. Open
+Volume and verify the weekly bars, metric picker, range picker and last-4,
+last-12 and YTD summaries against the desktop for the same snapshot. Record
+the device models, OS versions and results before calling either screen
+validated.
 
 ## Budget the pairing codes
 
