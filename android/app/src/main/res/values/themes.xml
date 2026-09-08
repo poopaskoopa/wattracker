@@ -1,5 +1,13 @@
 <?xml version="1.0" encoding="utf-8"?>
 <resources>
 
-    <style name="Theme.WatTracker" parent="android:Theme.Material.Light.NoActionBar" />
+    <!--
+        Dark-only. The screens are read next to a trainer in a room that is
+        usually dim, and a half-finished light theme is worse than none: the
+        same rule as the web app and the iOS app (no light variant exists
+        upstream). The Compose MaterialTheme supplies the actual palette
+        (ui/theme/Theme.kt); this platform theme only removes the action bar
+        and keeps the pre-Compose window dark.
+    -->
+    <style name="Theme.WatTracker" parent="android:Theme.Material.NoActionBar" />
 </resources>

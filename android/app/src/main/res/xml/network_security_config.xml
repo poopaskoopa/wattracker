@@ -1,0 +1,15 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+    The strict (release) form: cleartext is refused for every connection.
+    The cloud backend is HTTPS in every build type, always.
+
+    The local desktop backend is plain HTTP on the rider's LAN. It is opened
+    per-host by the transport in Step 2 (#194), not here, and the debug build
+    replaces this resource (same name, src/debug) with a copy that permits
+    cleartext to loopback hosts only: the dev harness seen through the
+    emulator. Do not add LAN hosts to this file; that is the release
+    domain-config trade recorded in android/README.md.
+-->
+<network-security-config>
+    <base-config cleartextTrafficPermitted="false" />
+</network-security-config>

@@ -1,58 +1,45 @@
 package com.wattracker.android.ui.theme
 
-import android.app.Activity
-import android.os.Build
-import androidx.compose.foundation.isSystemInDarkTheme
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.darkColorScheme
-import androidx.compose.material3.dynamicDarkColorScheme
-import androidx.compose.material3.dynamicLightColorScheme
-import androidx.compose.material3.lightColorScheme
 import androidx.compose.runtime.Composable
-import androidx.compose.ui.platform.LocalContext
 
-private val DarkColorScheme = darkColorScheme(
-    primary = Purple80,
-    secondary = PurpleGrey80,
-    tertiary = Pink80
-)
-
-private val LightColorScheme = lightColorScheme(
-    primary = Purple40,
-    secondary = PurpleGrey40,
-    tertiary = Pink40
-
-    /* Other default colors to override
-    background = Color(0xFFFFFBFE),
-    surface = Color(0xFFFFFBFE),
-    onPrimary = Color.White,
-    onSecondary = Color.White,
-    onTertiary = Color.White,
-    onBackground = Color(0xFF1C1B1F),
-    onSurface = Color(0xFF1C1B1F),
-    */
+/**
+ * Dark-only, fixed palette.
+ *
+ * [Palette] is the source of truth (the web `:root` block). The scheme below
+ * starts from [darkColorScheme] -- the app is dark-only and there is no light
+ * variant, upstream or here -- and overrides the roles the shell actually
+ * uses, so stock Material components (the navigation rail, the drawer,
+ * buttons) render on the right surfaces. Screens style themselves with
+ * [Palette] directly, exactly as the iOS screens do with `Palette.swift`, so
+ * this mapping never has to express the design.
+ *
+ * No dynamic color: the product has one palette across web, iOS and Android,
+ * and Material You recoloring would make the phone a second one.
+ */
+private val wtDarkColorScheme = darkColorScheme(
+    primary = Palette.accent,
+    onPrimary = Palette.onAccent,
+    primaryContainer = Palette.accent.copy(alpha = 0.16f),
+    onPrimaryContainer = Palette.textBright,
+    secondary = Palette.ok,
+    onSecondary = Palette.onAccent,
+    background = Palette.bg,
+    onBackground = Palette.text,
+    surface = Palette.bg,
+    onSurface = Palette.text,
+    surfaceVariant = Palette.surfaceInset,
+    onSurfaceVariant = Palette.muted,
+    outline = Palette.surfaceBorder,
+    error = Palette.alert,
+    onError = Palette.textBright,
 )
 
 @Composable
-fun WatTrackerTheme(
-    darkTheme: Boolean = isSystemInDarkTheme(),
-    // Dynamic color is available on Android 12+
-    dynamicColor: Boolean = true,
-    content: @Composable () -> Unit
-) {
-    val colorScheme = when {
-        dynamicColor && Build.VERSION.SDK_INT >= Build.VERSION_CODES.S -> {
-            val context = LocalContext.current
-            if (darkTheme) dynamicDarkColorScheme(context) else dynamicLightColorScheme(context)
-        }
-
-        darkTheme -> DarkColorScheme
-        else -> LightColorScheme
-    }
-
+fun WatTrackerTheme(content: @Composable () -> Unit) {
     MaterialTheme(
-        colorScheme = colorScheme,
-        typography = Typography,
-        content = content
+        colorScheme = wtDarkColorScheme,
+        content = content,
     )
 }

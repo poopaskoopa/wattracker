@@ -1,3 +1,35 @@
 <resources>
     <string name="app_name">WatTracker</string>
+
+    <!-- Shell destinations (mirror the iOS Destination enum titles). -->
+    <string name="destination_dashboard">Dashboard</string>
+    <string name="destination_activities">Activities</string>
+    <string name="destination_calendar">Calendar</string>
+    <string name="destination_volume">Volume</string>
+    <string name="destination_settings">Settings</string>
+    <string name="app_shell_title">wattracker</string>
+
+    <!--
+        Screen stubs. They say what the screen will hold and which issue fills
+        it in, and they show no fake numbers and no fake charts: a placeholder
+        that looks like data is a screenshot waiting to be mistaken for a
+        working feature.
+    -->
+    <string name="screen_dashboard_subtitle">Training status and load</string>
+    <string name="screen_activities_subtitle">Every ride, newest first</string>
+    <string name="screen_calendar_subtitle">Plan, rides and races by day</string>
+    <string name="screen_volume_subtitle">Training load by week</string>
+    <string name="screen_settings_subtitle">Pairing, backend and device state</string>
+
+    <string name="stub_dashboard_note">Training status: CTL / ATL / TSB, load chart, current FTP and recent rides.</string>
+    <string name="stub_activities_note">The ride list and ride detail: summary, power trace, heart rate and zone time.</string>
+    <string name="stub_calendar_note">The month grid: planned workouts, completed rides, races and out-of-training phase.</string>
+    <string name="stub_volume_note">Weekly hours, TSS, distance and calories.</string>
+    <string name="stub_settings_note">Backend pairing (cloud / local), device state and key type. Pairing arrives with the client work.</string>
+
+    <string name="stub_issue_dashboard">#196</string>
+    <string name="stub_issue_activities">#197</string>
+    <string name="stub_issue_calendar">#198</string>
+    <string name="stub_issue_volume">#198</string>
+    <string name="stub_issue_settings">#195</string>
 </resources>

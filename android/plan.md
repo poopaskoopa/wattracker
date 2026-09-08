@@ -4,6 +4,16 @@ Epic #192 and sub-issues #193–#199, plus the owner's
 extra targets: Android 11+, dual-server support (cloud **and** local), offline
 cache. Kotlin + Jetpack Compose, single app under `android/`.
 
+**Resume point — Step 1 is done in code, blocked on the emulator toolchain**
+(see "Step 1 status — where to pick up", 2026-09-08). All Step-1 code is
+written on branch `feature/android-client` and **uncommitted**;
+`:app:assembleDebug` and `:app:assembleRelease` both build green (minSdk 30 /
+targetSdk 36). What remains is environmental, not architectural: create the
+two AVDs (old `avdmanager` NPEs; emulator 37.1.11 rejects hand-written AVD
+configs; new `avdmanager` can't locate the SDK dir), then boot/verify both
+idioms, fill the README measurement table, and do the git work (identity fix,
+announce, commit, PR).
+
 **Revised 2026-09-06.** Re-verified against `main` at `8c75eba`. What changed
 since the 2026-09-01 draft:
 
@@ -308,7 +318,7 @@ pinned toolchain, workspace-pinned env) into any new workflow.
 
 ---
 
-## Step 0 — Prerequisites (install & set up first)
+## Step 0 — Prerequisites (install & set up first) — ✅ done
 
 This machine: **Windows x64**. The Android SDK is already installed at
 `C:\Users\Takazumi\AppData\Local\Android\Sdk` (see `android/local.properties`);
@@ -468,6 +478,155 @@ install**; consequently there is no `.kilo/kilo.json` MCP block either
   POSIX script, so run it under Git-Bash/WSL (`bash scripts/hooks/install.sh`).
 - Python suite green (`.venv\Scripts\python.exe -m pytest` on Windows) before
   any merge to main.
+
+---
+
+## Step 1 status — where to pick up (2026-09-08, session 2)
+
+Branch `feature/android-client`: the scaffold commit `91a720d` plus an
+**uncommitted working tree that is the entire Step-1 deliverable** (see the
+warning at the end of this section). Nothing below is committed yet;
+`plan.md` itself is modified too.
+
+**Done in code (both variants build green):**
+
+- `gradle/libs.versions.toml` + `app/build.gradle.kts`: navigation-compose
+  2.10.0, room 2.8.4 (runtime/ktx/compiler), security-crypto 1.1.0,
+  KSP 2.2.10-2.0.2 (the tag for Kotlin 2.2.10; `2.2.10-2.0.3` is a 404),
+  material-icons-extended (BOM-managed). **Deviation to flag in the PR:**
+  icons-extended is one line beyond the plan's dependency list — it is
+  AndroidX and is the Android twin of the iOS shell's "SF Symbols ship with
+  the system" rule (rail/drawer render platform `ImageVector`s, no bundled
+  image assets). Build config: `buildConfig` on; `WATTRACKER_CLOUD_SCHEME` +
+  `WATTRACKER_CLOUD_HOST` per build type (debug `http` / `10.0.2.2:8765`;
+  release `https` / `cloud.wattracker.example` placeholder for Step 3).
+- Manifest: `INTERNET`, `usesCleartextTraffic="false"`,
+  `networkSecurityConfig="@xml/network_security_config"`.
+- `res/xml/network_security_config.xml` (release: base cleartext false) and
+  `app/src/debug/res/xml/network_security_config.xml` (debug: `domain-config`
+  cleartext for `localhost`, `127.0.0.1`, `10.0.2.2`).
+- `ui/theme/Palette.kt` (the CSS `:root` values, incl. `hr`) and dark-only
+  `Theme.kt` (`darkColorScheme(…)` overrides; no dynamic color, no light).
+  Template `Color.kt`/`Type.kt` deleted.
+- `shell/Destination.kt` (five destinations + `ImageVector` icons + routes),
+  `shell/Panel.kt` (`Panel`/`ScreenScaffold`/`StubPanel`, mirrors
+  `Theme/Panel.swift`), `shell/RootScreen.kt` (phone `NavigationRail` /
+  tablet `PermanentNavigationDrawer`; idiom predicate
+  `smallestScreenWidthDp >= 600`, rationale in KDoc), five stub screens,
+  `MainActivity` renders `RootScreen`.
+- Root `.gitignore`: Android section added.
+- `android/README.md`: written (build/run, both AVDs, rail/drawer
+  rationale, dependency rule, BYOK pointer, `WATTRACKER_HOST=0.0.0.0` **and**
+  `WATTRACKER_ALLOW_NON_LOOPBACK=1` for the emulator path — the second var is
+  the gate `wattracker/config.py:server_host()` actually enforces, which the
+  0.3 note abbreviates). **Its "Measured on the AVDs" table is still
+  placeholder** — fill it in the device-verification pass.
+
+**API ground truth for this BOM (2026.02.01 → M3 1.4.0, foundation 1.10.4) —
+cost several compile cycles to find, verified against the resolved jars; do
+not re-derive:**
+
+- Foundation 1.10 **removed** the window-size-class / window-metrics APIs
+  (`WindowWidthSizeClass`, `currentWindowWidthSizeClass`, and the
+  `currentWindowMetricsInfo` replacement are absent from `foundation` *and*
+  `ui`). The `smallestScreenWidthDp` predicate in `RootScreen.kt` is
+  deliberate, not a shortcut (its KDoc says so).
+- The M3 1.4 drawer API was revamped: `PermanentNavigationDrawer(
+  drawerContent, modifier, content)` — **no `gesturesEnabled`**
+  (modal-only); `PermanentDrawerSheet` **has no `containerColor`** — paint
+  the background on the sheet's content instead. `DismissibleNavigationDrawer`
+  / `DismissibleDrawerSheet` are the new names alongside the modal pair.
+- M3 1.4 `ColorScheme` constructors have **no default arguments** — build
+  the scheme from `darkColorScheme(…)` with named overrides.
+- material-icons-extended 1.7.x is KMP: **no drawable XMLs** in the AAR; the
+  icons are `ImageVector`s in `androidx.compose.material.icons.filled` (same
+  package as core, e.g. `Icons.Filled.Speed`). Also: the plain
+  `material-icons-extended-1.7.8.aar` Maven URL 404s — the KMP redirect
+  makes the real artifact `material-icons-extended-android` (same for
+  `material3-android`, `ui-android`, `foundation-android`).
+
+**Remaining, in order:**
+
+1. **Toolchain: create the two AVDs** (the blocker — state and next moves
+   below).
+2. Boot `wt-phone` (landscape) and `wt-tablet` (portrait **and** landscape);
+   verify rail with five navigable destinations / drawer correct in both.
+3. Measure `config.orientation` + `smallestScreenWidthDp` on the tablet in
+   both orientations; fill the README table (a Step-1 Done criterion).
+4. Screenshots of each idiom incl. tablet portrait, for the PR.
+5. Verify the 0.4 dev loop end to end (Agent mode + terminal
+   `gradlew`/`adb` equivalents).
+6. Git: **fix the local identity first** — it is `code@taksmon.com`
+   (personal; AGENTS.md mandates the noreply address, and the scaffold
+   commit's committer line already carries the personal address while its
+   author line is noreply). Then ANNOUNCE starting #193 (the Android epic is
+   not on the AGENTS.md queue — see "Issue state"), commit the Step-1 work
+   (`android/app/src/debug/` is new and untracked — add it), open the PR
+   with screenshots + the icons-extended deviation note.
+
+**Toolchain state on this machine (all discovered this session):**
+
+- No JDK on `PATH`; the only one is Android Studio's JBR:
+  `C:\Program Files\Android\Android Studio\jbr`. Every `sdkmanager` /
+  `avdmanager` / `android` invocation needs `$env:JAVA_HOME` set to it.
+  PowerShell also has neither `JAVA_HOME` nor `HOME` — the **new** tools
+  NPE without `$env:HOME` (`AvdManager.createInstance: parameter
+  baseAvdFolder` is null), so set it per shell too.
+- `cmdline-tools`: build 11076708 (sdkmanager 12.0) is **too old for this
+  SDK's package metadata** ("only understands SDK XML versions up to 3") and
+  its `avdmanager` NPEs (`Path.getFileSystem()`; "Error: AVD not created.
+  null" right after "Copying files"). **Upgraded to 16111833**, now in
+  `cmdline-tools\latest` — it ships the new `android.exe` CLI (1.0.16261425)
+  and `sdkmanager` prints a deprecation notice pointing at `android sdk`.
+  Newest-build lookup: `https://dl.google.com/android/repository/
+  repository2-3.xml` → `commandlinetools-win-<build>_latest.zip`.
+- All SDK licenses accepted. `sdkmanager --licenses` ignores piped input —
+  feed the `y`s through a file: `cmd /c "sdkmanager … --licenses < ys.txt"`.
+- `system-images;android-36;google_apis;x86_64` installed (~4.3 GB),
+  verified via `sdkmanager --list_installed`.
+- **Emulator 37.1.11 cannot boot hand-written AVDs.** It finds the AVD name
+  ("Found AVD name 'wt-phone'"), then `path_getRootIniPath` returns NULL →
+  "Failed to process .ini file (null)\config.ini" → falls back to the `arm`
+  default ABI → FATAL "CPU Architecture 'arm' is not supported". Both
+  layouts were tried (top-level `<name>.ini` pointer + `<name>.avd\config.ini`,
+  and the full config duplicated into `<name>.ini`) with and without
+  `ANDROID_AVD_HOME`/`ANDROID_SDK_HOME` (backslash and forward-slash forms).
+  Do **not** spend another cycle on hand-written AVDs.
+- **New `avdmanager` (16111833):** with `HOME` + `ANDROID_AVD_HOME` +
+  `ANDROID_HOME` + `ANDROID_SDK_ROOT` all set, `create avd` fails with
+  "Can't locate Android SDK installation directory for the AVD .ini file".
+  It has **no** `--sdk_root` option (checked its help). Unresolved.
+  Its failed runs leave partial `<name>.avd` dirs behind (next attempt then
+  fails with "already exists") — `~/.android/avd` currently holds
+  `wt-phone.avd` + `wt-tablet.avd` leftovers plus `avd.ini.bak` (the renamed
+  top-level `avd.ini`); delete the two `.avd` dirs before the next attempt.
+- **New `android` CLI passes environment detection:**
+  `…cmdline-tools\latest\bin\android.exe info` → `sdk:
+  C:\Users\Takazumi\AppData\Local\Android\Sdk`, `version: 1.0.16261425`.
+  Per the `android-cli` skill its `emulator` subcommand has `create` / `start`
+  ("returns when the emulator is fully started and ready to use") / `list` /
+  `stop` / `remove`, plus `android screenshot` and `android layout` (JSON UI
+  tree — the faster way to verify the rail/drawer than eyeballing a PNG).
+  **Paused here at the owner's request: the owner flagged a problem with the
+  android-cli skill and is debugging it.** Next move on resume: re-verify the
+  skill against `android help emulator create`, then create both AVDs with it
+  (device profiles: `pixel_tablet` for the tablet; `pixel_9` was absent from
+  the *old* tools' `list device` — re-check with the new tools before
+  falling back to `pixel_7`, and note whichever deviation), then
+  `android emulator start` and the verification pass above.
+- Web tooling this session: the SearXNG MCP server is broken (its
+  `pageno`/`time_range` params get mangled: "Expected Number, but 0 is
+  String" / "Value 'null' is not a valid enum value"), and the built-in web
+  search is user-disallowed; `web_url_read` with direct URLs works fine. If
+  the skill debugging needs web access, use that.
+- Scratch copies of the downloaded artifacts (cmdtools zips, the resolved
+  AARs, javap'd jars) live in this conversation's artifacts `scratch/`
+  directory — ephemeral, re-download if gone (URLs above).
+
+> [!WARNING]
+> The uncommitted working tree **is** the Step-1 deliverable. Do not run
+> `git checkout .` / `git reset --hard` in `wattracker/` while debugging the
+> toolchain.
 
 ---
 
