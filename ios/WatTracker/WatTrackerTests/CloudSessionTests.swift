@@ -519,17 +519,24 @@ final class CloudSessionTests: XCTestCase {
         XCTAssertEqual(second.queryItems["since"], "7")
     }
 
+    /// Uses `calendar` rather than `activities`, which used to stand here.
+    /// `api.py:1592` serves activities with `mobile=True`, so it is a delta
+    /// route now and cannot be this test's example of one that is not -- the
+    /// client flag simply lagged the server until PR #235's work landed.
+    /// The behaviour under test is unchanged and still worth pinning: a route
+    /// that serves no delta must never be sent `since`, and its read replaces
+    /// the cache rather than merging into it.
     func testARouteThatServesNoDeltaIsNeverAskedForOne() async throws {
         let cache = MemorySnapshotCache()
         cache.store(
             CachedCollection(
                 revision: 3,
                 items: [CloudFixtures.item(
-                    id: "activity-1", kind: "activity", revision: 3, data: #"{"tss":80}"#
+                    id: "workout-1", kind: "workout", revision: 3, data: #"{"tss":80}"#
                 )],
                 storedAt: Date()
             ),
-            for: .activities
+            for: .calendar
         )
         let rig = harness(cache: cache) { request, _ in
             request.url?.path == "/api/v1/context/refresh"
@@ -537,9 +544,9 @@ final class CloudSessionTests: XCTestCase {
                 : .json(#"{"items":[]}"#)
         }
 
-        let snapshot = try await rig.session.load(.activities)
-        let read = try XCTUnwrap(rig.transport.requests(matching: "/api/v1/context/activities").first)
-        XCTAssertNil(read.queryItems["since"], "activities is not a mobile delta route")
+        let snapshot = try await rig.session.load(.calendar)
+        let read = try XCTUnwrap(rig.transport.requests(matching: "/api/v1/context/calendar").first)
+        XCTAssertNil(read.queryItems["since"], "calendar is not a mobile delta route")
         XCTAssertTrue(snapshot.items.isEmpty, "a full read replaces rather than merges")
     }
 
@@ -812,5 +819,484 @@ final class CloudSessionTests: XCTestCase {
             }
         }
         XCTAssertEqual(rig.transport.requestCount, 0)
+    }
+
+
+    /// A pairing response for a *different* device than `CloudFixtures`
+    /// describes: different credential, subscription and namespace. Ported
+    /// with the reentrancy tests from PR #228, which needs a second identity
+    /// to prove a read cannot come back into a session that has since paired
+    /// something else.
+    private static func differentPairingBody(
+        context: String, expiresIn: Int = 300
+    ) -> String {
+        CloudFixtures.pairingBody(context: context)
+            .replacingOccurrences(of: "credential-1", with: "credential-2")
+            .replacingOccurrences(of: "subscription-1", with: "subscription-2")
+            .replacingOccurrences(
+                of: CloudFixtures.namespace, with: String(repeating: "b", count: 64)
+            )
+            .replacingOccurrences(of: "\"expires_in\":300", with: "\"expires_in\":\(expiresIn)")
+    }
+
+    // MARK: - Actor reentrancy across lifecycle changes
+    //
+    // Ported from PR #228 onto main's `lifecycleGeneration`, which is the same
+    // guard under the name that landed first (#233). These six describe races
+    // main's own tests do not: a read or refresh suspended across a sign-out,
+    // a removal, a re-pair, or a pair of a *different* device, arriving back to
+    // find the session is no longer the one it started in.
+
+    func testAnInFlightReadCannotReturnAfterRePairingTheSameDevice() async throws {
+            let gate = RequestGate()
+            let rig = harness { request, index in
+                if index == 1 {
+                    await gate.wait()
+                    return Self.dashboard(
+                        [CloudFixtures.profileItem(revision: 5, ftp: 240)], revision: 5
+                    )
+                }
+                if request.url?.path == "/api/v1/devices/pair" {
+                    return .json(CloudFixtures.pairingBody(context: "context-new"))
+                }
+                if request.httpMethod == "POST" {
+                    return .json(CloudFixtures.refreshBody(context: "context-old"))
+                }
+                return Self.dashboard([], revision: 5)
+            }
+
+            let read = Task { () -> String in
+                do {
+                    _ = try await rig.session.load(.dashboard)
+                    return "success"
+                } catch let failure as CloudSession.Failure {
+                    return failure.description
+                } catch {
+                    return "unexpected error"
+                }
+            }
+            let arrivedAtGate = await gate.waitForArrival()
+            XCTAssertTrue(arrivedAtGate, "the request never reached the gate; the race this test describes did not happen")
+            let arrived = await gate.arrived
+            XCTAssertEqual(arrived, 1)
+
+            await rig.session.signOut()
+            _ = try await rig.session.pair(code: "ABCD-EFGH-JKLM")
+            XCTAssertNil(rig.cache.load(.dashboard))
+            await gate.openGate()
+
+            let result = await read.value
+            XCTAssertEqual(result, "This device is not paired yet")
+            XCTAssertNil(rig.cache.load(.dashboard), "late data must not restore cache")
+
+            let snapshot = try await rig.session.load(.dashboard)
+            XCTAssertEqual(snapshot.source, .network)
+            let postPairRead = try XCTUnwrap(
+                rig.transport.requests(matching: "/api/v1/context/dashboard").last
+            )
+            XCTAssertEqual(postPairRead.bearerToken, "context-new")
+        }
+
+        func testAnInFlightReadCannotReturnDataAfterPairingADifferentDevice() async throws {
+            let gate = RequestGate()
+            let cache = MemorySnapshotCache()
+            cache.store(
+                CachedCollection(
+                    revision: 4,
+                    items: [CloudFixtures.item(
+                        id: "profile", kind: "profile", revision: 4, data: #"{"ftp":230}"#
+                    )],
+                    storedAt: Date()
+                ),
+                for: .dashboard
+            )
+            let rig = harness(cache: cache) { request, index in
+                if index == 1 {
+                    await gate.wait()
+                    return Self.dashboard(
+                        [CloudFixtures.profileItem(revision: 5, ftp: 240)], revision: 5
+                    )
+                }
+                if request.url?.path == "/api/v1/devices/pair" {
+                    let body = CloudFixtures.pairingBody(context: "context-new")
+                        .replacingOccurrences(of: "credential-1", with: "credential-2")
+                        .replacingOccurrences(of: "subscription-1", with: "subscription-2")
+                    return .json(body)
+                }
+                if request.httpMethod == "POST" {
+                    return .json(CloudFixtures.refreshBody(context: "context-1"))
+                }
+                return Self.dashboard([], revision: 5)
+            }
+
+            let read = Task { () -> String in
+                do {
+                    _ = try await rig.session.load(.dashboard)
+                    return "success"
+                } catch let failure as CloudSession.Failure {
+                    return failure.description
+                } catch {
+                    return "unexpected error"
+                }
+            }
+            let arrivedAtGate = await gate.waitForArrival()
+            XCTAssertTrue(arrivedAtGate, "the request never reached the gate; the race this test describes did not happen")
+            let arrived = await gate.arrived
+            XCTAssertEqual(arrived, 1)
+
+            _ = try await rig.session.pair(code: "ABCD-EFGH-JKLM")
+            XCTAssertNil(rig.cache.load(.dashboard))
+            await gate.openGate()
+
+            let result = await read.value
+            XCTAssertEqual(result, "This device is not paired yet")
+            XCTAssertNil(rig.cache.load(.dashboard), "late data must not restore cache")
+        }
+
+        func testAnInFlightReadCannotReturnOrRestoreDataAfterRemoval() async throws {
+            let clock = TestClock()
+            let gate = RequestGate()
+            let cache = MemorySnapshotCache()
+            cache.store(
+                CachedCollection(
+                    revision: 4,
+                    items: [CloudFixtures.item(
+                        id: "profile", kind: "profile", revision: 4, data: #"{"ftp":230}"#
+                    )],
+                    storedAt: clock.now
+                ),
+                for: .dashboard
+            )
+            let rig = harness(cache: cache, clock: clock) { request, index in
+                if index == 1 {
+                    await gate.wait()
+                    return Self.dashboard(
+                        [CloudFixtures.profileItem(revision: 5, ftp: 240)], revision: 5
+                    )
+                }
+                if request.httpMethod == "POST" {
+                    return index == 0
+                        ? .json(CloudFixtures.refreshBody(context: "context-0"))
+                        : .refused(404, serverDate: clock.now)
+                }
+                if index == 2 || index == 4 {
+                    return .refused(404, serverDate: clock.now)
+                }
+                return Self.dashboard([], revision: 5)
+            }
+
+            let read = Task { () -> String in
+                do {
+                    _ = try await rig.session.load(.dashboard)
+                    return "success"
+                } catch let failure as CloudSession.Failure {
+                    return failure.description
+                } catch {
+                    return "unexpected error"
+                }
+            }
+            let arrivedAtGate = await gate.waitForArrival()
+            XCTAssertTrue(arrivedAtGate, "the request never reached the gate; the race this test describes did not happen")
+            let arrived = await gate.arrived
+            XCTAssertEqual(arrived, 1)
+
+            // The two later refusals remove the device while the original page is
+            // still suspended. The original response is deliberately successful.
+            _ = try await rig.session.load(.dashboard)
+            clock.advance(60)
+            do {
+                _ = try await rig.session.load(.dashboard)
+                XCTFail("the second refused refresh must remove the device")
+            } catch let failure as CloudSession.Failure {
+                guard case .deviceRemoved = failure else {
+                    return XCTFail("expected removal, got \(failure)")
+                }
+            }
+
+            XCTAssertNil(rig.cache.load(.dashboard))
+            await gate.openGate()
+
+            let result = await read.value
+            XCTAssertEqual(result, "This device was removed")
+            XCTAssertNil(rig.cache.load(.dashboard), "late data must not restore cache")
+        }
+
+        func testAnInFlightReadCannotReturnOrRestoreDataAfterSigningOut() async throws {
+            let gate = RequestGate()
+            let cache = MemorySnapshotCache()
+            cache.store(
+                CachedCollection(
+                    revision: 4,
+                    items: [CloudFixtures.item(
+                        id: "profile", kind: "profile", revision: 4, data: #"{"ftp":230}"#
+                    )],
+                    storedAt: Date()
+                ),
+                for: .dashboard
+            )
+            let rig = harness(cache: cache) { request, index in
+                if index == 1 {
+                    await gate.wait()
+                    return Self.dashboard(
+                        [CloudFixtures.profileItem(revision: 5, ftp: 240)], revision: 5
+                    )
+                }
+                if request.httpMethod == "POST" {
+                    return .json(CloudFixtures.refreshBody(context: "context-1"))
+                }
+                return Self.dashboard([], revision: 5)
+            }
+
+            let read = Task { () -> String in
+                do {
+                    _ = try await rig.session.load(.dashboard)
+                    return "success"
+                } catch let failure as CloudSession.Failure {
+                    return failure.description
+                } catch {
+                    return "unexpected error"
+                }
+            }
+            let arrivedAtGate = await gate.waitForArrival()
+            XCTAssertTrue(arrivedAtGate, "the request never reached the gate; the race this test describes did not happen")
+            let arrived = await gate.arrived
+            XCTAssertEqual(arrived, 1)
+
+            await rig.session.signOut()
+            XCTAssertNil(rig.cache.load(.dashboard))
+            await gate.openGate()
+
+            let result = await read.value
+            XCTAssertEqual(result, "This device is not paired yet")
+            XCTAssertNil(rig.cache.load(.dashboard), "late data must not restore cache")
+        }
+
+        func testAnObsoleteRefreshCannotClearAReplacementRefreshTask() async throws {
+            let oldGate = RequestGate()
+            let replacementGate = RequestGate()
+            let rig = harness { request, index in
+                if index == 0 {
+                    await oldGate.wait()
+                    return .json(CloudFixtures.refreshBody(context: "context-old"))
+                }
+                if request.url?.path == "/api/v1/devices/pair" {
+                    return .json(
+                        Self.differentPairingBody(context: "context-paired", expiresIn: 10)
+                    )
+                }
+                if index == 2 {
+                    await replacementGate.wait()
+                    return .json(CloudFixtures.refreshBody(context: "context-replacement"))
+                }
+                if request.httpMethod == "POST" {
+                    return .json(CloudFixtures.refreshBody(context: "context-unexpected"))
+                }
+                return Self.dashboard([], revision: 1)
+            }
+
+            let oldRead = Task { () -> String in
+                do {
+                    return try await rig.session.readerContext()
+                } catch let failure as CloudSession.Failure {
+                    return failure.description
+                } catch {
+                    return "unexpected error"
+                }
+            }
+            let arrivedAtOldGate = await oldGate.waitForArrival()
+            XCTAssertTrue(arrivedAtOldGate, "the request never reached the gate; the race this test describes did not happen")
+            let oldRefreshArrived = await oldGate.arrived
+            XCTAssertEqual(oldRefreshArrived, 1)
+
+            await rig.session.signOut()
+            _ = try await rig.session.pair(code: "ABCD-EFGH-JKLM")
+
+            let replacement = Task { () -> String in
+                try await rig.session.readerContext()
+            }
+            let arrivedAtReplacementGate = await replacementGate.waitForArrival()
+            XCTAssertTrue(arrivedAtReplacementGate, "the request never reached the gate; the race this test describes did not happen")
+            let replacementArrived = await replacementGate.arrived
+            XCTAssertEqual(replacementArrived, 1)
+
+            let joiner = Task { () -> String in
+                try await rig.session.readerContext()
+            }
+            for _ in 0..<1_000 { await Task.yield() }
+
+            await oldGate.openGate()
+            let oldReadResult = await oldRead.value
+            XCTAssertEqual(oldReadResult, "This device is not paired yet")
+            let replacementStillWaiting = await replacementGate.arrived
+            XCTAssertEqual(replacementStillWaiting, 1)
+
+            await replacementGate.openGate()
+            let replacementResult = try await replacement.value
+            XCTAssertEqual(replacementResult, "context-replacement")
+            let joinerResult = try await joiner.value
+            XCTAssertEqual(joinerResult, "context-replacement")
+            XCTAssertEqual(
+                rig.transport.requests(matching: "/api/v1/context/refresh").count,
+                2,
+                "the obsolete task must not cause a replacement refresh"
+            )
+        }
+
+        func testARefreshSuspendedAcrossSignOutAndPairCannotPublishTheOldToken() async throws {
+            let refreshGate = RequestGate()
+            let rig = harness { request, index in
+                if index == 0 {
+                    await refreshGate.wait()
+                    return .json(CloudFixtures.refreshBody(context: "context-old"))
+                }
+                if request.url?.path == "/api/v1/devices/pair" {
+                    return .json(Self.differentPairingBody(context: "context-new"))
+                }
+                return Self.dashboard(
+                    [CloudFixtures.profileItem(revision: 1, ftp: 250)], revision: 1
+                )
+            }
+
+            let oldRead = Task { () -> String in
+                do {
+                    return try await rig.session.readerContext()
+                } catch let failure as CloudSession.Failure {
+                    return failure.description
+                } catch {
+                    return "unexpected error"
+                }
+            }
+            let arrivedAtRefreshGate = await refreshGate.waitForArrival()
+            XCTAssertTrue(arrivedAtRefreshGate, "the request never reached the gate; the race this test describes did not happen")
+            let refreshArrived = await refreshGate.arrived
+            XCTAssertEqual(refreshArrived, 1)
+
+            await rig.session.signOut()
+            _ = try await rig.session.pair(code: "ABCD-EFGH-JKLM")
+            await refreshGate.openGate()
+
+            let oldReadResult = await oldRead.value
+            XCTAssertEqual(oldReadResult, "This device is not paired yet")
+
+            let snapshot = try await rig.session.load(.dashboard)
+            XCTAssertEqual(snapshot.source, .network)
+            let read = try XCTUnwrap(
+                rig.transport.requests(matching: "/api/v1/context/dashboard").last
+            )
+            XCTAssertEqual(read.bearerToken, "context-new")
+            XCTAssertEqual(
+                read.value(forHTTPHeaderField: "Ocp-Apim-Subscription-Key"),
+                "subscription-2"
+            )
+        }
+
+    // MARK: - Activity-owned objects
+    //
+    // Ported from PR #235 onto main's `lifecycleGeneration`. That PR guarded
+    // these reads with its own `sessionGeneration`, written before #233 landed
+    // an equivalent; the reads are what was worth keeping.
+
+    func testActivitiesUseTheirDeltaCheckpointAndRemoveTombstones() async throws {
+        let cache = MemorySnapshotCache()
+        cache.store(
+            CachedCollection(
+                revision: 3,
+                items: [CloudFixtures.item(
+                    id: "activity-1", kind: "activity", revision: 3, data: #"{"tss":80}"#
+                )],
+                storedAt: Date()
+            ),
+            for: .activities
+        )
+        let rig = harness(cache: cache) { request, _ in
+            if request.url?.path == "/api/v1/context/refresh" {
+                return .json(CloudFixtures.refreshBody(context: "context-1"))
+            }
+            return .json(CloudFixtures.collection(
+                items: [CloudFixtures.tombstone(
+                    id: "activity-1", kind: "activity", revision: 4
+                )],
+                revision: 4
+            ))
+        }
+
+        let snapshot = try await rig.session.load(.activities)
+        let read = try XCTUnwrap(rig.transport.requests(matching: "/api/v1/context/activities").first)
+        XCTAssertEqual(read.queryItems["since"], "3")
+        XCTAssertTrue(snapshot.items.isEmpty, "the activity tombstone removes the cached ride")
+        XCTAssertEqual(snapshot.revision, 4)
+    }
+
+    func testActivityDetailAndStreamsUseObjectRoutesDecodeAndCachePerSession() async throws {
+        let rig = harness { request, _ in
+            switch request.url?.path {
+            case "/api/v1/context/refresh":
+                return .json(CloudFixtures.refreshBody(context: "context-1"))
+            case "/api/v1/context/activities/activity-detail-17":
+                return .json("""
+                {"id":"activity-detail-17","kind":"activity_detail","revision":17,"data":{
+                  "id":17,"start_time":"2026-01-02T18:04:00Z","duration_s":3600,
+                  "distance_m":32100.5,"avg_power":211,"np":225,"if_":0.9,
+                  "tss":81,"rpe":6,"zones":{"power":{"zones":[]}}}}
+                """)
+            case "/api/v1/context/activities/stream-17":
+                return .json("""
+                {"id":"stream-17","kind":"stream","revision":17,"data":{
+                  "streams":{"time":[0,1,2],"power":[180,null,205],
+                             "heartrate":[120,121,123],"altitude":[10,11,12]}}}
+                """)
+            default:
+                return .refused(404)
+            }
+        }
+
+        let detail = try await rig.session.activityDetail(17)
+        XCTAssertEqual(detail.id, 17)
+        XCTAssertEqual(detail.distanceM, 32_100.5)
+        XCTAssertEqual(detail.intensityFactor, 0.9)
+
+        let streams = try await rig.session.activityStreams(17)
+        XCTAssertEqual(streams.streams.power?.count, 3)
+        XCTAssertNil(streams.streams.power?[1])
+        XCTAssertNil(streams.streams.cadence)
+
+        _ = try await rig.session.activityDetail(17)
+        _ = try await rig.session.activityStreams(17)
+        let detailRequests = rig.transport.requests(
+            matching: "/api/v1/context/activities/activity-detail-17"
+        )
+        let streamRequests = rig.transport.requests(
+            matching: "/api/v1/context/activities/stream-17"
+        )
+        XCTAssertEqual(detailRequests.count, 1, "an opened detail stays in the session cache")
+        XCTAssertEqual(streamRequests.count, 1, "an opened stream stays in the session cache")
+        XCTAssertEqual(detailRequests.first?.httpMethod, "GET")
+        XCTAssertEqual(detailRequests.first?.bearerToken, "context-1")
+        XCTAssertEqual(streamRequests.first?.bearerToken, "context-1")
+        XCTAssertEqual(
+            detailRequests.first?.value(forHTTPHeaderField: "Ocp-Apim-Subscription-Key"),
+            CloudFixtures.device.subscriptionKey
+        )
+    }
+
+    func testARejectedContextRetriesAnActivityObjectOnceWithANewToken() async throws {
+        let rig = harness { request, index in
+            if request.url?.path == "/api/v1/context/refresh" {
+                return .json(CloudFixtures.refreshBody(context: "context-\(index)"))
+            }
+            return index == 1 ? .refused(404) : .json("""
+            {"id":"activity-detail-8","kind":"activity_detail","revision":8,
+             "data":{"id":8,"duration_s":1200}}
+            """)
+        }
+
+        let detail = try await rig.session.activityDetail(8)
+        XCTAssertEqual(detail.id, 8)
+        let reads = rig.transport.requests(
+            matching: "/api/v1/context/activities/activity-detail-8"
+        )
+        XCTAssertEqual(reads.count, 2)
+        XCTAssertEqual(reads.first?.bearerToken, "context-0")
+        XCTAssertEqual(reads.last?.bearerToken, "context-2")
     }
 }

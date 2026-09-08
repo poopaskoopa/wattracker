@@ -1785,6 +1785,69 @@ def profile_object(
     )
 
 
+MAX_SNAPSHOT_PUBLISH_PAGES = 64
+
+
+def snapshot_publish_pages(
+    path: str | os.PathLike[str],
+    user_id: int,
+    *,
+    batch_id: str,
+    revision: int,
+    limit: int = MAX_BATCH_OBJECTS,
+    include_streams: bool = False,
+    include_derived: bool = True,
+    max_pages: int = MAX_SNAPSHOT_PUBLISH_PAGES,
+) -> list[SyncBatch]:
+    """Page the full read-only snapshot into publishable batches.
+
+    ``snapshot_objects`` puts activity and activity-detail objects before
+    derived ones (``profile``, ``training_state``, ``load_point``, ``curve``,
+    ...), and other callers depend on that ordering and its offset contract,
+    so it is not reordered here. A rider with enough activities pushes the
+    derived objects past a single page's ``limit``; wrapping just the first
+    page in one batch would silently drop them. Paging here returns one ``SyncBatch`` per page, each
+    carrying at most ``limit`` objects, with a batch id derived from
+    ``batch_id`` and a revision counting up from ``revision`` so a caller can
+    post them as an ordered sequence of otherwise-independent batches.
+
+    An empty list means there is nothing to publish. ``max_pages`` bounds the
+    walk so a pathological database cannot page forever.
+    """
+
+    if max_pages < 1:
+        raise ValueError("max_pages must be positive")
+    batches: list[SyncBatch] = []
+    offset = 0
+    while True:
+        page = snapshot_objects(
+            path, user_id, limit=limit, include_streams=include_streams,
+            include_derived=include_derived, offset=offset,
+        )
+        # Exhausted. Reached either by a short page -- the common case, and
+        # cheap because it costs no further read -- or by a snapshot whose
+        # size is an exact multiple of ``limit``, which needs this empty read
+        # to distinguish "the last page happened to be full" from "there is
+        # more". That distinction is why the bound below is checked against a
+        # page that actually has objects in it: a snapshot of exactly
+        # ``max_pages`` full pages is a complete snapshot, not a runaway one.
+        if not page:
+            return batches
+        if len(batches) == max_pages:
+            raise SnapshotError(
+                f"snapshot for user {user_id} exceeds {max_pages} pages "
+                f"at limit={limit}"
+            )
+        batches.append(SyncBatch(
+            batch_id=f"{batch_id}-{len(batches) + 1}",
+            revision=revision + len(batches),
+            objects=tuple(page),
+        ))
+        offset += len(page)
+        if len(page) < limit:
+            return batches
+
+
 def profile_batch(
     path: str | os.PathLike[str],
     user_id: int,

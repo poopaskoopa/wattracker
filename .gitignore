@@ -72,6 +72,11 @@ tmp/
 # xcuserdata holds per-developer window state, breakpoints and the non-shared
 # schemes; the shared scheme in xcshareddata IS committed, because xcodebuild
 # needs it. DerivedData and build products never are.
+# Written by scripts/walking_skeleton_server.py --lan and optionally included
+# by Debug.xcconfig: the Mac's LAN address, which changes with the network and
+# so is never right to commit.
+ios/WatTracker/Config/Local.xcconfig
+
 DerivedData/
 *.xcuserstate
 *.xcuserdatad/

@@ -74,7 +74,7 @@ struct RootView: View {
             .listStyle(.sidebar)
             .scrollContentBackground(.hidden)
             .background(Palette.bg)
-            .navigationTitle("WatTracker")
+            .navigationTitle("wattracker")
         } detail: {
             NavigationStack {
                 screen(for: selection ?? .dashboard)
@@ -118,5 +118,10 @@ struct RootView: View {
 }
 
 #Preview {
-    RootView().preferredColorScheme(.dark)
+    // The gate is what `AppGate` injects in the running app; `SettingsScreen`
+    // reads it from the environment, so a preview without one would trap.
+    // Constructing one is free -- nothing touches the keychain until `start`.
+    RootView()
+        .environment(SessionGate())
+        .preferredColorScheme(.dark)
 }

@@ -5,7 +5,7 @@ import UIKit
 struct WatTrackerApp: App {
     var body: some Scene {
         WindowGroup {
-            RootView()
+            AppGate()
                 // Dark only. The palette in Theme/Palette.swift is the desktop
                 // app's dark theme and there is no light variant to fall back
                 // to, so the appearance is forced rather than followed.
