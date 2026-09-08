@@ -70,6 +70,10 @@ class _Replaced(Exception):
     """The server closed us because another connector took over the account."""
 
 
+class _Revoked(Exception):
+    """The server refused our token: the device has been revoked."""
+
+
 class ConnectorStatus:
     """What the tray icon shows. Plain attributes, read from another thread."""
 
@@ -147,6 +151,16 @@ class Connector:
             self._handlers.update(extra_handlers)
         self._peer: Optional[rpc.RpcPeer] = None
         self._stop = asyncio.Event()
+        # Set when the token (or the server) changed while this object is
+        # running: the session being served was handed the old credential,
+        # and the new one has to prove itself on a fresh handshake. The loop
+        # consumes it once per session it ends because of it - see
+        # run_forever and _serve.
+        self._reconnect = asyncio.Event()
+        # The loop run_forever is running on, held for its life. reconnect()
+        # comes from whatever thread a re-pair happens on, and
+        # call_soon_threadsafe is the only door into the loop.
+        self._loop: Optional[asyncio.AbstractEventLoop] = None
         # Watches the Zwift folder so a finished ride reaches the server in
         # about a minute instead of on the server's daily sweep. The interval
         # is settable (and 0 turns it off) because it is the one thing here a
@@ -191,8 +205,62 @@ class Connector:
     def stop(self) -> None:
         self._stop.set()
 
+    def reconnect(self) -> None:
+        """Drop the current session and reconnect with the current settings.
+
+        The re-pair path: the token and the server have just been reassigned
+        on this object from another thread, and the session being served - if
+        there is one - was handed the old ones. The request is posted to the
+        loop that is running ``run_forever``. Before it has started, or after
+        it has ended, there is no session holding the old credential, so a
+        request then is a no-op rather than an error: the next start already
+        reads the new values.
+        """
+        loop = self._loop
+        if loop is None:
+            return
+        try:
+            loop.call_soon_threadsafe(self._reconnect.set)
+        except RuntimeError:
+            # The loop closed between the read above and this call - there is
+            # no atomic way to ask. Same case as _loop being None already: the
+            # session holding the old credential is gone, so there is nothing
+            # to drop, and the next start reads the new values. Letting this
+            # out would pop a warning balloon at a rider whose re-pair was in
+            # fact saved.
+            pass
+
+    async def _wait_for_repair_or_stop(
+        self, timeout: Optional[float] = None
+    ) -> bool:
+        """Sleep until a re-pair, a quit, or ``timeout`` seconds (or forever).
+
+        Every wait in the run loop has to hear both Events rather than only
+        counting down: a quit ends the loop, and a re-pair makes whatever this
+        wait was for pointless. Both are set from other threads, so neither
+        arrives on the schedule the timeout was sized for.
+
+        Returns whether something woke it - True for a re-pair or a quit,
+        False for a timeout that ran its full course. The caller needs the
+        difference: only a delay that was actually served says anything about
+        how unreachable the server is.
+        """
+        stop_wait = asyncio.ensure_future(self._stop.wait())
+        reconnect_wait = asyncio.ensure_future(self._reconnect.wait())
+        try:
+            done, _pending = await asyncio.wait(
+                {stop_wait, reconnect_wait},
+                timeout=timeout,
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+            return bool(done)
+        finally:
+            stop_wait.cancel()
+            reconnect_wait.cancel()
+
     async def run_forever(self) -> None:
         """Connect, serve, and reconnect until stopped."""
+        self._loop = asyncio.get_running_loop()
         backoff = _BACKOFF_START_S
         # Started here, not inside a session: the folder has to keep
         # being watched while the socket is down, or a ride finished
@@ -200,6 +268,11 @@ class Connector:
         watch = self._start_activity_watch()
         try:
             while not self._stop.is_set():
+                # The credential the next session will use is whatever the
+                # object holds right now, so any earlier request to reconnect
+                # with a new one has been answered by the session this
+                # iteration is about to start.
+                self._reconnect.clear()
                 try:
                     await self._session()
                     backoff = _BACKOFF_START_S  # a clean session resets the clock
@@ -227,23 +300,91 @@ class Connector:
                     )
                     self._stop.set()
                     break
+                except _Revoked as exc:
+                    # A revoked token is a refusal, not a blip. Backing off and
+                    # redialling the same token forever is what the issue is
+                    # about: it looks exactly like an unreachable server, so a
+                    # rider who does not open the log chases a network problem.
+                    # Stop retrying and say why. Unlike _Replaced this is
+                    # recoverable without restarting the process - the tray's
+                    # Pair... item saves a fresh token and wakes this wait - so
+                    # the loop goes idle here rather than ending.
+                    self.status.connected = False
+                    self.status.last_error = str(exc)
+                    self.status.stopped_reason = (
+                        "The server will not accept this device's token - "
+                        "most likely it was revoked. Use Pair... to re-pair "
+                        "this device."
+                    )
+                    # The tray reads stopped to draw "not reconnecting" instead
+                    # of the retrying spinner, and to hold off the once-per-
+                    # outage "cannot reach" balloon that would misname this.
+                    self.status.stopped = True
+                    # Hedged deliberately: in this app a 403 on the upgrade
+                    # is only ever an unrecognised token, but an authenticating
+                    # proxy in front of the server answers the same way, and
+                    # naming a cause that confidently sends the wrong reader
+                    # looking for a revocation that never happened.
+                    log.error(
+                        "the server refused this device's token (HTTP 403) - "
+                        "most likely it was revoked. Dialling it again will "
+                        "not help, so not retrying; re-pair the device to "
+                        "reconnect. If it was not revoked, check whatever sits "
+                        "in front of the server."
+                    )
+                    # The radio goes back, for the same reason it goes back
+                    # when the loop ends: nothing is going to pick this ride
+                    # up. A dropped socket keeps the trainer because a server
+                    # is expected back within the backoff; a refusal is that
+                    # server saying it is not coming. This is exactly the case
+                    # _abandon_unclaimed_ride exists for, and it cannot help
+                    # here - it only ever arms inside a session, and the next
+                    # session is on the far side of a re-pair that may be
+                    # hours away. Without this a rider goes on pushing against
+                    # an ERG target no server is managing, while the tray says
+                    # the connector has stopped. The buffer survives teardown
+                    # and goes up on the next connection.
+                    await self.ble.teardown()
+                    # Then wait on the only two things that change the
+                    # outcome, not a backoff: a re-pair saves a new token, a
+                    # quit ends the process. Neither runs on the backoff's
+                    # schedule, so there is nothing to time out.
+                    await self._wait_for_repair_or_stop()
+                    if self._stop.is_set():
+                        break
+                    # A new pairing was saved: the token on this object is now
+                    # the fresh one, so the revoked state is over and the next
+                    # dial proves it.
+                    self.status.stopped = False
+                    self.status.stopped_reason = None
+                    continue
                 except Exception as exc:
                     self.status.connected = False
                     self.status.last_error = str(exc)
                     log.warning("connector session ended: %s", exc)
                 if self._stop.is_set():
                     break
+                # A repair that landed while the session was still up. The
+                # dial goes out now, and no delay is announced that is not
+                # going to be served.
+                if self._reconnect.is_set():
+                    continue
                 # Jitter so a fleet of connectors does not stampede a server that
                 # just came back up.
                 ceiling = _RIDE_BACKOFF_MAX_S if self.ble.riding else _BACKOFF_MAX_S
                 delay = min(backoff, ceiling) * (0.5 + random.random())
                 log.info("reconnecting in %.1fs", delay)
-                try:
-                    await asyncio.wait_for(self._stop.wait(), timeout=delay)
-                except asyncio.TimeoutError:
-                    pass
+                if await self._wait_for_repair_or_stop(timeout=delay):
+                    # Woken rather than timed out: a quit, which the top of the
+                    # loop answers, or a re-pair. Only a delay that actually ran
+                    # out is evidence the server is still unreachable and the
+                    # next one should be longer - a rider pasting a token is
+                    # not, and three re-pairs must not talk the connector into
+                    # a three-times-longer wait for the outage after them.
+                    continue
                 backoff = min(backoff * _BACKOFF_FACTOR, _BACKOFF_MAX_S)
         finally:
+            self._loop = None
             await _cancel(watch)
         # Leaving the loop is definitive - Ctrl-C, the tray quitting, or being
         # displaced by another connector - not a reconnect. So the radio goes
@@ -263,6 +404,15 @@ class Connector:
         log.info("connecting to %s", url)
         try:
             await self._connected_session(websockets, url)
+        except websockets.exceptions.InvalidStatus as exc:
+            # The handshake got an HTTP answer instead of a 101 - the server
+            # refused us before a socket ever existed. A 403 is a refused
+            # credential: the device has been revoked, and dialling the same
+            # token again is never going to be different. (Any other status is
+            # a transport failure and stays retryable.)
+            if exc.response.status_code == 403:
+                raise _Revoked(str(exc)) from exc
+            raise
         except websockets.exceptions.ConnectionClosed as exc:
             if exc.rcvd is not None and exc.rcvd.code == rpc.WS_REPLACED:
                 raise _Replaced(str(exc)) from exc
@@ -436,9 +586,27 @@ class Connector:
         self._activities_dirty = False
 
     async def _serve(self, socket, peer: rpc.RpcPeer) -> None:
-        """Answer requests until the socket closes or we are told to stop."""
+        """Answer requests until the socket closes or we are told to stop.
+
+        A repair ends the session too: it means the token this session was
+        handed is being replaced, and the new one proves itself on the next
+        handshake, not on this one.
+        """
         while not self._stop.is_set():
-            message = rpc.decode(await socket.receive_text())
+            receive = asyncio.ensure_future(socket.receive_text())
+            reconnect = asyncio.ensure_future(self._reconnect.wait())
+            done, _pending = await asyncio.wait(
+                {receive, reconnect}, return_when=asyncio.FIRST_COMPLETED
+            )
+            if receive not in done:
+                # The token changed while this session was serving the old
+                # one. End it and let run_forever dial again - the next
+                # session reads the new value.
+                receive.cancel()
+                log.info("settings changed; reconnecting with the new token")
+                break
+            reconnect.cancel()
+            message = rpc.decode(receive.result())
             if peer.resolve(message):
                 continue
             if "method" in message:

@@ -147,7 +147,9 @@ _ERROR_CLASS_ALREADY_EXISTS = 1410
 
 # Menu command identifiers. Only their distinctness matters.
 _ID_STATUS, _ID_DETAIL = 1, 2
-_ID_OPEN, _ID_LOG, _ID_CONFIG, _ID_AUTOSTART, _ID_QUIT = 3, 4, 5, 6, 7
+_ID_OPEN, _ID_LOG, _ID_CONFIG, _ID_AUTOSTART, _ID_QUIT, _ID_PAIR = (
+    3, 4, 5, 6, 7, 8
+)
 
 # The window class doubles as the way a second launch finds the first one, so
 # it is a fixed public-ish name rather than something generated per process.
@@ -302,9 +304,10 @@ def signal_existing_instance() -> bool:
 class TrayIcon:
     """The icon, its menu, and the pump that serves both.
 
-    ``status`` is read and never written. ``on_open`` and ``on_quit`` are
-    called on worker threads, so they may block; anything they want the rider
-    to see comes back through :meth:`notify`, which is safe from any thread.
+    ``status`` is read and never written. ``on_open``, ``on_pair`` and
+    ``on_quit`` are called on worker threads, so they may block; anything they
+    want the rider to see comes back through :meth:`notify`, which is safe
+    from any thread.
     """
 
     def __init__(
@@ -312,6 +315,7 @@ class TrayIcon:
         status,
         on_open: Callable[[], None],
         on_quit: Callable[[], None],
+        on_pair: Callable[[], None],
     ) -> None:
         if os.name != "nt":
             # Construction is where this fails, deliberately: importing must
@@ -323,6 +327,7 @@ class TrayIcon:
         self._status = status
         self._on_open = on_open
         self._on_quit = on_quit
+        self._on_pair = on_pair
         self._user32 = _user32()
         self._shell32 = _shell32()
         self._lock = threading.Lock()
@@ -678,6 +683,10 @@ class TrayIcon:
         append(_HANDLE(menu), _MF_STRING, _ID_OPEN, "&Open wattracker")
         append(_HANDLE(menu), _MF_STRING, _ID_LOG, "Open &log")
         append(_HANDLE(menu), _MF_STRING, _ID_CONFIG, "Open &config folder")
+        # Always on offer, in every state: a revoked device is one that shows
+        # up as "not connected", and the rider is not about to hand-edit
+        # connector.json to find out why.
+        append(_HANDLE(menu), _MF_STRING, _ID_PAIR, "&Pair...")
         append(_HANDLE(menu), _MF_SEPARATOR, 0, None)
         if autostart.supported():
             flags = _MF_STRING | (_MF_CHECKED if autostart.enabled() else 0)
@@ -701,6 +710,10 @@ class TrayIcon:
             self._reveal(log_path(), "log")
         elif command == _ID_CONFIG:
             self._reveal(config_dir(), "config folder")
+        elif command == _ID_PAIR:
+            # On a worker, like open and quit, because the pairing window
+            # pumps its own message loop until the rider closes it.
+            self._worker("pair", self._on_pair)
         elif command == _ID_AUTOSTART:
             self._toggle_autostart()
         elif command == _ID_QUIT:

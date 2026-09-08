@@ -24,6 +24,8 @@ session being replaced by a different one.
 from __future__ import annotations
 
 import asyncio
+import threading
+import time
 
 import pytest
 
@@ -677,6 +679,495 @@ def test_being_displaced_leaves_a_reason_a_rider_can_act_on(tmp_path, monkeypatc
     assert connector.status.stopped is True
     assert "Only one connector may run per account" in connector.status.stopped_reason
     assert "4409" not in connector.status.stopped_reason
+
+
+def test_a_revoked_device_is_terminal_and_says_so(tmp_path, monkeypatch):
+    """The 403 at the handshake is not a network failure.
+
+    Backing off and redialling the same revoked token forever is exactly what
+    the rider should not see: it looks like an unreachable server, so someone
+    who does not open the log chases a network problem. The correct shape is
+    "not connected, and that is the end of it" - stop retrying, and leave the
+    sentence the tray will show where the tray can find it.
+    """
+    from wattracker_connector import client as clientmod
+
+    # Instant backoff: if the revoked path ever falls through to the generic
+    # failure handler, a retrying loop would make many attempts in the sleep
+    # below. The one it must make is the last.
+    monkeypatch.setattr(clientmod, "_BACKOFF_START_S", 0.01)
+    monkeypatch.setattr(clientmod, "_BACKOFF_MAX_S", 0.01)
+
+    rig = _Rig(1, tmp_path)
+    connector = _connector(tmp_path, rig)
+
+    attempts = []
+
+    async def _revoked():
+        attempts.append(1)
+        raise clientmod._Revoked("server rejected WebSocket connection: HTTP 403")
+
+    monkeypatch.setattr(connector, "_session", _revoked)
+
+    thread = threading.Thread(
+        target=lambda: _run(connector.run_forever()), daemon=True
+    )
+    thread.start()
+    deadline = time.monotonic() + 10
+    while time.monotonic() < deadline and not attempts:
+        time.sleep(0.01)
+    assert attempts, "the first attempt never happened"
+
+    # It went idle waiting to be re-paired, it did not retry.
+    time.sleep(0.3)
+    assert attempts == [1], f"a revoked token was retried: {attempts}"
+    assert connector.status.connected is False
+    # "Stopped" to the tray, not "offline and still trying" - and the reason
+    # the rider can act on is left where the tray will read it.
+    assert connector.status.stopped is True
+    assert "revoked" in connector.status.stopped_reason.lower()
+    assert "Pair..." in connector.status.stopped_reason
+
+    # A quit is the other way out of the idle wait, and it must actually end.
+    connector._loop.call_soon_threadsafe(connector.stop)
+    thread.join(timeout=10)
+    assert not thread.is_alive(), "the loop did not exit after the stop"
+    assert connector.status.stopped is True
+
+
+def test_repair_after_revocation_reconnects_with_the_new_token(tmp_path, monkeypatch):
+    """Re-pairing is what un-sticks a revoked device, so the two must compose.
+
+    The 403 path goes idle rather than ending the loop on purpose: reconnect()
+    posts into the loop that is running run_forever, and a loop that has
+    returned cannot be woken - its _loop is None and the repair is a no-op. So
+    a revoked connector has to be sitting in the run loop when the tray's
+    Pair... item saves a fresh token, or the repair never reaches a handshake.
+    """
+    from wattracker_connector import client as clientmod
+
+    monkeypatch.setattr(clientmod, "_BACKOFF_START_S", 0.01)
+    monkeypatch.setattr(clientmod, "_BACKOFF_MAX_S", 0.01)
+
+    rig = _Rig(1, tmp_path)
+    connector = _connector(tmp_path, rig)
+
+    attempts = []
+
+    async def _session():
+        attempts.append(connector.token)
+        if len(attempts) == 1:
+            raise clientmod._Revoked(
+                "server rejected WebSocket connection: HTTP 403"
+            )
+        # A fresh token proves itself: stay connected until we are told to stop.
+        await connector._stop.wait()
+
+    monkeypatch.setattr(connector, "_session", _session)
+
+    thread = threading.Thread(
+        target=lambda: _run(connector.run_forever()), daemon=True
+    )
+    thread.start()
+    deadline = time.monotonic() + 10
+    while time.monotonic() < deadline and not attempts:
+        time.sleep(0.01)
+    assert attempts == ["t"], "the first (revoked) attempt never happened"
+
+    # Gone idle on the revoked token, not retrying it.
+    time.sleep(0.3)
+    assert attempts == ["t"], "a revoked token was retried instead of going idle"
+
+    # The rider re-pairs: the token on the object is new, and the loop dials
+    # with it - no process restart, no backoff to wait out.
+    connector.token = "new-token"
+    connector.reconnect()
+
+    deadline = time.monotonic() + 10
+    while time.monotonic() < deadline and len(attempts) < 2:
+        time.sleep(0.01)
+    connector._loop.call_soon_threadsafe(connector.stop)
+    thread.join(timeout=10)
+    assert not thread.is_alive(), "the loop did not exit after the stop"
+    assert attempts == ["t", "new-token"], (
+        f"the repair after revocation did not redial with the new token: "
+        f"{attempts}"
+    )
+    assert connector.status.stopped is True
+
+
+def test_a_403_at_the_handshake_is_a_revocation_not_a_blip(tmp_path, monkeypatch):
+    """The wire to _Revoked, pinned to the one answer it is.
+
+    The server refuses a revoked token before accept(); uvicorn turns that into
+    an HTTP 403 on the raw socket, and websockets surfaces it as
+    InvalidStatus - "server rejected WebSocket connection: HTTP 403", the line
+    from the issue. A 403 is the refused-credential answer and becomes the
+    terminal _Revoked; any other status is a transport failure left for the
+    ordinary retry path.
+    """
+    import websockets
+
+    from websockets.exceptions import InvalidStatus
+    from wattracker_connector import client as clientmod
+
+    rig = _Rig(1, tmp_path)
+    connector = _connector(tmp_path, rig)
+
+    def _refuse(status_code):
+        from types import SimpleNamespace
+
+        # websockets.connect is used as ``async with ... as connection``, so
+        # the fake has to hand back an async context manager, not a coroutine;
+        # the refusal lands in __aenter__, the way a real handshake fails.
+        class _Rejecting:
+            async def __aenter__(self):
+                # All InvalidStatus.__str__ and the client read is status_code.
+                raise InvalidStatus(SimpleNamespace(status_code=status_code))
+
+            async def __aexit__(self, *_exc):
+                return False
+
+        def _connect(*_args, **_kwargs):
+            return _Rejecting()
+
+        monkeypatch.setattr(websockets, "connect", _connect)
+
+    _refuse(403)
+    with pytest.raises(clientmod._Revoked):
+        _run(connector._session())
+
+    _refuse(500)
+    with pytest.raises(InvalidStatus):
+        _run(connector._session())
+
+
+def test_repair_drops_the_serving_session_and_dials_with_the_new_token(
+    tmp_path, monkeypatch
+):
+    """A saved re-pair must not keep serving on the token it replaced.
+
+    The socket stays open - a server that revoked the token has already closed
+    this one, but the code cannot assume which it is - and the old credential
+    keeps working on a session that was already accepted. The only way the new
+    token is used at all is a fresh handshake, so the session that is serving
+    has to go when the pairing changes, without waiting for the link to drop.
+    """
+    from websockets.exceptions import ConnectionClosedOK
+
+    rig = _Rig(1, tmp_path)
+    connector = _connector(tmp_path, rig)
+
+    sessions = []
+
+    class _Socket:
+        def __init__(self, connector) -> None:
+            self._connector = connector
+
+        async def send_text(self, _text):
+            pass
+
+        async def receive_text(self):
+            # No frame is coming. When the test stops the connector, close the
+            # way a real socket would, so _serve has its ordinary exit.
+            await self._connector._stop.wait()
+            raise ConnectionClosedOK(None, None)
+
+    class _Peer:
+        def resolve(self, _message):
+            return False
+
+        async def serve(self, *args, **kwargs):
+            pass
+
+    async def _serving_session():
+        sessions.append(connector.token)
+        peer = _Peer()
+        connector._peer = peer
+        await connector._serve(_Socket(connector), peer)
+
+    monkeypatch.setattr(connector, "_session", _serving_session)
+
+    thread = threading.Thread(
+        target=lambda: _run(connector.run_forever()), daemon=True
+    )
+    thread.start()
+    deadline = time.monotonic() + 10
+    while time.monotonic() < deadline and len(sessions) != 1:
+        time.sleep(0.01)
+    assert sessions == ["t"], "the first session never started serving"
+
+    connector.token = "new-token"
+    connector.reconnect()
+
+    deadline = time.monotonic() + 10
+    while time.monotonic() < deadline and len(sessions) != 2:
+        time.sleep(0.01)
+    # stop() is a loop-thread call (the _ConnectorThread is what the tray
+    # uses), so the request is posted the same way reconnect() posts its own.
+    connector._loop.call_soon_threadsafe(connector.stop)
+    thread.join(timeout=10)
+    assert not thread.is_alive(), "the loop did not exit after the stop"
+    assert sessions == ["t", "new-token"], (
+        f"the second session did not go out with the new token: {sessions}"
+    )
+    assert connector.status.stopped is True
+
+
+def test_repair_while_offline_wakes_the_backoff_instead_of_earning_it(
+    tmp_path, monkeypatch
+):
+    """A saved re-pair is not an outage, and must not wait out one.
+
+    The backoff is sized for a server that is rebooting or switched off - a
+    ceiling of minutes, where a rider who just pasted a fresh token wants the
+    answer now.
+    """
+    from wattracker_connector import client as clientmod
+
+    monkeypatch.setattr(clientmod, "_BACKOFF_START_S", 1000.0)
+    monkeypatch.setattr(clientmod, "_BACKOFF_MAX_S", 1000.0)
+
+    rig = _Rig(1, tmp_path)
+    connector = _connector(tmp_path, rig)
+
+    attempts = []
+
+    async def _always_down():
+        attempts.append(time.monotonic())
+        raise ConnectionRefusedError("server down")
+
+    monkeypatch.setattr(connector, "_session", _always_down)
+
+    thread = threading.Thread(
+        target=lambda: _run(connector.run_forever()), daemon=True
+    )
+    thread.start()
+    deadline = time.monotonic() + 10
+    while time.monotonic() < deadline and not attempts:
+        time.sleep(0.01)
+    assert attempts, "the first attempt never happened"
+
+    connector.reconnect()
+
+    deadline = time.monotonic() + 10
+    while time.monotonic() < deadline and len(attempts) < 2:
+        time.sleep(0.01)
+    connector._loop.call_soon_threadsafe(connector.stop)
+    thread.join(timeout=10)
+    assert len(attempts) == 2, "the repair never produced a retry"
+    assert attempts[1] - attempts[0] < 2.0, (
+        f"the retry waited out the backoff instead of landing on the repair: "
+        f"{attempts[1] - attempts[0]:.1f}s"
+    )
+    assert connector.status.stopped is True
+
+
+def test_a_revocation_mid_ride_gives_the_trainer_back(tmp_path, monkeypatch):
+    """The terminal state has to release the radio, like every other one.
+
+    A dropped socket deliberately keeps the trainer, the sampler and the
+    buffer: a server is expected back within the backoff, and a wifi stutter
+    must not end a workout. A refusal is the opposite - it is that server
+    saying it is not coming - and the safety net that would normally catch
+    this, _abandon_unclaimed_ride, only ever arms *inside* a session. There is
+    no next session until someone re-pairs, which may be hours away.
+
+    Without this the rider is left pushing against an ERG target no server is
+    managing, while the tray reports that the connector has stopped.
+    """
+    from wattracker_connector import client as clientmod
+
+    rig = _Rig(1, tmp_path)
+    connector = _connector(tmp_path, rig)
+
+    # A ride in progress, with the trainer held in ERG.
+    trainer = _Trainer()
+    trainer.erg_enabled = True
+    rig.state.conn = {"trainer": trainer, "clients": [_FakeClient(rig.devices)]}
+    rig.state.ride = {"started_at": "2026-08-01T10:00:00", "name": "VO2"}
+    rig.state.buffer.start("2026-08-01T10:00:00", "VO2", 250.0, None)
+    assert rig.state.riding
+
+    async def _revoked():
+        raise clientmod._Revoked("server rejected WebSocket connection: HTTP 403")
+
+    monkeypatch.setattr(connector, "_session", _revoked)
+
+    thread = threading.Thread(
+        target=lambda: _run(connector.run_forever()), daemon=True
+    )
+    thread.start()
+    deadline = time.monotonic() + 10
+    while time.monotonic() < deadline and not connector.status.stopped:
+        time.sleep(0.01)
+    assert connector.status.stopped, "never reached the terminal state"
+
+    # The radio goes back on the way into the idle wait, not on the way out of
+    # the process: a rider is not going to quit a connector they believe has
+    # already stopped.
+    deadline = time.monotonic() + 10
+    while time.monotonic() < deadline and rig.state.conn is not None:
+        time.sleep(0.01)
+    assert rig.state.conn is None, "the trainer was still held after a revocation"
+    assert rig.state.riding is False
+    assert trainer.erg_enabled is False
+    assert ("disable", None) in trainer.calls, (
+        f"the trainer was never released: {trainer.calls}"
+    )
+
+    # And it is still the recoverable terminal state rather than a quit: the
+    # loop is sitting in the idle wait, where a re-pair can still reach it.
+    assert connector._loop is not None
+    connector._loop.call_soon_threadsafe(connector.stop)
+    thread.join(timeout=10)
+    assert not thread.is_alive(), "the loop did not exit after the stop"
+
+
+def test_a_repair_is_not_charged_an_outages_backoff(tmp_path, monkeypatch):
+    """Re-pairing must not make the *next* real outage wait longer.
+
+    The wait wakes on a repair either way, so a prompt retry does not prove
+    this on its own. What does is the delay the retry *after* it is sized
+    against: a rider who re-pairs three times while a server happens to be
+    down must not have talked the connector into a three-times-longer wait,
+    and the log must not announce a delay that is never served.
+    """
+    from wattracker_connector import client as clientmod
+
+    # Long enough that nothing here times out naturally - every wait this test
+    # sees ends because of a repair - and a factor big enough that a single
+    # wrongly-charged repair is unmistakable.
+    monkeypatch.setattr(clientmod, "_BACKOFF_START_S", 30.0)
+    monkeypatch.setattr(clientmod, "_BACKOFF_MAX_S", 10000.0)
+    monkeypatch.setattr(clientmod, "_BACKOFF_FACTOR", 10.0)
+    # No jitter, so a recorded delay is the backoff itself and the assertion
+    # is about escalation rather than about a random draw.
+    monkeypatch.setattr(clientmod.random, "random", lambda: 0.5)
+
+    rig = _Rig(1, tmp_path)
+    connector = _connector(tmp_path, rig)
+
+    delays = []
+    real_wait = connector._wait_for_repair_or_stop
+
+    async def _record(timeout=None):
+        delays.append(timeout)
+        # The return value is the whole point - it is what tells the loop the
+        # wait was cut short - so the double has to pass it back.
+        return await real_wait(timeout=timeout)
+
+    monkeypatch.setattr(connector, "_wait_for_repair_or_stop", _record)
+
+    attempts = []
+
+    async def _always_down():
+        attempts.append(1)
+        raise ConnectionRefusedError("server down")
+
+    monkeypatch.setattr(connector, "_session", _always_down)
+
+    thread = threading.Thread(
+        target=lambda: _run(connector.run_forever()), daemon=True
+    )
+    thread.start()
+
+    # Three re-pairs in a row, each answered by a redial.
+    for expected in (2, 3, 4):
+        deadline = time.monotonic() + 10
+        while time.monotonic() < deadline and len(attempts) < expected - 1:
+            time.sleep(0.01)
+        connector.reconnect()
+        deadline = time.monotonic() + 10
+        while time.monotonic() < deadline and len(attempts) < expected:
+            time.sleep(0.01)
+    assert len(attempts) >= 4, f"the repairs did not all redial: {attempts}"
+
+    connector._loop.call_soon_threadsafe(connector.stop)
+    thread.join(timeout=10)
+    assert not thread.is_alive(), "the loop did not exit after the stop"
+
+    # Every wait entered was still the first backoff step. Charged as outages
+    # the three repairs would have taken this to 300s, then 3000s.
+    assert all(d == 30.0 for d in delays), (
+        f"a re-pair escalated the backoff: {delays}"
+    )
+
+
+def test_a_repair_does_not_announce_a_delay_it_will_not_serve(
+    tmp_path, monkeypatch, caplog
+):
+    """The log is the only account of itself the connector keeps.
+
+    A re-pair that lands while the session is still up ends that session and
+    dials again immediately. Falling through to the backoff would print
+    "reconnecting in 47.3s" and then reconnect at once - which is not what
+    happened, and this log is what anyone diagnosing a connector reads first.
+    """
+    from websockets.exceptions import ConnectionClosedOK
+
+    from wattracker_connector import client as clientmod
+
+    # Large, so a delay that did get announced is unmistakable in the log.
+    monkeypatch.setattr(clientmod, "_BACKOFF_START_S", 900.0)
+    monkeypatch.setattr(clientmod, "_BACKOFF_MAX_S", 900.0)
+
+    rig = _Rig(1, tmp_path)
+    connector = _connector(tmp_path, rig)
+
+    sessions = []
+
+    class _Socket:
+        def __init__(self, connector) -> None:
+            self._connector = connector
+
+        async def send_text(self, _text):
+            pass
+
+        async def receive_text(self):
+            await self._connector._stop.wait()
+            raise ConnectionClosedOK(None, None)
+
+    class _Peer:
+        def resolve(self, _message):
+            return False
+
+        async def serve(self, *args, **kwargs):
+            pass
+
+    async def _serving_session():
+        sessions.append(connector.token)
+        peer = _Peer()
+        connector._peer = peer
+        await connector._serve(_Socket(connector), peer)
+
+    monkeypatch.setattr(connector, "_session", _serving_session)
+
+    with caplog.at_level("INFO", logger=clientmod.log.name):
+        thread = threading.Thread(
+            target=lambda: _run(connector.run_forever()), daemon=True
+        )
+        thread.start()
+        deadline = time.monotonic() + 10
+        while time.monotonic() < deadline and len(sessions) != 1:
+            time.sleep(0.01)
+        assert sessions == ["t"], "the first session never started serving"
+
+        connector.token = "new-token"
+        connector.reconnect()
+
+        deadline = time.monotonic() + 10
+        while time.monotonic() < deadline and len(sessions) != 2:
+            time.sleep(0.01)
+        connector._loop.call_soon_threadsafe(connector.stop)
+        thread.join(timeout=10)
+
+    assert sessions == ["t", "new-token"], f"the repair did not redial: {sessions}"
+    announced = [r.getMessage() for r in caplog.records
+                 if "reconnecting in" in r.getMessage()]
+    assert not announced, (
+        f"a repair announced a backoff delay it then did not serve: {announced}"
+    )
 
 
 def test_an_unattended_ride_ends_itself_once_the_rider_stops(

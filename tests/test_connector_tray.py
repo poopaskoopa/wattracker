@@ -96,7 +96,8 @@ def tray():
     if not WINDOWS:
         pytest.skip("Win32 lives on Windows")
     return tray_win32.TrayIcon(
-        status=_status(connected=True), on_open=lambda: None, on_quit=lambda: None
+        status=_status(connected=True), on_open=lambda: None, on_quit=lambda: None,
+        on_pair=lambda: None,
     )
 
 
@@ -111,7 +112,8 @@ def test_it_imports_off_windows_and_refuses_only_on_construction():
 def test_constructing_off_windows_says_what_to_do_instead():
     with pytest.raises(tray_win32.TrayUnavailable) as excinfo:
         tray_win32.TrayIcon(status=_status(), on_open=lambda: None,
-                            on_quit=lambda: None)
+                            on_quit=lambda: None,
+                            on_pair=lambda: None)
     assert "headless" in str(excinfo.value)
 
 
@@ -422,11 +424,18 @@ def test_the_menu_offers_what_the_rider_came_for(tray):
     assert "&Open wattracker" in labels
     assert "Open &log" in labels
     assert "Open &config folder" in labels
+    assert "&Pair..." in labels
     assert "&Quit" in labels
     # The status line is shown, not offered: clicking it must do nothing.
     assert dict((text, greyed) for text, _c, greyed in items)[
         "Connected to http://192.168.1.10:8000"
     ]
+    # Pair sits right after the config folder, and is offered, not greyed: a
+    # revoked device is reachable from the tray in every state, and the tray
+    # is the only route back to the pairing window once a token exists.
+    pair_state = dict((text, greyed) for text, _c, greyed in items)["&Pair..."]
+    assert pair_state is False
+    assert labels.index("&Pair...") == labels.index("Open &config folder") + 1
 
 
 @windows_only
@@ -443,6 +452,19 @@ def test_the_menu_says_why_autostart_is_not_on_offer(tray):
     assert startup, [text for text, _c, _g in items]
     label, _checked, greyed = startup[0]
     assert greyed and "packaged" in label
+
+
+@windows_only
+def test_pairing_from_the_menu_reaches_the_pair_callback(tray):
+    """The menu click must survive on a worker, like open and quit do.
+
+    The callback pumps the pairing window's own message loop until the rider
+    closes it, which is exactly why it may not run on the tray's pump.
+    """
+    paired = threading.Event()
+    tray._on_pair = paired.set
+    tray._invoke(tray_win32._ID_PAIR)
+    assert paired.wait(10), "the Pair item never reached its callback"
 
 
 @windows_only
@@ -473,7 +495,8 @@ def test_the_icon_actually_goes_into_the_notification_area():
     window - which is also what makes the icon survive explorer restarting.
     """
     tray = tray_win32.TrayIcon(
-        status=_status(connected=True), on_open=lambda: None, on_quit=lambda: None
+        status=_status(connected=True), on_open=lambda: None, on_quit=lambda: None,
+        on_pair=lambda: None,
     )
     thread = threading.Thread(target=tray.run, name="tray-test", daemon=True)
     thread.start()
@@ -504,7 +527,8 @@ def test_the_icon_comes_back_when_explorer_restarts():
     rather than message-only.
     """
     tray = tray_win32.TrayIcon(
-        status=_status(connected=True), on_open=lambda: None, on_quit=lambda: None
+        status=_status(connected=True), on_open=lambda: None, on_quit=lambda: None,
+        on_pair=lambda: None,
     )
     thread = threading.Thread(target=tray.run, name="tray-test", daemon=True)
     thread.start()
@@ -536,7 +560,8 @@ def test_the_icon_comes_back_when_explorer_restarts():
 def test_a_second_launch_is_told_where_the_first_one_is():
     """The single-instance path, end to end: find the window, post the message."""
     tray = tray_win32.TrayIcon(
-        status=_status(connected=True), on_open=lambda: None, on_quit=lambda: None
+        status=_status(connected=True), on_open=lambda: None, on_quit=lambda: None,
+        on_pair=lambda: None,
     )
     thread = threading.Thread(target=tray.run, name="tray-test", daemon=True)
     thread.start()
