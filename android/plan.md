@@ -4,15 +4,13 @@ Epic #192 and sub-issues #193–#199, plus the owner's
 extra targets: Android 11+, dual-server support (cloud **and** local), offline
 cache. Kotlin + Jetpack Compose, single app under `android/`.
 
-**Resume point — Step 1 is done in code, blocked on the emulator toolchain**
-(see "Step 1 status — where to pick up", 2026-09-08). All Step-1 code is
-written on branch `feature/android-client` and **uncommitted**;
-`:app:assembleDebug` and `:app:assembleRelease` both build green (minSdk 30 /
-targetSdk 36). What remains is environmental, not architectural: create the
-two AVDs (old `avdmanager` NPEs; emulator 37.1.11 rejects hand-written AVD
-configs; new `avdmanager` can't locate the SDK dir), then boot/verify both
-idioms, fill the README measurement table, and do the git work (identity fix,
-announce, commit, PR).
+**Resume point — Step 1 is done and in review (PR #257, draft).**
+Branch `feature/android-client` has three commits (scaffold + shell + nav
+fix), all noreply identity, rebased onto current `origin/main`. Verified on
+both AVDs (`medium_phone` API 36, `medium_tablet` API 35): rail in landscape,
+bottom bar in portrait, drawer on tablet. README measurement table filled.
+Pre-push hook installed. **Next: Step 2 — Cloud API client + local client
+(issue #194 + local backend).** See "Step 1 — completion notes" below.
 
 **Revised 2026-09-06.** Re-verified against `main` at `8c75eba`. What changed
 since the 2026-09-01 draft:
@@ -481,12 +479,53 @@ install**; consequently there is no `.kilo/kilo.json` MCP block either
 
 ---
 
-## Step 1 status — where to pick up (2026-09-08, session 2)
+## Step 1 — completion notes (2026-09-11, session 3)
 
-Branch `feature/android-client`: the scaffold commit `91a720d` plus an
-**uncommitted working tree that is the entire Step-1 deliverable** (see the
-warning at the end of this section). Nothing below is committed yet;
-`plan.md` itself is modified too.
+**Status: DONE, in review.** PR #257 (draft, `feature/android-client` →
+`main`) has three commits, all noreply identity (`wattrackerboss@users.
+noreply.github.com`), rebased onto current `origin/main` (`14e4c4a`):
+`02b59db` scaffold, `ac15376` shell, `52fb520` nav fix. The pre-push hook is
+installed in this clone. The owner will merge when satisfied.
+
+**Verified on device (both AVDs booted, app installed + exercised):**
+
+- Phone (`medium_phone`, emulator-5554, API 36): **leading rail** in
+  landscape (5 destinations), **bottom `NavigationBar`** in portrait
+  (5 destinations, conventional thumb layout). The portrait bottom bar was
+  added in session 3 — the plan's "leading rail" was only the right call for
+  the wide-short landscape viewport.
+- Tablet (`medium_tablet`, emulator-5556, API 35, Pixel_Tablet): **permanent
+  drawer**, correct in both portrait and landscape.
+- `smallestScreenWidthDp` measured from `dumpsys` (not assumed): phone 411dp
+  (landscape); tablet **800dp in both orientations** → the `>= 600` predicate
+  is rotation-stable (no rail/drawer flip). README table filled.
+- Nav highlight unified: the rail, bottom bar and drawer rows all paint the
+  same `Palette.accent`/`Palette.muted` scheme explicitly (session-3 fix — the
+  rail had been falling back to M3 theme defaults, a different highlight).
+- Dev loop end to end: `:app:assembleDebug` green, `adb install`/`am start`,
+  screenshot, `logcat` (app pid clean, no `FATAL`).
+
+**Deviations from the plan (flagged in the PR):**
+
+1. **AVDs are the new `android` CLI's size profiles** (`medium_phone`,
+   `medium_tablet`), not `pixel_9`/`pixel_tablet` — the old `avdmanager` NPEs
+   on this SDK and the new CLI exposes profiles, not device models. The tablet
+   lands a Pixel_Tablet model anyway.
+2. **The tablet x86_64 image is API 35, not 36** — only
+   `google_playstore_tablet/x86_64-35` is available. `minSdk` 30, so it runs;
+   the phone stays on API 36.
+3. **`material-icons-extended`** is one dep beyond the plan's list — AndroidX,
+   the Android twin of the iOS shell's "SF Symbols ship with the system" rule.
+
+**Screenshot note:** on this host, every on-disk capture path (`adb exec-out
+screencap`, `adb screencap`+`pull`, `android screen capture`) returns a stale
+lock frame even with `isKeyguardShowing=false` and the lock screen disabled — an
+AEHD/Hyper-V surface-capture quirk, not an app problem. The IDE's capture of
+the emulator window is the reliable path (and what the PR images come from).
+Documented in `android/README.md`. The `dumpsys` measurements are unaffected.
+
+**The rest of this section is retained for the next steps** — the BOM API
+pitfalls (do not re-derive) and the toolchain state on this machine.
 
 **Done in code (both variants build green):**
 
@@ -545,26 +584,32 @@ not re-derive:**
   makes the real artifact `material-icons-extended-android` (same for
   `material3-android`, `ui-android`, `foundation-android`).
 
-**Remaining, in order:**
+**What comes next — Step 2 (issue #194 + local backend):**
 
-1. **Toolchain: create the two AVDs** (the blocker — state and next moves
-   below).
-2. Boot `wt-phone` (landscape) and `wt-tablet` (portrait **and** landscape);
-   verify rail with five navigable destinations / drawer correct in both.
-3. Measure `config.orientation` + `smallestScreenWidthDp` on the tablet in
-   both orientations; fill the README table (a Step-1 Done criterion).
-4. Screenshots of each idiom incl. tablet portrait, for the PR.
-5. Verify the 0.4 dev loop end to end (Agent mode + terminal
-   `gradlew`/`adb` equivalents).
-6. Git: **fix the local identity first** — it is `code@taksmon.com`
-   (personal; AGENTS.md mandates the noreply address, and the scaffold
-   commit's committer line already carries the personal address while its
-   author line is noreply). Then ANNOUNCE starting #193 (the Android epic is
-   not on the AGENTS.md queue — see "Issue state"), commit the Step-1 work
-   (`android/app/src/debug/` is new and untracked — add it), open the PR
-   with screenshots + the icons-extended deviation note.
+1. **Keying (2.1):** P-256 keypair in the Android Keystore, StrongBox-backed
+   with plain-Keystore fallback; assert non-exportability in a unit test;
+   state which key was obtained in Settings. Mirror `DeviceKey.swift`.
+2. **Canonical request + signing (2.2):** `CanonicalRequest.kt` framing
+   byte-for-byte; DER→raw `r‖s` conversion (no low-s normalization); JVM unit
+   tests against `tests/vectors/canonical_request_v1.json` and
+   `tests/vectors/cloud_objects_v1.json`.
+3. **Cloud session (2.3):** port the iOS refresh state machine
+   (`CloudSession.swift` — single-flight, two-strike removal, clock-skew
+   exclusion, backoff bounds, `DeviceState`/`Failure` taxonomy) keeping the
+   constants in sync with the Swift names. Live signed refresh against the dev
+   harness is the integration proof (depends on PR #240's harness, lands with
+   #234).
+4. **Local client + `ReadModel`:** connector-model token → local JSON API;
+   one `ReadModel` interface, one adapter per backend, so the screens in
+   Steps 4–6 read through it.
+5. **Room cache (2.x):** revision-keyed cloud cache + last-payload local
+   cache (~10 small tables, KSP codegen).
 
-**Toolchain state on this machine (all discovered this session):**
+Nothing in Step 2 touches the shell or the theme — `RootScreen.kt`, the
+`Destination` enum and `Palette.kt` are stable unless a new destination or
+colour is introduced by pairing (#195).
+
+**Toolchain state on this machine (all discovered sessions 2–3):**
 
 - No JDK on `PATH`; the only one is Android Studio's JBR:
   `C:\Program Files\Android\Android Studio\jbr`. Every `sdkmanager` /
@@ -607,13 +652,17 @@ not re-derive:**
   ("returns when the emulator is fully started and ready to use") / `list` /
   `stop` / `remove`, plus `android screenshot` and `android layout` (JSON UI
   tree — the faster way to verify the rail/drawer than eyeballing a PNG).
-  **Paused here at the owner's request: the owner flagged a problem with the
-  android-cli skill and is debugging it.** Next move on resume: re-verify the
-  skill against `android help emulator create`, then create both AVDs with it
-  (device profiles: `pixel_tablet` for the tablet; `pixel_9` was absent from
-  the *old* tools' `list device` — re-check with the new tools before
-  falling back to `pixel_7`, and note whichever deviation), then
-  `android emulator start` and the verification pass above.
+  **Resolved (session 3):** the CLI worked as documented. `android emulator
+  create` is profile-based, not device-model-based — there is **no**
+  `pixel_9`/`pixel_tablet`; the profiles are `small_phone`, `medium_phone`,
+  `medium_tablet`, `small_desktop`, `medium_desktop`, `large_desktop` (see
+  `android emulator create --list-profiles`). `medium_phone` +
+  `medium_tablet` were created and booted: the CLI auto-downloads the image
+  and `start` blocks until the device is ready. `medium_tablet` lands a
+  Pixel_Tablet model but only has an **API 35** x86_64 image (see the
+  deviation notes above). The orphaned `wt-phone.avd`/`wt-tablet.avd` dirs
+  from the old `avdmanager` attempts can be deleted from `~/.android/avd`
+  (harmless either way).
 - Web tooling this session: the SearXNG MCP server is broken (its
   `pageno`/`time_range` params get mangled: "Expected Number, but 0 is
   String" / "Value 'null' is not a valid enum value"), and the built-in web
@@ -623,10 +672,11 @@ not re-derive:**
   AARs, javap'd jars) live in this conversation's artifacts `scratch/`
   directory — ephemeral, re-download if gone (URLs above).
 
-> [!WARNING]
-> The uncommitted working tree **is** the Step-1 deliverable. Do not run
-> `git checkout .` / `git reset --hard` in `wattracker/` while debugging the
-> toolchain.
+> [!NOTE]
+> Step 1 is committed and pushed (PR #257). The branch is
+> `feature/android-client`; the working tree is clean. `plan.md` and
+> `android/README.md` are committed on that branch — update them there, not
+> on a detached checkout.
 
 ---
 
@@ -659,16 +709,32 @@ not re-derive:**
   `Config/Base.xcconfig`.
 - **Shell (five destinations: Dashboard, Activities, Calendar, Volume,
   Settings):**
-  - Phone (narrow, including landscape phones that report regular width):
-    **leading `NavigationRail`**, not a bottom bar — the arithmetic from #193:
-    a ~900×400dp landscape phone loses a fifth of its scarce height to a bottom
-    bar vs ~8% of width to a rail.
-  - Large screen (tablet, `smallestScreenWidthDp ≥ 600`): permanent
-    `ModalNavigationDrawer` **or** list-detail scaffold — the
-    `NavigationSplitView` analogue; pick one and justify in code comment.
+  - Phone, **landscape** (narrow, including landscape phones that report
+    regular width): **leading `NavigationRail`**, not a bottom bar — the
+    arithmetic from #193: a ~900×400dp landscape phone loses a fifth of its
+    scarce height to a bottom bar vs ~8% of width to a rail.
+  - Phone, **portrait** (added in implementation, session 3; the iOS app is
+    landscape-only so the plan's "leading rail" only covered landscape):
+    conventional **bottom `NavigationBar`** — the rail's wide-short-viewport
+    case does not apply in portrait, so chrome goes on the bottom edge under
+    the thumb. The shell branches on `Configuration.ORIENTATION_PORTRAIT`.
+  - Large screen (tablet, `smallestScreenWidthDp ≥ 600`): **permanent
+    drawer** (`PermanentNavigationDrawer`, the list-detail /
+    `NavigationSplitView` analogue) — chosen over a collapsible rail because
+    at the tablet's widths the list should always stay visible. (M3 1.4:
+    `PermanentNavigationDrawer` has no `gesturesEnabled` and
+    `PermanentDrawerSheet` has no `containerColor` — paint the surface on the
+    sheet's content.)
   - Idiom predicate = size class **and** idiom (same lesson as iOS `RootView`:
-    a Max-sized iPhone in landscape reports regular width).
+    a Max-sized iPhone in landscape reports regular width). In practice the two
+    collapse to `smallestScreenWidthDp >= 600` on Android (see `RootScreen.kt`
+    KDoc): the window-size-class composables were removed in Foundation 1.10
+    and `smallestScreenWidthDp` is the stable value they approximated.
   - Every tablet layout correct **and** in portrait (the standing requirement).
+  - **The nav highlight is explicit and shared** across rail, bottom bar and
+    drawer rows (amber `Palette.accent` selected / `Palette.muted` otherwise,
+    16% accent indicator) — not the M3 theme defaults, so the phone and tablet
+    read as one product.
   - One shared container composable (`Panel` + screen scaffold) mirroring
     `Theme/Panel.swift`; palette in `Theme/Palette.kt` with CSS variable names.
 - **No network code in this step** — stub screens only (that is #194+).
