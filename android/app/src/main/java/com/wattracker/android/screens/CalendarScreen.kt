@@ -3,7 +3,7 @@ package com.wattracker.android.screens
 import androidx.compose.runtime.Composable
 import androidx.compose.ui.res.stringResource
 import com.wattracker.android.R
-import com.wattracker.android.shell.ScreenScaffold
+import com.wattracker.android.shell.ScrollableScreenScaffold
 import com.wattracker.android.shell.StubPanel
 
 /**
@@ -13,7 +13,7 @@ import com.wattracker.android.shell.StubPanel
  */
 @Composable
 fun CalendarScreen() {
-    ScreenScaffold(
+    ScrollableScreenScaffold(
         title = stringResource(R.string.destination_calendar),
         subtitle = stringResource(R.string.screen_calendar_subtitle),
     ) {

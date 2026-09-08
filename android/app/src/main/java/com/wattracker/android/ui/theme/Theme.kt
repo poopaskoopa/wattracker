@@ -3,6 +3,7 @@ package com.wattracker.android.ui.theme
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.darkColorScheme
 import androidx.compose.runtime.Composable
+import androidx.compose.ui.graphics.Color
 
 /**
  * Dark-only, fixed palette.
@@ -25,15 +26,27 @@ private val wtDarkColorScheme = darkColorScheme(
     onPrimaryContainer = Palette.textBright,
     secondary = Palette.ok,
     onSecondary = Palette.onAccent,
+    tertiary = Palette.hr,
+    onTertiary = Palette.onAccent,
+    tertiaryContainer = Palette.hr.copy(alpha = 0.16f),
+    onTertiaryContainer = Palette.textBright,
     background = Palette.bg,
     onBackground = Palette.text,
     surface = Palette.bg,
     onSurface = Palette.text,
     surfaceVariant = Palette.surfaceInset,
     onSurfaceVariant = Palette.muted,
+    surfaceContainerLowest = Palette.bg,
+    surfaceContainerLow = Palette.panel,
+    surfaceContainer = Palette.panel,
+    surfaceContainerHigh = Palette.surface2,
+    surfaceContainerHighest = Palette.surface2,
     outline = Palette.surfaceBorder,
+    outlineVariant = Palette.surfaceBorder,
+    scrim = Color.Black.copy(alpha = 0.6f),
+    inverseSurface = Palette.text,
     error = Palette.alert,
-    onError = Palette.textBright,
+    onError = Palette.onAccent,
 )
 
 @Composable

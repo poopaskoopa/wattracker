@@ -2,14 +2,21 @@ package com.wattracker.android.shell
 
 import android.content.res.Configuration
 import androidx.compose.foundation.background
-import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
+import androidx.compose.foundation.layout.WindowInsets
+import androidx.compose.foundation.layout.WindowInsetsSides
+import androidx.compose.foundation.layout.consumeWindowInsets
 import androidx.compose.foundation.layout.fillMaxHeight
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.only
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.safeDrawing
 import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.layout.windowInsetsPadding
+import androidx.compose.foundation.selection.selectable
+import androidx.compose.ui.semantics.Role
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material3.Icon
 import androidx.compose.material3.MaterialTheme
@@ -45,6 +52,21 @@ import com.wattracker.android.screens.DashboardScreen
 import com.wattracker.android.screens.SettingsScreen
 import com.wattracker.android.screens.VolumeScreen
 import com.wattracker.android.ui.theme.Palette
+
+/**
+ * The highlight shared by every destination item in every shell -- the rail,
+ * the bottom bar and the drawer rows. Selection is amber [Palette.accent], the
+ * rest [Palette.muted], and the selected indicator is a 16% accent wash.
+ *
+ * This is written explicitly rather than left to the Material defaults, and it
+ * is the *same* Palette the tablet drawer already paints, so the phone and the
+ * tablet read as one product: the highlight is identical on both idioms. It is
+ * deliberately not the M3 primary/primaryContainer scheme, whose white selected
+ * icon and tinted pill would not match the drawer's amber.
+ */
+private val navSelectedColor = Palette.accent
+private val navUnselectedColor = Palette.muted
+private val navIndicatorColor = Palette.accent.copy(alpha = 0.16f)
 
 /**
  * The app shell: one navigation model, two presentations.
@@ -105,11 +127,18 @@ fun RootScreen() {
  * smallest the *device's* short edge ever gets, so it is simultaneously the
  * idiom test (a phone, even a large one in landscape, cannot reach 600dp on
  * its short edge -- the iOS trap cannot occur here) and the size-class test
- * (the platform's tablet threshold). Note the window-size-class composables
- * were removed from Compose Foundation 1.10; `smallestScreenWidthDp` is the
- * stable configuration value they used to approximate, so this also survives
- * a narrow freeform window on a tablet -- the drawer stays, which is the
- * correct list-detail behaviour at any width the drawer was designed for.
+ * (the platform's tablet threshold). The Material3
+ * `currentWindowAdaptiveInfo()` API in `androidx.compose.material3.adaptive`
+ * is the current recommended alternative, but reading `smallestScreenWidthDp`
+ * directly is a deliberate no-extra-dependency choice that also matches the
+ * platform's resource-qualifier semantics.
+ *
+ * Note: on API 24+, `smallestScreenWidthDp` is derived from the *app window*,
+ * not the physical device. A narrow split-screen or freeform window on a
+ * tablet therefore reports below 600dp and the app flips to the phone shell
+ * (rail or bottom bar from orientation). This is acceptable: at that width a
+ * list-detail drawer is the wrong layout anyway. The AVD measurements in
+ * README.md cover fullscreen only and cannot speak to this case.
  */
 @Composable
 private fun usesLargeScreenShell(): Boolean {
@@ -139,7 +168,7 @@ private fun PhoneLandscapeShell(navController: NavHostController, selected: Dest
                     icon = {
                         Icon(
                             imageVector = destination.icon,
-                            contentDescription = stringResource(destination.titleRes),
+                            contentDescription = null,
                         )
                     },
                     label = { Text(stringResource(destination.titleRes)) },
@@ -147,31 +176,27 @@ private fun PhoneLandscapeShell(navController: NavHostController, selected: Dest
                 )
             }
         }
-        AppNavHost(navController, modifier = Modifier.fillMaxSize())
+        AppNavHost(
+            navController,
+            modifier = Modifier
+                .fillMaxSize()
+                .consumeWindowInsets(WindowInsets.safeDrawing.only(WindowInsetsSides.Start))
+                .windowInsetsPadding(WindowInsets.safeDrawing),
+        )
     }
 }
 
 /**
- * The highlight shared by every destination item in every shell -- the rail,
- * the bottom bar and the drawer rows. Selection is amber [Palette.accent], the
- * rest [Palette.muted], and the selected indicator is a 16% accent wash.
- *
- * This is written explicitly rather than left to the Material defaults, and it
- * is the *same* Palette the tablet drawer already paints, so the phone and the
- * tablet read as one product: the highlight is identical on both idioms. It is
- * deliberately not the M3 primary/primaryContainer scheme, whose white selected
- * icon and tinted pill would not match the drawer's amber.
- *
  * Composable because [NavigationRailItemDefaults.colors] reads the theme for its
  * remaining defaults, so it cannot be hoisted to a top-level val.
  */
 @Composable
 private fun railItemColors() = NavigationRailItemDefaults.colors(
-    selectedIconColor = Palette.accent,
-    unselectedIconColor = Palette.muted,
-    selectedTextColor = Palette.accent,
-    unselectedTextColor = Palette.muted,
-    indicatorColor = Palette.accent.copy(alpha = 0.16f),
+    selectedIconColor = navSelectedColor,
+    unselectedIconColor = navUnselectedColor,
+    selectedTextColor = navSelectedColor,
+    unselectedTextColor = navUnselectedColor,
+    indicatorColor = navIndicatorColor,
 )
 
 @Composable
@@ -180,7 +205,13 @@ private fun PhonePortraitShell(navController: NavHostController, selected: Desti
     // edge, full width, under the thumb. The rail's case (a wide, short
     // landscape viewport) does not apply, so we do not reuse it here.
     Column(modifier = Modifier.fillMaxSize()) {
-        AppNavHost(navController, modifier = Modifier.weight(1f))
+        AppNavHost(
+            navController,
+            modifier = Modifier
+                .weight(1f)
+                .consumeWindowInsets(WindowInsets.safeDrawing.only(WindowInsetsSides.Bottom))
+                .windowInsetsPadding(WindowInsets.safeDrawing),
+        )
         NavigationBar(containerColor = Palette.panel) {
             Destination.entries.forEach { destination ->
                 NavigationBarItem(
@@ -189,7 +220,7 @@ private fun PhonePortraitShell(navController: NavHostController, selected: Desti
                     icon = {
                         Icon(
                             imageVector = destination.icon,
-                            contentDescription = stringResource(destination.titleRes),
+                            contentDescription = null,
                         )
                     },
                     label = { Text(stringResource(destination.titleRes)) },
@@ -201,16 +232,15 @@ private fun PhonePortraitShell(navController: NavHostController, selected: Desti
     }
 }
 
-/** Same [Palette] as [railItemColors] for the portrait bottom bar; a separate
- * function only because the M3 types differ between the rail and the bar. The
- * values must stay in sync with [railItemColors]. */
+/** Same colours as [railItemColors] for the portrait bottom bar; a separate
+ * function only because the M3 types differ between the rail and the bar. */
 @Composable
 private fun bottomBarItemColors() = NavigationBarItemDefaults.colors(
-    selectedIconColor = Palette.accent,
-    unselectedIconColor = Palette.muted,
-    selectedTextColor = Palette.accent,
-    unselectedTextColor = Palette.muted,
-    indicatorColor = Palette.accent.copy(alpha = 0.16f),
+    selectedIconColor = navSelectedColor,
+    unselectedIconColor = navUnselectedColor,
+    selectedTextColor = navSelectedColor,
+    unselectedTextColor = navUnselectedColor,
+    indicatorColor = navIndicatorColor,
 )
 
 @Composable
@@ -246,7 +276,15 @@ private fun TabletShell(navController: NavHostController, selected: Destination)
                 }
             }
         },
-        content = { AppNavHost(navController, modifier = Modifier.fillMaxSize()) },
+        content = {
+            AppNavHost(
+                navController,
+                modifier = Modifier
+                    .fillMaxSize()
+                    .consumeWindowInsets(WindowInsets.safeDrawing.only(WindowInsetsSides.Start))
+                    .windowInsetsPadding(WindowInsets.safeDrawing),
+            )
+        },
     )
 }
 
@@ -265,14 +303,14 @@ private fun DestinationRow(
             .fillMaxWidth()
             .padding(vertical = 2.dp)
             .clip(RoundedCornerShape(8.dp))
-            .background(if (selected) Palette.accent.copy(alpha = 0.16f) else Color.Transparent)
-            .clickable(onClick = onClick)
+            .background(if (selected) navIndicatorColor else Color.Transparent)
+            .selectable(selected = selected, role = Role.Tab, onClick = onClick)
             .padding(horizontal = 12.dp, vertical = 12.dp),
         verticalAlignment = Alignment.CenterVertically,
     ) {
         Icon(
             imageVector = destination.icon,
-            contentDescription = stringResource(destination.titleRes),
+            contentDescription = null,
             modifier = Modifier.size(24.dp),
             tint = if (selected) Palette.accent else Palette.muted,
         )
@@ -288,9 +326,9 @@ private fun DestinationRow(
 
 /**
  * Flat navigation: one destination per route, no stack. Switching
- * destinations pops back to the start route so the back button always exits
- * the app rather than walking a stack of screens that are siblings, not
- * levels.
+ * destinations pops to the start route (non-inclusive) so the back button
+ * returns to Dashboard rather than walking a stack of sibling screens.
+ * This is the conventional Android bottom-nav / rail pattern.
  */
 private fun navigateTo(navController: NavHostController, destination: Destination) {
     navController.navigate(destination.route) {

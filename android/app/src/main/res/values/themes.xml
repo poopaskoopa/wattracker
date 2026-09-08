@@ -9,5 +9,7 @@
         (ui/theme/Theme.kt); this platform theme only removes the action bar
         and keeps the pre-Compose window dark.
     -->
-    <style name="Theme.WatTracker" parent="android:Theme.Material.NoActionBar" />
+    <style name="Theme.WatTracker" parent="android:Theme.Material.NoActionBar">
+        <item name="android:windowBackground">@color/bg</item>
+    </style>
 </resources>

@@ -132,9 +132,10 @@ network exposure, on a machine that is otherwise loopback-only.
 
 Only AndroidX, Kotlin stdlib, and the two AndroidX extras the plan names:
 Room and Tink (`security-crypto`). The shell adds navigation-compose (AndroidX)
-and material-icons-extended (AndroidX) — the latter is the Android twin of the
-iOS shell's "SF Symbols ship with the system" rule: the rail and drawer render
-platform icon vectors rather than bundled image assets. Any other third-party
+The five nav icons are vendored as `ImageVector`s in `ui/theme/Icons.kt`
+(Material Design path data). Only `Settings` comes from `material-icons-core`;
+the other four are hand-vendored to avoid the 50 MB `material-icons-extended`
+AAR. Any other third-party
 artifact fails review; if a later step needs one, it comes back to the owner
 first (the plan's wording).
 

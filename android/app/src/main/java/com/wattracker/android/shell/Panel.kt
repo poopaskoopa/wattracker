@@ -69,7 +69,47 @@ fun ScreenScaffold(
         modifier = Modifier
             .fillMaxSize()
             .background(Palette.bg)
-            .verticalScroll(rememberScrollState())
+            .padding(16.dp),
+        verticalArrangement = Arrangement.spacedBy(12.dp),
+        horizontalAlignment = Alignment.Start,
+    ) {
+        Column(verticalArrangement = Arrangement.spacedBy(2.dp)) {
+            Text(
+                text = title,
+                style = MaterialTheme.typography.titleLarge,
+                fontWeight = FontWeight.SemiBold,
+                color = Palette.textBright,
+            )
+            Text(
+                text = subtitle,
+                style = MaterialTheme.typography.bodyMedium,
+                color = Palette.muted,
+            )
+        }
+        content()
+    }
+}
+
+/**
+ * A [ScreenScaffold] variant whose content column is vertically scrollable.
+ *
+ * The stub screens use this because their content is a fixed-size column
+ * that can overflow a phone in portrait. When the real screens land, the
+ * data-heavy ones (Activities list, Calendar grid) will use the non-scrolling
+ * [ScreenScaffold] plus their own `LazyColumn` / `LazyVerticalGrid`.
+ */
+@Composable
+fun ScrollableScreenScaffold(
+    title: String,
+    subtitle: String,
+    content: @Composable ColumnScope.() -> Unit,
+) {
+    val scrollState = rememberScrollState()
+    Column(
+        modifier = Modifier
+            .fillMaxSize()
+            .background(Palette.bg)
+            .verticalScroll(scrollState)
             .padding(16.dp),
         verticalArrangement = Arrangement.spacedBy(12.dp),
         horizontalAlignment = Alignment.Start,

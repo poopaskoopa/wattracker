@@ -7,7 +7,7 @@
     <string name="destination_calendar">Calendar</string>
     <string name="destination_volume">Volume</string>
     <string name="destination_settings">Settings</string>
-    <string name="app_shell_title">wattracker</string>
+    <string name="app_shell_title">WatTracker</string>
 
     <!--
         Screen stubs. They say what the screen will hold and which issue fills
