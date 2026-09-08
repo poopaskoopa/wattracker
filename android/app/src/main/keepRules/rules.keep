@@ -1,0 +1,3 @@
+# Intentionally empty: no R8 keep rules needed yet.
+# R8 rules for the Room entities and the Tink KeySetHandle will be added
+# in Step 2 (#194) when those dependencies are wired in.

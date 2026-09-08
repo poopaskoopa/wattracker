@@ -1,0 +1,6 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Intentionally empty: backup is disabled (allowBackup="false").
+     See AndroidManifest.xml for the rationale. -->
+<data-extraction-rules>
+    <cloud-backup />
+</data-extraction-rules>
