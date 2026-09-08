@@ -6,7 +6,9 @@ part a device run fails on silently - being told an address the phone cannot
 reach.
 """
 import importlib.util
+import shutil
 import socket
+import sys
 from pathlib import Path
 
 import pytest
@@ -15,6 +17,29 @@ import pytest
 ROOT = Path(__file__).parents[1]
 HARNESS_PATH = ROOT / "scripts" / "walking_skeleton_server.py"
 DEBUG_XCCONFIG = (ROOT / "ios" / "WatTracker" / "Config" / "Debug.xcconfig").read_text()
+
+
+#: ``ipv4_interfaces()`` shells out to ``ifconfig``, which is in the base
+#: system on macOS but is not installed by default on most Linux
+#: distributions (it moved to the optional net-tools package). Without it the
+#: call raises FileNotFoundError before any assertion runs, so the tests that
+#: read the real machine fail for a missing tool rather than for the
+#: behaviour they cover. Probed rather than branched on ``sys.platform``, so
+#: they keep running on any box that has the binary.
+requires_ifconfig = pytest.mark.skipif(
+    shutil.which("ifconfig") is None,
+    reason="reading interfaces needs the ifconfig binary (net-tools) on PATH",
+)
+
+#: ``test_interface_enumeration_reads_this_machine`` asserts a loopback named
+#: ``lo0``. That is the BSD/macOS name; Linux calls it ``lo``. The assertion
+#: is about parsing real BSD ifconfig output, so it is skipped off BSD rather
+#: than loosened - checking for "lo or lo0" would stop pinning the format the
+#: parser was written against.
+requires_bsd_ifconfig = pytest.mark.skipif(
+    sys.platform != "darwin" and "bsd" not in sys.platform,
+    reason="asserts the BSD loopback name lo0; Linux names it lo",
+)
 
 
 def load_harness():
@@ -112,6 +137,8 @@ def test_a_public_address_is_not_offered_to_a_phone(monkeypatch):
         harness.detect_lan_address(report=lambda line: None)
 
 
+@requires_ifconfig
+@requires_bsd_ifconfig
 def test_interface_enumeration_reads_this_machine():
     # Not a fixture: the parser has to survive real ifconfig output, including
     # the "inet A --> A" point-to-point form a tunnel prints.
@@ -125,6 +152,7 @@ def test_interface_enumeration_reads_this_machine():
         socket.inet_aton(item.address)  # raises if it is not dotted-quad IPv4
 
 
+@requires_ifconfig
 def test_lan_detection_returns_a_routable_ipv4():
     harness = load_harness()
     reachable = [
