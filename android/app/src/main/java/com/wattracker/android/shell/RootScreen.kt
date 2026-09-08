@@ -1,5 +1,6 @@
 package com.wattracker.android.shell
 
+import android.content.res.Configuration
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Column
@@ -12,8 +13,12 @@ import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material3.Icon
 import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.NavigationBar
+import androidx.compose.material3.NavigationBarItem
+import androidx.compose.material3.NavigationBarItemDefaults
 import androidx.compose.material3.NavigationRail
 import androidx.compose.material3.NavigationRailItem
+import androidx.compose.material3.NavigationRailItemDefaults
 import androidx.compose.material3.PermanentDrawerSheet
 import androidx.compose.material3.PermanentNavigationDrawer
 import androidx.compose.material3.Text
@@ -44,12 +49,14 @@ import com.wattracker.android.ui.theme.Palette
 /**
  * The app shell: one navigation model, two presentations.
  *
- * ## Why the phone gets a leading rail and not a bottom bar
+ * ## Why the phone gets a rail in landscape and a bottom bar in portrait
  *
  * (The arithmetic from issue #193; the iOS twin is the comment on `RootView`
- * in `ios/WatTracker/WatTracker/Shell/`.) This app is landscape on the phone,
- * so the viewport is wide and short -- roughly 900x400dp on a Pixel 9 before
- * insets. Vertical space is the scarce axis and horizontal space the abundant
+ * in `ios/WatTracker/WatTracker/Shell/`.) The iOS app is landscape-only on the
+ * phone; Android is not, so a phone in portrait is a real, reachable state and
+ * gets the conventional phone layout -- chrome on the bottom edge, full width,
+ * under the thumb. The rail is the *landscape* call: there the viewport is
+ * wide and short -- roughly 900x400dp on a Pixel 9 before insets -- Vertical space is the scarce axis and horizontal space the abundant
  * one.
  *
  * A bottom bar costs ~80dp of that ~400dp height, on every screen, forever: a
@@ -111,6 +118,15 @@ private fun usesLargeScreenShell(): Boolean {
 
 @Composable
 private fun PhoneShell(navController: NavHostController, selected: Destination) {
+    if (LocalConfiguration.current.orientation == Configuration.ORIENTATION_PORTRAIT) {
+        PhonePortraitShell(navController, selected)
+    } else {
+        PhoneLandscapeShell(navController, selected)
+    }
+}
+
+@Composable
+private fun PhoneLandscapeShell(navController: NavHostController, selected: Destination) {
     Row(modifier = Modifier.fillMaxSize()) {
         NavigationRail(
             modifier = Modifier.fillMaxHeight(),
@@ -127,12 +143,75 @@ private fun PhoneShell(navController: NavHostController, selected: Destination) 
                         )
                     },
                     label = { Text(stringResource(destination.titleRes)) },
+                    colors = railItemColors(),
                 )
             }
         }
         AppNavHost(navController, modifier = Modifier.fillMaxSize())
     }
 }
+
+/**
+ * The highlight shared by every destination item in every shell -- the rail,
+ * the bottom bar and the drawer rows. Selection is amber [Palette.accent], the
+ * rest [Palette.muted], and the selected indicator is a 16% accent wash.
+ *
+ * This is written explicitly rather than left to the Material defaults, and it
+ * is the *same* Palette the tablet drawer already paints, so the phone and the
+ * tablet read as one product: the highlight is identical on both idioms. It is
+ * deliberately not the M3 primary/primaryContainer scheme, whose white selected
+ * icon and tinted pill would not match the drawer's amber.
+ *
+ * Composable because [NavigationRailItemDefaults.colors] reads the theme for its
+ * remaining defaults, so it cannot be hoisted to a top-level val.
+ */
+@Composable
+private fun railItemColors() = NavigationRailItemDefaults.colors(
+    selectedIconColor = Palette.accent,
+    unselectedIconColor = Palette.muted,
+    selectedTextColor = Palette.accent,
+    unselectedTextColor = Palette.muted,
+    indicatorColor = Palette.accent.copy(alpha = 0.16f),
+)
+
+@Composable
+private fun PhonePortraitShell(navController: NavHostController, selected: Destination) {
+    // Portrait on a phone is the conventional phone layout: chrome on the bottom
+    // edge, full width, under the thumb. The rail's case (a wide, short
+    // landscape viewport) does not apply, so we do not reuse it here.
+    Column(modifier = Modifier.fillMaxSize()) {
+        AppNavHost(navController, modifier = Modifier.weight(1f))
+        NavigationBar(containerColor = Palette.panel) {
+            Destination.entries.forEach { destination ->
+                NavigationBarItem(
+                    selected = destination == selected,
+                    onClick = { navigateTo(navController, destination) },
+                    icon = {
+                        Icon(
+                            imageVector = destination.icon,
+                            contentDescription = stringResource(destination.titleRes),
+                        )
+                    },
+                    label = { Text(stringResource(destination.titleRes)) },
+                    alwaysShowLabel = true,
+                    colors = bottomBarItemColors(),
+                )
+            }
+        }
+    }
+}
+
+/** Same [Palette] as [railItemColors] for the portrait bottom bar; a separate
+ * function only because the M3 types differ between the rail and the bar. The
+ * values must stay in sync with [railItemColors]. */
+@Composable
+private fun bottomBarItemColors() = NavigationBarItemDefaults.colors(
+    selectedIconColor = Palette.accent,
+    unselectedIconColor = Palette.muted,
+    selectedTextColor = Palette.accent,
+    unselectedTextColor = Palette.muted,
+    indicatorColor = Palette.accent.copy(alpha = 0.16f),
+)
 
 @Composable
 private fun TabletShell(navController: NavHostController, selected: Destination) {
