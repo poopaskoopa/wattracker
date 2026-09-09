@@ -33,7 +33,7 @@ struct CalendarMonth: Hashable, Sendable, Equatable {
     }
 
     var dayCount: Int {
-        Self.gregorian.range(of: .day, in: .month, for: firstDate)?.count ?? 0
+        Self.gregorian.range(of: .day, in: .month, for: firstDate)?.count ?? 28
     }
 
     /// Number of empty cells before the first day when weeks begin on Monday.
@@ -47,7 +47,7 @@ struct CalendarMonth: Hashable, Sendable, Equatable {
         formatter.locale = .current
         formatter.calendar = Self.gregorian
         formatter.timeZone = TimeZone(secondsFromGMT: 0)
-        formatter.dateFormat = "LLLL yyyy"
+        formatter.setLocalizedDateFormatFromTemplate("LLLLyyyy")
         return formatter.string(from: firstDate)
     }
 
@@ -333,6 +333,9 @@ struct VolumeSummary: Sendable, Equatable {
 /// Volume objects prepared for the chart and summary tiles.
 struct VolumeData: Sendable, Equatable {
     let weeks: [VolumeWeek]
+    /// The server omits weeks with no rides. A zero bucket keeps the chart's
+    /// spacing and the rolling summaries honest about rest weeks.
+    let denseWeeks: [VolumeWeek]
     let source: CloudSnapshot.Source
     let asOf: Date
 
@@ -346,13 +349,12 @@ struct VolumeData: Sendable, Equatable {
         weeks = values.sorted {
             ($0.weekStart ?? "") < ($1.weekStart ?? "")
         }
+        denseWeeks = Self.densify(weeks)
         source = snapshot.source
         asOf = snapshot.asOf
     }
 
-    /// The server omits weeks with no rides. A zero bucket keeps the chart's
-    /// spacing and the rolling summaries honest about rest weeks.
-    var denseWeeks: [VolumeWeek] {
+    private static func densify(_ weeks: [VolumeWeek]) -> [VolumeWeek] {
         guard let first = weeks.first?.weekStart,
               let last = weeks.last?.weekStart,
               let firstDate = ISODate.parse(first),
@@ -408,11 +410,13 @@ struct VolumeData: Sendable, Equatable {
     }
 
     func previousWeeks(for range: VolumeRange) -> [VolumeWeek] {
+        // Year to date has no fixed-length prior-window comparison.
         guard let count = range.count else { return [] }
         let dense = denseWeeks
-        guard dense.count > count else { return [] }
+        // Both windows must be complete to compare equal spans of history.
+        guard dense.count >= count * 2 else { return [] }
         let end = dense.count - count
-        let start = max(0, end - count)
+        let start = end - count
         return Array(dense[start..<end])
     }
 
@@ -439,13 +443,17 @@ struct VolumeData: Sendable, Equatable {
 /// Date-only ISO helpers. Parsing is strict so a malformed server object is
 /// ignored instead of appearing in an arbitrary month or week.
 private enum ISODate {
-    static func parse(_ value: String) -> Date? {
-        guard value.count == 10 else { return nil }
+    private static let formatter: DateFormatter = {
         let formatter = DateFormatter()
         formatter.locale = Locale(identifier: "en_US_POSIX")
         formatter.calendar = CalendarMonth.gregorian
         formatter.timeZone = TimeZone(secondsFromGMT: 0)
         formatter.dateFormat = "yyyy-MM-dd"
+        return formatter
+    }()
+
+    static func parse(_ value: String) -> Date? {
+        guard value.count == 10 else { return nil }
         guard let date = formatter.date(from: value), format(date) == value else {
             return nil
         }
@@ -453,11 +461,6 @@ private enum ISODate {
     }
 
     static func format(_ date: Date) -> String {
-        let formatter = DateFormatter()
-        formatter.locale = Locale(identifier: "en_US_POSIX")
-        formatter.calendar = CalendarMonth.gregorian
-        formatter.timeZone = TimeZone(secondsFromGMT: 0)
-        formatter.dateFormat = "yyyy-MM-dd"
         return formatter.string(from: date)
     }
 }

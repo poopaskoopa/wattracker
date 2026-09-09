@@ -200,4 +200,61 @@ final class MobileScreenDataTests: XCTestCase {
             0
         )
     }
+
+    func testChangeIsWithheldUntilAFullPriorWindowExists() {
+        let data = flatVolumeData(weekCount: 5)
+
+        XCTAssertEqual(data.weeks(for: .last4).count, 4)
+        XCTAssertEqual(data.summary(for: .last4).hours, 20)
+        XCTAssertTrue(data.previousWeeks(for: .last4).isEmpty)
+        for metric in VolumeMetric.allCases {
+            XCTAssertNil(data.change(for: metric, range: .last4), "\(metric)")
+        }
+    }
+
+    func testChangeAppearsExactlyWhenTwoFullWindowsExist() throws {
+        for (range, count) in [(VolumeRange.last4, 4), (.last12, 12)] {
+            let before = flatVolumeData(weekCount: count * 2 - 1)
+            let complete = flatVolumeData(weekCount: count * 2)
+
+            XCTAssertEqual(before.weeks(for: range).count, count)
+            XCTAssertTrue(before.previousWeeks(for: range).isEmpty)
+            XCTAssertEqual(complete.weeks(for: range).count, count)
+            XCTAssertEqual(complete.previousWeeks(for: range).count, count)
+            for metric in VolumeMetric.allCases {
+                XCTAssertNil(before.change(for: metric, range: range), "\(range), \(metric)")
+                XCTAssertEqual(
+                    try XCTUnwrap(complete.change(for: metric, range: range)),
+                    0,
+                    accuracy: 0.0001,
+                    "\(range), \(metric)"
+                )
+            }
+        }
+    }
+
+    private func flatVolumeData(weekCount: Int) -> VolumeData {
+        var calendar = Calendar(identifier: .gregorian)
+        calendar.timeZone = TimeZone(secondsFromGMT: 0)!
+        let firstMonday = date(year: 2025, month: 1, day: 6)
+        let items = (0..<weekCount).map { index in
+            let monday = calendar.date(byAdding: .day, value: index * 7, to: firstMonday)!
+            let components = calendar.dateComponents([.year, .month, .day], from: monday)
+            let start = String(
+                format: "%04d-%02d-%02d", components.year!, components.month!, components.day!
+            )
+            return CloudItem(
+                id: "volume-week-\(start)",
+                kind: .volumeWeek,
+                revision: index + 1,
+                payload: .volumeWeek(
+                    VolumeWeek(
+                        weekStart: start, hours: 5, tss: 100,
+                        distanceKm: 50, calories: 1000
+                    )
+                )
+            )
+        }
+        return VolumeData(snapshot: snapshot(route: .volume, items: items))
+    }
 }
