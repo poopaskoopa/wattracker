@@ -1,0 +1,87 @@
+name: Android
+
+# A separate workflow rather than a job in cloud.yml so that `paths:` can keep
+# it off pull requests that touch no Android code. The workflow file is in its
+# own filter, so a change to this file is always validated by the job it
+# defines - including the pull request that introduces it.
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - 'android/**'
+      - '.github/workflows/android.yml'
+  pull_request:
+    paths:
+      - 'android/**'
+      - '.github/workflows/android.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  # This job deliberately does NOT carry the fork gate that cloud.yml's `tests`
+  # job has. That gate exists because the self-hosted macOS runner is a physical
+  # machine which is not torn down between jobs and which executes PR code as
+  # the runner's own user. A hosted ephemeral runner compiling android/ has
+  # neither property and holds no secrets, so an unreviewed fork PR is safe
+  # here - and this job is then the only CI a fork PR gets that the Python
+  # suite structurally cannot give it. Do not copy that `if:` across.
+  #
+  # Hosted runners are free on this repository because it is public;
+  # bicep-validation and containerized in cloud.yml have been running on
+  # ubuntu-latest throughout. Anything in the tree still claiming Actions are
+  # blocked at the account level predates the repository going public.
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      # android/gradle/gradle-daemon-jvm.properties pins toolchainVersion=25.
+      # Left unpinned here, Gradle resolves that through foojay and downloads a
+      # JDK on every single run. Temurin 25 also matches what local builds use
+      # (Android Studio's bundled JBR is 25.0.3), so the runner and the
+      # developer machine are on the same major.
+      - name: Provision JDK 25
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '25'
+
+      # compileSdk is release(37), which is not on the runner image. AGP will
+      # fetch it, but only once the licences are accepted - without this step
+      # the job fails on a licence prompt that reads like a missing-SDK error.
+      - name: Accept Android SDK licences
+        run: yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --licenses > /dev/null
+
+      # assembleRelease is here, and not only assembleDebug, because
+      # minifyReleaseWithR8 runs on the release path alone - and that is the
+      # task which reads app/src/main/keepRules/rules.keep. Step 2 (#194) puts
+      # the Room and Tink keep rules in that file. A debug-only job would never
+      # exercise them, and an R8-stripped Room entity fails at runtime in a
+      # release build, which is the most expensive place to discover it.
+      #
+      # -PallowPlaceholderHost is required for as long as #102 is open: the
+      # placeholder-host guard in app/build.gradle.kts refuses assembleRelease
+      # without it, on purpose. The flag suppresses that guard and nothing else,
+      # and the guard is verified to still fire without it.
+      - name: Build and unit-test
+        working-directory: android
+        run: >-
+          ./gradlew --no-daemon
+          :app:assembleDebug
+          :app:testDebugUnitTest
+          :app:assembleRelease -PallowPlaceholderHost
+
+      # Best effort. The account's artifact storage has been full, so this step
+      # can go yellow on a job that failed correctly; the failure itself is in
+      # the log above either way, so never let this decide the job's result.
+      - name: Upload test report on failure
+        if: failure()
+        continue-on-error: true
+        uses: actions/upload-artifact@v4
+        with:
+          name: android-test-report
+          path: android/app/build/reports/tests/
