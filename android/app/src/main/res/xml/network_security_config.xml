@@ -1,14 +1,21 @@
 <?xml version="1.0" encoding="utf-8"?>
 <!--
     The strict (release) form: cleartext is refused for every connection.
-    The cloud backend is HTTPS in every build type, always.
+    Both backends are HTTPS in every build type, always.
 
-    The local desktop backend is plain HTTP on the rider's LAN. It is opened
-    per-host by the transport in Step 2 (#194), not here, and the debug build
-    replaces this resource (same name, src/debug) with a copy that permits
-    cleartext to loopback hosts only: the dev harness seen through the
-    emulator. Do not add LAN hosts to this file; that is the release
-    domain-config trade recorded in android/README.md.
+    The local desktop backend is reached through whatever TLS terminator the
+    rider runs -- tailscale serve or an ordinary reverse proxy, both accepted
+    (owner decision, #192/#260) -- so it needs no exception here and Step 2
+    adds none. This file is final, not provisional.
+
+    Do not add a domain-config to this file. A strict base-config already
+    permits every HTTPS host, which is exactly what lets the rider point the
+    app at any hostname they like; naming one here would replace that
+    flexibility with a hardcoded host and buy nothing.
+
+    The debug build replaces this resource (same name, src/debug) with a copy
+    that permits cleartext to loopback hosts only: the dev harness seen through
+    the emulator. That copy cannot ship — it lives in the debug source set.
 -->
 <network-security-config>
     <base-config cleartextTrafficPermitted="false" />
