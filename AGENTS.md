@@ -175,42 +175,65 @@ If the two disagree, GitHub wins and the queue is stale; say so.
 1. **#249 — rotating full-suite test flakes.** The top item and the only one
    that makes every other item's green run trustworthy. 1 to 4 failures per
    full run, a *different* test each time, each one green in isolation **and**
-   under heavy synthetic CPU load — so it is not a timing race. It reads as
-   cross-test state leaking between short, synchronous server/HTTP tests. One
-   instance is already root-caused and fixed in `fedcd2b`;
-   `tests/test_onboarding.py::test_setup_timezone_can_be_confirmed_and_is_stored`
-   is the open one. Fully local, no hardware, no deployment.
-2. **#163 — iOS Calendar and Volume screens.** Unblocked: #234 merged
-   2026-09-06 as PR #240 (`ebd010e`). Preferred over #162 because it carries no
-   existing PR to reconcile.
-3. **#162 — iOS Activities list and ride detail.** Also unblocked, but PR #235
-   already exists and is **not** simply rebasable — see below. Do not rebase it
-   and merge; the conflict is semantic, not textual.
+   under heavy synthetic CPU load — so it is not a timing race.
+   **Substantially narrowed on 2026-09-07.** Four hypotheses are dead: leaked
+   export/ride writers, `httpx2`, the starlette version gap, and
+   `cookie_secure`. The mechanism is identified — the session goes missing
+   mid-test, `AuthMiddleware` 303s to `/welcome`, `TestClient` follows it, and
+   the assertion reads a 200 of the wrong page. What is *not* established is
+   why the session goes missing. The most promising remaining lead is named in
+   the issue: the `_register()` helpers in the implicated test files discard
+   their response, so a silently-failing registration would produce exactly
+   this shape. Start there. Fully local, no hardware, no deployment.
+2. **#163 — iOS Calendar and Volume screens. In flight as PR #256.** Reviewed
+   2026-09-09; one correctness bug to fix (`VolumeData.previousWeeks` compares
+   a full current window against a clamped prior one, so `change()` reports
+   e.g. +300% for a flat 5 h/week rider with five weeks of history), plus two
+   performance items. Apply-ready diffs and the two tests are on the PR. The
+   branch is already rebased and green. Finish this before taking anything
+   else.
+3. **#258 — iOS: read the local desktop server as a second backend.**
+   `blocked` on #256, because the protocol extraction touches the same screen
+   files. Order: land #256, extract the read protocol behind `CloudClient` /
+   `CloudSession` / `SnapshotCache` as one behaviour-preserving refactor, then
+   add the local adapter. Transport is settled — see #192: TLS in front of the
+   local server, terminator the rider's choice, not publicly reachable.
 
-**Done since this list was last written:** #234 merged as PR #240 on
-2026-09-06, after an on-device validation run on an iPhone. #233 landed in PR
-#238. #217's credential-free half landed in PR #239 — its remainder is the
-Azure protected-environment smoke test, which needs a real deployment and so is
-gated on #102; do not pick #217 up expecting startable work. **#167 was closed
-2026-09-05** and is no longer the top item.
+**Done since this list was last written.** The iOS screens all landed:
+**#161 as PR #253** and **#162 as PR #254** (both re-applied onto `main`'s
+session; PRs #228 and #235 are closed as superseded). **#193 landed as PR
+#257** (`6830150a`) — the repository now has an `android/` tree. #234 merged
+as PR #240 after an on-device run; #233 landed in PR #238; #217's
+credential-free half landed in PR #239, its remainder gated on #102. #167 was
+closed 2026-09-05.
 
-**The iOS app can now be run against a real server on a device.**
+**Pairing is wired on `main`.** `CloudClient.pair(code:)` →
+`SessionGate.pair(code:label:)` → `PairingScreen`. The section below about
+#162 and #163 waiting for pairing describes a gap that no longer exists.
+
+**The iOS app can be run against a real server on a device.**
 `scripts/walking_skeleton_server.py --lan` enrols a writer, publishes a full
 snapshot, mints pairing codes and writes the Mac's LAN address to
 `ios/WatTracker/Config/Local.xcconfig`. `docs/ios-device-validation.md` is the
 checklist and carries the traps — a 900-second code, and remints that wipe the
-in-memory store along with the revoked-device record. A screen built for #162
-or #163 can be checked on real data now, which was the whole reason those two
-waited.
+in-memory store along with the revoked-device record.
 
-**Do not start #161.** Its work is done and sitting in PR #228. #234 has
-merged, so #228 is unblocked, but it is still unmerged pending its own
-on-real-data check — its body says `Closes #161`, and merging it on green CI
-would close the issue that tracks doing that check. Starting #161 re-implements
-a screen that already exists.
+**Do not start #161, #162 or #247.** All three are open *only* for an
+on-device check, which no agent can perform. Their screens are on `main`.
+Starting one re-implements code that already exists — the `agent:codex` labels
+that used to point here were removed on 2026-09-09 for that reason.
 
 **Do not start #169** without asking; it is `blocked`. #242 is `blocked` on
-#102 and is a measurement of a live deployment, not code.
+#102 and is a measurement of a live deployment, not code. **#217** needs a
+real deployment; its body's claims about `containerized` being parked and
+`Dockerfile.cloud` never being built are both stale.
+
+**The Android epic (#192-#199, plus #259 and #260) is taksmon's** by GitHub
+assignee and is not on this queue.
+
+**One iOS issue at a time.** `project.pbxproj` conflicts on almost every
+concurrent edit — see `docs/agent-workflow.md` §4. This is why #258 waits for
+#256 rather than running alongside it.
 
 ### Before starting any iOS issue that already has a PR
 
@@ -229,20 +252,24 @@ must drop its own counter and adopt the other's, then re-verify its reads.
 Keep #228's, which was reviewed line by line. Two generation counters guarding
 one actor is not a merge, it is a bug.
 
-### Why #162 and #163 wait for pairing
+Both PRs are now closed — #253 and #254 re-applied that work onto `main`
+instead. The two-dot rule above is the part to carry forward; the #235/#228
+collision is kept as the worked example of why it matters.
 
-Nothing in the app target currently calls `CloudSession.pair(code:)`, so the
-keychain is never written and every screen that reads cloud data renders its
-empty state on a device. That is exactly why #228 cannot be merged despite
-being correct and green. Building two more screens against that gap produces
-two more PRs in the same position: reviewable, passing CI, and impossible to
-verify against real data. One of those is a known cost; three is a backlog.
+### Say whether you ran it on a device
 
-#234 has now landed, so the app pairs against
-`scripts/walking_skeleton_server.py` and these are checkable on a device. That
-removes the reason to hold iOS screens back — and it also removes the excuse
-for shipping one unverified. If you build a screen, say whether you ran it on a
-device or only in CI.
+This section used to explain why #162 and #163 were held back: nothing in the
+app target called `CloudSession.pair(code:)`, so the keychain was never
+written and every screen rendered its empty state on a device. **That gap is
+closed** — pairing is wired on `main` (`CloudClient.pair` → `SessionGate.pair`
+→ `PairingScreen`) and #234 landed the harness to pair against.
+
+The rule that outlived it: a screen that passes CI has not been shown to work.
+Green `ios-tests` cannot see an unreachable screen, and it could not see the
+sideways QR preview a device run caught on 2026-09-06. **If you build a
+screen, say plainly whether you ran it on a device or only in CI.** That
+disclosure is what lets the review catch what the tests cannot — and it is why
+#161, #162 and #247 stay open after their code has merged.
 
 ### When an issue's premise has gone stale
 
