@@ -4,13 +4,27 @@ Epic #192 and sub-issues #193–#199, plus the owner's
 extra targets: Android 11+, dual-server support (cloud **and** local), offline
 cache. Kotlin + Jetpack Compose, single app under `android/`.
 
-**Resume point — Step 1 is done and in review (PR #257, draft).**
-Branch `feature/android-client` has three commits (scaffold + shell + nav
-fix), all noreply identity, rebased onto current `origin/main`. Verified on
-both AVDs (`medium_phone` API 36, `medium_tablet` API 35): rail in landscape,
-bottom bar in portrait, drawer on tablet. README measurement table filled.
-Pre-push hook installed. **Next: Step 2 — Cloud API client + local client
-(issue #194 + local backend).** See "Step 1 — completion notes" below.
+**Resume point — Step 1 is done and merged (PR #257).** `android/` is on
+`main`, so #194–#199 are unblocked. Verified on both AVDs (`medium_phone`
+API 36, `medium_tablet` API 35): rail in landscape, bottom bar in portrait,
+drawer on tablet. README measurement table filled. Pre-push hook installed.
+**Next: Step 2 — Cloud API client + local client (issue #194 + local
+backend).** See "Step 1 — completion notes" below.
+
+**Revised 2026-09-09 — local transport settled.** The #257 review's open
+transport question and the tailnet requirement recorded on #192 (2026-09-08)
+resolve the same way: **the local backend is reached over HTTPS, terminated by
+whatever front end the rider runs.** `tailscale serve` and an ordinary reverse
+proxy (nginx, Caddy) are equally accepted — the tailnet was the *mechanism*
+that comment picked, not the property it argued for, and either satisfies all
+three properties it actually mandated (strict release NSC, no raw-socket
+transport, loopback bind preserved). Widening it to any TLS terminator costs
+nothing and means a rider without a Tailscale account is not required to get
+one. The app speaks TLS to both backends and never cleartext in a release
+build. Full rationale in the Resolved decisions table ("Local backend
+transport"); spec in 2.3. The raw-socket path and the pinned self-signed cert
+are both dead — do not build either. The Android CI decision is now answered
+too (hosted `ubuntu-latest`, #259).
 
 **Revised 2026-09-06.** Re-verified against `main` at `8c75eba`. What changed
 since the 2026-09-01 draft:
@@ -57,9 +71,10 @@ since the 2026-09-01 draft:
 | Decision | Answer |
 |---|---|
 | `.fit` file uploads | **Dropped from scope** (2026-09-01). No assigned issue covers it; the cloud API has no `.fit` route (sync plane takes parsed objects only) and the local server's `POST /activities/upload` predates this work. Revisit later as a new issue. |
-| Architecture | **Dual backend.** (1) Cloud read plane as #194–#198 specify (pairing code → Keystore P-256 → signed context refresh → `GET /api/v1/context/*` with the bearer reader context). (2) Local desktop server via the **connector model**: device token paired in the web UI Settings → session → local JSON API (`/api/state`, `/api/activities`, …). Screens read through one common `ReadModel` interface with one adapter per backend. |
+| Architecture | **Dual backend.** (1) Cloud read plane as #194–#198 specify (pairing code → Keystore P-256 → signed context refresh → `GET /api/v1/context/*` with the bearer reader context). (2) Local desktop server via the **connector model**: device token paired in the web UI Settings → session → local JSON API (`/api/state`, `/api/activities`, …), reached **over HTTPS through the rider's own reverse proxy** (see the transport row below). Screens read through one common `ReadModel` interface with one adapter per backend. |
+| Local backend transport | **HTTPS only, terminated by whatever front end the rider runs** (owner, 2026-09-09). The requirement is TLS in front of the local server — **`tailscale serve` and an ordinary reverse proxy (nginx, Caddy) are both accepted**, and the app cannot tell them apart: it sees an HTTPS origin with a chain to a system trust anchor. The tailnet stays a valid deployment for anyone who wants it; it is no longer a *requirement*, because it was the mechanism the #192 comment (2026-09-08) picked, not the property it argued for. In either case the desktop server keeps its loopback bind and speaks plain http to a co-located terminator. The app never speaks cleartext in a release build: `usesCleartextTraffic="false"`, release `network_security_config.xml` strict, **no `domain-config`, no pinning, no custom `TrustManager`**. **No hostname is baked in anywhere** — the rider types the origin, so any front end, name, port or vhost works. This keeps all three properties #192's comment mandated (strict release NSC, no raw-socket transport, loopback bind preserved) while requiring no third-party account of a rider who does not already have one. Supersedes both options the #257 review put up: the raw-socket cleartext path and the self-signed cert pinned at pairing. |
 | minSdk / targetSdk | minSdk **30** (Android 11, owner's floor; StrongBox API is 28+, Keystore EC P-256 is long stable). targetSdk **36** — Google Play has required API 36+ for new apps and updates **since 2026-08-31** (verify current policy at implementation time). |
-| Release CI runner (#199) | **Deferred** — plan the job for the existing self-hosted macOS runner (`macos-ci`) as default; note that switching to a Linux runner later is a `runs-on` label change. |
+| Release CI runner (#199) | **Hosted `ubuntu-latest`** (owner, on #257; supersedes the earlier "deferred, plan for `macos-ci`" answer, which predated the repo going public). Standard hosted runners are unmetered on a public repo and `cloud.yml` already runs `bicep-validation` and `containerized` on `ubuntu-latest`. `macos-release.yml`'s `if: ${{ false }}` and any note claiming Actions are blocked at the account level are stale. The build/unit-test job is tracked as **#259**, with an untested starting workflow in the #257 thread; the two gotchas it encodes are `compileSdk 37` (not on the runner image — accept SDK licences so AGP can fetch it) and `gradle/gradle-daemon-jvm.properties` pinning `toolchainVersion=25` (pin it with `setup-java` or Gradle re-downloads a JDK from foojay every run). Do **not** copy `cloud.yml`'s fork gate: it exists for a persistent physical runner, and a hosted ephemeral Android job can safely cover fork PRs. |
 | HTTP client | `HttpURLConnection` (plain, no deps). **Note:** issue #193 names "HttpURLConnection or `java.net.http`", but `java.net.http.HttpClient` does not exist in the Android SDK (JDK-11 API, never ported) — the choice is unambiguous. |
 | Screen cache | **Room** (AndroidX, explicitly allowed by #194) for the revision-keyed cloud cache; last-payload cache for the local backend. Justification over hand-rolled SQLite: compile-time-checked SQL, Flow-driven screens, and the cache is ~10 tables of small objects — Room's codegen is the cheap part, not the liability. |
 | App id | `com.wattracker.android` (mirrors `com.wattracker.ios`). |
@@ -242,22 +257,65 @@ code; track, don't copy, what is on `main`.)
   renders what each backend publishes (the desktop is the source of truth for
   its own backend) and this discrepancy is noted in `android/README.md` — the
   app must not try to "fix" it client-side.
-- The server binds `WATTRACKER_HOST` (default `127.0.0.1`) on
-  `WATTRACKER_PORT` (default `8000`), and a Host-header allowlist
-  (`IPv6TrustedHostMiddleware`, `server.py:1056`) defaults to **loopback +
-  `testserver` only** — any other `Host` is a 400 before routing. LAN access
-  therefore needs two env vars, not one: `WATTRACKER_HOST=0.0.0.0` (bind)
-  and `WATTRACKER_PUBLIC_HOSTS=<hosts>` (comma-separated; `config.public_
-  hosts()`, `config.py:730-745`; bare hostname/IP entries, strictly
-  validated, no wildcards). Document in `android/README.md`; do not change
-  either default.
+- **Reaching it from the phone is the proxy's job, not a wider bind.** The
+  server binds `WATTRACKER_HOST` (default `127.0.0.1`) on `WATTRACKER_PORT`
+  (default `8000`), and `config.server_host()` (`config.py:625`) refuses any
+  non-loopback value unless `WATTRACKER_ALLOW_NON_LOOPBACK=1` is *also* set
+  (`config.py:580` — a deliberate second opt-in whose docstring notes that
+  every other control here, the Host allowlist and the cookie flags included,
+  was written assuming it never happens). With the proxy on the same machine
+  it never happens: the terminator dials `127.0.0.1:8000`, which *is* a loopback
+  connection, so **neither variable moves off its default**. Only a proxy on a
+  different box needs the pair — and there a host firewall rule, not a new
+  app-level peer allowlist, is what limits who may dial the port.
+- **What the rider does set** (`docker-compose.yml:31-35` and
+  `README.md:540-549` say the same three): `WATTRACKER_COOKIE_SECURE=1` — the
+  session cookie gets `Secure` (`config.py:752`, wired to `SessionMiddleware`'s
+  `https_only` at `server.py:1595`); `WATTRACKER_PUBLIC_SCHEME=https`
+  (`config.py:763`, already the default, because a fronting terminator was
+  always the assumed shape); and `WATTRACKER_PUBLIC_HOSTS=<the hostname the
+  phone uses>` — the tailnet name under `tailscale serve`, the proxy's
+  `server_name` otherwise
+  (`config.py:730`, comma-separated, bare hostname/IP entries, strictly
+  validated, no wildcards), because the Host-header allowlist
+  (`IPv6TrustedHostMiddleware`, `server.py:1056`) defaults to loopback +
+  `testserver` and 400s anything else before routing. The proxy must pass the
+  original `Host` through (`proxy_set_header Host $host;`) and forward at the
+  **root** — the app mints absolute-rooted paths and has no `root_path`
+  support, so a path-prefix mount will not work.
+- **The README's "buttons return 403 behind an https proxy" wrinkle does not
+  reach this app** (`README.md:548`). That guard is `_same_origin_or_absent`
+  (`server.py:1317`) and its first line accepts a request carrying **no
+  `Origin` header** — the codebase's convention for native clients.
+  `HttpURLConnection` sends none, so `POST /api/connector/session` passes
+  cleanly through the proxy. Two adjacent facts verified at the same time:
+  `connector_session_redeem` returns a **relative** `Location: /`
+  (`server.py:3021`), so the 303 cannot leak the backend's scheme or port to
+  the phone; and `_ws_origin_ok` (`server.py:5622`) compares **host only**
+  against `public_hosts()`, so the live-ride WebSocket survives the proxy too
+  (nginx needs the usual `Upgrade`/`Connection` headers; `tailscale serve`
+  handles it). The 403 stays real
+  for the rider's *browser* over the proxy — so pair a device from the desktop
+  at `127.0.0.1`, not from the phone browser.
+- ⚠️ **`WATTRACKER_COOKIE_SECURE` goes in the launch environment, not a shell
+  export.** `conftest`'s `delenv` list does not clear it, so an exported value
+  produces mass Python-suite failures that look unrelated to it (#249, and the
+  owner repeated the warning on #257). Same care as any other server env var
+  set for a phone-facing run.
+- **Docs corrected 2026-09-09** (was Step-1 debt, now done): `android/README.md`
+  no longer claims the emulator needs `WATTRACKER_HOST=0.0.0.0` +
+  `WATTRACKER_ALLOW_NON_LOOPBACK=1` — it needs neither — and both shipped
+  config comments have dropped the superseded LAN framing (#260, item 3).
 - **Security fact to keep visible:** a connector-origin session is a *full
   user session* — the server refuses only a handful of credential-minting
   routes for it (`server.py` `_from_connector` checks,
   `server.py:2990-3011`). Read-only on the local backend is a property of
   *this app*, not of the server. A leaked local device token is a full
-  account login. The existing Revoke button is the mitigation. State this in
-  the Settings UI copy ("remove this device") and in `android/README.md`.
+  account login. HTTPS takes that token off the wire; it does not take away
+  what the token *is*, so a leak from the phone, a screenshot or a paste buffer
+  is still a full login. The existing Revoke button remains the mitigation.
+  State this in the Settings UI copy ("remove this device") and in
+  `android/README.md`.
 
 **Cloud dev harness** (`scripts/walking_skeleton_server.py`):
 
@@ -382,19 +440,22 @@ avdmanager create avd -n wt-tablet -k "system-images;google_apis;x86_64;36" -d p
   script — run it under Git-Bash/WSL, or start the server directly in
   PowerShell:
   ```powershell
-  $env:WATTRACKER_HOST = "0.0.0.0"
-  $env:WATTRACKER_PUBLIC_HOSTS = "10.0.2.2,<machine-LAN-IP>"
+  $env:WATTRACKER_PUBLIC_HOSTS = "10.0.2.2"
   .\.venv\Scripts\python.exe wattracker\server.py
   ```
-  Both vars matter: the bind (`WATTRACKER_HOST=0.0.0.0`) and the
-  Host-allowlist — the server rejects any request whose `Host` header is not
-  loopback/listed, so the phone's host must be registered:
-  - emulator → `http://10.0.2.2:8000` (the emulator's alias for the host
-    machine's loopback; never `127.0.0.1` from an emulator — that is the
-    emulator's own loopback);
-  - physical device → `http://<machine-LAN-IP>:8000` (register that IP in
-    `WATTRACKER_PUBLIC_HOSTS`; a `.local` name works too if the rider prefers
-    typing a name).
+  **The bind stays on loopback for the emulator path** — one variable, not two.
+  `10.0.2.2` is the emulator's NAT alias for the *host's* loopback, so a
+  `127.0.0.1`-bound server is already reachable; only the Host-header allowlist
+  needs the name, because the server 400s any `Host` it does not answer to.
+  (Never `127.0.0.1` from an emulator — that is the emulator's own loopback.)
+  - emulator, debug build → `http://10.0.2.2:8000`, under the `debug` source
+    set's NSC exception;
+  - physical device, or any release-shaped run → `https://<hostname>` through
+    the rider's TLS terminator (`tailscale serve` or a reverse proxy — either),
+    with that name in `WATTRACKER_PUBLIC_HOSTS` and
+    `WATTRACKER_COOKIE_SECURE=1` set. A wider bind (`WATTRACKER_HOST` +
+    `WATTRACKER_ALLOW_NON_LOOPBACK=1`) is needed **only** if the terminator
+    runs on a different machine than the server.
   Pair the phone as a device in the web UI (Settings → connector pairing,
   label e.g. `Pixel-9`) to obtain a token.
 - **Cloud dev harness** (the cloud backend in debug), once PR #240 has merged
@@ -638,8 +699,9 @@ not re-derive:**
    cache (~10 small tables, KSP codegen).
 
 > [!CAUTION]
-> **Two decisions to settle before Step 2 code lands (flagged in the #193
-> review; not yet resolved — address in the next session):**
+> **One decision still open before Step 2 code lands** (both were flagged in
+> the #193 review; the transport half is now resolved — see Resolved
+> decisions → "Local backend transport"):
 >
 > 1. **No Android CI exists.** `.github/workflows/` has cloud, ios-release,
 >    macos-release, windows-release and windows — none compiles `android/`.
@@ -653,23 +715,11 @@ not re-derive:**
 >    high-value addition, but it needs the `ui-test` deps that the review
 >    cleanup removed for size — a deliberate add-back, not a regression.
 >
-> 2. **The local-backend transport (2.3) hand-rolls HTTP over a raw socket to
->    bypass `NetworkSecurityPolicy`.** The stated goal (cleartext only to the
->    host the rider typed) is real, but the mechanism routes around the
->    platform's enforcement point, so no NSC audit tells the truth about the
->    app's network use; ~150 lines of hand-written HTTP (chunked decoding,
->    header folding, `Content-Length`/chunked disagreement, response
->    splitting) is a meaningful attack surface for a client carrying a device
->    bearer token in cleartext over the LAN; and it forfeits pooling, timeouts,
->    redirects and proxy support. Two better options to put to the owner first:
->    (a) keep the platform gate and use a release `domain-config` allowlist
->    scoped via `NetworkSecurityPolicy.isCleartextTrafficPermittedForHost`, or
->    (b) have the local desktop server present a **self-signed cert pinned at
->    pairing time** (the pairing flow already exchanges a secret, so
->    trust-on-first-use is free) — strictly better than cleartext for a
->    token-bearing connection and it removes the whole question. Cheaper to
->    redirect before the transport exists. See the callout on the 2.3
->    `LocalClient` transport bullet.
+> 2. ~~The local-backend transport hand-rolls HTTP over a raw socket.~~
+>    **Resolved 2026-09-09: HTTPS only, through the rider's own reverse proxy.**
+>    No raw socket, no `domain-config`, no pinning; the release NSC stays
+>    strict and `LocalClient` becomes an ordinary `HttpsURLConnection` caller.
+>    Spec in 2.3, rationale in the Resolved decisions table.
 
 Nothing in Step 2 touches the shell or the theme — `RootScreen.kt`, the
 `Destination` enum and `Palette.kt` are stable unless a new destination or
@@ -757,14 +807,18 @@ colour is introduced by pairing (#195).
   `android:usesCleartextTraffic="false"` + `res/xml/network_security_config.xml`
   (base-config cleartext **false**; a `domain-config` permitting cleartext for
   `localhost`, `127.0.0.1`, `10.0.2.2` **in the debug build only** — released
-  via a debug-specific manifest merge or a debug resource; the LAN-cleartext
-  story for the *local backend* lives in the Step 2 transport, not here).
+  via a debug-specific manifest merge or a debug resource. As built this is
+  also the *final* shape: the Step 2 transport decision added no release
+  `domain-config`, because the local backend is reached over HTTPS through the
+  rider's TLS terminator — the shipped file's comment was corrected on
+  2026-09-09 to say so, and to say why no `domain-config` may be added).
   No INTERNET-adjacent permissions beyond `INTERNET`; no camera, no location.
 - **Build types/flavors:** `debug` (cloud base URL → dev harness
   `http://10.0.2.2:8765`; local-server default → `http://10.0.2.2:8000`;
   cleartext-localhost allowed) / `release` (cloud base URL → the production
-  host as a **build config field**, never a literal in code; no cleartext for
-  the cloud backend, ever). The base URLs are build fields (the iOS xcconfig
+  host as a **build config field**, never a literal in code; no cleartext on
+  either backend, ever — the local server's origin is rider-entered at pairing
+  and is not a build field). The base URLs are build fields (the iOS xcconfig
   precedent): two fields `WATTRACKER_CLOUD_SCHEME` + `WATTRACKER_CLOUD_HOST`
   (split because `//` can't be a whole config value cleanly) — same trick as
   `Config/Base.xcconfig`.
@@ -939,29 +993,35 @@ Port the iOS decisions, keeping the constants and their *names* in sync with
     is the durable half).
   - Revoked device: the middleware clears the session and the app will get
     redirects/401s → detect, show "device unpaired", clear local state.
-  - **Transport:** cloud traffic uses the strict-nsconfig HTTPS
-    `HttpURLConnection` path. The local server is plain HTTP on the rider's
-    LAN; rather than weakening the #194 cleartext rule (manifest `false`,
-    nsconfig loopback-only), `LocalClient` opens its own `java.net.Socket`
-    and speaks minimal HTTP/1.1 (request line, headers, `Content-Length` and
-    chunked decoding — both used by uvicorn). Cleartext is thereby opened only
-    to the host the rider explicitly typed, on their LAN, and the platform's
-    cleartext gate keeps covering every other connection. ~150 lines, unit-
-    tested against the real local server (request → status → JSON body), plus
-    the same no-secrets-in-logs rule. *If manual-HTTP proves a time sink,
-    fall back to a release `domain-config` allowlist for specific LAN
-    hostnames the rider builds with, and record the trade in the README — but
-    do not flip `usesCleartextTraffic` on app-wide in release.*
-    > [!CAUTION]
-    > **DECISION NEEDED before implementing this bullet (owner, next session).**
-    > The #193 review flagged that hand-rolling HTTP here defeats the platform
-    > cleartext gate by construction, adds ~150 lines of HTTP-parsing attack
-    > surface to a token-bearing LAN connection, and forfeits pooling /
-    > timeouts / redirects / proxy support. The review's preferred fix is a
-    > self-signed local cert pinned at pairing time (option (b) in the
-    > "Two decisions to settle before Step 2" callout in "What comes next") —
-    > strictly better than cleartext. Do not build the raw-socket path until
-    > this is resolved.
+  - **Transport: HTTPS for both backends, one code path.** Cloud and local
+    traffic both use `HttpURLConnection` over TLS against the strict release
+    `network_security_config.xml`. The local server is reached through whatever
+    TLS terminator the rider runs — `tailscale serve` or an ordinary reverse
+    proxy, both accepted (Resolved decisions → "Local backend transport") — so
+    from the app's side it is an ordinary HTTPS origin with an ordinary chain to
+    a system trust anchor, and the app has no way to tell which is in front.
+    There is no local-only transport left to write: **no `java.net.Socket`, no
+    hand-rolled HTTP/1.1, no `domain-config`, no pin set, no custom
+    `TrustManager` or `HostnameVerifier`.**
+    - **Flexible by construction: no hostname is baked in.** The rider types
+      the origin and the app accepts any `https://` host, name or port, so an
+      arbitrary proxy works without an app change. Nothing in the app, the
+      manifest or the NSC may name a domain — a strict base config already
+      permits every HTTPS host, and *that* is what buys the flexibility. Adding
+      a `domain-config` for a specific name would take it away.
+    - **Reject `http://` at the edge in release**, in URL validation (Step 3),
+      rather than letting the platform throw: a refused scheme must read as
+      "this backend needs https", not as an opaque network failure two screens
+      later.
+    - **Debug keeps its loopback and `10.0.2.2` cleartext exceptions**
+      (`src/debug/res/xml/network_security_config.xml`) for the emulator and
+      the cloud dev harness. That file stays in the `debug` source set so it
+      cannot ship; debug-only scaffolding is fine, shipped cleartext is not.
+    - Platform `HttpURLConnection` behaviour is now an asset rather than
+      something to re-implement: connection reuse, timeouts, redirects, chunked
+      decoding and proxy support all come from the SDK. Keep the cloud client's
+      no-secrets-in-logs rule — the local device token and the session cookie
+      are bearer secrets on this path too.
   - Read endpoints per the local API list; the adapter (Step 4) pins the
     shapes from `curl`-captured fixtures.
 
@@ -1015,9 +1075,13 @@ fallback; nothing sensitive in `SharedPreferences` dumps or `logcat`.
   reusable; a failed pairing keeps the same Keystore key so re-pairing after
   a revoked device is a clean re-registration, and the new credential binds
   the same public key, which is fine because the old one is gone).
-- **Local pairing screen:** server URL field (scheme/host/port validation;
-  `http` allowed here only — this is the LAN path; a prominent "not encrypted"
-  note) + device token pasted from the web UI (Instructions: "open the
+- **Local pairing screen:** server URL field — **`https://` required in
+  release**, with any host, name or port accepted and **no domain allowlist**
+  (the rider's front end can be called anything). Refuse `http://` with a message
+  that says the local backend needs a TLS front end and points at
+  `README.md:540-549`, not with a generic "invalid URL". Debug builds
+  additionally accept `http://` for loopback and `10.0.2.2`, matching the debug
+  NSC. Then the device token pasted from the web UI (Instructions: "open the
   wattracker web UI → Settings → pair a device, label it, copy the token — it
   is shown once"). Validate over the network (`POST /api/connector/session`
   returns 200 or 401 — unlike cloud, **this one can distinguish**: 401 =
@@ -1211,11 +1275,14 @@ inspection).
    against the full snapshot → in-app revoke (2xx → removed state; device
    listed with revoked flag in `GET /api/v1/devices`) and simulated
    server-side revocation (two 404 strikes → removed; one 404 does not).
-3. **Live, local:** `WATTRACKER_HOST=0.0.0.0 ./start.sh` → pair the phone
-   (emulator: `10.0.2.2:8000`) → all four screens → Revoke in the web UI →
-   session dies on next request → app shows unpaired. Also one physical-
-   device run over the LAN (real IP, not loopback) for the cleartext
-   transport.
+3. **Live, local:** `WATTRACKER_PUBLIC_HOSTS=10.0.2.2 ./start.sh` (loopback
+   bind unchanged) → pair the phone (emulator, debug build:
+   `http://10.0.2.2:8000`) → all four screens → Revoke in the web UI →
+   session dies on next request → app shows unpaired. Then the run that
+   actually exercises the transport decision: a **physical device against
+   `https://<the phone-facing hostname>`** through the TLS terminator on a
+   release-configured NSC, proving the whole local path works with cleartext
+   off and with a hostname the app has never seen before.
 4. **Orientation/idiom:** screenshots on `wt-phone` landscape, `wt-tablet`
    portrait + landscape (and rotated live) — the #193/#196–#198 Done
    criteria; the tablet-portrait correctness is the standing requirement.
