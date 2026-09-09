@@ -181,10 +181,18 @@ If the two disagree, GitHub wins and the queue is stale; say so.
    `cookie_secure`. The mechanism is identified — the session goes missing
    mid-test, `AuthMiddleware` 303s to `/welcome`, `TestClient` follows it, and
    the assertion reads a 200 of the wrong page. What is *not* established is
-   why the session goes missing. The most promising remaining lead is named in
-   the issue: the `_register()` helpers in the implicated test files discard
-   their response, so a silently-failing registration would produce exactly
-   this shape. Start there. Fully local, no hardware, no deployment.
+   why the session goes missing. **PR #261 (merged 2026-09-09, `9fb8169b`)
+   acted on the most promising lead** — the four implicated `_register()`
+   helpers now assert the 303 and probe an authenticated endpoint, so a lost
+   session fails as "registration did not leave an authenticated session"
+   instead of as a misleading assertion three lines later. It also stopped an
+   exported `WATTRACKER_COOKIE_SECURE` breaking the suite (85 failed before,
+   107 passed after). **That was diagnostic only and #249 is still open.** The
+   next step is to run full suites until an instance fires and read what the
+   new assertion says — the instrumentation is in place, the root cause is
+   not. 37 other files still have `_register` helpers that discard their
+   response; sweep them once the cause is known, not before. Fully local, no
+   hardware, no deployment.
 2. **#163 — iOS Calendar and Volume screens. In flight as PR #256.** Reviewed
    2026-09-09; one correctness bug to fix (`VolumeData.previousWeeks` compares
    a full current window against a clamped prior one, so `change()` reports
@@ -227,6 +235,11 @@ that used to point here were removed on 2026-09-09 for that reason.
 #102 and is a measurement of a live deployment, not code. **#217** needs a
 real deployment; its body's claims about `containerized` being parked and
 `Dockerfile.cloud` never being built are both stale.
+
+4. **#264 — one device-validation procedure for iOS and Android.** Unassigned
+   and cross-cutting: the harness, both clients, and the validation doc.
+   Android has no on-device path at all today. Ask before taking it — it
+   spans both epics and its Android half is taksmon's territory.
 
 **The Android epic (#192-#199, plus #259 and #260) is taksmon's** by GitHub
 assignee and is not on this queue.
