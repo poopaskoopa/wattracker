@@ -4,9 +4,9 @@
     Both backends are HTTPS in every build type, always.
 
     The local desktop backend is reached through whatever TLS terminator the
-    rider runs -- tailscale serve or an ordinary reverse proxy, both accepted
-    (owner decision, #192/#260) -- so it needs no exception here and Step 2
-    adds none. This file is final, not provisional.
+    rider runs (tailscale serve or an ordinary reverse proxy, both accepted;
+    owner decision, #192/#260), so it needs no exception here and Step 2 adds
+    none. This file is final, not provisional.
 
     Do not add a domain-config to this file. A strict base-config already
     permits every HTTPS host, which is exactly what lets the rider point the
