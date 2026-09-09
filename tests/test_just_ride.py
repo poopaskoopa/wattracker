@@ -32,7 +32,18 @@ def client():
 
 
 def _register(client, username="rider"):
-    client.post("/register", data={"username": username, "password": "password123"})
+    response = client.post(
+        "/register",
+        data={"username": username, "password": "password123"},
+        follow_redirects=False,
+    )
+    assert response.status_code == 303
+    assert response.headers.get("location") == "/"
+    session_probe = client.get("/api/scan/status", follow_redirects=False)
+    assert session_probe.status_code == 200, (
+        "registration did not leave an authenticated session: "
+        f"{session_probe.status_code} {session_probe.headers.get('location')}"
+    )
     return db.get_user_by_username(username)["id"]
 
 
@@ -307,9 +318,12 @@ def test_description_discloses_the_inserted_zone2_base(client, kind):
     reference = build_workout(kind, minutes)
     assert absorb_long_cooldown(reference) == 0
 
-    data = client.get(
-        f"/ride/workout/preview?type={kind}&minutes={minutes}"
-    ).json()
+    response = client.get(
+        f"/ride/workout/preview?type={kind}&minutes={minutes}",
+        follow_redirects=False,
+    )
+    assert response.status_code == 200
+    data = response.json()
     if "Zone 2 base" in reference.description:
         assert "Zone 2 base" in data["description"], (
             f"{kind} @{minutes}: {data['description']!r}"

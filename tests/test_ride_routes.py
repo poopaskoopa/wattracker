@@ -24,7 +24,18 @@ def client():
 
 
 def _register(client, username="rider"):
-    client.post("/register", data={"username": username, "password": "password123"})
+    response = client.post(
+        "/register",
+        data={"username": username, "password": "password123"},
+        follow_redirects=False,
+    )
+    assert response.status_code == 303
+    assert response.headers.get("location") == "/"
+    session_probe = client.get("/api/scan/status", follow_redirects=False)
+    assert session_probe.status_code == 200, (
+        "registration did not leave an authenticated session: "
+        f"{session_probe.status_code} {session_probe.headers.get('location')}"
+    )
 
 
 def _receive_after_workout(ws):
@@ -190,7 +201,9 @@ def test_ride_page_deep_link_includes_workout_outside_upcoming_cap(client):
     ]
     selected_id = workout_ids[-1]
 
-    r = client.get(f"/ride?workout_id={selected_id}")
+    r = client.get(
+        f"/ride?workout_id={selected_id}", follow_redirects=False
+    )
 
     assert r.status_code == 200
     assert r.text.count(f'<option value="{selected_id}"') == 1

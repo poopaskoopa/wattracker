@@ -34,8 +34,18 @@ def client():
 
 
 def _register(client, username="rider"):
-    response = client.post("/register", data={"username": username, "password": "password123"})
-    assert response.status_code == 200
+    response = client.post(
+        "/register",
+        data={"username": username, "password": "password123"},
+        follow_redirects=False,
+    )
+    assert response.status_code == 303
+    assert response.headers.get("location") == "/"
+    session_probe = client.get("/api/scan/status", follow_redirects=False)
+    assert session_probe.status_code == 200, (
+        "registration did not leave an authenticated session: "
+        f"{session_probe.status_code} {session_probe.headers.get('location')}"
+    )
     return db.get_user_by_username(username)["id"]
 
 
@@ -684,7 +694,9 @@ def test_completion_no_profile_sets_flag_and_saves_settings(client):
 
 def test_setup_timezone_can_be_confirmed_and_is_stored(client):
     uid = _register(client)
-    page = client.get("/setup").text
+    page_response = client.get("/setup", follow_redirects=False)
+    assert page_response.status_code == 200
+    page = page_response.text
 
     assert '<select id="setup-timezone" name="timezone" required' in page
     assert "Intl.DateTimeFormat().resolvedOptions().timeZone" in page
@@ -693,7 +705,7 @@ def test_setup_timezone_can_be_confirmed_and_is_stored(client):
     response = client.post("/setup/complete", data={
         "weight_kg": "72.5", "ftp_choice": "manual", "manual_ftp": "250",
         "zwiftpower": "no", "timezone": "America/New_York",
-    })
+    }, follow_redirects=False)
 
     assert response.status_code == 200
     assert db.onboarding_complete(uid)
