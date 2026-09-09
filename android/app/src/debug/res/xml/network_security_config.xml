@@ -1,11 +1,20 @@
 <?xml version="1.0" encoding="utf-8"?>
 <!--
     Debug build only (this resource of the same name overrides the strict
-    one in main/). Permits cleartext to the host's loopback as seen from the
-    emulator: 10.0.2.2 is the emulator's alias for the host's loopback, so
-    the cloud dev harness (http://10.0.2.2:8765) and a local server running on
-    the machine under test can be reached during development. Everything else
-    stays strict, and the release build never sees this file.
+    one in main/). Permits cleartext to the host's loopback, by both routes
+    that reach it during development:
+
+      10.0.2.2  is the emulator's NAT alias for the host's loopback, so the
+                cloud dev harness (http://10.0.2.2:8765) and a local server
+                on its default 127.0.0.1 bind are reachable as they are.
+      localhost / 127.0.0.1
+                cover a tethered physical device after
+                "adb reverse tcp:8765 tcp:8765", which maps the phone's own
+                loopback to the host's over USB.
+
+    Neither route needs a non-loopback server bind, and no LAN exposure is
+    involved in either. Everything else stays strict, and the release build
+    never sees this file.
 -->
 <network-security-config>
     <base-config cleartextTrafficPermitted="false" />
