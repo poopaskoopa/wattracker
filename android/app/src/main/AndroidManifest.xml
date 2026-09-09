@@ -4,7 +4,9 @@
 
     <!--
         The only permission the app needs, now or later: it talks to the cloud
-        (HTTPS) and, on the rider's own LAN, to the local desktop server.
+        and to the local desktop server, both over HTTPS — the local one behind
+        whatever TLS terminator the rider runs, tailscale serve or an ordinary
+        reverse proxy (owner decision, #192/#260).
         No camera, no location, nothing else.
     -->
     <uses-permission android:name="android.permission.INTERNET" />
