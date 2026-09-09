@@ -124,6 +124,15 @@ apart:**
 - **An ordinary reverse proxy** — nginx, Caddy, anything that terminates TLS
   with a certificate your phone already trusts. No account, no third party.
 
+**Whichever you pick, it must not be publicly reachable.** A tailnet, a
+LAN-only bind, or a VPN all qualify; an internet-facing proxy does not. This is
+not only about transport secrecy: the server's `127.0.0.1` default is what
+keeps the desktop UI unreachable by anyone who is not at the keyboard, and **a
+reverse proxy defeats that even while the server stays bound to loopback,
+because the proxy is what accepts the connection.** `/login` and the rest of
+the UI would then be internet-facing, against auth that was never designed for
+it. Terminate TLS somewhere only your own devices can dial.
+
 Pick either. The server itself keeps binding loopback and speaks plain http to
 the co-located terminator, so **no bind variable changes**: `127.0.0.1:8000` is
 what it dials, and that is a loopback connection.
@@ -173,6 +182,24 @@ python -m wattracker
 
 Never point an emulator at `127.0.0.1` — that is the emulator's own loopback.
 The debug config lives in `src/debug/res/xml/`, so it cannot ship.
+
+### Debug: a physical phone talks to loopback too, over USB
+
+A tethered device needs no wider bind and no TLS terminator either. `adb
+reverse` maps the phone's own loopback to the host's:
+
+```
+adb reverse tcp:8765 tcp:8765
+```
+
+Then point the app at `http://localhost:8765` — already permitted by the debug
+network security config above, so there is nothing to change. Set
+`WATTRACKER_PUBLIC_HOSTS=localhost` for the Host allowlist and leave the server
+on its default `127.0.0.1` bind.
+
+This is the reason the Android dev loop never wants `--lan` or
+`WATTRACKER_HOST=0.0.0.0`. iOS binds every interface only because it has no
+`adb reverse` equivalent; do not copy that posture here.
 
 ## Dependencies
 
