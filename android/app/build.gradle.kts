@@ -3,6 +3,13 @@ plugins {
     alias(libs.plugins.kotlin.compose)
 }
 
+// The release cloud authority lives here, once. Both the buildConfigField that
+// ships it and the guard that refuses to ship it read this same val, so the
+// guard cannot be silently disabled by editing one and forgetting the other
+// (#260). Replacing this with the real host when #102 lands is the only edit
+// needed to retire the guard.
+val releaseCloudAuthority = "cloud.wattracker.example"
+
 android {
     namespace = "com.wattracker.android"
     compileSdk {
@@ -41,7 +48,7 @@ android {
             // Placeholder host until the deployment exists (#102); the field,
             // not code, is where the production host lives.
             buildConfigField("String", "WATTRACKER_CLOUD_SCHEME", "\"https\"")
-            buildConfigField("String", "WATTRACKER_CLOUD_AUTHORITY", "\"cloud.wattracker.example\"")
+            buildConfigField("String", "WATTRACKER_CLOUD_AUTHORITY", "\"$releaseCloudAuthority\"")
         }
     }
     compileOptions {
@@ -55,9 +62,9 @@ android {
 }
 
 // Guard: refuse release builds with the placeholder host until the #102
-// hosting decision lands.
-val releaseAuthority = "cloud.wattracker.example"
-if (releaseAuthority.endsWith(".example") && !project.hasProperty("allowPlaceholderHost")) {
+// hosting decision lands. Reads the same val the release buildConfigField
+// ships -- see the comment on it above.
+if (releaseCloudAuthority.endsWith(".example") && !project.hasProperty("allowPlaceholderHost")) {
     afterEvaluate {
         tasks.named("assembleRelease") {
             doFirst {
