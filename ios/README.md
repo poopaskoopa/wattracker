@@ -2,8 +2,8 @@
 
 A SwiftUI app for iPhone and iPad. It is the app shell from issue #158: five
 destinations -- Dashboard, Activities, Calendar, Volume, Settings -- in a
-navigation structure that adapts to the idiom, with every screen still a stub.
-No screen reads any data yet; filling them in is #161, #162 and #163.
+navigation structure that adapts to the idiom. Dashboard, Calendar and Volume
+read the shared cloud session; Activities remains the #162 stub.
 
 Folded inside it is the walking skeleton from issue #171, which does read real
 data: **Settings > Debug: FTP round-trip** renders one number, the rider's FTP,
@@ -15,8 +15,8 @@ end to end; #161 can retire it once the Dashboard reads the same data properly.
 Underneath both sits the signed API client from issue #159: Secure Enclave
 keys, a coalesced reader-token refresh, `Codable` models for every published
 kind, an offline cache keyed by revision, and a "this device was removed" state
-that clears it. No screen consumes it yet — that is #161, #162 and #163 — but
-it is finished, tested and documented below.
+that clears it. The read screens consume the same cache and session, so an
+offline launch renders last-known data with its sync time.
 
 No third-party dependencies. No package resolution step. `URLSession`,
 `CryptoKit`, `Security`, SwiftUI.
@@ -43,10 +43,10 @@ ios/WatTracker/
       Destination.swift          the five destinations, the whole nav model
       SideRail.swift             the iPhone-landscape leading icon rail
     Screens/
-      DashboardScreen.swift      stub - #161
+      DashboardScreen.swift      dashboard metrics and charts - #161
       ActivitiesScreen.swift     stub - #162
-      CalendarScreen.swift       stub - #163
-      VolumeScreen.swift         stub - #163
+      CalendarScreen.swift       month grid, day detail and ride detail - #163
+      VolumeScreen.swift          weekly chart and range summaries - #163
       SettingsScreen.swift       the pairing, the device list, removal, #171
       PairingScreen.swift        type the code or scan the QR - #234
       PairingFailureMessage.swift  one message for wrong/expired/already used
@@ -67,12 +67,14 @@ ios/WatTracker/
       DeviceKey.swift            P-256 key: Secure Enclave, or a gated fallback
       JSONValue.swift            what carries a kind this build cannot model
       SnapshotCache.swift        last-known data, protected and unbacked-up
+      MobileScreenData.swift     calendar aggregation and volume windows
   WatTrackerTests/
     CanonicalRequestVectorTests.swift
     CloudModelsTests.swift       the envelope, and the two decoding rules
     CloudSessionTests.swift      expiry, coalescing, 429, revocation, offline
     SessionGateTests.swift       the gate's states and the transitions between
     PairingTests.swift           the code's shape, and one message per refusal
+    MobileScreenDataTests.swift  calendar chunks, months and volume windows
     CloudTestSupport.swift       a scripted transport and a clock tests move
     SnapshotCacheTests.swift     protection class, backup exclusion, clearing
 ```
