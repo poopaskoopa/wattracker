@@ -17,11 +17,11 @@ resolve the same way: **the local backend is reached over HTTPS, terminated by
 whatever front end the rider runs.** `tailscale serve` and an ordinary reverse
 proxy (nginx, Caddy) are equally accepted — the tailnet was the *mechanism*
 that comment picked, not the property it argued for, and either satisfies all
-three properties it actually mandated (strict release NSC, no raw-socket
-transport, loopback bind preserved). Widening it to any TLS terminator costs
-nothing and means a rider without a Tailscale account is not required to get
-one. The app speaks TLS to both backends and never cleartext in a release
-build. Full rationale in the Resolved decisions table ("Local backend
+four properties it actually mandated (strict release NSC, no raw-socket
+transport, loopback bind preserved, **and the terminator not publicly
+reachable**). Widening it to any TLS terminator costs nothing and means a rider
+without a Tailscale account is not required to get one. The app speaks TLS to
+both backends and never cleartext in a release build. Full rationale in the Resolved decisions table ("Local backend
 transport"); spec in 2.3. The raw-socket path and the pinned self-signed cert
 are both dead — do not build either. The Android CI decision is now answered
 too (hosted `ubuntu-latest`, #259).
@@ -72,7 +72,7 @@ since the 2026-09-01 draft:
 |---|---|
 | `.fit` file uploads | **Dropped from scope** (2026-09-01). No assigned issue covers it; the cloud API has no `.fit` route (sync plane takes parsed objects only) and the local server's `POST /activities/upload` predates this work. Revisit later as a new issue. |
 | Architecture | **Dual backend.** (1) Cloud read plane as #194–#198 specify (pairing code → Keystore P-256 → signed context refresh → `GET /api/v1/context/*` with the bearer reader context). (2) Local desktop server via the **connector model**: device token paired in the web UI Settings → session → local JSON API (`/api/state`, `/api/activities`, …), reached **over HTTPS through the rider's own reverse proxy** (see the transport row below). Screens read through one common `ReadModel` interface with one adapter per backend. |
-| Local backend transport | **HTTPS only, terminated by whatever front end the rider runs** (owner, 2026-09-09). The requirement is TLS in front of the local server — **`tailscale serve` and an ordinary reverse proxy (nginx, Caddy) are both accepted**, and the app cannot tell them apart: it sees an HTTPS origin with a chain to a system trust anchor. The tailnet stays a valid deployment for anyone who wants it; it is no longer a *requirement*, because it was the mechanism the #192 comment (2026-09-08) picked, not the property it argued for. In either case the desktop server keeps its loopback bind and speaks plain http to a co-located terminator. The app never speaks cleartext in a release build: `usesCleartextTraffic="false"`, release `network_security_config.xml` strict, **no `domain-config`, no pinning, no custom `TrustManager`**. **No hostname is baked in anywhere** — the rider types the origin, so any front end, name, port or vhost works. This keeps all three properties #192's comment mandated (strict release NSC, no raw-socket transport, loopback bind preserved) while requiring no third-party account of a rider who does not already have one. Supersedes both options the #257 review put up: the raw-socket cleartext path and the self-signed cert pinned at pairing. |
+| Local backend transport | **HTTPS only, terminated by whatever front end the rider runs** (owner, 2026-09-09). The requirement is TLS in front of the local server — **`tailscale serve` and an ordinary reverse proxy (nginx, Caddy) are both accepted**, and the app cannot tell them apart: it sees an HTTPS origin with a chain to a system trust anchor. The tailnet stays a valid deployment for anyone who wants it; it is no longer a *requirement*, because it was the mechanism the #192 comment (2026-09-08) picked, not the property it argued for. In either case the desktop server keeps its loopback bind and speaks plain http to a co-located terminator. The app never speaks cleartext in a release build: `usesCleartextTraffic="false"`, release `network_security_config.xml` strict, **no `domain-config`, no pinning, no custom `TrustManager`**. **No hostname is baked in anywhere** — the rider types the origin, so any front end, name, port or vhost works. **The terminator must also not be publicly reachable** (owner, 2026-09-09): `tailscale serve`, nginx or Caddy on a LAN-only bind, or a VPN all qualify; an internet-facing proxy does not. The tailnet was providing that property silently, and widening to any terminator would have dropped it — an nginx satisfies the other three while bound to `0.0.0.0` and port-forwarded. It is load-bearing beyond transport secrecy: per the reasoning on #132 item 4, the `WATTRACKER_HOST` default of `127.0.0.1` is what keeps the first-account land grab unreachable, and **a reverse proxy defeats that even with the server still bound to loopback, because the proxy is what accepts the connection**. The land-grab window itself is narrow (`/welcome` gates on `_first_run()`, so it cannot mint a second account), but `/login` and the whole desktop UI would be internet-facing, and none of the app's auth was designed against an internet-facing threat model. The server keeps binding loopback and `WATTRACKER_ALLOW_NON_LOOPBACK` stays unset. This keeps all four properties #192's comment mandated (strict release NSC, no raw-socket transport, loopback bind preserved, terminator not publicly reachable) while requiring no third-party account of a rider who does not already have one. Supersedes both options the #257 review put up: the raw-socket cleartext path and the self-signed cert pinned at pairing. |
 | minSdk / targetSdk | minSdk **30** (Android 11, owner's floor; StrongBox API is 28+, Keystore EC P-256 is long stable). targetSdk **36** — Google Play has required API 36+ for new apps and updates **since 2026-08-31** (verify current policy at implementation time). |
 | Release CI runner (#199) | **Hosted `ubuntu-latest`** (owner, on #257; supersedes the earlier "deferred, plan for `macos-ci`" answer, which predated the repo going public). Standard hosted runners are unmetered on a public repo and `cloud.yml` already runs `bicep-validation` and `containerized` on `ubuntu-latest`. `macos-release.yml`'s `if: ${{ false }}` and any note claiming Actions are blocked at the account level are stale. The build/unit-test job is tracked as **#259**, with an untested starting workflow in the #257 thread; the two gotchas it encodes are `compileSdk 37` (not on the runner image — accept SDK licences so AGP can fetch it) and `gradle/gradle-daemon-jvm.properties` pinning `toolchainVersion=25` (pin it with `setup-java` or Gradle re-downloads a JDK from foojay every run). Do **not** copy `cloud.yml`'s fork gate: it exists for a persistent physical runner, and a hosted ephemeral Android job can safely cover fork PRs. |
 | HTTP client | `HttpURLConnection` (plain, no deps). **Note:** issue #193 names "HttpURLConnection or `java.net.http`", but `java.net.http.HttpClient` does not exist in the Android SDK (JDK-11 API, never ported) — the choice is unambiguous. |
@@ -345,8 +345,15 @@ code; track, don't copy, what is on `main`.)
   alias for the host's loopback). `--lan`'s address detection is written for
   macOS (`ifconfig`, BSD `route`, `en*` preference); on this Linux box it
   degrades to "first non-tunnel private-IPv4 interface", which works but is
-  unmeasured — for a physical-device run prefer `--host 0.0.0.0` and an
-  explicit address in the app, or verify `--lan` once and record the result.
+  unmeasured. **For a physical device, do not use `--lan` or `--host 0.0.0.0`
+  either** — run `adb reverse tcp:8765 tcp:8765` over USB, which maps the
+  phone's own loopback to the host's, and point the app at
+  `http://localhost:8765`. The debug `network_security_config.xml` already
+  permits `localhost` and `127.0.0.1`, so this needs no config change and no
+  LAN exposure (owner, 2026-09-09, correcting an earlier claim that a physical
+  phone could reach none of the permitted hosts). iOS binds every interface
+  only because it has no `adb reverse` equivalent; do not adopt `0.0.0.0` here
+  by symmetry with it.
 - **Dependency:** everything in this plan that assumes the full-snapshot
   harness (Step 2's Done, validation item 2) is gated on PR #240 merging.
   Until then the harness on `main` publishes only a `profile` object —
@@ -463,9 +470,12 @@ avdmanager create avd -n wt-tablet -k "system-images;google_apis;x86_64;36" -d p
   `\.\.venv\Scripts\python.exe scripts\walking_skeleton_server.py --user-id
   <id>` — loopback by default, in-memory store, full snapshot published,
   prints pairing code(s). No harness changes in this epic's branches. The
-  `--lan` auto-detect is written for macOS and is untested on Windows, so for
-  a physical device use `--host 0.0.0.0` plus an explicit IP in the app (the
-  emulator needs no `--lan`; it reaches the host via `10.0.2.2`).
+  `--lan` auto-detect is written for macOS and is untested on Windows, but a
+  physical device needs neither it nor `--host 0.0.0.0`: run
+  `adb reverse tcp:8765 tcp:8765` over USB and point the app at
+  `http://localhost:8765`, which the debug `network_security_config.xml`
+  already permits (the emulator needs no `--lan` either; it reaches the host
+  via `10.0.2.2`). Keep the harness on its default loopback bind in both cases.
 
 ### 0.4 IDE agent: Android Studio 4 Agent mode + BYOK
 
@@ -648,11 +658,15 @@ pitfalls (do not re-derive) and the toolchain state on this machine.
   `MainActivity` renders `RootScreen`.
 - Root `.gitignore`: Android section added.
 - `android/README.md`: written (build/run, both AVDs, rail/drawer
-  rationale, dependency rule, BYOK pointer, `WATTRACKER_HOST=0.0.0.0` **and**
-  `WATTRACKER_ALLOW_NON_LOOPBACK=1` for the emulator path — the second var is
-  the gate `wattracker/config.py:server_host()` actually enforces, which the
-  0.3 note abbreviates). **Its "Measured on the AVDs" table is still
-  placeholder** — fill it in the device-verification pass.
+  rationale, dependency rule, BYOK pointer). **Corrected 2026-09-09:** it
+  originally called for `WATTRACKER_HOST=0.0.0.0` **and**
+  `WATTRACKER_ALLOW_NON_LOOPBACK=1` on the emulator path; the emulator needs
+  neither, because `10.0.2.2` is its NAT alias for the *host's* loopback. Only
+  a non-loopback bind needs `WATTRACKER_ALLOW_NON_LOOPBACK` — it is the gate
+  `wattracker/config.py:server_host()` actually enforces — and nothing in the
+  Android dev loop requires one now that a physical device uses `adb reverse`.
+  **Its "Measured on the AVDs" table is still placeholder** — fill it in the
+  device-verification pass.
 
 **API ground truth for this BOM (2026.02.01 → M3 1.4.0, foundation 1.10.4) —
 cost several compile cycles to find, verified against the resolved jars; do
@@ -859,9 +873,10 @@ colour is introduced by pairing (#195).
   `*.jks`/`*.keystore` (Step 8; `*.key`/`*.pem`/`*.p12` are already ignored).
 - **`android/README.md`:** how to open/build/run on phone + tablet AVD, the
   dependency rule, the orientation split and why, the two AVDs, the IDE-agent
-  setup pointer (BYOK key in IDE settings, never in the repo),
-  `WATTRACKER_HOST=0.0.0.0` for LAN use, and the measured large-screen
-  orientation findings from 0.2.
+  setup pointer (BYOK key in IDE settings, never in the repo), how each target
+  reaches the desktop server (emulator via `10.0.2.2`, physical device via
+  `adb reverse` — neither needs a non-loopback bind; see 0.3), and the measured
+  large-screen orientation findings from 0.2.
 
 **Done (per #193):** `./gradlew :app:assembleDebug` from a clean checkout
 (network only for Gradle/AndroidX); runs on the phone AVD (landscape rail,
