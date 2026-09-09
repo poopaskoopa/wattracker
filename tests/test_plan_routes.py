@@ -611,7 +611,11 @@ def test_stored_compliance_cannot_verify_oversized_linked_activity(
 
     assert not importer.plan_workout_completion_verified(uid, linked)
     assert not importer.save_workout_rpe(uid, "plan", workout_id, 10)
-    detail = client.get(f"/api/plan/workout/{workout_id}").json()
+    detail_response = client.get(
+        f"/api/plan/workout/{workout_id}", follow_redirects=False
+    )
+    assert detail_response.status_code == 200
+    detail = detail_response.json()
     assert detail["completion_verified"] is False
     assert detail["rpe_eligible"] is False
     assert client.post(

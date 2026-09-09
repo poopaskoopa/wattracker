@@ -318,9 +318,12 @@ def test_description_discloses_the_inserted_zone2_base(client, kind):
     reference = build_workout(kind, minutes)
     assert absorb_long_cooldown(reference) == 0
 
-    data = client.get(
-        f"/ride/workout/preview?type={kind}&minutes={minutes}"
-    ).json()
+    response = client.get(
+        f"/ride/workout/preview?type={kind}&minutes={minutes}",
+        follow_redirects=False,
+    )
+    assert response.status_code == 200
+    data = response.json()
     if "Zone 2 base" in reference.description:
         assert "Zone 2 base" in data["description"], (
             f"{kind} @{minutes}: {data['description']!r}"

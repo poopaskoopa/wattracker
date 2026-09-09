@@ -694,7 +694,9 @@ def test_completion_no_profile_sets_flag_and_saves_settings(client):
 
 def test_setup_timezone_can_be_confirmed_and_is_stored(client):
     uid = _register(client)
-    page = client.get("/setup").text
+    page_response = client.get("/setup", follow_redirects=False)
+    assert page_response.status_code == 200
+    page = page_response.text
 
     assert '<select id="setup-timezone" name="timezone" required' in page
     assert "Intl.DateTimeFormat().resolvedOptions().timeZone" in page
@@ -703,7 +705,7 @@ def test_setup_timezone_can_be_confirmed_and_is_stored(client):
     response = client.post("/setup/complete", data={
         "weight_kg": "72.5", "ftp_choice": "manual", "manual_ftp": "250",
         "zwiftpower": "no", "timezone": "America/New_York",
-    })
+    }, follow_redirects=False)
 
     assert response.status_code == 200
     assert db.onboarding_complete(uid)

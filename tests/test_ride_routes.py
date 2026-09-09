@@ -201,7 +201,9 @@ def test_ride_page_deep_link_includes_workout_outside_upcoming_cap(client):
     ]
     selected_id = workout_ids[-1]
 
-    r = client.get(f"/ride?workout_id={selected_id}")
+    r = client.get(
+        f"/ride?workout_id={selected_id}", follow_redirects=False
+    )
 
     assert r.status_code == 200
     assert r.text.count(f'<option value="{selected_id}"') == 1
