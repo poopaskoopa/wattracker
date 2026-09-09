@@ -133,6 +133,9 @@ def isolated_env(tmp_path, monkeypatch):
         # under test.
         "WATTRACKER_PUBLIC_HOST",
         "WATTRACKER_PUBLIC_SCHEME",
+        # Tests use plain HTTP; an exported secure-cookie switch would make
+        # every authenticated TestClient request look signed out.
+        "WATTRACKER_COOKIE_SECURE",
         # LLM settings: a developer's real keys/endpoints must never leak in
         # and call a live provider from a test.
         "API_KEY",
