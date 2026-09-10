@@ -136,6 +136,30 @@ def isolated_env(tmp_path, monkeypatch):
         # Tests use plain HTTP; an exported secure-cookie switch would make
         # every authenticated TestClient request look signed out.
         "WATTRACKER_COOKIE_SECURE",
+        # The plural sibling of WATTRACKER_PUBLIC_HOST above, feeding the same
+        # allowlist through config.public_hosts(). It was missed when the
+        # singular was added, which is the same shape of gap as
+        # WATTRACKER_COOKIE_SECURE: an exported value silently widens the Host
+        # allowlist for every test in the run.
+        "WATTRACKER_PUBLIC_HOSTS",
+        # Bind posture. The default is loopback-only and several tests assert
+        # that a non-loopback host is REFUSED; an exported opt-out turns those
+        # into passing no-ops, which is the worst failure mode a security test
+        # has.
+        "WATTRACKER_ALLOW_NON_LOOPBACK",
+        "WATTRACKER_HOST",
+        "WATTRACKER_PORT",
+        # Backend selection (wattracker.backend). Exported as "cloud" this
+        # points the suite at a different backend than the one under test.
+        "WATTRACKER_MODE",
+        # Cloud plane configuration. The tests that exercise it set these
+        # deliberately; ambient values from a developer's deployment work must
+        # not leak into the ones that do not.
+        "WATTRACKER_CLOUD_ENABLED",
+        "WATTRACKER_CLOUD_HOST",
+        "WATTRACKER_CLOUD_PORT",
+        "WATTRACKER_CLOUD_PLANE",
+        "WATTRACKER_ALLOWED_ORIGINS",
         # LLM settings: a developer's real keys/endpoints must never leak in
         # and call a live provider from a test.
         "API_KEY",
