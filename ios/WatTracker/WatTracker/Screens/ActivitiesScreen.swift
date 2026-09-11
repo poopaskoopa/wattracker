@@ -186,7 +186,7 @@ private struct RideMetric: View {
 
 private struct ActivityDetailScreen: View {
     let ride: RideSummary
-    let session: CloudSession
+    let session: any ReadSession
     @State private var detail: ActivityDetail?
     @State private var streams: ActivityStreams?
     @State private var detailError: String?

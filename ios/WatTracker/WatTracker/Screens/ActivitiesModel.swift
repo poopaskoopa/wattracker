@@ -41,7 +41,7 @@ final class ActivitiesModel {
     /// rides. The signing-key failure the old initialiser reported as
     /// `startupError` is the gate's to report now -- it never gets as far as
     /// showing this screen.
-    func refresh(session: CloudSession?) async {
+    func refresh(session: (any ReadSession)?) async {
         // No session means the gate has not produced one: no credential yet,
         // or the signing key could not be read. Neither is a ride list.
         guard let session else {

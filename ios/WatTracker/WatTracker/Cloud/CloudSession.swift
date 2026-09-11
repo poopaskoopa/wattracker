@@ -52,6 +52,20 @@ struct CloudSnapshot: Sendable, Equatable {
     let asOf: Date
 }
 
+/// A backend-neutral read session consumed by the screen models.
+///
+/// The cache is deliberately part of the seam: screens can paint the same
+/// `CloudSnapshot` before a backend request, regardless of which adapter owns
+/// the session. `CloudSession` remains the cloud implementation and keeps its
+/// pairing, signing, and revocation API for the shell and Settings screen.
+protocol ReadSession: Sendable {
+    var deviceState: CloudSession.DeviceState { get async }
+    nonisolated func cached(_ route: CloudRoute) -> CloudSnapshot?
+    func load(_ route: CloudRoute) async throws -> CloudSnapshot
+    func activityDetail(_ activityID: Int) async throws -> ActivityDetail
+    func activityStreams(_ activityID: Int) async throws -> ActivityStreams
+}
+
 /// The token lifecycle, the offline cache, and the one place that decides this
 /// device is gone.
 ///
@@ -61,7 +75,7 @@ struct CloudSnapshot: Sendable, Equatable {
 /// Actor reentrancy is what makes the coalescing work -- callers that arrive
 /// while a refresh is suspended see the in-flight `Task` and await *it*
 /// instead of starting a second signed refresh.
-actor CloudSession {
+actor CloudSession: ReadSession {
     /// `READER_CONTEXT_TTL_SECONDS` in `security.py`.  Used only where the
     /// server did not say; the response's own `expires_in` always wins.
     static let defaultContextLifetime: TimeInterval = 300
@@ -412,7 +426,7 @@ actor CloudSession {
     /// rather than an object that is genuinely absent.
     private func activityObject(
         objectID: String,
-        read: (CloudClient, String, PairedDevice) async throws -> CloudItem
+        read: (ReadClient, String, PairedDevice) async throws -> CloudItem
     ) async throws -> CloudItem {
         if state == .removed { throw Failure.deviceRemoved }
         guard let device else { throw Failure.notPaired }

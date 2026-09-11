@@ -74,7 +74,7 @@ final class VolumeScreenModel {
 
     private var started = false
 
-    func start(session: CloudSession?) async {
+    func start(session: (any ReadSession)?) async {
         guard !started else { return }
         started = true
 
