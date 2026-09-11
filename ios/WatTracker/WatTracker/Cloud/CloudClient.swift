@@ -1,6 +1,25 @@
 import Foundation
 import Security
 
+/// The backend operations used by the read session. Authentication and
+/// lifecycle remain outside this interface so another backend can provide the
+/// same read objects without adopting the cloud signing protocol.
+protocol ReadClient: Sendable {
+    func collection(
+        _ route: CloudRoute,
+        readerContext: String,
+        device: PairedDevice,
+        since: Int?,
+        cursor: String?
+    ) async throws -> CollectionResponse
+    func activityDetail(
+        activityID: Int, readerContext: String, device: PairedDevice
+    ) async throws -> CloudItem
+    func activityStreams(
+        activityID: Int, readerContext: String, device: PairedDevice
+    ) async throws -> CloudItem
+}
+
 /// One request each, typed, with nothing remembered between them.
 ///
 /// Pair once with a code the rider's desktop minted, trade the durable device
@@ -9,11 +28,11 @@ import Security
 /// the exercise.
 ///
 /// This layer deliberately holds no state: no token, no cache, no retry, no
-/// idea what time the last request failed at.  All of that is `CloudSession`,
+/// idea what time the last request failed at. All of that is `CloudSession`,
 /// and keeping the two apart is what lets the lifecycle be tested against
 /// scripted responses without a network and the requests be read without the
 /// lifecycle in the way.
-struct CloudClient: Sendable {
+struct CloudClient: ReadClient, Sendable {
     let baseURL: URL
     let signer: DeviceSigner
     var transport: CloudTransport = URLSessionCloudTransport.shared

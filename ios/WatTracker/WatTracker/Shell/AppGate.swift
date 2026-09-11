@@ -1,7 +1,7 @@
 import SwiftUI
 
-private struct CloudSessionKey: EnvironmentKey {
-    static let defaultValue: CloudSession? = nil
+private struct ReadSessionKey: EnvironmentKey {
+    static let defaultValue: (any ReadSession)? = nil
 }
 
 extension EnvironmentValues {
@@ -13,9 +13,9 @@ extension EnvironmentValues {
     /// finds it nil should render its empty state, not build a session of its
     /// own -- a second session means a second token, a second cache writer and
     /// a pairing one half of the app cannot see.
-    var cloudSession: CloudSession? {
-        get { self[CloudSessionKey.self] }
-        set { self[CloudSessionKey.self] = newValue }
+    var cloudSession: (any ReadSession)? {
+        get { self[ReadSessionKey.self] }
+        set { self[ReadSessionKey.self] = newValue }
     }
 }
 

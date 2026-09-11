@@ -90,7 +90,7 @@ final class DashboardModel {
     /// credential means a sign-out or a revoke in Settings leaves this screen
     /// holding one that still believes it is paired, rendering a signed-out
     /// rider's numbers until something forces a reload.
-    func start(session: CloudSession?) async {
+    func start(session: (any ReadSession)?) async {
         guard !started else { return }
         started = true
 
