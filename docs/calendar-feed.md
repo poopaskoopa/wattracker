@@ -77,6 +77,15 @@ wattracker, if you want it to survive a reboot.
 gives you. Only set it (to `http`) if you are fronting the app with something
 that does not terminate TLS.
 
+When an HTTPS front end is in use, set `WATTRACKER_COOKIE_SECURE=1` in the
+environment that launches wattracker. Keep it with the launch command or
+service configuration rather than exporting it in a developer shell, so test
+processes do not inherit the production cookie policy:
+
+```sh
+WATTRACKER_COOKIE_SECURE=1 WATTRACKER_PUBLIC_HOST=macbook.tail1a2b3c.ts.net ./start.sh
+```
+
 **A malformed value stops the server from starting**, with a `ValueError` in the
 log naming the variable. That is deliberate — this value is appended to a
 security allowlist, so it fails closed rather than guessing. It accepts a plain
@@ -160,10 +169,11 @@ ACLs: anyone on your tailnet can reach the whole app, not just the feed. If you
 share your tailnet with other people or devices, tighten the ACLs.
 
 **Do not point a public DNS name at this.** wattracker is a single-user local
-server. Its CSRF protection is a same-origin check, the session cookie is not
-`Secure`, and there is no rate limiting beyond the login form. It is not built
-to sit on the open internet, and `tailscale funnel` would put it there — use
-`tailscale serve`, which does not.
+server. Its CSRF protection is a same-origin check, and there is no rate
+limiting beyond the login form. With the HTTPS setup above, the session cookie
+is `Secure`; a plain-HTTP front end must not be used for the iOS local backend.
+It is not built to sit on the open internet, and `tailscale funnel` would put
+it there — use `tailscale serve`, which does not.
 
 ---
 

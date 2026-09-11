@@ -4075,14 +4075,13 @@ def create_app() -> FastAPI:
             is_head,
         )
 
-    @app.get("/calendar", response_class=HTMLResponse)
-    def calendar_view(
-        request: Request,
+    def _calendar_data(
+        uid: int,
         year: Optional[int] = None,
         month: Optional[int] = None,
         adjustment_id: Optional[int] = None,
     ):
-        uid = _uid(request)
+        """Build the calendar's JSON-safe month model for HTML and mobile reads."""
         today = utc_today()
         y = year or today.year
         m = month or today.month
@@ -4093,26 +4092,17 @@ def create_app() -> FastAPI:
             y, m = y + 1, 1
 
         ooto_ranges = db.list_ooto_ranges(uid)
-        # Each row gets its matched ZwiftPower/local result (if the race has
-        # passed and one was found) attached under "result" - see
-        # races.match_result_for_race_date for why this is resolved live
-        # rather than stored on race_dates.
         stored_races = db.list_race_dates(uid)
         race_dates = races.attach_results_to_race_dates(uid, stored_races)
-        # The badge must show the priority the PLAN uses, not the one the row
-        # stores: an A race inside an earlier A race's taper is planned as a B
-        # race, and a calendar saying "A" next to a plan that tapers it as a B
-        # is exactly the confusion this describes away. Same resolution the plan
-        # summary uses - never a second copy of the rule.
         described = {d["id"]: d for d in planmod.race_priorities(stored_races)}
-        for r in race_dates:
-            d = described.get(r["id"])
-            if d is not None:
-                r["priority"] = d["priority"]        # EFFECTIVE
-                r["demoted"] = d["demoted"]
-                r["conflicts_with"] = d["conflicts_with"]
-                r["separation_days"] = d["separation_days"]
-        races_by_date = {r["date"]: r for r in race_dates}
+        for race in race_dates:
+            description = described.get(race["id"])
+            if description is not None:
+                race["priority"] = description["priority"]
+                race["demoted"] = description["demoted"]
+                race["conflicts_with"] = description["conflicts_with"]
+                race["separation_days"] = description["separation_days"]
+        races_by_date = {race["date"]: race for race in race_dates}
 
         def _in_ooto(date_iso: str) -> bool:
             return any(r["start_date"] <= date_iso <= r["end_date"]
@@ -4121,59 +4111,54 @@ def create_app() -> FastAPI:
         today_iso = today.isoformat()
         by_date: dict = {}
         activities_by_date: dict = {}
-        for w in db.plan_workouts_for_month(uid, y, m):
-            wd = dict(w)
-            adjustment_state = w.get("adjustment_state")
-            wd["adjustment_cancelled"] = adjustment_state in {
+        for workout in db.plan_workouts_for_month(uid, y, m):
+            value = dict(workout)
+            adjustment_state = workout.get("adjustment_state")
+            value["adjustment_cancelled"] = adjustment_state in {
                 "ooto_canceled", "displaced",
             }
-            wd["adjustment_replacement"] = adjustment_state in {
+            value["adjustment_replacement"] = adjustment_state in {
                 "rescheduled", "rebalanced",
             }
-            wd["skipped"] = (
-                _in_ooto(w["date"])
-                and not w.get("completed_activity_id")
+            value["skipped"] = (
+                _in_ooto(workout["date"])
+                and not workout.get("completed_activity_id")
             )
-            # Missed: a past-dated workout left uncompleted that wasn't an
-            # out-of-office skip (i.e. its day passed without completion).
-            wd["missed"] = (
-                w["date"] < today_iso
-                and not w.get("completed_activity_id")
-                and not wd["skipped"]
+            value["missed"] = (
+                workout["date"] < today_iso
+                and not workout.get("completed_activity_id")
+                and not value["skipped"]
             )
-            by_date.setdefault(w["date"], []).append(wd)
-        for w in db.standalone_workouts_for_month(uid, y, m):
-            wd = dict(w)
-            wd.update({
-                "date": w["scheduled_date"],
+            by_date.setdefault(workout["date"], []).append(value)
+        for workout in db.standalone_workouts_for_month(uid, y, m):
+            value = dict(workout)
+            value.update({
+                "date": workout["scheduled_date"],
                 "standalone": True,
                 "adapted": None,
                 "skipped": False,
                 "missed": (
-                    w["scheduled_date"] < today_iso
-                    and not w.get("completed_activity_id")
+                    workout["scheduled_date"] < today_iso
+                    and not workout.get("completed_activity_id")
                 ),
             })
-            by_date.setdefault(w["scheduled_date"], []).append(wd)
+            by_date.setdefault(workout["scheduled_date"], []).append(value)
         calendar_settings = db.get_user_settings(uid)
         for activity in db.activities_for_month_unlinked(uid, y, m):
-            activity = dict(activity)
-            activity_date = activity["start_time"][:10]
-            started = parse_naive(activity.get("start_time"))
+            value = dict(activity)
+            activity_date = value["start_time"][:10]
+            started = parse_naive(value.get("start_time"))
             if started is not None:
                 activity_date = to_user_timezone(
                     started, calendar_settings.get("timezone")
                 ).date().isoformat()
-            activity.update({
+            value.update({
                 "date": activity_date,
                 "activity": True,
-                "url": f"/activity/{activity['id']}",
+                "url": f"/activity/{value['id']}",
             })
-            activities_by_date.setdefault(activity["date"], []).append(activity)
+            activities_by_date.setdefault(activity_date, []).append(value)
 
-        # Which block of the active plan's arc each day belongs to, so a day
-        # cell can say "build" rather than leaving the rider to count weeks.
-        # Empty for a plan with no goal, which is every plan that predates them.
         active = db.get_active_plan(uid) if uid is not None else None
         adjustment = None
         if adjustment_id is not None:
@@ -4195,22 +4180,41 @@ def create_app() -> FastAPI:
         weeks = []
         for week in cal.monthdatescalendar(y, m):
             row = []
-            for d in week:
-                iso = d.isoformat()
-                row.append(
-                    {
-                        "date": iso,
-                        "day": d.day,
-                        "in_month": d.month == m,
-                        "ooto": _in_ooto(iso),
-                        "race": races_by_date.get(iso),
-                        "workouts": by_date.get(iso, []),
-                        "activities": activities_by_date.get(iso, []),
-                        "phase": phase_by_date.get(iso),
-                    }
-                )
+            for day in week:
+                iso = day.isoformat()
+                row.append({
+                    "date": iso,
+                    "day": day.day,
+                    "in_month": day.month == m,
+                    "ooto": _in_ooto(iso),
+                    "race": races_by_date.get(iso),
+                    "workouts": by_date.get(iso, []),
+                    "activities": activities_by_date.get(iso, []),
+                    "phase": phase_by_date.get(iso),
+                })
             weeks.append(row)
+        return {
+            "year": y,
+            "month": m,
+            "month_name": _cal.month_name[m],
+            "weeks": weeks,
+            "ooto_ranges": ooto_ranges,
+            "race_dates": race_dates,
+            "active": active,
+            "adjustment": adjustment,
+        }
 
+    @app.get("/calendar", response_class=HTMLResponse)
+    def calendar_view(
+        request: Request,
+        year: Optional[int] = None,
+        month: Optional[int] = None,
+        adjustment_id: Optional[int] = None,
+    ):
+        uid = _uid(request)
+        data = _calendar_data(uid, year, month, adjustment_id)
+        y = data["year"]
+        m = data["month"]
         prev_y, prev_m = (y - 1, 12) if m == 1 else (y, m - 1)
         next_y, next_m = (y + 1, 1) if m == 12 else (y, m + 1)
         return templates.TemplateResponse(
@@ -4220,23 +4224,32 @@ def create_app() -> FastAPI:
                 request,
                 year=y,
                 month=m,
-                month_name=_cal.month_name[m],
-                weeks=weeks,
+                month_name=data["month_name"],
+                weeks=data["weeks"],
                 day_labels=DAY_LABELS,
                 prev=f"?year={prev_y}&month={prev_m}",
                 next=f"?year={next_y}&month={next_m}",
                 plans=db.list_plans(uid),
-                ooto_ranges=ooto_ranges,
-                race_dates=race_dates,
+                ooto_ranges=data["ooto_ranges"],
+                race_dates=data["race_dates"],
                 export_result=request.query_params.get("exported"),
                 flash=request.query_params.get("flash"),
-                # An unattended overnight rewrite the rider was never told
-                # about is indistinguishable from us changing their training
-                # behind their back, so it is surfaced until dismissed.
-                reflow_notice=(active or {}).get("reflow_notice"),
-                reflow_notice_plan_id=(active or {}).get("id"),
-                ooto_adjustment=_ooto_adjustment_view(adjustment),
+                reflow_notice=(data["active"] or {}).get("reflow_notice"),
+                reflow_notice_plan_id=(data["active"] or {}).get("id"),
+                ooto_adjustment=_ooto_adjustment_view(data["adjustment"]),
             ),
+        )
+
+    @app.get("/api/calendar")
+    def api_calendar(
+        request: Request,
+        year: Optional[int] = None,
+        month: Optional[int] = None,
+    ):
+        data = _calendar_data(_uid(request), year, month)
+        return JSONResponse(
+            {"weeks": data["weeks"]},
+            headers={"Cache-Control": "private, no-store"},
         )
 
     @app.post("/plan/{plan_id}/reflow-notice/dismiss")

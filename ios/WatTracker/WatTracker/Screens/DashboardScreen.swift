@@ -17,7 +17,7 @@ struct DashboardScreen: View {
     /// a revoke performed in Settings would leave this screen holding a
     /// session that still believed it was paired, and it would keep rendering
     /// a signed-out rider's numbers until something forced it to reload.
-    @Environment(\.cloudSession) private var session
+    @Environment(\.readSession) private var session
     @State private var model = DashboardModel()
 
     var body: some View {

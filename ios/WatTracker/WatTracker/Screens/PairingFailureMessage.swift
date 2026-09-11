@@ -51,6 +51,21 @@ enum PairingFailureMessage {
         if let failure = error as? CloudClient.Failure {
             return text(for: failure)
         }
+        if let failure = error as? LocalClient.Failure {
+            switch failure {
+            case .insecureOrInvalidBaseURL:
+                return "Enter an HTTPS desktop address, including the TLS terminator host."
+            case .missingToken:
+                return "Enter the connector token from the desktop web settings."
+            case .unauthorized:
+                return codeRefused
+            case let .http(status, _, retryAfter):
+                if status == 429 || status == 503 { return busy(retryAfter: retryAfter) }
+                return codeRefused
+            case .malformedResponse:
+                return "The desktop's reply could not be read. This app may need updating."
+            }
+        }
         if error is URLError { return offline }
         return codeRefused
     }

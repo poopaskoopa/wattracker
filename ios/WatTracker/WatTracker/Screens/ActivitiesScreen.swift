@@ -3,7 +3,7 @@ import SwiftUI
 
 struct ActivitiesScreen: View {
     /// The one session, owned by `SessionGate` and injected by `AppGate`.
-    @Environment(\.cloudSession) private var session
+    @Environment(\.readSession) private var session
     @Environment(\.horizontalSizeClass) private var horizontalSizeClass
     @State private var model = ActivitiesModel()
 

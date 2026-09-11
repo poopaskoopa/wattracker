@@ -8,7 +8,7 @@ import SwiftUI
 /// the screen on the same credential and cache as Dashboard and means a
 /// cached calendar is useful while the phone is offline.
 struct CalendarScreen: View {
-    @Environment(\.cloudSession) private var session
+    @Environment(\.readSession) private var session
     @State private var model = CalendarModel()
     @State private var selectedDay: CalendarDayEntry?
 
