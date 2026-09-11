@@ -191,25 +191,29 @@ If the two disagree, GitHub wins and the queue is stale; say so.
    next step is to run full suites until an instance fires and read what the
    new assertion says — the instrumentation is in place, the root cause is
    not. 37 other files still have `_register` helpers that discard their
-   response; sweep them once the cause is known, not before. Fully local, no
-   hardware, no deployment.
-2. **#163 — iOS Calendar and Volume screens. In flight as PR #256.** Reviewed
-   2026-09-09; one correctness bug to fix (`VolumeData.previousWeeks` compares
-   a full current window against a clamped prior one, so `change()` reports
-   e.g. +300% for a flat 5 h/week rider with five weeks of history), plus two
-   performance items. Apply-ready diffs and the two tests are on the PR. The
-   branch is already rebased and green. Finish this before taking anything
-   else.
-3. **#258 — iOS: read the local desktop server as a second backend.**
-   `blocked` on #256, because the protocol extraction touches the same screen
-   files. Order: land #256, extract the read protocol behind `CloudClient` /
-   `CloudSession` / `SnapshotCache` as one behaviour-preserving refactor, then
-   add the local adapter. Transport is settled — see #192: TLS in front of the
-   local server, terminator the rider's choice, not publicly reachable.
+   response; sweep them once the cause is known, not before. **PR #265 (merged
+   2026-09-10) closed off the ambient-environment class of cause entirely**:
+   `conftest.isolated_env` now clears ten more variables the app reads, and
+   `tests/test_env_isolation.py` fails if a new `os.environ.get` in the app is
+   neither isolated nor exempted with a reason. A surviving flake is therefore
+   not the developer's shell leaking in. Fully local, no hardware, no
+   deployment.
+2. **#258 — iOS: read the local desktop server as a second backend.**
+   **Unblocked on 2026-09-09** when #256 merged; the `blocked` label is off and
+   GitHub now has it `ready`. It waited on #256 because the protocol extraction
+   touches the same screen files. Order: extract the read protocol behind
+   `CloudClient` / `CloudSession` / `SnapshotCache` as one behaviour-preserving
+   refactor, then add the local adapter. Transport is settled — see #192: TLS in
+   front of the local server, terminator the rider's choice, not publicly
+   reachable.
 
 **Done since this list was last written.** The iOS screens all landed:
-**#161 as PR #253** and **#162 as PR #254** (both re-applied onto `main`'s
-session; PRs #228 and #235 are closed as superseded). **#193 landed as PR
+**#161 as PR #253**, **#162 as PR #254** (both re-applied onto `main`'s
+session; PRs #228 and #235 are closed as superseded) and **#163 as PR #256**
+(merged 2026-09-09) — `fac4836` fixed the review's one correctness bug, where
+`VolumeData.previousWeeks` compared a full current window against a clamped
+prior one and `change()` reported e.g. +300% for a flat 5 h/week rider, and the
+two performance items, with tests. **#193 landed as PR
 #257** (`6830150a`) — the repository now has an `android/` tree. #234 merged
 as PR #240 after an on-device run; #233 landed in PR #238; #217's
 credential-free half landed in PR #239, its remainder gated on #102. #167 was
@@ -226,17 +230,20 @@ snapshot, mints pairing codes and writes the Mac's LAN address to
 checklist and carries the traps — a 900-second code, and remints that wipe the
 in-memory store along with the revoked-device record.
 
-**Do not start #161, #162 or #247.** All three are open *only* for an
+**Do not start #161, #162, #163 or #247.** All four are open *only* for an
 on-device check, which no agent can perform. Their screens are on `main`.
 Starting one re-implements code that already exists — the `agent:codex` labels
-that used to point here were removed on 2026-09-09 for that reason.
+that used to point here were removed on 2026-09-09 for that reason. #163 joined
+them when PR #256 merged: what is left of it is its done-criterion "both screens
+match the desktop's numbers for the same rider and period", which is a rider
+holding a device, not a test run.
 
 **Do not start #169** without asking; it is `blocked`. #242 is `blocked` on
 #102 and is a measurement of a live deployment, not code. **#217** needs a
 real deployment; its body's claims about `containerized` being parked and
 `Dockerfile.cloud` never being built are both stale.
 
-4. **#264 — one device-validation procedure for iOS and Android.** Unassigned
+3. **#264 — one device-validation procedure for iOS and Android.** Unassigned
    and cross-cutting: the harness, both clients, and the validation doc.
    Android has no on-device path at all today. Ask before taking it — it
    spans both epics and its Android half is taksmon's territory.
@@ -245,7 +252,7 @@ real deployment; its body's claims about `containerized` being parked and
 assignee and is not on this queue.
 
 **One iOS issue at a time.** `project.pbxproj` conflicts on almost every
-concurrent edit — see `docs/agent-workflow.md` §4. This is why #258 waits for
+concurrent edit — see `docs/agent-workflow.md` §4. This is why #258 waited for
 #256 rather than running alongside it.
 
 ### Before starting any iOS issue that already has a PR
