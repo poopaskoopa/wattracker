@@ -5,7 +5,7 @@ private struct ReadSessionKey: EnvironmentKey {
 }
 
 extension EnvironmentValues {
-    /// The app's one session, for screens that read the cloud.
+    /// The app's one backend-neutral read session.
     ///
     /// Optional because the environment has to have a default and there is no
     /// session before `AppGate` has built one; every screen that sees this is
@@ -13,9 +13,17 @@ extension EnvironmentValues {
     /// finds it nil should render its empty state, not build a session of its
     /// own -- a second session means a second token, a second cache writer and
     /// a pairing one half of the app cannot see.
-    var cloudSession: (any ReadSession)? {
+    var readSession: (any ReadSession)? {
         get { self[ReadSessionKey.self] }
         set { self[ReadSessionKey.self] = newValue }
+    }
+
+    /// Compatibility name for callers that still inject the cloud session.
+    /// The value is backend-neutral; the alias can be removed with the next
+    /// screen-facing API cleanup.
+    var cloudSession: (any ReadSession)? {
+        get { readSession }
+        set { readSession = newValue }
     }
 }
 
@@ -40,7 +48,7 @@ struct AppGate: View {
                 PairingScreen()
             case .paired:
                 RootView()
-                    .environment(\.cloudSession, gate.session)
+                    .environment(\.readSession, gate.activeSession)
             case .removed:
                 RemovedScreen()
             case let .unusable(reason):

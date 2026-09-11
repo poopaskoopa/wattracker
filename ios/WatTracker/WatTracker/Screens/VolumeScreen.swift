@@ -4,7 +4,7 @@ import Observation
 import SwiftUI
 
 struct VolumeScreen: View {
-    @Environment(\.cloudSession) private var session
+    @Environment(\.readSession) private var session
     @State private var model = VolumeScreenModel()
 
     var body: some View {

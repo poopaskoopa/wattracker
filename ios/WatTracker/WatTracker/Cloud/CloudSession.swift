@@ -60,6 +60,7 @@ struct CloudSnapshot: Sendable, Equatable {
 /// pairing, signing, and revocation API for the shell and Settings screen.
 protocol ReadSession: Sendable {
     var deviceState: CloudSession.DeviceState { get async }
+    var lastSuccess: Date? { get async }
     nonisolated func cached(_ route: CloudRoute) -> CloudSnapshot?
     func load(_ route: CloudRoute) async throws -> CloudSnapshot
     func activityDetail(_ activityID: Int) async throws -> ActivityDetail
@@ -174,6 +175,7 @@ actor CloudSession: ReadSession {
     private var device: PairedDevice?
     private var token: ReaderToken?
     private var state: DeviceState
+    private var lastSuccessfulRead: Date?
     private var lifecycleGeneration = 0
 
     /// Activity detail and stream payloads, kept out of the snapshot cache on
@@ -205,6 +207,7 @@ actor CloudSession: ReadSession {
         self.credentials = credentials
         self.cache = cache
         self.clock = clock
+        self.lastSuccessfulRead = nil
         let stored = credentials.load()
         self.device = stored
         self.state = stored == nil ? .unpaired : .paired
@@ -213,6 +216,8 @@ actor CloudSession: ReadSession {
     // MARK: - What the app asks
 
     var deviceState: DeviceState { state }
+
+    var lastSuccess: Date? { lastSuccessfulRead }
 
     var isPaired: Bool { device != nil }
 
@@ -294,6 +299,7 @@ actor CloudSession: ReadSession {
         device = nil
         token = nil
         state = .unpaired
+        lastSuccessfulRead = nil
         refreshTask = nil
         refreshTaskID = nil
         consecutiveFailures = 0
@@ -349,6 +355,7 @@ actor CloudSession: ReadSession {
                 lifecycleGeneration: readLifecycleGeneration
             )
             try validate(readDevice, lifecycleGeneration: readLifecycleGeneration)
+            lastSuccessfulRead = clock()
             return snapshot
         } catch Failure.deviceRemoved {
             throw Failure.deviceRemoved
@@ -447,6 +454,7 @@ actor CloudSession: ReadSession {
             let item = try await read(client, attempt.value, device)
             try validate(device, lifecycleGeneration: generation)
             activityObjects[objectID] = item
+            lastSuccessfulRead = clock()
             return item
         } catch let failure as CloudClient.Failure {
             guard case let .http(status, _, retryAfter, _) = failure else {
@@ -462,6 +470,7 @@ actor CloudSession: ReadSession {
                 let item = try await read(client, renewed.value, device)
                 try validate(device, lifecycleGeneration: generation)
                 activityObjects[objectID] = item
+                lastSuccessfulRead = clock()
                 return item
             } catch let retried as CloudClient.Failure {
                 throw Failure.server(retried)
@@ -575,6 +584,7 @@ actor CloudSession: ReadSession {
             consecutiveRejections = 0
             nextAttemptAllowedAt = nil
             mintCount += 1
+            lastSuccessfulRead = clock()
             return ReaderToken(
                 value: outcome.readerContext,
                 generation: mintCount,
@@ -700,6 +710,7 @@ actor CloudSession: ReadSession {
         credentials.clear()
         cache.removeAll()
         activityObjects.removeAll()
+        lastSuccessfulRead = nil
     }
 
     /// Push the next attempt out.

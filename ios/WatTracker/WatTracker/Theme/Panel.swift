@@ -35,6 +35,7 @@ struct Panel<Content: View>: View {
 /// shows as the selected item. Rendering it in the content keeps both idioms
 /// showing the same thing without a bar.
 struct ScreenScaffold<Content: View>: View {
+    @Environment(SessionGate.self) private var gate
     let title: String
     let subtitle: String
     private let content: Content
@@ -52,9 +53,17 @@ struct ScreenScaffold<Content: View>: View {
                     Text(title)
                         .font(.title2.weight(.semibold))
                         .foregroundStyle(Palette.textBright)
-                    Text(subtitle)
-                        .font(.subheadline)
-                        .foregroundStyle(Palette.muted)
+                    HStack(alignment: .firstTextBaseline) {
+                        Text(subtitle)
+                            .font(.subheadline)
+                            .foregroundStyle(Palette.muted)
+                        Spacer(minLength: 8)
+                        if gate.phase == .paired {
+                            Label(gate.backend.title, systemImage: "arrow.triangle.2.circlepath")
+                                .font(.caption.weight(.medium))
+                                .foregroundStyle(Palette.muted)
+                        }
+                    }
                 }
                 content
             }
