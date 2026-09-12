@@ -1,5 +1,7 @@
 """The read-only calendar feed used by the local iOS backend."""
 
+import json
+
 import pytest
 
 pytest.importorskip("httpx")
@@ -34,3 +36,18 @@ def test_api_calendar_returns_the_same_month_model_as_html(client):
     assert payload["weeks"][0][0]["date"] == "2026-07-27"
     assert payload["weeks"][0][0]["in_month"] is False
     assert payload["weeks"][0][2]["date"] == "2026-07-29"
+
+
+def test_api_calendar_requires_authentication(client):
+    response = client.get("/api/calendar", follow_redirects=False)
+
+    assert response.status_code == 303
+    assert response.headers["location"] == "/welcome"
+
+    followed = client.get("/api/calendar", follow_redirects=True)
+
+    assert followed.status_code == 200
+    assert followed.url.path == "/welcome"
+    assert followed.headers["content-type"].startswith("text/html")
+    with pytest.raises(json.JSONDecodeError):
+        followed.json()
