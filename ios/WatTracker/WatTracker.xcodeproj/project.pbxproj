@@ -70,6 +70,7 @@
 		1A0000000000000000000204 /* MobileScreenData.swift in Sources */ = {isa = PBXBuildFile; fileRef = 1A0000000000000000000200 /* MobileScreenData.swift */; };
 		1A0000000000000000000211 /* LocalBackend.swift in Sources */ = {isa = PBXBuildFile; fileRef = 1A0000000000000000000210 /* LocalBackend.swift */; };
 		1A0000000000000000000212 /* LocalBackendTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 1A0000000000000000000213 /* LocalBackendTests.swift */; };
+		1A0000000000000000000214 /* LocalBackend.swift in Sources */ = {isa = PBXBuildFile; fileRef = 1A0000000000000000000210 /* LocalBackend.swift */; };
 /* End PBXBuildFile section */
 
 /* Begin PBXFileReference section */
@@ -425,6 +426,7 @@
 				1A0000000000000000000156 /* SnapshotCache.swift in Sources */,
 				1A0000000000000000000157 /* CloudSession.swift in Sources */,
 				1A0000000000000000000204 /* MobileScreenData.swift in Sources */,
+				1A0000000000000000000214 /* LocalBackend.swift in Sources */,
 				1A00000000000000000001C6 /* SessionGate.swift in Sources */,
 				1A00000000000000000001C7 /* PairingFailureMessage.swift in Sources */,
 				1A00000000000000000001C8 /* PairingCode.swift in Sources */,
