@@ -17,6 +17,7 @@ from wattracker import connectorhub, db, paths, server as servermod  # noqa: E40
 from wattracker.ingest import importer  # noqa: E402
 from wattracker.prescribe import zwo  # noqa: E402
 from wattracker.server import create_app  # noqa: E402
+from wattracker.timeutil import utc_today  # noqa: E402
 
 from conftest import redirect_home  # noqa: E402
 from conftest_connector import attach_connector  # noqa: E402
@@ -174,15 +175,19 @@ def test_workout_prune_rules_travel_over_the_connector(
     workouts = zwift_home / "Workouts"
     db.save_user_settings(uid, {"zwift_id": "12345",
                                 "workouts_dir": str(workouts)})
-    plan_id = db.create_plan(uid, "Test", "2026-08-01", 1, 8, {})
+    # Dated today, not a fixed date: the manifest prunes uncompleted workouts
+    # older than exporter.EXPORT_GRACE_DAYS, so a hardcoded day eventually ages
+    # out of the export and this test would read as "nothing was written".
+    day = utc_today().isoformat()
+    plan_id = db.create_plan(uid, "Test", day, 1, 8, {})
     db.add_plan_workout(
-        plan_id, uid, "2026-08-01", "VO2 5x4", "vo2max", 3600, 80.0,
+        plan_id, uid, day, "VO2 5x4", "vo2max", 3600, 80.0,
         "<workout_file><name>VO2 5x4</name></workout_file>",
     )
     from wattracker import exporter
 
     attached, _config = attach_connector(client, uid, zwift_home)
-    written = workouts / zwo.plan_filename("2026-08-01", "VO2 5x4")
+    written = workouts / zwo.plan_filename(day, "VO2 5x4")
     with attached:
         result = exporter.sync_plan_exports(uid)
         assert result["status"] == "ok", result
@@ -190,7 +195,7 @@ def test_workout_prune_rules_travel_over_the_connector(
         assert written.exists()
 
         # Mark the day out-of-office: the file must be pruned remotely.
-        db.add_ooto_range(uid, "2026-08-01", "2026-08-01", "holiday")
+        db.add_ooto_range(uid, day, day, "holiday")
         result = exporter.sync_plan_exports(uid)
         assert result["removed"] == 1, result
         assert not written.exists()

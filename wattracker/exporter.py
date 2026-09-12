@@ -1,10 +1,11 @@
 """Keep a user's Zwift custom-workout folder in sync with their plan.
 
-Exports EVERY not-yet-completed plan workout (past and future) whose date is
-not inside an out-of-office (OOTO) range and is not a planned race day, and
-removes the .zwo of any workout that is now skipped (or completed) so the
-Zwift list stays clean. Used by the "Export all to Zwift" action and the daily
-maintenance sweep.
+Exports every not-yet-completed plan workout that is still worth riding -
+today's, every future one, and anything skipped within the last
+``EXPORT_GRACE_DAYS`` days - whose date is not inside an out-of-office (OOTO)
+range and is not a planned race day. It removes the .zwo of any workout that is
+now completed, skipped, or long past, so the Zwift list stays clean. Used by
+the "Export all to Zwift" action and the daily maintenance sweep.
 
 Deciding *what* the Zwift folder should contain is pure database work and
 happens here (``plan_export_manifest``); actually touching files is the
@@ -13,14 +14,25 @@ machine entirely.
 """
 from __future__ import annotations
 
+import datetime as _dt
 import logging
 from typing import Dict, List, Optional
 
 from . import db
 from .backend import BackendUnavailable, ExportManifest, get_backend
 from .prescribe import zwo
+from .timeutil import utc_today
 
 log = logging.getLogger(__name__)
+
+# How long an uncompleted past workout keeps its .zwo in the Zwift folder.
+# Two forces pull against each other here. Riders routinely do a scheduled
+# session a day or several days late, so pruning at midnight would delete the
+# file out from under someone about to ride it. But a workout that was simply
+# skipped never gets completed, so with no cut-off its .zwo lingers in Zwift's
+# custom-workout list forever and the list fills with dead sessions. Seven days
+# covers "I rode it the following weekend" while keeping the list current.
+EXPORT_GRACE_DAYS = 7
 
 
 def _all_plan_workouts(user_id: int) -> List[dict]:
@@ -28,6 +40,24 @@ def _all_plan_workouts(user_id: int) -> List[dict]:
     for p in db.list_plans(user_id):
         out.extend(db.plan_workouts_for_plan(user_id, p["id"], include_zwo=True))
     return out
+
+
+def _stale_uncompleted(workout: dict, stale_before: _dt.date) -> bool:
+    """Is this an uncompleted workout dated before the grace window?
+
+    ``stale_before`` is the oldest date that still exports, so a workout dated
+    exactly ``utc_today() - EXPORT_GRACE_DAYS`` is kept and the day before it is
+    pruned. A missing or unparseable date is never pruned on this rule: the
+    other skip branches key off the same string and nothing here should delete a
+    file on the strength of a value it could not read.
+    """
+    if workout.get("completed_activity_id"):
+        return False
+    try:
+        day = _dt.date.fromisoformat(str(workout.get("date") or ""))
+    except (TypeError, ValueError):
+        return False
+    return day < stale_before
 
 
 def plan_export_manifest(user_id: int) -> Optional[ExportManifest]:
@@ -45,6 +75,7 @@ def plan_export_manifest(user_id: int) -> Optional[ExportManifest]:
     to_write: List[dict] = []
     to_remove: List[str] = []
     write_names = set()
+    stale_before = utc_today() - _dt.timedelta(days=EXPORT_GRACE_DAYS)
     for w in workouts:
         fname = zwo.plan_filename(w["date"], w["name"])
         skip = (
@@ -55,9 +86,13 @@ def plan_export_manifest(user_id: int) -> Optional[ExportManifest]:
             # the plan row, but a past-dated or otherwise locked row can
             # survive it, and it must still not be exported.
             or db.race_on(user_id, w["date"]) is not None
+            # Never ridden and older than the grace period: it is not going to
+            # be ridden now, so stop carrying it in the Zwift list.
+            or _stale_uncompleted(w, stale_before)
         )
         if skip:
-            # Completed rides / OOTO / race days should not linger in Zwift.
+            # Completed rides / OOTO / race days / long-skipped sessions should
+            # not linger in Zwift.
             # A confirmed reschedule may replace a displaced row with a new
             # workout that happens to have the same filename; never remove
             # the file that the replacement is about to write.

@@ -1,4 +1,5 @@
 """Tests: Zwift player-folder detection, export-target resolution, auto-export."""
+import datetime as _dt
 import os
 import re
 
@@ -7,8 +8,9 @@ import pytest
 pytest.importorskip("httpx")
 from fastapi.testclient import TestClient  # noqa: E402
 
-from wattracker import db, paths  # noqa: E402
+from wattracker import db, exporter, paths  # noqa: E402
 from wattracker.server import create_app  # noqa: E402
+from wattracker.timeutil import utc_today  # noqa: E402
 
 
 def _zwift_root() -> str:
@@ -32,12 +34,31 @@ def _register(client, username="rider"):
     client.post("/register", data={"username": username, "password": "password123"})
 
 
+def _zwo_name(entry: dict) -> str:
+    """The .zwo filename an ExportManifest write entry will land in."""
+    from wattracker.prescribe import zwo as zwomod
+
+    return zwomod.plan_filename(entry["date"], entry["name"])
+
+
+def _upcoming_monday() -> _dt.date:
+    """The next Monday on or after today (UTC).
+
+    Plans in this file must start in the FUTURE: the export manifest now prunes
+    uncompleted workouts more than ``EXPORT_GRACE_DAYS`` days old, so a
+    hardcoded start date silently stops exporting anything once that date ages
+    past the grace window.
+    """
+    today = utc_today()
+    return today + _dt.timedelta(days=(0 - today.weekday()) % 7)
+
+
 PLAN_FORM = {
     "name": "Base Plan",
     "weeks": "2",
     "hours_per_week": "6",
     "hit_days_per_week": "1",
-    "start_date": "2026-08-03",
+    "start_date": _upcoming_monday().isoformat(),
     "days": ["0", "2", "4"],
 }
 
@@ -540,3 +561,72 @@ def test_the_adapt_reexport_never_falls_back_to_a_me_folder(client):
     assert [n for n in os.listdir(real)] == [
         f"{workout['date']} Renamed.zwo"
     ]
+
+
+# ------------------------------ stale uncompleted workouts are pruned (grace)
+#
+# A skipped session never becomes 'completed', so with no cut-off its .zwo sat
+# in Zwift's custom-workout list forever. But riders often ride a scheduled
+# workout a day or several days late, so the file must not vanish at midnight
+# either. exporter.EXPORT_GRACE_DAYS is the compromise; these pin both edges of
+# it, relative to utc_today() so they cannot rot.
+
+def _add_workout(uid, plan_id, day, name):
+    """One extra plan workout on an arbitrary date; returns its filename."""
+    date = day.isoformat()
+    db.add_plan_workout(
+        plan_id, uid, date, name, "endurance", 3600, 50.0, "<workout_file/>"
+    )
+    return f"{date} {name}.zwo"
+
+
+def test_a_long_past_uncompleted_workout_is_pruned_not_exported(client):
+    uid, plan_id = _seed_plan(client)
+    fname = _add_workout(
+        uid, plan_id, utc_today() - _dt.timedelta(days=exporter.EXPORT_GRACE_DAYS + 1),
+        "Stale Endurance",
+    )
+
+    manifest = exporter.plan_export_manifest(uid)
+    assert fname in manifest.remove
+    assert fname not in [_zwo_name(w) for w in manifest.write]
+
+
+def test_a_workout_exactly_at_the_grace_boundary_still_exports(client):
+    """Ridden a week late is still ridden: the boundary day must survive."""
+    uid, plan_id = _seed_plan(client)
+    fname = _add_workout(
+        uid, plan_id, utc_today() - _dt.timedelta(days=exporter.EXPORT_GRACE_DAYS),
+        "Boundary Endurance",
+    )
+
+    manifest = exporter.plan_export_manifest(uid)
+    assert fname in [_zwo_name(w) for w in manifest.write]
+    assert fname not in manifest.remove
+
+
+def test_todays_and_future_workouts_always_export(client):
+    uid, plan_id = _seed_plan(client)
+    today_f = _add_workout(uid, plan_id, utc_today(), "Today Endurance")
+    future_f = _add_workout(
+        uid, plan_id, utc_today() + _dt.timedelta(days=30), "Future Endurance"
+    )
+
+    manifest = exporter.plan_export_manifest(uid)
+    written = [_zwo_name(w) for w in manifest.write]
+    assert today_f in written and future_f in written
+    assert today_f not in manifest.remove and future_f not in manifest.remove
+
+
+def test_a_long_past_completed_workout_is_still_pruned(client):
+    """Unchanged behaviour: completion already pruned it, and still does."""
+    uid, plan_id = _seed_plan(client)
+    day = utc_today() - _dt.timedelta(days=exporter.EXPORT_GRACE_DAYS + 10)
+    fname = _add_workout(uid, plan_id, day, "Done Endurance")
+    workout = [w for w in db.plan_workouts_for_plan(uid, plan_id)
+               if w["date"] == day.isoformat()][0]
+    assert db.mark_plan_workout_completed(uid, workout["id"], 4242, day.isoformat())
+
+    manifest = exporter.plan_export_manifest(uid)
+    assert fname in manifest.remove
+    assert fname not in [_zwo_name(w) for w in manifest.write]
