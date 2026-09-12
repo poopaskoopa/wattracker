@@ -163,8 +163,8 @@ struct LocalClient: Sendable {
         guard (200..<300).contains(response.status) else {
             throw map(response, path: "/connector/session")
         }
-        // A valid ticket lands on the authenticated home page. A bad or
-        // revoked ticket lands on /login, even though that page is a 200.
+        // A valid ticket lands on the authenticated home page. Reject any
+        // other landing path, including /login or /welcome, even if it is a 200.
         guard response.url.path == "/" else { throw Failure.unauthorized }
     }
 
