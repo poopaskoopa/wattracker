@@ -1,3 +1,8 @@
 # Intentionally empty: no R8 keep rules needed yet.
 # R8 rules for the Room entities and the Tink KeySetHandle will be added
 # in Step 2 (#194) when those dependencies are wired in.
+#
+# Verified 2026-09-09 (#260 item 2): R8 DOES read this path. A deliberately
+# unparseable directive here failed :app:minifyReleaseWithR8 with
+# 'Unknown option', naming this file and line. The AGP 9 keepRules source-set
+# convention is wired; rules added here will take effect.

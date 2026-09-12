@@ -47,6 +47,20 @@ private val wtDarkColorScheme = darkColorScheme(
     inverseSurface = Palette.text,
     error = Palette.alert,
     onError = Palette.onAccent,
+    // The roles nothing in the shell touches yet. Left at the stock
+    // darkColorScheme() defaults they are tinted M3 greys, so the first Step 2
+    // component to reach for one (a Snackbar, a tonal surface) would render a
+    // single stray lilac panel in an otherwise fixed palette (#260). Cheaper to
+    // map them now than to hunt one down later.
+    surfaceBright = Palette.surface2,
+    surfaceDim = Palette.bg,
+    inverseOnSurface = Palette.bg,
+    // The one role this palette cannot fill well: inverseSurface is light
+    // (Palette.text), and there is no dark accent variant to place on it -- the
+    // palette is value-for-value from the web `:root`, so inventing one is not
+    // an option here. Step 2 should style Snackbar actions from [Palette]
+    // directly rather than rely on this pairing.
+    inversePrimary = Palette.accent,
 )
 
 @Composable

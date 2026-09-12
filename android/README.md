@@ -1,7 +1,8 @@
 # android/
 
 The wattracker Android client: a single-activity Jetpack Compose app that reads
-from the local desktop app (primary, LAN) or the hosted cloud (secondary).
+from the local desktop app (over proxied HTTPS) or the hosted cloud. Both backends
+are TLS; the app never speaks cleartext in a release build.
 `plan.md` is the authoritative step-by-step plan for this directory; this file
 records what the steps assume of the machine around them.
 
@@ -108,25 +109,97 @@ changelog):
   correctly in portrait, which is exactly why the drawer (not a collapsible
   rail) is the right scaffold.
 
-## Reaching the local backend from the emulator
+## Reaching the local backend
 
-The debug build's `BuildConfig` points at `10.0.2.2:8765` — the emulator's
-NAT alias for the host's loopback — and the debug network security config
-permits cleartext to `localhost`/`127.0.0.1`/`10.0.2.2` only. For the
-emulator to actually reach the desktop harness, the harness must be listening
-on a non-loopback bind, which `wattracker/config.py` gates behind two
-variables on purpose (binding beyond loopback is what turns the personal app
-into a networked service):
+### Release: HTTPS, terminated by whatever front end you run
+
+The local desktop server is reached at `https://<hostname>`, with TLS
+terminated in front of it. **Both are accepted and the app cannot tell them
+apart:**
+
+- **`tailscale serve`** — `https://<machine>.<tailnet>.ts.net`, the path
+  `docs/calendar-feed.md` documents and the reason `WATTRACKER_PUBLIC_SCHEME`
+  already defaults to `https`. Keeps the server off the public internet;
+  requires a Tailscale account.
+- **An ordinary reverse proxy** — nginx, Caddy, anything that terminates TLS
+  with a certificate your phone already trusts. No account, no third party.
+
+**Whichever you pick, it must not be publicly reachable.** A tailnet, a
+LAN-only bind, or a VPN all qualify; an internet-facing proxy does not. This is
+not only about transport secrecy: the server's `127.0.0.1` default is what
+keeps the desktop UI unreachable by anyone who is not at the keyboard, and **a
+reverse proxy defeats that even while the server stays bound to loopback,
+because the proxy is what accepts the connection.** `/login` and the rest of
+the UI would then be internet-facing, against auth that was never designed for
+it. Terminate TLS somewhere only your own devices can dial.
+
+Pick either. The server itself keeps binding loopback and speaks plain http to
+the co-located terminator, so **no bind variable changes**: `127.0.0.1:8000` is
+what it dials, and that is a loopback connection.
+
+Three variables on the server, none of them a bind (see `README.md` in the
+repo root, "Reaching the server from other devices"):
 
 ```
-set WATTRACKER_HOST=0.0.0.0
-set WATTRACKER_ALLOW_NON_LOOPBACK=1
+WATTRACKER_COOKIE_SECURE=1
+WATTRACKER_PUBLIC_SCHEME=https
+WATTRACKER_PUBLIC_HOSTS=<the hostname the phone uses>
+```
+
+The last one matters because the server 400s any request whose `Host` header it
+does not answer to — so it is the tailnet name under `tailscale serve`, or the
+proxy's `server_name` otherwise. The front end must pass the original `Host`
+through (in nginx, `proxy_set_header Host $host;`; `tailscale serve` already
+does) and forward at the root — the app has no `root_path` support.
+
+**`WATTRACKER_COOKIE_SECURE` must be set in the launch environment, not
+exported into a shell that later runs the test suite:** `conftest`'s `delenv`
+list does not clear it, and a stray export produces mass test failures that
+look unrelated to it (see #249).
+
+The app pins no hostname anywhere — not in the manifest, not in the network
+security config, not in `BuildConfig`. The rider types the origin at pairing
+and any `https://` host, name or port is accepted.
+
+`WATTRACKER_HOST` + `WATTRACKER_ALLOW_NON_LOOPBACK=1` are needed **only** if
+the terminator runs on a different machine than the server. That gate is right
+and stays: binding beyond loopback is what turns the personal app into a
+networked service, and there a host firewall rule is what limits who may dial
+the port.
+
+### Debug: the emulator talks to loopback
+
+The debug build's `BuildConfig` points at `10.0.2.2:8765` and the debug network
+security config permits cleartext to `localhost`/`127.0.0.1`/`10.0.2.2` only.
+`10.0.2.2` is the emulator's NAT alias for **the host's loopback**, so a server
+on its default `127.0.0.1` bind is already reachable — no wider bind is needed
+for the emulator path. Only the Host allowlist needs the name:
+
+```
+set WATTRACKER_PUBLIC_HOSTS=10.0.2.2
 python -m wattracker
 ```
 
-That gate is correct and stays. What it means in practice: the development
-harness for the Android client is a harness someone deliberately started with
-network exposure, on a machine that is otherwise loopback-only.
+Never point an emulator at `127.0.0.1` — that is the emulator's own loopback.
+The debug config lives in `src/debug/res/xml/`, so it cannot ship.
+
+### Debug: a physical phone talks to loopback too, over USB
+
+A tethered device needs no wider bind and no TLS terminator either. `adb
+reverse` maps the phone's own loopback to the host's:
+
+```
+adb reverse tcp:8765 tcp:8765
+```
+
+Then point the app at `http://localhost:8765` — already permitted by the debug
+network security config above, so there is nothing to change. Set
+`WATTRACKER_PUBLIC_HOSTS=localhost` for the Host allowlist and leave the server
+on its default `127.0.0.1` bind.
+
+This is the reason the Android dev loop never wants `--lan` or
+`WATTRACKER_HOST=0.0.0.0`. iOS binds every interface only because it has no
+`adb reverse` equivalent; do not copy that posture here.
 
 ## Dependencies
 
