@@ -512,12 +512,21 @@ def test_suppression_banner_renders(user_id):
 
 
 # ------------------------------------------------------------- export
-def test_race_days_are_not_exported_and_a_stale_zwo_is_removed(user_id, home_dir):
+def test_race_days_are_not_exported_and_a_stale_zwo_is_removed(
+    user_id, home_dir, monkeypatch
+):
     out = home_dir / "zwo"
     out.mkdir()
     db.save_user_settings(user_id, {"workouts_dir": str(out), "zwift_id": "123"})
     plan_id = _seed_plan(user_id)
     race_day = "2026-08-10"
+    # This file's plan sits on fixed calendar dates. The export manifest prunes
+    # uncompleted workouts more than exporter.EXPORT_GRACE_DAYS days old, so
+    # pin its clock to the race day - what is under test here is race-day
+    # suppression, not the grace window.
+    monkeypatch.setattr(
+        exporter, "utc_today", lambda: dt.date.fromisoformat(race_day)
+    )
     row = next(r for r in _rows(user_id, plan_id) if r["date"] == race_day)
 
     exporter.sync_plan_exports(user_id)

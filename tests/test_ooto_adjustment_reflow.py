@@ -25,7 +25,8 @@ DAYS = [0, 2, 4, 6]
 HOURS_PER_WEEK = 6.0
 START = dt.date(2026, 8, 3)
 WEEKS = 4
-TODAY = "2026-08-01"
+TODAY_DATE = dt.date(2026, 8, 1)
+TODAY = TODAY_DATE.isoformat()
 
 
 def _install_real_plan(uid):
@@ -329,8 +330,14 @@ def _folder(directory):
 
 
 @pytest.fixture()
-def exporting_rider(home_dir):
+def exporting_rider(home_dir, monkeypatch):
     """A registered rider with a real plan and a real Zwift workouts folder."""
+    # This whole file is pinned to a fixed TODAY, and the plan starts two days
+    # after it. The export manifest prunes uncompleted workouts older than
+    # exporter.EXPORT_GRACE_DAYS, so it has to read the same pinned clock or
+    # the real date eventually leaves every workout here long past and the
+    # fixture exports nothing.
+    monkeypatch.setattr(exporter, "utc_today", lambda: TODAY_DATE)
     app = create_app()
     with TestClient(app) as client:
         client.post("/register",
@@ -358,7 +365,7 @@ def test_reverting_leaves_the_zwift_folder_byte_identical(
     import wattracker.server as servermod
 
     client, uid, out = exporting_rider
-    monkeypatch.setattr(servermod, "utc_today", lambda: dt.date(2026, 8, 1))
+    monkeypatch.setattr(servermod, "utc_today", lambda: TODAY_DATE)
     baseline = _folder(out)
     assert baseline  # the fixture really did export something
 
