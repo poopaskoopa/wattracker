@@ -4,7 +4,7 @@ import Observation
 import SwiftUI
 
 struct VolumeScreen: View {
-    @Environment(\.cloudSession) private var session
+    @Environment(\.readSession) private var session
     @State private var model = VolumeScreenModel()
 
     var body: some View {
@@ -74,7 +74,7 @@ final class VolumeScreenModel {
 
     private var started = false
 
-    func start(session: CloudSession?) async {
+    func start(session: (any ReadSession)?) async {
         guard !started else { return }
         started = true
 

@@ -20,7 +20,6 @@ import SwiftUI
 /// reads the same data through the same planes, and not before.
 struct SettingsScreen: View {
     @Environment(SessionGate.self) private var gate
-    @Environment(\.cloudSession) private var session
     @State private var model = SettingsModel()
     @State private var showingFTPRoundTrip = false
     @State private var confirmingRemoval = false
@@ -30,6 +29,7 @@ struct SettingsScreen: View {
             title: "Settings",
             subtitle: "Pairing, units and account"
         ) {
+            backendPanel
             pairingPanels
             removalPanel
             debugPanel
@@ -47,40 +47,94 @@ struct SettingsScreen: View {
             }
             .preferredColorScheme(.dark)
         }
-        .task { await model.load(session: session, gate: gate) }
+        .task { await model.load(session: gate.session, gate: gate) }
+    }
+
+    private var backendPanel: some View {
+        Panel {
+            VStack(alignment: .leading, spacing: 10) {
+                Text("Read data from")
+                    .font(.callout.weight(.semibold))
+                    .foregroundStyle(Palette.textBright)
+                Picker("Read data from", selection: Binding(
+                    get: { gate.backend },
+                    set: { value in
+                        Task {
+                            await gate.selectBackend(value)
+                            await model.reload(session: gate.session, gate: gate)
+                        }
+                    }
+                )) {
+                    ForEach(SessionGate.Backend.allCases) { backend in
+                        Text(backend.title).tag(backend)
+                    }
+                }
+                .pickerStyle(.segmented)
+                Text("Dashboard, Calendar, Volume and Activities use this backend.")
+                    .font(.caption)
+                    .foregroundStyle(Palette.muted)
+                if let lastSuccess = gate.lastSuccess {
+                    Text("Last connection: \(SettingsModel.lastSeen(lastSuccess.timeIntervalSince1970))")
+                        .font(.caption)
+                        .foregroundStyle(Palette.muted)
+                }
+            }
+        }
     }
 
     @ViewBuilder
     private var pairingPanels: some View {
-        switch model.state {
-        case .loading:
-            Panel {
-                HStack(spacing: 10) {
-                    ProgressView().tint(Palette.accent)
-                    Text("Reading the device list")
-                        .font(.callout)
-                        .foregroundStyle(Palette.muted)
-                }
-            }
-        case let .failed(message):
-            Panel {
-                VStack(alignment: .leading, spacing: 8) {
-                    Text("Could not read the device list")
-                        .font(.callout.weight(.semibold))
-                        .foregroundStyle(Palette.textBright)
-                    Text(message)
-                        .font(.caption)
-                        .foregroundStyle(Palette.alert)
-                    Button("Try again") {
-                        Task { await model.reload(session: session, gate: gate) }
+        if gate.backend == .local {
+            localPairingPanel
+        } else {
+            switch model.state {
+            case .loading:
+                Panel {
+                    HStack(spacing: 10) {
+                        ProgressView().tint(Palette.accent)
+                        Text("Reading the device list")
+                            .font(.callout)
+                            .foregroundStyle(Palette.muted)
                     }
-                    .buttonStyle(.bordered)
-                    .tint(Palette.accent)
                 }
+            case let .failed(message):
+                Panel {
+                    VStack(alignment: .leading, spacing: 8) {
+                        Text("Could not read the device list")
+                            .font(.callout.weight(.semibold))
+                            .foregroundStyle(Palette.textBright)
+                        Text(message)
+                            .font(.caption)
+                            .foregroundStyle(Palette.alert)
+                        Button("Try again") {
+                            Task { await model.reload(session: gate.session, gate: gate) }
+                        }
+                        .buttonStyle(.bordered)
+                        .tint(Palette.accent)
+                    }
+                }
+            case let .loaded(devices):
+                thisDevicePanel(devices.first { $0.isSelf })
+                otherDevicesPanel(devices.filter { !$0.isSelf })
             }
-        case let .loaded(devices):
-            thisDevicePanel(devices.first { $0.isSelf })
-            otherDevicesPanel(devices.filter { !$0.isSelf })
+        }
+    }
+
+    private var localPairingPanel: some View {
+        Panel {
+            VStack(alignment: .leading, spacing: 8) {
+                Text("This desktop")
+                    .font(.callout.weight(.semibold))
+                    .foregroundStyle(Palette.textBright)
+                row("Address", model.localBaseURL ?? "—", monospaced: true)
+                row("Token", "Stored in this device's Keychain")
+                Text(
+                    "To revoke this device, use the desktop web settings. Remove here clears "
+                        + "the local token and cached data."
+                )
+                .font(.caption)
+                .foregroundStyle(Palette.muted)
+            }
         }
     }
 
@@ -127,9 +181,11 @@ struct SettingsScreen: View {
                 Text("Remove this device")
                     .font(.callout.weight(.semibold))
                     .foregroundStyle(Palette.textBright)
-                Text(
-                    "Revokes this device's access on the server and deletes everything it has "
-                    + "stored. You will need a new pairing code to use wattracker here again."
+                Text(gate.backend == .local
+                    ? "Deletes the local token and cached data. To revoke server access, use "
+                        + "the desktop web settings."
+                    : "Revokes this device's access on the server and deletes everything it has "
+                        + "stored. You will need a new pairing code to use wattracker here again."
                 )
                 .font(.caption)
                 .foregroundStyle(Palette.muted)
@@ -157,7 +213,10 @@ struct SettingsScreen: View {
             }
             Button("Cancel", role: .cancel) {}
         } message: {
-            Text("This cannot be undone. Pairing again needs a new code from the desktop app.")
+            Text(gate.backend == .local
+                ? "This cannot be undone. Pairing again needs the desktop address and token."
+                : "This cannot be undone. Pairing again needs a new code from the desktop app."
+            )
         }
     }
 
@@ -234,6 +293,7 @@ final class SettingsModel {
     }
 
     private(set) var state: State = .loading
+    private(set) var localBaseURL: String? = nil
     private(set) var isRemoving = false
     private(set) var removalFailure: String?
 
@@ -256,6 +316,11 @@ final class SettingsModel {
     func reload(session: CloudSession?, gate: SessionGate) async {
         state = .loading
         await gate.probe()
+        if gate.backend == .local {
+            localBaseURL = await gate.localBaseURL()
+            state = .loaded([])
+            return
+        }
         guard let session else {
             state = .failed(SessionGate.GateFailure.noSession.description)
             return

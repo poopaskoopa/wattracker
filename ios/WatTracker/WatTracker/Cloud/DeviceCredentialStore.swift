@@ -144,3 +144,140 @@ final class MemoryDeviceCredentialStore: DeviceCredentialStore, @unchecked Senda
         clearCount += 1
     }
 }
+
+/// The durable local-server pairing. The token is a connector credential, not
+/// a reader context, and is kept out of the snapshot cache and UserDefaults.
+struct LocalCredential: Codable, Sendable, Equatable {
+    let baseURL: String
+    let token: String
+    let label: String?
+
+    private enum CodingKeys: String, CodingKey {
+        case baseURL, token, label
+    }
+
+    init(baseURL: String, token: String, label: String? = nil) throws {
+        guard let url = URL(string: baseURL),
+              url.scheme?.lowercased() == "https",
+              url.host != nil,
+              url.user == nil,
+              url.password == nil,
+              url.query == nil,
+              url.fragment == nil,
+              url.path.isEmpty || url.path == "/"
+        else { throw LocalClient.Failure.insecureOrInvalidBaseURL }
+        let trimmedToken = token.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmedToken.isEmpty else { throw LocalClient.Failure.missingToken }
+        var components = URLComponents(url: url, resolvingAgainstBaseURL: false)!
+        components.path = ""
+        self.baseURL = components.url!.absoluteString
+        self.token = trimmedToken
+        if let label {
+            let value = label.trimmingCharacters(in: .whitespacesAndNewlines)
+            self.label = value.isEmpty ? nil : String(value.prefix(64))
+        } else {
+            self.label = nil
+        }
+    }
+
+    init(from decoder: Decoder) throws {
+        let values = try decoder.container(keyedBy: CodingKeys.self)
+        try self.init(
+            baseURL: values.decode(String.self, forKey: .baseURL),
+            token: values.decode(String.self, forKey: .token),
+            label: values.decodeIfPresent(String.self, forKey: .label)
+        )
+    }
+}
+
+protocol LocalCredentialStore: Sendable {
+    func load() -> LocalCredential?
+    func save(_ credential: LocalCredential) throws
+    func clear()
+}
+
+/// The local token is the authority to open a full desktop session, so it has
+/// the same device-only protection as the cloud credential.
+struct KeychainLocalCredentialStore: LocalCredentialStore {
+    enum Failure: Error, CustomStringConvertible {
+        case keychain(OSStatus)
+
+        var description: String {
+            switch self {
+            case let .keychain(status): return "Keychain error \(status)"
+            }
+        }
+    }
+
+    private let service: String
+    private let account: String
+
+    init(service: String = "com.wattracker.ios.local-credential",
+         account: String = "paired-local-v1") {
+        self.service = service
+        self.account = account
+    }
+
+    func load() -> LocalCredential? {
+        var query = baseQuery()
+        query[kSecReturnData as String] = true
+        query[kSecMatchLimit as String] = kSecMatchLimitOne
+        var item: CFTypeRef?
+        let status = withUnsafeMutablePointer(to: &item) {
+            SecItemCopyMatching(query as CFDictionary, $0)
+        }
+        guard status == errSecSuccess, let data = item as? Data else { return nil }
+        return try? JSONDecoder().decode(LocalCredential.self, from: data)
+    }
+
+    func save(_ credential: LocalCredential) throws {
+        let data = try JSONEncoder().encode(credential)
+        var query = baseQuery()
+        query[kSecValueData as String] = data
+        query[kSecAttrAccessible as String] = kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly
+        SecItemDelete(baseQuery() as CFDictionary)
+        let status = SecItemAdd(query as CFDictionary, nil)
+        guard status == errSecSuccess else { throw Failure.keychain(status) }
+    }
+
+    func clear() {
+        SecItemDelete(baseQuery() as CFDictionary)
+    }
+
+    private func baseQuery() -> [String: Any] {
+        [
+            kSecClass as String: kSecClassGenericPassword,
+            kSecAttrService as String: service,
+            kSecAttrAccount as String: account,
+        ]
+    }
+}
+
+final class MemoryLocalCredentialStore: LocalCredentialStore, @unchecked Sendable {
+    private let lock = NSLock()
+    private var credential: LocalCredential?
+    private(set) var clearCount = 0
+
+    init(credential: LocalCredential? = nil) {
+        self.credential = credential
+    }
+
+    func load() -> LocalCredential? {
+        lock.lock()
+        defer { lock.unlock() }
+        return credential
+    }
+
+    func save(_ credential: LocalCredential) throws {
+        lock.lock()
+        defer { lock.unlock() }
+        self.credential = credential
+    }
+
+    func clear() {
+        lock.lock()
+        defer { lock.unlock() }
+        credential = nil
+        clearCount += 1
+    }
+}

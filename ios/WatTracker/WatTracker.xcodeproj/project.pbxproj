@@ -68,6 +68,9 @@
 		1A0000000000000000000201 /* MobileScreenData.swift in Sources */ = {isa = PBXBuildFile; fileRef = 1A0000000000000000000200 /* MobileScreenData.swift */; };
 		1A0000000000000000000202 /* MobileScreenDataTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 1A0000000000000000000203 /* MobileScreenDataTests.swift */; };
 		1A0000000000000000000204 /* MobileScreenData.swift in Sources */ = {isa = PBXBuildFile; fileRef = 1A0000000000000000000200 /* MobileScreenData.swift */; };
+		1A0000000000000000000211 /* LocalBackend.swift in Sources */ = {isa = PBXBuildFile; fileRef = 1A0000000000000000000210 /* LocalBackend.swift */; };
+		1A0000000000000000000212 /* LocalBackendTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 1A0000000000000000000213 /* LocalBackendTests.swift */; };
+		1A0000000000000000000214 /* LocalBackend.swift in Sources */ = {isa = PBXBuildFile; fileRef = 1A0000000000000000000210 /* LocalBackend.swift */; };
 /* End PBXBuildFile section */
 
 /* Begin PBXFileReference section */
@@ -120,6 +123,8 @@
 		1A00000000000000000001B9 /* ActivitiesModelTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ActivitiesModelTests.swift; sourceTree = "<group>"; };
 		1A0000000000000000000200 /* MobileScreenData.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MobileScreenData.swift; sourceTree = "<group>"; };
 		1A0000000000000000000203 /* MobileScreenDataTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MobileScreenDataTests.swift; sourceTree = "<group>"; };
+		1A0000000000000000000210 /* LocalBackend.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = LocalBackend.swift; sourceTree = "<group>"; };
+		1A0000000000000000000213 /* LocalBackendTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = LocalBackendTests.swift; sourceTree = "<group>"; };
 /* End PBXFileReference section */
 
 /* Begin PBXFrameworksBuildPhase section */
@@ -190,6 +195,7 @@
 				1A0000000000000000000104 /* SnapshotCache.swift */,
 				1A0000000000000000000105 /* CloudSession.swift */,
 				1A0000000000000000000200 /* MobileScreenData.swift */,
+				1A0000000000000000000210 /* LocalBackend.swift */,
 				1A00000000000000000001B5 /* PairingCode.swift */,
 			);
 			path = Cloud;
@@ -207,6 +213,7 @@
 				1A00000000000000000001B7 /* PairingTests.swift */,
 				1A00000000000000000001B9 /* ActivitiesModelTests.swift */,
 				1A0000000000000000000203 /* MobileScreenDataTests.swift */,
+				1A0000000000000000000213 /* LocalBackendTests.swift */,
 			);
 			path = WatTrackerTests;
 			sourceTree = "<group>";
@@ -379,6 +386,7 @@
 				1A0000000000000000000124 /* SnapshotCache.swift in Sources */,
 				1A0000000000000000000125 /* CloudSession.swift in Sources */,
 				1A0000000000000000000201 /* MobileScreenData.swift in Sources */,
+				1A0000000000000000000211 /* LocalBackend.swift in Sources */,
 				1A0000000000000000000190 /* RootView.swift in Sources */,
 				1A0000000000000000000191 /* Destination.swift in Sources */,
 				1A0000000000000000000192 /* SideRail.swift in Sources */,
@@ -418,6 +426,7 @@
 				1A0000000000000000000156 /* SnapshotCache.swift in Sources */,
 				1A0000000000000000000157 /* CloudSession.swift in Sources */,
 				1A0000000000000000000204 /* MobileScreenData.swift in Sources */,
+				1A0000000000000000000214 /* LocalBackend.swift in Sources */,
 				1A00000000000000000001C6 /* SessionGate.swift in Sources */,
 				1A00000000000000000001C7 /* PairingFailureMessage.swift in Sources */,
 				1A00000000000000000001C8 /* PairingCode.swift in Sources */,
@@ -431,6 +440,7 @@
 				1A00000000000000000001CF /* Panel.swift in Sources */,
 				1A00000000000000000001D1 /* ActivitiesModel.swift in Sources */,
 				1A00000000000000000001D2 /* ActivitiesModelTests.swift in Sources */,
+				1A0000000000000000000212 /* LocalBackendTests.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};

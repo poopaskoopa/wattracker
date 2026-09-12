@@ -17,7 +17,7 @@ struct DashboardScreen: View {
     /// a revoke performed in Settings would leave this screen holding a
     /// session that still believed it was paired, and it would keep rendering
     /// a signed-out rider's numbers until something forced it to reload.
-    @Environment(\.cloudSession) private var session
+    @Environment(\.readSession) private var session
     @State private var model = DashboardModel()
 
     var body: some View {
@@ -90,7 +90,7 @@ final class DashboardModel {
     /// credential means a sign-out or a revoke in Settings leaves this screen
     /// holding one that still believes it is paired, rendering a signed-out
     /// rider's numbers until something forces a reload.
-    func start(session: CloudSession?) async {
+    func start(session: (any ReadSession)?) async {
         guard !started else { return }
         started = true
 

@@ -3,7 +3,7 @@ import SwiftUI
 
 struct ActivitiesScreen: View {
     /// The one session, owned by `SessionGate` and injected by `AppGate`.
-    @Environment(\.cloudSession) private var session
+    @Environment(\.readSession) private var session
     @Environment(\.horizontalSizeClass) private var horizontalSizeClass
     @State private var model = ActivitiesModel()
 
@@ -186,7 +186,7 @@ private struct RideMetric: View {
 
 private struct ActivityDetailScreen: View {
     let ride: RideSummary
-    let session: CloudSession
+    let session: any ReadSession
     @State private var detail: ActivityDetail?
     @State private var streams: ActivityStreams?
     @State private var detailError: String?
