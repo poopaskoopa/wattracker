@@ -172,54 +172,60 @@ The list gives the **order**. GitHub gives the **state** — always
 (#234's scope grew a whole section after it was filed) and its labels move.
 If the two disagree, GitHub wins and the queue is stale; say so.
 
-1. **#274's review items — finish #156.** The PR is open on
-   `agent2/156-cloud-sync` and it is close: enrollment, pairing, QR, device
-   management, a single background scheduler, bounded backoff and keyring-only
-   credentials all landed, and its 3149-pass claim was reproduced
-   independently. It is held on one bug, and it is the one criterion #156
-   calls non-negotiable: **the enable/disable checkbox is inoperative after
-   enrollment.** `server.py:4857-4863` — the endpoint field is prefilled, so
-   every later save posts an endpoint with an empty invitation, raises
-   `ValueError("Enter both the cloud endpoint and invitation.")`, has it
-   swallowed by a bare `except Exception`, and never reaches
-   `sync.set_enabled()`. The rider cannot turn cloud sync off from the UI at
-   all. `tests/test_desktop_cloud_routes.py:47` misses it because its fake
-   returns no `endpoint`, so fix the fake in the same commit. Second, the kill
-   switch does not cover pairing or device administration — `mint_pairing_code`,
-   `list_devices` and `revoke_device` still emit signed outbound requests with
-   `enabled=False`. Then the pairing code living in the signed-but-unencrypted
-   session cookie, silent revocation failures, and a transient exception that
-   permanently unschedules a user. The full list and the merge gate are in the
-   review comments on the PR.
+1. **#276 — finish #272. The PR is open and REFUTED; a test fails on it.**
+   `agent2/272-late-completion`. The design is right and almost every point of
+   the spec landed as asked — the two-pass matcher is real, pass 2 is
+   genuinely globally sorted by `(lag, score, start_time)` rather than
+   per-workout greedy, and mutation checks confirm the new tests bite. It is
+   held on one piece of collateral damage: `activities_on_date` was rewritten
+   to delegate to the new `activities_between` (`db.py:3894-3921`), which
+   deleted its no-cutoff fast path. That path used naive prefix matching on
+   the stored UTC string; the replacement always converts through
+   `to_user_timezone(...).date()`, so **which day an activity comes back on
+   changed for every caller.** `races.py:466` (`_matching_activity`)
+   deliberately looks up by the UTC race date and converts to local itself, so
+   it now misses, and `tests/test_weight.py::test_a_zwift_race_weight_is_filed_on_the_local_date`
+   fails deterministically — `1 failed, 3147 passed` on the branch, green on
+   `main`. The fix is narrow: leave `activities_on_date` exactly as it is on
+   `main`, fast path included, and let `activities_between` be a genuinely
+   separate function. Sharing row-filtering internals is fine; changing an
+   existing function's observable behaviour is not. Also
+   `tests/test_completion.py:62` is vacuous — it still passes with backward
+   matching fully enabled, because the fetch range never reaches a ride dated
+   before the only workout; add a second, earlier workout so it bites. **Run
+   the whole suite before pushing.** The 247-test focused subset is what hid
+   this.
 
-2. **#258's residuals — the local iOS backend.** PR #268 merged 2026-09-13
-   (`6462204`) and seven of the nine review findings are genuinely fixed,
-   including the 403 blocker. Eight items remain, and the first three are one
-   story: each ends with a rider who holds a working credential being asked to
-   pair again. A landing-path mismatch still reaches `markRemoved()` with no
-   backoff; selecting "This desktop" while local is unpaired strands a working
-   cloud pairing with no in-app route back; and `pair`/`pairLocal` persist the
-   backend switch before the attempt succeeds. Then the read backend that
-   writes — `authenticate()` follows its redirect into `GET /`, which runs
-   `retire_elapsed_ooto_adjustments` and `apply_adaptations`, so opening the
-   phone app can adapt the plan. Ordered into three groups in the issue
-   comment. **One iOS issue at a time** — `project.pbxproj` conflicts on
-   concurrent edits. The device-run half of #258 is not agent work and stays
-   open regardless.
+2. **#156's three product questions, and #277's items 3 to 9.** #156 is closed
+   (PR #274, `2586f14`) but the questions it asked for *instead of defaults*
+   were never answered — the only answer that exists anywhere is the string
+   "every 15 minutes" in `settings.html:217-218`, as UI copy with no
+   reasoning, and the reader-context expiry is not addressed at all. Answer
+   all three in a comment on #156: when sync runs and why that interval, what
+   the rider sees during a normal offline period, and what they see when a
+   reader context expires after 300 s. Then take #277 items 3 to 9 — a silent
+   no-op when the endpoint is edited without an invitation, enabling applied
+   before enrollment succeeds, an unguarded requeue that kills the scheduler
+   thread for every user, the full snapshot recomputation on every wake-up,
+   the 1 Hz poll with sync off, and the inconsistent POST/redirect/GET that
+   makes a browser refresh mint a fresh bearer code. **Item 1 is being
+   handled separately and item 2 is an owner decision — do not take either.**
 
-3. **#272 — a plan workout ridden late is never marked completed.**
-   `match_plan_completions` pins its search to the workout's own date, so a
-   Tuesday session ridden Wednesday is recorded as missed plus an unrelated
-   ride, and everything downstream of `completed_activity_id` — compliance,
-   the calendar's marks, plan adherence — under-counts a rider who trains a
-   day or two off-schedule. Since #269 the export layer and the completion
-   layer actively disagree: the file stays live for 7 days, the match only
-   ever succeeds on day 0. **The four open decisions in the body are settled
-   in the issue comment** — 7-day forward-only window, `completed_date` reads
-   the activity's date, and a two-pass matcher (same-day first, then late
-   pairs sorted by lag) that preserves same-day first refusal by construction.
-   The standalone one-off path has the identical bug and is in scope. Fully
-   local: no hardware, no deployment, no cloud.
+3. **#258's follow-ups from the #275 review.** #275 merged (`90bede6`) and all
+   eight residuals are fixed, but the review left three worth acting on, and
+   the first is real: **`Location` is compared as an exact string.**
+   `LocalBackend.swift:191` requires `response.location == "/"`, and Starlette
+   emits the relative `/` — but a reverse proxy in front of the desktop
+   (nginx `proxy_redirect`, Apache `ProxyPassReverse`) may rewrite it to an
+   absolute URL, after which the rider can never authenticate; every attempt
+   is `unexpectedLanding`. Given that the settled deployment story is "any
+   non-public TLS terminator, rider's choice", this is reachable. It fails
+   closed, so it is availability rather than security. Fix:
+   `URL(string: location, relativeTo: baseURL)`, then assert same-origin and
+   `path == "/"`. The other two are recorded on the PR and are informational.
+   **One iOS issue at a time** — `project.pbxproj` conflicts on concurrent
+   edits. #258 stays open for the device run regardless.
+
 4. **#249 — rotating full-suite test flakes. Re-scoped: do not spend more
    local runs on it.** 1 to 4 failures per full run, a different test each
    time, each green in isolation and under heavy synthetic CPU load.
@@ -238,20 +244,38 @@ If the two disagree, GitHub wins and the queue is stale; say so.
    The 37 other files with `_register` helpers that discard their response get
    swept once the cause is known, not before.
 
-**Done since this list was last written.** **#268** merged 2026-09-13
-(`6462204`): the iOS app can now read the local desktop server as a second
-backend over HTTPS, with connector-ticket auth, device-only Keychain
-credentials and a snapshot cache kept separate from the cloud one; #258 stays
-open for the eight residual items and the device run. **#269** merged
+**Done since this list was last written.** **Cloud sync is on.** **#274**
+merged 2026-09-13 (`2586f14`) and closed **#156**: the desktop app enrols,
+pairs, manages devices and pushes on a background scheduler with bounded
+backoff, credentials in the OS keyring only, and sync state in schema v36
+carrying no cloud secrets. Two things are recorded on #156 rather than here —
+the kill-switch criterion now has one deliberate, commented exception
+(revocation is allowed while sync is off), and the three product questions it
+asked for are still unanswered. Residue is **#277**. **#268** merged
+2026-09-13 (`6462204`): the iOS app can read the local desktop server as a
+second backend over HTTPS, with connector-ticket auth, device-only Keychain
+credentials and a snapshot cache kept separate from the cloud one. **#275**
+merged the same day (`90bede6`) and fixed all eight of its residuals — a
+transient failure no longer unpairs, the backend picker works and persists,
+and the "read" backend no longer writes (it stops at the 303 instead of
+following into `GET /`, which was running `retire_elapsed_ooto_adjustments`
+and `apply_adaptations` on every phone authentication). #258 stays open for
+the device run and the `Location` string-comparison follow-up. **#273** merged
+(`d7ddbf0`): one-off workout exports are pruned on the same grace window as
+plan workouts. **#269** merged
 2026-09-13 (`e06280c`): the Zwift export manifest now prunes an uncompleted
 plan workout more than `EXPORT_GRACE_DAYS` (7) days past, so a skipped session
 stops lingering in Zwift's custom-workout list forever while a ride done a few
 days late still finds its file — and **#272**, filed from that work, is the
-completion side catching up to it. **#270** is open: two workflows still claimed
+completion side catching up to it. **#270** merged (`0ef56d9`): two workflows still claimed
 hosted runners were blocked at the account level, which stopped being true
-when this repo went public — `macos-release.yml` is re-enabled and
-`ios-release.yml`'s false justification for its self-hosted pin is replaced
-with the real trade-off. The iOS screens all landed: **#161 as PR #253**,
+when this repo went public — `macos-release.yml` is re-enabled on
+`macos-latest` and `ios-release.yml`'s false justification for its self-hosted
+pin is replaced with the real trade-off. Its guard test moved with it:
+`test_release_workflow_is_tag_only_and_hard_disabled` required the very `if:
+${{ false }}` the change removes, so it now asserts the gate that actually
+remains — `environment: macos-code-signing`. **Note for the next tag:** that
+signed macOS release job has never run. Watch the first `v*` tag. The iOS screens all landed: **#161 as PR #253**,
 **#162 as PR #254** and **#163 as PR #256** (PRs #228 and #235 closed as
 superseded). **#193 landed as PR #257** — the repository now has an `android/`
 tree. #234 merged as PR #240 after an on-device run; #233 landed in PR #238;
