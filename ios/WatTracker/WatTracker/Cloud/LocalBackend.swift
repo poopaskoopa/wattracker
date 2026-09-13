@@ -188,7 +188,9 @@ struct LocalClient: Sendable {
         }
         // Stop before GET /: rendering the desktop dashboard performs plan
         // maintenance, which a read-only mobile authentication must not trigger.
-        guard response.location == "/", !(response.setCookie?.isEmpty ?? true) else {
+        guard isExpectedRootLanding(response.location),
+              !(response.setCookie?.isEmpty ?? true)
+        else {
             throw Failure.unexpectedLanding(
                 expected: "/", actual: response.location ?? response.url.path
             )
@@ -287,6 +289,26 @@ struct LocalClient: Sendable {
             return .unauthorized
         }
         return .http(status: response.status, path: path, retryAfter: response.retryAfter)
+    }
+
+    private func isExpectedRootLanding(_ location: String?) -> Bool {
+        guard let location,
+              !location.isEmpty,
+              location == location.trimmingCharacters(in: .whitespacesAndNewlines),
+              let landing = URL(string: location, relativeTo: baseURL)?.absoluteURL,
+              let components = URLComponents(
+                url: landing, resolvingAgainstBaseURL: false
+              ),
+              landing.scheme?.lowercased() == baseURL.scheme?.lowercased(),
+              landing.host?.lowercased() == baseURL.host?.lowercased(),
+              (landing.port ?? 443) == (baseURL.port ?? 443),
+              landing.user == nil,
+              landing.password == nil,
+              landing.query == nil,
+              landing.fragment == nil,
+              components.percentEncodedPath.isEmpty || components.percentEncodedPath == "/"
+        else { return false }
+        return true
     }
 
     private func endpoint(_ path: String, query: [URLQueryItem] = []) throws -> URL {
