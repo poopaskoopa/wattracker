@@ -31,7 +31,7 @@ from .timeutil import (
 
 _log = logging.getLogger(__name__)
 
-SCHEMA_VERSION = 35
+SCHEMA_VERSION = 36
 
 
 def _restrict_db_files(path: str) -> None:
@@ -460,12 +460,17 @@ _MIGRATIONS: Dict[int, Sequence[Union[str, Callable[[sqlite3.Connection], None]]
         # _SCHEMA after migrating. They contain no local source data to
         # backfill; an empty ledger means the first opt-in push is a full one.
     ],
+    35: [
+        # New per-user cloud sync state is created by _SCHEMA after migrating.
+        # It contains no credentials or source data to backfill.
+    ],
 }
 
 _DROP = """
 DROP TABLE IF EXISTS cloud_publication_state;
 DROP TABLE IF EXISTS cloud_publication_pending;
 DROP TABLE IF EXISTS cloud_publication_ledger;
+DROP TABLE IF EXISTS cloud_sync_state;
 DROP TABLE IF EXISTS weight_history;
 DROP TABLE IF EXISTS connector_devices;
 DROP TABLE IF EXISTS curve_cache;
@@ -904,6 +909,21 @@ CREATE TABLE IF NOT EXISTS cloud_publication_state (
     last_revision INTEGER NOT NULL,
     FOREIGN KEY(user_id) REFERENCES users(id)
 );
+
+-- Durable control-plane state for opt-in desktop cloud sync.  This table
+-- intentionally contains no invitation, signing key, subscription key, or
+-- other credential material; those values belong exclusively in the OS
+-- keyring-backed CloudCredentialStore.
+CREATE TABLE IF NOT EXISTS cloud_sync_state (
+    user_id          INTEGER PRIMARY KEY,
+    enabled          INTEGER NOT NULL DEFAULT 0 CHECK (enabled IN (0, 1)),
+    endpoint         TEXT,
+    last_success_at  REAL,
+    retry_count      INTEGER NOT NULL DEFAULT 0 CHECK (retry_count >= 0),
+    next_retry_at    REAL,
+    last_error       TEXT,
+    FOREIGN KEY(user_id) REFERENCES users(id)
+);
 """
 
 
@@ -1121,6 +1141,140 @@ def get_user_by_id(user_id: int, path: Optional[str] = None) -> Optional[dict]:
             "SELECT id, username, created FROM users WHERE id = ?", (user_id,)
         ).fetchone()
         return dict(row) if row else None
+    finally:
+        conn.close()
+
+
+def get_cloud_sync_state(
+    user_id: int, path: Optional[str] = None,
+) -> dict:
+    """Return non-secret durable cloud control state for one local user."""
+    if isinstance(user_id, bool) or not isinstance(user_id, int) or user_id < 1:
+        raise ValueError("user_id must be positive")
+    conn = connect(path)
+    try:
+        row = conn.execute(
+            "SELECT enabled, endpoint, last_success_at, retry_count, "
+            "next_retry_at, last_error FROM cloud_sync_state WHERE user_id = ?",
+            (user_id,),
+        ).fetchone()
+        if row is None:
+            return {
+                "enabled": False,
+                "endpoint": None,
+                "last_success_at": None,
+                "retry_count": 0,
+                "next_retry_at": None,
+                "last_error": None,
+            }
+        return {
+            "enabled": bool(row["enabled"]),
+            "endpoint": row["endpoint"],
+            "last_success_at": row["last_success_at"],
+            "retry_count": int(row["retry_count"]),
+            "next_retry_at": row["next_retry_at"],
+            "last_error": row["last_error"],
+        }
+    finally:
+        conn.close()
+
+
+def save_cloud_sync_state(
+    user_id: int, updates: dict, path: Optional[str] = None,
+) -> dict:
+    """Atomically update non-secret cloud control state for one local user."""
+    if isinstance(user_id, bool) or not isinstance(user_id, int) or user_id < 1:
+        raise ValueError("user_id must be positive")
+    if not isinstance(updates, dict):
+        raise TypeError("updates must be a dict")
+    allowed = {
+        "enabled", "endpoint", "last_success_at", "retry_count",
+        "next_retry_at", "last_error",
+    }
+    if not set(updates) <= allowed:
+        raise ValueError("unknown cloud sync state field")
+    conn = connect(path)
+    try:
+        exists = conn.execute(
+            "SELECT 1 FROM users WHERE id = ?", (user_id,)
+        ).fetchone()
+        if exists is None:
+            raise ValueError("unknown user")
+        row = conn.execute(
+            "SELECT enabled, endpoint, last_success_at, retry_count, "
+            "next_retry_at, last_error FROM cloud_sync_state WHERE user_id = ?",
+            (user_id,),
+        ).fetchone()
+        current = {
+            "enabled": bool(row["enabled"]) if row else False,
+            "endpoint": row["endpoint"] if row else None,
+            "last_success_at": row["last_success_at"] if row else None,
+            "retry_count": int(row["retry_count"]) if row else 0,
+            "next_retry_at": row["next_retry_at"] if row else None,
+            "last_error": row["last_error"] if row else None,
+        }
+        current.update(updates)
+        enabled = current["enabled"]
+        if not isinstance(enabled, bool):
+            raise ValueError("enabled must be a boolean")
+        retry_count = current["retry_count"]
+        if (
+            isinstance(retry_count, bool)
+            or not isinstance(retry_count, int)
+            or retry_count < 0
+        ):
+            raise ValueError("retry_count must be a non-negative integer")
+        endpoint = current["endpoint"]
+        if endpoint is not None and not isinstance(endpoint, str):
+            raise ValueError("endpoint must be text or null")
+        last_error = current["last_error"]
+        if last_error is not None and not isinstance(last_error, str):
+            raise ValueError("last_error must be text or null")
+        if last_error is not None and len(last_error) > 2048:
+            raise ValueError("last_error is too long")
+        for field_name in ("last_success_at", "next_retry_at"):
+            value = current[field_name]
+            if value is not None:
+                if (
+                    isinstance(value, bool)
+                    or not isinstance(value, (int, float))
+                    or not math.isfinite(float(value))
+                ):
+                    raise ValueError(f"{field_name} must be a finite number or null")
+        conn.execute(
+            "INSERT INTO cloud_sync_state "
+            "(user_id, enabled, endpoint, last_success_at, retry_count, "
+            "next_retry_at, last_error) VALUES (?, ?, ?, ?, ?, ?, ?) "
+            "ON CONFLICT(user_id) DO UPDATE SET enabled=excluded.enabled, "
+            "endpoint=excluded.endpoint, last_success_at=excluded.last_success_at, "
+            "retry_count=excluded.retry_count, next_retry_at=excluded.next_retry_at, "
+            "last_error=excluded.last_error",
+            (
+                user_id, int(enabled), endpoint, current["last_success_at"],
+                retry_count, current["next_retry_at"], last_error,
+            ),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+    return current
+
+
+def enabled_cloud_sync_users(path: Optional[str] = None) -> list[dict]:
+    """Return enabled users and their durable retry deadlines."""
+    conn = connect(path)
+    try:
+        rows = conn.execute(
+            "SELECT user_id, next_retry_at FROM cloud_sync_state "
+            "WHERE enabled = 1"
+        ).fetchall()
+        return [
+            {
+                "user_id": int(row["user_id"]),
+                "next_retry_at": row["next_retry_at"],
+            }
+            for row in rows
+        ]
     finally:
         conn.close()
 

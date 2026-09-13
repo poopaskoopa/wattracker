@@ -39,6 +39,22 @@ from .fit_parser import parse_fit
 
 log = logging.getLogger(__name__)
 
+_activity_import_hook: Optional[Callable[[int], None]] = None
+
+
+def set_activity_import_hook(hook: Optional[Callable[[int], None]]) -> None:
+    """Install the process-local callback used by background integrations."""
+    global _activity_import_hook
+    _activity_import_hook = hook
+
+
+def _notify_activity_import(user_id: int) -> None:
+    if _activity_import_hook is not None:
+        try:
+            _activity_import_hook(user_id)
+        except Exception:
+            log.warning("activity integration hook failed", exc_info=True)
+
 
 _log = logging.getLogger(__name__)
 
@@ -867,6 +883,7 @@ def scan_activities(
         profile_store.refresh(user_id)
         from ..metrics import curve_store
         curve_store.ensure(user_id)
+        _notify_activity_import(user_id)
 
     return {
         "found": found,
@@ -945,6 +962,7 @@ def save_ride_record(
             log.warning(
                 "rider profile refresh after in-app ride failed", exc_info=True
             )
+        _notify_activity_import(user_id)
     return activity_id, record
 
 
@@ -993,6 +1011,8 @@ def ingest_upload(
                 # Same reasoning as scan_activities: a new ride can move every
                 # measured capacity, and prescriptions read the stored snapshot.
                 profile_store.refresh(user_id)
+            if result is not None:
+                _notify_activity_import(user_id)
         return result
     finally:
         try:
