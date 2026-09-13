@@ -4049,6 +4049,13 @@ def activities_on_date(
     user_id: int, date_iso: str, path: Optional[str] = None
 ) -> List[dict]:
     """Activity summaries whose start_time falls on the given date."""
+    return activities_between(user_id, date_iso, date_iso, path)
+
+
+def activities_between(
+    user_id: int, start_iso: str, end_iso: str, path: Optional[str] = None
+) -> List[dict]:
+    """Activity summaries on rider-local dates in the inclusive range."""
     conn = connect(path)
     try:
         rows = conn.execute(
@@ -4056,18 +4063,13 @@ def activities_on_date(
             "ORDER BY start_time ASC", (user_id,)
         ).fetchall()
         settings = get_user_settings(user_id, path)
-        if not settings.get("history_start_date"):
-            return [
-                _row_summary(r) for r in rows
-                if isinstance(r["start_time"], str)
-                and r["start_time"].startswith(date_iso)
-            ]
         visible = _visible_rows(conn, user_id, rows)
         return [
             _row_summary(r) for r in visible
             if (parse_naive(r["start_time"]) is not None and
-                to_user_timezone(parse_naive(r["start_time"]), settings.get("timezone"))
-                .date().isoformat() == date_iso)
+                start_iso <= to_user_timezone(
+                    parse_naive(r["start_time"]), settings.get("timezone")
+                ).date().isoformat() <= end_iso)
         ]
     finally:
         conn.close()

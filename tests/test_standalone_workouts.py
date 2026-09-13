@@ -187,6 +187,54 @@ def test_profile_matching_requires_date_user_and_target_similarity(user_id):
     assert stored["effective_ftp"] == pytest.approx(210, rel=.02)
 
 
+def test_standalone_matches_on_grace_boundary_and_records_activity_date(user_id):
+    scheduled = "2026-07-12"
+    workout_id, xml = _workout(user_id, key="late", date=scheduled)
+    target = importer._zwo_fraction_profile(xml)
+    activity_id = _activity(
+        user_id, DATE, [fraction * 210 for fraction in target], suffix="late"
+    )
+
+    assert importer.match_standalone_completions(
+        user_id, dt.datetime.fromisoformat(f"{DATE}T20:00:00")
+    ) == 1
+    stored = db.get_standalone_workout(user_id, workout_id)
+    assert stored["completed_activity_id"] == activity_id
+    assert stored["completed_date"] == DATE
+
+
+def test_standalone_same_day_gets_first_refusal_before_late_match(user_id):
+    older, xml = _workout(user_id, key="older", date="2026-07-18")
+    same_day, _ = _workout(user_id, key="same-day", date=DATE)
+    target = importer._zwo_fraction_profile(xml)
+    activity_id = _activity(
+        user_id, DATE, [fraction * 210 for fraction in target], suffix="refusal"
+    )
+
+    assert importer.match_standalone_completions(
+        user_id, dt.datetime.fromisoformat(f"{DATE}T20:00:00")
+    ) == 1
+    assert db.get_standalone_workout(user_id, same_day)["completed_activity_id"] == activity_id
+    assert db.get_standalone_workout(user_id, older)["completed_activity_id"] is None
+
+
+def test_standalone_same_day_beats_late_plan_candidate(user_id):
+    late_plan, xml = _plan_workout(
+        user_id, key="late-plan", date="2026-07-18"
+    )
+    same_day, _ = _workout(user_id, key="same-day", date=DATE)
+    target = importer._zwo_fraction_profile(xml)
+    activity_id = _activity(
+        user_id, DATE, [fraction * 210 for fraction in target], suffix="cross-table"
+    )
+
+    assert importer.match_standalone_completions(
+        user_id, dt.datetime.fromisoformat(f"{DATE}T20:00:00")
+    ) == 1
+    assert db.get_standalone_workout(user_id, same_day)["completed_activity_id"] == activity_id
+    assert db.get_plan_workout(user_id, late_plan)["completed_activity_id"] is None
+
+
 def test_threshold_does_not_match_same_duration_endurance_profile(user_id):
     """Structure separates these; neither average power nor scale can.
 

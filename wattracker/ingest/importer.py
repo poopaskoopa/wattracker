@@ -34,7 +34,7 @@ from ..metrics import profile_store
 from ..prescribe.plan import HARD_STEADY_POWER
 from ..ramp_test import SOURCE as RAMP_TEST_SOURCE, is_declared_ftp_test
 from ..rpc import ConnectorUnavailable
-from ..timeutil import parse_naive, utc_now, utc_today
+from ..timeutil import parse_naive, to_user_timezone, utc_now, utc_today
 from .fit_parser import parse_fit
 
 log = logging.getLogger(__name__)
@@ -1025,6 +1025,9 @@ def ingest_upload(
 # An activity completes a same-day plan workout when its duration or TSS is
 # within this relative tolerance of the prescription.
 COMPLETION_TOLERANCE = 0.30
+# Seven days matches the export grace period: while a workout remains available
+# to ride, completing it late must still satisfy the scheduled commitment.
+COMPLETION_GRACE_DAYS = 7
 
 
 def _zwo_fraction_profile(zwo_str: str) -> List[float]:
@@ -1243,61 +1246,26 @@ def plan_workout_completion_verified(user_id: int, workout: dict) -> bool:
     activity = db.get_activity(user_id, workout["completed_activity_id"])
     if not activity or duration <= 0:
         return False
+    started = parse_naive(activity.get("start_time"))
     try:
-        activity_date = _dt.datetime.fromisoformat(
-            str(activity.get("start_time") or "")
-        ).date().isoformat()
+        scheduled = _dt.date.fromisoformat(str(workout.get("date") or ""))
+        completed = _dt.date.fromisoformat(str(workout.get("completed_date") or ""))
     except (TypeError, ValueError):
         return False
-    if activity_date != workout.get("date"):
+    if started is None:
+        return False
+    timezone = db.get_user_settings(user_id).get("timezone")
+    activity_date = to_user_timezone(started, timezone).date()
+    if (
+        activity_date != completed
+        or not 0 <= (completed - scheduled).days <= COMPLETION_GRACE_DAYS
+    ):
         return False
     duration_error = abs(float(activity.get("duration_s") or 0) - duration) / duration
     if duration_error > STANDALONE_DURATION_TOLERANCE:
         return False
     evidence = _profile_evidence(activity, workout)
     return bool(evidence and evidence[0] >= PROFILE_MIN_COMPLIANCE)
-
-
-def _match_standalone_completions(
-    user_id: int, now: Optional[_dt.datetime] = None
-) -> int:
-    """Match persisted one-off exports using date, duration and target profile."""
-    db.init_db()
-    now = now or utc_now()
-    used = db.completed_activity_ids(user_id)
-    marked = 0
-    for workout in db.incomplete_standalone_workouts_up_to(
-        user_id, now.date().isoformat()
-    ):
-        best = None
-        best_score = None
-        for summary in db.activities_on_date(user_id, workout["scheduled_date"]):
-            if summary["id"] in used:
-                continue
-            plan_duration = float(workout.get("duration_s") or 0)
-            if plan_duration <= 0:
-                continue
-            duration_error = abs(float(summary.get("duration_s") or 0) - plan_duration) / plan_duration
-            if duration_error > STANDALONE_DURATION_TOLERANCE:
-                continue
-            activity = db.get_activity(user_id, summary["id"])
-            evidence = _profile_evidence(activity or {}, workout)
-            if evidence is None:
-                continue
-            compliance, effective = evidence
-            if compliance < PROFILE_MIN_COMPLIANCE:
-                continue
-            score = duration_error + (1.0 - compliance)
-            if best_score is None or score < best_score:
-                best = (summary, compliance, effective)
-                best_score = score
-        if best and db.mark_standalone_completed(
-            user_id, workout["id"], best[0]["id"], workout["scheduled_date"],
-            best[1], best[2],
-        ):
-            used.add(best[0]["id"])
-            marked += 1
-    return marked
 
 
 def _completion_score(activity: dict, workout: dict) -> Optional[float]:
@@ -1320,6 +1288,123 @@ def _completion_score(activity: dict, workout: dict) -> Optional[float]:
     if plan_tss > 0 and abs(act_tss - plan_tss) / plan_tss <= COMPLETION_TOLERANCE:
         return COMPLETION_TOLERANCE + abs(act_tss - plan_tss) / plan_tss
     return None
+
+
+def _plan_candidate_score(
+    activity: dict, workout: dict, full_activity: dict
+) -> Optional[tuple]:
+    evidence = _profile_evidence(full_activity, workout)
+    duration = float(workout.get("duration_s") or 0)
+    duration_error = (
+        abs(float(activity.get("duration_s") or 0) - duration) / duration
+        if duration > 0 else 999.0
+    )
+    if _requires_power_profile(workout):
+        if evidence is None or duration_error > STANDALONE_DURATION_TOLERANCE:
+            return None
+        compliance, effective = evidence
+        if compliance < PROFILE_MIN_COMPLIANCE:
+            return None
+        return duration_error + (1.0 - compliance), compliance, effective
+    fallback = _completion_score(activity, workout)
+    if fallback is None:
+        return None
+    return 1.0 + fallback, None, None
+
+
+def _standalone_candidate_score(
+    activity: dict, workout: dict, full_activity: dict
+) -> Optional[tuple]:
+    duration = float(workout.get("duration_s") or 0)
+    if duration <= 0:
+        return None
+    duration_error = abs(
+        float(activity.get("duration_s") or 0) - duration
+    ) / duration
+    if duration_error > STANDALONE_DURATION_TOLERANCE:
+        return None
+    evidence = _profile_evidence(full_activity, workout)
+    if evidence is None or evidence[0] < PROFILE_MIN_COMPLIANCE:
+        return None
+    compliance, effective = evidence
+    return duration_error + (1.0 - compliance), compliance, effective
+
+
+def _match_completion_candidates(
+    workouts: List[dict],
+    scheduled_key: str,
+    activities_by_date: Dict[str, List[dict]],
+    used: set,
+    full_activity: Callable[[int], dict],
+    score_candidate: Callable[[dict, dict, dict], Optional[tuple]],
+    mark_completed: Callable[[dict, dict, str, Optional[float], Optional[float]], bool],
+) -> tuple:
+    """Match same-day candidates and return the workouts still unmatched."""
+    marked = 0
+    remaining = []
+
+    # Preserve the established plan-order and best-score same-day behavior.
+    for workout in workouts:
+        scheduled = workout[scheduled_key]
+        best = None
+        for activity in activities_by_date.get(scheduled, []):
+            if activity["id"] in used:
+                continue
+            scored = score_candidate(
+                activity, workout, full_activity(activity["id"]) or {}
+            )
+            if scored is not None and (best is None or scored[0] < best[0]):
+                best = (*scored, activity)
+        if best is not None and mark_completed(
+            workout, best[3], scheduled, best[1], best[2]
+        ):
+            used.add(best[3]["id"])
+            marked += 1
+        else:
+            remaining.append(workout)
+    return marked, remaining
+
+
+def _match_late_completion_candidates(
+    workouts: List[dict],
+    scheduled_key: str,
+    activities_by_date: Dict[str, List[dict]],
+    used: set,
+    full_activity: Callable[[int], dict],
+    score_candidate: Callable[[dict, dict, dict], Optional[tuple]],
+    mark_completed: Callable[[dict, dict, str, Optional[float], Optional[float]], bool],
+) -> int:
+    """Match remaining workouts by global lag, score, and start-time order."""
+    marked = 0
+    candidates = []
+    for workout in workouts:
+        scheduled = _dt.date.fromisoformat(workout[scheduled_key])
+        for lag in range(1, COMPLETION_GRACE_DAYS + 1):
+            activity_date = (scheduled + _dt.timedelta(days=lag)).isoformat()
+            for activity in activities_by_date.get(activity_date, []):
+                if activity["id"] in used:
+                    continue
+                scored = score_candidate(
+                    activity, workout, full_activity(activity["id"]) or {}
+                )
+                if scored is not None:
+                    candidates.append((
+                        lag, scored[0], str(activity.get("start_time") or ""),
+                        workout, activity, activity_date, scored[1], scored[2],
+                    ))
+
+    candidates.sort(key=lambda candidate: candidate[:3])
+    completed_workouts = set()
+    for _, _, _, workout, activity, activity_date, compliance, effective in candidates:
+        if workout["id"] in completed_workouts or activity["id"] in used:
+            continue
+        if mark_completed(
+            workout, activity, activity_date, compliance, effective
+        ):
+            completed_workouts.add(workout["id"])
+            used.add(activity["id"])
+            marked += 1
+    return marked
 
 
 def match_plan_workout_completion(
@@ -1475,58 +1560,94 @@ def manually_complete_plan_workout(user_id: int, workout_id: int) -> str:
 
 
 def match_plan_completions(user_id: int, now: Optional[_dt.datetime] = None) -> int:
-    """Mark plan workouts completed by matching same-day activities.
-
-    For every not-yet-completed plan workout dated today or earlier, find the
-    user's best-matching activity on that date (each activity completes at most
-    one workout). Returns the number of workouts newly marked completed.
-    """
+    """Match scheduled and one-off workouts, including rides up to seven days late."""
     db.init_db()
     now = now or utc_now()
-    # Scheduled plan commitments always get first refusal on same-day rides.
-    marked = 0
+    today = now.date().isoformat()
+    plan_workouts = db.incomplete_plan_workouts_up_to(user_id, today)
+    standalone_workouts = db.incomplete_standalone_workouts_up_to(user_id, today)
+    workout_dates = (
+        [workout["date"] for workout in plan_workouts]
+        + [workout["scheduled_date"] for workout in standalone_workouts]
+    )
+    if not workout_dates:
+        return 0
+
+    activities = db.activities_between(user_id, min(workout_dates), today)
+    timezone = db.get_user_settings(user_id).get("timezone")
+    activities_by_date: Dict[str, List[dict]] = {}
+    for activity in activities:
+        started = parse_naive(activity.get("start_time"))
+        if started is None:
+            continue
+        activity_date = to_user_timezone(started, timezone).date().isoformat()
+        activities_by_date.setdefault(activity_date, []).append(activity)
+
     used = db.completed_activity_ids(user_id)
-    for workout in db.incomplete_plan_workouts_up_to(user_id, now.date().isoformat()):
-        best = None
-        best_score = None
-        for act in db.activities_on_date(user_id, workout["date"]):
-            if act["id"] in used:
-                continue
-            full = db.get_activity(user_id, act["id"])
-            evidence = _profile_evidence(full or {}, workout)
-            duration = float(workout.get("duration_s") or 0)
-            duration_error = (
-                abs(float(act.get("duration_s") or 0) - duration) / duration
-                if duration > 0 else 999.0
+    activity_cache = {}
+
+    def full_activity(activity_id: int) -> dict:
+        if activity_id not in activity_cache:
+            activity_cache[activity_id] = db.get_activity(user_id, activity_id)
+        return activity_cache[activity_id]
+
+    plan_marked, remaining_plan = _match_completion_candidates(
+        plan_workouts,
+        "date",
+        activities_by_date,
+        used,
+        full_activity,
+        _plan_candidate_score,
+        lambda workout, activity, completed_date, compliance, effective: (
+            db.mark_plan_workout_completed(
+                user_id, workout["id"], activity["id"], completed_date,
+                compliance, effective,
             )
-            if _requires_power_profile(workout):
-                if (
-                    evidence is not None
-                    and duration_error <= STANDALONE_DURATION_TOLERANCE
-                ):
-                    compliance, effective = evidence
-                    score = (
-                        duration_error + (1.0 - compliance)
-                        if compliance >= PROFILE_MIN_COMPLIANCE
-                        else None
-                    )
-                else:
-                    compliance = effective = None
-                    score = None
-            else:
-                compliance = effective = None
-                fallback = _completion_score(act, workout)
-                score = 1.0 + fallback if fallback is not None else None
-            if score is not None and (best_score is None or score < best_score):
-                best, best_score = (act, compliance, effective), score
-        if best is not None:
-            if db.mark_plan_workout_completed(
-                user_id, workout["id"], best[0]["id"], workout["date"],
-                best[1], best[2],
-            ):
-                used.add(best[0]["id"])
-                marked += 1
-    return marked + _match_standalone_completions(user_id, now)
+        ),
+    )
+    standalone_marked, remaining_standalone = _match_completion_candidates(
+        standalone_workouts,
+        "scheduled_date",
+        activities_by_date,
+        used,
+        full_activity,
+        _standalone_candidate_score,
+        lambda workout, activity, completed_date, compliance, effective: (
+            db.mark_standalone_completed(
+                user_id, workout["id"], activity["id"], completed_date,
+                compliance, effective,
+            )
+        ),
+    )
+    plan_late = _match_late_completion_candidates(
+        remaining_plan,
+        "date",
+        activities_by_date,
+        used,
+        full_activity,
+        _plan_candidate_score,
+        lambda workout, activity, completed_date, compliance, effective: (
+            db.mark_plan_workout_completed(
+                user_id, workout["id"], activity["id"], completed_date,
+                compliance, effective,
+            )
+        ),
+    )
+    standalone_late = _match_late_completion_candidates(
+        remaining_standalone,
+        "scheduled_date",
+        activities_by_date,
+        used,
+        full_activity,
+        _standalone_candidate_score,
+        lambda workout, activity, completed_date, compliance, effective: (
+            db.mark_standalone_completed(
+                user_id, workout["id"], activity["id"], completed_date,
+                compliance, effective,
+            )
+        ),
+    )
+    return plan_marked + standalone_marked + plan_late + standalone_late
 
 
 def match_standalone_completions(
