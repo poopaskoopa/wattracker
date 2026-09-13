@@ -59,9 +59,128 @@ def test_no_match_outside_tolerance(user_id):
     assert importer.match_plan_completions(user_id, NOW) == 0
 
 
-def test_no_match_on_other_days(user_id):
+def test_pre_workout_activity_does_not_match(user_id):
+    workout_id = _plan_workout(user_id, "2026-07-10", duration_s=3600)
+    earlier_workout_id = _plan_workout(
+        user_id, "2026-07-09", duration_s=1200, tss=15.0
+    )
+    _activity(user_id, "2026-07-09T08:00:00", seconds=3600)
+    assert importer.match_plan_completions(user_id, NOW) == 0
+    assert db.get_plan_workout(user_id, workout_id)["completed_activity_id"] is None
+    assert db.get_plan_workout(user_id, earlier_workout_id)["completed_activity_id"] is None
+
+
+@pytest.mark.parametrize("scheduled, expected", [
+    ("2026-07-03", 1),  # exact seven-day grace boundary
+    ("2026-07-02", 0),  # one day beyond it
+])
+def test_late_completion_grace_boundary(user_id, scheduled, expected):
+    workout_id = _plan_workout(user_id, scheduled, duration_s=3600)
+    activity_id = _activity(user_id, "2026-07-10T08:00:00", seconds=3600)
+
+    assert importer.match_plan_completions(user_id, NOW) == expected
+    workout = db.get_plan_workout(user_id, workout_id)
+    assert workout["completed_activity_id"] == (activity_id if expected else None)
+    assert workout["completed_date"] == ("2026-07-10" if expected else None)
+
+
+def test_late_candidates_prefer_nearest_workout_then_score(user_id):
+    plan_id = db.create_plan(user_id, "P", "2026-07-06", 1)
+    monday = db.add_plan_workout(
+        plan_id, user_id, "2026-07-06", "Monday", "endurance",
+        3600, 60.0, "<x/>",
+    )
+    friday = db.add_plan_workout(
+        plan_id, user_id, "2026-07-10", "Friday", "endurance",
+        3300, 60.0, "<x/>",
+    )
+    exact_monday_ride = _activity(
+        user_id, "2026-07-11T08:00:00", seconds=3600
+    )
+    remaining_ride = _activity(
+        user_id, "2026-07-11T09:00:00", seconds=4500
+    )
+
+    assert importer.match_plan_completions(
+        user_id, dt.datetime(2026, 7, 11, 18, 0)
+    ) == 2
+    assert db.get_plan_workout(user_id, friday)["completed_activity_id"] == exact_monday_ride
+    assert db.get_plan_workout(user_id, monday)["completed_activity_id"] == remaining_ride
+
+
+def test_same_day_workout_keeps_first_refusal_over_late_candidate(user_id):
+    plan_id = db.create_plan(user_id, "P", "2026-07-09", 1)
+    thursday = db.add_plan_workout(
+        plan_id, user_id, "2026-07-09", "Thursday", "endurance",
+        3600, 60.0, "<x/>",
+    )
+    friday = db.add_plan_workout(
+        plan_id, user_id, "2026-07-10", "Friday", "endurance",
+        3600, 60.0, "<x/>",
+    )
+    activity_id = _activity(user_id, "2026-07-10T08:00:00", seconds=3600)
+
+    assert importer.match_plan_completions(user_id, NOW) == 1
+    assert db.get_plan_workout(user_id, friday)["completed_activity_id"] == activity_id
+    assert db.get_plan_workout(user_id, thursday)["completed_activity_id"] is None
+
+
+def test_late_profile_completion_remains_verified(user_id):
+    session = build_workout("threshold", 60)
+    xml = zwo.zwo_string(session)
+    profile = importer._zwo_fraction_profile(xml)
+    plan_id = db.create_plan(user_id, "Profile", "2026-07-09", 1)
+    workout_id = db.add_plan_workout(
+        plan_id, user_id, "2026-07-09", session.name, "threshold",
+        session.total_duration(), session.estimated_tss, xml,
+    )
+    activity_id = db.insert_activity(
+        user_id,
+        {
+            "dedup_hash": "late-profile",
+            "filename": "late-profile.fit",
+            "start_time": "2026-07-10T10:00:00",
+            "duration_s": len(profile),
+            "distance_m": 0,
+            "avg_power": 210,
+            "avg_hr": None,
+            "np": 210,
+            "if_": 1.0,
+            "tss": session.estimated_tss,
+            "streams": {"power": [power * 210 for power in profile]},
+        },
+    )
+
+    assert importer.match_plan_completions(user_id, NOW) == 1
+    workout = db.get_plan_workout(user_id, workout_id)
+    assert workout["completed_activity_id"] == activity_id
+    assert workout["completed_date"] == "2026-07-10"
+    assert importer.plan_workout_completion_verified(user_id, workout)
+
+
+def test_completion_matching_fetches_one_activity_range(user_id, monkeypatch):
     _plan_workout(user_id, "2026-07-09", duration_s=3600)
-    _activity(user_id, "2026-07-10T08:00:00", seconds=3600)  # a day late
+    _activity(user_id, "2026-07-10T08:00:00", seconds=3600)
+    original = db.activities_between
+    calls = []
+
+    def counted(*args, **kwargs):
+        calls.append((args, kwargs))
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(db, "activities_between", counted)
+    monkeypatch.setattr(
+        db, "activities_on_date",
+        lambda *args, **kwargs: pytest.fail("per-date activity query used"),
+    )
+
+    assert importer.match_plan_completions(user_id, NOW) == 1
+    assert len(calls) == 1
+
+
+def test_activity_after_today_is_not_considered(user_id):
+    _plan_workout(user_id, "2026-07-10", duration_s=3600)
+    _activity(user_id, "2026-07-11T08:00:00", seconds=3600)
     assert importer.match_plan_completions(user_id, NOW) == 0
 
 
