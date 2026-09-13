@@ -33,15 +33,14 @@ final class LocalBackendTests: XCTestCase {
         }
     }
 
-    func testAuthenticateUsesBearerTokenAndRedeemsTicketWithoutPersistingIt() async throws {
-        let redeemURL = URL(string: "https://desktop.example/")!
+    func testAuthenticateStopsAtRedeemRedirectAndRequiresSessionCookie() async throws {
         let transport = ScriptedLocalTransport([
             LocalResponse(
                 status: 200,
                 body: Data(#"{"ticket":"one-time-ticket"}"#.utf8),
                 url: URL(string: "https://desktop.example/api/connector/session")!
             ),
-            LocalResponse(status: 200, body: Data("<html>home</html>".utf8), url: redeemURL),
+            successfulRedeem(),
         ])
         let client = try LocalClient(
             baseURL: baseURL, token: "device-token", transport: transport
@@ -59,6 +58,29 @@ final class LocalBackendTests: XCTestCase {
         XCTAssertEqual(transport.requests[1].queryItems["token"], "one-time-ticket")
     }
 
+    func testRedirectDelegateDoesNotFollowRedeemIntoDashboard() throws {
+        let delegate = LocalRedirectDelegate(origin: baseURL)
+        let redeemURL = try XCTUnwrap(
+            URL(string: "https://desktop.example/connector/session?token=ticket")
+        )
+        let task = URLSession.shared.dataTask(with: redeemURL)
+        let response = try XCTUnwrap(
+            HTTPURLResponse(
+                url: redeemURL, statusCode: 303, httpVersion: nil,
+                headerFields: ["Location": "/"]
+            )
+        )
+        var redirectedRequest: URLRequest? = URLRequest(url: baseURL)
+
+        delegate.urlSession(
+            .shared, task: task, willPerformHTTPRedirection: response,
+            newRequest: URLRequest(url: baseURL)
+        ) { redirectedRequest = $0 }
+
+        XCTAssertNil(redirectedRequest)
+        task.cancel()
+    }
+
     func test403KeepsCredentialAndReturnsRequestedCache() async throws {
         let credential = try LocalCredential(
             baseURL: baseURL.absoluteString, token: "device-token"
@@ -69,7 +91,7 @@ final class LocalBackendTests: XCTestCase {
                 body: Data(#"{"ticket":"ticket"}"#.utf8),
                 url: URL(string: "https://desktop.example/api/connector/session")!
             ),
-            LocalResponse(status: 200, body: Data(), url: baseURL.appendingPathComponent("/")),
+            successfulRedeem(),
             LocalResponse(
                 status: 403, body: Data(), url: baseURL.appendingPathComponent("/api/state")
             ),
@@ -98,6 +120,68 @@ final class LocalBackendTests: XCTestCase {
 
         XCTAssertEqual(snapshot.source, .cache)
         XCTAssertEqual(snapshot.items, [cachedState])
+        let state = await session.deviceState
+        XCTAssertEqual(state, .paired)
+        XCTAssertNotNil(store.load())
+        XCTAssertNotNil(cache.load(.dashboard))
+    }
+
+    func testSameOriginAuthenticationLandingIsRetriedWithoutRemovingDevice() async throws {
+        let credential = try LocalCredential(
+            baseURL: baseURL.absoluteString, token: "device-token"
+        )
+        let transport = ScriptedLocalTransport([
+            LocalResponse(
+                status: 200,
+                body: Data(#"{"ticket":"ticket-1"}"#.utf8),
+                url: baseURL.appendingPathComponent("/api/connector/session")
+            ),
+            LocalResponse(
+                status: 303, body: Data(),
+                url: baseURL.appendingPathComponent("/connector/session"),
+                location: "/login"
+            ),
+            LocalResponse(
+                status: 200,
+                body: Data(#"{"ticket":"ticket-2"}"#.utf8),
+                url: baseURL.appendingPathComponent("/api/connector/session")
+            ),
+            successfulRedeem(),
+            LocalResponse(
+                status: 403, body: Data(),
+                url: baseURL.appendingPathComponent("/api/state")
+            ),
+        ])
+        let store = MemoryLocalCredentialStore(credential: credential)
+        let cache = MemorySnapshotCache()
+        let cachedState = CloudFixtures.item(
+            id: "training-state", kind: "training_state", revision: 0,
+            data: #"{"ftp":250}"#
+        )
+        cache.store(
+            CachedCollection(revision: 0, items: [cachedState], storedAt: Date()),
+            for: .dashboard
+        )
+        let session = LocalSession(
+            credentials: store,
+            cache: cache,
+            makeClient: { value in
+                try LocalClient(
+                    baseURL: URL(string: value.baseURL)!, token: value.token,
+                    transport: transport
+                )
+            }
+        )
+
+        let snapshot = try await session.load(.dashboard)
+
+        XCTAssertEqual(snapshot.source, .cache)
+        XCTAssertEqual(snapshot.items, [cachedState])
+        XCTAssertEqual(
+            transport.requests.filter { $0.url?.path == "/api/connector/session" }.count,
+            2,
+            "the first authentication failure must be retried"
+        )
         let state = await session.deviceState
         XCTAssertEqual(state, .paired)
         XCTAssertNotNil(store.load())
@@ -133,7 +217,7 @@ final class LocalBackendTests: XCTestCase {
                 body: Data(#"{"ticket":"ticket"}"#.utf8),
                 url: URL(string: "https://desktop.example/api/connector/session")!
             ),
-            LocalResponse(status: 200, body: Data(), url: baseURL.appendingPathComponent("/")),
+            successfulRedeem(),
             LocalResponse(
                 status: 200,
                 body: Data(#"{"weeks":[[{"date":"2026-01-02"},{"date":"2025-12-31"}]]}"#.utf8),
@@ -166,6 +250,14 @@ final class LocalBackendTests: XCTestCase {
         XCTAssertEqual(februarySnapshot.items.compactMap(Self.calendarDate), ["2026-02-03"])
         XCTAssertEqual(fallback.source, .cache)
         XCTAssertEqual(fallback.items.compactMap(Self.calendarDate), ["2026-01-02"])
+        XCTAssertEqual(
+            session.cached(.calendar, month: january)?.items.compactMap(Self.calendarDate),
+            ["2026-01-02"]
+        )
+        XCTAssertEqual(
+            session.cached(.calendar, month: february)?.items.compactMap(Self.calendarDate),
+            ["2026-02-03"]
+        )
         let calendarRequests = transport.requests.filter { $0.url?.path == "/api/calendar" }
         XCTAssertEqual(calendarRequests[0].queryItems["year"], "2026")
         XCTAssertEqual(calendarRequests[0].queryItems["month"], "1")
@@ -183,7 +275,7 @@ final class LocalBackendTests: XCTestCase {
                 body: Data(#"{"ticket":"ticket"}"#.utf8),
                 url: URL(string: "https://desktop.example/api/connector/session")!
             ),
-            LocalResponse(status: 200, body: Data(), url: baseURL.appendingPathComponent("/")),
+            successfulRedeem(),
             LocalResponse(
                 status: 200,
                 body: Data(#"{"ftp":250,"cp":300,"wprime":18000}"#.utf8),
@@ -242,14 +334,14 @@ final class LocalBackendTests: XCTestCase {
                 body: Data(#"{"ticket":"ticket-1"}"#.utf8),
                 url: URL(string: "https://desktop.example/api/connector/session")!
             ),
-            LocalResponse(status: 200, body: Data(), url: baseURL.appendingPathComponent("/")),
+            successfulRedeem(),
             LocalResponse(status: 401, body: Data(), url: baseURL.appendingPathComponent("/api/state")),
             LocalResponse(
                 status: 200,
                 body: Data(#"{"ticket":"ticket-2"}"#.utf8),
                 url: URL(string: "https://desktop.example/api/connector/session")!
             ),
-            LocalResponse(status: 200, body: Data(), url: baseURL.appendingPathComponent("/")),
+            successfulRedeem(),
             LocalResponse(status: 401, body: Data(), url: baseURL.appendingPathComponent("/api/state")),
         ])
         let store = MemoryLocalCredentialStore(credential: credential)
@@ -284,5 +376,13 @@ final class LocalBackendTests: XCTestCase {
     private static func calendarDate(_ item: CloudItem) -> String? {
         guard case let .calendarDay(day) = item.payload else { return nil }
         return day.date
+    }
+
+    private func successfulRedeem() -> LocalResponse {
+        LocalResponse(
+            status: 303, body: Data(),
+            url: baseURL.appendingPathComponent("/connector/session"),
+            location: "/", setCookie: "session=authenticated; Secure; HttpOnly"
+        )
     }
 }

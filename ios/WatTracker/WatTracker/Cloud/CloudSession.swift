@@ -62,6 +62,7 @@ protocol ReadSession: Sendable {
     var deviceState: CloudSession.DeviceState { get async }
     var lastSuccess: Date? { get async }
     nonisolated func cached(_ route: CloudRoute) -> CloudSnapshot?
+    nonisolated func cached(_ route: CloudRoute, month: CalendarMonth?) -> CloudSnapshot?
     func load(_ route: CloudRoute) async throws -> CloudSnapshot
     func load(_ route: CloudRoute, month: CalendarMonth?) async throws -> CloudSnapshot
     func activityDetail(_ activityID: Int) async throws -> ActivityDetail
@@ -69,6 +70,10 @@ protocol ReadSession: Sendable {
 }
 
 extension ReadSession {
+    nonisolated func cached(_ route: CloudRoute, month: CalendarMonth?) -> CloudSnapshot? {
+        cached(route)
+    }
+
     func load(_ route: CloudRoute, month: CalendarMonth? = nil) async throws -> CloudSnapshot {
         try await load(route)
     }

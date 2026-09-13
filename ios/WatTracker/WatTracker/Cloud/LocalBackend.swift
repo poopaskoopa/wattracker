@@ -4,14 +4,19 @@ struct LocalResponse: Sendable {
     let status: Int
     let body: Data
     let url: URL
+    let location: String?
+    let setCookie: String?
     let retryAfter: TimeInterval?
     let serverDate: Date?
 
     init(status: Int, body: Data, url: URL,
+         location: String? = nil, setCookie: String? = nil,
          retryAfter: TimeInterval? = nil, serverDate: Date? = nil) {
         self.status = status
         self.body = body
         self.url = url
+        self.location = location
+        self.setCookie = setCookie
         self.retryAfter = retryAfter
         self.serverDate = serverDate
     }
@@ -23,7 +28,7 @@ protocol LocalTransport: Sendable {
 
 /// Redirects are limited to the configured desktop origin. There is no trust
 /// delegate here: system TLS validation remains the only certificate policy.
-private final class LocalRedirectDelegate: NSObject, URLSessionTaskDelegate {
+final class LocalRedirectDelegate: NSObject, URLSessionTaskDelegate {
     let origin: URL
 
     init(origin: URL) {
@@ -37,6 +42,10 @@ private final class LocalRedirectDelegate: NSObject, URLSessionTaskDelegate {
         newRequest request: URLRequest,
         completionHandler: @escaping (URLRequest?) -> Void
     ) {
+        if task.originalRequest?.url?.path == "/connector/session" {
+            completionHandler(nil)
+            return
+        }
         guard let target = request.url, sameOrigin(origin, target) else {
             completionHandler(nil)
             return
@@ -51,12 +60,14 @@ private final class LocalRedirectDelegate: NSObject, URLSessionTaskDelegate {
     }
 }
 
-struct URLSessionLocalTransport: LocalTransport {
+final class URLSessionLocalTransport: LocalTransport, @unchecked Sendable {
     private let session: URLSession
+    private let ownsSession: Bool
 
     init(baseURL: URL, session: URLSession? = nil) {
         if let session {
             self.session = session
+            self.ownsSession = false
         } else {
             let configuration = URLSessionConfiguration.ephemeral
             configuration.urlCache = nil
@@ -72,6 +83,13 @@ struct URLSessionLocalTransport: LocalTransport {
                 delegate: LocalRedirectDelegate(origin: baseURL),
                 delegateQueue: nil
             )
+            self.ownsSession = true
+        }
+    }
+
+    deinit {
+        if ownsSession {
+            session.invalidateAndCancel()
         }
     }
 
@@ -84,6 +102,8 @@ struct URLSessionLocalTransport: LocalTransport {
             status: http.statusCode,
             body: data,
             url: url,
+            location: http.value(forHTTPHeaderField: "Location"),
+            setCookie: http.value(forHTTPHeaderField: "Set-Cookie"),
             retryAfter: HTTPHeaderDates.retryAfterSeconds(
                 http.value(forHTTPHeaderField: "Retry-After")
             ),
@@ -97,6 +117,7 @@ struct LocalClient: Sendable {
         case insecureOrInvalidBaseURL
         case missingToken
         case unauthorized
+        case unexpectedLanding(expected: String, actual: String)
         case http(status: Int, path: String, retryAfter: TimeInterval?)
         case malformedResponse(String)
 
@@ -105,6 +126,8 @@ struct LocalClient: Sendable {
             case .insecureOrInvalidBaseURL: return "The desktop address must use HTTPS"
             case .missingToken: return "The desktop token is missing"
             case .unauthorized: return "The local device token was refused"
+            case let .unexpectedLanding(expected, actual):
+                return "Expected \(expected), landed on \(actual)"
             case let .http(status, path, _): return "HTTP \(status) from \(path)"
             case let .malformedResponse(path): return "Malformed response from \(path)"
             }
@@ -160,12 +183,16 @@ struct LocalClient: Sendable {
         var redeem = URLRequest(url: redeemURL)
         redeem.httpMethod = "GET"
         let response = try await transport.send(redeem)
-        guard (200..<300).contains(response.status) else {
+        guard response.status == 303 else {
             throw map(response, path: "/connector/session")
         }
-        // A valid ticket lands on the authenticated home page. Reject any
-        // other landing path, including /login or /welcome, even if it is a 200.
-        guard response.url.path == "/" else { throw Failure.unauthorized }
+        // Stop before GET /: rendering the desktop dashboard performs plan
+        // maintenance, which a read-only mobile authentication must not trigger.
+        guard response.location == "/", !(response.setCookie?.isEmpty ?? true) else {
+            throw Failure.unexpectedLanding(
+                expected: "/", actual: response.location ?? response.url.path
+            )
+        }
     }
 
     func trainingState() async throws -> TrainingState {
@@ -243,7 +270,11 @@ struct LocalClient: Sendable {
         }
         // URLSession follows the desktop auth middleware's redirect to /login;
         // accepting that HTML as a JSON response would hide a revoked token.
-        guard response.url.path == expectedPath else { throw Failure.unauthorized }
+        guard response.url.path == expectedPath else {
+            throw Failure.unexpectedLanding(
+                expected: expectedPath, actual: response.url.path
+            )
+        }
         do {
             return try JSONDecoder().decode(T.self, from: response.body)
         } catch {
@@ -316,10 +347,16 @@ actor LocalSession: ReadSession {
     var lastSuccess: Date? { lastSuccessfulRead }
 
     nonisolated func cached(_ route: CloudRoute) -> CloudSnapshot? {
+        cached(route, month: route == .calendar ? CalendarMonth.current() : nil)
+    }
+
+    nonisolated func cached(
+        _ route: CloudRoute, month: CalendarMonth?
+    ) -> CloudSnapshot? {
         guard let cached = cache.load(route) else { return nil }
         let items: [CloudItem]
         if route == .calendar {
-            let month = CalendarMonth.current()
+            let month = month ?? CalendarMonth.current()
             items = Self.calendarItems(cached.items, for: month)
             guard !items.isEmpty else { return nil }
         } else {
@@ -552,13 +589,14 @@ actor LocalSession: ReadSession {
     ) async throws -> T {
         let generation = lifecycleGeneration
         guard let client else { throw LocalClient.Failure.insecureOrInvalidBaseURL }
-        try await ensureAuthenticated()
-        try validate(generation)
         do {
+            try await ensureAuthenticated()
+            try validate(generation)
             let value = try await operation(client)
             try validate(generation)
             return value
-        } catch LocalClient.Failure.unauthorized {
+        } catch LocalClient.Failure.unauthorized,
+                LocalClient.Failure.unexpectedLanding {
             try validate(generation)
             authenticated = false
             try await ensureAuthenticated()
@@ -612,6 +650,10 @@ actor LocalSession: ReadSession {
         if let failure = error as? LocalClient.Failure {
             switch failure {
             case .unauthorized: return .deviceRemoved
+            case let .unexpectedLanding(expected, actual):
+                return .server(.malformedResponse(
+                    "local expected \(expected), landed on \(actual)"
+                ))
             case let .http(status, path, retryAfter):
                 if status == 429 || status == 503 {
                     return .throttled(retryAfter: retryAfter ?? 30)

@@ -51,6 +51,7 @@ struct PairingScreen: View {
             .background(Palette.bg)
         }
         .task { model.refreshCameraAccess() }
+        .onAppear { model.appeared(gate: gate) }
     }
 
     private var form: some View {
@@ -76,6 +77,9 @@ struct PairingScreen: View {
                         }
                     }
                     .pickerStyle(.segmented)
+                    .onChange(of: model.backend) { _, backend in
+                        Task { await model.selectBackend(backend, gate: gate) }
+                    }
 
                     if model.backend == .cloud {
                         field(
@@ -274,6 +278,15 @@ final class PairingModel {
         cameraAccess = CameraAccess.current
     }
 
+    func appeared(gate: SessionGate) {
+        backend = gate.backend
+    }
+
+    func selectBackend(_ backend: SessionGate.Backend, gate: SessionGate) async {
+        self.backend = backend
+        await gate.selectBackend(backend)
+    }
+
     func requestCamera() async {
         cameraAccess = await CameraAccess.request()
     }
@@ -331,10 +344,10 @@ final class PairingModel {
             case .cloud:
                 try await gate.pair(code: typed, label: name.isEmpty ? nil : name)
             case .local:
+                localToken = ""
                 try await gate.pairLocal(
                     host: host, token: token, label: name.isEmpty ? nil : name
                 )
-                localToken = ""
             }
             // Nothing else to do: the gate's phase is already `.paired` and
             // `AppGate` has replaced this screen with the shell.

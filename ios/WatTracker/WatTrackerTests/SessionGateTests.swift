@@ -24,13 +24,17 @@ final class SessionGateTests: XCTestCase {
 
     private final class MemoryPreferenceStore: SessionGate.PreferenceStore, @unchecked Sendable {
         var backend: SessionGate.Backend?
+        private(set) var savedBackends: [SessionGate.Backend] = []
 
         init(_ backend: SessionGate.Backend? = nil) {
             self.backend = backend
         }
 
         func loadBackend() -> SessionGate.Backend? { backend }
-        func saveBackend(_ backend: SessionGate.Backend) { self.backend = backend }
+        func saveBackend(_ backend: SessionGate.Backend) {
+            self.backend = backend
+            savedBackends.append(backend)
+        }
     }
 
     private func harness(
@@ -115,7 +119,7 @@ final class SessionGateTests: XCTestCase {
         XCTAssertEqual(preference.loadBackend(), .local)
     }
 
-    func testSelectingAnUnpairedLocalBackendEntersPairing() async {
+    func testPairingScreenCanReturnFromUnpairedLocalToPairedCloud() async {
         let preference = MemoryPreferenceStore()
         let rig = harness(paired: true) { _, _ in .refused(404) }
         let local = LocalSession(
@@ -134,6 +138,15 @@ final class SessionGateTests: XCTestCase {
         XCTAssertEqual(gate.phase, .unpaired)
         XCTAssertEqual(preference.backend, .local)
         XCTAssertNil(gate.lastSuccess)
+
+        let model = PairingModel()
+        model.appeared(gate: gate)
+        XCTAssertEqual(model.backend, .local)
+        await model.selectBackend(.cloud, gate: gate)
+
+        XCTAssertEqual(gate.backend, .cloud)
+        XCTAssertEqual(gate.phase, .paired)
+        XCTAssertEqual(preference.backend, .cloud)
     }
 
     func testRemovingLocalFallsBackToPairedCloud() async {
@@ -169,6 +182,23 @@ final class SessionGateTests: XCTestCase {
             return XCTFail("expected .unusable, got \(gate.phase)")
         }
         XCTAssertNil(gate.session)
+    }
+
+    func testMissingSelectedLocalSessionDoesNotLeaveGateStarting() async {
+        struct NoLocalStore: Error {}
+        let preference = MemoryPreferenceStore(.local)
+        let rig = harness(paired: false) { _, _ in .refused(404) }
+        let gate = SessionGate(
+            makeSession: { rig.session },
+            makeLocalSession: { throw NoLocalStore() },
+            preferences: preference
+        )
+
+        await gate.start()
+
+        XCTAssertEqual(gate.backend, .local)
+        XCTAssertEqual(gate.phase, .unpaired)
+        XCTAssertNil(gate.lastSuccess)
     }
 
     // MARK: - Pairing
@@ -207,6 +237,33 @@ final class SessionGateTests: XCTestCase {
         }
         XCTAssertEqual(rig.gate.phase, .unpaired)
         XCTAssertNil(rig.credentials.load())
+    }
+
+    func testFailedLocalPairingDoesNotPersistAttemptedBackend() async {
+        let preference = MemoryPreferenceStore(.cloud)
+        let rig = harness(paired: true) { _, _ in .refused(404) }
+        let local = LocalSession(
+            credentials: MemoryLocalCredentialStore(),
+            cache: MemorySnapshotCache(),
+            makeClient: { _ in throw URLError(.cannotConnectToHost) }
+        )
+        let gate = SessionGate(
+            makeSession: { rig.session },
+            makeLocalSession: { local },
+            preferences: preference
+        )
+        await gate.start()
+        let savesBeforePairing = preference.savedBackends
+
+        do {
+            try await gate.pairLocal(
+                host: "https://desktop.example", token: "device-token", label: nil
+            )
+            XCTFail("a failed local pairing must throw")
+        } catch {}
+
+        XCTAssertEqual(preference.savedBackends, savesBeforePairing)
+        XCTAssertEqual(preference.backend, .cloud)
     }
 
     // MARK: - Leaving

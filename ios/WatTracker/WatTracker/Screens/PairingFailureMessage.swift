@@ -59,6 +59,8 @@ enum PairingFailureMessage {
                 return "Enter the connector token from the desktop web settings."
             case .unauthorized:
                 return codeRefused
+            case .unexpectedLanding:
+                return "The desktop's reply could not be read. This app may need updating."
             case let .http(status, _, retryAfter):
                 if status == 429 || status == 503 { return busy(retryAfter: retryAfter) }
                 return codeRefused
