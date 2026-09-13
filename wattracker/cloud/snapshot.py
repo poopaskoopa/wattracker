@@ -1025,6 +1025,30 @@ def snapshot_counts(path: str | os.PathLike[str], user_id: int) -> dict[str, int
         return result
 
 
+def pending_snapshot_objects(
+    path: str | os.PathLike[str], user_id: int,
+) -> int:
+    """Count objects in the durable prepared batch, without creating one."""
+    if isinstance(user_id, bool) or not isinstance(user_id, int) or user_id < 1:
+        raise ValueError("user_id must be positive")
+    with readonly_connection(path) as conn:
+        if not _publication_schema_available(conn):
+            return 0
+        rows = conn.execute(
+            "SELECT objects_json FROM cloud_publication_pending "
+            "WHERE user_id = ?", (user_id,),
+        ).fetchall()
+        total = 0
+        for row in rows:
+            try:
+                objects = json.loads(row["objects_json"])
+                if isinstance(objects, list):
+                    total += len(objects)
+            except (TypeError, ValueError, json.JSONDecodeError):
+                continue
+        return total
+
+
 def snapshot_objects(
     path: str | os.PathLike[str],
     user_id: int,
@@ -1033,6 +1057,7 @@ def snapshot_objects(
     include_streams: bool = False,
     include_derived: bool = True,
     offset: int = 0,
+    derived_first: bool = False,
 ) -> list[CloudObject]:
     """Read a bounded, user-scoped object snapshot on a separate connection.
 
@@ -1103,7 +1128,10 @@ def snapshot_objects(
                 detail_objects.append(detail)
                 if include_streams and stream is not None:
                     detail_objects.append(stream)
-        objects = activity_objects + detail_objects + derived_objects
+        if derived_first and derived_enabled:
+            objects = derived_objects + activity_objects + detail_objects
+        else:
+            objects = activity_objects + detail_objects + derived_objects
         return objects[offset : offset + limit]
 
 
@@ -1169,15 +1197,19 @@ def _content_digest(obj: CloudObject) -> str:
 
 def _snapshot_options_digest(
     *, include_streams: bool, include_derived: bool, limit: int, offset: int,
+    derived_first: bool = False,
 ) -> str:
+    options = {
+        "include_derived": bool(include_derived),
+        "include_streams": bool(include_streams),
+        "limit": limit,
+        "offset": offset,
+        "version": 1,
+    }
+    if derived_first:
+        options["derived_first"] = True
     material = json.dumps(
-        {
-            "include_derived": bool(include_derived),
-            "include_streams": bool(include_streams),
-            "limit": limit,
-            "offset": offset,
-            "version": 1,
-        },
+        options,
         sort_keys=True, separators=(",", ":"),
     ).encode("utf-8")
     return hashlib.sha256(material).hexdigest()
@@ -1207,7 +1239,7 @@ def _batch_identifier(
 
 def _all_snapshot_objects(
     path: str | os.PathLike[str], user_id: int, *,
-    include_streams: bool, include_derived: bool,
+    include_streams: bool, include_derived: bool, derived_first: bool = False,
 ) -> list[CloudObject]:
     """Read the complete deterministic snapshot through bounded pages."""
     objects: list[CloudObject] = []
@@ -1217,6 +1249,7 @@ def _all_snapshot_objects(
             path, user_id, limit=MAX_BATCH_OBJECTS,
             include_streams=include_streams,
             include_derived=include_derived,
+            derived_first=derived_first,
             offset=offset,
         )
         if not page:
@@ -1288,6 +1321,7 @@ def snapshot_batch(
     include_streams: bool = False,
     include_derived: bool = True,
     offset: int = 0,
+    derived_first: bool = False,
     previously_published: Optional[Mapping[str, Mapping[str, object]]] = None,
     complete: Optional[bool] = None,
     republish: bool = False,
@@ -1323,6 +1357,7 @@ def snapshot_batch(
         objects = snapshot_objects(
             path, user_id, limit=limit, include_streams=include_streams,
             include_derived=include_derived, offset=offset,
+            derived_first=derived_first,
         )
         if complete is None:
             complete = offset == 0 and len(objects) < limit
@@ -1342,17 +1377,17 @@ def snapshot_batch(
 
     current = _all_snapshot_objects(
         path, user_id, include_streams=include_streams,
-        include_derived=include_derived,
+        include_derived=include_derived, derived_first=derived_first,
     )
     current_by_key = {(obj.kind, obj.object_id): obj for obj in current}
     options_digest = _snapshot_options_digest(
         include_streams=include_streams, include_derived=include_derived,
-        limit=limit, offset=offset,
+        limit=limit, offset=offset, derived_first=derived_first,
     )
 
     # A hand-built legacy fixture may not have the current schema. Preserve
     # the old pure-read behavior there; initialized application databases have
-    # the ledger through migration 35.
+    # the ledger through migration 35 and sync state through migration 36.
     with _publication_connection(path) as conn:
         if not _publication_schema_available(conn):
             objects = current[offset : offset + limit]
@@ -1469,7 +1504,21 @@ def snapshot_batch(
             if revision is not None and resolved_revision <= max_revision:
                 raise ValueError("revision is not newer than the publication ledger")
 
-            candidates.sort(key=lambda obj: (obj.kind, obj.object_id))
+            if derived_first:
+                current_order = {
+                    (obj.kind, obj.object_id): index
+                    for index, obj in enumerate(current)
+                }
+                candidates.sort(key=lambda obj: (
+                    1 if obj.deleted else 0,
+                    current_order.get(
+                        (obj.kind, obj.object_id), len(current_order)
+                    ),
+                    obj.kind,
+                    obj.object_id,
+                ))
+            else:
+                candidates.sort(key=lambda obj: (obj.kind, obj.object_id))
             versioned_candidates = tuple(
                 obj if obj.revision == resolved_revision
                 else replace(obj, revision=resolved_revision)

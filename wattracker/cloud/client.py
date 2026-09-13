@@ -10,6 +10,8 @@ are kept in the local database so failed pushes can resume safely.
 from __future__ import annotations
 
 import json
+import inspect
+import re
 import secrets
 import ssl
 import time
@@ -17,7 +19,7 @@ from dataclasses import dataclass
 from typing import Any, Callable, Mapping, Optional
 from urllib.parse import urlsplit
 from urllib.error import HTTPError
-from urllib.request import Request, urlopen
+from urllib.request import HTTPRedirectHandler, HTTPSHandler, Request, build_opener
 
 from .models import SyncBatch
 from .security import canonical_request, digest_body, sign_request, sign_request_ed25519
@@ -30,8 +32,74 @@ from .snapshot import (
 )
 
 SYNC_PATH = "/api/v1/sync/batches"
+ENROLLMENT_PATH = "/api/v1/enrollment/complete"
+PAIRING_CODE_PATH = "/api/v1/devices/pairing-codes"
+DEVICES_PATH = "/api/v1/devices"
+PAIRING_IDEMPOTENCY_KEY = "device-pairing-code"
+DEVICE_LIST_IDEMPOTENCY_KEY = "device-list"
+DEVICE_REVOKE_IDEMPOTENCY_KEY = "device-revoke"
 OFFLINE_MESSAGE = "Cloud sync offline — local data and features are unaffected."
 MAX_RESPONSE_BYTES = 1 * 1024 * 1024
+_TOKEN_RE = re.compile(r"^[A-Za-z0-9_-]{16,256}$")
+_CREDENTIAL_ID_RE = re.compile(r"^[0-9a-f]{64}$")
+_NAMESPACE_RE = re.compile(r"^[0-9a-f]{64}$")
+_PUBLIC_KEY_RE = re.compile(r"^[0-9a-fA-F]{64}$")
+
+
+class CloudEnrollmentError(ValueError):
+    """Enrollment failed before a credential could be stored."""
+
+
+class _NoRedirect(HTTPRedirectHandler):
+    """Never forward signed cloud headers to a redirect target."""
+
+    def redirect_request(self, req, fp, code, msg, headers, new_url):
+        del req, fp, code, msg, headers, new_url
+        return None
+
+
+def validate_cloud_endpoint(endpoint: str) -> str:
+    """Validate and normalize a cloud base URL at the trust boundary."""
+    if not isinstance(endpoint, str) or not endpoint or len(endpoint) > 2048:
+        raise ValueError("cloud endpoint must be an absolute HTTPS URL")
+    if any(
+        char.isspace()
+        or char == "\\"
+        or ord(char) < 0x20
+        or ord(char) == 0x7f
+        for char in endpoint
+    ):
+        raise ValueError("cloud endpoint contains control characters")
+    parsed = urlsplit(endpoint)
+    try:
+        hostname = parsed.hostname
+        _ = parsed.port
+    except ValueError as exc:
+        raise ValueError("cloud endpoint is invalid") from exc
+    if (
+        parsed.scheme != "https"
+        or not parsed.netloc
+        or not hostname
+        or not hostname.isascii()
+        or parsed.username is not None
+        or parsed.password is not None
+        or parsed.query
+        or parsed.fragment
+    ):
+        raise ValueError("cloud endpoint must be an absolute HTTPS URL")
+    return endpoint.rstrip("/")
+
+
+def _validate_invitation(invitation: str) -> str:
+    if not isinstance(invitation, str) or not _TOKEN_RE.fullmatch(invitation):
+        raise CloudEnrollmentError("invalid enrollment invitation")
+    return invitation
+
+
+def _validate_public_key_hex(public_key: str) -> bytes:
+    if not isinstance(public_key, str) or not _PUBLIC_KEY_RE.fullmatch(public_key):
+        raise CloudEnrollmentError("invalid enrollment public key")
+    return bytes.fromhex(public_key)
 
 
 @dataclass(frozen=True)
@@ -77,16 +145,29 @@ def https_transport(
     context = ssl.create_default_context(cafile=ca_file)
     if client_certificate is not None and client_key is not None:
         context.load_cert_chain(client_certificate, client_key)
+    opener = build_opener(_NoRedirect, HTTPSHandler(context=context))
 
-    def send(url: str, headers: Mapping[str, str], body: bytes) -> tuple[int, bytes]:
-        request = Request(url, data=body, headers=dict(headers), method="POST")
+    def send(
+        url: str, headers: Mapping[str, str], body: bytes, method: str = "POST",
+    ) -> tuple[int, bytes]:
+        validate_cloud_endpoint(url.rsplit("/api/v1/", 1)[0])
+        method = method.upper()
+        if method not in {"GET", "POST"}:
+            raise ValueError("unsupported cloud method")
+        request = Request(
+            url,
+            data=None if method == "GET" else body,
+            headers=dict(headers),
+            method=method,
+        )
         try:
-            response = urlopen(request, context=context, timeout=timeout)
+            response = opener.open(request, timeout=timeout)
         except HTTPError as exc:
             return exc.code, exc.read(MAX_RESPONSE_BYTES)
         with response:
             return int(response.status), response.read(MAX_RESPONSE_BYTES)
 
+    send.supports_method = True  # type: ignore[attr-defined]
     return send
 
 
@@ -96,20 +177,147 @@ class CloudSyncClient:
     def __init__(
         self,
         endpoint: str,
-        credentials: SyncCredentials,
+        credentials: Optional[SyncCredentials] = None,
         *,
         transport: Optional[Callable[[str, Mapping[str, str], bytes], tuple[int, bytes]]] = None,
         mtls_headers: Optional[Mapping[str, str]] = None,
         clock: Callable[[], float] = time.time,
     ) -> None:
-        parsed = urlsplit(endpoint)
-        if parsed.scheme != "https" or not parsed.netloc or parsed.query or parsed.fragment:
-            raise ValueError("cloud endpoint must be an absolute HTTPS URL")
-        self.endpoint = endpoint.rstrip("/")
+        self.endpoint = validate_cloud_endpoint(endpoint)
         self.credentials = credentials
         self.transport = transport
         self.mtls_headers = dict(mtls_headers or {})
         self.clock = clock
+        self._transport_accepts_method = bool(
+            getattr(self.transport, "supports_method", False)
+        )
+        if self.transport is not None and not self._transport_accepts_method:
+            try:
+                signature = inspect.signature(self.transport)
+                parameters = tuple(signature.parameters.values())
+                self._transport_accepts_method = (
+                    any(p.kind == inspect.Parameter.VAR_POSITIONAL for p in parameters)
+                    or len(parameters) >= 4
+                )
+            except (TypeError, ValueError):
+                self._transport_accepts_method = False
+
+    def _request(
+        self, method: str, path: str, body: bytes,
+        *, headers: Optional[Mapping[str, str]] = None,
+    ) -> tuple[Optional[int], dict[str, Any]]:
+        if self.transport is None:
+            return None, {}
+        request_headers = {"Content-Length": str(len(body))}
+        if body:
+            request_headers["Content-Type"] = "application/json"
+        request_headers.update(self.mtls_headers)
+        request_headers.update(headers or {})
+        try:
+            if self._transport_accepts_method:
+                status, response_body = self.transport(
+                    self.endpoint + path, request_headers, body, method,
+                )
+            else:
+                status, response_body = self.transport(
+                    self.endpoint + path, request_headers, body,
+                )
+        except Exception:
+            return None, {}
+        try:
+            payload = json.loads(response_body.decode("utf-8"))
+            if not isinstance(payload, dict):
+                payload = {}
+        except (UnicodeDecodeError, json.JSONDecodeError, AttributeError):
+            payload = {}
+        try:
+            status_code = int(status)
+        except (TypeError, ValueError):
+            return None, {}
+        return status_code, payload
+
+    @classmethod
+    def enroll(
+        cls,
+        endpoint: str,
+        invitation: str,
+        *,
+        transport: Optional[Callable[..., tuple[int, bytes]]] = None,
+        mtls_headers: Optional[Mapping[str, str]] = None,
+        clock: Callable[[], float] = time.time,
+    ) -> SyncCredentials:
+        """Complete an invitation and return private material for keyring storage."""
+        endpoint = validate_cloud_endpoint(endpoint)
+        invitation = _validate_invitation(invitation)
+        try:
+            from .security import generate_signing_keypair
+            private_key, public_key = generate_signing_keypair()
+        except Exception as exc:
+            raise CloudEnrollmentError("cloud signing crypto is unavailable") from exc
+        client = cls(
+            endpoint, transport=transport, mtls_headers=mtls_headers, clock=clock,
+        )
+        body = json.dumps(
+            {"invitation": invitation, "public_key": public_key.hex()},
+            sort_keys=True, separators=(",", ":"),
+        ).encode("utf-8")
+        status, payload = client._request("POST", ENROLLMENT_PATH, body)
+        if status != 200:
+            raise CloudEnrollmentError("cloud enrollment failed")
+        credential_id = payload.get("credential")
+        subscription = payload.get("subscription_key")
+        namespace = payload.get("signing_namespace")
+        algorithm = payload.get("signature_algorithm", "ed25519")
+        if (
+            not isinstance(credential_id, str)
+            or not _CREDENTIAL_ID_RE.fullmatch(credential_id)
+            or not isinstance(subscription, str)
+            or not subscription
+            or len(subscription) > 512
+            or any(ord(char) < 0x21 or ord(char) > 0x7e for char in subscription)
+            or not isinstance(namespace, str)
+            or not _NAMESPACE_RE.fullmatch(namespace)
+            or algorithm != "ed25519"
+        ):
+            raise CloudEnrollmentError("cloud enrollment response is invalid")
+        return SyncCredentials(
+            credential_id=credential_id,
+            subscription_key=subscription,
+            signing_key=private_key,
+            namespace=namespace,
+            signature_algorithm="ed25519",
+        )
+
+    def _signed_headers(
+        self, method: str, path: str, body: bytes,
+        *, idempotency_key: str, revision: int,
+    ) -> dict[str, str]:
+        credentials = self.credentials
+        if credentials is None:
+            raise CloudEnrollmentError("cloud credentials are unavailable")
+        timestamp = int(self.clock())
+        nonce = secrets.token_urlsafe(24)
+        canonical = canonical_request(
+            method, path, credentials.namespace, timestamp, nonce,
+            digest_body(body), idempotency_key, str(revision),
+        )
+        if credentials.signer is not None:
+            signature = credentials.signer(credentials.signing_key, canonical)
+        elif credentials.signature_algorithm == "ed25519":
+            signature = sign_request_ed25519(credentials.signing_key, canonical)
+        else:
+            signature = sign_request(credentials.signing_key, canonical)
+        return {
+            "Authorization": "Writer " + credentials.credential_id,
+            "Content-Length": str(len(body)),
+            "Ocp-Apim-Subscription-Key": credentials.subscription_key,
+            "X-Writer-Credential": credentials.credential_id,
+            "X-Writer-Timestamp": str(timestamp),
+            "X-Writer-Nonce": nonce,
+            "X-Writer-Idempotency-Key": idempotency_key,
+            "X-Writer-Revision": str(revision),
+            "X-Writer-Signature": signature,
+        }
 
     def push(self, batch: SyncBatch, *, namespace: Optional[str] = None) -> SyncResult:
         # A namespace supplied at construction is the server-issued signing
@@ -117,6 +325,8 @@ class CloudSyncClient:
         # callers written before enrollment returned that context; it can
         # never override the bound value.
         del namespace  # Compatibility argument; the enrolled binding wins.
+        if self.credentials is None:
+            return SyncResult(False, None, OFFLINE_MESSAGE)
         signing_namespace = self.credentials.namespace
         raw = json.dumps(
             {
@@ -128,44 +338,16 @@ class CloudSyncClient:
             separators=(",", ":"),
             ensure_ascii=False,
         ).encode("utf-8")
-        timestamp = int(self.clock())
-        nonce = secrets.token_urlsafe(24)
-        body_hash = digest_body(raw)
-        canonical = canonical_request(
-            "POST", SYNC_PATH, signing_namespace, timestamp, nonce, body_hash,
-            batch.batch_id, str(batch.revision),
-        )
-        if self.credentials.signer is not None:
-            signature = self.credentials.signer(self.credentials.signing_key, canonical)
-        elif self.credentials.signature_algorithm == "ed25519":
-            signature = sign_request_ed25519(self.credentials.signing_key, canonical)
-        else:
-            signature = sign_request(self.credentials.signing_key, canonical)
-        headers = {
-            "Authorization": "Writer " + self.credentials.credential_id,
-            "Content-Type": "application/json",
-            "Content-Length": str(len(raw)),
-            "Ocp-Apim-Subscription-Key": self.credentials.subscription_key,
-            "X-Writer-Credential": self.credentials.credential_id,
-            "X-Writer-Timestamp": str(timestamp),
-            "X-Writer-Nonce": nonce,
-            "X-Writer-Idempotency-Key": batch.batch_id,
-            "X-Writer-Revision": str(batch.revision),
-            "X-Writer-Signature": signature,
-        }
-        headers.update(self.mtls_headers)
-        if self.transport is None:
-            return SyncResult(False, None, OFFLINE_MESSAGE)
         try:
-            status, response_body = self.transport(
-                self.endpoint + SYNC_PATH, headers, raw
+            headers = self._signed_headers(
+                "POST", SYNC_PATH, raw,
+                idempotency_key=batch.batch_id, revision=batch.revision,
             )
         except Exception:
             return SyncResult(False, None, OFFLINE_MESSAGE)
-        try:
-            payload = json.loads(response_body.decode("utf-8"))
-        except (UnicodeDecodeError, json.JSONDecodeError):
-            payload = {}
+        status, payload = self._request("POST", SYNC_PATH, raw, headers=headers)
+        if status is None:
+            return SyncResult(False, None, OFFLINE_MESSAGE)
         if status in (200, 201):
             return SyncResult(
                 True, status, "ok", payload.get("revision"), bool(payload.get("replayed"))
@@ -173,6 +355,58 @@ class CloudSyncClient:
         if status in (401, 403, 404, 409, 413, 429, 503):
             return SyncResult(False, status, str(payload.get("detail") or OFFLINE_MESSAGE))
         return SyncResult(False, status, OFFLINE_MESSAGE)
+
+    def mint_pairing_code(self) -> dict[str, Any]:
+        """Mint a pairing code using the fixed signed writer envelope."""
+        headers = self._signed_headers(
+            "POST", PAIRING_CODE_PATH, b"",
+            idempotency_key=PAIRING_IDEMPOTENCY_KEY, revision=0,
+        )
+        status, payload = self._request("POST", PAIRING_CODE_PATH, b"", headers=headers)
+        if status not in (200, 201) or not isinstance(payload.get("pairing_code"), str):
+            raise CloudEnrollmentError("pairing code request failed")
+        result = {"pairing_code": payload["pairing_code"]}
+        for key in ("expires_at", "expires_in"):
+            value = payload.get(key)
+            if isinstance(value, (int, float)) and not isinstance(value, bool):
+                result[key] = value
+        return result
+
+    def list_devices(self) -> list[dict[str, Any]]:
+        """List allowlisted device metadata; response secrets are discarded."""
+        headers = self._signed_headers(
+            "GET", DEVICES_PATH, b"",
+            idempotency_key=DEVICE_LIST_IDEMPOTENCY_KEY, revision=0,
+        )
+        status, payload = self._request("GET", DEVICES_PATH, b"", headers=headers)
+        if status != 200 or not isinstance(payload.get("devices"), list):
+            raise CloudEnrollmentError("device listing request failed")
+        allowed = {
+            "credential_id", "label", "capabilities", "created_at",
+            "last_seen_at", "revoked", "self",
+        }
+        devices: list[dict[str, Any]] = []
+        for device in payload["devices"]:
+            if not isinstance(device, dict):
+                continue
+            safe = {key: device[key] for key in allowed if key in device}
+            credential_id = safe.get("credential_id")
+            if not isinstance(credential_id, str) or not _CREDENTIAL_ID_RE.fullmatch(credential_id):
+                continue
+            devices.append(safe)
+        return devices
+
+    def revoke_device(self, credential_id: str) -> bool:
+        """Revoke one device by its server-issued opaque credential id."""
+        if not isinstance(credential_id, str) or not _CREDENTIAL_ID_RE.fullmatch(credential_id):
+            raise ValueError("credential_id is invalid")
+        path = DEVICES_PATH + "/" + credential_id + "/revoke"
+        headers = self._signed_headers(
+            "POST", path, b"",
+            idempotency_key=DEVICE_REVOKE_IDEMPOTENCY_KEY, revision=0,
+        )
+        status, payload = self._request("POST", path, b"", headers=headers)
+        return status == 200 and payload.get("revoked") is True
 
 
     def push_snapshot(
@@ -184,8 +418,12 @@ class CloudSyncClient:
         include_streams: bool = False,
         include_derived: bool = True,
         republish: bool = False,
+        derived_first: bool = False,
+        should_continue: Optional[Callable[[], bool]] = None,
     ) -> list[SyncResult]:
         """Upload resumable local deltas, acknowledging each successful page."""
+        if should_continue is not None and not should_continue():
+            return []
         if republish:
             if self.transport is None:
                 return [SyncResult(False, None, OFFLINE_MESSAGE)]
@@ -197,12 +435,17 @@ class CloudSyncClient:
                 return [SyncResult(False, None, str(exc))]
         results: list[SyncResult] = []
         while True:
+            if should_continue is not None and not should_continue():
+                return results
             batch = build_snapshot_batch(
                 path, user_id, limit=limit,
                 include_streams=include_streams,
                 include_derived=include_derived,
+                derived_first=derived_first,
             )
             if batch is None:
+                return results
+            if should_continue is not None and not should_continue():
                 return results
             result = self.push(batch)
             results.append(result)
@@ -228,6 +471,7 @@ def build_snapshot_batch(
     limit: int = 1_000,
     include_streams: bool = False,
     include_derived: bool = True,
+    derived_first: bool = False,
     offset: int = 0,
     previously_published: Optional[Mapping[str, Mapping[str, object]]] = None,
     complete: Optional[bool] = None,
@@ -242,6 +486,7 @@ def build_snapshot_batch(
         limit=limit,
         include_streams=include_streams,
         include_derived=include_derived,
+        derived_first=derived_first,
         offset=offset,
         previously_published=previously_published,
         complete=complete,

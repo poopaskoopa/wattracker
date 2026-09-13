@@ -85,7 +85,19 @@ class CloudCredentialStore:
         self.backend.set(_INSTALLATION_ACCOUNT, installation_id)
         return installation_id
 
-    def save_writer(self, credentials: SyncCredentials) -> None:
+    @staticmethod
+    def _writer_account(user_id: Optional[int]) -> str:
+        if user_id is None:
+            # Compatibility for callers that predate per-user cloud sync.
+            # Scoped callers intentionally never read this ambiguous record.
+            return _WRITER_ACCOUNT
+        if isinstance(user_id, bool) or not isinstance(user_id, int) or user_id < 1:
+            raise ValueError("user_id must be positive")
+        return f"{_WRITER_ACCOUNT}:user:{user_id}"
+
+    def save_writer(
+        self, credentials: SyncCredentials, user_id: Optional[int] = None,
+    ) -> None:
         payload = {
             "credential_id": credentials.credential_id,
             "subscription_key": credentials.subscription_key,
@@ -94,12 +106,12 @@ class CloudCredentialStore:
             "signature_algorithm": credentials.signature_algorithm,
         }
         self.backend.set(
-            _WRITER_ACCOUNT,
+            self._writer_account(user_id),
             json.dumps(payload, sort_keys=True, separators=(",", ":")),
         )
 
-    def load_writer(self) -> Optional[SyncCredentials]:
-        raw = self.backend.get(_WRITER_ACCOUNT)
+    def load_writer(self, user_id: Optional[int] = None) -> Optional[SyncCredentials]:
+        raw = self.backend.get(self._writer_account(user_id))
         if not raw:
             return None
         try:
@@ -114,5 +126,5 @@ class CloudCredentialStore:
         except (KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
             raise CloudCredentialUnavailable("stored cloud credential is invalid") from exc
 
-    def revoke_local_writer(self) -> None:
-        self.backend.delete(_WRITER_ACCOUNT)
+    def revoke_local_writer(self, user_id: Optional[int] = None) -> None:
+        self.backend.delete(self._writer_account(user_id))

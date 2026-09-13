@@ -112,6 +112,7 @@ from .timeutil import (
     utc_today,
     valid_timezone,
 )
+from .web.qr import pairing_qr_svg
 
 DAY_LABELS = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
 
@@ -164,6 +165,48 @@ _scan_threads: "set[threading.Thread]" = set()
 # is sitting in front of, so this is generous; overrunning it is logged rather
 # than passed over in silence.
 SCAN_SHUTDOWN_TIMEOUT_S = 30.0
+
+class _DesktopCloudSyncUnavailable:
+    """Offline-compatible seam until the desktop adapter is installed."""
+    def __init__(self, path: str, *args, **kwargs):
+        self.path = path
+        self._enabled = False
+        self._status = {"enabled": False, "enrolled": False,
+                        "last_success": None, "last_error": None,
+                        "pending": 0, "retry": None}
+
+    def status(self, user_id):
+        del user_id
+        return dict(self._status)
+
+    def set_enabled(self, user_id, enabled):
+        del user_id
+        self._enabled = bool(enabled)
+        self._status["enabled"] = self._enabled
+
+    def request_sync(self, user_id):
+        del user_id
+
+    def start(self):
+        return None
+
+    def stop(self):
+        return None
+
+    def __getattr__(self, name):
+        if name in {"enroll", "sync_once", "mint_pairing_code", "list_devices", "revoke_device"}:
+            def unavailable(*args, **kwargs):
+                raise RuntimeError("cloud synchronization is unavailable")
+            return unavailable
+        raise AttributeError(name)
+
+
+try:
+    from .cloud.desktop_sync import DesktopCloudSync
+except ImportError:
+    # The adapter is supplied by the cloud integration branch when available;
+    # keeping this fallback makes the local app byte-compatible and offline.
+    DesktopCloudSync = _DesktopCloudSyncUnavailable
 
 
 def live_scan_threads() -> "list[threading.Thread]":
@@ -1499,6 +1542,14 @@ def create_app() -> FastAPI:
     @asynccontextmanager
     async def lifespan(_app: FastAPI):
         db.init_db()
+        cloud = DesktopCloudSync(config.db_path())
+        _app.state.cloud_sync = cloud
+        # DesktopCloudSync owns the single background worker.  Keeping the
+        # scheduler there also makes an import hook and a settings request
+        # share one queue, so a single batch cannot be sent twice.
+        _app.state.cloud_scheduler = cloud
+        importer.set_activity_import_hook(cloud.request_sync)
+        cloud.start()
         stop = asyncio.Event()
         task: Optional[asyncio.Task] = None
         if config.auto_scan_enabled():
@@ -1519,6 +1570,8 @@ def create_app() -> FastAPI:
                 await asyncio.wait_for(task, timeout=5.0)
             except (asyncio.TimeoutError, asyncio.CancelledError):
                 task.cancel()
+        importer.set_activity_import_hook(None)
+        cloud.stop()
 
     # Local single-purpose app: interactive API docs / OpenAPI schema are
     # disabled to reduce surface area.
@@ -2254,6 +2307,9 @@ def create_app() -> FastAPI:
             importer.profile_store.refresh(uid)
             from .metrics import curve_store
             curve_store.ensure(uid)
+            scheduler = getattr(app.state, "cloud_scheduler", None)
+            if scheduler is not None:
+                scheduler.request_sync(uid)
         estimate = importer.recent_best_effort_ftp(uid)
         return JSONResponse({
             "selected": len(staged),
@@ -4606,6 +4662,24 @@ def create_app() -> FastAPI:
             headers={"Content-Disposition": f'attachment; filename="{fname}"'},
         )
 
+    def _cloud_status(uid: int) -> dict:
+        sync = getattr(app.state, "cloud_sync", None)
+        if sync is None:
+            return {"enabled": False, "enrolled": False, "pending": 0,
+                    "last_success": None, "last_error": None, "retry": None}
+        try:
+            status = dict(sync.status(uid) or {})
+        except Exception:
+            status = {}
+        status.setdefault("enabled", False)
+        status.setdefault("enrolled", False)
+        status.setdefault("pending", 0)
+        status.setdefault("last_success", None)
+        status.setdefault("last_error", None)
+        status.setdefault("retry", None)
+        status.setdefault("devices", [])
+        return status
+
     def _settings_ctx(request: Request, uid: int, saved: bool,
                       cred_message: Optional[str] = None,
                       backup_message: Optional[str] = None,
@@ -4622,7 +4696,8 @@ def create_app() -> FastAPI:
                       connector_new_label: Optional[str] = None,
                       refusal_message: Optional[str] = None,
                       llm_message: Optional[str] = None,
-                      timezone_message: Optional[str] = None) -> dict:
+                      timezone_message: Optional[str] = None,
+                      cloud_message: Optional[str] = None) -> dict:
         settings = db.get_user_settings(uid)
         # LLM refinement (app-level). The page shows the EFFECTIVE endpoint
         # (an env var wins silently) and the STORED model: blank falls back to
@@ -4639,6 +4714,8 @@ def create_app() -> FastAPI:
             llm_endpoint_display, llm_custom_url_display = (
                 "custom", llm_endpoint_raw,
             )
+        pairing = request.session.get("cloud_pairing")
+        pairing_code = pairing.get("code") if isinstance(pairing, dict) else None
         return _ctx(
             request,
             settings=settings,
@@ -4663,6 +4740,12 @@ def create_app() -> FastAPI:
                 utc_now(), settings.get("timezone")
             ),
             timezone_message=timezone_message,
+            cloud_message=cloud_message,
+            cloud_sync=_cloud_status(uid),
+            cloud_pairing_qr=(
+                pairing_qr_svg(pairing_code)
+                if isinstance(pairing_code, str) else None
+            ),
             ftp_min=round(FTP_INPUT_MIN_WATTS),
             ftp_max=round(FTP_INPUT_MAX_WATTS),
             # A refused weight is echoed back in the field, the FTP way: the
@@ -4791,6 +4874,94 @@ def create_app() -> FastAPI:
         return templates.TemplateResponse(
             request, "settings.html", _settings_ctx(request, _uid(request), False)
         )
+
+    @app.post("/settings/cloud", response_class=HTMLResponse)
+    def settings_cloud(request: Request, enabled: str = Form(""),
+                       endpoint: str = Form(""), invitation: str = Form("")):
+        if not _same_origin_or_absent(request):
+            return PlainTextResponse("Origin not allowed", status_code=403)
+        uid = _uid(request)
+        if _from_connector(request):
+            return _refuse_connector_session(request, uid)
+        sync = getattr(app.state, "cloud_sync", None)
+        message = None
+        try:
+            if endpoint.strip() or invitation.strip():
+                if not endpoint.strip() or not invitation.strip():
+                    raise ValueError("Enter both the cloud endpoint and invitation.")
+                sync.enroll(uid, endpoint.strip(), invitation.strip())
+            sync.set_enabled(uid, _checked(enabled))
+        except Exception:
+            message = "Cloud enrollment could not be completed. Check the invitation and try again."
+        return templates.TemplateResponse(
+            request, "settings.html", _settings_ctx(request, uid, False,
+                                                     cloud_message=message)
+        )
+
+    @app.post("/settings/cloud/sync")
+    def settings_cloud_sync(request: Request):
+        if not _same_origin_or_absent(request):
+            return PlainTextResponse("Origin not allowed", status_code=403)
+        uid = _uid(request)
+        if _from_connector(request):
+            return _refuse_connector_session(request, uid)
+        scheduler = getattr(app.state, "cloud_scheduler", None)
+        if scheduler is not None:
+            scheduler.request_sync(uid)
+        return RedirectResponse("/settings", status_code=303)
+
+    @app.post("/settings/cloud/pairing")
+    def settings_cloud_pairing(request: Request):
+        if not _same_origin_or_absent(request):
+            return PlainTextResponse("Origin not allowed", status_code=403)
+        uid = _uid(request)
+        if _from_connector(request):
+            return _refuse_connector_session(request, uid)
+        sync = getattr(app.state, "cloud_sync", None)
+        message = None
+        try:
+            result = sync.mint_pairing_code(uid)
+            request.session["cloud_pairing"] = {
+                "code": str(result.get("pairing_code") or result.get("code") or ""),
+                "expires_at": result.get("expires_at"),
+                "expires_in": result.get("expires_in"),
+            }
+        except Exception:
+            message = "A pairing code could not be generated right now."
+        return templates.TemplateResponse(
+            request, "settings.html", _settings_ctx(request, uid, False,
+                                                     cloud_message=message)
+        )
+
+    @app.post("/settings/cloud/devices")
+    def settings_cloud_devices(request: Request):
+        if not _same_origin_or_absent(request):
+            return PlainTextResponse("Origin not allowed", status_code=403)
+        uid = _uid(request)
+        if _from_connector(request):
+            return _refuse_connector_session(request, uid)
+        message = None
+        try:
+            getattr(app.state, "cloud_sync").list_devices(uid)
+        except Exception:
+            message = "Paired devices could not be loaded right now."
+        return templates.TemplateResponse(
+            request, "settings.html", _settings_ctx(request, uid, False,
+                                                     cloud_message=message)
+        )
+
+    @app.post("/settings/cloud/devices/{credential_id}/revoke")
+    def settings_cloud_revoke(request: Request, credential_id: str):
+        if not _same_origin_or_absent(request):
+            return PlainTextResponse("Origin not allowed", status_code=403)
+        uid = _uid(request)
+        if _from_connector(request):
+            return _refuse_connector_session(request, uid)
+        try:
+            getattr(app.state, "cloud_sync").revoke_device(uid, credential_id)
+        except Exception:
+            pass
+        return RedirectResponse("/settings", status_code=303)
 
     @app.post("/settings", response_class=HTMLResponse)
     def settings_save(
