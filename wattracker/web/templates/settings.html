@@ -12,7 +12,7 @@
 {% set cred_is_alert = cred_message and not ('saved (' in cred_message or 'cleared' in cred_message) %}
 {% set settings_alert = refusal_message or cred_is_alert or dir_message
                         or ftp_message or timezone_message or llm_message
-                        or weight_message %}
+                        or weight_message or cloud_message %}
 <div id="settings-alerts">
 {% if saved %}<p class="ok">Settings saved.</p>{% endif %}
 {# Refused because of what this session is, not because of what was typed:
@@ -25,6 +25,7 @@
 {% if timezone_message %}<p class="alert" role="alert">{{ timezone_message }}</p>{% endif %}
 {% if llm_message %}<p class="alert" role="alert">{{ llm_message }}</p>{% endif %}
 {% if weight_message %}<p class="alert" role="alert">{{ weight_message }}</p>{% endif %}
+{% if cloud_message %}<p class="alert" role="alert">{{ cloud_message }}</p>{% endif %}
 </div>
 
 <p class="current-ftp"><strong>Current Training FTP:</strong> {{ current_ftp }} W</p>
@@ -210,6 +211,64 @@
         </div>
     </div>
 </form>
+
+<section class="cloud-sync-settings" aria-labelledby="cloud-sync-heading">
+    <h3 id="cloud-sync-heading">Cloud sync</h3>
+    <p class="hint">Cloud sync is off until you enable it. Publishing runs in
+       the background every 15 minutes and stays queued while offline.</p>
+    <form method="post" action="/settings/cloud" class="cloud-sync-form">
+        <label><input type="checkbox" name="enabled" value="on"
+            {{ 'checked' if cloud_sync.enabled else '' }}> Enable cloud sync</label>
+        <label>Cloud endpoint
+            <input type="url" name="endpoint" value="{{ cloud_sync.endpoint or '' }}"
+                   placeholder="https://cloud.example"></label>
+        <label>Enrollment invitation
+            <input type="text" name="invitation" value="" autocomplete="off"></label>
+        <button type="submit">Save cloud settings</button>
+    </form>
+    <dl class="cloud-sync-status">
+        <dt>Enrollment</dt><dd>{{ 'Enrolled' if cloud_sync.enrolled else 'Not enrolled' }}</dd>
+        <dt>Last successful push</dt><dd>{{ cloud_sync.last_success or 'Never' }}</dd>
+        <dt>Pending objects</dt><dd>{{ cloud_sync.pending }}</dd>
+        <dt>Status</dt><dd>{% if cloud_sync.last_error %}{{ cloud_sync.last_error }}{% elif cloud_sync.retry %}Retry scheduled (attempt {{ cloud_sync.retry }}){% elif cloud_sync.enabled %}Queued/offline{% else %}Disabled{% endif %}</dd>
+    </dl>
+    {% set pairing = cloud_pairing %}
+    {% if pairing and pairing.code %}
+    <div class="cloud-pairing-code" data-qr-payload="{{ pairing.code }}">
+        <p><strong>Pairing code:</strong> <code>{{ pairing.code }}</code>
+           {% if pairing.expires_in %} (expires in
+           <span class="cloud-pairing-countdown"
+                 data-expires-at="{{ pairing.expires_at }}">{{ pairing.expires_in }}</span>
+           seconds){% endif %}</p>
+        {% if cloud_pairing_qr %}
+        <div class="cloud-qr" aria-label="Pairing code QR">
+            {{ cloud_pairing_qr | safe }}
+        </div>
+        {% endif %}
+        <p class="hint">Scan the QR code or enter the pairing code in the companion app.</p>
+    </div>
+    {% endif %}
+    <form method="post" action="/settings/cloud/pairing">
+        <button type="submit" {% if not cloud_sync.enabled %}disabled{% endif %}>Generate pairing code</button>
+    </form>
+    <form method="post" action="/settings/cloud/devices">
+        <button type="submit" {% if not cloud_sync.enabled %}disabled{% endif %}>Refresh paired devices</button>
+    </form>
+    {% if cloud_sync.devices %}
+    <table><thead><tr><th>Paired device</th><th></th></tr></thead><tbody>
+    {% for device in cloud_sync.devices %}
+      <tr><td>{{ device.label or device.id or device.credential_id }}</td><td>
+        <form method="post" action="/settings/cloud/devices/{{ device.id or device.credential_id }}/revoke">
+          <button type="submit" class="danger-btn">Revoke</button>
+        </form>
+      </td></tr>
+    {% endfor %}
+    </tbody></table>
+    {% endif %}
+    <form method="post" action="/settings/cloud/sync">
+        <button type="submit" {% if not cloud_sync.enabled %}disabled{% endif %}>Sync now</button>
+    </form>
+</section>
 
 {% if zwift_creds_saved %}
 <form method="post" action="/settings/zwift-credentials/clear" class="clear-creds-form">
@@ -405,8 +464,22 @@
     values; <code>ANTHROPIC_API_KEY</code> is the legacy name for
     <code>API_KEY</code>.</p>
 {% endblock %}
-
 {% block scripts %}
+<script>
+(function () {
+    var countdown = document.querySelector(".cloud-pairing-countdown");
+    if (!countdown) return;
+    var expiresAt = Number(countdown.dataset.expiresAt) * 1000;
+    if (!isFinite(expiresAt) || expiresAt <= 0) return;
+    function update() {
+        var remaining = Math.max(0, Math.ceil((expiresAt - Date.now()) / 1000));
+        countdown.textContent = String(remaining);
+        if (remaining === 0) window.clearInterval(timer);
+    }
+    var timer = window.setInterval(update, 1000);
+    update();
+})();
+</script>
 <script>
 // The save bar is pinned to the bottom of the viewport, so the form can be
 // submitted from a point several screens below the alerts block that reports a

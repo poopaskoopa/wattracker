@@ -7,7 +7,9 @@ Tests can inject a memory backend without touching a developer keychain.
 from __future__ import annotations
 
 import base64
+import hmac
 import json
+import secrets
 from dataclasses import dataclass, field
 from typing import Optional, Protocol
 
@@ -17,6 +19,7 @@ from .security import INSTALLATION_ID_BYTES, new_installation_id
 SERVICE = "wattracker.cloud"
 _INSTALLATION_ACCOUNT = "installation-id"
 _WRITER_ACCOUNT = "writer-credentials"
+_PROBE_ACCOUNT = "credential-probe"
 
 
 class CloudCredentialUnavailable(RuntimeError):
@@ -73,6 +76,23 @@ class CloudCredentialStore:
     def __init__(self, backend: SecretBackend) -> None:
         self.backend = backend
 
+    def probe(self) -> None:
+        """Verify that the secure backend can round-trip and remove a value."""
+        account = f"{_PROBE_ACCOUNT}:{secrets.token_hex(16)}"
+        value = secrets.token_urlsafe(32)
+        written = False
+        try:
+            self.backend.set(account, value)
+            written = True
+            stored = self.backend.get(account)
+            if not isinstance(stored, str) or not hmac.compare_digest(stored, value):
+                raise CloudCredentialUnavailable(
+                    "OS secure storage could not verify a stored credential"
+                )
+        finally:
+            if written:
+                self.backend.delete(account)
+
     def load_or_create_installation(self) -> str:
         value = self.backend.get(_INSTALLATION_ACCOUNT)
         if value:
@@ -85,7 +105,19 @@ class CloudCredentialStore:
         self.backend.set(_INSTALLATION_ACCOUNT, installation_id)
         return installation_id
 
-    def save_writer(self, credentials: SyncCredentials) -> None:
+    @staticmethod
+    def _writer_account(user_id: Optional[int]) -> str:
+        if user_id is None:
+            # Compatibility for callers that predate per-user cloud sync.
+            # Scoped callers intentionally never read this ambiguous record.
+            return _WRITER_ACCOUNT
+        if isinstance(user_id, bool) or not isinstance(user_id, int) or user_id < 1:
+            raise ValueError("user_id must be positive")
+        return f"{_WRITER_ACCOUNT}:user:{user_id}"
+
+    def save_writer(
+        self, credentials: SyncCredentials, user_id: Optional[int] = None,
+    ) -> None:
         payload = {
             "credential_id": credentials.credential_id,
             "subscription_key": credentials.subscription_key,
@@ -94,12 +126,12 @@ class CloudCredentialStore:
             "signature_algorithm": credentials.signature_algorithm,
         }
         self.backend.set(
-            _WRITER_ACCOUNT,
+            self._writer_account(user_id),
             json.dumps(payload, sort_keys=True, separators=(",", ":")),
         )
 
-    def load_writer(self) -> Optional[SyncCredentials]:
-        raw = self.backend.get(_WRITER_ACCOUNT)
+    def load_writer(self, user_id: Optional[int] = None) -> Optional[SyncCredentials]:
+        raw = self.backend.get(self._writer_account(user_id))
         if not raw:
             return None
         try:
@@ -114,5 +146,5 @@ class CloudCredentialStore:
         except (KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
             raise CloudCredentialUnavailable("stored cloud credential is invalid") from exc
 
-    def revoke_local_writer(self) -> None:
-        self.backend.delete(_WRITER_ACCOUNT)
+    def revoke_local_writer(self, user_id: Optional[int] = None) -> None:
+        self.backend.delete(self._writer_account(user_id))

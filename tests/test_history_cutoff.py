@@ -173,7 +173,7 @@ def test_changing_cutoff_invalidates_scanned_file_cache(tmp_path):
     assert db.seen_files(uid, path) == {}
 
 
-def test_v34_to_v35_migration_adds_nullable_cutoff_in_place(tmp_path, monkeypatch):
+def test_v34_to_current_migration_adds_nullable_cutoff_in_place(tmp_path, monkeypatch):
     path = str(tmp_path / "history.db")
     db.init_db(path)
     uid = db.create_user("rider", "hash", path)
@@ -198,7 +198,7 @@ def test_v34_to_v35_migration_adds_nullable_cutoff_in_place(tmp_path, monkeypatc
     monkeypatch.setattr("wattracker.backup.create_backup", lambda *a, **k: None)
     db.init_db(path)
     check = db.connect(path)
-    assert check.execute("PRAGMA user_version").fetchone()[0] == 35
+    assert check.execute("PRAGMA user_version").fetchone()[0] == db.SCHEMA_VERSION
     check.close()
     assert db.get_user_settings(uid, path)["history_start_date"] is None
 
