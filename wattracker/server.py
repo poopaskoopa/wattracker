@@ -4075,14 +4075,13 @@ def create_app() -> FastAPI:
             is_head,
         )
 
-    @app.get("/calendar", response_class=HTMLResponse)
-    def calendar_view(
-        request: Request,
+    def _calendar_data(
+        uid: int,
         year: Optional[int] = None,
         month: Optional[int] = None,
         adjustment_id: Optional[int] = None,
     ):
-        uid = _uid(request)
+        """Build the calendar's JSON-safe month model for HTML and mobile reads."""
         today = utc_today()
         y = year or today.year
         m = month or today.month
@@ -4210,7 +4209,28 @@ def create_app() -> FastAPI:
                     }
                 )
             weeks.append(row)
+        return {
+            "year": y,
+            "month": m,
+            "month_name": _cal.month_name[m],
+            "weeks": weeks,
+            "ooto_ranges": ooto_ranges,
+            "race_dates": race_dates,
+            "active": active,
+            "adjustment": adjustment,
+        }
 
+    @app.get("/calendar", response_class=HTMLResponse)
+    def calendar_view(
+        request: Request,
+        year: Optional[int] = None,
+        month: Optional[int] = None,
+        adjustment_id: Optional[int] = None,
+    ):
+        uid = _uid(request)
+        data = _calendar_data(uid, year, month, adjustment_id)
+        y = data["year"]
+        m = data["month"]
         prev_y, prev_m = (y - 1, 12) if m == 1 else (y, m - 1)
         next_y, next_m = (y + 1, 1) if m == 12 else (y, m + 1)
         return templates.TemplateResponse(
@@ -4220,23 +4240,35 @@ def create_app() -> FastAPI:
                 request,
                 year=y,
                 month=m,
-                month_name=_cal.month_name[m],
-                weeks=weeks,
+                month_name=data["month_name"],
+                weeks=data["weeks"],
                 day_labels=DAY_LABELS,
                 prev=f"?year={prev_y}&month={prev_m}",
                 next=f"?year={next_y}&month={next_m}",
                 plans=db.list_plans(uid),
-                ooto_ranges=ooto_ranges,
-                race_dates=race_dates,
+                ooto_ranges=data["ooto_ranges"],
+                race_dates=data["race_dates"],
                 export_result=request.query_params.get("exported"),
                 flash=request.query_params.get("flash"),
                 # An unattended overnight rewrite the rider was never told
                 # about is indistinguishable from us changing their training
                 # behind their back, so it is surfaced until dismissed.
-                reflow_notice=(active or {}).get("reflow_notice"),
-                reflow_notice_plan_id=(active or {}).get("id"),
-                ooto_adjustment=_ooto_adjustment_view(adjustment),
+                reflow_notice=(data["active"] or {}).get("reflow_notice"),
+                reflow_notice_plan_id=(data["active"] or {}).get("id"),
+                ooto_adjustment=_ooto_adjustment_view(data["adjustment"]),
             ),
+        )
+
+    @app.get("/api/calendar")
+    def api_calendar(
+        request: Request,
+        year: Optional[int] = None,
+        month: Optional[int] = None,
+    ):
+        data = _calendar_data(_uid(request), year, month)
+        return JSONResponse(
+            {"weeks": data["weeks"]},
+            headers={"Cache-Control": "private, no-store"},
         )
 
     @app.post("/plan/{plan_id}/reflow-notice/dismiss")

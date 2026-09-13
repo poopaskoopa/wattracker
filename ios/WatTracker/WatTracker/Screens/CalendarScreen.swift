@@ -8,7 +8,7 @@ import SwiftUI
 /// the screen on the same credential and cache as Dashboard and means a
 /// cached calendar is useful while the phone is offline.
 struct CalendarScreen: View {
-    @Environment(\.cloudSession) private var session
+    @Environment(SessionGate.self) private var gate
     @State private var model = CalendarModel()
     @State private var selectedDay: CalendarDayEntry?
 
@@ -19,7 +19,7 @@ struct CalendarScreen: View {
         ) {
             content
         }
-        .task { await model.start(session: session) }
+        .task(id: gate.backend) { await model.start(session: gate.activeSession) }
         .sheet(item: $selectedDay) { day in
             CalendarDayDetail(day: day)
         }
@@ -88,11 +88,11 @@ final class CalendarModel {
     private(set) var state: State = .starting
     var month = CalendarMonth.current()
 
-    private var started = false
+    private var requestGeneration = 0
 
-    func start(session: CloudSession?) async {
-        guard !started else { return }
-        started = true
+    func start(session: (any ReadSession)?) async {
+        let generation = beginRequest()
+        state = .starting
 
         guard let session else {
             state = .unpaired
@@ -110,15 +110,17 @@ final class CalendarModel {
             break
         }
 
+        guard generation == requestGeneration else { return }
+
         // Applying the cache before awaiting the network gives the calendar
-        // an immediate first paint and keeps month navigation local.
+        // an immediate first paint while retaining offline use.
         let cachedActivities = session.cached(.activities)
         if let cached = session.cached(.calendar) {
             apply(cached, activities: cachedActivities)
         }
 
         do {
-            let calendar = try await session.load(.calendar)
+            let calendar = try await session.load(.calendar, month: month)
             // Linked rides are intentionally omitted from calendar_day
             // objects to avoid publishing the same activity twice. The
             // activities collection supplies those summaries when it is
@@ -141,8 +143,10 @@ final class CalendarModel {
                 // A missing activities collection should not hide a usable
                 // calendar snapshot.
             }
+            guard generation == requestGeneration else { return }
             apply(calendar, activities: activities ?? cachedActivities)
         } catch let failure as CloudSession.Failure {
+            guard generation == requestGeneration else { return }
             switch failure {
             case .notPaired:
                 state = .unpaired
@@ -153,13 +157,55 @@ final class CalendarModel {
                 state = .error(failure.description)
             }
         } catch {
+            guard generation == requestGeneration else { return }
             if case .ready = state { return }
             state = .error(error.localizedDescription)
         }
     }
 
-    func moveMonth(by offset: Int) {
-        month = month.adding(months: offset)
+    func moveMonth(by offset: Int, session: (any ReadSession)?) async {
+        let selectedMonth = month.adding(months: offset)
+        month = selectedMonth
+        let generation = beginRequest()
+        guard let session else {
+            state = .unpaired
+            return
+        }
+        do {
+            let calendar = try await session.load(.calendar, month: selectedMonth)
+            guard generation == requestGeneration, selectedMonth == month else { return }
+            var activities = session.cached(.activities)
+            do {
+                activities = try await session.load(.activities)
+            } catch let failure as CloudSession.Failure {
+                switch failure {
+                case .notPaired, .deviceRemoved: throw failure
+                default: break
+                }
+            } catch {
+                // Calendar data remains useful when the activity list is offline.
+            }
+            guard generation == requestGeneration, selectedMonth == month else { return }
+            apply(calendar, activities: activities)
+        } catch let failure as CloudSession.Failure {
+            guard generation == requestGeneration, selectedMonth == month else { return }
+            switch failure {
+            case .notPaired: state = .unpaired
+            case .deviceRemoved: state = .removed
+            default:
+                if case .ready = state { return }
+                state = .error(failure.description)
+            }
+        } catch {
+            guard generation == requestGeneration, selectedMonth == month else { return }
+            if case .ready = state { return }
+            state = .error(error.localizedDescription)
+        }
+    }
+
+    private func beginRequest() -> Int {
+        requestGeneration += 1
+        return requestGeneration
     }
 
     private func apply(
@@ -174,6 +220,7 @@ private struct CalendarContent: View {
     @Bindable var model: CalendarModel
     let calendar: CalendarData
     let selectDay: (CalendarDayEntry) -> Void
+    @Environment(SessionGate.self) private var gate
 
     private let weekdays = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
 
@@ -187,7 +234,7 @@ private struct CalendarContent: View {
                 VStack(alignment: .leading, spacing: 12) {
                     HStack(spacing: 8) {
                         Button {
-                            model.moveMonth(by: -1)
+                            Task { await model.moveMonth(by: -1, session: gate.activeSession) }
                         } label: {
                             Image(systemName: "chevron.left")
                                 .frame(width: 34, height: 30)
@@ -202,7 +249,7 @@ private struct CalendarContent: View {
                             .frame(maxWidth: .infinity)
 
                         Button {
-                            model.moveMonth(by: 1)
+                            Task { await model.moveMonth(by: 1, session: gate.activeSession) }
                         } label: {
                             Image(systemName: "chevron.right")
                                 .frame(width: 34, height: 30)
