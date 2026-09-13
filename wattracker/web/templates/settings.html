@@ -251,8 +251,14 @@
     <form method="post" action="/settings/cloud/pairing">
         <button type="submit" {% if not cloud_sync.enabled %}disabled{% endif %}>Generate pairing code</button>
     </form>
+    {# Deliberately live while cloud sync is off: the device list and the
+       Revoke control beneath it are the rider's recovery path after losing a
+       paired device, which is exactly when sync is switched off. The paired
+       device cache is in memory only, so without this button a restart leaves
+       nothing to revoke. Generating a pairing code and Sync now stay disabled
+       -- those are what the kill switch exists to stop. #}
     <form method="post" action="/settings/cloud/devices">
-        <button type="submit" {% if not cloud_sync.enabled %}disabled{% endif %}>Refresh paired devices</button>
+        <button type="submit">Refresh paired devices</button>
     </form>
     {% if cloud_sync.devices %}
     <table><thead><tr><th>Paired device</th><th></th></tr></thead><tbody>

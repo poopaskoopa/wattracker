@@ -305,8 +305,17 @@ class DesktopCloudSync:
 
     def list_devices(self, user_id: int) -> list[dict[str, Any]]:
         user_id = self._user_id(user_id)
-        if not self._state_enabled(user_id):
-            return []
+        # The second deliberate exception to the kill switch, and the one that
+        # makes the first reachable.  ``_devices_cache`` lives only in memory,
+        # so after a restart with sync off there is no device list on screen
+        # and therefore no Revoke control -- and sync off after losing a phone
+        # is precisely the state the rider is in when they need to revoke it.
+        # Gating the read would leave re-enabling cloud sync as the only route
+        # to the button, resuming the outbound pushes the rider just stopped.
+        # Reading the device list on an explicit click is the same bargain
+        # already struck below for revocation, so do not restore the
+        # ``enabled`` gate here.  Minting a pairing code stays gated above:
+        # adding a new device is not recovery.
         try:
             devices = self._client(user_id).list_devices()
             self._devices_cache[user_id] = [dict(device) for device in devices]
