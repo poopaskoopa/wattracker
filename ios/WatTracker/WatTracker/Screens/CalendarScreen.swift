@@ -115,7 +115,7 @@ final class CalendarModel {
         // Applying the cache before awaiting the network gives the calendar
         // an immediate first paint while retaining offline use.
         let cachedActivities = session.cached(.activities)
-        if let cached = session.cached(.calendar) {
+        if let cached = session.cached(.calendar, month: month) {
             apply(cached, activities: cachedActivities)
         }
 

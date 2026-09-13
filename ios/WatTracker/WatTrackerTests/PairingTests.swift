@@ -139,8 +139,35 @@ final class PairingTests: XCTestCase {
     }
 
     @MainActor
+    func testFailedLocalPairingClearsTokenField() async {
+        let local = LocalSession(
+            credentials: MemoryLocalCredentialStore(),
+            cache: MemorySnapshotCache(),
+            makeClient: { _ in throw URLError(.cannotConnectToHost) }
+        )
+        let gate = SessionGate(
+            makeSession: { PairingTests.cloudSession() },
+            makeLocalSession: { local }
+        )
+        await gate.start()
+        let model = PairingModel()
+        model.backend = .local
+        model.localHost = "https://desktop.example"
+        model.localToken = "device-token"
+
+        await model.pair(gate: gate)
+
+        XCTAssertEqual(model.localToken, "")
+        XCTAssertNotNil(model.message)
+    }
+
+    @MainActor
     private static func gate() -> SessionGate {
-        SessionGate(makeSession: { CloudSession(
+        SessionGate(makeSession: { cloudSession() })
+    }
+
+    private static func cloudSession() -> CloudSession {
+        CloudSession(
             client: CloudClient(
                 baseURL: URL(string: "https://api.example.invalid")!,
                 signer: StubSigner(),
@@ -150,7 +177,6 @@ final class PairingTests: XCTestCase {
             ),
             credentials: MemoryDeviceCredentialStore(device: nil),
             cache: MemorySnapshotCache()
-        ) })
+        )
     }
 }
-

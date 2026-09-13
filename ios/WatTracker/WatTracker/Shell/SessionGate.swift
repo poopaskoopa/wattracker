@@ -211,7 +211,11 @@ final class SessionGate {
     /// Re-read the actor's state. Cheap -- no request -- and safe to call after
     /// anything that might have moved it.
     func refresh() async {
-        guard let activeSession else { return }
+        guard let activeSession else {
+            phase = .unpaired
+            lastSuccess = nil
+            return
+        }
         phase = Self.phase(for: await activeSession.deviceState)
         lastSuccess = await activeSession.lastSuccess
     }
@@ -229,7 +233,6 @@ final class SessionGate {
     func pair(code: String, label: String?) async throws {
         guard let session else { throw GateFailure.noSession }
         backend = .cloud
-        preferences.saveBackend(.cloud)
         do {
             try await session.pair(code: code, label: label)
         } catch {
@@ -239,6 +242,7 @@ final class SessionGate {
             await refresh()
             throw error
         }
+        preferences.saveBackend(.cloud)
         await refresh()
     }
 
@@ -248,21 +252,24 @@ final class SessionGate {
     func pairLocal(host: String, token: String, label: String?) async throws {
         guard let localSession else { throw GateFailure.noSession }
         backend = .local
-        preferences.saveBackend(.local)
         do {
             try await localSession.pair(host: host, token: token, label: label)
         } catch {
             await refresh()
             throw error
         }
+        preferences.saveBackend(.local)
         await refresh()
     }
 
     func selectBackend(_ backend: Backend) async {
         let candidate: (any ReadSession)? = backend == .cloud ? session : localSession
         guard let candidate else { return }
+        let isPaired = await candidate.deviceState == .paired
         self.backend = backend
-        preferences.saveBackend(backend)
+        if isPaired {
+            preferences.saveBackend(backend)
+        }
         await refresh()
     }
 

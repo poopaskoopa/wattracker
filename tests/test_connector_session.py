@@ -177,6 +177,7 @@ def test_a_minted_ticket_opens_a_real_session(client):
         )
         assert landing.status_code == 303
         assert landing.headers["location"] == "/"
+        assert "session=" in landing.headers["set-cookie"]
 
         page = window.get("/settings", follow_redirects=False)
         assert page.status_code == 200
