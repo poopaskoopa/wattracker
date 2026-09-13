@@ -265,8 +265,11 @@ final class SessionGate {
     func selectBackend(_ backend: Backend) async {
         let candidate: (any ReadSession)? = backend == .cloud ? session : localSession
         guard let candidate else { return }
+        let isPaired = await candidate.deviceState == .paired
         self.backend = backend
-        preferences.saveBackend(backend)
+        if isPaired {
+            preferences.saveBackend(backend)
+        }
         await refresh()
     }
 

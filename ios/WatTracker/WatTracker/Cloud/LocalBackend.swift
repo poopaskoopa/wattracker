@@ -595,16 +595,40 @@ actor LocalSession: ReadSession {
             let value = try await operation(client)
             try validate(generation)
             return value
-        } catch LocalClient.Failure.unauthorized,
-                LocalClient.Failure.unexpectedLanding {
+        } catch let firstFailure as LocalClient.Failure {
+            guard Self.isUnauthorized(firstFailure)
+                    || Self.isUnexpectedLanding(firstFailure)
+            else { throw firstFailure }
             try validate(generation)
             authenticated = false
-            try await ensureAuthenticated()
-            try validate(generation)
-            let value = try await operation(client)
-            try validate(generation)
-            return value
+            do {
+                try await ensureAuthenticated()
+                try validate(generation)
+                let value = try await operation(client)
+                try validate(generation)
+                return value
+            } catch let retryFailure as LocalClient.Failure {
+                if Self.isUnexpectedLanding(firstFailure),
+                   (Self.isUnauthorized(retryFailure)
+                    || Self.isUnexpectedLanding(retryFailure)) {
+                    // An unexpected landing is an authentication ambiguity,
+                    // not evidence that the device was revoked. A single 401
+                    // after it must retain the credential and cache.
+                    throw firstFailure
+                }
+                throw retryFailure
+            }
         }
+    }
+
+    private static func isUnauthorized(_ failure: LocalClient.Failure) -> Bool {
+        if case .unauthorized = failure { return true }
+        return false
+    }
+
+    private static func isUnexpectedLanding(_ failure: LocalClient.Failure) -> Bool {
+        if case .unexpectedLanding = failure { return true }
+        return false
     }
 
     private func ensureAuthenticated() async throws {

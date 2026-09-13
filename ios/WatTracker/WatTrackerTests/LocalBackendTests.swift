@@ -188,6 +188,63 @@ final class LocalBackendTests: XCTestCase {
         XCTAssertNotNil(cache.load(.dashboard))
     }
 
+    func testUnexpectedLandingThenOneUnauthorizedKeepsCredentialAndCache() async throws {
+        let credential = try LocalCredential(
+            baseURL: baseURL.absoluteString, token: "device-token"
+        )
+        let transport = ScriptedLocalTransport([
+            LocalResponse(
+                status: 200,
+                body: Data(#"{"ticket":"ticket-1"}"#.utf8),
+                url: baseURL.appendingPathComponent("/api/connector/session")
+            ),
+            successfulRedeem(),
+            LocalResponse(
+                status: 200, body: Data("<html>login</html>".utf8),
+                url: baseURL.appendingPathComponent("/login")
+            ),
+            LocalResponse(
+                status: 200,
+                body: Data(#"{"ticket":"ticket-2"}"#.utf8),
+                url: baseURL.appendingPathComponent("/api/connector/session")
+            ),
+            successfulRedeem(),
+            LocalResponse(
+                status: 401, body: Data(),
+                url: baseURL.appendingPathComponent("/api/state")
+            ),
+        ])
+        let store = MemoryLocalCredentialStore(credential: credential)
+        let cache = MemorySnapshotCache()
+        let cachedState = CloudFixtures.item(
+            id: "training-state", kind: "training_state", revision: 0,
+            data: #"{"ftp":250}"#
+        )
+        cache.store(
+            CachedCollection(revision: 0, items: [cachedState], storedAt: Date()),
+            for: .dashboard
+        )
+        let session = LocalSession(
+            credentials: store,
+            cache: cache,
+            makeClient: { value in
+                try LocalClient(
+                    baseURL: URL(string: value.baseURL)!, token: value.token,
+                    transport: transport
+                )
+            }
+        )
+
+        let snapshot = try await session.load(.dashboard)
+
+        XCTAssertEqual(snapshot.source, .cache)
+        XCTAssertEqual(snapshot.items, [cachedState])
+        let state = await session.deviceState
+        XCTAssertEqual(state, .paired)
+        XCTAssertNotNil(store.load())
+        XCTAssertNotNil(cache.load(.dashboard))
+    }
+
     func testLocalActivityStreamTimeIsNormalizedToSeconds() async throws {
         let transport = ScriptedLocalTransport([
             LocalResponse(

@@ -136,7 +136,7 @@ final class SessionGateTests: XCTestCase {
 
         XCTAssertEqual(gate.backend, .local)
         XCTAssertEqual(gate.phase, .unpaired)
-        XCTAssertEqual(preference.backend, .local)
+        XCTAssertEqual(preference.backend, .cloud)
         XCTAssertNil(gate.lastSuccess)
 
         let model = PairingModel()
