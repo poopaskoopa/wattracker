@@ -1,4 +1,5 @@
 import json
+import logging
 import sqlite3
 import threading
 import time
@@ -392,7 +393,140 @@ def test_request_sync_only_enqueues_and_pairing_uses_exact_signed_routes(tmp_pat
     ]
 
 
-def test_scheduler_persists_backoff_after_unexpected_sync_exception(tmp_path):
+def test_unchanged_sync_skips_snapshot_rebuild(tmp_path, monkeypatch):
+    path, user_id = _fixture_db(tmp_path, count=1)
+    store = CloudCredentialStore(MemorySecrets())
+    store.save_writer(_credentials(), user_id=user_id)
+    calls = []
+
+    def transport(_url, _headers, body):
+        calls.append(json.loads(body))
+        return 200, b'{"revision":1}'
+
+    sync = DesktopCloudSync(
+        str(path), store, transport=transport, include_derived=False,
+    )
+    db.save_cloud_sync_state(
+        user_id, {"endpoint": "https://cloud.example", "enabled": True},
+        path=str(path),
+    )
+    try:
+        assert sync.sync_once(user_id)[0].ok
+        assert len(calls) == 1
+
+        monkeypatch.setattr(
+            "wattracker.cloud.snapshot._all_snapshot_objects",
+            lambda *_args, **_kwargs: pytest.fail("unchanged snapshot rebuilt"),
+        )
+        assert sync.sync_once(user_id) == []
+        assert len(calls) == 1
+    finally:
+        sync.stop()
+
+
+def test_same_count_activity_edit_invalidates_snapshot_gate(tmp_path):
+    path, user_id = _fixture_db(tmp_path, count=1)
+    store = CloudCredentialStore(MemorySecrets())
+    store.save_writer(_credentials(), user_id=user_id)
+    calls = []
+
+    def transport(_url, _headers, body):
+        calls.append(json.loads(body))
+        return 200, b'{"revision":1}'
+
+    sync = DesktopCloudSync(
+        str(path), store, transport=transport, include_derived=False,
+    )
+    db.save_cloud_sync_state(
+        user_id, {"endpoint": "https://cloud.example", "enabled": True},
+        path=str(path),
+    )
+    try:
+        assert sync.sync_once(user_id)[0].ok
+        conn = sqlite3.connect(path)
+        try:
+            conn.execute(
+                "UPDATE activities SET avg_power = 210 "
+                "WHERE user_id = ? AND id = 1",
+                (user_id,),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
+        assert sync.sync_once(user_id)[0].ok
+        assert len(calls) == 2
+        assert calls[1]["objects"][0]["data"]["avg_power"] == 210
+    finally:
+        sync.stop()
+
+
+def test_scheduler_requeues_when_state_read_fails(tmp_path, monkeypatch):
+    path, user_id = _fixture_db(tmp_path, count=0)
+    sync = DesktopCloudSync(
+        str(path), CloudCredentialStore(MemorySecrets()),
+        periodic_interval_seconds=60,
+    )
+    db.save_cloud_sync_state(user_id, {"enabled": True}, path=str(path))
+    original = db.get_cloud_sync_state
+    calls = 0
+    attempted = threading.Event()
+
+    def flaky_state(uid, path=None):
+        nonlocal calls
+        calls += 1
+        if calls >= 2:
+            raise sqlite3.OperationalError("state temporarily unavailable")
+        return original(uid, path=path)
+
+    monkeypatch.setattr(db, "get_cloud_sync_state", flaky_state)
+    sync.sync_once = lambda _uid: attempted.set() or []
+    sync.start()
+    try:
+        assert attempted.wait(2)
+        deadline = time.monotonic() + 2
+        while time.monotonic() < deadline:
+            with sync._scheduler_lock:
+                if user_id in sync._scheduled:
+                    break
+            time.sleep(0.01)
+        with sync._scheduler_lock:
+            assert user_id in sync._scheduled
+        assert sync._worker is not None and sync._worker.is_alive()
+    finally:
+        sync.stop()
+
+
+def test_idle_scheduler_wait_is_untimed(tmp_path):
+    path, _user_id = _fixture_db(tmp_path, count=0)
+    entered = threading.Event()
+
+    class RecordingCondition(threading.Condition):
+        def __init__(self):
+            super().__init__()
+            self.timeouts = []
+
+        def wait(self, timeout=None):
+            self.timeouts.append(timeout)
+            if timeout is None:
+                entered.set()
+            return super().wait(timeout)
+
+    sync = DesktopCloudSync(
+        str(path), CloudCredentialStore(MemorySecrets()),
+    )
+    sync._scheduler_lock = RecordingCondition()
+    sync.start()
+    try:
+        assert entered.wait(2)
+        assert None in sync._scheduler_lock.timeouts
+    finally:
+        sync.stop()
+
+
+def test_scheduler_persists_backoff_after_unexpected_sync_exception(
+    tmp_path, caplog,
+):
     path, user_id = _fixture_db(tmp_path, count=0)
     sync = DesktopCloudSync(
         str(path), CloudCredentialStore(MemorySecrets()),
@@ -402,6 +536,7 @@ def test_scheduler_persists_backoff_after_unexpected_sync_exception(tmp_path):
         user_id, {"enabled": True}, path=str(path),
     )
     attempted = threading.Event()
+    caplog.set_level(logging.DEBUG, logger="wattracker.cloud.desktop_sync")
 
     def fail(_user_id):
         attempted.set()
@@ -419,6 +554,8 @@ def test_scheduler_persists_backoff_after_unexpected_sync_exception(tmp_path):
         assert status.next_retry_at is not None
         assert status.last_error == "Cloud sync encountered an unexpected error."
         assert "sensitive detail" not in status.last_error
+        assert "RuntimeError" in caplog.text
+        assert "sensitive detail" not in caplog.text
     finally:
         sync.stop()
 

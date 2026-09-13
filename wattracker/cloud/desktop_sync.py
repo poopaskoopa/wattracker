@@ -1,6 +1,8 @@
 """Opt-in desktop coordinator for the cloud synchronization plane."""
 from __future__ import annotations
 
+import logging
+import sqlite3
 import threading
 import time
 from dataclasses import dataclass, field
@@ -16,7 +18,14 @@ from .client import (
 )
 from .credentials import CloudCredentialStore, CloudCredentialUnavailable, KeyringBackend
 from .security import PublicKeyUnavailable
-from .snapshot import SnapshotError, pending_snapshot_objects
+from .snapshot import (
+    SnapshotError,
+    pending_snapshot_objects,
+    snapshot_change_token,
+)
+
+
+_log = logging.getLogger(__name__)
 
 
 class CloudDependencyUnavailable(RuntimeError):
@@ -122,6 +131,11 @@ class DesktopCloudSync:
         self._devices_cache: dict[int, list[dict[str, Any]]] = {}
         self._stop_event = threading.Event()
         self._worker: Optional[threading.Thread] = None
+        self._snapshot_gate_lock = threading.Lock()
+        self._snapshot_gate_connection: Optional[sqlite3.Connection] = None
+        self._snapshot_gate_baseline: dict[
+            int, tuple[int, tuple[Any, ...]]
+        ] = {}
 
     @staticmethod
     def _user_id(user_id: int) -> int:
@@ -134,6 +148,66 @@ class DesktopCloudSync:
             return pending_snapshot_objects(self.path, user_id)
         except Exception:
             return 0
+
+    def _snapshot_gate_options(self) -> tuple[Any, ...]:
+        return (
+            self.batch_limit,
+            self.include_streams,
+            self.include_derived,
+            self.derived_first,
+        )
+
+    def _snapshot_gate_token(self, user_id: int) -> Optional[tuple[int, bool]]:
+        with self._snapshot_gate_lock:
+            connection = self._snapshot_gate_connection
+            try:
+                if connection is None:
+                    connection = sqlite3.connect(
+                        db.read_only_uri(self.path),
+                        uri=True,
+                        check_same_thread=False,
+                    )
+                    connection.row_factory = sqlite3.Row
+                    self._snapshot_gate_connection = connection
+                return snapshot_change_token(connection, user_id)
+            except (OSError, sqlite3.Error):
+                if connection is not None:
+                    try:
+                        connection.close()
+                    except sqlite3.Error:
+                        pass
+                self._snapshot_gate_connection = None
+                return None
+
+    def _snapshot_gate_unchanged(self, user_id: int) -> bool:
+        token = self._snapshot_gate_token(user_id)
+        if token is None:
+            return False
+        version, pending = token
+        if pending:
+            return False
+        return self._snapshot_gate_baseline.get(user_id) == (
+            version, self._snapshot_gate_options(),
+        )
+
+    def _snapshot_gate_mark_current(self, user_id: int) -> None:
+        token = self._snapshot_gate_token(user_id)
+        if token is None or token[1]:
+            self._snapshot_gate_baseline.pop(user_id, None)
+            return
+        self._snapshot_gate_baseline[user_id] = (
+            token[0], self._snapshot_gate_options(),
+        )
+
+    def _close_snapshot_gate(self) -> None:
+        with self._snapshot_gate_lock:
+            if self._snapshot_gate_connection is not None:
+                try:
+                    self._snapshot_gate_connection.close()
+                except sqlite3.Error:
+                    pass
+                self._snapshot_gate_connection = None
+            self._snapshot_gate_baseline.clear()
 
     def _has_credentials(self, user_id: int) -> bool:
         try:
@@ -270,6 +344,8 @@ class DesktopCloudSync:
         user_id = self._user_id(user_id)
         if not self._state_enabled(user_id):
             return []
+        if self._snapshot_gate_unchanged(user_id):
+            return []
         try:
             client = self._client(user_id)
             results = client.push_snapshot(
@@ -290,6 +366,7 @@ class DesktopCloudSync:
         failed = next((result for result in results if not result.ok), None)
         if failed is None:
             self._record_success(user_id)
+            self._snapshot_gate_mark_current(user_id)
         else:
             self._record_failure(user_id, self._error_text(failed))
         return results
@@ -381,12 +458,13 @@ class DesktopCloudSync:
         with self._scheduler_lock:
             if self._worker is worker:
                 self._worker = None
+        self._close_snapshot_gate()
 
     def _run_scheduler(self) -> None:
         while not self._stop_event.is_set():
             with self._scheduler_lock:
                 while not self._scheduled and not self._stop_event.is_set():
-                    self._scheduler_lock.wait(timeout=1.0)
+                    self._scheduler_lock.wait()
                 if self._stop_event.is_set():
                     return
                 user_id, due = min(self._scheduled.items(), key=lambda item: item[1])
@@ -397,10 +475,15 @@ class DesktopCloudSync:
                 self._scheduled.pop(user_id, None)
             try:
                 self.sync_once(user_id)
-            except Exception:
+            except Exception as exc:
                 # Keep unexpected failures on the same durable retry path as
                 # ordinary offline errors. The fixed text avoids persisting
                 # exception details that could contain local or remote data.
+                _log.debug(
+                    "cloud sync cycle failed for user %s (%s)",
+                    user_id,
+                    type(exc).__name__,
+                )
                 if self._state_enabled(user_id):
                     try:
                         self._record_failure(
@@ -411,16 +494,22 @@ class DesktopCloudSync:
                         # worker; a later import or restart can schedule again.
                         pass
             if self._state_enabled(user_id):
-                state = db.get_cloud_sync_state(user_id, path=self.path)
-                next_retry = state["next_retry_at"]
-                if next_retry is not None:
-                    due = float(next_retry)
+                try:
+                    state = db.get_cloud_sync_state(user_id, path=self.path)
+                except Exception as exc:
+                    _log.debug(
+                        "cloud sync requeue state read failed for user %s (%s)",
+                        user_id,
+                        type(exc).__name__,
+                    )
+                    state = None
+                if state is not None and state["next_retry_at"] is not None:
+                    due = float(state["next_retry_at"])
                 else:
                     due = self.clock() + self.periodic_interval_seconds
-                if self._state_enabled(user_id):
-                    with self._scheduler_lock:
-                        current = self._scheduled.get(user_id)
-                        self._scheduled[user_id] = (
-                            due if current is None else min(current, due)
-                        )
-                        self._scheduler_lock.notify_all()
+                with self._scheduler_lock:
+                    current = self._scheduled.get(user_id)
+                    self._scheduled[user_id] = (
+                        due if current is None else min(current, due)
+                    )
+                    self._scheduler_lock.notify_all()

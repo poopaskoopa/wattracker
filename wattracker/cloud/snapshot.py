@@ -1049,6 +1049,35 @@ def pending_snapshot_objects(
         return total
 
 
+def snapshot_change_token(
+    conn: sqlite3.Connection, user_id: int,
+) -> Optional[tuple[int, bool]]:
+    """Return a cheap database-change token and pending-batch flag.
+
+    ``PRAGMA data_version`` is meaningful across reads on this same connection
+    and changes whenever another connection commits.  The caller keeps the
+    connection open for the lifetime of its gate, so same-count edits and
+    deletions cannot be mistaken for an unchanged snapshot.  A missing ledger,
+    pending-table error, or malformed database returns ``None`` so callers
+    rebuild conservatively.
+    """
+    if isinstance(user_id, bool) or not isinstance(user_id, int) or user_id < 1:
+        raise ValueError("user_id must be positive")
+    try:
+        if not _publication_schema_available(conn):
+            return None
+        row = conn.execute("PRAGMA data_version").fetchone()
+        if row is None:
+            return None
+        pending = conn.execute(
+            "SELECT 1 FROM cloud_publication_pending WHERE user_id = ? LIMIT 1",
+            (user_id,),
+        ).fetchone()
+        return int(row[0]), pending is not None
+    except (sqlite3.Error, TypeError, ValueError, OverflowError):
+        return None
+
+
 def snapshot_objects(
     path: str | os.PathLike[str],
     user_id: int,
@@ -1375,15 +1404,63 @@ def snapshot_batch(
             batch_id=batch_id, revision=revision, objects=versioned,
         )
 
+    options_digest = _snapshot_options_digest(
+        include_streams=include_streams, include_derived=include_derived,
+        limit=limit, offset=offset, derived_first=derived_first,
+    )
+
+    # Resolve an already prepared batch before inflating the complete local
+    # snapshot. A retry must send the durable payload verbatim; recomputing
+    # every activity and derived object first only wastes work and can delay
+    # recovery while the desktop is offline.
+    with _publication_connection(path) as conn:
+        if _publication_schema_available(conn):
+            if republish:
+                pending = conn.execute(
+                    "SELECT batch_id FROM cloud_publication_pending "
+                    "WHERE user_id = ? LIMIT 1",
+                    (user_id,),
+                ).fetchone()
+                if pending is not None:
+                    raise SnapshotError(
+                        "another publication batch is still pending"
+                    )
+            elif batch_id is not None:
+                pending = conn.execute(
+                    "SELECT * FROM cloud_publication_pending "
+                    "WHERE user_id = ? AND batch_id = ?",
+                    (user_id, batch_id),
+                ).fetchone()
+                if pending is None:
+                    other_pending = conn.execute(
+                        "SELECT batch_id FROM cloud_publication_pending "
+                        "WHERE user_id = ? LIMIT 1",
+                        (user_id,),
+                    ).fetchone()
+                    if other_pending is not None:
+                        raise SnapshotError(
+                            "another publication batch is still pending"
+                        )
+                elif revision is not None and int(pending["revision"]) != revision:
+                    raise SnapshotError("pending batch revision does not match")
+                elif pending is not None:
+                    return _pending_to_batch(pending)
+            else:
+                pending = conn.execute(
+                    "SELECT * FROM cloud_publication_pending "
+                    "WHERE user_id = ? ORDER BY revision ASC LIMIT 1",
+                    (user_id,),
+                ).fetchone()
+                if pending is not None:
+                    if revision is not None and int(pending["revision"]) != revision:
+                        raise SnapshotError("pending batch revision does not match")
+                    return _pending_to_batch(pending)
+
     current = _all_snapshot_objects(
         path, user_id, include_streams=include_streams,
         include_derived=include_derived, derived_first=derived_first,
     )
     current_by_key = {(obj.kind, obj.object_id): obj for obj in current}
-    options_digest = _snapshot_options_digest(
-        include_streams=include_streams, include_derived=include_derived,
-        limit=limit, offset=offset, derived_first=derived_first,
-    )
 
     # A hand-built legacy fixture may not have the current schema. Preserve
     # the old pure-read behavior there; initialized application databases have
