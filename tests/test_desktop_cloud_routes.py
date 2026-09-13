@@ -1,6 +1,7 @@
 """Desktop cloud controls stay local to the request and scheduler seam."""
 
 import base64
+import json
 import time
 
 import pytest
@@ -9,6 +10,9 @@ pytest.importorskip("httpx")
 from fastapi.testclient import TestClient
 
 from wattracker import db
+from wattracker.cloud.client import SyncCredentials
+from wattracker.cloud.credentials import CloudCredentialStore
+from wattracker.cloud.desktop_sync import DesktopCloudSync
 import wattracker.server as server
 
 
@@ -143,3 +147,116 @@ def test_missing_cloud_extra_and_retry_status_are_clear(client):
     sync.state.update({"enabled": True, "retry": 3})
     text = web.get("/settings").text
     assert "Retry scheduled (attempt 3)" in text
+
+
+class _MemorySecrets:
+    def __init__(self):
+        self.values = {}
+
+    def get(self, account):
+        return self.values.get(account)
+
+    def set(self, account, value):
+        self.values[account] = value
+
+    def delete(self, account):
+        self.values.pop(account, None)
+
+
+@pytest.fixture()
+def cold_disabled_cloud(monkeypatch):
+    """The real DesktopCloudSync behind the routes, enrolled but switched off.
+
+    The fake above cannot answer the question this covers - whether a signed
+    request actually leaves - so these tests drive the real adapter over a
+    captured transport, with a device cache that has never been filled.
+    """
+    captured = []
+    store = CloudCredentialStore(_MemorySecrets())
+
+    def transport(url, headers, body, method):
+        captured.append((method, url))
+        if url.endswith("/api/v1/devices"):
+            return 200, json.dumps({"devices": [
+                {"credential_id": "b" * 64, "label": "Phone"},
+            ]}).encode()
+        if url.endswith("/revoke"):
+            return 200, b'{"revoked":true}'
+        if url.endswith("pairing-codes"):
+            return 200, b'{"pairing_code":"123456","expires_at":1800000000}'
+        raise AssertionError(f"unexpected cloud URL while disabled: {url}")
+
+    monkeypatch.setattr(
+        server, "DesktopCloudSync",
+        lambda path: DesktopCloudSync(path, store, transport=transport),
+    )
+    app = server.create_app()
+    with TestClient(app) as web:
+        web.post("/register", data={"username": "rider", "password": "password123"})
+        uid = db.get_user_by_username("rider")["id"]
+        store.save_writer(
+            SyncCredentials("c" * 64, "subscription", b"signing-key", namespace="a" * 64),
+            user_id=uid,
+        )
+        db.save_cloud_sync_state(
+            uid, {"endpoint": "https://cloud.example", "enabled": False},
+        )
+        assert app.state.cloud_sync.status(uid).devices == []
+        yield web, app.state.cloud_sync, captured, uid
+
+
+def test_refresh_reaches_the_revoke_button_with_sync_off(cold_disabled_cloud):
+    """After a restart with sync off, the rider can still reach Revoke.
+
+    This is the case the revocation exception exists for - a lost phone, sync
+    killed - and before this it was the one case that could not get to the
+    button, because the device cache is in memory only and the refresh control
+    was disabled alongside everything else.
+    """
+    web, sync, captured, uid = cold_disabled_cloud
+
+    text = web.get("/settings").text
+    refresh_form = text.split('action="/settings/cloud/devices"', 1)[1].split("</form>", 1)[0]
+    assert "Refresh paired devices" in refresh_form
+    assert "disabled" not in refresh_form
+    # Nothing to revoke yet: the cache is cold and the page has not asked.
+    assert "/revoke" not in text
+    assert captured == []
+
+    text = web.post("/settings/cloud/devices").text
+    assert captured == [("GET", "https://cloud.example/api/v1/devices")]
+    revoke_form = f'action="/settings/cloud/devices/{"b" * 64}/revoke"'
+    assert revoke_form in text
+    assert "Phone" in text
+    revoke_button = text.split(revoke_form, 1)[1].split("</form>", 1)[0]
+    assert "disabled" not in revoke_button
+    assert not sync.status(uid).enabled
+
+    captured.clear()
+    assert "Paired device revoked." in web.post(
+        f"/settings/cloud/devices/{'b' * 64}/revoke"
+    ).text
+    assert captured[0] == (
+        "POST", "https://cloud.example/api/v1/devices/" + "b" * 64 + "/revoke",
+    )
+    assert not sync.status(uid).enabled
+
+
+def test_pairing_and_sync_stay_gated_while_disabled(cold_disabled_cloud):
+    """The exception is exactly two calls wide; nothing else may leave.
+
+    Asserted on the transport rather than the response, so widening the
+    exception later cannot pass by returning the same page.
+    """
+    web, sync, captured, uid = cold_disabled_cloud
+
+    text = web.get("/settings").text
+    pairing_button = text.split('action="/settings/cloud/pairing"', 1)[1].split("</form>", 1)[0]
+    assert "disabled" in pairing_button
+    sync_button = text.split('action="/settings/cloud/sync"', 1)[1].split("</form>", 1)[0]
+    assert "disabled" in sync_button
+
+    assert sync.mint_pairing_code(uid) is None
+    assert web.post("/settings/cloud/sync", follow_redirects=False).status_code == 303
+    assert sync.sync_once(uid) == []
+    assert captured == []

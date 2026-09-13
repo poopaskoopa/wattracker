@@ -380,10 +380,14 @@ def test_request_sync_only_enqueues_and_pairing_uses_exact_signed_routes(tmp_pat
 
     sync.set_enabled(user_id, False)
     captured.clear()
+    # Pairing a new device is gated by the kill switch; reading the device list
+    # and revoking one are the two deliberate exceptions, because that pair is
+    # the rider's recovery path after losing a device.
     assert sync.mint_pairing_code(user_id) is None
-    assert sync.list_devices(user_id) == []
+    assert sync.list_devices(user_id)[0] == {"credential_id": "b" * 64, "label": "Phone"}
     assert sync.revoke_device(user_id, "b" * 64)
     assert [(method, url) for method, url, _headers, _body in captured] == [
+        ("GET", "https://cloud.example/api/v1/devices"),
         ("POST", "https://cloud.example/api/v1/devices/" + "b" * 64 + "/revoke"),
     ]
 
@@ -417,3 +421,108 @@ def test_scheduler_persists_backoff_after_unexpected_sync_exception(tmp_path):
         assert "sensitive detail" not in status.last_error
     finally:
         sync.stop()
+
+
+def test_device_administration_stays_reachable_from_a_cold_start_with_sync_off(tmp_path):
+    """The stolen-phone case: sync off, cache cold, revoke still reachable.
+
+    ``list_devices`` and ``revoke_device`` are the two deliberate exceptions to
+    the kill switch, and they only work as a pair: ``_devices_cache`` is in
+    memory only, so a restart with sync off leaves nothing to revoke unless the
+    listing can go out. Minting a pairing code is not recovery and stays
+    gated - asserted here against the transport, not only the return value.
+    """
+    path, user_id = _fixture_db(tmp_path, count=1)
+    credentials = _credentials()
+    captured = []
+
+    def transport(url, headers, body, method):
+        captured.append((method, url, headers, body))
+        if url.endswith("/api/v1/devices"):
+            return 200, json.dumps({"devices": [
+                {"credential_id": "b" * 64, "label": "Phone", "subscription_key": "leak"},
+            ]}).encode()
+        if url.endswith("/revoke"):
+            return 200, b'{"revoked":true}'
+        raise AssertionError(f"unexpected cloud URL while disabled: {url}")
+
+    store = CloudCredentialStore(MemorySecrets())
+    store.save_writer(credentials, user_id=user_id)
+    # A freshly constructed instance is the post-restart state: the device
+    # cache is empty and nothing but a live listing can refill it.
+    sync = DesktopCloudSync(str(path), store, transport=transport)
+    db.save_cloud_sync_state(
+        user_id,
+        {"endpoint": "https://cloud.example", "enabled": False},
+        path=str(path),
+    )
+    assert not sync.status(user_id).enabled
+    assert sync.status(user_id).devices == []
+
+    assert sync.list_devices(user_id) == [
+        {"credential_id": "b" * 64, "label": "Phone"},
+    ]
+    assert len(captured) == 1
+    assert sync.status(user_id).devices == [
+        {"credential_id": "b" * 64, "label": "Phone"},
+    ]
+
+    assert sync.revoke_device(user_id, "b" * 64)
+    assert len(captured) == 2
+    assert [(method, url) for method, url, _headers, _body in captured] == [
+        ("GET", "https://cloud.example/api/v1/devices"),
+        ("POST", "https://cloud.example/api/v1/devices/" + "b" * 64 + "/revoke"),
+    ]
+    assert sync.status(user_id).devices[0]["revoked"] is True
+    for method, url, headers, body in captured:
+        path_part = url.split("cloud.example", 1)[1]
+        canonical = canonical_request(
+            method, path_part, credentials.namespace, int(headers["X-Writer-Timestamp"]),
+            headers["X-Writer-Nonce"], digest_body(body),
+            headers["X-Writer-Idempotency-Key"], headers["X-Writer-Revision"],
+        )
+        assert sign_request(credentials.signing_key, canonical) == headers["X-Writer-Signature"]
+
+    # Everything the kill switch exists to stop is still stopped.
+    captured.clear()
+    assert sync.mint_pairing_code(user_id) is None
+    assert sync.sync_once(user_id) == []
+    assert captured == []
+
+
+def test_disabled_scheduler_round_publishes_nothing(tmp_path):
+    """A wake-up while disabled must not put a byte on the wire."""
+    path, user_id = _fixture_db(tmp_path, count=1)
+    captured = []
+
+    def transport(url, _headers, _body, _method=None):
+        captured.append(url)
+        raise AssertionError(f"outbound request while disabled: {url}")
+
+    store = CloudCredentialStore(MemorySecrets())
+    store.save_writer(_credentials(), user_id=user_id)
+    sync = DesktopCloudSync(str(path), store, transport=transport)
+    db.save_cloud_sync_state(
+        user_id,
+        {"endpoint": "https://cloud.example", "enabled": False},
+        path=str(path),
+    )
+    sync.start()
+    try:
+        assert sync.request_sync(user_id)
+        deadline = time.monotonic() + 2
+        while time.monotonic() < deadline:
+            with sync._scheduler_lock:
+                drained = not sync._scheduled
+            if drained:
+                break
+            time.sleep(0.01)
+        assert drained
+    finally:
+        sync.stop()
+    assert captured == []
+    status = sync.status(user_id)
+    assert not status.enabled
+    assert status.retry == 0
+    assert status.last_error is None
+    assert status.last_success is None
