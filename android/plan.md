@@ -358,11 +358,8 @@ reference. #228 closed as superseded.)
   handles it). The 403 stays real
   for the rider's *browser* over the proxy — so pair a device from the desktop
   at `127.0.0.1`, not from the phone browser.
-- ⚠️ **`WATTRACKER_COOKIE_SECURE` goes in the launch environment, not a shell
-  export.** `conftest`'s `delenv` list does not clear it, so an exported value
-  produces mass Python-suite failures that look unrelated to it (#249, and the
-  owner repeated the warning on #257). Same care as any other server env var
-  set for a phone-facing run.
+- **`WATTRACKER_COOKIE_SECURE` goes in the launch environment, not a shell
+  export.** Same care as any other server env var set for a phone-facing run.
 - **Docs corrected 2026-09-09** (was Step-1 debt; done in #266, in flight —
   on `main` only once it merges): `android/README.md` no longer claims the
   emulator needs `WATTRACKER_HOST=0.0.0.0` +

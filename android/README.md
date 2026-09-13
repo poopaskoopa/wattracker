@@ -152,10 +152,9 @@ proxy's `server_name` otherwise. The front end must pass the original `Host`
 through (in nginx, `proxy_set_header Host $host;`; `tailscale serve` already
 does) and forward at the root — the app has no `root_path` support.
 
-**`WATTRACKER_COOKIE_SECURE` must be set in the launch environment, not
-exported into a shell that later runs the test suite:** `conftest`'s `delenv`
-list does not clear it, and a stray export produces mass test failures that
-look unrelated to it (see #249).
+**Set `WATTRACKER_COOKIE_SECURE` in the launch environment rather than
+exporting it into your shell** — the same care as any other server env var set
+for a phone-facing run.
 
 The app pins no hostname anywhere — not in the manifest, not in the network
 security config, not in `BuildConfig`. The rider types the origin at pairing
