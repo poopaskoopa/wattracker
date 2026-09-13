@@ -1,7 +1,7 @@
 import pytest
 
 from wattracker.cloud.client import SyncCredentials
-from wattracker.cloud.credentials import CloudCredentialStore
+from wattracker.cloud.credentials import CloudCredentialStore, CloudCredentialUnavailable
 
 
 class MemorySecrets:
@@ -32,6 +32,46 @@ def test_cloud_identity_and_writer_are_stored_only_in_secure_backend():
     assert b"private-key" not in backend.values["writer-credentials"].encode()
     store.revoke_local_writer()
     assert store.load_writer() is None
+
+
+def test_failed_probe_delete_reuses_recoverable_account_across_stores():
+    class FailingDeleteSecrets(MemorySecrets):
+        fail_delete = True
+
+        def delete(self, account):
+            if self.fail_delete:
+                raise CloudCredentialUnavailable("delete unavailable")
+            super().delete(account)
+
+    backend = FailingDeleteSecrets()
+    # Recreating the store also exercises recovery without in-memory tracking.
+    for _ in range(3):
+        with pytest.raises(CloudCredentialUnavailable, match="delete unavailable"):
+            CloudCredentialStore(backend).probe()
+        assert set(backend.values) == {"credential-probe"}
+
+    backend.fail_delete = False
+    CloudCredentialStore(backend).probe()
+    assert backend.values == {}
+
+
+@pytest.mark.parametrize("failure", ["partial_write", "read", "mismatch"])
+def test_probe_cleans_up_after_write_and_verification_failures(failure):
+    class FailingSecrets(MemorySecrets):
+        def set(self, account, value):
+            super().set(account, value)
+            if failure == "partial_write":
+                raise CloudCredentialUnavailable("write failed after storing")
+
+        def get(self, account):
+            if failure == "read":
+                raise CloudCredentialUnavailable("read unavailable")
+            return "incorrect value"
+
+    backend = FailingSecrets()
+    with pytest.raises(CloudCredentialUnavailable):
+        CloudCredentialStore(backend).probe()
+    assert backend.values == {}
 
 
 def test_scoped_writers_are_isolated_and_reject_invalid_user_ids():
