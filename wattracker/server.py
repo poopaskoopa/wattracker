@@ -5027,11 +5027,7 @@ def create_app() -> FastAPI:
             "Paired device revoked."
             if revoked else "Paired device could not be revoked. Try again."
         )
-        return templates.TemplateResponse(
-            request, "settings.html", _settings_ctx(
-                request, uid, False, cloud_message=message,
-            )
-        )
+        return _cloud_settings_redirect(request, message)
 
     @app.post("/settings", response_class=HTMLResponse)
     def settings_save(
