@@ -4,7 +4,7 @@ import Observation
 import SwiftUI
 
 struct VolumeScreen: View {
-    @Environment(\.readSession) private var session
+    @Environment(SessionGate.self) private var gate
     @State private var model = VolumeScreenModel()
 
     var body: some View {
@@ -14,7 +14,7 @@ struct VolumeScreen: View {
         ) {
             content
         }
-        .task { await model.start(session: session) }
+        .task(id: gate.backend) { await model.start(session: gate.activeSession) }
     }
 
     @ViewBuilder
@@ -72,12 +72,8 @@ final class VolumeScreenModel {
     var selectedMetric: VolumeMetric = .hours
     var selectedRange: VolumeRange = .last12
 
-    private var started = false
-
     func start(session: (any ReadSession)?) async {
-        guard !started else { return }
-        started = true
-
+        state = .starting
         guard let session else {
             state = .unpaired
             return

@@ -15,10 +15,22 @@ final class SessionGateTests: XCTestCase {
 
     private struct Harness {
         let gate: SessionGate
+        let session: CloudSession
         let transport: ScriptedTransport
         let clock: TestClock
         let credentials: MemoryDeviceCredentialStore
         let cache: MemorySnapshotCache
+    }
+
+    private final class MemoryPreferenceStore: SessionGate.PreferenceStore, @unchecked Sendable {
+        var backend: SessionGate.Backend?
+
+        init(_ backend: SessionGate.Backend? = nil) {
+            self.backend = backend
+        }
+
+        func loadBackend() -> SessionGate.Backend? { backend }
+        func saveBackend(_ backend: SessionGate.Backend) { self.backend = backend }
     }
 
     private func harness(
@@ -41,7 +53,10 @@ final class SessionGateTests: XCTestCase {
             clock: clock.reader
         )
         return Harness(
-            gate: SessionGate(makeSession: { session }),
+            gate: SessionGate(
+                makeSession: { session }, preferences: MemoryPreferenceStore()
+            ),
+            session: session,
             transport: transport,
             clock: clock,
             credentials: credentials,
@@ -66,6 +81,84 @@ final class SessionGateTests: XCTestCase {
         // A launch reads the keychain and nothing else: a device that opens the
         // app on a train must not need the network to reach its cached data.
         XCTAssertEqual(rig.transport.requestCount, 0)
+    }
+
+    func testSavedBackendIsRestoredWhenThatBackendIsPaired() async {
+        let preference = MemoryPreferenceStore(.local)
+        let cloud = harness(paired: true) { _, _ in .refused(404) }
+        let local = LocalSession(
+            credentials: MemoryLocalCredentialStore(
+                credential: try? LocalCredential(
+                    baseURL: "https://desktop.example", token: "token"
+                )
+            ),
+            cache: MemorySnapshotCache()
+        )
+        let gate = SessionGate(
+            makeSession: { cloud.session },
+            makeLocalSession: { local },
+            preferences: preference
+        )
+
+        await gate.start()
+
+        XCTAssertEqual(gate.backend, .local)
+        XCTAssertEqual(gate.phase, .paired)
+    }
+
+    func testInjectedPreferenceStoreRestoresOnlyTheBackendValue() {
+        let preference = MemoryPreferenceStore(.local)
+
+        let gate = SessionGate(preferences: preference)
+
+        XCTAssertEqual(gate.backend, .local)
+        XCTAssertEqual(preference.loadBackend(), .local)
+    }
+
+    func testSelectingAnUnpairedLocalBackendEntersPairing() async {
+        let preference = MemoryPreferenceStore()
+        let rig = harness(paired: true) { _, _ in .refused(404) }
+        let local = LocalSession(
+            credentials: MemoryLocalCredentialStore(), cache: MemorySnapshotCache()
+        )
+        let gate = SessionGate(
+            makeSession: { rig.session },
+            makeLocalSession: { local },
+            preferences: preference
+        )
+        await gate.start()
+
+        await gate.selectBackend(.local)
+
+        XCTAssertEqual(gate.backend, .local)
+        XCTAssertEqual(gate.phase, .unpaired)
+        XCTAssertEqual(preference.backend, .local)
+        XCTAssertNil(gate.lastSuccess)
+    }
+
+    func testRemovingLocalFallsBackToPairedCloud() async {
+        let preference = MemoryPreferenceStore(.local)
+        let cloud = harness(paired: true) { _, _ in .refused(404) }
+        let local = LocalSession(
+            credentials: MemoryLocalCredentialStore(
+                credential: try? LocalCredential(
+                    baseURL: "https://desktop.example", token: "token"
+                )
+            ),
+            cache: MemorySnapshotCache()
+        )
+        let gate = SessionGate(
+            makeSession: { cloud.session },
+            makeLocalSession: { local },
+            preferences: preference
+        )
+        await gate.start()
+
+        try? await gate.removeDevice()
+
+        XCTAssertEqual(gate.backend, .cloud)
+        XCTAssertEqual(gate.phase, .paired)
+        XCTAssertEqual(preference.backend, .cloud)
     }
 
     func testAKeyThatCannotBeCreatedIsUnusable() async {

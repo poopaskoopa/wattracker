@@ -17,7 +17,7 @@ struct DashboardScreen: View {
     /// a revoke performed in Settings would leave this screen holding a
     /// session that still believed it was paired, and it would keep rendering
     /// a signed-out rider's numbers until something forced it to reload.
-    @Environment(\.readSession) private var session
+    @Environment(SessionGate.self) private var gate
     @State private var model = DashboardModel()
 
     var body: some View {
@@ -27,7 +27,7 @@ struct DashboardScreen: View {
         ) {
             content
         }
-        .task { await model.start(session: session) }
+        .task(id: gate.backend) { await model.start(session: gate.activeSession) }
     }
 
     @ViewBuilder
@@ -80,8 +80,6 @@ final class DashboardModel {
     private(set) var state: State = .starting
     var selectedWindow: LoadWindow = .sixWeeks
 
-    private var started = false
-
     /// Takes the session rather than building one.
     ///
     /// This model used to construct its own `CloudSession` when none was
@@ -91,9 +89,7 @@ final class DashboardModel {
     /// holding one that still believes it is paired, rendering a signed-out
     /// rider's numbers until something forces a reload.
     func start(session: (any ReadSession)?) async {
-        guard !started else { return }
-        started = true
-
+        state = .starting
         // No session means the gate has not produced one: no credential yet,
         // or the signing key could not be read. Both are the shell's to
         // explain, and neither is a dashboard this screen can fill.

@@ -63,8 +63,15 @@ protocol ReadSession: Sendable {
     var lastSuccess: Date? { get async }
     nonisolated func cached(_ route: CloudRoute) -> CloudSnapshot?
     func load(_ route: CloudRoute) async throws -> CloudSnapshot
+    func load(_ route: CloudRoute, month: CalendarMonth?) async throws -> CloudSnapshot
     func activityDetail(_ activityID: Int) async throws -> ActivityDetail
     func activityStreams(_ activityID: Int) async throws -> ActivityStreams
+}
+
+extension ReadSession {
+    func load(_ route: CloudRoute, month: CalendarMonth? = nil) async throws -> CloudSnapshot {
+        try await load(route)
+    }
 }
 
 /// The token lifecycle, the offline cache, and the one place that decides this

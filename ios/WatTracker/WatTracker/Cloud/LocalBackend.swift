@@ -217,7 +217,9 @@ struct LocalClient: Sendable {
         let value: StreamResponse = try await get("/api/activity/\(activityID)")
         return ActivityStreams(
             streams: ActivityStreams.Channels(
-                time: value.t,
+                // The desktop activity page exposes elapsed minutes; the
+                // shared chart contract is elapsed seconds.
+                time: value.t?.map { $0.map { $0 * 60.0 } },
                 power: value.power,
                 heartrate: value.heartrate,
                 cadence: value.cadence,
@@ -250,7 +252,7 @@ struct LocalClient: Sendable {
     }
 
     private func map(_ response: LocalResponse, path: String) -> Failure {
-        if response.status == 401 || response.status == 403 {
+        if response.status == 401 {
             return .unauthorized
         }
         return .http(status: response.status, path: path, retryAfter: response.retryAfter)
@@ -283,6 +285,7 @@ actor LocalSession: ReadSession {
     private var authenticated = false
     private var details: [Int: ActivityDetail] = [:]
     private var streams: [Int: ActivityStreams] = [:]
+    private var calendarCache: [CalendarMonth: CachedCollection] = [:]
 
     init(
         credentials: LocalCredentialStore,
@@ -314,10 +317,18 @@ actor LocalSession: ReadSession {
 
     nonisolated func cached(_ route: CloudRoute) -> CloudSnapshot? {
         guard let cached = cache.load(route) else { return nil }
+        let items: [CloudItem]
+        if route == .calendar {
+            let month = CalendarMonth.current()
+            items = Self.calendarItems(cached.items, for: month)
+            guard !items.isEmpty else { return nil }
+        } else {
+            items = cached.items
+        }
         return CloudSnapshot(
             route: route,
             revision: cached.revision,
-            items: cached.items,
+            items: items,
             source: .cache,
             asOf: cached.storedAt
         )
@@ -345,6 +356,7 @@ actor LocalSession: ReadSession {
         cache.removeAll()
         details.removeAll()
         streams.removeAll()
+        calendarCache.removeAll()
         credential = candidate
         client = candidateClient
         authenticated = true
@@ -358,6 +370,7 @@ actor LocalSession: ReadSession {
         cache.removeAll()
         details.removeAll()
         streams.removeAll()
+        calendarCache.removeAll()
         credential = nil
         client = nil
         authenticated = false
@@ -380,12 +393,21 @@ actor LocalSession: ReadSession {
     }
 
     func load(_ route: CloudRoute) async throws -> CloudSnapshot {
+        try await load(route, month: route == .calendar
+            ? CalendarMonth.current(date: clock())
+            : nil)
+    }
+
+    func load(_ route: CloudRoute, month: CalendarMonth? = nil) async throws -> CloudSnapshot {
         guard state != .removed else { throw CloudSession.Failure.deviceRemoved }
         guard state == .paired else { throw CloudSession.Failure.notPaired }
         let generation = lifecycleGeneration
-        let cached = cache.load(route)
+        let requestedMonth = route == .calendar
+            ? (month ?? CalendarMonth.current(date: clock()))
+            : nil
+        let cached = cachedCollection(for: route, month: requestedMonth)
         do {
-            let items = try await read(route)
+            let items = try await read(route, month: requestedMonth)
             try validate(generation)
             let now = clock()
             let snapshot = CloudSnapshot(
@@ -395,7 +417,7 @@ actor LocalSession: ReadSession {
                 source: .network,
                 asOf: now
             )
-            cache.store(CachedCollection(revision: 0, items: items, storedAt: now), for: route)
+            store(items: items, route: route, month: requestedMonth, now: now)
             lastSuccessfulRead = now
             return snapshot
         } catch let failure as CloudSession.Failure {
@@ -454,7 +476,7 @@ actor LocalSession: ReadSession {
         }
     }
 
-    private func read(_ route: CloudRoute) async throws -> [CloudItem] {
+    private func read(_ route: CloudRoute, month: CalendarMonth? = nil) async throws -> [CloudItem] {
         try await perform { client in
             switch route {
             case .dashboard:
@@ -499,12 +521,15 @@ actor LocalSession: ReadSession {
                                      payload: .activity(activity))
                 }
             case .calendar:
-                let month = CalendarMonth.current(date: clock())
+                let month = month ?? CalendarMonth.current(date: clock())
                 let days = try await client.calendar(year: month.year, month: month.month)
-                return days.enumerated().map { index, day in
-                        CloudItem(id: "calendar-\(day.date ?? index.description)",
-                                  kind: .calendarDay, revision: 0, payload: .calendarDay(day))
+                return days.enumerated().compactMap { index, day in
+                    guard let date = day.date, CalendarMonth.fromISODate(date) == month else {
+                        return nil
                     }
+                    return CloudItem(id: "calendar-\(date.isEmpty ? index.description : date)",
+                                     kind: .calendarDay, revision: 0, payload: .calendarDay(day))
+                }
             case .curve:
                 return [CloudItem(id: "curve", kind: .curve, revision: 0,
                                   payload: .curve(try await client.curve()))]
@@ -557,6 +582,7 @@ actor LocalSession: ReadSession {
         cache.removeAll()
         details.removeAll()
         streams.removeAll()
+        calendarCache.removeAll()
         credential = nil
         client = nil
         authenticated = false
@@ -598,5 +624,49 @@ actor LocalSession: ReadSession {
             }
         }
         return .server(.malformedResponse("local response"))
+    }
+
+    private func cachedCollection(
+        for route: CloudRoute, month: CalendarMonth?
+    ) -> CachedCollection? {
+        guard route == .calendar, let month else { return cache.load(route) }
+        if let cached = calendarCache[month] { return cached }
+        guard let cached = cache.load(route) else { return nil }
+        let items = Self.calendarItems(cached.items, for: month)
+        let result = CachedCollection(
+            revision: cached.revision, items: items, storedAt: cached.storedAt
+        )
+        guard !items.isEmpty else { return nil }
+        calendarCache[month] = result
+        return result
+    }
+
+    private func store(
+        items: [CloudItem], route: CloudRoute, month: CalendarMonth?, now: Date
+    ) {
+        guard route == .calendar, let month else {
+            cache.store(CachedCollection(revision: 0, items: items, storedAt: now), for: route)
+            return
+        }
+        let existing = cache.load(.calendar)?.items ?? []
+        let retained = existing.filter { Self.calendarMonth(for: $0) != month }
+        let incoming = Self.calendarItems(items, for: month)
+        calendarCache[month] = CachedCollection(revision: 0, items: incoming, storedAt: now)
+        cache.store(
+            CachedCollection(revision: 0, items: retained + incoming, storedAt: now),
+            for: .calendar
+        )
+    }
+
+    private static func calendarMonth(for item: CloudItem) -> CalendarMonth? {
+        guard !item.deleted, case let .calendarDay(day) = item.payload,
+              let date = day.date else { return nil }
+        return CalendarMonth.fromISODate(date)
+    }
+
+    private static func calendarItems(
+        _ items: [CloudItem], for month: CalendarMonth
+    ) -> [CloudItem] {
+        items.filter { calendarMonth(for: $0) == month }
     }
 }

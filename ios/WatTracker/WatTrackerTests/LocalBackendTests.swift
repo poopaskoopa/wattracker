@@ -59,6 +59,120 @@ final class LocalBackendTests: XCTestCase {
         XCTAssertEqual(transport.requests[1].queryItems["token"], "one-time-ticket")
     }
 
+    func test403KeepsCredentialAndReturnsRequestedCache() async throws {
+        let credential = try LocalCredential(
+            baseURL: baseURL.absoluteString, token: "device-token"
+        )
+        let transport = ScriptedLocalTransport([
+            LocalResponse(
+                status: 200,
+                body: Data(#"{"ticket":"ticket"}"#.utf8),
+                url: URL(string: "https://desktop.example/api/connector/session")!
+            ),
+            LocalResponse(status: 200, body: Data(), url: baseURL.appendingPathComponent("/")),
+            LocalResponse(
+                status: 403, body: Data(), url: baseURL.appendingPathComponent("/api/state")
+            ),
+        ])
+        let store = MemoryLocalCredentialStore(credential: credential)
+        let cache = MemorySnapshotCache()
+        let cachedState = CloudFixtures.item(
+            id: "training-state", kind: "training_state", revision: 0,
+            data: #"{"ftp":250}"#
+        )
+        cache.store(
+            CachedCollection(revision: 0, items: [cachedState], storedAt: Date()),
+            for: .dashboard
+        )
+        let session = LocalSession(
+            credentials: store,
+            cache: cache,
+            makeClient: { value in
+                try LocalClient(
+                    baseURL: URL(string: value.baseURL)!, token: value.token, transport: transport
+                )
+            }
+        )
+
+        let snapshot = try await session.load(.dashboard)
+
+        XCTAssertEqual(snapshot.source, .cache)
+        XCTAssertEqual(snapshot.items, [cachedState])
+        let state = await session.deviceState
+        XCTAssertEqual(state, .paired)
+        XCTAssertNotNil(store.load())
+        XCTAssertNotNil(cache.load(.dashboard))
+    }
+
+    func testLocalActivityStreamTimeIsNormalizedToSeconds() async throws {
+        let transport = ScriptedLocalTransport([
+            LocalResponse(
+                status: 200,
+                body: Data(#"{"t":[0,0.5,1.25],"power":[100,200,300]}"#.utf8),
+                url: baseURL.appendingPathComponent("/api/activity/7")
+            ),
+        ])
+        let client = try LocalClient(
+            baseURL: baseURL, token: "device-token", transport: transport
+        )
+
+        let streams = try await client.activityStreams(7)
+
+        XCTAssertEqual(streams.streams.time!, [0, 30, 75])
+    }
+
+    func testCalendarRequestsAndFallsBackToTheRequestedMonthOnly() async throws {
+        let credential = try LocalCredential(
+            baseURL: baseURL.absoluteString, token: "device-token"
+        )
+        let january = CalendarMonth(year: 2026, month: 1)
+        let february = CalendarMonth(year: 2026, month: 2)
+        let transport = ScriptedLocalTransport([
+            LocalResponse(
+                status: 200,
+                body: Data(#"{"ticket":"ticket"}"#.utf8),
+                url: URL(string: "https://desktop.example/api/connector/session")!
+            ),
+            LocalResponse(status: 200, body: Data(), url: baseURL.appendingPathComponent("/")),
+            LocalResponse(
+                status: 200,
+                body: Data(#"{"weeks":[[{"date":"2026-01-02"},{"date":"2025-12-31"}]]}"#.utf8),
+                url: baseURL.appendingPathComponent("/api/calendar")
+            ),
+            LocalResponse(
+                status: 200,
+                body: Data(#"{"weeks":[[{"date":"2026-02-03"},{"date":"2026-01-31"}]]}"#.utf8),
+                url: baseURL.appendingPathComponent("/api/calendar")
+            ),
+            LocalResponse(
+                status: 403, body: Data(), url: baseURL.appendingPathComponent("/api/calendar")
+            ),
+        ])
+        let session = LocalSession(
+            credentials: MemoryLocalCredentialStore(credential: credential),
+            cache: MemorySnapshotCache(),
+            makeClient: { value in
+                try LocalClient(
+                    baseURL: URL(string: value.baseURL)!, token: value.token, transport: transport
+                )
+            }
+        )
+
+        let januarySnapshot = try await session.load(.calendar, month: january)
+        let februarySnapshot = try await session.load(.calendar, month: february)
+        let fallback = try await session.load(.calendar, month: january)
+
+        XCTAssertEqual(januarySnapshot.items.compactMap(Self.calendarDate), ["2026-01-02"])
+        XCTAssertEqual(februarySnapshot.items.compactMap(Self.calendarDate), ["2026-02-03"])
+        XCTAssertEqual(fallback.source, .cache)
+        XCTAssertEqual(fallback.items.compactMap(Self.calendarDate), ["2026-01-02"])
+        let calendarRequests = transport.requests.filter { $0.url?.path == "/api/calendar" }
+        XCTAssertEqual(calendarRequests[0].queryItems["year"], "2026")
+        XCTAssertEqual(calendarRequests[0].queryItems["month"], "1")
+        XCTAssertEqual(calendarRequests[1].queryItems["month"], "2")
+        XCTAssertEqual(calendarRequests[2].queryItems["month"], "1")
+    }
+
     func testLocalSessionMapsDesktopStateIntoSharedSnapshot() async throws {
         let credential = try LocalCredential(
             baseURL: baseURL.absoluteString, token: "device-token", label: "Mac"
@@ -165,5 +279,10 @@ final class LocalBackendTests: XCTestCase {
         XCTAssertEqual(state, .removed)
         XCTAssertNil(store.load())
         XCTAssertNil(cache.load(.dashboard))
+    }
+
+    private static func calendarDate(_ item: CloudItem) -> String? {
+        guard case let .calendarDay(day) = item.payload else { return nil }
+        return day.date
     }
 }

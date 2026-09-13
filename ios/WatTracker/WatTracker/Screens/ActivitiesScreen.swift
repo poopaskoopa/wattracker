@@ -4,6 +4,7 @@ import SwiftUI
 struct ActivitiesScreen: View {
     /// The one session, owned by `SessionGate` and injected by `AppGate`.
     @Environment(\.readSession) private var session
+    @Environment(SessionGate.self) private var gate
     @Environment(\.horizontalSizeClass) private var horizontalSizeClass
     @State private var model = ActivitiesModel()
 
@@ -31,7 +32,7 @@ struct ActivitiesScreen: View {
             }
         }
         .background(Palette.bg)
-        .task { await model.refresh(session: session) }
+        .task(id: gate.backend) { await model.refresh(session: gate.activeSession) }
         .onChange(of: rides.map(\.id)) { _, ids in
             if model.selectedID == nil || !ids.contains(model.selectedID ?? "") {
                 model.selectedID = ids.first

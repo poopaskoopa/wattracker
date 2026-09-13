@@ -1,5 +1,6 @@
 import Foundation
 import Observation
+import Security
 
 /// The one `CloudSession` in the app, and the observable answer to "which of
 /// the three worlds is the rider in".
@@ -61,6 +62,55 @@ final class SessionGate {
         var description: String { "This device has no signing key" }
     }
 
+    protocol PreferenceStore {
+        func loadBackend() -> Backend?
+        func saveBackend(_ backend: Backend)
+    }
+
+    struct KeychainPreferenceStore: PreferenceStore, Sendable {
+        private let service: String
+        private let account: String
+
+        init(
+            service: String = "com.wattracker.ios.session",
+            account: String = "selected-backend-v1"
+        ) {
+            self.service = service
+            self.account = account
+        }
+
+        func loadBackend() -> Backend? {
+            var query = baseQuery()
+            query[kSecReturnData as String] = true
+            query[kSecMatchLimit as String] = kSecMatchLimitOne
+            var item: CFTypeRef?
+            let status = withUnsafeMutablePointer(to: &item) {
+                SecItemCopyMatching(query as CFDictionary, $0)
+            }
+            guard status == errSecSuccess, let data = item as? Data,
+                  let rawValue = String(data: data, encoding: .utf8)
+            else { return nil }
+            return Backend(rawValue: rawValue)
+        }
+
+        func saveBackend(_ backend: Backend) {
+            var query = baseQuery()
+            query[kSecValueData as String] = Data(backend.rawValue.utf8)
+            query[kSecAttrAccessible as String] =
+                kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly
+            SecItemDelete(baseQuery() as CFDictionary)
+            _ = SecItemAdd(query as CFDictionary, nil)
+        }
+
+        private func baseQuery() -> [String: Any] {
+            [
+                kSecClass as String: kSecClassGenericPassword,
+                kSecAttrService as String: service,
+                kSecAttrAccount as String: account,
+            ]
+        }
+    }
+
     private(set) var phase: Phase = .starting
 
     /// The app's session, once there is one. Nil only in `starting` and
@@ -72,14 +122,17 @@ final class SessionGate {
 
     private let makeSession: @Sendable () throws -> CloudSession
     private let makeLocalSession: @Sendable () throws -> LocalSession
+    private let preferences: PreferenceStore
 
     init(
         makeSession: @escaping @Sendable () throws -> CloudSession = SessionGate.liveSession,
-        makeLocalSession: @escaping @Sendable () throws -> LocalSession = SessionGate.liveLocalSession
+        makeLocalSession: @escaping @Sendable () throws -> LocalSession = SessionGate.liveLocalSession,
+        preferences: PreferenceStore = KeychainPreferenceStore()
     ) {
         self.makeSession = makeSession
         self.makeLocalSession = makeLocalSession
-        self.backend = .cloud
+        self.preferences = preferences
+        self.backend = preferences.loadBackend() ?? .cloud
     }
 
     /// The real session: an Enclave key where there is one, the keychain
@@ -147,6 +200,7 @@ final class SessionGate {
             // A stale local preference must not hide a paired cloud session.
             backend = .cloud
         }
+        preferences.saveBackend(backend)
         if session == nil && !localPaired {
             phase = .unusable(String(describing: cloudError ?? GateFailure.noSession))
             return
@@ -175,6 +229,7 @@ final class SessionGate {
     func pair(code: String, label: String?) async throws {
         guard let session else { throw GateFailure.noSession }
         backend = .cloud
+        preferences.saveBackend(.cloud)
         do {
             try await session.pair(code: code, label: label)
         } catch {
@@ -192,20 +247,22 @@ final class SessionGate {
     /// cookie it receives from the desktop.
     func pairLocal(host: String, token: String, label: String?) async throws {
         guard let localSession else { throw GateFailure.noSession }
+        backend = .local
+        preferences.saveBackend(.local)
         do {
             try await localSession.pair(host: host, token: token, label: label)
         } catch {
             await refresh()
             throw error
         }
-        backend = .local
         await refresh()
     }
 
     func selectBackend(_ backend: Backend) async {
         let candidate: (any ReadSession)? = backend == .cloud ? session : localSession
-        guard let candidate, await candidate.deviceState == .paired else { return }
+        guard let candidate else { return }
         self.backend = backend
+        preferences.saveBackend(backend)
         await refresh()
     }
 
@@ -233,6 +290,12 @@ final class SessionGate {
         case .local:
             guard let localSession else { throw GateFailure.noSession }
             await localSession.signOut()
+            if await session?.deviceState == .paired {
+                backend = .cloud
+                preferences.saveBackend(.cloud)
+            } else {
+                preferences.saveBackend(.local)
+            }
         }
         await refresh()
     }
