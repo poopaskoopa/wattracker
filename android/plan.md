@@ -62,7 +62,7 @@ The items the 2026-09-09 note left mid-flight have moved:
    closed as superseded; #256 (iOS calendar/volume for #163) merged.
    In-flight iOS epic work is now **#258** (local desktop server as a second
    backend, `ready`, `agent:codex`) with **#249** (rotating suite flakes) at
-   the top of the refreshed queue (#263). **PR #266 is open** on
+   the top of the refreshed queue (#263, then #267). **PR #266 is open** on
    `docs/local-transport-https` — this checkout: it carries the 2026-09-09
    transport decision plus the four #260 follow-ups (release-host guard
    reading the value it guards, `keepRules` wired to R8 — verified
@@ -151,10 +151,10 @@ since the 2026-09-01 draft:
   credential) and **#102** (hosting decision — `infra/azure/DEPLOY.md` is an
   *unexecuted* runbook). Both gate only the "real deployment" half of #199's
   Done; the dev harness and the local backend are unaffected.
-- **Queue rule:** the refreshed AGENTS.md work queue (#263) still carries no
-  Android epic item — announce before starting #194. Its top items are #249
-  (rotating full-suite flakes, open) and #258 (iOS local backend, `ready`,
-  `agent:codex`) — the in-flight iOS epic work; do not touch iOS files.
+- **Queue rule:** the refreshed AGENTS.md work queue (#263, then #267) still
+  carries no Android epic item — announce before starting #194. Its top items
+  are #249 (rotating full-suite flakes, open) and #258 (iOS local backend,
+  `ready`, `agent:codex`) — in-flight iOS epic work; do not touch iOS files.
   #228 closed as superseded; #234 closed via #240; #256 (iOS calendar/
   volume for #163) merged.
 
