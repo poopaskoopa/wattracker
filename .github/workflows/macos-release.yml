@@ -10,13 +10,14 @@ permissions:
 
 jobs:
   build-test-sign:
-    # Hard-disabled for the same reason as every other job in this repository:
-    # Actions runs are blocked at the account level (failed payment / spending
-    # limit) and macOS runners are billable on a private repo at a 10x
-    # multiplier, so this would only ever report a red "job was not started".
-    # The gate until billing is fixed is a local run of
-    # `packaging/build-macos.sh`. Drop this `if` to restore the job.
-    if: ${{ false }}
+    # RE-ENABLED 2026-09-13. This job was hard-disabled on two premises that
+    # are both dead: that Actions runs were blocked at the account level
+    # (failed payment / spending limit), and that macOS runners bill at a 10x
+    # multiplier. Both dated from when this repository was PRIVATE. It is
+    # public now, so standard hosted runners - macOS included - are unmetered,
+    # and cloud.yml and android.yml have been running hosted jobs green on
+    # every PR for weeks. Nothing needed provisioning or paying for; the
+    # constraint was gone and only this comment still remembered it.
     runs-on: macos-latest
     environment: macos-code-signing
     timeout-minutes: 45

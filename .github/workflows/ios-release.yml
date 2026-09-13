@@ -64,10 +64,31 @@ jobs:
     # already excludes.
     if: github.repository == 'poopaskoopa/wattracker'
     runs-on: [self-hosted, macOS]
-    # NOT macos-latest. macos-release.yml is hard-disabled with `if: ${{ false }}`
-    # because GitHub-hosted runners are blocked at the account level; the
-    # self-hosted macOS runner is the only machine in this project that can
-    # build for Apple platforms at all.
+    # WHY THIS IS STILL SELF-HOSTED, AND WHY THAT IS NOW A CHOICE.
+    #
+    # The comment that used to sit here said hosted runners were blocked at
+    # the account level and that this was the only machine able to build for
+    # Apple platforms at all. Both were true of a PRIVATE repository and
+    # neither is true now: this repo is public, hosted runners are unmetered,
+    # macos-release.yml was re-enabled on `macos-latest` on 2026-09-13, and
+    # cloud.yml and android.yml run hosted jobs on every PR.
+    #
+    # Moving this job to `macos-latest` is the better end state, for two
+    # reasons that have nothing to do with cost:
+    #   - This runner is a laptop that sleeps. Jobs die at exactly 10m00s with
+    #     no failed step and have to be re-run; a hosted VM does not sleep.
+    #   - Signing secrets belong on an ephemeral machine. See the KNOWN
+    #     RESIDUAL note further down, which says outright that the `security
+    #     import -P` exposure "is worse here than on the ephemeral macOS VM
+    #     that workflow describes, because this runner is not discarded". That
+    #     residual is a consequence of this `runs-on`, not a fact of life.
+    #
+    # It is NOT flipped in this commit because one thing has to be checked on
+    # hardware first: the steps below pin Xcode 26.6's SDK and the matching
+    # iOS 26.5 simulator runtime, and the hosted image's Xcode is whatever
+    # GitHub ships. Verify the image has them (or pin with `xcode-select`)
+    # before changing this line - a release workflow that only fires on a tag
+    # is the worst place to discover a toolchain mismatch.
     environment: ios-code-signing
     timeout-minutes: 60
 
