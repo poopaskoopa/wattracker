@@ -7,7 +7,9 @@ Tests can inject a memory backend without touching a developer keychain.
 from __future__ import annotations
 
 import base64
+import hmac
 import json
+import secrets
 from dataclasses import dataclass, field
 from typing import Optional, Protocol
 
@@ -17,6 +19,7 @@ from .security import INSTALLATION_ID_BYTES, new_installation_id
 SERVICE = "wattracker.cloud"
 _INSTALLATION_ACCOUNT = "installation-id"
 _WRITER_ACCOUNT = "writer-credentials"
+_PROBE_ACCOUNT = "credential-probe"
 
 
 class CloudCredentialUnavailable(RuntimeError):
@@ -72,6 +75,23 @@ class CloudCredentialStore:
 
     def __init__(self, backend: SecretBackend) -> None:
         self.backend = backend
+
+    def probe(self) -> None:
+        """Verify that the secure backend can round-trip and remove a value."""
+        account = f"{_PROBE_ACCOUNT}:{secrets.token_hex(16)}"
+        value = secrets.token_urlsafe(32)
+        written = False
+        try:
+            self.backend.set(account, value)
+            written = True
+            stored = self.backend.get(account)
+            if not isinstance(stored, str) or not hmac.compare_digest(stored, value):
+                raise CloudCredentialUnavailable(
+                    "OS secure storage could not verify a stored credential"
+                )
+        finally:
+            if written:
+                self.backend.delete(account)
 
     def load_or_create_installation(self) -> str:
         value = self.backend.get(_INSTALLATION_ACCOUNT)

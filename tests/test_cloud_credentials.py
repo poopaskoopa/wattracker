@@ -21,6 +21,8 @@ class MemorySecrets:
 def test_cloud_identity_and_writer_are_stored_only_in_secure_backend():
     backend = MemorySecrets()
     store = CloudCredentialStore(backend)
+    store.probe()
+    assert backend.values == {}
     first = store.load_or_create_installation()
     assert first == store.load_or_create_installation()
     creds = SyncCredentials("c" * 64, "subscription", b"private-key", "n" * 64)

@@ -1,5 +1,7 @@
 import json
 import sqlite3
+import threading
+import time
 
 import pytest
 
@@ -13,8 +15,9 @@ from wattracker.cloud.client import (
     sign_request,
     validate_cloud_endpoint,
 )
-from wattracker.cloud.credentials import CloudCredentialStore
-from wattracker.cloud.desktop_sync import DesktopCloudSync
+from wattracker.cloud.credentials import CloudCredentialStore, CloudCredentialUnavailable
+from wattracker.cloud.desktop_sync import CloudDependencyUnavailable, DesktopCloudSync
+from wattracker.cloud.security import PublicKeyUnavailable
 from wattracker.cloud.snapshot import snapshot_objects
 
 
@@ -74,9 +77,13 @@ def test_default_off_enable_disable_and_status_is_dict_compatible(tmp_path):
     assert not sync.set_enabled(user_id, False).enabled
 
 
-def test_enrollment_failure_never_writes_keyring_or_database(tmp_path):
+def test_enrollment_failure_never_writes_keyring_or_database(tmp_path, monkeypatch):
     path, user_id = _fixture_db(tmp_path, count=0)
     backend = MemorySecrets()
+    monkeypatch.setattr(
+        "wattracker.cloud.security.generate_signing_keypair",
+        lambda: (b"p" * 32, b"u" * 32),
+    )
 
     def offline(_url, _headers, _body):
         return 503, b'{"detail":"offline"}'
@@ -88,6 +95,47 @@ def test_enrollment_failure_never_writes_keyring_or_database(tmp_path):
     raw = path.read_bytes()
     assert b"cloud.example" not in raw
     assert b"subscription" not in raw
+
+
+def test_enrollment_probes_secure_storage_before_consuming_invitation(tmp_path):
+    path, user_id = _fixture_db(tmp_path, count=0)
+    calls = []
+
+    class BrokenSecrets(MemorySecrets):
+        def set(self, account, value):
+            raise CloudCredentialUnavailable("keyring unavailable")
+
+    def transport(*args):
+        calls.append(args)
+        return 200, b"{}"
+
+    sync = DesktopCloudSync(
+        str(path), CloudCredentialStore(BrokenSecrets()), transport=transport,
+    )
+    with pytest.raises(CloudCredentialUnavailable):
+        sync.enroll(user_id, "https://cloud.example", "I" * 32)
+    assert calls == []
+
+
+def test_enrollment_reports_missing_optional_crypto_before_network(tmp_path, monkeypatch):
+    path, user_id = _fixture_db(tmp_path, count=0)
+    backend = MemorySecrets()
+    calls = []
+
+    def missing_crypto():
+        raise PublicKeyUnavailable("missing cryptography")
+
+    monkeypatch.setattr(
+        "wattracker.cloud.security.generate_signing_keypair", missing_crypto,
+    )
+    sync = DesktopCloudSync(
+        str(path), CloudCredentialStore(backend),
+        transport=lambda *args: calls.append(args) or (200, b"{}"),
+    )
+    with pytest.raises(CloudDependencyUnavailable, match=r"wattracker\[cloud\]"):
+        sync.enroll(user_id, "https://cloud.example", "I" * 32)
+    assert calls == []
+    assert backend.values == {}
 
 
 def test_endpoint_validation_is_https_only_and_rejects_authority_secrets():
@@ -297,7 +345,7 @@ def test_request_sync_only_enqueues_and_pairing_uses_exact_signed_routes(tmp_pat
     def transport(url, headers, body, method):
         captured.append((method, url, headers, body))
         if url.endswith("pairing-codes"):
-            return 200, b'{"pairing_code":"ABCD-EFGH-JKMN","expires_in":900}'
+            return 200, b'{"pairing_code":"ABCD-EFGH-JKMN","expires_at":1800000000,"expires_in":900}'
         if url.endswith("/devices"):
             return 200, json.dumps({"devices": [{
                 "credential_id": "b" * 64, "label": "Phone", "subscription_key": "leak",
@@ -329,3 +377,43 @@ def test_request_sync_only_enqueues_and_pairing_uses_exact_signed_routes(tmp_pat
             headers["X-Writer-Idempotency-Key"], headers["X-Writer-Revision"],
         )
         assert sign_request(credentials.signing_key, canonical) == headers["X-Writer-Signature"]
+
+    sync.set_enabled(user_id, False)
+    captured.clear()
+    assert sync.mint_pairing_code(user_id) is None
+    assert sync.list_devices(user_id) == []
+    assert sync.revoke_device(user_id, "b" * 64)
+    assert [(method, url) for method, url, _headers, _body in captured] == [
+        ("POST", "https://cloud.example/api/v1/devices/" + "b" * 64 + "/revoke"),
+    ]
+
+
+def test_scheduler_persists_backoff_after_unexpected_sync_exception(tmp_path):
+    path, user_id = _fixture_db(tmp_path, count=0)
+    sync = DesktopCloudSync(
+        str(path), CloudCredentialStore(MemorySecrets()),
+        retry_base_seconds=60,
+    )
+    db.save_cloud_sync_state(
+        user_id, {"enabled": True}, path=str(path),
+    )
+    attempted = threading.Event()
+
+    def fail(_user_id):
+        attempted.set()
+        raise RuntimeError("sensitive detail must not be persisted")
+
+    sync.sync_once = fail
+    sync.start()
+    try:
+        assert attempted.wait(2)
+        deadline = time.monotonic() + 2
+        while sync.status(user_id).retry != 1 and time.monotonic() < deadline:
+            time.sleep(0.01)
+        status = sync.status(user_id)
+        assert status.retry == 1
+        assert status.next_retry_at is not None
+        assert status.last_error == "Cloud sync encountered an unexpected error."
+        assert "sensitive detail" not in status.last_error
+    finally:
+        sync.stop()

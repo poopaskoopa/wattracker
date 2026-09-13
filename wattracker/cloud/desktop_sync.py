@@ -15,7 +15,12 @@ from .client import (
     validate_cloud_endpoint,
 )
 from .credentials import CloudCredentialStore, CloudCredentialUnavailable, KeyringBackend
+from .security import PublicKeyUnavailable
 from .snapshot import SnapshotError, pending_snapshot_objects
+
+
+class CloudDependencyUnavailable(RuntimeError):
+    """The optional packages required for desktop cloud sync are absent."""
 
 
 class _UnavailableSecretBackend:
@@ -172,13 +177,23 @@ class DesktopCloudSync:
         """Complete enrollment, then persist the endpoint and private credential."""
         user_id = self._user_id(user_id)
         endpoint = validate_cloud_endpoint(endpoint)
-        credentials = CloudSyncClient.enroll(
-            endpoint,
-            invitation,
-            transport=self.transport,
-            mtls_headers=self.mtls_headers,
-            clock=self.clock,
-        )
+        # Prove that the private credential can be stored before consuming the
+        # one-time invitation at the cloud endpoint.
+        self.credential_store.probe()
+        try:
+            credentials = CloudSyncClient.enroll(
+                endpoint,
+                invitation,
+                transport=self.transport,
+                mtls_headers=self.mtls_headers,
+                clock=self.clock,
+            )
+        except CloudEnrollmentError as exc:
+            if isinstance(exc.__cause__, PublicKeyUnavailable):
+                raise CloudDependencyUnavailable(
+                    "install wattracker[cloud] to enroll this desktop"
+                ) from exc
+            raise
         # The single credential record is written only after a valid server
         # response.  The endpoint contains no credential material and is
         # persisted only after keyring storage succeeds.
@@ -281,6 +296,8 @@ class DesktopCloudSync:
 
     def mint_pairing_code(self, user_id: int) -> Optional[dict[str, Any]]:
         user_id = self._user_id(user_id)
+        if not self._state_enabled(user_id):
+            return None
         try:
             return self._client(user_id).mint_pairing_code()
         except Exception:
@@ -288,6 +305,8 @@ class DesktopCloudSync:
 
     def list_devices(self, user_id: int) -> list[dict[str, Any]]:
         user_id = self._user_id(user_id)
+        if not self._state_enabled(user_id):
+            return []
         try:
             devices = self._client(user_id).list_devices()
             self._devices_cache[user_id] = [dict(device) for device in devices]
@@ -297,6 +316,8 @@ class DesktopCloudSync:
 
     def revoke_device(self, user_id: int, credential_id: str) -> bool:
         user_id = self._user_id(user_id)
+        # Revocation deliberately remains available while sync is disabled: it
+        # is the rider's recovery path for a lost or compromised paired device.
         try:
             revoked = self._client(user_id).revoke_device(credential_id)
             if revoked:
@@ -368,9 +389,18 @@ class DesktopCloudSync:
             try:
                 self.sync_once(user_id)
             except Exception:
-                # A worker failure must not kill the opt-in scheduler or the
-                # local application; the next explicit request can retry.
-                continue
+                # Keep unexpected failures on the same durable retry path as
+                # ordinary offline errors. The fixed text avoids persisting
+                # exception details that could contain local or remote data.
+                if self._state_enabled(user_id):
+                    try:
+                        self._record_failure(
+                            user_id, "Cloud sync encountered an unexpected error."
+                        )
+                    except Exception:
+                        # If the state store itself is unavailable, preserve the
+                        # worker; a later import or restart can schedule again.
+                        pass
             if self._state_enabled(user_id):
                 state = db.get_cloud_sync_state(user_id, path=self.path)
                 next_retry = state["next_retry_at"]

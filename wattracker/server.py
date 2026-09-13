@@ -202,10 +202,17 @@ class _DesktopCloudSyncUnavailable:
 
 
 try:
-    from .cloud.desktop_sync import DesktopCloudSync
+    from .cloud.credentials import CloudCredentialUnavailable
+    from .cloud.desktop_sync import CloudDependencyUnavailable, DesktopCloudSync
 except ImportError:
     # The adapter is supplied by the cloud integration branch when available;
     # keeping this fallback makes the local app byte-compatible and offline.
+    class CloudCredentialUnavailable(RuntimeError):
+        pass
+
+    class CloudDependencyUnavailable(RuntimeError):
+        pass
+
     DesktopCloudSync = _DesktopCloudSyncUnavailable
 
 
@@ -1597,6 +1604,9 @@ def create_app() -> FastAPI:
 
     # Per-user cache of the last generated .zwo (avoids cross-user bleed).
     app.state.last = {}
+    # Pairing codes are bearer secrets. Keep them server-side, scoped to the
+    # authenticated user, instead of placing them in the signed session cookie.
+    app.state.cloud_pairings = {}
     # In-process brute-force throttle for /login (per lowercased username).
     app.state.login_throttle = auth.LoginThrottle()
     # Hard ceiling on concurrent scrypt hashes (~128 MiB each). Shared by
@@ -4714,8 +4724,26 @@ def create_app() -> FastAPI:
             llm_endpoint_display, llm_custom_url_display = (
                 "custom", llm_endpoint_raw,
             )
-        pairing = request.session.get("cloud_pairing")
-        pairing_code = pairing.get("code") if isinstance(pairing, dict) else None
+        pairing = app.state.cloud_pairings.get(uid)
+        now = _time.time()
+        if not (
+            isinstance(pairing, dict)
+            and isinstance(pairing.get("code"), str)
+            and pairing["code"]
+            and isinstance(pairing.get("expires_at"), (int, float))
+            and not isinstance(pairing["expires_at"], bool)
+            and _math.isfinite(pairing["expires_at"])
+            and pairing["expires_at"] > now
+        ):
+            app.state.cloud_pairings.pop(uid, None)
+            pairing = None
+        elif pairing is not None:
+            pairing = {
+                "code": pairing["code"],
+                "expires_at": float(pairing["expires_at"]),
+                "expires_in": max(0, int(_math.ceil(pairing["expires_at"] - now))),
+            }
+        pairing_code = pairing["code"] if pairing is not None else None
         return _ctx(
             request,
             settings=settings,
@@ -4742,6 +4770,7 @@ def create_app() -> FastAPI:
             timezone_message=timezone_message,
             cloud_message=cloud_message,
             cloud_sync=_cloud_status(uid),
+            cloud_pairing=pairing,
             cloud_pairing_qr=(
                 pairing_qr_svg(pairing_code)
                 if isinstance(pairing_code, str) else None
@@ -4886,11 +4915,23 @@ def create_app() -> FastAPI:
         sync = getattr(app.state, "cloud_sync", None)
         message = None
         try:
-            if endpoint.strip() or invitation.strip():
-                if not endpoint.strip() or not invitation.strip():
-                    raise ValueError("Enter both the cloud endpoint and invitation.")
-                sync.enroll(uid, endpoint.strip(), invitation.strip())
+            # The checkbox is an independent kill switch. A stored endpoint is
+            # submitted on every save, so only a fresh invitation triggers
+            # enrollment.
             sync.set_enabled(uid, _checked(enabled))
+            if invitation.strip():
+                if not endpoint.strip():
+                    raise ValueError("Enter the cloud endpoint with the invitation.")
+                sync.enroll(uid, endpoint.strip(), invitation.strip())
+        except CloudDependencyUnavailable:
+            message = (
+                "Cloud enrollment requires optional dependencies. "
+                "Install wattracker[cloud] and try again."
+            )
+        except CloudCredentialUnavailable:
+            message = "OS secure credential storage is unavailable."
+        except ValueError:
+            message = "Enter a valid HTTPS cloud endpoint and invitation."
         except Exception:
             message = "Cloud enrollment could not be completed. Check the invitation and try again."
         return templates.TemplateResponse(
@@ -4921,10 +4962,20 @@ def create_app() -> FastAPI:
         message = None
         try:
             result = sync.mint_pairing_code(uid)
-            request.session["cloud_pairing"] = {
-                "code": str(result.get("pairing_code") or result.get("code") or ""),
-                "expires_at": result.get("expires_at"),
-                "expires_in": result.get("expires_in"),
+            code = result.get("pairing_code") or result.get("code")
+            expires_at = result.get("expires_at")
+            if not (
+                isinstance(code, str)
+                and code
+                and isinstance(expires_at, (int, float))
+                and not isinstance(expires_at, bool)
+                and _math.isfinite(expires_at)
+                and expires_at > _time.time()
+            ):
+                raise ValueError("invalid pairing response")
+            app.state.cloud_pairings[uid] = {
+                "code": code,
+                "expires_at": float(expires_at),
             }
         except Exception:
             message = "A pairing code could not be generated right now."
@@ -4957,11 +5008,21 @@ def create_app() -> FastAPI:
         uid = _uid(request)
         if _from_connector(request):
             return _refuse_connector_session(request, uid)
+        sync = getattr(app.state, "cloud_sync")
         try:
-            getattr(app.state, "cloud_sync").revoke_device(uid, credential_id)
+            revoked = sync.revoke_device(uid, credential_id)
+            sync.list_devices(uid)
         except Exception:
-            pass
-        return RedirectResponse("/settings", status_code=303)
+            revoked = False
+        message = (
+            "Paired device revoked."
+            if revoked else "Paired device could not be revoked. Try again."
+        )
+        return templates.TemplateResponse(
+            request, "settings.html", _settings_ctx(
+                request, uid, False, cloud_message=message,
+            )
+        )
 
     @app.post("/settings", response_class=HTMLResponse)
     def settings_save(
