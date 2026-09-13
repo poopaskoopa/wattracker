@@ -4,8 +4,11 @@ Exports every not-yet-completed plan workout that is still worth riding -
 today's, every future one, and anything skipped within the last
 ``EXPORT_GRACE_DAYS`` days - whose date is not inside an out-of-office (OOTO)
 range and is not a planned race day. It removes the .zwo of any workout that is
-now completed, skipped, or long past, so the Zwift list stays clean. Used by
-the "Export all to Zwift" action and the daily maintenance sweep.
+now completed, skipped, or long past, so the Zwift list stays clean. It also
+prunes - but never re-writes - the one-off workouts in ``standalone_workouts``,
+which are written straight to the folder at generate time and which nothing
+removed before. Used by the "Export all to Zwift" action and the daily
+maintenance sweep.
 
 Deciding *what* the Zwift folder should contain is pure database work and
 happens here (``plan_export_manifest``); actually touching files is the
@@ -60,22 +63,56 @@ def _stale_uncompleted(workout: dict, stale_before: _dt.date) -> bool:
     return day < stale_before
 
 
+def _standalone_removals(user_id: int, stale_before: _dt.date) -> List[str]:
+    """.zwo filenames of one-off workouts that should no longer be in Zwift.
+
+    One-off workouts ("generate a workout" -> "export to Zwift") are written
+    straight to the folder at generate time and recorded in
+    ``standalone_workouts``; nothing has ever removed them, so a rider's Zwift
+    list accumulates every one-off they ever made. They are pruned on the same
+    two rules as plan workouts - ridden, or never ridden and past the grace
+    window - but they are NEVER re-written: the manifest does not own them, it
+    only cleans up after them. A one-off that is still inside the grace window
+    is therefore left completely alone.
+    """
+    out: List[str] = []
+    for w in db.all_standalone_workouts(user_id):
+        date = w.get("scheduled_date")
+        if not date:
+            continue
+        if w.get("completed_activity_id"):
+            out.append(zwo.plan_filename(date, w["name"]))
+            continue
+        try:
+            day = _dt.date.fromisoformat(str(date))
+        except (TypeError, ValueError):
+            continue
+        if day < stale_before:
+            out.append(zwo.plan_filename(date, w["name"]))
+    return out
+
 def plan_export_manifest(user_id: int) -> Optional[ExportManifest]:
     """The .zwo files a user's Zwift folder should hold, and which to prune.
 
     Pure: reads the database and returns intent, touching no files. ``None``
-    means the user has no plan workouts at all, which the callers report as
-    'empty' rather than writing an empty manifest.
+    means the user has no plan workouts *and* no one-off exports worth
+    pruning, which the callers report as 'empty' rather than writing an empty
+    manifest.
     """
     settings = db.get_user_settings(user_id)
     workouts = _all_plan_workouts(user_id)
-    if not workouts:
+    stale_before = utc_today() - _dt.timedelta(days=EXPORT_GRACE_DAYS)
+    standalone_removals = _standalone_removals(user_id, stale_before)
+    # No plan at all is only "empty" if there is also nothing to clean up. A
+    # rider who has never built a plan can still have generated one-off
+    # workouts straight into Zwift, and those are exactly the files nothing
+    # has ever pruned - returning None here would leave them there forever.
+    if not workouts and not standalone_removals:
         return None
 
     to_write: List[dict] = []
     to_remove: List[str] = []
     write_names = set()
-    stale_before = utc_today() - _dt.timedelta(days=EXPORT_GRACE_DAYS)
     for w in workouts:
         fname = zwo.plan_filename(w["date"], w["name"])
         skip = (
@@ -103,6 +140,10 @@ def plan_export_manifest(user_id: int) -> Optional[ExportManifest]:
             to_write.append(
                 {"date": w["date"], "name": w["name"], "zwo": w["zwo_or_segments"]}
             )
+
+    # One-off exports live in the same folder and are pruned by the same two
+    # rules, but are never re-written - see _standalone_removals.
+    to_remove.extend(standalone_removals)
 
     to_remove = [fname for fname in to_remove if fname not in write_names]
     return ExportManifest(
