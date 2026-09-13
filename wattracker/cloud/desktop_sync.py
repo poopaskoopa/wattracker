@@ -1,6 +1,7 @@
 """Opt-in desktop coordinator for the cloud synchronization plane."""
 from __future__ import annotations
 
+import datetime as _dt
 import logging
 import sqlite3
 import threading
@@ -9,6 +10,7 @@ from dataclasses import dataclass, field
 from typing import Any, Callable, Optional
 
 from .. import db
+from ..timeutil import parse_naive
 from .client import (
     CloudEnrollmentError,
     CloudSyncClient,
@@ -134,7 +136,8 @@ class DesktopCloudSync:
         self._snapshot_gate_lock = threading.Lock()
         self._snapshot_gate_connection: Optional[sqlite3.Connection] = None
         self._snapshot_gate_baseline: dict[
-            int, tuple[int, tuple[Any, ...]]
+            int,
+            tuple[int, tuple[Any, ...], Optional[tuple[float, Optional[float]]]],
         ] = {}
 
     @staticmethod
@@ -179,6 +182,53 @@ class DesktopCloudSync:
                 self._snapshot_gate_connection = None
                 return None
 
+    def _snapshot_gate_validity(
+        self, user_id: int,
+    ) -> Optional[tuple[float, Optional[float]]]:
+        if not self.include_derived:
+            return None
+        now_epoch = float(self.clock())
+        now = _dt.datetime.fromtimestamp(
+            now_epoch, tz=_dt.timezone.utc,
+        ).replace(tzinfo=None)
+        tomorrow = _dt.datetime.combine(
+            now.date() + _dt.timedelta(days=1), _dt.time.min,
+        )
+        next_midnight = tomorrow.replace(tzinfo=_dt.timezone.utc).timestamp()
+        next_curve_expiry = None
+
+        # The calendar's ``missed`` flag changes at UTC midnight. The measured
+        # power curve also drops activities at their exact 90-day boundary,
+        # which can happen within a day. Reading timestamps after a successful
+        # rebuild is cheap compared with decoding every stream, and lets the
+        # gate remain valid until the first possible derived-object change.
+        with self._snapshot_gate_lock:
+            connection = self._snapshot_gate_connection
+            if connection is None:
+                return now_epoch, now_epoch
+            try:
+                rows = connection.execute(
+                    "SELECT start_time FROM activities WHERE user_id = ?",
+                    (user_id,),
+                ).fetchall()
+            except sqlite3.Error:
+                return now_epoch, now_epoch
+        for row in rows:
+            started = parse_naive(row["start_time"])
+            if started is None:
+                continue
+            try:
+                expires = (started + _dt.timedelta(days=90)).replace(
+                    tzinfo=_dt.timezone.utc,
+                ).timestamp()
+            except (OverflowError, OSError, ValueError):
+                continue
+            if now_epoch <= expires and (
+                next_curve_expiry is None or expires < next_curve_expiry
+            ):
+                next_curve_expiry = expires
+        return next_midnight, next_curve_expiry
+
     def _snapshot_gate_unchanged(self, user_id: int) -> bool:
         token = self._snapshot_gate_token(user_id)
         if token is None:
@@ -186,8 +236,18 @@ class DesktopCloudSync:
         version, pending = token
         if pending:
             return False
-        return self._snapshot_gate_baseline.get(user_id) == (
+        baseline = self._snapshot_gate_baseline.get(user_id)
+        if baseline is None or baseline[:2] != (
             version, self._snapshot_gate_options(),
+        ):
+            return False
+        validity = baseline[2]
+        if validity is None:
+            return True
+        next_midnight, next_curve_expiry = validity
+        now = self.clock()
+        return now < next_midnight and (
+            next_curve_expiry is None or now <= next_curve_expiry
         )
 
     def _snapshot_gate_mark_current(self, user_id: int) -> None:
@@ -197,6 +257,7 @@ class DesktopCloudSync:
             return
         self._snapshot_gate_baseline[user_id] = (
             token[0], self._snapshot_gate_options(),
+            self._snapshot_gate_validity(user_id),
         )
 
     def _close_snapshot_gate(self) -> None:

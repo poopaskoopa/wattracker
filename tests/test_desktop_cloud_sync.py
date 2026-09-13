@@ -1,3 +1,4 @@
+import datetime as dt
 import json
 import logging
 import sqlite3
@@ -457,6 +458,58 @@ def test_same_count_activity_edit_invalidates_snapshot_gate(tmp_path):
         assert sync.sync_once(user_id)[0].ok
         assert len(calls) == 2
         assert calls[1]["objects"][0]["data"]["avg_power"] == 210
+    finally:
+        sync.stop()
+
+
+def test_derived_snapshot_gate_expires_when_calendar_day_changes(
+    tmp_path, monkeypatch,
+):
+    path, user_id = _fixture_db(tmp_path, count=0)
+    plan_id = db.create_plan(
+        user_id, "Gate plan", "2026-09-13", 1, path=str(path),
+    )
+    db.add_plan_workout(
+        plan_id, user_id, "2026-09-13", "Tempo", "tempo", 3600, 50,
+        "{}", path=str(path),
+    )
+    current = [dt.datetime(2026, 9, 13, 23, 59, tzinfo=dt.timezone.utc)]
+
+    def clock():
+        return current[0].timestamp()
+
+    monkeypatch.setattr(
+        "wattracker.cloud.snapshot.utc_now",
+        lambda: current[0].replace(tzinfo=None),
+    )
+    store = CloudCredentialStore(MemorySecrets())
+    store.save_writer(_credentials(), user_id=user_id)
+    calls = []
+
+    def transport(_url, _headers, body):
+        calls.append(json.loads(body))
+        return 200, b'{"revision":1}'
+
+    sync = DesktopCloudSync(str(path), store, transport=transport, clock=clock)
+    db.save_cloud_sync_state(
+        user_id, {"endpoint": "https://cloud.example", "enabled": True},
+        path=str(path),
+    )
+    try:
+        assert sync.sync_once(user_id)[0].ok
+        first_day = next(
+            obj for batch in calls for obj in batch["objects"]
+            if obj["id"] == "calendar-day-2026-09-13"
+        )
+        assert first_day["data"]["workouts"][0]["missed"] is False
+
+        current[0] += dt.timedelta(minutes=2)
+        assert sync.sync_once(user_id)[0].ok
+        second_day = next(
+            obj for obj in calls[-1]["objects"]
+            if obj["id"] == "calendar-day-2026-09-13"
+        )
+        assert second_day["data"]["workouts"][0]["missed"] is True
     finally:
         sync.stop()
 
