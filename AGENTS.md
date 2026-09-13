@@ -172,56 +172,81 @@ The list gives the **order**. GitHub gives the **state** — always
 (#234's scope grew a whole section after it was filed) and its labels move.
 If the two disagree, GitHub wins and the queue is stale; say so.
 
-1. **#249 — rotating full-suite test flakes.** The top item and the only one
-   that makes every other item's green run trustworthy. 1 to 4 failures per
-   full run, a *different* test each time, each one green in isolation **and**
-   under heavy synthetic CPU load — so it is not a timing race.
-   **Substantially narrowed on 2026-09-07.** Four hypotheses are dead: leaked
-   export/ride writers, `httpx2`, the starlette version gap, and
-   `cookie_secure`. The mechanism is identified — the session goes missing
-   mid-test, `AuthMiddleware` 303s to `/welcome`, `TestClient` follows it, and
-   the assertion reads a 200 of the wrong page. What is *not* established is
-   why the session goes missing. **PR #261 (merged 2026-09-09, `9fb8169b`)
-   acted on the most promising lead** — the four implicated `_register()`
-   helpers now assert the 303 and probe an authenticated endpoint, so a lost
-   session fails as "registration did not leave an authenticated session"
-   instead of as a misleading assertion three lines later. It also stopped an
-   exported `WATTRACKER_COOKIE_SECURE` breaking the suite (85 failed before,
-   107 passed after). **That was diagnostic only and #249 is still open.** The
-   next step is to run full suites until an instance fires and read what the
-   new assertion says — the instrumentation is in place, the root cause is
-   not. 37 other files still have `_register` helpers that discard their
-   response; sweep them once the cause is known, not before. **PR #265 (merged
-   2026-09-10) closed off the ambient-environment class of cause entirely**:
-   `conftest.isolated_env` now clears ten more variables the app reads, and
-   `tests/test_env_isolation.py` fails if a new `os.environ.get` in the app is
-   neither isolated nor exempted with a reason. A surviving flake is therefore
-   not the developer's shell leaking in. Fully local, no hardware, no
-   deployment.
-2. **#258 — iOS: read the local desktop server as a second backend.**
-   **Unblocked on 2026-09-09** when #256 merged; the `blocked` label is off and
-   GitHub now has it `ready`. It waited on #256 because the protocol extraction
-   touches the same screen files. Order: extract the read protocol behind
-   `CloudClient` / `CloudSession` / `SnapshotCache` as one behaviour-preserving
-   refactor, then add the local adapter. Transport is settled — see #192: TLS in
-   front of the local server, terminator the rider's choice, not publicly
-   reachable.
+1. **#268's review items — finish #258.** The PR is open on
+   `agent2/258-local-backend` and its blocker is already fixed (`5f81f22`
+   added `LocalBackend.swift` to the test target, so `xcodebuild test`
+   compiles). What is left is behaviour, and the first one is the reason this
+   is the top item rather than a follow-up: **a single 403 destroys the local
+   pairing.** `LocalBackend.swift:253` folds 403 into `.unauthorized`,
+   `markRemoved()` clears the Keychain credential *and* the snapshot cache,
+   and `ensureAuthenticated()` at line 530 sits outside the retry `do/catch`
+   so nothing is retried. The docs that ship in the same PR tell the rider to
+   put a TLS terminator in front of the server — and a terminator doing its
+   own access control returns 403. The cloud path deliberately requires two
+   refusals with backoff for exactly this reason; the local path must hold the
+   same line. Then the four backend-switching gaps (dead Settings picker,
+   stale screen data after a switch, local removal stranding a valid cloud
+   pairing, choice not persisted), empty Calendar month navigation on local,
+   and two minor items. All nine are in the review comment on the PR.
 
-**Done since this list was last written.** The iOS screens all landed:
-**#161 as PR #253**, **#162 as PR #254** (both re-applied onto `main`'s
-session; PRs #228 and #235 are closed as superseded) and **#163 as PR #256**
-(merged 2026-09-09) — `fac4836` fixed the review's one correctness bug, where
-`VolumeData.previousWeeks` compared a full current window against a clamped
-prior one and `change()` reported e.g. +300% for a flat 5 h/week rider, and the
-two performance items, with tests. **#193 landed as PR
-#257** (`6830150a`) — the repository now has an `android/` tree. #234 merged
-as PR #240 after an on-device run; #233 landed in PR #238; #217's
-credential-free half landed in PR #239, its remainder gated on #102. #167 was
-closed 2026-09-05.
+2. **#156 — turn cloud sync on in the desktop app.** **Unblocked and assigned
+   to codex on 2026-09-13 (owner decision): this is where cloud-sync work
+   starts.** Nothing in the application imports `wattracker.cloud` today, and
+   that is the single biggest reason #102 is still deferred — until the
+   desktop actually pushes, the phone has nothing to read. The `blocked` label
+   was for the device half and is satisfied: pairing is wired on `main`.
+
+   **Hosting stays deferred on purpose, and does not block this.** The client
+   half (`wattracker/cloud/client.py`) is pure stdlib and talks to whatever
+   host it is pointed at; `scripts/walking_skeleton_server.py` is a real
+   server to develop against. Only the *server* half is Azure-locked
+   (`runtime.py` demands `AzureTenantStore` on Blob + Table). **Do not add an
+   Azure dependency to the desktop app.**
+
+   Three constraints that are not negotiable: credentials go only through
+   `CloudCredentialStore` (OS keychain, no plaintext fallback) and the "never
+   hits the DB or a config file" criterion wants a test that greps the files;
+   the kill switch must stop outbound traffic immediately, tested while a push
+   is queued rather than from idle; and the existing "local app is unmodified
+   / not cloud-dependent" test must still pass **unedited**. See the
+   assignment comment on the issue for the product questions to answer there
+   rather than inventing defaults.
+
+3. **#249 — rotating full-suite test flakes. Re-scoped: do not spend more
+   local runs on it.** 1 to 4 failures per full run, a different test each
+   time, each green in isolation and under heavy synthetic CPU load.
+   Both reported instances were observed on **taksmon's machine**; 21
+   consecutive clean local full suites (12 parallel with CI's exact
+   invocation, 4 serial, plus 5 more) stand against zero local reproductions,
+   which is not compatible with a 1–4-per-run rate on this hardware. The
+   mechanism is known — the session goes missing mid-test, `AuthMiddleware`
+   303s to `/welcome`, `TestClient` follows, and the assertion reads a 200 of
+   the wrong page — but not the cause. Two classes of cause are now dead: PR
+   #261 made the four implicated `_register()` helpers assert the 303 and
+   probe an authenticated endpoint, and PR #265 put ten more variables the app
+   reads into `conftest.isolated_env` with `tests/test_env_isolation.py`
+   guarding the list, so a surviving flake is not a leaked env var. **The next
+   step is taksmon's log and his exact invocation, not another local run.**
+   The 37 other files with `_register` helpers that discard their response get
+   swept once the cause is known, not before.
+
+**Done since this list was last written.** **#269** merged 2026-09-13
+(`e06280c`): the Zwift export manifest now prunes an uncompleted plan workout
+more than `EXPORT_GRACE_DAYS` (7) days past, so a skipped session stops
+lingering in Zwift's custom-workout list forever while a ride done a few days
+late still finds its file. **#270** is open: two workflows still claimed
+hosted runners were blocked at the account level, which stopped being true
+when this repo went public — `macos-release.yml` is re-enabled and
+`ios-release.yml`'s false justification for its self-hosted pin is replaced
+with the real trade-off. The iOS screens all landed: **#161 as PR #253**,
+**#162 as PR #254** and **#163 as PR #256** (PRs #228 and #235 closed as
+superseded). **#193 landed as PR #257** — the repository now has an `android/`
+tree. #234 merged as PR #240 after an on-device run; #233 landed in PR #238;
+#217's credential-free half landed in PR #239, its remainder gated on #102.
+#167 was closed 2026-09-05.
 
 **Pairing is wired on `main`.** `CloudClient.pair(code:)` →
-`SessionGate.pair(code:label:)` → `PairingScreen`. The section below about
-#162 and #163 waiting for pairing describes a gap that no longer exists.
+`SessionGate.pair(code:label:)` → `PairingScreen`.
 
 **The iOS app can be run against a real server on a device.**
 `scripts/walking_skeleton_server.py --lan` enrols a writer, publishes a full
@@ -232,18 +257,14 @@ in-memory store along with the revoked-device record.
 
 **Do not start #161, #162, #163 or #247.** All four are open *only* for an
 on-device check, which no agent can perform. Their screens are on `main`.
-Starting one re-implements code that already exists — the `agent:codex` labels
-that used to point here were removed on 2026-09-09 for that reason. #163 joined
-them when PR #256 merged: what is left of it is its done-criterion "both screens
-match the desktop's numbers for the same rider and period", which is a rider
-holding a device, not a test run.
+Starting one re-implements code that already exists.
 
 **Do not start #169** without asking; it is `blocked`. #242 is `blocked` on
 #102 and is a measurement of a live deployment, not code. **#217** needs a
 real deployment; its body's claims about `containerized` being parked and
 `Dockerfile.cloud` never being built are both stale.
 
-3. **#264 — one device-validation procedure for iOS and Android.** Unassigned
+4. **#264 — one device-validation procedure for iOS and Android.** Unassigned
    and cross-cutting: the harness, both clients, and the validation doc.
    Android has no on-device path at all today. Ask before taking it — it
    spans both epics and its Android half is taksmon's territory.
