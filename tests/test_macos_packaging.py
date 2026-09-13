@@ -62,14 +62,24 @@ def test_bundle_is_macos_only_and_declares_its_plist():
     assert "0.1.0" not in bundle
 
 
-def test_release_workflow_is_tag_only_and_hard_disabled():
+def test_release_workflow_is_tag_only_and_environment_gated():
     workflow = WORKFLOW.read_text()
+    # A signed build may only ever be produced from a version tag. No manual
+    # dispatch and no caller-supplied ref, because either would let an
+    # arbitrary commit be signed with the Developer ID and notarised.
     assert 'tags:\n      - "v*"' in workflow
     assert "workflow_dispatch" not in workflow
     assert "inputs.ref" not in workflow
-    job = workflow.split("  build-test-sign:\n", 1)[1]
-    # The disabling `if` must be part of the job header, before any step can run.
-    assert "    if: ${{ false }}\n" in job.split("\n    steps:", 1)[0]
+    header = workflow.split("  build-test-sign:\n", 1)[1].split("\n    steps:", 1)[0]
+    # This job used to be hard-disabled with `if: ${{ false }}` because Actions
+    # was blocked at the account level and macOS minutes billed at 10x on a
+    # private repo. The repository is public and neither holds, so the job runs
+    # (see the comment in the workflow). What still has to hold is that the
+    # signing secrets stay behind an environment: `macos-code-signing` is what
+    # applies GitHub's protection rules to them, and it is the only remaining
+    # gate now that the `if` is gone.
+    assert "    environment: macos-code-signing\n" in header
+    assert "    runs-on: macos-latest\n" in header
 
 
 def test_release_workflow_scopes_signing_secrets_to_their_steps():
