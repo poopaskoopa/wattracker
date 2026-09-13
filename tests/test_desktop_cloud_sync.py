@@ -516,8 +516,10 @@ def test_derived_snapshot_gate_expires_when_calendar_day_changes(
 
 def test_scheduler_requeues_when_state_read_fails(tmp_path, monkeypatch):
     path, user_id = _fixture_db(tmp_path, count=0)
+    now = 1_000.0
     sync = DesktopCloudSync(
         str(path), CloudCredentialStore(MemorySecrets()),
+        clock=lambda: now,
         periodic_interval_seconds=60,
     )
     db.save_cloud_sync_state(user_id, {"enabled": True}, path=str(path))
@@ -528,7 +530,7 @@ def test_scheduler_requeues_when_state_read_fails(tmp_path, monkeypatch):
     def flaky_state(uid, path=None):
         nonlocal calls
         calls += 1
-        if calls >= 2:
+        if calls == 1:
             raise sqlite3.OperationalError("state temporarily unavailable")
         return original(uid, path=path)
 
@@ -545,6 +547,8 @@ def test_scheduler_requeues_when_state_read_fails(tmp_path, monkeypatch):
             time.sleep(0.01)
         with sync._scheduler_lock:
             assert user_id in sync._scheduled
+            assert sync._scheduled[user_id] == now + 60
+        assert calls == 1
         assert sync._worker is not None and sync._worker.is_alive()
     finally:
         sync.stop()

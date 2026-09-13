@@ -554,23 +554,25 @@ class DesktopCloudSync:
                         # If the state store itself is unavailable, preserve the
                         # worker; a later import or restart can schedule again.
                         pass
-            if self._state_enabled(user_id):
-                try:
-                    state = db.get_cloud_sync_state(user_id, path=self.path)
-                except Exception as exc:
-                    _log.debug(
-                        "cloud sync requeue state read failed for user %s (%s)",
-                        user_id,
-                        type(exc).__name__,
-                    )
-                    state = None
-                if state is not None and state["next_retry_at"] is not None:
+            try:
+                state = db.get_cloud_sync_state(user_id, path=self.path)
+            except Exception as exc:
+                _log.debug(
+                    "cloud sync requeue state read failed for user %s (%s)",
+                    user_id,
+                    type(exc).__name__,
+                )
+                due = self.clock() + self.periodic_interval_seconds
+            else:
+                if not state["enabled"]:
+                    continue
+                if state["next_retry_at"] is not None:
                     due = float(state["next_retry_at"])
                 else:
                     due = self.clock() + self.periodic_interval_seconds
-                with self._scheduler_lock:
-                    current = self._scheduled.get(user_id)
-                    self._scheduled[user_id] = (
-                        due if current is None else min(current, due)
-                    )
-                    self._scheduler_lock.notify_all()
+            with self._scheduler_lock:
+                current = self._scheduled.get(user_id)
+                self._scheduled[user_id] = (
+                    due if current is None else min(current, due)
+                )
+                self._scheduler_lock.notify_all()
