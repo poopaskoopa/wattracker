@@ -630,3 +630,89 @@ def test_a_long_past_completed_workout_is_still_pruned(client):
     manifest = exporter.plan_export_manifest(uid)
     assert fname in manifest.remove
     assert fname not in [_zwo_name(w) for w in manifest.write]
+
+
+# ------------------------------------- one-off ("standalone") exports are pruned
+#
+# A one-off workout is written straight into the Zwift folder at generate time
+# and recorded in standalone_workouts; before this, nothing ever removed one, so
+# a rider's custom-workout list accumulated every one-off they had ever made.
+# The manifest now prunes them on the same two rules as plan workouts - ridden,
+# or never ridden and past the grace window - but never re-writes them.
+
+def _add_standalone(uid, day, name, completed=False):
+    """One exported one-off workout; returns the filename it landed in."""
+    date = day.isoformat()
+    db.add_standalone_workout(
+        uid, f"key-{name}-{date}", date, name, "endurance", 3600, 50.0,
+        "<workout_file/>", 250.0,
+    )
+    if completed:
+        wid = db.standalone_workouts_on_date(uid, date)[0]["id"]
+        db.mark_standalone_completed(uid, wid, 4242, date, None, None)
+    return f"{date} {name}.zwo"
+
+
+def test_a_long_past_one_off_is_pruned(client):
+    uid, _plan_id = _seed_plan(client)
+    fname = _add_standalone(
+        uid, utc_today() - _dt.timedelta(days=exporter.EXPORT_GRACE_DAYS + 1),
+        "Old One Off",
+    )
+
+    manifest = exporter.plan_export_manifest(uid)
+    assert fname in manifest.remove
+    # Never re-written: the manifest cleans up after one-offs, it does not own
+    # them.
+    assert fname not in [_zwo_name(w) for w in manifest.write]
+
+
+def test_a_completed_one_off_is_pruned_even_inside_the_grace_window(client):
+    uid, _plan_id = _seed_plan(client)
+    fname = _add_standalone(uid, utc_today(), "Ridden One Off", completed=True)
+
+    assert fname in exporter.plan_export_manifest(uid).remove
+
+
+def test_a_recent_unridden_one_off_is_left_alone(client):
+    """Inside the grace window it is still worth riding - do not touch it."""
+    uid, _plan_id = _seed_plan(client)
+    fname = _add_standalone(
+        uid, utc_today() - _dt.timedelta(days=exporter.EXPORT_GRACE_DAYS),
+        "Fresh One Off",
+    )
+
+    manifest = exporter.plan_export_manifest(uid)
+    assert fname not in manifest.remove
+    assert fname not in [_zwo_name(w) for w in manifest.write]
+
+
+def test_a_one_off_is_never_removed_from_under_a_plan_workout(client):
+    """Same date and name as a workout the plan is about to write: keep it.
+
+    plan_filename() is derived from (date, name), so a one-off can collide with
+    a live plan workout. The write always wins.
+    """
+    uid, plan_id = _seed_plan(client)
+    day = utc_today() + _dt.timedelta(days=1)
+    _add_workout(uid, plan_id, day, "Shared Name")
+    fname = _add_standalone(uid, day, "Shared Name")
+
+    manifest = exporter.plan_export_manifest(uid)
+    assert fname in [_zwo_name(w) for w in manifest.write]
+    assert fname not in manifest.remove
+
+
+def test_a_rider_with_no_plan_still_gets_one_offs_pruned(user_id, home_dir):
+    """No plan at all is only 'empty' if there is nothing to clean up either."""
+    out = home_dir / "zwo"
+    out.mkdir()
+    db.save_user_settings(user_id, {"workouts_dir": str(out), "zwift_id": "123"})
+    stale = utc_today() - _dt.timedelta(days=exporter.EXPORT_GRACE_DAYS + 1)
+    fname = _add_standalone(user_id, stale, "Orphan One Off")
+    (out / fname).write_text("<workout_file/>")
+
+    res = exporter.sync_plan_exports(user_id)
+    assert res["status"] == "ok", res
+    assert res["removed"] == 1
+    assert not (out / fname).exists()

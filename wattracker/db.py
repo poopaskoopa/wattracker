@@ -3445,6 +3445,26 @@ def mark_standalone_completed(
         conn.close()
 
 
+def all_standalone_workouts(
+    user_id: int, path: Optional[str] = None,
+) -> List[dict]:
+    """Every one-off workout this rider has exported, oldest first.
+
+    The export manifest needs the whole set, not a window: a one-off .zwo is
+    written straight to the Zwift folder at generate time and nothing has ever
+    removed it, so deciding what to prune means looking at all of them.
+    """
+    conn = connect(path)
+    try:
+        rows = conn.execute(
+            "SELECT * FROM standalone_workouts WHERE user_id=? "
+            "ORDER BY scheduled_date,id", (user_id,),
+        ).fetchall()
+        return [_standalone_row(r) for r in rows]
+    finally:
+        conn.close()
+
+
 def standalone_workouts_for_month(
     user_id: int, year: int, month: int, path: Optional[str] = None,
 ) -> List[dict]:
