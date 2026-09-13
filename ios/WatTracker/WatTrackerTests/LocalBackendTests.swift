@@ -58,6 +58,79 @@ final class LocalBackendTests: XCTestCase {
         XCTAssertEqual(transport.requests[1].queryItems["token"], "one-time-ticket")
     }
 
+    func testAuthenticateAcceptsAbsoluteSameOriginRootLanding() async throws {
+        let baseURL = URL(string: "https://desktop.example/")!
+        for location in ["https://desktop.example/", "https://desktop.example"] {
+            let transport = ScriptedLocalTransport([
+                LocalResponse(
+                    status: 200,
+                    body: Data(#"{"ticket":"one-time-ticket"}"#.utf8),
+                    url: baseURL.appendingPathComponent("/api/connector/session")
+                ),
+                LocalResponse(
+                    status: 303, body: Data(),
+                    url: baseURL.appendingPathComponent("/connector/session"),
+                    location: location,
+                    setCookie: "session=authenticated; Secure; HttpOnly"
+                ),
+            ])
+            let client = try LocalClient(
+                baseURL: baseURL, token: "device-token", transport: transport
+            )
+
+            try await client.authenticate()
+
+            XCTAssertEqual(transport.requests.count, 2)
+        }
+    }
+
+    func testAuthenticateRejectsUntrustedOrUnexpectedLandings() async throws {
+        let baseURL = URL(string: "https://desktop.example/")!
+        let rejectedLocations: [(name: String, value: String?)] = [
+            ("network-path cross-origin", "//attacker.example/"),
+            ("scheme mismatch", "http://desktop.example/"),
+            ("host mismatch", "https://attacker.example/"),
+            ("port mismatch", "https://desktop.example:8443/"),
+            ("unexpected path", "/login"),
+            ("encoded path", "https://desktop.example/%2F"),
+            ("double-slash path", "https://desktop.example//"),
+            ("query", "/?next=/"),
+            ("fragment", "/#landing"),
+            ("userinfo", "https://rider@desktop.example/"),
+            ("malformed", "https://[::1"),
+            ("empty", ""),
+            ("missing", nil),
+        ]
+
+        for rejected in rejectedLocations {
+            let transport = ScriptedLocalTransport([
+                LocalResponse(
+                    status: 200,
+                    body: Data(#"{"ticket":"one-time-ticket"}"#.utf8),
+                    url: baseURL.appendingPathComponent("/api/connector/session")
+                ),
+                LocalResponse(
+                    status: 303, body: Data(),
+                    url: baseURL.appendingPathComponent("/connector/session"),
+                    location: rejected.value,
+                    setCookie: "session=authenticated; Secure; HttpOnly"
+                ),
+            ])
+            let client = try LocalClient(
+                baseURL: baseURL, token: "device-token", transport: transport
+            )
+
+            do {
+                try await client.authenticate()
+                XCTFail("accepted \(rejected.name) landing")
+            } catch let failure as LocalClient.Failure {
+                guard case .unexpectedLanding = failure else {
+                    return XCTFail("\(rejected.name) produced unexpected failure: \(failure)")
+                }
+            }
+        }
+    }
+
     func testRedirectDelegateDoesNotFollowRedeemIntoDashboard() throws {
         let delegate = LocalRedirectDelegate(origin: baseURL)
         let redeemURL = try XCTUnwrap(
