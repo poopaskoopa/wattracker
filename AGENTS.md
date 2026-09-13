@@ -172,61 +172,90 @@ The list gives the **order**. GitHub gives the **state** — always
 (#234's scope grew a whole section after it was filed) and its labels move.
 If the two disagree, GitHub wins and the queue is stale; say so.
 
-1. **#276 — finish #272. The PR is open and REFUTED; a test fails on it.**
-   `agent2/272-late-completion`. The design is right and almost every point of
-   the spec landed as asked — the two-pass matcher is real, pass 2 is
-   genuinely globally sorted by `(lag, score, start_time)` rather than
-   per-workout greedy, and mutation checks confirm the new tests bite. It is
-   held on one piece of collateral damage: `activities_on_date` was rewritten
-   to delegate to the new `activities_between` (`db.py:3894-3921`), which
-   deleted its no-cutoff fast path. That path used naive prefix matching on
-   the stored UTC string; the replacement always converts through
-   `to_user_timezone(...).date()`, so **which day an activity comes back on
-   changed for every caller.** `races.py:466` (`_matching_activity`)
-   deliberately looks up by the UTC race date and converts to local itself, so
-   it now misses, and `tests/test_weight.py::test_a_zwift_race_weight_is_filed_on_the_local_date`
-   fails deterministically — `1 failed, 3147 passed` on the branch, green on
-   `main`. The fix is narrow: leave `activities_on_date` exactly as it is on
-   `main`, fast path included, and let `activities_between` be a genuinely
-   separate function. Sharing row-filtering internals is fine; changing an
-   existing function's observable behaviour is not. Also
-   `tests/test_completion.py:62` is vacuous — it still passes with backward
-   matching fully enabled, because the fetch range never reaches a ride dated
-   before the only workout; add a second, earlier workout so it bites. **Run
-   the whole suite before pushing.** The 247-test focused subset is what hid
-   this.
+1. **#283's two defects — finish #277.** The PR is open on
+   `agent2/277-cloud-sync-followups` and blocked. Items 3 to 9 are all
+   implemented and mutation-checked and the suite is green at 3,207 — but two
+   of the new behaviours fail *silently*, which is the shape of bug that batch
+   of work existed to remove.
 
-2. **#156's three product questions, and #277's items 3 to 9.** #156 is closed
-   (PR #274, `2586f14`) but the questions it asked for *instead of defaults*
-   were never answered — the only answer that exists anywhere is the string
-   "every 15 minutes" in `settings.html:217-218`, as UI copy with no
-   reasoning, and the reader-context expiry is not addressed at all. Answer
-   all three in a comment on #156: when sync runs and why that interval, what
-   the rider sees during a normal offline period, and what they see when a
-   reader context expires after 300 s. Then take #277 items 3 to 9 — a silent
-   no-op when the endpoint is edited without an invitation, enabling applied
-   before enrollment succeeds, an unguarded requeue that kills the scheduler
-   thread for every user, the full snapshot recomputation on every wake-up,
-   the 1 Hz poll with sync off, and the inconsistent POST/redirect/GET that
-   makes a browser refresh mint a fresh bearer code. **Item 1 is being
-   handled separately and item 2 is an owner decision — do not take either.**
+   **The snapshot gate can permanently swallow a push.**
+   `desktop_sync.py:427-430` calls `_snapshot_gate_mark_current` *after* the
+   push and after `_record_success` has already written, so anything another
+   connection committed between the snapshot read and that `PRAGMA
+   data_version` read is absorbed into the baseline and never sent. The window
+   is not small: `_all_snapshot_objects` (`cloud/snapshot.py:1269-1287`) opens
+   its own `readonly_connection` per page, so the snapshot read is not one
+   consistent transaction. On `main` the same non-atomicity is harmless
+   because the next cycle rebuilds unconditionally; the gate turns it sticky,
+   and since the 900 s cycle no longer writes while the gate holds, it does
+   not self-heal. Reproduced: an activity committed after the final "nothing
+   to send" read stays unsynced across three further cycles. Fix by taking the
+   change token inside the same write transaction that records success
+   (`BEGIN IMMEDIATE` serializes against other writers), or by keying the gate
+   on a content token scoped to the user's source tables rather than a
+   whole-file `data_version` that the sync plane's own writes also bump.
 
-3. **#258's follow-ups from the #275 review.** #275 merged (`90bede6`) and all
-   eight residuals are fixed, but the review left three worth acting on, and
-   the first is real: **`Location` is compared as an exact string.**
-   `LocalBackend.swift:191` requires `response.location == "/"`, and Starlette
-   emits the relative `/` — but a reverse proxy in front of the desktop
-   (nginx `proxy_redirect`, Apache `ProxyPassReverse`) may rewrite it to an
-   absolute URL, after which the rider can never authenticate; every attempt
-   is `unexpectedLanding`. Given that the settled deployment story is "any
-   non-public TLS terminator, rider's choice", this is reachable. It fails
-   closed, so it is availability rather than security. Fix:
-   `URL(string: location, relativeTo: baseURL)`, then assert same-origin and
-   `path == "/"`. The other two are recorded on the PR and are informational.
-   **One iOS issue at a time** — `project.pbxproj` conflicts on concurrent
-   edits. #258 stays open for the device run regardless.
+   **The endpoint guard can silently discard the kill switch.**
+   `server.py:4930-4938` returns before `sync.set_enabled(...)`, so unchecking
+   "Enable cloud sync" *while also* editing the endpoint throws the disable
+   away and leaves sync on, with no message saying so. That is a regression
+   against `main` and it lands on #156's safety control, which the owner has
+   just finished adjudicating (#277 item 2). Turning sync **off** is never
+   gated: apply `set_enabled(uid, False)` ahead of the guard when the box is
+   unchecked. `tests/test_desktop_cloud_routes.py:86-107` currently pins the
+   wrong behaviour and must be corrected, not kept.
 
-4. **#249 — rotating full-suite test flakes. Re-scoped: do not spend more
+   Item 5 — the scheduler requeue — is genuinely fixed and needs no rework;
+   the evidence is in the review comment. Item 7 has no lost-notification
+   race. Do not re-derive either.
+
+2. **#156's third product answer, re-posted.** One comment, and it is owed.
+   The first two answers are good and recorded. The third answers the question
+   as it was asked — "what does the rider see when a reader context expires
+   **with no refresh endpoint**" — but that parenthetical was wrong, and came
+   from #102's stale body. `POST /api/v1/context/refresh` exists
+   (`cloud/api.py:1056`, ungated) and `CloudClient.swift:172` already calls
+   it. So expiry is a routine refresh the rider never sees; the behaviour
+   described belongs to the *refresh-failure* path. Re-label it, and confirm
+   the client refreshes **proactively** rather than after a failure —
+   reactive-only would stall the rider every five minutes on a good network.
+
+3. **#280 — legacy completions read as unverified for a non-UTC rider.**
+   `plan_workout_completion_verified` (`importer.py:1229-1263`) compares the
+   activity's rider-local date against a stored `completed_date` that legacy
+   rows derived from UTC-prefix matching, so pre-existing rows flip to
+   unverified and drop out of RPE evidence feeding FTP re-evaluation. **This
+   rider is UTC-4**, where the stored UTC date runs one day *ahead* of local
+   for rides between 20:00 and 23:59 local — prime indoor-trainer time, so the
+   affected share of history is large rather than an edge case. Decide backfill
+   versus a tolerance keyed to pre-upgrade rows; the issue lays out both. A
+   backfill rewrites stored user data, so it wants the mandatory pre-migration
+   backup and an idempotence test.
+
+4. **#281 — iOS: prefer the rider's own desktop when reachable.** Owner
+   request. The identity question is already answered — the connector token
+   *is* the proof, since `device_for_token` resolves the owning user from the
+   token hash — and the phone already stores the local `baseURL` from pairing,
+   so this is a reachability probe on an endpoint already trusted, **not**
+   discovery. mDNS is explicitly out of scope: there is no publicly-valid
+   certificate for a `.local` name, so discovering arbitrary hosts forces
+   pinning or trust-on-first-use, both of which #192 rejected. The hard
+   constraint is that the phone must never present its connector token to a
+   host it has not already paired with — that credential is a full desktop
+   session, not a read-scoped one. **One iOS issue at a time**; this touches
+   `project.pbxproj`, so do not run it alongside other iOS work. #280 is
+   Python and is the safe thing to run in parallel.
+
+5. **#258's two test vectors.** Not a PR of their own — fold into whichever
+   iOS change comes next. The rejected-landing list at
+   `LocalBackendTests.swift:89-101` shares no substring with the base host, so
+   weakening the same-origin host check to `hasSuffix` passes all 12 existing
+   tests; adding `https://desktop.example.evil.com/` and
+   `https://evil-desktop.example/` closes that. And every test base is
+   `https://desktop.example`, so the port comparison never runs with a
+   non-nil port — a `https://desktop.example:8443` base covers it.
+
+6. **#249 — rotating full-suite test flakes. Re-scoped: do not spend more
    local runs on it.** 1 to 4 failures per full run, a different test each
    time, each green in isolation and under heavy synthetic CPU load.
    Both reported instances were observed on **taksmon's machine**; 21
@@ -244,7 +273,21 @@ If the two disagree, GitHub wins and the queue is stale; say so.
    The 37 other files with `_register` helpers that discard their response get
    swept once the cause is known, not before.
 
-**Done since this list was last written.** **Cloud sync is on.** **#274**
+**Done since this list was last written.** **#276** merged (`ed39ebb`) and
+closed **#272**: a plan workout ridden late is now matched within a 7-day
+forward grace window, by a two-pass matcher that keeps same-day first refusal
+by construction and assigns late pairs globally by `(lag, score, start_time)`.
+It was refuted once first — the original rewrote `activities_on_date` to
+delegate to the new range helper, which dropped its naive-prefix fast path and
+silently changed which day an activity is returned on for *every* caller,
+breaking race weigh-in attribution. That is **#280**, still open: the same
+date-rule change leaves legacy completions reading as unverified. **#284**
+merged (`b1d8fcf`): the local iOS backend now accepts a proxy-rewritten
+absolute `Location` on the auth landing, resolved against the configured
+`baseURL` and checked for same-origin plus a root path — verified against 82
+hostile vectors. **#279** merged (`a1e8d44`): revoking a lost device is
+reachable with sync off, which is what made #156's kill-switch exception
+worth having. **Cloud sync is on.** **#274**
 merged 2026-09-13 (`2586f14`) and closed **#156**: the desktop app enrols,
 pairs, manages devices and pushes on a background scheduler with bounded
 backoff, credentials in the OS keyring only, and sync state in schema v36
