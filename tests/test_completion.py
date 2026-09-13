@@ -60,9 +60,14 @@ def test_no_match_outside_tolerance(user_id):
 
 
 def test_pre_workout_activity_does_not_match(user_id):
-    _plan_workout(user_id, "2026-07-10", duration_s=3600)
+    workout_id = _plan_workout(user_id, "2026-07-10", duration_s=3600)
+    earlier_workout_id = _plan_workout(
+        user_id, "2026-07-09", duration_s=1200, tss=15.0
+    )
     _activity(user_id, "2026-07-09T08:00:00", seconds=3600)
     assert importer.match_plan_completions(user_id, NOW) == 0
+    assert db.get_plan_workout(user_id, workout_id)["completed_activity_id"] is None
+    assert db.get_plan_workout(user_id, earlier_workout_id)["completed_activity_id"] is None
 
 
 @pytest.mark.parametrize("scheduled, expected", [
