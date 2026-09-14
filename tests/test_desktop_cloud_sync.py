@@ -65,6 +65,39 @@ def _credentials():
     )
 
 
+def _two_rider_sync(tmp_path):
+    path, first_user_id = _fixture_db(tmp_path, count=1)
+    second_user_id = db.create_user("second-rider", "not-a-password", path=str(path))
+    db.insert_activity(
+        second_user_id,
+        {
+            "dedup_hash": "desktop-cloud-second",
+            "filename": "second-ride.fit",
+            "start_time": "2026-08-03T10:00:00",
+            "duration_s": 60,
+            "distance_m": 1000.0,
+            "avg_power": 180.0,
+            "avg_hr": 140.0,
+        },
+        path=str(path),
+    )
+    store = CloudCredentialStore(MemorySecrets())
+    for user_id in (first_user_id, second_user_id):
+        store.save_writer(_credentials(), user_id=user_id)
+        db.save_cloud_sync_state(
+            user_id,
+            {"endpoint": "https://cloud.example", "enabled": True},
+            path=str(path),
+        )
+    sync = DesktopCloudSync(
+        str(path), store, transport=lambda *_args: (200, b'{"revision":1}'),
+        include_derived=False,
+    )
+    assert sync.sync_once(first_user_id)[0].ok
+    assert sync.sync_once(second_user_id)[0].ok
+    return sync, first_user_id, second_user_id
+
+
 def test_default_off_enable_disable_and_status_is_dict_compatible(tmp_path):
     path, user_id = _fixture_db(tmp_path, count=0)
     store = CloudCredentialStore(MemorySecrets())
@@ -512,6 +545,56 @@ def test_source_write_racing_success_baseline_is_published_next_cycle(
         assert sync.sync_once(user_id)[0].ok
         assert len(calls) == 2
         assert [obj["id"] for obj in calls[1]["objects"]] == ["activity-2"]
+    finally:
+        sync.stop()
+
+
+def test_gate_connection_drop_invalidates_all_rider_baselines(tmp_path, monkeypatch):
+    sync, first_user_id, second_user_id = _two_rider_sync(tmp_path)
+    try:
+        assert set(sync._snapshot_gate_baseline) == {first_user_id, second_user_id}
+
+        def connection_dropped(*_args):
+            raise sqlite3.OperationalError("connection dropped")
+
+        monkeypatch.setattr(
+            "wattracker.cloud.desktop_sync.snapshot_change_token",
+            connection_dropped,
+        )
+
+        assert sync._snapshot_gate_token(first_user_id) is None
+        assert sync._snapshot_gate_baseline == {}
+    finally:
+        sync.stop()
+
+
+def test_record_success_transaction_failure_invalidates_all_rider_baselines(tmp_path):
+    sync, first_user_id, second_user_id = _two_rider_sync(tmp_path)
+
+    class FailingTransactionConnection:
+        def __init__(self, connection):
+            self.connection = connection
+
+        def execute(self, statement, *args):
+            if statement == "BEGIN IMMEDIATE":
+                raise sqlite3.OperationalError("database is locked")
+            return self.connection.execute(statement, *args)
+
+        def rollback(self):
+            return self.connection.rollback()
+
+        def close(self):
+            return self.connection.close()
+
+    try:
+        assert set(sync._snapshot_gate_baseline) == {first_user_id, second_user_id}
+        sync._snapshot_gate_connection = FailingTransactionConnection(
+            sync._snapshot_gate_connection,
+        )
+
+        with pytest.raises(sqlite3.OperationalError, match="database is locked"):
+            sync._record_success(first_user_id, None)
+        assert sync._snapshot_gate_baseline == {}
     finally:
         sync.stop()
 
