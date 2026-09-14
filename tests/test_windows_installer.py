@@ -110,6 +110,11 @@ def test_installer_job_uses_setup_python_312():
     assert r".venv\Scripts\python" not in package_job
 
 
+def test_lifecycle_uses_the_installed_console_launcher():
+    _, package_job = WORKFLOW.split("  package-unsigned:", 1)
+    assert "$env:WATTRACKER_EXECUTABLE = (Get-Command wattracker).Source" in package_job
+
+
 def test_workflow_builds_smokes_and_uploads_the_wheel_and_setup_artifacts():
     assert "innosetup-6.7.3.exe" in WORKFLOW
     assert "9c73c3bae7ed48d44112a0f48e66742c00090bdb5bef71d9d3c056c66e97b732" in WORKFLOW

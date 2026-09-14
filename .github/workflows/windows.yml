@@ -16,10 +16,8 @@ jobs:
     # every push and pull request in the `Cloud` workflow's self-hosted macOS
     # job, so duplicating ~6 minutes of it on the single physical Windows box
     # buys little for the wall time it costs. Windows-specific coverage is a
-    # fair argument for turning this on later; if you do, move it to the
-    # self-hosted runner (`runs-on: [self-hosted, Windows, X64]`) and give it
-    # its own workspace virtual environment the way package-unsigned does,
-    # rather than installing into the runner account's interpreter.
+    # fair argument for turning this on later; if you do, keep it on the
+    # hosted runner with the setup-python configuration already shown here.
     if: ${{ false }}
     runs-on: windows-latest
     timeout-minutes: 30
@@ -137,7 +135,7 @@ jobs:
       - name: PowerShell lifecycle safety
         shell: powershell
         run: |
-          $env:WATTRACKER_EXECUTABLE = (Get-Command python).Source
+          $env:WATTRACKER_EXECUTABLE = (Get-Command wattracker).Source
           tests\windows\lifecycle.ps1
       - name: Build wheel and installed smoke
         shell: pwsh
