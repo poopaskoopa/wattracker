@@ -172,8 +172,7 @@ uninstall (tampered launcher state) to have removed none of them.
 ## CI
 
 The installer is built by the `package-unsigned` job in
-`.github/workflows/windows.yml`, on a **self-hosted Windows runner**
-(`runs-on: [self-hosted, Windows, X64]`), in this order:
+`.github/workflows/windows.yml`, on GitHub-hosted **`windows-latest`**, in this order:
 
 1. check out, set up Python **3.12** (the interpreter that gives the inline
    `tomllib` version read), assert the runner carries no leftover install state,
@@ -205,8 +204,9 @@ The digest and publisher checks in step 2 have their own paragraph in
 version, the digest, the hash command and the publisher string so they cannot be
 loosened without a test change.
 
-**Why step 8 no longer uploads a portable zip.** Self-hosted runners are not
-billed for minutes, but artifacts still consume the *account*'s shared storage,
+**Why step 8 no longer uploads a portable zip.** The former self-hosted runner
+was not billed for minutes, but artifacts still consume the *account*'s shared
+storage,
 and a free account has 500 MB of it. A run used to upload 106.8 MB - a 44.4 MB
 setup exe, a 61.8 MB portable zip and the wheel - at the 90-day default
 retention, so roughly four runs filled the quota and `upload-artifact` began
@@ -267,7 +267,11 @@ cannot read `settings/billing` (that needs the `user` scope), so the owner's
 billing page is the only remaining place to look. Until it clears, expect a red upload on merges
 to `main` while every PR run stays green.
 
-### Yielding the box to a hardware session
+### Historical: yielding the box to a hardware session
+
+This operational material describes the persistent Windows machine used before
+this job moved to GitHub-hosted `windows-latest`; it is retained for reference
+and is not a current CI requirement.
 
 The runner shares a physical machine with the trainer and Zwift, so a build can
 begin in the middle of a ride. Three steps - the dependency install, the wheel
@@ -303,7 +307,7 @@ the daily *activity-file* scan rather than a BLE scan, and lifecycle runs agains
 a throwaway `WATTRACKER_DATA_DIR` with no Zwift folder configured, so the scan
 has nothing to walk.
 
-### The runner
+### Historical: the former self-hosted runner
 
 GitHub-hosted minutes are exhausted and `windows-latest` is billable on a private
 repository, which is what kept this job gated. Self-hosted runners are not
@@ -391,7 +395,7 @@ deliberately does neither.
   or written by a step, so nothing needs the weaker setting, and a downloaded
   script still has to be signed to run.
 
-**`windows-release.yml` and the `test` job in `windows.yml` are still gated.**
+**Historical: `windows-release.yml` and the `test` job in `windows.yml` were gated.**
 The release workflow needs hosted minutes and code-signing secrets, and the suite
 already runs on the macOS runner every push and pull request - duplicating ~6
 minutes of it on the one physical Windows box is not worth the wall time. Only
@@ -436,7 +440,7 @@ Two smaller consequences of the runner being a real machine that persists:
   `smoke_installer.ps1`'s `finally` block - the thing that uninstalls the product.
   A queued run is cheaper than a poisoned machine.
 
-### Stopping the runner for a trainer session
+### Historical: stopping the runner for a trainer session
 
 The runner shares a machine with the trainer setup, and a service-mode runner
 picks up jobs whenever a pull request opens - including mid-ride. Before a
@@ -457,11 +461,11 @@ confirms the isolation above - `(Get-CimInstance Win32_Service -Filter "Name LIK
 'actions.runner%'").StartName` must read `.\wattracker-ci`, not
 `NT AUTHORITY\NETWORK SERVICE`.
 
-## What the first run observed
+## Historical: what the first self-hosted run observed
 
 Run
 [32332933878](https://github.com/poopaskoopa/wattracker/actions/runs/32332933878),
-on the self-hosted runner, is the first time any of this executed. Recorded
+on the former self-hosted runner, was the first time any of this executed. Recorded
 here as observations, with what was actually seen - not as "the job is enabled
 now".
 

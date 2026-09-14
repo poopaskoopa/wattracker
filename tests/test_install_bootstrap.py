@@ -472,7 +472,7 @@ def test_start_does_not_trust_a_reused_pid_without_lsof(tmp_path):
 #
 # restart.sh signals every PID it selects, so these tests must never let it
 # see a process they do not own: this machine can be running the real server
-# and a self-hosted CI runner whose working directory is
+# and a CI runner whose working directory is
 # .../_work/wattracker/wattracker/. The sandbox below gives restart.sh its own
 # ROOT (so its PID file is test-owned), its own free port (so lsof finds
 # nothing), and a `pgrep` shim that runs the *real* pgrep — the pattern under
@@ -598,8 +598,8 @@ def test_restart_matches_the_module_invocation_not_the_bare_name():
 def test_restart_stop_leaves_a_process_whose_path_merely_contains_the_name(
     tmp_path,
 ):
-    # The self-hosted CI runner works out of
-    # /Users/<user>/actions-runner/_work/wattracker/wattracker/, so every
+    # A CI runner may work out of
+    # an actions-runner/_work/wattracker/wattracker/ directory, so every
     # process it spawns carries "wattracker" in its command line as a path
     # component. `pgrep -f 'wattracker'` matched those, and stop() SIGTERMed
     # and then SIGKILLed in-flight CI.

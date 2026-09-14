@@ -5,7 +5,7 @@ test_windows_installer.py and test_macos_packaging.py: the invariants that
 would otherwise be noticed only by shipping a broken binary.
 
 That used to be all there was, because nothing could build the artifact. It no
-longer is: the self-hosted Windows runner added in #114 freezes the connector
+longer is: the GitHub-hosted `windows-latest` runner freezes the connector
 and runs packaging/smoke_frozen_connector.py against it on every pull request,
 so the executable's own behaviour is now covered by something that runs. What
 stays here is what a checkout can answer and a build cannot - that the spec
@@ -109,7 +109,7 @@ WORKFLOW = (
 ).read_text(encoding="utf-8")
 # The per-commit job. Distinct from WORKFLOW above in the way that matters
 # most here: that one is hard-disabled and fires on a tag, this one actually
-# runs, on every pull request, on the self-hosted Windows box.
+# runs on every pull request on GitHub-hosted `windows-latest`.
 CI_WORKFLOW = (ROOT / ".github" / "workflows" / "windows.yml").read_text(encoding="utf-8")
 ISS = (ROOT / "packaging" / "wattracker.iss").read_text(encoding="utf-8")
 

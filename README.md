@@ -560,19 +560,17 @@ or `wattracker-restore --restore 1`; a frozen bundle uses
 `wattracker.exe restore [--restore N]`. Restore safety follows the configured
 loopback port.
 
-CI runs on self-hosted runners, which are not billed and so survived the
-account-level block on hosted minutes. The suite runs on a macOS runner
-(`cloud.yml`) on every push and pull request, and a Windows runner
-(`windows.yml`) builds and smoke-tests the packaged artifacts on every pull
+CI runs on GitHub-hosted runners. The suite runs on a self-hosted macOS runner
+(`cloud.yml`) on every push and pull request, and a GitHub-hosted
+`windows-latest` runner (`windows.yml`) builds and smoke-tests the packaged artifacts on every pull
 request: the wheel, the frozen application, the Inno Setup installer through a
 full install/upgrade/uninstall, and the frozen connector. A merge to `main`
 uploads the wheel, the installer and the connector, best-effort — the account's
 artifact storage is full, so that step may go yellow on an otherwise green
 build.
 
-What stays disabled needs something CI cannot supply. The Windows *test* job is
-gated to keep a duplicate of the suite off the single physical box; the
-signed-release workflows (`windows-release.yml`, `macos-release.yml`) fire only
+What stays disabled needs something CI cannot supply. The signed-release
+workflows (`windows-release.yml`, `macos-release.yml`) fire only
 on a `v*` tag and are gated for want of a code-signing certificate, so every
 shipped binary is still an unsigned local build. The containerized cloud checks
 run on hosted ubuntu-latest Linux and build the linux/amd64 image, verify its
@@ -589,6 +587,14 @@ platforms). Only ad-hoc signing can be produced here, so a downloaded DMG is
 still quarantined by Gatekeeper; see
 [the macOS packaging guide](docs/macos-packaging.md) for the Developer ID and
 notarization path and the full list of gaps.
+
+### Historical: former Windows runner operations
+
+The Windows packaging job formerly ran on a persistent self-hosted machine
+shared with a trainer. The old notes about account isolation, service control,
+hardware-session priority, and runner/toolchain setup are retained in the
+[historical section of the Windows packaging guide](docs/windows-packaging.md),
+but do not describe the current GitHub-hosted CI environment.
 
 Chart.js and the zoom plugin are vendored with the application, so ride,
 training-load, power-curve, and volume charts work without internet access.
