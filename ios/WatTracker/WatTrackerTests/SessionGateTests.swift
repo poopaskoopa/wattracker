@@ -283,7 +283,7 @@ final class SessionGateTests: XCTestCase {
         await gate.select(.cloud)
         transport.setReachable(true)
         monitor.trigger()
-        await Task.yield()
+        await gate.automaticReevaluate()
         XCTAssertEqual(gate.backend, .cloud)
 
         await gate.select(.automatic)
@@ -319,11 +319,12 @@ final class SessionGateTests: XCTestCase {
         guard await transport.gate.waitForArrival(timeout: 1) else {
             return XCTFail("local probe did not start")
         }
-        await gate.select(.cloud)
+        await gate.selectBackend(.cloud)
         await transport.gate.openGate()
         await startTask.value
 
         XCTAssertEqual(gate.backend, .cloud)
+        XCTAssertNil(preference.backend)
     }
 
     func testAnOlderAutomaticProbeCannotOverwriteANewerPathEvaluation() async {
@@ -412,6 +413,7 @@ final class SessionGateTests: XCTestCase {
 
         XCTAssertEqual(gate.backend, .local)
         XCTAssertEqual(gate.phase, .unpaired)
+        XCTAssertEqual(gate.selection, .automatic)
         XCTAssertNil(preference.backend)
         XCTAssertNil(gate.lastSuccess)
 
