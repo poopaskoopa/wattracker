@@ -284,9 +284,14 @@ def _backfill_plan_completion_dates(conn: sqlite3.Connection) -> None:
         started = parse_naive(row["start_time"])
         if started is None:
             continue
-        completed = to_user_timezone(
-            started, zones.get(row["user_id"])
-        ).date().isoformat()
+        try:
+            completed = to_user_timezone(
+                started, zones.get(row["user_id"])
+            ).date().isoformat()
+        except (OverflowError, OSError, ValueError):
+            # A syntactically valid but unrepresentable instant is not safe
+            # evidence for a date correction; leave the completion untouched.
+            continue
         if row["completed_date"] != completed:
             conn.execute(
                 "UPDATE plan_workouts SET completed_date=? WHERE id=?",
