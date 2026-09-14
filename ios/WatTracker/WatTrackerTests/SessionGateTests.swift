@@ -409,7 +409,7 @@ final class SessionGateTests: XCTestCase {
 
         await gate.selectBackend(.local)
         monitor.trigger()
-        await Task.yield()
+        await gate.automaticReevaluate()
 
         XCTAssertEqual(gate.backend, .local)
         XCTAssertEqual(gate.phase, .unpaired)
@@ -424,6 +424,37 @@ final class SessionGateTests: XCTestCase {
 
         XCTAssertEqual(gate.backend, .cloud)
         XCTAssertEqual(gate.phase, .paired)
+        XCTAssertNil(preference.backend)
+    }
+
+    func testPairingScreenSelectionWinsOverLateAutomaticReevaluation() async {
+        let preference = MemoryPreferenceStore()
+        let monitor = FakePathMonitor()
+        let cloud = harness(paired: true) { _, _ in .refused(404) }
+        let transport = LocalProbeTransport()
+        let local = LocalSession(
+            credentials: MemoryLocalCredentialStore(credential: try? LocalCredential(
+                baseURL: "https://desktop.example", token: "token")),
+            cache: MemorySnapshotCache(),
+            makeClient: { value in
+                try LocalClient(baseURL: URL(string: value.baseURL)!, token: value.token,
+                                transport: transport)
+            }
+        )
+        let gate = SessionGate(
+            makeSession: { cloud.session },
+            makeLocalSession: { local },
+            preferences: preference,
+            pathMonitor: monitor
+        )
+
+        await gate.start()
+        monitor.trigger()
+        await gate.selectBackend(.cloud)
+        await gate.automaticReevaluate()
+
+        XCTAssertEqual(gate.backend, .cloud)
+        XCTAssertEqual(gate.selection, .automatic)
         XCTAssertNil(preference.backend)
     }
 

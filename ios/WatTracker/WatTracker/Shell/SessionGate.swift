@@ -179,6 +179,7 @@ final class SessionGate {
     private let preferences: PreferenceStore
     private let pathMonitor: SessionPathMonitor
     private var manualOverride: Backend?
+    private var temporaryOverride: Backend?
     private var selectionGeneration = 0
     private var automaticGeneration = 0
     private var automaticReevaluationTask: Task<Void, Never>?
@@ -306,6 +307,10 @@ final class SessionGate {
     }
 
     private func runAutomaticReevaluation(force: Bool = false) async {
+        if temporaryOverride != nil {
+            temporaryOverride = nil
+            return
+        }
         guard phase == .starting || phase == .paired || (force && phase == .unpaired)
         else { return }
         automaticGeneration += 1
@@ -334,6 +339,7 @@ final class SessionGate {
               automaticGeneration == self.automaticGeneration,
               selectionGeneration == self.selectionGeneration
         else {
+            temporaryOverride = nil
             await refresh()
             return
         }
@@ -416,12 +422,10 @@ final class SessionGate {
         let hasCandidate = backend == .cloud ? session != nil : localSession != nil
         guard hasCandidate else { return }
         selectionGeneration += 1
-        let previousOverride = manualOverride
-        manualOverride = backend
+        temporaryOverride = backend
         self.backend = backend
         await refresh()
         selectionGeneration += 1
-        manualOverride = previousOverride
     }
 
     func select(_ selection: Selection) async {
