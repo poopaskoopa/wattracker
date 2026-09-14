@@ -37,6 +37,46 @@ final class SessionGateTests: XCTestCase {
         }
     }
 
+    private final class FakePathMonitor: SessionPathMonitor, @unchecked Sendable {
+        private var handler: (@Sendable () -> Void)?
+        func start(onChange: @escaping @Sendable () -> Void) { handler = onChange }
+        func cancel() { handler = nil }
+        func trigger() { handler?() }
+    }
+
+    private final class LocalProbeTransport: LocalTransport, @unchecked Sendable {
+        private let lock = NSLock()
+        private var reachable = true
+        private(set) var requests = [URLRequest]()
+
+        func setReachable(_ value: Bool) {
+            lock.lock(); reachable = value; lock.unlock()
+        }
+
+        func send(_ request: URLRequest) async throws -> LocalResponse {
+            lock.lock()
+            requests.append(request)
+            let isReachable = reachable
+            lock.unlock()
+            guard isReachable else { throw URLError(.cannotConnectToHost) }
+            if request.url?.path == "/api/connector/session" {
+                return LocalResponse(
+                    status: 200, body: Data(#"{"ticket":"ticket"}"#.utf8),
+                    url: request.url!
+                )
+            }
+            if request.url?.path == "/connector/session" {
+                return LocalResponse(
+                    status: 303, body: Data(), url: request.url!, location: "/",
+                    setCookie: "session=authenticated; Secure; HttpOnly"
+                )
+            }
+            return LocalResponse(
+                status: 200, body: Data(#"{"ftp":250}"#.utf8), url: request.url!
+            )
+        }
+    }
+
     private func harness(
         paired: Bool,
         clock: TestClock = TestClock(),
@@ -87,16 +127,21 @@ final class SessionGateTests: XCTestCase {
         XCTAssertEqual(rig.transport.requestCount, 0)
     }
 
-    func testSavedBackendIsRestoredWhenThatBackendIsPaired() async {
-        let preference = MemoryPreferenceStore(.local)
+    func testColdLaunchPrefersReachableLocalOverPersistedCloudPreference() async {
+        let preference = MemoryPreferenceStore(.cloud)
         let cloud = harness(paired: true) { _, _ in .refused(404) }
+        let transport = LocalProbeTransport()
         let local = LocalSession(
             credentials: MemoryLocalCredentialStore(
                 credential: try? LocalCredential(
                     baseURL: "https://desktop.example", token: "token"
                 )
             ),
-            cache: MemorySnapshotCache()
+            cache: MemorySnapshotCache(),
+            makeClient: { value in
+                try LocalClient(baseURL: URL(string: value.baseURL)!, token: value.token,
+                                transport: transport)
+            }
         )
         let gate = SessionGate(
             makeSession: { cloud.session },
@@ -108,6 +153,53 @@ final class SessionGateTests: XCTestCase {
 
         XCTAssertEqual(gate.backend, .local)
         XCTAssertEqual(gate.phase, .paired)
+    }
+
+    func testAutomaticReevaluationFallsBackToCloudWhenLocalIsUnavailable() async {
+        let preference = MemoryPreferenceStore()
+        let cloud = harness(paired: true) { _, _ in .refused(404) }
+        let transport = LocalProbeTransport()
+        let local = LocalSession(
+            credentials: MemoryLocalCredentialStore(credential: try? LocalCredential(
+                baseURL: "https://desktop.example", token: "token")),
+            cache: MemorySnapshotCache(),
+            makeClient: { value in
+                try LocalClient(baseURL: URL(string: value.baseURL)!, token: value.token,
+                                transport: transport)
+            }
+        )
+        let gate = SessionGate(makeSession: { cloud.session }, makeLocalSession: { local },
+                               preferences: preference)
+        await gate.start()
+        XCTAssertEqual(gate.backend, .local)
+        transport.setReachable(false)
+        await gate.automaticReevaluate()
+        XCTAssertEqual(gate.backend, .cloud)
+        let state = await local.deviceState
+        XCTAssertEqual(state, .paired)
+    }
+
+    func testManualBackendOverrideSurvivesAutomaticReevaluationAndPathChange() async {
+        let monitor = FakePathMonitor()
+        let cloud = harness(paired: true) { _, _ in .refused(404) }
+        let transport = LocalProbeTransport()
+        let local = LocalSession(
+            credentials: MemoryLocalCredentialStore(credential: try? LocalCredential(
+                baseURL: "https://desktop.example", token: "token")),
+            cache: MemorySnapshotCache(),
+            makeClient: { value in
+                try LocalClient(baseURL: URL(string: value.baseURL)!, token: value.token,
+                                transport: transport)
+            }
+        )
+        let gate = SessionGate(makeSession: { cloud.session }, makeLocalSession: { local },
+                               preferences: MemoryPreferenceStore(), pathMonitor: monitor)
+        await gate.start()
+        await gate.selectBackend(.cloud)
+        transport.setReachable(true)
+        monitor.trigger()
+        await Task.yield()
+        XCTAssertEqual(gate.backend, .cloud)
     }
 
     func testInjectedPreferenceStoreRestoresOnlyTheBackendValue() {

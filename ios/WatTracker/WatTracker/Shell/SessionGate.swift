@@ -1,6 +1,26 @@
 import Foundation
 import Observation
+import Network
 import Security
+
+protocol SessionPathMonitor: AnyObject {
+    func start(onChange: @escaping @Sendable () -> Void)
+    func cancel()
+}
+
+final class SystemSessionPathMonitor: SessionPathMonitor {
+    private let monitor = NWPathMonitor()
+    private let queue = DispatchQueue(label: "com.wattracker.ios.network-path")
+
+    func start(onChange: @escaping @Sendable () -> Void) {
+        monitor.pathUpdateHandler = { _ in onChange() }
+        monitor.start(queue: queue)
+    }
+
+    func cancel() {
+        monitor.cancel()
+    }
+}
 
 /// The one `CloudSession` in the app, and the observable answer to "which of
 /// the three worlds is the rider in".
@@ -123,16 +143,24 @@ final class SessionGate {
     private let makeSession: @Sendable () throws -> CloudSession
     private let makeLocalSession: @Sendable () throws -> LocalSession
     private let preferences: PreferenceStore
+    private let pathMonitor: SessionPathMonitor
+    private var manualOverride = false
 
     init(
         makeSession: @escaping @Sendable () throws -> CloudSession = SessionGate.liveSession,
         makeLocalSession: @escaping @Sendable () throws -> LocalSession = SessionGate.liveLocalSession,
-        preferences: PreferenceStore = KeychainPreferenceStore()
+        preferences: PreferenceStore = KeychainPreferenceStore(),
+        pathMonitor: SessionPathMonitor = SystemSessionPathMonitor()
     ) {
         self.makeSession = makeSession
         self.makeLocalSession = makeLocalSession
         self.preferences = preferences
+        self.pathMonitor = pathMonitor
         self.backend = preferences.loadBackend() ?? .cloud
+    }
+
+    deinit {
+        pathMonitor.cancel()
     }
 
     /// The real session: an Enclave key where there is one, the keychain
@@ -190,22 +218,50 @@ final class SessionGate {
 
         let cloudPaired = await session?.deviceState == .paired
         let localPaired = await localSession?.deviceState == .paired
-        if backend == .local, localPaired {
-            // Keep the rider's explicit choice when its credential is present.
-        } else if backend == .cloud, cloudPaired {
-            // Keep the rider's explicit choice when its credential is present.
-        } else if localPaired {
-            backend = .local
-        } else if cloudPaired {
-            // A stale local preference must not hide a paired cloud session.
-            backend = .cloud
-        }
-        preferences.saveBackend(backend)
+        // The stored setting is only a remembered UI value. A cold launch is
+        // always automatic so an old cloud choice cannot hide a reachable
+        // paired desktop.
+        backend = cloudPaired ? .cloud : .local
         if session == nil && !localPaired {
             phase = .unusable(String(describing: cloudError ?? GateFailure.noSession))
             return
         }
+        pathMonitor.start { [weak self] in
+            Task { @MainActor in await self?.automaticReevaluate() }
+        }
+        await automaticReevaluate()
+    }
+
+    /// Prefer the already paired desktop when its endpoint answers. No host
+    /// discovery occurs; LocalSession probes only its stored credential.
+    func automaticReevaluate() async {
+        guard phase == .starting || phase == .paired else { return }
+        guard !manualOverride else {
+            await probeSelectedBackend()
+            await refresh()
+            return
+        }
+        let localPaired = await localSession?.deviceState == .paired
+        let cloudPaired = await session?.deviceState == .paired
+        if localPaired, let localSession, await localSession.probe() {
+            backend = .local
+        } else if cloudPaired {
+            backend = .cloud
+        } else if localPaired {
+            // Keep the only paired backend selected when the desktop is
+            // temporarily unavailable, so its cache remains usable.
+            backend = .local
+        }
         await refresh()
+    }
+
+    private func probeSelectedBackend() async {
+        switch backend {
+        case .cloud:
+            if let session { _ = try? await session.readerContext() }
+        case .local:
+            if let localSession { _ = await localSession.probe() }
+        }
     }
 
     /// Re-read the actor's state. Cheap -- no request -- and safe to call after
@@ -232,6 +288,7 @@ final class SessionGate {
     /// through `PairingFailureMessage` and never directly.
     func pair(code: String, label: String?) async throws {
         guard let session else { throw GateFailure.noSession }
+        manualOverride = true
         backend = .cloud
         do {
             try await session.pair(code: code, label: label)
@@ -251,6 +308,7 @@ final class SessionGate {
     /// cookie it receives from the desktop.
     func pairLocal(host: String, token: String, label: String?) async throws {
         guard let localSession else { throw GateFailure.noSession }
+        manualOverride = true
         backend = .local
         do {
             try await localSession.pair(host: host, token: token, label: label)
@@ -268,6 +326,7 @@ final class SessionGate {
         let isPaired = await candidate.deviceState == .paired
         self.backend = backend
         if isPaired {
+            manualOverride = true
             preferences.saveBackend(backend)
         }
         await refresh()
@@ -337,15 +396,9 @@ final class SessionGate {
     /// recorded in the phase this then reads. Two refusals are needed, with the
     /// backoff between them, so a single foregrounding cannot unpair anything.
     func probe() async {
-        guard phase == .paired else { return }
-        switch backend {
-        case .cloud:
-            guard let session else { return }
-            _ = try? await session.readerContext()
-        case .local:
-            guard let localSession else { return }
-            await localSession.probe()
+        if !manualOverride, await localSession?.deviceState != .paired {
+            await probeSelectedBackend()
         }
-        await refresh()
+        await automaticReevaluate()
     }
 }
