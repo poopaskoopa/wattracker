@@ -1229,6 +1229,16 @@ def _requires_power_profile(workout: dict) -> bool:
     return len(target) >= 600 and any(power >= 0.50 for power in target)
 
 
+def _completion_activity_date(started, timezone) -> Optional[_dt.date]:
+    """Unrepresentable local timestamps cannot supply completion evidence."""
+    if started is None:
+        return None
+    try:
+        return to_user_timezone(started, timezone).date()
+    except (OverflowError, OSError, ValueError):
+        return None
+
+
 def plan_workout_completion_verified(user_id: int, workout: dict) -> bool:
     """Whether a stored completion is strong enough to expose RPE feedback.
 
@@ -1255,7 +1265,7 @@ def plan_workout_completion_verified(user_id: int, workout: dict) -> bool:
     if started is None:
         return False
     timezone = db.get_user_settings(user_id).get("timezone")
-    activity_date = to_user_timezone(started, timezone).date()
+    activity_date = _completion_activity_date(started, timezone)
     if (
         activity_date != completed
         or not 0 <= (completed - scheduled).days <= COMPLETION_GRACE_DAYS
@@ -1380,7 +1390,10 @@ def _match_late_completion_candidates(
     for workout in workouts:
         scheduled = _dt.date.fromisoformat(workout[scheduled_key])
         for lag in range(1, COMPLETION_GRACE_DAYS + 1):
-            activity_date = (scheduled + _dt.timedelta(days=lag)).isoformat()
+            try:
+                activity_date = (scheduled + _dt.timedelta(days=lag)).isoformat()
+            except OverflowError:
+                break
             for activity in activities_by_date.get(activity_date, []):
                 if activity["id"] in used:
                     continue
@@ -1455,11 +1468,18 @@ def match_plan_workout_completion(
 
     if best is None:
         return False
+    started = parse_naive(best[0].get("start_time"))
+    if started is None:
+        return False
+    timezone = db.get_user_settings(user_id).get("timezone")
+    completed = _completion_activity_date(started, timezone)
+    if completed is None:
+        return False
     return db.mark_plan_workout_completed(
         user_id,
         workout_id,
         best[0]["id"],
-        workout["date"],
+        completed.isoformat(),
         best[1],
         best[2],
     )
@@ -1485,12 +1505,14 @@ def link_selected_plan_workout(
         or activity_id in db.completed_activity_ids(user_id)
     ):
         return False
-    try:
-        completed_date = _dt.datetime.fromisoformat(
-            str(activity.get("start_time") or "")
-        ).date().isoformat()
-    except (TypeError, ValueError):
+    started = parse_naive(activity.get("start_time"))
+    if started is None:
         return False
+    timezone = db.get_user_settings(user_id).get("timezone")
+    completed = _completion_activity_date(started, timezone)
+    if completed is None:
+        return False
+    completed_date = completed.isoformat()
 
     compliance = effective = None
     if completed_date == workout.get("date"):
@@ -1542,6 +1564,13 @@ def manually_complete_plan_workout(user_id: int, workout_id: int) -> str:
             int(activity["id"]),
         ),
     )
+    started = parse_naive(best.get("start_time"))
+    if started is None:
+        return "no_activity"
+    timezone = db.get_user_settings(user_id).get("timezone")
+    completed = _completion_activity_date(started, timezone)
+    if completed is None:
+        return "no_activity"
     activity = db.get_activity(user_id, best["id"])
     evidence = _profile_evidence(activity or {}, workout)
     compliance = effective = None
@@ -1551,7 +1580,7 @@ def manually_complete_plan_workout(user_id: int, workout_id: int) -> str:
         user_id,
         workout_id,
         best["id"],
-        workout["date"],
+        completed.isoformat(),
         compliance,
         effective,
     ):
@@ -1580,7 +1609,10 @@ def match_plan_completions(user_id: int, now: Optional[_dt.datetime] = None) -> 
         started = parse_naive(activity.get("start_time"))
         if started is None:
             continue
-        activity_date = to_user_timezone(started, timezone).date().isoformat()
+        completed = _completion_activity_date(started, timezone)
+        if completed is None:
+            continue
+        activity_date = completed.isoformat()
         activities_by_date.setdefault(activity_date, []).append(activity)
 
     used = db.completed_activity_ids(user_id)

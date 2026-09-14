@@ -1091,3 +1091,32 @@ def test_using_a_low_suggestion_confirms_it_through_the_shared_policy(user_id):
             (suggestion["id"],),
         ).fetchone()[0]
     assert status == "accepted"
+
+
+def test_same_day_plan_and_standalone_share_one_activity(user_id, monkeypatch):
+    from unittest.mock import Mock
+
+    plan_id, xml = _plan_workout(user_id)
+    standalone_id, standalone_xml = _workout(user_id)
+    assert importer._zwo_fraction_profile(xml) == importer._zwo_fraction_profile(standalone_xml)
+    target = importer._zwo_fraction_profile(xml)
+    activity_id = _activity(user_id, DATE, [p * 210 for p in target])
+
+    activity = db.get_activity(user_id, activity_id)
+    assert importer._standalone_candidate_score(
+        activity, db.get_standalone_workout(user_id, standalone_id), activity
+    ) is not None
+    mark_standalone = Mock(wraps=db.mark_standalone_completed)
+    monkeypatch.setattr(db, "mark_standalone_completed", mark_standalone)
+    # The database also rejects duplicate links. Check that the matcher shares
+    # its consumed set rather than relying on that last-line protection.
+    importer.match_standalone_completions(
+        user_id, dt.datetime.fromisoformat(f"{DATE}T20:00:00")
+    )
+    links = [
+        db.get_plan_workout(user_id, plan_id)["completed_activity_id"],
+        db.get_standalone_workout(user_id, standalone_id)["completed_activity_id"],
+    ]
+    assert links.count(activity_id) == 1
+    assert links.count(None) == 1
+    mark_standalone.assert_not_called()

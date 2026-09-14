@@ -31,7 +31,7 @@ from .timeutil import (
 
 _log = logging.getLogger(__name__)
 
-SCHEMA_VERSION = 36
+SCHEMA_VERSION = 37
 
 
 def _restrict_db_files(path: str) -> None:
@@ -272,6 +272,33 @@ def _backfill_weight_history(conn: sqlite3.Connection) -> None:
         )
 
 
+def _backfill_plan_completion_dates(conn: sqlite3.Connection) -> None:
+    """v36 -> v37: reconcile UTC-prefix completion dates with rider-local dates."""
+    zones = _user_timezones(conn)
+    rows = conn.execute(
+        "SELECT w.id, w.user_id, w.completed_date, a.start_time "
+        "FROM plan_workouts w JOIN activities a "
+        "ON a.id = w.completed_activity_id AND a.user_id = w.user_id"
+    ).fetchall()
+    for row in rows:
+        started = parse_naive(row["start_time"])
+        if started is None:
+            continue
+        try:
+            completed = to_user_timezone(
+                started, zones.get(row["user_id"])
+            ).date().isoformat()
+        except (OverflowError, OSError, ValueError):
+            # A syntactically valid but unrepresentable instant is not safe
+            # evidence for a date correction; leave the completion untouched.
+            continue
+        if row["completed_date"] != completed:
+            conn.execute(
+                "UPDATE plan_workouts SET completed_date=? WHERE id=?",
+                (completed, row["id"]),
+            )
+
+
 # In-place migrations: version N -> N+1 statement lists. A database whose
 # version has an unbroken chain here is upgraded without losing live data.
 # (Brand-new tables need no ALTERs - init_db runs _SCHEMA after migrating - but
@@ -464,6 +491,7 @@ _MIGRATIONS: Dict[int, Sequence[Union[str, Callable[[sqlite3.Connection], None]]
         # New per-user cloud sync state is created by _SCHEMA after migrating.
         # It contains no credentials or source data to backfill.
     ],
+    36: [_backfill_plan_completion_dates],
 }
 
 _DROP = """
@@ -1995,7 +2023,10 @@ def _activity_is_visible(row, cutoff: Optional[str], timezone: Optional[str]) ->
     when = parse_naive(row["start_time"] if hasattr(row, "keys") else row.get("start_time"))
     if when is None:
         return False
-    return to_user_timezone(when, timezone).date().isoformat() >= cutoff
+    try:
+        return to_user_timezone(when, timezone).date().isoformat() >= cutoff
+    except (OverflowError, OSError, ValueError):
+        return False
 
 
 def activity_is_visible(user_id: int, start_time: Optional[str], path: Optional[str] = None) -> bool:
@@ -4085,13 +4116,19 @@ def activities_between(
         ).fetchall()
         settings = get_user_settings(user_id, path)
         visible = _visible_rows(conn, user_id, rows)
-        return [
-            _row_summary(r) for r in visible
-            if (parse_naive(r["start_time"]) is not None and
-                start_iso <= to_user_timezone(
-                    parse_naive(r["start_time"]), settings.get("timezone")
-                ).date().isoformat() <= end_iso)
-        ]
+        result = []
+        for row in visible:
+            started = parse_naive(row["start_time"])
+            if started is None:
+                continue
+            try:
+                date = to_user_timezone(started, settings.get("timezone")).date().isoformat()
+            except (OverflowError, OSError, ValueError):
+                # Matchers cannot use an instant without a representable local date.
+                continue
+            if start_iso <= date <= end_iso:
+                result.append(_row_summary(row))
+        return result
     finally:
         conn.close()
 
