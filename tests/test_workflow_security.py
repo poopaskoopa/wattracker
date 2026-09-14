@@ -1,12 +1,10 @@
 """Fork pull requests must never reach a self-hosted runner.
 
-This repository is public, and two of its jobs run on physical machines that
-are not torn down between jobs. Both execute code from the branch under test
-before any human reads it: the macOS job runs the branch's build backend via
-`uv pip install -e` and its conftest.py via pytest, and the Windows job also
-runs its PyInstaller spec, its Inno Setup script, and an installer built from
-the branch. Without a gate, opening a pull request is remote code execution on
-someone's desk.
+This repository is public, and its self-hosted jobs run on a physical machine
+that is not torn down between jobs. They execute code from the branch under
+test before any human reads it: the macOS job runs the branch's build backend
+via `uv pip install -e` and its conftest.py via pytest. Without a gate, opening
+a pull request is remote code execution on someone's desk.
 
 GitHub's first-time-contributor approval prompt does not cover this: approving
 a contributor once exempts every later pull request from that account. The
@@ -79,9 +77,18 @@ def test_every_self_hosted_job_excludes_fork_pull_requests():
     assert sorted(checked) == [
         "cloud.yml:ios-tests",
         "cloud.yml:tests",
-        "windows.yml:package-unsigned",
-        "windows.yml:windows-real",
     ]
+
+
+def test_windows_coverage_jobs_use_hosted_python_312_without_fork_gates():
+    text = (WORKFLOW_DIR / "windows.yml").read_text(encoding="utf-8")
+    jobs = dict(_jobs(text))
+    for name in ("windows-real", "package-unsigned"):
+        job = jobs[name]
+        assert re.search(r"(?m)^    runs-on: windows-latest$", job)
+        assert FORK_GATE not in job
+        assert "uses: actions/setup-python@v5" in job
+        assert 'python-version: "3.12"' in job
 
 
 def test_cloud_ios_tests_job_has_required_security_and_test_configuration():

@@ -114,21 +114,26 @@ def test_signed_release_only_builds_the_triggering_release_tag():
 def test_windows_ci_uses_one_fixed_python_version():
     workflow = Path(".github/workflows/windows.yml").read_text()
     test_job = workflow.split("  test:\n", 1)[1].split(
+        "\n  windows-real:", 1
+    )[0]
+    real_job = workflow.split("  windows-real:\n", 1)[1].split(
         "\n  package-unsigned:", 1
     )[0]
-    assert 'python-version: "3.12"' in test_job
-    assert "matrix:" not in test_job
-    assert test_job.count("python-version:") == 1
+    package_job = workflow.split("  package-unsigned:\n", 1)[1]
+    for job in (test_job, real_job, package_job):
+        assert 'python-version: "3.12"' in job
+        assert "matrix:" not in job
+        assert job.count("python-version:") == 1
 
 
 def test_windows_signed_release_job_is_hard_disabled():
     """The *signed* release stays gated; the unsigned installer job does not.
 
     `package-unsigned` deliberately carries no gate any more: it runs on the
-    self-hosted Windows runner, which is what finally executes the setup
-    compiler this repository had never once run. The release job is a different
-    case - it needs hosted minutes and the code-signing secrets - so it keeps
-    its gate, and this asserts the two do not get conflated again.
+    hosted Windows runner, which is what finally executes the setup compiler
+    this repository had never once run. The release job is a different case -
+    it needs hosted minutes and the code-signing secrets - so it keeps its gate,
+    and this asserts the two do not get conflated again.
 
     `tests/test_windows_installer.py` pins the shape of the job that now runs.
     """

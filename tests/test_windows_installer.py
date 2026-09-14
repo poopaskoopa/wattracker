@@ -8,15 +8,6 @@ LAUNCHER = (ROOT / "scripts" / "wattracker.ps1").read_text(encoding="utf-8")
 SMOKE = (ROOT / "packaging" / "smoke_installer.ps1").read_text(encoding="utf-8")
 WORKFLOW = (ROOT / ".github" / "workflows" / "windows.yml").read_text(encoding="utf-8")
 
-# The one job-level gate the self-hosted jobs are allowed to carry. Duplicated
-# in tests/test_workflow_security.py rather than shared: tests/ is not a
-# package, and a security invariant is worth asserting from both directions.
-FORK_GATE = (
-    "github.event_name == 'push' "
-    "|| github.event.pull_request.head.repo.full_name == github.repository"
-)
-
-
 def test_installer_is_stable_per_user_and_ships_the_full_payload():
     assert re.search(r"(?m)^AppId=\{\{[0-9A-F-]{36}\}$", ISS)
     assert "PrivilegesRequired=lowest" in ISS
@@ -91,60 +82,37 @@ def test_launcher_prefers_override_then_frozen_then_source_virtualenv():
     assert "$env:WATTRACKER_EXECUTABLE = $Executable" not in SMOKE
 
 
-def test_workflow_runs_the_installer_job_on_the_self_hosted_runner():
+def test_workflow_runs_the_installer_job_on_a_hosted_runner():
     """The installer job runs; the suite job does not. Both halves matter.
 
     `package-unsigned` reverting to a gate would take the only execution of
-    the setup compiler with it - the state this repository was in until the
-    self-hosted runner existed. An ungated `test` job would put a duplicate of
-    the macOS runner's suite on the single physical Windows box.
+    the setup compiler with it. Enabling the `test` job would duplicate the
+    platform-neutral suite that already runs in the Cloud workflow.
     """
     test_job, package_job = WORKFLOW.split("  package-unsigned:", 1)
     assert "if: ${{ false }}" in test_job
     # Matched at job indentation, not anywhere in the job. A *step* inside
-    # package-unsigned may legitimately be gated - the upload is, while the
-    # storage question is open - and that must not read as the job reverting to
-    # a gate, which is the thing this asserts against.
-    #
-    # Exactly one job-level gate is allowed, and only this one: the fork
-    # exclusion. It is not the failure mode above - it still runs for every
-    # push to main and every pull request raised from a branch in this
-    # repository, so installer coverage is intact. Anything else at this
-    # indentation is the reversion this test exists to catch.
+    # package-unsigned may legitimately contain gated steps - the upload is,
+    # while the storage question is open - and that must not read as the whole
+    # job reverting to a gate.
     job_gates = re.findall(r"(?m)^    if: (.+)$", package_job)
-    assert job_gates == [FORK_GATE]
-    # The `Windows` label is load-bearing: a bare [self-hosted] also matches the
-    # macOS runner that the Cloud workflow uses.
-    assert "runs-on: [self-hosted, Windows, X64]" in package_job
-    # Cancelling mid-job skips smoke_installer.ps1's `finally`, which is what
-    # uninstalls the product - leaving a half-installed application on a runner
-    # that persists between jobs. Serializing is the correct trade.
-    #
-    # Matched as a YAML key, not as a substring: the workflow comment explaining
-    # this decision necessarily contains the word.
-    assert re.search(r"(?m)^\s*concurrency:", WORKFLOW)
-    assert not re.search(r"(?m)^\s*cancel-in-progress\s*:", WORKFLOW)
+    assert job_gates == []
+    assert "runs-on: windows-latest" in package_job
 
 
-def test_installer_job_uses_the_runners_machine_wide_python():
-    """No setup-python on this job, and the interpreter is asserted instead.
-
-    actions/setup-python is not a tool-cache unpack on Windows: the setup
-    script in actions/python-versions runs the official installer with
-    InstallAllUsers=1 and clears keys under HKLM, so it needs administrator.
-    The runner's service account deliberately is not one, and handing it admin
-    would remove the account isolation the installer smoke test depends on -
-    so reintroducing the action would either fail the job or undo that.
-
-    The cost is that the interpreter becomes a property of the machine rather
-    than of this file. Asserting the version is what buys it back: a drifted
-    runner fails on a line that names what it found.
-    """
+def test_installer_job_uses_setup_python_312():
     _, package_job = WORKFLOW.split("  package-unsigned:", 1)
-    # Matched as a `uses:` line, not as a substring: the comment in the workflow
-    # explaining why the action is absent necessarily names it.
-    assert not re.search(r"(?m)^\s*-?\s*uses:\s*actions/setup-python", package_job)
-    assert "sys.version_info[:2] == (3, 12)" in package_job
+    assert re.search(
+        r'(?m)^\s*- uses: actions/setup-python@v5\n\s+with:\n\s+python-version: "3\.12"$',
+        package_job,
+    )
+    assert "Assert the runner's machine-wide Python" not in package_job
+    assert r".venv\Scripts\python" not in package_job
+
+
+def test_lifecycle_uses_the_installed_console_launcher():
+    _, package_job = WORKFLOW.split("  package-unsigned:", 1)
+    assert "$env:WATTRACKER_EXECUTABLE = (Get-Command wattracker).Source" in package_job
 
 
 def test_workflow_builds_smokes_and_uploads_the_wheel_and_setup_artifacts():
@@ -186,37 +154,8 @@ def test_a_full_storage_quota_cannot_red_check_a_green_build():
     assert re.search(r'(?m)^\s+if \(\$connector\.Count -eq 0\) \{ throw ', WORKFLOW)
 
 
-def test_heavy_steps_yield_the_box_to_a_hardware_session():
-    """The runner shares a machine with the trainer and Zwift.
-
-    Nothing in the job touches Bluetooth, so the trainer link is never
-    contended - but the PyInstaller freeze and the Inno Setup compress each
-    saturate every core for minutes, and a build can start in the middle of a
-    session. Dropping the shell lets Zwift preempt it; children inherit.
-
-    BelowNormal rather than Idle is the load-bearing half: at Idle the runner's
-    heartbeat can starve under sustained load and the job is reported lost.
-    """
-    _, package_job = WORKFLOW.split("  package-unsigned:", 1)
-    drops = re.findall(r"PriorityClass = '(\w+)'", package_job)
-    assert drops, "no step lowers its priority"
-    assert set(drops) == {"BelowNormal"}
-    # The four steps that do real work: dependency install, wheel build, the
-    # app's freeze plus installer compile, and the connector's freeze. Counted
-    # rather than merely checked for presence, so that a new heavy step added
-    # without the drop fails here instead of quietly competing with a ride.
-    assert len(drops) == 4
-
-
 def test_push_is_filtered_to_main_so_a_commit_runs_once():
-    """One physical runner means a duplicate run is queued, not parallel.
-
-    A bare `push:` beside `pull_request:` fires twice for every commit on a
-    branch with an open PR, and the second waits for the first: runs
-    32386196713 and 32386202547 were one commit, 10m45s of wall for 5m30s of
-    work. Filtering push to main gives a PR run while the work is in review and
-    a push run when it merges - which is also what the upload keys off.
-    """
+    """Review each PR commit and upload from the post-merge main run."""
     on = WORKFLOW.split("permissions:", 1)[0]
     assert re.search(r"(?m)^  push:$", on)
     assert re.search(r"(?m)^    branches: \[main\]$", on)
