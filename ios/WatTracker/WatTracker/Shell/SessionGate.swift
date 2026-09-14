@@ -445,10 +445,8 @@ final class SessionGate {
     /// recorded in the phase this then reads. Two refusals are needed, with the
     /// backoff between them, so a single foregrounding cannot unpair anything.
     func probe() async {
-        if manualOverride == nil, await localSession?.deviceState == .paired {
-            if let localSession { _ = await localSession.probe() }
-        } else if manualOverride == nil {
-            await probeSelectedBackend()
+        if let session, await session.deviceState == .paired {
+            _ = try? await session.readerContext()
         }
         await automaticReevaluate()
     }

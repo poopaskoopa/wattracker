@@ -571,22 +571,40 @@ final class SessionGateTests: XCTestCase {
             // header is what lets the session rule its own clock out.
             .refused(404, serverDate: clock.now)
         }
-        await rig.gate.start()
+        let local = LocalSession(
+            credentials: MemoryLocalCredentialStore(credential: try? LocalCredential(
+                baseURL: "https://desktop.example", token: "token")),
+            cache: MemorySnapshotCache(),
+            makeClient: { value in
+                try LocalClient(baseURL: URL(string: value.baseURL)!, token: value.token,
+                                transport: LocalProbeTransport())
+            }
+        )
+        let gate = SessionGate(
+            makeSession: { rig.session }, makeLocalSession: { local },
+            preferences: MemoryPreferenceStore(.local)
+        )
+        await gate.start()
+        XCTAssertEqual(gate.backend, .local)
+        let requestsBeforeProbe = rig.transport.requestCount
 
         // One refusal is also what a deployment mid-restart looks like, so it
         // must not be enough.
-        await rig.gate.probe()
-        XCTAssertEqual(rig.gate.phase, .paired)
+        await gate.probe()
+        XCTAssertGreaterThan(rig.transport.requestCount, requestsBeforeProbe)
+        XCTAssertEqual(gate.phase, .paired)
 
         // Past the backoff the session enforces between the two strikes.
         clock.advance(400)
-        await rig.gate.probe()
-        XCTAssertEqual(rig.gate.phase, .removed)
+        let requestsBeforeSecondProbe = rig.transport.requestCount
+        await gate.probe()
+        XCTAssertGreaterThan(rig.transport.requestCount, requestsBeforeSecondProbe)
+        XCTAssertEqual(gate.phase, .removed)
         XCTAssertNil(rig.credentials.load())
 
         // And there is a way back: the removed screen's only action.
-        await rig.gate.startOver()
-        XCTAssertEqual(rig.gate.phase, .unpaired)
+        await gate.startOver()
+        XCTAssertEqual(gate.phase, .unpaired)
     }
 
     func testProbingAnUnpairedGateSendsNothing() async {
@@ -625,32 +643,6 @@ final class SessionGateTests: XCTestCase {
         await rig.gate.start()
 
         XCTAssertEqual(rig.gate.backend, .cloud)
-    }
-
-    func testForegroundProbeChecksPairedLocalSession() async {
-        let cloud = harness(paired: false) { _, _ in .refused(404) }
-        let transport = LocalProbeTransport()
-        let local = LocalSession(
-            credentials: MemoryLocalCredentialStore(credential: try? LocalCredential(
-                baseURL: "https://desktop.example", token: "token")),
-            cache: MemorySnapshotCache(),
-            makeClient: { value in
-                try LocalClient(baseURL: URL(string: value.baseURL)!, token: value.token,
-                                transport: transport)
-            }
-        )
-        let gate = SessionGate(
-            makeSession: { cloud.session }, makeLocalSession: { local },
-            preferences: MemoryPreferenceStore()
-        )
-
-        await gate.start()
-        transport.setReachable(false)
-        let requestsBeforeProbe = transport.requests.count
-
-        await gate.probe()
-
-        XCTAssertGreaterThan(transport.requests.count, requestsBeforeProbe)
     }
 
     func testStartRefreshesBeforeLaunchingNonBlockingAutomaticReevaluation() async {
