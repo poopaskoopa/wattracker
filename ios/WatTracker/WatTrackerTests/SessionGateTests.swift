@@ -100,6 +100,56 @@ final class SessionGateTests: XCTestCase {
         }
     }
 
+    private final class StaggeredLocalProbeTransport: LocalTransport, @unchecked Sendable {
+        let firstProbeGate = RequestGate()
+        let secondProbeGate = RequestGate()
+        private let lock = NSLock()
+        private var staggered = false
+        private var probeCount = 0
+
+        func beginStaggeredProbes() {
+            lock.lock()
+            staggered = true
+            probeCount = 0
+            lock.unlock()
+        }
+
+        func send(_ request: URLRequest) async throws -> LocalResponse {
+            lock.lock()
+            let probeNumber: Int?
+            if staggered, request.url?.path == "/api/state" {
+                probeCount += 1
+                probeNumber = probeCount
+            } else {
+                probeNumber = nil
+            }
+            lock.unlock()
+
+            if probeNumber == 1 {
+                await firstProbeGate.wait()
+                throw URLError(.timedOut)
+            }
+            if probeNumber == 2 {
+                await secondProbeGate.wait()
+            }
+            if request.url?.path == "/api/connector/session" {
+                return LocalResponse(
+                    status: 200, body: Data(#"{"ticket":"ticket"}"#.utf8),
+                    url: request.url!
+                )
+            }
+            if request.url?.path == "/connector/session" {
+                return LocalResponse(
+                    status: 303, body: Data(), url: request.url!, location: "/",
+                    setCookie: "session=authenticated; Secure; HttpOnly"
+                )
+            }
+            return LocalResponse(
+                status: 200, body: Data(#"{"ftp":250}"#.utf8), url: request.url!
+            )
+        }
+    }
+
     private func harness(
         paired: Bool,
         clock: TestClock = TestClock(),
@@ -259,6 +309,48 @@ final class SessionGateTests: XCTestCase {
         XCTAssertEqual(gate.backend, .cloud)
     }
 
+    func testAnOlderAutomaticProbeCannotOverwriteANewerPathEvaluation() async {
+        let monitor = FakePathMonitor()
+        let cloud = harness(paired: true) { _, _ in .refused(404) }
+        let transport = StaggeredLocalProbeTransport()
+        let local = LocalSession(
+            credentials: MemoryLocalCredentialStore(credential: try? LocalCredential(
+                baseURL: "https://desktop.example", token: "token")),
+            cache: MemorySnapshotCache(),
+            makeClient: { value in
+                try LocalClient(
+                    baseURL: URL(string: value.baseURL)!,
+                    token: value.token,
+                    transport: transport
+                )
+            }
+        )
+        let gate = SessionGate(
+            makeSession: { cloud.session },
+            makeLocalSession: { local },
+            preferences: MemoryPreferenceStore(),
+            pathMonitor: monitor
+        )
+        await gate.start()
+        transport.beginStaggeredProbes()
+
+        let older = Task { await gate.automaticReevaluate() }
+        guard await transport.firstProbeGate.waitForArrival(timeout: 1) else {
+            return XCTFail("the older local probe did not start")
+        }
+        let newer = Task { await gate.automaticReevaluate() }
+        await Task.yield()
+
+        await transport.firstProbeGate.openGate()
+        guard await transport.secondProbeGate.waitForArrival(timeout: 1) else {
+            return XCTFail("the coalesced local probe did not start")
+        }
+        await transport.secondProbeGate.openGate()
+        await older.value
+        await newer.value
+        XCTAssertEqual(gate.backend, .local)
+    }
+
     func testInjectedPreferenceStoreRestoresOnlyTheBackendValue() {
         let preference = MemoryPreferenceStore(.local)
 
@@ -270,6 +362,7 @@ final class SessionGateTests: XCTestCase {
 
     func testPairingScreenCanReturnFromUnpairedLocalToPairedCloud() async {
         let preference = MemoryPreferenceStore()
+        let monitor = FakePathMonitor()
         let rig = harness(paired: true) { _, _ in .refused(404) }
         let local = LocalSession(
             credentials: MemoryLocalCredentialStore(), cache: MemorySnapshotCache()
@@ -277,11 +370,14 @@ final class SessionGateTests: XCTestCase {
         let gate = SessionGate(
             makeSession: { rig.session },
             makeLocalSession: { local },
-            preferences: preference
+            preferences: preference,
+            pathMonitor: monitor
         )
         await gate.start()
 
         await gate.selectBackend(.local)
+        monitor.trigger()
+        await Task.yield()
 
         XCTAssertEqual(gate.backend, .local)
         XCTAssertEqual(gate.phase, .unpaired)
