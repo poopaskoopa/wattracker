@@ -296,6 +296,7 @@ final class SessionGateTests: XCTestCase {
         let monitor = FakePathMonitor()
         let cloud = harness(paired: true) { _, _ in .refused(404) }
         let transport = BlockingLocalProbeTransport()
+        let preference = MemoryPreferenceStore()
         let local = LocalSession(
             credentials: MemoryLocalCredentialStore(credential: try? LocalCredential(
                 baseURL: "https://desktop.example", token: "token")),
@@ -311,7 +312,7 @@ final class SessionGateTests: XCTestCase {
         let gate = SessionGate(
             makeSession: { cloud.session },
             makeLocalSession: { local },
-            preferences: MemoryPreferenceStore(),
+            preferences: preference,
             pathMonitor: monitor
         )
 
@@ -413,7 +414,7 @@ final class SessionGateTests: XCTestCase {
 
         XCTAssertEqual(gate.backend, .local)
         XCTAssertEqual(gate.phase, .unpaired)
-        XCTAssertEqual(gate.selection, .automatic)
+        XCTAssertEqual(gate.selection, .local)
         XCTAssertNil(preference.backend)
         XCTAssertNil(gate.lastSuccess)
 
@@ -454,7 +455,7 @@ final class SessionGateTests: XCTestCase {
         await gate.automaticReevaluate()
 
         XCTAssertEqual(gate.backend, .cloud)
-        XCTAssertEqual(gate.selection, .automatic)
+        XCTAssertEqual(gate.selection, .cloud)
         XCTAssertNil(preference.backend)
     }
 
