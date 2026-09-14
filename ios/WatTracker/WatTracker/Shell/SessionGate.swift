@@ -181,7 +181,8 @@ final class SessionGate {
     private var manualOverride: Backend?
     /// The pairing screen's explicit choice is session-local. It is separate
     /// from the persisted Settings override, but automatic selection must
-    /// still respect it until the rider chooses Automatic or another backend.
+    /// still respect it until pairing leaves this flow or the rider chooses a
+    /// different backend.
     private var temporaryOverride: Backend?
     private var selectionGeneration = 0
     private var automaticGeneration = 0
@@ -191,8 +192,7 @@ final class SessionGate {
     private var pathMonitorStarted = false
 
     var selection: Selection {
-        let selected = temporaryOverride ?? manualOverride
-        return selected.map { $0 == .cloud ? .cloud : .local } ?? .automatic
+        manualOverride.map { $0 == .cloud ? .cloud : .local } ?? .automatic
     }
 
     init(
@@ -312,7 +312,6 @@ final class SessionGate {
 
     private func runAutomaticReevaluation(force: Bool = false) async {
         if temporaryOverride != nil {
-            await probeSelectedBackend()
             await refresh()
             return
         }
@@ -393,6 +392,7 @@ final class SessionGate {
     func pair(code: String, label: String?) async throws {
         guard let session else { throw GateFailure.noSession }
         selectionGeneration += 1
+        temporaryOverride = nil
         backend = .cloud
         do {
             try await session.pair(code: code, label: label)
@@ -412,6 +412,7 @@ final class SessionGate {
     func pairLocal(host: String, token: String, label: String?) async throws {
         guard let localSession else { throw GateFailure.noSession }
         selectionGeneration += 1
+        temporaryOverride = nil
         backend = .local
         do {
             try await localSession.pair(host: host, token: token, label: label)
@@ -432,7 +433,6 @@ final class SessionGate {
         temporaryOverride = backend
         self.backend = backend
         await refresh()
-        selectionGeneration += 1
     }
 
     func select(_ selection: Selection) async {
@@ -472,6 +472,8 @@ final class SessionGate {
     /// Revoke this device on the server, then wipe it locally. Both halves are
     /// `CloudSession.removeDevice`'s; this only makes the result visible.
     func removeDevice() async throws {
+        selectionGeneration += 1
+        temporaryOverride = nil
         switch backend {
         case .cloud:
             guard let session else { throw GateFailure.noSession }
@@ -498,6 +500,8 @@ final class SessionGate {
     /// change, and `signOut` is used rather than a direct assignment so the
     /// actor stays the one place that decides what "not paired" means.
     func startOver() async {
+        selectionGeneration += 1
+        temporaryOverride = nil
         switch backend {
         case .cloud:
             if let session { await session.signOut() }

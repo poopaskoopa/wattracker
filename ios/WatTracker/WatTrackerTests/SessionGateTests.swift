@@ -87,6 +87,26 @@ final class SessionGateTests: XCTestCase {
         }
     }
 
+    private func probeLocal(
+        _ transport: LocalProbeTransport,
+        paired: Bool
+    ) -> LocalSession {
+        LocalSession(
+            credentials: paired
+                ? MemoryLocalCredentialStore(credential: try? LocalCredential(
+                    baseURL: "https://desktop.example", token: "token"))
+                : MemoryLocalCredentialStore(),
+            cache: MemorySnapshotCache(),
+            makeClient: { value in
+                try LocalClient(
+                    baseURL: URL(string: value.baseURL)!,
+                    token: value.token,
+                    transport: transport
+                )
+            }
+        )
+    }
+
     private final class BlockingLocalProbeTransport: LocalTransport, @unchecked Sendable {
         let gate = RequestGate()
 
@@ -320,12 +340,12 @@ final class SessionGateTests: XCTestCase {
         guard await transport.gate.waitForArrival(timeout: 1) else {
             return XCTFail("local probe did not start")
         }
-        await gate.selectBackend(.cloud)
+        await gate.select(.cloud)
         await transport.gate.openGate()
         await startTask.value
 
         XCTAssertEqual(gate.backend, .cloud)
-        XCTAssertNil(preference.backend)
+        XCTAssertEqual(preference.backend, .cloud)
     }
 
     func testAnOlderAutomaticProbeCannotOverwriteANewerPathEvaluation() async {
@@ -414,7 +434,7 @@ final class SessionGateTests: XCTestCase {
 
         XCTAssertEqual(gate.backend, .local)
         XCTAssertEqual(gate.phase, .unpaired)
-        XCTAssertEqual(gate.selection, .local)
+        XCTAssertEqual(gate.selection, .automatic)
         XCTAssertNil(preference.backend)
         XCTAssertNil(gate.lastSuccess)
 
@@ -455,8 +475,135 @@ final class SessionGateTests: XCTestCase {
         await gate.automaticReevaluate()
 
         XCTAssertEqual(gate.backend, .cloud)
-        XCTAssertEqual(gate.selection, .cloud)
+        XCTAssertEqual(gate.selection, .automatic)
         XCTAssertNil(preference.backend)
+    }
+
+    func testVProbe1PairAfterToggleKeepsAutomaticContract() async throws {
+        let preference = MemoryPreferenceStore()
+        let monitor = FakePathMonitor()
+        let rig = harness(paired: true) { _, _ in .refused(404) }
+        let transport = LocalProbeTransport()
+        let local = probeLocal(transport, paired: false)
+        let gate = SessionGate(
+            makeSession: { rig.session },
+            makeLocalSession: { local },
+            preferences: preference,
+            pathMonitor: monitor
+        )
+
+        await gate.start()
+        await gate.selectBackend(.local)
+        try await gate.pairLocal(
+            host: "https://desktop.example", token: "token", label: nil
+        )
+        XCTAssertEqual(gate.backend, .local)
+        XCTAssertEqual(gate.phase, .paired)
+        XCTAssertNil(preference.backend)
+        XCTAssertEqual(
+            gate.selection,
+            .automatic,
+            "P1: selection reports a non-persisted choice"
+        )
+
+        transport.setReachable(false)
+        monitor.trigger()
+        await gate.automaticReevaluate()
+        XCTAssertEqual(
+            gate.backend,
+            .cloud,
+            "P1: desktop lost, should fall back to paired cloud"
+        )
+    }
+
+    func testVProbe3RemoveLocalUnderTemporaryOverride() async throws {
+        let preference = MemoryPreferenceStore()
+        let monitor = FakePathMonitor()
+        let rig = harness(paired: true) { _, _ in .refused(404) }
+        let transport = LocalProbeTransport()
+        let local = probeLocal(transport, paired: true)
+        let gate = SessionGate(
+            makeSession: { rig.session },
+            makeLocalSession: { local },
+            preferences: preference,
+            pathMonitor: monitor
+        )
+
+        await gate.start()
+        await gate.automaticReevaluate()
+        await gate.selectBackend(.local)
+        try await gate.removeDevice()
+
+        XCTAssertEqual(gate.backend, .cloud)
+        XCTAssertNotEqual(
+            gate.selection,
+            .local,
+            "P3: selection says Local while backend is cloud"
+        )
+    }
+
+    func testVProbe4OriginalManualSelectionDuringLocalProbe() async {
+        let monitor = FakePathMonitor()
+        let cloud = harness(paired: true) { _, _ in .refused(404) }
+        let transport = BlockingLocalProbeTransport()
+        let local = LocalSession(
+            credentials: MemoryLocalCredentialStore(credential: try? LocalCredential(
+                baseURL: "https://desktop.example", token: "token")),
+            cache: MemorySnapshotCache(),
+            makeClient: { value in
+                try LocalClient(
+                    baseURL: URL(string: value.baseURL)!,
+                    token: value.token,
+                    transport: transport
+                )
+            }
+        )
+        let gate = SessionGate(
+            makeSession: { cloud.session },
+            makeLocalSession: { local },
+            preferences: MemoryPreferenceStore(),
+            pathMonitor: monitor
+        )
+
+        let startTask = Task { await gate.start() }
+        guard await transport.gate.waitForArrival(timeout: 1) else {
+            return XCTFail("local probe did not start")
+        }
+        await gate.select(.cloud)
+        await transport.gate.openGate()
+        await startTask.value
+
+        XCTAssertEqual(gate.backend, .cloud)
+    }
+
+    func testVProbe5AutomaticDuringPairingToggleRefresh() async {
+        let preference = MemoryPreferenceStore()
+        let monitor = FakePathMonitor()
+        let rig = harness(paired: true) { _, _ in .refused(404) }
+        let transport = LocalProbeTransport()
+        let local = probeLocal(transport, paired: true)
+        let gate = SessionGate(
+            makeSession: { rig.session },
+            makeLocalSession: { local },
+            preferences: preference,
+            pathMonitor: monitor
+        )
+
+        await gate.start()
+        await gate.automaticReevaluate()
+        XCTAssertEqual(gate.backend, .local)
+
+        let pairingSelection = Task { await gate.selectBackend(.cloud) }
+        let automaticSelection = Task { await gate.select(.automatic) }
+        await pairingSelection.value
+        await automaticSelection.value
+
+        XCTAssertEqual(gate.selection, .automatic)
+        XCTAssertEqual(
+            gate.backend,
+            .local,
+            "P5: automatic chosen last with reachable desktop"
+        )
     }
 
     func testRemovingLocalFallsBackToPairedCloud() async {
