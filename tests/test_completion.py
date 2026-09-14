@@ -84,6 +84,14 @@ def test_late_completion_grace_boundary(user_id, scheduled, expected):
     assert workout["completed_date"] == ("2026-07-10" if expected else None)
 
 
+def test_late_completion_at_date_max_returns_no_match(user_id):
+    db.save_user_settings(user_id, {"timezone": "Pacific/Kiritimati"})
+    _plan_workout(user_id, "9999-12-31")
+    _activity(user_id, "9999-12-31T23:30:00")
+
+    assert importer.match_plan_completions(user_id, dt.datetime.max) == 0
+
+
 def test_late_candidates_prefer_nearest_workout_then_score(user_id):
     plan_id = db.create_plan(user_id, "P", "2026-07-06", 1)
     monday = db.add_plan_workout(

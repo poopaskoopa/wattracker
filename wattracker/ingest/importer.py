@@ -1395,7 +1395,10 @@ def _match_late_completion_candidates(
     for workout in workouts:
         scheduled = _dt.date.fromisoformat(workout[scheduled_key])
         for lag in range(1, COMPLETION_GRACE_DAYS + 1):
-            activity_date = (scheduled + _dt.timedelta(days=lag)).isoformat()
+            try:
+                activity_date = (scheduled + _dt.timedelta(days=lag)).isoformat()
+            except OverflowError:
+                break
             for activity in activities_by_date.get(activity_date, []):
                 if activity["id"] in used:
                     continue
