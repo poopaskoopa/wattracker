@@ -776,3 +776,21 @@ def test_v37_corrects_utc_prefix_date_for_evening_ride(user_id):
     stored = db.get_plan_workout(user_id, workout_id)
     assert stored["date"] == stored["completed_date"] == "2026-07-15"
     assert importer.plan_workout_completion_verified(user_id, stored)
+
+
+def test_v37_skips_unrepresentable_timezone_conversion(user_id):
+    workout_id, activity_id = _rollover_completion(
+        user_id, "America/New_York", "0001-01-01T00:30:00"
+    )
+    db.mark_plan_workout_completed(
+        user_id, workout_id, activity_id, "0001-01-01"
+    )
+    with db.connect() as conn:
+        before = dict(conn.execute("SELECT * FROM plan_workouts").fetchone())
+        conn.execute("PRAGMA user_version=36")
+
+    db.init_db()
+
+    with db.connect() as conn:
+        assert conn.execute("PRAGMA user_version").fetchone()[0] == 37
+        assert dict(conn.execute("SELECT * FROM plan_workouts").fetchone()) == before
