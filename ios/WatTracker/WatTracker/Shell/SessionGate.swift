@@ -145,6 +145,8 @@ final class SessionGate {
     private let preferences: PreferenceStore
     private let pathMonitor: SessionPathMonitor
     private var manualOverride = false
+    private var selectionGeneration = 0
+    private var automaticGeneration = 0
 
     init(
         makeSession: @escaping @Sendable () throws -> CloudSession = SessionGate.liveSession,
@@ -226,24 +228,47 @@ final class SessionGate {
             phase = .unusable(String(describing: cloudError ?? GateFailure.noSession))
             return
         }
+        await automaticReevaluate()
+        preferences.saveBackend(backend)
         pathMonitor.start { [weak self] in
             Task { @MainActor in await self?.automaticReevaluate() }
         }
-        await automaticReevaluate()
     }
 
     /// Prefer the already paired desktop when its endpoint answers. No host
     /// discovery occurs; LocalSession probes only its stored credential.
     func automaticReevaluate() async {
         guard phase == .starting || phase == .paired else { return }
+        automaticGeneration += 1
+        let automaticGeneration = self.automaticGeneration
+        let selectionGeneration = self.selectionGeneration
         guard !manualOverride else {
             await probeSelectedBackend()
+            guard automaticGeneration == self.automaticGeneration,
+                  selectionGeneration == self.selectionGeneration
+            else {
+                await refresh()
+                return
+            }
             await refresh()
             return
         }
         let localPaired = await localSession?.deviceState == .paired
         let cloudPaired = await session?.deviceState == .paired
-        if localPaired, let localSession, await localSession.probe() {
+        let localReachable: Bool
+        if localPaired, let localSession {
+            localReachable = await localSession.probe()
+        } else {
+            localReachable = false
+        }
+        guard !manualOverride,
+              automaticGeneration == self.automaticGeneration,
+              selectionGeneration == self.selectionGeneration
+        else {
+            await refresh()
+            return
+        }
+        if localReachable {
             backend = .local
         } else if cloudPaired {
             backend = .cloud
@@ -288,6 +313,7 @@ final class SessionGate {
     /// through `PairingFailureMessage` and never directly.
     func pair(code: String, label: String?) async throws {
         guard let session else { throw GateFailure.noSession }
+        selectionGeneration += 1
         backend = .cloud
         do {
             try await session.pair(code: code, label: label)
@@ -308,6 +334,7 @@ final class SessionGate {
     /// cookie it receives from the desktop.
     func pairLocal(host: String, token: String, label: String?) async throws {
         guard let localSession else { throw GateFailure.noSession }
+        selectionGeneration += 1
         backend = .local
         do {
             try await localSession.pair(host: host, token: token, label: label)
@@ -321,6 +348,7 @@ final class SessionGate {
     }
 
     func selectBackend(_ backend: Backend) async {
+        selectionGeneration += 1
         let candidate: (any ReadSession)? = backend == .cloud ? session : localSession
         guard let candidate else { return }
         let isPaired = await candidate.deviceState == .paired
