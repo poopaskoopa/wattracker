@@ -1455,11 +1455,15 @@ def match_plan_workout_completion(
 
     if best is None:
         return False
+    started = parse_naive(best[0].get("start_time"))
+    if started is None:
+        return False
+    timezone = db.get_user_settings(user_id).get("timezone")
     return db.mark_plan_workout_completed(
         user_id,
         workout_id,
         best[0]["id"],
-        workout["date"],
+        to_user_timezone(started, timezone).date().isoformat(),
         best[1],
         best[2],
     )
@@ -1485,12 +1489,11 @@ def link_selected_plan_workout(
         or activity_id in db.completed_activity_ids(user_id)
     ):
         return False
-    try:
-        completed_date = _dt.datetime.fromisoformat(
-            str(activity.get("start_time") or "")
-        ).date().isoformat()
-    except (TypeError, ValueError):
+    started = parse_naive(activity.get("start_time"))
+    if started is None:
         return False
+    timezone = db.get_user_settings(user_id).get("timezone")
+    completed_date = to_user_timezone(started, timezone).date().isoformat()
 
     compliance = effective = None
     if completed_date == workout.get("date"):
@@ -1542,6 +1545,10 @@ def manually_complete_plan_workout(user_id: int, workout_id: int) -> str:
             int(activity["id"]),
         ),
     )
+    started = parse_naive(best.get("start_time"))
+    if started is None:
+        return "no_activity"
+    timezone = db.get_user_settings(user_id).get("timezone")
     activity = db.get_activity(user_id, best["id"])
     evidence = _profile_evidence(activity or {}, workout)
     compliance = effective = None
@@ -1551,7 +1558,7 @@ def manually_complete_plan_workout(user_id: int, workout_id: int) -> str:
         user_id,
         workout_id,
         best["id"],
-        workout["date"],
+        to_user_timezone(started, timezone).date().isoformat(),
         compliance,
         effective,
     ):

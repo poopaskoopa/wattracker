@@ -626,3 +626,153 @@ def test_lifespan_starts_scan_task_when_enabled(monkeypatch):
 
             time.sleep(0.01)
     assert calls, "startup sweep should run once when auto-scan is enabled"
+
+
+ROLLOVER_CASES = [
+    ("America/New_York", "2026-07-16T00:30:00", "2026-07-15"),
+    ("Pacific/Auckland", "2026-07-15T23:30:00", "2026-07-16"),
+]
+
+
+def _rollover_completion(user_id, timezone, started, *, weak=False):
+    db.save_user_settings(user_id, {"timezone": timezone})
+    session = build_workout("threshold", 60)
+    xml = zwo.zwo_string(session)
+    profile = importer._zwo_fraction_profile(xml)
+    plan_id = db.create_plan(user_id, "Rollover", "2026-07-15", 1)
+    workout_id = db.add_plan_workout(
+        plan_id, user_id, "2026-07-15", session.name, "threshold",
+        session.total_duration(), session.estimated_tss, xml,
+    )
+    activity_id = db.insert_activity(user_id, {
+        "dedup_hash": "rollover", "filename": "rollover.fit",
+        "start_time": started, "duration_s": len(profile),
+        "distance_m": 0, "avg_power": 210, "avg_hr": None,
+        "np": 210, "if_": 1, "tss": session.estimated_tss,
+        "streams": {"power": [0 if weak else p * 210 for p in profile]},
+    })
+    return workout_id, activity_id
+
+
+@pytest.mark.parametrize("timezone,started,local_date", ROLLOVER_CASES)
+@pytest.mark.parametrize("weak", [False, True])
+def test_v37_completion_dates_preserve_evidence_and_backup(
+    user_id, timezone, started, local_date, weak
+):
+    from wattracker import backup
+
+    workout_id, activity_id = _rollover_completion(
+        user_id, timezone, started, weak=weak
+    )
+    db.mark_plan_workout_completed(
+        user_id, workout_id, activity_id, "2026-07-15", .95, 210
+    )
+    with db.connect() as conn:
+        conn.execute("UPDATE plan_workouts SET rpe=7 WHERE id=?", (workout_id,))
+        before = dict(conn.execute("SELECT * FROM plan_workouts").fetchone())
+        conn.execute("PRAGMA user_version=36")
+    assert importer.plan_workout_completion_verified(
+        user_id, db.get_plan_workout(user_id, workout_id)
+    ) == (not weak and local_date == "2026-07-15")
+
+    db.init_db()
+
+    with db.connect() as conn:
+        assert conn.execute("PRAGMA user_version").fetchone()[0] == 37
+        after = dict(conn.execute("SELECT * FROM plan_workouts").fetchone())
+        assert after == {**before, "completed_date": local_date}
+        changes = conn.total_changes
+        db._backfill_plan_completion_dates(conn)
+        assert conn.total_changes == changes
+    assert importer.plan_workout_completion_verified(
+        user_id, db.get_plan_workout(user_id, workout_id)
+    ) == (not weak)
+    snapshots = backup.list_backups()
+    assert len(snapshots) == 1
+    assert snapshots[0]["reason"] == "pre-migration"
+    with db.connect(snapshots[0]["path"]) as conn:
+        assert conn.execute("PRAGMA user_version").fetchone()[0] == 36
+        assert dict(conn.execute("SELECT * FROM plan_workouts").fetchone()) == before
+    db.init_db()
+    assert backup.list_backups() == snapshots
+
+
+@pytest.mark.parametrize("failure", ["missing", "other_user", "unparseable", "null", "unlinked"])
+def test_v37_leaves_unusable_completion_links_untouched(user_id, failure):
+    workout_id, activity_id = _rollover_completion(user_id, *ROLLOVER_CASES[1][:2])
+    other = db.create_user("other-rollover", "hash")
+    db.mark_plan_workout_completed(user_id, workout_id, activity_id, "2026-07-15")
+    with db.connect() as conn:
+        if failure == "missing":
+            conn.execute("DELETE FROM activities WHERE id=?", (activity_id,))
+        elif failure == "other_user":
+            conn.execute("UPDATE activities SET user_id=? WHERE id=?", (other, activity_id))
+        elif failure in ("unparseable", "null"):
+            conn.execute("UPDATE activities SET start_time=? WHERE id=?",
+                         ("bad date" if failure == "unparseable" else None, activity_id))
+        else:
+            conn.execute("UPDATE plan_workouts SET completed_activity_id=NULL")
+        before = dict(conn.execute("SELECT * FROM plan_workouts").fetchone())
+        conn.execute("PRAGMA user_version=36")
+    db.init_db()
+    with db.connect() as conn:
+        assert dict(conn.execute("SELECT * FROM plan_workouts").fetchone()) == before
+
+
+def test_v37_backup_failure_preserves_legacy_row(user_id, monkeypatch):
+    from wattracker import backup
+
+    workout_id, activity_id = _rollover_completion(user_id, *ROLLOVER_CASES[1][:2])
+    db.mark_plan_workout_completed(user_id, workout_id, activity_id, "2026-07-15")
+    with db.connect() as conn:
+        conn.execute("PRAGMA user_version=36")
+        before = dict(conn.execute("SELECT * FROM plan_workouts").fetchone())
+
+    def fail_backup(*args, **kwargs):
+        raise OSError("disk full")
+
+    monkeypatch.setattr(backup, "create_backup", fail_backup)
+    with pytest.raises(OSError, match="disk full"):
+        db.init_db()
+    with db.connect() as conn:
+        assert conn.execute("PRAGMA user_version").fetchone()[0] == 36
+        assert dict(conn.execute("SELECT * FROM plan_workouts").fetchone()) == before
+
+
+@pytest.mark.parametrize("timezone,started,local_date", ROLLOVER_CASES)
+@pytest.mark.parametrize("writer", ["explicit", "calendar", "manual"])
+def test_completion_writers_store_local_activity_date(
+    user_id, timezone, started, local_date, writer
+):
+    workout_id, activity_id = _rollover_completion(user_id, timezone, started)
+    # Calendar/manual selection uses the existing UTC-day lookup. Preserve
+    # that selection behavior while fixing the persisted completion date.
+    if writer != "explicit":
+        with db.connect() as conn:
+            conn.execute("UPDATE plan_workouts SET date=? WHERE id=?",
+                         (started[:10], workout_id))
+    if writer == "explicit":
+        assert importer.link_selected_plan_workout(user_id, workout_id, activity_id)
+    elif writer == "calendar":
+        assert importer.match_plan_workout_completion(
+            user_id, workout_id, dt.date.fromisoformat(started[:10])
+        )
+    else:
+        assert importer.manually_complete_plan_workout(user_id, workout_id) == "completed"
+    stored = db.get_plan_workout(user_id, workout_id)
+    assert stored["completed_activity_id"] == activity_id
+    assert stored["completed_date"] == local_date
+
+
+def test_v37_corrects_utc_prefix_date_for_evening_ride(user_id):
+    workout_id, activity_id = _rollover_completion(user_id, *ROLLOVER_CASES[0][:2])
+    db.mark_plan_workout_completed(user_id, workout_id, activity_id, "2026-07-16")
+    assert not importer.plan_workout_completion_verified(
+        user_id, db.get_plan_workout(user_id, workout_id)
+    )
+    with db.connect() as conn:
+        conn.execute("PRAGMA user_version=36")
+    db.init_db()
+    stored = db.get_plan_workout(user_id, workout_id)
+    assert stored["date"] == stored["completed_date"] == "2026-07-15"
+    assert importer.plan_workout_completion_verified(user_id, stored)
