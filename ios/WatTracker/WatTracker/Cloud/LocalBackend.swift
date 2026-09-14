@@ -437,17 +437,37 @@ actor LocalSession: ReadSession {
         lastSuccessfulRead = nil
     }
 
-    func probe() async {
-        guard state == .paired else { return }
+    /// Check the stored desktop without allowing an unavailable endpoint to
+    /// hold backend selection up. The credential and cache are only changed by
+    /// the existing repeated-401 removal path.
+    func probe(timeout: TimeInterval = 3) async -> Bool {
+        guard state == .paired else { return false }
+        return await withTaskGroup(of: Bool.self) { group in
+            group.addTask { await self.probeOnce() }
+            group.addTask {
+                let nanos = UInt64(max(0, timeout) * 1_000_000_000)
+                try? await Task.sleep(nanoseconds: nanos)
+                return false
+            }
+            let result = await group.next() ?? false
+            group.cancelAll()
+            return result
+        }
+    }
+
+    private func probeOnce() async -> Bool {
         let generation = lifecycleGeneration
         do {
             _ = try await perform { try await $0.trainingState() }
-            guard lifecycleGeneration == generation, state == .paired else { return }
+            guard lifecycleGeneration == generation, state == .paired else { return false }
             lastSuccessfulRead = clock()
+            return true
         } catch LocalClient.Failure.unauthorized {
             markRemoved()
+            return false
         } catch {
             // A temporary local outage must not erase a still-valid token.
+            return false
         }
     }
 
