@@ -31,7 +31,7 @@ from .timeutil import (
 
 _log = logging.getLogger(__name__)
 
-SCHEMA_VERSION = 36
+SCHEMA_VERSION = 37
 
 
 def _restrict_db_files(path: str) -> None:
@@ -272,6 +272,28 @@ def _backfill_weight_history(conn: sqlite3.Connection) -> None:
         )
 
 
+def _backfill_plan_completion_dates(conn: sqlite3.Connection) -> None:
+    """v36 -> v37: reconcile UTC-prefix completion dates with rider-local dates."""
+    zones = _user_timezones(conn)
+    rows = conn.execute(
+        "SELECT w.id, w.user_id, w.completed_date, a.start_time "
+        "FROM plan_workouts w JOIN activities a "
+        "ON a.id = w.completed_activity_id AND a.user_id = w.user_id"
+    ).fetchall()
+    for row in rows:
+        started = parse_naive(row["start_time"])
+        if started is None:
+            continue
+        completed = to_user_timezone(
+            started, zones.get(row["user_id"])
+        ).date().isoformat()
+        if row["completed_date"] != completed:
+            conn.execute(
+                "UPDATE plan_workouts SET completed_date=? WHERE id=?",
+                (completed, row["id"]),
+            )
+
+
 # In-place migrations: version N -> N+1 statement lists. A database whose
 # version has an unbroken chain here is upgraded without losing live data.
 # (Brand-new tables need no ALTERs - init_db runs _SCHEMA after migrating - but
@@ -464,6 +486,7 @@ _MIGRATIONS: Dict[int, Sequence[Union[str, Callable[[sqlite3.Connection], None]]
         # New per-user cloud sync state is created by _SCHEMA after migrating.
         # It contains no credentials or source data to backfill.
     ],
+    36: [_backfill_plan_completion_dates],
 }
 
 _DROP = """
