@@ -77,6 +77,29 @@ final class SessionGateTests: XCTestCase {
         }
     }
 
+    private final class BlockingLocalProbeTransport: LocalTransport, @unchecked Sendable {
+        let gate = RequestGate()
+
+        func send(_ request: URLRequest) async throws -> LocalResponse {
+            await gate.wait()
+            if request.url?.path == "/api/connector/session" {
+                return LocalResponse(
+                    status: 200, body: Data(#"{"ticket":"ticket"}"#.utf8),
+                    url: request.url!
+                )
+            }
+            if request.url?.path == "/connector/session" {
+                return LocalResponse(
+                    status: 303, body: Data(), url: request.url!, location: "/",
+                    setCookie: "session=authenticated; Secure; HttpOnly"
+                )
+            }
+            return LocalResponse(
+                status: 200, body: Data(#"{"ftp":250}"#.utf8), url: request.url!
+            )
+        }
+    }
+
     private func harness(
         paired: Bool,
         clock: TestClock = TestClock(),
@@ -202,6 +225,40 @@ final class SessionGateTests: XCTestCase {
         XCTAssertEqual(gate.backend, .cloud)
     }
 
+    func testManualSelectionDuringLocalProbeCannotBeOverwritten() async {
+        let monitor = FakePathMonitor()
+        let cloud = harness(paired: true) { _, _ in .refused(404) }
+        let transport = BlockingLocalProbeTransport()
+        let local = LocalSession(
+            credentials: MemoryLocalCredentialStore(credential: try? LocalCredential(
+                baseURL: "https://desktop.example", token: "token")),
+            cache: MemorySnapshotCache(),
+            makeClient: { value in
+                try LocalClient(
+                    baseURL: URL(string: value.baseURL)!,
+                    token: value.token,
+                    transport: transport
+                )
+            }
+        )
+        let gate = SessionGate(
+            makeSession: { cloud.session },
+            makeLocalSession: { local },
+            preferences: MemoryPreferenceStore(),
+            pathMonitor: monitor
+        )
+
+        let startTask = Task { await gate.start() }
+        guard await transport.gate.waitForArrival(timeout: 1) else {
+            return XCTFail("local probe did not start")
+        }
+        await gate.selectBackend(.cloud)
+        await transport.gate.openGate()
+        await startTask.value
+
+        XCTAssertEqual(gate.backend, .cloud)
+    }
+
     func testInjectedPreferenceStoreRestoresOnlyTheBackendValue() {
         let preference = MemoryPreferenceStore(.local)
 
@@ -244,21 +301,33 @@ final class SessionGateTests: XCTestCase {
     func testRemovingLocalFallsBackToPairedCloud() async {
         let preference = MemoryPreferenceStore(.local)
         let cloud = harness(paired: true) { _, _ in .refused(404) }
+        let monitor = FakePathMonitor()
+        let transport = LocalProbeTransport()
+        transport.setReachable(false)
         let local = LocalSession(
             credentials: MemoryLocalCredentialStore(
                 credential: try? LocalCredential(
                     baseURL: "https://desktop.example", token: "token"
                 )
             ),
-            cache: MemorySnapshotCache()
+            cache: MemorySnapshotCache(),
+            makeClient: { value in
+                try LocalClient(
+                    baseURL: URL(string: value.baseURL)!,
+                    token: value.token,
+                    transport: transport
+                )
+            }
         )
         let gate = SessionGate(
             makeSession: { cloud.session },
             makeLocalSession: { local },
-            preferences: preference
+            preferences: preference,
+            pathMonitor: monitor
         )
         await gate.start()
 
+        await gate.selectBackend(.local)
         try? await gate.removeDevice()
 
         XCTAssertEqual(gate.backend, .cloud)

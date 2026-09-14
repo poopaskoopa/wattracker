@@ -325,9 +325,9 @@ struct LocalClient: Sendable {
 /// The local session adapts the desktop JSON endpoints to the same snapshots
 /// consumed by the cloud-backed screen models.
 actor LocalSession: ReadSession {
-    private enum ProbeResult {
-        case reachable
-        case unauthorized
+    private enum ProbeResult: Sendable {
+        case reachable(generation: Int)
+        case unauthorized(generation: Int)
         case transient
     }
 
@@ -351,10 +351,16 @@ actor LocalSession: ReadSession {
             if shouldCancel { operation.cancel(); timeout.cancel() }
         }
 
-        func finish(_ value: Bool) {
+        func claim() -> Bool {
             lock.lock()
-            guard !finished else { lock.unlock(); return }
+            guard !finished else { lock.unlock(); return false }
             finished = true
+            lock.unlock()
+            return true
+        }
+
+        func resolve(_ value: Bool) {
+            lock.lock()
             let continuation = self.continuation
             self.continuation = nil
             let operation = self.operation
@@ -488,13 +494,29 @@ actor LocalSession: ReadSession {
                 let race = ProbeRace(continuation)
                 let operation = Task {
                     let result = await self.probeOnce()
-                    race.finish(result == .reachable)
-                    if result == .unauthorized { await self.removeAfterProbe() }
+                    guard race.claim() else { return }
+                    switch result {
+                    case let .reachable(generation):
+                        guard self.lifecycleGeneration == generation,
+                              self.state == .paired
+                        else {
+                            race.resolve(false)
+                            return
+                        }
+                        self.lastSuccessfulRead = self.clock()
+                        race.resolve(true)
+                    case let .unauthorized(generation):
+                        self.removeAfterProbe(generation: generation)
+                        race.resolve(false)
+                    case .transient:
+                        race.resolve(false)
+                    }
                 }
                 let timer = Task {
                     let nanos = UInt64(max(0, timeout) * 1_000_000_000)
                     try? await Task.sleep(nanoseconds: nanos)
-                    race.finish(false)
+                    guard race.claim() else { return }
+                    race.resolve(false)
                 }
                 race.install(operation: operation, timeout: timer)
             }
@@ -502,8 +524,8 @@ actor LocalSession: ReadSession {
         return result
     }
 
-    private func removeAfterProbe() {
-        guard state == .paired else { return }
+    private func removeAfterProbe(generation: Int) {
+        guard lifecycleGeneration == generation, state == .paired else { return }
         markRemoved()
     }
 
@@ -511,11 +533,15 @@ actor LocalSession: ReadSession {
         let generation = lifecycleGeneration
         do {
             _ = try await perform { try await $0.trainingState() }
-            guard lifecycleGeneration == generation, state == .paired else { return .transient }
-            lastSuccessfulRead = clock()
-            return .reachable
+            guard lifecycleGeneration == generation, state == .paired else {
+                return .transient
+            }
+            return .reachable(generation: generation)
         } catch LocalClient.Failure.unauthorized {
-            return .unauthorized
+            guard lifecycleGeneration == generation, state == .paired else {
+                return .transient
+            }
+            return .unauthorized(generation: generation)
         } catch {
             // A temporary local outage must not erase a still-valid token.
             return .transient
