@@ -423,6 +423,7 @@ final class SessionGateTests: XCTestCase {
             pathMonitor: monitor
         )
         await gate.start()
+        await gate.automaticReevaluate()
 
         await gate.selectBackend(.local)
         try? await gate.removeDevice()
