@@ -6,6 +6,10 @@ simulator is not a substitute: it has no Secure Enclave, so
 `DeviceKeyStore` silently takes the software-key fallback there and the
 Enclave branch never executes.
 
+This is the currently supported iOS-only physical-device procedure. It uses
+the Debug-only plain-HTTP LAN harness; Android device networking and validation
+are intentionally deferred until #194 adds an Android network client.
+
 ## Point the app at a server first
 
 - Start the local harness with `--lan`:
