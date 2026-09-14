@@ -1266,14 +1266,9 @@ def plan_workout_completion_verified(user_id: int, workout: dict) -> bool:
         return False
     timezone = db.get_user_settings(user_id).get("timezone")
     activity_date = _completion_activity_date(started, timezone)
-    lag = (completed - scheduled).days
-    # Legacy matching used the stored UTC day. v37 corrects completed_date
-    # to the local day, which can precede that scheduled UTC day by one.
-    # Accept only that rollover, not an arbitrary ride before the workout.
-    legacy_rollover = lag == -1 and started.date() == scheduled
     if (
         activity_date != completed
-        or not (0 <= lag <= COMPLETION_GRACE_DAYS or legacy_rollover)
+        or not 0 <= (completed - scheduled).days <= COMPLETION_GRACE_DAYS
     ):
         return False
     duration_error = abs(float(activity.get("duration_s") or 0) - duration) / duration
