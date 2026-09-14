@@ -462,6 +462,60 @@ def test_same_count_activity_edit_invalidates_snapshot_gate(tmp_path):
         sync.stop()
 
 
+def test_source_write_racing_success_baseline_is_published_next_cycle(
+    tmp_path, monkeypatch,
+):
+    path, user_id = _fixture_db(tmp_path, count=1)
+    store = CloudCredentialStore(MemorySecrets())
+    store.save_writer(_credentials(), user_id=user_id)
+    calls = []
+
+    def transport(_url, _headers, body):
+        calls.append(json.loads(body))
+        return 200, b'{"revision":1}'
+
+    sync = DesktopCloudSync(
+        str(path), store, transport=transport, include_derived=False,
+    )
+    db.save_cloud_sync_state(
+        user_id, {"endpoint": "https://cloud.example", "enabled": True},
+        path=str(path),
+    )
+
+    original_record_success = sync._record_success
+    raced = False
+
+    def race_before_success_capture(uid, *args):
+        nonlocal raced
+        if not raced:
+            raced = True
+            db.insert_activity(
+                user_id,
+                {
+                    "dedup_hash": "desktop-cloud-2",
+                    "filename": "ride-2.fit",
+                    "start_time": "2026-08-02T10:00:00",
+                    "duration_s": 60,
+                    "distance_m": 1000.0,
+                    "avg_power": 220.0,
+                    "avg_hr": 145.0,
+                },
+                path=str(path),
+            )
+        original_record_success(uid, *args)
+
+    monkeypatch.setattr(sync, "_record_success", race_before_success_capture)
+    try:
+        assert sync.sync_once(user_id)[0].ok
+        assert raced
+
+        assert sync.sync_once(user_id)[0].ok
+        assert len(calls) == 2
+        assert [obj["id"] for obj in calls[1]["objects"]] == ["activity-2"]
+    finally:
+        sync.stop()
+
+
 def test_derived_snapshot_gate_expires_when_calendar_day_changes(
     tmp_path, monkeypatch,
 ):

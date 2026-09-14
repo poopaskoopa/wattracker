@@ -160,18 +160,24 @@ class DesktopCloudSync:
             self.derived_first,
         )
 
+    def _snapshot_gate_connection_locked(self) -> sqlite3.Connection:
+        connection = self._snapshot_gate_connection
+        if connection is None:
+            connection = sqlite3.connect(
+                self.path,
+                timeout=10,
+                check_same_thread=False,
+            )
+            connection.row_factory = sqlite3.Row
+            connection.execute("PRAGMA busy_timeout=10000")
+            self._snapshot_gate_connection = connection
+        return connection
+
     def _snapshot_gate_token(self, user_id: int) -> Optional[tuple[int, bool]]:
         with self._snapshot_gate_lock:
-            connection = self._snapshot_gate_connection
+            connection = None
             try:
-                if connection is None:
-                    connection = sqlite3.connect(
-                        db.read_only_uri(self.path),
-                        uri=True,
-                        check_same_thread=False,
-                    )
-                    connection.row_factory = sqlite3.Row
-                    self._snapshot_gate_connection = connection
+                connection = self._snapshot_gate_connection_locked()
                 return snapshot_change_token(connection, user_id)
             except (OSError, sqlite3.Error):
                 if connection is not None:
@@ -182,8 +188,8 @@ class DesktopCloudSync:
                 self._snapshot_gate_connection = None
                 return None
 
-    def _snapshot_gate_validity(
-        self, user_id: int,
+    def _snapshot_gate_validity_locked(
+        self, connection: sqlite3.Connection, user_id: int,
     ) -> Optional[tuple[float, Optional[float]]]:
         if not self.include_derived:
             return None
@@ -202,17 +208,13 @@ class DesktopCloudSync:
         # which can happen within a day. Reading timestamps after a successful
         # rebuild is cheap compared with decoding every stream, and lets the
         # gate remain valid until the first possible derived-object change.
-        with self._snapshot_gate_lock:
-            connection = self._snapshot_gate_connection
-            if connection is None:
-                return now_epoch, now_epoch
-            try:
-                rows = connection.execute(
-                    "SELECT start_time FROM activities WHERE user_id = ?",
-                    (user_id,),
-                ).fetchall()
-            except sqlite3.Error:
-                return now_epoch, now_epoch
+        try:
+            rows = connection.execute(
+                "SELECT start_time FROM activities WHERE user_id = ?",
+                (user_id,),
+            ).fetchall()
+        except sqlite3.Error:
+            return now_epoch, now_epoch
         for row in rows:
             started = parse_naive(row["start_time"])
             if started is None:
@@ -248,16 +250,6 @@ class DesktopCloudSync:
         now = self.clock()
         return now < next_midnight and (
             next_curve_expiry is None or now <= next_curve_expiry
-        )
-
-    def _snapshot_gate_mark_current(self, user_id: int) -> None:
-        token = self._snapshot_gate_token(user_id)
-        if token is None or token[1]:
-            self._snapshot_gate_baseline.pop(user_id, None)
-            return
-        self._snapshot_gate_baseline[user_id] = (
-            token[0], self._snapshot_gate_options(),
-            self._snapshot_gate_validity(user_id),
         )
 
     def _close_snapshot_gate(self) -> None:
@@ -388,17 +380,42 @@ class DesktopCloudSync:
             path=self.path,
         )
 
-    def _record_success(self, user_id: int) -> None:
-        db.save_cloud_sync_state(
-            user_id,
-            {
-                "last_success_at": self.clock(),
-                "retry_count": 0,
-                "next_retry_at": None,
-                "last_error": None,
-            },
-            path=self.path,
-        )
+    def _record_success(
+        self, user_id: int, snapshot_token: Optional[tuple[int, bool]],
+    ) -> None:
+        with self._snapshot_gate_lock:
+            connection = None
+            try:
+                connection = self._snapshot_gate_connection_locked()
+                connection.execute("BEGIN IMMEDIATE")
+                connection.execute(
+                    "UPDATE cloud_sync_state SET last_success_at = ?, "
+                    "retry_count = 0, next_retry_at = NULL, last_error = NULL "
+                    "WHERE user_id = ?",
+                    (self.clock(), user_id),
+                )
+                token = snapshot_change_token(connection, user_id)
+                validity = self._snapshot_gate_validity_locked(
+                    connection, user_id,
+                )
+                connection.commit()
+            except Exception:
+                if connection is not None:
+                    try:
+                        connection.rollback()
+                        connection.close()
+                    except sqlite3.Error:
+                        pass
+                self._snapshot_gate_connection = None
+                self._snapshot_gate_baseline.pop(user_id, None)
+                raise
+
+            if token is None or token[1] or token != snapshot_token:
+                self._snapshot_gate_baseline.pop(user_id, None)
+            else:
+                self._snapshot_gate_baseline[user_id] = (
+                    token[0], self._snapshot_gate_options(), validity,
+                )
 
     def sync_once(self, user_id: int) -> list[SyncResult]:
         """Drain prepared snapshot pages while the local kill switch remains on."""
@@ -407,6 +424,15 @@ class DesktopCloudSync:
             return []
         if self._snapshot_gate_unchanged(user_id):
             return []
+        snapshot_token = None
+
+        def should_continue() -> bool:
+            nonlocal snapshot_token
+            if not self._state_enabled(user_id):
+                return False
+            snapshot_token = self._snapshot_gate_token(user_id)
+            return True
+
         try:
             client = self._client(user_id)
             results = client.push_snapshot(
@@ -416,7 +442,7 @@ class DesktopCloudSync:
                 include_streams=self.include_streams,
                 include_derived=self.include_derived,
                 derived_first=self.derived_first,
-                should_continue=lambda: self._state_enabled(user_id),
+                should_continue=should_continue,
             )
         except (CloudCredentialUnavailable, CloudEnrollmentError, SnapshotError, ValueError) as exc:
             if self._state_enabled(user_id):
@@ -426,8 +452,7 @@ class DesktopCloudSync:
             return results
         failed = next((result for result in results if not result.ok), None)
         if failed is None:
-            self._record_success(user_id)
-            self._snapshot_gate_mark_current(user_id)
+            self._record_success(user_id, snapshot_token)
         else:
             self._record_failure(user_id, self._error_text(failed))
         return results
