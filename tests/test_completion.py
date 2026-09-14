@@ -634,14 +634,14 @@ ROLLOVER_CASES = [
 ]
 
 
-def _rollover_completion(user_id, timezone, started, *, weak=False):
+def _rollover_completion(user_id, timezone, started, *, weak=False, scheduled="2026-07-15"):
     db.save_user_settings(user_id, {"timezone": timezone})
     session = build_workout("threshold", 60)
     xml = zwo.zwo_string(session)
     profile = importer._zwo_fraction_profile(xml)
-    plan_id = db.create_plan(user_id, "Rollover", "2026-07-15", 1)
+    plan_id = db.create_plan(user_id, "Rollover", scheduled, 1)
     workout_id = db.add_plan_workout(
-        plan_id, user_id, "2026-07-15", session.name, "threshold",
+        plan_id, user_id, scheduled, session.name, "threshold",
         session.total_duration(), session.estimated_tss, xml,
     )
     activity_id = db.insert_activity(user_id, {
@@ -662,10 +662,10 @@ def test_v37_completion_dates_preserve_evidence_and_backup(
     from wattracker import backup
 
     workout_id, activity_id = _rollover_completion(
-        user_id, timezone, started, weak=weak
+        user_id, timezone, started, weak=weak, scheduled=started[:10]
     )
     db.mark_plan_workout_completed(
-        user_id, workout_id, activity_id, "2026-07-15", .95, 210
+        user_id, workout_id, activity_id, started[:10], .95, 210
     )
     with db.connect() as conn:
         conn.execute("UPDATE plan_workouts SET rpe=7 WHERE id=?", (workout_id,))
@@ -673,7 +673,7 @@ def test_v37_completion_dates_preserve_evidence_and_backup(
         conn.execute("PRAGMA user_version=36")
     assert importer.plan_workout_completion_verified(
         user_id, db.get_plan_workout(user_id, workout_id)
-    ) == (not weak and local_date == "2026-07-15")
+    ) is False
 
     db.init_db()
 
@@ -765,7 +765,9 @@ def test_completion_writers_store_local_activity_date(
 
 
 def test_v37_corrects_utc_prefix_date_for_evening_ride(user_id):
-    workout_id, activity_id = _rollover_completion(user_id, *ROLLOVER_CASES[0][:2])
+    workout_id, activity_id = _rollover_completion(
+        user_id, *ROLLOVER_CASES[0][:2], scheduled="2026-07-16"
+    )
     db.mark_plan_workout_completed(user_id, workout_id, activity_id, "2026-07-16")
     assert not importer.plan_workout_completion_verified(
         user_id, db.get_plan_workout(user_id, workout_id)
@@ -774,7 +776,8 @@ def test_v37_corrects_utc_prefix_date_for_evening_ride(user_id):
         conn.execute("PRAGMA user_version=36")
     db.init_db()
     stored = db.get_plan_workout(user_id, workout_id)
-    assert stored["date"] == stored["completed_date"] == "2026-07-15"
+    assert stored["date"] == "2026-07-16"
+    assert stored["completed_date"] == "2026-07-15"
     assert importer.plan_workout_completion_verified(user_id, stored)
 
 
@@ -794,3 +797,66 @@ def test_v37_skips_unrepresentable_timezone_conversion(user_id):
     with db.connect() as conn:
         assert conn.execute("PRAGMA user_version").fetchone()[0] == 37
         assert dict(conn.execute("SELECT * FROM plan_workouts").fetchone()) == before
+
+
+@pytest.mark.parametrize("failure", ["early_utc", "two_days_early", "duration", "profile", "missing_power", "wrong_completed_date", "other_user"])
+def test_rollover_verification_keeps_date_and_evidence_guards(user_id, failure):
+    started = "2026-07-15T12:30:00" if failure == "early_utc" else "2026-07-16T00:30:00"
+    scheduled = "2026-07-17" if failure == "two_days_early" else "2026-07-16"
+    workout_id, activity_id = _rollover_completion(
+        user_id, "America/New_York", started, scheduled=scheduled,
+        weak=failure == "profile",
+    )
+    completed = "2026-07-16" if failure == "wrong_completed_date" else "2026-07-15"
+    db.mark_plan_workout_completed(user_id, workout_id, activity_id, completed, .95, 210)
+    with db.connect() as conn:
+        if failure == "duration":
+            conn.execute("UPDATE activities SET duration_s=60 WHERE id=?", (activity_id,))
+        elif failure == "missing_power":
+            conn.execute("UPDATE activities SET streams=NULL WHERE id=?", (activity_id,))
+        elif failure == "other_user":
+            other = db.create_user("other-evidence", "hash")
+            conn.execute("UPDATE activities SET user_id=? WHERE id=?", (other, activity_id))
+    stored = db.get_plan_workout(user_id, workout_id)
+    assert stored["date"] == scheduled
+    assert not importer.plan_workout_completion_verified(user_id, stored)
+
+
+@pytest.mark.parametrize("cutoff", [None, "0001-01-01"])
+@pytest.mark.parametrize("writer", ["explicit", "calendar", "manual", "batch"])
+def test_completion_writers_skip_unrepresentable_local_date(user_id, writer, cutoff):
+    workout_id, activity_id = _rollover_completion(
+        user_id, "America/New_York", "0001-01-01T00:30:00", scheduled="0001-01-01"
+    )
+    with db.connect() as conn:
+        conn.execute("UPDATE user_settings SET history_start_date=? WHERE user_id=?", (cutoff, user_id))
+    before = db.get_plan_workout(user_id, workout_id)
+    if writer == "explicit":
+        assert importer.link_selected_plan_workout(user_id, workout_id, activity_id) is False
+    elif writer == "calendar":
+        assert importer.match_plan_workout_completion(user_id, workout_id, dt.date.min) is False
+    elif writer == "manual":
+        assert importer.manually_complete_plan_workout(user_id, workout_id) == "no_activity"
+    else:
+        assert importer.match_plan_completions(user_id, NOW) == 0
+    assert db.get_plan_workout(user_id, workout_id) == before
+
+
+def test_batch_match_skips_unrepresentable_candidate(user_id, monkeypatch):
+    workout_id, activity_id = _rollover_completion(
+        user_id, "America/New_York", "0001-01-01T00:30:00", scheduled="0001-01-01"
+    )
+    # Exercise the matcher's own conversion even if retrieval returns the row.
+    monkeypatch.setattr(db, "activities_between", lambda *args: [db.get_activity(user_id, activity_id)])
+    assert importer.match_plan_completions(user_id, NOW) == 0
+    assert db.get_plan_workout(user_id, workout_id)["completed_activity_id"] is None
+
+
+def test_verification_rejects_unrepresentable_local_date(user_id):
+    workout_id, activity_id = _rollover_completion(
+        user_id, "America/New_York", "0001-01-01T00:30:00", scheduled="0001-01-01"
+    )
+    db.mark_plan_workout_completed(user_id, workout_id, activity_id, "0001-01-01", .95, 210)
+    assert not importer.plan_workout_completion_verified(
+        user_id, db.get_plan_workout(user_id, workout_id)
+    )
