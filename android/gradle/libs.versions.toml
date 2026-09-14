@@ -2,7 +2,6 @@
 agp = "9.4.0"
 coreKtx = "1.18.0"
 junit = "4.13.2"
-junitVersion = "1.3.0"
 kotlin = "2.2.10"
 composeBom = "2026.02.01"
 # Step 1 (#193): navigation for the five-destination shell.
@@ -17,7 +16,10 @@ ksp = "2.2.10-2.0.2"
 [libraries]
 androidx-core-ktx = { group = "androidx.core", name = "core-ktx", version.ref = "coreKtx" }
 junit = { group = "junit", name = "junit", version.ref = "junit" }
-androidx-junit = { group = "androidx.test.ext", name = "junit", version.ref = "junitVersion" }
+# androidx.test.ext:junit is deliberately absent: there is no
+# androidTestImplementation, so declaring it read as "instrumented tests are
+# wired up" when they are not (#260). Add it back with the first real
+# instrumented test, which is its own decision (KVM + an emulator action in CI).
 androidx-activity-compose = { group = "androidx.activity", name = "activity-compose" }
 androidx-compose-bom = { group = "androidx.compose", name = "compose-bom", version.ref = "composeBom" }
 androidx-compose-ui = { group = "androidx.compose.ui", name = "ui" }
