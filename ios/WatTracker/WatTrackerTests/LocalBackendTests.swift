@@ -165,12 +165,64 @@ final class LocalBackendTests: XCTestCase {
         }
     }
 
+    func testAuthenticateComparesNonDefaultHTTPSPort() async throws {
+        let baseURL = URL(string: "https://desktop.example:8443/")!
+        let acceptedTransport = ScriptedLocalTransport([
+            LocalResponse(
+                status: 200,
+                body: Data(#"{"ticket":"one-time-ticket"}"#.utf8),
+                url: baseURL.appendingPathComponent("/api/connector/session")
+            ),
+            LocalResponse(
+                status: 303, body: Data(),
+                url: baseURL.appendingPathComponent("/connector/session"),
+                location: "https://desktop.example:8443/",
+                setCookie: "session=authenticated; Secure; HttpOnly"
+            ),
+        ])
+        let acceptedClient = try LocalClient(
+            baseURL: baseURL, token: "device-token", transport: acceptedTransport
+        )
+
+        try await acceptedClient.authenticate()
+
+        XCTAssertEqual(acceptedTransport.requests.count, 2)
+
+        let rejectedTransport = ScriptedLocalTransport([
+            LocalResponse(
+                status: 200,
+                body: Data(#"{"ticket":"one-time-ticket"}"#.utf8),
+                url: baseURL.appendingPathComponent("/api/connector/session")
+            ),
+            LocalResponse(
+                status: 303, body: Data(),
+                url: baseURL.appendingPathComponent("/connector/session"),
+                location: "https://desktop.example/",
+                setCookie: "session=authenticated; Secure; HttpOnly"
+            ),
+        ])
+        let rejectedClient = try LocalClient(
+            baseURL: baseURL, token: "device-token", transport: rejectedTransport
+        )
+
+        do {
+            try await rejectedClient.authenticate()
+            XCTFail("accepted default HTTPS port for non-default-port base URL")
+        } catch let failure as LocalClient.Failure {
+            guard case .unexpectedLanding = failure else {
+                return XCTFail("unexpected failure: \(failure)")
+            }
+        }
+    }
+
     func testAuthenticateRejectsUntrustedOrUnexpectedLandings() async throws {
         let baseURL = URL(string: "https://desktop.example/")!
         let rejectedLocations: [(name: String, value: String?)] = [
             ("network-path cross-origin", "//attacker.example/"),
             ("scheme mismatch", "http://desktop.example/"),
             ("host mismatch", "https://attacker.example/"),
+            ("host suffix", "https://desktop.example.evil.com/"),
+            ("host prefix", "https://evil-desktop.example/"),
             ("port mismatch", "https://desktop.example:8443/"),
             ("unexpected path", "/login"),
             ("encoded path", "https://desktop.example/%2F"),
