@@ -37,7 +37,9 @@ class FakeSync:
         if self.enroll_error:
             raise self.enroll_error
         self.state["enrolled"] = True
+        self.state["endpoint"] = endpoint
     def mint_pairing_code(self, uid):
+        self.calls.append(("pairing", uid))
         return {"pairing_code": "123456", "expires_at": time.time() + 900}
     def list_devices(self, uid):
         self.calls.append(("list", uid))
@@ -72,10 +74,122 @@ def test_enable_disable_and_enrollment_are_local_controls(client):
     web.post("/settings/cloud", data={"enabled": "on", "endpoint": "https://cloud.example", "invitation": "invite"})
     assert ("enroll", "https://cloud.example", "invite") in sync.calls
     assert ("enabled", True) in sync.calls
+    assert [call[0] for call in sync.calls] == ["enroll", "enabled"]
     sync.calls.clear()
     web.post("/settings/cloud", data={"endpoint": "https://cloud.example"})
     assert ("enabled", False) in sync.calls
     assert not any(call[0] == "enroll" for call in sync.calls)
+
+
+@pytest.mark.parametrize(
+    "initial_enabled,submitted_enabled,expected_enabled,expected_calls",
+    [
+        (False, "on", False, []),
+        (True, "on", True, []),
+        (False, "", False, [("enabled", False)]),
+        (True, "", False, [("enabled", False)]),
+    ],
+)
+@pytest.mark.parametrize("endpoint", ["https://new.example", ""])
+def test_endpoint_edit_without_invitation_only_applies_disable(
+    client, initial_enabled, submitted_enabled, expected_enabled, expected_calls,
+    endpoint,
+):
+    web, sync = client
+    sync.state.update(enabled=initial_enabled, enrolled=True)
+    before = dict(sync.state)
+    response = web.post(
+        "/settings/cloud", data={
+            "endpoint": endpoint, "invitation": "  ",
+            "enabled": submitted_enabled,
+        }, follow_redirects=False,
+    )
+    assert response.status_code == 303
+    assert response.headers["location"] == "/settings"
+    assert sync.state == {**before, "enabled": expected_enabled}
+    assert sync.calls == expected_calls
+    message = "Enter an invitation to enroll against a new endpoint"
+    page = web.get(response.headers["location"])
+    assert message in page.text
+    assert 'value="https://cloud.example"' in page.text
+    assert message not in web.get("/settings").text
+
+
+@pytest.mark.parametrize("initial_enabled", [False, True])
+@pytest.mark.parametrize("error,message", [
+    (server.CloudDependencyUnavailable(), "Install wattracker[cloud] and try again."),
+    (server.CloudCredentialUnavailable(), "OS secure credential storage is unavailable."),
+    (ValueError("private invitation"), "Enter a valid HTTPS cloud endpoint and invitation."),
+    (RuntimeError("private invitation"), "Cloud enrollment could not be completed."),
+])
+def test_failed_enrollment_does_not_change_enabled_state(client, initial_enabled, error, message):
+    web, sync = client
+    sync.state.update(enabled=initial_enabled, enrolled=initial_enabled)
+    before = dict(sync.state)
+    sync.enroll_error = error
+    response = web.post(
+        "/settings/cloud", data={
+            "endpoint": "https://new.example", "invitation": "private invitation",
+            "enabled": "on",
+        }, follow_redirects=False,
+    )
+    assert response.status_code == 303
+    assert response.headers["location"] == "/settings"
+    assert sync.state == before
+    assert [call[0] for call in sync.calls] == ["enroll"]
+    page = web.get("/settings")
+    assert message in page.text
+    assert "private invitation" not in page.text
+
+
+def test_missing_endpoint_does_not_enable_or_enroll(client):
+    web, sync = client
+    page = web.post("/settings/cloud", data={"enabled": "on", "invitation": "invite"})
+    assert "Enter a valid HTTPS cloud endpoint and invitation." in page.text
+    assert not sync.calls
+    assert not sync.state["enabled"]
+
+
+@pytest.mark.parametrize("path,data,operation", [
+    ("/settings/cloud", {"endpoint": "https://cloud.example", "enabled": "on"}, "enabled"),
+    ("/settings/cloud/pairing", {}, "pairing"),
+    ("/settings/cloud/devices", {}, "list"),
+])
+def test_cloud_posts_redirect_and_settings_refresh_does_not_repeat_actions(client, path, data, operation):
+    web, sync = client
+    assert web.get("/settings").status_code == 200
+    assert sync.calls == []
+    response = web.post(path, data=data, follow_redirects=False)
+    assert response.status_code == 303
+    assert response.headers["location"] == "/settings"
+    assert [call[0] for call in sync.calls] == [operation]
+    calls = list(sync.calls)
+    for _ in range(2):
+        page = web.get(response.headers["location"])
+        assert page.status_code == 200
+        if operation == "pairing":
+            assert "123456" in page.text
+    assert sync.calls == calls
+
+
+@pytest.mark.parametrize("path,method,message", [
+    ("/settings/cloud/pairing", "mint_pairing_code", "A pairing code could not be generated right now."),
+    ("/settings/cloud/devices", "list_devices", "Paired devices could not be loaded right now."),
+])
+def test_cloud_action_errors_survive_redirect_once(client, monkeypatch, path, method, message):
+    web, sync = client
+
+    def fail(uid):
+        raise RuntimeError("private credential")
+
+    monkeypatch.setattr(sync, method, fail)
+    response = web.post(path, follow_redirects=False)
+    assert response.status_code == 303
+    assert response.headers["location"] == "/settings"
+    page = web.get("/settings")
+    assert message in page.text
+    assert "private credential" not in page.text
+    assert message not in web.get("/settings").text
 
 
 def test_sync_route_only_queues(client):
@@ -85,17 +199,21 @@ def test_sync_route_only_queues(client):
     assert any(call[0] == "request" for call in sync.calls)
 
 
-def test_cloud_state_changes_require_same_origin(client):
+@pytest.mark.parametrize("path", [
+    "/settings/cloud", "/settings/cloud/sync",
+    "/settings/cloud/pairing", "/settings/cloud/devices",
+])
+def test_cloud_state_changes_require_same_origin(client, path):
     web, sync = client
     response = web.post(
-        "/settings/cloud/sync", headers={"Origin": "http://evil.example"},
+        path, headers={"Origin": "http://evil.example"},
         follow_redirects=False,
     )
     assert response.status_code == 403
     assert not sync.calls
 
 
-def test_pairing_payload_and_revoke_use_server_ids(client):
+def test_pairing_payload_stays_out_of_the_session(client):
     web, sync = client
     sync.state["enabled"] = True
     text = web.post("/settings/cloud/pairing").text
@@ -110,15 +228,33 @@ def test_pairing_payload_and_revoke_use_server_ids(client):
     pairing = next(iter(web.app.state.cloud_pairings.values()))
     assert pairing["code"] == "123456"
 
-    sync.state["devices"] = [{"id": "device-1", "label": "Phone"}]
-    response = web.post("/settings/cloud/devices/device-1/revoke")
-    assert ("revoke", "device-1") in sync.calls
-    assert any(call[0] == "list" for call in sync.calls)
-    assert "Paired device revoked." in response.text
 
-    sync.revoke_result = False
-    response = web.post("/settings/cloud/devices/device-1/revoke")
-    assert "Paired device could not be revoked. Try again." in response.text
+@pytest.mark.parametrize("revoked,message", [
+    (True, "Paired device revoked."),
+    (False, "Paired device could not be revoked. Try again."),
+])
+def test_revoke_redirects_with_one_time_message_and_does_not_repeat(client, revoked, message):
+    web, sync = client
+    sync.state["devices"] = [{"id": "device-1", "label": "Phone"}]
+    sync.revoke_result = revoked
+
+    response = web.post(
+        "/settings/cloud/devices/device-1/revoke", follow_redirects=False,
+    )
+
+    assert response.status_code == 303
+    assert response.headers["location"] == "/settings"
+    assert sync.calls[0] == ("revoke", "device-1")
+    assert [call[0] for call in sync.calls] == ["revoke", "list"]
+    calls = list(sync.calls)
+
+    page = web.get(response.headers["location"])
+    assert message in page.text
+    assert sync.calls == calls
+
+    refreshed = web.get("/settings")
+    assert message not in refreshed.text
+    assert sync.calls == calls
 
 
 def test_expired_pairing_is_removed_from_server_state(client):

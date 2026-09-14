@@ -82,11 +82,18 @@ def test_v34_migrates_in_place_and_creates_publication_tables(tmp_path):
     assert db.get_activity(user_id, 1, path=str(path)) == activity
 
 
-def test_delta_is_deterministic_noop_after_commit_and_supports_republish(tmp_path):
+def test_delta_is_deterministic_noop_after_commit_and_supports_republish(
+    tmp_path, monkeypatch,
+):
     path, user_id = _fixture_db(tmp_path)
 
     first = snapshot_batch(path, user_id, include_derived=False)
     assert first is not None
+    monkeypatch.setattr(
+        snapshot_module,
+        "_all_snapshot_objects",
+        lambda *_args, **_kwargs: pytest.fail("pending snapshot was rebuilt"),
+    )
     retry = snapshot_batch(path, user_id, include_derived=False)
     assert retry is not None
     assert retry.batch_id == first.batch_id
@@ -96,6 +103,7 @@ def test_delta_is_deterministic_noop_after_commit_and_supports_republish(tmp_pat
     ]
 
     commit_snapshot_batch(path, user_id, first)
+    monkeypatch.undo()
     assert snapshot_batch(path, user_id, include_derived=False) is None
 
     forced = snapshot_batch(

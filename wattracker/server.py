@@ -4901,10 +4901,22 @@ def create_app() -> FastAPI:
     @app.get("/settings", response_class=HTMLResponse)
     def settings_page(request: Request):
         return templates.TemplateResponse(
-            request, "settings.html", _settings_ctx(request, _uid(request), False)
+            request, "settings.html", _settings_ctx(
+                request, _uid(request), False,
+                cloud_message=request.session.pop("cloud_message", None),
+            )
         )
 
-    @app.post("/settings/cloud", response_class=HTMLResponse)
+    def _cloud_settings_redirect(request: Request, message: Optional[str]):
+        # Only fixed UI messages enter the signed (not encrypted) session.
+        # Pairing codes remain in server-side state, never cookies or URLs.
+        if message is None:
+            request.session.pop("cloud_message", None)
+        else:
+            request.session["cloud_message"] = message
+        return RedirectResponse("/settings", status_code=303)
+
+    @app.post("/settings/cloud")
     def settings_cloud(request: Request, enabled: str = Form(""),
                        endpoint: str = Form(""), invitation: str = Form("")):
         if not _same_origin_or_absent(request):
@@ -4915,14 +4927,24 @@ def create_app() -> FastAPI:
         sync = getattr(app.state, "cloud_sync", None)
         message = None
         try:
-            # The checkbox is an independent kill switch. A stored endpoint is
-            # submitted on every save, so only a fresh invitation triggers
-            # enrollment.
-            sync.set_enabled(uid, _checked(enabled))
+            requested_enabled = _checked(enabled)
+            if not requested_enabled:
+                sync.set_enabled(uid, False)
+            endpoint = endpoint.strip()
+            if (
+                not invitation.strip()
+                and endpoint != (_cloud_status(uid).get("endpoint") or "")
+            ):
+                return _cloud_settings_redirect(
+                    request, "Enter an invitation to enroll against a new endpoint",
+                )
             if invitation.strip():
-                if not endpoint.strip():
+                if not endpoint:
                     raise ValueError("Enter the cloud endpoint with the invitation.")
-                sync.enroll(uid, endpoint.strip(), invitation.strip())
+                sync.enroll(uid, endpoint, invitation.strip())
+            # Enrollment must succeed before enabling sync.
+            if requested_enabled:
+                sync.set_enabled(uid, True)
         except CloudDependencyUnavailable:
             message = (
                 "Cloud enrollment requires optional dependencies. "
@@ -4934,10 +4956,7 @@ def create_app() -> FastAPI:
             message = "Enter a valid HTTPS cloud endpoint and invitation."
         except Exception:
             message = "Cloud enrollment could not be completed. Check the invitation and try again."
-        return templates.TemplateResponse(
-            request, "settings.html", _settings_ctx(request, uid, False,
-                                                     cloud_message=message)
-        )
+        return _cloud_settings_redirect(request, message)
 
     @app.post("/settings/cloud/sync")
     def settings_cloud_sync(request: Request):
@@ -4979,10 +4998,7 @@ def create_app() -> FastAPI:
             }
         except Exception:
             message = "A pairing code could not be generated right now."
-        return templates.TemplateResponse(
-            request, "settings.html", _settings_ctx(request, uid, False,
-                                                     cloud_message=message)
-        )
+        return _cloud_settings_redirect(request, message)
 
     @app.post("/settings/cloud/devices")
     def settings_cloud_devices(request: Request):
@@ -4996,10 +5012,7 @@ def create_app() -> FastAPI:
             getattr(app.state, "cloud_sync").list_devices(uid)
         except Exception:
             message = "Paired devices could not be loaded right now."
-        return templates.TemplateResponse(
-            request, "settings.html", _settings_ctx(request, uid, False,
-                                                     cloud_message=message)
-        )
+        return _cloud_settings_redirect(request, message)
 
     @app.post("/settings/cloud/devices/{credential_id}/revoke")
     def settings_cloud_revoke(request: Request, credential_id: str):
@@ -5018,11 +5031,7 @@ def create_app() -> FastAPI:
             "Paired device revoked."
             if revoked else "Paired device could not be revoked. Try again."
         )
-        return templates.TemplateResponse(
-            request, "settings.html", _settings_ctx(
-                request, uid, False, cloud_message=message,
-            )
-        )
+        return _cloud_settings_redirect(request, message)
 
     @app.post("/settings", response_class=HTMLResponse)
     def settings_save(
