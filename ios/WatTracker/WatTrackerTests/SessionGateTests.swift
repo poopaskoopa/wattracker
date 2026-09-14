@@ -381,7 +381,7 @@ final class SessionGateTests: XCTestCase {
 
         XCTAssertEqual(gate.backend, .local)
         XCTAssertEqual(gate.phase, .unpaired)
-        XCTAssertEqual(preference.backend, .cloud)
+        XCTAssertNil(preference.backend)
         XCTAssertNil(gate.lastSuccess)
 
         let model = PairingModel()
@@ -638,11 +638,16 @@ final class SessionGateTests: XCTestCase {
     }
 
     func testFreshInstallDefaultsToCloudWhenNeitherBackendIsPaired() async {
+        let preference = MemoryPreferenceStore()
         let rig = harness(paired: false) { _, _ in .refused(404) }
+        let gate = SessionGate(
+            makeSession: { rig.session }, preferences: preference
+        )
 
-        await rig.gate.start()
+        await gate.start()
 
-        XCTAssertEqual(rig.gate.backend, .cloud)
+        XCTAssertEqual(gate.backend, .cloud)
+        XCTAssertNil(preference.backend)
     }
 
     func testStartRefreshesBeforeLaunchingNonBlockingAutomaticReevaluation() async {
