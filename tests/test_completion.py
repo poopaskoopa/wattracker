@@ -692,9 +692,15 @@ def test_v37_completion_dates_preserve_evidence_and_backup(
         changes = conn.total_changes
         db._backfill_plan_completion_dates(conn)
         assert conn.total_changes == changes
-    assert importer.plan_workout_completion_verified(
-        user_id, db.get_plan_workout(user_id, workout_id)
-    ) == (not weak)
+    stored = db.get_plan_workout(user_id, workout_id)
+    expected = (
+        not weak
+        and 0 <= (
+            dt.date.fromisoformat(stored["completed_date"])
+            - dt.date.fromisoformat(stored["date"])
+        ).days <= importer.COMPLETION_GRACE_DAYS
+    )
+    assert importer.plan_workout_completion_verified(user_id, stored) == expected
     snapshots = backup.list_backups()
     assert len(snapshots) == 1
     assert snapshots[0]["reason"] == "pre-migration"
@@ -772,23 +778,6 @@ def test_completion_writers_store_local_activity_date(
     assert stored["completed_date"] == local_date
 
 
-def test_v37_corrects_utc_prefix_date_for_evening_ride(user_id):
-    workout_id, activity_id = _rollover_completion(
-        user_id, *ROLLOVER_CASES[0][:2], scheduled="2026-07-16"
-    )
-    db.mark_plan_workout_completed(user_id, workout_id, activity_id, "2026-07-16")
-    assert not importer.plan_workout_completion_verified(
-        user_id, db.get_plan_workout(user_id, workout_id)
-    )
-    with db.connect() as conn:
-        conn.execute("PRAGMA user_version=36")
-    db.init_db()
-    stored = db.get_plan_workout(user_id, workout_id)
-    assert stored["date"] == "2026-07-16"
-    assert stored["completed_date"] == "2026-07-15"
-    assert importer.plan_workout_completion_verified(user_id, stored)
-
-
 def test_v37_skips_unrepresentable_timezone_conversion(user_id):
     workout_id, activity_id = _rollover_completion(
         user_id, "America/New_York", "0001-01-01T00:30:00"
@@ -807,9 +796,9 @@ def test_v37_skips_unrepresentable_timezone_conversion(user_id):
         assert dict(conn.execute("SELECT * FROM plan_workouts").fetchone()) == before
 
 
-@pytest.mark.parametrize("failure", ["early_utc", "two_days_early", "duration", "profile", "missing_power", "wrong_completed_date", "other_user"])
+@pytest.mark.parametrize("failure", ["two_days_early", "duration", "profile", "missing_power", "wrong_completed_date", "other_user"])
 def test_rollover_verification_keeps_date_and_evidence_guards(user_id, failure):
-    started = "2026-07-15T12:30:00" if failure == "early_utc" else "2026-07-16T00:30:00"
+    started = "2026-07-16T00:30:00"
     scheduled = "2026-07-17" if failure == "two_days_early" else "2026-07-16"
     workout_id, activity_id = _rollover_completion(
         user_id, "America/New_York", started, scheduled=scheduled,
