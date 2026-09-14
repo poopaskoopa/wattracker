@@ -200,7 +200,7 @@ final class SessionGateTests: XCTestCase {
         XCTAssertEqual(rig.transport.requestCount, 0)
     }
 
-    func testColdLaunchPrefersReachableLocalOverPersistedCloudPreference() async {
+    func testColdLaunchPreservesPersistedCloudPreference() async {
         let preference = MemoryPreferenceStore(.cloud)
         let cloud = harness(paired: true) { _, _ in .refused(404) }
         let transport = LocalProbeTransport()
@@ -224,7 +224,7 @@ final class SessionGateTests: XCTestCase {
 
         await gate.start()
 
-        XCTAssertEqual(gate.backend, .local)
+        XCTAssertEqual(gate.backend, .cloud)
         XCTAssertEqual(gate.phase, .paired)
     }
 
@@ -595,5 +595,113 @@ final class SessionGateTests: XCTestCase {
         await rig.gate.probe()
         XCTAssertEqual(rig.gate.phase, .unpaired)
         XCTAssertEqual(rig.transport.requestCount, 0)
+    }
+
+    func testForegroundProbeLeavesUnpairedLocalSessionUntouched() async {
+        let cloud = harness(paired: false) { _, _ in .refused(404) }
+        let transport = LocalProbeTransport()
+        let local = LocalSession(
+            credentials: MemoryLocalCredentialStore(),
+            cache: MemorySnapshotCache(),
+            makeClient: { value in
+                try LocalClient(baseURL: URL(string: value.baseURL)!, token: value.token,
+                                transport: transport)
+            }
+        )
+        let gate = SessionGate(
+            makeSession: { cloud.session }, makeLocalSession: { local },
+            preferences: MemoryPreferenceStore()
+        )
+
+        await gate.start()
+        await gate.probe()
+
+        XCTAssertTrue(transport.requests.isEmpty)
+    }
+
+    func testFreshInstallDefaultsToCloudWhenNeitherBackendIsPaired() async {
+        let rig = harness(paired: false) { _, _ in .refused(404) }
+
+        await rig.gate.start()
+
+        XCTAssertEqual(rig.gate.backend, .cloud)
+    }
+
+    func testForegroundProbeChecksPairedLocalSession() async {
+        let cloud = harness(paired: false) { _, _ in .refused(404) }
+        let transport = LocalProbeTransport()
+        let local = LocalSession(
+            credentials: MemoryLocalCredentialStore(credential: try? LocalCredential(
+                baseURL: "https://desktop.example", token: "token")),
+            cache: MemorySnapshotCache(),
+            makeClient: { value in
+                try LocalClient(baseURL: URL(string: value.baseURL)!, token: value.token,
+                                transport: transport)
+            }
+        )
+        let gate = SessionGate(
+            makeSession: { cloud.session }, makeLocalSession: { local },
+            preferences: MemoryPreferenceStore()
+        )
+
+        await gate.start()
+        transport.setReachable(false)
+        let requestsBeforeProbe = transport.requests.count
+
+        await gate.probe()
+
+        XCTAssertGreaterThan(transport.requests.count, requestsBeforeProbe)
+    }
+
+    func testStartRefreshesBeforeLaunchingNonBlockingAutomaticReevaluation() async {
+        let cloud = harness(paired: true) { _, _ in .refused(404) }
+        let transport = BlockingLocalProbeTransport()
+        let local = LocalSession(
+            credentials: MemoryLocalCredentialStore(credential: try? LocalCredential(
+                baseURL: "https://desktop.example", token: "token")),
+            cache: MemorySnapshotCache(),
+            makeClient: { value in
+                try LocalClient(baseURL: URL(string: value.baseURL)!, token: value.token,
+                                transport: transport)
+            }
+        )
+        let gate = SessionGate(
+            makeSession: { cloud.session }, makeLocalSession: { local },
+            preferences: MemoryPreferenceStore()
+        )
+
+        let startTask = Task { await gate.start() }
+        guard await transport.gate.waitForArrival(timeout: 1) else {
+            return XCTFail("automatic local probe did not start")
+        }
+        await Task.yield()
+        XCTAssertEqual(gate.phase, .paired)
+
+        await transport.gate.openGate()
+        await startTask.value
+    }
+
+    func testPersistedBackendIsAnExplicitOverrideAcrossStart() async {
+        let preference = MemoryPreferenceStore(.cloud)
+        let cloud = harness(paired: true) { _, _ in .refused(404) }
+        let transport = LocalProbeTransport()
+        let local = LocalSession(
+            credentials: MemoryLocalCredentialStore(credential: try? LocalCredential(
+                baseURL: "https://desktop.example", token: "token")),
+            cache: MemorySnapshotCache(),
+            makeClient: { value in
+                try LocalClient(baseURL: URL(string: value.baseURL)!, token: value.token,
+                                transport: transport)
+            }
+        )
+        let gate = SessionGate(
+            makeSession: { cloud.session }, makeLocalSession: { local },
+            preferences: preference
+        )
+
+        await gate.start()
+
+        XCTAssertEqual(gate.backend, .cloud)
+        XCTAssertEqual(preference.backend, .cloud)
     }
 }

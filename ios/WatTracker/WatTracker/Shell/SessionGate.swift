@@ -144,7 +144,7 @@ final class SessionGate {
     private let makeLocalSession: @Sendable () throws -> LocalSession
     private let preferences: PreferenceStore
     private let pathMonitor: SessionPathMonitor
-    private var manualOverride = false
+    private var manualOverride: Backend?
     private var selectionGeneration = 0
     private var automaticGeneration = 0
     private var automaticReevaluationTask: Task<Void, Never>?
@@ -160,7 +160,8 @@ final class SessionGate {
         self.makeLocalSession = makeLocalSession
         self.preferences = preferences
         self.pathMonitor = pathMonitor
-        self.backend = preferences.loadBackend() ?? .cloud
+        self.manualOverride = preferences.loadBackend()
+        self.backend = manualOverride ?? .cloud
     }
 
     deinit {
@@ -222,16 +223,17 @@ final class SessionGate {
 
         let cloudPaired = await session?.deviceState == .paired
         let localPaired = await localSession?.deviceState == .paired
-        // The stored setting is only a remembered UI value. A cold launch is
-        // always automatic so an old cloud choice cannot hide a reachable
-        // paired desktop.
-        backend = cloudPaired ? .cloud : .local
+        if let manualOverride {
+            backend = manualOverride
+        } else {
+            backend = cloudPaired ? .cloud : (localPaired ? .local : .cloud)
+        }
         if session == nil && !localPaired {
             phase = .unusable(String(describing: cloudError ?? GateFailure.noSession))
             return
         }
-        await automaticReevaluate()
-        preferences.saveBackend(backend)
+        await refresh()
+        Task { @MainActor [weak self] in await self?.automaticReevaluate() }
         pathMonitor.start { [weak self] in
             Task { @MainActor in await self?.automaticReevaluate() }
         }
@@ -261,7 +263,7 @@ final class SessionGate {
         automaticGeneration += 1
         let automaticGeneration = self.automaticGeneration
         let selectionGeneration = self.selectionGeneration
-        guard !manualOverride else {
+        guard manualOverride == nil else {
             await probeSelectedBackend()
             guard automaticGeneration == self.automaticGeneration,
                   selectionGeneration == self.selectionGeneration
@@ -280,7 +282,7 @@ final class SessionGate {
         } else {
             localReachable = false
         }
-        guard !manualOverride,
+        guard manualOverride == nil,
               automaticGeneration == self.automaticGeneration,
               selectionGeneration == self.selectionGeneration
         else {
@@ -333,7 +335,7 @@ final class SessionGate {
     func pair(code: String, label: String?) async throws {
         guard let session else { throw GateFailure.noSession }
         selectionGeneration += 1
-        manualOverride = true
+        manualOverride = .cloud
         backend = .cloud
         do {
             try await session.pair(code: code, label: label)
@@ -354,7 +356,7 @@ final class SessionGate {
     func pairLocal(host: String, token: String, label: String?) async throws {
         guard let localSession else { throw GateFailure.noSession }
         selectionGeneration += 1
-        manualOverride = true
+        manualOverride = .local
         backend = .local
         do {
             try await localSession.pair(host: host, token: token, label: label)
@@ -370,7 +372,7 @@ final class SessionGate {
         let candidate: (any ReadSession)? = backend == .cloud ? session : localSession
         guard let candidate else { return }
         selectionGeneration += 1
-        manualOverride = true
+        manualOverride = backend
         let isPaired = await candidate.deviceState == .paired
         self.backend = backend
         if isPaired {
@@ -443,7 +445,9 @@ final class SessionGate {
     /// recorded in the phase this then reads. Two refusals are needed, with the
     /// backoff between them, so a single foregrounding cannot unpair anything.
     func probe() async {
-        if !manualOverride, await localSession?.deviceState != .paired {
+        if manualOverride == nil, await localSession?.deviceState == .paired {
+            if let localSession { _ = await localSession.probe() }
+        } else if manualOverride == nil {
             await probeSelectedBackend()
         }
         await automaticReevaluate()
