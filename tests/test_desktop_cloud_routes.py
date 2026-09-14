@@ -81,22 +81,33 @@ def test_enable_disable_and_enrollment_are_local_controls(client):
     assert not any(call[0] == "enroll" for call in sync.calls)
 
 
-@pytest.mark.parametrize("initial_enabled", [False, True])
+@pytest.mark.parametrize(
+    "initial_enabled,submitted_enabled,expected_enabled,expected_calls",
+    [
+        (False, "on", False, []),
+        (True, "on", True, []),
+        (False, "", False, [("enabled", False)]),
+        (True, "", False, [("enabled", False)]),
+    ],
+)
 @pytest.mark.parametrize("endpoint", ["https://new.example", ""])
-def test_endpoint_edit_without_invitation_preserves_state(client, initial_enabled, endpoint):
+def test_endpoint_edit_without_invitation_only_applies_disable(
+    client, initial_enabled, submitted_enabled, expected_enabled, expected_calls,
+    endpoint,
+):
     web, sync = client
     sync.state.update(enabled=initial_enabled, enrolled=True)
     before = dict(sync.state)
     response = web.post(
         "/settings/cloud", data={
             "endpoint": endpoint, "invitation": "  ",
-            "enabled": "" if initial_enabled else "on",
+            "enabled": submitted_enabled,
         }, follow_redirects=False,
     )
     assert response.status_code == 303
     assert response.headers["location"] == "/settings"
-    assert sync.state == before
-    assert sync.calls == []
+    assert sync.state == {**before, "enabled": expected_enabled}
+    assert sync.calls == expected_calls
     message = "Enter an invitation to enroll against a new endpoint"
     page = web.get(response.headers["location"])
     assert message in page.text
@@ -119,7 +130,7 @@ def test_failed_enrollment_does_not_change_enabled_state(client, initial_enabled
     response = web.post(
         "/settings/cloud", data={
             "endpoint": "https://new.example", "invitation": "private invitation",
-            "enabled": "" if initial_enabled else "on",
+            "enabled": "on",
         }, follow_redirects=False,
     )
     assert response.status_code == 303

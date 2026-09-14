@@ -4927,6 +4927,9 @@ def create_app() -> FastAPI:
         sync = getattr(app.state, "cloud_sync", None)
         message = None
         try:
+            requested_enabled = _checked(enabled)
+            if not requested_enabled:
+                sync.set_enabled(uid, False)
             endpoint = endpoint.strip()
             if (
                 not invitation.strip()
@@ -4939,8 +4942,9 @@ def create_app() -> FastAPI:
                 if not endpoint:
                     raise ValueError("Enter the cloud endpoint with the invitation.")
                 sync.enroll(uid, endpoint, invitation.strip())
-            # Enrollment must succeed before applying the requested switch.
-            sync.set_enabled(uid, _checked(enabled))
+            # Enrollment must succeed before enabling sync.
+            if requested_enabled:
+                sync.set_enabled(uid, True)
         except CloudDependencyUnavailable:
             message = (
                 "Cloud enrollment requires optional dependencies. "
