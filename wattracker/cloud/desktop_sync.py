@@ -186,6 +186,7 @@ class DesktopCloudSync:
                     except sqlite3.Error:
                         pass
                 self._snapshot_gate_connection = None
+                self._snapshot_gate_baseline.clear()
                 return None
 
     def _snapshot_gate_validity_locked(
@@ -407,7 +408,7 @@ class DesktopCloudSync:
                     except sqlite3.Error:
                         pass
                 self._snapshot_gate_connection = None
-                self._snapshot_gate_baseline.pop(user_id, None)
+                self._snapshot_gate_baseline.clear()
                 raise
 
             if token is None or token[1] or token != snapshot_token:
