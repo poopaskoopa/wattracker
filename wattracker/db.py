@@ -31,7 +31,7 @@ from .timeutil import (
 
 _log = logging.getLogger(__name__)
 
-SCHEMA_VERSION = 36
+SCHEMA_VERSION = 37
 
 
 def _restrict_db_files(path: str) -> None:
@@ -272,6 +272,63 @@ def _backfill_weight_history(conn: sqlite3.Connection) -> None:
         )
 
 
+def _backfill_completed_dates_local(conn: sqlite3.Connection) -> None:
+    """v36 -> v37: restate legacy ``completed_date`` in the rider's timezone.
+
+    ``completed_date`` was always meant to hold the linked activity's date, but
+    the old matcher filled it from the scheduled day it matched on, which came
+    from a naive UTC-prefix comparison. The current matcher stores the
+    activity's rider-local date, and ``plan_workout_completion_verified``
+    checks that value against the same local date - so for a non-UTC rider
+    every pre-upgrade row silently reads as unverified and drops out of the RPE
+    evidence that feeds FTP re-evaluation.
+
+    The correct value is derivable from the linked activity, so this is a
+    one-time correction of stored data rather than a tolerance in a hot path.
+    It deliberately does NOT re-match: a row whose corrected date falls outside
+    the completion grace window becomes unverified, which is the honest answer
+    (an evening ride at local 22:00 on day D carried UTC date D+1 and was
+    attributed to a workout the rider had not ridden yet). Re-attribution is a
+    larger, destructive question and does not belong in a migration.
+
+    Conversion uses the same helpers as the verifier (``parse_naive`` plus
+    ``to_user_timezone``, per the owning user's saved timezone read through
+    *this* connection - the database is mid-transaction, so a nested connection
+    risks a lock or a stale read), so the two agree by construction, including
+    on the UTC fallback ``to_user_timezone`` applies to a missing or unusable
+    timezone. Rows whose linked activity is gone, or whose ``start_time`` will
+    not parse, are left untouched - a migration that aborts on one bad row is
+    worse than one that skips it - and only rows whose stored value actually
+    differs are written, which is what makes a second run a no-op.
+    """
+    zones = _user_timezones(conn)
+    for table in ("plan_workouts", "standalone_workouts"):
+        try:
+            rows = conn.execute(
+                f"SELECT w.id AS id, w.user_id AS user_id, "
+                f"w.completed_date AS completed_date, a.start_time AS start_time "
+                f"FROM {table} AS w JOIN activities AS a "
+                f"ON a.id = w.completed_activity_id AND a.user_id = w.user_id "
+                f"WHERE w.completed_activity_id IS NOT NULL "
+                f"AND w.completed_date IS NOT NULL"
+            ).fetchall()
+        except sqlite3.OperationalError:
+            continue  # table/column predates this version; nothing to correct
+        for row in rows:
+            started = parse_naive(row["start_time"])
+            if started is None:
+                continue
+            local = to_user_timezone(
+                started, zones.get(row["user_id"])
+            ).date().isoformat()
+            if local == row["completed_date"]:
+                continue
+            conn.execute(
+                f"UPDATE {table} SET completed_date = ? WHERE id = ?",
+                (local, row["id"]),
+            )
+
+
 # In-place migrations: version N -> N+1 statement lists. A database whose
 # version has an unbroken chain here is upgraded without losing live data.
 # (Brand-new tables need no ALTERs - init_db runs _SCHEMA after migrating - but
@@ -463,6 +520,13 @@ _MIGRATIONS: Dict[int, Sequence[Union[str, Callable[[sqlite3.Connection], None]]
     35: [
         # New per-user cloud sync state is created by _SCHEMA after migrating.
         # It contains no credentials or source data to backfill.
+    ],
+    36: [
+        # Restate legacy completion dates in the rider's own timezone so they
+        # agree with the matcher that writes them today - see
+        # _backfill_completed_dates_local for why this corrects data rather
+        # than loosening the verifier.
+        _backfill_completed_dates_local,
     ],
 }
 

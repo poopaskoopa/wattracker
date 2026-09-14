@@ -59,6 +59,56 @@ def test_no_match_outside_tolerance(user_id):
     assert importer.match_plan_completions(user_id, NOW) == 0
 
 
+def test_one_activity_cannot_complete_both_a_plan_and_a_standalone(user_id):
+    # Both passes of the matcher share one ``used`` set, so a single ride is
+    # spent on the first workout that claims it. Giving the standalone pass its
+    # own copy is the regression this pins - the shipped behaviour is that
+    # exactly one of these two same-day workouts completes.
+    session = build_workout("threshold", 60)
+    xml = zwo.zwo_string(session)
+    duration = session.total_duration()
+    plan_id = db.create_plan(user_id, "P", "2026-07-10", 1)
+    plan_wid = db.add_plan_workout(
+        plan_id, user_id, "2026-07-10", session.name, "threshold",
+        duration, session.estimated_tss, xml,
+    )
+    solo_wid = db.add_standalone_workout(
+        user_id, "solo", "2026-07-10", session.name, "threshold",
+        duration, session.estimated_tss, xml, 220.0,
+    )
+    # One ride that traces the shared prescription, so either workout would
+    # accept it on its own.
+    profile = importer._zwo_fraction_profile(xml)
+    activity_id = db.insert_activity(user_id, {
+        "dedup_hash": "shared-ride",
+        "filename": "shared.fit",
+        "start_time": "2026-07-10T08:00:00",
+        "duration_s": len(profile),
+        "distance_m": 0.0,
+        "avg_power": 220.0,
+        "avg_hr": None,
+        "np": None,
+        "if_": None,
+        "tss": session.estimated_tss,
+        "streams": {"power": [p * 220.0 for p in profile]},
+    })
+
+    assert importer.match_plan_completions(user_id, NOW) == 1
+
+    linked = [
+        db.get_plan_workout(user_id, plan_wid)["completed_activity_id"],
+        db.get_standalone_workout(user_id, solo_wid)["completed_activity_id"],
+    ]
+    assert linked.count(activity_id) == 1
+    assert linked.count(None) == 1
+    assert linked[0] == activity_id  # the plan pass runs first and claims it
+    # The second layer under the shared ``used`` set: the write itself refuses
+    # an activity another workout has already spent.
+    assert not db.mark_standalone_completed(
+        user_id, solo_wid, activity_id, "2026-07-10", .95, 220.0
+    )
+
+
 def test_pre_workout_activity_does_not_match(user_id):
     workout_id = _plan_workout(user_id, "2026-07-10", duration_s=3600)
     earlier_workout_id = _plan_workout(
