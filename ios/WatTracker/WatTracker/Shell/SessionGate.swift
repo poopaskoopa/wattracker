@@ -288,7 +288,6 @@ final class SessionGate {
     /// through `PairingFailureMessage` and never directly.
     func pair(code: String, label: String?) async throws {
         guard let session else { throw GateFailure.noSession }
-        manualOverride = true
         backend = .cloud
         do {
             try await session.pair(code: code, label: label)
@@ -299,6 +298,7 @@ final class SessionGate {
             await refresh()
             throw error
         }
+        manualOverride = true
         preferences.saveBackend(.cloud)
         await refresh()
     }
@@ -308,7 +308,6 @@ final class SessionGate {
     /// cookie it receives from the desktop.
     func pairLocal(host: String, token: String, label: String?) async throws {
         guard let localSession else { throw GateFailure.noSession }
-        manualOverride = true
         backend = .local
         do {
             try await localSession.pair(host: host, token: token, label: label)
@@ -316,6 +315,7 @@ final class SessionGate {
             await refresh()
             throw error
         }
+        manualOverride = true
         preferences.saveBackend(.local)
         await refresh()
     }

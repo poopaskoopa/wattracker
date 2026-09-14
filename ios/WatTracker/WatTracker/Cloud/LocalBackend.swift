@@ -325,6 +325,47 @@ struct LocalClient: Sendable {
 /// The local session adapts the desktop JSON endpoints to the same snapshots
 /// consumed by the cloud-backed screen models.
 actor LocalSession: ReadSession {
+    private enum ProbeResult {
+        case reachable
+        case unauthorized
+        case transient
+    }
+
+    private final class ProbeRace: @unchecked Sendable {
+        private let lock = NSLock()
+        private var finished = false
+        private var continuation: CheckedContinuation<Bool, Never>?
+        private var operation: Task<Void, Never>?
+        private var timeout: Task<Void, Never>?
+
+        init(_ continuation: CheckedContinuation<Bool, Never>) {
+            self.continuation = continuation
+        }
+
+        func install(operation: Task<Void, Never>, timeout: Task<Void, Never>) {
+            lock.lock()
+            self.operation = operation
+            self.timeout = timeout
+            let shouldCancel = finished
+            lock.unlock()
+            if shouldCancel { operation.cancel(); timeout.cancel() }
+        }
+
+        func finish(_ value: Bool) {
+            lock.lock()
+            guard !finished else { lock.unlock(); return }
+            finished = true
+            let continuation = self.continuation
+            self.continuation = nil
+            let operation = self.operation
+            let timeout = self.timeout
+            lock.unlock()
+            operation?.cancel()
+            timeout?.cancel()
+            continuation?.resume(returning: value)
+        }
+    }
+
     private let credentials: LocalCredentialStore
     private let cache: SnapshotCache
     private let makeClient: @Sendable (LocalCredential) throws -> LocalClient
@@ -442,32 +483,42 @@ actor LocalSession: ReadSession {
     /// the existing repeated-401 removal path.
     func probe(timeout: TimeInterval = 3) async -> Bool {
         guard state == .paired else { return false }
-        return await withTaskGroup(of: Bool.self) { group in
-            group.addTask { await self.probeOnce() }
-            group.addTask {
-                let nanos = UInt64(max(0, timeout) * 1_000_000_000)
-                try? await Task.sleep(nanoseconds: nanos)
-                return false
+        let result = await withTaskCancellationHandler(operation: {
+            await withCheckedContinuation { continuation in
+                let race = ProbeRace(continuation)
+                let operation = Task {
+                    let result = await self.probeOnce()
+                    race.finish(result == .reachable)
+                    if result == .unauthorized { await self.removeAfterProbe() }
+                }
+                let timer = Task {
+                    let nanos = UInt64(max(0, timeout) * 1_000_000_000)
+                    try? await Task.sleep(nanoseconds: nanos)
+                    race.finish(false)
+                }
+                race.install(operation: operation, timeout: timer)
             }
-            let result = await group.next() ?? false
-            group.cancelAll()
-            return result
-        }
+        }, onCancel: {})
+        return result
     }
 
-    private func probeOnce() async -> Bool {
+    private func removeAfterProbe() {
+        guard state == .paired else { return }
+        markRemoved()
+    }
+
+    private func probeOnce() async -> ProbeResult {
         let generation = lifecycleGeneration
         do {
             _ = try await perform { try await $0.trainingState() }
-            guard lifecycleGeneration == generation, state == .paired else { return false }
+            guard lifecycleGeneration == generation, state == .paired else { return .transient }
             lastSuccessfulRead = clock()
-            return true
+            return .reachable
         } catch LocalClient.Failure.unauthorized {
-            markRemoved()
-            return false
+            return .unauthorized
         } catch {
             // A temporary local outage must not erase a still-valid token.
-            return false
+            return .transient
         }
     }
 
