@@ -1,16 +1,7 @@
 name: Windows
 
-# A bare `push:` alongside `pull_request:` runs this twice for every commit on a
-# branch with an open PR - and with one physical runner the second run queues
-# behind the first rather than running beside it, so it is pure wall time. Runs
-# 32386196713 and 32386202547 were the same commit, 10m45s of wall for 5m30s of
-# work.
-#
-# Filtering push to `main` gives exactly one run per commit: a PR run while the
-# work is in review, a push run once it merges. The trade is that a branch with
-# no PR open gets no Windows run, so packaging breakage surfaces when the PR
-# opens rather than on the push - which is the right moment for a job that takes
-# six minutes of a machine shared with the trainer.
+# Filtering push to `main` gives one review run per PR commit and one run after
+# merge. The post-merge run is also where the unsigned artifacts are uploaded.
 on:
   push:
     branches: [main]
@@ -18,17 +9,6 @@ on:
 
 permissions:
   contents: read
-
-# One physical Windows machine backs this workflow, and the installer smoke test
-# below registers per-user state (a Start Menu group, an HKCU uninstall key) that
-# two concurrent jobs would fight over. Serialize per ref.
-#
-# Deliberately no `cancel-in-progress`: packaging/smoke_installer.ps1 uninstalls
-# in a `finally` block, and cancelling a job kills the process before that block
-# runs, leaving a half-installed application behind on a runner that persists
-# between jobs. A queued run is cheaper than a poisoned one.
-concurrency:
-  group: windows-${{ github.ref }}
 
 jobs:
   test:
@@ -65,142 +45,54 @@ jobs:
     # belief about the platform: test_windows_acl.py encoded the wrong icacls
     # output shape for weeks while every one of its tests passed.
     #
-    # Same fork guard as package-unsigned: only branches pushed to this
-    # repository reach the physical box that also runs the trainer.
-    if: github.event_name == 'push' || github.event.pull_request.head.repo.full_name == github.repository
-    runs-on: [self-hosted, Windows, X64]
+    runs-on: windows-latest
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
-
-      # No actions/setup-python, for the reason package-unsigned gives at
-      # length: its Windows path needs administrator, and this runner's service
-      # account deliberately is not one. Assert the machine-wide version rather
-      # than trusting it.
-      - name: Assert the runner's machine-wide Python
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - name: Install test dependencies
         shell: pwsh
         run: |
-          python -c "import sys; assert sys.version_info[:2] == (3, 12), sys.version; print(sys.version)"
-
-      # Into a workspace venv, never the runner's interpreter: the tool cache
-      # outlives the job on a self-hosted runner and the pollution accumulates.
-      - name: Create workspace virtual environment
-        shell: pwsh
-        run: |
-          python -m venv .venv
-          .venv\Scripts\python -m pip install --disable-pip-version-check --upgrade pip
-          .venv\Scripts\python -m pip install --disable-pip-version-check -e ".[dev,ble,connector,webview]"
+          python -m pip install --disable-pip-version-check --upgrade pip
+          python -m pip install --disable-pip-version-check -e ".[dev,ble,connector,webview]"
 
       - name: Real Windows APIs
         shell: pwsh
-        run: .venv\Scripts\python -m pytest tests/test_windows_real.py -q
+        run: python -m pytest tests/test_windows_real.py -q
 
       # Separate step so a failure here is legible: these drive real Win32
-      # windows and HKCU, and the runner's service account has no interactive
-      # desktop, which is a difference from a developer's session.
+      # windows and HKCU and execute on no other platform.
       - name: Registry and tray
         shell: pwsh
-        run: .venv\Scripts\python -m pytest tests/test_connector_autostart.py tests/test_connector_tray.py -q
+        run: python -m pytest tests/test_connector_autostart.py tests/test_connector_tray.py -q
 
   package-unsigned:
-    # See the same gate in cloud.yml. This job is the sharper of the two: the
-    # PyInstaller spec, the Inno Setup script and smoke_installer.ps1 all come
-    # from the checked-out branch, and the smoke test installs and runs the
-    # installer it just built. On a public repository that is arbitrary code
-    # execution on the physical box that also runs the trainer, so fork PRs are
-    # excluded and only branches pushed to this repository reach the runner.
-    if: github.event_name == 'push' || github.event.pull_request.head.repo.full_name == github.repository
-    runs-on: [self-hosted, Windows, X64]
+    # Build the Windows installer and frozen tray connector, then exercise the
+    # lifecycle, wheel, frozen application, installer and connector smokes on a
+    # real Windows host. These paths do not execute in the platform-neutral
+    # suite, and Inno Setup compilation is Windows-only.
+    runs-on: windows-latest
     timeout-minutes: 45
     steps:
       - uses: actions/checkout@v4
-
-      # Deliberately no actions/setup-python. Its Windows path is not a
-      # tool-cache unpack: installers/win-setup-template.ps1 in
-      # actions/python-versions runs the official installer with
-      # InstallAllUsers=1 and clears keys under
-      # HKLM\...\Installer\UserData\S-1-5-18\Products, so it requires
-      # administrator. This runner's service account deliberately is not one,
-      # and granting it admin would remove the isolation the installer smoke
-      # test depends on - see docs/windows-packaging.md. Python 3.12 is
-      # installed machine-wide on the runner instead.
-      #
-      # That makes the interpreter a property of the machine rather than
-      # something this file pins, so assert the version here instead of
-      # trusting it. A drifted box fails on this line, naming the version it
-      # found, rather than somewhere inside a PyInstaller build. The same
-      # reasoning as cloud.yml's `assert sys.version_info >= (3, 12)`.
-      #
-      # Losing setup-python also loses `cache: pip`, which costs nothing here:
-      # pip's own cache in the runner account's profile persists between jobs
-      # on a machine that is not discarded.
-      - name: Assert the runner's machine-wide Python
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - name: Install build and test dependencies
         shell: pwsh
         run: |
-          python -c "import sys; assert sys.version_info[:2] == (3, 12), sys.version; print(sys.version)"
-
-      # A self-hosted runner keeps whatever the previous job left behind. Two of
-      # the things the installer registers cannot be redirected away from a
-      # shared location: packaging/wattracker.iss sets DisableProgramGroupPage=yes,
-      # which makes Inno ignore /GROUP, so the Start Menu group name is fixed at
-      # compile time; and the uninstall key is always named {AppId}_is1. Both are
-      # per-user, which is why the runner service runs as its own account (see
-      # docs/windows-packaging.md) - that keeps them out of the developer's hive
-      # entirely. What the account cannot prevent is a run that died between
-      # install and uninstall leaving its own state behind, which would then fail
-      # a later run somewhere much harder to read than here.
-      - name: Assert no leftover install state
-        shell: pwsh
-        run: |
-          $leftovers = @(
-            "HKCU:\Software\Microsoft\Windows\CurrentVersion\Uninstall\{63E9478B-5D6D-4D36-9202-E8C7941AD567}_is1"
-            (Join-Path $env:APPDATA "Microsoft\Windows\Start Menu\Programs\wattracker")
-          ) | Where-Object { Test-Path -LiteralPath $_ }
-          if ($leftovers) {
-            $leftovers | ForEach-Object { Write-Host "leftover install state: $_" }
-            throw "A previous run left wattracker install state on this runner. Remove the paths listed above, then re-run."
-          }
-
-      # Everything the job installs goes into a virtual environment inside the
-      # workspace, and nothing is installed into the interpreter itself. On a
-      # hosted runner that distinction does not matter because the whole machine
-      # is discarded; on a self-hosted runner the tool cache outlives the job and
-      # the pollution accumulates run over run. actions/checkout runs
-      # `git clean -ffdx`, so this directory starts empty every time.
-      #
-      # The path is load-bearing beyond hygiene: scripts/wattracker.ps1 resolves
-      # `<repo>\.venv\Scripts\python.exe` as its interpreter of last resort, which
-      # is what lets tests\windows\lifecycle.ps1 start the app from source.
-      # This runner shares a physical box with the trainer and Zwift, so a build
-      # can land in the middle of a hardware session. Nothing here touches
-      # Bluetooth, and every script binds a dynamically chosen free loopback
-      # port rather than a fixed one, so neither the trainer link nor a live
-      # session's server is contended. What is contended is the CPU: the
-      # PyInstaller freeze and the Inno Setup LZMA compress each saturate every
-      # core for minutes.
-      #
-      # Dropping the shell to BelowNormal lets Zwift preempt them; the build's
-      # own children (pip, PyInstaller, ISCC) inherit it. BelowNormal and not
-      # Idle deliberately - at Idle the runner's heartbeat can starve under
-      # sustained load and the job gets reported lost.
-      #
-      # Note this does NOT lower I/O priority, which is a separate axis on
-      # Windows and cannot be set on another process from outside it. A build
-      # still competes for the disk. Add the same line to any new step that does
-      # heavy work; the four that do today each carry it.
-      - name: Create workspace virtual environment
-        shell: pwsh
-        run: |
-          (Get-Process -Id $PID).PriorityClass = 'BelowNormal'
-          python -m venv .venv
-          .venv\Scripts\python -m pip install --disable-pip-version-check --upgrade pip
+          python -m pip install --disable-pip-version-check --upgrade pip
           # connector and webview are the frozen connector's own halves: the
           # websockets client it dials the server with, and the ctypes WebView
           # binding its tray window uses. The connector spec collects both
           # best-effort, so leaving them out here does not fail the build - it
           # produces a connector that is quietly missing the radio or the
           # window, which is exactly what the smoke below exists to catch.
-          .venv\Scripts\python -m pip install --disable-pip-version-check build -e ".[dev,ble,package,connector,webview]"
+          python -m pip install --disable-pip-version-check build -e ".[dev,ble,package,connector,webview]"
       - name: Install pinned Inno Setup compiler
         shell: pwsh
         run: |
@@ -244,14 +136,15 @@ jobs:
           $innoRoot | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
       - name: PowerShell lifecycle safety
         shell: powershell
-        run: tests\windows\lifecycle.ps1
+        run: |
+          $env:WATTRACKER_EXECUTABLE = (Get-Command python).Source
+          tests\windows\lifecycle.ps1
       - name: Build wheel and installed smoke
         shell: pwsh
         run: |
-          (Get-Process -Id $PID).PriorityClass = 'BelowNormal'
-          .venv\Scripts\python -m build --wheel
+          python -m build --wheel
           $smoke = Join-Path $env:RUNNER_TEMP "wheel-smoke"
-          .venv\Scripts\python -m venv $smoke
+          python -m venv $smoke
           & "$smoke\Scripts\python.exe" -m pip install (Get-ChildItem dist\*.whl | Select-Object -First 1).FullName
           Push-Location $env:RUNNER_TEMP
           & "$smoke\Scripts\python.exe" "$env:GITHUB_WORKSPACE\packaging\smoke_installed.py"
@@ -259,10 +152,9 @@ jobs:
       - name: Build onedir and smoke
         shell: pwsh
         run: |
-          (Get-Process -Id $PID).PriorityClass = 'BelowNormal'
-          .venv\Scripts\python -m PyInstaller --clean --noconfirm packaging\wattracker.spec
+          python -m PyInstaller --clean --noconfirm packaging\wattracker.spec
           powershell -File packaging\smoke_frozen.ps1 -Executable dist\wattracker\wattracker.exe
-          $version = .venv\Scripts\python -c "import tomllib; print(tomllib.load(open('pyproject.toml','rb'))['project']['version'])"
+          $version = python -c "import tomllib; print(tomllib.load(open('pyproject.toml','rb'))['project']['version'])"
           ISCC.exe "/DAppVersion=$version" packaging\wattracker.iss
           $setup = "dist\wattracker-$version-windows-x64-unsigned-setup.exe"
           if (-not (Test-Path -LiteralPath $setup)) { throw "Setup compiler produced no artifact" }
@@ -275,9 +167,6 @@ jobs:
       # until a signing certificate exists. Until then, this step is the whole
       # of the connector's build coverage.
       #
-      # PyInstaller saturates every core, so this carries the same priority drop
-      # as the three steps above it that do real work.
-      #
       # The smoke is not dressing. The connector serves no UI to request, so
       # nothing else proves the binary does anything at all: it must refuse to
       # run unpaired and say why, connect and answer a request against a stub
@@ -285,20 +174,14 @@ jobs:
       # The last of those is what catches a spec whose best-effort collection
       # quietly stopped collecting.
       #
-      # Safe on a runner that persists and shares a box with the trainer: every
-      # check points WATTRACKER_CONNECTOR_DIR at its own temporary directory, so
-      # it cannot read or write a real connector configuration, and the stub
-      # server binds a free loopback port rather than a fixed one. Nothing here
-      # touches Bluetooth, the registry, or the autostart key.
       - name: Build frozen connector and smoke
         shell: pwsh
         run: |
-          (Get-Process -Id $PID).PriorityClass = 'BelowNormal'
-          .venv\Scripts\python -m PyInstaller --clean --noconfirm packaging\wattracker-connector.spec
+          python -m PyInstaller --clean --noconfirm packaging\wattracker-connector.spec
           if (-not (Test-Path -LiteralPath "dist\WattrackerConnector.exe")) {
             throw "Frozen connector was not produced"
           }
-          .venv\Scripts\python packaging\smoke_frozen_connector.py dist\WattrackerConnector.exe
+          python packaging\smoke_frozen_connector.py dist\WattrackerConnector.exe
       # The portable zip is deliberately not built or uploaded. It was the
       # largest single file at 61.8 MB and it duplicated the installer's
       # payload: the same onedir tree, wrapped differently rather than built
