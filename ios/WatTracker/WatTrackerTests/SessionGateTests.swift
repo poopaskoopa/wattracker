@@ -24,22 +24,32 @@ final class SessionGateTests: XCTestCase {
 
     private final class MemoryPreferenceStore: SessionGate.PreferenceStore, @unchecked Sendable {
         var backend: SessionGate.Backend?
+        var legacyBackend: SessionGate.Backend?
         private(set) var savedBackends: [SessionGate.Backend] = []
 
         init(_ backend: SessionGate.Backend? = nil) {
             self.backend = backend
         }
 
-        func loadBackend() -> SessionGate.Backend? { backend }
-        func saveBackend(_ backend: SessionGate.Backend) {
+        func loadBackendOverride() -> SessionGate.Backend? { backend }
+        func saveBackendOverride(_ backend: SessionGate.Backend) {
             self.backend = backend
             savedBackends.append(backend)
+        }
+        func clearBackendOverride() { backend = nil }
+        func consumeLegacyBackend() -> SessionGate.Backend? {
+            defer { legacyBackend = nil }
+            return legacyBackend
         }
     }
 
     private final class FakePathMonitor: SessionPathMonitor, @unchecked Sendable {
         private var handler: (@Sendable () -> Void)?
-        func start(onChange: @escaping @Sendable () -> Void) { handler = onChange }
+        private(set) var startCount = 0
+        func start(onChange: @escaping @Sendable () -> Void) {
+            startCount += 1
+            handler = onChange
+        }
         func cancel() { handler = nil }
         func trigger() { handler?() }
     }
@@ -266,14 +276,20 @@ final class SessionGateTests: XCTestCase {
                                 transport: transport)
             }
         )
+        let preference = MemoryPreferenceStore()
         let gate = SessionGate(makeSession: { cloud.session }, makeLocalSession: { local },
-                               preferences: MemoryPreferenceStore(), pathMonitor: monitor)
+                               preferences: preference, pathMonitor: monitor)
         await gate.start()
-        await gate.selectBackend(.cloud)
+        await gate.select(.cloud)
         transport.setReachable(true)
         monitor.trigger()
         await Task.yield()
         XCTAssertEqual(gate.backend, .cloud)
+
+        await gate.select(.automatic)
+        XCTAssertEqual(gate.selection, .automatic)
+        XCTAssertEqual(gate.backend, .local)
+        XCTAssertNil(preference.backend)
     }
 
     func testManualSelectionDuringLocalProbeCannotBeOverwritten() async {
@@ -303,7 +319,7 @@ final class SessionGateTests: XCTestCase {
         guard await transport.gate.waitForArrival(timeout: 1) else {
             return XCTFail("local probe did not start")
         }
-        await gate.selectBackend(.cloud)
+        await gate.select(.cloud)
         await transport.gate.openGate()
         await startTask.value
 
@@ -358,7 +374,21 @@ final class SessionGateTests: XCTestCase {
         let gate = SessionGate(preferences: preference)
 
         XCTAssertEqual(gate.backend, .local)
-        XCTAssertEqual(preference.loadBackend(), .local)
+        XCTAssertEqual(preference.loadBackendOverride(), .local)
+    }
+
+    func testLegacyPreferenceIsConsumedButDoesNotSelectBackend() async {
+        let preference = MemoryPreferenceStore()
+        preference.legacyBackend = .local
+        let rig = harness(paired: true) { _, _ in .refused(404) }
+        let gate = SessionGate(makeSession: { rig.session }, preferences: preference)
+
+        await gate.start()
+
+        XCTAssertEqual(gate.selection, .automatic)
+        XCTAssertEqual(gate.backend, .cloud)
+        XCTAssertNil(preference.legacyBackend)
+        XCTAssertNil(preference.backend)
     }
 
     func testPairingScreenCanReturnFromUnpairedLocalToPairedCloud() async {
@@ -392,7 +422,7 @@ final class SessionGateTests: XCTestCase {
 
         XCTAssertEqual(gate.backend, .cloud)
         XCTAssertEqual(gate.phase, .paired)
-        XCTAssertEqual(preference.backend, .cloud)
+        XCTAssertNil(preference.backend)
     }
 
     func testRemovingLocalFallsBackToPairedCloud() async {
@@ -430,7 +460,7 @@ final class SessionGateTests: XCTestCase {
 
         XCTAssertEqual(gate.backend, .cloud)
         XCTAssertEqual(gate.phase, .paired)
-        XCTAssertEqual(preference.backend, .cloud)
+        XCTAssertEqual(preference.backend, .local)
     }
 
     func testAKeyThatCannotBeCreatedIsUnusable() async {
@@ -481,6 +511,55 @@ final class SessionGateTests: XCTestCase {
         // The label the rider typed is what the desktop's device list shows, so
         // it has to actually leave the device.
         XCTAssertEqual(json["label"] as? String, "TR1 iPad")
+    }
+
+    func testPairThenAutomaticClearsTheTemporarySelection() async throws {
+        let preference = MemoryPreferenceStore()
+        let rig = harness(paired: false) { _, _ in .json(CloudFixtures.pairingBody()) }
+        let gate = SessionGate(makeSession: { rig.session }, preferences: preference)
+        await gate.start()
+
+        try await gate.pair(code: "ABCD-EFGH-JKMN", label: nil)
+        XCTAssertEqual(gate.backend, .cloud)
+        XCTAssertEqual(gate.selection, .automatic)
+        XCTAssertNil(preference.backend)
+
+        await gate.select(.automatic)
+        XCTAssertEqual(gate.selection, .automatic)
+        XCTAssertEqual(gate.backend, .cloud)
+        XCTAssertNil(preference.backend)
+    }
+
+    func testAutomaticClearsAPersistedOverrideForAnUnpairedBackend() async {
+        let preference = MemoryPreferenceStore()
+        let cloud = harness(paired: false) { _, _ in .refused(404) }
+        let transport = LocalProbeTransport()
+        let local = LocalSession(
+            credentials: MemoryLocalCredentialStore(credential: try? LocalCredential(
+                baseURL: "https://desktop.example", token: "token")),
+            cache: MemorySnapshotCache(),
+            makeClient: { value in
+                try LocalClient(baseURL: URL(string: value.baseURL)!, token: value.token,
+                                transport: transport)
+            }
+        )
+        let gate = SessionGate(
+            makeSession: { cloud.session }, makeLocalSession: { local },
+            preferences: preference
+        )
+
+        await gate.start()
+        await gate.select(.cloud)
+        XCTAssertEqual(gate.selection, .cloud)
+        XCTAssertEqual(preference.backend, .cloud)
+        XCTAssertEqual(gate.phase, .unpaired)
+
+        await gate.select(.automatic)
+
+        XCTAssertEqual(gate.selection, .automatic)
+        XCTAssertEqual(gate.backend, .local)
+        XCTAssertEqual(gate.phase, .paired)
+        XCTAssertNil(preference.backend)
     }
 
     func testARefusedPairingLeavesTheGateOnThePairingScreen() async {
@@ -704,5 +783,24 @@ final class SessionGateTests: XCTestCase {
 
         XCTAssertEqual(gate.backend, .cloud)
         XCTAssertEqual(preference.backend, .cloud)
+    }
+
+    func testStartingTwiceStartsThePathMonitorOnlyOnce() async {
+        let monitor = FakePathMonitor()
+        let rig = harness(paired: true) { _, _ in .refused(404) }
+        let gate = SessionGate(makeSession: { rig.session }, preferences: MemoryPreferenceStore(), pathMonitor: monitor)
+
+        await gate.start()
+        await gate.start()
+
+        XCTAssertEqual(monitor.startCount, 1)
+    }
+
+    func testSystemPathMonitorIgnoresDuplicateStartAndCancelIsSafe() {
+        let monitor = SystemSessionPathMonitor()
+        monitor.start(onChange: {})
+        monitor.start(onChange: {})
+        monitor.cancel()
+        monitor.cancel()
     }
 }
