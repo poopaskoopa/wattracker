@@ -2023,7 +2023,10 @@ def _activity_is_visible(row, cutoff: Optional[str], timezone: Optional[str]) ->
     when = parse_naive(row["start_time"] if hasattr(row, "keys") else row.get("start_time"))
     if when is None:
         return False
-    return to_user_timezone(when, timezone).date().isoformat() >= cutoff
+    try:
+        return to_user_timezone(when, timezone).date().isoformat() >= cutoff
+    except (OverflowError, OSError, ValueError):
+        return False
 
 
 def activity_is_visible(user_id: int, start_time: Optional[str], path: Optional[str] = None) -> bool:
@@ -4113,13 +4116,19 @@ def activities_between(
         ).fetchall()
         settings = get_user_settings(user_id, path)
         visible = _visible_rows(conn, user_id, rows)
-        return [
-            _row_summary(r) for r in visible
-            if (parse_naive(r["start_time"]) is not None and
-                start_iso <= to_user_timezone(
-                    parse_naive(r["start_time"]), settings.get("timezone")
-                ).date().isoformat() <= end_iso)
-        ]
+        result = []
+        for row in visible:
+            started = parse_naive(row["start_time"])
+            if started is None:
+                continue
+            try:
+                date = to_user_timezone(started, settings.get("timezone")).date().isoformat()
+            except (OverflowError, OSError, ValueError):
+                # Matchers cannot use an instant without a representable local date.
+                continue
+            if start_iso <= date <= end_iso:
+                result.append(_row_summary(row))
+        return result
     finally:
         conn.close()
 
