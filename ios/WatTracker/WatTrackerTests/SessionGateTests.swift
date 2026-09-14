@@ -244,6 +244,7 @@ final class SessionGateTests: XCTestCase {
         let gate = SessionGate(makeSession: { cloud.session }, makeLocalSession: { local },
                                preferences: preference)
         await gate.start()
+        await gate.automaticReevaluate()
         XCTAssertEqual(gate.backend, .local)
         transport.setReachable(false)
         await gate.automaticReevaluate()
@@ -564,7 +565,7 @@ final class SessionGateTests: XCTestCase {
 
     // MARK: - Being removed from the other end
 
-    func testAServerSideRevokeReachesTheGateOnAProbe() async {
+    func testAServerSideRevokeReachesCloudSessionWhenLocalBackendSelected() async {
         let clock = TestClock()
         let rig = harness(paired: true, clock: clock) { _, _ in
             // Every authentication failure on this plane is a 404; the `Date`
@@ -584,6 +585,10 @@ final class SessionGateTests: XCTestCase {
             makeSession: { rig.session }, makeLocalSession: { local },
             preferences: MemoryPreferenceStore(.local)
         )
+        rig.cache.store(
+            CachedCollection(revision: 4, items: [], storedAt: clock.now),
+            for: .dashboard
+        )
         await gate.start()
         XCTAssertEqual(gate.backend, .local)
         let requestsBeforeProbe = rig.transport.requestCount
@@ -599,12 +604,10 @@ final class SessionGateTests: XCTestCase {
         let requestsBeforeSecondProbe = rig.transport.requestCount
         await gate.probe()
         XCTAssertGreaterThan(rig.transport.requestCount, requestsBeforeSecondProbe)
-        XCTAssertEqual(gate.phase, .removed)
+        let cloudState = await rig.session.deviceState
+        XCTAssertEqual(cloudState, .removed)
         XCTAssertNil(rig.credentials.load())
-
-        // And there is a way back: the removed screen's only action.
-        await gate.startOver()
-        XCTAssertEqual(gate.phase, .unpaired)
+        XCTAssertNil(rig.cache.load(.dashboard))
     }
 
     func testProbingAnUnpairedGateSendsNothing() async {
