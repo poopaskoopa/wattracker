@@ -637,8 +637,10 @@ def test_lifespan_starts_scan_task_when_enabled(monkeypatch):
 
 
 ROLLOVER_CASES = [
+    # 00:30 UTC is 20:30 on the prior local day in UTC-4.
     ("America/New_York", "2026-07-16T00:30:00", "2026-07-15"),
-    ("Pacific/Auckland", "2026-07-15T23:30:00", "2026-07-16"),
+    # 12:30 UTC is 00:30 on the next local day in UTC+12.
+    ("Pacific/Auckland", "2026-07-15T12:30:00", "2026-07-16"),
 ]
 
 
@@ -759,17 +761,16 @@ def test_completion_writers_store_local_activity_date(
     user_id, timezone, started, local_date, writer
 ):
     workout_id, activity_id = _rollover_completion(user_id, timezone, started)
-    # Calendar/manual selection uses the existing UTC-day lookup. Preserve
-    # that selection behavior while fixing the persisted completion date.
+    # Calendar/manual selection uses the rider-local activity day.
     if writer != "explicit":
         with db.connect() as conn:
             conn.execute("UPDATE plan_workouts SET date=? WHERE id=?",
-                         (started[:10], workout_id))
+                         (local_date, workout_id))
     if writer == "explicit":
         assert importer.link_selected_plan_workout(user_id, workout_id, activity_id)
     elif writer == "calendar":
         assert importer.match_plan_workout_completion(
-            user_id, workout_id, dt.date.fromisoformat(started[:10])
+            user_id, workout_id, dt.date.fromisoformat(local_date)
         )
     else:
         assert importer.manually_complete_plan_workout(user_id, workout_id) == "completed"

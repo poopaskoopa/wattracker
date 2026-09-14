@@ -1448,7 +1448,7 @@ def match_plan_workout_completion(
     if duration <= 0:
         return False
 
-    for summary in db.activities_on_date(user_id, workout["date"]):
+    for summary in db.activities_between(user_id, workout["date"], workout["date"]):
         if summary["id"] in used:
             continue
         duration_error = abs(float(summary.get("duration_s") or 0) - duration) / duration
@@ -1548,7 +1548,7 @@ def manually_complete_plan_workout(user_id: int, workout_id: int) -> str:
     if scheduled > utc_today():
         return "future"
 
-    activities = db.activities_on_date(user_id, workout["date"])
+    activities = db.activities_between(user_id, workout["date"], workout["date"])
     if not activities:
         return "no_activity"
     used = db.completed_activity_ids(user_id)
