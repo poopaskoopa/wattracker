@@ -325,6 +325,53 @@ struct LocalClient: Sendable {
 /// The local session adapts the desktop JSON endpoints to the same snapshots
 /// consumed by the cloud-backed screen models.
 actor LocalSession: ReadSession {
+    private enum ProbeResult: Sendable {
+        case reachable(generation: Int)
+        case unauthorized(generation: Int)
+        case transient
+    }
+
+    private final class ProbeRace: @unchecked Sendable {
+        private let lock = NSLock()
+        private var finished = false
+        private var continuation: CheckedContinuation<Bool, Never>?
+        private var operation: Task<Void, Never>?
+        private var timeout: Task<Void, Never>?
+
+        init(_ continuation: CheckedContinuation<Bool, Never>) {
+            self.continuation = continuation
+        }
+
+        func install(operation: Task<Void, Never>, timeout: Task<Void, Never>) {
+            lock.lock()
+            self.operation = operation
+            self.timeout = timeout
+            let shouldCancel = finished
+            lock.unlock()
+            if shouldCancel { operation.cancel(); timeout.cancel() }
+        }
+
+        func claim() -> Bool {
+            lock.lock()
+            guard !finished else { lock.unlock(); return false }
+            finished = true
+            lock.unlock()
+            return true
+        }
+
+        func resolve(_ value: Bool) {
+            lock.lock()
+            let continuation = self.continuation
+            self.continuation = nil
+            let operation = self.operation
+            let timeout = self.timeout
+            lock.unlock()
+            operation?.cancel()
+            timeout?.cancel()
+            continuation?.resume(returning: value)
+        }
+    }
+
     private let credentials: LocalCredentialStore
     private let cache: SnapshotCache
     private let makeClient: @Sendable (LocalCredential) throws -> LocalClient
@@ -437,17 +484,67 @@ actor LocalSession: ReadSession {
         lastSuccessfulRead = nil
     }
 
-    func probe() async {
-        guard state == .paired else { return }
+    /// Check the stored desktop without allowing an unavailable endpoint to
+    /// hold backend selection up. The credential and cache are only changed by
+    /// the existing repeated-401 removal path.
+    func probe(timeout: TimeInterval = 3) async -> Bool {
+        guard state == .paired else { return false }
+        let result = await withTaskCancellationHandler(operation: {
+            await withCheckedContinuation { continuation in
+                let race = ProbeRace(continuation)
+                let operation = Task {
+                    let result = await self.probeOnce()
+                    guard race.claim() else { return }
+                    switch result {
+                    case let .reachable(generation):
+                        guard self.lifecycleGeneration == generation,
+                              self.state == .paired
+                        else {
+                            race.resolve(false)
+                            return
+                        }
+                        self.lastSuccessfulRead = self.clock()
+                        race.resolve(true)
+                    case let .unauthorized(generation):
+                        self.removeAfterProbe(generation: generation)
+                        race.resolve(false)
+                    case .transient:
+                        race.resolve(false)
+                    }
+                }
+                let timer = Task {
+                    let nanos = UInt64(max(0, timeout) * 1_000_000_000)
+                    try? await Task.sleep(nanoseconds: nanos)
+                    guard race.claim() else { return }
+                    race.resolve(false)
+                }
+                race.install(operation: operation, timeout: timer)
+            }
+        }, onCancel: {})
+        return result
+    }
+
+    private func removeAfterProbe(generation: Int) {
+        guard lifecycleGeneration == generation, state == .paired else { return }
+        markRemoved()
+    }
+
+    private func probeOnce() async -> ProbeResult {
         let generation = lifecycleGeneration
         do {
             _ = try await perform { try await $0.trainingState() }
-            guard lifecycleGeneration == generation, state == .paired else { return }
-            lastSuccessfulRead = clock()
+            guard lifecycleGeneration == generation, state == .paired else {
+                return .transient
+            }
+            return .reachable(generation: generation)
         } catch LocalClient.Failure.unauthorized {
-            markRemoved()
+            guard lifecycleGeneration == generation, state == .paired else {
+                return .transient
+            }
+            return .unauthorized(generation: generation)
         } catch {
             // A temporary local outage must not erase a still-valid token.
+            return .transient
         }
     }
 

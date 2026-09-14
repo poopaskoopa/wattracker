@@ -1,6 +1,29 @@
 import Foundation
 import Observation
+import Network
 import Security
+
+protocol SessionPathMonitor: AnyObject {
+    func start(onChange: @escaping @Sendable () -> Void)
+    func cancel()
+}
+
+final class SystemSessionPathMonitor: SessionPathMonitor {
+    private let monitor = NWPathMonitor()
+    private let queue = DispatchQueue(label: "com.wattracker.ios.network-path")
+    private var hasStarted = false
+
+    func start(onChange: @escaping @Sendable () -> Void) {
+        guard !hasStarted else { return }
+        hasStarted = true
+        monitor.pathUpdateHandler = { _ in onChange() }
+        monitor.start(queue: queue)
+    }
+
+    func cancel() {
+        monitor.cancel()
+    }
+}
 
 /// The one `CloudSession` in the app, and the observable answer to "which of
 /// the three worlds is the rider in".
@@ -39,6 +62,22 @@ final class SessionGate {
         }
     }
 
+    enum Selection: String, CaseIterable, Identifiable, Hashable {
+        case automatic
+        case cloud
+        case local
+
+        var id: String { rawValue }
+
+        var title: String {
+            switch self {
+            case .automatic: return "Automatic"
+            case .cloud: return "Cloud"
+            case .local: return "This desktop"
+            }
+        }
+    }
+
     enum Phase: Equatable {
         /// Before the signing key has been loaded. Distinct from `unpaired`
         /// because showing the pairing screen for the fraction of a second it
@@ -63,8 +102,10 @@ final class SessionGate {
     }
 
     protocol PreferenceStore {
-        func loadBackend() -> Backend?
-        func saveBackend(_ backend: Backend)
+        func loadBackendOverride() -> Backend?
+        func saveBackendOverride(_ backend: Backend)
+        func clearBackendOverride()
+        func consumeLegacyBackend() -> Backend?
     }
 
     struct KeychainPreferenceStore: PreferenceStore, Sendable {
@@ -73,14 +114,36 @@ final class SessionGate {
 
         init(
             service: String = "com.wattracker.ios.session",
-            account: String = "selected-backend-v1"
+            account: String = "backend-override-v2"
         ) {
             self.service = service
             self.account = account
         }
 
-        func loadBackend() -> Backend? {
-            var query = baseQuery()
+        func loadBackendOverride() -> Backend? {
+            load(account: account)
+        }
+
+        func saveBackendOverride(_ backend: Backend) {
+            var query = baseQuery(account: account)
+            query[kSecValueData as String] = Data(backend.rawValue.utf8)
+            query[kSecAttrAccessible as String] =
+                kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly
+            SecItemDelete(baseQuery(account: account) as CFDictionary)
+            _ = SecItemAdd(query as CFDictionary, nil)
+        }
+
+        func clearBackendOverride() {
+            SecItemDelete(baseQuery(account: account) as CFDictionary)
+        }
+
+        func consumeLegacyBackend() -> Backend? {
+            defer { SecItemDelete(baseQuery(account: "selected-backend-v1") as CFDictionary) }
+            return load(account: "selected-backend-v1")
+        }
+
+        private func load(account: String) -> Backend? {
+            var query = baseQuery(account: account)
             query[kSecReturnData as String] = true
             query[kSecMatchLimit as String] = kSecMatchLimitOne
             var item: CFTypeRef?
@@ -93,20 +156,11 @@ final class SessionGate {
             return Backend(rawValue: rawValue)
         }
 
-        func saveBackend(_ backend: Backend) {
-            var query = baseQuery()
-            query[kSecValueData as String] = Data(backend.rawValue.utf8)
-            query[kSecAttrAccessible as String] =
-                kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly
-            SecItemDelete(baseQuery() as CFDictionary)
-            _ = SecItemAdd(query as CFDictionary, nil)
-        }
-
-        private func baseQuery() -> [String: Any] {
+        private func baseQuery(account: String? = nil) -> [String: Any] {
             [
                 kSecClass as String: kSecClassGenericPassword,
                 kSecAttrService as String: service,
-                kSecAttrAccount as String: account,
+                kSecAttrAccount as String: account ?? self.account,
             ]
         }
     }
@@ -123,16 +177,37 @@ final class SessionGate {
     private let makeSession: @Sendable () throws -> CloudSession
     private let makeLocalSession: @Sendable () throws -> LocalSession
     private let preferences: PreferenceStore
+    private let pathMonitor: SessionPathMonitor
+    private var manualOverride: Backend?
+    private var selectionGeneration = 0
+    private var automaticGeneration = 0
+    private var automaticReevaluationTask: Task<Void, Never>?
+    private var automaticReevaluationPending = false
+    private var automaticReevaluationForcePending = false
+    private var pathMonitorStarted = false
+
+    var selection: Selection {
+        manualOverride.map { $0 == .cloud ? .cloud : .local } ?? .automatic
+    }
 
     init(
         makeSession: @escaping @Sendable () throws -> CloudSession = SessionGate.liveSession,
         makeLocalSession: @escaping @Sendable () throws -> LocalSession = SessionGate.liveLocalSession,
-        preferences: PreferenceStore = KeychainPreferenceStore()
+        preferences: PreferenceStore = KeychainPreferenceStore(),
+        pathMonitor: SessionPathMonitor = SystemSessionPathMonitor()
     ) {
         self.makeSession = makeSession
         self.makeLocalSession = makeLocalSession
         self.preferences = preferences
-        self.backend = preferences.loadBackend() ?? .cloud
+        self.pathMonitor = pathMonitor
+        let storedBackend = preferences.loadBackendOverride()
+        _ = preferences.consumeLegacyBackend()
+        self.manualOverride = storedBackend
+        self.backend = storedBackend ?? .cloud
+    }
+
+    deinit {
+        pathMonitor.cancel()
     }
 
     /// The real session: an Enclave key where there is one, the keychain
@@ -190,22 +265,97 @@ final class SessionGate {
 
         let cloudPaired = await session?.deviceState == .paired
         let localPaired = await localSession?.deviceState == .paired
-        if backend == .local, localPaired {
-            // Keep the rider's explicit choice when its credential is present.
-        } else if backend == .cloud, cloudPaired {
-            // Keep the rider's explicit choice when its credential is present.
-        } else if localPaired {
-            backend = .local
-        } else if cloudPaired {
-            // A stale local preference must not hide a paired cloud session.
-            backend = .cloud
+        if let manualOverride {
+            backend = manualOverride
+        } else {
+            backend = cloudPaired ? .cloud : (localPaired ? .local : .cloud)
         }
-        preferences.saveBackend(backend)
         if session == nil && !localPaired {
             phase = .unusable(String(describing: cloudError ?? GateFailure.noSession))
             return
         }
         await refresh()
+        Task { @MainActor [weak self] in await self?.automaticReevaluate() }
+        guard !pathMonitorStarted else { return }
+        pathMonitorStarted = true
+        pathMonitor.start { [weak self] in
+            Task { @MainActor in await self?.automaticReevaluate() }
+        }
+    }
+
+    /// Prefer the already paired desktop when its endpoint answers. No host
+    /// discovery occurs; LocalSession probes only its stored credential.
+    func automaticReevaluate(force: Bool = false) async {
+        automaticReevaluationPending = true
+        automaticReevaluationForcePending = automaticReevaluationForcePending || force
+        if automaticReevaluationTask == nil {
+            automaticReevaluationTask = Task { @MainActor [weak self] in
+                guard let self else { return }
+                while self.automaticReevaluationPending {
+                    self.automaticReevaluationPending = false
+                    let force = self.automaticReevaluationForcePending
+                    self.automaticReevaluationForcePending = false
+                    await self.runAutomaticReevaluation(force: force)
+                }
+                self.automaticReevaluationTask = nil
+            }
+        }
+        if let task = automaticReevaluationTask {
+            await task.value
+        }
+    }
+
+    private func runAutomaticReevaluation(force: Bool = false) async {
+        guard phase == .starting || phase == .paired || (force && phase == .unpaired)
+        else { return }
+        automaticGeneration += 1
+        let automaticGeneration = self.automaticGeneration
+        let selectionGeneration = self.selectionGeneration
+        guard manualOverride == nil else {
+            await probeSelectedBackend()
+            guard automaticGeneration == self.automaticGeneration,
+                  selectionGeneration == self.selectionGeneration
+            else {
+                await refresh()
+                return
+            }
+            await refresh()
+            return
+        }
+        let localPaired = await localSession?.deviceState == .paired
+        let cloudPaired = await session?.deviceState == .paired
+        let localReachable: Bool
+        if localPaired, let localSession {
+            localReachable = await localSession.probe()
+        } else {
+            localReachable = false
+        }
+        guard manualOverride == nil,
+              automaticGeneration == self.automaticGeneration,
+              selectionGeneration == self.selectionGeneration
+        else {
+            await refresh()
+            return
+        }
+        if localReachable {
+            backend = .local
+        } else if cloudPaired {
+            backend = .cloud
+        } else if localPaired {
+            // Keep the only paired backend selected when the desktop is
+            // temporarily unavailable, so its cache remains usable.
+            backend = .local
+        }
+        await refresh()
+    }
+
+    private func probeSelectedBackend() async {
+        switch backend {
+        case .cloud:
+            if let session { _ = try? await session.readerContext() }
+        case .local:
+            if let localSession { _ = await localSession.probe() }
+        }
     }
 
     /// Re-read the actor's state. Cheap -- no request -- and safe to call after
@@ -232,6 +382,7 @@ final class SessionGate {
     /// through `PairingFailureMessage` and never directly.
     func pair(code: String, label: String?) async throws {
         guard let session else { throw GateFailure.noSession }
+        selectionGeneration += 1
         backend = .cloud
         do {
             try await session.pair(code: code, label: label)
@@ -242,7 +393,6 @@ final class SessionGate {
             await refresh()
             throw error
         }
-        preferences.saveBackend(.cloud)
         await refresh()
     }
 
@@ -251,6 +401,7 @@ final class SessionGate {
     /// cookie it receives from the desktop.
     func pairLocal(host: String, token: String, label: String?) async throws {
         guard let localSession else { throw GateFailure.noSession }
+        selectionGeneration += 1
         backend = .local
         do {
             try await localSession.pair(host: host, token: token, label: label)
@@ -258,18 +409,37 @@ final class SessionGate {
             await refresh()
             throw error
         }
-        preferences.saveBackend(.local)
         await refresh()
     }
 
     func selectBackend(_ backend: Backend) async {
+        let hasCandidate = backend == .cloud ? session != nil : localSession != nil
+        guard hasCandidate else { return }
+        selectionGeneration += 1
+        self.backend = backend
+        await refresh()
+    }
+
+    func select(_ selection: Selection) async {
+        switch selection {
+        case .automatic:
+            selectionGeneration += 1
+            manualOverride = nil
+            preferences.clearBackendOverride()
+            await automaticReevaluate(force: true)
+        case .cloud, .local:
+            let backend: Backend = selection == .cloud ? .cloud : .local
+            await selectBackendOverride(backend)
+        }
+    }
+
+    private func selectBackendOverride(_ backend: Backend) async {
         let candidate: (any ReadSession)? = backend == .cloud ? session : localSession
         guard let candidate else { return }
-        let isPaired = await candidate.deviceState == .paired
+        selectionGeneration += 1
+        manualOverride = backend
         self.backend = backend
-        if isPaired {
-            preferences.saveBackend(backend)
-        }
+        preferences.saveBackendOverride(backend)
         await refresh()
     }
 
@@ -299,9 +469,6 @@ final class SessionGate {
             await localSession.signOut()
             if await session?.deviceState == .paired {
                 backend = .cloud
-                preferences.saveBackend(.cloud)
-            } else {
-                preferences.saveBackend(.local)
             }
         }
         await refresh()
@@ -337,15 +504,9 @@ final class SessionGate {
     /// recorded in the phase this then reads. Two refusals are needed, with the
     /// backoff between them, so a single foregrounding cannot unpair anything.
     func probe() async {
-        guard phase == .paired else { return }
-        switch backend {
-        case .cloud:
-            guard let session else { return }
+        if let session, await session.deviceState == .paired {
             _ = try? await session.readerContext()
-        case .local:
-            guard let localSession else { return }
-            await localSession.probe()
         }
-        await refresh()
+        await automaticReevaluate()
     }
 }

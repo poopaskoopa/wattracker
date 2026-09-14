@@ -57,16 +57,16 @@ struct SettingsScreen: View {
                     .font(.callout.weight(.semibold))
                     .foregroundStyle(Palette.textBright)
                 Picker("Read data from", selection: Binding(
-                    get: { gate.backend },
+                    get: { gate.selection },
                     set: { value in
                         Task {
-                            await gate.selectBackend(value)
+                            await gate.select(value)
                             await model.reload(session: gate.session, gate: gate)
                         }
                     }
                 )) {
-                    ForEach(SessionGate.Backend.allCases) { backend in
-                        Text(backend.title).tag(backend)
+                    ForEach(SessionGate.Selection.allCases) { selection in
+                        Text(selection.title).tag(selection)
                     }
                 }
                 .pickerStyle(.segmented)
