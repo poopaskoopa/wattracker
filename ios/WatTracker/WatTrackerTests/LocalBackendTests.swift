@@ -28,6 +28,24 @@ final class LocalBackendTests: XCTestCase {
         }
     }
 
+    private final class LateUnauthorizedTransport: LocalTransport, @unchecked Sendable {
+        private let delay: TimeInterval
+
+        init(delay: TimeInterval) {
+            self.delay = delay
+        }
+
+        func send(_ request: URLRequest) async throws -> LocalResponse {
+            await withCheckedContinuation { continuation in
+                DispatchQueue.global().asyncAfter(deadline: .now() + delay) {
+                    continuation.resume(returning: LocalResponse(
+                        status: 401, body: Data(), url: request.url!
+                    ))
+                }
+            }
+        }
+    }
+
     private let baseURL = URL(string: "https://desktop.example")!
 
     func testProbeIsBoundedAndPreservesCredentialAndCacheOnTimeout() async throws {
@@ -46,6 +64,38 @@ final class LocalBackendTests: XCTestCase {
         let reachable = await session.probe(timeout: 0.02)
         XCTAssertFalse(reachable)
         XCTAssertLessThan(Date().timeIntervalSince(started), 0.25)
+        let state = await session.deviceState
+        XCTAssertEqual(state, .paired)
+        XCTAssertNotNil(store.load())
+        XCTAssertNotNil(cache.load(.dashboard))
+    }
+
+    func testLateUnauthorizedProbeAfterTimeoutCannotRemoveCredentialOrCache() async throws {
+        let credential = try LocalCredential(
+            baseURL: baseURL.absoluteString, token: "device-token"
+        )
+        let store = MemoryLocalCredentialStore(credential: credential)
+        let cache = MemorySnapshotCache()
+        cache.store(
+            CachedCollection(revision: 1, items: [], storedAt: Date()),
+            for: .dashboard
+        )
+        let session = LocalSession(
+            credentials: store,
+            cache: cache,
+            makeClient: { value in
+                try LocalClient(
+                    baseURL: URL(string: value.baseURL)!,
+                    token: value.token,
+                    transport: LateUnauthorizedTransport(delay: 0.05)
+                )
+            }
+        )
+
+        let reachable = await session.probe(timeout: 0.01)
+        XCTAssertFalse(reachable)
+        try await Task.sleep(nanoseconds: 150_000_000)
+
         let state = await session.deviceState
         XCTAssertEqual(state, .paired)
         XCTAssertNotNil(store.load())
