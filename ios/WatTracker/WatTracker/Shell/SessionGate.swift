@@ -160,8 +160,9 @@ final class SessionGate {
         self.makeLocalSession = makeLocalSession
         self.preferences = preferences
         self.pathMonitor = pathMonitor
-        self.manualOverride = preferences.loadBackend()
-        self.backend = manualOverride ?? .cloud
+        let storedBackend = preferences.loadBackend()
+        self.manualOverride = storedBackend
+        self.backend = storedBackend ?? .cloud
     }
 
     deinit {
