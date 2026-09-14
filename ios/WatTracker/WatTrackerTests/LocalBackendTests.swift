@@ -46,7 +46,8 @@ final class LocalBackendTests: XCTestCase {
         let reachable = await session.probe(timeout: 0.02)
         XCTAssertFalse(reachable)
         XCTAssertLessThan(Date().timeIntervalSince(started), 0.25)
-        XCTAssertEqual(await session.deviceState, .paired)
+        let state = await session.deviceState
+        XCTAssertEqual(state, .paired)
         XCTAssertNotNil(store.load())
         XCTAssertNotNil(cache.load(.dashboard))
     }
