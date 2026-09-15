@@ -1,7 +1,5 @@
 package com.wattracker.android.cloud
 
-import kotlin.math.max
-
 /**
  * One route's last-known objects, and the checkpoint they were read at.
  *
@@ -34,7 +32,9 @@ interface SnapshotCache {
      * [generation] is the lifecycle identity the read ran under. A write is
      * refused once a newer identity has committed (a removal or re-pairing),
      * so a read still in flight cannot put the previous device's objects back
-     * on disk after the wipe.
+     * on disk after the wipe. The identity is process-local (a [GenerationGate]
+     * in memory, never on disk): a restarted process is a fresh identity, and
+     * its writes must land against the rows the prior launch stored.
      */
     fun store(received: List<CloudItem>, revision: Int, route: CloudRoute, full: Boolean, generation: Long)
 
@@ -50,37 +50,69 @@ interface SnapshotCache {
 }
 
 /**
+ * The identity gate behind the generation-stamped cache writes.
+ *
+ * [accepts] refuses a write from an identity older than one already
+ * committed, so a read that is still in flight cannot put a wiped device's
+ * objects back after a removal or re-pairing. [commit] records the identity
+ * a write (or wipe) ran under.
+ *
+ * Process-local on purpose: an in-flight read cannot outlive the process that
+ * started it (the iOS session's `lifecycleGeneration` is the same shape), so
+ * the gate must not outlive it either. Persisting the highest committed
+ * identity lets a dead process veto a living one -- after a restart the
+ * fresh session's identity sits below the persisted epoch and every write is
+ * refused, freezing the cache at the prior launch's revision. The gate lives
+ * in memory and is born with the process.
+ */
+class GenerationGate {
+    @Volatile private var committed = 0L
+
+    /** True if a write under [generation] may land. */
+    fun accepts(generation: Long): Boolean = generation >= committed
+
+    /** Record that [generation] committed; older identities are refused after. */
+    fun commit(generation: Long) {
+        if (generation > committed) committed = generation
+    }
+}
+
+/**
  * The in-process cache: the tests use it, and it is the reference for the
  * [merge] rule. It also lets a build with no disk access fall back to
  * last-known data for the life of the process.
+ *
+ * [backing] exists so a test can share one map between two cache instances --
+ * the rows survive a "restart" while each instance keeps its own in-memory
+ * gate, the exact shape of the Room cache.
  */
 class InMemorySnapshotCache(
     private val clock: () -> Long = { System.currentTimeMillis() },
+    private val backing: MutableMap<CloudRoute, CachedCollection> = HashMap(),
 ) : SnapshotCache {
 
     private val lock = Any()
-    private val store = HashMap<CloudRoute, CachedCollection>()
-    private var epoch = 0L
+    private val gate = GenerationGate()
 
-    override fun load(route: CloudRoute): CachedCollection? = synchronized(lock) { store[route] }
+    override fun load(route: CloudRoute): CachedCollection? = synchronized(lock) { backing[route] }
 
     override fun store(received: List<CloudItem>, revision: Int, route: CloudRoute, full: Boolean, generation: Long) {
         synchronized(lock) {
-            if (generation < epoch) return
-            val items = if (full) received.sortedBy { it.id } else merge(received, store[route])
-            store[route] = CachedCollection(revision, items, clock())
-            epoch = max(epoch, generation)
+            if (!gate.accepts(generation)) return
+            val items = if (full) received.sortedBy { it.id } else merge(received, backing[route])
+            backing[route] = CachedCollection(revision, items, clock())
+            gate.commit(generation)
         }
     }
 
     override fun dropRoute(route: CloudRoute) {
-        synchronized(lock) { store.remove(route) }
+        synchronized(lock) { backing.remove(route) }
     }
 
     override fun removeAll(generation: Long) {
         synchronized(lock) {
-            store.clear()
-            epoch = max(epoch, generation)
+            backing.clear()
+            gate.commit(generation)
         }
     }
 }

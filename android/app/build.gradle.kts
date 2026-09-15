@@ -76,12 +76,17 @@ android {
 // ships -- see the comment on it above.
 if (releaseCloudAuthority.endsWith(".example") && !project.hasProperty("allowPlaceholderHost")) {
     afterEvaluate {
-        tasks.named("assembleRelease") {
-            doFirst {
-                throw GradleException(
-                    "Release build points at the #102 placeholder host. " +
-                    "Pass -PallowPlaceholderHost to override."
-                )
+        // Both release entry points: the APK path and the bundle path (Step 7
+        // ships a bundle, not an APK) -- a guard on one alone is a door left
+        // ajar on the other.
+        listOf("assembleRelease", "bundleRelease").forEach { name ->
+            tasks.named(name) {
+                doFirst {
+                    throw GradleException(
+                        "Release build points at the #102 placeholder host. " +
+                        "Pass -PallowPlaceholderHost to override."
+                    )
+                }
             }
         }
     }
