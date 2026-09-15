@@ -100,13 +100,17 @@ class CloudSession(
         // An unfinished removal from a prior start -- a credential wipe that
         // failed, leaving the device paired with an empty cache -- is completed
         // now. Runs on the construction thread, which the app keeps off main.
-        if (removalGate.takePending()) {
+        // The flag is read, not consumed, and is cleared only after the wipe
+        // succeeds: a process death in the middle of this block leaves it set,
+        // so the start after that retries instead of resuming as paired.
+        if (removalGate.isPending()) {
             try {
                 credentials.clear()
+                cache.removeAll(lifecycleGeneration.toLong())
+                removalGate.clearPending()
             } catch (_: Exception) {
                 removalGate.markPending()
             }
-            cache.removeAll(lifecycleGeneration.toLong())
         }
         val stored = credentials.load()
         device = stored
@@ -147,7 +151,8 @@ class CloudSession(
      * left over from the credential being replaced would be wrong from the
      * first request onward. The generation commits *before* the disk is
      * touched, so a read that captured the old identity is refused by the
-     * cache's epoch; the cache is wiped and the new credential written
+     * cache's identity gate; the cache is wiped and the new credential
+     * written
      * durably *before* the in-memory state flips, so a crash in between is a
      * cold start rather than a new credential bound to the old checkpoint.
      */
@@ -462,7 +467,13 @@ class CloudSession(
         try {
             onIo { credentials.clear() }
         } catch (e: Exception) {
-            removalGate.markPending()
+            // The flag write can be refused too; report it, but keep the
+            // original wipe failure as the primary exception.
+            try {
+                removalGate.markPending()
+            } catch (gateFailure: Exception) {
+                e.addSuppressed(gateFailure)
+            }
             throw e
         }
     }

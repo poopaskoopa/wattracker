@@ -1,6 +1,7 @@
 package com.wattracker.android.cloud
 
 import java.io.ByteArrayOutputStream
+import java.io.IOException
 import java.io.InputStream
 import java.net.HttpURLConnection
 import java.net.URL
@@ -72,10 +73,18 @@ interface CloudTransport {
  */
 class HttpUrlCloudTransport(
     private val clock: () -> Long = { System.currentTimeMillis() / 1000L },
+    private val nowMillis: () -> Long = { System.currentTimeMillis() },
 ) : CloudTransport {
 
     override suspend fun send(request: CloudRequest): CloudResponse = withContext(Dispatchers.IO) {
         val connection = URL(request.url).openConnection() as HttpURLConnection
+        // `setReadTimeout` bounds one blocking read, not the request: a server
+        // that drips a byte at a time, each just inside the per-read window,
+        // would otherwise hold the request open forever. The deadline below is
+        // the bound on the whole thing, checked after the headers and between
+        // body chunks; a single blocking read can overshoot it by at most
+        // READ_TIMEOUT_MS.
+        val deadline = nowMillis() + REQUEST_DEADLINE_MS
         try {
             // The API never redirects; a 3xx is a failure the caller sees as-is.
             connection.instanceFollowRedirects = false
@@ -91,8 +100,9 @@ class HttpUrlCloudTransport(
             }
 
             val status = connection.responseCode
+            if (nowMillis() > deadline) throw IOException("the request exceeded the overall deadline")
             val stream = if (status in 200..299) connection.inputStream else connection.errorStream
-            val body = stream?.use { readCapped(it) } ?: ByteArray(0)
+            val body = stream?.use { readCapped(it, MAX_RESPONSE_BYTES, deadline, nowMillis) } ?: ByteArray(0)
             val retryAfter = connection.getHeaderField("Retry-After")
                 ?.let { parseRetryAfter(it, clock()) }
             val serverDate = parseHttpDate(connection.getHeaderField("Date"))
@@ -105,21 +115,39 @@ class HttpUrlCloudTransport(
     companion object {
         private const val CONNECT_TIMEOUT_MS = 15_000
         private const val READ_TIMEOUT_MS = 30_000
+
+        /** Headers to last byte: the whole request may not take longer than this. */
+        internal const val REQUEST_DEADLINE_MS = 60_000
     }
 }
 
 /**
  * A body past this cap is not this API; it is truncated and then fails to
  * decode, which the client surfaces as a failure rather than a success.
+ *
+ * A few megabytes, not fifty: the cap becomes bytes, then a String, then a
+ * JSON tree in memory, and the largest real payload on this API is a
+ * 1500-point stream page -- tens of kilobytes. Four MiB is two orders of
+ * magnitude past that, and it is the same order as the iOS cache's
+ * per-route cap.
  */
-internal const val MAX_RESPONSE_BYTES = 50 * 1024 * 1024
+internal const val MAX_RESPONSE_BYTES = 4 * 1024 * 1024
 
 /**
  * Read a response body up to a hard cap, closing the stream, so a runaway
- * body cannot hold the socket or exhaust memory. Top-level (not a member) so
- * the cap is testable without an HTTP connection.
+ * body cannot hold the socket or exhaust memory. [deadline] is the request's
+ * overall limit (epoch millis): it is checked after every chunk, so a
+ * trickling server is cut off instead of held open -- at most one read
+ * timeout past the deadline, because a single blocking read is bounded only
+ * by the connection's read timeout. Top-level (not a member) so the cap and
+ * the deadline are testable without an HTTP connection.
  */
-internal fun readCapped(stream: InputStream, cap: Int = MAX_RESPONSE_BYTES): ByteArray {
+internal fun readCapped(
+    stream: InputStream,
+    cap: Int = MAX_RESPONSE_BYTES,
+    deadline: Long = Long.MAX_VALUE,
+    now: () -> Long = { System.currentTimeMillis() },
+): ByteArray {
     val out = ByteArrayOutputStream()
     val chunk = ByteArray(8192)
     while (out.size() < cap) {
@@ -128,6 +156,7 @@ internal fun readCapped(stream: InputStream, cap: Int = MAX_RESPONSE_BYTES): Byt
         val read = stream.read(chunk, 0, minOf(chunk.size, cap - out.size()))
         if (read == -1) break
         out.write(chunk, 0, read)
+        if (now() > deadline) throw IOException("the response exceeded the overall deadline")
     }
     return out.toByteArray()
 }

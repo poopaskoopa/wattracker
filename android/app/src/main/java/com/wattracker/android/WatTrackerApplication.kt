@@ -60,6 +60,16 @@ object WatTrackerApp {
     val keyKind: DeviceKeyStore.KeyKind?
         get() = deviceKey?.kind
 
+    /**
+     * Set when the encrypted credential store will not open and the in-memory
+     * fallback is serving: a pairing then works for this launch only and is
+     * lost on the next start. #195's pairing screen must surface this instead
+     * of letting the rider pair into a void; until then this is the record.
+     */
+    @Volatile
+    var credentialStoreDegraded: Boolean = false
+        private set
+
     /** Kick the (blocking) setup off the main thread. Idempotent. */
     fun start(context: Context) {
         ensureStarted(context)
@@ -116,12 +126,19 @@ object WatTrackerApp {
 
     private fun openDatabase(context: Context): WatTrackerDatabase {
         val builder = Room.databaseBuilder(context, WatTrackerDatabase::class.java, WatTrackerDatabase.FILE_NAME)
+        val database = builder.build()
         return try {
-            builder.build()
+            // build() is lazy: the file opens on first use, so a corrupt file
+            // would throw on the first read -- long after this, and outside
+            // any catch. An empty transaction forces the open now, where the
+            // reset below can see it.
+            database.runInTransaction { }
+            database
         } catch (e: Exception) {
             // A corrupt file or schema drift: drop the actual database file
             // (it lives under databases/, not filesDir, so deleteFile would be
             // a no-op) and start with no cache.
+            runCatching { database.close() }
             context.deleteDatabase(WatTrackerDatabase.FILE_NAME)
             builder.build()
         }
@@ -141,6 +158,12 @@ object WatTrackerApp {
                 // master keyset): start unpaired from memory rather than
                 // bricking the app. There is no credential to protect that is
                 // not also missing.
+                //
+                // But the fallback is not silent: with it in place a pairing
+                // "succeeds" for this launch and is lost on the next start,
+                // so the state is recorded -- #195's pairing screen must show
+                // it instead of letting the rider pair into a void.
+                credentialStoreDegraded = true
                 InMemoryDeviceCredentialStore()
             }
         }
