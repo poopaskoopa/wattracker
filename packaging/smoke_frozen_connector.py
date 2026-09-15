@@ -1,6 +1,6 @@
 """Assert the frozen connector actually works, on the machine that built it.
 
-CI runs this. The self-hosted Windows runner freezes the connector and calls
+CI runs this. The GitHub-hosted `windows-latest` runner freezes the connector and calls
 this script against the result on every pull request, which makes it the only
 thing between a spec change and a rider being handed a binary that does
 nothing - windows-release.yml would sign such a binary quite happily, and it is
@@ -8,8 +8,7 @@ hard-disabled until a certificate exists anyway.
 tests/test_connector_packaging.py asserts what the *checkout* says; this
 asserts what the *executable* does.
 
-Everything here is safe to run on a runner that persists between jobs and
-shares its box with a trainer: each check gets its own temporary
+Everything here is safe to run on a hosted runner: each check gets its own temporary
 WATTRACKER_CONNECTOR_DIR, the stub server binds a free loopback port, and
 nothing touches Bluetooth, the registry, or the autostart key.
 

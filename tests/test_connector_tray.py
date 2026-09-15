@@ -47,12 +47,11 @@ windows_only = pytest.mark.skipif(not WINDOWS, reason="Win32 lives on Windows")
 def _has_an_interactive_desktop():
     """Is this process in a session that owns a notification area?
 
-    Session 0 is the services session and has no shell, so Shell_NotifyIcon
-    has nowhere to put an icon and refuses. The self-hosted CI runner is a
-    service account and lands there, where the three tests below fail on an
-    environment that cannot host a tray icon rather than on anything about the
-    tray. A developer's session, and a runner configured to log on
-    interactively, are non-zero and run them for real.
+    Session 0 is the services session and has no notification area, so
+    Shell_NotifyIcon has nowhere to put an icon and refuses. Hosted Windows
+    session behavior is not assumed: the helper checks this process's session
+    directly, and the three tests below skip only when it is Session 0. A
+    developer's interactive session runs them for real.
 
     Session id rather than FindWindowW("Shell_TrayWnd"): a packaged terminal
     cannot see windows owned by processes outside its container, so the window
