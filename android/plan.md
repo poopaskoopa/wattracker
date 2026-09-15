@@ -4,23 +4,49 @@ Epic #192 and sub-issues #193–#199, plus the owner's
 extra targets: Android 11+, dual-server support (cloud **and** local), offline
 cache. Kotlin + Jetpack Compose, single app under `android/`.
 
-**Resume point — all Step-1 debt is merged; Step 2 is startable.**
-PR #266 (the local-transport decision + the four #260 follow-ups) landed in
-**PR #294, merged 2026-09-14 (`ff1f2aa`)**; #266 and #260 are closed, and
-the strict release NSC, the release-host guard, the `keepRules` wiring and
-the `wtDarkColorScheme` surface mapping are on `main`. **#193 is closed**
-(owner confirmed the tablet-in-portrait screenshot) and **#194 is the next
-startable Android issue, labelled `ready`** — the stale `blocked` label the
-2026-09-11 notes carried has since been corrected. #156 (desktop cloud
-sync) closed via #274 (2026-09-13); the deployment itself (#102) remains an
-unexecuted runbook. This checkout is **`feature/android-client-2`**, cut
-from the merged `main` at `ff1f2aa` — Step 2's branch. Android CI (PR #262,
-closes #259) compiles and unit-tests `android/` on hosted `ubuntu-latest`
-for every PR touching it; the full-snapshot cloud dev harness is the code
-that runs (PR #240 merged 2026-09-06). Verified on both AVDs
-(`medium_phone` API 36, `medium_tablet` API 35): rail in landscape, bottom
-bar in portrait, drawer on tablet. README measurement table filled.
-Pre-push hook installed. See "Step 1 — completion notes" below.
+**Resume point — Step 2 (#194) is implemented on this branch; it is not yet a PR.**
+This checkout is **`feature/android-client-2`**, rebased onto `main` at
+**`52996a7`** (2026-09-14). **Step 2 — the cloud client and the
+revision-keyed offline cache — is now implemented here and committed** (see
+the 2026-09-14 rebase note below): `CloudSession` (single-flight refresh,
+conservative two-strike revocation, generation-stamped cache writes),
+`CloudClient` plus a capped, redirect-free transport, the Room snapshot
+cache keyed on the server revision, the EncryptedSharedPreferences
+credential store, the forward-compatible JSON value model, and
+`WatTrackerApplication` wiring with Tink R8 keep rules and an exported Room
+schema — unit-tested against scripted responses. Since this branch cut,
+`main` merged #295–#302 (backend-selection follow-ups, local-day
+completion, snapshot-gate baselines, hosted Windows CI, local-backend
+origin vectors, iOS device validation); none of them touch `android/`, so
+the rebase was conflict-free.
+Step-1 context: #266 landed via **#294 (`ff1f2aa`)**; #193 is closed
+(tablet-in-portrait screenshot confirmed), #156 closed via #274; #102 (the
+hosting decision) remains an unexecuted runbook and alone gates the "real
+deployment" half of #199. Android CI (PR #262) compiles and unit-tests
+`android/` on hosted `ubuntu-latest`; the full-snapshot dev harness (PR
+#240) is what runs. Verified on both AVDs (`medium_phone` API 36,
+`medium_tablet` API 35): rail in landscape, bottom bar in portrait, drawer
+on tablet. Pre-push hook installed. See "Step 1 — completion notes" below.
+
+**Revised 2026-09-14 (rebase; Step 2 implemented).** `main` moved from
+`ff1f2aa` (#294) to **`52996a7`** (#302) in the course of 2026-09-14: #295
+(separate automatic backend selection from overrides), #296 (local-day
+completion matching), #297 (clear snapshot-gate baselines), #299 (hosted
+Windows CI), #301 (local-backend origin regression vectors) and #302 (iOS
+device validation). None of these touch `android/`, so **this branch was
+rebased onto `52996a7` with no conflicts** (pre-rebase backup:
+`backup/android-client-2-pre-rebase`). **Step 2 (#194) is now implemented on
+this branch and committed** — one commit on top of the plan note: `CloudSession`
+owns the reader-context lifecycle (single-flight refresh under a `Mutex`,
+conservative two-strike revocation, generation-stamped cache writes so an
+in-flight read cannot write back after a removal or re-pairing); `CloudClient`
+signs the requests over a capped, redirect-free `HttpURLConnection` transport;
+the Room snapshot cache is keyed on the server's revision with revision-gated
+upserts and tombstone deletes; the credential store is
+EncryptedSharedPreferences; the JSON value model round-trips unknown kinds for
+forward compatibility. Wired via `WatTrackerApplication`, with Tink R8 keep
+rules and an exported Room schema. `:app:assembleDebug` and
+`:app:testDebugUnitTest` are green (53 tests). This is **not yet a PR**.
 
 **Revised 2026-09-14 — re-verified with `gh` against `main` at `ff1f2aa`.**
 The one blocker for Step 2 has landed:
@@ -163,7 +189,7 @@ since the 2026-09-01 draft:
 | IDE agent | **Android Studio 4's built-in Agent mode with BYOK** (owner, 2026-09-06). First-party, supported feature of the IDE — not a community plugin, no MCP servers, no npm bridges, no `.kilo` MCP registration. The owner's API key lives in IDE-local settings only, never in the repo. Dev accelerator, not infrastructure: every Done criterion stands on `./gradlew` + `adb`, which is also what CI runs. |
 | Local calendar data | Owner-approved (2026-09-01, unchanged): **extract the month builder out of `calendar_view` and serve it from a new read-only `GET /api/calendar?year=&month=` JSON route** in `wattracker/server.py`, so the HTML page and the app render the same data by construction. Verified still absent on 2026-09-06. Lands as a small server PR (green Python suite) before Step 6; it is the one local-backend exception to "no server changes". |
 
-## Issue state (verified 2026-09-14 with `gh`, `main` at `ff1f2aa`)
+## Issue state (issue labels as of the 2026-09-14 `gh` check; branch rebased onto `52996a7`, 2026-09-14)
 
 - #192 (epic) open. **#193 closed** (2026-09-14 — the owner confirmed the
   tablet-in-portrait screenshot that #257's re-opening was scoped to).
@@ -178,9 +204,11 @@ since the 2026-09-01 draft:
   `main` since 2026-09-10, closes #259), **#274** (desktop cloud sync, on
   `main` since 2026-09-13, closes #156), **#294** (lands the #266
   transport decision + #260 follow-ups, on `main` since 2026-09-14).
-- In flight: nothing Android. The #266 blocker is out; **Step 2 (#194 +
-  local backend) starts on `feature/android-client-2`**, cut from `main`
-  at `ff1f2aa` — this checkout. Announced per the queue rule below.
+- In flight: **Step 2 (#194) — the cloud client and offline cache — is
+  implemented on `feature/android-client-2`** (this checkout, now rebased
+  onto `main` at `52996a7`) and committed, pending its PR. The local-backend
+  seam (`LocalClient`) stays an honest stub for its own later step. Announced
+  per the queue rule below.
 - Still open and relevant: **#102** (hosting decision —
   `infra/azure/DEPLOY.md` is an *unexecuted* runbook). It alone gates the
   "real deployment" half of #199's Done; #156 (desktop cloud sync, which
