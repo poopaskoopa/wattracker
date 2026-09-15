@@ -1,6 +1,16 @@
 plugins {
     alias(libs.plugins.android.application)
     alias(libs.plugins.kotlin.compose)
+    // KSP generates the Room DAO bindings (Step 2 cache). No other annotation
+    // processor is in the project, so this is the whole codegen surface.
+    alias(libs.plugins.ksp)
+    // Exports the Room schemas to app/schemas (exportSchema = true writes
+    // nothing without a directory) so #266 can build migrations against them.
+    alias(libs.plugins.androidx.room)
+}
+
+room {
+    schemaDirectory("$projectDir/schemas")
 }
 
 // The release cloud authority lives here, once. Both the buildConfigField that
@@ -85,5 +95,19 @@ dependencies {
     implementation(libs.androidx.compose.ui)
     implementation(libs.androidx.core.ktx)
     implementation(libs.androidx.navigation.compose)
+
+    // Step 2 (#194): the revision-keyed cloud cache and the durable credential
+    // store. Room is the AndroidX store; security-crypto backs
+    // EncryptedSharedPreferences for the bearer secrets. Both are AndroidX --
+    // within the epic's dependency rule. Their codegen and runtime only; no
+    // JSON, HTTP or DI library is introduced anywhere (HttpURLConnection +
+    // the in-project JSON model are the rest of the transport).
+    implementation(libs.androidx.room.runtime)
+    implementation(libs.androidx.room.ktx)
+    implementation(libs.androidx.security.crypto)
+    implementation(libs.kotlinx.coroutines.core)
+    ksp(libs.androidx.room.compiler)
+
     testImplementation(libs.junit)
+    testImplementation(libs.kotlinx.coroutines.test)
 }
