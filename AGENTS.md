@@ -192,7 +192,17 @@ If the two disagree, GitHub wins and the queue is stale; say so.
    the reasoning. The cloud macOS jobs are still self-hosted, so the README
    line may be only partly wrong.
 
-3. **#249 — rotating full-suite test flakes. Still not a local-runs job.**
+3. **#305 — kill switch answers 404, so a budget shutdown unpairs every
+   phone.** Server-side Python on the auth admission path: `_resolve_device`
+   and `_resolve_reader` in `wattracker/cloud/api.py` answer 503 with
+   `Retry-After`, raised before any credential lookup or nonce use.
+   Enrollment stays 404, the writer routes stay 403, and `android/` is not
+   touched. The issue records the decision and the argument against it; do
+   not re-open the 404-vs-503 question. **A security review of the diff is
+   part of Done.** Open the PR and wait for that review; do not self-merge.
+   Python only, so it can run alongside #298.
+
+4. **#249 — rotating full-suite test flakes. Still not a local-runs job.**
    Nothing has changed since the re-scope. 21 consecutive clean local full
    suites stand against zero reproductions. Both known instances came from
    **taksmon's machine**. The mechanism is known: the session goes missing
