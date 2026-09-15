@@ -4,7 +4,9 @@ Epic #192 and sub-issues #193–#199, plus the owner's
 extra targets: Android 11+, dual-server support (cloud **and** local), offline
 cache. Kotlin + Jetpack Compose, single app under `android/`.
 
-**Resume point — Step 2 (#194) is implemented on this branch; it is not yet a PR.**
+**Resume point — Step 2 (#194) is implemented on this branch and open as
+PR #304; the owner's review (2026-09-15, CHANGES_REQUESTED) is addressed on
+this branch** (see the 2026-09-15 note below).
 This checkout is **`feature/android-client-2`**, rebased onto `main` at
 **`52996a7`** (2026-09-14). **Step 2 — the cloud client and the
 revision-keyed offline cache — is now implemented here and committed** (see
@@ -28,6 +30,94 @@ deployment" half of #199. Android CI (PR #262) compiles and unit-tests
 `medium_tablet` API 35): rail in landscape, bottom bar in portrait, drawer
 on tablet. Pre-push hook installed. See "Step 1 — completion notes" below.
 
+**Revised 2026-09-15 — PR #304 review addressed.** Step 2 (#194) is open as
+**PR #304** (`feature/android-client-2` → `main`, head `9c9a6ba`). The
+owner's review (2026-09-15) is `CHANGES_REQUESTED` — one blocker plus
+non-blocking notes; every point is addressed on this branch:
+
+1. **Blocker — every cache write silently dropped after the first
+   restart.** `RoomSnapshotCache` persisted the write-identity epoch in the
+   `meta` table while `CloudSession.lifecycleGeneration` is in-memory and
+   restarts at 0: after a relaunch every `store` fell below the persisted
+   epoch and was refused, so the checkpoint never advanced (every `since=`
+   refetched an ever-growing delta, quota use climbing) and cold-start
+   reads served stale data — the revision-keyed cache frozen at the pairing
+   session's revision. Fixed by making the identity process-local, as iOS
+   does (`lifecycleGeneration` never survives a restart; an in-flight read
+   cannot outlive the process): both caches now hold it in a `GenerationGate`
+   in memory, and the `cloud_epoch` meta row is gone (the `meta` table stays
+   for the plan's non-secret settings). Tests: the restart test the review
+   asks for (pair → store → a fresh session on the same persistent rows →
+   store → the write lands, the checkpoint advances, and the read asks
+   `since=<old checkpoint>`) — run against a cache double that mirrors the
+   fixed shape (persistent rows, in-memory gate); a JVM test has no Context
+   to open a file-backed Room database and the dependency rule bars
+   Robolectric, so it is the contract half, with the gate half in
+   `GenerationGateTest` and the Room class verified on device — plus the
+   existing seeds that wrote generation-1 rows under a generation-0 session
+   now seeding at generation 0, a prior launch's honest identity.
+2. **RemovalGate durability.** `markPending`/`clearPending` are `commit()` —
+   an `apply()` that died before hitting disk traded a lost credential for a
+   lost sign-out — and the flag is cleared only *after* the retried wipe
+   succeeds (`takePending` split into `isPending` + `clearPending`); a
+   process death in the middle leaves the flag where the next start finds
+   it. A `commit()` the store refuses (`false`, not an exception) is thrown,
+   not ignored, and `removeDisk` keeps the original wipe failure as the
+   primary exception. Unit-tested both ways (the wipe completes and clears;
+   a failing wipe keeps the flag and the stale paired state).
+3. **The degraded credential store is surfaced.** An unopenable encrypted
+   store still falls back to memory (a corrupt Tink keyset bricks no app),
+   but `WatTrackerApp.credentialStoreDegraded` records it: pairing into the
+   in-memory store "succeeds" for one launch and is lost on relaunch, and
+   #195's pairing screen must say so instead of silently.
+4. **The corrupt-DB reset now runs.** `Room…build()` is lazy, so the file
+   opened on first use — outside the try — and the reset branch never fired.
+   An empty `runInTransaction` now forces the open inside the try (and the
+   failed database is closed before `deleteDatabase`).
+5. **Transport bounds.** The response cap is 4 MiB, not 50 (the cap becomes
+   bytes + String + JSON tree in memory; the largest real payload is a
+   1500-point stream page), and a 60 s overall per-request deadline (checked
+   after the headers and between body chunks) bounds a trickling server the
+   per-read timeout cannot. Collection reads also send `limit=5`: the
+   server's default page is 100 objects at up to 512 KiB each (a 50 MiB
+   response) that the cap would truncate — and a truncated page fails on
+   every read, not just the first — while five objects keep the worst-case
+   page at 2.5 MiB under it. All pinned by tests.
+6. **A test that always passed.** `assertNotEquals` on two `ByteArray`s
+   compared references in `boundaryPairsAreDistinct` — the first pass
+   claimed the fix without touching the file (caught in re-review); it is a
+   `assertFalse` on `contentEquals` now.
+7. **The JSON parser is strict where the server is canonical.** Leading
+   zeros, raw control characters in strings, lone surrogates and non-finite
+   numbers (`1e999` parsed as `Infinity` and would have serialized back out
+   as invalid JSON) are rejected; a 200 body decodes with strict UTF-8
+   (malformed bytes are protocol drift, not U+FFFD in rider data). Duplicate
+   keys keep the last value, parity with the server's `json` module —
+   documented, not a leniency. `JsonValueTest` pins all of it.
+8. **Pre-existing, fixed here.** The placeholder-host guard covers
+   `bundleRelease` as well as `assembleRelease` (Step 7 ships a bundle), and
+   the manifest wires `dataExtractionRules` (with `fullBackupContent` for
+   the API-30 half) carrying a `<device-transfer>` exclude over the app
+   root — `allowBackup="false"` alone does not stop Android 12+
+   device-to-device transfer.
+9. **Re-review (second round) cleanup.** The restart test's description
+   no longer claims regression coverage of the Room class (it runs the
+   contract against a double mirroring the fixed shape; the Room class is
+   verified on device — no JVM Context, no Robolectric). The manifest
+   comment no longer calls the empty rule files "everything excluded": an
+   empty rule set includes everything if the transfer mode were enabled; the
+   gate is `allowBackup="false"` plus the device-transfer exclude. The
+   stale "cache's epoch" wording in `pair()` is the identity gate. The gate
+   throws
+   on a refused `commit()` write instead of ignoring it, and `removeDisk`
+   keeps the original wipe failure as the primary exception. `decodeUtf8`
+   is the decoder's one-liner. Leftover blank lines are gone.
+
+`:app:assembleDebug`, `:app:testDebugUnitTest` (78 tests) and
+`:app:assembleRelease :app:bundleRelease -PallowPlaceholderHost` are green
+locally; the guard's refusal of an unflagged `bundleRelease` is verified
+the same way. Push held for the owner's re-review.
+
 **Revised 2026-09-14 (rebase; Step 2 implemented).** `main` moved from
 `ff1f2aa` (#294) to **`52996a7`** (#302) in the course of 2026-09-14: #295
 (separate automatic backend selection from overrides), #296 (local-day
@@ -46,7 +136,8 @@ upserts and tombstone deletes; the credential store is
 EncryptedSharedPreferences; the JSON value model round-trips unknown kinds for
 forward compatibility. Wired via `WatTrackerApplication`, with Tink R8 keep
 rules and an exported Room schema. `:app:assembleDebug` and
-`:app:testDebugUnitTest` are green (53 tests). This is **not yet a PR**.
+`:app:testDebugUnitTest` are green (53 tests). It opened as **PR #304** on
+2026-09-15; the review's fixes are in the 2026-09-15 note above.
 
 **Revised 2026-09-14 — re-verified with `gh` against `main` at `ff1f2aa`.**
 The one blocker for Step 2 has landed:
@@ -205,8 +296,10 @@ since the 2026-09-01 draft:
   `main` since 2026-09-13, closes #156), **#294** (lands the #266
   transport decision + #260 follow-ups, on `main` since 2026-09-14).
 - In flight: **Step 2 (#194) — the cloud client and offline cache — is
-  implemented on `feature/android-client-2`** (this checkout, now rebased
-  onto `main` at `52996a7`) and committed, pending its PR. The local-backend
+  implemented on `feature/android-client-2`** (this checkout, rebased onto
+  `main` at `52996a7`) and open as **PR #304**; the owner's
+  CHANGES_REQUESTED review of 2026-09-15 is addressed on the branch
+  (see the 2026-09-15 note above), push held for re-review. The local-backend
   seam (`LocalClient`) stays an honest stub for its own later step. Announced
   per the queue rule below.
 - Still open and relevant: **#102** (hosting decision —
