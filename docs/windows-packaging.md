@@ -395,12 +395,13 @@ deliberately does neither.
   or written by a step, so nothing needs the weaker setting, and a downloaded
   script still has to be signed to run.
 
-**Historical: `windows-release.yml` and the `test` job in `windows.yml` were gated.**
-The release workflow needs hosted minutes and code-signing secrets, and the suite
-already runs on the macOS runner every push and pull request - duplicating ~6
-minutes of it on the one physical Windows box is not worth the wall time. Only
-the installer job runs here, because it is the only thing that *cannot* run
-anywhere else.
+**`windows-release.yml` and the `test` job in `windows.yml` are still gated.**
+The `test` job is gated because the full suite already runs on the `Cloud`
+workflow's self-hosted macOS job every push and pull request; duplicating ~6
+minutes of it on hosted Windows buys little for the wall time it costs. The
+signed release workflow is tag-only and remains gated until its code-signing
+certificate and secrets are available. The former physical runner carried only
+the installer job, because it was the only part that could not run elsewhere.
 
 **The runner service runs as a dedicated non-admin local account**
 (`wattracker-ci`), not as the developer's. This is the least obvious decision in

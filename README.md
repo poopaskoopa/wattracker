@@ -560,16 +560,19 @@ or `wattracker-restore --restore 1`; a frozen bundle uses
 `wattracker.exe restore [--restore N]`. Restore safety follows the configured
 loopback port.
 
-CI runs on GitHub-hosted runners. The suite runs on a self-hosted macOS runner
-(`cloud.yml`) on every push and pull request, and a GitHub-hosted
-`windows-latest` runner (`windows.yml`) builds and smoke-tests the packaged artifacts on every pull
-request: the wheel, the frozen application, the Inno Setup installer through a
+CI is mixed. The suite runs on a self-hosted macOS runner (`cloud.yml`) on every
+push and pull request, while Windows-specific checks and packaging run on
+GitHub-hosted `windows-latest` runners (`windows.yml`) on every pull request:
+the wheel, the frozen application, the Inno Setup installer through a
 full install/upgrade/uninstall, and the frozen connector. A merge to `main`
 uploads the wheel, the installer and the connector, best-effort — the account's
 artifact storage is full, so that step may go yellow on an otherwise green
 build.
 
-What stays disabled needs something CI cannot supply. The signed-release
+What stays disabled is deliberate. The Windows *test* job remains gated because
+the full suite already runs on the self-hosted macOS runner in the `Cloud`
+workflow; duplicating roughly six minutes of it on hosted Windows buys little
+for the wall time it costs. The signed-release
 workflows (`windows-release.yml`, `macos-release.yml`) fire only
 on a `v*` tag and are gated for want of a code-signing certificate, so every
 shipped binary is still an unsigned local build. The containerized cloud checks
