@@ -88,7 +88,7 @@ final class SessionGateTests: XCTestCase {
     }
 
     private func probeLocal(
-        _ transport: LocalProbeTransport,
+        _ transport: any LocalTransport,
         paired: Bool
     ) -> LocalSession {
         LocalSession(
@@ -127,6 +127,25 @@ final class SessionGateTests: XCTestCase {
             return LocalResponse(
                 status: 200, body: Data(#"{"ftp":250}"#.utf8), url: request.url!
             )
+        }
+    }
+
+    private actor GatedStateReader {
+        let gate = RequestGate()
+        private var blocksNextRead = false
+
+        func blockNextRead() {
+            blocksNextRead = true
+        }
+
+        func read(
+            _ session: any ReadSession
+        ) async -> (CloudSession.DeviceState, Date?) {
+            if blocksNextRead {
+                blocksNextRead = false
+                await gate.wait()
+            }
+            return (await session.deviceState, await session.lastSuccess)
         }
     }
 
@@ -477,6 +496,77 @@ final class SessionGateTests: XCTestCase {
         XCTAssertEqual(gate.backend, .cloud)
         XCTAssertEqual(gate.selection, .automatic)
         XCTAssertNil(preference.backend)
+    }
+
+    func testN6AutomaticReevaluationCannotPublishStateFromOldBackend() async {
+        let monitor = FakePathMonitor()
+        let cloud = harness(paired: true) { _, _ in .refused(404) }
+        let transport = BlockingLocalProbeTransport()
+        let local = probeLocal(transport, paired: true)
+        let stateReader = GatedStateReader()
+        let gate = SessionGate(
+            makeSession: { cloud.session },
+            makeLocalSession: { local },
+            preferences: MemoryPreferenceStore(),
+            pathMonitor: monitor,
+            stateReader: { session in await stateReader.read(session) }
+        )
+
+        let startTask = Task { await gate.start() }
+        guard await transport.gate.waitForArrival(timeout: 1) else {
+            return XCTFail("the launch probe did not start")
+        }
+        await startTask.value
+        await transport.gate.openGate()
+        await gate.automaticReevaluate()
+
+        await gate.selectBackend(.local)
+        await local.signOut()
+        await stateReader.blockNextRead()
+        let reevaluation = Task { await gate.automaticReevaluate() }
+
+        guard await stateReader.gate.waitForArrival(timeout: 1) else {
+            return XCTFail("the late reevaluation refresh did not start")
+        }
+        let cloudSelection = Task { await gate.selectBackend(.cloud) }
+        await cloudSelection.value
+        await stateReader.gate.openGate()
+        await reevaluation.value
+
+        XCTAssertEqual(gate.backend, .cloud)
+        XCTAssertEqual(gate.phase, .paired)
+    }
+
+    func testN7LaunchToggleCannotPublishStaleLocalState() async {
+        let cloud = harness(paired: true) { _, _ in .refused(404) }
+        let local = LocalSession(
+            credentials: MemoryLocalCredentialStore(),
+            cache: MemorySnapshotCache()
+        )
+        let stateReader = GatedStateReader()
+        let gate = SessionGate(
+            makeSession: { cloud.session },
+            makeLocalSession: { local },
+            preferences: MemoryPreferenceStore(),
+            stateReader: { session in await stateReader.read(session) }
+        )
+
+        await gate.start()
+        await gate.automaticReevaluate()
+        await gate.selectBackend(.local)
+        await stateReader.blockNextRead()
+        let reevaluation = Task { await gate.automaticReevaluate() }
+        guard await stateReader.gate.waitForArrival(timeout: 1) else {
+            return XCTFail("the override reevaluation refresh did not start")
+        }
+
+        let cloudSelection = Task { await gate.selectBackend(.cloud) }
+        await cloudSelection.value
+        await stateReader.gate.openGate()
+        await reevaluation.value
+
+        XCTAssertEqual(gate.backend, .cloud)
+        XCTAssertEqual(gate.phase, .paired)
     }
 
     func testVProbe1PairAfterToggleKeepsAutomaticContract() async throws {

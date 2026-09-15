@@ -108,6 +108,12 @@ final class SessionGate {
         func consumeLegacyBackend() -> Backend?
     }
 
+    /// Reads a backend's state for `refresh`. Tests can suspend this seam to
+    /// force a backend switch across the actor awaits.
+    typealias StateReader = @Sendable (
+        any ReadSession
+    ) async -> (CloudSession.DeviceState, Date?)
+
     struct KeychainPreferenceStore: PreferenceStore, Sendable {
         private let service: String
         private let account: String
@@ -176,6 +182,7 @@ final class SessionGate {
 
     private let makeSession: @Sendable () throws -> CloudSession
     private let makeLocalSession: @Sendable () throws -> LocalSession
+    private let stateReader: StateReader
     private let preferences: PreferenceStore
     private let pathMonitor: SessionPathMonitor
     private var manualOverride: Backend?
@@ -199,10 +206,14 @@ final class SessionGate {
         makeSession: @escaping @Sendable () throws -> CloudSession = SessionGate.liveSession,
         makeLocalSession: @escaping @Sendable () throws -> LocalSession = SessionGate.liveLocalSession,
         preferences: PreferenceStore = KeychainPreferenceStore(),
-        pathMonitor: SessionPathMonitor = SystemSessionPathMonitor()
+        pathMonitor: SessionPathMonitor = SystemSessionPathMonitor(),
+        stateReader: @escaping StateReader = { session in
+            (await session.deviceState, await session.lastSuccess)
+        }
     ) {
         self.makeSession = makeSession
         self.makeLocalSession = makeLocalSession
+        self.stateReader = stateReader
         self.preferences = preferences
         self.pathMonitor = pathMonitor
         let storedBackend = preferences.loadBackendOverride()
@@ -370,13 +381,23 @@ final class SessionGate {
     /// Re-read the actor's state. Cheap -- no request -- and safe to call after
     /// anything that might have moved it.
     func refresh() async {
+        let generation = selectionGeneration
+        let selectedBackend = backend
         guard let activeSession else {
+            guard generation == selectionGeneration, selectedBackend == backend else {
+                return
+            }
             phase = .unpaired
             lastSuccess = nil
             return
         }
-        phase = Self.phase(for: await activeSession.deviceState)
-        lastSuccess = await activeSession.lastSuccess
+        let (nextState, nextLastSuccess) = await stateReader(activeSession)
+        let nextPhase = Self.phase(for: nextState)
+        guard generation == selectionGeneration, selectedBackend == backend else {
+            return
+        }
+        phase = nextPhase
+        lastSuccess = nextLastSuccess
     }
 
     static func phase(for state: CloudSession.DeviceState) -> Phase {
