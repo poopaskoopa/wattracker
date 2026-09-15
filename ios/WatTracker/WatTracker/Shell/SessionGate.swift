@@ -108,6 +108,12 @@ final class SessionGate {
         func consumeLegacyBackend() -> Backend?
     }
 
+    /// Reads a backend's state for `refresh`. Tests can suspend this seam to
+    /// force a backend switch across the actor awaits.
+    typealias StateReader = @Sendable (
+        any ReadSession
+    ) async -> (CloudSession.DeviceState, Date?)
+
     struct KeychainPreferenceStore: PreferenceStore, Sendable {
         private let service: String
         private let account: String
@@ -176,9 +182,15 @@ final class SessionGate {
 
     private let makeSession: @Sendable () throws -> CloudSession
     private let makeLocalSession: @Sendable () throws -> LocalSession
+    private let stateReader: StateReader
     private let preferences: PreferenceStore
     private let pathMonitor: SessionPathMonitor
     private var manualOverride: Backend?
+    /// The pairing screen's explicit choice is session-local. It is separate
+    /// from the persisted Settings override, but automatic selection must
+    /// still respect it until pairing leaves this flow or the rider chooses a
+    /// different backend.
+    private var temporaryOverride: Backend?
     private var selectionGeneration = 0
     private var automaticGeneration = 0
     private var automaticReevaluationTask: Task<Void, Never>?
@@ -194,10 +206,14 @@ final class SessionGate {
         makeSession: @escaping @Sendable () throws -> CloudSession = SessionGate.liveSession,
         makeLocalSession: @escaping @Sendable () throws -> LocalSession = SessionGate.liveLocalSession,
         preferences: PreferenceStore = KeychainPreferenceStore(),
-        pathMonitor: SessionPathMonitor = SystemSessionPathMonitor()
+        pathMonitor: SessionPathMonitor = SystemSessionPathMonitor(),
+        stateReader: @escaping StateReader = { session in
+            (await session.deviceState, await session.lastSuccess)
+        }
     ) {
         self.makeSession = makeSession
         self.makeLocalSession = makeLocalSession
+        self.stateReader = stateReader
         self.preferences = preferences
         self.pathMonitor = pathMonitor
         let storedBackend = preferences.loadBackendOverride()
@@ -306,6 +322,10 @@ final class SessionGate {
     }
 
     private func runAutomaticReevaluation(force: Bool = false) async {
+        if temporaryOverride != nil {
+            await refresh()
+            return
+        }
         guard phase == .starting || phase == .paired || (force && phase == .unpaired)
         else { return }
         automaticGeneration += 1
@@ -361,13 +381,23 @@ final class SessionGate {
     /// Re-read the actor's state. Cheap -- no request -- and safe to call after
     /// anything that might have moved it.
     func refresh() async {
+        let generation = selectionGeneration
+        let selectedBackend = backend
         guard let activeSession else {
+            guard generation == selectionGeneration, selectedBackend == backend else {
+                return
+            }
             phase = .unpaired
             lastSuccess = nil
             return
         }
-        phase = Self.phase(for: await activeSession.deviceState)
-        lastSuccess = await activeSession.lastSuccess
+        let (nextState, nextLastSuccess) = await stateReader(activeSession)
+        let nextPhase = Self.phase(for: nextState)
+        guard generation == selectionGeneration, selectedBackend == backend else {
+            return
+        }
+        phase = nextPhase
+        lastSuccess = nextLastSuccess
     }
 
     static func phase(for state: CloudSession.DeviceState) -> Phase {
@@ -383,6 +413,7 @@ final class SessionGate {
     func pair(code: String, label: String?) async throws {
         guard let session else { throw GateFailure.noSession }
         selectionGeneration += 1
+        temporaryOverride = nil
         backend = .cloud
         do {
             try await session.pair(code: code, label: label)
@@ -402,6 +433,7 @@ final class SessionGate {
     func pairLocal(host: String, token: String, label: String?) async throws {
         guard let localSession else { throw GateFailure.noSession }
         selectionGeneration += 1
+        temporaryOverride = nil
         backend = .local
         do {
             try await localSession.pair(host: host, token: token, label: label)
@@ -412,10 +444,14 @@ final class SessionGate {
         await refresh()
     }
 
+    /// Select the backend for the pairing flow. This choice is intentionally
+    /// not persisted like the Settings selection, but it is still explicit for
+    /// this gate and must not be replaced by automatic selection.
     func selectBackend(_ backend: Backend) async {
         let hasCandidate = backend == .cloud ? session != nil : localSession != nil
         guard hasCandidate else { return }
         selectionGeneration += 1
+        temporaryOverride = backend
         self.backend = backend
         await refresh()
     }
@@ -425,10 +461,12 @@ final class SessionGate {
         case .automatic:
             selectionGeneration += 1
             manualOverride = nil
+            temporaryOverride = nil
             preferences.clearBackendOverride()
             await automaticReevaluate(force: true)
         case .cloud, .local:
             let backend: Backend = selection == .cloud ? .cloud : .local
+            temporaryOverride = nil
             await selectBackendOverride(backend)
         }
     }
@@ -455,6 +493,8 @@ final class SessionGate {
     /// Revoke this device on the server, then wipe it locally. Both halves are
     /// `CloudSession.removeDevice`'s; this only makes the result visible.
     func removeDevice() async throws {
+        selectionGeneration += 1
+        temporaryOverride = nil
         switch backend {
         case .cloud:
             guard let session else { throw GateFailure.noSession }
@@ -481,6 +521,8 @@ final class SessionGate {
     /// change, and `signOut` is used rather than a direct assignment so the
     /// actor stays the one place that decides what "not paired" means.
     func startOver() async {
+        selectionGeneration += 1
+        temporaryOverride = nil
         switch backend {
         case .cloud:
             if let session { await session.signOut() }
