@@ -157,9 +157,15 @@ there is no ASN.1 parser at this trust boundary. An Ed25519 signature is also
 128 hexadecimal characters, so length distinguishes nothing and only the
 stored algorithm separates the two.
 
-Every refresh rejection — unknown device, revoked device, bad signature, stale
-timestamp, replayed nonce, subject mismatch, missing capability — returns the
-same 404 body and headers as an unknown reader context.
+Every refresh authentication rejection — unknown device, revoked device, bad
+signature, stale timestamp, replayed nonce, subject mismatch, missing
+capability — returns the same 404 body and headers as an unknown reader
+context. A disabled or unreadable public API is different: device refresh,
+reader-context data routes, and device revocation answer 503 with
+`Retry-After: 30` before credentials or contexts are resolved, so a deliberate
+shutdown cannot be mistaken for revocation. Other writer-authenticated routes
+keep their 403 refusal, while enrollment and pairing redemption keep their
+404 response.
 
 Because refresh consumes replay nonces, the read plane now claims them
 durably. It writes those claims to the `CloudAuth` table its managed identity
