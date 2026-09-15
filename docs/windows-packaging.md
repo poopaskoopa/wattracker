@@ -196,8 +196,11 @@ The installer is built by the `package-unsigned` job in
    `/login`, `/static/style.css` and `/register`, reinstall over the top,
    attempt an uninstall with tampered state and require it to fail, then
    uninstall for real;
-8. upload the wheel and the setup exe, with `if-no-files-found: error`
-   and `retention-days: 5` - **only on a merge to `main`**, see below.
+8. assert that the wheel, setup exe and frozen connector exist, then upload
+   those three artifacts **only on a merge to `main`**, see below. The upload
+   is best-effort (`continue-on-error: true` and `if-no-files-found: warn`),
+   while the preceding assertion keeps a missing build artifact fatal;
+   retention is 5 days.
 
 The digest and publisher checks in step 2 have their own paragraph in
 `docs/windows-security.md`, and `tests/test_windows_installer.py` pins the
@@ -217,7 +220,7 @@ The zip was the cheapest thing to drop, because it duplicated the installer's
 payload: the same onedir tree, wrapped differently rather than built
 differently. Nothing downstream consumed it, and the portable form still ships
 where it is actually used - `windows-release.yml` builds and signs its own on a
-`v*` tag. Retention on what remains is 7 days, since these are unsigned builds
+`v*` tag. Retention on what remains is 5 days, since these are unsigned builds
 that exist to check a commit; the signed release artifacts keep their own 30.
 `tests/test_windows_installer.py` asserts both the retention value and the zip's
 absence, so re-adding a `Compress-Archive` here fails the suite.
@@ -264,8 +267,8 @@ stale artifacts left `total_count: 0`, but uploads continued to fail with
 `Artifact storage quota has been hit` well past GitHub's stated 6-12 hour
 recalculation window. Nothing visible accounts for it; the workflow token
 cannot read `settings/billing` (that needs the `user` scope), so the owner's
-billing page is the only remaining place to look. Until it clears, expect a red upload on merges
-to `main` while every PR run stays green.
+billing page is the only remaining place to look. Until it clears, the upload
+step may warn on merges to `main` while the packaging and test jobs remain green.
 
 ### Historical: yielding the box to a hardware session
 
