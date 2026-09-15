@@ -3,6 +3,7 @@ package com.wattracker.android.cache
 import com.wattracker.android.cloud.CachedCollection
 import com.wattracker.android.cloud.CloudItem
 import com.wattracker.android.cloud.CloudRoute
+import com.wattracker.android.cloud.GenerationGate
 import com.wattracker.android.cloud.SnapshotCache
 import com.wattracker.android.json.JsonValue
 import com.wattracker.android.json.toJson
@@ -15,10 +16,16 @@ import com.wattracker.android.json.toJson
  * an at-least-once replay cannot clobber a newer row) and deletes its
  * tombstones at the same gate, then sets the route's checkpoint to the
  * revision the server returned. A write from an identity older than one
- * already committed is refused (the epoch), so a read still in flight cannot
- * put a wiped device's objects back. All of it in one transaction. The
- * checkpoint's `fetched_at` is the age the UI reports, so an empty collection
- * reads as recently-fetched rather than brand-new.
+ * already committed is refused (the [GenerationGate]), so a read still in
+ * flight cannot put a wiped device's objects back. The gate is in memory, not
+ * in the `meta` table: it guards against in-flight writes of *this* process,
+ * and an in-flight read cannot outlive the process -- a persisted epoch let a
+ * dead process veto the fresh identity a restart starts at, and every write
+ * after the first relaunch was refused. All of the disk work is in one
+ * transaction, which is also what serializes the gate's access (the
+ * transaction body runs on the database thread). The checkpoint's `fetched_at`
+ * is the age the UI reports, so an empty collection reads as
+ * recently-fetched rather than brand-new.
  */
 class RoomSnapshotCache(
     private val database: WatTrackerDatabase,
@@ -27,7 +34,10 @@ class RoomSnapshotCache(
 
     private val objectsDao = database.cloudObjectsDao()
     private val checkpointDao = database.checkpointDao()
-    private val metaDao = database.metaDao()
+
+    // Touched only inside `runInTransaction` blocks, which Room serializes on
+    // the database thread, so no lock of its own.
+    private val gate = GenerationGate()
 
     override fun load(route: CloudRoute): CachedCollection? {
         val checkpoint = checkpointDao.get(route.path) ?: return null
@@ -52,8 +62,7 @@ class RoomSnapshotCache(
             // A write from an identity older than one already committed is a
             // stale replay: refuse it so a read in flight cannot put a wiped
             // device's objects back after a removal or re-pairing.
-            val epoch = epochOf()
-            if (generation < epoch) return@runInTransaction
+            if (!gate.accepts(generation)) return@runInTransaction
             val path = route.path
             if (full) {
                 objectsDao.deleteRoute(path)
@@ -74,7 +83,7 @@ class RoomSnapshotCache(
                 }
             }
             checkpointDao.upsert(CheckpointEntity(path, revision.toLong(), now))
-            if (generation > epoch) metaDao.put(MetaEntity(EPOCH_KEY, generation.toString()))
+            gate.commit(generation)
         }
     }
 
@@ -89,18 +98,15 @@ class RoomSnapshotCache(
     override fun removeAll(generation: Long) {
         // Only the cloud objects and their checkpoints. The local data source's
         // payloads and the app settings are a different backend's state and
-        // survive a cloud removal. Bumping the epoch means a read from a
-        // superseded identity cannot write back after this wipe.
+        // survive a cloud removal. Recording the wiping identity in the gate
+        // means a read from a superseded identity cannot write back after the
+        // wipe.
         database.runInTransaction {
-            val epoch = epochOf()
             objectsDao.deleteAll()
             checkpointDao.deleteAll()
-            if (generation > epoch) metaDao.put(MetaEntity(EPOCH_KEY, generation.toString()))
+            gate.commit(generation)
         }
     }
-
-    /** The highest identity that has committed a write, for stale-write refusal. */
-    private fun epochOf(): Long = metaDao.get(EPOCH_KEY)?.toLongOrNull() ?: 0L
 
     private fun entity(route: String, item: CloudItem, fetchedAt: Long) = CloudObjectEntity(
         route = route,
@@ -110,9 +116,4 @@ class RoomSnapshotCache(
         dataJson = item.toJson().toJson(),
         fetchedAt = fetchedAt,
     )
-
-    private companion object {
-        /** The meta key holding the highest committed identity. */
-        const val EPOCH_KEY = "cloud_epoch"
-    }
 }

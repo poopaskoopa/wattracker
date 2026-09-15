@@ -1,6 +1,21 @@
 <?xml version="1.0" encoding="utf-8"?>
-<!-- Intentionally empty: backup is disabled (allowBackup="false").
-     See AndroidManifest.xml for the rationale. -->
+<!--
+    Nothing may leave the device, by either door. allowBackup="false" closes
+    cloud backup, but Android 12+ device-to-device transfer ignores that
+    attribute and reads only this file; with no <device-transfer> rules at
+    all, the transfer defaults to including everything. (The device_* domain
+    variants name device-protected storage, which this app does not use; the
+    plain domains cover its ordinary app data.)
+
+    The app's entire on-disk state is the Room cache (databases/) and the
+    credential plus removal prefs (shared_prefs/), both under the root the
+    one exclude covers; the signing key itself is in the Keystore, which no
+    transfer mechanism can carry. See the AndroidManifest comment for the
+    credentials rationale.
+-->
 <data-extraction-rules>
     <cloud-backup />
+    <device-transfer>
+        <exclude domain="root" path="./" />
+    </device-transfer>
 </data-extraction-rules>

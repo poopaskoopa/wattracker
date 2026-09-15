@@ -217,6 +217,9 @@ private class Parser(private val text: String) {
                 skipWhitespace()
                 expect(':')
                 val value = parseValue()
+                // A duplicate key keeps the last value, exactly what the
+                // server's json module does on decode; RFC 8259 only says
+                // names *should* be unique, and the server never emits two.
                 fields[key] = value
                 skipWhitespace()
                 when (val c = peek()) {
@@ -279,26 +282,60 @@ private class Parser(private val text: String) {
                         't' -> out.append('\t')
                         'b' -> out.append('\b')
                         'f' -> out.append('\u000c')
-                        'u' -> {
-                            if (pos + 4 > text.length) {
-                                throw JsonException("truncated \\u escape")
-                            }
-                            val hex = text.substring(pos, pos + 4)
-                            // Strict JSON: all four must be ASCII hex digits,
-                            // which rejects signed forms like \u-02d.
-                            if (hex.any { it !in '0'..'9' && it !in 'a'..'f' && it !in 'A'..'F' }) {
-                                throw JsonException("bad \\u escape '$hex'")
-                            }
-                            val code = hex.toInt(16)
-                            pos += 4
-                            out.append(code.toChar())
-                        }
+                        'u' -> appendUnicodeEscape(out)
                         else -> throw JsonException("bad escape '\\$e'")
                     }
                 }
-                else -> out.append(c)
+                else -> {
+                    // A raw control character (U+0000-U+001F) must be escaped
+                    // in JSON text; the escape branch above is the only legal
+                    // way one may appear in a string.
+                    if (c < ' ') throw JsonException("raw control character at offset ${pos - 1}")
+                    out.append(c)
+                }
             }
         }
+    }
+
+    /**
+     * A `\u` escape and, where the code is a high surrogate, the low
+     * surrogate that must follow it. JSON text is Unicode, and a lone
+     * surrogate is not a character: a string carrying one would re-serialize
+     * as invalid UTF-8, corrupting the rider's data on the way to the cache.
+     */
+    private fun appendUnicodeEscape(out: StringBuilder) {
+        val high = parseUnicodeEscape()
+        when (high) {
+            in 0xD800..0xDBFF -> {
+                if (!text.startsWith("\\u", pos)) {
+                    throw JsonException("unpaired high surrogate at offset $pos")
+                }
+                val pairStart = pos
+                pos += 2
+                val low = parseUnicodeEscape()
+                if (low !in 0xDC00..0xDFFF) {
+                    throw JsonException("high surrogate not followed by a low one at offset $pairStart")
+                }
+                out.appendCodePoint(((high - 0xD800) shl 10) or (low - 0xDC00) or 0x10000)
+            }
+            in 0xDC00..0xDFFF -> throw JsonException("unpaired low surrogate at offset $pos")
+            else -> out.append(high.toChar())
+        }
+    }
+
+    private fun parseUnicodeEscape(): Int {
+        if (pos + 4 > text.length) {
+            throw JsonException("truncated \\u escape")
+        }
+        val hex = text.substring(pos, pos + 4)
+        // Strict JSON: all four must be ASCII hex digits, which rejects
+        // signed forms like \u-02d.
+        if (hex.any { it !in '0'..'9' && it !in 'a'..'f' && it !in 'A'..'F' }) {
+            throw JsonException("bad \\u escape '$hex'")
+        }
+        val code = hex.toInt(16)
+        pos += 4
+        return code
     }
 
     private fun parseBoolean(): JsonValue {
@@ -322,12 +359,18 @@ private class Parser(private val text: String) {
     }
 
     private fun parseNumber(): JsonValue {
-        // Strict JSON number: an optional minus (no plus), an integer part, an
-        // optional fraction, and an optional exponent. Anything else is an
-        // error, not a leniency -- the server emits canonical JSON.
+        // Strict JSON number: an optional minus (no plus), an integer part
+        // with no leading zeros, an optional fraction, and an optional
+        // exponent. Anything else is an error, not a leniency -- the server
+        // emits canonical JSON.
         val start = pos
         if (pos < text.length && text[pos] == '-') pos++
         requireDigit(start)
+        val firstDigit = text[pos]
+        pos++
+        if (firstDigit == '0' && pos < text.length && text[pos] in '0'..'9') {
+            throw JsonException("leading zeros in number at offset $start")
+        }
         while (pos < text.length && text[pos] in '0'..'9') pos++
         if (pos < text.length && text[pos] == '.') {
             pos++
@@ -343,6 +386,12 @@ private class Parser(private val text: String) {
         val literal = text.substring(start, pos)
         val value = literal.toDoubleOrNull()
             ?: throw JsonException("invalid number '$literal'")
+        // toDoubleOrNull overflows to Infinity instead of failing, and a
+        // non-finite value would serialize back out as invalid JSON. A number
+        // past the Double range is protocol drift, not a value.
+        if (!value.isFinite()) {
+            throw JsonException("number out of range '$literal'")
+        }
         return JsonValue.Number(value)
     }
 

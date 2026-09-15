@@ -3,6 +3,9 @@ package com.wattracker.android.cloud
 import com.wattracker.android.json.JsonValue
 import com.wattracker.android.json.toJson
 import java.net.URLEncoder
+import java.nio.ByteBuffer
+import java.nio.charset.CodingErrorAction
+import java.nio.charset.StandardCharsets
 import java.security.SecureRandom
 import java.util.Base64
 
@@ -185,6 +188,12 @@ class CloudClient(
         val params = buildList {
             if (since != null) add("since" to since.toString())
             if (cursor != null) add("cursor" to cursor)
+            // The server's default page is 100 objects at up to 512 KiB each
+            // (a 50 MiB response); the transport's 4 MiB cap would truncate
+            // it, and a truncated page fails on every read, not just the
+            // first. A bounded page keeps the worst case under the cap --
+            // see COLLECTION_PAGE_LIMIT.
+            add("limit" to COLLECTION_PAGE_LIMIT.toString())
         }
         val response = transport.send(
             CloudRequest(
@@ -388,7 +397,7 @@ class CloudClient(
             )
         }
         return try {
-            val json = JsonValue.parse(String(response.body, Charsets.UTF_8))
+            val json = JsonValue.parse(decodeUtf8(response.body))
             CloudApiResult.Success(parse(json), response.status, response.retryAfterSeconds, response.serverDateMillis)
         } catch (e: Exception) {
             // A 200 with an unreadable body is a protocol drift, surfaced as a
@@ -403,5 +412,28 @@ class CloudClient(
         private val EMPTY = ByteArray(0)
         private const val MALFORMED_STATUS = 0
         private const val SIGNATURE_ALGORITHM = "ecdsa-p256-sha256"
+
+        /**
+         * The page size every collection read asks for. Worst case is five
+         * objects at the server's 512 KiB payload ceiling -- 2.5 MiB plus
+         * envelope overhead, under the transport's 4 MiB cap. The walk pays
+         * the smaller page back in a few extra cursor requests, far inside
+         * the durable read quota (50 000 requests a day).
+         */
+        internal const val COLLECTION_PAGE_LIMIT = 5
     }
+}
+
+/**
+ * A strict UTF-8 decode: malformed bytes throw a `CharacterCodingException`
+ * rather than becoming U+FFFD replacement characters, so a corrupt body
+ * reads as protocol drift (a [CloudClient.MALFORMED_STATUS] failure the
+ * state machine reacts to), never as rider data with holes silently filled in.
+ * The lenient `String(bytes, UTF_8)` substitutes U+FFFD on its own.
+ */
+internal fun decodeUtf8(bytes: ByteArray): String {
+    val decoder = StandardCharsets.UTF_8.newDecoder()
+        .onMalformedInput(CodingErrorAction.REPORT)
+        .onUnmappableCharacter(CodingErrorAction.REPORT)
+    return decoder.decode(ByteBuffer.wrap(bytes)).toString()
 }

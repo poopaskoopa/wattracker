@@ -8,7 +8,7 @@ import com.wattracker.android.json.optInt
 import com.wattracker.android.json.optString
 import org.junit.Assert.assertArrayEquals
 import org.junit.Assert.assertEquals
-import org.junit.Assert.assertNotEquals
+import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
 import org.junit.Test
 import java.security.MessageDigest
@@ -100,7 +100,10 @@ class CanonicalRequestVectorTest {
             val names = (pair as JsonValue.Array).values.map { it.asString()!! }
             val left = canonical(byName[names[0]]!!)
             val right = canonical(byName[names[1]]!!)
-            assertNotEquals("${names[0]} vs ${names[1]}", left, right)
+            // contentEquals: assertEquals/assertNotEquals on two ByteArrays
+            // compare references, so the old form passed whatever the bytes
+            // were.
+            assertFalse("${names[0]} vs ${names[1]}", left.contentEquals(right))
         }
     }
 

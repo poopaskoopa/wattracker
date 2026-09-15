@@ -88,7 +88,10 @@ class CloudSessionTest {
                 throw AssertionError("unexpected request ${request.url}")
             }
         }
-        cache.store(listOf(profileItem(9)), 9, CloudRoute.Dashboard, full = true, generation = 1)
+        // A prior launch stored it under its own fresh identity (a restart
+        // starts at generation 0); a seed above the session's identity would
+        // make the session's own later writes refused, not a prior launch.
+        cache.store(listOf(profileItem(9)), 9, CloudRoute.Dashboard, full = true, generation = 0)
         val device = session.pair("THE-CODE", "bike phone")
         assertEquals("cred-1", device.credentialId)
         assertEquals(CloudSession.DeviceState.paired, session.deviceState)
@@ -128,7 +131,9 @@ class CloudSessionTest {
                 else -> throw AssertionError("unexpected ${request.url}")
             }
         }
-        cache.store(listOf(profileItem(7)), 7, CloudRoute.Dashboard, full = true, generation = 1)
+        // A prior launch stored it under its own fresh identity (a restart
+        // starts at generation 0).
+        cache.store(listOf(profileItem(7)), 7, CloudRoute.Dashboard, full = true, generation = 0)
         val snapshot = session.load(CloudRoute.Dashboard)
         assertEquals(CloudSnapshot.Source.cache, snapshot.source)
         assertEquals(7, snapshot.revision)
@@ -154,7 +159,9 @@ class CloudSessionTest {
             }
             CloudResponse(200, ByteArray(0), null, nowMillis)
         }
-        cache.store(listOf(profileItem(4)), 4, CloudRoute.Curve, full = true, generation = 1)
+        // A prior launch stored it under its own fresh identity (a restart
+        // starts at generation 0).
+        cache.store(listOf(profileItem(4)), 4, CloudRoute.Curve, full = true, generation = 0)
         val snapshot = session.load(CloudRoute.Curve)
         assertEquals(CloudSnapshot.Source.cache, snapshot.source)
         // And it did not move the device toward removal.
@@ -259,8 +266,10 @@ class CloudSessionTest {
                 else -> throw AssertionError("unexpected ${request.url}")
             }
         }
-        // A little rider data, so the wipe is observable on the cache.
-        cache.store(listOf(profileItem(3)), 3, CloudRoute.Dashboard, full = true, generation = 1)
+        // A little rider data, so the wipe is observable on the cache. A prior
+        // launch stored it under its own fresh identity (a restart starts at
+        // generation 0).
+        cache.store(listOf(profileItem(3)), 3, CloudRoute.Dashboard, full = true, generation = 0)
         session.removeDevice()
         assertEquals(CloudSession.DeviceState.unpaired, session.deviceState)
         // The disk is wiped, not just memory: the credential and the rider's
@@ -401,6 +410,174 @@ class CloudSessionTest {
         // A truncated walk must not write a checkpoint it did not earn.
         assertNull(cache.load(CloudRoute.Activities))
     }
+
+    @Test
+    fun aCollectionReadSendsTheBoundedPageLimit() = runTest {
+        // The server's default page (100 objects at up to 512 KiB each)
+        // can out-run the transport cap, and a truncated page fails on
+        // every read, not just the first; the client bounds the page
+        // itself.
+        makePairedSession { request ->
+            when {
+                request.url.contains("/context/refresh") ->
+                    CloudResponse(200, refreshJson("ctx-1", 300.0).toByteArray(), null, nowMillis)
+                else ->
+                    CloudResponse(200, collectionJson(listOf(profileItem(1)), 1, null).toByteArray(), null, null)
+            }
+        }
+        session.load(CloudRoute.Dashboard)
+        val request = transport.requests.first { it.url.contains("/context/dashboard") }
+        assertTrue(
+            "the page limit keeps a worst-case page under the transport cap",
+            request.url.contains("limit=${CloudClient.COLLECTION_PAGE_LIMIT}"),
+        )
+    }
+
+    // MARK: - Restart: the cache must not out-veto a new process
+
+    @Test
+    fun aRestartedSessionWritesToThePersistentCache() = runTest {
+        // The "database": rows that survive a process restart, shared by the
+        // two cache instances. Each cache keeps its own in-memory identity
+        // gate -- the shape of the Room cache, whose gate is process-local
+        // while the rows are durable. This pins the contract a restarted
+        // session must meet against that shape: the write lands, the
+        // checkpoint advances, and the read asks a delta from the old
+        // checkpoint. It does not run RoomSnapshotCache itself -- a JVM test
+        // has no Context to open a file-backed Room database, and the
+        // dependency rule bars Robolectric -- so it is the contract half of
+        // the restart fix; the gate half is GenerationGateTest, and the
+        // Room class is verified on device.
+        val disk = HashMap<CloudRoute, CachedCollection>()
+        val sinceSeen = mutableListOf<Int?>()
+        val client = CloudClient(
+            "http",
+            "host",
+            signer,
+            transport = FakeTransport { request ->
+                when {
+                    request.url.contains("/devices/pair") ->
+                        CloudResponse(200, pairingJson().toByteArray(), null, nowMillis)
+                    request.url.contains("/context/refresh") ->
+                        CloudResponse(200, refreshJson("ctx", 300.0).toByteArray(), null, nowMillis)
+                    request.url.contains("/context/dashboard") -> {
+                        // One query parameter at a time: the read also
+                        // carries the bounded page limit.
+                        val since = request.url.substringAfter("since=", missingDelimiterValue = "")
+                            .substringBefore("&")
+                            .takeIf { it.isNotEmpty() }?.toIntOrNull()
+                        sinceSeen += since
+                        if (since == null) {
+                            // The first launch's full read.
+                            CloudResponse(200, collectionJson(listOf(profileItem(5)), 5, null).toByteArray(), null, null)
+                        } else {
+                            // The restarted launch's delta from the stored checkpoint.
+                            CloudResponse(200, collectionJson(listOf(profileItem(8)), 8, null).toByteArray(), null, null)
+                        }
+                    }
+                    else -> throw AssertionError("unexpected ${request.url}")
+                }
+            },
+            clock = { nowMillis / 1000 },
+        )
+
+        // First launch: pair, read, store.
+        val firstStore = InMemoryDeviceCredentialStore()
+        val first = CloudSession(
+            client = client,
+            credentials = firstStore,
+            cache = InMemorySnapshotCache({ nowMillis }, disk),
+            clock = { nowMillis },
+            random = { 0.5 },
+        )
+        first.pair("THE-CODE", "bike phone")
+        val firstRead = first.load(CloudRoute.Dashboard)
+        assertEquals(CloudSnapshot.Source.network, firstRead.source)
+        assertEquals(5, disk[CloudRoute.Dashboard]?.revision)
+
+        // Restart: the credential and the rows are durable; the identity is
+        // not. A fresh session starts a fresh generation against the same
+        // rows -- and it must be able to write to them.
+        val secondStore = InMemoryDeviceCredentialStore().apply { save(firstStore.load()!!) }
+        val second = CloudSession(
+            client = client,
+            credentials = secondStore,
+            cache = InMemorySnapshotCache({ nowMillis }, disk),
+            clock = { nowMillis },
+            random = { 0.5 },
+        )
+        val secondRead = second.load(CloudRoute.Dashboard)
+        assertEquals(CloudSnapshot.Source.network, secondRead.source)
+        // The write landed and the checkpoint advanced past the first launch's.
+        assertEquals(8, secondRead.revision)
+        assertEquals(8, disk[CloudRoute.Dashboard]?.revision)
+        // And the second read asked for a delta from the first launch's
+        // checkpoint, not a full refetch.
+        assertEquals(listOf<Int?>(null, 5), sinceSeen)
+    }
+
+    // MARK: - The removal gate
+
+    @Test
+    fun anUnfinishedRemovalIsCompletedOnTheNextStart() {
+        // A prior launch's removal wiped the cache, then the credential wipe
+        // failed and left the gate pending with the credential still on disk.
+        val gate = InMemoryRemovalGate()
+        gate.markPending()
+        val credentialStore = InMemoryDeviceCredentialStore().apply { save(paired) }
+        val disk = HashMap<CloudRoute, CachedCollection>()
+        val cache = InMemorySnapshotCache({ nowMillis }, disk)
+        cache.store(listOf(profileItem(4)), 4, CloudRoute.Dashboard, full = true, generation = 0)
+
+        // Constructing the session completes the removal and clears the flag.
+        val client = noNetworkClient()
+        val session = CloudSession(
+            client = client,
+            credentials = credentialStore,
+            cache = cache,
+            removalGate = gate,
+            clock = { nowMillis },
+            random = { 0.5 },
+        )
+        assertEquals(CloudSession.DeviceState.unpaired, session.deviceState)
+        assertFalse(gate.isPending())
+        assertNull(credentialStore.load())
+        assertNull(cache.load(CloudRoute.Dashboard))
+    }
+
+    @Test
+    fun aFailedRemovalRetryKeepsTheGatePending() {
+        // The wipe fails again: the flag stays set so the start after that
+        // retries, and the stale credential is not silently forgotten.
+        val gate = InMemoryRemovalGate()
+        gate.markPending()
+        val credentialStore = object : DeviceCredentialStore {
+            override fun load(): PairedDevice? = paired
+            override fun save(device: PairedDevice) {}
+            override fun clear() {
+                throw IOException("disk full")
+            }
+        }
+        val session = CloudSession(
+            client = noNetworkClient(),
+            credentials = credentialStore,
+            cache = InMemorySnapshotCache(),
+            removalGate = gate,
+            clock = { nowMillis },
+            random = { 0.5 },
+        )
+        assertTrue(gate.isPending())
+        assertEquals(CloudSession.DeviceState.paired, session.deviceState)
+    }
+
+    /** A client that must never touch the network; these tests run init only. */
+    private fun noNetworkClient(): CloudClient = CloudClient(
+        "http",
+        "host",
+        signer,
+        transport = FakeTransport { throw AssertionError("no network expected") },
+        clock = { nowMillis / 1000 },
+    )
 
     // MARK: - Secret hygiene
 
