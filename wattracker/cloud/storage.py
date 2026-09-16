@@ -289,6 +289,37 @@ class AzureDependencyUnavailable(RuntimeError):
     """Azure SDK dependencies were not installed in the cloud deployment."""
 
 
+class _AbsentAzureError(Exception):
+    """Stand-in for an ``azure.core`` class when the SDK is not installed.
+
+    Nothing raises it, so ``isinstance(exc, _AbsentAzureError)`` is always
+    ``False`` -- the correct answer when no ``azure.*`` package is present and
+    the only exceptions reaching the classifiers below are injected doubles
+    carrying an HTTP status.
+    """
+
+
+def _azure_core_error(name: str) -> type:
+    """Look up an ``azure.core.exceptions`` class without depending on it.
+
+    The Azure SDK is optional in this package: the local app never installs
+    it and the tests inject storage doubles.  The import is therefore deferred
+    to the call, exactly as ``AzureTenantStore.from_managed_identity`` and
+    ``AzureTenantStore._scope_lock`` defer theirs.  It is deliberately not
+    cached: the classifiers only run on an exception path, so a ``sys.modules``
+    lookup costs nothing that matters, and an uncached lookup stays correct
+    when a test swaps ``sys.modules['azure.core']``.
+    """
+    try:
+        from azure.core import exceptions
+    except ImportError:
+        return _AbsentAzureError
+    found = getattr(exceptions, name, None)
+    if isinstance(found, type) and issubclass(found, BaseException):
+        return found
+    return _AbsentAzureError
+
+
 class AzureTenantStore:
     """Blob/Table-backed tenant store using managed identity data-plane clients.
 
@@ -368,13 +399,61 @@ class AzureTenantStore:
             table_name=table_name,
         )
 
+    #: The statuses that mean "the resource is already there" at the four
+    #: create-if-absent call sites in this class.  409 is the service's own
+    #: ``ContainerAlreadyExists`` / ``TableAlreadyExists`` /
+    #: ``EntityAlreadyExists`` / ``BlobAlreadyExists``; 412 is the
+    #: ``If-None-Match: *`` precondition that ``upload_blob(overwrite=False)``
+    #: sends for the scope lock, which some Blob paths answer with instead.
+    _CONFLICT_STATUSES = frozenset({409, 412})
+
+    @staticmethod
+    def _http_status(exc: Exception) -> Optional[int]:
+        """The SDK's structured HTTP status, or ``None`` when it carries none.
+
+        ``bool`` is an ``int`` in Python, so it is excluded explicitly: a
+        double that set ``status_code = True`` must not be read as status 1.
+        """
+        status = getattr(exc, "status_code", None)
+        if isinstance(status, bool) or not isinstance(status, int):
+            return None
+        return status
+
     @staticmethod
     def _is_conflict(exc: Exception) -> bool:
-        return getattr(exc, "status_code", None) in (409, 412) or "already exists" in str(exc).lower()
+        """True only for "this resource already exists", never for a refusal.
+
+        Classification is on the SDK's structured signal -- the mapped
+        exception class, else the HTTP status -- and never on the message
+        text.  Substring matching on ``str(exc)`` read any error mentioning
+        "already exists" as a benign collision, so a 403 quoting the resource
+        it refused was swallowed and the caller carried on to create or
+        overwrite.  That both hid a misconfigured role assignment and defeated
+        the least-privilege roles in ``infra/azure``.  Everything else -- 403
+        included, and anything with no structured status at all -- propagates.
+        """
+        if isinstance(exc, _azure_core_error("ResourceExistsError")):
+            return True
+        # 412; the Blob SDK maps the failed ``If-None-Match: *`` precondition
+        # to this rather than to a plain ``HttpResponseError``.
+        if isinstance(exc, _azure_core_error("ResourceModifiedError")):
+            return True
+        return AzureTenantStore._http_status(exc) in AzureTenantStore._CONFLICT_STATUSES
 
     @staticmethod
     def _not_found(exc: Exception) -> bool:
-        return getattr(exc, "status_code", None) == 404 or "not found" in str(exc).lower()
+        """True only for a genuine 404, never for "you may not look".
+
+        The same reasoning as :meth:`_is_conflict`.  A 403 whose body quotes
+        "the specified resource was not found" used to be reported to callers
+        as absent data, silently converting an authorization failure into a
+        missing object.  Only ``ResourceNotFoundError`` or a structured 404
+        counts; a 403, a 401, a 5xx, or a transport error with no status at
+        all propagates.
+        """
+        if isinstance(exc, _azure_core_error("ResourceNotFoundError")):
+            return True
+        return AzureTenantStore._http_status(exc) == 404
 
     @staticmethod
     def _partition(namespace: str, local_user_scope: str) -> str:

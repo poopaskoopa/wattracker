@@ -156,6 +156,329 @@ def test_azure_store_uses_verified_coordinates_and_recovers_idempotently():
         store.get(namespace, "../other", "a1")
 
 
+class _AzureRefusal(Exception):
+    """A real-shaped Azure error: an HTTP status plus a misleading message.
+
+    Azure quotes the operation and the resource it refused in its error
+    bodies, so a 403 ``AuthorizationPermissionMismatch`` really does carry the
+    words "not found", and a refused conditional write really does carry
+    "conflict"/"already exists".  Those bodies are exactly why classification
+    must read the structured status and never the text.
+    """
+
+    def __init__(self, status_code, message):
+        super().__init__(message)
+        self.status_code = status_code
+
+
+def _forbidden_reading_as_absent():
+    return _AzureRefusal(
+        403,
+        "This request is not authorized to perform this operation using this "
+        "permission. ErrorCode:AuthorizationPermissionMismatch. The specified "
+        "resource was not found.",
+    )
+
+
+def _forbidden_reading_as_conflict():
+    return _AzureRefusal(
+        403,
+        "This request is not authorized to perform this operation. "
+        "ErrorCode:AuthorizationPermissionMismatch. Conflict: the specified "
+        "container already exists.",
+    )
+
+
+class _RefusingBlob(_FakeBlob):
+    def __init__(self, container, name, on_create):
+        super().__init__(container, name)
+        self._on_create = on_create
+
+    def upload_blob(self, payload, *, overwrite=False):
+        if not overwrite:
+            raise self._on_create()
+        return super().upload_blob(payload, overwrite=overwrite)
+
+
+class _RefusingContainer(_FakeContainer):
+    def __init__(self, *, on_create_container=None, on_lock_create=None):
+        super().__init__()
+        self._on_create_container = on_create_container
+        self._on_lock_create = on_lock_create
+        self.create_container_calls = 0
+
+    def create_container(self):
+        self.create_container_calls += 1
+        if self._on_create_container is not None:
+            raise self._on_create_container()
+
+    def get_blob_client(self, name):
+        if name.endswith("/__lock") and self._on_lock_create is not None:
+            return _RefusingBlob(self, name, self._on_lock_create)
+        return super().get_blob_client(name)
+
+
+class _RefusingTable(_FakeTable):
+    def __init__(self, *, on_get=None, on_create_entity=None, on_create_table=None):
+        super().__init__()
+        self._on_get = on_get
+        self._on_create_entity = on_create_entity
+        self._on_create_table = on_create_table
+        self.create_table_calls = 0
+
+    def create_table(self):
+        self.create_table_calls += 1
+        if self._on_create_table is not None:
+            raise self._on_create_table()
+
+    def get_entity(self, *, partition_key, row_key):
+        if self._on_get is not None:
+            raise self._on_get()
+        return super().get_entity(partition_key=partition_key, row_key=row_key)
+
+    def create_entity(self, entity):
+        if self._on_create_entity is not None:
+            raise self._on_create_entity()
+        return super().create_entity(entity)
+
+
+def _azure_services(*, container=None, table=None):
+    blob_service = _FakeBlobService()
+    table_service = _FakeTableService()
+    if container is not None:
+        blob_service.container = container
+    if table is not None:
+        table_service.table = table
+    return blob_service, table_service
+
+
+def test_azure_store_propagates_a_403_that_merely_reads_like_a_missing_object():
+    """An authorization failure must never be reported to a caller as absence.
+
+    The classifier used to substring-match "not found" in ``str(exc)``, so a
+    403 quoting the resource it refused was swallowed and every read reported
+    the rider's scope as empty -- masking a misconfigured role assignment
+    instead of surfacing it, which is the whole point of the least-privilege
+    roles in ``infra/azure``.
+    """
+    namespace = "a" * 64
+    blob_service, table_service = _azure_services(
+        table=_RefusingTable(on_get=_forbidden_reading_as_absent)
+    )
+    store = AzureTenantStore(blob_service, table_service)
+
+    with pytest.raises(_AzureRefusal):
+        store.get(namespace, "scope", "a1")
+    with pytest.raises(_AzureRefusal):
+        store.revision(namespace, "scope")
+    with pytest.raises(_AzureRefusal):
+        store.list_objects_with_revision(namespace, "scope", limit=10)
+    # The write path is worse than the read path: a refused read of the
+    # idempotency marker used to look like "no such batch", so the batch was
+    # applied again rather than refused.
+    with pytest.raises(_AzureRefusal):
+        store.apply(namespace, "scope", _batch())
+
+
+def test_azure_store_propagates_a_403_that_merely_reads_like_a_conflict():
+    """A refusal must never be mistaken for a benign "already exists".
+
+    Each of these call sites creates a resource if it is absent and continues
+    on a collision.  Substring-matching "already exists" meant a 403 was
+    treated as the collision, so the caller carried straight on to the
+    create-or-overwrite it had just been denied.
+    """
+    namespace = "a" * 64
+
+    blob_service, table_service = _azure_services(
+        container=_RefusingContainer(
+            on_create_container=_forbidden_reading_as_conflict
+        )
+    )
+    with pytest.raises(_AzureRefusal):
+        AzureTenantStore(blob_service, table_service, ensure_resources=True)
+
+    blob_service, table_service = _azure_services(
+        container=_RefusingContainer(),
+        table=_RefusingTable(on_create_table=_forbidden_reading_as_conflict),
+    )
+    with pytest.raises(_AzureRefusal):
+        AzureTenantStore(blob_service, table_service, ensure_resources=True)
+
+    blob_service, table_service = _azure_services(
+        table=_RefusingTable(on_create_entity=_forbidden_reading_as_conflict)
+    )
+    store = AzureTenantStore(blob_service, table_service)
+    with pytest.raises(_AzureRefusal):
+        store.apply(namespace, "scope", _batch())
+
+    # The scope lock's create-if-absent blob: a refusal here used to be read
+    # as "the lock blob is already there", and the write proceeded unlocked.
+    blob_service, table_service = _azure_services(
+        container=_RefusingContainer(on_lock_create=_forbidden_reading_as_conflict)
+    )
+    store = AzureTenantStore(blob_service, table_service)
+    with pytest.raises(_AzureRefusal):
+        store.apply(namespace, "scope", _batch())
+
+
+def test_azure_store_still_reads_a_real_404_409_or_412_as_before():
+    namespace = "a" * 64
+    blob_service, table_service = _azure_services(
+        table=_RefusingTable(on_get=lambda: _AzureRefusal(404, "ResourceNotFound"))
+    )
+    store = AzureTenantStore(blob_service, table_service)
+    assert store.get(namespace, "scope", "a1") is None
+    assert store.revision(namespace, "scope") == 0
+
+    container = _RefusingContainer(
+        on_create_container=lambda: _AzureRefusal(409, "ContainerAlreadyExists")
+    )
+    table = _RefusingTable(
+        on_create_table=lambda: _AzureRefusal(409, "TableAlreadyExists")
+    )
+    blob_service, table_service = _azure_services(container=container, table=table)
+    AzureTenantStore(blob_service, table_service, ensure_resources=True)
+    assert container.create_container_calls == 1
+    assert table.create_table_calls == 1
+
+    # 412 is the ``If-None-Match: *`` precondition ``upload_blob(overwrite=
+    # False)`` sends: the scope lock blob already exists, so the write runs.
+    blob_service, table_service = _azure_services(
+        container=_RefusingContainer(
+            on_lock_create=lambda: _AzureRefusal(412, "ConditionNotMet")
+        )
+    )
+    store = AzureTenantStore(blob_service, table_service)
+    assert store.apply(namespace, "scope", _batch()).accepted == 1
+    assert store.get(namespace, "scope", "a1").data["watts"] == 250
+
+
+@pytest.mark.parametrize("status, conflict, absent", [
+    (404, False, True),
+    (409, True, False),
+    (412, True, False),
+    (401, False, False),
+    (403, False, False),
+    (429, False, False),
+    (500, False, False),
+    (503, False, False),
+])
+def test_azure_error_classification_follows_the_status_not_the_message(
+    status, conflict, absent
+):
+    """One deliberately misleading message; only the status may decide."""
+    exc = _AzureRefusal(
+        status, "Conflict: the specified resource already exists and was not found"
+    )
+    assert AzureTenantStore._is_conflict(exc) is conflict
+    assert AzureTenantStore._not_found(exc) is absent
+
+
+def test_an_azure_error_with_no_status_is_never_classified():
+    """A transport failure carries no status and must not read as absence.
+
+    ``ServiceRequestError`` (DNS, TLS, a reset connection) has no
+    ``status_code`` at all.  Reporting one as "no such object" would show the
+    rider an empty scope during a network outage.
+    """
+    for exc in (
+        Exception("the specified blob was not found"),
+        Exception("Conflict: the entity already exists"),
+        ConnectionResetError("connection reset by peer: resource not found"),
+        _AzureRefusal(None, "not found"),
+        _AzureRefusal("404", "not found"),
+        _AzureRefusal(True, "already exists"),
+    ):
+        assert AzureTenantStore._is_conflict(exc) is False
+        assert AzureTenantStore._not_found(exc) is False
+
+
+def _install_azure_core_exception_fakes(monkeypatch):
+    """Install a stand-in ``azure.core.exceptions``.
+
+    The Azure SDK is an optional install here, so the type-based branch is
+    proved against classes shaped like the real ones rather than skipped
+    wherever ``azure.*`` is absent.
+    """
+    azure = ModuleType("azure")
+    azure.__path__ = []
+    core = ModuleType("azure.core")
+    core.__path__ = []
+    exceptions = ModuleType("azure.core.exceptions")
+
+    class HttpResponseError(Exception):
+        pass
+
+    class ResourceNotFoundError(HttpResponseError):
+        pass
+
+    class ResourceExistsError(HttpResponseError):
+        pass
+
+    class ResourceModifiedError(HttpResponseError):
+        pass
+
+    class ClientAuthenticationError(HttpResponseError):
+        pass
+
+    exceptions.HttpResponseError = HttpResponseError
+    exceptions.ResourceNotFoundError = ResourceNotFoundError
+    exceptions.ResourceExistsError = ResourceExistsError
+    exceptions.ResourceModifiedError = ResourceModifiedError
+    exceptions.ClientAuthenticationError = ClientAuthenticationError
+    core.exceptions = exceptions
+    azure.core = core
+    for name, module in {
+        "azure": azure,
+        "azure.core": core,
+        "azure.core.exceptions": exceptions,
+    }.items():
+        monkeypatch.setitem(sys.modules, name, module)
+    return exceptions
+
+
+def test_azure_sdk_exception_types_classify_without_a_status_code(monkeypatch):
+    exceptions = _install_azure_core_exception_fakes(monkeypatch)
+
+    absent = exceptions.ResourceNotFoundError("the entity does not exist")
+    assert AzureTenantStore._not_found(absent) is True
+    assert AzureTenantStore._is_conflict(absent) is False
+
+    duplicate = exceptions.ResourceExistsError("the entity already exists")
+    assert AzureTenantStore._is_conflict(duplicate) is True
+    assert AzureTenantStore._not_found(duplicate) is False
+
+    assert AzureTenantStore._is_conflict(
+        exceptions.ResourceModifiedError("the condition was not met")
+    ) is True
+
+    # 401/403 map to ``ClientAuthenticationError``; the SDK never types a
+    # refusal as absence, and neither may this store.
+    refused = exceptions.ClientAuthenticationError(
+        "AuthorizationPermissionMismatch: the specified resource was not found"
+    )
+    assert AzureTenantStore._not_found(refused) is False
+    assert AzureTenantStore._is_conflict(refused) is False
+
+
+def test_azure_error_classification_holds_with_no_azure_sdk_installed(monkeypatch):
+    """The module stays importable and correct without the optional SDK.
+
+    ``sys.modules[name] = None`` is how the import system records "this module
+    is definitively absent", so this holds whether or not the optional Azure
+    packages happen to be installed in the environment running the suite.
+    """
+    for name in ("azure", "azure.core", "azure.core.exceptions"):
+        monkeypatch.setitem(sys.modules, name, None)
+
+    assert AzureTenantStore._not_found(_AzureRefusal(404, "")) is True
+    assert AzureTenantStore._is_conflict(_AzureRefusal(409, "")) is True
+    assert AzureTenantStore._is_conflict(_AzureRefusal(412, "")) is True
+    assert AzureTenantStore._not_found(_AzureRefusal(403, "not found")) is False
+    assert AzureTenantStore._is_conflict(_AzureRefusal(403, "already exists")) is False
+
+
 def _install_azure_credential_fakes(monkeypatch, created):
     azure = ModuleType("azure")
     azure.__path__ = []
