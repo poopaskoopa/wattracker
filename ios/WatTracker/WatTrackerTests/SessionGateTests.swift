@@ -538,6 +538,7 @@ final class SessionGateTests: XCTestCase {
     }
 
     func testN7LaunchToggleCannotPublishStaleLocalState() async {
+        let monitor = FakePathMonitor()
         let cloud = harness(paired: true) { _, _ in .refused(404) }
         let local = LocalSession(
             credentials: MemoryLocalCredentialStore(),
@@ -548,10 +549,14 @@ final class SessionGateTests: XCTestCase {
             makeSession: { cloud.session },
             makeLocalSession: { local },
             preferences: MemoryPreferenceStore(),
+            pathMonitor: monitor,
             stateReader: { session in await stateReader.read(session) }
         )
 
-        await gate.start()
+        let startTask = Task { await gate.start() }
+        await startTask.value
+        // `start()` launches automatic reevaluation without awaiting it. The
+        // explicit call drains that task before the gate below is armed.
         await gate.automaticReevaluate()
         await gate.selectBackend(.local)
         await stateReader.blockNextRead()
@@ -567,6 +572,42 @@ final class SessionGateTests: XCTestCase {
 
         XCTAssertEqual(gate.backend, .cloud)
         XCTAssertEqual(gate.phase, .paired)
+    }
+
+    func testAutomaticSelectionAfterStartOverLeavesRemovedPhase() async {
+        let clock = TestClock()
+        let monitor = FakePathMonitor()
+        let cloud = harness(paired: true, clock: clock) { _, _ in
+            .refused(404, serverDate: clock.now)
+        }
+        let stateReader = GatedStateReader()
+        let gate = SessionGate(
+            makeSession: { cloud.session },
+            preferences: MemoryPreferenceStore(),
+            pathMonitor: monitor,
+            stateReader: { session in await stateReader.read(session) }
+        )
+
+        await gate.start()
+        await gate.automaticReevaluate()
+        await gate.probe()
+        clock.advance(400)
+        await gate.probe()
+        XCTAssertEqual(gate.phase, .removed)
+
+        await stateReader.blockNextRead()
+        let startOver = Task { await gate.startOver() }
+        guard await stateReader.gate.waitForArrival(timeout: 1) else {
+            return XCTFail("startOver did not reach its gated state read")
+        }
+
+        let automatic = Task { await gate.select(.automatic) }
+        await automatic.value
+        await stateReader.gate.openGate()
+        await startOver.value
+
+        XCTAssertEqual(gate.phase, .unpaired)
+        XCTAssertEqual(gate.selection, .automatic)
     }
 
     func testVProbe1PairAfterToggleKeepsAutomaticContract() async throws {
