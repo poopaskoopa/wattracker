@@ -191,8 +191,8 @@ Resolved by #164:
   calls 429 every other tenant.~~ Fixed: `max_backend_concurrency` is now the per-namespace cap and
   `max_total_backend_concurrency` (16) the process-wide ceiling, so a saturated installation refuses
   only itself. `QuotaManager.backend_slot` takes the namespace, defaulting to the one the request was
-  admitted for, and the per-namespace state exists only while a slot is held — it is bounded by the
-  process-wide ceiling, not by how many namespaces a caller invents.
+  admitted for, and the per-namespace state exists only while a slot is held or waited for, so it is
+  bounded by the number of concurrent callers and never by how many namespaces a caller invents.
 - `CloudConfig` keeps an 8-character floor for local/test dependency injection; the production
   Bicep parameter and `cloud.runtime` require at least 32 characters. Entropy, rotation, and
   secret storage remain deployment-operator responsibilities.

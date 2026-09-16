@@ -829,9 +829,13 @@ class QuotaManager:
         )
         self._backend_lock = threading.Lock()
         # Namespace -> in-flight backend calls.  An entry exists only while
-        # that namespace holds at least one slot and is removed when its last
-        # slot is released, so this is bounded by
-        # ``max_total_backend_concurrency`` entries no matter how many
+        # that namespace holds or is waiting for a slot, and is removed when
+        # its last slot is released, so this is bounded by the number of
+        # concurrent callers -- not by ``max_total_backend_concurrency``: the
+        # reservation is taken before the ceiling is acquired, so callers
+        # parked on the ceiling each hold an entry.  Every production caller
+        # uses the ``0.0`` default timeout, so that window is microseconds and
+        # the map drains to empty; it can never grow with the number of
         # namespaces a caller invents.  That is the whole reason the per-tenant
         # state is a counter rather than a semaphore per namespace: a
         # semaphore has to be kept to stay meaningful, a counter at zero is
