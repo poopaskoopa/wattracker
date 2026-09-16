@@ -579,10 +579,35 @@ first batch forever — `StaleRevision`, because 1 ≤ 3 — and a surviving bat
 marker replays an old `ApplyResult` describing bytes that no longer exist.
 
 `device-seen` and `context-index` carry no namespace of their own, so neither
-can be matched on a scope. Each is addressed by the same digest that addresses
-the row that owns it, so its key is derived from the owner's payload and
-deleted with it. Walking those two kinds blind is exactly how a wipe would
-reach into another rider's rows.
+can be matched on a scope, and walking those two kinds blind is exactly how a
+wipe would reach into another rider's rows. Each is reachable only through the
+row that owns it — which means the *derivation* of its key is the only access
+control there is, so it cannot be a bare read of a payload field. The read
+plane holds `entities/write` on `authTable` and can rewrite any payload, so a
+`credential_id` or `context_id` edited to name another rider's row would
+otherwise turn one rider's wipe into a deletion of theirs. Each key is proved
+against the record claiming it instead:
+
+- a `device` row re-derives `sha256(credential_id)` and requires it to equal
+  the row's own key — the same check `_device_id_from_value` already applies
+  to the device listing;
+- a `context` row cannot do that (its key digests the token, its companion's
+  key digests the context id), so the `context-index` row is read back and
+  required to name *this* context row in its `token_digest`.
+
+A record that cannot prove a companion has that companion left alone and
+counted in `skipped`. The record itself is still deleted: a tampered payload
+does not stop it authenticating — `_find_device_locked` and
+`read_context_token` resolve from the row's own address and never read the
+edited field — so leaving it would leave a live credential behind a wipe.
+
+A blob is likewise deleted by the name `AzureTenantStore` derives from the
+partition and object id, never by the `BlobName` the row stores. A row whose
+stored name disagrees is counted in `skipped` and the name it points at is
+left alone — but the derived name is deleted regardless, because it is
+provably inside this partition and the row goes either way. Skipping it
+entirely left the rider's own ride data at that name with nothing pointing at
+it: unreachable by `get`, by `recover_deleted`, and by any later wipe.
 
 ### What survives a wipe, and why
 
@@ -611,7 +636,9 @@ reach into another rider's rows.
   local scope with constant-time whole-field comparisons, never on a prefix or
   a row key. A row whose payload will not decode is left where it is and
   counted in the report's `skipped`: a row nobody can read is a row nobody can
-  prove belongs to this rider.
+  prove belongs to this rider. `skipped` also covers an unproven companion row
+  and an object row whose stored `BlobName` was not followed, so a non-zero
+  count means some row disagrees with the row that addresses it.
 
 ### The identity that runs it
 

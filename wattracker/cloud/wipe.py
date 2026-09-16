@@ -66,6 +66,36 @@ What a wipe deliberately keeps
   it is and counted in ``skipped``: a row nobody can read is a row nobody can
   prove belongs to this rider.
 
+Companion rows, and why a payload field is not an address
+=========================================================
+
+``device-seen`` and ``context-index`` carry no namespace and no local scope,
+so neither can be matched on one; each is reachable only through the row that
+owns it.  That makes the *derivation* of the companion's key the only access
+control there is, and it therefore cannot be a bare read of a payload field.
+The threat model includes a compromised read plane, which holds
+``entities/write`` on ``authTable`` (``infra/azure/main.bicep``) and can
+rewrite any row's payload; a ``credential_id`` or ``context_id`` edited to
+name another rider's row turned one rider's wipe into a deletion of theirs.
+
+So each companion key is *proved* against the record claiming it, and a
+record that cannot prove one has its companion left alone and counted in
+``skipped`` -- never deleted on the strength of an editable field:
+
+* ``device`` re-derives ``sha256(credential_id)`` and requires it to equal
+  the device row's own key, through ``security._device_id_from_value`` -- the
+  same check the device listing already applies, not a second one.
+* ``context`` cannot do that (its key digests the token, its companion's key
+  digests the context id), so the index is read back and required to name
+  this very context row in its ``token_digest``.
+
+The record itself still goes.  A tampered payload does not make a row stop
+being a credential: both ``_find_device_locked`` and ``read_context_token``
+resolve from the row's own address and never read the edited field, so
+leaving one behind would leave a live credential for a scope the rider asked
+to empty.  Only the reach into a row this record has not proved it owns is
+withheld.
+
 The tombstone decision
 ======================
 
@@ -107,6 +137,7 @@ from typing import Any, Final, Mapping, Protocol
 # either misses rows or reaches rows it was not asked about.
 from .security import (
     DEVICE_SEEN_RECORD_KIND,
+    _device_id_from_value,
     _digest_token,
     _require_local_scope,
     _require_namespace,
@@ -159,7 +190,14 @@ class TenantStore(Protocol):
 
 
 class StateBackend(Protocol):
-    """The subset of ``SecurityStateBackend`` a wipe needs."""
+    """The subset of ``SecurityStateBackend`` a wipe needs.
+
+    ``read`` is here for one reason: a ``context`` row cannot prove which
+    ``context-index`` row belongs to it without reading that row back.  See
+    :func:`_context_index_companion`.
+    """
+
+    def read(self, kind: str, key: str) -> dict[str, Any] | None: ...
 
     def delete(self, kind: str, key: str) -> bool: ...
 
@@ -174,8 +212,21 @@ class ScopeWipeReport:
 
     ``complete`` is False when any pass filled its scan bound, so the operator
     learns "run it again" from the return value rather than from a silently
-    short result.  ``skipped`` counts rows left alone because their payload
-    would not decode or did not name a scope -- never a guess.
+    short result.
+
+    ``skipped`` counts everything this wipe declined to act on rather than
+    guessed at, from both halves of it:
+
+    * a row whose payload would not decode, or did not name a scope;
+    * a companion row a record claimed but could not prove it owns (see the
+      module docstring);
+    * from :class:`~wattracker.cloud.storage.ScopePurge`, an object row whose
+      stored ``BlobName`` named a blob outside its own partition -- that blob
+      was not followed, though the row's own blob was still deleted.
+
+    None of these is an error and none of them stops the wipe.  A non-zero
+    ``skipped`` means a row somewhere disagrees with the row that addresses
+    it, which on this table is evidence worth looking at.
     """
 
     namespace: str
@@ -230,25 +281,104 @@ def _matches_scope(
         return False
 
 
-def _owned_row_key(value: Mapping[str, Any], field_name: str) -> str | None:
-    """The row key of a companion row this record owns, or ``None``.
+@dataclass(frozen=True)
+class _Companion:
+    """A companion row key, or a refusal to name one.
 
-    ``device-seen`` is addressed by ``sha256(credential_id)`` and
-    ``context-index`` by ``sha256(context_id)`` -- the same digest that
-    addresses the row being deleted.  Deriving the companion's key from the
-    parent payload is what keeps those two kinds in scope without enumerating
-    them: neither carries a namespace of its own, so neither could be matched
-    on one, and walking them blind is exactly how a wipe would reach into
-    another rider's rows.
+    ``key`` is a row key this wipe has *proved* belongs to the record being
+    deleted.  ``unproven`` says the record named a companion that could not be
+    tied back to it, so nothing was deleted and the operator is told; it is
+    never both.
     """
 
-    identifier = value.get(field_name)
-    if not isinstance(identifier, str) or not identifier:
-        return None
+    key: str | None = None
+    unproven: bool = False
+
+
+#: Nothing named, nothing claimed -- the record owns no companion row.
+_NO_COMPANION: Final = _Companion()
+#: A companion was named and could not be proved; refuse and report.
+_UNPROVEN_COMPANION: Final = _Companion(unproven=True)
+
+
+def _device_seen_companion(row_key: str, value: Mapping[str, Any]) -> _Companion:
+    """The ``device-seen`` key a device row owns, proved against its address.
+
+    ``device-seen`` carries no namespace and no scope of its own, so it can
+    never be matched on one; it is reachable only through the device row that
+    owns it.  That makes the derivation itself the access control, and a
+    derivation from an unchecked payload field is no access control at all.
+
+    A device row is *addressed* by ``sha256(credential_id)``, and ``device-
+    seen`` by the same digest of the same id.  The threat model includes a
+    compromised read plane holding ``entities/write`` on ``authTable``
+    (``infra/azure/main.bicep``), which can rewrite any payload; an edited
+    ``credential_id`` naming another rider's device made a wipe of this scope
+    delete *that* rider's ``device-seen`` row.  So the id is proved against
+    the row it sits in -- exactly as ``security._device_id_from_value`` does
+    for the device listing, and reusing that function rather than restating
+    it.  A payload that names a different credential describes a row this
+    record does not own, and is skipped.
+
+    The proof is total, not best-effort: the row key *is* the digest, so a
+    payload that passes cannot name anything but this row's own companion.
+    """
+
+    credential_id = _device_id_from_value(row_key, value)
+    if credential_id is None:
+        return _UNPROVEN_COMPANION
+    # Re-derived rather than reusing ``row_key`` so the key is canonically
+    # spelled, whatever case the stored key happened to use.
+    return _Companion(key=_digest_token(credential_id).hex())
+
+
+def _context_index_companion(
+    row_key: str, value: Mapping[str, Any], backend: StateBackend
+) -> _Companion:
+    """The ``context-index`` key a context row owns, proved through the index.
+
+    A context row is addressed by ``sha256(token)`` while its index is
+    addressed by ``sha256(context_id)`` -- two different digests of two
+    different secrets, so unlike a device row this one cannot re-derive its
+    own address from its payload.  The binding runs the other way instead:
+    the index stores ``token_digest``, which is the context row's own key, so
+    the index is read back and required to name *this* row before it is
+    deleted.  A payload edited to another rider's ``context_id`` points at an
+    index naming that rider's context, which fails the comparison and is
+    skipped -- previously it broke their reader-context lookups.
+
+    This is not a proof that the pair is untampered, and it is not meant to
+    be: an attacker who can rewrite both rows has already broken the victim's
+    lookup by rewriting the index, without needing a wipe to do it.  What the
+    check buys is that a wipe is not a *lever* -- deleting an index requires
+    that index to already point at the row asking for it, so no single edit
+    turns one rider's wipe into another rider's deletion.
+
+    A context whose index is missing or does not point back is left with an
+    orphan: a row holding a token digest and an expiry, naming no rider,
+    resolving to nothing once the context row is gone, and removed by the
+    ordinary sweep when it expires.  That is reported in ``skipped``.
+    """
+
+    context_id = value.get("context_id")
+    if not isinstance(context_id, str) or not context_id:
+        return _UNPROVEN_COMPANION
     try:
-        return _digest_token(identifier).hex()
+        candidate = _digest_token(context_id).hex()
     except (TypeError, ValueError):  # pragma: no cover - defensive
-        return None
+        return _UNPROVEN_COMPANION
+    index = backend.read("context-index", candidate)
+    if not isinstance(index, Mapping):
+        return _UNPROVEN_COMPANION
+    stored_digest = index.get("token_digest")
+    if not isinstance(stored_digest, str):
+        return _UNPROVEN_COMPANION
+    try:
+        if not hmac.compare_digest(stored_digest, row_key):
+            return _UNPROVEN_COMPANION
+    except TypeError:  # pragma: no cover - non-ASCII in an edited row
+        return _UNPROVEN_COMPANION
+    return _Companion(key=candidate)
 
 
 def wipe_scope(
@@ -316,14 +446,33 @@ def wipe_scope(
                     continue
                 if not _matches_scope(value, namespace_text, scope_text):
                     continue
+                # The companion is decided *before* the parent row goes, and
+                # the parent goes either way.  A tampered payload does not
+                # make the record stop being a credential for this scope:
+                # ``_find_device_locked`` and ``read_context_token`` both
+                # resolve from the row's own address and never read the field
+                # that was edited, so a row left behind here would still
+                # authenticate a device, or still authorize reads on a scope
+                # the rider asked to have emptied.  Only the *companion*
+                # deletion is withheld, because only that one reaches a row
+                # this record has not proved it owns.
                 if kind == "device":
-                    companion = _owned_row_key(value, "credential_id")
-                    if companion is not None:
-                        _delete(DEVICE_SEEN_RECORD_KIND, companion)
+                    companion = _device_seen_companion(key, value)
+                    if companion.key is not None:
+                        _delete(DEVICE_SEEN_RECORD_KIND, companion.key)
                 elif kind == "context":
-                    companion = _owned_row_key(value, "context_id")
-                    if companion is not None:
-                        _delete("context-index", companion)
+                    companion = _context_index_companion(key, value, backend)
+                    if companion.key is not None:
+                        _delete("context-index", companion.key)
+                else:
+                    companion = _NO_COMPANION
+                if companion.unproven:
+                    skipped += 1
+                    _log.warning(
+                        "cloud scope wipe left a %s companion row alone: the "
+                        "parent row does not prove it owns it",
+                        kind,
+                    )
                 _delete(kind, key)
 
     purge = ScopePurge()

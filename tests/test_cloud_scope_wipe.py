@@ -54,6 +54,7 @@ from wattracker.cloud.security import (
 from wattracker.cloud.storage import (
     AzureTenantStore,
     MemoryTenantStore,
+    ScopePurge,
     StaleRevision,
 )
 from wattracker.cloud.wipe import (
@@ -319,6 +320,118 @@ def test_a_wipe_rejects_an_invalid_scope_and_an_empty_call(riders):
     with pytest.raises(ValueError):
         wipe_scope(alice.namespace, alice.scope, irreversible=True)
     assert alice.readable_objects()
+
+
+def test_credentials_are_gone_before_the_store_is_purged(riders):
+    """N1: "credentials first, data last" is the design, so it is pinned.
+
+    Moving the ``purge_scope`` call above the record loop is the exact
+    inversion of the ordering the module docstring argues for, and it left the
+    suite green. It is not cosmetic: a sync in flight under a credential that
+    still resolves can write a fresh object into a scope that has just been
+    emptied, and an invitation can still be redeemed for it.
+
+    Asserted from inside ``purge_scope`` itself -- the only place that can
+    observe the ordering -- rather than from the report, which looks identical
+    either way.
+    """
+
+    store, backend, alice, _bob = riders
+    writer_key = hashlib.sha256(
+        alice.writer.credential_id.encode("utf-8")
+    ).hexdigest()
+    device_key = hashlib.sha256(
+        alice.device.credential_id.encode("utf-8")
+    ).hexdigest()
+    observed = {}
+
+    class _ObservingStore:
+        def purge_scope(self, namespace, local_user_scope):
+            observed["writer"] = backend.read("writer", writer_key)
+            observed["device"] = backend.read("device", device_key)
+            observed["invitation"] = alice.enrollment.consume(alice.invitation)
+            observed["pairing"] = alice.pairing.consume(alice.pairing_code.code)
+            return store.purge_scope(namespace, local_user_scope)
+
+    assert backend.read("writer", writer_key) is not None
+
+    wipe_scope(
+        alice.namespace,
+        alice.scope,
+        irreversible=True,
+        store=_ObservingStore(),
+        security_backend=backend,
+    )
+
+    assert observed["writer"] is None
+    assert observed["device"] is None
+    # And nothing redeemable into a fresh credential was left either.
+    assert observed["invitation"] is None
+    assert observed["pairing"] is None
+
+
+def test_the_report_adds_the_stores_skipped_rows_to_its_own(riders):
+    """N2: ``purge.skipped`` must reach the caller.
+
+    Dropping it left the suite green while silently discarding the one signal
+    that says "a row in your store names a blob this purge would not follow".
+    The two sources are summed, so the assertion is on a total neither half
+    could produce alone.
+    """
+
+    _store, backend, alice, _bob = riders
+
+    class _SkippingStore:
+        def purge_scope(self, _namespace, _scope):
+            return ScopePurge(objects=1, blobs=1, markers=2, skipped=3)
+
+    class _Undecodable(_DurableMemoryBackend):
+        def iter_records(self, kind, *, limit):
+            rows = super().iter_records(kind, limit=limit)
+            if kind == "writer":
+                rows = list(rows) + [("c" * 64, None)]
+            return rows
+
+    hostile = _Undecodable()
+    hostile._records = backend._records  # noqa: SLF001 - same rows, hostile reader
+
+    report = wipe_scope(
+        alice.namespace,
+        alice.scope,
+        irreversible=True,
+        store=_SkippingStore(),
+        security_backend=hostile,
+    )
+
+    assert report.skipped == 4  # 3 from the store, 1 unreadable row
+    assert report.objects == 1
+    assert report.blobs == 1
+    assert report.markers == 2
+
+
+def test_an_invalid_scan_limit_is_refused_by_the_wipe_itself(riders):
+    """N2: the bound is validated here, not borrowed from the backend.
+
+    ``MemorySecurityStateBackend.iter_records`` raises on a non-positive
+    limit, so a wipe driven by *that* backend appears to validate even with
+    its own check removed. A store-only wipe never calls ``iter_records`` at
+    all, which is what makes this test pin ``wipe_scope``'s own guard.
+    """
+
+    store, _backend, alice, _bob = riders
+
+    for limit in (0, -1, True, False, 1.5, "10", None):
+        with pytest.raises(ValueError, match="scan_limit"):
+            wipe_scope(
+                alice.namespace,
+                alice.scope,
+                irreversible=True,
+                store=store,
+                scan_limit=limit,
+            )
+    # Refused before anything was removed: the check precedes the purge.
+    assert [value.object_id for value in alice.readable_objects()] == ["ride-2"]
+    assert store.revision(alice.namespace, alice.scope) == 3
 
 
 # ---------------------------------------------------------------------------
@@ -613,6 +726,132 @@ def test_a_row_whose_payload_will_not_decode_is_skipped_not_deleted(riders):
     assert report.records.get("writer") == 1
 
 
+def test_a_tampered_device_payload_cannot_delete_another_riders_device_seen_row(
+    riders,
+):
+    """B1, the ``device-seen`` vector.
+
+    The threat model includes a compromised read plane, which holds
+    ``entities/write`` on ``authTable`` and can therefore rewrite any row's
+    payload. A ``device`` row is *addressed* by ``sha256(credential_id)``, so
+    a payload whose ``credential_id`` names a different device describes a row
+    that is not the one it sits in. Deriving the companion key from that field
+    alone made wiping Alice delete Bob's ``device-seen`` row -- a row that
+    carries no namespace, so nothing downstream could catch it.
+
+    The parent row is still deleted: ``_find_device_locked`` resolves a device
+    from the *supplied* id and the row at its digest, ignoring the payload's
+    ``credential_id``, so a tampered row still authenticates Alice's device.
+    Leaving it would leave a live credential behind a wipe.
+    """
+
+    store, backend, alice, bob = riders
+    alice_device_key = hashlib.sha256(
+        alice.device.credential_id.encode("utf-8")
+    ).hexdigest()
+    bob_seen_key = hashlib.sha256(
+        bob.device.credential_id.encode("utf-8")
+    ).hexdigest()
+    tampered = dict(backend.read("device", alice_device_key))
+    tampered["credential_id"] = bob.device.credential_id
+    backend.write("device", alice_device_key, tampered)
+    assert backend.read(DEVICE_SEEN_RECORD_KIND, bob_seen_key) is not None
+
+    report = wipe_scope(
+        alice.namespace,
+        alice.scope,
+        irreversible=True,
+        store=store,
+        security_backend=backend,
+    )
+
+    # Bob keeps the row, and keeps reading his own "last seen" through it.
+    assert backend.read(DEVICE_SEEN_RECORD_KIND, bob_seen_key) is not None
+    assert bob.restarted().device_last_seen(bob.device.credential_id) == 1_000.0
+    assert report.records.get(DEVICE_SEEN_RECORD_KIND, 0) == 0
+    # Alice's device row is gone anyway: it still authenticated her device.
+    assert backend.read("device", alice_device_key) is None
+    assert alice.restarted().lookup_device(alice.device.credential_id) is None
+    # And the refusal is reported rather than silent.
+    assert report.skipped >= 1
+
+
+def test_a_tampered_context_payload_cannot_delete_another_riders_context_index(
+    riders,
+):
+    """B1, the ``context-index`` vector.
+
+    A ``context`` row is addressed by ``sha256(token)`` and its payload's
+    ``context_id`` addresses the ``context-index`` row -- two different
+    digests, so the row cannot prove its own ``context_id`` the way a device
+    row can. The index is what binds them, and it is read back here: its
+    ``token_digest`` must name this very context row. A payload edited to
+    Bob's context id points at an index that names Bob's context, so it is
+    skipped; without the check, Bob's reader-context lookups broke.
+    """
+
+    store, backend, alice, bob = riders
+    alice_context_key = hashlib.sha256(
+        alice.context_token.encode("utf-8")
+    ).hexdigest()
+    bob_index_key = hashlib.sha256(
+        bob.context.context_id.encode("utf-8")
+    ).hexdigest()
+    assert backend.read("context", alice_context_key) is not None
+    tampered = dict(backend.read("context", alice_context_key))
+    tampered["context_id"] = bob.context.context_id
+    backend.write("context", alice_context_key, tampered)
+
+    report = wipe_scope(
+        alice.namespace,
+        alice.scope,
+        irreversible=True,
+        store=store,
+        security_backend=backend,
+    )
+
+    # Bob's index survives and still resolves his context by id.
+    assert backend.read("context-index", bob_index_key) is not None
+    assert bob.restarted().lookup_reader(bob.context.context_id) is not None
+    assert bob.restarted().read_context_token(bob.context_token) is not None
+    assert report.records.get("context-index", 0) == 0
+    # Alice's context row is gone anyway: it still granted reads on her scope.
+    assert backend.read("context", alice_context_key) is None
+    assert alice.restarted().read_context_token(alice.context_token) is None
+    assert report.skipped >= 1
+
+
+def test_a_wipe_still_removes_the_companion_rows_it_can_prove(riders):
+    """The control for the two tests above: proof is not an excuse to stop.
+
+    Untampered rows prove out, so both companions go and nothing is reported
+    as skipped. Without this, the fix for B1 could be "never delete a
+    companion" and the suite would not notice.
+    """
+
+    store, backend, alice, _bob = riders
+    seen_key = hashlib.sha256(
+        alice.device.credential_id.encode("utf-8")
+    ).hexdigest()
+    index_key = hashlib.sha256(
+        alice.context.context_id.encode("utf-8")
+    ).hexdigest()
+
+    report = wipe_scope(
+        alice.namespace,
+        alice.scope,
+        irreversible=True,
+        store=store,
+        security_backend=backend,
+    )
+
+    assert backend.read(DEVICE_SEEN_RECORD_KIND, seen_key) is None
+    assert backend.read("context-index", index_key) is None
+    assert report.records[DEVICE_SEEN_RECORD_KIND] == 1
+    assert report.records["context-index"] == 1
+    assert report.skipped == 0
+
+
 def test_a_scope_prefix_is_not_a_scope_match():
     """``rider`` must not match ``rider2``, on either half of the pair."""
 
@@ -802,8 +1041,16 @@ def test_azure_purge_will_not_follow_a_blobname_out_of_its_own_partition():
 
     An edited row naming another partition's blob would, if followed, make a
     wipe of one rider delete a different rider's data. The expected name is
-    recomputed from the partition and the object id instead, and a row that
-    disagrees is skipped and counted.
+    recomputed from the partition and the object id instead, and *that* is the
+    name deleted; a row that disagrees is counted in ``skipped``.
+
+    The ``blobs`` count here used to be 0, which is what the defect looked
+    like from the report: the disagreement stopped the deletion outright
+    rather than only stopping the stored name being followed, and the wiped
+    rider's own blob survived. See
+    ``test_azure_purge_leaves_no_readable_blob_when_a_row_names_a_foreign_one``
+    for that half; what this test still owns is the other rider's blob, and
+    that assertion is unchanged.
     """
 
     store, container, table = _azure_store()
@@ -820,7 +1067,57 @@ def test_azure_purge_will_not_follow_a_blobname_out_of_its_own_partition():
     result = store.purge_scope(attacker, SCOPE)
 
     assert result.skipped == 1
-    assert result.blobs == 0
+    # One blob deleted, and it is the wiped rider's own -- at the derived
+    # name, never at the name the row stored.
+    assert result.blobs == 1
+    assert f"{attacker}:{SCOPE}/object:ride-1.json" not in container.blobs
+    assert victim_blob in container.blobs
+    assert store.get(victim, SCOPE, "ride-1") is not None
+
+
+def test_azure_purge_leaves_no_readable_blob_when_a_row_names_a_foreign_one():
+    """B2: refusing to follow a stored name must not orphan the rider's data.
+
+    Skipping the *stored* name is right -- it may be another rider's blob.
+    Skipping the deletion entirely was not: the row was deleted anyway, so the
+    rider's own blob at the derived name survived holding heart rate, watts
+    and body weight with nothing left pointing at it, and no later wipe could
+    ever find it again. #170's promise is "a wipe leaves no readable object".
+
+    The derived name is provably inside this partition -- ``_partition``
+    validates the namespace as 64 hex characters and the scope against a
+    charset with no quote or slash in it, and ``_row_key`` validates the
+    object id the same way -- so deleting it can reach nothing but this
+    rider's own data. The disagreement is still counted in ``skipped``.
+    """
+
+    store, container, table = _azure_store()
+    victim = "b" * 64
+    attacker = "a" * 64
+    store.apply(victim, SCOPE, _batch("b1", 1, "ride-1"))
+    store.apply(attacker, SCOPE, _batch("b1", 1, "ride-1"))
+    victim_blob = f"{victim}:{SCOPE}/object:ride-1.json"
+    attacker_partition = f"{attacker}:{SCOPE}"
+    attacker_blob = f"{attacker_partition}/object:ride-1.json"
+    # The rider's own blob really does hold the rider's own data.
+    assert b"heartrate" in container.blobs[attacker_blob]
+    tampered = dict(table.entities[(attacker_partition, "object:ride-1")])
+    tampered["BlobName"] = victim_blob
+    table.entities[(attacker_partition, "object:ride-1")] = tampered
+
+    result = store.purge_scope(attacker, SCOPE)
+
+    # Nothing of the wiped rider's survives, at any name in the partition.
+    assert attacker_blob not in container.blobs
+    assert not [name for name in container.blobs if name.startswith(attacker_partition)]
+    assert not [key for key in table.entities if key[0] == attacker_partition]
+    assert store.get(attacker, SCOPE, "ride-1", include_deleted=True) is None
+    # The counts describe what was actually deleted, and still report the
+    # disagreement rather than hiding it.
+    assert (result.objects, result.blobs, result.markers, result.skipped) == (
+        1, 1, 2, 1,
+    )
+    # The other rider's blob was never a coordinate this purge could use.
     assert victim_blob in container.blobs
     assert store.get(victim, SCOPE, "ride-1") is not None
 

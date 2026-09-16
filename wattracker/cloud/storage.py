@@ -74,11 +74,22 @@ class _Stored:
 class ScopePurge:
     """What :meth:`purge_scope` removed from one ``(namespace, scope)``.
 
-    ``skipped`` counts rows a purge refused to act on rather than guessed at:
-    an object row whose stored ``BlobName`` does not match the name this class
-    would itself derive for that partition and object id.  A row like that
-    names a blob somewhere else, so its blob is left alone and the operator is
-    told, instead of the purge following a stored path out of its own scope.
+    Every count is of something actually deleted, so the four can be read as a
+    receipt rather than as an intent:
+
+    * ``objects`` -- object rows removed from the table.
+    * ``blobs`` -- blobs removed from the container, each one at the name this
+      class derives for its partition and object id.  It is lower than
+      ``objects`` when a row's blob was already gone.
+    * ``markers`` -- every other row in the partition: batch idempotency
+      markers and the scope revision row.
+    * ``skipped`` -- object rows whose stored ``BlobName`` did **not** match
+      the derived name, so the stored name was not followed.  A row like that
+      names a blob somewhere else, possibly another rider's; that blob is left
+      exactly where it is and the operator is told.  The row's *own* blob, at
+      the derived name inside this partition, is still deleted and still
+      counted in ``blobs`` -- refusing to follow a foreign name is not a
+      reason to leave a rider's data behind unreachable.
     """
 
     objects: int = 0
@@ -858,10 +869,23 @@ class AzureTenantStore:
         * **A blob is deleted by the name this class derives, never by the
           name the row stores.**  ``BlobName`` is data in a table row.  An
           edited row naming ``<other partition>/object:x.json`` would, if
-          followed, make a wipe of one rider delete another rider's blob.  The
-          expected name is recomputed from the partition and the object id and
-          compared; a row that disagrees is counted in ``skipped`` and its
-          blob is left where it is.
+          followed, make a wipe of one rider delete another rider's blob.  So
+          the name is recomputed from the partition and the object id, and
+          *that* name is the one deleted -- always, whether or not the row
+          agrees with it.  The derived name cannot leave this partition:
+          ``_partition`` validates the namespace as 64 hexadecimal characters
+          and the scope against a charset containing neither a quote nor a
+          slash, and ``_row_key`` validates the object id the same way.
+
+          A disagreement is still counted in ``skipped``, because the stored
+          name is never followed and whatever it points at is left alone.
+          What it must not do is stop the deletion: the row is removed either
+          way, so skipping the blob left the rider's own data sitting at the
+          derived name with nothing pointing at it -- unreachable by
+          ``get``, by ``recover_deleted`` and by any later purge, which is the
+          exact opposite of what a wipe promises.  Retrying would not have
+          helped: the stored name is attacker-controlled data, so a retry
+          reads the same disagreement forever.
 
         The scope lease is held for the deletions so a concurrent ``apply``
         cannot interleave a new object into a partition being emptied, and the
@@ -883,12 +907,13 @@ class AzureTenantStore:
                     try:
                         expected = self._blob_name(partition, object_id)
                     except ValueError:
+                        # The row key is not a well-formed object id, so no
+                        # name can be derived for it and none is guessed.
                         expected = None
-                    if expected is not None and entity.get("BlobName") == expected:
-                        if self._delete_blob(expected):
-                            blobs += 1
-                    else:
+                    if expected is None or entity.get("BlobName") != expected:
                         skipped += 1
+                    if expected is not None and self._delete_blob(expected):
+                        blobs += 1
                 else:
                     markers += 1
                 self._table.delete_entity(
