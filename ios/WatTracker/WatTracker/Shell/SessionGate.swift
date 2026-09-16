@@ -327,7 +327,16 @@ final class SessionGate {
             return
         }
         guard phase == .starting || phase == .paired || (force && phase == .unpaired)
-        else { return }
+        else {
+            if phase == .removed {
+                // `select(.automatic)` invalidates an in-flight refresh.  A
+                // removed gate is still allowed to leave that state after
+                // `startOver()` has cleared the session, so replace the
+                // invalidated write before returning.
+                await refresh()
+            }
+            return
+        }
         automaticGeneration += 1
         let automaticGeneration = self.automaticGeneration
         let selectionGeneration = self.selectionGeneration
