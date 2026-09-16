@@ -22,6 +22,8 @@ from fastapi.responses import JSONResponse, Response
 from .limits import (
     DurableKillSwitch,
     DurableQuotaCounters,
+    PUBLIC_UNAVAILABLE_DETAIL,
+    PUBLIC_UNAVAILABLE_RETRY_AFTER,
     QuotaExceeded,
     QuotaManager,
     QuotaPolicy,
@@ -82,10 +84,6 @@ _MAX_DEVICE_ADMIN_BODY_BYTES = 4 * 1024
 # A credential id is 32 bytes of hex.  The path parameter is bounded before it
 # reaches the registry so an enormous path cannot be used to probe anything.
 _MAX_CREDENTIAL_ID_CHARS = 64
-# A disabled deployment is a global transient refusal, not an authentication
-# result.  Keep its retry window fixed and aligned with the unreadable kill
-# state response documented in docs/cloud-sync.md.
-_PUBLIC_DISABLED_RETRY_AFTER = 30
 
 
 @dataclass
@@ -530,13 +528,18 @@ def _require_public_api_for_device_or_reader(state: CloudState) -> None:
     disabled deployment is a global condition, so returning the same 503 for
     every credential shape prevents the shutdown from being mistaken for a
     revoked device while preserving the writer plane's existing 403 contract.
+
+    Running before authentication also means anonymous internet traffic reads
+    this body, so it is the same neutral detail and the same retry window an
+    unreadable kill state answers with: a deliberate shutdown and a failing
+    security backend are indistinguishable from outside.
     """
 
     if not state.quotas.kill_state().public_enabled:
         raise QuotaExceeded(
-            "public API disabled",
+            PUBLIC_UNAVAILABLE_DETAIL,
             status_code=503,
-            retry_after=_PUBLIC_DISABLED_RETRY_AFTER,
+            retry_after=PUBLIC_UNAVAILABLE_RETRY_AFTER,
         )
 
 
@@ -1460,10 +1463,12 @@ def create_cloud_app(
             """
 
             # A disabled public API is a global 503 before authentication, so
-            # it cannot be mistaken for a credential refusal and cannot spend
-            # the writer replay nonce.  Once enabled, authentication and the
-            # kill state remain first, body second: nothing unauthenticated
-            # gets to hand this route bytes to buffer.
+            # it cannot be mistaken for a credential refusal.  The replay nonce
+            # was never at risk -- ``_writer_auth`` already refused ahead of it
+            # -- but the ordering keeps the shutdown ahead of every credential
+            # verdict.  Once enabled, authentication and the kill state remain
+            # first, body second: nothing unauthenticated gets to hand this
+            # route bytes to buffer.
             _require_public_api_for_device_or_reader(state)
             credential = _writer_auth(state, request, capability="read")
             try:

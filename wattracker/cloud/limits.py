@@ -94,6 +94,21 @@ KILL_SWITCH_TTL_SECONDS: Final = 30.0
 KILL_SWITCH_MAX_TTL_SECONDS: Final = 60.0
 _MAX_KILL_SWITCH_REASON: Final = 200
 
+# Every 503 the kill switch produces carries this one detail, whether the
+# deployment was deliberately shut down or its durable kill state could not be
+# read.  The check runs before authentication, so an anonymous caller from the
+# internet sees these bodies: telling the two apart would advertise a failing
+# security backend to exactly the audience that must not learn about it.
+PUBLIC_UNAVAILABLE_DETAIL: Final = "public API unavailable"
+# The retry window travels with that detail for the same reason -- a differing
+# Retry-After would re-separate the two states the shared body just merged.
+# 300s matches the iOS client's own backoff ceiling (``maximumBackoff`` in
+# ios/WatTracker/WatTracker/Cloud/CloudSession.swift); the client honours a
+# server-supplied value exactly, with no growth and no jitter, so a shorter
+# window would pin every paired phone to a permanent poll against a deployment
+# that was switched off to stop it spending money.
+PUBLIC_UNAVAILABLE_RETRY_AFTER: Final = 300
+
 
 class KillSwitchUnavailable(RuntimeError):
     """The durable kill state could not be read, or is not intelligible.
@@ -880,7 +895,9 @@ class QuotaManager:
             return self._kill.state()
         except Exception as exc:
             raise QuotaExceeded(
-                "kill state unavailable", status_code=503, retry_after=30
+                PUBLIC_UNAVAILABLE_DETAIL,
+                status_code=503,
+                retry_after=PUBLIC_UNAVAILABLE_RETRY_AFTER,
             ) from exc
 
     def require_public_enabled(self) -> KillSwitchState:
@@ -925,7 +942,9 @@ class QuotaManager:
             self._kill.set_writes_enabled(bool(enabled), reason=reason)
         except KillSwitchUnavailable as exc:
             raise QuotaExceeded(
-                "kill state unavailable", status_code=503, retry_after=30
+                PUBLIC_UNAVAILABLE_DETAIL,
+                status_code=503,
+                retry_after=PUBLIC_UNAVAILABLE_RETRY_AFTER,
             ) from exc
 
     def set_public_enabled(self, enabled: bool, *, reason: str = "") -> None:
@@ -941,7 +960,9 @@ class QuotaManager:
             self._kill.set_public_enabled(bool(enabled), reason=reason)
         except KillSwitchUnavailable as exc:
             raise QuotaExceeded(
-                "kill state unavailable", status_code=503, retry_after=30
+                PUBLIC_UNAVAILABLE_DETAIL,
+                status_code=503,
+                retry_after=PUBLIC_UNAVAILABLE_RETRY_AFTER,
             ) from exc
 
     @staticmethod
