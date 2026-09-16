@@ -521,6 +521,228 @@ that nonce is outside the 300-second timestamp-freshness window long before
 its claim expires at 600 seconds. Deleting an unexpired one could, which is
 why expiry is the whole test.
 
+## Deleting a rider's data: the scope wipe
+
+Cloud sync stores heart rate, body weight and ride history. There has to be a
+way to take it back out, and that way is deliberately **not** a flag on the
+sync client. The sync identity's storage roles carry no delete action at all,
+which is what stops a compromised writer destroying data, so deletion is a
+separate privileged path run by a different principal.
+
+`wattracker.cloud.wipe.wipe_scope(namespace, local_user_scope,
+irreversible=True, store=..., security_backend=...)` is the library entry
+point. There is no CLI yet (#169) and no HTTP route yet — the route and the
+desktop's "delete everything I have synced" button land after #305 rewrites
+the admission path. The function takes an already-verified namespace, exactly
+as every other path here does; no caller-supplied namespace or scope ever
+reaches it.
+
+### It is irreversible, and that is the choice
+
+`RECOVERY_RETENTION` keeps an ordinary *tombstoned* object recoverable for
+seven days — the rider deleted one ride and wants it back. A scope wipe
+deliberately does **not** honour that window. Honouring it would mean "delete
+everything I have synced" leaves every byte in the store for a week, still
+readable with `include_deleted=True` and still restorable by
+`recover_deleted`, which is precisely what was asked to be gone. So the wipe
+purges outright, and `irreversible=True` is a required keyword argument with
+no default: a wipe cannot be performed without typing the word.
+
+One copy outlives the call and it is not the application's. The storage
+account sets a 7-day blob soft-delete window (`deleteRetentionPolicy` in
+`infra/azure/main.bicep`). Those copies are reachable only by an Azure account
+owner through the storage platform — never by this application, any credential
+it issues, or any identity it deploys. It is documented rather than switched
+off, because it is the deployment's only protection against an accidental
+purge.
+
+### What goes, in order
+
+Credentials first, data last. Taking access away before taking the data away
+means a sync in flight cannot write a fresh object into a scope that has
+already been emptied, and an invitation cannot be redeemed into a credential
+for a scope that is about to stop existing. It also decides what a *partial*
+wipe looks like: what is left over is data nobody holds a credential for,
+never a live credential pointing at data that is half gone.
+
+1. `writer` rows for the scope — the desktop's sync credential.
+2. `device` rows, and the `device-seen` row each one owns.
+3. `context` rows, and the `context-index` row each one owns.
+4. `invitation` and `device-pairing` rows — anything still redeemable into a
+   credential for the scope.
+5. Then the objects, their blobs, the batch idempotency markers and the
+   scope's revision row — and then everything else still sitting under the
+   scope's blob prefix, whether a row named it or not.
+
+Step 5 is why a re-sync gets a clean scope rather than a half-restored one. A
+scope emptied of objects but left at revision 3 refuses a fresh install's
+first batch forever — `StaleRevision`, because 1 ≤ 3 — and a surviving batch
+marker replays an old `ApplyResult` describing bytes that no longer exist.
+
+### The wipe is defined by the container, not by the table
+
+The rows are walked first, because a row is the only thing that pairs a blob
+with an object id and a byte count. The rows are **not** the definition of
+what is there. `_put_object` uploads the blob and *then* upserts the row, so a
+crash, a dropped connection or a 500 between those two writes leaves a blob
+holding heart rate, watts and body weight with no row naming it. `get` never
+returns it, so nobody ever notices it exists. A wipe driven only by the table
+never enumerates it either, and it would sit in the container after the rider
+asked for deletion — while the receipt reported a clean sweep. That needs no
+attacker; it is ordinary failure.
+
+So the purge finishes by listing the `f"{namespace}:{scope}/"` blob prefix and
+deleting everything still under it. The prefix is provably this rider's alone:
+a local scope cannot contain `/`, so `ns:rider/` is not a prefix of
+`ns:rider2/…`. Those blobs are counted separately, in `ScopePurge.orphans` and
+`ScopeWipeReport.orphans`, and logged at warning level — the data is gone
+either way, but a non-zero count is evidence that an earlier sync was
+interrupted mid-object and is worth knowing about. The blob listing is the one
+coordinate source here the service controls rather than this code derives, so
+a returned name outside the prefix is refused and counted in `skipped`, the
+same rule `BlobName` gets.
+
+The scope lease blob (`__lock`) lives under that prefix too. It is excluded
+from the prefix pass and deleted immediately afterwards instead — not so that
+it survives, it does not, but because the pass runs while the lease on it is
+held and deleting a leased blob without its lease id fails the call and then
+fails the release. It is written as zero bytes and used only as a lease
+target, so it holds nothing of the rider's.
+
+A row that is already gone is not a failure. `delete_entity` returning 404
+means the row reached the state the call wanted, so it is swallowed exactly as
+a missing blob is; raising instead abandoned the rest of the partition
+part-way through, *after* step 1–4 had deleted every credential that could
+reach what was left. `_not_found` is strict — a mapped `ResourceNotFoundError`
+or a structured 404, nothing else — so a 403, a 401 or a 5xx still propagates
+and still stops the purge.
+
+`device-seen` and `context-index` carry no namespace of their own, so neither
+can be matched on a scope, and walking those two kinds blind is exactly how a
+wipe would reach into another rider's rows. Each is reachable only through the
+row that owns it — which means the *derivation* of its key is the only access
+control there is, so it cannot be a bare read of a payload field. The read
+plane holds `entities/write` on `authTable` and can rewrite any payload, so a
+`credential_id` or `context_id` edited to name another rider's row would
+otherwise turn one rider's wipe into a deletion of theirs. Each key is proved
+against the record claiming it instead:
+
+- a `device` row re-derives `sha256(credential_id)` and requires it to equal
+  the row's own key — the same check `_device_id_from_value` already applies
+  to the device listing;
+- a `context` row cannot do that (its key digests the token, its companion's
+  key digests the context id), so the `context-index` row is read back and
+  required to name *this* context row in its `token_digest`.
+
+A record that cannot prove a companion has that companion left alone and
+counted in `skipped`. The record itself is still deleted: a tampered payload
+does not stop it authenticating — `_find_device_locked` and
+`read_context_token` resolve from the row's own address and never read the
+edited field — so leaving it would leave a live credential behind a wipe.
+
+A blob is likewise deleted by the name `AzureTenantStore` derives from the
+partition and object id, never by the `BlobName` the row stores. A row whose
+stored name disagrees is counted in `skipped` and the name it points at is
+left alone — but the derived name is deleted regardless, because it is
+provably inside this partition and the row goes either way. Skipping it
+entirely left the rider's own ride data at that name with nothing pointing at
+it: unreachable by `get`, by `recover_deleted`, and by any later wipe.
+
+An `object:` row whose key yields no valid object id is the one row a purge
+**keeps**. `_row_key` validates on write, so the application cannot produce
+one; it takes `entities/write` on `CloudObjects`, the same compromised sync
+identity as the tampered `BlobName` above. No blob name can be derived from
+such a key, so the row cannot be paired with anything — and deleting it
+anyway destroyed the only surviving evidence that an unvalidated key had been
+written to the table. The rider's data is not what is kept: the prefix pass
+reaches the blob the row key can no longer name, so the data goes and an empty
+inconsistent row remains, counted in `skipped` and visible to the next
+operator who looks. It is never counted in `objects`, which is a receipt of
+rows actually removed.
+
+### What survives a wipe, and why
+
+- **The budget kill switch.** An absent `kill-switch` row reads as *ENABLED*,
+  so deleting it would silently re-enable spending and the public API on a
+  deployment somebody deliberately killed — no error, no log. A wipe is most
+  likely to be run exactly when the switch is most likely to be thrown. Two
+  things stop it: the row lives in `CloudControl`, which the operator wipe
+  roles are **not** assignable to, so the grant cannot reach it; and
+  `WIPE_PROTECTED_RECORD_KINDS` excludes the kind by name anyway, because a
+  wipe whose safety is an emergent property of the scope filter is a wipe
+  whose safety depends on the thing this change edits.
+- **The daily quota counters.** Unlike the switch, `quota-counter` rows *are*
+  keyed by `(namespace, scope)`, so a scope filter would find them. They are
+  kept because an absent counter reads as *zero*: wiping them would turn
+  wipe-then-re-enrol into an unlimited daily budget on a deployment whose only
+  cost control is those rows, and the installation-subject counters are shared
+  with the other rider, so deleting one would refund a stranger's spending. A
+  counter row is a byte count, a request count and a UTC date — no heart rate,
+  no weight, no ride — and it is reclaimed in place by the first charge of the
+  next day, so keeping it leaks nothing and grows nothing.
+- **Replay claims.** A `nonce` row is keyed by an unrecoverable digest, so one
+  scope's claims cannot be selected; and deleting an unexpired claim re-opens
+  a captured request to replay. They expire within 600 seconds on their own.
+- **Every other scope.** Rows are matched on the *payload's* namespace and
+  local scope with constant-time whole-field comparisons, never on a prefix or
+  a row key. A row whose payload will not decode is left where it is and
+  counted in the report's `skipped`: a row nobody can read is a row nobody can
+  prove belongs to this rider. `skipped` also covers an unproven companion
+  row, an object row whose stored `BlobName` was not followed, an object row
+  whose key yields no object id (kept, once its blob is gone), and a blob name
+  the listing returned from outside the scope's own prefix. A non-zero count
+  means something in the scope disagrees with the thing that addresses it.
+- **An empty row with no data behind it**, in the one tampered case just
+  described. This is the only rider-addressable residual inside the
+  application's own storage, and it holds no ride data — only a row key, a
+  revision number and a byte count. Everything a rider synced is gone.
+
+Stated plainly for the rider: **after a wipe, nothing the rider synced remains
+in the container or the tables.** The one copy that outlives the call is the
+storage account's 7-day blob soft-delete window described above, which no
+credential this application issues can read.
+
+### The identity that runs it
+
+`operatorWipeBlobRoleDefinition` and `operatorWipeTableRoleDefinition` are two
+custom roles: blob read + delete on `wattracker-objects`, and entity read +
+delete assignable only to `CloudObjects` and `CloudAuth`. Neither is assigned
+to any container app identity. Both are assigned only when a deployment sets
+`operatorWipePrincipalId`, and `main.bicepparam` leaves it empty, so the
+default deployment defines the capability and gives it to nobody. The sync
+identity is unchanged and still holds no delete anywhere.
+
+`CloudControl` is absent from both roles on purpose: not being able to delete
+the kill switch is better than being trusted not to.
+
+`tests/test_cloud_scope_wipe.py` proves each of these. It sets the kill switch,
+runs a full wipe and asserts `read_kill_switch(backend)` still reports the
+deployment killed **with its reason intact** — asserted on the read, not on the
+table contents, because the whole failure mode is that an absent row reads as
+healthy. It also builds two installations that share one `local_user_scope`
+name, so only the namespace separates them, and proves a wipe of one leaves
+the other's objects, revision, credentials, devices and contexts untouched.
+
+The container-defined wipe has its own four:
+`test_azure_purge_removes_a_blob_no_table_row_accounts_for` plants the blob a
+crash between `_put_object`'s two writes leaves behind and requires the purge
+to find it; `test_azure_purge_finishes_the_partition_when_a_row_is_already_gone`
+raises a 404 out of `delete_entity` mid-partition and requires the rest of the
+scope to still be emptied, then raises a 403 from the same call and requires
+it to propagate; `test_azure_purge_keeps_an_object_row_whose_id_cannot_be_derived`
+requires the unparseable row to survive and its blob not to; and
+`test_azure_purge_will_not_delete_a_listed_name_outside_the_partition` has the
+listing return another rider's blob name and requires it to be refused.
+
+There is no two-installation fixture in this repository to reuse — #167's does
+not exist, and `tests/test_cloud_device_revocation.py` already says so in its
+own docstring — so `tests/test_cloud_scope_wipe.py::riders` builds one.
+
+**A wipe is not a device revocation.** #160's "remove this device" ends one
+device's access and leaves every byte of the rider's data in place. A wipe
+destroys the data and every credential that could reach it. The two must stay
+distinct in any UI that offers both.
+
 ## Local offline contract
 
 The desktop app remains the source of truth while offline. The opt-in client
@@ -787,7 +1009,12 @@ hard billing ceiling.
       firewall admits only those sources.
 - [ ] Verify each managed identity has only its documented data-plane role —
       in particular, `entities/delete` on `CloudAuth` is held by the read
-      identity alone through `authSweeperRoleDefinition`.
+      identity alone through `authSweeperRoleDefinition`, and no container app
+      identity holds `operatorWipeBlobRoleDefinition` or
+      `operatorWipeTableRoleDefinition`.
+- [ ] Confirm `operatorWipePrincipalId` is empty unless a named operator
+      principal is meant to hold the wipe roles, and that neither wipe role is
+      assignable to `CloudControl`.
 - [ ] Throw the kill switch, let the read plane sweep, and confirm the switch
       still reads disabled. An absent row is enabled; a missing table refuses
       startup.

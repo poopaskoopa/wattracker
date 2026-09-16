@@ -256,18 +256,87 @@ def test_apim_and_private_endpoint_parameters_are_removed_from_the_template():
 
 
 def test_cleanup_delete_identity_is_not_deployed_without_a_cleanup_job():
-    """A delete action is deployed only where something actually deletes.
+    """A delete action is *held* only where something actually deletes.
 
     #153 grants one -- `entities/delete` on `CloudAuth`, to the read identity,
     for the expired-row sweep the read plane runs in process. That is a job
     that exists. A standalone cleanup identity with delete on blobs and on
     every table, with no job behind it, still is not.
+
+    #170 adds the first blob delete in the template, for the operator scope
+    wipe. The original assertion here was "no blob delete exists anywhere",
+    and it cannot survive an issue whose entire purpose is deleting a rider's
+    blobs. What survives is the rule it was protecting, restated at the only
+    place it can now be checked: the blob delete exists once, in a role
+    definition, and the deployment's own parameter file assigns it to nobody.
+    The operator CLI that will hold it is #169 and is not built.
     """
 
     assert "cleanupIdentity" not in BICEP
     assert "cleanupBlobRole" not in BICEP
     assert "cleanupTableRole" not in BICEP
-    assert "blobServices/containers/blobs/delete" not in BICEP
+    assert BICEP.count("blobServices/containers/blobs/delete") == 1
+    wipe_blob_role = BICEP.split(
+        "resource operatorWipeBlobRoleDefinition "
+        "'Microsoft.Authorization/roleDefinitions"
+    )[1].split("resource ")[0]
+    assert "blobServices/containers/blobs/delete" in wipe_blob_role
+    # Assigned only through a parameter, and the skeleton leaves it empty.
+    for assignment in (
+        "operatorWipeBlobRole ",
+        "operatorWipeObjectTableRole ",
+        "operatorWipeAuthTableRole ",
+    ):
+        block = BICEP.split(f"resource {assignment}")[1].split("resource ")[0]
+        assert "if (!empty(operatorWipePrincipalId))" in block
+        assert "principalId: operatorWipePrincipalId" in block
+        assert "readIdentity" not in block
+        assert "syncIdentity" not in block
+    assert "param operatorWipePrincipalId = ''" in PARAMS
+
+
+def test_the_operator_wipe_role_cannot_reach_the_kill_switch_table():
+    """#170's separation: the wipe identity is not the sync identity.
+
+    The sync identity's storage roles carry no delete action at all, which is
+    what makes a compromised writer unable to destroy data, so the wipe has to
+    be a different principal. What bounds the new grant is the *scope* it is
+    assignable to: `CloudObjects`, `CloudAuth` and the object container, and
+    deliberately not `CloudControl`. An absent kill-switch row reads as
+    ENABLED, so the switch being unreachable by the grant beats the wipe being
+    trusted not to touch it. `tests/test_cloud_scope_wipe.py` covers the
+    application-side exclusion by record kind, which is what protects the
+    quota counters that do share `CloudAuth`.
+    """
+
+    table_role = BICEP.split(
+        "resource operatorWipeTableRoleDefinition "
+        "'Microsoft.Authorization/roleDefinitions"
+    )[1].split("resource ")[0]
+    assert "assignableScopes: [objectTable.id, authTable.id]" in table_role
+    assert "controlTable" not in table_role
+    assert "replayTable" not in table_role
+    blob_role = BICEP.split(
+        "resource operatorWipeBlobRoleDefinition "
+        "'Microsoft.Authorization/roleDefinitions"
+    )[1].split("resource ")[0]
+    assert "assignableScopes: [objectContainer.id]" in blob_role
+    # `purge_scope` ends by listing the scope's blob prefix, so a blob with no
+    # row is still deleted. Azure's List Blobs is gated on the *blobs* read
+    # data action, so losing this line would not lose a test elsewhere -- it
+    # would 403 the wipe in production, after the credentials were gone.
+    assert (
+        "'Microsoft.Storage/storageAccounts/blobServices/containers/blobs/read'"
+        in blob_role
+    )
+    # No container app identity gains the wipe roles.
+    assert BICEP.count("operatorWipeTableRoleDefinition.id") == 2
+    assert BICEP.count("operatorWipeBlobRoleDefinition.id") == 1
+    for definition in ("syncBlobWriterRoleDefinition", "syncTableWriterRoleDefinition"):
+        role = BICEP.split(
+            f"resource {definition} 'Microsoft.Authorization/roleDefinitions"
+        )[1].split("resource ")[0]
+        assert "delete" not in role
 
 
 def test_only_the_read_identity_may_delete_and_only_from_cloudauth():
@@ -279,10 +348,25 @@ def test_only_the_read_identity_may_delete_and_only_from_cloudauth():
     of this grant is the whole table and the narrowing that matters is which
     identity holds it, on which table, and how many delete actions exist at
     all. `tests/test_cloud_security.py` covers the application-side exclusion.
+
+    #170 adds the second table delete in the template, for the operator scope
+    wipe, so "exactly one" becomes "exactly these two, each accounted for".
+    The read identity is still the only *deployed workload* identity holding a
+    table delete: the wipe roles are assigned only when a deployment names an
+    operator principal, which the skeleton parameter file does not.
     """
 
-    # Exactly one delete action in the template, in exactly one custom role.
-    assert BICEP.count("tables/entities/delete") == 1
+    # Two delete actions in the template, in two custom roles, each named.
+    assert BICEP.count("tables/entities/delete") == 2
+    sweeper_role = BICEP.split(
+        "resource authSweeperRoleDefinition 'Microsoft.Authorization/roleDefinitions"
+    )[1].split("resource ")[0]
+    wipe_table_role = BICEP.split(
+        "resource operatorWipeTableRoleDefinition "
+        "'Microsoft.Authorization/roleDefinitions"
+    )[1].split("resource ")[0]
+    assert "tables/entities/delete" in sweeper_role
+    assert "tables/entities/delete" in wipe_table_role
     assert "roleName: 'Wattracker Cloud Auth Sweeper'" in BICEP
     assert (
         "assignableScopes: [authTable.id]" in BICEP

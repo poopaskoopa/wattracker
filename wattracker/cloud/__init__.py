@@ -28,6 +28,11 @@ _EXPORTS: Final[dict[str, tuple[str, str]]] = {
     "SyncBatch": (".models", "SyncBatch"),
     "AzureTenantStore": (".storage", "AzureTenantStore"),
     "MemoryTenantStore": (".storage", "MemoryTenantStore"),
+    "ScopePurge": (".storage", "ScopePurge"),
+    "ScopeWipeReport": (".wipe", "ScopeWipeReport"),
+    "WIPE_PROTECTED_RECORD_KINDS": (".wipe", "WIPE_PROTECTED_RECORD_KINDS"),
+    "WIPE_RECORD_KINDS": (".wipe", "WIPE_RECORD_KINDS"),
+    "wipe_scope": (".wipe", "wipe_scope"),
     "AzureTableSecurityStateBackend": (
         ".security", "AzureTableSecurityStateBackend"
     ),
