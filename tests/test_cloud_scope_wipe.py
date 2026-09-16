@@ -1272,6 +1272,70 @@ def test_azure_purge_keeps_an_object_row_whose_id_cannot_be_derived():
     )
 
 
+def test_azure_purge_leaves_a_sibling_scope_whose_name_it_prefixes():
+    """The prefix is a path prefix, not a string prefix.
+
+    ``rider`` and ``rider2`` share a namespace and the first spells the start
+    of the second, so a pass that listed ``f"{partition}"`` rather than
+    ``f"{partition}/"`` would empty both and report nothing wrong. The
+    trailing separator is the whole isolation guarantee for the prefix pass,
+    and this is the case that can tell.
+    """
+
+    store, container, table = _azure_store()
+    namespace = "a" * 64
+    store.apply(namespace, "rider", _batch("b1", 1, "ride-1"))
+    store.apply(namespace, "rider2", _batch("b1", 1, "ride-2"))
+    sibling_blob = f"{namespace}:rider2/object:ride-2.json"
+    orphan = f"{namespace}:rider2/object:ride-9.json"
+    container.blobs[orphan] = b'{"heartrate": 152}'
+
+    result = store.purge_scope(namespace, "rider")
+
+    assert sibling_blob in container.blobs
+    assert orphan in container.blobs
+    assert store.get(namespace, "rider2", "ride-2") is not None
+    assert store.revision(namespace, "rider2") == 1
+    assert not [n for n in container.blobs if n.startswith(f"{namespace}:rider/")]
+    assert result.orphans == 0
+
+
+def test_azure_purge_will_not_follow_a_listed_name_back_out_of_the_prefix():
+    """``startswith`` is not containment: the service resolves ``..``.
+
+    A listed name can sit inside the prefix as text and still address another
+    rider's blob once the service walks it, which is the one way past the
+    check above. The rider's own names never carry a ``..`` segment --
+    ``_blob_name`` builds them from a validated object id -- so refusing them
+    costs nothing and is counted like any other listing anomaly.
+    """
+
+    store, container, table = _azure_store()
+    victim = "b" * 64
+    attacker = "a" * 64
+    store.apply(victim, SCOPE, _batch("b1", 1, "ride-1"))
+    store.apply(attacker, SCOPE, _batch("b1", 1, "ride-1"))
+    victim_blob = f"{victim}:{SCOPE}/object:ride-1.json"
+    prefix = f"{attacker}:{SCOPE}/"
+    climbing = f"{prefix}../{victim}:{SCOPE}/object:ride-1.json"
+    container.blobs[climbing] = b"placeholder"
+    honest_list = container.list_blobs
+
+    def lying_list(*, name_starts_with):
+        listed = honest_list(name_starts_with=name_starts_with)
+        if name_starts_with.startswith(attacker):
+            listed.append(_FakeBlobProperties(climbing))
+        return listed
+
+    container.list_blobs = lying_list
+
+    result = store.purge_scope(attacker, SCOPE)
+
+    assert victim_blob in container.blobs
+    assert store.get(victim, SCOPE, "ride-1") is not None
+    assert result.skipped >= 1
+
+
 def test_azure_purge_will_not_delete_a_listed_name_outside_the_partition():
     """The prefix listing is a coordinate source, so it is bounded too.
 

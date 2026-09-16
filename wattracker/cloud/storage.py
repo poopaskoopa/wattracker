@@ -1014,6 +1014,14 @@ class AzureTenantStore:
                     # than ``BlobName`` is.  It is reported, not swallowed.
                     skipped += 1
                     continue
+                if ".." in name[len(prefix):].split("/"):
+                    # ``startswith`` alone is not containment: the service
+                    # resolves ``..`` segments, so a listed name could climb
+                    # back out of the prefix it appears to sit inside.  The
+                    # rider's own names never carry one -- ``_blob_name``
+                    # builds them from a validated object id.
+                    skipped += 1
+                    continue
                 if name != lock_name and self._delete_blob(name):
                     orphans += 1
         self._delete_blob(lock_name)
