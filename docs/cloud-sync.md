@@ -571,12 +571,51 @@ never a live credential pointing at data that is half gone.
 4. `invitation` and `device-pairing` rows — anything still redeemable into a
    credential for the scope.
 5. Then the objects, their blobs, the batch idempotency markers and the
-   scope's revision row.
+   scope's revision row — and then everything else still sitting under the
+   scope's blob prefix, whether a row named it or not.
 
 Step 5 is why a re-sync gets a clean scope rather than a half-restored one. A
 scope emptied of objects but left at revision 3 refuses a fresh install's
 first batch forever — `StaleRevision`, because 1 ≤ 3 — and a surviving batch
 marker replays an old `ApplyResult` describing bytes that no longer exist.
+
+### The wipe is defined by the container, not by the table
+
+The rows are walked first, because a row is the only thing that pairs a blob
+with an object id and a byte count. The rows are **not** the definition of
+what is there. `_put_object` uploads the blob and *then* upserts the row, so a
+crash, a dropped connection or a 500 between those two writes leaves a blob
+holding heart rate, watts and body weight with no row naming it. `get` never
+returns it, so nobody ever notices it exists. A wipe driven only by the table
+never enumerates it either, and it would sit in the container after the rider
+asked for deletion — while the receipt reported a clean sweep. That needs no
+attacker; it is ordinary failure.
+
+So the purge finishes by listing the `f"{namespace}:{scope}/"` blob prefix and
+deleting everything still under it. The prefix is provably this rider's alone:
+a local scope cannot contain `/`, so `ns:rider/` is not a prefix of
+`ns:rider2/…`. Those blobs are counted separately, in `ScopePurge.orphans` and
+`ScopeWipeReport.orphans`, and logged at warning level — the data is gone
+either way, but a non-zero count is evidence that an earlier sync was
+interrupted mid-object and is worth knowing about. The blob listing is the one
+coordinate source here the service controls rather than this code derives, so
+a returned name outside the prefix is refused and counted in `skipped`, the
+same rule `BlobName` gets.
+
+The scope lease blob (`__lock`) lives under that prefix too. It is excluded
+from the prefix pass and deleted immediately afterwards instead — not so that
+it survives, it does not, but because the pass runs while the lease on it is
+held and deleting a leased blob without its lease id fails the call and then
+fails the release. It is written as zero bytes and used only as a lease
+target, so it holds nothing of the rider's.
+
+A row that is already gone is not a failure. `delete_entity` returning 404
+means the row reached the state the call wanted, so it is swallowed exactly as
+a missing blob is; raising instead abandoned the rest of the partition
+part-way through, *after* step 1–4 had deleted every credential that could
+reach what was left. `_not_found` is strict — a mapped `ResourceNotFoundError`
+or a structured 404, nothing else — so a 403, a 401 or a 5xx still propagates
+and still stops the purge.
 
 `device-seen` and `context-index` carry no namespace of their own, so neither
 can be matched on a scope, and walking those two kinds blind is exactly how a
@@ -609,6 +648,18 @@ provably inside this partition and the row goes either way. Skipping it
 entirely left the rider's own ride data at that name with nothing pointing at
 it: unreachable by `get`, by `recover_deleted`, and by any later wipe.
 
+An `object:` row whose key yields no valid object id is the one row a purge
+**keeps**. `_row_key` validates on write, so the application cannot produce
+one; it takes `entities/write` on `CloudObjects`, the same compromised sync
+identity as the tampered `BlobName` above. No blob name can be derived from
+such a key, so the row cannot be paired with anything — and deleting it
+anyway destroyed the only surviving evidence that an unvalidated key had been
+written to the table. The rider's data is not what is kept: the prefix pass
+reaches the blob the row key can no longer name, so the data goes and an empty
+inconsistent row remains, counted in `skipped` and visible to the next
+operator who looks. It is never counted in `objects`, which is a receipt of
+rows actually removed.
+
 ### What survives a wipe, and why
 
 - **The budget kill switch.** An absent `kill-switch` row reads as *ENABLED*,
@@ -636,9 +687,20 @@ it: unreachable by `get`, by `recover_deleted`, and by any later wipe.
   local scope with constant-time whole-field comparisons, never on a prefix or
   a row key. A row whose payload will not decode is left where it is and
   counted in the report's `skipped`: a row nobody can read is a row nobody can
-  prove belongs to this rider. `skipped` also covers an unproven companion row
-  and an object row whose stored `BlobName` was not followed, so a non-zero
-  count means some row disagrees with the row that addresses it.
+  prove belongs to this rider. `skipped` also covers an unproven companion
+  row, an object row whose stored `BlobName` was not followed, an object row
+  whose key yields no object id (kept, once its blob is gone), and a blob name
+  the listing returned from outside the scope's own prefix. A non-zero count
+  means something in the scope disagrees with the thing that addresses it.
+- **An empty row with no data behind it**, in the one tampered case just
+  described. This is the only rider-addressable residual inside the
+  application's own storage, and it holds no ride data — only a row key, a
+  revision number and a byte count. Everything a rider synced is gone.
+
+Stated plainly for the rider: **after a wipe, nothing the rider synced remains
+in the container or the tables.** The one copy that outlives the call is the
+storage account's 7-day blob soft-delete window described above, which no
+credential this application issues can read.
 
 ### The identity that runs it
 
@@ -660,6 +722,17 @@ table contents, because the whole failure mode is that an absent row reads as
 healthy. It also builds two installations that share one `local_user_scope`
 name, so only the namespace separates them, and proves a wipe of one leaves
 the other's objects, revision, credentials, devices and contexts untouched.
+
+The container-defined wipe has its own four:
+`test_azure_purge_removes_a_blob_no_table_row_accounts_for` plants the blob a
+crash between `_put_object`'s two writes leaves behind and requires the purge
+to find it; `test_azure_purge_finishes_the_partition_when_a_row_is_already_gone`
+raises a 404 out of `delete_entity` mid-partition and requires the rest of the
+scope to still be emptied, then raises a 403 from the same call and requires
+it to propagate; `test_azure_purge_keeps_an_object_row_whose_id_cannot_be_derived`
+requires the unparseable row to survive and its blob not to; and
+`test_azure_purge_will_not_delete_a_listed_name_outside_the_partition` has the
+listing return another rider's blob name and requires it to be refused.
 
 There is no two-installation fixture in this repository to reuse — #167's does
 not exist, and `tests/test_cloud_device_revocation.py` already says so in its

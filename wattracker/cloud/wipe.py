@@ -214,15 +214,26 @@ class ScopeWipeReport:
     learns "run it again" from the return value rather than from a silently
     short result.
 
+    ``orphans`` comes straight from
+    :attr:`~wattracker.cloud.storage.ScopePurge.orphans`: blobs that were
+    under the scope's blob prefix with no row naming them, found and deleted
+    by the store's container pass.  It is normally zero.  A non-zero value is
+    not an error and not a partial wipe -- the data is gone either way -- but
+    it is evidence that an earlier sync was interrupted between writing a blob
+    and writing its row, which is worth knowing about.
+
     ``skipped`` counts everything this wipe declined to act on rather than
     guessed at, from both halves of it:
 
     * a row whose payload would not decode, or did not name a scope;
     * a companion row a record claimed but could not prove it owns (see the
       module docstring);
-    * from :class:`~wattracker.cloud.storage.ScopePurge`, an object row whose
-      stored ``BlobName`` named a blob outside its own partition -- that blob
-      was not followed, though the row's own blob was still deleted.
+    * from :class:`~wattracker.cloud.storage.ScopePurge`: an object row whose
+      stored ``BlobName`` named a blob outside its own partition (that blob
+      was not followed, though the row's own blob was still deleted); an
+      object row whose key yields no object id, which is **kept** so the
+      inconsistency stays visible after its blob is gone; and a name the blob
+      listing returned from outside the scope's own prefix.
 
     None of these is an error and none of them stops the wipe.  A non-zero
     ``skipped`` means a row somewhere disagrees with the row that addresses
@@ -237,6 +248,7 @@ class ScopeWipeReport:
     markers: int = 0
     skipped: int = 0
     complete: bool = True
+    orphans: int = 0
 
     @property
     def credentials(self) -> int:
@@ -490,6 +502,7 @@ def wipe_scope(
         markers=purge.markers,
         skipped=skipped + purge.skipped,
         complete=complete,
+        orphans=purge.orphans,
     )
     _log.info(
         "cloud scope wipe removed %d records and %d objects (complete=%s)",
@@ -497,6 +510,12 @@ def wipe_scope(
         report.objects,
         report.complete,
     )
+    if report.orphans:
+        _log.warning(
+            "cloud scope wipe deleted %d blob(s) that no table row named: an "
+            "earlier sync was interrupted between writing a blob and its row",
+            report.orphans,
+        )
     return report
 
 

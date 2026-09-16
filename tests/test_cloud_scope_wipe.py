@@ -371,19 +371,25 @@ def test_credentials_are_gone_before_the_store_is_purged(riders):
 
 
 def test_the_report_adds_the_stores_skipped_rows_to_its_own(riders):
-    """N2: ``purge.skipped`` must reach the caller.
+    """N2: ``purge.skipped`` must reach the caller, and so must ``orphans``.
 
     Dropping it left the suite green while silently discarding the one signal
     that says "a row in your store names a blob this purge would not follow".
     The two sources are summed, so the assertion is on a total neither half
     could produce alone.
+
+    ``orphans`` is the same class of signal for C1 -- blobs found under the
+    scope's prefix with no row naming them -- and has only one source, so it
+    is asserted to arrive unchanged and not folded into ``skipped``.
     """
 
     _store, backend, alice, _bob = riders
 
     class _SkippingStore:
         def purge_scope(self, _namespace, _scope):
-            return ScopePurge(objects=1, blobs=1, markers=2, skipped=3)
+            return ScopePurge(
+                objects=1, blobs=1, markers=2, skipped=3, orphans=5
+            )
 
     class _Undecodable(_DurableMemoryBackend):
         def iter_records(self, kind, *, limit):
@@ -407,6 +413,7 @@ def test_the_report_adds_the_stores_skipped_rows_to_its_own(riders):
     assert report.objects == 1
     assert report.blobs == 1
     assert report.markers == 2
+    assert report.orphans == 5  # its own count, not folded into skipped
 
 
 def test_an_invalid_scan_limit_is_refused_by_the_wipe_itself(riders):
@@ -925,12 +932,26 @@ class _FakeBlob:
             raise _StorageError(404) from exc
 
 
+class _FakeBlobProperties:
+    """What ``ContainerClient.list_blobs`` yields: a name-carrying object."""
+
+    def __init__(self, name):
+        self.name = name
+
+
 class _FakeContainer:
     def __init__(self):
         self.blobs = {}
 
     def get_blob_client(self, name):
         return _FakeBlob(self, name)
+
+    def list_blobs(self, *, name_starts_with):
+        return [
+            _FakeBlobProperties(name)
+            for name in sorted(self.blobs)
+            if name.startswith(name_starts_with)
+        ]
 
 
 class _FakeBlobService:
@@ -1120,6 +1141,169 @@ def test_azure_purge_leaves_no_readable_blob_when_a_row_names_a_foreign_one():
     # The other rider's blob was never a coordinate this purge could use.
     assert victim_blob in container.blobs
     assert store.get(victim, SCOPE, "ride-1") is not None
+
+
+def test_azure_purge_removes_a_blob_no_table_row_accounts_for():
+    """C1: the wipe is defined by the container, not only by the table.
+
+    ``_put_object`` uploads the blob and *then* upserts the row. A crash, a
+    dropped connection or a 500 between those two writes leaves a blob holding
+    heart rate, watts and body weight with no row naming it. ``get`` never
+    returns it, so nobody notices -- and a row-driven purge never enumerates
+    it, so it sits in the container after the rider asked for deletion. This
+    needs no attacker; it is ordinary failure.
+
+    Before the prefix pass the receipt said ``skipped=0`` while the blob
+    survived, which is the worst version of the bug: the wipe reported a
+    clean sweep it had not performed.
+    """
+
+    store, container, table = _azure_store()
+    namespace = "a" * 64
+    store.apply(namespace, SCOPE, _batch("b1", 1, "ride-1"))
+    partition = f"{namespace}:{SCOPE}"
+    # Exactly the state a crash between the two writes of ``_put_object``
+    # leaves: the blob is there, the row never landed.
+    orphan = f"{partition}/object:ride-9.json"
+    container.blobs[orphan] = json.dumps(
+        {"object_id": "ride-9", "heartrate": 152, "weight_kg": 71.4}
+    ).encode("utf-8")
+    assert (partition, "object:ride-9") not in table.entities
+
+    result = store.purge_scope(namespace, SCOPE)
+
+    # Nothing of this rider's is left in the container at any name.
+    assert orphan not in container.blobs
+    assert not [name for name in container.blobs if name.startswith(partition)]
+    assert not [key for key in table.entities if key[0] == partition]
+    # And the receipt says so: one row-driven blob, one the prefix pass found.
+    assert (result.objects, result.blobs, result.orphans) == (1, 1, 1)
+    assert result.skipped == 0
+
+
+def test_azure_purge_finishes_the_partition_when_a_row_is_already_gone():
+    """C2: a 404 from ``delete_entity`` is the desired end state, not an error.
+
+    ``_delete_blob`` already swallows not-found; the row deletion called the
+    table raw, so one 404 raised out of ``purge_scope`` mid-partition and left
+    the remaining rows and blobs behind -- with the rider's credentials
+    already deleted by the wipe's earlier phase, so nothing could reach the
+    data and no later call could find it either.
+
+    Genuine failures must still propagate: the second half asserts a 403 out
+    of the same call is not swallowed.
+    """
+
+    store, container, table = _azure_store()
+    namespace = "a" * 64
+    store.apply(namespace, SCOPE, _batch("b1", 1, "ride-1"))
+    store.apply(namespace, SCOPE, _batch("b2", 2, "ride-2"))
+    partition = f"{namespace}:{SCOPE}"
+    raw_delete = table.delete_entity
+    vanished = {"object:ride-1"}
+
+    def racing_delete(*, partition_key, row_key):
+        if row_key in vanished:
+            vanished.discard(row_key)
+            del table.entities[(partition_key, row_key)]
+            raise _StorageError(404)
+        return raw_delete(partition_key=partition_key, row_key=row_key)
+
+    table.delete_entity = racing_delete
+
+    result = store.purge_scope(namespace, SCOPE)
+
+    assert not [key for key in table.entities if key[0] == partition]
+    assert not [name for name in container.blobs if name.startswith(partition)]
+    # The row that was already gone is not counted as one this call removed.
+    assert (result.objects, result.blobs, result.markers) == (1, 2, 3)
+    assert store.revision(namespace, SCOPE) == 0
+
+    # A refusal is not an absence. 403 still propagates.
+    store.apply(namespace, SCOPE, _batch("b3", 3, "ride-3"))
+
+    def refusing_delete(*, partition_key, row_key):
+        raise _StorageError(403)
+
+    table.delete_entity = refusing_delete
+    with pytest.raises(_StorageError):
+        store.purge_scope(namespace, SCOPE)
+
+
+def test_azure_purge_keeps_an_object_row_whose_id_cannot_be_derived():
+    """C3: an underivable RowKey must not be deleted into invisibility.
+
+    ``_row_key`` validates on write, so this is not reachable through the app:
+    it needs ``entities/write`` on ``CloudObjects`` -- the same compromised
+    sync identity as the ``BlobName`` tampering. The row key ``object:.bad``
+    yields no object id, so no blob name can be derived from it. Deleting the
+    row anyway destroyed the only record that the pair was inconsistent while
+    leaving the blob, so no later wipe could ever find it.
+
+    The prefix pass of C1 does remove that blob -- the rider's data is gone
+    either way, which is the promise that matters. The row is still kept,
+    because it is the only remaining evidence that something wrote an
+    unvalidated key into this table, and a row with no data behind it is
+    cheap. It is counted in ``skipped``, never in ``objects``: ``objects`` is
+    a receipt of rows actually removed.
+    """
+
+    store, container, table = _azure_store()
+    namespace = "a" * 64
+    store.apply(namespace, SCOPE, _batch("b1", 1, "ride-1"))
+    partition = f"{namespace}:{SCOPE}"
+    real_blob = f"{partition}/object:ride-1.json"
+    assert b"heartrate" in container.blobs[real_blob]
+    tampered = dict(table.entities.pop((partition, "object:ride-1")))
+    tampered["RowKey"] = "object:.bad"
+    table.entities[(partition, "object:.bad")] = tampered
+
+    result = store.purge_scope(namespace, SCOPE)
+
+    # The row survives, and it is the only thing in the partition that does.
+    assert [key[1] for key in table.entities if key[0] == partition] == [
+        "object:.bad"
+    ]
+    # The rider's data does not survive: the prefix pass reached the blob the
+    # row key could no longer name.
+    assert not [name for name in container.blobs if name.startswith(partition)]
+    assert (result.objects, result.blobs, result.orphans, result.skipped) == (
+        0, 0, 1, 1,
+    )
+
+
+def test_azure_purge_will_not_delete_a_listed_name_outside_the_partition():
+    """The prefix listing is a coordinate source, so it is bounded too.
+
+    Every other name this purge deletes is derived locally. These come back
+    from the service, so a name outside ``f"{partition}/"`` is refused rather
+    than followed -- the same rule as ``BlobName`` -- and counted in
+    ``skipped`` so the anomaly is reported rather than swallowed.
+    """
+
+    store, container, table = _azure_store()
+    victim = "b" * 64
+    attacker = "a" * 64
+    store.apply(victim, SCOPE, _batch("b1", 1, "ride-1"))
+    store.apply(attacker, SCOPE, _batch("b1", 1, "ride-1"))
+    victim_blob = f"{victim}:{SCOPE}/object:ride-1.json"
+    partition = f"{attacker}:{SCOPE}"
+    honest_list = container.list_blobs
+
+    def lying_list(*, name_starts_with):
+        listed = honest_list(name_starts_with=name_starts_with)
+        if name_starts_with.startswith(attacker):
+            listed.append(_FakeBlobProperties(victim_blob))
+        return listed
+
+    container.list_blobs = lying_list
+
+    result = store.purge_scope(attacker, SCOPE)
+
+    assert victim_blob in container.blobs
+    assert store.get(victim, SCOPE, "ride-1") is not None
+    assert not [name for name in container.blobs if name.startswith(partition)]
+    assert result.skipped == 1
 
 
 def test_azure_and_memory_stores_agree_on_what_a_purge_leaves_behind():

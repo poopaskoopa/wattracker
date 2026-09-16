@@ -321,6 +321,14 @@ def test_the_operator_wipe_role_cannot_reach_the_kill_switch_table():
         "'Microsoft.Authorization/roleDefinitions"
     )[1].split("resource ")[0]
     assert "assignableScopes: [objectContainer.id]" in blob_role
+    # `purge_scope` ends by listing the scope's blob prefix, so a blob with no
+    # row is still deleted. Azure's List Blobs is gated on the *blobs* read
+    # data action, so losing this line would not lose a test elsewhere -- it
+    # would 403 the wipe in production, after the credentials were gone.
+    assert (
+        "'Microsoft.Storage/storageAccounts/blobServices/containers/blobs/read'"
+        in blob_role
+    )
     # No container app identity gains the wipe roles.
     assert BICEP.count("operatorWipeTableRoleDefinition.id") == 2
     assert BICEP.count("operatorWipeBlobRoleDefinition.id") == 1

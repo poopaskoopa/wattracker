@@ -74,28 +74,46 @@ class _Stored:
 class ScopePurge:
     """What :meth:`purge_scope` removed from one ``(namespace, scope)``.
 
-    Every count is of something actually deleted, so the four can be read as a
+    Every count is of something actually deleted, so these can be read as a
     receipt rather than as an intent:
 
     * ``objects`` -- object rows removed from the table.
-    * ``blobs`` -- blobs removed from the container, each one at the name this
-      class derives for its partition and object id.  It is lower than
-      ``objects`` when a row's blob was already gone.
+    * ``blobs`` -- blobs removed from the container by the row pass, each one
+      at the name this class derives for its partition and object id.  It is
+      lower than ``objects`` when a row's blob was already gone.
+    * ``orphans`` -- blobs removed by the container pass, which enumerates the
+      partition's blob prefix after the rows are done.  Each one is a blob no
+      surviving row named.  It is normally zero, and a non-zero value is not
+      an error: ``_put_object`` writes the blob before the row, so any
+      interruption between the two leaves exactly one of these.  The wipe is
+      defined by the container's contents, not by the table's, so they go.
     * ``markers`` -- every other row in the partition: batch idempotency
       markers and the scope revision row.
-    * ``skipped`` -- object rows whose stored ``BlobName`` did **not** match
-      the derived name, so the stored name was not followed.  A row like that
-      names a blob somewhere else, possibly another rider's; that blob is left
-      exactly where it is and the operator is told.  The row's *own* blob, at
-      the derived name inside this partition, is still deleted and still
-      counted in ``blobs`` -- refusing to follow a foreign name is not a
-      reason to leave a rider's data behind unreachable.
+    * ``skipped`` -- everything this purge declined to follow rather than
+      guessed at.  Three things count here:
+
+      - an object row whose stored ``BlobName`` did **not** match the derived
+        name, so the stored name was not followed.  A row like that names a
+        blob somewhere else, possibly another rider's; that blob is left
+        exactly where it is.  The row's *own* blob, at the derived name inside
+        this partition, is still deleted and still counted in ``blobs`` --
+        refusing to follow a foreign name is not a reason to leave a rider's
+        data behind unreachable;
+      - an object row whose key yields no valid object id, so no blob name can
+        be derived from it.  That row is **kept**; see :meth:`purge_scope`;
+      - a name the blob listing returned that lies outside this partition's
+        prefix.  It is not deleted.
+
+      None of the three is an error and none stops the purge.  A non-zero
+      ``skipped`` means something in this partition disagrees with the thing
+      that addresses it, which on this table is evidence worth looking at.
     """
 
     objects: int = 0
     blobs: int = 0
     markers: int = 0
     skipped: int = 0
+    orphans: int = 0
 
 
 class MemoryTenantStore:
@@ -858,14 +876,57 @@ class AzureTenantStore:
         7-day blob soft-delete window, which is a platform setting this code
         cannot reach.
 
-        Two isolation properties are load-bearing and neither is incidental:
+        **The container is what is emptied, not the table.**  The rows are
+        walked first, because a row is the only thing that can pair a blob
+        with an object id and a byte count.  But the rows are not the
+        definition of what is here: ``_put_object`` uploads the blob and
+        *then* upserts the row, so a crash, a dropped connection or a 500
+        between those two writes leaves a blob holding the rider's heart rate
+        and body weight with no row naming it.  ``get`` never returns it, so
+        nobody notices -- and a row-driven purge never enumerates it, so it
+        would outlive the wipe.  That needs no attacker; it is ordinary
+        failure.  So after the row pass, everything still under this
+        partition's blob prefix is enumerated and deleted, and counted in
+        ``ScopePurge.orphans``.
+
+        Two things live under that prefix that are not object blobs, and both
+        are decided deliberately:
+
+        * ``__lock``, the scope lease blob, is **excluded from the prefix
+          pass** and deleted afterwards, at the bottom of this method.  Not
+          because it should survive -- it should not, and it does not -- but
+          because this pass runs while the lease on it is held, and deleting a
+          leased blob without its lease id fails the call and then fails the
+          release in ``_scope_lock``'s ``finally``.  It holds no rider data:
+          it is written as zero bytes and only ever used as a lease target.
+        * Anything else under the prefix is deleted.  Nothing in this class
+          writes such a name, so one appearing is either a future blob kind or
+          something that should not be there; either way the rider asked for
+          the scope to be empty, and the prefix is provably theirs alone.
+
+        Neither pass is bounded, and that is the point.  Every *scan* in this
+        package takes a limit because a scan that runs long is worse than a
+        scan that reports "call me again".  A wipe is the opposite: a bound
+        here would leave a blob behind and call the scope empty, which is the
+        defect this pass exists to close.  Both passes are bounded in practice
+        by the per-scope storage quota, and the prefix pass is materialised
+        before anything is deleted, the same way the row query already is.
+
+        Three properties below are load-bearing and none is incidental:
 
         * **The partition is the boundary.**  ``_partition`` is the same
           constructor every other method here uses, and it validates the
           namespace as 64 hexadecimal characters and the local scope against a
           charset with no quote in it, so the ``PartitionKey eq`` filter below
           carries no caller-chosen text and cannot be widened into a range.
-          One scope's rows are the only rows this query can return.
+          One scope's rows are the only rows this query can return.  The same
+          validation bounds the blob prefix: a scope cannot contain ``/``, so
+          ``f"{partition}/"`` cannot be a prefix of any other partition's
+          names -- ``ns:rider/`` does not prefix ``ns:rider2/...``.  The
+          listing is still a coordinate source the service controls rather
+          than one derived here, so a returned name that does not start with
+          the prefix is refused and counted in ``skipped``, the same rule
+          ``BlobName`` gets.
         * **A blob is deleted by the name this class derives, never by the
           name the row stores.**  ``BlobName`` is data in a table row.  An
           edited row naming ``<other partition>/object:x.json`` would, if
@@ -887,14 +948,38 @@ class AzureTenantStore:
           helped: the stored name is attacker-controlled data, so a retry
           reads the same disagreement forever.
 
+        * **A row whose key yields no object id keeps its row.**  ``_row_key``
+          validates on write, so an unparseable ``object:`` row key is not
+          reachable through the application at all; producing one needs
+          ``entities/write`` on ``CloudObjects``, the same compromised sync
+          identity as the tampered ``BlobName`` above.  No blob name can be
+          derived from it, so the row cannot be paired with anything.
+          Deleting it anyway destroyed the only surviving evidence that an
+          unvalidated key had been written here, so the row is kept and
+          counted in ``skipped`` instead -- and never in ``objects``, which is
+          a receipt of rows this call actually removed.  The rider's data is
+          not what is being kept: the prefix pass above reaches the blob that
+          the row key can no longer name, so the data goes and only the empty
+          inconsistent row remains, visible to the next operator who looks.
+
+        Rows that are already gone are not failures.  A 404 from
+        ``delete_entity`` means the row reached the state this call wanted, so
+        it is swallowed exactly as ``_delete_blob`` swallows a missing blob;
+        raising instead abandoned the rest of the partition part-way through,
+        after the wipe's earlier phase had already deleted the credentials
+        that could reach it.  ``_not_found`` is strict -- only a mapped
+        ``ResourceNotFoundError`` or a structured 404 -- so a 403, a 401 or a
+        5xx still propagates and still stops the purge.
+
         The scope lease is held for the deletions so a concurrent ``apply``
         cannot interleave a new object into a partition being emptied, and the
         lock blob itself is removed afterwards, once its lease is released.
         """
 
         partition = self._partition(namespace, local_user_scope)
-        lock_name = f"{partition}/__lock"
-        objects = blobs = markers = skipped = 0
+        prefix = f"{partition}/"
+        lock_name = f"{prefix}__lock"
+        objects = blobs = markers = skipped = orphans = 0
         with self._scope_lock(partition):
             entities = list(self._table.query_entities(
                 query_filter=f"PartitionKey eq '{partition}'"
@@ -902,27 +987,76 @@ class AzureTenantStore:
             for entity in entities:
                 row_key = str(entity.get("RowKey", ""))
                 if row_key.startswith("object:"):
-                    objects += 1
                     object_id = row_key[len("object:"):]
                     try:
                         expected = self._blob_name(partition, object_id)
                     except ValueError:
                         # The row key is not a well-formed object id, so no
-                        # name can be derived for it and none is guessed.
-                        expected = None
-                    if expected is None or entity.get("BlobName") != expected:
+                        # name can be derived for it and none is guessed.  The
+                        # row stays; the prefix pass below takes the blob.
                         skipped += 1
-                    if expected is not None and self._delete_blob(expected):
+                        continue
+                    if entity.get("BlobName") != expected:
+                        skipped += 1
+                    if self._delete_blob(expected):
                         blobs += 1
-                else:
+                    if self._delete_entity(partition, row_key):
+                        objects += 1
+                elif self._delete_entity(partition, row_key):
                     markers += 1
-                self._table.delete_entity(
-                    partition_key=partition, row_key=row_key
-                )
+            # What the rows did not account for.  The lease blob is left for
+            # the release below; everything else under this rider's prefix is
+            # this rider's and goes.
+            for name in self._blob_names(prefix):
+                if not isinstance(name, str) or not name.startswith(prefix):
+                    # A listed entry that is not a name inside this partition
+                    # is not a coordinate this purge will act on, any more
+                    # than ``BlobName`` is.  It is reported, not swallowed.
+                    skipped += 1
+                    continue
+                if name != lock_name and self._delete_blob(name):
+                    orphans += 1
         self._delete_blob(lock_name)
         return ScopePurge(
-            objects=objects, blobs=blobs, markers=markers, skipped=skipped
+            objects=objects,
+            blobs=blobs,
+            markers=markers,
+            skipped=skipped,
+            orphans=orphans,
         )
+
+    def _blob_names(self, prefix: str) -> list[object]:
+        """What the container lists under ``prefix``, as names, unvalidated.
+
+        The listing is drained into a list before anything is deleted: a
+        server-side paged iterator being consumed while the pages underneath
+        it are deleted is not a combination worth relying on.
+
+        Nothing is filtered here.  The SDK yields ``BlobProperties`` and the
+        caller wants a name, but deciding *which* names may be acted on is the
+        caller's job and is not a decision to make silently -- an entry that
+        carries no usable name comes back as-is so the caller reports it.
+        """
+
+        return [
+            blob if isinstance(blob, str) else getattr(blob, "name", None)
+            for blob in self._container.list_blobs(name_starts_with=prefix)
+        ]
+
+    def _delete_entity(self, partition: str, row_key: str) -> bool:
+        """Delete one row, treating "already gone" as the desired end state.
+
+        Returns whether this call was the one that removed it, so a purge
+        counts rows it actually deleted rather than rows it enumerated.
+        """
+
+        try:
+            self._table.delete_entity(partition_key=partition, row_key=row_key)
+        except Exception as exc:
+            if self._not_found(exc):
+                return False
+            raise
+        return True
 
     def _delete_blob(self, name: str) -> bool:
         """Delete one blob, treating "already gone" as success."""
