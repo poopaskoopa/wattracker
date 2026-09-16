@@ -728,11 +728,19 @@ class AzureTableSecurityStateBackend:
     def delete(self, kind: str, key: str) -> bool:
         """Remove one row, addressed exactly as every other method addresses it.
 
-        This is the only delete in the package, and it is reachable only
-        through :class:`ExpiredRecordSweeper`, which will not name a kind
-        outside :data:`SWEEPABLE_RECORD_KINDS`.  ``_row_key`` validates the
-        kind and key here as well, so a caller cannot address a row this
-        table has no other way to reach.
+        Two callers reach this, and they are deliberately different shapes.
+        :class:`ExpiredRecordSweeper` runs unattended on a request path and
+        will not name a kind outside :data:`SWEEPABLE_RECORD_KINDS` or a row
+        that is not already past its own expiry.  ``wattracker.cloud.wipe``
+        runs only when an operator asks for one rider's data to be destroyed,
+        names a different allowlist of *scope-bearing* kinds, and matches each
+        row on the namespace and local scope in its payload; it keeps its own
+        denylist -- ``kill-switch``, ``quota-counter``, ``health``, ``nonce``
+        -- for the rows whose absence reads as a permissive value.
+
+        Neither is trusted by this method.  ``_row_key`` validates the kind
+        and key here as well, so no caller can address a row this table has no
+        other way to reach.
         """
 
         row_key = self._row_key(kind, key)

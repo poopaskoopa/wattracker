@@ -43,6 +43,8 @@ param cloudServerSecret string
 param operatorToken string
 @description('Built-in Storage Blob Data Reader role definition ID.')
 param blobReaderRoleDefinitionId string
+@description('Object ID of the operator principal that runs a scope wipe (#170). Empty deploys the wipe role definitions without assigning them to anybody, which is the default: the capability stays reviewable and nothing holds it until an operator is named. Never a container app identity.')
+param operatorWipePrincipalId string = ''
 
 var vnetName = 'wattracker-vnet'
 var envName = 'wattracker-aca-env'
@@ -421,6 +423,56 @@ resource authSweeperRoleDefinition 'Microsoft.Authorization/roleDefinitions@2022
     assignableScopes: [authTable.id]
   }
 }
+// #170: deleting one rider's data is a privileged operator path, not a flag on
+// the sync client. The sync identity holds no delete anywhere and does not
+// gain one here; these two roles exist so the operator wipe runs under an
+// identity that is not the sync identity and not the read identity either.
+//
+// What they are scoped to is the design. Between them they reach the rider's
+// objects -- the blobs in `wattracker-objects` and their rows in
+// `CloudObjects` -- and the credential rows in `CloudAuth`. They are NOT
+// scoped to `CloudControl`, so the budget kill switch is out of reach of the
+// grant itself rather than protected by the wipe being careful: an absent
+// kill-switch row reads as ENABLED, and not being able to delete it is better
+// than being trusted not to.
+//
+// `CloudAuth` also holds the daily quota counters on the read plane, and Azure
+// table roles cannot be conditioned on a row key, so that grant does reach
+// them. `wattracker.cloud.wipe` excludes `quota-counter` by record kind for
+// the same reason it excludes `kill-switch`: an absent counter row reads as
+// zero, so a wipe that took them would hand the scope a fresh daily budget.
+//
+// Neither is assigned unless `operatorWipePrincipalId` names somebody. The
+// default deployment defines the capability and gives it to no one, which is
+// the same bar `test_cleanup_delete_identity_is_not_deployed_without_a_cleanup_job`
+// set: a delete grant is held only where something actually deletes, and the
+// operator CLI that will run this (#169) is not built yet.
+resource operatorWipeBlobRoleDefinition 'Microsoft.Authorization/roleDefinitions@2022-04-01' = {
+  name: guid(objectContainer.id, 'wattracker-operator-wipe-blob')
+  properties: {
+    roleName: 'Wattracker Operator Scope Wipe Blob'
+    description: 'Read and delete the sync object blobs of one scope during an operator scope wipe. Held by no deployed workload identity; the sync identity keeps no delete.'
+    type: 'CustomRole'
+    permissions: [{ dataActions: [
+      'Microsoft.Storage/storageAccounts/blobServices/containers/blobs/read'
+      'Microsoft.Storage/storageAccounts/blobServices/containers/blobs/delete'
+    ] }]
+    assignableScopes: [objectContainer.id]
+  }
+}
+resource operatorWipeTableRoleDefinition 'Microsoft.Authorization/roleDefinitions@2022-04-01' = {
+  name: guid(storage.id, 'wattracker-operator-wipe-table')
+  properties: {
+    roleName: 'Wattracker Operator Scope Wipe Table'
+    description: 'Read and delete the object and credential rows of one scope during an operator scope wipe. Assignable only to CloudObjects and CloudAuth; the kill switch in CloudControl is out of reach.'
+    type: 'CustomRole'
+    permissions: [{ dataActions: [
+      'Microsoft.Storage/storageAccounts/tableServices/tables/entities/read'
+      'Microsoft.Storage/storageAccounts/tableServices/tables/entities/delete'
+    ] }]
+    assignableScopes: [objectTable.id, authTable.id]
+  }
+}
 resource controlReaderRoleDefinition 'Microsoft.Authorization/roleDefinitions@2022-04-01' = {
   name: guid(storage.id, 'wattracker-control-reader')
   properties: {
@@ -552,6 +604,35 @@ resource syncReplayRole 'Microsoft.Authorization/roleAssignments@2022-04-01' = {
     roleDefinitionId: replayWriterRoleDefinition.id
     principalId: syncIdentity.properties.principalId
     principalType: 'ServicePrincipal'
+  }
+}
+// No `principalType` on these three. Every other assignment in this template
+// names a managed identity and says 'ServicePrincipal'; the wipe principal is
+// whoever the owner decides runs #169's operator CLI, which may be a user
+// account. Pinning the type would refuse that, and pinning the wrong one
+// fails the deployment rather than the wipe.
+resource operatorWipeBlobRole 'Microsoft.Authorization/roleAssignments@2022-04-01' = if (!empty(operatorWipePrincipalId)) {
+  name: guid(objectContainer.id, operatorWipePrincipalId, 'operator-wipe-blob')
+  scope: objectContainer
+  properties: {
+    roleDefinitionId: operatorWipeBlobRoleDefinition.id
+    principalId: operatorWipePrincipalId
+  }
+}
+resource operatorWipeObjectTableRole 'Microsoft.Authorization/roleAssignments@2022-04-01' = if (!empty(operatorWipePrincipalId)) {
+  name: guid(objectTable.id, operatorWipePrincipalId, 'operator-wipe-object-table')
+  scope: objectTable
+  properties: {
+    roleDefinitionId: operatorWipeTableRoleDefinition.id
+    principalId: operatorWipePrincipalId
+  }
+}
+resource operatorWipeAuthTableRole 'Microsoft.Authorization/roleAssignments@2022-04-01' = if (!empty(operatorWipePrincipalId)) {
+  name: guid(authTable.id, operatorWipePrincipalId, 'operator-wipe-auth-table')
+  scope: authTable
+  properties: {
+    roleDefinitionId: operatorWipeTableRoleDefinition.id
+    principalId: operatorWipePrincipalId
   }
 }
 resource budgetHookRole 'Microsoft.Authorization/roleAssignments@2022-04-01' = {

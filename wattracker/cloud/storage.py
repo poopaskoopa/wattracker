@@ -18,6 +18,16 @@ from typing import Iterable, Optional, Sequence
 
 from .models import MAX_PAYLOAD_BYTES, CloudObject, SyncBatch
 
+#: How long a *tombstoned* object stays recoverable through
+#: :meth:`MemoryTenantStore.recover_deleted`.  This window belongs to ordinary
+#: sync deletions -- the rider deleted one ride and wants it back.
+#:
+#: :meth:`purge_scope` deliberately does not use it.  A scope wipe is a rider
+#: asking for their heart rate, body weight and ride history to be gone; a
+#: 7-day window in which every byte of that is still stored, still readable
+#: with ``include_deleted=True``, and restorable by anyone who can reach the
+#: store, is the opposite of what was asked for.  See ``wattracker.cloud.wipe``
+#: for the full statement of that choice.
 RECOVERY_RETENTION = timedelta(days=7)
 
 #: The largest ``?limit=`` the read API will accept.  ``wattracker.cloud.api``
@@ -58,6 +68,23 @@ class _BatchRecord:
 class _Stored:
     value: CloudObject
     deleted_at: Optional[datetime] = None
+
+
+@dataclass(frozen=True)
+class ScopePurge:
+    """What :meth:`purge_scope` removed from one ``(namespace, scope)``.
+
+    ``skipped`` counts rows a purge refused to act on rather than guessed at:
+    an object row whose stored ``BlobName`` does not match the name this class
+    would itself derive for that partition and object id.  A row like that
+    names a blob somewhere else, so its blob is left alone and the operator is
+    told, instead of the purge following a stored path out of its own scope.
+    """
+
+    objects: int = 0
+    blobs: int = 0
+    markers: int = 0
+    skipped: int = 0
 
 
 class MemoryTenantStore:
@@ -283,6 +310,32 @@ class MemoryTenantStore:
                         del rows[object_id]
                         removed += 1
         return removed
+
+    def purge_scope(self, namespace: str, local_user_scope: str) -> ScopePurge:
+        """Remove one scope's objects, batch markers and revision outright.
+
+        Irreversible, and deliberately not a tombstone write -- see the module
+        note on :data:`RECOVERY_RETENTION` and ``wattracker.cloud.wipe``.
+
+        The revision and the batch markers go with the objects, and that is
+        not housekeeping.  A scope emptied of objects but left at revision 42
+        refuses the first batch a re-enrolled install sends (``StaleRevision``,
+        because 1 <= 42) and keeps refusing until the new install happens to
+        pass 42.  A surviving batch marker is worse: the same ``batch_id``
+        replays the old ``ApplyResult`` and reports bytes that no longer
+        exist.  Either one is the "half-restored scope" a wipe exists to make
+        impossible, so the scope leaves this call in exactly the state it
+        would be in had it never existed.
+        """
+
+        scope = self._scope(namespace, local_user_scope)
+        with self._lock:
+            rows = self._scopes.pop(scope, {})
+            markers = 1 if self._revisions.pop(scope, None) is not None else 0
+            for key in [key for key in self._batches if key[:2] == scope]:
+                del self._batches[key]
+                markers += 1
+        return ScopePurge(objects=len(rows), blobs=len(rows), markers=markers)
 
 
 class AzureDependencyUnavailable(RuntimeError):
@@ -784,3 +837,75 @@ class AzureTenantStore:
     def revision(self, namespace: str, local_user_scope: str) -> int:
         entity = self._entity(self._partition(namespace, local_user_scope), self._scope_row())
         return int(entity.get("Revision", 0)) if entity else 0
+
+    def purge_scope(self, namespace: str, local_user_scope: str) -> ScopePurge:
+        """Delete every blob and table row of exactly one partition.
+
+        Irreversible: no tombstone is written and ``recover_deleted`` cannot
+        bring any of it back.  See ``wattracker.cloud.wipe`` for why, and for
+        the one copy that does outlive this call -- the storage account's own
+        7-day blob soft-delete window, which is a platform setting this code
+        cannot reach.
+
+        Two isolation properties are load-bearing and neither is incidental:
+
+        * **The partition is the boundary.**  ``_partition`` is the same
+          constructor every other method here uses, and it validates the
+          namespace as 64 hexadecimal characters and the local scope against a
+          charset with no quote in it, so the ``PartitionKey eq`` filter below
+          carries no caller-chosen text and cannot be widened into a range.
+          One scope's rows are the only rows this query can return.
+        * **A blob is deleted by the name this class derives, never by the
+          name the row stores.**  ``BlobName`` is data in a table row.  An
+          edited row naming ``<other partition>/object:x.json`` would, if
+          followed, make a wipe of one rider delete another rider's blob.  The
+          expected name is recomputed from the partition and the object id and
+          compared; a row that disagrees is counted in ``skipped`` and its
+          blob is left where it is.
+
+        The scope lease is held for the deletions so a concurrent ``apply``
+        cannot interleave a new object into a partition being emptied, and the
+        lock blob itself is removed afterwards, once its lease is released.
+        """
+
+        partition = self._partition(namespace, local_user_scope)
+        lock_name = f"{partition}/__lock"
+        objects = blobs = markers = skipped = 0
+        with self._scope_lock(partition):
+            entities = list(self._table.query_entities(
+                query_filter=f"PartitionKey eq '{partition}'"
+            ))
+            for entity in entities:
+                row_key = str(entity.get("RowKey", ""))
+                if row_key.startswith("object:"):
+                    objects += 1
+                    object_id = row_key[len("object:"):]
+                    try:
+                        expected = self._blob_name(partition, object_id)
+                    except ValueError:
+                        expected = None
+                    if expected is not None and entity.get("BlobName") == expected:
+                        if self._delete_blob(expected):
+                            blobs += 1
+                    else:
+                        skipped += 1
+                else:
+                    markers += 1
+                self._table.delete_entity(
+                    partition_key=partition, row_key=row_key
+                )
+        self._delete_blob(lock_name)
+        return ScopePurge(
+            objects=objects, blobs=blobs, markers=markers, skipped=skipped
+        )
+
+    def _delete_blob(self, name: str) -> bool:
+        """Delete one blob, treating "already gone" as success."""
+
+        try:
+            self._container.get_blob_client(name).delete_blob()
+        except Exception as exc:
+            if self._not_found(exc):
+                return False
+            raise
+        return True

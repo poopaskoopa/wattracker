@@ -40,3 +40,5 @@ param cloudServerSecret = readEnvironmentVariable('WATTRACKER_CLOUD_SERVER_SECRE
 param operatorToken = readEnvironmentVariable('WATTRACKER_OPERATOR_TOKEN')
 // Source: Azure built-in role definition lookup (Storage Blob Data Reader; not tenant-specific).
 param blobReaderRoleDefinitionId = '2a2b9908-6ea1-4ae2-8e65-a410df84e7d1'
+// Source: owner decision (object ID of the operator principal allowed to run a scope wipe; empty assigns the wipe roles to nobody, which is the intended default until #169 exists).
+param operatorWipePrincipalId = ''
