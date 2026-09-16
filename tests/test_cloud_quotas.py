@@ -14,6 +14,7 @@ import sys
 import threading
 import types
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import ExitStack
 from datetime import datetime, timedelta, timezone
 
 import pytest
@@ -822,3 +823,112 @@ def test_a_malformed_charge_is_refused_by_the_backend():
             backend.charge_counter(
                 QUOTA_RECORD_KIND, key, expires_at=4e9, now=1.0, **kwargs
             )
+
+
+# ---------------------------------------------------------------------------
+# Backend concurrency is per-namespace, under a process-wide ceiling
+# ---------------------------------------------------------------------------
+
+
+def test_one_namespace_saturating_the_backend_does_not_refuse_another():
+    """The cap that matters is per-rider; a global one is an outage.
+
+    Two slow calls used to exhaust the whole process's allowance, so the next
+    backend call from any other installation got a 429 -- however cheap that
+    call was, and however idle that installation had been.
+    """
+
+    manager = QuotaManager(QuotaPolicy(max_backend_concurrency=2))
+    with ExitStack() as held:
+        held.enter_context(manager.backend_slot(NAMESPACE))
+        held.enter_context(manager.backend_slot(NAMESPACE))
+
+        # The saturated namespace is bounded: its third call is refused, with
+        # the same reason, status and Retry-After as before.
+        with pytest.raises(QuotaExceeded, match="backend concurrency exceeded") as raised:
+            with manager.backend_slot(NAMESPACE):
+                pass
+        assert raised.value.status_code == 429
+        assert raised.value.retry_after == 60
+
+        # The other rider is untouched, and is bounded by its own cap.
+        held.enter_context(manager.backend_slot(OTHER_NAMESPACE))
+        held.enter_context(manager.backend_slot(OTHER_NAMESPACE))
+        with pytest.raises(QuotaExceeded, match="backend concurrency exceeded"):
+            with manager.backend_slot(OTHER_NAMESPACE):
+                pass
+
+    # Everything is released on exit, so the next request starts from zero.
+    assert manager.backend_slots_in_flight() == {}
+    with manager.backend_slot(NAMESPACE):
+        pass
+
+
+def test_the_process_wide_backend_ceiling_still_bounds_every_namespace_together():
+    """Per-tenant fairness must not remove the replica's own resource bound."""
+
+    manager = QuotaManager(
+        QuotaPolicy(max_backend_concurrency=1, max_total_backend_concurrency=3)
+    )
+    with ExitStack() as held:
+        for index in range(3):
+            held.enter_context(manager.backend_slot(f"namespace-{index}"))
+        with pytest.raises(QuotaExceeded, match="backend concurrency exceeded"):
+            with manager.backend_slot("namespace-3"):
+                pass
+        # A refused caller leaves no reservation behind.
+        assert "namespace-3" not in manager.backend_slots_in_flight()
+
+
+def test_unknown_namespaces_cannot_grow_the_per_namespace_state():
+    """State exists only while a slot is held, so it is bounded by the ceiling.
+
+    A caller that invents namespaces is exactly the caller this state is for,
+    so it must not be a way to spend the replica's memory.
+    """
+
+    manager = QuotaManager(
+        QuotaPolicy(max_backend_concurrency=1, max_total_backend_concurrency=2)
+    )
+    for index in range(500):
+        with manager.backend_slot(f"namespace-{index}"):
+            assert len(manager.backend_slots_in_flight()) == 1
+    assert manager.backend_slots_in_flight() == {}
+
+
+def test_a_backend_slot_is_charged_to_the_namespace_the_request_was_admitted_for():
+    """The API routes take a slot straight after admitting, and pass no
+    namespace; the slot must still land in that rider's bucket rather than a
+    shared one."""
+
+    manager = QuotaManager(QuotaPolicy(max_backend_concurrency=1))
+
+    def admitted(namespace: str) -> str:
+        manager.admit_read(namespace, "scope", response_bytes=0, now=DAY_ONE)
+        with manager.backend_slot():
+            return next(iter(manager.backend_slots_in_flight()))
+
+    assert admitted(NAMESPACE) == NAMESPACE
+    assert admitted(OTHER_NAMESPACE) == OTHER_NAMESPACE
+
+    # And two riders admitted on their own tasks do not share one cap.
+    manager.admit_read(NAMESPACE, "scope", response_bytes=0, now=DAY_ONE)
+    with manager.backend_slot():
+        manager.admit_write(
+            OTHER_NAMESPACE, "scope", request_bytes=1, decompressed_bytes=1,
+            object_count=1, stored_bytes=0, now=DAY_ONE,
+        )
+        with manager.backend_slot():
+            assert manager.backend_slots_in_flight() == {
+                NAMESPACE: 1, OTHER_NAMESPACE: 1
+            }
+
+
+def test_a_policy_whose_total_is_below_its_per_namespace_cap_is_refused():
+    """Otherwise the per-namespace number in the policy is unreachable and
+    means something other than what it says."""
+
+    with pytest.raises(ValueError, match="max_total_backend_concurrency"):
+        QuotaPolicy(max_backend_concurrency=4, max_total_backend_concurrency=2)
+    with pytest.raises(ValueError, match="positive integer"):
+        QuotaPolicy(max_total_backend_concurrency=0)
