@@ -187,8 +187,12 @@ Resolved by #164:
   message contains "not found" silently becomes a missing object.
 - `api.py:210,148` — `HTTPException` responses skip the `Cache-Control: no-store` header that
   `_error`/`_not_found` set.
-- `limits.py:69` + `api.py:469,497,559` — global `max_backend_concurrency: 2`; two slow backend
-  calls 429 every other tenant.
+- ~~`limits.py:69` + `api.py:469,497,559` — global `max_backend_concurrency: 2`; two slow backend
+  calls 429 every other tenant.~~ Fixed: `max_backend_concurrency` is now the per-namespace cap and
+  `max_total_backend_concurrency` (16) the process-wide ceiling, so a saturated installation refuses
+  only itself. `QuotaManager.backend_slot` takes the namespace, defaulting to the one the request was
+  admitted for, and the per-namespace state exists only while a slot is held — it is bounded by the
+  process-wide ceiling, not by how many namespaces a caller invents.
 - `CloudConfig` keeps an 8-character floor for local/test dependency injection; the production
   Bicep parameter and `cloud.runtime` require at least 32 characters. Entropy, rotation, and
   secret storage remain deployment-operator responsibilities.
@@ -206,10 +210,11 @@ Resolved by #164:
   identity and remains available when those apps are scaled to zero. Full operator declarations use
   plain upsert, while the 80% and 100% partial level actions use etag-guarded updates so a delayed
   80% notification cannot re-enable a public API already disabled at 100%.
-- The per-second global window (`global_requests_per_second`) and the backend concurrency semaphore
+- The per-second global window (`global_requests_per_second`) and the backend concurrency limits
   are process-local by design, so N replicas allow N times the configured rate. That is correct for
   a load shaper and wrong for anyone reading it as a global limit; with no managed gateway in #164,
-  durable application quotas, not this window, are the cost control.
+  durable application quotas, not this window, are the cost control. `maxReplicas: 1` is what keeps
+  N at 1, and `tests/test_cloud_deployment.py` now pins it.
 - Read-plane and sync-plane counters live in different tables (`CloudAuth` and `CloudReplay`),
   because the sync identity holds only read access to `CloudAuth`. Read metrics charged by the sync
   plane's `/api/v1/sync/status` therefore do not share a counter with the read plane's. Worst case

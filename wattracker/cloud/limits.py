@@ -24,6 +24,7 @@ import hashlib
 import threading
 import time
 from contextlib import contextmanager
+from contextvars import ContextVar
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from typing import Final, Iterator, Mapping, Optional, Protocol, Sequence
@@ -537,13 +538,51 @@ class QuotaPolicy:
     max_read_bytes_per_day: int = 512 * 1024 * 1024
     max_read_requests_per_day: int = 50_000
     global_requests_per_second: int = 100
+    # In-flight backend calls one *namespace* may hold at once.  This used to
+    # be the whole process's allowance, which made it a cross-tenant outage:
+    # two slow calls from one installation refused every other installation's
+    # next backend call with a 429, however cheap that call was.
     max_backend_concurrency: int = 2
+    # The process-wide ceiling, which is what actually protects the replica.
+    # It is deliberately well above the per-namespace cap: the per-namespace
+    # cap is the fairness control, this one is the resource control.  With
+    # ``maxReplicas: 1`` and 0.5 vCPU, 16 concurrent storage round trips is a
+    # bounded amount of in-flight work, and no single installation can reach
+    # it because its own cap stops it at 2.
+    max_total_backend_concurrency: int = 16
 
     def __post_init__(self) -> None:
         for name in self.__dataclass_fields__:
             value = getattr(self, name)
             if not isinstance(value, int) or value < 1:
                 raise ValueError(f"{name} must be a positive integer")
+        if self.max_total_backend_concurrency < self.max_backend_concurrency:
+            # Otherwise the per-namespace cap is unreachable and the policy
+            # quietly means something other than what it says.
+            raise ValueError(
+                "max_total_backend_concurrency must be at least "
+                "max_backend_concurrency"
+            )
+
+
+# The namespace the current request was admitted for.
+#
+# ``QuotaManager.backend_slot`` takes the namespace explicitly; this is what it
+# falls back to when a caller does not pass one.  Every backend slot in
+# ``wattracker.cloud.api`` is taken inside the same request handler that has
+# just called ``admit_read``/``admit_write`` with the verified namespace, so
+# recording it there is enough to make the per-namespace cap real without every
+# call site having to repeat it.
+#
+# A ContextVar and not a plain attribute: each asyncio task and each thread
+# reads its own value, so two concurrent requests cannot see each other's.  The
+# value is advisory -- it only decides which bucket a slot is charged to, never
+# whether a request is authorized -- so the worst case if a future call site
+# takes a slot without admitting first is that the slot is charged to the wrong
+# bucket, still under the process-wide ceiling.
+_ADMITTED_NAMESPACE: Final[ContextVar[str]] = ContextVar(
+    "wattracker_cloud_admitted_namespace", default=""
+)
 
 
 class QuotaExceeded(RuntimeError):
@@ -753,10 +792,15 @@ class QuotaManager:
     The budget kill switch is durable on the same terms: ``kill_switch_durable``
     reports what is in use and the same boot check refuses a process-local one.
 
-    The per-second global rate window and the backend concurrency semaphore
-    stay process-local on purpose: they shape one replica's instantaneous
-    load, and unlike a daily budget they mean nothing once the process is
-    gone.
+    The per-second global rate window and the backend concurrency limits stay
+    process-local on purpose: they shape one replica's instantaneous load, and
+    unlike a daily budget they mean nothing once the process is gone.
+
+    Backend concurrency is two limits, not one.  Each namespace may hold
+    ``max_backend_concurrency`` in-flight backend calls, and the process as a
+    whole ``max_total_backend_concurrency``.  A single global semaphore -- what
+    this was -- made one installation's two slow calls refuse every other
+    installation, which is a cost control that behaves like an outage.
     """
 
     def __init__(
@@ -780,7 +824,19 @@ class QuotaManager:
         self._global_requests = 0
         self._counters: QuotaCounters = counters or ProcessQuotaCounters()
         self._kill: KillSwitch = kill_switch or ProcessKillSwitch()
-        self._backend = threading.BoundedSemaphore(self.policy.max_backend_concurrency)
+        self._backend_total = threading.BoundedSemaphore(
+            self.policy.max_total_backend_concurrency
+        )
+        self._backend_lock = threading.Lock()
+        # Namespace -> in-flight backend calls.  An entry exists only while
+        # that namespace holds at least one slot and is removed when its last
+        # slot is released, so this is bounded by
+        # ``max_total_backend_concurrency`` entries no matter how many
+        # namespaces a caller invents.  That is the whole reason the per-tenant
+        # state is a counter rather than a semaphore per namespace: a
+        # semaphore has to be kept to stay meaningful, a counter at zero is
+        # indistinguishable from an absent one.
+        self._backend_in_flight: dict[str, int] = {}
 
     @property
     def durable(self) -> bool:
@@ -884,6 +940,17 @@ class QuotaManager:
                 "kill state unavailable", status_code=503, retry_after=30
             ) from exc
 
+    @staticmethod
+    def _note_namespace(namespace: str) -> None:
+        """Remember the namespace this request is being admitted for.
+
+        Only :meth:`backend_slot` reads it, and only to pick a bucket.  It is
+        set before the admission decision rather than after it because a
+        refused request takes no backend slot anyway.
+        """
+
+        _ADMITTED_NAMESPACE.set(namespace if isinstance(namespace, str) else "")
+
     def _global_admit(self) -> None:
         now = self._clock()
         with self._lock:
@@ -914,6 +981,7 @@ class QuotaManager:
         installation_stored_bytes: Optional[int] = None,
         now: Optional[datetime] = None,
     ) -> None:
+        self._note_namespace(namespace)
         self._global_admit()
         if request_bytes > self.policy.max_request_bytes:
             raise QuotaExceeded("request body too large", status_code=413)
@@ -970,6 +1038,7 @@ class QuotaManager:
         count_request: bool = True,
         now: Optional[datetime] = None,
     ) -> None:
+        self._note_namespace(namespace)
         self._global_admit()
         self.require_public_enabled()
         requests = 1 if count_request else 0
@@ -1021,15 +1090,70 @@ class QuotaManager:
             now,
         )
 
+    def _backend_tenant(self, namespace: Optional[str]) -> str:
+        if namespace is None:
+            namespace = _ADMITTED_NAMESPACE.get()
+        return namespace if isinstance(namespace, str) else ""
+
+    def _reserve_backend_slot(self, tenant: str) -> None:
+        with self._backend_lock:
+            in_flight = self._backend_in_flight.get(tenant, 0)
+            if in_flight >= self.policy.max_backend_concurrency:
+                raise QuotaExceeded("backend concurrency exceeded")
+            self._backend_in_flight[tenant] = in_flight + 1
+
+    def _release_backend_slot(self, tenant: str) -> None:
+        with self._backend_lock:
+            remaining = self._backend_in_flight.get(tenant, 0) - 1
+            if remaining > 0:
+                self._backend_in_flight[tenant] = remaining
+            else:
+                self._backend_in_flight.pop(tenant, None)
+
+    def backend_slots_in_flight(self) -> dict[str, int]:
+        """A snapshot of the per-namespace in-flight counts.
+
+        Introspection for tests and operators; nothing on the admission path
+        reads it.
+        """
+
+        with self._backend_lock:
+            return dict(self._backend_in_flight)
+
     @contextmanager
-    def backend_slot(self, *, timeout: float = 0.0) -> Iterator[None]:
-        acquired = self._backend.acquire(timeout=timeout)
+    def backend_slot(
+        self, namespace: Optional[str] = None, *, timeout: float = 0.0
+    ) -> Iterator[None]:
+        """Hold one backend slot for ``namespace`` for the duration of a call.
+
+        Two gates, in this order.  The per-namespace cap is checked first and
+        never waits: a namespace already at its cap is refused immediately,
+        because queueing it would hand it the very latency it is causing back
+        to the process-wide ceiling.  ``timeout`` then applies to the
+        process-wide ceiling, which is the only one a well-behaved caller can
+        ever be parked behind.
+
+        ``namespace`` defaults to the one this request was admitted for, which
+        is what the API routes rely on.  Refusal is unchanged in both cases:
+        the same :class:`QuotaExceeded` with the same reason, status and
+        ``Retry-After`` the single global semaphore raised.
+        """
+
+        tenant = self._backend_tenant(namespace)
+        self._reserve_backend_slot(tenant)
+        try:
+            acquired = self._backend_total.acquire(timeout=timeout)
+        except BaseException:
+            self._release_backend_slot(tenant)
+            raise
         if not acquired:
+            self._release_backend_slot(tenant)
             raise QuotaExceeded("backend concurrency exceeded")
         try:
             yield
         finally:
-            self._backend.release()
+            self._backend_total.release()
+            self._release_backend_slot(tenant)
 
     def scope_status(self, namespace: str, local_user_scope: str,
                      *, now: Optional[datetime] = None) -> dict:

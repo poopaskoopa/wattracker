@@ -80,6 +80,28 @@ def test_storage_uses_service_endpoints_and_a_deny_by_default_firewall():
     assert "anonymous blobs" in RUNBOOK
 
 
+def test_both_container_apps_scale_to_zero_and_never_past_one_replica():
+    """#168 Layer 2: the replica count is a limit, not a cost preference.
+
+    The per-second rate window and the backend concurrency ceiling in
+    `wattracker/cloud/limits.py` are process-local by design, so a second
+    replica does not share them -- it silently doubles both. `maxReplicas: 1`
+    is what makes "process-local" and "deployment-wide" the same sentence, and
+    nothing else in the template says so. `minReplicas: 0` is pinned with it
+    because the `$2-5/mo` baseline assumes no compute charge while idle.
+    """
+
+    assert BICEP.count("maxReplicas: 1") == 2
+    assert BICEP.count("minReplicas: 0") == 2
+    assert not re.search(r"maxReplicas: (?!1\b)", BICEP)
+    assert not re.search(r"minReplicas: (?!0\b)", BICEP)
+    for app in ("readApp", "syncApp"):
+        block = BICEP.split(f"resource {app} 'Microsoft.App/containerApps", 1)[1]
+        block = block.split("\nresource ", 1)[0]
+        assert re.search(r"scale:\s*\{\s*minReplicas: 0\s+maxReplicas: 1\s*\}", block)
+    assert "minReplicas: 0" in RUNBOOK
+
+
 def test_budget_actions_target_authenticated_durable_kill_switch_handlers():
     assert "budgetHookRoleDefinition" in BICEP
     assert "budgetHookPrincipalId" in BICEP
