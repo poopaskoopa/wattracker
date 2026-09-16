@@ -686,8 +686,11 @@ also burn its daily upload allowance.
 
 Two app-side limits stay deliberately process-local, because they shape one
 replica's instantaneous load rather than a day's spend: the
-100-request-per-second global window and the two-slot backend concurrency
-semaphore. They are load shapers, not global security or billing quotas; the
+100-request-per-second global window and the backend concurrency limits. The
+latter is two limits: each namespace may hold `max_backend_concurrency` (2)
+in-flight backend calls and the process as a whole
+`max_total_backend_concurrency` (16), so one installation's slow calls cannot
+refuse another's. They are load shapers, not global security or billing quotas; the
 durable application counters are the authoritative daily limits.
 
 **The budget kill switch is durable.** It is the last line of cost protection,
