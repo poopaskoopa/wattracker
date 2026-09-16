@@ -36,6 +36,8 @@ from wattracker.cloud.limits import (
     KILL_SWITCH_TTL_SECONDS,
     KillSwitchState,
     KillSwitchUnavailable,
+    PUBLIC_UNAVAILABLE_DETAIL,
+    PUBLIC_UNAVAILABLE_RETRY_AFTER,
     ProcessKillSwitch,
     QUOTA_RECORD_KIND,
     QuotaExceeded,
@@ -66,6 +68,8 @@ SECRET = b"cloud-test-server-secret-32-bytes-long"
 NAMESPACE = "a" * 64
 MINT_PATH = "/api/v1/devices/pairing-codes"
 PAIR_PATH = "/api/v1/devices/pair"
+# The header form of the retry window every kill-switch 503 carries.
+_RETRY_AFTER = str(PUBLIC_UNAVAILABLE_RETRY_AFTER)
 
 
 # ---------------------------------------------------------------------------
@@ -439,7 +443,7 @@ def test_an_unreadable_kill_state_refuses_the_writer_and_reader_routes():
         new_installation_id(), "reader-scope", "entra-user"
     )
     body = _batch(1)
-    unavailable = {"detail": "kill state unavailable"}
+    unavailable = {"detail": PUBLIC_UNAVAILABLE_DETAIL}
 
     with TestClient(create_cloud_app(config, state=state)) as client:
         cases = {
@@ -481,7 +485,7 @@ def test_an_unreadable_kill_state_refuses_the_writer_and_reader_routes():
     for name, response in cases.items():
         assert response.status_code == 503, f"{name}: {response.status_code}"
         assert response.json() == unavailable, name
-        assert response.headers["Retry-After"] == "30", name
+        assert response.headers["Retry-After"] == _RETRY_AFTER, name
 
     # Nothing was written by the batch that was refused.
     assert state.store.revision(writer.namespace, "scope") == 0
@@ -526,6 +530,159 @@ def test_an_unreadable_kill_state_refuses_the_device_routes():
         ).status_code == 200
 
 
+def test_disabled_public_api_refuses_device_refresh_before_lookup(monkeypatch):
+    """A shutdown is global, so device-shaped input cannot reach auth state."""
+
+    pytest.importorskip("cryptography")
+    backend = _DurableMemoryBackend()
+    config = _config("read")
+    state = CloudState.create(config, security_backend=backend)
+    private_key, public_key = generate_signing_keypair()
+    device = state.credentials.register_device(
+        new_installation_id(), "scope", public_key,
+        signature_algorithm="ed25519", capabilities=("read",), subject="entra-user",
+    )
+    state.quotas.set_public_enabled(False)
+
+    def unexpected_lookup(*_args, **_kwargs):
+        raise AssertionError("disabled refresh looked up a device")
+
+    def unexpected_nonce(*_args, **_kwargs):
+        raise AssertionError("disabled refresh consumed a nonce")
+
+    monkeypatch.setattr(state.credentials, "resolve_device", unexpected_lookup)
+    monkeypatch.setattr(state.nonces, "accept", unexpected_nonce)
+    valid = _refresh_headers(device, private_key, nonce="disabled-valid")
+    unknown = dict(valid)
+    unknown["X-Device-Credential"] = "0" * 64
+    malformed = dict(valid)
+    malformed["X-Device-Credential"] = "x" * 513
+
+    with TestClient(create_cloud_app(config, state=state)) as client:
+        responses = [
+            client.post("/api/v1/context/refresh", headers=valid),
+            client.post("/api/v1/context/refresh", headers=unknown),
+            client.post("/api/v1/context/refresh", headers=malformed),
+            client.post("/api/v1/context/refresh", headers={}),
+        ]
+
+    for response in responses:
+        assert response.status_code == 503
+        assert response.json() == {"detail": PUBLIC_UNAVAILABLE_DETAIL}
+        assert dict(response.headers) == dict(responses[0].headers)
+    assert responses[0].headers["Retry-After"] == _RETRY_AFTER
+
+
+def test_disabled_public_api_does_not_spend_a_device_refresh_nonce():
+    """The signed retry remains usable when the deployment comes back."""
+
+    pytest.importorskip("cryptography")
+    backend = _DurableMemoryBackend()
+    config = _config("read")
+    state = CloudState.create(config, security_backend=backend)
+    private_key, public_key = generate_signing_keypair()
+    device = state.credentials.register_device(
+        new_installation_id(), "scope", public_key,
+        signature_algorithm="ed25519", capabilities=("read",), subject="entra-user",
+    )
+    headers = _refresh_headers(device, private_key, nonce="disabled-retry")
+    state.quotas.set_public_enabled(False)
+
+    with TestClient(create_cloud_app(config, state=state)) as client:
+        disabled = client.post("/api/v1/context/refresh", headers=headers)
+    assert disabled.status_code == 503
+    assert disabled.headers["Retry-After"] == _RETRY_AFTER
+
+    state.quotas.set_public_enabled(True)
+    with TestClient(create_cloud_app(config, state=state)) as client:
+        retried = client.post("/api/v1/context/refresh", headers=headers)
+    assert retried.status_code == 200, retried.text
+
+
+def test_disabled_public_api_refuses_every_reader_route_before_context_lookup(monkeypatch):
+    """All reader-context routes share the same global 503 admission result."""
+
+    backend = _DurableMemoryBackend()
+    config = _config("read")
+    state = CloudState.create(config, security_backend=backend)
+    token, _context = state.credentials.issue_reader_context(
+        new_installation_id(), "scope", "entra-user"
+    )
+    state.quotas.set_public_enabled(False)
+
+    def unexpected_lookup(*_args, **_kwargs):
+        raise AssertionError("disabled reader request looked up a context")
+
+    monkeypatch.setattr(state.credentials, "resolve_reader", unexpected_lookup)
+    routes = [
+        "/api/v1/context",
+        "/api/v1/context/calendar",
+        "/api/v1/context/activities",
+        "/api/v1/context/activities/activity-1",
+        "/api/v1/context/profile",
+        "/api/v1/context/races",
+        "/api/v1/context/dashboard",
+        "/api/v1/context/volume",
+        "/api/v1/context/curve",
+    ]
+
+    with TestClient(create_cloud_app(config, state=state)) as client:
+        responses = [
+            client.get(route, headers=_reader_headers(token)) for route in routes
+        ]
+        responses.extend([
+            client.get("/api/v1/context", headers=_reader_headers("unknown")),
+            client.get("/api/v1/context", headers={}),
+        ])
+
+    for response in responses:
+        assert response.status_code == 503
+        assert response.json() == {"detail": PUBLIC_UNAVAILABLE_DETAIL}
+        assert dict(response.headers) == dict(responses[0].headers)
+    assert responses[0].headers["Retry-After"] == _RETRY_AFTER
+
+
+def test_disabled_public_api_refuses_device_revoke_before_authentication(monkeypatch):
+    """Revocation is unavailable during a public shutdown, without spending auth."""
+
+    pytest.importorskip("cryptography")
+    backend = _DurableMemoryBackend()
+    config = _config("all")
+    state = CloudState.create(config, security_backend=backend)
+    writer = _writer(state)
+    _private_key, public_key = generate_signing_keypair()
+    target = state.credentials.register_device_for_scope(
+        writer.namespace, writer.local_user_scope, public_key,
+        signature_algorithm="ed25519", capabilities=("read",), subject="entra-user",
+    )
+    path = f"/api/v1/devices/{target.credential_id}/revoke"
+    headers = _signed(
+        writer, "POST", path, nonce="disabled-revoke", idem="device-revoke", revision=0
+    )
+    state.quotas.set_public_enabled(False)
+
+    def unexpected_auth(*_args, **_kwargs):
+        raise AssertionError("disabled revoke authenticated a writer")
+
+    def unexpected_nonce(*_args, **_kwargs):
+        raise AssertionError("disabled revoke consumed a nonce")
+
+    monkeypatch.setattr(state.credentials, "authenticate_writer", unexpected_auth)
+    monkeypatch.setattr(state.nonces, "accept", unexpected_nonce)
+    with TestClient(create_cloud_app(config, state=state)) as client:
+        disabled = client.post(path, headers=headers)
+    assert disabled.status_code == 503
+    assert disabled.json() == {"detail": PUBLIC_UNAVAILABLE_DETAIL}
+    assert disabled.headers["Retry-After"] == _RETRY_AFTER
+
+    monkeypatch.undo()
+    state.quotas.set_public_enabled(True)
+    with TestClient(create_cloud_app(config, state=state)) as client:
+        retried = client.post(path, headers=headers)
+    assert retried.status_code == 200, retried.text
+    assert state.credentials.lookup_device(target.credential_id).revoked is True
+
+
 def test_the_device_refresh_is_refused_before_it_spends_its_replay_nonce():
     """Why the check sits in ``_resolve_device`` and not only in ``admit_read``.
 
@@ -536,9 +693,8 @@ def test_the_device_refresh_is_refused_before_it_spends_its_replay_nonce():
     device's retry -- with the same signed envelope -- would then be rejected
     as a replay long after the backend recovered.
 
-    The disabled case pins the same call site from the other side: this route
-    answers a uniform 404 for every credential outcome, and a kill switch must
-    not become the one condition that answers differently.
+    The disabled case is a global 503 before this call site: it must not be
+    mistaken for the 404 used for every credential outcome while serving.
     """
 
     pytest.importorskip("cryptography")
@@ -562,7 +718,8 @@ def test_the_device_refresh_is_refused_before_it_spends_its_replay_nonce():
         retried = client.post("/api/v1/context/refresh", headers=headers)
     assert retried.status_code == 200, retried.text
 
-    # And a disabled public API keeps this route's uniform 404.
+    # A disabled public API is a global transient refusal, not a credential
+    # outcome, and carries the fixed retry window.
     disable_public_api(backend)
     with TestClient(
         create_cloud_app(config, state=CloudState.create(config, security_backend=backend))
@@ -571,7 +728,9 @@ def test_the_device_refresh_is_refused_before_it_spends_its_replay_nonce():
             "/api/v1/context/refresh",
             headers=_refresh_headers(device, private_key, nonce="disabled-nonce"),
         )
-    assert disabled.status_code == 404
+    assert disabled.status_code == 503
+    assert disabled.json() == {"detail": PUBLIC_UNAVAILABLE_DETAIL}
+    assert disabled.headers["Retry-After"] == _RETRY_AFTER
 
 
 def test_an_unreadable_kill_state_refuses_before_a_credential_is_even_looked_up():
@@ -605,10 +764,10 @@ def test_the_quota_paths_refuse_directly_too():
             object_count=1, stored_bytes=0,
         ),
     ):
-        with pytest.raises(QuotaExceeded, match="kill state unavailable") as refused:
+        with pytest.raises(QuotaExceeded, match=PUBLIC_UNAVAILABLE_DETAIL) as refused:
             call()
         assert refused.value.status_code == 503
-        assert refused.value.retry_after == 30
+        assert refused.value.retry_after == PUBLIC_UNAVAILABLE_RETRY_AFTER
 
 
 def test_a_row_that_cannot_be_understood_is_not_read_as_enabled():
@@ -885,7 +1044,7 @@ def test_a_partial_setter_raises_rather_than_guessing_the_other_level():
         lambda: manager.set_writes_enabled(False),
         lambda: manager.set_public_enabled(False),
     ):
-        with pytest.raises(QuotaExceeded, match="kill state unavailable"):
+        with pytest.raises(QuotaExceeded, match=PUBLIC_UNAVAILABLE_DETAIL):
             call()
     # The whole desired state needs no read and lands anyway.
     set_kill_switch(backend, writes_enabled=False, public_enabled=False)

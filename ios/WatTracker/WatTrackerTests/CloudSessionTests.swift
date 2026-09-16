@@ -453,6 +453,30 @@ final class CloudSessionTests: XCTestCase {
         XCTAssertNotNil(rig.credentials.load())
     }
 
+    func testAKillSwitchRefusalNeverCountsTowardRemoval() async throws {
+        let clock = TestClock()
+        let rig = harness(clock: clock) { _, _ in
+            .refused(503, retryAfter: 30)
+        }
+
+        for _ in 0..<3 {
+            do {
+                _ = try await rig.session.readerContext()
+                XCTFail("a kill-switch refusal cannot produce a context")
+            } catch let failure as CloudSession.Failure {
+                guard case let .throttled(retryAfter) = failure else {
+                    return XCTFail("expected throttling, got \(failure)")
+                }
+                XCTAssertEqual(retryAfter, 30)
+            }
+            clock.advance(31)
+        }
+
+        let state = await rig.session.deviceState
+        XCTAssertEqual(state, .paired)
+        XCTAssertNotNil(rig.credentials.load())
+    }
+
     // MARK: - Cold start and the delta
 
     func testAColdStartServesTheCacheAndThenReconcilesWithSince() async throws {

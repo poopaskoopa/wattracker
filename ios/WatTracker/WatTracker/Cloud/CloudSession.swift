@@ -637,26 +637,27 @@ actor CloudSession: ReadSession {
     ///
     /// The read plane answers **404 to every authentication failure** --
     /// unknown credential, revoked credential, bad signature, stale timestamp,
-    /// replayed nonce, wrong attested subject, missing capability, and the
-    /// public-API kill switch -- deliberately, so nothing about credential
-    /// state is observable from a response. That is right for the server, and
-    /// it means this client can never be *told* it was revoked. It can only
+    /// replayed nonce, wrong attested subject, and missing capability --
+    /// deliberately, so nothing about credential state is observable from a
+    /// response. The public-API kill switch is not an authentication failure:
+    /// device refresh answers 503 with `Retry-After` before authentication.
+    /// This means the client can never be *told* it was revoked. It can only
     /// observe that a correctly signed request stopped being accepted.
     ///
     /// So `removed` is inferred, and inferred conservatively, because acting on
     /// it destroys local state:
     ///
-    /// - **Only 404 counts.** A 403 on this route is a quota refusal, reachable
-    ///   only *after* the signature verified, and a 401 can only come from a
-    ///   gateway in front of the app. Neither says anything about the
-    ///   credential, and treating either as revocation would wipe a working
-    ///   device over a billing threshold.
+    /// - **Only 404 counts.** A 503 is a global shutdown or unreadable kill
+    ///   state and is handled as transient backoff, never removal. A 403 on
+    ///   this route is a quota refusal, reachable only *after* the signature
+    ///   verified, and a 401 can only come from a gateway in front of the app.
+    ///   Neither says anything about the credential, and treating either as
+    ///   revocation would wipe a working device over a billing threshold.
     /// - **Twice, with a backoff between.** A single 404 is also what a
-    ///   deployment mid-restart or a flipped kill switch produces, and the gap
-    ///   `noteFailure` enforces before the second attempt is sized to outlast
-    ///   one -- at least half of `baseBackoff` (15s), scaling with repeated
-    ///   failures. A rider pulling to refresh twice inside that window gets
-    ///   throttled, not unpaired.
+    ///   deployment mid-restart produces, and the gap `noteFailure` enforces
+    ///   before the second attempt is sized to outlast one -- at least half of
+    ///   `baseBackoff` (15s), scaling with repeated failures. A rider pulling
+    ///   to refresh twice inside that window gets throttled, not unpaired.
     /// - **Never while the clock is suspect -- including when that cannot be
     ///   checked.** A device more than four minutes off the server's clock has
     ///   its signed timestamp refused on every attempt, forever, and would
@@ -668,12 +669,10 @@ actor CloudSession: ReadSession {
     ///   "cannot tell" as "clock is fine", which is the opposite of what a
     ///   fail-safe reading of an unreadable clock means.
     ///
-    /// The residual false positive is the kill switch: a deployment that turns
-    /// the public API off for longer than the backoff window unpairs these
-    /// phones and the rider pairs again when it returns. That is the
-    /// direction to be wrong in. The opposite -- a revoked phone still
-    /// showing the rider's training data because the client would rather not
-    /// be hasty -- is the outcome revocation exists to prevent.
+    /// A public-API shutdown now has its own 503 and `Retry-After`, so it never
+    /// contributes a strike toward removal. The opposite -- a revoked phone
+    /// still showing the rider's training data because the client would rather
+    /// not be hasty -- is the outcome revocation exists to prevent.
     private func refusal(_ failure: CloudClient.Failure) -> Failure {
         guard case let .http(status, _, retryAfter, serverDate) = failure else {
             noteFailure(retryAfter: nil)

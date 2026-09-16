@@ -157,9 +157,26 @@ there is no ASN.1 parser at this trust boundary. An Ed25519 signature is also
 128 hexadecimal characters, so length distinguishes nothing and only the
 stored algorithm separates the two.
 
-Every refresh rejection — unknown device, revoked device, bad signature, stale
-timestamp, replayed nonce, subject mismatch, missing capability — returns the
-same 404 body and headers as an unknown reader context.
+Every refresh authentication rejection — unknown device, revoked device, bad
+signature, stale timestamp, replayed nonce, subject mismatch, missing
+capability — returns the same 404 body and headers as an unknown reader
+context. A disabled or unreadable public API is different: device refresh,
+reader-context data routes, and device revocation answer 503 with
+`Retry-After: 300` before credentials or contexts are resolved, so a deliberate
+shutdown cannot be mistaken for revocation. Other writer-authenticated routes
+keep their 403 refusal, while enrollment and pairing redemption keep their
+404 response.
+
+Both 503s carry the same body, `{"detail": "public API unavailable"}`, and the
+same retry window. The check runs ahead of authentication, so an anonymous
+caller reads these bodies: a deliberate shutdown and an unreadable kill state
+must not be told apart from the internet, because the second would advertise a
+failing security backend. The window matches the iOS client's own backoff
+ceiling, since the client honours a server-supplied `Retry-After` exactly, with
+no growth and no jitter — a shorter one would pin every paired phone to a
+permanent poll against a deployment switched off to stop it spending. No client
+change was needed for any of this: the iOS session already classified 503 as
+throttling rather than as a revoked credential, and still does.
 
 Because refresh consumes replay nonces, the read plane now claims them
 durably. It writes those claims to the `CloudAuth` table its managed identity
@@ -949,7 +966,7 @@ thrown has no cache at all and reads the row on its first request, which is the
 property the process-local flag never had.
 
 *It fails closed.* An unreadable or unintelligible kill state refuses the
-request — 503 with `Retry-After: 30` — on every route that admits traffic. This
+request — 503 with `Retry-After: 300` — on every route that admits traffic. This
 is deliberately the opposite of what the quota paths do with a damaged row:
 there, an unparseable counter is reset and healed, because refusing forever
 would strand a rider and the ceiling immediately re-applies. The kill switch

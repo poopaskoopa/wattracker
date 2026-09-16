@@ -22,6 +22,8 @@ from fastapi.responses import JSONResponse, Response
 from .limits import (
     DurableKillSwitch,
     DurableQuotaCounters,
+    PUBLIC_UNAVAILABLE_DETAIL,
+    PUBLIC_UNAVAILABLE_RETRY_AFTER,
     QuotaExceeded,
     QuotaManager,
     QuotaPolicy,
@@ -519,6 +521,28 @@ def _writer_auth(state: CloudState, request: Request, *, capability: str) -> Any
     return credential
 
 
+def _require_public_api_for_device_or_reader(state: CloudState) -> None:
+    """Refuse device/read-context traffic while the public API is disabled.
+
+    This check deliberately precedes all credential parsing and lookup.  A
+    disabled deployment is a global condition, so returning the same 503 for
+    every credential shape prevents the shutdown from being mistaken for a
+    revoked device while preserving the writer plane's existing 403 contract.
+
+    Running before authentication also means anonymous internet traffic reads
+    this body, so it is the same neutral detail and the same retry window an
+    unreadable kill state answers with: a deliberate shutdown and a failing
+    security backend are indistinguishable from outside.
+    """
+
+    if not state.quotas.kill_state().public_enabled:
+        raise QuotaExceeded(
+            PUBLIC_UNAVAILABLE_DETAIL,
+            status_code=503,
+            retry_after=PUBLIC_UNAVAILABLE_RETRY_AFTER,
+        )
+
+
 def _sweep_expired_auth_state(state: CloudState) -> None:
     """Opportunistic housekeeping, attached to a route that already wrote.
 
@@ -677,17 +701,15 @@ def _device_signature_fields(request: Request) -> tuple[int, str, str]:
 
 
 def _resolve_device(state: CloudState, request: Request) -> Any:
-    """Resolve an active paired device; unknown and revoked are both ``None``."""
-    # A disabled public API keeps this route's uniform 404, which says nothing
-    # about the credential.  An unreadable kill state does not: it raises, and
-    # the refusal is a 503.  That distinction is deliberate -- a global outage
-    # is not credential-dependent so a 503 leaks nothing, while answering 404
-    # would tell a healthy device its credential is gone and invite it to
-    # re-pair exactly when the backend is sick.
+    """Resolve an active paired device; unknown and revoked are both ``None``.
+
+    A disabled public API raises the global 503 before looking at the
+    credential.  Unknown and revoked credentials remain indistinguishable
+    404s while the deployment is serving.
+    """
+    _require_public_api_for_device_or_reader(state)
     credential_id = request.headers.get("x-device-credential", "")
     if not credential_id or len(credential_id) > 512:
-        return None
-    if not state.quotas.kill_state().public_enabled:
         return None
     return state.credentials.resolve_device(credential_id)
 
@@ -725,12 +747,10 @@ def _verify_device_request(
 
 
 def _resolve_reader(state: CloudState, request: Request) -> Any:
-    # Read the kill state first and unconditionally.  Folding it into the
-    # `context is None` test below would let a short circuit skip it: an
-    # unreadable kill state on an unknown token would answer 404 instead of
-    # refusing, and the one flag that must never be bypassed would be bypassed
-    # by whichever caller guessed wrong.
-    public_enabled = state.quotas.kill_state().public_enabled
+    # Read the kill state first and unconditionally.  Folding a disabled state
+    # into the `context is None` test would let it answer 404 and make a phone
+    # infer revocation during a deliberate shutdown.
+    _require_public_api_for_device_or_reader(state)
     if not _gateway_proof_valid(state, request):
         return None
     raw = request.headers.get("authorization", "")
@@ -741,7 +761,7 @@ def _resolve_reader(state: CloudState, request: Request) -> Any:
     if not ok:
         return None
     context = state.credentials.resolve_reader(token)
-    if context is None or not public_enabled:
+    if context is None:
         return None
     bound_subject = getattr(context, "subject", None)
     # A bound subject is only checkable where one is attested.  Where it is
@@ -881,11 +901,11 @@ def create_cloud_app(
     async def _refused(_request: Request, exc: QuotaExceeded) -> Response:
         """Turn an admission refusal raised outside a route body into a response.
 
-        The kill state is now read inside the credential-resolution helpers,
-        which have no response to return -- they answer ``None``.  Registering
-        the refusal here means a helper cannot accidentally turn a kill-switch
-        or unreadable-state refusal into a served request by forgetting to
-        catch it: the only way past this handler is not to raise.
+        The kill state is read inside credential-resolution helpers, which
+        have no route response to return.  Registering the refusal here means
+        a helper cannot accidentally turn a kill-switch or unreadable-state
+        refusal into a served request by forgetting to catch it: the only way
+        past this handler is not to raise.
         """
 
         return _error(exc.status_code, exc.reason, retry_after=exc.retry_after)
@@ -1063,8 +1083,10 @@ def create_cloud_app(
             as an unknown reader context, so nothing about credential state is
             observable from the response.  The one non-404 outcome, a quota
             refusal, is reachable only after the caller has already proven
-            possession of the device key.
+            possession of the device key.  A disabled or unreadable public
+            API is a global 503 before authentication.
             """
+            _require_public_api_for_device_or_reader(state)
             if not _gateway_proof_valid(state, request):
                 return _not_found()
             ok, subject = _subject_binding(state, request)
@@ -1440,8 +1462,14 @@ def create_cloud_app(
             is safe and the status code carries no state either way.
             """
 
-            # Authentication and the kill state first, body second: nothing
-            # unauthenticated gets to hand this route bytes to buffer.
+            # A disabled public API is a global 503 before authentication, so
+            # it cannot be mistaken for a credential refusal.  The replay nonce
+            # was never at risk -- ``_writer_auth`` already refused ahead of it
+            # -- but the ordering keeps the shutdown ahead of every credential
+            # verdict.  Once enabled, authentication and the kill state remain
+            # first, body second: nothing unauthenticated gets to hand this
+            # route bytes to buffer.
+            _require_public_api_for_device_or_reader(state)
             credential = _writer_auth(state, request, capability="read")
             try:
                 body = await _bounded_body(request, _MAX_DEVICE_ADMIN_BODY_BYTES)
