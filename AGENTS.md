@@ -172,27 +172,7 @@ The list gives the **order**. GitHub gives the **state** — always
 (#234's scope grew a whole section after it was filed) and its labels move.
 If the two disagree, GitHub wins and the queue is stale; say so.
 
-1. **#298 — flaky iOS `SessionGateTests` test.** It failed CI three times on
-   2026-09-14, each time on a Python-only PR (#296, #297, #301). The failures
-   are at `SessionGateTests.swift:413/414/420`, where `backend` reads `cloud`
-   and `phase` reads `paired` after an explicit `.local` selection. The spec is
-   in the issue comment. The lead is a single `Task.yield()` standing in for an
-   awaited automatic re-evaluation; `b53ed90` fixed the sibling test the same
-   way. **Answer first whether it is test-only or production.** If a late
-   automatic re-evaluation can override an explicit selection in the app, #281's
-   contract is broken and the fix goes in `SessionGate`. Do not add yields or
-   sleeps. The done criterion is 50 consecutive green iterations of that one
-   test, with the count reported.
-
-2. **#300 — Windows docs still describe the self-hosted runner.** #299 moved
-   `windows-real` and `package-unsigned` to `windows-latest`, but
-   `docs/windows-packaging.md` and `README.md:563` still describe the old setup.
-   Mechanical, and Python/docs only, so it is safe to run alongside #298.
-   Mark anything kept about the self-hosted runner as history; don't delete
-   the reasoning. The cloud macOS jobs are still self-hosted, so the README
-   line may be only partly wrong.
-
-3. **#305 — kill switch answers 404, so a budget shutdown unpairs every
+1. **#305 — kill switch answers 404, so a budget shutdown unpairs every
    phone.** Server-side Python on the auth admission path: `_resolve_device`
    and `_resolve_reader` in `wattracker/cloud/api.py` answer 503 with
    `Retry-After`, raised before any credential lookup or nonce use.
@@ -200,9 +180,15 @@ If the two disagree, GitHub wins and the queue is stale; say so.
    touched. The issue records the decision and the argument against it; do
    not re-open the 404-vs-503 question. **A security review of the diff is
    part of Done.** Open the PR and wait for that review; do not self-merge.
-   Python only, so it can run alongside #298.
 
-4. **#249 — rotating full-suite test flakes. Still not a local-runs job.**
+2. **#307 — two residuals from the #298 fix.** The committed N7 race test
+   catches a missing guard in only 44 of 50 runs: it uses the real path
+   monitor and does not drain `start()`'s re-evaluation before gating. And
+   `select(.automatic)` can drop a refresh that nothing replaces, leaving
+   `phase` stuck at `.removed`. Both have repros and counts on the issue.
+   iOS only, so do not run it alongside other iOS work.
+
+3. **#249 — rotating full-suite test flakes. Still not a local-runs job.**
    Nothing has changed since the re-scope. 21 consecutive clean local full
    suites stand against zero reproductions. Both known instances came from
    **taksmon's machine**. The mechanism is known: the session goes missing
@@ -224,23 +210,26 @@ or anything below on your own.
   in #295 (`0546364`).
 - **#264** waits on #194 (Android network client). #302 closed it by accident;
   it was reopened. Its Android half is taksmon's.
-- **#102, #168, #169, #170, #217, #242** are `blocked` on the hosting decision
-  or a live deployment.
+- **#102, #168, #169, #217, #242** are `blocked` on the hosting decision or a
+  live deployment.
+- **#170** (scope wipe) and the `#102` "known-open code items" are in progress
+  in the Claude session. `wattracker/cloud/storage.py` and
+  `wattracker/cloud/limits.py` are being edited there, so #305 must stay
+  inside `api.py`.
 
-**Done since this list was last written (2026-09-13 → 09-14).**
-- #277 is closed. Items 3–9 landed in #283 (`42966db`) once both review
-  blockers were fixed; the capture now happens inside the `BEGIN IMMEDIATE`
-  that records success.
-- #291, the snapshot-gate baseline outliving its connection, landed in #297
-  (`72ac394`).
-- #280, legacy completions for a non-UTC rider, landed in #292 (`2be58e5`).
-  #288, calendar and manual completion by rider-local day, landed in #296
-  (`cf0eeb0`).
-- #156's third product answer is posted: expiry is a proactive refresh the
-  rider never sees.
-- #281, prefer the local desktop, landed in #295 (`0546364`).
-- #290, Windows CI on hosted runners, landed in #299 (`375491d`).
-- #302 clarified the scope of the iOS device-validation doc.
+**Done since this list was last written (2026-09-14 → 09-15).**
+- **#298** merged as PR #308 (`38322dd`). The production race is fixed: an
+  explicit backend selection is authoritative, and `refresh()` drops a write
+  whose generation or backend changed under it. Verified over three review
+  rounds; the first two revisions were refuted. Residuals are **#307**.
+- **#300** merged as PR #306 (`f830fd9`): the docs describe hosted Windows CI,
+  the self-hosted material is kept under `Historical:` headings, and the stale
+  comments in `packaging/` and `tests/` are corrected.
+- **#303** (`5fa6368`) rewrote this queue. **#277** was closed: items 3-9
+  landed in #283 (`42966db`) and #291 in #297 (`72ac394`).
+- **#305** was filed from the #304 review: the kill switch's 404 is
+  indistinguishable from revocation, so a budget shutdown would unpair every
+  phone.
 
 Older history is in `git log` and on the issues.
 
