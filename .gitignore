@@ -104,3 +104,8 @@ xcuserdata/
 *.ipa
 *.dSYM.zip
 *.dSYM
+
+# Real deployment parameters. infra/azure/main.bicepparam is the committed
+# skeleton and carries no tenant values; a filled copy holds the billing email,
+# storage name and region, and this repository is public.
+infra/azure/*.local.bicepparam
