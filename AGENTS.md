@@ -172,23 +172,22 @@ The list gives the **order**. GitHub gives the **state** — always
 (#234's scope grew a whole section after it was filed) and its labels move.
 If the two disagree, GitHub wins and the queue is stale; say so.
 
-1. **#305 — kill switch answers 404, so a budget shutdown unpairs every
-   phone.** Server-side Python on the auth admission path: `_resolve_device`
-   and `_resolve_reader` in `wattracker/cloud/api.py` answer 503 with
-   `Retry-After`, raised before any credential lookup or nonce use.
-   Enrollment stays 404, the writer routes stay 403, and `android/` is not
-   touched. The issue records the decision and the argument against it; do
-   not re-open the 404-vs-503 question. **A security review of the diff is
-   part of Done.** Open the PR and wait for that review; do not self-merge.
+1. **#169 — an operator CLI for the one-time enrollment bootstrap.**
+   Re-scoped and unblocked 2026-09-17: the CLI itself never needed a
+   deployment. `tests/test_cloud_api.py` already drives
+   `POST /api/v1/enrollment/start` through `MemoryTenantStore` +
+   `MemorySecurityStateBackend` + `TestClient`, and
+   `scripts/walking_skeleton_server.py` runs the real cloud app against an
+   in-memory store, so `invite`, `list-installations` and
+   `revoke-installation` are all verifiable offline.
+   `wattracker/cloud/admin.py` does not exist yet — this starts from nothing.
+   Two traps, both on the issue: the operator token must come from the
+   environment or the keychain and never from argv, and the non-HTTPS refusal
+   needs an explicit loopback exemption or the tool cannot be tested against
+   the walking-skeleton server, which serves plain `http://127.0.0.1`. The
+   "onboard a second real rider" criterion is split out and stays with #102.
 
-2. **#307 — two residuals from the #298 fix.** The committed N7 race test
-   catches a missing guard in only 44 of 50 runs: it uses the real path
-   monitor and does not drain `start()`'s re-evaluation before gating. And
-   `select(.automatic)` can drop a refresh that nothing replaces, leaving
-   `phase` stuck at `.removed`. Both have repros and counts on the issue.
-   iOS only, so do not run it alongside other iOS work.
-
-3. **#249 — rotating full-suite test flakes. Still not a local-runs job.**
+2. **#249 — rotating full-suite test flakes. Still not a local-runs job.**
    Nothing has changed since the re-scope. 21 consecutive clean local full
    suites stand against zero reproductions. Both known instances came from
    **taksmon's machine**. The mechanism is known: the session goes missing
@@ -210,14 +209,29 @@ or anything below on your own.
   in #295 (`0546364`).
 - **#264** waits on #194 (Android network client). #302 closed it by accident;
   it was reopened. Its Android half is taksmon's.
-- **#102, #168, #169, #217, #242** are `blocked` on the hosting decision or a
-  live deployment.
-- **#170** (scope wipe) and the `#102` "known-open code items" are in progress
-  in the Claude session. `wattracker/cloud/storage.py` and
-  `wattracker/cloud/limits.py` are being edited there, so #305 must stay
-  inside `api.py`.
+- **#102, #168, #217, #242** are `blocked` on the hosting decision or a
+  live deployment. **#169 is no longer among them** — see item 1.
+- **#170** (scope wipe) landed its repository half in PR #312 (`9a66743`) and
+  stays open and `blocked` for the part that needs a live deployment. The
+  `#102` "known-open code items" continue in the Claude session, which owns
+  `wattracker/cloud/storage.py` and `wattracker/cloud/limits.py`.
 
-**Done since this list was last written (2026-09-14 → 09-15).**
+**Done since this list was last written (2026-09-15 → 09-17).**
+- **#305** merged as PR #313 (`89da4f3`) and **#307** as PR #314 (`30761c7`).
+  Both were written by codex on 2026-09-15 and pushed to `agent2/*` **without
+  a PR ever being opened**, so the queue looked untouched while the work sat
+  finished on a branch. Open the PR, or say the branch is ready. #313 carried
+  two review fixes on top: the shutdown `Retry-After` went 30 → 300 to match
+  the iOS client's own backoff ceiling, and both 503 bodies collapsed to one
+  neutral string so an anonymous caller cannot tell a deliberate shutdown from
+  a failing security backend.
+- **A registry push-and-sign workflow does not exist.** `cloud.yml:188` builds
+  with `--load` and stops; nothing in `.github/workflows/` mentions `ghcr` or
+  `cosign`. `readImage`/`syncImage` in `main.bicepparam` want signed immutable
+  digests, so this is on the deployment critical path and is **not** blocked on
+  a subscription. Not yet filed as an issue; do not start it unprompted.
+
+**Done earlier (2026-09-14 → 09-15).**
 - **#298** merged as PR #308 (`38322dd`). The production race is fixed: an
   explicit backend selection is authoritative, and `refresh()` drops a write
   whose generation or backend changed under it. Verified over three review
