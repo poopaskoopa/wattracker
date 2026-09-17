@@ -1,0 +1,93 @@
+name: Publish cloud image
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+# This workflow is separate from cloud.yml so the fork-safe PR build keeps its
+# read-only permissions while this trusted main-only job can publish and sign.
+permissions:
+  packages: write
+  id-token: write
+  contents: read
+
+env:
+  IMAGE: ghcr.io/poopaskoopa/wattracker-cloud
+
+jobs:
+  publish:
+    # A manual dispatch can be selected on another ref; never publish an
+    # unreviewed branch with the repository's package and signing permissions.
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Derive commit tag
+        id: image
+        env:
+          COMMIT_SHA: ${{ github.sha }}
+        shell: bash
+        run: echo "tag=sha-${COMMIT_SHA:0:7}" >> "$GITHUB_OUTPUT"
+
+      - name: Build and push the cloud image
+        id: build
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ./Dockerfile.cloud
+          platforms: linux/amd64
+          push: true
+          tags: ghcr.io/poopaskoopa/wattracker-cloud:${{ steps.image.outputs.tag }}
+
+      - name: Install cosign
+        uses: sigstore/cosign-installer@v3.8.1
+
+      - name: Sign the image keylessly
+        env:
+          IMAGE: ghcr.io/poopaskoopa/wattracker-cloud
+          DIGEST: ${{ steps.build.outputs.digest }}
+        run: cosign sign --yes "${IMAGE}@${DIGEST}"
+
+      - name: Verify the signature
+        env:
+          IMAGE: ghcr.io/poopaskoopa/wattracker-cloud
+          DIGEST: ${{ steps.build.outputs.digest }}
+        run: >-
+          cosign verify
+          --certificate-identity-regexp
+          '^https://github\.com/poopaskoopa/wattracker/\.github/workflows/cloud-publish\.yml@refs/heads/main$'
+          --certificate-oidc-issuer https://token.actions.githubusercontent.com
+          "${IMAGE}@${DIGEST}"
+
+      - name: Record the immutable image reference
+        env:
+          IMAGE: ghcr.io/poopaskoopa/wattracker-cloud
+          DIGEST: ${{ steps.build.outputs.digest }}
+        shell: bash
+        run: |
+          image_ref="${IMAGE}@${DIGEST}"
+          echo "Published ${image_ref}"
+          {
+            echo "### Immutable cloud image"
+            echo
+            echo '```text'
+            echo "${image_ref}"
+            echo '```'
+            echo
+            echo "Use this same digest for both readImage and syncImage in infra/azure/main.bicepparam."
+          } >> "$GITHUB_STEP_SUMMARY"
