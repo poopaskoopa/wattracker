@@ -172,7 +172,19 @@ The list gives the **order**. GitHub gives the **state** — always
 (#234's scope grew a whole section after it was filed) and its labels move.
 If the two disagree, GitHub wins and the queue is stale; say so.
 
-1. **#169 — an operator CLI for the one-time enrollment bootstrap.**
+1. **#316 — publish and sign the cloud image to GHCR.** The owner has
+   decided to deploy and picked GHCR + cosign keyless over ACR Basic (a fixed
+   ~$5/mo against a sub-$1 baseline). Nothing in the repo publishes an image
+   today: `cloud.yml:188` builds with `--load` and stops, and no workflow
+   mentions `ghcr` or `cosign`, while `main.bicepparam:34,36` want signed
+   immutable digests. **Build one image, not two** — both container apps run
+   `args: ['-m', 'wattracker.cloud.runtime']` (`main.bicep:225`) and differ
+   only by `WATTRACKER_CLOUD_PLANE`, so one digest fills both params. Hosted
+   `ubuntu-latest`, linux/amd64 only, and the fork-safe local build check in
+   `containerized` stays. This is the last deployment-path item that needs no
+   Azure subscription, so it goes first.
+
+2. **#169 — an operator CLI for the one-time enrollment bootstrap.**
    Re-scoped and unblocked 2026-09-17: the CLI itself never needed a
    deployment. `tests/test_cloud_api.py` already drives
    `POST /api/v1/enrollment/start` through `MemoryTenantStore` +
@@ -187,7 +199,7 @@ If the two disagree, GitHub wins and the queue is stale; say so.
    the walking-skeleton server, which serves plain `http://127.0.0.1`. The
    "onboard a second real rider" criterion is split out and stays with #102.
 
-2. **#249 — rotating full-suite test flakes. Still not a local-runs job.**
+3. **#249 — rotating full-suite test flakes. Still not a local-runs job.**
    Nothing has changed since the re-scope. 21 consecutive clean local full
    suites stand against zero reproductions. Both known instances came from
    **taksmon's machine**. The mechanism is known: the session goes missing
@@ -229,7 +241,7 @@ or anything below on your own.
   with `--load` and stops; nothing in `.github/workflows/` mentions `ghcr` or
   `cosign`. `readImage`/`syncImage` in `main.bicepparam` want signed immutable
   digests, so this is on the deployment critical path and is **not** blocked on
-  a subscription. Not yet filed as an issue; do not start it unprompted.
+  a subscription. **Now filed as #316 and it is item 1.**
 
 **Done earlier (2026-09-14 → 09-15).**
 - **#298** merged as PR #308 (`38322dd`). The production race is fixed: an
