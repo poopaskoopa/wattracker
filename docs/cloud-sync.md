@@ -66,7 +66,8 @@ pastes it into the desktop cloud settings; the desktop enrolls once and gets
 its writer credential and namespace. From there, phones are paired by the
 desktop with the normal pairing flow. Operators can audit the enrolled writer
 installations with `list-installations` and revoke one with
-`revoke-installation <installation_id>`.
+`revoke-installation <installation_id>`. Revoking an installation also revokes
+every paired device in that writer's `(namespace, local_user_scope)`.
 
 ### Mobile read context
 

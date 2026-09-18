@@ -2673,6 +2673,70 @@ class CredentialRegistry:
             self._backend.update("writer", credential_id, revoke_legacy)
             return True
 
+    def revoke_writer_and_devices(self, credential_id: str) -> bool:
+        """Revoke a writer and every paired device in its scope.
+
+        A known writer is an idempotent target: an already-revoked writer and
+        already-revoked devices still produce success.  Device rows are
+        written before the writer so a cascade failure never leaves this
+        method reporting success, and a retry can finish a partial cascade.
+        Legacy writer rows are updated in place without adding a credential
+        id, so their durable operator handle remains the row key.
+        """
+
+        if not isinstance(credential_id, str) or _HEX_ID_RE.fullmatch(credential_id) is None:
+            return False
+        with self._lock:
+            writer = self._find_writer_locked(credential_id)
+            legacy = False
+            if writer is None and self._backend is not None:
+                writer = self._legacy_writer_locked(credential_id)
+                legacy = writer is not None
+            if writer is None:
+                return False
+
+            devices = self._all_devices_for_scope_locked(
+                writer.namespace, writer.local_user_scope
+            )
+            for device in devices:
+                current = self._find_device_locked(device.credential_id)
+                if current is None:
+                    raise RuntimeError("device disappeared during writer revocation")
+                if not self._matches_scope(
+                    current, writer.namespace, writer.local_user_scope
+                ):
+                    raise RuntimeError("device scope changed during writer revocation")
+                if current.revoked and not current.active:
+                    continue
+                self._write_device_locked(
+                    replace(current, active=False, revoked=True)
+                )
+
+            if writer.revoked and not writer.active:
+                return True
+            if legacy:
+                if self._backend is None:  # pragma: no cover - guarded above
+                    raise RuntimeError("legacy writer requires durable backend")
+
+                def revoke_legacy(value: Mapping[str, Any] | None) -> Mapping[str, Any]:
+                    if not isinstance(value, Mapping) or "credential_id" in value:
+                        raise ValueError("legacy writer row is invalid")
+                    try:
+                        current = _writer_from_value(credential_id, value)
+                    except (KeyError, TypeError, ValueError) as exc:
+                        raise ValueError("legacy writer row is invalid") from exc
+                    updated = dict(value)
+                    updated["active"] = False
+                    updated["revoked"] = True
+                    return updated
+
+                self._backend.update("writer", credential_id, revoke_legacy)
+            else:
+                self._write_writer_locked(
+                    replace(writer, active=False, revoked=True)
+                )
+            return True
+
     revoke = revoke_writer
 
     # ------------------------------------------------------------------
@@ -3001,6 +3065,36 @@ class CredentialRegistry:
                         if len(found) >= bound:
                             break
         found.sort(key=lambda item: (item.created_at, item.credential_id))
+        return tuple(found)
+
+    def _all_devices_for_scope_locked(
+        self, namespace: str, local_user_scope: str
+    ) -> tuple[DeviceCredential, ...]:
+        """Read every device in a scope, failing closed on malformed rows."""
+
+        namespace_text = _require_namespace(namespace)
+        scope_text = _require_local_scope(local_user_scope)
+        found: list[DeviceCredential] = []
+        if self._backend is not None:
+            rows = self._backend.iter_records("device", limit=self._capacity)
+            for row_key, value in rows:
+                if not isinstance(value, Mapping):
+                    raise RuntimeError("device record is invalid")
+                stored_id = _device_id_from_value(row_key, value)
+                if stored_id is None:
+                    raise RuntimeError("device record identity is invalid")
+                try:
+                    credential = _device_from_value(stored_id, value)
+                except (KeyError, TypeError, ValueError) as exc:
+                    raise RuntimeError("device record is invalid") from exc
+                if self._matches_scope(credential, namespace_text, scope_text):
+                    found.append(credential)
+        else:
+            found.extend(
+                credential
+                for credential in self._devices.values()
+                if self._matches_scope(credential, namespace_text, scope_text)
+            )
         return tuple(found)
 
     def list_writers(

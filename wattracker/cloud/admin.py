@@ -8,6 +8,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import sys
 import urllib.error
 import urllib.parse
@@ -22,6 +23,7 @@ _KEYCHAIN_ACCOUNT = "operator-token"
 _MAX_RESPONSE_BYTES = 256 * 1024
 _REQUEST_TIMEOUT_SECONDS = 15.0
 _LOOPBACK_HOSTS = frozenset({"localhost", "127.0.0.1", "::1"})
+_INSTALLATION_ID_RE = re.compile(r"\A[0-9a-f]{64}\Z")
 
 
 class AdminError(RuntimeError):
@@ -179,7 +181,7 @@ def _list_installations(endpoint: str, token: str) -> dict[str, Any]:
 
 
 def _revoke_installation(endpoint: str, token: str, installation_id: str) -> dict[str, Any]:
-    if not installation_id or any(ord(char) < 0x21 for char in installation_id):
+    if not isinstance(installation_id, str) or _INSTALLATION_ID_RE.fullmatch(installation_id) is None:
         raise AdminError("invalid installation id")
     payload = _request_json(
         endpoint,

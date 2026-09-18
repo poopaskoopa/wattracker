@@ -11,6 +11,7 @@ from wattracker.cloud.security import MemorySecurityStateBackend, new_installati
 
 SECRET = b"cloud-admin-test-server-secret-32-bytes"
 TOKEN = "operator-token-for-admin-tests"
+GATEWAY_PROOF = "gateway-proof-for-admin-tests"
 
 
 @pytest.mark.parametrize(
@@ -61,7 +62,11 @@ def test_invalid_token_arguments_are_rejected_without_echo(argv, capsys):
 
 def test_admin_routes_list_and_revoke_durable_writer_installation():
     backend = MemorySecurityStateBackend()
-    config = CloudConfig(server_secret=SECRET, operator_token=TOKEN)
+    config = CloudConfig(
+        server_secret=SECRET,
+        operator_token=TOKEN,
+        gateway_proof_value=GATEWAY_PROOF,
+    )
     state = CloudState.create(config, security_backend=backend)
     writer = state.credentials.register_writer(
         new_installation_id(), "rider-scope", b"w" * 32, b"s" * 32
@@ -73,13 +78,19 @@ def test_admin_routes_list_and_revoke_durable_writer_installation():
     with TestClient(create_cloud_app(config, state=restarted)) as client:
         unauthorized = client.get(
             "/api/v1/admin/installations",
-            headers={"X-Operator-Token": "wrong-token"},
+            headers={
+                "X-Operator-Token": "wrong-token",
+                "X-Gateway-Request-Proof": GATEWAY_PROOF,
+            },
         )
         assert unauthorized.status_code == 404
 
         listed = client.get(
             "/api/v1/admin/installations",
-            headers={"X-Operator-Token": TOKEN},
+            headers={
+                "X-Operator-Token": TOKEN,
+                "X-Gateway-Request-Proof": GATEWAY_PROOF,
+            },
         )
         assert listed.status_code == 200
         assert listed.json() == {
@@ -95,7 +106,10 @@ def test_admin_routes_list_and_revoke_durable_writer_installation():
 
         revoked = client.post(
             f"/api/v1/admin/installations/{writer.credential_id}/revoke",
-            headers={"X-Operator-Token": TOKEN},
+            headers={
+                "X-Operator-Token": TOKEN,
+                "X-Gateway-Request-Proof": GATEWAY_PROOF,
+            },
         )
         assert revoked.status_code == 200
         assert revoked.json() == {
@@ -105,14 +119,21 @@ def test_admin_routes_list_and_revoke_durable_writer_installation():
 
         listed_again = client.get(
             "/api/v1/admin/installations",
-            headers={"X-Operator-Token": TOKEN},
+            headers={
+                "X-Operator-Token": TOKEN,
+                "X-Gateway-Request-Proof": GATEWAY_PROOF,
+            },
         )
         assert listed_again.json()["installations"][0]["status"] == "revoked"
 
 
 def test_admin_routes_list_and_revoke_legacy_durable_writer_row_in_place():
     backend = MemorySecurityStateBackend()
-    config = CloudConfig(server_secret=SECRET, operator_token=TOKEN)
+    config = CloudConfig(
+        server_secret=SECRET,
+        operator_token=TOKEN,
+        gateway_proof_value=GATEWAY_PROOF,
+    )
     state = CloudState.create(config, security_backend=backend)
     writer = state.credentials.register_writer(
         new_installation_id(), "rider-scope", b"w" * 32, b"s" * 32
@@ -127,7 +148,10 @@ def test_admin_routes_list_and_revoke_legacy_durable_writer_row_in_place():
     with TestClient(create_cloud_app(config, state=restarted)) as client:
         listed = client.get(
             "/api/v1/admin/installations",
-            headers={"X-Operator-Token": TOKEN},
+            headers={
+                "X-Operator-Token": TOKEN,
+                "X-Gateway-Request-Proof": GATEWAY_PROOF,
+            },
         )
         assert listed.status_code == 200
         assert listed.json() == {
@@ -145,7 +169,10 @@ def test_admin_routes_list_and_revoke_legacy_durable_writer_row_in_place():
 
         revoked = client.post(
             f"/api/v1/admin/installations/{row_key}/revoke",
-            headers={"X-Operator-Token": TOKEN},
+            headers={
+                "X-Operator-Token": TOKEN,
+                "X-Gateway-Request-Proof": GATEWAY_PROOF,
+            },
         )
         assert revoked.status_code == 200
         assert revoked.json() == {
@@ -165,27 +192,145 @@ def test_admin_routes_list_and_revoke_legacy_durable_writer_row_in_place():
 
 
 def test_admin_revoke_rejects_unknown_and_malformed_handles():
-    config = CloudConfig(server_secret=SECRET, operator_token=TOKEN)
+    config = CloudConfig(
+        server_secret=SECRET,
+        operator_token=TOKEN,
+        gateway_proof_value=GATEWAY_PROOF,
+    )
     state = CloudState.create(config)
     with TestClient(create_cloud_app(config, state=state)) as client:
         for handle in ("not-a-handle", "f" * 63, "f" * 65):
             response = client.post(
                 f"/api/v1/admin/installations/{handle}/revoke",
-                headers={"X-Operator-Token": TOKEN},
+                headers={
+                    "X-Operator-Token": TOKEN,
+                    "X-Gateway-Request-Proof": GATEWAY_PROOF,
+                },
             )
             assert response.status_code == 404
 
 
-def test_admin_operator_token_is_sufficient_without_gateway_proof():
-    config = CloudConfig(server_secret=SECRET, operator_token=TOKEN)
+def test_admin_requires_gateway_proof_in_addition_to_operator_token():
+    config = CloudConfig(
+        server_secret=SECRET,
+        operator_token=TOKEN,
+        gateway_proof_value=GATEWAY_PROOF,
+    )
     state = CloudState.create(config)
+    writer = state.credentials.register_writer(
+        new_installation_id(), "rider-scope", b"w" * 32, b"s" * 32
+    )
     with TestClient(create_cloud_app(config, state=state)) as client:
-        response = client.get(
+        missing = client.get(
             "/api/v1/admin/installations",
             headers={"X-Operator-Token": TOKEN},
         )
-    assert response.status_code == 200
-    assert response.json() == {"installations": []}
+        wrong = client.get(
+            "/api/v1/admin/installations",
+            headers={
+                "X-Operator-Token": TOKEN,
+                "X-Gateway-Request-Proof": "wrong-proof",
+            },
+        )
+        correct = client.get(
+            "/api/v1/admin/installations",
+            headers={
+                "X-Operator-Token": TOKEN,
+                "X-Gateway-Request-Proof": GATEWAY_PROOF,
+            },
+        )
+        missing_revoke = client.post(
+            f"/api/v1/admin/installations/{writer.credential_id}/revoke",
+            headers={"X-Operator-Token": TOKEN},
+        )
+        correct_revoke = client.post(
+            f"/api/v1/admin/installations/{writer.credential_id}/revoke",
+            headers={
+                "X-Operator-Token": TOKEN,
+                "X-Gateway-Request-Proof": GATEWAY_PROOF,
+            },
+        )
+    assert missing.status_code == 404
+    assert wrong.status_code == 404
+    assert correct.status_code == 200
+    assert missing_revoke.status_code == 404
+    assert correct_revoke.status_code == 200
+
+
+def test_admin_revoke_cascades_to_same_scope_device_and_is_idempotent():
+    backend = MemorySecurityStateBackend()
+    config = CloudConfig(
+        server_secret=SECRET,
+        operator_token=TOKEN,
+        gateway_proof_value=GATEWAY_PROOF,
+    )
+    state = CloudState.create(config, security_backend=backend)
+    writer = state.credentials.register_writer(
+        new_installation_id(), "rider-scope", b"w" * 32, b"s" * 32
+    )
+    device = state.credentials.register_device_for_scope(
+        writer.namespace,
+        writer.local_user_scope,
+        b"d" * 32,
+        subscription_key=b"device-subscription",
+    )
+    assert state.credentials.authenticate_writer(
+        writer.credential_id, writer.subscription_key
+    ) is not None
+    assert state.credentials.authenticate_device(
+        device.credential_id, device.subscription_key
+    ) is not None
+    headers = {
+        "X-Operator-Token": TOKEN,
+        "X-Gateway-Request-Proof": GATEWAY_PROOF,
+    }
+
+    with TestClient(create_cloud_app(config, state=state)) as client:
+        first = client.post(
+            f"/api/v1/admin/installations/{writer.credential_id}/revoke",
+            headers=headers,
+        )
+        retry = client.post(
+            f"/api/v1/admin/installations/{writer.credential_id}/revoke",
+            headers=headers,
+        )
+
+    assert first.status_code == 200
+    assert retry.status_code == 200
+    assert first.json() == retry.json() == {
+        "installation_id": writer.credential_id,
+        "status": "revoked",
+    }
+    assert state.credentials.authenticate_writer(
+        writer.credential_id, writer.subscription_key
+    ) is None
+    assert state.credentials.authenticate_device(
+        device.credential_id, device.subscription_key
+    ) is None
+
+
+@pytest.mark.parametrize("installation_id", [
+    TOKEN,
+    "g" * 64,
+    "A" * 64,
+    "a" * 63,
+    "a" * 65,
+])
+def test_revoke_installation_rejects_non_hex_handle_before_transport(
+    monkeypatch, installation_id
+):
+    calls = []
+
+    def unexpected_transport(*args, **kwargs):
+        calls.append((args, kwargs))
+        raise AssertionError("transport must not be called")
+
+    monkeypatch.setattr(admin, "_request_json", unexpected_transport)
+    with pytest.raises(admin.AdminError, match="invalid installation id"):
+        admin._revoke_installation(
+            "https://cloud.example", TOKEN, installation_id
+        )
+    assert calls == []
 
 
 def test_three_commands_dispatch_and_print_json(monkeypatch, capsys):

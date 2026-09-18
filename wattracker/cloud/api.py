@@ -445,6 +445,8 @@ def _safe_compare_text(left: object, right: object) -> bool:
 def _operator_authenticated(state: CloudState, request: Request) -> bool:
     """Authenticate the operator header without exposing failure details."""
 
+    if not _gateway_proof_valid(state, request):
+        return False
     if not state.quotas.kill_state().public_enabled:
         return False
     return _safe_compare_text(
@@ -1016,7 +1018,8 @@ def create_cloud_app(
                 writer = state.credentials.lookup_writer(installation_id)
                 if writer is None:
                     return _not_found()
-                state.credentials.revoke_writer(installation_id)
+                if not state.credentials.revoke_writer_and_devices(installation_id):
+                    return _not_found()
             except Exception:
                 return _not_found()
             return JSONResponse(
