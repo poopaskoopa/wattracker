@@ -388,7 +388,6 @@ class CloudSession(
                         consecutiveRejections = 0
                         nextAttemptAllowedAt = null
                         mintCount += 1
-                        lastSuccessfulRead = now()
                         val fresh = ReaderToken(
                             value = result.value.readerContext,
                             generation = mintCount,
