@@ -52,6 +52,20 @@ class CacheTest {
         assertEquals(listOf("a"), merged.map { it.id })
     }
 
+    @Test
+    fun inMemoryCacheStoreFullFiltersTombstones() {
+        val cache = InMemorySnapshotCache()
+        cache.store(
+            received = listOf(item("a", 1), item("b", 1, deleted = true)),
+            revision = 1,
+            route = CloudRoute.Dashboard,
+            full = true,
+            generation = 0,
+        )
+        val loaded = cache.load(CloudRoute.Dashboard)!!
+        assertEquals(listOf("a"), loaded.items.map { it.id })
+    }
+
     private fun item(id: String, revision: Int, deleted: Boolean = false): CloudItem =
         CloudItem.fromJson(
             JsonValue.parse("""{"id":"$id","kind":"profile","revision":$revision,"data":{"ftp":250},"deleted":$deleted}"""),
