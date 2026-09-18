@@ -5,9 +5,8 @@ import java.io.IOException
 import java.io.InputStream
 import java.net.HttpURLConnection
 import java.net.URL
-import java.text.SimpleDateFormat
-import java.util.Locale
-import java.util.TimeZone
+import java.time.ZonedDateTime
+import java.time.format.DateTimeFormatter
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 
@@ -38,7 +37,14 @@ data class CloudRequest(
         }
 
     companion object {
-        private val SENSITIVE = setOf("Authorization", "Ocp-Apim-Subscription-Key")
+        private val SENSITIVE = setOf(
+            "Authorization",
+            "Ocp-Apim-Subscription-Key",
+            "X-Device-Credential",
+            "X-Device-Signature",
+            "X-Writer-Credential",
+            "X-Writer-Signature",
+        )
     }
 }
 
@@ -176,6 +182,8 @@ internal fun parseRetryAfter(value: String, nowSeconds: Long): Double? {
     return null
 }
 
+private val HTTP_DATE_FORMATTER = DateTimeFormatter.RFC_1123_DATE_TIME
+
 /**
  * Parse an HTTP-date (RFC 1123 `Wed, 21 Oct 2015 07:28:00 GMT`), the format
  * `server.py`'s `Date` header uses. Returns null rather than guessing on a
@@ -184,13 +192,9 @@ internal fun parseRetryAfter(value: String, nowSeconds: Long): Double? {
  */
 internal fun parseHttpDate(value: String?): Long? {
     if (value == null) return null
-    val format = SimpleDateFormat("EEE, dd MMM yyyy HH:mm:ss zzz", Locale.US).apply {
-        timeZone = TimeZone.getTimeZone("GMT")
-        isLenient = false
-    }
     return try {
-        format.parse(value.trim())?.time
-    } catch (e: Exception) {
+        ZonedDateTime.parse(value.trim(), HTTP_DATE_FORMATTER).toInstant().toEpochMilli()
+    } catch (_: Exception) {
         null
     }
 }
