@@ -9,15 +9,57 @@ routes, and parameters) are template-derived. CLI/provider behavior, chosen
 SKUs and runtime availability, permissions, networking, image publication,
 and every command result must be confirmed during the first real deployment.
 
+## Immutable cloud image handoff
+
+The repository workflow `.github/workflows/cloud-publish.yml` builds
+`Dockerfile.cloud` once for `linux/amd64`, publishes
+`ghcr.io/poopaskoopa/wattracker-cloud:sha-<short-sha>`, signs the resulting
+digest with keyless cosign through GitHub OIDC, and verifies that signature in
+the same run. The existing `cloud.yml` workflow remains the fork-safe local
+container build; the publishing workflow is separate so pull requests never
+receive package-write or OIDC signing permissions.
+
+To get the digest for a commit, find its successful publishing run and print
+the immutable reference that the run logs and Summary contain:
+
+```sh
+COMMIT='FULL_COMMIT_SHA'
+RUN_ID="$(gh run list --workflow cloud-publish.yml --commit "$COMMIT" --status success --limit 1 --json databaseId --jq '.[0].databaseId')"
+gh run view "$RUN_ID" --log | rg 'ghcr.io/poopaskoopa/wattracker-cloud@sha256:'
+```
+
+Before deploying, verify the exact digest from a clean checkout or deployment
+shell (replace the placeholder with the full `@sha256:...` reference printed
+by the run):
+
+```sh
+IMAGE_REF='ghcr.io/poopaskoopa/wattracker-cloud@sha256:FULL_DIGEST'
+cosign verify \
+  --certificate-identity-regexp '^https://github\.com/poopaskoopa/wattracker/\.github/workflows/cloud-publish\.yml@refs/heads/main$' \
+  --certificate-oidc-issuer 'https://token.actions.githubusercontent.com' \
+  "$IMAGE_REF"
+```
+
+The one verified digest fills both `readImage` and `syncImage` in
+`main.bicepparam`; the two Container Apps run the same entrypoint and differ
+only by `WATTRACKER_CLOUD_PLANE`. Keep the parameter file's placeholders in
+source control and copy the same full image reference—and therefore the same
+exact digest—into both values only in the deployment copy.
+
+GHCR creates the package private on its first push. The package owner must
+flip it to Public once in the package settings; until then, Container Apps
+needs a registry pull credential. The publishing workflow cannot change that
+package visibility.
+
 ## Prerequisites and secret handling
 
 Have an Azure subscription; an owner-approved region, resource-group name,
 globally unique storage name, PWA origin, billing email and budget period;
-registry-backed immutable **signed** read and sync image references whose build
-and import evidence is recorded using the #217 verification procedure; and
-permission to create the resources, assign roles, list Function host keys, and
-create Consumption budgets. #217 verifies a local image but does not publish
-one, so the registry, signing workflow, and final digest remain owner inputs.
+registry-backed immutable **signed** cloud image reference from the
+successful #316 publishing run; and permission to create the resources, assign
+roles, list Function host keys, and create Consumption budgets. The final
+digest remains an owner deployment input even though its build and signature
+are produced and verified by the repository workflow.
 
 Install and authenticate Azure CLI with Bicep support, Azure Functions Core
 Tools, and Docker in the real deployment environment. Do not copy this
@@ -51,10 +93,11 @@ before its settings are completed and the hook is published.
    `defaultHostName`, system identity `principalId`, and complete possible
    outbound IPv4 list for `budgetHookFunctionAppName`, `budgetHookHost`,
    `budgetHookPrincipalId`, and `budgetHookIpRules`.
-2. Resolve owner inputs and #217 image outputs. They yield `location`,
-   `storageName`, `allowedOrigin`, `billingEmail`, `budgetStartDate`,
-   `budgetEndDate`, `readImage`, `syncImage`, and (if used) Static Web App
-   repository inputs.
+2. Resolve owner inputs and the successful #316 publishing run. They yield
+   `location`, `storageName`, `allowedOrigin`, `billingEmail`,
+   `budgetStartDate`, `budgetEndDate`, and one signed image reference to use
+   for both `readImage` and `syncImage` (plus, if used, Static Web App
+   repository inputs).
 3. Build, validate, review what-if, then create `main.bicep`. This creates
    the application Storage account and `CloudControl`, the VNet/ACA
    environment and apps, managed identities and RBAC, action groups, and
@@ -102,10 +145,10 @@ Put the identity `principalId` in `budgetHookPrincipalId`.
 
 ## 2. Complete parameters and deploy the main template (unverified commands)
 
-Use the immutable signed image references from #217's actual output. #217
-documents reproducible verification; it neither pushed an image nor supplies a
-registry, repository, tag, or digest. Fill `readImage` and `syncImage` only
-after that output exists. Keep `staticRepositoryUrl = ''` to disable the
+Use the immutable signed image reference from the successful #316 publishing
+run. It is one `linux/amd64` GHCR image, and its full `@sha256` digest must be
+verified before deployment. Fill `readImage` and `syncImage` with that same
+reference only after the run exists. Keep `staticRepositoryUrl = ''` to disable the
 optional Static Web App, or supply owner-approved repository values and the
 environment-provided deployment token.
 
@@ -216,8 +259,9 @@ firewall/IP/resource-instance rules, and connectivity.
 - [ ] Deployment activity shows the Function host-key lookup, role assignment,
       firewall/resource-instance rule, tables, action groups, budget, and
       Container Apps succeeded.
-- [ ] Image references are immutable signed references actually produced and
-      verified by #217's process.
+- [ ] The one immutable signed image reference was produced by the #316
+      publishing run, verified with the documented cosign command, and copied
+      identically into `readImage` and `syncImage`.
 - [ ] Function settings/publish logs show the staged package was published and
       the Function can access CloudControl with managed identity.
 - [ ] The authenticated clear drill returned 200 JSON and the CloudControl row

@@ -30,9 +30,9 @@ param staticRepositoryUrl = ''
 param staticBranch = 'main'
 // Source: owner decision (set WATTRACKER_STATIC_REPOSITORY_TOKEN outside source control; empty is valid when staticRepositoryUrl is empty).
 param staticRepositoryToken = readEnvironmentVariable('WATTRACKER_STATIC_REPOSITORY_TOKEN', '')
-// Source: #217 image output (TODO immutable signed read-plane image reference; #217 did not push an image).
+// Source: successful #316 `.github/workflows/cloud-publish.yml` run for the deployment commit; copy its full GHCR @sha256 digest (same value used for syncImage).
 param readImage = 'TODO_SIGNED_IMMUTABLE_READ_IMAGE_FROM_217_OUTPUT'
-// Source: #217 image output (TODO immutable signed sync-plane image reference; #217 did not push an image).
+// Source: same successful #316 workflow run and digest as readImage; both planes use one image and differ only by WATTRACKER_CLOUD_PLANE.
 param syncImage = 'TODO_SIGNED_IMMUTABLE_SYNC_IMAGE_FROM_217_OUTPUT'
 // Source: owner decision (set WATTRACKER_CLOUD_SERVER_SECRET outside source control to base64-encoded 256-bit material).
 param cloudServerSecret = readEnvironmentVariable('WATTRACKER_CLOUD_SERVER_SECRET')
