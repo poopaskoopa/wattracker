@@ -69,38 +69,11 @@ private val navUnselectedColor = Palette.muted
 private val navIndicatorColor = Palette.accent.copy(alpha = 0.16f)
 
 /**
- * The app shell: one navigation model, two presentations.
+ * The app shell: adapts navigation presentation based on device screen size and orientation.
  *
- * ## Why the phone gets a rail in landscape and a bottom bar in portrait
- *
- * (The arithmetic from issue #193; the iOS twin is the comment on `RootView`
- * in `ios/WatTracker/WatTracker/Shell/`.) The iOS app is landscape-only on the
- * phone; Android is not, so a phone in portrait is a real, reachable state and
- * gets the conventional phone layout -- chrome on the bottom edge, full width,
- * under the thumb. The rail is the *landscape* call: there the viewport is
- * wide and short -- roughly 900x400dp on a Pixel 9 before insets -- Vertical space is the scarce axis and horizontal space the abundant
- * one.
- *
- * A bottom bar costs ~80dp of that ~400dp height, on every screen, forever: a
- * fifth of the scarce axis. An 80dp leading rail costs 80 of ~900dp, under a
- * tenth of the abundant axis. On a wide, short viewport chrome belongs on the
- * long edge. The rail also sits under the left thumb, which is where the device
- * is actually held in landscape, while a bottom bar in landscape sits under
- * neither hand.
- *
- * This is a deliberate departure from the platform default, and the default is
- * the right call in portrait. It is not right here.
- *
- * ## Why the tablet gets a permanent drawer and must survive portrait
- *
- * targetSdk 36 means the app is built against the Android 16 large-screen
- * rules, where orientation restrictions are ignored on large screens: a
- * tablet window can be portrait whatever the manifest asks for, so the drawer
- * layout has to be *correct* in portrait, though not necessarily optimal.
- * [PermanentNavigationDrawer] is the pick because it is a list-detail
- * scaffold (the `NavigationSplitView` analogue): at the tablet's portrait
- * width the list stays visible and nothing has to be written to collapse it,
- * and the window never gets narrow enough for that to be the wrong call.
+ * - Phone Landscape: leading `NavigationRail` to maximize vertical screen space.
+ * - Phone Portrait: bottom `NavigationBar` for conventional single-hand thumb navigation.
+ * - Large Screen (sw >= 600dp): permanent navigation drawer sheet.
  */
 @Composable
 fun RootScreen() {
@@ -117,28 +90,8 @@ fun RootScreen() {
 }
 
 /**
- * Whether the current window gets the large-screen shell (drawer) or the phone
- * shell (rail).
- *
- * The iOS twin of this predicate (`RootView.usesSplitView`) had to check both
- * the width size class and the idiom, because a Max-sized iPhone in landscape
- * reports a regular width class. On Android the two halves collapse into one
- * honest check: [android.content.Configuration.smallestScreenWidthDp] is the
- * smallest the *device's* short edge ever gets, so it is simultaneously the
- * idiom test (a phone, even a large one in landscape, cannot reach 600dp on
- * its short edge -- the iOS trap cannot occur here) and the size-class test
- * (the platform's tablet threshold). The Material3
- * `currentWindowAdaptiveInfo()` API in `androidx.compose.material3.adaptive`
- * is the current recommended alternative, but reading `smallestScreenWidthDp`
- * directly is a deliberate no-extra-dependency choice that also matches the
- * platform's resource-qualifier semantics.
- *
- * Note: on API 24+, `smallestScreenWidthDp` is derived from the *app window*,
- * not the physical device. A narrow split-screen or freeform window on a
- * tablet therefore reports below 600dp and the app flips to the phone shell
- * (rail or bottom bar from orientation). This is acceptable: at that width a
- * list-detail drawer is the wrong layout anyway. The AVD measurements in
- * README.md cover fullscreen only and cannot speak to this case.
+ * Returns true if the window's `smallestScreenWidthDp >= 600`, selecting the
+ * large-screen drawer layout.
  */
 @Composable
 private fun usesLargeScreenShell(): Boolean {

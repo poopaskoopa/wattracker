@@ -1,31 +1,11 @@
 package com.wattracker.android.json
 
 /**
- * A JSON value the app can carry and re-emit without a model for it.
+ * Represents a parsed JSON value tree.
  *
- * This is the Kotlin twin of `ios/.../Cloud/JSONValue.swift`, and it exists for
- * the same two reasons that file documents:
- *
- * 1. **Forward compatibility.** The delta protocol is at-least-once but never
- *    at-least-twice: an object of a kind this build does not model must still
- *    be *kept*, byte-preserving, or a rider who updates the app finds a
- *    permanent hole where the objects the old build discarded used to be.
- *    Decoding an unknown kind into this and writing it back out is what makes
- *    an app update safe.
- * 2. **Sub-payloads the server does not fix.** A calendar day's `workouts`
- *    come straight out of the desktop's `db._plan_workout_row`, and an
- *    activity detail's `zones` is a summary block. Inventing a struct for
- *    either would be a second, weaker copy of a schema the desktop owns.
- *
- * It is a self-contained parser and serializer rather than `org.json` for a
- * concrete, load-bearing reason: `org.json` is an Android-framework class that
- * is *stubbed* in plain JVM unit tests, so the interop vector tests -- the ones
- * that read the shared JSON files under `tests/vectors` and prove this client
- * signs and decodes what the server expects -- could not run without an Android
- * runtime. A pure-Kotlin
- * value that behaves identically on the JVM and on device keeps those tests on
- * the same footing as the Python and Swift suites, and adds no dependency,
- * which is the epic's rule.
+ * Provides:
+ * 1. Forward compatibility: Unmodeled object kinds round-trip byte-preserving.
+ * 2. Pure Kotlin implementation: Runs on both JVM unit tests and Android without framework dependencies.
  */
 sealed class JsonValue {
     object Null : JsonValue()

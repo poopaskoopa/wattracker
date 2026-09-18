@@ -3,26 +3,15 @@ package com.wattracker.android.cloud
 import java.security.MessageDigest
 
 /**
- * The Kotlin half of `wattracker/cloud/security.py:canonical_request`.
+ * Constructs length-framed, domain-separated byte strings for request signing and verification,
+ * matching `wattracker/cloud/security.py:canonical_request`.
  *
- * This type is the reason the walking skeleton exists. The server signs and
- * verifies over a length-framed, domain-separated byte string, and a client
- * that produces those bytes even one byte differently gets a 401 with no
- * diagnostic on either side. So the rules are restated here in full, and
- * `tests/vectors/canonical_request_v1.json` -- the same file the Python and
- * Swift suites assert against -- proves the three agree rather than leaving it
- * to review.
+ * Tested against shared vectors in `tests/vectors/canonical_request_v1.json`.
  *
- * Three things are easy to get wrong in Kotlin specifically, and all three are
- * covered by a vector:
- *
- * 1. **Lengths are UTF-8 byte counts.** `String.length` is UTF-16 code units;
- *    it produces a different prefix for a non-ASCII field and a signature that
- *    verifies nowhere. Every length here is computed from `toByteArray()`.
- * 2. **An empty field is still a field.** The refresh envelope's revision is
- *    the empty string, which contributes a four-byte zero length and no bytes.
- *    Skipping it is the single most likely way to break refresh.
- * 3. **The method is upper-cased before framing**, not after.
+ * Key encoding rules:
+ * 1. Lengths are UTF-8 byte counts (not UTF-16 code units).
+ * 2. Empty fields contribute a 4-byte zero length prefix (`0x00000000`).
+ * 3. HTTP method is upper-cased prior to framing.
  */
 object CanonicalRequest {
 
@@ -82,21 +71,24 @@ object CanonicalRequest {
             normalizedMethod, path, namespace, timestamp,
             nonce, bodyDigest, idempotencyKey, revision,
         )
-        val out = ArrayList<Byte>(DOMAIN_SEPARATOR.size + fields.sumOf {
-            4 + it.toByteArray(Charsets.UTF_8).size
-        })
-        out.addAll(DOMAIN_SEPARATOR.toList())
-        for (field in fields) {
-            val encoded = field.toByteArray(Charsets.UTF_8)
-            val length = encoded.size
-            // 4-byte big-endian length prefix.
-            out.add(((length shr 24) and 0xFF).toByte())
-            out.add(((length shr 16) and 0xFF).toByte())
-            out.add(((length shr 8) and 0xFF).toByte())
-            out.add((length and 0xFF).toByte())
-            out.addAll(encoded.toList())
+        val encodedFields = fields.map { it.toByteArray(Charsets.UTF_8) }
+        val totalSize = DOMAIN_SEPARATOR.size + encodedFields.sumOf { 4 + it.size }
+        val out = ByteArray(totalSize)
+        var pos = 0
+
+        System.arraycopy(DOMAIN_SEPARATOR, 0, out, pos, DOMAIN_SEPARATOR.size)
+        pos += DOMAIN_SEPARATOR.size
+
+        for (encoded in encodedFields) {
+            val len = encoded.size
+            out[pos++] = ((len shr 24) and 0xFF).toByte()
+            out[pos++] = ((len shr 16) and 0xFF).toByte()
+            out[pos++] = ((len shr 8) and 0xFF).toByte()
+            out[pos++] = (len and 0xFF).toByte()
+            System.arraycopy(encoded, 0, out, pos, len)
+            pos += len
         }
-        return out.toByteArray()
+        return out
     }
 
     /** Lowercase hex SHA-256 of a request body, matching `digest_body`. */
