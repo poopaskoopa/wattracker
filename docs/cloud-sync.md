@@ -67,7 +67,14 @@ its writer credential and namespace. From there, phones are paired by the
 desktop with the normal pairing flow. Operators can audit the enrolled writer
 installations with `list-installations` and revoke one with
 `revoke-installation <installation_id>`. Revoking an installation also revokes
-every paired device in that writer's `(namespace, local_user_scope)`.
+every paired device and outstanding pairing code in that writer's
+`(namespace, local_user_scope)`.
+
+A revoke `404` is deliberately ambiguous: it can mean the installation is
+absent, but it can also mean storage failed or a same-scope cascade stopped
+part-way. The operator must retry the revoke before concluding that the
+installation is absent; a retry is idempotent and completes any partial
+cascade.
 
 ### Mobile read context
 

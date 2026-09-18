@@ -664,7 +664,10 @@ def test_metering_after_the_fact_never_strands_a_rider():
         clock=lambda: 1_000,
     )
     state = CloudState.create(config, security_backend=backend)
-    code = state.pairings.create(NAMESPACE, "scope").code
+    writer = state.credentials.register_writer(
+        new_installation_id(), "scope", b"w" * 32, b"s" * 32
+    )
+    code = state.pairings.create(writer.namespace, "scope").code
     _private, public_key = generate_signing_keypair()
     # The counter backend dies after the code is minted.
     state.quotas = _durable(QuotaPolicy(), _BrokenCounterBackend())

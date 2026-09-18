@@ -499,11 +499,14 @@ def test_an_unreadable_kill_state_refuses_the_device_routes():
     config = _config("read")
     state = CloudState.create(config, security_backend=backend)
     private_key, public_key = generate_signing_keypair()
+    writer = _writer(state, seed=b"p", scope="scope")
     device = state.credentials.register_device(
-        new_installation_id(), "scope", public_key,
+        writer.namespace, "scope", public_key,
         signature_algorithm="ed25519", capabilities=("read",), subject="entra-user",
     )
-    code = state.pairings.create(device.namespace, "scope", subject="entra-user").code
+    code = state.pairings.create(
+        writer.namespace, "scope", subject="entra-user"
+    ).code
 
     backend.failing = True
     with TestClient(create_cloud_app(config, state=state)) as client:

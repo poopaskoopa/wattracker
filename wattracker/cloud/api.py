@@ -988,10 +988,9 @@ def create_cloud_app(
                     MAX_WRITER_LISTING,
                 )
                 writers = state.credentials.list_writers(limit=limit)
-            except HTTPException:
-                raise
             except Exception:
-                # Do not turn backend failures into a diagnostic oracle.
+                # Keep every admin failure opaque.  #320 owns preserving the
+                # intended 503 response for unavailable quota/security state.
                 return _not_found()
             installations = [
                 {
@@ -1021,6 +1020,8 @@ def create_cloud_app(
                 if not state.credentials.revoke_writer_and_devices(installation_id):
                     return _not_found()
             except Exception:
+                # As above, #320 owns preserving intentional 503s; until then
+                # a storage or partial-cascade failure remains fail-closed.
                 return _not_found()
             return JSONResponse(
                 {

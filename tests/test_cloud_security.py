@@ -1,5 +1,7 @@
 import hashlib
 import hmac
+import sys
+import types
 
 import pytest
 
@@ -14,6 +16,7 @@ from wattracker.cloud.security import (
     MemorySecurityStateBackend,
     MIN_REPLAY_TTL_SECONDS,
     NonceReplayGuard,
+    SecurityStateUnavailable,
     canonical_request,
     derive_installation_namespace,
     digest_body,
@@ -29,7 +32,7 @@ from wattracker.cloud.security import (
     validate_public_key,
     verify_signature,
 )
-from wattracker.cloud.security import _PAIRING_ALPHABET
+from wattracker.cloud.security import _PAIRING_ALPHABET, _PAIRING_SCOPE_GUARD_KIND
 
 
 def _namespace(seed: bytes = b"installation") -> str:
@@ -615,10 +618,13 @@ def test_pairing_code_is_bound_to_the_minting_scope_and_subject():
 def test_pairing_binding_cannot_be_forged_or_redirected():
     registry = DevicePairingRegistry(b"server secret", clock=lambda: 100)
     credentials = CredentialRegistry(b"server secret", pairing_registry=registry)
+    writer = credentials.register_writer(
+        _installation(b"rider-a"), "scope-a", b"w" * 32, b"s" * 32
+    )
     # A raw 32-byte Ed25519 key: this test is about the binding proof, so it
     # must run whether or not the optional crypto extra is installed.
     public_key = b"k" * 32
-    minted = registry.create(_namespace(b"rider-a"), "scope-a")
+    minted = registry.create(writer.namespace, "scope-a")
     binding = registry.consume(minted.code)
     assert binding is not None
     assert registry.verify_binding(binding)
@@ -641,9 +647,30 @@ def test_pairing_binding_cannot_be_forged_or_redirected():
         credentials.pair_device(redirected, public_key)
 
     device = credentials.pair_device(binding, public_key)
-    assert device.namespace == _namespace(b"rider-a")
+    assert device.namespace == writer.namespace
     assert device.local_user_scope == "scope-a"
     assert device.capabilities == frozenset({"read"})
+
+
+@pytest.mark.parametrize("shared", [False, True])
+def test_consumed_pairing_binding_cannot_outlive_its_revoked_owner(shared):
+    backend = MemorySecurityStateBackend() if shared else None
+    registry = DevicePairingRegistry(
+        b"server secret", backend=backend, clock=lambda: 100
+    )
+    credentials = CredentialRegistry(
+        b"server secret", pairing_registry=registry, backend=backend
+    )
+    writer = credentials.register_writer(
+        _installation(b"owner"), "scope", b"w" * 32, b"s" * 32
+    )
+    minted = registry.create(writer.namespace, writer.local_user_scope)
+    binding = registry.consume(minted.code)
+    assert binding is not None
+
+    assert credentials.revoke_writer_and_devices(writer.credential_id)
+    with pytest.raises(ValueError, match="pairing owner is revoked"):
+        credentials.pair_device(binding, b"k" * 32)
 
 
 def test_pairing_ttl_is_capped_at_fifteen_minutes():
@@ -1019,6 +1046,403 @@ class _SweepStorageError(Exception):
     def __init__(self, status_code):
         super().__init__(str(status_code))
         self.status_code = status_code
+
+
+class _ScopeGuardTable(_RangeTable):
+    """Azure-style CAS rows, with no delete permission or cross-call lock."""
+
+    def __init__(self):
+        super().__init__()
+        self.version = 0
+
+    def upsert_entity(self, entity):
+        self.version += 1
+        self.entities[(entity["PartitionKey"], entity["RowKey"])] = dict(
+            entity, etag=str(self.version)
+        )
+
+    def create_entity(self, entity):
+        if (entity["PartitionKey"], entity["RowKey"]) in self.entities:
+            raise _SweepStorageError(409)
+        self.upsert_entity(entity)
+
+    def update_entity(self, entity, *, mode, etag, match_condition):
+        from azure.core import MatchConditions
+
+        assert match_condition == MatchConditions.IfNotModified
+        current = self.entities[(entity["PartitionKey"], entity["RowKey"])]
+        if current["etag"] != etag:
+            raise _SweepStorageError(412)
+        self.upsert_entity(entity)
+
+    def delete_entity(self, **kwargs):
+        pytest.fail("runtime scope guards must not require delete permission")
+
+
+@pytest.fixture
+def pairing_replicas(monkeypatch):
+    # These tests exercise the real Azure backend even without optional SDK
+    # packages; only the enum imports are substituted, never its CAS logic.
+    try:
+        import azure.core
+        import azure.data.tables
+    except ImportError:
+        for name in ("azure", "azure.core", "azure.data", "azure.data.tables"):
+            module = types.ModuleType(name)
+            module.__path__ = []
+            monkeypatch.setitem(sys.modules, name, module)
+        sys.modules["azure.core"].MatchConditions = types.SimpleNamespace(
+            IfNotModified="IfNotModified"
+        )
+        sys.modules["azure.data.tables"].UpdateMode = types.SimpleNamespace(MERGE="merge")
+
+    table = _ScopeGuardTable()
+    backend_a = AzureTableSecurityStateBackend(table)
+    backend_b = AzureTableSecurityStateBackend(table)
+    pairings = DevicePairingRegistry(
+        b"server secret", backend=backend_a, clock=lambda: 100
+    )
+    first = CredentialRegistry(
+        b"server secret", backend=backend_a, pairing_registry=pairings
+    )
+    second = CredentialRegistry(
+        b"server secret", backend=backend_b,
+        pairing_registry=DevicePairingRegistry(
+            b"server secret", backend=backend_b, clock=lambda: 100
+        ),
+    )
+    writer = first.register_writer(
+        _installation(b"owner"), "scope", b"w" * 32, b"s" * 32
+    )
+    code = pairings.create(writer.namespace, writer.local_user_scope).code
+    binding = pairings.consume(code)
+    assert binding is not None
+    return first, second, writer, binding, table
+
+
+def test_distributed_revoke_contends_with_pair_after_owner_check(
+    pairing_replicas, monkeypatch
+):
+    first, second, writer, binding, _table = pairing_replicas
+    store_device = first._store_device_locked
+    contended = []
+
+    def pause_before_device_write(device):
+        # A has already consumed the code and checked the active writer.
+        # B must not report a successful cascade while A can still write.
+        with pytest.raises(SecurityStateUnavailable):
+            second.revoke_writer_and_devices(writer.credential_id)
+        contended.append(True)
+        assert second.resolve_writer(writer.credential_id) is not None
+        assert second.list_devices_for_scope(writer.namespace, "scope") == ()
+        store_device(device)
+
+    monkeypatch.setattr(first, "_store_device_locked", pause_before_device_write)
+    device = first.pair_device(binding, b"k" * 32)
+    assert contended == [True]
+    assert second.resolve_device(device.credential_id) is not None
+    assert second.revoke_writer_and_devices(writer.credential_id)
+    assert first.resolve_writer(writer.credential_id) is None
+    assert first.resolve_device(device.credential_id) is None
+    with pytest.raises(ValueError, match="pairing owner is revoked"):
+        first.pair_device(binding, b"k" * 32)
+    assert second.revoke_writer_and_devices(writer.credential_id)
+
+
+def test_distributed_pair_contends_with_revoke_then_refuses_revoked_owner(
+    pairing_replicas, monkeypatch
+):
+    first, second, writer, binding, _table = pairing_replicas
+    scan_devices = second._all_devices_for_scope_locked
+    contended = []
+
+    def pause_before_cascade(namespace, scope):
+        with pytest.raises(SecurityStateUnavailable):
+            first.pair_device(binding, b"k" * 32)
+        contended.append(True)
+        return scan_devices(namespace, scope)
+
+    monkeypatch.setattr(second, "_all_devices_for_scope_locked", pause_before_cascade)
+    assert second.revoke_writer_and_devices(writer.credential_id)
+    assert contended == [True]
+    with pytest.raises(ValueError, match="pairing owner is revoked"):
+        first.pair_device(binding, b"k" * 32)
+    assert first.list_devices_for_scope(writer.namespace, "scope") == ()
+
+
+def test_pair_write_after_lease_loss_is_not_returned(pairing_replicas, monkeypatch):
+    first, second, writer, binding, _table = pairing_replicas
+    now = [100.0]
+    first._clock = lambda: now[0]
+    second._clock = lambda: now[0]
+    create = first._backend.create
+    raced = False
+
+    def revoke_before_device_create(kind, key, value):
+        nonlocal raced
+        if kind == "device" and not raced:
+            raced = True
+            now[0] = 200.0
+            assert second.revoke_writer_and_devices(writer.credential_id)
+        return create(kind, key, value)
+
+    monkeypatch.setattr(first._backend, "create", revoke_before_device_create)
+    with pytest.raises(SecurityStateUnavailable):
+        first.pair_device(binding, b"k" * 32)
+
+    assert raced
+    assert second.resolve_writer(writer.credential_id) is None
+    listed = second.list_devices_for_scope(writer.namespace, "scope")
+    assert all(device.revoked and not device.active for device in listed)
+    assert second.revoke_writer_and_devices(writer.credential_id)
+    assert all(
+        device.revoked and not device.active
+        for device in second.list_devices_for_scope(writer.namespace, "scope")
+    )
+
+
+@pytest.mark.parametrize("legacy", [False, True])
+def test_revoke_rereads_writer_after_shared_guard(pairing_replicas, monkeypatch, legacy):
+    first, second, writer, _binding, _table = pairing_replicas
+    row_key = first._credential_digest(writer.credential_id).hex()
+    handle = writer.credential_id
+    if legacy:
+        value = first._backend.read("writer", row_key)
+        value.pop("credential_id")
+        first._backend.write("writer", row_key, value)
+        handle = row_key
+    assert second.lookup_writer(handle).subject is None
+    update = second._backend.update
+    changed = False
+
+    def change_writer_before_acquisition(kind, key, transform):
+        nonlocal changed
+        if kind == _PAIRING_SCOPE_GUARD_KIND and not changed:
+            changed = True
+            value = first._backend.read("writer", row_key)
+            value["subject"] = "newer-subject"
+            first._backend.write("writer", row_key, value)
+        return update(kind, key, transform)
+
+    monkeypatch.setattr(second._backend, "update", change_writer_before_acquisition)
+    assert second.revoke_writer_and_devices(handle)
+    stored = first._backend.read("writer", row_key)
+    assert stored["subject"] == "newer-subject"
+    assert stored["revoked"] is True
+    assert stored["active"] is False
+    assert ("credential_id" not in stored) == legacy
+
+
+@pytest.mark.parametrize("existing_guard", [False, True])
+def test_scope_guard_cas_conflict_cannot_admit_two_holders(
+    pairing_replicas, monkeypatch, existing_guard
+):
+    first, second, writer, binding, table = pairing_replicas
+    if existing_guard:
+        with first._lock, first._pairing_scope_guard_locked(writer.namespace, "scope"):
+            pass
+    method = "update_entity" if existing_guard else "create_entity"
+    write_entity = getattr(table, method)
+    competing_guard = second._pairing_scope_guard_locked(writer.namespace, "scope")
+    entered = False
+
+    def compete_between_read_and_cas(entity, **kwargs):
+        nonlocal entered
+        if entity["RowKey"].startswith(_PAIRING_SCOPE_GUARD_KIND + ":") and not entered:
+            entered = True
+            competing_guard.__enter__()
+        return write_entity(entity, **kwargs)
+
+    monkeypatch.setattr(table, method, compete_between_read_and_cas)
+    try:
+        with second._lock, pytest.raises(SecurityStateUnavailable):
+            first.pair_device(binding, b"k" * 32)
+        assert entered
+        assert second.list_devices_for_scope(writer.namespace, "scope") == ()
+    finally:
+        if entered:
+            competing_guard.__exit__(None, None, None)
+    assert second.revoke_writer_and_devices(writer.credential_id)
+
+
+def test_pairing_guard_is_exact_scope(pairing_replicas):
+    first, second, writer, _binding, _table = pairing_replicas
+    same_namespace = first.register_writer(
+        _installation(b"owner"), "other-scope", b"w" * 32, b"s" * 32
+    )
+    other_namespace = first.register_writer(
+        _installation(b"other"), "scope", b"w" * 32, b"s" * 32
+    )
+    with first._lock, first._pairing_scope_guard_locked(writer.namespace, "scope"):
+        assert second.revoke_writer_and_devices(same_namespace.credential_id)
+        assert second.revoke_writer_and_devices(other_namespace.credential_id)
+        with pytest.raises(SecurityStateUnavailable):
+            second.revoke_writer_and_devices(writer.credential_id)
+    assert second.revoke_writer_and_devices(writer.credential_id)
+
+
+def test_expired_pairing_guard_is_reclaimable(pairing_replicas):
+    first, second, writer, _binding, _table = pairing_replicas
+    key = first._pairing_scope_guard_key(writer.namespace, "scope")
+    first._backend.write(
+        _PAIRING_SCOPE_GUARD_KIND,
+        key,
+        {"owner": "stale-holder", "expires_at": 0.0},
+    )
+
+    assert second.revoke_writer_and_devices(writer.credential_id)
+    assert second.resolve_writer(writer.credential_id) is None
+
+
+def test_scope_guard_cas_exhaustion_is_bounded_and_retryable(pairing_replicas, monkeypatch):
+    first, second, writer, _binding, table = pairing_replicas
+    with first._lock, first._pairing_scope_guard_locked(writer.namespace, "scope"):
+        pass
+    attempts = []
+
+    def conflict(entity, **kwargs):
+        assert entity["RowKey"].startswith(_PAIRING_SCOPE_GUARD_KIND + ":")
+        attempts.append(True)
+        raise _SweepStorageError(412)
+
+    with monkeypatch.context() as patch:
+        patch.setattr(table, "update_entity", conflict)
+        with pytest.raises(SecurityStateUnavailable):
+            second.revoke_writer_and_devices(writer.credential_id)
+    assert len(attempts) == 5
+    assert first.resolve_writer(writer.credential_id) is not None
+    assert second.revoke_writer_and_devices(writer.credential_id)
+
+
+@pytest.mark.parametrize("operation", ["pair", "revoke"])
+@pytest.mark.parametrize("commit_before_error", [False, True])
+def test_scope_guard_acquisition_failure_is_safe_and_bounded(
+    pairing_replicas, monkeypatch, operation, commit_before_error
+):
+    first, second, writer, binding, _table = pairing_replicas
+    update = first._backend.update
+
+    def fail_update(kind, key, transform):
+        if kind == _PAIRING_SCOPE_GUARD_KIND:
+            if commit_before_error:
+                update(kind, key, transform)
+            raise OSError("lost guard update response")
+        return update(kind, key, transform)
+
+    monkeypatch.setattr(first._backend, "update", fail_update)
+    if commit_before_error:
+        # A lost response is recoverable because the unique owner is read back
+        # before the guarded operation is admitted.
+        if operation == "pair":
+            device = first.pair_device(binding, b"k" * 32)
+            assert second.resolve_device(device.credential_id) is not None
+        else:
+            assert first.revoke_writer_and_devices(writer.credential_id)
+    else:
+        with pytest.raises(SecurityStateUnavailable):
+            if operation == "pair":
+                first.pair_device(binding, b"k" * 32)
+            else:
+                first.revoke_writer_and_devices(writer.credential_id)
+    if commit_before_error:
+        if operation == "pair":
+            assert second.resolve_writer(writer.credential_id) is not None
+            assert len(second.list_devices_for_scope(writer.namespace, "scope")) == 1
+        else:
+            assert second.resolve_writer(writer.credential_id) is None
+    else:
+        assert second.resolve_writer(writer.credential_id) is not None
+        assert second.list_devices_for_scope(writer.namespace, "scope") == ()
+        assert second.revoke_writer_and_devices(writer.credential_id)
+
+
+@pytest.mark.parametrize("operation", ["pair", "revoke"])
+@pytest.mark.parametrize("commit_before_error", [False, True])
+def test_scope_guard_release_failure_is_safe_and_bounded(
+    pairing_replicas, monkeypatch, operation, commit_before_error
+):
+    first, second, writer, binding, _table = pairing_replicas
+    update = first._backend.update
+    acquired = False
+
+    def fail_release(kind, key, transform):
+        nonlocal acquired
+        if kind == _PAIRING_SCOPE_GUARD_KIND:
+            if acquired:
+                if commit_before_error:
+                    update(kind, key, transform)
+                raise OSError("lost guard release response")
+            acquired = True
+        return update(kind, key, transform)
+
+    monkeypatch.setattr(first._backend, "update", fail_release)
+    if commit_before_error:
+        # The release response may be lost after its CAS committed; a read of
+        # owner=None proves that the scope is available for the next retry.
+        if operation == "pair":
+            device = first.pair_device(binding, b"k" * 32)
+            assert second.resolve_device(device.credential_id) is not None
+            assert second.revoke_writer_and_devices(writer.credential_id)
+        else:
+            assert first.revoke_writer_and_devices(writer.credential_id)
+        assert second.resolve_writer(writer.credential_id) is None
+    else:
+        with pytest.raises(SecurityStateUnavailable):
+            if operation == "pair":
+                first.pair_device(binding, b"k" * 32)
+            else:
+                first.revoke_writer_and_devices(writer.credential_id)
+        with pytest.raises(SecurityStateUnavailable):
+            second.revoke_writer_and_devices(writer.credential_id)
+
+
+@pytest.mark.parametrize("commit_before_error", [False, True])
+def test_device_write_failure_releases_guard_for_revoke_retry(
+    pairing_replicas, monkeypatch, commit_before_error
+):
+    first, second, writer, binding, _table = pairing_replicas
+    create = first._backend.create
+
+    def fail_device_write(kind, key, value):
+        if kind == "device":
+            if commit_before_error:
+                create(kind, key, value)
+            raise OSError("device write failed")
+        return create(kind, key, value)
+
+    monkeypatch.setattr(first._backend, "create", fail_device_write)
+    with pytest.raises(OSError, match="device write failed"):
+        first.pair_device(binding, b"k" * 32)
+    assert second.revoke_writer_and_devices(writer.credential_id)
+    assert all(
+        device.revoked and not device.active
+        for device in second.list_devices_for_scope(writer.namespace, "scope")
+    )
+
+
+@pytest.mark.parametrize("failed_kind", ["device-pairing", "device", "writer"])
+def test_partial_cascade_failure_releases_guard_for_retry(
+    pairing_replicas, monkeypatch, failed_kind
+):
+    first, second, writer, binding, _table = pairing_replicas
+    device = first.pair_device(binding, b"k" * 32)
+    code = first._pairing_registry.create(writer.namespace, "scope").code
+    write = second._backend.write
+
+    def fail_write(kind, key, value):
+        if kind == failed_kind:
+            raise OSError("cascade write failed")
+        return write(kind, key, value)
+
+    with monkeypatch.context() as patch:
+        patch.setattr(second._backend, "write", fail_write)
+        with pytest.raises(OSError, match="cascade write failed"):
+            second.revoke_writer_and_devices(writer.credential_id)
+    # A different replica can finish the partial cascade after release.
+    assert first.revoke_writer_and_devices(writer.credential_id)
+    assert second.resolve_device(device.credential_id) is None
+    assert second.resolve_writer(writer.credential_id) is None
+    assert first._pairing_registry.consume(code) is None
 
 
 def test_azure_scan_separates_kinds_that_share_a_prefix():

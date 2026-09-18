@@ -6,7 +6,13 @@ from fastapi.testclient import TestClient
 
 from wattracker.cloud import admin
 from wattracker.cloud.api import CloudConfig, CloudState, create_cloud_app
-from wattracker.cloud.security import MemorySecurityStateBackend, new_installation_id
+from wattracker.cloud.security import (
+    MemorySecurityStateBackend,
+    canonical_request,
+    digest_body,
+    new_installation_id,
+    sign_request,
+)
 
 
 SECRET = b"cloud-admin-test-server-secret-32-bytes"
@@ -307,6 +313,94 @@ def test_admin_revoke_cascades_to_same_scope_device_and_is_idempotent():
     assert state.credentials.authenticate_device(
         device.credential_id, device.subscription_key
     ) is None
+
+
+def test_admin_revoke_invalidates_preexisting_pairing_code_without_collateral():
+    backend = MemorySecurityStateBackend()
+    config = CloudConfig(
+        server_secret=SECRET,
+        operator_token=TOKEN,
+        gateway_proof_value=GATEWAY_PROOF,
+        clock=lambda: 1_000,
+    )
+    state = CloudState.create(config, security_backend=backend)
+    revoked_writer = state.credentials.register_writer(
+        new_installation_id(), "revoked-scope", b"a" * 32, b"s" * 32
+    )
+    other_writer = state.credentials.register_writer(
+        new_installation_id(), "other-scope", b"b" * 32, b"t" * 32
+    )
+
+    def mint(client, writer, nonce):
+        path = "/api/v1/devices/pairing-codes"
+        canonical = canonical_request(
+            "POST",
+            path,
+            writer.namespace,
+            1_000,
+            nonce,
+            digest_body(b""),
+            "device-pairing-code",
+            "0",
+        )
+        response = client.post(
+            path,
+            headers={
+                "Ocp-Apim-Subscription-Key": writer.subscription_key.decode(),
+                "X-Gateway-Request-Proof": GATEWAY_PROOF,
+                "X-Verified-Entra-Subject": "rider",
+                "X-Writer-Credential": writer.credential_id,
+                "X-Writer-Timestamp": "1000",
+                "X-Writer-Nonce": nonce,
+                "X-Writer-Idempotency-Key": "device-pairing-code",
+                "X-Writer-Revision": "0",
+                "X-Writer-Signature": sign_request(
+                    writer.signing_key, canonical
+                ),
+            },
+        )
+        assert response.status_code == 200, response.text
+        return response.json()["pairing_code"]
+
+    with TestClient(create_cloud_app(config, state=state)) as client:
+        revoked_code = mint(client, revoked_writer, "mint-revoked")
+        other_code = mint(client, other_writer, "mint-other")
+
+    # Rebuild around the durable backend so both invalidation and owner checks
+    # run without relying on the first process's caches.
+    restarted = CloudState.create(config, security_backend=backend)
+    common_headers = {
+        "X-Gateway-Request-Proof": GATEWAY_PROOF,
+        "X-Verified-Entra-Subject": "rider",
+    }
+    with TestClient(create_cloud_app(config, state=restarted)) as client:
+        revoked = client.post(
+            f"/api/v1/admin/installations/{revoked_writer.credential_id}/revoke",
+            headers={
+                "X-Operator-Token": TOKEN,
+                "X-Gateway-Request-Proof": GATEWAY_PROOF,
+            },
+        )
+        blocked = client.post(
+            "/api/v1/devices/pair",
+            headers=common_headers,
+            json={"code": revoked_code, "public_key": (b"x" * 32).hex()},
+        )
+        unaffected = client.post(
+            "/api/v1/devices/pair",
+            headers=common_headers,
+            json={"code": other_code, "public_key": (b"y" * 32).hex()},
+        )
+
+    assert revoked.status_code == 200
+    assert blocked.status_code == 404
+    assert blocked.json() == {"detail": "not found"}
+    assert unaffected.status_code == 200, unaffected.text
+    unaffected_device = restarted.credentials.resolve_device(
+        unaffected.json()["device_credential"]
+    )
+    assert unaffected_device is not None
+    assert unaffected_device.namespace == other_writer.namespace
 
 
 @pytest.mark.parametrize("installation_id", [
