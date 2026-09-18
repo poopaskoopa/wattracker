@@ -4,6 +4,7 @@ import com.wattracker.android.json.JsonValue
 import com.wattracker.android.json.opt
 import com.wattracker.android.json.optArray
 import com.wattracker.android.json.optString
+import org.junit.Assert
 import org.junit.Assert.assertArrayEquals
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
@@ -111,6 +112,16 @@ class EcdsaTest {
         assertEquals(Ecdsa.P256_ORDER, lowS.add(highS))
         assertTrue(lowS < Ecdsa.P256_ORDER.shiftRight(1))
         assertTrue(highS > Ecdsa.P256_ORDER.shiftRight(1))
+    }
+
+    @Test
+    fun zeroLengthIntegerThrowsEcdsaException() {
+        // A DER sequence containing an INTEGER tag (0x02) with length 0 (0x00)
+        // must throw EcdsaException, not NumberFormatException.
+        val zeroLenDer = byteArrayOf(0x30, 0x02, 0x02, 0x00)
+        Assert.assertThrows(Ecdsa.EcdsaException::class.java) {
+            Ecdsa.derToRawRorS(zeroLenDer)
+        }
     }
 
     @Test
