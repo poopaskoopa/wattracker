@@ -172,32 +172,34 @@ The list gives the **order**. GitHub gives the **state** — always
 (#234's scope grew a whole section after it was filed) and its labels move.
 If the two disagree, GitHub wins and the queue is stale; say so.
 
-1. **#316 — publish and sign the cloud image to GHCR.** The owner has
-   decided to deploy and picked GHCR + cosign keyless over ACR Basic (a fixed
-   ~$5/mo against a sub-$1 baseline). Nothing in the repo publishes an image
-   today: `cloud.yml:188` builds with `--load` and stops, and no workflow
-   mentions `ghcr` or `cosign`, while `main.bicepparam:34,36` want signed
-   immutable digests. **Build one image, not two** — both container apps run
-   `args: ['-m', 'wattracker.cloud.runtime']` (`main.bicep:225`) and differ
-   only by `WATTRACKER_CLOUD_PLANE`, so one digest fills both params. Hosted
-   `ubuntu-latest`, linux/amd64 only, and the fork-safe local build check in
-   `containerized` stays. This is the last deployment-path item that needs no
-   Azure subscription, so it goes first.
+1. **#320 — preserve kill-switch 503 responses on the cloud admin routes.**
+   Small and self-contained; take it first. The admin handlers catch
+   `Exception` and turn a kill-switch shutdown into a 404. **Check what #319
+   actually landed before starting** — its first attempt at this guard was
+   inert, because `QuotaExceeded` is a `RuntimeError` (`limits.py:603`), not an
+   `HTTPException`, so `except HTTPException: raise` never caught it, and
+   `admin_revoke_installation` had no guard at all. If #319 landed the real
+   fix, close this as done rather than redoing it; if it landed only the inert
+   guard, the fix is
+   `except (HTTPException, QuotaExceeded): raise` on both handlers, matching
+   the 503 + `Retry-After` contract `/api/v1/enrollment/start` already honors
+   (#305). Prove it with a test that raises `QuotaExceeded` from `kill_state`,
+   not one that reads the except clause. The 503 must not become an oracle:
+   it cannot distinguish a valid operator token from an invalid one, or a real
+   installation id from a fake one.
 
-2. **#169 — an operator CLI for the one-time enrollment bootstrap.**
-   Re-scoped and unblocked 2026-09-17: the CLI itself never needed a
-   deployment. `tests/test_cloud_api.py` already drives
-   `POST /api/v1/enrollment/start` through `MemoryTenantStore` +
-   `MemorySecurityStateBackend` + `TestClient`, and
-   `scripts/walking_skeleton_server.py` runs the real cloud app against an
-   in-memory store, so `invite`, `list-installations` and
-   `revoke-installation` are all verifiable offline.
-   `wattracker/cloud/admin.py` does not exist yet — this starts from nothing.
-   Two traps, both on the issue: the operator token must come from the
-   environment or the keychain and never from argv, and the non-HTTPS refusal
-   needs an explicit loopback exemption or the tool cannot be tested against
-   the walking-skeleton server, which serves plain `http://127.0.0.1`. The
-   "onboard a second real rider" criterion is split out and stays with #102.
+2. **#321 — stop persisting writer credential IDs in durable auth rows.**
+   `security.py:1669` writes `credential_id` in plaintext beside
+   `verification_key`. Harmless for the ed25519 rows `enroll_writer` mints,
+   but for the `hmac-sha256` rows `register_writer` still produces the
+   verification key *is* the symmetric secret, so one storage read yields a
+   forgeable credential — which was not true before #319. `register_writer`
+   has no non-test caller, which is why this is not urgent. Drop the field and
+   address every row by its row key; `_legacy_writer_locked`
+   (`security.py:3059`) already implements that opaque-handle representation
+   including revoke-by-handle, so follow it rather than inventing a second
+   scheme. Decide and state explicitly what happens to rows already written
+   with the field, and leave no read path that silently trusts one.
 
 3. **#249 — rotating full-suite test flakes. Still not a local-runs job.**
    Nothing has changed since the re-scope. 21 consecutive clean local full
@@ -222,13 +224,29 @@ or anything below on your own.
 - **#264** waits on #194 (Android network client). #302 closed it by accident;
   it was reopened. Its Android half is taksmon's.
 - **#102, #168, #217, #242** are `blocked` on the hosting decision or a
-  live deployment. **#169 is no longer among them** — see item 1.
+  live deployment.
+- **#322** (deregister the Windows-TT self-hosted runner) is taksmon's
+  machine, so it routes to him.
 - **#170** (scope wipe) landed its repository half in PR #312 (`9a66743`) and
   stays open and `blocked` for the part that needs a live deployment. The
   `#102` "known-open code items" continue in the Claude session, which owns
   `wattracker/cloud/storage.py` and `wattracker/cloud/limits.py`.
 
-**Done since this list was last written (2026-09-15 → 09-17).**
+**Done since this list was last written (2026-09-17 → 09-18).**
+- **#316** merged as PR #318 (`f9d13ee`). `.github/workflows/cloud-publish.yml`
+  builds `Dockerfile.cloud` for `linux/amd64` on pushes to `main`, publishes to
+  GHCR, signs the digest with keyless cosign and verifies it in the same run.
+  The first run produced
+  `ghcr.io/poopaskoopa/wattracker-cloud@sha256:8f81259c8a468650944e0dde9464b8a6b439b61cfb272869c44f231369057e96`,
+  which fills **both** `readImage` and `syncImage`. Two owner steps remain
+  before a deploy can pin it: flip the GHCR package to Public (it is private on
+  first push and the workflow cannot change that), and confirm the digest
+  actually pulls on Container Apps — buildx's default provenance makes it an
+  index digest.
+- **#169** is implemented in PR #319 (`wattracker/cloud/admin.py`). #320 and
+  #321 were filed from its review, which is why they are items 1 and 2.
+
+**Done earlier (2026-09-15 → 09-17).**
 - **#305** merged as PR #313 (`89da4f3`) and **#307** as PR #314 (`30761c7`).
   Both were written by codex on 2026-09-15 and pushed to `agent2/*` **without
   a PR ever being opened**, so the queue looked untouched while the work sat
