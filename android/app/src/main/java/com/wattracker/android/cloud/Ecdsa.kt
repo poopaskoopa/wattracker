@@ -62,6 +62,7 @@ object Ecdsa {
             pos++
             val intLen = byteAt()
             pos++
+            if (intLen == 0) fail("zero-length INTEGER")
             if (intLen and 0x80 != 0) fail("long-form INTEGER length")
             if (pos + intLen > der.size) fail("INTEGER runs past the buffer")
             val bytes = der.copyOfRange(pos, pos + intLen)
