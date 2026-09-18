@@ -99,7 +99,11 @@ class InMemorySnapshotCache(
     override fun store(received: List<CloudItem>, revision: Int, route: CloudRoute, full: Boolean, generation: Long) {
         synchronized(lock) {
             if (!gate.accepts(generation)) return
-            val items = if (full) received.sortedBy { it.id } else merge(received, backing[route])
+            val items = if (full) {
+                received.filter { !it.deleted }.sortedBy { it.id }
+            } else {
+                merge(received, backing[route])
+            }
             backing[route] = CachedCollection(revision, items, clock())
             gate.commit(generation)
         }
