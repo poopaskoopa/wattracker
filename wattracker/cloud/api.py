@@ -988,9 +988,11 @@ def create_cloud_app(
                     MAX_WRITER_LISTING,
                 )
                 writers = state.credentials.list_writers(limit=limit)
+            except (HTTPException, QuotaExceeded):
+                raise
             except Exception:
-                # Keep every admin failure opaque.  #320 owns preserving the
-                # intended 503 response for unavailable quota/security state.
+                # Keep unrelated admin failures opaque while allowing the
+                # app-level handlers to preserve expected responses.
                 return _not_found()
             installations = [
                 {
@@ -1019,9 +1021,10 @@ def create_cloud_app(
                     return _not_found()
                 if not state.credentials.revoke_writer_and_devices(installation_id):
                     return _not_found()
+            except (HTTPException, QuotaExceeded):
+                raise
             except Exception:
-                # As above, #320 owns preserving intentional 503s; until then
-                # a storage or partial-cascade failure remains fail-closed.
+                # Storage and partial-cascade failures remain fail-closed.
                 return _not_found()
             return JSONResponse(
                 {

@@ -6,6 +6,11 @@ from fastapi.testclient import TestClient
 
 from wattracker.cloud import admin
 from wattracker.cloud.api import CloudConfig, CloudState, create_cloud_app
+from wattracker.cloud.limits import (
+    PUBLIC_UNAVAILABLE_DETAIL,
+    PUBLIC_UNAVAILABLE_RETRY_AFTER,
+    QuotaExceeded,
+)
 from wattracker.cloud.security import (
     MemorySecurityStateBackend,
     canonical_request,
@@ -18,6 +23,22 @@ from wattracker.cloud.security import (
 SECRET = b"cloud-admin-test-server-secret-32-bytes"
 TOKEN = "operator-token-for-admin-tests"
 GATEWAY_PROOF = "gateway-proof-for-admin-tests"
+
+
+def _raise_public_unavailable():
+    raise QuotaExceeded(
+        PUBLIC_UNAVAILABLE_DETAIL,
+        status_code=503,
+        retry_after=PUBLIC_UNAVAILABLE_RETRY_AFTER,
+    )
+
+
+def _admin_response_contract(response):
+    return (
+        response.status_code,
+        response.content,
+        response.headers.get("Retry-After"),
+    )
 
 
 @pytest.mark.parametrize(
@@ -261,6 +282,75 @@ def test_admin_requires_gateway_proof_in_addition_to_operator_token():
     assert correct.status_code == 200
     assert missing_revoke.status_code == 404
     assert correct_revoke.status_code == 200
+
+
+def test_admin_list_preserves_kill_switch_503_for_any_operator_token(monkeypatch):
+    config = CloudConfig(
+        server_secret=SECRET,
+        operator_token=TOKEN,
+        gateway_proof_value=GATEWAY_PROOF,
+    )
+    state = CloudState.create(config)
+    monkeypatch.setattr(state.quotas, "kill_state", _raise_public_unavailable)
+
+    with TestClient(create_cloud_app(config, state=state)) as client:
+        responses = [
+            client.get(
+                "/api/v1/admin/installations",
+                headers={
+                    "X-Operator-Token": token,
+                    "X-Gateway-Request-Proof": GATEWAY_PROOF,
+                },
+            )
+            for token in (TOKEN, "wrong-token")
+        ]
+
+    assert [_admin_response_contract(response) for response in responses] == [
+        (
+            503,
+            b'{"detail":"public API unavailable"}',
+            str(PUBLIC_UNAVAILABLE_RETRY_AFTER),
+        ),
+    ] * 2
+    assert all(response.json() == {"detail": PUBLIC_UNAVAILABLE_DETAIL} for response in responses)
+
+
+def test_admin_revoke_preserves_kill_switch_503_without_an_installation_or_token_oracle(
+    monkeypatch,
+):
+    config = CloudConfig(
+        server_secret=SECRET,
+        operator_token=TOKEN,
+        gateway_proof_value=GATEWAY_PROOF,
+    )
+    state = CloudState.create(config)
+    writer = state.credentials.register_writer(
+        new_installation_id(), "rider-scope", b"w" * 32, b"s" * 32
+    )
+    fake_installation_id = "f" * 64
+    monkeypatch.setattr(state.quotas, "kill_state", _raise_public_unavailable)
+
+    with TestClient(create_cloud_app(config, state=state)) as client:
+        responses = [
+            client.post(
+                f"/api/v1/admin/installations/{installation_id}/revoke",
+                headers={
+                    "X-Operator-Token": token,
+                    "X-Gateway-Request-Proof": GATEWAY_PROOF,
+                },
+            )
+            for token in (TOKEN, "wrong-token")
+            for installation_id in (writer.credential_id, fake_installation_id)
+        ]
+
+    assert [_admin_response_contract(response) for response in responses] == [
+        (
+            503,
+            b'{"detail":"public API unavailable"}',
+            str(PUBLIC_UNAVAILABLE_RETRY_AFTER),
+        ),
+    ] * 4
+    assert all(response.json() == {"detail": PUBLIC_UNAVAILABLE_DETAIL} for response in responses)
 
 
 def test_admin_revoke_cascades_to_same_scope_device_and_is_idempotent():
