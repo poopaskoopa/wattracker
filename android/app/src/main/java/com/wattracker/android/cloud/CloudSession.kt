@@ -176,6 +176,9 @@ class CloudSession(
         }
         onIo { cache.removeAll(newGeneration.toLong()) }
         onIo { credentials.save(pairing.device) }
+        onIo { removalGate.clearPending() }
+        val expiresIn = pairing.expiresIn?.takeIf { it > 0.0 } ?: defaultContextLifetime
+        val effectiveExpiresIn = min(expiresIn, maximumContextLifetime)
         return mutex.withLock {
             if (lifecycleGeneration != newGeneration) throw lifecycleFailure()
             device = pairing.device
@@ -184,7 +187,7 @@ class CloudSession(
             token = ReaderToken(
                 value = pairing.initialReaderContext,
                 generation = mintCount,
-                expiresAt = now() + (min(pairing.expiresIn ?: defaultContextLifetime, maximumContextLifetime) * 1000).toLong(),
+                expiresAt = now() + (effectiveExpiresIn * 1000).toLong(),
             )
             consecutiveFailures = 0
             consecutiveRejections = 0

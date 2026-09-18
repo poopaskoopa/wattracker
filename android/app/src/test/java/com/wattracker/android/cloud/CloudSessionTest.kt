@@ -44,6 +44,7 @@ class CloudSessionTest {
     private lateinit var store: InMemoryDeviceCredentialStore
     private lateinit var cache: InMemorySnapshotCache
     private lateinit var transport: FakeTransport
+    private lateinit var removalGate: InMemoryRemovalGate
     private lateinit var session: CloudSession
 
     @Before
@@ -63,11 +64,13 @@ class CloudSessionTest {
         store = credentialStore
         cache = InMemorySnapshotCache({ nowMillis })
         transport = FakeTransport(responder)
+        removalGate = InMemoryRemovalGate()
         val client = CloudClient("http", "host", signer, transport) { nowMillis / 1000 }
         session = CloudSession(
             client = client,
             credentials = credentialStore,
             cache = cache,
+            removalGate = removalGate,
             clock = { nowMillis },
             random = { 0.5 },
         )
@@ -97,6 +100,34 @@ class CloudSessionTest {
         assertEquals(CloudSession.DeviceState.paired, session.deviceState)
         // A new identity starts from nothing: the prior scope's checkpoint is gone.
         assertNull(cache.load(CloudRoute.Dashboard))
+    }
+
+    @Test
+    fun pairingClearsPendingRemovalGate() = runTest {
+        makeSession { request ->
+            if (request.url.endsWith("/devices/pair")) {
+                CloudResponse(200, pairingJson().toByteArray(), null, nowMillis)
+            } else {
+                throw AssertionError("unexpected request ${request.url}")
+            }
+        }
+        removalGate.markPending()
+        assertTrue(removalGate.isPending())
+        session.pair("THE-CODE", "bike phone")
+        assertFalse(removalGate.isPending())
+    }
+
+    @Test
+    fun pairingWithZeroExpiresInUsesDefaultLifetime() = runTest {
+        makeSession { request ->
+            if (request.url.endsWith("/devices/pair")) {
+                CloudResponse(200, pairingJson(expiresIn = 0.0).toByteArray(), null, nowMillis)
+            } else {
+                throw AssertionError("unexpected request ${request.url}")
+            }
+        }
+        session.pair("THE-CODE", "bike phone")
+        assertEquals(CloudSession.DeviceState.paired, session.deviceState)
     }
 
     // MARK: - Reads
@@ -613,8 +644,8 @@ class CloudSessionTest {
 
     // MARK: - JSON builders
 
-    private fun pairingJson(): String =
-        """{"device_credential":"cred-1","device_subscription_key":"sub-1","device_signature_algorithm":"ecdsa-p256-sha256","device_capabilities":["read"],"signing_namespace":"$signingNamespace","reader_context":"ctx-1","expires_in":300}"""
+    private fun pairingJson(expiresIn: Double = 300.0): String =
+        """{"device_credential":"cred-1","device_subscription_key":"sub-1","device_signature_algorithm":"ecdsa-p256-sha256","device_capabilities":["read"],"signing_namespace":"$signingNamespace","reader_context":"ctx-1","expires_in":$expiresIn}"""
 
     private fun refreshJson(context: String, expiresIn: Double): String =
         """{"reader_context":"$context","expires_in":$expiresIn}"""
