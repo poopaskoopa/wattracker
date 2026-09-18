@@ -16,8 +16,9 @@ import re
 import secrets
 import threading
 import time
+from contextlib import contextmanager
 from dataclasses import dataclass, field, replace
-from typing import Any, Callable, Final, Mapping, Protocol
+from typing import Any, Callable, Final, Iterator, Mapping, Protocol
 
 
 _log = logging.getLogger(__name__)
@@ -95,6 +96,8 @@ DEFAULT_DEVICE_PAIRING_TTL_SECONDS: Final = 600.0
 MAX_DEVICE_PAIRING_TTL_SECONDS: Final = 900.0
 _PAIRING_CODE_DOMAIN: Final = b"wattracker-cloud-device-pairing-code-v1\x00"
 _PAIRING_RECORD_KIND: Final = "device-pairing"
+_PAIRING_SCOPE_GUARD_KIND: Final = "pairing-scope-guard"
+_PAIRING_SCOPE_GUARD_TTL_SECONDS: Final = 60.0
 
 # ---------------------------------------------------------------------------
 # Record kinds, and which of them the expired-row sweep may remove
@@ -127,6 +130,7 @@ NEVER_SWEEP_RECORD_KINDS: Final = frozenset({
     "quota-counter",  # absent reads as zero -- deleting hands out free quota
     "writer",         # durable credentials; revocation is an update, not a delete
     "device",
+    _PAIRING_SCOPE_GUARD_KIND,
     DEVICE_SEEN_RECORD_KIND,
     "health",         # the startup access probe
 })
@@ -156,6 +160,9 @@ _MAX_DEVICE_LABEL: Final = 48
 # Two riders, four devices.  The ceiling exists so a listing is bounded by
 # something other than what happens to be in the table.
 MAX_DEVICE_LISTING: Final = 64
+# The operator listing is bounded by the registry capacity, but this public
+# bound keeps the response contract explicit for callers and tests.
+MAX_WRITER_LISTING: Final = 64
 
 
 class SecurityStateUnavailable(RuntimeError):
@@ -1524,6 +1531,10 @@ class DeviceCredential:
     # rather than here (see ``CredentialRegistry.record_device_seen``).
     label: str | None = field(default=None, repr=False, compare=False)
     created_at: float = field(default=0.0, repr=False, compare=False)
+    # Pairing-issued devices carry the writer that authorized them.  Legacy
+    # and direct registration rows leave this unset and retain their existing
+    # independent-device semantics.
+    pairing_writer_id: str | None = field(default=None, repr=False, compare=False)
 
     def __post_init__(self) -> None:
         _require_opaque_id(self.credential_id, "credential_id")
@@ -1556,6 +1567,8 @@ class DeviceCredential:
         )
         if self.subject is not None:
             _require_text(self.subject, "subject")
+        if self.pairing_writer_id is not None:
+            _require_opaque_id(self.pairing_writer_id, "pairing_writer_id")
         if self.active == self.revoked:
             raise ValueError("credential status is invalid")
 
@@ -1663,6 +1676,13 @@ def _writer_value(credential: WriterCredential) -> dict[str, Any]:
         credential.subscription_key
     )
     return {
+        # The row key is sha256(credential_id), so retaining the opaque id in
+        # the value is necessary for a durable operator listing.  It is an
+        # identifier, not sufficient proof by itself: both Ed25519 enrollment
+        # rows and legacy/register_writer HMAC rows require their configured
+        # signing and subscription factors.  The id is checked against the row
+        # address when listing records.
+        "credential_id": credential.credential_id,
         "namespace": credential.namespace,
         "local_user_scope": credential.local_user_scope,
         "verification_key": _encode_bytes(credential.verification_key),
@@ -1678,6 +1698,9 @@ def _writer_value(credential: WriterCredential) -> dict[str, Any]:
 def _writer_from_value(
     credential_id: str, value: Mapping[str, Any]
 ) -> WriterCredential:
+    stored_id = value.get("credential_id", credential_id)
+    if not isinstance(stored_id, str) or not hmac.compare_digest(stored_id, credential_id):
+        raise ValueError("persisted credential id is invalid")
     subject = value.get("subject")
     capabilities = value.get("capabilities")
     return WriterCredential(
@@ -1725,6 +1748,7 @@ def _device_value(credential: DeviceCredential) -> dict[str, Any]:
         "active": credential.active,
         "revoked": credential.revoked,
         "subject": credential.subject,
+        "pairing_writer_id": credential.pairing_writer_id,
     }
 
 
@@ -1753,6 +1777,7 @@ def _device_from_value(
     credential_id: str, value: Mapping[str, Any]
 ) -> DeviceCredential:
     subject = value.get("subject")
+    pairing_writer_id = value.get("pairing_writer_id")
     label = value.get("label")
     created_at = value.get("created_at", 0.0)
     # A persisted record without an explicit capability set is not assumed to
@@ -1770,6 +1795,11 @@ def _device_from_value(
         active=bool(value["active"]),
         revoked=bool(value["revoked"]),
         subject=None if subject is None else _require_text(subject, "subject"),
+        pairing_writer_id=(
+            None
+            if pairing_writer_id is None
+            else _require_opaque_id(pairing_writer_id, "pairing_writer_id")
+        ),
         label=None if label is None else _require_device_label(label),
         created_at=(
             0.0 if created_at is None
@@ -2313,6 +2343,9 @@ class DevicePairingRegistry:
                 if value is None:
                     hmac.compare_digest(supplied, _DUMMY_DIGEST)
                     return None
+                if bool(value.get("revoked", False)):
+                    hmac.compare_digest(supplied, _DUMMY_DIGEST)
+                    return None
                 try:
                     record = _pairing_from_value(value)
                 except (KeyError, TypeError, ValueError):
@@ -2358,6 +2391,51 @@ class DevicePairingRegistry:
                 proof,
                 record.subject,
             )
+
+    def invalidate_scope(self, namespace: str, local_user_scope: str) -> int:
+        """Make every outstanding code for one server-derived scope unusable.
+
+        Durable rows are marked rather than deleted so an old code cannot
+        become valid again if its random value is ever generated a second
+        time.  Malformed rows are already unredeemable and are left untouched;
+        rows from every other scope are never written.
+        """
+
+        namespace_text = _require_namespace(namespace)
+        scope_text = _require_local_scope(local_user_scope)
+        invalidated = 0
+        with self._lock:
+            if self._backend is not None:
+                rows = self._backend.iter_records(
+                    _PAIRING_RECORD_KIND, limit=self._capacity
+                )
+                for row_key, value in rows:
+                    if not isinstance(value, Mapping):
+                        continue
+                    try:
+                        record = _pairing_from_value(value)
+                    except (KeyError, TypeError, ValueError):
+                        continue
+                    if not (
+                        hmac.compare_digest(record.namespace, namespace_text)
+                        and hmac.compare_digest(record.local_user_scope, scope_text)
+                    ):
+                        continue
+                    if bool(value.get("revoked", False)):
+                        continue
+                    revoked = dict(value)
+                    revoked["revoked"] = True
+                    self._backend.write(_PAIRING_RECORD_KIND, row_key, revoked)
+                    invalidated += 1
+                return invalidated
+
+            for digest, record in tuple(self._records.items()):
+                if hmac.compare_digest(
+                    record.namespace, namespace_text
+                ) and hmac.compare_digest(record.local_user_scope, scope_text):
+                    del self._records[digest]
+                    invalidated += 1
+        return invalidated
 
     def _proof_for(
         self,
@@ -2419,6 +2497,7 @@ class CredentialRegistry:
         self._device_seen: dict[bytes, float] = {}
         self._contexts: dict[bytes, _ContextRecord] = {}
         self._contexts_by_id: dict[bytes, bytes] = {}
+        self._pairing_guard_context: tuple[str, str, str] | None = None
 
     @staticmethod
     def _credential_digest(credential_id: str) -> bytes:
@@ -2427,6 +2506,145 @@ class CredentialRegistry:
     @staticmethod
     def _context_digest(context_id: str) -> bytes:
         return _digest_token(context_id)
+
+    @contextmanager
+    def _pairing_scope_guard_locked(
+        self, namespace: str, local_user_scope: str
+    ) -> Iterator[str]:
+        """Serialize pairing and admin revoke across replicas; never wait.
+
+        The caller holds the local RLock.  Durable ownership is acquired and
+        released by CAS, with no side effects inside the replayable transform.
+        The row is reused, not deleted (runtime identities cannot delete), and
+        expires so an owner whose response was lost or whose process died does
+        not strand the scope forever.  The owner is a random fence token: a
+        holder must still own the guard immediately before its device write.
+        """
+        namespace_text = _require_namespace(namespace)
+        scope_text = _require_local_scope(local_user_scope)
+        if self._backend is None:
+            yield ""
+            return
+        key = self._pairing_scope_guard_key(namespace_text, scope_text)
+        owner = _new_id()
+        acquired_at = self._clock()
+
+        def acquire(value: Mapping[str, Any] | None) -> Mapping[str, Any]:
+            if value is not None:
+                current_owner = value.get("owner", "invalid")
+                try:
+                    expires_at = float(value["expires_at"])
+                except (KeyError, TypeError, ValueError) as exc:
+                    raise SecurityStateUnavailable(
+                        "pairing scope guard is invalid"
+                    ) from exc
+                if current_owner is not None:
+                    if expires_at > acquired_at:
+                        raise SecurityStateUnavailable("pairing scope is busy")
+            return {
+                "owner": owner,
+                "expires_at": acquired_at + _PAIRING_SCOPE_GUARD_TTL_SECONDS,
+            }
+
+        def release(value: Mapping[str, Any] | None) -> Mapping[str, Any]:
+            if value is None or value.get("owner") != owner:
+                raise SecurityStateUnavailable("pairing scope ownership changed")
+            return {"owner": None, "expires_at": 0.0}
+
+        try:
+            self._backend.update(_PAIRING_SCOPE_GUARD_KIND, key, acquire)
+        except Exception as exc:
+            # Azure can commit the CAS and lose its response.  A read-back of
+            # this operation's unique owner distinguishes that case from a
+            # failed acquisition without ever accepting somebody else's row.
+            try:
+                current = self._backend.read(_PAIRING_SCOPE_GUARD_KIND, key)
+            except Exception as read_exc:
+                raise SecurityStateUnavailable(
+                    "pairing scope guard unavailable"
+                ) from read_exc
+            if not (
+                isinstance(current, Mapping)
+                and current.get("owner") == owner
+            ):
+                raise SecurityStateUnavailable(
+                    "pairing scope guard unavailable"
+                ) from exc
+        try:
+            yield owner
+        finally:
+            try:
+                self._backend.update(_PAIRING_SCOPE_GUARD_KIND, key, release)
+            except Exception as exc:
+                try:
+                    current = self._backend.read(_PAIRING_SCOPE_GUARD_KIND, key)
+                except Exception as read_exc:
+                    raise SecurityStateUnavailable(
+                        "pairing scope guard unavailable"
+                    ) from read_exc
+                if not (
+                    isinstance(current, Mapping) and current.get("owner") is None
+                ):
+                    try:
+                        self._backend.update(_PAIRING_SCOPE_GUARD_KIND, key, release)
+                    except Exception as retry_exc:
+                        raise SecurityStateUnavailable(
+                            "pairing scope guard unavailable"
+                        ) from retry_exc
+
+    @staticmethod
+    def _pairing_scope_guard_key(namespace: str, local_user_scope: str) -> str:
+        return hashlib.sha256(
+            json.dumps([namespace, local_user_scope], separators=(",", ":")).encode()
+        ).hexdigest()
+
+    def _renew_pairing_scope_guard_locked(
+        self, namespace: str, local_user_scope: str, owner: str
+    ) -> None:
+        """Fence a guarded write against an expired or replaced owner."""
+
+        if self._backend is None:
+            return
+        key = self._pairing_scope_guard_key(namespace, local_user_scope)
+        now = self._clock()
+
+        def renew(value: Mapping[str, Any] | None) -> Mapping[str, Any]:
+            if not isinstance(value, Mapping) or value.get("owner") != owner:
+                raise SecurityStateUnavailable("pairing scope ownership changed")
+            try:
+                expires_at = float(value["expires_at"])
+            except (KeyError, TypeError, ValueError) as exc:
+                raise SecurityStateUnavailable(
+                    "pairing scope guard is invalid"
+                ) from exc
+            if expires_at <= now:
+                raise SecurityStateUnavailable("pairing scope guard expired")
+            return {
+                "owner": owner,
+                "expires_at": now + _PAIRING_SCOPE_GUARD_TTL_SECONDS,
+            }
+
+        try:
+            self._backend.update(_PAIRING_SCOPE_GUARD_KIND, key, renew)
+        except Exception as exc:
+            try:
+                current = self._backend.read(_PAIRING_SCOPE_GUARD_KIND, key)
+            except Exception as read_exc:
+                raise SecurityStateUnavailable(
+                    "pairing scope guard unavailable"
+                ) from read_exc
+            try:
+                still_owned = (
+                    isinstance(current, Mapping)
+                    and current.get("owner") == owner
+                    and float(current.get("expires_at", 0)) > now
+                )
+            except (TypeError, ValueError):
+                still_owned = False
+            if not still_owned:
+                raise SecurityStateUnavailable(
+                    "pairing scope guard unavailable"
+                ) from exc
 
     def _find_writer_locked(self, credential_id: str) -> WriterCredential | None:
         supplied = self._credential_digest(credential_id)
@@ -2596,7 +2814,10 @@ class CredentialRegistry:
         if not isinstance(credential_id, str) or _HEX_ID_RE.fullmatch(credential_id) is None:
             return None
         with self._lock:
-            return self._find_writer_locked(credential_id)
+            writer = self._find_writer_locked(credential_id)
+            if writer is not None:
+                return writer
+            return self._legacy_writer_locked(credential_id)
 
     def get_writer(self, credential_id: str) -> WriterCredential | None:
         """Resolve only active writers; unknown and revoked are both ``None``."""
@@ -2628,13 +2849,142 @@ class CredentialRegistry:
         if not isinstance(credential_id, str) or _HEX_ID_RE.fullmatch(credential_id) is None:
             return False
         with self._lock:
-            digest = self._credential_digest(credential_id)
             credential = self._find_writer_locked(credential_id)
-            if credential is None or credential.revoked:
+            if credential is not None:
+                if credential.revoked:
+                    return False
+                self._write_writer_locked(
+                    replace(credential, active=False, revoked=True)
+                )
+                return True
+            if self._backend is None:
                 return False
-            self._write_writer_locked(
-                replace(credential, active=False, revoked=True)
+            legacy = self._legacy_writer_locked(credential_id)
+            if legacy is None or legacy.revoked:
+                return False
+
+            def revoke_legacy(value: Mapping[str, Any] | None) -> Mapping[str, Any]:
+                if not isinstance(value, Mapping) or "credential_id" in value:
+                    raise ValueError("legacy writer row is invalid")
+                try:
+                    current = _writer_from_value(credential_id, value)
+                except (KeyError, TypeError, ValueError) as exc:
+                    raise ValueError("legacy writer row is invalid") from exc
+                if current.revoked:
+                    raise ValueError("legacy writer row is already revoked")
+                updated = dict(value)
+                updated["active"] = False
+                updated["revoked"] = True
+                return updated
+
+            self._backend.update("writer", credential_id, revoke_legacy)
+            return True
+
+    def revoke_writer_and_devices(self, credential_id: str) -> bool:
+        """Revoke a writer and every paired device in its scope.
+
+        A known writer is an idempotent target: an already-revoked writer and
+        already-revoked devices still produce success.  Outstanding pairing
+        codes and device rows are invalidated before the writer so a cascade
+        failure never leaves this method reporting success, and a retry can
+        finish a partial cascade.  Legacy writer rows are updated in place
+        without adding a credential id, so their durable operator handle
+        remains the row key.
+        """
+
+        if not isinstance(credential_id, str) or _HEX_ID_RE.fullmatch(credential_id) is None:
+            return False
+        with self._lock:
+            writer = self.lookup_writer(credential_id)
+            if writer is None:
+                return False
+            with self._pairing_scope_guard_locked(
+                writer.namespace, writer.local_user_scope
+            ) as guard_owner:
+                return self._revoke_writer_and_devices_locked(
+                    credential_id, writer, guard_owner
+                )
+
+    def _revoke_writer_and_devices_locked(
+        self,
+        credential_id: str,
+        expected: WriterCredential,
+        guard_owner: str,
+    ) -> bool:
+        # Re-read under the shared guard: another replica may have updated
+        # the writer since the lookup used only to choose the guard's scope.
+        with self._lock:
+            writer = self._find_writer_locked(credential_id)
+            legacy = False
+            if writer is None and self._backend is not None:
+                writer = self._legacy_writer_locked(credential_id)
+                legacy = writer is not None
+            if writer is None:
+                return False
+            if (
+                writer.namespace != expected.namespace
+                or writer.local_user_scope != expected.local_user_scope
+            ):
+                raise SecurityStateUnavailable("writer scope changed during revocation")
+
+            self._renew_pairing_scope_guard_locked(
+                writer.namespace, writer.local_user_scope, guard_owner
             )
+            if self._pairing_registry is not None:
+                self._pairing_registry.invalidate_scope(
+                    writer.namespace, writer.local_user_scope
+                )
+
+            devices = self._all_devices_for_scope_locked(
+                writer.namespace, writer.local_user_scope
+            )
+            for device in devices:
+                current = self._find_device_locked(device.credential_id)
+                if current is None:
+                    raise RuntimeError("device disappeared during writer revocation")
+                if not self._matches_scope(
+                    current, writer.namespace, writer.local_user_scope
+                ):
+                    raise RuntimeError("device scope changed during writer revocation")
+                if current.revoked and not current.active:
+                    continue
+                self._renew_pairing_scope_guard_locked(
+                    writer.namespace, writer.local_user_scope, guard_owner
+                )
+                self._write_device_locked(
+                    replace(current, active=False, revoked=True)
+                )
+
+            if writer.revoked and not writer.active:
+                return True
+            if legacy:
+                if self._backend is None:  # pragma: no cover - guarded above
+                    raise RuntimeError("legacy writer requires durable backend")
+
+                self._renew_pairing_scope_guard_locked(
+                    writer.namespace, writer.local_user_scope, guard_owner
+                )
+
+                def revoke_legacy(value: Mapping[str, Any] | None) -> Mapping[str, Any]:
+                    if not isinstance(value, Mapping) or "credential_id" in value:
+                        raise ValueError("legacy writer row is invalid")
+                    try:
+                        current = _writer_from_value(credential_id, value)
+                    except (KeyError, TypeError, ValueError) as exc:
+                        raise ValueError("legacy writer row is invalid") from exc
+                    updated = dict(value)
+                    updated["active"] = False
+                    updated["revoked"] = True
+                    return updated
+
+                self._backend.update("writer", credential_id, revoke_legacy)
+            else:
+                self._renew_pairing_scope_guard_locked(
+                    writer.namespace, writer.local_user_scope, guard_owner
+                )
+                self._write_writer_locked(
+                    replace(writer, active=False, revoked=True)
+                )
             return True
 
     revoke = revoke_writer
@@ -2662,6 +3012,9 @@ class CredentialRegistry:
         return found_device
 
     def _store_device_locked(self, credential: DeviceCredential) -> None:
+        guard = self._pairing_guard_context
+        if guard is not None:
+            self._renew_pairing_scope_guard_locked(*guard)
         digest = self._credential_digest(credential.credential_id)
         if len(self._devices) >= self._capacity and digest not in self._devices:
             raise RuntimeError("credential capacity is full")
@@ -2689,6 +3042,7 @@ class CredentialRegistry:
         subscription_key: bytes | None = None,
         subject: str | None = None,
         label: object = None,
+        pairing_writer_id: str | None = None,
     ) -> DeviceCredential:
         """Pair a device against an already server-derived namespace.
 
@@ -2721,6 +3075,7 @@ class CredentialRegistry:
             subject=subject_text,
             label=label_text,
             created_at=float(self._clock()),
+            pairing_writer_id=pairing_writer_id,
         )
         with self._lock:
             self._store_device_locked(credential)
@@ -2782,16 +3137,45 @@ class CredentialRegistry:
         registry = pairing_registry or self._pairing_registry
         if registry is not None and not registry.verify_binding(binding):
             raise ValueError("invalid pairing binding")
-        return self.register_device_for_scope(
-            binding.namespace,
-            binding.local_user_scope,
-            public_key,
-            signature_algorithm=signature_algorithm,
-            capabilities=capabilities,
-            subscription_key=subscription_key,
-            subject=binding.subject if subject is None else subject,
-            label=label,
-        )
+        with self._lock, self._pairing_scope_guard_locked(
+            binding.namespace, binding.local_user_scope
+        ) as guard_owner:
+            # The shared guard covers both the owner check and the device
+            # write, including when an admin revoke runs on another replica.
+            owner = self._active_writer_for_scope_locked(
+                binding.namespace, binding.local_user_scope
+            )
+            if owner is None:
+                raise ValueError("pairing owner is revoked")
+            self._renew_pairing_scope_guard_locked(
+                binding.namespace, binding.local_user_scope, guard_owner
+            )
+            previous_guard = self._pairing_guard_context
+            self._pairing_guard_context = (
+                binding.namespace, binding.local_user_scope, guard_owner
+            )
+            try:
+                device = self.register_device_for_scope(
+                    binding.namespace,
+                    binding.local_user_scope,
+                    public_key,
+                    signature_algorithm=signature_algorithm,
+                    capabilities=capabilities,
+                    subscription_key=subscription_key,
+                    subject=binding.subject if subject is None else subject,
+                    label=label,
+                    pairing_writer_id=owner.credential_id,
+                )
+                # The backend create can lose the lease between its last
+                # renewal and the write.  Fence the result before exposing a
+                # credential to the caller; a retryable failure is safer than
+                # returning a device that was paired after its writer died.
+                self._renew_pairing_scope_guard_locked(
+                    binding.namespace, binding.local_user_scope, guard_owner
+                )
+                return device
+            finally:
+                self._pairing_guard_context = previous_guard
 
     def lookup_device(self, credential_id: str) -> DeviceCredential | None:
         """Resolve a device regardless of status; used by revocation tooling."""
@@ -2826,6 +3210,7 @@ class CredentialRegistry:
                 or not credential.active
                 or credential.revoked
                 or (namespace is not None and credential.namespace != namespace)
+                or not self._device_owner_active_locked(credential)
             ):
                 return None
             return credential
@@ -2955,17 +3340,197 @@ class CredentialRegistry:
                     except (KeyError, TypeError, ValueError):
                         continue
                     if self._matches_scope(credential, namespace_text, scope_text):
+                        if not self._device_owner_active_locked(credential):
+                            credential = replace(credential, active=False, revoked=True)
                         found.append(credential)
                         if len(found) >= bound:
                             break
             else:
                 for credential in self._devices.values():
                     if self._matches_scope(credential, namespace_text, scope_text):
+                        if not self._device_owner_active_locked(credential):
+                            credential = replace(credential, active=False, revoked=True)
                         found.append(credential)
                         if len(found) >= bound:
                             break
         found.sort(key=lambda item: (item.created_at, item.credential_id))
         return tuple(found)
+
+    def _all_devices_for_scope_locked(
+        self, namespace: str, local_user_scope: str
+    ) -> tuple[DeviceCredential, ...]:
+        """Read every device in a scope, failing closed on malformed rows."""
+
+        namespace_text = _require_namespace(namespace)
+        scope_text = _require_local_scope(local_user_scope)
+        found: list[DeviceCredential] = []
+        if self._backend is not None:
+            rows = self._backend.iter_records("device", limit=self._capacity)
+            for row_key, value in rows:
+                if not isinstance(value, Mapping):
+                    raise RuntimeError("device record is invalid")
+                stored_id = _device_id_from_value(row_key, value)
+                if stored_id is None:
+                    raise RuntimeError("device record identity is invalid")
+                try:
+                    credential = _device_from_value(stored_id, value)
+                except (KeyError, TypeError, ValueError) as exc:
+                    raise RuntimeError("device record is invalid") from exc
+                if self._matches_scope(credential, namespace_text, scope_text):
+                    found.append(credential)
+        else:
+            found.extend(
+                credential
+                for credential in self._devices.values()
+                if self._matches_scope(credential, namespace_text, scope_text)
+            )
+        return tuple(found)
+
+    def _active_writer_for_scope_locked(
+        self, namespace: str, local_user_scope: str
+    ) -> WriterCredential | None:
+        """Return a valid active writer for this exact scope, if any."""
+
+        namespace_text = _require_namespace(namespace)
+        scope_text = _require_local_scope(local_user_scope)
+        writers: list[WriterCredential] = []
+        if self._backend is not None:
+            for row_key, value in self._backend.iter_records(
+                "writer", limit=self._capacity
+            ):
+                if not isinstance(value, Mapping):
+                    continue
+                stored_id = value.get("credential_id")
+                if stored_id is None:
+                    writer = self._legacy_writer_locked(row_key, value=value)
+                else:
+                    writer = None
+                    if (
+                        isinstance(stored_id, str)
+                        and _HEX_ID_RE.fullmatch(stored_id) is not None
+                        and _HEX_ID_RE.fullmatch(row_key) is not None
+                        and hmac.compare_digest(
+                            self._credential_digest(stored_id), bytes.fromhex(row_key)
+                        )
+                    ):
+                        try:
+                            writer = _writer_from_value(stored_id, value)
+                        except (KeyError, TypeError, ValueError):
+                            pass
+                if writer is not None:
+                    writers.append(writer)
+        else:
+            writers.extend(self._writers.values())
+
+        for writer in writers:
+            if (
+                writer.active
+                and not writer.revoked
+                and hmac.compare_digest(writer.namespace, namespace_text)
+                and hmac.compare_digest(writer.local_user_scope, scope_text)
+            ):
+                return writer
+        return None
+
+    def _scope_has_active_writer_locked(
+        self, namespace: str, local_user_scope: str
+    ) -> bool:
+        return self._active_writer_for_scope_locked(
+            namespace, local_user_scope
+        ) is not None
+
+    def _device_owner_active_locked(self, device: DeviceCredential) -> bool:
+        """Reject a pairing-issued device after its writer is revoked."""
+
+        owner_id = device.pairing_writer_id
+        if owner_id is None:
+            return True
+        owner = self._find_writer_locked(owner_id)
+        if owner is None and self._backend is not None:
+            owner = self._legacy_writer_locked(owner_id)
+        return bool(
+            owner is not None
+            and owner.active
+            and not owner.revoked
+            and hmac.compare_digest(owner.namespace, device.namespace)
+            and hmac.compare_digest(owner.local_user_scope, device.local_user_scope)
+        )
+
+    def list_writers(
+        self, *, limit: int = MAX_WRITER_LISTING
+    ) -> tuple[WriterCredential, ...]:
+        """Return bounded writer status records for an authenticated operator.
+
+        Durable rows carry their own credential id because the backend address
+        stores only its digest.  A legacy row without that field is represented
+        by its validated row key, which is an opaque operator handle rather
+        than a recovered credential id.
+        """
+
+        bound = _validate_capacity(limit)
+        found: list[WriterCredential] = []
+        with self._lock:
+            if self._backend is not None:
+                for row_key, value in self._backend.iter_records(
+                    "writer", limit=self._capacity
+                ):
+                    if not isinstance(value, Mapping):
+                        continue
+                    stored_id = value.get("credential_id")
+                    if stored_id is None:
+                        credential = self._legacy_writer_locked(row_key, value=value)
+                        if credential is None:
+                            continue
+                        found.append(credential)
+                        if len(found) >= bound:
+                            break
+                        continue
+                    if (
+                        not isinstance(stored_id, str)
+                        or _HEX_ID_RE.fullmatch(stored_id) is None
+                    ):
+                        continue
+                    if _HEX_ID_RE.fullmatch(row_key) is None:
+                        continue
+                    expected = bytes.fromhex(row_key)
+                    if not hmac.compare_digest(
+                        self._credential_digest(stored_id), expected
+                    ):
+                        continue
+                    try:
+                        credential = _writer_from_value(stored_id, value)
+                    except (KeyError, TypeError, ValueError):
+                        continue
+                    found.append(credential)
+                    if len(found) >= bound:
+                        break
+            else:
+                found.extend(self._writers.values())
+                found = found[:bound]
+        return tuple(sorted(found, key=lambda item: item.credential_id))
+
+    def _legacy_writer_locked(
+        self,
+        row_key: str,
+        *,
+        value: Mapping[str, Any] | None = None,
+    ) -> WriterCredential | None:
+        """Decode one pre-credential-id writer row using only its row key.
+
+        The row key is an operator handle, never an attempted inversion of the
+        credential digest.  Requiring the field to be absent also prevents a
+        malformed new row from entering the legacy path.
+        """
+
+        if self._backend is None or _HEX_ID_RE.fullmatch(row_key) is None:
+            return None
+        current = value if value is not None else self._backend.read("writer", row_key)
+        if not isinstance(current, Mapping) or "credential_id" in current:
+            return None
+        try:
+            return _writer_from_value(row_key, current)
+        except (KeyError, TypeError, ValueError):
+            return None
 
     @staticmethod
     def _matches_scope(
@@ -3149,8 +3714,32 @@ class CredentialRegistry:
             context, token_digest, current + ttl, device_credential_id=device_id
         )
         with self._lock:
-            self._prune_contexts_locked(current)
-            self._store_context_locked(token_digest, record)
+            if device_id is None:
+                self._prune_contexts_locked(current)
+                self._store_context_locked(token_digest, record)
+            else:
+                # Keep the initial context issuance in the same scope
+                # serialization as pairing and admin revocation.  Without
+                # this check, a pairing that loses the writer race could
+                # still return a freshly minted context after revocation.
+                with self._pairing_scope_guard_locked(
+                    namespace_text, scope_text
+                ) as guard_owner:
+                    device = self._find_device_locked(device_id)
+                    if (
+                        device is None
+                        or not device.active
+                        or device.revoked
+                        or device.namespace != namespace_text
+                        or device.local_user_scope != scope_text
+                        or not self._device_owner_active_locked(device)
+                    ):
+                        raise ValueError("device is not active")
+                    self._renew_pairing_scope_guard_locked(
+                        namespace_text, scope_text, guard_owner
+                    )
+                    self._prune_contexts_locked(current)
+                    self._store_context_locked(token_digest, record)
         return token, context
 
     def read_context_token(
@@ -3230,6 +3819,7 @@ class CredentialRegistry:
                     or not hmac.compare_digest(
                         issuer.local_user_scope, record.context.local_user_scope
                     )
+                    or not self._device_owner_active_locked(issuer)
                 ):
                     hmac.compare_digest(supplied, _DUMMY_DIGEST)
                     return None
@@ -3382,6 +3972,7 @@ __all__ = [
     "DEVICE_SEEN_RECORD_KIND",
     "ExpiredRecordSweeper",
     "MAX_DEVICE_LISTING",
+    "MAX_WRITER_LISTING",
     "NEVER_SWEEP_RECORD_KINDS",
     "SWEEPABLE_RECORD_KINDS",
     "SWEEP_BATCH_LIMIT",

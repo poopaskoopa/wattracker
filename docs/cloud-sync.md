@@ -47,8 +47,34 @@ contract is:
 | `GET /api/v1/context/dashboard` | read | reader context | — |
 | `GET /api/v1/context/volume` | read | reader context | — |
 | `GET /api/v1/context/curve` | read | reader context | — |
+| `GET /api/v1/admin/installations` | read | operator token | list writer installations |
+| `POST /api/v1/admin/installations/{installation_id}/revoke` | read | operator token | revoke a writer installation |
 | `POST /api/v1/sync/batches` | sync | server-issued writer credential + signed request | `write` |
 | `GET /api/v1/sync/status` | sync | server-issued writer credential + signed request | `write` |
+
+### One-time operator bootstrap
+
+The operator runs `python -m wattracker.cloud.admin invite`. The tool reads
+`WATTRACKER_CLOUD_OPERATOR_TOKEN` or the `wattracker.cloud` OS keychain entry
+`operator-token`; it never accepts the token as an argument. Set the endpoint
+with `--endpoint` or `WATTRACKER_CLOUD_ENDPOINT`. HTTPS is required, with HTTP
+allowed only for `localhost`, `127.0.0.1`, and `::1` when testing against the
+walking-skeleton server.
+
+The operator gives the printed, one-time invitation to the rider. The rider
+pastes it into the desktop cloud settings; the desktop enrolls once and gets
+its writer credential and namespace. From there, phones are paired by the
+desktop with the normal pairing flow. Operators can audit the enrolled writer
+installations with `list-installations` and revoke one with
+`revoke-installation <installation_id>`. Revoking an installation also revokes
+every paired device and outstanding pairing code in that writer's
+`(namespace, local_user_scope)`.
+
+A revoke `404` is deliberately ambiguous: it can mean the installation is
+absent, but it can also mean storage failed or a same-scope cascade stopped
+part-way. The operator must retry the revoke before concluding that the
+installation is absent; a retry is idempotent and completes any partial
+cascade.
 
 ### Mobile read context
 
