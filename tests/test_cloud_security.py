@@ -1265,6 +1265,62 @@ def test_scope_guard_cas_conflict_cannot_admit_two_holders(
     assert second.revoke_writer_and_devices(writer.credential_id)
 
 
+def test_pairing_code_survives_guard_contention_but_not_owner_revocation(
+    pairing_replicas, monkeypatch
+):
+    first, second, writer, _binding, table = pairing_replicas
+    retry_code = first._pairing_registry.create(
+        writer.namespace, writer.local_user_scope
+    ).code
+    revoked_code = first._pairing_registry.create(
+        writer.namespace, writer.local_user_scope
+    ).code
+    competing_guard = second._pairing_scope_guard_locked(
+        writer.namespace, writer.local_user_scope
+    )
+    entered = False
+    create_entity = table.create_entity
+
+    # This uses the Azure-style CAS backend and an in-memory table stand-in;
+    # it exercises the real compare-and-swap path but is not a live Azure test.
+    def contend(entity, **kwargs):
+        nonlocal entered
+        if entity["RowKey"].startswith(_PAIRING_SCOPE_GUARD_KIND + ":") and not entered:
+            entered = True
+            competing_guard.__enter__()
+        return create_entity(entity, **kwargs)
+
+    monkeypatch.setattr(table, "create_entity", contend)
+    try:
+        with second._lock, pytest.raises(SecurityStateUnavailable):
+            first.pair_device_code(
+                retry_code,
+                b"k" * 32,
+                pairing_registry=first._pairing_registry,
+            )
+        assert entered
+        assert first._pairing_registry.peek(retry_code) is not None
+    finally:
+        if entered:
+            competing_guard.__exit__(None, None, None)
+
+    device = first.pair_device_code(
+        retry_code,
+        b"k" * 32,
+        pairing_registry=first._pairing_registry,
+    )
+    assert second.resolve_device(device.credential_id) is not None
+
+    assert second.revoke_writer_and_devices(writer.credential_id)
+    assert first._pairing_registry.peek(revoked_code) is None
+    with pytest.raises(ValueError):
+        first.pair_device_code(
+            revoked_code,
+            b"z" * 32,
+            pairing_registry=first._pairing_registry,
+        )
+
+
 def test_pairing_guard_is_exact_scope(pairing_replicas):
     first, second, writer, _binding, _table = pairing_replicas
     same_namespace = first.register_writer(

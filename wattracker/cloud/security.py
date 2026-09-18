@@ -2112,12 +2112,17 @@ class DevicePairingBinding:
     pairing_id: str = field(repr=False)
     _proof: bytes = field(repr=False, compare=False)
     subject: str | None = field(default=None, repr=False, compare=False)
+    _code_digest: bytes | None = field(default=None, repr=False, compare=False)
 
     def __post_init__(self) -> None:
         _require_namespace(self.namespace)
         _require_local_scope(self.local_user_scope)
         _require_opaque_id(self.pairing_id, "pairing_id")
         _require_bytes(self._proof, "pairing proof")
+        if self._code_digest is not None:
+            _require_bytes(self._code_digest, "pairing code digest")
+            if len(self._code_digest) != hashlib.sha256().digest_size:
+                raise ValueError("pairing code digest is invalid")
         if self.subject is not None:
             _require_text(self.subject, "subject")
 
@@ -2261,6 +2266,82 @@ class DevicePairingRegistry:
             if record.expires_at <= now:
                 del self._records[digest]
 
+    def _record_for_digest_locked(
+        self, digest: bytes, now: float
+    ) -> _PairingRecord | None:
+        if self._backend is not None:
+            value = self._backend.read(_PAIRING_RECORD_KIND, digest.hex())
+            if value is None or bool(value.get("consumed", False)):
+                return None
+            if bool(value.get("revoked", False)):
+                return None
+            try:
+                record = _pairing_from_value(value)
+            except (KeyError, TypeError, ValueError):
+                return None
+        else:
+            self._prune_locked(now)
+            record = self._records.get(digest)
+        if record is None or record.expires_at <= now:
+            return None
+        return record
+
+    def _binding_for_record(
+        self, record: _PairingRecord, digest: bytes
+    ) -> DevicePairingBinding:
+        return DevicePairingBinding(
+            record.namespace,
+            record.local_user_scope,
+            record.pairing_id,
+            self._proof_for(
+                record.pairing_id,
+                record.namespace,
+                record.local_user_scope,
+                record.subject,
+            ),
+            record.subject,
+            digest,
+        )
+
+    @staticmethod
+    def _subject_matches(record: _PairingRecord, subject: str | None) -> bool:
+        if record.subject is None:
+            return True
+        try:
+            supplied_subject = _require_text(subject, "subject")
+        except ValueError:
+            return False
+        return hmac.compare_digest(
+            record.subject.encode("utf-8"), supplied_subject.encode("utf-8")
+        )
+
+    def peek(
+        self,
+        code: object,
+        subject: str | None = None,
+        *,
+        now: float | None = None,
+    ) -> DevicePairingBinding | None:
+        """Validate a code without spending it.
+
+        The returned binding carries only an internal digest used by
+        :meth:`consume_binding`; it is still non-secret and cannot be forged
+        without this registry's binding proof.
+        """
+
+        canonical = normalize_pairing_code(code)
+        current = self._clock() if now is None else float(now)
+        if canonical is None:
+            hmac.compare_digest(_DUMMY_DIGEST, _DUMMY_DIGEST)
+            return None
+        digest = _digest_pairing_code(canonical)
+        with self._lock:
+            record = self._record_for_digest_locked(digest, current)
+            if record is None or not self._subject_matches(record, subject):
+                hmac.compare_digest(digest, _DUMMY_DIGEST)
+                return None
+            return self._binding_for_record(record, digest)
+
     def _store_record(self, digest: bytes, record: _PairingRecord) -> bool:
         if self._backend is not None:
             return bool(
@@ -2337,40 +2418,10 @@ class DevicePairingRegistry:
             return None
         supplied = _digest_pairing_code(canonical)
         with self._lock:
-            record: _PairingRecord | None = None
-            if self._backend is not None:
-                value = self._backend.read(_PAIRING_RECORD_KIND, supplied.hex())
-                if value is None:
-                    hmac.compare_digest(supplied, _DUMMY_DIGEST)
-                    return None
-                if bool(value.get("revoked", False)):
-                    hmac.compare_digest(supplied, _DUMMY_DIGEST)
-                    return None
-                try:
-                    record = _pairing_from_value(value)
-                except (KeyError, TypeError, ValueError):
-                    return None
-                if record.expires_at <= current:
-                    hmac.compare_digest(supplied, _DUMMY_DIGEST)
-                    return None
-            else:
-                self._prune_locked(current)
-                for stored_digest, candidate in self._records.items():
-                    if hmac.compare_digest(supplied, stored_digest):
-                        record = candidate
-                        break
-                if record is None or record.expires_at <= current:
-                    hmac.compare_digest(supplied, _DUMMY_DIGEST)
-                    return None
-            if record.subject is not None:
-                try:
-                    supplied_subject = _require_text(subject, "subject")
-                except ValueError:
-                    return None
-                if not hmac.compare_digest(
-                    record.subject.encode("utf-8"), supplied_subject.encode("utf-8")
-                ):
-                    return None
+            record = self._record_for_digest_locked(supplied, current)
+            if record is None or not self._subject_matches(record, subject):
+                hmac.compare_digest(supplied, _DUMMY_DIGEST)
+                return None
             if self._backend is not None:
                 if self._backend.consume(
                     _PAIRING_RECORD_KIND, supplied.hex(), now=current
@@ -2378,19 +2429,47 @@ class DevicePairingRegistry:
                     return None
             else:
                 del self._records[supplied]
-            proof = self._proof_for(
-                record.pairing_id,
-                record.namespace,
-                record.local_user_scope,
-                record.subject,
-            )
-            return DevicePairingBinding(
-                record.namespace,
-                record.local_user_scope,
-                record.pairing_id,
-                proof,
-                record.subject,
-            )
+            return self._binding_for_record(record, supplied)
+
+    def consume_binding(
+        self,
+        binding: DevicePairingBinding,
+        *,
+        now: float | None = None,
+    ) -> DevicePairingBinding | None:
+        """Spend a binding previously returned by :meth:`peek`.
+
+        This is separate from :meth:`consume` so a caller can acquire the
+        pairing-scope guard before spending the code.  A failed guard
+        acquisition therefore cannot burn a usable code.
+        """
+
+        if (
+            not isinstance(binding, DevicePairingBinding)
+            or binding._code_digest is None
+            or not self.verify_binding(binding)
+        ):
+            return None
+        current = self._clock() if now is None else float(now)
+        digest = binding._code_digest
+        with self._lock:
+            record = self._record_for_digest_locked(digest, current)
+            if record is None or record.pairing_id != binding.pairing_id:
+                return None
+            if (
+                record.namespace != binding.namespace
+                or record.local_user_scope != binding.local_user_scope
+                or record.subject != binding.subject
+            ):
+                return None
+            if self._backend is not None:
+                if self._backend.consume(
+                    _PAIRING_RECORD_KIND, digest.hex(), now=current
+                ) is None:
+                    return None
+            else:
+                del self._records[digest]
+            return self._binding_for_record(record, digest)
 
     def invalidate_scope(self, namespace: str, local_user_scope: str) -> int:
         """Make every outstanding code for one server-derived scope unusable.
@@ -3140,42 +3219,108 @@ class CredentialRegistry:
         with self._lock, self._pairing_scope_guard_locked(
             binding.namespace, binding.local_user_scope
         ) as guard_owner:
-            # The shared guard covers both the owner check and the device
-            # write, including when an admin revoke runs on another replica.
+            return self._pair_device_locked(
+                binding,
+                public_key,
+                signature_algorithm=signature_algorithm,
+                capabilities=capabilities,
+                subscription_key=subscription_key,
+                subject=subject,
+                label=label,
+                guard_owner=guard_owner,
+            )
+
+    def pair_device_code(
+        self,
+        code: object,
+        public_key: bytes,
+        *,
+        pairing_registry: "DevicePairingRegistry | None" = None,
+        signature_algorithm: str = "ed25519",
+        capabilities: object = DEFAULT_DEVICE_CAPABILITIES,
+        subscription_key: bytes | None = None,
+        subject: str | None = None,
+        label: object = None,
+    ) -> DeviceCredential:
+        """Pair from a code without spending it before guard acquisition."""
+
+        registry = pairing_registry or self._pairing_registry
+        if registry is None:
+            raise ValueError("pairing registry is unavailable")
+        binding = registry.peek(code, subject)
+        if binding is None:
+            raise ValueError("invalid pairing code")
+        with self._lock, self._pairing_scope_guard_locked(
+            binding.namespace, binding.local_user_scope
+        ) as guard_owner:
             owner = self._active_writer_for_scope_locked(
                 binding.namespace, binding.local_user_scope
             )
             if owner is None:
                 raise ValueError("pairing owner is revoked")
+            if registry.consume_binding(binding) is None:
+                raise ValueError("pairing code is unavailable")
+            return self._pair_device_locked(
+                binding,
+                public_key,
+                signature_algorithm=signature_algorithm,
+                capabilities=capabilities,
+                subscription_key=subscription_key,
+                subject=subject,
+                label=label,
+                guard_owner=guard_owner,
+                owner=owner,
+            )
+
+    def _pair_device_locked(
+        self,
+        binding: DevicePairingBinding,
+        public_key: bytes,
+        *,
+        signature_algorithm: str,
+        capabilities: object,
+        subscription_key: bytes | None,
+        subject: str | None,
+        label: object,
+        guard_owner: str,
+        owner: WriterCredential | None = None,
+    ) -> DeviceCredential:
+        # The shared guard covers both the owner check and the device write,
+        # including when an admin revoke runs on another replica.
+        owner = owner or self._active_writer_for_scope_locked(
+            binding.namespace, binding.local_user_scope
+        )
+        if owner is None:
+            raise ValueError("pairing owner is revoked")
+        self._renew_pairing_scope_guard_locked(
+            binding.namespace, binding.local_user_scope, guard_owner
+        )
+        previous_guard = self._pairing_guard_context
+        self._pairing_guard_context = (
+            binding.namespace, binding.local_user_scope, guard_owner
+        )
+        try:
+            device = self.register_device_for_scope(
+                binding.namespace,
+                binding.local_user_scope,
+                public_key,
+                signature_algorithm=signature_algorithm,
+                capabilities=capabilities,
+                subscription_key=subscription_key,
+                subject=binding.subject if subject is None else subject,
+                label=label,
+                pairing_writer_id=owner.credential_id,
+            )
+            # The backend create can lose the lease between its last renewal
+            # and the write.  Fence the result before exposing a credential to
+            # the caller; a retryable failure is safer than returning a device
+            # that was paired after its writer died.
             self._renew_pairing_scope_guard_locked(
                 binding.namespace, binding.local_user_scope, guard_owner
             )
-            previous_guard = self._pairing_guard_context
-            self._pairing_guard_context = (
-                binding.namespace, binding.local_user_scope, guard_owner
-            )
-            try:
-                device = self.register_device_for_scope(
-                    binding.namespace,
-                    binding.local_user_scope,
-                    public_key,
-                    signature_algorithm=signature_algorithm,
-                    capabilities=capabilities,
-                    subscription_key=subscription_key,
-                    subject=binding.subject if subject is None else subject,
-                    label=label,
-                    pairing_writer_id=owner.credential_id,
-                )
-                # The backend create can lose the lease between its last
-                # renewal and the write.  Fence the result before exposing a
-                # credential to the caller; a retryable failure is safer than
-                # returning a device that was paired after its writer died.
-                self._renew_pairing_scope_guard_locked(
-                    binding.namespace, binding.local_user_scope, guard_owner
-                )
-                return device
-            finally:
-                self._pairing_guard_context = previous_guard
+            return device
+        finally:
+            self._pairing_guard_context = previous_guard
 
     def lookup_device(self, credential_id: str) -> DeviceCredential | None:
         """Resolve a device regardless of status; used by revocation tooling."""
@@ -3431,13 +3576,6 @@ class CredentialRegistry:
             ):
                 return writer
         return None
-
-    def _scope_has_active_writer_locked(
-        self, namespace: str, local_user_scope: str
-    ) -> bool:
-        return self._active_writer_for_scope_locked(
-            namespace, local_user_scope
-        ) is not None
 
     def _device_owner_active_locked(self, device: DeviceCredential) -> bool:
         """Reject a pairing-issued device after its writer is revoked."""

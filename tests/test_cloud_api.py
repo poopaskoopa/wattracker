@@ -13,6 +13,10 @@ from wattracker.cloud.api import (
     _cursor_key,
     create_cloud_app,
 )
+from wattracker.cloud.limits import (
+    PUBLIC_UNAVAILABLE_DETAIL,
+    PUBLIC_UNAVAILABLE_RETRY_AFTER,
+)
 from wattracker.cloud.models import (
     PUBLISHED_OBJECT_KINDS,
     CloudObject,
@@ -2344,6 +2348,39 @@ def test_pairing_survives_a_read_plane_restart():
             headers=_refresh_headers(device, device_private, nonce="post-restart"),
         )
     assert refreshed.status_code == 200, refreshed.text
+
+
+def test_http_pairing_guard_contention_does_not_consume_code():
+    pytest.importorskip("cryptography")
+    backend = MemorySecurityStateBackend()
+    config = CloudConfig(
+        server_secret=SECRET,
+        operator_token="operator-token",
+        require_gateway_proof=False,
+        clock=lambda: 1_000,
+    )
+    holder = CloudState.create(config, security_backend=backend)
+    contender = CloudState.create(config, security_backend=backend)
+    writer = _writer(holder, b"a")
+    code = holder.pairings.create(
+        writer.namespace, writer.local_user_scope
+    ).code
+    _private_key, public_key = generate_signing_keypair()
+
+    # This is the real scope guard on an in-memory backend, not live Azure.
+    with holder.credentials._lock, holder.credentials._pairing_scope_guard_locked(
+        writer.namespace, writer.local_user_scope
+    ):
+        with TestClient(create_cloud_app(config, state=contender)) as client:
+            blocked = _pair(client, code, public_key)
+
+    assert blocked.status_code == 503
+    assert blocked.json() == {"detail": PUBLIC_UNAVAILABLE_DETAIL}
+    assert blocked.headers["Retry-After"] == str(PUBLIC_UNAVAILABLE_RETRY_AFTER)
+
+    with TestClient(create_cloud_app(config, state=contender)) as client:
+        paired = _pair(client, code, public_key)
+    assert paired.status_code == 200, paired.text
 
 
 def test_the_kill_switch_disables_pairing(cloud):

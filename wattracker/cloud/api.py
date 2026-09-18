@@ -39,6 +39,7 @@ from .security import (
     NonceReplayGuard,
     PublicKeyUnavailable,
     READER_CONTEXT_TTL_SECONDS,
+    SecurityStateUnavailable,
     SecurityStateBackend,
     canonical_request,
     digest_body,
@@ -924,6 +925,18 @@ def create_cloud_app(
 
         return _error(exc.status_code, exc.reason, retry_after=exc.retry_after)
 
+    @app.exception_handler(SecurityStateUnavailable)
+    async def _security_state_unavailable(
+        _request: Request, _exc: SecurityStateUnavailable
+    ) -> Response:
+        """Keep unreadable authorization state neutral and retryable."""
+
+        return _error(
+            503,
+            PUBLIC_UNAVAILABLE_DETAIL,
+            retry_after=PUBLIC_UNAVAILABLE_RETRY_AFTER,
+        )
+
     if config.allowed_origins:
         app.add_middleware(
             CORSMiddleware,
@@ -988,7 +1001,7 @@ def create_cloud_app(
                     MAX_WRITER_LISTING,
                 )
                 writers = state.credentials.list_writers(limit=limit)
-            except (HTTPException, QuotaExceeded):
+            except (HTTPException, QuotaExceeded, SecurityStateUnavailable):
                 raise
             except Exception:
                 # Keep unrelated admin failures opaque while allowing the
@@ -1021,7 +1034,7 @@ def create_cloud_app(
                     return _not_found()
                 if not state.credentials.revoke_writer_and_devices(installation_id):
                     return _not_found()
-            except (HTTPException, QuotaExceeded):
+            except (HTTPException, QuotaExceeded, SecurityStateUnavailable):
                 raise
             except Exception:
                 # Storage and partial-cascade failures remain fail-closed.
@@ -1415,14 +1428,18 @@ def create_cloud_app(
                 # The deployment lacks the crypto extra.  Refuse without
                 # spending the code, and without saying why.
                 return _not_found()
-            binding = state.pairings.consume(code, subject)
-            if binding is None:
-                return _not_found()
             try:
-                device = state.credentials.pair_device(
-                    binding,
+                # Peek first, acquire the scope guard inside the credential
+                # registry, and spend the code only after that guard is held.
+                # A contended guard therefore leaves the code retryable; once
+                # a device or context may have been durably written, no code
+                # rollback is attempted.
+                device = state.credentials.pair_device_code(
+                    code,
                     public_key,
+                    pairing_registry=state.pairings,
                     signature_algorithm=algorithm,
+                    subject=subject,
                     label=label,
                     # Devices are issued read-only here, exactly as at
                     # enrollment.  Widening one is a capability grant on the
@@ -1437,6 +1454,8 @@ def create_cloud_app(
                     device.namespace, device.local_user_scope, device.subject,
                     device_credential_id=device.credential_id,
                 )
+            except SecurityStateUnavailable:
+                raise
             except (ValueError, RuntimeError, PublicKeyUnavailable):
                 return _not_found()
             paired = {

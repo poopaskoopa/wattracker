@@ -13,6 +13,7 @@ from wattracker.cloud.limits import (
 )
 from wattracker.cloud.security import (
     MemorySecurityStateBackend,
+    SecurityStateUnavailable,
     canonical_request,
     digest_body,
     new_installation_id,
@@ -31,6 +32,10 @@ def _raise_public_unavailable():
         status_code=503,
         retry_after=PUBLIC_UNAVAILABLE_RETRY_AFTER,
     )
+
+
+def _raise_security_state_unavailable():
+    raise SecurityStateUnavailable("security backend unavailable")
 
 
 def _admin_response_contract(response):
@@ -351,6 +356,102 @@ def test_admin_revoke_preserves_kill_switch_503_without_an_installation_or_token
         ),
     ] * 4
     assert all(response.json() == {"detail": PUBLIC_UNAVAILABLE_DETAIL} for response in responses)
+
+
+def test_admin_security_state_unavailable_is_neutral_and_retryable_without_oracles(
+    monkeypatch,
+):
+    config = CloudConfig(
+        server_secret=SECRET,
+        operator_token=TOKEN,
+        gateway_proof_value=GATEWAY_PROOF,
+    )
+    state = CloudState.create(config)
+    writer = state.credentials.register_writer(
+        new_installation_id(), "rider-scope", b"w" * 32, b"s" * 32
+    )
+    fake_installation_id = "f" * 64
+    monkeypatch.setattr(state.quotas, "kill_state", _raise_security_state_unavailable)
+
+    with TestClient(create_cloud_app(config, state=state)) as client:
+        listed = [
+            client.get(
+                "/api/v1/admin/installations",
+                headers={
+                    "X-Operator-Token": token,
+                    "X-Gateway-Request-Proof": GATEWAY_PROOF,
+                },
+            )
+            for token in (TOKEN, "wrong-token")
+        ]
+        revoked = [
+            client.post(
+                f"/api/v1/admin/installations/{installation_id}/revoke",
+                headers={
+                    "X-Operator-Token": token,
+                    "X-Gateway-Request-Proof": GATEWAY_PROOF,
+                },
+            )
+            for token in (TOKEN, "wrong-token")
+            for installation_id in (writer.credential_id, fake_installation_id)
+        ]
+        gateway_refused = client.get(
+            "/api/v1/admin/installations",
+            headers={
+                "X-Operator-Token": TOKEN,
+                "X-Gateway-Request-Proof": "wrong-proof",
+            },
+        )
+
+    expected = (
+        503,
+        b'{"detail":"public API unavailable"}',
+        str(PUBLIC_UNAVAILABLE_RETRY_AFTER),
+    )
+    assert [_admin_response_contract(response) for response in listed] == [expected] * 2
+    assert [_admin_response_contract(response) for response in revoked] == [expected] * 4
+    assert gateway_refused.status_code == 404
+    assert gateway_refused.json() == {"detail": "not found"}
+
+
+def test_admin_revoke_guard_contention_is_neutral_for_known_installation():
+    """Known-installation contention uses the in-memory Azure-style backend."""
+    backend = MemorySecurityStateBackend()
+    config = CloudConfig(
+        server_secret=SECRET,
+        operator_token=TOKEN,
+        gateway_proof_value=GATEWAY_PROOF,
+    )
+    holder = CloudState.create(config, security_backend=backend)
+    contender = CloudState.create(config, security_backend=backend)
+    writer = holder.credentials.register_writer(
+        new_installation_id(), "rider-scope", b"w" * 32, b"s" * 32
+    )
+    headers = {
+        "X-Operator-Token": TOKEN,
+        "X-Gateway-Request-Proof": GATEWAY_PROOF,
+    }
+
+    # This is the real scope-guard implementation on the in-memory backend,
+    # not a live Azure test or a monkeypatched exception.
+    with holder.credentials._lock, holder.credentials._pairing_scope_guard_locked(
+        writer.namespace, writer.local_user_scope
+    ):
+        with TestClient(create_cloud_app(config, state=contender)) as client:
+            response = client.post(
+                f"/api/v1/admin/installations/{writer.credential_id}/revoke",
+                headers=headers,
+            )
+
+    expected = (
+        503,
+        b'{"detail":"public API unavailable"}',
+        str(PUBLIC_UNAVAILABLE_RETRY_AFTER),
+    )
+    assert _admin_response_contract(response) == expected
+    assert holder.credentials.authenticate_writer(
+        writer.credential_id, writer.subscription_key
+    ) is not None
 
 
 def test_admin_revoke_cascades_to_same_scope_device_and_is_idempotent():
