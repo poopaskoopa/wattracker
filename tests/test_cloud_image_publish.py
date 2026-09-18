@@ -48,4 +48,7 @@ def test_deployment_skeleton_and_runbook_use_one_signed_digest_for_both_planes()
     assert "ghcr.io/poopaskoopa/wattracker-cloud@sha256:" in DEPLOY
     assert "cosign verify" in DEPLOY
     assert "same full image reference" in DEPLOY
-    assert "package owner must\nflip it to Public" in DEPLOY
+    assert "The package is **public** and needs no registry pull credential" in DEPLOY
+    assert "inherits that repository's\nvisibility" in DEPLOY
+    assert "OCI image index, not a single manifest" in DEPLOY
+    assert "provenance: false" in DEPLOY
