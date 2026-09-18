@@ -12,12 +12,22 @@
     <uses-permission android:name="android.permission.INTERNET" />
 
     <!--
-        Backup is off: Step 2 adds non-exportable Keystore-wrapped credentials;
-        a restored blob would be undecryptable. Revisit with real exclude rules
-        when the backup policy is decided.
+        Backup is off: Step 2 adds non-exportable Keystore-wrapped
+        credentials; a restored blob would be undecryptable. The gate is
+        allowBackup="false" itself: the rule files it points at carry no
+        include rules (an empty rule set would include everything if backup
+        were ever re-enabled), so they exist only to give the attributes
+        something to point at. The one load-bearing content is the
+        <device-transfer> exclude in data_extraction_rules.xml: Android 12+
+        device-to-device transfer ignores allowBackup and, with no rules at
+        all, would transfer everything. Revisit with real rules when the
+        policy is decided.
     -->
     <application
+        android:name=".WatTrackerApplication"
         android:allowBackup="false"
+        android:fullBackupContent="@xml/backup_rules"
+        android:dataExtractionRules="@xml/data_extraction_rules"
         android:icon="@mipmap/ic_launcher"
         android:label="@string/app_name"
         android:roundIcon="@mipmap/ic_launcher_round"

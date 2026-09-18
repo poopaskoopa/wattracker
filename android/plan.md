@@ -4,20 +4,204 @@ Epic #192 and sub-issues #193–#199, plus the owner's
 extra targets: Android 11+, dual-server support (cloud **and** local), offline
 cache. Kotlin + Jetpack Compose, single app under `android/`.
 
-**Resume point — Step 1 is merged, CI is live, the harness is on `main`.**
-PR #257 (skeleton) merged 2026-09-08; `android/` is on `main`.
-`.github/workflows/android.yml` (PR #262, merged 2026-09-10, closes #259)
-compiles and unit-tests `android/` on hosted `ubuntu-latest` for every PR
-touching it. The full-snapshot cloud dev harness is the code that runs (PR
-#240 merged 2026-09-06). **Next: Step 2 — Cloud API client + local client
-(issue #194 + local backend)** — #194 is the next startable Android issue
-(#193 is closed out pending one owner confirmation, see Issue state). The
-local-transport decision is settled; its code/doc changes ride in PR #266
-(open, branch `docs/local-transport-https` — this checkout, closes #260).
-**Land #266 before Step 2 code.** Verified on both AVDs (`medium_phone` API
-36, `medium_tablet` API 35): rail in landscape, bottom bar in portrait,
-drawer on tablet. README measurement table filled. Pre-push hook installed.
-See "Step 1 — completion notes" below.
+**Resume point — Step 2 (#194) is implemented on this branch and open as
+PR #304; the owner's review (2026-09-15, CHANGES_REQUESTED) is addressed on
+this branch** (see the 2026-09-15 note below).
+This checkout is **`feature/android-client-2`**, rebased onto `main` at
+**`52996a7`** (2026-09-14). **Step 2 — the cloud client and the
+revision-keyed offline cache — is now implemented here and committed** (see
+the 2026-09-14 rebase note below): `CloudSession` (single-flight refresh,
+conservative two-strike revocation, generation-stamped cache writes),
+`CloudClient` plus a capped, redirect-free transport, the Room snapshot
+cache keyed on the server revision, the EncryptedSharedPreferences
+credential store, the forward-compatible JSON value model, and
+`WatTrackerApplication` wiring with Tink R8 keep rules and an exported Room
+schema — unit-tested against scripted responses. Since this branch cut,
+`main` merged #295–#302 (backend-selection follow-ups, local-day
+completion, snapshot-gate baselines, hosted Windows CI, local-backend
+origin vectors, iOS device validation); none of them touch `android/`, so
+the rebase was conflict-free.
+Step-1 context: #266 landed via **#294 (`ff1f2aa`)**; #193 is closed
+(tablet-in-portrait screenshot confirmed), #156 closed via #274; #102 (the
+hosting decision) remains an unexecuted runbook and alone gates the "real
+deployment" half of #199. Android CI (PR #262) compiles and unit-tests
+`android/` on hosted `ubuntu-latest`; the full-snapshot dev harness (PR
+#240) is what runs. Verified on both AVDs (`medium_phone` API 36,
+`medium_tablet` API 35): rail in landscape, bottom bar in portrait, drawer
+on tablet. Pre-push hook installed. See "Step 1 — completion notes" below.
+
+**Revised 2026-09-15 — PR #304 review addressed.** Step 2 (#194) is open as
+**PR #304** (`feature/android-client-2` → `main`, head `9c9a6ba`). The
+owner's review (2026-09-15) is `CHANGES_REQUESTED` — one blocker plus
+non-blocking notes; every point is addressed on this branch:
+
+1. **Blocker — every cache write silently dropped after the first
+   restart.** `RoomSnapshotCache` persisted the write-identity epoch in the
+   `meta` table while `CloudSession.lifecycleGeneration` is in-memory and
+   restarts at 0: after a relaunch every `store` fell below the persisted
+   epoch and was refused, so the checkpoint never advanced (every `since=`
+   refetched an ever-growing delta, quota use climbing) and cold-start
+   reads served stale data — the revision-keyed cache frozen at the pairing
+   session's revision. Fixed by making the identity process-local, as iOS
+   does (`lifecycleGeneration` never survives a restart; an in-flight read
+   cannot outlive the process): both caches now hold it in a `GenerationGate`
+   in memory, and the `cloud_epoch` meta row is gone (the `meta` table stays
+   for the plan's non-secret settings). Tests: the restart test the review
+   asks for (pair → store → a fresh session on the same persistent rows →
+   store → the write lands, the checkpoint advances, and the read asks
+   `since=<old checkpoint>`) — run against a cache double that mirrors the
+   fixed shape (persistent rows, in-memory gate); a JVM test has no Context
+   to open a file-backed Room database and the dependency rule bars
+   Robolectric, so it is the contract half, with the gate half in
+   `GenerationGateTest` and the Room class verified on device — plus the
+   existing seeds that wrote generation-1 rows under a generation-0 session
+   now seeding at generation 0, a prior launch's honest identity.
+2. **RemovalGate durability.** `markPending`/`clearPending` are `commit()` —
+   an `apply()` that died before hitting disk traded a lost credential for a
+   lost sign-out — and the flag is cleared only *after* the retried wipe
+   succeeds (`takePending` split into `isPending` + `clearPending`); a
+   process death in the middle leaves the flag where the next start finds
+   it. A `commit()` the store refuses (`false`, not an exception) is thrown,
+   not ignored, and `removeDisk` keeps the original wipe failure as the
+   primary exception. Unit-tested both ways (the wipe completes and clears;
+   a failing wipe keeps the flag and the stale paired state).
+3. **The degraded credential store is surfaced.** An unopenable encrypted
+   store still falls back to memory (a corrupt Tink keyset bricks no app),
+   but `WatTrackerApp.credentialStoreDegraded` records it: pairing into the
+   in-memory store "succeeds" for one launch and is lost on relaunch, and
+   #195's pairing screen must say so instead of silently.
+4. **The corrupt-DB reset now runs.** `Room…build()` is lazy, so the file
+   opened on first use — outside the try — and the reset branch never fired.
+   An empty `runInTransaction` now forces the open inside the try (and the
+   failed database is closed before `deleteDatabase`).
+5. **Transport bounds.** The response cap is 4 MiB, not 50 (the cap becomes
+   bytes + String + JSON tree in memory; the largest real payload is a
+   1500-point stream page), and a 60 s overall per-request deadline (checked
+   after the headers and between body chunks) bounds a trickling server the
+   per-read timeout cannot. Collection reads also send `limit=5`: the
+   server's default page is 100 objects at up to 512 KiB each (a 50 MiB
+   response) that the cap would truncate — and a truncated page fails on
+   every read, not just the first — while five objects keep the worst-case
+   page at 2.5 MiB under it. All pinned by tests.
+6. **A test that always passed.** `assertNotEquals` on two `ByteArray`s
+   compared references in `boundaryPairsAreDistinct` — the first pass
+   claimed the fix without touching the file (caught in re-review); it is a
+   `assertFalse` on `contentEquals` now.
+7. **The JSON parser is strict where the server is canonical.** Leading
+   zeros, raw control characters in strings, lone surrogates and non-finite
+   numbers (`1e999` parsed as `Infinity` and would have serialized back out
+   as invalid JSON) are rejected; a 200 body decodes with strict UTF-8
+   (malformed bytes are protocol drift, not U+FFFD in rider data). Duplicate
+   keys keep the last value, parity with the server's `json` module —
+   documented, not a leniency. `JsonValueTest` pins all of it.
+8. **Pre-existing, fixed here.** The placeholder-host guard covers
+   `bundleRelease` as well as `assembleRelease` (Step 7 ships a bundle), and
+   the manifest wires `dataExtractionRules` (with `fullBackupContent` for
+   the API-30 half) carrying a `<device-transfer>` exclude over the app
+   root — `allowBackup="false"` alone does not stop Android 12+
+   device-to-device transfer.
+9. **Re-review (second round) cleanup.** The restart test's description
+   no longer claims regression coverage of the Room class (it runs the
+   contract against a double mirroring the fixed shape; the Room class is
+   verified on device — no JVM Context, no Robolectric). The manifest
+   comment no longer calls the empty rule files "everything excluded": an
+   empty rule set includes everything if the transfer mode were enabled; the
+   gate is `allowBackup="false"` plus the device-transfer exclude. The
+   stale "cache's epoch" wording in `pair()` is the identity gate. The gate
+   throws
+   on a refused `commit()` write instead of ignoring it, and `removeDisk`
+   keeps the original wipe failure as the primary exception. `decodeUtf8`
+   is the decoder's one-liner. Leftover blank lines are gone.
+
+`:app:assembleDebug`, `:app:testDebugUnitTest` (84 tests) and
+`:app:assembleRelease :app:bundleRelease -PallowPlaceholderHost` are green
+locally; the guard's refusal of an unflagged `bundleRelease` is verified
+the same way.
+
+**Revised 2026-09-17 — PR #304 review (10 findings) addressed & rebased.**
+The branch was rebased onto `main` (`71abea5`). All 10 findings from the owner's
+2026-09-17 review on PR #304 are addressed on this branch and committed:
+
+1. **Unpaginated routes (`calendar`, `profile`, `races`) no longer send `limit=5`.**
+   `CloudClient.collection` appends `limit` only when `route.servesDeltas` is `true`.
+   Unpaginated routes return full collections without truncation or cursor gaps.
+2. **Page limit raised from 5 to 100.** `COLLECTION_PAGE_LIMIT` in `CloudClient` is 100
+   (matching the server's max query limit). Up to 50 pages allows complete delta
+   walks for up to 5,000 objects without hitting a premature 250-item ceiling.
+3. **`pair()` clears `RemovalGate`.** In `CloudSession.pair()`, `removalGate.clearPending()`
+   is called once the new credential is saved, preventing a prior failed sign-out
+   from wiping the newly paired device on relaunch.
+4. **`data_extraction_rules.xml` excludes database and sharedpref domains.**
+   Explicit `<exclude>` tags cover `root`, `database`, `sharedpref`, `file`, and `external`
+   domains with valid `path="."` syntax for Android 12+ device-to-device transfers.
+5. **Token refresh no longer updates `lastSuccessfulRead`.** `performRefresh` leaves
+   `lastSuccessfulRead` untouched so `ReadSession.lastSuccess` reflects only actual data reads.
+6. **`RoomSnapshotCache` query adds `ORDER BY id ASC`.** `CloudObjectsDao.load` sorts cached
+   rows by ID, eliminating cold-start vs. post-fetch reshuffling.
+7. **`InMemorySnapshotCache` filters tombstones on full store.** `store` with `full = true`
+   filters `!it.deleted` before sorting, matching `RoomSnapshotCache` behavior.
+8. **Broadened StrongBox exception handling in `DeviceKeyStore`.** `generate()` catches
+   all `Exception` during StrongBox key generation, falling back cleanly on devices
+   that throw `ProviderException`, `IllegalStateException`, or wrapped `KeyStoreException`.
+9. **Positivity guard on `expires_in` during pairing.** `pair()` guards `expiresIn` with
+   `takeIf { it > 0.0 }`, defaulting to `defaultContextLifetime` if zero or negative.
+10. **Zero-length DER INTEGER throws `EcdsaException`.** In `Ecdsa.readInteger()`,
+    `intLen == 0` is checked explicitly, throwing `EcdsaException("zero-length INTEGER")`.
+
+**Revised 2026-09-14 (rebase; Step 2 implemented).** `main` moved from
+`ff1f2aa` (#294) to **`52996a7`** (#302) in the course of 2026-09-14: #295
+(separate automatic backend selection from overrides), #296 (local-day
+completion matching), #297 (clear snapshot-gate baselines), #299 (hosted
+Windows CI), #301 (local-backend origin regression vectors) and #302 (iOS
+device validation). None of these touch `android/`, so **this branch was
+rebased onto `52996a7` with no conflicts** (pre-rebase backup:
+`backup/android-client-2-pre-rebase`). **Step 2 (#194) is now implemented on
+this branch and committed** — one commit on top of the plan note: `CloudSession`
+owns the reader-context lifecycle (single-flight refresh under a `Mutex`,
+conservative two-strike revocation, generation-stamped cache writes so an
+in-flight read cannot write back after a removal or re-pairing); `CloudClient`
+signs the requests over a capped, redirect-free `HttpURLConnection` transport;
+the Room snapshot cache is keyed on the server's revision with revision-gated
+upserts and tombstone deletes; the credential store is
+EncryptedSharedPreferences; the JSON value model round-trips unknown kinds for
+forward compatibility. Wired via `WatTrackerApplication`, with Tink R8 keep
+rules and an exported Room schema. `:app:assembleDebug` and
+`:app:testDebugUnitTest` are green (53 tests). It opened as **PR #304** on
+2026-09-15; the review's fixes are in the 2026-09-15 note above.
+
+**Revised 2026-09-14 — re-verified with `gh` against `main` at `ff1f2aa`.**
+The one blocker for Step 2 has landed:
+
+1. **PR #266 is in** — via **PR #294** ("Android: settle the local transport
+   as HTTPS, and clear the #257 follow-ups", head
+   `land/266-local-transport-https`), merged 2026-09-14 as `ff1f2aa`. The
+   original #266 PR was closed by that landing (same diff, re-based). #260
+   is closed. Everything the 2026-09-11 notes said was "in flight on
+   `docs/local-transport-https`" is now on `main`: the strict-NSC wording
+   (main + debug), the release-host guard reading the same
+   `releaseCloudAuthority` val, the `keepRules` source set (R8 reads it),
+   the `ExampleUnitTest`/`androidx.test.ext:junit` removal, and the
+   `wtDarkColorScheme` surface mapping. **No Step 2 branch may re-land any
+   of it.**
+2. **#193 is closed** (2026-09-14) — the owner confirmed the
+   tablet-in-portrait screenshot; the Step 1 chain is fully out. **#194 is
+   the next startable Android issue and is labelled `ready`** (verified
+   2026-09-14); #195–#199 remain `blocked` as labelled.
+3. **The shared queue has moved** (AGENTS.md refreshed at #267). Top item
+   is #277's two defects (open PR `agent2/277-cloud-sync-followups`); then
+   #156's third product answer, #280 (legacy completions), #281 (iOS
+   prefer-desktop), #258's two test vectors (fold into the next iOS
+   change), #249 (re-scoped: no more local runs — needs taksmon's log).
+   The Android epic is not on the queue and is taksmon's by assignee —
+   say so when starting #194. **Do not touch iOS files**: #258's code has
+   landed as #268 (local backend) + #275 (its residuals); #258 stays open
+   for the device run and the `Location` follow-up.
+4. **#156 is closed** (merged 2026-09-13 via #274): the desktop app
+   enrolls, pairs, manages devices and pushes on a background scheduler —
+   per AGENTS.md, "cloud sync is on". What still gates the "real
+   deployment" half of #199 is #102 alone (the unexecuted hosting
+   runbook). #264 (one device-validation procedure, cross-cutting) is
+   unassigned; its Android half is taksmon's — ask before taking it.
 
 **Revised 2026-09-09 — local transport settled.** The #257 review's open
 transport question and the tailnet requirement recorded on #192 (2026-09-08)
@@ -116,7 +300,7 @@ since the 2026-09-01 draft:
 |---|---|
 | `.fit` file uploads | **Dropped from scope** (2026-09-01). No assigned issue covers it; the cloud API has no `.fit` route (sync plane takes parsed objects only) and the local server's `POST /activities/upload` predates this work. Revisit later as a new issue. |
 | Architecture | **Dual backend.** (1) Cloud read plane as #194–#198 specify (pairing code → Keystore P-256 → signed context refresh → `GET /api/v1/context/*` with the bearer reader context). (2) Local desktop server via the **connector model**: device token paired in the web UI Settings → session → local JSON API (`/api/state`, `/api/activities`, …), reached **over HTTPS through the rider's own reverse proxy** (see the transport row below). Screens read through one common `ReadModel` interface with one adapter per backend. |
-| Local backend transport | **HTTPS only, terminated by whatever front end the rider runs** (owner, 2026-09-09). The requirement is TLS in front of the local server — **`tailscale serve` and an ordinary reverse proxy (nginx, Caddy) are both accepted**, and the app cannot tell them apart: it sees an HTTPS origin with a chain to a system trust anchor. The tailnet stays a valid deployment for anyone who wants it; it is no longer a *requirement*, because it was the mechanism the #192 comment (2026-09-08) picked, not the property it argued for. In either case the desktop server keeps its loopback bind and speaks plain http to a co-located terminator. The app never speaks cleartext in a release build: `usesCleartextTraffic="false"`, release `network_security_config.xml` strict, **no `domain-config`, no pinning, no custom `TrustManager`**. **No hostname is baked in anywhere** — the rider types the origin, so any front end, name, port or vhost works. **The terminator must also not be publicly reachable** (owner, 2026-09-09): `tailscale serve`, nginx or Caddy on a LAN-only bind, or a VPN all qualify; an internet-facing proxy does not. The tailnet was providing that property silently, and widening to any terminator would have dropped it — an nginx satisfies the other three while bound to `0.0.0.0` and port-forwarded. It is load-bearing beyond transport secrecy: per the reasoning on #132 item 4, the `WATTRACKER_HOST` default of `127.0.0.1` is what keeps the first-account land grab unreachable, and **a reverse proxy defeats that even with the server still bound to loopback, because the proxy is what accepts the connection**. The land-grab window itself is narrow (`/welcome` gates on `_first_run()`, so it cannot mint a second account), but `/login` and the whole desktop UI would be internet-facing, and none of the app's auth was designed against an internet-facing threat model. The server keeps binding loopback and `WATTRACKER_ALLOW_NON_LOOPBACK` stays unset. This keeps all four properties #192's comment mandated (strict release NSC, no raw-socket transport, loopback bind preserved, terminator not publicly reachable) while requiring no third-party account of a rider who does not already have one. Supersedes both options the #257 review put up: the raw-socket cleartext path and the self-signed cert pinned at pairing. The decision and its code/doc changes ride together in **PR #266** (open, branch `docs/local-transport-https`, closes #260) — until it merges, the strict-NSC description in this plan is the in-flight tree, not `main`. |
+| Local backend transport | **HTTPS only, terminated by whatever front end the rider runs** (owner, 2026-09-09). The requirement is TLS in front of the local server — **`tailscale serve` and an ordinary reverse proxy (nginx, Caddy) are both accepted**, and the app cannot tell them apart: it sees an HTTPS origin with a chain to a system trust anchor. The tailnet stays a valid deployment for anyone who wants it; it is no longer a *requirement*, because it was the mechanism the #192 comment (2026-09-08) picked, not the property it argued for. In either case the desktop server keeps its loopback bind and speaks plain http to a co-located terminator. The app never speaks cleartext in a release build: `usesCleartextTraffic="false"`, release `network_security_config.xml` strict, **no `domain-config`, no pinning, no custom `TrustManager`**. **No hostname is baked in anywhere** — the rider types the origin, so any front end, name, port or vhost works. **The terminator must also not be publicly reachable** (owner, 2026-09-09): `tailscale serve`, nginx or Caddy on a LAN-only bind, or a VPN all qualify; an internet-facing proxy does not. The tailnet was providing that property silently, and widening to any terminator would have dropped it — an nginx satisfies the other three while bound to `0.0.0.0` and port-forwarded. It is load-bearing beyond transport secrecy: per the reasoning on #132 item 4, the `WATTRACKER_HOST` default of `127.0.0.1` is what keeps the first-account land grab unreachable, and **a reverse proxy defeats that even with the server still bound to loopback, because the proxy is what accepts the connection**. The land-grab window itself is narrow (`/welcome` gates on `_first_run()`, so it cannot mint a second account), but `/login` and the whole desktop UI would be internet-facing, and none of the app's auth was designed against an internet-facing threat model. The server keeps binding loopback and `WATTRACKER_ALLOW_NON_LOOPBACK` stays unset. This keeps all four properties #192's comment mandated (strict release NSC, no raw-socket transport, loopback bind preserved, terminator not publicly reachable) while requiring no third-party account of a rider who does not already have one. Supersedes both options the #257 review put up: the raw-socket cleartext path and the self-signed cert pinned at pairing. The decision and its code/doc changes **landed on `main` via PR #294 (merged 2026-09-14, `ff1f2aa`), which closed PR #266 and #260** — the strict-NSC description in this plan is `main`, not an in-flight tree. |
 | minSdk / targetSdk | minSdk **30** (Android 11, owner's floor; StrongBox API is 28+, Keystore EC P-256 is long stable). targetSdk **36** — Google Play has required API 36+ for new apps and updates **since 2026-08-31** (verify current policy at implementation time). |
 | Release CI runner (#199) | **Hosted `ubuntu-latest`** (owner, on #257; supersedes the earlier "deferred, plan for `macos-ci`" answer, which predated the repo going public). Standard hosted runners are unmetered on a public repo and `cloud.yml` already runs `bicep-validation` and `containerized` on `ubuntu-latest`. `macos-release.yml`'s `if: ${{ false }}` and any note claiming Actions are blocked at the account level are stale. The build/unit-test job (**#259**) **has landed**: `.github/workflows/android.yml` (PR #262, merged 2026-09-10), encoding both gotchas — `compileSdk 37` is not on the runner image (SDK licences accepted so AGP can fetch it) and `gradle/gradle-daemon-jvm.properties` pins `toolchainVersion=25` (pinned with `setup-java`, or Gradle re-downloads a JDK from foojay every run) — plus two deliberate deviations from the #257 sketch: `:app:assembleRelease -PallowPlaceholderHost` is in the job (it is the task that reads `keepRules/rules.keep`, where Step 2's Room/Tink rules go; the flag suppresses only the placeholder-host guard while #102 is open) and the test-report upload is `continue-on-error`. Do **not** copy `cloud.yml`'s fork gate: it exists for a persistent physical runner, and a hosted ephemeral Android job can safely cover fork PRs. |
 | HTTP client | `HttpURLConnection` (plain, no deps). **Note:** issue #193 names "HttpURLConnection or `java.net.http`", but `java.net.http.HttpClient` does not exist in the Android SDK (JDK-11 API, never ported) — the choice is unambiguous. |
@@ -126,37 +310,47 @@ since the 2026-09-01 draft:
 | IDE agent | **Android Studio 4's built-in Agent mode with BYOK** (owner, 2026-09-06). First-party, supported feature of the IDE — not a community plugin, no MCP servers, no npm bridges, no `.kilo` MCP registration. The owner's API key lives in IDE-local settings only, never in the repo. Dev accelerator, not infrastructure: every Done criterion stands on `./gradlew` + `adb`, which is also what CI runs. |
 | Local calendar data | Owner-approved (2026-09-01, unchanged): **extract the month builder out of `calendar_view` and serve it from a new read-only `GET /api/calendar?year=&month=` JSON route** in `wattracker/server.py`, so the HTML page and the app render the same data by construction. Verified still absent on 2026-09-06. Lands as a small server PR (green Python suite) before Step 6; it is the one local-backend exception to "no server changes". |
 
-## Issue state (verified 2026-09-11 with `gh`)
+## Issue state (issue labels as of the 2026-09-14 `gh` check; branch rebased onto `52996a7`, 2026-09-14)
 
-- #192 (epic) open. **#193 open only for one check**: #257 merged
-  (2026-09-08) and auto-closed it; the owner reopened it scoped to the
-  tablet-in-portrait screenshot the Done list requires (Android 16 ignores
-  orientation locks on large screens — the #171 lesson: evidence it, don't
-  assume it). A collaborator attached the screenshot; the issue stays open
-  until the owner confirms (standing pattern for checks CI cannot perform).
-  **#194 is the next startable Android issue** — still labelled `blocked`,
-  which is stale (the #193 chain is satisfied); say so when starting it.
-  #195–#199 remain `blocked` as labelled (screens also on #194/#195).
+- #192 (epic) open. **#193 closed** (2026-09-14 — the owner confirmed the
+  tablet-in-portrait screenshot that #257's re-opening was scoped to).
+  **#194 is the next startable Android issue and is labelled `ready`**
+  (verified 2026-09-14; the stale `blocked` label is gone). #195–#199
+  remain `blocked` as labelled (screens also on #194/#195).
 - Merged/closed and relied on here: #153 (device revocation routes), #165
   (deployment checks — and the APIM removal that followed), #167 (rider
   isolation + `cloud_objects_v1.json` fixture), **#240** (full-snapshot
   cloud dev harness, on `main` since 2026-09-06, closes #234), **#257**
   (Step 1 skeleton, on `main` since 2026-09-08), **#262** (Android CI, on
-  `main` since 2026-09-10, closes #259).
-- In flight: **#266** (open, branch `docs/local-transport-https` — this
-  checkout): the local-transport decision + the four #260 follow-ups; closes
-  #260 when merged. Land it before Step 2 code.
-- Still open and relevant: **#156** (turn cloud sync on in the desktop app —
-  a *deployed* cloud's pairing codes are minted from the desktop's writer
-  credential) and **#102** (hosting decision — `infra/azure/DEPLOY.md` is an
-  *unexecuted* runbook). Both gate only the "real deployment" half of #199's
-  Done; the dev harness and the local backend are unaffected.
-- **Queue rule:** the refreshed AGENTS.md work queue (#263, then #267) still
-  carries no Android epic item — announce before starting #194. Its top items
-  are #249 (rotating full-suite flakes, open) and #258 (iOS local backend,
-  `ready`, `agent:codex`) — in-flight iOS epic work; do not touch iOS files.
-  #228 closed as superseded; #234 closed via #240; #256 (iOS calendar/
-  volume for #163) merged.
+  `main` since 2026-09-10, closes #259), **#274** (desktop cloud sync, on
+  `main` since 2026-09-13, closes #156), **#294** (lands the #266
+  transport decision + #260 follow-ups, on `main` since 2026-09-14).
+- In flight: **Step 2 (#194) — the cloud client and offline cache — is
+  implemented on `feature/android-client-2`** (this checkout, rebased onto
+  `main` at `52996a7`) and open as **PR #304**; the owner's
+  CHANGES_REQUESTED review of 2026-09-15 is addressed on the branch
+  (see the 2026-09-15 note above), push held for re-review. The local-backend
+  seam (`LocalClient`) stays an honest stub for its own later step. Announced
+  per the queue rule below.
+- Still open and relevant: **#102** (hosting decision —
+  `infra/azure/DEPLOY.md` is an *unexecuted* runbook). It alone gates the
+  "real deployment" half of #199's Done; #156 (desktop cloud sync, which
+  mints pairing codes against a deployment) closed via #274, so the
+  desktop side exists on `main`. The dev harness and the local backend are
+  unaffected either way.
+- **Queue rule:** the refreshed AGENTS.md work queue (#267) carries no
+  Android epic item — "the Android epic (#192–#199, plus #259 and #260) is
+  taksmon's by GitHub assignee and is not on this queue"; announce before
+  starting #194. Its top items are #277's two defects (the snapshot gate
+  swallowing a push; the endpoint guard discarding the kill switch — open
+  PR `agent2/277-cloud-sync-followups`), then #156's third product answer,
+  #280 (legacy completions), #281 (iOS prefer-desktop) and #249 (re-scoped:
+  the next step is taksmon's log, not another local run). **Do not touch
+  iOS files**: #258's code landed as #268 (local backend) + #275
+  (residuals); #258 stays open for the device run and the `Location`
+  follow-up, with two test vectors to fold into the next iOS change. #264
+  (one device-validation procedure) is unassigned and cross-cutting — its
+  Android half is taksmon's; ask before taking it.
 
 ## Ground truth (verified against the code on 2026-09-06; issue state and CI
 re-verified with `gh` on 2026-09-11)
@@ -360,8 +554,8 @@ reference. #228 closed as superseded.)
   at `127.0.0.1`, not from the phone browser.
 - **`WATTRACKER_COOKIE_SECURE` goes in the launch environment, not a shell
   export.** Same care as any other server env var set for a phone-facing run.
-- **Docs corrected 2026-09-09** (was Step-1 debt; done in #266, in flight —
-  on `main` only once it merges): `android/README.md` no longer claims the
+- **Docs corrected 2026-09-09** (was Step-1 debt; **on `main` since PR
+  #294 landed #266, 2026-09-14**): `android/README.md` no longer claims the
   emulator needs `WATTRACKER_HOST=0.0.0.0` +
   `WATTRACKER_ALLOW_NON_LOOPBACK=1` — it needs neither — and both shipped
   config comments have dropped the superseded LAN framing (#260, item 3).
@@ -819,10 +1013,11 @@ not re-derive:**
 >    **Resolved 2026-09-09: HTTPS only, terminated by whatever front end the
 >    rider runs** — no raw socket, no `domain-config`, no pinning; the
 >    release NSC stays strict and `LocalClient` becomes an ordinary
->    `HttpsURLConnection` caller. The code/doc change is PR #266 (in flight,
->    closes #260). Spec in 2.3, rationale in the Resolved decisions table.
->    **Land #266 before Step 2 code** so the strict NSC, the release-host
->    guard and the `keepRules` wiring are what CI verifies.
+>    `HttpsURLConnection` caller. **Landed on `main` via PR #294 (merged
+>    2026-09-14, `ff1f2aa`); PR #266 and #260 are closed.** Spec in 2.3,
+>    rationale in the Resolved decisions table. Step 2 builds on the strict
+>    NSC, the release-host guard and the `keepRules` wiring as CI verifies
+>    them.
 
 Nothing in Step 2 touches the shell or the theme — `RootScreen.kt`, the
 `Destination` enum and `Palette.kt` are stable unless a new destination or
@@ -888,11 +1083,10 @@ colour is introduced by pairing (#195).
 
 > [!NOTE]
 > Step 1 is merged (PR #257, `6830150a`); `feature/android-client` is
-> deleted on the remote. `plan.md` and `android/README.md` are on `main` and
-> also carry the in-flight #266 changes — the current checkout is
-> `docs/local-transport-https` (4 commits over `main`). Continue plan edits
-> on that branch until #266 merges; then cut the Step 2 branch from the
-> merged `main`, not from a detached checkout.
+> deleted on the remote. #266 is on `main` (via PR #294, 2026-09-14,
+> `ff1f2aa`). The current checkout is **`feature/android-client-2`**, cut
+> from the merged `main` at `ff1f2aa` — the Step 2 branch. Plan edits and
+> Step 2 code land on it.
 
 ---
 
@@ -1358,12 +1552,12 @@ Code/config:
    track (invite by email, Play Install on the device, the app is sideloaded —
    pairing still goes through the in-app pairing screens), how to promote a
    build, how to rotate the upload key.
-4. **The "pair against a real deployment" half is gated on #102 + #156:**
-   the deployment is an unexecuted runbook and the desktop app does not yet
-   mint pairing codes against it. Nothing here blocks on that — the internal
-   track can run and riders can pair against the dev harness / local backend —
-   but say so in the PR description if the Done wording implies a deployed
-   cloud.
+4. **The "pair against a real deployment" half is gated on #102 alone:**
+   the deployment is an unexecuted runbook; the desktop app can already
+   mint pairing codes against a deployment (#156 closed via #274,
+   2026-09-13). Nothing here blocks on that — the internal track can run
+   and riders can pair against the dev harness / local backend — but say
+   so in the PR description if the Done wording implies a deployed cloud.
 
 **Done (per #199):** both riders install from the internal track and pair
 (with a code — harness/local until the deployment exists); release job runs
@@ -1435,13 +1629,12 @@ inspection).
   only real exposure is the BYOK key — it lives in IDE-local settings on one
   machine and must never enter the repo, a PR, a screenshot of Settings, or a
   log. Rotate the key if it is ever printed.
-- **PR #266 in flight.** The transport decision and the four #260
-  follow-ups (release-host guard reading the value it guards, `keepRules`
-  wired to R8, test/cleanup, `wtDarkColorScheme` surface mapping) live in
-  the open PR #266 (branch `docs/local-transport-https`, closes #260).
-  Land it before Step 2 code so the strict NSC, the guard and the
-  `keepRules` file are what CI verifies — and do not re-land any of those
-  changes in a Step 2 branch.
+- **Step 2 must not re-land #266's work.** The transport decision and the
+  four #260 follow-ups (release-host guard reading the value it guards,
+  `keepRules` wired to R8, test/cleanup, `wtDarkColorScheme` surface
+  mapping) are on `main` since PR #294 (2026-09-14). If a Step 2 change
+  appears to need any of it, that is a divergence to raise on the issue, not
+  a fix to re-apply in a Step 2 branch.
 - **Android 16 large-screen behavior (targetSdk 36):** orientation locks are
   ignored on large screens — the iOS twin of this bug cost #171 a
   measurement. Mitigation: the 0.2 AVD measurement is a Step-1 prerequisite
@@ -1454,12 +1647,14 @@ inspection).
   prominent Revoke guidance, "remove this device" copy that doesn't overclaim.
   Accepted by the owner (the connector model is the explicit request);
   document in `android/README.md`.
-- **Deployed cloud does not exist yet.** #102's deployment is an unexecuted
-  runbook; #156 (desktop cloud sync, which mints pairing codes on a real
-  deployment) is unmerged. Consequence: #199's "pair with a code" and any
-  "real cloud" validation run against the harness or the local backend until
-  both land. APIM is no longer in the picture at all — there is no gateway
-  gap to close, only a deployment to execute.
+- **Deployed cloud does not exist yet.** #102's deployment is an
+  unexecuted runbook. #156 (desktop cloud sync, which mints pairing codes
+  against a deployment) **closed 2026-09-13 via #274** — the desktop half
+  is on `main`; only the hosting decision is left. Consequence: #199's
+  "pair with a code" and any "real cloud" validation run against the
+  harness or the local backend until #102 executes. APIM is no longer in
+  the picture at all — there is no gateway gap to close, only a deployment
+  to execute.
 - **Cloud self-revocation is a documented server trade-off.** The revoke
   route deliberately allows any same-scope credential — including the target
   — to revoke (a lost-phone rider has the other device in hand). Corollary:
@@ -1504,8 +1699,9 @@ cache (#194) → 3 pairing (#195) → 3b local-calendar server PR (shared
 `build_calendar_month` + read-only `GET /api/calendar`, green Python suite)
 → 4/5/6 screens (#196, #197, #198 — independent of each other after #195;
 #198's local half needs 3b) → 7 Play internal testing (#199, unblocked by
-#193 but its Done criterium needs #195). Precondition for Step 2: **merge
-#266** (transport + #260 follow-ups) so #194 lands on top of it. The
+#193 but its Done criterium needs #195). Precondition for Step 2 — **merge
+#266** (transport + #260 follow-ups) — is **satisfied** (PR #294,
+2026-09-14; #194 lands on top of it). The
 external dependency previously tracked — PR #240 (#234) merging — is
 **satisfied** (merged 2026-09-06; the harness is on `main`). Each step ends
 with its issue's Done criteria checked, android.yml green, and a PR
