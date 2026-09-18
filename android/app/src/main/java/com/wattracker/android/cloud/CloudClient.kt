@@ -188,12 +188,12 @@ class CloudClient(
         val params = buildList {
             if (since != null) add("since" to since.toString())
             if (cursor != null) add("cursor" to cursor)
-            // The server's default page is 100 objects at up to 512 KiB each
-            // (a 50 MiB response); the transport's 4 MiB cap would truncate
-            // it, and a truncated page fails on every read, not just the
-            // first. A bounded page keeps the worst case under the cap --
-            // see COLLECTION_PAGE_LIMIT.
-            add("limit" to COLLECTION_PAGE_LIMIT.toString())
+            // The server only paginates mobile=True routes (servesDeltas). Sending
+            // limit on non-mobile routes (calendar, profile, races) applies the
+            // limit without returning a next_cursor, truncating the response.
+            if (route.servesDeltas) {
+                add("limit" to COLLECTION_PAGE_LIMIT.toString())
+            }
         }
         val response = transport.send(
             CloudRequest(
@@ -414,13 +414,10 @@ class CloudClient(
         private const val SIGNATURE_ALGORITHM = "ecdsa-p256-sha256"
 
         /**
-         * The page size every collection read asks for. Worst case is five
-         * objects at the server's 512 KiB payload ceiling -- 2.5 MiB plus
-         * envelope overhead, under the transport's 4 MiB cap. The walk pays
-         * the smaller page back in a few extra cursor requests, far inside
-         * the durable read quota (50 000 requests a day).
+         * The page size every paginated collection read asks for. Matches the
+         * server's maximum query limit (100 objects).
          */
-        internal const val COLLECTION_PAGE_LIMIT = 5
+        internal const val COLLECTION_PAGE_LIMIT = 100
     }
 }
 

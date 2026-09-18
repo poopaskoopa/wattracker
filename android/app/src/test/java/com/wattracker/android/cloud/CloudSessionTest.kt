@@ -433,6 +433,24 @@ class CloudSessionTest {
         )
     }
 
+    @Test
+    fun anUnpaginatedCollectionReadDoesNotSendALimit() = runTest {
+        makePairedSession { request ->
+            when {
+                request.url.contains("/context/refresh") ->
+                    CloudResponse(200, refreshJson("ctx-1", 300.0).toByteArray(), null, nowMillis)
+                else ->
+                    CloudResponse(200, collectionJson(listOf(profileItem(1)), 1, null).toByteArray(), null, null)
+            }
+        }
+        session.load(CloudRoute.Calendar)
+        val request = transport.requests.first { it.url.contains("/context/calendar") }
+        assertFalse(
+            "unpaginated routes must not send limit query parameter",
+            request.url.contains("limit="),
+        )
+    }
+
     // MARK: - Restart: the cache must not out-veto a new process
 
     @Test
