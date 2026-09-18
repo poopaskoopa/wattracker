@@ -130,6 +130,24 @@ class CloudSessionTest {
         assertEquals(CloudSession.DeviceState.paired, session.deviceState)
     }
 
+    @Test
+    fun aFailedDataReadAfterSuccessfulRefreshDoesNotUpdateLastSuccess() = runTest {
+        makePairedSession { request ->
+            when {
+                request.url.contains("/context/refresh") ->
+                    CloudResponse(200, refreshJson("ctx-1", 300.0).toByteArray(), null, nowMillis)
+                request.url.contains("/context/dashboard") ->
+                    CloudResponse(500, "error".toByteArray(), null, null)
+                else -> throw AssertionError("unexpected ${request.url}")
+            }
+        }
+        assertNull(session.lastSuccess)
+        try {
+            session.load(CloudRoute.Dashboard)
+        } catch (_: Exception) {}
+        assertNull("lastSuccess must remain null if data read failed", session.lastSuccess)
+    }
+
     // MARK: - Reads
 
     @Test
