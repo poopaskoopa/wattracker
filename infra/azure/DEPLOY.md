@@ -46,10 +46,33 @@ only by `WATTRACKER_CLOUD_PLANE`. Keep the parameter file's placeholders in
 source control and copy the same full image reference—and therefore the same
 exact digest—into both values only in the deployment copy.
 
-GHCR creates the package private on its first push. The package owner must
-flip it to Public once in the package settings; until then, Container Apps
-needs a registry pull credential. The publishing workflow cannot change that
-package visibility.
+The package is **public** and needs no registry pull credential. A package
+published by Actions from a public repository inherits that repository's
+visibility, so `wattracker-cloud` was public from its first push — there is no
+visibility flip to perform, and `main.bicep` needs no `registries` block or
+stored PAT. Verified 2026-09-18 by fetching the manifest from `ghcr.io` with an
+anonymous pull token.
+
+The published digest is an **OCI image index, not a single manifest**, because
+`docker/build-push-action` attaches a provenance attestation by default. The
+index for the first published digest holds two entries:
+
+```text
+application/vnd.oci.image.index.v1+json
+  linux/amd64       sha256:ae4982dcb892bee2...
+  unknown/unknown   sha256:3847548a06c26e79...   attestation-manifest
+```
+
+That is expected, and the `unknown/unknown` entry is the attestation rather
+than a broken platform — a runtime selects `linux/amd64` and ignores it. Pin
+the **index** digest (the one the run Summary prints), which is what cosign
+signed and what the verify command above checks.
+
+Confirm the digest actually pulls on Container Apps before completing a
+deployment with it. If a pull path ever rejects the attestation-bearing index,
+the fix is `provenance: false` in the build step followed by a re-publish and a
+fresh digest — never a switch to a mutable tag, which would discard the
+signature this whole path exists to produce.
 
 ## Prerequisites and secret handling
 
