@@ -57,7 +57,7 @@ data class MetaEntity(
 
 @Dao
 interface CloudObjectsDao {
-    @Query("SELECT * FROM objects WHERE route = :route")
+    @Query("SELECT * FROM objects WHERE route = :route ORDER BY id ASC")
     fun load(route: String): List<CloudObjectEntity>
 
     /** Replace one row; the caller gates on revision first (a delta). */
