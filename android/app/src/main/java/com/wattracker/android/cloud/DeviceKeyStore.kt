@@ -4,7 +4,6 @@ import android.os.Build
 import android.security.keystore.KeyGenParameterSpec
 import android.security.keystore.KeyInfo
 import android.security.keystore.KeyProperties
-import android.security.keystore.StrongBoxUnavailableException
 import java.security.InvalidKeyException
 import java.security.Key
 import java.security.KeyFactory
@@ -129,8 +128,9 @@ class DeviceKeyStore {
             val generator = KeyPairGenerator.getInstance(KEY_ALGORITHM, KEYSTORE)
             generator.initialize(strongBox)
             return generator.generateKeyPair()
-        } catch (e: StrongBoxUnavailableException) {
-            // No StrongBox IC: fall through to the hardware/software Keystore.
+        } catch (_: Exception) {
+            // StrongBox unavailable or rejected by hardware/provider (StrongBoxUnavailableException,
+            // ProviderException, IllegalStateException): fall through to TEE/software Keystore.
         }
 
         val generator = KeyPairGenerator.getInstance(KEY_ALGORITHM, KEYSTORE)
