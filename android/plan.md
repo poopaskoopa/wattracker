@@ -113,10 +113,40 @@ non-blocking notes; every point is addressed on this branch:
    keeps the original wipe failure as the primary exception. `decodeUtf8`
    is the decoder's one-liner. Leftover blank lines are gone.
 
-`:app:assembleDebug`, `:app:testDebugUnitTest` (78 tests) and
+`:app:assembleDebug`, `:app:testDebugUnitTest` (84 tests) and
 `:app:assembleRelease :app:bundleRelease -PallowPlaceholderHost` are green
 locally; the guard's refusal of an unflagged `bundleRelease` is verified
-the same way. Push held for the owner's re-review.
+the same way.
+
+**Revised 2026-09-17 — PR #304 review (10 findings) addressed & rebased.**
+The branch was rebased onto `main` (`71abea5`). All 10 findings from the owner's
+2026-09-17 review on PR #304 are addressed on this branch and committed:
+
+1. **Unpaginated routes (`calendar`, `profile`, `races`) no longer send `limit=5`.**
+   `CloudClient.collection` appends `limit` only when `route.servesDeltas` is `true`.
+   Unpaginated routes return full collections without truncation or cursor gaps.
+2. **Page limit raised from 5 to 100.** `COLLECTION_PAGE_LIMIT` in `CloudClient` is 100
+   (matching the server's max query limit). Up to 50 pages allows complete delta
+   walks for up to 5,000 objects without hitting a premature 250-item ceiling.
+3. **`pair()` clears `RemovalGate`.** In `CloudSession.pair()`, `removalGate.clearPending()`
+   is called once the new credential is saved, preventing a prior failed sign-out
+   from wiping the newly paired device on relaunch.
+4. **`data_extraction_rules.xml` excludes database and sharedpref domains.**
+   Explicit `<exclude>` tags cover `root`, `database`, `sharedpref`, `file`, and `external`
+   domains with valid `path="."` syntax for Android 12+ device-to-device transfers.
+5. **Token refresh no longer updates `lastSuccessfulRead`.** `performRefresh` leaves
+   `lastSuccessfulRead` untouched so `ReadSession.lastSuccess` reflects only actual data reads.
+6. **`RoomSnapshotCache` query adds `ORDER BY id ASC`.** `CloudObjectsDao.load` sorts cached
+   rows by ID, eliminating cold-start vs. post-fetch reshuffling.
+7. **`InMemorySnapshotCache` filters tombstones on full store.** `store` with `full = true`
+   filters `!it.deleted` before sorting, matching `RoomSnapshotCache` behavior.
+8. **Broadened StrongBox exception handling in `DeviceKeyStore`.** `generate()` catches
+   all `Exception` during StrongBox key generation, falling back cleanly on devices
+   that throw `ProviderException`, `IllegalStateException`, or wrapped `KeyStoreException`.
+9. **Positivity guard on `expires_in` during pairing.** `pair()` guards `expiresIn` with
+   `takeIf { it > 0.0 }`, defaulting to `defaultContextLifetime` if zero or negative.
+10. **Zero-length DER INTEGER throws `EcdsaException`.** In `Ecdsa.readInteger()`,
+    `intLen == 0` is checked explicitly, throwing `EcdsaException("zero-length INTEGER")`.
 
 **Revised 2026-09-14 (rebase; Step 2 implemented).** `main` moved from
 `ff1f2aa` (#294) to **`52996a7`** (#302) in the course of 2026-09-14: #295
