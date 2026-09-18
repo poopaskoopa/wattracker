@@ -7,15 +7,18 @@
     variants name device-protected storage, which this app does not use; the
     plain domains cover its ordinary app data.)
 
-    The app's entire on-disk state is the Room cache (databases/) and the
-    credential plus removal prefs (shared_prefs/), both under the root the
-    one exclude covers; the signing key itself is in the Keystore, which no
-    transfer mechanism can carry. See the AndroidManifest comment for the
-    credentials rationale.
+    The app's entire on-disk state is excluded across all domains (root,
+    database, sharedpref, file, external), including the Room cache (database)
+    and EncryptedSharedPreferences (sharedpref). The signing key itself is in
+    the Keystore, which no transfer mechanism can carry. See AndroidManifest.xml.
 -->
 <data-extraction-rules>
     <cloud-backup />
     <device-transfer>
-        <exclude domain="root" path="./" />
+        <exclude domain="root" path="." />
+        <exclude domain="database" path="." />
+        <exclude domain="sharedpref" path="." />
+        <exclude domain="file" path="." />
+        <exclude domain="external" path="." />
     </device-transfer>
 </data-extraction-rules>
