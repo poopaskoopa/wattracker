@@ -156,6 +156,9 @@ _MAX_DEVICE_LABEL: Final = 48
 # Two riders, four devices.  The ceiling exists so a listing is bounded by
 # something other than what happens to be in the table.
 MAX_DEVICE_LISTING: Final = 64
+# The operator listing is bounded by the registry capacity, but this public
+# bound keeps the response contract explicit for callers and tests.
+MAX_WRITER_LISTING: Final = 64
 
 
 class SecurityStateUnavailable(RuntimeError):
@@ -1663,6 +1666,11 @@ def _writer_value(credential: WriterCredential) -> dict[str, Any]:
         credential.subscription_key
     )
     return {
+        # The row key is sha256(credential_id), so retaining the opaque id in
+        # the value is necessary for a durable operator listing.  It is not
+        # authentication material and is checked against the row address when
+        # listing records.
+        "credential_id": credential.credential_id,
         "namespace": credential.namespace,
         "local_user_scope": credential.local_user_scope,
         "verification_key": _encode_bytes(credential.verification_key),
@@ -1678,6 +1686,9 @@ def _writer_value(credential: WriterCredential) -> dict[str, Any]:
 def _writer_from_value(
     credential_id: str, value: Mapping[str, Any]
 ) -> WriterCredential:
+    stored_id = value.get("credential_id", credential_id)
+    if not isinstance(stored_id, str) or not hmac.compare_digest(stored_id, credential_id):
+        raise ValueError("persisted credential id is invalid")
     subject = value.get("subject")
     capabilities = value.get("capabilities")
     return WriterCredential(
@@ -2596,7 +2607,10 @@ class CredentialRegistry:
         if not isinstance(credential_id, str) or _HEX_ID_RE.fullmatch(credential_id) is None:
             return None
         with self._lock:
-            return self._find_writer_locked(credential_id)
+            writer = self._find_writer_locked(credential_id)
+            if writer is not None:
+                return writer
+            return self._legacy_writer_locked(credential_id)
 
     def get_writer(self, credential_id: str) -> WriterCredential | None:
         """Resolve only active writers; unknown and revoked are both ``None``."""
@@ -2628,13 +2642,35 @@ class CredentialRegistry:
         if not isinstance(credential_id, str) or _HEX_ID_RE.fullmatch(credential_id) is None:
             return False
         with self._lock:
-            digest = self._credential_digest(credential_id)
             credential = self._find_writer_locked(credential_id)
-            if credential is None or credential.revoked:
+            if credential is not None:
+                if credential.revoked:
+                    return False
+                self._write_writer_locked(
+                    replace(credential, active=False, revoked=True)
+                )
+                return True
+            if self._backend is None:
                 return False
-            self._write_writer_locked(
-                replace(credential, active=False, revoked=True)
-            )
+            legacy = self._legacy_writer_locked(credential_id)
+            if legacy is None or legacy.revoked:
+                return False
+
+            def revoke_legacy(value: Mapping[str, Any] | None) -> Mapping[str, Any]:
+                if not isinstance(value, Mapping) or "credential_id" in value:
+                    raise ValueError("legacy writer row is invalid")
+                try:
+                    current = _writer_from_value(credential_id, value)
+                except (KeyError, TypeError, ValueError) as exc:
+                    raise ValueError("legacy writer row is invalid") from exc
+                if current.revoked:
+                    raise ValueError("legacy writer row is already revoked")
+                updated = dict(value)
+                updated["active"] = False
+                updated["revoked"] = True
+                return updated
+
+            self._backend.update("writer", credential_id, revoke_legacy)
             return True
 
     revoke = revoke_writer
@@ -2966,6 +3002,82 @@ class CredentialRegistry:
                             break
         found.sort(key=lambda item: (item.created_at, item.credential_id))
         return tuple(found)
+
+    def list_writers(
+        self, *, limit: int = MAX_WRITER_LISTING
+    ) -> tuple[WriterCredential, ...]:
+        """Return bounded writer status records for an authenticated operator.
+
+        Durable rows carry their own credential id because the backend address
+        stores only its digest.  A legacy row without that field is represented
+        by its validated row key, which is an opaque operator handle rather
+        than a recovered credential id.
+        """
+
+        bound = _validate_capacity(limit)
+        found: list[WriterCredential] = []
+        with self._lock:
+            if self._backend is not None:
+                for row_key, value in self._backend.iter_records(
+                    "writer", limit=self._capacity
+                ):
+                    if not isinstance(value, Mapping):
+                        continue
+                    stored_id = value.get("credential_id")
+                    if stored_id is None:
+                        credential = self._legacy_writer_locked(row_key, value=value)
+                        if credential is None:
+                            continue
+                        found.append(credential)
+                        if len(found) >= bound:
+                            break
+                        continue
+                    if (
+                        not isinstance(stored_id, str)
+                        or _HEX_ID_RE.fullmatch(stored_id) is None
+                    ):
+                        continue
+                    if _HEX_ID_RE.fullmatch(row_key) is None:
+                        continue
+                    expected = bytes.fromhex(row_key)
+                    if not hmac.compare_digest(
+                        self._credential_digest(stored_id), expected
+                    ):
+                        continue
+                    try:
+                        credential = _writer_from_value(stored_id, value)
+                    except (KeyError, TypeError, ValueError):
+                        continue
+                    found.append(credential)
+                    if len(found) >= bound:
+                        break
+            else:
+                found.extend(self._writers.values())
+                found = found[:bound]
+        return tuple(sorted(found, key=lambda item: item.credential_id))
+
+    def _legacy_writer_locked(
+        self,
+        row_key: str,
+        *,
+        value: Mapping[str, Any] | None = None,
+    ) -> WriterCredential | None:
+        """Decode one pre-credential-id writer row using only its row key.
+
+        The row key is an operator handle, never an attempted inversion of the
+        credential digest.  Requiring the field to be absent also prevents a
+        malformed new row from entering the legacy path.
+        """
+
+        if self._backend is None or _HEX_ID_RE.fullmatch(row_key) is None:
+            return None
+        current = value if value is not None else self._backend.read("writer", row_key)
+        if not isinstance(current, Mapping) or "credential_id" in current:
+            return None
+        try:
+            return _writer_from_value(row_key, current)
+        except (KeyError, TypeError, ValueError):
+            return None
 
     @staticmethod
     def _matches_scope(
@@ -3382,6 +3494,7 @@ __all__ = [
     "DEVICE_SEEN_RECORD_KIND",
     "ExpiredRecordSweeper",
     "MAX_DEVICE_LISTING",
+    "MAX_WRITER_LISTING",
     "NEVER_SWEEP_RECORD_KINDS",
     "SWEEPABLE_RECORD_KINDS",
     "SWEEP_BATCH_LIMIT",

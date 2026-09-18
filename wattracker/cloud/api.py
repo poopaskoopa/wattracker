@@ -43,6 +43,7 @@ from .security import (
     canonical_request,
     digest_body,
     MIN_REPLAY_TTL_SECONDS,
+    MAX_WRITER_LISTING,
     new_installation_id,
     validate_device_label,
     validate_public_key,
@@ -439,6 +440,17 @@ def _safe_compare_text(left: object, right: object) -> bool:
         return hmac.compare_digest(left.encode("utf-8"), right.encode("utf-8"))
     except (UnicodeEncodeError, TypeError):
         return False
+
+
+def _operator_authenticated(state: CloudState, request: Request) -> bool:
+    """Authenticate the operator header without exposing failure details."""
+
+    if not state.quotas.kill_state().public_enabled:
+        return False
+    return _safe_compare_text(
+        request.headers.get("x-operator-token", ""),
+        state.config.operator_token,
+    )
 
 
 def _gateway_proof_valid(state: CloudState, request: Request) -> bool:
@@ -915,9 +927,10 @@ def create_cloud_app(
             CORSMiddleware,
             allow_origins=list(config.allowed_origins),
             allow_credentials=False,
-            allow_methods=["GET", "HEAD", "POST"],
+            allow_methods=["DELETE", "GET", "HEAD", "POST"],
             allow_headers=[
                 "Authorization", "Content-Type", config.subscription_header,
+                "X-Operator-Token",
                 "X-Writer-Credential", "X-Writer-Timestamp", "X-Writer-Nonce",
                 "X-Writer-Idempotency-Key", "X-Writer-Revision", "X-Writer-Signature",
                 "X-Device-Credential", "X-Device-Timestamp", "X-Device-Nonce",
@@ -960,6 +973,70 @@ def create_cloud_app(
                 "invitation": invitation.token,
                 "expires_at": invitation.expires_at,
             }, headers={"Cache-Control": "no-store"})
+
+        @app.get("/api/v1/admin/installations")
+        async def admin_list_installations(request: Request) -> Response:
+            """List writer installations without returning credential material."""
+
+            try:
+                if not _operator_authenticated(state, request):
+                    return _not_found()
+                limit = min(
+                    _safe_limit(request.query_params.get("limit")),
+                    MAX_WRITER_LISTING,
+                )
+                writers = state.credentials.list_writers(limit=limit)
+            except HTTPException:
+                raise
+            except Exception:
+                # Do not turn backend failures into a diagnostic oracle.
+                return _not_found()
+            installations = [
+                {
+                    "installation_id": writer.credential_id,
+                    "status": "active" if writer.active and not writer.revoked else "revoked",
+                    "capabilities": sorted(writer.capabilities),
+                    "signature_algorithm": writer.signature_algorithm,
+                }
+                for writer in writers
+            ]
+            return JSONResponse(
+                {"installations": installations},
+                headers={"Cache-Control": "no-store"},
+            )
+
+        async def admin_revoke_installation(
+            request: Request, installation_id: str
+        ) -> Response:
+            """Revoke one writer, with an idempotent response for known rows."""
+
+            try:
+                if not _operator_authenticated(state, request):
+                    return _not_found()
+                writer = state.credentials.lookup_writer(installation_id)
+                if writer is None:
+                    return _not_found()
+                state.credentials.revoke_writer(installation_id)
+            except Exception:
+                return _not_found()
+            return JSONResponse(
+                {
+                    "installation_id": writer.credential_id,
+                    "status": "revoked",
+                },
+                headers={"Cache-Control": "no-store"},
+            )
+
+        app.add_api_route(
+            "/api/v1/admin/installations/{installation_id}",
+            admin_revoke_installation,
+            methods=["DELETE"],
+        )
+        app.add_api_route(
+            "/api/v1/admin/installations/{installation_id}/revoke",
+            admin_revoke_installation,
+            methods=["POST"],
+        )
 
         @app.post("/api/v1/enrollment/complete")
         async def enrollment_complete(request: Request) -> Response:
