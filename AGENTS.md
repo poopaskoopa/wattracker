@@ -172,21 +172,30 @@ The list gives the **order**. GitHub gives the **state** — always
 (#234's scope grew a whole section after it was filed) and its labels move.
 If the two disagree, GitHub wins and the queue is stale; say so.
 
-1. **#327 — the main Bicep template cannot deploy: storage `resourceAccessRules`
-   names the Function App.** Found 2026-09-19 running phase 3 of
-   `infra/azure/DEPLOY.md` against the real subscription for the first time.
-   `az deployment group validate` fails preflight with
-   `InvalidValuesForRequestParameters` on
-   `networkAcls.resourceAccessRules[*].resourceId`: `main.bicep:109-114` points
-   a storage resource-access rule at `budgetHookApp`, a `Microsoft.Web/sites`,
-   which that rule type does not accept. Confirmed by execution that deleting
-   the block makes the whole rest of the template validate — every other
-   resource passes preflight, so this is one isolated defect. Delete the block
-   and rely on `ipRules`, which already exist for this purpose. VNet
-   integration is not available (the Function is `Y1 Dynamic`, Linux
-   Consumption) and `bypass: 'AzureServices'` is strictly weaker. Also record
-   the IP-list fragility in DEPLOY.md. **This blocks the entire deployment, so
-   it goes first.**
+1. **#330 — a custom role grants a blob lease data action that does not exist,
+   and `az deployment group create` fails half-applied.** The first real
+   deployment ran 2026-09-19 and failed with `InvalidDataActionOrNotDataAction`
+   on `Microsoft.Storage/storageAccounts/blobServices/containers/blobs/lease/action`
+   (`main.bicep:343`, `syncBlobWriterRoleDefinition`). There is no blob-level
+   lease data action — verified against the live provider catalog. Delete the
+   line; nothing replaces it. `wattracker/cloud/` never uses blob leases and
+   `write` is already in the role. Do **not** substitute the container-level
+   `.../containers/lease/action`, which grants lease control over the container
+   and is broader than this role's stated intent.
+
+   **The lesson that generalises: `validate` and `what-if` both passed clean
+   immediately before this failed.** Data actions inside a custom role are only
+   checked when the role is written, so no pre-flight command catches this
+   class of error. Do not treat a green what-if as proof a deployment will
+   succeed.
+
+   The owner's resource group is **half-built but healthy** — 37 of 39
+   resources exist, including storage, all four tables, the blob container, the
+   VNet, the ACA environment, both container apps, both identities, both action
+   groups, and 9 of the 10 custom roles. Only `Wattracker Sync Blob Writer` and
+   its assignment are missing. The template is declarative: correct it and
+   **re-run the same `create`**; existing resources are no-ops. Never write
+   migration logic, cleanup scripts, or suggest deleting the resource group.
 
 2. **#249 — rotating full-suite test flakes. Still not a local-runs job.**
    Nothing has changed since the re-scope. 21 consecutive clean local full
@@ -219,7 +228,18 @@ or anything below on your own.
   `#102` "known-open code items" continue in the Claude session, which owns
   `wattracker/cloud/storage.py` and `wattracker/cloud/limits.py`.
 
+**Infrastructure work cannot be self-verified — say so in the PR.** Codex
+cannot run `az bicep build` (the compiler fetch from `aka.ms` is blocked in its
+environment), and cannot run `validate`, `what-if` or `create`, which need the
+owner's subscription and the untracked `infra/azure/main.local.bicepparam`. State
+plainly what was and was not run. Never imply Azure-side verification. The owner
+runs the Azure commands and reports back; that is the gate for every infra change.
+
 **Done since this list was last written (2026-09-18 → 09-19).**
+- **#327** merged as PR #329 (`abaf224`). The storage `resourceAccessRules`
+  block naming the Function App is gone, and `az deployment group validate` now
+  returns `Succeeded` with 39 resources and no errors — run against the real
+  subscription by the owner's session.
 - **#320** merged as PR #325 (`56d3f8f`) and **#321** as PR #326 (`285ff03`).
   The admin plane now preserves kill-switch and contention 503s all the way out
   to the operator CLI, and durable writer rows no longer carry `credential_id`.
