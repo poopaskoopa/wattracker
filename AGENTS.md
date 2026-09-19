@@ -172,36 +172,23 @@ The list gives the **order**. GitHub gives the **state** — always
 (#234's scope grew a whole section after it was filed) and its labels move.
 If the two disagree, GitHub wins and the queue is stale; say so.
 
-1. **#320 — preserve kill-switch 503 responses on the cloud admin routes.**
-   Small and self-contained; take it first. The admin handlers catch
-   `Exception` and turn a kill-switch shutdown into a 404. **Check what #319
-   actually landed before starting** — its first attempt at this guard was
-   inert, because `QuotaExceeded` is a `RuntimeError` (`limits.py:603`), not an
-   `HTTPException`, so `except HTTPException: raise` never caught it, and
-   `admin_revoke_installation` had no guard at all. If #319 landed the real
-   fix, close this as done rather than redoing it; if it landed only the inert
-   guard, the fix is
-   `except (HTTPException, QuotaExceeded): raise` on both handlers, matching
-   the 503 + `Retry-After` contract `/api/v1/enrollment/start` already honors
-   (#305). Prove it with a test that raises `QuotaExceeded` from `kill_state`,
-   not one that reads the except clause. The 503 must not become an oracle:
-   it cannot distinguish a valid operator token from an invalid one, or a real
-   installation id from a fake one.
+1. **#327 — the main Bicep template cannot deploy: storage `resourceAccessRules`
+   names the Function App.** Found 2026-09-19 running phase 3 of
+   `infra/azure/DEPLOY.md` against the real subscription for the first time.
+   `az deployment group validate` fails preflight with
+   `InvalidValuesForRequestParameters` on
+   `networkAcls.resourceAccessRules[*].resourceId`: `main.bicep:109-114` points
+   a storage resource-access rule at `budgetHookApp`, a `Microsoft.Web/sites`,
+   which that rule type does not accept. Confirmed by execution that deleting
+   the block makes the whole rest of the template validate — every other
+   resource passes preflight, so this is one isolated defect. Delete the block
+   and rely on `ipRules`, which already exist for this purpose. VNet
+   integration is not available (the Function is `Y1 Dynamic`, Linux
+   Consumption) and `bypass: 'AzureServices'` is strictly weaker. Also record
+   the IP-list fragility in DEPLOY.md. **This blocks the entire deployment, so
+   it goes first.**
 
-2. **#321 — stop persisting writer credential IDs in durable auth rows.**
-   `security.py:1669` writes `credential_id` in plaintext beside
-   `verification_key`. Harmless for the ed25519 rows `enroll_writer` mints,
-   but for the `hmac-sha256` rows `register_writer` still produces the
-   verification key *is* the symmetric secret, so one storage read yields a
-   forgeable credential — which was not true before #319. `register_writer`
-   has no non-test caller, which is why this is not urgent. Drop the field and
-   address every row by its row key; `_legacy_writer_locked`
-   (`security.py:3059`) already implements that opaque-handle representation
-   including revoke-by-handle, so follow it rather than inventing a second
-   scheme. Decide and state explicitly what happens to rows already written
-   with the field, and leave no read path that silently trusts one.
-
-3. **#249 — rotating full-suite test flakes. Still not a local-runs job.**
+2. **#249 — rotating full-suite test flakes. Still not a local-runs job.**
    Nothing has changed since the re-scope. 21 consecutive clean local full
    suites stand against zero reproductions. Both known instances came from
    **taksmon's machine**. The mechanism is known: the session goes missing
@@ -232,7 +219,17 @@ or anything below on your own.
   `#102` "known-open code items" continue in the Claude session, which owns
   `wattracker/cloud/storage.py` and `wattracker/cloud/limits.py`.
 
-**Done since this list was last written (2026-09-17 → 09-18).**
+**Done since this list was last written (2026-09-18 → 09-19).**
+- **#320** merged as PR #325 (`56d3f8f`) and **#321** as PR #326 (`285ff03`).
+  The admin plane now preserves kill-switch and contention 503s all the way out
+  to the operator CLI, and durable writer rows no longer carry `credential_id`.
+- **The GHCR digest is verified end to end.** It pulls on Container Apps
+  anonymously (tested 2026-09-19 with a throwaway environment, since deleted),
+  the package is public by inheritance from this repo, and the buildx provenance
+  index is fine as-is — no `provenance: false` change needed. `readImage` and
+  `syncImage` are filled in the owner's untracked parameter file.
+
+**Done earlier (2026-09-17 → 09-18).**
 - **#316** merged as PR #318 (`f9d13ee`). `.github/workflows/cloud-publish.yml`
   builds `Dockerfile.cloud` for `linux/amd64` on pushes to `main`, publishes to
   GHCR, signs the digest with keyless cosign and verifies it in the same run.
