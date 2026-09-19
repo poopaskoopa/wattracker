@@ -30,6 +30,13 @@ class AdminError(RuntimeError):
     """A safe, user-facing failure that contains no secret material."""
 
 
+class _RevokeHTTPError(AdminError):
+    def __init__(self, status: int, retry_after: str | None) -> None:
+        super().__init__("cloud admin revoke request failed")
+        self.status = status
+        self.retry_after = retry_after
+
+
 class _ArgumentError(AdminError):
     pass
 
@@ -99,7 +106,14 @@ def _load_operator_token() -> str:
     return value
 
 
-def _request_json(endpoint: str, path: str, token: str, *, method: str) -> Mapping[str, Any]:
+def _request_json(
+    endpoint: str,
+    path: str,
+    token: str,
+    *,
+    method: str,
+    preserve_revoke_status: bool = False,
+) -> Mapping[str, Any]:
     url = _validate_endpoint(endpoint) + path
     request = urllib.request.Request(
         url,
@@ -113,7 +127,12 @@ def _request_json(endpoint: str, path: str, token: str, *, method: str) -> Mappi
     try:
         with opener.open(request, timeout=_REQUEST_TIMEOUT_SECONDS) as response:
             raw = response.read(_MAX_RESPONSE_BYTES + 1)
-    except (urllib.error.HTTPError, urllib.error.URLError, OSError, ValueError) as exc:
+    except urllib.error.HTTPError as exc:
+        if preserve_revoke_status:
+            retry_after = exc.headers.get("Retry-After") if exc.headers else None
+            raise _RevokeHTTPError(exc.code, retry_after) from exc
+        raise AdminError("cloud admin request failed") from exc
+    except (urllib.error.URLError, OSError, ValueError) as exc:
         raise AdminError("cloud admin request failed") from exc
     if len(raw) > _MAX_RESPONSE_BYTES:
         raise AdminError("cloud admin response is too large")
@@ -190,6 +209,7 @@ def _revoke_installation(endpoint: str, token: str, installation_id: str) -> dic
         + "/revoke",
         token,
         method="POST",
+        preserve_revoke_status=True,
     )
     result = {
         "installation_id": payload.get("installation_id"),
@@ -232,6 +252,29 @@ def main(argv: list[str] | None = None) -> int:
         json.dump(result, sys.stdout, sort_keys=True)
         sys.stdout.write("\n")
         return 0
+    except _RevokeHTTPError as exc:
+        if exc.status == 404:
+            print("no such installation", file=sys.stderr)
+        elif exc.status == 503:
+            retry_after = exc.retry_after
+            if (
+                retry_after is not None
+                and len(retry_after.strip()) <= 5
+                and re.fullmatch(r"[0-9]+", retry_after.strip())
+            ):
+                seconds = int(retry_after.strip())
+                if 0 <= seconds <= 86400:
+                    print(
+                        f"cloud admin unavailable; retry in {seconds} seconds",
+                        file=sys.stderr,
+                    )
+                else:
+                    print("cloud admin unavailable; retry later", file=sys.stderr)
+            else:
+                print("cloud admin unavailable; retry later", file=sys.stderr)
+        else:
+            print("cloud admin request failed", file=sys.stderr)
+        return 2
     except AdminError as exc:
         print(str(exc), file=sys.stderr)
         return 2

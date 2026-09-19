@@ -1,13 +1,20 @@
 import hashlib
 import json
+import urllib.error
 
 import pytest
 from fastapi.testclient import TestClient
 
 from wattracker.cloud import admin
 from wattracker.cloud.api import CloudConfig, CloudState, create_cloud_app
+from wattracker.cloud.limits import (
+    PUBLIC_UNAVAILABLE_DETAIL,
+    PUBLIC_UNAVAILABLE_RETRY_AFTER,
+    QuotaExceeded,
+)
 from wattracker.cloud.security import (
     MemorySecurityStateBackend,
+    SecurityStateUnavailable,
     canonical_request,
     digest_body,
     new_installation_id,
@@ -18,6 +25,26 @@ from wattracker.cloud.security import (
 SECRET = b"cloud-admin-test-server-secret-32-bytes"
 TOKEN = "operator-token-for-admin-tests"
 GATEWAY_PROOF = "gateway-proof-for-admin-tests"
+
+
+def _raise_public_unavailable():
+    raise QuotaExceeded(
+        PUBLIC_UNAVAILABLE_DETAIL,
+        status_code=503,
+        retry_after=PUBLIC_UNAVAILABLE_RETRY_AFTER,
+    )
+
+
+def _raise_security_state_unavailable():
+    raise SecurityStateUnavailable("security backend unavailable")
+
+
+def _admin_response_contract(response):
+    return (
+        response.status_code,
+        response.content,
+        response.headers.get("Retry-After"),
+    )
 
 
 @pytest.mark.parametrize(
@@ -217,6 +244,9 @@ def test_admin_revoke_rejects_unknown_and_malformed_handles():
 
 
 def test_admin_requires_gateway_proof_in_addition_to_operator_token():
+    # Gateway-proof-first is a deliberate security exception to #320 criterion
+    # 2: reordering would expose outage state to unauthenticated callers, so
+    # this oracle remains accepted by review.
     config = CloudConfig(
         server_secret=SECRET,
         operator_token=TOKEN,
@@ -261,6 +291,171 @@ def test_admin_requires_gateway_proof_in_addition_to_operator_token():
     assert correct.status_code == 200
     assert missing_revoke.status_code == 404
     assert correct_revoke.status_code == 200
+
+
+def test_admin_list_preserves_kill_switch_503_for_any_operator_token(monkeypatch):
+    config = CloudConfig(
+        server_secret=SECRET,
+        operator_token=TOKEN,
+        gateway_proof_value=GATEWAY_PROOF,
+    )
+    state = CloudState.create(config)
+    monkeypatch.setattr(state.quotas, "kill_state", _raise_public_unavailable)
+
+    with TestClient(create_cloud_app(config, state=state)) as client:
+        responses = [
+            client.get(
+                "/api/v1/admin/installations",
+                headers={
+                    "X-Operator-Token": token,
+                    "X-Gateway-Request-Proof": GATEWAY_PROOF,
+                },
+            )
+            for token in (TOKEN, "wrong-token")
+        ]
+
+    assert [_admin_response_contract(response) for response in responses] == [
+        (
+            503,
+            b'{"detail":"public API unavailable"}',
+            str(PUBLIC_UNAVAILABLE_RETRY_AFTER),
+        ),
+    ] * 2
+    assert all(response.json() == {"detail": PUBLIC_UNAVAILABLE_DETAIL} for response in responses)
+
+
+def test_admin_revoke_preserves_kill_switch_503_without_an_installation_or_token_oracle(
+    monkeypatch,
+):
+    config = CloudConfig(
+        server_secret=SECRET,
+        operator_token=TOKEN,
+        gateway_proof_value=GATEWAY_PROOF,
+    )
+    state = CloudState.create(config)
+    writer = state.credentials.register_writer(
+        new_installation_id(), "rider-scope", b"w" * 32, b"s" * 32
+    )
+    fake_installation_id = "f" * 64
+    monkeypatch.setattr(state.quotas, "kill_state", _raise_public_unavailable)
+
+    with TestClient(create_cloud_app(config, state=state)) as client:
+        responses = [
+            client.post(
+                f"/api/v1/admin/installations/{installation_id}/revoke",
+                headers={
+                    "X-Operator-Token": token,
+                    "X-Gateway-Request-Proof": GATEWAY_PROOF,
+                },
+            )
+            for token in (TOKEN, "wrong-token")
+            for installation_id in (writer.credential_id, fake_installation_id)
+        ]
+
+    assert [_admin_response_contract(response) for response in responses] == [
+        (
+            503,
+            b'{"detail":"public API unavailable"}',
+            str(PUBLIC_UNAVAILABLE_RETRY_AFTER),
+        ),
+    ] * 4
+    assert all(response.json() == {"detail": PUBLIC_UNAVAILABLE_DETAIL} for response in responses)
+
+
+def test_admin_security_state_unavailable_is_neutral_and_retryable_without_oracles(
+    monkeypatch,
+):
+    config = CloudConfig(
+        server_secret=SECRET,
+        operator_token=TOKEN,
+        gateway_proof_value=GATEWAY_PROOF,
+    )
+    state = CloudState.create(config)
+    writer = state.credentials.register_writer(
+        new_installation_id(), "rider-scope", b"w" * 32, b"s" * 32
+    )
+    fake_installation_id = "f" * 64
+    monkeypatch.setattr(state.quotas, "kill_state", _raise_security_state_unavailable)
+
+    with TestClient(create_cloud_app(config, state=state)) as client:
+        listed = [
+            client.get(
+                "/api/v1/admin/installations",
+                headers={
+                    "X-Operator-Token": token,
+                    "X-Gateway-Request-Proof": GATEWAY_PROOF,
+                },
+            )
+            for token in (TOKEN, "wrong-token")
+        ]
+        revoked = [
+            client.post(
+                f"/api/v1/admin/installations/{installation_id}/revoke",
+                headers={
+                    "X-Operator-Token": token,
+                    "X-Gateway-Request-Proof": GATEWAY_PROOF,
+                },
+            )
+            for token in (TOKEN, "wrong-token")
+            for installation_id in (writer.credential_id, fake_installation_id)
+        ]
+        gateway_refused = client.get(
+            "/api/v1/admin/installations",
+            headers={
+                "X-Operator-Token": TOKEN,
+                "X-Gateway-Request-Proof": "wrong-proof",
+            },
+        )
+
+    expected = (
+        503,
+        b'{"detail":"public API unavailable"}',
+        str(PUBLIC_UNAVAILABLE_RETRY_AFTER),
+    )
+    assert [_admin_response_contract(response) for response in listed] == [expected] * 2
+    assert [_admin_response_contract(response) for response in revoked] == [expected] * 4
+    assert gateway_refused.status_code == 404
+    assert gateway_refused.json() == {"detail": "not found"}
+
+
+def test_admin_revoke_guard_contention_is_neutral_for_known_installation():
+    """Known-installation contention uses the in-memory Azure-style backend."""
+    backend = MemorySecurityStateBackend()
+    config = CloudConfig(
+        server_secret=SECRET,
+        operator_token=TOKEN,
+        gateway_proof_value=GATEWAY_PROOF,
+    )
+    holder = CloudState.create(config, security_backend=backend)
+    contender = CloudState.create(config, security_backend=backend)
+    writer = holder.credentials.register_writer(
+        new_installation_id(), "rider-scope", b"w" * 32, b"s" * 32
+    )
+    headers = {
+        "X-Operator-Token": TOKEN,
+        "X-Gateway-Request-Proof": GATEWAY_PROOF,
+    }
+
+    # This is the real scope-guard implementation on the in-memory backend,
+    # not a live Azure test or a monkeypatched exception.
+    with holder.credentials._lock, holder.credentials._pairing_scope_guard_locked(
+        writer.namespace, writer.local_user_scope
+    ):
+        with TestClient(create_cloud_app(config, state=contender)) as client:
+            response = client.post(
+                f"/api/v1/admin/installations/{writer.credential_id}/revoke",
+                headers=headers,
+            )
+
+    expected = (
+        503,
+        b'{"detail":"public API unavailable"}',
+        str(PUBLIC_UNAVAILABLE_RETRY_AFTER),
+    )
+    assert _admin_response_contract(response) == expected
+    assert holder.credentials.authenticate_writer(
+        writer.credential_id, writer.subscription_key
+    ) is not None
 
 
 def test_admin_revoke_cascades_to_same_scope_device_and_is_idempotent():
@@ -431,7 +626,7 @@ def test_three_commands_dispatch_and_print_json(monkeypatch, capsys):
     installation_id = "a" * 64
     calls = []
 
-    def fake_request(endpoint, path, token, *, method):
+    def fake_request(endpoint, path, token, *, method, **kwargs):
         calls.append((endpoint, path, token, method))
         assert token == TOKEN
         if path == "/api/v1/enrollment/start":
@@ -473,6 +668,48 @@ def test_three_commands_dispatch_and_print_json(monkeypatch, capsys):
         ("/api/v1/admin/installations", "GET"),
         (f"/api/v1/admin/installations/{installation_id}/revoke", "POST"),
     ]
+
+
+@pytest.mark.parametrize("status, expected", [(404, "no such installation"), (503, "retry in 37 seconds")])
+def test_revoke_cli_distinguishes_missing_and_busy_without_echoing_token(
+    monkeypatch, capsys, status, expected
+):
+    installation_id = "a" * 64
+    class FakeOpener:
+        def open(self, request, timeout):
+            raise urllib.error.HTTPError(
+                request.full_url, status, "opaque", {"Retry-After": "37"}, None
+            )
+
+    monkeypatch.setattr(urllib.request, "build_opener", lambda *args: FakeOpener())
+    monkeypatch.setenv("WATTRACKER_CLOUD_ENDPOINT", "https://cloud.example")
+    monkeypatch.setenv("WATTRACKER_CLOUD_OPERATOR_TOKEN", TOKEN)
+
+    assert admin.main(["revoke-installation", installation_id]) == 2
+    captured = capsys.readouterr()
+    assert expected in captured.err
+    assert "operator-token-for-admin-tests" not in captured.err
+    assert "operator-token-for-admin-tests" not in captured.out
+    if status == 503:
+        assert "no such installation" not in captured.err
+
+
+def test_revoke_cli_uses_generic_message_for_malformed_retry_after(monkeypatch, capsys):
+    installation_id = "a" * 64
+    class FakeOpener:
+        def open(self, request, timeout):
+            raise urllib.error.HTTPError(
+                request.full_url, 503, "opaque", {"Retry-After": "9" * 6}, None
+            )
+
+    monkeypatch.setattr(urllib.request, "build_opener", lambda *args: FakeOpener())
+    monkeypatch.setenv("WATTRACKER_CLOUD_ENDPOINT", "https://cloud.example")
+    monkeypatch.setenv("WATTRACKER_CLOUD_OPERATOR_TOKEN", TOKEN)
+
+    assert admin.main(["revoke-installation", installation_id]) == 2
+    captured = capsys.readouterr()
+    assert captured.err.strip() == "cloud admin unavailable; retry later"
+    assert "secret" not in captured.err
 
 
 def test_operator_token_falls_back_to_keychain(monkeypatch):

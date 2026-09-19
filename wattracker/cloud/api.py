@@ -39,6 +39,7 @@ from .security import (
     NonceReplayGuard,
     PublicKeyUnavailable,
     READER_CONTEXT_TTL_SECONDS,
+    SecurityStateUnavailable,
     SecurityStateBackend,
     canonical_request,
     digest_body,
@@ -924,6 +925,18 @@ def create_cloud_app(
 
         return _error(exc.status_code, exc.reason, retry_after=exc.retry_after)
 
+    @app.exception_handler(SecurityStateUnavailable)
+    async def _security_state_unavailable(
+        _request: Request, _exc: SecurityStateUnavailable
+    ) -> Response:
+        """Keep unreadable authorization state neutral and retryable."""
+
+        return _error(
+            503,
+            PUBLIC_UNAVAILABLE_DETAIL,
+            retry_after=PUBLIC_UNAVAILABLE_RETRY_AFTER,
+        )
+
     if config.allowed_origins:
         app.add_middleware(
             CORSMiddleware,
@@ -988,9 +1001,11 @@ def create_cloud_app(
                     MAX_WRITER_LISTING,
                 )
                 writers = state.credentials.list_writers(limit=limit)
+            except (QuotaExceeded, SecurityStateUnavailable):
+                raise
             except Exception:
-                # Keep every admin failure opaque.  #320 owns preserving the
-                # intended 503 response for unavailable quota/security state.
+                # Keep unrelated admin failures opaque while allowing the
+                # app-level handlers to preserve expected responses.
                 return _not_found()
             installations = [
                 {
@@ -1019,9 +1034,10 @@ def create_cloud_app(
                     return _not_found()
                 if not state.credentials.revoke_writer_and_devices(installation_id):
                     return _not_found()
+            except (QuotaExceeded, SecurityStateUnavailable):
+                raise
             except Exception:
-                # As above, #320 owns preserving intentional 503s; until then
-                # a storage or partial-cascade failure remains fail-closed.
+                # Storage and partial-cascade failures remain fail-closed.
                 return _not_found()
             return JSONResponse(
                 {
@@ -1347,13 +1363,17 @@ def create_cloud_app(
             deployment may not have.  Where one is attested it is applied as
             an additional binding on top of the code, never instead of it.
 
-            Every code failure -- unknown, malformed, expired, already
-            consumed, or (where a subject is attested) redeemed by the wrong
-            one -- returns the identical 404 body and headers as an unknown
-            reader context.  A 400 is reachable only for a request that is
-            malformed independently of the code (bad JSON, a missing or
-            unusable public key), which reveals nothing secret because the
-            wire format is public.
+            Malformed or unknown code input, an expired or already-consumed
+            code, and (where a subject is attested) a redemption by the wrong
+            one return the identical 404 body and headers as an unknown reader
+            context.  A valid code can instead produce a neutral 503 when its
+            pairing scope is busy or unavailable: acquiring that guard before
+            spending the code is required to keep a contended redemption
+            retryable.  This is an intentional narrow code-existence signal;
+            a garbage code has no scope to guard and remains a 404.  A 400 is
+            reachable only for a request malformed independently of the code
+            (bad JSON, a missing or unusable public key), which reveals nothing
+            secret because the wire format is public.
             """
             if not _gateway_proof_valid(state, request):
                 return _not_found()
@@ -1361,8 +1381,8 @@ def create_cloud_app(
             # becomes a 503, before the single-use code is spent.
             if not state.quotas.kill_state().public_enabled:
                 return _not_found()
-            # Never demanded here.  ``consume`` enforces a subject if and only
-            # if the code carries one, which can only have happened in a
+            # Never demanded here.  ``peek`` enforces a subject if and only if
+            # the code carries one, which can only have happened in a
             # deployment that attests one -- so the demand comes from the
             # code, never from the route, and omitting the header cannot
             # bypass a binding that exists.
@@ -1404,6 +1424,10 @@ def create_cloud_app(
             # proof -- before the single-use code is spent, for the same
             # reason enrollment does it in that order: a key rejected
             # afterwards would burn the rider's code and leave no device.
+            # Malformed or unknown code input remains retryable too.  Once a
+            # valid code is identified, a busy scope guard may produce the
+            # narrow 503 described above; this is deliberate to avoid burning
+            # that valid code, while garbage codes still return 404.
             try:
                 validate_public_key(algorithm, public_key)
             except ValueError:
@@ -1412,14 +1436,18 @@ def create_cloud_app(
                 # The deployment lacks the crypto extra.  Refuse without
                 # spending the code, and without saying why.
                 return _not_found()
-            binding = state.pairings.consume(code, subject)
-            if binding is None:
-                return _not_found()
             try:
-                device = state.credentials.pair_device(
-                    binding,
+                # Peek first, acquire the scope guard inside the credential
+                # registry, and spend the code only after that guard is held.
+                # A contended guard therefore leaves the code retryable; once
+                # a device or context may have been durably written, no code
+                # rollback is attempted.
+                device = state.credentials.pair_device_code(
+                    code,
                     public_key,
+                    pairing_registry=state.pairings,
                     signature_algorithm=algorithm,
+                    subject=subject,
                     label=label,
                     # Devices are issued read-only here, exactly as at
                     # enrollment.  Widening one is a capability grant on the
@@ -1434,6 +1462,8 @@ def create_cloud_app(
                     device.namespace, device.local_user_scope, device.subject,
                     device_credential_id=device.credential_id,
                 )
+            except SecurityStateUnavailable:
+                raise
             except (ValueError, RuntimeError, PublicKeyUnavailable):
                 return _not_found()
             paired = {

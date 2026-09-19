@@ -89,6 +89,13 @@ def _batch(batch_id, revision, object_id="ride-1", deleted=False, watts=250):
     )
 
 
+def _consume_pairing(registry, code):
+    binding = registry.peek(code)
+    if binding is None:
+        return None
+    return registry.consume_binding(binding)
+
+
 class _Rider:
     """One installation, with every row kind a scope can own."""
 
@@ -216,7 +223,7 @@ def test_a_wipe_leaves_no_object_no_credential_and_no_device(riders):
     assert after.read_context_token(alice.context_token) is None
     # Nothing left that could be redeemed back into a credential.
     assert alice.enrollment.consume(alice.invitation) is None
-    assert alice.pairing.consume(alice.pairing_code.code) is None
+    assert _consume_pairing(alice.pairing, alice.pairing_code.code) is None
 
 
 def test_the_companion_rows_that_carry_no_scope_go_with_their_owners(riders):
@@ -350,7 +357,9 @@ def test_credentials_are_gone_before_the_store_is_purged(riders):
             observed["writer"] = backend.read("writer", writer_key)
             observed["device"] = backend.read("device", device_key)
             observed["invitation"] = alice.enrollment.consume(alice.invitation)
-            observed["pairing"] = alice.pairing.consume(alice.pairing_code.code)
+            observed["pairing"] = _consume_pairing(
+                alice.pairing, alice.pairing_code.code
+            )
             return store.purge_scope(namespace, local_user_scope)
 
     assert backend.read("writer", writer_key) is not None
