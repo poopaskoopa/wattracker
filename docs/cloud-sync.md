@@ -70,11 +70,13 @@ installations with `list-installations` and revoke one with
 every paired device and outstanding pairing code in that writer's
 `(namespace, local_user_scope)`.
 
-A revoke `404` is deliberately ambiguous: it can mean the installation is
-absent, but it can also mean storage failed or a same-scope cascade stopped
-part-way. The operator must retry the revoke before concluding that the
-installation is absent; a retry is idempotent and completes any partial
-cascade.
+A revoke `404` is deliberately opaque and fail-closed: the CLI reports no such
+installation without exposing whether the installation, gateway proof, or
+backend lookup was responsible. A `503` with `Retry-After` means the service
+is busy or unavailable; retry the revoke after the indicated number of
+seconds. The CLI validates that value and otherwise prints only a generic
+retry-later message. Do not treat the 404 as the old 404-only retry contract;
+retrying remains safe and idempotent when a partial cascade needs completion.
 
 ### Mobile read context
 
@@ -133,7 +135,8 @@ Every "attested subject" above is conditional on
 `CloudConfig.require_verified_subject`, which a deployment may only set while a
 gateway actually attests one — see "The subject is an optional binding" below.
 `POST /api/v1/devices/pair` is the one route that never requires a subject at
-all: the pairing code is the authorization.
+all: the pairing code is the authorization. It may also return `503` while a
+scope guard is busy or unavailable; the pairing code remains retryable.
 
 Enrollment and pairing validate device binding, expiry, nonce, and replay state.
 Enrollment returns a server-generated writer subscription key; it is an app

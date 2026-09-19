@@ -1001,7 +1001,7 @@ def create_cloud_app(
                     MAX_WRITER_LISTING,
                 )
                 writers = state.credentials.list_writers(limit=limit)
-            except (HTTPException, QuotaExceeded, SecurityStateUnavailable):
+            except (QuotaExceeded, SecurityStateUnavailable):
                 raise
             except Exception:
                 # Keep unrelated admin failures opaque while allowing the
@@ -1034,7 +1034,7 @@ def create_cloud_app(
                     return _not_found()
                 if not state.credentials.revoke_writer_and_devices(installation_id):
                     return _not_found()
-            except (HTTPException, QuotaExceeded, SecurityStateUnavailable):
+            except (QuotaExceeded, SecurityStateUnavailable):
                 raise
             except Exception:
                 # Storage and partial-cascade failures remain fail-closed.
@@ -1363,13 +1363,17 @@ def create_cloud_app(
             deployment may not have.  Where one is attested it is applied as
             an additional binding on top of the code, never instead of it.
 
-            Every code failure -- unknown, malformed, expired, already
-            consumed, or (where a subject is attested) redeemed by the wrong
-            one -- returns the identical 404 body and headers as an unknown
-            reader context.  A 400 is reachable only for a request that is
-            malformed independently of the code (bad JSON, a missing or
-            unusable public key), which reveals nothing secret because the
-            wire format is public.
+            Malformed or unknown code input, an expired or already-consumed
+            code, and (where a subject is attested) a redemption by the wrong
+            one return the identical 404 body and headers as an unknown reader
+            context.  A valid code can instead produce a neutral 503 when its
+            pairing scope is busy or unavailable: acquiring that guard before
+            spending the code is required to keep a contended redemption
+            retryable.  This is an intentional narrow code-existence signal;
+            a garbage code has no scope to guard and remains a 404.  A 400 is
+            reachable only for a request malformed independently of the code
+            (bad JSON, a missing or unusable public key), which reveals nothing
+            secret because the wire format is public.
             """
             if not _gateway_proof_valid(state, request):
                 return _not_found()
@@ -1377,8 +1381,8 @@ def create_cloud_app(
             # becomes a 503, before the single-use code is spent.
             if not state.quotas.kill_state().public_enabled:
                 return _not_found()
-            # Never demanded here.  ``consume`` enforces a subject if and only
-            # if the code carries one, which can only have happened in a
+            # Never demanded here.  ``peek`` enforces a subject if and only if
+            # the code carries one, which can only have happened in a
             # deployment that attests one -- so the demand comes from the
             # code, never from the route, and omitting the header cannot
             # bypass a binding that exists.
@@ -1420,6 +1424,10 @@ def create_cloud_app(
             # proof -- before the single-use code is spent, for the same
             # reason enrollment does it in that order: a key rejected
             # afterwards would burn the rider's code and leave no device.
+            # Malformed or unknown code input remains retryable too.  Once a
+            # valid code is identified, a busy scope guard may produce the
+            # narrow 503 described above; this is deliberate to avoid burning
+            # that valid code, while garbage codes still return 404.
             try:
                 validate_public_key(algorithm, public_key)
             except ValueError:

@@ -1,5 +1,6 @@
 import hashlib
 import json
+import urllib.error
 
 import pytest
 from fastapi.testclient import TestClient
@@ -243,6 +244,9 @@ def test_admin_revoke_rejects_unknown_and_malformed_handles():
 
 
 def test_admin_requires_gateway_proof_in_addition_to_operator_token():
+    # Gateway-proof-first is a deliberate security exception to #320 criterion
+    # 2: reordering would expose outage state to unauthenticated callers, so
+    # this oracle remains accepted by review.
     config = CloudConfig(
         server_secret=SECRET,
         operator_token=TOKEN,
@@ -622,7 +626,7 @@ def test_three_commands_dispatch_and_print_json(monkeypatch, capsys):
     installation_id = "a" * 64
     calls = []
 
-    def fake_request(endpoint, path, token, *, method):
+    def fake_request(endpoint, path, token, *, method, **kwargs):
         calls.append((endpoint, path, token, method))
         assert token == TOKEN
         if path == "/api/v1/enrollment/start":
@@ -664,6 +668,48 @@ def test_three_commands_dispatch_and_print_json(monkeypatch, capsys):
         ("/api/v1/admin/installations", "GET"),
         (f"/api/v1/admin/installations/{installation_id}/revoke", "POST"),
     ]
+
+
+@pytest.mark.parametrize("status, expected", [(404, "no such installation"), (503, "retry in 37 seconds")])
+def test_revoke_cli_distinguishes_missing_and_busy_without_echoing_token(
+    monkeypatch, capsys, status, expected
+):
+    installation_id = "a" * 64
+    class FakeOpener:
+        def open(self, request, timeout):
+            raise urllib.error.HTTPError(
+                request.full_url, status, "opaque", {"Retry-After": "37"}, None
+            )
+
+    monkeypatch.setattr(urllib.request, "build_opener", lambda *args: FakeOpener())
+    monkeypatch.setenv("WATTRACKER_CLOUD_ENDPOINT", "https://cloud.example")
+    monkeypatch.setenv("WATTRACKER_CLOUD_OPERATOR_TOKEN", TOKEN)
+
+    assert admin.main(["revoke-installation", installation_id]) == 2
+    captured = capsys.readouterr()
+    assert expected in captured.err
+    assert "operator-token-for-admin-tests" not in captured.err
+    assert "operator-token-for-admin-tests" not in captured.out
+    if status == 503:
+        assert "no such installation" not in captured.err
+
+
+def test_revoke_cli_uses_generic_message_for_malformed_retry_after(monkeypatch, capsys):
+    installation_id = "a" * 64
+    class FakeOpener:
+        def open(self, request, timeout):
+            raise urllib.error.HTTPError(
+                request.full_url, 503, "opaque", {"Retry-After": "9" * 6}, None
+            )
+
+    monkeypatch.setattr(urllib.request, "build_opener", lambda *args: FakeOpener())
+    monkeypatch.setenv("WATTRACKER_CLOUD_ENDPOINT", "https://cloud.example")
+    monkeypatch.setenv("WATTRACKER_CLOUD_OPERATOR_TOKEN", TOKEN)
+
+    assert admin.main(["revoke-installation", installation_id]) == 2
+    captured = capsys.readouterr()
+    assert captured.err.strip() == "cloud admin unavailable; retry later"
+    assert "secret" not in captured.err
 
 
 def test_operator_token_falls_back_to_keychain(monkeypatch):

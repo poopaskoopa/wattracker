@@ -45,6 +45,13 @@ def _installation(seed: bytes = b"installation") -> str:
     return (seed * INSTALLATION_ID_BYTES)[:INSTALLATION_ID_BYTES].hex()
 
 
+def _consume_pairing(registry, code, subject=None, *, now=None):
+    binding = registry.peek(code, subject, now=now)
+    if binding is None:
+        return None
+    return registry.consume_binding(binding, now=now)
+
+
 def test_installation_ids_are_random_opaque_lowercase_hex():
     first = new_installation_id()
     second = new_installation_id()
@@ -587,17 +594,17 @@ def test_pairing_codes_are_single_use_expire_and_are_indistinguishable():
     minted = registry.create(_namespace(), "local-scope", subject="subject", now=100)
     assert minted.expires_at == 1_000
 
-    binding = registry.consume(minted.code, "subject", now=500)
+    binding = _consume_pairing(registry, minted.code, "subject", now=500)
     assert binding is not None
     assert binding.namespace == _namespace()
     assert binding.local_user_scope == "local-scope"
 
     # Consumed, expired, and never-issued are the same observable outcome.
-    consumed = registry.consume(minted.code, "subject", now=500)
+    consumed = _consume_pairing(registry, minted.code, "subject", now=500)
     expired_code = registry.create(_namespace(), "local-scope", subject="subject", now=100)
-    expired = registry.consume(expired_code.code, "subject", now=1_000)
-    unknown = registry.consume(generate_pairing_code(), "subject", now=500)
-    malformed = registry.consume("not-a-pairing-code", "subject", now=500)
+    expired = _consume_pairing(registry, expired_code.code, "subject", now=1_000)
+    unknown = _consume_pairing(registry, generate_pairing_code(), "subject", now=500)
+    malformed = _consume_pairing(registry, "not-a-pairing-code", "subject", now=500)
     assert consumed is expired is unknown is malformed is None
 
 
@@ -607,9 +614,9 @@ def test_pairing_code_is_bound_to_the_minting_scope_and_subject():
 
     # A different verified subject cannot redeem it -- and does not burn it,
     # so the rider who mistypes an account does not lose the code.
-    assert registry.consume(minted.code, "rider-b") is None
-    assert registry.consume(minted.code, None) is None
-    binding = registry.consume(minted.code, "rider-a")
+    assert _consume_pairing(registry, minted.code, "rider-b") is None
+    assert _consume_pairing(registry, minted.code, None) is None
+    binding = _consume_pairing(registry, minted.code, "rider-a")
     assert binding is not None
     assert binding.namespace == _namespace(b"rider-a")
     assert binding.namespace != _namespace(b"rider-b")
@@ -625,7 +632,7 @@ def test_pairing_binding_cannot_be_forged_or_redirected():
     # must run whether or not the optional crypto extra is installed.
     public_key = b"k" * 32
     minted = registry.create(writer.namespace, "scope-a")
-    binding = registry.consume(minted.code)
+    binding = _consume_pairing(registry, minted.code)
     assert binding is not None
     assert registry.verify_binding(binding)
 
@@ -635,7 +642,7 @@ def test_pairing_binding_cannot_be_forged_or_redirected():
     )
     assert not registry.verify_binding(forged)
     with pytest.raises(ValueError):
-        credentials.pair_device(forged, public_key)
+        credentials._pair_device_binding(forged, public_key)
 
     # Reusing a real proof under a swapped namespace fails the same way: the
     # namespace is inside the HMAC.
@@ -644,9 +651,9 @@ def test_pairing_binding_cannot_be_forged_or_redirected():
     )
     assert not registry.verify_binding(redirected)
     with pytest.raises(ValueError):
-        credentials.pair_device(redirected, public_key)
+        credentials._pair_device_binding(redirected, public_key)
 
-    device = credentials.pair_device(binding, public_key)
+    device = credentials._pair_device_binding(binding, public_key)
     assert device.namespace == writer.namespace
     assert device.local_user_scope == "scope-a"
     assert device.capabilities == frozenset({"read"})
@@ -665,12 +672,12 @@ def test_consumed_pairing_binding_cannot_outlive_its_revoked_owner(shared):
         _installation(b"owner"), "scope", b"w" * 32, b"s" * 32
     )
     minted = registry.create(writer.namespace, writer.local_user_scope)
-    binding = registry.consume(minted.code)
+    binding = _consume_pairing(registry, minted.code)
     assert binding is not None
 
     assert credentials.revoke_writer_and_devices(writer.credential_id)
     with pytest.raises(ValueError, match="pairing owner is revoked"):
-        credentials.pair_device(binding, b"k" * 32)
+        credentials._pair_device_binding(binding, b"k" * 32)
 
 
 def test_pairing_ttl_is_capped_at_fifteen_minutes():
@@ -758,14 +765,14 @@ def test_pairing_codes_and_enrollment_invitations_are_separate_token_spaces():
     invitation = enrollments.create(_installation(), "scope")
     minted = pairings.create(_namespace(), "scope")
 
-    assert pairings.consume(invitation.token) is None
+    assert _consume_pairing(pairings, invitation.token) is None
     # Both the display form and the canonical form: the enrollment registry
     # digests what it is handed, so the separation has to hold for either.
     assert enrollments.consume(minted.code) is None
     assert enrollments.consume(normalize_pairing_code(minted.code)) is None
     # Each still works in its own registry afterwards.
     assert enrollments.consume(invitation.token) is not None
-    assert pairings.consume(minted.code) is not None
+    assert _consume_pairing(pairings, minted.code) is not None
 
 
 def test_pairing_codes_survive_a_restart_and_stay_single_use():
@@ -776,16 +783,16 @@ def test_pairing_codes_survive_a_restart_and_stay_single_use():
     restarted = DevicePairingRegistry(
         b"server secret", backend=backend, clock=lambda: 200
     )
-    assert restarted.consume(minted.code, "rider") is not None
+    assert _consume_pairing(restarted, minted.code, "rider") is not None
     again = DevicePairingRegistry(b"server secret", backend=backend, clock=lambda: 300)
-    assert again.consume(minted.code, "rider") is None
+    assert _consume_pairing(again, minted.code, "rider") is None
     stale = DevicePairingRegistry(
         b"server secret", backend=backend, clock=lambda: 100
     ).create(_namespace(), "scope", subject="rider")
     expired = DevicePairingRegistry(
         b"server secret", backend=backend, clock=lambda: 1_000
     )
-    assert expired.consume(stale.code, "rider") is None
+    assert _consume_pairing(expired, stale.code, "rider") is None
 
 
 # ---------------------------------------------------------------------------
@@ -1115,7 +1122,7 @@ def pairing_replicas(monkeypatch):
         _installation(b"owner"), "scope", b"w" * 32, b"s" * 32
     )
     code = pairings.create(writer.namespace, writer.local_user_scope).code
-    binding = pairings.consume(code)
+    binding = _consume_pairing(pairings, code)
     assert binding is not None
     return first, second, writer, binding, table
 
@@ -1138,14 +1145,14 @@ def test_distributed_revoke_contends_with_pair_after_owner_check(
         store_device(device)
 
     monkeypatch.setattr(first, "_store_device_locked", pause_before_device_write)
-    device = first.pair_device(binding, b"k" * 32)
+    device = first._pair_device_binding(binding, b"k" * 32)
     assert contended == [True]
     assert second.resolve_device(device.credential_id) is not None
     assert second.revoke_writer_and_devices(writer.credential_id)
     assert first.resolve_writer(writer.credential_id) is None
     assert first.resolve_device(device.credential_id) is None
     with pytest.raises(ValueError, match="pairing owner is revoked"):
-        first.pair_device(binding, b"k" * 32)
+        first._pair_device_binding(binding, b"k" * 32)
     assert second.revoke_writer_and_devices(writer.credential_id)
 
 
@@ -1158,7 +1165,7 @@ def test_distributed_pair_contends_with_revoke_then_refuses_revoked_owner(
 
     def pause_before_cascade(namespace, scope):
         with pytest.raises(SecurityStateUnavailable):
-            first.pair_device(binding, b"k" * 32)
+            first._pair_device_binding(binding, b"k" * 32)
         contended.append(True)
         return scan_devices(namespace, scope)
 
@@ -1166,7 +1173,7 @@ def test_distributed_pair_contends_with_revoke_then_refuses_revoked_owner(
     assert second.revoke_writer_and_devices(writer.credential_id)
     assert contended == [True]
     with pytest.raises(ValueError, match="pairing owner is revoked"):
-        first.pair_device(binding, b"k" * 32)
+        first._pair_device_binding(binding, b"k" * 32)
     assert first.list_devices_for_scope(writer.namespace, "scope") == ()
 
 
@@ -1188,7 +1195,7 @@ def test_pair_write_after_lease_loss_is_not_returned(pairing_replicas, monkeypat
 
     monkeypatch.setattr(first._backend, "create", revoke_before_device_create)
     with pytest.raises(SecurityStateUnavailable):
-        first.pair_device(binding, b"k" * 32)
+        first._pair_device_binding(binding, b"k" * 32)
 
     assert raced
     assert second.resolve_writer(writer.credential_id) is None
@@ -1256,7 +1263,7 @@ def test_scope_guard_cas_conflict_cannot_admit_two_holders(
     monkeypatch.setattr(table, method, compete_between_read_and_cas)
     try:
         with second._lock, pytest.raises(SecurityStateUnavailable):
-            first.pair_device(binding, b"k" * 32)
+            first._pair_device_binding(binding, b"k" * 32)
         assert entered
         assert second.list_devices_for_scope(writer.namespace, "scope") == ()
     finally:
@@ -1390,14 +1397,14 @@ def test_scope_guard_acquisition_failure_is_safe_and_bounded(
         # A lost response is recoverable because the unique owner is read back
         # before the guarded operation is admitted.
         if operation == "pair":
-            device = first.pair_device(binding, b"k" * 32)
+            device = first._pair_device_binding(binding, b"k" * 32)
             assert second.resolve_device(device.credential_id) is not None
         else:
             assert first.revoke_writer_and_devices(writer.credential_id)
     else:
         with pytest.raises(SecurityStateUnavailable):
             if operation == "pair":
-                first.pair_device(binding, b"k" * 32)
+                first._pair_device_binding(binding, b"k" * 32)
             else:
                 first.revoke_writer_and_devices(writer.credential_id)
     if commit_before_error:
@@ -1436,7 +1443,7 @@ def test_scope_guard_release_failure_is_safe_and_bounded(
         # The release response may be lost after its CAS committed; a read of
         # owner=None proves that the scope is available for the next retry.
         if operation == "pair":
-            device = first.pair_device(binding, b"k" * 32)
+            device = first._pair_device_binding(binding, b"k" * 32)
             assert second.resolve_device(device.credential_id) is not None
             assert second.revoke_writer_and_devices(writer.credential_id)
         else:
@@ -1445,7 +1452,7 @@ def test_scope_guard_release_failure_is_safe_and_bounded(
     else:
         with pytest.raises(SecurityStateUnavailable):
             if operation == "pair":
-                first.pair_device(binding, b"k" * 32)
+                first._pair_device_binding(binding, b"k" * 32)
             else:
                 first.revoke_writer_and_devices(writer.credential_id)
         with pytest.raises(SecurityStateUnavailable):
@@ -1468,7 +1475,7 @@ def test_device_write_failure_releases_guard_for_revoke_retry(
 
     monkeypatch.setattr(first._backend, "create", fail_device_write)
     with pytest.raises(OSError, match="device write failed"):
-        first.pair_device(binding, b"k" * 32)
+        first._pair_device_binding(binding, b"k" * 32)
     assert second.revoke_writer_and_devices(writer.credential_id)
     assert all(
         device.revoked and not device.active
@@ -1481,7 +1488,7 @@ def test_partial_cascade_failure_releases_guard_for_retry(
     pairing_replicas, monkeypatch, failed_kind
 ):
     first, second, writer, binding, _table = pairing_replicas
-    device = first.pair_device(binding, b"k" * 32)
+    device = first._pair_device_binding(binding, b"k" * 32)
     code = first._pairing_registry.create(writer.namespace, "scope").code
     write = second._backend.write
 
@@ -1498,7 +1505,7 @@ def test_partial_cascade_failure_releases_guard_for_retry(
     assert first.revoke_writer_and_devices(writer.credential_id)
     assert second.resolve_device(device.credential_id) is None
     assert second.resolve_writer(writer.credential_id) is None
-    assert first._pairing_registry.consume(code) is None
+    assert _consume_pairing(first._pairing_registry, code) is None
 
 
 def test_azure_scan_separates_kinds_that_share_a_prefix():

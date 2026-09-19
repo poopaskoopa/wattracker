@@ -2397,51 +2397,16 @@ class DevicePairingRegistry:
                     )
         raise RuntimeError("pairing code collision")
 
-    def consume(
-        self,
-        code: object,
-        subject: str | None = None,
-        *,
-        now: float | None = None,
-    ) -> DevicePairingBinding | None:
-        """Spend a pairing code once, or return ``None`` indistinguishably.
-
-        A subject mismatch deliberately does *not* spend the code: a rider who
-        redeems on the wrong account should not lose it, and the response is
-        identical either way, so nothing is observable.
-        """
-
-        canonical = normalize_pairing_code(code)
-        current = self._clock() if now is None else float(now)
-        if canonical is None:
-            hmac.compare_digest(_DUMMY_DIGEST, _DUMMY_DIGEST)
-            return None
-        supplied = _digest_pairing_code(canonical)
-        with self._lock:
-            record = self._record_for_digest_locked(supplied, current)
-            if record is None or not self._subject_matches(record, subject):
-                hmac.compare_digest(supplied, _DUMMY_DIGEST)
-                return None
-            if self._backend is not None:
-                if self._backend.consume(
-                    _PAIRING_RECORD_KIND, supplied.hex(), now=current
-                ) is None:
-                    return None
-            else:
-                del self._records[supplied]
-            return self._binding_for_record(record, supplied)
-
     def consume_binding(
         self,
         binding: DevicePairingBinding,
         *,
         now: float | None = None,
     ) -> DevicePairingBinding | None:
-        """Spend a binding previously returned by :meth:`peek`.
+        """Spend a binding after :meth:`peek` and scope-guard acquisition.
 
-        This is separate from :meth:`consume` so a caller can acquire the
-        pairing-scope guard before spending the code.  A failed guard
-        acquisition therefore cannot burn a usable code.
+        Pairing callers must acquire the scope guard between these operations;
+        a failed guard acquisition therefore cannot burn a usable code.
         """
 
         if (
@@ -3189,7 +3154,7 @@ class CredentialRegistry:
             label=label,
         )
 
-    def pair_device(
+    def _pair_device_binding(
         self,
         binding: DevicePairingBinding,
         public_key: bytes,
@@ -3206,7 +3171,7 @@ class CredentialRegistry:
         The namespace and scope come from ``binding`` and nowhere else, and
         the binding's HMAC proof is re-verified here so a caller that
         assembled a :class:`DevicePairingBinding` by hand -- rather than
-        obtaining one from :meth:`DevicePairingRegistry.consume` -- cannot
+        obtaining one from :meth:`DevicePairingRegistry.peek` -- cannot
         name a namespace it never proved ownership of.  This mirrors
         :meth:`enroll_writer`.
         """
