@@ -106,12 +106,6 @@ resource storage 'Microsoft.Storage/storageAccounts@2023-05-01' = {
         value: address
         action: 'Allow'
       }]
-      resourceAccessRules: [
-        {
-          tenantId: subscription().tenantId
-          resourceId: budgetHookApp.id
-        }
-      ]
       virtualNetworkRules: [
         {
           id: acaSubnet.id
