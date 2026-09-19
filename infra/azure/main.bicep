@@ -340,7 +340,6 @@ resource syncBlobWriterRoleDefinition 'Microsoft.Authorization/roleDefinitions@2
       'Microsoft.Storage/storageAccounts/blobServices/containers/blobs/read'
       'Microsoft.Storage/storageAccounts/blobServices/containers/blobs/add/action'
       'Microsoft.Storage/storageAccounts/blobServices/containers/blobs/write'
-      'Microsoft.Storage/storageAccounts/blobServices/containers/blobs/lease/action'
     ] }]
     assignableScopes: [storage.id]
   }
