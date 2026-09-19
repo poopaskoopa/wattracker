@@ -291,6 +291,19 @@ def test_cleanup_delete_identity_is_not_deployed_without_a_cleanup_job():
     assert "param operatorWipePrincipalId = ''" in PARAMS
 
 
+def test_sync_blob_writer_role_has_only_supported_write_actions():
+    role = BICEP.split(
+        "resource syncBlobWriterRoleDefinition "
+        "'Microsoft.Authorization/roleDefinitions"
+    )[1].split("resource ")[0]
+    actions = re.findall(r"'([^']+)'", role.split("dataActions: [", 1)[1].split("]", 1)[0])
+    assert actions == [
+        "Microsoft.Storage/storageAccounts/blobServices/containers/blobs/read",
+        "Microsoft.Storage/storageAccounts/blobServices/containers/blobs/add/action",
+        "Microsoft.Storage/storageAccounts/blobServices/containers/blobs/write",
+    ]
+
+
 def test_the_operator_wipe_role_cannot_reach_the_kill_switch_table():
     """#170's separation: the wipe identity is not the sync identity.
 
