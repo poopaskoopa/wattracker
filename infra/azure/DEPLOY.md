@@ -46,6 +46,25 @@ only by `WATTRACKER_CLOUD_PLANE`. Keep the parameter file's placeholders in
 source control and copy the same full image reference—and therefore the same
 exact digest—into both values only in the deployment copy.
 
+Before `az deployment group create`, run the read-only drift check against the
+untracked local parameter file and the commit intended for deployment:
+
+```sh
+DEPLOYMENT_COMMIT='FULL_COMMIT_SHA'
+python scripts/check_cloud_image_drift.py infra/azure/main.local.bicepparam \
+  --deployment-commit "$DEPLOYMENT_COMMIT"
+```
+
+The checker resolves the full digest through successful `main` publishing runs
+and reports the published commit, current `main` commit, run ID, and how many
+commits `main` is ahead or behind. A nonzero `main ahead` count means the
+deployment would still succeed but would deliberately run an older image;
+review and choose the image deliberately. The command returns success when the
+digest matches the explicitly requested deployment commit, even when that
+commit is intentionally older than `main`. It never edits the parameter file
+or updates a digest, and it does not verify Azure state. Keep the cosign
+command above as the signature check.
+
 The package is **public** and needs no registry pull credential. A package
 published by Actions from a public repository inherits that repository's
 visibility, so `wattracker-cloud` was public from its first push — there is no

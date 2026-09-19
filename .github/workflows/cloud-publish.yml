@@ -89,5 +89,7 @@ jobs:
             echo "${image_ref}"
             echo '```'
             echo
+            echo "Published commit: ${GITHUB_SHA}"
+            echo
             echo "Use this same digest for both readImage and syncImage in infra/azure/main.bicepparam."
           } >> "$GITHUB_STEP_SUMMARY"

@@ -37,6 +37,7 @@ def test_publish_workflow_builds_one_amd64_image_and_verifies_its_signature():
     assert "GITHUB_STEP_SUMMARY" in WORKFLOW
     assert 'image_ref="${IMAGE}@${DIGEST}"' in WORKFLOW
     assert "${{ steps.build.outputs.digest }}" in WORKFLOW
+    assert 'Published commit: ${GITHUB_SHA}' in WORKFLOW
 
 
 def test_deployment_skeleton_and_runbook_use_one_signed_digest_for_both_planes():
@@ -48,6 +49,8 @@ def test_deployment_skeleton_and_runbook_use_one_signed_digest_for_both_planes()
     assert "ghcr.io/poopaskoopa/wattracker-cloud@sha256:" in DEPLOY
     assert "cosign verify" in DEPLOY
     assert "same full image reference" in DEPLOY
+    assert "check_cloud_image_drift.py" in DEPLOY
+    assert "--deployment-commit" in DEPLOY
     assert "The package is **public** and needs no registry pull credential" in DEPLOY
     assert "inherits that repository's\nvisibility" in DEPLOY
     assert "OCI image index, not a single manifest" in DEPLOY
