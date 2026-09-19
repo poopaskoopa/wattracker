@@ -105,11 +105,14 @@ parameter file: `main.bicep` obtains the existing app's default host key with
 ## Phase order and parameter handoffs
 
 `main.bicep` declares the budget Function App as an existing resource and
-uses it for both `listKeys` and the Storage `resourceAccessRules` entry. The
-Function therefore must exist and have its system-assigned identity enabled
-before the main deployment. Conversely, the Function needs the application
-Storage account and its `CloudControl` table, which `main.bicep` creates,
-before its settings are completed and the hook is published.
+uses it to obtain the host key for the action-group callback URLs. The budget
+Function's access to the application Storage account rests solely on the
+`budgetHookIpRules` IP allowlist; its system-assigned identity is used for the
+separate CloudControl role assignment. The Function therefore must exist and
+have its system-assigned identity enabled before the main deployment.
+Conversely, the Function needs the application Storage account and its
+`CloudControl` table, which `main.bicep` creates, before its settings are
+completed and the hook is published.
 
 1. Select subscription/resource group and create bootstrap host storage plus
    the empty Consumption Function. This yields the Function name,
@@ -164,7 +167,9 @@ Confirm the actual supported Python/runtime flags and the Function plan in the
 first deployment. Put `defaultHostName` (without `https://`) and the app name
 in the matching parameter entries. Split `possibleOutboundIpAddresses` into
 one string per `budgetHookIpRules` array item; preserve every returned IPv4.
-Put the identity `principalId` in `budgetHookPrincipalId`.
+Put the identity `principalId` in `budgetHookPrincipalId`. The budget
+Function's application-Storage access rests solely on this IP allowlist, so
+preserve the complete outbound address list.
 
 ## 2. Complete parameters and deploy the main template (unverified commands)
 
@@ -226,8 +231,9 @@ func azure functionapp publish "$FUNCTION_APP_NAME"
 
 Confirm the Function's app settings, enabled system identity, logs, host key,
 and its ability to reach the application storage before treating callbacks as
-live. If the Function changes hosting resource or possible outbound IPs,
-refresh `budgetHookIpRules` and redeploy `main.bicep`.
+live. Re-read the complete outbound IP list and redeploy `main.bicep` whenever
+the Consumption Function App is moved, rescaled, or recreated, because its
+outbound address set can change in each case.
 
 ## 4. Non-production budget drill (unverified commands)
 
@@ -259,11 +265,9 @@ query/portal view needs an Entra principal with Storage Table Data Reader on
 CloudControl row is a failed drill, not evidence of recovery.
 
 This drill proves or refutes two template assumptions: that
-`Microsoft.Web/sites` `resourceAccessRules` is eligible for this Function
-resource, and that the Function identity has the CloudControl Table
-Insert-Or-Merge (`upsert_entity`) write permission. A non-production
-isolation/retest may be necessary because the Function IP allow-list can mask
-whether the resource-instance rule itself works.
+the complete Consumption Function outbound IP allowlist permits application
+Storage access, and that the Function identity has the CloudControl Table
+Insert-Or-Merge (`upsert_entity`) write permission.
 
 Missing or invalid Function keys are rejected by the Functions host; a missing
 or invalid app token is rejected by the app. Storage RBAC or firewall denial
@@ -271,7 +275,7 @@ during `budget_hook.py` apply/clear is surfaced as HTTP 503, as can a network
 failure. The same outside HTTP error can therefore represent firewall denial:
 inspect Function logs and the CloudControl row to distinguish it. Treat HTTP
 200 without the row as failure and investigate logs, storage data-plane RBAC,
-firewall/IP/resource-instance rules, and connectivity.
+firewall/IP-allowlist rules, and connectivity.
 
 ## Actual-deployment evidence checklist
 
@@ -280,7 +284,7 @@ firewall/IP/resource-instance rules, and connectivity.
 - [ ] The existing Function name, host, identity principal ID, and all possible
       outbound IPv4 addresses match `main.bicepparam`.
 - [ ] Deployment activity shows the Function host-key lookup, role assignment,
-      firewall/resource-instance rule, tables, action groups, budget, and
+      firewall/IP allowlist, tables, action groups, budget, and
       Container Apps succeeded.
 - [ ] The one immutable signed image reference was produced by the #316
       publishing run, verified with the documented cosign command, and copied

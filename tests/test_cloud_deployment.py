@@ -63,12 +63,8 @@ def test_storage_uses_service_endpoints_and_a_deny_by_default_firewall():
     assert "service: 'Microsoft.Storage'" in BICEP
     assert "budgetHookIpRules" in BICEP
     assert "ipRules:" in BICEP
-    assert "resourceAccessRules:" in BICEP
-    assert re.search(
-        r"resourceAccessRules:\s*\[\s*\{\s*tenantId:\s*subscription\(\)\.tenantId\s*"
-        r"resourceId:\s*budgetHookApp\.id",
-        BICEP,
-    )
+    uncommented_bicep = re.sub(r"//[^\n]*", "", BICEP)
+    assert not re.search(r"\bresourceAccessRules\s*:", uncommented_bicep)
     assert "virtualNetworkRules:" in BICEP
     assert "resource acaSubnet 'Microsoft.Network/virtualNetworks/subnets@2023-11-01'" in BICEP
     assert "id: acaSubnet.id" in BICEP
