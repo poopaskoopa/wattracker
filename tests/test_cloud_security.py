@@ -290,6 +290,56 @@ def test_shared_backend_survives_registry_restart_and_propagates_revocation():
     assert first_credentials.resolve_reader(reader_token, now=102) is None
 
 
+def test_writer_rows_use_opaque_handles_and_validate_legacy_credential_ids():
+    backend = MemorySecurityStateBackend()
+    first = CredentialRegistry(b"server secret", backend=backend)
+    writer = first.register_writer(
+        _installation(), "scope", b"signing", b"subscription"
+    )
+    row_key = first._credential_digest(writer.credential_id).hex()
+    persisted = backend.read("writer", row_key)
+    assert persisted is not None
+    assert "credential_id" not in persisted
+
+    legacy = dict(persisted)
+    legacy["credential_id"] = writer.credential_id
+    backend.write("writer", row_key, legacy)
+
+    restarted = CredentialRegistry(b"server secret", backend=backend)
+    assert restarted.authenticate_writer(
+        writer.credential_id, b"subscription"
+    ) is not None
+    listed = restarted.list_writers()
+    assert [item.credential_id for item in listed] == [row_key]
+    assert restarted.revoke_writer_and_devices(row_key)
+    persisted = backend.read("writer", row_key)
+    assert persisted is not None
+    assert "credential_id" not in persisted
+    assert restarted.authenticate_writer(
+        writer.credential_id, b"subscription"
+    ) is None
+
+
+def test_writer_rows_with_mismatched_legacy_credential_id_fail_closed():
+    backend = MemorySecurityStateBackend()
+    first = CredentialRegistry(b"server secret", backend=backend)
+    writer = first.register_writer(
+        _installation(), "scope", b"signing", b"subscription"
+    )
+    row_key = first._credential_digest(writer.credential_id).hex()
+    persisted = backend.read("writer", row_key)
+    assert persisted is not None
+    persisted["credential_id"] = "f" * 64
+    backend.write("writer", row_key, persisted)
+
+    restarted = CredentialRegistry(b"server secret", backend=backend)
+    assert restarted.authenticate_writer(
+        writer.credential_id, b"subscription"
+    ) is None
+    assert restarted.list_writers() == ()
+    assert not restarted.revoke_writer_and_devices(row_key)
+
+
 def test_ed25519_credential_rejects_public_key_hmac_downgrade():
     canonical = b"signed request"
     public_key = b"p" * 32
@@ -1215,7 +1265,7 @@ def test_revoke_rereads_writer_after_shared_guard(pairing_replicas, monkeypatch,
     handle = writer.credential_id
     if legacy:
         value = first._backend.read("writer", row_key)
-        value.pop("credential_id")
+        value["credential_id"] = writer.credential_id
         first._backend.write("writer", row_key, value)
         handle = row_key
     assert second.lookup_writer(handle).subject is None
@@ -1237,7 +1287,7 @@ def test_revoke_rereads_writer_after_shared_guard(pairing_replicas, monkeypatch,
     assert stored["subject"] == "newer-subject"
     assert stored["revoked"] is True
     assert stored["active"] is False
-    assert ("credential_id" not in stored) == legacy
+    assert "credential_id" not in stored
 
 
 @pytest.mark.parametrize("existing_guard", [False, True])

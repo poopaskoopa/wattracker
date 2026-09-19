@@ -104,10 +104,17 @@ def test_admin_routes_list_and_revoke_durable_writer_installation():
     writer = state.credentials.register_writer(
         new_installation_id(), "rider-scope", b"w" * 32, b"s" * 32
     )
+    row_key = hashlib.sha256(writer.credential_id.encode("ascii")).hexdigest()
+    persisted = backend.read("writer", row_key)
+    assert persisted is not None
+    assert "credential_id" not in persisted
 
     # Recreate the registries around the same backend to exercise the durable
     # row rather than the first process's in-memory writer cache.
     restarted = CloudState.create(config, security_backend=backend)
+    assert restarted.credentials.authenticate_writer(
+        writer.credential_id, b"s" * 32
+    ) is not None
     with TestClient(create_cloud_app(config, state=restarted)) as client:
         unauthorized = client.get(
             "/api/v1/admin/installations",
@@ -128,7 +135,7 @@ def test_admin_routes_list_and_revoke_durable_writer_installation():
         assert listed.status_code == 200
         assert listed.json() == {
             "installations": [{
-                "installation_id": writer.credential_id,
+                "installation_id": row_key,
                 "status": "active",
                 "capabilities": ["read", "write"],
                 "signature_algorithm": "hmac-sha256",
@@ -138,7 +145,7 @@ def test_admin_routes_list_and_revoke_durable_writer_installation():
         assert "local_user_scope" not in json.dumps(listed.json())
 
         revoked = client.post(
-            f"/api/v1/admin/installations/{writer.credential_id}/revoke",
+            f"/api/v1/admin/installations/{row_key}/revoke",
             headers={
                 "X-Operator-Token": TOKEN,
                 "X-Gateway-Request-Proof": GATEWAY_PROOF,
@@ -146,7 +153,7 @@ def test_admin_routes_list_and_revoke_durable_writer_installation():
         )
         assert revoked.status_code == 200
         assert revoked.json() == {
-            "installation_id": writer.credential_id,
+            "installation_id": row_key,
             "status": "revoked",
         }
 
@@ -174,10 +181,13 @@ def test_admin_routes_list_and_revoke_legacy_durable_writer_row_in_place():
     row_key = hashlib.sha256(writer.credential_id.encode("ascii")).hexdigest()
     legacy_value = backend.read("writer", row_key)
     assert legacy_value is not None
-    legacy_value.pop("credential_id")
+    legacy_value["credential_id"] = writer.credential_id
     backend.write("writer", row_key, legacy_value)
 
     restarted = CloudState.create(config, security_backend=backend)
+    assert restarted.credentials.authenticate_writer(
+        writer.credential_id, b"s" * 32
+    ) is not None
     with TestClient(create_cloud_app(config, state=restarted)) as client:
         listed = client.get(
             "/api/v1/admin/installations",
@@ -481,25 +491,27 @@ def test_admin_revoke_cascades_to_same_scope_device_and_is_idempotent():
     assert state.credentials.authenticate_device(
         device.credential_id, device.subscription_key
     ) is not None
+    row_key = hashlib.sha256(writer.credential_id.encode("ascii")).hexdigest()
+    restarted = CloudState.create(config, security_backend=backend)
     headers = {
         "X-Operator-Token": TOKEN,
         "X-Gateway-Request-Proof": GATEWAY_PROOF,
     }
 
-    with TestClient(create_cloud_app(config, state=state)) as client:
+    with TestClient(create_cloud_app(config, state=restarted)) as client:
         first = client.post(
-            f"/api/v1/admin/installations/{writer.credential_id}/revoke",
+            f"/api/v1/admin/installations/{row_key}/revoke",
             headers=headers,
         )
         retry = client.post(
-            f"/api/v1/admin/installations/{writer.credential_id}/revoke",
+            f"/api/v1/admin/installations/{row_key}/revoke",
             headers=headers,
         )
 
     assert first.status_code == 200
     assert retry.status_code == 200
     assert first.json() == retry.json() == {
-        "installation_id": writer.credential_id,
+        "installation_id": row_key,
         "status": "revoked",
     }
     assert state.credentials.authenticate_writer(

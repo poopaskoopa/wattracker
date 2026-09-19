@@ -1676,13 +1676,6 @@ def _writer_value(credential: WriterCredential) -> dict[str, Any]:
         credential.subscription_key
     )
     return {
-        # The row key is sha256(credential_id), so retaining the opaque id in
-        # the value is necessary for a durable operator listing.  It is an
-        # identifier, not sufficient proof by itself: both Ed25519 enrollment
-        # rows and legacy/register_writer HMAC rows require their configured
-        # signing and subscription factors.  The id is checked against the row
-        # address when listing records.
-        "credential_id": credential.credential_id,
         "namespace": credential.namespace,
         "local_user_scope": credential.local_user_scope,
         "verification_key": _encode_bytes(credential.verification_key),
@@ -1696,11 +1689,23 @@ def _writer_value(credential: WriterCredential) -> dict[str, Any]:
 
 
 def _writer_from_value(
-    credential_id: str, value: Mapping[str, Any]
+    credential_id: str,
+    value: Mapping[str, Any],
+    *,
+    row_key: str,
 ) -> WriterCredential:
-    stored_id = value.get("credential_id", credential_id)
-    if not isinstance(stored_id, str) or not hmac.compare_digest(stored_id, credential_id):
-        raise ValueError("persisted credential id is invalid")
+    stored_id = value.get("credential_id")
+    if stored_id is not None:
+        if not isinstance(stored_id, str) or _HEX_ID_RE.fullmatch(stored_id) is None:
+            raise ValueError("persisted credential id is invalid")
+        if _HEX_ID_RE.fullmatch(row_key) is None:
+            raise ValueError("writer row key is invalid")
+        if not hmac.compare_digest(
+            _digest_token(stored_id), bytes.fromhex(row_key)
+        ):
+            raise ValueError("persisted credential id is invalid")
+        if not hmac.compare_digest(stored_id, credential_id):
+            raise ValueError("persisted credential id is invalid")
     subject = value.get("subject")
     capabilities = value.get("capabilities")
     return WriterCredential(
@@ -2693,11 +2698,12 @@ class CredentialRegistry:
     def _find_writer_locked(self, credential_id: str) -> WriterCredential | None:
         supplied = self._credential_digest(credential_id)
         if self._backend is not None:
-            value = self._backend.read("writer", supplied.hex())
+            row_key = supplied.hex()
+            value = self._backend.read("writer", row_key)
             if value is None:
                 return None
             try:
-                found = _writer_from_value(credential_id, value)
+                found = _writer_from_value(credential_id, value, row_key=row_key)
             except (KeyError, TypeError, ValueError):
                 return None
             self._writers[supplied] = found
@@ -2908,15 +2914,16 @@ class CredentialRegistry:
                 return False
 
             def revoke_legacy(value: Mapping[str, Any] | None) -> Mapping[str, Any]:
-                if not isinstance(value, Mapping) or "credential_id" in value:
+                if not isinstance(value, Mapping):
                     raise ValueError("legacy writer row is invalid")
                 try:
-                    current = _writer_from_value(credential_id, value)
+                    current = self._writer_from_row(credential_id, value)
                 except (KeyError, TypeError, ValueError) as exc:
                     raise ValueError("legacy writer row is invalid") from exc
                 if current.revoked:
                     raise ValueError("legacy writer row is already revoked")
                 updated = dict(value)
+                updated.pop("credential_id", None)
                 updated["active"] = False
                 updated["revoked"] = True
                 return updated
@@ -3010,13 +3017,16 @@ class CredentialRegistry:
                 )
 
                 def revoke_legacy(value: Mapping[str, Any] | None) -> Mapping[str, Any]:
-                    if not isinstance(value, Mapping) or "credential_id" in value:
+                    if not isinstance(value, Mapping):
                         raise ValueError("legacy writer row is invalid")
                     try:
-                        current = _writer_from_value(credential_id, value)
+                        current = self._writer_from_row(credential_id, value)
                     except (KeyError, TypeError, ValueError) as exc:
                         raise ValueError("legacy writer row is invalid") from exc
+                    if current.revoked:
+                        raise ValueError("legacy writer row is already revoked")
                     updated = dict(value)
+                    updated.pop("credential_id", None)
                     updated["active"] = False
                     updated["revoked"] = True
                     return updated
@@ -3510,23 +3520,10 @@ class CredentialRegistry:
             ):
                 if not isinstance(value, Mapping):
                     continue
-                stored_id = value.get("credential_id")
-                if stored_id is None:
-                    writer = self._legacy_writer_locked(row_key, value=value)
-                else:
+                try:
+                    writer = self._writer_from_row(row_key, value)
+                except (KeyError, TypeError, ValueError):
                     writer = None
-                    if (
-                        isinstance(stored_id, str)
-                        and _HEX_ID_RE.fullmatch(stored_id) is not None
-                        and _HEX_ID_RE.fullmatch(row_key) is not None
-                        and hmac.compare_digest(
-                            self._credential_digest(stored_id), bytes.fromhex(row_key)
-                        )
-                    ):
-                        try:
-                            writer = _writer_from_value(stored_id, value)
-                        except (KeyError, TypeError, ValueError):
-                            pass
                 if writer is not None:
                     writers.append(writer)
         else:
@@ -3564,10 +3561,11 @@ class CredentialRegistry:
     ) -> tuple[WriterCredential, ...]:
         """Return bounded writer status records for an authenticated operator.
 
-        Durable rows carry their own credential id because the backend address
-        stores only its digest.  A legacy row without that field is represented
-        by its validated row key, which is an opaque operator handle rather
-        than a recovered credential id.
+        The backend address is the credential digest, so every durable row is
+        represented by its validated row key, which is an opaque operator
+        handle rather than a recovered credential id.  A pre-migration row
+        carrying ``credential_id`` is accepted only when that field validates
+        against the row key, and is still listed by the row-key handle.
         """
 
         bound = _validate_capacity(limit)
@@ -3579,29 +3577,8 @@ class CredentialRegistry:
                 ):
                     if not isinstance(value, Mapping):
                         continue
-                    stored_id = value.get("credential_id")
-                    if stored_id is None:
-                        credential = self._legacy_writer_locked(row_key, value=value)
-                        if credential is None:
-                            continue
-                        found.append(credential)
-                        if len(found) >= bound:
-                            break
-                        continue
-                    if (
-                        not isinstance(stored_id, str)
-                        or _HEX_ID_RE.fullmatch(stored_id) is None
-                    ):
-                        continue
-                    if _HEX_ID_RE.fullmatch(row_key) is None:
-                        continue
-                    expected = bytes.fromhex(row_key)
-                    if not hmac.compare_digest(
-                        self._credential_digest(stored_id), expected
-                    ):
-                        continue
                     try:
-                        credential = _writer_from_value(stored_id, value)
+                        credential = self._writer_from_row(row_key, value)
                     except (KeyError, TypeError, ValueError):
                         continue
                     found.append(credential)
@@ -3618,22 +3595,28 @@ class CredentialRegistry:
         *,
         value: Mapping[str, Any] | None = None,
     ) -> WriterCredential | None:
-        """Decode one pre-credential-id writer row using only its row key.
-
-        The row key is an operator handle, never an attempted inversion of the
-        credential digest.  Requiring the field to be absent also prevents a
-        malformed new row from entering the legacy path.
-        """
+        """Decode one writer row using only its validated row-key handle."""
 
         if self._backend is None or _HEX_ID_RE.fullmatch(row_key) is None:
             return None
         current = value if value is not None else self._backend.read("writer", row_key)
-        if not isinstance(current, Mapping) or "credential_id" in current:
+        if not isinstance(current, Mapping):
             return None
         try:
-            return _writer_from_value(row_key, current)
+            return self._writer_from_row(row_key, current)
         except (KeyError, TypeError, ValueError):
             return None
+
+    @staticmethod
+    def _writer_from_row(
+        row_key: str, value: Mapping[str, Any]
+    ) -> WriterCredential:
+        if _HEX_ID_RE.fullmatch(row_key) is None:
+            raise ValueError("writer row key is invalid")
+        stored_id = value.get("credential_id")
+        credential_id = row_key if stored_id is None else stored_id
+        writer = _writer_from_value(credential_id, value, row_key=row_key)
+        return replace(writer, credential_id=row_key)
 
     @staticmethod
     def _matches_scope(
