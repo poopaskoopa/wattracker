@@ -3024,7 +3024,7 @@ class CredentialRegistry:
                     except (KeyError, TypeError, ValueError) as exc:
                         raise ValueError("legacy writer row is invalid") from exc
                     if current.revoked:
-                        raise ValueError("legacy writer row is already revoked")
+                        return value
                     updated = dict(value)
                     updated.pop("credential_id", None)
                     updated["active"] = False
