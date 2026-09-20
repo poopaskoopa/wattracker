@@ -20,10 +20,6 @@ param budgetStartDate = 'TODO_BUDGET_START_DATE'
 param budgetEndDate = 'TODO_BUDGET_END_DATE'
 // Source: Function App output (system-assigned identity principalId).
 param budgetHookPrincipalId = 'TODO_BUDGET_HOOK_PRINCIPAL_ID'
-// Source: az query (all possible Function App outbound IPv4 addresses, as an array).
-param budgetHookIpRules = [
-  'TODO_BUDGET_HOOK_OUTBOUND_IPV4'
-]
 // Source: owner decision (empty honestly disables the optional Static Web App).
 param staticRepositoryUrl = ''
 // Source: owner decision (template-safe default for an enabled optional Static Web App).

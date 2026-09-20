@@ -97,9 +97,11 @@ signature this whole path exists to produce.
 
 Have an Azure subscription; an owner-approved region, resource-group name,
 globally unique storage name, PWA origin, billing email and budget period;
+Flex Consumption availability in `eastus2` must be confirmed by the owner
+with `az functionapp list-flexconsumption-locations` and by the deployment;
 registry-backed immutable **signed** cloud image reference from the
 successful #316 publishing run; and permission to create the resources, assign
-roles, list Function host keys, and create Consumption budgets. The final
+roles, list Function host keys, and create Azure budgets. The final
 digest remains an owner deployment input even though its build and signature
 are produced and verified by the repository workflow.
 
@@ -138,19 +140,25 @@ parameter file: `main.bicep` obtains the existing app's default host key with
 
 `main.bicep` declares the budget Function App as an existing resource and
 uses it to obtain the host key for the action-group callback URLs. The budget
-Function's access to the application Storage account rests solely on the
-`budgetHookIpRules` IP allowlist; its system-assigned identity is used for the
-separate CloudControl role assignment. The Function therefore must exist and
-have its system-assigned identity enabled before the main deployment.
-Conversely, the Function needs the application Storage account and its
-`CloudControl` table, which `main.bicep` creates, before its settings are
-completed and the hook is published.
+Function is an externally bootstrapped Flex Consumption app integrated with
+the dedicated `budget-hook-flex` subnet that this template declares. Storage
+access is admitted by that subnet's virtual-network rule; there is no Function
+IP allowlist. Its system-assigned identity is used for the separate
+CloudControl role assignment, so the Function must exist and have identity
+enabled before the main deployment. The Function needs the application
+Storage account and its `CloudControl` table, which `main.bicep` creates,
+before its settings are completed and the hook is published.
 
-1. Select subscription/resource group and create bootstrap host storage plus
-   the empty Consumption Function. This yields the Function name,
-   `defaultHostName`, system identity `principalId`, and complete possible
-   outbound IPv4 list for `budgetHookFunctionAppName`, `budgetHookHost`,
-   `budgetHookPrincipalId`, and `budgetHookIpRules`.
+1. Confirm that `eastus2` is listed by `az functionapp
+   list-flexconsumption-locations`. Create the bootstrap VNet and the empty
+   Flex Function externally. The VNet is `wattracker-vnet` with address space
+   `10.42.0.0/16`; its dedicated Function subnet is
+   `budget-hook-flex`, `10.42.2.0/27`, delegated to
+   `Microsoft.App/environments`, with the `Microsoft.Storage` service
+   endpoint. The ACA subnet is not shared with Flex. This yields the Function
+   name, `defaultHostName`, and new system identity `principalId` for
+   `budgetHookFunctionAppName`, `budgetHookHost`, and
+   `budgetHookPrincipalId`.
 2. Resolve owner inputs and the successful #316 publishing run. They yield
    `location`, `storageName`, `allowedOrigin`, `billingEmail`,
    `budgetStartDate`, `budgetEndDate`, and one signed image reference to use
@@ -159,23 +167,36 @@ completed and the hook is published.
 3. Build, validate, review what-if, then create `main.bicep`. This creates
    the application Storage account and `CloudControl`, the VNet/ACA
    environment and apps, managed identities and RBAC, action groups, and
-   budget. It also assigns the pre-existing Function identity the narrowly
-   scoped CloudControl read/upsert role. Record the storage name and Container
-   App endpoint/identity outputs obtained from Azure; the current template has
-   no Bicep `output` declarations, so portal/`az` queries are required.
-4. Set the Function's application Storage name and budget-hook token, stage
-   and publish it, then verify the Function and execute a non-production drill.
+   budget. It also reconciles the Flex subnet and assigns the newly recreated
+   Function identity the narrowly scoped CloudControl read/upsert role. Record
+   the storage name and Container App endpoint/identity outputs obtained from
+   Azure; the current template has no Bicep `output` declarations, so
+   portal/`az` queries are required.
+4. After `az functionapp create` and the main deployment, re-set the
+   Function's application Storage name and budget-hook token, stage and
+   publish the hook. Do not run the drill until both the settings update and
+   the publish have succeeded; then verify the Function and execute a
+   non-production drill.
 
 The bootstrap storage is intentionally separate from the application storage:
-a Consumption Function needs host storage before `main.bicep` can create the
-application storage it will later access. The exact provider-supported
-bootstrap storage/account and Consumption runtime setup must be confirmed on
-the first deployment; do not infer that this has been tested here.
+a Flex Function needs host/deployment storage before `main.bicep` can create
+the application storage it will later access. `dailyMemoryTimeQuota` is a Y1
+Consumption setting, not a Flex setting; do not carry it into the recreated
+app. Flex uses per-instance memory sizing and regional quotas/scaling instead;
+choose only a currently supported instance-memory size and confirm the
+owner's regional quota during deployment. The exact provider-supported
+bootstrap storage/account and runtime setup must be confirmed on the first
+deployment; do not infer that this has been tested here.
 
-## 1. Bootstrap the existing Function App (unverified commands)
+## 1. Bootstrap or recreate the Flex Function App (unverified commands)
 
 From a clean deployment shell, choose non-secret names. The following is an
-expected Azure CLI flow to confirm against the installed CLI and subscription:
+expected Azure CLI flow to confirm against the installed CLI and subscription.
+The existing Y1 app is recreated rather than converted: capture its name and
+settings, delete the old site after the replacement window is approved, and
+create the Flex site with the same or a new name. A recreation changes the
+system-assigned principal ID, host key, and default host name; re-read all of
+them after creation and before filling `main.bicepparam`.
 
 ```sh
 export SUBSCRIPTION_ID='TODO_SUBSCRIPTION_ID'
@@ -183,25 +204,38 @@ export RESOURCE_GROUP='TODO_RESOURCE_GROUP'
 export LOCATION='TODO_RESOURCE_GROUP_LOCATION'
 export BOOTSTRAP_STORAGE_NAME='TODO_UNIQUE_FUNCTION_HOST_STORAGE_NAME'
 export FUNCTION_APP_NAME='TODO_UNIQUE_BUDGET_HOOK_FUNCTION_APP_NAME'
+export VNET_NAME='wattracker-vnet'
+export FLEX_SUBNET_NAME='budget-hook-flex'
+export VNET_ID="/subscriptions/$SUBSCRIPTION_ID/resourceGroups/$RESOURCE_GROUP/providers/Microsoft.Network/virtualNetworks/$VNET_NAME"
 
 az login
 az account set --subscription "$SUBSCRIPTION_ID"
 az group create --name "$RESOURCE_GROUP" --location "$LOCATION"
+az functionapp list-flexconsumption-locations --query "[?name=='$LOCATION']" --output table
+az provider register --namespace Microsoft.App
+az network vnet create --name "$VNET_NAME" --resource-group "$RESOURCE_GROUP" --location "$LOCATION" --address-prefixes 10.42.0.0/16
+az network vnet subnet create --name "$FLEX_SUBNET_NAME" --resource-group "$RESOURCE_GROUP" --vnet-name "$VNET_NAME" --address-prefixes 10.42.2.0/27 --delegations Microsoft.App/environments --service-endpoints Microsoft.Storage
 az storage account create --name "$BOOTSTRAP_STORAGE_NAME" --resource-group "$RESOURCE_GROUP" --location "$LOCATION" --sku Standard_LRS
-az functionapp create --name "$FUNCTION_APP_NAME" --resource-group "$RESOURCE_GROUP" --consumption-plan-location "$LOCATION" --storage-account "$BOOTSTRAP_STORAGE_NAME" --runtime python --runtime-version 3.11 --functions-version 4
+az functionapp delete --name "$FUNCTION_APP_NAME" --resource-group "$RESOURCE_GROUP" # only when replacing the existing Y1 site
+az functionapp create --name "$FUNCTION_APP_NAME" --resource-group "$RESOURCE_GROUP" --storage-account "$BOOTSTRAP_STORAGE_NAME" --flexconsumption-location "$LOCATION" --runtime python --runtime-version 3.12 --functions-version 4 --vnet "$VNET_ID" --subnet "$FLEX_SUBNET_NAME"
 az functionapp identity assign --name "$FUNCTION_APP_NAME" --resource-group "$RESOURCE_GROUP"
 
-az functionapp show --name "$FUNCTION_APP_NAME" --resource-group "$RESOURCE_GROUP" --query '{name:name,host:defaultHostName,possibleOutboundIps:possibleOutboundIpAddresses}' --output json
+az functionapp show --name "$FUNCTION_APP_NAME" --resource-group "$RESOURCE_GROUP" --query '{name:name,host:defaultHostName,plan:kind,flexSubnet:siteConfig.virtualNetworkSubnetId}' --output json
 az functionapp identity show --name "$FUNCTION_APP_NAME" --resource-group "$RESOURCE_GROUP" --query principalId --output tsv
 ```
 
-Confirm the actual supported Python/runtime flags and the Function plan in the
-first deployment. Put `defaultHostName` (without `https://`) and the app name
-in the matching parameter entries. Split `possibleOutboundIpAddresses` into
-one string per `budgetHookIpRules` array item; preserve every returned IPv4.
-Put the identity `principalId` in `budgetHookPrincipalId`. The budget
-Function's application-Storage access rests solely on this IP allowlist, so
-preserve the complete outbound address list.
+A recreated Function App starts empty. After `az functionapp create` and after
+Phase 2 has created the application Storage, run the Phase 3 app-settings
+command again, restage the project, and publish the hook before Phase 4. Do not
+send the new site through the drill with old settings or an empty code package.
+
+Confirm the actual supported Python/runtime flags, Flex plan, instance-memory
+choice, and subnet integration in the first deployment. Put the new
+`defaultHostName` (without `https://`) and app name in the matching parameter
+entries. Put the new identity `principalId` in `budgetHookPrincipalId`.
+There is no outbound-IP handoff or allowlist parameter. If the owner keeps the
+same app name, the new host key still must be re-read by the main deployment's
+`listKeys` lookup; treat any old callback URL as stale.
 
 ## 2. Complete parameters and deploy the main template (unverified commands)
 
@@ -211,6 +245,11 @@ verified before deployment. Fill `readImage` and `syncImage` with that same
 reference only after the run exists. Keep `staticRepositoryUrl = ''` to disable the
 optional Static Web App, or supply owner-approved repository values and the
 environment-provided deployment token.
+
+If this parameter file was copied from the earlier Y1 deployment, delete the
+entire `budgetHookIpRules` parameter block before running any command below.
+`main.bicep` no longer declares that parameter; leaving it in the parameter
+file causes `BCP259` and the deployment cannot validate or create.
 
 ```sh
 cd infra/azure
@@ -263,11 +302,11 @@ cd build/azure-budget-hook
 func azure functionapp publish "$FUNCTION_APP_NAME" --python
 ```
 
-Confirm the Function's app settings, enabled system identity, logs, host key,
-and its ability to reach the application storage before treating callbacks as
-live. Re-read the complete outbound IP list and redeploy `main.bicep` whenever
-the Consumption Function App is moved, rescaled, or recreated, because its
-outbound address set can change in each case.
+Confirm the Function's app settings, enabled system identity, Flex plan,
+`budget-hook-flex` integration, logs, new host key, and ability to reach the
+application storage before treating callbacks as live. If the Function is
+recreated, re-read its principal ID, host, and host key and redeploy the main
+template; no outbound-IP synchronization is required.
 
 ## 4. Non-production budget drill (unverified commands)
 
@@ -298,10 +337,14 @@ query/portal view needs an Entra principal with Storage Table Data Reader on
 `CloudControl` and is the proof that the durable row landed; a 200 with no
 CloudControl row is a failed drill, not evidence of recovery.
 
-This drill proves or refutes two template assumptions: that
-the complete Consumption Function outbound IP allowlist permits application
-Storage access, and that the Function identity has the CloudControl Table
-Insert-Or-Merge (`upsert_entity`) write permission.
+Before or alongside the drill, inspect the deployed subnet and Storage ACLs to
+prove that the Function's `budget-hook-flex` subnet is delegated as
+`Microsoft.App/environments`, has the `Microsoft.Storage` service endpoint,
+and appears as a `virtualNetworkRules` entry on the application Storage
+account alongside the ACA subnet. Do not use or add an IP allowlist for this
+proof. The drill then proves that this virtual-network path and the recreated
+Function identity's CloudControl Table Insert-Or-Merge (`upsert_entity`)
+permission work together.
 
 Missing or invalid Function keys are rejected by the Functions host; a missing
 or invalid app token is rejected by the app. Storage RBAC or firewall denial
@@ -309,16 +352,20 @@ during `budget_hook.py` apply/clear is surfaced as HTTP 503, as can a network
 failure. The same outside HTTP error can therefore represent firewall denial:
 inspect Function logs and the CloudControl row to distinguish it. Treat HTTP
 200 without the row as failure and investigate logs, storage data-plane RBAC,
-firewall/IP-allowlist rules, and connectivity.
+firewall virtual-network rules, subnet delegation/service endpoint, and
+connectivity.
 
 ## Actual-deployment evidence checklist
 
 - [ ] `az account show` identifies the intended non-production subscription.
 - [ ] Bicep build, validate, reviewed what-if, and create outputs are saved.
-- [ ] The existing Function name, host, identity principal ID, and all possible
-      outbound IPv4 addresses match `main.bicepparam`.
+- [ ] The recreated Flex Function name, host, and new identity principal ID
+      match `main.bicepparam`; no outbound IPv4 list is supplied.
+- [ ] The `budget-hook-flex` subnet is `10.42.2.0/27`, delegated to
+      `Microsoft.App/environments`, has the `Microsoft.Storage` service
+      endpoint, and is integrated with the Function.
 - [ ] Deployment activity shows the Function host-key lookup, role assignment,
-      firewall/IP allowlist, tables, action groups, budget, and
+      ACA and budget-hook virtual-network firewall rules, tables, action groups, budget, and
       Container Apps succeeded.
 - [ ] The one immutable signed image reference was produced by the #316
       publishing run, verified with the documented cosign command, and copied

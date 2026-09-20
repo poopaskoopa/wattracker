@@ -27,11 +27,10 @@ assumptions are recorded in [`docs/azure-gateway-decision.md`](../../docs/azure-
   credentials; writes use server-issued writer credentials and signed request
   envelopes. `X-Verified-Entra-Subject` and `X-Gateway-Request-Proof` are not
   production trust inputs.
-- The VNet has an ACA infrastructure subnet using the `Microsoft.Storage`
-  service endpoint. Storage keeps its public endpoint enabled because service
-  endpoints use it, but its firewall is deny by default and allows only that
-  subnet, the same-tenant budget Function resource instance, and the explicitly
-  supplied Function egress IPs.
+- The VNet has dedicated ACA and Flex budget-hook subnets, each using the
+  `Microsoft.Storage` service endpoint. Storage keeps its public endpoint
+  enabled because service endpoints use it, but its firewall is deny by
+  default and allows only those two virtual-network rules.
 - Storage uses managed identity and Azure RBAC only. Shared keys, anonymous
   blobs, TLS below 1.2, private endpoints, and private DNS are not part of this
   profile. The read identity, sync identity, and budget-hook identity have
@@ -41,11 +40,13 @@ assumptions are recorded in [`docs/azure-gateway-decision.md`](../../docs/azure-
 
 ## Budget hook deployment contract
 
-Provision the external Azure Functions Consumption app before applying this
-template. The classic Consumption plan has no VNet integration, so obtain all
-possible outbound IPv4 addresses from the Function resource and pass them as
-`budgetHookIpRules`. Keep that list synchronized when the Function's hosting
-resource changes. Stage and deploy `infra/azure/budget-hook` with a
+Provision the external Azure Functions Flex Consumption app before applying
+this template. Confirm that `eastus2` is supported with
+`az functionapp list-flexconsumption-locations`. Create or recreate the app
+with VNet integration on `wattracker-vnet` / `budget-hook-flex`
+(`10.42.2.0/27`), delegated to `Microsoft.App/environments` and configured
+with the `Microsoft.Storage` service endpoint. The ACA subnet cannot be shared
+with the Flex app. Stage and deploy `infra/azure/budget-hook` with a
 system-assigned managed identity and these settings; see [Azure Functions networking
 options](https://learn.microsoft.com/en-us/azure/azure-functions/functions-networking-options):
 
@@ -82,10 +83,14 @@ host key with `listKeys` at deployment time, constructs the two HTTPS
 route-specific URLs, and appends the `code` query parameter. The deployment
 principal therefore needs permission to list host keys for that Function App;
 the key is never passed as a Bicep parameter. Rotate it with the Function
-deployment and redeploy this template. Pass the Function's complete
-possible outbound IP list as `budgetHookIpRules`; the Storage firewall also
-allows the same-tenant Function resource instance, while its `bypass` remains
-`None`. The fixed routes are:
+deployment and redeploy this template. The Storage firewall admits the Flex
+subnet through a virtual-network rule, alongside the ACA subnet, while its
+`bypass` remains `None`. There is no Function outbound-IP parameter or
+other Function-specific admission; the firewall relies only on the two subnet
+rules.
+Recreating the old Y1 app changes its principal ID, host, and host key; re-read
+those values before deploying the main template.
+The fixed routes are:
 
 Set `budgetStartDate` to the first day of the current budget period and
 `budgetEndDate` to its end date explicitly on every deployment. These are
@@ -109,11 +114,10 @@ explicit operator action that writes both levels enabled.
 - [ ] Images are signed and the cloud runtime imports successfully.
 - [ ] Both Container Apps have external HTTPS ingress and application-level
       credentials/signature checks; no gateway headers are trusted.
-- [ ] Storage firewall rules contain only the ACA subnet, the same-tenant
-      budget-hook Function resource instance, and current Function egress IPs;
-      shared-key and anonymous-blob access remain disabled.
-- [ ] The Function's managed identity object ID is passed to Bicep, its full
-      possible egress-IP list is current, and both callback URLs use the
-      current default host key resolved by Bicep.
+- [ ] Storage firewall rules contain only the ACA and dedicated Flex budget-hook
+      subnets; shared-key and anonymous-blob access remain disabled.
+- [ ] The recreated Flex Function's managed identity object ID is passed to
+      Bicep, and both callback URLs use its current default host key resolved
+      by Bicep.
 - [ ] A non-production budget drill confirms the 80% and 100% routes persist in
       `CloudControl`, survive an app restart, and are cleared explicitly.

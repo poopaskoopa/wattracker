@@ -14,12 +14,10 @@ revocable and never logged. The gateway decision and pricing evidence are in
 
 The Container Apps environment remains VNet-integrated but is public so
 clients can reach it directly. Storage uses the `Microsoft.Storage` service
-endpoint from the ACA subnet with a deny-by-default firewall; the external
-budget Function is admitted by a same-tenant resource-instance rule and its
-explicitly supplied possible outbound IPs.
-Shared keys, anonymous blobs, private endpoints, and private DNS are not used.
-The storage firewall admits only the ACA subnet, the budget Function resource
-instance, and those explicitly supplied Function egress IPs.
+endpoint from both the ACA subnet and the external Flex budget Function's
+dedicated `budget-hook-flex` subnet (`10.42.2.0/27`), with a deny-by-default
+firewall. Shared keys, anonymous blobs, private endpoints, and private DNS are
+not used. The storage firewall admits only those two virtual-network rules.
 Managed identities and Azure RBAC remain required. Production deployment
 inputs require a high-entropy operator token of at least 32 characters.
 Certificate presence and caller-controlled gateway headers are not application
@@ -909,9 +907,9 @@ The Bicep monthly budget is `$10`, with percentage alerts at 50%, 80%, and
 100% of that amount. The 80% and 100% notifications invoke authenticated
 Azure Function routes outside Container Apps: `disable-writes` persists the
 80% state with reason `budget 80%`, and `disable-public-api` persists the 100%
-state with reason `budget 100%`. The Function is a separately deployed
-Consumption app; keep its possible outbound IP list synchronized in
-`budgetHookIpRules`. See
+state with reason `budget 100%`. The Function is a separately deployed Flex
+Consumption app with VNet integration on the dedicated budget-hook subnet;
+there is no outbound IP list to synchronize. See
 [`docs/azure-gateway-decision.md`](azure-gateway-decision.md) for the deployment
 contract and drill. Supply `budgetStartDate` and `budgetEndDate` explicitly so
 the budget period is current and is not inherited from a stale template date.
@@ -1051,8 +1049,8 @@ hard billing ceiling.
       routing; anonymous blobs, Shared Key, and HTTP are disabled; TLS 1.2 is
       enforced; the firewall is deny-by-default.
 - [ ] Resolve Blob/Table names from the ACA service-endpoint subnet and the
-      budget Function resource instance and current egress IPs; verify the
-      firewall admits only those sources.
+      dedicated Flex budget-hook subnet; verify the firewall admits only those
+      virtual-network sources.
 - [ ] Verify each managed identity has only its documented data-plane role —
       in particular, `entities/delete` on `CloudAuth` is held by the read
       identity alone through `authSweeperRoleDefinition`, and no container app

@@ -252,5 +252,5 @@ Probed specifically during review; do not spend time re-auditing these without n
 - **Storage account posture.** Public network access is enabled only because service endpoints
   use the public service hostname; shared keys and anonymous blobs remain disabled, HTTPS-only and
   TLS 1.2 minimum remain enforced, and deny-by-default network ACLs with `bypass: 'None'` admit only
-  the ACA subnet and the explicitly supplied budget-Function egress IPs. Private endpoints and DNS
-  are intentionally not provisioned; custom data-plane roles still omit delete for the sync identity.
+  the ACA subnet and the dedicated Flex budget-hook subnet. Private endpoints and DNS are
+  intentionally not provisioned; custom data-plane roles still omit delete for the sync identity.

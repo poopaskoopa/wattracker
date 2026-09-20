@@ -52,17 +52,16 @@ and its tier requirement in the [Front Door FAQ](https://learn.microsoft.com/en-
   separately configured proxy deployment, and production refuses to claim an
   attested subject without a proof-carrying gateway.
 - Storage uses the [Microsoft.Storage service endpoint](https://learn.microsoft.com/en-us/azure/virtual-network/virtual-network-service-endpoints-overview)
-  from the ACA subnet. Its public endpoint is enabled because service endpoints
-  use it, but the [storage firewall](https://learn.microsoft.com/en-us/azure/storage/common/storage-network-security-virtual-networks)
-  is deny-by-default and allows only that subnet, the same-tenant external
-  Function resource instance, and its explicitly supplied possible outbound
-  IPs. Shared keys and anonymous blobs remain disabled; HTTPS and TLS 1.2
-  remain mandatory.
-- The budget callback is an externally deployed Azure Function on Consumption,
-  because the handler must remain alive when the apps are scaled to zero. The
-  classic Consumption plan has no VNet integration, so Bicep accepts the
-  Function's possible outbound IPs as `budgetHookIpRules` and keeps the storage
-  firewall deny-by-default. Bicep derives each Azure Monitor Action Group URL
+  from both the ACA subnet and the dedicated Flex Function subnet. Its public
+  endpoint is enabled because service endpoints use it, but the [storage
+  firewall](https://learn.microsoft.com/en-us/azure/storage/common/storage-network-security-virtual-networks)
+  is deny-by-default and allows those two virtual-network rules only. Shared
+  keys and anonymous blobs remain disabled; HTTPS and TLS 1.2 remain mandatory.
+- The budget callback is an externally deployed Azure Function on Flex
+  Consumption, because the handler must remain alive when the apps are scaled
+  to zero. Its dedicated `10.42.2.0/27` subnet is delegated to
+  `Microsoft.App/environments` and integrated before the main deployment.
+  Bicep derives each Azure Monitor Action Group URL
   from the Function hostname and its existing default host key via `listKeys`;
   Bicep constructs HTTPS URLs;
   the hook uses managed identity

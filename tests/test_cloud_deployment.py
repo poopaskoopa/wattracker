@@ -60,6 +60,27 @@ def test_phase_three_publish_commands_use_the_repo_python_and_stop_on_failure():
     assert all(block.splitlines()[0] == "set -euo pipefail" for block in shell_blocks)
 
 
+def test_flex_migration_runbook_cleans_legacy_params_and_republishes_after_recreate():
+    phase_one = DEPLOY_RUNBOOK.split(
+        "## 1. Bootstrap or recreate the Flex Function App", 1
+    )[1].split("\n## 2.", 1)[0]
+    phase_two = DEPLOY_RUNBOOK.split(
+        "## 2. Complete parameters and deploy the main template", 1
+    )[1].split("\n## 3.", 1)[0]
+
+    assert "--runtime-version 3.12" in phase_one
+    assert "--runtime-version 3.11" not in phase_one
+    assert re.search(
+        r"delete the\s+entire `budgetHookIpRules` parameter block.*?"
+        r"`main\.bicep` no longer declares.*?BCP259",
+        phase_two,
+        re.DOTALL,
+    )
+    assert "A recreated Function App starts empty." in phase_one
+    assert re.search(r"run the Phase 3 app-settings\s+command again", phase_one)
+    assert "before Phase 4" in phase_one
+
+
 def test_public_container_apps_are_tls_terminated_and_authenticate_at_the_app():
     assert "vnetConfiguration:" in BICEP
     assert "internal: false" in BICEP
@@ -82,14 +103,37 @@ def test_storage_uses_service_endpoints_and_a_deny_by_default_firewall():
     assert "bypass: 'None'" in BICEP
     assert "serviceEndpoints:" in BICEP
     assert "service: 'Microsoft.Storage'" in BICEP
-    assert "budgetHookIpRules" in BICEP
-    assert "ipRules:" in BICEP
+    assert "budgetHookIpRules" not in BICEP
+    assert "ipRules:" not in BICEP
+    assert "budgetHookIpRules" not in PARAMS
+    budget_subnet = BICEP.split(
+        "resource budgetHookSubnet 'Microsoft.Network/virtualNetworks/subnets@2023-11-01'",
+        1,
+    )[1].split("\nresource ", 1)[0]
+    assert "name: 'budget-hook-flex'" in budget_subnet
+    assert "addressPrefix: '10.42.2.0/27'" in budget_subnet
+    assert "serviceName: 'Microsoft.App/environments'" in budget_subnet
+    assert "service: 'Microsoft.Storage'" in budget_subnet
     uncommented_bicep = re.sub(r"//[^\n]*", "", BICEP)
     assert not re.search(r"\bresourceAccessRules\s*:", uncommented_bicep)
-    assert "virtualNetworkRules:" in BICEP
+    virtual_network_rules = re.search(
+        r"virtualNetworkRules:\s*\[(?P<body>.*?)\n\s*\]",
+        uncommented_bicep,
+        re.DOTALL,
+    )
+    assert virtual_network_rules
+    rules_body = virtual_network_rules.group("body")
+    assert rules_body.count("{") == rules_body.count("}") == 2
+    assert re.findall(
+        r"^\s*id:\s*(.+?)\s*$",
+        rules_body,
+        re.MULTILINE,
+    ) == ["acaSubnet.id", "budgetHookSubnet.id"]
     assert "resource acaSubnet 'Microsoft.Network/virtualNetworks/subnets@2023-11-01'" in BICEP
     assert "id: acaSubnet.id" in BICEP
+    assert "id: budgetHookSubnet.id" in BICEP
     assert "infrastructureSubnetId: acaSubnet.id" in BICEP
+    assert "infrastructureSubnetId: budgetHookSubnet.id" not in BICEP
     assert "resourceId('Microsoft.Network/virtualNetworks/subnets', vnetName" not in BICEP
     assert "Microsoft.Network/privateEndpoints" not in BICEP
     assert "Microsoft.Network/privateDnsZones" not in BICEP
