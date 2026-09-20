@@ -172,8 +172,11 @@ before its settings are completed and the hook is published.
    the storage name and Container App endpoint/identity outputs obtained from
    Azure; the current template has no Bicep `output` declarations, so
    portal/`az` queries are required.
-4. Set the Function's application Storage name and budget-hook token, stage
-   and publish it, then verify the Function and execute a non-production drill.
+4. After `az functionapp create` and the main deployment, re-set the
+   Function's application Storage name and budget-hook token, stage and
+   publish the hook. Do not run the drill until both the settings update and
+   the publish have succeeded; then verify the Function and execute a
+   non-production drill.
 
 The bootstrap storage is intentionally separate from the application storage:
 a Flex Function needs host/deployment storage before `main.bicep` can create
@@ -214,12 +217,17 @@ az network vnet create --name "$VNET_NAME" --resource-group "$RESOURCE_GROUP" --
 az network vnet subnet create --name "$FLEX_SUBNET_NAME" --resource-group "$RESOURCE_GROUP" --vnet-name "$VNET_NAME" --address-prefixes 10.42.2.0/27 --delegations Microsoft.App/environments --service-endpoints Microsoft.Storage
 az storage account create --name "$BOOTSTRAP_STORAGE_NAME" --resource-group "$RESOURCE_GROUP" --location "$LOCATION" --sku Standard_LRS
 az functionapp delete --name "$FUNCTION_APP_NAME" --resource-group "$RESOURCE_GROUP" # only when replacing the existing Y1 site
-az functionapp create --name "$FUNCTION_APP_NAME" --resource-group "$RESOURCE_GROUP" --storage-account "$BOOTSTRAP_STORAGE_NAME" --flexconsumption-location "$LOCATION" --runtime python --runtime-version 3.11 --functions-version 4 --vnet "$VNET_ID" --subnet "$FLEX_SUBNET_NAME"
+az functionapp create --name "$FUNCTION_APP_NAME" --resource-group "$RESOURCE_GROUP" --storage-account "$BOOTSTRAP_STORAGE_NAME" --flexconsumption-location "$LOCATION" --runtime python --runtime-version 3.12 --functions-version 4 --vnet "$VNET_ID" --subnet "$FLEX_SUBNET_NAME"
 az functionapp identity assign --name "$FUNCTION_APP_NAME" --resource-group "$RESOURCE_GROUP"
 
 az functionapp show --name "$FUNCTION_APP_NAME" --resource-group "$RESOURCE_GROUP" --query '{name:name,host:defaultHostName,plan:kind,flexSubnet:siteConfig.virtualNetworkSubnetId}' --output json
 az functionapp identity show --name "$FUNCTION_APP_NAME" --resource-group "$RESOURCE_GROUP" --query principalId --output tsv
 ```
+
+A recreated Function App starts empty. After `az functionapp create` and after
+Phase 2 has created the application Storage, run the Phase 3 app-settings
+command again, restage the project, and publish the hook before Phase 4. Do not
+send the new site through the drill with old settings or an empty code package.
 
 Confirm the actual supported Python/runtime flags, Flex plan, instance-memory
 choice, and subnet integration in the first deployment. Put the new
@@ -237,6 +245,11 @@ verified before deployment. Fill `readImage` and `syncImage` with that same
 reference only after the run exists. Keep `staticRepositoryUrl = ''` to disable the
 optional Static Web App, or supply owner-approved repository values and the
 environment-provided deployment token.
+
+If this parameter file was copied from the earlier Y1 deployment, delete the
+entire `budgetHookIpRules` parameter block before running any command below.
+`main.bicep` no longer declares that parameter; leaving it in the parameter
+file causes `BCP259` and the deployment cannot validate or create.
 
 ```sh
 cd infra/azure

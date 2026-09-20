@@ -60,6 +60,27 @@ def test_phase_three_publish_commands_use_the_repo_python_and_stop_on_failure():
     assert all(block.splitlines()[0] == "set -euo pipefail" for block in shell_blocks)
 
 
+def test_flex_migration_runbook_cleans_legacy_params_and_republishes_after_recreate():
+    phase_one = DEPLOY_RUNBOOK.split(
+        "## 1. Bootstrap or recreate the Flex Function App", 1
+    )[1].split("\n## 2.", 1)[0]
+    phase_two = DEPLOY_RUNBOOK.split(
+        "## 2. Complete parameters and deploy the main template", 1
+    )[1].split("\n## 3.", 1)[0]
+
+    assert "--runtime-version 3.12" in phase_one
+    assert "--runtime-version 3.11" not in phase_one
+    assert re.search(
+        r"delete the\s+entire `budgetHookIpRules` parameter block.*?"
+        r"`main\.bicep` no longer declares.*?BCP259",
+        phase_two,
+        re.DOTALL,
+    )
+    assert "A recreated Function App starts empty." in phase_one
+    assert re.search(r"run the Phase 3 app-settings\s+command again", phase_one)
+    assert "before Phase 4" in phase_one
+
+
 def test_public_container_apps_are_tls_terminated_and_authenticate_at_the_app():
     assert "vnetConfiguration:" in BICEP
     assert "internal: false" in BICEP
@@ -85,7 +106,6 @@ def test_storage_uses_service_endpoints_and_a_deny_by_default_firewall():
     assert "budgetHookIpRules" not in BICEP
     assert "ipRules:" not in BICEP
     assert "budgetHookIpRules" not in PARAMS
-    assert "budgetHookIpRules" not in DEPLOY_RUNBOOK
     budget_subnet = BICEP.split(
         "resource budgetHookSubnet 'Microsoft.Network/virtualNetworks/subnets@2023-11-01'",
         1,
