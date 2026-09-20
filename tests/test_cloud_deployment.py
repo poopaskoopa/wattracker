@@ -39,6 +39,27 @@ def test_budget_drill_targets_the_source_kill_switch_row():
     assert '--row-key "$WATTRACKER_KILL_SWITCH_ROW_KEY"' in DEPLOY_RUNBOOK
 
 
+def test_phase_three_publish_commands_use_the_repo_python_and_stop_on_failure():
+    phase_three = DEPLOY_RUNBOOK.split(
+        "## 3. Stage and publish the budget hook", 1
+    )[1].split("\n## 4.", 1)[0]
+    shell_blocks = re.findall(r"```sh\n(.*?)\n```", phase_three, re.DOTALL)
+
+    staging_commands = re.findall(
+        r"(?m)^\.venv/bin/python scripts/package_budget_hook\.py$", phase_three
+    )
+    publish_commands = re.findall(
+        r'(?m)^func azure functionapp publish "\$FUNCTION_APP_NAME" --python$',
+        phase_three,
+    )
+
+    assert len(staging_commands) == 2
+    assert len(publish_commands) == 2
+    assert not re.search(r"(?m)^python scripts/package_budget_hook\.py$", phase_three)
+    assert len(shell_blocks) == 2
+    assert all(block.splitlines()[0] == "set -euo pipefail" for block in shell_blocks)
+
+
 def test_public_container_apps_are_tls_terminated_and_authenticate_at_the_app():
     assert "vnetConfiguration:" in BICEP
     assert "internal: false" in BICEP

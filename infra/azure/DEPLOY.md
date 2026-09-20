@@ -110,6 +110,19 @@ tenant-specific values in source control. Keep secret values in the process
 environment or an approved secret system, not in the parameter file or shell
 history:
 
+Azure Functions Core Tools is not in Homebrew core. The Homebrew route is
+`brew tap azure/functions`, `brew trust azure/functions`, then
+`brew install azure-functions-core-tools@4`; on the owner's machine that
+installation path failed while the installed Command Line Tools were
+outdated. As a prebuilt alternative that worked without that toolchain issue,
+use
+`npm install --global azure-functions-core-tools@4`.
+
+During Function publication, a warning that the local Python version differs
+from the remote app's configured version is expected. For the owner's deployed
+`Python|3.12` app, Oryx performed the remote build with 3.12.14; do not install
+another local Python solely to remove that warning.
+
 ```sh
 export WATTRACKER_CLOUD_SERVER_SECRET="$(openssl rand -base64 32)" # base64 256-bit material
 export WATTRACKER_OPERATOR_TOKEN="$(openssl rand -hex 32)"         # 64 characters; template floor is 32
@@ -232,20 +245,22 @@ intentional restage, remove **only**
 directory. Publish from the staged directory, not `infra/azure/budget-hook`.
 
 ```sh
+set -euo pipefail
 az functionapp config appsettings set --name "$FUNCTION_APP_NAME" --resource-group "$RESOURCE_GROUP" --settings WATTRACKER_STORAGE_ACCOUNT_NAME="$STORAGE_NAME" WATTRACKER_BUDGET_HOOK_TOKEN="$WATTRACKER_BUDGET_HOOK_TOKEN"
-python scripts/package_budget_hook.py
+.venv/bin/python scripts/package_budget_hook.py
 cd build/azure-budget-hook
-func azure functionapp publish "$FUNCTION_APP_NAME"
+func azure functionapp publish "$FUNCTION_APP_NAME" --python
 cd ../..
 ```
 
 For an explicit restage after a prior stage:
 
 ```sh
+set -euo pipefail
 rm -rf -- build/azure-budget-hook
-python scripts/package_budget_hook.py
+.venv/bin/python scripts/package_budget_hook.py
 cd build/azure-budget-hook
-func azure functionapp publish "$FUNCTION_APP_NAME"
+func azure functionapp publish "$FUNCTION_APP_NAME" --python
 ```
 
 Confirm the Function's app settings, enabled system identity, logs, host key,
