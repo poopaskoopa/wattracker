@@ -989,6 +989,36 @@ def create_cloud_app(
                 "expires_at": invitation.expires_at,
             }, headers={"Cache-Control": "no-store"})
 
+        def _operator_handle(target: str) -> str:
+            """Return the canonical opaque handle for an accepted target."""
+
+            backend = getattr(state.credentials, "_backend", None)
+            if backend is None:
+                # The process-local registry has no durable row key, so use
+                # the same opaque digest shape as the durable row address.
+                return hashlib.sha256(target.encode("ascii")).hexdigest()
+            # Durable rows are addressed by the handle itself.  A credential
+            # id instead addresses the row at sha256(credential_id).
+            if backend.read("writer", target) is not None:
+                return target
+            return hashlib.sha256(target.encode("ascii")).hexdigest()
+
+        def _resolve_operator_target(
+            target: str,
+        ) -> tuple[str, Any | None]:
+            """Resolve a real credential id or its operator handle."""
+
+            writer = state.credentials.lookup_writer(target)
+            if writer is not None:
+                return target, writer
+            if getattr(state.credentials, "_backend", None) is None:
+                for candidate in state.credentials.list_writers():
+                    if hmac.compare_digest(
+                        _operator_handle(candidate.credential_id), target
+                    ):
+                        return candidate.credential_id, candidate
+            return target, None
+
         @app.get("/api/v1/admin/installations")
         async def admin_list_installations(request: Request) -> Response:
             """List writer installations without returning credential material."""
@@ -1009,7 +1039,7 @@ def create_cloud_app(
                 return _not_found()
             installations = [
                 {
-                    "installation_id": writer.credential_id,
+                    "operator_handle": _operator_handle(writer.credential_id),
                     "status": "active" if writer.active and not writer.revoked else "revoked",
                     "capabilities": sorted(writer.capabilities),
                     "signature_algorithm": writer.signature_algorithm,
@@ -1022,17 +1052,17 @@ def create_cloud_app(
             )
 
         async def admin_revoke_installation(
-            request: Request, installation_id: str
+            request: Request, operator_handle: str
         ) -> Response:
             """Revoke one writer, with an idempotent response for known rows."""
 
             try:
                 if not _operator_authenticated(state, request):
                     return _not_found()
-                writer = state.credentials.lookup_writer(installation_id)
+                target, writer = _resolve_operator_target(operator_handle)
                 if writer is None:
                     return _not_found()
-                if not state.credentials.revoke_writer_and_devices(installation_id):
+                if not state.credentials.revoke_writer_and_devices(target):
                     return _not_found()
             except (QuotaExceeded, SecurityStateUnavailable):
                 raise
@@ -1041,19 +1071,19 @@ def create_cloud_app(
                 return _not_found()
             return JSONResponse(
                 {
-                    "installation_id": writer.credential_id,
+                    "operator_handle": _operator_handle(target),
                     "status": "revoked",
                 },
                 headers={"Cache-Control": "no-store"},
             )
 
         app.add_api_route(
-            "/api/v1/admin/installations/{installation_id}",
+            "/api/v1/admin/installations/{operator_handle}",
             admin_revoke_installation,
             methods=["DELETE"],
         )
         app.add_api_route(
-            "/api/v1/admin/installations/{installation_id}/revoke",
+            "/api/v1/admin/installations/{operator_handle}/revoke",
             admin_revoke_installation,
             methods=["POST"],
         )

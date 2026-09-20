@@ -23,7 +23,7 @@ _KEYCHAIN_ACCOUNT = "operator-token"
 _MAX_RESPONSE_BYTES = 256 * 1024
 _REQUEST_TIMEOUT_SECONDS = 15.0
 _LOOPBACK_HOSTS = frozenset({"localhost", "127.0.0.1", "::1"})
-_INSTALLATION_ID_RE = re.compile(r"\A[0-9a-f]{64}\Z")
+_HEX_ID_RE = re.compile(r"\A[0-9a-f]{64}\Z")
 
 
 class AdminError(RuntimeError):
@@ -175,12 +175,12 @@ def _list_installations(endpoint: str, token: str) -> dict[str, Any]:
     for row in rows:
         if not isinstance(row, Mapping):
             raise AdminError("cloud admin response was invalid")
-        installation_id = row.get("installation_id")
+        operator_handle = row.get("operator_handle")
         status = row.get("status")
         capabilities = row.get("capabilities")
         algorithm = row.get("signature_algorithm")
         if (
-            not isinstance(installation_id, str)
+            not isinstance(operator_handle, str)
             or status not in {"active", "revoked"}
             or not isinstance(capabilities, list)
             or not all(isinstance(item, str) for item in capabilities)
@@ -188,7 +188,7 @@ def _list_installations(endpoint: str, token: str) -> dict[str, Any]:
         ):
             raise AdminError("cloud admin response was invalid")
         result_rows.append({
-            "installation_id": installation_id,
+            "operator_handle": operator_handle,
             "status": status,
             "capabilities": capabilities,
             "signature_algorithm": algorithm,
@@ -199,23 +199,27 @@ def _list_installations(endpoint: str, token: str) -> dict[str, Any]:
     return result
 
 
-def _revoke_installation(endpoint: str, token: str, installation_id: str) -> dict[str, Any]:
-    if not isinstance(installation_id, str) or _INSTALLATION_ID_RE.fullmatch(installation_id) is None:
-        raise AdminError("invalid installation id")
+def _revoke_installation(endpoint: str, token: str, operator_handle: str) -> dict[str, Any]:
+    if not isinstance(operator_handle, str) or _HEX_ID_RE.fullmatch(operator_handle) is None:
+        raise AdminError("invalid operator handle or credential id")
     payload = _request_json(
         endpoint,
         "/api/v1/admin/installations/"
-        + urllib.parse.quote(installation_id, safe="")
+        + urllib.parse.quote(operator_handle, safe="")
         + "/revoke",
         token,
         method="POST",
         preserve_revoke_status=True,
     )
     result = {
-        "installation_id": payload.get("installation_id"),
+        "operator_handle": payload.get("operator_handle"),
         "status": payload.get("status"),
     }
-    if result["installation_id"] != installation_id or result["status"] != "revoked":
+    if (
+        not isinstance(result["operator_handle"], str)
+        or _HEX_ID_RE.fullmatch(result["operator_handle"]) is None
+        or result["status"] != "revoked"
+    ):
         raise AdminError("cloud admin response was invalid")
     if _contains_token(result, token):
         raise AdminError("cloud admin response was invalid")
@@ -229,10 +233,22 @@ def _parser() -> argparse.ArgumentParser:
         dest="command", required=True, parser_class=_ArgumentParser
     )
     for name in ("invite", "list-installations"):
-        command = commands.add_parser(name)
+        help_text = (
+            "list writer installations; output contains opaque operator handles"
+            if name == "list-installations"
+            else None
+        )
+        command = commands.add_parser(name, help=help_text, description=help_text)
         command.add_argument("--endpoint", default=argparse.SUPPRESS)
-    revoke = commands.add_parser("revoke-installation")
-    revoke.add_argument("installation_id")
+    revoke = commands.add_parser(
+        "revoke-installation",
+        help="revoke by opaque operator handle or writer credential id",
+        description="Revoke by opaque operator handle or writer credential id.",
+    )
+    revoke.add_argument(
+        "operator_handle",
+        help="opaque operator handle or real writer credential id",
+    )
     revoke.add_argument("--endpoint", default=argparse.SUPPRESS)
     return parser
 
@@ -248,7 +264,7 @@ def main(argv: list[str] | None = None) -> int:
         elif args.command == "list-installations":
             result = _list_installations(endpoint, token)
         else:
-            result = _revoke_installation(endpoint, token, args.installation_id)
+            result = _revoke_installation(endpoint, token, args.operator_handle)
         json.dump(result, sys.stdout, sort_keys=True)
         sys.stdout.write("\n")
         return 0

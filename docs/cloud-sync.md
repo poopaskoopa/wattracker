@@ -48,7 +48,7 @@ contract is:
 | `GET /api/v1/context/volume` | read | reader context | — |
 | `GET /api/v1/context/curve` | read | reader context | — |
 | `GET /api/v1/admin/installations` | read | operator token | list writer installations |
-| `POST /api/v1/admin/installations/{installation_id}/revoke` | read | operator token | revoke a writer installation |
+| `POST /api/v1/admin/installations/{operator_handle}/revoke` | read | operator token | revoke a writer installation by opaque handle or writer credential id |
 | `POST /api/v1/sync/batches` | sync | server-issued writer credential + signed request | `write` |
 | `GET /api/v1/sync/status` | sync | server-issued writer credential + signed request | `write` |
 
@@ -66,7 +66,11 @@ pastes it into the desktop cloud settings; the desktop enrolls once and gets
 its writer credential and namespace. From there, phones are paired by the
 desktop with the normal pairing flow. Operators can audit the enrolled writer
 installations with `list-installations` and revoke one with
-`revoke-installation <installation_id>`. Revoking an installation also revokes
+`revoke-installation <operator_handle-or-credential-id>`. The list's
+`operator_handle` is an opaque durable row-key handle, not the writer
+credential id shown by the rider's desktop. Revoke accepts either that handle
+or the real writer credential id, and its response always returns the canonical
+`operator_handle`. Revoking an installation also revokes
 every paired device and outstanding pairing code in that writer's
 `(namespace, local_user_scope)`.
 

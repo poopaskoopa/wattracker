@@ -135,7 +135,7 @@ def test_admin_routes_list_and_revoke_durable_writer_installation():
         assert listed.status_code == 200
         assert listed.json() == {
             "installations": [{
-                "installation_id": row_key,
+                "operator_handle": row_key,
                 "status": "active",
                 "capabilities": ["read", "write"],
                 "signature_algorithm": "hmac-sha256",
@@ -153,7 +153,7 @@ def test_admin_routes_list_and_revoke_durable_writer_installation():
         )
         assert revoked.status_code == 200
         assert revoked.json() == {
-            "installation_id": row_key,
+            "operator_handle": row_key,
             "status": "revoked",
         }
 
@@ -199,7 +199,7 @@ def test_admin_routes_list_and_revoke_legacy_durable_writer_row_in_place():
         assert listed.status_code == 200
         assert listed.json() == {
             "installations": [{
-                "installation_id": row_key,
+                "operator_handle": row_key,
                 "status": "active",
                 "capabilities": ["read", "write"],
                 "signature_algorithm": "hmac-sha256",
@@ -219,7 +219,7 @@ def test_admin_routes_list_and_revoke_legacy_durable_writer_row_in_place():
         )
         assert revoked.status_code == 200
         assert revoked.json() == {
-            "installation_id": row_key,
+            "operator_handle": row_key,
             "status": "revoked",
         }
 
@@ -301,6 +301,39 @@ def test_admin_requires_gateway_proof_in_addition_to_operator_token():
     assert correct.status_code == 200
     assert missing_revoke.status_code == 404
     assert correct_revoke.status_code == 200
+    assert correct_revoke.json() == {
+        "operator_handle": hashlib.sha256(writer.credential_id.encode("ascii")).hexdigest(),
+        "status": "revoked",
+    }
+
+
+def test_admin_operator_handle_round_trips_without_durable_backend():
+    config = CloudConfig(
+        server_secret=SECRET,
+        operator_token=TOKEN,
+        gateway_proof_value=GATEWAY_PROOF,
+    )
+    state = CloudState.create(config)
+    writer = state.credentials.register_writer(
+        new_installation_id(), "rider-scope", b"w" * 32, b"s" * 32
+    )
+    headers = {
+        "X-Operator-Token": TOKEN,
+        "X-Gateway-Request-Proof": GATEWAY_PROOF,
+    }
+    with TestClient(create_cloud_app(config, state=state)) as client:
+        listed = client.get("/api/v1/admin/installations", headers=headers)
+        handle = listed.json()["installations"][0]["operator_handle"]
+        revoked = client.post(
+            f"/api/v1/admin/installations/{handle}/revoke", headers=headers
+        )
+
+    assert handle == hashlib.sha256(writer.credential_id.encode("ascii")).hexdigest()
+    assert revoked.status_code == 200
+    assert revoked.json() == {
+        "operator_handle": handle,
+        "status": "revoked",
+    }
 
 
 def test_admin_list_preserves_kill_switch_503_for_any_operator_token(monkeypatch):
@@ -511,7 +544,7 @@ def test_admin_revoke_cascades_to_same_scope_device_and_is_idempotent():
     assert first.status_code == 200
     assert retry.status_code == 200
     assert first.json() == retry.json() == {
-        "installation_id": row_key,
+        "operator_handle": row_key,
         "status": "revoked",
     }
     assert state.credentials.authenticate_writer(
@@ -627,7 +660,7 @@ def test_revoke_installation_rejects_non_hex_handle_before_transport(
         raise AssertionError("transport must not be called")
 
     monkeypatch.setattr(admin, "_request_json", unexpected_transport)
-    with pytest.raises(admin.AdminError, match="invalid installation id"):
+    with pytest.raises(admin.AdminError, match="invalid operator handle or credential id"):
         admin._revoke_installation(
             "https://cloud.example", TOKEN, installation_id
         )
@@ -646,14 +679,14 @@ def test_three_commands_dispatch_and_print_json(monkeypatch, capsys):
         if path == "/api/v1/admin/installations":
             return {
                 "installations": [{
-                    "installation_id": installation_id,
+                    "operator_handle": installation_id,
                     "status": "active",
                     "capabilities": ["read", "write"],
                     "signature_algorithm": "hmac-sha256",
                 }]
             }
         assert path == f"/api/v1/admin/installations/{installation_id}/revoke"
-        return {"installation_id": installation_id, "status": "revoked"}
+        return {"operator_handle": installation_id, "status": "revoked"}
 
     monkeypatch.setattr(admin, "_request_json", fake_request)
     monkeypatch.setenv("WATTRACKER_CLOUD_ENDPOINT", "http://127.0.0.1:8765")
@@ -667,12 +700,12 @@ def test_three_commands_dispatch_and_print_json(monkeypatch, capsys):
 
     assert admin.main(["list-installations"]) == 0
     assert json.loads(capsys.readouterr().out)["installations"][0][
-        "installation_id"
+        "operator_handle"
     ] == installation_id
 
     assert admin.main(["revoke-installation", installation_id]) == 0
     assert json.loads(capsys.readouterr().out) == {
-        "installation_id": installation_id,
+        "operator_handle": installation_id,
         "status": "revoked",
     }
     assert [(path, method) for _, path, _, method in calls] == [
@@ -680,6 +713,19 @@ def test_three_commands_dispatch_and_print_json(monkeypatch, capsys):
         ("/api/v1/admin/installations", "GET"),
         (f"/api/v1/admin/installations/{installation_id}/revoke", "POST"),
     ]
+
+
+def test_cli_help_explains_opaque_handles_and_credential_id_revoke():
+    parser = admin._parser()
+    subparsers = next(
+        action for action in parser._actions if getattr(action, "choices", None)
+    )
+    help_text = "\n".join(
+        subparsers.choices[name].format_help()
+        for name in ("list-installations", "revoke-installation")
+    )
+    assert "opaque operator handles" in help_text
+    assert "opaque operator handle or writer credential id" in help_text
 
 
 @pytest.mark.parametrize("status, expected", [(404, "no such installation"), (503, "retry in 37 seconds")])
