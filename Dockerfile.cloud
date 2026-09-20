@@ -13,7 +13,15 @@ COPY pyproject.toml README.md ./
 COPY wattracker ./wattracker
 COPY wattracker_connector ./wattracker_connector
 
-RUN python -m venv /opt/venv \
+ARG WATTRACKER_CLOUD_COMMIT
+
+RUN test "${#WATTRACKER_CLOUD_COMMIT}" -eq 40 \
+    && printf '%s\n' "$WATTRACKER_CLOUD_COMMIT" | grep -Eq '^[0-9a-f]{40}$' \
+    && printf '%s\n' \
+        '"""Build identity baked into the cloud image."""' \
+        "COMMIT = \"$WATTRACKER_CLOUD_COMMIT\"" \
+        > wattracker/cloud/build_info.py \
+    && python -m venv /opt/venv \
     && /opt/venv/bin/pip install --upgrade pip \
     && /opt/venv/bin/pip install ".[cloud]"
 

@@ -725,6 +725,8 @@ def test_three_commands_dispatch_and_print_json(monkeypatch, capsys):
                     "signature_algorithm": "hmac-sha256",
                 }]
             }
+        if path == "/api/v1/admin/version":
+            return {"commit": "a" * 40}
         assert path == f"/api/v1/admin/installations/{installation_id}/revoke"
         return {"operator_handle": installation_id, "status": "revoked"}
 
@@ -738,6 +740,9 @@ def test_three_commands_dispatch_and_print_json(monkeypatch, capsys):
         "expires_at": 1900,
     }
 
+    assert admin.main(["version"]) == 0
+    assert json.loads(capsys.readouterr().out) == {"commit": "a" * 40}
+
     assert admin.main(["list-installations"]) == 0
     assert json.loads(capsys.readouterr().out)["installations"][0][
         "operator_handle"
@@ -750,9 +755,54 @@ def test_three_commands_dispatch_and_print_json(monkeypatch, capsys):
     }
     assert [(path, method) for _, path, _, method in calls] == [
         ("/api/v1/enrollment/start", "POST"),
+        ("/api/v1/admin/version", "GET"),
         ("/api/v1/admin/installations", "GET"),
         (f"/api/v1/admin/installations/{installation_id}/revoke", "POST"),
     ]
+
+
+@pytest.mark.parametrize(
+    "argv",
+    [
+        ["invite"],
+        ["version"],
+        ["list-installations"],
+        ["revoke-installation", "a" * 64],
+    ],
+)
+def test_cli_timeout_is_actionable_and_token_safe(monkeypatch, capsys, argv):
+    class FakeOpener:
+        def open(self, request, timeout):
+            raise urllib.error.URLError(TimeoutError(TOKEN))
+
+    monkeypatch.setattr(urllib.request, "build_opener", lambda *args: FakeOpener())
+    monkeypatch.setenv("WATTRACKER_CLOUD_ENDPOINT", "https://cloud.example")
+    monkeypatch.setenv("WATTRACKER_CLOUD_OPERATOR_TOKEN", TOKEN)
+
+    assert admin.main(argv) == 2
+    captured = capsys.readouterr()
+    assert captured.err == (
+        "cloud admin request timed out: service did not respond within 30 seconds, "
+        "may be scaling up from zero; it should be retried\n"
+    )
+    assert TOKEN not in captured.err
+    assert TOKEN not in captured.out
+
+
+def test_cli_transport_failure_stays_generic_and_token_safe(monkeypatch, capsys):
+    class FakeOpener:
+        def open(self, request, timeout):
+            raise urllib.error.URLError(TOKEN)
+
+    monkeypatch.setattr(urllib.request, "build_opener", lambda *args: FakeOpener())
+    monkeypatch.setenv("WATTRACKER_CLOUD_ENDPOINT", "https://cloud.example")
+    monkeypatch.setenv("WATTRACKER_CLOUD_OPERATOR_TOKEN", TOKEN)
+
+    assert admin.main(["version"]) == 2
+    captured = capsys.readouterr()
+    assert captured.err.strip() == "cloud admin request failed"
+    assert TOKEN not in captured.err
+    assert TOKEN not in captured.out
 
 
 def test_cli_help_explains_opaque_handles_and_credential_id_revoke():

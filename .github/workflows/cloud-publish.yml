@@ -53,6 +53,8 @@ jobs:
           platforms: linux/amd64
           push: true
           tags: ghcr.io/poopaskoopa/wattracker-cloud:${{ steps.image.outputs.tag }}
+          build-args: |
+            WATTRACKER_CLOUD_COMMIT=${{ github.sha }}
 
       - name: Install cosign
         uses: sigstore/cosign-installer@v3.8.1

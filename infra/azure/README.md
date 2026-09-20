@@ -7,7 +7,9 @@ From the repository root, build the cloud runtime image with the cloud
 dependency extra enabled:
 
 ```sh
-docker buildx build --platform linux/amd64 --load -f Dockerfile.cloud -t wattracker-cloud .
+docker buildx build --platform linux/amd64 --load \
+  --build-arg WATTRACKER_CLOUD_COMMIT="$(git rev-parse HEAD)" \
+  -f Dockerfile.cloud -t wattracker-cloud .
 ```
 
 This Bicep is a review skeleton, not a zero-cost guarantee. Azure billing can

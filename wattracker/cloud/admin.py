@@ -21,13 +21,24 @@ _ENDPOINT_ENV = "WATTRACKER_CLOUD_ENDPOINT"
 _TOKEN_ENV = "WATTRACKER_CLOUD_OPERATOR_TOKEN"
 _KEYCHAIN_ACCOUNT = "operator-token"
 _MAX_RESPONSE_BYTES = 256 * 1024
-_REQUEST_TIMEOUT_SECONDS = 15.0
+# Container Apps scale to zero and measured cold starts are about 20 seconds.
+_REQUEST_TIMEOUT_SECONDS = 30.0
+_REQUEST_TIMEOUT_MESSAGE = (
+    "cloud admin request timed out: service did not respond within 30 seconds, "
+    "may be scaling up from zero; it should be retried"
+)
 _LOOPBACK_HOSTS = frozenset({"localhost", "127.0.0.1", "::1"})
 _HEX_ID_RE = re.compile(r"\A[0-9a-f]{64}\Z")
+_COMMIT_RE = re.compile(r"\A[0-9a-f]{40}\Z")
 
 
 class AdminError(RuntimeError):
     """A safe, user-facing failure that contains no secret material."""
+
+
+class _RequestTimeout(AdminError):
+    def __init__(self) -> None:
+        super().__init__(_REQUEST_TIMEOUT_MESSAGE)
 
 
 class _RevokeHTTPError(AdminError):
@@ -132,7 +143,13 @@ def _request_json(
             retry_after = exc.headers.get("Retry-After") if exc.headers else None
             raise _RevokeHTTPError(exc.code, retry_after) from exc
         raise AdminError("cloud admin request failed") from exc
-    except (urllib.error.URLError, OSError, ValueError) as exc:
+    except urllib.error.URLError as exc:
+        if isinstance(exc.reason, TimeoutError):
+            raise _RequestTimeout() from exc
+        raise AdminError("cloud admin request failed") from exc
+    except TimeoutError as exc:
+        raise _RequestTimeout() from exc
+    except (OSError, ValueError) as exc:
         raise AdminError("cloud admin request failed") from exc
     if len(raw) > _MAX_RESPONSE_BYTES:
         raise AdminError("cloud admin response is too large")
@@ -161,6 +178,17 @@ def _invite(endpoint: str, token: str) -> dict[str, Any]:
     result = {"invitation": payload.get("invitation"), "expires_at": payload.get("expires_at")}
     if not isinstance(result["invitation"], str) or result["expires_at"] is None:
         raise AdminError("cloud admin response was invalid")
+    if _contains_token(result, token):
+        raise AdminError("cloud admin response was invalid")
+    return result
+
+
+def _version(endpoint: str, token: str) -> dict[str, Any]:
+    payload = _request_json(endpoint, "/api/v1/admin/version", token, method="GET")
+    commit = payload.get("commit")
+    if not isinstance(commit, str) or (commit != "source" and _COMMIT_RE.fullmatch(commit) is None):
+        raise AdminError("cloud admin response was invalid")
+    result = {"commit": commit}
     if _contains_token(result, token):
         raise AdminError("cloud admin response was invalid")
     return result
@@ -238,10 +266,12 @@ def _parser() -> argparse.ArgumentParser:
     commands = parser.add_subparsers(
         dest="command", required=True, parser_class=_ArgumentParser
     )
-    for name in ("invite", "list-installations"):
+    for name in ("invite", "version", "list-installations"):
         help_text = (
             "list writer installations; output contains opaque operator handles"
             if name == "list-installations"
+            else "report the running cloud image commit"
+            if name == "version"
             else None
         )
         command = commands.add_parser(name, help=help_text, description=help_text)
@@ -267,6 +297,8 @@ def main(argv: list[str] | None = None) -> int:
         token = _load_operator_token()
         if args.command == "invite":
             result = _invite(endpoint, token)
+        elif args.command == "version":
+            result = _version(endpoint, token)
         elif args.command == "list-installations":
             result = _list_installations(endpoint, token)
         else:

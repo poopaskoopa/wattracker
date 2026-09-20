@@ -30,6 +30,7 @@ contract is:
 
 | Route | Plane | Authentication | Capability |
 |---|---|---|---|
+| `GET /api/v1/admin/version` | read and sync | operator token + configured gateway proof | report baked-in image commit |
 | `POST /api/v1/enrollment/start` | read | operator token + conditional attested subject | — |
 | `POST /api/v1/enrollment/complete` | read | one-time invitation + writer public key + conditional attested subject | — |
 | `POST /api/v1/context/refresh` | read | signed device credential + conditional attested subject | `read` |
@@ -58,6 +59,21 @@ The operator runs `python -m wattracker.cloud.admin invite`. The tool reads
 with `--endpoint` or `WATTRACKER_CLOUD_ENDPOINT`. HTTPS is required, with HTTP
 allowed only for `localhost`, `127.0.0.1`, and `::1` when testing against the
 walking-skeleton server.
+
+`python -m wattracker.cloud.admin version` calls the same operator-authenticated
+version route on either plane and prints the running image's full git commit
+SHA. The route returns the same neutral `404 {"detail":"not found"}` for a
+missing or incorrect operator token, and also requires the configured gateway
+proof when one is enabled. A valid request does not read the kill switch,
+Azure storage, credentials, or any other backend, so it remains usable while
+those dependencies are unavailable. Published images bake the full SHA into
+the image at build time; it is not taken from a runtime environment variable.
+
+The admin CLI waits 30 seconds because the Container Apps scale to zero and a
+cold start takes about 20 seconds. If the service does not respond within 30
+seconds, it reports that it may be scaling up from zero and should be retried;
+it does not retry automatically. Other transport failures remain the generic
+`cloud admin request failed` message.
 
 The operator gives the printed, one-time invitation to the rider. The rider
 pastes it into the desktop cloud settings; the desktop enrolls once and gets
@@ -839,7 +855,9 @@ than inferring its result.
 
 ```sh
 WATTRACKER_CLOUD_IMAGE=wattracker-cloud-verify:local
-docker buildx build --platform linux/amd64 --load --tag "$WATTRACKER_CLOUD_IMAGE" -f Dockerfile.cloud .
+docker buildx build --platform linux/amd64 --load \
+  --build-arg WATTRACKER_CLOUD_COMMIT="$(git rev-parse HEAD)" \
+  --tag "$WATTRACKER_CLOUD_IMAGE" -f Dockerfile.cloud .
 docker run --rm --platform linux/amd64 --entrypoint python "$WATTRACKER_CLOUD_IMAGE" -c \
   'import cryptography, azure.identity, azure.storage.blob, azure.data.tables; import wattracker.cloud.api, wattracker.cloud.runtime'
 docker image inspect "$WATTRACKER_CLOUD_IMAGE" --format 'image={{.Id}} size_bytes={{.Size}}'
