@@ -707,7 +707,7 @@ def test_revoke_installation_rejects_non_hex_handle_before_transport(
     assert calls == []
 
 
-def test_three_commands_dispatch_and_print_json(monkeypatch, capsys):
+def test_commands_dispatch_and_print_json(monkeypatch, capsys):
     installation_id = "a" * 64
     calls = []
 
@@ -773,6 +773,7 @@ def test_three_commands_dispatch_and_print_json(monkeypatch, capsys):
 def test_cli_timeout_is_actionable_and_token_safe(monkeypatch, capsys, argv):
     class FakeOpener:
         def open(self, request, timeout):
+            assert timeout == 30.0
             raise urllib.error.URLError(TimeoutError(TOKEN))
 
     monkeypatch.setattr(urllib.request, "build_opener", lambda *args: FakeOpener())
