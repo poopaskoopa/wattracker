@@ -73,6 +73,8 @@ or the real writer credential id, and its response always returns the canonical
 `operator_handle`. Revoking an installation also revokes
 every paired device and outstanding pairing code in that writer's
 `(namespace, local_user_scope)`.
+If the response uses `installation_id` instead, the deployed image is older;
+`readImage`/`syncImage` must be re-pinned to the current digest and redeployed.
 
 A revoke `404` is deliberately opaque and fail-closed: the CLI reports no such
 installation without exposing whether the installation, gateway proof, or

@@ -175,6 +175,12 @@ def _list_installations(endpoint: str, token: str) -> dict[str, Any]:
     for row in rows:
         if not isinstance(row, Mapping):
             raise AdminError("cloud admin response was invalid")
+        if "operator_handle" not in row and "installation_id" in row:
+            raise AdminError(
+                "cloud admin response uses the old installation_id field; "
+                "the deployed image predates this CLI; readImage/syncImage must be "
+                "re-pinned to the current digest and redeployed"
+            )
         operator_handle = row.get("operator_handle")
         status = row.get("status")
         capabilities = row.get("capabilities")

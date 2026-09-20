@@ -253,6 +253,46 @@ def test_admin_revoke_rejects_unknown_and_malformed_handles():
             assert response.status_code == 404
 
 
+def test_list_installations_rejects_old_shape_without_echoing_response_or_token(monkeypatch):
+    old_installation_id = "legacy-installation-value-that-must-not-appear"
+    payload = {
+        "installations": [{
+            "installation_id": old_installation_id,
+            "status": "active",
+            "capabilities": [TOKEN],
+            "signature_algorithm": "hmac-sha256",
+        }]
+    }
+    monkeypatch.setattr(admin, "_request_json", lambda *args, **kwargs: payload)
+
+    with pytest.raises(admin.AdminError) as raised:
+        admin._list_installations("https://cloud.example", TOKEN)
+
+    message = str(raised.value)
+    assert message == (
+        "cloud admin response uses the old installation_id field; "
+        "the deployed image predates this CLI; readImage/syncImage must be "
+        "re-pinned to the current digest and redeployed"
+    )
+    assert old_installation_id not in message
+    assert TOKEN not in message
+
+
+def test_list_installations_preserves_generic_error_for_other_malformed_payload(monkeypatch):
+    payload = {
+        "installations": [{
+            "operator_handle": None,
+            "status": "active",
+            "capabilities": [],
+            "signature_algorithm": "hmac-sha256",
+        }]
+    }
+    monkeypatch.setattr(admin, "_request_json", lambda *args, **kwargs: payload)
+
+    with pytest.raises(admin.AdminError, match="^cloud admin response was invalid$"):
+        admin._list_installations("https://cloud.example", TOKEN)
+
+
 def test_admin_requires_gateway_proof_in_addition_to_operator_token():
     # Gateway-proof-first is a deliberate security exception to #320 criterion
     # 2: reordering would expose outage state to unauthenticated callers, so
