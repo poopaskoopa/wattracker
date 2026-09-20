@@ -172,8 +172,16 @@ The list gives the **order**. GitHub gives the **state** — always
 (#234's scope grew a whole section after it was filed) and its labels move.
 If the two disagree, GitHub wins and the queue is stale; say so.
 
+**Three PRs are open at once and two of them collide.** #342 (#339, Flex
+networking) and #343 (#337, the publish commands) both edit
+`infra/azure/DEPLOY.md` **and** `tests/test_cloud_deployment.py` in overlapping
+regions. **Land #343 first**, then rebase #342 onto it — #343 is two files and
+corrects commands that are wrong today, while #342 is nine files and needs
+another review round anyway, so it is the one that should absorb the conflict.
+Do not merge #342 first and then try to rebase #343 into it.
+
 1. **#339 — the budget hook cannot reach storage, so the kill switch cannot
-   fire.** The decision is made: **move the Function to Flex Consumption with
+   fire.** **PR #342 is open with review changes requested.** The decision is made: **move the Function to Flex Consumption with
    VNet integration**; read the issue comment for the full brief before starting.
    Evidence from the owner's subscription: with storage `defaultAction: Deny` the
    drill returns `503 budget hook unavailable`; with `Allow` it returns
@@ -192,27 +200,40 @@ If the two disagree, GitHub wins and the queue is stale; say so.
    is the largest infra change yet and none of it can be self-verified — budget
    for several rounds.
 
-2. **#337 — phase 3 of DEPLOY.md does not work as written.** `python` must be
+2. **#337 — phase 3 of DEPLOY.md does not work as written.** **PR #343 is open.** `python` must be
    `.venv/bin/python`, and the publish needs `--python` because the staged
    directory has no `local.settings.json`. Both were hit for real on
    2026-09-19. Small, and it stops the next person losing twenty minutes.
 
-3. **#335 — a racing admin revoke returns 404 for a revoke that succeeded.**
+3. **#336 — `list-installations` shows an opaque handle the docs call an
+   `installation_id`.** **PR #340 is open and awaiting a change**: it renames the
+   JSON field to `operator_handle`, which is a breaking wire-format change
+   against the live deployment, and the new CLI parses strictly. The decision
+   recorded on that PR is to detect the skew and say so — when a row carries
+   `installation_id` instead, fail with a message naming the cause and the fix,
+   rather than tolerating both names silently or relying on the operator
+   remembering a four-step redeploy order.
+
+4. **#335 — a racing admin revoke returns 404 for a revoke that succeeded.**
    Fail-closed and idempotent, so this is an operator-honesty defect rather than
    a security one — the same class #320 was filed to remove.
 
-4. **#334 — the cloud app cannot say what version it is.** Diagnosing the stale
+5. **#334 — the cloud app cannot say what version it is.** Diagnosing the stale
    image took four indirect probes and ultimately hinged on the capitalisation
    of a 404 body. Includes the CLI's 15-second timeout being shorter than the
    apps' ~20-second cold start, so the operator's first command after any idle
    period fails opaquely.
 
-5. **#249 — rotating full-suite test flakes. Still not a local-runs job.**
+6. **#249 — rotating full-suite test flakes. Still not a local-runs job.**
    Nothing has changed since the re-scope. 21 consecutive clean local full
    suites stand against zero reproductions. Both known instances came from
    **taksmon's machine**. **The next step is taksmon's log and his exact
    invocation.** Until he provides them, skip this item rather than spending
    runs on it.
+
+**An item with an open PR stays on this list until the PR merges**, marked with
+its PR number. Dropping it while it is in flight makes it invisible if the PR is
+closed or abandoned.
 
 **When the list runs out, stop and say so.** Do not pick up unlabelled issues
 or anything below on your own.
