@@ -28,6 +28,7 @@ from .limits import (
     QuotaManager,
     QuotaPolicy,
 )
+from .build_info import COMMIT as BUILD_COMMIT
 from .models import ModelError, SyncBatch
 from .security import (
     CredentialRegistry,
@@ -451,6 +452,15 @@ def _operator_authenticated(state: CloudState, request: Request) -> bool:
     if not state.quotas.kill_state().public_enabled:
         return False
     return _safe_compare_text(
+        request.headers.get("x-operator-token", ""),
+        state.config.operator_token,
+    )
+
+
+def _version_operator_authenticated(state: CloudState, request: Request) -> bool:
+    """Authenticate the version probe without consulting any backend state."""
+
+    return _gateway_proof_valid(state, request) and _safe_compare_text(
         request.headers.get("x-operator-token", ""),
         state.config.operator_token,
     )
@@ -958,6 +968,17 @@ def create_cloud_app(
 
     def sync_enabled() -> bool:
         return config.plane in {"all", "sync"}
+
+    @app.get("/api/v1/admin/version")
+    async def admin_version(request: Request) -> Response:
+        """Return the image build identity without reading cloud state."""
+
+        if not _version_operator_authenticated(state, request):
+            return _not_found()
+        return JSONResponse(
+            {"commit": BUILD_COMMIT},
+            headers={"Cache-Control": "no-store"},
+        )
 
     if read_enabled():
         @app.post("/api/v1/enrollment/start")

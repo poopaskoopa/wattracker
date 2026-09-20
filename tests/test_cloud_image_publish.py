@@ -4,6 +4,8 @@ import re
 
 ROOT = Path(__file__).parents[1]
 WORKFLOW = (ROOT / ".github" / "workflows" / "cloud-publish.yml").read_text()
+CI_WORKFLOW = (ROOT / ".github" / "workflows" / "cloud.yml").read_text()
+DOCKERFILE = (ROOT / "Dockerfile.cloud").read_text()
 PARAMS = (ROOT / "infra" / "azure" / "main.bicepparam").read_text()
 DEPLOY = (ROOT / "infra" / "azure" / "DEPLOY.md").read_text()
 
@@ -38,6 +40,16 @@ def test_publish_workflow_builds_one_amd64_image_and_verifies_its_signature():
     assert 'image_ref="${IMAGE}@${DIGEST}"' in WORKFLOW
     assert "${{ steps.build.outputs.digest }}" in WORKFLOW
     assert 'Published commit: ${GITHUB_SHA}' in WORKFLOW
+
+
+def test_cloud_builds_bake_and_validate_a_full_commit_sha():
+    assert "ARG WATTRACKER_CLOUD_COMMIT" in DOCKERFILE
+    assert 'test "${#WATTRACKER_CLOUD_COMMIT}" -eq 40' in DOCKERFILE
+    assert "grep -Eq '^[0-9a-f]{40}$'" in DOCKERFILE
+    assert 'COMMIT = \\"$WATTRACKER_CLOUD_COMMIT\\"' in DOCKERFILE
+    assert "WATTRACKER_CLOUD_COMMIT=${{ github.sha }}" in WORKFLOW
+    assert 'WATTRACKER_CLOUD_COMMIT=${GITHUB_SHA}' in CI_WORKFLOW
+    assert "--platform linux/amd64" in CI_WORKFLOW
 
 
 def test_deployment_skeleton_and_runbook_use_one_signed_digest_for_both_planes():

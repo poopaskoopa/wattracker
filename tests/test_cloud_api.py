@@ -2430,6 +2430,51 @@ def test_enrollment_start_does_not_reveal_public_kill_state(cloud):
     assert dict(disabled.headers) == dict(invalid_token.headers)
 
 
+@pytest.mark.parametrize("plane", ["read", "sync"])
+def test_version_endpoint_requires_operator_auth_and_skips_kill_state(plane, monkeypatch):
+    config = CloudConfig(
+        server_secret=SECRET,
+        operator_token="operator-token",
+        plane=plane,
+        gateway_proof_value="proof-value",
+    )
+    state = CloudState.create(config)
+
+    def kill_state_must_not_run():
+        raise AssertionError("version must not read kill state")
+
+    monkeypatch.setattr(state.quotas, "kill_state", kill_state_must_not_run)
+    with TestClient(create_cloud_app(config, state=state)) as client:
+        valid = client.get(
+            "/api/v1/admin/version",
+            headers={
+                "X-Operator-Token": "operator-token",
+                "X-Gateway-Request-Proof": "proof-value",
+            },
+        )
+        missing = client.get(
+            "/api/v1/admin/version",
+            headers={"X-Gateway-Request-Proof": "proof-value"},
+        )
+        wrong = client.get(
+            "/api/v1/admin/version",
+            headers={
+                "X-Operator-Token": "wrong-token",
+                "X-Gateway-Request-Proof": "proof-value",
+            },
+        )
+        no_proof = client.get(
+            "/api/v1/admin/version",
+            headers={"X-Operator-Token": "operator-token"},
+        )
+
+    assert valid.status_code == 200
+    assert valid.json() == {"commit": "source"}
+    for response in (missing, wrong, no_proof):
+        assert response.status_code == 404
+        assert response.json() == {"detail": "not found"}
+
+
 @pytest.mark.parametrize("public_enabled", [True, False])
 def test_enrollment_complete_invalid_gateway_proof_matches_start(public_enabled):
     config = CloudConfig(
