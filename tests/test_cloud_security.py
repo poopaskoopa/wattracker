@@ -340,6 +340,50 @@ def test_writer_rows_with_mismatched_legacy_credential_id_fail_closed():
     assert not restarted.revoke_writer_and_devices(row_key)
 
 
+def test_legacy_revoke_is_idempotent_when_row_is_revoked_during_update():
+    backend = MemorySecurityStateBackend()
+    first = CredentialRegistry(b"server secret", backend=backend)
+    writer = first.register_writer(
+        _installation(), "scope", b"signing", b"subscription"
+    )
+    row_key = first._credential_digest(writer.credential_id).hex()
+    persisted = backend.read("writer", row_key)
+    assert persisted is not None
+    persisted["credential_id"] = writer.credential_id
+    backend.write("writer", row_key, persisted)
+
+    restarted = CredentialRegistry(b"server secret", backend=backend)
+    update = backend.update
+    raced = False
+
+    def revoke_before_transform(kind, key, transform):
+        nonlocal raced
+        if kind == "writer" and not raced:
+            raced = True
+            update(
+                kind,
+                key,
+                lambda value: {
+                    **{
+                        field: item
+                        for field, item in value.items()
+                        if field != "credential_id"
+                    },
+                    "active": False,
+                    "revoked": True,
+                },
+            )
+        return update(kind, key, transform)
+
+    restarted._backend.update = revoke_before_transform
+    assert restarted.revoke_writer_and_devices(row_key)
+    assert raced
+    revoked = backend.read("writer", row_key)
+    assert revoked is not None
+    assert revoked["active"] is False
+    assert revoked["revoked"] is True
+
+
 def test_ed25519_credential_rejects_public_key_hmac_downgrade():
     canonical = b"signed request"
     public_key = b"p" * 32

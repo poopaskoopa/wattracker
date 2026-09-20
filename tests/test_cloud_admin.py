@@ -167,7 +167,7 @@ def test_admin_routes_list_and_revoke_durable_writer_installation():
         assert listed_again.json()["installations"][0]["status"] == "revoked"
 
 
-def test_admin_routes_list_and_revoke_legacy_durable_writer_row_in_place():
+def test_admin_routes_list_and_revoke_legacy_durable_writer_row_in_place(monkeypatch):
     backend = MemorySecurityStateBackend()
     config = CloudConfig(
         server_secret=SECRET,
@@ -188,6 +188,29 @@ def test_admin_routes_list_and_revoke_legacy_durable_writer_row_in_place():
     assert restarted.credentials.authenticate_writer(
         writer.credential_id, b"s" * 32
     ) is not None
+    update = backend.update
+    raced = False
+
+    def revoke_before_transform(kind, key, transform):
+        nonlocal raced
+        if kind == "writer" and not raced:
+            raced = True
+            update(
+                kind,
+                key,
+                lambda value: {
+                    **{
+                        field: item
+                        for field, item in value.items()
+                        if field != "credential_id"
+                    },
+                    "active": False,
+                    "revoked": True,
+                },
+            )
+        return update(kind, key, transform)
+
+    monkeypatch.setattr(backend, "update", revoke_before_transform)
     with TestClient(create_cloud_app(config, state=restarted)) as client:
         listed = client.get(
             "/api/v1/admin/installations",
@@ -222,6 +245,7 @@ def test_admin_routes_list_and_revoke_legacy_durable_writer_row_in_place():
             "operator_handle": row_key,
             "status": "revoked",
         }
+        assert raced
 
     persisted = backend.read("writer", row_key)
     assert persisted is not None
