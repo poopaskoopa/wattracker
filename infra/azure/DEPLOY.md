@@ -46,6 +46,30 @@ only by `WATTRACKER_CLOUD_PLANE`. Keep the parameter file's placeholders in
 source control and copy the same full image reference—and therefore the same
 exact digest—into both values only in the deployment copy.
 
+## Normal path: reconcile and deploy explicitly
+
+After the deployment parameter file is complete, run the reconciler from a
+checkout of the current `main` commit with no changes except that explicit
+untracked parameter file. It requires the arm64 Homebrew
+GitHub CLI at `/opt/homebrew/bin/gh`, uses the existing operator CLI's endpoint
+and token loading, and never prints parameter contents, credentials, or cloud
+response bodies:
+
+```sh
+.venv/bin/python scripts/deploy_cloud.py infra/azure/main.local.bicepparam \
+  --resource-group "$RESOURCE_GROUP"
+```
+
+The command exits without deploying when the image is current or when the
+published-to-main gap is docs/tests/infra-only. For image drift it resolves a
+digest only from a successful `cloud-publish.yml` run for current `main`,
+updates both image parameters atomically, runs Azure `validate` before
+`create`, and prints the commit reported by `admin version`. It refuses a dirty
+checkout or a checkout other than `main`; a failed post-update step restores
+the parameter file byte-for-byte. These checks and the focused tests are the
+only verification performed in this environment; no Azure command or live
+subscription deployment has been run here.
+
 Before `az deployment group create`, run the read-only drift check against the
 untracked local parameter file and the commit intended for deployment:
 
@@ -237,7 +261,7 @@ There is no outbound-IP handoff or allowlist parameter. If the owner keeps the
 same app name, the new host key still must be re-read by the main deployment's
 `listKeys` lookup; treat any old callback URL as stale.
 
-## 2. Complete parameters and deploy the main template (unverified commands)
+## 2. Complete parameters and deploy the main template — manual fallback (unverified commands)
 
 Use the immutable signed image reference from the successful #316 publishing
 run. It is one `linux/amd64` GHCR image, and its full `@sha256` digest must be
