@@ -82,14 +82,38 @@ def test_storage_uses_service_endpoints_and_a_deny_by_default_firewall():
     assert "bypass: 'None'" in BICEP
     assert "serviceEndpoints:" in BICEP
     assert "service: 'Microsoft.Storage'" in BICEP
-    assert "budgetHookIpRules" in BICEP
-    assert "ipRules:" in BICEP
+    assert "budgetHookIpRules" not in BICEP
+    assert "ipRules:" not in BICEP
+    assert "budgetHookIpRules" not in PARAMS
+    assert "budgetHookIpRules" not in DEPLOY_RUNBOOK
+    budget_subnet = BICEP.split(
+        "resource budgetHookSubnet 'Microsoft.Network/virtualNetworks/subnets@2023-11-01'",
+        1,
+    )[1].split("\nresource ", 1)[0]
+    assert "name: 'budget-hook-flex'" in budget_subnet
+    assert "addressPrefix: '10.42.2.0/27'" in budget_subnet
+    assert "serviceName: 'Microsoft.App/environments'" in budget_subnet
+    assert "service: 'Microsoft.Storage'" in budget_subnet
     uncommented_bicep = re.sub(r"//[^\n]*", "", BICEP)
     assert not re.search(r"\bresourceAccessRules\s*:", uncommented_bicep)
-    assert "virtualNetworkRules:" in BICEP
+    virtual_network_rules = re.search(
+        r"virtualNetworkRules:\s*\[(?P<body>.*?)\n\s*\]",
+        uncommented_bicep,
+        re.DOTALL,
+    )
+    assert virtual_network_rules
+    rules_body = virtual_network_rules.group("body")
+    assert rules_body.count("{") == rules_body.count("}") == 2
+    assert re.findall(
+        r"^\s*id:\s*(.+?)\s*$",
+        rules_body,
+        re.MULTILINE,
+    ) == ["acaSubnet.id", "budgetHookSubnet.id"]
     assert "resource acaSubnet 'Microsoft.Network/virtualNetworks/subnets@2023-11-01'" in BICEP
     assert "id: acaSubnet.id" in BICEP
+    assert "id: budgetHookSubnet.id" in BICEP
     assert "infrastructureSubnetId: acaSubnet.id" in BICEP
+    assert "infrastructureSubnetId: budgetHookSubnet.id" not in BICEP
     assert "resourceId('Microsoft.Network/virtualNetworks/subnets', vnetName" not in BICEP
     assert "Microsoft.Network/privateEndpoints" not in BICEP
     assert "Microsoft.Network/privateDnsZones" not in BICEP

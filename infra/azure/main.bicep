@@ -20,9 +20,6 @@ param budgetStartDate string
 param budgetEndDate string
 @description('Object ID of the managed identity used by the external budget-hook Function App.')
 param budgetHookPrincipalId string
-@description('All possible public IPv4 egress addresses of the external budget-hook Function App; keep this list synchronized with the Function resource.')
-@minLength(1)
-param budgetHookIpRules array
 @description('Static Web Apps repository URL; static assets never access Storage.')
 param staticRepositoryUrl string = ''
 @description('Static Web Apps branch.')
@@ -88,6 +85,28 @@ resource acaSubnet 'Microsoft.Network/virtualNetworks/subnets@2023-11-01' = {
   }
 }
 
+resource budgetHookSubnet 'Microsoft.Network/virtualNetworks/subnets@2023-11-01' = {
+  parent: vnet
+  name: 'budget-hook-flex'
+  properties: {
+    addressPrefix: '10.42.2.0/27'
+    delegations: [
+      {
+        name: 'budget-hook-flex'
+        properties: {
+          serviceName: 'Microsoft.App/environments'
+        }
+      }
+    ]
+    serviceEndpoints: [
+      {
+        service: 'Microsoft.Storage'
+        locations: [location]
+      }
+    ]
+  }
+}
+
 resource storage 'Microsoft.Storage/storageAccounts@2023-05-01' = {
   name: storageName
   location: location
@@ -102,13 +121,13 @@ resource storage 'Microsoft.Storage/storageAccounts@2023-05-01' = {
     networkAcls: {
       defaultAction: 'Deny'
       bypass: 'None'
-      ipRules: [for address in budgetHookIpRules: {
-        value: address
-        action: 'Allow'
-      }]
       virtualNetworkRules: [
         {
           id: acaSubnet.id
+          action: 'Allow'
+        }
+        {
+          id: budgetHookSubnet.id
           action: 'Allow'
         }
       ]

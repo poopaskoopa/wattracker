@@ -1,6 +1,6 @@
 # Budget hook
 
-This Azure Functions Consumption app hosts the authenticated budget callbacks
+This Azure Functions Flex Consumption app hosts the authenticated budget callbacks
 that remain reachable when the Container Apps public API is disabled or scaled
 to zero.
 
@@ -37,10 +37,13 @@ application settings:
 Enable a system-assigned managed identity on the Function App and pass its
 object ID to the main Bicep deployment as `budgetHookPrincipalId`. The hook
 uses that identity for the `CloudControl` Table data plane; it does not use an
-account key or SAS token. Keep the Function's complete possible outbound IPv4
-list in the main deployment's `budgetHookIpRules` parameter. The Storage
-firewall also has a same-tenant resource-instance rule for this Function App;
-the IP list remains an explicit defense-in-depth deployment input.
+account key or SAS token. The app is Flex Consumption, integrated with the
+dedicated `wattracker-vnet/budget-hook-flex` subnet (`10.42.2.0/27`) delegated
+to `Microsoft.App/environments` with a `Microsoft.Storage` service endpoint.
+The main deployment admits that subnet with a Storage virtual-network rule;
+there is no outbound-IP parameter; the firewall relies only on subnet rules.
+If the old Y1 app is recreated, re-read its new principal ID, host, and host
+key before deploying the main template.
 
 The fixed POST endpoints are:
 
