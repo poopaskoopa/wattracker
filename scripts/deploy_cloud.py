@@ -19,6 +19,7 @@ from typing import Any, Sequence
 SCRIPT_DIR = Path(__file__).resolve().parent
 REPOSITORY_ROOT = SCRIPT_DIR.parent
 GH_PATH = Path("/opt/homebrew/bin/gh")
+_DEPLOYMENT_PARAMETER = Path("infra/azure/main.local.bicepparam")
 _IMAGE_PATHS = ("Dockerfile.cloud", "wattracker/")
 _PARAM_LINE_RE = re.compile(
     rb"(?m)^(?P<prefix>[ \t]*param[ \t]+(?P<name>readImage|syncImage)"
@@ -117,6 +118,10 @@ def _require_clean_main(parameter_file: Path) -> str:
         allowed_parameter = parameter_file.resolve().relative_to(REPOSITORY_ROOT)
     except ValueError as exc:
         raise DeployError("refusing to deploy: the parameter file must be inside the checkout") from exc
+    if allowed_parameter != _DEPLOYMENT_PARAMETER:
+        raise DeployError(
+            "refusing to deploy: use infra/azure/main.local.bicepparam as the parameter file"
+        )
     status = _git_output(["status", "--porcelain=v1", "-z", "--untracked-files=all"])
     for entry in status.split("\0"):
         if not entry:

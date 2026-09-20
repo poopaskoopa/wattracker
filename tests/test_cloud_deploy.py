@@ -213,6 +213,16 @@ def test_other_untracked_entry_still_blocks_deploy(monkeypatch, deploy_cloud):
         module._require_clean_main(parameter_file)
 
 
+def test_alternate_untracked_parameter_path_is_rejected(monkeypatch, deploy_cloud):
+    module = deploy_cloud
+    alternate = module.REPOSITORY_ROOT / "infra/azure/other.bicepparam"
+    monkeypatch.setattr(module, "_git_output", lambda args: {
+        ("branch", "--show-current"): "main\n",
+    }[tuple(args)])
+    with pytest.raises(module.DeployError, match="main.local.bicepparam"):
+        module._require_clean_main(alternate)
+
+
 def test_credentials_parameter_contents_and_response_bodies_are_not_leaked(
     monkeypatch, capsys, deploy_cloud
 ):
