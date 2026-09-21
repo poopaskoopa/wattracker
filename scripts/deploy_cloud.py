@@ -382,6 +382,11 @@ def deploy(
             parameter_file, resource_group, deployment_name
         )
         print("dry-run: Azure commands not run")
+        print(
+            "dry-run: the commands below are what the real run would execute after "
+            "pinning both image parameters; run scripts/deploy_cloud.py without "
+            "--dry-run to execute the deployment"
+        )
         print(validate_command)
         print(create_command)
         return 0

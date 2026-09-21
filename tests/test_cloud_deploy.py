@@ -295,9 +295,10 @@ def test_dry_run_preserves_parameter_file_and_never_runs_azure(
     assert parameter_file.stat().st_mtime_ns == before_mtime
     assert not any(command and command[0] == "az" for command in commands)
     output = capsys.readouterr().out
-    assert "dry-run: relaxing branch-is-main" in output
     assert "dry-run finding: local checkout commit differs" in output
     assert NEW_REF in output
+    assert "real run would execute after pinning both image parameters" in output
+    assert "scripts/deploy_cloud.py without --dry-run" in output
     validate_command, create_command = module._format_azure_commands(
         parameter_file, "resource-group", "deployment"
     )

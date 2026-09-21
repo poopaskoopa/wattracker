@@ -58,11 +58,19 @@ cp infra/azure/main.local.bicepparam infra/azure/main.dry-run.bicepparam
   --resource-group "$RESOURCE_GROUP" --dry-run
 ```
 
+`--dry-run` still requires `--resource-group` (or `RESOURCE_GROUP`) so it can
+include that value in the printed commands; it does not require Azure
+credentials.
+
 The dry run reports the published-to-main gap, whether it touches the image,
-the digest it would pin, and pasteable `az deployment group validate` and
-`create` commands. It can run from a topic branch or dirty checkout, but the
-copy must stay inside the checkout because the tool only deploys parameters
-alongside the template it deploys. Remove the copy after reviewing it.
+the digest it would pin, and the `az deployment group validate` and `create`
+commands the real run would execute after pinning both image parameters. It
+does not rewrite the copy, so do not paste those commands against the
+unchanged copy. To execute the deployment, run `scripts/deploy_cloud.py`
+without `--dry-run`; it performs the pinning, validation, and deployment. The
+dry run can run from a topic branch or dirty checkout, but the copy must stay
+inside the checkout because the tool only deploys parameters alongside the
+template it deploys. Remove the copy after reviewing it.
 
 For the real deployment, use the exact untracked parameter file from a
 checkout of the current `main` commit with no changes except that file. It
