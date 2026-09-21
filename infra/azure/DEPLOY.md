@@ -46,11 +46,35 @@ only by `WATTRACKER_CLOUD_PLANE`. Keep the parameter file's placeholders in
 source control and copy the same full image reference—and therefore the same
 exact digest—into both values only in the deployment copy.
 
-## Normal path: reconcile and deploy explicitly
+## Normal path: preview, then reconcile and deploy explicitly
 
-After the deployment parameter file is complete, run the reconciler from a
-checkout of the current `main` commit with no changes except that explicit
-untracked parameter file. It requires the arm64 Homebrew
+After copying the completed deployment parameter file inside this checkout,
+preview the operation first. The dry run needs no Azure login, makes no Azure
+calls, and does not modify the copy:
+
+```sh
+cp infra/azure/main.local.bicepparam infra/azure/main.dry-run.bicepparam
+.venv/bin/python scripts/deploy_cloud.py infra/azure/main.dry-run.bicepparam \
+  --resource-group "$RESOURCE_GROUP" --dry-run
+```
+
+`--dry-run` still requires `--resource-group` (or `RESOURCE_GROUP`) so it can
+include that value in the printed commands; it does not require Azure
+credentials.
+
+The dry run reports the published-to-main gap, whether it touches the image,
+the digest it would pin, and the `az deployment group validate` and `create`
+commands the real run would execute after pinning both image parameters. It
+does not rewrite the copy, so do not paste those commands against the
+unchanged copy. To execute the deployment, run `scripts/deploy_cloud.py`
+without `--dry-run`; it performs the pinning, validation, and deployment. The
+dry run can run from a topic branch or dirty checkout, but the copy must stay
+inside the checkout because the tool only deploys parameters alongside the
+template it deploys. Remove the copy after reviewing it.
+
+For the real deployment, use the exact untracked parameter file from a
+checkout of the current `main` commit with no changes except that file. It
+requires the arm64 Homebrew
 GitHub CLI at `/opt/homebrew/bin/gh`, uses the existing operator CLI's endpoint
 and token loading, and never prints parameter contents, credentials, or cloud
 response bodies:
