@@ -8,6 +8,7 @@ import importlib.util
 import json
 import os
 import re
+import shlex
 import stat
 import subprocess
 import sys
@@ -110,27 +111,31 @@ def _git_output(args: Sequence[str]) -> str:
     return _run_process(["git", *args], label="git")
 
 
-def _require_clean_main(parameter_file: Path) -> str:
-    branch = _git_output(["branch", "--show-current"]).strip()
-    if branch != "main":
-        raise DeployError("refusing to deploy: the current checkout is not main")
+def _require_clean_main(parameter_file: Path, *, dry_run: bool = False) -> str:
     try:
         allowed_parameter = parameter_file.resolve().relative_to(REPOSITORY_ROOT)
     except ValueError as exc:
-        raise DeployError("refusing to deploy: the parameter file must be inside the checkout") from exc
-    if allowed_parameter != _DEPLOYMENT_PARAMETER:
+        raise DeployError(
+            "refusing to deploy: the parameter file must be inside the checkout "
+            "alongside the template it deploys"
+        ) from exc
+    if not dry_run and allowed_parameter != _DEPLOYMENT_PARAMETER:
         raise DeployError(
             "refusing to deploy: use infra/azure/main.local.bicepparam as the parameter file"
         )
-    status = _git_output(["status", "--porcelain=v1", "-z", "--untracked-files=all"])
-    for entry in status.split("\0"):
-        if not entry:
-            continue
-        code = entry[:2]
-        changed_path = entry[3:] if len(entry) > 3 else ""
-        if code == "??" and Path(changed_path) == allowed_parameter:
-            continue
-        raise DeployError("refusing to deploy: the working tree is dirty")
+    if not dry_run:
+        branch = _git_output(["branch", "--show-current"]).strip()
+        if branch != "main":
+            raise DeployError("refusing to deploy: the current checkout is not main")
+        status = _git_output(["status", "--porcelain=v1", "-z", "--untracked-files=all"])
+        for entry in status.split("\0"):
+            if not entry:
+                continue
+            code = entry[:2]
+            changed_path = entry[3:] if len(entry) > 3 else ""
+            if code == "??" and Path(changed_path) == allowed_parameter:
+                continue
+            raise DeployError("refusing to deploy: the working tree is dirty")
     head = _git_output(["rev-parse", "HEAD"]).strip().lower()
     if not _COMMIT_RE.fullmatch(head):
         raise DeployError("refusing to deploy: the checkout commit is invalid")
@@ -264,6 +269,29 @@ def _run_azure_deployment(parameter_file: Path, resource_group: str, deployment_
     )
 
 
+def _format_azure_commands(
+    parameter_file: Path, resource_group: str, deployment_name: str
+) -> tuple[str, str]:
+    common = [
+        "--resource-group",
+        resource_group,
+        "--parameters",
+        str(parameter_file.resolve()),
+    ]
+    return (
+        shlex.join(["az", "deployment", "group", "validate", *common]),
+        shlex.join([
+            "az",
+            "deployment",
+            "group",
+            "create",
+            "--name",
+            deployment_name,
+            *common,
+        ]),
+    )
+
+
 def _running_commit() -> str:
     try:
         result = subprocess.run(
@@ -298,14 +326,37 @@ def _validate_cli_value(value: str, label: str) -> str:
     return value
 
 
-def deploy(parameter_file: Path, resource_group: str, deployment_name: str) -> int:
+def deploy(
+    parameter_file: Path,
+    resource_group: str,
+    deployment_name: str,
+    *,
+    dry_run: bool = False,
+) -> int:
+    parameter_file = parameter_file.resolve()
     resource_group = _validate_cli_value(resource_group, "resource group")
     deployment_name = _validate_cli_value(deployment_name, "deployment name")
-    local_head = _require_clean_main(parameter_file)
+    if dry_run:
+        print(
+            "dry-run: relaxing branch-is-main, dirty-working-tree, and "
+            "exact-parameter-path guards"
+        )
+    local_head = (
+        _require_clean_main(parameter_file, dry_run=True)
+        if dry_run
+        else _require_clean_main(parameter_file)
+    )
     initial = _check_drift(parameter_file)
     main_sha = str(initial["main_sha"]).lower()
     if local_head != main_sha:
-        raise DeployError("refusing to deploy: local main is not at the current remote main commit")
+        if not dry_run:
+            raise DeployError(
+                "refusing to deploy: local main is not at the current remote main commit"
+            )
+        print(
+            "dry-run finding: local checkout commit differs from remote main "
+            f"({local_head} != {main_sha}); continuing"
+        )
     if not initial["main_ahead"] and not initial["main_behind"]:
         print("cloud image is current; no deployment needed")
         return 0
@@ -323,7 +374,17 @@ def deploy(parameter_file: Path, resource_group: str, deployment_name: str) -> i
         return 0
 
     image_ref, run_id = _resolve_published_image(main_sha)
-    print(f"image drift detected; using the successful cloud publish run {run_id}")
+    print(
+        f"image drift detected; using the successful cloud publish run {run_id}: {image_ref}"
+    )
+    if dry_run:
+        validate_command, create_command = _format_azure_commands(
+            parameter_file, resource_group, deployment_name
+        )
+        print("dry-run: Azure commands not run")
+        print(validate_command)
+        print(create_command)
+        return 0
     print("updating both image pins, then running Azure validate and create")
     original: bytes | None = None
     mode: int | None = None
@@ -354,11 +415,17 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("parameter_file", type=Path)
     parser.add_argument("--resource-group", default=os.environ.get("RESOURCE_GROUP", ""))
     parser.add_argument("--deployment-name", default="wattracker-cloud")
+    parser.add_argument("--dry-run", action="store_true")
     try:
         args = parser.parse_args(argv)
         if not args.resource_group:
             raise DeployError("resource group is required via --resource-group or RESOURCE_GROUP")
-        return deploy(args.parameter_file.resolve(), args.resource_group, args.deployment_name)
+        return deploy(
+            args.parameter_file.resolve(),
+            args.resource_group,
+            args.deployment_name,
+            dry_run=args.dry_run,
+        )
     except DeployError as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 1

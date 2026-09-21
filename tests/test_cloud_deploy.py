@@ -265,3 +265,92 @@ def test_gh_resolution_uses_arm64_homebrew_path(monkeypatch, deploy_cloud):
     module._run_gh(["run", "list"])
     assert calls[-1][0] == "/opt/homebrew/bin/gh"
     assert "/usr/local/bin/gh" not in calls[-1]
+
+
+def test_dry_run_preserves_parameter_file_and_never_runs_azure(
+    monkeypatch, capsys, deploy_cloud, tmp_path
+):
+    module = deploy_cloud
+    checkout = tmp_path / "checkout"
+    parameter_file = checkout / "infra/azure/main.local.bicepparam"
+    parameter_file.parent.mkdir(parents=True)
+    parameter_file.write_bytes(b"readImage=old\nsyncImage=old\n")
+    before = parameter_file.read_bytes()
+    before_mtime = parameter_file.stat().st_mtime_ns
+    monkeypatch.setattr(module, "REPOSITORY_ROOT", checkout)
+    monkeypatch.setattr(module, "_require_clean_main", lambda *_args, **_kwargs: "c" * 40)
+    monkeypatch.setattr(module, "_check_drift", lambda *_args, **_kwargs: _initial_drift())
+    monkeypatch.setattr(module, "_changed_paths", lambda *_args: ["Dockerfile.cloud"])
+    monkeypatch.setattr(module, "_resolve_published_image", lambda *_args: (NEW_REF, 42))
+    commands = []
+    monkeypatch.setattr(
+        module,
+        "_run_process",
+        lambda command, **_kwargs: commands.append(list(command)) or "",
+    )
+
+    assert module.deploy(parameter_file, "resource-group", "deployment", dry_run=True) == 0
+
+    assert parameter_file.read_bytes() == before
+    assert parameter_file.stat().st_mtime_ns == before_mtime
+    assert not any(command and command[0] == "az" for command in commands)
+    output = capsys.readouterr().out
+    assert "dry-run: relaxing branch-is-main" in output
+    assert "dry-run finding: local checkout commit differs" in output
+    assert NEW_REF in output
+    validate_command, create_command = module._format_azure_commands(
+        parameter_file, "resource-group", "deployment"
+    )
+    assert validate_command in output
+    assert create_command in output
+
+
+def test_dry_run_allows_dirty_topic_checkout_and_parameter_copy(
+    monkeypatch, deploy_cloud, tmp_path
+):
+    module = deploy_cloud
+    checkout = tmp_path / "checkout"
+    parameter_file = checkout / "infra/azure/main.dry-run.bicepparam"
+    parameter_file.parent.mkdir(parents=True)
+    parameter_file.write_bytes(b"copy\n")
+    monkeypatch.setattr(module, "REPOSITORY_ROOT", checkout)
+
+    def fake_git(args):
+        assert args == ["rev-parse", "HEAD"]
+        return SHA + "\n"
+
+    monkeypatch.setattr(module, "_git_output", fake_git)
+    monkeypatch.setattr(module, "_check_drift", lambda *_args, **_kwargs: {
+        **_initial_drift(),
+        "main_ahead": 0,
+        "main_behind": 0,
+    })
+    monkeypatch.setattr(module, "_run_azure_deployment", lambda *_args: pytest.fail("deployed"))
+
+    assert module.deploy(parameter_file, "resource-group", "deployment", dry_run=True) == 0
+
+
+def test_dry_run_still_rejects_parameter_outside_checkout(monkeypatch, deploy_cloud, tmp_path):
+    module = deploy_cloud
+    checkout = tmp_path / "checkout"
+    monkeypatch.setattr(module, "REPOSITORY_ROOT", checkout)
+    outside = tmp_path / "outside.bicepparam"
+    with pytest.raises(module.DeployError, match="alongside the template"):
+        module._require_clean_main(outside, dry_run=True)
+
+
+def test_real_azure_path_still_validates_then_creates(monkeypatch, deploy_cloud, tmp_path):
+    module = deploy_cloud
+    commands = []
+    monkeypatch.setattr(
+        module,
+        "_run_process",
+        lambda command, **_kwargs: commands.append(list(command)) or "",
+    )
+
+    module._run_azure_deployment(tmp_path / "params.bicepparam", "resource-group", "deployment")
+
+    assert [command[:4] for command in commands] == [
+        ["az", "deployment", "group", "validate"],
+        ["az", "deployment", "group", "create"],
+    ]
