@@ -1323,4 +1323,34 @@ final class CloudSessionTests: XCTestCase {
         XCTAssertEqual(reads.first?.bearerToken, "context-0")
         XCTAssertEqual(reads.last?.bearerToken, "context-2")
     }
+
+    func testARejectedContextRetryThrottleIsClassifiedAndSetsBackoff() async throws {
+        let clock = TestClock()
+        let rig = harness(clock: clock) { request, index in
+            if request.url?.path == "/api/v1/context/refresh" {
+                return .json(CloudFixtures.refreshBody(context: "context-\(index)"))
+            }
+            return index == 1 ? .refused(404) : .refused(429, retryAfter: 30)
+        }
+
+        do {
+            _ = try await rig.session.activityDetail(8)
+            XCTFail("expected throttling")
+        } catch let failure as CloudSession.Failure {
+            guard case let .throttled(retryAfter) = failure else {
+                return XCTFail("expected throttled failure, got \(failure)")
+            }
+            XCTAssertEqual(retryAfter, 30)
+        }
+
+        do {
+            _ = try await rig.session.activityDetail(8)
+            XCTFail("expected backoff gate")
+        } catch let failure as CloudSession.Failure {
+            guard case let .throttled(retryAfter) = failure else {
+                return XCTFail("expected backoff throttling, got \(failure)")
+            }
+            XCTAssertEqual(retryAfter, 30)
+        }
+    }
 }
