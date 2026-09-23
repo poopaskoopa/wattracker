@@ -14,10 +14,15 @@ final class RideDisplayTests: XCTestCase {
         XCTAssertEqual(ride?.startedAt, "")
     }
 
-    func testFormattingHandlesHourBoundaryDistanceAndMissingValues() {
-        // Desktop rounds the same duration in wattracker/calendarfeed.py:268-278.
+    func testFormattingMatchesDesktopDurationRoundingAndPadding() {
+        // Desktop formats durations in wattracker/races.py:627-637.
+        XCTAssertEqual(RideFormatting.duration(309), "05:09")
         XCTAssertEqual(RideFormatting.duration(3599.5), "1:00:00")
+        XCTAssertEqual(RideFormatting.duration(3600.5), "1:00:00")
         XCTAssertEqual(RideFormatting.duration(3601), "1:00:01")
+    }
+
+    func testFormattingHandlesDistanceAndMissingValues() {
         // The desktop detail card divides meters by 1,000 and formats one
         // decimal place in wattracker/web/templates/activity_detail.html:13.
         XCTAssertEqual(RideFormatting.distance(12345), "12.3 km")
@@ -26,7 +31,7 @@ final class RideDisplayTests: XCTestCase {
         XCTAssertEqual(RideFormatting.watts(nil), "—")
     }
 
-    func testStreamsDropGapsAndUseIndexWhenTimeIsMissing() {
+    func testStreamsDropGapsAndUseTimeChannelWhenPresent() {
         let channels = ActivityStreams.Channels(
             time: nil, power: [0, nil, .infinity],
             heartrate: [nil, nil], cadence: [nil, nil], altitude: nil
@@ -42,25 +47,35 @@ final class RideDisplayTests: XCTestCase {
         XCTAssertFalse(series.contains { $0.id == "cadence" })
         XCTAssertTrue(StreamSeries.all(in: ActivityStreams(streams: .init(
             time: nil, power: nil, heartrate: nil, cadence: nil, altitude: nil))).isEmpty)
+
+        let timedChannels = ActivityStreams.Channels(
+            time: [12.5, 18.25, 24.75], power: [100, nil, 300],
+            heartrate: nil, cadence: nil, altitude: nil
+        )
+        let timedSeries = StreamSeries.all(in: ActivityStreams(streams: timedChannels))
+        XCTAssertEqual(timedSeries[0].points.map(\.time), [12.5, 24.75])
+        XCTAssertEqual(timedSeries[0].points.map(\.value), [100, 300])
     }
 
-    func testZoneGroupsPreservePositiveRowsAndTotals() {
+    func testZoneGroupsPreservePositiveRowsLabelsAndPercentages() {
         let zones: JSONValue = .object([
             "power": .object(["zones": .array([
-                .object(["label": .string("Z1"), "seconds": .number(60), "percent": .number(10)]),
-                .object(["label": .string("Z2"), "seconds": .number(540), "percent": .number(90)]),
-                .object(["label": .string("empty"), "seconds": .number(0)])
+                .object(["label": .string("Recovery"), "seconds": .number(61), "percent": .number(10.25)]),
+                .object(["seconds": .number(539), "percent": .number(89.75)]),
+                .object(["label": .string("empty"), "seconds": .number(0), "percent": .number(0)])
             ])]),
             "heart_rate": .object(["zones": .array([
-                .object(["label": .string("Z1"), "seconds": .number(600), "percent": .number(100)])
+                .object(["seconds": .number(600), "percent": .number(100)])
             ])])
         ])
         let groups = ZoneGroup.extract(from: zones)
         XCTAssertEqual(groups.map(\.id), ["power", "heart_rate"])
-        // Desktop assigns elapsed samples in wattracker/analysis/zones.py:325-369
-        // (`time_in_zones`), so each group's rows must sum to the ride duration.
-        XCTAssertEqual(groups[0].rows.map(\.seconds).reduce(0, +), 600)
-        XCTAssertEqual(groups[1].rows.map(\.seconds).reduce(0, +), 600)
+        XCTAssertEqual(groups[0].rows.map(\.seconds), [61, 539])
+        XCTAssertEqual(groups[0].rows.map(\.label), ["Recovery", "Z2"])
+        XCTAssertEqual(groups[0].rows.map(\.percent), [10.25, 89.75])
+        XCTAssertEqual(groups[1].rows.map(\.seconds), [600])
+        XCTAssertEqual(groups[1].rows.map(\.label), ["Z1"])
+        XCTAssertEqual(groups[1].rows.map(\.percent), [100])
         XCTAssertTrue(ZoneGroup.extract(from: nil).isEmpty)
     }
 }

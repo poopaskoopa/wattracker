@@ -197,10 +197,10 @@ enum RideFormatting {
 
     static func duration(_ seconds: Double?) -> String {
         guard let seconds, seconds.isFinite, seconds >= 0 else { return "—" }
-        let total = Int(seconds.rounded()), hours = total / 3_600
+        let total = Int(seconds.rounded(.toNearestOrEven)), hours = total / 3_600
         let minutes = (total % 3_600) / 60, remainder = total % 60
         return hours > 0 ? String(format: "%d:%02d:%02d", hours, minutes, remainder)
-            : String(format: "%d:%02d", minutes, remainder)
+            : String(format: "%02d:%02d", minutes, remainder)
     }
 
     static func distance(_ meters: Double?) -> String {
