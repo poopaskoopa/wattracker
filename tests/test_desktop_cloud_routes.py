@@ -262,9 +262,12 @@ def test_revoke_redirects_with_one_time_message_and_does_not_repeat(client, revo
     assert sync.calls == calls
 
 
-def test_cloud_wipe_is_distinct_and_requires_typed_confirmation(client):
+def test_cloud_wipe_is_distinct_and_requires_typed_confirmation(client, monkeypatch):
     web, sync = client
     sync.state.update(enabled=True, enrolled=True)
+    # The desktop-side setting is deliberately separate from the cloud route's
+    # server flag and is off by default.
+    monkeypatch.setenv("WATTRACKER_DESKTOP_ALLOW_ACCOUNT_WIPE", "1")
     text = web.get("/settings").text
     assert "Delete all cloud data" in text
     assert "This permanently destroys" in text
@@ -289,8 +292,26 @@ def test_cloud_wipe_is_distinct_and_requires_typed_confirmation(client):
     assert "Cloud data permanently deleted." in web.get("/settings").text
 
 
-def test_cloud_wipe_does_not_retry_an_unconfirmed_request(client):
+def test_cloud_wipe_button_and_action_are_off_by_default(client, monkeypatch):
     web, sync = client
+    monkeypatch.delenv("WATTRACKER_DESKTOP_ALLOW_ACCOUNT_WIPE", raising=False)
+    sync.state.update(enabled=True, enrolled=True)
+    text = web.get("/settings").text
+    assert "Delete all cloud data" not in text
+    assert "/settings/cloud/wipe" not in text
+    response = web.post(
+        "/settings/cloud/wipe",
+        data={"confirmation": "DELETE ALL CLOUD DATA"},
+        follow_redirects=False,
+    )
+    assert response.status_code == 303
+    assert not [call for call in sync.calls if call[0] == "wipe"]
+    assert "Cloud data wipe is disabled in desktop settings." in web.get("/settings").text
+
+
+def test_cloud_wipe_does_not_retry_an_unconfirmed_request(client, monkeypatch):
+    web, sync = client
+    monkeypatch.setenv("WATTRACKER_DESKTOP_ALLOW_ACCOUNT_WIPE", "1")
     sync.state.update(enabled=True, enrolled=True)
     sync.wipe_result = None
 
@@ -304,8 +325,9 @@ def test_cloud_wipe_does_not_retry_an_unconfirmed_request(client):
     assert [call[0] for call in sync.calls] == ["wipe"]
 
 
-def test_cloud_wipe_404_reports_operator_follow_up(client):
+def test_cloud_wipe_404_reports_operator_follow_up(client, monkeypatch):
     web, sync = client
+    monkeypatch.setenv("WATTRACKER_DESKTOP_ALLOW_ACCOUNT_WIPE", "1")
     sync.state.update(enabled=True, enrolled=True)
     sync.wipe_result = False
     response = web.post(
@@ -315,8 +337,9 @@ def test_cloud_wipe_404_reports_operator_follow_up(client):
     )
     assert response.status_code == 303
     page = web.get(response.headers["location"])
-    assert "server credential is gone" in page.text
-    assert "operator can finish the wipe if data may remain" in page.text
+    assert "The cloud did not recognise this installation." in page.text
+    assert "Local sync has been turned off" in page.text
+    assert "server credential is gone" not in page.text
 
 
 def test_expired_pairing_is_removed_from_server_state(client):

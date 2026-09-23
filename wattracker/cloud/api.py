@@ -1694,7 +1694,6 @@ def create_cloud_app(
                 headers={"Cache-Control": "no-store"},
             )
 
-        @app.post(_WIPE_PATH)
         async def wipe_account(request: Request) -> Response:
             """Permanently delete the authenticated writer's cloud scope.
 
@@ -1710,8 +1709,8 @@ def create_cloud_app(
             deployment-wide 503 admission contract.
             """
             # Keep the capability dark until the deployment explicitly opts
-            # in.  This check must precede kill-state and credential handling:
-            # disabled and unknown routes have the same 404 contract.
+            # in.  The route is also omitted from the app below so every HTTP
+            # method has unknown-route behavior while the flag is off.
             if not config.allow_account_wipe:
                 raise HTTPException(status_code=404)
             _require_public_api_for_device_or_reader(state)
@@ -1774,6 +1773,9 @@ def create_cloud_app(
                 return _error(503, "cloud wipe incomplete")
             _sweep_expired_auth_state(state)
             return success
+
+        if config.allow_account_wipe:
+            app.post(_WIPE_PATH)(wipe_account)
 
         @app.get("/api/v1/context")
         async def context(request: Request) -> Response:

@@ -870,11 +870,14 @@ def test_scope_wipe_requires_authentication_and_is_not_exposed_on_sync_plane():
         clock=lambda: 1_000,
     )
     read_app = create_cloud_app(config)
-    assert WIPE_PATH in {route.path for route in read_app.routes}
     with TestClient(read_app) as client:
-        response = client.post(WIPE_PATH)
-    assert response.status_code == 404
-    assert response.json() == {"detail": "Not Found"}
+        assert WIPE_PATH not in {route.path for route in read_app.routes}
+        for method in ("GET", "POST", "PUT", "DELETE", "HEAD"):
+            gated = client.request(method, WIPE_PATH)
+            unknown = client.request(method, "/api/v1/account/not-a-route")
+            assert gated.status_code == unknown.status_code == 404
+            assert gated.content == unknown.content
+            assert gated.headers.get("allow") == unknown.headers.get("allow")
 
     sync_app = create_cloud_app(
         CloudConfig(
@@ -923,12 +926,14 @@ def test_scope_wipe_accepts_only_the_installation_writer_not_a_device():
     writer = state.credentials.register_writer(
         new_installation_id(), "rider", b"g" * 32, b"sub-g"
     )
-    device, private_key = _device(state, scope=writer.local_user_scope)
+    device, private_key = _device(
+        state, scope=writer.local_user_scope, capabilities=("read", "write")
+    )
     # Put the device into the writer's namespace explicitly; a device from a
     # different installation must not become a destructive signer either.
     device = state.credentials.register_device_for_scope(
         writer.namespace, writer.local_user_scope, device.verification_key,
-        subscription_key=device.subscription_key,
+        subscription_key=device.subscription_key, capabilities=("read", "write"),
     )
     with TestClient(create_cloud_app(config, state=state)) as client:
         response = client.post(

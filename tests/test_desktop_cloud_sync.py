@@ -497,6 +497,44 @@ def test_cloud_wipe_404_clears_local_credential_disables_sync_and_forces_republi
     assert payloads, "wipe must clear publication acknowledgements"
 
 
+def test_cloud_wipe_503_keeps_local_writer_and_sync_enabled(tmp_path):
+    path, user_id = _fixture_db(tmp_path, count=0)
+    credentials = _credentials()
+
+    store = CloudCredentialStore(MemorySecrets())
+    store.save_writer(credentials, user_id=user_id)
+    db.save_cloud_sync_state(
+        user_id, {"endpoint": "https://cloud.example", "enabled": True}, path=str(path),
+    )
+    sync = DesktopCloudSync(
+        str(path), store,
+        transport=lambda *_args: (503, b'{"detail":"unavailable"}'),
+    )
+
+    assert sync.wipe_cloud_data(user_id) is None
+    assert store.load_writer(user_id=user_id) is not None
+    assert db.get_cloud_sync_state(user_id, path=str(path))["enabled"] is True
+
+
+def test_cloud_wipe_transport_exception_keeps_local_writer_and_sync_enabled(tmp_path):
+    path, user_id = _fixture_db(tmp_path, count=0)
+    credentials = _credentials()
+
+    def transport(*_args):
+        raise OSError("network unavailable")
+
+    store = CloudCredentialStore(MemorySecrets())
+    store.save_writer(credentials, user_id=user_id)
+    db.save_cloud_sync_state(
+        user_id, {"endpoint": "https://cloud.example", "enabled": True}, path=str(path),
+    )
+    sync = DesktopCloudSync(str(path), store, transport=transport)
+
+    assert sync.wipe_cloud_data(user_id) is None
+    assert store.load_writer(user_id=user_id) is not None
+    assert db.get_cloud_sync_state(user_id, path=str(path))["enabled"] is True
+
+
 def test_unchanged_sync_skips_snapshot_rebuild(tmp_path, monkeypatch):
     path, user_id = _fixture_db(tmp_path, count=1)
     store = CloudCredentialStore(MemorySecrets())

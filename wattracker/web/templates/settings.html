@@ -271,7 +271,7 @@
     {% endfor %}
     </tbody></table>
     {% endif %}
-    {% if cloud_sync.enrolled %}
+    {% if cloud_sync.enrolled and cloud_wipe_enabled %}
     <section class="cloud-wipe-settings" aria-labelledby="cloud-wipe-heading">
         <h4 id="cloud-wipe-heading">Delete all cloud data</h4>
         <p class="hint"><strong>This permanently destroys all data synced to the cloud</strong>
