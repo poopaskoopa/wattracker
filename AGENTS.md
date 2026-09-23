@@ -172,59 +172,28 @@ The list gives the **order**. GitHub gives the **state** — always
 (#234's scope grew a whole section after it was filed) and its labels move.
 If the two disagree, GitHub wins and the queue is stale; say so.
 
-**Three PRs are open at once and two of them collide.** #342 (#339, Flex
-networking) and #343 (#337, the publish commands) both edit
-`infra/azure/DEPLOY.md` **and** `tests/test_cloud_deployment.py` in overlapping
-regions. **Land #343 first**, then rebase #342 onto it — #343 is two files and
-corrects commands that are wrong today, while #342 is nine files and needs
-another review round anyway, so it is the one that should absorb the conflict.
-Do not merge #342 first and then try to rebase #343 into it.
+1. **#170 — the rider-scoped cloud wipe: route, and the desktop button.**
+   Unblocked on 2026-09-23: #305's `api.py` rewrite is closed and the stack is
+   deployed. Read the 2026-09-23 comment on the issue for the exact scope,
+   which is items 1, 3, 4 and 5 of the comment before it. The wipe library is
+   already on `main` (`wattracker/cloud/wipe.py`, PR #312), so do not rewrite it.
+   The scope comes from the authenticated credential only. This is data
+   deletion behind authentication, so the PR gets a security review. No
+   Azure-side verification is possible from your environment; say so.
 
-1. **#339 — the budget hook cannot reach storage, so the kill switch cannot
-   fire.** **PR #342 is open with review changes requested.** The decision is made: **move the Function to Flex Consumption with
-   VNet integration**; read the issue comment for the full brief before starting.
-   Evidence from the owner's subscription: with storage `defaultAction: Deny` the
-   drill returns `503 budget hook unavailable`; with `Allow` it returns
-   `200 {"status":"ok"}`. Everything but the network path is correct — the
-   Function identity holds `Wattracker Budget Hook Writer` on `CloudControl`, all
-   26 outbound IPs are in the allowlist, and the 200 proves the upsert works.
-   **Azure Storage IP rules do not apply to same-region traffic**, so no IP list
-   can ever work; the container apps succeed only because they are covered by the
-   ACA subnet's `virtualNetworkRule`. Ruled out by execution, do not revisit:
-   `resourceAccessRules` on a `Microsoft.Web/sites` (#327), VNet rules for a `Y1`
-   Consumption app, widening the IP list, `defaultAction: Allow`, and having the
-   Function call the cloud app instead (`api.py` only *reads* `kill_state`; that
-   would mean a public "disable yourself" endpoint). Expect the app to be
-   recreated, so `budgetHookPrincipalId` and its role assignment change and
-   `budgetHookIpRules` must be deleted along with the #327 fragility note. This
-   is the largest infra change yet and none of it can be self-verified — budget
-   for several rounds.
+2. **#352 — collapse the 404-retry in `CloudSession.activityObject`.** Take it
+   before #351: both edit `activityObject`, and #351's cache work is simpler on
+   the single read-and-store helper this one introduces. Do not run them in
+   parallel.
 
-2. **#337 — phase 3 of DEPLOY.md does not work as written.** **PR #343 is open.** `python` must be
-   `.venv/bin/python`, and the publish needs `--python` because the staged
-   directory has no `local.settings.json`. Both were hit for real on
-   2026-09-19. Small, and it stops the next person losing twenty minutes.
+3. **#351 — bound and revalidate the iOS activity detail/stream cache.**
 
-3. **#336 — `list-installations` shows an opaque handle the docs call an
-   `installation_id`.** **PR #340 is open and awaiting a change**: it renames the
-   JSON field to `operator_handle`, which is a breaking wire-format change
-   against the live deployment, and the new CLI parses strictly. The decision
-   recorded on that PR is to detect the skew and say so — when a row carries
-   `installation_id` instead, fail with a message naming the cause and the fix,
-   rather than tolerating both names silently or relying on the operator
-   remembering a four-step redeploy order.
+4. **#353 — unit tests for `RideSummary`, `RideFormatting`, `StreamSeries`,
+   `ZoneGroup`.** Independent of 2 and 3; different files except
+   `project.pbxproj`, which every new Swift file touches, so rebase before
+   opening the PR.
 
-4. **#335 — a racing admin revoke returns 404 for a revoke that succeeded.**
-   Fail-closed and idempotent, so this is an operator-honesty defect rather than
-   a security one — the same class #320 was filed to remove.
-
-5. **#334 — the cloud app cannot say what version it is.** Diagnosing the stale
-   image took four indirect probes and ultimately hinged on the capitalisation
-   of a 404 body. Includes the CLI's 15-second timeout being shorter than the
-   apps' ~20-second cold start, so the operator's first command after any idle
-   period fails opaquely.
-
-6. **#249 — rotating full-suite test flakes. Still not a local-runs job.**
+5. **#249 — rotating full-suite test flakes. Still not a local-runs job.**
    Nothing has changed since the re-scope. 21 consecutive clean local full
    suites stand against zero reproductions. Both known instances came from
    **taksmon's machine**. **The next step is taksmon's log and his exact
@@ -246,14 +215,13 @@ or anything below on your own.
   in #295 (`0546364`).
 - **#264** waits on #194 (Android network client). #302 closed it by accident;
   it was reopened. Its Android half is taksmon's.
-- **#102, #168, #217, #242** are `blocked` on the hosting decision or a
-  live deployment.
+- **#339** (budget hook networking) is merged as PR #342. What remains is the
+  owner's Flex migration and the `POST /budget/clear` drill against Azure.
+  **#168** stays `blocked` until that drill passes.
+- **#102, #217, #242** wait on live-deployment evidence (a real enrolment and
+  a week of real use), not on code.
 - **#322** (deregister the Windows-TT self-hosted runner) is taksmon's
   machine, so it routes to him.
-- **#170** (scope wipe) landed its repository half in PR #312 (`9a66743`) and
-  stays open and `blocked` for the part that needs a live deployment. The
-  `#102` "known-open code items" continue in the Claude session, which owns
-  `wattracker/cloud/storage.py` and `wattracker/cloud/limits.py`.
 
 **Infrastructure work cannot be self-verified — say so in the PR.** Codex
 cannot run `az bicep build` (the compiler fetch from `aka.ms` is blocked in its
