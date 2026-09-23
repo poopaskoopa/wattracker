@@ -1,5 +1,4 @@
 import XCTest
-@testable import WatTracker
 
 final class RideDisplayTests: XCTestCase {
     func testRideSummaryPreservesMissingHeartRateAndPower() {
