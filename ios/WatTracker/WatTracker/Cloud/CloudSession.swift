@@ -194,7 +194,19 @@ actor CloudSession: ReadSession {
     /// purpose: the activities collection stays small and these are fetched
     /// only once a rider opens a ride. Cleared wherever `cache` is, because a
     /// ride opened under one credential must never be served to the next.
-    private var activityObjects: [String: CloudItem] = [:]
+    static let activityObjectCacheCapacity = 8
+
+    private struct ActivityObjectCacheEntry {
+        let activityID: Int
+        let item: CloudItem
+    }
+
+    private var activityObjects: [String: ActivityObjectCacheEntry] = [:]
+    /// Least recently used first. Streams are still preferred for eviction
+    /// when the cap is exceeded, because they are the larger payload.
+    private var activityObjectLRU: [String] = []
+    private var activityObjectGenerations: [Int: Int] = [:]
+    private var activityCollectionRevisions: [Int: Int] = [:]
 
     private var mintCount = 0
     /// The one refresh allowed to be in flight. Every caller that arrives
@@ -278,6 +290,9 @@ actor CloudSession: ReadSession {
         // loss.
         cache.removeAll()
         activityObjects.removeAll()
+        activityObjectLRU.removeAll()
+        activityObjectGenerations.removeAll()
+        activityCollectionRevisions.removeAll()
         try credentials.save(result.device)
         lifecycleGeneration += 1
         refreshTask = nil
@@ -308,6 +323,9 @@ actor CloudSession: ReadSession {
         credentials.clear()
         cache.removeAll()
         activityObjects.removeAll()
+        activityObjectLRU.removeAll()
+        activityObjectGenerations.removeAll()
+        activityCollectionRevisions.removeAll()
         device = nil
         token = nil
         state = .unpaired
@@ -406,6 +424,7 @@ actor CloudSession: ReadSession {
         let objectID = "activity-detail-\(activityID)"
         let item = try await activityObject(
             objectID: objectID,
+            activityID: activityID,
             read: { client, context, device in
                 try await client.activityDetail(
                     activityID: activityID, readerContext: context, device: device
@@ -423,6 +442,7 @@ actor CloudSession: ReadSession {
         let objectID = "stream-\(activityID)"
         let item = try await activityObject(
             objectID: objectID,
+            activityID: activityID,
             read: { client, context, device in
                 try await client.activityStreams(
                     activityID: activityID, readerContext: context, device: device
@@ -445,13 +465,18 @@ actor CloudSession: ReadSession {
     /// rather than an object that is genuinely absent.
     private func activityObject(
         objectID: String,
+        activityID: Int,
         read: (ReadClient, String, PairedDevice) async throws -> CloudItem
     ) async throws -> CloudItem {
         if state == .removed { throw Failure.deviceRemoved }
         guard let device else { throw Failure.notPaired }
         let generation = lifecycleGeneration
         try validate(device, lifecycleGeneration: generation)
-        if let cached = activityObjects[objectID] { return cached }
+        if let cached = activityObjects[objectID] {
+            touchActivityObject(objectID)
+            return cached.item
+        }
+        let activityObjectGeneration = activityObjectGenerations[activityID] ?? 0
         if let allowed = nextAttemptAllowedAt, allowed > clock() {
             throw Failure.throttled(retryAfter: allowed.timeIntervalSince(clock()))
         }
@@ -464,8 +489,10 @@ actor CloudSession: ReadSession {
         }
         do {
             return try await readAndStoreActivityObject(
-                objectID: objectID, context: attempt.value, device: device,
-                lifecycleGeneration: generation, read: read
+                objectID: objectID, activityID: activityID,
+                context: attempt.value, device: device,
+                lifecycleGeneration: generation,
+                activityObjectGeneration: activityObjectGeneration, read: read
             )
         } catch {
             guard let failure = error as? CloudClient.Failure,
@@ -475,8 +502,10 @@ actor CloudSession: ReadSession {
             let renewed = try await context(after: attempt.generation)
             do {
                 return try await readAndStoreActivityObject(
-                    objectID: objectID, context: renewed.value, device: device,
-                    lifecycleGeneration: generation, read: read
+                    objectID: objectID, activityID: activityID,
+                    context: renewed.value, device: device,
+                    lifecycleGeneration: generation,
+                    activityObjectGeneration: activityObjectGeneration, read: read
                 )
             } catch {
                 throw try classifyActivityReadError(error)
@@ -486,16 +515,73 @@ actor CloudSession: ReadSession {
 
     private func readAndStoreActivityObject(
         objectID: String,
+        activityID: Int,
         context: String,
         device: PairedDevice,
         lifecycleGeneration: Int,
+        activityObjectGeneration: Int,
         read: (ReadClient, String, PairedDevice) async throws -> CloudItem
     ) async throws -> CloudItem {
         let item = try await read(client, context, device)
         try validate(device, lifecycleGeneration: lifecycleGeneration)
-        activityObjects[objectID] = item
+        if (activityObjectGenerations[activityID] ?? 0) == activityObjectGeneration {
+            activityObjects[objectID] = ActivityObjectCacheEntry(
+                activityID: activityID, item: item
+            )
+            touchActivityObject(objectID)
+            trimActivityObjectCache()
+        }
         lastSuccessfulRead = clock()
         return item
+    }
+
+    private func touchActivityObject(_ objectID: String) {
+        activityObjectLRU.removeAll { $0 == objectID }
+        activityObjectLRU.append(objectID)
+    }
+
+    private func trimActivityObjectCache() {
+        while activityObjects.count > Self.activityObjectCacheCapacity {
+            let streamID = activityObjectLRU.first {
+                activityObjects[$0]?.item.kind == .stream
+            }
+            let evictedID = streamID ?? activityObjectLRU.first!
+            activityObjects.removeValue(forKey: evictedID)
+            activityObjectLRU.removeAll { $0 == evictedID }
+        }
+    }
+
+    private func invalidateActivityObjects(for items: [CloudItem]) {
+        for activity in items where activity.kind == .activity {
+            guard let activityID = Int(activity.id.replacingOccurrences(of: "activity-", with: "")) else {
+                continue
+            }
+            let previousRevision = activityCollectionRevisions[activityID]
+            let isNewerRevision: Bool
+            if activity.deleted {
+                isNewerRevision = true
+            } else if let previousRevision {
+                isNewerRevision = activity.revision > previousRevision
+            } else {
+                isNewerRevision = true
+            }
+            if isNewerRevision {
+                activityObjectGenerations[activityID, default: 0] += 1
+                activityCollectionRevisions[activityID] = Swift.max(
+                    previousRevision ?? activity.revision, activity.revision
+                )
+            }
+            let objectIDs: [String] = activityObjects.compactMap { pair in
+                let (objectID, entry) = pair
+                guard entry.activityID == activityID,
+                      activity.deleted || activity.revision > entry.item.revision else { return nil }
+                return objectID
+            }
+            for objectID in objectIDs {
+                activityObjects.removeValue(forKey: objectID)
+                activityObjectLRU.removeAll { $0 == objectID }
+            }
+        }
     }
 
     /// Retry failures use the same classification as the first read. Preserve
@@ -744,6 +830,9 @@ actor CloudSession: ReadSession {
         credentials.clear()
         cache.removeAll()
         activityObjects.removeAll()
+        activityObjectLRU.removeAll()
+        activityObjectGenerations.removeAll()
+        activityCollectionRevisions.removeAll()
         lastSuccessfulRead = nil
     }
 
@@ -831,6 +920,9 @@ actor CloudSession: ReadSession {
         let now = clock()
         if complete {
             try validate(device, lifecycleGeneration: lifecycleGeneration)
+            if route == .activities {
+                invalidateActivityObjects(for: received)
+            }
             cache.store(
                 CachedCollection(revision: revision, items: merged, storedAt: now),
                 for: route
