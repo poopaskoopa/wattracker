@@ -113,6 +113,10 @@ class CloudConfig:
     # one deployment and forgeable in another, with nothing at startup telling
     # them apart, is the failure mode this flag exists to remove.
     require_verified_subject: bool = True
+    # Account wipe is an operator-enabled destructive capability.  The route
+    # remains indistinguishable from an unknown route until the deployment has
+    # explicitly granted the identity the deletes the wipe needs.
+    allow_account_wipe: bool = False
     subscription_header: str = "Ocp-Apim-Subscription-Key"
     allowed_origins: tuple[str, ...] = ()
     max_request_bytes: int = 8 * 1024 * 1024
@@ -151,6 +155,8 @@ class CloudConfig:
                 raise ValueError("gateway proof value must be a secret, not a placeholder")
         if not isinstance(self.require_verified_subject, bool):
             raise ValueError("require_verified_subject must be a boolean")
+        if not isinstance(self.allow_account_wipe, bool):
+            raise ValueError("allow_account_wipe must be a boolean")
         if any(
             not isinstance(origin, str) or not origin or "*" in origin
             for origin in self.allowed_origins
@@ -525,7 +531,13 @@ def _has_capability(credential: Any, capability: str) -> bool:
     return capability in granted
 
 
-def _writer_auth(state: CloudState, request: Request, *, capability: str) -> Any:
+def _writer_auth(
+    state: CloudState,
+    request: Request,
+    *,
+    capability: str,
+    writer_only: bool = False,
+) -> Any:
     """Authenticate a signing credential and assert one required capability.
 
     Both writer and paired-device credentials are resolvable here, and both
@@ -545,7 +557,7 @@ def _writer_auth(state: CloudState, request: Request, *, capability: str) -> Any
     if state.config.require_subscription and not subscription:
         raise HTTPException(status_code=401, detail="subscription authorization required")
     credential = state.credentials.authenticate_writer(credential_id, subscription)
-    if credential is None:
+    if credential is None and not writer_only:
         credential = state.credentials.authenticate_device(credential_id, subscription)
     if credential is None or not _has_capability(credential, capability):
         raise HTTPException(status_code=401, detail="writer authorization required")
@@ -1697,9 +1709,16 @@ def create_cloud_app(
             disabled public API before credential lookup, preserving the
             deployment-wide 503 admission contract.
             """
+            # Keep the capability dark until the deployment explicitly opts
+            # in.  This check must precede kill-state and credential handling:
+            # disabled and unknown routes have the same 404 contract.
+            if not config.allow_account_wipe:
+                raise HTTPException(status_code=404)
             _require_public_api_for_device_or_reader(state)
             try:
-                credential = _writer_auth(state, request, capability="write")
+                credential = _writer_auth(
+                    state, request, capability="write", writer_only=True
+                )
             except HTTPException:
                 # No target scope is supplied by the caller.  An unknown,
                 # revoked, malformed, or otherwise unauthenticated credential

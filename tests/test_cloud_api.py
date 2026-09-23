@@ -2,6 +2,7 @@ import base64
 import hashlib
 import hmac
 import json
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
@@ -38,6 +39,7 @@ from wattracker.cloud.security import (
     sign_request_ed25519,
 )
 from wattracker.cloud.storage import MemoryTenantStore
+from wattracker.cloud.wipe import ScopeWipeReport
 
 
 SECRET = b"cloud-test-server-secret-32-bytes-long"
@@ -98,6 +100,22 @@ def _wipe_headers(writer, *, nonce="wipe-1", timestamp=1_000):
         "X-Writer-Idempotency-Key": WIPE_IDEMPOTENCY_KEY,
         "X-Writer-Revision": "0",
         "X-Writer-Signature": sign_request(writer.signing_key, canonical),
+    }
+
+
+def _wipe_device_headers(device, private_key, *, nonce="device-wipe", timestamp=1_000):
+    canonical = canonical_request(
+        "POST", WIPE_PATH, device.namespace, timestamp, nonce,
+        digest_body(b""), WIPE_IDEMPOTENCY_KEY, "0",
+    )
+    return {
+        "Ocp-Apim-Subscription-Key": device.subscription_key.decode(),
+        "X-Writer-Credential": device.credential_id,
+        "X-Writer-Timestamp": str(timestamp),
+        "X-Writer-Nonce": nonce,
+        "X-Writer-Idempotency-Key": WIPE_IDEMPOTENCY_KEY,
+        "X-Writer-Revision": "0",
+        "X-Writer-Signature": sign_request_ed25519(private_key, canonical),
     }
 
 
@@ -735,6 +753,7 @@ def test_scope_wipe_uses_authenticated_scope_and_self_destructs_after_response_i
         server_secret=SECRET,
         operator_token="operator-token",
         plane="read",
+        allow_account_wipe=True,
         require_gateway_proof=False,
         require_verified_subject=False,
         clock=lambda: 1_000,
@@ -790,6 +809,7 @@ def test_scope_wipe_is_idempotent_and_allowed_during_write_shutdown():
         server_secret=SECRET,
         operator_token="operator-token",
         plane="read",
+        allow_account_wipe=True,
         require_gateway_proof=False,
         require_verified_subject=False,
         clock=lambda: 1_000,
@@ -813,6 +833,7 @@ def test_scope_wipe_is_idempotent_and_allowed_during_write_shutdown():
 
     assert first.status_code == second.status_code == 200
     assert first.json() == second.json() == {"wiped": True}
+    assert state.quotas.kill_state().writes_enabled is False
 
 
 def test_scope_wipe_refuses_when_public_api_is_disabled():
@@ -820,6 +841,7 @@ def test_scope_wipe_refuses_when_public_api_is_disabled():
         server_secret=SECRET,
         operator_token="operator-token",
         plane="read",
+        allow_account_wipe=True,
         require_gateway_proof=False,
         require_verified_subject=False,
         clock=lambda: 1_000,
@@ -852,7 +874,7 @@ def test_scope_wipe_requires_authentication_and_is_not_exposed_on_sync_plane():
     with TestClient(read_app) as client:
         response = client.post(WIPE_PATH)
     assert response.status_code == 404
-    assert response.json() == {"detail": "not found"}
+    assert response.json() == {"detail": "Not Found"}
 
     sync_app = create_cloud_app(
         CloudConfig(
@@ -864,6 +886,187 @@ def test_scope_wipe_requires_authentication_and_is_not_exposed_on_sync_plane():
         )
     )
     assert WIPE_PATH not in {route.path for route in sync_app.routes}
+
+
+def test_scope_wipe_is_off_by_default_and_matches_unknown_route():
+    config = CloudConfig(
+        server_secret=SECRET,
+        operator_token="operator-token",
+        plane="read",
+        require_gateway_proof=False,
+        require_verified_subject=False,
+    )
+    state = CloudState.create(config, security_backend=MemorySecurityStateBackend())
+    writer = state.credentials.register_writer(
+        new_installation_id(), "rider", b"f" * 32, b"sub-f"
+    )
+    with TestClient(create_cloud_app(config, state=state)) as client:
+        gated = client.post(WIPE_PATH, headers=_wipe_headers(writer))
+        unknown = client.post("/api/v1/account/not-a-route")
+    assert (gated.status_code, gated.json(), gated.headers.get("cache-control")) == (
+        unknown.status_code, unknown.json(), unknown.headers.get("cache-control")
+    )
+    assert state.credentials.lookup_writer(writer.credential_id) is not None
+
+
+def test_scope_wipe_accepts_only_the_installation_writer_not_a_device():
+    config = CloudConfig(
+        server_secret=SECRET,
+        operator_token="operator-token",
+        plane="read",
+        allow_account_wipe=True,
+        require_gateway_proof=False,
+        require_verified_subject=False,
+        clock=lambda: 1_000,
+    )
+    state = CloudState.create(config, security_backend=MemorySecurityStateBackend())
+    writer = state.credentials.register_writer(
+        new_installation_id(), "rider", b"g" * 32, b"sub-g"
+    )
+    device, private_key = _device(state, scope=writer.local_user_scope)
+    # Put the device into the writer's namespace explicitly; a device from a
+    # different installation must not become a destructive signer either.
+    device = state.credentials.register_device_for_scope(
+        writer.namespace, writer.local_user_scope, device.verification_key,
+        subscription_key=device.subscription_key,
+    )
+    with TestClient(create_cloud_app(config, state=state)) as client:
+        response = client.post(
+            WIPE_PATH, headers=_wipe_device_headers(device, private_key)
+        )
+    assert response.status_code == 404
+    assert state.credentials.lookup_writer(writer.credential_id) is not None
+
+
+def test_scope_wipe_requires_write_capability(monkeypatch):
+    config = CloudConfig(
+        server_secret=SECRET,
+        operator_token="operator-token",
+        plane="read",
+        allow_account_wipe=True,
+        require_gateway_proof=False,
+        require_verified_subject=False,
+        clock=lambda: 1_000,
+    )
+    state = CloudState.create(config, security_backend=MemorySecurityStateBackend())
+    writer = state.credentials.register_writer(
+        new_installation_id(), "rider", b"h" * 32, b"sub-h"
+    )
+    monkeypatch.setattr(
+        state.credentials, "authenticate_writer",
+        lambda *_args: replace(writer, capabilities=frozenset({"read"})),
+    )
+    with TestClient(create_cloud_app(config, state=state)) as client:
+        response = client.post(WIPE_PATH, headers=_wipe_headers(writer))
+    assert response.status_code == 404
+    assert state.credentials.lookup_writer(writer.credential_id) is not None
+
+
+def test_scope_wipe_bad_auth_is_404_not_401():
+    config = CloudConfig(
+        server_secret=SECRET,
+        operator_token="operator-token",
+        plane="read",
+        allow_account_wipe=True,
+        require_gateway_proof=False,
+        require_verified_subject=False,
+        clock=lambda: 1_000,
+    )
+    state = CloudState.create(config, security_backend=MemorySecurityStateBackend())
+    with TestClient(create_cloud_app(config, state=state)) as client:
+        response = client.post(WIPE_PATH, headers={"X-Writer-Credential": "bad"})
+    assert response.status_code == 404
+    assert response.json() == {"detail": "not found"}
+
+
+def test_scope_wipe_refuses_an_incomplete_report(monkeypatch):
+    config = CloudConfig(
+        server_secret=SECRET,
+        operator_token="operator-token",
+        plane="read",
+        allow_account_wipe=True,
+        require_gateway_proof=False,
+        require_verified_subject=False,
+        clock=lambda: 1_000,
+    )
+    state = CloudState.create(config, security_backend=MemorySecurityStateBackend())
+    writer = state.credentials.register_writer(
+        new_installation_id(), "rider", b"i" * 32, b"sub-i"
+    )
+    monkeypatch.setattr(
+        "wattracker.cloud.api.wipe_scope",
+        lambda *args, **kwargs: ScopeWipeReport(
+            namespace=writer.namespace, local_user_scope=writer.local_user_scope,
+            complete=False,
+        ),
+    )
+    with TestClient(create_cloud_app(config, state=state)) as client:
+        response = client.post(WIPE_PATH, headers=_wipe_headers(writer))
+    assert response.status_code == 503
+    assert state.credentials.lookup_writer(writer.credential_id) is not None
+
+
+def test_scope_wipe_exception_is_not_swallowed_as_success(monkeypatch):
+    config = CloudConfig(
+        server_secret=SECRET,
+        operator_token="operator-token",
+        plane="read",
+        allow_account_wipe=True,
+        require_gateway_proof=False,
+        require_verified_subject=False,
+        clock=lambda: 1_000,
+    )
+    state = CloudState.create(config, security_backend=MemorySecurityStateBackend())
+    writer = state.credentials.register_writer(
+        new_installation_id(), "rider", b"j" * 32, b"sub-j"
+    )
+    def fail(*args, **kwargs):
+        raise RuntimeError("backend failure")
+    monkeypatch.setattr("wattracker.cloud.api.wipe_scope", fail)
+    with TestClient(create_cloud_app(config, state=state)) as client:
+        response = client.post(WIPE_PATH, headers=_wipe_headers(writer))
+    assert response.status_code == 503
+    assert state.credentials.lookup_writer(writer.credential_id) is not None
+
+
+def test_scope_wipe_recreates_a_clean_scope_after_two_installation_isolation():
+    config = CloudConfig(
+        server_secret=SECRET,
+        operator_token="operator-token",
+        plane="all",
+        allow_account_wipe=True,
+        require_gateway_proof=False,
+        require_verified_subject=False,
+        clock=lambda: 1_000,
+    )
+    backend = MemorySecurityStateBackend()
+    store = MemoryTenantStore()
+    state = CloudState.create(config, store=store, security_backend=backend)
+    installation = new_installation_id()
+    writer = state.credentials.register_writer(installation, "rider", b"k" * 32, b"sub-k")
+    other = state.credentials.register_writer(
+        new_installation_id(), "rider", b"l" * 32, b"sub-l"
+    )
+    store.apply(writer.namespace, writer.local_user_scope, SyncBatch(
+        batch_id="old", revision=1,
+        objects=(CloudObject(object_id="old", kind="activity", revision=1, data={}),),
+    ))
+    body = _batch(batch_id="new")
+    with TestClient(create_cloud_app(config, state=state)) as client:
+        wiped = client.post(WIPE_PATH, headers=_wipe_headers(writer))
+        assert wiped.status_code == 200
+        replacement = state.credentials.register_writer(
+            installation, "rider", b"m" * 32, b"sub-m"
+        )
+        synced = client.post(
+            "/api/v1/sync/batches",
+            content=body,
+            headers=_headers(replacement, body, nonce="new", revision=1, idem="new"),
+        )
+    assert synced.status_code == 200
+    assert store.get(writer.namespace, writer.local_user_scope, "old") is None
+    assert store.get(replacement.namespace, replacement.local_user_scope, "activity-1") is not None
+    assert state.credentials.lookup_writer(other.credential_id) is not None
 
 
 def test_local_app_is_not_modified_or_cloud_dependent():

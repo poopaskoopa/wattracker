@@ -22,6 +22,7 @@ from .credentials import CloudCredentialStore, CloudCredentialUnavailable, Keyri
 from .security import PublicKeyUnavailable
 from .snapshot import (
     SnapshotError,
+    clear_snapshot_publication,
     pending_snapshot_objects,
     snapshot_change_token,
 )
@@ -508,18 +509,30 @@ class DesktopCloudSync:
             result = self._client(user_id).wipe_scope()
         except Exception:
             return None
-        if result is not True:
+        if result not in (True, False):
             return result
-        # Stop local publication before removing the credential that signs it.
-        # A successful remote wipe is irreversible; this local cleanup is the
-        # only safe follow-up and is never attempted after an ambiguous result.
+        # A 404 means the server no longer recognizes this writer.  Treat it
+        # as a revoked local credential, while retaining False so the UI can
+        # tell the rider that an operator may still need to finish the wipe.
+        # The same cleanup after success is what lets a later enrollment
+        # republish a clean scope instead of trusting stale acknowledgements.
+        cleanup_ok = True
         try:
             self.set_enabled(user_id, False)
+        except Exception:
+            cleanup_ok = False
+        try:
             self.credential_store.revoke_local_writer(user_id=user_id)
         except Exception:
-            return None
+            cleanup_ok = False
+        try:
+            clear_snapshot_publication(self.path, user_id)
+        except Exception:
+            cleanup_ok = False
+        with self._snapshot_gate_lock:
+            self._snapshot_gate_baseline.pop(user_id, None)
         self._devices_cache.pop(user_id, None)
-        return True
+        return result if cleanup_ok else None
 
     def request_sync(self, user_id: int) -> bool:
         """Wake the opt-in worker; this method performs no network I/O."""

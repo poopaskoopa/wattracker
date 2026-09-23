@@ -304,6 +304,21 @@ def test_cloud_wipe_does_not_retry_an_unconfirmed_request(client):
     assert [call[0] for call in sync.calls] == ["wipe"]
 
 
+def test_cloud_wipe_404_reports_operator_follow_up(client):
+    web, sync = client
+    sync.state.update(enabled=True, enrolled=True)
+    sync.wipe_result = False
+    response = web.post(
+        "/settings/cloud/wipe",
+        data={"confirmation": "DELETE ALL CLOUD DATA"},
+        follow_redirects=False,
+    )
+    assert response.status_code == 303
+    page = web.get(response.headers["location"])
+    assert "server credential is gone" in page.text
+    assert "operator can finish the wipe if data may remain" in page.text
+
+
 def test_expired_pairing_is_removed_from_server_state(client):
     web, sync = client
     sync.state["enabled"] = True

@@ -460,6 +460,43 @@ def test_cloud_wipe_uses_signed_empty_request_and_clears_local_credential(tmp_pa
     assert sign_request(credentials.signing_key, canonical) == headers["X-Writer-Signature"]
 
 
+def test_cloud_wipe_404_clears_local_credential_disables_sync_and_forces_republish(tmp_path):
+    path, user_id = _fixture_db(tmp_path, count=1)
+    credentials = _credentials()
+    calls = []
+
+    def transport(url, headers, body, method):
+        calls.append((method, url))
+        return 404, b'{"detail":"not found"}'
+
+    store = CloudCredentialStore(MemorySecrets())
+    store.save_writer(credentials, user_id=user_id)
+    db.save_cloud_sync_state(
+        user_id, {"endpoint": "https://cloud.example", "enabled": True}, path=str(path),
+    )
+    sync = DesktopCloudSync(str(path), store, transport=transport, include_derived=False)
+    assert sync.wipe_cloud_data(user_id) is False
+    assert store.load_writer(user_id=user_id) is None
+    assert not db.get_cloud_sync_state(user_id, path=str(path))["enabled"]
+
+    # A new enrollment can use the same local database and must publish the
+    # local snapshot again after the remote scope disappeared.
+    replacement = _credentials()
+    store.save_writer(replacement, user_id=user_id)
+    db.save_cloud_sync_state(user_id, {"enabled": True}, path=str(path))
+    payloads = []
+
+    def republish_transport(_url, _headers, body, _method):
+        payloads.append(body)
+        return 200, b'{"revision":1}'
+
+    sync.transport = republish_transport
+    sync._transport_accepts_method = True
+    results = sync.sync_once(user_id)
+    assert results and results[0].ok
+    assert payloads, "wipe must clear publication acknowledgements"
+
+
 def test_unchanged_sync_skips_snapshot_rebuild(tmp_path, monkeypatch):
     path, user_id = _fixture_db(tmp_path, count=1)
     store = CloudCredentialStore(MemorySecrets())

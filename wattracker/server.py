@@ -5056,7 +5056,10 @@ def create_app() -> FastAPI:
         if result is True:
             message = "Cloud data permanently deleted."
         elif result is False:
-            message = "Cloud data wipe was not completed. Check cloud settings before trying again."
+            message = (
+                "The server credential is gone and sync is disabled. "
+                "An operator can finish the wipe if data may remain."
+            )
         else:
             message = "Cloud data wipe could not be confirmed. Check cloud settings before trying again."
         return _cloud_settings_redirect(request, message)
