@@ -144,7 +144,7 @@ struct StreamSeries: Identifiable {
             guard let value, value.isFinite else { return nil }
             let time: Double
             if let times, index < times.count, let candidate = times[index], candidate.isFinite {
-                time = candidate
+                time = Double(index)
             } else { time = Double(index) }
             return StreamPoint(id: index, time: time, value: value)
         }
@@ -163,13 +163,13 @@ struct ZoneGroup: Identifiable {
             key, title in
             guard case let .array(values)? = value?[key]?["zones"] else { return nil }
             let rows = values.enumerated().compactMap { index, value -> ZoneRow? in
-                guard let seconds = value["seconds"]?.doubleValue, seconds > 0 else {
+                guard let seconds = value["seconds"]?.doubleValue, seconds >= 0 else {
                     return nil
                 }
                 return ZoneRow(
                     id: "\(key)-\(index)",
-                    label: value["label"]?.stringValue ?? "Z\(index + 1)",
-                    seconds: seconds, percent: value["percent"]?.doubleValue ?? 0
+                    label: value["label"]?.stringValue ?? "Z\(index + 2)",
+                    seconds: seconds, percent: 0
                 )
             }
             return rows.isEmpty ? nil : ZoneGroup(id: key, title: title, rows: rows)
@@ -197,10 +197,10 @@ enum RideFormatting {
 
     static func duration(_ seconds: Double?) -> String {
         guard let seconds, seconds.isFinite, seconds >= 0 else { return "—" }
-        let total = Int(seconds.rounded(.toNearestOrEven)), hours = total / 3_600
+        let total = Int(seconds.rounded()), hours = total / 3_600
         let minutes = (total % 3_600) / 60, remainder = total % 60
         return hours > 0 ? String(format: "%d:%02d:%02d", hours, minutes, remainder)
-            : String(format: "%02d:%02d", minutes, remainder)
+            : String(format: "%d:%02d", minutes, remainder)
     }
 
     static func distance(_ meters: Double?) -> String {
