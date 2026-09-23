@@ -291,6 +291,10 @@ actor CloudSession: ReadSession {
         // and not the credential is a cold start; the reverse is silent data
         // loss.
         cache.removeAll()
+        activityObjects.removeAll()
+        activityObjectLRU.removeAll()
+        activityObjectGenerations.removeAll()
+        activityCollectionRevisions.removeAll()
         try credentials.save(result.device)
         lifecycleGeneration += 1
         refreshTask = nil
@@ -320,6 +324,10 @@ actor CloudSession: ReadSession {
         lifecycleGeneration += 1
         credentials.clear()
         cache.removeAll()
+        activityObjects.removeAll()
+        activityObjectLRU.removeAll()
+        activityObjectGenerations.removeAll()
+        activityCollectionRevisions.removeAll()
         device = nil
         token = nil
         state = .unpaired
@@ -470,7 +478,8 @@ actor CloudSession: ReadSession {
         // detail/stream revisions. Generation invalidation is supplemented by
         // this five-minute age bound so an edit that changes only an object is
         // eventually observed.
-        if let cached = activityObjects[objectID] {
+        if let cached = activityObjects[objectID],
+           clock().timeIntervalSince(cached.storedAt) <= Self.activityObjectCacheLifetime {
             touchActivityObject(objectID)
             return cached.item
         }
@@ -527,7 +536,7 @@ actor CloudSession: ReadSession {
                 activityID: activityID, item: item, storedAt: clock()
             )
             touchActivityObject(objectID)
-            trimActivityObjectCache()
+            trimActivityObjectCache(excluding: objectID)
         }
         lastSuccessfulRead = clock()
         return item
@@ -538,12 +547,12 @@ actor CloudSession: ReadSession {
         activityObjectLRU.append(objectID)
     }
 
-    private func trimActivityObjectCache() {
+    private func trimActivityObjectCache(excluding insertedID: String) {
         while activityObjects.count > Self.activityObjectCacheCapacity {
             let streamID = activityObjectLRU.first {
-                activityObjects[$0]?.item.kind == .stream
+                $0 != insertedID && activityObjects[$0]?.item.kind == .stream
             }
-            let evictedID = streamID ?? activityObjectLRU.first!
+            let evictedID = streamID ?? activityObjectLRU.first { $0 != insertedID }!
             activityObjects.removeValue(forKey: evictedID)
             activityObjectLRU.removeAll { $0 == evictedID }
         }
@@ -569,7 +578,7 @@ actor CloudSession: ReadSession {
                     previousRevision ?? activity.revision, activity.revision
                 )
             }
-            if isNewerRevision && !activity.deleted {
+            if isNewerRevision {
                 let objectIDs = activityObjects.compactMap { pair in
                     pair.value.activityID == activityID ? pair.key : nil
                 }
