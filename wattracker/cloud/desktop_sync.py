@@ -501,6 +501,26 @@ class DesktopCloudSync:
         except Exception:
             return False
 
+    def wipe_cloud_data(self, user_id: int) -> Optional[bool]:
+        """Permanently remove the user's cloud scope, with no blind retry."""
+        user_id = self._user_id(user_id)
+        try:
+            result = self._client(user_id).wipe_scope()
+        except Exception:
+            return None
+        if result is not True:
+            return result
+        # Stop local publication before removing the credential that signs it.
+        # A successful remote wipe is irreversible; this local cleanup is the
+        # only safe follow-up and is never attempted after an ambiguous result.
+        try:
+            self.set_enabled(user_id, False)
+            self.credential_store.revoke_local_writer(user_id=user_id)
+        except Exception:
+            return None
+        self._devices_cache.pop(user_id, None)
+        return True
+
     def request_sync(self, user_id: int) -> bool:
         """Wake the opt-in worker; this method performs no network I/O."""
         user_id = self._user_id(user_id)

@@ -271,6 +271,20 @@
     {% endfor %}
     </tbody></table>
     {% endif %}
+    {% if cloud_sync.enrolled %}
+    <section class="cloud-wipe-settings" aria-labelledby="cloud-wipe-heading">
+        <h4 id="cloud-wipe-heading">Delete all cloud data</h4>
+        <p class="hint"><strong>This permanently destroys all data synced to the cloud</strong>
+           and all paired-device access. It is different from revoking a device:
+           revocation keeps your cloud data.</p>
+        <form method="post" action="/settings/cloud/wipe">
+            <label>Type <code>DELETE ALL CLOUD DATA</code> to confirm
+                <input type="text" name="confirmation" autocomplete="off"
+                       required></label>
+            <button type="submit" class="danger-btn">Delete all cloud data</button>
+        </form>
+    </section>
+    {% endif %}
     <form method="post" action="/settings/cloud/sync">
         <button type="submit" {% if not cloud_sync.enabled %}disabled{% endif %}>Sync now</button>
     </form>

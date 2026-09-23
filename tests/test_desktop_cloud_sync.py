@@ -427,6 +427,39 @@ def test_request_sync_only_enqueues_and_pairing_uses_exact_signed_routes(tmp_pat
     ]
 
 
+def test_cloud_wipe_uses_signed_empty_request_and_clears_local_credential(tmp_path):
+    path, user_id = _fixture_db(tmp_path, count=0)
+    credentials = _credentials()
+    captured = []
+
+    def transport(url, headers, body, method):
+        captured.append((method, url, headers, body))
+        return 200, b'{"wiped":true}'
+
+    store = CloudCredentialStore(MemorySecrets())
+    store.save_writer(credentials, user_id=user_id)
+    sync = DesktopCloudSync(str(path), store, transport=transport)
+    db.save_cloud_sync_state(
+        user_id, {"endpoint": "https://cloud.example", "enabled": True}, path=str(path),
+    )
+
+    assert sync.wipe_cloud_data(user_id) is True
+    assert store.load_writer(user_id=user_id) is None
+    assert db.get_cloud_sync_state(user_id, path=str(path))["enabled"] is False
+    assert [(method, url) for method, url, _headers, _body in captured] == [
+        ("POST", "https://cloud.example/api/v1/account/wipe"),
+    ]
+    method, _url, headers, body = captured[0]
+    canonical = canonical_request(
+        method, "/api/v1/account/wipe", credentials.namespace,
+        int(headers["X-Writer-Timestamp"]), headers["X-Writer-Nonce"],
+        digest_body(body), headers["X-Writer-Idempotency-Key"],
+        headers["X-Writer-Revision"],
+    )
+    assert body == b""
+    assert sign_request(credentials.signing_key, canonical) == headers["X-Writer-Signature"]
+
+
 def test_unchanged_sync_skips_snapshot_rebuild(tmp_path, monkeypatch):
     path, user_id = _fixture_db(tmp_path, count=1)
     store = CloudCredentialStore(MemorySecrets())
