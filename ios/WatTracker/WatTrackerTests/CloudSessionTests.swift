@@ -1369,9 +1369,7 @@ final class CloudSessionTests: XCTestCase {
                 return .json(#"{"id":"stream-17","kind":"stream","revision":1,"data":{"streams":{"time":[0]}}}"#)
             case "/api/v1/context/activities":
                 return .json(CloudFixtures.collection(
-                    items: [CloudFixtures.item(
-                        id: "activity-17", kind: "activity", revision: 2, data: #"{"tss":90}"#
-                    )],
+                    items: [#"{"id":"activity-17","kind":"activity","revision":2,"data":{"tss":90}}"#],
                     revision: 2
                 ))
             default:
@@ -1415,9 +1413,7 @@ final class CloudSessionTests: XCTestCase {
                 return .json(#"{"id":"activity-detail-17","kind":"activity_detail","revision":1,"data":{"id":17,"duration_s":1200}}"#)
             case "/api/v1/context/activities":
                 return .json(CloudFixtures.collection(
-                    items: [CloudFixtures.item(
-                        id: "activity-17", kind: "activity", revision: 2, data: #"{"tss":90}"#
-                    )],
+                    items: [#"{"id":"activity-17","kind":"activity","revision":2,"data":{"tss":90}}"#],
                     revision: 2
                 ))
             default:
