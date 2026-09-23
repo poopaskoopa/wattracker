@@ -65,6 +65,7 @@
 		1A00000000000000000001D0 /* ActivitiesModel.swift in Sources */ = {isa = PBXBuildFile; fileRef = 1A00000000000000000001B8 /* ActivitiesModel.swift */; };
 		1A00000000000000000001D1 /* ActivitiesModel.swift in Sources */ = {isa = PBXBuildFile; fileRef = 1A00000000000000000001B8 /* ActivitiesModel.swift */; };
 		1A00000000000000000001D2 /* ActivitiesModelTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 1A00000000000000000001B9 /* ActivitiesModelTests.swift */; };
+		1A00000000000000000001D3 /* RideDisplayTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 1A00000000000000000001BA /* RideDisplayTests.swift */; };
 		1A0000000000000000000201 /* MobileScreenData.swift in Sources */ = {isa = PBXBuildFile; fileRef = 1A0000000000000000000200 /* MobileScreenData.swift */; };
 		1A0000000000000000000202 /* MobileScreenDataTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 1A0000000000000000000203 /* MobileScreenDataTests.swift */; };
 		1A0000000000000000000204 /* MobileScreenData.swift in Sources */ = {isa = PBXBuildFile; fileRef = 1A0000000000000000000200 /* MobileScreenData.swift */; };
@@ -121,6 +122,7 @@
 		1A00000000000000000001B7 /* PairingTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PairingTests.swift; sourceTree = "<group>"; };
 		1A00000000000000000001B8 /* ActivitiesModel.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ActivitiesModel.swift; sourceTree = "<group>"; };
 		1A00000000000000000001B9 /* ActivitiesModelTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ActivitiesModelTests.swift; sourceTree = "<group>"; };
+		1A00000000000000000001BA /* RideDisplayTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RideDisplayTests.swift; sourceTree = "<group>"; };
 		1A0000000000000000000200 /* MobileScreenData.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MobileScreenData.swift; sourceTree = "<group>"; };
 		1A0000000000000000000203 /* MobileScreenDataTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MobileScreenDataTests.swift; sourceTree = "<group>"; };
 		1A0000000000000000000210 /* LocalBackend.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = LocalBackend.swift; sourceTree = "<group>"; };
@@ -212,6 +214,7 @@
 				1A00000000000000000001B6 /* SessionGateTests.swift */,
 				1A00000000000000000001B7 /* PairingTests.swift */,
 				1A00000000000000000001B9 /* ActivitiesModelTests.swift */,
+				1A00000000000000000001BA /* RideDisplayTests.swift */,
 				1A0000000000000000000203 /* MobileScreenDataTests.swift */,
 				1A0000000000000000000213 /* LocalBackendTests.swift */,
 			);
@@ -440,6 +443,7 @@
 				1A00000000000000000001CF /* Panel.swift in Sources */,
 				1A00000000000000000001D1 /* ActivitiesModel.swift in Sources */,
 				1A00000000000000000001D2 /* ActivitiesModelTests.swift in Sources */,
+				1A00000000000000000001D3 /* RideDisplayTests.swift in Sources */,
 				1A0000000000000000000212 /* LocalBackendTests.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;

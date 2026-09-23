@@ -334,9 +334,9 @@ private struct ZoneSection: View {
     }
 }
 
-private struct StreamPoint: Identifiable { let id: Int; let time: Double; let value: Double }
+struct StreamPoint: Identifiable { let id: Int; let time: Double; let value: Double }
 
-private struct StreamSeries: Identifiable {
+struct StreamSeries: Identifiable {
     let id: String
     let title: String
     let color: Color
@@ -370,7 +370,7 @@ private struct StreamSeries: Identifiable {
     }
 }
 
-private struct ZoneGroup: Identifiable {
+struct ZoneGroup: Identifiable {
     let id: String
     let title: String
     let rows: [ZoneRow]
@@ -394,7 +394,7 @@ private struct ZoneGroup: Identifiable {
     }
 }
 
-private struct ZoneRow: Identifiable {
+struct ZoneRow: Identifiable {
     let id: String; let label: String; let seconds: Double; let percent: Double
 }
 
