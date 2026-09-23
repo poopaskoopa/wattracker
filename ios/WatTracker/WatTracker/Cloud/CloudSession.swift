@@ -501,6 +501,7 @@ actor CloudSession: ReadSession {
     /// Retry failures use the same classification as the first read. Preserve
     /// cancellation so task cancellation remains observable to the caller.
     private func classifyActivityReadError(_ error: Error) throws -> Failure {
+        if error is CancellationError { throw error }
         guard let failure = error as? CloudClient.Failure else {
             return classify(error)
         }
