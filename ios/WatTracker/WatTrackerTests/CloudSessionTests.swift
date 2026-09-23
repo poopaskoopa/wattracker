@@ -1324,6 +1324,52 @@ final class CloudSessionTests: XCTestCase {
         XCTAssertEqual(reads.last?.bearerToken, "context-2")
     }
 
+    func testActivityObjectFirstAttemptCancellationPropagates() async throws {
+        let rig = harness { request, _ in
+            if request.url?.path == "/api/v1/context/refresh" {
+                return .json(CloudFixtures.refreshBody(context: "context-0"))
+            }
+            throw CancellationError()
+        }
+
+        do {
+            _ = try await rig.session.activityDetail(8)
+            XCTFail("expected cancellation")
+        } catch is CancellationError {
+            // The task's cancellation must not become a server failure.
+        }
+
+        XCTAssertEqual(
+            rig.transport.requests(matching: "/api/v1/context/activities/activity-detail-8").count,
+            1,
+            "a cancelled first attempt must not retry"
+        )
+    }
+
+    func testActivityObjectRetryCancellationPropagates() async throws {
+        let rig = harness { request, index in
+            if request.url?.path == "/api/v1/context/refresh" {
+                return .json(CloudFixtures.refreshBody(context: "context-\(index)"))
+            }
+            if index == 1 { return .refused(404) }
+            throw CancellationError()
+        }
+
+        do {
+            _ = try await rig.session.activityDetail(8)
+            XCTFail("expected cancellation")
+        } catch is CancellationError {
+            // The retry's cancellation must also remain observable.
+        }
+
+        let reads = rig.transport.requests(
+            matching: "/api/v1/context/activities/activity-detail-8"
+        )
+        XCTAssertEqual(reads.count, 2, "the cancellation is on the single 404 retry")
+        XCTAssertEqual(reads.first?.bearerToken, "context-0")
+        XCTAssertEqual(reads.last?.bearerToken, "context-2")
+    }
+
     func testARejectedContextRetryThrottleIsClassifiedAndSetsBackoff() async throws {
         let clock = TestClock()
         let rig = harness(clock: clock) { request, index in
