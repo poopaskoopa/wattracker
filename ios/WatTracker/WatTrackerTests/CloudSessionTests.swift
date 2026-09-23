@@ -1307,6 +1307,9 @@ final class CloudSessionTests: XCTestCase {
         let cap = 8
         let rig = harness { request, _ in
             let path = request.url?.path ?? ""
+            if path == "/api/v1/context/refresh" {
+                return .json(CloudFixtures.refreshBody(context: "context-1"))
+            }
             if path.contains("activity-detail-") {
                 let id = path.split(separator: "-").last!
                 return .json("""
@@ -1363,6 +1366,8 @@ final class CloudSessionTests: XCTestCase {
         )
         let rig = harness(cache: cache) { request, _ in
             switch request.url?.path {
+            case "/api/v1/context/refresh":
+                return .json(CloudFixtures.refreshBody(context: "context-1"))
             case "/api/v1/context/activities/activity-detail-17":
                 return .json(#"{"id":"activity-detail-17","kind":"activity_detail","revision":1,"data":{"id":17,"duration_s":1200}}"#)
             case "/api/v1/context/activities/stream-17":
@@ -1408,6 +1413,8 @@ final class CloudSessionTests: XCTestCase {
         )
         let rig = harness(cache: cache) { request, _ in
             switch request.url?.path {
+            case "/api/v1/context/refresh":
+                return .json(CloudFixtures.refreshBody(context: "context-1"))
             case "/api/v1/context/activities/activity-detail-17":
                 await detailGate.wait()
                 return .json(#"{"id":"activity-detail-17","kind":"activity_detail","revision":1,"data":{"id":17,"duration_s":1200}}"#)
