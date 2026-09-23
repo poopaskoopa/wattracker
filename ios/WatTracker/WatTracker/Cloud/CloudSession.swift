@@ -470,7 +470,7 @@ actor CloudSession: ReadSession {
         } catch {
             guard let failure = error as? CloudClient.Failure,
                   case .http(404, _, _, _) = failure else {
-                throw classifyActivityReadError(error)
+                throw try classifyActivityReadError(error)
             }
             let renewed = try await context(after: attempt.generation)
             do {
@@ -479,7 +479,7 @@ actor CloudSession: ReadSession {
                     lifecycleGeneration: generation, read: read
                 )
             } catch {
-                throw classifyActivityReadError(error)
+                throw try classifyActivityReadError(error)
             }
         }
     }
@@ -498,7 +498,10 @@ actor CloudSession: ReadSession {
         return item
     }
 
-    private func classifyActivityReadError(_ error: Error) -> Failure {
+    /// Retry failures use the same classification as the first read. Preserve
+    /// cancellation so task cancellation remains observable to the caller.
+    private func classifyActivityReadError(_ error: Error) throws -> Failure {
+        if error is CancellationError { throw error }
         guard let failure = error as? CloudClient.Failure else {
             return classify(error)
         }

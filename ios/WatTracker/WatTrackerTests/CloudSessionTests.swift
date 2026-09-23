@@ -1352,5 +1352,76 @@ final class CloudSessionTests: XCTestCase {
             }
             XCTAssertEqual(retryAfter, 30)
         }
+
+        XCTAssertEqual(
+            rig.transport.requests(matching: "/api/v1/context/activities/activity-detail-8").count,
+            2,
+            "the backoff gate must prevent a third detail read"
+        )
+    }
+
+    func testARejectedContextRetry404IsServerFailureAndReadsTwice() async throws {
+        let rig = harness { request, index in
+            if request.url?.path == "/api/v1/context/refresh" {
+                return .json(CloudFixtures.refreshBody(context: "context-\(index)"))
+            }
+            return .refused(404)
+        }
+
+        do {
+            _ = try await rig.session.activityDetail(8)
+            XCTFail("expected server failure")
+        } catch let failure as CloudSession.Failure {
+            guard case .server = failure else {
+                return XCTFail("expected server failure, got \(failure)")
+            }
+        }
+
+        XCTAssertEqual(
+            rig.transport.requests(matching: "/api/v1/context/activities/activity-detail-8").count,
+            2
+        )
+    }
+
+    func testActivityObject500DoesNotRetryAndIsServerFailure() async throws {
+        let rig = harness { request, index in
+            if request.url?.path == "/api/v1/context/refresh" {
+                return .json(CloudFixtures.refreshBody(context: "context-\(index)"))
+            }
+            return .refused(500)
+        }
+
+        do {
+            _ = try await rig.session.activityDetail(8)
+            XCTFail("expected server failure")
+        } catch let failure as CloudSession.Failure {
+            guard case .server = failure else {
+                return XCTFail("expected server failure, got \(failure)")
+            }
+        }
+
+        XCTAssertEqual(
+            rig.transport.requests(matching: "/api/v1/context/activities/activity-detail-8").count,
+            1
+        )
+    }
+
+    func testARejectedContextRetry503IsThrottled() async throws {
+        let rig = harness { request, index in
+            if request.url?.path == "/api/v1/context/refresh" {
+                return .json(CloudFixtures.refreshBody(context: "context-\(index)"))
+            }
+            return index == 1 ? .refused(404) : .refused(503, retryAfter: 30)
+        }
+
+        do {
+            _ = try await rig.session.activityDetail(8)
+            XCTFail("expected throttling")
+        } catch let failure as CloudSession.Failure {
+            guard case let .throttled(retryAfter) = failure else {
+                return XCTFail("expected throttled failure, got \(failure)")
+            }
+            XCTAssertEqual(retryAfter, 30)
+        }
     }
 }
