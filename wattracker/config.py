@@ -622,6 +622,17 @@ def allow_registration() -> bool:
     return raw in ("1", "true", "yes", "on")
 
 
+def desktop_cloud_wipe_enabled() -> bool:
+    """Whether the desktop exposes its destructive cloud-wipe control.
+
+    The cloud route has its own server-side opt-in.  This separate desktop
+    opt-in keeps the irreversible control out of the ordinary settings page
+    until the rider deliberately enables it on this machine.
+    """
+    raw = os.environ.get("WATTRACKER_DESKTOP_ALLOW_ACCOUNT_WIPE", "").strip().lower()
+    return raw in ("1", "true", "yes", "on")
+
+
 def server_host() -> str:
     """Validated bind host. Loopback-only unless explicitly opted out of."""
     raw = os.environ.get("WATTRACKER_HOST", "127.0.0.1").strip()

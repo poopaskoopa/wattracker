@@ -643,7 +643,7 @@ def test_sync_client_uses_bound_namespace_and_keeps_network_optional():
     assert offline.push(batch).detail.startswith("Cloud sync offline")
 
 
-def _configure_container_runtime(monkeypatch, plane):
+def _configure_container_runtime(monkeypatch, plane, *, allow_account_wipe=None):
     from wattracker.cloud import runtime
     from wattracker.cloud.security import MemorySecurityStateBackend
 
@@ -665,6 +665,10 @@ def _configure_container_runtime(monkeypatch, plane):
         "operator-token-0123456789abcdef0123456789",
     )
     monkeypatch.setenv("WATTRACKER_CLOUD_PLANE", plane)
+    if allow_account_wipe is None:
+        monkeypatch.delenv("WATTRACKER_CLOUD_ALLOW_ACCOUNT_WIPE", raising=False)
+    else:
+        monkeypatch.setenv("WATTRACKER_CLOUD_ALLOW_ACCOUNT_WIPE", allow_account_wipe)
     monkeypatch.setenv("WATTRACKER_STORAGE_ACCOUNT_NAME", "storageacct")
     monkeypatch.setenv("AZURE_CLIENT_ID", "user-assigned-client-id")
     monkeypatch.setattr(
@@ -727,6 +731,21 @@ def test_container_runtime_read_plane_does_not_open_replay_table(monkeypatch):
     assert table_names == ["CloudAuth", "CloudControl"]
     assert access_checks == [True, False]
     assert app.state.cloud.config.plane == "read"
+
+
+@pytest.mark.parametrize(
+    ("raw", "expected"),
+    [("", False), ("0", False), ("false", False), ("1", True)],
+)
+def test_container_runtime_parses_account_wipe_flag_via_factory(
+    monkeypatch, raw, expected
+):
+    app, _sentinel, _security_backend, _control_backend, _table_names, _access_checks = (
+        _configure_container_runtime(
+            monkeypatch, "read", allow_account_wipe=raw
+        )
+    )
+    assert app.state.cloud.config.allow_account_wipe is expected
 
 
 def test_batch_schema_rejects_paths_urls_commands_and_duplicates():
