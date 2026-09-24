@@ -184,7 +184,7 @@ struct ZoneRow: Identifiable {
     let label: String
     let seconds: Double
     let percent: Double
-    let duration: String? = nil
+    let duration: String?
 
     init(id: String, label: String, seconds: Double, percent: Double, duration: String? = nil) {
         self.id = id
