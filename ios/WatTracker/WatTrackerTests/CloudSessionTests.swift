@@ -1558,6 +1558,63 @@ final class CloudSessionTests: XCTestCase {
         ).count, 2)
     }
 
+    func testTombstoneAtAlreadySeenRevisionStillInvalidates() async throws {
+        let rig = harness { request, _ in
+            switch request.url?.path {
+            case "/api/v1/context/refresh":
+                return .json(CloudFixtures.refreshBody(context: "context-1"))
+            case "/api/v1/context/activities/activity-detail-17":
+                return .json(#"{"id":"activity-detail-17","kind":"activity_detail","revision":17,"data":{"id":17,"duration_s":1200}}"#)
+            case "/api/v1/context/activities/stream-17":
+                return .json(#"{"id":"stream-17","kind":"stream","revision":17,"data":{"streams":{"time":[0]}}}"#)
+            case "/api/v1/context/activities":
+                if request.url?.query?.contains("since=1") == true {
+                    return .json(CloudFixtures.collection(
+                        items: [CloudFixtures.tombstone(
+                            id: "activity-17", kind: "activity", revision: 1
+                        )],
+                        revision: 1
+                    ))
+                }
+                return .json(CloudFixtures.collection(
+                    items: [#"{"id":"activity-17","kind":"activity","revision":1,"data":{"tss":80}}"#],
+                    revision: 1
+                ))
+            default:
+                return .refused(404)
+            }
+        }
+
+        let initial = try await rig.session.load(.activities)
+        XCTAssertEqual(initial.revision, 1)
+        _ = try await rig.session.activityDetail(17)
+        _ = try await rig.session.activityStreams(17)
+        XCTAssertEqual(rig.transport.requests(
+            matching: "/api/v1/context/activities/activity-detail-17"
+        ).count, 1)
+        XCTAssertEqual(rig.transport.requests(
+            matching: "/api/v1/context/activities/stream-17"
+        ).count, 1)
+
+        let tombstoned = try await rig.session.load(.activities)
+        XCTAssertTrue(
+            tombstoned.items.isEmpty,
+            "a tombstone delivered at the same revision already seen still removes the cached activity"
+        )
+        XCTAssertEqual(tombstoned.revision, 1)
+        _ = try await rig.session.activityDetail(17)
+        _ = try await rig.session.activityStreams(17)
+
+        XCTAssertEqual(rig.transport.requests(
+            matching: "/api/v1/context/activities/activity-detail-17"
+        ).count, 2,
+        "the cached detail must be refetched, never served from cache, after a same-revision tombstone")
+        XCTAssertEqual(rig.transport.requests(
+            matching: "/api/v1/context/activities/stream-17"
+        ).count, 2,
+        "the cached streams must be refetched, never served from cache, after a same-revision tombstone")
+    }
+
     func testActivitiesRefreshAtUnchangedRevisionKeepsCachedActivityObjects() async throws {
         let rig = harness { request, _ in
             switch request.url?.path {
