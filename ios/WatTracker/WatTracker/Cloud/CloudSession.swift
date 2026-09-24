@@ -595,7 +595,7 @@ actor CloudSession: ReadSession {
     private func classifyActivityReadError(_ error: Error) throws -> Failure {
         if error is CancellationError { throw error }
         guard let failure = error as? CloudClient.Failure else {
-            return classify(error)
+            return .server(.malformedResponse("\(type(of: error))"))
         }
         guard case let .http(status, _, retryAfter, _) = failure else {
             return .server(failure)
