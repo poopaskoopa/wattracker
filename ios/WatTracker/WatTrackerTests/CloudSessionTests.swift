@@ -1820,6 +1820,31 @@ final class CloudSessionTests: XCTestCase {
         XCTAssertEqual(reads.last?.bearerToken, "context-2")
     }
 
+    func testActivityObjectRetryURLErrorIsOffline() async throws {
+        let rig = harness { request, index in
+            if request.url?.path == "/api/v1/context/refresh" {
+                return .json(CloudFixtures.refreshBody(context: "context-\(index)"))
+            }
+            if index == 1 { return .refused(404) }
+            throw URLError(.notConnectedToInternet)
+        }
+
+        do {
+            _ = try await rig.session.activityDetail(8)
+            XCTFail("expected offline failure")
+        } catch let failure as CloudSession.Failure {
+            guard case .offline = failure else {
+                return XCTFail("expected offline failure, got \(failure)")
+            }
+        }
+
+        XCTAssertEqual(
+            rig.transport.requests(matching: "/api/v1/context/activities/activity-detail-8").count,
+            2,
+            "the offline error is on the single 404 retry"
+        )
+    }
+
     func testARejectedContextRetryThrottleIsClassifiedAndSetsBackoff() async throws {
         let clock = TestClock()
         let rig = harness(clock: clock) { request, index in
