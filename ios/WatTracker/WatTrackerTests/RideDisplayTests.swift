@@ -37,6 +37,12 @@ final class RideDisplayTests: XCTestCase {
         XCTAssertEqual(ZoneFormatting.duration(row.seconds), "5:09")
         XCTAssertEqual(row.durationText, "5:09")
         XCTAssertEqual(RideFormatting.duration(row.seconds), "05:09")
+
+        // Desktop rounds half to even: `int(round(seconds))` in Python 3.
+        XCTAssertEqual(ZoneFormatting.duration(2.5), "0:02")
+        XCTAssertEqual(ZoneFormatting.duration(0.5), "0:00")
+        XCTAssertEqual(ZoneFormatting.duration(59.5), "1:00")
+        XCTAssertEqual(ZoneFormatting.duration(3725), "1:02:05")
     }
 
     func testStreamsDropGapsAndUseTimeChannelWhenPresent() {
