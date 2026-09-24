@@ -52,6 +52,7 @@ from .security import (
     verify_signature,
 )
 from .storage import MAX_QUERY_LIMIT, MemoryTenantStore, StorageConflict, StaleRevision
+from .wipe import wipe_scope
 
 _NOT_FOUND_BODY = {"detail": "not found"}
 _MAX_TIMESTAMP = 60 * 5
@@ -84,6 +85,11 @@ _DEVICE_LIST_REVISION = 0
 _DEVICE_REVOKE_IDEMPOTENCY_KEY = "device-revoke"
 _DEVICE_REVOKE_REVISION = 0
 _MAX_DEVICE_ADMIN_BODY_BYTES = 4 * 1024
+# A wipe carries no caller-selected data.  Its fixed signed envelope prevents
+# a request body, header, or path segment from becoming a scope selector.
+_WIPE_IDEMPOTENCY_KEY = "account-wipe"
+_WIPE_REVISION = 0
+_WIPE_PATH = "/api/v1/account/wipe"
 # A credential id is 32 bytes of hex.  The path parameter is bounded before it
 # reaches the registry so an enormous path cannot be used to probe anything.
 _MAX_CREDENTIAL_ID_CHARS = 64
@@ -107,6 +113,10 @@ class CloudConfig:
     # one deployment and forgeable in another, with nothing at startup telling
     # them apart, is the failure mode this flag exists to remove.
     require_verified_subject: bool = True
+    # Account wipe is an operator-enabled destructive capability.  The route
+    # remains indistinguishable from an unknown route until the deployment has
+    # explicitly granted the identity the deletes the wipe needs.
+    allow_account_wipe: bool = False
     subscription_header: str = "Ocp-Apim-Subscription-Key"
     allowed_origins: tuple[str, ...] = ()
     max_request_bytes: int = 8 * 1024 * 1024
@@ -145,6 +155,8 @@ class CloudConfig:
                 raise ValueError("gateway proof value must be a secret, not a placeholder")
         if not isinstance(self.require_verified_subject, bool):
             raise ValueError("require_verified_subject must be a boolean")
+        if not isinstance(self.allow_account_wipe, bool):
+            raise ValueError("allow_account_wipe must be a boolean")
         if any(
             not isinstance(origin, str) or not origin or "*" in origin
             for origin in self.allowed_origins
@@ -519,7 +531,13 @@ def _has_capability(credential: Any, capability: str) -> bool:
     return capability in granted
 
 
-def _writer_auth(state: CloudState, request: Request, *, capability: str) -> Any:
+def _writer_auth(
+    state: CloudState,
+    request: Request,
+    *,
+    capability: str,
+    writer_only: bool = False,
+) -> Any:
     """Authenticate a signing credential and assert one required capability.
 
     Both writer and paired-device credentials are resolvable here, and both
@@ -539,7 +557,7 @@ def _writer_auth(state: CloudState, request: Request, *, capability: str) -> Any
     if state.config.require_subscription and not subscription:
         raise HTTPException(status_code=401, detail="subscription authorization required")
     credential = state.credentials.authenticate_writer(credential_id, subscription)
-    if credential is None:
+    if credential is None and not writer_only:
         credential = state.credentials.authenticate_device(credential_id, subscription)
     if credential is None or not _has_capability(credential, capability):
         raise HTTPException(status_code=401, detail="writer authorization required")
@@ -1675,6 +1693,89 @@ def create_cloud_app(
                 media_type="application/json",
                 headers={"Cache-Control": "no-store"},
             )
+
+        async def wipe_account(request: Request) -> Response:
+            """Permanently delete the authenticated writer's cloud scope.
+
+            The caller's writer credential is one of the rows deleted by the
+            operation.  Authentication therefore happens first, while the
+            success response is fully constructed before ``wipe_scope`` is
+            called.  A client that loses the connection must re-check its
+            state; this route never retries a destructive request itself.
+
+            This is admitted while writes are disabled because deletion does
+            not spend the write budget.  ``_writer_auth`` still rejects a
+            disabled public API before credential lookup, preserving the
+            deployment-wide 503 admission contract.
+            """
+            # Keep the capability dark until the deployment explicitly opts
+            # in.  The route is also omitted from the app below so every HTTP
+            # method has unknown-route behavior while the flag is off.
+            if not config.allow_account_wipe:
+                raise HTTPException(status_code=404)
+            _require_public_api_for_device_or_reader(state)
+            try:
+                credential = _writer_auth(
+                    state, request, capability="write", writer_only=True
+                )
+            except HTTPException:
+                # No target scope is supplied by the caller.  An unknown,
+                # revoked, malformed, or otherwise unauthenticated credential
+                # is therefore one indistinguishable not-found result, never a
+                # 403 oracle about another rider's data.
+                return _not_found()
+
+            try:
+                body = await _bounded_body(request, _MAX_DEVICE_ADMIN_BODY_BYTES)
+            except HTTPException:
+                return _not_found()
+            if body:
+                return _not_found()
+            verified = _verified_scope(
+                state,
+                request,
+                credential,
+                b"",
+                idempotency_key=_WIPE_IDEMPOTENCY_KEY,
+                revision=_WIPE_REVISION,
+            )
+            if verified is None:
+                return _not_found()
+            namespace, scope = verified
+
+            security_backend = getattr(state.credentials, "_backend", None)
+            if security_backend is None:
+                # Without the durable auth backend the library can purge
+                # objects but cannot remove the in-memory caller credential.
+                # Refuse rather than claim that a self-destruct completed.
+                return _error(503, "cloud wipe unavailable")
+
+            # Construct this before deleting credentials.  In particular, do
+            # not serialize the credential or report after the self-destruct.
+            success = Response(
+                b'{"wiped":true}',
+                media_type="application/json",
+                headers={"Cache-Control": "no-store"},
+            )
+            try:
+                report = wipe_scope(
+                    namespace,
+                    scope,
+                    irreversible=True,
+                    store=state.store,
+                    security_backend=security_backend,
+                )
+            except Exception:
+                # A partial or unavailable destructive operation must not be
+                # reported as success and must not expose storage details.
+                return _error(503, "cloud wipe unavailable")
+            if not report.complete:
+                return _error(503, "cloud wipe incomplete")
+            _sweep_expired_auth_state(state)
+            return success
+
+        if config.allow_account_wipe:
+            app.post(_WIPE_PATH)(wipe_account)
 
         @app.get("/api/v1/context")
         async def context(request: Request) -> Response:

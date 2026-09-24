@@ -427,6 +427,114 @@ def test_request_sync_only_enqueues_and_pairing_uses_exact_signed_routes(tmp_pat
     ]
 
 
+def test_cloud_wipe_uses_signed_empty_request_and_clears_local_credential(tmp_path):
+    path, user_id = _fixture_db(tmp_path, count=0)
+    credentials = _credentials()
+    captured = []
+
+    def transport(url, headers, body, method):
+        captured.append((method, url, headers, body))
+        return 200, b'{"wiped":true}'
+
+    store = CloudCredentialStore(MemorySecrets())
+    store.save_writer(credentials, user_id=user_id)
+    sync = DesktopCloudSync(str(path), store, transport=transport)
+    db.save_cloud_sync_state(
+        user_id, {"endpoint": "https://cloud.example", "enabled": True}, path=str(path),
+    )
+
+    assert sync.wipe_cloud_data(user_id) is True
+    assert store.load_writer(user_id=user_id) is None
+    assert db.get_cloud_sync_state(user_id, path=str(path))["enabled"] is False
+    assert [(method, url) for method, url, _headers, _body in captured] == [
+        ("POST", "https://cloud.example/api/v1/account/wipe"),
+    ]
+    method, _url, headers, body = captured[0]
+    canonical = canonical_request(
+        method, "/api/v1/account/wipe", credentials.namespace,
+        int(headers["X-Writer-Timestamp"]), headers["X-Writer-Nonce"],
+        digest_body(body), headers["X-Writer-Idempotency-Key"],
+        headers["X-Writer-Revision"],
+    )
+    assert body == b""
+    assert sign_request(credentials.signing_key, canonical) == headers["X-Writer-Signature"]
+
+
+def test_cloud_wipe_404_clears_local_credential_disables_sync_and_forces_republish(tmp_path):
+    path, user_id = _fixture_db(tmp_path, count=1)
+    credentials = _credentials()
+    calls = []
+
+    def transport(url, headers, body, method):
+        calls.append((method, url))
+        return 404, b'{"detail":"not found"}'
+
+    store = CloudCredentialStore(MemorySecrets())
+    store.save_writer(credentials, user_id=user_id)
+    db.save_cloud_sync_state(
+        user_id, {"endpoint": "https://cloud.example", "enabled": True}, path=str(path),
+    )
+    sync = DesktopCloudSync(str(path), store, transport=transport, include_derived=False)
+    assert sync.wipe_cloud_data(user_id) is False
+    assert store.load_writer(user_id=user_id) is None
+    assert not db.get_cloud_sync_state(user_id, path=str(path))["enabled"]
+
+    # A new enrollment can use the same local database and must publish the
+    # local snapshot again after the remote scope disappeared.
+    replacement = _credentials()
+    store.save_writer(replacement, user_id=user_id)
+    db.save_cloud_sync_state(user_id, {"enabled": True}, path=str(path))
+    payloads = []
+
+    def republish_transport(_url, _headers, body, _method):
+        payloads.append(body)
+        return 200, b'{"revision":1}'
+
+    sync.transport = republish_transport
+    sync._transport_accepts_method = True
+    results = sync.sync_once(user_id)
+    assert results and results[0].ok
+    assert payloads, "wipe must clear publication acknowledgements"
+
+
+def test_cloud_wipe_503_keeps_local_writer_and_sync_enabled(tmp_path):
+    path, user_id = _fixture_db(tmp_path, count=0)
+    credentials = _credentials()
+
+    store = CloudCredentialStore(MemorySecrets())
+    store.save_writer(credentials, user_id=user_id)
+    db.save_cloud_sync_state(
+        user_id, {"endpoint": "https://cloud.example", "enabled": True}, path=str(path),
+    )
+    sync = DesktopCloudSync(
+        str(path), store,
+        transport=lambda *_args: (503, b'{"detail":"unavailable"}'),
+    )
+
+    assert sync.wipe_cloud_data(user_id) is None
+    assert store.load_writer(user_id=user_id) is not None
+    assert db.get_cloud_sync_state(user_id, path=str(path))["enabled"] is True
+
+
+def test_cloud_wipe_transport_exception_keeps_local_writer_and_sync_enabled(tmp_path):
+    path, user_id = _fixture_db(tmp_path, count=0)
+    credentials = _credentials()
+
+    def transport(*_args):
+        raise OSError("network unavailable")
+
+    store = CloudCredentialStore(MemorySecrets())
+    store.save_writer(credentials, user_id=user_id)
+    db.save_cloud_sync_state(
+        user_id, {"endpoint": "https://cloud.example", "enabled": True}, path=str(path),
+    )
+    sync = DesktopCloudSync(str(path), store, transport=transport)
+
+    assert sync.wipe_cloud_data(user_id) is None
+    assert store.load_writer(user_id=user_id) is not None
+    assert db.get_cloud_sync_state(user_id, path=str(path))["enabled"] is True
+
+
 def test_unchanged_sync_skips_snapshot_rebuild(tmp_path, monkeypatch):
     path, user_id = _fixture_db(tmp_path, count=1)
     store = CloudCredentialStore(MemorySecrets())
