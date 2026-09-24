@@ -186,7 +186,7 @@ struct ZoneRow: Identifiable {
     let percent: Double
     let duration: String? = nil
 
-    var durationText: String { duration ?? ZoneFormatting.duration(seconds) }
+    var durationText: String { ZoneFormatting.duration(seconds) }
 }
 
 enum ZoneFormatting {
