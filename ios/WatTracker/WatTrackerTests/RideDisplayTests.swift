@@ -31,6 +31,14 @@ final class RideDisplayTests: XCTestCase {
         XCTAssertEqual(RideFormatting.watts(nil), "—")
     }
 
+    func testZoneDurationUsesZoneFormatterNotRideCardPadding() {
+        let row = ZoneRow(id: "power-1", label: "Z1", seconds: 309, percent: 100)
+        // Desktop zone rows use wattracker/analysis/zones.py:55-59.
+        XCTAssertEqual(ZoneFormatting.duration(row.seconds), "5:09")
+        XCTAssertEqual(row.durationText, "5:09")
+        XCTAssertEqual(RideFormatting.duration(row.seconds), "05:09")
+    }
+
     func testStreamsDropGapsAndUseTimeChannelWhenPresent() {
         let channels = ActivityStreams.Channels(
             time: nil, power: [0, nil, .infinity],

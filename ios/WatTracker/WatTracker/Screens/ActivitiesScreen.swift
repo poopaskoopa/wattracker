@@ -320,7 +320,7 @@ private struct ZoneSection: View {
                         HStack {
                             Text(row.label).foregroundStyle(Palette.text)
                             Spacer()
-                            Text(RideFormatting.duration(row.seconds))
+                            Text(row.durationText)
                                 .monospacedDigit().foregroundStyle(Palette.muted)
                             Text("\(Int(row.percent.rounded()))%")
                                 .monospacedDigit().frame(width: 42, alignment: .trailing)

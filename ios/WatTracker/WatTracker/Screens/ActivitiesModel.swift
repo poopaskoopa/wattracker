@@ -179,6 +179,19 @@ struct ZoneGroup: Identifiable {
 
 struct ZoneRow: Identifiable {
     let id: String; let label: String; let seconds: Double; let percent: Double
+
+    var durationText: String { ZoneFormatting.duration(seconds) }
+}
+
+enum ZoneFormatting {
+    // Mirrors wattracker/analysis/zones.py:55-59: zone minutes are not padded.
+    static func duration(_ seconds: Double?) -> String {
+        guard let seconds, seconds.isFinite, seconds >= 0 else { return "—" }
+        let total = Int(seconds.rounded(.toNearestOrEven)), hours = total / 3_600
+        let minutes = (total % 3_600) / 60, remainder = total % 60
+        return hours > 0 ? String(format: "%d:%02d:%02d", hours, minutes, remainder)
+            : String(format: "%d:%02d", minutes, remainder)
+    }
 }
 
 enum RideFormatting {
