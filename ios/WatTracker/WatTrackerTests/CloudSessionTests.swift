@@ -1507,18 +1507,7 @@ final class CloudSessionTests: XCTestCase {
     }
 
     func testActivitiesTombstoneInvalidatesCachedDetailAndStreams() async throws {
-        let cache = MemorySnapshotCache()
-        cache.store(
-            CachedCollection(
-                revision: 1,
-                items: [CloudFixtures.item(
-                    id: "activity-17", kind: "activity", revision: 1, data: #"{"tss":80}"#
-                )],
-                storedAt: Date()
-            ),
-            for: .activities
-        )
-        let rig = harness(cache: cache) { request, _ in
+        let rig = harness { request, _ in
             switch request.url?.path {
             case "/api/v1/context/refresh":
                 return .json(CloudFixtures.refreshBody(context: "context-1"))
@@ -1527,17 +1516,25 @@ final class CloudSessionTests: XCTestCase {
             case "/api/v1/context/activities/stream-17":
                 return .json(#"{"id":"stream-17","kind":"stream","revision":17,"data":{"streams":{"time":[0]}}}"#)
             case "/api/v1/context/activities":
+                if request.url?.query?.contains("since=1") == true {
+                    return .json(CloudFixtures.collection(
+                        items: [CloudFixtures.tombstone(
+                            id: "activity-17", kind: "activity", revision: 2
+                        )],
+                        revision: 2
+                    ))
+                }
                 return .json(CloudFixtures.collection(
-                    items: [CloudFixtures.tombstone(
-                        id: "activity-17", kind: "activity", revision: 2
-                    )],
-                    revision: 2
+                    items: [#"{"id":"activity-17","kind":"activity","revision":1,"data":{"tss":80}}"#],
+                    revision: 1
                 ))
             default:
                 return .refused(404)
             }
         }
 
+        let initial = try await rig.session.load(.activities)
+        XCTAssertEqual(initial.revision, 1)
         _ = try await rig.session.activityDetail(17)
         _ = try await rig.session.activityStreams(17)
         XCTAssertEqual(rig.transport.requests(
@@ -1548,7 +1545,6 @@ final class CloudSessionTests: XCTestCase {
         ).count, 1)
 
         let tombstoned = try await rig.session.load(.activities)
-        XCTAssertEqual(rig.cache.load(.activities)?.revision, 2)
         XCTAssertTrue(tombstoned.items.isEmpty, "the newer tombstone removes the cached activity")
         XCTAssertEqual(tombstoned.revision, 2)
         _ = try await rig.session.activityDetail(17)
@@ -1563,18 +1559,7 @@ final class CloudSessionTests: XCTestCase {
     }
 
     func testActivitiesRefreshAtUnchangedRevisionKeepsCachedActivityObjects() async throws {
-        let cache = MemorySnapshotCache()
-        cache.store(
-            CachedCollection(
-                revision: 1,
-                items: [CloudFixtures.item(
-                    id: "activity-17", kind: "activity", revision: 1, data: #"{"tss":80}"#
-                )],
-                storedAt: Date()
-            ),
-            for: .activities
-        )
-        let rig = harness(cache: cache) { request, _ in
+        let rig = harness { request, _ in
             switch request.url?.path {
             case "/api/v1/context/refresh":
                 return .json(CloudFixtures.refreshBody(context: "context-1"))
