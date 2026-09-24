@@ -180,7 +180,7 @@ struct ZoneGroup: Identifiable {
 struct ZoneRow: Identifiable {
     let id: String; let label: String; let seconds: Double; let percent: Double
 
-    var durationText: String { RideFormatting.duration(seconds) }
+    var durationText: String { ZoneFormatting.duration(seconds) }
 }
 
 enum ZoneFormatting {
