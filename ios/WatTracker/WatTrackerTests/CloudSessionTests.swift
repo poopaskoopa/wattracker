@@ -1303,6 +1303,456 @@ final class CloudSessionTests: XCTestCase {
         )
     }
 
+    func testActivityObjectCacheEvictsStreamsBeforeDetailsAtItsCap() async throws {
+        let cap = 8
+        let rig = harness { request, _ in
+            let path = request.url?.path ?? ""
+            if path == "/api/v1/context/refresh" {
+                return .json(CloudFixtures.refreshBody(context: "context-1"))
+            }
+            if path.contains("activity-detail-") {
+                let id = path.split(separator: "-").last!
+                return .json("""
+                {"id":"activity-detail-\(id)","kind":"activity_detail","revision":\(id),
+                 "data":{"id":\(id),"duration_s":1200}}
+                """)
+            }
+            if path.contains("/stream-") {
+                return .json("""
+                {"id":"stream-\(path.split(separator: "-").last!)","kind":"stream","revision":1,
+                 "data":{"streams":{"time":[0]}}}
+                """)
+            }
+            return .refused(404)
+        }
+
+        _ = try await rig.session.activityDetail(1)
+        for activityID in 2...cap {
+            _ = try await rig.session.activityStreams(activityID)
+        }
+        _ = try await rig.session.activityStreams(2)
+        _ = try await rig.session.activityStreams(cap + 1)
+
+        _ = try await rig.session.activityDetail(1)
+        _ = try await rig.session.activityStreams(3)
+        XCTAssertEqual(
+            rig.transport.requests(matching: "/api/v1/context/activities/activity-detail-1").count,
+            1,
+            "the oldest detail survives while streams are evicted first"
+        )
+        XCTAssertEqual(
+            rig.transport.requests(matching: "/api/v1/context/activities/stream-3").count,
+            2,
+            "the least recently used stream is evicted at the cap"
+        )
+        XCTAssertEqual(
+            rig.transport.requests(matching: "/api/v1/context/activities/stream-2").count,
+            1,
+            "a stream cache hit refreshes its LRU position"
+        )
+    }
+
+    func testActivityObjectCacheHitRefreshesLRUPosition() async throws {
+        let cap = 8
+        let rig = harness { request, _ in
+            let path = request.url?.path ?? ""
+            if path == "/api/v1/context/refresh" {
+                return .json(CloudFixtures.refreshBody(context: "context-1"))
+            }
+            if path.contains("activity-detail-") {
+                let id = path.split(separator: "-").last!
+                return .json("""
+                {"id":"activity-detail-\(id)","kind":"activity_detail","revision":\(id),
+                 "data":{"id":\(id),"duration_s":1200}}
+                """)
+            }
+            return .refused(404)
+        }
+
+        for activityID in 1...cap {
+            _ = try await rig.session.activityDetail(activityID)
+        }
+        _ = try await rig.session.activityDetail(1)
+        _ = try await rig.session.activityDetail(cap + 1)
+
+        _ = try await rig.session.activityDetail(1)
+        _ = try await rig.session.activityDetail(2)
+        XCTAssertEqual(
+            rig.transport.requests(matching: "/api/v1/context/activities/activity-detail-1").count,
+            1,
+            "a detail cache hit moves it to the most-recently-used position"
+        )
+        XCTAssertEqual(
+            rig.transport.requests(matching: "/api/v1/context/activities/activity-detail-2").count,
+            2,
+            "the untouched detail is evicted instead"
+        )
+    }
+
+    func testActivityObjectCacheNeverEvictsTheInsertedStream() async throws {
+        let cap = 8
+        let rig = harness { request, _ in
+            let path = request.url?.path ?? ""
+            if path == "/api/v1/context/refresh" {
+                return .json(CloudFixtures.refreshBody(context: "context-1"))
+            }
+            if path.contains("activity-detail-") {
+                let id = path.split(separator: "-").last!
+                return .json("""
+                {"id":"activity-detail-\(id)","kind":"activity_detail","revision":\(id),
+                 "data":{"id":\(id),"duration_s":1200}}
+                """)
+            }
+            if path.contains("/stream-") {
+                return .json("""
+                {"id":"stream-\(path.split(separator: "-").last!)","kind":"stream","revision":1,
+                 "data":{"streams":{"time":[0]}}}
+                """)
+            }
+            return .refused(404)
+        }
+
+        for activityID in 1...cap {
+            _ = try await rig.session.activityDetail(activityID)
+        }
+        _ = try await rig.session.activityStreams(cap)
+        _ = try await rig.session.activityStreams(cap)
+
+        _ = try await rig.session.activityDetail(1)
+        XCTAssertEqual(
+            rig.transport.requests(matching: "/api/v1/context/activities/activity-detail-1").count,
+            2,
+            "when the inserted stream is the only stream, the LRU detail is evicted"
+        )
+        XCTAssertEqual(
+            rig.transport.requests(matching: "/api/v1/context/activities/stream-8").count,
+            1,
+            "the inserted stream remains cached"
+        )
+    }
+
+    func testActivityObjectCacheRereadsDetailAndStreamsAfterFiveMinutes() async throws {
+        let clock = TestClock()
+        let rig = harness(clock: clock) { request, _ in
+            switch request.url?.path {
+            case "/api/v1/context/refresh":
+                return .json(CloudFixtures.refreshBody(context: "context-1"))
+            case "/api/v1/context/activities/activity-detail-17":
+                return .json(#"{"id":"activity-detail-17","kind":"activity_detail","revision":1,"data":{"id":17,"duration_s":1200}}"#)
+            case "/api/v1/context/activities/stream-17":
+                return .json(#"{"id":"stream-17","kind":"stream","revision":1,"data":{"streams":{"time":[0]}}}"#)
+            default:
+                return .refused(404)
+            }
+        }
+
+        _ = try await rig.session.activityDetail(17)
+        _ = try await rig.session.activityStreams(17)
+        clock.advance(CloudSession.activityObjectCacheLifetime + 1)
+        _ = try await rig.session.activityDetail(17)
+        _ = try await rig.session.activityStreams(17)
+
+        XCTAssertEqual(rig.transport.requests(
+            matching: "/api/v1/context/activities/activity-detail-17"
+        ).count, 2)
+        XCTAssertEqual(rig.transport.requests(
+            matching: "/api/v1/context/activities/stream-17"
+        ).count, 2)
+    }
+
+    func testActivitiesRefreshInvalidatesCachedDetailAndStreamsAtNewerRevision() async throws {
+        let cache = MemorySnapshotCache()
+        cache.store(
+            CachedCollection(
+                revision: 1,
+                items: [CloudFixtures.item(
+                    id: "activity-17", kind: "activity", revision: 1, data: #"{"tss":80}"#
+                )],
+                storedAt: Date()
+            ),
+            for: .activities
+        )
+        let rig = harness(cache: cache) { request, _ in
+            switch request.url?.path {
+            case "/api/v1/context/refresh":
+                return .json(CloudFixtures.refreshBody(context: "context-1"))
+            case "/api/v1/context/activities/activity-detail-17":
+                return .json(#"{"id":"activity-detail-17","kind":"activity_detail","revision":1,"data":{"id":17,"duration_s":1200}}"#)
+            case "/api/v1/context/activities/stream-17":
+                return .json(#"{"id":"stream-17","kind":"stream","revision":1,"data":{"streams":{"time":[0]}}}"#)
+            case "/api/v1/context/activities":
+                return .json(CloudFixtures.collection(
+                    items: [#"{"id":"activity-17","kind":"activity","revision":2,"data":{"tss":90}}"#],
+                    revision: 2
+                ))
+            default:
+                return .refused(404)
+            }
+        }
+
+        _ = try await rig.session.activityDetail(17)
+        _ = try await rig.session.activityStreams(17)
+        _ = try await rig.session.load(.activities)
+        _ = try await rig.session.activityDetail(17)
+        _ = try await rig.session.activityStreams(17)
+
+        XCTAssertEqual(
+            rig.transport.requests(matching: "/api/v1/context/activities/activity-detail-17").count,
+            2
+        )
+        XCTAssertEqual(
+            rig.transport.requests(matching: "/api/v1/context/activities/stream-17").count,
+            2
+        )
+    }
+
+    func testActivitiesTombstoneInvalidatesCachedDetailAndStreams() async throws {
+        let rig = harness { request, _ in
+            switch request.url?.path {
+            case "/api/v1/context/refresh":
+                return .json(CloudFixtures.refreshBody(context: "context-1"))
+            case "/api/v1/context/activities/activity-detail-17":
+                return .json(#"{"id":"activity-detail-17","kind":"activity_detail","revision":17,"data":{"id":17,"duration_s":1200}}"#)
+            case "/api/v1/context/activities/stream-17":
+                return .json(#"{"id":"stream-17","kind":"stream","revision":17,"data":{"streams":{"time":[0]}}}"#)
+            case "/api/v1/context/activities":
+                if request.url?.query?.contains("since=1") == true {
+                    return .json(CloudFixtures.collection(
+                        items: [CloudFixtures.tombstone(
+                            id: "activity-17", kind: "activity", revision: 2
+                        )],
+                        revision: 2
+                    ))
+                }
+                return .json(CloudFixtures.collection(
+                    items: [#"{"id":"activity-17","kind":"activity","revision":1,"data":{"tss":80}}"#],
+                    revision: 1
+                ))
+            default:
+                return .refused(404)
+            }
+        }
+
+        let initial = try await rig.session.load(.activities)
+        XCTAssertEqual(initial.revision, 1)
+        _ = try await rig.session.activityDetail(17)
+        _ = try await rig.session.activityStreams(17)
+        XCTAssertEqual(rig.transport.requests(
+            matching: "/api/v1/context/activities/activity-detail-17"
+        ).count, 1)
+        XCTAssertEqual(rig.transport.requests(
+            matching: "/api/v1/context/activities/stream-17"
+        ).count, 1)
+
+        let tombstoned = try await rig.session.load(.activities)
+        XCTAssertTrue(tombstoned.items.isEmpty, "the newer tombstone removes the cached activity")
+        XCTAssertEqual(tombstoned.revision, 2)
+        _ = try await rig.session.activityDetail(17)
+        _ = try await rig.session.activityStreams(17)
+
+        XCTAssertEqual(rig.transport.requests(
+            matching: "/api/v1/context/activities/activity-detail-17"
+        ).count, 2)
+        XCTAssertEqual(rig.transport.requests(
+            matching: "/api/v1/context/activities/stream-17"
+        ).count, 2)
+    }
+
+    func testTombstoneAtAlreadySeenRevisionStillInvalidates() async throws {
+        let rig = harness { request, _ in
+            switch request.url?.path {
+            case "/api/v1/context/refresh":
+                return .json(CloudFixtures.refreshBody(context: "context-1"))
+            case "/api/v1/context/activities/activity-detail-17":
+                return .json(#"{"id":"activity-detail-17","kind":"activity_detail","revision":17,"data":{"id":17,"duration_s":1200}}"#)
+            case "/api/v1/context/activities/stream-17":
+                return .json(#"{"id":"stream-17","kind":"stream","revision":17,"data":{"streams":{"time":[0]}}}"#)
+            case "/api/v1/context/activities":
+                if request.url?.query?.contains("since=1") == true {
+                    return .json(CloudFixtures.collection(
+                        items: [CloudFixtures.tombstone(
+                            id: "activity-17", kind: "activity", revision: 1
+                        )],
+                        revision: 1
+                    ))
+                }
+                return .json(CloudFixtures.collection(
+                    items: [#"{"id":"activity-17","kind":"activity","revision":1,"data":{"tss":80}}"#],
+                    revision: 1
+                ))
+            default:
+                return .refused(404)
+            }
+        }
+
+        let initial = try await rig.session.load(.activities)
+        XCTAssertEqual(initial.revision, 1)
+        _ = try await rig.session.activityDetail(17)
+        _ = try await rig.session.activityStreams(17)
+        XCTAssertEqual(rig.transport.requests(
+            matching: "/api/v1/context/activities/activity-detail-17"
+        ).count, 1)
+        XCTAssertEqual(rig.transport.requests(
+            matching: "/api/v1/context/activities/stream-17"
+        ).count, 1)
+
+        let tombstoned = try await rig.session.load(.activities)
+        XCTAssertTrue(
+            tombstoned.items.isEmpty,
+            "a tombstone delivered at the same revision already seen still removes the cached activity"
+        )
+        XCTAssertEqual(tombstoned.revision, 1)
+        _ = try await rig.session.activityDetail(17)
+        _ = try await rig.session.activityStreams(17)
+
+        XCTAssertEqual(rig.transport.requests(
+            matching: "/api/v1/context/activities/activity-detail-17"
+        ).count, 2,
+        "the cached detail must be refetched, never served from cache, after a same-revision tombstone")
+        XCTAssertEqual(rig.transport.requests(
+            matching: "/api/v1/context/activities/stream-17"
+        ).count, 2,
+        "the cached streams must be refetched, never served from cache, after a same-revision tombstone")
+    }
+
+    func testActivitiesRefreshAtUnchangedRevisionKeepsCachedActivityObjects() async throws {
+        let rig = harness { request, _ in
+            switch request.url?.path {
+            case "/api/v1/context/refresh":
+                return .json(CloudFixtures.refreshBody(context: "context-1"))
+            case "/api/v1/context/activities/activity-detail-17":
+                return .json(#"{"id":"activity-detail-17","kind":"activity_detail","revision":1,"data":{"id":17,"duration_s":1200}}"#)
+            case "/api/v1/context/activities":
+                return .json(CloudFixtures.collection(
+                    items: [#"{"id":"activity-17","kind":"activity","revision":1,"data":{"tss":80}}"#],
+                    revision: 1
+                ))
+            default:
+                return .refused(404)
+            }
+        }
+
+        _ = try await rig.session.load(.activities)
+        _ = try await rig.session.activityDetail(17)
+        _ = try await rig.session.load(.activities)
+        _ = try await rig.session.activityDetail(17)
+
+        XCTAssertEqual(
+            rig.transport.requests(matching: "/api/v1/context/activities/activity-detail-17").count,
+            1,
+            "an unchanged activity revision does not invalidate its cached detail"
+        )
+    }
+
+    func testDirectRePairDoesNotServeCachedActivityObjectsToTheNewIdentity() async throws {
+        let rig = harness { request, _ in
+            switch request.url?.path {
+            case "/api/v1/context/refresh":
+                return .json(CloudFixtures.refreshBody(context: "context-old"))
+            case "/api/v1/devices/pair":
+                return .json(Self.differentPairingBody(context: "context-new"))
+            case "/api/v1/context/activities/activity-detail-17":
+                return .json(#"{"id":"activity-detail-17","kind":"activity_detail","revision":1,"data":{"id":17,"duration_s":1200}}"#)
+            case "/api/v1/context/activities/stream-17":
+                return .json(#"{"id":"stream-17","kind":"stream","revision":1,"data":{"streams":{"time":[0]}}}"#)
+            default:
+                return .refused(404)
+            }
+        }
+
+        _ = try await rig.session.activityDetail(17)
+        _ = try await rig.session.activityStreams(17)
+        _ = try await rig.session.pair(code: "REPLACE")
+        _ = try await rig.session.activityDetail(17)
+        _ = try await rig.session.activityStreams(17)
+
+        XCTAssertEqual(rig.transport.requests(
+            matching: "/api/v1/context/activities/activity-detail-17"
+        ).count, 2)
+        XCTAssertEqual(rig.transport.requests(
+            matching: "/api/v1/context/activities/stream-17"
+        ).count, 2)
+    }
+
+    func testSignOutThenRePairDoesNotServeCachedActivityObjectsToTheNewIdentity() async throws {
+        let rig = harness { request, _ in
+            switch request.url?.path {
+            case "/api/v1/context/refresh":
+                return .json(CloudFixtures.refreshBody(context: "context-old"))
+            case "/api/v1/devices/pair":
+                return .json(Self.differentPairingBody(context: "context-new"))
+            case "/api/v1/context/activities/activity-detail-17":
+                return .json(#"{"id":"activity-detail-17","kind":"activity_detail","revision":1,"data":{"id":17,"duration_s":1200}}"#)
+            case "/api/v1/context/activities/stream-17":
+                return .json(#"{"id":"stream-17","kind":"stream","revision":1,"data":{"streams":{"time":[0]}}}"#)
+            default:
+                return .refused(404)
+            }
+        }
+
+        _ = try await rig.session.activityDetail(17)
+        _ = try await rig.session.activityStreams(17)
+        await rig.session.signOut()
+        _ = try await rig.session.pair(code: "REPLACE")
+        _ = try await rig.session.activityDetail(17)
+        _ = try await rig.session.activityStreams(17)
+
+        XCTAssertEqual(rig.transport.requests(
+            matching: "/api/v1/context/activities/activity-detail-17"
+        ).count, 2)
+        XCTAssertEqual(rig.transport.requests(
+            matching: "/api/v1/context/activities/stream-17"
+        ).count, 2)
+    }
+
+    func testActivityReadHeldAcrossRefreshCannotRepopulateInvalidatedCache() async throws {
+        let detailGate = RequestGate()
+        let cache = MemorySnapshotCache()
+        cache.store(
+            CachedCollection(
+                revision: 1,
+                items: [CloudFixtures.item(
+                    id: "activity-17", kind: "activity", revision: 1, data: #"{"tss":80}"#
+                )],
+                storedAt: Date()
+            ),
+            for: .activities
+        )
+        let rig = harness(cache: cache) { request, _ in
+            switch request.url?.path {
+            case "/api/v1/context/refresh":
+                return .json(CloudFixtures.refreshBody(context: "context-1"))
+            case "/api/v1/context/activities/activity-detail-17":
+                await detailGate.wait()
+                return .json(#"{"id":"activity-detail-17","kind":"activity_detail","revision":1,"data":{"id":17,"duration_s":1200}}"#)
+            case "/api/v1/context/activities":
+                return .json(CloudFixtures.collection(
+                    items: [#"{"id":"activity-17","kind":"activity","revision":2,"data":{"tss":90}}"#],
+                    revision: 2
+                ))
+            default:
+                return .refused(404)
+            }
+        }
+
+        let heldRead = Task {
+            try await rig.session.activityDetail(17)
+        }
+        let arrivedAtGate = await detailGate.waitForArrival()
+        XCTAssertTrue(arrivedAtGate)
+
+        _ = try await rig.session.load(.activities)
+        await detailGate.openGate()
+        _ = try await heldRead.value
+
+        _ = try await rig.session.activityDetail(17)
+        XCTAssertEqual(
+            rig.transport.requests(matching: "/api/v1/context/activities/activity-detail-17").count,
+            2,
+            "the read resumed after invalidation and must not repopulate stale cache"
+        )
+    }
+
     func testARejectedContextRetriesAnActivityObjectOnceWithANewToken() async throws {
         let rig = harness { request, index in
             if request.url?.path == "/api/v1/context/refresh" {
