@@ -320,7 +320,7 @@ private struct ZoneSection: View {
                         HStack {
                             Text(row.label).foregroundStyle(Palette.text)
                             Spacer()
-                            Text(RideFormatting.duration(row.seconds))
+                            Text(row.durationText)
                                 .monospacedDigit().foregroundStyle(Palette.muted)
                             Text("\(Int(row.percent.rounded()))%")
                                 .monospacedDigit().frame(width: 42, alignment: .trailing)
@@ -331,107 +331,5 @@ private struct ZoneSection: View {
                 }
             }
         }
-    }
-}
-
-private struct StreamPoint: Identifiable { let id: Int; let time: Double; let value: Double }
-
-private struct StreamSeries: Identifiable {
-    let id: String
-    let title: String
-    let color: Color
-    let points: [StreamPoint]
-
-    static func all(in payload: ActivityStreams) -> [StreamSeries] {
-        let channels = payload.streams
-        return [
-            make("power", "Power (W)", Palette.accent, channels.power, channels.time),
-            make("heart-rate", "Heart rate (bpm)", Palette.hr, channels.heartrate, channels.time),
-            make("cadence", "Cadence (rpm)", Palette.ok, channels.cadence, channels.time),
-            make("altitude", "Altitude (m)", .cyan, channels.altitude, channels.time),
-        ].compactMap { $0 }
-    }
-
-    private static func make(
-        _ id: String, _ title: String, _ color: Color,
-        _ values: [Double?]?, _ times: [Double?]?
-    ) -> StreamSeries? {
-        guard let values else { return nil }
-        let points = values.enumerated().compactMap { index, value -> StreamPoint? in
-            guard let value, value.isFinite else { return nil }
-            let time: Double
-            if let times, index < times.count, let candidate = times[index], candidate.isFinite {
-                time = candidate
-            } else { time = Double(index) }
-            return StreamPoint(id: index, time: time, value: value)
-        }
-        guard !points.isEmpty else { return nil }
-        return StreamSeries(id: id, title: title, color: color, points: points)
-    }
-}
-
-private struct ZoneGroup: Identifiable {
-    let id: String
-    let title: String
-    let rows: [ZoneRow]
-
-    static func extract(from value: JSONValue?) -> [ZoneGroup] {
-        [("power", "Power zones"), ("heart_rate", "Heart-rate zones")].compactMap {
-            key, title in
-            guard case let .array(values)? = value?[key]?["zones"] else { return nil }
-            let rows = values.enumerated().compactMap { index, value -> ZoneRow? in
-                guard let seconds = value["seconds"]?.doubleValue, seconds > 0 else {
-                    return nil
-                }
-                return ZoneRow(
-                    id: "\(key)-\(index)",
-                    label: value["label"]?.stringValue ?? "Z\(index + 1)",
-                    seconds: seconds, percent: value["percent"]?.doubleValue ?? 0
-                )
-            }
-            return rows.isEmpty ? nil : ZoneGroup(id: key, title: title, rows: rows)
-        }
-    }
-}
-
-private struct ZoneRow: Identifiable {
-    let id: String; let label: String; let seconds: Double; let percent: Double
-}
-
-enum RideFormatting {
-    static func date(_ value: String?) -> String {
-        guard let value else { return "Unknown date" }
-        let fractional = ISO8601DateFormatter()
-        fractional.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
-        let parsed = fractional.date(from: value) ?? ISO8601DateFormatter().date(from: value)
-        guard let parsed else { return value.replacingOccurrences(of: "T", with: " ") }
-        return parsed.formatted(date: .abbreviated, time: .shortened)
-    }
-
-    static func relative(_ date: Date) -> String {
-        RelativeDateTimeFormatter().localizedString(for: date, relativeTo: Date())
-    }
-
-    static func duration(_ seconds: Double?) -> String {
-        guard let seconds, seconds.isFinite, seconds >= 0 else { return "—" }
-        let total = Int(seconds.rounded()), hours = total / 3_600
-        let minutes = (total % 3_600) / 60, remainder = total % 60
-        return hours > 0 ? String(format: "%d:%02d:%02d", hours, minutes, remainder)
-            : String(format: "%d:%02d", minutes, remainder)
-    }
-
-    static func distance(_ meters: Double?) -> String {
-        guard let meters, meters.isFinite else { return "—" }
-        return String(format: "%.1f km", meters / 1_000)
-    }
-
-    static func watts(_ value: Double?) -> String {
-        guard let value, value.isFinite else { return "—" }
-        return "\(Int(value.rounded())) W"
-    }
-
-    static func decimal(_ value: Double?, _ places: Int) -> String {
-        guard let value, value.isFinite else { return "—" }
-        return String(format: "%.*f", places, value)
     }
 }
