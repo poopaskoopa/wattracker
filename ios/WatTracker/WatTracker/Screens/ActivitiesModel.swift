@@ -160,7 +160,7 @@ struct ZoneGroup: Identifiable {
 
     static func extract(from value: JSONValue?) -> [ZoneGroup] {
         [("power", "Power zones"), ("heart_rate", "Heart-rate zones")].compactMap {
-            key, title in
+            (key, title) -> ZoneGroup? in
             guard case let .array(values)? = value?[key]?["zones"] else { return nil }
             let rows = values.enumerated().compactMap { index, value -> ZoneRow? in
                 guard let seconds = value["seconds"]?.doubleValue, seconds > 0 else {
