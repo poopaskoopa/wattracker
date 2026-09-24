@@ -172,28 +172,22 @@ The list gives the **order**. GitHub gives the **state** — always
 (#234's scope grew a whole section after it was filed) and its labels move.
 If the two disagree, GitHub wins and the queue is stale; say so.
 
-1. **#170 — the rider-scoped cloud wipe: route, and the desktop button.**
-   Unblocked on 2026-09-23: #305's `api.py` rewrite is closed and the stack is
-   deployed. Read the 2026-09-23 comment on the issue for the exact scope,
-   which is items 1, 3, 4 and 5 of the comment before it. The wipe library is
-   already on `main` (`wattracker/cloud/wipe.py`, PR #312), so do not rewrite it.
-   The scope comes from the authenticated credential only. This is data
-   deletion behind authentication, so the PR gets a security review. No
-   Azure-side verification is possible from your environment; say so.
+1. **#361 — test-only gaps from the #357 and #355 reviews.** Connector-session
+   refusal tests for every `/settings/cloud*` POST route, plus an iOS
+   404 → `URLError` → `.offline` test on the `activityObject` retry path.
 
-2. **#352 — collapse the 404-retry in `CloudSession.activityObject`.** Take it
-   before #351: both edit `activityObject`, and #351's cache work is simpler on
-   the single read-and-store helper this one introduces. Do not run them in
-   parallel.
+2. **#360 — iOS zone rows show the payload's `duration` string.** The server
+   rounds `seconds` to 0.1 but formats `duration` from the raw value, so a
+   recomputed string can disagree with the desktop.
 
-3. **#351 — bound and revalidate the iOS activity detail/stream cache.**
+**Prove tests by mutation locally, never on the PR branch.** Break the
+behaviour, show the test go red, revert, and list the results in the PR body.
+Pushing "test: mutate …" commits to a PR branch lands deliberately broken
+states on `main` when the PR is merge-committed. Four such commits are on
+`main` from #358 and #356 (`a04e344`, `95a6bb2`, `8d1a582`, `892b345`); if
+`git bisect` lands on one, `git bisect skip` it.
 
-4. **#353 — unit tests for `RideSummary`, `RideFormatting`, `StreamSeries`,
-   `ZoneGroup`.** Independent of 2 and 3; different files except
-   `project.pbxproj`, which every new Swift file touches, so rebase before
-   opening the PR.
-
-5. **#249 — rotating full-suite test flakes. Still not a local-runs job.**
+3. **#249 — rotating full-suite test flakes. Still not a local-runs job.**
    Nothing has changed since the re-scope. 21 consecutive clean local full
    suites stand against zero reproductions. Both known instances came from
    **taksmon's machine**. **The next step is taksmon's log and his exact
