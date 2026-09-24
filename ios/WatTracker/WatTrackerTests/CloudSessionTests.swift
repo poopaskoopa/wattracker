@@ -1323,4 +1323,151 @@ final class CloudSessionTests: XCTestCase {
         XCTAssertEqual(reads.first?.bearerToken, "context-0")
         XCTAssertEqual(reads.last?.bearerToken, "context-2")
     }
+
+    func testActivityObjectFirstAttemptCancellationPropagates() async throws {
+        let rig = harness { request, _ in
+            if request.url?.path == "/api/v1/context/refresh" {
+                return .json(CloudFixtures.refreshBody(context: "context-0"))
+            }
+            throw CancellationError()
+        }
+
+        do {
+            _ = try await rig.session.activityDetail(8)
+            XCTFail("expected cancellation")
+        } catch is CancellationError {
+            // The task's cancellation must not become a server failure.
+        }
+
+        XCTAssertEqual(
+            rig.transport.requests(matching: "/api/v1/context/activities/activity-detail-8").count,
+            1,
+            "a cancelled first attempt must not retry"
+        )
+    }
+
+    func testActivityObjectRetryCancellationPropagates() async throws {
+        let rig = harness { request, index in
+            if request.url?.path == "/api/v1/context/refresh" {
+                return .json(CloudFixtures.refreshBody(context: "context-\(index)"))
+            }
+            if index == 1 { return .refused(404) }
+            throw CancellationError()
+        }
+
+        do {
+            _ = try await rig.session.activityDetail(8)
+            XCTFail("expected cancellation")
+        } catch is CancellationError {
+            // The retry's cancellation must also remain observable.
+        }
+
+        let reads = rig.transport.requests(
+            matching: "/api/v1/context/activities/activity-detail-8"
+        )
+        XCTAssertEqual(reads.count, 2, "the cancellation is on the single 404 retry")
+        XCTAssertEqual(reads.first?.bearerToken, "context-0")
+        XCTAssertEqual(reads.last?.bearerToken, "context-2")
+    }
+
+    func testARejectedContextRetryThrottleIsClassifiedAndSetsBackoff() async throws {
+        let clock = TestClock()
+        let rig = harness(clock: clock) { request, index in
+            if request.url?.path == "/api/v1/context/refresh" {
+                return .json(CloudFixtures.refreshBody(context: "context-\(index)"))
+            }
+            return index == 1 ? .refused(404) : .refused(429, retryAfter: 30)
+        }
+
+        do {
+            _ = try await rig.session.activityDetail(8)
+            XCTFail("expected throttling")
+        } catch let failure as CloudSession.Failure {
+            guard case let .throttled(retryAfter) = failure else {
+                return XCTFail("expected throttled failure, got \(failure)")
+            }
+            XCTAssertEqual(retryAfter, 30)
+        }
+
+        do {
+            _ = try await rig.session.activityDetail(8)
+            XCTFail("expected backoff gate")
+        } catch let failure as CloudSession.Failure {
+            guard case let .throttled(retryAfter) = failure else {
+                return XCTFail("expected backoff throttling, got \(failure)")
+            }
+            XCTAssertEqual(retryAfter, 30)
+        }
+
+        XCTAssertEqual(
+            rig.transport.requests(matching: "/api/v1/context/activities/activity-detail-8").count,
+            2,
+            "the backoff gate must prevent a third detail read"
+        )
+    }
+
+    func testARejectedContextRetry404IsServerFailureAndReadsTwice() async throws {
+        let rig = harness { request, index in
+            if request.url?.path == "/api/v1/context/refresh" {
+                return .json(CloudFixtures.refreshBody(context: "context-\(index)"))
+            }
+            return .refused(404)
+        }
+
+        do {
+            _ = try await rig.session.activityDetail(8)
+            XCTFail("expected server failure")
+        } catch let failure as CloudSession.Failure {
+            guard case .server = failure else {
+                return XCTFail("expected server failure, got \(failure)")
+            }
+        }
+
+        XCTAssertEqual(
+            rig.transport.requests(matching: "/api/v1/context/activities/activity-detail-8").count,
+            2
+        )
+    }
+
+    func testActivityObject500DoesNotRetryAndIsServerFailure() async throws {
+        let rig = harness { request, index in
+            if request.url?.path == "/api/v1/context/refresh" {
+                return .json(CloudFixtures.refreshBody(context: "context-\(index)"))
+            }
+            return .refused(500)
+        }
+
+        do {
+            _ = try await rig.session.activityDetail(8)
+            XCTFail("expected server failure")
+        } catch let failure as CloudSession.Failure {
+            guard case .server = failure else {
+                return XCTFail("expected server failure, got \(failure)")
+            }
+        }
+
+        XCTAssertEqual(
+            rig.transport.requests(matching: "/api/v1/context/activities/activity-detail-8").count,
+            1
+        )
+    }
+
+    func testARejectedContextRetry503IsThrottled() async throws {
+        let rig = harness { request, index in
+            if request.url?.path == "/api/v1/context/refresh" {
+                return .json(CloudFixtures.refreshBody(context: "context-\(index)"))
+            }
+            return index == 1 ? .refused(404) : .refused(503, retryAfter: 30)
+        }
+
+        do {
+            _ = try await rig.session.activityDetail(8)
+            XCTFail("expected throttling")
+        } catch let failure as CloudSession.Failure {
+            guard case let .throttled(retryAfter) = failure else {
+                return XCTFail("expected throttled failure, got \(failure)")
+            }
+            XCTAssertEqual(retryAfter, 30)
+        }
+    }
 }

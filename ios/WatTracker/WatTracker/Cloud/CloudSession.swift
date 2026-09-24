@@ -463,33 +463,56 @@ actor CloudSession: ReadSession {
             throw classify(error)
         }
         do {
-            let item = try await read(client, attempt.value, device)
-            try validate(device, lifecycleGeneration: generation)
-            activityObjects[objectID] = item
-            lastSuccessfulRead = clock()
-            return item
-        } catch let failure as CloudClient.Failure {
-            guard case let .http(status, _, retryAfter, _) = failure else {
-                throw Failure.server(failure)
+            return try await readAndStoreActivityObject(
+                objectID: objectID, context: attempt.value, device: device,
+                lifecycleGeneration: generation, read: read
+            )
+        } catch {
+            guard let failure = error as? CloudClient.Failure,
+                  case .http(404, _, _, _) = failure else {
+                throw try classifyActivityReadError(error)
             }
-            if status == 429 || status == 503 {
-                noteFailure(retryAfter: retryAfter)
-                throw Failure.throttled(retryAfter: retryAfter ?? pendingDelay())
-            }
-            guard status == 404 else { throw Failure.server(failure) }
             let renewed = try await context(after: attempt.generation)
             do {
-                let item = try await read(client, renewed.value, device)
-                try validate(device, lifecycleGeneration: generation)
-                activityObjects[objectID] = item
-                lastSuccessfulRead = clock()
-                return item
-            } catch let retried as CloudClient.Failure {
-                throw Failure.server(retried)
+                return try await readAndStoreActivityObject(
+                    objectID: objectID, context: renewed.value, device: device,
+                    lifecycleGeneration: generation, read: read
+                )
+            } catch {
+                throw try classifyActivityReadError(error)
             }
-        } catch {
-            throw classify(error)
         }
+    }
+
+    private func readAndStoreActivityObject(
+        objectID: String,
+        context: String,
+        device: PairedDevice,
+        lifecycleGeneration: Int,
+        read: (ReadClient, String, PairedDevice) async throws -> CloudItem
+    ) async throws -> CloudItem {
+        let item = try await read(client, context, device)
+        try validate(device, lifecycleGeneration: lifecycleGeneration)
+        activityObjects[objectID] = item
+        lastSuccessfulRead = clock()
+        return item
+    }
+
+    /// Retry failures use the same classification as the first read. Preserve
+    /// cancellation so task cancellation remains observable to the caller.
+    private func classifyActivityReadError(_ error: Error) throws -> Failure {
+        if error is CancellationError { throw error }
+        guard let failure = error as? CloudClient.Failure else {
+            return classify(error)
+        }
+        guard case let .http(status, _, retryAfter, _) = failure else {
+            return .server(failure)
+        }
+        guard status == 429 || status == 503 else {
+            return .server(failure)
+        }
+        noteFailure(retryAfter: retryAfter)
+        return .throttled(retryAfter: retryAfter ?? pendingDelay())
     }
 
     private func validate(_ readDevice: PairedDevice, lifecycleGeneration: Int) throws {
