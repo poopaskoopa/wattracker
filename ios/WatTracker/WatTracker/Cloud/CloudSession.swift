@@ -480,7 +480,6 @@ actor CloudSession: ReadSession {
         // eventually observed.
         if let cached = activityObjects[objectID],
            clock().timeIntervalSince(cached.storedAt) <= Self.activityObjectCacheLifetime {
-            touchActivityObject(objectID)
             return cached.item
         }
         let activityObjectGeneration = activityObjectGenerations[activityID] ?? 0
@@ -552,7 +551,7 @@ actor CloudSession: ReadSession {
             let streamID = activityObjectLRU.first {
                 $0 != insertedID && activityObjects[$0]?.item.kind == .stream
             }
-            let evictedID = streamID ?? activityObjectLRU.first { $0 != insertedID }!
+            let evictedID = activityObjectLRU.first { $0 != insertedID }!
             activityObjects.removeValue(forKey: evictedID)
             activityObjectLRU.removeAll { $0 == evictedID }
         }
@@ -566,9 +565,9 @@ actor CloudSession: ReadSession {
             let previousRevision = activityCollectionRevisions[activityID]
             let isNewerRevision: Bool
             if activity.deleted {
-                isNewerRevision = true
+                isNewerRevision = false
             } else if let previousRevision {
-                isNewerRevision = activity.revision > previousRevision
+                isNewerRevision = activity.revision >= previousRevision
             } else {
                 isNewerRevision = true
             }
