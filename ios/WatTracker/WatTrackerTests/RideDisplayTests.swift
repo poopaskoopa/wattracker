@@ -45,6 +45,25 @@ final class RideDisplayTests: XCTestCase {
         XCTAssertEqual(ZoneFormatting.duration(3725), "1:02:05")
     }
 
+    func testZoneDurationPrefersPayloadStringAndFallsBackWhenMissing() throws {
+        let zones: JSONValue = .object([
+            "power": .object(["zones": .array([
+                .object([
+                    "seconds": .number(2.5),
+                    "duration": .string("0:03"),
+                    "percent": .number(50)
+                ]),
+                .object(["seconds": .number(2.5), "percent": .number(50)])
+            ])])
+        ])
+
+        let rows = try XCTUnwrap(ZoneGroup.extract(from: zones).first?.rows)
+        // The server's duration comes from the unrounded sample; use it when
+        // present, but keep the local half-to-even formatter as the fallback.
+        XCTAssertEqual(rows.map(\.durationText), ["0:03", "0:02"])
+        XCTAssertEqual(ZoneFormatting.duration(rows[0].seconds), "0:02")
+    }
+
     func testStreamsDropGapsAndUseTimeChannelWhenPresent() {
         let channels = ActivityStreams.Channels(
             time: nil, power: [0, nil, .infinity],

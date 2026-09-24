@@ -169,7 +169,9 @@ struct ZoneGroup: Identifiable {
                 return ZoneRow(
                     id: "\(key)-\(index)",
                     label: value["label"]?.stringValue ?? "Z\(index + 1)",
-                    seconds: seconds, percent: value["percent"]?.doubleValue ?? 0
+                    seconds: seconds,
+                    percent: value["percent"]?.doubleValue ?? 0,
+                    duration: value["duration"]?.stringValue
                 )
             }
             return rows.isEmpty ? nil : ZoneGroup(id: key, title: title, rows: rows)
@@ -178,9 +180,13 @@ struct ZoneGroup: Identifiable {
 }
 
 struct ZoneRow: Identifiable {
-    let id: String; let label: String; let seconds: Double; let percent: Double
+    let id: String
+    let label: String
+    let seconds: Double
+    let percent: Double
+    let duration: String? = nil
 
-    var durationText: String { ZoneFormatting.duration(seconds) }
+    var durationText: String { duration ?? ZoneFormatting.duration(seconds) }
 }
 
 enum ZoneFormatting {
