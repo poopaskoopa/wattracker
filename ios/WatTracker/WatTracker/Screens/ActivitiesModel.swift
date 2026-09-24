@@ -186,6 +186,14 @@ struct ZoneRow: Identifiable {
     let percent: Double
     let duration: String? = nil
 
+    init(id: String, label: String, seconds: Double, percent: Double, duration: String? = nil) {
+        self.id = id
+        self.label = label
+        self.seconds = seconds
+        self.percent = percent
+        self.duration = duration
+    }
+
     var durationText: String { ZoneFormatting.duration(seconds) }
 }
 
