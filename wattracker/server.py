@@ -115,6 +115,7 @@ from .timeutil import (
 from .web.qr import pairing_qr_svg
 
 DAY_LABELS = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
+_CLOUD_WIPE_CONFIRMATION = "DELETE ALL CLOUD DATA"
 
 # Real-hardware ride loop cadence (seconds); module-level so tests can shrink it.
 RIDE_POLL_INTERVAL_S = 1.0
@@ -4770,6 +4771,7 @@ def create_app() -> FastAPI:
             timezone_message=timezone_message,
             cloud_message=cloud_message,
             cloud_sync=_cloud_status(uid),
+            cloud_wipe_enabled=config.desktop_cloud_wipe_enabled(),
             cloud_pairing=pairing,
             cloud_pairing_qr=(
                 pairing_qr_svg(pairing_code)
@@ -5031,6 +5033,40 @@ def create_app() -> FastAPI:
             "Paired device revoked."
             if revoked else "Paired device could not be revoked. Try again."
         )
+        return _cloud_settings_redirect(request, message)
+
+    @app.post("/settings/cloud/wipe")
+    def settings_cloud_wipe(
+        request: Request, confirmation: str = Form("")
+    ):
+        if not _same_origin_or_absent(request):
+            return PlainTextResponse("Origin not allowed", status_code=403)
+        uid = _uid(request)
+        if _from_connector(request):
+            return _refuse_connector_session(request, uid)
+        if not config.desktop_cloud_wipe_enabled():
+            return _cloud_settings_redirect(
+                request, "Cloud data wipe is disabled in desktop settings."
+            )
+        if confirmation != _CLOUD_WIPE_CONFIRMATION:
+            return _cloud_settings_redirect(
+                request,
+                f"Type {_CLOUD_WIPE_CONFIRMATION} to confirm the permanent wipe.",
+            )
+        sync = getattr(app.state, "cloud_sync", None)
+        try:
+            result = sync.wipe_cloud_data(uid)
+        except Exception:
+            result = None
+        if result is True:
+            message = "Cloud data permanently deleted."
+        elif result is False:
+            message = (
+                "The cloud did not recognise this installation. Local sync has "
+                "been turned off; if cloud data may remain, contact the operator."
+            )
+        else:
+            message = "Cloud data wipe could not be confirmed. Check cloud settings before trying again."
         return _cloud_settings_redirect(request, message)
 
     @app.post("/settings", response_class=HTMLResponse)

@@ -48,12 +48,19 @@ def _origins() -> tuple[str, ...]:
     return tuple(value for value in values if value)
 
 
+def _env_flag(name: str) -> bool:
+    return os.environ.get(name, "0").strip().lower() in {
+        "1", "true", "yes", "on"
+    }
+
+
 def create_runtime_app():
     """Build the production app with persistent Azure-backed object storage."""
     config = CloudConfig(
         server_secret=_server_secret(),
         operator_token=_required_secret("WATTRACKER_CLOUD_OPERATOR_TOKEN"),
         plane=os.environ.get("WATTRACKER_CLOUD_PLANE", "read"),
+        allow_account_wipe=_env_flag("WATTRACKER_CLOUD_ALLOW_ACCOUNT_WIPE"),
         allowed_origins=_origins(),
         # The production deployment has no gateway that can overwrite and
         # attest identity headers.  Authentication is therefore performed by

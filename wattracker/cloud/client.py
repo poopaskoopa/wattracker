@@ -35,9 +35,11 @@ SYNC_PATH = "/api/v1/sync/batches"
 ENROLLMENT_PATH = "/api/v1/enrollment/complete"
 PAIRING_CODE_PATH = "/api/v1/devices/pairing-codes"
 DEVICES_PATH = "/api/v1/devices"
+WIPE_PATH = "/api/v1/account/wipe"
 PAIRING_IDEMPOTENCY_KEY = "device-pairing-code"
 DEVICE_LIST_IDEMPOTENCY_KEY = "device-list"
 DEVICE_REVOKE_IDEMPOTENCY_KEY = "device-revoke"
+WIPE_IDEMPOTENCY_KEY = "account-wipe"
 OFFLINE_MESSAGE = "Cloud sync offline — local data and features are unaffected."
 MAX_RESPONSE_BYTES = 1 * 1024 * 1024
 _TOKEN_RE = re.compile(r"^[A-Za-z0-9_-]{16,256}$")
@@ -407,6 +409,27 @@ class CloudSyncClient:
         )
         status, payload = self._request("POST", path, b"", headers=headers)
         return status == 200 and payload.get("revoked") is True
+
+    def wipe_scope(self) -> Optional[bool]:
+        """Request one irreversible wipe without retrying an ambiguous result.
+
+        ``True`` is an acknowledged wipe, ``False`` is a definitive 404, and
+        ``None`` means the client cannot tell whether the request reached the
+        server.  The caller must not blindly repeat ``None``.
+        """
+        try:
+            headers = self._signed_headers(
+                "POST", WIPE_PATH, b"",
+                idempotency_key=WIPE_IDEMPOTENCY_KEY, revision=0,
+            )
+        except Exception:
+            return None
+        status, payload = self._request("POST", WIPE_PATH, b"", headers=headers)
+        if status == 200 and payload.get("wiped") is True:
+            return True
+        if status == 404:
+            return False
+        return None
 
 
     def push_snapshot(

@@ -160,6 +160,9 @@ def isolated_env(tmp_path, monkeypatch):
         "WATTRACKER_CLOUD_PORT",
         "WATTRACKER_CLOUD_PLANE",
         "WATTRACKER_ALLOWED_ORIGINS",
+        # Destructive desktop controls are opt-in and must never inherit a
+        # developer's local setting into unrelated tests.
+        "WATTRACKER_DESKTOP_ALLOW_ACCOUNT_WIPE",
         # LLM settings: a developer's real keys/endpoints must never leak in
         # and call a live provider from a test.
         "API_KEY",

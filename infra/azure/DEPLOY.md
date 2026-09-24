@@ -143,6 +143,18 @@ signature this whole path exists to produce.
 
 ## Prerequisites and secret handling
 
+### Account wipe capability
+
+The account wipe route is disabled by default. Leave
+`WATTRACKER_CLOUD_ALLOW_ACCOUNT_WIPE` unset (or set it to `0`) until the
+read-plane identity has an explicitly reviewed **delete grant** for every
+CloudAuth and tenant-storage record the wipe implementation must remove. Grant
+that delete permission first, verify it on the deployment identity, and only
+then enable the flag with `WATTRACKER_CLOUD_ALLOW_ACCOUNT_WIPE=1`. The flag is
+an application gate, not a substitute for the grant; enabling it without the
+grant can leave a destructive request only partially completed. This change
+does not alter any Bicep role assignment.
+
 Have an Azure subscription; an owner-approved region, resource-group name,
 globally unique storage name, PWA origin, billing email and budget period;
 Flex Consumption availability in `eastus2` must be confirmed by the owner
