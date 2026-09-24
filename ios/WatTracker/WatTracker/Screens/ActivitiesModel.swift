@@ -194,7 +194,7 @@ struct ZoneRow: Identifiable {
         self.duration = duration
     }
 
-    var durationText: String { ZoneFormatting.duration(seconds) }
+    var durationText: String { duration ?? "—" }
 }
 
 enum ZoneFormatting {
