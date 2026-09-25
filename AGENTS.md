@@ -172,27 +172,22 @@ The list gives the **order**. GitHub gives the **state** — always
 (#234's scope grew a whole section after it was filed) and its labels move.
 If the two disagree, GitHub wins and the queue is stale; say so.
 
-1. **#369 — PR #371 open. Cloud credential store ignores `WATTRACKER_KEYRING=0`, so tests
-   can reach the real macOS Keychain.** Found verifying PR #366: with a route
-   guard removed under mutation, an unpatched `enroll` hit the real Keychain
-   and blocked pytest on an authorization prompt. `KeyringBackend`
-   (`wattracker/cloud/credentials.py:35-44`) must honour the same switch
-   `credstore.py` already does. Needs a guard test and a security review
-   before merge — do not skip that review for this one.
+1. **#374 — the cloud credential store accepts plaintext keyring backends that
+   `credstore` rejects.** `KeyringBackend` (`wattracker/cloud/credentials.py`)
+   uses whatever backend `keyring` has configured, skipping
+   `credstore._keyring_backend_allowed` (which rejects fail and plaintext backends
+   and requires WinVault on Windows), so a plaintext backend would write the cloud
+   writer credential to disk unencrypted. Reuse credstore's check rather than
+   duplicating its rules, and parametrise #371's guard test over "0", "false"
+   and "no". Credential handling: needs a security review before merge.
 
-2. **#361 — PR #366 open, reviewed *not ready*.** The six connector-refusal
-   tests patch `app.state.cloud_sync` / `cloud_scheduler` before
-   `_connector_window` opens a fresh `TestClient`, whose startup replaces both
-   objects — so every "side effect did not happen" assertion is inert; only
-   the 403 checks can fail. Fix: patch the window's own `app.state`, or the
-   module-level target the handler actually calls, and add a control request
-   through a normal password session proving the same call reaches the spy
-   otherwise. The wipe test also can't reach the wipe: `WATTRACKER_DESKTOP_
-   ALLOW_ACCOUNT_WIPE` is off and the confirmation string is wrong (sends
-   "DELETE CLOUD DATA", server wants "DELETE ALL CLOUD DATA" —
-   `server.py:118`). Fix #369 first — this rework will re-exercise the same
-   unpatched paths, and #369 is what stops that from touching a real
-   Keychain again.
+**Keychain safety, mandatory.** This machine's real Keychain holds the
+owner's credentials, and a mutation run here once hung pytest on a Keychain
+prompt (#369, fixed by #371). For any run where code under test might reach
+`keyring` (above all, mutation runs that revert a guard), put a fake `keyring`
+module that raises on use into `sys.modules` before import, set
+`PYTHON_KEYRING_BACKEND=keyring.backends.fail.Keyring`, and pass
+`--timeout=120`. Never answer a Keychain prompt.
 
 **Prove tests by mutation locally, never on the PR branch.** Break the
 behaviour, show the test go red, revert, and list the results in the PR body.
@@ -201,7 +196,7 @@ states on `main` when the PR is merge-committed. Four such commits are on
 `main` from #358 and #356 (`a04e344`, `95a6bb2`, `8d1a582`, `892b345`); if
 `git bisect` lands on one, `git bisect skip` it.
 
-3. **#372 — unpaginated cloud collections silently truncate at 100 objects.**
+2. **#372 — unpaginated cloud collections silently truncate at 100 objects.**
    Non-mobile routes in `wattracker/cloud/api.py`'s `collection()` fetch exactly
    `limit` items and then test `len(items) > limit`, which can never be true, so
    a scope past 100 calendar, profile or race objects gets a truncated list with
@@ -211,7 +206,7 @@ states on `main` when the PR is merge-committed. Four such commits are on
    change is taksmon's**: do the server and iOS parts, and leave a note on #192
    instead of touching `android/`.
 
-4. **#249 — rotating full-suite test flakes. Still not a local-runs job.**
+3. **#249 — rotating full-suite test flakes. Still not a local-runs job.**
    Nothing has changed since the re-scope. 21 consecutive clean local full
    suites stand against zero reproductions. Both known instances came from
    **taksmon's machine**. **The next step is taksmon's log and his exact
