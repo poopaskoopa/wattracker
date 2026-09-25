@@ -1,7 +1,15 @@
+import builtins
+import sys
+import types
+
 import pytest
 
 from wattracker.cloud.client import SyncCredentials
-from wattracker.cloud.credentials import CloudCredentialStore, CloudCredentialUnavailable
+from wattracker.cloud.credentials import (
+    CloudCredentialStore,
+    CloudCredentialUnavailable,
+)
+from wattracker.cloud.desktop_sync import DesktopCloudSync
 
 
 class MemorySecrets:
@@ -16,6 +24,41 @@ class MemorySecrets:
 
     def delete(self, account):
         self.values.pop(account, None)
+
+
+@pytest.mark.parametrize("operation", ["get", "set"])
+def test_default_cloud_backend_respects_disabled_keyring_without_importing_or_calling_it(
+    monkeypatch, operation,
+):
+    calls = []
+    failing_keyring = types.ModuleType("keyring")
+
+    def fail(*args, **kwargs):
+        calls.append((args, kwargs))
+        raise AssertionError("disabled keyring was called")
+
+    failing_keyring.get_password = fail
+    failing_keyring.set_password = fail
+    failing_keyring.delete_password = fail
+    monkeypatch.setitem(sys.modules, "keyring", failing_keyring)
+
+    real_import = builtins.__import__
+
+    def reject_keyring_import(name, *args, **kwargs):
+        if name == "keyring":
+            raise AssertionError("disabled keyring was imported")
+        return real_import(name, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "__import__", reject_keyring_import)
+
+    sync = DesktopCloudSync()
+    with pytest.raises(CloudCredentialUnavailable, match="secure storage"):
+        if operation == "get":
+            sync.credential_store.backend.get("account")
+        else:
+            sync.credential_store.backend.set("account", "value")
+
+    assert calls == []
 
 
 def test_cloud_identity_and_writer_are_stored_only_in_secure_backend():
