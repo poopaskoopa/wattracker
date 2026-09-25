@@ -624,6 +624,9 @@ class CloudSessionTest {
             override fun clear() {
                 throw IOException("disk full")
             }
+            override fun loadLocal(): LocalCredentials? = null
+            override fun saveLocal(credentials: LocalCredentials) {}
+            override fun clearLocal() {}
         }
         val session = CloudSession(
             client = noNetworkClient(),
