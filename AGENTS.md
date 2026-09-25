@@ -172,7 +172,7 @@ The list gives the **order**. GitHub gives the **state** — always
 (#234's scope grew a whole section after it was filed) and its labels move.
 If the two disagree, GitHub wins and the queue is stale; say so.
 
-1. **#369 — cloud credential store ignores `WATTRACKER_KEYRING=0`, so tests
+1. **#369 — PR #371 open. Cloud credential store ignores `WATTRACKER_KEYRING=0`, so tests
    can reach the real macOS Keychain.** Found verifying PR #366: with a route
    guard removed under mutation, an unpatched `enroll` hit the real Keychain
    and blocked pytest on an authorization prompt. `KeyringBackend`
@@ -201,7 +201,17 @@ states on `main` when the PR is merge-committed. Four such commits are on
 `main` from #358 and #356 (`a04e344`, `95a6bb2`, `8d1a582`, `892b345`); if
 `git bisect` lands on one, `git bisect skip` it.
 
-3. **#249 — rotating full-suite test flakes. Still not a local-runs job.**
+3. **#372 — unpaginated cloud collections silently truncate at 100 objects.**
+   Non-mobile routes in `wattracker/cloud/api.py`'s `collection()` fetch exactly
+   `limit` items and then test `len(items) > limit`, which can never be true, so
+   a scope past 100 calendar, profile or race objects gets a truncated list with
+   no cursor, and both clients cache it as complete. Pick option (a), paging, or
+   (b), a loud failure, from the issue and state which you chose. A server test with
+   101 objects must go red on the old code. **If you choose (a), the Android client
+   change is taksmon's**: do the server and iOS parts, and leave a note on #192
+   instead of touching `android/`.
+
+4. **#249 — rotating full-suite test flakes. Still not a local-runs job.**
    Nothing has changed since the re-scope. 21 consecutive clean local full
    suites stand against zero reproductions. Both known instances came from
    **taksmon's machine**. **The next step is taksmon's log and his exact
