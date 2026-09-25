@@ -415,6 +415,152 @@ def test_a_connector_session_cannot_clear_the_stored_llm_model(client):
     assert config.load_config().llm_model == "pinned"
 
 
+def test_a_connector_session_cannot_change_cloud_settings(client, monkeypatch):
+    uid, token = _paired(client)
+    calls = []
+
+    with _connector_window(client, token) as window:
+        sync = window.app.state.cloud_sync
+        monkeypatch.setattr(
+            sync, "set_enabled", lambda *args: calls.append(("enabled", args))
+        )
+        monkeypatch.setattr(
+            sync, "enroll", lambda *args: calls.append(("enroll", args))
+        )
+        response = window.post(
+            "/settings/cloud",
+            data={"enabled": "on", "endpoint": "https://cloud.example", "invitation": "invite"},
+        )
+
+    assert response.status_code == 403
+    assert calls == []
+    control = client.post(
+        "/settings/cloud",
+        data={"enabled": "on", "endpoint": "https://cloud.example", "invitation": "invite"},
+        follow_redirects=False,
+    )
+    assert control.status_code == 303
+    assert calls == [("enroll", (uid, "https://cloud.example", "invite")),
+                     ("enabled", (uid, True))]
+
+
+def test_a_connector_session_cannot_request_cloud_sync(client, monkeypatch):
+    uid, token = _paired(client)
+    calls = []
+
+    with _connector_window(client, token) as window:
+        scheduler = window.app.state.cloud_scheduler
+        monkeypatch.setattr(
+            scheduler, "request_sync", lambda *args: calls.append(args)
+        )
+        response = window.post("/settings/cloud/sync")
+
+    assert response.status_code == 403
+    assert calls == []
+    control = client.post("/settings/cloud/sync", follow_redirects=False)
+    assert control.status_code == 303
+    assert calls == [(uid,)]
+
+
+def test_a_connector_session_cannot_mint_cloud_pairing_code(client, monkeypatch):
+    uid, token = _paired(client)
+    calls = []
+
+    with _connector_window(client, token) as window:
+        sync = window.app.state.cloud_sync
+        monkeypatch.setattr(
+            sync,
+            "mint_pairing_code",
+            lambda *args: (calls.append(args), {
+                "pairing_code": "TEST-CODE", "expires_at": 4102444800,
+            })[1],
+        )
+        response = window.post("/settings/cloud/pairing")
+
+        assert response.status_code == 403
+    assert calls == []
+    assert client.app.state.cloud_pairings == {}
+    control = client.post("/settings/cloud/pairing", follow_redirects=False)
+    assert control.status_code == 303
+    assert calls == [(uid,)]
+
+
+def test_a_connector_session_cannot_list_cloud_devices(client, monkeypatch):
+    uid, token = _paired(client)
+    calls = []
+
+    with _connector_window(client, token) as window:
+        sync = window.app.state.cloud_sync
+        monkeypatch.setattr(
+            sync, "list_devices", lambda *args: (calls.append(args), [])[1]
+        )
+        response = window.post("/settings/cloud/devices")
+
+    assert response.status_code == 403
+    assert calls == []
+    control = client.post("/settings/cloud/devices", follow_redirects=False)
+    assert control.status_code == 303
+    assert calls == [(uid,)]
+
+
+def test_a_connector_session_cannot_revoke_cloud_device(client, monkeypatch):
+    uid, token = _paired(client)
+    calls = []
+
+    with _connector_window(client, token) as window:
+        sync = window.app.state.cloud_sync
+        monkeypatch.setattr(
+            sync,
+            "revoke_device",
+            lambda *args: (calls.append(("revoke", args)), True)[1],
+        )
+        monkeypatch.setattr(
+            sync,
+            "list_devices",
+            lambda *args: (calls.append(("list", args)), [])[1],
+        )
+        response = window.post(
+            "/settings/cloud/devices/" + "a" * 64 + "/revoke"
+        )
+
+        assert response.status_code == 403
+        assert calls == []
+    control = client.post(
+        "/settings/cloud/devices/" + "a" * 64 + "/revoke",
+        follow_redirects=False,
+    )
+    assert control.status_code == 303
+    assert calls == [("revoke", (uid, "a" * 64)), ("list", (uid,))]
+
+
+def test_a_connector_session_cannot_wipe_cloud_data(client, monkeypatch):
+    monkeypatch.setenv("WATTRACKER_DESKTOP_ALLOW_ACCOUNT_WIPE", "1")
+    uid, token = _paired(client)
+    calls = []
+
+    with _connector_window(client, token) as window:
+        sync = window.app.state.cloud_sync
+        monkeypatch.setattr(
+            sync,
+            "wipe_cloud_data",
+            lambda *args: (calls.append(args), True)[1],
+        )
+        response = window.post(
+            "/settings/cloud/wipe",
+            data={"confirmation": "DELETE ALL CLOUD DATA"},
+        )
+
+        assert response.status_code == 403
+        assert calls == []
+    control = client.post(
+        "/settings/cloud/wipe",
+        data={"confirmation": "DELETE ALL CLOUD DATA"},
+        follow_redirects=False,
+    )
+    assert control.status_code == 303
+    assert calls == [(uid,)]
+
+
 def test_a_connector_session_still_saves_folders_with_the_llm_form_echoed(client):
     """The refusal is about changing the group, not about posting it.
 
