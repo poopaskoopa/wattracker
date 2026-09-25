@@ -172,13 +172,27 @@ The list gives the **order**. GitHub gives the **state** — always
 (#234's scope grew a whole section after it was filed) and its labels move.
 If the two disagree, GitHub wins and the queue is stale; say so.
 
-1. **#361 — test-only gaps from the #357 and #355 reviews.** Connector-session
-   refusal tests for every `/settings/cloud*` POST route, plus an iOS
-   404 → `URLError` → `.offline` test on the `activityObject` retry path.
+1. **#369 — cloud credential store ignores `WATTRACKER_KEYRING=0`, so tests
+   can reach the real macOS Keychain.** Found verifying PR #366: with a route
+   guard removed under mutation, an unpatched `enroll` hit the real Keychain
+   and blocked pytest on an authorization prompt. `KeyringBackend`
+   (`wattracker/cloud/credentials.py:35-44`) must honour the same switch
+   `credstore.py` already does. Needs a guard test and a security review
+   before merge — do not skip that review for this one.
 
-2. **#360 — iOS zone rows show the payload's `duration` string.** The server
-   rounds `seconds` to 0.1 but formats `duration` from the raw value, so a
-   recomputed string can disagree with the desktop.
+2. **#361 — PR #366 open, reviewed *not ready*.** The six connector-refusal
+   tests patch `app.state.cloud_sync` / `cloud_scheduler` before
+   `_connector_window` opens a fresh `TestClient`, whose startup replaces both
+   objects — so every "side effect did not happen" assertion is inert; only
+   the 403 checks can fail. Fix: patch the window's own `app.state`, or the
+   module-level target the handler actually calls, and add a control request
+   through a normal password session proving the same call reaches the spy
+   otherwise. The wipe test also can't reach the wipe: `WATTRACKER_DESKTOP_
+   ALLOW_ACCOUNT_WIPE` is off and the confirmation string is wrong (sends
+   "DELETE CLOUD DATA", server wants "DELETE ALL CLOUD DATA" —
+   `server.py:118`). Fix #369 first — this rework will re-exercise the same
+   unpatched paths, and #369 is what stops that from touching a real
+   Keychain again.
 
 **Prove tests by mutation locally, never on the PR branch.** Break the
 behaviour, show the test go red, revert, and list the results in the PR body.
@@ -239,6 +253,21 @@ five-commit-old image with no admin routes at all (#333, PR #338 adds a
 checker). And `validate` and `what-if` both pass clean immediately before a
 `create` that fails on a custom role's data actions, because those are only
 checked when the role is written (#330).
+
+**Done since this list was last written (2026-09-19 → 09-25).**
+- **#360** merged as PR #368 (`0b66aee`). iOS zone rows now render the
+  payload's `duration` string when present and fall back to
+  `ZoneFormatting` only when it is absent; ride-card call sites are
+  unchanged. Reviewed ready: the mutation proof showed both the
+  always-formatter and the payload-with-placeholder-fallback variants going
+  red. Full suite green on `main` at `0b66aee` (3393 passed, 90 skipped; the
+  one `test_gh_resolution_uses_arm64_homebrew_path` failure is this sandbox
+  lacking a real `/opt/homebrew/bin/gh`, unrelated to the merge).
+- **#361 / PR #366 reviewed, found not ready** — see item 2 above. Also
+  **exposed and filed #369**, now item 1: an unpatched `enroll` under
+  mutation testing reached the real macOS Keychain and blocked pytest on an
+  authorization prompt. Neither issue is closed; PR #366 needs rework and
+  is unmerged.
 
 **Done since this list was last written (2026-09-18 → 09-19).**
 - **#327** merged as PR #329 (`abaf224`) and **#330** as PR #332 (`d974819`).
