@@ -10,6 +10,12 @@ navigationCompose = "2.10.0"
 # per the plan; the dependencies are wired in when the client is written.
 room = "2.8.4"
 securityCrypto = "1.1.0"
+# Coroutines back the §2.3 single-flight refresh (a Mutex-guarded shared
+# Deferred) and the suspend read seam. It is already a transitive of
+# room-ktx / activity-compose; declared explicitly so the client does not rely
+# on it arriving by accident. Not a JSON/HTTP/DI library -- the epic rule
+# holds.
+coroutines = "1.11.0"
 # KSP plugin version is coupled to the Kotlin version above.
 ksp = "2.2.10-2.0.2"
 
@@ -30,8 +36,14 @@ androidx-room-runtime = { group = "androidx.room", name = "room-runtime", versio
 androidx-room-ktx = { group = "androidx.room", name = "room-ktx", version.ref = "room" }
 androidx-room-compiler = { group = "androidx.room", name = "room-compiler", version.ref = "room" }
 androidx-security-crypto = { group = "androidx.security", name = "security-crypto", version.ref = "securityCrypto" }
+kotlinx-coroutines-core = { group = "org.jetbrains.kotlinx", name = "kotlinx-coroutines-core", version.ref = "coroutines" }
+kotlinx-coroutines-test = { group = "org.jetbrains.kotlinx", name = "kotlinx-coroutines-test", version.ref = "coroutines" }
 
 [plugins]
 android-application = { id = "com.android.application", version.ref = "agp" }
 kotlin-compose = { id = "org.jetbrains.kotlin.plugin.compose", version.ref = "kotlin" }
 ksp = { id = "com.google.devtools.ksp", version.ref = "ksp" }
+# Exports the Room schemas to app/schemas so the #266 migrations can be built
+# against them. Without it KSP warns "Schema export directory was not provided"
+# and exportSchema = true writes nothing.
+androidx-room = { id = "androidx.room", version.ref = "room" }

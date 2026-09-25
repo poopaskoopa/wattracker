@@ -1,8 +1,20 @@
-# Intentionally empty: no R8 keep rules needed yet.
-# R8 rules for the Room entities and the Tink KeySetHandle will be added
-# in Step 2 (#194) when those dependencies are wired in.
+# R8 rules for the minified release build.
 #
 # Verified 2026-09-09 (#260 item 2): R8 DOES read this path. A deliberately
 # unparseable directive here failed :app:minifyReleaseWithR8 with
 # 'Unknown option', naming this file and line. The AGP 9 keepRules source-set
 # convention is wired; rules added here will take effect.
+
+# security-crypto drags in Tink, which references annotation types it does not
+# bundle (errorprone annotations) and the JSR-305 concurrency/nullable
+# annotations (javax.annotation.*). None of that is retained in a release APK
+# -- it is only referenced from Tink's signatures -- so the classes are
+# legitimately absent. These are exactly the lines R8 emitted in
+# build/outputs/mapping/release/missing_rules.txt; adding the classes instead
+# would only bloat the APK with annotation stubs.
+-dontwarn com.google.errorprone.annotations.CanIgnoreReturnValue
+-dontwarn com.google.errorprone.annotations.CheckReturnValue
+-dontwarn com.google.errorprone.annotations.Immutable
+-dontwarn com.google.errorprone.annotations.RestrictedApi
+-dontwarn javax.annotation.Nullable
+-dontwarn javax.annotation.concurrent.GuardedBy
