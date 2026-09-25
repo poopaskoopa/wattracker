@@ -160,7 +160,7 @@ struct ZoneGroup: Identifiable {
 
     static func extract(from value: JSONValue?) -> [ZoneGroup] {
         [("power", "Power zones"), ("heart_rate", "Heart-rate zones")].compactMap {
-            key, title in
+            (key, title) -> ZoneGroup? in
             guard case let .array(values)? = value?[key]?["zones"] else { return nil }
             let rows = values.enumerated().compactMap { index, value -> ZoneRow? in
                 guard let seconds = value["seconds"]?.doubleValue, seconds > 0 else {
@@ -169,7 +169,9 @@ struct ZoneGroup: Identifiable {
                 return ZoneRow(
                     id: "\(key)-\(index)",
                     label: value["label"]?.stringValue ?? "Z\(index + 1)",
-                    seconds: seconds, percent: value["percent"]?.doubleValue ?? 0
+                    seconds: seconds,
+                    percent: value["percent"]?.doubleValue ?? 0,
+                    duration: value["duration"]?.stringValue
                 )
             }
             return rows.isEmpty ? nil : ZoneGroup(id: key, title: title, rows: rows)
@@ -178,9 +180,21 @@ struct ZoneGroup: Identifiable {
 }
 
 struct ZoneRow: Identifiable {
-    let id: String; let label: String; let seconds: Double; let percent: Double
+    let id: String
+    let label: String
+    let seconds: Double
+    let percent: Double
+    let duration: String?
 
-    var durationText: String { ZoneFormatting.duration(seconds) }
+    init(id: String, label: String, seconds: Double, percent: Double, duration: String? = nil) {
+        self.id = id
+        self.label = label
+        self.seconds = seconds
+        self.percent = percent
+        self.duration = duration
+    }
+
+    var durationText: String { duration ?? ZoneFormatting.duration(seconds) }
 }
 
 enum ZoneFormatting {
