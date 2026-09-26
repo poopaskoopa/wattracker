@@ -247,6 +247,42 @@ def _apply_mobile_batch(state, namespace, scope, batch_id, revision, objects):
     )
 
 
+@pytest.mark.parametrize(
+    ("path", "kind"),
+    [
+        ("/api/v1/context/calendar", "calendar"),
+        ("/api/v1/context/profile", "profile"),
+        ("/api/v1/context/races", "race"),
+    ],
+)
+def test_unpaginated_collection_fails_loudly_when_scope_exceeds_limit(
+    cloud, path, kind,
+):
+    _config, state, client = cloud
+    token, context = _mobile_reader(state, scope="overflow-scope")
+    _apply_mobile_batch(
+        state,
+        context.namespace,
+        context.local_user_scope,
+        "profile-overflow",
+        1,
+        [
+            CloudObject(
+                f"{kind}-{index}", kind, 1, {"index": index}
+            )
+            for index in range(101)
+        ],
+    )
+
+    response = client.get(path, headers=_mobile_headers(token))
+
+    assert response.status_code == 413
+    assert response.json() == {
+        "code": "collection_too_large",
+        "detail": "collection exceeds limit",
+    }
+
+
 def test_mobile_read_surface_routes_filter_kinds_and_expose_revision(cloud):
     _config, state, client = cloud
     token, context = _mobile_reader(state)
