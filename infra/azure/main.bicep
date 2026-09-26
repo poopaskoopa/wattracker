@@ -131,6 +131,8 @@ resource storage 'Microsoft.Storage/storageAccounts@2023-05-01' = {
           action: 'Allow'
         }
       ]
+      // Explicit: an omitted ipRules is preserved by Azure on redeploy, leaving stale rules live (#339)
+      ipRules: []
     }
   }
 }
