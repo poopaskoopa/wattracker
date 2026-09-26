@@ -257,7 +257,9 @@ first: it makes no subprocess or network call, performs the local checks and
 prints every command a real run may issue, with secrets masked.
 
 ```sh
-export WATTRACKER_BUDGET_HOOK_TOKEN='...'   # from the approved secret system; never argv
+# Paste the token from the approved secret system at the silent prompt: no echo,
+# nothing in shell history, never argv.
+read -rs WATTRACKER_BUDGET_HOOK_TOKEN; export WATTRACKER_BUDGET_HOOK_TOKEN
 # plus WATTRACKER_CLOUD_SERVER_SECRET and WATTRACKER_OPERATOR_TOKEN (existing values), for step 2
 .venv/bin/python scripts/migrate_budget_hook.py \
   --resource-group "$RESOURCE_GROUP" --subscription "$SUBSCRIPTION_ID" \
@@ -275,9 +277,15 @@ prints the exact `--from-step N` command to resume with. Keep these points in mi
 - It never runs `az network vnet create`. If `wattracker-vnet` is missing, it
   stops. It creates `budget-hook-flex` only when that subnet is missing, using
   the exact subnet body that `main.bicep` declares.
-- Deleting a non-Flex app is the only destructive step. The script asks you to
-  type the app name, or accepts `--confirm-delete <name>` when no terminal is
-  attached.
+- Deleting the old Y1 app is the only destructive step. The script deletes
+  `--function-app-name` only when `az functionapp show` positively identifies
+  it as a Y1 Consumption app (`sku` `Dynamic`, `kind` including
+  `functionapp`, no `functionAppConfig`) and it is the app the parameter
+  file's `budgetHookFunctionAppName` names. A positively Flex app is kept;
+  any other shape stops the run for you to inspect by hand. The script asks
+  you to type the app name, or accepts `--confirm-delete <name>` when no
+  terminal is attached. The printed resume command never carries
+  `--confirm-delete`, so a resume that reaches the delete asks again.
 - Before editing the parameter file, the script refuses it if
   `budgetHookIpRules` is still present; delete that block by hand. It rewrites
   only `budgetHookPrincipalId`, `budgetHookHost` and
@@ -298,12 +306,17 @@ prints the exact `--from-step N` command to resume with. Keep these points in mi
   3. The same probe must answer 503 `public API unavailable` within the kill
      switch's 30s cache window plus a cold-start margin (90s in total).
   4. `POST /budget/clear`, with the host key and the app token, then **always**
-     runs, including after a failure or Ctrl-C.
+     runs, including after a failure, Ctrl-C, SIGTERM or SIGHUP.
   5. The probe must return to 404 within the same timeout.
 
   If the clear itself fails, the script prints a loud warning with the manual
   `curl` (secrets are read from variables) and exits nonzero: the cloud is
   still disabled.
+
+The run ends with a `paste into #339` block that holds only step results,
+statuses, timings, the Function App name and the subnet name, because #339 is
+public. The principal ID, host name and subnet resource ID follow in a
+separate `LOCAL ONLY` block: do not paste that block into GitHub.
 
 The manual commands in sections 1-4 remain the fallback. Section 4 is the
 manual drill.

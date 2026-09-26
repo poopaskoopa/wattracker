@@ -6,11 +6,15 @@ No test here runs a real ``az``, ``func``, network call, or touches
 from __future__ import annotations
 
 import importlib.util
+import http.server
 import json
+import shlex
 import shutil
+import signal
 import stat
 import subprocess
 import sys
+import threading
 from pathlib import Path
 
 import pytest
@@ -19,13 +23,14 @@ import pytest
 ROOT = Path(__file__).parents[1]
 SCRIPT = ROOT / "scripts" / "migrate_budget_hook.py"
 
-SUB = "11111111-2222-3333-4444-555555555555"
-RG = "wattracker-rg"
+# Identifier sentinels: none may appear in the public "paste into #339" block.
+SUB = "5e571e11-5ab5-4c1d-9e57-0000005e571e"
+RG = "rg-sentinel-7c1d"
 APP = "wattracker-budget-hook"
 BOOT = "wattrackerhook"
 STORAGE = "wattrackerapp"
-PID = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
-HOST = "wattracker-budget-hook-abc123.eastus2-01.azurewebsites.net"
+PID = "a1b2c3d4-5e57-4e11-8a11-5e571e11d00d"
+HOST = "wattracker-budget-hook-hostsentinel83.eastus2-01.azurewebsites.net"
 READ_HOST = "wattracker-read.proudcoast-test.eastus2.azurecontainerapps.io"
 SUBNET_ID = (
     f"/subscriptions/{SUB}/resourceGroups/{RG}/providers/Microsoft.Network"
@@ -47,7 +52,7 @@ PARAMS = (
     f"param storageName = '{STORAGE}'\n"
     "// Source: Function App output (defaultHostName, with no scheme).\n"
     "param budgetHookHost = 'old-y1-host.azurewebsites.net'\n"
-    "param budgetHookFunctionAppName = 'old-y1-name'\n"
+    f"param budgetHookFunctionAppName = '{APP}'\n"
     "param billingEmail = 'owner@example.invalid'\n"
     "param budgetHookPrincipalId = 'c2691b35-abcf-4b0c-bbb6-4fdbfc6e3798'  // old Y1 identity\n"
     "param readImage = 'ghcr.io/poopaskoopa/wattracker-cloud@sha256:" + "1" * 64 + "'\n"
@@ -94,9 +99,11 @@ class FakeWorld:
         self.subnet = state.get("subnet", "ok")  # ok | missing | a dict override
         self.vnet = state.get("vnet", True)
         self.vnet_prefixes = state.get("vnet_prefixes", ["10.42.0.0/16"])
+        self.vnet_location = state.get("vnet_location", "eastus2")
         self.boot_storage = state.get("boot_storage", True)
-        self.app = state.get("app", "y1")  # y1 | flex | missing | flex-unintegrated
-        self.identity = state.get("identity", self.app in ("flex", "y1"))
+        # y1 | y1-nested | flex | flex-flat | flex-unintegrated | missing | a dict
+        self.app = state.get("app", "y1")
+        self.identity = state.get("identity", self.app != "missing")
         self.tracked = state.get("tracked", False)
         self.deploy_rc = state.get("deploy_rc", 0)
         self.deploy_reaches_azure = state.get("deploy_reaches_azure", True)
@@ -132,13 +139,24 @@ class FakeWorld:
         }
 
     def _app(self):
-        if self.app == "y1":
+        if isinstance(self.app, dict):
+            return self.app
+        if self.app == "y1":  # the SDK model, flattened, as az prints a non-Flex site
             return {"name": APP, "kind": "functionapp,linux", "sku": "Dynamic",
+                    "functionAppConfig": None,
                     "defaultHostName": "old-y1-host.azurewebsites.net"}
-        integrated = SUBNET_ID if self.app == "flex" else None
-        return {"name": APP, "kind": "functionapp,linux", "sku": "FlexConsumption",
+        if self.app == "y1-nested":
+            return {"name": APP, "kind": "functionapp,linux", "properties": {
+                "sku": "Dynamic", "defaultHostName": "old-y1-host.azurewebsites.net"}}
+        integrated = SUBNET_ID if self.app in ("flex", "flex-flat") else None
+        site = {"sku": "FlexConsumption",
                 "functionAppConfig": {"runtime": {"name": "python"}},
                 "defaultHostName": HOST, "virtualNetworkSubnetId": integrated}
+        if self.app == "flex-flat":
+            return {"name": APP, "kind": "functionapp,linux", **site}
+        # az functionapp show returns the raw ARM resource for a Flex app.
+        return {"id": "/x", "name": APP, "kind": "functionapp,linux", "location": "East US 2",
+                "properties": site}
 
     # -- dispatch -------------------------------------------------------
     def __call__(self, argv, *, cwd=None, capture=True):
@@ -185,7 +203,8 @@ class FakeWorld:
         if argv[1:4] == ["network", "vnet", "show"]:
             if not self.vnet:
                 return self._missing(argv)
-            return self._json(argv, {"addressSpace": {"addressPrefixes": self.vnet_prefixes}})
+            return self._json(argv, {"location": self.vnet_location,
+                                     "addressSpace": {"addressPrefixes": self.vnet_prefixes}})
         if argv[1:5] == ["network", "vnet", "subnet", "show"]:
             if self.subnet == "missing":
                 return self._missing(argv)
@@ -624,7 +643,7 @@ def test_flex_app_that_is_not_integrated_stops(mig, repo, capsys):
 # ---------------------------------------------------------------------------
 
 
-def test_params_edit_changes_exactly_three_values_and_keeps_a_0600_backup(mig, repo):
+def test_params_edit_changes_only_the_budget_hook_values_and_keeps_a_0600_backup(mig, repo):
     params = repo / "infra/azure/main.local.bicepparam"
     original = params.read_bytes()
     code, _world, _http = _full_run(mig, repo)
@@ -633,7 +652,8 @@ def test_params_edit_changes_exactly_three_values_and_keeps_a_0600_backup(mig, r
     before, after = original.decode().splitlines(True), updated.decode().splitlines(True)
     assert len(before) == len(after)
     changed = [(a, b) for a, b in zip(before, after) if a != b]
-    assert len(changed) == 3
+    # Same app name (the delete needs it): only the principal and host change.
+    assert len(changed) == 2
     assert f"param budgetHookPrincipalId = '{PID}'  // old Y1 identity\n" in after
     assert f"param budgetHookHost = '{HOST}'\n" in after
     assert f"param budgetHookFunctionAppName = '{APP}'\n" in after
@@ -760,7 +780,7 @@ def test_deploy_cloud_failure_names_the_resume_step(mig, repo, capsys):
     assert code == 1
     assert "step 2 (parameters and deploy) failed" in err
     assert "--from-step 2" in err
-    assert f"--confirm-delete {APP}" in err
+    assert "--confirm-delete" not in err  # a resume that reaches the delete re-confirms
     assert not _commands(world, "appsettings", "set")
 
 
@@ -1212,7 +1232,7 @@ def test_resume_step_two_without_a_flex_app_points_back_to_step_one(mig, repo, c
     world = FakeWorld(repo, mig, app="y1")
     assert _migrator(mig, repo, world, from_step=2).execute() == 1
     err = capsys.readouterr().err
-    assert "not Flex Consumption; resume with --from-step 1" in err
+    assert "is not Flex Consumption (" in err and "resume with --from-step 1" in err
     assert not [call for call in world.calls if call[1].endswith("deploy_cloud.py")]
 
 
@@ -1228,3 +1248,339 @@ def test_unexpected_exception_is_reported_by_type_with_the_resume_step(mig, repo
     err = capsys.readouterr().err
     assert "unexpected ValueError" in err and "--from-step 3" in err
     _assert_no_secret(err)
+
+
+# ---------------------------------------------------------------------------
+# security review fixes
+# ---------------------------------------------------------------------------
+
+
+def _paste_block(out):
+    start = out.index("----- paste into #339 -----")
+    end = out.index("----- end -----", start)
+    return out[start:end + len("----- end -----")], out[end:]
+
+
+@pytest.mark.parametrize("state, cloud_kwargs", [
+    ({}, {}),
+    ({}, {"clear": ((500, b""),)}),
+    ({"role_assigned": False}, {}),
+])
+def test_paste_block_carries_no_identifiers(mig, repo, capsys, state, cloud_kwargs):
+    """#339 is public: ids and host names go only to the LOCAL ONLY block."""
+
+    _full_run(mig, repo, cloud=FakeCloud(mig, **cloud_kwargs), **state)
+    out = capsys.readouterr().out
+    paste, after = _paste_block(out)
+    for identifier in (SUB, RG, PID, HOST, SUBNET_ID, READ_HOST, "/subscriptions/",
+                       "hostsentinel83", "azurewebsites.net"):
+        assert identifier not in paste, identifier
+    assert f"- Function App: `{APP}`" in paste
+    assert "- subnet: `budget-hook-flex`" in paste
+    local = after[after.index("LOCAL ONLY -- do not paste into GitHub"):]
+    assert PID in local and HOST in local and SUBNET_ID in local
+
+
+@pytest.mark.parametrize("app", [
+    {"name": APP, "kind": "functionapp,linux", "sku": "ElasticPremium"},
+    {"name": APP, "kind": "functionapp,linux"},
+    {"name": APP, "kind": "app,linux", "sku": "Dynamic"},
+    {"name": APP, "sku": "Dynamic"},
+    {"name": APP, "kind": "functionapp,linux", "sku": "Dynamic",
+     "functionAppConfig": {"runtime": {"name": "python"}}},
+    {"name": APP, "kind": "functionapp,linux", "sku": "Dynamic", "functionAppConfig": {}},
+    {"name": APP, "kind": "functionapp,linux", "sku": "Dynamic",
+     "properties": {"sku": "FlexConsumption"}},
+    {},
+])
+def test_unknown_app_shape_stops_without_a_delete(mig, repo, capsys, app):
+    code, world, _http = _full_run(mig, repo, app=app)
+    err = capsys.readouterr().err
+    assert code == 1
+    assert "neither positively the old Y1" in err and "Inspect it by hand" in err
+    assert "kind=" in err and "sku=" in err
+    assert not _commands(world, "functionapp", "delete")
+    assert not _commands(world, "functionapp", "create")
+
+
+@pytest.mark.parametrize("app", [
+    {"name": APP, "kind": "functionapp,linux", "sku": "FlexConsumption"},
+    {"name": APP, "kind": "functionapp,linux", "functionAppConfig": {"runtime": {}}},
+    {"name": APP, "kind": "functionapp,linux", "properties": {"sku": "FlexConsumption"}},
+    {"name": APP, "kind": "functionapp,linux",
+     "properties": {"functionAppConfig": {"runtime": {"name": "python"}}}},
+])
+def test_flex_with_only_one_field_is_not_deleted_and_stops(mig, repo, capsys, app):
+    code, world, _http = _full_run(mig, repo, app=app)
+    assert code == 1
+    assert "neither positively the old Y1" in capsys.readouterr().err
+    assert not _commands(world, "functionapp", "delete")
+    assert not _commands(world, "functionapp", "create")
+
+
+@pytest.mark.parametrize("app", ["flex", "flex-flat"])
+def test_positively_flex_in_either_shape_is_kept(mig, repo, app):
+    code, world, _http = _full_run(mig, repo, app=app)
+    assert code == 0
+    assert not _commands(world, "functionapp", "delete")
+    assert not _commands(world, "functionapp", "create")
+
+
+@pytest.mark.parametrize("app", ["y1", "y1-nested"])
+def test_positively_y1_in_either_shape_is_deleted_after_confirmation(mig, repo, app):
+    code, world, _http = _full_run(mig, repo, app=app)
+    assert code == 0
+    assert len(_commands(world, "functionapp", "delete")) == 1
+
+
+def test_classify_app_requires_every_signal(mig):
+    y1 = {"kind": "functionapp", "sku": "Dynamic"}
+    flex = {"kind": "functionapp,linux", "sku": "FlexConsumption", "functionAppConfig": {"a": 1}}
+    assert mig.classify_app(y1) == mig.APP_Y1
+    assert mig.classify_app(flex) == mig.APP_FLEX
+    for key in y1:
+        assert mig.classify_app({k: v for k, v in y1.items() if k != key}) == mig.APP_UNKNOWN
+    for key in flex:
+        assert mig.classify_app({k: v for k, v in flex.items() if k != key}) == mig.APP_UNKNOWN
+
+
+@pytest.mark.parametrize("step", [1, 2, 3, 4])
+def test_resume_command_never_carries_confirm_delete(mig, repo, step):
+    opts = mig.Options(
+        resource_group=RG, subscription=SUB, function_app_name=APP,
+        bootstrap_storage_name=BOOT, params=repo / "infra/azure/main.local.bicepparam",
+        confirm_delete=APP,
+    )
+    command = opts.resume_command(step)
+    assert "--confirm-delete" not in shlex.split(command)
+    assert "--confirm-delete" not in command
+
+
+def test_resumed_run_that_reaches_the_delete_must_reconfirm(mig, repo, capsys):
+    """Step 1 fails after --confirm-delete; the printed resume refuses to delete unasked."""
+
+    code, world, _http = _full_run(mig, repo, app="y1", fail=(["az", "storage", "account", "create"],),
+                                   boot_storage=False)
+    err = capsys.readouterr().err
+    assert code == 1 and not _commands(world, "functionapp", "delete")
+    resume = shlex.split(err.split("resume with --from-step 1:\n", 1)[1].strip().splitlines()[0])
+    assert "--confirm-delete" not in resume
+    world = FakeWorld(repo, mig, app="y1")
+    code = _migrator(mig, repo, world, tty=False).execute()  # the resume's options
+    assert code == 1
+    assert f"--confirm-delete {APP}" in capsys.readouterr().err
+    assert not _commands(world, "functionapp", "delete")
+
+
+def test_delete_target_must_be_the_app_the_params_file_references(mig, repo, capsys):
+    params = repo / "infra/azure/main.local.bicepparam"
+    params.write_text(PARAMS.replace(f"budgetHookFunctionAppName = '{APP}'",
+                                     "budgetHookFunctionAppName = 'some-other-app'"))
+    world = FakeWorld(repo, mig, app="y1")
+    migrator = _migrator(mig, repo, world, confirm_delete=APP)
+    assert migrator.execute() == 1
+    err = capsys.readouterr().err
+    assert "is not the budgetHookFunctionAppName in the parameter file" in err
+    assert "nothing was deleted" in err
+    assert "some-other-app" not in err  # parameter contents are never printed
+    assert not _commands(world, "functionapp", "delete")
+    assert not _commands(world, "functionapp", "create")
+
+
+def test_delete_target_check_also_gates_the_interactive_prompt(mig, repo, capsys):
+    params = repo / "infra/azure/main.local.bicepparam"
+    params.write_text(PARAMS.replace(f"budgetHookFunctionAppName = '{APP}'",
+                                     "budgetHookFunctionAppName = 'some-other-app'"))
+    world = FakeWorld(repo, mig, app="y1")
+    # the default prompt fails the test if it is ever shown
+    assert _migrator(mig, repo, world, tty=True).execute() == 1
+    assert not _commands(world, "functionapp", "delete")
+
+
+def test_new_app_name_creates_without_touching_the_old_app(mig, repo):
+    """A different --function-app-name that does not exist: create, never delete."""
+
+    params = repo / "infra/azure/main.local.bicepparam"
+    params.write_text(PARAMS.replace(f"budgetHookFunctionAppName = '{APP}'",
+                                     "budgetHookFunctionAppName = 'old-y1-name'"))
+    original = params.read_bytes()
+    code, world, _http = _full_run(mig, repo, app="missing", identity=False)
+    assert code == 0
+    assert not _commands(world, "functionapp", "delete")
+    changed = [
+        (a, b) for a, b in zip(original.decode().splitlines(), params.read_text().splitlines())
+        if a != b
+    ]
+    assert len(changed) == 3
+    assert f"param budgetHookFunctionAppName = '{APP}'" in params.read_text()
+
+
+class _SignalCloud(FakeCloud):
+    """Delivers a real signal to this process on the first probe after disable."""
+
+    def __init__(self, mig, signum, **kwargs):
+        super().__init__(mig, **kwargs)
+        self.signum = signum
+        self.sent = False
+
+    def __call__(self, method, url, headers, timeout):
+        if method == "GET" and not self.sent and self.posts(DISABLE_URL):
+            self.sent = True
+            signal.raise_signal(self.signum)
+        return super().__call__(method, url, headers, timeout)
+
+
+@pytest.mark.parametrize("signame", ["SIGTERM", "SIGHUP"])
+def test_termination_signal_after_disable_still_clears(mig, repo, capsys, signame):
+    signum = getattr(signal, signame)
+    delivered = []
+
+    # Stands in for the default action (which would end pytest): records and returns.
+    def previous_handler(number, _frame):
+        delivered.append(number)
+
+    saved = signal.signal(signum, previous_handler)
+    try:
+        cloud = _SignalCloud(mig, signum)
+        code, _world, _ = _full_run(mig, repo, cloud=cloud)
+        after = signal.getsignal(signum)
+    finally:
+        signal.signal(signum, saved)
+    captured = capsys.readouterr()
+    assert cloud.sent
+    assert delivered == []  # the drill's handler took it, not the previous one
+    assert code == 130
+    assert _order(cloud) == [("POST", DISABLE_URL), ("POST", CLEAR_URL)]
+    assert cloud.calls[-1][1] == CLEAR_URL
+    assert "interrupted" in captured.err
+    assert "LEFT DISABLED" not in captured.err
+    assert after is previous_handler  # restored once the clear completed
+
+
+def test_signal_handlers_cover_disable_through_clear_only(mig, repo, capsys):
+    seen = {}
+    term = signal.getsignal(signal.SIGTERM)
+
+    class Probe(FakeCloud):
+        def __call__(self, method, url, headers, timeout):
+            seen.setdefault((method, url), signal.getsignal(signal.SIGTERM))
+            return super().__call__(method, url, headers, timeout)
+
+    cloud = Probe(mig)
+    code, _world, _ = _full_run(mig, repo, cloud=cloud)
+    capsys.readouterr()
+    assert code == 0
+    assert seen[("POST", DISABLE_URL)] is mig._raise_drill_signal
+    assert seen[("POST", CLEAR_URL)] is mig._raise_drill_signal
+    assert signal.getsignal(signal.SIGTERM) is term
+
+
+class _Recorder(http.server.BaseHTTPRequestHandler):
+    def log_message(self, *_args):
+        pass
+
+
+def _serve(handler):
+    server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), handler)
+    thread = threading.Thread(target=server.serve_forever, kwargs={"poll_interval": 0.05},
+                              daemon=True)
+    thread.start()
+    return server
+
+
+@pytest.mark.parametrize("method, code", [("GET", 307), ("POST", 307), ("POST", 302), ("POST", 303)])
+def test_default_http_opener_does_not_follow_a_real_redirect(mig, monkeypatch, method, code):
+    for name in ("http_proxy", "HTTP_PROXY", "all_proxy", "ALL_PROXY"):
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.setenv("no_proxy", "*")
+    monkeypatch.setenv("NO_PROXY", "*")
+    second_hits = []
+    first_hits = []
+
+    class Second(_Recorder):
+        def _any(self):
+            second_hits.append(dict(self.headers))
+            self.send_response(200)
+            self.end_headers()
+            self.wfile.write(b'{"status":"ok"}')
+
+        do_GET = do_POST = _any
+
+    second = _serve(Second)
+
+    class First(_Recorder):
+        def _any(self):
+            first_hits.append(dict(self.headers))
+            self.send_response(code)
+            self.send_header("Location", f"http://127.0.0.1:{second.server_port}/steal")
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+
+        do_GET = do_POST = _any
+
+    first = _serve(First)
+    try:
+        status, _body = mig._http_request(
+            method, f"http://127.0.0.1:{first.server_port}/budget/clear",
+            {"x-functions-key": HOST_KEY, "X-Wattracker-Budget-Token": TOKEN}, 5.0,
+            loopback_http_for_tests=True,
+        )
+    finally:
+        first.shutdown()
+        second.shutdown()
+    assert len(first_hits) == 1
+    assert {k.lower(): v for k, v in first_hits[0].items()}["x-functions-key"] == HOST_KEY
+    for headers in second_hits:
+        assert not {k.lower() for k in headers} & {"x-functions-key", "x-wattracker-budget-token"}
+    assert second_hits == []
+    assert status == code
+
+
+def test_loopback_seam_never_widens_production(mig):
+    with pytest.raises(mig.MigrationError, match="non-HTTPS"):
+        mig.default_http("GET", "http://127.0.0.1:9/x", {}, 1.0)
+    with pytest.raises(mig.MigrationError, match="non-HTTPS"):
+        mig._http_request("GET", "http://example.invalid/x", {}, 1.0, loopback_http_for_tests=True)
+    with pytest.raises(mig.MigrationError, match="non-HTTPS"):
+        mig._http_request("GET", "http://localhost:9/x", {}, 1.0, loopback_http_for_tests=True)
+
+
+def test_subnet_put_uses_the_vnet_location_and_warns_on_a_mismatch(mig, repo, capsys):
+    code, world, _http = _full_run(mig, repo, subnet="missing", vnet_location="centralus")
+    out = capsys.readouterr().out
+    assert code == 0
+    (put,) = [call for call in world.calls if call[:2] == ["az", "rest"]]
+    body = json.loads(put[put.index("--body") + 1])
+    assert body["properties"]["serviceEndpoints"] == [
+        {"service": "Microsoft.Storage", "locations": ["centralus"]}
+    ]
+    assert "warning: wattracker-vnet is in centralus but --location is eastus2" in out
+
+
+def test_vnet_without_a_location_stops_before_any_write(mig, repo, capsys):
+    code, world, _http = _full_run(mig, repo, subnet="missing", vnet_location=None)
+    assert code == 1
+    assert "wattracker-vnet reports no usable location" in capsys.readouterr().err
+    assert not [call for call in world.calls if call[:2] == ["az", "rest"]]
+
+
+def test_matching_vnet_location_does_not_warn(mig, repo, capsys):
+    code, _world, _http = _full_run(mig, repo, subnet="missing")
+    assert code == 0
+    assert "warning: wattracker-vnet is in" not in capsys.readouterr().out
+
+
+def test_manual_clear_hints_reading_the_token_without_history(mig, repo, capsys):
+    code, _cloud, _world, captured = _drill(mig, repo, capsys, clear=((500, b""),))
+    assert code != 0
+    assert "read -rs WATTRACKER_BUDGET_HOOK_TOKEN; export WATTRACKER_BUDGET_HOOK_TOKEN" in captured.err
+    assert "$WATTRACKER_BUDGET_HOOK_TOKEN" in captured.err
+    _assert_no_secret(captured.err)
+
+
+def test_deploy_doc_reads_the_token_without_shell_history():
+    doc = (ROOT / "infra/azure/DEPLOY.md").read_text()
+    section = doc.split("## Scripted migration (#339)", 1)[1].split("\n## ", 1)[0]
+    assert "read -rs WATTRACKER_BUDGET_HOOK_TOKEN; export WATTRACKER_BUDGET_HOOK_TOKEN" in section
+    assert "export WATTRACKER_BUDGET_HOOK_TOKEN='" not in section
+    assert 'export WATTRACKER_BUDGET_HOOK_TOKEN="' not in section

@@ -19,18 +19,21 @@ is read only from ``WATTRACKER_BUDGET_HOOK_TOKEN``.
 from __future__ import annotations
 
 import argparse
+import contextlib
 import ipaddress
 import json
 import os
 import re
 import shlex
 import shutil
+import signal
 import stat
 import subprocess
 import sys
 import tempfile
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -150,16 +153,30 @@ def default_runner(
 class _NoRedirect(urllib.request.HTTPRedirectHandler):
     """Never follow a redirect: it would re-send the host key to another URL."""
 
-    def redirect_request(self, *_args, **_kwargs):  # type: ignore[override]
+    def redirect_request(self, *args, **kwargs):  # type: ignore[override]
         return None
 
 
-def default_http(
-    method: str, url: str, headers: Mapping[str, str], timeout: float
+def _http_request(
+    method: str,
+    url: str,
+    headers: Mapping[str, str],
+    timeout: float,
+    *,
+    loopback_http_for_tests: bool = False,
 ) -> tuple[int, bytes]:
-    """One HTTPS request; returns (status, first 4 KiB of body). Never redirects."""
+    """The one HTTP path. Production (``default_http``) is HTTPS-only.
 
-    if not url.startswith("https://"):
+    ``loopback_http_for_tests`` exists only so a test can drive this exact
+    opener against a plain-HTTP server on 127.0.0.1; it never widens anything
+    beyond that loopback address.
+    """
+
+    parts = urllib.parse.urlsplit(url)
+    loopback = (
+        loopback_http_for_tests and parts.scheme == "http" and parts.hostname == "127.0.0.1"
+    )
+    if parts.scheme != "https" and not loopback:
         raise MigrationError("refusing a non-HTTPS drill URL")
     if method not in ("GET", "POST"):
         raise MigrationError("internal error: unsupported HTTP method")
@@ -180,6 +197,14 @@ def default_http(
         return int(exc.code), body
     except (urllib.error.URLError, TimeoutError, OSError):
         raise MigrationError("could not reach the budget hook over HTTPS") from None
+
+
+def default_http(
+    method: str, url: str, headers: Mapping[str, str], timeout: float
+) -> tuple[int, bytes]:
+    """One HTTPS request; returns (status, first 4 KiB of body). Never redirects."""
+
+    return _http_request(method, url, headers, timeout)
 
 
 # ---------------------------------------------------------------------------
@@ -227,8 +252,7 @@ class Options:
             "--bootstrap-storage-name", self.bootstrap_storage_name,
             "--params", str(self.params),
         ]
-        if self.confirm_delete is not None:
-            argv += ["--confirm-delete", self.confirm_delete]
+        # Never --confirm-delete: a resume that reaches the delete re-confirms.
         argv += ["--from-step", str(max(step, 1))]
         return shlex.join(argv)
 
@@ -267,6 +291,127 @@ def _utc(epoch: float) -> str:
 
 def _same_id(left: object, right: object) -> bool:
     return isinstance(left, str) and isinstance(right, str) and left.lower() == right.lower()
+
+
+# ---------------------------------------------------------------------------
+# What `az functionapp show` returned
+# ---------------------------------------------------------------------------
+
+APP_Y1 = "y1"
+APP_FLEX = "flex"
+APP_UNKNOWN = "unknown"
+
+
+class _Conflict(Exception):
+    pass
+
+
+def site_field(app: Mapping[str, Any], name: str) -> object:
+    """One Site property from either shape `az functionapp show` prints.
+
+    For a Flex app az returns the raw ARM resource, with the site properties
+    nested under ``properties``; for other apps it prints the SDK model, which
+    may be flattened.  A property present in both places with different values
+    raises ``_Conflict``.
+    """
+
+    top = app.get(name)
+    properties = app.get("properties")
+    nested = properties.get(name) if isinstance(properties, dict) else None
+    if top is not None and nested is not None and top != nested:
+        raise _Conflict(name)
+    return top if top is not None else nested
+
+
+def classify_app(app: Mapping[str, Any]) -> str:
+    """APP_Y1 only with ALL the Y1 signals; APP_FLEX only with ALL the Flex ones.
+
+    Y1 Consumption: ``kind`` lists ``functionapp``, ``sku`` is ``Dynamic`` and
+    there is no ``functionAppConfig``.  Flex Consumption: ``kind`` lists
+    ``functionapp``, ``sku`` is ``FlexConsumption`` and ``functionAppConfig``
+    is a non-empty object.  Anything else is APP_UNKNOWN, which must stop the
+    run: the delete is allowed only on a positive Y1 identification.
+    """
+
+    kind = app.get("kind")
+    kinds = {part.strip().lower() for part in kind.split(",")} if isinstance(kind, str) else set()
+    if "functionapp" not in kinds:
+        return APP_UNKNOWN
+    try:
+        sku = site_field(app, "sku")
+        config = site_field(app, "functionAppConfig")
+    except _Conflict:
+        return APP_UNKNOWN
+    sku = sku.lower() if isinstance(sku, str) else None
+    if sku == "dynamic" and config is None:
+        return APP_Y1
+    if sku == "flexconsumption" and isinstance(config, dict) and config:
+        return APP_FLEX
+    return APP_UNKNOWN
+
+
+def describe_app(app: Mapping[str, Any]) -> str:
+    """kind and sku for a message, from both shapes, bounded in length."""
+
+    properties = app.get("properties") if isinstance(app.get("properties"), dict) else {}
+    values = {
+        "kind": app.get("kind"),
+        "sku": app.get("sku"),
+        "properties.sku": properties.get("sku"),
+        "functionAppConfig": "present" if (
+            app.get("functionAppConfig") is not None
+            or properties.get("functionAppConfig") is not None
+        ) else "absent",
+    }
+    return ", ".join(f"{key}={str(value)[:40]!r}" for key, value in values.items())
+
+
+# ---------------------------------------------------------------------------
+# SIGTERM/SIGHUP during the drill
+# ---------------------------------------------------------------------------
+
+DRILL_SIGNALS = tuple(
+    signum for signum in (getattr(signal, "SIGTERM", None), getattr(signal, "SIGHUP", None))
+    if signum is not None
+)
+
+
+class DrillSignal(KeyboardInterrupt):
+    """SIGTERM/SIGHUP during the drill; handled exactly like Ctrl-C."""
+
+
+def _raise_drill_signal(signum: int, _frame: object) -> None:
+    raise DrillSignal(signum)
+
+
+@contextlib.contextmanager
+def termination_raises_interrupt():
+    """Turn SIGTERM and SIGHUP into KeyboardInterrupt for the block.
+
+    Their default action ends the process without running ``finally``, which
+    would skip /budget/clear and leave the public API disabled.  The previous
+    handlers are restored on exit.  If they cannot be installed (not the main
+    thread), this raises before the block runs, so nothing is disabled.
+    """
+
+    previous: dict[int, Any] = {}
+
+    def restore() -> None:
+        for signum, handler in previous.items():
+            signal.signal(signum, handler if handler is not None else signal.SIG_DFL)
+
+    try:
+        for signum in DRILL_SIGNALS:
+            previous[signum] = signal.signal(signum, _raise_drill_signal)
+    except (ValueError, OSError):
+        restore()
+        raise MigrationError(
+            "could not install the SIGTERM/SIGHUP handlers the drill needs; nothing was disabled"
+        ) from None
+    try:
+        yield
+    finally:
+        restore()
 
 
 # ---------------------------------------------------------------------------
@@ -378,6 +523,7 @@ class Migrator:
         self.records: list[StepRecord] = []
         self.drill: DrillRecord | None = None
         self.last_hook_status: int | None = None
+        self.vnet_location: str | None = None  # from `az network vnet show`, step 0
 
     # -- paths and ids ---------------------------------------------------
 
@@ -431,11 +577,13 @@ class Migrator:
             "--vnet-name", VNET_NAME, *self._rg(),
         )
 
-    def subnet_body(self) -> dict[str, Any]:
+    def subnet_body(self, location: str) -> dict[str, Any]:
         # Exactly the budgetHookSubnet properties in main.bicep, including the
         # delegation *name*: the CLI's `subnet create --delegations` names it
         # "0", and main.bicep renaming the delegation of an in-use subnet at
-        # step 2 is a change Azure can refuse.
+        # step 2 is a change Azure can refuse.  `location` is the VNet's own
+        # location: main.bicep's `location` is the one the VNet was deployed
+        # with, not necessarily --location.
         return {
             "properties": {
                 "addressPrefix": SUBNET_PREFIX,
@@ -443,19 +591,19 @@ class Migrator:
                     {"name": SUBNET_NAME, "properties": {"serviceName": SUBNET_DELEGATION}}
                 ],
                 "serviceEndpoints": [
-                    {"service": SUBNET_SERVICE_ENDPOINT, "locations": [self.o.location]}
+                    {"service": SUBNET_SERVICE_ENDPOINT, "locations": [location]}
                 ],
             }
         }
 
-    def cmd_subnet_put(self) -> list[str]:
+    def cmd_subnet_put(self, location: str) -> list[str]:
         url = (
             f"https://management.azure.com{self.expected_subnet_id}"
             f"?api-version={SUBNET_API_VERSION}"
         )
         return self._az(
             "rest", "--method", "put", "--url", url,
-            "--body", json.dumps(self.subnet_body(), separators=(",", ":")),
+            "--body", json.dumps(self.subnet_body(location), separators=(",", ":")),
             pin=False,
         )
 
@@ -528,7 +676,9 @@ class Migrator:
 
         keys = shlex.join(self.cmd_keys_list()[:-2] + ["--query", "functionKeys.default", "--output", "tsv"])
         return (
-            f'FUNCTION_HOST_KEY="$({keys})"\n'
+            f"# if {TOKEN_ENV} is not set in this shell, read it with no echo and no shell history:\n"
+            f"  read -rs {TOKEN_ENV}; export {TOKEN_ENV}\n"
+            f'  FUNCTION_HOST_KEY="$({keys})"\n'
             f"  curl --fail-with-body --request POST 'https://{self.facts.host or '<defaultHostName>'}"
             "/budget/clear' --header \"x-functions-key: $FUNCTION_HOST_KEY\" "
             f'--header "X-Wattracker-Budget-Token: ${TOKEN_ENV}"'
@@ -688,6 +838,16 @@ class Migrator:
                 contained = True
         if not contained:
             raise MigrationError(f"{VNET_NAME}'s address space does not contain {SUBNET_PREFIX}")
+        location = str(vnet.get("location") or "").replace(" ", "").lower()
+        if not _LOCATION_RE.fullmatch(location):
+            raise MigrationError(f"{VNET_NAME} reports no usable location")
+        self.vnet_location = location
+        if location != self.o.location:
+            self.say(
+                f"warning: {VNET_NAME} is in {location} but --location is {self.o.location}; "
+                f"the {SUBNET_NAME} subnet uses the VNet's location (as main.bicep does), "
+                "while the Flex app and bootstrap storage are created in --location"
+            )
 
     # -- step 1 ------------------------------------------------------------
 
@@ -717,8 +877,10 @@ class Migrator:
     def ensure_subnet(self) -> str:
         subnet = self.az_json(self.cmd_subnet_show(), allow_missing=True)
         if subnet is MISSING:
+            if self.vnet_location is None:
+                raise MigrationError("internal error: the VNet location was not read in preflight")
             self.say(f"creating subnet {SUBNET_NAME} ({SUBNET_PREFIX}) with the main.bicep body")
-            self.run_ok(self.cmd_subnet_put())
+            self.run_ok(self.cmd_subnet_put(self.vnet_location))
             for _attempt in range(20):
                 subnet = self.az_json(self.cmd_subnet_show(), allow_missing=True)
                 if isinstance(subnet, dict) and subnet.get("provisioningState") == "Succeeded":
@@ -737,21 +899,35 @@ class Migrator:
         self.facts.subnet_id = str(subnet_id)
         return str(subnet_id)
 
-    @staticmethod
-    def is_flex(app: Mapping[str, Any]) -> bool:
-        sku = str(app.get("sku") or "").lower()
-        return sku == "flexconsumption" or isinstance(app.get("functionAppConfig"), dict)
-
     def app_subnet(self, app: Mapping[str, Any]) -> object:
-        return app.get("virtualNetworkSubnetId") or (app.get("siteConfig") or {}).get(
-            "virtualNetworkSubnetId"
-        )
+        try:
+            subnet = site_field(app, "virtualNetworkSubnetId")
+        except _Conflict:
+            return None
+        if subnet:
+            return subnet
+        site_config = app.get("siteConfig")
+        if not isinstance(site_config, dict):
+            properties = app.get("properties")
+            site_config = properties.get("siteConfig") if isinstance(properties, dict) else None
+        return site_config.get("virtualNetworkSubnetId") if isinstance(site_config, dict) else None
+
+    def check_delete_target(self) -> None:
+        """Only the app the deployment currently references may be deleted."""
+
+        referenced = read_param(self.read_params_bytes(), "budgetHookFunctionAppName")
+        if referenced != self.o.function_app_name:
+            raise MigrationError(
+                "--function-app-name is not the budgetHookFunctionAppName in the parameter "
+                "file, so it is not the app this deployment references. Only that app may be "
+                "deleted; nothing was deleted. Check the name (to move to a new app name, "
+                "pass a name that does not exist yet: the old Y1 app is then left alone)"
+            )
 
     def confirm_delete(self, app: Mapping[str, Any]) -> None:
         name = self.o.function_app_name
-        description = f"kind={app.get('kind')!s}, sku={app.get('sku')!s}"
         self.say(
-            f"{name} exists and is NOT a Flex Consumption app ({description}).\n"
+            f"{name} is the old Y1 Consumption app ({describe_app(app)}).\n"
             "Deleting it is the one destructive step: it removes the old Y1 site, its "
             "host key and its system identity."
         )
@@ -783,10 +959,19 @@ class Migrator:
         app = self.az_json(self.cmd_app_show(), allow_missing=True)
         if app is not MISSING and not isinstance(app, dict):
             raise MigrationError("could not read the Function App")
-        if isinstance(app, dict) and self.is_flex(app):
+        shape = classify_app(app) if isinstance(app, dict) else None
+        if shape == APP_FLEX:
             self.say(f"{self.o.function_app_name} is already Flex Consumption; skipping delete/create")
+        elif shape == APP_UNKNOWN:
+            raise MigrationError(
+                f"{self.o.function_app_name} exists but is neither positively the old Y1 "
+                f"Consumption app nor positively Flex Consumption ({describe_app(app)}). "
+                "Nothing was deleted. Inspect it by hand with `az functionapp show` and "
+                "decide what it is before re-running"
+            )
         else:
-            if isinstance(app, dict):
+            if shape == APP_Y1:
+                self.check_delete_target()
                 self.confirm_delete(app)
                 self.say(f"deleting {self.o.function_app_name}")
                 self.run_ok(self.cmd_app_delete())
@@ -805,16 +990,20 @@ class Migrator:
             raise MigrationError(
                 f"{self.o.function_app_name} does not exist; resume with --from-step 1"
             )
-        if not self.is_flex(app):
+        if classify_app(app) != APP_FLEX:
             raise MigrationError(
-                f"{self.o.function_app_name} is not Flex Consumption; resume with --from-step 1"
+                f"{self.o.function_app_name} is not Flex Consumption ({describe_app(app)}); "
+                "resume with --from-step 1"
             )
         if not _same_id(self.app_subnet(app), self.expected_subnet_id):
             raise MigrationError(
                 f"{self.o.function_app_name} is not integrated with {SUBNET_NAME}; integrate it "
                 "(or delete it by hand) and resume with --from-step 1"
             )
-        host = str(app.get("defaultHostName") or "").lower()
+        try:
+            host = str(site_field(app, "defaultHostName") or "").lower()
+        except _Conflict:
+            host = ""
         if not _HOST_RE.fullmatch(host):
             raise MigrationError("the Function App has no valid defaultHostName")
         identity = self.az_json(self.cmd_identity_show(), allow_missing=True)
@@ -1103,30 +1292,37 @@ class Migrator:
         key = self.host_key()
         failure: BaseException | None = None
         self.last_hook_status = None
+        cleared = False
         try:
-            try:
-                self.say(
-                    "POST /budget/disable-public-api (host key only, masked): the public API "
-                    "goes down for under a minute"
-                )
-                self.drill.disable = self.hook_post(
-                    "/budget/disable-public-api", {"x-functions-key": key}
-                )
-                self.drill.shutdown_seconds = self.observe(
-                    probe_url, 503, PUBLIC_UNAVAILABLE_DETAIL, "shutdown"
-                )
-                self.say(f"shutdown observed: HTTP 503 after {self.drill.shutdown_seconds:.0f}s")
-            except BaseException as exc:  # KeyboardInterrupt included: clear must still run
-                failure = exc
-                if self.drill.disable is None:
-                    self.drill.disable = self.last_hook_status
-            if not self.clear_always(key, token):
-                raise MigrationError(
-                    "the cloud is LEFT DISABLED because /budget/clear failed; clear it by "
-                    "hand (see the warning above) before anything else"
-                )
+            # From just before disable until the clear completes, SIGTERM and
+            # SIGHUP raise KeyboardInterrupt, so the clear below still runs.
+            with termination_raises_interrupt():
+                try:
+                    self.say(
+                        "POST /budget/disable-public-api (host key only, masked): the public "
+                        "API goes down for under a minute"
+                    )
+                    self.drill.disable = self.hook_post(
+                        "/budget/disable-public-api", {"x-functions-key": key}
+                    )
+                    self.drill.shutdown_seconds = self.observe(
+                        probe_url, 503, PUBLIC_UNAVAILABLE_DETAIL, "shutdown"
+                    )
+                    self.say(
+                        f"shutdown observed: HTTP 503 after {self.drill.shutdown_seconds:.0f}s"
+                    )
+                except BaseException as exc:  # KeyboardInterrupt included: clear must still run
+                    failure = exc
+                    if self.drill.disable is None:
+                        self.drill.disable = self.last_hook_status
+                cleared = self.clear_always(key, token)
         finally:
             del key
+        if not cleared:
+            raise MigrationError(
+                "the cloud is LEFT DISABLED because /budget/clear failed; clear it by "
+                "hand (see the warning above) before anything else"
+            )
         if isinstance(failure, KeyboardInterrupt):
             raise failure
         try:
@@ -1179,14 +1375,20 @@ class Migrator:
         if self.o.from_step <= 1:
             say("\n[step 1: Flex Function]")
             say("  " + shlex.join(self.cmd_subnet_show()))
-            say("  if the subnet is missing: " + shlex.join(self.cmd_subnet_put()))
+            say(
+                "  if the subnet is missing: "
+                + shlex.join(self.cmd_subnet_put(f"<{VNET_NAME} location>"))
+            )
             say("  " + shlex.join(self.cmd_bootstrap_storage_show()))
             say("  if missing: " + shlex.join(self.cmd_bootstrap_storage_create()))
             say("  " + shlex.join(self.cmd_app_show()))
             say(
-                "  if the app exists and is not Flex, after the typed name confirmation: "
+                "  only if the app is positively the old Y1 Consumption app (sku Dynamic, kind "
+                "functionapp, no functionAppConfig), is the budgetHookFunctionAppName in the "
+                "parameter file, and after the typed name confirmation: "
                 + shlex.join(self.cmd_app_delete())
             )
+            say("  any other existing app that is not positively Flex stops the run")
             say("  unless already Flex: " + shlex.join(self.cmd_app_create(self.expected_subnet_id)))
             say("  " + shlex.join(self.cmd_identity_show()))
             say("  if no identity: " + shlex.join(self.cmd_identity_assign()))
@@ -1302,9 +1504,10 @@ class Migrator:
                 f"{record.started} | {record.finished} |"
             )
         lines.append("")
-        lines.append(f"- principalId: `{self.facts.principal_id or 'n/a'}`")
-        lines.append(f"- defaultHostName: `{self.facts.host or 'n/a'}`")
-        lines.append(f"- subnet: `{self.facts.subnet_id or 'n/a'}`")
+        # Only non-identifying facts: #339 is public.  No subscription, resource
+        # group, resource ID, host name or principal ID in this block.
+        lines.append(f"- Function App: `{self.o.function_app_name}`")
+        lines.append(f"- subnet: `{SUBNET_NAME if self.facts.subnet_id else 'n/a'}`")
         drill = self.drill
         if drill is not None:
             def status(value: int | None) -> str:
@@ -1323,6 +1526,14 @@ class Migrator:
             if drill.cloud_left_disabled:
                 lines.append("  - **the public API was left DISABLED: clear failed**")
         lines.append("----- end -----")
+        lines += [
+            "",
+            "===== LOCAL ONLY -- do not paste into GitHub =====",
+            f"principalId:     {self.facts.principal_id or 'n/a'}",
+            f"defaultHostName: {self.facts.host or 'n/a'}",
+            f"subnet id:       {self.facts.subnet_id or 'n/a'}",
+            "===== end LOCAL ONLY =====",
+        ]
         self.say("\n".join(lines))
 
 
