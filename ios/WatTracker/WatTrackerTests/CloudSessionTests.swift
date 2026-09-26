@@ -554,7 +554,7 @@ final class CloudSessionTests: XCTestCase {
                     id: "workout-1", kind: "workout", revision: 3, data: #"{"tss":80}"#
                 )],
                 storedAt: Date()
-                ),
+            ),
             for: .profile
         )
         let rig = harness(cache: cache) { request, _ in
@@ -593,22 +593,38 @@ final class CloudSessionTests: XCTestCase {
                 )
             }
             return .json(
-                #"{"items":[{"id":"calendar-new-2","kind":"calendar_day","revision":7,"data":{"date":"2026-09-03"}}],"revision":7,"next_cursor":null}"#
+                CloudFixtures.collection(
+                    items: [
+                        #"{"id":"calendar-new-2","kind":"calendar_day","revision":7,"data":{"date":"2026-09-03"}}"#,
+                        CloudFixtures.tombstone(
+                            id: "calendar-old", kind: "calendar_day", revision: 8
+                        ),
+                    ],
+                    revision: 8
+                )
             )
         }
 
         let snapshot = try await rig.session.load(.calendar)
-        XCTAssertEqual(snapshot.revision, 7)
+        XCTAssertEqual(snapshot.revision, 8)
         XCTAssertEqual(
             snapshot.items.map(\.id),
-            ["calendar-new-1", "calendar-new-2", "calendar-old"]
+            ["calendar-new-1", "calendar-new-2"]
+        )
+        XCTAssertFalse(
+            rig.cache.load(.calendar)?.items.contains { $0.id == "calendar-old" } ?? true,
+            "the tombstone removes the cached calendar day"
+        )
+        XCTAssertNil(
+            CalendarData(snapshot: snapshot).entry(for: "2026-09-01"),
+            "the tombstoned day is absent from the calendar projection"
         )
         let reads = rig.transport.requests(matching: "/api/v1/context/calendar")
         XCTAssertEqual(reads.count, 2)
         XCTAssertEqual(reads[0].queryItems["since"], "5")
         XCTAssertNil(reads[0].queryItems["cursor"])
         XCTAssertEqual(reads[1].queryItems["cursor"], "cursor-2")
-        XCTAssertEqual(rig.cache.load(.calendar)?.revision, 7)
+        XCTAssertEqual(rig.cache.load(.calendar)?.revision, 8)
         XCTAssertEqual(rig.cache.load(.calendar)?.items.map(\.id), snapshot.items.map(\.id))
     }
 
