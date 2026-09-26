@@ -204,7 +204,7 @@ class CloudSession(
     }
 
     /** Revoke this device on the server and forget it locally. */
-    suspend fun removeDevice() {
+    suspend fun removeDevice(): RemoveDeviceResult {
         val (active, generation) = mutex.withLock { activeDevice() to lifecycleGeneration }
         val result = try {
             client.revoke(active.credentialId, active)
@@ -213,14 +213,24 @@ class CloudSession(
         } catch (e: IOException) {
             throw Failure.Offline()
         }
-        when (result) {
-            is CloudApiResult.Failure -> throw Failure.Server(result.status)
+        return when (result) {
             is CloudApiResult.Success -> {
                 val newGeneration = mutex.withLock {
                     if (lifecycleGeneration != generation) throw lifecycleFailure()
                     signOutState()
                 }
                 removeDisk(newGeneration)
+                RemoveDeviceResult.ServerRevoked
+            }
+            is CloudApiResult.Failure -> {
+                if (result.status == 404) {
+                    // The rider asked for this phone to stop reading, and that can be done without the server:
+                    // on 404 (e.g., missing route or credential unknown on server), fall back to local signOut().
+                    signOut()
+                    RemoveDeviceResult.LocalFallback
+                } else {
+                    throw Failure.Server(result.status)
+                }
             }
         }
     }

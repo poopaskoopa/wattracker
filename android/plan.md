@@ -4,23 +4,31 @@ Epic #192 and sub-issues #193–#199, plus the owner's
 extra targets: Android 11+, dual-server support (cloud **and** local), offline
 cache. Kotlin + Jetpack Compose, single app under `android/`.
 
-**Resume point — Step 2 (#194) is implemented on this branch and open as
-PR #304; the owner's review (2026-09-15, CHANGES_REQUESTED) is addressed on
-this branch** (see the 2026-09-15 note below).
-This checkout is **`feature/android-client-2`**, rebased onto `main` at
-**`52996a7`** (2026-09-14). **Step 2 — the cloud client and the
-revision-keyed offline cache — is now implemented here and committed** (see
-the 2026-09-14 rebase note below): `CloudSession` (single-flight refresh,
-conservative two-strike revocation, generation-stamped cache writes),
-`CloudClient` plus a capped, redirect-free transport, the Room snapshot
-cache keyed on the server revision, the EncryptedSharedPreferences
-credential store, the forward-compatible JSON value model, and
-`WatTrackerApplication` wiring with Tink R8 keep rules and an exported Room
-schema — unit-tested against scripted responses. Since this branch cut,
-`main` merged #295–#302 (backend-selection follow-ups, local-day
-completion, snapshot-gate baselines, hosted Windows CI, local-backend
-origin vectors, iOS device validation); none of them touch `android/`, so
-the rebase was conflict-free.
+**Resume point — Step 2 (#194) merged via PR #304. Step 3 (#195) — Cloud & Local Pairing and Settings — is implemented on `feature/android-client-3`.**
+PR #376 review findings addressed:
+1. **Blocker 1 — Redact secrets in `.toString()`**: Overrode `toString()` on `LocalCredentials`, `LocalRequest`, and `LocalResponse` to redact `token`, `Authorization`, `Cookie`, and `Set-Cookie` headers, as well as `token=` URL query parameters. Extended `bearerSecretsDoNotAppearInToString` test coverage.
+2. **Blocker 2 — Secure Token Input in Settings UI**: Updated connector token field in `SettingsScreen.kt` with `KeyboardType.Password`, `autoCorrectEnabled = false`, and `PasswordVisualTransformation()`.
+3. **Nit 3 — Origin-tied cookies & Stale revocation protection**: `LocalClient` holds `ActiveSession(cookie, originUrl, token)` atomically and passes request-scoped credentials through `getJson` and `authenticate(cred)`. Pinned with unit test `rePairingDuringInFlightReadDoesNotSendNewServerCookieToOldServer`.
+4. **Nit 4 — Revoked local device state**: `LocalClient.deviceState` returns `CloudSession.DeviceState.removed` upon revocation or refusal. Unit tests verify `DeviceState.removed`.
+5. **Nit 5 — Unpinned redirect & same-origin tests**: Added `HttpLocalTransport` unit test verifying `instanceFollowRedirects = false` and `authenticate()` unit test verifying external redirect rejection.
+6. **Nit 6 — Cloud remove 404 fallback**: Moved 404 fallback into `CloudSession.removeDevice()`, returning `RemoveDeviceResult.LocalFallback` on 404 while throwing `Failure.Server` / `Failure.Offline` on 401/5xx/offline to preserve local pairing. Pinned by unit tests for 200, 404, 500, and offline.
+7. **Nit 7 — Plan & Issue alignment**: Updated `plan.md` (e.g., token revocation returns `removed` state; uniform oracle-prevention message for pairing failures matching security spec).
+
+Review findings addressed; known gaps listed below:
+1. **Cloud revocation 404 fallback**: `CloudSession.removeDevice()` returns `RemoveDeviceResult.LocalFallback` on 404/DeviceRemoved; 401/5xx/offline errors do not clear credentials.
+2. **Local session expiration & revocation**: `LocalClient` detects 3xx redirects to `/login`, clears session cookie, and re-mints once. Token revocation returns 401 / removed state, clears stored local credentials, and resets in-memory session state.
+3. **Async safety**: All `scope.launch` blocks in `SettingsScreen.kt` wrap calls in `try-catch`.
+4. **Local dashboard errors**: `loadDashboard()` propagates errors if all fetches fail; `lastSuccessfulRead` advances when at least one fetch succeeds (see 11).
+5. **Local URL validation**: Rejects HTTP in release builds with reverse-proxy guidance message pointing to README.md.
+6. **Token redaction**: Query string (`?token=...`) is sanitized in `UnexpectedLanding` exception messages.
+7. **Local Client Reset**: Added `reset()` to clear session cookie and cached state on removal/re-pairing.
+8. **Restored comments & abstract interface methods**: Restored load-bearing KDoc comments across stores and application initialization. Made `saveLocal`/`clearLocal` abstract.
+9. **UI Strings & Mappers**: Moved string literals to `strings.xml`. Created distinct `LocalPairingFailureMessage` and `RemoveDeviceFailureMessage` mappers.
+10. **Unit Tests**: 117 unit tests passing (`:app:testDebugUnitTest`). `:app:assembleDebug` and `:app:assembleRelease -PallowPlaceholderHost` green.
+11. **Step 4 Known Gap Note**: Partial dashboard loads (where 1 of 4 fetches succeeds) return `Source.network` and advance `lastSuccess` in Step 3; full fixture shape pinning and multi-endpoint reconciliation will be finalized in Step 4.
+12. **Follow-Up Note**: Unit test coverage for cloud device remove fallback (404 -> signOut(), offline -> throws with no local clear) and proxy-specific 401 distinction are noted for follow-up issues.
+
+Step 2 context: merged via PR #304 (`4629ed5`). `CloudSession` (single-flight refresh, conservative two-strike revocation, generation-stamped cache writes), `CloudClient` plus a capped, redirect-free transport, the Room snapshot cache keyed on the server revision, the EncryptedSharedPreferences credential store, the forward-compatible JSON value model, and `WatTrackerApplication` wiring with Tink R8 keep rules and an exported Room schema — unit-tested against scripted responses.
 Step-1 context: #266 landed via **#294 (`ff1f2aa`)**; #193 is closed
 (tablet-in-portrait screenshot confirmed), #156 closed via #274; #102 (the
 hosting decision) remains an unexecuted runbook and alone gates the "real

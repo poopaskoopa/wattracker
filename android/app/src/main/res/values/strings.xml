@@ -9,27 +9,56 @@
     <string name="destination_settings">Settings</string>
     <string name="app_shell_title">WatTracker</string>
 
-    <!--
-        Screen stubs. They say what the screen will hold and which issue fills
-        it in, and they show no fake numbers and no fake charts: a placeholder
-        that looks like data is a screenshot waiting to be mistaken for a
-        working feature.
-    -->
+    <!-- Subtitles -->
     <string name="screen_dashboard_subtitle">Training status and load</string>
     <string name="screen_activities_subtitle">Every ride, newest first</string>
     <string name="screen_calendar_subtitle">Plan, rides and races by day</string>
     <string name="screen_volume_subtitle">Training load by week</string>
     <string name="screen_settings_subtitle">Pairing, backend and device state</string>
 
+    <!-- Screen stubs -->
     <string name="stub_dashboard_note">Training status: CTL / ATL / TSB, load chart, current FTP and recent rides.</string>
     <string name="stub_activities_note">The ride list and ride detail: summary, power trace, heart rate and zone time.</string>
     <string name="stub_calendar_note">The month grid: planned workouts, completed rides, races and out-of-training phase.</string>
     <string name="stub_volume_note">Weekly hours, TSS, distance and calories.</string>
-    <string name="stub_settings_note">Backend pairing (cloud / local), device state and key type. Pairing arrives with the client work.</string>
+    <string name="stub_settings_note">Backend pairing (cloud / local), device state and key type.</string>
 
     <string name="stub_issue_dashboard">#196</string>
     <string name="stub_issue_activities">#197</string>
     <string name="stub_issue_calendar">#198</string>
     <string name="stub_issue_volume">#198</string>
     <string name="stub_issue_settings">#195</string>
+
+    <!-- Settings & Pairing Strings -->
+    <string name="settings_backend_title">Backend Source</string>
+    <string name="settings_tab_cloud">Cloud Backend</string>
+    <string name="settings_tab_local">Local Desktop</string>
+    <string name="settings_active_badge">ACTIVE BACKEND</string>
+    <string name="settings_set_active">Set as Active Backend</string>
+
+    <string name="settings_cloud_paired_title">Cloud Device Paired</string>
+    <string name="settings_cloud_unpaired_title">Pair Cloud Device</string>
+    <string name="settings_cloud_unpaired_sub">Enter the 12-symbol pairing code shown in the desktop app or cloud settings.</string>
+    <string name="settings_cloud_degraded_warning">Warning: Encrypted key storage is unavailable on this device. Pairing will last for this session only and will be lost when the app closes.</string>
+
+    <string name="settings_local_paired_title">Local Desktop Paired</string>
+    <string name="settings_local_unpaired_title">Pair Local Desktop</string>
+    <string name="settings_local_unpaired_sub">Connect to your desktop server over HTTPS. Open the desktop web UI -> Settings -> pair a device -> copy token.</string>
+    <string name="settings_local_revoke_notice">To revoke server access completely, open desktop web settings -> pair a device -> Revoke.</string>
+
+    <string name="settings_paired_at">Paired: %1$s</string>
+    <string name="settings_remove_device">Remove this device</string>
+    <string name="settings_removing">Removing...</string>
+    <string name="settings_pair_button">Pair Device</string>
+    <string name="settings_pairing">Pairing...</string>
+    <string name="settings_pair_local_button">Pair Local Desktop</string>
+    <string name="settings_connecting">Connecting...</string>
+
+    <string name="settings_cloud_remove_fallback_notice">Could not confirm with the server; the pairing may already be gone — the device list will settle it.</string>
+    <string name="settings_local_remove_failed">Could not clear local credentials. Try again.</string>
+
+    <string name="settings_code_label">Pairing Code (XXXX-XXXX-XXXX)</string>
+    <string name="settings_device_label">Device Label</string>
+    <string name="settings_server_url_label">Server Address (e.g. https://192.168.1.10:8000)</string>
+    <string name="settings_token_label">Connector Token</string>
 </resources>
