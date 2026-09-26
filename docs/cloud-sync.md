@@ -772,11 +772,34 @@ credential this application issues can read.
 
 `operatorWipeBlobRoleDefinition` and `operatorWipeTableRoleDefinition` are two
 custom roles: blob read + delete on `wattracker-objects`, and entity read +
-delete assignable only to `CloudObjects` and `CloudAuth`. Neither is assigned
-to any container app identity. Both are assigned only when a deployment sets
-`operatorWipePrincipalId`, and `main.bicepparam` leaves it empty, so the
-default deployment defines the capability and gives it to nobody. The sync
-identity is unchanged and still holds no delete anywhere.
+delete assignable only to `CloudObjects` and `CloudAuth`. They are assigned
+behind two independent switches, both off in `main.bicepparam`, so the default
+deployment defines the capability and gives it to nobody:
+
+- `operatorWipePrincipalId` names an operator principal (#169's CLI);
+- `enableAccountWipe` gives them to the **read identity** and, in the same
+  deployment, sets `WATTRACKER_CLOUD_ALLOW_ACCOUNT_WIPE=1` on the read app, so
+  the rider wipe route and its grant cannot diverge (owner decision,
+  2026-09-26). The accepted risk: a compromised read app can delete cloud
+  copies, which are replicas of each rider's desktop, and it could already read
+  all of them. Setting it back to false removes only the route flag: the
+  deployment is incremental, so the read identity's four wipe assignments stay
+  until they are deleted by hand (`infra/azure/DEPLOY.md`, "Rollback").
+
+The sync identity is unchanged and still holds no delete anywhere.
+
+Before it deletes anything, the route proves delete permission on the object
+blobs, `CloudObjects` and `CloudAuth` by deleting random keys that cannot exist.
+"Not found" means allowed. A 403 or any other error means `503 cloud wipe
+unavailable` with nothing deleted. This covers the minutes of RBAC propagation
+during which a credentials-first wipe would otherwise strand the data.
+The purge also holds the scope's blob lease, which needs `blobs/write`. The
+same switches assign `wipeLockRoleDefinition` for that. Its only action is
+`blobs/write`, and every assignment carries an ABAC path condition confining it
+to `<64-hex namespace>:<scope>/__lock`. The read app can delete rider data but
+can't overwrite it. `infra/azure/DEPLOY.md` covers turning the wipe on and gives
+the exact condition. The condition is unverified live; if it is wrong, the
+probe refuses the wipe with 503.
 
 `CloudControl` is absent from both roles on purpose: not being able to delete
 the kill switch is better than being trusted not to.
@@ -1077,9 +1100,14 @@ hard billing ceiling.
       virtual-network sources.
 - [ ] Verify each managed identity has only its documented data-plane role —
       in particular, `entities/delete` on `CloudAuth` is held by the read
-      identity alone through `authSweeperRoleDefinition`, and no container app
-      identity holds `operatorWipeBlobRoleDefinition` or
-      `operatorWipeTableRoleDefinition`.
+      identity alone through `authSweeperRoleDefinition`, the sync identity
+      holds neither `operatorWipeBlobRoleDefinition` nor
+      `operatorWipeTableRoleDefinition`, and the read identity holds them only
+      when `enableAccountWipe` is true.
+- [ ] With `enableAccountWipe` true, confirm the read identity's
+      `wipeLockRoleDefinition` assignment shows the lock-path ABAC condition,
+      and that a `blobs/write` by that identity to an `object:*.json` blob is
+      refused with 403 while a wipe of a test scope succeeds.
 - [ ] Confirm `operatorWipePrincipalId` is empty unless a named operator
       principal is meant to hold the wipe roles, and that neither wipe role is
       assignable to `CloudControl`.

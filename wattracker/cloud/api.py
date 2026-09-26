@@ -18,6 +18,7 @@ from typing import Any, Callable, Mapping, Optional
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, Response
+from fastapi.concurrency import run_in_threadpool
 
 from .limits import (
     DurableKillSwitch,
@@ -52,7 +53,7 @@ from .security import (
     verify_signature,
 )
 from .storage import MAX_QUERY_LIMIT, MemoryTenantStore, StorageConflict, StaleRevision
-from .wipe import wipe_scope
+from .wipe import wipe_capability_proven, wipe_scope
 
 _NOT_FOUND_BODY = {"detail": "not found"}
 _MAX_TIMESTAMP = 60 * 5
@@ -1759,6 +1760,21 @@ def create_cloud_app(
                 # Refuse rather than claim that a self-destruct completed.
                 return _error(503, "cloud wipe unavailable")
 
+            # Prove delete permission on every store before touching any of
+            # them.  ``wipe_scope`` removes credentials first, so a grant that
+            # has not propagated to the data stores yet (Azure RBAC lags a
+            # deployment by minutes) would otherwise delete this rider's
+            # credentials and then 403 on the purge -- data left in the cloud
+            # with no credential to retry with.  Refused here, nothing has
+            # been deleted and the rider can simply try again later.
+            if not wipe_capability_proven(
+                namespace,
+                scope,
+                store=state.store,
+                security_backend=security_backend,
+            ):
+                return _error(503, "cloud wipe unavailable")
+
             # Construct this before deleting credentials.  In particular, do
             # not serialize the credential or report after the self-destruct.
             success = Response(
@@ -1767,7 +1783,12 @@ def create_cloud_app(
                 headers={"Cache-Control": "no-store"},
             )
             try:
-                report = wipe_scope(
+                # Off the event loop: the purge may wait up to
+                # ``PURGE_LEASE_DEADLINE_SECONDS`` for a sync that holds the
+                # scope lease, and a blocking wait here would stall every
+                # other request this process is serving.
+                report = await run_in_threadpool(
+                    wipe_scope,
                     namespace,
                     scope,
                     irreversible=True,

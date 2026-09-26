@@ -145,15 +145,111 @@ signature this whole path exists to produce.
 
 ### Account wipe capability
 
-The account wipe route is disabled by default. Leave
-`WATTRACKER_CLOUD_ALLOW_ACCOUNT_WIPE` unset (or set it to `0`) until the
-read-plane identity has an explicitly reviewed **delete grant** for every
-CloudAuth and tenant-storage record the wipe implementation must remove. Grant
-that delete permission first, verify it on the deployment identity, and only
-then enable the flag with `WATTRACKER_CLOUD_ALLOW_ACCOUNT_WIPE=1`. The flag is
-an application gate, not a substitute for the grant; enabling it without the
-grant can leave a destructive request only partially completed. This change
-does not alter any Bicep role assignment.
+The rider account wipe (`POST /api/v1/account/wipe`, #170) is off by default,
+and one template switch turns it on: `enableAccountWipe` in `main.bicep`.
+That single parameter controls **both** halves, so they cannot diverge:
+
+- the read identity's delete grant — the existing scope-wipe roles, assigned to
+  the read identity on the `wattracker-objects` container, `CloudObjects` and
+  `CloudAuth`, never `CloudControl`; and
+- the route — `WATTRACKER_CLOUD_ALLOW_ACCOUNT_WIPE=1` in the read app's
+  environment. The sync app never gets it.
+
+Do not set `WATTRACKER_CLOUD_ALLOW_ACCOUNT_WIPE` by hand on either app; let the
+switch set it. The operator path (`operatorWipePrincipalId`) is separate and
+unchanged.
+
+**The accepted risk (owner decision, 2026-09-26).** With the switch on, a
+compromise of the internet-facing read app can delete riders' cloud copies. That
+is accepted because the cloud holds a replica: each rider's desktop is the
+source of truth and can sync again. Confidentiality does not change, because
+the read identity can already read everything the grant lets it delete.
+
+To enable rider wipes:
+
+1. Set `param enableAccountWipe = true` in your untracked
+   `main.local.bicepparam`. The committed skeleton keeps it `false`.
+2. Preview with `.venv/bin/python scripts/deploy_cloud.py --dry-run`, then
+   redeploy through the normal path below. The read app's new revision is
+   ordered after the read identity's four role assignments (`dependsOn`).
+3. On each rider's desktop, set `WATTRACKER_DESKTOP_ALLOW_ACCOUNT_WIPE=1` as
+   well. Without it the desktop never shows the wipe button, whatever the
+   server allows.
+
+**A wipe while RBAC is still propagating returns 503 and deletes nothing.**
+Azure can take several minutes to apply a new role assignment. The wipe
+deletes credentials before data, so a wipe that ran before the grant arrived
+could delete the rider's credentials and then fail on the data, leaving data
+nobody can reach. The route therefore proves delete permission on the object
+blobs, `CloudObjects` and `CloudAuth` before it deletes anything. Each probe
+deletes a random key that cannot exist: "not found" means allowed, and anything
+else, including a 403, means not allowed. If any probe fails, the route returns
+`503 cloud wipe unavailable` with nothing deleted. Retry after a few minutes.
+
+**The scope lease, and the one write the read identity gets.** `purge_scope`
+holds the scope's blob lease while it deletes. Creating and leasing that lock
+blob needs the blob `write` data action (Put Blob and Lease Blob both map to
+it; there is no blob-level lease action, see #330). The delete roles don't
+carry it. So the same switch also assigns the custom role
+`Wattracker Scope Wipe Lock`, whose only action is `blobs/write`, on the objects
+container. The assignment always carries an ABAC condition (`conditionVersion
+'2.0'`), so the write applies only to blob paths shaped like the lock blob
+`<64-hex namespace>:<scope>/__lock`:
+
+```
+((!(ActionMatches{'Microsoft.Storage/storageAccounts/blobServices/containers/blobs/write'})) OR (@Resource[Microsoft.Storage/storageAccounts/blobServices/containers/blobs:path] StringLike '????????????????????????????????????????????????????????????????:*/__lock'))
+```
+
+Rider data can't match that pattern: object blobs are always
+`<scope>/object:<id>.json`, and neither the scope nor the id may contain `/`.
+The read app can still read and delete rider data, but it can't overwrite it.
+The operator principal, when one is named, gets the same conditional grant.
+
+**Unverified live.** No Azure command has evaluated this condition. If it is
+wrong, or not yet propagated, the probe's lease step fails and the wipe returns
+503 with nothing deleted. It doesn't strand data. If wipes keep returning 503
+long after propagation, check the lock assignment's condition first.
+
+**Rollback: turning the switch off does not revoke the grants.**
+`scripts/deploy_cloud.py` deploys in ARM's default Incremental mode. A resource
+whose `if (...)` condition becomes false is skipped, not deleted, so a redeploy
+with `enableAccountWipe = false` leaves the read identity's four wipe role
+assignments in place. Only the route flag goes. Roll back in two steps:
+
+1. Set `param enableAccountWipe = false` in `main.local.bicepparam` and
+   redeploy through the normal path. The read app's new revision drops
+   `WATTRACKER_CLOUD_ALLOW_ACCOUNT_WIPE`, so the route answers 404 again.
+2. Delete the read identity's four wipe assignments by hand. The read identity
+   is `wattracker-read-identity` (`readIdentity` in `main.bicep`). The filter
+   matches the three wipe roles by name: `Wattracker Operator Scope Wipe Blob`
+   on the objects container, `Wattracker Operator Scope Wipe Table` on
+   `CloudObjects` and on `CloudAuth`, and `Wattracker Scope Wipe Lock` on the
+   objects container. It matches only this principal, so the read identity's
+   other roles and any operator principal's wipe assignments are untouched.
+
+```sh
+RG='<resource group>'
+READ_PRINCIPAL_ID="$(az identity show -n wattracker-read-identity -g "$RG" --query principalId -o tsv)"
+WIPE_ROLES="[?roleDefinitionName=='Wattracker Operator Scope Wipe Blob' || roleDefinitionName=='Wattracker Operator Scope Wipe Table' || roleDefinitionName=='Wattracker Scope Wipe Lock']"
+
+# Review: four rows while the grant is in place.
+az role assignment list --assignee "$READ_PRINCIPAL_ID" --all \
+  --query "$WIPE_ROLES.{role:roleDefinitionName, scope:scope}" -o table
+
+# Delete exactly those rows.
+az role assignment list --assignee "$READ_PRINCIPAL_ID" --all \
+  --query "$WIPE_ROLES.id" -o tsv |
+  while IFS= read -r id; do az role assignment delete --ids "$id"; done
+
+# Verify: both commands must print nothing.
+az role assignment list --assignee "$READ_PRINCIPAL_ID" --all \
+  --query "$WIPE_ROLES.id" -o tsv
+az containerapp show -n wattracker-read -g "$RG" \
+  --query "properties.template.containers[].env[] | [?name=='WATTRACKER_CLOUD_ALLOW_ACCOUNT_WIPE'].value" -o tsv
+```
+
+Later redeploys with the switch off do not recreate the assignments. Setting it
+back to `true` recreates all four under the same deterministic names.
 
 Have an Azure subscription; an owner-approved region, resource-group name,
 globally unique storage name, PWA origin, billing email and budget period;
