@@ -187,29 +187,17 @@ states on `main` when the PR is merge-committed. Four such commits are on
 `main` from #358 and #356 (`a04e344`, `95a6bb2`, `8d1a582`, `892b345`); if
 `git bisect` lands on one, `git bisect skip` it.
 
-1. **#384: the cloud Calendar is empty on real data, and the fix must
-   paginate.** The desktop publishes `calendar_day` (one object per rider-local
-   day, `snapshot.py`), but `/api/v1/context/calendar` only serves
-   `calendar`/`scheduled_workout`, so iOS always gets `{"items":[]}`. Adding
-   the kind alone is wrong: since #379, unpaginated routes 413 above 100
-   objects, and a year of days is ~365. Make the calendar a `mobile=True`
-   (cursor) route, update iOS to follow the cursor, and add a publisher-to-route
-   contract test built from the real publisher. Also fold in the #379 gap from
-   the issue comment: an exactly-100-objects-returns-200 test. **The Android
-   half is taksmon's**: leave a note on #192 and do not touch `android/`. This
-   blocks #163's device check against real cloud data.
+1. **#389: test-only gaps from the #386 and #387 reviews.** Five items, each a
+   mutation that still survives on `main`:
+   - the calendar contract test must also fail when the publisher ADDS a kind;
+   - iOS calendar tombstones are untested;
+   - no test rejects a subclass of an allowed keyring backend;
+   - `test_zwift_auth.py` still uses the fake `FailKeyring` pattern that hid #374;
+   - a misleading `safe_backend` name.
+   Tests only: if a test exposes a real defect, stop and report it. Follow the
+   Keychain-safety rule on every run.
 
-2. **#374: replace the keyring-backend name heuristic with an allowlist.** PR
-   #378 merged the reuse of `credstore._keyring()`, but the post-merge review
-   (see the issue comment of 2026-09-26) showed that `_keyring_backend_allowed`
-   matches NAMES, so the real `keyring.backends.fail.Keyring`,
-   `null.Keyring` and `chainer.ChainerBackend` all pass. The tests used a
-   made-up `FailKeyring` class. Allowlist the known secure backends by module
-   and class, test with the REAL classes, and cover the shared local
-   Zwift-credential path too. Credential handling: needs a security review
-   before merge. Follow the Keychain-safety rule above on every run.
-
-3. **#249: rotating full-suite test flakes. Still not a local-runs job.**
+2. **#249: rotating full-suite test flakes. Still not a local-runs job.**
    Nothing has changed since the re-scope. 21 consecutive clean local full
    suites stand against zero reproductions. Both known instances came from
    **taksmon's machine**. **The next step is taksmon's log and his exact
@@ -220,7 +208,7 @@ states on `main` when the PR is merge-committed. Four such commits are on
 its PR number. Dropping it while it is in flight makes it invisible if the PR is
 closed or abandoned.
 
-**When items 1 and 2 are done, the queue is empty.** #249 stays skipped pending
+**When item 1 is done, the queue is empty.** #249 stays skipped pending
 taksmon's log and invocation. Do not pick up unlabelled issues or anything
 below on your own. Say the queue ran out rather than inventing scope.
 
