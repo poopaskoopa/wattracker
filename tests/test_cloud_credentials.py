@@ -46,10 +46,10 @@ def test_default_cloud_backend_respects_disabled_keyring_without_importing_or_ca
     fake_errors = types.ModuleType("keyring.errors")
     fake_errors.KeyringError = RuntimeError
     failing_keyring.errors = fake_errors
-    safe_backend = type(
-        "WinVaultKeyring", (), {"__module__": "keyring.backends.windows"}
+    uncalled_backend = type(
+        "DisabledKeyring", (), {"__module__": "test_disabled_keyring"}
     )()
-    failing_keyring.get_keyring = lambda: safe_backend
+    failing_keyring.get_keyring = lambda: uncalled_backend
 
     def fail(*args, **kwargs):
         calls.append((args, kwargs))
@@ -147,6 +147,17 @@ def test_keyring_backend_rejects_real_non_winvault_backend_on_windows(monkeypatc
         KeyringBackend()
 
     assert calls == []
+
+
+def test_keyring_backend_rejects_subclass_of_real_secure_backend(monkeypatch):
+    class DerivedMacOSKeyring(MacOSKeyring):
+        pass
+
+    monkeypatch.setattr(credstore, "_is_windows", lambda: False)
+
+    assert credstore._keyring_backend_allowed(
+        _backend_instance(DerivedMacOSKeyring)
+    ) is False
 
 
 @pytest.mark.parametrize("backend_class", [FailKeyring, NullKeyring, ChainerBackend])
