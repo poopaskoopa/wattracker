@@ -42,8 +42,32 @@ from wattracker.cloud.security import (
     sign_request_ecdsa_p256,
     sign_request_ed25519,
 )
+
+
 from wattracker.cloud.storage import MemoryTenantStore
 from wattracker.cloud.wipe import ScopeWipeReport
+
+
+_CONTEXT_ROUTE_KINDS = {
+    "calendar": {"calendar_day"},
+    "activities": {"activity"},
+    "activity detail": {"activity", "activity_detail", "stream"},
+    "profile": {"profile"},
+    "dashboard": {"profile", "training_state", "load_point", "curve"},
+    "volume": {"volume_week"},
+    "curve": {"curve"},
+}
+# FTP history supports desktop synchronization but has no mobile context
+# surface. Races likewise remain embedded in calendar_day objects.
+_PUBLISHED_BUT_INTENTIONALLY_UNSERVED_KINDS = {"ftp_history"}
+
+
+def _assert_published_kinds_have_context_routes(objects):
+    served_kinds = set().union(*_CONTEXT_ROUTE_KINDS.values())
+    published_kinds = {obj.kind for obj in objects}
+    assert published_kinds <= (
+        served_kinds | _PUBLISHED_BUT_INTENTIONALLY_UNSERVED_KINDS
+    )
 
 
 SECRET = b"cloud-test-server-secret-32-bytes-long"
@@ -373,6 +397,7 @@ def test_calendar_route_matches_real_snapshot_publisher(tmp_path, cloud):
         conn.close()
 
     published = snapshot_objects(path, user_id)
+    _assert_published_kinds_have_context_routes(published)
     expected = {
         obj.object_id: obj for obj in published if obj.kind == "calendar_day"
     }
@@ -406,6 +431,13 @@ def test_calendar_route_matches_real_snapshot_publisher(tmp_path, cloud):
         object_id: obj.wire() for object_id, obj in expected.items()
     }
     assert client.get("/api/v1/context/races", headers=headers).json() == {"items": []}
+
+
+def test_calendar_route_contract_rejects_extra_publisher_kind():
+    with pytest.raises(AssertionError):
+        _assert_published_kinds_have_context_routes([
+            CloudObject("workout", "scheduled_workout", 1, {}),
+        ])
 
 
 def test_mobile_read_surface_routes_filter_kinds_and_expose_revision(cloud):
