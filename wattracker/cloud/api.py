@@ -369,11 +369,20 @@ def _not_found() -> JSONResponse:
     )
 
 
-def _error(status: int, detail: str, *, retry_after: Optional[int] = None) -> JSONResponse:
+def _error(
+    status: int,
+    detail: str,
+    *,
+    retry_after: Optional[int] = None,
+    code: Optional[str] = None,
+) -> JSONResponse:
     headers = {"Cache-Control": "no-store"}
     if retry_after is not None:
         headers["Retry-After"] = str(retry_after)
-    return JSONResponse({"detail": detail}, status_code=status, headers=headers)
+    body = {"detail": detail}
+    if code is not None:
+        body["code"] = code
+    return JSONResponse(body, status_code=status, headers=headers)
 
 
 def _safe_limit(raw: Optional[str]) -> int:
@@ -1846,9 +1855,15 @@ def create_cloud_app(
                     else:
                         current_revision = None
                         items = state.store.list_objects(
-                            namespace, scope, kinds=kinds, limit=limit,
+                            namespace, scope, kinds=kinds, limit=limit + 1,
                         )
-                has_more = len(items) > limit
+                if not mobile and len(items) > limit:
+                    return _error(
+                        413,
+                        "collection exceeds limit",
+                        code="collection_too_large",
+                    )
+                has_more = mobile and len(items) > limit
                 items = items[:limit]
                 next_cursor = (
                     _encode_cursor(
