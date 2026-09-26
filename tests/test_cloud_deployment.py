@@ -104,8 +104,14 @@ def test_storage_uses_service_endpoints_and_a_deny_by_default_firewall():
     assert "serviceEndpoints:" in BICEP
     assert "service: 'Microsoft.Storage'" in BICEP
     assert "budgetHookIpRules" not in BICEP
-    assert "ipRules:" not in BICEP
     assert "budgetHookIpRules" not in PARAMS
+    network_acls = re.search(
+        r"networkAcls: \{(?P<body>.*?)\n    \}\n",
+        BICEP,
+        re.DOTALL,
+    )
+    assert network_acls
+    assert "ipRules: []" in network_acls.group("body")
     budget_subnet = BICEP.split(
         "resource budgetHookSubnet 'Microsoft.Network/virtualNetworks/subnets@2023-11-01'",
         1,
