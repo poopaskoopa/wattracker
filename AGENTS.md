@@ -187,17 +187,7 @@ states on `main` when the PR is merge-committed. Four such commits are on
 `main` from #358 and #356 (`a04e344`, `95a6bb2`, `8d1a582`, `892b345`); if
 `git bisect` lands on one, `git bisect skip` it.
 
-1. **#389: test-only gaps from the #386 and #387 reviews.** Five items, each a
-   mutation that still survives on `main`:
-   - the calendar contract test must also fail when the publisher ADDS a kind;
-   - iOS calendar tombstones are untested;
-   - no test rejects a subclass of an allowed keyring backend;
-   - `test_zwift_auth.py` still uses the fake `FailKeyring` pattern that hid #374;
-   - a misleading `safe_backend` name.
-   Tests only: if a test exposes a real defect, stop and report it. Follow the
-   Keychain-safety rule on every run.
-
-2. **#249: rotating full-suite test flakes. Still not a local-runs job.**
+1. **#249: rotating full-suite test flakes. Still not a local-runs job.**
    Nothing has changed since the re-scope. 21 consecutive clean local full
    suites stand against zero reproductions. Both known instances came from
    **taksmon's machine**. **The next step is taksmon's log and his exact
@@ -208,7 +198,7 @@ states on `main` when the PR is merge-committed. Four such commits are on
 its PR number. Dropping it while it is in flight makes it invisible if the PR is
 closed or abandoned.
 
-**When item 1 is done, the queue is empty.** #249 stays skipped pending
+**The queue is empty of unblocked work.** #249 stays skipped pending
 taksmon's log and invocation. Do not pick up unlabelled issues or anything
 below on your own. Say the queue ran out rather than inventing scope.
 
