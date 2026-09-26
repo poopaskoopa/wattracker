@@ -63,15 +63,23 @@ def _is_windows() -> bool:
     return sys.platform.startswith("win")
 
 
+_SECURE_KEYRING_BACKENDS = frozenset({
+    ("keyring.backends.macOS", "Keyring"),
+    ("keyring.backends.Windows", "WinVaultKeyring"),
+    ("keyring.backends.SecretService", "Keyring"),
+    ("keyring.backends.kwallet", "DBusKeyring"),
+})
+_WINDOWS_KEYRING_BACKEND = ("keyring.backends.Windows", "WinVaultKeyring")
+
+
 def _keyring_backend_allowed(backend) -> bool:
-    """Reject known fail/plaintext stores and require WinVault on Windows."""
+    """Allow only OS-vault keyring implementations; Windows requires WinVault."""
     cls = backend.__class__
-    name = cls.__name__.lower()
-    module = cls.__module__.lower()
-    if name.startswith("fail") or "plaintext" in name or "plaintext" in module:
+    identity = (cls.__module__, cls.__name__)
+    if identity not in _SECURE_KEYRING_BACKENDS:
         return False
     if _is_windows():
-        return module == "keyring.backends.windows" and "winvault" in name
+        return identity == _WINDOWS_KEYRING_BACKEND
     return True
 
 

@@ -3,6 +3,13 @@ import sys
 import types
 
 import pytest
+from keyring.backends.chainer import ChainerBackend
+from keyring.backends.fail import Keyring as FailKeyring
+from keyring.backends.kwallet import DBusKeyring
+from keyring.backends.macOS import Keyring as MacOSKeyring
+from keyring.backends.null import Keyring as NullKeyring
+from keyring.backends.SecretService import Keyring as SecretServiceKeyring
+from keyring.backends.Windows import WinVaultKeyring
 
 from wattracker.cloud.client import SyncCredentials
 from wattracker.cloud.credentials import (
@@ -93,17 +100,19 @@ def _install_fake_keyring(monkeypatch, backend):
     return calls
 
 
+def _backend_instance(backend_class):
+    """Exercise backend identity only; never initialize or call a backend."""
+    return backend_class.__new__(backend_class)
+
+
 @pytest.mark.parametrize(
-    "backend_name, backend_module",
-    [
-        ("PlaintextKeyring", "keyrings.alt.file"),
-        ("FailKeyring", "keyring.backends.fail"),
-    ],
+    "backend_class",
+    [FailKeyring, NullKeyring, ChainerBackend],
 )
-def test_keyring_backend_rejects_unsafe_backends_before_writing(
-    monkeypatch, backend_name, backend_module,
+def test_keyring_backend_rejects_real_unsafe_backends_before_writing(
+    monkeypatch, backend_class,
 ):
-    backend = type(backend_name, (), {"__module__": backend_module})()
+    backend = _backend_instance(backend_class)
     calls = _install_fake_keyring(monkeypatch, backend)
 
     with pytest.raises(CloudCredentialUnavailable, match="secure storage"):
@@ -112,14 +121,46 @@ def test_keyring_backend_rejects_unsafe_backends_before_writing(
     assert calls == []
 
 
-def test_keyring_backend_rejects_non_winvault_backend_on_windows(monkeypatch):
-    backend = type("MacKeyring", (), {"__module__": "keyring.backends.macOS"})()
+@pytest.mark.parametrize(
+    ("backend_class", "is_windows"),
+    [
+        (MacOSKeyring, False),
+        (SecretServiceKeyring, False),
+        (DBusKeyring, False),
+        (WinVaultKeyring, True),
+    ],
+)
+def test_keyring_backend_allows_real_secure_backends_on_supported_platforms(
+    monkeypatch, backend_class, is_windows,
+):
+    monkeypatch.setattr(credstore, "_is_windows", lambda: is_windows)
+
+    assert credstore._keyring_backend_allowed(_backend_instance(backend_class)) is True
+
+
+def test_keyring_backend_rejects_real_non_winvault_backend_on_windows(monkeypatch):
+    backend = _backend_instance(MacOSKeyring)
     calls = _install_fake_keyring(monkeypatch, backend)
     monkeypatch.setattr(credstore, "_is_windows", lambda: True)
 
     with pytest.raises(CloudCredentialUnavailable, match="secure storage"):
         KeyringBackend()
 
+    assert calls == []
+
+
+@pytest.mark.parametrize("backend_class", [FailKeyring, NullKeyring, ChainerBackend])
+def test_rejected_backend_uses_local_encrypted_fallback(
+    monkeypatch, backend_class, user_id,
+):
+    calls = _install_fake_keyring(monkeypatch, _backend_instance(backend_class))
+    monkeypatch.setattr(credstore, "_is_windows", lambda: False)
+
+    assert credstore.storage_backend() == "encrypted local file key"
+    assert credstore.save_zwift_credentials(
+        user_id, "rider@example.com", "secret"
+    ) == "encrypted local file key"
+    assert credstore.get_zwift_credentials(user_id).password == "secret"
     assert calls == []
 
 
