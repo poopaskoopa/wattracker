@@ -172,15 +172,6 @@ The list gives the **order**. GitHub gives the **state** — always
 (#234's scope grew a whole section after it was filed) and its labels move.
 If the two disagree, GitHub wins and the queue is stale; say so.
 
-1. **#374 — the cloud credential store accepts plaintext keyring backends that
-   `credstore` rejects.** `KeyringBackend` (`wattracker/cloud/credentials.py`)
-   uses whatever backend `keyring` has configured, skipping
-   `credstore._keyring_backend_allowed` (which rejects fail and plaintext backends
-   and requires WinVault on Windows), so a plaintext backend would write the cloud
-   writer credential to disk unencrypted. Reuse credstore's check rather than
-   duplicating its rules, and parametrise #371's guard test over "0", "false"
-   and "no". Credential handling: needs a security review before merge.
-
 **Keychain safety, mandatory.** This machine's real Keychain holds the
 owner's credentials, and a mutation run here once hung pytest on a Keychain
 prompt (#369, fixed by #371). For any run where code under test might reach
@@ -196,17 +187,7 @@ states on `main` when the PR is merge-committed. Four such commits are on
 `main` from #358 and #356 (`a04e344`, `95a6bb2`, `8d1a582`, `892b345`); if
 `git bisect` lands on one, `git bisect skip` it.
 
-2. **#372 — unpaginated cloud collections silently truncate at 100 objects.**
-   Non-mobile routes in `wattracker/cloud/api.py`'s `collection()` fetch exactly
-   `limit` items and then test `len(items) > limit`, which can never be true, so
-   a scope past 100 calendar, profile or race objects gets a truncated list with
-   no cursor, and both clients cache it as complete. Pick option (a), paging, or
-   (b), a loud failure, from the issue and state which you chose. A server test with
-   101 objects must go red on the old code. **If you choose (a), the Android client
-   change is taksmon's**: do the server and iOS parts, and leave a note on #192
-   instead of touching `android/`.
-
-3. **#249 — rotating full-suite test flakes. Still not a local-runs job.**
+1. **#249 — rotating full-suite test flakes. Still not a local-runs job.**
    Nothing has changed since the re-scope. 21 consecutive clean local full
    suites stand against zero reproductions. Both known instances came from
    **taksmon's machine**. **The next step is taksmon's log and his exact
@@ -217,8 +198,9 @@ states on `main` when the PR is merge-committed. Four such commits are on
 its PR number. Dropping it while it is in flight makes it invisible if the PR is
 closed or abandoned.
 
-**When the list runs out, stop and say so.** Do not pick up unlabelled issues
-or anything below on your own.
+**The queue is empty of unblocked work.** #249 (above) stays skipped pending
+taksmon's log and invocation. Do not pick up unlabelled issues or anything
+below on your own — say the queue ran out rather than inventing scope.
 
 **Not codex work, do not start:**
 
@@ -273,6 +255,37 @@ checked when the role is written (#330).
   mutation testing reached the real macOS Keychain and blocked pytest on an
   authorization prompt. Neither issue is closed; PR #366 needs rework and
   is unmerged.
+
+**Done since this list was last written (2026-09-25 → 09-26).**
+- **#374** merged as PR #378 (`99788a7`). `KeyringBackend` now goes through
+  `credstore._keyring()` instead of importing `keyring` directly, so a
+  plaintext or fail backend — or a non-WinVault backend on Windows — is
+  rejected before any cloud credential write, matching the local store's
+  existing rule. The #371 disabled-keyring guard test is now parametrised
+  over `"0"`, `"false"` and `"no"`. Read directly against the PR's own base
+  (two-dot, not three-dot): only `wattracker/cloud/credentials.py` and its
+  test file changed. Security review done inline before merge: the fix
+  reuses credstore's check with no duplicated logic and no other call site
+  bypasses it.
+- **#372** merged as PR #379 (`6c07ebc`). Option (b) chosen: non-mobile
+  calendar/profile/race routes now fetch `limit + 1` and return `413
+  collection_too_large` instead of silently truncating past 100 objects;
+  mobile cursor pagination is unchanged and no Android code was touched. A
+  101-object regression test on the old code went red on all three routes.
+- Also merged **PR #381** (not a queue item): `infra/azure/main.bicep`'s
+  storage `networkAcls` now declares `ipRules: []` explicitly, so a redeploy
+  clears stale IP rules instead of Azure preserving them (the #339 cleanup
+  the owner had to do by hand on 2026-09-26). Static test only; no `az`
+  command was run.
+- **PR #382** ("cloud: let the read app wipe a rider's scope…", refs #170
+  item 6) is open, CI-green, and already through two review rounds with
+  extensive mutation proof, but is not on this queue and was left for the
+  owner: it grants the read identity a scope-delete capability (behind
+  `enableAccountWipe`, default `false`) and a conditional ABAC write grant
+  for the lease blob, and states plainly that the ABAC condition and RBAC
+  propagation are unverified against real Azure. Needs a rebase check after
+  #381 touched the same file's storage block (different section, but see
+  the PR's own merge-order note).
 
 **Done since this list was last written (2026-09-18 → 09-19).**
 - **#327** merged as PR #329 (`abaf224`) and **#330** as PR #332 (`d974819`).

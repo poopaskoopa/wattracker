@@ -449,7 +449,7 @@ az functionapp delete --name "$FUNCTION_APP_NAME" --resource-group "$RESOURCE_GR
 az functionapp create --name "$FUNCTION_APP_NAME" --resource-group "$RESOURCE_GROUP" --storage-account "$BOOTSTRAP_STORAGE_NAME" --flexconsumption-location "$LOCATION" --runtime python --runtime-version 3.12 --functions-version 4 --vnet "$VNET_ID" --subnet "$FLEX_SUBNET_NAME"
 az functionapp identity assign --name "$FUNCTION_APP_NAME" --resource-group "$RESOURCE_GROUP"
 
-az functionapp show --name "$FUNCTION_APP_NAME" --resource-group "$RESOURCE_GROUP" --query '{name:name,host:defaultHostName,plan:kind,flexSubnet:siteConfig.virtualNetworkSubnetId}' --output json
+az functionapp show --name "$FUNCTION_APP_NAME" --resource-group "$RESOURCE_GROUP" --query '{name:name,host:properties.defaultHostName,plan:kind,flexSubnet:properties.virtualNetworkSubnetId}' --output json
 az functionapp identity show --name "$FUNCTION_APP_NAME" --resource-group "$RESOURCE_GROUP" --query principalId --output tsv
 ```
 
