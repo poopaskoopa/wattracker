@@ -248,6 +248,79 @@ owner's regional quota during deployment. The exact provider-supported
 bootstrap storage/account and runtime setup must be confirmed on the first
 deployment; do not infer that this has been tested here.
 
+## Scripted migration (#339)
+
+`scripts/migrate_budget_hook.py` runs sections 1-4 below for the Y1-to-Flex
+migration, so nothing is hand-copied between phases. It has not been run
+against Azure; its first real run is the migration itself. Run `--dry-run`
+first: it makes no subprocess or network call, performs the local checks and
+prints every command a real run may issue, with secrets masked.
+
+```sh
+# Paste the token from the approved secret system at the silent prompt: no echo,
+# nothing in shell history, never argv.
+read -rs WATTRACKER_BUDGET_HOOK_TOKEN; export WATTRACKER_BUDGET_HOOK_TOKEN
+# plus WATTRACKER_CLOUD_SERVER_SECRET and WATTRACKER_OPERATOR_TOKEN (existing values), for step 2
+.venv/bin/python scripts/migrate_budget_hook.py \
+  --resource-group "$RESOURCE_GROUP" --subscription "$SUBSCRIPTION_ID" \
+  --function-app-name "$FUNCTION_APP_NAME" \
+  --bootstrap-storage-name "$BOOTSTRAP_STORAGE_NAME" \
+  --params infra/azure/main.local.bicepparam --dry-run
+```
+
+Then run it again without `--dry-run`, from a clean checkout of `main`.
+Steps: 0 preflight (read-only), 1 Flex Function, 2 parameters and deploy
+(through `scripts/deploy_cloud.py --always-deploy`), 3 settings and publish,
+4 drill. Each step can be re-run; on failure the script names the failed step and
+prints the exact `--from-step N` command to resume with. Keep these points in mind:
+
+- It never runs `az network vnet create`. If `wattracker-vnet` is missing, it
+  stops. It creates `budget-hook-flex` only when that subnet is missing, using
+  the exact subnet body that `main.bicep` declares.
+- Deleting the old Y1 app is the only destructive step. The script deletes
+  `--function-app-name` only when `az functionapp show` positively identifies
+  it as a Y1 Consumption app (`sku` `Dynamic`, `kind` including
+  `functionapp`, no `functionAppConfig`) and it is the app the parameter
+  file's `budgetHookFunctionAppName` names. A positively Flex app is kept;
+  any other shape stops the run for you to inspect by hand. The script asks
+  you to type the app name, or accepts `--confirm-delete <name>` when no
+  terminal is attached. The printed resume command never carries
+  `--confirm-delete`, so a resume that reaches the delete asks again.
+- Before editing the parameter file, the script refuses it if
+  `budgetHookIpRules` is still present; delete that block by hand. It rewrites
+  only `budgetHookPrincipalId`, `budgetHookHost` and
+  `budgetHookFunctionAppName`, and keeps a 0600 copy of the original as
+  `infra/azure/main.pre-339-backup.local.bicepparam` (git-ignored).
+- If `build/azure-budget-hook` exists, the script stops. Remove only that
+  directory yourself.
+- **The scripted drill (step 4) briefly disables the public API**, for under
+  a minute. Run it before any rider enrolls. It proves the whole path end to
+  end. It needs no storage firewall change and no table read from this
+  workstation:
+  1. An anonymous `GET /api/v1/context` on `wattracker-read` must first answer
+     the neutral 404. A 503 at this point means the switch is already on or
+     its state is unreadable. The drill then stops and prints the manual
+     clear command.
+  2. `POST /budget/disable-public-api` is sent with the host key only. That
+     route is platform-authenticated, so the app token is not sent.
+  3. The same probe must answer 503 `public API unavailable` within the kill
+     switch's 30s cache window plus a cold-start margin (90s in total).
+  4. `POST /budget/clear`, with the host key and the app token, then **always**
+     runs, including after a failure, Ctrl-C, SIGTERM or SIGHUP.
+  5. The probe must return to 404 within the same timeout.
+
+  If the clear itself fails, the script prints a loud warning with the manual
+  `curl` (secrets are read from variables) and exits nonzero: the cloud is
+  still disabled.
+
+The run ends with a `paste into #339` block that holds only step results,
+statuses, timings, the Function App name and the subnet name, because #339 is
+public. The principal ID, host name and subnet resource ID follow in a
+separate `LOCAL ONLY` block: do not paste that block into GitHub.
+
+The manual commands in sections 1-4 remain the fallback. Section 4 is the
+manual drill.
+
 ## 1. Bootstrap or recreate the Flex Function App (unverified commands)
 
 From a clean deployment shell, choose non-secret names. The following is an

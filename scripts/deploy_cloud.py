@@ -326,12 +326,38 @@ def _validate_cli_value(value: str, label: str) -> str:
     return value
 
 
+def _deploy_existing_pins(
+    parameter_file: Path, resource_group: str, deployment_name: str, *, dry_run: bool
+) -> int:
+    """Validate and create with the image pins already in the file.
+
+    Used only by ``--always-deploy``: a template or parameter change (for
+    example a new ``budgetHookPrincipalId`` after the #339 Function recreation)
+    must reach Azure even when no image re-pin is needed.  The parameter file
+    is not modified on this path, so there is nothing to restore.
+    """
+
+    if dry_run:
+        validate_command, create_command = _format_azure_commands(
+            parameter_file, resource_group, deployment_name
+        )
+        print("dry-run: Azure commands not run")
+        print(validate_command)
+        print(create_command)
+        return 0
+    _run_azure_deployment(parameter_file, resource_group, deployment_name)
+    running = _running_commit()
+    print(f"cloud deployment completed; running commit: {running}")
+    return 0
+
+
 def deploy(
     parameter_file: Path,
     resource_group: str,
     deployment_name: str,
     *,
     dry_run: bool = False,
+    always_deploy: bool = False,
 ) -> int:
     parameter_file = parameter_file.resolve()
     resource_group = _validate_cli_value(resource_group, "resource group")
@@ -358,6 +384,11 @@ def deploy(
             f"({local_head} != {main_sha}); continuing"
         )
     if not initial["main_ahead"] and not initial["main_behind"]:
+        if always_deploy:
+            print("cloud image is current; --always-deploy keeps the existing image pins")
+            return _deploy_existing_pins(
+                parameter_file, resource_group, deployment_name, dry_run=dry_run
+            )
         print("cloud image is current; no deployment needed")
         return 0
 
@@ -370,6 +401,14 @@ def deploy(
     for path in changed:
         print(f"  {path}")
     if not image_paths:
+        if always_deploy:
+            print(
+                "drift contains no image changes; --always-deploy keeps the "
+                "existing image pins"
+            )
+            return _deploy_existing_pins(
+                parameter_file, resource_group, deployment_name, dry_run=dry_run
+            )
         print("drift contains no image changes; docs/tests/infra-only drift needs no deployment")
         return 0
 
@@ -421,6 +460,14 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--resource-group", default=os.environ.get("RESOURCE_GROUP", ""))
     parser.add_argument("--deployment-name", default="wattracker-cloud")
     parser.add_argument("--dry-run", action="store_true")
+    parser.add_argument(
+        "--always-deploy",
+        action="store_true",
+        help=(
+            "run validate and create even when no image re-pin is needed, "
+            "keeping the existing pins (used by scripts/migrate_budget_hook.py)"
+        ),
+    )
     try:
         args = parser.parse_args(argv)
         if not args.resource_group:
@@ -430,6 +477,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             args.resource_group,
             args.deployment_name,
             dry_run=args.dry_run,
+            always_deploy=args.always_deploy,
         )
     except DeployError as exc:
         print(f"error: {exc}", file=sys.stderr)

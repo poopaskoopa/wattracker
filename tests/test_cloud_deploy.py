@@ -355,3 +355,75 @@ def test_real_azure_path_still_validates_then_creates(monkeypatch, deploy_cloud,
         ["az", "deployment", "group", "validate"],
         ["az", "deployment", "group", "create"],
     ]
+
+
+def test_always_deploy_with_a_current_image_deploys_the_existing_pins(
+    monkeypatch, capsys, deploy_cloud, tmp_path
+):
+    module = deploy_cloud
+    path = _param_file(tmp_path)
+    original = path.read_bytes()
+    monkeypatch.setattr(module, "_require_clean_main", lambda *_: SHA)
+    monkeypatch.setattr(module, "_check_drift", lambda *_: {
+        "main_sha": SHA,
+        "main_ahead": 0,
+        "main_behind": 0,
+    })
+    monkeypatch.setattr(module, "_resolve_published_image", lambda *_: pytest.fail("re-pinned"))
+    monkeypatch.setattr(module, "_running_commit", lambda: SHA)
+    deployments = []
+    monkeypatch.setattr(module, "_run_azure_deployment", lambda *args: deployments.append(args))
+
+    assert module.deploy(path, "rg", "deployment", always_deploy=True) == 0
+    assert deployments == [(path, "rg", "deployment")]
+    assert path.read_bytes() == original
+    assert "--always-deploy keeps the existing image pins" in capsys.readouterr().out
+
+
+def test_always_deploy_with_docs_only_drift_deploys_without_repinning(
+    monkeypatch, deploy_cloud, tmp_path
+):
+    module = deploy_cloud
+    path = _param_file(tmp_path)
+    original = path.read_bytes()
+    monkeypatch.setattr(module, "_require_clean_main", lambda *_: SHA)
+    monkeypatch.setattr(module, "_check_drift", lambda *_: _initial_drift())
+    monkeypatch.setattr(module, "_changed_paths", lambda *_: ["infra/azure/main.bicep"])
+    monkeypatch.setattr(module, "_resolve_published_image", lambda *_: pytest.fail("re-pinned"))
+    monkeypatch.setattr(module, "_running_commit", lambda: SHA)
+    deployments = []
+    monkeypatch.setattr(module, "_run_azure_deployment", lambda *args: deployments.append(args))
+
+    assert module.deploy(path, "rg", "deployment", always_deploy=True) == 0
+    assert deployments == [(path, "rg", "deployment")]
+    assert path.read_bytes() == original
+
+
+def test_always_deploy_dry_run_prints_commands_without_running_azure(
+    monkeypatch, capsys, deploy_cloud, tmp_path
+):
+    module = deploy_cloud
+    path = _param_file(tmp_path)
+    monkeypatch.setattr(module, "_require_clean_main", lambda *_args, **_kwargs: SHA)
+    monkeypatch.setattr(module, "_check_drift", lambda *_: {
+        "main_sha": SHA,
+        "main_ahead": 0,
+        "main_behind": 0,
+    })
+    monkeypatch.setattr(module, "_run_azure_deployment", lambda *_: pytest.fail("deployed"))
+    monkeypatch.setattr(module, "_running_commit", lambda: pytest.fail("ran admin"))
+
+    assert module.deploy(path, "rg", "deployment", dry_run=True, always_deploy=True) == 0
+    validate_command, create_command = module._format_azure_commands(path, "rg", "deployment")
+    output = capsys.readouterr().out
+    assert validate_command in output and create_command in output
+
+
+def test_always_deploy_flag_reaches_deploy(monkeypatch, deploy_cloud, tmp_path):
+    module = deploy_cloud
+    seen = {}
+    monkeypatch.setattr(module, "deploy", lambda *args, **kwargs: seen.update(kwargs) or 0)
+    assert module.main([str(tmp_path / "p"), "--resource-group", "rg", "--always-deploy"]) == 0
+    assert seen["always_deploy"] is True
+    assert module.main([str(tmp_path / "p"), "--resource-group", "rg"]) == 0
+    assert seen["always_deploy"] is False

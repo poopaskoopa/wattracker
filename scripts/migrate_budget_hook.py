@@ -1,0 +1,1590 @@
+#!/usr/bin/env python3
+"""Run the #339 budget-hook Flex Consumption migration (DEPLOY.md sections 1-4).
+
+Steps, each safe to re-run and resumable with ``--from-step N``:
+
+0. preflight (read-only, always runs)
+1. Flex Function: subnet, bootstrap storage, Y1 delete (confirmed), Flex create
+2. parameters and deploy: rewrite three params, run scripts/deploy_cloud.py
+3. settings and publish: app settings, stage, ``func ... publish``
+4. drill, end to end: disable the public API through the Function, watch the
+   read app answer 503, then ALWAYS clear and watch it recover
+
+Every Azure/git/func call goes through one injectable runner, and every HTTP
+call through one injectable request function.  Nothing here prints parameter
+contents, credentials, host keys or response bodies, and the budget-hook token
+is read only from ``WATTRACKER_BUDGET_HOOK_TOKEN``.
+"""
+
+from __future__ import annotations
+
+import argparse
+import contextlib
+import ipaddress
+import json
+import os
+import re
+import shlex
+import shutil
+import signal
+import stat
+import subprocess
+import sys
+import tempfile
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+from dataclasses import dataclass, field
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any, Callable, Mapping, Sequence
+
+
+SCRIPT_DIR = Path(__file__).resolve().parent
+REPOSITORY_ROOT = SCRIPT_DIR.parent
+if str(REPOSITORY_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPOSITORY_ROOT))
+
+# Kill-switch timing and the refusal body come from the source, never a copy.
+from wattracker.cloud.limits import (  # noqa: E402
+    KILL_SWITCH_TTL_SECONDS,
+    PUBLIC_UNAVAILABLE_DETAIL,
+)
+
+
+TOKEN_ENV = "WATTRACKER_BUDGET_HOOK_TOKEN"
+DEPLOYMENT_PARAMETER = Path("infra/azure/main.local.bicepparam")
+BACKUP_NAME = "main.pre-339-backup.local.bicepparam"
+STAGED_DIR = Path("build/azure-budget-hook")
+VNET_NAME = "wattracker-vnet"
+SUBNET_NAME = "budget-hook-flex"
+SUBNET_PREFIX = "10.42.2.0/27"
+SUBNET_DELEGATION = "Microsoft.App/environments"
+SUBNET_SERVICE_ENDPOINT = "Microsoft.Storage"
+SUBNET_API_VERSION = "2023-11-01"  # the version main.bicep declares the subnet with
+CONTROL_TABLE = "CloudControl"
+BUDGET_HOOK_ROLE = "Wattracker Budget Hook Writer"
+DRILL_OK_BODY = b'{"status":"ok"}'
+READ_APP_NAME = "wattracker-read"  # main.bicep: var readName
+# The drill probe: an anonymous GET on the read plane.  `_resolve_reader`
+# (wattracker/cloud/api.py) calls `_require_public_api_for_device_or_reader`
+# first and unconditionally, so with no credential this route answers the
+# neutral 404 while serving and the kill switch's 503 while the public API is
+# disabled.  Not /api/v1/admin/version: that route never reads cloud state.
+PROBE_PATH = "/api/v1/context"
+NOT_FOUND_DETAIL = "not found"  # api.py: _NOT_FOUND_BODY
+# A replica may serve a cached kill state for KILL_SWITCH_TTL_SECONDS; the
+# margin covers a scale-from-zero cold start (~20s measured) and slack.
+OBSERVE_TIMEOUT_SECONDS = KILL_SWITCH_TTL_SECONDS + 60.0
+POLL_INTERVAL_SECONDS = 3.0
+TRANSIENT_STATUSES = (0, 502, 503, 504)  # 0 = no response
+REWRITTEN_PARAMS = ("budgetHookPrincipalId", "budgetHookHost", "budgetHookFunctionAppName")
+DEAD_PARAMS = ("budgetHookIpRules",)
+STEP_NAMES = {
+    0: "preflight",
+    1: "Flex Function",
+    2: "parameters and deploy",
+    3: "settings and publish",
+    4: "drill",
+}
+
+_GUID_RE = re.compile(r"\A[0-9a-fA-F]{8}-(?:[0-9a-fA-F]{4}-){3}[0-9a-fA-F]{12}\Z")
+_HOST_RE = re.compile(r"\A(?=.{1,253}\Z)[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?(?:\.[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)+\Z")
+_APP_NAME_RE = re.compile(r"\A[A-Za-z0-9](?:[A-Za-z0-9-]{0,58}[A-Za-z0-9])?\Z")
+_STORAGE_NAME_RE = re.compile(r"\A[a-z0-9]{3,24}\Z")
+_RG_RE = re.compile(r"\A[\w.()-]{1,90}\Z")
+_LOCATION_RE = re.compile(r"\A[a-z0-9]{2,40}\Z")
+_ENV_READ_RE = re.compile(rb"readEnvironmentVariable\(\s*'([A-Za-z_][A-Za-z0-9_]*)'\s*\)")
+
+
+def _param_decl_re(name: str) -> re.Pattern[bytes]:
+    return re.compile(rb"(?m)^[ \t]*param[ \t]+" + re.escape(name.encode()) + rb"\b")
+
+
+def _param_literal_re(name: str) -> re.Pattern[bytes]:
+    return re.compile(
+        rb"(?m)^[ \t]*param[ \t]+" + re.escape(name.encode())
+        + rb"[ \t]*=[ \t]*'(?P<value>[^'\\\r\n]*)'[ \t]*(?://[^\r\n]*)?(?:\r?\n|\Z)"
+    )
+
+
+class MigrationError(RuntimeError):
+    """A safe, user-facing failure. Messages never carry secrets or bodies."""
+
+
+class _Missing:
+    def __repr__(self) -> str:  # pragma: no cover - debugging aid
+        return "MISSING"
+
+
+MISSING = _Missing()
+
+
+# ---------------------------------------------------------------------------
+# Injectable side effects
+# ---------------------------------------------------------------------------
+
+Runner = Callable[..., "subprocess.CompletedProcess[str]"]
+HttpRequest = Callable[[str, str, Mapping[str, str], float], "tuple[int, bytes]"]
+
+
+def default_runner(
+    argv: Sequence[str], *, cwd: Path | None = None, capture: bool = True
+) -> "subprocess.CompletedProcess[str]":
+    """Run one command. Captured output is returned, never echoed.
+
+    The budget-hook token is removed from every child's environment: no child
+    needs it (it reaches Azure only via a 0600 ``--settings @file``).
+    """
+
+    env = {key: value for key, value in os.environ.items() if key != TOKEN_ENV}
+    kwargs: dict[str, Any] = {"cwd": cwd, "check": False, "env": env}
+    if capture:
+        kwargs.update(capture_output=True, text=True, stdin=subprocess.DEVNULL)
+    try:
+        return subprocess.run(list(argv), **kwargs)
+    except FileNotFoundError:
+        raise MigrationError(f"{Path(argv[0]).name} is not installed or not on PATH") from None
+    except OSError:
+        raise MigrationError(f"could not run {Path(argv[0]).name}") from None
+
+
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    """Never follow a redirect: it would re-send the host key to another URL."""
+
+    def redirect_request(self, *args, **kwargs):  # type: ignore[override]
+        return None
+
+
+def _http_request(
+    method: str,
+    url: str,
+    headers: Mapping[str, str],
+    timeout: float,
+    *,
+    loopback_http_for_tests: bool = False,
+) -> tuple[int, bytes]:
+    """The one HTTP path. Production (``default_http``) is HTTPS-only.
+
+    ``loopback_http_for_tests`` exists only so a test can drive this exact
+    opener against a plain-HTTP server on 127.0.0.1; it never widens anything
+    beyond that loopback address.
+    """
+
+    parts = urllib.parse.urlsplit(url)
+    loopback = (
+        loopback_http_for_tests and parts.scheme == "http" and parts.hostname == "127.0.0.1"
+    )
+    if parts.scheme != "https" and not loopback:
+        raise MigrationError("refusing a non-HTTPS drill URL")
+    if method not in ("GET", "POST"):
+        raise MigrationError("internal error: unsupported HTTP method")
+    opener = urllib.request.build_opener(_NoRedirect())
+    request = urllib.request.Request(
+        url, data=b"" if method == "POST" else None, method=method, headers=dict(headers)
+    )
+    try:
+        with opener.open(request, timeout=timeout) as response:
+            return int(response.status), response.read(4096)
+    except urllib.error.HTTPError as exc:
+        try:
+            body = exc.read(4096)
+        except OSError:
+            body = b""
+        finally:
+            exc.close()
+        return int(exc.code), body
+    except (urllib.error.URLError, TimeoutError, OSError):
+        raise MigrationError("could not reach the budget hook over HTTPS") from None
+
+
+def default_http(
+    method: str, url: str, headers: Mapping[str, str], timeout: float
+) -> tuple[int, bytes]:
+    """One HTTPS request; returns (status, first 4 KiB of body). Never redirects."""
+
+    return _http_request(method, url, headers, timeout)
+
+
+# ---------------------------------------------------------------------------
+# Options and validation
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class Options:
+    resource_group: str
+    subscription: str
+    function_app_name: str
+    bootstrap_storage_name: str
+    params: Path
+    location: str = "eastus2"
+    dry_run: bool = False
+    from_step: int = 1
+    confirm_delete: str | None = None
+
+    def validate(self) -> None:
+        if not _RG_RE.fullmatch(self.resource_group) or self.resource_group.startswith("-"):
+            raise MigrationError("invalid --resource-group")
+        if not _GUID_RE.fullmatch(self.subscription):
+            raise MigrationError("--subscription must be the subscription ID (a GUID)")
+        if not _LOCATION_RE.fullmatch(self.location):
+            raise MigrationError("invalid --location; use the short form, e.g. eastus2")
+        if not _APP_NAME_RE.fullmatch(self.function_app_name):
+            raise MigrationError("invalid --function-app-name")
+        if not _STORAGE_NAME_RE.fullmatch(self.bootstrap_storage_name):
+            raise MigrationError("invalid --bootstrap-storage-name")
+        if self.from_step not in (1, 2, 3, 4):
+            raise MigrationError("--from-step must be 1, 2, 3 or 4")
+        if self.confirm_delete is not None and self.confirm_delete != self.function_app_name:
+            raise MigrationError(
+                "--confirm-delete does not match --function-app-name; nothing was deleted"
+            )
+
+    def resume_command(self, step: int) -> str:
+        argv = [
+            ".venv/bin/python", "scripts/migrate_budget_hook.py",
+            "--resource-group", self.resource_group,
+            "--subscription", self.subscription,
+            "--location", self.location,
+            "--function-app-name", self.function_app_name,
+            "--bootstrap-storage-name", self.bootstrap_storage_name,
+            "--params", str(self.params),
+        ]
+        # Never --confirm-delete: a resume that reaches the delete re-confirms.
+        argv += ["--from-step", str(max(step, 1))]
+        return shlex.join(argv)
+
+
+@dataclass
+class StepRecord:
+    step: int
+    result: str
+    started: str
+    finished: str
+
+
+@dataclass
+class Facts:
+    principal_id: str = ""
+    host: str = ""
+    subnet_id: str = ""
+
+
+@dataclass
+class DrillRecord:
+    """Statuses and timings for the summary; never bodies, keys or tokens."""
+
+    baseline: int | None = None
+    disable: int | None = None
+    shutdown_seconds: float | None = None
+    clear: int | None = None
+    recovery_seconds: float | None = None
+    result: str = ""
+    cloud_left_disabled: bool = False
+
+
+def _utc(epoch: float) -> str:
+    return datetime.fromtimestamp(epoch, tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def _same_id(left: object, right: object) -> bool:
+    return isinstance(left, str) and isinstance(right, str) and left.lower() == right.lower()
+
+
+# ---------------------------------------------------------------------------
+# What `az functionapp show` returned
+# ---------------------------------------------------------------------------
+
+APP_Y1 = "y1"
+APP_FLEX = "flex"
+APP_UNKNOWN = "unknown"
+
+
+class _Conflict(Exception):
+    pass
+
+
+def site_field(app: Mapping[str, Any], name: str) -> object:
+    """One Site property from either shape `az functionapp show` prints.
+
+    For a Flex app az returns the raw ARM resource, with the site properties
+    nested under ``properties``; for other apps it prints the SDK model, which
+    may be flattened.  A property present in both places with different values
+    raises ``_Conflict``.
+    """
+
+    top = app.get(name)
+    properties = app.get("properties")
+    nested = properties.get(name) if isinstance(properties, dict) else None
+    if top is not None and nested is not None and top != nested:
+        raise _Conflict(name)
+    return top if top is not None else nested
+
+
+def classify_app(app: Mapping[str, Any]) -> str:
+    """APP_Y1 only with ALL the Y1 signals; APP_FLEX only with ALL the Flex ones.
+
+    Y1 Consumption: ``kind`` lists ``functionapp``, ``sku`` is ``Dynamic`` and
+    there is no ``functionAppConfig``.  Flex Consumption: ``kind`` lists
+    ``functionapp``, ``sku`` is ``FlexConsumption`` and ``functionAppConfig``
+    is a non-empty object.  Anything else is APP_UNKNOWN, which must stop the
+    run: the delete is allowed only on a positive Y1 identification.
+    """
+
+    kind = app.get("kind")
+    kinds = {part.strip().lower() for part in kind.split(",")} if isinstance(kind, str) else set()
+    if "functionapp" not in kinds:
+        return APP_UNKNOWN
+    try:
+        sku = site_field(app, "sku")
+        config = site_field(app, "functionAppConfig")
+    except _Conflict:
+        return APP_UNKNOWN
+    sku = sku.lower() if isinstance(sku, str) else None
+    if sku == "dynamic" and config is None:
+        return APP_Y1
+    if sku == "flexconsumption" and isinstance(config, dict) and config:
+        return APP_FLEX
+    return APP_UNKNOWN
+
+
+def describe_app(app: Mapping[str, Any]) -> str:
+    """kind and sku for a message, from both shapes, bounded in length."""
+
+    properties = app.get("properties") if isinstance(app.get("properties"), dict) else {}
+    values = {
+        "kind": app.get("kind"),
+        "sku": app.get("sku"),
+        "properties.sku": properties.get("sku"),
+        "functionAppConfig": "present" if (
+            app.get("functionAppConfig") is not None
+            or properties.get("functionAppConfig") is not None
+        ) else "absent",
+    }
+    return ", ".join(f"{key}={str(value)[:40]!r}" for key, value in values.items())
+
+
+# ---------------------------------------------------------------------------
+# SIGTERM/SIGHUP during the drill
+# ---------------------------------------------------------------------------
+
+DRILL_SIGNALS = tuple(
+    signum for signum in (getattr(signal, "SIGTERM", None), getattr(signal, "SIGHUP", None))
+    if signum is not None
+)
+
+
+class DrillSignal(KeyboardInterrupt):
+    """SIGTERM/SIGHUP during the drill; handled exactly like Ctrl-C."""
+
+
+def _raise_drill_signal(signum: int, _frame: object) -> None:
+    raise DrillSignal(signum)
+
+
+@contextlib.contextmanager
+def termination_raises_interrupt():
+    """Turn SIGTERM and SIGHUP into KeyboardInterrupt for the block.
+
+    Their default action ends the process without running ``finally``, which
+    would skip /budget/clear and leave the public API disabled.  The previous
+    handlers are restored on exit.  If they cannot be installed (not the main
+    thread), this raises before the block runs, so nothing is disabled.
+    """
+
+    previous: dict[int, Any] = {}
+
+    def restore() -> None:
+        for signum, handler in previous.items():
+            signal.signal(signum, handler if handler is not None else signal.SIG_DFL)
+
+    try:
+        for signum in DRILL_SIGNALS:
+            previous[signum] = signal.signal(signum, _raise_drill_signal)
+    except (ValueError, OSError):
+        restore()
+        raise MigrationError(
+            "could not install the SIGTERM/SIGHUP handlers the drill needs; nothing was disabled"
+        ) from None
+    try:
+        yield
+    finally:
+        restore()
+
+
+# ---------------------------------------------------------------------------
+# The parameter file
+# ---------------------------------------------------------------------------
+
+
+def check_param_structure(contents: bytes) -> None:
+    """Refuse a file the three-value edit (or the deployment) cannot handle."""
+
+    for name in (*REWRITTEN_PARAMS, "storageName"):
+        declarations = len(_param_decl_re(name).findall(contents))
+        if declarations == 0:
+            raise MigrationError(f"parameter file does not declare {name}")
+        if declarations > 1:
+            raise MigrationError(f"parameter file declares {name} more than once")
+        if not _param_literal_re(name).search(contents):
+            raise MigrationError(f"parameter {name} must be a single-quoted literal on one line")
+    for name in DEAD_PARAMS:
+        if _param_decl_re(name).search(contents):
+            raise MigrationError(
+                f"parameter file still declares {name}; delete that whole param block by "
+                "hand first (DEPLOY.md section 2: main.bicep no longer declares it, BCP259)"
+            )
+
+
+def read_param(contents: bytes, name: str) -> str:
+    check_param_structure(contents)
+    match = _param_literal_re(name).search(contents)
+    assert match is not None
+    return match.group("value").decode("utf-8")
+
+
+def rewrite_params(contents: bytes, values: Mapping[str, str]) -> bytes:
+    """Replace only the value spans of the three budget-hook params."""
+
+    check_param_structure(contents)
+    if set(values) != set(REWRITTEN_PARAMS):
+        raise MigrationError("internal error: unexpected parameter set")
+    spans = []
+    for name, value in values.items():
+        if "'" in value or "\\" in value or any(ord(c) < 0x20 for c in value):
+            raise MigrationError(f"refusing an unsafe value for {name}")
+        match = _param_literal_re(name).search(contents)
+        assert match is not None
+        spans.append((match.start("value"), match.end("value"), value.encode("utf-8")))
+    updated = bytearray(contents)
+    for start, end, value in sorted(spans, reverse=True):
+        updated[start:end] = value
+    return bytes(updated)
+
+
+def _atomic_write(path: Path, contents: bytes, mode: int) -> None:
+    temporary_name: str | None = None
+    try:
+        descriptor, temporary_name = tempfile.mkstemp(
+            dir=path.parent, prefix=f".{path.name}.", suffix=".tmp"
+        )
+        with os.fdopen(descriptor, "wb") as handle:
+            handle.write(contents)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.chmod(temporary_name, mode)
+        os.replace(temporary_name, path)
+        temporary_name = None
+    except OSError:
+        raise MigrationError("could not update the parameter file") from None
+    finally:
+        if temporary_name is not None:
+            try:
+                os.unlink(temporary_name)
+            except OSError:
+                pass
+
+
+# ---------------------------------------------------------------------------
+# The migration
+# ---------------------------------------------------------------------------
+
+
+class Migrator:
+    def __init__(
+        self,
+        options: Options,
+        *,
+        runner: Runner = default_runner,
+        http: HttpRequest = default_http,
+        environ: Mapping[str, str] | None = None,
+        prompt: Callable[[str], str] = input,
+        stdin_isatty: Callable[[], bool] = lambda: sys.stdin.isatty(),
+        which: Callable[[str], str | None] = shutil.which,
+        sleep: Callable[[float], None] = time.sleep,
+        now: Callable[[], float] = time.time,
+        repo_root: Path = REPOSITORY_ROOT,
+        python: str = sys.executable,
+    ) -> None:
+        self.o = options
+        self.runner = runner
+        self.http = http
+        self.environ = os.environ if environ is None else environ
+        self.prompt = prompt
+        self.stdin_isatty = stdin_isatty
+        self.which = which
+        self.sleep = sleep
+        self.now = now
+        self.repo = repo_root.resolve()
+        self.python = python
+        self.facts = Facts()
+        self.records: list[StepRecord] = []
+        self.drill: DrillRecord | None = None
+        self.last_hook_status: int | None = None
+        self.vnet_location: str | None = None  # from `az network vnet show`, step 0
+
+    # -- paths and ids ---------------------------------------------------
+
+    @property
+    def params_path(self) -> Path:
+        return self.o.params
+
+    @property
+    def vnet_id(self) -> str:
+        return (
+            f"/subscriptions/{self.o.subscription}/resourceGroups/{self.o.resource_group}"
+            f"/providers/Microsoft.Network/virtualNetworks/{VNET_NAME}"
+        )
+
+    @property
+    def expected_subnet_id(self) -> str:
+        return f"{self.vnet_id}/subnets/{SUBNET_NAME}"
+
+    # -- command builders (shared by the real run and --dry-run) ----------
+
+    def _az(self, *args: str, pin: bool = True) -> list[str]:
+        argv = ["az", *args]
+        if pin:
+            argv += ["--subscription", self.o.subscription]
+        return argv + ["--output", "json"]
+
+    def _rg(self) -> list[str]:
+        return ["--resource-group", self.o.resource_group]
+
+    def _app(self) -> list[str]:
+        return ["--name", self.o.function_app_name, *self._rg()]
+
+    def cmd_account_show(self) -> list[str]:
+        return self._az("account", "show", pin=False)
+
+    def cmd_group_show(self) -> list[str]:
+        return self._az("group", "show", "--name", self.o.resource_group)
+
+    def cmd_flex_locations(self) -> list[str]:
+        return self._az("functionapp", "list-flexconsumption-locations")
+
+    def cmd_provider_show(self) -> list[str]:
+        return self._az("provider", "show", "--namespace", "Microsoft.App")
+
+    def cmd_vnet_show(self) -> list[str]:
+        return self._az("network", "vnet", "show", "--name", VNET_NAME, *self._rg())
+
+    def cmd_subnet_show(self) -> list[str]:
+        return self._az(
+            "network", "vnet", "subnet", "show", "--name", SUBNET_NAME,
+            "--vnet-name", VNET_NAME, *self._rg(),
+        )
+
+    def subnet_body(self, location: str) -> dict[str, Any]:
+        # Exactly the budgetHookSubnet properties in main.bicep, including the
+        # delegation *name*: the CLI's `subnet create --delegations` names it
+        # "0", and main.bicep renaming the delegation of an in-use subnet at
+        # step 2 is a change Azure can refuse.  `location` is the VNet's own
+        # location: main.bicep's `location` is the one the VNet was deployed
+        # with, not necessarily --location.
+        return {
+            "properties": {
+                "addressPrefix": SUBNET_PREFIX,
+                "delegations": [
+                    {"name": SUBNET_NAME, "properties": {"serviceName": SUBNET_DELEGATION}}
+                ],
+                "serviceEndpoints": [
+                    {"service": SUBNET_SERVICE_ENDPOINT, "locations": [location]}
+                ],
+            }
+        }
+
+    def cmd_subnet_put(self, location: str) -> list[str]:
+        url = (
+            f"https://management.azure.com{self.expected_subnet_id}"
+            f"?api-version={SUBNET_API_VERSION}"
+        )
+        return self._az(
+            "rest", "--method", "put", "--url", url,
+            "--body", json.dumps(self.subnet_body(location), separators=(",", ":")),
+            pin=False,
+        )
+
+    def cmd_bootstrap_storage_show(self) -> list[str]:
+        return self._az(
+            "storage", "account", "show", "--name", self.o.bootstrap_storage_name, *self._rg()
+        )
+
+    def cmd_bootstrap_storage_create(self) -> list[str]:
+        return self._az(
+            "storage", "account", "create", "--name", self.o.bootstrap_storage_name,
+            *self._rg(), "--location", self.o.location, "--sku", "Standard_LRS",
+        )
+
+    def cmd_app_show(self) -> list[str]:
+        return self._az("functionapp", "show", *self._app())
+
+    def cmd_app_delete(self) -> list[str]:
+        return self._az("functionapp", "delete", *self._app())
+
+    def cmd_app_create(self, subnet_id: str) -> list[str]:
+        return self._az(
+            "functionapp", "create", *self._app(),
+            "--storage-account", self.o.bootstrap_storage_name,
+            "--flexconsumption-location", self.o.location,
+            "--runtime", "python", "--runtime-version", "3.12",
+            "--functions-version", "4",
+            "--vnet", self.vnet_id, "--subnet", SUBNET_NAME,
+        )
+
+    def cmd_identity_show(self) -> list[str]:
+        return self._az("functionapp", "identity", "show", *self._app())
+
+    def cmd_identity_assign(self) -> list[str]:
+        return self._az("functionapp", "identity", "assign", *self._app())
+
+    def cmd_deploy_cloud(self) -> list[str]:
+        return [
+            self.python, str(self.repo / "scripts" / "deploy_cloud.py"),
+            str(self.params_path), "--resource-group", self.o.resource_group,
+            "--always-deploy",
+        ]
+
+    def cmd_app_storage_show(self, storage_name: str) -> list[str]:
+        return self._az("storage", "account", "show", "--name", storage_name, *self._rg())
+
+    def cmd_role_list(self, scope: str) -> list[str]:
+        return self._az("role", "assignment", "list", "--scope", scope)
+
+    def cmd_appsettings_set(self, settings_file: str) -> list[str]:
+        return self._az(
+            "functionapp", "config", "appsettings", "set", *self._app(),
+            "--settings", f"@{settings_file}",
+        )
+
+    def cmd_package(self) -> list[str]:
+        return [self.python, str(self.repo / "scripts" / "package_budget_hook.py")]
+
+    def cmd_publish(self) -> list[str]:
+        return ["func", "azure", "functionapp", "publish", self.o.function_app_name, "--python"]
+
+    def cmd_keys_list(self) -> list[str]:
+        return self._az("functionapp", "keys", "list", *self._app())
+
+    def cmd_read_app_show(self) -> list[str]:
+        return self._az("containerapp", "show", "--name", READ_APP_NAME, *self._rg())
+
+    def manual_clear_command(self) -> str:
+        """The fallback clear, with secrets referenced by variable, never by value."""
+
+        keys = shlex.join(self.cmd_keys_list()[:-2] + ["--query", "functionKeys.default", "--output", "tsv"])
+        return (
+            f"# if {TOKEN_ENV} is not set in this shell, read it with no echo and no shell history:\n"
+            f"  read -rs {TOKEN_ENV}; export {TOKEN_ENV}\n"
+            f'  FUNCTION_HOST_KEY="$({keys})"\n'
+            f"  curl --fail-with-body --request POST 'https://{self.facts.host or '<defaultHostName>'}"
+            "/budget/clear' --header \"x-functions-key: $FUNCTION_HOST_KEY\" "
+            f'--header "X-Wattracker-Budget-Token: ${TOKEN_ENV}"'
+        )
+
+    # -- running -----------------------------------------------------------
+
+    @staticmethod
+    def _label(argv: Sequence[str]) -> str:
+        words = []
+        for arg in argv:
+            if arg.startswith("-"):
+                break
+            words.append(Path(arg).name if not words else arg)
+        return " ".join(words[:5])
+
+    def run(self, argv: Sequence[str], *, cwd: Path | None = None, capture: bool = True):
+        if self.o.dry_run:  # defence in depth: a dry run never reaches the runner
+            raise MigrationError("internal error: a command was run during --dry-run")
+        return self.runner(list(argv), cwd=cwd if cwd is not None else self.repo, capture=capture)
+
+    def run_ok(self, argv: Sequence[str], **kwargs: Any) -> "subprocess.CompletedProcess[str]":
+        result = self.run(argv, **kwargs)
+        if result.returncode:
+            raise MigrationError(
+                f"`{self._label(argv)}` failed (exit {result.returncode}); its output is "
+                "suppressed here, so re-run that command by hand to see the diagnostics"
+            )
+        return result
+
+    def az_json(self, argv: Sequence[str], *, allow_missing: bool = False) -> Any:
+        result = self.run(argv)
+        if allow_missing and result.returncode == 3:  # az: resource not found
+            return MISSING
+        if result.returncode:
+            raise MigrationError(
+                f"`{self._label(argv)}` failed (exit {result.returncode}); its output is "
+                "suppressed here, so re-run that command by hand to see the diagnostics"
+            )
+        text = (result.stdout or "").strip()
+        if not text:
+            return None
+        try:
+            return json.loads(text)
+        except json.JSONDecodeError:
+            raise MigrationError(f"`{self._label(argv)}` returned unreadable JSON") from None
+
+    def say(self, message: str) -> None:
+        print(message, flush=True)
+
+    # -- step 0 ------------------------------------------------------------
+
+    def read_params_bytes(self) -> bytes:
+        path = self.params_path
+        try:
+            if path.is_symlink() or not path.is_file():
+                raise MigrationError("--params must be an existing regular file")
+            return path.read_bytes()
+        except OSError:
+            raise MigrationError("could not read the parameter file") from None
+
+    def storage_name(self) -> str:
+        name = read_param(self.read_params_bytes(), "storageName")
+        if not _STORAGE_NAME_RE.fullmatch(name):
+            raise MigrationError("storageName in the parameter file is not a storage account name")
+        return name
+
+    def local_preflight(self) -> None:
+        """Checks that need no subprocess, so --dry-run performs them too."""
+
+        self.o.validate()
+        self.o.params = self.o.params.expanduser().absolute()
+        try:
+            relative = self.o.params.resolve().relative_to(self.repo)
+        except ValueError:
+            raise MigrationError("--params must be inside this checkout") from None
+        if relative != DEPLOYMENT_PARAMETER:
+            raise MigrationError(
+                "--params must be infra/azure/main.local.bicepparam "
+                "(the only file scripts/deploy_cloud.py will deploy)"
+            )
+        contents = self.read_params_bytes()
+        check_param_structure(contents)
+        self.storage_name()
+        if not self.environ.get(TOKEN_ENV):
+            raise MigrationError(f"{TOKEN_ENV} must be set in the environment (never argv)")
+        if self.o.from_step <= 2:
+            missing = [
+                name.decode() for name in dict.fromkeys(_ENV_READ_RE.findall(contents))
+                if not self.environ.get(name.decode())
+            ]
+            if missing:
+                raise MigrationError(
+                    "the parameter file reads these unset environment variables: "
+                    + ", ".join(missing)
+                )
+        for tool in ("az", "func", "git"):
+            if not self.which(tool):
+                raise MigrationError(f"{tool} is not installed or not on PATH")
+        if self.o.from_step <= 3 and (self.repo / STAGED_DIR).exists():
+            raise MigrationError(
+                f"{STAGED_DIR} already exists; remove only that directory yourself "
+                f"(rm -rf -- {STAGED_DIR}) -- this script never deletes it"
+            )
+
+    def step0_preflight(self) -> None:
+        # The checkout: the params file is untracked and ignored, and
+        # deploy_cloud.py's own clean-main guard will pass.
+        git = ["git", "-C", str(self.repo)]
+        relative = str(DEPLOYMENT_PARAMETER)
+        if self.run(git + ["ls-files", "--error-unmatch", "--", relative]).returncode == 0:
+            raise MigrationError("refusing a tracked parameter file; it must stay untracked")
+        for candidate in (relative, str(DEPLOYMENT_PARAMETER.parent / BACKUP_NAME)):
+            if self.run(git + ["check-ignore", "-q", "--", candidate]).returncode != 0:
+                raise MigrationError(f"{candidate} is not git-ignored; refusing to write it")
+        branch = self.run_ok(git + ["branch", "--show-current"]).stdout.strip()
+        if branch != "main":
+            raise MigrationError("run this from a checkout of main (deploy_cloud.py requires it)")
+        status = self.run_ok(git + ["status", "--porcelain=v1", "--untracked-files=all"])
+        if status.stdout.strip():
+            raise MigrationError("the working tree is dirty; deploy_cloud.py would refuse it")
+
+        account = self.az_json(self.cmd_account_show())
+        if not isinstance(account, dict) or not _same_id(account.get("id"), self.o.subscription):
+            raise MigrationError(
+                "the active az subscription is not --subscription; run "
+                "`az account set --subscription <id>` first (func publishes to it)"
+            )
+        if self.az_json(self.cmd_group_show(), allow_missing=True) is MISSING:
+            raise MigrationError("the resource group does not exist")
+        locations = self.az_json(self.cmd_flex_locations()) or []
+        names = {
+            str(item.get("name", "")).replace(" ", "").lower()
+            for item in locations if isinstance(item, dict)
+        }
+        if self.o.location not in names:
+            raise MigrationError(f"{self.o.location} is not a Flex Consumption location")
+        provider = self.az_json(self.cmd_provider_show())
+        if not isinstance(provider, dict) or provider.get("registrationState") != "Registered":
+            raise MigrationError("the Microsoft.App provider is not registered")
+        vnet = self.az_json(self.cmd_vnet_show(), allow_missing=True)
+        if vnet is MISSING or not isinstance(vnet, dict):
+            raise MigrationError(
+                f"{VNET_NAME} does not exist. This script never creates or rewrites the "
+                "VNet (vnet create against a live network can drop subnets); stop and "
+                "investigate"
+            )
+        prefixes = ((vnet.get("addressSpace") or {}).get("addressPrefixes")) or []
+        wanted = ipaddress.ip_network(SUBNET_PREFIX)
+        contained = False
+        for prefix in prefixes:
+            try:
+                network = ipaddress.ip_network(str(prefix), strict=False)
+            except ValueError:
+                continue
+            if network.version == wanted.version and wanted.subnet_of(network):
+                contained = True
+        if not contained:
+            raise MigrationError(f"{VNET_NAME}'s address space does not contain {SUBNET_PREFIX}")
+        location = str(vnet.get("location") or "").replace(" ", "").lower()
+        if not _LOCATION_RE.fullmatch(location):
+            raise MigrationError(f"{VNET_NAME} reports no usable location")
+        self.vnet_location = location
+        if location != self.o.location:
+            self.say(
+                f"warning: {VNET_NAME} is in {location} but --location is {self.o.location}; "
+                f"the {SUBNET_NAME} subnet uses the VNet's location (as main.bicep does), "
+                "while the Flex app and bootstrap storage are created in --location"
+            )
+
+    # -- step 1 ------------------------------------------------------------
+
+    def verify_subnet(self, subnet: Mapping[str, Any]) -> None:
+        prefixes = [subnet.get("addressPrefix"), *(subnet.get("addressPrefixes") or [])]
+        if SUBNET_PREFIX not in [p for p in prefixes if p]:
+            raise MigrationError(f"{SUBNET_NAME} exists but its prefix is not {SUBNET_PREFIX}")
+        delegations = subnet.get("delegations") or []
+        services = [d.get("serviceName") for d in delegations if isinstance(d, dict)]
+        if services != [SUBNET_DELEGATION]:
+            raise MigrationError(
+                f"{SUBNET_NAME} exists but is not delegated only to {SUBNET_DELEGATION}"
+            )
+        endpoints = [
+            e.get("service") for e in subnet.get("serviceEndpoints") or [] if isinstance(e, dict)
+        ]
+        if SUBNET_SERVICE_ENDPOINT not in endpoints:
+            raise MigrationError(
+                f"{SUBNET_NAME} exists but has no {SUBNET_SERVICE_ENDPOINT} service endpoint"
+            )
+        if [d.get("name") for d in delegations] != [SUBNET_NAME]:
+            self.say(
+                f"warning: {SUBNET_NAME}'s delegation is not named {SUBNET_NAME!r} as in "
+                "main.bicep; step 2 will rename it, which Azure may refuse on an in-use subnet"
+            )
+
+    def ensure_subnet(self) -> str:
+        subnet = self.az_json(self.cmd_subnet_show(), allow_missing=True)
+        if subnet is MISSING:
+            if self.vnet_location is None:
+                raise MigrationError("internal error: the VNet location was not read in preflight")
+            self.say(f"creating subnet {SUBNET_NAME} ({SUBNET_PREFIX}) with the main.bicep body")
+            self.run_ok(self.cmd_subnet_put(self.vnet_location))
+            for _attempt in range(20):
+                subnet = self.az_json(self.cmd_subnet_show(), allow_missing=True)
+                if isinstance(subnet, dict) and subnet.get("provisioningState") == "Succeeded":
+                    break
+                self.sleep(3)
+            else:
+                raise MigrationError(f"{SUBNET_NAME} did not finish provisioning")
+        else:
+            self.say(f"subnet {SUBNET_NAME} exists; verifying it")
+        if not isinstance(subnet, dict):
+            raise MigrationError(f"could not read {SUBNET_NAME}")
+        self.verify_subnet(subnet)
+        subnet_id = subnet.get("id")
+        if not _same_id(subnet_id, self.expected_subnet_id):
+            raise MigrationError(f"{SUBNET_NAME} has an unexpected resource ID")
+        self.facts.subnet_id = str(subnet_id)
+        return str(subnet_id)
+
+    def app_subnet(self, app: Mapping[str, Any]) -> object:
+        try:
+            subnet = site_field(app, "virtualNetworkSubnetId")
+        except _Conflict:
+            return None
+        if subnet:
+            return subnet
+        site_config = app.get("siteConfig")
+        if not isinstance(site_config, dict):
+            properties = app.get("properties")
+            site_config = properties.get("siteConfig") if isinstance(properties, dict) else None
+        return site_config.get("virtualNetworkSubnetId") if isinstance(site_config, dict) else None
+
+    def check_delete_target(self) -> None:
+        """Only the app the deployment currently references may be deleted."""
+
+        referenced = read_param(self.read_params_bytes(), "budgetHookFunctionAppName")
+        if referenced != self.o.function_app_name:
+            raise MigrationError(
+                "--function-app-name is not the budgetHookFunctionAppName in the parameter "
+                "file, so it is not the app this deployment references. Only that app may be "
+                "deleted; nothing was deleted. Check the name (to move to a new app name, "
+                "pass a name that does not exist yet: the old Y1 app is then left alone)"
+            )
+
+    def confirm_delete(self, app: Mapping[str, Any]) -> None:
+        name = self.o.function_app_name
+        self.say(
+            f"{name} is the old Y1 Consumption app ({describe_app(app)}).\n"
+            "Deleting it is the one destructive step: it removes the old Y1 site, its "
+            "host key and its system identity."
+        )
+        if self.o.confirm_delete is not None:
+            if self.o.confirm_delete != name:  # validate() already refuses this
+                raise MigrationError("--confirm-delete does not match; nothing was deleted")
+            return
+        if not self.stdin_isatty():
+            raise MigrationError(
+                "deleting the app needs confirmation: run interactively, or pass "
+                f"--confirm-delete {name}"
+            )
+        try:
+            typed = self.prompt(f"Type the Function App name ({name}) to delete it: ")
+        except EOFError:
+            typed = ""
+        if typed.strip() != name:
+            raise MigrationError("confirmation did not match; nothing was deleted")
+
+    def step1_flex(self) -> None:
+        subnet_id = self.ensure_subnet()
+        storage = self.az_json(self.cmd_bootstrap_storage_show(), allow_missing=True)
+        if storage is MISSING:
+            self.say(f"creating bootstrap storage {self.o.bootstrap_storage_name}")
+            self.run_ok(self.cmd_bootstrap_storage_create())
+        else:
+            self.say(f"bootstrap storage {self.o.bootstrap_storage_name} exists; skipping")
+
+        app = self.az_json(self.cmd_app_show(), allow_missing=True)
+        if app is not MISSING and not isinstance(app, dict):
+            raise MigrationError("could not read the Function App")
+        shape = classify_app(app) if isinstance(app, dict) else None
+        if shape == APP_FLEX:
+            self.say(f"{self.o.function_app_name} is already Flex Consumption; skipping delete/create")
+        elif shape == APP_UNKNOWN:
+            raise MigrationError(
+                f"{self.o.function_app_name} exists but is neither positively the old Y1 "
+                f"Consumption app nor positively Flex Consumption ({describe_app(app)}). "
+                "Nothing was deleted. Inspect it by hand with `az functionapp show` and "
+                "decide what it is before re-running"
+            )
+        else:
+            if shape == APP_Y1:
+                self.check_delete_target()
+                self.confirm_delete(app)
+                self.say(f"deleting {self.o.function_app_name}")
+                self.run_ok(self.cmd_app_delete())
+            self.say(f"creating Flex Function App {self.o.function_app_name}")
+            self.run_ok(self.cmd_app_create(subnet_id))
+
+        identity = self.az_json(self.cmd_identity_show(), allow_missing=True)
+        if not isinstance(identity, dict) or not identity.get("principalId"):
+            self.say("assigning the system identity")
+            self.run_ok(self.cmd_identity_assign())
+        self.read_app_facts()
+
+    def read_app_facts(self) -> None:
+        app = self.az_json(self.cmd_app_show(), allow_missing=True)
+        if not isinstance(app, dict):
+            raise MigrationError(
+                f"{self.o.function_app_name} does not exist; resume with --from-step 1"
+            )
+        if classify_app(app) != APP_FLEX:
+            raise MigrationError(
+                f"{self.o.function_app_name} is not Flex Consumption ({describe_app(app)}); "
+                "resume with --from-step 1"
+            )
+        if not _same_id(self.app_subnet(app), self.expected_subnet_id):
+            raise MigrationError(
+                f"{self.o.function_app_name} is not integrated with {SUBNET_NAME}; integrate it "
+                "(or delete it by hand) and resume with --from-step 1"
+            )
+        try:
+            host = str(site_field(app, "defaultHostName") or "").lower()
+        except _Conflict:
+            host = ""
+        if not _HOST_RE.fullmatch(host):
+            raise MigrationError("the Function App has no valid defaultHostName")
+        identity = self.az_json(self.cmd_identity_show(), allow_missing=True)
+        principal = identity.get("principalId") if isinstance(identity, dict) else None
+        if not isinstance(principal, str) or not _GUID_RE.fullmatch(principal):
+            raise MigrationError("the Function App has no system-assigned identity principalId")
+        self.facts.principal_id = principal.lower()
+        self.facts.host = host
+        self.facts.subnet_id = str(self.app_subnet(app))
+        self.say(f"Function App: principalId={self.facts.principal_id} host={host}")
+
+    def ensure_facts(self) -> None:
+        if not (self.facts.principal_id and self.facts.host):
+            self.read_app_facts()
+
+    # -- step 2 ------------------------------------------------------------
+
+    def write_backup(self, original: bytes) -> None:
+        backup = self.params_path.parent / BACKUP_NAME
+        if backup.exists() or backup.is_symlink():
+            self.say(f"keeping the existing backup {backup.name}")
+            return
+        try:
+            descriptor = os.open(backup, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+            with os.fdopen(descriptor, "wb") as handle:
+                handle.write(original)
+            os.chmod(backup, 0o600)
+        except OSError:
+            raise MigrationError("could not write the parameter backup") from None
+        self.say(f"backed up the parameter file to {backup.name} (0600)")
+
+    def update_params(self) -> None:
+        original = self.read_params_bytes()
+        values = {
+            "budgetHookPrincipalId": self.facts.principal_id,
+            "budgetHookHost": self.facts.host,
+            "budgetHookFunctionAppName": self.o.function_app_name,
+        }
+        updated = rewrite_params(original, values)
+        if updated == original:
+            self.say("parameter file already has the Function's values; not rewriting")
+            return
+        mode = stat.S_IMODE(self.params_path.stat().st_mode)
+        self.write_backup(original)
+        _atomic_write(self.params_path, updated, mode)
+        self.say("updated budgetHookPrincipalId, budgetHookHost, budgetHookFunctionAppName")
+
+    def verify_network_and_role(self) -> None:
+        storage = self.az_json(self.cmd_app_storage_show(self.storage_name()), allow_missing=True)
+        if not isinstance(storage, dict):
+            raise MigrationError("could not read the application storage account")
+        rules = storage.get("networkRuleSet") or {}
+        if str(rules.get("defaultAction", "")).lower() != "deny":
+            raise MigrationError(
+                "application storage defaultAction is not Deny; the drill would prove nothing"
+            )
+        if rules.get("ipRules"):
+            raise MigrationError("application storage still has IP rules; the Function must not depend on them")
+        vnet_rules = rules.get("virtualNetworkRules") or []
+        if not any(
+            isinstance(rule, dict)
+            and (
+                _same_id(rule.get("virtualNetworkResourceId"), self.expected_subnet_id)
+                or _same_id(rule.get("id"), self.expected_subnet_id)
+            )
+            and str(rule.get("action", "Allow")).lower() == "allow"
+            for rule in vnet_rules
+        ):
+            raise MigrationError(
+                f"application storage has no virtualNetworkRules entry for {SUBNET_NAME}"
+            )
+        self.say(f"storage firewall: Deny, no IP rules, {SUBNET_NAME} virtual-network rule present")
+
+        storage_id = storage.get("id")
+        if not isinstance(storage_id, str) or not storage_id.startswith("/subscriptions/"):
+            raise MigrationError("the application storage account has no resource ID")
+        scope = f"{storage_id}/tableServices/default/tables/{CONTROL_TABLE}"
+        assignments = self.az_json(self.cmd_role_list(scope)) or []
+        if not any(
+            isinstance(item, dict)
+            and _same_id(item.get("principalId"), self.facts.principal_id)
+            and item.get("roleDefinitionName", BUDGET_HOOK_ROLE) == BUDGET_HOOK_ROLE
+            for item in assignments
+        ):
+            raise MigrationError(
+                f"the new principal has no {BUDGET_HOOK_ROLE} assignment on {CONTROL_TABLE}; "
+                "the main deployment did not reach Azure"
+            )
+        self.say(f"{BUDGET_HOOK_ROLE} is assigned to the new principal on {CONTROL_TABLE}")
+
+    def step2_deploy(self) -> None:
+        self.ensure_facts()
+        self.update_params()
+        self.say("running scripts/deploy_cloud.py (its output follows)")
+        result = self.run(self.cmd_deploy_cloud(), capture=False)
+        if result.returncode:
+            raise MigrationError("scripts/deploy_cloud.py failed; see its output above")
+        self.verify_network_and_role()
+
+    # -- step 3 ------------------------------------------------------------
+
+    def set_app_settings(self, storage_name: str) -> None:
+        token = self.environ.get(TOKEN_ENV) or ""
+        if not token:
+            raise MigrationError(f"{TOKEN_ENV} is not set")
+        settings = [
+            {"name": "WATTRACKER_STORAGE_ACCOUNT_NAME", "value": storage_name, "slotSetting": False},
+            {"name": TOKEN_ENV, "value": token, "slotSetting": False},
+        ]
+        path: str | None = None
+        try:
+            descriptor, path = tempfile.mkstemp(prefix="wattracker-settings-", suffix=".json")
+            os.fchmod(descriptor, 0o600)
+            with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+                json.dump(settings, handle)
+            self.run_ok(self.cmd_appsettings_set(path))
+        except OSError:
+            raise MigrationError("could not write the temporary settings file") from None
+        finally:
+            if path is not None:
+                try:
+                    os.unlink(path)
+                except FileNotFoundError:
+                    pass
+        self.say("set WATTRACKER_STORAGE_ACCOUNT_NAME and WATTRACKER_BUDGET_HOOK_TOKEN")
+
+    def step3_publish(self) -> None:
+        self.ensure_facts()
+        staged = self.repo / STAGED_DIR
+        if staged.exists():
+            raise MigrationError(
+                f"{STAGED_DIR} already exists; remove only that directory yourself "
+                f"(rm -rf -- {STAGED_DIR}) -- this script never deletes it"
+            )
+        self.set_app_settings(self.storage_name())
+        self.say("staging the hook")
+        self.run_ok(self.cmd_package())
+        if not staged.is_dir():
+            raise MigrationError(f"{STAGED_DIR} was not created")
+        self.say("publishing with func (a remote build; this can take minutes, output captured)")
+        self.run_ok(self.cmd_publish(), cwd=staged)
+        self.say("published")
+
+    # -- step 4 ------------------------------------------------------------
+
+    def host_key(self) -> str:
+        keys = self.az_json(self.cmd_keys_list())
+        key = ((keys or {}).get("functionKeys") or {}).get("default") if isinstance(keys, dict) else None
+        if not isinstance(key, str) or not key:
+            raise MigrationError("the Function App has no default function key")
+        return key
+
+    def read_app_host(self) -> str:
+        app = self.az_json(self.cmd_read_app_show(), allow_missing=True)
+        if not isinstance(app, dict):
+            raise MigrationError(f"container app {READ_APP_NAME} does not exist")
+        properties = app.get("properties") if isinstance(app.get("properties"), dict) else app
+        fqdn = (((properties or {}).get("configuration") or {}).get("ingress") or {}).get("fqdn")
+        fqdn = str(fqdn or "").lower()
+        if not _HOST_RE.fullmatch(fqdn):
+            raise MigrationError(f"{READ_APP_NAME} has no valid ingress FQDN")
+        return fqdn
+
+    @staticmethod
+    def _detail(body: bytes) -> object:
+        try:
+            value = json.loads(body)
+        except (ValueError, TypeError):
+            return None
+        return value.get("detail") if isinstance(value, dict) else None
+
+    def probe(self, url: str) -> tuple[int, object]:
+        """Anonymous GET; returns (status, detail). No credential is ever sent."""
+
+        try:
+            status, body = self.http("GET", url, {"Accept": "application/json"}, 30.0)
+        except MigrationError:
+            return 0, None
+        return status, self._detail(body)
+
+    def probe_baseline(self, url: str) -> None:
+        deadline = self.now() + OBSERVE_TIMEOUT_SECONDS
+        while True:
+            status, detail = self.probe(url)
+            if status == 404 and detail == NOT_FOUND_DETAIL:
+                self.drill.baseline = status
+                self.say("baseline: the read API answers the neutral 404 (serving)")
+                return
+            if status == 503 and detail == PUBLIC_UNAVAILABLE_DETAIL:
+                self.drill.baseline = status
+                raise MigrationError(
+                    "the read API already answers 503 'public API unavailable': the kill "
+                    "switch is on or its state is unreadable. Nothing was disabled. Clear it "
+                    "first, then resume with --from-step 4:\n  " + self.manual_clear_command()
+                )
+            if status in TRANSIENT_STATUSES and self.now() < deadline:
+                self.sleep(POLL_INTERVAL_SECONDS)
+                continue
+            self.drill.baseline = status
+            raise MigrationError(
+                f"the probe answered HTTP {status or 'no response'}, not the neutral 404; "
+                "refusing to drill against an unexpected baseline"
+            )
+
+    def observe(self, url: str, status_wanted: int, detail_wanted: str, label: str) -> float:
+        """Poll the probe until it answers exactly (status, detail); return seconds taken."""
+
+        started = self.now()
+        deadline = started + OBSERVE_TIMEOUT_SECONDS
+        last = 0
+        while True:
+            status, detail = self.probe(url)
+            last = status
+            if status == status_wanted and detail == detail_wanted:
+                return self.now() - started
+            if self.now() >= deadline:
+                raise MigrationError(
+                    f"FAIL: {label}: the read API did not answer HTTP {status_wanted} within "
+                    f"{OBSERVE_TIMEOUT_SECONDS:.0f}s (last: HTTP {last or 'no response'})"
+                )
+            self.sleep(POLL_INTERVAL_SECONDS)
+
+    def hook_post(self, path: str, headers: Mapping[str, str]) -> int:
+        """POST to the Function; retry cold starts; demand exactly {"status":"ok"}."""
+
+        url = f"https://{self.facts.host}{path}"
+        status, body = 0, b""
+        for attempt in range(1, 4):
+            try:
+                status, body = self.http("POST", url, headers, 60.0)
+            except MigrationError:
+                status, body = 0, b""
+            if status not in TRANSIENT_STATUSES or attempt == 3:
+                break
+            self.say(f"{path} attempt {attempt}: HTTP {status or 'no response'}; retrying")
+            self.sleep(10)
+        self.last_hook_status = status  # for the summary, even when this raises
+        if status != 200:
+            raise MigrationError(f"FAIL: {path} returned HTTP {status or 'no response'}")
+        if body != DRILL_OK_BODY:
+            raise MigrationError(f'FAIL: {path} returned 200 but not exactly {{"status":"ok"}}')
+        return status
+
+    def clear_always(self, key: str, token: str) -> bool:
+        """Run /budget/clear; never raises. False means the cloud is left disabled."""
+
+        self.say("POST /budget/clear (host key and app token masked)")
+        self.last_hook_status = None
+        try:
+            self.drill.clear = self.hook_post(
+                "/budget/clear", {"x-functions-key": key, "X-Wattracker-Budget-Token": token}
+            )
+            return True
+        except MigrationError as exc:
+            reason = str(exc)
+        except KeyboardInterrupt:
+            reason = "interrupted during clear"
+        except Exception as exc:  # never echo str(exc)
+            reason = f"unexpected {type(exc).__name__}"
+        self.drill.clear = self.last_hook_status
+        self.drill.cloud_left_disabled = True
+        banner = "!" * 72
+        print(
+            f"\n{banner}\n"
+            f"WARNING: /budget/clear FAILED ({reason}).\n"
+            "THE CLOUD PUBLIC API IS LEFT DISABLED: every rider request answers 503.\n"
+            "Clear it by hand now (secrets are read from variables, never typed):\n"
+            f"  {self.manual_clear_command()}\n"
+            f"{banner}",
+            file=sys.stderr,
+            flush=True,
+        )
+        return False
+
+    def step4_drill(self) -> None:
+        """End-to-end kill-switch drill; the clear runs whenever disable was attempted."""
+
+        self.ensure_facts()
+        self.drill = DrillRecord()
+        token = self.environ.get(TOKEN_ENV) or ""
+        if not token:
+            raise MigrationError(f"{TOKEN_ENV} is not set")
+        probe_url = f"https://{self.read_app_host()}{PROBE_PATH}"
+        self.say(f"probe: anonymous GET {PROBE_PATH} on {READ_APP_NAME}")
+        self.probe_baseline(probe_url)
+        key = self.host_key()
+        failure: BaseException | None = None
+        self.last_hook_status = None
+        cleared = False
+        try:
+            # From just before disable until the clear completes, SIGTERM and
+            # SIGHUP raise KeyboardInterrupt, so the clear below still runs.
+            with termination_raises_interrupt():
+                try:
+                    self.say(
+                        "POST /budget/disable-public-api (host key only, masked): the public "
+                        "API goes down for under a minute"
+                    )
+                    self.drill.disable = self.hook_post(
+                        "/budget/disable-public-api", {"x-functions-key": key}
+                    )
+                    self.drill.shutdown_seconds = self.observe(
+                        probe_url, 503, PUBLIC_UNAVAILABLE_DETAIL, "shutdown"
+                    )
+                    self.say(
+                        f"shutdown observed: HTTP 503 after {self.drill.shutdown_seconds:.0f}s"
+                    )
+                except BaseException as exc:  # KeyboardInterrupt included: clear must still run
+                    failure = exc
+                    if self.drill.disable is None:
+                        self.drill.disable = self.last_hook_status
+                cleared = self.clear_always(key, token)
+        finally:
+            del key
+        if not cleared:
+            raise MigrationError(
+                "the cloud is LEFT DISABLED because /budget/clear failed; clear it by "
+                "hand (see the warning above) before anything else"
+            )
+        if isinstance(failure, KeyboardInterrupt):
+            raise failure
+        try:
+            self.drill.recovery_seconds = self.observe(
+                probe_url, 404, NOT_FOUND_DETAIL, "recovery"
+            )
+            self.say(f"recovery observed: HTTP 404 after {self.drill.recovery_seconds:.0f}s")
+        except MigrationError as recovery:
+            if failure is None:
+                self.drill.result = "FAIL"
+                raise
+            self.drill.result = "FAIL"
+            raise MigrationError(f"{failure}; and {recovery}") from None
+        if failure is not None:
+            self.drill.result = "FAIL"
+            if isinstance(failure, MigrationError):
+                raise failure
+            raise MigrationError(f"unexpected {type(failure).__name__}") from None
+        self.drill.result = "PASS"
+        self.say("PASS: disable shut the public API, clear restored it")
+
+    # -- orchestration -------------------------------------------------------
+
+    STEPS = {
+        1: "step1_flex",
+        2: "step2_deploy",
+        3: "step3_publish",
+        4: "step4_drill",
+    }
+
+    def print_plan(self) -> None:
+        mask = "***"
+        storage = "<storageName from params>"
+        host = "<defaultHostName from Azure>"
+        say = self.say
+        say("dry-run: no subprocess or network call is made; the commands a real run may issue:")
+        say("\n[step 0: preflight]")
+        git = ["git", "-C", str(self.repo)]
+        for argv in (
+            git + ["ls-files", "--error-unmatch", "--", str(DEPLOYMENT_PARAMETER)],
+            git + ["check-ignore", "-q", "--", str(DEPLOYMENT_PARAMETER)],
+            git + ["check-ignore", "-q", "--", str(DEPLOYMENT_PARAMETER.parent / BACKUP_NAME)],
+            git + ["branch", "--show-current"],
+            git + ["status", "--porcelain=v1", "--untracked-files=all"],
+            self.cmd_account_show(), self.cmd_group_show(), self.cmd_flex_locations(),
+            self.cmd_provider_show(), self.cmd_vnet_show(),
+        ):
+            say("  " + shlex.join(argv))
+        say("  (never `az network vnet create`: a missing VNet stops the run)")
+        if self.o.from_step <= 1:
+            say("\n[step 1: Flex Function]")
+            say("  " + shlex.join(self.cmd_subnet_show()))
+            say(
+                "  if the subnet is missing: "
+                + shlex.join(self.cmd_subnet_put(f"<{VNET_NAME} location>"))
+            )
+            say("  " + shlex.join(self.cmd_bootstrap_storage_show()))
+            say("  if missing: " + shlex.join(self.cmd_bootstrap_storage_create()))
+            say("  " + shlex.join(self.cmd_app_show()))
+            say(
+                "  only if the app is positively the old Y1 Consumption app (sku Dynamic, kind "
+                "functionapp, no functionAppConfig), is the budgetHookFunctionAppName in the "
+                "parameter file, and after the typed name confirmation: "
+                + shlex.join(self.cmd_app_delete())
+            )
+            say("  any other existing app that is not positively Flex stops the run")
+            say("  unless already Flex: " + shlex.join(self.cmd_app_create(self.expected_subnet_id)))
+            say("  " + shlex.join(self.cmd_identity_show()))
+            say("  if no identity: " + shlex.join(self.cmd_identity_assign()))
+        if self.o.from_step <= 2:
+            say("\n[step 2: parameters and deploy]")
+            say(
+                "  rewrite budgetHookPrincipalId, budgetHookHost, budgetHookFunctionAppName in "
+                f"{DEPLOYMENT_PARAMETER} (backup: {BACKUP_NAME}, 0600)"
+            )
+            say("  " + shlex.join(self.cmd_deploy_cloud()))
+            say("  " + shlex.join(self.cmd_app_storage_show(storage)))
+            say("  " + shlex.join(self.cmd_role_list(f"<storage id>/tableServices/default/tables/{CONTROL_TABLE}")))
+        if self.o.from_step <= 3:
+            say("\n[step 3: settings and publish]")
+            say(
+                "  " + shlex.join(self.cmd_appsettings_set("<0600 temp file>"))
+                + f"   # file: WATTRACKER_STORAGE_ACCOUNT_NAME={storage}, {TOKEN_ENV}={mask}; "
+                "deleted afterwards"
+            )
+            say("  " + shlex.join(self.cmd_package()))
+            say(f"  (cd {STAGED_DIR} && " + shlex.join(self.cmd_publish()) + ")")
+        say("\n[step 4: drill -- briefly disables the public API]")
+        probe = f"https://<{READ_APP_NAME} ingress fqdn>{PROBE_PATH}"
+        say("  " + shlex.join(self.cmd_read_app_show()) + "   # ingress fqdn")
+        say(f"  GET {probe}  (anonymous; baseline must be 404 'not found', never 503)")
+        say("  " + shlex.join(self.cmd_keys_list()) + "   # functionKeys.default, kept in memory")
+        say(f"  POST https://{host}/budget/disable-public-api  headers: x-functions-key: {mask}")
+        say(
+            f"  poll GET {probe} until 503 '{PUBLIC_UNAVAILABLE_DETAIL}' "
+            f"(timeout {OBSERVE_TIMEOUT_SECONDS:.0f}s)"
+        )
+        say(
+            f"  ALWAYS: POST https://{host}/budget/clear  headers: x-functions-key: {mask}, "
+            f"X-Wattracker-Budget-Token: {mask}"
+        )
+        say(f"  poll GET {probe} until 404 again (timeout {OBSERVE_TIMEOUT_SECONDS:.0f}s)")
+
+    def execute(self) -> int:
+        started = self.now()
+        finding: str | None = None
+        try:
+            self.local_preflight()
+        except MigrationError as exc:
+            if not self.o.dry_run:
+                self.fail(0, str(exc))
+                return 1
+            finding = str(exc)
+        if self.o.dry_run:
+            self.print_plan()
+            if finding is not None:
+                print(
+                    f"\ndry-run finding: a real run would stop at preflight: {finding}",
+                    file=sys.stderr,
+                )
+                return 1
+            self.say(
+                "\ndry-run complete; local checks passed. Run again without --dry-run to migrate."
+            )
+            return 0
+        order = [0, *range(self.o.from_step, 5)]
+        for step in order:
+            step_started = self.now()
+            self.say(f"\n== step {step}: {STEP_NAMES[step]} ==")
+            try:
+                if step == 0:
+                    self.step0_preflight()
+                else:
+                    getattr(self, self.STEPS[step])()
+            except MigrationError as exc:
+                self.records.append(StepRecord(step, "FAIL", _utc(step_started), _utc(self.now())))
+                self.fail(step, str(exc))
+                self.print_summary(started)
+                return 1
+            except KeyboardInterrupt:
+                self.records.append(StepRecord(step, "INTERRUPTED", _utc(step_started), _utc(self.now())))
+                self.fail(step, "interrupted")
+                self.print_summary(started)
+                return 130
+            except Exception as exc:  # never echo str(exc): it could carry output
+                self.records.append(StepRecord(step, "FAIL", _utc(step_started), _utc(self.now())))
+                self.fail(step, f"unexpected {type(exc).__name__}")
+                self.print_summary(started)
+                return 1
+            self.records.append(StepRecord(step, "PASS", _utc(step_started), _utc(self.now())))
+        self.print_summary(started)
+        return 0
+
+    def fail(self, step: int, message: str) -> None:
+        resume = self.o.from_step if step == 0 else step
+        print(f"\nerror: step {step} ({STEP_NAMES[step]}) failed: {message}", file=sys.stderr)
+        print(
+            f"Fix the cause, then resume with --from-step {resume}:\n  "
+            + self.o.resume_command(resume),
+            file=sys.stderr,
+        )
+
+    def print_summary(self, started: float) -> None:
+        lines = [
+            "",
+            "----- paste into #339 -----",
+            "#### Flex migration run (`scripts/migrate_budget_hook.py`)",
+            f"- started {_utc(started)}, finished {_utc(self.now())}",
+        ]
+        skipped = [s for s in range(1, self.o.from_step)]
+        lines.append("")
+        lines.append("| step | result | started | finished |")
+        lines.append("|---|---|---|---|")
+        for step in skipped:
+            lines.append(f"| {step}. {STEP_NAMES[step]} | skipped (--from-step) | | |")
+        for record in self.records:
+            lines.append(
+                f"| {record.step}. {STEP_NAMES[record.step]} | {record.result} | "
+                f"{record.started} | {record.finished} |"
+            )
+        lines.append("")
+        # Only non-identifying facts: #339 is public.  No subscription, resource
+        # group, resource ID, host name or principal ID in this block.
+        lines.append(f"- Function App: `{self.o.function_app_name}`")
+        lines.append(f"- subnet: `{SUBNET_NAME if self.facts.subnet_id else 'n/a'}`")
+        drill = self.drill
+        if drill is not None:
+            def status(value: int | None) -> str:
+                return "not reached" if value is None else f"HTTP {value or 'no response'}"
+
+            def seconds(value: float | None) -> str:
+                return "not observed" if value is None else f"{value:.0f}s"
+
+            lines.append(f"- drill probe: anonymous `GET {PROBE_PATH}` on `{READ_APP_NAME}`")
+            lines.append(f"  - baseline: {status(drill.baseline)}")
+            lines.append(f"  - `POST /budget/disable-public-api`: {status(drill.disable)}")
+            lines.append(f"  - disable -> 503: {seconds(drill.shutdown_seconds)}")
+            lines.append(f"  - `POST /budget/clear`: {status(drill.clear)}")
+            lines.append(f"  - clear -> 404 recovery: {seconds(drill.recovery_seconds)}")
+            lines.append(f"  - drill result: {drill.result or 'FAIL'}")
+            if drill.cloud_left_disabled:
+                lines.append("  - **the public API was left DISABLED: clear failed**")
+        lines.append("----- end -----")
+        lines += [
+            "",
+            "===== LOCAL ONLY -- do not paste into GitHub =====",
+            f"principalId:     {self.facts.principal_id or 'n/a'}",
+            f"defaultHostName: {self.facts.host or 'n/a'}",
+            f"subnet id:       {self.facts.subnet_id or 'n/a'}",
+            "===== end LOCAL ONLY =====",
+        ]
+        self.say("\n".join(lines))
+
+
+# ---------------------------------------------------------------------------
+# CLI
+# ---------------------------------------------------------------------------
+
+
+class _ArgumentParser(argparse.ArgumentParser):
+    def error(self, message: str) -> None:  # argparse messages echo argv values
+        self.print_usage(sys.stderr)
+        raise MigrationError("invalid command-line arguments")
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = _ArgumentParser(
+        description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
+    )
+    parser.add_argument("--resource-group", required=True)
+    parser.add_argument("--subscription", required=True, help="subscription ID (GUID)")
+    parser.add_argument("--location", default="eastus2")
+    parser.add_argument("--function-app-name", required=True)
+    parser.add_argument("--bootstrap-storage-name", required=True)
+    parser.add_argument("--params", required=True, type=Path,
+                        help="infra/azure/main.local.bicepparam (untracked)")
+    parser.add_argument("--dry-run", action="store_true")
+    parser.add_argument("--from-step", type=int, default=1, choices=(1, 2, 3, 4))
+    parser.add_argument("--confirm-delete", metavar="NAME",
+                        help="non-interactive confirmation for deleting the non-Flex app")
+    return parser
+
+
+def main(argv: Sequence[str] | None = None, **migrator_kwargs: Any) -> int:
+    try:
+        args = build_parser().parse_args(argv)
+    except MigrationError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+    options = Options(
+        resource_group=args.resource_group,
+        subscription=args.subscription,
+        location=args.location,
+        function_app_name=args.function_app_name,
+        bootstrap_storage_name=args.bootstrap_storage_name,
+        params=args.params,
+        dry_run=args.dry_run,
+        from_step=args.from_step,
+        confirm_delete=args.confirm_delete,
+    )
+    return Migrator(options, **migrator_kwargs).execute()
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
