@@ -285,14 +285,28 @@ prints the exact `--from-step N` command to resume with. Keep these points in mi
   `infra/azure/main.pre-339-backup.local.bicepparam` (git-ignored).
 - If `build/azure-budget-hook` exists, the script stops. Remove only that
   directory yourself.
-- A 200 response alone does not pass the drill. The script also reads the
-  CloudControl row, which must show both levels enabled with the
-  `operator clear` reason and must not predate the drill. Reading the row
-  requires Storage Table Data Reader on `CloudControl`, and the storage
-  firewall must admit this workstation. If either one blocks the read, the
-  script reports the drill as not passed instead of guessing.
+- **The scripted drill (step 4) briefly disables the public API**, for under
+  a minute. Run it before any rider enrolls. It proves the whole path end to
+  end. It needs no storage firewall change and no table read from this
+  workstation:
+  1. An anonymous `GET /api/v1/context` on `wattracker-read` must first answer
+     the neutral 404. A 503 at this point means the switch is already on or
+     its state is unreadable. The drill then stops and prints the manual
+     clear command.
+  2. `POST /budget/disable-public-api` is sent with the host key only. That
+     route is platform-authenticated, so the app token is not sent.
+  3. The same probe must answer 503 `public API unavailable` within the kill
+     switch's 30s cache window plus a cold-start margin (90s in total).
+  4. `POST /budget/clear`, with the host key and the app token, then **always**
+     runs, including after a failure or Ctrl-C.
+  5. The probe must return to 404 within the same timeout.
 
-The manual commands in sections 1-4 remain the fallback.
+  If the clear itself fails, the script prints a loud warning with the manual
+  `curl` (secrets are read from variables) and exits nonzero: the cloud is
+  still disabled.
+
+The manual commands in sections 1-4 remain the fallback. Section 4 is the
+manual drill.
 
 ## 1. Bootstrap or recreate the Flex Function App (unverified commands)
 

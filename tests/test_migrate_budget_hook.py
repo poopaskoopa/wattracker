@@ -26,6 +26,7 @@ BOOT = "wattrackerhook"
 STORAGE = "wattrackerapp"
 PID = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
 HOST = "wattracker-budget-hook-abc123.eastus2-01.azurewebsites.net"
+READ_HOST = "wattracker-read.proudcoast-test.eastus2.azurecontainerapps.io"
 SUBNET_ID = (
     f"/subscriptions/{SUB}/resourceGroups/{RG}/providers/Microsoft.Network"
     "/virtualNetworks/wattracker-vnet/subnets/budget-hook-flex"
@@ -82,19 +83,6 @@ def _result(argv, returncode=0, stdout="", stderr=""):
     return subprocess.CompletedProcess(argv, returncode, stdout, stderr)
 
 
-def _row(*, writes=True, public=True, reason="operator clear", updated_at=NOW + 1, mig=None):
-    return {
-        "PartitionKey": "__wattracker_auth_v1__",
-        "RowKey": mig.KILL_SWITCH_ROW_KEY,
-        "Payload": json.dumps({
-            "writes_enabled": writes,
-            "public_enabled": public,
-            "reason": reason,
-            "updated_at": updated_at,
-        }, sort_keys=True, separators=(",", ":")),
-    }
-
-
 class FakeWorld:
     """A scripted Azure/git/func. State changes as write commands run."""
 
@@ -117,7 +105,7 @@ class FakeWorld:
         self.default_action = state.get("default_action", "Deny")
         self.ip_rules = state.get("ip_rules", [])
         self.settings_rc = state.get("settings_rc", 0)
-        self.row = state.get("row", "fresh")  # fresh | missing | forbidden | dict
+        self.read_app = state.get("read_app", True)
         self.fail = state.get("fail", ())  # argv prefixes that exit 1
         self.settings_files: list[dict] = []
 
@@ -252,24 +240,116 @@ class FakeWorld:
         if argv[1:4] == ["functionapp", "keys", "list"]:
             return self._json(argv, {"functionKeys": {"default": HOST_KEY},
                                      "masterKey": MASTER_KEY, "systemKeys": {}})
-        if argv[1:4] == ["storage", "entity", "show"]:
-            if self.row == "missing":
-                return _result(argv, 1, "", "The specified resource does not exist. ResourceNotFound")
-            if self.row == "forbidden":
-                return _result(argv, 1, "", "AuthorizationFailure: This request is not authorized")
-            row = _row(mig=self.mig) if self.row == "fresh" else self.row
-            return self._json(argv, row)
+        if argv[1:3] == ["containerapp", "show"]:
+            assert argv[argv.index("--name") + 1] == "wattracker-read"
+            if not self.read_app:
+                return self._missing(argv)
+            return self._json(argv, {"name": "wattracker-read", "properties": {
+                "configuration": {"ingress": {"fqdn": READ_HOST}}}})
         raise AssertionError(f"unscripted command: {argv}")
 
 
-class FakeHttp:
-    def __init__(self, responses=None):
-        self.responses = list(responses or [(200, b'{"status":"ok"}')])
-        self.calls = []
+OK = b'{"status":"ok"}'
+NOT_FOUND = b'{"detail":"not found"}'
+UNAVAILABLE = b'{"detail":"public API unavailable"}'
+PROBE_URL = f"https://{READ_HOST}/api/v1/context"
+DISABLE_URL = f"https://{HOST}/budget/disable-public-api"
+CLEAR_URL = f"https://{HOST}/budget/clear"
 
-    def __call__(self, url, headers, timeout):
-        self.calls.append((url, dict(headers)))
-        return self.responses.pop(0) if len(self.responses) > 1 else self.responses[0]
+
+class Clock:
+    """Deterministic time: sleeping advances it, nothing else does."""
+
+    def __init__(self):
+        self.t = NOW
+
+    def now(self):
+        return self.t
+
+    def sleep(self, seconds):
+        self.t += seconds
+
+
+class FakeCloud:
+    """The Function's hooks plus the read app, with a replica cache lag.
+
+    The durable state flips when a hook succeeds; the read app shows the new
+    state ``lag`` seconds later, as a warm replica with a cached kill state does.
+    """
+
+    def __init__(self, mig, *, public=True, lag=12.0, cold=0, platform_503=0,
+                 disable=((200, OK),), clear=((200, OK),), shutdown_never=False,
+                 recover_never=False, baseline=None, interrupt_on=None, shutdown_platform=False):
+        self.mig = mig
+        self.shutdown_platform = shutdown_platform
+        self.clock = Clock()
+        self.calls = []  # (method, url, headers)
+        self.public = public
+        self.shown = public
+        self.changed_at = float("-inf")
+        self.lag = lag
+        self.cold = cold
+        self.platform_503 = platform_503
+        self.disable = list(disable)
+        self.clear = list(clear)
+        self.shutdown_never = shutdown_never
+        self.recover_never = recover_never
+        self.baseline = baseline
+        self.interrupt_on = interrupt_on
+
+    def _next(self, responses):
+        return responses.pop(0) if len(responses) > 1 else responses[0]
+
+    def _set(self, public):
+        self.shown = self._visible()
+        self.public = public
+        self.changed_at = self.clock.now()
+
+    def _visible(self):
+        if self.clock.now() - self.changed_at >= self.lag:
+            return self.public
+        return self.shown
+
+    def posts(self, url):
+        return [call for call in self.calls if call[0] == "POST" and call[1] == url]
+
+    def __call__(self, method, url, headers, timeout):
+        self.calls.append((method, url, dict(headers)))
+        if method == "GET":
+            assert url == PROBE_URL, url
+            if self.interrupt_on == "probe-after-disable" and self.posts(DISABLE_URL):
+                self.interrupt_on = None  # one Ctrl-C
+                raise KeyboardInterrupt
+            if self.baseline is not None and not self.posts(DISABLE_URL):
+                return self.baseline
+            if self.cold:  # scale-from-zero: no response yet
+                self.cold -= 1
+                raise self.mig.MigrationError("could not reach the budget hook over HTTPS")
+            if self.platform_503:
+                self.platform_503 -= 1
+                return 503, b"upstream connect error"
+            visible = self._visible()
+            if self.shutdown_platform and self.posts(DISABLE_URL) and not self.posts(CLEAR_URL):
+                return 503, b"upstream connect error or disconnect/reset before headers"
+            if self.shutdown_never and not self.posts(CLEAR_URL):
+                visible = True
+            if self.recover_never and self.posts(CLEAR_URL):
+                visible = False
+            return (404, NOT_FOUND) if visible else (503, UNAVAILABLE)
+        assert method == "POST", method
+        if url == DISABLE_URL:
+            status, body = self._next(self.disable)
+            if status == 200:
+                self._set(False)
+            return status, body
+        if url == CLEAR_URL:
+            if self.interrupt_on == "clear":
+                raise KeyboardInterrupt
+            status, body = self._next(self.clear)
+            if status == 200:
+                self._set(True)
+            return status, body
+        raise AssertionError(url)
 
 
 @pytest.fixture
@@ -282,7 +362,7 @@ def repo(tmp_path):
     return root
 
 
-def _migrator(mig, repo, world, *, http=None, env=None, prompt=None, tty=False, clock=None, **options):
+def _migrator(mig, repo, world, *, http=None, env=None, prompt=None, tty=False, **options):
     opts = mig.Options(
         resource_group=RG,
         subscription=SUB,
@@ -291,17 +371,17 @@ def _migrator(mig, repo, world, *, http=None, env=None, prompt=None, tty=False, 
         params=repo / "infra" / "azure" / "main.local.bicepparam",
         **options,
     )
-    ticks = iter(range(10_000))
+    cloud = http if http is not None else FakeCloud(mig)
     return mig.Migrator(
         opts,
         runner=world,
-        http_post=http or FakeHttp(),
+        http=cloud,
         environ=ENV if env is None else env,
         prompt=prompt or (lambda _message: pytest.fail("unexpected prompt")),
         stdin_isatty=lambda: tty,
         which=lambda name: f"/usr/local/bin/{name}",
-        sleep=lambda _seconds: None,
-        now=clock or (lambda: NOW + next(ticks) * 0.001),
+        sleep=cloud.clock.sleep,
+        now=cloud.clock.now,
         repo_root=repo,
         python="/venv/python",
     )
@@ -342,7 +422,7 @@ def test_dry_run_makes_zero_calls(mig, repo, capsys):
             "--bootstrap-storage-name", BOOT, "--params", str(params), "--dry-run",
         ],
         runner=forbidden_runner,
-        http_post=forbidden_http,
+        http=forbidden_http,
         environ=ENV,
         which=lambda name: f"/usr/local/bin/{name}",
         repo_root=repo,
@@ -358,6 +438,9 @@ def test_dry_run_makes_zero_calls(mig, repo, capsys):
     assert "deploy_cloud.py" in out and "--always-deploy" in out
     assert "func azure functionapp publish" in out
     assert "X-Wattracker-Budget-Token: ***" in out and "x-functions-key: ***" in out
+    assert "/budget/disable-public-api  headers: x-functions-key: ***\n" in out
+    assert "ALWAYS: POST" in out and "/api/v1/context" in out
+    assert "storage entity show" not in out
     assert "vnet create" not in out.replace("never `az network vnet create`", "")
     assert STORAGE not in out  # parameter contents are never printed
     _assert_no_secret(out, captured.err)
@@ -379,9 +462,9 @@ def test_dry_run_reports_local_findings_without_calls(mig, repo, capsys):
 # ---------------------------------------------------------------------------
 
 
-def _full_run(mig, repo, capsys=None, **state):
+def _full_run(mig, repo, capsys=None, cloud=None, **state):
     world = FakeWorld(repo, mig, **state)
-    http = FakeHttp()
+    http = cloud if cloud is not None else FakeCloud(mig)
     code = _migrator(mig, repo, world, http=http, confirm_delete=APP).execute()
     return code, world, http
 
@@ -692,10 +775,8 @@ def test_secrets_never_reach_argv_output_or_the_summary(mig, repo, capsys):
     assert code == 0
     _assert_argv_clean(world)
     _assert_no_secret(captured.out, captured.err)
-    # The secrets did travel where they must: headers and the settings file.
-    (url, headers), = http.calls
-    assert url == f"https://{HOST}/budget/clear"
-    assert headers == {"x-functions-key": HOST_KEY, "X-Wattracker-Budget-Token": TOKEN}
+    # The secrets did travel where they must: hook headers and the settings file.
+    assert http.posts(DISABLE_URL) and http.posts(CLEAR_URL)
     (settings,) = world.settings_files
     assert {"name": "WATTRACKER_BUDGET_HOOK_TOKEN", "value": TOKEN, "slotSetting": False} in settings["content"]
     assert {"name": "WATTRACKER_STORAGE_ACCOUNT_NAME", "value": STORAGE, "slotSetting": False} in settings["content"]
@@ -708,8 +789,6 @@ def test_secrets_never_reach_argv_output_or_the_summary(mig, repo, capsys):
     {"fail": (["az", "functionapp", "keys", "list"],)},
     {"fail": (["az", "functionapp", "config", "appsettings", "set"],)},
     {"fail": (["func"],)},
-    {"row": "missing"},
-    {"row": "forbidden"},
 ])
 def test_secrets_stay_out_of_failure_output(mig, repo, capsys, state):
     code, world, _http = _full_run(mig, repo, **state)
@@ -719,9 +798,32 @@ def test_secrets_stay_out_of_failure_output(mig, repo, capsys, state):
     _assert_no_secret(captured.out, captured.err)
 
 
+_LEAKY = f"bad {HOST_KEY} {TOKEN} {MASTER_KEY}".encode()
+
+
+@pytest.mark.parametrize("cloud_kwargs", [
+    {"disable": ((401, _LEAKY),)},
+    {"disable": ((200, _LEAKY),)},
+    {"shutdown_never": True},
+    {"recover_never": True},
+    {"clear": ((500, _LEAKY),)},
+    {"interrupt_on": "clear"},
+    {"interrupt_on": "probe-after-disable"},
+    {"baseline": (503, UNAVAILABLE)},
+    {"baseline": (200, _LEAKY)},
+])
+def test_secrets_stay_out_of_drill_failure_output(mig, repo, capsys, cloud_kwargs):
+    code, world, _cloud = _full_run(mig, repo, cloud=FakeCloud(mig, **cloud_kwargs))
+    captured = capsys.readouterr()
+    assert code != 0
+    _assert_argv_clean(world)
+    _assert_no_secret(captured.out, captured.err)
+
+
 def test_secrets_stay_out_of_exception_text(mig, repo):
     world = FakeWorld(repo, mig, app="flex", deployed=True)
-    migrator = _migrator(mig, repo, world, http=FakeHttp([(401, f"bad {HOST_KEY} {TOKEN}".encode())]))
+    cloud = FakeCloud(mig, disable=((401, _LEAKY),), recover_never=True)
+    migrator = _migrator(mig, repo, world, http=cloud)
     migrator.local_preflight()
     migrator.read_app_facts()
     with pytest.raises(mig.MigrationError) as drill:
@@ -732,15 +834,12 @@ def test_secrets_stay_out_of_exception_text(mig, repo):
     world.fail = (["az", "functionapp", "keys", "list"],)
     with pytest.raises(mig.MigrationError) as keys:
         migrator.host_key()
-
-    def exploding_http(*_args):
-        raise mig.MigrationError("could not reach the budget hook over HTTPS")
-
-    migrator.http_post = exploding_http
     world.fail = ()
-    with pytest.raises(mig.MigrationError) as network:
-        migrator.post_clear()
-    for info in (drill, settings, keys, network):
+    migrator.http = FakeCloud(mig, clear=((500, _LEAKY),))
+    migrator.drill = mig.DrillRecord()
+    with pytest.raises(mig.MigrationError) as clear:
+        migrator.hook_post("/budget/clear", {"x-functions-key": HOST_KEY})
+    for info in (drill, settings, keys, clear):
         text = str(info.value) + repr(info.value) + repr(info.value.__cause__) + repr(info.value.__context__)
         _assert_no_secret(text)
 
@@ -759,9 +858,10 @@ def test_default_runner_strips_the_token_from_child_environments(mig, monkeypatc
     assert TOKEN not in json.dumps(seen["env"])
 
 
-def test_default_http_post_refuses_plain_http_and_never_follows_redirects(mig):
-    with pytest.raises(mig.MigrationError, match="non-HTTPS"):
-        mig.default_http_post("http://example.invalid/budget/clear", {}, 1.0)
+def test_default_http_refuses_plain_http_and_never_follows_redirects(mig):
+    for method in ("GET", "POST"):
+        with pytest.raises(mig.MigrationError, match="non-HTTPS"):
+            mig.default_http(method, "http://example.invalid/budget/clear", {}, 1.0)
     assert mig._NoRedirect().redirect_request(None, None, 302, "Found", {}, "https://evil") is None
 
 
@@ -815,90 +915,258 @@ def test_publish_runs_from_the_staged_dir_after_settings(mig, repo):
 
 
 # ---------------------------------------------------------------------------
-# the drill
+# the drill: disable -> observe 503 -> ALWAYS clear -> observe recovery
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.parametrize("response, message", [
-    ((200, b'{"status": "ok"}'), 'not exactly {"status":"ok"}'),
-    ((200, b""), 'not exactly {"status":"ok"}'),
-    ((401, b'{"detail":"unauthorized"}'), "returned HTTP 401"),
-])
-def test_drill_wrong_response_fails(mig, repo, capsys, response, message):
-    world = FakeWorld(repo, mig)
-    code = _migrator(mig, repo, world, http=FakeHttp([response]), confirm_delete=APP).execute()
-    assert code == 1
-    err = capsys.readouterr().err
-    assert message in err and "--from-step 4" in err
-    assert not _commands(world, "storage", "entity", "show")
+def _drill(mig, repo, capsys, **cloud_kwargs):
+    cloud = FakeCloud(mig, **cloud_kwargs)
+    code, world, _ = _full_run(mig, repo, cloud=cloud)
+    captured = capsys.readouterr()
+    return code, cloud, world, captured
 
 
-def test_drill_200_without_the_row_fails(mig, repo, capsys):
-    code, _world, _http = _full_run(mig, repo, row="missing")
-    assert code == 1
-    assert "row does not exist" in capsys.readouterr().err
-
-
-def test_drill_unreadable_row_is_not_a_pass(mig, repo, capsys):
-    code, _world, _http = _full_run(mig, repo, row="forbidden")
-    assert code == 1
-    assert "drill is NOT passed" in capsys.readouterr().err
-
-
-@pytest.mark.parametrize("row_kwargs, message", [
-    ({"writes": False}, "both levels enabled"),
-    ({"public": False}, "both levels enabled"),
-    ({"reason": "budget 100%"}, "not the operator clear"),
-    ({"updated_at": NOW - 3600}, "predates this drill"),
-])
-def test_drill_row_that_does_not_prove_the_clear_fails(mig, repo, capsys, row_kwargs, message):
-    code, _world, _http = _full_run(mig, repo, row=_row(mig=mig, **row_kwargs))
-    assert code == 1
-    assert message in capsys.readouterr().err
-
-
-def test_drill_row_payload_that_is_malformed_fails(mig, repo, capsys):
-    row = _row(mig=mig)
-    row["Payload"] = json.dumps({"writes_enabled": "true", "public_enabled": True})
-    code, _world, _http = _full_run(mig, repo, row=row)
-    assert code == 1
-    assert "payload is malformed" in capsys.readouterr().err
+def _order(cloud):
+    return [(method, url) for method, url, _headers in cloud.calls if method == "POST"]
 
 
 def test_drill_full_pass(mig, repo, capsys):
-    code, world, http = _full_run(mig, repo)
-    out = capsys.readouterr().out
+    code, cloud, _world, captured = _drill(mig, repo, capsys)
     assert code == 0
-    assert "PASS: the kill-switch row shows both levels enabled" in out
-    (entity,) = _commands(world, "storage", "entity", "show")
-    assert entity[entity.index("--partition-key") + 1] == "__wattracker_auth_v1__"
-    assert entity[entity.index("--row-key") + 1] == mig.KILL_SWITCH_ROW_KEY
-    assert entity[entity.index("--table-name") + 1] == "CloudControl"
+    assert _order(cloud) == [("POST", DISABLE_URL), ("POST", CLEAR_URL)]
+    out = captured.out
+    assert "PASS: disable shut the public API, clear restored it" in out
+    assert "  - baseline: HTTP 404" in out
+    assert "  - `POST /budget/disable-public-api`: HTTP 200" in out
+    assert "  - disable -> 503: 12s" in out
+    assert "  - `POST /budget/clear`: HTTP 200" in out
+    assert "  - clear -> 404 recovery: 12s" in out
+    assert "  - drill result: PASS" in out
     for step in range(5):
-        assert f"| {step}. " in out and "| PASS |" in out
-    assert "HTTP 200" in out
+        assert f"| {step}. " in out
+    assert "| FAIL |" not in out
 
 
-def test_drill_retries_a_cold_start_then_passes(mig, repo):
-    world = FakeWorld(repo, mig)
-    http = FakeHttp([(503, b""), (200, b'{"status":"ok"}')])
-    assert _migrator(mig, repo, world, http=http, confirm_delete=APP).execute() == 0
-    assert len(http.calls) == 2
+def test_probe_is_anonymous_and_https_on_the_read_app(mig, repo, capsys):
+    _code, cloud, world, _captured = _drill(mig, repo, capsys)
+    probes = [(url, headers) for method, url, headers in cloud.calls if method == "GET"]
+    assert probes and all(url == PROBE_URL for url, _ in probes)
+    for _url, headers in probes:
+        assert headers == {"Accept": "application/json"}
+    (show,) = _commands(world, "containerapp", "show")
+    assert show[show.index("--name") + 1] == "wattracker-read"
 
 
-def test_row_key_is_derived_from_the_source_module(mig):
-    import hashlib
-
-    expected = "kill-switch:" + hashlib.sha256(
-        b"wattracker-cloud-kill-switch-v1\x00deployment"
-    ).hexdigest()
-    assert mig.KILL_SWITCH_ROW_KEY == expected
-    assert mig.KILL_SWITCH_PARTITION == "__wattracker_auth_v1__"
+def test_app_token_goes_to_clear_but_never_to_disable(mig, repo, capsys):
+    _code, cloud, _world, _captured = _drill(mig, repo, capsys)
+    ((_, _, disable_headers),) = [c for c in cloud.calls if c[1] == DISABLE_URL]
+    ((_, _, clear_headers),) = [c for c in cloud.calls if c[1] == CLEAR_URL]
+    assert disable_headers == {"x-functions-key": HOST_KEY}
+    assert clear_headers == {"x-functions-key": HOST_KEY, "X-Wattracker-Budget-Token": TOKEN}
 
 
-def test_operator_clear_reason_matches_the_hook(mig):
-    source = (ROOT / "wattracker/cloud/budget_hook.py").read_text()
-    assert f'clear_kill_switch(backend, reason="{mig.OPERATOR_CLEAR_REASON}")' in source
+def test_disable_public_api_needs_no_app_token_in_the_functions_shape():
+    """The reason the drill may omit the token: platform auth on this route."""
+
+    hook = (ROOT / "wattracker/cloud/budget_hook.py").read_text()
+    entry = (ROOT / "infra/azure/budget-hook/function_app.py").read_text()
+    assert "platform_authenticated=True" in entry
+    disable = hook.split('@app.post("/budget/disable-public-api")', 1)[1].split("@app.post", 1)[0]
+    assert "await apply(" in disable
+    clear = hook.split('@app.post("/budget/clear")', 1)[1]
+    assert "authenticate_header(request)" in clear
+
+
+@pytest.mark.parametrize("baseline", [
+    (503, UNAVAILABLE),
+])
+def test_baseline_503_stops_before_anything_is_disabled(mig, repo, capsys, baseline):
+    code, cloud, _world, captured = _drill(mig, repo, capsys, baseline=baseline)
+    assert code == 1
+    assert _order(cloud) == []
+    assert "kill switch is on or its state is unreadable" in captured.err
+    assert "Nothing was disabled" in captured.err
+    assert "/budget/clear" in captured.err and "--from-step 4" in captured.err
+
+
+def test_baseline_rides_out_a_cold_start_and_platform_503s(mig, repo, capsys):
+    code, cloud, _world, _captured = _drill(mig, repo, capsys, cold=4, platform_503=2)
+    assert code == 0
+    assert _order(cloud) == [("POST", DISABLE_URL), ("POST", CLEAR_URL)]
+
+
+def test_unexpected_baseline_stops_before_anything_is_disabled(mig, repo, capsys):
+    code, cloud, _world, captured = _drill(mig, repo, capsys, baseline=(200, b"{}"))
+    assert code == 1
+    assert _order(cloud) == []
+    assert "not the neutral 404" in captured.err
+
+
+def test_no_503_within_the_timeout_fails_and_still_clears(mig, repo, capsys):
+    code, cloud, _world, captured = _drill(mig, repo, capsys, shutdown_never=True)
+    assert code == 1
+    assert _order(cloud) == [("POST", DISABLE_URL), ("POST", CLEAR_URL)]
+    assert "did not answer HTTP 503 within 90s" in captured.err
+    assert "  - disable -> 503: not observed" in captured.out
+    assert "  - drill result: FAIL" in captured.out
+
+
+def test_a_platform_503_is_not_proof_of_the_shutdown(mig, repo, capsys):
+    """Only the app's own 'public API unavailable' 503 proves the kill switch."""
+
+    code, cloud, _world, captured = _drill(mig, repo, capsys, shutdown_platform=True)
+    assert code == 1
+    assert _order(cloud) == [("POST", DISABLE_URL), ("POST", CLEAR_URL)]
+    assert "did not answer HTTP 503" in captured.err
+    assert "(last: HTTP 503)" in captured.err
+
+
+def test_shutdown_timeout_is_the_kill_switch_ttl_plus_a_cold_start_margin(mig, repo, capsys):
+    from wattracker.cloud.limits import KILL_SWITCH_TTL_SECONDS
+
+    assert mig.OBSERVE_TIMEOUT_SECONDS == KILL_SWITCH_TTL_SECONDS + 60.0
+    cloud = FakeCloud(mig, shutdown_never=True)
+    _full_run(mig, repo, cloud=cloud)
+    capsys.readouterr()
+    disabled_at = next(i for i, c in enumerate(cloud.calls) if c[1] == DISABLE_URL)
+    polls = [c for c in cloud.calls[disabled_at:] if c[0] == "GET"]
+    polls_until_clear = []
+    for call in cloud.calls[disabled_at + 1:]:
+        if call[1] == CLEAR_URL:
+            break
+        polls_until_clear.append(call)
+    assert polls
+    assert len(polls_until_clear) == int(mig.OBSERVE_TIMEOUT_SECONDS / mig.POLL_INTERVAL_SECONDS) + 1
+
+
+@pytest.mark.parametrize("cloud_kwargs, message", [
+    ({"disable": ((401, b'{"detail":"unauthorized"}'),)}, "returned HTTP 401"),
+    ({"disable": ((200, b'{"status": "ok"}'),)}, 'not exactly {"status":"ok"}'),
+    ({"disable": ((0, b""),)}, "returned HTTP no response"),
+    ({"disable": ((302, b""),)}, "returned HTTP 302"),
+    ({"shutdown_never": True}, "did not answer HTTP 503"),
+])
+def test_clear_runs_after_every_failure_once_disable_was_attempted(
+    mig, repo, capsys, cloud_kwargs, message
+):
+    code, cloud, _world, captured = _drill(mig, repo, capsys, **cloud_kwargs)
+    assert code == 1
+    posts = _order(cloud)
+    assert ("POST", DISABLE_URL) in posts
+    assert posts[-1] == ("POST", CLEAR_URL)
+    assert message in captured.err
+    assert "step 4 (drill) failed" in captured.err
+    assert "  - `POST /budget/clear`: HTTP 200" in captured.out
+    assert "  - drill result: FAIL" in captured.out
+    if "disable" in cloud_kwargs:
+        status = cloud_kwargs["disable"][0][0]
+        assert f"  - `POST /budget/disable-public-api`: HTTP {status or 'no response'}" in captured.out
+
+
+def test_ctrl_c_after_disable_still_clears(mig, repo, capsys):
+    code, cloud, _world, captured = _drill(mig, repo, capsys, interrupt_on="probe-after-disable")
+    assert code == 130
+    assert _order(cloud) == [("POST", DISABLE_URL), ("POST", CLEAR_URL)]
+    # The interrupt is honoured after the clear: no recovery polling follows.
+    assert cloud.calls[-1][1] == CLEAR_URL
+    assert "interrupted" in captured.err
+    assert "LEFT DISABLED" not in captured.err
+    assert "  - `POST /budget/clear`: HTTP 200" in captured.out
+
+
+@pytest.mark.parametrize("cloud_kwargs", [
+    {"clear": ((500, b'{"detail":"budget hook unavailable"}'),)},
+    {"clear": ((503, b""),)},
+    {"interrupt_on": "clear"},
+])
+def test_clear_failure_warns_loudly_and_exits_nonzero(mig, repo, capsys, cloud_kwargs):
+    code, cloud, _world, captured = _drill(mig, repo, capsys, **cloud_kwargs)
+    assert code != 0
+    err = captured.err
+    assert "THE CLOUD PUBLIC API IS LEFT DISABLED" in err
+    assert "curl --fail-with-body --request POST" in err
+    assert f"https://{HOST}/budget/clear" in err
+    assert '"x-functions-key: $FUNCTION_HOST_KEY"' in err
+    assert '"X-Wattracker-Budget-Token: $WATTRACKER_BUDGET_HOOK_TOKEN"' in err
+    assert "--query functionKeys.default --output tsv" in err
+    assert "**the public API was left DISABLED: clear failed**" in captured.out
+    if "clear" in cloud_kwargs:
+        status = cloud_kwargs["clear"][0][0]
+        assert f"  - `POST /budget/clear`: HTTP {status}" in captured.out
+    _assert_no_secret(captured.out, err)
+    # No recovery poll is attempted against a cloud that was never cleared.
+    last_clear = max(i for i, c in enumerate(cloud.calls) if c[1] == CLEAR_URL)
+    assert not [c for c in cloud.calls[last_clear + 1:] if c[0] == "GET"]
+
+
+def test_clear_retries_a_cold_start(mig, repo, capsys):
+    code, cloud, _world, _captured = _drill(mig, repo, capsys, clear=((503, b""), (200, OK)))
+    assert code == 0
+    assert len(cloud.posts(CLEAR_URL)) == 2
+
+
+def test_no_recovery_within_the_timeout_fails(mig, repo, capsys):
+    code, cloud, _world, captured = _drill(mig, repo, capsys, recover_never=True)
+    assert code == 1
+    assert _order(cloud) == [("POST", DISABLE_URL), ("POST", CLEAR_URL)]
+    assert "FAIL: recovery" in captured.err
+    assert "  - clear -> 404 recovery: not observed" in captured.out
+    assert "  - drill result: FAIL" in captured.out
+
+
+def test_shutdown_failure_and_no_recovery_are_both_reported(mig, repo, capsys):
+    code, _cloud, _world, captured = _drill(
+        mig, repo, capsys, disable=((401, b""),), recover_never=True
+    )
+    assert code == 1
+    assert "returned HTTP 401" in captured.err and "FAIL: recovery" in captured.err
+
+
+def test_drill_disable_retries_a_cold_start_then_passes(mig, repo, capsys):
+    code, cloud, _world, _captured = _drill(mig, repo, capsys, disable=((503, b""), (200, OK)))
+    assert code == 0
+    assert len(cloud.posts(DISABLE_URL)) == 2
+
+
+def test_missing_read_app_stops_before_anything_is_disabled(mig, repo, capsys):
+    cloud = FakeCloud(mig)
+    code, _world, _ = _full_run(mig, repo, cloud=cloud, read_app=False)
+    assert code == 1
+    assert "wattracker-read does not exist" in capsys.readouterr().err
+    assert cloud.calls == []
+
+
+def test_probe_contract_against_the_real_read_app():
+    """GET /api/v1/context, anonymous: neutral 404 serving, 503 when disabled."""
+
+    from fastapi.testclient import TestClient
+
+    from wattracker.cloud.api import _NOT_FOUND_BODY, CloudConfig, CloudState, create_cloud_app
+    from wattracker.cloud.limits import PUBLIC_UNAVAILABLE_DETAIL
+
+    mig = _load()
+    assert _NOT_FOUND_BODY == {"detail": mig.NOT_FOUND_DETAIL}
+    assert mig.PUBLIC_UNAVAILABLE_DETAIL == PUBLIC_UNAVAILABLE_DETAIL
+    for gateway in (False, True):
+        config = CloudConfig(
+            server_secret=b"cloud-test-server-secret-32-bytes-long",
+            operator_token="operator-token",
+            plane="read",
+            require_gateway_proof=gateway,
+            gateway_proof_value="gateway-proof" if gateway else "",
+            clock=lambda: 1_000,
+        )
+        state = CloudState.create(config)
+        with TestClient(create_cloud_app(config, state=state)) as client:
+            serving = client.get(mig.PROBE_PATH, headers={"Accept": "application/json"})
+            state.quotas.set_public_enabled(False)
+            disabled = client.get(mig.PROBE_PATH, headers={"Accept": "application/json"})
+            state.quotas.set_public_enabled(True)
+            recovered = client.get(mig.PROBE_PATH, headers={"Accept": "application/json"})
+        assert (serving.status_code, serving.json()) == (404, {"detail": mig.NOT_FOUND_DETAIL})
+        assert (disabled.status_code, disabled.json()) == (503, {"detail": PUBLIC_UNAVAILABLE_DETAIL})
+        assert (recovered.status_code, recovered.json()) == (404, {"detail": mig.NOT_FOUND_DETAIL})
+    assert mig.PROBE_PATH != "/api/v1/admin/version"
 
 
 # ---------------------------------------------------------------------------
@@ -926,10 +1194,11 @@ def test_from_step_three_skips_steps_one_and_two(mig, repo, capsys):
 def test_from_step_four_runs_only_preflight_and_the_drill(mig, repo):
     world = FakeWorld(repo, mig, app="flex", deployed=True)
     (repo / "build/azure-budget-hook").mkdir(parents=True)  # left by a prior publish
-    assert _migrator(mig, repo, world, from_step=4).execute() == 0
+    cloud = FakeCloud(mig)
+    assert _migrator(mig, repo, world, http=cloud, from_step=4).execute() == 0
     assert not _commands(world, "appsettings", "set")
     assert not [call for call in world.calls if call[0] == "func"]
-    assert _commands(world, "storage", "entity", "show")
+    assert cloud.posts(DISABLE_URL) and cloud.posts(CLEAR_URL)
 
 
 def test_resuming_step_one_after_a_delete_creates_without_deleting_again(mig, repo):

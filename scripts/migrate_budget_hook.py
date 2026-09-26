@@ -7,11 +7,13 @@ Steps, each safe to re-run and resumable with ``--from-step N``:
 1. Flex Function: subnet, bootstrap storage, Y1 delete (confirmed), Flex create
 2. parameters and deploy: rewrite three params, run scripts/deploy_cloud.py
 3. settings and publish: app settings, stage, ``func ... publish``
-4. drill: POST /budget/clear, then prove the CloudControl row landed
+4. drill, end to end: disable the public API through the Function, watch the
+   read app answer 503, then ALWAYS clear and watch it recover
 
-Every Azure/git/func call goes through one injectable runner.  Nothing here
-prints parameter contents, credentials, host keys or response bodies, and the
-budget-hook token is read only from ``WATTRACKER_BUDGET_HOOK_TOKEN``.
+Every Azure/git/func call goes through one injectable runner, and every HTTP
+call through one injectable request function.  Nothing here prints parameter
+contents, credentials, host keys or response bodies, and the budget-hook token
+is read only from ``WATTRACKER_BUDGET_HOOK_TOKEN``.
 """
 
 from __future__ import annotations
@@ -41,16 +43,10 @@ REPOSITORY_ROOT = SCRIPT_DIR.parent
 if str(REPOSITORY_ROOT) not in sys.path:
     sys.path.insert(0, str(REPOSITORY_ROOT))
 
-# The kill-switch row identity comes from the source, never a copy of it.
+# Kill-switch timing and the refusal body come from the source, never a copy.
 from wattracker.cloud.limits import (  # noqa: E402
-    KILL_SWITCH_KEY,
-    KILL_SWITCH_RECORD_KIND,
-    KillSwitchUnavailable,
-    _kill_switch_from_record,
-)
-from wattracker.cloud.security import (  # noqa: E402
-    _AUTH_PARTITION,
-    AzureTableSecurityStateBackend,
+    KILL_SWITCH_TTL_SECONDS,
+    PUBLIC_UNAVAILABLE_DETAIL,
 )
 
 
@@ -66,17 +62,20 @@ SUBNET_SERVICE_ENDPOINT = "Microsoft.Storage"
 SUBNET_API_VERSION = "2023-11-01"  # the version main.bicep declares the subnet with
 CONTROL_TABLE = "CloudControl"
 BUDGET_HOOK_ROLE = "Wattracker Budget Hook Writer"
-# budget_hook.py: clear_kill_switch(backend, reason="operator clear")
-OPERATOR_CLEAR_REASON = "operator clear"
-KILL_SWITCH_ROW_KEY = AzureTableSecurityStateBackend._row_key(
-    KILL_SWITCH_RECORD_KIND, KILL_SWITCH_KEY
-)
-KILL_SWITCH_PARTITION = _AUTH_PARTITION
 DRILL_OK_BODY = b'{"status":"ok"}'
-# A row older than the drill (minus this clock-skew allowance) is a leftover
-# from an earlier clear -- e.g. the 2026-09-19 defaultAction=Allow test -- and
-# proves nothing about the new Function's network path.
-ROW_FRESHNESS_SKEW_SECONDS = 300.0
+READ_APP_NAME = "wattracker-read"  # main.bicep: var readName
+# The drill probe: an anonymous GET on the read plane.  `_resolve_reader`
+# (wattracker/cloud/api.py) calls `_require_public_api_for_device_or_reader`
+# first and unconditionally, so with no credential this route answers the
+# neutral 404 while serving and the kill switch's 503 while the public API is
+# disabled.  Not /api/v1/admin/version: that route never reads cloud state.
+PROBE_PATH = "/api/v1/context"
+NOT_FOUND_DETAIL = "not found"  # api.py: _NOT_FOUND_BODY
+# A replica may serve a cached kill state for KILL_SWITCH_TTL_SECONDS; the
+# margin covers a scale-from-zero cold start (~20s measured) and slack.
+OBSERVE_TIMEOUT_SECONDS = KILL_SWITCH_TTL_SECONDS + 60.0
+POLL_INTERVAL_SECONDS = 3.0
+TRANSIENT_STATUSES = (0, 502, 503, 504)  # 0 = no response
 REWRITTEN_PARAMS = ("budgetHookPrincipalId", "budgetHookHost", "budgetHookFunctionAppName")
 DEAD_PARAMS = ("budgetHookIpRules",)
 STEP_NAMES = {
@@ -124,7 +123,7 @@ MISSING = _Missing()
 # ---------------------------------------------------------------------------
 
 Runner = Callable[..., "subprocess.CompletedProcess[str]"]
-HttpPost = Callable[[str, Mapping[str, str], float], "tuple[int, bytes]"]
+HttpRequest = Callable[[str, str, Mapping[str, str], float], "tuple[int, bytes]"]
 
 
 def default_runner(
@@ -155,11 +154,19 @@ class _NoRedirect(urllib.request.HTTPRedirectHandler):
         return None
 
 
-def default_http_post(url: str, headers: Mapping[str, str], timeout: float) -> tuple[int, bytes]:
+def default_http(
+    method: str, url: str, headers: Mapping[str, str], timeout: float
+) -> tuple[int, bytes]:
+    """One HTTPS request; returns (status, first 4 KiB of body). Never redirects."""
+
     if not url.startswith("https://"):
         raise MigrationError("refusing a non-HTTPS drill URL")
+    if method not in ("GET", "POST"):
+        raise MigrationError("internal error: unsupported HTTP method")
     opener = urllib.request.build_opener(_NoRedirect())
-    request = urllib.request.Request(url, data=b"", method="POST", headers=dict(headers))
+    request = urllib.request.Request(
+        url, data=b"" if method == "POST" else None, method=method, headers=dict(headers)
+    )
     try:
         with opener.open(request, timeout=timeout) as response:
             return int(response.status), response.read(4096)
@@ -239,7 +246,19 @@ class Facts:
     principal_id: str = ""
     host: str = ""
     subnet_id: str = ""
-    row_updated_at: str = ""
+
+
+@dataclass
+class DrillRecord:
+    """Statuses and timings for the summary; never bodies, keys or tokens."""
+
+    baseline: int | None = None
+    disable: int | None = None
+    shutdown_seconds: float | None = None
+    clear: int | None = None
+    recovery_seconds: float | None = None
+    result: str = ""
+    cloud_left_disabled: bool = False
 
 
 def _utc(epoch: float) -> str:
@@ -334,7 +353,7 @@ class Migrator:
         options: Options,
         *,
         runner: Runner = default_runner,
-        http_post: HttpPost = default_http_post,
+        http: HttpRequest = default_http,
         environ: Mapping[str, str] | None = None,
         prompt: Callable[[str], str] = input,
         stdin_isatty: Callable[[], bool] = lambda: sys.stdin.isatty(),
@@ -346,7 +365,7 @@ class Migrator:
     ) -> None:
         self.o = options
         self.runner = runner
-        self.http_post = http_post
+        self.http = http
         self.environ = os.environ if environ is None else environ
         self.prompt = prompt
         self.stdin_isatty = stdin_isatty
@@ -357,7 +376,8 @@ class Migrator:
         self.python = python
         self.facts = Facts()
         self.records: list[StepRecord] = []
-        self.drill_status: int | None = None
+        self.drill: DrillRecord | None = None
+        self.last_hook_status: int | None = None
 
     # -- paths and ids ---------------------------------------------------
 
@@ -500,12 +520,18 @@ class Migrator:
     def cmd_keys_list(self) -> list[str]:
         return self._az("functionapp", "keys", "list", *self._app())
 
-    def cmd_entity_show(self, storage_name: str) -> list[str]:
-        return self._az(
-            "storage", "entity", "show", "--account-name", storage_name,
-            "--table-name", CONTROL_TABLE, "--auth-mode", "login",
-            "--partition-key", KILL_SWITCH_PARTITION, "--row-key", KILL_SWITCH_ROW_KEY,
-            "--select", "PartitionKey", "RowKey", "Payload", "Timestamp",
+    def cmd_read_app_show(self) -> list[str]:
+        return self._az("containerapp", "show", "--name", READ_APP_NAME, *self._rg())
+
+    def manual_clear_command(self) -> str:
+        """The fallback clear, with secrets referenced by variable, never by value."""
+
+        keys = shlex.join(self.cmd_keys_list()[:-2] + ["--query", "functionKeys.default", "--output", "tsv"])
+        return (
+            f'FUNCTION_HOST_KEY="$({keys})"\n'
+            f"  curl --fail-with-body --request POST 'https://{self.facts.host or '<defaultHostName>'}"
+            "/budget/clear' --header \"x-functions-key: $FUNCTION_HOST_KEY\" "
+            f'--header "X-Wattracker-Budget-Token: ${TOKEN_ENV}"'
         )
 
     # -- running -----------------------------------------------------------
@@ -941,89 +967,186 @@ class Migrator:
             raise MigrationError("the Function App has no default function key")
         return key
 
-    def post_clear(self) -> tuple[int, bytes]:
+    def read_app_host(self) -> str:
+        app = self.az_json(self.cmd_read_app_show(), allow_missing=True)
+        if not isinstance(app, dict):
+            raise MigrationError(f"container app {READ_APP_NAME} does not exist")
+        properties = app.get("properties") if isinstance(app.get("properties"), dict) else app
+        fqdn = (((properties or {}).get("configuration") or {}).get("ingress") or {}).get("fqdn")
+        fqdn = str(fqdn or "").lower()
+        if not _HOST_RE.fullmatch(fqdn):
+            raise MigrationError(f"{READ_APP_NAME} has no valid ingress FQDN")
+        return fqdn
+
+    @staticmethod
+    def _detail(body: bytes) -> object:
+        try:
+            value = json.loads(body)
+        except (ValueError, TypeError):
+            return None
+        return value.get("detail") if isinstance(value, dict) else None
+
+    def probe(self, url: str) -> tuple[int, object]:
+        """Anonymous GET; returns (status, detail). No credential is ever sent."""
+
+        try:
+            status, body = self.http("GET", url, {"Accept": "application/json"}, 30.0)
+        except MigrationError:
+            return 0, None
+        return status, self._detail(body)
+
+    def probe_baseline(self, url: str) -> None:
+        deadline = self.now() + OBSERVE_TIMEOUT_SECONDS
+        while True:
+            status, detail = self.probe(url)
+            if status == 404 and detail == NOT_FOUND_DETAIL:
+                self.drill.baseline = status
+                self.say("baseline: the read API answers the neutral 404 (serving)")
+                return
+            if status == 503 and detail == PUBLIC_UNAVAILABLE_DETAIL:
+                self.drill.baseline = status
+                raise MigrationError(
+                    "the read API already answers 503 'public API unavailable': the kill "
+                    "switch is on or its state is unreadable. Nothing was disabled. Clear it "
+                    "first, then resume with --from-step 4:\n  " + self.manual_clear_command()
+                )
+            if status in TRANSIENT_STATUSES and self.now() < deadline:
+                self.sleep(POLL_INTERVAL_SECONDS)
+                continue
+            self.drill.baseline = status
+            raise MigrationError(
+                f"the probe answered HTTP {status or 'no response'}, not the neutral 404; "
+                "refusing to drill against an unexpected baseline"
+            )
+
+    def observe(self, url: str, status_wanted: int, detail_wanted: str, label: str) -> float:
+        """Poll the probe until it answers exactly (status, detail); return seconds taken."""
+
+        started = self.now()
+        deadline = started + OBSERVE_TIMEOUT_SECONDS
+        last = 0
+        while True:
+            status, detail = self.probe(url)
+            last = status
+            if status == status_wanted and detail == detail_wanted:
+                return self.now() - started
+            if self.now() >= deadline:
+                raise MigrationError(
+                    f"FAIL: {label}: the read API did not answer HTTP {status_wanted} within "
+                    f"{OBSERVE_TIMEOUT_SECONDS:.0f}s (last: HTTP {last or 'no response'})"
+                )
+            self.sleep(POLL_INTERVAL_SECONDS)
+
+    def hook_post(self, path: str, headers: Mapping[str, str]) -> int:
+        """POST to the Function; retry cold starts; demand exactly {"status":"ok"}."""
+
+        url = f"https://{self.facts.host}{path}"
+        status, body = 0, b""
+        for attempt in range(1, 4):
+            try:
+                status, body = self.http("POST", url, headers, 60.0)
+            except MigrationError:
+                status, body = 0, b""
+            if status not in TRANSIENT_STATUSES or attempt == 3:
+                break
+            self.say(f"{path} attempt {attempt}: HTTP {status or 'no response'}; retrying")
+            self.sleep(10)
+        self.last_hook_status = status  # for the summary, even when this raises
+        if status != 200:
+            raise MigrationError(f"FAIL: {path} returned HTTP {status or 'no response'}")
+        if body != DRILL_OK_BODY:
+            raise MigrationError(f'FAIL: {path} returned 200 but not exactly {{"status":"ok"}}')
+        return status
+
+    def clear_always(self, key: str, token: str) -> bool:
+        """Run /budget/clear; never raises. False means the cloud is left disabled."""
+
+        self.say("POST /budget/clear (host key and app token masked)")
+        self.last_hook_status = None
+        try:
+            self.drill.clear = self.hook_post(
+                "/budget/clear", {"x-functions-key": key, "X-Wattracker-Budget-Token": token}
+            )
+            return True
+        except MigrationError as exc:
+            reason = str(exc)
+        except KeyboardInterrupt:
+            reason = "interrupted during clear"
+        except Exception as exc:  # never echo str(exc)
+            reason = f"unexpected {type(exc).__name__}"
+        self.drill.clear = self.last_hook_status
+        self.drill.cloud_left_disabled = True
+        banner = "!" * 72
+        print(
+            f"\n{banner}\n"
+            f"WARNING: /budget/clear FAILED ({reason}).\n"
+            "THE CLOUD PUBLIC API IS LEFT DISABLED: every rider request answers 503.\n"
+            "Clear it by hand now (secrets are read from variables, never typed):\n"
+            f"  {self.manual_clear_command()}\n"
+            f"{banner}",
+            file=sys.stderr,
+            flush=True,
+        )
+        return False
+
+    def step4_drill(self) -> None:
+        """End-to-end kill-switch drill; the clear runs whenever disable was attempted."""
+
+        self.ensure_facts()
+        self.drill = DrillRecord()
         token = self.environ.get(TOKEN_ENV) or ""
         if not token:
             raise MigrationError(f"{TOKEN_ENV} is not set")
+        probe_url = f"https://{self.read_app_host()}{PROBE_PATH}"
+        self.say(f"probe: anonymous GET {PROBE_PATH} on {READ_APP_NAME}")
+        self.probe_baseline(probe_url)
         key = self.host_key()
-        url = f"https://{self.facts.host}/budget/clear"
-        headers = {"x-functions-key": key, "X-Wattracker-Budget-Token": token}
-        status, body = 0, b""
+        failure: BaseException | None = None
+        self.last_hook_status = None
         try:
-            for attempt in range(1, 4):
-                try:
-                    status, body = self.http_post(url, headers, 60.0)
-                except MigrationError:
-                    status, body = 0, b""
-                    if attempt == 3:
-                        raise
-                if status not in (0, 502, 503, 504):
-                    break
-                if attempt < 3:
-                    self.say(f"drill attempt {attempt}: HTTP {status or 'no response'}; retrying")
-                    self.sleep(10)
-        finally:
-            headers.clear()
-            del key
-        return status, body
-
-    def read_row(self, storage_name: str) -> dict[str, Any]:
-        result = self.run(self.cmd_entity_show(storage_name))
-        stderr = result.stderr or ""
-        if result.returncode == 3 or "ResourceNotFound" in stderr or "does not exist" in stderr:
-            raise MigrationError(
-                "FAIL: HTTP 200 but the CloudControl kill-switch row does not exist"
-            )
-        if result.returncode:
-            if "Authorization" in stderr or "not authorized" in stderr.lower():
-                raise MigrationError(
-                    "could not read the CloudControl row from this workstation (storage "
-                    "firewall defaultAction=Deny or missing Storage Table Data Reader); the "
-                    "drill is NOT passed until the row is proven"
+            try:
+                self.say(
+                    "POST /budget/disable-public-api (host key only, masked): the public API "
+                    "goes down for under a minute"
                 )
-            raise MigrationError(
-                "`az storage entity show` failed; the drill is NOT passed until the row is proven"
-            )
+                self.drill.disable = self.hook_post(
+                    "/budget/disable-public-api", {"x-functions-key": key}
+                )
+                self.drill.shutdown_seconds = self.observe(
+                    probe_url, 503, PUBLIC_UNAVAILABLE_DETAIL, "shutdown"
+                )
+                self.say(f"shutdown observed: HTTP 503 after {self.drill.shutdown_seconds:.0f}s")
+            except BaseException as exc:  # KeyboardInterrupt included: clear must still run
+                failure = exc
+                if self.drill.disable is None:
+                    self.drill.disable = self.last_hook_status
+            if not self.clear_always(key, token):
+                raise MigrationError(
+                    "the cloud is LEFT DISABLED because /budget/clear failed; clear it by "
+                    "hand (see the warning above) before anything else"
+                )
+        finally:
+            del key
+        if isinstance(failure, KeyboardInterrupt):
+            raise failure
         try:
-            entity = json.loads(result.stdout or "")
-        except json.JSONDecodeError:
-            raise MigrationError("the CloudControl row query returned unreadable JSON") from None
-        if not isinstance(entity, dict) or not entity:
-            raise MigrationError("FAIL: HTTP 200 but the CloudControl kill-switch row does not exist")
-        return entity
-
-    def check_row(self, entity: Mapping[str, Any], drill_started: float) -> None:
-        if entity.get("PartitionKey") != KILL_SWITCH_PARTITION or entity.get("RowKey") != KILL_SWITCH_ROW_KEY:
-            raise MigrationError("FAIL: the returned entity is not the kill-switch row")
-        try:
-            record = json.loads(str(entity.get("Payload")))
-            state = _kill_switch_from_record(record)
-        except (json.JSONDecodeError, KillSwitchUnavailable):
-            raise MigrationError("FAIL: the kill-switch row payload is malformed") from None
-        if not (state.writes_enabled and state.public_enabled):
-            raise MigrationError("FAIL: the kill-switch row does not show both levels enabled")
-        if state.reason != OPERATOR_CLEAR_REASON:
-            raise MigrationError("FAIL: the kill-switch row reason is not the operator clear")
-        if state.updated_at < drill_started - ROW_FRESHNESS_SKEW_SECONDS:
-            raise MigrationError(
-                "FAIL: the kill-switch row predates this drill; it is a leftover, not proof"
+            self.drill.recovery_seconds = self.observe(
+                probe_url, 404, NOT_FOUND_DETAIL, "recovery"
             )
-        self.facts.row_updated_at = _utc(state.updated_at)
-
-    def step4_drill(self) -> None:
-        self.ensure_facts()
-        storage_name = self.storage_name()
-        drill_started = self.now()
-        self.say(f"POST https://{self.facts.host}/budget/clear (host key and token masked)")
-        status, body = self.post_clear()
-        self.drill_status = status
-        if status != 200:
-            raise MigrationError(f"FAIL: /budget/clear returned HTTP {status or 'no response'}")
-        if body != DRILL_OK_BODY:
-            raise MigrationError('FAIL: /budget/clear returned 200 but not exactly {"status":"ok"}')
-        self.say('HTTP 200 {"status":"ok"}; reading the CloudControl row')
-        self.check_row(self.read_row(storage_name), drill_started)
-        self.say("PASS: the kill-switch row shows both levels enabled by the operator clear")
+            self.say(f"recovery observed: HTTP 404 after {self.drill.recovery_seconds:.0f}s")
+        except MigrationError as recovery:
+            if failure is None:
+                self.drill.result = "FAIL"
+                raise
+            self.drill.result = "FAIL"
+            raise MigrationError(f"{failure}; and {recovery}") from None
+        if failure is not None:
+            self.drill.result = "FAIL"
+            if isinstance(failure, MigrationError):
+                raise failure
+            raise MigrationError(f"unexpected {type(failure).__name__}") from None
+        self.drill.result = "PASS"
+        self.say("PASS: disable shut the public API, clear restored it")
 
     # -- orchestration -------------------------------------------------------
 
@@ -1085,13 +1208,21 @@ class Migrator:
             )
             say("  " + shlex.join(self.cmd_package()))
             say(f"  (cd {STAGED_DIR} && " + shlex.join(self.cmd_publish()) + ")")
-        say("\n[step 4: drill]")
+        say("\n[step 4: drill -- briefly disables the public API]")
+        probe = f"https://<{READ_APP_NAME} ingress fqdn>{PROBE_PATH}"
+        say("  " + shlex.join(self.cmd_read_app_show()) + "   # ingress fqdn")
+        say(f"  GET {probe}  (anonymous; baseline must be 404 'not found', never 503)")
         say("  " + shlex.join(self.cmd_keys_list()) + "   # functionKeys.default, kept in memory")
+        say(f"  POST https://{host}/budget/disable-public-api  headers: x-functions-key: {mask}")
         say(
-            f"  POST https://{host}/budget/clear  headers: x-functions-key: {mask}, "
+            f"  poll GET {probe} until 503 '{PUBLIC_UNAVAILABLE_DETAIL}' "
+            f"(timeout {OBSERVE_TIMEOUT_SECONDS:.0f}s)"
+        )
+        say(
+            f"  ALWAYS: POST https://{host}/budget/clear  headers: x-functions-key: {mask}, "
             f"X-Wattracker-Budget-Token: {mask}"
         )
-        say("  " + shlex.join(self.cmd_entity_show(storage)))
+        say(f"  poll GET {probe} until 404 again (timeout {OBSERVE_TIMEOUT_SECONDS:.0f}s)")
 
     def execute(self) -> int:
         started = self.now()
@@ -1132,6 +1263,7 @@ class Migrator:
             except KeyboardInterrupt:
                 self.records.append(StepRecord(step, "INTERRUPTED", _utc(step_started), _utc(self.now())))
                 self.fail(step, "interrupted")
+                self.print_summary(started)
                 return 130
             except Exception as exc:  # never echo str(exc): it could carry output
                 self.records.append(StepRecord(step, "FAIL", _utc(step_started), _utc(self.now())))
@@ -1173,13 +1305,23 @@ class Migrator:
         lines.append(f"- principalId: `{self.facts.principal_id or 'n/a'}`")
         lines.append(f"- defaultHostName: `{self.facts.host or 'n/a'}`")
         lines.append(f"- subnet: `{self.facts.subnet_id or 'n/a'}`")
-        if self.drill_status is not None:
-            lines.append(f"- drill: POST /budget/clear -> HTTP {self.drill_status}")
-        if self.facts.row_updated_at:
-            lines.append(
-                "- CloudControl kill-switch row: writes_enabled=true, public_enabled=true, "
-                f"reason=\"{OPERATOR_CLEAR_REASON}\", updated_at {self.facts.row_updated_at}"
-            )
+        drill = self.drill
+        if drill is not None:
+            def status(value: int | None) -> str:
+                return "not reached" if value is None else f"HTTP {value or 'no response'}"
+
+            def seconds(value: float | None) -> str:
+                return "not observed" if value is None else f"{value:.0f}s"
+
+            lines.append(f"- drill probe: anonymous `GET {PROBE_PATH}` on `{READ_APP_NAME}`")
+            lines.append(f"  - baseline: {status(drill.baseline)}")
+            lines.append(f"  - `POST /budget/disable-public-api`: {status(drill.disable)}")
+            lines.append(f"  - disable -> 503: {seconds(drill.shutdown_seconds)}")
+            lines.append(f"  - `POST /budget/clear`: {status(drill.clear)}")
+            lines.append(f"  - clear -> 404 recovery: {seconds(drill.recovery_seconds)}")
+            lines.append(f"  - drill result: {drill.result or 'FAIL'}")
+            if drill.cloud_left_disabled:
+                lines.append("  - **the public API was left DISABLED: clear failed**")
         lines.append("----- end -----")
         self.say("\n".join(lines))
 
