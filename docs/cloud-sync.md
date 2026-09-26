@@ -111,12 +111,22 @@ The dashboard route returns object kinds `profile`, `training_state`,
  "revision":7,"next_cursor":null}
 ```
 
+The calendar route returns `calendar_day` objects and is also a mobile,
+paginated route. Races are embedded in each `calendar_day`; the compatibility
+route `/api/v1/context/races` is intentionally empty and does not expose a
+standalone race kind.
+
 `?since=N` returns only objects whose object revision is greater than `N`;
 delta responses also include matching tombstones (`"deleted":true`), while
 full reads omit tombstones. `?limit=` is bounded to 100 and a non-null
 `next_cursor` is passed as `?cursor=` for the next page. Cursors are opaque,
 deterministic, scope-bound, and bound to the route and `since` value; they
 cannot be reused across scopes or to change ordering/filter semantics.
+
+Non-mobile collection routes are bounded to 100 objects. A read containing
+more than 100 objects returns `413` with code `collection_too_large` rather
+than silently truncating the collection. Mobile routes use the signed cursor
+envelope above instead.
 
 **Checkpointing.** The `revision` in the envelope is *pinned when pagination
 starts*: the first request of a walk (the one with no `?cursor=`) reads the

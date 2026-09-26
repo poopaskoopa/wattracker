@@ -543,13 +543,8 @@ final class CloudSessionTests: XCTestCase {
         XCTAssertEqual(second.queryItems["since"], "7")
     }
 
-    /// Uses `calendar` rather than `activities`, which used to stand here.
-    /// `api.py:1592` serves activities with `mobile=True`, so it is a delta
-    /// route now and cannot be this test's example of one that is not -- the
-    /// client flag simply lagged the server until PR #235's work landed.
-    /// The behaviour under test is unchanged and still worth pinning: a route
-    /// that serves no delta must never be sent `since`, and its read replaces
-    /// the cache rather than merging into it.
+    /// The profile route does not serve deltas, so it must never be sent
+    /// `since`, and its read replaces the cache rather than merging into it.
     func testARouteThatServesNoDeltaIsNeverAskedForOne() async throws {
         let cache = MemorySnapshotCache()
         cache.store(
@@ -559,8 +554,8 @@ final class CloudSessionTests: XCTestCase {
                     id: "workout-1", kind: "workout", revision: 3, data: #"{"tss":80}"#
                 )],
                 storedAt: Date()
-            ),
-            for: .calendar
+                ),
+            for: .profile
         )
         let rig = harness(cache: cache) { request, _ in
             request.url?.path == "/api/v1/context/refresh"
@@ -568,10 +563,53 @@ final class CloudSessionTests: XCTestCase {
                 : .json(#"{"items":[]}"#)
         }
 
-        let snapshot = try await rig.session.load(.calendar)
-        let read = try XCTUnwrap(rig.transport.requests(matching: "/api/v1/context/calendar").first)
-        XCTAssertNil(read.queryItems["since"], "calendar is not a mobile delta route")
+        let snapshot = try await rig.session.load(.profile)
+        let read = try XCTUnwrap(rig.transport.requests(matching: "/api/v1/context/profile").first)
+        XCTAssertNil(read.queryItems["since"], "profile is not a mobile delta route")
         XCTAssertTrue(snapshot.items.isEmpty, "a full read replaces rather than merges")
+    }
+
+    func testCalendarPagesFromCachedRevisionAndCheckpointsAfterTheWalk() async throws {
+        let cache = MemorySnapshotCache()
+        cache.store(
+            CachedCollection(
+                revision: 5,
+                items: [CloudFixtures.item(
+                    id: "calendar-old", kind: "calendar_day", revision: 5,
+                    data: #"{"date":"2026-09-01"}"#
+                )],
+                storedAt: Date()
+            ),
+            for: .calendar
+        )
+        let rig = harness(cache: cache) { request, _ in
+            if request.url?.path == "/api/v1/context/refresh" {
+                return .json(CloudFixtures.refreshBody(context: "context-1"))
+            }
+            let query = request.queryItems
+            if query["cursor"] == nil {
+                return .json(
+                    #"{"items":[{"id":"calendar-new-1","kind":"calendar_day","revision":7,"data":{"date":"2026-09-02"}}],"revision":7,"next_cursor":"cursor-2"}"#
+                )
+            }
+            return .json(
+                #"{"items":[{"id":"calendar-new-2","kind":"calendar_day","revision":7,"data":{"date":"2026-09-03"}}],"revision":7,"next_cursor":null}"#
+            )
+        }
+
+        let snapshot = try await rig.session.load(.calendar)
+        XCTAssertEqual(snapshot.revision, 7)
+        XCTAssertEqual(
+            snapshot.items.map(\.id),
+            ["calendar-new-1", "calendar-new-2", "calendar-old"]
+        )
+        let reads = rig.transport.requests(matching: "/api/v1/context/calendar")
+        XCTAssertEqual(reads.count, 2)
+        XCTAssertEqual(reads[0].queryItems["since"], "5")
+        XCTAssertNil(reads[0].queryItems["cursor"])
+        XCTAssertEqual(reads[1].queryItems["cursor"], "cursor-2")
+        XCTAssertEqual(rig.cache.load(.calendar)?.revision, 7)
+        XCTAssertEqual(rig.cache.load(.calendar)?.items.map(\.id), snapshot.items.map(\.id))
     }
 
     // MARK: - Offline

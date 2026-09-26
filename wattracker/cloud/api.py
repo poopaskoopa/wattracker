@@ -1911,7 +1911,9 @@ def create_cloud_app(
 
         @app.get("/api/v1/context/calendar")
         async def calendar(request: Request) -> Response:
-            return await collection(request, {"calendar", "scheduled_workout"}, route="calendar")
+            return await collection(
+                request, {"calendar_day"}, route="calendar", mobile=True
+            )
 
         @app.get("/api/v1/context/activities")
         async def activities(request: Request) -> Response:
@@ -1953,7 +1955,10 @@ def create_cloud_app(
 
         @app.get("/api/v1/context/races")
         async def races(request: Request) -> Response:
-            return await collection(request, {"race"}, route="races")
+            # Races are embedded in calendar_day objects.  Keep this route as
+            # an explicit empty compatibility surface rather than duplicating
+            # the same data under a standalone kind.
+            return await collection(request, set(), route="races")
 
         @app.get("/api/v1/context/dashboard")
         async def dashboard(request: Request) -> Response:
