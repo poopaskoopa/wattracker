@@ -187,7 +187,29 @@ states on `main` when the PR is merge-committed. Four such commits are on
 `main` from #358 and #356 (`a04e344`, `95a6bb2`, `8d1a582`, `892b345`); if
 `git bisect` lands on one, `git bisect skip` it.
 
-1. **#249 — rotating full-suite test flakes. Still not a local-runs job.**
+1. **#384: the cloud Calendar is empty on real data, and the fix must
+   paginate.** The desktop publishes `calendar_day` (one object per rider-local
+   day, `snapshot.py`), but `/api/v1/context/calendar` only serves
+   `calendar`/`scheduled_workout`, so iOS always gets `{"items":[]}`. Adding
+   the kind alone is wrong: since #379, unpaginated routes 413 above 100
+   objects, and a year of days is ~365. Make the calendar a `mobile=True`
+   (cursor) route, update iOS to follow the cursor, and add a publisher-to-route
+   contract test built from the real publisher. Also fold in the #379 gap from
+   the issue comment: an exactly-100-objects-returns-200 test. **The Android
+   half is taksmon's**: leave a note on #192 and do not touch `android/`. This
+   blocks #163's device check against real cloud data.
+
+2. **#374: replace the keyring-backend name heuristic with an allowlist.** PR
+   #378 merged the reuse of `credstore._keyring()`, but the post-merge review
+   (see the issue comment of 2026-09-26) showed that `_keyring_backend_allowed`
+   matches NAMES, so the real `keyring.backends.fail.Keyring`,
+   `null.Keyring` and `chainer.ChainerBackend` all pass. The tests used a
+   made-up `FailKeyring` class. Allowlist the known secure backends by module
+   and class, test with the REAL classes, and cover the shared local
+   Zwift-credential path too. Credential handling: needs a security review
+   before merge. Follow the Keychain-safety rule above on every run.
+
+3. **#249: rotating full-suite test flakes. Still not a local-runs job.**
    Nothing has changed since the re-scope. 21 consecutive clean local full
    suites stand against zero reproductions. Both known instances came from
    **taksmon's machine**. **The next step is taksmon's log and his exact
@@ -198,9 +220,9 @@ states on `main` when the PR is merge-committed. Four such commits are on
 its PR number. Dropping it while it is in flight makes it invisible if the PR is
 closed or abandoned.
 
-**The queue is empty of unblocked work.** #249 (above) stays skipped pending
+**When items 1 and 2 are done, the queue is empty.** #249 stays skipped pending
 taksmon's log and invocation. Do not pick up unlabelled issues or anything
-below on your own — say the queue ran out rather than inventing scope.
+below on your own. Say the queue ran out rather than inventing scope.
 
 **Not codex work, do not start:**
 
@@ -210,9 +232,14 @@ below on your own — say the queue ran out rather than inventing scope.
   in #295 (`0546364`).
 - **#264** waits on #194 (Android network client). #302 closed it by accident;
   it was reopened. Its Android half is taksmon's.
-- **#339** (budget hook networking) is merged as PR #342. What remains is the
-  owner's Flex migration and the `POST /budget/clear` drill against Azure.
-  **#168** stays `blocked` until that drill passes.
+- **#339** is CLOSED (2026-09-26): the owner ran `scripts/migrate_budget_hook.py`
+  (#380), and the end-to-end drill passed (disable to 503 in 29s, clear to 404 in
+  26s). **#168** still waits on its Layers 1-2 (Azure Policy denies and
+  threshold wiring), which are owner decisions.
+- **#170**'s code is merged (#357, then #382 at `e0a08be`). What remains is the
+  owner turning `enableAccountWipe` on, redeploying, and proving a live wipe
+  on a throwaway rider.
+- **#163**'s device check is additionally blocked on #384 (item 1).
 - **#102, #217, #242** wait on live-deployment evidence (a real enrolment and
   a week of real use), not on code.
 - **#322** (deregister the Windows-TT self-hosted runner) is taksmon's
@@ -230,8 +257,7 @@ resources, both container apps live, and
 `python -m wattracker.cloud.admin list-installations` returns
 `{"installations": []}` against the real deployment — so the operator token,
 the admin routes, the managed identity and the storage RBAC all work together.
-The budget hook is published but cannot write (#339), so the kill switch cannot
-fire yet. Real spending is bounded by the container apps' `minReplicas: 0` /
+The budget kill switch is proven end to end since 2026-09-26 (#339). Real spending is bounded by the container apps' `minReplicas: 0` /
 `maxReplicas: 1` regardless.
 
 **Two deployment traps worth knowing before touching anything here.** The
@@ -264,9 +290,10 @@ checked when the role is written (#330).
   existing rule. The #371 disabled-keyring guard test is now parametrised
   over `"0"`, `"false"` and `"no"`. Read directly against the PR's own base
   (two-dot, not three-dot): only `wattracker/cloud/credentials.py` and its
-  test file changed. Security review done inline before merge: the fix
-  reuses credstore's check with no duplicated logic and no other call site
-  bypasses it.
+  test file changed. It was merged by an automated routine without
+  the security review #374 required. The post-merge review found the shared
+  check matches names, so the real fail/null/chainer backends pass; #374
+  stays open (item 2).
 - **#372** merged as PR #379 (`6c07ebc`). Option (b) chosen: non-mobile
   calendar/profile/race routes now fetch `limit + 1` and return `413
   collection_too_large` instead of silently truncating past 100 objects;
@@ -277,15 +304,14 @@ checked when the role is written (#330).
   clears stale IP rules instead of Azure preserving them (the #339 cleanup
   the owner had to do by hand on 2026-09-26). Static test only; no `az`
   command was run.
-- **PR #382** ("cloud: let the read app wipe a rider's scope…", refs #170
-  item 6) is open, CI-green, and already through two review rounds with
-  extensive mutation proof, but is not on this queue and was left for the
-  owner: it grants the read identity a scope-delete capability (behind
-  `enableAccountWipe`, default `false`) and a conditional ABAC write grant
-  for the lease blob, and states plainly that the ABAC condition and RBAC
-  propagation are unverified against real Azure. Needs a rebase check after
-  #381 touched the same file's storage block (different section, but see
-  the PR's own merge-order note).
+- **PR #382** merged at `e0a08be` (#170 item 6). `enableAccountWipe` (default
+  false) grants the read identity the scope-wipe roles plus an ABAC-conditioned
+  `blobs/write` on `…/__lock` blobs only. A delete-and-lease capability probe
+  runs before any deletion, and the purge waits up to 65s for a held lease.
+  Rollback must delete the four assignments explicitly (incremental deploys
+  keep them). The Azure-side behaviour is unverified live.
+- Post-merge verification of #379 found the calendar kind mismatch, now #384
+  (item 1).
 
 **Done since this list was last written (2026-09-18 → 09-19).**
 - **#327** merged as PR #329 (`abaf224`) and **#330** as PR #332 (`d974819`).
