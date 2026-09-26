@@ -42,6 +42,13 @@ _DEFAULT_CAPACITY: Final = 10_000
 _CANONICAL_DOMAIN: Final = b"wattracker-cloud-request-v1\x00"
 _DUMMY_DIGEST: Final = hashlib.sha256(b"wattracker-cloud-dummy").digest()
 _AUTH_PARTITION: Final = "__wattracker_auth_v1__"
+#: The record kind the wipe capability probe deletes (#170), and nothing
+#: ever writes.  A probe deletes ``<this kind>:<256 random bits>``: an
+#: authorized delete of a row that does not exist is a 404 (which the Tables
+#: SDK swallows), an unauthorized one is a 403.  No real row can be the one a
+#: probe addresses -- every written kind is named elsewhere, and a
+#: ``tests/test_cloud_wipe_probe.py`` check keeps this string out of them.
+WIPE_PROBE_RECORD_KIND: Final = "wipe-probe"
 
 # Signature algorithms are a property of stored credential state, never of a
 # request.  ``ecdsa-p256-sha256`` exists because Apple's Secure Enclave only
@@ -271,6 +278,11 @@ class MemorySecurityStateBackend:
     def __init__(self) -> None:
         self._lock = threading.RLock()
         self._records: dict[tuple[str, str], dict[str, Any]] = {}
+        #: Test knob: simulate an identity with no delete grant on this
+        #: table, as a deployment has while a role assignment propagates.
+        #: :meth:`delete` then raises the way a 403 would, and so
+        #: :meth:`can_delete` reports False.
+        self.delete_denied = False
 
     def create(self, kind: str, key: str, value: Mapping[str, Any]) -> bool:
         record_key = (kind, key)
@@ -371,8 +383,23 @@ class MemorySecurityStateBackend:
             return total
 
     def delete(self, kind: str, key: str) -> bool:
+        if self.delete_denied:
+            raise PermissionError("simulated: this identity may not delete")
         with self._lock:
             return self._records.pop((kind, key), None) is not None
+
+    def can_delete(self) -> bool:
+        """Probe delete permission the way the Azure backend does.
+
+        Deletes a random row of :data:`WIPE_PROBE_RECORD_KIND`, which no code
+        writes, through the ordinary :meth:`delete`.  Any error is "cannot".
+        """
+
+        try:
+            self.delete(WIPE_PROBE_RECORD_KIND, secrets.token_hex(32))
+        except Exception:
+            return False
+        return True
 
     def iter_records(
         self, kind: str, *, limit: int
@@ -760,6 +787,32 @@ class AzureTableSecurityStateBackend:
             if self._not_found(exc):
                 return False
             raise
+
+    def can_delete(self) -> bool:
+        """Prove this identity may delete rows here, without deleting one.
+
+        The wipe route asks this before it removes anything (#170): a wipe
+        deletes credentials first, and Azure RBAC can lag a deployment by
+        minutes, so a grant that has not reached this table yet must refuse
+        the wipe up front rather than half-way through it.
+
+        The probe deletes ``<WIPE_PROBE_RECORD_KIND>:<256 random bits>`` in
+        the auth partition, addressed through :meth:`_row_key` like every
+        other row.  No code writes that kind, so an authorized delete finds
+        nothing: the Tables SDK swallows that 404 and returns, and an older
+        SDK that raised it is read through :meth:`_not_found`.  A 403
+        (``AuthorizationPermissionMismatch``), a 401, a 5xx, or an error
+        with no structured status is "cannot" -- fail closed.
+        """
+
+        row_key = self._row_key(WIPE_PROBE_RECORD_KIND, secrets.token_hex(32))
+        try:
+            self._table.delete_entity(
+                partition_key=_AUTH_PARTITION, row_key=row_key
+            )
+        except Exception as exc:
+            return self._not_found(exc)
+        return True
 
     def iter_records(
         self, kind: str, *, limit: int

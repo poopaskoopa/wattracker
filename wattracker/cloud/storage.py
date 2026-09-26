@@ -10,11 +10,12 @@ from __future__ import annotations
 import hashlib
 import json
 import re
+import secrets
 import threading
 from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
-from typing import Iterable, Optional, Sequence
+from typing import Final, Iterable, Optional, Sequence
 
 from .models import MAX_PAYLOAD_BYTES, CloudObject, SyncBatch
 
@@ -39,6 +40,23 @@ MAX_QUERY_LIMIT = 100
 #: than the API bound.  Deriving it keeps raising ``MAX_QUERY_LIMIT`` from
 #: turning every read into a ``ValueError`` -- that is, a 500.
 _MAX_LIST_LIMIT = MAX_QUERY_LIMIT + 1
+
+
+#: The reserved names the wipe capability probe deletes (#170).  A probe is a
+#: delete of something guaranteed not to exist: an identity allowed to delete
+#: gets "not found", one that is not gets 403.  Nothing in this package ever
+#: writes a name under either of these, and neither can collide with one that
+#: is written: object blobs are ``<partition>/object:<id>.json`` and the lease
+#: blob is ``<partition>/__lock``; object-table rows are ``object:<id>``,
+#: ``batch:<id>`` and ``scope``.  Each probe also appends 128 random bits, so
+#: even a row somebody wrote under the reserved prefix by hand is not the one
+#: a probe addresses.
+WIPE_PROBE_BLOB_STEM: Final = "__wipe-probe-"
+WIPE_PROBE_ROW_PREFIX: Final = "wipe-probe:"
+
+
+def _wipe_probe_token() -> str:
+    return secrets.token_hex(16)
 
 
 class StorageConflict(RuntimeError):
@@ -125,6 +143,11 @@ class MemoryTenantStore:
         self._revisions: dict[tuple[str, str], int] = {}
         self._batches: dict[tuple[str, str, str], _BatchRecord] = {}
         self._retention = recovery_retention
+        #: Test knob: simulate an identity that holds no delete grant on the
+        #: store, as a deployment does while a new role assignment is still
+        #: propagating.  :meth:`can_purge_scope` then reports False and
+        #: :meth:`purge_scope` raises, the way a 403 from Azure would.
+        self.delete_denied = False
 
     @staticmethod
     def _scope(namespace: str, local_user_scope: str) -> tuple[str, str]:
@@ -358,6 +381,8 @@ class MemoryTenantStore:
         """
 
         scope = self._scope(namespace, local_user_scope)
+        if self.delete_denied:
+            raise PermissionError("simulated: this identity may not delete")
         with self._lock:
             rows = self._scopes.pop(scope, {})
             markers = 1 if self._revisions.pop(scope, None) is not None else 0
@@ -365,6 +390,16 @@ class MemoryTenantStore:
                 del self._batches[key]
                 markers += 1
         return ScopePurge(objects=len(rows), blobs=len(rows), markers=markers)
+
+    def can_purge_scope(self, namespace: str, local_user_scope: str) -> bool:
+        """Whether :meth:`purge_scope` would be allowed to delete here.
+
+        The memory store has no permissions, so this answers the
+        :attr:`delete_denied` knob and nothing else.  It deletes nothing.
+        """
+
+        self._scope(namespace, local_user_scope)
+        return not self.delete_denied
 
 
 class AzureDependencyUnavailable(RuntimeError):
@@ -1032,6 +1067,64 @@ class AzureTenantStore:
             skipped=skipped,
             orphans=orphans,
         )
+
+    def can_purge_scope(self, namespace: str, local_user_scope: str) -> bool:
+        """Prove, without deleting anything real, that a purge can finish.
+
+        Azure RBAC propagation lags a deployment by minutes, and a wipe
+        deletes the rider's credentials *before* it purges the data.  A purge
+        that met a 403 then would leave the data stranded with nobody holding
+        a credential to ask again.  So the caller asks this first, and every
+        storage permission :meth:`purge_scope` needs and a probe can test
+        without touching rider data is exercised here:
+
+        1. **Blob delete**, by deleting a random name under this partition's
+           own prefix that nothing ever writes (:data:`WIPE_PROBE_BLOB_STEM`).
+        2. **Object-row delete**, by deleting a random row key in this
+           partition that nothing ever writes (:data:`WIPE_PROBE_ROW_PREFIX`).
+        3. **The scope lease** that :meth:`purge_scope` holds while it
+           deletes, by taking it and letting it go through the very same
+           :meth:`_scope_lock`.  Creating the lease blob and leasing it need a
+           blob *write* action, which a delete-only grant does not carry; a
+           probe that skipped this would pass and the purge would 403 after
+           the credentials were already gone.  This step may create the
+           zero-byte ``__lock`` blob if the scope never synced -- exactly what
+           the sync plane does on every write, holding no rider data, and
+           removed again at the end of :meth:`purge_scope`.  If a sync holds
+           the lease right now, the answer is "not now", which is also the
+           right answer for a wipe.
+
+        Classification reuses :meth:`_not_found`: an authorized delete of a
+        missing item is a 404 (``ResourceNotFoundError``), or no error at all
+        from the Tables SDK, which swallows a 404 on ``delete_entity``.  A
+        403 (``AuthorizationPermissionMismatch``), a 401, a 5xx, a transport
+        error, or anything without a structured status means "cannot", and
+        so does any failure taking the lease.  Fail closed: a wrong "cannot"
+        costs a retry; a wrong "can" strands a rider's data.
+        """
+
+        partition = self._partition(namespace, local_user_scope)
+        token = _wipe_probe_token()
+        try:
+            self._container.get_blob_client(
+                f"{partition}/{WIPE_PROBE_BLOB_STEM}{token}"
+            ).delete_blob()
+        except Exception as exc:
+            if not self._not_found(exc):
+                return False
+        try:
+            self._table.delete_entity(
+                partition_key=partition, row_key=f"{WIPE_PROBE_ROW_PREFIX}{token}"
+            )
+        except Exception as exc:
+            if not self._not_found(exc):
+                return False
+        try:
+            with self._scope_lock(partition):
+                pass
+        except Exception:
+            return False
+        return True
 
     def _blob_names(self, prefix: str) -> list[object]:
         """What the container lists under ``prefix``, as names, unvalidated.

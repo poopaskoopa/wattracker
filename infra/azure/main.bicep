@@ -42,6 +42,21 @@ param operatorToken string
 param blobReaderRoleDefinitionId string
 @description('Object ID of the operator principal that runs a scope wipe (#170). Empty deploys the wipe role definitions without assigning them to anybody, which is the default: the capability stays reviewable and nothing holds it until an operator is named. Never a container app identity.')
 param operatorWipePrincipalId string = ''
+// #170 item 6, owner decision 2026-09-26: the READ app's own identity holds the
+// scope-wipe grant, and this one switch controls both that grant and the
+// route's WATTRACKER_CLOUD_ALLOW_ACCOUNT_WIPE flag, so the two can never
+// diverge -- no route without the grant, no grant without the route.
+//
+// The accepted risk, stated plainly: the read app is the internet-facing plane,
+// and with this on, a compromise of it can delete riders' cloud copies (object
+// blobs, their CloudObjects rows, and CloudAuth credential rows). That is
+// accepted because rider data in the cloud is a replica -- each rider's
+// desktop is the source of truth and can re-sync it. Confidentiality does not
+// change: the read identity can already read all of it. What stays out of
+// reach is unchanged too: no delete on CloudControl (the kill switch), and the
+// sync identity gains nothing and keeps no delete anywhere.
+@description('Owner switch for rider account wipes (#170). True grants the read identity the scope-wipe delete roles on the objects container, CloudObjects and CloudAuth (never CloudControl) and sets WATTRACKER_CLOUD_ALLOW_ACCOUNT_WIPE=1 on the read app only. False (the default) does neither.')
+param enableAccountWipe bool = false
 
 var vnetName = 'wattracker-vnet'
 var envName = 'wattracker-aca-env'
@@ -51,6 +66,14 @@ var staticName = 'wattracker-pwa'
 resource budgetHookApp 'Microsoft.Web/sites@2022-09-01' existing = {
   name: budgetHookFunctionAppName
 }
+// The route flag rides on the same switch as the grant. Absent when false,
+// so the app's own default (off) applies; the sync app never gets it.
+var readAccountWipeEnv = enableAccountWipe ? [
+  {
+    name: 'WATTRACKER_CLOUD_ALLOW_ACCOUNT_WIPE'
+    value: '1'
+  }
+] : []
 var budgetHookDefaultKey = listKeys('${budgetHookApp.id}/host/default', '2022-03-01').functionKeys.default
 var writeShutdownWebhookUri = 'https://${budgetHookHost}/budget/disable-writes?code=${budgetHookDefaultKey}'
 var publicShutdownWebhookUri = 'https://${budgetHookHost}/budget/disable-public-api?code=${budgetHookDefaultKey}'
@@ -203,6 +226,16 @@ resource appEnv 'Microsoft.App/managedEnvironments@2023-05-01' = {
 resource readApp 'Microsoft.App/containerApps@2023-05-01' = {
   name: readName
   location: location
+  // The revision that exposes the wipe route is created only after the
+  // read identity's wipe grants exist. When enableAccountWipe is false the
+  // three are not deployed and ARM drops them from the dependency list.
+  // (RBAC propagation can still lag the assignment by minutes; the route's
+  // delete-capability probe answers 503 with nothing deleted until it lands.)
+  dependsOn: [
+    readWipeBlobRole
+    readWipeObjectTableRole
+    readWipeAuthTableRole
+  ]
   identity: {
     type: 'UserAssigned'
     userAssignedIdentities: {
@@ -236,7 +269,7 @@ resource readApp 'Microsoft.App/containerApps@2023-05-01' = {
         image: readImage
         command: ['python']
         args: ['-m', 'wattracker.cloud.runtime']
-        env: [
+        env: concat([
           {
             name: 'WATTRACKER_CLOUD_PLANE'
             value: 'read'
@@ -261,7 +294,7 @@ resource readApp 'Microsoft.App/containerApps@2023-05-01' = {
             name: 'WATTRACKER_CLOUD_OPERATOR_TOKEN'
             secretRef: 'operator-token'
           }
-        ]
+        ], readAccountWipeEnv)
         resources: {
           cpu: any('0.5')
           memory: '1Gi'
@@ -435,10 +468,13 @@ resource authSweeperRoleDefinition 'Microsoft.Authorization/roleDefinitions@2022
     assignableScopes: [authTable.id]
   }
 }
-// #170: deleting one rider's data is a privileged operator path, not a flag on
-// the sync client. The sync identity holds no delete anywhere and does not
-// gain one here; these two roles exist so the operator wipe runs under an
-// identity that is not the sync identity and not the read identity either.
+// #170: deleting one rider's data is a privileged path, not a flag on the sync
+// client. The sync identity holds no delete anywhere and does not gain one
+// here. These two roles are held by up to two principals, each behind its own
+// switch: the operator named by `operatorWipePrincipalId` (#169's CLI), and --
+// only when `enableAccountWipe` is true -- the read identity, which serves the
+// rider-initiated wipe route (owner decision 2026-09-26; the accepted risk is
+// stated at the `enableAccountWipe` parameter).
 //
 // What they are scoped to is the design. Between them they reach the rider's
 // objects -- the blobs in `wattracker-objects` and their rows in
@@ -454,16 +490,23 @@ resource authSweeperRoleDefinition 'Microsoft.Authorization/roleDefinitions@2022
 // the same reason it excludes `kill-switch`: an absent counter row reads as
 // zero, so a wipe that took them would hand the scope a fresh daily budget.
 //
-// Neither is assigned unless `operatorWipePrincipalId` names somebody. The
-// default deployment defines the capability and gives it to no one, which is
-// the same bar `test_cleanup_delete_identity_is_not_deployed_without_a_cleanup_job`
-// set: a delete grant is held only where something actually deletes, and the
-// operator CLI that will run this (#169) is not built yet.
+// Neither is assigned by default: not to an operator unless
+// `operatorWipePrincipalId` names somebody, and not to the read identity unless
+// `enableAccountWipe` is true. The default deployment defines the capability
+// and gives it to no one, which is the bar
+// `test_cleanup_delete_identity_is_not_deployed_without_a_cleanup_job` set: a
+// delete grant is held only where something actually deletes.
+//
+// Open (#170): `purge_scope` holds the scope's blob lease while it deletes,
+// and creating or leasing that lock blob needs the blob write action, which
+// neither role carries. The wipe route's capability probe takes the same
+// lease before anything is deleted, so until the owner decides how that is
+// granted a wipe is refused with 503 rather than stranding a rider's data.
 resource operatorWipeBlobRoleDefinition 'Microsoft.Authorization/roleDefinitions@2022-04-01' = {
   name: guid(objectContainer.id, 'wattracker-operator-wipe-blob')
   properties: {
     roleName: 'Wattracker Operator Scope Wipe Blob'
-    description: 'Read and delete the sync object blobs of one scope during an operator scope wipe. Held by no deployed workload identity; the sync identity keeps no delete.'
+    description: 'Read and delete the sync object blobs of one scope during a scope wipe. Held by the named operator principal, and by the read identity only when enableAccountWipe is true; the sync identity keeps no delete.'
     type: 'CustomRole'
     permissions: [{ dataActions: [
       'Microsoft.Storage/storageAccounts/blobServices/containers/blobs/read'
@@ -645,6 +688,38 @@ resource operatorWipeAuthTableRole 'Microsoft.Authorization/roleAssignments@2022
   properties: {
     roleDefinitionId: operatorWipeTableRoleDefinition.id
     principalId: operatorWipePrincipalId
+  }
+}
+// The read identity's copy of the same three grants, behind `enableAccountWipe`.
+// Distinct names (the read identity's id and a 'read-account-wipe-*' salt), so
+// they never collide with the operator assignments above, which are unchanged.
+// Same roles, same three scopes -- the objects container, CloudObjects and
+// CloudAuth -- and never CloudControl.
+resource readWipeBlobRole 'Microsoft.Authorization/roleAssignments@2022-04-01' = if (enableAccountWipe) {
+  name: guid(objectContainer.id, readIdentity.id, 'read-account-wipe-blob')
+  scope: objectContainer
+  properties: {
+    roleDefinitionId: operatorWipeBlobRoleDefinition.id
+    principalId: readIdentity.properties.principalId
+    principalType: 'ServicePrincipal'
+  }
+}
+resource readWipeObjectTableRole 'Microsoft.Authorization/roleAssignments@2022-04-01' = if (enableAccountWipe) {
+  name: guid(objectTable.id, readIdentity.id, 'read-account-wipe-object-table')
+  scope: objectTable
+  properties: {
+    roleDefinitionId: operatorWipeTableRoleDefinition.id
+    principalId: readIdentity.properties.principalId
+    principalType: 'ServicePrincipal'
+  }
+}
+resource readWipeAuthTableRole 'Microsoft.Authorization/roleAssignments@2022-04-01' = if (enableAccountWipe) {
+  name: guid(authTable.id, readIdentity.id, 'read-account-wipe-auth-table')
+  scope: authTable
+  properties: {
+    roleDefinitionId: operatorWipeTableRoleDefinition.id
+    principalId: readIdentity.properties.principalId
+    principalType: 'ServicePrincipal'
   }
 }
 resource budgetHookRole 'Microsoft.Authorization/roleAssignments@2022-04-01' = {

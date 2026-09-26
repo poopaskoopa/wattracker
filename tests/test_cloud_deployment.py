@@ -403,9 +403,12 @@ def test_the_operator_wipe_role_cannot_reach_the_kill_switch_table():
         "'Microsoft.Storage/storageAccounts/blobServices/containers/blobs/read'"
         in blob_role
     )
-    # No container app identity gains the wipe roles.
-    assert BICEP.count("operatorWipeTableRoleDefinition.id") == 2
-    assert BICEP.count("operatorWipeBlobRoleDefinition.id") == 1
+    # Each role is referenced by exactly the operator assignments and the
+    # read identity's switch-gated copies; every one of those is checked by
+    # scope, principal and condition in
+    # `test_every_wipe_role_assignment_is_accounted_for`.
+    assert BICEP.count("operatorWipeTableRoleDefinition.id") == 4
+    assert BICEP.count("operatorWipeBlobRoleDefinition.id") == 2
     for definition in ("syncBlobWriterRoleDefinition", "syncTableWriterRoleDefinition"):
         role = BICEP.split(
             f"resource {definition} 'Microsoft.Authorization/roleDefinitions"
@@ -500,3 +503,152 @@ def test_the_runbook_says_the_sweep_cannot_remove_the_kill_switch():
     # action" -- is no longer true anywhere in the runbook.
     assert "no\nmanaged identity holds a table `entities/delete`" not in RUNBOOK
     assert "No deployed managed identity holds\na table `entities/delete`" not in RUNBOOK
+
+
+# ---------------------------------------------------------------------------
+# #170 item 6: one switch gives the read identity the wipe grant and the route
+# ---------------------------------------------------------------------------
+
+
+def _resource_block(name):
+    """The text of one top-level ``resource <name>`` declaration."""
+
+    return BICEP.split(f"\nresource {name} ", 1)[1].split("\nresource ", 1)[0]
+
+
+def _role_assignment_blocks():
+    """Every roleAssignments declaration, by symbolic name."""
+
+    blocks = {}
+    for chunk in BICEP.split("\nresource ")[1:]:
+        name, rest = chunk.split(" ", 1)
+        if rest.startswith("'Microsoft.Authorization/roleAssignments@"):
+            blocks[name] = rest
+    return blocks
+
+
+_WIPE_ROLE_IDS = (
+    "operatorWipeBlobRoleDefinition.id",
+    "operatorWipeTableRoleDefinition.id",
+)
+_READ_WIPE_ASSIGNMENTS = {
+    "readWipeBlobRole": ("objectContainer", "operatorWipeBlobRoleDefinition.id"),
+    "readWipeObjectTableRole": ("objectTable", "operatorWipeTableRoleDefinition.id"),
+    "readWipeAuthTableRole": ("authTable", "operatorWipeTableRoleDefinition.id"),
+}
+_OPERATOR_WIPE_ASSIGNMENTS = {
+    "operatorWipeBlobRole": ("objectContainer", "operatorWipeBlobRoleDefinition.id"),
+    "operatorWipeObjectTableRole": ("objectTable", "operatorWipeTableRoleDefinition.id"),
+    "operatorWipeAuthTableRole": ("authTable", "operatorWipeTableRoleDefinition.id"),
+}
+
+
+def test_the_account_wipe_switch_defaults_off_in_template_and_skeleton():
+    assert re.search(r"(?m)^param enableAccountWipe bool = false$", BICEP)
+    assert re.search(r"(?m)^param enableAccountWipe = false$", PARAMS)
+    assert len(re.findall(r"(?m)^param enableAccountWipe\b", BICEP)) == 1
+    assert len(re.findall(r"(?m)^param enableAccountWipe\b", PARAMS)) == 1
+    # The accepted risk is written down where the switch is.
+    param_comment = BICEP.split("param enableAccountWipe bool", 1)[0].rsplit(
+        "param operatorWipePrincipalId", 1
+    )[1]
+    assert "source of truth" in param_comment
+    assert "replica" in param_comment
+    assert "CloudControl" in param_comment
+
+
+def test_the_read_identity_wipe_grants_hang_on_the_switch_and_skip_cloudcontrol():
+    for name, (scope, role) in _READ_WIPE_ASSIGNMENTS.items():
+        block = _resource_block(name)
+        assert block.startswith(
+            "'Microsoft.Authorization/roleAssignments@2022-04-01' = "
+            "if (enableAccountWipe) {"
+        ), name
+        assert f"\n  scope: {scope}\n" in block
+        assert f"roleDefinitionId: {role}\n" in block
+        assert "principalId: readIdentity.properties.principalId" in block
+        assert "principalType: 'ServicePrincipal'" in block
+        # A name of its own: never the operator assignment's guid.
+        assert f"guid({scope}.id, readIdentity.id, 'read-account-wipe-" in block
+        for forbidden in (
+            "syncIdentity", "controlTable", "replayTable", "operatorWipePrincipalId",
+        ):
+            assert forbidden not in block, (name, forbidden)
+    # The operator path is unchanged.
+    for name, (scope, role) in _OPERATOR_WIPE_ASSIGNMENTS.items():
+        block = _resource_block(name)
+        assert "= if (!empty(operatorWipePrincipalId)) {" in block
+        assert f"\n  scope: {scope}\n" in block
+        assert f"roleDefinitionId: {role}\n" in block
+        assert "principalId: operatorWipePrincipalId" in block
+
+
+def test_every_wipe_role_assignment_is_accounted_for():
+    """No assignment of a wipe role exists beyond the six named above.
+
+    This is the check that catches a seventh: a wipe role handed to the sync
+    identity, or scoped to CloudControl, shows up here whatever it is called.
+    """
+
+    holders = {
+        name: block
+        for name, block in _role_assignment_blocks().items()
+        if any(role in block for role in _WIPE_ROLE_IDS)
+    }
+    assert set(holders) == set(_READ_WIPE_ASSIGNMENTS) | set(_OPERATOR_WIPE_ASSIGNMENTS)
+    for name, block in holders.items():
+        scope = re.search(r"\n  scope: (\w+)\n", block).group(1)
+        assert scope in {"objectContainer", "objectTable", "authTable"}, name
+
+
+def test_the_sync_identity_never_holds_a_wipe_role():
+    sync_assignments = {
+        name: block
+        for name, block in _role_assignment_blocks().items()
+        if "syncIdentity" in block
+    }
+    assert len(sync_assignments) >= 4  # the parse found them at all
+    for name, block in sync_assignments.items():
+        for role in _WIPE_ROLE_IDS:
+            assert role not in block, name
+        assert "authSweeperRoleDefinition" not in block, name
+        assert "enableAccountWipe" not in block, name
+
+
+def test_the_read_app_gets_the_wipe_flag_only_under_the_switch():
+    from wattracker.cloud.runtime import _env_flag
+
+    runtime_source = (ROOT / "wattracker" / "cloud" / "runtime.py").read_text()
+    assert '_env_flag("WATTRACKER_CLOUD_ALLOW_ACCOUNT_WIPE")' in runtime_source
+
+    # The flag is spelled once in the template, inside the switch-gated var.
+    assert len(re.findall(r"name: 'WATTRACKER_CLOUD_ALLOW_ACCOUNT_WIPE'", BICEP)) == 1
+    var = BICEP.split("\nvar readAccountWipeEnv = ", 1)[1].split("\nvar ", 1)[0]
+    assert var.startswith("enableAccountWipe ? [")
+    assert var.rstrip().endswith("] : []")
+    assert "name: 'WATTRACKER_CLOUD_ALLOW_ACCOUNT_WIPE'" in var
+    value = re.search(r"value: '([^']*)'", var).group(1)
+    # The value the template sets is one the runtime actually reads as "on".
+    import os
+    from unittest import mock
+
+    with mock.patch.dict(os.environ, {"WATTRACKER_CLOUD_ALLOW_ACCOUNT_WIPE": value}):
+        assert _env_flag("WATTRACKER_CLOUD_ALLOW_ACCOUNT_WIPE") is True
+    read_app = _resource_block("readApp")
+    assert "env: concat([" in read_app
+    assert "], readAccountWipeEnv)" in read_app
+    assert "WATTRACKER_CLOUD_ALLOW_ACCOUNT_WIPE" not in read_app
+    assert BICEP.count("readAccountWipeEnv") == 2
+
+
+def test_the_sync_app_never_gets_the_wipe_flag():
+    sync_app = _resource_block("syncApp")
+    assert "WATTRACKER_CLOUD_ALLOW_ACCOUNT_WIPE" not in sync_app
+    assert "readAccountWipeEnv" not in sync_app
+    assert "enableAccountWipe" not in sync_app
+
+
+def test_the_read_app_revision_waits_for_the_wipe_grants():
+    read_app = _resource_block("readApp")
+    depends = read_app.split("dependsOn: [", 1)[1].split("]", 1)[0]
+    assert set(depends.split()) == set(_READ_WIPE_ASSIGNMENTS)

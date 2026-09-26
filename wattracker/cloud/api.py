@@ -52,7 +52,7 @@ from .security import (
     verify_signature,
 )
 from .storage import MAX_QUERY_LIMIT, MemoryTenantStore, StorageConflict, StaleRevision
-from .wipe import wipe_scope
+from .wipe import wipe_capability_proven, wipe_scope
 
 _NOT_FOUND_BODY = {"detail": "not found"}
 _MAX_TIMESTAMP = 60 * 5
@@ -1748,6 +1748,21 @@ def create_cloud_app(
                 # Without the durable auth backend the library can purge
                 # objects but cannot remove the in-memory caller credential.
                 # Refuse rather than claim that a self-destruct completed.
+                return _error(503, "cloud wipe unavailable")
+
+            # Prove delete permission on every store before touching any of
+            # them.  ``wipe_scope`` removes credentials first, so a grant that
+            # has not propagated to the data stores yet (Azure RBAC lags a
+            # deployment by minutes) would otherwise delete this rider's
+            # credentials and then 403 on the purge -- data left in the cloud
+            # with no credential to retry with.  Refused here, nothing has
+            # been deleted and the rider can simply try again later.
+            if not wipe_capability_proven(
+                namespace,
+                scope,
+                store=state.store,
+                security_backend=security_backend,
+            ):
                 return _error(503, "cloud wipe unavailable")
 
             # Construct this before deleting credentials.  In particular, do
