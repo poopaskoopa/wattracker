@@ -606,6 +606,26 @@ class AzureTenantStore:
     def _blob_name(partition: str, object_id: str) -> str:
         return f"{partition}/{AzureTenantStore._row_key(object_id)}.json"
 
+    @staticmethod
+    def _lock_blob_name(partition: str) -> str:
+        """The scope lease blob: ``<64 hex namespace>:<scope>/__lock``.
+
+        This exact shape is load-bearing outside Python.  ``main.bicep``
+        grants the wipe identities ``blobs/write`` only under an ABAC
+        condition whose blob-path pattern is this name
+        (``wipeLockWriteCondition``), so that the grant reaches lease blobs
+        and never a rider's data.  Change it here and a wipe's capability
+        probe fails its lease step and refuses with 503 -- safe, but broken
+        -- until the condition is changed to match.
+        ``tests/test_cloud_deployment.py`` pins the two together.
+
+        No object blob can take this name: those are always
+        ``<partition>/object:<id>.json`` (:meth:`_blob_name`), with the id
+        validated by :meth:`_row_key` to a charset with no ``/``, so an
+        object name cannot end in ``/__lock``.
+        """
+        return f"{partition}/__lock"
+
     def _entity(self, partition: str, row_key: str) -> Optional[dict]:
         try:
             return dict(self._table.get_entity(partition_key=partition, row_key=row_key))
@@ -623,7 +643,7 @@ class AzureTenantStore:
         checks.  A pending marker remains recoverable if a process dies after
         a blob write and before the marker is committed.
         """
-        lock_blob = self._container.get_blob_client(f"{partition}/__lock")
+        lock_blob = self._container.get_blob_client(self._lock_blob_name(partition))
         try:
             lock_blob.upload_blob(b"", overwrite=False)
         except Exception as exc:
@@ -1013,7 +1033,7 @@ class AzureTenantStore:
 
         partition = self._partition(namespace, local_user_scope)
         prefix = f"{partition}/"
-        lock_name = f"{prefix}__lock"
+        lock_name = self._lock_blob_name(partition)
         objects = blobs = markers = skipped = orphans = 0
         with self._scope_lock(partition):
             entities = list(self._table.query_entities(
@@ -1084,10 +1104,13 @@ class AzureTenantStore:
            partition that nothing ever writes (:data:`WIPE_PROBE_ROW_PREFIX`).
         3. **The scope lease** that :meth:`purge_scope` holds while it
            deletes, by taking it and letting it go through the very same
-           :meth:`_scope_lock`.  Creating the lease blob and leasing it need a
-           blob *write* action, which a delete-only grant does not carry; a
-           probe that skipped this would pass and the purge would 403 after
-           the credentials were already gone.  This step may create the
+           :meth:`_scope_lock`.  Creating the lease blob and leasing it need
+           the blob *write* action, which the delete roles do not carry; the
+           deployment grants it separately, only on lease-blob paths, under an
+           ABAC condition (see :meth:`_lock_blob_name`).  A probe that skipped
+           this step would pass while that grant was missing, not yet
+           propagated, or its condition wrong, and the purge would then 403
+           after the credentials were already gone.  This step may create the
            zero-byte ``__lock`` blob if the scope never synced -- exactly what
            the sync plane does on every write, holding no rider data, and
            removed again at the end of :meth:`purge_scope`.  If a sync holds

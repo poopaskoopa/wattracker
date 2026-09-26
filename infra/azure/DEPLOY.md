@@ -186,15 +186,29 @@ deletes a random key that cannot exist: "not found" means allowed, and anything
 else, including a 403, means not allowed. If any probe fails, the route returns
 `503 cloud wipe unavailable` with nothing deleted. Retry after a few minutes.
 
-**Known blocker before a live wipe can succeed.** `purge_scope` holds the
-scope's blob lease (`<scope>/__lock`) while it deletes. Creating and leasing that
-blob needs the blob `write` data action. The scope-wipe blob role (read and
-delete) does not include it, and neither does the read identity's Storage Blob
-Data Reader role. The probe also takes and releases that lease, so with the
-grants as they are it is expected to refuse every wipe with 503 rather than
-strand data. This has not been checked against Azure. Turning wipes on
-therefore needs an owner decision on the lease: grant the write, or change the
-purge so it does not need one.
+**The scope lease, and the one write the read identity gets.** `purge_scope`
+holds the scope's blob lease while it deletes. Creating and leasing that lock
+blob needs the blob `write` data action (Put Blob and Lease Blob both map to
+it; there is no blob-level lease action, see #330). The delete roles don't
+carry it. So the same switch also assigns the custom role
+`Wattracker Scope Wipe Lock`, whose only action is `blobs/write`, on the objects
+container. The assignment always carries an ABAC condition (`conditionVersion
+'2.0'`), so the write applies only to blob paths shaped like the lock blob
+`<64-hex namespace>:<scope>/__lock`:
+
+```
+((!(ActionMatches{'Microsoft.Storage/storageAccounts/blobServices/containers/blobs/write'})) OR (@Resource[Microsoft.Storage/storageAccounts/blobServices/containers/blobs:path] StringLike '????????????????????????????????????????????????????????????????:*/__lock'))
+```
+
+Rider data can't match that pattern: object blobs are always
+`<scope>/object:<id>.json`, and neither the scope nor the id may contain `/`.
+The read app can still read and delete rider data, but it can't overwrite it.
+The operator principal, when one is named, gets the same conditional grant.
+
+**Unverified live.** No Azure command has evaluated this condition. If it is
+wrong, or not yet propagated, the probe's lease step fails and the wipe returns
+503 with nothing deleted. It doesn't strand data. If wipes keep returning 503
+long after propagation, check the lock assignment's condition first.
 
 **Rollback:** set `enableAccountWipe = false` and redeploy. That removes the
 read identity's wipe assignments and the route flag in the same deployment.

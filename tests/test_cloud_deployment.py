@@ -510,37 +510,87 @@ def test_the_runbook_says_the_sweep_cannot_remove_the_kill_switch():
 # ---------------------------------------------------------------------------
 
 
+def _until_closing_brace(text):
+    """A declaration up to its own closing ``}`` at column 0.
+
+    Nested braces are indented, so the first column-0 ``}`` ends the
+    declaration; comments written before the *next* declaration are not
+    part of this one.
+    """
+
+    return text.split("\n}\n", 1)[0] + "\n}"
+
+
 def _resource_block(name):
     """The text of one top-level ``resource <name>`` declaration."""
 
-    return BICEP.split(f"\nresource {name} ", 1)[1].split("\nresource ", 1)[0]
+    return _until_closing_brace(BICEP.split(f"\nresource {name} ", 1)[1])
+
+
+def _blocks_of_type(resource_type):
+    blocks = {}
+    for chunk in BICEP.split("\nresource ")[1:]:
+        name, rest = chunk.split(" ", 1)
+        if rest.startswith(f"'{resource_type}@"):
+            blocks[name] = _until_closing_brace(rest)
+    return blocks
 
 
 def _role_assignment_blocks():
     """Every roleAssignments declaration, by symbolic name."""
 
-    blocks = {}
-    for chunk in BICEP.split("\nresource ")[1:]:
-        name, rest = chunk.split(" ", 1)
-        if rest.startswith("'Microsoft.Authorization/roleAssignments@"):
-            blocks[name] = rest
-    return blocks
+    return _blocks_of_type("Microsoft.Authorization/roleAssignments")
+
+
+def _role_definition_actions():
+    """Every custom role's dataActions, by symbolic name."""
+
+    return {
+        name: re.findall(
+            r"'(Microsoft\.Storage/[^']+)'",
+            block.split("dataActions: [", 1)[1].split("]", 1)[0],
+        )
+        for name, block in _blocks_of_type(
+            "Microsoft.Authorization/roleDefinitions"
+        ).items()
+    }
+
+
+def _bicep_string_var(name):
+    """A single-quoted Bicep string ``var``, with its escapes undone."""
+
+    match = re.search(rf"(?m)^var {name} = '((?:[^'\\]|\\.)*)'$", BICEP)
+    assert match, name
+    return re.sub(r"\\(.)", r"\1", match.group(1))
 
 
 _WIPE_ROLE_IDS = (
     "operatorWipeBlobRoleDefinition.id",
     "operatorWipeTableRoleDefinition.id",
+    "wipeLockRoleDefinition.id",
 )
 _READ_WIPE_ASSIGNMENTS = {
     "readWipeBlobRole": ("objectContainer", "operatorWipeBlobRoleDefinition.id"),
     "readWipeObjectTableRole": ("objectTable", "operatorWipeTableRoleDefinition.id"),
     "readWipeAuthTableRole": ("authTable", "operatorWipeTableRoleDefinition.id"),
+    "readWipeLockRole": ("objectContainer", "wipeLockRoleDefinition.id"),
 }
 _OPERATOR_WIPE_ASSIGNMENTS = {
     "operatorWipeBlobRole": ("objectContainer", "operatorWipeBlobRoleDefinition.id"),
     "operatorWipeObjectTableRole": ("objectTable", "operatorWipeTableRoleDefinition.id"),
     "operatorWipeAuthTableRole": ("authTable", "operatorWipeTableRoleDefinition.id"),
+    "operatorWipeLockRole": ("objectContainer", "wipeLockRoleDefinition.id"),
 }
+_LOCK_ASSIGNMENTS = ("readWipeLockRole", "operatorWipeLockRole")
+_BLOB_WRITE = "Microsoft.Storage/storageAccounts/blobServices/containers/blobs/write"
+#: The exact ABAC condition every lock assignment must carry.  Spelled out
+#: here rather than read back from the template, so widening it is a diff.
+_LOCK_PATH_PATTERN = "?" * 64 + ":*/__lock"
+_LOCK_CONDITION = (
+    "((!(ActionMatches{'" + _BLOB_WRITE + "'})) OR "
+    "(@Resource[Microsoft.Storage/storageAccounts/blobServices/containers/"
+    "blobs:path] StringLike '" + _LOCK_PATH_PATTERN + "'))"
+)
 
 
 def test_the_account_wipe_switch_defaults_off_in_template_and_skeleton():
@@ -584,7 +634,7 @@ def test_the_read_identity_wipe_grants_hang_on_the_switch_and_skip_cloudcontrol(
 
 
 def test_every_wipe_role_assignment_is_accounted_for():
-    """No assignment of a wipe role exists beyond the six named above.
+    """No assignment of a wipe role exists beyond the eight named above.
 
     This is the check that catches a seventh: a wipe role handed to the sync
     identity, or scoped to CloudControl, shows up here whatever it is called.
@@ -623,7 +673,9 @@ def test_the_read_app_gets_the_wipe_flag_only_under_the_switch():
 
     # The flag is spelled once in the template, inside the switch-gated var.
     assert len(re.findall(r"name: 'WATTRACKER_CLOUD_ALLOW_ACCOUNT_WIPE'", BICEP)) == 1
-    var = BICEP.split("\nvar readAccountWipeEnv = ", 1)[1].split("\nvar ", 1)[0]
+    var = re.split(
+        r"\n(?:var |//)", BICEP.split("\nvar readAccountWipeEnv = ", 1)[1], maxsplit=1
+    )[0]
     assert var.startswith("enableAccountWipe ? [")
     assert var.rstrip().endswith("] : []")
     assert "name: 'WATTRACKER_CLOUD_ALLOW_ACCOUNT_WIPE'" in var
@@ -652,3 +704,154 @@ def test_the_read_app_revision_waits_for_the_wipe_grants():
     read_app = _resource_block("readApp")
     depends = read_app.split("dependsOn: [", 1)[1].split("]", 1)[0]
     assert set(depends.split()) == set(_READ_WIPE_ASSIGNMENTS)
+    assert "readWipeLockRole" in depends.split()
+
+
+def _string_like(pattern):
+    """ABAC ``StringLike`` as a regex: case-sensitive, ``*`` any run, ``?`` one.
+
+    Per https://learn.microsoft.com/en-us/azure/role-based-access-control/conditions-format#stringlike
+    -- a backslash would escape a wildcard; the lock pattern uses none.
+    """
+
+    assert "\\" not in pattern
+    return re.compile(
+        "".join(
+            ".*" if ch == "*" else "." if ch == "?" else re.escape(ch)
+            for ch in pattern
+        ),
+        re.DOTALL,
+    )
+
+
+def test_the_lock_role_holds_only_blob_write_and_only_on_the_objects_container():
+    actions = _role_definition_actions()
+    assert actions["wipeLockRoleDefinition"] == [_BLOB_WRITE]
+    block = _resource_block("wipeLockRoleDefinition")
+    assert "roleName: 'Wattracker Scope Wipe Lock'" in block
+    assert "assignableScopes: [objectContainer.id]" in block
+    # #330: no role names a blob-level lease data action; it does not exist.
+    for name, role_actions in actions.items():
+        assert not any("lease" in action for action in role_actions), name
+
+
+def test_every_lock_grant_is_confined_to_lock_blob_paths():
+    assert _bicep_string_var("wipeLockWriteCondition") == _LOCK_CONDITION
+    holders = {
+        name
+        for name, block in _role_assignment_blocks().items()
+        if "wipeLockRoleDefinition.id" in block
+    }
+    assert holders == set(_LOCK_ASSIGNMENTS)
+    for name in _LOCK_ASSIGNMENTS:
+        block = _resource_block(name)
+        assert "\n  scope: objectContainer\n" in block, name
+        assert "    conditionVersion: '2.0'\n" in block, name
+        assert "    condition: wipeLockWriteCondition\n" in block, name
+    read_lock = _resource_block("readWipeLockRole")
+    assert read_lock.startswith(
+        "'Microsoft.Authorization/roleAssignments@2022-04-01' = if (enableAccountWipe) {"
+    )
+    assert "principalId: readIdentity.properties.principalId" in read_lock
+    operator_lock = _resource_block("operatorWipeLockRole")
+    assert "= if (!empty(operatorWipePrincipalId)) {" in operator_lock
+    assert "principalId: operatorWipePrincipalId" in operator_lock
+
+
+def test_the_lock_pattern_matches_the_lock_blob_and_never_rider_data():
+    """The storage-side half of the ABAC condition.
+
+    Every blob this package writes has one of two names: the scope lease blob
+    (``_lock_blob_name``) or an object blob (``_blob_name``).  The first must
+    match the condition's pattern, or wipes 503; the second must never match,
+    or the lock grant could overwrite a rider's data.  The object id is the
+    only client-supplied part of an object name, and ``_row_key`` limits it to
+    a charset with no ``/``, so no object name can end in ``/__lock`` -- and
+    every object name ends in ``.json`` anyway.
+    """
+
+    import random
+    import string
+
+    from wattracker.cloud.storage import WIPE_PROBE_BLOB_STEM, AzureTenantStore
+
+    matcher = _string_like(_LOCK_PATH_PATTERN)
+    rng = random.Random(170)
+    first = string.ascii_letters + string.digits
+    rest = first + "._~-"
+    scopes = ["a", "rider", "Z" * 256, "r.i_d~e-r", "lock", "L__lock"]
+    scopes += [
+        rng.choice(first) + "".join(rng.choice(rest) for _ in range(rng.randint(0, 60)))
+        for _ in range(50)
+    ]
+    object_ids = ["ride-1", "lock", "x.__lock", "a__lock", "L__lock"]
+    object_ids += [
+        rng.choice(first) + "".join(rng.choice(rest) for _ in range(rng.randint(0, 127)))
+        for _ in range(200)
+    ]
+    for scope in scopes:
+        namespace = "".join(rng.choice("0123456789abcdef") for _ in range(64))
+        partition = AzureTenantStore._partition(namespace, scope)
+        assert matcher.fullmatch(AzureTenantStore._lock_blob_name(partition))
+        assert not matcher.fullmatch(f"{partition}/{WIPE_PROBE_BLOB_STEM}0")
+        for object_id in object_ids:
+            name = AzureTenantStore._blob_name(partition, object_id)
+            assert not matcher.fullmatch(name), name
+    # An id or scope that could end a name in ``/__lock`` is refused outright.
+    for hostile in ("x/__lock", "__lock", "/__lock", "a/../__lock"):
+        with pytest.raises(ValueError):
+            AzureTenantStore._row_key(hostile)
+        with pytest.raises(ValueError):
+            AzureTenantStore._partition("a" * 64, hostile)
+    # The pattern is not a loose wildcard: the 64 single-character wildcards
+    # and the literal separators are doing work.
+    assert not matcher.fullmatch("__lock")
+    assert not matcher.fullmatch("abc:rider/__lock")
+    assert not matcher.fullmatch("a" * 64 + ":rider/object:ride-1.json")
+    assert not matcher.fullmatch("a" * 64 + ":rider/__lock.json")
+
+
+def test_the_read_identity_holds_no_unconditioned_blob_write():
+    """Blob write or create reaches the read identity only under the lock condition."""
+
+    actions = _role_definition_actions()
+    writes = {_BLOB_WRITE, _BLOB_WRITE.replace("/write", "/add/action")}
+    seen = set()
+    for name, block in _role_assignment_blocks().items():
+        if "readIdentity" not in block:
+            continue
+        seen.add(name)
+        role = re.search(r"roleDefinitionId: (\w+)\.id\n", block)
+        if role is None:
+            # Built-in roles, pinned below to the two readers.
+            assert name in {"tableRole", "readBlobRole"}, name
+            continue
+        if writes & set(actions[role.group(1)]):
+            assert "    condition: wipeLockWriteCondition\n" in block, name
+            assert "    conditionVersion: '2.0'\n" in block, name
+    assert "readWipeLockRole" in seen
+    assert re.search(
+        r"(?m)^param blobReaderRoleDefinitionId = '2a2b9908-6ea1-4ae2-8e65-a410df84e7d1'$",
+        PARAMS,
+    )
+    assert "'76199698-9eea-4c19-bc75-cec21354c6b6'" in _resource_block("tableRole")
+
+
+def test_the_sync_identity_roles_are_unchanged():
+    sync = {
+        name: (
+            re.search(r"roleDefinitionId: (\w+)\.id\n", block).group(1),
+            re.search(r"\n  scope: (\w+)\n", block).group(1),
+        )
+        for name, block in _role_assignment_blocks().items()
+        if "syncIdentity" in block
+    }
+    assert sync == {
+        "blobRole": ("syncBlobWriterRoleDefinition", "objectContainer"),
+        "syncTableRole": ("syncTableWriterRoleDefinition", "objectTable"),
+        "syncAuthRole": ("authReaderRoleDefinition", "authTable"),
+        "syncControlRole": ("controlReaderRoleDefinition", "controlTable"),
+        "syncReplayRole": ("replayWriterRoleDefinition", "replayTable"),
+    }
+    for name in sync:
+        assert "condition" not in _resource_block(name), name

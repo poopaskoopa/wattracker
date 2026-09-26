@@ -55,7 +55,7 @@ param operatorWipePrincipalId string = ''
 // change: the read identity can already read all of it. What stays out of
 // reach is unchanged too: no delete on CloudControl (the kill switch), and the
 // sync identity gains nothing and keeps no delete anywhere.
-@description('Owner switch for rider account wipes (#170). True grants the read identity the scope-wipe delete roles on the objects container, CloudObjects and CloudAuth (never CloudControl) and sets WATTRACKER_CLOUD_ALLOW_ACCOUNT_WIPE=1 on the read app only. False (the default) does neither.')
+@description('Owner switch for rider account wipes (#170). True grants the read identity the scope-wipe delete roles on the objects container, CloudObjects and CloudAuth (never CloudControl), plus blobs/write on per-scope lease blobs only (ABAC path condition), and sets WATTRACKER_CLOUD_ALLOW_ACCOUNT_WIPE=1 on the read app only. False (the default) does neither.')
 param enableAccountWipe bool = false
 
 var vnetName = 'wattracker-vnet'
@@ -74,6 +74,23 @@ var readAccountWipeEnv = enableAccountWipe ? [
     value: '1'
   }
 ] : []
+// #170: the ABAC condition on every assignment of `wipeLockRoleDefinition`.
+// It allows the role's one action, blobs/write, only on a blob whose path
+// matches the per-scope lease blob `AzureTenantStore._lock_blob_name` builds:
+// `<64-hex namespace>:<local scope>/__lock`. 64 single-character wildcards
+// (`?`) cover the namespace exactly, then a literal `:`, the scope (`*`),
+// and the literal `/__lock`. No rider data blob can match: object blobs are
+// always `<partition>/object:<id>.json`, and neither the scope nor the id
+// may contain `/` (validated in `storage.py`, pinned by a test).
+// Attribute and operator per the ABAC references:
+//   https://learn.microsoft.com/en-us/azure/storage/blobs/storage-auth-abac-attributes#blob-path
+//     (`blobs:path` is the name inside the container, no container, no leading `/`)
+//   https://learn.microsoft.com/en-us/azure/role-based-access-control/conditions-format#stringlike
+//     (case-sensitive; `*` any run of characters, `?` exactly one)
+// UNVERIFIED LIVE: no Azure command has evaluated this condition. If it is
+// wrong, the wipe route's capability probe fails its lease step and refuses
+// the wipe with 503, nothing deleted.
+var wipeLockWriteCondition = '((!(ActionMatches{\'Microsoft.Storage/storageAccounts/blobServices/containers/blobs/write\'})) OR (@Resource[Microsoft.Storage/storageAccounts/blobServices/containers/blobs:path] StringLike \'????????????????????????????????????????????????????????????????:*/__lock\'))'
 var budgetHookDefaultKey = listKeys('${budgetHookApp.id}/host/default', '2022-03-01').functionKeys.default
 var writeShutdownWebhookUri = 'https://${budgetHookHost}/budget/disable-writes?code=${budgetHookDefaultKey}'
 var publicShutdownWebhookUri = 'https://${budgetHookHost}/budget/disable-public-api?code=${budgetHookDefaultKey}'
@@ -228,13 +245,14 @@ resource readApp 'Microsoft.App/containerApps@2023-05-01' = {
   location: location
   // The revision that exposes the wipe route is created only after the
   // read identity's wipe grants exist. When enableAccountWipe is false the
-  // three are not deployed and ARM drops them from the dependency list.
+  // four are not deployed and ARM drops them from the dependency list.
   // (RBAC propagation can still lag the assignment by minutes; the route's
   // delete-capability probe answers 503 with nothing deleted until it lands.)
   dependsOn: [
     readWipeBlobRole
     readWipeObjectTableRole
     readWipeAuthTableRole
+    readWipeLockRole
   ]
   identity: {
     type: 'UserAssigned'
@@ -497,11 +515,10 @@ resource authSweeperRoleDefinition 'Microsoft.Authorization/roleDefinitions@2022
 // `test_cleanup_delete_identity_is_not_deployed_without_a_cleanup_job` set: a
 // delete grant is held only where something actually deletes.
 //
-// Open (#170): `purge_scope` holds the scope's blob lease while it deletes,
-// and creating or leasing that lock blob needs the blob write action, which
-// neither role carries. The wipe route's capability probe takes the same
-// lease before anything is deleted, so until the owner decides how that is
-// granted a wipe is refused with 503 rather than stranding a rider's data.
+// `purge_scope` also holds the scope's blob lease while it deletes, and
+// creating or leasing that lock blob needs blobs/write, which neither of these
+// roles carries. That is `wipeLockRoleDefinition` below, assigned alongside
+// them to the same principals and always under `wipeLockWriteCondition`.
 resource operatorWipeBlobRoleDefinition 'Microsoft.Authorization/roleDefinitions@2022-04-01' = {
   name: guid(objectContainer.id, 'wattracker-operator-wipe-blob')
   properties: {
@@ -526,6 +543,30 @@ resource operatorWipeTableRoleDefinition 'Microsoft.Authorization/roleDefinition
       'Microsoft.Storage/storageAccounts/tableServices/tables/entities/delete'
     ] }]
     assignableScopes: [objectTable.id, authTable.id]
+  }
+}
+// #170 (owner decision 2026-09-26): the lease `purge_scope` takes on the
+// scope's lock blob before it deletes. Per the Blob permissions table, Put
+// Blob (create or replace) and Lease Blob both need exactly
+// `Microsoft.Storage/storageAccounts/blobServices/containers/blobs/write`;
+// nothing further is needed to acquire or release a lease:
+//   https://learn.microsoft.com/en-us/rest/api/storageservices/authorize-with-azure-active-directory#permissions-for-blob-service-operations
+// There is no blob-level lease data action: `blobs/lease/action` does not
+// exist, and naming it failed the first real deployment (#330).
+//
+// blobs/write on its own would let the holder overwrite any rider's data, so
+// this role is never assigned without `wipeLockWriteCondition`, which confines
+// the write to lock-blob paths. Assignable only to the objects container.
+resource wipeLockRoleDefinition 'Microsoft.Authorization/roleDefinitions@2022-04-01' = {
+  name: guid(objectContainer.id, 'wattracker-scope-wipe-lock')
+  properties: {
+    roleName: 'Wattracker Scope Wipe Lock'
+    description: 'Write only the per-scope lease blob <namespace>:<scope>/__lock that a scope wipe holds while it deletes. Every assignment carries an ABAC condition restricting blobs/write to that path; never rider data.'
+    type: 'CustomRole'
+    permissions: [{ dataActions: [
+      'Microsoft.Storage/storageAccounts/blobServices/containers/blobs/write'
+    ] }]
+    assignableScopes: [objectContainer.id]
   }
 }
 resource controlReaderRoleDefinition 'Microsoft.Authorization/roleDefinitions@2022-04-01' = {
@@ -720,6 +761,30 @@ resource readWipeAuthTableRole 'Microsoft.Authorization/roleAssignments@2022-04-
     roleDefinitionId: operatorWipeTableRoleDefinition.id
     principalId: readIdentity.properties.principalId
     principalType: 'ServicePrincipal'
+  }
+}
+// The lease grant, to the same two principals behind the same two switches,
+// and only ever with `wipeLockWriteCondition`: write on lock blobs, nothing
+// else. The operator gets it too, so #169's CLI does not hit the same 403.
+resource operatorWipeLockRole 'Microsoft.Authorization/roleAssignments@2022-04-01' = if (!empty(operatorWipePrincipalId)) {
+  name: guid(objectContainer.id, operatorWipePrincipalId, 'operator-wipe-lock')
+  scope: objectContainer
+  properties: {
+    roleDefinitionId: wipeLockRoleDefinition.id
+    principalId: operatorWipePrincipalId
+    conditionVersion: '2.0'
+    condition: wipeLockWriteCondition
+  }
+}
+resource readWipeLockRole 'Microsoft.Authorization/roleAssignments@2022-04-01' = if (enableAccountWipe) {
+  name: guid(objectContainer.id, readIdentity.id, 'read-account-wipe-lock')
+  scope: objectContainer
+  properties: {
+    roleDefinitionId: wipeLockRoleDefinition.id
+    principalId: readIdentity.properties.principalId
+    principalType: 'ServicePrincipal'
+    conditionVersion: '2.0'
+    condition: wipeLockWriteCondition
   }
 }
 resource budgetHookRole 'Microsoft.Authorization/roleAssignments@2022-04-01' = {

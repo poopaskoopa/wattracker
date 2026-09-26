@@ -791,8 +791,13 @@ blobs, `CloudObjects` and `CloudAuth` by deleting random keys that cannot exist.
 "Not found" means allowed. A 403 or any other error means `503 cloud wipe
 unavailable` with nothing deleted. This covers the minutes of RBAC propagation
 during which a credentials-first wipe would otherwise strand the data.
-`infra/azure/DEPLOY.md` covers turning it on, and one open blocker: the scope
-lease the purge holds needs a blob write that no wipe grant carries yet.
+The purge also holds the scope's blob lease, which needs `blobs/write`. The
+same switches assign `wipeLockRoleDefinition` for that. Its only action is
+`blobs/write`, and every assignment carries an ABAC path condition confining it
+to `<64-hex namespace>:<scope>/__lock`. The read app can delete rider data but
+can't overwrite it. `infra/azure/DEPLOY.md` covers turning the wipe on and gives
+the exact condition. The condition is unverified live; if it is wrong, the
+probe refuses the wipe with 503.
 
 `CloudControl` is absent from both roles on purpose: not being able to delete
 the kill switch is better than being trusted not to.
@@ -1097,6 +1102,10 @@ hard billing ceiling.
       holds neither `operatorWipeBlobRoleDefinition` nor
       `operatorWipeTableRoleDefinition`, and the read identity holds them only
       when `enableAccountWipe` is true.
+- [ ] With `enableAccountWipe` true, confirm the read identity's
+      `wipeLockRoleDefinition` assignment shows the lock-path ABAC condition,
+      and that a `blobs/write` by that identity to an `object:*.json` blob is
+      refused with 403 while a wipe of a test scope succeeds.
 - [ ] Confirm `operatorWipePrincipalId` is empty unless a named operator
       principal is meant to hold the wipe roles, and that neither wipe role is
       assignable to `CloudControl`.
