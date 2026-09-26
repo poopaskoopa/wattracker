@@ -248,6 +248,52 @@ owner's regional quota during deployment. The exact provider-supported
 bootstrap storage/account and runtime setup must be confirmed on the first
 deployment; do not infer that this has been tested here.
 
+## Scripted migration (#339)
+
+`scripts/migrate_budget_hook.py` runs sections 1-4 below for the Y1-to-Flex
+migration, so nothing is hand-copied between phases. It has not been run
+against Azure; its first real run is the migration itself. Run `--dry-run`
+first: it makes no subprocess or network call, performs the local checks and
+prints every command a real run may issue, with secrets masked.
+
+```sh
+export WATTRACKER_BUDGET_HOOK_TOKEN='...'   # from the approved secret system; never argv
+# plus WATTRACKER_CLOUD_SERVER_SECRET and WATTRACKER_OPERATOR_TOKEN (existing values), for step 2
+.venv/bin/python scripts/migrate_budget_hook.py \
+  --resource-group "$RESOURCE_GROUP" --subscription "$SUBSCRIPTION_ID" \
+  --function-app-name "$FUNCTION_APP_NAME" \
+  --bootstrap-storage-name "$BOOTSTRAP_STORAGE_NAME" \
+  --params infra/azure/main.local.bicepparam --dry-run
+```
+
+Then run it again without `--dry-run`, from a clean checkout of `main`.
+Steps: 0 preflight (read-only), 1 Flex Function, 2 parameters and deploy
+(through `scripts/deploy_cloud.py --always-deploy`), 3 settings and publish,
+4 drill. Each step can be re-run; on failure the script names the failed step and
+prints the exact `--from-step N` command to resume with. Keep these points in mind:
+
+- It never runs `az network vnet create`. If `wattracker-vnet` is missing, it
+  stops. It creates `budget-hook-flex` only when that subnet is missing, using
+  the exact subnet body that `main.bicep` declares.
+- Deleting a non-Flex app is the only destructive step. The script asks you to
+  type the app name, or accepts `--confirm-delete <name>` when no terminal is
+  attached.
+- Before editing the parameter file, the script refuses it if
+  `budgetHookIpRules` is still present; delete that block by hand. It rewrites
+  only `budgetHookPrincipalId`, `budgetHookHost` and
+  `budgetHookFunctionAppName`, and keeps a 0600 copy of the original as
+  `infra/azure/main.pre-339-backup.local.bicepparam` (git-ignored).
+- If `build/azure-budget-hook` exists, the script stops. Remove only that
+  directory yourself.
+- A 200 response alone does not pass the drill. The script also reads the
+  CloudControl row, which must show both levels enabled with the
+  `operator clear` reason and must not predate the drill. Reading the row
+  requires Storage Table Data Reader on `CloudControl`, and the storage
+  firewall must admit this workstation. If either one blocks the read, the
+  script reports the drill as not passed instead of guessing.
+
+The manual commands in sections 1-4 remain the fallback.
+
 ## 1. Bootstrap or recreate the Flex Function App (unverified commands)
 
 From a clean deployment shell, choose non-secret names. The following is an
