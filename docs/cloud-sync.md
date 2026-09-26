@@ -782,7 +782,9 @@ deployment defines the capability and gives it to nobody:
   the rider wipe route and its grant cannot diverge (owner decision,
   2026-09-26). The accepted risk: a compromised read app can delete cloud
   copies, which are replicas of each rider's desktop, and it could already read
-  all of them.
+  all of them. Setting it back to false removes only the route flag: the
+  deployment is incremental, so the read identity's four wipe assignments stay
+  until they are deleted by hand (`infra/azure/DEPLOY.md`, "Rollback").
 
 The sync identity is unchanged and still holds no delete anywhere.
 

@@ -55,7 +55,13 @@ param operatorWipePrincipalId string = ''
 // change: the read identity can already read all of it. What stays out of
 // reach is unchanged too: no delete on CloudControl (the kill switch), and the
 // sync identity gains nothing and keeps no delete anywhere.
-@description('Owner switch for rider account wipes (#170). True grants the read identity the scope-wipe delete roles on the objects container, CloudObjects and CloudAuth (never CloudControl), plus blobs/write on per-scope lease blobs only (ABAC path condition), and sets WATTRACKER_CLOUD_ALLOW_ACCOUNT_WIPE=1 on the read app only. False (the default) does neither.')
+//
+// Turning this back to false does NOT revoke grants already made.
+// deploy_cloud.py deploys in Incremental mode, where a resource whose condition
+// becomes false is skipped, not deleted: the read identity keeps its four wipe
+// role assignments and only the route flag goes. infra/azure/DEPLOY.md
+// ("Rollback") gives the commands that delete the four assignments.
+@description('Owner switch for rider account wipes (#170). True grants the read identity the scope-wipe delete roles on the objects container, CloudObjects and CloudAuth (never CloudControl), plus blobs/write on per-scope lease blobs only (ABAC path condition), and sets WATTRACKER_CLOUD_ALLOW_ACCOUNT_WIPE=1 on the read app only. False (the default) grants nothing, but switching an existing deployment back to false removes only the flag: incremental deploys leave the assignments, which infra/azure/DEPLOY.md says how to delete.')
 param enableAccountWipe bool = false
 
 var vnetName = 'wattracker-vnet'

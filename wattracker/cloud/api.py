@@ -18,6 +18,7 @@ from typing import Any, Callable, Mapping, Optional
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, Response
+from fastapi.concurrency import run_in_threadpool
 
 from .limits import (
     DurableKillSwitch,
@@ -1773,7 +1774,12 @@ def create_cloud_app(
                 headers={"Cache-Control": "no-store"},
             )
             try:
-                report = wipe_scope(
+                # Off the event loop: the purge may wait up to
+                # ``PURGE_LEASE_DEADLINE_SECONDS`` for a sync that holds the
+                # scope lease, and a blocking wait here would stall every
+                # other request this process is serving.
+                report = await run_in_threadpool(
+                    wipe_scope,
                     namespace,
                     scope,
                     irreversible=True,

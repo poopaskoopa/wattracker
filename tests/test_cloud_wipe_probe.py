@@ -19,6 +19,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 from wattracker.cloud import api as cloud_api
+from wattracker.cloud import storage as storage_module
 from wattracker.cloud.api import CloudConfig, CloudState, create_cloud_app
 from wattracker.cloud.models import CloudObject, SyncBatch
 from wattracker.cloud.security import (
@@ -643,3 +644,266 @@ def test_the_combinator_refuses_an_empty_call():
     assert wipe_capability_proven(
         NAMESPACE, SCOPE, store=None, security_backend=None
     ) is False
+
+
+# ---------------------------------------------------------------------------
+# The purge waits out a sync that holds the scope lease (review round 2)
+#
+# The probe takes and releases the scope lease before ``wipe_scope`` starts,
+# and ``wipe_scope`` deletes the credentials before it purges.  A sync that
+# took the lease in between used to fail the purge at once: credentials gone,
+# data stranded.  The purge -- and only the purge -- now retries a lease
+# conflict until a bounded deadline.
+# ---------------------------------------------------------------------------
+
+
+class _LeaseError(_StorageError):
+    """A lease SDK error: structured status plus the service's error code."""
+
+    def __init__(self, status_code, error_code=None):
+        super().__init__(status_code)
+        if error_code is not None:
+            self.error_code = error_code
+
+
+def _lease_held():
+    return _LeaseError(409, "LeaseAlreadyPresent")
+
+
+class _FakeClock:
+    def __init__(self):
+        self.now = 0.0
+        self.sleeps = []
+
+    def monotonic(self):
+        return self.now
+
+    def sleep(self, seconds):
+        assert seconds > 0
+        self.sleeps.append(seconds)
+        self.now += seconds
+
+
+class _Lease:
+    """A lease double.  ``busy(attempt, now)`` says whether somebody else
+    holds the lease at that attempt; ``error`` fails every attempt instead."""
+
+    def __init__(self, clock, *, busy=lambda attempt, now: False, error=None):
+        self.clock = clock
+        self.busy = busy
+        self.error = error
+        self.attempts = []
+        self.durations = []
+        self.releases = 0
+
+    def acquire(self, *, lease_duration):
+        attempt = len(self.attempts)
+        self.attempts.append(self.clock.now)
+        self.durations.append(lease_duration)
+        if self.error is not None:
+            raise self.error
+        if self.busy(attempt, self.clock.now):
+            raise _lease_held()
+
+    def release(self):
+        self.releases += 1
+
+
+def _leased_store():
+    clock = _FakeClock()
+    blobs = _BlobService()
+    table = _Table()
+    store = AzureTenantStore(
+        blobs, _TableService(table), monotonic=clock.monotonic, sleep=clock.sleep
+    )
+    lease = _Lease(clock)
+    store._new_lease = lambda _blob: lease
+    store.apply(NAMESPACE, SCOPE, _batch("b1", 1, "ride-1"))
+    lease.attempts.clear()
+    lease.releases = 0
+    return store, blobs.container, table, clock, lease
+
+
+def test_the_purge_waits_out_a_sync_that_holds_the_scope_lease_briefly():
+    store, container, table, clock, lease = _leased_store()
+    # A sync holds the lease for the next three seconds, then releases it.
+    lease.busy = lambda _attempt, now: now < 3.0
+
+    purge = store.purge_scope(NAMESPACE, SCOPE)
+
+    assert purge.objects == 1 and purge.blobs == 1
+    assert container.blobs == {}
+    assert table.entities == {}
+    assert len(lease.attempts) > 1
+    assert 3.0 <= clock.now < storage_module.PURGE_LEASE_DEADLINE_SECONDS
+    assert lease.releases == 1
+    assert set(lease.durations) == {storage_module.SCOPE_LEASE_SECONDS}
+
+
+def test_the_purge_gives_up_at_the_deadline_having_deleted_nothing():
+    """A lease that is never released: the purge fails at the deadline, as it
+    failed at once before, and it has deleted nothing -- it deletes only
+    under the lease, and it never got the lease."""
+
+    store, container, table, clock, lease = _leased_store()
+    blobs_before = dict(container.blobs)
+    rows_before = {key: dict(value) for key, value in table.entities.items()}
+    lease.busy = lambda _attempt, _now: True
+
+    with pytest.raises(_LeaseError) as raised:
+        store.purge_scope(NAMESPACE, SCOPE)
+
+    assert raised.value.status_code == 409
+    deadline = storage_module.PURGE_LEASE_DEADLINE_SECONDS
+    assert deadline <= 65.0
+    assert clock.now == pytest.approx(deadline)
+    assert sum(clock.sleeps) == pytest.approx(deadline)
+    assert max(clock.sleeps) <= 4.0
+    # The last attempt is made at the deadline, and none after it.
+    assert lease.attempts[-1] == pytest.approx(deadline)
+    assert container.delete_attempts == []
+    assert table.delete_attempts == []
+    assert container.blobs == blobs_before
+    assert table.entities == rows_before
+    assert lease.releases == 0
+
+
+@pytest.mark.parametrize(
+    "error",
+    [
+        _LeaseError(403),
+        _LeaseError(409, "LeaseIdMismatchWithLeaseOperation"),
+        _LeaseError(409),
+        _LeaseError(412, "LeaseAlreadyPresent"),
+        _LeaseError(500, "LeaseAlreadyPresent"),
+        RuntimeError("409 LeaseAlreadyPresent: there is already a lease present"),
+    ],
+    ids=[
+        "403", "409-other-code", "409-no-code", "412-lease-code",
+        "500-lease-code", "message-text-only",
+    ],
+)
+def test_the_purge_does_not_retry_anything_but_a_held_lease(error):
+    store, container, table, clock, lease = _leased_store()
+    lease.error = error
+
+    with pytest.raises(type(error)) as raised:
+        store.purge_scope(NAMESPACE, SCOPE)
+
+    assert raised.value is error
+    assert len(lease.attempts) == 1
+    assert clock.sleeps == []
+    assert container.delete_attempts == []
+    assert table.delete_attempts == []
+
+
+def test_the_sync_writer_and_the_probe_still_fail_fast_on_a_held_lease():
+    """Only the purge waits.  The sync client retries its own batch, and a
+    probe that meets a held lease answers "not now" with nothing deleted."""
+
+    store, _container, _table, clock, lease = _leased_store()
+    lease.busy = lambda _attempt, _now: True
+
+    with pytest.raises(_LeaseError):
+        store.apply(NAMESPACE, SCOPE, _batch("b2", 2, "ride-2"))
+    assert len(lease.attempts) == 1
+
+    assert store.can_purge_scope(NAMESPACE, SCOPE) is False
+    assert len(lease.attempts) == 2
+    assert clock.sleeps == []
+
+
+def test_the_lease_conflict_is_read_from_the_sdks_own_error_shape():
+    """The real Blob SDK path: a 409 lease response run through the SDK's
+    ``process_storage_error`` comes out as ``ResourceExistsError`` with
+    ``status_code`` 409 and ``error_code`` ``LeaseAlreadyPresent``."""
+
+    exceptions = pytest.importorskip("azure.core.exceptions")
+    try:
+        from azure.core.rest import HttpRequest
+        from azure.core.rest._http_response_impl import HttpResponseImpl
+        from azure.storage.blob._shared.response_handlers import (
+            process_storage_error,
+        )
+    except ImportError:  # pragma: no cover - SDK layout changed
+        pytest.skip("Azure Blob SDK internals not available")
+
+    def sdk_error(status, code):
+        response = HttpResponseImpl(
+            request=HttpRequest("PUT", "https://account.invalid/c/b?comp=lease"),
+            internal_response=None,
+            status_code=status,
+            reason="Conflict",
+            content_type="application/xml",
+            headers={"x-ms-error-code": code, "Content-Type": "application/xml"},
+            stream_download_generator=None,
+        )
+        response._content = (
+            f"<?xml version=\"1.0\" encoding=\"utf-8\"?><Error><Code>{code}"
+            "</Code><Message>There is already a lease present.</Message></Error>"
+        ).encode()
+        response._is_closed = True
+        response._is_stream_consumed = True
+        try:
+            process_storage_error(exceptions.ResourceExistsError(response=response))
+        except exceptions.HttpResponseError as exc:
+            return exc
+        raise AssertionError("process_storage_error did not raise")
+
+    held = sdk_error(409, "LeaseAlreadyPresent")
+    assert isinstance(held, exceptions.ResourceExistsError)
+    assert AzureTenantStore._is_lease_conflict(held) is True
+    assert AzureTenantStore._is_lease_conflict(
+        sdk_error(409, "LeaseIdMismatchWithLeaseOperation")
+    ) is False
+
+    store, container, _table, clock, lease = _leased_store()
+    outcomes = [held, held]
+
+    def acquire(*, lease_duration):
+        lease.attempts.append(clock.now)
+        if outcomes:
+            raise outcomes.pop(0)
+
+    lease.acquire = acquire
+    store.purge_scope(NAMESPACE, SCOPE)
+    assert len(lease.attempts) == 3
+    assert container.blobs == {}
+
+
+def test_a_wipe_that_meets_a_sync_holding_the_lease_still_completes():
+    """End to end through the route: the probe gets the lease, a sync takes
+    it before the purge does, and the purge waits it out.  The rider's
+    credentials and data are both gone, and the route says so."""
+
+    deployment = _Deployment()
+    clock = _FakeClock()
+    deployment.store._monotonic = clock.monotonic
+    deployment.store._sleep = clock.sleep
+    lease = _Lease(clock)
+    deployment.store._new_lease = lambda _blob: lease
+    # Attempt 0 is the probe's.  Then a sync holds the lease for two seconds.
+    sync_took_it_at = []
+
+    def busy(attempt, now):
+        if attempt == 1:
+            sync_took_it_at.append(now)
+        return attempt >= 1 and now < sync_took_it_at[0] + 2.0
+
+    lease.busy = busy
+
+    response = deployment.wipe()
+
+    assert response.status_code == 200
+    assert response.json() == {"wiped": True}
+    assert len(lease.attempts) > 2
+    assert deployment.state.credentials.lookup_writer(
+        deployment.writer.credential_id
+    ) is None
+    assert not [
+        name for name in deployment.container.blobs
+        if name.startswith(f"{deployment.partition}/")
+    ]
+    assert not [
+        key for key in deployment.table.entities if key[0] == deployment.partition
+    ]

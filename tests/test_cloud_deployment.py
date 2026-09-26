@@ -707,6 +707,71 @@ def test_the_read_app_revision_waits_for_the_wipe_grants():
     assert "readWipeLockRole" in depends.split()
 
 
+def _account_wipe_rollback():
+    """DEPLOY.md's account-wipe rollback, from its bold lead to the next section."""
+
+    assert DEPLOY_RUNBOOK.count("**Rollback") == 1
+    section = DEPLOY_RUNBOOK.split("**Rollback", 1)[1]
+    for end in ("\nHave an Azure subscription", "\n## ", "\n### "):
+        section = section.split(end, 1)[0]
+    return section
+
+
+def test_the_account_wipe_rollback_deletes_the_grants_explicitly():
+    """Review round 2: a redeploy with the switch off does not revoke anything.
+
+    ``deploy_cloud.py`` deploys in Incremental mode, where a conditional
+    resource whose condition turns false is skipped, never deleted.  The
+    rollback used to claim the redeploy removed the read identity's wipe
+    assignments; it removes only the route flag.  Pin the doc to the explicit
+    delete, naming every role the read identity is assigned under the switch.
+    """
+
+    deploy_script = (ROOT / "scripts" / "deploy_cloud.py").read_text()
+    assert "--mode" not in deploy_script  # still ARM's default: Incremental
+
+    rollback = _account_wipe_rollback()
+    assert "az role assignment delete" in rollback
+    assert "az role assignment list --assignee" in rollback
+    assert "--all" in rollback
+    read_name = re.search(r"(?m)^var readName = '([^']+)'$", BICEP).group(1)
+    identity = re.search(
+        r"name: '\$\{readName\}(-[^']*)'", _resource_block("readIdentity")
+    ).group(1)
+    assert f"az identity show -n {read_name}{identity} " in rollback
+    assert "--query principalId -o tsv" in rollback
+    role_names = set()
+    for _scope, role in _READ_WIPE_ASSIGNMENTS.values():
+        definition = _resource_block(role.removesuffix(".id"))
+        role_names.add(re.search(r"roleName: '([^']+)'", definition).group(1))
+    assert role_names == {
+        "Wattracker Operator Scope Wipe Blob",
+        "Wattracker Operator Scope Wipe Table",
+        "Wattracker Scope Wipe Lock",
+    }
+    for role_name in role_names:
+        assert f"roleDefinitionName=='{role_name}'" in rollback, role_name
+    assert "must print nothing" in rollback
+    assert "Incremental" in rollback
+    # The false claim cannot come back.
+    flat = " ".join(DEPLOY_RUNBOOK.split())
+    assert "That removes the read identity's wipe assignments" not in flat
+    # And the template says the same thing where the switch is.
+    param_comment = BICEP.split("param enableAccountWipe bool", 1)[0].rsplit(
+        "param operatorWipePrincipalId", 1
+    )[1]
+    assert "does NOT revoke" in param_comment
+    assert "infra/azure/DEPLOY.md" in param_comment
+
+
+def test_the_docs_count_the_read_identitys_wipe_assignments_right():
+    assert len(_READ_WIPE_ASSIGNMENTS) == 4
+    for text in (DEPLOY_RUNBOOK, RUNBOOK):
+        flat = " ".join(text.split())
+        assert "three role assignments" not in flat
+        assert "three wipe role assignments" not in flat
+
+
 def _string_like(pattern):
     """ABAC ``StringLike`` as a regex: case-sensitive, ``*`` any run, ``?`` one.
 

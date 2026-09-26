@@ -12,10 +12,11 @@ import json
 import re
 import secrets
 import threading
+import time
 from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
-from typing import Final, Iterable, Optional, Sequence
+from typing import Callable, Final, Iterable, Optional, Sequence
 
 from .models import MAX_PAYLOAD_BYTES, CloudObject, SyncBatch
 
@@ -57,6 +58,24 @@ WIPE_PROBE_ROW_PREFIX: Final = "wipe-probe:"
 
 def _wipe_probe_token() -> str:
     return secrets.token_hex(16)
+
+
+#: The scope lease's duration.  Every holder -- the sync writers, the probe and
+#: the purge -- takes it for this long, and a holder that dies without
+#: releasing it loses it when it expires.
+SCOPE_LEASE_SECONDS: Final = 60
+#: How long :meth:`AzureTenantStore.purge_scope` keeps asking for a scope lease
+#: somebody else holds (#170).  The purge runs *after* the wipe has deleted the
+#: rider's credentials, so giving up at the first conflict would strand the
+#: data with nobody able to ask again.  One full lease plus a margin outlasts
+#: any single sync write, and even a writer that died holding the lease.  It
+#: is a bound, not a hope: past it the purge raises exactly as it did before.
+PURGE_LEASE_DEADLINE_SECONDS: Final = SCOPE_LEASE_SECONDS + 5.0
+_PURGE_LEASE_FIRST_BACKOFF_SECONDS: Final = 0.25
+_PURGE_LEASE_MAX_BACKOFF_SECONDS: Final = 4.0
+#: The Blob service's ``x-ms-error-code`` for "this blob already has an active
+#: lease" (a 409).  The SDK carries it as ``error_code`` on the exception.
+_LEASE_ALREADY_PRESENT: Final = "LeaseAlreadyPresent"
 
 
 class StorageConflict(RuntimeError):
@@ -454,7 +473,13 @@ class AzureTenantStore:
         container_name: str = "wattracker-objects",
         table_name: str = "CloudObjects",
         ensure_resources: bool = False,
+        monotonic: Callable[[], float] = time.monotonic,
+        sleep: Callable[[float], None] = time.sleep,
     ) -> None:
+        # ``monotonic`` and ``sleep`` pace only the purge's wait for a held
+        # scope lease; tests inject a fake pair so that wait costs no time.
+        self._monotonic = monotonic
+        self._sleep = sleep
         self._blob_service = blob_service
         self._table_service = table_service
         self._container = blob_service.get_container_client(container_name)
@@ -573,6 +598,21 @@ class AzureTenantStore:
         return AzureTenantStore._http_status(exc) == 404
 
     @staticmethod
+    def _is_lease_conflict(exc: Exception) -> bool:
+        """True only for "another holder has this blob's lease right now".
+
+        Structured, as :meth:`_is_conflict` is: a 409 whose service error code
+        (the ``x-ms-error-code`` header, which the SDK exposes as
+        ``error_code``) is ``LeaseAlreadyPresent``.  Both are required.  A 409
+        with any other code, a 409 with no code, a 403, and anything without
+        a structured status are not a held lease, and waiting would not help.
+        """
+        if AzureTenantStore._http_status(exc) != 409:
+            return False
+        code = getattr(exc, "error_code", None)
+        return isinstance(code, str) and code == _LEASE_ALREADY_PRESENT
+
+    @staticmethod
     def _partition(namespace: str, local_user_scope: str) -> str:
         if not isinstance(namespace, str) or not re.fullmatch(r"[0-9a-f]{64}", namespace):
             raise ValueError("namespace is invalid")
@@ -634,14 +674,65 @@ class AzureTenantStore:
                 return None
             raise
 
+    def _new_lease(self, lock_blob: object) -> object | None:
+        """The SDK lease client for ``lock_blob``, or ``None`` for a double.
+
+        Tests replace this to exercise :meth:`_scope_lock`'s lease handling
+        with a lease double.
+        """
+        try:
+            from azure.storage.blob import BlobLeaseClient
+        except ImportError:
+            # Injected test doubles do not need an Azure lease implementation.
+            return None
+        if not (
+            hasattr(lock_blob, "blob_name") or hasattr(lock_blob, "container_name")
+        ):
+            # A storage-protocol test double is intentionally not an SDK
+            # BlobClient. Real Azure clients expose one of these coordinates.
+            return None
+        return BlobLeaseClient(lock_blob)
+
+    def _acquire_lease_waiting(self, lease: object) -> None:
+        """Acquire ``lease``, waiting out a holder for a bounded time.
+
+        Only :meth:`purge_scope` asks for this.  A lease conflict
+        (:meth:`_is_lease_conflict`) backs off -- a quarter second, doubling,
+        capped at four -- and asks again until
+        :data:`PURGE_LEASE_DEADLINE_SECONDS` have passed; the last sleep is
+        trimmed to the deadline, and one final attempt is made there.  Any
+        other error raises at once, and so does a conflict at the deadline.
+        """
+        deadline = self._monotonic() + PURGE_LEASE_DEADLINE_SECONDS
+        delay = _PURGE_LEASE_FIRST_BACKOFF_SECONDS
+        while True:
+            try:
+                lease.acquire(lease_duration=SCOPE_LEASE_SECONDS)
+                return
+            except Exception as exc:
+                if not self._is_lease_conflict(exc):
+                    raise
+                remaining = deadline - self._monotonic()
+                if remaining <= 0:
+                    raise
+            self._sleep(min(delay, remaining))
+            delay = min(delay * 2, _PURGE_LEASE_MAX_BACKOFF_SECONDS)
+
     @contextmanager
-    def _scope_lock(self, partition: str):
+    def _scope_lock(self, partition: str, *, wait_for_lease: bool = False):
         """Serialize a scope across replicas with a short Blob lease.
 
         The sync app is configured with one replica, but the lease also keeps
         retries and a future scale-out from racing the revision/idempotency
         checks.  A pending marker remains recoverable if a process dies after
         a blob write and before the marker is committed.
+
+        By default a held lease fails the caller at once, which is what the
+        sync writers and the wipe probe want: the sync client retries a
+        failed batch, and a probe that meets a held lease answers "not now"
+        with nothing deleted.  ``wait_for_lease`` is for :meth:`purge_scope`
+        alone, which runs after the rider's credentials are gone and so has
+        no caller left to retry it (see :meth:`_acquire_lease_waiting`).
         """
         lock_blob = self._container.get_blob_client(self._lock_blob_name(partition))
         try:
@@ -649,21 +740,14 @@ class AzureTenantStore:
         except Exception as exc:
             if not self._is_conflict(exc):
                 raise
-        try:
-            from azure.storage.blob import BlobLeaseClient
-        except ImportError:
-            # Injected test doubles do not need an Azure lease implementation.
+        lease = self._new_lease(lock_blob)
+        if lease is None:
             yield
             return
-        if not (
-            hasattr(lock_blob, "blob_name") or hasattr(lock_blob, "container_name")
-        ):
-            # A storage-protocol test double is intentionally not an SDK
-            # BlobClient. Real Azure clients expose one of these coordinates.
-            yield
-            return
-        lease = BlobLeaseClient(lock_blob)
-        lease.acquire(lease_duration=60)
+        if wait_for_lease:
+            self._acquire_lease_waiting(lease)
+        else:
+            lease.acquire(lease_duration=SCOPE_LEASE_SECONDS)
         try:
             yield
         finally:
@@ -1035,7 +1119,10 @@ class AzureTenantStore:
         prefix = f"{partition}/"
         lock_name = self._lock_blob_name(partition)
         objects = blobs = markers = skipped = orphans = 0
-        with self._scope_lock(partition):
+        # Wait out a sync that holds the lease right now: the wipe deleted the
+        # rider's credentials before calling this, so a purge that gave up at
+        # the first conflict would strand the data with no way to ask again.
+        with self._scope_lock(partition, wait_for_lease=True):
             entities = list(self._table.query_entities(
                 query_filter=f"PartitionKey eq '{partition}'"
             ))
