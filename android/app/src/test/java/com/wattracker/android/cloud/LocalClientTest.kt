@@ -8,6 +8,10 @@ import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Assert.fail
 import org.junit.Test
+import java.io.BufferedReader
+import java.io.InputStreamReader
+import java.net.InetAddress
+import java.net.ServerSocket
 
 class LocalClientTest {
 
@@ -184,6 +188,7 @@ class LocalClientTest {
             assertTrue(revokedCalled)
             assertNull(client.cached(CloudRoute.Profile))
             assertFalse(client.isPaired)
+            assertEquals(CloudSession.DeviceState.removed, client.deviceState)
         }
     }
 
@@ -405,6 +410,119 @@ class LocalClientTest {
             assertTrue(revokedCalled)
             assertNull(client.cached(CloudRoute.Dashboard))
             assertFalse(client.isPaired)
+            assertEquals(CloudSession.DeviceState.removed, client.deviceState)
         }
+    }
+
+    @Test
+    fun httpLocalTransportDoesNotFollowRedirects() = runTest {
+        val serverSocket = ServerSocket(0, 1, InetAddress.getByName("127.0.0.1"))
+        val port = serverSocket.localPort
+        val thread = Thread {
+            try {
+                val socket = serverSocket.accept()
+                val reader = BufferedReader(InputStreamReader(socket.getInputStream()))
+                while (reader.readLine()?.isEmpty() == false) {}
+                val out = socket.getOutputStream()
+                out.write("HTTP/1.1 307 Temporary Redirect\r\nLocation: http://127.0.0.1:9999/other\r\nContent-Length: 0\r\n\r\n".toByteArray(Charsets.UTF_8))
+                out.flush()
+                socket.close()
+            } catch (_: Exception) {}
+        }
+        thread.start()
+
+        try {
+            val transport = HttpLocalTransport()
+            val response = transport.send(LocalRequest("GET", "http://127.0.0.1:$port/redirect"))
+            assertEquals(307, response.status)
+            assertEquals("http://127.0.0.1:9999/other", response.location)
+        } finally {
+            serverSocket.close()
+            thread.join()
+        }
+    }
+
+    @Test
+    fun authenticateRejectsRedirectToExternalOrigin() = runTest {
+        val transport = FakeLocalTransport().apply {
+            redeemResponse = LocalResponse(
+                status = 303,
+                body = ByteArray(0),
+                url = "http://10.0.2.2:8000/connector/session?token=test-ticket-123",
+                headers = mapOf(
+                    "Set-Cookie" to listOf("session=test-cookie"),
+                    "Location" to listOf("https://evil.com/"),
+                ),
+            )
+        }
+        val creds = LocalCredentials("http://10.0.2.2:8000", "token")
+        val client = LocalClient(credentialsProvider = { creds }, transport = transport, isDebug = true)
+
+        try {
+            client.authenticate()
+            fail("Expected UnexpectedLanding for external origin")
+        } catch (_: LocalClientException.UnexpectedLanding) {
+            // expected
+        }
+    }
+
+    @Test
+    fun revokedLocalClientSurfacesDeviceStateRemoved() = runTest {
+        val creds = LocalCredentials("http://10.0.2.2:8000", "token")
+        val client = LocalClient(credentialsProvider = { creds }, isDebug = true)
+
+        assertEquals(CloudSession.DeviceState.paired, client.deviceState)
+        client.markRemoved()
+        assertEquals(CloudSession.DeviceState.removed, client.deviceState)
+    }
+
+    @Test
+    fun rePairingDuringInFlightReadDoesNotSendNewServerCookieToOldServer() = runTest {
+        var revokedCalled = false
+        var currentCreds: LocalCredentials? = LocalCredentials("http://10.0.2.2:8000", "server-a-token")
+        val requests = mutableListOf<LocalRequest>()
+
+        val transport = object : LocalTransport {
+            override suspend fun send(request: LocalRequest): LocalResponse {
+                requests.add(request)
+                if (request.url.contains("10.0.2.2:8000")) {
+                    // Simulate re-pairing happening while read on Server A is in flight
+                    currentCreds = LocalCredentials("http://10.0.2.2:9000", "server-b-token")
+                    return LocalResponse(status = 401, body = ByteArray(0), url = request.url)
+                }
+                if (request.url.contains("10.0.2.2:9000/api/connector/session")) {
+                    return LocalResponse(status = 200, body = "{\"ticket\": \"b-ticket\"}".toByteArray(Charsets.UTF_8), url = request.url)
+                }
+                if (request.url.contains("10.0.2.2:9000/connector/session")) {
+                    return LocalResponse(status = 303, body = ByteArray(0), url = request.url, headers = mapOf("Set-Cookie" to listOf("session=server-b-cookie"), "Location" to listOf("/")))
+                }
+                return LocalResponse(status = 200, body = "{}".toByteArray(Charsets.UTF_8), url = request.url)
+            }
+        }
+
+        val client = LocalClient(
+            credentialsProvider = { currentCreds },
+            onRevoked = { revokedCalled = true },
+            transport = transport,
+            isDebug = true,
+        )
+
+        // Authenticate against Server A
+        client.setSessionCookieForTesting("session=server-a-cookie", "http://10.0.2.2:8000")
+
+        // In-flight read on Server A is triggered
+        try {
+            client.load(CloudRoute.Profile)
+            fail("Expected Unauthorized for Server A read")
+        } catch (_: LocalClientException.Unauthorized) {
+            // Must NOT wipe Server B's credentials!
+            assertFalse(revokedCalled)
+            assertEquals(CloudSession.DeviceState.paired, client.deviceState)
+            assertEquals("server-b-token", client.credentials?.token)
+        }
+
+        // None of the requests sent to Server A contained Server B's cookie
+        val serverARequests = requests.filter { it.url.contains("10.0.2.2:8000") }
+        assertTrue(serverARequests.none { it.headers["Cookie"] == "session=server-b-cookie" })
     }
 }

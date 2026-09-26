@@ -19,6 +19,9 @@ data class LocalCredentials(
     val username: String? = null,
     val pairedAtMillis: Long = System.currentTimeMillis(),
 ) {
+    override fun toString(): String =
+        "LocalCredentials(serverUrl=$serverUrl, token=<redacted>, username=$username, pairedAtMillis=$pairedAtMillis)"
+
     companion object
 }
 
@@ -37,6 +40,12 @@ sealed class LocalClientException(message: String) : Exception(message) {
         LocalClientException("Malformed response from $path")
 }
 
+private data class ActiveSession(
+    val cookie: String,
+    val originUrl: String,
+    val token: String,
+)
+
 /**
  * Client for the rider's local desktop server reached via the connector protocol over HTTPS.
  *
@@ -51,7 +60,8 @@ class LocalClient(
     private val clock: () -> Long = { System.currentTimeMillis() },
 ) : ReadSession {
 
-    @Volatile private var sessionCookie: String? = null
+    @Volatile private var activeSession: ActiveSession? = null
+    @Volatile private var isRevoked: Boolean = false
     @Volatile private var lastSuccessfulRead: Long? = null
     @Volatile private var cachedState: CloudSnapshot? = null
 
@@ -59,7 +69,11 @@ class LocalClient(
         get() = credentialsProvider()
 
     override val deviceState: CloudSession.DeviceState
-        get() = if (credentials != null) CloudSession.DeviceState.paired else CloudSession.DeviceState.unpaired
+        get() = when {
+            isRevoked -> CloudSession.DeviceState.removed
+            credentials != null -> CloudSession.DeviceState.paired
+            else -> CloudSession.DeviceState.unpaired
+        }
 
     override val isPaired: Boolean
         get() = credentials != null
@@ -68,13 +82,23 @@ class LocalClient(
         get() = lastSuccessfulRead
 
     fun reset() {
-        sessionCookie = null
+        activeSession = null
         cachedState = null
         lastSuccessfulRead = null
     }
 
-    internal fun setSessionCookieForTesting(cookie: String?) {
-        sessionCookie = cookie
+    fun markRemoved() {
+        isRevoked = true
+        reset()
+    }
+
+    internal fun setSessionCookieForTesting(cookie: String?, originUrl: String? = null) {
+        activeSession = if (cookie != null) {
+            val cred = credentials
+            val url = originUrl ?: cred?.let { runCatching { validateServerUrl(it.serverUrl, isDebug) }.getOrNull() } ?: ""
+            val tok = cred?.token ?: ""
+            ActiveSession(cookie, url, tok)
+        } else null
     }
 
     override suspend fun cached(route: CloudRoute): CloudSnapshot? {
@@ -138,7 +162,8 @@ class LocalClient(
         }
 
         val cookieValue = setCookieHeader.substringBefore(";").trim()
-        sessionCookie = cookieValue
+        activeSession = ActiveSession(cookieValue, validUrl, token)
+        isRevoked = false
 
         return cookieValue
     }
@@ -148,13 +173,13 @@ class LocalClient(
         val validUrl = validateServerUrl(cred.serverUrl, isDebug)
 
         val items = when (route) {
-            CloudRoute.Dashboard -> loadDashboard(validUrl)
-            CloudRoute.Volume -> loadVolume(validUrl)
-            CloudRoute.Curve -> loadCurve(validUrl)
-            CloudRoute.Profile -> loadProfile(validUrl)
-            CloudRoute.Activities -> loadActivities(validUrl)
-            CloudRoute.Calendar -> loadCalendar(validUrl)
-            CloudRoute.Races -> loadRaces(validUrl)
+            CloudRoute.Dashboard -> loadDashboard(cred, validUrl)
+            CloudRoute.Volume -> loadVolume(cred, validUrl)
+            CloudRoute.Curve -> loadCurve(cred, validUrl)
+            CloudRoute.Profile -> loadProfile(cred, validUrl)
+            CloudRoute.Activities -> loadActivities(cred, validUrl)
+            CloudRoute.Calendar -> loadCalendar(cred, validUrl)
+            CloudRoute.Races -> loadRaces(cred, validUrl)
         }
 
         lastSuccessfulRead = clock()
@@ -172,14 +197,14 @@ class LocalClient(
     override suspend fun activityDetail(activityId: Int): ActivityDetail {
         val cred = requireCredentials()
         val validUrl = validateServerUrl(cred.serverUrl, isDebug)
-        val json = getJson(validUrl, "/api/activity/$activityId")
+        val json = getJson(cred, validUrl, "/api/activity/$activityId")
         return ActivityDetail.fromJson(json)
     }
 
     override suspend fun activityStreams(activityId: Int): ActivityStreams {
         val cred = requireCredentials()
         val validUrl = validateServerUrl(cred.serverUrl, isDebug)
-        val json = getJson(validUrl, "/api/activity/$activityId")
+        val json = getJson(cred, validUrl, "/api/activity/$activityId")
         val streamsObj = (json.opt("streams") as? JsonValue.Object)
             ?: ((json.opt("data") as? JsonValue.Object)?.opt("streams") as? JsonValue.Object)
             ?: (json as? JsonValue.Object)
@@ -202,13 +227,13 @@ class LocalClient(
         )
     }
 
-    private suspend fun loadDashboard(baseUrl: String): List<CloudItem> {
+    private suspend fun loadDashboard(cred: LocalCredentials, baseUrl: String): List<CloudItem> {
         val items = mutableListOf<CloudItem>()
         var successCount = 0
         var lastError: Throwable? = null
 
         try {
-            val stateJson = getJson(baseUrl, "/api/state")
+            val stateJson = getJson(cred, baseUrl, "/api/state")
             val trainingState = TrainingState.fromJson(stateJson)
             items.add(CloudItem("training-state", CloudKind.TrainingState, 1, deleted = false, payload = CloudPayload.TrainingState(trainingState)))
             successCount++
@@ -218,7 +243,7 @@ class LocalClient(
         }
 
         try {
-            val loadJson = getJson(baseUrl, "/api/load", mapOf("months" to "3"))
+            val loadJson = getJson(cred, baseUrl, "/api/load", mapOf("months" to "3"))
             if (loadJson is JsonValue.Array) {
                 loadJson.values.forEachIndexed { idx, elem ->
                     if (elem is JsonValue.Object) {
@@ -234,7 +259,7 @@ class LocalClient(
         }
 
         try {
-            val curveJson = getJson(baseUrl, "/api/curve")
+            val curveJson = getJson(cred, baseUrl, "/api/curve")
             val curve = PowerCurve.fromJson(curveJson)
             items.add(CloudItem("power-curve", CloudKind.Curve, 1, deleted = false, payload = CloudPayload.Curve(curve)))
             successCount++
@@ -244,7 +269,7 @@ class LocalClient(
         }
 
         try {
-            val activitiesJson = getJson(baseUrl, "/api/activities")
+            val activitiesJson = getJson(cred, baseUrl, "/api/activities")
             if (activitiesJson is JsonValue.Array) {
                 activitiesJson.values.take(5).forEachIndexed { idx, elem ->
                     if (elem is JsonValue.Object) {
@@ -266,8 +291,8 @@ class LocalClient(
         return items
     }
 
-    private suspend fun loadVolume(baseUrl: String): List<CloudItem> {
-        val json = getJson(baseUrl, "/api/volume")
+    private suspend fun loadVolume(cred: LocalCredentials, baseUrl: String): List<CloudItem> {
+        val json = getJson(cred, baseUrl, "/api/volume")
         val weeksArr = json.optArray("weeks") ?: (json as? JsonValue.Array)?.values ?: return emptyList()
         return weeksArr.mapIndexedNotNull { idx, elem ->
             (elem as? JsonValue.Object)?.let { obj ->
@@ -277,20 +302,20 @@ class LocalClient(
         }
     }
 
-    private suspend fun loadCurve(baseUrl: String): List<CloudItem> {
-        val json = getJson(baseUrl, "/api/curve")
+    private suspend fun loadCurve(cred: LocalCredentials, baseUrl: String): List<CloudItem> {
+        val json = getJson(cred, baseUrl, "/api/curve")
         val curve = PowerCurve.fromJson(json)
         return listOf(CloudItem("power-curve", CloudKind.Curve, 1, deleted = false, payload = CloudPayload.Curve(curve)))
     }
 
-    private suspend fun loadProfile(baseUrl: String): List<CloudItem> {
-        val json = getJson(baseUrl, "/api/state")
+    private suspend fun loadProfile(cred: LocalCredentials, baseUrl: String): List<CloudItem> {
+        val json = getJson(cred, baseUrl, "/api/state")
         val profile = RiderProfile.fromJson(json)
         return listOf(CloudItem("rider-profile", CloudKind.Profile, 1, deleted = false, payload = CloudPayload.Profile(profile)))
     }
 
-    private suspend fun loadActivities(baseUrl: String): List<CloudItem> {
-        val json = getJson(baseUrl, "/api/activities")
+    private suspend fun loadActivities(cred: LocalCredentials, baseUrl: String): List<CloudItem> {
+        val json = getJson(cred, baseUrl, "/api/activities")
         val itemsArr = (json as? JsonValue.Array)?.values ?: json.optArray("activities") ?: return emptyList()
         return itemsArr.mapIndexedNotNull { idx, elem ->
             (elem as? JsonValue.Object)?.let { obj ->
@@ -300,11 +325,11 @@ class LocalClient(
         }
     }
 
-    private suspend fun loadCalendar(baseUrl: String): List<CloudItem> {
+    private suspend fun loadCalendar(cred: LocalCredentials, baseUrl: String): List<CloudItem> {
         val cal = Calendar.getInstance(TimeZone.getDefault())
         val year = cal.get(Calendar.YEAR)
         val month = cal.get(Calendar.MONTH) + 1
-        val json = getJson(baseUrl, "/api/calendar", mapOf("year" to year.toString(), "month" to month.toString()))
+        val json = getJson(cred, baseUrl, "/api/calendar", mapOf("year" to year.toString(), "month" to month.toString()))
         val weeksArr = json.optArray("weeks") ?: return emptyList()
         val days = mutableListOf<CloudItem>()
         var dayIdx = 0
@@ -319,36 +344,57 @@ class LocalClient(
         return days
     }
 
-    private suspend fun loadRaces(baseUrl: String): List<CloudItem> {
-        val calDays = loadCalendar(baseUrl)
+    private suspend fun loadRaces(cred: LocalCredentials, baseUrl: String): List<CloudItem> {
+        val calDays = loadCalendar(cred, baseUrl)
         return calDays.filter { item ->
             val cd = (item.payload as? CloudPayload.CalendarDay)?.value
             cd?.race != null
         }
     }
 
-    private suspend fun getJson(baseUrl: String, path: String, params: Map<String, String> = emptyMap()): JsonValue {
+    private suspend fun getJson(
+        cred: LocalCredentials,
+        baseUrl: String,
+        path: String,
+        params: Map<String, String> = emptyMap(),
+    ): JsonValue {
+        val currentSession = activeSession
         val cookie = try {
-            sessionCookie ?: authenticate()
+            if (currentSession != null && currentSession.originUrl == baseUrl && currentSession.token == cred.token) {
+                currentSession.cookie
+            } else {
+                authenticate(cred)
+            }
         } catch (e: LocalClientException.Unauthorized) {
-            reset()
-            onRevoked()
+            handleRevocation(cred, baseUrl)
             throw e
         }
         return try {
             sendJsonWithCookie(baseUrl, path, cookie, params)
         } catch (_: LocalClientException.Unauthorized) {
             // Re-authenticate once on 401 or session redirect to /login
-            sessionCookie = null
+            activeSession = null
             val newCookie = try {
-                authenticate()
+                authenticate(cred)
             } catch (e: LocalClientException.Unauthorized) {
-                reset()
-                onRevoked()
+                handleRevocation(cred, baseUrl)
                 throw e
             }
             sendJsonWithCookie(baseUrl, path, newCookie, params)
         }
+    }
+
+    private fun handleRevocation(attemptedCred: LocalCredentials?, attemptedBaseUrl: String) {
+        val currentCred = credentials
+        if (currentCred != null && attemptedCred != null) {
+            val currentUrl = runCatching { validateServerUrl(currentCred.serverUrl, isDebug) }.getOrNull()
+            if (currentUrl != attemptedBaseUrl || currentCred.token != attemptedCred.token) {
+                // Credentials changed while this request was in flight. Do NOT wipe new credentials.
+                return
+            }
+        }
+        markRemoved()
+        onRevoked()
     }
 
     private suspend fun sendJsonWithCookie(
@@ -375,12 +421,12 @@ class LocalClient(
         // Detect session expiration / redirect to login (/login or /welcome)
         val loc = resp.location
         if (loc != null && (loc.contains("/login") || loc.contains("/welcome"))) {
-            sessionCookie = null
+            activeSession = null
             throw LocalClientException.Unauthorized()
         }
 
         if (resp.status == 401) {
-            sessionCookie = null
+            activeSession = null
             throw LocalClientException.Unauthorized()
         }
         if (resp.status !in 200..299) {

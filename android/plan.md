@@ -5,9 +5,18 @@ extra targets: Android 11+, dual-server support (cloud **and** local), offline
 cache. Kotlin + Jetpack Compose, single app under `android/`.
 
 **Resume point — Step 2 (#194) merged via PR #304. Step 3 (#195) — Cloud & Local Pairing and Settings — is implemented on `feature/android-client-3`.**
+PR #376 review findings addressed:
+1. **Blocker 1 — Redact secrets in `.toString()`**: Overrode `toString()` on `LocalCredentials`, `LocalRequest`, and `LocalResponse` to redact `token`, `Authorization`, `Cookie`, and `Set-Cookie` headers, as well as `token=` URL query parameters. Extended `bearerSecretsDoNotAppearInToString` test coverage.
+2. **Blocker 2 — Secure Token Input in Settings UI**: Updated connector token field in `SettingsScreen.kt` with `KeyboardType.Password`, `autoCorrectEnabled = false`, and `PasswordVisualTransformation()`.
+3. **Nit 3 — Origin-tied cookies & Stale revocation protection**: `LocalClient` holds `ActiveSession(cookie, originUrl, token)` atomically and passes request-scoped credentials through `getJson` and `authenticate(cred)`. Pinned with unit test `rePairingDuringInFlightReadDoesNotSendNewServerCookieToOldServer`.
+4. **Nit 4 — Revoked local device state**: `LocalClient.deviceState` returns `CloudSession.DeviceState.removed` upon revocation or refusal. Unit tests verify `DeviceState.removed`.
+5. **Nit 5 — Unpinned redirect & same-origin tests**: Added `HttpLocalTransport` unit test verifying `instanceFollowRedirects = false` and `authenticate()` unit test verifying external redirect rejection.
+6. **Nit 6 — Cloud remove 404 fallback**: Moved 404 fallback into `CloudSession.removeDevice()`, returning `RemoveDeviceResult.LocalFallback` on 404 while throwing `Failure.Server` / `Failure.Offline` on 401/5xx/offline to preserve local pairing. Pinned by unit tests for 200, 404, 500, and offline.
+7. **Nit 7 — Plan & Issue alignment**: Updated `plan.md` (e.g., token revocation returns `removed` state; uniform oracle-prevention message for pairing failures matching security spec).
+
 Review findings addressed; known gaps listed below:
-1. **Cloud revocation 404 fallback**: `removeCloudDevice()` falls back to local `signOut()` on 404/DeviceRemoved and reports local fallback notice; offline/throttled errors do not clear credentials.
-2. **Local session expiration & revocation**: `LocalClient` detects 3xx redirects to `/login`, clears session cookie, and re-mints once. Token revocation returns 401 / unauthenticated state, clears stored local credentials, and resets in-memory session state.
+1. **Cloud revocation 404 fallback**: `CloudSession.removeDevice()` returns `RemoveDeviceResult.LocalFallback` on 404/DeviceRemoved; 401/5xx/offline errors do not clear credentials.
+2. **Local session expiration & revocation**: `LocalClient` detects 3xx redirects to `/login`, clears session cookie, and re-mints once. Token revocation returns 401 / removed state, clears stored local credentials, and resets in-memory session state.
 3. **Async safety**: All `scope.launch` blocks in `SettingsScreen.kt` wrap calls in `try-catch`.
 4. **Local dashboard errors**: `loadDashboard()` propagates errors if all fetches fail; `lastSuccessfulRead` advances when at least one fetch succeeds (see 11).
 5. **Local URL validation**: Rejects HTTP in release builds with reverse-proxy guidance message pointing to README.md.

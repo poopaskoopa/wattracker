@@ -126,15 +126,6 @@ object WatTrackerApp {
         val s = session ?: error("session unavailable")
         try {
             s.removeDevice()
-            RemoveDeviceResult.ServerRevoked
-        } catch (e: CloudSession.Failure.Server) {
-            if (e.status == 404) {
-                // On 404, the pairing is already gone on the server: fall back to a local clear.
-                s.signOut()
-                RemoveDeviceResult.LocalFallback
-            } else {
-                throw e
-            }
         } catch (e: CloudSession.Failure.DeviceRemoved) {
             s.signOut()
             RemoveDeviceResult.LocalFallback

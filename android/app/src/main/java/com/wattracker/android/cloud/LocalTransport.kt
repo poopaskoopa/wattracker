@@ -7,12 +7,26 @@ import java.net.URL
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 
+internal fun sanitizeUrl(url: String): String {
+    return url.replace(Regex("(?i)([?&]token=)[^&]*"), "$1<redacted>")
+}
+
 data class LocalRequest(
     val method: String,
     val url: String,
     val headers: Map<String, String> = emptyMap(),
     val body: ByteArray = ByteArray(0),
-)
+) {
+    override fun toString(): String =
+        "LocalRequest(method=$method, url=${sanitizeUrl(url)}, headers={${headerSummary()}}, body=${body.size}B)"
+
+    private fun headerSummary(): String =
+        headers.entries.joinToString(", ") { (name, value) ->
+            val isSensitive = name.equals("Authorization", ignoreCase = true) ||
+                name.equals("Cookie", ignoreCase = true)
+            "$name=${if (isSensitive) "<redacted>" else value}"
+        }
+}
 
 data class LocalResponse(
     val status: Int,
@@ -32,6 +46,18 @@ data class LocalResponse(
     private fun header(name: String): String? {
         return headers.entries.firstOrNull { it.key.equals(name, ignoreCase = true) }?.value?.firstOrNull()
     }
+
+    override fun toString(): String =
+        "LocalResponse(status=$status, body=${body.size}B, url=${sanitizeUrl(url)}, headers={${headerSummary()}})"
+
+    private fun headerSummary(): String =
+        headers.entries.joinToString(", ") { (name, values) ->
+            val isSensitive = name.equals("Set-Cookie", ignoreCase = true) ||
+                name.equals("Cookie", ignoreCase = true) ||
+                name.equals("Authorization", ignoreCase = true)
+            val valStr = if (isSensitive) "[<redacted>]" else values.toString()
+            "$name=$valStr"
+        }
 }
 
 interface LocalTransport {
