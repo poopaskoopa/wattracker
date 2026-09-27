@@ -187,7 +187,18 @@ states on `main` when the PR is merge-committed. Four such commits are on
 `main` from #358 and #356 (`a04e344`, `95a6bb2`, `8d1a582`, `892b345`); if
 `git bisect` lands on one, `git bisect skip` it.
 
-1. **#249: rotating full-suite test flakes. Still not a local-runs job.**
+1. **#394: the desktop must use separate read and sync endpoints.** The
+   deployment runs read and sync as separate apps, but the desktop stores one
+   endpoint and sends everything there, so no desktop can both enrol (read) and
+   sync (sync). This blocks the first real enrolment. The fix is client-side:
+   store `read_endpoint` and `sync_endpoint` (a schema change, so serialize per
+   the section above), route `/api/v1/sync/*` to sync and everything else to
+   read, add two settings fields, and have `admin invite` print both. Do NOT
+   merge the planes. The key test runs `plane="read"` and `plane="sync"` as
+   separate apps end to end. Credential handling is unchanged, but it needs a
+   security review before merge.
+
+2. **#249: rotating full-suite test flakes. Still not a local-runs job.**
    Nothing has changed since the re-scope. 21 consecutive clean local full
    suites stand against zero reproductions. Both known instances came from
    **taksmon's machine**. **The next step is taksmon's log and his exact
@@ -198,7 +209,7 @@ states on `main` when the PR is merge-committed. Four such commits are on
 its PR number. Dropping it while it is in flight makes it invisible if the PR is
 closed or abandoned.
 
-**The queue is empty of unblocked work.** #249 stays skipped pending
+**When item 1 is done, the queue is empty.** #249 stays skipped pending
 taksmon's log and invocation. Do not pick up unlabelled issues or anything
 below on your own. Say the queue ran out rather than inventing scope.
 
