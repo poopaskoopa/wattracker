@@ -926,3 +926,16 @@ def test_the_sync_identity_roles_are_unchanged():
     }
     for name in sync:
         assert "condition" not in _resource_block(name), name
+
+
+def test_custom_role_names_and_descriptions_contain_no_angle_brackets():
+    """Azure rejects a role definition whose name or description looks like HTML.
+
+    ``RoleDefinitionCannotContainHtmlTags`` is only raised when the role is
+    written, so ``bicep build`` and ``validate`` both pass and the deployment
+    fails at ``create`` (it happened on 2026-09-27 with a
+    ``<namespace>:<scope>`` placeholder in a description).
+    """
+    for match in re.finditer(r"^\s*(roleName|description):\s*'([^']*)'", BICEP, re.MULTILINE):
+        field, text = match.groups()
+        assert "<" not in text and ">" not in text, f"{field} has angle brackets: {text!r}"
