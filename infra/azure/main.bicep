@@ -569,7 +569,7 @@ resource wipeLockRoleDefinition 'Microsoft.Authorization/roleDefinitions@2022-04
   name: guid(objectContainer.id, 'wattracker-scope-wipe-lock')
   properties: {
     roleName: 'Wattracker Scope Wipe Lock'
-    description: 'Write only the per-scope lease blob <namespace>:<scope>/__lock that a scope wipe holds while it deletes. Every assignment carries an ABAC condition restricting blobs/write to that path; never rider data.'
+    description: 'Write only the per-scope lease blob (namespace:scope/__lock) that a scope wipe holds while it deletes. Every assignment carries an ABAC condition restricting blobs/write to that path; never rider data.'
     type: 'CustomRole'
     permissions: [{ dataActions: [
       'Microsoft.Storage/storageAccounts/blobServices/containers/blobs/write'
