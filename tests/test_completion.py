@@ -688,7 +688,7 @@ def test_v37_completion_dates_preserve_evidence_and_backup(
     db.init_db()
 
     with db.connect() as conn:
-        assert conn.execute("PRAGMA user_version").fetchone()[0] == 37
+        assert conn.execute("PRAGMA user_version").fetchone()[0] == db.SCHEMA_VERSION
         after = dict(conn.execute("SELECT * FROM plan_workouts").fetchone())
         assert after == {**before, "completed_date": local_date}
         changes = conn.total_changes
@@ -793,7 +793,7 @@ def test_v37_skips_unrepresentable_timezone_conversion(user_id):
     db.init_db()
 
     with db.connect() as conn:
-        assert conn.execute("PRAGMA user_version").fetchone()[0] == 37
+        assert conn.execute("PRAGMA user_version").fetchone()[0] == db.SCHEMA_VERSION
         assert dict(conn.execute("SELECT * FROM plan_workouts").fetchone()) == before
 
 

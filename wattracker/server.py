@@ -4677,6 +4677,7 @@ def create_app() -> FastAPI:
         sync = getattr(app.state, "cloud_sync", None)
         if sync is None:
             return {"enabled": False, "enrolled": False, "pending": 0,
+                    "read_endpoint": None, "sync_endpoint": None, "endpoint": None,
                     "last_success": None, "last_error": None, "retry": None}
         try:
             status = dict(sync.status(uid) or {})
@@ -4684,6 +4685,9 @@ def create_app() -> FastAPI:
             status = {}
         status.setdefault("enabled", False)
         status.setdefault("enrolled", False)
+        status.setdefault("read_endpoint", status.get("endpoint"))
+        status.setdefault("sync_endpoint", None)
+        status.setdefault("endpoint", status.get("read_endpoint"))
         status.setdefault("pending", 0)
         status.setdefault("last_success", None)
         status.setdefault("last_error", None)
@@ -4920,7 +4924,10 @@ def create_app() -> FastAPI:
 
     @app.post("/settings/cloud")
     def settings_cloud(request: Request, enabled: str = Form(""),
-                       endpoint: str = Form(""), invitation: str = Form("")):
+                       read_endpoint: str = Form(""),
+                       sync_endpoint: str = Form(""),
+                       endpoint: str = Form(""),
+                       invitation: str = Form("")):
         if not _same_origin_or_absent(request):
             return PlainTextResponse("Origin not allowed", status_code=403)
         uid = _uid(request)
@@ -4932,18 +4939,35 @@ def create_app() -> FastAPI:
             requested_enabled = _checked(enabled)
             if not requested_enabled:
                 sync.set_enabled(uid, False)
-            endpoint = endpoint.strip()
+            legacy_endpoint = endpoint.strip()
+            read_endpoint = read_endpoint.strip()
+            sync_endpoint = sync_endpoint.strip()
+            if not read_endpoint and legacy_endpoint:
+                read_endpoint = legacy_endpoint
+                if not sync_endpoint:
+                    sync_endpoint = legacy_endpoint
+            stored = _cloud_status(uid)
             if (
                 not invitation.strip()
-                and endpoint != (_cloud_status(uid).get("endpoint") or "")
+                and (
+                    read_endpoint != (stored.get("read_endpoint") or "")
+                    or sync_endpoint != (stored.get("sync_endpoint") or "")
+                )
             ):
                 return _cloud_settings_redirect(
                     request, "Enter an invitation to enroll against a new endpoint",
                 )
             if invitation.strip():
-                if not endpoint:
-                    raise ValueError("Enter the cloud endpoint with the invitation.")
-                sync.enroll(uid, endpoint, invitation.strip())
+                if not read_endpoint or not sync_endpoint:
+                    raise ValueError(
+                        "Enter both cloud endpoints with the invitation."
+                    )
+                sync.enroll(
+                    uid,
+                    read_endpoint,
+                    invitation.strip(),
+                    sync_endpoint=sync_endpoint,
+                )
             # Enrollment must succeed before enabling sync.
             if requested_enabled:
                 sync.set_enabled(uid, True)

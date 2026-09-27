@@ -756,12 +756,15 @@ def test_commands_dispatch_and_print_json(monkeypatch, capsys):
 
     monkeypatch.setattr(admin, "_request_json", fake_request)
     monkeypatch.setenv("WATTRACKER_CLOUD_ENDPOINT", "http://127.0.0.1:8765")
+    monkeypatch.setenv("WATTRACKER_CLOUD_SYNC_ENDPOINT", "http://127.0.0.1:8766")
     monkeypatch.setenv("WATTRACKER_CLOUD_OPERATOR_TOKEN", TOKEN)
 
     assert admin.main(["invite"]) == 0
     assert json.loads(capsys.readouterr().out) == {
         "invitation": "invitation-value",
         "expires_at": 1900,
+        "read_endpoint": "http://127.0.0.1:8765",
+        "sync_endpoint": "http://127.0.0.1:8766",
     }
 
     assert admin.main(["version"]) == 0
@@ -802,6 +805,7 @@ def test_cli_timeout_is_actionable_and_token_safe(monkeypatch, capsys, argv):
 
     monkeypatch.setattr(urllib.request, "build_opener", lambda *args: FakeOpener())
     monkeypatch.setenv("WATTRACKER_CLOUD_ENDPOINT", "https://cloud.example")
+    monkeypatch.setenv("WATTRACKER_CLOUD_SYNC_ENDPOINT", "https://sync.example")
     monkeypatch.setenv("WATTRACKER_CLOUD_OPERATOR_TOKEN", TOKEN)
 
     assert admin.main(argv) == 2

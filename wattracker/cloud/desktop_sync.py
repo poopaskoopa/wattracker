@@ -57,13 +57,19 @@ class CloudSyncStatus:
 
     enabled: bool
     enrolled: bool
-    endpoint: Optional[str]
+    read_endpoint: Optional[str]
+    sync_endpoint: Optional[str]
     last_success: Optional[float]
     pending: int
     retry: int
     next_retry_at: Optional[float]
     last_error: Optional[str]
     devices: list[dict[str, Any]] = field(default_factory=list)
+
+    @property
+    def endpoint(self) -> Optional[str]:
+        """Compatibility alias for the former single endpoint field."""
+        return self.read_endpoint
 
     @property
     def last_success_at(self) -> Optional[float]:
@@ -84,7 +90,8 @@ class CloudSyncStatus:
     def __iter__(self):
         """Support the existing server/UI ``dict(status)`` seam."""
         for name in (
-            "enabled", "enrolled", "endpoint", "last_success", "pending",
+            "enabled", "enrolled", "read_endpoint", "sync_endpoint", "endpoint",
+            "last_success", "pending",
             "last_success_at", "pending_objects", "retry", "retry_count",
             "next_retry_at", "last_error", "devices",
         ):
@@ -276,7 +283,8 @@ class DesktopCloudSync:
         return CloudSyncStatus(
             enabled=bool(state["enabled"]),
             enrolled=self._has_credentials(user_id),
-            endpoint=state["endpoint"],
+            read_endpoint=state["read_endpoint"],
+            sync_endpoint=state["sync_endpoint"],
             last_success=state["last_success_at"],
             pending=self._pending_count(user_id),
             retry=state["retry_count"],
@@ -302,16 +310,29 @@ class DesktopCloudSync:
             self.request_sync(user_id)
         return self.status(user_id)
 
-    def enroll(self, user_id: int, endpoint: str, invitation: str) -> CloudSyncStatus:
-        """Complete enrollment, then persist the endpoint and private credential."""
+    def enroll(
+        self,
+        user_id: int,
+        read_endpoint: str,
+        invitation: str,
+        *,
+        sync_endpoint: Optional[str] = None,
+    ) -> CloudSyncStatus:
+        """Enroll on read, then persist both plane endpoints and the credential."""
         user_id = self._user_id(user_id)
-        endpoint = validate_cloud_endpoint(endpoint)
+        read_endpoint = validate_cloud_endpoint(read_endpoint)
+        if sync_endpoint is None:
+            # Preserve the old three-argument API for local callers. The
+            # settings route always supplies the separate sync endpoint.
+            sync_endpoint = read_endpoint
+        else:
+            sync_endpoint = validate_cloud_endpoint(sync_endpoint)
         # Prove that the private credential can be stored before consuming the
         # one-time invitation at the cloud endpoint.
         self.credential_store.probe()
         try:
             credentials = CloudSyncClient.enroll(
-                endpoint,
+                read_endpoint,
                 invitation,
                 transport=self.transport,
                 mtls_headers=self.mtls_headers,
@@ -324,12 +345,18 @@ class DesktopCloudSync:
                 ) from exc
             raise
         # The single credential record is written only after a valid server
-        # response.  The endpoint contains no credential material and is
+        # response.  The endpoints contain no credential material and are
         # persisted only after keyring storage succeeds.
         self.credential_store.save_writer(credentials, user_id=user_id)
         db.save_cloud_sync_state(
             user_id,
-            {"endpoint": endpoint, "last_error": None, "retry_count": 0, "next_retry_at": None},
+            {
+                "read_endpoint": read_endpoint,
+                "sync_endpoint": sync_endpoint,
+                "last_error": None,
+                "retry_count": 0,
+                "next_retry_at": None,
+            },
             path=self.path,
         )
         return self.status(user_id)
@@ -342,16 +369,20 @@ class DesktopCloudSync:
 
     def _client(self, user_id: int) -> CloudSyncClient:
         state = db.get_cloud_sync_state(user_id, path=self.path)
-        endpoint = state["endpoint"]
-        if not endpoint:
-            raise CloudEnrollmentError("cloud endpoint is unavailable")
-        endpoint = validate_cloud_endpoint(endpoint)
+        read_endpoint = state["read_endpoint"]
+        if not read_endpoint:
+            raise CloudEnrollmentError("cloud read endpoint is unavailable")
+        read_endpoint = validate_cloud_endpoint(read_endpoint)
+        sync_endpoint = state["sync_endpoint"]
+        if sync_endpoint:
+            sync_endpoint = validate_cloud_endpoint(sync_endpoint)
         credentials = self.credential_store.load_writer(user_id=user_id)
         if credentials is None:
             raise CloudCredentialUnavailable("cloud credentials are unavailable")
         return self.client_factory(
-            endpoint,
+            read_endpoint,
             credentials,
+            sync_endpoint=sync_endpoint,
             transport=self.transport,
             mtls_headers=self.mtls_headers,
             clock=self.clock,

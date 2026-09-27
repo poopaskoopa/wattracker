@@ -18,6 +18,8 @@ from typing import Any, Mapping
 from .credentials import CloudCredentialUnavailable, KeyringBackend
 
 _ENDPOINT_ENV = "WATTRACKER_CLOUD_ENDPOINT"
+_READ_ENDPOINT_ENV = "WATTRACKER_CLOUD_READ_ENDPOINT"
+_SYNC_ENDPOINT_ENV = "WATTRACKER_CLOUD_SYNC_ENDPOINT"
 _TOKEN_ENV = "WATTRACKER_CLOUD_OPERATOR_TOKEN"
 _KEYCHAIN_ACCOUNT = "operator-token"
 _MAX_RESPONSE_BYTES = 256 * 1024
@@ -263,6 +265,7 @@ def _revoke_installation(endpoint: str, token: str, operator_handle: str) -> dic
 def _parser() -> argparse.ArgumentParser:
     parser = _ArgumentParser(prog="python -m wattracker.cloud.admin")
     parser.add_argument("--endpoint", default=None, help="absolute cloud endpoint")
+    parser.add_argument("--sync-endpoint", default=None, help="absolute sync endpoint")
     commands = parser.add_subparsers(
         dest="command", required=True, parser_class=_ArgumentParser
     )
@@ -276,6 +279,8 @@ def _parser() -> argparse.ArgumentParser:
         )
         command = commands.add_parser(name, help=help_text, description=help_text)
         command.add_argument("--endpoint", default=argparse.SUPPRESS)
+        if name == "invite":
+            command.add_argument("--sync-endpoint", default=argparse.SUPPRESS)
     revoke = commands.add_parser(
         "revoke-installation",
         help="revoke by opaque operator handle or writer credential id",
@@ -292,16 +297,40 @@ def _parser() -> argparse.ArgumentParser:
 def main(argv: list[str] | None = None) -> int:
     try:
         args = _parser().parse_args(argv)
-        endpoint_value = args.endpoint or os.environ.get(_ENDPOINT_ENV, "")
-        endpoint = _validate_endpoint(endpoint_value)
         token = _load_operator_token()
         if args.command == "invite":
-            result = _invite(endpoint, token)
+            read_endpoint_value = (
+                args.endpoint
+                or os.environ.get(_READ_ENDPOINT_ENV)
+                or os.environ.get(_ENDPOINT_ENV, "")
+            )
+            sync_endpoint_value = (
+                getattr(args, "sync_endpoint", None)
+                or os.environ.get(_SYNC_ENDPOINT_ENV, "")
+            )
+            if not sync_endpoint_value:
+                raise AdminError(
+                    "sync endpoint is required for invite; set "
+                    f"{_SYNC_ENDPOINT_ENV}"
+                )
+            read_endpoint = _validate_endpoint(read_endpoint_value)
+            sync_endpoint = _validate_endpoint(sync_endpoint_value)
+            result = _invite(read_endpoint, token)
+            result.update(
+                read_endpoint=read_endpoint,
+                sync_endpoint=sync_endpoint,
+            )
         elif args.command == "version":
+            endpoint_value = args.endpoint or os.environ.get(_ENDPOINT_ENV, "")
+            endpoint = _validate_endpoint(endpoint_value)
             result = _version(endpoint, token)
         elif args.command == "list-installations":
+            endpoint_value = args.endpoint or os.environ.get(_ENDPOINT_ENV, "")
+            endpoint = _validate_endpoint(endpoint_value)
             result = _list_installations(endpoint, token)
         else:
+            endpoint_value = args.endpoint or os.environ.get(_ENDPOINT_ENV, "")
+            endpoint = _validate_endpoint(endpoint_value)
             result = _revoke_installation(endpoint, token, args.operator_handle)
         json.dump(result, sys.stdout, sort_keys=True)
         sys.stdout.write("\n")

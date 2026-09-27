@@ -55,10 +55,13 @@ contract is:
 
 The operator runs `python -m wattracker.cloud.admin invite`. The tool reads
 `WATTRACKER_CLOUD_OPERATOR_TOKEN` or the `wattracker.cloud` OS keychain entry
-`operator-token`; it never accepts the token as an argument. Set the endpoint
-with `--endpoint` or `WATTRACKER_CLOUD_ENDPOINT`. HTTPS is required, with HTTP
-allowed only for `localhost`, `127.0.0.1`, and `::1` when testing against the
-walking-skeleton server.
+`operator-token`; it never accepts the token as an argument. Set the read
+endpoint with `--endpoint` or `WATTRACKER_CLOUD_READ_ENDPOINT`, and set the
+sync endpoint with `--sync-endpoint` or `WATTRACKER_CLOUD_SYNC_ENDPOINT`.
+The legacy `WATTRACKER_CLOUD_ENDPOINT` remains accepted as the read endpoint
+for the other admin commands. `invite` prints both endpoint values alongside
+the invitation. HTTPS is required, with HTTP allowed only for `localhost`,
+`127.0.0.1`, and `::1` when testing against the walking-skeleton server.
 
 `python -m wattracker.cloud.admin version` calls the same operator-authenticated
 version route on either plane and prints the running image's full git commit
@@ -76,9 +79,12 @@ it does not retry automatically. Other transport failures remain the generic
 `cloud admin request failed` message.
 
 The operator gives the printed, one-time invitation to the rider. The rider
-pastes it into the desktop cloud settings; the desktop enrolls once and gets
-its writer credential and namespace. From there, phones are paired by the
-desktop with the normal pairing flow. Operators can audit the enrolled writer
+pastes it into the desktop cloud settings together with both printed endpoint
+values; the desktop enrolls against the read endpoint and sends only
+`/api/v1/sync/*` requests to the sync endpoint. A migrated installation keeps
+its old endpoint as the read endpoint and reports that the sync endpoint is not
+configured until it is enrolled again with both values. From there, phones are
+paired by the desktop with the normal pairing flow. Operators can audit the enrolled writer
 installations with `list-installations` and revoke one with
 `revoke-installation <operator_handle-or-credential-id>`. The list's
 `operator_handle` is an opaque durable row-key handle, not the writer
@@ -415,9 +421,11 @@ because the whole argument above is stated against a bounded window.
 ### Direct public ingress
 
 The selected deployment reaches `/api/v1/devices/*`, enrollment, reads, and
-sync directly through the public Container App HTTPS endpoints; there is no
-gateway operation inventory to keep in sync. The app's exact-origin CORS
-middleware and route-level credentials apply to every route.
+sync directly through the public Container App HTTPS endpoints; the desktop
+uses the read app for enrollment, pairing, device management, and context
+reads, and uses the sync app only for `/api/v1/sync/*`. There is no gateway
+operation inventory to keep in sync. The app's exact-origin CORS middleware
+and route-level credentials apply to every route.
 
 `require_verified_subject=False` is explicit in the production runtime.
 Enrollment start therefore uses the operator token alone, enrollment complete
