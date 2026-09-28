@@ -482,7 +482,7 @@ final class SessionGate {
 
     private func selectBackendOverride(_ backend: Backend) async {
         let candidate: (any ReadSession)? = backend == .cloud ? session : localSession
-        guard let candidate else { return }
+        guard candidate != nil else { return }
         selectionGeneration += 1
         manualOverride = backend
         self.backend = backend

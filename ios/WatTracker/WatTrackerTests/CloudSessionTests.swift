@@ -825,6 +825,72 @@ final class CloudSessionTests: XCTestCase {
         XCTAssertNotNil(rig.cache.load(.dashboard))
     }
 
+    // MARK: - Removing a device the server no longer knows (#410)
+
+    private func cachedRig(
+        revoke: @escaping @Sendable (TestClock) -> CloudResponse
+    ) -> Harness {
+        let cache = MemorySnapshotCache()
+        cache.store(CachedCollection(revision: 1, items: [], storedAt: Date()), for: .dashboard)
+        let clock = TestClock()
+        return harness(cache: cache, clock: clock) { _, _ in revoke(clock) }
+    }
+
+    private func assertRemovedLocally(_ rig: Harness, file: StaticString = #filePath, line: UInt = #line) async {
+        let state = await rig.session.deviceState
+        XCTAssertEqual(state, .unpaired, file: file, line: line)
+        XCTAssertNil(rig.credentials.load(), file: file, line: line)
+        XCTAssertNil(rig.cache.load(.dashboard), file: file, line: line)
+    }
+
+    private func assertKeptPaired(_ rig: Harness, file: StaticString = #filePath, line: UInt = #line) async {
+        let state = await rig.session.deviceState
+        XCTAssertEqual(state, .paired, file: file, line: line)
+        XCTAssertEqual(rig.credentials.load(), CloudFixtures.device, file: file, line: line)
+        XCTAssertNotNil(rig.cache.load(.dashboard), file: file, line: line)
+    }
+
+    func testRevokeRefusedWith401AndAFreshDateCompletesRemovalLocally() async throws {
+        let rig = cachedRig { clock in .refused(401, serverDate: clock.now) }
+        try await rig.session.removeDevice()
+        await assertRemovedLocally(rig)
+    }
+
+    func testRevokeRefusedWith404AndAFreshDateCompletesRemovalLocally() async throws {
+        let rig = cachedRig { clock in .refused(404, serverDate: clock.now.addingTimeInterval(-30)) }
+        try await rig.session.removeDevice()
+        await assertRemovedLocally(rig)
+    }
+
+    func testRevokeRefusedWith401AndNoDateKeepsTheCredential() async throws {
+        let rig = cachedRig { _ in .refused(401) }
+        do {
+            try await rig.session.removeDevice()
+            XCTFail("a refusal that cannot rule out clock skew must not sign out")
+        } catch { }
+        await assertKeptPaired(rig)
+    }
+
+    func testRevokeRefusedWith401AndASkewedDateKeepsTheCredential() async throws {
+        let rig = cachedRig { clock in
+            .refused(401, serverDate: clock.now.addingTimeInterval(CloudSession.clockSkewTolerance + 60))
+        }
+        do {
+            try await rig.session.removeDevice()
+            XCTFail("a skewed clock is not a forgotten credential")
+        } catch { }
+        await assertKeptPaired(rig)
+    }
+
+    func testRevokeRefusedWith503AndAFreshDateKeepsTheCredential() async throws {
+        let rig = cachedRig { clock in .refused(503, serverDate: clock.now) }
+        do {
+            try await rig.session.removeDevice()
+            XCTFail("an unavailable server has not revoked anything")
+        } catch { }
+        await assertKeptPaired(rig)
+    }
+
     func testReadSuspendedAcrossRemoveCannotReturnOrRestoreCache() async throws {
         let readGate = RequestGate()
         let revokeGate = RequestGate()

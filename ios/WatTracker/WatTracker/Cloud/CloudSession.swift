@@ -362,12 +362,37 @@ actor CloudSession: ReadSession {
         do {
             try await client.revoke(credentialID: activeDevice.credentialID, for: activeDevice)
         } catch {
-            throw classify(error)
+            guard serverNoLongerKnowsCredential(error) else { throw classify(error) }
         }
         guard state == .paired, device == activeDevice, lifecycleGeneration == generation else {
             throw lifecycleFailure()
         }
         signOut()
+    }
+
+    /// Whether a failed revoke means the server has already forgotten this
+    /// credential, so "Remove this device" can finish locally.
+    ///
+    /// A server that does not recognise the credential cannot revoke it, and
+    /// never will: retrying gets the same answer forever. Signing out locally
+    /// is then the only way back to pairing (#410). 401 and 404 are the
+    /// signed-request refusals that say nothing was accepted for this
+    /// credential; they are indistinguishable by design.
+    ///
+    /// Clock skew is excluded for the same reason as in `refusal(_:)`: a
+    /// device far enough off the server's clock has every signed request
+    /// refused with the same status, while its credential is still live. A
+    /// `Date` that is missing or unparseable means skew cannot be ruled out,
+    /// so that also fails safe: the error is thrown and the credential kept,
+    /// rather than leaving a live credential the rider believes is revoked.
+    /// Anything else (429, 503, other 5xx, offline, malformed) is transient
+    /// or unexplained and keeps the credential too.
+    private func serverNoLongerKnowsCredential(_ error: Error) -> Bool {
+        guard case let .http(status, _, _, serverDate)? = error as? CloudClient.Failure,
+              status == 401 || status == 404,
+              let serverDate
+        else { return false }
+        return abs(serverDate.timeIntervalSince(clock())) <= Self.clockSkewTolerance
     }
 
     /// A route's objects, reconciled with the server where that is possible.
