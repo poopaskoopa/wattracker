@@ -187,7 +187,16 @@ states on `main` when the PR is merge-committed. Four such commits are on
 `main` from #358 and #356 (`a04e344`, `95a6bb2`, `8d1a582`, `892b345`); if
 `git bisect` lands on one, `git bisect skip` it.
 
-1. **#397: the server supplies the sync endpoint at enrolment.** #396 made the
+1. **#399: the first desktop upload times out.** The owner's first real
+   enrolment worked, but uploads never land: `batch_limit=1000` and a hard-coded
+   30s `https_transport` timeout mean a full-history page outlasts the client,
+   which records the generic offline text (Azure shows `0xx` client
+   disconnects). Measure the per-batch cost, shrink the batch, give POSTs a
+   longer timeout, prove timeout-then-replay succeeds, and record a
+   distinguishable non-sensitive reason. This blocks all real cloud use; take it
+   before #397.
+
+2. **#397: the server supplies the sync endpoint at enrolment.** #396 made the
    desktop store separate read and sync URLs, but the rider types the sync URL
    and nothing verifies it. The owner decided the read app returns its sibling
    sync URL from `enrollment/complete`, configured via
@@ -196,7 +205,7 @@ states on `main` when the PR is merge-committed. Four such commits are on
    review cleanups. It's a server change, so the owner redeploys afterwards, and
    it needs a security review before merge.
 
-2. **#249: rotating full-suite test flakes. Still not a local-runs job.**
+3. **#249: rotating full-suite test flakes. Still not a local-runs job.**
    Nothing has changed since the re-scope. 21 consecutive clean local full
    suites stand against zero reproductions. Both known instances came from
    **taksmon's machine**. **The next step is taksmon's log and his exact
