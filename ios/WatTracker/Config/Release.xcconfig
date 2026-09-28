@@ -1,5 +1,11 @@
 #include "Base.xcconfig"
 
+// The production API host is deployment configuration, not source. A
+// gitignored Production.local.xcconfig, when present, overrides
+// WATTRACKER_API_SCHEME/WATTRACKER_API_HOST from Base.xcconfig for Release
+// and TestFlight builds on the owner's machine.
+#include? "Production.local.xcconfig"
+
 // Nothing overrides the production scheme and host from Base.xcconfig here.
 
 // Note what is absent: WATTRACKER_SOFTWARE_KEYS_ALLOWED. A release build has

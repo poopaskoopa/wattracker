@@ -58,7 +58,9 @@ SWIFT_EMIT_LOC_STRINGS = YES
 ENABLE_USER_SCRIPT_SANDBOXING = YES
 ALWAYS_SEARCH_USER_PATHS = NO
 
-// The production API. A moved host is an edit here plus a rebuild.
+// The production API default. api.wattracker.com is a placeholder that does not
+// resolve; the real host is set per machine in the gitignored
+// Production.local.xcconfig (Release) or Local.xcconfig (Debug).
 WATTRACKER_API_SCHEME = https
 WATTRACKER_API_HOST = api.wattracker.com
 
