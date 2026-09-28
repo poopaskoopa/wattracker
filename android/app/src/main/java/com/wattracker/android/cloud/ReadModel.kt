@@ -9,14 +9,13 @@ enum class DataSource {
 /**
  * The read seam the screens actually hold.
  *
- * `deviceState`, `isPaired` and `lastSuccess` always reflect the cloud, because
- * that is what the shell's pairing UI and status are about. The data source is
- * chosen by the rider, never inferred: the cloud source always delegates to the
- * cloud (which reports an unpaired or removed device rather than hiding it), and
- * local data is served only when the local source is explicitly selected. There
- * is no silent fallback from a removed/unpaired cloud to an empty local source --
- * that would leave the screens showing fresh-looking blanks instead of the
- * pairing or removed UI.
+ * `deviceState`, `isPaired` and `lastSuccess` reflect the active data source.
+ * The data source is chosen by the rider, never inferred: the cloud source
+ * delegates to the cloud (which reports an unpaired or removed device rather
+ * than hiding it), and local data is served only when the local source is
+ * explicitly selected. There is no silent fallback from a removed/unpaired
+ * cloud to an empty local source -- that would leave the screens showing
+ * fresh-looking blanks instead of the pairing or removed UI.
  */
 class ReadModel(
     private val cloud: CloudSession,
@@ -27,19 +26,25 @@ class ReadModel(
     val cloudSession: CloudSession
         get() = cloud
 
+    val localClient: LocalClient
+        get() = local
+
+    val activeDataSource: DataSource
+        get() = source()
+
     private fun active(): ReadSession = when (source()) {
         DataSource.Local -> local
         DataSource.Cloud -> cloud
     }
 
     override val deviceState: CloudSession.DeviceState
-        get() = cloud.deviceState
+        get() = active().deviceState
 
     override val isPaired: Boolean
-        get() = cloud.isPaired
+        get() = active().isPaired
 
     override val lastSuccess: Long?
-        get() = cloud.lastSuccess
+        get() = active().lastSuccess
 
     override suspend fun cached(route: CloudRoute): CloudSnapshot? = active().cached(route)
 
