@@ -12,6 +12,7 @@ from wattracker.cloud.client import (
     CloudEnrollmentError,
     CloudSyncClient,
     SyncCredentials,
+    UPLOAD_TIMEOUT_MESSAGE,
     canonical_request,
     digest_body,
     sign_request,
@@ -19,8 +20,10 @@ from wattracker.cloud.client import (
 )
 from wattracker.cloud.credentials import CloudCredentialStore, CloudCredentialUnavailable
 from wattracker.cloud.desktop_sync import CloudDependencyUnavailable, DesktopCloudSync
+from wattracker.cloud.models import SyncBatch
 from wattracker.cloud.security import PublicKeyUnavailable
 from wattracker.cloud.snapshot import snapshot_objects
+from wattracker.cloud.storage import MemoryTenantStore
 
 
 class MemorySecrets:
@@ -209,7 +212,9 @@ def test_enrollment_success_stores_private_material_only_in_keyring(tmp_path, mo
             "sync_endpoint": "https://server-sync.example",
         }).encode()
 
-    sync = DesktopCloudSync(str(path), CloudCredentialStore(backend), transport=enrolled)
+    sync = DesktopCloudSync(
+        str(path), CloudCredentialStore(backend), transport=enrolled,
+    )
     status = sync.enroll(
         user_id,
         "https://read.example",
@@ -228,6 +233,46 @@ def test_enrollment_success_stores_private_material_only_in_keyring(tmp_path, mo
     assert b"subscription-secret" not in raw
     assert b"I" * 32 not in raw
     assert b"private_key" not in raw
+
+
+@pytest.mark.parametrize(
+    "bad_sync_endpoint",
+    [
+        "http://sync.example",
+        "https://user:password@sync.example",
+        "https://sync.example?q",
+        "https://sync.example/#fragment",
+        None,
+        42,
+        "",
+    ],
+    ids=["http", "userinfo", "query", "fragment", "null", "non-string", "empty"],
+)
+def test_enrollment_rejects_untrusted_sync_endpoint_without_persistence(
+    tmp_path, monkeypatch, bad_sync_endpoint,
+):
+    path, user_id = _fixture_db(tmp_path, count=0)
+    backend = MemorySecrets()
+    monkeypatch.setattr(
+        "wattracker.cloud.security.generate_signing_keypair",
+        lambda: (b"p" * 32, b"u" * 32),
+    )
+
+    def enrolled(_url, _headers, _body):
+        return 200, json.dumps({
+            "credential": "d" * 64,
+            "subscription_key": "subscription-secret",
+            "signature_algorithm": "ed25519",
+            "signing_namespace": "e" * 64,
+            "sync_endpoint": bad_sync_endpoint,
+        }).encode()
+
+    sync = DesktopCloudSync(str(path), CloudCredentialStore(backend), transport=enrolled)
+    before = db.get_cloud_sync_state(user_id, path=str(path))
+    with pytest.raises(CloudEnrollmentError):
+        sync.enroll(user_id, "https://read.example", "I" * 32)
+    assert backend.values == {}
+    assert db.get_cloud_sync_state(user_id, path=str(path)) == before
 
 
 def test_enrollment_and_signing_are_scoped_to_each_local_user(tmp_path, monkeypatch):
@@ -347,6 +392,92 @@ def test_offline_queue_retry_and_drain_preserves_snapshot_ledger(tmp_path):
     assert sync.status(user_id).pending == 0
     assert sync.status(user_id).retry == 0
     assert sync.status(user_id).last_success is not None
+
+
+def test_default_batch_limit_uses_the_measured_100_object_page(tmp_path):
+    path, user_id = _fixture_db(tmp_path, count=101)
+    store = CloudCredentialStore(MemorySecrets())
+    store.save_writer(_credentials(), user_id=user_id)
+    bodies = []
+
+    def transport(_url, _headers, body):
+        bodies.append(json.loads(body))
+        return 200, b'{"revision":1}'
+
+    sync = DesktopCloudSync(
+        str(path), store, transport=transport, include_derived=False,
+    )
+    db.save_cloud_sync_state(
+        user_id,
+        {
+            "read_endpoint": "https://cloud.example",
+            "sync_endpoint": "https://sync.example",
+            "enabled": True,
+        },
+        path=str(path),
+    )
+    results = sync.sync_once(user_id)
+
+    assert all(result.ok for result in results)
+    assert [len(body["objects"]) for body in bodies] == [100, 1]
+
+
+def test_timeout_then_retry_replays_same_batch_and_records_success(tmp_path):
+    path, user_id = _fixture_db(tmp_path, count=1)
+    credentials = _credentials()
+    store = CloudCredentialStore(MemorySecrets())
+    store.save_writer(credentials, user_id=user_id)
+    db.save_cloud_sync_state(
+        user_id,
+        {
+            "read_endpoint": "https://cloud.example",
+            "sync_endpoint": "https://sync.example",
+            "enabled": True,
+        },
+        path=str(path),
+    )
+    server_store = MemoryTenantStore()
+    requests = []
+
+    def transport(_url, headers, body):
+        wire = json.loads(body)
+        requests.append((dict(headers), wire))
+        batch = SyncBatch.from_wire(wire)
+        applied = server_store.apply(credentials.namespace, str(user_id), batch)
+        if len(requests) == 1:
+            raise TimeoutError("server committed before the client timed out")
+        return 200, json.dumps({
+            "revision": applied.revision,
+            "replayed": applied.replay,
+        }).encode()
+
+    sync = DesktopCloudSync(
+        str(path), store, transport=transport, include_derived=False,
+        retry_base_seconds=1,
+    )
+    first = sync.sync_once(user_id)
+    first_status = sync.status(user_id)
+    assert first and not first[0].ok
+    assert first[0].status_code is None
+    assert first[0].detail == UPLOAD_TIMEOUT_MESSAGE
+    assert first_status.pending > 0
+    assert first_status.retry == 1
+    assert first_status.last_error == UPLOAD_TIMEOUT_MESSAGE
+    assert "server committed" not in first_status.last_error
+
+    second = sync.sync_once(user_id)
+    second_status = sync.status(user_id)
+    assert second and second[0].ok and second[0].replayed
+    assert len(requests) == 2
+    assert requests[0][0]["X-Writer-Idempotency-Key"] == requests[1][0][
+        "X-Writer-Idempotency-Key"
+    ]
+    assert requests[0][1]["batch_id"] == requests[1][1]["batch_id"]
+    assert requests[0][1] == requests[1][1]
+    assert second_status.pending == 0
+    assert second_status.retry == 0
+    assert second_status.last_error is None
+    assert second_status.last_success is not None
 
 
 def test_disable_between_pages_stops_before_the_next_outbound_request(tmp_path):

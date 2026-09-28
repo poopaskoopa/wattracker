@@ -27,6 +27,8 @@ from .snapshot import (
     snapshot_change_token,
 )
 
+DEFAULT_BATCH_LIMIT = 100
+
 
 _log = logging.getLogger(__name__)
 
@@ -104,7 +106,7 @@ class DesktopCloudSync:
         transport: Optional[Callable[..., tuple[int, bytes]]] = None,
         mtls_headers: Optional[dict[str, str]] = None,
         clock: Callable[[], float] = time.time,
-        batch_limit: int = 1_000,
+        batch_limit: int = DEFAULT_BATCH_LIMIT,
         include_streams: bool = False,
         include_derived: bool = True,
         derived_first: bool = True,

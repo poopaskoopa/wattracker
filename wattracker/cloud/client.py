@@ -13,12 +13,13 @@ import json
 import inspect
 import re
 import secrets
+import socket
 import ssl
 import time
 from dataclasses import dataclass
 from typing import Any, Callable, Mapping, Optional
 from urllib.parse import urlsplit
-from urllib.error import HTTPError
+from urllib.error import HTTPError, URLError
 from urllib.request import HTTPRedirectHandler, HTTPSHandler, Request, build_opener
 
 from .models import SyncBatch
@@ -42,7 +43,12 @@ DEVICE_REVOKE_IDEMPOTENCY_KEY = "device-revoke"
 WIPE_IDEMPOTENCY_KEY = "account-wipe"
 OFFLINE_MESSAGE = "Cloud sync offline — local data and features are unaffected."
 SYNC_ENDPOINT_NOT_CONFIGURED = "Cloud sync endpoint is not configured."
+UPLOAD_TIMEOUT_MESSAGE = "Cloud upload timed out; will retry."
+DEFAULT_HTTP_TIMEOUT = 30.0
+DEFAULT_POST_TIMEOUT = 90.0
 MAX_RESPONSE_BYTES = 1 * 1024 * 1024
+_TRANSPORT_ERROR_KEY = "_transport_error"
+_TRANSPORT_TIMEOUT = "timeout"
 _TOKEN_RE = re.compile(r"^[A-Za-z0-9_-]{16,256}$")
 _CREDENTIAL_ID_RE = re.compile(r"^[0-9a-f]{64}$")
 _NAMESPACE_RE = re.compile(r"^[0-9a-f]{64}$")
@@ -105,6 +111,22 @@ def _validate_public_key_hex(public_key: str) -> bytes:
     return bytes.fromhex(public_key)
 
 
+def _is_timeout_error(error: BaseException) -> bool:
+    """Recognize socket timeouts without exposing exception text to callers."""
+    seen: set[int] = set()
+    current: Optional[BaseException] = error
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
+        if isinstance(current, (TimeoutError, socket.timeout)):
+            return True
+        if isinstance(current, URLError):
+            reason = current.reason
+            current = reason if isinstance(reason, BaseException) else None
+            continue
+        current = current.__cause__ or current.__context__
+    return False
+
+
 @dataclass(frozen=True)
 class SyncCredentials:
     credential_id: str
@@ -141,7 +163,8 @@ def https_transport(
     client_certificate: Optional[str] = None,
     client_key: Optional[str] = None,
     ca_file: Optional[str] = None,
-    timeout: float = 30.0,
+    timeout: float = DEFAULT_HTTP_TIMEOUT,
+    post_timeout: float = DEFAULT_POST_TIMEOUT,
 ) -> Callable[[str, Mapping[str, str], bytes], tuple[int, bytes]]:
     """Create a strict HTTPS/mTLS transport for an enabled desktop worker.
 
@@ -170,7 +193,8 @@ def https_transport(
             method=method,
         )
         try:
-            response = opener.open(request, timeout=timeout)
+            request_timeout = post_timeout if method == "POST" else timeout
+            response = opener.open(request, timeout=request_timeout)
         except HTTPError as exc:
             return exc.code, exc.read(MAX_RESPONSE_BYTES)
         with response:
@@ -242,7 +266,9 @@ class CloudSyncClient:
                 status, response_body = self.transport(
                     endpoint + path, request_headers, body,
                 )
-        except Exception:
+        except Exception as exc:
+            if _is_timeout_error(exc):
+                return None, {_TRANSPORT_ERROR_KEY: _TRANSPORT_TIMEOUT}
             return None, {}
         try:
             payload = json.loads(response_body.decode("utf-8"))
@@ -378,7 +404,12 @@ class CloudSyncClient:
             return SyncResult(False, None, OFFLINE_MESSAGE)
         status, payload = self._request("POST", SYNC_PATH, raw, headers=headers)
         if status is None:
-            return SyncResult(False, None, OFFLINE_MESSAGE)
+            detail = (
+                UPLOAD_TIMEOUT_MESSAGE
+                if payload.get(_TRANSPORT_ERROR_KEY) == _TRANSPORT_TIMEOUT
+                else OFFLINE_MESSAGE
+            )
+            return SyncResult(False, None, detail)
         if status in (200, 201):
             return SyncResult(
                 True, status, "ok", payload.get("revision"), bool(payload.get("replayed"))

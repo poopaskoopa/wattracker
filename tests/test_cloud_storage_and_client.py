@@ -1,8 +1,9 @@
 import json
 import sqlite3
 import sys
-from types import ModuleType
 import zlib
+from types import ModuleType
+from urllib.error import URLError
 
 import pytest
 from fastapi.testclient import TestClient
@@ -13,6 +14,8 @@ from wattracker.cloud.client import (
     SyncCredentials,
     SyncResult,
     SYNC_ENDPOINT_NOT_CONFIGURED,
+    UPLOAD_TIMEOUT_MESSAGE,
+    https_transport,
 )
 from wattracker.cloud.models import (
     MAX_PAYLOAD_ARRAY_ITEMS,
@@ -647,6 +650,56 @@ def test_sync_client_uses_bound_namespace_and_keeps_network_optional():
 
     offline = CloudSyncClient("https://cloud.example", credentials)
     assert offline.push(batch).detail == SYNC_ENDPOINT_NOT_CONFIGURED
+
+
+def test_sync_client_classifies_a_wrapped_upload_timeout_without_details():
+    def transport(_url, _headers, _body):
+        raise URLError(TimeoutError("private endpoint and payload details"))
+
+    client = CloudSyncClient(
+        "https://cloud.example",
+        SyncCredentials("c" * 64, "subscription", b"signing-key", "a" * 64),
+        sync_endpoint="https://sync.example",
+        transport=transport,
+    )
+
+    result = client.push(_batch())
+
+    assert result == SyncResult(False, None, UPLOAD_TIMEOUT_MESSAGE)
+    assert "private endpoint" not in result.detail
+
+
+def test_https_transport_keeps_reads_snappy_but_allows_uploads_to_finish(
+    monkeypatch,
+):
+    calls = []
+
+    class Response:
+        status = 200
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def read(self, _limit):
+            return b"{}"
+
+    class Opener:
+        def open(self, request, *, timeout):
+            calls.append((request.get_method(), timeout))
+            return Response()
+
+    opener = Opener()
+    monkeypatch.setattr(
+        "wattracker.cloud.client.build_opener", lambda *_args, **_kwargs: opener,
+    )
+    transport = https_transport()
+    transport("https://cloud.example/api/v1/devices", {}, b"", "GET")
+    transport("https://cloud.example/api/v1/sync/batches", {}, b"{}", "POST")
+
+    assert calls == [("GET", 30.0), ("POST", 90.0)]
 
 
 def _configure_container_runtime(
