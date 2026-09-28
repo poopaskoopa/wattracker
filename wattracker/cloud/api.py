@@ -20,6 +20,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, Response
 from fastapi.concurrency import run_in_threadpool
 
+from .client import validate_cloud_endpoint
 from .limits import (
     DurableKillSwitch,
     DurableQuotaCounters,
@@ -103,6 +104,7 @@ class CloudConfig:
     server_secret: bytes
     operator_token: str
     plane: str = "all"  # all | read | sync
+    sync_endpoint: Optional[str] = None
     require_subscription: bool = True
     gateway_proof_header: str = "X-Gateway-Request-Proof"
     gateway_proof_value: str = field(default="", repr=False)
@@ -132,6 +134,11 @@ class CloudConfig:
             raise ValueError("operator_token must be configured")
         if self.plane not in {"all", "read", "sync"}:
             raise ValueError("plane must be all, read, or sync")
+        if self.sync_endpoint is not None:
+            try:
+                self.sync_endpoint = validate_cloud_endpoint(self.sync_endpoint)
+            except ValueError as exc:
+                raise ValueError("sync_endpoint must be an absolute HTTPS URL") from exc
         if self.max_request_bytes < 1 or self.max_decompressed_batch_bytes < 1:
             raise ValueError("body limits must be positive")
         if (
@@ -1239,6 +1246,7 @@ def create_cloud_app(
                 # sign it but cannot choose or alter it.
                 "signing_namespace": writer.namespace,
                 "reader_context": context_token,
+                "sync_endpoint": state.config.sync_endpoint,
             }
             if device is not None:
                 enrolled.update({

@@ -313,6 +313,10 @@ resource readApp 'Microsoft.App/containerApps@2023-05-01' = {
             value: allowedOrigin
           }
           {
+            name: 'WATTRACKER_CLOUD_SYNC_ENDPOINT'
+            value: 'https://${syncApp.properties.configuration.ingress.fqdn}'
+          }
+          {
             name: 'WATTRACKER_CLOUD_SERVER_SECRET'
             secretRef: 'cloud-server-secret'
           }

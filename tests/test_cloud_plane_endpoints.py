@@ -65,6 +65,7 @@ def test_split_plane_desktop_enrolls_syncs_pairs_and_lists_devices(tmp_path):
         server_secret=SECRET,
         operator_token="operator-token",
         plane="read",
+        sync_endpoint=SYNC_ENDPOINT,
         require_gateway_proof=False,
         require_verified_subject=False,
         clock=lambda: 1_000,
@@ -101,7 +102,6 @@ def test_split_plane_desktop_enrolls_syncs_pairs_and_lists_devices(tmp_path):
             user_id,
             READ_ENDPOINT,
             started.json()["invitation"],
-            sync_endpoint=SYNC_ENDPOINT,
         )
         enrolled = store.load_writer(user_id=user_id)
         assert enrolled is not None
@@ -175,7 +175,7 @@ def test_v37_cloud_endpoint_migrates_to_read_endpoint(tmp_path, monkeypatch):
     state = db.get_cloud_sync_state(user_id, path=str(path))
     assert state["read_endpoint"] == READ_ENDPOINT
     assert state["sync_endpoint"] is None
-    assert state["endpoint"] == READ_ENDPOINT
+    assert "endpoint" not in state
     with sqlite3.connect(path) as conn:
         assert conn.execute("PRAGMA user_version").fetchone()[0] == db.SCHEMA_VERSION
 

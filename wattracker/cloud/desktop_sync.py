@@ -67,11 +67,6 @@ class CloudSyncStatus:
     devices: list[dict[str, Any]] = field(default_factory=list)
 
     @property
-    def endpoint(self) -> Optional[str]:
-        """Compatibility alias for the former single endpoint field."""
-        return self.read_endpoint
-
-    @property
     def last_success_at(self) -> Optional[float]:
         return self.last_success
 
@@ -90,7 +85,7 @@ class CloudSyncStatus:
     def __iter__(self):
         """Support the existing server/UI ``dict(status)`` seam."""
         for name in (
-            "enabled", "enrolled", "read_endpoint", "sync_endpoint", "endpoint",
+            "enabled", "enrolled", "read_endpoint", "sync_endpoint",
             "last_success", "pending",
             "last_success_at", "pending_objects", "retry", "retry_count",
             "next_retry_at", "last_error", "devices",
@@ -315,23 +310,15 @@ class DesktopCloudSync:
         user_id: int,
         read_endpoint: str,
         invitation: str,
-        *,
-        sync_endpoint: Optional[str] = None,
     ) -> CloudSyncStatus:
-        """Enroll on read, then persist both plane endpoints and the credential."""
+        """Enroll on read, then persist the server-supplied sync endpoint."""
         user_id = self._user_id(user_id)
         read_endpoint = validate_cloud_endpoint(read_endpoint)
-        if sync_endpoint is None:
-            # Preserve the old three-argument API for local callers. The
-            # settings route always supplies the separate sync endpoint.
-            sync_endpoint = read_endpoint
-        else:
-            sync_endpoint = validate_cloud_endpoint(sync_endpoint)
         # Prove that the private credential can be stored before consuming the
         # one-time invitation at the cloud endpoint.
         self.credential_store.probe()
         try:
-            credentials = CloudSyncClient.enroll(
+            enrollment = CloudSyncClient.enroll(
                 read_endpoint,
                 invitation,
                 transport=self.transport,
@@ -344,6 +331,8 @@ class DesktopCloudSync:
                     "install wattracker[cloud] to enroll this desktop"
                 ) from exc
             raise
+        credentials = enrollment.credentials
+        sync_endpoint = enrollment.sync_endpoint
         # The single credential record is written only after a valid server
         # response.  The endpoints contain no credential material and are
         # persisted only after keyring storage succeeds.

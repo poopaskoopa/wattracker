@@ -56,11 +56,11 @@ contract is:
 The operator runs `python -m wattracker.cloud.admin invite`. The tool reads
 `WATTRACKER_CLOUD_OPERATOR_TOKEN` or the `wattracker.cloud` OS keychain entry
 `operator-token`; it never accepts the token as an argument. Set the read
-endpoint with `--endpoint` or `WATTRACKER_CLOUD_READ_ENDPOINT`, and set the
-sync endpoint with `--sync-endpoint` or `WATTRACKER_CLOUD_SYNC_ENDPOINT`.
-The legacy `WATTRACKER_CLOUD_ENDPOINT` remains accepted as the read endpoint
-for the other admin commands. `invite` prints both endpoint values alongside
-the invitation. HTTPS is required, with HTTP allowed only for `localhost`,
+endpoint with `--endpoint` or `WATTRACKER_CLOUD_READ_ENDPOINT`. The legacy
+`WATTRACKER_CLOUD_ENDPOINT` remains accepted as the read endpoint for the
+other admin commands. `invite` prints the read endpoint alongside the
+invitation; the read app supplies the sync endpoint at enrollment. HTTPS is
+required, with HTTP allowed only for `localhost`,
 `127.0.0.1`, and `::1` when testing against the walking-skeleton server.
 
 `python -m wattracker.cloud.admin version` calls the same operator-authenticated
@@ -79,11 +79,12 @@ it does not retry automatically. Other transport failures remain the generic
 `cloud admin request failed` message.
 
 The operator gives the printed, one-time invitation to the rider. The rider
-pastes it into the desktop cloud settings together with both printed endpoint
-values; the desktop enrolls against the read endpoint and sends only
-`/api/v1/sync/*` requests to the sync endpoint. A migrated installation keeps
-its old endpoint as the read endpoint and reports that the sync endpoint is not
-configured until it is enrolled again with both values. From there, phones are
+pastes it into the desktop cloud settings with the printed read endpoint. The
+desktop enrolls against the read endpoint, stores the HTTPS sync endpoint in
+the enrollment response, and sends only `/api/v1/sync/*` requests there. The
+sync URL is deployment configuration, not a rider-editable form field. A
+migrated installation keeps its old endpoint as the read endpoint and reports
+that the sync endpoint is not configured until it is enrolled again. From there, phones are
 paired by the desktop with the normal pairing flow. Operators can audit the enrolled writer
 installations with `list-installations` and revoke one with
 `revoke-installation <operator_handle-or-credential-id>`. The list's

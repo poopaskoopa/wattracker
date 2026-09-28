@@ -8,7 +8,12 @@ import pytest
 from fastapi.testclient import TestClient
 
 from wattracker.cloud.api import CloudConfig, CloudState, create_cloud_app
-from wattracker.cloud.client import CloudSyncClient, SyncCredentials, SyncResult
+from wattracker.cloud.client import (
+    CloudSyncClient,
+    SyncCredentials,
+    SyncResult,
+    SYNC_ENDPOINT_NOT_CONFIGURED,
+)
 from wattracker.cloud.models import (
     MAX_PAYLOAD_ARRAY_ITEMS,
     CloudObject,
@@ -631,19 +636,23 @@ def test_sync_client_uses_bound_namespace_and_keeps_network_optional():
     )
     client = CloudSyncClient(
         "https://cloud.example", credentials, transport=transport,
+        sync_endpoint="https://sync.example",
         mtls_headers={"X-APIM-Client-Certificate-Verified": "true"},
         clock=lambda: 100,
     )
     result = client.push(batch, namespace="wrong" * 10)
     assert result == SyncResult(True, 200, "ok", 1, False)
-    assert captured["url"] == "https://cloud.example/api/v1/sync/batches"
+    assert captured["url"] == "https://sync.example/api/v1/sync/batches"
     assert captured["headers"]["X-Writer-Credential"] == "c" * 64
 
     offline = CloudSyncClient("https://cloud.example", credentials)
-    assert offline.push(batch).detail.startswith("Cloud sync offline")
+    assert offline.push(batch).detail == SYNC_ENDPOINT_NOT_CONFIGURED
 
 
-def _configure_container_runtime(monkeypatch, plane, *, allow_account_wipe=None):
+def _configure_container_runtime(
+    monkeypatch, plane, *, allow_account_wipe=None,
+    sync_endpoint="https://sync.example",
+):
     from wattracker.cloud import runtime
     from wattracker.cloud.security import MemorySecurityStateBackend
 
@@ -665,6 +674,10 @@ def _configure_container_runtime(monkeypatch, plane, *, allow_account_wipe=None)
         "operator-token-0123456789abcdef0123456789",
     )
     monkeypatch.setenv("WATTRACKER_CLOUD_PLANE", plane)
+    if sync_endpoint is None:
+        monkeypatch.delenv("WATTRACKER_CLOUD_SYNC_ENDPOINT", raising=False)
+    else:
+        monkeypatch.setenv("WATTRACKER_CLOUD_SYNC_ENDPOINT", sync_endpoint)
     if allow_account_wipe is None:
         monkeypatch.delenv("WATTRACKER_CLOUD_ALLOW_ACCOUNT_WIPE", raising=False)
     else:
@@ -731,6 +744,18 @@ def test_container_runtime_read_plane_does_not_open_replay_table(monkeypatch):
     assert table_names == ["CloudAuth", "CloudControl"]
     assert access_checks == [True, False]
     assert app.state.cloud.config.plane == "read"
+
+
+def test_container_runtime_read_plane_requires_a_sync_endpoint(monkeypatch):
+    with pytest.raises(RuntimeError, match="WATTRACKER_CLOUD_SYNC_ENDPOINT"):
+        _configure_container_runtime(monkeypatch, "read", sync_endpoint=None)
+
+
+def test_container_runtime_rejects_a_non_https_sync_endpoint(monkeypatch):
+    with pytest.raises(RuntimeError, match="absolute HTTPS URL"):
+        _configure_container_runtime(
+            monkeypatch, "read", sync_endpoint="http://sync.example"
+        )
 
 
 @pytest.mark.parametrize(

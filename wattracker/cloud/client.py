@@ -47,7 +47,6 @@ _TOKEN_RE = re.compile(r"^[A-Za-z0-9_-]{16,256}$")
 _CREDENTIAL_ID_RE = re.compile(r"^[0-9a-f]{64}$")
 _NAMESPACE_RE = re.compile(r"^[0-9a-f]{64}$")
 _PUBLIC_KEY_RE = re.compile(r"^[0-9a-fA-F]{64}$")
-_DEFAULT_SYNC_ENDPOINT = object()
 
 
 class CloudEnrollmentError(ValueError):
@@ -131,6 +130,12 @@ class SyncResult:
     replayed: bool = False
 
 
+@dataclass(frozen=True)
+class EnrollmentResult:
+    credentials: SyncCredentials
+    sync_endpoint: str
+
+
 def https_transport(
     *,
     client_certificate: Optional[str] = None,
@@ -183,21 +188,15 @@ class CloudSyncClient:
         endpoint: str,
         credentials: Optional[SyncCredentials] = None,
         *,
-        sync_endpoint: Optional[str] | object = _DEFAULT_SYNC_ENDPOINT,
+        sync_endpoint: Optional[str] = None,
         transport: Optional[Callable[[str, Mapping[str, str], bytes], tuple[int, bytes]]] = None,
         mtls_headers: Optional[Mapping[str, str]] = None,
         clock: Callable[[], float] = time.time,
     ) -> None:
         self.read_endpoint = validate_cloud_endpoint(endpoint)
-        if sync_endpoint is _DEFAULT_SYNC_ENDPOINT:
-            # Keep the one-endpoint constructor compatible for callers that
-            # have not opted into the split-plane state yet.
-            self.sync_endpoint = self.read_endpoint
-        elif sync_endpoint is None:
-            self.sync_endpoint = None
-        else:
-            self.sync_endpoint = validate_cloud_endpoint(sync_endpoint)
-        self.endpoint = self.read_endpoint
+        self.sync_endpoint = (
+            None if sync_endpoint is None else validate_cloud_endpoint(sync_endpoint)
+        )
         self.credentials = credentials
         self.transport = transport
         self.mtls_headers = dict(mtls_headers or {})
@@ -266,7 +265,7 @@ class CloudSyncClient:
         transport: Optional[Callable[..., tuple[int, bytes]]] = None,
         mtls_headers: Optional[Mapping[str, str]] = None,
         clock: Callable[[], float] = time.time,
-    ) -> SyncCredentials:
+    ) -> EnrollmentResult:
         """Complete an invitation and return private material for keyring storage."""
         endpoint = validate_cloud_endpoint(endpoint)
         invitation = _validate_invitation(invitation)
@@ -288,6 +287,7 @@ class CloudSyncClient:
         credential_id = payload.get("credential")
         subscription = payload.get("subscription_key")
         namespace = payload.get("signing_namespace")
+        sync_endpoint_value = payload.get("sync_endpoint")
         algorithm = payload.get("signature_algorithm", "ed25519")
         if (
             not isinstance(credential_id, str)
@@ -298,15 +298,23 @@ class CloudSyncClient:
             or any(ord(char) < 0x21 or ord(char) > 0x7e for char in subscription)
             or not isinstance(namespace, str)
             or not _NAMESPACE_RE.fullmatch(namespace)
+            or not isinstance(sync_endpoint_value, str)
             or algorithm != "ed25519"
         ):
             raise CloudEnrollmentError("cloud enrollment response is invalid")
-        return SyncCredentials(
-            credential_id=credential_id,
-            subscription_key=subscription,
-            signing_key=private_key,
-            namespace=namespace,
-            signature_algorithm="ed25519",
+        try:
+            sync_endpoint = validate_cloud_endpoint(sync_endpoint_value)
+        except ValueError as exc:
+            raise CloudEnrollmentError("cloud enrollment response is invalid") from exc
+        return EnrollmentResult(
+            credentials=SyncCredentials(
+                credential_id=credential_id,
+                subscription_key=subscription,
+                signing_key=private_key,
+                namespace=namespace,
+                signature_algorithm="ed25519",
+            ),
+            sync_endpoint=sync_endpoint,
         )
 
     def _signed_headers(
@@ -468,6 +476,10 @@ class CloudSyncClient:
         """Upload resumable local deltas, acknowledging each successful page."""
         if should_continue is not None and not should_continue():
             return []
+        if self.credentials is None:
+            return [SyncResult(False, None, OFFLINE_MESSAGE)]
+        if self.sync_endpoint is None:
+            return [SyncResult(False, None, SYNC_ENDPOINT_NOT_CONFIGURED)]
         if republish:
             if self.transport is None:
                 return [SyncResult(False, None, OFFLINE_MESSAGE)]
