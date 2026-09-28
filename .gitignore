@@ -76,6 +76,8 @@ tmp/
 # by Debug.xcconfig: the Mac's LAN address, which changes with the network and
 # so is never right to commit.
 ios/WatTracker/Config/Local.xcconfig
+# The deployed API host for Release/TestFlight builds, included by Release.xcconfig.
+ios/WatTracker/Config/Production.local.xcconfig
 
 DerivedData/
 
