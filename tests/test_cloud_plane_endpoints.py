@@ -1,9 +1,11 @@
+import datetime as dt
 import sqlite3
 
 import pytest
 from fastapi.testclient import TestClient
 
 from wattracker import db
+from wattracker import server as desktop_server
 from wattracker.cloud.api import CloudConfig, CloudState, create_cloud_app
 from wattracker.cloud.client import CloudSyncClient, SyncCredentials
 from wattracker.cloud.models import CloudObject, SyncBatch
@@ -38,23 +40,25 @@ def _transport(read_client, sync_client, calls):
     return send
 
 
-def _desktop_db(tmp_path):
+def _desktop_db(tmp_path, *, count=1):
     path = tmp_path / "cloud-planes.db"
     db.init_db(str(path))
     user_id = db.create_user("rider", "not-a-password", path=str(path))
-    db.insert_activity(
-        user_id,
-        {
-            "dedup_hash": "cloud-plane-ride",
-            "filename": "ride.fit",
-            "start_time": "2026-09-27T10:00:00",
-            "duration_s": 600,
-            "distance_m": 10_000.0,
-            "avg_power": 180.0,
-            "avg_hr": 140.0,
-        },
-        path=str(path),
-    )
+    base = dt.datetime(2026, 1, 1, 10, 0, 0)
+    for number in range(count):
+        db.insert_activity(
+            user_id,
+            {
+                "dedup_hash": f"cloud-plane-ride-{number}",
+                "filename": f"ride-{number}.fit",
+                "start_time": (base + dt.timedelta(minutes=number)).isoformat(),
+                "duration_s": 600,
+                "distance_m": 10_000.0,
+                "avg_power": 180.0,
+                "avg_hr": 140.0,
+            },
+            path=str(path),
+        )
     return path, user_id
 
 
@@ -80,7 +84,7 @@ def test_split_plane_desktop_enrolls_syncs_pairs_and_lists_devices(tmp_path):
     )
     read_state = CloudState.create(read_config, security_backend=backend)
     sync_state = CloudState.create(sync_config, security_backend=backend)
-    path, user_id = _desktop_db(tmp_path)
+    path, user_id = _desktop_db(tmp_path, count=101)
     calls = []
 
     with (
@@ -111,7 +115,8 @@ def test_split_plane_desktop_enrolls_syncs_pairs_and_lists_devices(tmp_path):
         desktop.set_enabled(user_id, True)
 
         pushed = desktop.sync_once(user_id)
-        assert pushed and pushed[0].ok
+        assert len(pushed) == 2
+        assert all(result.ok for result in pushed)
 
         pairing = desktop.mint_pairing_code(user_id)
         assert pairing is not None
@@ -130,6 +135,7 @@ def test_split_plane_desktop_enrolls_syncs_pairs_and_lists_devices(tmp_path):
         assert devices[0]["credential_id"] == paired.json()["device_credential"]
 
     assert any(url.startswith(SYNC_ENDPOINT) for _method, url in calls)
+    assert sum("/api/v1/sync/batches" in url for _method, url in calls) == 2
     assert any(
         url.startswith(READ_ENDPOINT) and "/api/v1/devices" in url
         for _method, url in calls
@@ -142,6 +148,85 @@ def test_split_plane_desktop_enrolls_syncs_pairs_and_lists_devices(tmp_path):
         not (url.startswith(SYNC_ENDPOINT) and "/api/v1/sync/" not in url)
         for _method, url in calls
     )
+
+
+def test_split_plane_settings_route_ignores_crafted_endpoint_fields_in_db(
+    monkeypatch,
+):
+    pytest.importorskip("cryptography")
+    backend = MemorySecurityStateBackend()
+    common = dict(
+        server_secret=SECRET,
+        operator_token="operator-token",
+        require_gateway_proof=False,
+        require_verified_subject=False,
+        clock=lambda: 1_000,
+    )
+    read_config = CloudConfig(plane="read", sync_endpoint=SYNC_ENDPOINT, **common)
+    sync_config = CloudConfig(plane="sync", **common)
+    read_state = CloudState.create(read_config, security_backend=backend)
+    sync_state = CloudState.create(sync_config, security_backend=backend)
+    calls = []
+    store = CloudCredentialStore(_MemorySecrets())
+
+    def transport(url, headers, body, method="POST"):
+        if url.startswith(READ_ENDPOINT):
+            target = read_client
+            path = url[len(READ_ENDPOINT):]
+        elif url.startswith(SYNC_ENDPOINT):
+            target = sync_client
+            path = url[len(SYNC_ENDPOINT):]
+        else:  # pragma: no cover - the assertion below is the useful failure
+            raise AssertionError(f"unexpected cloud endpoint: {url}")
+        calls.append((method, url))
+        response = target.request(method, path, headers=headers, content=body)
+        return response.status_code, response.content
+
+    transport.supports_method = True
+
+    def desktop_sync_factory(path):
+        return DesktopCloudSync(
+            path, store, transport=transport, include_derived=False,
+            clock=lambda: 1_000,
+        )
+
+    monkeypatch.setattr(desktop_server, "DesktopCloudSync", desktop_sync_factory)
+    with (
+        TestClient(create_cloud_app(read_config, state=read_state)) as read_client,
+        TestClient(create_cloud_app(sync_config, state=sync_state)) as sync_client,
+        TestClient(desktop_server.create_app()) as desktop_client,
+    ):
+        registered = desktop_client.post(
+            "/register", data={"username": "rider", "password": "password123"},
+            follow_redirects=False,
+        )
+        assert registered.status_code in (303, 307), registered.text
+        started = read_client.post(
+            "/api/v1/enrollment/start",
+            headers={"X-Operator-Token": "operator-token"},
+        )
+        assert started.status_code == 200, started.text
+        response = desktop_client.post(
+            "/settings/cloud",
+            data={
+                "read_endpoint": READ_ENDPOINT,
+                "invitation": started.json()["invitation"],
+                "enabled": "",
+                "sync_endpoint": "https://crafted-sync.example",
+                "endpoint": "https://crafted-read.example",
+            },
+            follow_redirects=False,
+        )
+        assert response.status_code == 303, response.text
+        user_id = db.get_user_by_username("rider")["id"]
+        state = db.get_cloud_sync_state(user_id)
+
+    assert state["read_endpoint"] == READ_ENDPOINT
+    assert state["sync_endpoint"] == SYNC_ENDPOINT
+    assert state["sync_endpoint"] not in {
+        "https://crafted-sync.example", "https://crafted-read.example",
+    }
+    assert any(url.startswith(READ_ENDPOINT) for _method, url in calls)
 
 
 def test_v37_cloud_endpoint_migrates_to_read_endpoint(tmp_path, monkeypatch):
