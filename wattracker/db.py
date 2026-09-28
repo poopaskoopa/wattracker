@@ -31,7 +31,7 @@ from .timeutil import (
 
 _log = logging.getLogger(__name__)
 
-SCHEMA_VERSION = 37
+SCHEMA_VERSION = 38
 
 
 def _restrict_db_files(path: str) -> None:
@@ -299,6 +299,20 @@ def _backfill_plan_completion_dates(conn: sqlite3.Connection) -> None:
             )
 
 
+def _migrate_cloud_sync_endpoints(conn: sqlite3.Connection) -> None:
+    """v37 -> v38: split the desktop cloud endpoint by deployment plane."""
+    columns = {row[1] for row in conn.execute("PRAGMA table_info(cloud_sync_state)")}
+    if "read_endpoint" not in columns:
+        conn.execute("ALTER TABLE cloud_sync_state ADD COLUMN read_endpoint TEXT")
+    if "sync_endpoint" not in columns:
+        conn.execute("ALTER TABLE cloud_sync_state ADD COLUMN sync_endpoint TEXT")
+    if "endpoint" in columns:
+        conn.execute(
+            "UPDATE cloud_sync_state SET read_endpoint = endpoint "
+            "WHERE read_endpoint IS NULL AND endpoint IS NOT NULL"
+        )
+
+
 # In-place migrations: version N -> N+1 statement lists. A database whose
 # version has an unbroken chain here is upgraded without losing live data.
 # (Brand-new tables need no ALTERs - init_db runs _SCHEMA after migrating - but
@@ -492,6 +506,7 @@ _MIGRATIONS: Dict[int, Sequence[Union[str, Callable[[sqlite3.Connection], None]]
         # It contains no credentials or source data to backfill.
     ],
     36: [_backfill_plan_completion_dates],
+    37: [_migrate_cloud_sync_endpoints],
 }
 
 _DROP = """
@@ -945,7 +960,8 @@ CREATE TABLE IF NOT EXISTS cloud_publication_state (
 CREATE TABLE IF NOT EXISTS cloud_sync_state (
     user_id          INTEGER PRIMARY KEY,
     enabled          INTEGER NOT NULL DEFAULT 0 CHECK (enabled IN (0, 1)),
-    endpoint         TEXT,
+    read_endpoint    TEXT,
+    sync_endpoint    TEXT,
     last_success_at  REAL,
     retry_count      INTEGER NOT NULL DEFAULT 0 CHECK (retry_count >= 0),
     next_retry_at    REAL,
@@ -1182,22 +1198,28 @@ def get_cloud_sync_state(
     conn = connect(path)
     try:
         row = conn.execute(
-            "SELECT enabled, endpoint, last_success_at, retry_count, "
+            "SELECT enabled, read_endpoint, sync_endpoint, last_success_at, retry_count, "
             "next_retry_at, last_error FROM cloud_sync_state WHERE user_id = ?",
             (user_id,),
         ).fetchone()
         if row is None:
             return {
                 "enabled": False,
+                "read_endpoint": None,
+                "sync_endpoint": None,
                 "endpoint": None,
                 "last_success_at": None,
                 "retry_count": 0,
                 "next_retry_at": None,
                 "last_error": None,
             }
+        read_endpoint = row["read_endpoint"]
         return {
             "enabled": bool(row["enabled"]),
-            "endpoint": row["endpoint"],
+            "read_endpoint": read_endpoint,
+            "sync_endpoint": row["sync_endpoint"],
+            # Compatibility for callers that only displayed the old field.
+            "endpoint": read_endpoint,
             "last_success_at": row["last_success_at"],
             "retry_count": int(row["retry_count"]),
             "next_retry_at": row["next_retry_at"],
@@ -1215,8 +1237,15 @@ def save_cloud_sync_state(
         raise ValueError("user_id must be positive")
     if not isinstance(updates, dict):
         raise TypeError("updates must be a dict")
+    updates = dict(updates)
+    if "endpoint" in updates:
+        # Legacy callers supplied one endpoint for both planes. Keep that API
+        # meaning while all new callers use the explicit fields.
+        legacy_endpoint = updates.pop("endpoint")
+        updates.setdefault("read_endpoint", legacy_endpoint)
+        updates.setdefault("sync_endpoint", legacy_endpoint)
     allowed = {
-        "enabled", "endpoint", "last_success_at", "retry_count",
+        "enabled", "read_endpoint", "sync_endpoint", "last_success_at", "retry_count",
         "next_retry_at", "last_error",
     }
     if not set(updates) <= allowed:
@@ -1229,13 +1258,14 @@ def save_cloud_sync_state(
         if exists is None:
             raise ValueError("unknown user")
         row = conn.execute(
-            "SELECT enabled, endpoint, last_success_at, retry_count, "
+            "SELECT enabled, read_endpoint, sync_endpoint, last_success_at, retry_count, "
             "next_retry_at, last_error FROM cloud_sync_state WHERE user_id = ?",
             (user_id,),
         ).fetchone()
         current = {
             "enabled": bool(row["enabled"]) if row else False,
-            "endpoint": row["endpoint"] if row else None,
+            "read_endpoint": row["read_endpoint"] if row else None,
+            "sync_endpoint": row["sync_endpoint"] if row else None,
             "last_success_at": row["last_success_at"] if row else None,
             "retry_count": int(row["retry_count"]) if row else 0,
             "next_retry_at": row["next_retry_at"] if row else None,
@@ -1252,9 +1282,10 @@ def save_cloud_sync_state(
             or retry_count < 0
         ):
             raise ValueError("retry_count must be a non-negative integer")
-        endpoint = current["endpoint"]
-        if endpoint is not None and not isinstance(endpoint, str):
-            raise ValueError("endpoint must be text or null")
+        for endpoint_name in ("read_endpoint", "sync_endpoint"):
+            endpoint = current[endpoint_name]
+            if endpoint is not None and not isinstance(endpoint, str):
+                raise ValueError(f"{endpoint_name} must be text or null")
         last_error = current["last_error"]
         if last_error is not None and not isinstance(last_error, str):
             raise ValueError("last_error must be text or null")
@@ -1271,20 +1302,23 @@ def save_cloud_sync_state(
                     raise ValueError(f"{field_name} must be a finite number or null")
         conn.execute(
             "INSERT INTO cloud_sync_state "
-            "(user_id, enabled, endpoint, last_success_at, retry_count, "
-            "next_retry_at, last_error) VALUES (?, ?, ?, ?, ?, ?, ?) "
+            "(user_id, enabled, read_endpoint, sync_endpoint, last_success_at, "
+            "retry_count, next_retry_at, last_error) VALUES (?, ?, ?, ?, ?, ?, ?, ?) "
             "ON CONFLICT(user_id) DO UPDATE SET enabled=excluded.enabled, "
-            "endpoint=excluded.endpoint, last_success_at=excluded.last_success_at, "
+            "read_endpoint=excluded.read_endpoint, sync_endpoint=excluded.sync_endpoint, "
+            "last_success_at=excluded.last_success_at, "
             "retry_count=excluded.retry_count, next_retry_at=excluded.next_retry_at, "
             "last_error=excluded.last_error",
             (
-                user_id, int(enabled), endpoint, current["last_success_at"],
-                retry_count, current["next_retry_at"], last_error,
+                user_id, int(enabled), current["read_endpoint"],
+                current["sync_endpoint"], current["last_success_at"], retry_count,
+                current["next_retry_at"], last_error,
             ),
         )
         conn.commit()
     finally:
         conn.close()
+    current["endpoint"] = current["read_endpoint"]
     return current
 
 

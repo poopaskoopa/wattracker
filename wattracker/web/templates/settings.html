@@ -219,9 +219,14 @@
     <form method="post" action="/settings/cloud" class="cloud-sync-form">
         <label><input type="checkbox" name="enabled" value="on"
             {{ 'checked' if cloud_sync.enabled else '' }}> Enable cloud sync</label>
-        <label>Cloud endpoint
-            <input type="url" name="endpoint" value="{{ cloud_sync.endpoint or '' }}"
-                   placeholder="https://cloud.example"></label>
+        <label>Cloud read endpoint (enrollment, pairing, and reads)
+            <input type="url" name="read_endpoint"
+                   value="{{ cloud_sync.read_endpoint or '' }}"
+                   placeholder="https://wattracker-read.example"></label>
+        <label>Cloud sync endpoint (batch uploads)
+            <input type="url" name="sync_endpoint"
+                   value="{{ cloud_sync.sync_endpoint or '' }}"
+                   placeholder="https://wattracker-sync.example"></label>
         <label>Enrollment invitation
             <input type="text" name="invitation" value="" autocomplete="off"></label>
         <button type="submit">Save cloud settings</button>

@@ -205,8 +205,18 @@ def test_enrollment_success_stores_private_material_only_in_keyring(tmp_path, mo
         }).encode()
 
     sync = DesktopCloudSync(str(path), CloudCredentialStore(backend), transport=enrolled)
-    status = sync.enroll(user_id, "https://cloud.example", "I" * 32)
-    assert status.endpoint == "https://cloud.example"
+    status = sync.enroll(
+        user_id,
+        "https://read.example",
+        "I" * 32,
+        sync_endpoint="https://sync.example",
+    )
+    assert status.endpoint == "https://read.example"
+    assert status.read_endpoint == "https://read.example"
+    assert status.sync_endpoint == "https://sync.example"
+    stored = db.get_cloud_sync_state(user_id, path=str(path))
+    assert stored["read_endpoint"] == "https://read.example"
+    assert stored["sync_endpoint"] == "https://sync.example"
     assert status.enrolled
     assert calls[0][0].endswith("/api/v1/enrollment/complete")
     assert calls[0][2]["invitation"] == "I" * 32

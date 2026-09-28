@@ -41,11 +41,13 @@ DEVICE_LIST_IDEMPOTENCY_KEY = "device-list"
 DEVICE_REVOKE_IDEMPOTENCY_KEY = "device-revoke"
 WIPE_IDEMPOTENCY_KEY = "account-wipe"
 OFFLINE_MESSAGE = "Cloud sync offline — local data and features are unaffected."
+SYNC_ENDPOINT_NOT_CONFIGURED = "Cloud sync endpoint is not configured."
 MAX_RESPONSE_BYTES = 1 * 1024 * 1024
 _TOKEN_RE = re.compile(r"^[A-Za-z0-9_-]{16,256}$")
 _CREDENTIAL_ID_RE = re.compile(r"^[0-9a-f]{64}$")
 _NAMESPACE_RE = re.compile(r"^[0-9a-f]{64}$")
 _PUBLIC_KEY_RE = re.compile(r"^[0-9a-fA-F]{64}$")
+_DEFAULT_SYNC_ENDPOINT = object()
 
 
 class CloudEnrollmentError(ValueError):
@@ -181,11 +183,21 @@ class CloudSyncClient:
         endpoint: str,
         credentials: Optional[SyncCredentials] = None,
         *,
+        sync_endpoint: Optional[str] | object = _DEFAULT_SYNC_ENDPOINT,
         transport: Optional[Callable[[str, Mapping[str, str], bytes], tuple[int, bytes]]] = None,
         mtls_headers: Optional[Mapping[str, str]] = None,
         clock: Callable[[], float] = time.time,
     ) -> None:
-        self.endpoint = validate_cloud_endpoint(endpoint)
+        self.read_endpoint = validate_cloud_endpoint(endpoint)
+        if sync_endpoint is _DEFAULT_SYNC_ENDPOINT:
+            # Keep the one-endpoint constructor compatible for callers that
+            # have not opted into the split-plane state yet.
+            self.sync_endpoint = self.read_endpoint
+        elif sync_endpoint is None:
+            self.sync_endpoint = None
+        else:
+            self.sync_endpoint = validate_cloud_endpoint(sync_endpoint)
+        self.endpoint = self.read_endpoint
         self.credentials = credentials
         self.transport = transport
         self.mtls_headers = dict(mtls_headers or {})
@@ -215,14 +227,21 @@ class CloudSyncClient:
             request_headers["Content-Type"] = "application/json"
         request_headers.update(self.mtls_headers)
         request_headers.update(headers or {})
+        endpoint = (
+            self.sync_endpoint
+            if path.startswith("/api/v1/sync/")
+            else self.read_endpoint
+        )
+        if endpoint is None:
+            return None, {}
         try:
             if self._transport_accepts_method:
                 status, response_body = self.transport(
-                    self.endpoint + path, request_headers, body, method,
+                    endpoint + path, request_headers, body, method,
                 )
             else:
                 status, response_body = self.transport(
-                    self.endpoint + path, request_headers, body,
+                    endpoint + path, request_headers, body,
                 )
         except Exception:
             return None, {}
@@ -329,6 +348,8 @@ class CloudSyncClient:
         del namespace  # Compatibility argument; the enrolled binding wins.
         if self.credentials is None:
             return SyncResult(False, None, OFFLINE_MESSAGE)
+        if self.sync_endpoint is None:
+            return SyncResult(False, None, SYNC_ENDPOINT_NOT_CONFIGURED)
         signing_namespace = self.credentials.namespace
         raw = json.dumps(
             {

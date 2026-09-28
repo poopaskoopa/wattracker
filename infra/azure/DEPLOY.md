@@ -77,7 +77,10 @@ checkout of the current `main` commit with no changes except that file. It
 requires the arm64 Homebrew
 GitHub CLI at `/opt/homebrew/bin/gh`, uses the existing operator CLI's endpoint
 and token loading, and never prints parameter contents, credentials, or cloud
-response bodies:
+response bodies. The desktop needs both the read and sync Container App
+endpoints; `admin invite` reads them from
+`WATTRACKER_CLOUD_READ_ENDPOINT` and `WATTRACKER_CLOUD_SYNC_ENDPOINT` and
+prints both next to the invitation.
 
 ```sh
 .venv/bin/python scripts/deploy_cloud.py infra/azure/main.local.bicepparam \
@@ -501,6 +504,13 @@ az containerapp show --name wattracker-sync --resource-group "$RESOURCE_GROUP" -
 # Set this to the exact storageName value used in main.bicepparam.
 export STORAGE_NAME='TODO_STORAGE_NAME'
 ```
+
+Use the `fqdn` from the first command as the read endpoint and the `fqdn`
+from the second as the sync endpoint. The equivalent endpoint-only queries
+for preparing the operator environment are:
+
+    export WATTRACKER_CLOUD_READ_ENDPOINT="https://$(az containerapp show --name wattracker-read --resource-group "$RESOURCE_GROUP" --query properties.configuration.ingress.fqdn --output tsv)"
+    export WATTRACKER_CLOUD_SYNC_ENDPOINT="https://$(az containerapp show --name wattracker-sync --resource-group "$RESOURCE_GROUP" --query properties.configuration.ingress.fqdn --output tsv)"
 
 ## 3. Stage and publish the budget hook (unverified commands)
 
