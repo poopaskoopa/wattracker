@@ -187,16 +187,14 @@ states on `main` when the PR is merge-committed. Four such commits are on
 `main` from #358 and #356 (`a04e344`, `95a6bb2`, `8d1a582`, `892b345`); if
 `git bisect` lands on one, `git bisect skip` it.
 
-1. **#394: the desktop must use separate read and sync endpoints.** The
-   deployment runs read and sync as separate apps, but the desktop stores one
-   endpoint and sends everything there, so no desktop can both enrol (read) and
-   sync (sync). This blocks the first real enrolment. The fix is client-side:
-   store `read_endpoint` and `sync_endpoint` (a schema change, so serialize per
-   the section above), route `/api/v1/sync/*` to sync and everything else to
-   read, add two settings fields, and have `admin invite` print both. Do NOT
-   merge the planes. The key test runs `plane="read"` and `plane="sync"` as
-   separate apps end to end. Credential handling is unchanged, but it needs a
-   security review before merge.
+1. **#397: the server supplies the sync endpoint at enrolment.** #396 made the
+   desktop store separate read and sync URLs, but the rider types the sync URL
+   and nothing verifies it. The owner decided the read app returns its sibling
+   sync URL from `enrollment/complete`, configured via
+   `WATTRACKER_CLOUD_SYNC_ENDPOINT` and set in Bicep from the sync app's FQDN.
+   The desktop stores that URL and drops the typed field. Fold in #396's three
+   review cleanups. It's a server change, so the owner redeploys afterwards, and
+   it needs a security review before merge.
 
 2. **#249: rotating full-suite test flakes. Still not a local-runs job.**
    Nothing has changed since the re-scope. 21 consecutive clean local full
