@@ -432,7 +432,6 @@ def test_a_connector_session_cannot_change_cloud_settings(client, monkeypatch):
             data={
                 "enabled": "on",
                 "read_endpoint": "https://read.example",
-                "sync_endpoint": "https://sync.example",
                 "invitation": "invite",
             },
         )
@@ -444,14 +443,12 @@ def test_a_connector_session_cannot_change_cloud_settings(client, monkeypatch):
         data={
             "enabled": "on",
             "read_endpoint": "https://read.example",
-            "sync_endpoint": "https://sync.example",
             "invitation": "invite",
         },
         follow_redirects=False,
     )
     assert control.status_code == 303
-    assert calls == [("enroll", (uid, "https://read.example", "invite"),
-                      {"sync_endpoint": "https://sync.example"}),
+    assert calls == [("enroll", (uid, "https://read.example", "invite"), {}),
                      ("enabled", (uid, True))]
 
 

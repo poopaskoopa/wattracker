@@ -1308,6 +1308,7 @@ def test_enrollment_is_operator_only_one_time_and_returns_opaque_credentials(clo
     assert completed.status_code == 200
     payload = completed.json()
     assert payload["credential"] and payload["subscription_key"] and payload["reader_context"]
+    assert payload["sync_endpoint"] is None
     assert client.post(
         "/api/v1/enrollment/complete",
         headers={
@@ -1355,6 +1356,7 @@ def test_read_enrollment_is_usable_by_restarted_sync_and_read_planes():
         server_secret=SECRET,
         operator_token="operator-token",
         plane="read",
+        sync_endpoint="https://sync.example",
         require_gateway_proof=False,
         clock=lambda: 1_000,
     )
@@ -1385,6 +1387,7 @@ def test_read_enrollment_is_usable_by_restarted_sync_and_read_planes():
     enrolled = completed.json()
     assert enrolled["subscription_key"]
     assert enrolled["subscription_key"] != "apim-subscription"
+    assert enrolled["sync_endpoint"] == "https://sync.example"
 
     sync_config = CloudConfig(
         server_secret=SECRET,

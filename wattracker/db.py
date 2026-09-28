@@ -1207,7 +1207,6 @@ def get_cloud_sync_state(
                 "enabled": False,
                 "read_endpoint": None,
                 "sync_endpoint": None,
-                "endpoint": None,
                 "last_success_at": None,
                 "retry_count": 0,
                 "next_retry_at": None,
@@ -1218,8 +1217,6 @@ def get_cloud_sync_state(
             "enabled": bool(row["enabled"]),
             "read_endpoint": read_endpoint,
             "sync_endpoint": row["sync_endpoint"],
-            # Compatibility for callers that only displayed the old field.
-            "endpoint": read_endpoint,
             "last_success_at": row["last_success_at"],
             "retry_count": int(row["retry_count"]),
             "next_retry_at": row["next_retry_at"],
@@ -1238,12 +1235,6 @@ def save_cloud_sync_state(
     if not isinstance(updates, dict):
         raise TypeError("updates must be a dict")
     updates = dict(updates)
-    if "endpoint" in updates:
-        # Legacy callers supplied one endpoint for both planes. Keep that API
-        # meaning while all new callers use the explicit fields.
-        legacy_endpoint = updates.pop("endpoint")
-        updates.setdefault("read_endpoint", legacy_endpoint)
-        updates.setdefault("sync_endpoint", legacy_endpoint)
     allowed = {
         "enabled", "read_endpoint", "sync_endpoint", "last_success_at", "retry_count",
         "next_retry_at", "last_error",
@@ -1318,7 +1309,6 @@ def save_cloud_sync_state(
         conn.commit()
     finally:
         conn.close()
-    current["endpoint"] = current["read_endpoint"]
     return current
 
 

@@ -95,6 +95,17 @@ def test_public_container_apps_are_tls_terminated_and_authenticate_at_the_app():
     assert "application enforces" in RUNBOOK
 
 
+def test_read_app_receives_the_server_supplied_sync_endpoint():
+    read_app = _resource_block("readApp")
+    sync_app = _resource_block("syncApp")
+    assert "name: 'WATTRACKER_CLOUD_SYNC_ENDPOINT'" in read_app
+    assert (
+        "value: 'https://${syncApp.properties.configuration.ingress.fqdn}'"
+        in read_app
+    )
+    assert "WATTRACKER_CLOUD_SYNC_ENDPOINT" not in sync_app
+
+
 def test_storage_uses_service_endpoints_and_a_deny_by_default_firewall():
     assert "publicNetworkAccess: 'Enabled'" in BICEP
     assert "allowBlobPublicAccess: false" in BICEP

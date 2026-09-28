@@ -86,7 +86,11 @@ def _two_rider_sync(tmp_path):
         store.save_writer(_credentials(), user_id=user_id)
         db.save_cloud_sync_state(
             user_id,
-            {"endpoint": "https://cloud.example", "enabled": True},
+            {
+                "read_endpoint": "https://cloud.example",
+                "sync_endpoint": "https://sync.example",
+                "enabled": True,
+            },
             path=str(path),
         )
     sync = DesktopCloudSync(
@@ -202,6 +206,7 @@ def test_enrollment_success_stores_private_material_only_in_keyring(tmp_path, mo
             "subscription_key": "subscription-secret",
             "signature_algorithm": "ed25519",
             "signing_namespace": "e" * 64,
+            "sync_endpoint": "https://server-sync.example",
         }).encode()
 
     sync = DesktopCloudSync(str(path), CloudCredentialStore(backend), transport=enrolled)
@@ -209,14 +214,12 @@ def test_enrollment_success_stores_private_material_only_in_keyring(tmp_path, mo
         user_id,
         "https://read.example",
         "I" * 32,
-        sync_endpoint="https://sync.example",
     )
-    assert status.endpoint == "https://read.example"
     assert status.read_endpoint == "https://read.example"
-    assert status.sync_endpoint == "https://sync.example"
+    assert status.sync_endpoint == "https://server-sync.example"
     stored = db.get_cloud_sync_state(user_id, path=str(path))
     assert stored["read_endpoint"] == "https://read.example"
-    assert stored["sync_endpoint"] == "https://sync.example"
+    assert stored["sync_endpoint"] == "https://server-sync.example"
     assert status.enrolled
     assert calls[0][0].endswith("/api/v1/enrollment/complete")
     assert calls[0][2]["invitation"] == "I" * 32
@@ -269,6 +272,7 @@ def test_enrollment_and_signing_are_scoped_to_each_local_user(tmp_path, monkeypa
                 "subscription_key": subscription,
                 "signature_algorithm": "ed25519",
                 "signing_namespace": namespace,
+                "sync_endpoint": "https://sync.example",
             }).encode()
         if url.endswith("/api/v1/sync/batches"):
             signed_requests.append((headers, body))
@@ -326,7 +330,13 @@ def test_offline_queue_retry_and_drain_preserves_snapshot_ledger(tmp_path):
         str(path), store, transport=transport, retry_base_seconds=1,
     )
     db.save_cloud_sync_state(
-        user_id, {"endpoint": "https://cloud.example", "enabled": True}, path=str(path),
+        user_id,
+        {
+            "read_endpoint": "https://cloud.example",
+            "sync_endpoint": "https://sync.example",
+            "enabled": True,
+        },
+        path=str(path),
     )
     first = sync.sync_once(user_id)
     assert first[0].status_code == 503
@@ -356,10 +366,16 @@ def test_disable_between_pages_stops_before_the_next_outbound_request(tmp_path):
         include_derived=False,
     )
     db.save_cloud_sync_state(
-        user_id, {"endpoint": "https://cloud.example", "enabled": True}, path=str(path),
+        user_id,
+        {
+            "read_endpoint": "https://cloud.example",
+            "sync_endpoint": "https://sync.example",
+            "enabled": True,
+        },
+        path=str(path),
     )
     sync.sync_once(user_id)
-    assert calls == ["https://cloud.example/api/v1/sync/batches"]
+    assert calls == ["https://sync.example/api/v1/sync/batches"]
     conn = sqlite3.connect(path)
     try:
         assert conn.execute(
@@ -401,7 +417,13 @@ def test_request_sync_only_enqueues_and_pairing_uses_exact_signed_routes(tmp_pat
     store.save_writer(credentials, user_id=user_id)
     sync = DesktopCloudSync(str(path), store, transport=transport)
     db.save_cloud_sync_state(
-        user_id, {"endpoint": "https://cloud.example", "enabled": True}, path=str(path),
+        user_id,
+        {
+            "read_endpoint": "https://cloud.example",
+            "sync_endpoint": "https://sync.example",
+            "enabled": True,
+        },
+        path=str(path),
     )
     before = len(captured)
     assert sync.request_sync(user_id)
@@ -450,7 +472,13 @@ def test_cloud_wipe_uses_signed_empty_request_and_clears_local_credential(tmp_pa
     store.save_writer(credentials, user_id=user_id)
     sync = DesktopCloudSync(str(path), store, transport=transport)
     db.save_cloud_sync_state(
-        user_id, {"endpoint": "https://cloud.example", "enabled": True}, path=str(path),
+        user_id,
+        {
+            "read_endpoint": "https://cloud.example",
+            "sync_endpoint": "https://sync.example",
+            "enabled": True,
+        },
+        path=str(path),
     )
 
     assert sync.wipe_cloud_data(user_id) is True
@@ -482,7 +510,13 @@ def test_cloud_wipe_404_clears_local_credential_disables_sync_and_forces_republi
     store = CloudCredentialStore(MemorySecrets())
     store.save_writer(credentials, user_id=user_id)
     db.save_cloud_sync_state(
-        user_id, {"endpoint": "https://cloud.example", "enabled": True}, path=str(path),
+        user_id,
+        {
+            "read_endpoint": "https://cloud.example",
+            "sync_endpoint": "https://sync.example",
+            "enabled": True,
+        },
+        path=str(path),
     )
     sync = DesktopCloudSync(str(path), store, transport=transport, include_derived=False)
     assert sync.wipe_cloud_data(user_id) is False
@@ -514,7 +548,13 @@ def test_cloud_wipe_503_keeps_local_writer_and_sync_enabled(tmp_path):
     store = CloudCredentialStore(MemorySecrets())
     store.save_writer(credentials, user_id=user_id)
     db.save_cloud_sync_state(
-        user_id, {"endpoint": "https://cloud.example", "enabled": True}, path=str(path),
+        user_id,
+        {
+            "read_endpoint": "https://cloud.example",
+            "sync_endpoint": "https://sync.example",
+            "enabled": True,
+        },
+        path=str(path),
     )
     sync = DesktopCloudSync(
         str(path), store,
@@ -536,7 +576,13 @@ def test_cloud_wipe_transport_exception_keeps_local_writer_and_sync_enabled(tmp_
     store = CloudCredentialStore(MemorySecrets())
     store.save_writer(credentials, user_id=user_id)
     db.save_cloud_sync_state(
-        user_id, {"endpoint": "https://cloud.example", "enabled": True}, path=str(path),
+        user_id,
+        {
+            "read_endpoint": "https://cloud.example",
+            "sync_endpoint": "https://sync.example",
+            "enabled": True,
+        },
+        path=str(path),
     )
     sync = DesktopCloudSync(str(path), store, transport=transport)
 
@@ -559,7 +605,12 @@ def test_unchanged_sync_skips_snapshot_rebuild(tmp_path, monkeypatch):
         str(path), store, transport=transport, include_derived=False,
     )
     db.save_cloud_sync_state(
-        user_id, {"endpoint": "https://cloud.example", "enabled": True},
+        user_id,
+        {
+            "read_endpoint": "https://cloud.example",
+            "sync_endpoint": "https://sync.example",
+            "enabled": True,
+        },
         path=str(path),
     )
     try:
@@ -590,7 +641,12 @@ def test_same_count_activity_edit_invalidates_snapshot_gate(tmp_path):
         str(path), store, transport=transport, include_derived=False,
     )
     db.save_cloud_sync_state(
-        user_id, {"endpoint": "https://cloud.example", "enabled": True},
+        user_id,
+        {
+            "read_endpoint": "https://cloud.example",
+            "sync_endpoint": "https://sync.example",
+            "enabled": True,
+        },
         path=str(path),
     )
     try:
@@ -629,7 +685,12 @@ def test_source_write_racing_success_baseline_is_published_next_cycle(
         str(path), store, transport=transport, include_derived=False,
     )
     db.save_cloud_sync_state(
-        user_id, {"endpoint": "https://cloud.example", "enabled": True},
+        user_id,
+        {
+            "read_endpoint": "https://cloud.example",
+            "sync_endpoint": "https://sync.example",
+            "enabled": True,
+        },
         path=str(path),
     )
 
@@ -747,7 +808,12 @@ def test_derived_snapshot_gate_expires_when_calendar_day_changes(
 
     sync = DesktopCloudSync(str(path), store, transport=transport, clock=clock)
     db.save_cloud_sync_state(
-        user_id, {"endpoint": "https://cloud.example", "enabled": True},
+        user_id,
+        {
+            "read_endpoint": "https://cloud.example",
+            "sync_endpoint": "https://sync.example",
+            "enabled": True,
+        },
         path=str(path),
     )
     try:
@@ -902,7 +968,11 @@ def test_device_administration_stays_reachable_from_a_cold_start_with_sync_off(t
     sync = DesktopCloudSync(str(path), store, transport=transport)
     db.save_cloud_sync_state(
         user_id,
-        {"endpoint": "https://cloud.example", "enabled": False},
+        {
+            "read_endpoint": "https://cloud.example",
+            "sync_endpoint": "https://sync.example",
+            "enabled": False,
+        },
         path=str(path),
     )
     assert not sync.status(user_id).enabled
@@ -953,7 +1023,11 @@ def test_disabled_scheduler_round_publishes_nothing(tmp_path):
     sync = DesktopCloudSync(str(path), store, transport=transport)
     db.save_cloud_sync_state(
         user_id,
-        {"endpoint": "https://cloud.example", "enabled": False},
+        {
+            "read_endpoint": "https://cloud.example",
+            "sync_endpoint": "https://sync.example",
+            "enabled": False,
+        },
         path=str(path),
     )
     sync.start()

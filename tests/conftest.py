@@ -159,6 +159,10 @@ def isolated_env(tmp_path, monkeypatch):
         "WATTRACKER_CLOUD_HOST",
         "WATTRACKER_CLOUD_PORT",
         "WATTRACKER_CLOUD_PLANE",
+        "WATTRACKER_CLOUD_ENDPOINT",
+        "WATTRACKER_CLOUD_READ_ENDPOINT",
+        "WATTRACKER_CLOUD_SYNC_ENDPOINT",
+        "WATTRACKER_CLOUD_OPERATOR_TOKEN",
         "WATTRACKER_ALLOWED_ORIGINS",
         # Destructive desktop controls are opt-in and must never inherit a
         # developer's local setting into unrelated tests.

@@ -755,8 +755,8 @@ def test_commands_dispatch_and_print_json(monkeypatch, capsys):
         return {"operator_handle": installation_id, "status": "revoked"}
 
     monkeypatch.setattr(admin, "_request_json", fake_request)
-    monkeypatch.setenv("WATTRACKER_CLOUD_ENDPOINT", "http://127.0.0.1:8765")
-    monkeypatch.setenv("WATTRACKER_CLOUD_SYNC_ENDPOINT", "http://127.0.0.1:8766")
+    monkeypatch.setenv("WATTRACKER_CLOUD_READ_ENDPOINT", "http://127.0.0.1:8765")
+    monkeypatch.setenv("WATTRACKER_CLOUD_ENDPOINT", "https://legacy.example")
     monkeypatch.setenv("WATTRACKER_CLOUD_OPERATOR_TOKEN", TOKEN)
 
     assert admin.main(["invite"]) == 0
@@ -764,7 +764,6 @@ def test_commands_dispatch_and_print_json(monkeypatch, capsys):
         "invitation": "invitation-value",
         "expires_at": 1900,
         "read_endpoint": "http://127.0.0.1:8765",
-        "sync_endpoint": "http://127.0.0.1:8766",
     }
 
     assert admin.main(["version"]) == 0
@@ -786,6 +785,9 @@ def test_commands_dispatch_and_print_json(monkeypatch, capsys):
         ("/api/v1/admin/installations", "GET"),
         (f"/api/v1/admin/installations/{installation_id}/revoke", "POST"),
     ]
+    assert {endpoint for endpoint, _path, _token, _method in calls} == {
+        "http://127.0.0.1:8765"
+    }
 
 
 @pytest.mark.parametrize(
@@ -804,8 +806,7 @@ def test_cli_timeout_is_actionable_and_token_safe(monkeypatch, capsys, argv):
             raise urllib.error.URLError(TimeoutError(TOKEN))
 
     monkeypatch.setattr(urllib.request, "build_opener", lambda *args: FakeOpener())
-    monkeypatch.setenv("WATTRACKER_CLOUD_ENDPOINT", "https://cloud.example")
-    monkeypatch.setenv("WATTRACKER_CLOUD_SYNC_ENDPOINT", "https://sync.example")
+    monkeypatch.setenv("WATTRACKER_CLOUD_READ_ENDPOINT", "https://cloud.example")
     monkeypatch.setenv("WATTRACKER_CLOUD_OPERATOR_TOKEN", TOKEN)
 
     assert admin.main(argv) == 2
@@ -824,7 +825,7 @@ def test_cli_transport_failure_stays_generic_and_token_safe(monkeypatch, capsys)
             raise urllib.error.URLError(TOKEN)
 
     monkeypatch.setattr(urllib.request, "build_opener", lambda *args: FakeOpener())
-    monkeypatch.setenv("WATTRACKER_CLOUD_ENDPOINT", "https://cloud.example")
+    monkeypatch.setenv("WATTRACKER_CLOUD_READ_ENDPOINT", "https://cloud.example")
     monkeypatch.setenv("WATTRACKER_CLOUD_OPERATOR_TOKEN", TOKEN)
 
     assert admin.main(["version"]) == 2
@@ -859,7 +860,7 @@ def test_revoke_cli_distinguishes_missing_and_busy_without_echoing_token(
             )
 
     monkeypatch.setattr(urllib.request, "build_opener", lambda *args: FakeOpener())
-    monkeypatch.setenv("WATTRACKER_CLOUD_ENDPOINT", "https://cloud.example")
+    monkeypatch.setenv("WATTRACKER_CLOUD_READ_ENDPOINT", "https://cloud.example")
     monkeypatch.setenv("WATTRACKER_CLOUD_OPERATOR_TOKEN", TOKEN)
 
     assert admin.main(["revoke-installation", installation_id]) == 2
@@ -880,7 +881,7 @@ def test_revoke_cli_uses_generic_message_for_malformed_retry_after(monkeypatch, 
             )
 
     monkeypatch.setattr(urllib.request, "build_opener", lambda *args: FakeOpener())
-    monkeypatch.setenv("WATTRACKER_CLOUD_ENDPOINT", "https://cloud.example")
+    monkeypatch.setenv("WATTRACKER_CLOUD_READ_ENDPOINT", "https://cloud.example")
     monkeypatch.setenv("WATTRACKER_CLOUD_OPERATOR_TOKEN", TOKEN)
 
     assert admin.main(["revoke-installation", installation_id]) == 2

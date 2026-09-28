@@ -11,6 +11,7 @@ import os
 from typing import Iterable
 
 from .api import CloudConfig, CloudState, create_cloud_app
+from .client import validate_cloud_endpoint
 from .security import AzureTableSecurityStateBackend
 from .storage import AzureTenantStore
 
@@ -54,12 +55,30 @@ def _env_flag(name: str) -> bool:
     }
 
 
+def _sync_endpoint(plane: str) -> str | None:
+    value = os.environ.get("WATTRACKER_CLOUD_SYNC_ENDPOINT", "").strip()
+    if not value:
+        if plane == "read":
+            raise RuntimeError(
+                "WATTRACKER_CLOUD_SYNC_ENDPOINT is required for the read plane"
+            )
+        return None
+    try:
+        return validate_cloud_endpoint(value)
+    except ValueError as exc:
+        raise RuntimeError(
+            "WATTRACKER_CLOUD_SYNC_ENDPOINT must be an absolute HTTPS URL"
+        ) from exc
+
+
 def create_runtime_app():
     """Build the production app with persistent Azure-backed object storage."""
+    plane = os.environ.get("WATTRACKER_CLOUD_PLANE", "read")
     config = CloudConfig(
         server_secret=_server_secret(),
         operator_token=_required_secret("WATTRACKER_CLOUD_OPERATOR_TOKEN"),
-        plane=os.environ.get("WATTRACKER_CLOUD_PLANE", "read"),
+        plane=plane,
+        sync_endpoint=_sync_endpoint(plane),
         allow_account_wipe=_env_flag("WATTRACKER_CLOUD_ALLOW_ACCOUNT_WIPE"),
         allowed_origins=_origins(),
         # The production deployment has no gateway that can overwrite and
