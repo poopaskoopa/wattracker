@@ -193,19 +193,10 @@ states on `main` when the PR is merge-committed. Four such commits are on
    which records the generic offline text (Azure shows `0xx` client
    disconnects). Measure the per-batch cost, shrink the batch, give POSTs a
    longer timeout, prove timeout-then-replay succeeds, and record a
-   distinguishable non-sensitive reason. This blocks all real cloud use; take it
-   before #397.
+   distinguishable non-sensitive reason. Also covers the two #401 test gaps in
+   the issue comment. This blocks all real cloud use.
 
-2. **#397: the server supplies the sync endpoint at enrolment.** #396 made the
-   desktop store separate read and sync URLs, but the rider types the sync URL
-   and nothing verifies it. The owner decided the read app returns its sibling
-   sync URL from `enrollment/complete`, configured via
-   `WATTRACKER_CLOUD_SYNC_ENDPOINT` and set in Bicep from the sync app's FQDN.
-   The desktop stores that URL and drops the typed field. Fold in #396's three
-   review cleanups. It's a server change, so the owner redeploys afterwards, and
-   it needs a security review before merge.
-
-3. **#249: rotating full-suite test flakes. Still not a local-runs job.**
+2. **#249: rotating full-suite test flakes. Still not a local-runs job.**
    Nothing has changed since the re-scope. 21 consecutive clean local full
    suites stand against zero reproductions. Both known instances came from
    **taksmon's machine**. **The next step is taksmon's log and his exact
