@@ -393,6 +393,66 @@ def _context_index_companion(
     return _Companion(key=candidate)
 
 
+def wipe_capability_proven(
+    namespace: str,
+    local_user_scope: str,
+    *,
+    store: object | None,
+    security_backend: object | None,
+) -> bool:
+    """Whether every store a wipe deletes from will let this identity delete.
+
+    Call this before :func:`wipe_scope` and refuse the wipe on ``False``.
+    :func:`wipe_scope` removes credentials first and data last, so a delete
+    grant that is missing on the *data* stores -- as it is for the minutes
+    Azure RBAC takes to propagate a new role assignment -- would otherwise
+    delete the rider's credentials and then 403 on the purge, leaving the data
+    in the cloud with no credential left to retry with.  Proving capability
+    first turns that into a clean refusal with nothing deleted.
+
+    Three stores are proved, and each with a delete of a key that cannot
+    exist, never of real data:
+
+    * the object blobs and the object rows, through the store's
+      ``can_purge_scope`` (which also takes and releases the scope lease the
+      purge holds while it deletes);
+    * the credential rows, through the auth backend's ``can_delete``.
+
+    A collaborator that is ``None`` is not asked -- :func:`wipe_scope` will
+    not touch it either.  A collaborator that has no probe, or whose probe
+    raises, is "cannot": this answers "yes" only on positive evidence.
+    """
+
+    namespace_text = _require_namespace(namespace)
+    scope_text = _require_local_scope(local_user_scope)
+    if store is None and security_backend is None:
+        return False
+    checks: list[tuple[str, Any]] = []
+    if store is not None:
+        checks.append((
+            "object store",
+            lambda: store.can_purge_scope(namespace_text, scope_text),
+        ))
+    if security_backend is not None:
+        checks.append(("auth table", lambda: security_backend.can_delete()))
+    for name, check in checks:
+        try:
+            proven = check() is True
+        except Exception:
+            proven = False
+        if not proven:
+            # Which store, never which key: the probe key is random and the
+            # scope is the rider's.  This is the line an operator reads to
+            # learn "the grant has not reached this store yet".
+            _log.warning(
+                "cloud scope wipe refused: the %s did not prove delete "
+                "permission; nothing was deleted",
+                name,
+            )
+            return False
+    return True
+
+
 def wipe_scope(
     namespace: str,
     local_user_scope: str,
@@ -415,6 +475,11 @@ def wipe_scope(
 
     Either collaborator may be ``None`` so the two halves can be exercised
     apart; passing neither is a no-op and is refused.
+
+    This function does not probe permissions itself.  A caller running
+    against a real deployment must ask :func:`wipe_capability_proven` first
+    and refuse on ``False``, as the HTTP route does: once this has started,
+    the credentials are the first thing to go.
     """
 
     if irreversible is not True:
@@ -524,5 +589,6 @@ __all__ = [
     "WIPE_PROTECTED_RECORD_KINDS",
     "WIPE_RECORD_KINDS",
     "WIPE_SCAN_LIMIT",
+    "wipe_capability_proven",
     "wipe_scope",
 ]

@@ -6,7 +6,12 @@ import sqlite3
 import pytest
 
 from wattracker import db
-from wattracker.cloud.client import CloudSyncClient, SyncCredentials
+from wattracker.cloud.client import (
+    CloudSyncClient,
+    SyncCredentials,
+    SyncResult,
+    SYNC_ENDPOINT_NOT_CONFIGURED,
+)
 from wattracker.cloud.models import CloudObject, ModelError
 from wattracker.cloud.storage import MemoryTenantStore
 from wattracker.cloud import snapshot as snapshot_module
@@ -242,6 +247,7 @@ def test_interrupted_push_resumes_pages_without_skipping_or_duplicate_successes(
     )
     client = CloudSyncClient(
         "https://cloud.example", credentials, transport=transport,
+        sync_endpoint="https://sync.example",
         clock=lambda: 100,
     )
 
@@ -259,6 +265,22 @@ def test_interrupted_push_resumes_pages_without_skipping_or_duplicate_successes(
     assert [body["objects"][0]["id"] for body in bodies] == [
         "activity-1", "activity-2", "activity-2", "activity-3",
     ]
+
+
+def test_push_snapshot_refuses_missing_sync_endpoint_before_building_batch(
+    tmp_path, monkeypatch,
+):
+    path, user_id = _fixture_db(tmp_path, count=1)
+    credentials = SyncCredentials(
+        "c" * 64, "subscription", b"signing-key", namespace="ab" * 32,
+    )
+    client = CloudSyncClient("https://cloud.example", credentials)
+    monkeypatch.setattr(
+        "wattracker.cloud.client.build_snapshot_batch",
+        lambda *_args, **_kwargs: pytest.fail("snapshot batch was built"),
+    )
+    result = client.push_snapshot(str(path), user_id, include_derived=False)
+    assert result == [SyncResult(False, None, SYNC_ENDPOINT_NOT_CONFIGURED)]
 
 
 def test_pending_batch_blocks_a_newer_different_option_prepare(tmp_path):
@@ -331,6 +353,7 @@ def test_client_republish_preserves_an_unresolved_pending_batch(tmp_path):
 
     client = CloudSyncClient(
         "https://cloud.example", credentials, transport=transport,
+        sync_endpoint="https://sync.example",
     )
     result = client.push_snapshot(
         str(path), user_id, include_derived=False, republish=True,

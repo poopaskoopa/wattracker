@@ -3,13 +3,22 @@ import sys
 import types
 
 import pytest
+from keyring.backends.chainer import ChainerBackend
+from keyring.backends.fail import Keyring as FailKeyring
+from keyring.backends.kwallet import DBusKeyring
+from keyring.backends.macOS import Keyring as MacOSKeyring
+from keyring.backends.null import Keyring as NullKeyring
+from keyring.backends.SecretService import Keyring as SecretServiceKeyring
+from keyring.backends.Windows import WinVaultKeyring
 
 from wattracker.cloud.client import SyncCredentials
 from wattracker.cloud.credentials import (
     CloudCredentialStore,
     CloudCredentialUnavailable,
+    KeyringBackend,
 )
 from wattracker.cloud.desktop_sync import DesktopCloudSync
+from wattracker import credstore
 
 
 class MemorySecrets:
@@ -26,12 +35,21 @@ class MemorySecrets:
         self.values.pop(account, None)
 
 
+@pytest.mark.parametrize("disabled_value", ["0", "false", "no"])
 @pytest.mark.parametrize("operation", ["get", "set"])
 def test_default_cloud_backend_respects_disabled_keyring_without_importing_or_calling_it(
-    monkeypatch, operation,
+    monkeypatch, disabled_value, operation,
 ):
+    monkeypatch.setenv("WATTRACKER_KEYRING", disabled_value)
     calls = []
     failing_keyring = types.ModuleType("keyring")
+    fake_errors = types.ModuleType("keyring.errors")
+    fake_errors.KeyringError = RuntimeError
+    failing_keyring.errors = fake_errors
+    uncalled_backend = type(
+        "DisabledKeyring", (), {"__module__": "test_disabled_keyring"}
+    )()
+    failing_keyring.get_keyring = lambda: uncalled_backend
 
     def fail(*args, **kwargs):
         calls.append((args, kwargs))
@@ -41,15 +59,17 @@ def test_default_cloud_backend_respects_disabled_keyring_without_importing_or_ca
     failing_keyring.set_password = fail
     failing_keyring.delete_password = fail
     monkeypatch.setitem(sys.modules, "keyring", failing_keyring)
+    monkeypatch.setitem(sys.modules, "keyring.errors", fake_errors)
 
     real_import = builtins.__import__
+    imports = []
 
-    def reject_keyring_import(name, *args, **kwargs):
-        if name == "keyring":
-            raise AssertionError("disabled keyring was imported")
+    def record_keyring_import(name, *args, **kwargs):
+        if name == "keyring" or name.startswith("keyring."):
+            imports.append(name)
         return real_import(name, *args, **kwargs)
 
-    monkeypatch.setattr(builtins, "__import__", reject_keyring_import)
+    monkeypatch.setattr(builtins, "__import__", record_keyring_import)
 
     sync = DesktopCloudSync()
     with pytest.raises(CloudCredentialUnavailable, match="secure storage"):
@@ -58,6 +78,100 @@ def test_default_cloud_backend_respects_disabled_keyring_without_importing_or_ca
         else:
             sync.credential_store.backend.set("account", "value")
 
+    assert calls == []
+    assert imports == []
+
+
+def _install_fake_keyring(monkeypatch, backend):
+    calls = []
+    fake_keyring = types.ModuleType("keyring")
+    fake_errors = types.ModuleType("keyring.errors")
+    fake_errors.KeyringError = RuntimeError
+    fake_keyring.errors = fake_errors
+    fake_keyring.get_keyring = lambda: backend
+
+    def set_password(*args):
+        calls.append(args)
+
+    fake_keyring.set_password = set_password
+    monkeypatch.setitem(sys.modules, "keyring", fake_keyring)
+    monkeypatch.setitem(sys.modules, "keyring.errors", fake_errors)
+    monkeypatch.setenv("WATTRACKER_KEYRING", "1")
+    return calls
+
+
+def _backend_instance(backend_class):
+    """Exercise backend identity only; never initialize or call a backend."""
+    return backend_class.__new__(backend_class)
+
+
+@pytest.mark.parametrize(
+    "backend_class",
+    [FailKeyring, NullKeyring, ChainerBackend],
+)
+def test_keyring_backend_rejects_real_unsafe_backends_before_writing(
+    monkeypatch, backend_class,
+):
+    backend = _backend_instance(backend_class)
+    calls = _install_fake_keyring(monkeypatch, backend)
+
+    with pytest.raises(CloudCredentialUnavailable, match="secure storage"):
+        KeyringBackend()
+
+    assert calls == []
+
+
+@pytest.mark.parametrize(
+    ("backend_class", "is_windows"),
+    [
+        (MacOSKeyring, False),
+        (SecretServiceKeyring, False),
+        (DBusKeyring, False),
+        (WinVaultKeyring, True),
+    ],
+)
+def test_keyring_backend_allows_real_secure_backends_on_supported_platforms(
+    monkeypatch, backend_class, is_windows,
+):
+    monkeypatch.setattr(credstore, "_is_windows", lambda: is_windows)
+
+    assert credstore._keyring_backend_allowed(_backend_instance(backend_class)) is True
+
+
+def test_keyring_backend_rejects_real_non_winvault_backend_on_windows(monkeypatch):
+    backend = _backend_instance(MacOSKeyring)
+    calls = _install_fake_keyring(monkeypatch, backend)
+    monkeypatch.setattr(credstore, "_is_windows", lambda: True)
+
+    with pytest.raises(CloudCredentialUnavailable, match="secure storage"):
+        KeyringBackend()
+
+    assert calls == []
+
+
+def test_keyring_backend_rejects_subclass_of_real_secure_backend(monkeypatch):
+    class DerivedMacOSKeyring(MacOSKeyring):
+        pass
+
+    monkeypatch.setattr(credstore, "_is_windows", lambda: False)
+
+    assert credstore._keyring_backend_allowed(
+        _backend_instance(DerivedMacOSKeyring)
+    ) is False
+
+
+@pytest.mark.parametrize("backend_class", [FailKeyring, NullKeyring, ChainerBackend])
+def test_rejected_backend_uses_local_encrypted_fallback(
+    monkeypatch, backend_class, user_id,
+):
+    calls = _install_fake_keyring(monkeypatch, _backend_instance(backend_class))
+    monkeypatch.setattr(credstore, "_is_windows", lambda: False)
+
+    assert credstore.storage_backend() == "encrypted local file key"
+    assert credstore.save_zwift_credentials(
+        user_id, "rider@example.com", "secret"
+    ) == "encrypted local file key"
+    assert credstore.get_zwift_credentials(user_id).password == "secret"
     assert calls == []
 
 

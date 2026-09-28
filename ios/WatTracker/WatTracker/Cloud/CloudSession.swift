@@ -2,8 +2,9 @@ import Foundation
 
 /// The read-plane routes, and which of them serve deltas.
 ///
-/// `api.py` marks `dashboard`, `volume` and `curve` `mobile=True`; only those
-/// three read `since=`, return a `revision`, page with a signed `cursor`, and
+/// `api.py` marks `dashboard`, `volume`, `curve`, `activities` and `calendar`
+/// `mobile=True`; those five read `since=`, return a `revision`, page with a
+/// signed `cursor`, and
 /// include tombstones.  The rest answer `{"items": [...]}` and nothing else,
 /// so there is no checkpoint to cache against and asking for one would be
 /// asking a question the route does not answer.  That is a fact about the
@@ -22,8 +23,8 @@ enum CloudRoute: String, Sendable, Equatable, CaseIterable {
 
     var servesDeltas: Bool {
         switch self {
-        case .dashboard, .volume, .curve, .activities: return true
-        case .profile, .calendar, .races: return false
+        case .dashboard, .volume, .curve, .activities, .calendar: return true
+        case .profile, .races: return false
         }
     }
 

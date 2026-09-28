@@ -18,7 +18,9 @@ from typing import Any, Callable, Mapping, Optional
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, Response
+from fastapi.concurrency import run_in_threadpool
 
+from .client import validate_cloud_endpoint
 from .limits import (
     DurableKillSwitch,
     DurableQuotaCounters,
@@ -52,7 +54,7 @@ from .security import (
     verify_signature,
 )
 from .storage import MAX_QUERY_LIMIT, MemoryTenantStore, StorageConflict, StaleRevision
-from .wipe import wipe_scope
+from .wipe import wipe_capability_proven, wipe_scope
 
 _NOT_FOUND_BODY = {"detail": "not found"}
 _MAX_TIMESTAMP = 60 * 5
@@ -102,6 +104,7 @@ class CloudConfig:
     server_secret: bytes
     operator_token: str
     plane: str = "all"  # all | read | sync
+    sync_endpoint: Optional[str] = None
     require_subscription: bool = True
     gateway_proof_header: str = "X-Gateway-Request-Proof"
     gateway_proof_value: str = field(default="", repr=False)
@@ -131,6 +134,11 @@ class CloudConfig:
             raise ValueError("operator_token must be configured")
         if self.plane not in {"all", "read", "sync"}:
             raise ValueError("plane must be all, read, or sync")
+        if self.sync_endpoint is not None:
+            try:
+                self.sync_endpoint = validate_cloud_endpoint(self.sync_endpoint)
+            except ValueError as exc:
+                raise ValueError("sync_endpoint must be an absolute HTTPS URL") from exc
         if self.max_request_bytes < 1 or self.max_decompressed_batch_bytes < 1:
             raise ValueError("body limits must be positive")
         if (
@@ -369,11 +377,20 @@ def _not_found() -> JSONResponse:
     )
 
 
-def _error(status: int, detail: str, *, retry_after: Optional[int] = None) -> JSONResponse:
+def _error(
+    status: int,
+    detail: str,
+    *,
+    retry_after: Optional[int] = None,
+    code: Optional[str] = None,
+) -> JSONResponse:
     headers = {"Cache-Control": "no-store"}
     if retry_after is not None:
         headers["Retry-After"] = str(retry_after)
-    return JSONResponse({"detail": detail}, status_code=status, headers=headers)
+    body = {"detail": detail}
+    if code is not None:
+        body["code"] = code
+    return JSONResponse(body, status_code=status, headers=headers)
 
 
 def _safe_limit(raw: Optional[str]) -> int:
@@ -1229,6 +1246,7 @@ def create_cloud_app(
                 # sign it but cannot choose or alter it.
                 "signing_namespace": writer.namespace,
                 "reader_context": context_token,
+                "sync_endpoint": state.config.sync_endpoint,
             }
             if device is not None:
                 enrolled.update({
@@ -1750,6 +1768,21 @@ def create_cloud_app(
                 # Refuse rather than claim that a self-destruct completed.
                 return _error(503, "cloud wipe unavailable")
 
+            # Prove delete permission on every store before touching any of
+            # them.  ``wipe_scope`` removes credentials first, so a grant that
+            # has not propagated to the data stores yet (Azure RBAC lags a
+            # deployment by minutes) would otherwise delete this rider's
+            # credentials and then 403 on the purge -- data left in the cloud
+            # with no credential to retry with.  Refused here, nothing has
+            # been deleted and the rider can simply try again later.
+            if not wipe_capability_proven(
+                namespace,
+                scope,
+                store=state.store,
+                security_backend=security_backend,
+            ):
+                return _error(503, "cloud wipe unavailable")
+
             # Construct this before deleting credentials.  In particular, do
             # not serialize the credential or report after the self-destruct.
             success = Response(
@@ -1758,7 +1791,12 @@ def create_cloud_app(
                 headers={"Cache-Control": "no-store"},
             )
             try:
-                report = wipe_scope(
+                # Off the event loop: the purge may wait up to
+                # ``PURGE_LEASE_DEADLINE_SECONDS`` for a sync that holds the
+                # scope lease, and a blocking wait here would stall every
+                # other request this process is serving.
+                report = await run_in_threadpool(
+                    wipe_scope,
                     namespace,
                     scope,
                     irreversible=True,
@@ -1846,9 +1884,15 @@ def create_cloud_app(
                     else:
                         current_revision = None
                         items = state.store.list_objects(
-                            namespace, scope, kinds=kinds, limit=limit,
+                            namespace, scope, kinds=kinds, limit=limit + 1,
                         )
-                has_more = len(items) > limit
+                if not mobile and len(items) > limit:
+                    return _error(
+                        413,
+                        "collection exceeds limit",
+                        code="collection_too_large",
+                    )
+                has_more = mobile and len(items) > limit
                 items = items[:limit]
                 next_cursor = (
                     _encode_cursor(
@@ -1875,7 +1919,9 @@ def create_cloud_app(
 
         @app.get("/api/v1/context/calendar")
         async def calendar(request: Request) -> Response:
-            return await collection(request, {"calendar", "scheduled_workout"}, route="calendar")
+            return await collection(
+                request, {"calendar_day"}, route="calendar", mobile=True
+            )
 
         @app.get("/api/v1/context/activities")
         async def activities(request: Request) -> Response:
@@ -1917,7 +1963,10 @@ def create_cloud_app(
 
         @app.get("/api/v1/context/races")
         async def races(request: Request) -> Response:
-            return await collection(request, {"race"}, route="races")
+            # Races are embedded in calendar_day objects.  Keep this route as
+            # an explicit empty compatibility surface rather than duplicating
+            # the same data under a standalone kind.
+            return await collection(request, set(), route="races")
 
         @app.get("/api/v1/context/dashboard")
         async def dashboard(request: Request) -> Response:

@@ -41,6 +41,7 @@ DEVICE_LIST_IDEMPOTENCY_KEY = "device-list"
 DEVICE_REVOKE_IDEMPOTENCY_KEY = "device-revoke"
 WIPE_IDEMPOTENCY_KEY = "account-wipe"
 OFFLINE_MESSAGE = "Cloud sync offline — local data and features are unaffected."
+SYNC_ENDPOINT_NOT_CONFIGURED = "Cloud sync endpoint is not configured."
 MAX_RESPONSE_BYTES = 1 * 1024 * 1024
 _TOKEN_RE = re.compile(r"^[A-Za-z0-9_-]{16,256}$")
 _CREDENTIAL_ID_RE = re.compile(r"^[0-9a-f]{64}$")
@@ -129,6 +130,12 @@ class SyncResult:
     replayed: bool = False
 
 
+@dataclass(frozen=True)
+class EnrollmentResult:
+    credentials: SyncCredentials
+    sync_endpoint: str
+
+
 def https_transport(
     *,
     client_certificate: Optional[str] = None,
@@ -181,11 +188,15 @@ class CloudSyncClient:
         endpoint: str,
         credentials: Optional[SyncCredentials] = None,
         *,
+        sync_endpoint: Optional[str] = None,
         transport: Optional[Callable[[str, Mapping[str, str], bytes], tuple[int, bytes]]] = None,
         mtls_headers: Optional[Mapping[str, str]] = None,
         clock: Callable[[], float] = time.time,
     ) -> None:
-        self.endpoint = validate_cloud_endpoint(endpoint)
+        self.read_endpoint = validate_cloud_endpoint(endpoint)
+        self.sync_endpoint = (
+            None if sync_endpoint is None else validate_cloud_endpoint(sync_endpoint)
+        )
         self.credentials = credentials
         self.transport = transport
         self.mtls_headers = dict(mtls_headers or {})
@@ -215,14 +226,21 @@ class CloudSyncClient:
             request_headers["Content-Type"] = "application/json"
         request_headers.update(self.mtls_headers)
         request_headers.update(headers or {})
+        endpoint = (
+            self.sync_endpoint
+            if path.startswith("/api/v1/sync/")
+            else self.read_endpoint
+        )
+        if endpoint is None:
+            return None, {}
         try:
             if self._transport_accepts_method:
                 status, response_body = self.transport(
-                    self.endpoint + path, request_headers, body, method,
+                    endpoint + path, request_headers, body, method,
                 )
             else:
                 status, response_body = self.transport(
-                    self.endpoint + path, request_headers, body,
+                    endpoint + path, request_headers, body,
                 )
         except Exception:
             return None, {}
@@ -247,7 +265,7 @@ class CloudSyncClient:
         transport: Optional[Callable[..., tuple[int, bytes]]] = None,
         mtls_headers: Optional[Mapping[str, str]] = None,
         clock: Callable[[], float] = time.time,
-    ) -> SyncCredentials:
+    ) -> EnrollmentResult:
         """Complete an invitation and return private material for keyring storage."""
         endpoint = validate_cloud_endpoint(endpoint)
         invitation = _validate_invitation(invitation)
@@ -269,6 +287,7 @@ class CloudSyncClient:
         credential_id = payload.get("credential")
         subscription = payload.get("subscription_key")
         namespace = payload.get("signing_namespace")
+        sync_endpoint_value = payload.get("sync_endpoint")
         algorithm = payload.get("signature_algorithm", "ed25519")
         if (
             not isinstance(credential_id, str)
@@ -279,15 +298,23 @@ class CloudSyncClient:
             or any(ord(char) < 0x21 or ord(char) > 0x7e for char in subscription)
             or not isinstance(namespace, str)
             or not _NAMESPACE_RE.fullmatch(namespace)
+            or not isinstance(sync_endpoint_value, str)
             or algorithm != "ed25519"
         ):
             raise CloudEnrollmentError("cloud enrollment response is invalid")
-        return SyncCredentials(
-            credential_id=credential_id,
-            subscription_key=subscription,
-            signing_key=private_key,
-            namespace=namespace,
-            signature_algorithm="ed25519",
+        try:
+            sync_endpoint = validate_cloud_endpoint(sync_endpoint_value)
+        except ValueError as exc:
+            raise CloudEnrollmentError("cloud enrollment response is invalid") from exc
+        return EnrollmentResult(
+            credentials=SyncCredentials(
+                credential_id=credential_id,
+                subscription_key=subscription,
+                signing_key=private_key,
+                namespace=namespace,
+                signature_algorithm="ed25519",
+            ),
+            sync_endpoint=sync_endpoint,
         )
 
     def _signed_headers(
@@ -329,6 +356,8 @@ class CloudSyncClient:
         del namespace  # Compatibility argument; the enrolled binding wins.
         if self.credentials is None:
             return SyncResult(False, None, OFFLINE_MESSAGE)
+        if self.sync_endpoint is None:
+            return SyncResult(False, None, SYNC_ENDPOINT_NOT_CONFIGURED)
         signing_namespace = self.credentials.namespace
         raw = json.dumps(
             {
@@ -447,6 +476,10 @@ class CloudSyncClient:
         """Upload resumable local deltas, acknowledging each successful page."""
         if should_continue is not None and not should_continue():
             return []
+        if self.credentials is None:
+            return [SyncResult(False, None, OFFLINE_MESSAGE)]
+        if self.sync_endpoint is None:
+            return [SyncResult(False, None, SYNC_ENDPOINT_NOT_CONFIGURED)]
         if republish:
             if self.transport is None:
                 return [SyncResult(False, None, OFFLINE_MESSAGE)]

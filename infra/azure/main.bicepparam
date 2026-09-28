@@ -38,3 +38,5 @@ param operatorToken = readEnvironmentVariable('WATTRACKER_OPERATOR_TOKEN')
 param blobReaderRoleDefinitionId = '2a2b9908-6ea1-4ae2-8e65-a410df84e7d1'
 // Source: owner decision (object ID of the operator principal allowed to run a scope wipe; empty assigns the wipe roles to nobody, which is the intended default until #169 exists).
 param operatorWipePrincipalId = ''
+// Source: owner decision (TODO: set true in your untracked main.local.bicepparam to let riders wipe their own cloud scope; one switch grants the read identity the scope-wipe deletes AND turns the route on; false is the safe default; switching back to false removes only the route flag, not the grants, so follow the Rollback steps in DEPLOY.md).
+param enableAccountWipe = false

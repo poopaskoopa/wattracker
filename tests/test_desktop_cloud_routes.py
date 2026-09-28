@@ -22,7 +22,8 @@ class FakeSync:
         self.state = {"enabled": False, "enrolled": False, "pending": 0,
                       "last_success": None, "last_error": None,
                       "retry": 0, "devices": [],
-                      "endpoint": "https://cloud.example"}
+                      "read_endpoint": "https://cloud.example",
+                      "sync_endpoint": "https://server-sync.example"}
         self.revoke_result = True
         self.wipe_result = True
         self.enroll_error = None
@@ -38,7 +39,7 @@ class FakeSync:
         if self.enroll_error:
             raise self.enroll_error
         self.state["enrolled"] = True
-        self.state["endpoint"] = endpoint
+        self.state["read_endpoint"] = endpoint
     def mint_pairing_code(self, uid):
         self.calls.append(("pairing", uid))
         return {"pairing_code": "123456", "expires_at": time.time() + 900}
@@ -66,6 +67,8 @@ def test_cloud_is_off_by_default_and_has_no_secret_echo(client):
     web, sync = client
     text = web.get("/settings").text
     assert 'name="enabled"' in text
+    assert 'name="read_endpoint"' in text
+    assert 'name="sync_endpoint"' not in text
     assert "Queued/offline" not in text
     assert "value=\"\"" in text
     assert "123456" not in text
@@ -75,12 +78,27 @@ def test_cloud_is_off_by_default_and_has_no_secret_echo(client):
 
 def test_enable_disable_and_enrollment_are_local_controls(client):
     web, sync = client
-    web.post("/settings/cloud", data={"enabled": "on", "endpoint": "https://cloud.example", "invitation": "invite"})
-    assert ("enroll", "https://cloud.example", "invite") in sync.calls
+    web.post(
+        "/settings/cloud",
+        data={
+            "enabled": "on",
+            "read_endpoint": "https://read.example",
+            "sync_endpoint": "https://crafted.example",
+            "invitation": "invite",
+        },
+    )
+    assert ("enroll", "https://read.example", "invite") in sync.calls
+    assert sync.state["read_endpoint"] == "https://read.example"
+    assert sync.state["sync_endpoint"] == "https://server-sync.example"
     assert ("enabled", True) in sync.calls
     assert [call[0] for call in sync.calls] == ["enroll", "enabled"]
     sync.calls.clear()
-    web.post("/settings/cloud", data={"endpoint": "https://cloud.example"})
+    web.post(
+        "/settings/cloud",
+        data={
+            "read_endpoint": "https://read.example",
+        },
+    )
     assert ("enabled", False) in sync.calls
     assert not any(call[0] == "enroll" for call in sync.calls)
 
@@ -94,17 +112,17 @@ def test_enable_disable_and_enrollment_are_local_controls(client):
         (True, "", False, [("enabled", False)]),
     ],
 )
-@pytest.mark.parametrize("endpoint", ["https://new.example", ""])
+@pytest.mark.parametrize("read_endpoint", ["https://new.example", ""])
 def test_endpoint_edit_without_invitation_only_applies_disable(
     client, initial_enabled, submitted_enabled, expected_enabled, expected_calls,
-    endpoint,
+    read_endpoint,
 ):
     web, sync = client
     sync.state.update(enabled=initial_enabled, enrolled=True)
     before = dict(sync.state)
     response = web.post(
         "/settings/cloud", data={
-            "endpoint": endpoint, "invitation": "  ",
+            "read_endpoint": read_endpoint, "invitation": "  ",
             "enabled": submitted_enabled,
         }, follow_redirects=False,
     )
@@ -117,6 +135,22 @@ def test_endpoint_edit_without_invitation_only_applies_disable(
     assert message in page.text
     assert 'value="https://cloud.example"' in page.text
     assert message not in web.get("/settings").text
+
+
+def test_read_endpoint_change_requires_an_invitation(client):
+    web, sync = client
+    sync.state.update(enabled=True, enrolled=True)
+    data = {
+        "enabled": "on",
+        "read_endpoint": "https://cloud.example",
+    }
+    data["read_endpoint"] = "https://new.example"
+    response = web.post("/settings/cloud", data=data, follow_redirects=False)
+    assert response.status_code == 303
+    assert sync.calls == []
+    assert "Enter an invitation to enroll against a new endpoint" in web.get(
+        response.headers["location"]
+    ).text
 
 
 @pytest.mark.parametrize("initial_enabled", [False, True])
@@ -133,7 +167,8 @@ def test_failed_enrollment_does_not_change_enabled_state(client, initial_enabled
     sync.enroll_error = error
     response = web.post(
         "/settings/cloud", data={
-            "endpoint": "https://new.example", "invitation": "private invitation",
+            "read_endpoint": "https://new-read.example",
+            "invitation": "private invitation",
             "enabled": "on",
         }, follow_redirects=False,
     )
@@ -148,14 +183,24 @@ def test_failed_enrollment_does_not_change_enabled_state(client, initial_enabled
 
 def test_missing_endpoint_does_not_enable_or_enroll(client):
     web, sync = client
-    page = web.post("/settings/cloud", data={"enabled": "on", "invitation": "invite"})
+    page = web.post(
+        "/settings/cloud",
+        data={
+            "enabled": "on",
+            "endpoint": "https://read.example",
+            "invitation": "invite",
+        },
+    )
     assert "Enter a valid HTTPS cloud endpoint and invitation." in page.text
     assert not sync.calls
     assert not sync.state["enabled"]
 
 
 @pytest.mark.parametrize("path,data,operation", [
-    ("/settings/cloud", {"endpoint": "https://cloud.example", "enabled": "on"}, "enabled"),
+    ("/settings/cloud", {
+        "read_endpoint": "https://cloud.example",
+        "enabled": "on",
+    }, "enabled"),
     ("/settings/cloud/pairing", {}, "pairing"),
     ("/settings/cloud/devices", {}, "list"),
 ])
@@ -360,7 +405,7 @@ def test_missing_cloud_extra_and_retry_status_are_clear(client):
     sync.enroll_error = server.CloudDependencyUnavailable()
     response = web.post(
         "/settings/cloud",
-        data={"endpoint": "https://cloud.example", "invitation": "invite"},
+        data={"read_endpoint": "https://cloud.example", "invitation": "invite"},
     )
     assert "Install wattracker[cloud] and try again." in response.text
 
@@ -420,7 +465,12 @@ def cold_disabled_cloud(monkeypatch):
             user_id=uid,
         )
         db.save_cloud_sync_state(
-            uid, {"endpoint": "https://cloud.example", "enabled": False},
+            uid,
+            {
+                "read_endpoint": "https://cloud.example",
+                "sync_endpoint": "https://server-sync.example",
+                "enabled": False,
+            },
         )
         assert app.state.cloud_sync.status(uid).devices == []
         yield web, app.state.cloud_sync, captured, uid

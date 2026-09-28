@@ -16,7 +16,7 @@ from typing import Optional, Protocol
 
 from .client import SyncCredentials
 from .security import INSTALLATION_ID_BYTES, new_installation_id
-from ..credstore import _keyring_enabled
+from ..credstore import _keyring
 
 SERVICE = "wattracker.cloud"
 _INSTALLATION_ACCOUNT = "installation-id"
@@ -40,13 +40,10 @@ class KeyringBackend:
 
     def __init__(self, service: str = SERVICE) -> None:
         self.service = service
-        if not _keyring_enabled():
+        keyring = _keyring()
+        if keyring is None:
             raise CloudCredentialUnavailable("OS secure storage is unavailable")
-        try:
-            import keyring
-            self._keyring = keyring
-        except ImportError as exc:
-            raise CloudCredentialUnavailable("OS secure storage is unavailable") from exc
+        self._keyring = keyring
 
     def get(self, account: str) -> Optional[str]:
         try:

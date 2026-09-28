@@ -18,6 +18,7 @@ from typing import Any, Mapping
 from .credentials import CloudCredentialUnavailable, KeyringBackend
 
 _ENDPOINT_ENV = "WATTRACKER_CLOUD_ENDPOINT"
+_READ_ENDPOINT_ENV = "WATTRACKER_CLOUD_READ_ENDPOINT"
 _TOKEN_ENV = "WATTRACKER_CLOUD_OPERATOR_TOKEN"
 _KEYCHAIN_ACCOUNT = "operator-token"
 _MAX_RESPONSE_BYTES = 256 * 1024
@@ -292,11 +293,16 @@ def _parser() -> argparse.ArgumentParser:
 def main(argv: list[str] | None = None) -> int:
     try:
         args = _parser().parse_args(argv)
-        endpoint_value = args.endpoint or os.environ.get(_ENDPOINT_ENV, "")
-        endpoint = _validate_endpoint(endpoint_value)
         token = _load_operator_token()
+        endpoint_value = (
+            args.endpoint
+            or os.environ.get(_READ_ENDPOINT_ENV)
+            or os.environ.get(_ENDPOINT_ENV, "")
+        )
+        endpoint = _validate_endpoint(endpoint_value)
         if args.command == "invite":
             result = _invite(endpoint, token)
+            result["read_endpoint"] = endpoint
         elif args.command == "version":
             result = _version(endpoint, token)
         elif args.command == "list-installations":

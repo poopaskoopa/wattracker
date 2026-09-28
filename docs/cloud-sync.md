@@ -55,10 +55,13 @@ contract is:
 
 The operator runs `python -m wattracker.cloud.admin invite`. The tool reads
 `WATTRACKER_CLOUD_OPERATOR_TOKEN` or the `wattracker.cloud` OS keychain entry
-`operator-token`; it never accepts the token as an argument. Set the endpoint
-with `--endpoint` or `WATTRACKER_CLOUD_ENDPOINT`. HTTPS is required, with HTTP
-allowed only for `localhost`, `127.0.0.1`, and `::1` when testing against the
-walking-skeleton server.
+`operator-token`; it never accepts the token as an argument. Set the read
+endpoint with `--endpoint` or `WATTRACKER_CLOUD_READ_ENDPOINT`. The legacy
+`WATTRACKER_CLOUD_ENDPOINT` remains accepted as the read endpoint for the
+other admin commands. `invite` prints the read endpoint alongside the
+invitation; the read app supplies the sync endpoint at enrollment. HTTPS is
+required, with HTTP allowed only for `localhost`,
+`127.0.0.1`, and `::1` when testing against the walking-skeleton server.
 
 `python -m wattracker.cloud.admin version` calls the same operator-authenticated
 version route on either plane and prints the running image's full git commit
@@ -76,9 +79,13 @@ it does not retry automatically. Other transport failures remain the generic
 `cloud admin request failed` message.
 
 The operator gives the printed, one-time invitation to the rider. The rider
-pastes it into the desktop cloud settings; the desktop enrolls once and gets
-its writer credential and namespace. From there, phones are paired by the
-desktop with the normal pairing flow. Operators can audit the enrolled writer
+pastes it into the desktop cloud settings with the printed read endpoint. The
+desktop enrolls against the read endpoint, stores the HTTPS sync endpoint in
+the enrollment response, and sends only `/api/v1/sync/*` requests there. The
+sync URL is deployment configuration, not a rider-editable form field. A
+migrated installation keeps its old endpoint as the read endpoint and reports
+that the sync endpoint is not configured until it is enrolled again. From there, phones are
+paired by the desktop with the normal pairing flow. Operators can audit the enrolled writer
 installations with `list-installations` and revoke one with
 `revoke-installation <operator_handle-or-credential-id>`. The list's
 `operator_handle` is an opaque durable row-key handle, not the writer
@@ -111,12 +118,22 @@ The dashboard route returns object kinds `profile`, `training_state`,
  "revision":7,"next_cursor":null}
 ```
 
+The calendar route returns `calendar_day` objects and is also a mobile,
+paginated route. Races are embedded in each `calendar_day`; the compatibility
+route `/api/v1/context/races` is intentionally empty and does not expose a
+standalone race kind.
+
 `?since=N` returns only objects whose object revision is greater than `N`;
 delta responses also include matching tombstones (`"deleted":true`), while
 full reads omit tombstones. `?limit=` is bounded to 100 and a non-null
 `next_cursor` is passed as `?cursor=` for the next page. Cursors are opaque,
 deterministic, scope-bound, and bound to the route and `since` value; they
 cannot be reused across scopes or to change ordering/filter semantics.
+
+Non-mobile collection routes are bounded to 100 objects. A read containing
+more than 100 objects returns `413` with code `collection_too_large` rather
+than silently truncating the collection. Mobile routes use the signed cursor
+envelope above instead.
 
 **Checkpointing.** The `revision` in the envelope is *pinned when pagination
 starts*: the first request of a walk (the one with no `?cursor=`) reads the
@@ -405,9 +422,11 @@ because the whole argument above is stated against a bounded window.
 ### Direct public ingress
 
 The selected deployment reaches `/api/v1/devices/*`, enrollment, reads, and
-sync directly through the public Container App HTTPS endpoints; there is no
-gateway operation inventory to keep in sync. The app's exact-origin CORS
-middleware and route-level credentials apply to every route.
+sync directly through the public Container App HTTPS endpoints; the desktop
+uses the read app for enrollment, pairing, device management, and context
+reads, and uses the sync app only for `/api/v1/sync/*`. There is no gateway
+operation inventory to keep in sync. The app's exact-origin CORS middleware
+and route-level credentials apply to every route.
 
 `require_verified_subject=False` is explicit in the production runtime.
 Enrollment start therefore uses the operator token alone, enrollment complete
@@ -772,11 +791,34 @@ credential this application issues can read.
 
 `operatorWipeBlobRoleDefinition` and `operatorWipeTableRoleDefinition` are two
 custom roles: blob read + delete on `wattracker-objects`, and entity read +
-delete assignable only to `CloudObjects` and `CloudAuth`. Neither is assigned
-to any container app identity. Both are assigned only when a deployment sets
-`operatorWipePrincipalId`, and `main.bicepparam` leaves it empty, so the
-default deployment defines the capability and gives it to nobody. The sync
-identity is unchanged and still holds no delete anywhere.
+delete assignable only to `CloudObjects` and `CloudAuth`. They are assigned
+behind two independent switches, both off in `main.bicepparam`, so the default
+deployment defines the capability and gives it to nobody:
+
+- `operatorWipePrincipalId` names an operator principal (#169's CLI);
+- `enableAccountWipe` gives them to the **read identity** and, in the same
+  deployment, sets `WATTRACKER_CLOUD_ALLOW_ACCOUNT_WIPE=1` on the read app, so
+  the rider wipe route and its grant cannot diverge (owner decision,
+  2026-09-26). The accepted risk: a compromised read app can delete cloud
+  copies, which are replicas of each rider's desktop, and it could already read
+  all of them. Setting it back to false removes only the route flag: the
+  deployment is incremental, so the read identity's four wipe assignments stay
+  until they are deleted by hand (`infra/azure/DEPLOY.md`, "Rollback").
+
+The sync identity is unchanged and still holds no delete anywhere.
+
+Before it deletes anything, the route proves delete permission on the object
+blobs, `CloudObjects` and `CloudAuth` by deleting random keys that cannot exist.
+"Not found" means allowed. A 403 or any other error means `503 cloud wipe
+unavailable` with nothing deleted. This covers the minutes of RBAC propagation
+during which a credentials-first wipe would otherwise strand the data.
+The purge also holds the scope's blob lease, which needs `blobs/write`. The
+same switches assign `wipeLockRoleDefinition` for that. Its only action is
+`blobs/write`, and every assignment carries an ABAC path condition confining it
+to `<64-hex namespace>:<scope>/__lock`. The read app can delete rider data but
+can't overwrite it. `infra/azure/DEPLOY.md` covers turning the wipe on and gives
+the exact condition. The condition is unverified live; if it is wrong, the
+probe refuses the wipe with 503.
 
 `CloudControl` is absent from both roles on purpose: not being able to delete
 the kill switch is better than being trusted not to.
@@ -1077,9 +1119,14 @@ hard billing ceiling.
       virtual-network sources.
 - [ ] Verify each managed identity has only its documented data-plane role —
       in particular, `entities/delete` on `CloudAuth` is held by the read
-      identity alone through `authSweeperRoleDefinition`, and no container app
-      identity holds `operatorWipeBlobRoleDefinition` or
-      `operatorWipeTableRoleDefinition`.
+      identity alone through `authSweeperRoleDefinition`, the sync identity
+      holds neither `operatorWipeBlobRoleDefinition` nor
+      `operatorWipeTableRoleDefinition`, and the read identity holds them only
+      when `enableAccountWipe` is true.
+- [ ] With `enableAccountWipe` true, confirm the read identity's
+      `wipeLockRoleDefinition` assignment shows the lock-path ABAC condition,
+      and that a `blobs/write` by that identity to an `object:*.json` blob is
+      refused with 403 while a wipe of a test scope succeeds.
 - [ ] Confirm `operatorWipePrincipalId` is empty unless a named operator
       principal is meant to hold the wipe roles, and that neither wipe role is
       assignable to `CloudControl`.

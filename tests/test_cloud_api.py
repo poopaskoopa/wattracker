@@ -1,7 +1,9 @@
 import base64
+import datetime as dt
 import hashlib
 import hmac
 import json
+import sqlite3
 from dataclasses import replace
 from pathlib import Path
 
@@ -23,6 +25,8 @@ from wattracker.cloud.models import (
     CloudObject,
     SyncBatch,
 )
+from wattracker import db
+from wattracker.cloud.snapshot import snapshot_objects
 from wattracker.cloud.security import (
     DEVICE_PAIRING_CODE_BITS,
     MAX_DEVICE_PAIRING_TTL_SECONDS,
@@ -38,8 +42,32 @@ from wattracker.cloud.security import (
     sign_request_ecdsa_p256,
     sign_request_ed25519,
 )
+
+
 from wattracker.cloud.storage import MemoryTenantStore
 from wattracker.cloud.wipe import ScopeWipeReport
+
+
+_CONTEXT_ROUTE_KINDS = {
+    "calendar": {"calendar_day"},
+    "activities": {"activity"},
+    "activity detail": {"activity", "activity_detail", "stream"},
+    "profile": {"profile"},
+    "dashboard": {"profile", "training_state", "load_point", "curve"},
+    "volume": {"volume_week"},
+    "curve": {"curve"},
+}
+# FTP history supports desktop synchronization but has no mobile context
+# surface. Races likewise remain embedded in calendar_day objects.
+_PUBLISHED_BUT_INTENTIONALLY_UNSERVED_KINDS = {"ftp_history"}
+
+
+def _assert_published_kinds_have_context_routes(objects):
+    served_kinds = set().union(*_CONTEXT_ROUTE_KINDS.values())
+    published_kinds = {obj.kind for obj in objects}
+    assert published_kinds <= (
+        served_kinds | _PUBLISHED_BUT_INTENTIONALLY_UNSERVED_KINDS
+    )
 
 
 SECRET = b"cloud-test-server-secret-32-bytes-long"
@@ -245,6 +273,171 @@ def _apply_mobile_batch(state, namespace, scope, batch_id, revision, objects):
         scope,
         SyncBatch(batch_id=batch_id, revision=revision, objects=tuple(objects)),
     )
+
+
+@pytest.mark.parametrize(
+    ("path", "kind"),
+    [
+        ("/api/v1/context/profile", "profile"),
+    ],
+)
+def test_unpaginated_collection_fails_loudly_when_scope_exceeds_limit(
+    cloud, path, kind,
+):
+    _config, state, client = cloud
+    token, context = _mobile_reader(state, scope="overflow-scope")
+    _apply_mobile_batch(
+        state,
+        context.namespace,
+        context.local_user_scope,
+        "profile-overflow",
+        1,
+        [
+            CloudObject(
+                f"{kind}-{index}", kind, 1, {"index": index}
+            )
+            for index in range(101)
+        ],
+    )
+
+    response = client.get(path, headers=_mobile_headers(token))
+
+    assert response.status_code == 413
+    assert response.json() == {
+        "code": "collection_too_large",
+        "detail": "collection exceeds limit",
+    }
+
+
+def test_unpaginated_collection_allows_exactly_100_objects(cloud):
+    _config, state, client = cloud
+    token, context = _mobile_reader(state, scope="exact-boundary")
+    _apply_mobile_batch(
+        state,
+        context.namespace,
+        context.local_user_scope,
+        "profile-exact-boundary",
+        1,
+        [
+            CloudObject(f"profile-{index}", "profile", 1, {"index": index})
+            for index in range(100)
+        ],
+    )
+
+    response = client.get("/api/v1/context/profile", headers=_mobile_headers(token))
+
+    assert response.status_code == 200
+    assert len(response.json()["items"]) == 100
+
+
+def test_calendar_collection_pages_calendar_days_with_stable_revision(cloud):
+    _config, state, client = cloud
+    token, context = _mobile_reader(state, scope="calendar-pages")
+    calendar_days = [
+        CloudObject(f"calendar-day-{index:03d}", "calendar_day", 7, {"day": index})
+        for index in range(101)
+    ]
+    _apply_mobile_batch(
+        state, context.namespace, context.local_user_scope, "calendar-pages", 7,
+        calendar_days + [CloudObject("race-1", "race", 7, {"name": "embedded"})],
+    )
+    headers = _mobile_headers(token)
+
+    first = client.get(
+        "/api/v1/context/calendar?limit=100&since=0", headers=headers,
+    )
+    assert first.status_code == 200
+    first_body = first.json()
+    assert first_body["revision"] == 7
+    assert len(first_body["items"]) == 100
+    assert first_body["next_cursor"]
+    assert {item["kind"] for item in first_body["items"]} == {"calendar_day"}
+
+    second = client.get(
+        "/api/v1/context/calendar?limit=100&since=0&cursor="
+        + first_body["next_cursor"],
+        headers=headers,
+    )
+    assert second.status_code == 200
+    second_body = second.json()
+    assert second_body["revision"] == 7
+    assert second_body["next_cursor"] is None
+    assert len(second_body["items"]) == 1
+    assert [item["id"] for item in first_body["items"] + second_body["items"]] == [
+        obj.object_id for obj in calendar_days
+    ]
+    assert client.get("/api/v1/context/races", headers=headers).json() == {"items": []}
+
+
+def test_calendar_route_matches_real_snapshot_publisher(tmp_path, cloud):
+    _config, state, client = cloud
+    path = tmp_path / "publisher.db"
+    db.init_db(str(path))
+    user_id = db.create_user("publisher", "not-a-password", path=str(path))
+    db.save_user_settings(user_id, {"timezone": "UTC"}, path=str(path))
+    conn = sqlite3.connect(path)
+    try:
+        start = dt.date(2026, 1, 1)
+        conn.executemany(
+            "INSERT INTO activities "
+            "(user_id, dedup_hash, filename, start_time, duration_s, "
+            "distance_m, avg_power, avg_hr, np, if_, tss, streams) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            [
+                (
+                    user_id, f"publisher-{index}", "publisher.fit",
+                    f"{start + dt.timedelta(days=index)}T10:00:00",
+                    60, 1000, 100, 120, 100, 0.4, 1, None,
+                )
+                for index in range(105)
+            ],
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    published = snapshot_objects(path, user_id)
+    _assert_published_kinds_have_context_routes(published)
+    expected = {
+        obj.object_id: obj for obj in published if obj.kind == "calendar_day"
+    }
+    assert len(expected) > 100
+    token, context = _mobile_reader(state, scope="publisher-contract")
+    _apply_mobile_batch(
+        state, context.namespace, context.local_user_scope, "publisher-contract", 11,
+        published,
+    )
+
+    headers = _mobile_headers(token)
+    received = []
+    cursor = None
+    while True:
+        query = "?limit=40&since=0"
+        if cursor:
+            query += "&cursor=" + cursor
+        response = client.get("/api/v1/context/calendar" + query, headers=headers)
+        assert response.status_code == 200
+        body = response.json()
+        received.extend(body["items"])
+        assert body["revision"] == 11
+        cursor = body["next_cursor"]
+        if cursor is None:
+            break
+
+    assert len(received) == len(expected)
+    assert {
+        item["id"]: item for item in received
+    } == {
+        object_id: obj.wire() for object_id, obj in expected.items()
+    }
+    assert client.get("/api/v1/context/races", headers=headers).json() == {"items": []}
+
+
+def test_calendar_route_contract_rejects_extra_publisher_kind():
+    with pytest.raises(AssertionError):
+        _assert_published_kinds_have_context_routes([
+            CloudObject("workout", "scheduled_workout", 1, {}),
+        ])
 
 
 def test_mobile_read_surface_routes_filter_kinds_and_expose_revision(cloud):
@@ -1115,6 +1308,7 @@ def test_enrollment_is_operator_only_one_time_and_returns_opaque_credentials(clo
     assert completed.status_code == 200
     payload = completed.json()
     assert payload["credential"] and payload["subscription_key"] and payload["reader_context"]
+    assert payload["sync_endpoint"] is None
     assert client.post(
         "/api/v1/enrollment/complete",
         headers={
@@ -1162,6 +1356,7 @@ def test_read_enrollment_is_usable_by_restarted_sync_and_read_planes():
         server_secret=SECRET,
         operator_token="operator-token",
         plane="read",
+        sync_endpoint="https://sync.example",
         require_gateway_proof=False,
         clock=lambda: 1_000,
     )
@@ -1192,6 +1387,7 @@ def test_read_enrollment_is_usable_by_restarted_sync_and_read_planes():
     enrolled = completed.json()
     assert enrolled["subscription_key"]
     assert enrolled["subscription_key"] != "apim-subscription"
+    assert enrolled["sync_endpoint"] == "https://sync.example"
 
     sync_config = CloudConfig(
         server_secret=SECRET,

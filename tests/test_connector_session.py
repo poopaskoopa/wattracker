@@ -424,23 +424,31 @@ def test_a_connector_session_cannot_change_cloud_settings(client, monkeypatch):
         monkeypatch.setattr(
             sync, "set_enabled", lambda *args: calls.append(("enabled", args))
         )
-        monkeypatch.setattr(
-            sync, "enroll", lambda *args: calls.append(("enroll", args))
-        )
+        monkeypatch.setattr(sync, "enroll", lambda *args, **kwargs: calls.append(
+            ("enroll", args, kwargs)
+        ))
         response = window.post(
             "/settings/cloud",
-            data={"enabled": "on", "endpoint": "https://cloud.example", "invitation": "invite"},
+            data={
+                "enabled": "on",
+                "read_endpoint": "https://read.example",
+                "invitation": "invite",
+            },
         )
 
     assert response.status_code == 403
     assert calls == []
     control = client.post(
         "/settings/cloud",
-        data={"enabled": "on", "endpoint": "https://cloud.example", "invitation": "invite"},
+        data={
+            "enabled": "on",
+            "read_endpoint": "https://read.example",
+            "invitation": "invite",
+        },
         follow_redirects=False,
     )
     assert control.status_code == 303
-    assert calls == [("enroll", (uid, "https://cloud.example", "invite")),
+    assert calls == [("enroll", (uid, "https://read.example", "invite"), {}),
                      ("enabled", (uid, True))]
 
 

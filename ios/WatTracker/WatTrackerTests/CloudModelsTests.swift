@@ -131,7 +131,7 @@ final class CloudModelsTests: XCTestCase {
     func testTheRoutesThatServeDeltasAreExactlyTheMobileOnes() {
         XCTAssertEqual(
             Set(CloudRoute.allCases.filter(\.servesDeltas)),
-            [.dashboard, .volume, .curve, .activities]
+            [.dashboard, .volume, .curve, .activities, .calendar]
         )
         XCTAssertEqual(CloudRoute.dashboard.path, "/api/v1/context/dashboard")
     }

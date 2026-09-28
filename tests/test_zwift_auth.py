@@ -9,6 +9,10 @@ import stat
 import urllib.error
 
 import pytest
+from keyring.backends.fail import Keyring as FailKeyring
+from keyring.backends.macOS import Keyring as MacOSKeyring
+from keyring.backends.null import Keyring as NullKeyring
+from keyring.backends.Windows import WinVaultKeyring
 
 from wattracker import config, credstore, db, races, zwiftauth
 
@@ -129,19 +133,19 @@ def test_keyring_absent_falls_back(monkeypatch, user_id):
 
 def test_windows_keyring_backend_allowlist(monkeypatch):
     monkeypatch.setattr(credstore, "_is_windows", lambda: True)
-    WinVault = type("WinVaultKeyring", (), {})
-    WinVault.__module__ = "keyring.backends.Windows"
-    Plaintext = type("PlaintextKeyring", (), {})
-    Plaintext.__module__ = "keyrings.alt.file"
-    Mac = type("Keyring", (), {})
-    Mac.__module__ = "keyring.backends.macOS"
-    Fail = type("FailKeyring", (), {})
-    Fail.__module__ = "keyring.backends.fail"
 
-    assert credstore._keyring_backend_allowed(WinVault()) is True
-    assert credstore._keyring_backend_allowed(Plaintext()) is False
-    assert credstore._keyring_backend_allowed(Mac()) is False
-    assert credstore._keyring_backend_allowed(Fail()) is False
+    assert credstore._keyring_backend_allowed(
+        WinVaultKeyring.__new__(WinVaultKeyring)
+    ) is True
+    assert credstore._keyring_backend_allowed(
+        NullKeyring.__new__(NullKeyring)
+    ) is False
+    assert credstore._keyring_backend_allowed(
+        MacOSKeyring.__new__(MacOSKeyring)
+    ) is False
+    assert credstore._keyring_backend_allowed(
+        FailKeyring.__new__(FailKeyring)
+    ) is False
 
 
 def test_windows_falls_back_to_dpapi_never_file_key(user_id, monkeypatch):
