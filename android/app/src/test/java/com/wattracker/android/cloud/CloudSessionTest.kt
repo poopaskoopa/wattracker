@@ -11,6 +11,7 @@ import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNotNull
 import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
+import org.junit.Assert.fail
 import org.junit.Before
 import org.junit.Test
 import java.io.IOException
@@ -319,12 +320,79 @@ class CloudSessionTest {
         // launch stored it under its own fresh identity (a restart starts at
         // generation 0).
         cache.store(listOf(profileItem(3)), 3, CloudRoute.Dashboard, full = true, generation = 0)
-        session.removeDevice()
+        val res = session.removeDevice()
+        assertEquals(RemoveDeviceResult.ServerRevoked, res)
         assertEquals(CloudSession.DeviceState.unpaired, session.deviceState)
         // The disk is wiped, not just memory: the credential and the rider's
         // data are both gone, so the next launch is not paired again.
         assertNull(store.load())
         assertNull(cache.load(CloudRoute.Dashboard))
+    }
+
+    @Test
+    fun removeDevice404ReturnsLocalFallbackAndWipesLocal() = runTest {
+        makePairedSession { request ->
+            when {
+                request.url.contains("/revoke") ->
+                    CloudResponse(404, ByteArray(0), null, nowMillis)
+                else -> throw AssertionError("unexpected ${request.url}")
+            }
+        }
+        cache.store(listOf(profileItem(3)), 3, CloudRoute.Dashboard, full = true, generation = 0)
+
+        val res = session.removeDevice()
+        assertEquals(RemoveDeviceResult.LocalFallback, res)
+        assertEquals(CloudSession.DeviceState.unpaired, session.deviceState)
+        assertNull(store.load())
+        assertNull(cache.load(CloudRoute.Dashboard))
+    }
+
+    @Test
+    fun removeDeviceNon404ErrorThrowsAndKeepsLocalPairing() = runTest {
+        makePairedSession { request ->
+            when {
+                request.url.contains("/revoke") ->
+                    CloudResponse(500, ByteArray(0), null, nowMillis)
+                else -> throw AssertionError("unexpected ${request.url}")
+            }
+        }
+        cache.store(listOf(profileItem(3)), 3, CloudRoute.Dashboard, full = true, generation = 0)
+
+        try {
+            session.removeDevice()
+            fail("Expected Failure.Server(500)")
+        } catch (e: CloudSession.Failure.Server) {
+            assertEquals(500, e.status)
+        }
+
+        // Credentials and cache preserved!
+        assertEquals(CloudSession.DeviceState.paired, session.deviceState)
+        assertNotNull(store.load())
+        assertNotNull(cache.load(CloudRoute.Dashboard))
+    }
+
+    @Test
+    fun removeDeviceOfflineThrowsAndKeepsLocalPairing() = runTest {
+        makePairedSession { request ->
+            when {
+                request.url.contains("/revoke") ->
+                    throw IOException("Network error")
+                else -> throw AssertionError("unexpected ${request.url}")
+            }
+        }
+        cache.store(listOf(profileItem(3)), 3, CloudRoute.Dashboard, full = true, generation = 0)
+
+        try {
+            session.removeDevice()
+            fail("Expected Failure.Offline")
+        } catch (_: CloudSession.Failure.Offline) {
+            // expected
+        }
+
+        // Credentials and cache preserved!
+        assertEquals(CloudSession.DeviceState.paired, session.deviceState)
+        assertNotNull(store.load())
+        assertNotNull(cache.load(CloudRoute.Dashboard))
     }
 
     @Test
@@ -624,6 +692,9 @@ class CloudSessionTest {
             override fun clear() {
                 throw IOException("disk full")
             }
+            override fun loadLocal(): LocalCredentials? = null
+            override fun saveLocal(credentials: LocalCredentials) {}
+            override fun clearLocal() {}
         }
         val session = CloudSession(
             client = noNetworkClient(),
@@ -654,6 +725,14 @@ class CloudSessionTest {
         assertFalse(device.toString().contains("SECRET-SUB"))
         val local = LocalCredential("https://host", "SECRET-TOKEN")
         assertFalse(local.toString().contains("SECRET-TOKEN"))
+        val localCreds = LocalCredentials("https://host", "SECRET-TOKEN")
+        assertFalse(localCreds.toString().contains("SECRET-TOKEN"))
+        val localReq = LocalRequest("POST", "https://host", mapOf("Authorization" to "Bearer SECRET-TOKEN", "Cookie" to "session=SECRET-COOKIE"))
+        assertFalse(localReq.toString().contains("SECRET-TOKEN"))
+        assertFalse(localReq.toString().contains("SECRET-COOKIE"))
+        val localResp = LocalResponse(200, ByteArray(0), "https://host", mapOf("Set-Cookie" to listOf("session=SECRET-COOKIE"), "Authorization" to listOf("Bearer SECRET-TOKEN")))
+        assertFalse(localResp.toString().contains("SECRET-TOKEN"))
+        assertFalse(localResp.toString().contains("SECRET-COOKIE"))
         val pairing = PairingResult(device, "SECRET-CTX", 300.0)
         assertFalse(pairing.toString().contains("SECRET-CTX"))
         val refresh = RefreshOutcome("SECRET-CTX", 300.0, nowMillis)
