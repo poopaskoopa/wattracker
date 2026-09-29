@@ -223,10 +223,15 @@ class CloudSession(
                 RemoveDeviceResult.ServerRevoked
             }
             is CloudApiResult.Failure -> {
-                if (result.status == 404) {
-                    // The rider asked for this phone to stop reading, and that can be done without the server:
-                    // on 404 (e.g., missing route or credential unknown on server), fall back to local signOut().
-                    signOut()
+                val isTrustedDate = result.serverDateMillis != null &&
+                    Math.abs(now() - result.serverDateMillis) / 1000.0 <= clockSkewTolerance
+                if ((result.status == 404 || result.status == 401) && isTrustedDate) {
+                    // Complete removal locally only if the session hasn't re-paired mid-flight
+                    val newGeneration = mutex.withLock {
+                        if (lifecycleGeneration != generation) throw lifecycleFailure()
+                        signOutState()
+                    }
+                    removeDisk(newGeneration)
                     RemoveDeviceResult.LocalFallback
                 } else {
                     throw Failure.Server(result.status)

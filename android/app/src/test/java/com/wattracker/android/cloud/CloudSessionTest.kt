@@ -348,6 +348,67 @@ class CloudSessionTest {
     }
 
     @Test
+    fun removeDevice401WithTrustedDateReturnsLocalFallbackAndWipesLocal() = runTest {
+        makePairedSession { request ->
+            when {
+                request.url.contains("/revoke") ->
+                    CloudResponse(401, ByteArray(0), null, nowMillis)
+                else -> throw AssertionError("unexpected ${request.url}")
+            }
+        }
+        cache.store(listOf(profileItem(3)), 3, CloudRoute.Dashboard, full = true, generation = 0)
+
+        val res = session.removeDevice()
+        assertEquals(RemoveDeviceResult.LocalFallback, res)
+        assertEquals(CloudSession.DeviceState.unpaired, session.deviceState)
+        assertNull(store.load())
+    }
+
+    @Test
+    fun removeDevice404WithSkewedDateThrowsAndKeepsLocalPairing() = runTest {
+        makePairedSession { request ->
+            when {
+                request.url.contains("/revoke") ->
+                    CloudResponse(404, ByteArray(0), null, nowMillis - 1000 * 1000L)
+                else -> throw AssertionError("unexpected ${request.url}")
+            }
+        }
+        cache.store(listOf(profileItem(3)), 3, CloudRoute.Dashboard, full = true, generation = 0)
+
+        try {
+            session.removeDevice()
+            fail("Expected Failure.Server(404)")
+        } catch (e: CloudSession.Failure.Server) {
+            assertEquals(404, e.status)
+        }
+
+        assertEquals(CloudSession.DeviceState.paired, session.deviceState)
+        assertNotNull(store.load())
+    }
+
+    @Test
+    fun removeDevice404WithMissingDateHeaderThrowsAndKeepsLocalPairing() = runTest {
+        makePairedSession { request ->
+            when {
+                request.url.contains("/revoke") ->
+                    CloudResponse(404, ByteArray(0), null, null)
+                else -> throw AssertionError("unexpected ${request.url}")
+            }
+        }
+        cache.store(listOf(profileItem(3)), 3, CloudRoute.Dashboard, full = true, generation = 0)
+
+        try {
+            session.removeDevice()
+            fail("Expected Failure.Server(404)")
+        } catch (e: CloudSession.Failure.Server) {
+            assertEquals(404, e.status)
+        }
+
+        assertEquals(CloudSession.DeviceState.paired, session.deviceState)
+        assertNotNull(store.load())
+    }
+
+    @Test
     fun removeDeviceNon404ErrorThrowsAndKeepsLocalPairing() = runTest {
         makePairedSession { request ->
             when {
@@ -512,6 +573,24 @@ class CloudSessionTest {
     }
 
     @Test
+    fun a413CollectionResponseRetainsExistingCache() = runTest {
+        makePairedSession { request ->
+            when {
+                request.url.contains("/context/refresh") ->
+                    CloudResponse(200, refreshJson("ctx-1", 300.0).toByteArray(), null, nowMillis)
+                else ->
+                    CloudResponse(413, """{"code":"collection_too_large"}""".toByteArray(), null, null)
+            }
+        }
+        // Pre-seed cache with existing item
+        cache.store(listOf(profileItem(1)), 1, CloudRoute.Profile, full = true, generation = 0)
+
+        val snapshot = session.load(CloudRoute.Profile)
+        assertEquals(CloudSnapshot.Source.cache, snapshot.source)
+        assertEquals(1, snapshot.items.size)
+    }
+
+    @Test
     fun aWalkCutOffAtThePageLimitDoesNotAdvanceTheCheckpoint() = runTest {
         // Every page carries a next cursor: the walk hits the page limit.
         makePairedSession { request ->
@@ -560,8 +639,8 @@ class CloudSessionTest {
                     CloudResponse(200, collectionJson(listOf(profileItem(1)), 1, null).toByteArray(), null, null)
             }
         }
-        session.load(CloudRoute.Calendar)
-        val request = transport.requests.first { it.url.contains("/context/calendar") }
+        session.load(CloudRoute.Profile)
+        val request = transport.requests.first { it.url.contains("/context/profile") }
         assertFalse(
             "unpaginated routes must not send limit query parameter",
             request.url.contains("limit="),

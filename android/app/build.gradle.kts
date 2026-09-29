@@ -1,3 +1,5 @@
+import java.util.Properties
+
 plugins {
     alias(libs.plugins.android.application)
     alias(libs.plugins.kotlin.compose)
@@ -13,12 +15,17 @@ room {
     schemaDirectory("$projectDir/schemas")
 }
 
-// The release cloud authority lives here, once. Both the buildConfigField that
-// ships it and the guard that refuses to ship it read this same val, so the
-// guard cannot be silently disabled by editing one and forgetting the other
-// (#260). Replacing this with the real host when #102 lands is the only edit
-// needed to retire the guard.
-val releaseCloudAuthority = "cloud.wattracker.example"
+val localProperties = Properties()
+val localPropsFile = rootProject.file("local.properties")
+if (localPropsFile.exists()) {
+    localPropsFile.inputStream().use { stream ->
+        localProperties.load(stream)
+    }
+}
+val releaseCloudAuthority: String = providers.gradleProperty("wattrackerCloudAuthority")
+    .orNull
+    ?: localProperties.getProperty("wattrackerCloudAuthority")
+    ?: "cloud.wattracker.example"
 
 android {
     namespace = "com.wattracker.android"

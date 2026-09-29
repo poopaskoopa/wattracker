@@ -44,7 +44,10 @@ private data class ActiveSession(
     val cookie: String,
     val originUrl: String,
     val token: String,
-)
+) {
+    override fun toString(): String =
+        "ActiveSession(cookie=[REDACTED], originUrl='$originUrl', token=[REDACTED])"
+}
 
 /**
  * Client for the rider's local desktop server reached via the connector protocol over HTTPS.
@@ -231,6 +234,7 @@ class LocalClient(
         val items = mutableListOf<CloudItem>()
         var successCount = 0
         var lastError: Throwable? = null
+        var stateError: Throwable? = null
 
         try {
             val stateJson = getJson(cred, baseUrl, "/api/state")
@@ -239,11 +243,12 @@ class LocalClient(
             successCount++
         } catch (e: Exception) {
             if (e is CancellationException) throw e
+            stateError = e
             lastError = e
         }
 
         try {
-            val loadJson = getJson(cred, baseUrl, "/api/load", mapOf("months" to "3"))
+            val loadJson = getJson(cred, baseUrl, "/api/load", mapOf("months" to "12"))
             if (loadJson is JsonValue.Array) {
                 loadJson.values.forEachIndexed { idx, elem ->
                     if (elem is JsonValue.Object) {
@@ -284,6 +289,9 @@ class LocalClient(
             lastError = e
         }
 
+        if (stateError != null && items.none { it.kind == CloudKind.TrainingState }) {
+            throw stateError
+        }
         val err = lastError
         if (successCount == 0 && err != null) {
             throw err
