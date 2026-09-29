@@ -68,9 +68,21 @@ protocol ReadSession: Sendable {
     func load(_ route: CloudRoute, month: CalendarMonth?) async throws -> CloudSnapshot
     func activityDetail(_ activityID: Int) async throws -> ActivityDetail
     func activityStreams(_ activityID: Int) async throws -> ActivityStreams
+    /// Whether this backend can be asleep when asked, so a slow first answer
+    /// is the server waking rather than something wrong. Only the cloud read
+    /// app scales to zero; the rider's desktop is either up or it is not.
+    nonisolated var mayBeWaking: Bool { get }
+    /// The rider asked (pull to refresh): lift a backoff that a waking server
+    /// caused, so the next read goes out now. A backoff the server asked for
+    /// with 429/503 is not the rider's to shorten and stays in force.
+    func retryNowIfWaking() async
 }
 
 extension ReadSession {
+    nonisolated var mayBeWaking: Bool { false }
+
+    func retryNowIfWaking() async {}
+
     nonisolated func cached(_ route: CloudRoute, month: CalendarMonth?) -> CloudSnapshot? {
         cached(route)
     }
@@ -125,6 +137,21 @@ actor CloudSession: ReadSession {
     /// That protection is only as real as the gap enforced between the two
     /// attempts; see `baseBackoff`.
     static let rejectionsBeforeRemoval = 2
+    /// Riding out a cold start.
+    ///
+    /// The read app scales to zero, and the first request after an idle spell
+    /// waits 20-40s (longer just after a redeploy, while the image pulls) for
+    /// a replica. That request timing out says "the server is waking", not
+    /// "the server is failing", so it is retried once after this short pause
+    /// -- the replica keeps starting after the client gives up, so the retry
+    /// lands on a warmer server -- instead of earning `baseBackoff`.
+    static let coldStartRetryDelay: TimeInterval = 3
+    /// The gate left after the retry also timed out. Short and flat, never
+    /// escalating: two minutes of timeouts already passed before it is set,
+    /// the cache is on screen meanwhile, and the replica is still coming up.
+    /// It exists only so every screen does not immediately queue another
+    /// two-minute wait behind the one that just ended.
+    static let coldStartBackoff: TimeInterval = 10
     /// Cursor pages per collection read. Far above any real scope, and here so
     /// that a server answering with a cursor that never terminates costs a
     /// bounded number of requests rather than a loop.
@@ -146,6 +173,9 @@ actor CloudSession: ReadSession {
         case throttled(retryAfter: TimeInterval)
         case clockSkew(seconds: TimeInterval)
         case offline
+        /// The read app did not answer in time, twice: it is most likely
+        /// still starting after scaling to zero.
+        case waking(retryAfter: TimeInterval)
         case server(CloudClient.Failure)
 
         var description: String {
@@ -160,6 +190,9 @@ actor CloudSession: ReadSession {
                 return "This device's clock is \(Int(seconds))s off the server's"
             case .offline:
                 return "No connection"
+            case .waking:
+                return "The cloud is still waking up. It usually takes under a minute; "
+                    + "try again shortly."
             case let .server(failure):
                 return failure.description
             }
@@ -184,6 +217,7 @@ actor CloudSession: ReadSession {
     private let credentials: DeviceCredentialStore
     private let cache: SnapshotCache
     private let clock: @Sendable () -> Date
+    private let sleep: @Sendable (TimeInterval) async throws -> Void
 
     private var device: PairedDevice?
     private var token: ReaderToken?
@@ -221,6 +255,9 @@ actor CloudSession: ReadSession {
     /// deployment saying the same thing as a `Retry-After` on a refresh, and
     /// honouring it on one route while hammering another is not backing off.
     private var nextAttemptAllowedAt: Date?
+    /// Whether `nextAttemptAllowedAt` was set by a cold start rather than by
+    /// a refusal. Only that kind of gate may be lifted by the rider.
+    private var gateIsColdStart = false
     private var consecutiveFailures = 0
     private var consecutiveRejections = 0
 
@@ -228,12 +265,16 @@ actor CloudSession: ReadSession {
         client: CloudClient,
         credentials: DeviceCredentialStore,
         cache: SnapshotCache,
-        clock: @escaping @Sendable () -> Date = { Date() }
+        clock: @escaping @Sendable () -> Date = { Date() },
+        sleep: @escaping @Sendable (TimeInterval) async throws -> Void = {
+            try await Task.sleep(nanoseconds: UInt64($0 * 1_000_000_000))
+        }
     ) {
         self.client = client
         self.credentials = credentials
         self.cache = cache
         self.clock = clock
+        self.sleep = sleep
         self.lastSuccessfulRead = nil
         let stored = credentials.load()
         self.device = stored
@@ -247,6 +288,16 @@ actor CloudSession: ReadSession {
     var lastSuccess: Date? { lastSuccessfulRead }
 
     var isPaired: Bool { device != nil }
+
+    nonisolated var mayBeWaking: Bool { true }
+
+    /// `async` on purpose: a synchronous version loses overload resolution to
+    /// the protocol extension's async no-op in every async caller.
+    func retryNowIfWaking() async {
+        guard gateIsColdStart else { return }
+        nextAttemptAllowedAt = nil
+        gateIsColdStart = false
+    }
 
     /// Last-known data, with no network attempt at all.
     ///
@@ -313,6 +364,7 @@ actor CloudSession: ReadSession {
         consecutiveFailures = 0
         consecutiveRejections = 0
         nextAttemptAllowedAt = nil
+        gateIsColdStart = false
         return result.device
     }
 
@@ -338,6 +390,7 @@ actor CloudSession: ReadSession {
         consecutiveFailures = 0
         consecutiveRejections = 0
         nextAttemptAllowedAt = nil
+        gateIsColdStart = false
     }
 
     func devices() async throws -> [CloudDevice] {
@@ -511,7 +564,7 @@ actor CloudSession: ReadSession {
         }
         let activityObjectGeneration = activityObjectGenerations[activityID] ?? 0
         if let allowed = nextAttemptAllowedAt, allowed > clock() {
-            throw Failure.throttled(retryAfter: allowed.timeIntervalSince(clock()))
+            throw gated(until: allowed)
         }
 
         let attempt: ReaderToken
@@ -681,7 +734,7 @@ actor CloudSession: ReadSession {
             }
             let now = clock()
             if let allowed = nextAttemptAllowedAt, allowed > now {
-                throw Failure.throttled(retryAfter: allowed.timeIntervalSince(now))
+                throw gated(until: allowed)
             }
             guard let refreshDevice = device else { throw Failure.notPaired }
             let refreshGeneration = lifecycleGeneration
@@ -729,13 +782,22 @@ actor CloudSession: ReadSession {
             throw lifecycleFailure()
         }
         do {
-            let outcome = try await client.refreshReaderContext(for: device)
+            // The refresh is the first request after every idle spell -- a
+            // reader context outlives no scale-down -- so it is the one that
+            // meets a sleeping server, and the one that rides it out.
+            let outcome = try await ridingOutColdStart(firstRequest: true) {
+                guard self.isCurrent(
+                    device: device, lifecycleGeneration: lifecycleGeneration
+                ) else { throw self.lifecycleFailure() }
+                return try await self.client.refreshReaderContext(for: device)
+            }
             guard isCurrent(device: device, lifecycleGeneration: lifecycleGeneration) else {
                 throw lifecycleFailure()
             }
             consecutiveFailures = 0
             consecutiveRejections = 0
             nextAttemptAllowedAt = nil
+            gateIsColdStart = false
             mintCount += 1
             lastSuccessfulRead = clock()
             return ReaderToken(
@@ -758,7 +820,12 @@ actor CloudSession: ReadSession {
             }
             // A transport error is the network, not the credential: it must
             // never move this device toward `removed`, or a week in a valley
-            // would unpair the rider's phone.
+            // would unpair the rider's phone. A timeout is not even the
+            // network: it is the server waking, and gets the short gate.
+            if Self.isColdStart(error, firstRequest: true) {
+                noteColdStart()
+                throw Failure.waking(retryAfter: Self.coldStartBackoff)
+            }
             noteFailure(retryAfter: nil)
             throw Failure.offline
         }
@@ -896,6 +963,53 @@ actor CloudSession: ReadSession {
             delay = Double.random(in: (ceiling / 2)...ceiling)
         }
         nextAttemptAllowedAt = clock().addingTimeInterval(delay)
+        gateIsColdStart = false
+    }
+
+    /// The server did not answer in time, even on the retry.
+    ///
+    /// Deliberately none of what `noteFailure` does: no escalation, since a
+    /// server that is starting is not one that needs to be left alone for
+    /// five minutes; and -- like every transport error -- no strike toward
+    /// removal, since a timeout says nothing about the credential.
+    private func noteColdStart() {
+        nextAttemptAllowedAt = clock().addingTimeInterval(Self.coldStartBackoff)
+        gateIsColdStart = true
+    }
+
+    private func gated(until allowed: Date) -> Failure {
+        let remaining = allowed.timeIntervalSince(clock())
+        return gateIsColdStart
+            ? .waking(retryAfter: remaining) : .throttled(retryAfter: remaining)
+    }
+
+    /// Whether `error` is how a request to a scaled-to-zero server fails.
+    ///
+    /// A timeout, always. A dropped connection only on the first request of a
+    /// wake -- the refresh -- where the ingress can cut a connection it was
+    /// holding for a replica that has not come up. Later in a read it is just
+    /// a dropped connection.
+    private static func isColdStart(_ error: Error, firstRequest: Bool) -> Bool {
+        guard let error = error as? URLError else { return false }
+        switch error.code {
+        case .timedOut: return true
+        case .networkConnectionLost: return firstRequest
+        default: return false
+        }
+    }
+
+    /// `send`, and once more after `coldStartRetryDelay` if it failed the way
+    /// a waking server fails. Whatever the retry throws is the caller's to
+    /// classify.
+    private func ridingOutColdStart<T>(
+        firstRequest: Bool, _ send: () async throws -> T
+    ) async throws -> T {
+        do {
+            return try await send()
+        } catch where Self.isColdStart(error, firstRequest: firstRequest) {
+            try await sleep(Self.coldStartRetryDelay)
+            return try await send()
+        }
     }
 
     private func pendingDelay() -> TimeInterval {
@@ -917,7 +1031,7 @@ actor CloudSession: ReadSession {
         lifecycleGeneration: Int
     ) async throws -> CloudSnapshot {
         if let allowed = nextAttemptAllowedAt, allowed > clock() {
-            throw Failure.throttled(retryAfter: allowed.timeIntervalSince(clock()))
+            throw gated(until: allowed)
         }
         // A delta is asked for only where the route serves one AND there is
         // something to be a delta from. `since=0` and no `since` at all are
@@ -992,10 +1106,12 @@ actor CloudSession: ReadSession {
             throw classify(error)
         }
         do {
-            return try await client.collection(
-                route, readerContext: attempt.value, device: device,
-                since: since, cursor: cursor
-            )
+            return try await ridingOutColdStart(firstRequest: false) {
+                try await client.collection(
+                    route, readerContext: attempt.value, device: device,
+                    since: since, cursor: cursor
+                )
+            }
         } catch let failure as CloudClient.Failure {
             guard case let .http(status, _, retryAfter, _) = failure else {
                 throw Failure.server(failure)
@@ -1015,6 +1131,10 @@ actor CloudSession: ReadSession {
                 throw Failure.server(retried)
             }
         } catch {
+            if Self.isColdStart(error, firstRequest: false) {
+                noteColdStart()
+                throw Failure.waking(retryAfter: Self.coldStartBackoff)
+            }
             throw classify(error)
         }
     }

@@ -17,6 +17,25 @@ final class CloudSessionTests: XCTestCase {
         let credentials: MemoryDeviceCredentialStore
         let cache: MemorySnapshotCache
         let signer: StubSigner
+        /// Every pause the session asked for, in seconds. Each one also
+        /// moves `clock` on by that much, so a gate set before the pause is
+        /// measured against the time that really passed.
+        let sleeps: SleepRecorder
+    }
+
+    final class SleepRecorder: @unchecked Sendable {
+        private let lock = NSLock()
+        private var recorded: [TimeInterval] = []
+        var delays: [TimeInterval] {
+            lock.lock()
+            defer { lock.unlock() }
+            return recorded
+        }
+        func record(_ delay: TimeInterval) {
+            lock.lock()
+            recorded.append(delay)
+            lock.unlock()
+        }
     }
 
     private func harness(
@@ -36,16 +55,22 @@ final class CloudSessionTests: XCTestCase {
             transport: transport,
             clock: clock.reader
         )
+        let sleeps = SleepRecorder()
         return Harness(
             session: CloudSession(
                 client: client, credentials: credentials, cache: cache,
-                clock: clock.reader
+                clock: clock.reader,
+                sleep: { delay in
+                    sleeps.record(delay)
+                    clock.advance(delay)
+                }
             ),
             transport: transport,
             clock: clock,
             credentials: credentials,
             cache: cache,
-            signer: signer
+            signer: signer,
+            sleeps: sleeps
         )
     }
 
@@ -626,6 +651,168 @@ final class CloudSessionTests: XCTestCase {
         XCTAssertEqual(reads[1].queryItems["cursor"], "cursor-2")
         XCTAssertEqual(rig.cache.load(.calendar)?.revision, 8)
         XCTAssertEqual(rig.cache.load(.calendar)?.items.map(\.id), snapshot.items.map(\.id))
+    }
+
+    // MARK: - Cold start
+
+    /// The read app scales to zero; its first request after an idle spell
+    /// waits for a replica. A timeout there costs the transport's whole
+    /// request timeout, which is charged to the clock.
+    private static func timedOut(_ clock: TestClock) -> URLError {
+        clock.advance(URLSessionCloudTransport.requestTimeout)
+        return URLError(.timedOut)
+    }
+
+    private static func cachedDashboard(_ clock: TestClock) -> MemorySnapshotCache {
+        let cache = MemorySnapshotCache()
+        cache.store(
+            CachedCollection(
+                revision: 4,
+                items: [CloudFixtures.item(
+                    id: "profile", kind: "profile", revision: 4, data: #"{"ftp":230}"#
+                )],
+                storedAt: clock.now
+            ),
+            for: .dashboard
+        )
+        return cache
+    }
+
+    func testTheCloudTransportWaitsOutAColdStart() {
+        let configuration = URLSessionCloudTransport.makeSession().configuration
+        XCTAssertEqual(configuration.timeoutIntervalForRequest, 60)
+        XCTAssertEqual(configuration.timeoutIntervalForResource, 120)
+    }
+
+    func testAColdStartTimeoutIsRetriedOnceAndThenServesFreshData() async throws {
+        let clock = TestClock()
+        let rig = harness(cache: Self.cachedDashboard(clock), clock: clock) { request, index in
+            if index == 0 { throw Self.timedOut(clock) }
+            return request.url?.path == "/api/v1/context/refresh"
+                ? .json(CloudFixtures.refreshBody(context: "context-1"))
+                : Self.dashboard(
+                    [CloudFixtures.profileItem(revision: 5, ftp: 245)], revision: 5
+                )
+        }
+
+        let snapshot = try await rig.session.load(.dashboard)
+        XCTAssertEqual(snapshot.source, .network, "the retry reached the woken server")
+        XCTAssertEqual(snapshot.revision, 5)
+        XCTAssertEqual(rig.sleeps.delays, [CloudSession.coldStartRetryDelay])
+        XCTAssertEqual(rig.transport.requests(matching: "/api/v1/context/refresh").count, 2)
+        let lastSuccess = await rig.session.lastSuccess
+        XCTAssertEqual(lastSuccess, clock.now)
+
+        // No backoff was left behind: the next read goes straight out.
+        let reads = rig.transport.requests(matching: "/api/v1/context/dashboard").count
+        let again = try await rig.session.load(.dashboard)
+        XCTAssertEqual(again.source, .network)
+        XCTAssertEqual(
+            rig.transport.requests(matching: "/api/v1/context/dashboard").count, reads + 1
+        )
+    }
+
+    func testTwoColdStartTimeoutsServeTheCacheBehindAShortFlatGate() async throws {
+        let clock = TestClock()
+        let rig = harness(cache: Self.cachedDashboard(clock), clock: clock) { request, index in
+            if index < 2 { throw Self.timedOut(clock) }
+            return request.url?.path == "/api/v1/context/refresh"
+                ? .json(CloudFixtures.refreshBody(context: "context-1"))
+                : Self.dashboard(
+                    [CloudFixtures.profileItem(revision: 5, ftp: 245)], revision: 5
+                )
+        }
+
+        let first = try await rig.session.load(.dashboard)
+        XCTAssertEqual(first.source, .cache)
+        XCTAssertEqual(first.revision, 4)
+        XCTAssertEqual(rig.transport.requestCount, 2, "one try and one retry, no more")
+        XCTAssertEqual(rig.sleeps.delays, [CloudSession.coldStartRetryDelay])
+
+        // Inside the short gate nothing is sent, and the cache still shows.
+        clock.advance(CloudSession.coldStartBackoff - 1)
+        let gated = try await rig.session.load(.dashboard)
+        XCTAssertEqual(gated.source, .cache)
+        XCTAssertEqual(rig.transport.requestCount, 2)
+
+        // The gate is the short one, not `baseBackoff` (at least 15s): 11s
+        // on, the next read is allowed out -- and the server is up by now.
+        clock.advance(2)
+        let recovered = try await rig.session.load(.dashboard)
+        XCTAssertEqual(recovered.source, .network)
+        XCTAssertEqual(recovered.revision, 5)
+        let state = await rig.session.deviceState
+        XCTAssertEqual(state, .paired)
+    }
+
+    func testWithNoCacheAColdStartIsReportedAsWakingNotThrottled() async throws {
+        let clock = TestClock()
+        let rig = harness(clock: clock) { _, _ in throw Self.timedOut(clock) }
+
+        do {
+            _ = try await rig.session.load(.dashboard)
+            XCTFail("nothing cached and no answer must throw")
+        } catch let failure as CloudSession.Failure {
+            guard case let .waking(retryAfter) = failure else {
+                return XCTFail("expected waking, got \(failure)")
+            }
+            XCTAssertEqual(retryAfter, CloudSession.coldStartBackoff)
+        }
+        // A read inside the gate hears the same thing, not a 429's wording.
+        do {
+            _ = try await rig.session.load(.dashboard)
+            XCTFail("the gate must hold")
+        } catch let failure as CloudSession.Failure {
+            guard case .waking = failure else {
+                return XCTFail("expected waking, got \(failure)")
+            }
+        }
+        XCTAssertEqual(rig.transport.requestCount, 2)
+    }
+
+    /// A timeout is not evidence about the credential. Two timeouts, then one
+    /// refusal: that refusal is only the first strike if the timeouts banked
+    /// none, so the device must still be paired with its data intact.
+    func testAColdStartTimeoutNeverCountsTowardRemoval() async throws {
+        let clock = TestClock()
+        let rig = harness(cache: Self.cachedDashboard(clock), clock: clock) { _, index in
+            if index < 2 { throw Self.timedOut(clock) }
+            return .refused(404, serverDate: clock.now)
+        }
+
+        _ = try await rig.session.load(.dashboard)
+        clock.advance(CloudSession.coldStartBackoff + 1)
+        let refused = try await rig.session.load(.dashboard)
+        XCTAssertEqual(refused.source, .cache)
+        XCTAssertEqual(rig.transport.requestCount, 3)
+        let state = await rig.session.deviceState
+        XCTAssertEqual(state, .paired, "timeouts must not count as strikes")
+        XCTAssertNotNil(rig.cache.load(.dashboard))
+        XCTAssertNotNil(rig.credentials.load())
+    }
+
+    func testPullToRefreshLiftsAColdStartGateButNeverARetryAfter() async throws {
+        let clock = TestClock()
+        let rig = harness(cache: Self.cachedDashboard(clock), clock: clock) { request, index in
+            if index < 2 { throw Self.timedOut(clock) }
+            return request.url?.path == "/api/v1/context/refresh"
+                ? .json(CloudFixtures.refreshBody(context: "context-1"))
+                : .refused(429, retryAfter: 30)
+        }
+
+        _ = try await rig.session.load(.dashboard)
+        XCTAssertEqual(rig.transport.requestCount, 2)
+        await rig.session.retryNowIfWaking()
+        let pulled = try await rig.session.load(.dashboard)
+        XCTAssertEqual(rig.transport.requestCount, 4, "the rider's pull goes out at once")
+        XCTAssertEqual(pulled.source, .cache, "and meets a 429")
+
+        // A pull must not shorten a Retry-After the server asked for.
+        await rig.session.retryNowIfWaking()
+        clock.advance(29)
+        let throttled = try await rig.session.load(.dashboard)
+        XCTAssertEqual(throttled.source, .cache)
+        XCTAssertEqual(rig.transport.requestCount, 4)
     }
 
     // MARK: - Offline

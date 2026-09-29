@@ -32,9 +32,12 @@ struct DashboardScreen: View {
 
     @ViewBuilder
     private var content: some View {
+        if model.wake.isShowing {
+            CloudWakingPanel(showingCache: model.isReady)
+        }
         switch model.state {
         case .starting:
-            LoadingDashboard()
+            if !model.wake.isShowing { LoadingDashboard() }
         case .unpaired:
             EmptyDashboard(
                 symbol: "link.badge.plus",
@@ -79,6 +82,12 @@ final class DashboardModel {
 
     private(set) var state: State = .starting
     var selectedWindow: LoadWindow = .sixWeeks
+    let wake = CloudWakeNotice()
+
+    var isReady: Bool {
+        if case .ready = state { return true }
+        return false
+    }
 
     /// Takes the session rather than building one.
     ///
@@ -117,7 +126,7 @@ final class DashboardModel {
         }
 
         do {
-            apply(try await session.load(.dashboard))
+            apply(try await wake.during(session) { try await session.load(.dashboard) })
         } catch let failure as CloudSession.Failure {
             switch failure {
             case .notPaired:

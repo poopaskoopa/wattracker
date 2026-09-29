@@ -80,6 +80,9 @@ enum PairingFailureMessage {
         switch failure {
         case .offline:
             return offline
+        case .waking:
+            // Independent of the code: the request never got an answer.
+            return "The server is still starting up. Wait a moment and try again."
         case let .throttled(retryAfter):
             return busy(retryAfter: retryAfter)
         case let .clockSkew(seconds):

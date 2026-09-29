@@ -115,7 +115,7 @@ struct ActivitiesScreen: View {
             .overlay {
                 if model.isLoading, model.snapshot == nil { ProgressView().tint(Palette.accent) }
             }
-            .refreshable { await model.refresh(session: session) }
+            .refreshable { await model.refresh(session: session, userInitiated: true) }
         }
         .background(Palette.bg)
     }
@@ -134,6 +134,10 @@ struct ActivitiesScreen: View {
             Text(model.snapshot.map { "Newest first · updated \(RideFormatting.relative($0.asOf))" }
                 ?? "Every recorded ride")
                 .font(.subheadline).foregroundStyle(Palette.muted)
+            if model.wake.isShowing {
+                Label("Waking up the cloud…", systemImage: "cloud")
+                    .font(.caption).foregroundStyle(Palette.muted)
+            }
             if let errorMessage = model.errorMessage, !rides.isEmpty {
                 Text(errorMessage).font(.caption).foregroundStyle(Palette.alert).lineLimit(1)
             }
