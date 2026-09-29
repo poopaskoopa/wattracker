@@ -16,6 +16,8 @@ from wattracker.cloud.snapshot import (
     snapshot_objects,
     snapshot_publish_pages,
 )
+from wattracker.prescribe import zwo
+from wattracker.prescribe.planner import build_workout
 
 
 def _activity(path, user_id, number, start_time, seconds=3000):
@@ -293,6 +295,63 @@ def test_calendar_day_uses_rider_local_date_but_activity_detail_keeps_utc_date(t
         obj for obj in objects if obj.object_id == f"activity-detail-{activity_id}"
     )
     assert detail.data["id"] == activity_id
+
+
+def test_calendar_workouts_publish_a_bounded_profile_from_real_zwo(tmp_path):
+    path = tmp_path / "workout-profile.db"
+    db.init_db(str(path))
+    user_id = db.create_user("profile-rider", "not-a-password", path=str(path))
+    db.save_user_settings(user_id, {"ftp": 250, "timezone": "UTC"}, path=str(path))
+
+    session = build_workout("threshold", 60)
+    stored_zwo = zwo.zwo_string(session)
+    plan_id = db.create_plan(
+        user_id, "Profile", "2026-08-05", 1, path=str(path),
+    )
+    db.add_plan_workout(
+        plan_id, user_id, "2026-08-05", session.name, session.workout_type,
+        session.total_duration(), session.estimated_tss, stored_zwo,
+        path=str(path),
+    )
+    db.add_standalone_workout(
+        user_id, "profile-one-off", "2026-08-05", session.name,
+        session.workout_type, session.total_duration(), session.estimated_tss,
+        stored_zwo, 250, path=str(path),
+    )
+
+    day = next(
+        item for item in snapshot_objects(path, user_id)
+        if item.kind == "calendar_day" and item.data["date"] == "2026-08-05"
+    )
+    workouts = day.data["workouts"]
+    assert len(workouts) == 2
+    for workout in workouts:
+        profile = workout["profile"]
+        assert profile
+        assert profile[0]["start"] == 0
+        assert profile[-1]["end"] == session.total_duration()
+        assert profile[0]["label"] == "Warmup ramp"
+        assert profile[0]["text"] == session.segments[0].text
+        assert all(block["duration_s"] == block["end"] - block["start"]
+                   for block in profile)
+        assert all(
+            {"start", "end", "duration_s", "target_start", "target_end",
+             "kind"}.issubset(block)
+            for block in profile
+        )
+        assert any(block["kind"] == "intervals" for block in profile)
+        assert all(
+            isinstance(block["kind"], str)
+            and all(
+                value is None or 0 <= value <= 5
+                for value in (block["target_start"], block["target_end"])
+            )
+            for block in profile
+        )
+        encoded = json.dumps(workout, separators=(",", ":"), allow_nan=False)
+        assert "workout_file" not in encoded
+        assert "zwo_or_segments" not in workout
+        assert "zwo" not in workout
 
 
 def test_high_cardinality_calendar_day_is_chunked(tmp_path):

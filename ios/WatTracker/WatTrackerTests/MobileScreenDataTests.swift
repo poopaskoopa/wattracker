@@ -110,6 +110,114 @@ final class MobileScreenDataTests: XCTestCase {
         )
     }
 
+    func testCalendarWorkoutStepsUseTheCurrentFTPInTheirDescription() {
+        let step = CalendarWorkoutProfileBlock(
+            start: 0,
+            end: 600,
+            durationS: 600,
+            targetStart: 1,
+            targetEnd: 1,
+            kind: "steadystate",
+            label: "Steady block",
+            text: nil,
+            free: false
+        )
+
+        XCTAssertEqual(
+            CalendarWorkoutFormatting.stepDescription(step, ftp: 250),
+            "10 min at 250 W (100% FTP)"
+        )
+    }
+
+    func testCalendarIntervalStepsKeepTheDesktopDescriptionAndTargets() {
+        let steps = [
+            CalendarWorkoutProfileBlock(
+                start: 0, end: 60, durationS: 60,
+                targetStart: 0.93, targetEnd: 0.93,
+                kind: "intervals", label: "2 x 1min on / 1min easy",
+                text: nil, free: false
+            ),
+            CalendarWorkoutProfileBlock(
+                start: 60, end: 120, durationS: 60,
+                targetStart: 0.55, targetEnd: 0.55,
+                kind: "intervals", label: "2 x 1min on / 1min easy",
+                text: nil, free: false
+            ),
+            CalendarWorkoutProfileBlock(
+                start: 120, end: 180, durationS: 60,
+                targetStart: 0.93, targetEnd: 0.93,
+                kind: "intervals", label: "2 x 1min on / 1min easy",
+                text: nil, free: false
+            ),
+        ]
+
+        XCTAssertEqual(
+            CalendarWorkoutFormatting.stepDescriptions(steps, ftp: 250),
+            ["2 x 1min on / 1min easy at 232 W / 138 W (93% / 55% FTP)"]
+        )
+    }
+
+    func testCalendarCarriesFTPAlongsideAnOptionalWorkoutProfile() {
+        let item = calendarItem(
+            id: "calendar-day-2026-01-03",
+            date: "2026-01-03",
+            workouts: """
+            [{"name":"Threshold","profile":[{"start":0,"end":600,
+              "duration_s":600,"target_start":1,"target_end":1,
+              "kind":"steadystate"}]}]
+            """
+        )
+        let data = CalendarData(
+            snapshot: snapshot(route: .calendar, items: [item]),
+            ftp: 250
+        )
+
+        let day = data.entry(for: "2026-01-03")
+        XCTAssertEqual(day?.currentFTP, 250)
+        let profile = day.flatMap { CalendarWorkoutProfileDecoder.blocks(from: $0.workouts[0]) }
+        XCTAssertEqual(profile?.first?.targetStart, 1)
+    }
+
+    func testCalendarFTPUsesTrainingStateBeforeProfileFallback() {
+        let training = CloudFixtures.item(
+            id: "training-state",
+            kind: "training_state",
+            revision: 2,
+            data: "{\"ftp\":260}"
+        )
+        let profile = CloudFixtures.item(
+            id: "profile",
+            kind: "profile",
+            revision: 2,
+            data: "{\"ftp\":250}"
+        )
+
+        XCTAssertEqual(
+            CalendarData.currentFTP(
+                from: snapshot(route: .dashboard, items: [profile, training])
+            ),
+            260
+        )
+        XCTAssertEqual(
+            CalendarData.currentFTP(
+                from: snapshot(route: .dashboard, items: [profile])
+            ),
+            250
+        )
+        let invalidTraining = CloudFixtures.item(
+            id: "training-state",
+            kind: "training_state",
+            revision: 2,
+            data: "{\"ftp\":0}"
+        )
+        XCTAssertEqual(
+            CalendarData.currentFTP(
+                from: snapshot(route: .dashboard, items: [profile, invalidTraining])
+            ),
+            250
+        )
+    }
+
     func testCalendarMonthUsesMondayColumnsAndLeapDays() {
         let leap = CalendarMonth(year: 2024, month: 2)
         XCTAssertEqual(leap.dayCount, 29)

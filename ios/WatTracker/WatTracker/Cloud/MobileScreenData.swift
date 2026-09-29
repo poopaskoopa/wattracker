@@ -82,6 +82,195 @@ struct CalendarMonth: Hashable, Sendable, Equatable {
     }()
 }
 
+struct CalendarWorkoutProfileBlock: Identifiable, Sendable, Equatable {
+    let start: Double
+    let end: Double
+    let durationS: Double
+    let targetStart: Double?
+    let targetEnd: Double?
+    let kind: String
+    let label: String?
+    let text: String?
+    let free: Bool
+
+    var id: String { "\(start)-\(end)-\(kind)" }
+}
+
+enum CalendarWorkoutFormatting {
+    static func stepDescription(
+        _ step: CalendarWorkoutProfileBlock,
+        ftp: Double?
+    ) -> String {
+        let duration = duration(step.durationS)
+        if step.free {
+            return "\(duration) max effort — no target"
+        }
+        let start = target(step.targetStart, ftp: ftp)
+        let end = target(step.targetEnd, ftp: ftp)
+        let percentStart = percent(step.targetStart)
+        let percentEnd = percent(step.targetEnd)
+        guard let start, let end else {
+            return "\(duration) at \(percentStart ?? percentEnd ?? "unknown") FTP"
+        }
+        if start == end {
+            if let percentStart {
+                return "\(duration) at \(start) W (\(percentStart) FTP)"
+            }
+            return "\(duration) at \(start) W"
+        }
+        if let percentStart, let percentEnd {
+            return "\(duration) at \(start)–\(end) W (\(percentStart)–\(percentEnd) FTP)"
+        }
+        return "\(duration) at \(start)–\(end) W"
+    }
+
+    static func stepDescriptions(
+        _ steps: [CalendarWorkoutProfileBlock],
+        ftp: Double?
+    ) -> [String] {
+        var result: [String] = []
+        var index = 0
+        while index < steps.count {
+            let step = steps[index]
+            guard step.kind == "intervals",
+                  let label = step.label, !label.isEmpty else {
+                result.append(stepDescription(step, ftp: ftp))
+                index += 1
+                continue
+            }
+
+            var group = [step]
+            var next = index + 1
+            while next < steps.count,
+                  steps[next].kind == "intervals",
+                  steps[next].label == label {
+                group.append(steps[next])
+                next += 1
+            }
+            result.append(intervalDescription(label, group, ftp: ftp))
+            index = next
+        }
+        return result
+    }
+
+    static func coachingTexts(_ steps: [CalendarWorkoutProfileBlock]) -> [String] {
+        var result: [String] = []
+        for text in steps.compactMap(\.text) where !text.isEmpty {
+            if result.last != text { result.append(text) }
+        }
+        return result
+    }
+
+    private static func intervalDescription(
+        _ label: String,
+        _ steps: [CalendarWorkoutProfileBlock],
+        ftp: Double?
+    ) -> String {
+        var watts: [Int] = []
+        var percentages: [String] = []
+        for step in steps {
+            if let value = target(step.targetStart, ftp: ftp), !watts.contains(value) {
+                watts.append(value)
+            }
+            if let value = percent(step.targetStart), !percentages.contains(value) {
+                percentages.append(value)
+            }
+        }
+        var result = label
+        if !watts.isEmpty {
+            result += " at " + watts.map { "\($0) W" }.joined(separator: " / ")
+        }
+        if !percentages.isEmpty {
+            result += " (" + percentages.joined(separator: " / ") + " FTP)"
+        }
+        return result
+    }
+
+    static func duration(_ seconds: Double) -> String {
+        guard seconds.isFinite, seconds >= 0 else { return "—" }
+        let total = Int(seconds.rounded())
+        let minutes = total / 60
+        let remainder = total % 60
+        if minutes == 0 { return "\(remainder)s" }
+        if remainder == 0 { return "\(minutes) min" }
+        return "\(minutes)m \(remainder)s"
+    }
+
+    static func target(_ fraction: Double?, ftp: Double?) -> Int? {
+        guard let fraction, fraction.isFinite,
+              let ftp, ftp.isFinite, ftp > 0 else { return nil }
+        return Int((fraction * ftp).rounded(.toNearestOrEven))
+    }
+
+    static func percent(_ fraction: Double?) -> String? {
+        guard let fraction, fraction.isFinite else { return nil }
+        return "\(Int((fraction * 100).rounded()))%"
+    }
+
+    /// The desktop varies fill opacity by the same seven power zones. There
+    /// is no shared Swift color set, so the chart uses its accent with these
+    /// same opacity stops rather than inventing a second hue palette.
+    static func zoneOpacity(_ fraction: Double) -> Double {
+        switch fraction {
+        case ..<0.56: return 0.08
+        case ..<0.76: return 0.13
+        case ..<0.91: return 0.18
+        case ..<1.06: return 0.24
+        case ..<1.21: return 0.31
+        case ..<1.51: return 0.39
+        default: return 0.48
+        }
+    }
+}
+
+/// Field-by-field parsing keeps a malformed optional profile from blanking an
+/// otherwise valid calendar page. The publisher bounds this to 512 blocks too.
+enum CalendarWorkoutProfileDecoder {
+    private static let maxBlocks = 512
+
+    static func blocks(from workout: JSONValue) -> [CalendarWorkoutProfileBlock] {
+        guard case let .array(values) = workout["profile"] else { return [] }
+        return values.prefix(maxBlocks).compactMap { value in
+            guard let start = number(value, key: "start"),
+                  let end = number(value, key: "end"),
+                  let duration = number(value, key: "duration_s"),
+                  let kind = string(value, key: "kind"),
+                  start >= 0, end >= start, duration >= 0,
+                  end - start == duration else { return nil }
+            return CalendarWorkoutProfileBlock(
+                start: start,
+                end: end,
+                durationS: duration,
+                targetStart: number(value, key: "target_start"),
+                targetEnd: number(value, key: "target_end"),
+                kind: kind,
+                label: string(value, key: "label"),
+                text: string(value, key: "text"),
+                free: bool(value, key: "free")
+            )
+        }
+    }
+
+    private static func number(_ value: JSONValue, key: String) -> Double? {
+        guard let number = value[key]?.doubleValue, number.isFinite else {
+            return nil
+        }
+        return number
+    }
+
+    private static func string(_ value: JSONValue, key: String) -> String? {
+        guard let string = value[key]?.stringValue, !string.isEmpty else {
+            return nil
+        }
+        return string
+    }
+
+    private static func bool(_ value: JSONValue, key: String) -> Bool {
+        if case let .some(.bool(flag)) = value[key] { return flag }
+        return false
+    }
+}
+
 /// A merged day from one or more `calendar_day` objects.
 ///
 /// The server splits unusually large days into parts. The UI must aggregate by
@@ -94,6 +283,7 @@ struct CalendarDayEntry: Identifiable, Sendable, Equatable {
     let race: JSONValue?
     let workouts: [JSONValue]
     let activities: [JSONValue]
+    let currentFTP: Double?
 
     var id: String { dateISO }
     var workoutCount: Int { workouts.count }
@@ -116,10 +306,17 @@ struct CalendarDayEntry: Identifiable, Sendable, Equatable {
 /// The calendar route after its wire objects have been grouped by day.
 struct CalendarData: Sendable, Equatable {
     let days: [CalendarDayEntry]
+    /// The FTP used to turn a published %FTP target into rider watts. This is
+    /// read from the dashboard snapshot, never from a calendar row.
+    let currentFTP: Double?
     let source: CloudSnapshot.Source
     let asOf: Date
 
-    init(snapshot: CloudSnapshot, activitySnapshot: CloudSnapshot? = nil) {
+    init(
+        snapshot: CloudSnapshot,
+        activitySnapshot: CloudSnapshot? = nil,
+        ftp: Double? = nil
+    ) {
         struct Accumulator {
             var ooto = false
             var phase: String?
@@ -163,11 +360,31 @@ struct CalendarData: Sendable, Equatable {
                 phase: value.phase,
                 race: value.race,
                 workouts: value.workouts,
-                activities: activities
+                activities: activities,
+                currentFTP: ftp
             )
         }
         source = snapshot.source
         asOf = snapshot.asOf
+        currentFTP = ftp
+    }
+
+    static func currentFTP(from snapshot: CloudSnapshot?) -> Double? {
+        guard let snapshot else { return nil }
+        var training: TrainingState?
+        var profile: RiderProfile?
+        for item in snapshot.items where !item.deleted {
+            switch item.payload {
+            case let .trainingState(value): training = value
+            case let .profile(value): profile = value
+            default: break
+            }
+        }
+        for value in [training?.ftp, profile?.resolvedFTP] {
+            guard let value, value.isFinite, value > 0 else { continue }
+            return value
+        }
+        return nil
     }
 
     var hasContent: Bool { days.contains(where: \.hasContent) }

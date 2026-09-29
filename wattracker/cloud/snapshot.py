@@ -21,6 +21,8 @@ from ..metrics.curve import MMP_DURATIONS, fit_cp_wprime, mean_maximal_power
 from ..metrics.decoupling import aerobic_decoupling
 from ..metrics.load import compute_load, daily_tss_series
 from ..prescribe import goals
+from ..prescribe import profile as workout_profile
+from ..prescribe import zwo
 from ..timeutil import parse_naive, to_user_timezone, utc_now
 from .models import (
     MAX_BATCH_OBJECTS,
@@ -555,27 +557,50 @@ def _volume_objects(
     ]
 
 
+def _workout_profile(raw: Any, workout_type: Any) -> Optional[list[dict]]:
+    """Derive a bounded mobile profile without publishing the stored ZWO."""
+    if not isinstance(raw, str):
+        return None
+    session = zwo.session_from_zwo(raw, workout_type=str(workout_type or "workout"))
+    if session is None:
+        return None
+    profile = workout_profile.fraction_profile(session)
+    return profile or None
+
+
 def _row_payload(row: sqlite3.Row) -> dict:
-    """Use the DB's normalized workout row when the full schema is present."""
+    """Use the DB's normalized workout row and derive its mobile profile."""
     try:
-        return db._plan_workout_row(row)
+        payload = db._plan_workout_row(row, include_zwo=True)
     except (AttributeError, KeyError, IndexError):
-        return {
+        payload = {
             key: row[key]
             for key in row.keys()
-            if key not in {"user_id", "zwo_or_segments", "zwo"}
+            if key not in {"user_id", "zwo"}
         }
+    raw = payload.pop("zwo_or_segments", None)
+    if raw is None:
+        raw = payload.pop("zwo", None)
+    profile = _workout_profile(raw, payload.get("type"))
+    if profile is not None:
+        payload["profile"] = profile
+    return payload
 
 
 def _standalone_payload(row: sqlite3.Row) -> dict:
     try:
-        return db._standalone_row(row)
+        payload = db._standalone_row(row, include_zwo=True)
     except (AttributeError, KeyError, IndexError):
-        return {
+        payload = {
             key: row[key]
             for key in row.keys()
-            if key not in {"user_id", "export_key", "zwo"}
+            if key not in {"user_id", "export_key"}
         }
+    raw = payload.pop("zwo", None)
+    profile = _workout_profile(raw, payload.get("type"))
+    if profile is not None:
+        payload["profile"] = profile
+    return payload
 
 
 def _calendar_day_objects(
