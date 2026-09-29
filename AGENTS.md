@@ -187,7 +187,7 @@ states on `main` when the PR is merge-committed. Four such commits are on
 `main` from #358 and #356 (`a04e344`, `95a6bb2`, `8d1a582`, `892b345`); if
 `git bisect` lands on one, `git bisect skip` it.
 
-1. **#406: the cloud settings display.** "Last successful push" shows a raw
+1. **#406: PR #409 open, awaiting owner-side review.** The cloud settings display: "Last successful push" shows a raw
    Unix timestamp; show a local date and time. "Queued/offline" is shown for a
    healthy, idle sync; give distinct labels (up to date, queued N, waiting for
    the first sync, and the existing error and retry states) from the status data
