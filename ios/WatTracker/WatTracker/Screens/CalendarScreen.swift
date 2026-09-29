@@ -587,6 +587,14 @@ private struct CalendarWorkoutPanel: View {
                         .foregroundStyle(Palette.muted)
                         let profile = CalendarJSON.profile(workout)
                         if !profile.isEmpty {
+                            if let ftp, ftp.isFinite, ftp > 0 {
+                                Text(
+                                    "at FTP \(Int(ftp.rounded(.toNearestOrEven))) W"
+                                )
+                                .font(.caption.weight(.semibold))
+                                .foregroundStyle(Palette.accent)
+                                .accessibilityIdentifier("calendar-workout-ftp")
+                            }
                             CalendarWorkoutProfileChart(profile: profile, ftp: ftp)
                                 .frame(minHeight: 190)
                             VStack(alignment: .leading, spacing: 5) {
@@ -631,29 +639,48 @@ private struct CalendarWorkoutProfileChart: View {
     let ftp: Double?
 
     var body: some View {
+        let hasFTP = ftp?.isFinite == true && (ftp ?? 0) > 0
         Chart {
             ForEach(profile) { step in
                 if !step.free,
-                   let start = CalendarWorkoutFormatting.target(step.targetStart, ftp: ftp),
-                   let end = CalendarWorkoutFormatting.target(step.targetEnd, ftp: ftp) {
+                   let start = CalendarWorkoutFormatting.chartTarget(
+                       step.targetStart, ftp: ftp
+                   ),
+                   let end = CalendarWorkoutFormatting.chartTarget(
+                       step.targetEnd, ftp: ftp
+                   ) {
                     let opacity = CalendarWorkoutFormatting.zoneOpacity(
                         ((step.targetStart ?? 0) + (step.targetEnd ?? 0)) / 2
                     )
+                    AreaMark(
+                        x: .value("Time", step.start),
+                        yStart: .value("Baseline", 0.0),
+                        yEnd: .value("Power", start),
+                        series: .value("Step", step.id)
+                    )
+                    .foregroundStyle(Palette.accent.opacity(opacity))
+                    AreaMark(
+                        x: .value("Time", step.end),
+                        yStart: .value("Baseline", 0.0),
+                        yEnd: .value("Power", end),
+                        series: .value("Step", step.id)
+                    )
+                    .foregroundStyle(Palette.accent.opacity(opacity))
                     LineMark(
                         x: .value("Time", step.start),
                         y: .value("Power", start),
                         series: .value("Step", step.id)
                     )
-                    .foregroundStyle(Palette.accent.opacity(opacity))
+                    .foregroundStyle(Palette.accent)
                     LineMark(
                         x: .value("Time", step.end),
                         y: .value("Power", end),
                         series: .value("Step", step.id)
                     )
-                    .foregroundStyle(Palette.accent.opacity(opacity))
+                    .foregroundStyle(Palette.accent)
                 }
             }
-            if let ftp, ftp.isFinite, ftp > 0 {
+            if hasFTP, let ftp {
                 RuleMark(y: .value("FTP", ftp))
                     .foregroundStyle(Palette.muted)
                     .lineStyle(StrokeStyle(lineWidth: 1, dash: [5, 4]))
@@ -665,7 +692,7 @@ private struct CalendarWorkoutProfileChart: View {
             }
         }
         .chartXAxisLabel("Time (s)")
-        .chartYAxisLabel("Power (W)")
+        .chartYAxisLabel(hasFTP ? "Power (W)" : "Target (% FTP)")
         .frame(minHeight: 190)
         .accessibilityIdentifier("calendar-workout-profile-chart")
     }

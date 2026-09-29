@@ -51,7 +51,7 @@ def _xml_float(element: ET.Element, name: str) -> Optional[float]:
         value = float(raw or "")
     except (TypeError, ValueError, OverflowError):
         return None
-    return value if math.isfinite(value) and -5 <= value <= 5 else None
+    return value if math.isfinite(value) and 0 <= value <= 5 else None
 
 
 def _xml_text(element: ET.Element) -> Optional[str]:

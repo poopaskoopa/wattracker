@@ -66,6 +66,7 @@ def fraction_profile(session: Session) -> list[dict]:
             "start": int(start),
             "end": int(end),
             "duration_s": int(end - start),
+            "segment": int(source_index),
             "target_start": (
                 round(float(target_start), 4) if target_start is not None else None
             ),

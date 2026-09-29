@@ -92,6 +92,31 @@ struct CalendarWorkoutProfileBlock: Identifiable, Sendable, Equatable {
     let label: String?
     let text: String?
     let free: Bool
+    let segmentIndex: Int?
+
+    init(
+        start: Double,
+        end: Double,
+        durationS: Double,
+        targetStart: Double?,
+        targetEnd: Double?,
+        kind: String,
+        label: String?,
+        text: String?,
+        free: Bool,
+        segmentIndex: Int? = nil
+    ) {
+        self.start = start
+        self.end = end
+        self.durationS = durationS
+        self.targetStart = targetStart
+        self.targetEnd = targetEnd
+        self.kind = kind
+        self.label = label
+        self.text = text
+        self.free = free
+        self.segmentIndex = segmentIndex
+    }
 
     var id: String { "\(start)-\(end)-\(kind)" }
 }
@@ -139,11 +164,17 @@ enum CalendarWorkoutFormatting {
                 continue
             }
 
+            let segmentIndex = step.segmentIndex
             var group = [step]
             var next = index + 1
             while next < steps.count,
                   steps[next].kind == "intervals",
                   steps[next].label == label {
+                if let segmentIndex,
+                   let nextSegmentIndex = steps[next].segmentIndex,
+                   nextSegmentIndex != segmentIndex {
+                    break
+                }
                 group.append(steps[next])
                 next += 1
             }
@@ -202,6 +233,12 @@ enum CalendarWorkoutFormatting {
         return Int((fraction * ftp).rounded(.toNearestOrEven))
     }
 
+    static func chartTarget(_ fraction: Double?, ftp: Double?) -> Double? {
+        guard let fraction, fraction.isFinite else { return nil }
+        guard let ftp, ftp.isFinite, ftp > 0 else { return fraction * 100 }
+        return fraction * ftp
+    }
+
     static func percent(_ fraction: Double?) -> String? {
         guard let fraction, fraction.isFinite else { return nil }
         return "\(Int((fraction * 100).rounded()))%"
@@ -246,7 +283,8 @@ enum CalendarWorkoutProfileDecoder {
                 kind: kind,
                 label: string(value, key: "label"),
                 text: string(value, key: "text"),
-                free: bool(value, key: "free")
+                free: bool(value, key: "free"),
+                segmentIndex: integer(value, key: "segment")
             )
         }
     }
@@ -263,6 +301,13 @@ enum CalendarWorkoutProfileDecoder {
             return nil
         }
         return string
+    }
+
+    private static func integer(_ value: JSONValue, key: String) -> Int? {
+        guard let number = number(value, key: key), number.rounded() == number else {
+            return nil
+        }
+        return Int(exactly: number)
     }
 
     private static func bool(_ value: JSONValue, key: String) -> Bool {

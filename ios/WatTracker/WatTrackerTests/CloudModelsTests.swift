@@ -282,6 +282,30 @@ final class CloudModelsTests: XCTestCase {
         XCTAssertTrue(CalendarWorkoutProfileDecoder.blocks(from: workouts[2]).isEmpty)
     }
 
+    func testRealPublisherCalendarDayVectorDecodesThePublishedWorkoutProfile() throws {
+        let testsDirectory = URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent()
+        let vectorURL = testsDirectory
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+            .appendingPathComponent("tests/vectors/calendar_day_profile.json")
+        let item = try JSONDecoder().decode(
+            CloudItem.self, from: Data(contentsOf: vectorURL)
+        )
+        XCTAssertEqual(item.kind, .calendarDay)
+        guard case let .calendarDay(day) = item.payload,
+              let workout = day.workouts?.first else {
+            return XCTFail("the real publisher vector has no calendar workout")
+        }
+        let blocks = CalendarWorkoutProfileDecoder.blocks(from: workout)
+        XCTAssertEqual(blocks.count, 7)
+        XCTAssertEqual(blocks.first?.segmentIndex, 0)
+        XCTAssertEqual(blocks[1].segmentIndex, 1)
+        XCTAssertEqual(blocks[1].targetStart, 0.93)
+        XCTAssertEqual(blocks.last?.end, 3600)
+    }
+
     func testLeniencyStopsAtTheEnvelope() {
         XCTAssertThrowsError(try decode("""
         {"items":[{"id":"profile","kind":"profile","revision":"7",

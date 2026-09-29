@@ -20,8 +20,10 @@ from ..analysis import zones
 from ..metrics.curve import MMP_DURATIONS, fit_cp_wprime, mean_maximal_power
 from ..metrics.decoupling import aerobic_decoupling
 from ..metrics.load import compute_load, daily_tss_series
+from ..metrics import profile_store
 from ..prescribe import goals
 from ..prescribe import profile as workout_profile
+from ..prescribe.planner import build_workout
 from ..prescribe import zwo
 from ..timeutil import parse_naive, to_user_timezone, utc_now
 from .models import (
@@ -557,18 +559,36 @@ def _volume_objects(
     ]
 
 
-def _workout_profile(raw: Any, workout_type: Any) -> Optional[list[dict]]:
-    """Derive a bounded mobile profile without publishing the stored ZWO."""
-    if not isinstance(raw, str):
-        return None
-    session = zwo.session_from_zwo(raw, workout_type=str(workout_type or "workout"))
+def _workout_profile(
+    raw: Any,
+    payload: Mapping[str, Any],
+    rider_profile,
+) -> Optional[list[dict]]:
+    """Rebuild the desktop session, using ZWO only for non-builder rows."""
+    session = None
+    duration_s = _finite(payload.get("duration_s"))
+    workout_type = payload.get("type")
+    if isinstance(workout_type, str) and duration_s is not None and duration_s > 0:
+        try:
+            session = build_workout(
+                workout_type,
+                max(1.0, duration_s / 60.0),
+                payload.get("variant"),
+                profile=rider_profile,
+            )
+        except (TypeError, ValueError, OverflowError):
+            session = None
+    if session is None and isinstance(raw, str):
+        session = zwo.session_from_zwo(
+            raw, workout_type=str(workout_type or "workout")
+        )
     if session is None:
         return None
     profile = workout_profile.fraction_profile(session)
     return profile or None
 
 
-def _row_payload(row: sqlite3.Row) -> dict:
+def _row_payload(row: sqlite3.Row, rider_profile=None) -> dict:
     """Use the DB's normalized workout row and derive its mobile profile."""
     try:
         payload = db._plan_workout_row(row, include_zwo=True)
@@ -581,13 +601,13 @@ def _row_payload(row: sqlite3.Row) -> dict:
     raw = payload.pop("zwo_or_segments", None)
     if raw is None:
         raw = payload.pop("zwo", None)
-    profile = _workout_profile(raw, payload.get("type"))
+    profile = _workout_profile(raw, payload, rider_profile)
     if profile is not None:
         payload["profile"] = profile
     return payload
 
 
-def _standalone_payload(row: sqlite3.Row) -> dict:
+def _standalone_payload(row: sqlite3.Row, rider_profile=None) -> dict:
     try:
         payload = db._standalone_row(row, include_zwo=True)
     except (AttributeError, KeyError, IndexError):
@@ -597,7 +617,7 @@ def _standalone_payload(row: sqlite3.Row) -> dict:
             if key not in {"user_id", "export_key"}
         }
     raw = payload.pop("zwo", None)
-    profile = _workout_profile(raw, payload.get("type"))
+    profile = _workout_profile(raw, payload, rider_profile)
     if profile is not None:
         payload["profile"] = profile
     return payload
@@ -693,6 +713,7 @@ def _calendar_objects(
     user_id: int,
     records: Sequence[Mapping[str, Any]],
     settings: Mapping[str, Any],
+    rider_profile=None,
 ) -> list[CloudObject]:
     workouts_by_date: dict[str, list[dict]] = {}
     activities_by_date: dict[str, list[dict]] = {}
@@ -767,7 +788,7 @@ def _calendar_objects(
             if day:
                 day = str(day)[:10]
                 dates.add(day)
-                item = _row_payload(row)
+                item = _row_payload(row, rider_profile)
                 completed = row["completed_activity_id"] is not None
                 skipped = _in_ooto(day) and not completed
                 item.update({
@@ -793,7 +814,7 @@ def _calendar_objects(
             if day:
                 day = str(day)[:10]
                 dates.add(day)
-                item = _standalone_payload(row)
+                item = _standalone_payload(row, rider_profile)
                 completed = row["completed_activity_id"] is not None
                 item.update({
                     "date": day,
@@ -978,7 +999,12 @@ def _derived_objects(
         )
     )
     objects.extend(_volume_objects(records, settings))
-    objects.extend(_calendar_objects(conn, user_id, records, settings))
+    objects.extend(
+        _calendar_objects(
+            conn, user_id, records, settings,
+            rider_profile=profile_store.from_row(profile),
+        )
+    )
     return objects
 
 

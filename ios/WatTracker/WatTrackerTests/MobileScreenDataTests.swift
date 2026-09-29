@@ -135,25 +135,86 @@ final class MobileScreenDataTests: XCTestCase {
                 start: 0, end: 60, durationS: 60,
                 targetStart: 0.93, targetEnd: 0.93,
                 kind: "intervals", label: "2 x 1min on / 1min easy",
-                text: nil, free: false
+                text: nil, free: false, segmentIndex: 0
             ),
             CalendarWorkoutProfileBlock(
                 start: 60, end: 120, durationS: 60,
                 targetStart: 0.55, targetEnd: 0.55,
                 kind: "intervals", label: "2 x 1min on / 1min easy",
-                text: nil, free: false
+                text: nil, free: false, segmentIndex: 0
             ),
             CalendarWorkoutProfileBlock(
                 start: 120, end: 180, durationS: 60,
                 targetStart: 0.93, targetEnd: 0.93,
                 kind: "intervals", label: "2 x 1min on / 1min easy",
-                text: nil, free: false
+                text: nil, free: false, segmentIndex: 0
             ),
         ]
 
         XCTAssertEqual(
             CalendarWorkoutFormatting.stepDescriptions(steps, ftp: 250),
             ["2 x 1min on / 1min easy at 232 W / 138 W (93% / 55% FTP)"]
+        )
+    }
+
+    func testCalendarTempoProgressionKeepsDistinctStepsDistinct() {
+        let label = "1 x 9min on / 4min easy"
+        let steps = [0.78, 0.55, 0.80, 0.82].enumerated().map {
+            CalendarWorkoutProfileBlock(
+                start: Double($0.offset * 60),
+                end: Double(($0.offset + 1) * 60),
+                durationS: 60,
+                targetStart: $0.element,
+                targetEnd: $0.element,
+                kind: "intervals",
+                label: label,
+                text: nil,
+                free: false,
+                segmentIndex: $0.offset
+            )
+        }
+
+        XCTAssertEqual(
+            CalendarWorkoutFormatting.stepDescriptions(steps, ftp: 250),
+            [
+                "1 x 9min on / 4min easy at 195 W (78% FTP)",
+                "1 x 9min on / 4min easy at 138 W (55% FTP)",
+                "1 x 9min on / 4min easy at 200 W (80% FTP)",
+                "1 x 9min on / 4min easy at 205 W (82% FTP)",
+            ]
+        )
+    }
+
+    func testCalendarLegacyIntervalsStillGroupWithoutSegmentMarkers() {
+        let label = "2 x 1min on / 1min easy"
+        let steps = [0.93, 0.55, 0.93].enumerated().map {
+            CalendarWorkoutProfileBlock(
+                start: Double($0.offset * 60),
+                end: Double(($0.offset + 1) * 60),
+                durationS: 60,
+                targetStart: $0.element,
+                targetEnd: $0.element,
+                kind: "intervals",
+                label: label,
+                text: nil,
+                free: false
+            )
+        }
+
+        XCTAssertEqual(
+            CalendarWorkoutFormatting.stepDescriptions(steps, ftp: 250),
+            ["2 x 1min on / 1min easy at 232 W / 138 W (93% / 55% FTP)"]
+        )
+    }
+
+    func testCalendarChartFallsBackToPercentFTPWithoutAnFTP() {
+        XCTAssertEqual(
+            CalendarWorkoutFormatting.chartTarget(0.78, ftp: nil),
+            78
+        )
+        XCTAssertEqual(
+            CalendarWorkoutFormatting.chartTarget(0.78, ftp: 250),
+            195
         )
     }
 
