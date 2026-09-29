@@ -218,21 +218,57 @@ struct RiderProfile: Codable, Sendable, Equatable {
 }
 
 /// The `{available, value, source, zones}` block shared by power and HR.
+///
+/// This block and `Zone` decode leniently: an optional field of an unexpected
+/// type reads as nil instead of throwing.  They are display detail inside the
+/// profile, and a strict decode here fails the whole Dashboard page -- which
+/// is exactly what a numeric `Zone.pct` did against the desktop's string.
+/// `available` stays strict; the envelope (`id`, `kind`, `revision`) is
+/// `CloudItem`'s and is never lenient.
 struct MetricState: Codable, Sendable, Equatable {
     let available: Bool
     let value: Double?
     let source: String?
     let zones: [Zone]?
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        available = try container.decode(Bool.self, forKey: .available)
+        value = container.lenient(Double.self, forKey: .value)
+        source = container.lenient(String.self, forKey: .source)
+        zones = container.lenient([Zone].self, forKey: .zones)
+    }
 }
 
+/// One row of `zones.zone_ranges`: `{label, name, pct, min, max, range}`.
 struct Zone: Codable, Sendable, Equatable {
     let label: String?
     let name: String?
-    let pct: Double?
+    /// The desktop's display string for the zone's share of the anchor --
+    /// "<56%", "56–75%", ">150%" -- shown as-is, never parsed.  `min`/`max`
+    /// are the numbers.
+    let pct: String?
     let min: Double?
     /// Nil in the open-ended top zone, which is a value, not a gap.
     let max: Double?
     let range: String?
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        label = container.lenient(String.self, forKey: .label)
+        name = container.lenient(String.self, forKey: .name)
+        pct = container.lenient(String.self, forKey: .pct)
+        min = container.lenient(Double.self, forKey: .min)
+        max = container.lenient(Double.self, forKey: .max)
+        range = container.lenient(String.self, forKey: .range)
+    }
+}
+
+private extension KeyedDecodingContainer {
+    /// The value at `key`, or nil when it is absent, null, or of another type.
+    func lenient<T: Decodable>(_ type: T.Type, forKey key: Key) -> T? {
+        (try? decodeIfPresent(type, forKey: key)) ?? nil
+    }
 }
 
 /// `training_state`: the numbers the dashboard's header reads.
