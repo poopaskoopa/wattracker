@@ -28,7 +28,7 @@ rider who no longer exists.
 from __future__ import annotations
 
 import logging
-from typing import Optional
+from typing import Mapping, Optional
 
 from .. import db
 from . import rider
@@ -54,6 +54,11 @@ def _to_metrics(row: Optional[dict]) -> RiderMetrics:
     return RiderMetrics(**values)
 
 
+def from_row(row: Optional[Mapping[str, object]]) -> RiderMetrics:
+    """Rebuild the same stored rider profile used by prescription readers."""
+    return _to_metrics(dict(row) if row is not None else None)
+
+
 def for_user(user_id: int) -> RiderMetrics:
     """The rider's stored measured capacities. Never raises, never computes.
 
@@ -61,7 +66,7 @@ def for_user(user_id: int) -> RiderMetrics:
     exactly the population-constant prescription.
     """
     try:
-        return _to_metrics(db.get_rider_profile(user_id))
+        return from_row(db.get_rider_profile(user_id))
     except Exception:  # noqa: BLE001 - a prescription must not fail on this
         log.warning("rider profile read failed for user %s", user_id,
                     exc_info=True)

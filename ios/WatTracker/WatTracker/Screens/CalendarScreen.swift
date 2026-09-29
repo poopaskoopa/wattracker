@@ -1,4 +1,5 @@
 import Foundation
+import Charts
 import Observation
 import SwiftUI
 
@@ -93,6 +94,7 @@ final class CalendarModel {
     func start(session: (any ReadSession)?) async {
         let generation = beginRequest()
         state = .starting
+        currentFTP = nil
 
         guard let session else {
             state = .unpaired
@@ -115,8 +117,13 @@ final class CalendarModel {
         // Applying the cache before awaiting the network gives the calendar
         // an immediate first paint while retaining offline use.
         let cachedActivities = session.cached(.activities)
+        let cachedDashboard = session.cached(.dashboard)
         if let cached = session.cached(.calendar, month: month) {
-            apply(cached, activities: cachedActivities)
+            apply(
+                cached,
+                activities: cachedActivities,
+                ftp: CalendarData.currentFTP(from: cachedDashboard)
+            )
         }
 
         do {
@@ -143,8 +150,25 @@ final class CalendarModel {
                 // A missing activities collection should not hide a usable
                 // calendar snapshot.
             }
+            var dashboard = cachedDashboard
+            do {
+                dashboard = try await session.load(.dashboard)
+            } catch let failure as CloudSession.Failure {
+                switch failure {
+                case .notPaired, .deviceRemoved:
+                    throw failure
+                default:
+                    break
+                }
+            } catch {
+                // A dashboard outage must not hide a usable calendar.
+            }
             guard generation == requestGeneration else { return }
-            apply(calendar, activities: activities ?? cachedActivities)
+            apply(
+                calendar,
+                activities: activities ?? cachedActivities,
+                ftp: CalendarData.currentFTP(from: dashboard)
+            )
         } catch let failure as CloudSession.Failure {
             guard generation == requestGeneration else { return }
             switch failure {
@@ -186,7 +210,7 @@ final class CalendarModel {
                 // Calendar data remains useful when the activity list is offline.
             }
             guard generation == requestGeneration, selectedMonth == month else { return }
-            apply(calendar, activities: activities)
+            apply(calendar, activities: activities, ftp: currentFTP)
         } catch let failure as CloudSession.Failure {
             guard generation == requestGeneration, selectedMonth == month else { return }
             switch failure {
@@ -208,10 +232,19 @@ final class CalendarModel {
         return requestGeneration
     }
 
+    private var currentFTP: Double?
+
     private func apply(
-        _ snapshot: CloudSnapshot, activities: CloudSnapshot? = nil
+        _ snapshot: CloudSnapshot,
+        activities: CloudSnapshot? = nil,
+        ftp: Double? = nil
     ) {
-        let calendar = CalendarData(snapshot: snapshot, activitySnapshot: activities)
+        currentFTP = ftp
+        let calendar = CalendarData(
+            snapshot: snapshot,
+            activitySnapshot: activities,
+            ftp: currentFTP
+        )
         state = calendar.hasContent ? .ready(calendar) : .noData
     }
 }
@@ -288,7 +321,8 @@ private struct CalendarContent: View {
                                     phase: nil,
                                     race: nil,
                                     workouts: [],
-                                    activities: []
+                                    activities: [],
+                                    currentFTP: calendar.currentFTP
                                 )
                             CalendarDayCell(day: day, entry: entry) {
                                 selectDay(entry)
@@ -425,6 +459,7 @@ private struct CalendarDayCell: View {
 
 private struct CalendarDayDetail: View {
     let day: CalendarDayEntry
+    @Environment(\.dismiss) private var dismiss
 
     var body: some View {
         NavigationStack {
@@ -449,7 +484,10 @@ private struct CalendarDayDetail: View {
                     }
 
                     if !day.workouts.isEmpty {
-                        CalendarWorkoutPanel(workouts: day.workouts)
+                        CalendarWorkoutPanel(
+                            workouts: day.workouts,
+                            ftp: day.currentFTP
+                        )
                     }
 
                     if !day.activities.isEmpty {
@@ -486,6 +524,16 @@ private struct CalendarDayDetail: View {
             .background(Palette.bg)
             .navigationTitle("Calendar day")
             .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .topBarLeading) {
+                    Button {
+                        dismiss()
+                    } label: {
+                        Image(systemName: "chevron.left")
+                    }
+                    .accessibilityLabel("Back to calendar")
+                }
+            }
         }
         .preferredColorScheme(.dark)
     }
@@ -505,6 +553,7 @@ private struct CalendarDayDetail: View {
 
 private struct CalendarWorkoutPanel: View {
     let workouts: [JSONValue]
+    let ftp: Double?
 
     var body: some View {
         Panel {
@@ -536,6 +585,45 @@ private struct CalendarWorkoutPanel: View {
                         }
                         .font(.caption)
                         .foregroundStyle(Palette.muted)
+                        let profile = CalendarJSON.profile(workout)
+                        if !profile.isEmpty {
+                            if let ftp, ftp.isFinite, ftp > 0 {
+                                Text(
+                                    "at FTP \(Int(ftp.rounded(.toNearestOrEven))) W"
+                                )
+                                .font(.caption.weight(.semibold))
+                                .foregroundStyle(Palette.accent)
+                                .accessibilityIdentifier("calendar-workout-ftp")
+                            }
+                            CalendarWorkoutProfileChart(profile: profile, ftp: ftp)
+                                .frame(minHeight: 190)
+                            VStack(alignment: .leading, spacing: 5) {
+                                ForEach(
+                                    Array(
+                                        CalendarWorkoutFormatting.stepDescriptions(
+                                            profile, ftp: ftp
+                                        ).enumerated()
+                                    ),
+                                    id: \.offset
+                                ) { _, description in
+                                    Text(description)
+                                        .font(.callout.monospacedDigit())
+                                        .foregroundStyle(Palette.text)
+                                }
+                                ForEach(
+                                    Array(
+                                        CalendarWorkoutFormatting.coachingTexts(profile)
+                                            .enumerated()
+                                    ),
+                                    id: \.offset
+                                ) { _, text in
+                                    Text(text)
+                                        .font(.caption)
+                                        .foregroundStyle(Palette.muted)
+                                }
+                            }
+                            .accessibilityIdentifier("calendar-workout-steps")
+                        }
                     }
                     if index < workouts.count - 1 {
                         Divider().overlay(Palette.surfaceBorder)
@@ -543,6 +631,70 @@ private struct CalendarWorkoutPanel: View {
                 }
             }
         }
+    }
+}
+
+private struct CalendarWorkoutProfileChart: View {
+    let profile: [CalendarWorkoutProfileBlock]
+    let ftp: Double?
+
+    var body: some View {
+        let hasFTP = ftp?.isFinite == true && (ftp ?? 0) > 0
+        Chart {
+            ForEach(profile) { step in
+                if !step.free,
+                   let start = CalendarWorkoutFormatting.chartTarget(
+                       step.targetStart, ftp: ftp
+                   ),
+                   let end = CalendarWorkoutFormatting.chartTarget(
+                       step.targetEnd, ftp: ftp
+                   ) {
+                    let opacity = CalendarWorkoutFormatting.zoneOpacity(
+                        ((step.targetStart ?? 0) + (step.targetEnd ?? 0)) / 2
+                    )
+                    AreaMark(
+                        x: .value("Time", step.start),
+                        yStart: .value("Baseline", 0.0),
+                        yEnd: .value("Power", start),
+                        series: .value("Step", step.id)
+                    )
+                    .foregroundStyle(Palette.accent.opacity(opacity))
+                    AreaMark(
+                        x: .value("Time", step.end),
+                        yStart: .value("Baseline", 0.0),
+                        yEnd: .value("Power", end),
+                        series: .value("Step", step.id)
+                    )
+                    .foregroundStyle(Palette.accent.opacity(opacity))
+                    LineMark(
+                        x: .value("Time", step.start),
+                        y: .value("Power", start),
+                        series: .value("Step", step.id)
+                    )
+                    .foregroundStyle(Palette.accent)
+                    LineMark(
+                        x: .value("Time", step.end),
+                        y: .value("Power", end),
+                        series: .value("Step", step.id)
+                    )
+                    .foregroundStyle(Palette.accent)
+                }
+            }
+            if hasFTP, let ftp {
+                RuleMark(y: .value("FTP", ftp))
+                    .foregroundStyle(Palette.muted)
+                    .lineStyle(StrokeStyle(lineWidth: 1, dash: [5, 4]))
+                    .annotation(position: .top, alignment: .trailing) {
+                        Text("FTP")
+                            .font(.caption2)
+                            .foregroundStyle(Palette.muted)
+                    }
+            }
+        }
+        .chartXAxisLabel("Time (s)")
+        .chartYAxisLabel(hasFTP ? "Power (W)" : "Target (% FTP)")
+        .frame(minHeight: 190)
+        .accessibilityIdentifier("calendar-workout-profile-chart")
     }
 }
 
@@ -782,6 +934,10 @@ private enum CalendarJSON {
         case "Adapted": return Palette.accent
         default: return Palette.muted
         }
+    }
+
+    static func profile(_ workout: JSONValue) -> [CalendarWorkoutProfileBlock] {
+        CalendarWorkoutProfileDecoder.blocks(from: workout)
     }
 
     static func duration(_ object: JSONValue) -> String? {

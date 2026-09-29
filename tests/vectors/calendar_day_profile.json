@@ -1,0 +1,125 @@
+{
+  "data": {
+    "activities": [],
+    "date": "2099-01-02",
+    "ooto": false,
+    "phase": null,
+    "race": null,
+    "workouts": [
+      {
+        "adapted": null,
+        "adapted_at": null,
+        "adjustment_cancelled": false,
+        "adjustment_id": null,
+        "adjustment_replacement": false,
+        "adjustment_source_id": null,
+        "adjustment_state": null,
+        "completed_activity_id": null,
+        "completed_date": null,
+        "compliance": null,
+        "date": "2099-01-02",
+        "duration_s": 3600,
+        "effective_ftp": null,
+        "export_ftp": null,
+        "feedback_applied": false,
+        "feedback_batch_id": null,
+        "id": 1,
+        "missed": false,
+        "name": "Threshold Intervals",
+        "origin": null,
+        "plan_id": 1,
+        "prev_duration_s": null,
+        "prev_name": null,
+        "prev_tss": null,
+        "prev_type": null,
+        "profile": [
+          {
+            "duration_s": 600,
+            "end": 600,
+            "kind": "warmup",
+            "label": "Warmup ramp",
+            "segment": 0,
+            "start": 0,
+            "target_end": 0.85,
+            "target_start": 0.5,
+            "text": "Warm up to threshold effort."
+          },
+          {
+            "duration_s": 720,
+            "end": 1320,
+            "kind": "intervals",
+            "label": "2 x 12min on / 4min easy",
+            "segment": 1,
+            "start": 600,
+            "target_end": 0.93,
+            "target_start": 0.93,
+            "text": "Threshold: sustained at 91-95% FTP."
+          },
+          {
+            "duration_s": 240,
+            "end": 1560,
+            "kind": "intervals",
+            "label": "2 x 12min on / 4min easy",
+            "segment": 1,
+            "start": 1320,
+            "target_end": 0.55,
+            "target_start": 0.55,
+            "text": "Threshold: sustained at 91-95% FTP."
+          },
+          {
+            "duration_s": 720,
+            "end": 2280,
+            "kind": "intervals",
+            "label": "2 x 12min on / 4min easy",
+            "segment": 1,
+            "start": 1560,
+            "target_end": 0.93,
+            "target_start": 0.93,
+            "text": "Threshold: sustained at 91-95% FTP."
+          },
+          {
+            "duration_s": 240,
+            "end": 2520,
+            "kind": "intervals",
+            "label": "2 x 12min on / 4min easy",
+            "segment": 1,
+            "start": 2280,
+            "target_end": 0.55,
+            "target_start": 0.55,
+            "text": "Threshold: sustained at 91-95% FTP."
+          },
+          {
+            "duration_s": 720,
+            "end": 3240,
+            "kind": "steadystate",
+            "label": "Steady block",
+            "segment": 2,
+            "start": 2520,
+            "target_end": 0.93,
+            "target_start": 0.93,
+            "text": "Threshold: sustained at 91-95% FTP."
+          },
+          {
+            "duration_s": 360,
+            "end": 3600,
+            "kind": "cooldown",
+            "label": "Cooldown",
+            "segment": 3,
+            "start": 3240,
+            "target_end": 0.5,
+            "target_start": 0.55,
+            "text": "Cool down easy."
+          }
+        ],
+        "rpe": null,
+        "skipped": false,
+        "tss": 64.8,
+        "type": "threshold",
+        "variant": "classic"
+      }
+    ]
+  },
+  "id": "calendar-day-2099-01-02",
+  "kind": "calendar_day",
+  "revision": 1
+}

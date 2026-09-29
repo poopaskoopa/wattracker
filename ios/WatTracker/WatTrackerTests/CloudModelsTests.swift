@@ -256,6 +256,56 @@ final class CloudModelsTests: XCTestCase {
         XCTAssertEqual(profile.heartRate?.zones?.count, 5)
     }
 
+    func testCalendarWorkoutProfileIsOptionalAndLenient() throws {
+        let response = try decode("""
+        {"items":[{"id":"calendar-day-2026-09-29","kind":"calendar_day","revision":4,
+          "data":{"date":"2026-09-29","workouts":[
+            {"name":"Threshold","profile":[
+              {"start":0,"end":600,"duration_s":600,"target_start":1.0,
+               "target_end":1.0,"kind":"steadystate","label":"Steady block"}
+            ]},
+            {"name":"Legacy"},
+            {"name":"Malformed","profile":"not-an-array"}
+          ]}}],"revision":4,"next_cursor":null}
+        """)
+        guard case let .calendarDay(day) = response.items[0].payload else {
+            return XCTFail("calendar day did not decode")
+        }
+        let workouts = try XCTUnwrap(day.workouts)
+        XCTAssertEqual(workouts.count, 3)
+        let blocks = CalendarWorkoutProfileDecoder.blocks(from: workouts[0])
+        XCTAssertEqual(blocks.count, 1)
+        XCTAssertEqual(blocks[0].durationS, 600)
+        XCTAssertEqual(blocks[0].targetStart, 1.0)
+        XCTAssertEqual(blocks[0].kind, "steadystate")
+        XCTAssertTrue(CalendarWorkoutProfileDecoder.blocks(from: workouts[1]).isEmpty)
+        XCTAssertTrue(CalendarWorkoutProfileDecoder.blocks(from: workouts[2]).isEmpty)
+    }
+
+    func testRealPublisherCalendarDayVectorDecodesThePublishedWorkoutProfile() throws {
+        let testsDirectory = URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent()
+        let vectorURL = testsDirectory
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+            .appendingPathComponent("tests/vectors/calendar_day_profile.json")
+        let item = try JSONDecoder().decode(
+            CloudItem.self, from: Data(contentsOf: vectorURL)
+        )
+        XCTAssertEqual(item.kind, .calendarDay)
+        guard case let .calendarDay(day) = item.payload,
+              let workout = day.workouts?.first else {
+            return XCTFail("the real publisher vector has no calendar workout")
+        }
+        let blocks = CalendarWorkoutProfileDecoder.blocks(from: workout)
+        XCTAssertEqual(blocks.count, 7)
+        XCTAssertEqual(blocks.first?.segmentIndex, 0)
+        XCTAssertEqual(blocks[1].segmentIndex, 1)
+        XCTAssertEqual(blocks[1].targetStart, 0.93)
+        XCTAssertEqual(blocks.last?.end, 3600)
+    }
+
     func testLeniencyStopsAtTheEnvelope() {
         XCTAssertThrowsError(try decode("""
         {"items":[{"id":"profile","kind":"profile","revision":"7",

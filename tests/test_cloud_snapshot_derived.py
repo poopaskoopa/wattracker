@@ -3,10 +3,12 @@
 import datetime as dt
 import json
 import sqlite3
+from pathlib import Path
 
 import pytest
 
 from wattracker import db
+from wattracker.ble.runner import flatten_session
 from wattracker.cloud.models import PUBLISHED_OBJECT_KINDS, SyncBatch
 from wattracker.cloud.snapshot import (
     DETAIL_MAX_POINTS,
@@ -16,6 +18,67 @@ from wattracker.cloud.snapshot import (
     snapshot_objects,
     snapshot_publish_pages,
 )
+from wattracker.prescribe import zwo
+from wattracker.prescribe import present
+from wattracker.prescribe.planner import VARIANTS, build_workout
+from wattracker.metrics import profile_store
+
+
+def _desktop_fraction_profile(session):
+    """The route's flatten_session + segment_rows result, kept independent."""
+    blocks, total_s = flatten_session(session)
+    rows = present.segment_rows(session, 1.0)
+    boundaries = []
+    cursor = 0
+    for row in rows:
+        duration = int(row.get("duration_s") or 0)
+        if duration <= 0:
+            continue
+        boundaries.append((cursor, cursor + duration, row))
+        cursor += duration
+    assert cursor == total_s
+
+    result = []
+    source_index = 0
+    for start, end, flattened_kind, value in blocks:
+        while (
+            source_index + 1 < len(boundaries)
+            and start >= boundaries[source_index][1]
+        ):
+            source_index += 1
+        assert boundaries and boundaries[source_index][0] <= start < boundaries[source_index][1]
+        row = boundaries[source_index][2]
+        if flattened_kind == "ramp":
+            target_start, target_end = value
+        elif flattened_kind == "free":
+            target_start = target_end = None
+        else:
+            target_start = target_end = value
+        item = {
+            "start": int(start),
+            "end": int(end),
+            "duration_s": int(end - start),
+            "segment": int(source_index),
+            "target_start": (
+                round(float(target_start), 4)
+                if target_start is not None else None
+            ),
+            "target_end": (
+                round(float(target_end), 4)
+                if target_end is not None else None
+            ),
+            "kind": str(row.get("kind") or flattened_kind),
+        }
+        label = row.get("label")
+        if isinstance(label, str) and label:
+            item["label"] = label[:160]
+        text = row.get("text")
+        if isinstance(text, str) and text:
+            item["text"] = text[:160]
+        if flattened_kind == "free":
+            item["free"] = True
+        result.append(item)
+    return result
 
 
 def _activity(path, user_id, number, start_time, seconds=3000):
@@ -293,6 +356,111 @@ def test_calendar_day_uses_rider_local_date_but_activity_detail_keeps_utc_date(t
         obj for obj in objects if obj.object_id == f"activity-detail-{activity_id}"
     )
     assert detail.data["id"] == activity_id
+
+
+def test_calendar_workout_profiles_match_the_desktop_builder_for_every_variant(
+    tmp_path,
+):
+    path = tmp_path / "workout-profile.db"
+    db.init_db(str(path))
+    user_id = db.create_user("profile-rider", "not-a-password", path=str(path))
+    db.save_user_settings(user_id, {"ftp": 250, "timezone": "UTC"}, path=str(path))
+    db.save_rider_profile(
+        user_id, {"ftp": 250, "vo2_ratio": 1.12}, path=str(path),
+    )
+    rider_profile = profile_store.from_row(
+        db.get_rider_profile(user_id, path=str(path))
+    )
+    plan_id = db.create_plan(
+        user_id, "Profile", "2026-08-05", 1, path=str(path),
+    )
+
+    expected = {}
+    for kind, variants in VARIANTS.items():
+        for variant in variants:
+            for minutes in (30, 60, 120):
+                session = build_workout(
+                    kind, minutes, variant, profile=rider_profile,
+                )
+                workout_id = db.add_plan_workout(
+                    plan_id, user_id, "2026-08-05", session.name,
+                    session.workout_type, session.total_duration(),
+                    session.estimated_tss, zwo.zwo_string(session),
+                    variant=variant, path=str(path),
+                )
+                expected[workout_id] = _desktop_fraction_profile(session)
+
+    day = next(
+        item for item in snapshot_objects(path, user_id)
+        if item.kind == "calendar_day" and item.data["date"] == "2026-08-05"
+    )
+    workouts = day.data["workouts"]
+    assert len(workouts) == len(expected)
+    assert {workout["id"] for workout in workouts} == set(expected)
+    for workout in workouts:
+        profile = workout["profile"]
+        assert profile == expected[workout["id"]]
+        encoded = json.dumps(workout, separators=(",", ":"), allow_nan=False)
+        assert "workout_file" not in encoded
+        assert "zwo_or_segments" not in workout
+        assert "zwo" not in workout
+
+
+def test_calendar_custom_workout_fallback_matches_desktop_profile_and_rejects_negative_power(
+    tmp_path,
+):
+    path = tmp_path / "workout-fallback.db"
+    db.init_db(str(path))
+    user_id = db.create_user("fallback-rider", "not-a-password", path=str(path))
+    db.save_user_settings(user_id, {"ftp": 250, "timezone": "UTC"}, path=str(path))
+    session = build_workout("threshold", 60)
+    stored_zwo = zwo.zwo_string(session)
+    workout_id = db.add_standalone_workout(
+        user_id, "custom-fallback", "2026-08-05", "Imported workout",
+        "custom", session.total_duration(), session.estimated_tss,
+        stored_zwo, 250, path=str(path),
+    )
+
+    day = next(
+        item for item in snapshot_objects(path, user_id)
+        if item.kind == "calendar_day" and item.data["date"] == "2026-08-05"
+    )
+    workout = next(item for item in day.data["workouts"] if item["id"] == workout_id)
+    assert workout["profile"] == _desktop_fraction_profile(session)
+
+    negative = stored_zwo.replace('Power="0.93"', 'Power="-0.93"', 1)
+    assert zwo.session_from_zwo(negative, workout_type="custom") is None
+
+
+def test_calendar_day_vector_matches_the_real_publisher(tmp_path):
+    path = tmp_path / "calendar-vector.db"
+    db.init_db(str(path))
+    user_id = db.create_user("vector-rider", "not-a-password", path=str(path))
+    db.save_user_settings(
+        user_id, {"ftp": 250, "timezone": "UTC"}, path=str(path),
+    )
+    db.save_rider_profile(user_id, {"ftp": 250}, path=str(path))
+    profile = profile_store.from_row(
+        db.get_rider_profile(user_id, path=str(path))
+    )
+    session = build_workout("threshold", 60, "classic", profile=profile)
+    plan_id = db.create_plan(
+        user_id, "Vector", "2099-01-02", 1, path=str(path),
+    )
+    db.add_plan_workout(
+        plan_id, user_id, "2099-01-02", session.name, session.workout_type,
+        session.total_duration(), session.estimated_tss, zwo.zwo_string(session),
+        variant="classic", path=str(path),
+    )
+    day = next(
+        item for item in snapshot_objects(path, user_id)
+        if item.kind == "calendar_day"
+    )
+    vector = json.loads(
+        (Path(__file__).parent / "vectors" / "calendar_day_profile.json")
+        .read_text(encoding="utf-8")
+    )
+    assert day.wire() == vector
 
 
 def test_high_cardinality_calendar_day_is_chunked(tmp_path):

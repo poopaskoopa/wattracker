@@ -1,11 +1,13 @@
 """Render a Session to Zwift .zwo workout XML and write it to the Zwift folder."""
 from __future__ import annotations
 
+import math
 import ntpath
 import os
 import re
 import xml.etree.ElementTree as ET
 from xml.dom import minidom
+from typing import Optional
 
 from .planner import Segment, Session
 
@@ -13,6 +15,162 @@ _NAME_RE = re.compile(r"(<name>)(.*?)(</name>)", re.DOTALL)
 
 # A plan workout's date. Anything else is not a date, whatever produced it.
 _ISO_DATE_RE = re.compile(r"\A\d{4}-\d{2}-\d{2}\Z")
+
+# A stored workout is local input, but profile publication must not turn an
+# unexpectedly large or malformed XML value into an unbounded cloud object.
+_PROFILE_ZWO_MAX_BYTES = 256 * 1024
+_PROFILE_ZWO_MAX_SEGMENTS = 256
+_PROFILE_ZWO_MAX_DURATION_S = 24 * 60 * 60
+_PROFILE_ZWO_MAX_REPEATS = 256
+
+
+def _xml_local_name(tag: object) -> str:
+    return str(tag).rsplit("}", 1)[-1].lower()
+
+
+def _xml_attr(element: ET.Element, name: str) -> Optional[str]:
+    wanted = name.lower()
+    for key, value in element.attrib.items():
+        if key.lower() == wanted:
+            return value
+    return None
+
+
+def _xml_int(element: ET.Element, name: str, *, minimum: int = 0) -> Optional[int]:
+    raw = _xml_attr(element, name)
+    try:
+        value = int(raw or "")
+    except (TypeError, ValueError, OverflowError):
+        return None
+    return value if minimum <= value <= _PROFILE_ZWO_MAX_DURATION_S else None
+
+
+def _xml_float(element: ET.Element, name: str) -> Optional[float]:
+    raw = _xml_attr(element, name)
+    try:
+        value = float(raw or "")
+    except (TypeError, ValueError, OverflowError):
+        return None
+    return value if math.isfinite(value) and 0 <= value <= 5 else None
+
+
+def _xml_text(element: ET.Element) -> Optional[str]:
+    for child in element:
+        if _xml_local_name(child.tag) != "textevent":
+            continue
+        message = _xml_attr(child, "message")
+        if message:
+            return message[:160]
+    return None
+
+
+def session_from_zwo(
+    zwo_str: str,
+    *,
+    name: Optional[str] = None,
+    workout_type: str = "workout",
+) -> Optional[Session]:
+    """Read the supported prescription shape without retaining its XML.
+
+    The cloud publisher needs the same segments that the desktop uses for its
+    graph, but the XML itself is a local export format and must never cross the
+    sync boundary.  Invalid or unsupported workouts return ``None`` so the
+    caller can publish the ordinary calendar row without a misleading partial
+    profile.
+    """
+    if not isinstance(zwo_str, str):
+        return None
+    try:
+        if len(zwo_str.encode("utf-8")) > _PROFILE_ZWO_MAX_BYTES:
+            return None
+    except UnicodeEncodeError:
+        return None
+    try:
+        root = ET.fromstring(zwo_str)
+    except (ET.ParseError, TypeError, ValueError):
+        return None
+
+    workout = next(
+        (child for child in root if _xml_local_name(child.tag) == "workout"),
+        None,
+    )
+    if workout is None:
+        return None
+
+    segments: list[Segment] = []
+    for element in workout:
+        if len(segments) >= _PROFILE_ZWO_MAX_SEGMENTS:
+            return None
+        kind = _xml_local_name(element.tag)
+        text = _xml_text(element)
+        if kind in {"warmup", "cooldown", "ramp"}:
+            duration = _xml_int(element, "duration", minimum=1)
+            low = _xml_float(element, "powerlow")
+            high = _xml_float(element, "powerhigh")
+            if duration is None or low is None or high is None:
+                return None
+            segment = Segment(
+                kind=kind,
+                duration=duration,
+                power_low=low,
+                power_high=high,
+                text=text,
+            )
+        elif kind == "steadystate":
+            duration = _xml_int(element, "duration", minimum=1)
+            power = _xml_float(element, "power")
+            if duration is None or power is None:
+                return None
+            segment = Segment(
+                kind=kind, duration=duration, power=power, text=text,
+            )
+        elif kind == "intervalst":
+            repeat = _xml_int(element, "repeat", minimum=1)
+            on_duration = _xml_int(element, "onduration", minimum=1)
+            off_duration = _xml_int(element, "offduration")
+            on_power = _xml_float(element, "onpower")
+            off_power = _xml_float(element, "offpower")
+            if (
+                repeat is None or repeat > _PROFILE_ZWO_MAX_REPEATS
+                or on_duration is None or off_duration is None
+                or on_power is None or off_power is None
+            ):
+                return None
+            duration = repeat * (on_duration + off_duration)
+            if duration > _PROFILE_ZWO_MAX_DURATION_S:
+                return None
+            segment = Segment(
+                kind="intervals", duration=duration, repeat=repeat,
+                on_duration=on_duration, off_duration=off_duration,
+                on_power=on_power, off_power=off_power, text=text,
+            )
+        elif kind == "freeride":
+            duration = _xml_int(element, "duration", minimum=1)
+            if duration is None:
+                return None
+            segment = Segment(kind="freeride", duration=duration, text=text)
+        else:
+            # A partial parse would render a graph that does not describe the
+            # exported workout, so unknown ZWO elements fail closed.
+            return None
+        segments.append(segment)
+
+    if not segments or sum(segment.duration for segment in segments) > _PROFILE_ZWO_MAX_DURATION_S:
+        return None
+    stored_name = next(
+        (child.text for child in root if _xml_local_name(child.tag) == "name"),
+        None,
+    )
+    description = next(
+        (child.text for child in root if _xml_local_name(child.tag) == "description"),
+        "",
+    ) or ""
+    return Session(
+        name=name or stored_name or "Workout",
+        description=description[:160],
+        workout_type=workout_type or "workout",
+        segments=segments,
+    )
 
 
 def dated_name_zwo(zwo_str: str, date_iso: str) -> str:
