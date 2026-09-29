@@ -1,6 +1,7 @@
 """Desktop cloud controls stay local to the request and scheduler seam."""
 
 import base64
+import datetime as dt
 import json
 import time
 
@@ -74,6 +75,55 @@ def test_cloud_is_off_by_default_and_has_no_secret_echo(client):
     assert "123456" not in text
     assert "Generate pairing code</button>" in text
     assert "Generate pairing code" in text and "disabled" in text
+
+
+@pytest.mark.parametrize(
+    "state, label",
+    [
+        ({"enabled": False}, "Disabled"),
+        ({"enabled": True, "last_success": 1_750_000_000.0}, "Up to date"),
+        (
+            {"enabled": True, "last_success": None,
+             "last_success_at": 1_750_000_000.0},
+            "Up to date",
+        ),
+        ({"enabled": True, "pending": 3}, "Queued (3 objects)"),
+        ({"enabled": True}, "Waiting for first sync"),
+        ({"enabled": True, "last_error": "Cloud upload failed"}, "Cloud upload failed"),
+        ({"enabled": True, "retry": 2}, "Retry scheduled (attempt 2)"),
+    ],
+)
+def test_cloud_status_labels_distinguish_sync_states(client, state, label):
+    web, sync = client
+    sync.state.update(state)
+
+    text = web.get("/settings").text
+
+    assert label in text
+    assert "Queued/offline" not in text
+
+
+def test_cloud_last_success_is_local_and_never_raw(client):
+    web, sync = client
+    timestamp = dt.datetime(
+        2026, 7, 15, 18, 4, 5, tzinfo=dt.timezone.utc
+    ).timestamp()
+    db.save_user_settings(db.user_ids()[0], {"timezone": "America/New_York"})
+    sync.state.update(enabled=True, last_success=timestamp)
+
+    text = web.get("/settings").text
+
+    assert "2026-07-15 14:04:05 EDT" in text
+    assert str(timestamp) not in text
+
+
+def test_cloud_last_success_with_an_invalid_timestamp_is_never(client):
+    web, sync = client
+    sync.state.update(enabled=True, last_success=10**1000)
+
+    text = web.get("/settings").text
+
+    assert "<dt>Last successful push</dt><dd>Never</dd>" in text
 
 
 def test_enable_disable_and_enrollment_are_local_controls(client):

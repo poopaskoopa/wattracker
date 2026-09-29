@@ -806,6 +806,25 @@ def static_url(path: str) -> str:
     return f"/static/{path}?v={version}"
 
 
+def _format_cloud_last_success(
+    timestamp: object, timezone_name: object
+) -> Optional[str]:
+    """Render a cloud-success timestamp in the rider's local timezone."""
+    if not isinstance(timestamp, (int, float)) or isinstance(timestamp, bool):
+        return None
+    try:
+        numeric_timestamp = float(timestamp)
+        if not _math.isfinite(numeric_timestamp):
+            return None
+        instant = _dt.datetime.fromtimestamp(
+            numeric_timestamp, tz=_dt.timezone.utc
+        )
+    except (OverflowError, OSError, TypeError, ValueError):
+        return None
+    local = to_user_timezone(instant, timezone_name)
+    return local.strftime("%Y-%m-%d %H:%M:%S %Z")
+
+
 templates.env.globals["static_url"] = static_url
 # Exposed as a Jinja global rather than pushed through each route's context
 # dict: settings.html is rendered from a dozen different handlers (every
@@ -4683,6 +4702,14 @@ def create_app() -> FastAPI:
             status = dict(sync.status(uid) or {})
         except Exception:
             status = {}
+        if status.get("last_success") is None:
+            status["last_success"] = status.get("last_success_at")
+        if status.get("pending") is None:
+            status["pending"] = status.get(
+                "pending_objects", status.get("pending_count", 0)
+            )
+        if status.get("retry") is None:
+            status["retry"] = status.get("retry_count")
         status.setdefault("enabled", False)
         status.setdefault("enrolled", False)
         status.setdefault("sync_endpoint", None)
@@ -4729,6 +4756,10 @@ def create_app() -> FastAPI:
             )
         pairing = app.state.cloud_pairings.get(uid)
         now = _time.time()
+        cloud_sync = _cloud_status(uid)
+        cloud_sync["last_success_display"] = _format_cloud_last_success(
+            cloud_sync.get("last_success"), settings.get("timezone")
+        )
         if not (
             isinstance(pairing, dict)
             and isinstance(pairing.get("code"), str)
@@ -4772,7 +4803,7 @@ def create_app() -> FastAPI:
             ),
             timezone_message=timezone_message,
             cloud_message=cloud_message,
-            cloud_sync=_cloud_status(uid),
+            cloud_sync=cloud_sync,
             cloud_wipe_enabled=config.desktop_cloud_wipe_enabled(),
             cloud_pairing=pairing,
             cloud_pairing_qr=(
