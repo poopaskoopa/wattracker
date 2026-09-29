@@ -189,8 +189,8 @@ class CloudClient(
             if (since != null) add("since" to since.toString())
             if (cursor != null) add("cursor" to cursor)
             // The server only paginates mobile=True routes (servesDeltas). Sending
-            // limit on non-mobile routes (calendar, profile, races) applies the
-            // limit without returning a next_cursor, truncating the response.
+            // limit on unpaginated routes (profile, races) returns HTTP 413
+            // collection_too_large if exceeded.
             if (route.servesDeltas) {
                 add("limit" to COLLECTION_PAGE_LIMIT.toString())
             }

@@ -215,7 +215,13 @@ data class MetricState(
             available = v.optBoolean("available") ?: false,
             value = v.optDouble("value"),
             source = v.optString("source"),
-            zones = v.optArray("zones")?.map { Zone.fromJson(it) },
+            zones = v.optArray("zones")?.mapNotNull {
+                try {
+                    Zone.fromJson(it)
+                } catch (_: Exception) {
+                    null
+                }
+            },
         )
     }
 
@@ -228,7 +234,7 @@ data class MetricState(
 data class Zone(
     val label: String?,
     val name: String?,
-    val pct: Double?,
+    val pct: String?,
     val min: Double?,
     /** Nil in the open-ended top zone, which is a value, not a gap. */
     val max: Double?,
@@ -236,9 +242,12 @@ data class Zone(
 ) {
     companion object {
         fun fromJson(v: JsonValue): Zone = Zone(
-            label = v.optString("label"), name = v.optString("name"),
-            pct = v.optDouble("pct"), min = v.optDouble("min"),
-            max = v.optDouble("max"), range = v.optString("range"),
+            label = v.optString("label"),
+            name = v.optString("name"),
+            pct = v.optString("pct"),
+            min = v.optDouble("min"),
+            max = v.optDouble("max"),
+            range = v.optString("range"),
         )
     }
 
@@ -391,6 +400,16 @@ data class CalendarDay(
     val part: Int?,
     val parts: Int?,
 ) {
+    /** Parsed typed workouts with profile steps when present. */
+    val parsedWorkouts: List<CalendarWorkout>?
+        get() = workouts?.mapNotNull {
+            try {
+                CalendarWorkout.fromJson(it)
+            } catch (_: Exception) {
+                null
+            }
+        }
+
     companion object {
         fun fromJson(v: JsonValue): CalendarDay = CalendarDay(
             date = v.optString("date"),
@@ -415,6 +434,81 @@ data class CalendarDay(
         if (part != null) fields["part"] = JsonValue.Number(part.toDouble())
         if (parts != null) fields["parts"] = JsonValue.Number(parts.toDouble())
         return JsonValue.Object(fields)
+    }
+}
+
+/** A workout step/profile entry inside a planned workout. */
+data class WorkoutStep(
+    val kind: String?,
+    val label: String?,
+    val text: String?,
+    val durationS: Double?,
+    val start: Double?,
+    val end: Double?,
+    val targetStart: Double?,
+    val targetEnd: Double?,
+    val segment: Int?,
+) {
+    companion object {
+        fun fromJson(v: JsonValue): WorkoutStep = WorkoutStep(
+            kind = v.optString("kind"),
+            label = v.optString("label"),
+            text = v.optString("text"),
+            durationS = v.optDouble("duration_s"),
+            start = v.optDouble("start"),
+            end = v.optDouble("end"),
+            targetStart = v.optDouble("target_start"),
+            targetEnd = v.optDouble("target_end"),
+            segment = v.optInt("segment"),
+        )
+    }
+
+    fun toJson(): JsonValue = jsonObj(
+        "kind" to kind, "label" to label, "text" to text,
+        "duration_s" to durationS, "start" to start, "end" to end,
+        "target_start" to targetStart, "target_end" to targetEnd,
+        "segment" to segment,
+    )
+}
+
+/** A parsed workout item from `calendar_day.workouts`. */
+data class CalendarWorkout(
+    val id: Double?,
+    val name: String?,
+    val type: String?,
+    val variant: String?,
+    val durationS: Double?,
+    val tss: Double?,
+    val skipped: Boolean?,
+    val missed: Boolean?,
+    val completedActivityId: Double?,
+    val profile: List<WorkoutStep>?,
+    val raw: JsonValue,
+) {
+    companion object {
+        fun fromJson(v: JsonValue): CalendarWorkout {
+            val steps = v.optArray("profile")?.mapNotNull { stepJson ->
+                if (stepJson !is JsonValue.Object) return@mapNotNull null
+                try {
+                    WorkoutStep.fromJson(stepJson)
+                } catch (_: Exception) {
+                    null
+                }
+            }
+            return CalendarWorkout(
+                id = v.optDouble("id"),
+                name = v.optString("name"),
+                type = v.optString("type"),
+                variant = v.optString("variant"),
+                durationS = v.optDouble("duration_s"),
+                tss = v.optDouble("tss"),
+                skipped = v.optBoolean("skipped"),
+                missed = v.optBoolean("missed"),
+                completedActivityId = v.optDouble("completed_activity_id"),
+                profile = steps,
+                raw = v,
+            )
+        }
     }
 }
 

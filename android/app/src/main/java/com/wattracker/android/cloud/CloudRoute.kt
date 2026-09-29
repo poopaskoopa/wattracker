@@ -28,7 +28,7 @@ enum class CloudRoute(private val rawValue: String) {
 
     /** Whether this route serves deltas (`since`, `revision`, `cursor`). */
     val servesDeltas: Boolean
-        get() = this == Dashboard || this == Volume || this == Curve || this == Activities
+        get() = this == Dashboard || this == Volume || this == Curve || this == Activities || this == Calendar
 
     /** The cache key: a fixed alphabet, never a rider- or server-chosen value. */
     val cacheKey: String

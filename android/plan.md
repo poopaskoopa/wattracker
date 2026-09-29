@@ -4,29 +4,9 @@ Epic #192 and sub-issues #193–#199, plus the owner's
 extra targets: Android 11+, dual-server support (cloud **and** local), offline
 cache. Kotlin + Jetpack Compose, single app under `android/`.
 
-**Resume point — Step 2 (#194) merged via PR #304. Step 3 (#195) — Cloud & Local Pairing and Settings — is implemented on `feature/android-client-3`.**
-PR #376 review findings addressed:
-1. **Blocker 1 — Redact secrets in `.toString()`**: Overrode `toString()` on `LocalCredentials`, `LocalRequest`, and `LocalResponse` to redact `token`, `Authorization`, `Cookie`, and `Set-Cookie` headers, as well as `token=` URL query parameters. Extended `bearerSecretsDoNotAppearInToString` test coverage.
-2. **Blocker 2 — Secure Token Input in Settings UI**: Updated connector token field in `SettingsScreen.kt` with `KeyboardType.Password`, `autoCorrectEnabled = false`, and `PasswordVisualTransformation()`.
-3. **Nit 3 — Origin-tied cookies & Stale revocation protection**: `LocalClient` holds `ActiveSession(cookie, originUrl, token)` atomically and passes request-scoped credentials through `getJson` and `authenticate(cred)`. Pinned with unit test `rePairingDuringInFlightReadDoesNotSendNewServerCookieToOldServer`.
-4. **Nit 4 — Revoked local device state**: `LocalClient.deviceState` returns `CloudSession.DeviceState.removed` upon revocation or refusal. Unit tests verify `DeviceState.removed`.
-5. **Nit 5 — Unpinned redirect & same-origin tests**: Added `HttpLocalTransport` unit test verifying `instanceFollowRedirects = false` and `authenticate()` unit test verifying external redirect rejection.
-6. **Nit 6 — Cloud remove 404 fallback**: Moved 404 fallback into `CloudSession.removeDevice()`, returning `RemoveDeviceResult.LocalFallback` on 404 while throwing `Failure.Server` / `Failure.Offline` on 401/5xx/offline to preserve local pairing. Pinned by unit tests for 200, 404, 500, and offline.
-7. **Nit 7 — Plan & Issue alignment**: Updated `plan.md` (e.g., token revocation returns `removed` state; uniform oracle-prevention message for pairing failures matching security spec).
+**Resume point — Step 4 (#196) Dashboard is implemented on `feature/android-client-4`, not yet opened as a PR. Steps 1–3 are merged: Step 2 (#194) via PR #304, Step 3 (#195) via PR #376 (landed through #403, `8722198`).** #195 stays open for its device check. The Step 4 implementation notes, verification and known gaps are under "Step 4 — Dashboard screen" below.
 
-Review findings addressed; known gaps listed below:
-1. **Cloud revocation 404 fallback**: `CloudSession.removeDevice()` returns `RemoveDeviceResult.LocalFallback` on 404/DeviceRemoved; 401/5xx/offline errors do not clear credentials.
-2. **Local session expiration & revocation**: `LocalClient` detects 3xx redirects to `/login`, clears session cookie, and re-mints once. Token revocation returns 401 / removed state, clears stored local credentials, and resets in-memory session state.
-3. **Async safety**: All `scope.launch` blocks in `SettingsScreen.kt` wrap calls in `try-catch`.
-4. **Local dashboard errors**: `loadDashboard()` propagates errors if all fetches fail; `lastSuccessfulRead` advances when at least one fetch succeeds (see 11).
-5. **Local URL validation**: Rejects HTTP in release builds with reverse-proxy guidance message pointing to README.md.
-6. **Token redaction**: Query string (`?token=...`) is sanitized in `UnexpectedLanding` exception messages.
-7. **Local Client Reset**: Added `reset()` to clear session cookie and cached state on removal/re-pairing.
-8. **Restored comments & abstract interface methods**: Restored load-bearing KDoc comments across stores and application initialization. Made `saveLocal`/`clearLocal` abstract.
-9. **UI Strings & Mappers**: Moved string literals to `strings.xml`. Created distinct `LocalPairingFailureMessage` and `RemoveDeviceFailureMessage` mappers.
-10. **Unit Tests**: 117 unit tests passing (`:app:testDebugUnitTest`). `:app:assembleDebug` and `:app:assembleRelease -PallowPlaceholderHost` green.
-11. **Step 4 Known Gap Note**: Partial dashboard loads (where 1 of 4 fetches succeeds) return `Source.network` and advance `lastSuccess` in Step 3; full fixture shape pinning and multi-endpoint reconciliation will be finalized in Step 4.
-12. **Follow-Up Note**: Unit test coverage for cloud device remove fallback (404 -> signOut(), offline -> throws with no local clear) and proxy-specific 401 distinction are noted for follow-up issues.
+Step 3 context: merged via PR #376 (landed through #403). Cloud and local pairing, the Settings screen, and the removed state (#153, `markRemoved()`). The review findings and their resolutions are on PR #376; the durable ones are: every type holding a bearer secret (`LocalCredentials`, `LocalRequest`, `LocalResponse`, `ActiveSession`) redacts it in `toString()`; the connector-token field is a password field; a local session cookie is reused only for the origin and token it was minted for; a local 401 reports `removed`, not `unpaired`.
 
 Step 2 context: merged via PR #304 (`4629ed5`). `CloudSession` (single-flight refresh, conservative two-strike revocation, generation-stamped cache writes), `CloudClient` plus a capped, redirect-free transport, the Room snapshot cache keyed on the server revision, the EncryptedSharedPreferences credential store, the forward-compatible JSON value model, and `WatTrackerApplication` wiring with Tink R8 keep rules and an exported Room schema — unit-tested against scripted responses.
 Step-1 context: #266 landed via **#294 (`ff1f2aa`)**; #193 is closed
@@ -297,8 +277,7 @@ since the 2026-09-01 draft:
    kinds; Python and Swift suites read it and the Kotlin tests read it too.
    The object-kind list is corrected — `race` and `scheduled_workout` were
    never standalone published kinds (a race is the `calendar_day.race` field).
-7. **The local `GET /api/calendar` route still does not exist** — the Step 6
-   server PR is still required (code locations updated).
+7. **The local `GET /api/calendar` route exists** — implemented in `wattracker/server.py` (since commit `32444f7`), returning `{"weeks": ...}` from the same builder as the web calendar.
 
 ---
 
@@ -316,7 +295,7 @@ since the 2026-09-01 draft:
 | App id | `com.wattracker.android` (mirrors `com.wattracker.ios`). |
 | Third-party deps | None beyond AndroidX, Kotlin stdlib, and (Step 2) androidx.room + androidx.security. No Retrofit/OkHttp/Koin/Coil — the epic's dependency rule. |
 | IDE agent | **Android Studio 4's built-in Agent mode with BYOK** (owner, 2026-09-06). First-party, supported feature of the IDE — not a community plugin, no MCP servers, no npm bridges, no `.kilo` MCP registration. The owner's API key lives in IDE-local settings only, never in the repo. Dev accelerator, not infrastructure: every Done criterion stands on `./gradlew` + `adb`, which is also what CI runs. |
-| Local calendar data | Owner-approved (2026-09-01, unchanged): **extract the month builder out of `calendar_view` and serve it from a new read-only `GET /api/calendar?year=&month=` JSON route** in `wattracker/server.py`, so the HTML page and the app render the same data by construction. Verified still absent on 2026-09-06. Lands as a small server PR (green Python suite) before Step 6; it is the one local-backend exception to "no server changes". |
+| Local calendar data | **`GET /api/calendar?year=&month=` route exists** in `wattracker/server.py` (since `32444f7`), returning `{"weeks": ...}` from the same builder as the web calendar. |
 
 ## Issue state (issue labels as of the 2026-09-14 `gh` check; branch rebased onto `52996a7`, 2026-09-14)
 
@@ -1453,6 +1432,98 @@ and shows up flagged in `GET /api/v1/devices`; re-pairing is clean.
   authoritative — a delta can withdraw; tombstones/absence win over stored
   ghosts).
 
+### Step 4 — implementation notes (2026-09-30, `feature/android-client-4`)
+
+**Loading model.** `DashboardViewModel` is obtained with
+`viewModel(key = activeSource.name, factory = …)`, so it lives in the nav
+entry's `ViewModelStore`. Dashboard is the start destination and the tab
+navigation pops to it with `saveState = true`, so that entry, and the view
+model with it, lasts the whole process. Two consequences are designed in:
+- **It reloads on every `ON_RESUME`, and only then.** The screen observes its
+  lifecycle and calls `refresh()`. The observer receives `ON_RESUME` as soon as
+  it is added, so that is also the first load. The view model deliberately does
+  **not** load in `init`: both together start two full dashboard walks on every
+  cold start. A resume is how a pairing, sign-out or removal done in Settings
+  reaches this screen, so without it the Dashboard showed the state from app
+  start until the process died.
+- **A refresh cancels the load in flight.** Only the newest load has read the
+  current pairing state. `CloudSession.load` serves the cache when its network
+  step fails, and cancellation counts as a failure there, so a cancelled load
+  can still *return normally*; `checkActive()` after every read is what keeps
+  its stale result off the screen.
+
+**The read model is awaited, never blocked on.** `WatTrackerApp.readModel()`
+waits on the app's setup (Room, Keystore, EncryptedSharedPreferences), which
+runs off the main thread. The screen gets it with `produceState` and shows the
+starting card meanwhile; a setup failure shows `dashboard_start_failed` rather
+than crashing composition.
+
+**Recent rides.** The cloud dashboard route publishes only `profile`,
+`training_state`, `load_point` and `curve` (`wattracker/cloud/api.py`
+`_CONTEXT_KINDS`), so the strip reads the Activities route; the local dashboard
+adapter includes the latest five itself. Whether to fetch Activities is
+decided on the *fresh dashboard snapshot*, never on what is on screen: the
+rides already shown are kept only for display while the fetch runs, then
+replaced outright (a withdrawn ride disappears). Every list is sorted newest
+first by `startTime`, because the cache returns objects sorted by id as text.
+
+**Load chart.** CTL/ATL/TSB lines over daily TSS bars, all on **one y axis**
+(`loadAxisRange`, which includes TSS and always 0), matching the desktop's
+one-chart-one-axis rule. The canvas clips to its bounds.
+
+**States.** Starting, unpaired (pair CTA), removed (#153, checked *before*
+unpaired: a removal also clears `isPaired`), loading over cache ("Syncing…"),
+cache ("Cached data · last synced …"), rate-limited (`Retry-After` seconds from
+`Failure.Throttled`), and error. A `DeviceRemoved` or `NotPaired` found by any
+load, the Activities fetch included, clears the data from the screen.
+
+**Also on this branch (from the #192 parity brief, 2026-09-29).** Calendar
+marked `servesDeltas` (#386); `Zone.pct` decoded as the desktop's display
+string, a numeric value reading as absent, as iOS does (#412), and
+`tests/vectors/cloud_objects_v1.json` updated to real `zones.py` strings (two
+zones, Z1 and the open-ended Z7, which is what the iOS test asserts);
+`calendar_day` workout `profile` decoded leniently (`CalendarWorkout`,
+`WorkoutStep`), tested against `tests/vectors/calendar_day_profile.json`;
+`removeDevice()` finishes locally on a 401/404 only with a `Date` within
+`clockSkewTolerance` and only if no re-pair happened mid-flight (#410); the
+release cloud host is read from `-PwattrackerCloudAuthority` or
+`local.properties` (gitignored), keeping the `.example` guard.
+
+**Verification.** `:app:testDebugUnitTest` 151 passed, 0 failed;
+`:app:assembleDebug` and `:app:assembleRelease -PallowPlaceholderHost` green;
+the Python tests that read the shared vectors pass. Mutation-proved locally
+(each fix reverted, the named test red, then restored):
+
+| Mutation | Test that goes red |
+|---|---|
+| Decide the Activities fetch on the on-screen rides | `everyRefreshRefetchesActivitiesSoANewRideAppears`, `ridesStayOnScreenWhileTheActivitiesFetchRuns` |
+| Drop the `checkActive()` staleness guard | `aNewRefreshSupersedesTheOneInFlight` |
+| Load in `init` as well | `constructionDoesNotLoad` |
+| Clear the rides while the fetch runs | `ridesStayOnScreenWhileTheActivitiesFetchRuns` |
+| Leave TSS out of the chart's axis | `loadAxisIncludesTssSoBarsStayInsideTheChart` |
+| Join the in-flight load instead of cancelling it | `aNewRefreshSupersedesTheOneInFlight` |
+
+**Not verified.** Nothing here has run on a device or emulator. #196's Done
+(phone landscape and tablet, rotated live) is still owed, as is a real-data
+check against the deployed cloud (about 1,458 `load_point`s, about 15 pages).
+The iOS suite was not run (Windows host); the vector change was checked against
+`CloudModelsTests.swift`'s assertions by reading them.
+
+**Known gaps.**
+- The first Activities fetch walks the whole collection (up to
+  `CloudSession.maximumPages`), because `ReadSession` has no first-page read.
+  Later loads are `since=` deltas. The strip is filled after the dashboard
+  itself is shown, so this delays only the strip.
+- Local backend: a failed `/api/state` fails the dashboard load, and the
+  screen keeps what it was showing under the error banner. `LocalClient` has
+  no fallback of its own: `load` throws, and `cached` holds only the single
+  last response. A failure of `/api/load`, `/api/curve` or `/api/activities`
+  alone is still silent and shows those parts empty.
+- Switching the data source leaves the previous source's view model in the
+  store; a load it has in flight runs to completion unseen.
+- The loading message is a fixed "Syncing dashboard…", with no page count
+  (iOS is the same).
+
 ## Step 5 — Activities list + ride detail (issue #197)
 
 - List: newest first, `date, duration, distance, NP, IF, TSS`; lazy-loaded
@@ -1476,19 +1547,8 @@ and shows up flagged in `GET /api/v1/devices`; re-pairing is clean.
 
 ## Step 6 — Calendar + Volume (issue #198)
 
-**Preamble — server PR (lands before any screen work on the local calendar):**
-In `wattracker/server.py`, extract the month-data construction from
-`calendar_view` (the block from `ooto_ranges` through the per-day workout/
-activity/race/phase assembly, `server.py:4079` ff.) into a module-level
-`build_calendar_month(uid, year, month)` function; `calendar_view` calls it,
-and a new read-only route `GET /api/calendar?year=&month=` (same defaults and
-month normalisation as the HTML route: current month, 1..12 wrap) returns
-`build_calendar_month(...)` as JSON. No new auth (session, like the other
-`/api/*` routes), no new db access (the builder already takes the db
-functions), no change to any existing response. Focused test: a fixture month
-with plan workouts (incl. one completed, one past-missed, one ooto-skipped),
-a standalone workout, an activity, a race with demoted priority, and an ooto
-range — assert the JSON carries the same flags the HTML calendar renders, and
+**Preamble — server route:**
+The read-only route `GET /api/calendar?year=&month=` exists in `wattracker/server.py` (since commit `32444f7`), returning `build_calendar_month(...)` as JSON (`{"weeks": ...}`). The app's local calendar adapter is written against its test-pinned shape.
 that a history cutoff hides pre-cutoff activities. Full suite green per
 AGENTS.md. This PR is Python-only and does not touch `wattracker/cloud/` or
 the migrations.
