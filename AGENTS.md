@@ -193,7 +193,15 @@ states on `main` when the PR is merge-committed. Four such commits are on
    the first sync, and the existing error and retry states) from the status data
    already present. Desktop UI only.
 
-2. **#249: rotating full-suite test flakes. Still not a local-runs job.**
+2. **#413: the iOS Calendar day view shows the planned workout.** Publish a
+   compact per-workout `profile` (step durations and FTP fractions, reusing the
+   desktop's segment→profile code; never raw ZWO) in `calendar_day`. iOS then
+   draws the power graph with Swift Charts, lists the steps ("10 min at 250 W"),
+   and gets a top-left back arrow to the month view. Decode leniently (see
+   #412), and test with a real published workout shape. The Android half is
+   taksmon's.
+
+3. **#249: rotating full-suite test flakes. Still not a local-runs job.**
    Nothing has changed since the re-scope. 21 consecutive clean local full
    suites stand against zero reproductions. Both known instances came from
    **taksmon's machine**. **The next step is taksmon's log and his exact
