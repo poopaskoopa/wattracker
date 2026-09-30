@@ -7,6 +7,7 @@ replaced by a runner that records argv and stdin.
 
 from __future__ import annotations
 
+import hashlib
 import os
 import subprocess
 from pathlib import Path
@@ -17,6 +18,8 @@ from scripts import ios_release_secrets as helper
 
 
 WORKFLOW = Path(".github/workflows/ios-release.yml")
+WWDR_CERT = Path(".github/certs/AppleWWDRCAG3.cer")
+WWDR_G3_SHA256 = "dcf21878c77f4198e4b4614f03d696d89c66c66008d4244e1b99161aac91601f"
 
 
 class FakeRunner:
@@ -179,6 +182,122 @@ def test_workflow_classifies_certificate_failures_and_keeps_cleanup_unconditiona
     keychain_record = workflow.index('echo "IOS_SIGNING_KEYCHAIN=$keychain" >> "$GITHUB_ENV"')
     risky_validation = workflow.index("base64 --decode")
     assert keychain_record < risky_validation
+
+
+def test_workflow_pins_and_imports_only_the_checked_in_wwdr_g3_before_validity_check():
+    workflow = WORKFLOW.read_text(encoding="utf-8")
+    assert WWDR_CERT.is_file()
+    assert hashlib.sha256(WWDR_CERT.read_bytes()).hexdigest() == WWDR_G3_SHA256
+    assert f'wwdr_expected_sha256="{WWDR_G3_SHA256}"' in workflow
+    assert "shasum -a 256 \"$wwdr_cert\"" in workflow
+    assert "curl" not in workflow
+    assert "wget" not in workflow
+
+    # Keep the operator literal: changing != to == must make this test fail.
+    fingerprint_comparison = 'if [ "$wwdr_actual_sha256" != "$wwdr_expected_sha256" ]; then'
+    assert workflow.count(fingerprint_comparison) == 1
+    assert 'if [ "$wwdr_actual_sha256" == "$wwdr_expected_sha256" ]; then' not in workflow
+    fingerprint_check = workflow.index(fingerprint_comparison)
+    intermediate_import = workflow.index('security import "$wwdr_cert"')
+    validity_check = workflow.index('security find-identity -v -p codesigning "$keychain"')
+    p12_import = workflow.index('security import "$p12"')
+    assert fingerprint_check < intermediate_import < p12_import < validity_check
+
+
+def test_workflow_masks_leaf_and_wwdr_common_names_before_diagnostics():
+    workflow = WORKFLOW.read_text(encoding="utf-8")
+    leaf_cn = 'printf \'::add-mask::%s\\n\' "$leaf_cn"'
+    wwdr_cn = 'printf \'::add-mask::%s\\n\' "$wwdr_cn"'
+    assert workflow.count(leaf_cn) == 1
+    assert workflow.count(wwdr_cn) == 1
+    assert workflow.index('leaf_cn="$(/usr/bin/openssl x509') < workflow.index(leaf_cn)
+    assert workflow.index('wwdr_cn="$(/usr/bin/openssl x509') < workflow.index(wwdr_cn)
+    diagnose_start = workflow.index('if [ "${DIAGNOSE_SIGNING:-false}" = "true" ]; then')
+    assert workflow.index(leaf_cn) < diagnose_start
+    assert workflow.index(wwdr_cn) < diagnose_start
+
+
+def test_workflow_diagnose_summary_has_exact_safe_boundary():
+    script = _workflow_step_script("Import the distribution certificate into a temporary keychain")
+    start_marker = 'if [ "${DIAGNOSE_SIGNING:-false}" = "true" ]; then\n'
+    validity_marker = 'identities="$(security find-identity -v -p codesigning "$keychain"'
+    start = script.index(start_marker)
+    end = script.index(validity_marker, start)
+    diagnostic = script[start:end]
+
+    assert diagnostic.startswith(start_marker)
+    assert diagnostic.rstrip().endswith("fi")
+    assert script[end:].startswith(validity_marker)
+    assert diagnostic.count("security find-identity") == 2
+    assert 'valid_identity_output="$(security find-identity -v -p codesigning "$keychain" 2>&1 || true)"' in diagnostic
+    assert 'all_identity_output="$(security find-identity -p codesigning "$keychain" 2>&1 || true)"' in diagnostic
+    for summary in (
+        "Diagnostic valid identity count:",
+        "Diagnostic all identity count:",
+        "Diagnostic CSSMERR status count:",
+        "Diagnostic CSSMERR status:",
+        "Diagnostic certificate type:",
+        "Diagnostic certificate expiry:",
+    ):
+        assert summary in diagnostic
+    assert diagnostic.count("printf 'Diagnostic ") == 8
+    for forbidden in ("find-certificate", '"labl"', '"subj"', "-fingerprint", "-sha1"):
+        assert forbidden not in diagnostic
+
+
+def test_workflow_diagnose_summary_never_prints_fake_security_identity_name(tmp_path):
+    script = _workflow_step_script("Import the distribution certificate into a temporary keychain")
+    start = script.index('if [ "${DIAGNOSE_SIGNING:-false}" = "true" ]; then')
+    end = script.index('identities="$(security find-identity', start)
+    diagnostic = script[start:end]
+
+    sentinel = "Apple Distribution: Sentinel Legal Name (TEAM-SENTINEL)"
+    security_runner = tmp_path / "security"
+    security_runner.write_text(
+        "#!/bin/sh\n"
+        "if [ \"$1\" = find-identity ]; then\n"
+        f"  printf '%s\\n' '  1) {'A' * 40} \"{sentinel}\" (CSSMERR_TP_NOT_TRUSTED)'\n"
+        "fi\n",
+        encoding="utf-8",
+    )
+    security_runner.chmod(0o700)
+    cert_pem = tmp_path / "leaf.pem"
+    subprocess.run(
+        ["/usr/bin/openssl", "x509", "-inform", "der", "-in", str(WWDR_CERT), "-out", str(cert_pem)],
+        check=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    environment = os.environ.copy()
+    environment.update(
+        {
+            "PATH": f"{tmp_path}:{environment['PATH']}",
+            "DIAGNOSE_SIGNING": "true",
+        }
+    )
+    result = subprocess.run(
+        ["/bin/bash"],
+        input=(
+            "set -euo pipefail\n"
+            f"keychain={tmp_path / 'fake.keychain'}\n"
+            f"cert_pem={cert_pem}\n"
+            f"wwdr_cert={WWDR_CERT}\n"
+            + diagnostic
+        ),
+        text=True,
+        env=environment,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        check=False,
+    )
+    assert result.returncode == 0, result.stderr
+    assert sentinel not in result.stdout
+    assert sentinel not in result.stderr
+    assert "CSSMERR_TP_NOT_TRUSTED" in result.stdout
+    assert "Diagnostic certificate type:" in result.stdout
+    assert "Diagnostic certificate expiry:" in result.stdout
+    assert '"labl"' not in diagnostic
+    assert '"subj"' not in diagnostic
 
 
 def test_helper_uses_security_export_password_argv_but_never_gh_secret_argv():

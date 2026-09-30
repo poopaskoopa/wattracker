@@ -315,6 +315,8 @@ jobs:
           keychain_password="$(/usr/bin/openssl rand -hex 32)"
           p12="$RUNNER_TEMP/wattracker-ios-signing.p12"
           cert_pem="$RUNNER_TEMP/wattracker-ios-distribution-cert.pem"
+          wwdr_cert="$GITHUB_WORKSPACE/.github/certs/AppleWWDRCAG3.cer"
+          wwdr_expected_sha256="dcf21878c77f4198e4b4614f03d696d89c66c66008d4244e1b99161aac91601f"
           # Record this before creating or importing anything: the final
           # always-run step must know the path even when a later command fails.
           echo "IOS_SIGNING_KEYCHAIN=$keychain" >> "$GITHUB_ENV"
@@ -337,6 +339,11 @@ jobs:
             exit 1
           fi
           chmod 600 "$cert_pem"
+          leaf_cn="$(/usr/bin/openssl x509 -in "$cert_pem" -noout -subject -nameopt RFC2253 \
+            | sed -n 's/^subject=.*CN=//p')"
+          if [ -n "$leaf_cn" ]; then
+            printf '::add-mask::%s\n' "$leaf_cn"
+          fi
           if ! /usr/bin/openssl x509 -in "$cert_pem" -checkend 0 -noout >/dev/null 2>&1; then
             echo "The distribution certificate is expired." >&2
             exit 1
@@ -347,9 +354,28 @@ jobs:
             echo "The distribution certificate team does not match APPLE_TEAM_ID." >&2
             exit 1
           fi
+          if [ ! -f "$wwdr_cert" ]; then
+            echo "The checked-in Apple WWDR G3 certificate is missing." >&2
+            exit 1
+          fi
+          wwdr_actual_sha256="$(shasum -a 256 "$wwdr_cert" | awk '{print tolower($1)}')"
+          if [ "$wwdr_actual_sha256" != "$wwdr_expected_sha256" ]; then
+            echo "The checked-in Apple WWDR G3 certificate failed fingerprint verification." >&2
+            exit 1
+          fi
+          wwdr_cn="$(/usr/bin/openssl x509 -inform der -in "$wwdr_cert" -noout \
+            -subject -nameopt RFC2253 | sed -n 's/^subject=.*CN=//p')"
+          if [ -n "$wwdr_cn" ]; then
+            printf '::add-mask::%s\n' "$wwdr_cn"
+          fi
           security create-keychain -p "$keychain_password" "$keychain"
           security set-keychain-settings -lut 3600 "$keychain"
           security unlock-keychain -p "$keychain_password" "$keychain"
+          if ! security import "$wwdr_cert" -k "$keychain" -T /usr/bin/codesign \
+              >/dev/null 2>&1; then
+            echo "The checked-in Apple WWDR G3 certificate could not be imported." >&2
+            exit 1
+          fi
           # -x: the imported private key is not extractable, so nothing later
           # in this job (or a later job, if the delete below ever failed) can
           # read it back out of the keychain.
@@ -367,24 +393,38 @@ jobs:
           # exits 1 on no match, hence the `|| true`, and the default covers
           # find-identity itself failing under `set -o pipefail`. The count is
           # all that is printed - never the identity hashes.
-          # Diagnostics, opt-in. `find-identity -v` lists only VALID
-          # identities, so a count of zero cannot distinguish "nothing
-          # imported" from "imported, but the chain does not resolve here".
-          # Without -v lists them regardless of validity, which separates the
-          # two. Certificate subjects and identity names only - never a key.
+          # Diagnostics, opt-in. Capture every security response before
+          # summarising it: the raw responses contain identity labels,
+          # subjects, common names, and team identifiers, none of which may
+          # reach the log. The summary is deliberately limited to counts,
+          # CSSMERR status codes, certificate types, and expiry dates.
           if [ "${DIAGNOSE_SIGNING:-false}" = "true" ]; then
-            echo "--- identities in the keychain, valid only ---"
-            security find-identity -v -p codesigning "$keychain" || true
-            echo "--- identities in the keychain, including invalid ---"
-            security find-identity -p codesigning "$keychain" || true
-            echo "--- certificates in the keychain ---"
-            security find-certificate -a "$keychain" \
-              | grep -E '"labl"|"subj"' || true
-            echo "--- is an Apple root trusted for this account? ---"
-            security find-certificate -a -c "Apple Root CA" \
-              /System/Library/Keychains/SystemRootCertificates.keychain \
-              | grep -c '"labl"' || true
-            echo "--- end diagnostics ---"
+            valid_identity_output="$(security find-identity -v -p codesigning "$keychain" 2>&1 || true)"
+            all_identity_output="$(security find-identity -p codesigning "$keychain" 2>&1 || true)"
+            valid_identity_count="$(printf '%s\n' "$valid_identity_output" \
+              | grep -Ec '^[[:space:]]+[0-9]+\)' || true)"
+            all_identity_count="$(printf '%s\n' "$all_identity_output" \
+              | grep -Ec '^[[:space:]]+[0-9]+\)' || true)"
+            status_codes="$(printf '%s\n' "$all_identity_output" \
+              | grep -oE 'CSSMERR_[A-Z0-9_]+' | sort -u || true)"
+            status_count="$(printf '%s\n' "$status_codes" \
+              | grep -Ec '^CSSMERR_[A-Z0-9_]+$' || true)"
+            leaf_expiry="$(/usr/bin/openssl x509 -in "$cert_pem" -noout -enddate \
+              | sed 's/^notAfter=//')"
+            wwdr_expiry="$(/usr/bin/openssl x509 -inform der -in "$wwdr_cert" \
+              -noout -enddate | sed 's/^notAfter=//')"
+            printf 'Diagnostic valid identity count: %s\n' "$valid_identity_count"
+            printf 'Diagnostic all identity count: %s\n' "$all_identity_count"
+            printf 'Diagnostic CSSMERR status count: %s\n' "$status_count"
+            if [ -n "$status_codes" ]; then
+              printf '%s\n' "$status_codes" | while IFS= read -r status; do
+                printf 'Diagnostic CSSMERR status: %s\n' "$status"
+              done
+            fi
+            printf 'Diagnostic certificate type: Apple Distribution leaf\n'
+            printf 'Diagnostic certificate expiry: %s\n' "$leaf_expiry"
+            printf 'Diagnostic certificate type: Apple WWDR G3 intermediate\n'
+            printf 'Diagnostic certificate expiry: %s\n' "$wwdr_expiry"
           fi
           identities="$(security find-identity -v -p codesigning "$keychain" | grep -c 'Apple Distribution' || true)"
           if [ "${identities:-0}" -lt 1 ]; then
