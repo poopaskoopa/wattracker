@@ -244,15 +244,24 @@ def test_workflow_pins_and_imports_the_checked_in_apple_root_before_validity_che
     fingerprint_comparison = 'if [ "$root_actual_sha256" != "$root_expected_sha256" ]; then'
     assert workflow.count(fingerprint_comparison) == 1
     fingerprint_check = workflow.index(fingerprint_comparison)
-    root_import = workflow.index('security import "$root_cert"')
-    assert 'add-trusted-cert' not in workflow
+    trust_snapshot = workflow.index(
+        'security trust-settings-export "$trust_settings_original"'
+    )
+    root_trust = workflow.index(
+        'security add-trusted-cert -r trustRoot -p codeSign'
+    )
+    trust_install = workflow.index(
+        'security trust-settings-import "$trust_settings_updated"'
+    )
+    assert 'security import "$root_cert"' not in workflow
     wwdr_import = workflow.index('security import "$wwdr_cert"')
     p12_import = workflow.index('security import "$p12"')
     search_list = workflow.index(
         'security list-keychains -d user -s'
     )
     validity_check = workflow.index('security find-identity -v -p codesigning "$keychain"')
-    assert fingerprint_check < root_import < search_list < wwdr_import < p12_import < validity_check
+    assert fingerprint_check < trust_snapshot < root_trust < trust_install
+    assert trust_install < search_list < wwdr_import < p12_import < validity_check
 
 
 def test_workflow_searches_the_pinned_root_in_the_job_keychain():
@@ -266,8 +275,18 @@ def test_workflow_searches_the_pinned_root_in_the_job_keychain():
 
     assert signing_setup.count(search_list_command) == 1
     search_list = signing_setup.index(search_list_command)
-    root_import = signing_setup.index('security import "$root_cert"')
-    assert 'add-trusted-cert' not in signing_setup
+    trust_snapshot = signing_setup.index(
+        'security trust-settings-export "$trust_settings_original"'
+    )
+    root_trust = signing_setup.index(
+        'security add-trusted-cert -r trustRoot -p codeSign'
+    )
+    trust_install = signing_setup.index(
+        'security trust-settings-import "$trust_settings_updated"'
+    )
+    assert 'security import "$root_cert"' not in signing_setup
+    assert '-k "$keychain" -i "$trust_settings_original"' in signing_setup[root_trust:]
+    assert '-o "$trust_settings_updated" "$root_cert"' in signing_setup[root_trust:]
     search_list_end = signing_setup.index(
         'if ! security import "$wwdr_cert"', search_list
     )
@@ -276,7 +295,7 @@ def test_workflow_searches_the_pinned_root_in_the_job_keychain():
     assert '/System/Library/Keychains/SystemRootCertificates.keychain' in search_list_setup
     assert search_list_setup.index('"$keychain"') < search_list_setup.index('login.keychain-db')
     assert search_list_setup.index('login.keychain-db') < search_list_setup.index('/Library/Keychains/System.keychain')
-    assert root_import < search_list
+    assert trust_snapshot < root_trust < trust_install < search_list
     assert 'remove-trusted-cert' not in signing_setup
     assert 'echo "IOS_ROOT_TRUST_CERT=$root_cert" >> "$GITHUB_ENV"' not in signing_setup
     assert (
@@ -293,7 +312,7 @@ def test_workflow_searches_the_pinned_root_in_the_job_keychain():
     assert 'if [ "${identity_count:-0}" -ne 1 ] || [ "${distribution_count:-0}" -ne 1 ]; then' in signing_setup
 
 
-def test_workflow_keeps_keychain_cleanup_unconditional_without_trust_cleanup():
+def test_workflow_restores_trust_settings_and_keychain_cleanup_unconditionally():
     workflow = WORKFLOW.read_text(encoding="utf-8")
     cleanup_start = workflow.index("- name: Remove the signing material")
     cleanup = workflow[cleanup_start:]
@@ -303,6 +322,11 @@ def test_workflow_keeps_keychain_cleanup_unconditional_without_trust_cleanup():
     assert 'security list-keychains -d user -s login.keychain-db || true' in cleanup
     assert "add-trusted-cert" not in cleanup
     assert "remove-trusted-cert" not in cleanup
+    trust_restore = cleanup.index(
+        'security trust-settings-import "$IOS_TRUST_SETTINGS_ORIGINAL" || true'
+    )
+    assert trust_restore < keychain_delete
+    assert 'rm -f "${IOS_TRUST_SETTINGS_ORIGINAL:-}" "${IOS_TRUST_SETTINGS_UPDATED:-}" || true' in cleanup
     assert keychain_delete < cleanup.index('rm -f "$RUNNER_TEMP/wattracker-ios-signing.p12"')
     assert 'security default-keychain -d user -s "$IOS_ORIGINAL_DEFAULT_KEYCHAIN" || true' in cleanup
 

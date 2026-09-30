@@ -315,6 +315,8 @@ jobs:
           keychain_password="$(/usr/bin/openssl rand -hex 32)"
           p12="$RUNNER_TEMP/wattracker-ios-signing.p12"
           cert_pem="$RUNNER_TEMP/wattracker-ios-distribution-cert.pem"
+          trust_settings_original="$RUNNER_TEMP/wattracker-ios-trust-settings.original.plist"
+          trust_settings_updated="$RUNNER_TEMP/wattracker-ios-trust-settings.updated.plist"
           original_default_keychain="$(security default-keychain -d user 2>/dev/null || true)"
           original_default_keychain="$(printf '%s\n' "$original_default_keychain" \
             | sed -n 's/^ *"\(.*\)" *$/\1/p')"
@@ -329,6 +331,8 @@ jobs:
           # always-run step must know the path even when a later command fails.
           echo "IOS_SIGNING_KEYCHAIN=$keychain" >> "$GITHUB_ENV"
           echo "IOS_ORIGINAL_DEFAULT_KEYCHAIN=$original_default_keychain" >> "$GITHUB_ENV"
+          echo "IOS_TRUST_SETTINGS_ORIGINAL=$trust_settings_original" >> "$GITHUB_ENV"
+          echo "IOS_TRUST_SETTINGS_UPDATED=$trust_settings_updated" >> "$GITHUB_ENV"
           # The archive is a separate step, so mask this generated password
           # before it crosses the step boundary. It is never printed.
           printf '::add-mask::%s\n' "$keychain_password"
@@ -404,9 +408,28 @@ jobs:
           security create-keychain -p "$keychain_password" "$keychain"
           security set-keychain-settings -lut 3600 "$keychain"
           security unlock-keychain -p "$keychain_password" "$keychain"
-          if ! security import "$root_cert" -k "$keychain" -T /usr/bin/codesign \
+          # Build trust settings in files first. A direct add-trusted-cert call
+          # writes the user's trust database and asks SecurityAgent for GUI
+          # authorization on this runner. File mode avoids that prompt; the
+          # resulting user-domain settings are imported only for this job and
+          # restored by the unconditional cleanup.
+          if ! security trust-settings-export "$trust_settings_original" \
               >/dev/null 2>&1; then
-            echo "The checked-in Apple Root CA certificate could not be imported." >&2
+            if ! security add-trusted-cert -o "$trust_settings_original" \
+                >/dev/null 2>&1; then
+              echo "The runner's trust settings could not be snapshotted." >&2
+              exit 1
+            fi
+          fi
+          if ! security add-trusted-cert -r trustRoot -p codeSign \
+              -k "$keychain" -i "$trust_settings_original" \
+              -o "$trust_settings_updated" "$root_cert" >/dev/null 2>&1; then
+            echo "The checked-in Apple Root CA certificate could not be prepared for code signing." >&2
+            exit 1
+          fi
+          if ! security trust-settings-import "$trust_settings_updated" \
+              >/dev/null 2>&1; then
+            echo "The temporary Apple Root CA trust settings could not be installed." >&2
             exit 1
           fi
           # Put the complete job chain first, then expose the runner's normal
@@ -803,12 +826,17 @@ jobs:
           if [ -n "${IOS_ORIGINAL_DEFAULT_KEYCHAIN:-}" ]; then
             security default-keychain -d user -s "$IOS_ORIGINAL_DEFAULT_KEYCHAIN" || true
           fi
+          if [ -n "${IOS_TRUST_SETTINGS_ORIGINAL:-}" ] && \
+             [ -f "$IOS_TRUST_SETTINGS_ORIGINAL" ]; then
+            security trust-settings-import "$IOS_TRUST_SETTINGS_ORIGINAL" || true
+          fi
           security list-keychains -d user -s login.keychain-db || true
           if [ -n "${IOS_SIGNING_KEYCHAIN:-}" ]; then
             security delete-keychain "$IOS_SIGNING_KEYCHAIN" || true
           fi
           rm -f "$RUNNER_TEMP/wattracker-ios-signing.p12" || true
           rm -f "$RUNNER_TEMP/wattracker-ios-distribution-cert.pem" || true
+          rm -f "${IOS_TRUST_SETTINGS_ORIGINAL:-}" "${IOS_TRUST_SETTINGS_UPDATED:-}" || true
           rm -rf "$RUNNER_TEMP/asc" || true
           rm -f "$RUNNER_TEMP/ExportOptions.plist" || true
           # The archive and the export both carry the team identifier in the
