@@ -409,9 +409,9 @@ jobs:
           security set-keychain-settings -lut 3600 "$keychain"
           security unlock-keychain -p "$keychain_password" "$keychain"
           # Verify the leaf against the pinned public chain before importing
-          # the private identity. Import the pinned root into the disposable
-          # keychain while keeping Apple's system stores first in the search
-          # path. Do not call
+          # the private identity. Keep the pinned root as an explicit
+          # verification anchor, but let codesign use Apple's built-in root
+          # store. Do not call
           # add-trusted-cert: that mutates the runner's user trust database and
           # can summon SecurityAgent on a headless LaunchDaemon.
           if ! security verify-cert -p codeSign \
@@ -420,19 +420,13 @@ jobs:
             echo "The distribution certificate chain did not match the pinned Apple chain." >&2
             exit 1
           fi
-          if ! security import "$root_cert" -t cert -f x509 \
-              -k "$keychain" -T /usr/bin/codesign >/dev/null 2>&1; then
-            echo "The checked-in Apple Root CA certificate could not be imported." >&2
-            exit 1
-          fi
-          # Put the complete job chain first, then expose the runner's normal
-          # login keychain and Apple's system stores for any other public
-          # intermediates. The non-job identity guard fails closed before
+          # Use only the job keychain and Apple's built-in root store. The
+          # persistent login and mutable System keychains stay out of the
+          # search path, and the non-job identity guard fails closed before
           # codesign can select a persistent key.
           security list-keychains -d user -s \
-            /Library/Keychains/System.keychain \
-            /System/Library/Keychains/SystemRootCertificates.keychain \
-            "$keychain"
+            "$keychain" \
+            /System/Library/Keychains/SystemRootCertificates.keychain
           if ! security import "$wwdr_cert" -k "$keychain" -T /usr/bin/codesign \
               >/dev/null 2>&1; then
             echo "The checked-in Apple WWDR G3 certificate could not be imported." >&2
@@ -638,9 +632,8 @@ jobs:
           # guard above prevents a persistent signing key from being selected.
           security default-keychain -d user -s "$keychain"
           security list-keychains -d user -s \
-            /Library/Keychains/System.keychain \
-            /System/Library/Keychains/SystemRootCertificates.keychain \
-            "$keychain"
+            "$keychain" \
+            /System/Library/Keychains/SystemRootCertificates.keychain
           security unlock-keychain -p "$keychain_password" "$keychain"
           security set-key-partition-list -S apple-tool:,apple:,codesign: -s \
             -k "$keychain_password" "$keychain" > /dev/null
@@ -880,9 +873,8 @@ jobs:
           }
 
           security list-keychains -d user -s \
-            /Library/Keychains/System.keychain \
-            /System/Library/Keychains/SystemRootCertificates.keychain \
-            "$IOS_SIGNING_KEYCHAIN"
+            "$IOS_SIGNING_KEYCHAIN" \
+            /System/Library/Keychains/SystemRootCertificates.keychain
           security unlock-keychain -p "$IOS_SIGNING_KEYCHAIN_PASSWORD" "$IOS_SIGNING_KEYCHAIN"
           security set-key-partition-list -S apple-tool:,apple:,codesign: -s \
             -k "$IOS_SIGNING_KEYCHAIN_PASSWORD" "$IOS_SIGNING_KEYCHAIN" > /dev/null
