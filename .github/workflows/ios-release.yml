@@ -404,10 +404,12 @@ jobs:
           fi
           # Keep trust settings untouched: user-domain trust changes require
           # an interactive authentication dialog, which this headless
-          # LaunchDaemon runner cannot answer. Apple’s trusted roots
-          # live in SystemRootCertificates.keychain, so make that standard
-          # root store available for chain construction instead.
-          security list-keychains -d user -s "$keychain" /System/Library/Keychains/SystemRootCertificates.keychain
+          # LaunchDaemon runner cannot answer. The system keychain carries
+          # Apple's trust settings and the system-root keychain carries the
+          # built-in anchors, so expose both for chain construction.
+          security list-keychains -d user -s "$keychain" \
+            /Library/Keychains/System.keychain \
+            /System/Library/Keychains/SystemRootCertificates.keychain
           if ! security import "$wwdr_cert" -k "$keychain" -T /usr/bin/codesign \
               >/dev/null 2>&1; then
             echo "The checked-in Apple WWDR G3 certificate could not be imported." >&2
@@ -420,7 +422,7 @@ jobs:
             -P "$IOS_DIST_P12_PASSWORD" \
             -T /usr/bin/codesign -x
           # Exact order matters: the job keychain is first, followed only by
-          # Apple's system root store. Do not include the persistent login
+          # Apple's system keychains. Do not include the persistent login
           # keychain: without --keychain, codesign uses the search list for
           # both identity selection and chain construction.
           rm -f "$p12"
@@ -462,7 +464,10 @@ jobs:
             printf 'Diagnostic certificate type: Apple WWDR G3 intermediate\n'
             printf 'Diagnostic certificate expiry: %s\n' "$wwdr_expiry"
           fi
-          system_identities="$(security find-identity -v -p codesigning /System/Library/Keychains/SystemRootCertificates.keychain 2>&1 || true)"
+          system_identities="$(
+            security find-identity -v -p codesigning /Library/Keychains/System.keychain 2>&1 || true
+            security find-identity -v -p codesigning /System/Library/Keychains/SystemRootCertificates.keychain 2>&1 || true
+          )"
           system_identity_count="$(printf '%s\n' "$system_identities" \
             | grep -Ec '^[[:space:]]+[0-9]+\)' || true)"
           if [ "${system_identity_count:-0}" -ne 0 ]; then
@@ -508,8 +513,9 @@ jobs:
       #    the account - docs/ios-testflight.md has the one-time creation.
       #
       #    The signing search list contains only the job keychain and Apple's
-      #    system keychain. The job keychain is first, and the import step
-      #    fails closed if the system keychain contains any signing identity.
+      #    two system keychains. The job keychain is first, and the import
+      #    step fails closed if either system keychain contains any signing
+      #    identity.
       #    We deliberately do not pass OTHER_CODE_SIGN_FLAGS=--keychain: the
       #    root chain must be discoverable through the standard search list.
       #
@@ -615,8 +621,8 @@ jobs:
           }
 
           # Re-unlock immediately before archive. The imported root plus the
-          # system keychain make chain construction available; this partition
-          # list and the two-keychain search list avoid a GUI prompt while
+          # system keychains make chain construction available; this partition
+          # list and the three-keychain search list avoid a GUI prompt while
           # keeping the job keychain first.
           security unlock-keychain -p "$IOS_SIGNING_KEYCHAIN_PASSWORD" "$IOS_SIGNING_KEYCHAIN"
           security set-key-partition-list -S apple-tool:,apple:,codesign: \
@@ -652,7 +658,8 @@ jobs:
       # deletes it is at the bottom of the job and not immediately after the
       # archive. -exportArchive takes no build settings, so there is no
       # --keychain to pass here: it resolves the identity through the keychain
-      # search list, which the import step set to job, system, then login.
+      # search list, which the import step set to job, then Apple's two system
+      # keychains. The persistent login keychain is deliberately excluded.
       # ios/WatTracker/ExportOptions.plist names the same profile the
       # archive was signed with; a mismatch there re-signs with something else
       # and is not caught until Apple rejects the upload.

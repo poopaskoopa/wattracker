@@ -248,7 +248,7 @@ def test_workflow_pins_and_imports_the_checked_in_apple_root_before_validity_che
     wwdr_import = workflow.index('security import "$wwdr_cert"')
     p12_import = workflow.index('security import "$p12"')
     search_list = workflow.index(
-        'security list-keychains -d user -s "$keychain" /System/Library/Keychains/SystemRootCertificates.keychain'
+        'security list-keychains -d user -s "$keychain"'
     )
     validity_check = workflow.index('security find-identity -v -p codesigning "$keychain"')
     assert fingerprint_check < root_import < search_list < wwdr_import < p12_import < validity_check
@@ -256,10 +256,7 @@ def test_workflow_pins_and_imports_the_checked_in_apple_root_before_validity_che
 
 def test_workflow_uses_system_roots_without_mutating_trust_settings():
     workflow = WORKFLOW.read_text(encoding="utf-8")
-    search_list_command = (
-        'security list-keychains -d user -s "$keychain" '
-        "/System/Library/Keychains/SystemRootCertificates.keychain"
-    )
+    search_list_command = 'security list-keychains -d user -s "$keychain"'
     archive_start = workflow.index("- name: Archive for the App Store")
     import_start = workflow.index(
         "- name: Import the distribution certificate into a temporary keychain"
@@ -267,13 +264,23 @@ def test_workflow_uses_system_roots_without_mutating_trust_settings():
     signing_setup = workflow[import_start:archive_start]
 
     assert signing_setup.count(search_list_command) == 1
+    search_list = signing_setup.index(search_list_command)
+    search_list_end = signing_setup.index(
+        'if ! security import "$wwdr_cert"', search_list
+    )
+    search_list_setup = signing_setup[search_list:search_list_end]
+    assert '/Library/Keychains/System.keychain' in search_list_setup
+    assert '/System/Library/Keychains/SystemRootCertificates.keychain' in search_list_setup
     assert "login.keychain-db" not in signing_setup
     assert "add-trusted-cert" not in signing_setup
     assert "remove-trusted-cert" not in signing_setup
     assert 'echo "IOS_ROOT_TRUST_CERT=$root_cert" >> "$GITHUB_ENV"' not in signing_setup
     assert (
-        'system_identities="$(security find-identity -v -p codesigning '
-        '/System/Library/Keychains/SystemRootCertificates.keychain 2>&1 || true)"'
+        'security find-identity -v -p codesigning /Library/Keychains/System.keychain 2>&1 || true'
+    ) in signing_setup
+    assert (
+        'security find-identity -v -p codesigning '
+        '/System/Library/Keychains/SystemRootCertificates.keychain 2>&1 || true'
     ) in signing_setup
     assert 'if [ "${system_identity_count:-0}" -ne 0 ]; then' in signing_setup
     assert 'if [ "${identity_count:-0}" -ne 1 ] || [ "${distribution_count:-0}" -ne 1 ]; then' in signing_setup
@@ -529,7 +536,10 @@ def test_archive_redaction_preserves_a_failing_xcodebuild_status(tmp_path):
 def test_workflow_diagnose_summary_has_exact_safe_boundary():
     script = _workflow_step_script("Import the distribution certificate into a temporary keychain")
     start_marker = 'if [ "${DIAGNOSE_SIGNING:-false}" = "true" ]; then\n'
-    system_guard_marker = 'system_identities="$(security find-identity -v -p codesigning /System/Library/Keychains/SystemRootCertificates.keychain'
+    system_guard_marker = (
+        'system_identities="$(\n'
+        '  security find-identity -v -p codesigning /Library/Keychains/System.keychain'
+    )
     start = script.index(start_marker)
     end = script.index(system_guard_marker, start)
     diagnostic = script[start:end]
@@ -558,7 +568,8 @@ def test_workflow_diagnose_summary_never_prints_fake_security_identity_name(tmp_
     script = _workflow_step_script("Import the distribution certificate into a temporary keychain")
     start = script.index('if [ "${DIAGNOSE_SIGNING:-false}" = "true" ]; then')
     end = script.index(
-        'system_identities="$(security find-identity -v -p codesigning /System/Library/Keychains/SystemRootCertificates.keychain',
+        'system_identities="$(\n'
+        '  security find-identity -v -p codesigning /Library/Keychains/System.keychain',
         start,
     )
     diagnostic = script[start:end]
