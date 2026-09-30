@@ -402,6 +402,15 @@ jobs:
             echo "The checked-in Apple Root CA certificate could not be imported." >&2
             exit 1
           fi
+          if ! /usr/bin/security add-trusted-cert -r trustRoot -p codeSign \
+              -k "$keychain" "$root_cert" >/dev/null 2>&1; then
+            echo "The checked-in Apple Root CA certificate could not be trusted for code signing." >&2
+            exit 1
+          fi
+          # No -d: keep this trust setting in the runner user's domain. Record
+          # only the exact certificate path so the always-run cleanup removes
+          # this setting and cannot touch unrelated trust entries.
+          echo "IOS_ROOT_TRUST_CERT=$root_cert" >> "$GITHUB_ENV"
           if ! security import "$wwdr_cert" -k "$keychain" -T /usr/bin/codesign \
               >/dev/null 2>&1; then
             echo "The checked-in Apple WWDR G3 certificate could not be imported." >&2
@@ -746,6 +755,14 @@ jobs:
         if: always()
         run: |
           set -euo pipefail
+          cleanup_status=0
+          root_cert="${IOS_ROOT_TRUST_CERT:-}"
+          if [ -n "$root_cert" ]; then
+            if ! /usr/bin/security remove-trusted-cert "$root_cert"; then
+              echo "The temporary Apple Root CA trust setting could not be removed." >&2
+              cleanup_status=1
+            fi
+          fi
           # The keychain first: it holds the distribution private key, and it
           # is the one piece of this that would still be usable tomorrow. The
           # search list is put back before the keychain is deleted so that a
@@ -780,5 +797,8 @@ jobs:
             echo "The signing keychain could not be removed. It holds the" >&2
             echo "distribution private key and this runner is not discarded." >&2
             exit 1
+          fi
+          if [ "$cleanup_status" -ne 0 ]; then
+            exit "$cleanup_status"
           fi
           echo "Signing material removed."

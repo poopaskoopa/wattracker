@@ -174,6 +174,7 @@ def test_workflow_classifies_certificate_failures_and_keeps_cleanup_unconditiona
         "missing or empty",
         "not valid base64",
         "could not be opened; check its password",
+        "could not be trusted for code signing",
         "contains no Apple Distribution identity",
         "certificate is expired",
         "team does not match APPLE_TEAM_ID",
@@ -191,6 +192,7 @@ def test_workflow_classifies_certificate_failures_and_keeps_cleanup_unconditiona
     keychain_record = workflow.index('echo "IOS_SIGNING_KEYCHAIN=$keychain" >> "$GITHUB_ENV"')
     risky_validation = workflow.index("base64 --decode")
     assert keychain_record < risky_validation
+    assert 'echo "IOS_ROOT_TRUST_CERT=$root_cert" >> "$GITHUB_ENV"' in workflow
 
 
 def test_workflow_pins_and_imports_only_the_checked_in_wwdr_g3_before_validity_check():
@@ -243,10 +245,40 @@ def test_workflow_pins_and_imports_the_checked_in_apple_root_before_validity_che
     assert workflow.count(fingerprint_comparison) == 1
     fingerprint_check = workflow.index(fingerprint_comparison)
     root_import = workflow.index('security import "$root_cert"')
+    trust_anchor_command = (
+        '/usr/bin/security add-trusted-cert -r trustRoot -p codeSign \\\n'
+        '              -k "$keychain" "$root_cert" >/dev/null 2>&1'
+    )
+    trust_anchor = workflow.index(trust_anchor_command)
+    trust_record = workflow.index('echo "IOS_ROOT_TRUST_CERT=$root_cert" >> "$GITHUB_ENV"')
     wwdr_import = workflow.index('security import "$wwdr_cert"')
     p12_import = workflow.index('security import "$p12"')
     validity_check = workflow.index('security find-identity -v -p codesigning "$keychain"')
-    assert fingerprint_check < root_import < wwdr_import < p12_import < validity_check
+    assert workflow.count(f"if ! {trust_anchor_command}") == 1
+    assert workflow.count('/usr/bin/security add-trusted-cert') == 1
+    assert '-d' not in trust_anchor_command
+    assert fingerprint_check < root_import < trust_anchor < trust_record < wwdr_import < p12_import < validity_check
+
+
+def test_workflow_removes_only_the_recorded_user_trust_after_adding_it():
+    workflow = WORKFLOW.read_text(encoding="utf-8")
+    cleanup_start = workflow.index("- name: Remove the signing material")
+    cleanup = workflow[cleanup_start:]
+    trust_add = workflow.index('/usr/bin/security add-trusted-cert')
+    trust_record = workflow.index('echo "IOS_ROOT_TRUST_CERT=$root_cert" >> "$GITHUB_ENV"')
+    trust_remove = workflow.index('/usr/bin/security remove-trusted-cert "$root_cert"', cleanup_start)
+    keychain_delete = workflow.index('security delete-keychain', cleanup_start)
+    cleanup_exit = workflow.index('exit "$cleanup_status"', cleanup_start)
+
+    assert trust_add < trust_record < trust_remove < keychain_delete < cleanup_exit
+    assert cleanup.count('/usr/bin/security remove-trusted-cert') == 1
+    assert 'if [ -n "$root_cert" ]; then' in cleanup
+    assert 'if ! /usr/bin/security remove-trusted-cert "$root_cert"; then' in cleanup
+    assert 'cleanup_status=1' in cleanup
+    assert 'if [ "$cleanup_status" -ne 0 ]; then' in cleanup
+    assert 'exit "$cleanup_status"' in cleanup
+    assert 'remove-trusted-cert "$root_cert" || true' not in cleanup
+    assert 'remove-trusted-cert "$wwdr_cert"' not in cleanup
 
 
 def test_workflow_reunlocks_and_sets_partition_list_immediately_before_archive():

@@ -379,20 +379,24 @@ Two practical notes:
    `ExportOptions.plist`.
 6. Decodes `IOS_DIST_P12_B64` into `$RUNNER_TEMP`, creates a keychain with a
    random password, verifies the pinned Apple Root CA and WWDR G3 DER files,
-   imports both public certificates and the signing certificate with `-x` (not
-   extractable), puts that keychain first in the search list, deletes the
-   temporary certificate files, and asserts an `Apple Distribution` identity
-   actually landed. The archive step then re-unlocks the job keychain and runs
-   `set-key-partition-list -S apple-tool:,apple:,codesign:` immediately before
-   `xcodebuild archive`. The generated keychain password is masked before it
-   crosses the step boundary. `OTHER_CODE_SIGN_FLAGS="--keychain …"` remains
-   deliberate: adding the trusted root fixes chain validation without widening
-   `codesign` access to the runner's other keychains. It reports missing/empty
-   secrets, invalid base64, a p12 that cannot be opened with its password, a
-   non-Apple-Distribution identity, an expired certificate, and a team mismatch
-   without printing key material. A dedicated keychain, not the runner user's
-   login keychain, because this runner is a physical machine that persists
-   between jobs.
+   imports the root, marks the fingerprint-verified root as a code-signing
+   trust anchor in the runner user's trust settings with
+   `security add-trusted-cert -r trustRoot -p codeSign -k "$keychain"` (no
+   `-d`, which would modify machine-wide admin trust), and records that exact
+   root path for cleanup. It then imports the WWDR intermediate and signing
+   certificate with `-x` (not extractable). It puts that keychain first in the
+   search list, deletes the temporary certificate files, and asserts an `Apple
+   Distribution` identity actually landed. The archive step then re-unlocks the
+   job keychain and runs `set-key-partition-list -S apple-tool:,apple:,codesign:`
+   immediately before `xcodebuild archive`. The generated keychain password is
+   masked before it crosses the step boundary. `OTHER_CODE_SIGN_FLAGS="--keychain …"` remains
+   deliberate: trusting the pinned root for code signing fixes chain validation
+   without widening `codesign` access to the runner's other keychains. It
+   reports missing/empty secrets, invalid base64, a p12 that cannot be opened
+   with its password, a non-Apple-Distribution identity, an expired
+   certificate, and a team mismatch without printing key material. A dedicated
+   keychain, not the runner user's login keychain, because this runner is a
+   physical machine that persists between jobs.
 7. `xcodebuild archive` for `generic/platform=iOS`, with **manual** signing:
    `CODE_SIGN_IDENTITY="Apple Distribution"`,
    `PROVISIONING_PROFILE_SPECIFIER="WatTracker App Store"`, and
@@ -425,13 +429,15 @@ Two practical notes:
 9. `xcrun altool --validate-app`, then `--upload-app`. Validation first because
    it is where a missing app record surfaces in seconds rather than after a
    full upload.
-10. An `if: always()` step restores the keychain search list, deletes the
-   signing keychain, and removes the API key, the templated plist, the archive,
-   the export and both DerivedData trees — and fails the job if either the
-   keychain or the key directory survives. The runner is a physical machine
-   that is not discarded between jobs, which is the whole reason that step
-   exists: a distribution private key left in a keychain there is usable by
-   every later job on the box.
+10. An `if: always()` step first removes the recorded user trust setting with
+   `security remove-trusted-cert "$root_cert"`, and fails closed if that
+   removal fails. It then restores the keychain search list, deletes the signing
+   keychain, and removes the API key, the templated plist, the archive, the
+   export and both DerivedData trees — and fails the job if either the keychain
+   or the key directory survives. The runner is a physical machine that is not
+   discarded between jobs, which is the whole reason that step exists: a
+   distribution private key or temporary trust setting left on the machine
+   would affect later jobs.
 
 **No `.ipa` is uploaded as a build artifact, on purpose.** A
 distribution-signed `.ipa` embeds `embedded.mobileprovision`, whose
