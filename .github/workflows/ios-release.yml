@@ -645,10 +645,16 @@ jobs:
           }
 
           # Make the job keychain the default only for the archive/export
-          # window, then re-unlock it immediately before archive. The pinned
-          # root and WWDR chain are in that keychain, and this partition list
-          # avoids a GUI prompt.
+          # window, re-establish the complete search list, then re-unlock it
+          # immediately before archive. The WWDR intermediate and private
+          # identity are in that keychain; the system search path supplies the
+          # trusted Apple root. This partition list avoids a GUI prompt.
           security default-keychain -d user -s "$IOS_SIGNING_KEYCHAIN"
+          security list-keychains -d user -s \
+            "$IOS_SIGNING_KEYCHAIN" \
+            login.keychain-db \
+            /Library/Keychains/System.keychain \
+            /System/Library/Keychains/SystemRootCertificates.keychain
           security unlock-keychain -p "$IOS_SIGNING_KEYCHAIN_PASSWORD" "$IOS_SIGNING_KEYCHAIN"
           security set-key-partition-list -S apple-tool:,apple:,codesign: -s \
             -k "$IOS_SIGNING_KEYCHAIN_PASSWORD" "$IOS_SIGNING_KEYCHAIN" > /dev/null
@@ -768,6 +774,11 @@ jobs:
           PERL
           }
 
+          security list-keychains -d user -s \
+            "$IOS_SIGNING_KEYCHAIN" \
+            login.keychain-db \
+            /Library/Keychains/System.keychain \
+            /System/Library/Keychains/SystemRootCertificates.keychain
           security unlock-keychain -p "$IOS_SIGNING_KEYCHAIN_PASSWORD" "$IOS_SIGNING_KEYCHAIN"
           security set-key-partition-list -S apple-tool:,apple:,codesign: -s \
             -k "$IOS_SIGNING_KEYCHAIN_PASSWORD" "$IOS_SIGNING_KEYCHAIN" > /dev/null

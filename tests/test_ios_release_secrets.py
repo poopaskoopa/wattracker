@@ -323,9 +323,15 @@ def test_workflow_reunlocks_and_sets_partition_list_immediately_before_archive()
     partition = archive.index(
         "security set-key-partition-list -S apple-tool:,apple:,codesign: -s"
     )
+    search_list = archive.index("security list-keychains -d user -s")
     xcodebuild = archive.index("archive_with_redacted_output xcodebuild archive")
     assert mask < env_record
-    assert unlock < partition < xcodebuild
+    assert search_list < unlock < partition < xcodebuild
+    archive_search_list = archive[search_list:unlock]
+    assert '"$IOS_SIGNING_KEYCHAIN"' in archive_search_list
+    assert 'login.keychain-db' in archive_search_list
+    assert '/Library/Keychains/System.keychain' in archive_search_list
+    assert '/System/Library/Keychains/SystemRootCertificates.keychain' in archive_search_list
     assert 'OTHER_CODE_SIGN_FLAGS="--keychain $IOS_SIGNING_KEYCHAIN"' not in archive
     import_start = workflow.index(
         "- name: Import the distribution certificate into a temporary keychain"
@@ -358,8 +364,14 @@ def test_export_reunlocks_and_redacts_the_xcodebuild_stream():
     partition = export.index(
         "security set-key-partition-list -S apple-tool:,apple:,codesign: -s"
     )
+    search_list = export.index("security list-keychains -d user -s")
     xcodebuild = export.index("export_with_redacted_output xcodebuild -exportArchive")
-    assert unlock < partition < xcodebuild
+    assert search_list < unlock < partition < xcodebuild
+    export_search_list = export[search_list:unlock]
+    assert '"$IOS_SIGNING_KEYCHAIN"' in export_search_list
+    assert 'login.keychain-db' in export_search_list
+    assert '/Library/Keychains/System.keychain' in export_search_list
+    assert '/System/Library/Keychains/SystemRootCertificates.keychain' in export_search_list
     assert "export IOS_CERT_CN=" in export
     assert "export IOS_CERT_LEGAL_NAME=" in export
     assert "Signing Identity:" in export

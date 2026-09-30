@@ -401,7 +401,9 @@ Two practical notes:
    asserts exactly one `Apple Distribution` identity in the job keychain. The archive step then
    re-unlocks the job keychain and runs
    `set-key-partition-list -S apple-tool:,apple:,codesign:` immediately before
-   `xcodebuild archive`; the command targets signing keys with `-s`. Immediately
+   `xcodebuild archive`; the command targets signing keys with `-s`. The
+   four-keychain search list is re-established in the archive and export steps
+   because each Actions step starts a fresh process. Immediately
    before archive, the workflow also makes the temporary keychain the user's
    default so Security.framework's non-GUI private-key path uses it. The
    previous default is captured without printing it and restored by the
