@@ -187,21 +187,16 @@ states on `main` when the PR is merge-committed. Four such commits are on
 `main` from #358 and #356 (`a04e344`, `95a6bb2`, `8d1a582`, `892b345`); if
 `git bisect` lands on one, `git bisect skip` it.
 
-1. **#406: PR #409 open, awaiting owner-side review.** The cloud settings display: "Last successful push" shows a raw
-   Unix timestamp; show a local date and time. "Queued/offline" is shown for a
-   healthy, idle sync; give distinct labels (up to date, queued N, waiting for
-   the first sync, and the existing error and retry states) from the status data
-   already present. Desktop UI only.
+1. **#420: the iOS TestFlight release.** Pass the real cloud host from the
+   `WATTRACKER_IOS_API_HOST` secret into the archive step, and refuse the
+   placeholder. Make the certificate-import step say why it failed, without
+   printing key material. Write `scripts/ios_release_secrets.py`, which the
+   OWNER runs to export their Apple Distribution identity and set the p12
+   secrets via stdin; it must never print them. After merging, dispatch the
+   no-upload test mode and report. Never push an `ios-v*` tag. Update
+   `docs/ios-testflight.md`. It needs a security review before merge.
 
-2. **#413: the iOS Calendar day view shows the planned workout.** Publish a
-   compact per-workout `profile` (step durations and FTP fractions, reusing the
-   desktop's segment→profile code; never raw ZWO) in `calendar_day`. iOS then
-   draws the power graph with Swift Charts, lists the steps ("10 min at 250 W"),
-   and gets a top-left back arrow to the month view. Decode leniently (see
-   #412), and test with a real published workout shape. The Android half is
-   taksmon's.
-
-3. **#249: rotating full-suite test flakes. Still not a local-runs job.**
+2. **#249: rotating full-suite test flakes. Still not a local-runs job.**
    Nothing has changed since the re-scope. 21 consecutive clean local full
    suites stand against zero reproductions. Both known instances came from
    **taksmon's machine**. **The next step is taksmon's log and his exact
