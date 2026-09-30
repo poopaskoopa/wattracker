@@ -339,17 +339,23 @@ jobs:
             exit 1
           fi
           chmod 600 "$cert_pem"
-          leaf_cn="$(/usr/bin/openssl x509 -in "$cert_pem" -noout -subject -nameopt RFC2253 \
-            | sed -n 's/^subject=.*CN=//p')"
-          if [ -n "$leaf_cn" ]; then
-            printf '::add-mask::%s\n' "$leaf_cn"
+          leaf_cn="$(/usr/bin/openssl x509 -in "$cert_pem" -noout -subject \
+            -nameopt sep_multiline,utf8 | sed -n 's/^ *CN=//p')"
+          leaf_legal_name="$(/usr/bin/openssl x509 -in "$cert_pem" -noout -subject \
+            -nameopt sep_multiline,utf8 | sed -n 's/^ *O=//p')"
+          cert_team="$(/usr/bin/openssl x509 -in "$cert_pem" -noout -subject \
+            -nameopt sep_multiline,utf8 | sed -n 's/^ *OU=//p')"
+          if [ -z "$leaf_cn" ] || [ -z "$leaf_legal_name" ] || [ -z "$cert_team" ]; then
+            echo "The distribution certificate subject is missing a required RDN." >&2
+            exit 1
           fi
+          printf '::add-mask::%s\n' "$leaf_cn"
+          printf '::add-mask::%s\n' "$leaf_legal_name"
+          printf '::add-mask::%s\n' "$cert_team"
           if ! /usr/bin/openssl x509 -in "$cert_pem" -checkend 0 -noout >/dev/null 2>&1; then
             echo "The distribution certificate is expired." >&2
             exit 1
           fi
-          cert_team="$(/usr/bin/openssl x509 -in "$cert_pem" -noout -subject -nameopt RFC2253 \
-            | sed 's/^subject=//' | tr ',' '\n' | sed -n 's/^OU=//p' | head -n 1)"
           if [ -z "$cert_team" ] || [ "$cert_team" != "$APPLE_TEAM_ID" ]; then
             echo "The distribution certificate team does not match APPLE_TEAM_ID." >&2
             exit 1
@@ -363,10 +369,15 @@ jobs:
             echo "The checked-in Apple WWDR G3 certificate failed fingerprint verification." >&2
             exit 1
           fi
-          wwdr_cn="$(/usr/bin/openssl x509 -inform der -in "$wwdr_cert" -noout \
-            -subject -nameopt RFC2253 | sed -n 's/^subject=.*CN=//p')"
+          wwdr_cn="$(/usr/bin/openssl x509 -inform der -in "$wwdr_cert" -noout -subject \
+            -nameopt sep_multiline,utf8 | sed -n 's/^ *CN=//p')"
+          wwdr_legal_name="$(/usr/bin/openssl x509 -inform der -in "$wwdr_cert" -noout -subject \
+            -nameopt sep_multiline,utf8 | sed -n 's/^ *O=//p')"
           if [ -n "$wwdr_cn" ]; then
             printf '::add-mask::%s\n' "$wwdr_cn"
+          fi
+          if [ -n "$wwdr_legal_name" ]; then
+            printf '::add-mask::%s\n' "$wwdr_legal_name"
           fi
           security create-keychain -p "$keychain_password" "$keychain"
           security set-keychain-settings -lut 3600 "$keychain"
@@ -494,7 +505,80 @@ jobs:
           WATTRACKER_API_HOST: ${{ secrets.WATTRACKER_IOS_API_HOST }}
         run: |
           set -euo pipefail
-          xcodebuild archive \
+          export IOS_CERT_CN="$(/usr/bin/openssl x509 \
+            -in "$RUNNER_TEMP/wattracker-ios-distribution-cert.pem" -noout -subject \
+            -nameopt sep_multiline,utf8 | sed -n 's/^ *CN=//p')"
+          export IOS_CERT_LEGAL_NAME="$(/usr/bin/openssl x509 \
+            -in "$RUNNER_TEMP/wattracker-ios-distribution-cert.pem" -noout -subject \
+            -nameopt sep_multiline,utf8 | sed -n 's/^ *O=//p')"
+          if [ -z "$IOS_CERT_CN" ] || [ -z "$IOS_CERT_LEGAL_NAME" ]; then
+            echo "The distribution certificate subject is missing a required RDN." >&2
+            exit 1
+          fi
+
+          # xcodebuild can echo the full signing identity on either stream.
+          # Keep the streams separate, redact complete identity lines, and
+          # return the child status so a failed archive cannot be hidden by
+          # the redaction process.
+          archive_with_redacted_output() {
+            /usr/bin/perl - "$@" <<'PERL'
+          use strict;
+          use warnings;
+          use IO::Select;
+          use IPC::Open3;
+          use Symbol qw(gensym);
+
+          my @redactions = grep { defined($_) && length($_) }
+              @ENV{qw(IOS_CERT_CN IOS_CERT_LEGAL_NAME APPLE_TEAM_ID)};
+
+          sub redact {
+              my ($line) = @_;
+              for my $value (@redactions) {
+                  $line =~ s/\Q$value\E/[REDACTED]/g;
+              }
+              $line =~ s/^([^\r\n]*Signing Identity:)[^\r\n]*/$1 [REDACTED]/mg;
+              return $line;
+          }
+
+          my $child_stderr = gensym();
+          my ($child_stdin, $child_stdout);
+          my $pid = open3($child_stdin, $child_stdout, $child_stderr, @ARGV);
+          close $child_stdin;
+
+          my $select = IO::Select->new($child_stdout, $child_stderr);
+          my %buffers = map { fileno($_) => '' } ($child_stdout, $child_stderr);
+          my %destinations = (
+              fileno($child_stdout) => \*STDOUT,
+              fileno($child_stderr) => \*STDERR,
+          );
+          while ($select->count) {
+              for my $handle ($select->can_read) {
+                  my $fd = fileno($handle);
+                  my $bytes = sysread($handle, my $chunk, 8192);
+                  die "xcodebuild output read failed\n" if !defined($bytes);
+                  if ($bytes == 0) {
+                      my $tail = delete $buffers{$fd};
+                      print { $destinations{$fd} } redact($tail) if length($tail);
+                      $select->remove($handle);
+                      close $handle;
+                      next;
+                  }
+                  $buffers{$fd} .= $chunk;
+                  while ($buffers{$fd} =~ s/\A(.*?\n)//s) {
+                      print { $destinations{$fd} } redact($1);
+                  }
+              }
+          }
+
+          waitpid($pid, 0);
+          my $status = $?;
+          exit 127 if $status == -1;
+          exit 128 + ($status & 127) if $status & 127;
+          exit $status >> 8;
+          PERL
+          }
+
+          archive_with_redacted_output xcodebuild archive \
             -project ios/WatTracker/WatTracker.xcodeproj \
             -scheme WatTracker \
             -configuration Release \
