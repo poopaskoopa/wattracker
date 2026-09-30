@@ -244,10 +244,8 @@ def test_workflow_pins_and_imports_the_checked_in_apple_root_before_validity_che
     fingerprint_comparison = 'if [ "$root_actual_sha256" != "$root_expected_sha256" ]; then'
     assert workflow.count(fingerprint_comparison) == 1
     fingerprint_check = workflow.index(fingerprint_comparison)
-    root_import = workflow.index(
-        'security add-trusted-cert -r trustRoot -p codeSign'
-    )
-    assert 'security import "$root_cert"' not in workflow
+    root_import = workflow.index('security import "$root_cert"')
+    assert 'add-trusted-cert' not in workflow
     wwdr_import = workflow.index('security import "$wwdr_cert"')
     p12_import = workflow.index('security import "$p12"')
     search_list = workflow.index(
@@ -257,7 +255,7 @@ def test_workflow_pins_and_imports_the_checked_in_apple_root_before_validity_che
     assert fingerprint_check < root_import < search_list < wwdr_import < p12_import < validity_check
 
 
-def test_workflow_trusts_the_pinned_root_in_the_job_keychain():
+def test_workflow_searches_the_pinned_root_in_the_job_keychain():
     workflow = WORKFLOW.read_text(encoding="utf-8")
     search_list_command = 'security list-keychains -d user -s'
     archive_start = workflow.index("- name: Archive for the App Store")
@@ -268,11 +266,8 @@ def test_workflow_trusts_the_pinned_root_in_the_job_keychain():
 
     assert signing_setup.count(search_list_command) == 1
     search_list = signing_setup.index(search_list_command)
-    root_trust = signing_setup.index(
-        'security add-trusted-cert -r trustRoot -p codeSign'
-    )
-    assert 'security import "$root_cert"' not in signing_setup
-    assert '-k "$keychain" "$root_cert"' in signing_setup[root_trust:]
+    root_import = signing_setup.index('security import "$root_cert"')
+    assert 'add-trusted-cert' not in signing_setup
     search_list_end = signing_setup.index(
         'if ! security import "$wwdr_cert"', search_list
     )
@@ -281,7 +276,7 @@ def test_workflow_trusts_the_pinned_root_in_the_job_keychain():
     assert '/System/Library/Keychains/SystemRootCertificates.keychain' in search_list_setup
     assert search_list_setup.index('"$keychain"') < search_list_setup.index('login.keychain-db')
     assert search_list_setup.index('login.keychain-db') < search_list_setup.index('/Library/Keychains/System.keychain')
-    assert root_trust < search_list
+    assert root_import < search_list
     assert 'remove-trusted-cert' not in signing_setup
     assert 'echo "IOS_ROOT_TRUST_CERT=$root_cert" >> "$GITHUB_ENV"' not in signing_setup
     assert (
