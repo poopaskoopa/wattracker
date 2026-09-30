@@ -385,8 +385,9 @@ Two practical notes:
    `/Library/Keychains/System.keychain` (system trust settings) and
    `/System/Library/Keychains/SystemRootCertificates.keychain` (built-in
    anchors), then `login.keychain-db` (the runner's normal chain store). This
-   avoids user trust-settings changes, which would require an authentication
-   dialog unavailable to the headless LaunchDaemon runner. The signing
+   uses one temporary user-domain code-signing trust setting for the pinned
+   root; the runner's `SessionCreate=true` prerequisite makes that headless
+   operation possible. Cleanup removes that exact setting. The signing
    certificate is imported with `-x` (not extractable). The workflow fails
    closed if any non-job keychain contains a signing identity. The temporary
    certificate files are deleted and the job
@@ -449,7 +450,8 @@ Two practical notes:
    keychain or the key directory survives. The runner is a physical machine
    that is not discarded between jobs, which is the whole reason that step
    exists: a distribution private key left on the machine would affect later
-   jobs. The workflow never changes trust settings.
+   jobs. The workflow removes its temporary root trust setting and never
+   changes any other trust entry.
 
 **No `.ipa` is uploaded as a build artifact, on purpose.** A
 distribution-signed `.ipa` embeds `embedded.mobileprovision`, whose

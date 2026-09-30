@@ -409,18 +409,26 @@ jobs:
             echo "The checked-in Apple Root CA certificate could not be imported." >&2
             exit 1
           fi
-          # Keep trust settings untouched: user-domain trust changes require
-          # an interactive authentication dialog, which this headless
-          # LaunchDaemon runner cannot answer. Expose the runner's normal
-          # login keychain as well as Apple's system stores for chain
-          # construction; codesign's chain builder may need an intermediate
-          # that is not in the temporary keychain. The non-job identity guard
-          # below fails closed before codesign can select a persistent key.
+          # Expose the runner's normal login keychain as well as Apple's system
+          # stores for chain construction; codesign's chain builder may need an
+          # intermediate that is not in the temporary keychain. The pinned
+          # Apple root gets a temporary user-domain code-signing trust setting
+          # below; SessionCreate=true on the LaunchDaemon makes that headless
+          # operation possible. The non-job identity guard fails closed before
+          # codesign can select a persistent key.
           security list-keychains -d user -s \
             /Library/Keychains/System.keychain \
             /System/Library/Keychains/SystemRootCertificates.keychain \
             login.keychain-db \
             "$keychain"
+          if ! /usr/bin/security add-trusted-cert -r trustRoot -p codeSign \
+              -k "$keychain" "$root_cert" >/dev/null 2>&1; then
+            echo "The checked-in Apple Root CA certificate could not be trusted for code signing." >&2
+            exit 1
+          fi
+          # Record the exact public certificate path so the always-run cleanup
+          # can remove only this temporary trust setting.
+          echo "IOS_ROOT_TRUST_CERT=$root_cert" >> "$GITHUB_ENV"
           if ! security import "$wwdr_cert" -k "$keychain" -T /usr/bin/codesign \
               >/dev/null 2>&1; then
             echo "The checked-in Apple WWDR G3 certificate could not be imported." >&2
@@ -791,6 +799,14 @@ jobs:
         if: always()
         run: |
           set -euo pipefail
+          cleanup_status=0
+          root_cert="${IOS_ROOT_TRUST_CERT:-}"
+          if [ -n "$root_cert" ]; then
+            if ! /usr/bin/security remove-trusted-cert "$root_cert" >/dev/null 2>&1; then
+              echo "The temporary Apple Root CA trust setting could not be removed." >&2
+              cleanup_status=1
+            fi
+          fi
           # The keychain first: it holds the distribution private key, and it
           # is the one piece of this that would still be usable tomorrow. The
           # search list is put back before the keychain is deleted so that a
@@ -827,6 +843,9 @@ jobs:
           if [ -n "${IOS_SIGNING_KEYCHAIN:-}" ] && [ -e "$IOS_SIGNING_KEYCHAIN" ]; then
             echo "The signing keychain could not be removed. It holds the" >&2
             echo "distribution private key and this runner is not discarded." >&2
-            exit 1
+            cleanup_status=1
+          fi
+          if [ "$cleanup_status" -ne 0 ]; then
+            exit "$cleanup_status"
           fi
           echo "Signing material removed."
