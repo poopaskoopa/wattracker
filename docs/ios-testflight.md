@@ -99,8 +99,8 @@ is App Store Connect; they are different websites for the same account.
 
    The workflow supports the documented WWDR G3 generation for Apple
    Distribution certificates. It verifies the checked-in DER certificates'
-   SHA-256 before importing the root and intermediate into the temporary job
-   keychain; it never downloads a certificate at runtime.
+   SHA-256 before importing the pinned root and intermediate into the
+   temporary job keychain; it never downloads a certificate at runtime.
    To check which generation issued an existing local leaf without printing a
    private key, inspect its issuer:
 
@@ -381,8 +381,8 @@ Two practical notes:
 6. Decodes `IOS_DIST_P12_B64` into `$RUNNER_TEMP`, creates a keychain with a
    random password, verifies the pinned Apple Root CA and WWDR G3 DER files,
    and verifies the owner's leaf against that public chain. It imports the
-   pinned WWDR intermediate and private identity into the temporary job
-   keychain. The search list contains only the disposable job keychain and
+   pinned Apple Root CA, WWDR intermediate, and private identity into the
+   temporary job keychain. The search list contains only the disposable job keychain and
    Apple's built-in root store:
    `/System/Library/Keychains/SystemRootCertificates.keychain` (built-in
    anchors). The persistent login and mutable System keychains are deliberately
@@ -390,8 +390,9 @@ Two practical notes:
    The workflow verifies the leaf against the pinned Apple Root CA and WWDR G3
    chain, then deliberately omits `OTHER_CODE_SIGN_FLAGS=--keychain`
    so nested codesign invocations can use Apple's immutable system-root store
-   without changing trust settings. The private identity remains in the disposable job
-   keychain; the workflow does not modify the runner user's trust database.
+   without changing trust settings. The private identity and pinned public chain
+   remain in the disposable job keychain; the workflow does not modify the runner
+   user's trust database.
    The runner's `SessionCreate=true` prerequisite is still required for the
    non-GUI keychain operations. The signing certificate is imported with
    `-x` (not extractable). The workflow fails closed if any non-job keychain

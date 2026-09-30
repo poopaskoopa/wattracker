@@ -409,9 +409,7 @@ jobs:
           security set-keychain-settings -lut 3600 "$keychain"
           security unlock-keychain -p "$keychain_password" "$keychain"
           # Verify the leaf against the pinned public chain before importing
-          # the private identity. Keep the pinned root as an explicit
-          # verification anchor, but let codesign use Apple's built-in root
-          # store. Do not call
+          # the private identity. Do not call
           # add-trusted-cert: that mutates the runner's user trust database and
           # can summon SecurityAgent on a headless LaunchDaemon.
           if ! security verify-cert -p codeSign \
@@ -438,11 +436,18 @@ jobs:
             echo "The checked-in Apple WWDR G3 certificate could not be imported." >&2
             exit 1
           fi
-          # Exact order matters: the complete job chain comes first, followed
-          # by the persistent login and Apple's system keychains. Without
-          # --keychain, codesign uses this search list for identity selection
-          # and chain construction, while the non-job identity guard above
-          # prevents a persistent signing key from being selected.
+          if ! security import "$root_cert" -t cert -f x509 \
+              -k "$keychain" -T /usr/bin/codesign >/dev/null 2>&1; then
+            echo "The checked-in Apple Root CA certificate could not be imported." >&2
+            exit 1
+          fi
+          # The job keychain now contains the leaf, private key, pinned WWDR,
+          # and pinned Apple Root CA. The immutable system-root store remains
+          # available as a public fallback; persistent login/System keychains
+          # remain excluded. Without --keychain, codesign uses this search list
+          # for identity selection and chain construction, while the non-job
+          # identity guard above prevents a persistent signing key from being
+          # selected.
           rm -f "$p12"
           # Assert the identity is actually there before spending ten minutes
           # on an archive that would fail at the codesign step. `grep -c`
@@ -765,14 +770,13 @@ jobs:
       #    on the runner nor carried as a secret. It has to already exist in
       #    the account - docs/ios-testflight.md has the one-time creation.
       #
-      #    The signing search list contains the job keychain first, then the
-      #    runner's login keychain and Apple's two system keychains. The import
-      #    step fails closed if any non-job keychain contains a signing
-      #    identity. The pinned root, leaf, and WWDR are in the job keychain,
-      #    and the root/WWDR/leaf chain was verified before import. Do not pass
-      #    --keychain here: the standard search path remains available for
-      #    Apple's immutable system-root store and any other public
-      #    intermediates. The non-job identity guard still prevents a
+      #    The signing search list contains the job keychain first, then
+      #    Apple's immutable system-root keychain. The import step fails
+      #    closed if any non-job keychain contains a signing identity. The
+      #    pinned root, leaf, and WWDR are in the job keychain, and the
+      #    root/WWDR/leaf chain was verified before import. Do not pass
+      #    --keychain here: the explicit search path retains the public
+      #    system-root fallback, while the non-job identity guard prevents a
       #    persistent private key from being selected.
       #    The combined signing step temporarily makes this keychain the user's default
       #    as well, because Security.framework's non-GUI signing path consults
@@ -806,8 +810,8 @@ jobs:
       # deletes it is at the bottom of the job and not immediately after the
       # archive. -exportArchive takes no build settings, so there is no
       # --keychain to pass here: it resolves the identity through the keychain
-      # search list, which the combined signing step set to the job keychain first,
-      # followed by the login and Apple's two system keychains. The job
+      # search list, which the combined signing step set to the job keychain
+      # first, followed by Apple's immutable system-root keychain. The job
       # identity guard prevents a persistent signing key from being selected.
       # ios/WatTracker/ExportOptions.plist names the same profile the
       # archive was signed with; a mismatch there re-signs with something else
