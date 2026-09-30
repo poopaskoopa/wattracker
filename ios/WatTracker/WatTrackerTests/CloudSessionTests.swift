@@ -42,6 +42,7 @@ final class CloudSessionTests: XCTestCase {
         paired: Bool = true,
         cache: MemorySnapshotCache = MemorySnapshotCache(),
         clock: TestClock = TestClock(),
+        cancelSleeps: Bool = false,
         handler: @escaping ScriptedTransport.Handler
     ) -> Harness {
         let transport = ScriptedTransport(handler: handler)
@@ -62,6 +63,8 @@ final class CloudSessionTests: XCTestCase {
                 clock: clock.reader,
                 sleep: { delay in
                     sleeps.record(delay)
+                    // The caller was cancelled while it waited.
+                    if cancelSleeps { throw CancellationError() }
                     clock.advance(delay)
                 }
             ),
@@ -813,6 +816,271 @@ final class CloudSessionTests: XCTestCase {
         let throttled = try await rig.session.load(.dashboard)
         XCTAssertEqual(throttled.source, .cache)
         XCTAssertEqual(rig.transport.requestCount, 4)
+    }
+
+    /// A page's second timeout lands two minutes after it started. A 429
+    /// that another read met in the meantime is still in force then, and the
+    /// timeout must not relabel it as a cold start's gate -- that would let
+    /// a pull to refresh send the next request seconds after the server
+    /// asked for two minutes.
+    func testAConcurrentColdStartTimeoutNeverShortensARetryAfter() async throws {
+        let clock = TestClock()
+        let gate = RequestGate()
+        let rig = harness(cache: Self.cachedDashboard(clock), clock: clock) { request, index in
+            switch request.url?.path ?? "" {
+            case "/api/v1/context/refresh":
+                return .json(CloudFixtures.refreshBody(context: "context-1"))
+            case "/api/v1/context/activities":
+                if index == 1 { throw Self.timedOut(clock) }
+                // The retry: held until the dashboard has met its 429, then
+                // it times out too (its minute is charged by the test).
+                await gate.wait()
+                throw URLError(.timedOut)
+            default:
+                return index == 3
+                    ? .refused(429, retryAfter: 120)
+                    : Self.dashboard(
+                        [CloudFixtures.profileItem(revision: 5, ftp: 245)], revision: 5
+                    )
+            }
+        }
+
+        let activities = Task { _ = try? await rig.session.load(.activities) }
+        let arrived = await gate.waitForArrival()
+        XCTAssertTrue(arrived, "the page's retry never went out")
+        clock.advance(57)  // most of the retry's minute
+
+        let refused = try await rig.session.load(.dashboard)
+        XCTAssertEqual(refused.source, .cache, "the dashboard met the 429")
+        XCTAssertEqual(rig.transport.requestCount, 4)
+        let dashboardReads = { rig.transport.requests(matching: "/api/v1/context/dashboard").count }
+        XCTAssertEqual(dashboardReads(), 1)
+
+        clock.advance(3)
+        await gate.openGate()
+        await activities.value
+        XCTAssertEqual(rig.sleeps.delays, [CloudSession.coldStartRetryDelay])
+
+        // The rider pulls: that lifts a cold start's gate, and this is not one.
+        await rig.session.retryNowIfWaking()
+        let pulled = try await rig.session.load(.dashboard)
+        XCTAssertEqual(pulled.source, .cache)
+        XCTAssertEqual(
+            rig.transport.requestCount, 4,
+            "nothing may be sent 3s into a 120s Retry-After"
+        )
+
+        clock.advance(116)  // 119s after the 429
+        _ = try await rig.session.load(.dashboard)
+        XCTAssertEqual(rig.transport.requestCount, 4)
+
+        clock.advance(2)
+        let recovered = try await rig.session.load(.dashboard)
+        XCTAssertEqual(recovered.source, .network)
+        XCTAssertEqual(dashboardReads(), 2)
+    }
+
+    /// Two-strike removal is only as safe as the gap between the strikes. A
+    /// page's cold-start timeout landing after the first strike must not
+    /// replace that gap with a liftable 10s gate: here it would have put the
+    /// second signed refresh 3s after the first 404 and unpaired the phone.
+    func testAColdStartTimeoutNeverShortensTheGapBetweenTwoRemovalStrikes() async throws {
+        let clock = TestClock()
+        let gate = RequestGate()
+        let rig = harness(clock: clock) { request, index in
+            switch request.url?.path ?? "" {
+            case "/api/v1/context/refresh":
+                return index == 0
+                    ? .json(CloudFixtures.refreshBody(context: "context-1"))
+                    : .refused(404, serverDate: clock.now)
+            default:
+                if index == 1 { throw Self.timedOut(clock) }
+                await gate.wait()
+                throw URLError(.timedOut)
+            }
+        }
+
+        // A page in flight on a valid token, its retry held.
+        let activities = Task { _ = try? await rig.session.load(.activities) }
+        let arrived = await gate.waitForArrival()
+        XCTAssertTrue(arrived, "the page's retry never went out")
+
+        // Meanwhile the token needs replacing, and the refresh is refused.
+        clock.advance(180)
+        let firstStrikeAt = clock.now
+        do {
+            _ = try await rig.session.readerContext()
+            XCTFail("a refused refresh must not mint a context")
+        } catch let failure as CloudSession.Failure {
+            guard case .server = failure else {
+                return XCTFail("expected the first strike, got \(failure)")
+            }
+        }
+        XCTAssertEqual(rig.transport.requests(matching: "/api/v1/context/refresh").count, 2)
+
+        // The page's retry times out 3s later, and the rider pulls.
+        clock.advance(3)
+        await gate.openGate()
+        await activities.value
+        await rig.session.retryNowIfWaking()
+
+        do {
+            _ = try await rig.session.readerContext()
+            XCTFail("the first strike's gap is still in force")
+        } catch let failure as CloudSession.Failure {
+            guard case .throttled = failure else {
+                return XCTFail("expected throttling, not a second strike, got \(failure)")
+            }
+        }
+        XCTAssertEqual(
+            rig.transport.requests(matching: "/api/v1/context/refresh").count, 2,
+            "no second signed refresh inside the strike gap"
+        )
+        var state = await rig.session.deviceState
+        XCTAssertEqual(state, .paired)
+        XCTAssertNotNil(rig.credentials.load())
+
+        // Past the gap the second strike is taken, at least baseBackoff/2
+        // after the first.
+        clock.advance(CloudSession.baseBackoff)
+        do {
+            _ = try await rig.session.readerContext()
+            XCTFail("a twice-refused device must not mint a context")
+        } catch let failure as CloudSession.Failure {
+            guard case .deviceRemoved = failure else {
+                return XCTFail("expected removal, got \(failure)")
+            }
+        }
+        XCTAssertGreaterThanOrEqual(
+            clock.now.timeIntervalSince(firstStrikeAt), CloudSession.baseBackoff / 2
+        )
+        state = await rig.session.deviceState
+        XCTAssertEqual(state, .removed)
+    }
+
+    /// The converse: a refusal landing while a cold start's gate is up makes
+    /// the gate the server's -- never shorter than it was, and no longer one
+    /// the rider's pull may lift.
+    func testARefusalDuringAColdStartGateNeitherShortensItNorLeavesItLiftable() async throws {
+        let clock = TestClock()
+        let gate = RequestGate()
+        let rig = harness(cache: Self.cachedDashboard(clock), clock: clock) { request, index in
+            switch request.url?.path ?? "" {
+            case "/api/v1/context/refresh":
+                return .json(CloudFixtures.refreshBody(context: "context-1"))
+            case "/api/v1/context/activities":
+                throw Self.timedOut(clock)
+            default:
+                guard index == 1 else {
+                    return Self.dashboard(
+                        [CloudFixtures.profileItem(revision: 5, ftp: 245)], revision: 5
+                    )
+                }
+                await gate.wait()
+                return .refused(429, retryAfter: 2)
+            }
+        }
+
+        // A dashboard read in flight while the activities page times out twice.
+        let dashboard = Task { _ = try? await rig.session.load(.dashboard) }
+        let arrived = await gate.waitForArrival()
+        XCTAssertTrue(arrived, "the dashboard read never went out")
+        do {
+            _ = try await rig.session.load(.activities)
+            XCTFail("nothing cached and no answer must throw")
+        } catch let failure as CloudSession.Failure {
+            guard case .waking = failure else {
+                return XCTFail("expected waking, got \(failure)")
+            }
+        }
+        XCTAssertEqual(rig.transport.requestCount, 4)
+
+        // Then the dashboard read comes back with a short Retry-After.
+        await gate.openGate()
+        await dashboard.value
+        await rig.session.retryNowIfWaking()
+        _ = try await rig.session.load(.dashboard)
+        XCTAssertEqual(rig.transport.requestCount, 4, "the pull may not lift the server's gate")
+
+        clock.advance(CloudSession.coldStartBackoff - 1)
+        _ = try await rig.session.load(.dashboard)
+        XCTAssertEqual(
+            rig.transport.requestCount, 4,
+            "a 2s Retry-After must not cut the 10s gate already in force"
+        )
+
+        clock.advance(2)
+        let recovered = try await rig.session.load(.dashboard)
+        XCTAssertEqual(recovered.source, .network)
+        XCTAssertEqual(rig.transport.requestCount, 5)
+    }
+
+    /// A dropped connection is how the ingress lets go of a request held for
+    /// a replica, but only the first request of a wake -- the refresh -- is
+    /// held that way. Later in a read it is just a dropped connection.
+    func testALostConnectionIsRetriedOnTheRefreshButNotOnAPage() async throws {
+        let clock = TestClock()
+        let rig = harness(cache: Self.cachedDashboard(clock), clock: clock) { _, index in
+            if index == 0 || index == 2 { throw URLError(.networkConnectionLost) }
+            return .json(CloudFixtures.refreshBody(context: "context-1"))
+        }
+
+        let snapshot = try await rig.session.load(.dashboard)
+        XCTAssertEqual(snapshot.source, .cache, "the page's lost connection is offline")
+        XCTAssertEqual(
+            rig.transport.requests(matching: "/api/v1/context/refresh").count, 2,
+            "the refresh's lost connection was retried"
+        )
+        XCTAssertEqual(
+            rig.transport.requests(matching: "/api/v1/context/dashboard").count, 1,
+            "the page's was not"
+        )
+        XCTAssertEqual(rig.sleeps.delays, [CloudSession.coldStartRetryDelay])
+    }
+
+    func testCancellationDuringAPageColdStartPauseIsRethrown() async throws {
+        let clock = TestClock()
+        let rig = harness(clock: clock, cancelSleeps: true) { request, _ in
+            if request.url?.path == "/api/v1/context/refresh" {
+                return .json(CloudFixtures.refreshBody(context: "context-1"))
+            }
+            throw Self.timedOut(clock)
+        }
+
+        do {
+            _ = try await rig.session.load(.dashboard)
+            XCTFail("expected cancellation")
+        } catch is CancellationError {
+            // The caller's cancellation, not a malformed response.
+        }
+        XCTAssertEqual(rig.sleeps.delays, [CloudSession.coldStartRetryDelay])
+        XCTAssertEqual(
+            rig.transport.requests(matching: "/api/v1/context/dashboard").count, 1,
+            "a cancelled pause must not resend"
+        )
+    }
+
+    func testCancellationDuringARefreshColdStartPauseIsRethrownAndLeavesNoGate() async throws {
+        let clock = TestClock()
+        let rig = harness(clock: clock, cancelSleeps: true) { request, index in
+            if index == 0 { throw Self.timedOut(clock) }
+            return request.url?.path == "/api/v1/context/refresh"
+                ? .json(CloudFixtures.refreshBody(context: "context-1"))
+                : Self.dashboard(
+                    [CloudFixtures.profileItem(revision: 5, ftp: 245)], revision: 5
+                )
+        }
+
+        do {
+            _ = try await rig.session.load(.dashboard)
+            XCTFail("expected cancellation")
+        } catch is CancellationError {
+            // Neither `.offline` nor a backoff.
+        }
+        XCTAssertEqual(rig.transport.requestCount, 1)
+
+        let next = try await rig.session.load(.dashboard)
+        XCTAssertEqual(next.source, .network, "a cancellation leaves no gate behind")
     }
 
     // MARK: - Offline

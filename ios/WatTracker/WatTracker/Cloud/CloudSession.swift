@@ -822,9 +822,11 @@ actor CloudSession: ReadSession {
             // never move this device toward `removed`, or a week in a valley
             // would unpair the rider's phone. A timeout is not even the
             // network: it is the server waking, and gets the short gate.
+            // A caller cancelled during the cold-start pause is neither the
+            // network nor the server, and must not leave a gate behind.
+            if error is CancellationError { throw error }
             if Self.isColdStart(error, firstRequest: true) {
-                noteColdStart()
-                throw Failure.waking(retryAfter: Self.coldStartBackoff)
+                throw noteColdStart()
             }
             noteFailure(retryAfter: nil)
             throw Failure.offline
@@ -962,7 +964,18 @@ actor CloudSession: ReadSession {
             // thundering herd; it just never collapses to nothing.
             delay = Double.random(in: (ceiling / 2)...ceiling)
         }
-        nextAttemptAllowedAt = clock().addingTimeInterval(delay)
+        // Never shorten a gate already in force. Only a request that was in
+        // flight when the gate went up can land here, and its answer does not
+        // repeal the earlier one: a concurrent 429 must not cut short the gap
+        // a 404 strike set before the second strike may be taken, nor the
+        // reverse. Whatever set the stronger gate, it is now not a cold
+        // start's, so the rider cannot lift it.
+        let proposed = clock().addingTimeInterval(delay)
+        if let existing = nextAttemptAllowedAt, existing > proposed {
+            nextAttemptAllowedAt = existing
+        } else {
+            nextAttemptAllowedAt = proposed
+        }
         gateIsColdStart = false
     }
 
@@ -972,9 +985,27 @@ actor CloudSession: ReadSession {
     /// server that is starting is not one that needs to be left alone for
     /// five minutes; and -- like every transport error -- no strike toward
     /// removal, since a timeout says nothing about the credential.
-    private func noteColdStart() {
-        nextAttemptAllowedAt = clock().addingTimeInterval(Self.coldStartBackoff)
-        gateIsColdStart = true
+    ///
+    /// And never weaker than a gate already in force. A collection page's
+    /// second timeout lands two minutes after it started, long after a
+    /// concurrent read may have been told `Retry-After` or a refresh may have
+    /// taken a 404 strike. Relabelling that gate as a cold start's would let
+    /// `retryNowIfWaking` lift it, so a gate that is not a cold start's is
+    /// left exactly as it is, and a cold start's is only ever extended.
+    ///
+    /// Returns what the caller should hear: the gate actually in force.
+    private func noteColdStart() -> Failure {
+        let now = clock()
+        let proposed = now.addingTimeInterval(Self.coldStartBackoff)
+        if let existing = nextAttemptAllowedAt, existing > now {
+            if gateIsColdStart {
+                nextAttemptAllowedAt = Swift.max(existing, proposed)
+            }
+        } else {
+            nextAttemptAllowedAt = proposed
+            gateIsColdStart = true
+        }
+        return gated(until: nextAttemptAllowedAt ?? proposed)
     }
 
     private func gated(until allowed: Date) -> Failure {
@@ -1103,6 +1134,7 @@ actor CloudSession: ReadSession {
         do {
             attempt = try await context(after: nil)
         } catch {
+            if error is CancellationError { throw error }
             throw classify(error)
         }
         do {
@@ -1131,9 +1163,11 @@ actor CloudSession: ReadSession {
                 throw Failure.server(retried)
             }
         } catch {
+            // Cancelled during the cold-start pause: the caller's to observe,
+            // not a malformed response.
+            if error is CancellationError { throw error }
             if Self.isColdStart(error, firstRequest: false) {
-                noteColdStart()
-                throw Failure.waking(retryAfter: Self.coldStartBackoff)
+                throw noteColdStart()
             }
             throw classify(error)
         }
