@@ -687,6 +687,23 @@ jobs:
             else
               system_and_job_codesign_status="fail:other"
             fi
+            if [ -n "$probe_identity_hash" ] && \
+                /usr/bin/codesign --force --timestamp=none \
+                  --sign "$probe_identity_hash" \
+                  --keychain "$keychain" \
+                  --keychain /System/Library/Keychains/SystemRootCertificates.keychain \
+                  "$probe_path" \
+                  > /dev/null 2> "$probe_error"; then
+              job_and_system_root_codesign_status="pass"
+            elif grep -q 'unable to build chain to self-signed root' "$probe_error"; then
+              job_and_system_root_codesign_status="fail:chain"
+            elif grep -q 'errSecInternalComponent' "$probe_error"; then
+              job_and_system_root_codesign_status="fail:internal"
+            elif grep -qi 'user interaction is not allowed' "$probe_error"; then
+              job_and_system_root_codesign_status="fail:interaction"
+            else
+              job_and_system_root_codesign_status="fail:other"
+            fi
             rm -f "$probe_path" "$probe_error"
             printf 'Diagnostic post-partition explicit codesign probe: %s\n' \
               "$explicit_codesign_status"
@@ -694,6 +711,8 @@ jobs:
               "$search_codesign_status"
             printf 'Diagnostic system-and-job codesign probe: %s\n' \
               "$system_and_job_codesign_status"
+            printf 'Diagnostic job-and-system-root codesign probe: %s\n' \
+              "$job_and_system_root_codesign_status"
           fi
 
           archive_with_redacted_output xcodebuild archive \
