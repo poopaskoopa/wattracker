@@ -98,8 +98,9 @@ is App Store Connect; they are different websites for the same account.
    identifier — the profile the release job signs with by name.
 
    The workflow supports the documented WWDR G3 generation for Apple
-   Distribution certificates. It verifies the checked-in DER certificate's
-   SHA-256 before importing it and never downloads a certificate at runtime.
+   Distribution certificates. It verifies the checked-in DER certificates'
+   SHA-256 before adding the root as a temporary code-signing trust anchor and
+   importing the intermediate; it never downloads a certificate at runtime.
    To check which generation issued an existing local leaf without printing a
    private key, inspect its issuer:
 
@@ -379,13 +380,15 @@ Two practical notes:
    `ExportOptions.plist`.
 6. Decodes `IOS_DIST_P12_B64` into `$RUNNER_TEMP`, creates a keychain with a
    random password, verifies the pinned Apple Root CA and WWDR G3 DER files,
-   and imports both into the job keychain. It puts the job keychain first,
+   adds the root to the job keychain as a temporary `codeSign` trust anchor,
+   and imports WWDR G3 there. It puts the job keychain first,
    followed by the runner's normal login keychain and Apple's system keychains:
    `login.keychain-db` (the runner's normal chain store),
    `/Library/Keychains/System.keychain` (system trust settings), and
    `/System/Library/Keychains/SystemRootCertificates.keychain` (built-in
-   anchors). This leaves Apple's implicit trust settings untouched; the
-   runner's `SessionCreate=true` prerequisite is still required for the
+   anchors). The temporary trust setting is deleted with the job keychain and
+   does not alter Apple's persistent/system trust settings. The runner's
+   `SessionCreate=true` prerequisite is still required for the
    non-GUI keychain operations. The signing certificate is imported with
    `-x` (not extractable). The workflow fails closed if any non-job keychain
    contains a signing identity. The temporary certificate files are deleted
@@ -399,9 +402,10 @@ Two practical notes:
    previous default is captured without printing it and restored by the
    unconditional cleanup. The generated keychain password is masked before it
    crosses the step boundary. The explicit four-keychain search list is used
-   for import and validation, and archive uses that same list without
-   `OTHER_CODE_SIGN_FLAGS="--keychain …"` so Apple's implicit root trust is
-   available to codesign. The non-job identity guard remains fail-closed. It reports missing/empty
+   for import and validation, and archive uses the explicit
+   `OTHER_CODE_SIGN_FLAGS="--keychain …"` restriction because the temporary
+   keychain now contains the trusted root and complete signing chain. The
+   non-job identity guard remains fail-closed. It reports missing/empty
    secrets, invalid base64, a p12 that cannot be opened with its password, a
    non-Apple-Distribution identity, an expired certificate, and a team mismatch
    without printing key material. A dedicated keychain, not the runner user's
@@ -410,9 +414,9 @@ Two practical notes:
 7. `xcodebuild archive` for `generic/platform=iOS`, with **manual** signing:
    `CODE_SIGN_IDENTITY="Apple Distribution"`,
    `PROVISIONING_PROFILE_SPECIFIER="WatTracker App Store"`. The archive uses
-   the four-keychain search list established in step 6; the job keychain
-   contains the pinned root, WWDR G3, and the one permitted signing identity,
-   while the system keychains provide Apple's implicit root trust.
+   the four-keychain search list established in step 6, with codesign scoped
+   to the job keychain by `OTHER_CODE_SIGN_FLAGS`; that keychain contains the
+   trusted pinned root, WWDR G3, and the one permitted signing identity.
    `-allowProvisioningUpdates` and the three `-authenticationKey*`
    flags are still there, now doing the one job they can do: registering the
    App ID and downloading that profile from the portal, so it is neither
@@ -447,7 +451,9 @@ Two practical notes:
    keychain or the key directory survives. The runner is a physical machine
    that is not discarded between jobs, which is the whole reason that step
    exists: a distribution private key left on the machine would affect later
-   jobs. The workflow never changes trust settings.
+   jobs. The workflow changes trust only inside the temporary job keychain,
+   which it deletes during cleanup; persistent/system trust settings are not
+   changed.
 
 **No `.ipa` is uploaded as a build artifact, on purpose.** A
 distribution-signed `.ipa` embeds `embedded.mobileprovision`, whose

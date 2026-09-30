@@ -404,16 +404,18 @@ jobs:
           security create-keychain -p "$keychain_password" "$keychain"
           security set-keychain-settings -lut 3600 "$keychain"
           security unlock-keychain -p "$keychain_password" "$keychain"
-          if ! security import "$root_cert" -k "$keychain" -T /usr/bin/codesign \
-              >/dev/null 2>&1; then
-            echo "The checked-in Apple Root CA certificate could not be imported." >&2
+          # Add the root directly as a temporary code-signing trust anchor.
+          # `security import` alone stores the certificate but does not make
+          # codesign accept it as the root of this chain.
+          if ! security add-trusted-cert -r trustRoot -p codeSign \
+              -k "$keychain" "$root_cert" >/dev/null 2>&1; then
+            echo "The checked-in Apple Root CA certificate could not be trusted for code signing." >&2
             exit 1
           fi
           # Put the complete job chain first, then expose the runner's normal
-          # login keychain and Apple's system stores for implicit Apple trust.
-          # codesign's chain builder may need an intermediate that is not in
-          # the temporary keychain. The non-job identity guard fails closed
-          # before codesign can select a persistent key.
+          # login keychain and Apple's system stores for any other public
+          # intermediates. The non-job identity guard fails closed before
+          # codesign can select a persistent key.
           security list-keychains -d user -s \
             "$keychain" \
             login.keychain-db \
@@ -526,8 +528,9 @@ jobs:
       #    The signing search list contains the job keychain first, then the
       #    runner's login keychain and Apple's two system keychains. The import
       #    step fails closed if any non-job keychain contains a signing
-      #    identity. We deliberately omit OTHER_CODE_SIGN_FLAGS=--keychain so
-      #    codesign can use Apple's implicit root trust from the system stores.
+      #    identity. The job keychain contains the pinned Apple Root CA as a
+      #    temporary code-signing trust anchor, so
+      #    OTHER_CODE_SIGN_FLAGS=--keychain keeps codesign scoped to it.
       #    The archive step temporarily makes this keychain the user's default
       #    as well, because Security.framework's non-GUI signing path consults
       #    that default while opening the private key. The previous default is
@@ -635,10 +638,10 @@ jobs:
           }
 
           # Make the job keychain the default only for the archive/export
-          # window, then re-unlock it immediately before archive. The imported
-          # root plus the system keychains make chain construction available;
-          # this partition list and the four-keychain search list avoid a GUI
-          # prompt.
+          # window, then re-unlock it immediately before archive. The pinned
+          # root is trusted in that keychain; the four-keychain search list
+          # supplies any other public intermediates, and this partition list
+          # avoids a GUI prompt.
           security default-keychain -d user -s "$IOS_SIGNING_KEYCHAIN"
           security unlock-keychain -p "$IOS_SIGNING_KEYCHAIN_PASSWORD" "$IOS_SIGNING_KEYCHAIN"
           security set-key-partition-list -S apple-tool:,apple:,codesign: -s \
@@ -659,6 +662,7 @@ jobs:
             CODE_SIGN_STYLE=Manual \
             CODE_SIGN_IDENTITY="Apple Distribution" \
             PROVISIONING_PROFILE_SPECIFIER="WatTracker App Store" \
+            OTHER_CODE_SIGN_FLAGS="--keychain $IOS_SIGNING_KEYCHAIN" \
             CODE_SIGNING_REQUIRED=YES \
             CODE_SIGNING_ALLOWED=YES \
             WATTRACKER_API_SCHEME="$WATTRACKER_API_SCHEME" \
