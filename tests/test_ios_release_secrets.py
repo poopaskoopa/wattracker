@@ -192,7 +192,7 @@ def test_workflow_classifies_certificate_failures_and_keeps_cleanup_unconditiona
     keychain_record = workflow.index('echo "IOS_SIGNING_KEYCHAIN=$keychain" >> "$GITHUB_ENV"')
     risky_validation = workflow.index("base64 --decode")
     assert keychain_record < risky_validation
-    assert 'echo "IOS_ROOT_TRUST_CERT=$root_cert" >> "$GITHUB_ENV"' in workflow
+    assert 'echo "IOS_ROOT_TRUST_CERT=$root_cert" >> "$GITHUB_ENV"' not in workflow
 
 
 def test_workflow_pins_and_imports_only_the_checked_in_wwdr_g3_before_validity_check():
@@ -250,14 +250,11 @@ def test_workflow_pins_and_imports_the_checked_in_apple_root_before_validity_che
     search_list = workflow.index(
         'security list-keychains -d user -s'
     )
-    trust_root = workflow.index(
-        '/usr/bin/security add-trusted-cert -r trustRoot -p codeSign'
-    )
     validity_check = workflow.index('security find-identity -v -p codesigning "$keychain"')
-    assert fingerprint_check < root_import < search_list < trust_root < wwdr_import < p12_import < validity_check
+    assert fingerprint_check < root_import < search_list < wwdr_import < p12_import < validity_check
 
 
-def test_workflow_uses_system_roots_and_temporary_root_trust():
+def test_workflow_uses_system_roots_without_mutating_trust_settings():
     workflow = WORKFLOW.read_text(encoding="utf-8")
     search_list_command = 'security list-keychains -d user -s'
     archive_start = workflow.index("- name: Archive for the App Store")
@@ -274,12 +271,11 @@ def test_workflow_uses_system_roots_and_temporary_root_trust():
     search_list_setup = signing_setup[search_list:search_list_end]
     assert '/Library/Keychains/System.keychain' in search_list_setup
     assert '/System/Library/Keychains/SystemRootCertificates.keychain' in search_list_setup
-    assert search_list_setup.index('/Library/Keychains/System.keychain') < search_list_setup.index('login.keychain-db')
-    assert search_list_setup.index('login.keychain-db') < search_list_setup.index('"$keychain"')
-    assert '/usr/bin/security add-trusted-cert -r trustRoot -p codeSign' in signing_setup
-    assert '"$root_cert" >/dev/null 2>&1' in signing_setup
+    assert search_list_setup.index('"$keychain"') < search_list_setup.index('login.keychain-db')
+    assert search_list_setup.index('login.keychain-db') < search_list_setup.index('/Library/Keychains/System.keychain')
+    assert 'add-trusted-cert' not in signing_setup
     assert 'remove-trusted-cert' not in signing_setup
-    assert 'echo "IOS_ROOT_TRUST_CERT=$root_cert" >> "$GITHUB_ENV"' in signing_setup
+    assert 'echo "IOS_ROOT_TRUST_CERT=$root_cert" >> "$GITHUB_ENV"' not in signing_setup
     assert (
         'security find-identity -v -p codesigning /Library/Keychains/System.keychain 2>&1 || true'
     ) in signing_setup
@@ -294,7 +290,7 @@ def test_workflow_uses_system_roots_and_temporary_root_trust():
     assert 'if [ "${identity_count:-0}" -ne 1 ] || [ "${distribution_count:-0}" -ne 1 ]; then' in signing_setup
 
 
-def test_workflow_keeps_keychain_cleanup_unconditional_with_trust_cleanup():
+def test_workflow_keeps_keychain_cleanup_unconditional_without_trust_cleanup():
     workflow = WORKFLOW.read_text(encoding="utf-8")
     cleanup_start = workflow.index("- name: Remove the signing material")
     cleanup = workflow[cleanup_start:]
@@ -302,8 +298,8 @@ def test_workflow_keeps_keychain_cleanup_unconditional_with_trust_cleanup():
 
     assert "if: always()" in cleanup
     assert 'security list-keychains -d user -s login.keychain-db || true' in cleanup
-    assert '/usr/bin/security remove-trusted-cert "$root_cert"' in cleanup
-    assert 'cleanup_status=0' in cleanup
+    assert "add-trusted-cert" not in cleanup
+    assert "remove-trusted-cert" not in cleanup
     assert keychain_delete < cleanup.index('rm -f "$RUNNER_TEMP/wattracker-ios-signing.p12"')
     assert 'security default-keychain -d user -s "$IOS_ORIGINAL_DEFAULT_KEYCHAIN" || true' in cleanup
 
@@ -325,7 +321,7 @@ def test_workflow_reunlocks_and_sets_partition_list_immediately_before_archive()
     xcodebuild = archive.index("archive_with_redacted_output xcodebuild archive")
     assert mask < env_record
     assert unlock < partition < xcodebuild
-    assert 'OTHER_CODE_SIGN_FLAGS="--keychain $IOS_SIGNING_KEYCHAIN"' in archive
+    assert 'OTHER_CODE_SIGN_FLAGS="--keychain $IOS_SIGNING_KEYCHAIN"' not in archive
     import_start = workflow.index(
         "- name: Import the distribution certificate into a temporary keychain"
     )
