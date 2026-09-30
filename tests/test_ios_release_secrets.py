@@ -248,7 +248,7 @@ def test_workflow_pins_and_imports_the_checked_in_apple_root_before_validity_che
     wwdr_import = workflow.index('security import "$wwdr_cert"')
     p12_import = workflow.index('security import "$p12"')
     search_list = workflow.index(
-        'security list-keychains -d user -s "$keychain"'
+        'security list-keychains -d user -s'
     )
     validity_check = workflow.index('security find-identity -v -p codesigning "$keychain"')
     assert fingerprint_check < root_import < search_list < wwdr_import < p12_import < validity_check
@@ -256,7 +256,7 @@ def test_workflow_pins_and_imports_the_checked_in_apple_root_before_validity_che
 
 def test_workflow_uses_system_roots_without_mutating_trust_settings():
     workflow = WORKFLOW.read_text(encoding="utf-8")
-    search_list_command = 'security list-keychains -d user -s "$keychain"'
+    search_list_command = 'security list-keychains -d user -s'
     archive_start = workflow.index("- name: Archive for the App Store")
     import_start = workflow.index(
         "- name: Import the distribution certificate into a temporary keychain"
@@ -271,6 +271,7 @@ def test_workflow_uses_system_roots_without_mutating_trust_settings():
     search_list_setup = signing_setup[search_list:search_list_end]
     assert '/Library/Keychains/System.keychain' in search_list_setup
     assert '/System/Library/Keychains/SystemRootCertificates.keychain' in search_list_setup
+    assert search_list_setup.index('/Library/Keychains/System.keychain') < search_list_setup.index('"$keychain"')
     assert "login.keychain-db" not in signing_setup
     assert "add-trusted-cert" not in signing_setup
     assert "remove-trusted-cert" not in signing_setup

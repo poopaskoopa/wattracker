@@ -379,8 +379,8 @@ Two practical notes:
    `ExportOptions.plist`.
 6. Decodes `IOS_DIST_P12_B64` into `$RUNNER_TEMP`, creates a keychain with a
    random password, verifies the pinned Apple Root CA and WWDR G3 DER files,
-   and imports both into the job keychain. It puts that keychain first in the
-   search list, followed only by Apple's system keychains:
+   and imports both into the job keychain. It puts Apple's system keychains
+   first in the search list, followed by the job keychain:
    `/Library/Keychains/System.keychain` (system trust settings) and
    `/System/Library/Keychains/SystemRootCertificates.keychain` (built-in
    anchors). This avoids both the persistent login keychain and user
@@ -407,9 +407,9 @@ Two practical notes:
 7. `xcodebuild archive` for `generic/platform=iOS`, with **manual** signing:
    `CODE_SIGN_IDENTITY="Apple Distribution"`,
    `PROVISIONING_PROFILE_SPECIFIER="WatTracker App Store"`. The archive uses
-   the three-keychain search list established in step 6; the job keychain is
-   first and the two system keychains are present only for Apple's trusted
-   chain.
+   the three-keychain search list established in step 6; the two system
+   keychains are first for Apple's trusted chain and the job keychain supplies
+   the one permitted signing identity.
    `-allowProvisioningUpdates` and the three `-authenticationKey*`
    flags are still there, now doing the one job they can do: registering the
    App ID and downloading that profile from the portal, so it is neither
