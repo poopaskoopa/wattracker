@@ -215,7 +215,7 @@ def test_workflow_pins_and_imports_only_the_checked_in_wwdr_g3_before_validity_c
     assert fingerprint_check < intermediate_import < p12_import < validity_check
 
 
-def test_workflow_pins_and_imports_the_checked_in_apple_root_before_validity_check():
+def test_workflow_pins_and_verifies_the_checked_in_apple_root_before_validity_check():
     workflow = WORKFLOW.read_text(encoding="utf-8")
     assert ROOT_CERT.is_file()
     assert hashlib.sha256(ROOT_CERT.read_bytes()).hexdigest() == APPLE_ROOT_CA_SHA256
@@ -244,8 +244,8 @@ def test_workflow_pins_and_imports_the_checked_in_apple_root_before_validity_che
     fingerprint_comparison = 'if [ "$root_actual_sha256" != "$root_expected_sha256" ]; then'
     assert workflow.count(fingerprint_comparison) == 1
     fingerprint_check = workflow.index(fingerprint_comparison)
-    root_import = workflow.index(
-        'security import "$root_cert" -t cert -f x509'
+    root_verification = workflow.index(
+        'security verify-cert -p codeSign'
     )
     wwdr_import = workflow.index('security import "$wwdr_cert"')
     p12_import = workflow.index('security import "$p12"')
@@ -253,10 +253,11 @@ def test_workflow_pins_and_imports_the_checked_in_apple_root_before_validity_che
         'security list-keychains -d user -s'
     )
     validity_check = workflow.index('security find-identity -v -p codesigning "$keychain"')
-    assert fingerprint_check < root_import < search_list < wwdr_import < p12_import < validity_check
+    assert fingerprint_check < root_verification < search_list < wwdr_import < p12_import < validity_check
+    assert 'security import "$root_cert"' not in workflow
 
 
-def test_workflow_searches_the_pinned_root_in_the_job_keychain():
+def test_workflow_uses_the_system_root_store_without_a_job_keychain_restriction():
     workflow = WORKFLOW.read_text(encoding="utf-8")
     search_list_command = 'security list-keychains -d user -s'
     archive_start = workflow.index("- name: Archive for the App Store")
@@ -267,9 +268,6 @@ def test_workflow_searches_the_pinned_root_in_the_job_keychain():
 
     assert signing_setup.count(search_list_command) == 1
     search_list = signing_setup.index(search_list_command)
-    root_import = signing_setup.index(
-        'security import "$root_cert" -t cert -f x509'
-    )
     search_list_end = signing_setup.index(
         'if ! security import "$wwdr_cert"', search_list
     )
@@ -278,7 +276,8 @@ def test_workflow_searches_the_pinned_root_in_the_job_keychain():
     assert '/System/Library/Keychains/SystemRootCertificates.keychain' in search_list_setup
     assert search_list_setup.index('"$keychain"') < search_list_setup.index('login.keychain-db')
     assert search_list_setup.index('login.keychain-db') < search_list_setup.index('/Library/Keychains/System.keychain')
-    assert root_import < search_list
+    assert 'security verify-cert -p codeSign' in signing_setup
+    assert signing_setup.index('security verify-cert -p codeSign') < search_list
     assert 'remove-trusted-cert' not in signing_setup
     assert 'security add-trusted-cert' not in signing_setup
     assert 'trust-settings-' not in signing_setup
@@ -327,11 +326,7 @@ def test_workflow_reunlocks_and_sets_partition_list_immediately_before_archive()
     xcodebuild = archive.index("archive_with_redacted_output xcodebuild archive")
     assert mask < env_record
     assert unlock < partition < xcodebuild
-    assert 'OTHER_CODE_SIGN_FLAGS="--keychain $IOS_SIGNING_KEYCHAIN"' in archive
-    root_import = workflow.index(
-        'security import "$root_cert" -t cert -f x509'
-    )
-    assert root_import < workflow.index('OTHER_CODE_SIGN_FLAGS="--keychain $IOS_SIGNING_KEYCHAIN"')
+    assert 'OTHER_CODE_SIGN_FLAGS="--keychain $IOS_SIGNING_KEYCHAIN"' not in archive
     import_start = workflow.index(
         "- name: Import the distribution certificate into a temporary keychain"
     )
