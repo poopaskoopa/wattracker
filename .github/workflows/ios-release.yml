@@ -510,6 +510,28 @@ jobs:
             else
               search_chain_status="fail"
             fi
+            probe_identity_hash="$(printf '%s\n' "$valid_identity_output" \
+              | sed -n 's/^[[:space:]]*[0-9]*) \([0-9A-Fa-f]\{40\}\) .*/\1/p' \
+              | head -n 1)"
+            probe_path="$RUNNER_TEMP/wattracker-codesign-probe"
+            : > "$probe_path"
+            if [ -n "$probe_identity_hash" ] && \
+                /usr/bin/codesign --force --timestamp=none \
+                  --sign "$probe_identity_hash" --keychain "$keychain" \
+                  "$probe_path" >/dev/null 2>&1; then
+              explicit_codesign_status="pass"
+            else
+              explicit_codesign_status="fail"
+            fi
+            if [ -n "$probe_identity_hash" ] && \
+                /usr/bin/codesign --force --timestamp=none \
+                  --sign "$probe_identity_hash" "$probe_path" \
+                  >/dev/null 2>&1; then
+              search_codesign_status="pass"
+            else
+              search_codesign_status="fail"
+            fi
+            rm -f "$probe_path"
             printf 'Diagnostic valid identity count: %s\n' "$valid_identity_count"
             printf 'Diagnostic all identity count: %s\n' "$all_identity_count"
             printf 'Diagnostic CSSMERR status count: %s\n' "$status_count"
@@ -519,6 +541,8 @@ jobs:
             printf 'Diagnostic leaf issuer matches pinned WWDR: %s\n' "$issuer_match"
             printf 'Diagnostic job-only code-sign chain: %s\n' "$job_chain_status"
             printf 'Diagnostic full-search code-sign chain: %s\n' "$search_chain_status"
+            printf 'Diagnostic explicit codesign probe: %s\n' "$explicit_codesign_status"
+            printf 'Diagnostic search-list codesign probe: %s\n' "$search_codesign_status"
             if [ -n "$status_codes" ]; then
               printf '%s\n' "$status_codes" | while IFS= read -r status; do
                 printf 'Diagnostic CSSMERR status: %s\n' "$status"

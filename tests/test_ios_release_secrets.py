@@ -711,12 +711,14 @@ def test_workflow_diagnose_summary_has_exact_safe_boundary():
         "Diagnostic leaf issuer matches pinned WWDR:",
         "Diagnostic job-only code-sign chain:",
         "Diagnostic full-search code-sign chain:",
+        "Diagnostic explicit codesign probe:",
+        "Diagnostic search-list codesign probe:",
         "Diagnostic CSSMERR status:",
         "Diagnostic certificate type:",
         "Diagnostic certificate expiry:",
     ):
         assert summary in diagnostic
-    assert diagnostic.count("printf 'Diagnostic ") == 14
+    assert diagnostic.count("printf 'Diagnostic ") == 16
     for forbidden in ('"labl"', '"subj"', "-fingerprint", "-sha1"):
         assert forbidden not in diagnostic
 
@@ -753,6 +755,7 @@ def test_workflow_diagnose_summary_never_prints_fake_security_identity_name(tmp_
         {
             "PATH": f"{tmp_path}:{environment['PATH']}",
             "DIAGNOSE_SIGNING": "true",
+            "RUNNER_TEMP": str(tmp_path),
         }
     )
     result = subprocess.run(
