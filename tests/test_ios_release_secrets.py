@@ -708,12 +708,15 @@ def test_workflow_diagnose_summary_has_exact_safe_boundary():
         "Diagnostic job Apple Root CA certificate count:",
         "Diagnostic job Apple WWDR G3 certificate count:",
         "Diagnostic system Apple Root CA certificate count:",
+        "Diagnostic leaf issuer matches pinned WWDR:",
+        "Diagnostic job-only code-sign chain:",
+        "Diagnostic full-search code-sign chain:",
         "Diagnostic CSSMERR status:",
         "Diagnostic certificate type:",
         "Diagnostic certificate expiry:",
     ):
         assert summary in diagnostic
-    assert diagnostic.count("printf 'Diagnostic ") == 11
+    assert diagnostic.count("printf 'Diagnostic ") == 14
     for forbidden in ('"labl"', '"subj"', "-fingerprint", "-sha1"):
         assert forbidden not in diagnostic
 
