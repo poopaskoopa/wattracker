@@ -41,6 +41,12 @@ _IDENTITY_RE = re.compile(
 )
 
 
+# Any numbered identity row, parsed or not. A temp-keychain scan must refuse a
+# row it cannot fully parse rather than skip it: a skipped identity is never
+# deleted, so it would ride along into the exported p12.
+_NUMBERED_ROW_RE = re.compile(r"^\s*\d+\)\s")
+
+
 class SecretSetupError(RuntimeError):
     """A safe, user-facing error that never contains a secret value."""
 
@@ -130,6 +136,11 @@ def _find_identities(
     fingerprints: set[str] = set()
     for line in raw.splitlines():
         match = _IDENTITY_RE.match(line)
+        if match is None and not apple_distribution_only and _NUMBERED_ROW_RE.match(line):
+            raise SecretSetupError(
+                "the temporary keychain lists an identity this script cannot parse; "
+                "refusing to export"
+            )
         if match and (
             not apple_distribution_only or "Apple Distribution" in match.group("label")
         ):

@@ -443,3 +443,22 @@ def test_helper_rejects_unsafe_hosts(host):
 
 def test_helper_accepts_a_realistic_host_without_printing_it():
     assert helper.validate_host("api.prod.example.test") == "api.prod.example.test"
+
+
+def test_helper_refuses_an_unparseable_identity_row_in_the_temporary_keychain(tmp_path):
+    """A temp-keychain identity the parser cannot read must stop the export.
+
+    Skipping it would leave it undeleted, so it would ride along in the p12;
+    the private-key count is a second line of defence, not the only one.
+    """
+    runner = FakeRunner(
+        temporary_identities=(
+            ("A" * 40, "Apple Distribution: First Rider (TEAMONE)", ""),
+            ("B" * 40, "Developer ID Application: Other Rider (TEAMTWO)", "SOME_OTHER_STATUS"),
+        ),
+    )
+
+    with pytest.raises(helper.SecretSetupError, match="cannot parse"):
+        helper.install_secrets(runner=runner, input_fn=lambda prompt: "1", host_config=tmp_path / "missing")
+
+    assert len([path for path in runner.export_paths if path.name == "distribution.p12"]) == 0
