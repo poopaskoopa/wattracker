@@ -244,24 +244,16 @@ def test_workflow_pins_and_imports_the_checked_in_apple_root_before_validity_che
     fingerprint_comparison = 'if [ "$root_actual_sha256" != "$root_expected_sha256" ]; then'
     assert workflow.count(fingerprint_comparison) == 1
     fingerprint_check = workflow.index(fingerprint_comparison)
-    trust_snapshot = workflow.index(
-        'security trust-settings-export "$trust_settings_original"'
+    root_import = workflow.index(
+        'security import "$root_cert" -t cert -f x509'
     )
-    root_trust = workflow.index(
-        'security add-trusted-cert -r trustRoot -p codeSign'
-    )
-    trust_install = workflow.index(
-        'security trust-settings-import "$trust_settings_updated"'
-    )
-    assert 'security import "$root_cert"' not in workflow
     wwdr_import = workflow.index('security import "$wwdr_cert"')
     p12_import = workflow.index('security import "$p12"')
     search_list = workflow.index(
         'security list-keychains -d user -s'
     )
     validity_check = workflow.index('security find-identity -v -p codesigning "$keychain"')
-    assert fingerprint_check < trust_snapshot < root_trust < trust_install
-    assert trust_install < search_list < wwdr_import < p12_import < validity_check
+    assert fingerprint_check < root_import < search_list < wwdr_import < p12_import < validity_check
 
 
 def test_workflow_searches_the_pinned_root_in_the_job_keychain():
@@ -275,18 +267,9 @@ def test_workflow_searches_the_pinned_root_in_the_job_keychain():
 
     assert signing_setup.count(search_list_command) == 1
     search_list = signing_setup.index(search_list_command)
-    trust_snapshot = signing_setup.index(
-        'security trust-settings-export "$trust_settings_original"'
+    root_import = signing_setup.index(
+        'security import "$root_cert" -t cert -f x509'
     )
-    root_trust = signing_setup.index(
-        'security add-trusted-cert -r trustRoot -p codeSign'
-    )
-    trust_install = signing_setup.index(
-        'security trust-settings-import "$trust_settings_updated"'
-    )
-    assert 'security import "$root_cert"' not in signing_setup
-    assert '-k "$keychain" -i "$trust_settings_original"' in signing_setup[root_trust:]
-    assert '-o "$trust_settings_updated" "$root_cert"' in signing_setup[root_trust:]
     search_list_end = signing_setup.index(
         'if ! security import "$wwdr_cert"', search_list
     )
@@ -295,9 +278,10 @@ def test_workflow_searches_the_pinned_root_in_the_job_keychain():
     assert '/System/Library/Keychains/SystemRootCertificates.keychain' in search_list_setup
     assert search_list_setup.index('"$keychain"') < search_list_setup.index('login.keychain-db')
     assert search_list_setup.index('login.keychain-db') < search_list_setup.index('/Library/Keychains/System.keychain')
-    assert trust_snapshot < root_trust < trust_install < search_list
+    assert root_import < search_list
     assert 'remove-trusted-cert' not in signing_setup
-    assert 'echo "IOS_ROOT_TRUST_CERT=$root_cert" >> "$GITHUB_ENV"' not in signing_setup
+    assert 'security add-trusted-cert' not in signing_setup
+    assert 'trust-settings-' not in signing_setup
     assert (
         'security find-identity -v -p codesigning /Library/Keychains/System.keychain 2>&1 || true'
     ) in signing_setup
@@ -312,7 +296,7 @@ def test_workflow_searches_the_pinned_root_in_the_job_keychain():
     assert 'if [ "${identity_count:-0}" -ne 1 ] || [ "${distribution_count:-0}" -ne 1 ]; then' in signing_setup
 
 
-def test_workflow_restores_trust_settings_and_keychain_cleanup_unconditionally():
+def test_workflow_restores_keychain_state_and_cleanup_unconditionally():
     workflow = WORKFLOW.read_text(encoding="utf-8")
     cleanup_start = workflow.index("- name: Remove the signing material")
     cleanup = workflow[cleanup_start:]
@@ -322,11 +306,6 @@ def test_workflow_restores_trust_settings_and_keychain_cleanup_unconditionally()
     assert 'security list-keychains -d user -s login.keychain-db || true' in cleanup
     assert "add-trusted-cert" not in cleanup
     assert "remove-trusted-cert" not in cleanup
-    trust_restore = cleanup.index(
-        'security trust-settings-import "$IOS_TRUST_SETTINGS_ORIGINAL" || true'
-    )
-    assert trust_restore < keychain_delete
-    assert 'rm -f "${IOS_TRUST_SETTINGS_ORIGINAL:-}" "${IOS_TRUST_SETTINGS_UPDATED:-}" || true' in cleanup
     assert keychain_delete < cleanup.index('rm -f "$RUNNER_TEMP/wattracker-ios-signing.p12"')
     assert 'security default-keychain -d user -s "$IOS_ORIGINAL_DEFAULT_KEYCHAIN" || true' in cleanup
 
@@ -348,7 +327,7 @@ def test_workflow_reunlocks_and_sets_partition_list_immediately_before_archive()
     xcodebuild = archive.index("archive_with_redacted_output xcodebuild archive")
     assert mask < env_record
     assert unlock < partition < xcodebuild
-    assert 'OTHER_CODE_SIGN_FLAGS="--keychain $IOS_SIGNING_KEYCHAIN"' in archive
+    assert 'OTHER_CODE_SIGN_FLAGS="--keychain $IOS_SIGNING_KEYCHAIN"' not in archive
     import_start = workflow.index(
         "- name: Import the distribution certificate into a temporary keychain"
     )
@@ -363,6 +342,28 @@ def test_workflow_reunlocks_and_sets_partition_list_immediately_before_archive()
 def _archive_script() -> str:
     script = _workflow_step_script("Archive for the App Store")
     return script[script.index('export IOS_CERT_CN='):]
+
+
+def _export_script() -> str:
+    script = _workflow_step_script("Export the signed .ipa")
+    return script[script.index('export IOS_CERT_CN='):]
+
+
+def test_export_reunlocks_and_redacts_the_xcodebuild_stream():
+    workflow = WORKFLOW.read_text(encoding="utf-8")
+    export_start = workflow.index("- name: Export the signed .ipa")
+    export = workflow[export_start:]
+    unlock = export.index(
+        'security unlock-keychain -p "$IOS_SIGNING_KEYCHAIN_PASSWORD" "$IOS_SIGNING_KEYCHAIN"'
+    )
+    partition = export.index(
+        "security set-key-partition-list -S apple-tool:,apple:,codesign: -s"
+    )
+    xcodebuild = export.index("export_with_redacted_output xcodebuild -exportArchive")
+    assert unlock < partition < xcodebuild
+    assert "export IOS_CERT_CN=" in export
+    assert "export IOS_CERT_LEGAL_NAME=" in export
+    assert "Signing Identity:" in export
 
 
 def test_workflow_masks_leaf_and_wwdr_common_names_before_diagnostics():
@@ -572,6 +573,88 @@ def test_archive_redaction_preserves_a_failing_xcodebuild_status(tmp_path):
     assert result.returncode == 37
     assert "Sentinel Legal Name" not in result.stdout
     assert "Sentinel Legal Name" not in result.stderr
+
+
+def test_export_redaction_masks_apple_ordered_identity_lines(tmp_path):
+    script = _export_script()
+    sentinel_cn = "Apple Distribution: Sentinel Legal Name (TEAM-SENTINEL)"
+    sentinel_o = "Sentinel Legal Name"
+    cert_pem = tmp_path / "wattracker-ios-distribution-cert.pem"
+    key_pem = tmp_path / "sentinel-key.pem"
+    subprocess.run(
+        [
+            "/usr/bin/openssl",
+            "req",
+            "-x509",
+            "-newkey",
+            "rsa:2048",
+            "-nodes",
+            "-days",
+            "30",
+            "-subj",
+            f"/UID=sentinel-uid/CN={sentinel_cn}/OU=TEAM-SENTINEL/O={sentinel_o}/C=US",
+            "-keyout",
+            str(key_pem),
+            "-out",
+            str(cert_pem),
+        ],
+        check=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    fake_xcodebuild = tmp_path / "xcodebuild"
+    fake_xcodebuild.write_text(
+        "#!/bin/sh\n"
+        "export_path=\"\"\n"
+        "while [ \"$#\" -gt 0 ]; do\n"
+        "  if [ \"$1\" = \"-exportPath\" ]; then export_path=\"$2\"; shift 2; else shift; fi\n"
+        "done\n"
+        "mkdir -p \"$export_path\"\n"
+        ": > \"$export_path/WatTracker.ipa\"\n"
+        "printf '%s\\n' \"Signing Identity: \\\"$IOS_CERT_CN\\\"\"\n"
+        "printf '%s\\n' \"Signing Identity: \\\"$IOS_CERT_CN\\\"\" >&2\n"
+        "printf '%s\\n' \"Subject O: $IOS_CERT_LEGAL_NAME\"\n"
+        "printf '%s\\n' \"Subject O: $IOS_CERT_LEGAL_NAME\" >&2\n",
+        encoding="utf-8",
+    )
+    fake_xcodebuild.chmod(0o700)
+    fake_security = tmp_path / "security"
+    fake_security.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    fake_security.chmod(0o700)
+    github_env = tmp_path / "github-env"
+    environment = os.environ.copy()
+    environment.update(
+        {
+            "PATH": f"{tmp_path}:{environment['PATH']}",
+            "RUNNER_TEMP": str(tmp_path),
+            "IOS_SIGNING_KEYCHAIN": str(tmp_path / "signing.keychain-db"),
+            "IOS_SIGNING_KEYCHAIN_PASSWORD": "fake-keychain-password",
+            "APPLE_TEAM_ID": "TEAM-SENTINEL",
+            "ASC_KEY_PATH": str(tmp_path / "AuthKey.p8"),
+            "ASC_KEY_ID": "not-a-secret-key-id",
+            "ASC_ISSUER_ID": "not-a-secret-issuer-id",
+            "EXPORT_OPTIONS_PLIST": str(tmp_path / "ExportOptions.plist"),
+            "GITHUB_ENV": str(github_env),
+        }
+    )
+    result = subprocess.run(
+        ["/bin/bash"],
+        input=script,
+        text=True,
+        env=environment,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        check=False,
+    )
+    assert result.returncode == 0, result.stderr
+    assert sentinel_cn not in result.stdout
+    assert sentinel_cn not in result.stderr
+    assert sentinel_o not in result.stdout
+    assert sentinel_o not in result.stderr
+    assert "Signing Identity: [REDACTED]" in result.stdout
+    assert "Signing Identity: [REDACTED]" in result.stderr
+    assert "Subject O: [REDACTED]" in result.stdout
+    assert "Subject O: [REDACTED]" in result.stderr
 
 
 def test_workflow_diagnose_summary_has_exact_safe_boundary():
