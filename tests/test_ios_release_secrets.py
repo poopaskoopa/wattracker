@@ -192,7 +192,7 @@ def test_workflow_classifies_certificate_failures_and_keeps_cleanup_unconditiona
     keychain_record = workflow.index('echo "IOS_SIGNING_KEYCHAIN=$keychain" >> "$GITHUB_ENV"')
     risky_validation = workflow.index("base64 --decode")
     assert keychain_record < risky_validation
-    assert 'echo "IOS_ROOT_TRUST_CERT=$root_cert" >> "$GITHUB_ENV"' in workflow
+    assert 'echo "IOS_ROOT_TRUST_CERT=$root_cert" >> "$GITHUB_ENV"' not in workflow
 
 
 def test_workflow_pins_and_imports_only_the_checked_in_wwdr_g3_before_validity_check():
@@ -245,25 +245,20 @@ def test_workflow_pins_and_imports_the_checked_in_apple_root_before_validity_che
     assert workflow.count(fingerprint_comparison) == 1
     fingerprint_check = workflow.index(fingerprint_comparison)
     root_import = workflow.index('security import "$root_cert"')
-    trust_anchor_command = '/usr/bin/security add-trusted-cert -r trustRoot -p codeSign'
-    trust_anchor = workflow.index(trust_anchor_command)
-    trust_record = workflow.index('echo "IOS_ROOT_TRUST_CERT=$root_cert" >> "$GITHUB_ENV"')
     wwdr_import = workflow.index('security import "$wwdr_cert"')
     p12_import = workflow.index('security import "$p12"')
     search_list = workflow.index(
-        'security list-keychains -d user -s "$keychain" /Library/Keychains/System.keychain'
+        'security list-keychains -d user -s "$keychain" /System/Library/Keychains/SystemRootCertificates.keychain'
     )
     validity_check = workflow.index('security find-identity -v -p codesigning "$keychain"')
-    assert workflow.count(trust_anchor_command) == 1
-    assert '-d' not in trust_anchor_command
-    assert fingerprint_check < root_import < search_list < trust_anchor < trust_record < wwdr_import < p12_import < validity_check
+    assert fingerprint_check < root_import < search_list < wwdr_import < p12_import < validity_check
 
 
-def test_workflow_registers_root_after_search_setup_without_admin_trust():
+def test_workflow_uses_system_roots_without_mutating_trust_settings():
     workflow = WORKFLOW.read_text(encoding="utf-8")
     search_list_command = (
         'security list-keychains -d user -s "$keychain" '
-        "/Library/Keychains/System.keychain"
+        "/System/Library/Keychains/SystemRootCertificates.keychain"
     )
     archive_start = workflow.index("- name: Archive for the App Store")
     import_start = workflow.index(
@@ -271,38 +266,30 @@ def test_workflow_registers_root_after_search_setup_without_admin_trust():
     )
     signing_setup = workflow[import_start:archive_start]
 
-    trust_anchor = '/usr/bin/security add-trusted-cert -r trustRoot -p codeSign'
     assert signing_setup.count(search_list_command) == 1
     assert "login.keychain-db" not in signing_setup
-    assert signing_setup.count(trust_anchor) == 1
-    assert signing_setup.index(search_list_command) < signing_setup.index(trust_anchor)
-    trust_block_end = signing_setup.index("\n          fi", signing_setup.index(trust_anchor))
-    assert "-d" not in signing_setup[signing_setup.index(trust_anchor):trust_block_end]
-    assert '-k "$keychain" "$root_cert" >/dev/null 2>&1' in signing_setup
+    assert "add-trusted-cert" not in signing_setup
     assert "remove-trusted-cert" not in signing_setup
-    assert 'echo "IOS_ROOT_TRUST_CERT=$root_cert" >> "$GITHUB_ENV"' in signing_setup
+    assert 'echo "IOS_ROOT_TRUST_CERT=$root_cert" >> "$GITHUB_ENV"' not in signing_setup
     assert (
         'system_identities="$(security find-identity -v -p codesigning '
-        '/Library/Keychains/System.keychain 2>&1 || true)"'
+        '/System/Library/Keychains/SystemRootCertificates.keychain 2>&1 || true)"'
     ) in signing_setup
     assert 'if [ "${system_identity_count:-0}" -ne 0 ]; then' in signing_setup
     assert 'if [ "${identity_count:-0}" -ne 1 ] || [ "${distribution_count:-0}" -ne 1 ]; then' in signing_setup
 
 
-def test_workflow_removes_user_trust_before_keychain_cleanup_unconditionally():
+def test_workflow_keeps_keychain_cleanup_unconditional_without_trust_cleanup():
     workflow = WORKFLOW.read_text(encoding="utf-8")
     cleanup_start = workflow.index("- name: Remove the signing material")
     cleanup = workflow[cleanup_start:]
     keychain_delete = cleanup.index('security delete-keychain')
 
     assert "if: always()" in cleanup
-    trust_remove = cleanup.index('/usr/bin/security remove-trusted-cert "$root_cert"')
     assert 'security list-keychains -d user -s login.keychain-db || true' in cleanup
-    assert cleanup.count('/usr/bin/security remove-trusted-cert "$root_cert"') == 1
-    assert 'if [ -n "$root_cert" ]; then' in cleanup
-    assert 'cleanup_status=1' in cleanup
-    assert 'if [ "$cleanup_status" -ne 0 ]; then' in cleanup
-    assert trust_remove < keychain_delete < cleanup.index('rm -f "$RUNNER_TEMP/wattracker-ios-signing.p12"')
+    assert "add-trusted-cert" not in cleanup
+    assert "remove-trusted-cert" not in cleanup
+    assert keychain_delete < cleanup.index('rm -f "$RUNNER_TEMP/wattracker-ios-signing.p12"')
 
 
 def test_workflow_reunlocks_and_sets_partition_list_immediately_before_archive():
@@ -542,7 +529,7 @@ def test_archive_redaction_preserves_a_failing_xcodebuild_status(tmp_path):
 def test_workflow_diagnose_summary_has_exact_safe_boundary():
     script = _workflow_step_script("Import the distribution certificate into a temporary keychain")
     start_marker = 'if [ "${DIAGNOSE_SIGNING:-false}" = "true" ]; then\n'
-    system_guard_marker = 'system_identities="$(security find-identity -v -p codesigning /Library/Keychains/System.keychain'
+    system_guard_marker = 'system_identities="$(security find-identity -v -p codesigning /System/Library/Keychains/SystemRootCertificates.keychain'
     start = script.index(start_marker)
     end = script.index(system_guard_marker, start)
     diagnostic = script[start:end]
@@ -571,7 +558,7 @@ def test_workflow_diagnose_summary_never_prints_fake_security_identity_name(tmp_
     script = _workflow_step_script("Import the distribution certificate into a temporary keychain")
     start = script.index('if [ "${DIAGNOSE_SIGNING:-false}" = "true" ]; then')
     end = script.index(
-        'system_identities="$(security find-identity -v -p codesigning /Library/Keychains/System.keychain',
+        'system_identities="$(security find-identity -v -p codesigning /System/Library/Keychains/SystemRootCertificates.keychain',
         start,
     )
     diagnostic = script[start:end]

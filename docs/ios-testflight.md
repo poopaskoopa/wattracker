@@ -380,12 +380,12 @@ Two practical notes:
 6. Decodes `IOS_DIST_P12_B64` into `$RUNNER_TEMP`, creates a keychain with a
    random password, verifies the pinned Apple Root CA and WWDR G3 DER files,
    and imports both into the job keychain. It puts that keychain first in the
-   search list, followed only by `/Library/Keychains/System.keychain`, and then
-   registers the pinned root as a user-scoped code-signing anchor with
-   `security add-trusted-cert -r trustRoot -p codeSign -k "$keychain"`. The
-   search-list setup must precede that command on this headless runner. There
-   is deliberately no `-d`: admin trust is never changed. The signing
-   certificate is imported with `-x` (not extractable). The workflow fails
+   search list, followed only by Apple's trusted-root store at
+   `/System/Library/Keychains/SystemRootCertificates.keychain`. This avoids
+   both the persistent login keychain and user trust-settings changes, which
+   would require an authentication dialog unavailable to the headless
+   LaunchDaemon runner. The signing certificate is imported with `-x` (not
+   extractable). The workflow fails
    closed if the system keychain contains any signing identity, so dropping
    `OTHER_CODE_SIGN_FLAGS="--keychain …"` does not permit a different signing
    key to be selected. The temporary certificate files are deleted and the job
@@ -435,15 +435,13 @@ Two practical notes:
 9. `xcrun altool --validate-app`, then `--upload-app`. Validation first because
    it is where a missing app record surfaces in seconds rather than after a
    full upload.
-10. An `if: always()` step first removes the exact recorded user-scoped root
-   trust setting with `security remove-trusted-cert "$root_cert"`, failing
-   closed if removal fails. It then restores the keychain search list, deletes
-   the signing keychain, and removes the API key, the templated plist, the
-   archive, the export and both DerivedData trees — and fails the job if either
-   the keychain or the key directory survives. The runner is a physical
-   machine that is not discarded between jobs, which is the whole reason that
-   step exists: a distribution private key or temporary trust setting left on
-   the machine would affect later jobs.
+10. An `if: always()` step restores the keychain search list, deletes the
+   signing keychain, and removes the API key, the templated plist, the archive,
+   the export and both DerivedData trees — and fails the job if either the
+   keychain or the key directory survives. The runner is a physical machine
+   that is not discarded between jobs, which is the whole reason that step
+   exists: a distribution private key left on the machine would affect later
+   jobs. The workflow never changes trust settings.
 
 **No `.ipa` is uploaded as a build artifact, on purpose.** A
 distribution-signed `.ipa` embeds `embedded.mobileprovision`, whose
