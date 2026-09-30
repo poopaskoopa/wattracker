@@ -28,14 +28,19 @@ struct CalendarScreen: View {
 
     @ViewBuilder
     private var content: some View {
+        if model.wake.isShowing {
+            CloudWakingPanel(showingCache: model.isReady)
+        }
         switch model.state {
         case .starting:
-            CalendarStatusPanel(
-                symbol: "calendar",
-                title: "Syncing calendar…",
-                message: nil,
-                progress: true
-            )
+            if !model.wake.isShowing {
+                CalendarStatusPanel(
+                    symbol: "calendar",
+                    title: "Syncing calendar…",
+                    message: nil,
+                    progress: true
+                )
+            }
         case .unpaired:
             CalendarStatusPanel(
                 symbol: "link.badge.plus",
@@ -88,6 +93,12 @@ final class CalendarModel {
 
     private(set) var state: State = .starting
     var month = CalendarMonth.current()
+    let wake = CloudWakeNotice()
+
+    var isReady: Bool {
+        if case .ready = state { return true }
+        return false
+    }
 
     private var requestGeneration = 0
 
@@ -127,7 +138,9 @@ final class CalendarModel {
         }
 
         do {
-            let calendar = try await session.load(.calendar, month: month)
+            let calendar = try await wake.during(session) {
+                try await session.load(.calendar, month: month)
+            }
             // Linked rides are intentionally omitted from calendar_day
             // objects to avoid publishing the same activity twice. The
             // activities collection supplies those summaries when it is
@@ -196,7 +209,9 @@ final class CalendarModel {
             return
         }
         do {
-            let calendar = try await session.load(.calendar, month: selectedMonth)
+            let calendar = try await wake.during(session) {
+                try await session.load(.calendar, month: selectedMonth)
+            }
             guard generation == requestGeneration, selectedMonth == month else { return }
             var activities = session.cached(.activities)
             do {

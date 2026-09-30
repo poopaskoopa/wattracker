@@ -25,6 +25,7 @@ final class ActivitiesModel {
     private(set) var errorMessage: String?
     private(set) var isLoading = false
     var selectedID: String?
+    let wake = CloudWakeNotice()
 
     var rides: [RideSummary] {
         (snapshot?.items ?? []).compactMap(RideSummary.init(item:)).sorted {
@@ -42,7 +43,10 @@ final class ActivitiesModel {
     /// rides. The signing-key failure the old initialiser reported as
     /// `startupError` is the gate's to report now -- it never gets as far as
     /// showing this screen.
-    func refresh(session: (any ReadSession)?) async {
+    ///
+    /// `userInitiated` is pull to refresh: the rider asked, so a backoff left
+    /// by the cloud waking up is lifted rather than making them wait it out.
+    func refresh(session: (any ReadSession)?, userInitiated: Bool = false) async {
         // No session means the gate has not produced one: no credential yet,
         // or the signing key could not be read. Neither is a ride list.
         guard let session else {
@@ -67,8 +71,9 @@ final class ActivitiesModel {
         if snapshot == nil { snapshot = session.cached(.activities) }
         isLoading = true
         defer { isLoading = false }
+        if userInitiated { await session.retryNowIfWaking() }
         do {
-            snapshot = try await session.load(.activities)
+            snapshot = try await wake.during(session) { try await session.load(.activities) }
             availability = .available
             errorMessage = nil
             if selectedID == nil { selectedID = rides.first?.id }

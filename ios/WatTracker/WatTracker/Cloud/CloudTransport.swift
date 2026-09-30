@@ -44,6 +44,9 @@ struct URLSessionCloudTransport: CloudTransport {
     /// delegate queue; building one per client would throw away connection
     /// reuse on exactly the requests that benefit from it most.
     static let shared = URLSessionCloudTransport()
+    /// See `makeSession()` for why these are what they are.
+    static let requestTimeout: TimeInterval = 60
+    static let resourceTimeout: TimeInterval = 120
 
     private let session: URLSession
 
@@ -68,8 +71,17 @@ struct URLSessionCloudTransport: CloudTransport {
         // network is the cache, and it cannot show it while a request sits
         // waiting for connectivity that may not return for an hour.
         configuration.waitsForConnectivity = false
-        configuration.timeoutIntervalForRequest = 20
-        configuration.timeoutIntervalForResource = 60
+        // Sized for the read app's cold start, not for a warm server. It
+        // scales to zero when idle, and the first request after that waits
+        // 20-40s for a replica (longer after a redeploy, while the image
+        // pulls) with no bytes flowing. At the old 20s that request timed out
+        // on every wake. 60s idle is 1.5x the slow end of a normal wake; 120s
+        // total leaves room for the body after a wake that used most of it.
+        // `CloudSession` retries a timeout once, so the rider waits at most
+        // about two minutes -- with the cache on screen -- before giving up.
+        // `LocalBackend` keeps 20/60: the desktop does not scale to zero.
+        configuration.timeoutIntervalForRequest = Self.requestTimeout
+        configuration.timeoutIntervalForResource = Self.resourceTimeout
         return URLSession(configuration: configuration)
     }
 

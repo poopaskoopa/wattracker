@@ -1,3 +1,4 @@
+import Observation
 import SwiftUI
 
 /// The panel: a bordered container on the app background.
@@ -95,5 +96,76 @@ struct StubPanel: View {
                     .foregroundStyle(Palette.muted)
             }
         }
+    }
+}
+
+/// Whether a read has been in flight long enough to be the cloud waking up.
+///
+/// The cloud read app scales to zero, so the first read after an idle spell
+/// can take most of a minute. Past `threshold` a screen says so, calmly,
+/// rather than leaving a spinner that looks stuck -- and keeps whatever cached
+/// data it already has on screen underneath. Only for a session that can be
+/// asleep (`ReadSession.mayBeWaking`); the desktop is never "waking".
+@MainActor
+@Observable
+final class CloudWakeNotice {
+    static let threshold: Duration = .seconds(5)
+
+    private(set) var isShowing = false
+    @ObservationIgnored private var active = 0
+    @ObservationIgnored private var timer: Task<Void, Never>?
+
+    /// Run `read`, showing the notice if it is still running after
+    /// `threshold`. Overlapping reads keep it up until the last one ends.
+    func during<T>(
+        _ session: any ReadSession, _ read: () async throws -> T
+    ) async rethrows -> T {
+        guard session.mayBeWaking else { return try await read() }
+        active += 1
+        if timer == nil {
+            timer = Task { [weak self] in
+                try? await Task.sleep(for: Self.threshold)
+                guard !Task.isCancelled, let self, self.active > 0 else { return }
+                self.isShowing = true
+            }
+        }
+        defer {
+            active -= 1
+            if active == 0 {
+                timer?.cancel()
+                timer = nil
+                isShowing = false
+            }
+        }
+        return try await read()
+    }
+}
+
+/// What a screen shows while `CloudWakeNotice` is up.
+struct CloudWakingPanel: View {
+    /// Whether cached data is on screen below this.
+    let showingCache: Bool
+
+    var body: some View {
+        Panel {
+            HStack(alignment: .top, spacing: 12) {
+                ProgressView()
+                    .tint(Palette.accent)
+                VStack(alignment: .leading, spacing: 3) {
+                    Text("Waking up the cloud…")
+                        .font(.headline)
+                        .foregroundStyle(Palette.textBright)
+                    Text(
+                        showingCache
+                            ? "It sleeps when idle and can take up to a minute. "
+                                + "Showing your last sync meanwhile."
+                            : "It sleeps when idle and can take up to a minute."
+                    )
+                    .font(.callout)
+                    .foregroundStyle(Palette.muted)
+                }
+            }
+        }
+        .accessibilityElement(children: .combine)
     }
 }

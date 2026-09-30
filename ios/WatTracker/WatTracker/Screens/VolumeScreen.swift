@@ -19,13 +19,18 @@ struct VolumeScreen: View {
 
     @ViewBuilder
     private var content: some View {
+        if model.wake.isShowing {
+            CloudWakingPanel(showingCache: model.isReady)
+        }
         switch model.state {
         case .starting:
-            VolumeStatusPanel(
-                symbol: "arrow.triangle.2.circlepath",
-                title: "Syncing volume…",
-                showsProgress: true
-            )
+            if !model.wake.isShowing {
+                VolumeStatusPanel(
+                    symbol: "arrow.triangle.2.circlepath",
+                    title: "Syncing volume…",
+                    showsProgress: true
+                )
+            }
         case .unpaired:
             VolumeStatusPanel(
                 symbol: "link.badge.plus",
@@ -70,6 +75,12 @@ final class VolumeScreenModel {
 
     private(set) var state: State = .starting
     var selectedMetric: VolumeMetric = .hours
+    let wake = CloudWakeNotice()
+
+    var isReady: Bool {
+        if case .ready = state { return true }
+        return false
+    }
     var selectedRange: VolumeRange = .last12
 
     func start(session: (any ReadSession)?) async {
@@ -95,7 +106,7 @@ final class VolumeScreenModel {
         }
 
         do {
-            apply(try await session.load(.volume))
+            apply(try await wake.during(session) { try await session.load(.volume) })
         } catch let failure as CloudSession.Failure {
             switch failure {
             case .notPaired:
