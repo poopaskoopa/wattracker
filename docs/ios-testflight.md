@@ -381,8 +381,10 @@ Two practical notes:
 6. Decodes `IOS_DIST_P12_B64` into `$RUNNER_TEMP`, creates a keychain with a
    random password, verifies the pinned Apple Root CA and WWDR G3 DER files,
    and verifies the owner's leaf against that public chain. It imports the
-   pinned Apple Root CA, WWDR intermediate, and private identity into the
-   temporary job keychain. It
+   pinned WWDR intermediate and private identity into the temporary job
+   keychain. The pinned root is deliberately not copied into that keychain:
+   an untrusted duplicate can shadow Apple's trusted system root during
+   codesign chain building. It
    puts the job keychain first,
    followed by the runner's normal login keychain and Apple's system keychains:
    `login.keychain-db` (the runner's normal chain store),
@@ -390,8 +392,8 @@ Two practical notes:
    `/System/Library/Keychains/SystemRootCertificates.keychain` (built-in
    anchors). The workflow verifies the leaf against the pinned Apple Root CA
    and WWDR G3 chain, then deliberately omits `OTHER_CODE_SIGN_FLAGS=--keychain`
-   so nested codesign invocations can use the complete public chain without
-   changing trust settings. The private identity remains in the disposable job
+   so nested codesign invocations can use Apple's immutable system-root store
+   without changing trust settings. The private identity remains in the disposable job
    keychain; the workflow does not modify the runner user's trust database.
    The runner's `SessionCreate=true` prerequisite is still required for the
    non-GUI keychain operations. The signing certificate is imported with
@@ -421,8 +423,8 @@ Two practical notes:
    `CODE_SIGN_IDENTITY="Apple Distribution"`,
    `PROVISIONING_PROFILE_SPECIFIER="WatTracker App Store"`. The archive uses
    the four-keychain search list established in the combined step. Codesign uses the one
-   permitted identity from the job keychain and Apple's system-root store for
-   the trust anchor; no persistent private key is eligible.
+   permitted identity from the job keychain and Apple's immutable system-root
+   store for the trust anchor; no persistent private key is eligible.
    `-allowProvisioningUpdates` and the three `-authenticationKey*`
    flags are still there, now doing the one job they can do: registering the
    App ID and downloading that profile from the portal, so it is neither
