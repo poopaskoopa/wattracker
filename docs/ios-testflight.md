@@ -381,7 +381,8 @@ Two practical notes:
 6. Decodes `IOS_DIST_P12_B64` into `$RUNNER_TEMP`, creates a keychain with a
    random password, verifies the pinned Apple Root CA and WWDR G3 DER files,
    and verifies the owner's leaf against that public chain. It imports the
-   WWDR intermediate and private identity into the temporary job keychain. It
+   pinned Apple Root CA, WWDR intermediate, and private identity into the
+   temporary job keychain. It
    puts the job keychain first,
    followed by the runner's normal login keychain and Apple's system keychains:
    `login.keychain-db` (the runner's normal chain store),
@@ -389,10 +390,9 @@ Two practical notes:
    `/System/Library/Keychains/SystemRootCertificates.keychain` (built-in
    anchors). The workflow verifies the leaf against the pinned Apple Root CA
    and WWDR G3 chain, then deliberately omits `OTHER_CODE_SIGN_FLAGS=--keychain`
-   so nested codesign invocations can use Apple's immutable system-root store.
-   The private identity remains in the disposable job keychain; the workflow
-   does not modify the runner user's trust database or shadow the system root
-   with an untrusted duplicate.
+   so nested codesign invocations can use the complete public chain without
+   changing trust settings. The private identity remains in the disposable job
+   keychain; the workflow does not modify the runner user's trust database.
    The runner's `SessionCreate=true` prerequisite is still required for the
    non-GUI keychain operations. The signing certificate is imported with
    `-x` (not extractable). The workflow fails closed if any non-job keychain
