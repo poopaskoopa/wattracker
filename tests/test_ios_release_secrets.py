@@ -195,7 +195,7 @@ def test_workflow_classifies_certificate_failures_and_keeps_cleanup_unconditiona
     assert 'echo "IOS_ROOT_TRUST_CERT=$root_cert" >> "$GITHUB_ENV"' not in workflow
 
 
-def test_workflow_pins_and_imports_only_the_checked_in_wwdr_g3_before_validity_check():
+def test_workflow_pins_and_imports_the_checked_in_wwdr_g3_before_validity_check():
     workflow = WORKFLOW.read_text(encoding="utf-8")
     assert WWDR_CERT.is_file()
     assert hashlib.sha256(WWDR_CERT.read_bytes()).hexdigest() == WWDR_G3_SHA256
@@ -212,7 +212,7 @@ def test_workflow_pins_and_imports_only_the_checked_in_wwdr_g3_before_validity_c
     intermediate_import = workflow.index('security import "$wwdr_cert"')
     validity_check = workflow.index('security find-identity -v -p codesigning "$keychain"')
     p12_import = workflow.index('security import "$p12"')
-    assert fingerprint_check < intermediate_import < p12_import < validity_check
+    assert fingerprint_check < p12_import < intermediate_import < validity_check
 
 
 def test_workflow_pins_and_verifies_the_checked_in_apple_root_without_import():
@@ -251,7 +251,7 @@ def test_workflow_pins_and_verifies_the_checked_in_apple_root_without_import():
         'security list-keychains -d user -s'
     )
     validity_check = workflow.index('security find-identity -v -p codesigning "$keychain"')
-    assert fingerprint_check < root_verification < search_list < wwdr_import < p12_import < validity_check
+    assert fingerprint_check < root_verification < search_list < p12_import < wwdr_import < validity_check
     assert 'security import "$root_cert" -t cert -f x509' not in workflow
 
 

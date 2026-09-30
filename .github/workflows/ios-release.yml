@@ -427,17 +427,17 @@ jobs:
           security list-keychains -d user -s \
             "$keychain" \
             /System/Library/Keychains/SystemRootCertificates.keychain
-          if ! security import "$wwdr_cert" -k "$keychain" -T /usr/bin/codesign \
-              >/dev/null 2>&1; then
-            echo "The checked-in Apple WWDR G3 certificate could not be imported." >&2
-            exit 1
-          fi
           # -x: the imported private key is not extractable, so nothing later
           # in this job (or a later job, if the delete below ever failed) can
           # read it back out of the keychain.
           security import "$p12" -k "$keychain" \
             -P "$IOS_DIST_P12_PASSWORD" \
             -T /usr/bin/codesign -x
+          if ! security import "$wwdr_cert" -k "$keychain" -T /usr/bin/codesign \
+              >/dev/null 2>&1; then
+            echo "The checked-in Apple WWDR G3 certificate could not be imported." >&2
+            exit 1
+          fi
           # Exact order matters: the complete job chain comes first, followed
           # by the persistent login and Apple's system keychains. Without
           # --keychain, codesign uses this search list for identity selection
