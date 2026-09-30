@@ -384,13 +384,13 @@ Two practical notes:
    pinned WWDR intermediate and private identity into the temporary job
    keychain. The pinned root is deliberately not copied into that keychain:
    an untrusted duplicate can shadow Apple's trusted system root during
-   codesign chain building. It
-   puts the job keychain first,
-   followed by the runner's normal login keychain and Apple's system keychains:
-   `login.keychain-db` (the runner's normal chain store),
+   codesign chain building. The search list puts Apple's system keychains
+   first, followed by the disposable job keychain:
    `/Library/Keychains/System.keychain` (system trust settings), and
    `/System/Library/Keychains/SystemRootCertificates.keychain` (built-in
-   anchors). The workflow verifies the leaf against the pinned Apple Root CA
+   anchors). The persistent login keychain is deliberately excluded, so a
+   competing public chain cannot shadow Apple's system chain. The workflow
+   verifies the leaf against the pinned Apple Root CA
    and WWDR G3 chain, then deliberately omits `OTHER_CODE_SIGN_FLAGS=--keychain`
    so nested codesign invocations can use Apple's immutable system-root store
    without changing trust settings. The private identity remains in the disposable job
@@ -405,13 +405,13 @@ Two practical notes:
    `set-key-partition-list -S apple-tool:,apple:,codesign:` immediately before
    `xcodebuild archive`; the command targets signing keys with `-s`. Keeping
    import and archive in one Actions step preserves the same Security.framework
-   session while codesign builds the chain. The four-keychain search list is
+   session while codesign builds the chain. The three-keychain search list is
    re-established in that combined step and in export. Immediately
    before archive, the workflow also makes the temporary keychain the user's
    default so Security.framework's non-GUI private-key path uses it. The
    previous default is captured without printing it and restored by the
    unconditional cleanup. The generated keychain password is masked before it
-   crosses the step boundary. The explicit four-keychain search list is used
+   crosses the step boundary. The explicit three-keychain search list is used
    for import and validation. The non-job identity guard remains fail-closed.
    It reports missing/empty
    secrets, invalid base64, a p12 that cannot be opened with its password, a
@@ -422,7 +422,7 @@ Two practical notes:
 7. The archive in step 6 uses `generic/platform=iOS`, with **manual** signing:
    `CODE_SIGN_IDENTITY="Apple Distribution"`,
    `PROVISIONING_PROFILE_SPECIFIER="WatTracker App Store"`. The archive uses
-   the four-keychain search list established in the combined step. Codesign uses the one
+   the three-keychain search list established in the combined step. Codesign uses the one
    permitted identity from the job keychain and Apple's immutable system-root
    store for the trust anchor; no persistent private key is eligible.
    `-allowProvisioningUpdates` and the three `-authenticationKey*`

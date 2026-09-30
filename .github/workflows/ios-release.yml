@@ -426,10 +426,9 @@ jobs:
           # intermediates. The non-job identity guard fails closed before
           # codesign can select a persistent key.
           security list-keychains -d user -s \
-            "$keychain" \
-            login.keychain-db \
             /Library/Keychains/System.keychain \
-            /System/Library/Keychains/SystemRootCertificates.keychain
+            /System/Library/Keychains/SystemRootCertificates.keychain \
+            "$keychain"
           if ! security import "$wwdr_cert" -k "$keychain" -T /usr/bin/codesign \
               >/dev/null 2>&1; then
             echo "The checked-in Apple WWDR G3 certificate could not be imported." >&2
@@ -635,10 +634,9 @@ jobs:
           # guard above prevents a persistent signing key from being selected.
           security default-keychain -d user -s "$keychain"
           security list-keychains -d user -s \
-            "$keychain" \
-            login.keychain-db \
             /Library/Keychains/System.keychain \
-            /System/Library/Keychains/SystemRootCertificates.keychain
+            /System/Library/Keychains/SystemRootCertificates.keychain \
+            "$keychain"
           security unlock-keychain -p "$keychain_password" "$keychain"
           security set-key-partition-list -S apple-tool:,apple:,codesign: -s \
             -k "$keychain_password" "$keychain" > /dev/null
@@ -878,10 +876,9 @@ jobs:
           }
 
           security list-keychains -d user -s \
-            "$IOS_SIGNING_KEYCHAIN" \
-            login.keychain-db \
             /Library/Keychains/System.keychain \
-            /System/Library/Keychains/SystemRootCertificates.keychain
+            /System/Library/Keychains/SystemRootCertificates.keychain \
+            "$IOS_SIGNING_KEYCHAIN"
           security unlock-keychain -p "$IOS_SIGNING_KEYCHAIN_PASSWORD" "$IOS_SIGNING_KEYCHAIN"
           security set-key-partition-list -S apple-tool:,apple:,codesign: -s \
             -k "$IOS_SIGNING_KEYCHAIN_PASSWORD" "$IOS_SIGNING_KEYCHAIN" > /dev/null
