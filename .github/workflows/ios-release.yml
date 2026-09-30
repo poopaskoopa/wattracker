@@ -315,11 +315,11 @@ jobs:
           keychain_password="$(/usr/bin/openssl rand -hex 32)"
           p12="$RUNNER_TEMP/wattracker-ios-signing.p12"
           cert_pem="$RUNNER_TEMP/wattracker-ios-distribution-cert.pem"
-          original_default_keychain="$(security default-keychain -d user 2>/dev/null \
-            | sed -n 's/^ *"\(.*\)"$/\1/p')"
+          original_default_keychain="$(security default-keychain -d user 2>/dev/null || true)"
+          original_default_keychain="$(printf '%s\n' "$original_default_keychain" \
+            | sed -n 's/^ *"\(.*\)" *$/\1/p')"
           if [ -z "$original_default_keychain" ]; then
-            echo "The runner's default keychain could not be determined." >&2
-            exit 1
+            original_default_keychain="login.keychain-db"
           fi
           root_cert="$GITHUB_WORKSPACE/.github/certs/AppleIncRootCertificate.cer"
           root_expected_sha256="b0b1730ecbc7ff4505142c49f1295e6eda6bcaed7e2c68c5be91b5a11001f024"

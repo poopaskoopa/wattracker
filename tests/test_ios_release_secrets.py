@@ -272,7 +272,7 @@ def test_workflow_uses_system_roots_without_mutating_trust_settings():
     assert '/Library/Keychains/System.keychain' in search_list_setup
     assert '/System/Library/Keychains/SystemRootCertificates.keychain' in search_list_setup
     assert search_list_setup.index('/Library/Keychains/System.keychain') < search_list_setup.index('"$keychain"')
-    assert "login.keychain-db" not in signing_setup
+    assert "login.keychain-db" not in search_list_setup
     assert "add-trusted-cert" not in signing_setup
     assert "remove-trusted-cert" not in signing_setup
     assert 'echo "IOS_ROOT_TRUST_CERT=$root_cert" >> "$GITHUB_ENV"' not in signing_setup
@@ -325,6 +325,7 @@ def test_workflow_reunlocks_and_sets_partition_list_immediately_before_archive()
     archive_start = workflow.index("- name: Archive for the App Store")
     import_setup = workflow[import_start:archive_start]
     assert 'original_default_keychain="$(security default-keychain -d user' in import_setup
+    assert 'original_default_keychain="login.keychain-db"' in import_setup
     assert 'echo "IOS_ORIGINAL_DEFAULT_KEYCHAIN=$original_default_keychain" >> "$GITHUB_ENV"' in import_setup
     assert 'security default-keychain -d user -s "$IOS_SIGNING_KEYCHAIN"' in archive
 
