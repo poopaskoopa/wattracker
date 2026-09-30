@@ -719,6 +719,7 @@ def test_workflow_diagnose_summary_has_exact_safe_boundary():
     assert diagnostic.count("printf 'Diagnostic ") == 14
     assert "Diagnostic post-partition explicit codesign probe:" in script
     assert "Diagnostic post-partition search-list codesign probe:" in script
+    assert "Diagnostic system-and-job codesign probe:" in script
     for forbidden in ('"labl"', '"subj"', "-fingerprint", "-sha1"):
         assert forbidden not in diagnostic
 
