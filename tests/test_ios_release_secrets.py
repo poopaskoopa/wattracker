@@ -7,6 +7,7 @@ replaced by a runner that records argv and stdin.
 
 from __future__ import annotations
 
+import os
 import subprocess
 from pathlib import Path
 
@@ -19,7 +20,15 @@ WORKFLOW = Path(".github/workflows/ios-release.yml")
 
 
 class FakeRunner:
-    def __init__(self, *, secret_values: tuple[str, ...] = ()):
+    def __init__(
+        self,
+        *,
+        secret_values: tuple[str, ...] = (),
+        temporary_identities: tuple[tuple[str, str, str], ...] | None = None,
+        keep_deleted_identities: bool = False,
+        extra_private_keys: int = 0,
+        fail_selected_export: bool = False,
+    ):
         self.secret_values = secret_values
         self.calls: list[tuple[tuple[str, ...], bytes]] = []
         self.export_paths: list[Path] = []
@@ -27,6 +36,33 @@ class FakeRunner:
         self.deleted_keychains: list[str] = []
         self.temp_keychain: Path | None = None
         self.child_output = bytearray()
+        self.keep_deleted_identities = keep_deleted_identities
+        self.extra_private_keys = extra_private_keys
+        self.fail_selected_export = fail_selected_export
+        self.temporary_identities = list(
+            temporary_identities
+            or (
+                (
+                    "A" * 40,
+                    "Apple Distribution: First Rider (TEAMONE)",
+                    "",
+                ),
+                (
+                    "B" * 40,
+                    "Apple Distribution: Second Rider (TEAMTWO)",
+                    "",
+                ),
+                (
+                    "C" * 40,
+                    "Developer ID Application: Other Rider (TEAMTHREE)",
+                    "CSSMERR_TP_NOT_TRUSTED",
+                ),
+            )
+        )
+        self.remaining_identities = {
+            fingerprint: (label, status)
+            for fingerprint, label, status in self.temporary_identities
+        }
 
     def __call__(self, argv, *, input_data=b""):
         argv = tuple(argv)
@@ -37,7 +73,7 @@ class FakeRunner:
             for secret in self.secret_values:
                 assert secret not in argv
         self.calls.append((argv, input_data))
-        if argv[:3] == ("security", "find-identity", "-v"):
+        if argv[:2] == ("security", "find-identity"):
             if argv[-1] == helper.LOGIN_KEYCHAIN:
                 stdout = (
                     b'  1) AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA '
@@ -47,19 +83,20 @@ class FakeRunner:
                     b'     2 valid identities found\n'
                 )
             else:
-                stdout = (
-                    b'  1) AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA '
-                    b'"Apple Distribution: First Rider (TEAMONE)"\n'
-                    b'  2) BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB '
-                    b'"Apple Distribution: Second Rider (TEAMTWO)"\n'
-                    b'  3) CCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCC '
-                    b'"Developer ID Application: Other Rider (TEAMTHREE)"\n'
-                    b'     3 valid identities found\n'
-                )
+                lines = []
+                records = list(self.remaining_identities.items())
+                for _ in range(2):
+                    for number, (fingerprint, (label, status)) in enumerate(records, start=1):
+                        suffix = f" ({status})" if status else ""
+                        lines.append(f'  {number}) {fingerprint} "{label}"{suffix}\n')
+                    lines.append(f"     {len(records)} identities found\n")
+                stdout = "".join(lines).encode()
             self.child_output.extend(stdout)
             return subprocess.CompletedProcess(argv, 0, stdout=stdout, stderr=b"")
         if argv[:2] == ("security", "export"):
             output_path = Path(argv[argv.index("-o") + 1])
+            if self.fail_selected_export and output_path.name == "distribution.p12":
+                return subprocess.CompletedProcess(argv, 1, stdout=b"", stderr=b"")
             output_path.write_bytes(b"fake-p12-bytes")
             self.export_paths.append(output_path)
             return subprocess.CompletedProcess(argv, 0, stdout=b"", stderr=b"")
@@ -72,8 +109,18 @@ class FakeRunner:
         if argv[:2] == ("security", "import"):
             return subprocess.CompletedProcess(argv, 0, stdout=b"", stderr=b"")
         if argv[:2] == ("security", "delete-identity"):
-            self.deleted_identities.append(argv[argv.index("-Z") + 1])
+            fingerprint = argv[argv.index("-Z") + 1]
+            self.deleted_identities.append(fingerprint)
+            if not self.keep_deleted_identities:
+                self.remaining_identities.pop(fingerprint, None)
             return subprocess.CompletedProcess(argv, 0, stdout=b"", stderr=b"")
+        if argv[:2] == ("security", "find-key"):
+            key_count = len(self.remaining_identities) + self.extra_private_keys
+            stdout = "".join(
+                f'keychain: "{self.temp_keychain or "temporary"}"\n'
+                for _ in range(key_count)
+            ).encode()
+            return subprocess.CompletedProcess(argv, 0, stdout=stdout, stderr=b"")
         if argv[:2] == ("security", "delete-keychain"):
             self.deleted_keychains.append(argv[-1])
             return subprocess.CompletedProcess(argv, 0, stdout=b"", stderr=b"")
@@ -102,7 +149,11 @@ def test_workflow_uses_manual_diagnostic_version_and_upload_is_tag_only():
     workflow = WORKFLOW.read_text(encoding="utf-8")
     assert 'version="0.0.0"' in workflow
     assert "Manual dispatch archives and exports only" in workflow
-    assert "if: startsWith(github.ref, 'refs/tags/ios-v')" in workflow
+    upload_start = workflow.index("- name: Validate and upload to TestFlight")
+    upload_end = workflow.find("\n      - name:", upload_start + 1)
+    upload = workflow[upload_start:] if upload_end == -1 else workflow[upload_start:upload_end]
+    assert "if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/ios-v')" in upload
+    assert "if: startsWith(github.ref, 'refs/tags/ios-v')" not in upload
 
 
 def test_workflow_classifies_certificate_failures_and_keeps_cleanup_unconditional():
@@ -116,9 +167,9 @@ def test_workflow_classifies_certificate_failures_and_keeps_cleanup_unconditiona
         "team does not match APPLE_TEAM_ID",
     ):
         assert message in workflow
-    assert "openssl pkcs12" in workflow
+    assert "/usr/bin/openssl pkcs12" in workflow
     assert "-passin env:IOS_DIST_P12_PASSWORD" in workflow
-    assert "openssl x509" in workflow
+    assert "/usr/bin/openssl x509" in workflow
     cleanup_start = workflow.index("- name: Remove the signing material")
     cleanup_end = workflow.find("\n      - name:", cleanup_start + 1)
     cleanup = workflow[cleanup_start:] if cleanup_end == -1 else workflow[cleanup_start:cleanup_end]
@@ -133,7 +184,10 @@ def test_workflow_classifies_certificate_failures_and_keeps_cleanup_unconditiona
 def test_helper_uses_security_export_password_argv_but_never_gh_secret_argv():
     script = Path("scripts/ios_release_secrets.py").read_text(encoding="utf-8")
     assert '"-P",' in script
-    assert '"secret", "set"' in script
+    assert '"secret",' in script
+    assert '"set",' in script
+    assert '"--repo",' in script
+    assert '"poopaskoopa/wattracker",' in script
     assert "input_data=value.encode" in script
     assert "input_data=(password +" not in script
 
@@ -177,6 +231,8 @@ def test_helper_requires_selection_and_never_puts_password_in_argv_or_output(
         "find-identity",
         "delete-identity",
         "delete-identity",
+        "find-identity",
+        "find-key",
         "export",
         "delete-keychain",
     ]
@@ -194,7 +250,11 @@ def test_helper_requires_selection_and_never_puts_password_in_argv_or_output(
         host.encode(),
     ]
     assert all(not any(secret in argv for secret in runner.secret_values) for argv, _ in gh_calls)
+    assert all(
+        argv[-2:] == ("--repo", "poopaskoopa/wattracker") for argv, _ in gh_calls
+    )
     captured = capsys.readouterr()
+    assert "may prompt once per key" in captured.out
     assert all(secret not in captured.out for secret in runner.secret_values)
     assert all(secret not in captured.err for secret in runner.secret_values)
     assert all(secret.encode() not in runner.child_output for secret in runner.secret_values)
@@ -207,12 +267,128 @@ def test_helper_requires_selection_and_never_puts_password_in_argv_or_output(
         if argv[0] == helper.GH_PATH and argv[3] == "WATTRACKER_IOS_API_HOST"
     ]
     assert host_inputs == [host]
+    temp_find_calls = [
+        argv
+        for argv, _ in runner.calls
+        if argv[:2] == ("security", "find-identity") and argv[-1] != helper.LOGIN_KEYCHAIN
+    ]
+    assert len(temp_find_calls) == 2
+    assert all("-v" not in argv for argv in temp_find_calls)
+
+
+def test_helper_cleans_up_temporary_material_when_export_fails(tmp_path, monkeypatch):
+    runner = FakeRunner(fail_selected_export=True)
+    generated = iter(("final-password", "source-password", "temporary-keychain-password"))
+    monkeypatch.setattr(
+        helper.secrets,
+        "token_urlsafe",
+        lambda length: next(generated),
+    )
+
+    with pytest.raises(helper.SecretSetupError, match="could not export the selected"):
+        helper.install_secrets(runner=runner, input_fn=lambda prompt: "2", host_config=tmp_path / "missing")
+
+    assert runner.temp_keychain is not None
+    assert runner.deleted_keychains == [str(runner.temp_keychain)]
+    assert all(not path.exists() for path in runner.export_paths)
+
+
+def test_helper_aborts_if_two_identities_remain_before_final_export(tmp_path):
+    runner = FakeRunner(
+        keep_deleted_identities=True,
+        temporary_identities=(
+            ("A" * 40, "Apple Distribution: First Rider (TEAMONE)", ""),
+            ("B" * 40, "Apple Distribution: Second Rider (TEAMTWO)", ""),
+        ),
+    )
+
+    with pytest.raises(helper.SecretSetupError, match="exactly one identity"):
+        helper.install_secrets(runner=runner, input_fn=lambda prompt: "2", host_config=tmp_path / "missing")
+
+    assert len([path for path in runner.export_paths if path.name == "all-identities.p12"]) == 1
+    assert len([path for path in runner.export_paths if path.name == "distribution.p12"]) == 0
+
+
+def test_helper_aborts_if_two_private_keys_remain_before_final_export(tmp_path):
+    runner = FakeRunner(extra_private_keys=1)
+
+    with pytest.raises(helper.SecretSetupError, match="exactly one private key"):
+        helper.install_secrets(runner=runner, input_fn=lambda prompt: "2", host_config=tmp_path / "missing")
+
+    assert len([path for path in runner.export_paths if path.name == "distribution.p12"]) == 0
+
+
+def test_helper_deletes_expired_identity_before_final_export(tmp_path):
+    expired_fingerprint = "D" * 40
+    runner = FakeRunner(
+        temporary_identities=(
+            ("A" * 40, "Apple Distribution: First Rider (TEAMONE)", ""),
+            ("B" * 40, "Apple Distribution: Second Rider (TEAMTWO)", ""),
+            (
+                expired_fingerprint,
+                "Apple Distribution: Expired Rider (TEAMTHREE)",
+                "CSSMERR_TP_CERT_EXPIRED",
+            ),
+            (
+                "C" * 40,
+                "Developer ID Application: Other Rider (TEAMFOUR)",
+                "CSSMERR_TP_NOT_TRUSTED",
+            ),
+        )
+    )
+
+    helper.install_secrets(
+        runner=runner,
+        input_fn=lambda prompt: "2",
+        host_config=tmp_path / "missing",
+    )
+
+    final_export_index = next(
+        index
+        for index, (argv, _) in enumerate(runner.calls)
+        if argv[:2] == ("security", "export")
+        and Path(argv[argv.index("-o") + 1]).name == "distribution.p12"
+    )
+    assert expired_fingerprint in runner.deleted_identities
+    assert any(
+        index < final_export_index
+        and argv[:2] == ("security", "delete-identity")
+        and argv[argv.index("-Z") + 1] == expired_fingerprint
+        for index, (argv, _) in enumerate(runner.calls)
+    )
+
+
+def _workflow_step_script(step_name: str) -> str:
+    workflow = WORKFLOW.read_text(encoding="utf-8")
+    step_start = workflow.index(f"      - name: {step_name}")
+    run_start = workflow.index("        run: |\n", step_start) + len("        run: |\n")
+    step_end = workflow.find("\n      - name:", run_start)
+    block = workflow[run_start:] if step_end == -1 else workflow[run_start:step_end]
+    return "\n".join(line[10:] for line in block.splitlines()) + "\n"
+
+
+@pytest.mark.parametrize("host", ["api.wattracker.com", "https://api.wattracker.com"])
+def test_workflow_host_guard_rejects_bad_hosts_when_executed(host):
+    script = _workflow_step_script("Validate the iOS API host")
+    environment = os.environ.copy()
+    environment["WATTRACKER_IOS_API_HOST"] = host
+    result = subprocess.run(
+        ["/bin/bash"],
+        input=script,
+        text=True,
+        env=environment,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        check=False,
+    )
+    assert result.returncode == 1
 
 
 def test_helper_dry_run_does_not_export_or_set_secrets(tmp_path, capsys):
     runner = FakeRunner()
+    host = "cloud.example.test"
     host_config = tmp_path / "Production.local.xcconfig"
-    host_config.write_text("WATTRACKER_API_HOST = cloud.example.test;\n", encoding="utf-8")
+    host_config.write_text(f"WATTRACKER_API_HOST = {host};\n", encoding="utf-8")
 
     helper.install_secrets(
         runner=runner,
@@ -223,7 +399,26 @@ def test_helper_dry_run_does_not_export_or_set_secrets(tmp_path, capsys):
 
     assert not any(argv[:2] == ("security", "export") for argv, _ in runner.calls)
     assert not any(argv[0] == helper.GH_PATH for argv, _ in runner.calls)
-    assert "no p12 was exported" in capsys.readouterr().out
+    captured = capsys.readouterr().out
+    assert "no p12 was exported" in captured
+    assert host not in captured
+
+
+def test_helper_dry_run_never_generates_or_prints_a_password(tmp_path, monkeypatch, capsys):
+    password = "dry-run-password-sentinel"
+
+    def fail_if_generated(length):
+        raise AssertionError(f"dry-run generated {password}")
+
+    monkeypatch.setattr(helper.secrets, "token_urlsafe", fail_if_generated)
+    helper.install_secrets(
+        runner=FakeRunner(),
+        input_fn=lambda prompt: "1",
+        dry_run=True,
+        host_config=tmp_path / "missing",
+    )
+
+    assert password not in capsys.readouterr().out
 
 
 @pytest.mark.parametrize(

@@ -96,6 +96,24 @@ is App Store Connect; they are different websites for the same account.
    python3 scripts/ios_release_secrets.py
    ```
 
+   The first non-dry run exports every identity from the login keychain, not
+   only Apple Distribution identities. macOS may ask for authorization once
+   per private key, so keep the login session available and expect those
+   prompts before the temporary keychain is created. The helper then removes
+   every imported identity except the one selected above, including expired or
+   otherwise invalid identities, and refuses to export unless exactly one
+   identity and one private key remain.
+
+   There is one deliberate command-line exposure: macOS `security export` only
+   accepts its PKCS#12 wrapping password with `-P`, so the generated source
+   password (used for the all-identities export) and final password (used for
+   the selected-identity export) briefly appear in the `security export -P`
+   argv. The source password also appears in the matching `security import -P`
+   argv. The helper never prints these passwords, and all values passed to
+   `gh secret set` remain stdin-only. Anyone who can inspect this owner's
+   processes during those short-lived commands could see the passwords; use
+   the helper only on the owner's trusted Mac.
+
    If `ios/WatTracker/Config/Production.local.xcconfig` exists, the helper
    validates its `WATTRACKER_API_HOST` and sets `WATTRACKER_IOS_API_HOST` too.
    If it is absent, set that environment secret yourself without putting the

@@ -240,7 +240,7 @@ jobs:
           # minutes on an archive that will fail at the last step. -noout, and
           # stderr discarded: a parse failure must report "the key did not
           # parse" and nothing about the key.
-          if ! openssl pkey -in "$key_path" -noout >/dev/null 2>&1; then
+          if ! /usr/bin/openssl pkey -in "$key_path" -noout >/dev/null 2>&1; then
             echo "APP_STORE_CONNECT_PRIVATE_KEY did not parse as a private key." >&2
             echo "It must be the full PEM contents of the .p8, newlines included." >&2
             exit 1
@@ -312,7 +312,7 @@ jobs:
             exit 1
           fi
           keychain="$RUNNER_TEMP/wattracker-ios-signing.keychain-db"
-          keychain_password="$(openssl rand -hex 32)"
+          keychain_password="$(/usr/bin/openssl rand -hex 32)"
           p12="$RUNNER_TEMP/wattracker-ios-signing.p12"
           cert_pem="$RUNNER_TEMP/wattracker-ios-distribution-cert.pem"
           # Record this before creating or importing anything: the final
@@ -331,17 +331,17 @@ jobs:
           # Validate the container and password before invoking `security`.
           # -passin env keeps the password out of argv and -nokeys ensures the
           # private key is never copied to the diagnostic file.
-          if ! (umask 077; openssl pkcs12 -in "$p12" -passin env:IOS_DIST_P12_PASSWORD \
+          if ! (umask 077; /usr/bin/openssl pkcs12 -in "$p12" -passin env:IOS_DIST_P12_PASSWORD \
               -clcerts -nokeys -out "$cert_pem" >/dev/null 2>&1); then
             echo "The distribution certificate p12 could not be opened; check its password." >&2
             exit 1
           fi
           chmod 600 "$cert_pem"
-          if ! openssl x509 -in "$cert_pem" -checkend 0 -noout >/dev/null 2>&1; then
+          if ! /usr/bin/openssl x509 -in "$cert_pem" -checkend 0 -noout >/dev/null 2>&1; then
             echo "The distribution certificate is expired." >&2
             exit 1
           fi
-          cert_team="$(openssl x509 -in "$cert_pem" -noout -subject -nameopt RFC2253 \
+          cert_team="$(/usr/bin/openssl x509 -in "$cert_pem" -noout -subject -nameopt RFC2253 \
             | sed 's/^subject=//' | tr ',' '\n' | sed -n 's/^OU=//p' | head -n 1)"
           if [ -z "$cert_team" ] || [ "$cert_team" != "$APPLE_TEAM_ID" ]; then
             echo "The distribution certificate team does not match APPLE_TEAM_ID." >&2
@@ -548,7 +548,7 @@ jobs:
         # Tag runs only. A manual dispatch is for exercising the signing
         # and archive path; it must never be able to publish a build to
         # App Store Connect, where a bad build number cannot be reused.
-        if: startsWith(github.ref, 'refs/tags/ios-v')
+        if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/ios-v')
         env:
           ASC_KEY_ID: ${{ secrets.APP_STORE_CONNECT_KEY_ID }}
           ASC_ISSUER_ID: ${{ secrets.APP_STORE_CONNECT_ISSUER_ID }}

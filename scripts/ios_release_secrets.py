@@ -36,7 +36,8 @@ _HOST_RE = re.compile(
     r"(?:\.[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?)+$"
 )
 _IDENTITY_RE = re.compile(
-    r'^\s*(?P<number>\d+)\)\s+(?P<fingerprint>[0-9A-Fa-f]+)\s+"(?P<label>[^"]+)"\s*$'
+    r'^\s*(?P<number>\d+)\)\s+(?P<fingerprint>[0-9A-Fa-f]{40})\s+'
+    r'"(?P<label>[^"]+)"(?:\s+\(CSSMERR_[^)]+\))?\s*$'
 )
 
 
@@ -111,8 +112,11 @@ def _find_identities(
     apple_distribution_only: bool,
     runner: Runner,
     failure: str,
+    verbose: bool = True,
 ) -> list[Identity]:
-    argv = ["security", "find-identity", "-v"]
+    argv = ["security", "find-identity"]
+    if verbose:
+        argv.append("-v")
     if policy is not None:
         argv.extend(("-p", policy))
     argv.append(str(keychain))
@@ -123,17 +127,17 @@ def _find_identities(
     )
     raw = result.stdout.decode("utf-8", errors="replace")
     identities: list[Identity] = []
+    fingerprints: set[str] = set()
     for line in raw.splitlines():
         match = _IDENTITY_RE.match(line)
         if match and (
             not apple_distribution_only or "Apple Distribution" in match.group("label")
         ):
-            identities.append(
-                Identity(
-                    fingerprint=match.group("fingerprint"),
-                    label=match.group("label"),
-                )
-            )
+            fingerprint = match.group("fingerprint")
+            if fingerprint.casefold() in fingerprints:
+                continue
+            fingerprints.add(fingerprint.casefold())
+            identities.append(Identity(fingerprint=fingerprint, label=match.group("label")))
     return identities
 
 
@@ -142,9 +146,20 @@ def find_identities(*, runner: Runner = default_runner) -> list[Identity]:
         LOGIN_KEYCHAIN,
         policy="codesigning",
         apple_distribution_only=True,
+        verbose=True,
         runner=runner,
         failure="could not inspect the login keychain",
     )
+
+
+def _count_private_keys(keychain: str | Path, *, runner: Runner) -> int:
+    result = _run(
+        runner,
+        ("security", "find-key", "-t", "private", str(keychain)),
+        failure="could not inspect private keys in the temporary signing keychain",
+    )
+    raw = result.stdout.decode("utf-8", errors="replace")
+    return sum(1 for line in raw.splitlines() if line.startswith("keychain: "))
 
 
 def choose_identity(
@@ -208,7 +223,16 @@ def _set_secret(
 ) -> None:
     _run(
         runner,
-        (gh_path, "secret", "set", name, "--env", GH_ENVIRONMENT),
+        (
+            gh_path,
+            "secret",
+            "set",
+            name,
+            "--env",
+            GH_ENVIRONMENT,
+            "--repo",
+            "poopaskoopa/wattracker",
+        ),
         input_data=value.encode("utf-8"),
         failure=f"could not set the {name} GitHub secret",
     )
@@ -248,6 +272,11 @@ def install_secrets(
     host_config: Path = DEFAULT_HOST_CONFIG,
     gh_path: str = GH_PATH,
 ) -> None:
+    output_warning = (
+        "The first export inspects every identity in the login keychain; "
+        "macOS may prompt once per key."
+    )
+    output(output_warning)
     identities = find_identities(runner=runner)
     identity = choose_identity(identities, input_fn=input_fn, output=output)
     host = read_production_host(host_config)
@@ -320,6 +349,7 @@ def install_secrets(
             temp_keychain,
             policy=None,
             apple_distribution_only=False,
+            verbose=False,
             runner=runner,
             failure="could not inspect the temporary signing keychain",
         )
@@ -342,6 +372,25 @@ def install_secrets(
                     str(temp_keychain),
                 ),
                 failure="could not remove a non-selected temporary identity",
+            )
+
+        remaining_identities = _find_identities(
+            temp_keychain,
+            policy=None,
+            apple_distribution_only=False,
+            verbose=False,
+            runner=runner,
+            failure="could not verify the temporary signing keychain identities",
+        )
+        if len(remaining_identities) != 1:
+            raise SecretSetupError(
+                "the temporary signing keychain must contain exactly one identity before export"
+            )
+        if remaining_identities[0].fingerprint.casefold() != selected_fingerprint:
+            raise SecretSetupError("the selected identity was not the only identity left")
+        if _count_private_keys(temp_keychain, runner=runner) != 1:
+            raise SecretSetupError(
+                "the temporary signing keychain must contain exactly one private key before export"
             )
 
         _run_with_private_umask(
