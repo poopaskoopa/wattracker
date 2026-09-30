@@ -381,19 +381,22 @@ Two practical notes:
    random password, verifies the pinned Apple Root CA and WWDR G3 DER files,
    and imports both into the job keychain. It then imports the signing
    certificate with `-x` (not extractable). The search list is set explicitly
-   to the job keychain, `/Library/Keychains/System.keychain`, and
-   `login.keychain-db`, in that order: the job keychain remains the only source
-   of the signing identity, while the standard Apple system roots are available
-   to codesign when it constructs the chain. No trust-settings database is
-   modified, which keeps this headless runner path usable without authorization
-   prompts. The temporary certificate files are deleted and the job asserts an
-   `Apple Distribution` identity actually landed. The archive step then
+   to the job keychain followed only by `/Library/Keychains/System.keychain`:
+   the job keychain is first, while the standard Apple system roots are
+   available to codesign when it constructs the chain. The workflow fails
+   closed if the system keychain contains any signing identity, so dropping
+   `OTHER_CODE_SIGN_FLAGS="--keychain …"` does not permit a different signing
+   key to be selected. No trust-settings database is modified, which keeps this
+   headless runner path usable without authorization prompts. The temporary
+   certificate files are deleted and the job asserts exactly one
+   `Apple Distribution` identity in the job keychain. The archive step then
    re-unlocks the job keychain and runs
    `set-key-partition-list -S apple-tool:,apple:,codesign:` immediately before
    `xcodebuild archive`. The generated keychain password is masked before it
-   crosses the step boundary. `OTHER_CODE_SIGN_FLAGS="--keychain …"` remains
-   deliberate: it restricts identity selection to the job keychain while the
-   explicit search list supplies the trusted chain. It reports missing/empty
+   crosses the step boundary. The explicit two-keychain search list is the
+   deliberate compromise: it supplies the trusted chain without exposing the
+   persistent login keychain, and the system-keychain identity guard fails
+   closed if that keychain is ever used for signing. It reports missing/empty
    secrets, invalid base64, a p12 that cannot be opened with its password, a
    non-Apple-Distribution identity, an expired certificate, and a team mismatch
    without printing key material. A dedicated keychain, not the runner user's
@@ -401,9 +404,10 @@ Two practical notes:
    between jobs.
 7. `xcodebuild archive` for `generic/platform=iOS`, with **manual** signing:
    `CODE_SIGN_IDENTITY="Apple Distribution"`,
-   `PROVISIONING_PROFILE_SPECIFIER="WatTracker App Store"`, and
-   `OTHER_CODE_SIGN_FLAGS="--keychain …"` pinning `codesign` to the job's own
-   keychain. `-allowProvisioningUpdates` and the three `-authenticationKey*`
+   `PROVISIONING_PROFILE_SPECIFIER="WatTracker App Store"`. The archive uses
+   the two-keychain search list established in step 6; the job keychain is
+   first and the system keychain is present only for Apple's trusted chain.
+   `-allowProvisioningUpdates` and the three `-authenticationKey*`
    flags are still there, now doing the one job they can do: registering the
    App ID and downloading that profile from the portal, so it is neither
    installed on the runner nor carried as a secret.

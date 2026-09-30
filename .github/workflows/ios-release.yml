@@ -416,13 +416,11 @@ jobs:
           security import "$p12" -k "$keychain" \
             -P "$IOS_DIST_P12_PASSWORD" \
             -T /usr/bin/codesign -x
-          # Exact order matters: the job keychain is first for ordinary
-          # search-list consumers, followed by Apple's system roots and then
-          # the login keychain. `codesign --keychain "$keychain"` still
-          # selects the signing identity only from the job keychain, while
-          # codesign consults this full list to construct the certificate
-          # chain.
-          security list-keychains -d user -s "$keychain" /Library/Keychains/System.keychain login.keychain-db
+          # Exact order matters: the job keychain is first, followed only by
+          # Apple's system roots. Do not include the persistent login keychain:
+          # without --keychain, codesign uses the search list for both identity
+          # selection and chain construction.
+          security list-keychains -d user -s "$keychain" /Library/Keychains/System.keychain
           rm -f "$p12"
           # Assert the identity is actually there before spending ten minutes
           # on an archive that would fail at the codesign step. `grep -c`
@@ -462,9 +460,20 @@ jobs:
             printf 'Diagnostic certificate type: Apple WWDR G3 intermediate\n'
             printf 'Diagnostic certificate expiry: %s\n' "$wwdr_expiry"
           fi
-          identities="$(security find-identity -v -p codesigning "$keychain" | grep -c 'Apple Distribution' || true)"
-          if [ "${identities:-0}" -lt 1 ]; then
-            echo "The distribution certificate p12 contains no Apple Distribution identity." >&2
+          system_identities="$(security find-identity -v -p codesigning /Library/Keychains/System.keychain 2>&1 || true)"
+          system_identity_count="$(printf '%s\n' "$system_identities" \
+            | grep -Ec '^[[:space:]]+[0-9]+\)' || true)"
+          if [ "${system_identity_count:-0}" -ne 0 ]; then
+            echo "The system keychain contains a signing identity; refusing to sign." >&2
+            exit 1
+          fi
+          identities="$(security find-identity -v -p codesigning "$keychain" 2>&1 || true)"
+          identity_count="$(printf '%s\n' "$identities" \
+            | grep -Ec '^[[:space:]]+[0-9]+\)' || true)"
+          distribution_count="$(printf '%s\n' "$identities" \
+            | grep -c 'Apple Distribution' || true)"
+          if [ "${identity_count:-0}" -ne 1 ] || [ "${distribution_count:-0}" -ne 1 ]; then
+            echo "The signing keychain does not contain exactly one Apple Distribution identity." >&2
             exit 1
           fi
           echo "Imported the distribution identity into a job-scoped keychain."
@@ -496,14 +505,11 @@ jobs:
       #    on the runner nor carried as a secret. It has to already exist in
       #    the account - docs/ios-testflight.md has the one-time creation.
       #
-      #    OTHER_CODE_SIGN_FLAGS pins codesign to the job's own keychain. It is
-      #    first in the search list anyway, but this runner is a physical
-      #    machine whose other keychains are outside this job's control, and an
-      #    archive that silently signed with some other identity that happened
-      #    to be on the box is exactly the failure that is hardest to notice.
-      #    Keep this restriction while making the checked-in root and the
-      #    system Apple roots available for chain construction: the search
-      #    list must not widen identity selection beyond the job keychain.
+      #    The signing search list contains only the job keychain and Apple's
+      #    system keychain. The job keychain is first, and the import step
+      #    fails closed if the system keychain contains any signing identity.
+      #    We deliberately do not pass OTHER_CODE_SIGN_FLAGS=--keychain: the
+      #    root chain must be discoverable through the standard search list.
       #
       # 3. -allowProvisioningUpdates plus the three -authenticationKey* flags.
       #    Together these let xcodebuild talk to the developer portal as the
@@ -608,8 +614,8 @@ jobs:
 
           # Re-unlock immediately before archive. The imported root plus the
           # system keychain make chain construction available; this partition
-          # list and the explicit keychain flag keep identity selection
-          # restricted to the job keychain and avoid a GUI prompt.
+          # list and the two-keychain search list avoid a GUI prompt while
+          # keeping the job keychain first.
           security unlock-keychain -p "$IOS_SIGNING_KEYCHAIN_PASSWORD" "$IOS_SIGNING_KEYCHAIN"
           security set-key-partition-list -S apple-tool:,apple:,codesign: \
             -k "$IOS_SIGNING_KEYCHAIN_PASSWORD" "$IOS_SIGNING_KEYCHAIN" > /dev/null
@@ -629,7 +635,6 @@ jobs:
             CODE_SIGN_STYLE=Manual \
             CODE_SIGN_IDENTITY="Apple Distribution" \
             PROVISIONING_PROFILE_SPECIFIER="WatTracker App Store" \
-            OTHER_CODE_SIGN_FLAGS="--keychain $IOS_SIGNING_KEYCHAIN" \
             CODE_SIGNING_REQUIRED=YES \
             CODE_SIGNING_ALLOWED=YES \
             WATTRACKER_API_SCHEME="$WATTRACKER_API_SCHEME" \

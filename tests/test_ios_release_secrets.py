@@ -175,7 +175,7 @@ def test_workflow_classifies_certificate_failures_and_keeps_cleanup_unconditiona
         "not valid base64",
         "could not be opened; check its password",
         "could not be imported",
-        "contains no Apple Distribution identity",
+        "does not contain exactly one Apple Distribution identity",
         "certificate is expired",
         "team does not match APPLE_TEAM_ID",
     ):
@@ -248,7 +248,7 @@ def test_workflow_pins_and_imports_the_checked_in_apple_root_before_validity_che
     wwdr_import = workflow.index('security import "$wwdr_cert"')
     p12_import = workflow.index('security import "$p12"')
     search_list = workflow.index(
-        'security list-keychains -d user -s "$keychain" /Library/Keychains/System.keychain login.keychain-db'
+        'security list-keychains -d user -s "$keychain" /Library/Keychains/System.keychain'
     )
     validity_check = workflow.index('security find-identity -v -p codesigning "$keychain"')
     assert fingerprint_check < root_import < wwdr_import < p12_import < search_list < validity_check
@@ -258,17 +258,28 @@ def test_workflow_uses_system_chain_without_mutating_trust_settings():
     workflow = WORKFLOW.read_text(encoding="utf-8")
     search_list_command = (
         'security list-keychains -d user -s "$keychain" '
-        "/Library/Keychains/System.keychain login.keychain-db"
+        "/Library/Keychains/System.keychain"
     )
+    archive_start = workflow.index("- name: Archive for the App Store")
+    import_start = workflow.index(
+        "- name: Import the distribution certificate into a temporary keychain"
+    )
+    signing_setup = workflow[import_start:archive_start]
 
     # Keep the exact ordered list: removing System.keychain must make this
     # static test fail because it is the source of the trusted Apple chain.
-    assert workflow.count(search_list_command) == 1
-    assert 'security list-keychains -d user -s "$keychain" login.keychain-db' not in workflow
+    assert signing_setup.count(search_list_command) == 1
+    assert "login.keychain-db" not in signing_setup
     assert "add-trusted-cert" not in workflow
     assert "remove-trusted-cert" not in workflow
     assert "trust-settings-" not in workflow
     assert "IOS_ROOT_TRUST_CERT" not in workflow
+    assert (
+        'system_identities="$(security find-identity -v -p codesigning '
+        '/Library/Keychains/System.keychain 2>&1 || true)"'
+    ) in signing_setup
+    assert 'if [ "${system_identity_count:-0}" -ne 0 ]; then' in signing_setup
+    assert 'if [ "${identity_count:-0}" -ne 1 ] || [ "${distribution_count:-0}" -ne 1 ]; then' in signing_setup
 
 
 def test_workflow_keeps_keychain_cleanup_unconditional_without_trust_cleanup():
@@ -301,7 +312,7 @@ def test_workflow_reunlocks_and_sets_partition_list_immediately_before_archive()
     xcodebuild = archive.index("archive_with_redacted_output xcodebuild archive")
     assert mask < env_record
     assert unlock < partition < xcodebuild
-    assert 'OTHER_CODE_SIGN_FLAGS="--keychain $IOS_SIGNING_KEYCHAIN"' in archive
+    assert 'OTHER_CODE_SIGN_FLAGS="--keychain $IOS_SIGNING_KEYCHAIN"' not in archive
 
 
 def _archive_script() -> str:
@@ -521,14 +532,14 @@ def test_archive_redaction_preserves_a_failing_xcodebuild_status(tmp_path):
 def test_workflow_diagnose_summary_has_exact_safe_boundary():
     script = _workflow_step_script("Import the distribution certificate into a temporary keychain")
     start_marker = 'if [ "${DIAGNOSE_SIGNING:-false}" = "true" ]; then\n'
-    validity_marker = 'identities="$(security find-identity -v -p codesigning "$keychain"'
+    system_guard_marker = 'system_identities="$(security find-identity -v -p codesigning /Library/Keychains/System.keychain'
     start = script.index(start_marker)
-    end = script.index(validity_marker, start)
+    end = script.index(system_guard_marker, start)
     diagnostic = script[start:end]
 
     assert diagnostic.startswith(start_marker)
     assert diagnostic.rstrip().endswith("fi")
-    assert script[end:].startswith(validity_marker)
+    assert script[end:].startswith(system_guard_marker)
     assert diagnostic.count("security find-identity") == 2
     assert 'valid_identity_output="$(security find-identity -v -p codesigning "$keychain" 2>&1 || true)"' in diagnostic
     assert 'all_identity_output="$(security find-identity -p codesigning "$keychain" 2>&1 || true)"' in diagnostic
@@ -549,7 +560,10 @@ def test_workflow_diagnose_summary_has_exact_safe_boundary():
 def test_workflow_diagnose_summary_never_prints_fake_security_identity_name(tmp_path):
     script = _workflow_step_script("Import the distribution certificate into a temporary keychain")
     start = script.index('if [ "${DIAGNOSE_SIGNING:-false}" = "true" ]; then')
-    end = script.index('identities="$(security find-identity', start)
+    end = script.index(
+        'system_identities="$(security find-identity -v -p codesigning /Library/Keychains/System.keychain',
+        start,
+    )
     diagnostic = script[start:end]
 
     sentinel = "Apple Distribution: Sentinel Legal Name (TEAM-SENTINEL)"
