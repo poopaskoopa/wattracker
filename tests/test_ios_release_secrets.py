@@ -18,8 +18,17 @@ from scripts import ios_release_secrets as helper
 
 
 WORKFLOW = Path(".github/workflows/ios-release.yml")
+IOS_TESTFLIGHT_DOCS = Path("docs/ios-testflight.md")
+ROOT_CERT = Path(".github/certs/AppleIncRootCertificate.cer")
+APPLE_ROOT_CA_SHA256 = "b0b1730ecbc7ff4505142c49f1295e6eda6bcaed7e2c68c5be91b5a11001f024"
 WWDR_CERT = Path(".github/certs/AppleWWDRCAG3.cer")
 WWDR_G3_SHA256 = "dcf21878c77f4198e4b4614f03d696d89c66c66008d4244e1b99161aac91601f"
+
+
+def test_docs_require_a_session_created_self_hosted_runner():
+    docs = IOS_TESTFLIGHT_DOCS.read_text(encoding="utf-8")
+    assert "LaunchDaemon" in docs
+    assert "SessionCreate=true" in docs
 
 
 class FakeRunner:
@@ -204,6 +213,67 @@ def test_workflow_pins_and_imports_only_the_checked_in_wwdr_g3_before_validity_c
     assert fingerprint_check < intermediate_import < p12_import < validity_check
 
 
+def test_workflow_pins_and_imports_the_checked_in_apple_root_before_validity_check():
+    workflow = WORKFLOW.read_text(encoding="utf-8")
+    assert ROOT_CERT.is_file()
+    assert hashlib.sha256(ROOT_CERT.read_bytes()).hexdigest() == APPLE_ROOT_CA_SHA256
+    subject = subprocess.run(
+        [
+            "/usr/bin/openssl",
+            "x509",
+            "-inform",
+            "der",
+            "-in",
+            str(ROOT_CERT),
+            "-noout",
+            "-subject",
+        ],
+        check=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    ).stdout
+    assert "CN=Apple Root CA" in subject
+    assert f'root_expected_sha256="{APPLE_ROOT_CA_SHA256}"' in workflow
+    assert "shasum -a 256 \"$root_cert\"" in workflow
+    assert "curl" not in workflow
+    assert "wget" not in workflow
+
+    fingerprint_comparison = 'if [ "$root_actual_sha256" != "$root_expected_sha256" ]; then'
+    assert workflow.count(fingerprint_comparison) == 1
+    fingerprint_check = workflow.index(fingerprint_comparison)
+    root_import = workflow.index('security import "$root_cert"')
+    wwdr_import = workflow.index('security import "$wwdr_cert"')
+    p12_import = workflow.index('security import "$p12"')
+    validity_check = workflow.index('security find-identity -v -p codesigning "$keychain"')
+    assert fingerprint_check < root_import < wwdr_import < p12_import < validity_check
+
+
+def test_workflow_reunlocks_and_sets_partition_list_immediately_before_archive():
+    workflow = WORKFLOW.read_text(encoding="utf-8")
+    archive_start = workflow.index("- name: Archive for the App Store")
+    archive = workflow[archive_start:]
+    mask = workflow.index("printf '::add-mask::%s\\n' \"$keychain_password\"")
+    env_record = workflow.index(
+        'echo "IOS_SIGNING_KEYCHAIN_PASSWORD=$keychain_password" >> "$GITHUB_ENV"'
+    )
+    unlock = archive.index(
+        'security unlock-keychain -p "$IOS_SIGNING_KEYCHAIN_PASSWORD" "$IOS_SIGNING_KEYCHAIN"'
+    )
+    partition = archive.index(
+        "security set-key-partition-list -S apple-tool:,apple:,codesign:"
+    )
+    xcodebuild = archive.index("archive_with_redacted_output xcodebuild archive")
+    assert mask < env_record
+    assert unlock < partition < xcodebuild
+    assert 'OTHER_CODE_SIGN_FLAGS="--keychain $IOS_SIGNING_KEYCHAIN"' in archive
+
+
+def _archive_script() -> str:
+    script = _workflow_step_script("Archive for the App Store")
+    return script[script.index('export IOS_CERT_CN='):]
+
+
 def test_workflow_masks_leaf_and_wwdr_common_names_before_diagnostics():
     workflow = WORKFLOW.read_text(encoding="utf-8")
     leaf_cn = 'printf \'::add-mask::%s\\n\' "$leaf_cn"'
@@ -236,7 +306,7 @@ def test_workflow_masks_leaf_and_wwdr_common_names_before_diagnostics():
 
 
 def test_archive_extracts_apple_ordered_cn_and_o_and_redacts_xcodebuild_streams(tmp_path):
-    script = _workflow_step_script("Archive for the App Store")
+    script = _archive_script()
     sentinel_cn = "Apple Distribution: Sentinel Legal Name (TEAM-SENTINEL)"
     sentinel_o = "Sentinel Legal Name"
     cert_pem = tmp_path / "wattracker-ios-distribution-cert.pem"
@@ -304,6 +374,9 @@ def test_archive_extracts_apple_ordered_cn_and_o_and_redacts_xcodebuild_streams(
         encoding="utf-8",
     )
     fake_xcodebuild.chmod(0o700)
+    fake_security = tmp_path / "security"
+    fake_security.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    fake_security.chmod(0o700)
     environment = os.environ.copy()
     environment.update(
         {
@@ -311,6 +384,7 @@ def test_archive_extracts_apple_ordered_cn_and_o_and_redacts_xcodebuild_streams(
             "RUNNER_TEMP": str(tmp_path),
             "APPLE_TEAM_ID": "TEAM-SENTINEL",
             "IOS_SIGNING_KEYCHAIN": str(tmp_path / "signing.keychain-db"),
+            "IOS_SIGNING_KEYCHAIN_PASSWORD": "fake-keychain-password",
             "EXPECTED_CN": sentinel_cn,
             "EXPECTED_O": sentinel_o,
             "ASC_KEY_PATH": str(tmp_path / "AuthKey.p8"),
@@ -343,7 +417,7 @@ def test_archive_extracts_apple_ordered_cn_and_o_and_redacts_xcodebuild_streams(
 
 
 def test_archive_redaction_preserves_a_failing_xcodebuild_status(tmp_path):
-    script = _workflow_step_script("Archive for the App Store")
+    script = _archive_script()
     cert_pem = tmp_path / "wattracker-ios-distribution-cert.pem"
     key_pem = tmp_path / "sentinel-key.pem"
     subprocess.run(
@@ -375,6 +449,9 @@ def test_archive_redaction_preserves_a_failing_xcodebuild_status(tmp_path):
         encoding="utf-8",
     )
     fake_xcodebuild.chmod(0o700)
+    fake_security = tmp_path / "security"
+    fake_security.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    fake_security.chmod(0o700)
     environment = os.environ.copy()
     environment.update(
         {
@@ -382,6 +459,7 @@ def test_archive_redaction_preserves_a_failing_xcodebuild_status(tmp_path):
             "RUNNER_TEMP": str(tmp_path),
             "APPLE_TEAM_ID": "TEAM-SENTINEL",
             "IOS_SIGNING_KEYCHAIN": str(tmp_path / "signing.keychain-db"),
+            "IOS_SIGNING_KEYCHAIN_PASSWORD": "fake-keychain-password",
             "ASC_KEY_PATH": str(tmp_path / "AuthKey.p8"),
             "ASC_KEY_ID": "not-a-secret-key-id",
             "ASC_ISSUER_ID": "not-a-secret-issuer-id",

@@ -15,6 +15,14 @@ git push origin ios-v0.1.0
 `v*`, and a shared prefix would mean every desktop release tag also started an
 iOS archive on the one physical macOS runner.
 
+## Self-hosted runner prerequisite
+
+The macOS Actions runner is launched by a `LaunchDaemon`, not an interactive
+Terminal session. Its runner plist must set `SessionCreate=true`; without a
+created login session, `security`/`codesign` can block waiting for keychain
+access that has no GUI session to answer. Keep the runner user logged in and
+the laptop awake for the whole archive/export job.
+
 ## The one-time manual setup, in order
 
 **One thing here can never be automated, and the reason is worth stating once:
@@ -80,8 +88,11 @@ is App Store Connect; they are different websites for the same account.
    certificate + the Apple WWDR intermediate into a `.p12` under a random
    256-bit passphrase. The release-secrets helper then re-exports the selected
    identity for CI, and that secret may contain only the key and leaf. The
-   release job installs the pinned public WWDR G3 intermediate from
-   `.github/certs/AppleWWDRCAG3.cer` before validating the chain.
+   release job installs the pinned public Apple Root CA and WWDR G3
+   certificates from `.github/certs/AppleIncRootCertificate.cer` and
+   `.github/certs/AppleWWDRCAG3.cer` before validating the chain. The root is
+   pinned to SHA-256
+   `b0b1730ecbc7ff4505142c49f1295e6eda6bcaed7e2c68c5be91b5a11001f024`.
    `--create-profile` then creates the `WatTracker App
    Store` provisioning profile against that certificate and the bundle
    identifier — the profile the release job signs with by name.
@@ -367,15 +378,21 @@ Two practical notes:
    a private key, and templates `teamID` into a temporary copy of
    `ExportOptions.plist`.
 6. Decodes `IOS_DIST_P12_B64` into `$RUNNER_TEMP`, creates a keychain with a
-   random password, `security import`s the certificate into it with `-x` (not
-   extractable), runs `set-key-partition-list` so `codesign` does not block on
-   a GUI prompt, puts that keychain first in the search list, deletes the
+   random password, verifies the pinned Apple Root CA and WWDR G3 DER files,
+   imports both public certificates and the signing certificate with `-x` (not
+   extractable), puts that keychain first in the search list, deletes the
    temporary certificate files, and asserts an `Apple Distribution` identity
-   actually landed. It reports missing/empty secrets, invalid base64, a p12
-   that cannot be opened with its password, a non-Apple-Distribution identity,
-   an expired certificate, and a team mismatch without printing key material.
-   A dedicated keychain, not the runner user's login keychain, because this
-   runner is a physical machine that persists between jobs.
+   actually landed. The archive step then re-unlocks the job keychain and runs
+   `set-key-partition-list -S apple-tool:,apple:,codesign:` immediately before
+   `xcodebuild archive`. The generated keychain password is masked before it
+   crosses the step boundary. `OTHER_CODE_SIGN_FLAGS="--keychain …"` remains
+   deliberate: adding the trusted root fixes chain validation without widening
+   `codesign` access to the runner's other keychains. It reports missing/empty
+   secrets, invalid base64, a p12 that cannot be opened with its password, a
+   non-Apple-Distribution identity, an expired certificate, and a team mismatch
+   without printing key material. A dedicated keychain, not the runner user's
+   login keychain, because this runner is a physical machine that persists
+   between jobs.
 7. `xcodebuild archive` for `generic/platform=iOS`, with **manual** signing:
    `CODE_SIGN_IDENTITY="Apple Distribution"`,
    `PROVISIONING_PROFILE_SPECIFIER="WatTracker App Store"`, and
@@ -467,9 +484,9 @@ keeps out of the tree. Nothing needs it: the build's destination is TestFlight.
   its format from the file *extension*, so a `.p12` saved under any other
   suffix is rejected unmodified. The workflow always writes `.p12`.
 - `No Apple Distribution identity landed in the signing keychain` — the `.p12`
-  decoded, but no identity in it chains to a trusted root inside the job's
-  keychain. `find-identity -v` lists only *valid* identities, and validity
-  needs the whole chain.
+  decoded, but no identity in it chains to the pinned Apple Root CA and WWDR
+  G3 certificates inside the job's keychain. `find-identity -v` lists only
+  *valid* identities, and validity needs the whole chain.
 
   Check the bundled intermediate before you suspect the certificate itself.
   Apple has issued several generations of the WWDR intermediate (G2..G6) that

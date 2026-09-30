@@ -315,11 +315,17 @@ jobs:
           keychain_password="$(/usr/bin/openssl rand -hex 32)"
           p12="$RUNNER_TEMP/wattracker-ios-signing.p12"
           cert_pem="$RUNNER_TEMP/wattracker-ios-distribution-cert.pem"
+          root_cert="$GITHUB_WORKSPACE/.github/certs/AppleIncRootCertificate.cer"
+          root_expected_sha256="b0b1730ecbc7ff4505142c49f1295e6eda6bcaed7e2c68c5be91b5a11001f024"
           wwdr_cert="$GITHUB_WORKSPACE/.github/certs/AppleWWDRCAG3.cer"
           wwdr_expected_sha256="dcf21878c77f4198e4b4614f03d696d89c66c66008d4244e1b99161aac91601f"
           # Record this before creating or importing anything: the final
           # always-run step must know the path even when a later command fails.
           echo "IOS_SIGNING_KEYCHAIN=$keychain" >> "$GITHUB_ENV"
+          # The archive is a separate step, so mask this generated password
+          # before it crosses the step boundary. It is never printed.
+          printf '::add-mask::%s\n' "$keychain_password"
+          echo "IOS_SIGNING_KEYCHAIN_PASSWORD=$keychain_password" >> "$GITHUB_ENV"
           # umask before the redirection, not chmod after: the p12 must never
           # exist world-readable, not even for the instant between the two.
           if ! (umask 077; printf '%s' "$IOS_DIST_P12_B64" | base64 --decode > "$p12"); then
@@ -360,6 +366,15 @@ jobs:
             echo "The distribution certificate team does not match APPLE_TEAM_ID." >&2
             exit 1
           fi
+          if [ ! -f "$root_cert" ]; then
+            echo "The checked-in Apple Root CA certificate is missing." >&2
+            exit 1
+          fi
+          root_actual_sha256="$(shasum -a 256 "$root_cert" | awk '{print tolower($1)}')"
+          if [ "$root_actual_sha256" != "$root_expected_sha256" ]; then
+            echo "The checked-in Apple Root CA certificate failed fingerprint verification." >&2
+            exit 1
+          fi
           if [ ! -f "$wwdr_cert" ]; then
             echo "The checked-in Apple WWDR G3 certificate is missing." >&2
             exit 1
@@ -382,6 +397,11 @@ jobs:
           security create-keychain -p "$keychain_password" "$keychain"
           security set-keychain-settings -lut 3600 "$keychain"
           security unlock-keychain -p "$keychain_password" "$keychain"
+          if ! security import "$root_cert" -k "$keychain" -T /usr/bin/codesign \
+              >/dev/null 2>&1; then
+            echo "The checked-in Apple Root CA certificate could not be imported." >&2
+            exit 1
+          fi
           if ! security import "$wwdr_cert" -k "$keychain" -T /usr/bin/codesign \
               >/dev/null 2>&1; then
             echo "The checked-in Apple WWDR G3 certificate could not be imported." >&2
@@ -393,10 +413,6 @@ jobs:
           security import "$p12" -k "$keychain" \
             -P "$IOS_DIST_P12_PASSWORD" \
             -T /usr/bin/codesign -x
-          # Without this, codesign blocks on a GUI prompt the runner cannot
-          # answer - and blocks until the job's timeout, with no error.
-          security set-key-partition-list -S apple-tool:,apple: \
-            -k "$keychain_password" "$keychain" > /dev/null
           security list-keychains -d user -s "$keychain" login.keychain-db
           rm -f "$p12"
           # Assert the identity is actually there before spending ten minutes
@@ -476,6 +492,9 @@ jobs:
       #    machine whose other keychains are outside this job's control, and an
       #    archive that silently signed with some other identity that happened
       #    to be on the box is exactly the failure that is hardest to notice.
+      #    Keep this restriction while adding the checked-in Apple Root CA to
+      #    the job keychain: trusting the chain must not widen codesign's
+      #    access to the runner's other keychains.
       #
       # 3. -allowProvisioningUpdates plus the three -authenticationKey* flags.
       #    Together these let xcodebuild talk to the developer portal as the
@@ -577,6 +596,13 @@ jobs:
           exit $status >> 8;
           PERL
           }
+
+          # Re-unlock immediately before archive. The trusted root fixes chain
+          # validation; this partition list and the explicit keychain flag
+          # keep codesign restricted to the job keychain and avoid a GUI prompt.
+          security unlock-keychain -p "$IOS_SIGNING_KEYCHAIN_PASSWORD" "$IOS_SIGNING_KEYCHAIN"
+          security set-key-partition-list -S apple-tool:,apple:,codesign: \
+            -k "$IOS_SIGNING_KEYCHAIN_PASSWORD" "$IOS_SIGNING_KEYCHAIN" > /dev/null
 
           archive_with_redacted_output xcodebuild archive \
             -project ios/WatTracker/WatTracker.xcodeproj \
