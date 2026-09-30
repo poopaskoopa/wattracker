@@ -476,15 +476,15 @@ jobs:
               | sed 's/^notAfter=//')"
             wwdr_expiry="$(/usr/bin/openssl x509 -inform der -in "$wwdr_cert" \
               -noout -enddate | sed 's/^notAfter=//')"
-            root_cert_count="$(security find-certificate -a -c 'Apple Root CA' \
-              "$keychain" -p 2>/dev/null \
+            root_cert_count="$(security find-certificate -a -p -c 'Apple Root CA' \
+              "$keychain" 2>/dev/null \
               | grep -c '^-----BEGIN CERTIFICATE-----' || true)"
-            wwdr_cert_count="$(security find-certificate -a -c \
+            wwdr_cert_count="$(security find-certificate -a -p -c \
               'Apple Worldwide Developer Relations Certification Authority' \
-              "$keychain" -p 2>/dev/null \
+              "$keychain" 2>/dev/null \
               | grep -c '^-----BEGIN CERTIFICATE-----' || true)"
-            system_root_cert_count="$(security find-certificate -a -c 'Apple Root CA' \
-              /System/Library/Keychains/SystemRootCertificates.keychain -p 2>/dev/null \
+            system_root_cert_count="$(security find-certificate -a -p -c 'Apple Root CA' \
+              /System/Library/Keychains/SystemRootCertificates.keychain 2>/dev/null \
               | grep -c '^-----BEGIN CERTIFICATE-----' || true)"
             printf 'Diagnostic valid identity count: %s\n' "$valid_identity_count"
             printf 'Diagnostic all identity count: %s\n' "$all_identity_count"
