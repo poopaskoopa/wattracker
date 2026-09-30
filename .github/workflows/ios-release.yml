@@ -137,21 +137,53 @@ jobs:
           RUN_ATTEMPT: ${{ github.run_attempt }}
         run: |
           set -euo pipefail
-          version="${GITHUB_REF_NAME#ios-v}"
-          if [ "$version" = "$GITHUB_REF_NAME" ]; then
-            echo "Tag '$GITHUB_REF_NAME' does not start with ios-v" >&2
-            exit 1
-          fi
-          # CFBundleShortVersionString: one to three non-negative integers.
-          # Anything else is rejected by App Store Connect, and it is far
-          # cheaper to say so here than after the archive.
-          if ! printf '%s' "$version" | grep -Eq '^[0-9]+(\.[0-9]+){0,2}$'; then
-            echo "Tag '$GITHUB_REF_NAME' does not carry a 1-3 component numeric version" >&2
-            exit 1
+          if [[ "$GITHUB_REF_NAME" == ios-v* ]]; then
+            version="${GITHUB_REF_NAME#ios-v}"
+            # CFBundleShortVersionString: one to three non-negative integers.
+            # Anything else is rejected by App Store Connect, and it is far
+            # cheaper to say so here than after the archive.
+            if ! printf '%s' "$version" | grep -Eq '^[0-9]+(\.[0-9]+){0,2}$'; then
+              echo "Tag '$GITHUB_REF_NAME' does not carry a 1-3 component numeric version" >&2
+              exit 1
+            fi
+          else
+            # Manual dispatch archives and exports only; keep its diagnostic
+            # build clearly separate from every App Store release version.
+            version="0.0.0"
+            echo "Non-tag diagnostic run; using marketing version $version"
           fi
           echo "MARKETING_VERSION=$version" >> "$GITHUB_ENV"
           echo "BUILD_NUMBER=${RUN_NUMBER}.${RUN_ATTEMPT}" >> "$GITHUB_ENV"
           echo "Building version $version build ${RUN_NUMBER}.${RUN_ATTEMPT}"
+
+      # This must run before Archive: the host is an environment secret rather
+      # than a checked-in config value. Keep it out of shell diagnostics and
+      # reject URI-shaped values so an accidental scheme/path cannot change
+      # the app's endpoint semantics.
+      - name: Validate the iOS API host
+        env:
+          WATTRACKER_IOS_API_HOST: ${{ secrets.WATTRACKER_IOS_API_HOST }}
+        run: |
+          set -euo pipefail
+          host="${WATTRACKER_IOS_API_HOST:-}"
+          if [ -z "$host" ] || [[ "$host" =~ [[:space:]] ]]; then
+            echo "WATTRACKER_IOS_API_HOST is missing, empty, or contains whitespace." >&2
+            exit 1
+          fi
+          if [[ "$host" == *://* || "$host" == */* || "$host" == *\?* || "$host" == *#* || "$host" == *:* ]]; then
+            echo "WATTRACKER_IOS_API_HOST must be a hostname, not a URL or path." >&2
+            exit 1
+          fi
+          if ! [[ "$host" =~ ^[A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?(\.[A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?)+$ ]]; then
+            echo "WATTRACKER_IOS_API_HOST is not a valid hostname." >&2
+            exit 1
+          fi
+          host_lower="$(printf '%s' "$host" | tr '[:upper:]' '[:lower:]')"
+          if [ "$host_lower" = "api.wattracker.com" ]; then
+            echo "WATTRACKER_IOS_API_HOST must not be the placeholder host." >&2
+            exit 1
+          fi
+          echo "The iOS API host is valid."
 
       # Before anything is signed, because a failing test should cost nothing
       # but time. The iOS 26.5 simulator runtime matching Xcode 26.6's SDK is
@@ -267,21 +299,54 @@ jobs:
         env:
           IOS_DIST_P12_B64: ${{ secrets.IOS_DIST_P12_B64 }}
           IOS_DIST_P12_PASSWORD: ${{ secrets.IOS_DIST_P12_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
           DIAGNOSE_SIGNING: ${{ inputs.diagnose_signing }}
         run: |
           set -euo pipefail
           if [ -z "${IOS_DIST_P12_B64:-}" ] || [ -z "${IOS_DIST_P12_PASSWORD:-}" ]; then
-            echo "The ios-code-signing environment did not supply the distribution certificate." >&2
-            echo "IOS_DIST_P12_B64 and IOS_DIST_P12_PASSWORD are both required; see" >&2
-            echo "docs/ios-testflight.md for how they are produced." >&2
+            echo "The distribution certificate secret is missing or empty." >&2
+            exit 1
+          fi
+          if [ -z "${APPLE_TEAM_ID:-}" ]; then
+            echo "APPLE_TEAM_ID is missing or empty." >&2
             exit 1
           fi
           keychain="$RUNNER_TEMP/wattracker-ios-signing.keychain-db"
           keychain_password="$(openssl rand -hex 32)"
           p12="$RUNNER_TEMP/wattracker-ios-signing.p12"
+          cert_pem="$RUNNER_TEMP/wattracker-ios-distribution-cert.pem"
+          # Record this before creating or importing anything: the final
+          # always-run step must know the path even when a later command fails.
+          echo "IOS_SIGNING_KEYCHAIN=$keychain" >> "$GITHUB_ENV"
           # umask before the redirection, not chmod after: the p12 must never
           # exist world-readable, not even for the instant between the two.
-          (umask 077; printf '%s' "$IOS_DIST_P12_B64" | base64 --decode > "$p12")
+          if ! (umask 077; printf '%s' "$IOS_DIST_P12_B64" | base64 --decode > "$p12"); then
+            echo "The distribution certificate secret is not valid base64." >&2
+            exit 1
+          fi
+          if [ ! -s "$p12" ]; then
+            echo "The distribution certificate secret is not valid base64." >&2
+            exit 1
+          fi
+          # Validate the container and password before invoking `security`.
+          # -passin env keeps the password out of argv and -nokeys ensures the
+          # private key is never copied to the diagnostic file.
+          if ! (umask 077; openssl pkcs12 -in "$p12" -passin env:IOS_DIST_P12_PASSWORD \
+              -clcerts -nokeys -out "$cert_pem" >/dev/null 2>&1); then
+            echo "The distribution certificate p12 could not be opened; check its password." >&2
+            exit 1
+          fi
+          chmod 600 "$cert_pem"
+          if ! openssl x509 -in "$cert_pem" -checkend 0 -noout >/dev/null 2>&1; then
+            echo "The distribution certificate is expired." >&2
+            exit 1
+          fi
+          cert_team="$(openssl x509 -in "$cert_pem" -noout -subject -nameopt RFC2253 \
+            | sed 's/^subject=//' | tr ',' '\n' | sed -n 's/^OU=//p' | head -n 1)"
+          if [ -z "$cert_team" ] || [ "$cert_team" != "$APPLE_TEAM_ID" ]; then
+            echo "The distribution certificate team does not match APPLE_TEAM_ID." >&2
+            exit 1
+          fi
           security create-keychain -p "$keychain_password" "$keychain"
           security set-keychain-settings -lut 3600 "$keychain"
           security unlock-keychain -p "$keychain_password" "$keychain"
@@ -323,11 +388,9 @@ jobs:
           fi
           identities="$(security find-identity -v -p codesigning "$keychain" | grep -c 'Apple Distribution' || true)"
           if [ "${identities:-0}" -lt 1 ]; then
-            echo "No Apple Distribution identity landed in the signing keychain." >&2
-            echo "IOS_DIST_P12_B64 decoded, but it does not contain one." >&2
+            echo "The distribution certificate p12 contains no Apple Distribution identity." >&2
             exit 1
           fi
-          echo "IOS_SIGNING_KEYCHAIN=$keychain" >> "$GITHUB_ENV"
           echo "Imported the distribution identity into a job-scoped keychain."
 
       # The archive. Four groups of arguments are doing distinct work:
@@ -387,6 +450,8 @@ jobs:
           ASC_KEY_ID: ${{ secrets.APP_STORE_CONNECT_KEY_ID }}
           ASC_ISSUER_ID: ${{ secrets.APP_STORE_CONNECT_ISSUER_ID }}
           APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          WATTRACKER_API_SCHEME: https
+          WATTRACKER_API_HOST: ${{ secrets.WATTRACKER_IOS_API_HOST }}
         run: |
           set -euo pipefail
           xcodebuild archive \
@@ -407,6 +472,8 @@ jobs:
             OTHER_CODE_SIGN_FLAGS="--keychain $IOS_SIGNING_KEYCHAIN" \
             CODE_SIGNING_REQUIRED=YES \
             CODE_SIGNING_ALLOWED=YES \
+            WATTRACKER_API_SCHEME="$WATTRACKER_API_SCHEME" \
+            WATTRACKER_API_HOST="$WATTRACKER_API_HOST" \
             MARKETING_VERSION="$MARKETING_VERSION" \
             CURRENT_PROJECT_VERSION="$BUILD_NUMBER"
 
@@ -546,6 +613,7 @@ jobs:
             security delete-keychain "$IOS_SIGNING_KEYCHAIN" || true
           fi
           rm -f "$RUNNER_TEMP/wattracker-ios-signing.p12" || true
+          rm -f "$RUNNER_TEMP/wattracker-ios-distribution-cert.pem" || true
           rm -rf "$RUNNER_TEMP/asc" || true
           rm -f "$RUNNER_TEMP/ExportOptions.plist" || true
           # The archive and the export both carry the team identifier in the

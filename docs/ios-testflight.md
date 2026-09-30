@@ -1,8 +1,10 @@
 # Shipping the iOS app to TestFlight
 
 The pipeline is `.github/workflows/ios-release.yml`. Pushing a tag that starts
-with `ios-v` archives, signs, exports and uploads a build to TestFlight. That
-is the whole of the release procedure once the one-time setup below is done.
+with `ios-v` archives, signs, exports and uploads a build to TestFlight. A
+manual `workflow_dispatch` runs the same archive/export path without uploading;
+use that safe test after the workflow change has merged, before choosing to
+push a release tag.
 
 ```sh
 git tag ios-v0.1.0
@@ -21,9 +23,10 @@ the App Store Connect API cannot create an app record.** There is no
 an app that exists, and it can issue certificates and profiles — but the record
 itself is created by a human in the web UI, once, and never again.
 
-Step 2 *is* automated, by a script in this repository, but it is still a
-one-time act with a yearly expiry rather than something CI does on every run.
-Read it as setup, not as plumbing.
+The certificate is created by the existing Apple API helper, while the new
+release-secrets helper loads the owner's already-installed identity into the
+GitHub environment. Both are owner-only operations with a yearly expiry; CI
+never creates or exports a private key.
 
 Do these in this order. Steps 1 and 2 are on the Apple Developer portal; step 3
 is App Store Connect; they are different websites for the same account.
@@ -82,17 +85,35 @@ is App Store Connect; they are different websites for the same account.
    Everything it writes is mode 0600 in `~/.appstoreconnect/`, and it refuses
    to write into a git work tree at all.
 
-   Then load the certificate into CI, piped rather than pasted:
+   Then load the certificate and the optional production host into CI with the
+   owner-only helper. It reads the Apple Distribution identity from the login
+   keychain, creates a fresh temporary password, and sends secret values to
+   `gh secret set` on stdin. It never prints either value. The first command is
+   a safe preview; it does not export or set anything.
 
    ```sh
-   base64 < ~/.appstoreconnect/wattracker-dist.p12 | \
-     gh secret set IOS_DIST_P12_B64 --env ios-code-signing
-   gh secret set IOS_DIST_P12_PASSWORD --env ios-code-signing \
-     < ~/.appstoreconnect/wattracker-dist.p12.pass
+   python3 scripts/ios_release_secrets.py --dry-run
+   python3 scripts/ios_release_secrets.py
    ```
 
+   If `ios/WatTracker/Config/Production.local.xcconfig` exists, the helper
+   validates its `WATTRACKER_API_HOST` and sets `WATTRACKER_IOS_API_HOST` too.
+   If it is absent, set that environment secret yourself without putting the
+   host in shell history or a command argument:
+
+   ```sh
+   read -r WATTRACKER_IOS_API_HOST
+   printf '%s' "$WATTRACKER_IOS_API_HOST" | \
+     /opt/homebrew/bin/gh secret set WATTRACKER_IOS_API_HOST --env ios-code-signing
+   unset WATTRACKER_IOS_API_HOST
+   ```
+
+   The workflow accepts only a bare DNS hostname over HTTPS. It rejects an
+   empty value, whitespace, a URL/path, malformed DNS, and the placeholder
+   `api.wattracker.com` before archiving.
+
    **The certificate expires one year after issue** and nothing renews it. The
-   script prints the exact date; put it in a calendar. See "Rotating the
+   certificate script prints the exact date; put it in a calendar. See "Rotating the
    distribution certificate" below.
 
    The script refuses to create a second certificate unless you pass `--force`,
@@ -116,6 +137,33 @@ is App Store Connect; they are different websites for the same account.
 
 4. **Push the tag.** From here on, releases are `git tag ios-v… && git push`.
 
+## The owner's release sequence
+
+After the workflow changes have merged, use this order for the first safe run
+and every later release:
+
+1. From the owner's Mac, run `python3 scripts/ios_release_secrets.py --dry-run`,
+   review the identity and host it will use, then run the helper without
+   `--dry-run`. If no `Production.local.xcconfig` is present, set
+   `WATTRACKER_IOS_API_HOST` with the stdin-only command above.
+2. In App Store Connect, confirm the `WatTracker` app record has bundle ID
+   `com.wattracker.ios`, and add the intended internal testers. Internal
+   testers need App Store Connect access and do not need beta review.
+3. In Actions, dispatch **iOS TestFlight release** once with the default
+   `diagnose_signing` setting. This archives and exports but does not upload;
+   inspect the first failing step and its diagnostic if it fails. Do not push an
+   `ios-v*` tag for this test.
+4. Keep the owner's laptop awake while the self-hosted runner performs the
+   archive, export, and (for a tag) upload.
+5. When the test-mode run is satisfactory, create and push the release tag,
+   for example `git tag ios-v0.1.0 && git push origin ios-v0.1.0`.
+6. Wait roughly 10–30 minutes for Apple's processing. Then install the build
+   through the TestFlight app and verify the app reaches the production cloud.
+7. To invite riders who are not on the App Store Connect team, create an
+   external testing group and submit the first build for Apple's one-time Beta
+   App Review. Do not treat internal tester availability as evidence that
+   external testing is approved.
+
 ### Export compliance, which will stop the first build
 
 App Store Connect asks an export-compliance question about encryption before a
@@ -134,7 +182,7 @@ for each uploaded build. Adding it is one key in
 
 They live in the **`ios-code-signing`** GitHub *environment* on this
 repository, not in repository-wide secrets, so only a job that declares
-`environment: ios-code-signing` can read them. Six secrets:
+`environment: ios-code-signing` can read them. Seven secrets:
 
 | Secret | What it is |
 | --- | --- |
@@ -144,8 +192,9 @@ repository, not in repository-wide secrets, so only a job that declares
 | `APP_STORE_CONNECT_PRIVATE_KEY` | The full PEM contents of the `.p8`, newlines included |
 | `IOS_DIST_P12_B64` | The distribution certificate and its private key, as a base64 `.p12` |
 | `IOS_DIST_P12_PASSWORD` | The random passphrase protecting that `.p12`, with no trailing newline |
+| `WATTRACKER_IOS_API_HOST` | The bare production cloud hostname, without scheme, path, port, or whitespace |
 
-The last two are the actual signing key, and they are the most sensitive thing
+The distribution pair is the actual signing key, and it is the most sensitive thing
 in this list: the API key can be revoked and replaced in a minute, while the
 distribution key signs everything the account ships and is capped at two or
 three per account. `IOS_DIST_P12_PASSWORD` must be stored with **no trailing
@@ -153,7 +202,7 @@ newline** — `gh secret set` stores stdin verbatim, and a stored `"<hex>\n"`
 makes `security import -P` fail on the runner with "wrong password" for a
 reason nobody would ever find.
 
-**None of those six values appears anywhere in this repository, and none may.**
+**None of those seven values appears anywhere in this repository, and none may.**
 This repository is public. A team identifier and a key id are account
 identifiers: once one is in a git history on github.com it is public
 permanently, and unlike the key itself it cannot be rotated. That is why
@@ -270,19 +319,25 @@ Two practical notes:
 2. Derives the version from the tag and the build number from the run. Nothing
    secret is in scope yet, so a malformed tag fails before any credential is
    written to disk.
-3. Runs the Swift test suite on the iPhone 17 Pro simulator. A failing test
+3. Validates the secret-backed production API hostname. This happens before
+   the archive and rejects an empty value, whitespace, a URL/path, malformed
+   DNS, or the placeholder `api.wattracker.com` without printing the host.
+4. Runs the Swift test suite on the iPhone 17 Pro simulator. A failing test
    costs nothing but time at this point.
-4. Writes the `.p8` to `$RUNNER_TEMP` under `umask 077`, verifies it parses as
+5. Writes the `.p8` to `$RUNNER_TEMP` under `umask 077`, verifies it parses as
    a private key, and templates `teamID` into a temporary copy of
    `ExportOptions.plist`.
-5. Decodes `IOS_DIST_P12_B64` into `$RUNNER_TEMP`, creates a keychain with a
+6. Decodes `IOS_DIST_P12_B64` into `$RUNNER_TEMP`, creates a keychain with a
    random password, `security import`s the certificate into it with `-x` (not
    extractable), runs `set-key-partition-list` so `codesign` does not block on
    a GUI prompt, puts that keychain first in the search list, deletes the
-   `.p12`, and asserts an `Apple Distribution` identity actually landed. A
-   dedicated keychain, not the runner user's login keychain, because this
+   temporary certificate files, and asserts an `Apple Distribution` identity
+   actually landed. It reports missing/empty secrets, invalid base64, a p12
+   that cannot be opened with its password, a non-Apple-Distribution identity,
+   an expired certificate, and a team mismatch without printing key material.
+   A dedicated keychain, not the runner user's login keychain, because this
    runner is a physical machine that persists between jobs.
-6. `xcodebuild archive` for `generic/platform=iOS`, with **manual** signing:
+7. `xcodebuild archive` for `generic/platform=iOS`, with **manual** signing:
    `CODE_SIGN_IDENTITY="Apple Distribution"`,
    `PROVISIONING_PROFILE_SPECIFIER="WatTracker App Store"`, and
    `OTHER_CODE_SIGN_FLAGS="--keychain …"` pinning `codesign` to the job's own
@@ -303,7 +358,7 @@ Two practical notes:
 
    The signing settings from `Config/Base.xcconfig` — which ad-hoc sign — are
    overridden here on the command line and nowhere on disk.
-7. `xcodebuild -exportArchive` with the templated options, then asserts no
+8. `xcodebuild -exportArchive` with the templated options, then asserts no
    `.p8` ended up inside the archive or the export. The export **re-signs**, so
    it needs the signing keychain too — which is why the cleanup that deletes it
    is at the end of the job and not straight after the archive.
@@ -311,10 +366,10 @@ Two practical notes:
    (`signingStyle` `manual`, `provisioningProfiles` mapping
    `com.wattracker.ios`); a mismatch there re-signs with something else and is
    not caught until Apple rejects the upload.
-8. `xcrun altool --validate-app`, then `--upload-app`. Validation first because
+9. `xcrun altool --validate-app`, then `--upload-app`. Validation first because
    it is where a missing app record surfaces in seconds rather than after a
    full upload.
-9. An `if: always()` step restores the keychain search list, deletes the
+10. An `if: always()` step restores the keychain search list, deletes the
    signing keychain, and removes the API key, the templated plist, the archive,
    the export and both DerivedData trees — and fails the job if either the
    keychain or the key directory survives. The runner is a physical machine
@@ -334,12 +389,34 @@ keeps out of the tree. Nothing needs it: the build's destination is TestFlight.
 - `No App Store Connect app record` / `The bundle ID could not be found` at the
   validate step — the one-time setup above has not been done, or the bundle id
   in the record does not match `com.wattracker.ios`.
+- `WATTRACKER_IOS_API_HOST is missing, empty, or contains whitespace` — the
+  owner did not set the environment secret, or pasted a value with a newline.
+  Run the helper from the owner's Mac, or use the stdin-only command above.
+- `WATTRACKER_IOS_API_HOST must be a hostname` / `must not be the placeholder`
+  — store only the production DNS name, without `https://`, a path, port, query,
+  whitespace, or the checked-in placeholder `api.wattracker.com`.
 - `did not parse as a private key` — `APP_STORE_CONNECT_PRIVATE_KEY` was pasted
   without its newlines or without the BEGIN/END lines. It must be the file's
   full contents.
 - `The ios-code-signing environment did not supply the signing credentials` /
   `... did not supply the distribution certificate` — the job lost its
   `environment:` declaration, or a secret was renamed.
+- `The distribution certificate secret is not valid base64` — recreate the
+  secret with `scripts/ios_release_secrets.py`; do not paste wrapped or
+  truncated base64.
+- `The distribution certificate p12 could not be opened; check its password` —
+  the p12 password secret does not match the exported identity, or the p12 is
+  not a readable PKCS#12 file. The helper sets both values together and sends
+  them to GitHub over stdin.
+- `The distribution certificate is expired` — create or rotate the Apple
+  Distribution certificate before another release.
+- `The distribution certificate team does not match APPLE_TEAM_ID` — the
+  selected identity belongs to a different Apple Developer team; select the
+  correct identity and refresh the secrets.
+- `The distribution certificate p12 contains no Apple Distribution identity` —
+  the selected/exported identity was development or otherwise did not import
+  as a valid Apple Distribution identity. The workflow never prints private
+  key material while making this distinction.
 - `SecKeychainItemImport: MAC verification failed during PKCS12 import (wrong
   password?)` or `Unknown format in import` at the import step — the `.p12` was
   built with OpenSSL 3's defaults. macOS's `security` tool understands only the
