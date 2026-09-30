@@ -271,8 +271,8 @@ def test_workflow_uses_system_roots_without_mutating_trust_settings():
     search_list_setup = signing_setup[search_list:search_list_end]
     assert '/Library/Keychains/System.keychain' in search_list_setup
     assert '/System/Library/Keychains/SystemRootCertificates.keychain' in search_list_setup
-    assert search_list_setup.index('/Library/Keychains/System.keychain') < search_list_setup.index('"$keychain"')
-    assert "login.keychain-db" not in search_list_setup
+    assert search_list_setup.index('/Library/Keychains/System.keychain') < search_list_setup.index('login.keychain-db')
+    assert search_list_setup.index('login.keychain-db') < search_list_setup.index('"$keychain"')
     assert "add-trusted-cert" not in signing_setup
     assert "remove-trusted-cert" not in signing_setup
     assert 'echo "IOS_ROOT_TRUST_CERT=$root_cert" >> "$GITHUB_ENV"' not in signing_setup
@@ -283,7 +283,10 @@ def test_workflow_uses_system_roots_without_mutating_trust_settings():
         'security find-identity -v -p codesigning '
         '/System/Library/Keychains/SystemRootCertificates.keychain 2>&1 || true'
     ) in signing_setup
-    assert 'if [ "${system_identity_count:-0}" -ne 0 ]; then' in signing_setup
+    assert (
+        'security find-identity -v -p codesigning login.keychain-db 2>&1 || true'
+    ) in signing_setup
+    assert 'if [ "${non_job_identity_count:-0}" -ne 0 ]; then' in signing_setup
     assert 'if [ "${identity_count:-0}" -ne 1 ] || [ "${distribution_count:-0}" -ne 1 ]; then' in signing_setup
 
 
@@ -548,7 +551,7 @@ def test_workflow_diagnose_summary_has_exact_safe_boundary():
     script = _workflow_step_script("Import the distribution certificate into a temporary keychain")
     start_marker = 'if [ "${DIAGNOSE_SIGNING:-false}" = "true" ]; then\n'
     system_guard_marker = (
-        'system_identities="$(\n'
+        'non_job_identities="$(\n'
         '  security find-identity -v -p codesigning /Library/Keychains/System.keychain'
     )
     start = script.index(start_marker)
@@ -579,7 +582,7 @@ def test_workflow_diagnose_summary_never_prints_fake_security_identity_name(tmp_
     script = _workflow_step_script("Import the distribution certificate into a temporary keychain")
     start = script.index('if [ "${DIAGNOSE_SIGNING:-false}" = "true" ]; then')
     end = script.index(
-        'system_identities="$(\n'
+        'non_job_identities="$(\n'
         '  security find-identity -v -p codesigning /Library/Keychains/System.keychain',
         start,
     )

@@ -411,12 +411,15 @@ jobs:
           fi
           # Keep trust settings untouched: user-domain trust changes require
           # an interactive authentication dialog, which this headless
-          # LaunchDaemon runner cannot answer. The system keychain carries
-          # Apple's trust settings and the system-root keychain carries the
-          # built-in anchors, so expose both for chain construction.
+          # LaunchDaemon runner cannot answer. Expose the runner's normal
+          # login keychain as well as Apple's system stores for chain
+          # construction; codesign's chain builder may need an intermediate
+          # that is not in the temporary keychain. The non-job identity guard
+          # below fails closed before codesign can select a persistent key.
           security list-keychains -d user -s \
             /Library/Keychains/System.keychain \
             /System/Library/Keychains/SystemRootCertificates.keychain \
+            login.keychain-db \
             "$keychain"
           if ! security import "$wwdr_cert" -k "$keychain" -T /usr/bin/codesign \
               >/dev/null 2>&1; then
@@ -472,14 +475,15 @@ jobs:
             printf 'Diagnostic certificate type: Apple WWDR G3 intermediate\n'
             printf 'Diagnostic certificate expiry: %s\n' "$wwdr_expiry"
           fi
-          system_identities="$(
+          non_job_identities="$(
             security find-identity -v -p codesigning /Library/Keychains/System.keychain 2>&1 || true
             security find-identity -v -p codesigning /System/Library/Keychains/SystemRootCertificates.keychain 2>&1 || true
+            security find-identity -v -p codesigning login.keychain-db 2>&1 || true
           )"
-          system_identity_count="$(printf '%s\n' "$system_identities" \
+          non_job_identity_count="$(printf '%s\n' "$non_job_identities" \
             | grep -Ec '^[[:space:]]+[0-9]+\)' || true)"
-          if [ "${system_identity_count:-0}" -ne 0 ]; then
-            echo "The system keychain contains a signing identity; refusing to sign." >&2
+          if [ "${non_job_identity_count:-0}" -ne 0 ]; then
+            echo "A non-job keychain contains a signing identity; refusing to sign." >&2
             exit 1
           fi
           identities="$(security find-identity -v -p codesigning "$keychain" 2>&1 || true)"
@@ -520,10 +524,10 @@ jobs:
       #    on the runner nor carried as a secret. It has to already exist in
       #    the account - docs/ios-testflight.md has the one-time creation.
       #
-      #    The signing search list contains only the job keychain and Apple's
-          #    two system keychains, then the job keychain. The import step
-          #    fails closed if either system keychain contains any signing
-          #    identity.
+      #    The signing search list contains Apple's two system keychains, the
+      #    runner's login keychain for chain construction, and the job
+      #    keychain. The import step fails closed if any non-job keychain
+      #    contains a signing identity.
       #    We deliberately do not pass OTHER_CODE_SIGN_FLAGS=--keychain: the
       #    root chain must be discoverable through the standard search list.
       #    The archive step temporarily makes this keychain the user's default
