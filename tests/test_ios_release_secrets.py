@@ -321,7 +321,7 @@ def test_workflow_reunlocks_and_sets_partition_list_immediately_before_archive()
     xcodebuild = archive.index("archive_with_redacted_output xcodebuild archive")
     assert mask < env_record
     assert unlock < partition < xcodebuild
-    assert 'OTHER_CODE_SIGN_FLAGS="--keychain $IOS_SIGNING_KEYCHAIN"' not in archive
+    assert 'OTHER_CODE_SIGN_FLAGS="--keychain $IOS_SIGNING_KEYCHAIN"' in archive
     import_start = workflow.index(
         "- name: Import the distribution certificate into a temporary keychain"
     )

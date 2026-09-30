@@ -528,8 +528,9 @@ jobs:
       #    runner's login keychain for chain construction, and the job
       #    keychain. The import step fails closed if any non-job keychain
       #    contains a signing identity.
-      #    We deliberately do not pass OTHER_CODE_SIGN_FLAGS=--keychain: the
-      #    root chain must be discoverable through the standard search list.
+      #    The job keychain contains the pinned root, WWDR G3, and the one
+      #    signing identity, so OTHER_CODE_SIGN_FLAGS=--keychain keeps the
+      #    archive's codesign lookup inside this job's keychain.
       #    The archive step temporarily makes this keychain the user's default
       #    as well, because Security.framework's non-GUI signing path consults
       #    that default while opening the private key. The previous default is
@@ -663,6 +664,7 @@ jobs:
             PROVISIONING_PROFILE_SPECIFIER="WatTracker App Store" \
             CODE_SIGNING_REQUIRED=YES \
             CODE_SIGNING_ALLOWED=YES \
+            OTHER_CODE_SIGN_FLAGS="--keychain $IOS_SIGNING_KEYCHAIN" \
             WATTRACKER_API_SCHEME="$WATTRACKER_API_SCHEME" \
             WATTRACKER_API_HOST="$WATTRACKER_API_HOST" \
             MARKETING_VERSION="$MARKETING_VERSION" \

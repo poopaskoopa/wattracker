@@ -388,9 +388,8 @@ Two practical notes:
    avoids user trust-settings changes, which would require an authentication
    dialog unavailable to the headless LaunchDaemon runner. The signing
    certificate is imported with `-x` (not extractable). The workflow fails
-   closed if any non-job keychain contains a signing identity, so dropping
-   `OTHER_CODE_SIGN_FLAGS="--keychain …"` does not permit a different signing
-   key to be selected. The temporary certificate files are deleted and the job
+   closed if any non-job keychain contains a signing identity. The temporary
+   certificate files are deleted and the job
    asserts exactly one `Apple Distribution` identity in the job keychain. The archive step then
    re-unlocks the job keychain and runs
    `set-key-partition-list -S apple-tool:,apple:,codesign:` immediately before
@@ -399,10 +398,11 @@ Two practical notes:
    default so Security.framework's non-GUI private-key path uses it. The
    previous default is captured without printing it and restored by the
    unconditional cleanup. The generated keychain password is masked before it
-   crosses the step boundary. The explicit four-keychain search list is the
-   deliberate compromise: it supplies the system trust settings, built-in
-   anchors, and the login keychain's chain material while the non-job identity
-   guard fails closed if any persistent keychain is ever used for signing. It reports missing/empty
+   crosses the step boundary. The explicit four-keychain search list is used
+   for import and validation, while archive passes
+   `OTHER_CODE_SIGN_FLAGS="--keychain …"` because the pinned root, WWDR G3,
+   and one signing identity make the job keychain self-contained. The non-job
+   identity guard remains fail-closed. It reports missing/empty
    secrets, invalid base64, a p12 that cannot be opened with its password, a
    non-Apple-Distribution identity, an expired certificate, and a team mismatch
    without printing key material. A dedicated keychain, not the runner user's
@@ -411,9 +411,10 @@ Two practical notes:
 7. `xcodebuild archive` for `generic/platform=iOS`, with **manual** signing:
    `CODE_SIGN_IDENTITY="Apple Distribution"`,
    `PROVISIONING_PROFILE_SPECIFIER="WatTracker App Store"`. The archive uses
-   the four-keychain search list established in step 6; the two system
-   keychains and login keychain are available for Apple's trusted chain, while
-   the job keychain supplies the one permitted signing identity.
+   the four-keychain search list established in step 6, but the
+   `OTHER_CODE_SIGN_FLAGS` restriction makes codesign use only the job
+   keychain, which contains the pinned root, WWDR G3, and the one permitted
+   signing identity.
    `-allowProvisioningUpdates` and the three `-authenticationKey*`
    flags are still there, now doing the one job they can do: registering the
    App ID and downloading that profile from the portal, so it is neither
