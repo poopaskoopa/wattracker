@@ -641,7 +641,7 @@ jobs:
           if [ "${DIAGNOSE_SIGNING:-false}" = "true" ]; then
             probe_path="$RUNNER_TEMP/wattracker-codesign-probe"
             probe_error="$RUNNER_TEMP/wattracker-codesign-probe.err"
-            : > "$probe_path"
+            cp /usr/bin/true "$probe_path"
             if [ -n "$probe_identity_hash" ] && \
                 /usr/bin/codesign --force --timestamp=none \
                   --sign "$probe_identity_hash" --keychain "$keychain" \
