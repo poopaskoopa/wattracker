@@ -382,15 +382,13 @@ Two practical notes:
    random password, verifies the pinned Apple Root CA and WWDR G3 DER files,
    and verifies the owner's leaf against that public chain. It imports the
    pinned WWDR intermediate and private identity into the temporary job
-   keychain. The pinned root is deliberately not copied into that keychain:
-   an untrusted duplicate can shadow Apple's trusted system root during
-   codesign chain building. The search list puts Apple's system keychains
-   first, followed by the disposable job keychain:
+   keychain. The search list puts Apple's system keychains first, followed by
+   the disposable job keychain containing the pinned root and WWDR:
    `/Library/Keychains/System.keychain` (system trust settings), and
    `/System/Library/Keychains/SystemRootCertificates.keychain` (built-in
    anchors). The persistent login keychain is deliberately excluded, so a
    competing public chain cannot shadow Apple's system chain. The workflow
-   verifies the leaf against the pinned Apple Root CA
+   verifies the leaf against and imports the pinned Apple Root CA
    and WWDR G3 chain, then deliberately omits `OTHER_CODE_SIGN_FLAGS=--keychain`
    so nested codesign invocations can use Apple's immutable system-root store
    without changing trust settings. The private identity remains in the disposable job

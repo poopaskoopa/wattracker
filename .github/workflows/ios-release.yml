@@ -409,16 +409,20 @@ jobs:
           security set-keychain-settings -lut 3600 "$keychain"
           security unlock-keychain -p "$keychain_password" "$keychain"
           # Verify the leaf against the pinned public chain before importing
-          # the private identity. Do not copy the root into the disposable
-          # keychain: an untrusted duplicate can shadow the trusted Apple root
-          # in codesign's chain builder. Codesign remains unrestricted and
-          # uses Apple's immutable system-root store. Do not call
+          # the private identity. Import the pinned root into the disposable
+          # keychain while keeping Apple's system stores first in the search
+          # path. Do not call
           # add-trusted-cert: that mutates the runner's user trust database and
           # can summon SecurityAgent on a headless LaunchDaemon.
           if ! security verify-cert -p codeSign \
               -c "$cert_pem" -c "$wwdr_cert" -r "$root_cert" \
               >/dev/null 2>&1; then
             echo "The distribution certificate chain did not match the pinned Apple chain." >&2
+            exit 1
+          fi
+          if ! security import "$root_cert" -t cert -f x509 \
+              -k "$keychain" -T /usr/bin/codesign >/dev/null 2>&1; then
+            echo "The checked-in Apple Root CA certificate could not be imported." >&2
             exit 1
           fi
           # Put the complete job chain first, then expose the runner's normal
