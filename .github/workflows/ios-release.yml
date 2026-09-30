@@ -407,9 +407,9 @@ jobs:
           # Import the pinned root as a public certificate into the job
           # keychain. Do not call add-trusted-cert: that mutates the runner's
           # user trust database and can summon SecurityAgent on a headless
-          # LaunchDaemon. The archive deliberately omits --keychain so
-          # codesign can use Apple's immutable system-root trust store for the
-          # anchor while the job keychain supplies the private identity.
+          # LaunchDaemon. The archive is explicitly restricted to this job
+          # keychain, so the pinned root must be present here for chain
+          # construction.
           if ! security import "$root_cert" -t cert -f x509 \
               -k "$keychain" -T /usr/bin/codesign >/dev/null 2>&1; then
             echo "The checked-in Apple Root CA certificate could not be imported." >&2
@@ -532,10 +532,10 @@ jobs:
       #    runner's login keychain and Apple's two system keychains. The import
       #    step fails closed if any non-job keychain contains a signing
       #    identity. The job keychain contains the pinned Apple Root CA and
-      #    complete signing chain. Do not pass --keychain here: codesign must
-      #    also consult Apple's immutable system-root store for the trust
-      #    anchor. The non-job identity guard still prevents a persistent
-      #    private key from being selected.
+      #    complete signing chain; OTHER_CODE_SIGN_FLAGS limits every nested
+      #    codesign invocation to that disposable keychain. The non-job
+      #    identity guard still prevents a persistent private key from being
+      #    selected.
       #    The archive step temporarily makes this keychain the user's default
       #    as well, because Security.framework's non-GUI signing path consults
       #    that default while opening the private key. The previous default is
@@ -665,6 +665,7 @@ jobs:
             DEVELOPMENT_TEAM="$APPLE_TEAM_ID" \
             CODE_SIGN_STYLE=Manual \
             CODE_SIGN_IDENTITY="Apple Distribution" \
+            OTHER_CODE_SIGN_FLAGS="--keychain $IOS_SIGNING_KEYCHAIN" \
             PROVISIONING_PROFILE_SPECIFIER="WatTracker App Store" \
             CODE_SIGNING_REQUIRED=YES \
             CODE_SIGNING_ALLOWED=YES \

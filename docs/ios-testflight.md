@@ -386,10 +386,10 @@ Two practical notes:
    `login.keychain-db` (the runner's normal chain store),
    `/Library/Keychains/System.keychain` (system trust settings), and
    `/System/Library/Keychains/SystemRootCertificates.keychain` (built-in
-   anchors). The archive intentionally does not pass `--keychain`: this keeps
-   the private identity in the job keychain while allowing codesign to use
-   Apple's immutable system-root store for the trust anchor. This avoids
-   changing the runner user's trust database.
+   anchors). The archive passes `OTHER_CODE_SIGN_FLAGS=--keychain` to every
+   nested codesign invocation. The pinned Apple Root CA, WWDR G3 intermediate,
+   and private identity are therefore all resolved from the disposable job
+   keychain; the workflow does not modify the runner user's trust database.
    The runner's `SessionCreate=true` prerequisite is still required for the
    non-GUI keychain operations. The signing certificate is imported with
    `-x` (not extractable). The workflow fails closed if any non-job keychain
@@ -415,9 +415,8 @@ Two practical notes:
    `CODE_SIGN_IDENTITY="Apple Distribution"`,
    `PROVISIONING_PROFILE_SPECIFIER="WatTracker App Store"`. The archive uses
    the four-keychain search list established in step 6. Codesign uses the one
-   permitted identity from the job keychain and Apple's system-root store for
-   the trust anchor; no `OTHER_CODE_SIGN_FLAGS=--keychain` restriction is
-   passed, because that restriction would hide the system root.
+   permitted identity and the pinned chain from the job keychain via
+   `OTHER_CODE_SIGN_FLAGS=--keychain`; no persistent private key is eligible.
    `-allowProvisioningUpdates` and the three `-authenticationKey*`
    flags are still there, now doing the one job they can do: registering the
    App ID and downloading that profile from the portal, so it is neither
