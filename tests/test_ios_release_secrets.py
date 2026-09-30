@@ -150,7 +150,7 @@ def test_workflow_validates_and_passes_the_secret_backed_host_separately():
     assert 'WATTRACKER_API_SCHEME="$WATTRACKER_API_SCHEME"' in workflow
     assert 'WATTRACKER_API_HOST="$WATTRACKER_API_HOST"' in workflow
     assert workflow.index("- name: Validate the iOS API host") < workflow.index(
-        "- name: Archive for the App Store"
+        "- name: Import signing material and archive"
     )
     assert "api.wattracker.com" in workflow
     assert "contains whitespace" in workflow
@@ -258,11 +258,15 @@ def test_workflow_pins_and_verifies_the_checked_in_apple_root_before_validity_ch
 def test_workflow_uses_the_system_root_store_without_a_job_keychain_restriction():
     workflow = WORKFLOW.read_text(encoding="utf-8")
     search_list_command = 'security list-keychains -d user -s'
-    archive_start = workflow.index("- name: Archive for the App Store")
+    archive_start = workflow.index("      # The archive in the combined signing step above.")
     import_start = workflow.index(
-        "- name: Import the distribution certificate into a temporary keychain"
+        "- name: Import signing material and archive"
     )
-    signing_setup = workflow[import_start:archive_start]
+    signing_setup = workflow[
+        import_start:workflow.index(
+            "          # Keep import and archive in one process.", import_start
+        )
+    ]
 
     assert signing_setup.count(search_list_command) == 1
     search_list = signing_setup.index(search_list_command)
@@ -310,14 +314,17 @@ def test_workflow_restores_keychain_state_and_cleanup_unconditionally():
 
 def test_workflow_reunlocks_and_sets_partition_list_immediately_before_archive():
     workflow = WORKFLOW.read_text(encoding="utf-8")
-    archive_start = workflow.index("- name: Archive for the App Store")
-    archive = workflow[archive_start:]
+    archive_start = workflow.index("          # Keep import and archive in one process.")
+    archive_end = workflow.index(
+        "      # The archive in the combined signing step above.", archive_start
+    )
+    archive = workflow[archive_start:archive_end]
     mask = workflow.index("printf '::add-mask::%s\\n' \"$keychain_password\"")
     env_record = workflow.index(
         'echo "IOS_SIGNING_KEYCHAIN_PASSWORD=$keychain_password" >> "$GITHUB_ENV"'
     )
     unlock = archive.index(
-        'security unlock-keychain -p "$IOS_SIGNING_KEYCHAIN_PASSWORD" "$IOS_SIGNING_KEYCHAIN"'
+        'security unlock-keychain -p "$keychain_password" "$keychain"'
     )
     partition = archive.index(
         "security set-key-partition-list -S apple-tool:,apple:,codesign: -s"
@@ -327,24 +334,34 @@ def test_workflow_reunlocks_and_sets_partition_list_immediately_before_archive()
     assert mask < env_record
     assert search_list < unlock < partition < xcodebuild
     archive_search_list = archive[search_list:unlock]
-    assert '"$IOS_SIGNING_KEYCHAIN"' in archive_search_list
+    assert '"$keychain"' in archive_search_list
     assert 'login.keychain-db' in archive_search_list
     assert '/Library/Keychains/System.keychain' in archive_search_list
     assert '/System/Library/Keychains/SystemRootCertificates.keychain' in archive_search_list
     assert 'OTHER_CODE_SIGN_FLAGS="--keychain $IOS_SIGNING_KEYCHAIN"' not in archive
     import_start = workflow.index(
-        "- name: Import the distribution certificate into a temporary keychain"
+        "- name: Import signing material and archive"
     )
-    archive_start = workflow.index("- name: Archive for the App Store")
+    archive_start = workflow.index("          # Keep import and archive in one process.")
     import_setup = workflow[import_start:archive_start]
     assert 'original_default_keychain="$(security default-keychain -d user' in import_setup
     assert 'original_default_keychain="login.keychain-db"' in import_setup
     assert 'echo "IOS_ORIGINAL_DEFAULT_KEYCHAIN=$original_default_keychain" >> "$GITHUB_ENV"' in import_setup
-    assert 'security default-keychain -d user -s "$IOS_SIGNING_KEYCHAIN"' in archive
+    assert 'security default-keychain -d user -s "$keychain"' in archive
+
+
+def test_workflow_keeps_import_and_archive_in_one_signing_step():
+    workflow = WORKFLOW.read_text(encoding="utf-8")
+    assert workflow.count("- name: Import signing material and archive") == 1
+    assert "- name: Archive for the App Store" not in workflow
+    signing_step = _workflow_step_script("Import signing material and archive")
+    assert signing_step.index('security import "$p12"') < signing_step.index(
+        "archive_with_redacted_output xcodebuild archive"
+    )
 
 
 def _archive_script() -> str:
-    script = _workflow_step_script("Archive for the App Store")
+    script = _workflow_step_script("Import signing material and archive")
     return script[script.index('export IOS_CERT_CN='):]
 
 
@@ -668,7 +685,7 @@ def test_export_redaction_masks_apple_ordered_identity_lines(tmp_path):
 
 
 def test_workflow_diagnose_summary_has_exact_safe_boundary():
-    script = _workflow_step_script("Import the distribution certificate into a temporary keychain")
+    script = _workflow_step_script("Import signing material and archive")
     start_marker = 'if [ "${DIAGNOSE_SIGNING:-false}" = "true" ]; then\n'
     system_guard_marker = (
         'non_job_identities="$(\n'
@@ -699,7 +716,7 @@ def test_workflow_diagnose_summary_has_exact_safe_boundary():
 
 
 def test_workflow_diagnose_summary_never_prints_fake_security_identity_name(tmp_path):
-    script = _workflow_step_script("Import the distribution certificate into a temporary keychain")
+    script = _workflow_step_script("Import signing material and archive")
     start = script.index('if [ "${DIAGNOSE_SIGNING:-false}" = "true" ]; then')
     end = script.index(
         'non_job_identities="$(\n'

@@ -398,12 +398,13 @@ Two practical notes:
    `-x` (not extractable). The workflow fails closed if any non-job keychain
    contains a signing identity. The temporary certificate files are deleted
    and the job
-   asserts exactly one `Apple Distribution` identity in the job keychain. The archive step then
-   re-unlocks the job keychain and runs
+   asserts exactly one `Apple Distribution` identity in the job keychain. The
+   same signing step then re-unlocks the job keychain and runs
    `set-key-partition-list -S apple-tool:,apple:,codesign:` immediately before
-   `xcodebuild archive`; the command targets signing keys with `-s`. The
-   four-keychain search list is re-established in the archive and export steps
-   because each Actions step starts a fresh process. Immediately
+   `xcodebuild archive`; the command targets signing keys with `-s`. Keeping
+   import and archive in one Actions step preserves the same Security.framework
+   session while codesign builds the chain. The four-keychain search list is
+   re-established in that combined step and in export. Immediately
    before archive, the workflow also makes the temporary keychain the user's
    default so Security.framework's non-GUI private-key path uses it. The
    previous default is captured without printing it and restored by the
@@ -416,10 +417,10 @@ Two practical notes:
    without printing key material. A dedicated keychain, not the runner user's
    login keychain, because this runner is a physical machine that persists
    between jobs.
-7. `xcodebuild archive` for `generic/platform=iOS`, with **manual** signing:
+7. The archive in step 6 uses `generic/platform=iOS`, with **manual** signing:
    `CODE_SIGN_IDENTITY="Apple Distribution"`,
    `PROVISIONING_PROFILE_SPECIFIER="WatTracker App Store"`. The archive uses
-   the four-keychain search list established in step 6. Codesign uses the one
+   the four-keychain search list established in the combined step. Codesign uses the one
    permitted identity from the job keychain and Apple's system-root store for
    the trust anchor; no persistent private key is eligible.
    `-allowProvisioningUpdates` and the three `-authenticationKey*`

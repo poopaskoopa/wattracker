@@ -295,11 +295,15 @@ jobs:
       #
       # No `set -x`, here or anywhere below: the passphrase, the keychain
       # password and the decoded p12 all pass through this shell.
-      - name: Import the distribution certificate into a temporary keychain
+      - name: Import signing material and archive
         env:
           IOS_DIST_P12_B64: ${{ secrets.IOS_DIST_P12_B64 }}
           IOS_DIST_P12_PASSWORD: ${{ secrets.IOS_DIST_P12_PASSWORD }}
           APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          ASC_KEY_ID: ${{ secrets.APP_STORE_CONNECT_KEY_ID }}
+          ASC_ISSUER_ID: ${{ secrets.APP_STORE_CONNECT_ISSUER_ID }}
+          WATTRACKER_API_SCHEME: https
+          WATTRACKER_API_HOST: ${{ secrets.WATTRACKER_IOS_API_HOST }}
           DIAGNOSE_SIGNING: ${{ inputs.diagnose_signing }}
         run: |
           set -euo pipefail
@@ -329,8 +333,8 @@ jobs:
           # always-run step must know the path even when a later command fails.
           echo "IOS_SIGNING_KEYCHAIN=$keychain" >> "$GITHUB_ENV"
           echo "IOS_ORIGINAL_DEFAULT_KEYCHAIN=$original_default_keychain" >> "$GITHUB_ENV"
-          # The archive is a separate step, so mask this generated password
-          # before it crosses the step boundary. It is never printed.
+          # Export is a separate step, so mask this generated password before
+          # it crosses the step boundary. It is never printed.
           printf '::add-mask::%s\n' "$keychain_password"
           echo "IOS_SIGNING_KEYCHAIN_PASSWORD=$keychain_password" >> "$GITHUB_ENV"
           # umask before the redirection, not chmod after: the p12 must never
@@ -507,75 +511,10 @@ jobs:
           fi
           echo "Imported the distribution identity into a job-scoped keychain."
 
-      # The archive. Four groups of arguments are doing distinct work:
-      #
-      # 1. The signing overrides. Config/Base.xcconfig ad-hoc signs
-      #    (CODE_SIGN_IDENTITY = -, CODE_SIGNING_REQUIRED = NO,
-      #    CODE_SIGN_STYLE = Manual) so that a clone with no Apple credentials
-      #    still builds for a simulator. A device archive needs the opposite of
-      #    two of those three. Command-line build settings beat an xcconfig, so
-      #    they are overridden here and nowhere on disk changes - which is the
-      #    point: the team identifier exists only in this process's argument
-      #    list, for the length of this step.
-      #
-      # 2. MANUAL signing with a named profile, and this is the part that was
-      #    wrong before. CODE_SIGN_STYLE=Automatic does not work for this
-      #    project: Xcode decides development-vs-distribution for automatic
-      #    signing from the target's ProvisioningStyle attribute in the
-      #    .pbxproj, and this project deliberately has no such attribute -
-      #    every signing setting lives in the xcconfig so that a
-      #    credential-less clone still builds. With nothing to read, automatic
-      #    signing resolves to development and the archive fails; both of the
-      #    failure messages are quoted in the certificate-import step above.
-      #
-      #    Manual signing removes the guess. PROVISIONING_PROFILE_SPECIFIER
-      #    names the App Store profile by name; -allowProvisioningUpdates below
-      #    downloads it from the developer portal, so it is neither installed
-      #    on the runner nor carried as a secret. It has to already exist in
-      #    the account - docs/ios-testflight.md has the one-time creation.
-      #
-      #    The signing search list contains the job keychain first, then the
-      #    runner's login keychain and Apple's two system keychains. The import
-      #    step fails closed if any non-job keychain contains a signing
-      #    identity. The pinned root, leaf, and WWDR are in the job keychain,
-      #    and the root/WWDR/leaf chain was verified before import. Do not pass
-      #    --keychain here: the standard search path remains available for
-      #    Apple's immutable system-root store and any other public
-      #    intermediates. The non-job identity guard still prevents a
-      #    persistent private key from being selected.
-      #    The archive step temporarily makes this keychain the user's default
-      #    as well, because Security.framework's non-GUI signing path consults
-      #    that default while opening the private key. The previous default is
-      #    captured without printing it and restored by the always-run cleanup.
-      #
-      # 3. -allowProvisioningUpdates plus the three -authenticationKey* flags.
-      #    Together these let xcodebuild talk to the developer portal as the
-      #    API key, to register the App ID for com.wattracker.ios if it does
-      #    not exist and to download the App Store provisioning profile. Note
-      #    what is NOT in that list: it does not issue the distribution
-      #    certificate. See the import step above. Without the key flags,
-      #    -allowProvisioningUpdates falls back to an Apple account configured
-      #    in Xcode's own Accounts pane, which a CI job does not have.
-      #
-      # 4. The version numbers, from the step above.
-      #
-      # -destination 'generic/platform=iOS' rather than a concrete device: an
-      # archive is built for the device family, not for one device.
-      #
-      # No -verbose. The verbose log echoes the full compiler and codesign
-      # invocations, which include -authenticationKeyPath; the path is not
-      # itself secret, but a log that names it invites the next person to paste
-      # it somewhere. -quiet is not used either - the default is the level at
-      # which a signing failure is readable.
-      - name: Archive for the App Store
-        env:
-          ASC_KEY_ID: ${{ secrets.APP_STORE_CONNECT_KEY_ID }}
-          ASC_ISSUER_ID: ${{ secrets.APP_STORE_CONNECT_ISSUER_ID }}
-          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
-          WATTRACKER_API_SCHEME: https
-          WATTRACKER_API_HOST: ${{ secrets.WATTRACKER_IOS_API_HOST }}
-        run: |
-          set -euo pipefail
+          # Keep import and archive in one process. The runner's keychain and
+          # Security.framework session then remain the same while codesign
+          # builds the Apple chain; export is a separate action and repeats
+          # the unlock and partition setup below.
           export IOS_CERT_CN="$(/usr/bin/openssl x509 \
             -in "$RUNNER_TEMP/wattracker-ios-distribution-cert.pem" -noout -subject \
             -nameopt sep_multiline,utf8 | sed -n 's/^ *CN=//p')"
@@ -649,20 +588,21 @@ jobs:
           PERL
           }
 
-          # Make the job keychain the default only for the archive/export
-          # window, re-establish the complete search list, then re-unlock it
-          # immediately before archive. The WWDR intermediate and private
-          # identity are in that keychain; the system search path supplies the
-          # trusted Apple root. This partition list avoids a GUI prompt.
-          security default-keychain -d user -s "$IOS_SIGNING_KEYCHAIN"
+          # Import and archive share the same security session. Re-establish
+          # the complete search list, make the job keychain the default, then
+          # re-unlock it and set the partition list immediately before the
+          # archive. Do not pass OTHER_CODE_SIGN_FLAGS=--keychain: codesign
+          # must see the public Apple root while the non-job identity guard
+          # above prevents a persistent signing key from being selected.
+          security default-keychain -d user -s "$keychain"
           security list-keychains -d user -s \
-            "$IOS_SIGNING_KEYCHAIN" \
+            "$keychain" \
             login.keychain-db \
             /Library/Keychains/System.keychain \
             /System/Library/Keychains/SystemRootCertificates.keychain
-          security unlock-keychain -p "$IOS_SIGNING_KEYCHAIN_PASSWORD" "$IOS_SIGNING_KEYCHAIN"
+          security unlock-keychain -p "$keychain_password" "$keychain"
           security set-key-partition-list -S apple-tool:,apple:,codesign: -s \
-            -k "$IOS_SIGNING_KEYCHAIN_PASSWORD" "$IOS_SIGNING_KEYCHAIN" > /dev/null
+            -k "$keychain_password" "$keychain" > /dev/null
 
           archive_with_redacted_output xcodebuild archive \
             -project ios/WatTracker/WatTracker.xcodeproj \
@@ -686,6 +626,67 @@ jobs:
             MARKETING_VERSION="$MARKETING_VERSION" \
             CURRENT_PROJECT_VERSION="$BUILD_NUMBER"
 
+      # The archive in the combined signing step above. Four groups of
+      # arguments are doing distinct work:
+      #
+      # 1. The signing overrides. Config/Base.xcconfig ad-hoc signs
+      #    (CODE_SIGN_IDENTITY = -, CODE_SIGNING_REQUIRED = NO,
+      #    CODE_SIGN_STYLE = Manual) so that a clone with no Apple credentials
+      #    still builds for a simulator. A device archive needs the opposite of
+      #    two of those three. Command-line build settings beat an xcconfig, so
+      #    they are overridden here and nowhere on disk changes - which is the
+      #    point: the team identifier exists only in this process's argument
+      #    list, for the length of this step.
+      #
+      # 2. MANUAL signing with a named profile, and this is the part that was
+      #    wrong before. CODE_SIGN_STYLE=Automatic does not work for this
+      #    project: Xcode decides development-vs-distribution for automatic
+      #    signing from the target's ProvisioningStyle attribute in the
+      #    .pbxproj, and this project deliberately has no such attribute -
+      #    every signing setting lives in the xcconfig so that a
+      #    credential-less clone still builds. With nothing to read, automatic
+      #    signing resolves to development and the archive fails; both of the
+      #    failure messages are quoted in the certificate-import step above.
+      #
+      #    Manual signing removes the guess. PROVISIONING_PROFILE_SPECIFIER
+      #    names the App Store profile by name; -allowProvisioningUpdates below
+      #    downloads it from the developer portal, so it is neither installed
+      #    on the runner nor carried as a secret. It has to already exist in
+      #    the account - docs/ios-testflight.md has the one-time creation.
+      #
+      #    The signing search list contains the job keychain first, then the
+      #    runner's login keychain and Apple's two system keychains. The import
+      #    step fails closed if any non-job keychain contains a signing
+      #    identity. The pinned root, leaf, and WWDR are in the job keychain,
+      #    and the root/WWDR/leaf chain was verified before import. Do not pass
+      #    --keychain here: the standard search path remains available for
+      #    Apple's immutable system-root store and any other public
+      #    intermediates. The non-job identity guard still prevents a
+      #    persistent private key from being selected.
+      #    The combined signing step temporarily makes this keychain the user's default
+      #    as well, because Security.framework's non-GUI signing path consults
+      #    that default while opening the private key. The previous default is
+      #    captured without printing it and restored by the always-run cleanup.
+      #
+      # 3. -allowProvisioningUpdates plus the three -authenticationKey* flags.
+      #    Together these let xcodebuild talk to the developer portal as the
+      #    API key, to register the App ID for com.wattracker.ios if it does
+      #    not exist and to download the App Store provisioning profile. Note
+      #    what is NOT in that list: it does not issue the distribution
+      #    certificate. See the import step above. Without the key flags,
+      #    -allowProvisioningUpdates falls back to an Apple account configured
+      #    in Xcode's own Accounts pane, which a CI job does not have.
+      #
+      # 4. The version numbers, from the step above.
+      #
+      # -destination 'generic/platform=iOS' rather than a concrete device: an
+      # archive is built for the device family, not for one device.
+      #
+      # No -verbose. The verbose log echoes the full compiler and codesign
+      # invocations, which include -authenticationKeyPath; the path is not
+      # itself secret, but a log that names it invites the next person to paste
+      # it somewhere. -quiet is not used either - the default is the level at
+      # which a signing failure is readable.
       # -exportArchive re-signs the archived app for distribution, so it needs
       # the portal credentials too - this is the step that downloads the App
       # Store profile if the archive step only just created it.
@@ -694,7 +695,7 @@ jobs:
       # deletes it is at the bottom of the job and not immediately after the
       # archive. -exportArchive takes no build settings, so there is no
       # --keychain to pass here: it resolves the identity through the keychain
-      # search list, which the import step set to the job keychain first,
+      # search list, which the combined signing step set to the job keychain first,
       # followed by the login and Apple's two system keychains. The job
       # identity guard prevents a persistent signing key from being selected.
       # ios/WatTracker/ExportOptions.plist names the same profile the
