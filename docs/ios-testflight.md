@@ -78,9 +78,30 @@ is App Store Connect; they are different websites for the same account.
    `DISTRIBUTION` (the modern type; `IOS_DISTRIBUTION` is the legacy name and
    is not needed), converts the returned certificate to PEM, and bundles key +
    certificate + the Apple WWDR intermediate into a `.p12` under a random
-   256-bit passphrase. `--create-profile` then creates the `WatTracker App
+   256-bit passphrase. The release-secrets helper then re-exports the selected
+   identity for CI, and that secret may contain only the key and leaf. The
+   release job installs the pinned public WWDR G3 intermediate from
+   `.github/certs/AppleWWDRCAG3.cer` before validating the chain.
+   `--create-profile` then creates the `WatTracker App
    Store` provisioning profile against that certificate and the bundle
    identifier — the profile the release job signs with by name.
+
+   The workflow supports the documented WWDR G3 generation for Apple
+   Distribution certificates. It verifies the checked-in DER certificate's
+   SHA-256 before importing it and never downloads a certificate at runtime.
+   To check which generation issued an existing local leaf without printing a
+   private key, inspect its issuer:
+
+   ```sh
+   openssl pkcs12 -in distribution.p12 -clcerts -nokeys | \
+     openssl x509 -noout -issuer
+   ```
+
+   The issuer should contain `OU=G3`. `OU=G2`, `OU=G4`, or another generation
+   means the leaf does not chain to the pinned intermediate; rotate the
+   Apple Distribution certificate through the owner process or request a
+   separately reviewed allowlist update. Do not replace the committed
+   certificate ad hoc.
 
    Everything it writes is mode 0600 in `~/.appstoreconnect/`, and it refuses
    to write into a git work tree at all.

@@ -7,6 +7,7 @@ replaced by a runner that records argv and stdin.
 
 from __future__ import annotations
 
+import hashlib
 import os
 import subprocess
 from pathlib import Path
@@ -17,6 +18,8 @@ from scripts import ios_release_secrets as helper
 
 
 WORKFLOW = Path(".github/workflows/ios-release.yml")
+WWDR_CERT = Path(".github/certs/AppleWWDRCAG3.cer")
+WWDR_G3_SHA256 = "dcf21878c77f4198e4b4614f03d696d89c66c66008d4244e1b99161aac91601f"
 
 
 class FakeRunner:
@@ -179,6 +182,310 @@ def test_workflow_classifies_certificate_failures_and_keeps_cleanup_unconditiona
     keychain_record = workflow.index('echo "IOS_SIGNING_KEYCHAIN=$keychain" >> "$GITHUB_ENV"')
     risky_validation = workflow.index("base64 --decode")
     assert keychain_record < risky_validation
+
+
+def test_workflow_pins_and_imports_only_the_checked_in_wwdr_g3_before_validity_check():
+    workflow = WORKFLOW.read_text(encoding="utf-8")
+    assert WWDR_CERT.is_file()
+    assert hashlib.sha256(WWDR_CERT.read_bytes()).hexdigest() == WWDR_G3_SHA256
+    assert f'wwdr_expected_sha256="{WWDR_G3_SHA256}"' in workflow
+    assert "shasum -a 256 \"$wwdr_cert\"" in workflow
+    assert "curl" not in workflow
+    assert "wget" not in workflow
+
+    # Keep the operator literal: changing != to == must make this test fail.
+    fingerprint_comparison = 'if [ "$wwdr_actual_sha256" != "$wwdr_expected_sha256" ]; then'
+    assert workflow.count(fingerprint_comparison) == 1
+    assert 'if [ "$wwdr_actual_sha256" == "$wwdr_expected_sha256" ]; then' not in workflow
+    fingerprint_check = workflow.index(fingerprint_comparison)
+    intermediate_import = workflow.index('security import "$wwdr_cert"')
+    validity_check = workflow.index('security find-identity -v -p codesigning "$keychain"')
+    p12_import = workflow.index('security import "$p12"')
+    assert fingerprint_check < intermediate_import < p12_import < validity_check
+
+
+def test_workflow_masks_leaf_and_wwdr_common_names_before_diagnostics():
+    workflow = WORKFLOW.read_text(encoding="utf-8")
+    leaf_cn = 'printf \'::add-mask::%s\\n\' "$leaf_cn"'
+    leaf_legal_name = 'printf \'::add-mask::%s\\n\' "$leaf_legal_name"'
+    cert_team = 'printf \'::add-mask::%s\\n\' "$cert_team"'
+    wwdr_cn = 'printf \'::add-mask::%s\\n\' "$wwdr_cn"'
+    wwdr_legal_name = 'printf \'::add-mask::%s\\n\' "$wwdr_legal_name"'
+    assert workflow.count(leaf_cn) == 1
+    assert workflow.count(leaf_legal_name) == 1
+    assert workflow.count(cert_team) == 1
+    assert workflow.count(wwdr_cn) == 1
+    assert workflow.count(wwdr_legal_name) == 1
+    for extraction in (
+        "-nameopt sep_multiline,utf8 | sed -n 's/^ *CN=//p'",
+        "-nameopt sep_multiline,utf8 | sed -n 's/^ *O=//p'",
+        "-nameopt sep_multiline,utf8 | sed -n 's/^ *OU=//p'",
+    ):
+        assert extraction in workflow
+    assert workflow.index('leaf_cn="$(/usr/bin/openssl x509') < workflow.index(leaf_cn)
+    assert workflow.index('leaf_legal_name="$(/usr/bin/openssl x509') < workflow.index(leaf_legal_name)
+    assert workflow.index('cert_team="$(/usr/bin/openssl x509') < workflow.index(cert_team)
+    assert workflow.index('wwdr_cn="$(/usr/bin/openssl x509') < workflow.index(wwdr_cn)
+    assert workflow.index('wwdr_legal_name="$(/usr/bin/openssl x509') < workflow.index(wwdr_legal_name)
+    diagnose_start = workflow.index('if [ "${DIAGNOSE_SIGNING:-false}" = "true" ]; then')
+    assert workflow.index(leaf_cn) < diagnose_start
+    assert workflow.index(leaf_legal_name) < diagnose_start
+    assert workflow.index(cert_team) < diagnose_start
+    assert workflow.index(wwdr_cn) < diagnose_start
+    assert workflow.index(wwdr_legal_name) < diagnose_start
+
+
+def test_archive_extracts_apple_ordered_cn_and_o_and_redacts_xcodebuild_streams(tmp_path):
+    script = _workflow_step_script("Archive for the App Store")
+    sentinel_cn = "Apple Distribution: Sentinel Legal Name (TEAM-SENTINEL)"
+    sentinel_o = "Sentinel Legal Name"
+    cert_pem = tmp_path / "wattracker-ios-distribution-cert.pem"
+    key_pem = tmp_path / "sentinel-key.pem"
+    generated = subprocess.run(
+        [
+            "/usr/bin/openssl",
+            "req",
+            "-x509",
+            "-newkey",
+            "rsa:2048",
+            "-nodes",
+            "-days",
+            "30",
+            "-subj",
+            f"/UID=sentinel-uid/CN={sentinel_cn}/OU=TEAM-SENTINEL/O={sentinel_o}/C=US",
+            "-keyout",
+            str(key_pem),
+            "-out",
+            str(cert_pem),
+        ],
+        check=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    assert generated.returncode == 0
+    subject = subprocess.run(
+        [
+            "/usr/bin/openssl",
+            "x509",
+            "-in",
+            str(cert_pem),
+            "-noout",
+            "-subject",
+            "-nameopt",
+            "sep_multiline,utf8",
+        ],
+        check=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    ).stdout
+    assert [line.strip() for line in subject.splitlines()[1:]] == [
+        "UID=sentinel-uid",
+        f"CN={sentinel_cn}",
+        "OU=TEAM-SENTINEL",
+        f"O={sentinel_o}",
+        "C=US",
+    ]
+
+    fake_xcodebuild = tmp_path / "xcodebuild"
+    fake_xcodebuild.write_text(
+        "#!/bin/sh\n"
+        "if [ \"${IOS_CERT_CN:-}\" != \"$EXPECTED_CN\" ] || "
+        "[ \"${IOS_CERT_LEGAL_NAME:-}\" != \"$EXPECTED_O\" ]; then\n"
+        "  echo 'mask values were not exact RDN values' >&2\n"
+        "  exit 42\n"
+        "fi\n"
+        "printf '%s\\n' \"Signing Identity: \\\"$IOS_CERT_CN\\\"\"\n"
+        "printf '%s\\n' \"Signing Identity: \\\"$IOS_CERT_CN\\\"\" >&2\n"
+        "printf '%s\\n' \"Subject O: $IOS_CERT_LEGAL_NAME\"\n"
+        "printf '%s\\n' \"Subject O: $IOS_CERT_LEGAL_NAME\" >&2\n"
+        "exit \"${FAKE_XCODEBUILD_STATUS:-0}\"\n",
+        encoding="utf-8",
+    )
+    fake_xcodebuild.chmod(0o700)
+    environment = os.environ.copy()
+    environment.update(
+        {
+            "PATH": f"{tmp_path}:{environment['PATH']}",
+            "RUNNER_TEMP": str(tmp_path),
+            "APPLE_TEAM_ID": "TEAM-SENTINEL",
+            "IOS_SIGNING_KEYCHAIN": str(tmp_path / "signing.keychain-db"),
+            "EXPECTED_CN": sentinel_cn,
+            "EXPECTED_O": sentinel_o,
+            "ASC_KEY_PATH": str(tmp_path / "AuthKey.p8"),
+            "ASC_KEY_ID": "not-a-secret-key-id",
+            "ASC_ISSUER_ID": "not-a-secret-issuer-id",
+            "WATTRACKER_API_SCHEME": "https",
+            "WATTRACKER_API_HOST": "cloud.example.test",
+            "MARKETING_VERSION": "0.0.0",
+            "BUILD_NUMBER": "1.1",
+        }
+    )
+    result = subprocess.run(
+        ["/bin/bash"],
+        input=script,
+        text=True,
+        env=environment,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        check=False,
+    )
+    assert result.returncode == 0, result.stderr
+    assert sentinel_cn not in result.stdout
+    assert sentinel_cn not in result.stderr
+    assert sentinel_o not in result.stdout
+    assert sentinel_o not in result.stderr
+    assert "Signing Identity: [REDACTED]" in result.stdout
+    assert "Signing Identity: [REDACTED]" in result.stderr
+    assert "Subject O: [REDACTED]" in result.stdout
+    assert "Subject O: [REDACTED]" in result.stderr
+
+
+def test_archive_redaction_preserves_a_failing_xcodebuild_status(tmp_path):
+    script = _workflow_step_script("Archive for the App Store")
+    cert_pem = tmp_path / "wattracker-ios-distribution-cert.pem"
+    key_pem = tmp_path / "sentinel-key.pem"
+    subprocess.run(
+        [
+            "/usr/bin/openssl",
+            "req",
+            "-x509",
+            "-newkey",
+            "rsa:2048",
+            "-nodes",
+            "-days",
+            "30",
+            "-subj",
+            "/UID=sentinel-uid/CN=Apple Distribution: Sentinel Legal Name (TEAM-SENTINEL)/OU=TEAM-SENTINEL/O=Sentinel Legal Name/C=US",
+            "-keyout",
+            str(key_pem),
+            "-out",
+            str(cert_pem),
+        ],
+        check=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    fake_xcodebuild = tmp_path / "xcodebuild"
+    fake_xcodebuild.write_text(
+        "#!/bin/sh\n"
+        "echo 'Signing Identity: \"Apple Distribution: Sentinel Legal Name (TEAM-SENTINEL)\"' >&2\n"
+        "exit 37\n",
+        encoding="utf-8",
+    )
+    fake_xcodebuild.chmod(0o700)
+    environment = os.environ.copy()
+    environment.update(
+        {
+            "PATH": f"{tmp_path}:{environment['PATH']}",
+            "RUNNER_TEMP": str(tmp_path),
+            "APPLE_TEAM_ID": "TEAM-SENTINEL",
+            "IOS_SIGNING_KEYCHAIN": str(tmp_path / "signing.keychain-db"),
+            "ASC_KEY_PATH": str(tmp_path / "AuthKey.p8"),
+            "ASC_KEY_ID": "not-a-secret-key-id",
+            "ASC_ISSUER_ID": "not-a-secret-issuer-id",
+            "WATTRACKER_API_SCHEME": "https",
+            "WATTRACKER_API_HOST": "cloud.example.test",
+            "MARKETING_VERSION": "0.0.0",
+            "BUILD_NUMBER": "1.1",
+        }
+    )
+    result = subprocess.run(
+        ["/bin/bash"],
+        input=script,
+        text=True,
+        env=environment,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        check=False,
+    )
+    assert result.returncode == 37
+    assert "Sentinel Legal Name" not in result.stdout
+    assert "Sentinel Legal Name" not in result.stderr
+
+
+def test_workflow_diagnose_summary_has_exact_safe_boundary():
+    script = _workflow_step_script("Import the distribution certificate into a temporary keychain")
+    start_marker = 'if [ "${DIAGNOSE_SIGNING:-false}" = "true" ]; then\n'
+    validity_marker = 'identities="$(security find-identity -v -p codesigning "$keychain"'
+    start = script.index(start_marker)
+    end = script.index(validity_marker, start)
+    diagnostic = script[start:end]
+
+    assert diagnostic.startswith(start_marker)
+    assert diagnostic.rstrip().endswith("fi")
+    assert script[end:].startswith(validity_marker)
+    assert diagnostic.count("security find-identity") == 2
+    assert 'valid_identity_output="$(security find-identity -v -p codesigning "$keychain" 2>&1 || true)"' in diagnostic
+    assert 'all_identity_output="$(security find-identity -p codesigning "$keychain" 2>&1 || true)"' in diagnostic
+    for summary in (
+        "Diagnostic valid identity count:",
+        "Diagnostic all identity count:",
+        "Diagnostic CSSMERR status count:",
+        "Diagnostic CSSMERR status:",
+        "Diagnostic certificate type:",
+        "Diagnostic certificate expiry:",
+    ):
+        assert summary in diagnostic
+    assert diagnostic.count("printf 'Diagnostic ") == 8
+    for forbidden in ("find-certificate", '"labl"', '"subj"', "-fingerprint", "-sha1"):
+        assert forbidden not in diagnostic
+
+
+def test_workflow_diagnose_summary_never_prints_fake_security_identity_name(tmp_path):
+    script = _workflow_step_script("Import the distribution certificate into a temporary keychain")
+    start = script.index('if [ "${DIAGNOSE_SIGNING:-false}" = "true" ]; then')
+    end = script.index('identities="$(security find-identity', start)
+    diagnostic = script[start:end]
+
+    sentinel = "Apple Distribution: Sentinel Legal Name (TEAM-SENTINEL)"
+    security_runner = tmp_path / "security"
+    security_runner.write_text(
+        "#!/bin/sh\n"
+        "if [ \"$1\" = find-identity ]; then\n"
+        f"  printf '%s\\n' '  1) {'A' * 40} \"{sentinel}\" (CSSMERR_TP_NOT_TRUSTED)'\n"
+        "fi\n",
+        encoding="utf-8",
+    )
+    security_runner.chmod(0o700)
+    cert_pem = tmp_path / "leaf.pem"
+    subprocess.run(
+        ["/usr/bin/openssl", "x509", "-inform", "der", "-in", str(WWDR_CERT), "-out", str(cert_pem)],
+        check=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    environment = os.environ.copy()
+    environment.update(
+        {
+            "PATH": f"{tmp_path}:{environment['PATH']}",
+            "DIAGNOSE_SIGNING": "true",
+        }
+    )
+    result = subprocess.run(
+        ["/bin/bash"],
+        input=(
+            "set -euo pipefail\n"
+            f"keychain={tmp_path / 'fake.keychain'}\n"
+            f"cert_pem={cert_pem}\n"
+            f"wwdr_cert={WWDR_CERT}\n"
+            + diagnostic
+        ),
+        text=True,
+        env=environment,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        check=False,
+    )
+    assert result.returncode == 0, result.stderr
+    assert sentinel not in result.stdout
+    assert sentinel not in result.stderr
+    assert "CSSMERR_TP_NOT_TRUSTED" in result.stdout
+    assert "Diagnostic certificate type:" in result.stdout
+    assert "Diagnostic certificate expiry:" in result.stdout
+    assert '"labl"' not in diagnostic
+    assert '"subj"' not in diagnostic
 
 
 def test_helper_uses_security_export_password_argv_but_never_gh_secret_argv():
@@ -362,7 +669,15 @@ def _workflow_step_script(step_name: str) -> str:
     workflow = WORKFLOW.read_text(encoding="utf-8")
     step_start = workflow.index(f"      - name: {step_name}")
     run_start = workflow.index("        run: |\n", step_start) + len("        run: |\n")
-    step_end = workflow.find("\n      - name:", run_start)
+    step_ends = [
+        end
+        for end in (
+            workflow.find("\n      - name:", run_start),
+            workflow.find("\n      #", run_start),
+        )
+        if end != -1
+    ]
+    step_end = min(step_ends, default=-1)
     block = workflow[run_start:] if step_end == -1 else workflow[run_start:step_end]
     return "\n".join(line[10:] for line in block.splitlines()) + "\n"
 
