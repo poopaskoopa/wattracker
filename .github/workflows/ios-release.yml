@@ -402,15 +402,9 @@ jobs:
             echo "The checked-in Apple Root CA certificate could not be imported." >&2
             exit 1
           fi
-          if ! /usr/bin/security add-trusted-cert -r trustRoot -p codeSign \
-              -k "$keychain" "$root_cert" >/dev/null 2>&1; then
-            echo "The checked-in Apple Root CA certificate could not be trusted for code signing." >&2
-            exit 1
-          fi
-          # No -d: keep this trust setting in the runner user's domain. Record
-          # only the exact certificate path so the always-run cleanup removes
-          # this setting and cannot touch unrelated trust entries.
-          echo "IOS_ROOT_TRUST_CERT=$root_cert" >> "$GITHUB_ENV"
+          # Keep the checked-in root in the job keychain, but do not modify
+          # user or admin trust settings. The system keychain is added to the
+          # search list below so codesign can build Apple's trusted chain.
           if ! security import "$wwdr_cert" -k "$keychain" -T /usr/bin/codesign \
               >/dev/null 2>&1; then
             echo "The checked-in Apple WWDR G3 certificate could not be imported." >&2
@@ -422,7 +416,13 @@ jobs:
           security import "$p12" -k "$keychain" \
             -P "$IOS_DIST_P12_PASSWORD" \
             -T /usr/bin/codesign -x
-          security list-keychains -d user -s "$keychain" login.keychain-db
+          # Exact order matters: the job keychain is first for ordinary
+          # search-list consumers, followed by Apple's system roots and then
+          # the login keychain. `codesign --keychain "$keychain"` still
+          # selects the signing identity only from the job keychain, while
+          # codesign consults this full list to construct the certificate
+          # chain.
+          security list-keychains -d user -s "$keychain" /Library/Keychains/System.keychain login.keychain-db
           rm -f "$p12"
           # Assert the identity is actually there before spending ten minutes
           # on an archive that would fail at the codesign step. `grep -c`
@@ -501,9 +501,9 @@ jobs:
       #    machine whose other keychains are outside this job's control, and an
       #    archive that silently signed with some other identity that happened
       #    to be on the box is exactly the failure that is hardest to notice.
-      #    Keep this restriction while adding the checked-in Apple Root CA to
-      #    the job keychain: trusting the chain must not widen codesign's
-      #    access to the runner's other keychains.
+      #    Keep this restriction while making the checked-in root and the
+      #    system Apple roots available for chain construction: the search
+      #    list must not widen identity selection beyond the job keychain.
       #
       # 3. -allowProvisioningUpdates plus the three -authenticationKey* flags.
       #    Together these let xcodebuild talk to the developer portal as the
@@ -606,9 +606,10 @@ jobs:
           PERL
           }
 
-          # Re-unlock immediately before archive. The trusted root fixes chain
-          # validation; this partition list and the explicit keychain flag
-          # keep codesign restricted to the job keychain and avoid a GUI prompt.
+          # Re-unlock immediately before archive. The imported root plus the
+          # system keychain make chain construction available; this partition
+          # list and the explicit keychain flag keep identity selection
+          # restricted to the job keychain and avoid a GUI prompt.
           security unlock-keychain -p "$IOS_SIGNING_KEYCHAIN_PASSWORD" "$IOS_SIGNING_KEYCHAIN"
           security set-key-partition-list -S apple-tool:,apple:,codesign: \
             -k "$IOS_SIGNING_KEYCHAIN_PASSWORD" "$IOS_SIGNING_KEYCHAIN" > /dev/null
@@ -644,8 +645,8 @@ jobs:
       # deletes it is at the bottom of the job and not immediately after the
       # archive. -exportArchive takes no build settings, so there is no
       # --keychain to pass here: it resolves the identity through the keychain
-      # search list, which the import step put the job's keychain at the front
-      # of. ios/WatTracker/ExportOptions.plist names the same profile the
+      # search list, which the import step set to job, system, then login.
+      # ios/WatTracker/ExportOptions.plist names the same profile the
       # archive was signed with; a mismatch there re-signs with something else
       # and is not caught until Apple rejects the upload.
       - name: Export the signed .ipa
@@ -755,14 +756,6 @@ jobs:
         if: always()
         run: |
           set -euo pipefail
-          cleanup_status=0
-          root_cert="${IOS_ROOT_TRUST_CERT:-}"
-          if [ -n "$root_cert" ]; then
-            if ! /usr/bin/security remove-trusted-cert "$root_cert"; then
-              echo "The temporary Apple Root CA trust setting could not be removed." >&2
-              cleanup_status=1
-            fi
-          fi
           # The keychain first: it holds the distribution private key, and it
           # is the one piece of this that would still be usable tomorrow. The
           # search list is put back before the keychain is deleted so that a
@@ -797,8 +790,5 @@ jobs:
             echo "The signing keychain could not be removed. It holds the" >&2
             echo "distribution private key and this runner is not discarded." >&2
             exit 1
-          fi
-          if [ "$cleanup_status" -ne 0 ]; then
-            exit "$cleanup_status"
           fi
           echo "Signing material removed."
