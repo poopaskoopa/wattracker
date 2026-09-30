@@ -315,6 +315,12 @@ jobs:
           keychain_password="$(/usr/bin/openssl rand -hex 32)"
           p12="$RUNNER_TEMP/wattracker-ios-signing.p12"
           cert_pem="$RUNNER_TEMP/wattracker-ios-distribution-cert.pem"
+          original_default_keychain="$(security default-keychain -d user 2>/dev/null \
+            | sed -n 's/^ *"\(.*\)"$/\1/p')"
+          if [ -z "$original_default_keychain" ]; then
+            echo "The runner's default keychain could not be determined." >&2
+            exit 1
+          fi
           root_cert="$GITHUB_WORKSPACE/.github/certs/AppleIncRootCertificate.cer"
           root_expected_sha256="b0b1730ecbc7ff4505142c49f1295e6eda6bcaed7e2c68c5be91b5a11001f024"
           wwdr_cert="$GITHUB_WORKSPACE/.github/certs/AppleWWDRCAG3.cer"
@@ -322,6 +328,7 @@ jobs:
           # Record this before creating or importing anything: the final
           # always-run step must know the path even when a later command fails.
           echo "IOS_SIGNING_KEYCHAIN=$keychain" >> "$GITHUB_ENV"
+          echo "IOS_ORIGINAL_DEFAULT_KEYCHAIN=$original_default_keychain" >> "$GITHUB_ENV"
           # The archive is a separate step, so mask this generated password
           # before it crosses the step boundary. It is never printed.
           printf '::add-mask::%s\n' "$keychain_password"
@@ -519,6 +526,10 @@ jobs:
           #    identity.
       #    We deliberately do not pass OTHER_CODE_SIGN_FLAGS=--keychain: the
       #    root chain must be discoverable through the standard search list.
+      #    The archive step temporarily makes this keychain the user's default
+      #    as well, because Security.framework's non-GUI signing path consults
+      #    that default while opening the private key. The previous default is
+      #    captured without printing it and restored by the always-run cleanup.
       #
       # 3. -allowProvisioningUpdates plus the three -authenticationKey* flags.
       #    Together these let xcodebuild talk to the developer portal as the
@@ -621,12 +632,14 @@ jobs:
           PERL
           }
 
-          # Re-unlock immediately before archive. The imported root plus the
+          # Make the job keychain the default only for the archive/export
+          # window, then re-unlock it immediately before archive. The imported root plus the
           # system keychains make chain construction available; this partition
           # list and the three-keychain search list avoid a GUI prompt while
           # keeping trusted roots before the job keychain.
+          security default-keychain -d user -s "$IOS_SIGNING_KEYCHAIN"
           security unlock-keychain -p "$IOS_SIGNING_KEYCHAIN_PASSWORD" "$IOS_SIGNING_KEYCHAIN"
-          security set-key-partition-list -S apple-tool:,apple:,codesign: \
+          security set-key-partition-list -S apple-tool:,apple:,codesign: -s \
             -k "$IOS_SIGNING_KEYCHAIN_PASSWORD" "$IOS_SIGNING_KEYCHAIN" > /dev/null
 
           archive_with_redacted_output xcodebuild archive \
@@ -784,6 +797,9 @@ jobs:
           # uses, and this one does not. If the ci-runner account is ever
           # given extra keychains of its own, this line drops them from its
           # search list and they have to be added back.
+          if [ -n "${IOS_ORIGINAL_DEFAULT_KEYCHAIN:-}" ]; then
+            security default-keychain -d user -s "$IOS_ORIGINAL_DEFAULT_KEYCHAIN" || true
+          fi
           security list-keychains -d user -s login.keychain-db || true
           if [ -n "${IOS_SIGNING_KEYCHAIN:-}" ]; then
             security delete-keychain "$IOS_SIGNING_KEYCHAIN" || true

@@ -298,6 +298,7 @@ def test_workflow_keeps_keychain_cleanup_unconditional_without_trust_cleanup():
     assert "add-trusted-cert" not in cleanup
     assert "remove-trusted-cert" not in cleanup
     assert keychain_delete < cleanup.index('rm -f "$RUNNER_TEMP/wattracker-ios-signing.p12"')
+    assert 'security default-keychain -d user -s "$IOS_ORIGINAL_DEFAULT_KEYCHAIN" || true' in cleanup
 
 
 def test_workflow_reunlocks_and_sets_partition_list_immediately_before_archive():
@@ -312,12 +313,20 @@ def test_workflow_reunlocks_and_sets_partition_list_immediately_before_archive()
         'security unlock-keychain -p "$IOS_SIGNING_KEYCHAIN_PASSWORD" "$IOS_SIGNING_KEYCHAIN"'
     )
     partition = archive.index(
-        "security set-key-partition-list -S apple-tool:,apple:,codesign:"
+        "security set-key-partition-list -S apple-tool:,apple:,codesign: -s"
     )
     xcodebuild = archive.index("archive_with_redacted_output xcodebuild archive")
     assert mask < env_record
     assert unlock < partition < xcodebuild
     assert 'OTHER_CODE_SIGN_FLAGS="--keychain $IOS_SIGNING_KEYCHAIN"' not in archive
+    import_start = workflow.index(
+        "- name: Import the distribution certificate into a temporary keychain"
+    )
+    archive_start = workflow.index("- name: Archive for the App Store")
+    import_setup = workflow[import_start:archive_start]
+    assert 'original_default_keychain="$(security default-keychain -d user' in import_setup
+    assert 'echo "IOS_ORIGINAL_DEFAULT_KEYCHAIN=$original_default_keychain" >> "$GITHUB_ENV"' in import_setup
+    assert 'security default-keychain -d user -s "$IOS_SIGNING_KEYCHAIN"' in archive
 
 
 def _archive_script() -> str:

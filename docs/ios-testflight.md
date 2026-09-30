@@ -393,7 +393,11 @@ Two practical notes:
    asserts exactly one `Apple Distribution` identity in the job keychain. The archive step then
    re-unlocks the job keychain and runs
    `set-key-partition-list -S apple-tool:,apple:,codesign:` immediately before
-   `xcodebuild archive`. The generated keychain password is masked before it
+   `xcodebuild archive`; the command targets signing keys with `-s`. Immediately
+   before archive, the workflow also makes the temporary keychain the user's
+   default so Security.framework's non-GUI private-key path uses it. The
+   previous default is captured without printing it and restored by the
+   unconditional cleanup. The generated keychain password is masked before it
    crosses the step boundary. The explicit three-keychain search list is the
    deliberate compromise: it supplies both the system trust settings and
    built-in anchors without exposing the persistent login keychain, and the
