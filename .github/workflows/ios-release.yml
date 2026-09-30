@@ -422,7 +422,7 @@ jobs:
             login.keychain-db \
             "$keychain"
           if ! /usr/bin/security add-trusted-cert -r trustRoot -p codeSign \
-              -k "$keychain" "$root_cert" >/dev/null 2>&1; then
+              "$root_cert" >/dev/null 2>&1; then
             echo "The checked-in Apple Root CA certificate could not be trusted for code signing." >&2
             exit 1
           fi

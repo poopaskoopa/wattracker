@@ -277,7 +277,7 @@ def test_workflow_uses_system_roots_and_temporary_root_trust():
     assert search_list_setup.index('/Library/Keychains/System.keychain') < search_list_setup.index('login.keychain-db')
     assert search_list_setup.index('login.keychain-db') < search_list_setup.index('"$keychain"')
     assert '/usr/bin/security add-trusted-cert -r trustRoot -p codeSign' in signing_setup
-    assert '-k "$keychain" "$root_cert" >/dev/null 2>&1' in signing_setup
+    assert '"$root_cert" >/dev/null 2>&1' in signing_setup
     assert 'remove-trusted-cert' not in signing_setup
     assert 'echo "IOS_ROOT_TRUST_CERT=$root_cert" >> "$GITHUB_ENV"' in signing_setup
     assert (
