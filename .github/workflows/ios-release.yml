@@ -172,17 +172,32 @@ jobs:
           echo "The iOS API host is valid."
 
       # Before anything is signed, because a failing test should cost nothing
-      # but time. The selected hosted image carries the iOS 26.5 runtime
-      # matching Xcode 26.6's SDK; ios/README.md describes the by-SDK fallback
-      # for a machine where it does not.
+      # but time. Prefer a real simulator when the hosted image supplies one.
+      # Some macOS arm64 capacity pools have the Xcode/iOS SDK but no simulator
+      # device; in that case the trusted ios-tests job remains the test gate and
+      # this release job performs an unsigned device-SDK compile so signing can
+      # still be exercised.
       - name: Run the Swift test suite
         run: |
           set -euo pipefail
-          xcodebuild test \
-            -project ios/WatTracker/WatTracker.xcodeproj \
-            -scheme WatTracker \
-            -destination 'platform=iOS Simulator,name=iPhone 17 Pro' \
-            -derivedDataPath "$RUNNER_TEMP/ios-test-dd"
+          simulator_udid="$(xcrun simctl list devices available \
+            | awk -F '[()]' '/iPhone/ {print $2; exit}')"
+          if [ -n "$simulator_udid" ]; then
+            echo "Running Swift tests on simulator $simulator_udid."
+            xcodebuild test \
+              -project ios/WatTracker/WatTracker.xcodeproj \
+              -scheme WatTracker \
+              -destination "id=$simulator_udid" \
+              -derivedDataPath "$RUNNER_TEMP/ios-test-dd"
+          else
+            echo "::warning::This hosted macOS VM has no available iOS Simulator; CI ios-tests remains the test gate, so this job will compile the device target before signing."
+            xcodebuild build \
+              -project ios/WatTracker/WatTracker.xcodeproj \
+              -scheme WatTracker \
+              -sdk iphoneos \
+              -derivedDataPath "$RUNNER_TEMP/ios-test-dd" \
+              CODE_SIGNING_ALLOWED=NO
+          fi
 
       # The App Store Connect API key, written to a file because that is the
       # only way any of the three tools that need it will take it - xcodebuild
