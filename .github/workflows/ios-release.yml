@@ -418,13 +418,13 @@ jobs:
             echo "The distribution certificate chain did not match the pinned Apple chain." >&2
             exit 1
           fi
-          # Use only the job keychain and Apple's built-in root store. The
+          # Use only the job keychain and Apple's system trust store. The
           # persistent login and mutable System keychains stay out of the
           # search path, and the non-job identity guard fails closed before
           # codesign can select a persistent key.
           security list-keychains -d user -s \
             "$keychain" \
-            /System/Library/Keychains/SystemRootCertificates.keychain
+            /Library/Keychains/System.keychain
           # -x: the imported private key is not extractable, so nothing later
           # in this job (or a later job, if the delete below ever failed) can
           # read it back out of the keychain.
@@ -442,9 +442,9 @@ jobs:
             exit 1
           fi
           # The job keychain now contains the leaf, private key, pinned WWDR,
-          # and pinned Apple Root CA. The immutable system-root store remains
-          # available as a public fallback; persistent login/System keychains
-          # remain excluded. Without --keychain, codesign uses this search list
+          # and pinned Apple Root CA. Apple's system trust store remains
+          # available as a public fallback; the persistent login keychain
+          # remains excluded. Without --keychain, codesign uses this search list
           # for identity selection and chain construction, while the non-job
           # identity guard above prevents a persistent signing key from being
           # selected.
@@ -482,7 +482,7 @@ jobs:
               "$keychain" 2>/dev/null \
               | grep -c '^-----BEGIN CERTIFICATE-----' || true)"
             system_root_cert_count="$(security find-certificate -a -p -c 'Apple Root CA' \
-              /System/Library/Keychains/SystemRootCertificates.keychain 2>/dev/null \
+              /Library/Keychains/System.keychain 2>/dev/null \
               | grep -c '^-----BEGIN CERTIFICATE-----' || true)"
             leaf_issuer_hash="$(/usr/bin/openssl x509 -in "$cert_pem" \
               -noout -issuer_hash)"
@@ -633,12 +633,12 @@ jobs:
           # the complete search list, make the job keychain the default, then
           # re-unlock it and set the partition list immediately before the
           # archive. Do not pass OTHER_CODE_SIGN_FLAGS=--keychain: codesign
-          # must see Apple's immutable system root while the non-job identity
+          # must see Apple's system trust keychain while the non-job identity
           # guard above prevents a persistent signing key from being selected.
           security default-keychain -d user -s "$keychain"
           security list-keychains -d user -s \
             "$keychain" \
-            /System/Library/Keychains/SystemRootCertificates.keychain
+            /Library/Keychains/System.keychain
           security unlock-keychain -p "$keychain_password" "$keychain"
           security set-key-partition-list -S apple-tool:,apple:,codesign: -s \
             -k "$keychain_password" "$keychain" > /dev/null
@@ -771,12 +771,12 @@ jobs:
       #    the account - docs/ios-testflight.md has the one-time creation.
       #
       #    The signing search list contains the job keychain first, then
-      #    Apple's immutable system-root keychain. The import step fails
+      #    Apple's system trust keychain. The import step fails
       #    closed if any non-job keychain contains a signing identity. The
       #    pinned root, leaf, and WWDR are in the job keychain, and the
       #    root/WWDR/leaf chain was verified before import. Do not pass
       #    --keychain here: the explicit search path retains the public
-      #    system-root fallback, while the non-job identity guard prevents a
+      #    system trust fallback, while the non-job identity guard prevents a
       #    persistent private key from being selected.
       #    The combined signing step temporarily makes this keychain the user's default
       #    as well, because Security.framework's non-GUI signing path consults
@@ -811,7 +811,7 @@ jobs:
       # archive. -exportArchive takes no build settings, so there is no
       # --keychain to pass here: it resolves the identity through the keychain
       # search list, which the combined signing step set to the job keychain
-      # first, followed by Apple's immutable system-root keychain. The job
+      # first, followed by Apple's system trust keychain. The job
       # identity guard prevents a persistent signing key from being selected.
       # ios/WatTracker/ExportOptions.plist names the same profile the
       # archive was signed with; a mismatch there re-signs with something else
@@ -897,7 +897,7 @@ jobs:
 
           security list-keychains -d user -s \
             "$IOS_SIGNING_KEYCHAIN" \
-            /System/Library/Keychains/SystemRootCertificates.keychain
+            /Library/Keychains/System.keychain
           security unlock-keychain -p "$IOS_SIGNING_KEYCHAIN_PASSWORD" "$IOS_SIGNING_KEYCHAIN"
           security set-key-partition-list -S apple-tool:,apple:,codesign: -s \
             -k "$IOS_SIGNING_KEYCHAIN_PASSWORD" "$IOS_SIGNING_KEYCHAIN" > /dev/null

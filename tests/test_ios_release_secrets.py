@@ -256,7 +256,7 @@ def test_workflow_pins_verifies_and_imports_the_checked_in_apple_root():
     assert workflow.count('security import "$root_cert" -t cert -f x509') == 1
 
 
-def test_workflow_uses_only_job_and_system_root_keychains():
+def test_workflow_uses_only_job_and_system_keychains():
     workflow = WORKFLOW.read_text(encoding="utf-8")
     search_list_command = 'security list-keychains -d user -s'
     archive_start = workflow.index("      # The archive in the combined signing step above.")
@@ -275,9 +275,9 @@ def test_workflow_uses_only_job_and_system_root_keychains():
         'if ! security import "$wwdr_cert"', search_list
     )
     search_list_setup = signing_setup[search_list:search_list_end]
-    assert '/System/Library/Keychains/SystemRootCertificates.keychain' in search_list_setup
-    assert search_list_setup.index('"$keychain"') < search_list_setup.index('/System/Library/Keychains/SystemRootCertificates.keychain')
-    assert '/Library/Keychains/System.keychain' not in search_list_setup
+    assert '/Library/Keychains/System.keychain' in search_list_setup
+    assert search_list_setup.index('"$keychain"') < search_list_setup.index('/Library/Keychains/System.keychain')
+    assert '/System/Library/Keychains/SystemRootCertificates.keychain' not in search_list_setup
     assert 'login.keychain-db' not in search_list_setup
     assert 'security verify-cert -p codeSign' in signing_setup
     assert signing_setup.index('security verify-cert -p codeSign') < search_list
@@ -336,11 +336,11 @@ def test_workflow_reunlocks_and_sets_partition_list_immediately_before_archive()
     assert search_list < unlock < partition < xcodebuild
     archive_search_list = archive[search_list:unlock]
     assert '"$keychain"' in archive_search_list
-    assert '/System/Library/Keychains/SystemRootCertificates.keychain' in archive_search_list
+    assert '/Library/Keychains/System.keychain' in archive_search_list
     assert archive_search_list.index('"$keychain"') < archive_search_list.index(
-        '/System/Library/Keychains/SystemRootCertificates.keychain'
+        '/Library/Keychains/System.keychain'
     )
-    assert '/Library/Keychains/System.keychain' not in archive_search_list
+    assert '/System/Library/Keychains/SystemRootCertificates.keychain' not in archive_search_list
     assert 'login.keychain-db' not in archive_search_list
     assert 'OTHER_CODE_SIGN_FLAGS="--keychain $IOS_SIGNING_KEYCHAIN"' not in archive
     import_start = workflow.index(
@@ -389,11 +389,11 @@ def test_export_reunlocks_and_redacts_the_xcodebuild_stream():
     assert search_list < unlock < partition < xcodebuild
     export_search_list = export[search_list:unlock]
     assert '"$IOS_SIGNING_KEYCHAIN"' in export_search_list
-    assert '/System/Library/Keychains/SystemRootCertificates.keychain' in export_search_list
+    assert '/Library/Keychains/System.keychain' in export_search_list
     assert export_search_list.index('"$IOS_SIGNING_KEYCHAIN"') < export_search_list.index(
-        '/System/Library/Keychains/SystemRootCertificates.keychain'
+        '/Library/Keychains/System.keychain'
     )
-    assert '/Library/Keychains/System.keychain' not in export_search_list
+    assert '/System/Library/Keychains/SystemRootCertificates.keychain' not in export_search_list
     assert 'login.keychain-db' not in export_search_list
     assert "export IOS_CERT_CN=" in export
     assert "export IOS_CERT_LEGAL_NAME=" in export
