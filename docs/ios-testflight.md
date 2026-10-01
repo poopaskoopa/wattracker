@@ -88,10 +88,11 @@ is App Store Connect; they are different websites for the same account.
    certificate + the Apple WWDR intermediate into a `.p12` under a random
    256-bit passphrase. The release-secrets helper then re-exports the selected
    identity for CI, and that secret may contain only the key and leaf. The
-   release job installs the pinned public Apple Root CA and WWDR G3
+   release job verifies the pinned public Apple Root CA and WWDR G3
    certificates from `.github/certs/AppleIncRootCertificate.cer` and
-   `.github/certs/AppleWWDRCAG3.cer` into the temporary job keychain before
-   validating the chain. The root is pinned to SHA-256
+   `.github/certs/AppleWWDRCAG3.cer`; the job imports the pinned WWDR
+   intermediate, while the root is used as an explicit chain-verification
+   anchor. The root is pinned to SHA-256
    `b0b1730ecbc7ff4505142c49f1295e6eda6bcaed7e2c68c5be91b5a11001f024`.
    `--create-profile` then creates the `WatTracker App
    Store` provisioning profile against that certificate and the bundle
@@ -99,8 +100,9 @@ is App Store Connect; they are different websites for the same account.
 
    The workflow supports the documented WWDR G3 generation for Apple
    Distribution certificates. It verifies the checked-in DER certificates'
-   SHA-256 before importing the pinned root and intermediate into the
-   temporary job keychain; it never downloads a certificate at runtime.
+   SHA-256 before importing the pinned intermediate into the temporary job
+   keychain and verifying the leaf against the pinned root; it never downloads
+   a certificate at runtime.
    To check which generation issued an existing local leaf without printing a
    private key, inspect its issuer:
 
@@ -381,18 +383,19 @@ Two practical notes:
 6. Decodes `IOS_DIST_P12_B64` into `$RUNNER_TEMP`, creates a keychain with a
    random password, verifies the pinned Apple Root CA and WWDR G3 DER files,
    and verifies the owner's leaf against that public chain. It imports the
-   pinned Apple Root CA, WWDR intermediate, and private identity into the
-   temporary job keychain. The search list contains only the disposable job keychain
-   and `/Library/Keychains/System.keychain` for Apple's system trust settings. The
-   persistent login keychain is deliberately excluded, and the workflow rejects
-   any signing identity in a non-job keychain, so a competing private key cannot
-   be selected.
+   pinned WWDR intermediate and private identity into the temporary job
+   keychain. The three-entry search list contains the disposable job keychain first, then
+   `/Library/Keychains/System.keychain` and
+   `/System/Library/Keychains/SystemRootCertificates.keychain` for Apple's
+   public trust stores. The persistent login keychain is deliberately excluded,
+   and the workflow rejects any signing identity in a non-job keychain, so a
+   competing private key cannot be selected.
    The workflow verifies the leaf against the pinned Apple Root CA and WWDR G3
    chain, then deliberately omits `OTHER_CODE_SIGN_FLAGS=--keychain`
-   so nested codesign invocations can use Apple's system trust keychain without
-   changing trust settings. The private identity and pinned public chain
-   remain in the disposable job keychain; the workflow does not modify the runner
-   user's trust database.
+   so nested codesign invocations can use Apple's public trust stores without
+   changing trust settings. The private identity and WWDR remain in the
+   disposable job keychain; the workflow does not modify the runner user's trust
+   database.
    The runner's `SessionCreate=true` prerequisite is still required for the
    non-GUI keychain operations. The signing certificate is imported with
    `-x` (not extractable). The workflow fails closed if any non-job keychain
@@ -403,13 +406,13 @@ Two practical notes:
    `set-key-partition-list -S apple-tool:,apple:,codesign:` immediately before
    `xcodebuild archive`; the command targets signing keys with `-s`. Keeping
    import and archive in one Actions step preserves the same Security.framework
-   session while codesign builds the chain. The two-keychain search list is
+   session while codesign builds the chain. The three-keychain search list is
    re-established in that combined step and in export. Immediately
    before archive, the workflow also makes the temporary keychain the user's
    default so Security.framework's non-GUI private-key path uses it. The
    previous default is captured without printing it and restored by the
    unconditional cleanup. The generated keychain password is masked before it
-   crosses the step boundary. The explicit two-keychain search list is used
+   crosses the step boundary. The explicit three-keychain search list is used
    for import and validation. The non-job identity guard remains fail-closed.
    It reports missing/empty
    secrets, invalid base64, a p12 that cannot be opened with its password, a
@@ -420,9 +423,9 @@ Two practical notes:
 7. The archive in step 6 uses `generic/platform=iOS`, with **manual** signing:
    `CODE_SIGN_IDENTITY="Apple Distribution"`,
    `PROVISIONING_PROFILE_SPECIFIER="WatTracker App Store"`. The archive uses
-   the two-keychain search list established in the combined step. Codesign uses the one
-   permitted identity from the job keychain and Apple's system trust keychain
-   for the trust anchor; no persistent private key is eligible.
+   the three-keychain search list established in the combined step. Codesign uses the one
+   permitted identity from the job keychain and Apple's public trust stores for
+   the trust anchor; no persistent private key is eligible.
    `-allowProvisioningUpdates` and the three `-authenticationKey*`
    flags are still there, now doing the one job they can do: registering the
    App ID and downloading that profile from the portal, so it is neither
