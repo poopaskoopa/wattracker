@@ -420,12 +420,11 @@ jobs:
           fi
           # Keep the disposable job keychain first, then expose Apple's
           # public System and SystemRoot stores for chain construction. The
-          # login keychain is included only for public chain material, and the
+          # persistent login keychain stays out of the search path, and the
           # non-job identity guard fails closed before codesign can select a
           # persistent key.
           security list-keychains -d user -s \
             "$keychain" \
-            login.keychain-db \
             /Library/Keychains/System.keychain \
             /System/Library/Keychains/SystemRootCertificates.keychain
           # -x: the imported private key is not extractable, so nothing later
@@ -442,7 +441,7 @@ jobs:
           # The job keychain contains the leaf, private key, and pinned WWDR;
           # the pinned root is verified above and Apple's public System and
           # SystemRoot stores provide the trust anchor. The persistent login
-          # keychain is guarded below for signing identities. Without --keychain, codesign uses this
+          # keychain remains excluded. Without --keychain, codesign uses this
           # search list for identity selection and chain construction, while
           # the non-job identity guard above prevents a persistent signing key
           # from being selected.
@@ -636,7 +635,6 @@ jobs:
           security default-keychain -d user -s "$keychain"
           security list-keychains -d user -s \
             "$keychain" \
-            login.keychain-db \
             /Library/Keychains/System.keychain \
             /System/Library/Keychains/SystemRootCertificates.keychain
           security unlock-keychain -p "$keychain_password" "$keychain"
@@ -771,8 +769,7 @@ jobs:
       #    the account - docs/ios-testflight.md has the one-time creation.
       #
       #    The signing search list contains the job keychain first, then
-      #    the runner login keychain and Apple's public System and SystemRoot
-      #    keychains. The import step
+      #    Apple's public System and SystemRoot keychains. The import step
       #    fails closed if any non-job keychain contains a signing identity.
       #    The leaf and WWDR are in the job keychain; the pinned root/WWDR/
       #    leaf chain was verified before import. Do not pass --keychain here:
@@ -812,8 +809,7 @@ jobs:
       # archive. -exportArchive takes no build settings, so there is no
       # --keychain to pass here: it resolves the identity through the keychain
       # search list, which the combined signing step set to the job keychain
-      # first, followed by the runner login keychain and Apple's public System
-      # and SystemRoot keychains. The job
+      # first, followed by Apple's public System and SystemRoot keychains. The job
       # identity guard prevents a persistent signing key from being selected.
       # ios/WatTracker/ExportOptions.plist names the same profile the
       # archive was signed with; a mismatch there re-signs with something else
@@ -899,7 +895,6 @@ jobs:
 
           security list-keychains -d user -s \
             "$IOS_SIGNING_KEYCHAIN" \
-            login.keychain-db \
             /Library/Keychains/System.keychain \
             /System/Library/Keychains/SystemRootCertificates.keychain
           security unlock-keychain -p "$IOS_SIGNING_KEYCHAIN_PASSWORD" "$IOS_SIGNING_KEYCHAIN"
