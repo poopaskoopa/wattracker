@@ -187,16 +187,19 @@ states on `main` when the PR is merge-committed. Four such commits are on
 `main` from #358 and #356 (`a04e344`, `95a6bb2`, `8d1a582`, `892b345`); if
 `git bisect` lands on one, `git bisect skip` it.
 
-1. **#420: the iOS TestFlight release.** Pass the real cloud host from the
-   `WATTRACKER_IOS_API_HOST` secret into the archive step, and refuse the
-   placeholder. Make the certificate-import step say why it failed, without
-   printing key material. Write `scripts/ios_release_secrets.py`, which the
-   OWNER runs to export their Apple Distribution identity and set the p12
-   secrets via stdin; it must never print them. After merging, dispatch the
-   no-upload test mode and report. Never push an `ios-v*` tag. Update
-   `docs/ios-testflight.md`. It needs a security review before merge.
+1. **#420: move the iOS release job to a GitHub-hosted macOS runner.** The
+   laptop runner (a LaunchDaemon) can't codesign: `errSecInternalComponent`
+   after six attempts on #426. Read the 2026-09-30 owner-decision comment.
+   First confirm a hosted image has a new enough Xcode/iOS SDK, and stop if
+   not. Keep the pinned WWDR/root import, the name masking and the diagnose
+   redaction. Fold in or close #426. Dispatch only; never upload or push a tag.
 
-2. **#249: rotating full-suite test flakes. Still not a local-runs job.**
+2. **#427: name the iOS app `wattracker` in Xcode** (scheme, `PRODUCT_NAME`,
+   archive label). The bundle ID, keychain service and UserDefaults names
+   must not change. It edits `ios-release.yml` too, so land it after #420 or
+   rebase.
+
+3. **#249: rotating full-suite test flakes. Still not a local-runs job.**
    Nothing has changed since the re-scope. 21 consecutive clean local full
    suites stand against zero reproductions. Both known instances came from
    **taksmon's machine**. **The next step is taksmon's log and his exact
