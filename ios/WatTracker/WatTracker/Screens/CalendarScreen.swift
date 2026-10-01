@@ -133,7 +133,8 @@ final class CalendarModel {
             apply(
                 cached,
                 activities: cachedActivities,
-                ftp: CalendarData.currentFTP(from: cachedDashboard)
+                ftp: CalendarData.currentFTP(from: cachedDashboard),
+                session: session
             )
         }
 
@@ -180,7 +181,8 @@ final class CalendarModel {
             apply(
                 calendar,
                 activities: activities ?? cachedActivities,
-                ftp: CalendarData.currentFTP(from: dashboard)
+                ftp: CalendarData.currentFTP(from: dashboard),
+                session: session
             )
         } catch let failure as CloudSession.Failure {
             guard generation == requestGeneration else { return }
@@ -225,7 +227,7 @@ final class CalendarModel {
                 // Calendar data remains useful when the activity list is offline.
             }
             guard generation == requestGeneration, selectedMonth == month else { return }
-            apply(calendar, activities: activities, ftp: currentFTP)
+            apply(calendar, activities: activities, ftp: currentFTP, session: session)
         } catch let failure as CloudSession.Failure {
             guard generation == requestGeneration, selectedMonth == month else { return }
             switch failure {
@@ -252,15 +254,28 @@ final class CalendarModel {
     private func apply(
         _ snapshot: CloudSnapshot,
         activities: CloudSnapshot? = nil,
-        ftp: Double? = nil
+        ftp: Double? = nil,
+        session: any ReadSession
     ) {
         currentFTP = ftp
+        // The grid's leading and trailing cells are the adjacent months' real
+        // dates; whatever the cache already holds for them is shown too.
+        let gridSnapshot = CalendarData.gridSnapshot(
+            snapshot,
+            month: month,
+            adjacent: [
+                session.cached(.calendar, month: month.adding(months: -1)),
+                session.cached(.calendar, month: month.adding(months: 1)),
+            ]
+        )
         let calendar = CalendarData(
-            snapshot: snapshot,
+            snapshot: gridSnapshot,
             activitySnapshot: activities,
             ftp: currentFTP
         )
-        state = calendar.hasContent ? .ready(calendar) : .noData
+        // Whether the month has data is still decided by the month alone.
+        let hasContent = CalendarData(snapshot: snapshot).hasContent
+        state = hasContent ? .ready(calendar) : .noData
     }
 }
 
@@ -322,16 +337,14 @@ private struct CalendarContent: View {
                                 .accessibilityHidden(true)
                         }
 
-                        ForEach(0..<model.month.leadingEmptyDays, id: \.self) { _ in
-                            Color.clear
-                                .frame(minHeight: 72)
-                                .accessibilityHidden(true)
-                        }
-
-                        ForEach(1...model.month.dayCount, id: \.self) { day in
-                            let entry = calendar.entry(for: model.month, day: day)
+                        // One ForEach keyed by ISO date: every cell's identity
+                        // is unique. Separate blank and day ForEaches keyed by
+                        // Int collided (blank 1 vs day 1) and SwiftUI reused
+                        // or dropped cells, shifting the month's weekdays.
+                        ForEach(model.month.gridDates(), id: \.isoDate) { gridDay in
+                            let entry = calendar.entry(for: gridDay.isoDate)
                                 ?? CalendarDayEntry(
-                                    dateISO: model.month.isoDate(day: day),
+                                    dateISO: gridDay.isoDate,
                                     ooto: false,
                                     phase: nil,
                                     race: nil,
@@ -339,7 +352,11 @@ private struct CalendarContent: View {
                                     activities: [],
                                     currentFTP: calendar.currentFTP
                                 )
-                            CalendarDayCell(day: day, entry: entry) {
+                            CalendarDayCell(
+                                day: gridDay.day,
+                                isInMonth: gridDay.isInMonth,
+                                entry: entry
+                            ) {
                                 selectDay(entry)
                             }
                         }
@@ -357,6 +374,7 @@ private struct CalendarContent: View {
 
 private struct CalendarDayCell: View {
     let day: Int
+    let isInMonth: Bool
     let entry: CalendarDayEntry
     let select: () -> Void
 
@@ -368,14 +386,13 @@ private struct CalendarDayCell: View {
             }
             .frame(maxWidth: .infinity, minHeight: 72, alignment: .topLeading)
             .padding(7)
-            .background(
-                entry.ooto ? Palette.surface2 : Palette.panel,
-                in: .rect(cornerRadius: 8)
-            )
+            .background(background, in: .rect(cornerRadius: 8))
             .overlay {
                 RoundedRectangle(cornerRadius: 8)
                     .strokeBorder(
-                        entry.hasContent ? Palette.accent.opacity(0.55) : Palette.surfaceBorder,
+                        entry.hasContent
+                            ? Palette.accent.opacity(isInMonth ? 0.55 : 0.3)
+                            : Palette.surfaceBorder,
                         lineWidth: 1
                     )
             }
@@ -390,7 +407,7 @@ private struct CalendarDayCell: View {
             HStack(alignment: .firstTextBaseline, spacing: 4) {
                 Text(String(day))
                     .font(.callout.weight(.semibold))
-                    .foregroundStyle(Palette.textBright)
+                    .foregroundStyle(isInMonth ? Palette.textBright : Palette.muted)
                 Spacer(minLength: 0)
                 if entry.ooto {
                     Image(systemName: "airplane")
@@ -446,7 +463,7 @@ private struct CalendarDayCell: View {
         VStack(spacing: 4) {
             Text(String(day))
                 .font(.caption.weight(.semibold))
-                .foregroundStyle(Palette.textBright)
+                .foregroundStyle(isInMonth ? Palette.textBright : Palette.muted)
             if entry.hasContent {
                 Circle()
                     .fill(entry.ooto ? Palette.accent : Palette.ok)
@@ -457,8 +474,15 @@ private struct CalendarDayCell: View {
         .frame(maxWidth: .infinity)
     }
 
+    /// Adjacent-month cells recede to the inset surface so the month's own
+    /// days lead; an out-of-office day keeps its tint, only dimmer.
+    private var background: Color {
+        if entry.ooto { return Palette.surface2.opacity(isInMonth ? 1 : 0.5) }
+        return isInMonth ? Palette.panel : Palette.surfaceInset
+    }
+
     private var accessibilityLabel: String {
-        var parts = ["Day \(day)"]
+        var parts = [isInMonth ? "Day \(day)" : "\(entry.dateISO), adjacent month"]
         if let phase = entry.phase, !phase.isEmpty { parts.append(phase) }
         if entry.ooto { parts.append("out of office") }
         if CalendarJSON.isPresent(entry.race) { parts.append("race") }
