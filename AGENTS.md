@@ -195,11 +195,18 @@ states on `main` when the PR is merge-committed. Four such commits are on
    redaction. Fold in or close #426. Dispatch only; never upload or push a tag.
 
 2. **#427: name the iOS app `wattracker` in Xcode** (scheme, `PRODUCT_NAME`,
-   archive label). The bundle ID, keychain service and UserDefaults names
+   archive label), plus `ITSAppUsesNonExemptEncryption = NO` in both plists. The bundle ID, keychain service and UserDefaults names
    must not change. It edits `ios-release.yml` too, so land it after #420 or
    rebase.
 
-3. **#249: rotating full-suite test flakes. Still not a local-runs job.**
+3. **#429: iOS follow-ups.** Pull to refresh on Dashboard, Calendar and Volume
+   (calling `retryNowIfWaking()`); #422's cold-start handling for activity
+   detail and stream reads, keeping every gate rule; and publish standalone
+   workouts' saved step texts if the desktop modal shows them. Independent of
+   #420 and #427; it touches the iOS screens and `CloudSession`, so rebase if
+   #427 lands first.
+
+4. **#249: rotating full-suite test flakes. Still not a local-runs job.**
    Nothing has changed since the re-scope. 21 consecutive clean local full
    suites stand against zero reproductions. Both known instances came from
    **taksmon's machine**. **The next step is taksmon's log and his exact
