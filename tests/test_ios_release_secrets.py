@@ -165,6 +165,19 @@ def test_release_uses_a_hosted_xcode_26_toolchain_and_leaves_ios_tests_in_place(
     assert "xcodebuild test" in ios_tests
 
 
+def test_release_test_step_falls_back_to_a_device_sdk_compile_without_a_simulator():
+    workflow = WORKFLOW.read_text(encoding="utf-8")
+    start = workflow.index("- name: Run the Swift test suite")
+    end = workflow.index("- name: Write the App Store Connect API key", start)
+    step = workflow[start:end]
+    assert "xcrun simctl list devices available" in step
+    assert 'if [ -n "$simulator_udid" ]; then' in step
+    assert "xcodebuild test" in step
+    assert "xcodebuild build" in step
+    assert "CODE_SIGNING_ALLOWED=NO" in step
+    assert "CI ios-tests remains the test gate" in step
+
+
 def test_workflow_pins_verifies_and_imports_apple_root_and_wwdr_before_identity_check():
     workflow = WORKFLOW.read_text(encoding="utf-8")
     assert ROOT_CERT.is_file()

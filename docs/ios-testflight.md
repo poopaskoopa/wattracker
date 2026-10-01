@@ -375,8 +375,10 @@ Two practical notes:
 3. Validates the secret-backed production API hostname. This happens before
    the archive and rejects an empty value, whitespace, a URL/path, malformed
    DNS, or the placeholder `api.wattracker.com` without printing the host.
-4. Runs the Swift test suite on the iPhone 17 Pro simulator. A failing test
-   costs nothing but time at this point.
+4. Runs the Swift test suite on an available iOS Simulator. If a hosted arm64
+   capacity pool has no simulator device, it performs an unsigned iOS-device
+   SDK compile instead; the trusted `ios-tests` job remains the test gate. A
+   failing test or compile costs nothing but time at this point.
 5. Writes the `.p8` to `$RUNNER_TEMP` under `umask 077`, verifies it parses as
    a private key, and templates `teamID` into a temporary copy of
    `ExportOptions.plist`.
