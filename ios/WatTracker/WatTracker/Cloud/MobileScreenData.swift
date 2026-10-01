@@ -42,6 +42,35 @@ struct CalendarMonth: Hashable, Sendable, Equatable {
         (Self.gregorian.component(.weekday, from: firstDate) + 5) % 7
     }
 
+    /// One cell of the month grid: a real date, which may belong to the
+    /// previous or next month when it fills out the first or last week.
+    struct GridDay: Hashable, Sendable {
+        let isoDate: String
+        let day: Int
+        let isInMonth: Bool
+    }
+
+    /// Full Monday-to-Sunday weeks covering the month, as the desktop
+    /// calendar lays them out (`calendar.monthdatescalendar`, Monday first):
+    /// the first row starts on the Monday on or before the 1st and the last
+    /// row ends on the Sunday on or after the last day, filled with the
+    /// adjacent months' real dates. Date-only arithmetic in the UTC Gregorian
+    /// calendar, so the phone's timezone can never shift a cell.
+    func gridDates() -> [GridDay] {
+        let leading = leadingEmptyDays
+        let trailing = (7 - (leading + dayCount) % 7) % 7
+        let calendar = Self.gregorian
+        return (-leading..<(dayCount + trailing)).map { offset in
+            let date = calendar.date(byAdding: .day, value: offset, to: firstDate)!
+            let c = calendar.dateComponents([.year, .month, .day], from: date)
+            return GridDay(
+                isoDate: String(format: "%04d-%02d-%02d", c.year!, c.month!, c.day!),
+                day: c.day!,
+                isInMonth: c.year == year && c.month == month
+            )
+        }
+    }
+
     var title: String {
         let formatter = DateFormatter()
         formatter.locale = .current
@@ -440,6 +469,40 @@ struct CalendarData: Sendable, Equatable {
 
     func entry(for month: CalendarMonth, day: Int) -> CalendarDayEntry? {
         entry(for: month.isoDate(day: day))
+    }
+
+    /// The month's calendar snapshot, plus any adjacent-month days already
+    /// cached that fall in its grid's leading or trailing week.
+    ///
+    /// A backend that returns one month at a time leaves those cells empty;
+    /// one whose snapshot already spans them (the cloud collection) keeps its
+    /// own rows, because a date the primary snapshot carries is never added a
+    /// second time — `init` appends every row for a date, so a duplicate
+    /// would double that day's workouts.
+    static func gridSnapshot(
+        _ snapshot: CloudSnapshot,
+        month: CalendarMonth,
+        adjacent: [CloudSnapshot?]
+    ) -> CloudSnapshot {
+        let outside = Set(month.gridDates().filter { !$0.isInMonth }.map(\.isoDate))
+        let present = Set(snapshot.items.compactMap(Self.calendarDate))
+        let extra = adjacent.compactMap { $0 }.flatMap(\.items).filter { item in
+            guard let date = Self.calendarDate(item) else { return false }
+            return outside.contains(date) && !present.contains(date)
+        }
+        guard !extra.isEmpty else { return snapshot }
+        return CloudSnapshot(
+            route: snapshot.route,
+            revision: snapshot.revision,
+            items: snapshot.items + extra,
+            source: snapshot.source,
+            asOf: snapshot.asOf
+        )
+    }
+
+    private static func calendarDate(_ item: CloudItem) -> String? {
+        guard !item.deleted, case let .calendarDay(day) = item.payload else { return nil }
+        return day.date
     }
 
     private static func activitySummaries(

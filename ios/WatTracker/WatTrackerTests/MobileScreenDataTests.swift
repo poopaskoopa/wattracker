@@ -291,6 +291,198 @@ final class MobileScreenDataTests: XCTestCase {
         XCTAssertNil(CalendarMonth.fromISODate("2024-02-30"))
     }
 
+    // The grid's view identity (one ForEach keyed by ISO date) is a SwiftUI
+    // concern no model test can see; these pin the dates it is keyed by.
+    private func gridISO(_ year: Int, _ month: Int) -> [String] {
+        CalendarMonth(year: year, month: month).gridDates().map(\.isoDate)
+    }
+
+    /// Parses "yyyy-MM-dd" independently of the grid code (UTC midnight).
+    private func parseISO(_ iso: String) -> Date {
+        let parts = iso.split(separator: "-").map { Int($0)! }
+        return date(year: parts[0], month: parts[1], day: parts[2])
+    }
+
+    /// Sunday = 1 ... Saturday = 7.
+    private func weekday(_ iso: String) -> Int {
+        var calendar = Calendar(identifier: .gregorian)
+        calendar.timeZone = TimeZone(secondsFromGMT: 0)!
+        return calendar.component(.weekday, from: parseISO(iso))
+    }
+
+    private func assertGridShape(
+        _ month: CalendarMonth, file: StaticString = #filePath, line: UInt = #line
+    ) {
+        let grid = month.gridDates()
+        XCTAssertEqual(grid.count % 7, 0, file: file, line: line)
+        XCTAssertEqual(Set(grid.map(\.isoDate)).count, grid.count, file: file, line: line)
+        XCTAssertEqual(weekday(grid.first!.isoDate), 2, "starts on Monday", file: file, line: line)
+        XCTAssertEqual(weekday(grid.last!.isoDate), 1, "ends on Sunday", file: file, line: line)
+        XCTAssertLessThan(grid.filter { !$0.isInMonth }.count, 13, file: file, line: line)
+        let inMonth = grid.filter(\.isInMonth)
+        XCTAssertEqual(inMonth.map(\.day), Array(1...month.dayCount), file: file, line: line)
+        XCTAssertEqual(inMonth.first?.isoDate, month.isoDate(day: 1), file: file, line: line)
+        // The 1st sits in its real weekday column (Monday = index 0).
+        let firstIn = grid.firstIndex(where: \.isInMonth)!
+        XCTAssertEqual(firstIn, (weekday(month.isoDate(day: 1)) + 5) % 7, file: file, line: line)
+        XCTAssertTrue(
+            grid[firstIn..<(firstIn + month.dayCount)].allSatisfy(\.isInMonth),
+            file: file, line: line
+        )
+        // Consecutive cells are consecutive calendar days.
+        let parsed = grid.map { parseISO($0.isoDate) }
+        for (a, b) in zip(parsed, parsed.dropFirst()) {
+            XCTAssertEqual(b.timeIntervalSince(a), 86_400, file: file, line: line)
+        }
+    }
+
+    func testCalendarGridSeptember2026IsFullMondayToSundayWeeks() {
+        let month = CalendarMonth(year: 2026, month: 9)
+        let grid = month.gridDates()
+        XCTAssertEqual(weekday("2026-09-01"), 3) // Tuesday
+        XCTAssertEqual(grid.count, 35)
+        XCTAssertEqual(grid.first, .init(isoDate: "2026-08-31", day: 31, isInMonth: false))
+        XCTAssertEqual(grid[1], .init(isoDate: "2026-09-01", day: 1, isInMonth: true))
+        XCTAssertEqual(
+            grid.suffix(7).map(\.isoDate),
+            ["2026-09-28", "2026-09-29", "2026-09-30",
+             "2026-10-01", "2026-10-02", "2026-10-03", "2026-10-04"]
+        )
+        XCTAssertEqual(
+            grid.suffix(7).map(\.isInMonth),
+            [true, true, true, false, false, false, false]
+        )
+        XCTAssertEqual(grid.filter { !$0.isInMonth }.count, 5)
+        assertGridShape(month)
+    }
+
+    func testCalendarGridOctober2026PutsTheFirstOnThursday() {
+        let month = CalendarMonth(year: 2026, month: 10)
+        let grid = month.gridDates()
+        XCTAssertEqual(weekday("2026-10-01"), 5) // Thursday
+        XCTAssertEqual(
+            grid.prefix(7).map(\.isoDate),
+            ["2026-09-28", "2026-09-29", "2026-09-30",
+             "2026-10-01", "2026-10-02", "2026-10-03", "2026-10-04"]
+        )
+        XCTAssertEqual(grid.firstIndex { $0.isoDate == "2026-10-01" }, 3)
+        XCTAssertEqual(grid[3], .init(isoDate: "2026-10-01", day: 1, isInMonth: true))
+        XCTAssertEqual(grid.last, .init(isoDate: "2026-11-01", day: 1, isInMonth: false))
+        XCTAssertEqual(grid.count, 35)
+        assertGridShape(month)
+    }
+
+    func testCalendarGridHasNoPaddingWhenTheMonthAlignsToWeeks() {
+        // 2026-06-01 is a Monday: nothing leading.
+        let june = CalendarMonth(year: 2026, month: 6).gridDates()
+        XCTAssertEqual(june.first, .init(isoDate: "2026-06-01", day: 1, isInMonth: true))
+        XCTAssertEqual(june.last?.isoDate, "2026-07-05")
+        // 2026-05-31 is a Sunday: nothing trailing.
+        let may = CalendarMonth(year: 2026, month: 5).gridDates()
+        XCTAssertEqual(may.first?.isoDate, "2026-04-27")
+        XCTAssertEqual(may.last, .init(isoDate: "2026-05-31", day: 31, isInMonth: true))
+        // February 2027 starts Monday and ends Sunday: exactly four rows.
+        let february = CalendarMonth(year: 2027, month: 2).gridDates()
+        XCTAssertEqual(february.count, 28)
+        XCTAssertTrue(february.allSatisfy(\.isInMonth))
+        assertGridShape(CalendarMonth(year: 2026, month: 5))
+        assertGridShape(CalendarMonth(year: 2026, month: 6))
+    }
+
+    func testCalendarGridFebruaryInLeapAndNonLeapYears() {
+        let leap = CalendarMonth(year: 2028, month: 2) // 2028-02-01 is a Tuesday
+        XCTAssertEqual(leap.gridDates().filter(\.isInMonth).count, 29)
+        XCTAssertEqual(gridISO(2028, 2).first, "2028-01-31")
+        XCTAssertTrue(gridISO(2028, 2).contains("2028-02-29"))
+        XCTAssertEqual(gridISO(2028, 2).last, "2028-03-05")
+        assertGridShape(leap)
+
+        let common = CalendarMonth(year: 2027, month: 2)
+        XCTAssertEqual(common.gridDates().filter(\.isInMonth).count, 28)
+        XCTAssertFalse(gridISO(2027, 2).contains("2027-02-29"))
+        XCTAssertEqual(gridISO(2027, 2).first, "2027-02-01")
+        XCTAssertEqual(gridISO(2027, 2).last, "2027-02-28")
+        assertGridShape(common)
+    }
+
+    func testCalendarGridCrossesYearBoundaries() {
+        // December 2026 ends on a Thursday: the last row runs into 2027.
+        XCTAssertEqual(
+            Array(CalendarMonth(year: 2026, month: 12).gridDates().suffix(4)),
+            [
+                .init(isoDate: "2026-12-31", day: 31, isInMonth: true),
+                .init(isoDate: "2027-01-01", day: 1, isInMonth: false),
+                .init(isoDate: "2027-01-02", day: 2, isInMonth: false),
+                .init(isoDate: "2027-01-03", day: 3, isInMonth: false),
+            ]
+        )
+        XCTAssertEqual(gridISO(2026, 12).first, "2026-11-30")
+        // January 2027 starts on a Friday: the first row reaches into 2026.
+        XCTAssertEqual(
+            Array(gridISO(2027, 1).prefix(5)),
+            ["2026-12-28", "2026-12-29", "2026-12-30", "2026-12-31", "2027-01-01"]
+        )
+        assertGridShape(CalendarMonth(year: 2026, month: 12))
+        assertGridShape(CalendarMonth(year: 2027, month: 1))
+    }
+
+    func testCalendarGridIsWellFormedForEveryMonthOfSeveralYears() {
+        for year in 2024...2030 {
+            for month in 1...12 {
+                assertGridShape(CalendarMonth(year: year, month: month))
+            }
+        }
+    }
+
+    func testCalendarGridDaysAreIndependentOfThePhoneTimeZone() {
+        let original = NSTimeZone.default
+        defer { NSTimeZone.default = original }
+        for zone in ["Pacific/Kiritimati", "Pacific/Pago_Pago", "America/New_York"] {
+            NSTimeZone.default = TimeZone(identifier: zone)!
+            XCTAssertEqual(gridISO(2026, 10).first, "2026-09-28")
+            XCTAssertEqual(gridISO(2026, 10)[3], "2026-10-01")
+        }
+    }
+
+    func testCalendarGridSnapshotAddsCachedAdjacentDaysWithoutDuplicates() {
+        let october = CalendarMonth(year: 2026, month: 10)
+        let workout = "[{\"id\":9,\"name\":\"Endurance\"}]"
+        let primary = snapshot(route: .calendar, items: [
+            calendarItem(id: "c-10-05", date: "2026-10-05", workouts: workout),
+            // A backend whose snapshot already spans the grid keeps its row.
+            calendarItem(id: "c-09-30", date: "2026-09-30", workouts: workout),
+        ])
+        let september = snapshot(route: .calendar, items: [
+            calendarItem(id: "s-09-29", date: "2026-09-29", workouts: workout),
+            calendarItem(id: "s-09-30", date: "2026-09-30", workouts: workout),
+            // Outside October's grid: never added.
+            calendarItem(id: "s-09-27", date: "2026-09-27", workouts: workout),
+        ])
+        let november = snapshot(route: .calendar, items: [
+            calendarItem(id: "n-11-01", date: "2026-11-01", workouts: workout),
+            calendarItem(id: "n-11-02", date: "2026-11-02", workouts: workout),
+        ])
+        let merged = CalendarData.gridSnapshot(
+            primary, month: october, adjacent: [september, nil, november]
+        )
+        let data = CalendarData(snapshot: merged)
+        XCTAssertEqual(
+            data.days.map(\.dateISO),
+            ["2026-09-29", "2026-09-30", "2026-10-05", "2026-11-01"]
+        )
+        XCTAssertEqual(data.entry(for: "2026-09-30")?.workoutCount, 1)
+        XCTAssertEqual(data.entry(for: "2026-09-29")?.workoutCount, 1)
+        XCTAssertEqual(data.entry(for: "2026-11-01")?.workoutCount, 1)
+        XCTAssertNil(data.entry(for: "2026-09-27"))
+        XCTAssertNil(data.entry(for: "2026-11-02"))
+
+        // No adjacent cache: the snapshot is returned untouched.
+        XCTAssertEqual(
+            CalendarData.gridSnapshot(primary, month: october, adjacent: [nil, nil]),
+            primary
+        )
+    }
+
     func testVolumeFillsMissingMondayBucketsAndCalculatesSummaries() {
         let starts = [
             "2025-12-01", "2025-12-08", "2025-12-15", "2025-12-22",
