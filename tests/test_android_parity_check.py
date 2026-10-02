@@ -7,6 +7,7 @@ and that the workflows carrying it stay wired the way the doc says.
 
 import importlib.util
 import re
+import subprocess
 from pathlib import Path
 
 import pytest
@@ -53,6 +54,9 @@ def test_other_paths_do_not(path):
     "Summary\n\n- Android: note on #197\n\nMore text",
     "* Android: n/a, Swift test-only change",
     "Intro\r\nAndroid: posted on #198\r\n",
+    "Android: n/a ok",
+    "```\ncode\n```\nAndroid: posted on #198",
+    "<!-- note -->\nAndroid: n/a - docs only",
 ])
 def test_bodies_that_pass(body):
     assert parity.has_android_line(body)
@@ -70,9 +74,41 @@ def test_bodies_that_pass(body):
     "Android note posted on #198",
     "<!-- Android: n/a <reason>  or  Android: posted on #N -->\nAndroid: ",
     "`Android: posted on #198`",
+    "Android: n/a.",
+    "Android: n/abc",
+    "Android: n/a <reason>",
+    "Android: n/a <reason>  ",
+    "Android: n/a -",
+    "Android: posted on #<N>",
+    "Android: posted on #N",
+    "Text\n```\nAndroid: posted on #198\n```\nAndroid:",
+    "Text\n```\nAndroid: posted on #198",
+    "Text\n<!-- unclosed\nAndroid: posted on #198",
 ])
 def test_bodies_that_fail(body):
     assert not parity.has_android_line(body)
+
+
+def _git(cwd, *args):
+    subprocess.run(
+        ["git", "-c", "user.name=t", "-c", "user.email=t@example.invalid", *args],
+        cwd=cwd, check=True, capture_output=True,
+    )
+
+
+def test_moving_a_file_out_of_a_shared_tree_still_counts(tmp_path, monkeypatch):
+    _git(tmp_path, "init", "-q", "-b", "main")
+    (tmp_path / "ios").mkdir()
+    (tmp_path / "ios" / "Foo.swift").write_text("let shared = 1\n" * 20)
+    _git(tmp_path, "add", "-A")
+    _git(tmp_path, "commit", "-q", "-m", "base")
+    (tmp_path / "other").mkdir()
+    _git(tmp_path, "mv", "ios/Foo.swift", "other/Foo.swift")
+    _git(tmp_path, "commit", "-q", "-m", "move")
+    monkeypatch.chdir(tmp_path)
+    changed = parity.changed_files("HEAD~1", "HEAD")
+    assert sorted(changed) == ["ios/Foo.swift", "other/Foo.swift"]
+    assert parity.check(changed, "") is not None
 
 
 def test_check_passes_untouched_prs_without_a_body():
@@ -111,6 +147,9 @@ def test_parity_workflow_passes_body_through_env_only():
     # Only first-party actions: no third-party code sees the PR.
     for action in re.findall(r"uses: (\S+)", text):
         assert action.startswith("actions/"), action
+    # Rapid description edits cancel the run they supersede.
+    assert "group: mobile-parity-${{ github.event.pull_request.number }}" in text
+    assert "cancel-in-progress: true" in text
     # The body is referenced exactly once, and that is the env entry above.
     assert text.count("pull_request.body") == 1
 

@@ -20,16 +20,22 @@ import sys
 
 SHARED_PREFIXES = ("ios/", "wattracker/cloud/", "tests/vectors/")
 
-# `Android: n/a <reason>` or `Android: <anything> #N`. A bare `Android: n/a`
-# does not count: the reason is the point. A leading list marker is allowed so
-# the line can sit in a bulleted summary.
+# A line of its own: `Android: <value>`, optionally after a list marker so it
+# can sit in a bulleted summary.
 _ANDROID_LINE = re.compile(
-    r"^[ \t]*(?:[-*][ \t]+)?android:[ \t]*(?:n/a[ \t]*\S.*|.*#[0-9]+.*)$",
+    r"^[ \t]*(?:[-*][ \t]+)?android:[ \t]*(.*?)[ \t]*$",
     re.IGNORECASE | re.MULTILINE,
 )
-# The PR template explains the format inside an HTML comment, examples and
-# all. Those must not satisfy the check on a body nobody filled in.
-_HTML_COMMENT = re.compile(r"<!--.*?-->", re.DOTALL)
+# The value either names an issue or PR (`#N`), or is `n/a` and a reason. A
+# bare `n/a`, `n/a.` or `n/abc` is not a reason (`n/a, <reason>` is fine), and
+# neither is the template's own `<reason>` placeholder.
+_ISSUE_REF = re.compile(r"#[0-9]+")
+_NOT_APPLICABLE = re.compile(r"n/a[,:;.]?[ \t]+(.+)", re.IGNORECASE)
+_WORD = re.compile(r"\S{2,}")
+# Text a reader does not see as a statement: HTML comments (the PR template
+# explains the format inside one, examples and all) and fenced code blocks.
+# An unclosed comment or fence runs to the end of the body, as it renders.
+_HIDDEN = re.compile(r"<!--.*?(?:-->|\Z)|^[ \t]*```.*?(?:^[ \t]*```|\Z)", re.DOTALL | re.MULTILINE)
 
 FAILURE = """\
 This pull request changes files that both mobile clients depend on:
@@ -49,13 +55,23 @@ def touches_shared_surface(paths):
     return [p for p in paths if p.startswith(SHARED_PREFIXES)]
 
 
+def _satisfies(value):
+    if _ISSUE_REF.search(value):
+        return True
+    reason = _NOT_APPLICABLE.fullmatch(value)
+    return bool(reason) and reason.group(1) != "<reason>" and bool(_WORD.search(reason.group(1)))
+
+
 def has_android_line(body):
-    return bool(_ANDROID_LINE.search(_HTML_COMMENT.sub("", body or "")))
+    visible = _HIDDEN.sub("", (body or "").replace("\r\n", "\n"))
+    return any(_satisfies(m.group(1)) for m in _ANDROID_LINE.finditer(visible))
 
 
 def changed_files(base, head):
+    # --no-renames: a file moved out of ios/ must list its old path too, or
+    # moving it would be a way past this check.
     result = subprocess.run(
-        ["git", "diff", "--name-only", f"{base}...{head}"],
+        ["git", "diff", "--no-renames", "--name-only", f"{base}...{head}"],
         capture_output=True, text=True, check=True,
     )
     return [line for line in result.stdout.splitlines() if line]
