@@ -441,11 +441,18 @@ actor CloudSession: ReadSession {
     /// Anything else (429, 503, other 5xx, offline, malformed) is transient
     /// or unexplained and keeps the credential too.
     private func serverNoLongerKnowsCredential(_ error: Error) -> Bool {
-        guard case let .http(status, _, _, serverDate)? = error as? CloudClient.Failure,
-              status == 401 || status == 404,
-              let serverDate
+        guard case let .http(status, _, _, serverDate)? = error as? CloudClient.Failure
         else { return false }
-        return abs(serverDate.timeIntervalSince(clock())) <= Self.clockSkewTolerance
+        return Self.removalCompletesLocally(status: status, serverDate: serverDate, now: clock())
+    }
+
+    /// The decision `serverNoLongerKnowsCredential` makes, as a pure function
+    /// so it can be checked against `tests/vectors/removal_decision_v1.json`,
+    /// the rule shared with the Android client. `status` is nil when no
+    /// response arrived at all.
+    static func removalCompletesLocally(status: Int?, serverDate: Date?, now: Date) -> Bool {
+        guard let status, status == 401 || status == 404, let serverDate else { return false }
+        return abs(serverDate.timeIntervalSince(now)) <= clockSkewTolerance
     }
 
     /// A route's objects, reconciled with the server where that is possible.

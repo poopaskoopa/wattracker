@@ -27,21 +27,29 @@ enum PairingCode {
     /// Generated codes never contain the folded letters, so folding them onto
     /// digits cannot merge two distinct codes or shrink the 2^60 space. `U` is
     /// not folded because it is not a legal symbol at all.
-    private static let folds: [Character: Character] = ["I": "1", "L": "1", "O": "0"]
-    private static let stripped: Set<Character> = ["-", " ", "\t"]
+    private static let folds: [Unicode.Scalar: Unicode.Scalar] = ["I": "1", "L": "1", "O": "0"]
+    private static let stripped: Set<Unicode.Scalar> = ["-", " ", "\t"]
+    private static let alphabetScalars = Set(alphabet.unicodeScalars)
 
     /// The canonical, ungrouped code, or nil if this is not one.
+    ///
+    /// Compared scalar by scalar, as the server compares code points, and not
+    /// `Character` by `Character`: Swift's `Character` equality is canonical
+    /// equivalence, under which KELVIN SIGN (U+212A) *is* `K`, so a Character
+    /// loop accepted a code the server refuses
+    /// (`tests/vectors/pairing_code_v1.json`, case `kelvin-sign`). The length
+    /// bound counts scalars for the same reason: the server counts code
+    /// points, not grapheme clusters.
     static func normalized(_ value: String) -> String? {
-        guard !value.isEmpty, value.count <= maximumInputLength else { return nil }
-        var symbols = ""
-        symbols.reserveCapacity(symbolCount)
-        for character in value.uppercased() {
-            if stripped.contains(character) { continue }
-            let folded = folds[character] ?? character
-            guard alphabet.contains(folded) else { return nil }
+        guard !value.isEmpty, value.unicodeScalars.count <= maximumInputLength else { return nil }
+        var symbols = String.UnicodeScalarView()
+        for scalar in value.uppercased().unicodeScalars {
+            if stripped.contains(scalar) { continue }
+            let folded = folds[scalar] ?? scalar
+            guard alphabetScalars.contains(folded) else { return nil }
             symbols.append(folded)
         }
-        return symbols.count == symbolCount ? symbols : nil
+        return symbols.count == symbolCount ? String(symbols) : nil
     }
 
     /// The grouped display form, or nil if this is not a code.

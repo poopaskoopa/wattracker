@@ -1,0 +1,311 @@
+{
+  "version": 1,
+  "generated_by": "scripts/generate_behaviour_vectors.py",
+  "source_of_truth": "wattracker/cloud/security.py normalize_pairing_code and format_pairing_code (_PAIRING_ALPHABET, _PAIRING_FOLD, _PAIRING_STRIP, _MAX_PAIRING_INPUT)",
+  "description": "Pairing-code normalization. The server is the truth: reject input that is empty or longer than max_input_length characters; upper-case the whole string (locale-independent); drop every character in server_strip; fold I and L to 1 and O to 0; any other character outside the alphabet makes the input not a code (U included); exactly symbol_count symbols must remain. 'normalized' is the canonical ungrouped code and 'grouped' the XXXX-XXXX-XXXX display form, both null when the input is not a code. A client must produce exactly these values, with ONE permitted leniency: a case marked client_may_accept differs from a valid code only by carriage returns and line feeds (client_extra_strip), and a client may either refuse it like the server (null) or accept it as exactly client_normalized / client_grouped. That leniency is harmless only because a client that applies it sends the server the normalized code, never the raw input; a client that forwards raw typed input must not use it to decide anything the server would decide differently.",
+  "alphabet": "0123456789ABCDEFGHJKMNPQRSTVWXYZ",
+  "folds": {
+    "I": "1",
+    "L": "1",
+    "O": "0"
+  },
+  "server_strip": "- \t",
+  "client_extra_strip": "\r\n",
+  "symbol_count": 12,
+  "group_size": 4,
+  "max_input_length": 64,
+  "cases": [
+    {
+      "name": "canonical",
+      "why": "Already canonical: returned unchanged.",
+      "input": "ABCDEFGHJKMN",
+      "normalized": "ABCDEFGHJKMN",
+      "grouped": "ABCD-EFGH-JKMN"
+    },
+    {
+      "name": "grouped-dashes",
+      "why": "The display form the desktop shows.",
+      "input": "ABCD-EFGH-JKMN",
+      "normalized": "ABCDEFGHJKMN",
+      "grouped": "ABCD-EFGH-JKMN"
+    },
+    {
+      "name": "lowercase",
+      "why": "Typed in lowercase: upper-cased before anything else.",
+      "input": "abcd-efgh-jkmn",
+      "normalized": "ABCDEFGHJKMN",
+      "grouped": "ABCD-EFGH-JKMN"
+    },
+    {
+      "name": "mixed-case",
+      "why": "Mixed case.",
+      "input": "aBcD-eFgH-jKmN",
+      "normalized": "ABCDEFGHJKMN",
+      "grouped": "ABCD-EFGH-JKMN"
+    },
+    {
+      "name": "grouped-spaces",
+      "why": "Spaces are stripped like dashes.",
+      "input": "ABCD EFGH JKMN",
+      "normalized": "ABCDEFGHJKMN",
+      "grouped": "ABCD-EFGH-JKMN"
+    },
+    {
+      "name": "grouped-tabs",
+      "why": "Tabs are in the server's strip set too.",
+      "input": "ABCD\tEFGH\tJKMN",
+      "normalized": "ABCDEFGHJKMN",
+      "grouped": "ABCD-EFGH-JKMN"
+    },
+    {
+      "name": "surrounding-spaces",
+      "why": "Leading and trailing spaces are stripped.",
+      "input": "  ABCD-EFGH-JKMN  ",
+      "normalized": "ABCDEFGHJKMN",
+      "grouped": "ABCD-EFGH-JKMN"
+    },
+    {
+      "name": "irregular-separators",
+      "why": "Separators anywhere, repeated: grouping is not checked.",
+      "input": "A-B C\tD--EFGH  JK-MN",
+      "normalized": "ABCDEFGHJKMN",
+      "grouped": "ABCD-EFGH-JKMN"
+    },
+    {
+      "name": "all-digits",
+      "why": "Digits only.",
+      "input": "0123-4567-8901",
+      "normalized": "012345678901",
+      "grouped": "0123-4567-8901"
+    },
+    {
+      "name": "fold-i-l-o",
+      "why": "I and L fold to 1, O folds to 0.",
+      "input": "IL0O-1234-5678",
+      "normalized": "110012345678",
+      "grouped": "1100-1234-5678"
+    },
+    {
+      "name": "fold-lowercase",
+      "why": "Folding happens after upper-casing, so i, l and o fold too.",
+      "input": "ilo0-ilo0-ilo0",
+      "normalized": "110011001100",
+      "grouped": "1100-1100-1100"
+    },
+    {
+      "name": "illegal-u",
+      "why": "U is not folded: it is simply not a symbol.",
+      "input": "ABCD-EFGH-JKMU",
+      "normalized": null,
+      "grouped": null
+    },
+    {
+      "name": "illegal-lowercase-u",
+      "why": "Nor is u.",
+      "input": "abcd-efgh-jkmu",
+      "normalized": null,
+      "grouped": null
+    },
+    {
+      "name": "illegal-punctuation",
+      "why": "Only dash, space and tab are separators.",
+      "input": "ABCD.EFGH.JKMN",
+      "normalized": null,
+      "grouped": null
+    },
+    {
+      "name": "illegal-underscore",
+      "why": "Underscore is not a separator.",
+      "input": "ABCD_EFGH_JKMN",
+      "normalized": null,
+      "grouped": null
+    },
+    {
+      "name": "too-short",
+      "why": "11 symbols.",
+      "input": "ABCD-EFGH-JKM",
+      "normalized": null,
+      "grouped": null
+    },
+    {
+      "name": "too-long",
+      "why": "13 symbols.",
+      "input": "ABCD-EFGH-JKMNP",
+      "normalized": null,
+      "grouped": null
+    },
+    {
+      "name": "empty",
+      "why": "Empty is not a code.",
+      "input": "",
+      "normalized": null,
+      "grouped": null
+    },
+    {
+      "name": "only-separators",
+      "why": "Zero symbols.",
+      "input": "- \t-",
+      "normalized": null,
+      "grouped": null
+    },
+    {
+      "name": "max-input-length-64",
+      "why": "Exactly 64 characters including padding: still accepted.",
+      "input": "ABCD-EFGH-JKMN                                                  ",
+      "normalized": "ABCDEFGHJKMN",
+      "grouped": "ABCD-EFGH-JKMN"
+    },
+    {
+      "name": "overlong-input-65",
+      "why": "65 characters: refused before normalizing, even though the symbols inside are a valid code. The bound is on raw input length.",
+      "input": "ABCD-EFGH-JKMN                                                   ",
+      "normalized": null,
+      "grouped": null
+    },
+    {
+      "name": "overlong-input-garbage",
+      "why": "Far over the bound.",
+      "input": "XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX",
+      "normalized": null,
+      "grouped": null
+    },
+    {
+      "name": "fullwidth-letters",
+      "why": "Fullwidth Latin lookalikes are not the ASCII symbols.",
+      "input": "\uff21\uff22\uff23\uff24-\uff25\uff26\uff27\uff28-\uff2a\uff2b\uff2d\uff2e",
+      "normalized": null,
+      "grouped": null
+    },
+    {
+      "name": "fullwidth-digits",
+      "why": "Fullwidth digits are not digits here either.",
+      "input": "\uff10\uff11\uff12\uff13-4567-8901",
+      "normalized": null,
+      "grouped": null
+    },
+    {
+      "name": "cyrillic-lookalike",
+      "why": "Cyrillic capital A looks like A and is not.",
+      "input": "\u0410BCD-EFGH-JKMN",
+      "normalized": null,
+      "grouped": null
+    },
+    {
+      "name": "kelvin-sign",
+      "why": "KELVIN SIGN upper-cases to itself, not to K.",
+      "input": "ABCD-EFGH-J\u212aMN",
+      "normalized": null,
+      "grouped": null
+    },
+    {
+      "name": "zero-width-space",
+      "why": "Zero-width space is not in the strip set.",
+      "input": "ABCD\u200bEFGH\u200bJKMN",
+      "normalized": null,
+      "grouped": null
+    },
+    {
+      "name": "no-break-space",
+      "why": "NO-BREAK SPACE is not an ASCII space.",
+      "input": "ABCD\u00a0EFGH\u00a0JKMN",
+      "normalized": null,
+      "grouped": null
+    },
+    {
+      "name": "combining-accent",
+      "why": "A combining mark makes the last symbol not a symbol.",
+      "input": "ABCD-EFGH-JKME\u0301",
+      "normalized": null,
+      "grouped": null
+    },
+    {
+      "name": "emoji",
+      "why": "Astral-plane characters are refused.",
+      "input": "ABCD-EFGH-JK\ud83d\udeb4",
+      "normalized": null,
+      "grouped": null
+    },
+    {
+      "name": "dotted-capital-i",
+      "why": "Turkish dotted capital I upper-cases to itself: refused.",
+      "input": "ABCD-EFGH-JKM\u0130",
+      "normalized": null,
+      "grouped": null
+    },
+    {
+      "name": "dotless-small-i",
+      "why": "Turkish dotless small i upper-cases to plain I, which then folds to 1. Locale-independent upper-casing is part of the rule.",
+      "input": "abcd-efgh-jkm\u0131",
+      "normalized": "ABCDEFGHJKM1",
+      "grouped": "ABCD-EFGH-JKM1"
+    },
+    {
+      "name": "sharp-s-expands",
+      "why": "German sharp s upper-cases to SS: one input character becomes two symbols. Upper-case the whole string first, then iterate.",
+      "input": "abcd-efgh-jk\u00df",
+      "normalized": "ABCDEFGHJKSS",
+      "grouped": "ABCD-EFGH-JKSS"
+    },
+    {
+      "name": "ligature-ff-expands",
+      "why": "The ff ligature upper-cases to FF, also two symbols.",
+      "input": "ABCD-EFGH-JK\ufb00",
+      "normalized": "ABCDEFGHJKFF",
+      "grouped": "ABCD-EFGH-JKFF"
+    },
+    {
+      "name": "trailing-newline",
+      "why": "A pasted code with a trailing newline.",
+      "input": "ABCD-EFGH-JKMN\n",
+      "normalized": null,
+      "grouped": null,
+      "client_may_accept": true,
+      "client_normalized": "ABCDEFGHJKMN",
+      "client_grouped": "ABCD-EFGH-JKMN"
+    },
+    {
+      "name": "trailing-crlf",
+      "why": "A pasted code with a Windows line ending.",
+      "input": "ABCD-EFGH-JKMN\r\n",
+      "normalized": null,
+      "grouped": null,
+      "client_may_accept": true,
+      "client_normalized": "ABCDEFGHJKMN",
+      "client_grouped": "ABCD-EFGH-JKMN"
+    },
+    {
+      "name": "embedded-newlines",
+      "why": "Groups on separate lines.",
+      "input": "ABCD\nEFGH\nJKMN",
+      "normalized": null,
+      "grouped": null,
+      "client_may_accept": true,
+      "client_normalized": "ABCDEFGHJKMN",
+      "client_grouped": "ABCD-EFGH-JKMN"
+    },
+    {
+      "name": "embedded-cr",
+      "why": "Bare carriage returns between groups.",
+      "input": "ABCD\rEFGH\rJKMN",
+      "normalized": null,
+      "grouped": null,
+      "client_may_accept": true,
+      "client_normalized": "ABCDEFGHJKMN",
+      "client_grouped": "ABCD-EFGH-JKMN"
+    },
+    {
+      "name": "newline-does-not-rescue-illegal",
+      "why": "Stripping newlines never makes an illegal symbol legal.",
+      "input": "ABCD-EFGH-JKMU\n",
+      "normalized": null,
+      "grouped": null
+    },
+    {
+      "name": "newline-does-not-rescue-length",
+      "why": "Nor a wrong length.",
+      "input": "ABCD-EFGH-JKM\n",
+      "normalized": null,
+      "grouped": null
+    }
+  ]
+}
