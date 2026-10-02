@@ -1,0 +1,35 @@
+name: Mobile parity
+
+# A pull request that changes ios/, wattracker/cloud/ or tests/vectors/ must
+# carry an `Android:` line in its description - where the Android note was
+# posted, or why none is needed. docs/mobile-parity.md explains the rule; the
+# logic and its tests live in scripts/check_android_parity.py.
+#
+# `edited` is in the types so that fixing the description re-runs the check
+# without a new push. Hosted, no secrets, read-only token: safe on fork PRs.
+on:
+  pull_request:
+    types: [opened, edited, synchronize, reopened]
+
+permissions:
+  contents: read
+
+jobs:
+  android-line:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      # Full history so the base...head diff has a merge base to work from.
+      - name: Check out source
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      # The body is attacker-controllable text. It reaches the script through
+      # env only; interpolating it into `run:` would be shell injection.
+      - name: Require an Android line
+        env:
+          PR_BODY: ${{ github.event.pull_request.body }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: python3 scripts/check_android_parity.py

@@ -4,16 +4,23 @@ name: Android
 # it off pull requests that touch no Android code. The workflow file is in its
 # own filter, so a change to this file is always validated by the job it
 # defines - including the pull request that introduces it.
+#
+# tests/vectors/ is in the filter because the Kotlin unit tests read the shared
+# vector files from there (TestVectors.kt walks up to the repository root). A
+# vector changed without it would merge with the Kotlin half never run against
+# the new file.
 on:
   push:
     branches:
       - main
     paths:
       - 'android/**'
+      - 'tests/vectors/**'
       - '.github/workflows/android.yml'
   pull_request:
     paths:
       - 'android/**'
+      - 'tests/vectors/**'
       - '.github/workflows/android.yml'
 
 permissions:

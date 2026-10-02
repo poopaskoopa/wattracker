@@ -126,7 +126,27 @@ These have all cost real time here before.
 - **This repository is public.** No credentials, no signing material, no real
   email addresses in commits, issues, or code.
 
-## 8. Which work suits which agent
+## 8. Changes the Android client must hear about
+
+iOS and Android are two clients of one read plane, and Android is built by a
+human contributor, taksmon, who cannot see what an agent changed on the iOS
+side unless someone tells him. `docs/mobile-parity.md` is the full rule. For
+any PR that touches `ios/`, `wattracker/cloud/` or `tests/vectors/`:
+
+- **Post an Android note** on the matching Android issue (#195 pairing, #196
+  Dashboard, #197 Activities, #198 Calendar and Volume, #199 release, #282
+  backend selection) — not on the epic. Those issues are assigned to taksmon:
+  post notes only. Never implement, relabel or reassign them.
+- **Put an `Android:` line in the PR body** — `Android: posted on #N`, or
+  `Android: n/a <reason>`. CI fails without it, and `gh pr create --body`
+  skips the PR template, so it has to be typed.
+- **Update `docs/mobile-parity.md`** in the same PR when the change alters
+  user-visible behaviour on either client.
+- **Add or extend a vector** in `tests/vectors/` when the change introduces a
+  rule both clients must compute the same way, so Swift and Kotlin tests read
+  one file instead of two descriptions.
+
+## 9. Which work suits which agent
 
 Guidance for choosing, not a rule. Any issue can go to either.
 
