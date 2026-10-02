@@ -2,9 +2,8 @@
 
 The pipeline is `.github/workflows/ios-release.yml`. Pushing a tag that starts
 with `ios-v` archives, signs, exports and uploads a build to TestFlight. A
-manual `workflow_dispatch` runs the same archive/export path without uploading;
-use that safe test after the workflow change has merged, before choosing to
-push a release tag.
+manual `workflow_dispatch` from `main` runs the same archive/export path
+without uploading; manual verification is main-only.
 
 ```sh
 git tag ios-v0.1.0
@@ -162,7 +161,7 @@ is App Store Connect; they are different websites for the same account.
 
    Before any certificate subject or keychain password reaches the Actions
    command channel, the workflow masks it. Percent signs, carriage returns,
-   and line feeds are escaped as `%25`, `%0D`, and `%0A), respectively,
+   and line feeds are escaped as `%25`, `%0D`, and `%0A`, respectively,
    because those characters have command-channel meaning. The archive and
    export streams also replace the complete `Signing Identity:` line and
    the certificate's CN/O values, including non-ASCII names.
@@ -204,15 +203,15 @@ and every later release:
 2. In App Store Connect, confirm the `WatTracker` app record has bundle ID
    `com.wattracker.ios`, and add the intended internal testers. Internal
    testers need App Store Connect access and do not need beta review.
-3. In Actions, dispatch **iOS TestFlight release** once with the default
-   `diagnose_signing` setting. This hosted-runner test archives and exports
-   but does not upload; inspect the first failing step and its diagnostic if it
-   fails. Never use an `ios-v*` tag for this verification.
-5. When the test-mode run is satisfactory, create and push the release tag,
+3. From the `main` branch, dispatch **iOS TestFlight release** once with the
+   default `diagnose_signing` setting. This hosted-runner test archives and
+   exports but does not upload; inspect the first failing step and its
+   diagnostic if it fails. Manual verification is main-only.
+4. When the test-mode run is satisfactory, create and push the release tag,
    for example `git tag ios-v0.1.0 && git push origin ios-v0.1.0`.
-6. Wait roughly 10–30 minutes for Apple's processing. Then install the build
+5. Wait roughly 10–30 minutes for Apple's processing. Then install the build
    through the TestFlight app and verify the app reaches the production cloud.
-7. To invite riders who are not on the App Store Connect team, create an
+6. To invite riders who are not on the App Store Connect team, create an
    external testing group and submit the first build for Apple's one-time Beta
    App Review. Do not treat internal tester availability as evidence that
    external testing is approved.
@@ -375,10 +374,11 @@ Two practical notes:
 3. Validates the secret-backed production API hostname. This happens before
    the archive and rejects an empty value, whitespace, a URL/path, malformed
    DNS, or the placeholder `api.wattracker.com` without printing the host.
-4. Runs the Swift test suite on an available iOS Simulator. If a hosted arm64
-   capacity pool has no simulator device, it performs an unsigned iOS-device
-   SDK compile instead; the trusted `ios-tests` job remains the test gate. A
-   failing test or compile costs nothing but time at this point.
+4. Runs the Swift test suite on an available iOS Simulator. If the selected
+   image has an installed runtime and device type but no device, the workflow
+   creates one. A manual dispatch with no simulator performs an unsigned
+   iOS-device SDK compile; a release event fails rather than using that
+   fallback. The trusted `ios-tests` job remains the test gate.
 5. Writes the `.p8` to `$RUNNER_TEMP` under `umask 077`, verifies it parses as
    a private key, and templates `teamID` into a temporary copy of
    `ExportOptions.plist`.
