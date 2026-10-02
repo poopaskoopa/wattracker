@@ -63,7 +63,7 @@ jobs:
 
     steps:
       - name: Check out the tagged source
-        uses: actions/checkout@v4
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
           # The repository convention, and it matters more here than usual: a
           # persisted credential would sit in .git/config on a runner that is
@@ -173,15 +173,25 @@ jobs:
 
       # Before anything is signed, because a failing test should cost nothing
       # but time. Prefer a real simulator when the hosted image supplies one.
-      # Some macOS arm64 capacity pools have the Xcode/iOS SDK but no simulator
-      # device; in that case the trusted ios-tests job remains the test gate and
-      # this release job performs an unsigned device-SDK compile so signing can
-      # still be exercised.
+      # If the image has an installed runtime and device type but no bootable
+      # device, create one. A release event must never silently substitute an
+      # unsigned compile; manual dispatch retains the diagnostic fallback.
       - name: Run the Swift test suite
         run: |
           set -euo pipefail
           simulator_udid="$(xcrun simctl list devices available \
             | awk -F '[()]' '/iPhone/ {print $2; exit}')"
+          if [ -z "$simulator_udid" ]; then
+            simulator_runtime="$(xcrun simctl list runtimes \
+              | awk -F '[()]' '/iOS .*available/ {print $2; exit}' || true)"
+            simulator_device_type="$(xcrun simctl list devicetypes \
+              | awk -F '[()]' '/iPhone/ {print $2; exit}' || true)"
+            if [ -n "$simulator_runtime" ] && [ -n "$simulator_device_type" ]; then
+              simulator_udid="$(xcrun simctl create \
+                "WatTracker Release Test ${GITHUB_RUN_ID:-manual}" \
+                "$simulator_device_type" "$simulator_runtime" || true)"
+            fi
+          fi
           if [ -n "$simulator_udid" ]; then
             echo "Running Swift tests on simulator $simulator_udid."
             xcodebuild test \
@@ -190,7 +200,12 @@ jobs:
               -destination "id=$simulator_udid" \
               -derivedDataPath "$RUNNER_TEMP/ios-test-dd"
           else
-            echo "::warning::This hosted macOS VM has no available iOS Simulator; CI ios-tests remains the test gate, so this job will compile the device target before signing."
+            event_name="${GITHUB_EVENT_NAME:-}"
+            if [ "$event_name" != "workflow_dispatch" ]; then
+              echo "No iOS Simulator is available for this release event." >&2
+              exit 1
+            fi
+            echo "::warning::This hosted macOS VM has no available iOS Simulator; CI ios-tests remains the test gate, so this manual run will compile the device target before signing."
             xcodebuild build \
               -project ios/WatTracker/WatTracker.xcodeproj \
               -scheme WatTracker \
@@ -325,6 +340,27 @@ jobs:
             value="${value//$'\n'/%0A}"
             printf '::add-mask::%s\n' "$value"
           }
+          unicode_form() {
+            local form="$1"
+            local value="$2"
+            /usr/bin/perl -MEncode=decode,encode -MUnicode::Normalize -e '
+              my ($form, $value) = @ARGV;
+              $value = decode("UTF-8", $value, 1);
+              my $normalized = $form eq "NFC" ? NFC($value) : NFD($value);
+              print encode("UTF-8", $normalized);
+            ' "$form" "$value"
+          }
+          mask_unicode_forms() {
+            local value="$1"
+            local nfc
+            local nfd
+            [ -n "$value" ] || return 0
+            mask_secret "$value"
+            nfc="$(unicode_form NFC "$value")"
+            nfd="$(unicode_form NFD "$value")"
+            mask_secret "$nfc"
+            mask_secret "$nfd"
+          }
           # The password is passed to the export step through GITHUB_ENV; mask
           # it before the runner can persist that value for another step.
           mask_secret "$keychain_password"
@@ -358,8 +394,8 @@ jobs:
             echo "The distribution certificate subject is missing a required RDN." >&2
             exit 1
           fi
-          mask_secret "$leaf_cn"
-          mask_secret "$leaf_legal_name"
+          mask_unicode_forms "$leaf_cn"
+          mask_unicode_forms "$leaf_legal_name"
           mask_secret "$cert_team"
           if ! /usr/bin/openssl x509 -in "$cert_pem" -checkend 0 -noout >/dev/null 2>&1; then
             echo "The distribution certificate is expired." >&2
@@ -392,10 +428,10 @@ jobs:
           wwdr_legal_name="$(/usr/bin/openssl x509 -inform der -in "$wwdr_cert" -noout -subject \
             -nameopt sep_multiline,utf8 | sed -n 's/^ *O=//p')"
           if [ -n "$wwdr_cn" ]; then
-            mask_secret "$wwdr_cn"
+            mask_unicode_forms "$wwdr_cn"
           fi
           if [ -n "$wwdr_legal_name" ]; then
-            mask_secret "$wwdr_legal_name"
+            mask_unicode_forms "$wwdr_legal_name"
           fi
           security create-keychain -p "$keychain_password" "$keychain"
           security set-keychain-settings -lut 3600 "$keychain"
@@ -583,8 +619,20 @@ jobs:
           use IPC::Open3;
           use Symbol qw(gensym);
 
-          my @redactions = grep { defined($_) && length($_) }
-              @ENV{qw(IOS_CERT_CN IOS_CERT_LEGAL_NAME APPLE_TEAM_ID)};
+          use Encode qw(decode encode);
+          use Unicode::Normalize qw(NFC NFD);
+
+          my @redactions;
+          for my $raw_value (grep { defined($_) && length($_) }
+              @ENV{qw(IOS_CERT_CN IOS_CERT_LEGAL_NAME APPLE_TEAM_ID)}) {
+              my $value = "$raw_value";
+              push @redactions, $value;
+              my $unicode = eval { decode('UTF-8', $value, Encode::FB_CROAK) };
+              if (defined $unicode) {
+                  push @redactions, encode('UTF-8', NFC($unicode));
+                  push @redactions, encode('UTF-8', NFD($unicode));
+              }
+          }
 
           sub redact {
               my ($line) = @_;
@@ -706,8 +754,20 @@ jobs:
           use IPC::Open3;
           use Symbol qw(gensym);
 
-          my @redactions = grep { defined($_) && length($_) }
-              @ENV{qw(IOS_CERT_CN IOS_CERT_LEGAL_NAME APPLE_TEAM_ID)};
+          use Encode qw(decode encode);
+          use Unicode::Normalize qw(NFC NFD);
+
+          my @redactions;
+          for my $raw_value (grep { defined($_) && length($_) }
+              @ENV{qw(IOS_CERT_CN IOS_CERT_LEGAL_NAME APPLE_TEAM_ID)}) {
+              my $value = "$raw_value";
+              push @redactions, $value;
+              my $unicode = eval { decode('UTF-8', $value, Encode::FB_CROAK) };
+              if (defined $unicode) {
+                  push @redactions, encode('UTF-8', NFC($unicode));
+                  push @redactions, encode('UTF-8', NFD($unicode));
+              }
+          }
 
           sub redact {
               my ($line) = @_;

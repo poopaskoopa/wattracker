@@ -154,6 +154,11 @@ def test_workflow_validates_and_passes_the_secret_backed_host_separately():
 def test_release_uses_a_hosted_xcode_26_toolchain_and_leaves_ios_tests_in_place():
     workflow = WORKFLOW.read_text(encoding="utf-8")
     assert "runs-on: macos-26" in workflow
+    checkout = next(line.strip() for line in workflow.splitlines() if "uses: actions/checkout@" in line)
+    checkout_ref = checkout.split("@", 1)[1].split()[0]
+    assert len(checkout_ref) == 40
+    assert all(character in "0123456789abcdef" for character in checkout_ref)
+    assert "# v4.2.2" in checkout
     assert "xcode_path=/Applications/Xcode_26.6.app" in workflow
     assert 'sudo xcode-select --switch "$xcode_path"' in workflow
     assert 'xcrun --sdk iphoneos --show-sdk-version' in workflow
@@ -165,17 +170,37 @@ def test_release_uses_a_hosted_xcode_26_toolchain_and_leaves_ios_tests_in_place(
     assert "xcodebuild test" in ios_tests
 
 
-def test_release_test_step_falls_back_to_a_device_sdk_compile_without_a_simulator():
+def test_release_test_step_creates_simulator_or_fails_release_without_one():
     workflow = WORKFLOW.read_text(encoding="utf-8")
     start = workflow.index("- name: Run the Swift test suite")
     end = workflow.index("- name: Write the App Store Connect API key", start)
     step = workflow[start:end]
     assert "xcrun simctl list devices available" in step
+    assert "xcrun simctl list runtimes" in step
+    assert "xcrun simctl list devicetypes" in step
+    assert "xcrun simctl create" in step
     assert 'if [ -n "$simulator_udid" ]; then' in step
     assert "xcodebuild test" in step
+    assert 'event_name="${GITHUB_EVENT_NAME:-}"' in step
+    assert 'if [ "$event_name" != "workflow_dispatch" ]; then' in step
+    assert 'echo "No iOS Simulator is available for this release event." >&2' in step
+    assert "exit 1" in step
     assert "xcodebuild build" in step
     assert "CODE_SIGNING_ALLOWED=NO" in step
-    assert "CI ios-tests remains the test gate" in step
+    assert "manual run will compile the device target" in step
+
+
+def test_ios_testflight_docs_keep_manual_runs_main_only_and_numbered():
+    docs = Path("docs/ios-testflight.md").read_text(encoding="utf-8")
+    assert "and line feeds are escaped as `%25`, `%0D`, and `%0A`, respectively," in docs
+    sequence_start = docs.index("## The owner's release sequence")
+    sequence_end = docs.index("### Export compliance", sequence_start)
+    sequence = docs[sequence_start:sequence_end]
+    assert "From the `main` branch, dispatch" in sequence
+    assert "\n4. When the test-mode run is satisfactory" in sequence
+    assert "\n5. Wait roughly 10–30 minutes" in sequence
+    assert "\n6. To invite riders" in sequence
+    assert "\n7." not in sequence
 
 
 def test_workflow_pins_verifies_and_imports_apple_root_and_wwdr_before_identity_check():
@@ -274,37 +299,48 @@ def test_workflow_masks_leaf_and_wwdr_common_names_before_diagnostics():
     workflow = WORKFLOW.read_text(encoding="utf-8")
     leaf_cn = 'mask_secret "$leaf_cn"'
     leaf_legal_name = 'mask_secret "$leaf_legal_name"'
+    leaf_cn_forms = 'mask_unicode_forms "$leaf_cn"'
+    leaf_legal_name_forms = 'mask_unicode_forms "$leaf_legal_name"'
     cert_team = 'mask_secret "$cert_team"'
     wwdr_cn = 'mask_secret "$wwdr_cn"'
     wwdr_legal_name = 'mask_secret "$wwdr_legal_name"'
-    assert workflow.count(leaf_cn) == 1
-    assert workflow.count(leaf_legal_name) == 1
+    assert workflow.count(leaf_cn) == 0
+    assert workflow.count(leaf_legal_name) == 0
+    assert workflow.count(leaf_cn_forms) == 1
+    assert workflow.count(leaf_legal_name_forms) == 1
     assert workflow.count(cert_team) == 1
-    assert workflow.count(wwdr_cn) == 1
-    assert workflow.count(wwdr_legal_name) == 1
+    assert workflow.count(wwdr_cn) == 0
+    assert workflow.count(wwdr_legal_name) == 0
+    assert workflow.count('mask_unicode_forms "$wwdr_cn"') == 1
+    assert workflow.count('mask_unicode_forms "$wwdr_legal_name"') == 1
     for extraction in (
         "-nameopt sep_multiline,utf8 | sed -n 's/^ *CN=//p'",
         "-nameopt sep_multiline,utf8 | sed -n 's/^ *O=//p'",
         "-nameopt sep_multiline,utf8 | sed -n 's/^ *OU=//p'",
     ):
         assert extraction in workflow
-    assert workflow.index('leaf_cn="$(/usr/bin/openssl x509') < workflow.index(leaf_cn)
-    assert workflow.index('leaf_legal_name="$(/usr/bin/openssl x509') < workflow.index(leaf_legal_name)
+    assert workflow.index('leaf_cn="$(/usr/bin/openssl x509') < workflow.index(leaf_cn_forms)
+    assert workflow.index('leaf_legal_name="$(/usr/bin/openssl x509') < workflow.index(leaf_legal_name_forms)
     assert workflow.index('cert_team="$(/usr/bin/openssl x509') < workflow.index(cert_team)
-    assert workflow.index('wwdr_cn="$(/usr/bin/openssl x509') < workflow.index(wwdr_cn)
-    assert workflow.index('wwdr_legal_name="$(/usr/bin/openssl x509') < workflow.index(wwdr_legal_name)
+    assert workflow.index('wwdr_cn="$(/usr/bin/openssl x509') < workflow.index('mask_unicode_forms "$wwdr_cn"')
+    assert workflow.index('wwdr_legal_name="$(/usr/bin/openssl x509') < workflow.index('mask_unicode_forms "$wwdr_legal_name"')
     diagnose_start = workflow.index('if [ "${DIAGNOSE_SIGNING:-false}" = "true" ]; then')
-    assert workflow.index(leaf_cn) < diagnose_start
-    assert workflow.index(leaf_legal_name) < diagnose_start
+    assert workflow.index(leaf_cn_forms) < diagnose_start
+    assert workflow.index(leaf_legal_name_forms) < diagnose_start
     assert workflow.index(cert_team) < diagnose_start
-    assert workflow.index(wwdr_cn) < diagnose_start
-    assert workflow.index(wwdr_legal_name) < diagnose_start
+    assert workflow.index('mask_unicode_forms "$wwdr_cn"') < diagnose_start
+    assert workflow.index('mask_unicode_forms "$wwdr_legal_name"') < diagnose_start
     mask_start = workflow.index("mask_secret() {")
     mask_end = workflow.index("# The password is passed", mask_start)
     mask_function = workflow[mask_start:mask_end]
     assert "value=\"${value//%/%25}\"" in mask_function
     assert "value=\"${value//$'\\r'/%0D}\"" in mask_function
     assert "value=\"${value//$'\\n'/%0A}\"" in mask_function
+    assert 'nfc="$(unicode_form NFC "$value")"' in mask_function
+    assert 'nfd="$(unicode_form NFD "$value")"' in mask_function
+    assert 'mask_secret "$nfc"' in mask_function
+    assert 'mask_secret "$nfd"' in mask_function
+    assert "Unicode::Normalize" in mask_function
 
 
 def test_mask_secret_preserves_nfc_nfd_and_escapes_workflow_command_separators():
@@ -333,8 +369,11 @@ def test_mask_secret_preserves_nfc_nfd_and_escapes_workflow_command_separators()
 def test_archive_extracts_apple_ordered_cn_and_o_and_redacts_xcodebuild_streams(tmp_path):
     script = _workflow_step_script("Archive for the App Store")
     sentinel_name = "José Ñúñez"
-    sentinel_cn = f"Apple Distribution: {unicodedata.normalize('NFC', sentinel_name)} (TEAM-SENTINEL)"
-    sentinel_o = unicodedata.normalize("NFD", sentinel_name)
+    sentinel_nfc = unicodedata.normalize("NFC", sentinel_name)
+    sentinel_nfd = unicodedata.normalize("NFD", sentinel_name)
+    sentinel_cn = f"Apple Distribution: {sentinel_nfc} (TEAM-SENTINEL)"
+    sentinel_cn_nfd = unicodedata.normalize("NFD", sentinel_cn)
+    sentinel_o = sentinel_nfd
     cert_pem = tmp_path / "wattracker-ios-distribution-cert.pem"
     key_pem = tmp_path / "sentinel-key.pem"
     generated = subprocess.run(
@@ -397,6 +436,12 @@ def test_archive_extracts_apple_ordered_cn_and_o_and_redacts_xcodebuild_streams(
         "printf '%s\\n' \"Signing Identity: \\\"$IOS_CERT_CN\\\"\" >&2\n"
         "printf '%s\\n' \"Subject O: $IOS_CERT_LEGAL_NAME\"\n"
         "printf '%s\\n' \"Subject O: $IOS_CERT_LEGAL_NAME\" >&2\n"
+        "printf '%s\\n' \"Subject NFD CN: $EXPECTED_NFD_CN\"\n"
+        "printf '%s\\n' \"Subject NFD CN: $EXPECTED_NFD_CN\" >&2\n"
+        "printf '%s\\n' \"Subject NFC O: $EXPECTED_NFC_O\"\n"
+        "printf '%s\\n' \"Subject NFC O: $EXPECTED_NFC_O\" >&2\n"
+        "printf '%s\\n' \"Subject NFD O: $EXPECTED_NFD_O\"\n"
+        "printf '%s\\n' \"Subject NFD O: $EXPECTED_NFD_O\" >&2\n"
         "exit \"${FAKE_XCODEBUILD_STATUS:-0}\"\n",
         encoding="utf-8",
     )
@@ -413,7 +458,10 @@ def test_archive_extracts_apple_ordered_cn_and_o_and_redacts_xcodebuild_streams(
             "IOS_SIGNING_KEYCHAIN": str(tmp_path / "signing.keychain-db"),
             "IOS_SIGNING_KEYCHAIN_PASSWORD": "temporary-keychain-password",
             "EXPECTED_CN": sentinel_cn,
+            "EXPECTED_NFD_CN": sentinel_cn_nfd,
             "EXPECTED_O": sentinel_o,
+            "EXPECTED_NFC_O": sentinel_nfc,
+            "EXPECTED_NFD_O": sentinel_nfd,
             "ASC_KEY_PATH": str(tmp_path / "AuthKey.p8"),
             "ASC_KEY_ID": "not-a-secret-key-id",
             "ASC_ISSUER_ID": "not-a-secret-issuer-id",
@@ -437,10 +485,20 @@ def test_archive_extracts_apple_ordered_cn_and_o_and_redacts_xcodebuild_streams(
     assert sentinel_cn not in result.stderr
     assert sentinel_o not in result.stdout
     assert sentinel_o not in result.stderr
+    assert sentinel_nfc not in result.stdout
+    assert sentinel_nfc not in result.stderr
+    assert sentinel_nfd not in result.stdout
+    assert sentinel_nfd not in result.stderr
     assert "Signing Identity: [REDACTED]" in result.stdout
     assert "Signing Identity: [REDACTED]" in result.stderr
     assert "Subject O: [REDACTED]" in result.stdout
     assert "Subject O: [REDACTED]" in result.stderr
+    assert "Subject NFD CN: [REDACTED]" in result.stdout
+    assert "Subject NFD CN: [REDACTED]" in result.stderr
+    assert "Subject NFC O: [REDACTED]" in result.stdout
+    assert "Subject NFC O: [REDACTED]" in result.stderr
+    assert "Subject NFD O: [REDACTED]" in result.stdout
+    assert "Subject NFD O: [REDACTED]" in result.stderr
 
 
 def test_archive_redaction_preserves_a_failing_xcodebuild_status(tmp_path):
@@ -515,6 +573,7 @@ def test_export_redaction_masks_xcodebuild_signing_identity(tmp_path):
     script = _workflow_step_script("Export the signed .ipa")
     sentinel_cn = "Apple Distribution: José Ñúñez (TEAM-SENTINEL)"
     sentinel_o = "José Ñúñez"
+    sentinel_o_nfd = unicodedata.normalize("NFD", sentinel_o)
     cert_pem = tmp_path / "wattracker-ios-distribution-cert.pem"
     key_pem = tmp_path / "sentinel-key.pem"
     subprocess.run(
@@ -545,7 +604,8 @@ def test_export_redaction_masks_xcodebuild_signing_identity(tmp_path):
         "mkdir -p \"$RUNNER_TEMP/export\"\n"
         "touch \"$RUNNER_TEMP/export/Wattracker.ipa\"\n"
         "printf '%s\\n' \"Signing Identity: \\\"$IOS_CERT_CN\\\"\"\n"
-        "printf '%s\\n' \"Subject O: $IOS_CERT_LEGAL_NAME\" >&2\n",
+        "printf '%s\\n' \"Subject O: $IOS_CERT_LEGAL_NAME\" >&2\n"
+        "printf '%s\\n' \"Subject NFD O: $EXPECTED_NFD_O\" >&2\n",
         encoding="utf-8",
     )
     fake_xcodebuild.chmod(0o700)
@@ -560,6 +620,7 @@ def test_export_redaction_masks_xcodebuild_signing_identity(tmp_path):
             "APPLE_TEAM_ID": "TEAM-SENTINEL",
             "IOS_SIGNING_KEYCHAIN": str(tmp_path / "signing.keychain-db"),
             "IOS_SIGNING_KEYCHAIN_PASSWORD": "temporary-keychain-password",
+            "EXPECTED_NFD_O": sentinel_o_nfd,
             "ASC_KEY_PATH": str(tmp_path / "AuthKey.p8"),
             "ASC_KEY_ID": "not-a-secret-key-id",
             "ASC_ISSUER_ID": "not-a-secret-issuer-id",
@@ -581,8 +642,11 @@ def test_export_redaction_masks_xcodebuild_signing_identity(tmp_path):
     assert sentinel_cn not in result.stderr
     assert sentinel_o not in result.stdout
     assert sentinel_o not in result.stderr
+    assert sentinel_o_nfd not in result.stdout
+    assert sentinel_o_nfd not in result.stderr
     assert "Signing Identity: [REDACTED]" in result.stdout
     assert "Subject O: [REDACTED]" in result.stderr
+    assert "Subject NFD O: [REDACTED]" in result.stderr
 
 
 def test_workflow_diagnose_summary_has_exact_safe_boundary():
