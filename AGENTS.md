@@ -187,26 +187,26 @@ states on `main` when the PR is merge-committed. Four such commits are on
 `main` from #358 and #356 (`a04e344`, `95a6bb2`, `8d1a582`, `892b345`); if
 `git bisect` lands on one, `git bisect skip` it.
 
-1. **#420: move the iOS release job to a GitHub-hosted macOS runner.** The
-   laptop runner (a LaunchDaemon) can't codesign: `errSecInternalComponent`
-   after six attempts on #426. Read the 2026-09-30 owner-decision comment.
-   First confirm a hosted image has a new enough Xcode/iOS SDK, and stop if
-   not. Keep the pinned WWDR/root import, the name masking and the diagnose
-   redaction. Fold in or close #426. Dispatch only; never upload or push a tag.
-
-2. **#427: name the iOS app `wattracker` in Xcode** (scheme, `PRODUCT_NAME`,
+1. **#427: name the iOS app `wattracker` in Xcode** (scheme, `PRODUCT_NAME`,
    archive label), plus `ITSAppUsesNonExemptEncryption = NO` in both plists. The bundle ID, keychain service and UserDefaults names
-   must not change. It edits `ios-release.yml` too, so land it after #420 or
-   rebase.
+   must not change. Also read the 2026-10-02 comment on #427: fix the
+   release workflow's concurrency group, which can cancel a queued tag
+   release, and reword the `ios-testflight.md` keychain-fallback line. The
+   `ios-code-signing` environment now allows only `main` and `ios-v*` and
+   needs the owner's approval, so **a release dispatch from your branch is
+   refused**. Verify with `-showBuildSettings`, an unsigned archive and
+   `ios-tests`, and say the signed path was not run.
 
-3. **#429: iOS follow-ups.** Pull to refresh on Dashboard, Calendar and Volume
+2. **#429: iOS follow-ups.** Pull to refresh on Dashboard, Calendar and Volume
    (calling `retryNowIfWaking()`); #422's cold-start handling for activity
    detail and stream reads, keeping every gate rule; and publish standalone
    workouts' saved step texts if the desktop modal shows them. Independent of
-   #420 and #427; it touches the iOS screens and `CloudSession`, so rebase if
-   #427 lands first.
+   #427; it touches the iOS screens and `CloudSession`, so rebase if #427
+   lands first. Android parity applies (`docs/agent-workflow.md` §8): post
+   the pull-to-refresh and detail cold-start notes on #196–#198, and put an
+   `Android:` line in the PR body.
 
-4. **#249: rotating full-suite test flakes. Still not a local-runs job.**
+3. **#249: rotating full-suite test flakes. Still not a local-runs job.**
    Nothing has changed since the re-scope. 21 consecutive clean local full
    suites stand against zero reproductions. Both known instances came from
    **taksmon's machine**. **The next step is taksmon's log and his exact
@@ -217,7 +217,7 @@ states on `main` when the PR is merge-committed. Four such commits are on
 its PR number. Dropping it while it is in flight makes it invisible if the PR is
 closed or abandoned.
 
-**When item 1 is done, the queue is empty.** #249 stays skipped pending
+**When items 1 and 2 are done, the queue is empty.** #249 stays skipped pending
 taksmon's log and invocation. Do not pick up unlabelled issues or anything
 below on your own. Say the queue ran out rather than inventing scope.
 
