@@ -1,0 +1,200 @@
+{
+  "version": 1,
+  "generated_by": "scripts/generate_behaviour_vectors.py",
+  "source_of_truth": "This file. The rule exists only on the clients (#410/#411); the iOS reference is CloudSession.removalCompletesLocally, the tolerance is CloudSession.clockSkewTolerance.",
+  "description": "'Remove this device' sends a revoke. When the revoke FAILS, the client finishes removal locally (drops the credential) iff the status is 401 or 404 AND the response Date header is present, parses as an RFC 9110 IMF-fixdate, and is within clock_skew_tolerance_seconds of the device clock (inclusive). Everything else keeps the credential: other statuses (429, 503, any 5xx, 403, 400, 410), no response (status null), and a Date that is missing, empty, unparseable, in an obsolete format, or skewed. Evaluate each case with the device clock at now_epoch; date_header_raw is the header exactly as received (null when absent), and date_offset_seconds is what it encodes relative to now_epoch (null when it encodes nothing usable).",
+  "now_epoch": 1790870400,
+  "now_iso": "2026-10-01T16:00:00Z",
+  "clock_skew_tolerance_seconds": 240,
+  "server_timestamp_window_seconds": 300,
+  "complete_statuses": [
+    401,
+    404
+  ],
+  "cases": [
+    {
+      "name": "404-in-sync",
+      "why": "The server forgot the credential and the clocks agree.",
+      "status": 404,
+      "date_offset_seconds": 0,
+      "date_header_raw": "Thu, 01 Oct 2026 16:00:00 GMT",
+      "complete_locally": true
+    },
+    {
+      "name": "401-in-sync",
+      "why": "401 and 404 are indistinguishable by design.",
+      "status": 401,
+      "date_offset_seconds": 0,
+      "date_header_raw": "Thu, 01 Oct 2026 16:00:00 GMT",
+      "complete_locally": true
+    },
+    {
+      "name": "404-ahead-at-tolerance",
+      "why": "Exactly at +tolerance: inclusive.",
+      "status": 404,
+      "date_offset_seconds": 240,
+      "date_header_raw": "Thu, 01 Oct 2026 16:04:00 GMT",
+      "complete_locally": true
+    },
+    {
+      "name": "404-behind-at-tolerance",
+      "why": "Exactly at -tolerance: inclusive.",
+      "status": 404,
+      "date_offset_seconds": -240,
+      "date_header_raw": "Thu, 01 Oct 2026 15:56:00 GMT",
+      "complete_locally": true
+    },
+    {
+      "name": "404-ahead-past-tolerance",
+      "why": "One second past: the device clock may be the reason.",
+      "status": 404,
+      "date_offset_seconds": 241,
+      "date_header_raw": "Thu, 01 Oct 2026 16:04:01 GMT",
+      "complete_locally": false
+    },
+    {
+      "name": "404-behind-past-tolerance",
+      "why": "One second past, the other way.",
+      "status": 404,
+      "date_offset_seconds": -241,
+      "date_header_raw": "Thu, 01 Oct 2026 15:55:59 GMT",
+      "complete_locally": false
+    },
+    {
+      "name": "401-ahead-at-tolerance",
+      "why": "The boundary holds for 401 too.",
+      "status": 401,
+      "date_offset_seconds": 240,
+      "date_header_raw": "Thu, 01 Oct 2026 16:04:00 GMT",
+      "complete_locally": true
+    },
+    {
+      "name": "401-behind-past-tolerance",
+      "why": "And so does the refusal past it.",
+      "status": 401,
+      "date_offset_seconds": -241,
+      "date_header_raw": "Thu, 01 Oct 2026 15:55:59 GMT",
+      "complete_locally": false
+    },
+    {
+      "name": "404-badly-skewed",
+      "why": "An hour off: every signed request would be refused anyway.",
+      "status": 404,
+      "date_offset_seconds": 3600,
+      "date_header_raw": "Thu, 01 Oct 2026 17:00:00 GMT",
+      "complete_locally": false
+    },
+    {
+      "name": "404-no-date",
+      "why": "No Date header: skew cannot be ruled out, so keep.",
+      "status": 404,
+      "date_offset_seconds": null,
+      "date_header_raw": null,
+      "complete_locally": false
+    },
+    {
+      "name": "401-no-date",
+      "why": "Same for 401.",
+      "status": 401,
+      "date_offset_seconds": null,
+      "date_header_raw": null,
+      "complete_locally": false
+    },
+    {
+      "name": "404-empty-date",
+      "why": "An empty header is an absent one.",
+      "status": 404,
+      "date_offset_seconds": null,
+      "date_header_raw": "",
+      "complete_locally": false
+    },
+    {
+      "name": "404-garbage-date",
+      "why": "Unparseable is absent.",
+      "status": 404,
+      "date_offset_seconds": null,
+      "date_header_raw": "not a date",
+      "complete_locally": false
+    },
+    {
+      "name": "404-rfc850-date",
+      "why": "The obsolete RFC 850 form is not parsed, so it counts as absent.",
+      "status": 404,
+      "date_offset_seconds": null,
+      "date_header_raw": "Thursday, 01-Oct-26 16:00:00 GMT",
+      "complete_locally": false
+    },
+    {
+      "name": "404-asctime-date",
+      "why": "Nor is asctime.",
+      "status": 404,
+      "date_offset_seconds": null,
+      "date_header_raw": "Thu Oct  1 16:00:00 2026",
+      "complete_locally": false
+    },
+    {
+      "name": "429-in-sync",
+      "why": "Rate limited: transient, keep the credential.",
+      "status": 429,
+      "date_offset_seconds": 0,
+      "date_header_raw": "Thu, 01 Oct 2026 16:00:00 GMT",
+      "complete_locally": false
+    },
+    {
+      "name": "503-in-sync",
+      "why": "Unavailable: transient.",
+      "status": 503,
+      "date_offset_seconds": 0,
+      "date_header_raw": "Thu, 01 Oct 2026 16:00:00 GMT",
+      "complete_locally": false
+    },
+    {
+      "name": "500-in-sync",
+      "why": "Server error: unexplained.",
+      "status": 500,
+      "date_offset_seconds": 0,
+      "date_header_raw": "Thu, 01 Oct 2026 16:00:00 GMT",
+      "complete_locally": false
+    },
+    {
+      "name": "502-in-sync",
+      "why": "Bad gateway: transient.",
+      "status": 502,
+      "date_offset_seconds": 0,
+      "date_header_raw": "Thu, 01 Oct 2026 16:00:00 GMT",
+      "complete_locally": false
+    },
+    {
+      "name": "403-in-sync",
+      "why": "Only 401 and 404 mean 'no such credential'.",
+      "status": 403,
+      "date_offset_seconds": 0,
+      "date_header_raw": "Thu, 01 Oct 2026 16:00:00 GMT",
+      "complete_locally": false
+    },
+    {
+      "name": "400-in-sync",
+      "why": "Malformed request: our bug, not the server forgetting us.",
+      "status": 400,
+      "date_offset_seconds": 0,
+      "date_header_raw": "Thu, 01 Oct 2026 16:00:00 GMT",
+      "complete_locally": false
+    },
+    {
+      "name": "410-in-sync",
+      "why": "Not one of the two statuses, however suggestive.",
+      "status": 410,
+      "date_offset_seconds": 0,
+      "date_header_raw": "Thu, 01 Oct 2026 16:00:00 GMT",
+      "complete_locally": false
+    },
+    {
+      "name": "offline",
+      "why": "No response at all: keep the credential.",
+      "status": null,
+      "date_offset_seconds": null,
+      "date_header_raw": null,
+      "complete_locally": false
+    }
+  ]
+}
