@@ -81,9 +81,9 @@ that would consume the vector does not exist on `main` yet.
 | `canonical_request_v1.json` | Canonical request bytes and ECDSA signatures | `tests/test_canonical_request_vectors.py` (`scripts/generate_canonical_vectors.py`) | `CanonicalRequestVectorTests.swift` | `CanonicalRequestVectorTest.kt`, `EcdsaTest.kt` |
 | `cloud_objects_v1.json` | The published object kinds and their shapes | `tests/test_cloud_api.py` | `CloudModelsTests.swift` | `CloudObjectsTest.kt` (real zone strings arrive with PR #419) |
 | `calendar_day_profile.json` | `calendar_day` workout `profile` from the real publisher; drift-tested | `tests/test_cloud_snapshot_derived.py` | `CloudModelsTests.swift` | Pending: consumed by PR #419 |
-| `calendar_grid_v1.json` | Monday–Sunday month grid | `scripts/generate_behaviour_vectors.py` | Incoming | Pending (no Calendar screen) |
-| `pairing_code_v1.json` | Pairing code normalization | `scripts/generate_behaviour_vectors.py` | Incoming | Incoming |
-| `removal_decision_v1.json` | Remove-device decision on 401/404 and `Date` skew | `scripts/generate_behaviour_vectors.py` | Incoming | Pending: the rule lands with PR #419 |
+| `calendar_grid_v1.json` | Monday–Sunday month grid; agrees with the desktop's `/api/calendar` | `tests/test_behaviour_vectors.py` (`scripts/generate_behaviour_vectors.py`) | `BehaviourVectorTests.swift` | Pending: #198 must read it |
+| `pairing_code_v1.json` | Pairing code normalization; `client_may_accept` cases allow a client to also strip `\r`/`\n` | `tests/test_behaviour_vectors.py` (`scripts/generate_behaviour_vectors.py`) | `BehaviourVectorTests.swift` | `PairingCodeVectorTest.kt` |
+| `removal_decision_v1.json` | Remove-device decision on 401/404 and `Date` skew (240 s, inside the server's 300 s) | `tests/test_behaviour_vectors.py` (`scripts/generate_behaviour_vectors.py`) | `BehaviourVectorTests.swift` (`CloudSession.removalCompletesLocally`) | Pending: the rule lands with PR #419 |
 
 The last three are being added on a separate branch; fill in the exact test
 names here when it merges.
