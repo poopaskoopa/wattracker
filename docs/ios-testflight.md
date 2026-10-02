@@ -2,9 +2,8 @@
 
 The pipeline is `.github/workflows/ios-release.yml`. Pushing a tag that starts
 with `ios-v` archives, signs, exports and uploads a build to TestFlight. A
-manual `workflow_dispatch` runs the same archive/export path without uploading;
-use that safe test after the workflow change has merged, before choosing to
-push a release tag.
+manual `workflow_dispatch` from `main` runs the same archive/export path
+without uploading; manual verification is main-only.
 
 ```sh
 git tag ios-v0.1.0
@@ -13,7 +12,10 @@ git push origin ios-v0.1.0
 
 `ios-v`, not `v`: `macos-release.yml` and `windows-release.yml` both fire on
 `v*`, and a shared prefix would mean every desktop release tag also started an
-iOS archive on the one physical macOS runner.
+iOS archive. The release job runs on GitHub's hosted `macos-26` image, with
+Xcode 26.6 and the iOS 26.5 SDK selected explicitly. That is the toolchain
+Apple requires for App Store uploads after April 28, 2026. The `ios-tests` job
+remains on its existing trusted simulator runner.
 
 ## The one-time manual setup, in order
 
@@ -80,8 +82,14 @@ is App Store Connect; they are different websites for the same account.
    certificate + the Apple WWDR intermediate into a `.p12` under a random
    256-bit passphrase. The release-secrets helper then re-exports the selected
    identity for CI, and that secret may contain only the key and leaf. The
-   release job installs the pinned public WWDR G3 intermediate from
-   `.github/certs/AppleWWDRCAG3.cer` before validating the chain.
+   release job installs the pinned public Apple Root CA from
+   `.github/certs/AppleIncRootCertificate.cer` and WWDR G3 from
+   `.github/certs/AppleWWDRCAG3.cer` before validating the chain. Their SHA-256
+   pins are checked before either certificate is imported:
+   `b0b1730ecbc7ff4505142c49f1295e6eda6bcaed7e2c68c5be91b5a11001f024`
+   for Apple Root CA and
+   `dcf21878c77f4198e4b4614f03d696d89c66c66008d4244e1b99161aac91601f`
+   for WWDR G3. Neither is fetched at runtime.
    `--create-profile` then creates the `WatTracker App
    Store` provisioning profile against that certificate and the bundle
    identifier — the profile the release job signs with by name.
@@ -119,8 +127,8 @@ is App Store Connect; they are different websites for the same account.
 
    The first non-dry run exports every identity from the login keychain, not
    only Apple Distribution identities. macOS may ask for authorization once
-   per private key, so keep the login session available and expect those
-   prompts before the temporary keychain is created. The helper then removes
+   per private key, so expect one prompt per key before the temporary keychain
+   is created. The helper then removes
    every imported identity except the one selected above, including expired or
    otherwise invalid identities, and refuses to export unless exactly one
    identity and one private key remain.
@@ -150,6 +158,13 @@ is App Store Connect; they are different websites for the same account.
    The workflow accepts only a bare DNS hostname over HTTPS. It rejects an
    empty value, whitespace, a URL/path, malformed DNS, and the placeholder
    `api.wattracker.com` before archiving.
+
+   Before any certificate subject or keychain password reaches the Actions
+   command channel, the workflow masks it. Percent signs, carriage returns,
+   and line feeds are escaped as `%25`, `%0D`, and `%0A`, respectively,
+   because those characters have command-channel meaning. The archive and
+   export streams also replace the complete `Signing Identity:` line and
+   the certificate's CN/O values, including non-ASCII names.
 
    **The certificate expires one year after issue** and nothing renews it. The
    certificate script prints the exact date; put it in a calendar. See "Rotating the
@@ -188,17 +203,15 @@ and every later release:
 2. In App Store Connect, confirm the `WatTracker` app record has bundle ID
    `com.wattracker.ios`, and add the intended internal testers. Internal
    testers need App Store Connect access and do not need beta review.
-3. In Actions, dispatch **iOS TestFlight release** once with the default
-   `diagnose_signing` setting. This archives and exports but does not upload;
-   inspect the first failing step and its diagnostic if it fails. Do not push an
-   `ios-v*` tag for this test.
-4. Keep the owner's laptop awake while the self-hosted runner performs the
-   archive, export, and (for a tag) upload.
-5. When the test-mode run is satisfactory, create and push the release tag,
+3. From the `main` branch, dispatch **iOS TestFlight release** once with the
+   default `diagnose_signing` setting. This hosted-runner test archives and
+   exports but does not upload; inspect the first failing step and its
+   diagnostic if it fails. Manual verification is main-only.
+4. When the test-mode run is satisfactory, create and push the release tag,
    for example `git tag ios-v0.1.0 && git push origin ios-v0.1.0`.
-6. Wait roughly 10–30 minutes for Apple's processing. Then install the build
+5. Wait roughly 10–30 minutes for Apple's processing. Then install the build
    through the TestFlight app and verify the app reaches the production cloud.
-7. To invite riders who are not on the App Store Connect team, create an
+6. To invite riders who are not on the App Store Connect team, create an
    external testing group and submit the first build for Apple's one-time Beta
    App Review. Do not treat internal tester availability as evidence that
    external testing is approved.
@@ -361,8 +374,11 @@ Two practical notes:
 3. Validates the secret-backed production API hostname. This happens before
    the archive and rejects an empty value, whitespace, a URL/path, malformed
    DNS, or the placeholder `api.wattracker.com` without printing the host.
-4. Runs the Swift test suite on the iPhone 17 Pro simulator. A failing test
-   costs nothing but time at this point.
+4. Runs the Swift test suite on an available iOS Simulator. If the selected
+   image has an installed runtime and device type but no device, the workflow
+   creates one. A manual dispatch with no simulator performs an unsigned
+   iOS-device SDK compile; a release event fails rather than using that
+   fallback. The trusted `ios-tests` job remains the test gate.
 5. Writes the `.p8` to `$RUNNER_TEMP` under `umask 077`, verifies it parses as
    a private key, and templates `teamID` into a temporary copy of
    `ExportOptions.plist`.
@@ -374,13 +390,15 @@ Two practical notes:
    actually landed. It reports missing/empty secrets, invalid base64, a p12
    that cannot be opened with its password, a non-Apple-Distribution identity,
    an expired certificate, and a team mismatch without printing key material.
-   A dedicated keychain, not the runner user's login keychain, because this
-   runner is a physical machine that persists between jobs.
+   The job keychain contains the checked-in, SHA-256-pinned Apple Root CA and
+   WWDR G3 chain. The release job runs on a disposable GitHub-hosted VM rather
+   than the owner's laptop, but cleanup remains unconditional.
 7. `xcodebuild archive` for `generic/platform=iOS`, with **manual** signing:
    `CODE_SIGN_IDENTITY="Apple Distribution"`,
    `PROVISIONING_PROFILE_SPECIFIER="WatTracker App Store"`, and
    `OTHER_CODE_SIGN_FLAGS="--keychain …"` pinning `codesign` to the job's own
-   keychain. `-allowProvisioningUpdates` and the three `-authenticationKey*`
+   keychain. Because the complete leaf/WWDR/root chain is imported there,
+   chain building does not fall back to another keychain. `-allowProvisioningUpdates` and the three `-authenticationKey*`
    flags are still there, now doing the one job they can do: registering the
    App ID and downloading that profile from the portal, so it is neither
    installed on the runner nor carried as a secret.
@@ -411,10 +429,10 @@ Two practical notes:
 10. An `if: always()` step restores the keychain search list, deletes the
    signing keychain, and removes the API key, the templated plist, the archive,
    the export and both DerivedData trees — and fails the job if either the
-   keychain or the key directory survives. The runner is a physical machine
-   that is not discarded between jobs, which is the whole reason that step
-   exists: a distribution private key left in a keychain there is usable by
-   every later job on the box.
+   keychain or the key directory survives. The VM is discarded after the job,
+   but this cleanup is still required for deterministic failure handling and
+   protects any workspace or diagnostic state retained while the job is
+   running.
 
 **No `.ipa` is uploaded as a build artifact, on purpose.** A
 distribution-signed `.ipa` embeds `embedded.mobileprovision`, whose

@@ -4,12 +4,10 @@ name: iOS TestFlight release
 # macos-release.yml and windows-release.yml both use. The desktop app and the
 # iOS app version independently, and a shared `v*` prefix would mean every
 # desktop release tag also fired an iOS archive (and vice versa) - three
-# release workflows racing for one physical runner over a tag that concerned
-# one of them.
+# release workflows racing over a tag that concerned one of them.
 #
 # FORK SAFETY. This repository is public and the job below both reads
-# code-signing secrets and runs on a self-hosted runner that is a physical
-# machine, not a discarded VM. Neither may ever be reachable from a fork.
+# code-signing secrets. Neither may ever be reachable from a fork.
 #
 # A `push` trigger restricted to tags is inherently safe from that, and it is
 # worth saying why rather than leaving it as folklore: a fork's tags live in
@@ -43,17 +41,10 @@ on:
 permissions:
   contents: read
 
-# One physical macOS runner backs this, and it is the same machine that runs
-# the Cloud workflow's test job. A second release archive running beside the
-# first would contend for every core, two exports would fight over the
-# provisioning profiles that -allowProvisioningUpdates installs into the
-# runner user's shared profile directory, and both would be rewriting the
-# user keychain search list under each other. Serialize, and do not cancel in
-# progress: the cleanup step is an `if: always()` step, and cancelling a job
-# can kill it before that step runs, which would leave TWO private keys on a
-# machine that is not discarded - the App Store Connect key in $RUNNER_TEMP
-# and the distribution key in the job's keychain - plus a search list pointing
-# at a keychain nothing owns.
+# Serialize release attempts so two archives cannot race over App Store
+# Connect's provisioning profile updates. The hosted VM is disposable, but
+# cleanup still runs unconditionally so a cancelled step does not leave
+# signing material in its workspace.
 concurrency:
   group: ios-release
 
@@ -63,43 +54,38 @@ jobs:
     # its own credentials" case, not the fork-PR case, which the trigger
     # already excludes.
     if: github.repository == 'poopaskoopa/wattracker'
-    runs-on: [self-hosted, macOS]
-    # WHY THIS IS STILL SELF-HOSTED, AND WHY THAT IS NOW A CHOICE.
-    #
-    # The comment that used to sit here said hosted runners were blocked at
-    # the account level and that this was the only machine able to build for
-    # Apple platforms at all. Both were true of a PRIVATE repository and
-    # neither is true now: this repo is public, hosted runners are unmetered,
-    # macos-release.yml was re-enabled on `macos-latest` on 2026-09-13, and
-    # cloud.yml and android.yml run hosted jobs on every PR.
-    #
-    # Moving this job to `macos-latest` is the better end state, for two
-    # reasons that have nothing to do with cost:
-    #   - This runner is a laptop that sleeps. Jobs die at exactly 10m00s with
-    #     no failed step and have to be re-run; a hosted VM does not sleep.
-    #   - Signing secrets belong on an ephemeral machine. See the KNOWN
-    #     RESIDUAL note further down, which says outright that the `security
-    #     import -P` exposure "is worse here than on the ephemeral macOS VM
-    #     that workflow describes, because this runner is not discarded". That
-    #     residual is a consequence of this `runs-on`, not a fact of life.
-    #
-    # It is NOT flipped in this commit because one thing has to be checked on
-    # hardware first: the steps below pin Xcode 26.6's SDK and the matching
-    # iOS 26.5 simulator runtime, and the hosted image's Xcode is whatever
-    # GitHub ships. Verify the image has them (or pin with `xcode-select`)
-    # before changing this line - a release workflow that only fires on a tag
-    # is the worst place to discover a toolchain mismatch.
+    # GitHub's hosted macOS 26 arm64 image currently ships Xcode 26.6 and the
+    # iOS 26.5 SDK. Select it explicitly so an image-default change cannot
+    # silently fall below Apple's App Store Connect upload requirement.
+    runs-on: macos-26
     environment: ios-code-signing
     timeout-minutes: 60
 
     steps:
       - name: Check out the tagged source
-        uses: actions/checkout@v4
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
           # The repository convention, and it matters more here than usual: a
           # persisted credential would sit in .git/config on a runner that is
           # not torn down between jobs.
           persist-credentials: false
+
+      - name: Select the App Store upload toolchain
+        run: |
+          set -euo pipefail
+          xcode_path=/Applications/Xcode_26.6.app
+          if [ ! -d "$xcode_path" ]; then
+            echo "The hosted macOS image does not provide Xcode 26.6." >&2
+            exit 1
+          fi
+          sudo xcode-select --switch "$xcode_path"
+          xcodebuild -version
+          sdk_version="$(xcrun --sdk iphoneos --show-sdk-version)"
+          if [ "${sdk_version%%.*}" -lt 26 ]; then
+            echo "The selected Xcode does not provide an iOS 26 SDK." >&2
+            exit 1
+          fi
+          echo "Using Xcode 26.6 with iOS SDK $sdk_version."
 
       # Nothing secret in this step, deliberately, so it can fail loudly and
       # early on a malformed tag before any credential is written to disk.
@@ -186,18 +172,47 @@ jobs:
           echo "The iOS API host is valid."
 
       # Before anything is signed, because a failing test should cost nothing
-      # but time. The iOS 26.5 simulator runtime matching Xcode 26.6's SDK is
-      # installed on this runner, so a destination-based build resolves here;
-      # ios/README.md describes the by-SDK fallback for a machine where it does
-      # not.
+      # but time. Prefer a real simulator when the hosted image supplies one.
+      # If the image has an installed runtime and device type but no bootable
+      # device, create one. A release event must never silently substitute an
+      # unsigned compile; manual dispatch retains the diagnostic fallback.
       - name: Run the Swift test suite
         run: |
           set -euo pipefail
-          xcodebuild test \
-            -project ios/WatTracker/WatTracker.xcodeproj \
-            -scheme WatTracker \
-            -destination 'platform=iOS Simulator,name=iPhone 17 Pro' \
-            -derivedDataPath "$RUNNER_TEMP/ios-test-dd"
+          simulator_udid="$(xcrun simctl list devices available \
+            | awk -F '[()]' '/iPhone/ {print $2; exit}')"
+          if [ -z "$simulator_udid" ]; then
+            simulator_runtime="$(xcrun simctl list runtimes \
+              | awk -F '[()]' '/iOS .*available/ {print $2; exit}' || true)"
+            simulator_device_type="$(xcrun simctl list devicetypes \
+              | awk -F '[()]' '/iPhone/ {print $2; exit}' || true)"
+            if [ -n "$simulator_runtime" ] && [ -n "$simulator_device_type" ]; then
+              simulator_udid="$(xcrun simctl create \
+                "WatTracker Release Test ${GITHUB_RUN_ID:-manual}" \
+                "$simulator_device_type" "$simulator_runtime" || true)"
+            fi
+          fi
+          if [ -n "$simulator_udid" ]; then
+            echo "Running Swift tests on simulator $simulator_udid."
+            xcodebuild test \
+              -project ios/WatTracker/WatTracker.xcodeproj \
+              -scheme WatTracker \
+              -destination "id=$simulator_udid" \
+              -derivedDataPath "$RUNNER_TEMP/ios-test-dd"
+          else
+            event_name="${GITHUB_EVENT_NAME:-}"
+            if [ "$event_name" != "workflow_dispatch" ]; then
+              echo "No iOS Simulator is available for this release event." >&2
+              exit 1
+            fi
+            echo "::warning::This hosted macOS VM has no available iOS Simulator; CI ios-tests remains the test gate, so this manual run will compile the device target before signing."
+            xcodebuild build \
+              -project ios/WatTracker/WatTracker.xcodeproj \
+              -scheme WatTracker \
+              -sdk iphoneos \
+              -derivedDataPath "$RUNNER_TEMP/ios-test-dd" \
+              CODE_SIGNING_ALLOWED=NO
+          fi
 
       # The App Store Connect API key, written to a file because that is the
       # only way any of the three tools that need it will take it - xcodebuild
@@ -277,21 +292,17 @@ jobs:
       # rotation procedure; it expires a year after issue and nothing here
       # renews it.
       #
-      # A dedicated keychain, not the runner user's login keychain. This
-      # runner is a physical machine that persists between jobs, so an
-      # identity added to a permanent keychain would stay there, usable by
-      # every later job on the box. The keychain below exists for one job and
-      # is deleted by the if: always() step at the bottom.
+      # A dedicated keychain, not the runner user's login keychain. The hosted
+      # VM is disposable, but keeping the private identity in a job-scoped
+      # keychain makes the signing identity explicit and leaves no credential
+      # in a shared keychain if cleanup ever has to diagnose a failure.
       #
       # KNOWN RESIDUAL, the same one macos-release.yml documents: `security
       # import` takes the p12 passphrase only via -P, its sole alternative
       # being an interactive GUI prompt that a headless runner cannot answer,
       # so that one argv is unavoidable and any process on the runner could
-      # read it for the length of the call. It is worse here than on the
-      # ephemeral macOS VM that workflow describes, because this runner is not
-      # discarded: the mitigation is that the p12 it unlocks is deleted in the
-      # same step and the keychain it unlocks into is deleted at the end of
-      # the job. Closing it properly means hosted signing or a hardware token.
+      # read it for the length of the call. The hosted VM is discarded after
+      # the job; the p12 is still deleted as soon as the import succeeds.
       #
       # No `set -x`, here or anywhere below: the passphrase, the keychain
       # password and the decoded p12 all pass through this shell.
@@ -315,11 +326,45 @@ jobs:
           keychain_password="$(/usr/bin/openssl rand -hex 32)"
           p12="$RUNNER_TEMP/wattracker-ios-signing.p12"
           cert_pem="$RUNNER_TEMP/wattracker-ios-distribution-cert.pem"
+          root_cert="$GITHUB_WORKSPACE/.github/certs/AppleIncRootCertificate.cer"
+          root_expected_sha256="b0b1730ecbc7ff4505142c49f1295e6eda6bcaed7e2c68c5be91b5a11001f024"
           wwdr_cert="$GITHUB_WORKSPACE/.github/certs/AppleWWDRCAG3.cer"
           wwdr_expected_sha256="dcf21878c77f4198e4b4614f03d696d89c66c66008d4244e1b99161aac91601f"
           # Record this before creating or importing anything: the final
           # always-run step must know the path even when a later command fails.
           echo "IOS_SIGNING_KEYCHAIN=$keychain" >> "$GITHUB_ENV"
+          mask_secret() {
+            local value="$1"
+            value="${value//%/%25}"
+            value="${value//$'\r'/%0D}"
+            value="${value//$'\n'/%0A}"
+            printf '::add-mask::%s\n' "$value"
+          }
+          unicode_form() {
+            local form="$1"
+            local value="$2"
+            /usr/bin/perl -MEncode=decode,encode -MUnicode::Normalize -e '
+              my ($form, $value) = @ARGV;
+              $value = decode("UTF-8", $value, 1);
+              my $normalized = $form eq "NFC" ? NFC($value) : NFD($value);
+              print encode("UTF-8", $normalized);
+            ' "$form" "$value"
+          }
+          mask_unicode_forms() {
+            local value="$1"
+            local nfc
+            local nfd
+            [ -n "$value" ] || return 0
+            mask_secret "$value"
+            nfc="$(unicode_form NFC "$value")"
+            nfd="$(unicode_form NFD "$value")"
+            mask_secret "$nfc"
+            mask_secret "$nfd"
+          }
+          # The password is passed to the export step through GITHUB_ENV; mask
+          # it before the runner can persist that value for another step.
+          mask_secret "$keychain_password"
+          echo "IOS_SIGNING_KEYCHAIN_PASSWORD=$keychain_password" >> "$GITHUB_ENV"
           # umask before the redirection, not chmod after: the p12 must never
           # exist world-readable, not even for the instant between the two.
           if ! (umask 077; printf '%s' "$IOS_DIST_P12_B64" | base64 --decode > "$p12"); then
@@ -349,15 +394,24 @@ jobs:
             echo "The distribution certificate subject is missing a required RDN." >&2
             exit 1
           fi
-          printf '::add-mask::%s\n' "$leaf_cn"
-          printf '::add-mask::%s\n' "$leaf_legal_name"
-          printf '::add-mask::%s\n' "$cert_team"
+          mask_unicode_forms "$leaf_cn"
+          mask_unicode_forms "$leaf_legal_name"
+          mask_secret "$cert_team"
           if ! /usr/bin/openssl x509 -in "$cert_pem" -checkend 0 -noout >/dev/null 2>&1; then
             echo "The distribution certificate is expired." >&2
             exit 1
           fi
           if [ -z "$cert_team" ] || [ "$cert_team" != "$APPLE_TEAM_ID" ]; then
             echo "The distribution certificate team does not match APPLE_TEAM_ID." >&2
+            exit 1
+          fi
+          if [ ! -f "$root_cert" ]; then
+            echo "The checked-in Apple Root CA certificate is missing." >&2
+            exit 1
+          fi
+          root_actual_sha256="$(shasum -a 256 "$root_cert" | awk '{print tolower($1)}')"
+          if [ "$root_actual_sha256" != "$root_expected_sha256" ]; then
+            echo "The checked-in Apple Root CA certificate failed fingerprint verification." >&2
             exit 1
           fi
           if [ ! -f "$wwdr_cert" ]; then
@@ -374,14 +428,27 @@ jobs:
           wwdr_legal_name="$(/usr/bin/openssl x509 -inform der -in "$wwdr_cert" -noout -subject \
             -nameopt sep_multiline,utf8 | sed -n 's/^ *O=//p')"
           if [ -n "$wwdr_cn" ]; then
-            printf '::add-mask::%s\n' "$wwdr_cn"
+            mask_unicode_forms "$wwdr_cn"
           fi
           if [ -n "$wwdr_legal_name" ]; then
-            printf '::add-mask::%s\n' "$wwdr_legal_name"
+            mask_unicode_forms "$wwdr_legal_name"
           fi
           security create-keychain -p "$keychain_password" "$keychain"
           security set-keychain-settings -lut 3600 "$keychain"
           security unlock-keychain -p "$keychain_password" "$keychain"
+          if ! security verify-cert -p codeSign \
+              -c "$cert_pem" -c "$wwdr_cert" -r "$root_cert" \
+              >/dev/null 2>&1; then
+            echo "The distribution certificate chain did not match the pinned Apple chain." >&2
+            exit 1
+          fi
+          security list-keychains -d user -s "$keychain"
+          if ! security import "$root_cert" -t cert -f x509 -k "$keychain" \
+              -T /usr/bin/codesign \
+              >/dev/null 2>&1; then
+            echo "The checked-in Apple Root CA certificate could not be imported." >&2
+            exit 1
+          fi
           if ! security import "$wwdr_cert" -k "$keychain" -T /usr/bin/codesign \
               >/dev/null 2>&1; then
             echo "The checked-in Apple WWDR G3 certificate could not be imported." >&2
@@ -395,9 +462,8 @@ jobs:
             -T /usr/bin/codesign -x
           # Without this, codesign blocks on a GUI prompt the runner cannot
           # answer - and blocks until the job's timeout, with no error.
-          security set-key-partition-list -S apple-tool:,apple: \
+          security set-key-partition-list -S apple-tool:,apple:,codesign: -s \
             -k "$keychain_password" "$keychain" > /dev/null
-          security list-keychains -d user -s "$keychain" login.keychain-db
           rm -f "$p12"
           # Assert the identity is actually there before spending ten minutes
           # on an archive that would fail at the codesign step. `grep -c`
@@ -424,9 +490,18 @@ jobs:
               | sed 's/^notAfter=//')"
             wwdr_expiry="$(/usr/bin/openssl x509 -inform der -in "$wwdr_cert" \
               -noout -enddate | sed 's/^notAfter=//')"
+            root_cert_count="$(security find-certificate -a -p -c 'Apple Root CA' \
+              "$keychain" 2>/dev/null \
+              | grep -c '^-----BEGIN CERTIFICATE-----' || true)"
+            wwdr_cert_count="$(security find-certificate -a -p -c \
+              'Apple Worldwide Developer Relations Certification Authority' \
+              "$keychain" 2>/dev/null \
+              | grep -c '^-----BEGIN CERTIFICATE-----' || true)"
             printf 'Diagnostic valid identity count: %s\n' "$valid_identity_count"
             printf 'Diagnostic all identity count: %s\n' "$all_identity_count"
             printf 'Diagnostic CSSMERR status count: %s\n' "$status_count"
+            printf 'Diagnostic job Apple Root CA certificate count: %s\n' "$root_cert_count"
+            printf 'Diagnostic job Apple WWDR G3 certificate count: %s\n' "$wwdr_cert_count"
             if [ -n "$status_codes" ]; then
               printf '%s\n' "$status_codes" | while IFS= read -r status; do
                 printf 'Diagnostic CSSMERR status: %s\n' "$status"
@@ -437,11 +512,23 @@ jobs:
             printf 'Diagnostic certificate type: Apple WWDR G3 intermediate\n'
             printf 'Diagnostic certificate expiry: %s\n' "$wwdr_expiry"
           fi
-          identities="$(security find-identity -v -p codesigning "$keychain" | grep -c 'Apple Distribution' || true)"
-          if [ "${identities:-0}" -lt 1 ]; then
-            echo "The distribution certificate p12 contains no Apple Distribution identity." >&2
+          identities="$(security find-identity -v -p codesigning "$keychain" 2>&1 || true)"
+          identity_count="$(printf '%s\n' "$identities" \
+            | grep -Ec '^[[:space:]]+[0-9]+\)' || true)"
+          distribution_count="$(printf '%s\n' "$identities" \
+            | grep -c 'Apple Distribution' || true)"
+          if [ "${identity_count:-0}" -ne 1 ] || [ "${distribution_count:-0}" -ne 1 ]; then
+            echo "The signing keychain does not contain exactly one Apple Distribution identity." >&2
             exit 1
           fi
+          identity_hash="$(printf '%s\n' "$identities" \
+            | sed -n 's/^[[:space:]]*[0-9]*) \([0-9A-Fa-f]\{40\}\) .*/\1/p' \
+            | head -n 1)"
+          if [ -z "$identity_hash" ]; then
+            echo "The Apple Distribution identity fingerprint could not be read safely." >&2
+            exit 1
+          fi
+          echo "IOS_SIGNING_IDENTITY_HASH=$identity_hash" >> "$GITHUB_ENV"
           echo "Imported the distribution identity into a job-scoped keychain."
 
       # The archive. Four groups of arguments are doing distinct work:
@@ -471,11 +558,10 @@ jobs:
       #    on the runner nor carried as a secret. It has to already exist in
       #    the account - docs/ios-testflight.md has the one-time creation.
       #
-      #    OTHER_CODE_SIGN_FLAGS pins codesign to the job's own keychain. It is
-      #    first in the search list anyway, but this runner is a physical
-      #    machine whose other keychains are outside this job's control, and an
-      #    archive that silently signed with some other identity that happened
-      #    to be on the box is exactly the failure that is hardest to notice.
+      #    OTHER_CODE_SIGN_FLAGS pins identity selection to the job keychain.
+      #    The complete leaf/WWDR/root chain is imported into that same
+      #    keychain, so this restriction cannot reproduce the previous
+      #    missing-root failure.
       #
       # 3. -allowProvisioningUpdates plus the three -authenticationKey* flags.
       #    Together these let xcodebuild talk to the developer portal as the
@@ -503,8 +589,13 @@ jobs:
           APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
           WATTRACKER_API_SCHEME: https
           WATTRACKER_API_HOST: ${{ secrets.WATTRACKER_IOS_API_HOST }}
+          DIAGNOSE_SIGNING: ${{ inputs.diagnose_signing }}
         run: |
           set -euo pipefail
+          security list-keychains -d user -s "$IOS_SIGNING_KEYCHAIN"
+          security unlock-keychain -p "$IOS_SIGNING_KEYCHAIN_PASSWORD" "$IOS_SIGNING_KEYCHAIN"
+          security set-key-partition-list -S apple-tool:,apple:,codesign: -s \
+            -k "$IOS_SIGNING_KEYCHAIN_PASSWORD" "$IOS_SIGNING_KEYCHAIN" > /dev/null
           export IOS_CERT_CN="$(/usr/bin/openssl x509 \
             -in "$RUNNER_TEMP/wattracker-ios-distribution-cert.pem" -noout -subject \
             -nameopt sep_multiline,utf8 | sed -n 's/^ *CN=//p')"
@@ -528,8 +619,20 @@ jobs:
           use IPC::Open3;
           use Symbol qw(gensym);
 
-          my @redactions = grep { defined($_) && length($_) }
-              @ENV{qw(IOS_CERT_CN IOS_CERT_LEGAL_NAME APPLE_TEAM_ID)};
+          use Encode qw(decode encode);
+          use Unicode::Normalize qw(NFC NFD);
+
+          my @redactions;
+          for my $raw_value (grep { defined($_) && length($_) }
+              @ENV{qw(IOS_CERT_CN IOS_CERT_LEGAL_NAME APPLE_TEAM_ID)}) {
+              my $value = "$raw_value";
+              push @redactions, $value;
+              my $unicode = eval { decode('UTF-8', $value, Encode::FB_CROAK) };
+              if (defined $unicode) {
+                  push @redactions, encode('UTF-8', NFC($unicode));
+                  push @redactions, encode('UTF-8', NFD($unicode));
+              }
+          }
 
           sub redact {
               my ($line) = @_;
@@ -578,6 +681,22 @@ jobs:
           PERL
           }
 
+          if [ "${DIAGNOSE_SIGNING:-false}" = "true" ]; then
+            probe_path="$RUNNER_TEMP/wattracker-codesign-probe"
+            probe_error="$RUNNER_TEMP/wattracker-codesign-probe.err"
+            cp /usr/bin/true "$probe_path"
+            if /usr/bin/codesign --force --timestamp=none \
+                --sign "$IOS_SIGNING_IDENTITY_HASH" \
+                --keychain "$IOS_SIGNING_KEYCHAIN" "$probe_path" \
+                > /dev/null 2> "$probe_error"; then
+              probe_status="pass"
+            else
+              probe_status="fail"
+            fi
+            printf 'Diagnostic post-partition code-sign probe: %s\n' "$probe_status"
+            rm -f "$probe_path" "$probe_error"
+          fi
+
           archive_with_redacted_output xcodebuild archive \
             -project ios/WatTracker/WatTracker.xcodeproj \
             -scheme WatTracker \
@@ -605,21 +724,103 @@ jobs:
       # the portal credentials too - this is the step that downloads the App
       # Store profile if the archive step only just created it.
       #
-      # It also needs the signing keychain, which is why the cleanup that
-      # deletes it is at the bottom of the job and not immediately after the
-      # archive. -exportArchive takes no build settings, so there is no
-      # --keychain to pass here: it resolves the identity through the keychain
-      # search list, which the import step put the job's keychain at the front
-      # of. ios/WatTracker/ExportOptions.plist names the same profile the
-      # archive was signed with; a mismatch there re-signs with something else
-      # and is not caught until Apple rejects the upload.
+      # It also needs the signing keychain, which is why cleanup is at the
+      # bottom of the job rather than immediately after archive. Re-establish
+      # the hosted job keychain and its partition list before export; the
+      # archive was signed with the same profile named by ExportOptions.plist.
       - name: Export the signed .ipa
         env:
           ASC_KEY_ID: ${{ secrets.APP_STORE_CONNECT_KEY_ID }}
           ASC_ISSUER_ID: ${{ secrets.APP_STORE_CONNECT_ISSUER_ID }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
         run: |
           set -euo pipefail
-          xcodebuild -exportArchive \
+          export IOS_CERT_CN="$(/usr/bin/openssl x509 \
+            -in "$RUNNER_TEMP/wattracker-ios-distribution-cert.pem" -noout -subject \
+            -nameopt sep_multiline,utf8 | sed -n 's/^ *CN=//p')"
+          export IOS_CERT_LEGAL_NAME="$(/usr/bin/openssl x509 \
+            -in "$RUNNER_TEMP/wattracker-ios-distribution-cert.pem" -noout -subject \
+            -nameopt sep_multiline,utf8 | sed -n 's/^ *O=//p')"
+          if [ -z "$IOS_CERT_CN" ] || [ -z "$IOS_CERT_LEGAL_NAME" ]; then
+            echo "The distribution certificate subject is missing a required RDN." >&2
+            exit 1
+          fi
+
+          export_with_redacted_output() {
+            /usr/bin/perl - "$@" <<'PERL'
+          use strict;
+          use warnings;
+          use IO::Select;
+          use IPC::Open3;
+          use Symbol qw(gensym);
+
+          use Encode qw(decode encode);
+          use Unicode::Normalize qw(NFC NFD);
+
+          my @redactions;
+          for my $raw_value (grep { defined($_) && length($_) }
+              @ENV{qw(IOS_CERT_CN IOS_CERT_LEGAL_NAME APPLE_TEAM_ID)}) {
+              my $value = "$raw_value";
+              push @redactions, $value;
+              my $unicode = eval { decode('UTF-8', $value, Encode::FB_CROAK) };
+              if (defined $unicode) {
+                  push @redactions, encode('UTF-8', NFC($unicode));
+                  push @redactions, encode('UTF-8', NFD($unicode));
+              }
+          }
+
+          sub redact {
+              my ($line) = @_;
+              for my $value (@redactions) {
+                  $line =~ s/\Q$value\E/[REDACTED]/g;
+              }
+              $line =~ s/^([^\r\n]*Signing Identity:)[^\r\n]*/$1 [REDACTED]/mg;
+              return $line;
+          }
+
+          my $child_stderr = gensym();
+          my ($child_stdin, $child_stdout);
+          my $pid = open3($child_stdin, $child_stdout, $child_stderr, @ARGV);
+          close $child_stdin;
+
+          my $select = IO::Select->new($child_stdout, $child_stderr);
+          my %buffers = map { fileno($_) => '' } ($child_stdout, $child_stderr);
+          my %destinations = (
+              fileno($child_stdout) => \*STDOUT,
+              fileno($child_stderr) => \*STDERR,
+          );
+          while ($select->count) {
+              for my $handle ($select->can_read) {
+                  my $fd = fileno($handle);
+                  my $bytes = sysread($handle, my $chunk, 8192);
+                  die "xcodebuild output read failed\n" if !defined($bytes);
+                  if ($bytes == 0) {
+                      my $tail = delete $buffers{$fd};
+                      print { $destinations{$fd} } redact($tail) if length($tail);
+                      $select->remove($handle);
+                      close $handle;
+                      next;
+                  }
+                  $buffers{$fd} .= $chunk;
+                  while ($buffers{$fd} =~ s/\A(.*?\n)//s) {
+                      print { $destinations{$fd} } redact($1);
+                  }
+              }
+          }
+
+          waitpid($pid, 0);
+          my $status = $?;
+          exit 127 if $status == -1;
+          exit 128 + ($status & 127) if $status & 127;
+          exit $status >> 8;
+          PERL
+          }
+
+          security list-keychains -d user -s "$IOS_SIGNING_KEYCHAIN"
+          security unlock-keychain -p "$IOS_SIGNING_KEYCHAIN_PASSWORD" "$IOS_SIGNING_KEYCHAIN"
+          security set-key-partition-list -S apple-tool:,apple:,codesign: -s \
+            -k "$IOS_SIGNING_KEYCHAIN_PASSWORD" "$IOS_SIGNING_KEYCHAIN" > /dev/null
+          export_with_redacted_output xcodebuild -exportArchive \
             -archivePath "$RUNNER_TEMP/WatTracker.xcarchive" \
             -exportPath "$RUNNER_TEMP/export" \
             -exportOptionsPlist "$EXPORT_OPTIONS_PLIST" \
@@ -650,11 +851,10 @@ jobs:
       #
       # --p8-file-path rather than altool's search path. altool otherwise looks
       # for AuthKey_<id>.p8 in ./private_keys, ~/private_keys, ~/.private_keys
-      # and ~/.appstoreconnect/private_keys, and on this runner the last of
-      # those is a real human's home directory with a real key in it. A search
-      # path would let this job silently authenticate with a machine-local
-      # credential nobody declared - and appear to work while the secret it is
-      # supposed to be testing was wrong. An explicit path cannot do that.
+      # and ~/.appstoreconnect/private_keys. A search path would let this job
+      # silently authenticate with a machine-local credential nobody declared
+      # and appear to work while the secret it is supposed to test was wrong.
+      # An explicit path cannot do that.
       #
       # --validate-app first: it runs Apple's own checks on the package and,
       # importantly, is where a missing App Store Connect app record surfaces -
@@ -711,8 +911,7 @@ jobs:
       # storage is also full - see the long note in windows.yml - so an upload
       # would turn a green release into a red one.)
 
-      # Unconditional, and it is the only thing standing between a private key
-      # and a machine that persists between jobs. It must not depend on any
+      # Unconditional even on a hosted failure. It must not depend on any
       # earlier step succeeding, must not fail the job if the paths are already
       # gone, and must not print what it is removing beyond the fact that it
       # ran.
@@ -720,18 +919,9 @@ jobs:
         if: always()
         run: |
           set -euo pipefail
-          # The keychain first: it holds the distribution private key, and it
-          # is the one piece of this that would still be usable tomorrow. The
-          # search list is put back before the keychain is deleted so that a
-          # failure to delete does not also leave the runner pointing at a
-          # keychain that is gone.
-          #
-          # `-s login.keychain-db` resets the list to the default rather than
-          # to whatever it was, which is what macos-release.yml does and is
-          # worth naming as a difference: that job runs on a VM nobody else
-          # uses, and this one does not. If the ci-runner account is ever
-          # given extra keychains of its own, this line drops them from its
-          # search list and they have to be added back.
+          # Restore the normal login search list before deleting the
+          # disposable keychain, so no later command references a path that no
+          # longer exists.
           security list-keychains -d user -s login.keychain-db || true
           if [ -n "${IOS_SIGNING_KEYCHAIN:-}" ]; then
             security delete-keychain "$IOS_SIGNING_KEYCHAIN" || true
@@ -743,7 +933,8 @@ jobs:
           # The archive and the export both carry the team identifier in the
           # embedded provisioning profile, and DerivedData holds a copy of
           # everything that was built. On a runner that is discarded this would
-          # not matter; this one is not discarded.
+          # not matter on a discarded hosted VM, but retaining the cleanup
+          # makes local re-runs and failure diagnostics deterministic.
           rm -rf "$RUNNER_TEMP/WatTracker.xcarchive" "$RUNNER_TEMP/export" || true
           rm -rf "$RUNNER_TEMP/ios-archive-dd" "$RUNNER_TEMP/ios-test-dd" || true
           if [ -e "$RUNNER_TEMP/asc" ]; then
@@ -752,7 +943,7 @@ jobs:
           fi
           if [ -n "${IOS_SIGNING_KEYCHAIN:-}" ] && [ -e "$IOS_SIGNING_KEYCHAIN" ]; then
             echo "The signing keychain could not be removed. It holds the" >&2
-            echo "distribution private key and this runner is not discarded." >&2
+            echo "distribution private key." >&2
             exit 1
           fi
           echo "Signing material removed."
