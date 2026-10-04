@@ -1,5 +1,5 @@
 [versions]
-agp = "9.4.0"
+agp = "9.4.1"
 coreKtx = "1.18.0"
 junit = "4.13.2"
 kotlin = "2.2.10"
@@ -17,7 +17,7 @@ securityCrypto = "1.1.0"
 # holds.
 coroutines = "1.11.0"
 # KSP plugin version is coupled to the Kotlin version above.
-ksp = "2.2.10-2.0.2"
+ksp = "2.3.6"
 
 [libraries]
 androidx-core-ktx = { group = "androidx.core", name = "core-ktx", version.ref = "coreKtx" }
