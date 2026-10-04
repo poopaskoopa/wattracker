@@ -4,7 +4,44 @@ Epic #192 and sub-issues #193–#199, plus the owner's
 extra targets: Android 11+, dual-server support (cloud **and** local), offline
 cache. Kotlin + Jetpack Compose, single app under `android/`.
 
-**Resume point — Step 4 (#196) Dashboard is implemented on `feature/android-client-4`, not yet opened as a PR. Steps 1–3 are merged: Step 2 (#194) via PR #304, Step 3 (#195) via PR #376 (landed through #403, `8722198`).** #195 stays open for its device check. The Step 4 implementation notes, verification and known gaps are under "Step 4 — Dashboard screen" below.
+## Agent tooling notes (PowerShell + `gh`, git pager)
+
+**Using `gh` from PowerShell.** The IDE's shell tool runs
+`powershell.exe -Command <cmd>`; PowerShell's native-argument handling and
+stdout capture both get in the way:
+
+- Prefer the `cmd` shell for `gh` calls: arguments pass through unharmed,
+  and `>` redirection writes `gh`'s raw UTF-8 bytes to a file.
+- Keep `--jq` trivial in PowerShell (a bare `--jq .field`, or no `--jq`
+  with `--json a,b,c`): a double-quoted jq expression arrives mangled (one
+  session turned `--jq "title, headRefName"` into a PowerShell
+  expression). Parse the JSON output yourself if you need more.
+- Never capture `gh` output containing non-ASCII into a PowerShell
+  variable: native stdout is decoded with the console code page, and a PR
+  body comes back mojibake (`WΓÇ▓` where `W′` was). Redirect to a file in
+  cmd (`gh pr view N --json body --jq .body > body.txt`), then process it
+  with .NET UTF-8: `[System.IO.File]::ReadAllText($p,
+  [Text.Encoding]::UTF8)` and `WriteAllText(..., New-Object
+  Text.UTF8Encoding($false))` (no BOM), then `gh pr edit N --body-file
+  body.txt`.
+- `;` is the command separator in PowerShell, `&` in cmd; neither stops on
+  failure, so verify intermediate results when a later step depends on an
+  earlier one (a failed `git reset` still lets the queued `git commit`
+  run, and stacks junk on the old history).
+- `String.Replace` that swaps same-length text cannot be verified by
+  comparing lengths; check with `Contains`.
+- For multi-paragraph commit messages, write the message to an
+  LF-terminated, BOM-less file and use `git commit -F file`: repeated `-m`
+  paragraphs are stored as single unwrapped lines (hundreds of characters
+  long), not wrapped.
+
+**Git: disable the pager.** The shell runs in a pseudo-terminal, so
+`git show`, `git log`, `git diff` and friends open the pager and hang
+until the command timeout kills them. Always prefix `git --no-pager`, e.g.
+`git --no-pager log --oneline -5`; for a whole session, set `GIT_PAGER=`
+to empty instead.
+
+**Resume point — Step 4 (#196) Dashboard is open as PR #419 on `feature/android-client-4`. Steps 1–3 are merged: Step 2 (#194) via PR #304, Step 3 (#195) via PR #376 (landed through #403, `8722198`).** #195 stays open for its device check. The Step 4 implementation notes, the PR #419 review (2026-09-30) and its fixes (2026-10-04), verification and known gaps are under "Step 4 — Dashboard screen" below.
 
 Step 3 context: merged via PR #376 (landed through #403). Cloud and local pairing, the Settings screen, and the removed state (#153, `markRemoved()`). The review findings and their resolutions are on PR #376; the durable ones are: every type holding a bearer secret (`LocalCredentials`, `LocalRequest`, `LocalResponse`, `ActiveSession`) redacts it in `toString()`; the connector-token field is a password field; a local session cookie is reused only for the origin and token it was minted for; a local 401 reports `removed`, not `unpaired`.
 
@@ -1523,6 +1560,73 @@ The iOS suite was not run (Windows host); the vector change was checked against
   store; a load it has in flight runs to completion unseen.
 - The loading message is a fixed "Syncing dashboard…", with no page count
   (iOS is the same).
+
+### Step 4 — PR #419 review (2026-09-30, at `38b1003`), addressed 2026-10-04
+
+The owner's CHANGES_REQUESTED review had two blockers and four non-blocking
+notes; all six are addressed on this branch:
+
+1. **Cold start rides out instead of backing off (mirrors iOS #422).** The
+   cloud transport runs 60s connect / 60s read / 120s overall (was
+   15/30/60), so a scale-to-zero wake (20-40s for a replica) no longer times
+   out the first request, which is the signed refresh. `CloudSession` treats
+   a timeout (and a dropped connection on the refresh only) as "waking": one
+   retry after 3s, then a flat 10s gate (`Failure.Waking`) that never
+   escalates, never shortens or relabels a stronger gate (a 429
+   `Retry-After`, the removal-strike gap), never counts as a removal strike,
+   and is the only gate `retryNowIfWaking()` (the pull-to-refresh seam on
+   `ReadSession`, beside `mayBeWaking`) may lift; `noteFailure` never
+   shortens a gate in force and always marks it the server's. The
+   gate-overwrite tests from iOS `CloudSessionTests` are ported
+   (`aConcurrentColdStartTimeoutNeverShortensARetryAfter`,
+   `aColdStartTimeoutNeverShortensTheGapBetweenTwoRemovalStrikes`,
+   `aRefusalDuringAColdStartGateNeitherShortensItNorLeavesItLiftable`), plus
+   the waking, no-strike, and lost-connection cases. The local transport
+   keeps its tighter bounds: the desktop does not scale to zero.
+2. **The dashboard's no-data state says what is true.** When a load fails
+   with no cache to serve, the screen shows its own waking or rate-limited
+   message (or "Failed to sync dashboard" plus the error) instead of
+   "No load history" with no message at all; "No load history yet" is only
+   the genuinely-empty state.
+3. **A same-identity resume joins the walk in flight** (non-blocking note
+   3). `ReadSession` gains `identity` (the backend's lifecycle identity:
+   changes on pairing, sign-out, removal). `DashboardViewModel.refresh()`
+   cancels and supersedes only when the identity changed; a rotation, tab
+   switch, or return from Settings that changed nothing lets the in-flight
+   walk finish and paint instead of restarting from page one. A changed
+   identity still supersedes exactly as before (pairing, sign-out and
+   removal all bump the cloud's `lifecycleGeneration`; `LocalClient` bumps
+   its own on `reset()`). Per-page progress stays deferred: iOS has none
+   either, and the device check is what decides whether it is wanted.
+4. **The en-dash zone is pinned** (non-blocking note 4): the display string
+   with the en dash (`"56–75%"`) is tested inline in `CloudObjectsTest`, as
+   iOS pins it; the shared vector keeps its two zones, which the iOS count
+   assertion (`CloudModelsTests.swift`) limits.
+5. **A local 429 earns the rate-limit notice** (non-blocking note 5): a
+   `LocalClientException.Http` 429/503 carrying `Retry-After` maps to the
+   same "Rate limited — retry in N seconds" state as the cloud's throttle.
+6. **The cache-first read is identity-checked** (non-blocking note 6):
+   `CloudSession.cached()` refuses to serve once the device is not paired
+   (a sign-out's disk wipe can still be in flight, and the rows on disk then
+   belong to the device that left), and the dashboard re-reads the identity
+   before painting the cached data, so a sign-out or re-pair landing
+   mid-load does not flash the old tiles until the rejection clears them.
+
+**Verification (2026-10-04).** `:app:testDebugUnitTest` 165 passed, 0
+failed; `:app:assembleDebug` and `:app:assembleRelease -PallowPlaceholderHost`
+green; the Python tests that read the shared vectors pass (114). The
+`android-line` parity check (required on `main` since #433 for PRs touching
+`ios/`, `wattracker/cloud/` or `tests/vectors/`) is satisfied by the
+`Android: #196` line in the PR description; its logic was verified locally
+against both PR heads. Still not verified on a device or emulator: #196's
+Done (phone landscape and tablet, rotated live) is still owed, as is the
+real-data check against the deployed cloud (about 1,458 `load_point`s, about
+15 pages).
+
+The round-1 note's "a refresh cancels the load in flight" is superseded by
+item 3 (cancel only on a changed identity): `aNewRefreshSupersedesTheOneInFlight`
+became `aChangedIdentitySupersedesTheLoadInFlight`, with
+`aSameIdentityResumeJoinsTheWalkInFlight` beside it.
 
 ## Step 5 — Activities list + ride detail (issue #197)
 
