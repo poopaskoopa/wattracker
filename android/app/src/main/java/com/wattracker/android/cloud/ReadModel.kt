@@ -43,6 +43,9 @@ class ReadModel(
     override val isPaired: Boolean
         get() = active().isPaired
 
+    override val identity: Int
+        get() = active().identity
+
     override val lastSuccess: Long?
         get() = active().lastSuccess
 

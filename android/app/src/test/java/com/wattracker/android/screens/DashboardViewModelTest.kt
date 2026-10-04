@@ -9,6 +9,7 @@ import com.wattracker.android.cloud.CloudPayload
 import com.wattracker.android.cloud.CloudRoute
 import com.wattracker.android.cloud.CloudSession
 import com.wattracker.android.cloud.CloudSnapshot
+import com.wattracker.android.cloud.LocalClientException
 import com.wattracker.android.cloud.ReadSession
 import com.wattracker.android.cloud.TrainingState
 import com.wattracker.android.screens.dashboard.DashboardViewModel
@@ -49,8 +50,10 @@ class DashboardViewModelTest {
     private class FakeReadSession(
         override var deviceState: CloudSession.DeviceState = CloudSession.DeviceState.paired,
         override var isPaired: Boolean = true,
+        override var identity: Int = 1,
         override var lastSuccess: Long? = 1000L,
         private val cachedSnapshots: Map<CloudRoute, CloudSnapshot> = emptyMap(),
+        private val bumpIdentityOnCachedRead: Boolean = false,
         private val loadHandler: suspend (CloudRoute) -> CloudSnapshot = { route ->
             CloudSnapshot(route, 1, emptyList(), CloudSnapshot.Source.network, 2000L)
         },
@@ -58,7 +61,12 @@ class DashboardViewModelTest {
         /** Every `load` call, in order, so a test can count network walks. */
         val loads = mutableListOf<CloudRoute>()
 
-        override suspend fun cached(route: CloudRoute): CloudSnapshot? = cachedSnapshots[route]
+        override suspend fun cached(route: CloudRoute): CloudSnapshot? {
+            // A concurrent sign-out landing mid-read: the identity changes
+            // while the rows are being read, before the wipe reaches the disk.
+            if (bumpIdentityOnCachedRead) identity += 1
+            return cachedSnapshots[route]
+        }
         override suspend fun load(route: CloudRoute): CloudSnapshot {
             loads.add(route)
             return loadHandler(route)
@@ -409,10 +417,12 @@ class DashboardViewModelTest {
     }
 
     @Test
-    fun aNewRefreshSupersedesTheOneInFlight() = runTest(testDispatcher) {
+    fun aChangedIdentitySupersedesTheLoadInFlight() = runTest(testDispatcher) {
         // CloudSession.load serves the cache when its network step is
         // cancelled, so a superseded load can still return normally. Its
-        // result must not overwrite the newer one.
+        // result must not overwrite the newer one. A pairing change is what
+        // supersedes: the identity differs, so the in-flight load is cancelled
+        // and restarted, as before.
         val network = CompletableDeferred<Unit>()
         val staleReturns = CompletableDeferred<Unit>()
         var dashboardLoads = 0
@@ -440,11 +450,85 @@ class DashboardViewModelTest {
         )
         val vm = DashboardViewModel(session, coroutineScope = backgroundScope)
         vm.refresh() // parks on `network`
+        session.identity += 1 // the rider paired a different device in Settings
         vm.refresh() // cancels it and loads 300 W
 
         assertEquals(300.0, vm.uiState.value.dashboardData?.currentFTP!!, 1e-9)
         staleReturns.complete(Unit) // the superseded load now returns 200 W
         assertEquals(300.0, vm.uiState.value.dashboardData?.currentFTP!!, 1e-9)
+    }
+
+    @Test
+    fun aSameIdentityResumeJoinsTheWalkInFlight() = runTest(testDispatcher) {
+        // A rotation, a tab switch, or a return from Settings that changed
+        // nothing resumes the screen while the walk is still in flight under
+        // the same identity. The in-flight load must finish and paint, not
+        // restart the fifteen-page walk from page one.
+        val network = CompletableDeferred<Unit>()
+        var dashboardLoads = 0
+        val session = FakeReadSession(
+            loadHandler = { route ->
+                if (route == CloudRoute.Dashboard) {
+                    dashboardLoads += 1
+                    network.await() // park on the walk
+                    trainingSnapshot(250.0)
+                } else {
+                    CloudSnapshot(route, 1, emptyList(), CloudSnapshot.Source.network, 2000L)
+                }
+            },
+        )
+        val vm = DashboardViewModel(session, coroutineScope = backgroundScope)
+        vm.refresh() // starts the walk, parks on `network`
+        vm.refresh() // ON_RESUME under the same identity: join
+        vm.refresh() // and join again
+        assertEquals("the walk is not restarted", 1, dashboardLoads)
+        network.complete(Unit)
+        assertEquals(250.0, vm.uiState.value.dashboardData?.currentFTP!!, 1e-9)
+    }
+
+    @Test
+    fun aSignOutDuringTheCachedReadIsNotPainted() = runTest(testDispatcher) {
+        // The sign-out's disk wipe is still in flight when the cache-first
+        // read lands: the rows are the old identity's. The identity changed,
+        // so the cached data must not paint, and the network step finds the
+        // sign-out and clears the screen.
+        val cachedItem = CloudItem(
+            id = "ts-1",
+            kind = CloudKind.TrainingState,
+            revision = 1,
+            payload = CloudPayload.TrainingState(
+                TrainingState(ftp = 100.0, cp = null, wprime = null, ctl = 50.0, atl = 55.0, tsb = -5.0, decoupling = null),
+            ),
+        )
+        val session = FakeReadSession(
+            cachedSnapshots = mapOf(
+                CloudRoute.Dashboard to CloudSnapshot(
+                    CloudRoute.Dashboard, 1, listOf(cachedItem), CloudSnapshot.Source.cache, 1000L,
+                ),
+            ),
+            bumpIdentityOnCachedRead = true,
+            loadHandler = { throw CloudSession.Failure.NotPaired() },
+        )
+        val vm = DashboardViewModel(session, coroutineScope = backgroundScope)
+        vm.refresh()
+        // The old identity's cache did not paint.
+        assertNull(vm.uiState.value.dashboardData)
+        assertFalse(vm.uiState.value.isPaired)
+    }
+
+    @Test
+    fun aLocal429WithRetryAfterShowsRateLimitMessage() = runTest(testDispatcher) {
+        // The local backend's 429 carries `Retry-After` on its own exception;
+        // it earns the same rate-limit notice the cloud's throttle does.
+        val session = FakeReadSession(
+            loadHandler = { throw LocalClientException.Http(429, "/api/state", 30.0) },
+        )
+        val vm = DashboardViewModel(session, coroutineScope = backgroundScope)
+        vm.refresh()
+        val state = vm.uiState.value
+        assertFalse(state.isLoading)
+        assertEquals(30, state.throttledRetrySeconds)
+        assertNull(state.error)
     }
 
     @Test

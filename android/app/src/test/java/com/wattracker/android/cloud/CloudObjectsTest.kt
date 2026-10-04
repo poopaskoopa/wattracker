@@ -72,6 +72,20 @@ class CloudObjectsTest {
     }
 
     @Test
+    fun enDashPctZoneKeepsTheDisplayString() {
+        // A range zone is the desktop's display string with an en dash, not
+        // a hyphen, and it is passed through as-is. The shared vector has no
+        // en-dash zone (its count assertion limits it to two zones), so the
+        // case is inline here, as iOS pins it inline.
+        val json = JsonValue.parse("""{"label":"Z2","name":"Endurance","pct":"56–75%","min":140,"max":189,"range":"140–189"}""")
+        val zone = Zone.fromJson(json)
+        assertEquals("56–75%", zone.pct)
+        assertEquals(140.0, zone.min!!, 1e-9)
+        assertEquals(189.0, zone.max!!, 1e-9)
+        assertEquals("140–189", zone.range)
+    }
+
+    @Test
     fun calendarDayWithMalformedWorkoutProfileDecodesLeniently() {
         val json = JsonValue.parse(
             """{

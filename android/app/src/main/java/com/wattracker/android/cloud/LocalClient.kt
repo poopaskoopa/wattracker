@@ -67,6 +67,7 @@ class LocalClient(
     @Volatile private var isRevoked: Boolean = false
     @Volatile private var lastSuccessfulRead: Long? = null
     @Volatile private var cachedState: CloudSnapshot? = null
+    @Volatile private var sessionIdentity = 0
 
     val credentials: LocalCredentials?
         get() = credentialsProvider()
@@ -84,6 +85,14 @@ class LocalClient(
     override val lastSuccess: Long?
         get() = lastSuccessfulRead
 
+    /**
+     * The identity of the local data: it changes when the desktop
+     * credentials are replaced or revoked ([reset] is the app's hook for
+     * both), the same contract as the cloud's.
+     */
+    override val identity: Int
+        get() = sessionIdentity
+
     /** The desktop does not scale to zero; it is either up or it is not. */
     override val mayBeWaking: Boolean
         get() = false
@@ -96,6 +105,8 @@ class LocalClient(
         activeSession = null
         cachedState = null
         lastSuccessfulRead = null
+        // New credential (or none): anything read under the old one is stale.
+        sessionIdentity += 1
     }
 
     fun markRemoved() {

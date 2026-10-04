@@ -108,7 +108,10 @@ class CloudSession(
 
     // Everything else is touched only inside the mutex.
     private val mutex = Mutex()
-    private var lifecycleGeneration = 0
+    // @Volatile: [identity] reads it without the lock, and a reader that
+    // misses a bump only ever costs itself a walk the session's own checks
+    // refuse -- never a stale write or a false removal.
+    @Volatile private var lifecycleGeneration = 0
     private var mintCount = 0
     private var nextAttemptAllowedAt: Long? = null
     // Whether [nextAttemptAllowedAt] was set by a cold start rather than by a
@@ -152,6 +155,16 @@ class CloudSession(
         get() = device != null
 
     /**
+     * The current lifecycle identity, read without the lock on purpose: a
+     * caller deciding whether to join an in-flight load must not block
+     * behind a network call. It changes when the credential behind the
+     * data is replaced -- pairing, sign-out, removal -- so a load started
+     * under an older identity is stale even while it is still running.
+     */
+    override val identity: Int
+        get() = lifecycleGeneration
+
+    /**
      * Whether this backend can be asleep when asked, so a slow first answer
      * is the server waking rather than something wrong. Only the cloud read
      * app scales to zero; the rider's desktop is either up or it is not.
@@ -180,8 +193,15 @@ class CloudSession(
      * with the reconciled result. It reads one small store and cannot fail --
      * an unreadable cache is simply nothing. Suspend so the Room read happens
      * off the caller's (possibly main) thread.
+     *
+     * Only for the current identity: a sign-out or removal's disk wipe can
+     * still be in flight, and the rows on disk then belong to the device
+     * that left, not the one that will pair next.
      */
     override suspend fun cached(route: CloudRoute): CloudSnapshot? {
+        mutex.withLock {
+            if (state != DeviceState.paired || device == null) return null
+        }
         val stored = onIo { cache.load(route) } ?: return null
         return CloudSnapshot(route, stored.revision, stored.items, CloudSnapshot.Source.cache, stored.storedAt)
     }

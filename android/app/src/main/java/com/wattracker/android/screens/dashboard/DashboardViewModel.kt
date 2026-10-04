@@ -52,6 +52,8 @@ class DashboardViewModel(
     val uiState: StateFlow<DashboardUiState> = _uiState.asStateFlow()
 
     private var loadJob: Job? = null
+    /** The identity the in-flight load started under; `null` when there is none. */
+    private var loadIdentity: Int? = null
 
     fun setWindow(window: LoadWindow) {
         _uiState.update { it.copy(selectedWindow = window) }
@@ -60,19 +62,29 @@ class DashboardViewModel(
     /**
      * Reload from the active backend, re-reading the pairing state first.
      *
-     * A refresh cancels the one in flight rather than joining it: the rider
-     * may have paired, signed out or re-paired in Settings since it started,
-     * and only the newest load has read that. The cancelled load never writes
-     * state again (see [checkActive]).
+     * A refresh under a changed identity cancels the load in flight: the
+     * rider may have paired, signed out or re-paired in Settings since it
+     * started, and only the newest load has read that. The cancelled load
+     * never writes state again (see [checkActive]). A resume under the same
+     * identity -- a rotation, a tab switch, a return from Settings that
+     * changed nothing -- joins the walk in flight instead of restarting it
+     * from page one; the in-flight load paints its own result.
      */
     fun refresh() {
-        loadJob?.cancel()
+        val identity = readModel.identity
+        val inFlight = loadJob
+        if (inFlight?.isActive == true && loadIdentity == identity) {
+            return
+        }
+        inFlight?.cancel()
+        loadIdentity = identity
         loadJob = scope.launch { load() }
     }
 
     private suspend fun load() {
         val deviceState = readModel.deviceState
         val isPaired = readModel.isPaired
+        val identity = readModel.identity
         _uiState.update {
             it.copy(isStarting = false, deviceState = deviceState, isPaired = isPaired)
         }
@@ -93,7 +105,14 @@ class DashboardViewModel(
                 }
             }
             checkActive()
-            _uiState.update { it.copy(dashboardData = data) }
+            // The identity may have changed since the top of this load -- a
+            // sign-out or re-pair whose disk wipe has not finished, so the
+            // cache still holds the previous identity's objects. Do not paint
+            // them; the network step below finds the change and clears the
+            // screen.
+            if (readModel.identity == identity) {
+                _uiState.update { it.copy(dashboardData = data) }
+            }
         }
 
         // 2. Always the network: it refreshes the numbers and it is how a
@@ -198,7 +217,13 @@ class DashboardViewModel(
             }
             else -> {
                 val waking = e is CloudSession.Failure.Waking
+                // The local backend's 429/503 carries `Retry-After` on its own
+                // exception; it earns the same rate-limit notice the cloud's
+                // throttle does.
+                val localThrottled = (e as? LocalClientException.Http)
+                    ?.takeIf { it.status == 429 || it.status == 503 }
                 val retrySec = (e as? CloudSession.Failure.Throttled)?.retryAfter?.toInt()
+                    ?: localThrottled?.retryAfter?.toInt()
                 _uiState.update {
                     it.copy(
                         isLoading = false,

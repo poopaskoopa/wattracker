@@ -843,6 +843,35 @@ class CloudSessionTest {
         assertEquals(5, transport.requests.size)
     }
 
+    @Test
+    fun cachedServesLastKnownDataOnlyForTheCurrentIdentity() = runTest {
+        // A sign-out's disk wipe can lag the in-memory state; until it lands,
+        // the rows on disk are the previous device's. Last-known data is only
+        // the current identity's, so the read refuses rather than serves them.
+        makePairedSession { request ->
+            if (request.url.contains("/context/refresh")) {
+                CloudResponse(200, refreshJson("ctx-1", 300.0).toByteArray(), null, nowMillis)
+            } else {
+                throw AssertionError("no network expected: ${request.url}")
+            }
+        }
+        cache.store(listOf(profileItem(4)), 4, CloudRoute.Dashboard, full = true, generation = 0)
+        assertNotNull(session.cached(CloudRoute.Dashboard))
+        session.signOut()
+        assertNull(session.cached(CloudRoute.Dashboard))
+    }
+
+    @Test
+    fun cachedServesNothingWhenNotPaired() = runTest {
+        // A process that started unpaired must not hand out leftover rows a
+        // prior identity left on disk before its wipe ran.
+        makeSession { request ->
+            throw AssertionError("no network expected: ${request.url}")
+        }
+        cache.store(listOf(profileItem(4)), 4, CloudRoute.Dashboard, full = true, generation = 0)
+        assertNull(session.cached(CloudRoute.Dashboard))
+    }
+
     // MARK: - Multi-page walk
 
     @Test
