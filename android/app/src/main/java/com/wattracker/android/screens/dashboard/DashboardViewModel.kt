@@ -25,6 +25,7 @@ data class DashboardUiState(
     val deviceState: CloudSession.DeviceState = CloudSession.DeviceState.unpaired,
     val isPaired: Boolean = false,
     val isLoading: Boolean = false,
+    val isWaking: Boolean = false,
     val throttledRetrySeconds: Int? = null,
     val error: String? = null,
     val selectedWindow: LoadWindow = LoadWindow.SIX_WEEKS,
@@ -97,7 +98,9 @@ class DashboardViewModel(
 
         // 2. Always the network: it refreshes the numbers and it is how a
         // revocation is discovered.
-        _uiState.update { it.copy(isLoading = true, error = null, throttledRetrySeconds = null) }
+        _uiState.update {
+            it.copy(isLoading = true, error = null, throttledRetrySeconds = null, isWaking = false)
+        }
 
         val freshDashboard = try {
             readModel.load(CloudRoute.Dashboard)
@@ -176,6 +179,7 @@ class DashboardViewModel(
             removed -> _uiState.update {
                 it.copy(
                     isLoading = false,
+                    isWaking = false,
                     deviceState = CloudSession.DeviceState.removed,
                     isPaired = false,
                     dashboardData = null,
@@ -185,6 +189,7 @@ class DashboardViewModel(
             notPaired -> _uiState.update {
                 it.copy(
                     isLoading = false,
+                    isWaking = false,
                     deviceState = CloudSession.DeviceState.unpaired,
                     isPaired = false,
                     dashboardData = null,
@@ -192,10 +197,12 @@ class DashboardViewModel(
                 )
             }
             else -> {
+                val waking = e is CloudSession.Failure.Waking
                 val retrySec = (e as? CloudSession.Failure.Throttled)?.retryAfter?.toInt()
                 _uiState.update {
                     it.copy(
                         isLoading = false,
+                        isWaking = waking,
                         throttledRetrySeconds = retrySec,
                         error = if (retrySec == null) e.message else null,
                     )

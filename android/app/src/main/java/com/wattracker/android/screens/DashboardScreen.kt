@@ -207,18 +207,61 @@ fun DashboardScreen(
                         }
                     }
                 } else {
-                    // Empty data fallback
+                    // Nothing on screen: no cache to serve. Either the load
+                    // failed -- say so, "no history" is not the answer to a
+                    // failure -- or there genuinely is no history yet.
                     Panel {
                         Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
-                            Text(
-                                text = stringResource(R.string.dashboard_no_load_history),
-                                style = TextStyle(fontSize = 15.sp, fontWeight = FontWeight.SemiBold, color = Palette.textBright),
-                            )
-                            if (uiState.error != null) {
-                                Text(
-                                    text = uiState.error!!,
-                                    style = TextStyle(fontSize = 13.sp, color = Palette.alert),
-                                )
+                            when {
+                                uiState.isWaking -> {
+                                    Row(
+                                        verticalAlignment = Alignment.CenterVertically,
+                                        horizontalArrangement = Arrangement.spacedBy(12.dp),
+                                    ) {
+                                        CircularProgressIndicator(
+                                            modifier = Modifier.size(20.dp),
+                                            strokeWidth = 2.5.dp,
+                                            color = Palette.accent,
+                                        )
+                                        Text(
+                                            text = stringResource(R.string.dashboard_waking_title),
+                                            style = TextStyle(fontSize = 14.sp, color = Palette.muted),
+                                        )
+                                    }
+                                    Text(
+                                        text = uiState.error ?: stringResource(R.string.dashboard_waking_notice),
+                                        style = TextStyle(fontSize = 13.sp, color = Palette.muted),
+                                    )
+                                }
+
+                                uiState.throttledRetrySeconds != null -> {
+                                    Text(
+                                        text = stringResource(R.string.dashboard_sync_failed),
+                                        style = TextStyle(fontSize = 15.sp, fontWeight = FontWeight.SemiBold, color = Palette.textBright),
+                                    )
+                                    Text(
+                                        text = stringResource(R.string.dashboard_throttled_notice, uiState.throttledRetrySeconds!!),
+                                        style = TextStyle(fontSize = 13.sp, color = Palette.muted),
+                                    )
+                                }
+
+                                uiState.error != null -> {
+                                    Text(
+                                        text = stringResource(R.string.dashboard_sync_failed),
+                                        style = TextStyle(fontSize = 15.sp, fontWeight = FontWeight.SemiBold, color = Palette.textBright),
+                                    )
+                                    Text(
+                                        text = uiState.error!!,
+                                        style = TextStyle(fontSize = 13.sp, color = Palette.alert),
+                                    )
+                                }
+
+                                else -> {
+                                    Text(
+                                        text = stringResource(R.string.dashboard_no_load_history),
+                                        style = TextStyle(fontSize = 15.sp, fontWeight = FontWeight.SemiBold, color = Palette.textBright),
+                                    )
+                                }
                             }
                         }
                     }

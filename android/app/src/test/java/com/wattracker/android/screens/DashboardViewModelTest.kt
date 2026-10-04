@@ -65,6 +65,13 @@ class DashboardViewModelTest {
         }
         override suspend fun activityDetail(activityId: Int): ActivityDetail = throw NotImplementedError()
         override suspend fun activityStreams(activityId: Int): ActivityStreams = throw NotImplementedError()
+
+        override val mayBeWaking: Boolean
+            get() = false
+
+        override suspend fun retryNowIfWaking() {
+            // No gate in the fake; nothing to lift.
+        }
     }
 
     @Test

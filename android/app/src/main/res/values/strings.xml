@@ -83,6 +83,8 @@
     <string name="dashboard_start_failed">The app could not finish starting up. Close and reopen it.</string>
     <string name="dashboard_sync_failed">Failed to sync dashboard</string>
     <string name="dashboard_throttled_notice">Rate limited — retry in %1$d seconds</string>
+    <string name="dashboard_waking_title">Waking up the cloud…</string>
+    <string name="dashboard_waking_notice">The cloud is still waking up. It usually takes under a minute; try again shortly.</string>
     <string name="dashboard_unpaired_title">No backend paired</string>
     <string name="dashboard_unpaired_note">Pair a cloud code or local desktop server in Settings to view training status and load.</string>
     <string name="dashboard_removed_title">Device removed</string>

@@ -84,6 +84,14 @@ class LocalClient(
     override val lastSuccess: Long?
         get() = lastSuccessfulRead
 
+    /** The desktop does not scale to zero; it is either up or it is not. */
+    override val mayBeWaking: Boolean
+        get() = false
+
+    override suspend fun retryNowIfWaking() {
+        // The desktop does not scale to zero; there is nothing to wake.
+    }
+
     fun reset() {
         activeSession = null
         cachedState = null

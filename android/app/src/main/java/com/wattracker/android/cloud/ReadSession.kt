@@ -29,4 +29,18 @@ interface ReadSession {
     suspend fun activityDetail(activityId: Int): ActivityDetail
 
     suspend fun activityStreams(activityId: Int): ActivityStreams
+
+    /**
+     * Whether this backend can be asleep when asked, so a slow first answer
+     * is the server waking rather than something wrong. Only the cloud read
+     * app scales to zero; the rider's desktop is either up or it is not.
+     */
+    val mayBeWaking: Boolean
+
+    /**
+     * The rider asked (pull to refresh): lift a backoff that a waking server
+     * caused, so the next read goes out now. A backoff the server asked for
+     * with 429/503 is not the rider's to shorten and stays in force.
+     */
+    suspend fun retryNowIfWaking()
 }
