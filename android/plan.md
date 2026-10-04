@@ -1534,11 +1534,11 @@ the Python tests that read the shared vectors pass. Mutation-proved locally
 | Mutation | Test that goes red |
 |---|---|
 | Decide the Activities fetch on the on-screen rides | `everyRefreshRefetchesActivitiesSoANewRideAppears`, `ridesStayOnScreenWhileTheActivitiesFetchRuns` |
-| Drop the `checkActive()` staleness guard | `aNewRefreshSupersedesTheOneInFlight` |
+| Drop the `checkActive()` staleness guard | `aChangedIdentitySupersedesTheLoadInFlight` |
 | Load in `init` as well | `constructionDoesNotLoad` |
 | Clear the rides while the fetch runs | `ridesStayOnScreenWhileTheActivitiesFetchRuns` |
 | Leave TSS out of the chart's axis | `loadAxisIncludesTssSoBarsStayInsideTheChart` |
-| Join the in-flight load instead of cancelling it | `aNewRefreshSupersedesTheOneInFlight` |
+| Join the in-flight load instead of cancelling it | `aChangedIdentitySupersedesTheLoadInFlight` |
 
 **Not verified.** Nothing here has run on a device or emulator. #196's Done
 (phone landscape and tablet, rotated live) is still owed, as is a real-data
@@ -1627,6 +1627,36 @@ The round-1 note's "a refresh cancels the load in flight" is superseded by
 item 3 (cancel only on a changed identity): `aNewRefreshSupersedesTheOneInFlight`
 became `aChangedIdentitySupersedesTheLoadInFlight`, with
 `aSameIdentityResumeJoinsTheWalkInFlight` beside it.
+
+**Code-review round (2026-10-05).** Addressed the review of the cold-start
+(ride-out), non-blocking-notes, and plan.md commits:
+- **The no-data waking state is no longer a dead end**: the dashboard's
+  `ScrollableScreenScaffold` gained pull-to-refresh (iOS parity); a pull lifts
+  a cold-start's gate (`retryNowIfWaking`) and re-runs the walk, and the
+  waking card is a static notice, not a spinner that never resolves.
+- **A re-pair clears the previous rider's tiles**: `load()` drops the
+  on-screen data the moment the identity changes, so a first load that fails
+  does not leave the old data up under "Syncing."
+- **A reset over HTTPS is recognised as a wake**: `isColdStart` walks the
+  cause chain and matches `SSLException` (and a `SocketException` that is not a
+  refused connection), not just a top-level `SocketException`/`EOFException`.
+- **The refresh ride-out is lifecycle-guarded**: the retry and the
+  `noteColdStart`/`noteFailure` both re-check the identity, so a sign-out or
+  re-pair in the pause neither re-signs for a departed device nor banks a gate
+  against the next identity.
+- **`cached()` re-validates after the disk read**: the identity is re-checked
+  once the read returns, so a sign-out landing mid-read cannot paint.
+- **The four previously un-pinned mutations now are**: the lift
+  (`aColdStartGateIsLiftableByTheRidersPull`), `isWaking`
+  (`aWakingFailureShowsTheWakingNoticeWithNoError`), the deadline throwing
+  `SocketTimeoutException` (`aResponseThatOutrunsTheDeadlineIsCutOff`), and the
+  cache-paint re-check (`aSignOutDuringTheCachedReadIsNotPainted`, now asserted
+  mid-flight). A re-pair clearing the tiles is pinned too
+  (`aRePairClearsThePreviousIdentitysTiles`).
+- `Failure.Waking`'s message no longer duplicates `dashboard_waking_notice`,
+  so the screen shows the string resource, not a hardcoded copy.
+- **Verification.** `:app:testDebugUnitTest` 174 passed, 0 failed (was 165);
+  `:app:assembleDebug` green.
 
 ## Step 5 — Activities list + ride detail (issue #197)
 

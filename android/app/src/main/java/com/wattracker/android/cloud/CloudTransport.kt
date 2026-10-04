@@ -131,6 +131,14 @@ class HttpUrlCloudTransport(
         // timeout once, so the rider waits at most about two minutes --
         // with the cache on screen -- before giving up. The local transport
         // keeps its own tighter bounds: the desktop does not scale to zero.
+        //
+        // The cost, and why it is left in place: a genuinely dead network is
+        // indistinguishable from a slow wake, so it also burns the full 60s
+        // before it is recognised, and a rider with no connectivity waits over
+        // two minutes before the failure is reported as `waking` rather than
+        // `offline`. iOS makes the same conflation, so this is parity, not a
+        // regression -- and the read app is the one that scales, so the wake,
+        // not the dead network, is the case to size for.
         private const val CONNECT_TIMEOUT_MS = 60_000
         private const val READ_TIMEOUT_MS = 60_000
 

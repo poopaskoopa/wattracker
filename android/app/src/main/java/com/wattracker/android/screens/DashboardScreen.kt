@@ -120,6 +120,8 @@ fun DashboardScreen(
     ScrollableScreenScaffold(
         title = stringResource(R.string.destination_dashboard),
         subtitle = stringResource(R.string.screen_dashboard_subtitle),
+        isRefreshing = uiState.isRefreshing,
+        onRefresh = { viewModel.pullToRefresh() },
     ) {
         val isWide = LocalConfiguration.current.orientation == Configuration.ORIENTATION_LANDSCAPE ||
             LocalConfiguration.current.smallestScreenWidthDp >= 600
@@ -214,22 +216,15 @@ fun DashboardScreen(
                         Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
                             when {
                                 uiState.isWaking -> {
-                                    Row(
-                                        verticalAlignment = Alignment.CenterVertically,
-                                        horizontalArrangement = Arrangement.spacedBy(12.dp),
-                                    ) {
-                                        CircularProgressIndicator(
-                                            modifier = Modifier.size(20.dp),
-                                            strokeWidth = 2.5.dp,
-                                            color = Palette.accent,
-                                        )
-                                        Text(
-                                            text = stringResource(R.string.dashboard_waking_title),
-                                            style = TextStyle(fontSize = 14.sp, color = Palette.muted),
-                                        )
-                                    }
+                                    // A static notice, not a spinner: nothing is
+                                    // in flight, so a spinner would lie. Pull to
+                                    // refresh re-runs the walk and lifts the gate.
                                     Text(
-                                        text = uiState.error ?: stringResource(R.string.dashboard_waking_notice),
+                                        text = stringResource(R.string.dashboard_waking_title),
+                                        style = TextStyle(fontSize = 15.sp, fontWeight = FontWeight.SemiBold, color = Palette.textBright),
+                                    )
+                                    Text(
+                                        text = stringResource(R.string.dashboard_waking_notice),
                                         style = TextStyle(fontSize = 13.sp, color = Palette.muted),
                                     )
                                 }

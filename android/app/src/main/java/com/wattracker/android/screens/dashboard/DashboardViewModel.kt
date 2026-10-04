@@ -25,6 +25,7 @@ data class DashboardUiState(
     val deviceState: CloudSession.DeviceState = CloudSession.DeviceState.unpaired,
     val isPaired: Boolean = false,
     val isLoading: Boolean = false,
+    val isRefreshing: Boolean = false,
     val isWaking: Boolean = false,
     val throttledRetrySeconds: Int? = null,
     val error: String? = null,
@@ -54,6 +55,8 @@ class DashboardViewModel(
     private var loadJob: Job? = null
     /** The identity the in-flight load started under; `null` when there is none. */
     private var loadIdentity: Int? = null
+    /** The identity whose data is on screen; a re-pair clears the previous rider's tiles. */
+    private var shownIdentity: Int? = null
 
     fun setWindow(window: LoadWindow) {
         _uiState.update { it.copy(selectedWindow = window) }
@@ -81,6 +84,24 @@ class DashboardViewModel(
         loadJob = scope.launch { load() }
     }
 
+    /**
+     * The rider pulled to refresh: lift a gate a waking server set, then
+     * reload from scratch. Unlike [refresh], a manual refresh always restarts
+     * the walk -- the rider asked for fresh data, so joining an in-flight one
+     * would not answer it.
+     */
+    fun pullToRefresh() {
+        loadJob?.cancel()
+        loadIdentity = readModel.identity
+        _uiState.update { it.copy(isRefreshing = true) }
+        loadJob = scope.launch {
+            // The desktop never scales to zero; only the cloud can be waking,
+            // and only a cold-start gate may be lifted.
+            if (readModel.mayBeWaking) readModel.retryNowIfWaking()
+            load()
+        }
+    }
+
     private suspend fun load() {
         val deviceState = readModel.deviceState
         val isPaired = readModel.isPaired
@@ -90,8 +111,18 @@ class DashboardViewModel(
         }
 
         if (!isPaired || deviceState == CloudSession.DeviceState.removed) {
-            _uiState.update { it.copy(isLoading = false, dashboardData = null, error = null) }
+            shownIdentity = null
+            _uiState.update { it.copy(isLoading = false, isRefreshing = false, dashboardData = null, error = null) }
             return
+        }
+
+        // A re-pair in Settings replaces the identity: the tiles on screen are
+        // the previous rider's. Clear them now, so a first load that fails does
+        // not leave the old data up under "Syncing" (or forever), and so the
+        // rides carried into the fresh snapshot below are this identity's.
+        if (shownIdentity != identity) {
+            shownIdentity = null
+            _uiState.update { it.copy(dashboardData = null) }
         }
 
         // 1. The cache first, so the network is not on the first-paint path.
@@ -111,6 +142,7 @@ class DashboardViewModel(
             // them; the network step below finds the change and clears the
             // screen.
             if (readModel.identity == identity) {
+                shownIdentity = identity
                 _uiState.update { it.copy(dashboardData = data) }
             }
         }
@@ -146,7 +178,8 @@ class DashboardViewModel(
         } else {
             fresh
         }
-        _uiState.update { it.copy(isLoading = false, dashboardData = shown, error = null) }
+        shownIdentity = identity
+        _uiState.update { it.copy(isLoading = false, isRefreshing = false, dashboardData = shown, error = null) }
 
         if (!needsActivities) return
         val activities = try {
@@ -198,6 +231,7 @@ class DashboardViewModel(
             removed -> _uiState.update {
                 it.copy(
                     isLoading = false,
+                    isRefreshing = false,
                     isWaking = false,
                     deviceState = CloudSession.DeviceState.removed,
                     isPaired = false,
@@ -208,6 +242,7 @@ class DashboardViewModel(
             notPaired -> _uiState.update {
                 it.copy(
                     isLoading = false,
+                    isRefreshing = false,
                     isWaking = false,
                     deviceState = CloudSession.DeviceState.unpaired,
                     isPaired = false,
@@ -227,9 +262,13 @@ class DashboardViewModel(
                 _uiState.update {
                     it.copy(
                         isLoading = false,
+                        isRefreshing = false,
                         isWaking = waking,
                         throttledRetrySeconds = retrySec,
-                        error = if (retrySec == null) e.message else null,
+                        // A Waking failure has its own localized notice in the
+                        // screen; `e.message` is a hardcoded duplicate of it, so
+                        // leave error null and let the screen show the string.
+                        error = if (waking || retrySec != null) null else e.message,
                     )
                 }
             }

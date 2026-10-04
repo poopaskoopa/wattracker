@@ -5,6 +5,7 @@ import java.io.IOException
 import java.net.ConnectException
 import java.net.SocketException
 import java.net.SocketTimeoutException
+import javax.net.ssl.SSLException
 import kotlin.math.abs
 import kotlin.math.max
 import kotlin.math.min
@@ -90,7 +91,9 @@ class CloudSession(
          * still starting after scaling to zero. The short flat gate that
          * follows is [coldStartBackoff], and it never escalates.
          */
-        class Waking : Failure("The cloud is still waking up. It usually takes under a minute; try again shortly.")
+        // The rider-facing text lives in `dashboard_waking_notice`; this is
+        // the internal reason only, so the two do not drift apart.
+        class Waking : Failure("The cloud is still waking up")
         class ClockSkew(val seconds: Double) :
             Failure("This device's clock is ${seconds.toInt()}s off the server's")
         class Server(val status: Int) : Failure("HTTP $status")
@@ -199,11 +202,24 @@ class CloudSession(
      * that left, not the one that will pair next.
      */
     override suspend fun cached(route: CloudRoute): CloudSnapshot? {
-        mutex.withLock {
-            if (state != DeviceState.paired || device == null) return null
+        val (readDevice, readGeneration) = mutex.withLock {
+            val dev = device
+            if (state != DeviceState.paired || dev == null) return null
+            dev to lifecycleGeneration
         }
         val stored = onIo { cache.load(route) } ?: return null
-        return CloudSnapshot(route, stored.revision, stored.items, CloudSnapshot.Source.cache, stored.storedAt)
+        // The read is off-thread, so a sign-out or re-pair can land in the
+        // window between the paired-check above and here (its disk wipe may
+        // not have run yet), which would make the rows the departed identity's.
+        // Re-check under the lock so the guarantee holds without each caller
+        // having to re-read the identity itself.
+        return mutex.withLock {
+            if (state != DeviceState.paired || device != readDevice || lifecycleGeneration != readGeneration) {
+                null
+            } else {
+                CloudSnapshot(route, stored.revision, stored.items, CloudSnapshot.Source.cache, stored.storedAt)
+            }
+        }
     }
 
     /**
@@ -451,6 +467,14 @@ class CloudSession(
             // reader context outlives no scale-down -- so it is the one that
             // meets a sleeping server, and the one that rides it out.
             ridingOutColdStart(firstRequest = true) {
+                // The retry lands after the cold-start pause; the identity may
+                // have changed in that window (a sign-out or re-pair). Never
+                // sign a refresh for a departed device -- the new identity
+                // refreshes on its own.
+                val gone = mutex.withLock {
+                    if (!isCurrent(refreshDevice, refreshGeneration)) lifecycleFailure() else null
+                }
+                if (gone != null) throw gone
                 client.refreshReaderContext(refreshDevice)
             }
         } catch (e: Failure) {
@@ -464,6 +488,13 @@ class CloudSession(
             // A transport error is the network, not the credential: it must
             // never move this device toward `removed`. A timeout is not even
             // the network: it is the server waking, and gets the short gate.
+            // But if the identity changed while the refresh rode out, neither
+            // a gate nor a failure may be banked against the departed device:
+            // that would gate the new identity's first read.
+            val gone = mutex.withLock {
+                if (!isCurrent(refreshDevice, refreshGeneration)) lifecycleFailure() else null
+            }
+            if (gone != null) throw gone
             if (isColdStart(e, firstRequest = true)) {
                 throw mutex.withLock { noteColdStart() }
             }
@@ -690,12 +721,34 @@ class CloudSession(
      * unresolvable host is the network, not the wake. Later in a read a
      * dropped connection is just a dropped connection.
      */
-    private fun isColdStart(e: IOException, firstRequest: Boolean): Boolean = when (e) {
-        // A timeout, always: one of the request's reads, or the request as a
-        // whole out-running its deadline.
-        is SocketTimeoutException -> true
-        is EOFException, is SocketException -> firstRequest && e !is ConnectException
-        else -> false
+    private fun isColdStart(e: IOException, firstRequest: Boolean): Boolean {
+        // A timeout is a timeout wherever it lands -- in a read, on the
+        // request's overall deadline, or wrapped by the TLS layer -- so look
+        // past the top-level exception, not just at it.
+        if (inCauseChain(e) { it is SocketTimeoutException }) return true
+        // A dropped connection counts only on the wake's first request (the
+        // refresh), where the ingress can cut a connection it was holding for
+        // a replica that has not come up. Over HTTPS the reset surfaces as an
+        // SSLException, or as the cause of the thrown IOException; a refused
+        // connection (ConnectException) is the network, not the wake.
+        return firstRequest && inCauseChain(e) { isDroppedConnection(it) }
+    }
+
+    private fun isDroppedConnection(t: Throwable): Boolean =
+        t is EOFException ||
+            (t is SocketException && t !is ConnectException) ||
+            t is SSLException
+
+    /** [e] and its causes, to a hop limit so a cyclic cause cannot loop. */
+    private fun inCauseChain(e: Throwable, match: (Throwable) -> Boolean): Boolean {
+        var current: Throwable? = e
+        var hops = 0
+        while (current != null && hops < 8) {
+            if (match(current)) return true
+            current = current.cause
+            hops++
+        }
+        return false
     }
 
     /**

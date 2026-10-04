@@ -52,11 +52,13 @@ class DashboardViewModelTest {
         override var isPaired: Boolean = true,
         override var identity: Int = 1,
         override var lastSuccess: Long? = 1000L,
+        override var mayBeWaking: Boolean = false,
         private val cachedSnapshots: Map<CloudRoute, CloudSnapshot> = emptyMap(),
         private val bumpIdentityOnCachedRead: Boolean = false,
         private val loadHandler: suspend (CloudRoute) -> CloudSnapshot = { route ->
             CloudSnapshot(route, 1, emptyList(), CloudSnapshot.Source.network, 2000L)
         },
+        private val retryNowIfWakingHandler: suspend () -> Unit = {},
     ) : ReadSession {
         /** Every `load` call, in order, so a test can count network walks. */
         val loads = mutableListOf<CloudRoute>()
@@ -74,12 +76,7 @@ class DashboardViewModelTest {
         override suspend fun activityDetail(activityId: Int): ActivityDetail = throw NotImplementedError()
         override suspend fun activityStreams(activityId: Int): ActivityStreams = throw NotImplementedError()
 
-        override val mayBeWaking: Boolean
-            get() = false
-
-        override suspend fun retryNowIfWaking() {
-            // No gate in the fake; nothing to lift.
-        }
+        override suspend fun retryNowIfWaking() = retryNowIfWakingHandler()
     }
 
     @Test
@@ -490,8 +487,11 @@ class DashboardViewModelTest {
     fun aSignOutDuringTheCachedReadIsNotPainted() = runTest(testDispatcher) {
         // The sign-out's disk wipe is still in flight when the cache-first
         // read lands: the rows are the old identity's. The identity changed,
-        // so the cached data must not paint, and the network step finds the
-        // sign-out and clears the screen.
+        // so the cached data must not paint. The network step is parked on a
+        // gate, so the assertion is on the screen *while* the load is in
+        // flight -- not just the final state, which the sign-out clears either
+        // way.
+        val network = CompletableDeferred<Unit>()
         val cachedItem = CloudItem(
             id = "ts-1",
             kind = CloudKind.TrainingState,
@@ -507,13 +507,22 @@ class DashboardViewModelTest {
                 ),
             ),
             bumpIdentityOnCachedRead = true,
-            loadHandler = { throw CloudSession.Failure.NotPaired() },
+            loadHandler = {
+                network.await()
+                throw CloudSession.Failure.NotPaired()
+            },
         )
         val vm = DashboardViewModel(session, coroutineScope = backgroundScope)
-        vm.refresh()
-        // The old identity's cache did not paint.
-        assertNull(vm.uiState.value.dashboardData)
+        vm.refresh() // runs to the network step, which parks on `network`
+
+        // The old identity's cache did not paint: with the load parked, the
+        // screen shows no data, not the cached 100 W.
+        assertTrue(vm.uiState.value.isLoading)
+        assertNull("the stale cache must not paint", vm.uiState.value.dashboardData)
+
+        network.complete(Unit)
         assertFalse(vm.uiState.value.isPaired)
+        assertNull(vm.uiState.value.dashboardData)
     }
 
     @Test
@@ -544,5 +553,85 @@ class DashboardViewModelTest {
         assertFalse(state.isLoading)
         assertEquals(30, state.throttledRetrySeconds)
         assertNull(state.error)
+    }
+
+    @Test
+    fun aWakingFailureShowsTheWakingNoticeWithNoError() = runTest(testDispatcher) {
+        // A scaled-to-zero server the refresh rides out and still cannot reach
+        // is "waking," not a generic failure: it shows the waking notice, not a
+        // red error card, and its (hardcoded) message does not duplicate it.
+        val session = FakeReadSession(
+            loadHandler = { throw CloudSession.Failure.Waking() },
+        )
+        val vm = DashboardViewModel(session, coroutineScope = backgroundScope)
+        vm.refresh()
+        val state = vm.uiState.value
+        assertFalse(state.isLoading)
+        assertTrue(state.isWaking)
+        assertNull(state.error)
+        assertNull(state.dashboardData)
+        assertTrue(state.isPaired) // waking is not a pairing failure
+    }
+
+    @Test
+    fun aRePairClearsThePreviousIdentitysTiles() = runTest(testDispatcher) {
+        // The rider re-paired a different device in Settings: the tiles on
+        // screen are the previous rider's. The new identity's load must clear
+        // them -- even when it fails (here, the new cloud is waking) -- instead
+        // of leaving the old data up under "Syncing."
+        var failing = false
+        val session = FakeReadSession(
+            loadHandler = { route ->
+                if (route == CloudRoute.Dashboard) {
+                    if (failing) throw CloudSession.Failure.Waking() else trainingSnapshot(250.0)
+                } else {
+                    CloudSnapshot(route, 1, emptyList(), CloudSnapshot.Source.network, 2000L)
+                }
+            },
+        )
+        val vm = DashboardViewModel(session, coroutineScope = backgroundScope)
+        vm.refresh()
+        assertNotNull(vm.uiState.value.dashboardData)
+
+        // The rider re-pairs a different device; its first load fails waking.
+        failing = true
+        session.identity += 1
+        vm.refresh()
+
+        val state = vm.uiState.value
+        assertNull("the previous rider's tiles are cleared", state.dashboardData)
+        assertTrue(state.isWaking)
+    }
+
+    @Test
+    fun aPullToRefreshLiftsTheWakingGateAndRerunsTheWalk() = runTest(testDispatcher) {
+        // The rider pulls to refresh: the gate a waking server set is lifted
+        // (`retryNowIfWaking`), and the walk re-runs from scratch -- a manual
+        // refresh is never joined.
+        val network = CompletableDeferred<Unit>()
+        var lifts = 0
+        var dashboardLoads = 0
+        val session = FakeReadSession(
+            mayBeWaking = true,
+            loadHandler = { route ->
+                if (route == CloudRoute.Dashboard) {
+                    dashboardLoads += 1
+                    network.await()
+                    trainingSnapshot(250.0)
+                } else {
+                    CloudSnapshot(route, 1, emptyList(), CloudSnapshot.Source.network, 2000L)
+                }
+            },
+            retryNowIfWakingHandler = { lifts += 1 },
+        )
+        val vm = DashboardViewModel(session, coroutineScope = backgroundScope)
+        vm.pullToRefresh()
+        assertEquals("the pull lifted the waking gate", 1, lifts)
+        assertEquals("the walk re-ran", 1, dashboardLoads)
+        assertTrue(vm.uiState.value.isRefreshing)
+
+        network.complete(Unit)
+        assertFalse(vm.uiState.value.isRefreshing)
+        assertEquals(250.0, vm.uiState.value.dashboardData?.currentFTP!!, 1e-9)
     }
 }

@@ -16,11 +16,14 @@ import org.junit.Assert.assertTrue
 import org.junit.Assert.fail
 import org.junit.Before
 import org.junit.Test
+import java.io.EOFException
 import java.io.IOException
+import java.net.ConnectException
 import java.net.SocketException
 import java.net.SocketTimeoutException
 import java.security.KeyPairGenerator
 import java.security.spec.ECGenParameterSpec
+import javax.net.ssl.SSLException
 
 /**
  * The state machine against scripted responses, no network.
@@ -841,6 +844,130 @@ class CloudSessionTest {
         val recovered = session.load(CloudRoute.Dashboard)
         assertEquals(CloudSnapshot.Source.network, recovered.source)
         assertEquals(5, transport.requests.size)
+    }
+
+    @Test
+    fun aColdStartGateIsLiftableByTheRidersPull() = runTest {
+        // The lift a rider asks for must actually work: it clears a cold start's
+        // gate, so the next read goes out immediately instead of waiting for the
+        // gate to expire. Removing the lift leaves this red.
+        val sleeps = mutableListOf<Long>()
+        makePairedSession(sleep = chargingSleep(sleeps)) { request ->
+            if (request.url.contains("/context/refresh")) {
+                CloudResponse(200, refreshJson("ctx-1", 300.0).toByteArray(), null, nowMillis)
+            } else {
+                nowMillis += 60_000
+                throw SocketTimeoutException("Read timed out")
+            }
+        }
+        expectFailure<CloudSession.Failure.Waking> { session.load(CloudRoute.Dashboard) }
+        // Inside the gate, a read costs no request and no new pause.
+        val inGate = transport.requests.size
+        expectFailure<CloudSession.Failure.Waking> { session.load(CloudRoute.Dashboard) }
+        assertEquals(inGate, transport.requests.size)
+        // The pull lifts the gate: the next read goes out now, not later.
+        session.retryNowIfWaking()
+        runCatching { session.load(CloudRoute.Dashboard) }
+        assertTrue("the pull lifted the gate, so a request went out", transport.requests.size > inGate)
+    }
+
+    @Test
+    fun aResetAsASslExceptionIsAWakeOnTheRefresh() = runTest {
+        // Over HTTPS a dropped connection surfaces as an SSLException, not a
+        // bare SocketException: the wake's first request still rides it out.
+        val sleeps = mutableListOf<Long>()
+        makePairedSession(sleep = chargingSleep(sleeps)) { request ->
+            if (request.url.contains("/context/refresh")) {
+                throw SSLException("Connection reset by peer")
+            }
+            CloudResponse(200, refreshJson("ctx-1", 300.0).toByteArray(), null, nowMillis)
+        }
+        cache.store(listOf(profileItem(4)), 4, CloudRoute.Dashboard, full = true, generation = 0)
+        val snapshot = session.load(CloudRoute.Dashboard)
+        assertEquals(CloudSnapshot.Source.cache, snapshot.source)
+        assertEquals(
+            "the reset was retried on the refresh",
+            2,
+            transport.requests.count { it.url.contains("/context/refresh") },
+        )
+        assertEquals(listOf(3_000L), sleeps)
+    }
+
+    @Test
+    fun aResetBuriedInTheCauseChainIsAWakeOnTheRefresh() = runTest {
+        // ... or the thrown IOException carries the reset as its cause; either
+        // way the refresh rides it out rather than reading it as the network.
+        val sleeps = mutableListOf<Long>()
+        makePairedSession(sleep = chargingSleep(sleeps)) { request ->
+            if (request.url.contains("/context/refresh")) {
+                throw IOException("SSL handshake", EOFException("Connection reset"))
+            }
+            CloudResponse(200, refreshJson("ctx-1", 300.0).toByteArray(), null, nowMillis)
+        }
+        cache.store(listOf(profileItem(4)), 4, CloudRoute.Dashboard, full = true, generation = 0)
+        val snapshot = session.load(CloudRoute.Dashboard)
+        assertEquals(CloudSnapshot.Source.cache, snapshot.source)
+        assertEquals(
+            "the wrapped reset was retried on the refresh",
+            2,
+            transport.requests.count { it.url.contains("/context/refresh") },
+        )
+        assertEquals(listOf(3_000L), sleeps)
+    }
+
+    @Test
+    fun aRefusedConnectionIsNotAWake() = runTest {
+        // A refused connection is the network, not a scaled-to-zero server: it
+        // is not retried as a wake and leaves no cold-start pause behind.
+        val sleeps = mutableListOf<Long>()
+        makePairedSession(sleep = chargingSleep(sleeps)) { request ->
+            if (request.url.contains("/context/refresh")) {
+                throw ConnectException("Connection refused")
+            }
+            CloudResponse(200, refreshJson("ctx-1", 300.0).toByteArray(), null, nowMillis)
+        }
+        cache.store(listOf(profileItem(4)), 4, CloudRoute.Dashboard, full = true, generation = 0)
+        val snapshot = session.load(CloudRoute.Dashboard)
+        assertEquals(CloudSnapshot.Source.cache, snapshot.source)
+        assertEquals(
+            "a refused connection is not retried as a wake",
+            1,
+            transport.requests.count { it.url.contains("/context/refresh") },
+        )
+        assertTrue("a refused connection leaves no cold-start pause", sleeps.isEmpty())
+    }
+
+    @Test
+    fun aColdStartRetryDoesNotGoOutForADepartedIdentity() = runTest {
+        // The rider signs out during the wake's 3s pause. The retry must not go
+        // out for the device that has already left.
+        var attempt = 0
+        makePairedSession(sleep = { ms ->
+            session.signOut()
+            nowMillis += ms
+        }) { _ ->
+            attempt += 1
+            if (attempt == 1) {
+                throw SocketException("Connection reset by peer")
+            }
+            throw AssertionError("the retry went out for a signed-out device")
+        }
+        expectFailure<CloudSession.Failure.NotPaired> { session.load(CloudRoute.Dashboard) }
+        assertEquals(1, attempt)
+    }
+
+    @Test
+    fun aColdStartGateIsNotBankedAgainstADepartedIdentity() = runTest {
+        // The rider signs out as the wake's retry lands: the timeout must not
+        // bank a gate against the identity that will pair next.
+        var attempt = 0
+        makePairedSession(sleep = { ms -> nowMillis += ms }) { _ ->
+            attempt += 1
+            if (attempt == 2) session.signOut()
+            throw SocketTimeoutException("Read timed out")
+        }
+        expectFailure<CloudSession.Failure.NotPaired> { session.load(CloudRoute.Dashboard) }
+        assertEquals(2, attempt)
     }
 
     @Test
