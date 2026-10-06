@@ -33,6 +33,9 @@ object PairingFailureMessage {
 
     private fun textForCloudSessionFailure(failure: CloudSession.Failure): String = when (failure) {
         is CloudSession.Failure.Offline -> OFFLINE
+        is CloudSession.Failure.Waking ->
+            // Independent of the code: the request never got an answer.
+            "The server is still starting up. Wait a moment and try again."
         is CloudSession.Failure.Throttled -> busy(failure.retryAfter)
         is CloudSession.Failure.ClockSkew ->
             "This device's clock is ${abs(failure.seconds).toInt()}s away from the server's. " +

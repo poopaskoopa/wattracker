@@ -61,4 +61,52 @@
     <string name="settings_device_label">Device Label</string>
     <string name="settings_server_url_label">Server Address (e.g. https://192.168.1.10:8000)</string>
     <string name="settings_token_label">Connector Token</string>
+
+    <!-- Dashboard Strings -->
+    <string name="metric_ftp">FTP</string>
+    <string name="metric_cp">CP</string>
+    <string name="metric_wprime">W′</string>
+    <string name="metric_weight">Weight</string>
+    <string name="metric_ctl">CTL</string>
+    <string name="metric_atl">ATL</string>
+    <string name="metric_tsb">TSB</string>
+
+    <string name="dashboard_chart_load_title">Training load</string>
+    <string name="dashboard_chart_curve_title">Power-duration curve</string>
+    <string name="dashboard_recent_rides_title">Recent rides</string>
+    <string name="dashboard_no_load_history">No load history yet</string>
+    <string name="dashboard_no_curve_data">No power data yet</string>
+
+    <string name="dashboard_cached_data_banner">Cached data · last synced %1$s</string>
+    <string name="dashboard_syncing">Syncing dashboard…</string>
+    <string name="dashboard_starting">Loading dashboard…</string>
+    <string name="dashboard_start_failed">The app could not finish starting up. Close and reopen it.</string>
+    <string name="dashboard_sync_failed">Failed to sync dashboard</string>
+    <string name="dashboard_throttled_notice">Rate limited — retry in %1$d seconds</string>
+    <string name="dashboard_waking_title">Waking up the cloud…</string>
+    <string name="dashboard_waking_notice">The cloud is still waking up. It usually takes under a minute; try again shortly.</string>
+    <string name="dashboard_unpaired_title">No backend paired</string>
+    <string name="dashboard_unpaired_note">Pair a cloud code or local desktop server in Settings to view training status and load.</string>
+    <string name="dashboard_removed_title">Device removed</string>
+    <string name="dashboard_removed_note">This device was removed from the backend. Re-pair in Settings to continue.</string>
+    <string name="dashboard_pair_cta">Open Settings</string>
+
+    <!-- Legend & Unit Labels -->
+    <string name="legend_ctl">CTL</string>
+    <string name="legend_atl">ATL</string>
+    <string name="legend_tsb">TSB</string>
+    <string name="legend_tss">TSS</string>
+    <string name="legend_last_90d">Last 90d</string>
+    <string name="legend_all_time">All-time</string>
+    <string name="legend_last_ride">Last ride</string>
+    <string name="legend_model">Model</string>
+
+    <string name="window_6_weeks">6 weeks</string>
+    <string name="window_6_months">6 months</string>
+    <string name="window_1_year">1 year</string>
+
+    <string name="unit_watts_np">W NP</string>
+    <string name="unit_tss">TSS</string>
+    <string name="unit_km">km</string>
+    <string name="unit_min">min</string>
 </resources>

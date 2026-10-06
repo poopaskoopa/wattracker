@@ -25,8 +25,8 @@
           "value": 248.0,
           "source": "Manual Training FTP setting",
           "zones": [
-            {"label": "Z1", "name": "Active Recovery", "pct": 0.55, "min": 0, "max": 136, "range": "0-136"},
-            {"label": "Z6", "name": "Anaerobic", "pct": 1.2, "min": 298, "max": null, "range": "≥298"}
+            {"label": "Z1", "name": "Active recovery", "pct": "<56%", "min": 0, "max": 138, "range": "≤138"},
+            {"label": "Z7", "name": "Neuromuscular", "pct": ">150%", "min": 375, "max": null, "range": "≥375"}
           ]
         },
         "heart_rate": {

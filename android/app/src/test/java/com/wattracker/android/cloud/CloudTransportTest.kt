@@ -1,8 +1,8 @@
 package com.wattracker.android.cloud
 
 import java.io.ByteArrayInputStream
-import java.io.IOException
 import java.io.InputStream
+import java.net.SocketTimeoutException
 import java.nio.charset.CharacterCodingException
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertNull
@@ -97,7 +97,9 @@ class CloudTransportTest {
             readCapped(EndlessStream(), cap = 65536, deadline = deadline) { now += 2_000L; now }
         }
         assertTrue("expected the deadline to cut the read off", body.isFailure)
-        assertTrue(body.exceptionOrNull() is IOException)
+        // A timeout, not a bare IOException: the session rides a timeout out as
+        // a wake, but reads a plain IOException as the network.
+        assertTrue(body.exceptionOrNull() is SocketTimeoutException)
     }
 
     @Test

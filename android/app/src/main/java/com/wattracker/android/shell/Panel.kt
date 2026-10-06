@@ -13,6 +13,7 @@ import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Text
+import androidx.compose.material3.pulltorefresh.PullToRefreshBox
 import androidx.compose.runtime.Composable
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -102,18 +103,15 @@ fun ScreenScaffold(
 fun ScrollableScreenScaffold(
     title: String,
     subtitle: String,
+    modifier: Modifier = Modifier,
+    isRefreshing: Boolean = false,
+    onRefresh: (() -> Unit)? = null,
     content: @Composable ColumnScope.() -> Unit,
 ) {
     val scrollState = rememberScrollState()
-    Column(
-        modifier = Modifier
-            .fillMaxSize()
-            .background(Palette.bg)
-            .verticalScroll(scrollState)
-            .padding(16.dp),
-        verticalArrangement = Arrangement.spacedBy(12.dp),
-        horizontalAlignment = Alignment.Start,
-    ) {
+    // The header and body every variant renders. [content] is a ColumnScope
+    // block, so it is invoked inside a Column in both paths.
+    val body: @Composable ColumnScope.() -> Unit = {
         Column(verticalArrangement = Arrangement.spacedBy(2.dp)) {
             Text(
                 text = title,
@@ -128,6 +126,41 @@ fun ScrollableScreenScaffold(
             )
         }
         content()
+    }
+    if (onRefresh == null) {
+        Column(
+            modifier = modifier
+                .fillMaxSize()
+                .background(Palette.bg)
+                .verticalScroll(scrollState)
+                .padding(16.dp),
+            verticalArrangement = Arrangement.spacedBy(12.dp),
+            horizontalAlignment = Alignment.Start,
+        ) {
+            body()
+        }
+    } else {
+        // A screen that can be refreshing (the cloud dashboard): the same
+        // scrollable body inside a pull-to-refresh box, so the rider can lift
+        // a gate a waking server set and re-run the walk.
+        PullToRefreshBox(
+            isRefreshing = isRefreshing,
+            onRefresh = onRefresh,
+            modifier = modifier
+                .fillMaxSize()
+                .background(Palette.bg),
+        ) {
+            Column(
+                modifier = Modifier
+                    .fillMaxSize()
+                    .verticalScroll(scrollState)
+                    .padding(16.dp),
+                verticalArrangement = Arrangement.spacedBy(12.dp),
+                horizontalAlignment = Alignment.Start,
+            ) {
+                body()
+            }
+        }
     }
 }
 

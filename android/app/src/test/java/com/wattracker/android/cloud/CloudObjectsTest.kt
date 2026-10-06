@@ -7,6 +7,7 @@ import com.wattracker.android.json.optString
 import com.wattracker.android.json.toJson
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
+import org.junit.Assert.assertNotNull
 import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
@@ -50,6 +51,8 @@ class CloudObjectsTest {
         val profile = (items.first { it.kind == CloudKind.Profile }.payload) as CloudPayload.Profile
         assertEquals(248.0, profile.value.resolvedFTP!!, 1e-9)
         assertEquals(2, profile.value.power?.zones?.size)
+        assertEquals("<56%", profile.value.power?.zones?.get(0)?.pct)
+        assertEquals(">150%", profile.value.power?.zones?.get(1)?.pct)
         assertNull(profile.value.power?.zones?.get(1)?.max)
         assertEquals(false, profile.value.heartRate?.available)
 
@@ -58,6 +61,56 @@ class CloudObjectsTest {
         assertEquals(3, power.size)
         assertNull(power[1]) // a recording gap stays a gap
         assertNull(stream.value.streams.cadence) // an unrecorded channel is absent, not empty
+    }
+
+    @Test
+    fun numericPctZoneDecodesPctAsNull() {
+        val json = JsonValue.parse("""{"label":"Z1","name":"Active recovery","pct":0.55,"min":0,"max":138,"range":"≤138"}""")
+        val zone = Zone.fromJson(json)
+        assertNull(zone.pct)
+        assertEquals("Active recovery", zone.name)
+    }
+
+    @Test
+    fun enDashPctZoneKeepsTheDisplayString() {
+        // A range zone is the desktop's display string with an en dash, not
+        // a hyphen, and it is passed through as-is. The shared vector has no
+        // en-dash zone (its count assertion limits it to two zones), so the
+        // case is inline here, as iOS pins it inline.
+        val json = JsonValue.parse("""{"label":"Z2","name":"Endurance","pct":"56–75%","min":140,"max":189,"range":"140–189"}""")
+        val zone = Zone.fromJson(json)
+        assertEquals("56–75%", zone.pct)
+        assertEquals(140.0, zone.min!!, 1e-9)
+        assertEquals(189.0, zone.max!!, 1e-9)
+        assertEquals("140–189", zone.range)
+    }
+
+    @Test
+    fun calendarDayWithMalformedWorkoutProfileDecodesLeniently() {
+        val json = JsonValue.parse(
+            """{
+              "id": "day-1",
+              "kind": "calendar_day",
+              "revision": 1,
+              "data": {
+                "date": "2024-05-01",
+                "workouts": [
+                  {
+                    "name": "Malformed Workout",
+                    "profile": ["not a json object", {"kind": "warmup", "duration_s": 300.0}]
+                  }
+                ]
+              }
+            }""",
+        )
+        val item = CloudItem.fromJson(json)
+        val day = (item.payload as CloudPayload.CalendarDay).value
+        val workouts = day.parsedWorkouts
+        assertNotNull(workouts)
+        assertEquals(1, workouts?.size)
+        val steps = workouts?.first()?.profile
+        assertEquals(1, steps?.size)
+        assertEquals("warmup", steps?.first()?.kind)
     }
 
     @Test
@@ -129,10 +182,25 @@ class CloudObjectsTest {
     @Test
     fun theRoutesThatServeDeltasAreExactlyTheMobileOnes() {
         assertEquals(
-            setOf(CloudRoute.Dashboard, CloudRoute.Volume, CloudRoute.Curve, CloudRoute.Activities),
+            setOf(CloudRoute.Dashboard, CloudRoute.Volume, CloudRoute.Curve, CloudRoute.Activities, CloudRoute.Calendar),
             CloudRoute.entries.filter { it.servesDeltas }.toSet(),
         )
         assertEquals("/api/v1/context/dashboard", CloudRoute.Dashboard.path)
+    }
+
+    @Test
+    fun calendarDayProfileVectorDecodes() {
+        val calendarProfileFixture = TestVectors.parse("calendar_day_profile.json")
+        val item = CloudItem.fromJson(calendarProfileFixture)
+        assertEquals(CloudKind.CalendarDay, item.kind)
+        val day = (item.payload as CloudPayload.CalendarDay).value
+        val workout = day.parsedWorkouts?.firstOrNull()
+        assertTrue(workout != null)
+        assertEquals("Threshold Intervals", workout?.name)
+        val steps = workout?.profile
+        assertTrue(steps != null && steps.isNotEmpty())
+        assertEquals("warmup", steps?.first()?.kind)
+        assertEquals("Warmup ramp", steps?.first()?.label)
     }
 
     @Test
@@ -167,7 +235,7 @@ class CloudObjectsTest {
         deleted = false,
         payload = CloudPayload.Profile(
             RiderProfile(
-                displayName = "Takazumi",
+                displayName = "rider",
                 ftp = null, // one publisher writes it, one doesn't; both legal
                 ftpWatts = 250.0,
                 power = MetricState(
@@ -176,8 +244,8 @@ class CloudObjectsTest {
                     source = "zwap8",
                     // Top zone is open-ended: max is a value (null), not a gap.
                     zones = listOf(
-                        Zone(label = "2", name = "Sweet Spot", pct = 88.0, min = 91.0, max = 104.0, range = "91-104%"),
-                        Zone(label = "5", name = "Neuromuscular", pct = 106.0, min = 106.0, max = null, range = null),
+                        Zone(label = "2", name = "Sweet Spot", pct = "88%", min = 91.0, max = 104.0, range = "91-104%"),
+                        Zone(label = "5", name = "Neuromuscular", pct = "106%", min = 106.0, max = null, range = null),
                     ),
                 ),
                 heartRate = MetricState(available = false, value = null, source = null, zones = null),

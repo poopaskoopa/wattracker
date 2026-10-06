@@ -1,9 +1,9 @@
 package com.wattracker.android.cloud
 
 import java.io.ByteArrayOutputStream
-import java.io.IOException
 import java.io.InputStream
 import java.net.HttpURLConnection
+import java.net.SocketTimeoutException
 import java.net.URL
 import java.time.ZonedDateTime
 import java.time.format.DateTimeFormatter
@@ -106,7 +106,9 @@ class HttpUrlCloudTransport(
             }
 
             val status = connection.responseCode
-            if (nowMillis() > deadline) throw IOException("the request exceeded the overall deadline")
+            // A timeout is a timeout: the session reads this as the server
+            // waking, not the network failing, and rides it out.
+            if (nowMillis() > deadline) throw SocketTimeoutException("the request exceeded the overall deadline")
             val stream = if (status in 200..299) connection.inputStream else connection.errorStream
             val body = stream?.use { readCapped(it, MAX_RESPONSE_BYTES, deadline, nowMillis) } ?: ByteArray(0)
             val retryAfter = connection.getHeaderField("Retry-After")
@@ -119,11 +121,29 @@ class HttpUrlCloudTransport(
     }
 
     companion object {
-        private const val CONNECT_TIMEOUT_MS = 15_000
-        private const val READ_TIMEOUT_MS = 30_000
+        // Sized for the read app's cold start, not for a warm server. It
+        // scales to zero when idle, and the first request after that waits
+        // 20-40s for a replica (longer just after a redeploy, while the
+        // image pulls) with no bytes flowing. At the old 15s connect / 30s
+        // read, that request timed out on every wake. 60s idle is 1.5x the
+        // slow end of a normal wake; 120s total leaves room for the body
+        // after a wake that used most of it. `CloudSession` retries a
+        // timeout once, so the rider waits at most about two minutes --
+        // with the cache on screen -- before giving up. The local transport
+        // keeps its own tighter bounds: the desktop does not scale to zero.
+        //
+        // The cost, and why it is left in place: a genuinely dead network is
+        // indistinguishable from a slow wake, so it also burns the full 60s
+        // before it is recognised, and a rider with no connectivity waits over
+        // two minutes before the failure is reported as `waking` rather than
+        // `offline`. iOS makes the same conflation, so this is parity, not a
+        // regression -- and the read app is the one that scales, so the wake,
+        // not the dead network, is the case to size for.
+        private const val CONNECT_TIMEOUT_MS = 60_000
+        private const val READ_TIMEOUT_MS = 60_000
 
         /** Headers to last byte: the whole request may not take longer than this. */
-        internal const val REQUEST_DEADLINE_MS = 60_000
+        internal const val REQUEST_DEADLINE_MS = 120_000
     }
 }
 
@@ -162,7 +182,9 @@ internal fun readCapped(
         val read = stream.read(chunk, 0, minOf(chunk.size, cap - out.size()))
         if (read == -1) break
         out.write(chunk, 0, read)
-        if (now() > deadline) throw IOException("the response exceeded the overall deadline")
+        // The whole request is a timeout when it out-runs its deadline, so
+        // this is a timeout too and not a plain failure.
+        if (now() > deadline) throw SocketTimeoutException("the response exceeded the overall deadline")
     }
     return out.toByteArray()
 }

@@ -44,7 +44,10 @@ private data class ActiveSession(
     val cookie: String,
     val originUrl: String,
     val token: String,
-)
+) {
+    override fun toString(): String =
+        "ActiveSession(cookie=[REDACTED], originUrl='$originUrl', token=[REDACTED])"
+}
 
 /**
  * Client for the rider's local desktop server reached via the connector protocol over HTTPS.
@@ -64,6 +67,7 @@ class LocalClient(
     @Volatile private var isRevoked: Boolean = false
     @Volatile private var lastSuccessfulRead: Long? = null
     @Volatile private var cachedState: CloudSnapshot? = null
+    @Volatile private var sessionIdentity = 0
 
     val credentials: LocalCredentials?
         get() = credentialsProvider()
@@ -81,10 +85,28 @@ class LocalClient(
     override val lastSuccess: Long?
         get() = lastSuccessfulRead
 
+    /**
+     * The identity of the local data: it changes when the desktop
+     * credentials are replaced or revoked ([reset] is the app's hook for
+     * both), the same contract as the cloud's.
+     */
+    override val identity: Int
+        get() = sessionIdentity
+
+    /** The desktop does not scale to zero; it is either up or it is not. */
+    override val mayBeWaking: Boolean
+        get() = false
+
+    override suspend fun retryNowIfWaking() {
+        // The desktop does not scale to zero; there is nothing to wake.
+    }
+
     fun reset() {
         activeSession = null
         cachedState = null
         lastSuccessfulRead = null
+        // New credential (or none): anything read under the old one is stale.
+        sessionIdentity += 1
     }
 
     fun markRemoved() {
@@ -231,6 +253,7 @@ class LocalClient(
         val items = mutableListOf<CloudItem>()
         var successCount = 0
         var lastError: Throwable? = null
+        var stateError: Throwable? = null
 
         try {
             val stateJson = getJson(cred, baseUrl, "/api/state")
@@ -239,11 +262,12 @@ class LocalClient(
             successCount++
         } catch (e: Exception) {
             if (e is CancellationException) throw e
+            stateError = e
             lastError = e
         }
 
         try {
-            val loadJson = getJson(cred, baseUrl, "/api/load", mapOf("months" to "3"))
+            val loadJson = getJson(cred, baseUrl, "/api/load", mapOf("months" to "12"))
             if (loadJson is JsonValue.Array) {
                 loadJson.values.forEachIndexed { idx, elem ->
                     if (elem is JsonValue.Object) {
@@ -284,6 +308,9 @@ class LocalClient(
             lastError = e
         }
 
+        if (stateError != null && items.none { it.kind == CloudKind.TrainingState }) {
+            throw stateError
+        }
         val err = lastError
         if (successCount == 0 && err != null) {
             throw err

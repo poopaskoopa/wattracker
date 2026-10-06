@@ -1,6 +1,11 @@
 package com.wattracker.android.cloud
 
+import java.io.EOFException
 import java.io.IOException
+import java.net.ConnectException
+import java.net.SocketException
+import java.net.SocketTimeoutException
+import javax.net.ssl.SSLException
 import kotlin.math.abs
 import kotlin.math.max
 import kotlin.math.min
@@ -8,9 +13,11 @@ import kotlin.math.pow
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
+import kotlin.time.Duration.Companion.milliseconds
 
 /** A route's objects as the app should render them right now. */
 data class CloudSnapshot(
@@ -43,6 +50,12 @@ data class CloudSnapshot(
  * `Dispatchers.IO` in the client, the stores via [onIo] -- so concurrent
  * callers overlap instead of queuing behind a page walk.
  *
+ * The read app scales to zero, so the first request after an idle spell
+ * meets a sleeping server. That is not a failure: it is ridden out -- one
+ * retry after [coldStartRetryDelay], then a flat [coldStartBackoff] gate
+ * labelled "waking" -- instead of earning the escalating backoff a refusal
+ * earns, and it never counts toward the two-strike removal.
+ *
  * The disk writes are generation-stamped: the cache refuses a write from an
  * identity older than one already committed, so a read that is still in flight
  * cannot put a wiped device's objects back after a removal or re-pairing.
@@ -54,6 +67,7 @@ class CloudSession(
     private val removalGate: RemovalGate = InMemoryRemovalGate(),
     private val clock: () -> Long = { System.currentTimeMillis() },
     private val random: () -> Double = { Math.random() },
+    private val sleep: suspend (Long) -> Unit = { delay(it.milliseconds) },
 ) : ReadSession {
 
     // MARK: - State
@@ -71,6 +85,15 @@ class CloudSession(
         class Offline : Failure("No connection")
         class Throttled(val retryAfter: Double) :
             Failure("The server asked for ${retryAfter.toInt()}s before the next try")
+
+        /**
+         * The read app did not answer in time, twice: it is most likely
+         * still starting after scaling to zero. The short flat gate that
+         * follows is [coldStartBackoff], and it never escalates.
+         */
+        // The rider-facing text lives in `dashboard_waking_notice`; this is
+        // the internal reason only, so the two do not drift apart.
+        class Waking : Failure("The cloud is still waking up")
         class ClockSkew(val seconds: Double) :
             Failure("This device's clock is ${seconds.toInt()}s off the server's")
         class Server(val status: Int) : Failure("HTTP $status")
@@ -88,9 +111,15 @@ class CloudSession(
 
     // Everything else is touched only inside the mutex.
     private val mutex = Mutex()
-    private var lifecycleGeneration = 0
+    // @Volatile: [identity] reads it without the lock, and a reader that
+    // misses a bump only ever costs itself a walk the session's own checks
+    // refuse -- never a stale write or a false removal.
+    @Volatile private var lifecycleGeneration = 0
     private var mintCount = 0
     private var nextAttemptAllowedAt: Long? = null
+    // Whether [nextAttemptAllowedAt] was set by a cold start rather than by a
+    // refusal. Only that kind of gate may be lifted by the rider.
+    private var gateIsColdStart = false
     private var consecutiveFailures = 0
     private var consecutiveRejections = 0
     private val activityObjects = HashMap<String, CloudItem>()
@@ -129,6 +158,37 @@ class CloudSession(
         get() = device != null
 
     /**
+     * The current lifecycle identity, read without the lock on purpose: a
+     * caller deciding whether to join an in-flight load must not block
+     * behind a network call. It changes when the credential behind the
+     * data is replaced -- pairing, sign-out, removal -- so a load started
+     * under an older identity is stale even while it is still running.
+     */
+    override val identity: Int
+        get() = lifecycleGeneration
+
+    /**
+     * Whether this backend can be asleep when asked, so a slow first answer
+     * is the server waking rather than something wrong. Only the cloud read
+     * app scales to zero; the rider's desktop is either up or it is not.
+     */
+    override val mayBeWaking: Boolean
+        get() = true
+
+    /**
+     * The rider asked (pull to refresh): lift a backoff that a waking server
+     * caused, so the next read goes out now. A backoff the server asked for
+     * with 429/503 is not the rider's to shorten and stays in force.
+     */
+    override suspend fun retryNowIfWaking() {
+        mutex.withLock {
+            if (!gateIsColdStart) return
+            nextAttemptAllowedAt = null
+            gateIsColdStart = false
+        }
+    }
+
+    /**
      * Last-known data, with no network attempt at all.
      *
      * This is what a cold start renders first: the screens have something real
@@ -136,10 +196,30 @@ class CloudSession(
      * with the reconciled result. It reads one small store and cannot fail --
      * an unreadable cache is simply nothing. Suspend so the Room read happens
      * off the caller's (possibly main) thread.
+     *
+     * Only for the current identity: a sign-out or removal's disk wipe can
+     * still be in flight, and the rows on disk then belong to the device
+     * that left, not the one that will pair next.
      */
     override suspend fun cached(route: CloudRoute): CloudSnapshot? {
+        val (readDevice, readGeneration) = mutex.withLock {
+            val dev = device
+            if (state != DeviceState.paired || dev == null) return null
+            dev to lifecycleGeneration
+        }
         val stored = onIo { cache.load(route) } ?: return null
-        return CloudSnapshot(route, stored.revision, stored.items, CloudSnapshot.Source.cache, stored.storedAt)
+        // The read is off-thread, so a sign-out or re-pair can land in the
+        // window between the paired-check above and here (its disk wipe may
+        // not have run yet), which would make the rows the departed identity's.
+        // Re-check under the lock so the guarantee holds without each caller
+        // having to re-read the identity itself.
+        return mutex.withLock {
+            if (state != DeviceState.paired || device != readDevice || lifecycleGeneration != readGeneration) {
+                null
+            } else {
+                CloudSnapshot(route, stored.revision, stored.items, CloudSnapshot.Source.cache, stored.storedAt)
+            }
+        }
     }
 
     /**
@@ -192,6 +272,7 @@ class CloudSession(
             consecutiveFailures = 0
             consecutiveRejections = 0
             nextAttemptAllowedAt = null
+            gateIsColdStart = false
             activityObjects.clear()
             pairing.device
         }
@@ -223,10 +304,15 @@ class CloudSession(
                 RemoveDeviceResult.ServerRevoked
             }
             is CloudApiResult.Failure -> {
-                if (result.status == 404) {
-                    // The rider asked for this phone to stop reading, and that can be done without the server:
-                    // on 404 (e.g., missing route or credential unknown on server), fall back to local signOut().
-                    signOut()
+                val isTrustedDate = result.serverDateMillis != null &&
+                    Math.abs(now() - result.serverDateMillis) / 1000.0 <= clockSkewTolerance
+                if ((result.status == 404 || result.status == 401) && isTrustedDate) {
+                    // Complete removal locally only if the session hasn't re-paired mid-flight
+                    val newGeneration = mutex.withLock {
+                        if (lifecycleGeneration != generation) throw lifecycleFailure()
+                        signOutState()
+                    }
+                    removeDisk(newGeneration)
                     RemoveDeviceResult.LocalFallback
                 } else {
                     throw Failure.Server(result.status)
@@ -313,7 +399,7 @@ class CloudSession(
                     return current
                 }
                 val allowed = nextAttemptAllowedAt
-                if (allowed != null && allowed > now()) throw Failure.Throttled((allowed - now()) / 1000.0)
+                if (allowed != null && allowed > now()) throw gated(until = allowed)
                 val running = pendingRefresh
                 if (running != null && running.isActive) {
                     RefreshDecision.Join(running)
@@ -377,12 +463,41 @@ class CloudSession(
             (device ?: throw Failure.NotPaired()) to lifecycleGeneration
         }
         val result = try {
-            client.refreshReaderContext(refreshDevice)
+            // The refresh is the first request after every idle spell -- a
+            // reader context outlives no scale-down -- so it is the one that
+            // meets a sleeping server, and the one that rides it out.
+            ridingOutColdStart(firstRequest = true) {
+                // The retry lands after the cold-start pause; the identity may
+                // have changed in that window (a sign-out or re-pair). Never
+                // sign a refresh for a departed device -- the new identity
+                // refreshes on its own.
+                val gone = mutex.withLock {
+                    if (!isCurrent(refreshDevice, refreshGeneration)) lifecycleFailure() else null
+                }
+                if (gone != null) throw gone
+                client.refreshReaderContext(refreshDevice)
+            }
         } catch (e: Failure) {
+            throw e
+        } catch (e: CancellationException) {
+            // The caller was cancelled, possibly during the cold-start
+            // pause: neither the network nor the server, and it leaves no
+            // gate behind.
             throw e
         } catch (e: IOException) {
             // A transport error is the network, not the credential: it must
-            // never move this device toward `removed`.
+            // never move this device toward `removed`. A timeout is not even
+            // the network: it is the server waking, and gets the short gate.
+            // But if the identity changed while the refresh rode out, neither
+            // a gate nor a failure may be banked against the departed device:
+            // that would gate the new identity's first read.
+            val gone = mutex.withLock {
+                if (!isCurrent(refreshDevice, refreshGeneration)) lifecycleFailure() else null
+            }
+            if (gone != null) throw gone
+            if (isColdStart(e, firstRequest = true)) {
+                throw mutex.withLock { noteColdStart() }
+            }
             mutex.withLock { noteFailure(retryAfter = null) }
             throw Failure.Offline()
         }
@@ -397,6 +512,7 @@ class CloudSession(
                         consecutiveFailures = 0
                         consecutiveRejections = 0
                         nextAttemptAllowedAt = null
+                        gateIsColdStart = false
                         mintCount += 1
                         val fresh = ReaderToken(
                             value = result.value.readerContext,
@@ -500,6 +616,7 @@ class CloudSession(
         consecutiveFailures = 0
         consecutiveRejections = 0
         nextAttemptAllowedAt = null
+        gateIsColdStart = false
         activityObjects.clear()
         return lifecycleGeneration
     }
@@ -514,6 +631,7 @@ class CloudSession(
         consecutiveFailures = 0
         consecutiveRejections = 0
         nextAttemptAllowedAt = null
+        gateIsColdStart = false
         activityObjects.clear()
         return lifecycleGeneration
     }
@@ -523,7 +641,9 @@ class CloudSession(
      * (clamped so a malformed value cannot overflow the arithmetic); otherwise
      * it is exponential with equal jitter (the floor is half the ceiling, not
      * one second -- full jitter's near-zero tail made two-strike removal a coin
-     * flip).
+     * flip). Never shortens a gate already in force, and always marks the gate
+     * the server's: a refusal is a refusal, whatever was gating before, so a
+     * rider's pull can no longer lift it.
      */
     private fun noteFailure(retryAfter: Double?) {
         consecutiveFailures += 1
@@ -535,12 +655,123 @@ class CloudSession(
             ceiling / 2 + random() * (ceiling / 2)
         }
         val delay = raw.coerceIn(0.0, maximumBackoffCeiling)
-        nextAttemptAllowedAt = now() + (delay * 1000).toLong()
+        // Never shorten a gate already in force. Only a request that was in
+        // flight when the gate went up can land here, and its answer does not
+        // repeal the earlier one: a concurrent 429 must not cut short the gap
+        // a 404 strike set before the second strike may be taken, nor the
+        // reverse.
+        val proposed = now() + (delay * 1000).toLong()
+        val existing = nextAttemptAllowedAt
+        nextAttemptAllowedAt = if (existing != null && existing > proposed) existing else proposed
+        gateIsColdStart = false
     }
 
     private fun pendingDelay(): Double {
         val allowed = nextAttemptAllowedAt ?: return baseBackoff
         return max((allowed - now()) / 1000.0, 0.0)
+    }
+
+    // MARK: - Riding out the cold start
+
+    /**
+     * The server did not answer in time, even on the retry.
+     *
+     * Deliberately none of what [noteFailure] does: no escalation, since a
+     * server that is starting is not one that needs to be left alone for
+     * five minutes; and -- like every transport error -- no strike toward
+     * removal, since a timeout says nothing about the credential.
+     *
+     * And never weaker than a gate already in force. A collection page's
+     * second timeout lands two minutes after it started, long after a
+     * concurrent read may have been told `Retry-After` or a refresh may have
+     * taken a 404 strike. Relabelling that gate as a cold start's would let
+     * [retryNowIfWaking] lift it, so a gate that is not a cold start's is
+     * left exactly as it is, and a cold start's is only ever extended.
+     *
+     * Under the mutex. Returns what the caller should hear: the gate actually
+     * in force.
+     */
+    private fun noteColdStart(): Failure {
+        val now = now()
+        val proposed = now + (coldStartBackoff * 1000).toLong()
+        val existing = nextAttemptAllowedAt
+        if (existing != null && existing > now) {
+            if (gateIsColdStart) {
+                nextAttemptAllowedAt = max(existing, proposed)
+            }
+        } else {
+            nextAttemptAllowedAt = proposed
+            gateIsColdStart = true
+        }
+        return gated(until = nextAttemptAllowedAt ?: proposed)
+    }
+
+    /** Under the mutex. */
+    private fun gated(until: Long): Failure {
+        if (gateIsColdStart) return Failure.Waking()
+        return Failure.Throttled((until - now()) / 1000.0)
+    }
+
+    /**
+     * Whether [e] is how a request to a scaled-to-zero server fails.
+     *
+     * A timeout, always. A dropped connection only on the first request of a
+     * wake -- the refresh -- where the ingress can cut a connection it was
+     * holding for a replica that has not come up. A refused connection or an
+     * unresolvable host is the network, not the wake. Later in a read a
+     * dropped connection is just a dropped connection.
+     */
+    private fun isColdStart(e: IOException, firstRequest: Boolean): Boolean {
+        // A timeout is a timeout wherever it lands -- in a read, on the
+        // request's overall deadline, or wrapped by the TLS layer -- so look
+        // past the top-level exception, not just at it.
+        if (inCauseChain(e) { it is SocketTimeoutException }) return true
+        // A dropped connection counts only on the wake's first request (the
+        // refresh), where the ingress can cut a connection it was holding for
+        // a replica that has not come up. Over HTTPS the reset surfaces as an
+        // SSLException, or as the cause of the thrown IOException; a refused
+        // connection (ConnectException) is the network, not the wake.
+        return firstRequest && inCauseChain(e) { isDroppedConnection(it) }
+    }
+
+    private fun isDroppedConnection(t: Throwable): Boolean =
+        t is EOFException ||
+            (t is SocketException && t !is ConnectException) ||
+            t is SSLException
+
+    /** [e] and its causes, to a hop limit so a cyclic cause cannot loop. */
+    private fun inCauseChain(e: Throwable, match: (Throwable) -> Boolean): Boolean {
+        var current: Throwable? = e
+        var hops = 0
+        while (current != null && hops < 8) {
+            if (match(current)) return true
+            current = current.cause
+            hops++
+        }
+        return false
+    }
+
+    /**
+     * [send], and once more after [coldStartRetryDelay] if it failed the way a
+     * waking server fails. Whatever the retry throws is the caller's to
+     * classify. A caller cancelled during the pause rethrows its own
+     * cancellation and leaves no gate behind.
+     */
+    private suspend fun <T> ridingOutColdStart(
+        firstRequest: Boolean,
+        send: suspend () -> T,
+    ): T {
+        return try {
+            send()
+        } catch (e: CancellationException) {
+            throw e
+        } catch (e: IOException) {
+            if (!isColdStart(e, firstRequest)) throw e
+            // The replica keeps starting after the client gives up, so the
+            // retry lands on a warmer server.
+            sleep((coldStartRetryDelay * 1000).toLong())
+            send()
+        }
     }
 
     private fun isCurrent(device: PairedDevice, lifecycleGeneration: Int): Boolean =
@@ -567,7 +798,7 @@ class CloudSession(
         mutex.withLock {
             activityObjects[objectId]?.let { return it }
             nextAttemptAllowedAt?.let { allowed ->
-                if (allowed > now()) throw Failure.Throttled((allowed - now()) / 1000.0)
+                if (allowed > now()) throw gated(until = allowed)
             }
         }
         val attempt = context(after = null)
@@ -626,7 +857,7 @@ class CloudSession(
     ): CloudSnapshot {
         mutex.withLock {
             nextAttemptAllowedAt?.let { allowed ->
-                if (allowed > now()) throw Failure.Throttled((allowed - now()) / 1000.0)
+                if (allowed > now()) throw gated(until = allowed)
             }
         }
         // A delta is asked for only where the route serves one AND there is
@@ -667,7 +898,9 @@ class CloudSession(
      * One page, with exactly one forced refresh if the reader context was the
      * problem. This path deliberately never counts toward revocation: only the
      * signed refresh, which proves possession of the device key, is allowed to
-     * decide that this device is gone.
+     * decide that this device is gone. A timeout on the walk is the server
+     * waking, and is ridden out the way a refresh's is: once more after
+     * [coldStartRetryDelay], then the short flat gate -- never a strike.
      */
     private suspend fun page(
         route: CloudRoute,
@@ -677,10 +910,18 @@ class CloudSession(
     ): CollectionResponse {
         val attempt = context(after = null)
         val result = try {
-            client.collection(route, attempt.value, device, since, cursor)
+            ridingOutColdStart(firstRequest = false) {
+                client.collection(route, attempt.value, device, since, cursor)
+            }
         } catch (e: Failure) {
             throw e
+        } catch (e: CancellationException) {
+            throw e
         } catch (e: IOException) {
+            // The retry also timed out: the server is waking, not failing.
+            if (isColdStart(e, firstRequest = false)) {
+                throw mutex.withLock { noteColdStart() }
+            }
             throw Failure.Offline()
         }
         return when (result) {
@@ -732,6 +973,28 @@ class CloudSession(
         const val maximumBackoff: Double = 300.0
         /** Upper bound on any backoff, so `delay * 1000` can never overflow. */
         const val maximumBackoffCeiling: Double = 86_400.0
+        /**
+         * Riding out a cold start.
+         *
+         * The read app scales to zero, and the first request after an idle
+         * spell waits 20-40s (longer just after a redeploy, while the image
+         * pulls) for a replica. That request timing out says "the server is
+         * waking", not "the server is failing", so it is retried once after
+         * this short pause -- the replica keeps starting after the client
+         * gives up, so the retry lands on a warmer server -- instead of
+         * earning [baseBackoff].
+         */
+        const val coldStartRetryDelay: Double = 3.0
+
+        /**
+         * The gate left after the retry also timed out. Short and flat, never
+         * escalating: two minutes of timeouts already passed before it is
+         * set, the cache is on screen meanwhile, and the replica is still
+         * coming up. It exists only so every screen does not immediately
+         * queue another two-minute wait behind the one that just ended.
+         */
+        const val coldStartBackoff: Double = 10.0
+
         const val rejectionsBeforeRemoval: Int = 2
         const val maximumPages: Int = 50
     }

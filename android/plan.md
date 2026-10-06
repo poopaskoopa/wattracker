@@ -4,29 +4,46 @@ Epic #192 and sub-issues #193–#199, plus the owner's
 extra targets: Android 11+, dual-server support (cloud **and** local), offline
 cache. Kotlin + Jetpack Compose, single app under `android/`.
 
-**Resume point — Step 2 (#194) merged via PR #304. Step 3 (#195) — Cloud & Local Pairing and Settings — is implemented on `feature/android-client-3`.**
-PR #376 review findings addressed:
-1. **Blocker 1 — Redact secrets in `.toString()`**: Overrode `toString()` on `LocalCredentials`, `LocalRequest`, and `LocalResponse` to redact `token`, `Authorization`, `Cookie`, and `Set-Cookie` headers, as well as `token=` URL query parameters. Extended `bearerSecretsDoNotAppearInToString` test coverage.
-2. **Blocker 2 — Secure Token Input in Settings UI**: Updated connector token field in `SettingsScreen.kt` with `KeyboardType.Password`, `autoCorrectEnabled = false`, and `PasswordVisualTransformation()`.
-3. **Nit 3 — Origin-tied cookies & Stale revocation protection**: `LocalClient` holds `ActiveSession(cookie, originUrl, token)` atomically and passes request-scoped credentials through `getJson` and `authenticate(cred)`. Pinned with unit test `rePairingDuringInFlightReadDoesNotSendNewServerCookieToOldServer`.
-4. **Nit 4 — Revoked local device state**: `LocalClient.deviceState` returns `CloudSession.DeviceState.removed` upon revocation or refusal. Unit tests verify `DeviceState.removed`.
-5. **Nit 5 — Unpinned redirect & same-origin tests**: Added `HttpLocalTransport` unit test verifying `instanceFollowRedirects = false` and `authenticate()` unit test verifying external redirect rejection.
-6. **Nit 6 — Cloud remove 404 fallback**: Moved 404 fallback into `CloudSession.removeDevice()`, returning `RemoveDeviceResult.LocalFallback` on 404 while throwing `Failure.Server` / `Failure.Offline` on 401/5xx/offline to preserve local pairing. Pinned by unit tests for 200, 404, 500, and offline.
-7. **Nit 7 — Plan & Issue alignment**: Updated `plan.md` (e.g., token revocation returns `removed` state; uniform oracle-prevention message for pairing failures matching security spec).
+## Agent tooling notes (PowerShell + `gh`, git pager)
 
-Review findings addressed; known gaps listed below:
-1. **Cloud revocation 404 fallback**: `CloudSession.removeDevice()` returns `RemoveDeviceResult.LocalFallback` on 404/DeviceRemoved; 401/5xx/offline errors do not clear credentials.
-2. **Local session expiration & revocation**: `LocalClient` detects 3xx redirects to `/login`, clears session cookie, and re-mints once. Token revocation returns 401 / removed state, clears stored local credentials, and resets in-memory session state.
-3. **Async safety**: All `scope.launch` blocks in `SettingsScreen.kt` wrap calls in `try-catch`.
-4. **Local dashboard errors**: `loadDashboard()` propagates errors if all fetches fail; `lastSuccessfulRead` advances when at least one fetch succeeds (see 11).
-5. **Local URL validation**: Rejects HTTP in release builds with reverse-proxy guidance message pointing to README.md.
-6. **Token redaction**: Query string (`?token=...`) is sanitized in `UnexpectedLanding` exception messages.
-7. **Local Client Reset**: Added `reset()` to clear session cookie and cached state on removal/re-pairing.
-8. **Restored comments & abstract interface methods**: Restored load-bearing KDoc comments across stores and application initialization. Made `saveLocal`/`clearLocal` abstract.
-9. **UI Strings & Mappers**: Moved string literals to `strings.xml`. Created distinct `LocalPairingFailureMessage` and `RemoveDeviceFailureMessage` mappers.
-10. **Unit Tests**: 117 unit tests passing (`:app:testDebugUnitTest`). `:app:assembleDebug` and `:app:assembleRelease -PallowPlaceholderHost` green.
-11. **Step 4 Known Gap Note**: Partial dashboard loads (where 1 of 4 fetches succeeds) return `Source.network` and advance `lastSuccess` in Step 3; full fixture shape pinning and multi-endpoint reconciliation will be finalized in Step 4.
-12. **Follow-Up Note**: Unit test coverage for cloud device remove fallback (404 -> signOut(), offline -> throws with no local clear) and proxy-specific 401 distinction are noted for follow-up issues.
+**Using `gh` from PowerShell.** The IDE's shell tool runs
+`powershell.exe -Command <cmd>`; PowerShell's native-argument handling and
+stdout capture both get in the way:
+
+- Prefer the `cmd` shell for `gh` calls: arguments pass through unharmed,
+  and `>` redirection writes `gh`'s raw UTF-8 bytes to a file.
+- Keep `--jq` trivial in PowerShell (a bare `--jq .field`, or no `--jq`
+  with `--json a,b,c`): a double-quoted jq expression arrives mangled (one
+  session turned `--jq "title, headRefName"` into a PowerShell
+  expression). Parse the JSON output yourself if you need more.
+- Never capture `gh` output containing non-ASCII into a PowerShell
+  variable: native stdout is decoded with the console code page, and a PR
+  body comes back mojibake (`WΓÇ▓` where `W′` was). Redirect to a file in
+  cmd (`gh pr view N --json body --jq .body > body.txt`), then process it
+  with .NET UTF-8: `[System.IO.File]::ReadAllText($p,
+  [Text.Encoding]::UTF8)` and `WriteAllText(..., New-Object
+  Text.UTF8Encoding($false))` (no BOM), then `gh pr edit N --body-file
+  body.txt`.
+- `;` is the command separator in PowerShell, `&` in cmd; neither stops on
+  failure, so verify intermediate results when a later step depends on an
+  earlier one (a failed `git reset` still lets the queued `git commit`
+  run, and stacks junk on the old history).
+- `String.Replace` that swaps same-length text cannot be verified by
+  comparing lengths; check with `Contains`.
+- For multi-paragraph commit messages, write the message to an
+  LF-terminated, BOM-less file and use `git commit -F file`: repeated `-m`
+  paragraphs are stored as single unwrapped lines (hundreds of characters
+  long), not wrapped.
+
+**Git: disable the pager.** The shell runs in a pseudo-terminal, so
+`git show`, `git log`, `git diff` and friends open the pager and hang
+until the command timeout kills them. Always prefix `git --no-pager`, e.g.
+`git --no-pager log --oneline -5`; for a whole session, set `GIT_PAGER=`
+to empty instead.
+
+**Resume point — Step 4 (#196) Dashboard is open as PR #419 on `feature/android-client-4`. Steps 1–3 are merged: Step 2 (#194) via PR #304, Step 3 (#195) via PR #376 (landed through #403, `8722198`).** #195 stays open for its device check. The Step 4 implementation notes, the PR #419 review (2026-09-30) and its fixes (2026-10-04), verification and known gaps are under "Step 4 — Dashboard screen" below.
+
+Step 3 context: merged via PR #376 (landed through #403). Cloud and local pairing, the Settings screen, and the removed state (#153, `markRemoved()`). The review findings and their resolutions are on PR #376; the durable ones are: every type holding a bearer secret (`LocalCredentials`, `LocalRequest`, `LocalResponse`, `ActiveSession`) redacts it in `toString()`; the connector-token field is a password field; a local session cookie is reused only for the origin and token it was minted for; a local 401 reports `removed`, not `unpaired`.
 
 Step 2 context: merged via PR #304 (`4629ed5`). `CloudSession` (single-flight refresh, conservative two-strike revocation, generation-stamped cache writes), `CloudClient` plus a capped, redirect-free transport, the Room snapshot cache keyed on the server revision, the EncryptedSharedPreferences credential store, the forward-compatible JSON value model, and `WatTrackerApplication` wiring with Tink R8 keep rules and an exported Room schema — unit-tested against scripted responses.
 Step-1 context: #266 landed via **#294 (`ff1f2aa`)**; #193 is closed
@@ -297,8 +314,7 @@ since the 2026-09-01 draft:
    kinds; Python and Swift suites read it and the Kotlin tests read it too.
    The object-kind list is corrected — `race` and `scheduled_workout` were
    never standalone published kinds (a race is the `calendar_day.race` field).
-7. **The local `GET /api/calendar` route still does not exist** — the Step 6
-   server PR is still required (code locations updated).
+7. **The local `GET /api/calendar` route exists** — implemented in `wattracker/server.py` (since commit `32444f7`), returning `{"weeks": ...}` from the same builder as the web calendar.
 
 ---
 
@@ -316,7 +332,7 @@ since the 2026-09-01 draft:
 | App id | `com.wattracker.android` (mirrors `com.wattracker.ios`). |
 | Third-party deps | None beyond AndroidX, Kotlin stdlib, and (Step 2) androidx.room + androidx.security. No Retrofit/OkHttp/Koin/Coil — the epic's dependency rule. |
 | IDE agent | **Android Studio 4's built-in Agent mode with BYOK** (owner, 2026-09-06). First-party, supported feature of the IDE — not a community plugin, no MCP servers, no npm bridges, no `.kilo` MCP registration. The owner's API key lives in IDE-local settings only, never in the repo. Dev accelerator, not infrastructure: every Done criterion stands on `./gradlew` + `adb`, which is also what CI runs. |
-| Local calendar data | Owner-approved (2026-09-01, unchanged): **extract the month builder out of `calendar_view` and serve it from a new read-only `GET /api/calendar?year=&month=` JSON route** in `wattracker/server.py`, so the HTML page and the app render the same data by construction. Verified still absent on 2026-09-06. Lands as a small server PR (green Python suite) before Step 6; it is the one local-backend exception to "no server changes". |
+| Local calendar data | **`GET /api/calendar?year=&month=` route exists** in `wattracker/server.py` (since `32444f7`), returning `{"weeks": ...}` from the same builder as the web calendar. |
 
 ## Issue state (issue labels as of the 2026-09-14 `gh` check; branch rebased onto `52996a7`, 2026-09-14)
 
@@ -1453,6 +1469,195 @@ and shows up flagged in `GET /api/v1/devices`; re-pairing is clean.
   authoritative — a delta can withdraw; tombstones/absence win over stored
   ghosts).
 
+### Step 4 — implementation notes (2026-09-30, `feature/android-client-4`)
+
+**Loading model.** `DashboardViewModel` is obtained with
+`viewModel(key = activeSource.name, factory = …)`, so it lives in the nav
+entry's `ViewModelStore`. Dashboard is the start destination and the tab
+navigation pops to it with `saveState = true`, so that entry, and the view
+model with it, lasts the whole process. Two consequences are designed in:
+- **It reloads on every `ON_RESUME`, and only then.** The screen observes its
+  lifecycle and calls `refresh()`. The observer receives `ON_RESUME` as soon as
+  it is added, so that is also the first load. The view model deliberately does
+  **not** load in `init`: both together start two full dashboard walks on every
+  cold start. A resume is how a pairing, sign-out or removal done in Settings
+  reaches this screen, so without it the Dashboard showed the state from app
+  start until the process died.
+- **A refresh cancels the load in flight.** Only the newest load has read the
+  current pairing state. `CloudSession.load` serves the cache when its network
+  step fails, and cancellation counts as a failure there, so a cancelled load
+  can still *return normally*; `checkActive()` after every read is what keeps
+  its stale result off the screen.
+
+**The read model is awaited, never blocked on.** `WatTrackerApp.readModel()`
+waits on the app's setup (Room, Keystore, EncryptedSharedPreferences), which
+runs off the main thread. The screen gets it with `produceState` and shows the
+starting card meanwhile; a setup failure shows `dashboard_start_failed` rather
+than crashing composition.
+
+**Recent rides.** The cloud dashboard route publishes only `profile`,
+`training_state`, `load_point` and `curve` (`wattracker/cloud/api.py`
+`_CONTEXT_KINDS`), so the strip reads the Activities route; the local dashboard
+adapter includes the latest five itself. Whether to fetch Activities is
+decided on the *fresh dashboard snapshot*, never on what is on screen: the
+rides already shown are kept only for display while the fetch runs, then
+replaced outright (a withdrawn ride disappears). Every list is sorted newest
+first by `startTime`, because the cache returns objects sorted by id as text.
+
+**Load chart.** CTL/ATL/TSB lines over daily TSS bars, all on **one y axis**
+(`loadAxisRange`, which includes TSS and always 0), matching the desktop's
+one-chart-one-axis rule. The canvas clips to its bounds.
+
+**States.** Starting, unpaired (pair CTA), removed (#153, checked *before*
+unpaired: a removal also clears `isPaired`), loading over cache ("Syncing…"),
+cache ("Cached data · last synced …"), rate-limited (`Retry-After` seconds from
+`Failure.Throttled`), and error. A `DeviceRemoved` or `NotPaired` found by any
+load, the Activities fetch included, clears the data from the screen.
+
+**Also on this branch (from the #192 parity brief, 2026-09-29).** Calendar
+marked `servesDeltas` (#386); `Zone.pct` decoded as the desktop's display
+string, a numeric value reading as absent, as iOS does (#412), and
+`tests/vectors/cloud_objects_v1.json` updated to real `zones.py` strings (two
+zones, Z1 and the open-ended Z7, which is what the iOS test asserts);
+`calendar_day` workout `profile` decoded leniently (`CalendarWorkout`,
+`WorkoutStep`), tested against `tests/vectors/calendar_day_profile.json`;
+`removeDevice()` finishes locally on a 401/404 only with a `Date` within
+`clockSkewTolerance` and only if no re-pair happened mid-flight (#410); the
+release cloud host is read from `-PwattrackerCloudAuthority` or
+`local.properties` (gitignored), keeping the `.example` guard.
+
+**Verification.** `:app:testDebugUnitTest` 151 passed, 0 failed;
+`:app:assembleDebug` and `:app:assembleRelease -PallowPlaceholderHost` green;
+the Python tests that read the shared vectors pass. Mutation-proved locally
+(each fix reverted, the named test red, then restored):
+
+| Mutation | Test that goes red |
+|---|---|
+| Decide the Activities fetch on the on-screen rides | `everyRefreshRefetchesActivitiesSoANewRideAppears`, `ridesStayOnScreenWhileTheActivitiesFetchRuns` |
+| Drop the `checkActive()` staleness guard | `aChangedIdentitySupersedesTheLoadInFlight` |
+| Load in `init` as well | `constructionDoesNotLoad` |
+| Clear the rides while the fetch runs | `ridesStayOnScreenWhileTheActivitiesFetchRuns` |
+| Leave TSS out of the chart's axis | `loadAxisIncludesTssSoBarsStayInsideTheChart` |
+| Join the in-flight load instead of cancelling it | `aChangedIdentitySupersedesTheLoadInFlight` |
+
+**Not verified.** Nothing here has run on a device or emulator. #196's Done
+(phone landscape and tablet, rotated live) is still owed, as is a real-data
+check against the deployed cloud (about 1,458 `load_point`s, about 15 pages).
+The iOS suite was not run (Windows host); the vector change was checked against
+`CloudModelsTests.swift`'s assertions by reading them.
+
+**Known gaps.**
+- The first Activities fetch walks the whole collection (up to
+  `CloudSession.maximumPages`), because `ReadSession` has no first-page read.
+  Later loads are `since=` deltas. The strip is filled after the dashboard
+  itself is shown, so this delays only the strip.
+- Local backend: a failed `/api/state` fails the dashboard load, and the
+  screen keeps what it was showing under the error banner. `LocalClient` has
+  no fallback of its own: `load` throws, and `cached` holds only the single
+  last response. A failure of `/api/load`, `/api/curve` or `/api/activities`
+  alone is still silent and shows those parts empty.
+- Switching the data source leaves the previous source's view model in the
+  store; a load it has in flight runs to completion unseen.
+- The loading message is a fixed "Syncing dashboard…", with no page count
+  (iOS is the same).
+
+### Step 4 — PR #419 review (2026-09-30, at `38b1003`), addressed 2026-10-04
+
+The owner's CHANGES_REQUESTED review had two blockers and four non-blocking
+notes; all six are addressed on this branch:
+
+1. **Cold start rides out instead of backing off (mirrors iOS #422).** The
+   cloud transport runs 60s connect / 60s read / 120s overall (was
+   15/30/60), so a scale-to-zero wake (20-40s for a replica) no longer times
+   out the first request, which is the signed refresh. `CloudSession` treats
+   a timeout (and a dropped connection on the refresh only) as "waking": one
+   retry after 3s, then a flat 10s gate (`Failure.Waking`) that never
+   escalates, never shortens or relabels a stronger gate (a 429
+   `Retry-After`, the removal-strike gap), never counts as a removal strike,
+   and is the only gate `retryNowIfWaking()` (the pull-to-refresh seam on
+   `ReadSession`, beside `mayBeWaking`) may lift; `noteFailure` never
+   shortens a gate in force and always marks it the server's. The
+   gate-overwrite tests from iOS `CloudSessionTests` are ported
+   (`aConcurrentColdStartTimeoutNeverShortensARetryAfter`,
+   `aColdStartTimeoutNeverShortensTheGapBetweenTwoRemovalStrikes`,
+   `aRefusalDuringAColdStartGateNeitherShortensItNorLeavesItLiftable`), plus
+   the waking, no-strike, and lost-connection cases. The local transport
+   keeps its tighter bounds: the desktop does not scale to zero.
+2. **The dashboard's no-data state says what is true.** When a load fails
+   with no cache to serve, the screen shows its own waking or rate-limited
+   message (or "Failed to sync dashboard" plus the error) instead of
+   "No load history" with no message at all; "No load history yet" is only
+   the genuinely-empty state.
+3. **A same-identity resume joins the walk in flight** (non-blocking note
+   3). `ReadSession` gains `identity` (the backend's lifecycle identity:
+   changes on pairing, sign-out, removal). `DashboardViewModel.refresh()`
+   cancels and supersedes only when the identity changed; a rotation, tab
+   switch, or return from Settings that changed nothing lets the in-flight
+   walk finish and paint instead of restarting from page one. A changed
+   identity still supersedes exactly as before (pairing, sign-out and
+   removal all bump the cloud's `lifecycleGeneration`; `LocalClient` bumps
+   its own on `reset()`). Per-page progress stays deferred: iOS has none
+   either, and the device check is what decides whether it is wanted.
+4. **The en-dash zone is pinned** (non-blocking note 4): the display string
+   with the en dash (`"56–75%"`) is tested inline in `CloudObjectsTest`, as
+   iOS pins it; the shared vector keeps its two zones, which the iOS count
+   assertion (`CloudModelsTests.swift`) limits.
+5. **A local 429 earns the rate-limit notice** (non-blocking note 5): a
+   `LocalClientException.Http` 429/503 carrying `Retry-After` maps to the
+   same "Rate limited — retry in N seconds" state as the cloud's throttle.
+6. **The cache-first read is identity-checked** (non-blocking note 6):
+   `CloudSession.cached()` refuses to serve once the device is not paired
+   (a sign-out's disk wipe can still be in flight, and the rows on disk then
+   belong to the device that left), and the dashboard re-reads the identity
+   before painting the cached data, so a sign-out or re-pair landing
+   mid-load does not flash the old tiles until the rejection clears them.
+
+**Verification (2026-10-04).** `:app:testDebugUnitTest` 165 passed, 0
+failed; `:app:assembleDebug` and `:app:assembleRelease -PallowPlaceholderHost`
+green; the Python tests that read the shared vectors pass (114). The
+`android-line` parity check (required on `main` since #433 for PRs touching
+`ios/`, `wattracker/cloud/` or `tests/vectors/`) is satisfied by the
+`Android: #196` line in the PR description; its logic was verified locally
+against both PR heads. Still not verified on a device or emulator: #196's
+Done (phone landscape and tablet, rotated live) is still owed, as is the
+real-data check against the deployed cloud (about 1,458 `load_point`s, about
+15 pages).
+
+The round-1 note's "a refresh cancels the load in flight" is superseded by
+item 3 (cancel only on a changed identity): `aNewRefreshSupersedesTheOneInFlight`
+became `aChangedIdentitySupersedesTheLoadInFlight`, with
+`aSameIdentityResumeJoinsTheWalkInFlight` beside it.
+
+**Code-review round (2026-10-05).** Addressed the review of the cold-start
+(ride-out), non-blocking-notes, and plan.md commits:
+- **The no-data waking state is no longer a dead end**: the dashboard's
+  `ScrollableScreenScaffold` gained pull-to-refresh (iOS parity); a pull lifts
+  a cold-start's gate (`retryNowIfWaking`) and re-runs the walk, and the
+  waking card is a static notice, not a spinner that never resolves.
+- **A re-pair clears the previous rider's tiles**: `load()` drops the
+  on-screen data the moment the identity changes, so a first load that fails
+  does not leave the old data up under "Syncing."
+- **A reset over HTTPS is recognised as a wake**: `isColdStart` walks the
+  cause chain and matches `SSLException` (and a `SocketException` that is not a
+  refused connection), not just a top-level `SocketException`/`EOFException`.
+- **The refresh ride-out is lifecycle-guarded**: the retry and the
+  `noteColdStart`/`noteFailure` both re-check the identity, so a sign-out or
+  re-pair in the pause neither re-signs for a departed device nor banks a gate
+  against the next identity.
+- **`cached()` re-validates after the disk read**: the identity is re-checked
+  once the read returns, so a sign-out landing mid-read cannot paint.
+- **The four previously un-pinned mutations now are**: the lift
+  (`aColdStartGateIsLiftableByTheRidersPull`), `isWaking`
+  (`aWakingFailureShowsTheWakingNoticeWithNoError`), the deadline throwing
+  `SocketTimeoutException` (`aResponseThatOutrunsTheDeadlineIsCutOff`), and the
+  cache-paint re-check (`aSignOutDuringTheCachedReadIsNotPainted`, now asserted
+  mid-flight). A re-pair clearing the tiles is pinned too
+  (`aRePairClearsThePreviousIdentitysTiles`).
+- `Failure.Waking`'s message no longer duplicates `dashboard_waking_notice`,
+  so the screen shows the string resource, not a hardcoded copy.
+- **Verification.** `:app:testDebugUnitTest` 174 passed, 0 failed (was 165);
+  `:app:assembleDebug` green.
+
 ## Step 5 — Activities list + ride detail (issue #197)
 
 - List: newest first, `date, duration, distance, NP, IF, TSS`; lazy-loaded
@@ -1476,19 +1681,8 @@ and shows up flagged in `GET /api/v1/devices`; re-pairing is clean.
 
 ## Step 6 — Calendar + Volume (issue #198)
 
-**Preamble — server PR (lands before any screen work on the local calendar):**
-In `wattracker/server.py`, extract the month-data construction from
-`calendar_view` (the block from `ooto_ranges` through the per-day workout/
-activity/race/phase assembly, `server.py:4079` ff.) into a module-level
-`build_calendar_month(uid, year, month)` function; `calendar_view` calls it,
-and a new read-only route `GET /api/calendar?year=&month=` (same defaults and
-month normalisation as the HTML route: current month, 1..12 wrap) returns
-`build_calendar_month(...)` as JSON. No new auth (session, like the other
-`/api/*` routes), no new db access (the builder already takes the db
-functions), no change to any existing response. Focused test: a fixture month
-with plan workouts (incl. one completed, one past-missed, one ooto-skipped),
-a standalone workout, an activity, a race with demoted priority, and an ooto
-range — assert the JSON carries the same flags the HTML calendar renders, and
+**Preamble — server route:**
+The read-only route `GET /api/calendar?year=&month=` exists in `wattracker/server.py` (since commit `32444f7`), returning `build_calendar_month(...)` as JSON (`{"weeks": ...}`). The app's local calendar adapter is written against its test-pinned shape.
 that a history cutoff hides pre-cutoff activities. Full suite green per
 AGENTS.md. This PR is Python-only and does not touch `wattracker/cloud/` or
 the migrations.

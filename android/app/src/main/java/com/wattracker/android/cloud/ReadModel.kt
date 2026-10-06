@@ -43,6 +43,9 @@ class ReadModel(
     override val isPaired: Boolean
         get() = active().isPaired
 
+    override val identity: Int
+        get() = active().identity
+
     override val lastSuccess: Long?
         get() = active().lastSuccess
 
@@ -53,4 +56,9 @@ class ReadModel(
     override suspend fun activityDetail(activityId: Int): ActivityDetail = active().activityDetail(activityId)
 
     override suspend fun activityStreams(activityId: Int): ActivityStreams = active().activityStreams(activityId)
+
+    override val mayBeWaking: Boolean
+        get() = active().mayBeWaking
+
+    override suspend fun retryNowIfWaking() = active().retryNowIfWaking()
 }

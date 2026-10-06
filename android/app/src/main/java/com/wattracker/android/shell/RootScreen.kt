@@ -301,7 +301,11 @@ private fun AppNavHost(
         startDestination = Destination.Dashboard.route,
         modifier = modifier,
     ) {
-        composable(Destination.Dashboard.route) { DashboardScreen() }
+        composable(Destination.Dashboard.route) {
+            DashboardScreen(
+                onNavigateToSettings = { navigateTo(navController, Destination.Settings) },
+            )
+        }
         composable(Destination.Activities.route) { ActivitiesScreen() }
         composable(Destination.Calendar.route) { CalendarScreen() }
         composable(Destination.Volume.route) { VolumeScreen() }
