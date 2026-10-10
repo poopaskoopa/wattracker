@@ -15,6 +15,9 @@ struct VolumeScreen: View {
             content
         }
         .task(id: gate.backend) { await model.start(session: gate.activeSession) }
+        .refreshable {
+            await model.start(session: gate.activeSession, userInitiated: true)
+        }
     }
 
     @ViewBuilder
@@ -83,7 +86,7 @@ final class VolumeScreenModel {
     }
     var selectedRange: VolumeRange = .last12
 
-    func start(session: (any ReadSession)?) async {
+    func start(session: (any ReadSession)?, userInitiated: Bool = false) async {
         state = .starting
         guard let session else {
             state = .unpaired
@@ -105,6 +108,7 @@ final class VolumeScreenModel {
             apply(cached)
         }
 
+        if userInitiated { await session.retryNowIfWaking() }
         do {
             apply(try await wake.during(session) { try await session.load(.volume) })
         } catch let failure as CloudSession.Failure {

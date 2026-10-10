@@ -21,6 +21,9 @@ struct CalendarScreen: View {
             content
         }
         .task(id: gate.backend) { await model.start(session: gate.activeSession) }
+        .refreshable {
+            await model.start(session: gate.activeSession, userInitiated: true)
+        }
         .sheet(item: $selectedDay) { day in
             CalendarDayDetail(day: day)
         }
@@ -102,7 +105,7 @@ final class CalendarModel {
 
     private var requestGeneration = 0
 
-    func start(session: (any ReadSession)?) async {
+    func start(session: (any ReadSession)?, userInitiated: Bool = false) async {
         let generation = beginRequest()
         state = .starting
         currentFTP = nil
@@ -138,6 +141,7 @@ final class CalendarModel {
             )
         }
 
+        if userInitiated { await session.retryNowIfWaking() }
         do {
             let calendar = try await wake.during(session) {
                 try await session.load(.calendar, month: month)
