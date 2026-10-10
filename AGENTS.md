@@ -187,49 +187,29 @@ states on `main` when the PR is merge-committed. Four such commits are on
 `main` from #358 and #356 (`a04e344`, `95a6bb2`, `8d1a582`, `892b345`); if
 `git bisect` lands on one, `git bisect skip` it.
 
-1. **#427: name the iOS app `wattracker` in Xcode** (scheme, `PRODUCT_NAME`,
-   archive label), plus `ITSAppUsesNonExemptEncryption = NO` in both plists. The bundle ID, keychain service and UserDefaults names
-   must not change. Also read the 2026-10-02 comment on #427: fix the
-   release workflow's concurrency group, which can cancel a queued tag
-   release, and reword the `ios-testflight.md` keychain-fallback line. The
-   `ios-code-signing` environment now allows only `main` and `ios-v*` and
-   needs the owner's approval, so **a release dispatch from your branch is
-   refused**. Verify with `-showBuildSettings`, an unsigned archive and
-   `ios-tests`, and say the signed path was not run.
+1. **#443: publish ride streams to the cloud.** Desktop sync never publishes
+   stream objects (`include_streams` defaults False), so iOS Activities and
+   Calendar charts always show "No recorded streams". The owner decided to
+   publish streams for all rides. Full spec is in the issue body; GitHub wins
+   if it differs. The integrator (not codex) runs the republish after merge.
+   Android parity applies: post a note on #197 and put an `Android:` line in
+   the PR body.
 
-2. **#429: iOS follow-ups.** Pull to refresh on Dashboard, Calendar and Volume
-   (calling `retryNowIfWaking()`); #422's cold-start handling for activity
-   detail and stream reads, keeping every gate rule; and publish standalone
-   workouts' saved step texts if the desktop modal shows them. Independent of
-   #427; it touches the iOS screens and `CloudSession`, so rebase if #427
-   lands first. Android parity applies (`docs/agent-workflow.md` §8): post
-   the pull-to-refresh and detail cold-start notes on #196–#198, and put an
-   `Android:` line in the PR body. Activities already has `.refreshable`; the
-   work is Dashboard, Calendar and Volume, plus a test pinning Activities'
-   existing behaviour. See the spec comment on #429.
-
-3. **#437: calendar completed-ride streams.** In the iOS Calendar day sheet,
-   a completed ride's detail shows the same power/HR/cadence/altitude charts
-   as Activities, by reusing StreamCharts (made internal) and fetching
-   streams by the activity id. No new files (pbxproj), no `retryNowIfWaking`
-   here (that is #429's job). Full spec is in the issue body; GitHub wins if
-   it differs. It edits CalendarActivityDetail only; #429 edits
-   CalendarScreen's refresh path, so rebase whichever lands second. Android
-   parity applies: put an `Android:` line in the PR body and post a note on
-   #196–#198.
-
-4. **#249: rotating full-suite test flakes. Still not a local-runs job.**
+2. **#249: rotating full-suite test flakes. Still not a local-runs job.**
    Nothing has changed since the re-scope. 21 consecutive clean local full
    suites stand against zero reproductions. Both known instances came from
    **taksmon's machine**. **The next step is taksmon's log and his exact
    invocation.** Until he provides them, skip this item rather than spending
    runs on it.
 
+**Done (landed, off the active list):** #427 via #441, #429 via #439 and #442,
+#437 via #440, and #438.
+
 **An item with an open PR stays on this list until the PR merges**, marked with
 its PR number. Dropping it while it is in flight makes it invisible if the PR is
 closed or abandoned.
 
-**When items 1-3 are done, the queue is empty.** #249 stays skipped pending
+**When item 1 is done, the queue is empty.** #249 stays skipped pending
 taksmon's log and invocation. Do not pick up unlabelled issues or anything
 below on your own. Say the queue ran out rather than inventing scope.
 
