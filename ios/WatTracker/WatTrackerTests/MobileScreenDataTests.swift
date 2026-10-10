@@ -3,6 +3,22 @@ import XCTest
 final class MobileScreenDataTests: XCTestCase {
     private let asOf = Date(timeIntervalSince1970: 1_735_689_600)
 
+    func testActivityIDAcceptsIntegralNumbersAndNumericStrings() {
+        XCTAssertEqual(
+            CalendarData.activityID(.object(["id": .number(123)])),
+            123
+        )
+        XCTAssertEqual(
+            CalendarData.activityID(.object(["id": .string("123")])),
+            123
+        )
+        XCTAssertNil(CalendarData.activityID(.object(["name": .string("ride")])))
+        XCTAssertNil(CalendarData.activityID(.object(["id": .number(1.5)])))
+        XCTAssertNil(
+            CalendarData.activityID(.object(["id": .string("not-a-number")]))
+        )
+    }
+
     private func date(year: Int, month: Int, day: Int) -> Date {
         var calendar = Calendar(identifier: .gregorian)
         calendar.timeZone = TimeZone(secondsFromGMT: 0)!

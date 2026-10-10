@@ -1,5 +1,17 @@
 import Foundation
+import SwiftUI
 import XCTest
+
+private struct TestReadSessionKey: EnvironmentKey {
+    static let defaultValue: (any ReadSession)? = nil
+}
+
+extension EnvironmentValues {
+    var readSession: (any ReadSession)? {
+        get { self[TestReadSessionKey.self] }
+        set { self[TestReadSessionKey.self] = newValue }
+    }
+}
 
 /// What the activities list is allowed to keep on screen.
 ///

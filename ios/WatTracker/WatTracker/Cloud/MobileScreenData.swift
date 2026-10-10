@@ -520,7 +520,7 @@ struct CalendarData: Sendable, Equatable {
         return result
     }
 
-    private static func activityID(_ value: JSONValue) -> Int? {
+    static func activityID(_ value: JSONValue) -> Int? {
         if let number = value["id"]?.doubleValue {
             return Int(exactly: number)
         }
