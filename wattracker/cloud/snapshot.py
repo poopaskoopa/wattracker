@@ -57,6 +57,7 @@ _ACTIVITY_FIELDS = (
     "start_time", "duration_s", "distance_m", "avg_power", "avg_hr", "np",
     "if_", "tss", "rpe",
 )
+_PLOTTABLE_STREAM_KEYS = ("power", "heartrate", "cadence", "altitude")
 
 
 def _safe_data(value: Any) -> Any:
@@ -190,6 +191,19 @@ def _downsample(values: Any, target: int = DETAIL_MAX_POINTS) -> list:
         ]
         out.append(round(sum(bucket) / len(bucket), 1) if bucket else None)
     return out
+
+
+def _has_plottable_stream(values: Any) -> bool:
+    if not isinstance(values, Sequence) or isinstance(
+        values, (str, bytes, bytearray)
+    ):
+        return False
+    return any(
+        isinstance(value, (int, float))
+        and not isinstance(value, bool)
+        and math.isfinite(float(value))
+        for value in values
+    )
 
 
 def _activity_rows(
@@ -950,7 +964,10 @@ def _activity_detail(
         data=_safe_data(detail),
     )
     stream_object = None
-    if streams:
+    if streams and any(
+        _has_plottable_stream(streams.get(key))
+        for key in _PLOTTABLE_STREAM_KEYS
+    ):
         stream_data = {
             key: _downsample(streams.get(key) or [])
             for key in ("time", "power", "heartrate", "cadence", "altitude")

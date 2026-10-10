@@ -107,7 +107,7 @@ class DesktopCloudSync:
         mtls_headers: Optional[dict[str, str]] = None,
         clock: Callable[[], float] = time.time,
         batch_limit: int = DEFAULT_BATCH_LIMIT,
-        include_streams: bool = False,
+        include_streams: bool = True,
         include_derived: bool = True,
         derived_first: bool = True,
         retry_base_seconds: float = 5.0,

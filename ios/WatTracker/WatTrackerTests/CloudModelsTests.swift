@@ -60,7 +60,8 @@ final class CloudModelsTests: XCTestCase {
         let power = try XCTUnwrap(streamPayload.streams.power)
         XCTAssertEqual(power.count, 3)
         XCTAssertNil(power[1], "a recording gap stays a gap")
-        XCTAssertNil(streamPayload.streams.cadence, "an unrecorded channel is absent, not empty")
+        XCTAssertEqual(try XCTUnwrap(streamPayload.streams.cadence), [85, 86, 87])
+        XCTAssertEqual(try XCTUnwrap(streamPayload.streams.altitude), [nil, nil, nil])
     }
 
     func testBothProfilePublishersAreUnderstood() throws {

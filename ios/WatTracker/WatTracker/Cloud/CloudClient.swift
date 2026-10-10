@@ -235,9 +235,10 @@ struct CloudClient: ReadClient, Sendable {
         return try await send(request, path: route.path)
     }
 
-    /// One activity-owned object. These objects deliberately stay out of the
-    /// activities collection: the summary list remains small, while detail
-    /// and stream payloads are fetched only after the rider opens a ride.
+    /// One activity-owned object. The desktop publishes bounded stream
+    /// payloads for every ride with a plottable channel; these objects
+    /// deliberately stay out of the activities collection, so detail and
+    /// stream payloads are fetched only after the rider opens a ride.
     func activityDetail(
         activityID: Int, readerContext: String, device: PairedDevice
     ) async throws -> CloudItem {

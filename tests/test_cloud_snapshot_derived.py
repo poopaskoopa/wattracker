@@ -9,7 +9,11 @@ import pytest
 
 from wattracker import db
 from wattracker.ble.runner import flatten_session
-from wattracker.cloud.models import PUBLISHED_OBJECT_KINDS, SyncBatch
+from wattracker.cloud.models import (
+    MAX_PAYLOAD_BYTES,
+    PUBLISHED_OBJECT_KINDS,
+    SyncBatch,
+)
 from wattracker.cloud.snapshot import (
     DETAIL_MAX_POINTS,
     SnapshotError,
@@ -149,10 +153,10 @@ def _fixture_db(tmp_path):
     return path, user_id
 
 
-def test_derived_snapshot_round_trips_all_kinds_and_keeps_streams_opt_in(tmp_path):
+def test_derived_snapshot_round_trips_all_kinds_with_explicit_stream_selection(tmp_path):
     path, user_id = _fixture_db(tmp_path)
 
-    without_streams = snapshot_objects(path, user_id)
+    without_streams = snapshot_objects(path, user_id, include_streams=False)
     assert "stream" not in {obj.kind for obj in without_streams}
     assert any(obj.kind == "activity_detail" for obj in without_streams)
     assert all(
@@ -190,6 +194,138 @@ def test_derived_snapshot_round_trips_all_kinds_and_keeps_streams_opt_in(tmp_pat
     assert [obj.object_id for obj in round_tripped.objects] == [
         obj.object_id for obj in objects
     ]
+
+
+def _stream_contract_db(tmp_path):
+    path = tmp_path / "stream-contract.db"
+    db.init_db(str(path))
+    user_id = db.create_user("rider", "not-a-password", path=str(path))
+    db.save_user_settings(
+        user_id, {"ftp": 240, "timezone": "UTC"}, path=str(path),
+    )
+    for number in range(1, 17):
+        db.insert_activity(
+            user_id,
+            {
+                "dedup_hash": f"stream-contract-{number}",
+                "filename": f"ride-{number}.fit",
+                "start_time": f"2026-01-{number:02d}T10:00:00",
+                "duration_s": 60,
+                "distance_m": 1000.0,
+                "avg_power": 180.0,
+                "avg_hr": 140.0,
+            },
+            path=str(path),
+        )
+    activity_id = db.insert_activity(
+        user_id,
+        {
+            "dedup_hash": "stream-contract-17",
+            "filename": "ride-17.fit",
+            "start_time": "2026-01-17T10:00:00",
+            "duration_s": 3,
+            "distance_m": 1000.0,
+            "avg_power": 190.0,
+            "avg_hr": 140.0,
+            "np": 195.0,
+            "if_": 0.78,
+            "tss": 1.0,
+            "streams": {
+                "time": [0, 1, 2],
+                "power": [180, None, 205],
+                "heartrate": [120, 121, 123],
+                "cadence": [85, 86, 87],
+                "altitude": [None, None, None],
+            },
+        },
+        path=str(path),
+    )
+    assert activity_id == 17
+    return path, user_id
+
+
+def test_publisher_stream_matches_shared_ios_decoder_fixture(tmp_path):
+    path, user_id = _stream_contract_db(tmp_path)
+
+    stream = next(
+        obj for obj in snapshot_objects(path, user_id, include_streams=True)
+        if obj.object_id == "stream-17"
+    )
+    fixture = json.loads(
+        (Path(__file__).parent / "vectors" / "cloud_objects_v1.json")
+        .read_text(encoding="utf-8")
+    )
+    expected = next(item for item in fixture["items"] if item["id"] == "stream-17")
+
+    assert stream.wire() == expected
+    assert set(stream.data["streams"]) == {
+        "time", "power", "heartrate", "cadence", "altitude",
+    }
+    assert stream.data["streams"]["power"][1] is None
+    assert stream.data["streams"]["altitude"] == [None, None, None]
+
+
+def test_stream_objects_skip_activities_without_a_plottable_channel(tmp_path):
+    path = tmp_path / "no-plottable-stream.db"
+    db.init_db(str(path))
+    user_id = db.create_user("rider", "not-a-password", path=str(path))
+    for number, streams in enumerate(
+        (
+            {"time": [0, 1, 2]},
+            {"time": [0, 1, 2], "power": [None, None, None]},
+        ),
+        start=1,
+    ):
+        db.insert_activity(
+            user_id,
+            {
+                "dedup_hash": f"no-plottable-{number}",
+                "filename": f"no-plottable-{number}.fit",
+                "start_time": f"2026-02-{number:02d}T10:00:00",
+                "duration_s": 3,
+                "streams": streams,
+            },
+            path=str(path),
+        )
+
+    objects = snapshot_objects(path, user_id, include_streams=True)
+    assert not any(obj.kind == "stream" for obj in objects)
+
+
+def test_ten_hour_all_channel_stream_stays_below_cloud_object_limit(tmp_path):
+    path, user_id = _stream_contract_db(tmp_path)
+    sample_count = 9_000  # Four-second samples across a ten-hour ride.
+    activity_id = db.insert_activity(
+        user_id,
+        {
+            "dedup_hash": "stream-contract-ten-hour",
+            "filename": "ten-hour.fit",
+            "start_time": "2026-01-18T00:00:00",
+            "duration_s": 10 * 60 * 60,
+            "streams": {
+                "time": [index * 4 for index in range(sample_count)],
+                "power": [180 + index % 40 for index in range(sample_count)],
+                "heartrate": [130 + index % 8 for index in range(sample_count)],
+                "cadence": [85 + index % 4 for index in range(sample_count)],
+                "altitude": [100 + index % 20 for index in range(sample_count)],
+            },
+        },
+        path=str(path),
+    )
+
+    stream = next(
+        obj for obj in snapshot_objects(path, user_id, include_streams=True)
+        if obj.object_id == f"stream-{activity_id}"
+    )
+    encoded = json.dumps(
+        stream.wire(), separators=(",", ":"), ensure_ascii=False,
+    ).encode("utf-8")
+    assert len(encoded) < MAX_PAYLOAD_BYTES
+    assert all(
+        len(values) <= DETAIL_MAX_POINTS
+        for values in stream.data["streams"].values()
+        if isinstance(values, list)
+    )
 
 
 def test_snapshot_publish_pages_keeps_derived_objects_past_one_page(tmp_path):

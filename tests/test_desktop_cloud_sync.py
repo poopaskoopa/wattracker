@@ -62,6 +62,28 @@ def _fixture_db(tmp_path, count=2):
     return path, user_id
 
 
+def _add_stream_activity(path, user_id, number=1):
+    return db.insert_activity(
+        user_id,
+        {
+            "dedup_hash": f"desktop-cloud-stream-{number}",
+            "filename": f"stream-ride-{number}.fit",
+            "start_time": f"2026-08-{number:02d}T10:00:00",
+            "duration_s": 3,
+            "distance_m": 1000.0,
+            "avg_power": 180.0,
+            "avg_hr": 140.0,
+            "streams": {
+                "time": [0, 1, 2],
+                "power": [180, None, 205],
+                "heartrate": [120, 121, 123],
+                "cadence": [85, 86, 87],
+            },
+        },
+        path=str(path),
+    )
+
+
 def _credentials():
     return SyncCredentials(
         "c" * 64, "subscription", b"signing-key", namespace="a" * 64,
@@ -117,6 +139,81 @@ def test_default_off_enable_disable_and_status_is_dict_compatible(tmp_path):
     assert dict(status)["devices"] == []
     assert sync.set_enabled(user_id, True).enabled
     assert not sync.set_enabled(user_id, False).enabled
+
+
+def test_desktop_sync_publishes_streams_by_default(tmp_path):
+    path, user_id = _fixture_db(tmp_path, count=0)
+    activity_id = _add_stream_activity(path, user_id)
+    store = CloudCredentialStore(MemorySecrets())
+    store.save_writer(_credentials(), user_id=user_id)
+    calls = []
+
+    def transport(_url, _headers, body):
+        calls.append(json.loads(body))
+        return 200, b'{"revision":1}'
+
+    sync = DesktopCloudSync(str(path), store, transport=transport)
+    db.save_cloud_sync_state(
+        user_id,
+        {
+            "read_endpoint": "https://cloud.example",
+            "sync_endpoint": "https://sync.example",
+            "enabled": True,
+        },
+        path=str(path),
+    )
+    try:
+        results = sync.sync_once(user_id)
+        assert results and all(result.ok for result in results)
+        assert any(
+            obj["id"] == f"stream-{activity_id}"
+            for call in calls
+            for obj in call["objects"]
+        )
+    finally:
+        sync.stop()
+
+
+def test_stream_option_gate_uploads_only_new_stream_objects(tmp_path):
+    path, user_id = _fixture_db(tmp_path, count=0)
+    activity_id = _add_stream_activity(path, user_id)
+    store = CloudCredentialStore(MemorySecrets())
+    store.save_writer(_credentials(), user_id=user_id)
+    calls = []
+
+    def transport(_url, _headers, body):
+        calls.append(json.loads(body))
+        return 200, b'{"revision":1}'
+
+    sync = DesktopCloudSync(
+        str(path), store, transport=transport, include_streams=False,
+    )
+    db.save_cloud_sync_state(
+        user_id,
+        {
+            "read_endpoint": "https://cloud.example",
+            "sync_endpoint": "https://sync.example",
+            "enabled": True,
+        },
+        path=str(path),
+    )
+    try:
+        first = sync.sync_once(user_id)
+        assert first and all(result.ok for result in first)
+        assert all(
+            obj["kind"] != "stream"
+            for call in calls
+            for obj in call["objects"]
+        )
+
+        sync.include_streams = True
+        second = sync.sync_once(user_id)
+        assert second and all(result.ok for result in second)
+        assert [
+            obj["id"] for obj in calls[-1]["objects"]
+        ] == [f"stream-{activity_id}"]
+    finally:
+        sync.stop()
 
 
 def test_enrollment_failure_never_writes_keyring_or_database(tmp_path, monkeypatch):
