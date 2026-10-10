@@ -869,17 +869,24 @@ published (weight is resolved at read time for display/scaling only). Filename,
 local IDs, and other local-only fields are intentionally excluded from the
 cloud payload. Enabled desktop sync publishes a bounded `stream-<id>` object
 for every published ride with at least one plottable power, heart-rate,
-cadence, or altitude channel, not only for recently opened rides. The stream
-object is fetched only after a mobile rider opens the ride; a ride with only a
-`time` channel (or no finite plottable samples) has no stream object, so the
-clients' existing 404 / “No recorded streams” handling remains correct.
+cadence, or altitude channel, not only for recently opened rides. Oversized
+decoded source streams keep the 512 KiB guard for activity-detail and other
+derived calculations; stream publication has a separate 4 MiB bound, then
+immediately downsamples eligible streams to bounded objects rather than
+exposing the source arrays. Sources beyond that stream-only bound are omitted.
+The stream object is fetched only after a mobile rider opens the ride; a ride
+with only a `time` channel (or no finite plottable samples) has no stream
+object, so the clients' existing 404 / “No recorded streams” handling remains
+correct.
 History cutoffs and dirty/republish tracking remain out of scope for #173
 (#172 and #157).
 Legacy read-only snapshots without `duplicate_of` retain all activities, and
 snapshots without a complete correction table publish streams without masking.
 Publisher streams are downsampled to at most 1,500 points per channel. The
 payload validator permits up to 16,384 array items for realistic long streams;
-the existing 512 KiB object and decompression limits still apply.
+the 512 KiB object limit still applies to published objects, while the normal
+512 KiB decoded-input guard and separate 4 MiB stream-publication bound keep
+decompression bounded.
 
 The deployed container entrypoint is `python -m wattracker.cloud.runtime`. It
 constructs `AzureTenantStore` with managed identity and Storage service

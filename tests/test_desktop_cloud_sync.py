@@ -200,6 +200,7 @@ def test_stream_option_gate_uploads_only_new_stream_objects(tmp_path):
     try:
         first = sync.sync_once(user_id)
         assert first and all(result.ok for result in first)
+        first_request_count = len(calls)
         assert all(
             obj["kind"] != "stream"
             for call in calls
@@ -209,9 +210,14 @@ def test_stream_option_gate_uploads_only_new_stream_objects(tmp_path):
         sync.include_streams = True
         second = sync.sync_once(user_id)
         assert second and all(result.ok for result in second)
-        assert [
-            obj["id"] for obj in calls[-1]["objects"]
-        ] == [f"stream-{activity_id}"]
+        second_objects = [
+            obj
+            for call in calls[first_request_count:]
+            for obj in call["objects"]
+        ]
+        assert [obj["id"] for obj in second_objects] == [
+            f"stream-{activity_id}"
+        ]
     finally:
         sync.stop()
 

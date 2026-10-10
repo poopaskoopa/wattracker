@@ -15,7 +15,7 @@ from wattracker.cloud.models import (
     SyncBatch,
 )
 from wattracker.cloud.snapshot import (
-    DETAIL_MAX_POINTS,
+    MAX_STREAM_DECODED,
     SnapshotError,
     _calendar_day_objects,
     snapshot_batch,
@@ -173,7 +173,7 @@ def test_derived_snapshot_round_trips_all_kinds_with_explicit_stream_selection(t
     # prevent - and a subset check cannot see it.
     assert kinds == PUBLISHED_OBJECT_KINDS
     assert all(
-        len(values) <= DETAIL_MAX_POINTS
+        len(values) <= 1500
         for obj in objects
         if obj.kind == "stream"
         for values in obj.data["streams"].values()
@@ -292,9 +292,62 @@ def test_stream_objects_skip_activities_without_a_plottable_channel(tmp_path):
     assert not any(obj.kind == "stream" for obj in objects)
 
 
+@pytest.mark.parametrize(
+    "channel",
+    ("heartrate", "cadence", "altitude"),
+)
+def test_stream_objects_publish_each_non_power_plottable_channel(
+    tmp_path, channel,
+):
+    path = tmp_path / f"{channel}-only.db"
+    db.init_db(str(path))
+    user_id = db.create_user("rider", "not-a-password", path=str(path))
+    activity_id = db.insert_activity(
+        user_id,
+        {
+            "dedup_hash": f"{channel}-only",
+            "filename": f"{channel}-only.fit",
+            "start_time": "2026-02-03T10:00:00",
+            "duration_s": 3,
+            "streams": {
+                "time": [0, 1, 2],
+                channel: [120.5, 121.5, 122.5],
+            },
+        },
+        path=str(path),
+    )
+
+    streams = [
+        obj for obj in snapshot_objects(path, user_id, include_streams=True)
+        if obj.kind == "stream"
+    ]
+    assert [obj.object_id for obj in streams] == [f"stream-{activity_id}"]
+    assert streams[0].data["streams"][channel] == [120.5, 121.5, 122.5]
+
+
 def test_ten_hour_all_channel_stream_stays_below_cloud_object_limit(tmp_path):
     path, user_id = _stream_contract_db(tmp_path)
-    sample_count = 9_000  # Four-second samples across a ten-hour ride.
+    sample_count = 10 * 60 * 60  # One-second samples across a ten-hour ride.
+    streams = {
+        "time": list(range(sample_count)),
+        "power": [
+            round(180.0 + index % 40 * 0.5, 1)
+            for index in range(sample_count)
+        ],
+        "heartrate": [
+            round(130.0 + index % 8 * 1.25, 1)
+            for index in range(sample_count)
+        ],
+        "cadence": [
+            round(85.0 + index % 4 * 1.5, 1)
+            for index in range(sample_count)
+        ],
+        "altitude": [
+            round(100.0 + index % 20 * 2.25, 1)
+            for index in range(sample_count)
+        ],
+    }
+    assert len(json.dumps(streams).encode("utf-8")) > MAX_STREAM_DECODED
     activity_id = db.insert_activity(
         user_id,
         {
@@ -302,13 +355,7 @@ def test_ten_hour_all_channel_stream_stays_below_cloud_object_limit(tmp_path):
             "filename": "ten-hour.fit",
             "start_time": "2026-01-18T00:00:00",
             "duration_s": 10 * 60 * 60,
-            "streams": {
-                "time": [index * 4 for index in range(sample_count)],
-                "power": [180 + index % 40 for index in range(sample_count)],
-                "heartrate": [130 + index % 8 for index in range(sample_count)],
-                "cadence": [85 + index % 4 for index in range(sample_count)],
-                "altitude": [100 + index % 20 for index in range(sample_count)],
-            },
+            "streams": streams,
         },
         path=str(path),
     )
@@ -322,7 +369,7 @@ def test_ten_hour_all_channel_stream_stays_below_cloud_object_limit(tmp_path):
     ).encode("utf-8")
     assert len(encoded) < MAX_PAYLOAD_BYTES
     assert all(
-        len(values) <= DETAIL_MAX_POINTS
+        len(values) <= 1500
         for values in stream.data["streams"].values()
         if isinstance(values, list)
     )
