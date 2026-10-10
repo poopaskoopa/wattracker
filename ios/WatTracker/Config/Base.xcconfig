@@ -5,7 +5,7 @@
 // starts a comment in an xcconfig, which is why the API base URL is split
 // into a scheme and a host rather than written as one URL.
 
-PRODUCT_NAME = WatTracker
+PRODUCT_NAME = wattracker
 PRODUCT_BUNDLE_IDENTIFIER = com.wattracker.ios
 
 // iOS 17 is the floor because Observation and Swift Charts are both worth it

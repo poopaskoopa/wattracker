@@ -41,12 +41,14 @@ on:
 permissions:
   contents: read
 
-# Serialize release attempts so two archives cannot race over App Store
-# Connect's provisioning profile updates. The hosted VM is disposable, but
-# cleanup still runs unconditionally so a cancelled step does not leave
+# Serialize release attempts within each event type so tag archives cannot
+# race over App Store Connect's provisioning profile updates, while a manual
+# dispatch cannot replace a queued tag release. The hosted VM is disposable,
+# but cleanup still runs unconditionally so a cancelled step does not leave
 # signing material in its workspace.
 concurrency:
-  group: ios-release
+  group: ios-release-${{ github.event_name }}
+  cancel-in-progress: false
 
 jobs:
   archive-export-upload:
@@ -188,7 +190,7 @@ jobs:
               | awk -F '[()]' '/iPhone/ {print $2; exit}' || true)"
             if [ -n "$simulator_runtime" ] && [ -n "$simulator_device_type" ]; then
               simulator_udid="$(xcrun simctl create \
-                "WatTracker Release Test ${GITHUB_RUN_ID:-manual}" \
+                "wattracker Release Test ${GITHUB_RUN_ID:-manual}" \
                 "$simulator_device_type" "$simulator_runtime" || true)"
             fi
           fi
@@ -196,7 +198,7 @@ jobs:
             echo "Running Swift tests on simulator $simulator_udid."
             xcodebuild test \
               -project ios/WatTracker/WatTracker.xcodeproj \
-              -scheme WatTracker \
+              -scheme wattracker \
               -destination "id=$simulator_udid" \
               -derivedDataPath "$RUNNER_TEMP/ios-test-dd"
           else
@@ -208,7 +210,7 @@ jobs:
             echo "::warning::This hosted macOS VM has no available iOS Simulator; CI ios-tests remains the test gate, so this manual run will compile the device target before signing."
             xcodebuild build \
               -project ios/WatTracker/WatTracker.xcodeproj \
-              -scheme WatTracker \
+              -scheme wattracker \
               -sdk iphoneos \
               -derivedDataPath "$RUNNER_TEMP/ios-test-dd" \
               CODE_SIGNING_ALLOWED=NO
@@ -699,10 +701,10 @@ jobs:
 
           archive_with_redacted_output xcodebuild archive \
             -project ios/WatTracker/WatTracker.xcodeproj \
-            -scheme WatTracker \
+            -scheme wattracker \
             -configuration Release \
             -destination 'generic/platform=iOS' \
-            -archivePath "$RUNNER_TEMP/WatTracker.xcarchive" \
+            -archivePath "$RUNNER_TEMP/wattracker.xcarchive" \
             -derivedDataPath "$RUNNER_TEMP/ios-archive-dd" \
             -allowProvisioningUpdates \
             -authenticationKeyPath "$ASC_KEY_PATH" \
@@ -821,7 +823,7 @@ jobs:
           security set-key-partition-list -S apple-tool:,apple:,codesign: -s \
             -k "$IOS_SIGNING_KEYCHAIN_PASSWORD" "$IOS_SIGNING_KEYCHAIN" > /dev/null
           export_with_redacted_output xcodebuild -exportArchive \
-            -archivePath "$RUNNER_TEMP/WatTracker.xcarchive" \
+            -archivePath "$RUNNER_TEMP/wattracker.xcarchive" \
             -exportPath "$RUNNER_TEMP/export" \
             -exportOptionsPlist "$EXPORT_OPTIONS_PLIST" \
             -allowProvisioningUpdates \
@@ -838,7 +840,7 @@ jobs:
           # The key must not have been copied anywhere by the export. Cheap
           # assertion, and the thing it guards against - a .p8 inside the
           # payload - would otherwise ship to Apple and to every tester.
-          if find "$RUNNER_TEMP/export" "$RUNNER_TEMP/WatTracker.xcarchive" -name '*.p8' | grep -q .; then
+          if find "$RUNNER_TEMP/export" "$RUNNER_TEMP/wattracker.xcarchive" -name '*.p8' | grep -q .; then
             echo "A .p8 was found inside the archive or export. Refusing to upload." >&2
             exit 1
           fi
@@ -935,7 +937,7 @@ jobs:
           # everything that was built. On a runner that is discarded this would
           # not matter on a discarded hosted VM, but retaining the cleanup
           # makes local re-runs and failure diagnostics deterministic.
-          rm -rf "$RUNNER_TEMP/WatTracker.xcarchive" "$RUNNER_TEMP/export" || true
+          rm -rf "$RUNNER_TEMP/wattracker.xcarchive" "$RUNNER_TEMP/export" || true
           rm -rf "$RUNNER_TEMP/ios-archive-dd" "$RUNNER_TEMP/ios-test-dd" || true
           if [ -e "$RUNNER_TEMP/asc" ]; then
             echo "The App Store Connect key directory could not be removed." >&2

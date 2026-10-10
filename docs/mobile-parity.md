@@ -68,7 +68,7 @@ against `android/` on `main` and PR #419 on 2026-10-01. "Pending" means not on
 | Backend | Rider picks local desktop or cloud | `Shell/SessionGate.swift`, `Screens/SettingsScreen.swift` | #282 | Done: manual picker in `SettingsScreen.kt` |
 | Backend | Prefer the paired desktop when reachable, cloud otherwise (#281) | `Cloud/LocalBackend.swift`, `Shell/SessionGate.swift` | #282 | Pending. iOS code is in; #281 stays open for the device check |
 | Release | Real cloud host from a gitignored per-machine file, never from the tree (#420). iOS: `Release.xcconfig` does an optional `#include?` of the gitignored `Production.local.xcconfig` | `ios/WatTracker/Config/` | #199 | In PR #419: `-PwattrackerCloudAuthority` or `local.properties`, keeping the build's refusal to ship the `.example` placeholder `releaseCloudAuthority` |
-| Release | App shown as `wattracker`, store identity unchanged (#427) | `Info.plist` (`CFBundleDisplayName`) | #199 | Pending: `app_name` is still `WatTracker`. Do not change `applicationId` |
+| Release | App shown as `wattracker`, store identity unchanged (#427) | `Info.plist` (`CFBundleDisplayName`) | #199 | iOS now uses `wattracker`; Android remains pending and must not change `applicationId` |
 
 ## Shared vectors
 

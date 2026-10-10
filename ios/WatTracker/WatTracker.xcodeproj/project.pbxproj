@@ -83,7 +83,7 @@
 /* End PBXBuildFile section */
 
 /* Begin PBXFileReference section */
-		1A0000000000000000000020 /* WatTracker.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = WatTracker.app; sourceTree = BUILT_PRODUCTS_DIR; };
+		1A0000000000000000000020 /* wattracker.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = wattracker.app; sourceTree = BUILT_PRODUCTS_DIR; };
 		1A0000000000000000000021 /* WatTrackerTests.xctest */ = {isa = PBXFileReference; explicitFileType = wrapper.cfbundle; includeInIndex = 0; path = WatTrackerTests.xctest; sourceTree = BUILT_PRODUCTS_DIR; };
 		1A0000000000000000000030 /* WatTrackerApp.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = WatTrackerApp.swift; sourceTree = "<group>"; };
 		1A0000000000000000000031 /* FTPScreen.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = FTPScreen.swift; sourceTree = "<group>"; };
@@ -173,7 +173,7 @@
 		1A0000000000000000000003 /* Products */ = {
 			isa = PBXGroup;
 			children = (
-				1A0000000000000000000020 /* WatTracker.app */,
+				1A0000000000000000000020 /* wattracker.app */,
 				1A0000000000000000000021 /* WatTrackerTests.xctest */,
 			);
 			name = Products;
@@ -309,8 +309,8 @@
 			dependencies = (
 			);
 			name = WatTracker;
-			productName = WatTracker;
-			productReference = 1A0000000000000000000020 /* WatTracker.app */;
+			productName = wattracker;
+			productReference = 1A0000000000000000000020 /* wattracker.app */;
 			productType = "com.apple.product-type.application";
 		};
 		1A0000000000000000000011 /* WatTrackerTests */ = {

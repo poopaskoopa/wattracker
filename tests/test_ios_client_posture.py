@@ -155,6 +155,12 @@ def test_the_debug_and_release_configurations_use_different_info_plists():
     )
 
 
+def test_both_source_plists_declare_exempt_encryption(info, info_debug):
+    for name, plist in (("Info.plist", info), ("Info-Debug.plist", info_debug)):
+        assert "ITSAppUsesNonExemptEncryption" in plist, name
+        assert plist["ITSAppUsesNonExemptEncryption"] is False, name
+
+
 def test_the_production_scheme_is_https():
     base = _config("Base.xcconfig")
     assert re.search(r"^WATTRACKER_API_SCHEME = https$", base, re.M)
