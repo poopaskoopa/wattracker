@@ -197,6 +197,7 @@ private struct ActivityDetailScreen: View {
     @State private var detailError: String?
     @State private var streamsError: String?
     @State private var isLoading = true
+    @State private var wake = CloudWakeNotice()
 
     var body: some View {
         ScrollView {
@@ -205,6 +206,10 @@ private struct ActivityDetailScreen: View {
                     Text(RideFormatting.date(ride.summary.startTime))
                         .font(.title2.weight(.semibold)).foregroundStyle(Palette.textBright)
                     Text("Activity detail").font(.subheadline).foregroundStyle(Palette.muted)
+                    if wake.isShowing {
+                        Label("Waking up the cloud…", systemImage: "cloud")
+                            .font(.caption).foregroundStyle(Palette.muted)
+                    }
                 }
                 summaryPanel
                 if let detail { ZoneSection(zones: detail.zones) }
@@ -268,8 +273,12 @@ private struct ActivityDetailScreen: View {
         isLoading = true
         detailError = nil
         streamsError = nil
-        async let detailResult = session.activityDetail(ride.activityID)
-        async let streamResult = session.activityStreams(ride.activityID)
+        async let detailResult = wake.during(session) {
+            try await session.activityDetail(ride.activityID)
+        }
+        async let streamResult = wake.during(session) {
+            try await session.activityStreams(ride.activityID)
+        }
         do { detail = try await detailResult } catch {
             detailError = String(describing: error)
         }

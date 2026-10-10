@@ -578,6 +578,7 @@ actor CloudSession: ReadSession {
         do {
             attempt = try await context(after: nil)
         } catch {
+            if error is CancellationError { throw error }
             throw classify(error)
         }
         do {
@@ -615,7 +616,9 @@ actor CloudSession: ReadSession {
         activityObjectGeneration: Int,
         read: (ReadClient, String, PairedDevice) async throws -> CloudItem
     ) async throws -> CloudItem {
-        let item = try await read(client, context, device)
+        let item = try await ridingOutColdStart(firstRequest: false) {
+            try await read(client, context, device)
+        }
         try validate(device, lifecycleGeneration: lifecycleGeneration)
         if (activityObjectGenerations[activityID] ?? 0) == activityObjectGeneration {
             activityObjects[objectID] = ActivityObjectCacheEntry(
@@ -680,6 +683,9 @@ actor CloudSession: ReadSession {
     /// cancellation so task cancellation remains observable to the caller.
     private func classifyActivityReadError(_ error: Error) throws -> Failure {
         if error is CancellationError { throw error }
+        if Self.isColdStart(error, firstRequest: false) {
+            return noteColdStart()
+        }
         guard let failure = error as? CloudClient.Failure else {
             return classify(error)
         }
