@@ -149,7 +149,7 @@ jobs:
         run: >-
           xcodebuild test
           -project ios/WatTracker/WatTracker.xcodeproj
-          -scheme WatTracker
+          -scheme wattracker
           -destination 'platform=iOS Simulator,name=iPhone 17 Pro'
           -derivedDataPath "$RUNNER_TEMP/ios-test-dd"
 

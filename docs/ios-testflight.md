@@ -220,15 +220,11 @@ and every later release:
 
 App Store Connect asks an export-compliance question about encryption before a
 build can be distributed to any tester, and it asks it per build unless the app
-answers it in advance. WatTracker's iOS app uses HTTPS and CryptoKit P-256
-signatures for request authentication, which is the shape of use Apple's
-`ITSAppUsesNonExemptEncryption = false` declaration exists for — but that
-declaration is a legal statement about the account's own product, so it is the
-owner's to make, not CI's, and it is deliberately not in `Info.plist` today.
-
-Until it is added, expect to answer the question by hand in App Store Connect
-for each uploaded build. Adding it is one key in
-`ios/WatTracker/WatTracker/Info.plist`.
+answers it in advance. wattracker's iOS app uses HTTPS and CryptoKit P-256
+signatures for request authentication, which is the use case Apple's
+`ITSAppUsesNonExemptEncryption = false` declaration covers. The
+declaration is checked into both source plists, so App Store Connect can use
+the answer for every uploaded build.
 
 ## Credentials
 
@@ -398,7 +394,7 @@ Two practical notes:
    `PROVISIONING_PROFILE_SPECIFIER="WatTracker App Store"`, and
    `OTHER_CODE_SIGN_FLAGS="--keychain …"` pinning `codesign` to the job's own
    keychain. Because the complete leaf/WWDR/root chain is imported there,
-   chain building does not fall back to another keychain. `-allowProvisioningUpdates` and the three `-authenticationKey*`
+   SecTrust always consults the system roots, and this import adds no trust settings. `-allowProvisioningUpdates` and the three `-authenticationKey*`
    flags are still there, now doing the one job they can do: registering the
    App ID and downloading that profile from the portal, so it is neither
    installed on the runner nor carried as a secret.

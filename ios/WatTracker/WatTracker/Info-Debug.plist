@@ -16,6 +16,10 @@
 	<string>$(PRODUCT_NAME)</string>
 	<key>CFBundlePackageType</key>
 	<string>APPL</string>
+	<!-- This app uses only exempt encryption; change this to true if it ever
+	     implements its own cryptography. -->
+	<key>ITSAppUsesNonExemptEncryption</key>
+	<false/>
 	<!-- Both come from build settings (Config/Base.xcconfig holds the local
 	     defaults) rather than being literals, because the TestFlight release
 	     job must set them per run: App Store Connect rejects a build number it

@@ -111,7 +111,7 @@ def test_cloud_ios_tests_job_has_required_security_and_test_configuration():
     assert re.search(r'if \[ -n "\$worker" \]', ios_job)
     assert "xcodebuild test" in ios_job
     assert "-project ios/WatTracker/WatTracker.xcodeproj" in ios_job
-    assert "-scheme WatTracker" in ios_job
+    assert "-scheme wattracker" in ios_job
     assert "-destination 'platform=iOS Simulator,name=iPhone 17 Pro'" in ios_job
     assert '-derivedDataPath "$RUNNER_TEMP/ios-test-dd"' in ios_job
 

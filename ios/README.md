@@ -1,4 +1,4 @@
-# WatTracker for iOS
+# wattracker for iOS
 
 A SwiftUI app for iPhone and iPad. It is the app shell from issue #158: five
 destinations -- Dashboard, Activities, Calendar, Volume, Settings -- in a
@@ -25,7 +25,7 @@ No third-party dependencies. No package resolution step. `URLSession`,
 
 ```
 ios/WatTracker/
-  WatTracker.xcodeproj/          the project, plus the shared WatTracker scheme
+  WatTracker.xcodeproj/          the project, plus the shared wattracker scheme
   ExportOptions.plist            App Store export options; note the absent teamID
   AppIcon.source.html            the vector the 1024 icon is rendered from
   Config/
@@ -145,7 +145,7 @@ open ios/WatTracker/WatTracker.xcodeproj
 From the command line, by simulator destination:
 
 ```sh
-xcodebuild -project ios/WatTracker/WatTracker.xcodeproj -scheme WatTracker \
+xcodebuild -project ios/WatTracker/WatTracker.xcodeproj -scheme wattracker \
   -destination 'platform=iOS Simulator,name=iPhone 17 Pro' build
 ```
 
@@ -175,7 +175,7 @@ xcodebuild -project WatTracker.xcodeproj -target WatTracker \
   SYMROOT=/tmp/wt-build build
 
 xcrun simctl boot "iPhone 17 Pro"          # or "iPad Pro 13-inch (M5)"
-xcrun simctl install booted /tmp/wt-build/Debug-iphonesimulator/WatTracker.app
+xcrun simctl install booted /tmp/wt-build/Debug-iphonesimulator/wattracker.app
 xcrun simctl launch booted com.wattracker.ios
 ```
 
