@@ -1878,6 +1878,155 @@ final class CloudSessionTests: XCTestCase {
         )
     }
 
+    func testActivityDetailColdStartTimeoutRetriesThenReportsWaking() async throws {
+        let clock = TestClock()
+        let rig = harness(clock: clock) { request, _ in
+            switch request.url?.path {
+            case "/api/v1/context/refresh":
+                return .json(CloudFixtures.refreshBody(context: "context-1"))
+            default:
+                throw Self.timedOut(clock)
+            }
+        }
+
+        do {
+            _ = try await rig.session.activityDetail(17)
+            XCTFail("two detail timeouts must report waking")
+        } catch let failure as CloudSession.Failure {
+            guard case let .waking(retryAfter) = failure else {
+                return XCTFail("expected waking, got \(failure)")
+            }
+            XCTAssertEqual(retryAfter, CloudSession.coldStartBackoff)
+        }
+
+        XCTAssertEqual(
+            rig.transport.requests(matching: "/api/v1/context/activities/activity-detail-17").count,
+            2
+        )
+        XCTAssertEqual(rig.sleeps.delays, [CloudSession.coldStartRetryDelay])
+        let state = await rig.session.deviceState
+        XCTAssertEqual(state, .paired)
+    }
+
+    func testActivityStreamsColdStartTimeoutRetriesThenReportsWaking() async throws {
+        let clock = TestClock()
+        let rig = harness(clock: clock) { request, _ in
+            switch request.url?.path {
+            case "/api/v1/context/refresh":
+                return .json(CloudFixtures.refreshBody(context: "context-1"))
+            default:
+                throw Self.timedOut(clock)
+            }
+        }
+
+        do {
+            _ = try await rig.session.activityStreams(17)
+            XCTFail("two stream timeouts must report waking")
+        } catch let failure as CloudSession.Failure {
+            guard case let .waking(retryAfter) = failure else {
+                return XCTFail("expected waking, got \(failure)")
+            }
+            XCTAssertEqual(retryAfter, CloudSession.coldStartBackoff)
+        }
+
+        XCTAssertEqual(
+            rig.transport.requests(matching: "/api/v1/context/activities/stream-17").count,
+            2
+        )
+        XCTAssertEqual(rig.sleeps.delays, [CloudSession.coldStartRetryDelay])
+    }
+
+    func testAConcurrentActivityDetailColdStartTimeoutNeverShortensARetryAfter() async throws {
+        let clock = TestClock()
+        let gate = RequestGate()
+        let rig = harness(cache: Self.cachedDashboard(clock), clock: clock) { request, index in
+            switch request.url?.path ?? "" {
+            case "/api/v1/context/refresh":
+                return .json(CloudFixtures.refreshBody(context: "context-1"))
+            case "/api/v1/context/activities/activity-detail-17":
+                if index == 1 { throw Self.timedOut(clock) }
+                await gate.wait()
+                throw URLError(.timedOut)
+            default:
+                return index == 3
+                    ? .refused(429, retryAfter: 120)
+                    : Self.dashboard(
+                        [CloudFixtures.profileItem(revision: 5, ftp: 245)], revision: 5
+                    )
+            }
+        }
+
+        let detail = Task { _ = try? await rig.session.activityDetail(17) }
+        let arrived = await gate.waitForArrival()
+        XCTAssertTrue(arrived, "the detail retry never went out")
+        clock.advance(57)
+
+        let refused = try await rig.session.load(.dashboard)
+        XCTAssertEqual(refused.source, .cache)
+        XCTAssertEqual(rig.transport.requestCount, 4)
+        let dashboardReads = {
+            rig.transport.requests(matching: "/api/v1/context/dashboard").count
+        }
+        XCTAssertEqual(dashboardReads(), 1)
+
+        clock.advance(3)
+        await gate.openGate()
+        await detail.value
+        XCTAssertEqual(rig.sleeps.delays, [CloudSession.coldStartRetryDelay])
+
+        // The detail timeout must not relabel the stronger 120s Retry-After as
+        // a liftable cold-start gate.
+        await rig.session.retryNowIfWaking()
+        _ = try await rig.session.load(.dashboard)
+        XCTAssertEqual(rig.transport.requestCount, 4)
+
+        clock.advance(116)
+        _ = try await rig.session.load(.dashboard)
+        XCTAssertEqual(rig.transport.requestCount, 4)
+        clock.advance(2)
+        _ = try await rig.session.load(.dashboard)
+        XCTAssertEqual(dashboardReads(), 2)
+    }
+
+    func testActivityDetailColdStartPauseCancellationPropagates() async throws {
+        let clock = TestClock()
+        let rig = harness(clock: clock, cancelSleeps: true) { request, _ in
+            if request.url?.path == "/api/v1/context/refresh" {
+                return .json(CloudFixtures.refreshBody(context: "context-1"))
+            }
+            throw Self.timedOut(clock)
+        }
+
+        do {
+            _ = try await rig.session.activityDetail(17)
+            XCTFail("cancellation during the cold-start pause must propagate")
+        } catch is CancellationError {
+            // The cancelled pause is not an offline or waking result.
+        }
+
+        XCTAssertEqual(
+            rig.transport.requests(matching: "/api/v1/context/activities/activity-detail-17").count,
+            1
+        )
+        XCTAssertEqual(rig.sleeps.delays, [CloudSession.coldStartRetryDelay])
+    }
+
+    func testActivityDetailContextCancellationPropagates() async throws {
+        let rig = harness { _, _ in throw CancellationError() }
+
+        do {
+            _ = try await rig.session.activityDetail(17)
+            XCTFail("cancellation while minting the reader context must propagate")
+        } catch is CancellationError {
+            // Context cancellation is not an offline or server failure.
+        }
+
+        XCTAssertEqual(
+            rig.transport.requests(matching: "/api/v1/context/refresh").count,
+            1
+        )
+    }
+
     func testActivityObjectCacheEvictsStreamsBeforeDetailsAtItsCap() async throws {
         let cap = 8
         let rig = harness { request, _ in

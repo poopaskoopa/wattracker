@@ -789,6 +789,7 @@ private struct CalendarActivityDetail: View {
     @State private var streams: ActivityStreams?
     @State private var streamsError: String?
     @State private var isLoading = true
+    @State private var wake = CloudWakeNotice()
 
     private var activityID: Int? {
         CalendarData.activityID(activity)
@@ -841,6 +842,10 @@ private struct CalendarActivityDetail: View {
                                 .foregroundStyle(Palette.muted)
                         }
                     }
+                }
+                if wake.isShowing {
+                    Label("Waking up the cloud…", systemImage: "cloud")
+                        .font(.caption).foregroundStyle(Palette.muted)
                 }
                 if !metrics.isEmpty {
                     Panel {
@@ -914,7 +919,9 @@ private struct CalendarActivityDetail: View {
         isLoading = true
         defer { isLoading = false }
         do {
-            streams = try await session.activityStreams(activityID)
+            streams = try await wake.during(session) {
+                try await session.activityStreams(activityID)
+            }
             if let streams, StreamSeries.all(in: streams).isEmpty {
                 streamsError = "No recorded streams for this activity."
             }
