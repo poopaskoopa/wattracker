@@ -287,7 +287,7 @@ private struct ActivityDetailScreen: View {
     }
 }
 
-private struct StreamCharts: View {
+struct StreamCharts: View {
     let streams: ActivityStreams
     var body: some View {
         ForEach(StreamSeries.all(in: streams)) { series in

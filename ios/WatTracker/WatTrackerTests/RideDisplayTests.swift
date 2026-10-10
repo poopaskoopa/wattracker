@@ -90,6 +90,24 @@ final class RideDisplayTests: XCTestCase {
         XCTAssertEqual(timedSeries[0].points.map(\.value), [100, 300])
     }
 
+    func testStreamSeriesPreservesActivityChartOrderAndPalette() {
+        let channels = ActivityStreams.Channels(
+            time: [0, 1],
+            power: [100, 101],
+            heartrate: [140, 141],
+            cadence: [88, 89],
+            altitude: nil
+        )
+        let series = StreamSeries.all(in: ActivityStreams(streams: channels))
+
+        XCTAssertEqual(series.map(\.id), ["power", "heart-rate", "cadence"])
+        XCTAssertEqual(
+            series.map(\.title),
+            ["Power (W)", "Heart rate (bpm)", "Cadence (rpm)"]
+        )
+        XCTAssertEqual(series.map(\.color), [Palette.accent, Palette.hr, Palette.ok])
+    }
+
     func testZoneGroupsPreservePositiveRowsLabelsAndPercentages() {
         let zones: JSONValue = .object([
             "power": .object(["zones": .array([

@@ -779,7 +779,27 @@ private struct CalendarActivityRow: View {
 }
 
 private struct CalendarActivityDetail: View {
+    private struct StreamTaskID: Equatable {
+        let activityID: Int?
+        let sessionID: ObjectIdentifier?
+    }
+
     let activity: JSONValue
+    @Environment(SessionGate.self) private var gate
+    @State private var streams: ActivityStreams?
+    @State private var streamsError: String?
+    @State private var isLoading = true
+
+    private var activityID: Int? {
+        CalendarData.activityID(activity)
+    }
+
+    private var streamTaskID: StreamTaskID {
+        StreamTaskID(
+            activityID: activityID,
+            sessionID: gate.activeSession.map { ObjectIdentifier($0 as AnyObject) }
+        )
+    }
 
     private var metrics: [CalendarMetric] {
         [
@@ -843,12 +863,70 @@ private struct CalendarActivityDetail: View {
                         }
                     }
                 }
+                if activityID != nil, gate.activeSession != nil {
+                    if let streams, !StreamSeries.all(in: streams).isEmpty {
+                        StreamCharts(streams: streams)
+                    } else if isLoading {
+                        Panel {
+                            HStack(spacing: 10) {
+                                ProgressView().tint(Palette.accent)
+                                Text("Loading recorded streams…")
+                                    .foregroundStyle(Palette.muted)
+                            }
+                        }
+                    } else if let streamsError {
+                        Panel {
+                            Label(
+                                streamsError,
+                                systemImage: "waveform.path.ecg.rectangle"
+                            )
+                            .font(.callout)
+                            .foregroundStyle(Palette.muted)
+                        }
+                    } else if streams != nil {
+                        Panel {
+                            Label(
+                                "No recorded streams for this activity.",
+                                systemImage: "waveform.path.ecg.rectangle"
+                            )
+                            .font(.callout)
+                            .foregroundStyle(Palette.muted)
+                        }
+                    }
+                }
             }
             .padding(16)
         }
         .background(Palette.bg)
         .navigationTitle("Ride detail")
         .navigationBarTitleDisplayMode(.inline)
+        .task(id: streamTaskID) { await loadStreams() }
+    }
+
+    @MainActor private func loadStreams() async {
+        streams = nil
+        streamsError = nil
+        guard let activityID, let session = gate.activeSession else {
+            isLoading = false
+            return
+        }
+
+        isLoading = true
+        defer { isLoading = false }
+        do {
+            streams = try await session.activityStreams(activityID)
+            if let streams, StreamSeries.all(in: streams).isEmpty {
+                streamsError = "No recorded streams for this activity."
+            }
+        } catch let failure as CloudSession.Failure {
+            if case let .server(.http(status, _, _, _)) = failure, status == 404 {
+                streamsError = "No recorded streams for this activity."
+            } else {
+                streamsError = String(describing: failure)
+            }
+        } catch {
+            streamsError = String(describing: error)
+        }
     }
 }
 
