@@ -204,9 +204,21 @@ states on `main` when the PR is merge-committed. Four such commits are on
    #427; it touches the iOS screens and `CloudSession`, so rebase if #427
    lands first. Android parity applies (`docs/agent-workflow.md` §8): post
    the pull-to-refresh and detail cold-start notes on #196–#198, and put an
-   `Android:` line in the PR body.
+   `Android:` line in the PR body. Activities already has `.refreshable`; the
+   work is Dashboard, Calendar and Volume, plus a test pinning Activities'
+   existing behaviour. See the spec comment on #429.
 
-3. **#249: rotating full-suite test flakes. Still not a local-runs job.**
+3. **#437: calendar completed-ride streams.** In the iOS Calendar day sheet,
+   a completed ride's detail shows the same power/HR/cadence/altitude charts
+   as Activities, by reusing StreamCharts (made internal) and fetching
+   streams by the activity id. No new files (pbxproj), no `retryNowIfWaking`
+   here (that is #429's job). Full spec is in the issue body; GitHub wins if
+   it differs. It edits CalendarActivityDetail only; #429 edits
+   CalendarScreen's refresh path, so rebase whichever lands second. Android
+   parity applies: put an `Android:` line in the PR body and post a note on
+   #196–#198.
+
+4. **#249: rotating full-suite test flakes. Still not a local-runs job.**
    Nothing has changed since the re-scope. 21 consecutive clean local full
    suites stand against zero reproductions. Both known instances came from
    **taksmon's machine**. **The next step is taksmon's log and his exact
@@ -217,7 +229,7 @@ states on `main` when the PR is merge-committed. Four such commits are on
 its PR number. Dropping it while it is in flight makes it invisible if the PR is
 closed or abandoned.
 
-**When items 1 and 2 are done, the queue is empty.** #249 stays skipped pending
+**When items 1-3 are done, the queue is empty.** #249 stays skipped pending
 taksmon's log and invocation. Do not pick up unlabelled issues or anything
 below on your own. Say the queue ran out rather than inventing scope.
 
