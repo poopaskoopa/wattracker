@@ -1,3 +1,4 @@
+import Foundation
 import XCTest
 
 /// What the activities list is allowed to keep on screen.
@@ -172,5 +173,98 @@ final class ActivitiesModelTests: XCTestCase {
         XCTAssertEqual(model.availability, .available)
         XCTAssertEqual(model.snapshot?.source, .cache)
         XCTAssertEqual(model.rides.count, 2)
+    }
+}
+
+private actor RefreshRecordingSession: ReadSession {
+    private(set) var retryCallCount = 0
+
+    var deviceState: CloudSession.DeviceState { .paired }
+    var lastSuccess: Date? { nil }
+
+    nonisolated func cached(_ route: CloudRoute) -> CloudSnapshot? { nil }
+
+    func load(_ route: CloudRoute) async throws -> CloudSnapshot {
+        CloudSnapshot(
+            route: route,
+            revision: 1,
+            items: [],
+            source: .network,
+            asOf: Date()
+        )
+    }
+
+    func activityDetail(_ activityID: Int) async throws -> ActivityDetail {
+        throw UnexpectedRead.activityDetail
+    }
+
+    func activityStreams(_ activityID: Int) async throws -> ActivityStreams {
+        throw UnexpectedRead.activityStreams
+    }
+
+    func retryNowIfWaking() async {
+        retryCallCount += 1
+    }
+
+    func retryCalls() -> Int { retryCallCount }
+
+    private enum UnexpectedRead: Error {
+        case activityDetail
+        case activityStreams
+    }
+}
+
+@MainActor
+final class PullToRefreshModelTests: XCTestCase {
+    func testActivitiesRefreshOnlyLiftsWakingGateWhenUserInitiated() async {
+        let session = RefreshRecordingSession()
+        let model = ActivitiesModel()
+
+        await model.refresh(session: session)
+        let initialCalls = await session.retryCalls()
+        XCTAssertEqual(initialCalls, 0)
+
+        await model.refresh(session: session, userInitiated: true)
+        let refreshedCalls = await session.retryCalls()
+        XCTAssertEqual(refreshedCalls, 1)
+    }
+
+    func testDashboardStartOnlyLiftsWakingGateWhenUserInitiated() async {
+        let session = RefreshRecordingSession()
+        let model = DashboardModel()
+
+        await model.start(session: session)
+        let initialCalls = await session.retryCalls()
+        XCTAssertEqual(initialCalls, 0)
+
+        await model.start(session: session, userInitiated: true)
+        let refreshedCalls = await session.retryCalls()
+        XCTAssertEqual(refreshedCalls, 1)
+    }
+
+    func testCalendarStartOnlyLiftsWakingGateWhenUserInitiated() async {
+        let session = RefreshRecordingSession()
+        let model = CalendarModel()
+
+        await model.start(session: session)
+        let initialCalls = await session.retryCalls()
+        XCTAssertEqual(initialCalls, 0)
+
+        await model.start(session: session, userInitiated: true)
+        let refreshedCalls = await session.retryCalls()
+        XCTAssertEqual(refreshedCalls, 1)
+    }
+
+    func testVolumeStartOnlyLiftsWakingGateWhenUserInitiated() async {
+        let session = RefreshRecordingSession()
+        let model = VolumeScreenModel()
+
+        await model.start(session: session)
+        let initialCalls = await session.retryCalls()
+        XCTAssertEqual(initialCalls, 0)
+
+        await model.start(session: session, userInitiated: true)
+        let refreshedCalls = await session.retryCalls()
+        XCTAssertEqual(refreshedCalls, 1)
     }
 }

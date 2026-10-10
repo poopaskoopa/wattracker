@@ -28,6 +28,9 @@ struct DashboardScreen: View {
             content
         }
         .task(id: gate.backend) { await model.start(session: gate.activeSession) }
+        .refreshable {
+            await model.start(session: gate.activeSession, userInitiated: true)
+        }
     }
 
     @ViewBuilder
@@ -97,7 +100,7 @@ final class DashboardModel {
     /// credential means a sign-out or a revoke in Settings leaves this screen
     /// holding one that still believes it is paired, rendering a signed-out
     /// rider's numbers until something forces a reload.
-    func start(session: (any ReadSession)?) async {
+    func start(session: (any ReadSession)?, userInitiated: Bool = false) async {
         state = .starting
         // No session means the gate has not produced one: no credential yet,
         // or the signing key could not be read. Both are the shell's to
@@ -125,6 +128,7 @@ final class DashboardModel {
             apply(cached)
         }
 
+        if userInitiated { await session.retryNowIfWaking() }
         do {
             apply(try await wake.during(session) { try await session.load(.dashboard) })
         } catch let failure as CloudSession.Failure {

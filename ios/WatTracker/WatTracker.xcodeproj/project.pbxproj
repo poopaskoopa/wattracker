@@ -76,6 +76,9 @@
 		1A0000000000000000000212 /* LocalBackendTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 1A0000000000000000000213 /* LocalBackendTests.swift */; };
 		1A0000000000000000000214 /* LocalBackend.swift in Sources */ = {isa = PBXBuildFile; fileRef = 1A0000000000000000000210 /* LocalBackend.swift */; };
 		1A0000000000000000000221 /* BehaviourVectorTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 1A0000000000000000000220 /* BehaviourVectorTests.swift */; };
+		1A0000000000000000000230 /* DashboardScreen.swift in Sources */ = {isa = PBXBuildFile; fileRef = 1A0000000000000000000093 /* DashboardScreen.swift */; };
+		1A0000000000000000000231 /* CalendarScreen.swift in Sources */ = {isa = PBXBuildFile; fileRef = 1A0000000000000000000095 /* CalendarScreen.swift */; };
+		1A0000000000000000000232 /* VolumeScreen.swift in Sources */ = {isa = PBXBuildFile; fileRef = 1A0000000000000000000096 /* VolumeScreen.swift */; };
 /* End PBXBuildFile section */
 
 /* Begin PBXFileReference section */
@@ -457,6 +460,9 @@
 				1A00000000000000000001CE /* Palette.swift in Sources */,
 				1A00000000000000000001CF /* Panel.swift in Sources */,
 				1A00000000000000000001D1 /* ActivitiesModel.swift in Sources */,
+				1A0000000000000000000230 /* DashboardScreen.swift in Sources */,
+				1A0000000000000000000231 /* CalendarScreen.swift in Sources */,
+				1A0000000000000000000232 /* VolumeScreen.swift in Sources */,
 				1A00000000000000000001D2 /* ActivitiesModelTests.swift in Sources */,
 				1A00000000000000000001D3 /* RideDisplayTests.swift in Sources */,
 				1A0000000000000000000212 /* LocalBackendTests.swift in Sources */,
