@@ -867,12 +867,19 @@ activity read summary; hidden duplicate rides are excluded; stream power uses
 the active correction ranges used by local activity reads; and no weight is
 published (weight is resolved at read time for display/scaling only). Filename,
 local IDs, and other local-only fields are intentionally excluded from the
-cloud payload. History cutoffs and dirty/republish tracking remain out of
-scope for #173 (#172 and #157).
+cloud payload. Enabled desktop sync publishes a bounded `stream-<id>` object
+for every published ride with at least one plottable power, heart-rate,
+cadence, or altitude channel, not only for recently opened rides. The stream
+object is fetched only after a mobile rider opens the ride; a ride with only a
+`time` channel (or no finite plottable samples) has no stream object, so the
+clients' existing 404 / “No recorded streams” handling remains correct.
+History cutoffs and dirty/republish tracking remain out of scope for #173
+(#172 and #157).
 Legacy read-only snapshots without `duplicate_of` retain all activities, and
 snapshots without a complete correction table publish streams without masking.
-The payload validator permits up to 16,384 array items for realistic long
-streams; the existing 512 KiB object and decompression limits still apply.
+Publisher streams are downsampled to at most 1,500 points per channel. The
+payload validator permits up to 16,384 array items for realistic long streams;
+the existing 512 KiB object and decompression limits still apply.
 
 The deployed container entrypoint is `python -m wattracker.cloud.runtime`. It
 constructs `AzureTenantStore` with managed identity and Storage service

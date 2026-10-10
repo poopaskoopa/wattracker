@@ -81,6 +81,21 @@ final class CloudSessionTests: XCTestCase {
         .json(CloudFixtures.collection(items: items, revision: revision))
     }
 
+    private func sharedCloudObject(_ id: String) throws -> String {
+        let bundle = Bundle(for: type(of: self))
+        let url = try XCTUnwrap(
+            bundle.url(forResource: "cloud_objects_v1", withExtension: "json")
+        )
+        let root = try XCTUnwrap(
+            try JSONSerialization.jsonObject(with: Data(contentsOf: url))
+                as? [String: Any]
+        )
+        let items = try XCTUnwrap(root["items"] as? [[String: Any]])
+        let item = try XCTUnwrap(items.first { $0["id"] as? String == id })
+        let data = try JSONSerialization.data(withJSONObject: item, options: [.sortedKeys])
+        return String(decoding: data, as: UTF8.self)
+    }
+
     // MARK: - Expiry
 
     func testATokenNearingExpiryIsReplacedBeforeItIsUsed() async throws {
@@ -1827,6 +1842,7 @@ final class CloudSessionTests: XCTestCase {
     }
 
     func testActivityDetailAndStreamsUseObjectRoutesDecodeAndCachePerSession() async throws {
+        let streamObject = try sharedCloudObject("stream-17")
         let rig = harness { request, _ in
             switch request.url?.path {
             case "/api/v1/context/refresh":
@@ -1839,11 +1855,7 @@ final class CloudSessionTests: XCTestCase {
                   "tss":81,"rpe":6,"zones":{"power":{"zones":[]}}}}
                 """)
             case "/api/v1/context/activities/stream-17":
-                return .json("""
-                {"id":"stream-17","kind":"stream","revision":17,"data":{
-                  "streams":{"time":[0,1,2],"power":[180,null,205],
-                             "heartrate":[120,121,123],"altitude":[10,11,12]}}}
-                """)
+                return .json(streamObject)
             default:
                 return .refused(404)
             }
@@ -1857,7 +1869,12 @@ final class CloudSessionTests: XCTestCase {
         let streams = try await rig.session.activityStreams(17)
         XCTAssertEqual(streams.streams.power?.count, 3)
         XCTAssertNil(streams.streams.power?[1])
-        XCTAssertNil(streams.streams.cadence)
+        XCTAssertEqual(streams.streams.cadence, [85, 86, 87])
+        XCTAssertEqual(
+            StreamSeries.all(in: streams).map(\.id),
+            ["power", "heart-rate", "cadence"],
+            "the shared publisher payload renders the expected three charts"
+        )
 
         _ = try await rig.session.activityDetail(17)
         _ = try await rig.session.activityStreams(17)
