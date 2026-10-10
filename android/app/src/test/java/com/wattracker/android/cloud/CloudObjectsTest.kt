@@ -60,7 +60,8 @@ class CloudObjectsTest {
         val power = stream.value.streams.power!!
         assertEquals(3, power.size)
         assertNull(power[1]) // a recording gap stays a gap
-        assertNull(stream.value.streams.cadence) // an unrecorded channel is absent, not empty
+        assertEquals(listOf(85.0, 86.0, 87.0), stream.value.streams.cadence)
+        assertTrue(stream.value.streams.altitude!!.all { it == null })
     }
 
     @Test

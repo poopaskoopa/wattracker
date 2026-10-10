@@ -121,7 +121,7 @@
       "id": "stream-17",
       "kind": "stream",
       "revision": 17,
-      "data": {"streams": {"time": [0, 1, 2], "power": [180, null, 205], "heartrate": [120, 121, 123]}}
+      "data": {"streams": {"time": [0, 1, 2], "power": [180, null, 205], "heartrate": [120, 121, 123], "cadence": [85, 86, 87], "altitude": [null, null, null]}}
     }
   ]
 }

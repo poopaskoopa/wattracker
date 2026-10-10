@@ -37,6 +37,11 @@ from .models import (
 
 DETAIL_MAX_POINTS = 1500
 MAX_STREAM_DECODED = 512 * 1024
+# Stream publication may recover a source ride that is larger than the normal
+# derived-object decode guard, but only within a separate bounded budget.  The
+# recovered mapping is downsampled immediately and is never fed to the other
+# derived-object calculations.
+MAX_STREAM_PUBLISH_DECODED = 4 * 1024 * 1024
 # Keep generated request bodies below the cloud API's default QuotaPolicy and
 # CloudConfig request ceiling. Object validation alone is not enough: dozens
 # of valid 512 KiB objects can still form an invalid request.
@@ -57,6 +62,7 @@ _ACTIVITY_FIELDS = (
     "start_time", "duration_s", "distance_m", "avg_power", "avg_hr", "np",
     "if_", "tss", "rpe",
 )
+_PLOTTABLE_STREAM_KEYS = ("power", "heartrate", "cadence", "altitude")
 
 
 def _safe_data(value: Any) -> Any:
@@ -192,6 +198,19 @@ def _downsample(values: Any, target: int = DETAIL_MAX_POINTS) -> list:
     return out
 
 
+def _has_plottable_stream(values: Any) -> bool:
+    if not isinstance(values, Sequence) or isinstance(
+        values, (str, bytes, bytearray)
+    ):
+        return False
+    return any(
+        isinstance(value, (int, float))
+        and not isinstance(value, bool)
+        and math.isfinite(float(value))
+        for value in values
+    )
+
+
 def _activity_rows(
     conn: sqlite3.Connection, user_id: int, settings: Mapping[str, Any],
     *, decode: bool, chronological: bool,
@@ -223,7 +242,12 @@ def _activity_rows(
             if decode and "streams" in row.keys()
             else {}
         )
-        records.append({"row": row, "summary": summary, "streams": streams})
+        records.append({
+            "row": row,
+            "summary": summary,
+            "streams": streams,
+            "stream_ranges": ranges.get(int(row["id"]), []),
+        })
     return records
 
 
@@ -924,6 +948,8 @@ def _activity_detail(
     settings: Mapping[str, Any],
     ftp: Mapping[str, Any],
     hr: Mapping[str, Any],
+    *,
+    include_streams: bool,
 ) -> tuple[CloudObject, Optional[CloudObject]]:
     summary = record["summary"]
     streams = record.get("streams")
@@ -949,13 +975,26 @@ def _activity_detail(
         revision=max(1, int(summary["id"])),
         data=_safe_data(detail),
     )
+    stream_source = streams
+    if include_streams and not stream_source:
+        row = record.get("row")
+        if row is not None and "streams" in row.keys():
+            stream_source = _decode_streams(
+                row["streams"], record.get("stream_ranges", []),
+                max_decoded=MAX_STREAM_PUBLISH_DECODED,
+            )
+    if not isinstance(stream_source, Mapping):
+        stream_source = {}
     stream_object = None
-    if streams:
+    if stream_source and any(
+        _has_plottable_stream(stream_source.get(key))
+        for key in _PLOTTABLE_STREAM_KEYS
+    ):
         stream_data = {
-            key: _downsample(streams.get(key) or [])
+            key: _downsample(stream_source.get(key) or [])
             for key in ("time", "power", "heartrate", "cadence", "altitude")
-            if isinstance(streams.get(key), Sequence)
-            and not isinstance(streams.get(key), (str, bytes, bytearray))
+            if isinstance(stream_source.get(key), Sequence)
+            and not isinstance(stream_source.get(key), (str, bytes, bytearray))
         }
         if stream_data:
             stream_object = CloudObject(
@@ -1203,7 +1242,8 @@ def snapshot_objects(
             activity_objects.append(activity_object)
             if derived_enabled:
                 detail, stream = _activity_detail(
-                    conn, user_id, record, settings, ftp, hr
+                    conn, user_id, record, settings, ftp, hr,
+                    include_streams=include_streams,
                 )
                 detail_objects.append(detail)
                 if include_streams and stream is not None:
