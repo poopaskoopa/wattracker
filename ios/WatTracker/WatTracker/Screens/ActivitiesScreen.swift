@@ -214,7 +214,7 @@ private struct ActivityDetailScreen: View {
                 summaryPanel
                 if let detail { ZoneSection(zones: detail.zones) }
                 if let streams, !StreamSeries.all(in: streams).isEmpty {
-                    StreamCharts(streams: streams)
+                    StreamCharts(streams: streams, durationSeconds: ride.summary.durationS)
                 } else if isLoading {
                     Panel {
                         HStack(spacing: 10) {
@@ -298,14 +298,28 @@ private struct ActivityDetailScreen: View {
 
 struct StreamCharts: View {
     let streams: ActivityStreams
+    var durationSeconds: Double?
     @State private var hidden: Set<String> = []
 
     var body: some View {
-        let series = CombinedChartSeries.build(from: streams)
+        let series = CombinedChartSeries.build(from: streams, durationSeconds: durationSeconds)
         let visible = series.filter { !hidden.contains($0.id) }
+        let all = StreamSeries.all(in: streams)
+        let powerAxis = visible.contains { $0.id == "power" }
+            ? CombinedChartSeries.axis(.power, in: all) : nil
+        let sharedAxis = visible.contains { $0.id == "heart-rate" || $0.id == "cadence" }
+            ? CombinedChartSeries.axis(.shared, in: all) : nil
+        let extent = CombinedChartSeries.extent(series)
+        let xTicks = ChartTicks.minutes(upTo: extent)
         Panel {
             VStack(alignment: .leading, spacing: 8) {
                 Text("Ride graphs").font(.headline).foregroundStyle(Palette.textBright)
+                HStack {
+                    Text(powerAxis?.title ?? "").foregroundStyle(Palette.accent)
+                    Spacer()
+                    Text(sharedAxis?.title ?? "").foregroundStyle(Palette.muted)
+                }
+                .font(.caption2)
                 Chart {
                     ForEach(visible) { s in
                         ForEach(s.points) { p in
@@ -335,20 +349,59 @@ struct StreamCharts: View {
                 .chartForegroundStyleScale(domain: series.map(\.id), range: series.map(\.color))
                 .chartLegend(.hidden)
                 .chartYScale(domain: 0...1)
-                .chartYAxis(.hidden)
+                .chartXScale(domain: 0...max(extent, 1.0 / 60))
+                .chartYAxis {
+                    if let powerAxis {
+                        AxisMarks(position: .leading, values: powerAxis.scaledTicks) { value in
+                            AxisGridLine().foregroundStyle(Palette.surfaceBorder)
+                            AxisValueLabel {
+                                if let p = value.as(Double.self) {
+                                    Text(Self.tickLabel(powerAxis.value(atScaled: p)))
+                                }
+                            }
+                            .foregroundStyle(Palette.muted)
+                        }
+                    }
+                    if let sharedAxis {
+                        AxisMarks(position: .trailing, values: sharedAxis.scaledTicks) { value in
+                            if powerAxis == nil { AxisGridLine().foregroundStyle(Palette.surfaceBorder) }
+                            AxisValueLabel {
+                                if let p = value.as(Double.self) {
+                                    Text(Self.tickLabel(sharedAxis.value(atScaled: p)))
+                                }
+                            }
+                            .foregroundStyle(Palette.muted)
+                        }
+                    }
+                }
                 .chartXAxis {
-                    AxisMarks {
+                    AxisMarks(values: xTicks) { value in
                         AxisGridLine().foregroundStyle(Palette.surfaceBorder)
-                        AxisValueLabel().foregroundStyle(Palette.muted)
+                        AxisValueLabel {
+                            if let m = value.as(Double.self) { Text(Self.tickLabel(m)) }
+                        }
+                        .foregroundStyle(Palette.muted)
                     }
                 }
                 .frame(height: 220)
                 .accessibilityLabel("Ride graphs chart")
-                Text("Time (min). Each series is scaled to its own range.")
+                Text("Time (min). Altitude is a faint background without an axis.")
                     .font(.caption2).foregroundStyle(Palette.muted)
                 legend(series)
             }
         }
+    }
+
+    private static func range(_ s: CombinedChartSeries) -> String {
+        let values = s.points.map(\.value)
+        guard let lo = values.min(), let hi = values.max() else { return "" }
+        let low = s.isBackground ? lo : 0
+        return "\(Int(low.rounded()))-\(Int(hi.rounded()))"
+    }
+
+    static func tickLabel(_ value: Double) -> String {
+        let rounded = (value * 10).rounded() / 10
+        return rounded == rounded.rounded() ? String(Int(rounded)) : String(format: "%.1f", rounded)
     }
 
     private func legend(_ series: [CombinedChartSeries]) -> some View {
@@ -361,7 +414,7 @@ struct StreamCharts: View {
                 } label: {
                     HStack(spacing: 6) {
                         Circle().fill(s.color).frame(width: 9, height: 9)
-                        Text("\(s.title) \(Int(s.lower.rounded()))-\(Int(s.upper.rounded()))")
+                        Text("\(s.title) \(Self.range(s))")
                             .font(.caption).foregroundStyle(Palette.text)
                     }
                     .opacity(off ? 0.4 : 1)
