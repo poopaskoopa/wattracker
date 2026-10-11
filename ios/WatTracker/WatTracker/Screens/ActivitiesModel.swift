@@ -158,6 +158,47 @@ struct StreamSeries: Identifiable {
     }
 }
 
+/// One series of the combined ride chart, rescaled onto a shared 0...1 band.
+/// Mirrors the desktop chart (wattracker/web/static/app.js, renderActivityDetail):
+/// every channel has its own y-scale, power/HR/cadence start at zero, and
+/// altitude is a faint filled background on an auto (min...max) scale.
+struct CombinedChartSeries: Identifiable {
+    struct Point: Identifiable { let id: Int; let minutes: Double; let value: Double; let scaled: Double }
+    let id: String
+    let title: String
+    let color: Color
+    let isBackground: Bool
+    let lower: Double
+    let upper: Double
+    let points: [Point]
+
+    /// Desktop draws altitude as fill 0.18 / border 0.5 of the context colour.
+    static let altitudeFillOpacity = 0.18
+    static let altitudeLineOpacity = 0.5
+
+    /// Altitude first (drawn behind), then power, heart rate, cadence.
+    static func build(from payload: ActivityStreams) -> [CombinedChartSeries] {
+        let all = StreamSeries.all(in: payload)
+        let order = ["altitude", "power", "heart-rate", "cadence"]
+        return order.compactMap { id in
+            guard let source = all.first(where: { $0.id == id }) else { return nil }
+            let isAltitude = id == "altitude"
+            let values = source.points.map(\.value)
+            let hi = values.max() ?? 0
+            let lo = isAltitude ? (values.min() ?? 0) : 0
+            let span = hi - lo
+            let points = source.points.map { p in
+                Point(id: p.id, minutes: p.time / 60, value: p.value,
+                      scaled: span > 0 ? (p.value - lo) / span : (isAltitude ? 0.5 : 0))
+            }
+            return CombinedChartSeries(
+                id: id, title: source.title,
+                color: isAltitude ? Palette.muted : source.color,
+                isBackground: isAltitude, lower: lo, upper: hi, points: points)
+        }
+    }
+}
+
 struct ZoneGroup: Identifiable {
     let id: String
     let title: String
