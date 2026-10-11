@@ -298,25 +298,75 @@ private struct ActivityDetailScreen: View {
 
 struct StreamCharts: View {
     let streams: ActivityStreams
+    @State private var hidden: Set<String> = []
+
     var body: some View {
-        ForEach(StreamSeries.all(in: streams)) { series in
-            Panel {
-                VStack(alignment: .leading, spacing: 8) {
-                    Text(series.title).font(.headline).foregroundStyle(Palette.textBright)
-                    Chart(series.points) { point in
-                        LineMark(x: .value("Seconds", point.time),
-                                 y: .value(series.title, point.value))
-                            .foregroundStyle(series.color).interpolationMethod(.linear)
-                    }
-                    .chartXAxis(.hidden)
-                    .chartYAxis {
-                        AxisMarks(position: .leading) {
-                            AxisGridLine().foregroundStyle(Palette.surfaceBorder)
-                            AxisValueLabel().foregroundStyle(Palette.muted)
+        let series = CombinedChartSeries.build(from: streams)
+        let visible = series.filter { !hidden.contains($0.id) }
+        Panel {
+            VStack(alignment: .leading, spacing: 8) {
+                Text("Ride graphs").font(.headline).foregroundStyle(Palette.textBright)
+                Chart {
+                    ForEach(visible) { s in
+                        ForEach(s.points) { p in
+                            if s.isBackground {
+                                AreaMark(x: .value("Minutes", p.minutes),
+                                         y: .value(s.title, p.scaled),
+                                         series: .value("Series", s.id))
+                                    .foregroundStyle(s.color.opacity(CombinedChartSeries.altitudeFillOpacity))
+                                    .interpolationMethod(.linear)
+                                LineMark(x: .value("Minutes", p.minutes),
+                                         y: .value(s.title, p.scaled),
+                                         series: .value("Series", s.id))
+                                    .foregroundStyle(s.color.opacity(CombinedChartSeries.altitudeLineOpacity))
+                                    .lineStyle(StrokeStyle(lineWidth: 1))
+                                    .interpolationMethod(.linear)
+                            } else {
+                                LineMark(x: .value("Minutes", p.minutes),
+                                         y: .value(s.title, p.scaled),
+                                         series: .value("Series", s.id))
+                                    .foregroundStyle(s.color)
+                                    .lineStyle(StrokeStyle(lineWidth: 1.5))
+                                    .interpolationMethod(.linear)
+                            }
                         }
                     }
-                    .frame(height: 145).accessibilityLabel("\(series.title) chart")
                 }
+                .chartForegroundStyleScale(domain: series.map(\.id), range: series.map(\.color))
+                .chartLegend(.hidden)
+                .chartYScale(domain: 0...1)
+                .chartYAxis(.hidden)
+                .chartXAxis {
+                    AxisMarks {
+                        AxisGridLine().foregroundStyle(Palette.surfaceBorder)
+                        AxisValueLabel().foregroundStyle(Palette.muted)
+                    }
+                }
+                .frame(height: 220)
+                .accessibilityLabel("Ride graphs chart")
+                Text("Time (min). Each series is scaled to its own range.")
+                    .font(.caption2).foregroundStyle(Palette.muted)
+                legend(series)
+            }
+        }
+    }
+
+    private func legend(_ series: [CombinedChartSeries]) -> some View {
+        LazyVGrid(columns: [GridItem(.adaptive(minimum: 150), alignment: .leading)],
+                  alignment: .leading, spacing: 6) {
+            ForEach(series) { s in
+                let off = hidden.contains(s.id)
+                Button {
+                    if off { hidden.remove(s.id) } else { hidden.insert(s.id) }
+                } label: {
+                    HStack(spacing: 6) {
+                        Circle().fill(s.color).frame(width: 9, height: 9)
+                        Text("\(s.title) \(Int(s.lower.rounded()))-\(Int(s.upper.rounded()))")
+                            .font(.caption).foregroundStyle(Palette.text)
+                    }
+                    .opacity(off ? 0.4 : 1)
+                }
+                .buttonStyle(.plain)
             }
         }
     }

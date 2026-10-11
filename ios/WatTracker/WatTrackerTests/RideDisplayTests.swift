@@ -108,6 +108,20 @@ final class RideDisplayTests: XCTestCase {
         XCTAssertEqual(series.map(\.color), [Palette.accent, Palette.hr, Palette.ok])
     }
 
+    func testCombinedChartScalesEachSeriesAndLayersAltitudeBehind() {
+        let channels = ActivityStreams.Channels(
+            time: [0, 60, 120], power: [0, 100, 200], heartrate: [100, 150, 200],
+            cadence: nil, altitude: [50, 60, 70]
+        )
+        let combined = CombinedChartSeries.build(from: ActivityStreams(streams: channels))
+        XCTAssertEqual(combined.map(\.id), ["altitude", "power", "heart-rate"])
+        XCTAssertTrue(combined[0].isBackground)
+        XCTAssertEqual(combined[0].points.map(\.scaled), [0, 0.5, 1])   // auto min...max
+        XCTAssertEqual(combined[1].points.map(\.scaled), [0, 0.5, 1])   // zero-based
+        XCTAssertEqual(combined[2].points.map(\.scaled), [0.5, 0.75, 1])
+        XCTAssertEqual(combined[1].points.map(\.minutes), [0, 1, 2])
+    }
+
     func testZoneGroupsPreservePositiveRowsLabelsAndPercentages() {
         let zones: JSONValue = .object([
             "power": .object(["zones": .array([
