@@ -158,10 +158,55 @@ struct StreamSeries: Identifiable {
     }
 }
 
+/// A y-axis of the combined ride chart: real-unit ticks over `lower...upper`.
+struct ChartAxis: Equatable {
+    let lower: Double
+    let upper: Double
+    let ticks: [Double]
+    let title: String
+
+    /// Tick positions on the shared 0...1 plot band.
+    var scaledTicks: [Double] { ticks.map { ($0 - lower) / (upper - lower) } }
+
+    /// Real value at a 0...1 plot position (inverse of the series scaling).
+    func value(atScaled position: Double) -> Double { lower + position * (upper - lower) }
+
+    /// Zero-based "nice" axis covering `values` (negatives extend the floor).
+    static func zeroBased(for values: [Double], title: String) -> ChartAxis {
+        let hi = values.max() ?? 0, lo = min(0, values.min() ?? 0)
+        let (ticks, lower, upper) = ChartTicks.nice(lower: lo, upper: hi, target: 5)
+        return ChartAxis(lower: lower, upper: upper, ticks: ticks, title: title)
+    }
+}
+
+enum ChartTicks {
+    /// Round tick values with 1/2/5 x 10^n steps; the returned bounds enclose
+    /// `lower...upper` and always span a positive range.
+    static func nice(lower: Double, upper: Double, target: Int) -> (ticks: [Double], lower: Double, upper: Double) {
+        let hi = max(upper, lower), span = hi - lower
+        let rough = (span > 1e-9 ? span : 1) / Double(max(target, 1))
+        let magnitude = pow(10, floor(log10(rough)))
+        let step = [1.0, 2, 5, 10].map { $0 * magnitude }.first { $0 >= rough } ?? 10 * magnitude
+        let lo = (lower / step).rounded(.down) * step
+        var top = (hi / step).rounded(.up) * step
+        if top <= lo { top = lo + step }
+        let count = Int(((top - lo) / step).rounded())
+        return ((0...count).map { lo + Double($0) * step }, lo, top)
+    }
+
+    /// Minute ticks for 0...`minutes`: whole-minute steps, at most ~6 labels.
+    static func minutes(upTo minutes: Double) -> [Double] {
+        guard minutes.isFinite, minutes > 0 else { return [0] }
+        let step = [1.0, 2, 5, 10, 15, 20, 30, 60, 120, 240].first { minutes / $0 <= 6 } ?? 480
+        return Array(stride(from: 0.0, through: minutes, by: step))
+    }
+}
+
 /// One series of the combined ride chart, rescaled onto a shared 0...1 band.
 /// Mirrors the desktop chart (wattracker/web/static/app.js, renderActivityDetail):
-/// every channel has its own y-scale, power/HR/cadence start at zero, and
-/// altitude is a faint filled background on an auto (min...max) scale.
+/// power has its own left axis, heart rate and cadence share one right axis
+/// (both zero-based), and altitude is a faint filled background on an auto
+/// (min...max) scale with no axis.
 struct CombinedChartSeries: Identifiable {
     struct Point: Identifiable { let id: Int; let minutes: Double; let value: Double; let scaled: Double }
     let id: String
@@ -177,25 +222,80 @@ struct CombinedChartSeries: Identifiable {
     static let altitudeLineOpacity = 0.5
 
     /// Altitude first (drawn behind), then power, heart rate, cadence.
-    static func build(from payload: ActivityStreams) -> [CombinedChartSeries] {
+    static func build(from payload: ActivityStreams, durationSeconds: Double? = nil) -> [CombinedChartSeries] {
         let all = StreamSeries.all(in: payload)
         let order = ["altitude", "power", "heart-rate", "cadence"]
+        let clock = MinutesClock(payload, durationSeconds: durationSeconds)
+        let powerAxis = axis(.power, in: all)
+        let sharedAxis = axis(.shared, in: all)
         return order.compactMap { id in
             guard let source = all.first(where: { $0.id == id }) else { return nil }
             let isAltitude = id == "altitude"
             let values = source.points.map(\.value)
-            let hi = values.max() ?? 0
-            let lo = isAltitude ? (values.min() ?? 0) : 0
+            let lo: Double, hi: Double
+            if isAltitude {
+                lo = values.min() ?? 0; hi = values.max() ?? 0
+            } else {
+                let a = id == "power" ? powerAxis : sharedAxis
+                lo = a?.lower ?? 0; hi = a?.upper ?? 1
+            }
             let span = hi - lo
             let points = source.points.map { p in
-                Point(id: p.id, minutes: p.time / 60, value: p.value,
-                      scaled: span > 0 ? (p.value - lo) / span : (isAltitude ? 0.5 : 0))
+                Point(id: p.id, minutes: clock.minutes(for: p), value: p.value,
+                      scaled: span > 0 ? (p.value - lo) / span : 0.5)
             }
             return CombinedChartSeries(
                 id: id, title: source.title,
                 color: isAltitude ? Palette.muted : source.color,
                 isBackground: isAltitude, lower: lo, upper: hi, points: points)
         }
+    }
+
+    enum Side { case power, shared }
+
+    /// Left (power, "W") or right (heart rate + cadence, "bpm / rpm") axis,
+    /// built from every series on that side whether or not it is hidden, so
+    /// toggling the legend never rescales the plot.
+    static func axis(_ side: Side, in all: [StreamSeries]) -> ChartAxis? {
+        let ids: Set<String> = side == .power ? ["power"] : ["heart-rate", "cadence"]
+        let values = all.filter { ids.contains($0.id) }.flatMap { $0.points.map(\.value) }
+        guard !values.isEmpty else { return nil }
+        return .zeroBased(for: values, title: side == .power ? "W" : "bpm / rpm")
+    }
+
+    /// X-axis extent in minutes (0...ride length) for a built chart.
+    static func extent(_ series: [CombinedChartSeries]) -> Double {
+        series.flatMap(\.points).map(\.minutes).max() ?? 0
+    }
+}
+
+/// Converts a stream sample to true elapsed minutes.
+///
+/// The cloud's `time` channel is usually all nil: the desktop stores ISO
+/// timestamps and the publisher's numeric downsampler drops them. Falling back
+/// to the sample index (as this once did) labelled a 1,500-point downsample of
+/// an 86-minute ride 0...25 minutes. With the ride duration known, samples are
+/// spread evenly over 0...duration (the downsample is uniform); without it, 1 Hz
+/// is assumed.
+struct MinutesClock {
+    private let hasTime: Bool
+    private let count: Int
+    private let durationSeconds: Double?
+
+    init(_ payload: ActivityStreams, durationSeconds: Double?) {
+        let c = payload.streams
+        hasTime = (c.time ?? []).contains { $0?.isFinite == true }
+        count = [c.power, c.heartrate, c.cadence, c.altitude, c.time]
+            .map { $0?.count ?? 0 }.max() ?? 0
+        self.durationSeconds = durationSeconds.flatMap { $0.isFinite && $0 > 0 ? $0 : nil }
+    }
+
+    func minutes(for point: StreamPoint) -> Double {
+        if hasTime { return point.time / 60 }
+        if let durationSeconds, count > 1 {
+            return Double(point.id) / Double(count - 1) * durationSeconds / 60
+        }
+        return Double(point.id) / 60
     }
 }
 

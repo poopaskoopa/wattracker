@@ -108,18 +108,64 @@ final class RideDisplayTests: XCTestCase {
         XCTAssertEqual(series.map(\.color), [Palette.accent, Palette.hr, Palette.ok])
     }
 
-    func testCombinedChartScalesEachSeriesAndLayersAltitudeBehind() {
+    func testCombinedChartUsesSharedAxesAndLayersAltitudeBehind() {
         let channels = ActivityStreams.Channels(
             time: [0, 60, 120], power: [0, 100, 200], heartrate: [100, 150, 200],
-            cadence: nil, altitude: [50, 60, 70]
+            cadence: [50, 60, 70], altitude: [50, 60, 70]
         )
         let combined = CombinedChartSeries.build(from: ActivityStreams(streams: channels))
-        XCTAssertEqual(combined.map(\.id), ["altitude", "power", "heart-rate"])
+        XCTAssertEqual(combined.map(\.id), ["altitude", "power", "heart-rate", "cadence"])
         XCTAssertTrue(combined[0].isBackground)
         XCTAssertEqual(combined[0].points.map(\.scaled), [0, 0.5, 1])   // auto min...max
-        XCTAssertEqual(combined[1].points.map(\.scaled), [0, 0.5, 1])   // zero-based
+        XCTAssertEqual(combined[1].points.map(\.scaled), [0, 0.5, 1])   // power axis 0...200
+        // HR and cadence share one 0...200 scale, so cadence stays low.
         XCTAssertEqual(combined[2].points.map(\.scaled), [0.5, 0.75, 1])
+        XCTAssertEqual(combined[3].points.map(\.scaled), [0.25, 0.3, 0.35])
         XCTAssertEqual(combined[1].points.map(\.minutes), [0, 1, 2])
+        let all = StreamSeries.all(in: ActivityStreams(streams: channels))
+        XCTAssertEqual(CombinedChartSeries.axis(.power, in: all)?.title, "W")
+        XCTAssertEqual(CombinedChartSeries.axis(.shared, in: all)?.title, "bpm / rpm")
+        XCTAssertEqual(CombinedChartSeries.axis(.shared, in: all)?.upper, 200)
+        XCTAssertEqual(CombinedChartSeries.axis(.shared, in: all)?.scaledTicks.last, 1)
+    }
+
+    /// Regression: the cloud time channel is all nil, so x fell back to the
+    /// downsampled point index / 60 and an 86-minute ride read 0...25.
+    func testEightySixMinuteRideSpansTrueMinutesWithoutTimeChannel() {
+        let n = 1_500, duration = 86.0 * 60
+        let ramp = (0..<n).map { Double($0 % 300) }
+        let channels = ActivityStreams.Channels(
+            time: Array(repeating: nil, count: n), power: ramp, heartrate: ramp,
+            cadence: nil, altitude: nil)
+        let payload = ActivityStreams(streams: channels)
+        let series = CombinedChartSeries.build(from: payload, durationSeconds: duration)
+        let xs = series[0].points.map(\.minutes)
+        XCTAssertEqual(xs.first ?? -1, 0, accuracy: 1e-9)
+        XCTAssertEqual(xs.last ?? -1, 86, accuracy: 1e-9)
+        XCTAssertEqual(CombinedChartSeries.extent(series), 86, accuracy: 1e-9)
+        XCTAssertEqual(ChartTicks.minutes(upTo: 86), [0, 15, 30, 45, 60, 75])
+        // 1 Hz, un-downsampled samples agree with the 1 Hz fallback.
+        let hz = ActivityStreams(streams: .init(
+            time: nil, power: Array(repeating: 100, count: 5_161), heartrate: nil,
+            cadence: nil, altitude: nil))
+        XCTAssertEqual(CombinedChartSeries.extent(CombinedChartSeries.build(from: hz)), 5_160.0 / 60, accuracy: 1e-9)
+        XCTAssertEqual(CombinedChartSeries.extent(CombinedChartSeries.build(from: hz, durationSeconds: 5_160)), 86, accuracy: 1e-9)
+    }
+
+    func testChartAxisEdgeCases() {
+        XCTAssertEqual(ChartTicks.nice(lower: 0, upper: 312, target: 5).ticks, [0, 100, 200, 300, 400])
+        XCTAssertGreaterThan(ChartTicks.nice(lower: 0, upper: 0, target: 5).upper, 0)
+        let flat = ChartAxis.zeroBased(for: [0, 0], title: "W")
+        XCTAssertGreaterThan(flat.upper, flat.lower)
+        let neg = ChartAxis.zeroBased(for: [-20, 100], title: "W")
+        XCTAssertLessThanOrEqual(neg.lower, -20)
+        XCTAssertGreaterThanOrEqual(neg.upper, 100)
+        // Single sample: no divide-by-zero, finite output.
+        let one = ActivityStreams(streams: .init(
+            time: nil, power: [150], heartrate: nil, cadence: nil, altitude: [10]))
+        let built = CombinedChartSeries.build(from: one, durationSeconds: 3_600)
+        XCTAssertTrue(built.flatMap(\.points).allSatisfy { $0.scaled.isFinite && $0.minutes.isFinite })
+        XCTAssertEqual(ChartTicks.minutes(upTo: 0), [0])
     }
 
     func testZoneGroupsPreservePositiveRowsLabelsAndPercentages() {

@@ -870,7 +870,8 @@ private struct CalendarActivityDetail: View {
                 }
                 if activityID != nil, gate.activeSession != nil {
                     if let streams, !StreamSeries.all(in: streams).isEmpty {
-                        StreamCharts(streams: streams)
+                        StreamCharts(streams: streams,
+                                     durationSeconds: CalendarJSON.number(activity, keys: ["duration_s"]))
                     } else if isLoading {
                         Panel {
                             HStack(spacing: 10) {
