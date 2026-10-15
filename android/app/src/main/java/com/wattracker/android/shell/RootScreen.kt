@@ -41,7 +41,9 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.navigation.NavGraph.Companion.findStartDestination
 import androidx.navigation.NavHostController
+import androidx.navigation.NavType
 import androidx.navigation.compose.NavHost
+import androidx.navigation.navArgument
 import androidx.navigation.compose.composable
 import androidx.navigation.compose.currentBackStackEntryAsState
 import androidx.navigation.compose.rememberNavController
@@ -316,8 +318,13 @@ private fun AppNavHost(
                 onNavigateToSettings = { navigateTo(navController, Destination.Settings) },
             )
         }
-        composable("${Destination.Activities.route}/detail/{activityId}") { entry ->
-            val activityId = entry.arguments?.getString("activityId")?.toIntOrNull() ?: 0
+        composable(
+            route = "${Destination.Activities.route}/detail/{activityId}",
+            // Typed: a route that does not carry an integer does not match
+            // this destination, so a bad argument can never open ride 0.
+            arguments = listOf(navArgument("activityId") { type = NavType.IntType }),
+        ) { entry ->
+            val activityId = entry.arguments?.getInt("activityId") ?: 0
             ActivityDetailScreen(
                 activityId = activityId,
                 onBack = { navController.popBackStack() },

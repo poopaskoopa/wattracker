@@ -31,7 +31,10 @@ data class RideSummary(
     val id: String,
     val activityId: Int,
     val summary: ActivitySummary,
+    /** The published start time, raw: the list order sorts on it. */
     val startedAt: String,
+    /** The start time, formatted once here: the rows recompose on scroll. */
+    val dateText: String,
 ) {
     companion object {
         /**
@@ -54,7 +57,13 @@ data class RideSummary(
             val numericId = summary.id?.toInt()
                 ?: item.id.substringAfterLast('-').toIntOrNull()
             if (numericId == null) return null
-            return RideSummary(item.id, numericId, summary, summary.startTime ?: "")
+            return RideSummary(
+                item.id,
+                numericId,
+                summary,
+                summary.startTime ?: "",
+                RideFormatting.date(summary.startTime) ?: "",
+            )
         }
     }
 }
@@ -294,8 +303,8 @@ object ChartTicks {
      * none), ticks at 0, step, 2*step ... up to the duration.
      */
     fun minutes(totalMinutes: Double): List<Double> {
+        if (!totalMinutes.isFinite() || totalMinutes <= 0) return listOf(0.0)
         val minutes = totalMinutes
-        if (!minutes.isFinite() || minutes <= 0) return listOf(0.0)
         val step = listOf(1.0, 2.0, 5.0, 10.0, 15.0, 20.0, 30.0, 60.0, 120.0, 240.0)
             .firstOrNull { minutes / it <= 6 } ?: 480.0
         val ticks = mutableListOf(0.0)
@@ -390,13 +399,22 @@ data class CombinedChartSeries(
 
         /**
          * Altitude first (drawn behind), then power, heart rate, cadence.
-         * [durationSeconds] is the ride's `duration_s`; the calendar feeds it
-         * from the activity payload the same way.
+         * [durationSeconds] is the ride's `duration_s`.
          */
-        fun build(payload: ActivityStreams, durationSeconds: Double? = null): List<CombinedChartSeries> {
-            val all = StreamSeries.all(payload)
+        fun build(payload: ActivityStreams, durationSeconds: Double? = null): List<CombinedChartSeries> =
+            buildFrom(StreamSeries.all(payload), payload.streams, durationSeconds)
+
+        /**
+         * [build], from channels already read: a screen that shows both the
+         * series and the axes reads the channels once.
+         */
+        fun buildFrom(
+            all: List<StreamSeries>,
+            channels: ActivityStreams.Channels,
+            durationSeconds: Double? = null,
+        ): List<CombinedChartSeries> {
             val order = listOf("altitude", "power", "heart-rate", "cadence")
-            val clock = MinutesClock(payload.streams, durationSeconds)
+            val clock = MinutesClock(channels, durationSeconds)
             val powerAxis = axis(Side.power, all)
             val sharedAxis = axis(Side.shared, all)
             return order.mapNotNull { id ->

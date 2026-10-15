@@ -6,7 +6,6 @@ import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
-import androidx.compose.foundation.layout.ColumnScope
 import androidx.compose.foundation.layout.FlowRow
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
@@ -20,6 +19,8 @@ import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.layout.widthIn
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.Text
@@ -148,6 +149,7 @@ fun ActivitiesScreen(
             uiState = uiState,
             viewModel = viewModel,
             readModel = currentReadModel,
+            sourceName = activeSource.name,
             // The list is wider on a tablet than on a phone in landscape.
             listWidth = if (configuration.smallestScreenWidthDp >= 600) 420.dp else 340.dp,
             onNavigateToSettings = onNavigateToSettings,
@@ -182,13 +184,8 @@ private fun SinglePaneActivities(
             modifier = Modifier
                 .fillMaxSize()
                 .padding(16.dp),
-            verticalArrangement = Arrangement.spacedBy(12.dp),
         ) {
-            ActivitiesHeader(uiState)
-            if (uiState.isLoading && uiState.rides.isNotEmpty()) {
-                SyncingNotice()
-            }
-            ActivitiesBody(
+            ActivitiesListContent(
                 uiState = uiState,
                 onRideClick = { ride -> onOpenDetail(ride.activityId) },
                 onNavigateToSettings = onNavigateToSettings,
@@ -205,28 +202,31 @@ private fun TwoPaneActivities(
     uiState: ActivitiesUiState,
     viewModel: ActivitiesViewModel,
     readModel: ReadModel,
+    sourceName: String,
     listWidth: androidx.compose.ui.unit.Dp,
     onNavigateToSettings: (() -> Unit)?,
 ) {
     Row(modifier = Modifier.fillMaxSize()) {
-        Column(
+        PullToRefreshBox(
+            isRefreshing = uiState.isRefreshing,
+            onRefresh = { viewModel.pullToRefresh() },
             modifier = Modifier
                 .width(listWidth)
-                .fillMaxHeight()
-                .background(Palette.bg)
-                .padding(16.dp),
-            verticalArrangement = Arrangement.spacedBy(12.dp),
+                .fillMaxHeight(),
         ) {
-            ActivitiesHeader(uiState)
-            if (uiState.isLoading && uiState.rides.isNotEmpty()) {
-                SyncingNotice()
+            Column(
+                modifier = Modifier
+                    .fillMaxSize()
+                    .background(Palette.bg)
+                    .padding(16.dp),
+            ) {
+                ActivitiesListContent(
+                    uiState = uiState,
+                    onRideClick = { ride -> viewModel.select(ride.id) },
+                    onNavigateToSettings = onNavigateToSettings,
+                    selectable = true,
+                )
             }
-            ActivitiesBody(
-                uiState = uiState,
-                onRideClick = { ride -> viewModel.select(ride.id) },
-                onNavigateToSettings = onNavigateToSettings,
-                selectable = true,
-            )
         }
 
         Box(
@@ -246,7 +246,7 @@ private fun TwoPaneActivities(
                 RideDetailPane(
                     activityId = ride.activityId,
                     readModel = readModel,
-                    summary = ride.summary,
+                    sourceName = sourceName,
                     modifier = Modifier.fillMaxSize(),
                 )
             } else {
@@ -319,17 +319,73 @@ private fun SyncingNotice() {
 }
 
 /**
- * The list and its states. The rides are rendered lazily (only the visible
- * rows are composed), so a long history does not hold itself in memory at
- * the UI layer; a hidden ride is absent from [uiState.rides] outright, never
+ * The list's content: the header, the syncing banner, and the rows or the
+ * states. The rides are rendered lazily (only the visible rows are
+ * composed), so a long history does not hold itself in memory at the UI
+ * layer; a hidden ride is absent from [uiState.rides] outright, never
  * greyed.
+ *
+ * The empty states sit in a scrollable box so pull to refresh still works
+ * with nothing to scroll -- exactly the "cloud waking, nothing cached"
+ * state the refresh exists for. With rows on screen the [LazyColumn] is
+ * the scrollable the box pulls on.
  */
 @Composable
-private fun ColumnScope.ActivitiesBody(
+private fun ActivitiesListContent(
     uiState: ActivitiesUiState,
     onRideClick: (RideSummary) -> Unit,
     onNavigateToSettings: (() -> Unit)?,
     selectable: Boolean,
+) {
+    Column(
+        modifier = Modifier.fillMaxSize(),
+        verticalArrangement = Arrangement.spacedBy(12.dp),
+    ) {
+        ActivitiesHeader(uiState)
+        if (uiState.isLoading && uiState.rides.isNotEmpty()) {
+            SyncingNotice()
+        }
+        if (uiState.rides.isEmpty()) {
+            Box(
+                modifier = Modifier
+                    .weight(1f)
+                    .fillMaxWidth()
+                    .verticalScroll(rememberScrollState()),
+            ) {
+                ActivitiesStates(
+                    uiState = uiState,
+                    onNavigateToSettings = onNavigateToSettings,
+                )
+            }
+        } else {
+            LazyColumn(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .weight(1f),
+                verticalArrangement = Arrangement.spacedBy(4.dp),
+            ) {
+                items(uiState.rides, key = { it.id }) { ride ->
+                    ActivityRow(
+                        ride = ride,
+                        selected = selectable && ride.id == uiState.selectedId,
+                        onClick = { onRideClick(ride) },
+                    )
+                }
+            }
+        }
+    }
+}
+
+/**
+ * The list's honest states, shown only when there are no rides on screen
+ * (the caller guarantees it): the unpaired/removed cards, a failed load
+ * with no cache, the waking notice, the first-load spinner, and the empty
+ * history.
+ */
+@Composable
+private fun ActivitiesStates(
+    uiState: ActivitiesUiState,
+    onNavigateToSettings: (() -> Unit)?,
 ) {
     when {
         uiState.deviceState == CloudSession.DeviceState.removed -> {
@@ -348,7 +404,7 @@ private fun ColumnScope.ActivitiesBody(
             )
         }
 
-        uiState.rides.isEmpty() && uiState.error != null -> {
+        uiState.error != null -> {
             // A failed load with no cache to serve says so; "no activities"
             // is the answer to an empty history, not to a failure.
             Panel {
@@ -365,15 +421,16 @@ private fun ColumnScope.ActivitiesBody(
             }
         }
 
-        uiState.rides.isEmpty() && uiState.isWaking -> {
+        uiState.isWaking -> {
             WakingCardInline()
         }
 
-        uiState.rides.isEmpty() && uiState.isLoading -> {
+        uiState.isLoading -> {
             LoadingCard()
         }
 
-        uiState.rides.isEmpty() -> {
+        else -> {
+            // An empty history, not a failure.
             Panel {
                 Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
                     Text(
@@ -383,23 +440,6 @@ private fun ColumnScope.ActivitiesBody(
                     Text(
                         text = stringResource(R.string.activities_none_note),
                         style = TextStyle(fontSize = 13.sp, color = Palette.muted),
-                    )
-                }
-            }
-        }
-
-        else -> {
-            LazyColumn(
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .weight(1f),
-                verticalArrangement = Arrangement.spacedBy(4.dp),
-            ) {
-                items(uiState.rides, key = { it.id }) { ride ->
-                    ActivityRow(
-                        ride = ride,
-                        selected = selectable && ride.id == uiState.selectedId,
-                        onClick = { onRideClick(ride) },
                     )
                 }
             }
@@ -427,8 +467,9 @@ private fun ActivityRow(
     ) {
         Row(verticalAlignment = Alignment.Top) {
             Text(
-                text = RideFormatting.date(ride.summary.startTime)
-                    ?: stringResource(R.string.ride_unknown_date),
+                // Formatted once when the ride was read, not on every row
+                // composition: a 300-ride list recomposes rows on scroll.
+                text = ride.dateText.ifEmpty { stringResource(R.string.ride_unknown_date) },
                 style = TextStyle(fontSize = 16.sp, fontWeight = FontWeight.SemiBold, color = Palette.textBright),
             )
             Spacer(modifier = Modifier.weight(1f))

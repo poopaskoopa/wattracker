@@ -47,8 +47,8 @@ class RideDetailViewModelTest {
         override var lastSuccess: Long? = 1000L,
         override var mayBeWaking: Boolean = false,
         private val cachedSnapshot: CloudSnapshot? = null,
-        private val detailResult: Result<ActivityDetail> = Result.failure(NotImplementedError()),
-        private val streamsResult: Result<ActivityStreams> = Result.failure(NotImplementedError()),
+        var detailResult: Result<ActivityDetail> = Result.failure(NotImplementedError()),
+        var streamsResult: Result<ActivityStreams> = Result.failure(NotImplementedError()),
     ) : ReadSession {
         override suspend fun cached(route: CloudRoute): CloudSnapshot? =
             cachedSnapshot?.takeIf { it.route == route }
@@ -120,8 +120,8 @@ class RideDetailViewModelTest {
             detailResult = Result.success(detail),
             streamsResult = Result.success(streamsWithPower()),
         )
-        val vm = RideDetailViewModel(session, 17, coroutineScope = backgroundScope)
-        vm.load()
+        val vm = RideDetailViewModel(session, coroutineScope = backgroundScope)
+        vm.load(17)
 
         val state = vm.uiState.value
         assertFalse(state.isLoading)
@@ -140,8 +140,8 @@ class RideDetailViewModelTest {
             detailResult = Result.success(detail),
             streamsResult = Result.failure(CloudSession.Failure.Server(404)),
         )
-        val vm = RideDetailViewModel(session, 17, coroutineScope = backgroundScope)
-        vm.load()
+        val vm = RideDetailViewModel(session, coroutineScope = backgroundScope)
+        vm.load(17)
 
         val state = vm.uiState.value
         assertTrue("a ride without plottable streams says so, not 'failed'", state.noStreams)
@@ -155,8 +155,8 @@ class RideDetailViewModelTest {
             detailResult = Result.success(detail),
             streamsResult = Result.failure(LocalClientException.Http(status = 404, path = "/api/activity/17", retryAfter = null)),
         )
-        val vm = RideDetailViewModel(session, 17, coroutineScope = backgroundScope)
-        vm.load()
+        val vm = RideDetailViewModel(session, coroutineScope = backgroundScope)
+        vm.load(17)
 
         val state = vm.uiState.value
         assertTrue(state.noStreams)
@@ -171,8 +171,8 @@ class RideDetailViewModelTest {
                 ActivityStreams(streams = ActivityStreams.Channels(null, null, null, null, null)),
             ),
         )
-        val vm = RideDetailViewModel(session, 17, coroutineScope = backgroundScope)
-        vm.load()
+        val vm = RideDetailViewModel(session, coroutineScope = backgroundScope)
+        vm.load(17)
 
         val state = vm.uiState.value
         assertTrue(state.noStreams)
@@ -186,8 +186,8 @@ class RideDetailViewModelTest {
             detailResult = Result.success(detail),
             streamsResult = Result.failure(CloudSession.Failure.Offline()),
         )
-        val vm = RideDetailViewModel(session, 17, coroutineScope = backgroundScope)
-        vm.load()
+        val vm = RideDetailViewModel(session, coroutineScope = backgroundScope)
+        vm.load(17)
 
         val state = vm.uiState.value
         assertFalse(state.noStreams)
@@ -201,8 +201,8 @@ class RideDetailViewModelTest {
             detailResult = Result.failure(CloudSession.Failure.Offline()),
             streamsResult = Result.success(streamsWithPower()),
         )
-        val vm = RideDetailViewModel(session, 17, coroutineScope = backgroundScope)
-        vm.load()
+        val vm = RideDetailViewModel(session, coroutineScope = backgroundScope)
+        vm.load(17)
 
         val state = vm.uiState.value
         assertNotNull(state.detailError)
@@ -216,8 +216,8 @@ class RideDetailViewModelTest {
             detailResult = Result.success(detail),
             streamsResult = Result.success(streamsWithPower()),
         )
-        val vm = RideDetailViewModel(session, 17, coroutineScope = backgroundScope)
-        vm.load()
+        val vm = RideDetailViewModel(session, coroutineScope = backgroundScope)
+        vm.load(17)
 
         assertEquals("2026-01-02T18:04:00", vm.uiState.value.shownSummary?.startTime)
     }
@@ -228,12 +228,49 @@ class RideDetailViewModelTest {
             deviceState = CloudSession.DeviceState.unpaired,
             isPaired = false,
         )
-        val vm = RideDetailViewModel(session, 17, coroutineScope = backgroundScope)
-        vm.load()
+        val vm = RideDetailViewModel(session, coroutineScope = backgroundScope)
+        vm.load(17)
 
         val state = vm.uiState.value
         assertFalse(state.isLoading)
         assertNull(state.detail)
         assertNull(state.streams)
+    }
+
+    @Test
+    fun loadResetsWakingStateAndReloads() = runTest(testDispatcher) {
+        val session = FakeReadSession(
+            detailResult = Result.failure(CloudSession.Failure.Waking()),
+            streamsResult = Result.failure(CloudSession.Failure.Waking()),
+        )
+        val vm = RideDetailViewModel(session, coroutineScope = backgroundScope)
+        vm.load(17)
+        assertTrue(vm.uiState.value.isWaking)
+
+        // On reload after cloud wakes up
+        session.detailResult = Result.success(detail)
+        session.streamsResult = Result.success(streamsWithPower())
+        vm.reload()
+
+        val state = vm.uiState.value
+        assertFalse(state.isWaking)
+        assertNotNull(state.detail)
+        assertNotNull(state.streams)
+    }
+
+    @Test
+    fun releaseClearsRideData() = runTest(testDispatcher) {
+        val session = FakeReadSession(
+            detailResult = Result.success(detail),
+            streamsResult = Result.success(streamsWithPower()),
+        )
+        val vm = RideDetailViewModel(session, coroutineScope = backgroundScope)
+        vm.load(17)
+        assertNotNull(vm.uiState.value.detail)
+
+        vm.release()
+        assertNull(vm.uiState.value.detail)
+        assertNull(vm.uiState.value.streams)
+        assertNull(vm.uiState.value.summary)
     }
 }

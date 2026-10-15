@@ -1382,6 +1382,35 @@ class CloudSessionTest {
     }
 
     @Test
+    fun anUnchangedRevisionKeepsTheCachedDetail() = runTest {
+        makePairedSession { request ->
+            when {
+                request.url.contains("/context/refresh") ->
+                    CloudResponse(200, refreshJson("ctx-1", 300.0).toByteArray(), null, nowMillis)
+                request.url.contains("/activities/activity-detail-17") ->
+                    CloudResponse(200, activityDetailItemJson(17, 1).toByteArray(), null, null)
+                request.url.contains("/context/activities") ->
+                    CloudResponse(
+                        200,
+                        collectionJson(listOf(activityItem(1)), 1, null).toByteArray(),
+                        null,
+                        null,
+                    )
+                else -> throw AssertionError("unexpected ${request.url}")
+            }
+        }
+        session.load(CloudRoute.Activities)
+        session.activityDetail(17)
+        session.load(CloudRoute.Activities)
+        session.activityDetail(17)
+        assertEquals(
+            "unchanged revision hits the cache",
+            1,
+            transport.requests.count { it.url.contains("/activities/activity-detail-17") },
+        )
+    }
+
+    @Test
     fun aNewerRevisionInvalidatesTheCachedDetail() = runTest {
         makePairedSession { request ->
             when {
