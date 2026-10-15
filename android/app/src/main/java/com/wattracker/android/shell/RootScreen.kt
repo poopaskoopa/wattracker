@@ -47,6 +47,7 @@ import androidx.navigation.compose.currentBackStackEntryAsState
 import androidx.navigation.compose.rememberNavController
 import com.wattracker.android.R
 import com.wattracker.android.screens.ActivitiesScreen
+import com.wattracker.android.screens.activities.ActivityDetailScreen
 import com.wattracker.android.screens.CalendarScreen
 import com.wattracker.android.screens.DashboardScreen
 import com.wattracker.android.screens.SettingsScreen
@@ -306,7 +307,22 @@ private fun AppNavHost(
                 onNavigateToSettings = { navigateTo(navController, Destination.Settings) },
             )
         }
-        composable(Destination.Activities.route) { ActivitiesScreen() }
+        composable(Destination.Activities.route) {
+            ActivitiesScreen(
+                onOpenDetail = { activityId ->
+                    // A plain push: the back button returns to the list.
+                    navController.navigate("${Destination.Activities.route}/detail/$activityId")
+                },
+                onNavigateToSettings = { navigateTo(navController, Destination.Settings) },
+            )
+        }
+        composable("${Destination.Activities.route}/detail/{activityId}") { entry ->
+            val activityId = entry.arguments?.getString("activityId")?.toIntOrNull() ?: 0
+            ActivityDetailScreen(
+                activityId = activityId,
+                onBack = { navController.popBackStack() },
+            )
+        }
         composable(Destination.Calendar.route) { CalendarScreen() }
         composable(Destination.Volume.route) { VolumeScreen() }
         composable(Destination.Settings.route) { SettingsScreen() }
