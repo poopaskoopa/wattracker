@@ -122,7 +122,24 @@ class CloudSession(
     private var gateIsColdStart = false
     private var consecutiveFailures = 0
     private var consecutiveRejections = 0
-    private val activityObjects = HashMap<String, CloudItem>()
+    /**
+     * A ride's detail or stream payload, kept out of the snapshot cache on
+     * purpose: the activities collection stays small and these are fetched
+     * only when a ride is opened. Cleared wherever the cache is, because a
+     * ride opened under one credential must never be served to the next.
+     */
+    private data class ActivityObjectCacheEntry(
+        val activityId: Int,
+        val item: CloudItem,
+        val storedAt: Long,
+    )
+
+    private val activityObjects = HashMap<String, ActivityObjectCacheEntry>()
+    // Least recently used first. Streams are preferred for eviction when the
+    // cap is exceeded, because they are the larger payload.
+    private val activityObjectLru = ArrayDeque<String>()
+    private val activityObjectGenerations = HashMap<Int, Int>()
+    private val activityCollectionRevisions = HashMap<Int, Int>()
     private var pendingRefresh: CompletableDeferred<ReaderToken>? = null
 
     init {
@@ -274,6 +291,9 @@ class CloudSession(
             nextAttemptAllowedAt = null
             gateIsColdStart = false
             activityObjects.clear()
+            activityObjectLru.clear()
+            activityObjectGenerations.clear()
+            activityCollectionRevisions.clear()
             pairing.device
         }
     }
@@ -304,9 +324,7 @@ class CloudSession(
                 RemoveDeviceResult.ServerRevoked
             }
             is CloudApiResult.Failure -> {
-                val isTrustedDate = result.serverDateMillis != null &&
-                    Math.abs(now() - result.serverDateMillis) / 1000.0 <= clockSkewTolerance
-                if ((result.status == 404 || result.status == 401) && isTrustedDate) {
+                if (removalCompletesLocally(result.status, result.serverDateMillis, now())) {
                     // Complete removal locally only if the session hasn't re-paired mid-flight
                     val newGeneration = mutex.withLock {
                         if (lifecycleGeneration != generation) throw lifecycleFailure()
@@ -356,7 +374,7 @@ class CloudSession(
 
     /** One ride's detail, fetched on demand and remembered for the session. */
     override suspend fun activityDetail(activityId: Int): ActivityDetail {
-        val item = activityObject("activity-detail-$activityId") { dev, ctx ->
+        val item = activityObject("activity-detail-$activityId", activityId) { dev, ctx ->
             client.activityDetail(activityId, ctx, dev)
         }
         return (item.payload as? CloudPayload.ActivityDetail)?.value ?: throw Failure.Server(0)
@@ -364,7 +382,7 @@ class CloudSession(
 
     /** The bounded, downsampled streams, fetched only after detail opens. */
     override suspend fun activityStreams(activityId: Int): ActivityStreams {
-        val item = activityObject("stream-$activityId") { dev, ctx ->
+        val item = activityObject("stream-$activityId", activityId) { dev, ctx ->
             client.activityStreams(activityId, ctx, dev)
         }
         return (item.payload as? CloudPayload.Stream)?.value ?: throw Failure.Server(0)
@@ -618,6 +636,9 @@ class CloudSession(
         nextAttemptAllowedAt = null
         gateIsColdStart = false
         activityObjects.clear()
+        activityObjectLru.clear()
+        activityObjectGenerations.clear()
+        activityCollectionRevisions.clear()
         return lifecycleGeneration
     }
 
@@ -633,6 +654,9 @@ class CloudSession(
         nextAttemptAllowedAt = null
         gateIsColdStart = false
         activityObjects.clear()
+        activityObjectLru.clear()
+        activityObjectGenerations.clear()
+        activityCollectionRevisions.clear()
         return lifecycleGeneration
     }
 
@@ -792,14 +816,29 @@ class CloudSession(
 
     private suspend fun activityObject(
         objectId: String,
+        activityId: Int,
         read: suspend (PairedDevice, String) -> CloudApiResult<CloudItem>,
     ): CloudItem {
         val (device, generation) = mutex.withLock { activeDevice() to lifecycleGeneration }
-        mutex.withLock {
-            activityObjects[objectId]?.let { return it }
+        // A refresh response exposes activity-summary revisions, not
+        // independent detail/stream revisions, so generation invalidation is
+        // supplemented by the age bound: an edit that changes only an object
+        // is eventually observed.
+        val cached = mutex.withLock {
+            val entry = activityObjects[objectId]
+            if (entry != null && now() - entry.storedAt <= activityObjectCacheLifetimeMs) {
+                touchActivityObject(objectId)
+                entry
+            } else {
+                null
+            }
+        }
+        cached?.let { return it.item }
+        val activityObjectGeneration = mutex.withLock {
             nextAttemptAllowedAt?.let { allowed ->
                 if (allowed > now()) throw gated(until = allowed)
             }
+            activityObjectGenerations[activityId] ?: 0
         }
         val attempt = context(after = null)
         val result = try {
@@ -810,12 +849,9 @@ class CloudSession(
             throw Failure.Offline()
         }
         return when (result) {
-            is CloudApiResult.Success -> mutex.withLock {
-                validate(device, generation)
-                activityObjects[objectId] = result.value
-                lastSuccessfulRead = now()
-                result.value
-            }
+            is CloudApiResult.Success -> storeActivityObject(
+                objectId, activityId, result.value, device, generation, activityObjectGeneration,
+            )
             is CloudApiResult.Failure -> {
                 val status = result.status
                 if (status == 429 || status == 503) {
@@ -835,14 +871,81 @@ class CloudSession(
                     throw Failure.Offline()
                 }
                 when (retry) {
-                    is CloudApiResult.Success -> mutex.withLock {
-                        validate(device, generation)
-                        activityObjects[objectId] = retry.value
-                        lastSuccessfulRead = now()
-                        retry.value
-                    }
+                    is CloudApiResult.Success -> storeActivityObject(
+                        objectId, activityId, retry.value, device, generation, activityObjectGeneration,
+                    )
                     is CloudApiResult.Failure -> throw Failure.Server(retry.status)
                 }
+            }
+        }
+    }
+
+    /** Takes the mutex. A read that raced a newer collection revision is served but not stored. */
+    private suspend fun storeActivityObject(
+        objectId: String,
+        activityId: Int,
+        item: CloudItem,
+        device: PairedDevice,
+        lifecycleGeneration: Int,
+        activityObjectGeneration: Int,
+    ): CloudItem {
+        return mutex.withLock {
+            validate(device, lifecycleGeneration)
+            if ((activityObjectGenerations[activityId] ?: 0) == activityObjectGeneration) {
+                activityObjects[objectId] = ActivityObjectCacheEntry(activityId, item, now())
+                touchActivityObject(objectId)
+                trimActivityObjectCache(excluding = objectId)
+            }
+            lastSuccessfulRead = now()
+            item
+        }
+    }
+
+    /** Under the mutex. */
+    private fun touchActivityObject(objectId: String) {
+        activityObjectLru.remove(objectId)
+        activityObjectLru.addLast(objectId)
+    }
+
+    /**
+     * Under the mutex. Evict least-recently-used first, streams before
+     * details, because a stream is the larger payload.
+     */
+    private fun trimActivityObjectCache(excluding: String) {
+        while (activityObjects.size > activityObjectCacheCapacity) {
+            val evicted = activityObjectLru.firstOrNull {
+                it != excluding && activityObjects[it]?.item?.kind == CloudKind.Stream
+            } ?: activityObjectLru.firstOrNull { it != excluding }
+                ?: return
+            activityObjects.remove(evicted)
+            activityObjectLru.remove(evicted)
+        }
+    }
+
+    /**
+     * Under the mutex. A ride whose collection revision advanced (or that was
+     * tombstoned) has new detail and stream objects on the server: forget the
+     * cached copies so the next open fetches them, and bump the ride's
+     * generation so a read that started before the advance is not stored.
+     */
+    private fun invalidateActivityObjects(received: List<CloudItem>) {
+        for (item in received) {
+            if (item.kind != CloudKind.Activity) continue
+            val activityId = item.id.removePrefix("activity-").toIntOrNull() ?: continue
+            val previousRevision = activityCollectionRevisions[activityId]
+            val isNewerRevision = item.deleted ||
+                previousRevision == null ||
+                item.revision > previousRevision
+            if (!isNewerRevision) continue
+            activityObjectGenerations[activityId] = (activityObjectGenerations[activityId] ?: 0) + 1
+            // The recorded revision never goes backwards: a tombstone can
+            // carry a lower revision than the one last seen (the iOS
+            // session applies the same max).
+            activityCollectionRevisions[activityId] = max(previousRevision ?: 0, item.revision)
+            val stale = activityObjects.keys.filter { activityObjects[it]?.activityId == activityId }
+            for (objectId in stale) {
+                activityObjects.remove(objectId)
+                activityObjectLru.remove(objectId)
             }
         }
     }
@@ -878,9 +981,17 @@ class CloudSession(
 
         val complete = cursor == null
         val merged = merge(received, if (since == null) null else cached)
+        // A ride that changed in this walk has new detail/stream objects: the
+        // cached copies are stale whether or not the walk completed. The
+        // identity check comes first: a removal or re-pair that committed
+        // while the walk ran has already cleared the per-ride maps, and this
+        // walk's items belong to the previous rider.
+        mutex.withLock {
+            validate(device, lifecycleGeneration)
+            invalidateActivityObjects(received)
+        }
         val now = now()
         if (complete) {
-            mutex.withLock { validate(device, lifecycleGeneration) }
             // The write carries the identity this read ran under, so the cache
             // refuses it if a removal or re-pairing committed in the meantime.
             onIo { cache.store(received, revision, route, full = since == null, generation = lifecycleGeneration.toLong()) }
@@ -997,5 +1108,48 @@ class CloudSession(
 
         const val rejectionsBeforeRemoval: Int = 2
         const val maximumPages: Int = 50
+
+        /**
+         * The most ride objects (details and streams) held in memory: two
+         * per ride, so four rides kept open. Mirrors the iOS session
+         * (PR #351, #358).
+         */
+        const val activityObjectCacheCapacity: Int = 8
+
+        /**
+         * A cached detail/stream older than this is refetched: the refresh
+         * protocol carries no independent detail/stream revision, so a
+         * bounded age is what makes an in-place edit eventually visible.
+         * Mirrors the iOS session (PR #358).
+         */
+        const val activityObjectCacheLifetimeMs: Long = 5 * 60_000L
+
+        /**
+         * The #410 removal rule: a refused revoke completes locally only when
+         * the refusal is the server's own clock saying it no longer knows
+         * this credential.
+         *
+         * 401 and 404 are indistinguishable by design, and either one with a
+         * parseable `Date` within [tolerance] (inclusive) of the device clock
+         * is trusted evidence the credential is gone. Every other status
+         * (429/503/5xx, 403, 400, 410), a no-response (`status == null`), and
+         * a missing or skewed `Date` keep the credential: a transient failure
+         * is not evidence the server forgot us, and a clock that disagrees
+         * with the server's cannot rule out skew as the cause of the refusal.
+         *
+         * Pinned by the shared vector: `tests/vectors/removal_decision_v1.json`
+         * is read by the Python, Swift and Kotlin
+         * (`RemovalDecisionVectorTest`) suites, which check all 23 cases.
+         */
+        fun removalCompletesLocally(
+            status: Int?,
+            serverDateMillis: Long?,
+            now: Long,
+            tolerance: Double = clockSkewTolerance,
+        ): Boolean {
+            if (status != 401 && status != 404) return false
+            val serverDate = serverDateMillis ?: return false
+            return Math.abs(now - serverDate) / 1000.0 <= tolerance
+        }
     }
 }

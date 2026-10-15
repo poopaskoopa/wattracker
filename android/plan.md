@@ -41,7 +41,7 @@ until the command timeout kills them. Always prefix `git --no-pager`, e.g.
 `git --no-pager log --oneline -5`; for a whole session, set `GIT_PAGER=`
 to empty instead.
 
-**Resume point — Step 4 (#196) Dashboard is open as PR #419 on `feature/android-client-4`. Steps 1–3 are merged: Step 2 (#194) via PR #304, Step 3 (#195) via PR #376 (landed through #403, `8722198`).** #195 stays open for its device check. The Step 4 implementation notes, the PR #419 review (2026-09-30) and its fixes (2026-10-04), verification and known gaps are under "Step 4 — Dashboard screen" below.
+**Resume point — Step 4 (#196) Dashboard is merged (PR #419, 2026-10-06, `736f290`). Step 5 (#197) Activities list + ride detail is being implemented on `feature/android-client-5` (cut from `main` at `25e7220`).** Steps 1–3 are merged: Step 2 (#194) via PR #304, Step 3 (#195) via PR #376 (landed through #403, `8722198`). #195 and #196 stay open for their device checks. The Step 4 implementation notes, the PR #419 review (2026-09-30) and its fixes (2026-10-04), verification and known gaps are under "Step 4 — Dashboard screen" below, and the PR #419 post-merge follow-up (the `removal_decision_v1` vector test, the mobile-parity cells) landed first on the Step 5 branch (2026-10-15). The Step 5 implementation notes are under "Step 5 — Activities list + ride detail" below.
 
 Step 3 context: merged via PR #376 (landed through #403). Cloud and local pairing, the Settings screen, and the removed state (#153, `markRemoved()`). The review findings and their resolutions are on PR #376; the durable ones are: every type holding a bearer secret (`LocalCredentials`, `LocalRequest`, `LocalResponse`, `ActiveSession`) redacts it in `toString()`; the connector-token field is a password field; a local session cookie is reused only for the origin and token it was minted for; a local 401 reports `removed`, not `unpaired`.
 
@@ -1678,6 +1678,114 @@ became `aChangedIdentitySupersedesTheLoadInFlight`, with
   with `adb shell dumpsys meminfo` before/after a long scroll (no unbounded
   growth) — the 1500-point downsampling decision gets validated here on a real
   device.
+
+**Implemented 2026-10-15 (on `feature/android-client-5`, five commits).**
+
+1. **The PR #419 post-merge follow-up first** (the approved re-review's
+   "After merge" item): the #410 removal rule is extracted into
+   `CloudSession.removalCompletesLocally(status, serverDateMillis, now,
+   tolerance)` (mirroring the iOS static), and
+   `RemovalDecisionVectorTest` reads `tests/vectors/removal_decision_v1.json`
+   unmodified, parsing each `Date` header with the transport's own
+   `parseHttpDate` ("unparseable means absent" end to end) and checking all
+   23 cases. The Step 4 cells in `docs/mobile-parity.md` that said "In PR
+   #419" / "Pending" now say "Done (#419)", the shared-vector table names the
+   Kotlin readers, and the stale "KSP coupled to Kotlin" comment in
+   `libs.versions.toml` is fixed (re-review small item 7c). The clone's git
+   identity is now `taksmon <taksmon@users.noreply.github.com>` (re-review
+   item 6), not the integrator's.
+2. **The bounded activity-object cache** (iOS #351/#358 parity, required by
+   the #197 matrix row): `CloudSession`'s detail/stream memory is now
+   capacity 8, least-recently-used with streams evicted first (the larger
+   payload), a 5-minute age bound (the refresh protocol carries no
+   independent detail/stream revision), and per-ride generations plus the
+   activities route's revisions tracked in `reconcile()` — a ride whose
+   revision advanced or was tombstoned loses its cached copies, and a read
+   that raced the advance is served but not stored. Pair, sign-out and
+   removal clear all four structures. Six `CloudSessionTest` cases trace the
+   cap, the TTL bound, and the eviction through the request log.
+3. **The ride display model** (`screens/activities/RideDisplay.kt`): a
+   line-for-line port of the iOS `ActivitiesModel.swift` half —
+   `RideSummary`, `RideFormatting` (half-to-even durations, `05:09` vs the
+   zone formatter's `5:09`), `ZoneGroup`/`ZoneRow` (server `duration` string
+   preferred), `StreamSeries`, `ChartAxis`/`ChartTicks` (1/2/5 x 10^n nice
+   ticks, zero-based bounds, negatives extend the floor, no clipping),
+   `MinutesClock` (the published `time` channel is effectively all nil: with
+   the ride duration the samples spread over 0...duration, else 1 Hz — the
+   86-minute regression) and `CombinedChartSeries` (altitude behind, own
+   min...max band; power left "W"; HR + cadence shared right "bpm / rpm").
+   `RideDisplayTest` ports the iOS `RideDisplayTests` case for case (15
+   tests). The shared clock/axis vector `docs/mobile-parity.md` leaves to the
+   Android issue to request is requested in the PR body; it is not added
+   here, because it needs a generator, a Python test and a Swift reader
+   (the iOS-side change the "one iOS issue at a time" rule defers).
+4. **The view models**: `ActivitiesViewModel` (the rides newest first,
+   tombstones absent, cache before network, a changed identity clears the
+   previous rider's rides and supersedes the load in flight, a same-identity
+   resume joins it, pull to refresh lifts a waking gate, a local 429/503
+   earns the rate-limit notice) and `RideDetailViewModel` (detail and
+   streams in parallel, failing independently; a streams 404 — cloud
+   `Failure.Server(404)` or the local `Http(404)` — and an empty payload both
+   map to "No recorded streams"; the header's summary comes from the cached
+   list). 18 tests against a scripted `ReadSession`.
+5. **The screens**: the list (date, duration, distance, NP, IF, TSS, RPE —
+   the iOS row's metrics, lazy rows), the detail (summary, zone time, the
+   "Ride graphs" chart with the tappable legend), and the layout decision
+   stated in the code: list and detail side by side on the wide, short
+   viewports (a phone in landscape, any tablet — the width is not the scarce
+   axis and push navigation costs the round trip on it), the detail pushed
+   as its own screen in a phone portrait (a plain push, so the back button
+   returns to the list; `Destination.fromRoute` maps the sub-route to its
+   parent for the shell's highlight). The "Ride graphs" chart is a
+   `Canvas` over the ported model: 220dp, dynamic label padding, grid from
+   the power axis (or the right axis when power is hidden), linear lines, no
+   markers, altitude fill 0.18 / line 0.5 in the muted grey — the iOS look,
+   not the desktop palette.
+
+**Verification (2026-10-15).** `:app:testDebugUnitTest` 218 passed, 0
+failed (was 174 before this branch); `:app:assembleDebug` and
+`:app:assembleRelease -PallowPlaceholderHost` green.
+
+**Code Review Fixes (2026-10-15).** Addressed 14 reviewer findings:
+- Detail and streams reads now launch truly in parallel (`scope.async`).
+- Waking state resets on `load()`; pane observer reloads on `ON_RESUME` and releases on `ON_STOP`.
+- Detail VM is scoped per pane (keyed on active source) so VMs do not pile up in two-pane mode.
+- Pull-to-refresh is scrollable in empty/waking states in both single-pane and two-pane modes.
+- `CloudSession` invalidation validates device identity before clearing cached objects and clamps revisions.
+- Cancellation propagates cleanly without swallowing or locking load state.
+- Errors show user-facing status panels (removed/unpaired/throttled).
+- Chart drawing uses `remember` for path/layout resolution and `StreamSeries.all` is computed once.
+- Date string formatted once into `RideSummary` rather than on every row composition.
+- Route argument uses typed `NavType.IntType`; back content description fixed to "Back".
+- Legend hidden set is reset on new ride streams.
+- Unused strings removed; comments/docs cleaned up.
+
+**Device check (2026-10-15, emulators).** Verified on `medium_phone`
+(API 36) against the cloud harness with a seeded 300-ride scratch DB
+(the harness publishes with `include_streams=True` for this check; its
+default excludes stream objects, which is why a streamless publish shows
+the "No recorded streams" state, not a failure):
+
+- unpaired state in portrait and landscape; paired list, newest first,
+  with the header stamp; the 90-minute ride's detail: summary, power and
+  heart-rate zones (server-computed), and the "Ride graphs" chart (90-min
+  x-axis at 15-min ticks, zero-based W axis, shared bpm/rpm axis, altitude
+  fill, legend ranges matching the seed);
+- the no-streams ride shows "No recorded streams for this activity."
+  (the #445 mapping), both in the two-pane and the pushed portrait detail
+  (back arrow returns to the list, position kept);
+- phone landscape two-pane and tablet (`medium_tablet`, API 35) two-pane
+  with the permanent drawer (tablet confirmed unpaired; the paired layout
+  is the same code verified on the phone);
+- removal (#410) exercised live against the server, twice, including the
+  unconfirmed-refusal banner; pairing, re-pairing and the device list
+  (THIS DEVICE / ACTIVE) all worked;
+- memory: `dumpsys meminfo` TOTAL PSS 100,921 KB before a full scroll of
+  the 300-ride list, 104,996 KB after (+4 MB, no unbounded growth; the
+  list renders lazily).
+
+Still owed with a real device / the owner's review: the paired tablet
+  data check and a physical-device no-jank pass.
 
 ## Step 6 — Calendar + Volume (issue #198)
 
