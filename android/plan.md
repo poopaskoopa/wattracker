@@ -1802,11 +1802,19 @@ five minor ones:
 - Follow-up, the same parse on the other screen: the reading moved out of
   `RideFormatting` into `screens/PublishedTime.kt`, and
   `DashboardData.parseDate` — which carried its own `SimpleDateFormat` list —
-  now goes through it. That one was wrong in a second way: its list put
-  `yyyy-MM-dd'T'HH:mm:ss` ahead of nothing, so the offset-free prefix of a
-  `+02:00` stamp parsed with the offset thrown away, and a colon-less
-  `+0200` parsed instead of being refused. Either moves the edge of the load
-  window, which is measured from the newest load point rather than the clock.
+  now goes through it. That one lost offsets as well, and the first draft of
+  this note explained the cause wrongly — it said the offset-free pattern was
+  listed ahead of the offset ones. It wasn't; they came first. Both offset
+  patterns ended in `XXXXX`, which `SimpleDateFormat` refuses to construct
+  (`IllegalArgumentException: invalid ISO 8601 format: length=5`), and the
+  loop's `catch` swallowed that at build time. With no offset form ever
+  reachable, `yyyy-MM-dd'T'HH:mm:ss` matched the leading characters of a
+  `+02:00` stamp and dropped its offset — two hours off — and a colon-less
+  `18:04:00+0200` parsed instead of being refused. Established with a
+  throwaway probe against the old pattern list, since deleted; the probe's
+  output is recorded in the commit message. Either mistake moves the edge of
+  the load window, which is measured from the newest load point rather than
+  the clock.
   `PublishedTimeTest` pins the reading itself (1-9 fractional digits, the
   offset applied, naive-is-UTC, a bare date is a day and not a timestamp,
   nothing half-read), and `DashboardDataTest` pins the two instants the
@@ -1815,9 +1823,60 @@ five minor ones:
   `DashboardDataTest` and `RideDisplayTest` — including the offset case, which
   the mis-scaled fraction alone would not have caught.
 
-**Verification (2026-10-17).** `:app:testDebugUnitTest` 233 passed, 0 failed
-(15 new this round); `:app:assembleDebug` and `:app:assembleRelease
--PallowPlaceholderHost` green. The emulator re-check this round owes: the
+**Local review round 3 (2026-10-19).** Seven findings; six fixed, one
+declined:
+- **A pull of the ride already on screen cleared the new load's spinners.**
+  The finishing load asked `loadedId == activityId` to decide whether it was
+  still current — sound while a second load of the same ride was ignored, and
+  wrong the moment `userInitiated` allowed one. A load token decides it now,
+  and `aPullWhileALoadIsInFlightLeavesTheFlagsToTheNewLoad` runs on a
+  `StandardTestDispatcher` for exactly that reason: every other test in the
+  file uses an unconfined one, which runs each launch through and cannot show
+  the interleaving.
+- **A pull wiped what was on screen**, showing "Unknown date" and a spinner in
+  place of a chart the rider already had. Data is now kept across a re-read of
+  the same ride (and still dropped when the ride changes —
+  `switchingRidesDropsTheRideJustLeft`), while the notices — waking, throttle,
+  either error — are cleared, because those belong to the attempt in flight.
+- **The pull was oversold in prose.** `activityObject` answers from its
+  five-minute object cache before it looks at any gate, so a pull does not
+  fetch a fresh copy of a ride read a minute ago; what it buys is the waking
+  gate lifted and the failed reads re-run. The comment says that now.
+- **A late answer could be written into a cleared pane**: reads fail
+  independently, so a successful streams payload could land after the detail
+  reported `DeviceRemoved` and cleared the pane. `paneStillWantsRideData()`
+  closes it, pinned by `aStreamsAnswerAfterTheCredentialWentAwayIsNotWritten`.
+- **`readActivityObject`'s comment overclaimed** ("exactly the way a
+  collection page's is"): its 404 retry rides out the wake and `page()`'s does
+  not. The code is right — iOS is asymmetric the same way — so the comment now
+  names the difference instead of denying it.
+- **The parity table's cold-start row said "Done"** for the whole of #422. It
+  is not: Android's waking notice comes from a `Failure.Waking` answer, never
+  from iOS's 5 s in-flight watch, so a read that spends the full ride-out
+  (60 s + 3 s + 60 s) shows a spinner the whole time on all three screens.
+  That is pre-#419 behaviour, not a regression from this PR, and the row now
+  says so. Implementing `WakingWatch` across the dashboard, the list and the
+  detail is the follow-up; it is one shared helper and three call sites.
+- **Declined: the author rewrite.** The reviewer would rather `taksmon`
+  stayed on the commits. The owner asked for `wattrackerboss` per `AGENTS.md`,
+  and the ident now matches that rule; the real cost of the command used
+  (`--reset-author`) was the author *dates*, which all collapsed to one
+  timestamp, and that is recorded here rather than argued away.
+
+**Verification (2026-10-19).** `:app:testDebugUnitTest` 237 passed, 0 failed
+(4 new `RideDetailViewModelTest` cases); `:app:assembleDebug` and
+`:app:assembleRelease -PallowPlaceholderHost` green. Each behaviour fix here
+was mutation-proved locally and the mutation reverted before committing:
+putting the old `loadedId == activityId` test back turns
+`aPullWhileALoadIsInFlightLeavesTheFlagsToTheNewLoad` red on its first
+assertion; always clearing turns `aPullKeepsTheRideOnScreenWhileItReReads`
+red; removing `paneStillWantsRideData()` lets the streams payload land in the
+cleared pane and turns `aStreamsAnswerAfterTheCredentialWentAwayIsNotWritten`
+red. With all three fixes in, the other 16 tests in the file still pass,
+including `switchingRidesDropsTheRideJustLeft`, which is the other side of
+keeping data across a re-read.
+
+The emulator re-check this round owes: the
 220dp chart, the detail pane's pull, and the `isStarting` gate on the
 pairing panels.
 

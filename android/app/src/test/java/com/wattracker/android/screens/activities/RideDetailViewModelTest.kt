@@ -14,8 +14,10 @@ import com.wattracker.android.cloud.ReadSession
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.ExperimentalCoroutinesApi
+import kotlinx.coroutines.test.StandardTestDispatcher
 import kotlinx.coroutines.test.UnconfinedTestDispatcher
 import kotlinx.coroutines.test.advanceUntilIdle
+import kotlinx.coroutines.test.runCurrent
 import kotlinx.coroutines.test.resetMain
 import kotlinx.coroutines.test.runTest
 import kotlinx.coroutines.test.setMain
@@ -57,8 +59,8 @@ class RideDetailViewModelTest {
          * suspends. Null means "use `detailResult`/`streamsResult`", read as
          * properties so a test can swap the canned result mid-flight.
          */
-        val detailHandler: (suspend (Int) -> ActivityDetail)? = null,
-        val streamsHandler: (suspend (Int) -> ActivityStreams)? = null,
+        var detailHandler: (suspend (Int) -> ActivityDetail)? = null,
+        var streamsHandler: (suspend (Int) -> ActivityStreams)? = null,
         val retryNowIfWakingHandler: suspend () -> Unit = {},
     ) : ReadSession {
         /** How often each read went out. */
@@ -350,6 +352,138 @@ class RideDetailViewModelTest {
 
         gate.complete(Unit)
         advanceUntilIdle()
+    }
+
+    @Test
+    fun aPullWhileALoadIsInFlightLeavesTheFlagsToTheNewLoad() = runTest(StandardTestDispatcher()) {
+        // A standard dispatcher on purpose: the unconfined one the other tests
+        // use runs each launch straight through, so it cannot show a cancelled
+        // load clearing the flags of the load that replaced it. A pull
+        // restarts a load of the *same* ride, which is exactly the case the
+        // ride id cannot tell apart.
+        val gate = CompletableDeferred<Unit>()
+        val session = FakeReadSession(
+            detailHandler = {
+                gate.await()
+                detail
+            },
+            streamsHandler = {
+                gate.await()
+                streamsWithPower()
+            },
+        )
+        val vm = RideDetailViewModel(session, coroutineScope = backgroundScope)
+
+        vm.load(17)
+        runCurrent()
+        assertTrue("the first load is in flight", vm.uiState.value.isLoading)
+        assertFalse(vm.uiState.value.isRefreshing)
+
+        vm.pullToRefresh()
+        runCurrent()
+
+        val during = vm.uiState.value
+        assertTrue("the pull's indicator survives the load it cancelled", during.isRefreshing)
+        assertTrue("and the new load is still the loading one", during.isLoading)
+
+        gate.complete(Unit)
+        // `runCurrent` is what dispatches the two resumed reads; on a standard
+        // dispatcher the awaits do not resume inside `advanceUntilIdle` alone.
+        runCurrent()
+        advanceUntilIdle()
+
+        val after = vm.uiState.value
+        assertFalse("the pull's indicator is cleared when its load finishes", after.isRefreshing)
+        assertFalse("and so is the spinner", after.isLoading)
+        assertNotNull(after.detail)
+        assertNotNull(after.streams)
+    }
+
+    @Test
+    fun aPullKeepsTheRideOnScreenWhileItReReads() = runTest(testDispatcher) {
+        val gate = CompletableDeferred<Unit>()
+        val session = FakeReadSession(
+            detailResult = Result.success(detail),
+            streamsResult = Result.success(streamsWithPower()),
+        )
+        val vm = RideDetailViewModel(session, coroutineScope = backgroundScope)
+        vm.load(17)
+        assertNotNull(vm.uiState.value.detail)
+        assertNotNull(vm.uiState.value.streams)
+
+        // A pull whose reads then suspend. The header, the summary and the
+        // chart stay painted -- collapsing them to "Unknown date" and a
+        // spinner is not what a re-read of the same ride should cost.
+        session.detailHandler = {
+            gate.await()
+            detail
+        }
+        session.streamsHandler = {
+            gate.await()
+            streamsWithPower()
+        }
+        vm.pullToRefresh()
+
+        val during = vm.uiState.value
+        assertNotNull("the detail stays put", during.detail)
+        assertNotNull("and so does the chart", during.streams)
+        assertEquals("2026-01-02T18:04:00", during.shownSummary?.startTime)
+        assertTrue(during.isRefreshing)
+
+        gate.complete(Unit)
+        advanceUntilIdle()
+        assertFalse(vm.uiState.value.isRefreshing)
+        assertNotNull(vm.uiState.value.streams)
+    }
+
+    @Test
+    fun switchingRidesDropsTheRideJustLeft() = runTest(testDispatcher) {
+        val gate = CompletableDeferred<Unit>()
+        val session = FakeReadSession(
+            detailResult = Result.success(detail),
+            streamsResult = Result.success(streamsWithPower()),
+        )
+        val vm = RideDetailViewModel(session, coroutineScope = backgroundScope)
+        vm.load(17)
+        assertNotNull(vm.uiState.value.streams)
+
+        // Keeping a re-read's data is not the same as keeping another ride's:
+        // the 1,500-point stream of the ride just left must not sit under a
+        // ride that is still loading.
+        session.detailHandler = {
+            gate.await()
+            detail
+        }
+        session.streamsHandler = {
+            gate.await()
+            streamsWithPower()
+        }
+        vm.load(18)
+
+        val during = vm.uiState.value
+        assertNull(during.detail)
+        assertNull(during.streams)
+        assertNull(during.shownSummary)
+        assertTrue(during.isLoading)
+    }
+
+    @Test
+    fun aStreamsAnswerAfterTheCredentialWentAwayIsNotWritten() = runTest(testDispatcher) {
+        // The two reads fail independently, so the streams can answer after
+        // the detail reported a device that no longer exists. That answer
+        // belongs to a pane that has since been cleared to the removed state.
+        val session = FakeReadSession(
+            detailResult = Result.failure(CloudSession.Failure.DeviceRemoved()),
+            streamsResult = Result.success(streamsWithPower()),
+        )
+        val vm = RideDetailViewModel(session, coroutineScope = backgroundScope)
+        vm.load(17)
+
+        val state = vm.uiState.value
+        assertEquals(CloudSession.DeviceState.removed, state.deviceState)
+        assertFalse(state.isPaired)
+        assertNull("the cleared pane keeps nothing from the late read", state.streams)
+        assertNull(state.detail)
     }
 
     @Test

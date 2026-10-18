@@ -869,16 +869,18 @@ class CloudSession(
     }
 
     /**
-     * One activity-object read, ridden out and classified exactly the way a
-     * collection page's is. A detail or stream read is a plain read of the
-     * same scale-to-zero app, so a timeout is the replica still starting --
-     * one retry after [coldStartRetryDelay], then the short waking gate --
-     * and the screen gets "Waking up the cloud…", not "No connection". A
-     * dropped connection this late in a wake is just a dropped connection,
-     * and stays the network's.
+     * One activity-object read, ridden out and classified the way a
+     * collection page's *first* read is: a timeout is the replica still
+     * starting -- one retry after [coldStartRetryDelay], then the short
+     * waking gate -- so the screen gets "Waking up the cloud…", not "No
+     * connection", and a dropped connection this late in a wake is just a
+     * dropped connection and stays the network's.
      *
-     * The 404 retry uses the same treatment: the renewed context's read meets
-     * the same server.
+     * One deliberate difference from [page]: this wraps the 404 retry too,
+     * because the renewed context's read meets the same sleeping replica.
+     * [page] does not ride out its own 404 retry, and that asymmetry is
+     * iOS's as well -- its `readAndStoreActivityObject` wraps both attempts
+     * while its `page` wraps only the first.
      */
     private suspend fun readActivityObject(
         read: suspend (PairedDevice, String) -> CloudApiResult<CloudItem>,

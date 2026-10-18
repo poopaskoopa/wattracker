@@ -98,6 +98,12 @@ class RideDetailViewModel(
     private var loadJob: Job? = null
     /** The ride the in-flight (or last) load ran for. */
     private var loadedId: Int? = null
+    /**
+     * Bumped by every load. A finishing load uses it to tell whether it is
+     * still the current one -- the ride id cannot say that, because a pull
+     * restarts a load of the ride that is already loaded.
+     */
+    private var loadToken = 0
 
     /**
      * Load [activityId]. A load of the same ride while one is in flight is
@@ -105,21 +111,34 @@ class RideDetailViewModel(
      * result belongs to the ride that was just left.
      *
      * [userInitiated] is the rider's own pull: it lifts a gate a waking
-     * server caused -- never one a 429/503 asked for -- and restarts the
-     * reads rather than joining them, because the rider asked for fresh data.
+     * server caused -- never one a 429/503 asked for -- and re-runs the reads
+     * rather than joining them. It is not a refetch, and should not be sold as
+     * one: `activityObject` answers a ride it read inside the five-minute
+     * object cache before it looks at any gate or network, so what a pull
+     * actually buys is the waking gate lifted and the reads that failed run
+     * again. A ride that answered fine a minute ago is served from memory.
      */
     fun load(activityId: Int, userInitiated: Boolean = false) {
         if (!userInitiated && loadedId == activityId && loadJob?.isActive == true) return
         loadJob?.cancel()
+        // A re-read of the ride already on screen keeps it on screen: pulling
+        // a loaded ride must not cost the rider its date, its zones and its
+        // chart for the length of the re-read. A different ride inherits
+        // nothing from the one just left.
+        val keepsItsData = loadedId == activityId
         loadedId = activityId
+        val token = ++loadToken
         _uiState.update {
             it.copy(
                 isLoading = true,
                 isRefreshing = userInitiated,
-                summary = null,
-                detail = null,
-                streams = null,
-                noStreams = false,
+                summary = if (keepsItsData) it.summary else null,
+                detail = if (keepsItsData) it.detail else null,
+                streams = if (keepsItsData) it.streams else null,
+                noStreams = if (keepsItsData) it.noStreams else false,
+                // The notices are this attempt's to set, whatever data it
+                // keeps: a stale "rate limited, retry in 40s" under a chart
+                // that is being re-read is not a thing the rider should see.
                 isWaking = false,
                 throttledRetrySeconds = null,
                 detailError = null,
@@ -133,9 +152,11 @@ class RideDetailViewModel(
                 if (userInitiated && readModel.mayBeWaking) readModel.retryNowIfWaking()
                 doLoad(activityId)
             } finally {
-                // A superseded load (the ride was left) must not clear the
-                // flags the new load just set.
-                if (loadedId == activityId) {
+                // Only the current load may clear the flags. The ride id
+                // cannot decide this: a pull cancels a load of the ride that
+                // is already loaded and starts another, and the cancelled
+                // job's finally would clear the spinner the new load set.
+                if (token == loadToken) {
                     _uiState.update {
                         if (it.isLoading || it.isRefreshing) {
                             it.copy(isLoading = false, isRefreshing = false)
@@ -159,7 +180,8 @@ class RideDetailViewModel(
      * The rider pulled the pane. A waking cloud's failed read leaves the
      * waking notice up, and until its gate expires every re-read is refused
      * without a request -- the pull lifts that gate and re-runs both reads,
-     * the way the list's and the dashboard's pulls do.
+     * the way the list's and the dashboard's pulls do. What is on screen
+     * stays on screen while they run.
      */
     fun pullToRefresh() {
         val id = loadedId ?: return
@@ -211,10 +233,12 @@ class RideDetailViewModel(
 
     /**
      * The detail, applied only while this load still owns the pane: a
-     * superseded load must not write its result over the new ride's.
+     * superseded load must not write its result over the new ride's, and a
+     * read that outlived a gone credential must not write anything at all.
      */
     private suspend fun applyDetail(result: Result<ActivityDetail>) {
         currentCoroutineContext().ensureActive()
+        if (!paneStillWantsRideData()) return
         result.fold(
             onSuccess = { detail ->
                 _uiState.update { it.copy(detail = detail) }
@@ -228,6 +252,7 @@ class RideDetailViewModel(
     /** The streams, applied only while this load still owns the pane. */
     private suspend fun applyStreams(result: Result<ActivityStreams>) {
         currentCoroutineContext().ensureActive()
+        if (!paneStillWantsRideData()) return
         result.fold(
             onSuccess = { streams ->
                 // A payload with no plottable channel says "no streams" the
@@ -247,6 +272,19 @@ class RideDetailViewModel(
                 }
             },
         )
+    }
+
+    /**
+     * Whether a result may still be written to the pane. The two reads fail
+     * independently, so the one that answers second can arrive after the
+     * first reported a credential that is gone -- and that answer cleared the
+     * pane. A successful payload written into a cleared state is invisible
+     * under the removed panel but still held in memory, and it would be
+     * rendered again if the state ever came back.
+     */
+    private fun paneStillWantsRideData(): Boolean {
+        val state = _uiState.value
+        return state.isPaired && state.deviceState != CloudSession.DeviceState.removed
     }
 
     /**
