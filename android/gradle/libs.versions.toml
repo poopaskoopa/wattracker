@@ -16,7 +16,7 @@ securityCrypto = "1.1.0"
 # on it arriving by accident. Not a JSON/HTTP/DI library -- the epic rule
 # holds.
 coroutines = "1.11.0"
-# KSP plugin version is coupled to the Kotlin version above.
+# KSP plugin version (pinned; its version line is not the Kotlin version above).
 ksp = "2.3.6"
 
 [libraries]
