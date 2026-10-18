@@ -305,7 +305,7 @@ private fun RideGraphsCanvas(
     BoxWithConstraints(
         modifier = Modifier
             .fillMaxWidth()
-            .height(200.dp)
+            .height(220.dp) // the spec's chart height (docs/mobile-parity.md)
             .background(Palette.surfaceInset)
             .clipToBounds(),
     ) {
@@ -351,9 +351,11 @@ private fun RideGraphsCanvas(
                 }
             }
 
-            // Draw series lines
+            // Draw series lines at the spec's widths: 1.5 pt on the data
+            // lines, 1 pt on the altitude context line (which also draws at
+            // 0.5 alpha).
             plot.renderedSeries.forEach { rs ->
-                val strokeWidth = if (rs.isBackground) 1.5.dp.toPx() else 2.dp.toPx()
+                val strokeWidth = if (rs.isBackground) 1.dp.toPx() else 1.5.dp.toPx()
                 val opacity = if (rs.isBackground) CombinedChartSeries.altitudeLineOpacity else 1f
                 drawPath(
                     path = rs.linePath,

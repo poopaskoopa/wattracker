@@ -21,6 +21,7 @@ import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.Text
+import androidx.compose.material3.pulltorefresh.PullToRefreshBox
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
@@ -71,7 +72,11 @@ import kotlinx.coroutines.CancellationException
  * The pane's view model is one per screen scope (keyed on the backend), not
  * one per ride: in the two-pane layout a ride's detail and streams must not
  * pile up as the rider clicks through the list. The pane reloads on resume
- * (a waking cloud's read re-runs) and releases its ride data on stop.
+ * (a waking cloud's read re-runs) and releases its ride data on stop, and it
+ * pulls to refresh -- the detail's waking notice is otherwise a dead end
+ * until the waking gate expires, so the pull is the rider's way of lifting
+ * it (the list and the dashboard pull the same way; iOS has no pull on its
+ * detail, which sits under the list's).
  */
 @Composable
 fun RideDetailPane(
@@ -116,124 +121,139 @@ fun RideDetailPane(
     val shown = uiState.shownSummary
     val zones: JsonValue? = uiState.detail?.zones
 
-    Column(
+    PullToRefreshBox(
+        isRefreshing = uiState.isRefreshing,
+        onRefresh = { viewModel.pullToRefresh() },
         modifier = modifier
             .fillMaxSize()
-            .background(Palette.bg)
-            .verticalScroll(rememberScrollState())
-            .padding(16.dp),
+            .background(Palette.bg),
     ) {
-        if (onBack != null) {
-            Row(verticalAlignment = Alignment.CenterVertically) {
-                IconButton(onClick = onBack) {
-                    Icon(
-                        imageVector = Icons.AutoMirrored.Filled.ArrowBack,
-                        contentDescription = stringResource(R.string.back),
-                        tint = Palette.muted,
-                    )
-                }
-                Text(
-                    text = stringResource(R.string.ride_detail_title),
-                    style = TextStyle(fontSize = 18.sp, fontWeight = FontWeight.SemiBold, color = Palette.textBright),
-                )
-            }
-        }
-
-        when {
-            uiState.deviceState == CloudSession.DeviceState.removed -> {
-                DeviceStatePanel(
-                    title = stringResource(R.string.activities_removed_title),
-                    note = stringResource(R.string.activities_removed_note),
-                )
-            }
-
-            !uiState.isPaired -> {
-                DeviceStatePanel(
-                    title = stringResource(R.string.activities_unpaired_title),
-                    note = stringResource(R.string.activities_unpaired_note),
-                )
-            }
-
-            else -> {
-                Column(verticalArrangement = Arrangement.spacedBy(2.dp)) {
-                    Text(
-                        text = RideFormatting.date(shown?.startTime) ?: stringResource(R.string.ride_unknown_date),
-                        style = TextStyle(fontSize = 20.sp, fontWeight = FontWeight.SemiBold, color = Palette.textBright),
-                    )
-                    Text(
-                        text = stringResource(R.string.activity_detail_subtitle),
-                        style = TextStyle(fontSize = 14.sp, color = Palette.muted),
-                    )
-                    if (uiState.isWaking) {
-                        WakingNotice()
-                    }
-                }
-                Spacer(modifier = Modifier.height(12.dp))
-
-                SummaryPanel(summary = shown)
-
-                if (zones != null) {
-                    ZoneSection(zones = zones)
-                }
-
-                when {
-                    uiState.isWaking -> {
-                        // A static notice, not a spinner: the next resume
-                        // re-runs the read (the pane's resume observer).
-                        WakingCard()
-                    }
-
-                    uiState.throttledRetrySeconds != null -> {
-                        ThrottledPanel(uiState.throttledRetrySeconds!!)
-                    }
-
-                    uiState.streams != null -> {
-                        RideGraphsChart(
-                            streams = uiState.streams!!,
-                            durationSeconds = shown?.durationS,
+        Column(
+            modifier = Modifier
+                .verticalScroll(rememberScrollState())
+                .padding(16.dp),
+        ) {
+            if (onBack != null) {
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    IconButton(onClick = onBack) {
+                        Icon(
+                            imageVector = Icons.AutoMirrored.Filled.ArrowBack,
+                            contentDescription = stringResource(R.string.back),
+                            tint = Palette.muted,
                         )
                     }
+                    Text(
+                        text = stringResource(R.string.ride_detail_title),
+                        style = TextStyle(fontSize = 18.sp, fontWeight = FontWeight.SemiBold, color = Palette.textBright),
+                    )
+                }
+            }
 
-                    uiState.isLoading -> {
-                        Panel {
-                            Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(10.dp)) {
-                                CircularProgressIndicator(
-                                    modifier = Modifier.size(18.dp),
-                                    color = Palette.accent,
-                                    strokeWidth = 2.dp,
-                                )
+            when {
+                // Opening or resuming: the pairing state has not been read
+                // yet, so neither panel below is known, and showing one would
+                // flash "No backend paired" over the ride a frame later.
+                uiState.isStarting -> Unit
+
+                uiState.deviceState == CloudSession.DeviceState.removed -> {
+                    DeviceStatePanel(
+                        title = stringResource(R.string.activities_removed_title),
+                        note = stringResource(R.string.activities_removed_note),
+                    )
+                }
+
+                !uiState.isPaired -> {
+                    DeviceStatePanel(
+                        title = stringResource(R.string.activities_unpaired_title),
+                        note = stringResource(R.string.activities_unpaired_note),
+                    )
+                }
+
+                else -> {
+                    Column(verticalArrangement = Arrangement.spacedBy(2.dp)) {
+                        Text(
+                            text = RideFormatting.date(shown?.startTime) ?: stringResource(R.string.ride_unknown_date),
+                            style = TextStyle(fontSize = 20.sp, fontWeight = FontWeight.SemiBold, color = Palette.textBright),
+                        )
+                        Text(
+                            text = stringResource(R.string.activity_detail_subtitle),
+                            style = TextStyle(fontSize = 14.sp, color = Palette.muted),
+                        )
+                        if (uiState.isWaking) {
+                            WakingNotice()
+                        }
+                    }
+                    Spacer(modifier = Modifier.height(12.dp))
+
+                    SummaryPanel(summary = shown)
+
+                    if (zones != null) {
+                        ZoneSection(zones = zones)
+                    }
+
+                    when {
+                        // The chart comes first: each read fails on its own,
+                        // so a detail that woke badly or was rate limited
+                        // must not cover streams that loaded fine.
+                        uiState.streams != null -> {
+                            RideGraphsChart(
+                                streams = uiState.streams!!,
+                                durationSeconds = shown?.durationS,
+                            )
+                        }
+
+                        uiState.isWaking -> {
+                            // A static notice, not a spinner: the pane's
+                            // resume re-runs the read, and a pull lifts the
+                            // waking gate so the retry goes out now.
+                            WakingCard()
+                        }
+
+                        uiState.throttledRetrySeconds != null -> {
+                            ThrottledPanel(uiState.throttledRetrySeconds!!)
+                        }
+
+                        uiState.isLoading -> {
+                            Panel {
+                                Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(10.dp)) {
+                                    CircularProgressIndicator(
+                                        modifier = Modifier.size(18.dp),
+                                        color = Palette.accent,
+                                        strokeWidth = 2.dp,
+                                    )
+                                    Text(
+                                        text = stringResource(R.string.activities_loading_streams),
+                                        style = TextStyle(fontSize = 14.sp, color = Palette.muted),
+                                    )
+                                }
+                            }
+                        }
+
+                        uiState.noStreams -> {
+                            Panel {
                                 Text(
-                                    text = stringResource(R.string.activities_loading_streams),
+                                    text = stringResource(R.string.activities_no_streams),
+                                    style = TextStyle(fontSize = 14.sp, color = Palette.muted),
+                                )
+                            }
+                        }
+
+                        uiState.streamsError != null -> {
+                            Panel {
+                                Text(
+                                    text = uiState.streamsError!!,
                                     style = TextStyle(fontSize = 14.sp, color = Palette.muted),
                                 )
                             }
                         }
                     }
 
-                    uiState.noStreams -> {
-                        Panel {
-                            Text(
-                                text = stringResource(R.string.activities_no_streams),
-                                style = TextStyle(fontSize = 14.sp, color = Palette.muted),
-                            )
-                        }
+                    uiState.detailError?.let {
+                        Text(
+                            text = it,
+                            style = TextStyle(fontSize = 12.sp, color = Palette.alert),
+                        )
                     }
-
-                    uiState.streamsError != null -> {
-                        Panel {
-                            Text(
-                                text = uiState.streamsError!!,
-                                style = TextStyle(fontSize = 14.sp, color = Palette.muted),
-                            )
-                        }
-                    }
-                }
-
-                uiState.detailError?.let {
-                    Text(
-                        text = it,
-                        style = TextStyle(fontSize = 12.sp, color = Palette.alert),
-                    )
                 }
             }
         }

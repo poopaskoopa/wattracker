@@ -13,7 +13,7 @@ import com.wattracker.android.cloud.ReadSession
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Job
-import kotlinx.coroutines.async
+import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -31,6 +31,8 @@ data class RideDetailUiState(
     val deviceState: CloudSession.DeviceState = CloudSession.DeviceState.unpaired,
     val isPaired: Boolean = false,
     val isLoading: Boolean = true,
+    /** The rider pulled the pane; the reads behind the pull are still running. */
+    val isRefreshing: Boolean = false,
     /** The list's summary for this ride, shown as soon as the cached list can supply it. */
     val summary: ActivitySummary? = null,
     val detail: ActivityDetail? = null,
@@ -73,9 +75,14 @@ data class RideDetailUiState(
  * Mirrors the iOS `ActivityDetailScreen`: the detail and the streams go
  * out in parallel and fail independently (a detail error does not hide a
  * chart, and a streams 404 is the rider's "No recorded streams", not a
- * failure). The ride's streams arrive downsampled to 1,500 points as
+ * failure), and each one is applied the moment it lands rather than after
+ * both have. The ride's streams arrive downsampled to 1,500 points as
  * published -- this view model renders what arrives and never requests raw
  * or resamples.
+ *
+ * Both reads are children of the load that started them, so superseding a
+ * load -- the rider clicking another ride while one is still loading --
+ * cancels them as a unit.
  */
 class RideDetailViewModel(
     private val readModel: ReadSession,
@@ -96,14 +103,19 @@ class RideDetailViewModel(
      * Load [activityId]. A load of the same ride while one is in flight is
      * ignored; a different ride supersedes the walk in flight, because its
      * result belongs to the ride that was just left.
+     *
+     * [userInitiated] is the rider's own pull: it lifts a gate a waking
+     * server caused -- never one a 429/503 asked for -- and restarts the
+     * reads rather than joining them, because the rider asked for fresh data.
      */
-    fun load(activityId: Int) {
-        if (loadedId == activityId && loadJob?.isActive == true) return
+    fun load(activityId: Int, userInitiated: Boolean = false) {
+        if (!userInitiated && loadedId == activityId && loadJob?.isActive == true) return
         loadJob?.cancel()
         loadedId = activityId
         _uiState.update {
             it.copy(
                 isLoading = true,
+                isRefreshing = userInitiated,
                 summary = null,
                 detail = null,
                 streams = null,
@@ -116,13 +128,20 @@ class RideDetailViewModel(
         }
         loadJob = scope.launch {
             try {
+                // The desktop never scales to zero; only the cloud can be
+                // waking, and only a cold start's gate may be lifted.
+                if (userInitiated && readModel.mayBeWaking) readModel.retryNowIfWaking()
                 doLoad(activityId)
             } finally {
                 // A superseded load (the ride was left) must not clear the
-                // flag the new load just set.
+                // flags the new load just set.
                 if (loadedId == activityId) {
                     _uiState.update {
-                        if (it.isLoading) it.copy(isLoading = false) else it
+                        if (it.isLoading || it.isRefreshing) {
+                            it.copy(isLoading = false, isRefreshing = false)
+                        } else {
+                            it
+                        }
                     }
                 }
             }
@@ -134,6 +153,17 @@ class RideDetailViewModel(
         val id = loadedId ?: return
         if (loadJob?.isActive == true) return // join the walk in flight
         load(id)
+    }
+
+    /**
+     * The rider pulled the pane. A waking cloud's failed read leaves the
+     * waking notice up, and until its gate expires every re-read is refused
+     * without a request -- the pull lifts that gate and re-runs both reads,
+     * the way the list's and the dashboard's pulls do.
+     */
+    fun pullToRefresh() {
+        val id = loadedId ?: return
+        load(id, userInitiated = true)
     }
 
     /**
@@ -160,20 +190,32 @@ class RideDetailViewModel(
             _uiState.update { it.copy(summary = cachedSummary) }
         }
 
-        // Both reads in flight at once, each failing on its own.
-        val detailDeferred = scope.async {
-            readResult { readModel.activityDetail(activityId) }
+        // Both reads go out in flight at once, each failing on its own, and
+        // each applied as it lands: the summary and the zones do not wait on
+        // the much larger stream payload, the way iOS assigns `detail` as
+        // soon as it returns. The reads are children of this load --
+        // `coroutineScope`, not the view model's scope -- so cancelling the
+        // load cancels them with it. Launched beside the load instead they
+        // would be its siblings, and `loadJob.cancel()` would only cancel the
+        // awaits: every click through the list in the two-pane layout would
+        // leave two reads running for the ride just left, which is how a
+        // cloud rider reaches a 429 backoff without meaning to.
+        coroutineScope {
+            launch { applyDetail(readResult { readModel.activityDetail(activityId) }) }
+            launch { applyStreams(readResult { readModel.activityStreams(activityId) }) }
         }
-        val streamsDeferred = scope.async {
-            readResult { readModel.activityStreams(activityId) }
-        }
-        val detailResult = detailDeferred.await()
-        val streamsResult = streamsDeferred.await()
 
-        // A superseded load must not write its result over the new ride's.
         currentCoroutineContext().ensureActive()
+        _uiState.update { it.copy(isLoading = false, isRefreshing = false) }
+    }
 
-        detailResult.fold(
+    /**
+     * The detail, applied only while this load still owns the pane: a
+     * superseded load must not write its result over the new ride's.
+     */
+    private suspend fun applyDetail(result: Result<ActivityDetail>) {
+        currentCoroutineContext().ensureActive()
+        result.fold(
             onSuccess = { detail ->
                 _uiState.update { it.copy(detail = detail) }
             },
@@ -181,8 +223,12 @@ class RideDetailViewModel(
                 applyFailure(e, forStreams = false)
             },
         )
+    }
 
-        streamsResult.fold(
+    /** The streams, applied only while this load still owns the pane. */
+    private suspend fun applyStreams(result: Result<ActivityStreams>) {
+        currentCoroutineContext().ensureActive()
+        result.fold(
             onSuccess = { streams ->
                 // A payload with no plottable channel says "no streams" the
                 // way a 404 does (a ride without any recorded channel).
@@ -201,9 +247,6 @@ class RideDetailViewModel(
                 }
             },
         )
-
-        currentCoroutineContext().ensureActive()
-        _uiState.update { it.copy(isLoading = false) }
     }
 
     /**
@@ -234,6 +277,7 @@ class RideDetailViewModel(
                         noStreams = false,
                         isWaking = false,
                         isLoading = false,
+                        isRefreshing = false,
                         detailError = null,
                         streamsError = null,
                     )
