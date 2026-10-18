@@ -1267,6 +1267,213 @@ class CloudSessionTest {
         assertFalse(refresh.toString().contains("SECRET-CTX"))
     }
 
+    // MARK: - The bounded activity-object cache (iOS #351, #358)
+
+    @Test
+    fun anActivityDetailIsCachedForTheSession() = runTest {
+        makePairedSession { request ->
+            when {
+                request.url.contains("/context/refresh") ->
+                    CloudResponse(200, refreshJson("ctx-1", 300.0).toByteArray(), null, nowMillis)
+                request.url.contains("/activities/activity-detail-17") ->
+                    CloudResponse(200, activityDetailItemJson(17, 1).toByteArray(), null, null)
+                else -> throw AssertionError("unexpected ${request.url}")
+            }
+        }
+        session.activityDetail(17)
+        session.activityDetail(17)
+        assertEquals(
+            "the second open reads the in-memory copy, not the network",
+            1,
+            transport.requests.count { it.url.contains("/activities/activity-detail-17") },
+        )
+    }
+
+    @Test
+    fun anExpiredActivityObjectIsRefetched() = runTest {
+        makePairedSession { request ->
+            when {
+                request.url.contains("/context/refresh") ->
+                    CloudResponse(200, refreshJson("ctx-1", 300.0).toByteArray(), null, nowMillis)
+                request.url.contains("/activities/activity-detail-17") ->
+                    CloudResponse(200, activityDetailItemJson(17, 1).toByteArray(), null, null)
+                else -> throw AssertionError("unexpected ${request.url}")
+            }
+        }
+        session.activityDetail(17)
+        // Exactly at the bound the entry is still fresh (<=), one millisecond
+        // past it is not: the refresh protocol carries no detail revision, so
+        // the age bound is what makes an in-place edit eventually visible.
+        nowMillis += CloudSession.activityObjectCacheLifetimeMs
+        session.activityDetail(17)
+        assertEquals(
+            "at the bound the copy is still served",
+            1,
+            transport.requests.count { it.url.contains("/activities/activity-detail-17") },
+        )
+        nowMillis += 1
+        session.activityDetail(17)
+        assertEquals(
+            "past the bound the copy is refetched",
+            2,
+            transport.requests.count { it.url.contains("/activities/activity-detail-17") },
+        )
+    }
+
+    @Test
+    fun theActivityObjectCacheIsBoundedAndPrefersStreamsForEviction() = runTest {
+        makePairedSession { request ->
+            when {
+                request.url.contains("/context/refresh") ->
+                    CloudResponse(200, refreshJson("ctx-1", 300.0).toByteArray(), null, nowMillis)
+                request.url.contains("/activities/activity-detail-") -> {
+                    val id = request.url.substringAfter("/activities/activity-detail-").toInt()
+                    CloudResponse(200, activityDetailItemJson(id, 1).toByteArray(), null, null)
+                }
+                request.url.contains("/activities/stream-") -> {
+                    val id = request.url.substringAfter("/activities/stream-").toInt()
+                    CloudResponse(200, activityStreamItemJson(id).toByteArray(), null, null)
+                }
+                else -> throw AssertionError("unexpected ${request.url}")
+            }
+        }
+        // Eight details fill the cap exactly.
+        (1..8).forEach { session.activityDetail(it) }
+        // A stream for ride 8 overflows: no other stream exists, so the
+        // least-recently-used detail (ride 1) goes.
+        session.activityStreams(8)
+        // Another stream overflows: now a stream (ride 8's) is evictable and
+        // goes before any detail.
+        session.activityStreams(7)
+        assertEquals(
+            "ride 1's detail was evicted by the first stream",
+            1,
+            transport.requests.count { it.url.contains("/activities/activity-detail-1") },
+        )
+        // It was evicted, so the next open costs a request. Re-inserting it
+        // evicts the only other stream (ride 7's).
+        session.activityDetail(1)
+        assertEquals(
+            "the evicted detail is fetched again",
+            2,
+            transport.requests.count { it.url.contains("/activities/activity-detail-1") },
+        )
+        // Ride 8's stream was evicted by ride 7's, and ride 7's was evicted
+        // by ride 1's re-insert: both cost requests, everything else served
+        // from memory.
+        session.activityStreams(8)
+        session.activityStreams(7)
+        session.activityDetail(3)
+        assertEquals(
+            "ride 8's stream was evicted and is fetched again",
+            2,
+            transport.requests.count { it.url.contains("/activities/stream-8") },
+        )
+        assertEquals(
+            "ride 7's stream was evicted and is fetched again",
+            2,
+            transport.requests.count { it.url.contains("/activities/stream-7") },
+        )
+        assertEquals(
+            "a ride that was never evicted is served from memory",
+            1,
+            transport.requests.count { it.url.contains("/activities/activity-detail-3") },
+        )
+    }
+
+    @Test
+    fun aNewerRevisionInvalidatesTheCachedDetail() = runTest {
+        makePairedSession { request ->
+            when {
+                request.url.contains("/context/refresh") ->
+                    CloudResponse(200, refreshJson("ctx-1", 300.0).toByteArray(), null, nowMillis)
+                request.url.contains("/activities/activity-detail-17") ->
+                    CloudResponse(200, activityDetailItemJson(17, 2).toByteArray(), null, null)
+                request.url.contains("/context/activities") ->
+                    CloudResponse(
+                        200,
+                        collectionJson(listOf(activityItem(2)), 2, null).toByteArray(),
+                        null,
+                        null,
+                    )
+                else -> throw AssertionError("unexpected ${request.url}")
+            }
+        }
+        session.activityDetail(17)
+        // The ride's revision advanced in the collection: the cached detail is
+        // the old one and must go.
+        val snapshot = session.load(CloudRoute.Activities)
+        assertEquals(2, snapshot.revision)
+        session.activityDetail(17)
+        assertEquals(
+            "the invalidated detail is refetched",
+            2,
+            transport.requests.count { it.url.contains("/activities/activity-detail-17") },
+        )
+    }
+
+    @Test
+    fun aTombstonedActivityInvalidatesTheCachedObjects() = runTest {
+        makePairedSession { request ->
+            when {
+                request.url.contains("/context/refresh") ->
+                    CloudResponse(200, refreshJson("ctx-1", 300.0).toByteArray(), null, nowMillis)
+                request.url.contains("/activities/activity-detail-17") ->
+                    CloudResponse(200, activityDetailItemJson(17, 1).toByteArray(), null, null)
+                request.url.contains("/activities/stream-17") ->
+                    CloudResponse(200, activityStreamItemJson(17).toByteArray(), null, null)
+                request.url.contains("/context/activities") ->
+                    CloudResponse(
+                        200,
+                        collectionJson(listOf(activityTombstone(3)), 3, null).toByteArray(),
+                        null,
+                        null,
+                    )
+                else -> throw AssertionError("unexpected ${request.url}")
+            }
+        }
+        session.activityDetail(17)
+        session.activityStreams(17)
+        session.load(CloudRoute.Activities)
+        session.activityDetail(17)
+        session.activityStreams(17)
+        assertEquals(
+            "the tombstone dropped the cached detail",
+            2,
+            transport.requests.count { it.url.contains("/activities/activity-detail-17") },
+        )
+        assertEquals(
+            "and the cached stream",
+            2,
+            transport.requests.count { it.url.contains("/activities/stream-17") },
+        )
+    }
+
+    @Test
+    fun aRePairClearsTheActivityObjectCache() = runTest {
+        makePairedSession { request ->
+            when {
+                request.url.contains("/devices/pair") ->
+                    CloudResponse(200, pairingJson().toByteArray(), null, nowMillis)
+                request.url.contains("/context/refresh") ->
+                    CloudResponse(200, refreshJson("ctx-1", 300.0).toByteArray(), null, nowMillis)
+                request.url.contains("/activities/activity-detail-17") ->
+                    CloudResponse(200, activityDetailItemJson(17, 1).toByteArray(), null, null)
+                else -> throw AssertionError("unexpected ${request.url}")
+            }
+        }
+        session.activityDetail(17)
+        // A new identity starts from nothing: the previous device's ride
+        // detail is not this one's to serve.
+        session.pair("THE-CODE", "bike phone")
+        session.activityDetail(17)
+        assertEquals(
+            "the re-pair forced a fresh fetch",
+            2,
+            transport.requests.count { it.url.contains("/activities/activity-detail-17") },
+        )
+    }
+
     // MARK: - JSON builders
 
     private fun pairingJson(expiresIn: Double = 300.0): String =
@@ -1286,6 +1493,24 @@ class CloudSessionTest {
     private fun objectItem(id: String, revision: Int): CloudItem = CloudItem.fromJson(
         JsonValue.parse("""{"id":"$id","kind":"profile","revision":$revision,"data":{"ftp":250}}"""),
     )
+
+    private fun activityItem(revision: Int): CloudItem = CloudItem.fromJson(
+        JsonValue.parse(
+            """{"id":"activity-17","kind":"activity","revision":$revision,"data":{"id":17,"start_time":"2026-01-02T18:04:00","duration_s":3600}}""",
+        ),
+    )
+
+    private fun activityTombstone(revision: Int): CloudItem = CloudItem.fromJson(
+        JsonValue.parse(
+            """{"id":"activity-17","kind":"activity","revision":$revision,"deleted":true,"data":{}}""",
+        ),
+    )
+
+    private fun activityDetailItemJson(id: Int, revision: Int): String =
+        """{"id":"activity-detail-$id","kind":"activity_detail","revision":$revision,"data":{"id":$id,"start_time":"2026-01-02T18:04:00","duration_s":3600,"distance_m":32100.5,"avg_power":211,"np":225,"if_":0.9,"tss":81.0,"rpe":6}}"""
+
+    private fun activityStreamItemJson(id: Int): String =
+        """{"id":"stream-$id","kind":"stream","revision":1,"data":{"streams":{"time":[0,1],"power":[180,205]}}}"""
 }
 
 /**
