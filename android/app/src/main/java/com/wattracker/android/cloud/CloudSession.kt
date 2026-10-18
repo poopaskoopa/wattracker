@@ -304,9 +304,7 @@ class CloudSession(
                 RemoveDeviceResult.ServerRevoked
             }
             is CloudApiResult.Failure -> {
-                val isTrustedDate = result.serverDateMillis != null &&
-                    Math.abs(now() - result.serverDateMillis) / 1000.0 <= clockSkewTolerance
-                if ((result.status == 404 || result.status == 401) && isTrustedDate) {
+                if (removalCompletesLocally(result.status, result.serverDateMillis, now())) {
                     // Complete removal locally only if the session hasn't re-paired mid-flight
                     val newGeneration = mutex.withLock {
                         if (lifecycleGeneration != generation) throw lifecycleFailure()
@@ -969,6 +967,34 @@ class CloudSession(
         const val minimumUsableLifetime: Double = 15.0
         const val maximumContextLifetime: Double = 300.0
         const val clockSkewTolerance: Double = 240.0
+
+        /**
+         * The #410 removal rule: a refused revoke completes locally only when
+         * the refusal is the server's own clock saying it no longer knows
+         * this credential.
+         *
+         * 401 and 404 are indistinguishable by design, and either one with a
+         * parseable `Date` within [tolerance] (inclusive) of the device clock
+         * is trusted evidence the credential is gone. Every other status
+         * (429/503/5xx, 403, 400, 410), a no-response (`status == null`), and
+         * a missing or skewed `Date` keep the credential: a transient failure
+         * is not evidence the server forgot us, and a clock that disagrees
+         * with the server's cannot rule out skew as the cause of the refusal.
+         *
+         * Pinned by the shared vector: `tests/vectors/removal_decision_v1.json`
+         * is read by the Python, Swift and Kotlin
+         * (`RemovalDecisionVectorTest`) suites, which check all 23 cases.
+         */
+        fun removalCompletesLocally(
+            status: Int?,
+            serverDateMillis: Long?,
+            now: Long,
+            tolerance: Double = clockSkewTolerance,
+        ): Boolean {
+            if (status != 401 && status != 404) return false
+            val serverDate = serverDateMillis ?: return false
+            return Math.abs(now - serverDate) / 1000.0 <= tolerance
+        }
         const val baseBackoff: Double = 30.0
         const val maximumBackoff: Double = 300.0
         /** Upper bound on any backoff, so `delay * 1000` can never overflow. */
