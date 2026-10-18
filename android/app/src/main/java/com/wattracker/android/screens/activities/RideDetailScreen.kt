@@ -31,6 +31,7 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.text.TextStyle
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.lifecycle.ViewModel
@@ -251,8 +252,14 @@ private fun ZoneSection(zones: JsonValue?) {
                         )
                         Text(
                             text = "${row.percent.roundToInt()}%",
-                            style = TextStyle(fontSize = 14.sp, color = Palette.text),
-                            modifier = Modifier.width(42.dp),
+                            style = TextStyle(
+                                fontSize = 14.sp,
+                                color = Palette.text,
+                                textAlign = TextAlign.End,
+                            ),
+                            modifier = Modifier
+                                .padding(start = 10.dp)
+                                .width(48.dp),
                         )
                     }
                 }
