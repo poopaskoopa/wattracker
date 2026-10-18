@@ -34,7 +34,12 @@ enum class Destination(
     val route: String = name.lowercase()
 
     companion object {
+        /**
+         * The destination a route belongs to. A pushed sub-route (the
+         * activities detail, `activities/detail/{id}`) highlights its
+         * parent destination, not the start one.
+         */
         fun fromRoute(route: String?): Destination? =
-            entries.firstOrNull { it.route == route }
+            entries.firstOrNull { route == it.route || route?.startsWith("${it.route}/") == true }
     }
 }

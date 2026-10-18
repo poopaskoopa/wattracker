@@ -33,6 +33,8 @@ data class RideDetailUiState(
     val streams: ActivityStreams? = null,
     /** The ride has no plottable streams: a 404, or an empty payload. */
     val noStreams: Boolean = false,
+    /** A waking cloud refused the read: the screen shows the waking notice. */
+    val isWaking: Boolean = false,
     val detailError: String? = null,
     val streamsError: String? = null,
 ) {
@@ -119,7 +121,11 @@ class RideDetailViewModel(
                     _uiState.update { it.copy(detail = detail) }
                 },
                 onFailure = { e ->
-                    _uiState.update { it.copy(detailError = e.message ?: e::class.simpleName) }
+                    if (e is CloudSession.Failure.Waking) {
+                        _uiState.update { it.copy(isWaking = true) }
+                    } else {
+                        _uiState.update { it.copy(detailError = e.message ?: e::class.simpleName) }
+                    }
                 },
             )
 
@@ -134,10 +140,13 @@ class RideDetailViewModel(
                     }
                 },
                 onFailure = { e ->
-                    if (isNotFound(e)) {
-                        _uiState.update { it.copy(streams = null, noStreams = true) }
-                    } else {
-                        _uiState.update { it.copy(streamsError = e.message ?: e::class.simpleName) }
+                    when {
+                        isNotFound(e) ->
+                            _uiState.update { it.copy(streams = null, noStreams = true) }
+                        e is CloudSession.Failure.Waking ->
+                            _uiState.update { it.copy(isWaking = true) }
+                        else ->
+                            _uiState.update { it.copy(streamsError = e.message ?: e::class.simpleName) }
                     }
                 },
             )
