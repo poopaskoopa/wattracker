@@ -841,13 +841,7 @@ class CloudSession(
             activityObjectGenerations[activityId] ?: 0
         }
         val attempt = context(after = null)
-        val result = try {
-            read(device, attempt.value)
-        } catch (e: Failure) {
-            throw e
-        } catch (e: IOException) {
-            throw Failure.Offline()
-        }
+        val result = readActivityObject(read, device, attempt.value)
         return when (result) {
             is CloudApiResult.Success -> storeActivityObject(
                 objectId, activityId, result.value, device, generation, activityObjectGeneration,
@@ -863,13 +857,7 @@ class CloudSession(
                 }
                 if (status != 404) throw Failure.Server(status)
                 val renewed = context(after = attempt.generation)
-                val retry = try {
-                    read(device, renewed.value)
-                } catch (e: Failure) {
-                    throw e
-                } catch (e: IOException) {
-                    throw Failure.Offline()
-                }
+                val retry = readActivityObject(read, device, renewed.value)
                 when (retry) {
                     is CloudApiResult.Success -> storeActivityObject(
                         objectId, activityId, retry.value, device, generation, activityObjectGeneration,
@@ -879,6 +867,37 @@ class CloudSession(
             }
         }
     }
+
+    /**
+     * One activity-object read, ridden out and classified exactly the way a
+     * collection page's is. A detail or stream read is a plain read of the
+     * same scale-to-zero app, so a timeout is the replica still starting --
+     * one retry after [coldStartRetryDelay], then the short waking gate --
+     * and the screen gets "Waking up the cloud…", not "No connection". A
+     * dropped connection this late in a wake is just a dropped connection,
+     * and stays the network's.
+     *
+     * The 404 retry uses the same treatment: the renewed context's read meets
+     * the same server.
+     */
+    private suspend fun readActivityObject(
+        read: suspend (PairedDevice, String) -> CloudApiResult<CloudItem>,
+        device: PairedDevice,
+        readerContext: String,
+    ): CloudApiResult<CloudItem> =
+        try {
+            ridingOutColdStart(firstRequest = false) { read(device, readerContext) }
+        } catch (e: Failure) {
+            throw e
+        } catch (e: CancellationException) {
+            throw e
+        } catch (e: IOException) {
+            // The retry also timed out: the server is waking, not failing.
+            if (isColdStart(e, firstRequest = false)) {
+                throw mutex.withLock { noteColdStart() }
+            }
+            throw Failure.Offline()
+        }
 
     /** Takes the mutex. A read that raced a newer collection revision is served but not stored. */
     private suspend fun storeActivityObject(

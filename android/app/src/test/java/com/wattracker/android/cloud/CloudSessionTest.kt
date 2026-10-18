@@ -1503,6 +1503,73 @@ class CloudSessionTest {
         )
     }
 
+    // MARK: - A detail/stream read meets a waking read app
+
+    @Test
+    fun anActivityReadRidesOutAColdStartAndHearsWaking() = runTest {
+        // The read app scales to zero, so opening a ride can be the request
+        // that meets a sleeping replica. A detail read is treated exactly as
+        // a collection page's is: one retry, then the short waking gate.
+        val sleeps = mutableListOf<Long>()
+        var detailReads = 0
+        makePairedSession(sleep = chargingSleep(sleeps)) { request ->
+            when {
+                request.url.contains("/context/refresh") ->
+                    CloudResponse(200, refreshJson("ctx-1", 300.0).toByteArray(), null, nowMillis)
+                request.url.contains("/activities/activity-detail-17") -> {
+                    detailReads += 1
+                    if (detailReads <= 2) {
+                        // Both the read and its retry time out: the replica
+                        // is still starting, and each timeout charges the
+                        // transport's whole request timeout.
+                        nowMillis += 60_000
+                        throw SocketTimeoutException("Read timed out")
+                    }
+                    CloudResponse(200, activityDetailItemJson(17, 1).toByteArray(), null, null)
+                }
+                else -> throw AssertionError("unexpected ${request.url}")
+            }
+        }
+        // The screen hears "waking", not "offline": the detail pane shows the
+        // waking notice instead of "No connection".
+        expectFailure<CloudSession.Failure.Waking> { session.activityDetail(17) }
+        assertEquals("one try and one retry, no more", 2, detailReads)
+        assertEquals("one cold-start pause", listOf(3_000L), sleeps)
+        // Re-opening the ride inside the waking gate costs no request.
+        expectFailure<CloudSession.Failure.Waking> { session.activityDetail(17) }
+        assertEquals(2, detailReads)
+        // The rider pulls the pane: only a cold start's gate may be lifted,
+        // so the next open goes out now.
+        session.retryNowIfWaking()
+        assertNotNull(session.activityDetail(17))
+        assertEquals(3, detailReads)
+        // A waking read says nothing about the credential: no strike.
+        assertEquals(CloudSession.DeviceState.paired, session.deviceState)
+    }
+
+    @Test
+    fun aRefusedConnectionOnAStreamReadIsOfflineNotWaking() = runTest {
+        // The other arm of the same classification: a refused connection is
+        // the network, so it neither retries nor sets a waking gate.
+        val sleeps = mutableListOf<Long>()
+        makePairedSession(sleep = chargingSleep(sleeps)) { request ->
+            when {
+                request.url.contains("/context/refresh") ->
+                    CloudResponse(200, refreshJson("ctx-1", 300.0).toByteArray(), null, nowMillis)
+                request.url.contains("/activities/stream-17") ->
+                    throw ConnectException("Connection refused")
+                else -> throw AssertionError("unexpected ${request.url}")
+            }
+        }
+        expectFailure<CloudSession.Failure.Offline> { session.activityStreams(17) }
+        assertEquals(
+            "no retry on a refused connection",
+            1,
+            transport.requests.count { it.url.contains("/activities/stream-17") },
+        )
+        assertEquals("and no cold-start pause", emptyList<Long>(), sleeps)
+    }
+
     // MARK: - JSON builders
 
     private fun pairingJson(expiresIn: Double = 300.0): String =

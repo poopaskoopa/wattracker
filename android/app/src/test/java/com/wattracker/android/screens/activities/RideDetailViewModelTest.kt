@@ -11,8 +11,11 @@ import com.wattracker.android.cloud.CloudSession
 import com.wattracker.android.cloud.CloudSnapshot
 import com.wattracker.android.cloud.LocalClientException
 import com.wattracker.android.cloud.ReadSession
+import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.ExperimentalCoroutinesApi
 import kotlinx.coroutines.test.UnconfinedTestDispatcher
+import kotlinx.coroutines.test.advanceUntilIdle
 import kotlinx.coroutines.test.resetMain
 import kotlinx.coroutines.test.runTest
 import kotlinx.coroutines.test.setMain
@@ -49,14 +52,39 @@ class RideDetailViewModelTest {
         private val cachedSnapshot: CloudSnapshot? = null,
         var detailResult: Result<ActivityDetail> = Result.failure(NotImplementedError()),
         var streamsResult: Result<ActivityStreams> = Result.failure(NotImplementedError()),
+        /**
+         * Handlers win over the canned results where a test needs a read that
+         * suspends. Null means "use `detailResult`/`streamsResult`", read as
+         * properties so a test can swap the canned result mid-flight.
+         */
+        val detailHandler: (suspend (Int) -> ActivityDetail)? = null,
+        val streamsHandler: (suspend (Int) -> ActivityStreams)? = null,
+        val retryNowIfWakingHandler: suspend () -> Unit = {},
     ) : ReadSession {
+        /** How often each read went out. */
+        var detailStarts = 0
+        var streamsStarts = 0
+        var wakingGateLifts = 0
+
         override suspend fun cached(route: CloudRoute): CloudSnapshot? =
             cachedSnapshot?.takeIf { it.route == route }
 
         override suspend fun load(route: CloudRoute): CloudSnapshot = throw NotImplementedError()
-        override suspend fun activityDetail(activityId: Int): ActivityDetail = detailResult.getOrThrow()
-        override suspend fun activityStreams(activityId: Int): ActivityStreams = streamsResult.getOrThrow()
-        override suspend fun retryNowIfWaking() {}
+
+        override suspend fun activityDetail(activityId: Int): ActivityDetail {
+            detailStarts += 1
+            return detailHandler?.invoke(activityId) ?: detailResult.getOrThrow()
+        }
+
+        override suspend fun activityStreams(activityId: Int): ActivityStreams {
+            streamsStarts += 1
+            return streamsHandler?.invoke(activityId) ?: streamsResult.getOrThrow()
+        }
+
+        override suspend fun retryNowIfWaking() {
+            wakingGateLifts += 1
+            retryNowIfWakingHandler()
+        }
     }
 
     private val detail = ActivityDetail(
@@ -272,5 +300,115 @@ class RideDetailViewModelTest {
         assertNull(vm.uiState.value.detail)
         assertNull(vm.uiState.value.streams)
         assertNull(vm.uiState.value.summary)
+    }
+
+    @Test
+    fun supersedingALoadCancelsTheReadsForTheRideJustLeft() = runTest(testDispatcher) {
+        // A gate neither read can pass: what the test can see is whether the
+        // ride just left stopped reading. Reads launched as siblings of the
+        // load rather than children of it keep running here, and a rider
+        // clicking through the two-pane list pushes the cloud into 429s.
+        val gate = CompletableDeferred<Unit>()
+        var detailCancels = 0
+        var streamsCancels = 0
+        val session = FakeReadSession(
+            detailHandler = {
+                try {
+                    gate.await()
+                } catch (e: CancellationException) {
+                    detailCancels += 1
+                    throw e
+                }
+                detail
+            },
+            streamsHandler = {
+                try {
+                    gate.await()
+                } catch (e: CancellationException) {
+                    streamsCancels += 1
+                    throw e
+                }
+                streamsWithPower()
+            },
+        )
+        val vm = RideDetailViewModel(session, coroutineScope = backgroundScope)
+        vm.load(17)
+        assertEquals("both reads went out", 1, session.detailStarts)
+        assertEquals(1, session.streamsStarts)
+
+        vm.load(18)
+        advanceUntilIdle()
+
+        assertEquals("the new ride's reads went out", 2, session.detailStarts)
+        assertEquals(2, session.streamsStarts)
+        assertEquals(
+            "and the old ride's went with the load that started them",
+            1,
+            detailCancels,
+        )
+        assertEquals(1, streamsCancels)
+
+        gate.complete(Unit)
+        advanceUntilIdle()
+    }
+
+    @Test
+    fun theDetailAndZonesPaintWithoutWaitingForTheStreams() = runTest(testDispatcher) {
+        // The stream payload is the large one (1,500 points a channel).
+        // Waiting for it before painting the detail is what iOS stopped doing
+        // when it started assigning `detail` as soon as it landed.
+        val streamsGate = CompletableDeferred<Unit>()
+        val session = FakeReadSession(
+            detailResult = Result.success(detail),
+            streamsHandler = {
+                streamsGate.await()
+                streamsWithPower()
+            },
+        )
+        val vm = RideDetailViewModel(session, coroutineScope = backgroundScope)
+        vm.load(17)
+
+        val painted = vm.uiState.value
+        assertNotNull("the detail paints while the streams are still in flight", painted.detail)
+        assertNotNull(painted.shownSummary)
+        assertNull(painted.streams)
+        assertTrue(painted.isLoading)
+
+        streamsGate.complete(Unit)
+        advanceUntilIdle()
+        assertNotNull(vm.uiState.value.streams)
+        assertFalse(vm.uiState.value.isLoading)
+    }
+
+    @Test
+    fun aPullLiftsTheWakingGateAndReRunsBothReads() = runTest(testDispatcher) {
+        val session = FakeReadSession(
+            mayBeWaking = true,
+            detailResult = Result.failure(CloudSession.Failure.Waking()),
+            streamsResult = Result.failure(CloudSession.Failure.Waking()),
+        )
+        val vm = RideDetailViewModel(session, coroutineScope = backgroundScope)
+        vm.load(17)
+        assertTrue(vm.uiState.value.isWaking)
+        assertEquals("an automatic load never lifts the gate", 0, session.wakingGateLifts)
+
+        vm.pullToRefresh()
+        advanceUntilIdle()
+
+        assertEquals("the rider's pull lifted the waking gate", 1, session.wakingGateLifts)
+        assertEquals("both reads re-ran", 2, session.detailStarts)
+        assertEquals(2, session.streamsStarts)
+        assertFalse("the pull's indicator clears with the load", vm.uiState.value.isRefreshing)
+        assertTrue("still waking: the server has not answered yet", vm.uiState.value.isWaking)
+    }
+
+    @Test
+    fun aPullBeforeAnythingIsLoadedReadsNothing() = runTest(testDispatcher) {
+        val session = FakeReadSession(mayBeWaking = true)
+        val vm = RideDetailViewModel(session, coroutineScope = backgroundScope)
+        vm.pullToRefresh()
+        advanceUntilIdle()
+        assertEquals(0, session.detailStarts)
+        assertEquals(0, session.wakingGateLifts)
     }
 }

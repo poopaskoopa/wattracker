@@ -39,6 +39,10 @@ class RemovalDecisionVectorTest {
         val nowMillis = (file.optInt("now_epoch") ?: 0) * 1000L
         val cases = file.optArray("cases")
             ?: throw AssertionError("vector has no cases")
+        // Asserted before the loop: a vector that came out empty or
+        // truncated would otherwise pass by checking nothing. Regenerate the
+        // vector and move this number on purpose, with the rule it covers.
+        assertEquals("removal_decision_v1.json case count", 23, cases.size)
 
         for (entry in cases) {
             val name = entry.optString("name")

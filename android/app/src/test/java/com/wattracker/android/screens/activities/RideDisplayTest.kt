@@ -94,6 +94,33 @@ class RideDisplayTest {
         assertEquals("2026-01-02 18:04:00x", RideFormatting.date("2026-01-02T18:04:00x"))
     }
 
+    @Test
+    fun aMicrosecondTimestampKeepsItsSecond() {
+        // Python publishes microseconds, and a lenient `.SSS` pattern reads
+        // `.123456` as 123,456 ms -- two minutes and three seconds off. The
+        // fraction has to be read at its own scale, so the rendered stamp of a
+        // microsecond timestamp is the rendered stamp of its whole second.
+        assertEquals(
+            RideFormatting.date("2026-01-02T18:04:00Z"),
+            RideFormatting.date("2026-01-02T18:04:00.123456Z"),
+        )
+        assertEquals(
+            RideFormatting.date("2026-01-02T18:04:00Z"),
+            RideFormatting.date("2026-01-02T18:04:00.999999Z"),
+        )
+    }
+
+    @Test
+    fun aNaiveTimestampIsReadAsUtcAndRenderedInTheRidersZone() {
+        // The parity difference recorded in docs/mobile-parity.md: iOS shows
+        // the raw string; Android turns the published instant into the
+        // rider's local time, and a stamp with no offset is published UTC.
+        assertEquals(
+            RideFormatting.date("2026-01-02T18:04:00Z"),
+            RideFormatting.date("2026-01-02T18:04:00"),
+        )
+    }
+
     // MARK: - Zones
 
     @Test

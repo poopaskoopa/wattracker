@@ -10,9 +10,13 @@ import com.wattracker.android.json.opt
 import com.wattracker.android.json.optDouble
 import com.wattracker.android.json.optString
 import com.wattracker.android.ui.theme.Palette
-import java.text.SimpleDateFormat
+import java.time.LocalDateTime
+import java.time.OffsetDateTime
+import java.time.ZoneId
+import java.time.ZoneOffset
+import java.time.format.DateTimeFormatter
+import java.time.format.DateTimeParseException
 import java.util.Locale
-import java.util.TimeZone
 import kotlin.math.floor
 import kotlin.math.log10
 import kotlin.math.max
@@ -79,35 +83,48 @@ data class RideSummary(
  * agrees across the three implementations.
  */
 object RideFormatting {
-    /** The ride's start, in the device's local zone, or null when absent. */
+
+    /**
+     * The ride's start, in the device's local zone, or null when absent.
+     *
+     * `java.time` rather than a `SimpleDateFormat`: a published timestamp can
+     * carry 0 to 9 fractional seconds (Python writes microseconds), and a
+     * `.SSS` pattern reads `.123456` as 123,456 ms -- two minutes off. The
+     * ISO forms parse those at their true scale, and they do not accept a
+     * prefix of garbage the way a lenient `parse` does.
+     *
+     * A naive timestamp -- no `Z`, no offset -- is read as UTC, because that
+     * is what the server writes them from. iOS shows the raw string instead,
+     * so Android's local rendering of a naive stamp is a deliberate parity
+     * difference, recorded in `docs/mobile-parity.md`.
+     */
     fun date(value: String?): String? {
         if (value == null) return null
-        val formats = listOf(
-            "yyyy-MM-dd'T'HH:mm:ss.SSSXXX",
-            "yyyy-MM-dd'T'HH:mm:ssXXX",
-            "yyyy-MM-dd'T'HH:mm:ss.SSS",
-            "yyyy-MM-dd'T'HH:mm:ss",
-        )
-        for (pattern in formats) {
-            val parsed = try {
-                val sdf = SimpleDateFormat(pattern, Locale.US)
-                sdf.timeZone = TimeZone.getTimeZone("UTC")
-                // A full match only: the default parse reads a prefix and
-                // would accept "2026-01-02T18:04:00<garbage>".
-                val pos = java.text.ParsePosition(0)
-                val date = sdf.parse(value, pos)
-                if (pos.index == value.length) date else null
-            } catch (_: Exception) {
-                null
-            }
-            if (parsed != null) {
-                return SimpleDateFormat("MMM d, yyyy, h:mm a", Locale.getDefault()).format(parsed)
-            }
-        }
-        // Not a timestamp this client will parse: show what was published,
-        // with the T for a space, rather than guessing.
-        return value.replace("T", " ")
+        val zone = ZoneId.systemDefault()
+        val inTheRidersZone = parseOffset(value)?.atZoneSameInstant(zone)
+            ?: parseNaive(value)?.atZone(ZoneOffset.UTC)?.withZoneSameInstant(zone)
+            ?: return value.replace("T", " ")
+        // Built per call rather than cached: a cached formatter would freeze
+        // the locale the object first loaded under.
+        return DateTimeFormatter.ofPattern("MMM d, yyyy, h:mm a", Locale.getDefault())
+            .format(inTheRidersZone)
     }
+
+    /** `2026-01-02T18:04:00Z`, `...T18:04:00+02:00`; null when unparseable. */
+    private fun parseOffset(value: String): OffsetDateTime? =
+        try {
+            OffsetDateTime.parse(value)
+        } catch (_: DateTimeParseException) {
+            null
+        }
+
+    /** `2026-01-02T18:04:00`, with any 1-9 digit fraction; null if not that. */
+    private fun parseNaive(value: String): LocalDateTime? =
+        try {
+            LocalDateTime.parse(value)
+        } catch (_: DateTimeParseException) {
+            null
+        }
 
     /** `mm:ss`, zero-padded; `h:mm:ss` past an hour. Half-to-even at half seconds. */
     fun duration(seconds: Double?): String {

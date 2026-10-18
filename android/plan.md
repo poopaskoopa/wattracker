@@ -1724,10 +1724,14 @@ became `aChangedIdentitySupersedesTheLoadInFlight`, with
    previous rider's rides and supersedes the load in flight, a same-identity
    resume joins it, pull to refresh lifts a waking gate, a local 429/503
    earns the rate-limit notice) and `RideDetailViewModel` (detail and
-   streams in parallel, failing independently; a streams 404 — cloud
+   streams out at once inside one `coroutineScope`, each applied as it lands
+   and each failing on its own, so a superseding load cancels both reads with
+   it and the zones never wait on the stream payload; a streams 404 — cloud
    `Failure.Server(404)` or the local `Http(404)` — and an empty payload both
    map to "No recorded streams"; the header's summary comes from the cached
-   list). 18 tests against a scripted `ReadSession`.
+   list; its pull to refresh lifts a waking gate, the pane's waking notice
+   being otherwise a dead end until the gate expires). 24 tests against a
+   scripted `ReadSession`.
 5. **The screens**: the list (date, duration, distance, NP, IF, TSS, RPE —
    the iOS row's metrics, lazy rows), the detail (summary, zone time, the
    "Ride graphs" chart with the tappable legend), and the layout decision
@@ -1747,7 +1751,9 @@ failed (was 174 before this branch); `:app:assembleDebug` and
 `:app:assembleRelease -PallowPlaceholderHost` green.
 
 **Code Review Fixes (2026-10-15).** Addressed 14 reviewer findings:
-- Detail and streams reads now launch truly in parallel (`scope.async`).
+- Detail and streams reads now launch in parallel (and stay children of the
+  load that starts them — see the 2026-10-17 round below, which replaced the
+  `scope.async` version of this fix).
 - Waking state resets on `load()`; pane observer reloads on `ON_RESUME` and releases on `ON_STOP`.
 - Detail VM is scoped per pane (keyed on active source) so VMs do not pile up in two-pane mode.
 - Pull-to-refresh is scrollable in empty/waking states in both single-pane and two-pane modes.
@@ -1759,6 +1765,46 @@ failed (was 174 before this branch); `:app:assembleDebug` and
 - Route argument uses typed `NavType.IntType`; back content description fixed to "Back".
 - Legend hidden set is reset on new ride streams.
 - Unused strings removed; comments/docs cleaned up.
+
+**Code review round 2 (2026-10-17, PR #450).** Four blocking findings and
+five minor ones:
+- **The detail/stream reads were siblings of the load, not children of it.**
+  `scope.async` used `viewModelScope`, so `loadJob.cancel()` cancelled only
+  the awaits and every click through the two-pane list left two reads running
+  for the ride just left — the road to a cloud 429. Both reads now run inside
+  a `coroutineScope` belonging to the load; `supersedingALoadCancelsTheReads…`
+  counts the cancellations to prove it.
+- **The detail waited for the streams.** Both results were awaited before
+  either was applied, so the summary and zones painted only once the
+  1,500-point stream payload landed or failed. Each is now applied inside its
+  own child, as iOS assigns `detail`.
+- **A detail/stream read met a sleeping read app with "No connection."**
+  `activityObject` had neither the ride-out nor the gate: a timeout was
+  `Failure.Offline`. It now wraps both its reads the way `page()` does
+  (`ridingOutColdStart(firstRequest = false)`, then `noteColdStart()` on a
+  timeout), so the pane shows the waking notice, and the pane gained a pull to
+  refresh that lifts that gate — `retryNowIfWaking()` had no caller on this
+  screen. Two `CloudSessionTest` cases pin the wake and the refused-connection
+  arm that must stay `Offline`.
+- **Agent scratch in the history.** `commit8.txt`, `issue197.json`,
+  `pr419_comments.json`, `pr419_reviews.json`, `pr_body.md` and a tracked
+  `android/.artifacts/…/task.artifact.md` were rewritten out of the branch
+  (the cleanup commit they spawned with is gone too), and `android/.artifacts/`
+  is now gitignored.
+- Minor: the chart is 220dp with 1.5 pt data lines and a 1 pt altitude line
+  (the spec's, not 200/2/1.5); a loaded chart is no longer covered by a
+  throttle notice from the detail read; the unpaired panel no longer flashes
+  while `isStarting`; `RideFormatting.date` moved to `java.time` because a
+  lenient `.SSS` pattern read `.123456` as 123,456 ms (two minutes off), and
+  the naive-stamp-is-UTC difference from iOS is recorded in
+  `docs/mobile-parity.md`; `RemovalDecisionVectorTest` asserts the vector's
+  23 cases so an empty file cannot pass.
+
+**Verification (2026-10-17).** `:app:testDebugUnitTest` 226 passed, 0 failed
+(8 more than the first round); `:app:assembleDebug` and `:app:assembleRelease
+-PallowPlaceholderHost` green. The emulator re-check this round owes: the
+220dp chart, the detail pane's pull, and the `isStarting` gate on the
+pairing panels.
 
 **Device check (2026-10-15, emulators).** Verified on `medium_phone`
 (API 36) against the cloud harness with a seeded 300-ride scratch DB
