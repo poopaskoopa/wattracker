@@ -18,13 +18,11 @@
 
     <!-- Screen stubs -->
     <string name="stub_dashboard_note">Training status: CTL / ATL / TSB, load chart, current FTP and recent rides.</string>
-    <string name="stub_activities_note">The ride list and ride detail: summary, power trace, heart rate and zone time.</string>
     <string name="stub_calendar_note">The month grid: planned workouts, completed rides, races and out-of-training phase.</string>
     <string name="stub_volume_note">Weekly hours, TSS, distance and calories.</string>
     <string name="stub_settings_note">Backend pairing (cloud / local), device state and key type.</string>
 
     <string name="stub_issue_dashboard">#196</string>
-    <string name="stub_issue_activities">#197</string>
     <string name="stub_issue_calendar">#198</string>
     <string name="stub_issue_volume">#198</string>
     <string name="stub_issue_settings">#195</string>
@@ -111,11 +109,11 @@
     <string name="unit_min">min</string>
 
     <!-- Activities (#197) -->
+    <string name="back">Back</string>
     <string name="activities_newest_first_updated">Newest first · updated %1$s</string>
     <string name="activities_every_ride">Every recorded ride</string>
     <string name="activities_offline_badge">Offline</string>
     <string name="activities_syncing">Syncing activities…</string>
-    <string name="activities_sync_failed">Failed to sync activities</string>
     <string name="activities_unpaired_title">No backend paired</string>
     <string name="activities_unpaired_note">Pair a cloud code or local desktop server in Settings to see your rides.</string>
     <string name="activities_removed_title">Device removed</string>

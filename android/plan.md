@@ -1742,9 +1742,23 @@ became `aChangedIdentitySupersedesTheLoadInFlight`, with
    markers, altitude fill 0.18 / line 0.5 in the muted grey — the iOS look,
    not the desktop palette.
 
-**Verification (2026-10-15).** `:app:testDebugUnitTest` 215 passed, 0
+**Verification (2026-10-15).** `:app:testDebugUnitTest` 218 passed, 0
 failed (was 174 before this branch); `:app:assembleDebug` and
 `:app:assembleRelease -PallowPlaceholderHost` green.
+
+**Code Review Fixes (2026-10-15).** Addressed 14 reviewer findings:
+- Detail and streams reads now launch truly in parallel (`scope.async`).
+- Waking state resets on `load()`; pane observer reloads on `ON_RESUME` and releases on `ON_STOP`.
+- Detail VM is scoped per pane (keyed on active source) so VMs do not pile up in two-pane mode.
+- Pull-to-refresh is scrollable in empty/waking states in both single-pane and two-pane modes.
+- `CloudSession` invalidation validates device identity before clearing cached objects and clamps revisions.
+- Cancellation propagates cleanly without swallowing or locking load state.
+- Errors show user-facing status panels (removed/unpaired/throttled).
+- Chart drawing uses `remember` for path/layout resolution and `StreamSeries.all` is computed once.
+- Date string formatted once into `RideSummary` rather than on every row composition.
+- Route argument uses typed `NavType.IntType`; back content description fixed to "Back".
+- Legend hidden set is reset on new ride streams.
+- Unused strings removed; comments/docs cleaned up.
 
 **Device check (2026-10-15, emulators).** Verified on `medium_phone`
 (API 36) against the cloud harness with a seeded 300-ride scratch DB

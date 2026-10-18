@@ -135,8 +135,8 @@ class CloudSession(
     )
 
     private val activityObjects = HashMap<String, ActivityObjectCacheEntry>()
-    /// Least recently used first. Streams are preferred for eviction when the
-    /// cap is exceeded, because they are the larger payload.
+    // Least recently used first. Streams are preferred for eviction when the
+    // cap is exceeded, because they are the larger payload.
     private val activityObjectLru = ArrayDeque<String>()
     private val activityObjectGenerations = HashMap<Int, Int>()
     private val activityCollectionRevisions = HashMap<Int, Int>()
@@ -880,7 +880,7 @@ class CloudSession(
         }
     }
 
-    /** Under the mutex. A read that raced a newer collection revision is served but not stored. */
+    /** Takes the mutex. A read that raced a newer collection revision is served but not stored. */
     private suspend fun storeActivityObject(
         objectId: String,
         activityId: Int,
@@ -938,7 +938,10 @@ class CloudSession(
                 item.revision > previousRevision
             if (!isNewerRevision) continue
             activityObjectGenerations[activityId] = (activityObjectGenerations[activityId] ?: 0) + 1
-            activityCollectionRevisions[activityId] = item.revision
+            // The recorded revision never goes backwards: a tombstone can
+            // carry a lower revision than the one last seen (the iOS
+            // session applies the same max).
+            activityCollectionRevisions[activityId] = max(previousRevision ?: 0, item.revision)
             val stale = activityObjects.keys.filter { activityObjects[it]?.activityId == activityId }
             for (objectId in stale) {
                 activityObjects.remove(objectId)
@@ -979,11 +982,16 @@ class CloudSession(
         val complete = cursor == null
         val merged = merge(received, if (since == null) null else cached)
         // A ride that changed in this walk has new detail/stream objects: the
-        // cached copies are stale whether or not the walk completed.
-        mutex.withLock { invalidateActivityObjects(received) }
+        // cached copies are stale whether or not the walk completed. The
+        // identity check comes first: a removal or re-pair that committed
+        // while the walk ran has already cleared the per-ride maps, and this
+        // walk's items belong to the previous rider.
+        mutex.withLock {
+            validate(device, lifecycleGeneration)
+            invalidateActivityObjects(received)
+        }
         val now = now()
         if (complete) {
-            mutex.withLock { validate(device, lifecycleGeneration) }
             // The write carries the identity this read ran under, so the cache
             // refuses it if a removal or re-pairing committed in the meantime.
             onIo { cache.store(received, revision, route, full = since == null, generation = lifecycleGeneration.toLong()) }
@@ -1072,34 +1080,6 @@ class CloudSession(
         const val minimumUsableLifetime: Double = 15.0
         const val maximumContextLifetime: Double = 300.0
         const val clockSkewTolerance: Double = 240.0
-
-        /**
-         * The #410 removal rule: a refused revoke completes locally only when
-         * the refusal is the server's own clock saying it no longer knows
-         * this credential.
-         *
-         * 401 and 404 are indistinguishable by design, and either one with a
-         * parseable `Date` within [tolerance] (inclusive) of the device clock
-         * is trusted evidence the credential is gone. Every other status
-         * (429/503/5xx, 403, 400, 410), a no-response (`status == null`), and
-         * a missing or skewed `Date` keep the credential: a transient failure
-         * is not evidence the server forgot us, and a clock that disagrees
-         * with the server's cannot rule out skew as the cause of the refusal.
-         *
-         * Pinned by the shared vector: `tests/vectors/removal_decision_v1.json`
-         * is read by the Python, Swift and Kotlin
-         * (`RemovalDecisionVectorTest`) suites, which check all 23 cases.
-         */
-        fun removalCompletesLocally(
-            status: Int?,
-            serverDateMillis: Long?,
-            now: Long,
-            tolerance: Double = clockSkewTolerance,
-        ): Boolean {
-            if (status != 401 && status != 404) return false
-            val serverDate = serverDateMillis ?: return false
-            return Math.abs(now - serverDate) / 1000.0 <= tolerance
-        }
         const val baseBackoff: Double = 30.0
         const val maximumBackoff: Double = 300.0
         /** Upper bound on any backoff, so `delay * 1000` can never overflow. */
@@ -1130,9 +1110,9 @@ class CloudSession(
         const val maximumPages: Int = 50
 
         /**
-         * The rides a rider keeps open, at most: one detail and one stream
-         * per ride, details and streams of the rides in the list pane.
-         * Mirrors the iOS session (PR #351, #358).
+         * The most ride objects (details and streams) held in memory: two
+         * per ride, so four rides kept open. Mirrors the iOS session
+         * (PR #351, #358).
          */
         const val activityObjectCacheCapacity: Int = 8
 
@@ -1143,5 +1123,33 @@ class CloudSession(
          * Mirrors the iOS session (PR #358).
          */
         const val activityObjectCacheLifetimeMs: Long = 5 * 60_000L
+
+        /**
+         * The #410 removal rule: a refused revoke completes locally only when
+         * the refusal is the server's own clock saying it no longer knows
+         * this credential.
+         *
+         * 401 and 404 are indistinguishable by design, and either one with a
+         * parseable `Date` within [tolerance] (inclusive) of the device clock
+         * is trusted evidence the credential is gone. Every other status
+         * (429/503/5xx, 403, 400, 410), a no-response (`status == null`), and
+         * a missing or skewed `Date` keep the credential: a transient failure
+         * is not evidence the server forgot us, and a clock that disagrees
+         * with the server's cannot rule out skew as the cause of the refusal.
+         *
+         * Pinned by the shared vector: `tests/vectors/removal_decision_v1.json`
+         * is read by the Python, Swift and Kotlin
+         * (`RemovalDecisionVectorTest`) suites, which check all 23 cases.
+         */
+        fun removalCompletesLocally(
+            status: Int?,
+            serverDateMillis: Long?,
+            now: Long,
+            tolerance: Double = clockSkewTolerance,
+        ): Boolean {
+            if (status != 401 && status != 404) return false
+            val serverDate = serverDateMillis ?: return false
+            return Math.abs(now - serverDate) / 1000.0 <= tolerance
+        }
     }
 }
