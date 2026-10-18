@@ -8,7 +8,7 @@ import com.wattracker.android.cloud.LoadPoint
 import com.wattracker.android.cloud.PowerCurve
 import com.wattracker.android.cloud.RiderProfile
 import com.wattracker.android.cloud.TrainingState
-import java.text.SimpleDateFormat
+import com.wattracker.android.screens.PublishedTime
 import java.util.Calendar
 import java.util.Date
 import java.util.Locale
@@ -111,27 +111,23 @@ data class DashboardData(
             )
         }
 
-        fun parseDate(value: String?): Date? {
-            if (value.isNullOrBlank()) return null
-            val formats = listOf(
-                "yyyy-MM-dd'T'HH:mm:ss.SSSXXXXX",
-                "yyyy-MM-dd'T'HH:mm:ssXXXXX",
-                "yyyy-MM-dd'T'HH:mm:ss.SSS",
-                "yyyy-MM-dd'T'HH:mm:ss",
-                "yyyy-MM-dd",
-            )
-            for (format in formats) {
-                try {
-                    val sdf = SimpleDateFormat(format, Locale.US)
-                    sdf.timeZone = TimeZone.getTimeZone("UTC")
-                    val date = sdf.parse(value)
-                    if (date != null) return date
-                } catch (_: Exception) {
-                    // Try next format
-                }
-            }
-            return null
-        }
+        /**
+         * A published date or timestamp as an instant, or null when this
+         * client will not read it.
+         *
+         * [PublishedTime] does the reading. The `SimpleDateFormat` list this
+         * replaces mis-scaled a microsecond fraction (`.123456` read as
+         * 123,456 ms) and accepted the readable prefix of a form it could
+         * not finish, and either mistake moves a load point across the
+         * window's cutoff -- which is why the window is measured from the
+         * newest load point rather than from the clock.
+         *
+         * The date-only arm is [PublishedTime.parseDay]: `load_point` objects
+         * are dated a day at a time, and `load_point` dates are the ones that
+         * set the chart's window.
+         */
+        fun parseDate(value: String?): Date? =
+            (PublishedTime.parse(value) ?: PublishedTime.parseDay(value))?.let(Date::from)
 
         fun formatNumber(value: Double?, suffix: String = ""): String {
             if (value == null || !value.isFinite()) return "—"
