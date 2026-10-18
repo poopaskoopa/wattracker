@@ -109,4 +109,41 @@
     <string name="unit_tss">TSS</string>
     <string name="unit_km">km</string>
     <string name="unit_min">min</string>
+
+    <!-- Activities (#197) -->
+    <string name="activities_newest_first_updated">Newest first · updated %1$s</string>
+    <string name="activities_every_ride">Every recorded ride</string>
+    <string name="activities_offline_badge">Offline</string>
+    <string name="activities_syncing">Syncing activities…</string>
+    <string name="activities_sync_failed">Failed to sync activities</string>
+    <string name="activities_unpaired_title">No backend paired</string>
+    <string name="activities_unpaired_note">Pair a cloud code or local desktop server in Settings to see your rides.</string>
+    <string name="activities_removed_title">Device removed</string>
+    <string name="activities_removed_note">This device was removed from the backend. Re-pair in Settings to continue.</string>
+    <string name="activities_unavailable">Activities unavailable</string>
+    <string name="activities_none_title">No activities</string>
+    <string name="activities_none_note">Recorded rides appear after the desktop syncs.</string>
+    <string name="activities_select_one_title">Select an activity</string>
+    <string name="activities_select_one_note">Ride details and recorded streams appear here.</string>
+    <string name="activities_loading_streams">Loading recorded streams…</string>
+    <string name="activities_no_streams">No recorded streams for this activity.</string>
+    <string name="ride_unknown_date">Unknown date</string>
+    <string name="activity_detail_subtitle">Activity detail</string>
+    <string name="ride_detail_title">Ride</string>
+
+    <!-- Ride graphs chart -->
+    <string name="ride_graphs_title">Ride graphs</string>
+    <string name="ride_graphs_caption">Time (min). Altitude is a faint background without an axis.</string>
+
+    <!-- Ride metric labels (list row and detail summary) -->
+    <string name="metric_dist">DIST</string>
+    <string name="metric_avg">AVG</string>
+    <string name="metric_np">NP</string>
+    <string name="metric_if">IF</string>
+    <string name="metric_tss">TSS</string>
+    <string name="metric_rpe">RPE</string>
+    <string name="metric_duration">DURATION</string>
+    <string name="metric_distance">DISTANCE</string>
+    <string name="metric_avg_power">AVG POWER</string>
+    <string name="metric_avg_hr">AVG HR</string>
 </resources>
