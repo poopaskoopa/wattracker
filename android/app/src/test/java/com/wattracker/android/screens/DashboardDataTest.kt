@@ -240,4 +240,52 @@ class DashboardDataTest {
         assertNull(data.currentFTP)
         assertNull(data.latestLoadPoint)
     }
+
+    // MARK: - The dates the load window is measured with
+
+    @Test
+    fun aStampedLoadPointKeepsItsInstant() {
+        // `load_point` objects are dated a day at a time, but a derived read
+        // can carry a full timestamp, and it has to be read at its true
+        // scale: the lenient formatter this replaced turned `.123456` into
+        // 123,456 ms -- two minutes of drift per stamp.
+        val day = DashboardData.parseDate("2024-05-10")!!.time
+        val wholeSecond = day + 18 * 3_600_000L + 4 * 60_000L
+        val eighteenOhFourTwelveMs = wholeSecond + 123L
+        assertEquals(
+            "a millisecond stamp",
+            eighteenOhFourTwelveMs,
+            DashboardData.parseDate("2024-05-10T18:04:00.123Z")!!.time,
+        )
+        assertEquals(
+            "microseconds stay inside the second they name -- 123,456 ms is two minutes and three seconds of drift",
+            wholeSecond,
+            DashboardData.parseDate("2024-05-10T18:04:00.123456Z")!!.time / 1_000L * 1_000L,
+        )
+        assertEquals(
+            "a naive stamp is the UTC the server wrote it from",
+            wholeSecond,
+            DashboardData.parseDate("2024-05-10T18:04:00")!!.time,
+        )
+        assertEquals(
+            "an offset is applied, not dropped",
+            eighteenOhFourTwelveMs,
+            DashboardData.parseDate("2024-05-10T20:04:00.123+02:00")!!.time,
+        )
+    }
+
+    @Test
+    fun anUnreadableStampIsRejectedRatherThanHalfRead() {
+        // The other half of the same fix: `SimpleDateFormat.parse` stopped at
+        // the first character it could not read and called the prefix a
+        // success, so a form this build does not know sorted as though it
+        // were one it does -- here, at the wrong instant and with the offset
+        // thrown away.
+        assertNull("offset without its colon", DashboardData.parseDate("2024-05-10T18:04:00+0200"))
+        assertNull("readable prefix, then garbage", DashboardData.parseDate("2024-05-10T18:04:00Garbage"))
+        assertNull("wrong order of the same numbers", DashboardData.parseDate("10/05/2024 18:04"))
+        assertNull("empty", DashboardData.parseDate(""))
+        assertNull("blank", DashboardData.parseDate("   "))
+        assertNull("absent", DashboardData.parseDate(null))
+    }
 }

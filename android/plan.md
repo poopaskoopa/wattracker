@@ -1799,9 +1799,24 @@ five minor ones:
   the naive-stamp-is-UTC difference from iOS is recorded in
   `docs/mobile-parity.md`; `RemovalDecisionVectorTest` asserts the vector's
   23 cases so an empty file cannot pass.
+- Follow-up, the same parse on the other screen: the reading moved out of
+  `RideFormatting` into `screens/PublishedTime.kt`, and
+  `DashboardData.parseDate` — which carried its own `SimpleDateFormat` list —
+  now goes through it. That one was wrong in a second way: its list put
+  `yyyy-MM-dd'T'HH:mm:ss` ahead of nothing, so the offset-free prefix of a
+  `+02:00` stamp parsed with the offset thrown away, and a colon-less
+  `+0200` parsed instead of being refused. Either moves the edge of the load
+  window, which is measured from the newest load point rather than the clock.
+  `PublishedTimeTest` pins the reading itself (1-9 fractional digits, the
+  offset applied, naive-is-UTC, a bare date is a day and not a timestamp,
+  nothing half-read), and `DashboardDataTest` pins the two instants the
+  dashboard plots by. Mutation proof, local only: restoring the old
+  formatter turns seven tests red across `PublishedTimeTest`,
+  `DashboardDataTest` and `RideDisplayTest` — including the offset case, which
+  the mis-scaled fraction alone would not have caught.
 
-**Verification (2026-10-17).** `:app:testDebugUnitTest` 226 passed, 0 failed
-(8 more than the first round); `:app:assembleDebug` and `:app:assembleRelease
+**Verification (2026-10-17).** `:app:testDebugUnitTest` 233 passed, 0 failed
+(15 new this round); `:app:assembleDebug` and `:app:assembleRelease
 -PallowPlaceholderHost` green. The emulator re-check this round owes: the
 220dp chart, the detail pane's pull, and the `isStarting` gate on the
 pairing panels.
