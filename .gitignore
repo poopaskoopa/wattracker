@@ -10,6 +10,7 @@ __pycache__/
 .eggs/
 build/
 dist/
+wattracker/_scm_version.py
 # packaged release artifacts (DMG/zip + checksums)
 release/
 

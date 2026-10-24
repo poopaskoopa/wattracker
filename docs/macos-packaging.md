@@ -32,9 +32,9 @@ PyInstaller is pinned in the `package` extra of `pyproject.toml`
 ### Info.plist choices
 
 - `CFBundleIdentifier` is `com.wattracker.wattracker`.
-- `CFBundleShortVersionString`/`CFBundleVersion` are read out of
-  `pyproject.toml` by the spec, so the bundle version cannot drift from the
-  wheel version.
+- `CFBundleShortVersionString` and `CFBundleVersion` are normalized from the
+  Git-derived version by `packaging/_version.py`; the plist fields stay numeric
+  while identifying the same build as the wheel and Windows installer.
 - **`LSUIElement` is true.** wattracker runs a uvicorn server and hands the user
   to their browser; it has no Cocoa event loop. A regular Dock-icon app that
   never answers AppKit gets flagged "Application Not Responding" and the only

@@ -19,4 +19,14 @@ from __future__ import annotations
 
 __all__ = ["__version__"]
 
-__version__ = "0.1.0"
+try:
+    # The frozen connector packages this generated module through the normal
+    # import graph, avoiding a dependency on dist-info metadata at runtime.
+    from wattracker._scm_version import __version__
+except ImportError:
+    from importlib.metadata import PackageNotFoundError, version
+
+    try:
+        __version__ = version("wattracker")
+    except PackageNotFoundError:
+        __version__ = "0+unknown"

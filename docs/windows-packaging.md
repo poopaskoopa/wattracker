@@ -32,7 +32,7 @@ The installer packages that tree; it does not replace it. Local build:
 
 ```powershell
 python -m PyInstaller --clean --noconfirm packaging\wattracker.spec
-$version = python -c "import tomllib; print(tomllib.load(open('pyproject.toml','rb'))['project']['version'])"
+$version = python packaging\_version.py
 ISCC.exe "/DAppVersion=$version" packaging\wattracker.iss
 ```
 
@@ -41,32 +41,17 @@ machine: CI installs a pinned compiler itself (see **CI** below).
 
 ### Version
 
-`pyproject.toml` is the single source of truth, exactly as it is for the macOS
-bundle version. Inno's preprocessor cannot parse TOML, so the caller reads the
-version and passes it as `/DAppVersion=`. The `.iss` contains no version literal
-at all - it `#error`s if the define is missing, and
-`tests/test_windows_installer.py` asserts the current version string does *not*
-appear in the script - so a caller that forgets fails the compile instead of
-shipping a stale version. `OutputBaseFilename` is built from the same define, so
-the artifact name cannot disagree with `AppVersion` either.
+Git tags are the only version source. `setuptools-scm` reads `vX.Y.Z` release
+tags and `preview-X.Y.Z` history tags; commits after a tag receive a PEP 440
+version that includes their distance and Git node. The generated
+`wattracker/_scm_version.py` supplies `wattracker.__version__` and the connector
+version. `packaging/_version.py` reads the same setuptools-scm configuration for
+the wheel, PyInstaller specs and Inno Setup define.
 
-That one field is read in two deliberately different ways:
-
-- **the workflow** uses `python -c "import tomllib; ..."`, because the
-  `package-unsigned` job runs on Python 3.12 - asserted in the job, see **The
-  runner** - and can rely on the stdlib parser;
-- **`packaging/wattracker.spec`** (`_project_version`, used for the macOS bundle
-  version) and `tests/test_windows_installer.py` both use a regex instead, and
-  say so in a comment. That was forced when the build interpreter and the test
-  interpreter were only required to be `>=3.10` while `tomllib` arrived in
-  3.11: importing `tomllib` in the test module broke collection of the whole
-  suite on the declared minimum interpreter.
-
-  That constraint is gone. `requires-python` is `>=3.12`, so `tomllib` is in
-  the stdlib of every interpreter allowed to build or test this project, and
-  the regex is no longer necessary — only harmless. Converting those two call
-  sites (and retiring the comments that justify them) is a follow-up, not part
-  of the change that raised the floor.
+Inno receives the full PEP 440 version through `/DAppVersion=`. The macOS plist
+and Windows numeric resource fields normalize that value to numeric components
+because those formats do not accept PEP 440 suffixes. `OutputBaseFilename` is
+built from the Inno define, so the installer name and displayed version agree.
 
 ## Installer choices
 
@@ -174,8 +159,8 @@ uninstall (tampered launcher state) to have removed none of them.
 The installer is built by the `package-unsigned` job in
 `.github/workflows/windows.yml`, on GitHub-hosted **`windows-latest`**, in this order:
 
-1. check out, set up Python **3.12** (the interpreter that gives the inline
-   `tomllib` version read), assert the runner carries no leftover install state,
+1. check out all history and tags, set up Python **3.12**, assert the runner
+   carries no leftover install state,
    create a `.venv` **in the workspace** and install everything into it;
 2. **install a pinned Inno Setup compiler.** `innosetup-6.7.3.exe` is downloaded
    from a pinned `github.com/jrsoftware/issrc` release URL, its SHA-256 compared
@@ -196,79 +181,23 @@ The installer is built by the `package-unsigned` job in
    `/login`, `/static/style.css` and `/register`, reinstall over the top,
    attempt an uninstall with tampered state and require it to fail, then
    uninstall for real;
-8. assert that the wheel, setup exe and frozen connector exist, then upload
-   those three artifacts **only on a merge to `main`**, see below. The upload
-   is best-effort (`continue-on-error: true` and `if-no-files-found: warn`),
-   while the preceding assertion keeps a missing build artifact fatal;
-   retention is 5 days.
+8. assert that the setup exe and frozen connector exist, then upload those two
+   payloads **only on a push to `main`** for the publisher job; the required
+   handoff expires after one day.
 
 The digest and publisher checks in step 2 have their own paragraph in
 `docs/windows-security.md`, and `tests/test_windows_installer.py` pins the
 version, the digest, the hash command and the publisher string so they cannot be
 loosened without a test change.
 
-**Why step 8 no longer uploads a portable zip.** The former self-hosted runner
-was not billed for minutes, but artifacts still consume the *account*'s shared
-storage,
-and a free account has 500 MB of it. A run used to upload 106.8 MB - a 44.4 MB
-setup exe, a 61.8 MB portable zip and the wheel - at the 90-day default
-retention, so roughly four runs filled the quota and `upload-artifact` began
-failing with `Artifact storage quota has been hit`. That is how 45 stale
-artifacts reached 2693 MB and blocked the job outright.
+### Rolling preview
 
-The zip was the cheapest thing to drop, because it duplicated the installer's
-payload: the same onedir tree, wrapped differently rather than built
-differently. Nothing downstream consumed it, and the portable form still ships
-where it is actually used - `windows-release.yml` builds and signs its own on a
-`v*` tag. Retention on what remains is 5 days, since these are unsigned builds
-that exist to check a commit; the signed release artifacts keep their own 30.
-`tests/test_windows_installer.py` asserts both the retention value and the zip's
-absence, so re-adding a `Compress-Archive` here fails the suite.
-
-### The upload runs only on merges to main
-
-Every PR commit builds; only a merge to `main` uploads. The step carries
-
-```yaml
-if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
-```
-
-and the `push` trigger is itself filtered to `main`, so the two agree by
-construction. The ref test is redundant today and kept anyway: it is what stops
-a later re-broadening of the trigger from silently turning the upload back on
-for every branch.
-
-**Why not every push.** The account's shared storage is 500 MB, and this step is
-the only thing in the repo that consumes it - `cloud.yml` uploads nothing, no
-workflow pushes to a registry, and the two release workflows fire only on `v*`
-tags. At the ~93 triggers a week this workflow sees, 45 MB a run needs several
-gigabytes. Merges to `main` run about 8.75 times a week (40 push events in the
-32 days to 2026-08-21), which is ~394 MB at 7-day retention: it fits, but leaves
-too little slack for a busy week, so retention is 5 and the steady state is
-nearer 280 MB.
-
-**Nothing is lost on the PR commits that do not upload.** They still run the
-`ISCC` compile, the frozen smoke and the full install / upgrade /
-tampered-uninstall / uninstall, and still fail the job if any of it breaks. The
-artifact is a downloadable convenience; nothing downstream reads it, and
-`windows-release.yml` builds its own signed artifacts on a tag.
-
-**One run per commit.** A bare `push:` beside `pull_request:` fired this
-workflow twice for every commit on a branch with an open PR, and with a single
-physical runner the second run queues behind the first rather than running
-beside it - runs `32386196713` and `32386202547` were the same commit, 10m45s of
-wall time for 5m30s of work. Filtering push to `main` gives a PR run while the
-work is in review and a push run when it merges. The trade is that a branch with
-no PR open gets no Windows run at all, so packaging breakage surfaces when the
-PR opens rather than on the push.
-
-**The quota block is separate and may still be in force.** Deleting 2693 MB of
-stale artifacts left `total_count: 0`, but uploads continued to fail with
-`Artifact storage quota has been hit` well past GitHub's stated 6-12 hour
-recalculation window. Nothing visible accounts for it; the workflow token
-cannot read `settings/billing` (that needs the `user` scope), so the owner's
-billing page is the only remaining place to look. Until it clears, the upload
-step may warn on merges to `main` while the packaging and test jobs remain green.
+On pushes to `main`, this workflow builds the Windows setup and connector in the
+existing `package-unsigned` job and builds the macOS DMG in `macos-preview`. The
+`publish-preview` job downloads only those three release payloads, writes
+`SHA256SUMS.txt`, and replaces the `preview-latest` pre-release. The
+cross-runner handoff is required and retained for one day; if Actions artifact
+storage is unavailable, publication fails visibly.
 
 ### Historical: yielding the box to a hardware session
 

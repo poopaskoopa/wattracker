@@ -26,6 +26,17 @@ jobs:
     steps:
       - name: Check out source
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Python for the Git-derived package version
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Compute the package version
+        run: |
+          python -m pip install --disable-pip-version-check "setuptools-scm>=9.2"
+          echo "WATTRACKER_PACKAGE_VERSION=$(python packaging/_version.py)" >> "$GITHUB_ENV"
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
@@ -55,6 +66,7 @@ jobs:
           tags: ghcr.io/poopaskoopa/wattracker-cloud:${{ steps.image.outputs.tag }}
           build-args: |
             WATTRACKER_CLOUD_COMMIT=${{ github.sha }}
+            WATTRACKER_PACKAGE_VERSION=${{ env.WATTRACKER_PACKAGE_VERSION }}
 
       - name: Install cosign
         uses: sigstore/cosign-installer@v3.8.1

@@ -215,12 +215,17 @@ def test_nothing_quietly_falls_off_the_exclude_list():
 
 
 def test_the_version_helper_is_shared_with_the_app_spec():
-    version = _load("_version").project_version(ROOT)
-    assert re.match(r"^\d+\.\d+", version), version
+    helper = _load("_version")
     for spec in (SPEC, APP_SPEC):
         assert '_load("_version")' in spec
-    # Read from pyproject, never typed into a spec.
-    assert version not in SPEC
+    # A Git-derived PEP 440 version keeps its commit identity in Inno, while
+    # Windows resources use four numeric fields accepted by PyInstaller.
+    version = "0.1.0.post1.dev29+g25e7220"
+    assert helper.windows_file_version(version) == (0, 1, 29, 0)
+    assert "windows_file_version(version)" in SPEC
+    assert "macos_short_version(project_version)" in APP_SPEC
+    assert helper.macos_short_version("0.1.0+29.g25e7220") == "0.1.0"
+    assert helper.macos_build_version("0.1.0+29.g25e7220") == "0.1.29"
 
 
 def test_optional_halves_are_collected_best_effort():

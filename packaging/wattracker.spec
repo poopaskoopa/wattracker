@@ -37,7 +37,7 @@ def _load(name):
 
 
 def _project_version() -> str:
-    """version from pyproject.toml, so the bundle cannot drift from the wheel."""
+    """Git-derived version, matching the wheel's build metadata."""
     return _load("_version").project_version(root)
 
 
@@ -97,15 +97,17 @@ if IS_MACOS:
     # gets no Dock icon and no unresponsive-app UI; the browser tab is the UI.
     # The cost is that quitting means Activity Monitor (documented in
     # docs/macos-packaging.md).
+    version_helper = _load("_version")
+    project_version = _project_version()
     app = BUNDLE(
         coll,
         name="wattracker.app",
         icon=None,
         bundle_identifier="com.wattracker.wattracker",
-        version=_project_version(),
+        version=version_helper.macos_short_version(project_version),
         info_plist={
-            "CFBundleShortVersionString": _project_version(),
-            "CFBundleVersion": _project_version(),
+            "CFBundleShortVersionString": version_helper.macos_short_version(project_version),
+            "CFBundleVersion": version_helper.macos_build_version(project_version),
             "LSUIElement": True,
             "NSHighResolutionCapable": True,
             # Oldest macOS the arm64 runners and PyInstaller bootloader support.

@@ -57,8 +57,10 @@ def test_bundle_is_macos_only_and_declares_its_plist():
     # CoreBluetooth terminates a process that touches it without a purpose
     # string, which would kill the app from the ride page.
     assert '"NSBluetoothAlwaysUsageDescription"' in bundle
-    # The bundle version is read from pyproject, never hard-coded.
-    assert '"CFBundleShortVersionString": _project_version()' in bundle
+    # Apple's plist versions stay numeric while sharing the Git-derived source.
+    assert '"CFBundleShortVersionString": version_helper.macos_short_version(project_version)' in bundle
+    assert '"CFBundleVersion": version_helper.macos_build_version(project_version)' in bundle
+    assert 'version=version_helper.macos_short_version(project_version)' in bundle
     assert "0.1.0" not in bundle
 
 
