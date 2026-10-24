@@ -29,6 +29,7 @@ jobs:
       - name: Check out selected source
         uses: actions/checkout@v4
         with:
+          fetch-depth: 0
           persist-credentials: false
 
       - name: Set up Python
@@ -41,6 +42,26 @@ jobs:
         run: |
           python -m pip install --disable-pip-version-check --upgrade "pip==25.1.1"
           python -m pip install --disable-pip-version-check "build==1.2.2.post1" ".[dev,ble,package]"
+
+      - name: Verify release tag matches desktop version
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ ! "$GITHUB_REF_NAME" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "Signed releases require an annotated plain vX.Y.Z tag; got $GITHUB_REF_NAME" >&2
+            exit 1
+          fi
+          tag_type="$(git cat-file -t "refs/tags/$GITHUB_REF_NAME" 2>/dev/null || true)"
+          if [[ "$tag_type" != "tag" ]]; then
+            echo "Signed stable tags must be annotated; $GITHUB_REF_NAME is missing or lightweight." >&2
+            exit 1
+          fi
+          expected="${GITHUB_REF_NAME#v}"
+          actual="$(python packaging/_version.py)"
+          if [[ "$actual" != "$expected" ]]; then
+            echo "Release tag $GITHUB_REF_NAME resolves to $actual, expected $expected" >&2
+            exit 1
+          fi
 
       - name: Run full test suite
         run: python -m pytest -q

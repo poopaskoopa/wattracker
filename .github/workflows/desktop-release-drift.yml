@@ -1,0 +1,23 @@
+name: Desktop release drift
+
+on:
+  schedule:
+    - cron: "23 9 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  check-drift:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Check out all tags and history
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Check published desktop release drift
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python scripts/check_desktop_release_drift.py

@@ -37,8 +37,21 @@ def _load(name):
 
 
 def _project_version() -> str:
-    """version from pyproject.toml, so the bundle cannot drift from the wheel."""
+    """Git-derived version, matching the wheel's build metadata."""
     return _load("_version").project_version(root)
+
+
+def _macos_info_plist(project_version: str, version_helper):
+    return {
+        "CFBundleShortVersionString": version_helper.macos_short_version(project_version),
+        "CFBundleVersion": version_helper.macos_build_version(project_version, root=root),
+        "LSUIElement": True,
+        "NSHighResolutionCapable": True,
+        "LSMinimumSystemVersion": "11.0",
+        "NSBluetoothAlwaysUsageDescription":
+            "wattracker connects to your trainer, power meter and heart rate "
+            "monitor over Bluetooth during a ride.",
+    }
 
 
 hidden = ["wattracker.server"] + collect_submodules("uvicorn")
@@ -97,24 +110,13 @@ if IS_MACOS:
     # gets no Dock icon and no unresponsive-app UI; the browser tab is the UI.
     # The cost is that quitting means Activity Monitor (documented in
     # docs/macos-packaging.md).
+    version_helper = _load("_version")
+    project_version = _project_version()
     app = BUNDLE(
         coll,
         name="wattracker.app",
         icon=None,
         bundle_identifier="com.wattracker.wattracker",
-        version=_project_version(),
-        info_plist={
-            "CFBundleShortVersionString": _project_version(),
-            "CFBundleVersion": _project_version(),
-            "LSUIElement": True,
-            "NSHighResolutionCapable": True,
-            # Oldest macOS the arm64 runners and PyInstaller bootloader support.
-            "LSMinimumSystemVersion": "11.0",
-            # Required before CoreBluetooth may be used: without a purpose
-            # string macOS terminates the process the moment the ride page
-            # starts a scan, rather than showing a permission prompt.
-            "NSBluetoothAlwaysUsageDescription":
-                "wattracker connects to your trainer, power meter and heart rate "
-                "monitor over Bluetooth during a ride.",
-        },
+        version=version_helper.macos_short_version(project_version),
+        info_plist=_macos_info_plist(project_version, version_helper),
     )

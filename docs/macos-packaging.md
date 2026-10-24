@@ -32,9 +32,23 @@ PyInstaller is pinned in the `package` extra of `pyproject.toml`
 ### Info.plist choices
 
 - `CFBundleIdentifier` is `com.wattracker.wattracker`.
-- `CFBundleShortVersionString`/`CFBundleVersion` are read out of
-  `pyproject.toml` by the spec, so the bundle version cannot drift from the
-  wheel version.
+- `CFBundleShortVersionString` preserves the semantic `X.Y.Z` release, while
+  `CFBundleVersion` is `major.minor.build-id`. The build ID counts reachable
+  commits plus reachable valid desktop tags. Signed stable `vX.Y.Z` tags must
+  be annotated, so they take precedence over lightweight preview tags on the
+  same commit and advance the sequence before the next commit; this keeps
+  previews ordered before the release. The sequence also ignores iOS tags. It
+  assumes counted tags remain: deleting a
+  previously counted desktop tag can make a later build reuse an earlier
+  native build ID. A stable hotfix tag cut from an older commit can also have a
+  lower build ID than a newer preview with the same major and minor version.
+  It is a numeric sequence rather than the PEP 440 string
+  because Apple's field accepts numeric components only. The shared 32-bit
+  build ID is capped at 4,294,967,295 to fit Windows version resources; major
+  and minor are each capped at 65,535 for Windows compatibility. Native app
+  builds fail in a shallow checkout because its partial history cannot
+  produce a comparable sequence; the wheel version itself still matches
+  setuptools-scm's shallow-checkout result. CI fetches full history.
 - **`LSUIElement` is true.** wattracker runs a uvicorn server and hands the user
   to their browser; it has no Cocoa event loop. A regular Dock-icon app that
   never answers AppKit gets flagged "Application Not Responding" and the only
