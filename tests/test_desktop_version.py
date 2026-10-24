@@ -111,13 +111,28 @@ def _wheel_versions(root: Path, wheel_directory: Path) -> tuple[str, str]:
     return _read_wheel_versions(wheel_directory)
 
 
-def _pip_wheel_versions(
-    root: Path, wheel_directory: Path, env: dict[str, str]
+def _frontend_wheel_versions(
+    root: Path,
+    wheel_directory: Path,
+    env: dict[str, str],
+    uv_executable: str | None,
 ) -> tuple[str, str]:
-    """Build through pip, with its PEP 517 frontend and the supplied environment."""
+    """Build through uv or pip while preserving the supplied minimal PATH."""
     wheel_directory.mkdir()
-    subprocess.run(
-        [
+    if uv_executable is not None:
+        command = [
+            uv_executable,
+            "build",
+            "--wheel",
+            "--no-build-isolation",
+            "--python",
+            sys.executable,
+            "--out-dir",
+            str(wheel_directory),
+            ".",
+        ]
+    else:
+        command = [
             sys.executable,
             "-m",
             "pip",
@@ -127,7 +142,9 @@ def _pip_wheel_versions(
             "--wheel-dir",
             str(wheel_directory),
             ".",
-        ],
+        ]
+    subprocess.run(
+        command,
         cwd=root,
         env=env,
         check=True,
@@ -275,19 +292,21 @@ def test_desktop_tag_contract_matches_scm_describe_and_drift_checker(tmp_path):
     )
 
 
-def test_helper_and_pip_wheel_work_without_python_names_on_path(tmp_path, monkeypatch):
+def test_helper_and_real_wheel_build_work_without_python_names_on_path(tmp_path, monkeypatch):
     pytest.importorskip("setuptools_scm")
     helper = _load_version_helper()
     repo = _git_repo(tmp_path / "minimal-path-repo")
     _git(repo, "tag", "v0.2.7")
     _, env = _minimal_path(tmp_path / "minimal-path")
+    uv_executable = shutil.which("uv")
 
-    # Exercise the helper with only the two deliberate PATH entries. The pip
-    # subprocess receives a clean environment with that same minimal PATH.
+    # Exercise the helper and a real PEP 517 wheel frontend with only the two
+    # deliberate PATH entries. The build frontend receives that same minimal
+    # environment, and gets the backend interpreter by absolute path.
     monkeypatch.setenv("PATH", env["PATH"])
     helper_version = helper.project_version(repo)
-    wheel_version, runtime_version = _pip_wheel_versions(
-        repo, tmp_path / "minimal-path-wheel", env
+    wheel_version, runtime_version = _frontend_wheel_versions(
+        repo, tmp_path / "minimal-path-wheel", env, uv_executable
     )
 
     assert helper_version == wheel_version == runtime_version == "0.2.7"
