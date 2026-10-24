@@ -34,6 +34,10 @@ DESCRIBE_COMMAND = [
     "preview-*.0[0-9]*.*",
     "--exclude",
     "preview-*.*.0[0-9]*",
+    "--exclude",
+    "v*.*.*.*",
+    "--exclude",
+    "preview-*.*.*.*",
 ]
 _MAX_BUILD_ID = (1 << 32) - 1
 

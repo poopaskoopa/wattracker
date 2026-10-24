@@ -91,6 +91,8 @@ describe_command = [
     "--exclude", "preview-0[0-9]*.*",
     "--exclude", "preview-*.0[0-9]*.*",
     "--exclude", "preview-*.*.0[0-9]*",
+    "--exclude", "v*.*.*.*",
+    "--exclude", "preview-*.*.*.*",
 ]
 
 [tool.setuptools.packages.find]

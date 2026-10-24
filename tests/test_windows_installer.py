@@ -187,6 +187,14 @@ def test_preview_replacement_rechecks_freshness_and_leases_the_observed_tag():
     preview_check = replacement.index(
         'observed_preview_ref="$(git ls-remote --refs origin refs/tags/preview-latest | awk'
     )
+    assert (
+        'if git merge-base --is-ancestor "$GITHUB_SHA" "$observed_preview_sha" || \\'
+        in replacement
+    )
+    assert (
+        '! git merge-base --is-ancestor "$observed_preview_sha" "$GITHUB_SHA"; then'
+        in replacement
+    )
     existing_release_upload = replacement.index("gh release upload preview-latest")
     first_release_create = replacement.index("gh release create preview-latest")
     lease_push = replacement.index(
