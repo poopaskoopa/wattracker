@@ -106,6 +106,20 @@ def test_latest_published_release_uses_publication_time_not_commit_distance(tmp_
     assert drift.latest_published_release(root)[0] == "v0.2.0"
 
 
+def test_release_with_tag_missing_from_local_checkout_is_skipped(tmp_path, monkeypatch):
+    root, _, _ = _repo(tmp_path)
+    _git(root, "tag", "-d", "preview-latest")
+    _releases(monkeypatch, [
+        {"tagName": "preview-latest", "publishedAt": "2026-01-03T00:00:00Z", "isDraft": False},
+        {"tagName": "preview-0.1.0", "publishedAt": "2026-01-02T00:00:00Z", "isDraft": False},
+    ])
+
+    assert drift.latest_published_release(root) == (
+        "preview-0.1.0",
+        _git(root, "rev-parse", "refs/tags/preview-0.1.0^{commit}"),
+    )
+
+
 def test_numeric_preview_release_is_a_valid_pre_rolling_baseline(tmp_path, monkeypatch):
     root, _, _ = _repo(tmp_path)
     _releases(monkeypatch, [

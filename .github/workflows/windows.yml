@@ -197,6 +197,8 @@ jobs:
           if ($connector.Count -eq 0) { throw "no WattrackerConnector.exe in dist\ - the connector freeze did not produce one" }
 
       - if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
+        # These are required by publish-preview. A quota failure must fail the
+        # release workflow rather than leave a green run with a stale preview.
         uses: actions/upload-artifact@v4
         with:
           name: desktop-preview-windows
@@ -249,13 +251,45 @@ jobs:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
+      - name: Skip stale preview publishes
+        id: freshness
+        shell: bash
+        run: |
+          set -euo pipefail
+          main_sha="$(git ls-remote --heads origin main | awk 'NR == 1 { print $1 }')"
+          if [[ -z "$main_sha" ]]; then
+            echo "Could not read the current main head from origin." >&2
+            exit 1
+          fi
+          if [[ "$GITHUB_SHA" != "$main_sha" ]]; then
+            echo "publish=false" >> "$GITHUB_OUTPUT"
+            echo "$GITHUB_SHA is not the current main head ($main_sha); skipping stale preview."
+            exit 0
+          fi
+
+          preview_ref="$(git ls-remote --refs origin refs/tags/preview-latest | awk 'NR == 1 { print $1 }')"
+          if [[ -n "$preview_ref" ]]; then
+            git fetch --quiet --force --no-tags origin refs/tags/preview-latest:refs/tags/preview-latest
+            preview_sha="$(git rev-parse 'refs/tags/preview-latest^{commit}')"
+            if [[ "$GITHUB_SHA" != "$preview_sha" ]]; then
+              if git merge-base --is-ancestor "$GITHUB_SHA" "$preview_sha" || \
+                ! git merge-base --is-ancestor "$preview_sha" "$GITHUB_SHA"; then
+                echo "publish=false" >> "$GITHUB_OUTPUT"
+                echo "$GITHUB_SHA is not newer than preview-latest ($preview_sha); skipping stale preview."
+                exit 0
+              fi
+            fi
+          fi
+          echo "publish=true" >> "$GITHUB_OUTPUT"
       - name: Download platform payloads
+        if: steps.freshness.outputs.publish == 'true'
         uses: actions/download-artifact@v4
         with:
           pattern: desktop-preview-*
           path: release
           merge-multiple: true
       - name: Verify payloads and write checksums
+        if: steps.freshness.outputs.publish == 'true'
         shell: bash
         run: |
           set -euo pipefail
@@ -270,20 +304,59 @@ jobs:
           sha256sum -- "${dmg[0]#release/}" "${setup[0]#release/}" "${connector[0]#release/}" \
             | LC_ALL=C sort -k2 > SHA256SUMS.txt
       - name: Replace rolling preview release
+        if: steps.freshness.outputs.publish == 'true'
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
+          main_sha_now="$(git ls-remote --heads origin main | awk 'NR == 1 { print $1 }')"
+          if [[ -z "$main_sha_now" ]]; then
+            echo "Could not read the current main head from origin." >&2
+            exit 1
+          fi
+          if [[ "$GITHUB_SHA" != "$main_sha_now" ]]; then
+            echo "$GITHUB_SHA is no longer the current main head ($main_sha_now); skipping preview replacement."
+            exit 0
+          fi
+
+          observed_preview_ref="$(git ls-remote --refs origin refs/tags/preview-latest | awk 'NR == 1 { print $1 }')"
+          if [[ -n "$observed_preview_ref" ]]; then
+            git fetch --quiet --force --no-tags origin refs/tags/preview-latest:refs/tags/preview-latest
+            observed_preview_sha="$(git rev-parse 'refs/tags/preview-latest^{commit}')"
+            if [[ "$GITHUB_SHA" != "$observed_preview_sha" ]]; then
+              if git merge-base --is-ancestor "$GITHUB_SHA" "$observed_preview_sha" || \
+                ! git merge-base --is-ancestor "$observed_preview_sha" "$GITHUB_SHA"; then
+                echo "$GITHUB_SHA is not newer than preview-latest ($observed_preview_sha); skipping preview replacement."
+                exit 0
+              fi
+            fi
+          fi
+
+          # Lease the exact ref observed above; an intervening publisher or
+          # maintainer update makes this push fail before release mutation.
+          git push "--force-with-lease=refs/tags/preview-latest:${observed_preview_ref}" \
+            origin "$GITHUB_SHA:refs/tags/preview-latest"
           if gh release view preview-latest --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
-            gh release delete preview-latest --repo "$GITHUB_REPOSITORY" --yes --cleanup-tag
+            gh release upload preview-latest release/*.dmg release/*-unsigned-setup.exe \
+              release/WattrackerConnector.exe release/SHA256SUMS.txt \
+              --repo "$GITHUB_REPOSITORY" --clobber
+            gh release edit preview-latest --repo "$GITHUB_REPOSITORY" \
+              --target "$GITHUB_SHA" --prerelease \
+              --title "Desktop preview (rolling)" \
+              --notes "Unsigned desktop preview built from main commit $GITHUB_SHA."
+          else
+            gh release create preview-latest release/*.dmg release/*-unsigned-setup.exe \
+              release/WattrackerConnector.exe release/SHA256SUMS.txt \
+              --repo "$GITHUB_REPOSITORY" --verify-tag --prerelease \
+              --title "Desktop preview (rolling)" \
+              --notes "Unsigned desktop preview built from main commit $GITHUB_SHA."
           fi
-          if git ls-remote --exit-code origin refs/tags/preview-latest >/dev/null 2>&1; then
-            gh api --silent --method DELETE \
-              "repos/$GITHUB_REPOSITORY/git/refs/tags/preview-latest"
-          fi
-          git tag -d preview-latest >/dev/null 2>&1 || true
-          gh release create preview-latest release/*.dmg release/*-unsigned-setup.exe \
-            release/WattrackerConnector.exe release/SHA256SUMS.txt \
-            --repo "$GITHUB_REPOSITORY" --target "$GITHUB_SHA" --prerelease \
-            --title "Desktop preview (rolling)" \
-            --notes "Unsigned desktop preview built from main commit $GITHUB_SHA."
+          # Remove obsolete version-named assets only after the new set exists.
+          export CURRENT_DMG="$(basename release/*.dmg)"
+          export CURRENT_SETUP="$(basename release/*-unsigned-setup.exe)"
+          gh api "repos/$GITHUB_REPOSITORY/releases/tags/preview-latest" \
+            --jq '.assets[] | select(.name != "SHA256SUMS.txt" and .name != "WattrackerConnector.exe" and .name != env.CURRENT_DMG and .name != env.CURRENT_SETUP) | .id' \
+            | while read -r asset_id; do
+                [[ -n "$asset_id" ]] && gh api --silent --method DELETE \
+                  "repos/$GITHUB_REPOSITORY/releases/assets/$asset_id"
+              done

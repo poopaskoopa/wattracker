@@ -8,6 +8,15 @@ LAUNCHER = (ROOT / "scripts" / "wattracker.ps1").read_text(encoding="utf-8")
 SMOKE = (ROOT / "packaging" / "smoke_installer.ps1").read_text(encoding="utf-8")
 WORKFLOW = (ROOT / ".github" / "workflows" / "windows.yml").read_text(encoding="utf-8")
 
+
+def _workflow_job(name: str) -> str:
+    match = re.search(
+        rf"(?ms)^  {re.escape(name)}:\n(?P<body>.*?)(?=^  [A-Za-z0-9_-]+:\n|\Z)",
+        WORKFLOW,
+    )
+    assert match, f"missing workflow job: {name}"
+    return match.group("body")
+
 def test_installer_is_stable_per_user_and_ships_the_full_payload():
     assert re.search(r"(?m)^AppId=\{\{[0-9A-F-]{36}\}$", ISS)
     assert "PrivilegesRequired=lowest" in ISS
@@ -83,8 +92,8 @@ def test_workflow_runs_the_installer_job_on_a_hosted_runner():
     the setup compiler with it. Enabling the `test` job would duplicate the
     platform-neutral suite that already runs in the Cloud workflow.
     """
-    test_job, jobs_after_package = WORKFLOW.split("  package-unsigned:", 1)
-    package_job = jobs_after_package.split("  macos-preview:", 1)[0]
+    test_job = _workflow_job("test")
+    package_job = _workflow_job("package-unsigned")
     assert "if: ${{ false }}" in test_job
     # Main-only conditions belong to individual handoff steps and later jobs;
     # the Windows packaging job itself stays enabled on PRs.
@@ -94,7 +103,7 @@ def test_workflow_runs_the_installer_job_on_a_hosted_runner():
 
 
 def test_installer_job_uses_setup_python_312():
-    _, package_job = WORKFLOW.split("  package-unsigned:", 1)
+    package_job = _workflow_job("package-unsigned")
     assert re.search(
         r'(?m)^\s*- uses: actions/setup-python@v5\n\s+with:\n\s+python-version: "3\.12"$',
         package_job,
@@ -104,7 +113,7 @@ def test_installer_job_uses_setup_python_312():
 
 
 def test_lifecycle_uses_the_installed_console_launcher():
-    _, package_job = WORKFLOW.split("  package-unsigned:", 1)
+    package_job = _workflow_job("package-unsigned")
     assert "$env:WATTRACKER_EXECUTABLE = (Get-Command wattracker).Source" in package_job
 
 
@@ -123,12 +132,68 @@ def test_workflow_builds_and_smokes_the_wheel_then_hands_off_release_payloads():
 
 
 def test_release_handoff_fails_visibly_when_artifact_upload_fails():
-    """A preview must not report success without payloads for the publisher."""
-    assert not re.search(r"(?m)^\s+continue-on-error: true$", WORKFLOW)
-    assert re.search(r"(?m)^\s+if-no-files-found: error$", WORKFLOW)
-    assert re.search(r"(?m)^\s+retention-days: 1$", WORKFLOW)
+    """Required publisher inputs must not be hidden by the artifact quota wall."""
+    package_job = _workflow_job("package-unsigned")
+    windows_handoff = package_job.split("name: desktop-preview-windows", 1)[1]
+    assert not re.search(r"(?m)^\s+continue-on-error: true$", windows_handoff)
+    assert re.search(r"(?m)^\s+if-no-files-found: error$", windows_handoff)
+    assert re.search(r"(?m)^\s+retention-days: 1$", windows_handoff)
+    assert "quota failure must fail the" in WORKFLOW
     assert re.search(r'(?m)^\s+if \(\$exe\.Count -eq 0\) \{ throw ', WORKFLOW)
     assert re.search(r'(?m)^\s+if \(\$connector\.Count -eq 0\) \{ throw ', WORKFLOW)
+
+
+def test_preview_jobs_are_gated_to_pushes_on_main():
+    expected = (
+        "if: ${{ github.event_name == 'push' && "
+        "github.ref == 'refs/heads/main' }}"
+    )
+    for name in ("macos-preview", "publish-preview"):
+        job = _workflow_job(name)
+        assert re.search(rf"(?m)^    {re.escape(expected)}$", job), name
+
+
+def test_preview_publisher_serializes_releases_without_cancelling_active_run():
+    publisher = _workflow_job("publish-preview")
+    assert re.search(
+        r"(?m)^    concurrency:\n"
+        r"      group: desktop-preview-publish\n"
+        r"      cancel-in-progress: false$",
+        publisher,
+    )
+
+
+def test_preview_publisher_skips_runs_older_than_main_or_preview_latest():
+    publisher = _workflow_job("publish-preview")
+    assert publisher.index("name: Skip stale preview publishes") < publisher.index(
+        "name: Download platform payloads"
+    )
+    assert 'git ls-remote --heads origin main' in publisher
+    assert '[[ "$GITHUB_SHA" != "$main_sha" ]]' in publisher
+    assert 'git merge-base --is-ancestor "$GITHUB_SHA" "$preview_sha"' in publisher
+    assert '! git merge-base --is-ancestor "$preview_sha" "$GITHUB_SHA"' in publisher
+    assert 'git push "--force-with-lease=refs/tags/preview-latest:${observed_preview_ref}"' in publisher
+    assert "gh release delete preview-latest" not in publisher
+
+
+def test_preview_replacement_rechecks_freshness_and_leases_the_observed_tag():
+    publisher = _workflow_job("publish-preview")
+    replacement = publisher.split("name: Replace rolling preview release", 1)[1]
+    main_check = replacement.index('main_sha_now="$(git ls-remote --heads origin main')
+    preview_check = replacement.index(
+        'observed_preview_ref="$(git ls-remote --refs origin refs/tags/preview-latest | awk'
+    )
+    lease_push = replacement.index(
+        'git push "--force-with-lease=refs/tags/preview-latest:${observed_preview_ref}"'
+    )
+    release_mutation = min(
+        replacement.index("gh release upload"),
+        replacement.index("gh release create"),
+        replacement.index("gh release edit"),
+    )
+    assert main_check < preview_check < lease_push < release_mutation
+    assert 'observed_preview_ref="$(git ls-remote' in replacement
+    assert "--verify-tag" in replacement
 
 
 def test_push_is_filtered_to_main_so_a_commit_runs_once():

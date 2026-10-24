@@ -5,14 +5,32 @@ from pathlib import Path
 
 
 def project_version(root) -> str:
-    """Return the PEP 440 version that setuptools-scm writes into the wheel."""
-    from setuptools_scm import get_version
+    """Return the same configured PEP 440 version setuptools-scm writes to the wheel."""
+    from setuptools_scm import Configuration, get_version
 
-    return get_version(root=root)
+    root = Path(root).resolve()
+    # Loading pyproject.toml is essential here: its tag regex and describe
+    # command deliberately ignore iOS tags, and its fallback version matches
+    # the wheel build when Git metadata is unavailable.
+    config = Configuration.from_file(name=root / "pyproject.toml")
+    return get_version(
+        root=root,
+        version_scheme=config.version_scheme,
+        local_scheme=config.local_scheme,
+        fallback_version=config.fallback_version,
+        fallback_root=config.fallback_root,
+        tag_regex=config.tag.regex,
+        dist_name=config.dist_name,
+        search_parent_directories=config.search_parent_directories,
+        scm={"git": {"describe_command": config.scm.git.describe_command}},
+    )
+
+
+_BUILDS_PER_PATCH = 10_000
 
 
 def _release_parts(version: str) -> tuple[int, int, int, int]:
-    """Normalize a PEP 440 version into numeric Windows resource fields."""
+    """Map a PEP 440 version to release fields plus the commit distance."""
     from packaging.version import InvalidVersion, Version
 
     try:
@@ -26,12 +44,15 @@ def _release_parts(version: str) -> tuple[int, int, int, int]:
         first_local = parsed.local.split(".", 1)[0]
         if first_local.isdigit():
             distance = int(first_local)
-    if distance is None:
-        distance = parsed.post or 0
-    patch += distance
-    if any(part > 65535 for part in (major, minor, patch)):
+    distance = distance or 0
+    if distance >= _BUILDS_PER_PATCH:
+        raise SystemExit(
+            f"version is too far from its desktop tag for macOS build numbering: {version}"
+        )
+    encoded_patch = patch * _BUILDS_PER_PATCH + distance
+    if any(part > 65535 for part in (major, minor, encoded_patch)):
         raise SystemExit(f"version is too large for Windows resources: {version}")
-    return major, minor, patch, 0
+    return major, minor, encoded_patch, 0
 
 
 def windows_file_version(version: str) -> tuple[int, int, int, int]:
@@ -48,9 +69,16 @@ def macos_short_version(version: str) -> str:
 
 
 def macos_build_version(version: str) -> str:
-    """Return a numeric CFBundleVersion that distinguishes preview commits."""
-    major, minor, patch, _ = _release_parts(version)
-    return f"{major}.{minor}.{patch}"
+    """Return monotonic three-part CFBundleVersion metadata.
+
+    macOS uses only three numeric components from CFBundleVersion. Put the
+    commit distance inside the patch component so a later tagged patch release
+    always sorts after a preview built from an earlier patch tag. The reserved
+    range allows up to 9,999 commits after one tag. Windows uses the same
+    encoded third component in its four-part file version.
+    """
+    major, minor, encoded_patch, _ = _release_parts(version)
+    return f"{major}.{minor}.{encoded_patch}"
 
 
 if __name__ == "__main__":

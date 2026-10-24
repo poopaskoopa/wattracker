@@ -10,5 +10,6 @@ except ImportError:
     try:
         __version__ = version("wattracker")
     except PackageNotFoundError:
-        # An uninstalled source checkout has no distribution metadata to read.
-        __version__ = "0+unknown"
+        # Match setuptools-scm's configured fallback when no Git metadata or
+        # installed distribution metadata is available.
+        __version__ = "0.0.0"

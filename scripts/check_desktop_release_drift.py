@@ -46,6 +46,28 @@ def run_git(args: list[str], root: Path) -> str | None:
     return result.stdout.strip()
 
 
+def local_tag_commit(tag: str, root: Path) -> str | None:
+    """Return a release tag's commit, or None when that tag is not checked out."""
+    ref = f"refs/tags/{tag}"
+    try:
+        result = subprocess.run(
+            ["git", "show-ref", "--verify", "--quiet", ref],
+            cwd=root,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+    except OSError as exc:
+        raise DriftError("could not run git") from exc
+    if result.returncode == 1:
+        # GitHub may list a release whose tag wasn't fetched by a shallow or
+        # selective checkout. Ignore that record and consider local tags.
+        return None
+    if result.returncode:
+        raise DriftError("git failed while checking a release tag")
+    return run_git(["rev-parse", "--verify", f"{ref}^{{commit}}"], root)
+
+
 def _is_desktop_tag(tag: object) -> bool:
     return isinstance(tag, str) and (
         tag == "preview-latest" or bool(_VERSION_TAG.fullmatch(tag))
@@ -53,7 +75,7 @@ def _is_desktop_tag(tag: object) -> bool:
 
 
 def latest_published_release(root: Path) -> tuple[str, str]:
-    """Choose the newest published desktop release reachable from this checkout."""
+    """Choose the newest published desktop release tag present in this checkout."""
     try:
         records = json.loads(run_gh([
             "release", "list", "--repo", REPOSITORY, "--limit", "1000",
@@ -71,8 +93,8 @@ def latest_published_release(root: Path) -> tuple[str, str]:
         if record.get("isDraft") is True:
             continue
         tag = record["tagName"]
-        sha = run_git(["rev-parse", "--verify", f"refs/tags/{tag}^{{commit}}"], root)
-        if not sha:
+        sha = local_tag_commit(tag, root)
+        if sha is None:
             continue
         if run_git(["merge-base", "--is-ancestor", sha, "HEAD"], root) is None:
             continue

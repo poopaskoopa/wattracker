@@ -29,4 +29,5 @@ except ImportError:
     try:
         __version__ = version("wattracker")
     except PackageNotFoundError:
-        __version__ = "0+unknown"
+        # Match setuptools-scm's configured fallback without Git or dist-info.
+        __version__ = "0.0.0"

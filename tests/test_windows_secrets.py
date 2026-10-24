@@ -119,7 +119,9 @@ def test_windows_ci_uses_one_fixed_python_version():
     real_job = workflow.split("  windows-real:\n", 1)[1].split(
         "\n  package-unsigned:", 1
     )[0]
-    package_job = workflow.split("  package-unsigned:\n", 1)[1]
+    package_job = workflow.split("  package-unsigned:\n", 1)[1].split(
+        "\n  macos-preview:", 1
+    )[0]
     for job in (test_job, real_job, package_job):
         assert 'python-version: "3.12"' in job
         assert "matrix:" not in job

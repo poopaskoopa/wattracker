@@ -9,9 +9,6 @@ ENV PIP_DISABLE_PIP_VERSION_CHECK=1 \
 
 WORKDIR /build
 
-ARG WATTRACKER_PACKAGE_VERSION=0.0.0
-ENV SETUPTOOLS_SCM_PRETEND_VERSION_FOR_WATTRACKER=${WATTRACKER_PACKAGE_VERSION}
-
 COPY pyproject.toml README.md ./
 COPY wattracker ./wattracker
 COPY wattracker_connector ./wattracker_connector
@@ -20,7 +17,6 @@ ARG WATTRACKER_CLOUD_COMMIT
 
 RUN test "${#WATTRACKER_CLOUD_COMMIT}" -eq 40 \
     && printf '%s\n' "$WATTRACKER_CLOUD_COMMIT" | grep -Eq '^[0-9a-f]{40}$' \
-    && test -n "$WATTRACKER_PACKAGE_VERSION" \
     && printf '%s\n' \
         '"""Build identity baked into the cloud image."""' \
         "COMMIT = \"$WATTRACKER_CLOUD_COMMIT\"" \
