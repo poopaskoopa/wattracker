@@ -214,19 +214,38 @@ def test_nothing_quietly_falls_off_the_exclude_list():
     assert {"anthropic", "openai"} <= forbidden
 
 
-def test_the_version_helper_is_shared_with_the_app_spec():
+def test_the_version_helper_is_shared_with_the_app_spec(tmp_path):
     helper = _load("_version")
     for spec in (SPEC, APP_SPEC):
         assert '_load("_version")' in spec
     # A Git-derived PEP 440 version keeps its commit identity in Inno, while
     # Windows resources use four numeric fields accepted by PyInstaller.
+    import subprocess
+
+    repo = tmp_path / "version-repo"
+    repo.mkdir()
+    subprocess.run(["git", "init", "--quiet"], cwd=repo, check=True)
+    subprocess.run(["git", "config", "user.name", "Packaging test"], cwd=repo, check=True)
+    subprocess.run(
+        ["git", "config", "user.email", "packaging-test@example.invalid"],
+        cwd=repo,
+        check=True,
+    )
+    (repo / "README.md").write_text("build id fixture\n", encoding="utf-8")
+    subprocess.run(["git", "add", "README.md"], cwd=repo, check=True)
+    subprocess.run(["git", "commit", "--quiet", "-m", "initial"], cwd=repo, check=True)
     version = "0.1.0.post1.dev29+g25e7220"
-    build_id = helper.git_build_id(ROOT)
-    assert helper.windows_file_version(version, root=ROOT) == (0, 1, build_id >> 16, build_id & 0xFFFF)
+    build_id = helper.git_build_id(repo)
+    assert helper.windows_file_version(version, root=repo) == (
+        0,
+        1,
+        build_id >> 16,
+        build_id & 0xFFFF,
+    )
     assert "windows_file_version(version, root=root)" in SPEC
     assert "macos_short_version(project_version)" in APP_SPEC
     assert helper.macos_short_version("0.1.0+29.g25e7220") == "0.1.0"
-    assert helper.macos_build_version("0.1.0+29.g25e7220", root=ROOT) == f"0.1.{build_id}"
+    assert helper.macos_build_version("0.1.0+29.g25e7220", root=repo) == f"0.1.{build_id}"
 
 
 def test_optional_halves_are_collected_best_effort():
