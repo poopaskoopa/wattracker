@@ -256,7 +256,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          main_sha="$(git ls-remote --heads origin main | awk 'NR == 1 { print $1 }')"
+          main_sha="$(git ls-remote --heads origin refs/heads/main | awk 'NR == 1 { print $1 }')"
           if [[ -z "$main_sha" ]]; then
             echo "Could not read the current main head from origin." >&2
             exit 1
@@ -319,7 +319,7 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          main_sha_now="$(git ls-remote --heads origin main | awk 'NR == 1 { print $1 }')"
+          main_sha_now="$(git ls-remote --heads origin refs/heads/main | awk 'NR == 1 { print $1 }')"
           if [[ -z "$main_sha_now" ]]; then
             echo "Could not read the current main head from origin." >&2
             exit 1

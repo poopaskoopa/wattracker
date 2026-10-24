@@ -372,6 +372,21 @@ def test_packaging_version_matches_real_desktop_tag_and_ignores_ios_tags(tmp_pat
     assert wheel_version == runtime_version == helper_version
 
 
+def test_annotated_stable_tags_win_collisions_on_shared_commits(tmp_path):
+    pytest.importorskip("setuptools_scm")
+    helper = _load_version_helper()
+    repo = _git_repo(tmp_path / "annotated-tag-collisions")
+
+    _git(repo, "tag", "v0.2.7")
+    _git(repo, "tag", "-a", "v1.0.10", "-m", "stable release")
+    assert helper.project_version(repo) == "1.0.10"
+
+    _commit(repo, "preview commit")
+    _git(repo, "tag", "preview-0.3.0")
+    _git(repo, "tag", "-a", "v0.2.0", "-m", "stable release")
+    assert helper.project_version(repo) == "0.2.0"
+
+
 def test_native_build_versions_are_monotonic_and_tag_independent(tmp_path):
     pytest.importorskip("setuptools_scm")
     helper = _load_version_helper()
@@ -533,7 +548,8 @@ def test_rolling_publish_has_one_write_job_and_short_artifact_handoff():
     assert "pattern: desktop-preview-*" in publisher
     assert "retention-days: 1" in workflow
     assert "preview-latest" in publisher and "--prerelease" in publisher
-    assert 'git ls-remote --heads origin main' in publisher
+    assert 'git ls-remote --heads origin refs/heads/main' in publisher
+    assert 'git ls-remote --heads origin main' not in publisher
     assert 'git ls-remote --refs origin refs/tags/preview-latest' in publisher
     assert '"$GITHUB_SHA" != "$main_sha"' in publisher
     assert '"$GITHUB_SHA" != "$main_sha_now"' in publisher

@@ -34,9 +34,11 @@ PyInstaller is pinned in the `package` extra of `pyproject.toml`
 - `CFBundleIdentifier` is `com.wattracker.wattracker`.
 - `CFBundleShortVersionString` preserves the semantic `X.Y.Z` release, while
   `CFBundleVersion` is `major.minor.build-id`. The build ID counts reachable
-  commits plus reachable valid desktop tags. This keeps previews ordered before
-  the next release, including when its tag is added to the same commit, and
-  ignores iOS tags. The sequence assumes counted tags remain: deleting a
+  commits plus reachable valid desktop tags. Signed stable `vX.Y.Z` tags must
+  be annotated, so they take precedence over lightweight preview tags on the
+  same commit and advance the sequence before the next commit; this keeps
+  previews ordered before the release. The sequence also ignores iOS tags. It
+  assumes counted tags remain: deleting a
   previously counted desktop tag can make a later build reuse an earlier
   native build ID. A stable hotfix tag cut from an older commit can also have a
   lower build ID than a newer preview with the same major and minor version.

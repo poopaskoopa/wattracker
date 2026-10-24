@@ -1,5 +1,6 @@
 from pathlib import Path
 import re
+import subprocess
 
 
 ROOT = Path(__file__).parents[1]
@@ -168,7 +169,7 @@ def test_preview_publisher_skips_runs_older_than_main_or_preview_latest():
     assert publisher.index("name: Skip stale preview publishes") < publisher.index(
         "name: Download platform payloads"
     )
-    assert 'git ls-remote --heads origin main' in publisher
+    assert 'git ls-remote --heads origin refs/heads/main' in publisher
     assert '[[ "$GITHUB_SHA" != "$main_sha" ]]' in publisher
     assert 'git merge-base --is-ancestor "$GITHUB_SHA" "$preview_sha"' in publisher
     assert '! git merge-base --is-ancestor "$preview_sha" "$GITHUB_SHA"' in publisher
@@ -180,7 +181,9 @@ def test_preview_publisher_skips_runs_older_than_main_or_preview_latest():
 def test_preview_replacement_rechecks_freshness_and_leases_the_observed_tag():
     publisher = _workflow_job("publish-preview")
     replacement = publisher.split("name: Replace rolling preview release", 1)[1]
-    main_check = replacement.index('main_sha_now="$(git ls-remote --heads origin main')
+    main_check = replacement.index(
+        'main_sha_now="$(git ls-remote --heads origin refs/heads/main'
+    )
     preview_check = replacement.index(
         'observed_preview_ref="$(git ls-remote --refs origin refs/tags/preview-latest | awk'
     )
@@ -198,6 +201,53 @@ def test_preview_replacement_rechecks_freshness_and_leases_the_observed_tag():
     assert "--draft=false --prerelease" in replacement
     assert 'observed_preview_ref="$(git ls-remote' in replacement
     assert "--verify-tag" in replacement
+
+
+def test_main_head_query_ignores_sorted_agent2_main_branch(tmp_path):
+    remote = tmp_path / "remote.git"
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    subprocess.run(["git", "init", "--quiet", "--bare", str(remote)], check=True)
+    subprocess.run(["git", "init", "--quiet"], cwd=repo, check=True)
+    subprocess.run(["git", "config", "user.name", "workflow test"], cwd=repo, check=True)
+    subprocess.run(
+        ["git", "config", "user.email", "workflow@example.invalid"], cwd=repo, check=True
+    )
+    (repo / "README.md").write_text("main\n", encoding="utf-8")
+    subprocess.run(["git", "add", "README.md"], cwd=repo, check=True)
+    subprocess.run(["git", "commit", "--quiet", "-m", "main"], cwd=repo, check=True)
+    subprocess.run(["git", "branch", "-M", "main"], cwd=repo, check=True)
+    subprocess.run(["git", "remote", "add", "origin", str(remote)], cwd=repo, check=True)
+    subprocess.run(["git", "push", "--quiet", "origin", "main"], cwd=repo, check=True)
+
+    (repo / "README.md").write_text("agent2 main\n", encoding="utf-8")
+    subprocess.run(["git", "commit", "--quiet", "-am", "agent2 main"], cwd=repo, check=True)
+    subprocess.run(
+        ["git", "push", "--quiet", "origin", "HEAD:refs/heads/agent2/main"],
+        cwd=repo,
+        check=True,
+    )
+
+    broad = subprocess.run(
+        ["git", "ls-remote", "--heads", str(remote), "main"],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.splitlines()
+    exact = subprocess.run(
+        ["git", "ls-remote", "--heads", str(remote), "refs/heads/main"],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.splitlines()
+    assert [line.split()[1] for line in broad] == [
+        "refs/heads/agent2/main",
+        "refs/heads/main",
+    ]
+    assert [line.split()[1] for line in exact] == ["refs/heads/main"]
+
+    assert WORKFLOW.count("git ls-remote --heads origin refs/heads/main") == 2
+    assert "git ls-remote --heads origin main" not in WORKFLOW
 
 
 def test_preview_assets_are_commit_run_suffixed_and_checksums_cover_uploaded_names():

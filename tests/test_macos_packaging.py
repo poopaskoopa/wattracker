@@ -113,6 +113,8 @@ def test_signed_release_tag_check_precedes_signing_on_both_platforms():
         )[1].split("\n      - ", 1)[0]
         assert "shell: bash" in check_step
         assert '[[ ! "$GITHUB_REF_NAME" =~ ^v[0-9]+\\.[0-9]+\\.[0-9]+$ ]]' in check_step
+        assert 'git cat-file -t "refs/tags/$GITHUB_REF_NAME"' in check_step
+        assert "Signed stable tags must be annotated" in check_step
         assert 'actual="$(python packaging/_version.py)"' in check_step
         assert '"$actual" != "$expected"' in check_step
 
@@ -131,7 +133,17 @@ def test_signed_release_tag_check_accepts_only_matching_plain_release_tags(tmp_p
     (root / "README.md").write_text("fixture\n", encoding="utf-8")
     subprocess.run(["git", "add", "."], cwd=root, check=True)
     subprocess.run(["git", "commit", "-qm", "fixture"], cwd=root, check=True)
-    subprocess.run(["git", "tag", "v0.4.0"], cwd=root, check=True)
+    subprocess.run(
+        ["git", "tag", "-a", "v0.4.0", "-m", "stable release"], cwd=root, check=True
+    )
+    subprocess.run(
+        ["git", "commit", "--allow-empty", "-qm", "next release"], cwd=root, check=True
+    )
+    subprocess.run(
+        ["git", "tag", "-a", "v0.4.1", "-m", "stable release"], cwd=root, check=True
+    )
+    subprocess.run(["git", "checkout", "--quiet", "v0.4.0"], cwd=root, check=True)
+    subprocess.run(["git", "tag", "v0.4.2"], cwd=root, check=True)
 
     minimal_bin = tmp_path / "bin"
     minimal_bin.mkdir()
@@ -144,8 +156,6 @@ def test_signed_release_tag_check_accepts_only_matching_plain_release_tags(tmp_p
         f'#!/bin/sh\nexec "{sys.executable}" "$@"\n', encoding="utf-8"
     )
     python.chmod(0o755)
-    check = _release_version_check(WORKFLOW.read_text())
-
     def run(tag: str) -> subprocess.CompletedProcess[str]:
         env = {
             "PATH": str(minimal_bin),
@@ -161,14 +171,22 @@ def test_signed_release_tag_check_accepts_only_matching_plain_release_tags(tmp_p
             check=False,
         )
 
-    assert run("v0.4.0").returncode == 0
-    mismatch = run("v0.4.1")
-    assert mismatch.returncode != 0
-    assert "resolves to 0.4.0, expected 0.4.1" in mismatch.stderr
-    for invalid in ("v0.4.0-rc1", "v1.0"):
-        result = run(invalid)
-        assert result.returncode != 0
-        assert "plain vX.Y.Z" in result.stderr
+    for path in (
+        WORKFLOW,
+        Path(".github/workflows/windows-release.yml"),
+    ):
+        check = _release_version_check(path.read_text())
+        assert run("v0.4.0").returncode == 0
+        mismatch = run("v0.4.1")
+        assert mismatch.returncode != 0
+        assert "resolves to 0.4.0, expected 0.4.1" in mismatch.stderr
+        lightweight = run("v0.4.2")
+        assert lightweight.returncode != 0
+        assert "Signed stable tags must be annotated" in lightweight.stderr
+        for invalid in ("v0.4.0-rc1", "v1.0"):
+            result = run(invalid)
+            assert result.returncode != 0
+            assert "plain vX.Y.Z" in result.stderr
 
 
 def test_release_workflow_scopes_signing_secrets_to_their_steps():

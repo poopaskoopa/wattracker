@@ -123,6 +123,8 @@ def test_signed_release_tag_version_is_checked_before_signing():
             "      - name: Verify release tag matches desktop version\n", 1
         )[1].split("\n      - ", 1)[0]
         assert "^v[0-9]+\\.[0-9]+\\.[0-9]+$" in block
+        assert 'git cat-file -t "refs/tags/$GITHUB_REF_NAME"' in block
+        assert "Signed stable tags must be annotated" in block
         assert 'actual="$(python packaging/_version.py)"' in block
 
 

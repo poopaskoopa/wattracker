@@ -41,9 +41,10 @@ machine: CI installs a pinned compiler itself (see **CI** below).
 
 ### Version
 
-Git tags are the only version source. `setuptools-scm` reads stable and
-prerelease `vX.Y.Z[-aN|-bN|-rcN]` tags and matching `preview-X.Y.Z[-aN|-bN|-rcN]`
-history tags; commits after a tag receive a PEP 440
+Git tags are the only version source. `setuptools-scm` reads plain stable
+`vX.Y.Z` tags and matching `preview-X.Y.Z` history tags; signed stable `v`
+tags must be annotated so they take precedence over lightweight preview tags
+on the same commit. Commits after a tag receive a PEP 440
 version that includes their distance and Git node. The generated
 `wattracker/_scm_version.py` supplies `wattracker.__version__` and the connector
 version. `packaging/_version.py` reads the same setuptools-scm configuration for
@@ -53,9 +54,10 @@ Inno receives the full PEP 440 version through `/DAppVersion=`. The macOS plist
 uses `major.minor.build-id`, and Windows stores that same build ID across its
 last two 16-bit numeric fields; the first two fields are the release major and
 minor, each limited to 65,535. The ID counts reachable commits plus reachable
-valid desktop tags, so a stable tag added to the preview's commit advances the
-value, and the next commit advances it again. iOS and malformed tags do not
-count. This assumes counted tags remain: deleting a previously counted desktop
+valid desktop tags, so an annotated stable tag added to the preview's commit
+takes precedence in version selection and advances the value, and the next
+commit advances it again. iOS and malformed tags do not count. This assumes
+counted tags remain: deleting a previously counted desktop
 tag can make a later build reuse an earlier native build ID. A stable hotfix
 tag cut from an older commit can also have a lower build ID than a newer preview
 with the same major and minor version. The 32-bit ID caps at 4,294,967,295.

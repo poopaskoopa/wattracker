@@ -51,6 +51,15 @@ def _releases(monkeypatch, records):
     monkeypatch.setattr(drift, "run_gh", lambda args: json.dumps(records))
 
 
+def test_drift_workflow_checks_out_full_history_and_tags():
+    workflow = (ROOT / ".github" / "workflows" / "desktop-release-drift.yml").read_text(
+        encoding="utf-8"
+    )
+    checkout = workflow.split("- name: Check out all tags and history\n", 1)[1]
+    checkout = checkout.split("\n      - name:", 1)[0]
+    assert "fetch-depth: 0" in checkout
+
+
 def test_drift_fails_for_app_commits_after_the_nearest_published_release(tmp_path, monkeypatch):
     root, version_sha, preview_sha = _repo(tmp_path)
     (root / "wattracker" / "app.py").write_text("BASE = 2\n", encoding="utf-8")
