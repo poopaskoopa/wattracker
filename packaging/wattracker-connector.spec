@@ -57,7 +57,8 @@ def _load(name):
     return module
 
 
-_project_version = lambda: _load("_version").project_version(root)  # noqa: E731
+_version_helper = _load("_version")
+_project_version = lambda: _version_helper.project_version(root)  # noqa: E731
 FORBIDDEN = _load("_connector_excludes").FORBIDDEN
 
 # bleak resolves its backend at runtime, so nothing static imports the WinRT
@@ -113,8 +114,7 @@ def _version_resource():
         )
 
         version = _project_version()
-        parts = [int(p) for p in version.split(".")[:3]] + [0, 0, 0, 0]
-        numbers = tuple(parts[:4])
+        numbers = _version_helper.windows_file_version(version, root=root)
         return VSVersionInfo(
             ffi=FixedFileInfo(filevers=numbers, prodvers=numbers),
             kids=[

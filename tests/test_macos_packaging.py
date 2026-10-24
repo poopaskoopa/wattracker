@@ -51,14 +51,18 @@ def test_bundle_is_macos_only_and_declares_its_plist():
     bundle = spec.split("if IS_MACOS:", 1)[1]
     assert "BUNDLE(" in bundle
     assert 'bundle_identifier="com.wattracker.wattracker"' in bundle
+    plist_builder = spec.split("def _macos_info_plist", 1)[1].split("hidden =", 1)[0]
     # An agent app: no Cocoa event loop, so a Dock icon would only ever be
     # reported as not responding.
-    assert '"LSUIElement": True' in bundle
+    assert '"LSUIElement": True' in plist_builder
     # CoreBluetooth terminates a process that touches it without a purpose
     # string, which would kill the app from the ride page.
-    assert '"NSBluetoothAlwaysUsageDescription"' in bundle
-    # The bundle version is read from pyproject, never hard-coded.
-    assert '"CFBundleShortVersionString": _project_version()' in bundle
+    assert '"NSBluetoothAlwaysUsageDescription"' in plist_builder
+    # Apple's plist versions stay numeric while sharing the Git-derived source.
+    assert '"CFBundleShortVersionString": version_helper.macos_short_version(project_version)' in plist_builder
+    assert '"CFBundleVersion": version_helper.macos_build_version(project_version, root=root)' in plist_builder
+    assert "info_plist=_macos_info_plist(project_version, version_helper)" in bundle
+    assert 'version=version_helper.macos_short_version(project_version)' in bundle
     assert "0.1.0" not in bundle
 
 

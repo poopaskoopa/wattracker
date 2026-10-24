@@ -47,6 +47,8 @@ jobs:
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
@@ -76,6 +78,8 @@ jobs:
     timeout-minutes: 45
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
@@ -152,7 +156,7 @@ jobs:
         run: |
           python -m PyInstaller --clean --noconfirm packaging\wattracker.spec
           powershell -File packaging\smoke_frozen.ps1 -Executable dist\wattracker\wattracker.exe
-          $version = python -c "import tomllib; print(tomllib.load(open('pyproject.toml','rb'))['project']['version'])"
+          $version = python packaging\_version.py
           ISCC.exe "/DAppVersion=$version" packaging\wattracker.iss
           $setup = "dist\wattracker-$version-windows-x64-unsigned-setup.exe"
           if (-not (Test-Path -LiteralPath $setup)) { throw "Setup compiler produced no artifact" }
@@ -180,89 +184,213 @@ jobs:
             throw "Frozen connector was not produced"
           }
           python packaging\smoke_frozen_connector.py dist\WattrackerConnector.exe
-      # The portable zip is deliberately not built or uploaded. It was the
-      # largest single file at 61.8 MB and it duplicated the installer's
-      # payload: the same onedir tree, wrapped differently rather than built
-      # differently. The portable form still ships where it is actually
-      # consumed - windows-release.yml builds and signs its own zip on a `v*`
-      # tag - so what is lost is a per-commit portable copy that nothing
-      # downstream reads. A run's payload is ~45 MB without it, plus the
-      # connector.
-      #
-      # The connector is the one addition that is not a duplicate: it is a
-      # separate onefile binary for a separate machine, and no other artifact
-      # contains it. It is also, while windows-release.yml stays hard-disabled,
-      # the only way anyone gets a built connector without a Windows checkout
-      # and a toolchain - which is what a rider testing a ride needs.
-      #
-      # It weighs 12.3 MB, measured off a real freeze of this tree on
-      # 2026-08-22 rather than estimated: the excludes in
-      # packaging/_connector_excludes.py keep numpy, pandas, scipy and fastapi
-      # out, which is most of why a binary carrying bleak, websockets and a
-      # WebView binding is a quarter of the installer's size.
-      # Build on every PR commit, upload only on a merge to main.
-      #
-      # The account's shared storage is 500 MB and this step is the only thing
-      # in the repo that consumes it (cloud.yml uploads nothing; the release
-      # workflows fire only on `v*` tags). Uploading on every push does not fit:
-      # at ~93 triggers a week, 45 MB a run needs several gigabytes. Merges to
-      # main run ~8.75 times a week, so ~394 MB at 7-day retention - which fits,
-      # but leaves too little for a busy week. Five days holds ~6.25 runs, so
-      # ~280 MB for the app's payload and ~77 MB for the connector beside it:
-      # ~358 MB against a 500 MB ceiling. That fits, and the headroom is real
-      # but not large. If it tightens, the retention window is the dial to turn
-      # first - it costs only how far back a downloadable copy reaches, and
-      # nothing downstream reaches back at all.
-      #
-      # Nothing is lost by not uploading on PR commits. The job still proves the
-      # ISCC compile, the frozen smoke, the full install/upgrade/tampered-
-      # uninstall/uninstall, and the connector's own freeze and smoke on every
-      # one of them; the artifact is a downloadable convenience, and nothing
-      # downstream reads it - windows-release.yml builds its own signed
-      # artifacts on a tag.
-      #
-      # The ref test is redundant while push is filtered to main above, and is
-      # kept deliberately: it is what stops a later re-broadening of the trigger
-      # from silently turning the upload back on for every branch.
-      # The upload used to carry the "did the build produce anything?" signal via
-      # if-no-files-found: error. It cannot any more: the first run of this job
-      # on main (32477527515) built and smoked everything successfully and then
-      # failed on `Artifact storage quota has been hit`, turning a green build
-      # into a red check on main. The sizing above is sound but assumes the
-      # account's 500 MB is available, and it is not - this repo holds zero
-      # artifacts, so the storage is committed elsewhere and cannot be reclaimed
-      # from here. GitHub also recalculates usage only every 6-12 hours, so the
-      # wall outlasts whatever frees it.
-      #
-      # So the signal moves off the upload and onto the step below, which reads
-      # the filesystem this job just wrote. A missing installer still fails the
-      # job, loudly and on the line that names it; a full quota no longer can.
+      # These are the Windows payloads consumed by the single rolling-release
+      # publisher. Keep the cross-runner handoff narrow and short-lived.
       - if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
-        name: Assert the build produced a wheel, an installer and a connector
+        name: Assert the build produced an installer and a connector
         shell: pwsh
         run: |
-          $whl = @(Get-ChildItem dist\*.whl -ErrorAction SilentlyContinue)
           $exe = @(Get-ChildItem dist\*-unsigned-setup.exe -ErrorAction SilentlyContinue)
           $connector = @(Get-ChildItem dist\WattrackerConnector.exe -ErrorAction SilentlyContinue)
-          Write-Host "wheel(s): $($whl.Count), installer(s): $($exe.Count), connector(s): $($connector.Count)"
-          if ($whl.Count -eq 0) { throw "no wheel in dist\ - the build did not produce one" }
+          Write-Host "installer(s): $($exe.Count), connector(s): $($connector.Count)"
           if ($exe.Count -eq 0) { throw "no *-unsigned-setup.exe in dist\ - ISCC did not produce an installer" }
           if ($connector.Count -eq 0) { throw "no WattrackerConnector.exe in dist\ - the connector freeze did not produce one" }
 
-      # continue-on-error, not `|| true`: a quota failure stays visible as a
-      # yellow step you can click into, rather than being swallowed. The job and
-      # the check on main go green because the build genuinely passed.
-      # if-no-files-found drops to `warn` because the assert above now owns that
-      # failure - leaving it at `error` would just reintroduce a red step for a
-      # condition already covered.
       - if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
+        # These are required by publish-preview. A quota failure must fail the
+        # release workflow rather than leave a green run with a stale preview.
         uses: actions/upload-artifact@v4
-        continue-on-error: true
         with:
-          name: wattracker-windows-x64-unsigned
+          name: desktop-preview-windows
           path: |
-            dist/*.whl
             dist/*-unsigned-setup.exe
             dist/WattrackerConnector.exe
-          if-no-files-found: warn
-          retention-days: 5
+          if-no-files-found: error
+          retention-days: 1
+
+  macos-preview:
+    if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
+    runs-on: macos-latest
+    timeout-minutes: 45
+    env:
+      WATTRACKER_AUTO_SCAN: "0"
+      WATTRACKER_OPEN_BROWSER: "0"
+    steps:
+      - name: Check out source and tags
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - name: Build unsigned macOS DMG
+        env:
+          WATTRACKER_BUILD_PYTHON: python
+        run: packaging/build-macos.sh
+      - name: Hand off the DMG to the publisher
+        uses: actions/upload-artifact@v4
+        with:
+          name: desktop-preview-macos
+          path: release/*.dmg
+          if-no-files-found: error
+          retention-days: 1
+
+  publish-preview:
+    if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
+    needs: [package-unsigned, macos-preview]
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    concurrency:
+      group: desktop-preview-publish
+      cancel-in-progress: false
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Skip stale preview publishes
+        id: freshness
+        shell: bash
+        run: |
+          set -euo pipefail
+          main_sha="$(git ls-remote --heads origin main | awk 'NR == 1 { print $1 }')"
+          if [[ -z "$main_sha" ]]; then
+            echo "Could not read the current main head from origin." >&2
+            exit 1
+          fi
+          if [[ "$GITHUB_SHA" != "$main_sha" ]]; then
+            echo "publish=false" >> "$GITHUB_OUTPUT"
+            echo "$GITHUB_SHA is not the current main head ($main_sha); skipping stale preview."
+            exit 0
+          fi
+
+          preview_ref="$(git ls-remote --refs origin refs/tags/preview-latest | awk 'NR == 1 { print $1 }')"
+          if [[ -n "$preview_ref" ]]; then
+            git fetch --quiet --force --no-tags origin refs/tags/preview-latest:refs/tags/preview-latest
+            preview_sha="$(git rev-parse 'refs/tags/preview-latest^{commit}')"
+            if [[ "$GITHUB_SHA" != "$preview_sha" ]]; then
+              if git merge-base --is-ancestor "$GITHUB_SHA" "$preview_sha" || \
+                ! git merge-base --is-ancestor "$preview_sha" "$GITHUB_SHA"; then
+                echo "publish=false" >> "$GITHUB_OUTPUT"
+                echo "$GITHUB_SHA is not newer than preview-latest ($preview_sha); skipping stale preview."
+                exit 0
+              fi
+            fi
+          fi
+          echo "publish=true" >> "$GITHUB_OUTPUT"
+      - name: Download platform payloads
+        if: steps.freshness.outputs.publish == 'true'
+        uses: actions/download-artifact@v4
+        with:
+          pattern: desktop-preview-*
+          path: release
+          merge-multiple: true
+      - name: Verify payloads and write checksums
+        if: steps.freshness.outputs.publish == 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          dmg=(release/*.dmg)
+          setup=(release/*-unsigned-setup.exe)
+          connector=(release/WattrackerConnector.exe)
+          test "${#dmg[@]}" -eq 1 || { echo "expected one macOS DMG" >&2; exit 1; }
+          test "${#setup[@]}" -eq 1 || { echo "expected one Windows setup" >&2; exit 1; }
+          test "${#connector[@]}" -eq 1 || { echo "expected one connector executable" >&2; exit 1; }
+          asset_suffix="${GITHUB_SHA:0:12}-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          dmg_asset="desktop-preview-${asset_suffix}-macos.dmg"
+          setup_asset="desktop-preview-${asset_suffix}-windows-setup.exe"
+          connector_asset="desktop-preview-${asset_suffix}-connector.exe"
+          checksums_asset="desktop-preview-${asset_suffix}-SHA256SUMS.txt"
+          cp "${dmg[0]}" "release/$dmg_asset"
+          cp "${setup[0]}" "release/$setup_asset"
+          cp "${connector[0]}" "release/$connector_asset"
+          (
+            cd release
+            sha256sum -- "$dmg_asset" "$setup_asset" "$connector_asset" \
+              | LC_ALL=C sort -k2 > "$checksums_asset"
+          )
+      - name: Replace rolling preview release
+        if: steps.freshness.outputs.publish == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          main_sha_now="$(git ls-remote --heads origin main | awk 'NR == 1 { print $1 }')"
+          if [[ -z "$main_sha_now" ]]; then
+            echo "Could not read the current main head from origin." >&2
+            exit 1
+          fi
+          if [[ "$GITHUB_SHA" != "$main_sha_now" ]]; then
+            echo "$GITHUB_SHA is no longer the current main head ($main_sha_now); skipping preview replacement."
+            exit 0
+          fi
+
+          observed_preview_ref="$(git ls-remote --refs origin refs/tags/preview-latest | awk 'NR == 1 { print $1 }')"
+          if [[ -n "$observed_preview_ref" ]]; then
+            git fetch --quiet --force --no-tags origin refs/tags/preview-latest:refs/tags/preview-latest
+            observed_preview_sha="$(git rev-parse 'refs/tags/preview-latest^{commit}')"
+            if [[ "$GITHUB_SHA" != "$observed_preview_sha" ]]; then
+              if git merge-base --is-ancestor "$GITHUB_SHA" "$observed_preview_sha" || \
+                ! git merge-base --is-ancestor "$observed_preview_sha" "$GITHUB_SHA"; then
+                echo "$GITHUB_SHA is not newer than preview-latest ($observed_preview_sha); skipping preview replacement."
+                exit 0
+              fi
+            fi
+          fi
+
+          asset_suffix="${GITHUB_SHA:0:12}-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          assets=(release/desktop-preview-"$asset_suffix"-*)
+          test "${#assets[@]}" -eq 4 || { echo "expected four versioned preview assets" >&2; exit 1; }
+          expected_preview_ref="$observed_preview_ref"
+          if gh release view preview-latest --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            # Unique names keep the previous complete asset set available until
+            # all assets for this publish have uploaded successfully.
+            gh release upload preview-latest "${assets[@]}" --repo "$GITHUB_REPOSITORY"
+          else
+            # A first publish has no previous asset set to preserve. Keep its
+            # release as a draft until all four versioned assets are present.
+            if [[ -n "$observed_preview_ref" ]]; then
+              gh release create preview-latest "${assets[@]}" \
+                --repo "$GITHUB_REPOSITORY" --verify-tag --draft --prerelease \
+                --title "Desktop preview (rolling)" \
+                --notes "Unsigned desktop preview built from main commit $GITHUB_SHA."
+            else
+              gh release create preview-latest "${assets[@]}" \
+                --repo "$GITHUB_REPOSITORY" --target "$GITHUB_SHA" --draft --prerelease \
+                --title "Desktop preview (rolling)" \
+                --notes "Unsigned desktop preview built from main commit $GITHUB_SHA."
+              # GitHub creates a new release tag when creating the first draft.
+              # Confirm it names this exact commit before accepting it as the
+              # expected value for the lease below.
+              expected_preview_ref="$(git ls-remote --refs origin refs/tags/preview-latest | awk 'NR == 1 { print $1 }')"
+              test -n "$expected_preview_ref" || { echo "preview-latest tag was not created" >&2; exit 1; }
+              git fetch --quiet --force --no-tags origin refs/tags/preview-latest:refs/tags/preview-latest
+              created_preview_sha="$(git rev-parse 'refs/tags/preview-latest^{commit}')"
+              if [[ "$created_preview_sha" != "$GITHUB_SHA" ]]; then
+                echo "New preview tag points to $created_preview_sha, expected $GITHUB_SHA." >&2
+                exit 1
+              fi
+            fi
+          fi
+
+          # Retarget only after the new complete asset set exists. The exact
+          # observed ref is leased; any intervening tag update rejects the push.
+          git push "--force-with-lease=refs/tags/preview-latest:${expected_preview_ref}" \
+            origin "$GITHUB_SHA:refs/tags/preview-latest"
+          gh release edit preview-latest --repo "$GITHUB_REPOSITORY" \
+            --target "$GITHUB_SHA" --draft=false --prerelease \
+            --title "Desktop preview (rolling)" \
+            --notes "Unsigned desktop preview built from main commit $GITHUB_SHA."
+          # Remove old assets only after upload, leased tag retarget, and release
+          # publication succeed. The current run's names all share this prefix.
+          export CURRENT_ASSET_PREFIX="desktop-preview-${asset_suffix}-"
+          gh api "repos/$GITHUB_REPOSITORY/releases/tags/preview-latest" \
+            --jq '.assets[] | select(.name | startswith(env.CURRENT_ASSET_PREFIX) | not) | .id' \
+            | while read -r asset_id; do
+                [[ -n "$asset_id" ]] && gh api --silent --method DELETE \
+                  "repos/$GITHUB_REPOSITORY/releases/assets/$asset_id"
+              done

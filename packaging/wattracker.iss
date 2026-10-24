@@ -1,5 +1,5 @@
 #ifndef AppVersion
-  #error AppVersion must be supplied from pyproject.toml with /DAppVersion=x.y.z
+  #error AppVersion must be supplied from packaging/_version.py with /DAppVersion=<git-version>
 #endif
 
 [Setup]
