@@ -238,6 +238,8 @@ def test_desktop_tag_contract_matches_scm_describe_and_drift_checker(tmp_path):
         "v1.0",
         "v01.0.0",
         "v0.1.00",
+        "v0.4.0.1",
+        "preview-0.4.0.1",
         "ios-v9.9.9",
         "preview-latest",
     )
@@ -261,6 +263,8 @@ def test_desktop_tag_contract_matches_scm_describe_and_drift_checker(tmp_path):
             "v1.0",
             "v01.0.0",
             "v0.1.00",
+            "v0.4.0.1",
+            "preview-0.4.0.1",
             "preview-latest",
         )
     ):
