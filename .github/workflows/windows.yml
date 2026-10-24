@@ -351,29 +351,27 @@ jobs:
             # all assets for this publish have uploaded successfully.
             gh release upload preview-latest "${assets[@]}" --repo "$GITHUB_REPOSITORY"
           else
-            # A first publish has no previous asset set to preserve. Keep its
-            # release as a draft until all four versioned assets are present.
+            # A first publish has no previous asset set to preserve. Create
+            # its tag explicitly before asking GitHub to create the release:
+            # draft release creation is not guaranteed to create the tag.
             if [[ -n "$observed_preview_ref" ]]; then
               gh release create preview-latest "${assets[@]}" \
                 --repo "$GITHUB_REPOSITORY" --verify-tag --draft --prerelease \
                 --title "Desktop preview (rolling)" \
                 --notes "Unsigned desktop preview built from main commit $GITHUB_SHA."
             else
-              gh release create preview-latest "${assets[@]}" \
-                --repo "$GITHUB_REPOSITORY" --target "$GITHUB_SHA" --draft --prerelease \
-                --title "Desktop preview (rolling)" \
-                --notes "Unsigned desktop preview built from main commit $GITHUB_SHA."
-              # GitHub creates a new release tag when creating the first draft.
-              # Confirm it names this exact commit before accepting it as the
-              # expected value for the lease below.
+              gh api --method POST "repos/$GITHUB_REPOSITORY/git/refs" \
+                -f ref=refs/tags/preview-latest -f sha="$GITHUB_SHA"
               expected_preview_ref="$(git ls-remote --refs origin refs/tags/preview-latest | awk 'NR == 1 { print $1 }')"
-              test -n "$expected_preview_ref" || { echo "preview-latest tag was not created" >&2; exit 1; }
-              git fetch --quiet --force --no-tags origin refs/tags/preview-latest:refs/tags/preview-latest
-              created_preview_sha="$(git rev-parse 'refs/tags/preview-latest^{commit}')"
-              if [[ "$created_preview_sha" != "$GITHUB_SHA" ]]; then
-                echo "New preview tag points to $created_preview_sha, expected $GITHUB_SHA." >&2
+              if [[ "$expected_preview_ref" != "$GITHUB_SHA" ]]; then
+                echo "New preview tag points to ${expected_preview_ref:-<missing>}, expected $GITHUB_SHA." >&2
                 exit 1
               fi
+              git fetch --quiet --force --no-tags origin refs/tags/preview-latest:refs/tags/preview-latest
+              gh release create preview-latest "${assets[@]}" \
+                --repo "$GITHUB_REPOSITORY" --verify-tag --prerelease \
+                --title "Desktop preview (rolling)" \
+                --notes "Unsigned desktop preview built from main commit $GITHUB_SHA."
             fi
           fi
 

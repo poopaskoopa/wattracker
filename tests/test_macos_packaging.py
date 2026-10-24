@@ -6,6 +6,12 @@ noticed only by shipping a broken artifact are asserted from the checkout.
 """
 from pathlib import Path
 import re
+import shutil
+import subprocess
+import sys
+import textwrap
+
+import pytest
 
 SPEC = Path("packaging/wattracker.spec")
 WORKFLOW = Path(".github/workflows/macos-release.yml")
@@ -84,6 +90,85 @@ def test_release_workflow_is_tag_only_and_environment_gated():
     # gate now that the `if` is gone.
     assert "    environment: macos-code-signing\n" in header
     assert "    runs-on: macos-latest\n" in header
+
+
+def _release_version_check(workflow: str) -> str:
+    step = workflow.split("      - name: Verify release tag matches desktop version\n", 1)[1]
+    step = step.split("\n      - ", 1)[0]
+    return textwrap.dedent(step.split("        run: |\n", 1)[1])
+
+
+def test_signed_release_tag_check_precedes_signing_on_both_platforms():
+    macos = WORKFLOW.read_text()
+    windows = Path(".github/workflows/windows-release.yml").read_text()
+    for workflow, signing_step in (
+        (macos, "Import Developer ID certificate into a temporary keychain"),
+        (windows, "Sign and verify every frozen binary"),
+    ):
+        check = workflow.index("- name: Verify release tag matches desktop version")
+        assert workflow.index("- name: Install pinned build tools and project") < check
+        assert check < workflow.index(f"- name: {signing_step}")
+        check_step = workflow.split(
+            "      - name: Verify release tag matches desktop version\n", 1
+        )[1].split("\n      - ", 1)[0]
+        assert "shell: bash" in check_step
+        assert '[[ ! "$GITHUB_REF_NAME" =~ ^v[0-9]+\\.[0-9]+\\.[0-9]+$ ]]' in check_step
+        assert 'actual="$(python packaging/_version.py)"' in check_step
+        assert '"$actual" != "$expected"' in check_step
+
+
+def test_signed_release_tag_check_accepts_only_matching_plain_release_tags(tmp_path):
+    pytest.importorskip("setuptools_scm")
+    root = tmp_path / "repo"
+    (root / "packaging").mkdir(parents=True)
+    shutil.copy2("pyproject.toml", root / "pyproject.toml")
+    shutil.copy2("packaging/_version.py", root / "packaging/_version.py")
+    subprocess.run(["git", "init", "-q"], cwd=root, check=True)
+    subprocess.run(["git", "config", "user.name", "test"], cwd=root, check=True)
+    subprocess.run(
+        ["git", "config", "user.email", "test@example.invalid"], cwd=root, check=True
+    )
+    (root / "README.md").write_text("fixture\n", encoding="utf-8")
+    subprocess.run(["git", "add", "."], cwd=root, check=True)
+    subprocess.run(["git", "commit", "-qm", "fixture"], cwd=root, check=True)
+    subprocess.run(["git", "tag", "v0.4.0"], cwd=root, check=True)
+
+    minimal_bin = tmp_path / "bin"
+    minimal_bin.mkdir()
+    for executable in ("git",):
+        source = shutil.which(executable)
+        assert source is not None
+        (minimal_bin / executable).symlink_to(source)
+    python = minimal_bin / "python"
+    python.write_text(
+        f'#!/bin/sh\nexec "{sys.executable}" "$@"\n', encoding="utf-8"
+    )
+    python.chmod(0o755)
+    check = _release_version_check(WORKFLOW.read_text())
+
+    def run(tag: str) -> subprocess.CompletedProcess[str]:
+        env = {
+            "PATH": str(minimal_bin),
+            "HOME": str(tmp_path),
+            "GITHUB_REF_NAME": tag,
+        }
+        return subprocess.run(
+            ["/bin/bash", "-e", "-c", check],
+            cwd=root,
+            env=env,
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+
+    assert run("v0.4.0").returncode == 0
+    mismatch = run("v0.4.1")
+    assert mismatch.returncode != 0
+    assert "resolves to 0.4.0, expected 0.4.1" in mismatch.stderr
+    for invalid in ("v0.4.0-rc1", "v1.0"):
+        result = run(invalid)
+        assert result.returncode != 0
+        assert "plain vX.Y.Z" in result.stderr
 
 
 def test_release_workflow_scopes_signing_secrets_to_their_steps():

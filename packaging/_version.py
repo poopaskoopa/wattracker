@@ -6,31 +6,81 @@ import subprocess
 from pathlib import Path
 
 _DESKTOP_TAG = re.compile(
-    r"^(?:v|preview-)(?P<version>(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)(?:-(?:a|b|rc)\d+)?)$"
+    r"^(?:v|preview-)(?P<version>(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)\.(?:0|[1-9]\d*))$"
 )
+DESCRIBE_COMMAND = [
+    "git",
+    "describe",
+    "--dirty",
+    "--tags",
+    "--long",
+    "--match",
+    "v[0-9]*.[0-9]*.[0-9]*",
+    "--match",
+    "preview-[0-9]*.[0-9]*.[0-9]*",
+    "--exclude",
+    "v*[!0-9.]*",
+    "--exclude",
+    "preview-*[!0-9.]*",
+    "--exclude",
+    "v0[0-9]*.*",
+    "--exclude",
+    "v*.0[0-9]*.*",
+    "--exclude",
+    "v*.*.0[0-9]*",
+    "--exclude",
+    "preview-0[0-9]*.*",
+    "--exclude",
+    "preview-*.0[0-9]*.*",
+    "--exclude",
+    "preview-*.*.0[0-9]*",
+]
 _MAX_BUILD_ID = (1 << 32) - 1
 
 
 def project_version(root) -> str:
     """Return the same configured PEP 440 version setuptools-scm writes to the wheel."""
-    from setuptools_scm import Configuration
     from setuptools_scm._get_version import _get_version
+    from vcs_versioning import VcsEnvironment
 
     root = Path(root).resolve()
-    # Loading pyproject.toml is essential here: its tag regex and describe
-    # command deliberately ignore iOS tags, and its fallback version matches
-    # the wheel build when Git metadata is unavailable.
-    try:
-        from vcs_versioning import VcsEnvironment
-    except ImportError:  # compatibility with earlier setuptools-scm 9.x installs
-        config = Configuration.from_file(name=root / "pyproject.toml")
-    else:
-        environment = VcsEnvironment.from_env("SETUPTOOLS_SCM")
-        config = environment.build_config(name=root / "pyproject.toml")
+    # Loading pyproject.toml keeps the helper and wheel on the same tag regex,
+    # git argv, and no-Git fallback configuration.
+    environment = VcsEnvironment.from_env("SETUPTOOLS_SCM")
+    config = environment.build_config(name=root / "pyproject.toml")
+    if _has_desktop_tag(root):
+        # setuptools-scm deliberately treats an unsuccessful custom describe
+        # command as a signal to infer a fallback version. In a tagged desktop
+        # checkout that would conceal a broken git invocation and report a
+        # version older than the release tag, so fail before invoking it.
+        subprocess.run(
+            config.scm.git.describe_command,
+            cwd=root,
+            check=True,
+            capture_output=True,
+            text=True,
+        )
     version = _get_version(config, force_write_version_files=False)
     if version is None:
         raise RuntimeError(f"setuptools-scm could not determine a version for {root}")
     return version
+
+
+def _has_desktop_tag(root: Path) -> bool:
+    """Return whether a recognized desktop version tag is reachable from HEAD."""
+    try:
+        result = subprocess.run(
+            ["git", "tag", "--merged", "HEAD"],
+            cwd=root,
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+    except (OSError, subprocess.CalledProcessError):
+        # A source export without Git is handled by setuptools-scm's configured
+        # fallback. Tagged repositories get a loud describe check above.
+        return False
+    return any(_DESKTOP_TAG.fullmatch(tag) for tag in result.stdout.splitlines())
 
 
 def _release_major_minor(version: str) -> tuple[int, int]:

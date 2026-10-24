@@ -55,8 +55,11 @@ last two 16-bit numeric fields; the first two fields are the release major and
 minor, each limited to 65,535. The ID counts reachable commits plus reachable
 valid desktop tags, so a stable tag added to the preview's commit advances the
 value, and the next commit advances it again. iOS and malformed tags do not
-count. The 32-bit ID
-caps at 4,294,967,295. Native version resources fail in a shallow checkout;
+count. This assumes counted tags remain: deleting a previously counted desktop
+tag can make a later build reuse an earlier native build ID. A stable hotfix
+tag cut from an older commit can also have a lower build ID than a newer preview
+with the same major and minor version. The 32-bit ID caps at 4,294,967,295.
+Native version resources fail in a shallow checkout;
 the wheel's setuptools-scm version can still be built there, but release builds
 need full history (provided by CI). `OutputBaseFilename` is built from the Inno
 define, so the installer name and displayed version agree.

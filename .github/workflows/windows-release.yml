@@ -44,6 +44,21 @@ jobs:
           # quietly missing a feature.
           python -m pip install --disable-pip-version-check "build==1.2.2.post1" ".[dev,ble,package,connector,webview]"
 
+      - name: Verify release tag matches desktop version
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ ! "$GITHUB_REF_NAME" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "Signed releases require a plain vX.Y.Z tag; got $GITHUB_REF_NAME" >&2
+            exit 1
+          fi
+          expected="${GITHUB_REF_NAME#v}"
+          actual="$(python packaging/_version.py)"
+          if [[ "$actual" != "$expected" ]]; then
+            echo "Release tag $GITHUB_REF_NAME resolves to $actual, expected $expected" >&2
+            exit 1
+          fi
+
       - name: Run full test suite
         shell: pwsh
         run: python -m pytest -q

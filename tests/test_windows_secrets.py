@@ -111,6 +111,69 @@ def test_signed_release_only_builds_the_triggering_release_tag():
     assert 'tags:\n      - "v*"' in workflow
 
 
+def test_signed_release_tag_version_is_checked_before_signing():
+    for path, signing_step in (
+        (".github/workflows/macos-release.yml", "Import Developer ID certificate"),
+        (".github/workflows/windows-release.yml", "Sign and verify every frozen binary"),
+    ):
+        workflow = Path(path).read_text()
+        check = workflow.index("- name: Verify release tag matches desktop version")
+        assert check < workflow.index(f"- name: {signing_step}")
+        block = workflow.split(
+            "      - name: Verify release tag matches desktop version\n", 1
+        )[1].split("\n      - ", 1)[0]
+        assert "^v[0-9]+\\.[0-9]+\\.[0-9]+$" in block
+        assert 'actual="$(python packaging/_version.py)"' in block
+
+
+def test_preview_workflow_guards_uploads_and_avoids_release_tag_triggers():
+    workflow = Path(".github/workflows/windows.yml").read_text()
+    trigger = workflow.split("jobs:", 1)[0]
+    assert "branches: [main]" in trigger
+    assert "pull_request:" in trigger
+    assert "tags:" not in trigger
+
+    handoff = workflow.split("      - name: Hand off the DMG to the publisher\n", 1)[1]
+    handoff = handoff.split("\n  publish-preview:", 1)[0]
+    assert "if-no-files-found: error" in handoff
+
+    replace = workflow.split("      - name: Replace rolling preview release\n", 1)[1]
+    replace = replace.split("\n      - ", 1)[0]
+    assert "if: steps.freshness.outputs.publish == 'true'" in replace
+
+
+def test_first_preview_publish_creates_tag_before_release():
+    workflow = Path(".github/workflows/windows.yml").read_text()
+    publisher = workflow.split("  publish-preview:\n", 1)[1]
+    create_tag = publisher.index('gh api --method POST "repos/$GITHUB_REPOSITORY/git/refs"')
+    first_release = publisher.index("gh release create preview-latest", create_tag)
+    assert create_tag < first_release
+    before_release = publisher[create_tag:first_release]
+    assert "ref=refs/tags/preview-latest" in before_release
+    assert 'sha="$GITHUB_SHA"' in before_release
+    assert "--verify-tag" in publisher[first_release:]
+    first_create = publisher[first_release:].split("\n            fi", 1)[0]
+    assert "--draft" not in first_create
+
+
+def test_version_derived_workflow_jobs_fetch_full_tag_history():
+    for path, job_names in (
+        (
+            ".github/workflows/windows.yml",
+            ("windows-real", "package-unsigned", "macos-preview", "publish-preview"),
+        ),
+        (".github/workflows/macos-release.yml", ("build-test-sign",)),
+        (".github/workflows/windows-release.yml", ("build-test-sign",)),
+    ):
+        workflow = Path(path).read_text()
+        for index, job_name in enumerate(job_names):
+            marker = f"  {job_name}:"
+            section = workflow.split(marker, 1)[1]
+            if index + 1 < len(job_names):
+                section = section.split(f"\n  {job_names[index + 1]}:", 1)[0]
+            assert "fetch-depth: 0" in section, f"{path} job {job_name} must fetch tags/history"
+
+
 def test_windows_ci_uses_one_fixed_python_version():
     workflow = Path(".github/workflows/windows.yml").read_text()
     test_job = workflow.split("  test:\n", 1)[1].split(

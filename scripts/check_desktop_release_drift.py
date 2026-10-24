@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Fail when desktop app or packaging commits are newer than a published release."""
+"""Fail when shipped desktop app or packaging commits are newer than a release."""
 from __future__ import annotations
 
 import argparse
@@ -11,7 +11,7 @@ from pathlib import Path
 
 REPOSITORY = "poopaskoopa/wattracker"
 _VERSION_TAG = re.compile(
-    r"^(?:v|preview-)(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)(?:-(?:a|b|rc)\d+)?$"
+    r"^(?:v|preview-)(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)$"
 )
 
 
@@ -132,7 +132,8 @@ def check(root: Path | str = ".") -> dict[str, object]:
     if not main_sha:
         raise DriftError("git returned an invalid HEAD")
     count = run_git([
-        "rev-list", "--count", f"{release_sha}..HEAD", "--", "wattracker", "packaging",
+        "rev-list", "--count", f"{release_sha}..HEAD", "--",
+        "wattracker", "wattracker_connector", "packaging", "pyproject.toml",
     ], root)
     if count is None:
         raise DriftError("git returned an invalid desktop change count")
@@ -148,7 +149,7 @@ def check(root: Path | str = ".") -> dict[str, object]:
     }
     if desktop_commits:
         raise DriftError(
-            f"{desktop_commits} commit(s) changed wattracker/ or packaging/ "
+            f"{desktop_commits} commit(s) changed shipped desktop code or packaging "
             f"after published release {tag} ({release_sha[:7]})"
         )
     return result

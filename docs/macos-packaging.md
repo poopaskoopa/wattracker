@@ -36,7 +36,11 @@ PyInstaller is pinned in the `package` extra of `pyproject.toml`
   `CFBundleVersion` is `major.minor.build-id`. The build ID counts reachable
   commits plus reachable valid desktop tags. This keeps previews ordered before
   the next release, including when its tag is added to the same commit, and
-  ignores iOS tags. It is a numeric sequence rather than the PEP 440 string
+  ignores iOS tags. The sequence assumes counted tags remain: deleting a
+  previously counted desktop tag can make a later build reuse an earlier
+  native build ID. A stable hotfix tag cut from an older commit can also have a
+  lower build ID than a newer preview with the same major and minor version.
+  It is a numeric sequence rather than the PEP 440 string
   because Apple's field accepts numeric components only. The shared 32-bit
   build ID is capped at 4,294,967,295 to fit Windows version resources; major
   and minor are each capped at 65,535 for Windows compatibility. Native app

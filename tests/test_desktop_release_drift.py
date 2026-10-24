@@ -85,6 +85,21 @@ def test_docs_only_commits_after_release_do_not_cause_drift(tmp_path, monkeypatc
     assert result["desktop_commits"] == 0
 
 
+@pytest.mark.parametrize("path", ["wattracker_connector/client.py", "pyproject.toml"])
+def test_drift_includes_connector_and_project_build_config(tmp_path, monkeypatch, path):
+    root, _, _ = _repo(tmp_path)
+    changed = root / path
+    changed.parent.mkdir(parents=True, exist_ok=True)
+    changed.write_text("changed shipped desktop build input\n", encoding="utf-8")
+    _commit(root, f"change {path}")
+    _releases(monkeypatch, [
+        {"tagName": "preview-latest", "publishedAt": "2026-01-02T00:00:00Z", "isDraft": False},
+    ])
+
+    with pytest.raises(drift.DriftError, match=r"1 commit\(s\).*shipped desktop code"):
+        drift.check(root)
+
+
 def test_rolling_alias_wins_when_tags_point_at_the_same_commit(tmp_path, monkeypatch):
     root, _, _ = _repo(tmp_path)
     _git(root, "tag", "v0.1.1")
@@ -109,16 +124,19 @@ def test_latest_release_uses_commit_ancestry_when_preview_published_at_is_fixed(
     assert drift.latest_published_release(root) == ("preview-latest", preview_sha)
 
 
-@pytest.mark.parametrize("tag", ["v0.4.0-rc1", "preview-0.4.0-rc1"])
-def test_desktop_prerelease_tags_are_accepted_but_ios_tags_are_not(tmp_path, monkeypatch, tag):
+@pytest.mark.parametrize(
+    "tag",
+    ["v0.4.0-rc1", "preview-0.4.0-rc1", "v1.0", "v0.4.0rc1", "v0.5.0-beta.1", "ios-v9.9.9"],
+)
+def test_malformed_and_ios_tags_are_not_desktop_releases(tmp_path, monkeypatch, tag):
     root, _, _ = _repo(tmp_path)
     _git(root, "tag", tag)
     _releases(monkeypatch, [
-        {"tagName": "ios-v0.9.0-rc1", "publishedAt": "2026-01-04T00:00:00Z", "isDraft": False},
-        {"tagName": tag, "publishedAt": "2026-01-01T00:00:00Z", "isDraft": False},
+        {"tagName": tag, "publishedAt": "2026-01-04T00:00:00Z", "isDraft": False},
+        {"tagName": "preview-latest", "publishedAt": "2026-01-01T00:00:00Z", "isDraft": False},
     ])
 
-    assert drift.latest_published_release(root)[0] == tag
+    assert drift.latest_published_release(root)[0] == "preview-latest"
 
 
 def test_release_with_tag_missing_from_local_checkout_is_skipped(tmp_path, monkeypatch):
