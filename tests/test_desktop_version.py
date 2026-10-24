@@ -1,11 +1,13 @@
 from __future__ import annotations
 
-import importlib.metadata
 import importlib.util
+import os
 import re
+import runpy
 import shutil
 import subprocess
 import sys
+import types
 import zipfile
 from email.parser import Parser
 from pathlib import Path
@@ -17,7 +19,12 @@ ROOT = Path(__file__).parents[1]
 PYPROJECT = ROOT / "pyproject.toml"
 WINDOWS = ROOT / ".github" / "workflows" / "windows.yml"
 DRIFT_WORKFLOW = ROOT / ".github" / "workflows" / "desktop-release-drift.yml"
-BUILDS_PER_PATCH = 10_000
+
+
+@pytest.fixture(autouse=True)
+def _python_on_path(monkeypatch):
+    # setuptools-scm runs the configured describe command as a subprocess.
+    monkeypatch.setenv("PATH", f"{Path(sys.executable).parent}{os.pathsep}{os.environ['PATH']}")
 
 
 def _load_version_helper():
@@ -42,6 +49,9 @@ def _project_tree(root: Path) -> Path:
     root.mkdir()
     shutil.copyfile(PYPROJECT, root / "pyproject.toml")
     shutil.copyfile(ROOT / ".gitignore", root / ".gitignore")
+    packaging = root / "packaging"
+    packaging.mkdir(exist_ok=True)
+    shutil.copyfile(ROOT / "packaging" / "desktop_describe.py", packaging / "desktop_describe.py")
     for package in ("wattracker", "wattracker_connector"):
         package_root = root / package
         package_root.mkdir()
@@ -65,6 +75,30 @@ def _commit(root: Path, message: str) -> None:
     (root / "README.md").write_text(f"{message}\n", encoding="utf-8")
     _git(root, "add", "README.md")
     _git(root, "commit", "--quiet", "-m", message)
+
+
+def _fast_import_commits(root: Path, count: int) -> None:
+    parent = _git(root, "rev-parse", "HEAD")
+    commands = []
+    for index in range(count):
+        content = f"fast-import commit {index}\n"
+        mark = index + 1
+        commands.append(
+            f"commit refs/heads/main\nmark :{mark}\n"
+            f"author Version Test <version@example.invalid> {1_700_000_000 + index} +0000\n"
+            f"committer Version Test <version@example.invalid> {1_700_000_000 + index} +0000\n"
+            f"data {len(content.encode())}\n{content}"
+            f"from {parent if index == 0 else ':' + str(mark - 1)}\n"
+            f"M 100644 inline README.md\ndata {len(content.encode())}\n{content}\n"
+        )
+    subprocess.run(
+        ["git", "-C", str(root), "fast-import", "--quiet"],
+        input="".join(commands),
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    _git(root, "reset", "--hard", "HEAD")
 
 
 def _wheel_versions(root: Path, wheel_directory: Path) -> tuple[str, str]:
@@ -111,9 +145,38 @@ def test_package_version_is_dynamic_and_only_uses_desktop_tags():
     assert scm["version_scheme"] == "no-guess-dev"
     assert scm["version_file"] == "wattracker/_scm_version.py"
     assert scm["write_to_source"] is True
-    assert scm["tag"]["regex"] == r"^(?:v|preview-)(?P<version>\d+\.\d+\.\d+)$"
-    assert "preview-[0-9]*" in scm["scm"]["git"]["describe_command"]
-    assert "v[0-9]*" in scm["scm"]["git"]["describe_command"]
+    assert scm["tag"]["regex"] == (
+        r"^(?:v|preview-)(?P<version>(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)\."
+        r"(?:0|[1-9]\d*)(?:-(?:a|b|rc)\d+)?)$"
+    )
+    assert scm["scm"]["git"]["describe_command"] == "python packaging/desktop_describe.py"
+    assert "strict" not in scm["tag"]
+
+
+def test_desktop_tag_contract_matches_scm_describe_and_drift_checker():
+    import tomllib
+
+    config = tomllib.loads(PYPROJECT.read_text(encoding="utf-8"))
+    scm_regex = re.compile(config["tool"]["setuptools_scm"]["tag"]["regex"])
+    helper = _load_version_helper()
+    describe = runpy.run_path(str(ROOT / "packaging" / "desktop_describe.py"))
+    drift_spec = importlib.util.spec_from_file_location(
+        "_desktop_drift", ROOT / "scripts" / "check_desktop_release_drift.py"
+    )
+    drift = importlib.util.module_from_spec(drift_spec)
+    drift_spec.loader.exec_module(drift)
+    valid = ("v0.4.0-rc1", "preview-0.4.0-rc1", "v1.0.10")
+    invalid = ("v0.4.0-rc1-suffix", "preview-0.4.0-rc1x", "v01.0.0")
+    for tag in valid:
+        assert scm_regex.fullmatch(tag)
+        assert helper._DESKTOP_TAG.fullmatch(tag)
+        assert describe["TAG"].fullmatch(tag)
+        assert drift._VERSION_TAG.fullmatch(tag)
+    for tag in invalid:
+        assert scm_regex.fullmatch(tag) is None
+        assert helper._DESKTOP_TAG.fullmatch(tag) is None
+        assert describe["TAG"].fullmatch(tag) is None
+        assert drift._VERSION_TAG.fullmatch(tag) is None
 
 
 def test_runtime_packages_use_the_generated_version_with_metadata_fallback():
@@ -136,6 +199,7 @@ def test_packaging_version_matches_real_desktop_tag_and_ignores_ios_tags(tmp_pat
     helper = _load_version_helper()
     repo = _git_repo(tmp_path / "desktop-tags")
     _git(repo, "tag", "ios-v9.9.9")
+    _git(repo, "tag", "v0.4.0junk1")
     _git(repo, "tag", "v0.2.0")
     helper_version = helper.project_version(repo)
     assert helper_version == "0.2.0"
@@ -143,42 +207,51 @@ def test_packaging_version_matches_real_desktop_tag_and_ignores_ios_tags(tmp_pat
     assert wheel_version == runtime_version == helper_version
 
     _commit(repo, "preview release")
-    _git(repo, "tag", "preview-0.3.0")
+    _git(repo, "tag", "preview-0.3.0-rc1")
     helper_version = helper.project_version(repo)
-    assert helper_version == "0.3.0"
+    assert Version(helper_version) == Version("0.3.0rc1")
     wheel_version, runtime_version = _wheel_versions(repo, tmp_path / "wheel-preview-tag")
     assert wheel_version == runtime_version == helper_version
 
     _commit(repo, "unreleased desktop change")
+    _git(repo, "tag", "v0.3.0-rc1-suffix")
     _git(repo, "tag", "ios-v99.99.99")
     helper_version = helper.project_version(repo)
-    assert re.fullmatch(r"0\.3\.0\.post1\.dev1\+g[0-9a-f]+", helper_version)
+    assert re.fullmatch(r"0\.3\.0rc1\.post1\.dev1\+g[0-9a-f]+", helper_version)
     wheel_version, runtime_version = _wheel_versions(repo, tmp_path / "wheel-ios-tag")
     assert wheel_version == runtime_version == helper_version
 
 
-def test_git_version_can_be_normalized_for_windows_and_macos_metadata():
+def test_native_build_versions_are_monotonic_and_tag_independent(tmp_path):
     helper = _load_version_helper()
-    for version, release, encoded_patch in (
-        ("0.1.0.post1.dev31+g25e7220", (0, 1, 0), 31),
-        ("0.1.0+31.g25e7220", (0, 1, 0), 31),
-        ("0.1.0", (0, 1, 0), 0),
-        ("0.1.5", (0, 1, 5), 5 * BUILDS_PER_PATCH),
-    ):
-        parsed = Version(version)
-        assert parsed.release[:3] == release
-        assert helper.windows_file_version(version) == (0, 1, encoded_patch, 0)
-        assert helper.macos_short_version(version) == ".".join(map(str, release))
-        assert helper.macos_build_version(version) == f"{release[0]}.{release[1]}.{encoded_patch}"
+    repo = _git_repo(tmp_path / "build-sequence")
+    _git(repo, "tag", "ios-v99.99.99")
+    _git(repo, "tag", "v0.2.7")
+    preview_id = helper.git_build_id(repo)
+    preview_version = helper.project_version(repo)
+    preview_windows = helper.windows_file_version(preview_version, root=repo)
+    assert preview_windows == (0, 2, 0, preview_id)
+    assert helper.macos_short_version(preview_version) == "0.2.7"
+    preview_macos = tuple(map(int, helper.macos_build_version(preview_version, root=repo).split(".")))
 
-    preview = helper.windows_file_version("0.1.0.post1.dev31+g25e7220")
-    next_patch_release = helper.windows_file_version("0.1.1")
-    assert preview < next_patch_release
-    preview_macos = tuple(
-        map(int, helper.macos_build_version("0.1.0.post1.dev31+g25e7220").split("."))
-    )
-    next_patch_macos = tuple(map(int, helper.macos_build_version("0.1.1").split(".")))
-    assert preview_macos < next_patch_macos
+    # A stable release tag can be added to the exact SHA that published a
+    # preview. The added reachable desktop tag must still advance the sequence.
+    _git(repo, "tag", "v1.0.10")
+    stable_id = helper.git_build_id(repo)
+    stable_version = helper.project_version(repo)
+    assert stable_id == preview_id + 1
+    stable_windows = helper.windows_file_version(stable_version, root=repo)
+    assert stable_windows > preview_windows
+    stable_macos = tuple(map(int, helper.macos_build_version(stable_version, root=repo).split(".")))
+    assert stable_macos > preview_macos
+
+    _commit(repo, "next preview commit")
+    next_id = helper.git_build_id(repo)
+    assert next_id == stable_id + 1
+    assert helper.windows_file_version(helper.project_version(repo), root=repo) > stable_windows
+    assert helper.windows_file_version("0.2.7", root=repo)[0:2] == (0, 2)
+    assert helper.windows_file_version("1.0.10", root=repo)[0:2] == (1, 0)
+
 
 
 def test_project_version_matches_wheel_fallback_without_git_or_with_shallow_clone(tmp_path):
@@ -191,6 +264,14 @@ def test_project_version_matches_wheel_fallback_without_git_or_with_shallow_clon
     assert helper_version == "0.0.0"
     wheel_version, runtime_version = _wheel_versions(source, tmp_path / "wheel-no-git")
     assert wheel_version == runtime_version == helper_version
+
+    ios_only = _git_repo(tmp_path / "ios-only-tags")
+    _git(ios_only, "tag", "ios-v9.9.9")
+    ios_only_version = helper.project_version(ios_only)
+    assert Version(ios_only_version).release == (0, 0, 0)
+    assert "9.9.9" not in ios_only_version
+    wheel_version, runtime_version = _wheel_versions(ios_only, tmp_path / "wheel-ios-only")
+    assert wheel_version == runtime_version == ios_only_version
 
     origin = _git_repo(tmp_path / "shallow-origin")
     _git(origin, "tag", "v0.2.0")
@@ -205,23 +286,90 @@ def test_project_version_matches_wheel_fallback_without_git_or_with_shallow_clon
     shallow_version = helper.project_version(shallow)
     wheel_version, runtime_version = _wheel_versions(shallow, tmp_path / "wheel-shallow")
     assert wheel_version == runtime_version == shallow_version
+    with pytest.raises(SystemExit, match="require a full-history Git checkout"):
+        helper.git_build_id(shallow)
 
 
-def test_setuptools_scm_current_checkout_version_matches_distribution_metadata():
-    pytest.importorskip("setuptools_scm")
-    helper = _load_version_helper()
-    derived = helper.project_version(ROOT)
-    installed = importlib.metadata.version("wattracker")
-    import wattracker
-    import wattracker_connector
+def test_real_specs_encode_exact_release_tags_and_large_dev_distance(tmp_path, monkeypatch):
+    repo = _git_repo(tmp_path / "spec-repo")
+    packaging = repo / "packaging"
+    packaging.mkdir(exist_ok=True)
+    for name in ("_version.py", "_connector_excludes.py", "desktop_describe.py", "wattracker.spec", "wattracker-connector.spec"):
+        shutil.copyfile(ROOT / "packaging" / name, packaging / name)
+    _git(repo, "add", "packaging")
+    _git(repo, "commit", "--quiet", "-m", "add actual specs")
+    _git(repo, "tag", "v0.2.7")
 
-    assert Version(derived) == Version(installed)
-    assert Version(wattracker.__version__) == Version(derived)
-    assert Version(wattracker_connector.__version__) == Version(derived)
-    assert re.fullmatch(
-        r"\d+\.\d+\.\d+(?:\.post1\.dev\d+\+g[0-9a-f]+(?:\.d\d{8})?)?",
-        derived,
-    )
+    class Record:
+        def __init__(self, *args, **kwargs):
+            self.args, self.kwargs = args, kwargs
+
+    class Analysis(Record):
+        def __init__(self, *args, **kwargs):
+            super().__init__(*args, **kwargs)
+            self.pure = []
+            self.scripts = self.binaries = self.datas = []
+
+    hooks = types.ModuleType("PyInstaller.utils.hooks")
+    hooks.collect_submodules = lambda _name: []
+    pyinstaller = types.ModuleType("PyInstaller")
+    utils = types.ModuleType("PyInstaller.utils")
+    pyinstaller.utils = utils
+    utils.hooks = hooks
+    monkeypatch.setitem(sys.modules, "PyInstaller", pyinstaller)
+    monkeypatch.setitem(sys.modules, "PyInstaller.utils", utils)
+    monkeypatch.setitem(sys.modules, "PyInstaller.utils.hooks", hooks)
+    monkeypatch.setattr(sys, "platform", "darwin")
+    mac_globals = {
+        "SPECPATH": str(packaging), "Analysis": Analysis, "PYZ": Record,
+        "EXE": Record, "COLLECT": Record,
+        "BUNDLE": lambda *args, **kwargs: Record(*args, **kwargs),
+    }
+    mac = runpy.run_path(str(packaging / "wattracker.spec"), init_globals=mac_globals)
+    assert mac["app"].kwargs["info_plist"]["CFBundleShortVersionString"] == "0.2.7"
+    exact_macos = tuple(map(int, mac["app"].kwargs["info_plist"]["CFBundleVersion"].split(".")))
+
+    monkeypatch.setattr(sys, "platform", "win32")
+    versioninfo = types.ModuleType("PyInstaller.utils.win32.versioninfo")
+    for name in ("FixedFileInfo", "StringFileInfo", "StringStruct", "StringTable", "VarFileInfo", "VarStruct", "VSVersionInfo"):
+        setattr(versioninfo, name, type(name, (Record,), {}))
+    win32 = types.ModuleType("PyInstaller.utils.win32")
+    win32.versioninfo = versioninfo
+    monkeypatch.setitem(sys.modules, "PyInstaller.utils.win32", win32)
+    monkeypatch.setitem(sys.modules, "PyInstaller.utils.win32.versioninfo", versioninfo)
+    connector_globals = {
+        "SPECPATH": str(packaging), "Analysis": Analysis, "PYZ": Record, "EXE": Record,
+    }
+    connector = runpy.run_path(str(packaging / "wattracker-connector.spec"), init_globals=connector_globals)
+    resource = connector["_version_resource"]()
+    assert resource.kwargs["ffi"].kwargs["filevers"][:2] == (0, 2)
+
+    # Exercise a real 10,001-commit describe distance through both specs.
+    _fast_import_commits(repo, 10_001)
+    monkeypatch.setattr(sys, "platform", "darwin")
+    preview_mac = runpy.run_path(str(packaging / "wattracker.spec"), init_globals=mac_globals)
+    preview_macos = tuple(map(int, preview_mac["app"].kwargs["info_plist"]["CFBundleVersion"].split(".")))
+    assert Version(preview_mac["project_version"]).dev == 10_001
+    monkeypatch.setattr(sys, "platform", "win32")
+    preview_connector = runpy.run_path(str(packaging / "wattracker-connector.spec"), init_globals=connector_globals)
+    preview_windows = preview_connector["_version_resource"]().kwargs["ffi"].kwargs["filevers"]
+    assert preview_windows[0:2] == (0, 2)
+    assert preview_macos > exact_macos
+
+    # A stable release tag added to this same SHA advances the build sequence.
+    _git(repo, "tag", "v1.0.10")
+    stable_id = _load_version_helper().git_build_id(repo)
+    monkeypatch.setattr(sys, "platform", "darwin")
+    stable_mac = runpy.run_path(str(packaging / "wattracker.spec"), init_globals=mac_globals)
+    assert stable_mac["project_version"] == "1.0.10"
+    stable_macos = tuple(map(int, stable_mac["app"].kwargs["info_plist"]["CFBundleVersion"].split(".")))
+    assert stable_macos > preview_macos
+    monkeypatch.setattr(sys, "platform", "win32")
+    stable_connector = runpy.run_path(str(packaging / "wattracker-connector.spec"), init_globals=connector_globals)
+    stable_windows = stable_connector["_version_resource"]().kwargs["ffi"].kwargs["filevers"]
+    assert stable_windows[0:2] == (1, 0)
+    assert stable_windows > preview_windows
+    assert stable_id > 0
 
 
 def test_rolling_publish_has_one_write_job_and_short_artifact_handoff():
@@ -239,7 +387,7 @@ def test_rolling_publish_has_one_write_job_and_short_artifact_handoff():
     assert '"$GITHUB_SHA" != "$main_sha_now"' in publisher
     assert '"$GITHUB_SHA" != "$preview_sha"' in publisher
     assert '"$GITHUB_SHA" != "$observed_preview_sha"' in publisher
-    assert '--force-with-lease=refs/tags/preview-latest:${observed_preview_ref}' in publisher
+    assert '--force-with-lease=refs/tags/preview-latest:${expected_preview_ref}' in publisher
     assert "gh release upload preview-latest" in publisher
     assert "gh release edit preview-latest" in publisher
     assert "--target \"$GITHUB_SHA\"" in publisher

@@ -41,17 +41,25 @@ machine: CI installs a pinned compiler itself (see **CI** below).
 
 ### Version
 
-Git tags are the only version source. `setuptools-scm` reads `vX.Y.Z` release
-tags and `preview-X.Y.Z` history tags; commits after a tag receive a PEP 440
+Git tags are the only version source. `setuptools-scm` reads stable and
+prerelease `vX.Y.Z[-aN|-bN|-rcN]` tags and matching `preview-X.Y.Z[-aN|-bN|-rcN]`
+history tags; commits after a tag receive a PEP 440
 version that includes their distance and Git node. The generated
 `wattracker/_scm_version.py` supplies `wattracker.__version__` and the connector
 version. `packaging/_version.py` reads the same setuptools-scm configuration for
 the wheel, PyInstaller specs and Inno Setup define.
 
 Inno receives the full PEP 440 version through `/DAppVersion=`. The macOS plist
-and Windows numeric resource fields normalize that value to numeric components
-because those formats do not accept PEP 440 suffixes. `OutputBaseFilename` is
-built from the Inno define, so the installer name and displayed version agree.
+uses `major.minor.build-id`, and Windows stores that same build ID across its
+last two 16-bit numeric fields; the first two fields are the release major and
+minor, each limited to 65,535. The ID counts reachable commits plus reachable
+valid desktop tags, so a stable tag added to the preview's commit advances the
+value, and the next commit advances it again. iOS and malformed tags do not
+count. The 32-bit ID
+caps at 4,294,967,295. Native version resources fail in a shallow checkout;
+the wheel's setuptools-scm version can still be built there, but release builds
+need full history (provided by CI). `OutputBaseFilename` is built from the Inno
+define, so the installer name and displayed version agree.
 
 ## Installer choices
 
@@ -194,8 +202,10 @@ loosened without a test change.
 
 On pushes to `main`, this workflow builds the Windows setup and connector in the
 existing `package-unsigned` job and builds the macOS DMG in `macos-preview`. The
-`publish-preview` job downloads only those three release payloads, writes
-`SHA256SUMS.txt`, and replaces the `preview-latest` pre-release. The
+`publish-preview` job downloads only those three release payloads and publishes
+unique assets named `desktop-preview-<sha12>-<run-id>-<attempt>-{macos.dmg,windows-setup.exe,connector.exe,SHA256SUMS.txt}`.
+It replaces the `preview-latest` pre-release and removes old assets only after
+the replacement assets are complete. The
 cross-runner handoff is required and retained for one day; if Actions artifact
 storage is unavailable, publication fails visibly.
 

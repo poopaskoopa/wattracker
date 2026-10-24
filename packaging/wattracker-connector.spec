@@ -114,7 +114,7 @@ def _version_resource():
         )
 
         version = _project_version()
-        numbers = _version_helper.windows_file_version(version)
+        numbers = _version_helper.windows_file_version(version, root=root)
         return VSVersionInfo(
             ffi=FixedFileInfo(filevers=numbers, prodvers=numbers),
             kids=[

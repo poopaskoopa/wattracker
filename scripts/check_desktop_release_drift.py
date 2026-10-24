@@ -11,7 +11,7 @@ from pathlib import Path
 
 REPOSITORY = "poopaskoopa/wattracker"
 _VERSION_TAG = re.compile(
-    r"^(?:v|preview-)\d+(?:\.\d+){1,2}(?:[-+][A-Za-z0-9.-]+)?$"
+    r"^(?:v|preview-)(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)(?:-(?:a|b|rc)\d+)?$"
 )
 
 
@@ -75,18 +75,31 @@ def _is_desktop_tag(tag: object) -> bool:
 
 
 def latest_published_release(root: Path) -> tuple[str, str]:
-    """Choose the newest published desktop release tag present in this checkout."""
+    """Choose the newest published desktop release by the commit it names.
+
+    GitHub preserves a release's original ``publishedAt`` when its assets and
+    tag are updated in place, so publication time cannot identify the newest
+    ``preview-latest`` build. Git's topological log orders descendant commits
+    before their ancestors and uses commit time to order independent history.
+    When multiple names point at the same newest commit, prefer the rolling
+    ``preview-latest`` name.
+    """
     try:
         records = json.loads(run_gh([
             "release", "list", "--repo", REPOSITORY, "--limit", "1000",
-            "--exclude-drafts", "--json", "tagName,publishedAt,isDraft",
+            "--exclude-drafts", "--json", "tagName,isDraft",
         ]))
     except json.JSONDecodeError as exc:
         raise DriftError("gh returned invalid release data") from exc
     if not isinstance(records, list):
         raise DriftError("gh returned invalid release data")
 
-    candidates = []
+    head_order = run_git(["rev-list", "--topo-order", "HEAD"], root)
+    if head_order is None:
+        raise DriftError("git returned an invalid HEAD history")
+    # Lower indexes are newer: --topo-order places descendants before parents.
+    commit_rank = {sha: index for index, sha in enumerate(head_order.splitlines())}
+    candidates: list[tuple[str, str, int]] = []
     for record in records:
         if not isinstance(record, dict) or not _is_desktop_tag(record.get("tagName")):
             continue
@@ -96,18 +109,19 @@ def latest_published_release(root: Path) -> tuple[str, str]:
         sha = local_tag_commit(tag, root)
         if sha is None:
             continue
-        if run_git(["merge-base", "--is-ancestor", sha, "HEAD"], root) is None:
+        rank = commit_rank.get(sha)
+        if rank is None:
             continue
-        published_at = record.get("publishedAt")
-        candidates.append((published_at if isinstance(published_at, str) else "", tag, sha))
+        candidates.append((tag, sha, rank))
 
     if not candidates:
         raise DriftError("no published desktop release tag (preview-latest or v*) is reachable from HEAD")
-    # The publisher replaces preview-latest on each main push, so its release
-    # publication time advances with the assets. This selects the actual newest
-    # published release, including a newer v* release that points at an older
-    # main commit.
-    _, tag, sha = max(candidates, key=lambda item: item[0])
+    # Git's order handles ancestry and commit-date tie breaking across
+    # independent branches; the rolling alias breaks a same-commit tie.
+    tag, sha, _ = max(
+        candidates,
+        key=lambda item: (-item[2], item[0] == "preview-latest", item[0]),
+    )
     return tag, sha
 
 

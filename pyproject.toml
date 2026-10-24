@@ -76,11 +76,10 @@ version_file = "wattracker/_scm_version.py"
 write_to_source = true
 
 [tool.setuptools_scm.tag]
-regex = "^(?:v|preview-)(?P<version>\\d+\\.\\d+\\.\\d+)$"
-strict = true
+regex = "^(?:v|preview-)(?P<version>(?:0|[1-9]\\d*)\\.(?:0|[1-9]\\d*)\\.(?:0|[1-9]\\d*)(?:-(?:a|b|rc)\\d+)?)$"
 
 [tool.setuptools_scm.scm.git]
-describe_command = "git describe --dirty --tags --long --match 'v[0-9]*' --match 'preview-[0-9]*'"
+describe_command = "python packaging/desktop_describe.py"
 
 [tool.setuptools.packages.find]
 include = ["wattracker*", "wattracker_connector*"]

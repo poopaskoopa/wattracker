@@ -172,7 +172,8 @@ def test_preview_publisher_skips_runs_older_than_main_or_preview_latest():
     assert '[[ "$GITHUB_SHA" != "$main_sha" ]]' in publisher
     assert 'git merge-base --is-ancestor "$GITHUB_SHA" "$preview_sha"' in publisher
     assert '! git merge-base --is-ancestor "$preview_sha" "$GITHUB_SHA"' in publisher
-    assert 'git push "--force-with-lease=refs/tags/preview-latest:${observed_preview_ref}"' in publisher
+    assert 'git push "--force-with-lease=refs/tags/preview-latest:${expected_preview_ref}"' in publisher
+    assert not re.search(r"(?m)^\s*git push --force(?:\s|$)", publisher)
     assert "gh release delete preview-latest" not in publisher
 
 
@@ -183,17 +184,31 @@ def test_preview_replacement_rechecks_freshness_and_leases_the_observed_tag():
     preview_check = replacement.index(
         'observed_preview_ref="$(git ls-remote --refs origin refs/tags/preview-latest | awk'
     )
+    existing_release_upload = replacement.index("gh release upload preview-latest")
+    first_release_create = replacement.index("gh release create preview-latest")
     lease_push = replacement.index(
-        'git push "--force-with-lease=refs/tags/preview-latest:${observed_preview_ref}"'
+        'git push "--force-with-lease=refs/tags/preview-latest:${expected_preview_ref}"'
     )
-    release_mutation = min(
-        replacement.index("gh release upload"),
-        replacement.index("gh release create"),
-        replacement.index("gh release edit"),
-    )
-    assert main_check < preview_check < lease_push < release_mutation
+    release_edit = replacement.index("gh release edit preview-latest")
+    cleanup = replacement.index("gh api \"repos/$GITHUB_REPOSITORY/releases/tags/preview-latest\"")
+    assert main_check < preview_check < existing_release_upload < lease_push < release_edit < cleanup
+    assert first_release_create < lease_push
+    assert "--clobber" not in replacement
+    assert "--draft --prerelease" in replacement
+    assert "--draft=false --prerelease" in replacement
     assert 'observed_preview_ref="$(git ls-remote' in replacement
     assert "--verify-tag" in replacement
+
+
+def test_preview_assets_are_commit_run_suffixed_and_checksums_cover_uploaded_names():
+    publisher = _workflow_job("publish-preview")
+    assert 'asset_suffix="${GITHUB_SHA:0:12}-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"' in publisher
+    assert 'dmg_asset="desktop-preview-${asset_suffix}-macos.dmg"' in publisher
+    assert 'setup_asset="desktop-preview-${asset_suffix}-windows-setup.exe"' in publisher
+    assert 'connector_asset="desktop-preview-${asset_suffix}-connector.exe"' in publisher
+    assert 'checksums_asset="desktop-preview-${asset_suffix}-SHA256SUMS.txt"' in publisher
+    assert 'sha256sum -- "$dmg_asset" "$setup_asset" "$connector_asset"' in publisher
+    assert 'assets=(release/desktop-preview-"$asset_suffix"-*)' in publisher
 
 
 def test_push_is_filtered_to_main_so_a_commit_runs_once():

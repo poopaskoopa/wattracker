@@ -85,25 +85,40 @@ def test_docs_only_commits_after_release_do_not_cause_drift(tmp_path, monkeypatc
     assert result["desktop_commits"] == 0
 
 
-def test_latest_published_release_wins_when_two_tags_point_at_same_commit(tmp_path, monkeypatch):
+def test_rolling_alias_wins_when_tags_point_at_the_same_commit(tmp_path, monkeypatch):
     root, _, _ = _repo(tmp_path)
+    _git(root, "tag", "v0.1.1")
     _releases(monkeypatch, [
-        {"tagName": "v0.1.0", "publishedAt": "2026-01-01T00:00:00Z", "isDraft": False},
-        {"tagName": "preview-latest", "publishedAt": "2026-01-02T00:00:00Z", "isDraft": False},
+        {"tagName": "v0.1.1", "publishedAt": "2026-01-04T00:00:00Z", "isDraft": False},
+        {"tagName": "preview-latest", "publishedAt": "2026-01-01T00:00:00Z", "isDraft": False},
     ])
 
     assert drift.latest_published_release(root)[0] == "preview-latest"
 
 
-def test_latest_published_release_uses_publication_time_not_commit_distance(tmp_path, monkeypatch):
-    root, version_sha, _ = _repo(tmp_path)
+def test_latest_release_uses_commit_ancestry_when_preview_published_at_is_fixed(tmp_path, monkeypatch):
+    root, version_sha, preview_sha = _repo(tmp_path)
     _git(root, "tag", "v0.2.0", version_sha)
     _releases(monkeypatch, [
-        {"tagName": "preview-latest", "publishedAt": "2026-01-03T00:00:00Z", "isDraft": False},
+        # Editing preview-latest in place preserves its first publication date,
+        # even though it now points at a later commit than this stable release.
+        {"tagName": "preview-latest", "publishedAt": "2026-01-01T00:00:00Z", "isDraft": False},
         {"tagName": "v0.2.0", "publishedAt": "2026-01-04T00:00:00Z", "isDraft": False},
     ])
 
-    assert drift.latest_published_release(root)[0] == "v0.2.0"
+    assert drift.latest_published_release(root) == ("preview-latest", preview_sha)
+
+
+@pytest.mark.parametrize("tag", ["v0.4.0-rc1", "preview-0.4.0-rc1"])
+def test_desktop_prerelease_tags_are_accepted_but_ios_tags_are_not(tmp_path, monkeypatch, tag):
+    root, _, _ = _repo(tmp_path)
+    _git(root, "tag", tag)
+    _releases(monkeypatch, [
+        {"tagName": "ios-v0.9.0-rc1", "publishedAt": "2026-01-04T00:00:00Z", "isDraft": False},
+        {"tagName": tag, "publishedAt": "2026-01-01T00:00:00Z", "isDraft": False},
+    ])
+
+    assert drift.latest_published_release(root)[0] == tag
 
 
 def test_release_with_tag_missing_from_local_checkout_is_skipped(tmp_path, monkeypatch):

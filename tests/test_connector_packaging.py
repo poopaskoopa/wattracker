@@ -221,11 +221,12 @@ def test_the_version_helper_is_shared_with_the_app_spec():
     # A Git-derived PEP 440 version keeps its commit identity in Inno, while
     # Windows resources use four numeric fields accepted by PyInstaller.
     version = "0.1.0.post1.dev29+g25e7220"
-    assert helper.windows_file_version(version) == (0, 1, 29, 0)
-    assert "windows_file_version(version)" in SPEC
+    build_id = helper.git_build_id(ROOT)
+    assert helper.windows_file_version(version, root=ROOT) == (0, 1, build_id >> 16, build_id & 0xFFFF)
+    assert "windows_file_version(version, root=root)" in SPEC
     assert "macos_short_version(project_version)" in APP_SPEC
     assert helper.macos_short_version("0.1.0+29.g25e7220") == "0.1.0"
-    assert helper.macos_build_version("0.1.0+29.g25e7220") == "0.1.29"
+    assert helper.macos_build_version("0.1.0+29.g25e7220", root=ROOT) == f"0.1.{build_id}"
 
 
 def test_optional_halves_are_collected_best_effort():
