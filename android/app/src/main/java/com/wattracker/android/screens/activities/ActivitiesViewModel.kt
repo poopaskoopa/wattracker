@@ -50,6 +50,17 @@ data class ActivitiesUiState(
  * changed identity (pair, sign-out, removal) clears the previous rider's
  * rides and supersedes a load in flight, and a same-identity resume joins
  * the walk in flight rather than restarting it from page one.
+ *
+ * Memory reads #197's "paged or lazily loaded -- do not hold every ride in
+ * memory" the way iOS's `ActivitiesModel` does: the walk's summaries land
+ * in one list and the *rendering* is what is lazy, `ActivitiesScreen`'s
+ * `LazyColumn` building only the visible rows. What is held is bounded by
+ * the walk -- `CloudSession.maximumPages` pages of `COLLECTION_PAGE_LIMIT`
+ * objects on the cloud, one rider's history on the local backend's
+ * `/api/activities` -- and a `RideSummary` is an id, its summary and two
+ * formatted strings. What the criterion rules out is a screen that renders
+ * a rider's whole history at once, and it does not: the 300-ride device
+ * check measured +4 MB of TOTAL PSS across a full scroll.
  */
 class ActivitiesViewModel(
     private val readModel: ReadSession,
@@ -284,6 +295,15 @@ class ActivitiesViewModel(
                         throttledRetrySeconds = retrySec,
                         // A Waking failure has its own localized notice in the
                         // screen; leave error null and let the screen show it.
+                        // The others bring their own rider-facing sentence --
+                        // `Failure.Offline` is "No connection", `Http` is
+                        // "HTTP 500 from /api/activities" -- which is what iOS
+                        // puts in this spot through `failure.description`. Only
+                        // an exception no arm mapped (a raw transport or Room
+                        // failure) arrives with engine text, as iOS's
+                        // `String(describing: error)` does there; replacing
+                        // that with one shared notice on all three screens is a
+                        // follow-up, not this PR's change.
                         error = if (waking || retrySec != null) null else e.message,
                     )
                 }

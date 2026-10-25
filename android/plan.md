@@ -1907,6 +1907,40 @@ the "No recorded streams" state, not a failure):
 Still owed with a real device / the owner's review: the paired tablet
   data check and a physical-device no-jank pass.
 
+**PR #450 review, round 4 (2026-10-24).** The owner's re-review of `9e425ea`
+found no blockers and left two non-blocking nits. Both are answered in prose:
+the head this round carries comments only, no behaviour change.
+
+- **The list holds every ride summary in memory** — #197's "paged or lazily
+  loaded — do not hold every ride in memory". It does, and the PR body now
+  says so instead of leaving the reading to be inferred. The *rendering* is
+  what is lazy (`ActivitiesScreen`'s `LazyColumn` builds only the visible
+  rows); the model holds one walk's `RideSummary` values — bounded on the
+  cloud by `CloudSession.maximumPages` (50) ×
+  `CloudClient.COLLECTION_PAGE_LIMIT` (100) objects, and on the local
+  backend by one rider's history — while the per-ride detail/stream cache is
+  bounded separately at 8 rides. That is the reading iOS's `ActivitiesModel`
+  takes (it holds `rides` too), and the criterion's real evidence — a long
+  scroll with no unbounded growth — is the 300-ride `dumpsys meminfo` check
+  (+4 MB TOTAL PSS). Recorded in `ActivitiesViewModel`'s KDoc, so the
+  reading lives with the code and not only in the PR.
+- **`e.message` puts raw exception text on screen.** Left as it is, on
+  purpose: every failure these read paths raise carries a rider-facing
+  sentence of its own (`Failure.Offline` → "No connection",
+  `LocalClientException.Http` → "HTTP 500 from /api/activities"), which is
+  what iOS puts in the same two places through `failure.description`, and
+  iOS's fallback for an unmapped error is `String(describing: error)`. Only
+  an exception no arm mapped — a raw transport or Room failure — brings
+  engine text. Replacing that means new copy in three screens
+  (`DashboardViewModel`, already on `main`, does the same thing) plus a
+  `docs/mobile-parity.md` cell: a follow-up, not a nit fold-in. Both sites
+  now state the choice in a comment.
+
+**Verification (2026-10-24).** Comments only, CI trio re-run green —
+`:app:assembleDebug`, `:app:testDebugUnitTest` (237 passed, 0 failed) and
+`:app:assembleRelease -PallowPlaceholderHost`. The emulator items round 3
+owed are still owed.
+
 ## Step 6 — Calendar + Volume (issue #198)
 
 **Preamble — server route:**

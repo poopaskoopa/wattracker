@@ -293,6 +293,14 @@ class RideDetailViewModel(
      * previous data), a waking cloud shows the waking notice, a throttle
      * the retry notice, and everything else its message on the side that
      * failed.
+     *
+     * "Its message" is a sentence, not a stack trace: every failure this
+     * read path raises carries a rider-facing one of its own
+     * (`Failure.Offline` is "No connection", `Http` is "HTTP 500 from
+     * /api/activity/17"), which is what iOS renders in the same
+     * place through `failure.description`. The `simpleName` arm covers only
+     * an exception carrying no message at all, where iOS prints
+     * `String(describing: error)`.
      */
     private fun applyFailure(e: Throwable, forStreams: Boolean) {
         when {
@@ -335,6 +343,7 @@ class RideDetailViewModel(
                 if (throttled != null) {
                     _uiState.update { it.copy(throttledRetrySeconds = throttled) }
                 } else {
+                    // The failure's own sentence -- see the KDoc above.
                     val message = e.message ?: e::class.simpleName
                     _uiState.update {
                         if (forStreams) it.copy(streamsError = message) else it.copy(detailError = message)
