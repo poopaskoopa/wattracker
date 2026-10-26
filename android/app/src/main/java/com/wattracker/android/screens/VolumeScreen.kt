@@ -135,25 +135,15 @@ fun VolumeScreen(
         onDispose { lifecycleOwner.lifecycle.removeObserver(observer) }
     }
 
+    // The scaffold paints the title and subtitle; the content below adds
+    // only the state chrome (offline badge, waking, throttle) and then the
+    // chart, tiles and windows -- no second "Volume" heading.
     ScrollableScreenScaffold(
         title = stringResource(R.string.destination_volume),
         subtitle = stringResource(R.string.screen_volume_subtitle),
         isRefreshing = uiState.isRefreshing,
         onRefresh = { viewModel.pullToRefresh() },
     ) {
-        Row(verticalAlignment = Alignment.CenterVertically) {
-            Text(
-                text = stringResource(R.string.destination_volume),
-                style = TextStyle(fontSize = 20.sp, fontWeight = FontWeight.SemiBold, color = Palette.textBright),
-            )
-            Spacer(modifier = Modifier.weight(1f))
-            if (uiState.data?.source == CloudSnapshot.Source.cache) {
-                Text(
-                    text = stringResource(R.string.activities_offline_badge),
-                    style = TextStyle(fontSize = 12.sp, fontWeight = FontWeight.Medium, color = Palette.muted),
-                )
-            }
-        }
         if (uiState.isWaking) {
             Text(
                 text = stringResource(R.string.dashboard_waking_title),

@@ -177,8 +177,13 @@ fun CalendarScreen(
             PullToRefreshBox(
                 isRefreshing = uiState.isRefreshing,
                 onRefresh = { viewModel.pullToRefresh() },
+                // 520dp on a tablet is not styling: seven detailed cells
+                // (number, ooto/race marks, phase, counts) need ~64dp each,
+                // and the grid is the widest fixed geometry in the app. A
+                // landscape phone gets 400dp and honestly falls back to the
+                // compact cell -- the width fact is the cell's, not a flag.
                 modifier = Modifier
-                    .width(if (configuration.smallestScreenWidthDp >= 600) 460.dp else 400.dp)
+                    .width(if (configuration.smallestScreenWidthDp >= 600) 520.dp else 400.dp)
                     .fillMaxHeight(),
             ) {
                 Column(
@@ -192,6 +197,7 @@ fun CalendarScreen(
                         uiState = uiState,
                         viewModel = viewModel,
                         onNavigateToSettings = onNavigateToSettings,
+                        showsOwnHeader = true,
                     )
                 }
             }
@@ -232,6 +238,9 @@ fun CalendarScreen(
                 uiState = uiState,
                 viewModel = viewModel,
                 onNavigateToSettings = onNavigateToSettings,
+                // The scaffold already paints "Calendar" and its subtitle;
+                // the content adds only the state chrome below it.
+                showsOwnHeader = false,
             )
         }
 
@@ -272,29 +281,47 @@ private fun CalendarContent(
     uiState: CalendarUiState,
     viewModel: CalendarViewModel,
     onNavigateToSettings: (() -> Unit)?,
+    showsOwnHeader: Boolean,
 ) {
+    val isCached = uiState.data?.source == CloudSnapshot.Source.cache
     Column(verticalArrangement = Arrangement.spacedBy(12.dp), modifier = Modifier.fillMaxWidth()) {
-        Row(verticalAlignment = Alignment.CenterVertically) {
-            Text(
-                text = stringResource(R.string.destination_calendar),
-                style = TextStyle(fontSize = 20.sp, fontWeight = FontWeight.SemiBold, color = Palette.textBright),
-            )
-            Spacer(modifier = Modifier.weight(1f))
-            if (uiState.data?.source == CloudSnapshot.Source.cache) {
+        if (showsOwnHeader) {
+            Row(verticalAlignment = Alignment.CenterVertically) {
                 Text(
-                    text = stringResource(R.string.activities_offline_badge),
-                    style = TextStyle(fontSize = 12.sp, fontWeight = FontWeight.Medium, color = Palette.muted),
+                    text = stringResource(R.string.destination_calendar),
+                    style = TextStyle(fontSize = 20.sp, fontWeight = FontWeight.SemiBold, color = Palette.textBright),
                 )
+                Spacer(modifier = Modifier.weight(1f))
+                if (isCached) {
+                    Text(
+                        text = stringResource(R.string.activities_offline_badge),
+                        style = TextStyle(fontSize = 12.sp, fontWeight = FontWeight.Medium, color = Palette.muted),
+                    )
+                }
             }
+        } else if (isCached) {
+            Text(
+                text = stringResource(R.string.activities_offline_badge),
+                style = TextStyle(fontSize = 12.sp, fontWeight = FontWeight.Medium, color = Palette.muted),
+                modifier = Modifier.fillMaxWidth(),
+                textAlign = TextAlign.End,
+            )
         }
-        Text(
-            text = if (uiState.data != null && uiState.data.asOf > 0) {
-                stringResource(R.string.calendar_updated, updatedAt(uiState.data.asOf))
-            } else {
-                stringResource(R.string.screen_calendar_subtitle)
-            },
-            style = TextStyle(fontSize = 14.sp, color = Palette.muted),
-        )
+        if (uiState.data != null) {
+            Text(
+                text = if (uiState.data.asOf > 0) {
+                    stringResource(R.string.calendar_updated, updatedAt(uiState.data.asOf))
+                } else {
+                    stringResource(R.string.screen_calendar_subtitle)
+                },
+                style = TextStyle(fontSize = 14.sp, color = Palette.muted),
+            )
+        } else if (showsOwnHeader) {
+            Text(
+                text = stringResource(R.string.screen_calendar_subtitle),
+                style = TextStyle(fontSize = 14.sp, color = Palette.muted),
+            )
+        }
         if (uiState.isWaking) {
             Text(
                 text = stringResource(R.string.dashboard_waking_title),

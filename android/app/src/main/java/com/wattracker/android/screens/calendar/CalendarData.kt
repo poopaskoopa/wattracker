@@ -52,9 +52,16 @@ data class CalendarDayEntry(
     val workoutCount: Int get() = workouts.size
     val activityCount: Int get() = activities.size
 
-    /** Whether this cell shows anything beyond its number. */
+    /**
+     * Whether this cell shows anything beyond its number. Phase is
+     * deliberately not in here, matching iOS: a plan window stamps a phase
+     * on every day it covers, so counting phase as content would light up
+     * the whole month, and the accent border would stop meaning that
+     * something happened or is planned on the day. The phase still shows
+     * in the cell and in the day view -- it is context, not content.
+     */
     val hasContent: Boolean
-        get() = ooto || phase != null || race != null || workouts.isNotEmpty() || activities.isNotEmpty()
+        get() = ooto || race != null || workouts.isNotEmpty() || activities.isNotEmpty()
 }
 
 // MARK: - The route's data

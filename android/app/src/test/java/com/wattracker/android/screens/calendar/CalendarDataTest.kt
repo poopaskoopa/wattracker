@@ -158,6 +158,22 @@ class CalendarDataTest {
     }
 
     @Test
+    fun phaseAloneIsContextNotContent() {
+        // A plan window stamps its phase on every day it covers. If that
+        // counted as content, the accent border would light up the whole
+        // month and stop meaning anything -- iOS's rule, ported.
+        val data = CalendarData(
+            calendarSnapshot(
+                listOf(dayItem("p", "2026-05-20", phase = "build")),
+            ),
+        )
+        val day = data.days.single()
+        assertEquals("build", day.phase)
+        assertFalse(day.hasContent)
+        assertFalse("the month stays a no-data month", data.hasContent)
+    }
+
+    @Test
     fun ootoAndPhaseAccumulateAcrossParts() {
         val data = CalendarData(
             calendarSnapshot(
