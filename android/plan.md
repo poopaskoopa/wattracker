@@ -1943,6 +1943,8 @@ owed are still owed.
 
 ## Step 6 — Calendar + Volume (issue #198)
 
+**Implemented on `feature/android-client-6` (PR #456).** The read seam gained month overloads (defaults ignore the month: the cloud feed is month-agnostic; only `LocalClient` fetches per-month, drops the desktop's adjacent-month week cells and accumulates visited months). `CalendarMonth`, `CalendarData`/`CalendarViewModel` and `CalendarScreen` landed (two panes on wide viewports, bottom sheet in portrait; ride rows reuse `activities/detail/<id>`, so the "Ride graphs" parity row holds by reuse), as did `VolumeData`/`VolumeViewModel` and `VolumeScreen`. The iOS twin's rules are ported with its tests: part-merge on date, one join per linked ride, currentFTP precedence, the 512-block profile validation, half-to-even rounding, densified zero weeks, YTD by the bucket's Monday year, change-not-out-of-zero. `calendar_grid_v1.json` finally has its Kotlin reader (`CalendarGridVectorTest`). 64 new JVM tests (301 green); debug and release assemble. **Owed:** the emulator pass below - month grid on phone landscape and tablet portrait, day detail on both idioms, volume numbers cross-checked by eye against the desktop web UI, both backends.
+
 **Preamble — server route:**
 The read-only route `GET /api/calendar?year=&month=` exists in `wattracker/server.py` (since commit `32444f7`), returning `build_calendar_month(...)` as JSON (`{"weeks": ...}`). The app's local calendar adapter is written against its test-pinned shape.
 that a history cutoff hides pre-cutoff activities. Full suite green per
