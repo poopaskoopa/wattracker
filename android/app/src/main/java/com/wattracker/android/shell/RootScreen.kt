@@ -330,8 +330,22 @@ private fun AppNavHost(
                 onBack = { navController.popBackStack() },
             )
         }
-        composable(Destination.Calendar.route) { CalendarScreen() }
-        composable(Destination.Volume.route) { VolumeScreen() }
+        composable(Destination.Calendar.route) {
+            CalendarScreen(
+                // The day detail's ride rows open the one ride detail screen
+                // the app has -- the same destination the activities list
+                // pushes, so the calendar owes no second detail to keep in
+                // sync, and `Destination.fromRoute` keeps Activities
+                // highlighted while the rider reads a ride from the plan.
+                onOpenRide = { activityId ->
+                    navController.navigate("${Destination.Activities.route}/detail/$activityId")
+                },
+                onNavigateToSettings = { navigateTo(navController, Destination.Settings) },
+            )
+        }
+        composable(Destination.Volume.route) {
+            VolumeScreen(onNavigateToSettings = { navigateTo(navController, Destination.Settings) })
+        }
         composable(Destination.Settings.route) { SettingsScreen() }
     }
 }

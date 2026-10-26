@@ -1,0 +1,189 @@
+package com.wattracker.android.screens.volume
+
+import com.wattracker.android.R
+import com.wattracker.android.cloud.CloudPayload
+import com.wattracker.android.cloud.CloudSnapshot
+import com.wattracker.android.cloud.VolumeWeek
+import com.wattracker.android.cloud.isoDateOrNull
+import java.time.LocalDate
+import java.util.Locale
+
+/**
+ * The volume route read for the screen -- a line-for-line port of the iOS
+ * `VolumeMetric` / `VolumeRange` / `VolumeSummary` / `VolumeData` block from
+ * `MobileScreenData.swift`.
+ *
+ * Weeks arrive as the desktop publishes them: Monday-anchored, rider-local,
+ * already bucketed. Nothing here re-buckets: dates are the published ones,
+ * and a client-side re-bucket is a day/week-boundary bug waiting to happen
+ * (it already happened once on the desktop side).
+ */
+
+/** The four published weekly totals. */
+enum class VolumeMetric(val titleRes: Int, val unit: String) {
+    Hours(R.string.volume_metric_hours, "h"),
+    Tss(R.string.volume_metric_tss, "TSS"),
+    DistanceKm(R.string.volume_metric_distance, "km"),
+    Calories(R.string.volume_metric_calories, "kcal"),
+    ;
+
+    fun valueFrom(week: VolumeWeek): Double = when (this) {
+        VolumeMetric.Hours -> week.hours ?: 0.0
+        VolumeMetric.Tss -> week.tss ?: 0.0
+        VolumeMetric.DistanceKm -> week.distanceKm ?: 0.0
+        VolumeMetric.Calories -> week.calories ?: 0.0
+    }
+}
+
+/** The windows the chart and the tiles are cut on. */
+enum class VolumeRange(val titleRes: Int, val shortTitleRes: Int, val weeks: Int?) {
+    Last4(R.string.volume_range_last_4, R.string.volume_range_last_4_short, 4),
+    Last12(R.string.volume_range_last_12, R.string.volume_range_last_12_short, 12),
+    YearToDate(R.string.volume_range_ytd, R.string.volume_range_ytd_short, null),
+    ;
+}
+
+/** The totals of one window of weeks. */
+data class VolumeSummary(
+    val hours: Double,
+    val tss: Double,
+    val distanceKm: Double,
+    val calories: Double,
+) {
+    constructor(weeks: List<VolumeWeek>) : this(
+        hours = weeks.sumOf { it.hours ?: 0.0 },
+        tss = weeks.sumOf { it.tss ?: 0.0 },
+        distanceKm = weeks.sumOf { it.distanceKm ?: 0.0 },
+        calories = weeks.sumOf { it.calories ?: 0.0 },
+    )
+
+    fun valueFor(metric: VolumeMetric): Double = when (metric) {
+        VolumeMetric.Hours -> hours
+        VolumeMetric.Tss -> tss
+        VolumeMetric.DistanceKm -> distanceKm
+        VolumeMetric.Calories -> calories
+    }
+}
+
+/**
+ * Volume objects prepared for the chart and the summary tiles.
+ */
+data class VolumeData(
+    val weeks: List<VolumeWeek>,
+    /**
+     * The weeks with the gaps filled: the server omits weeks with no rides,
+     * and a zero bucket keeps the chart's spacing and the rolling summaries
+     * honest about rest weeks.
+     */
+    val denseWeeks: List<VolumeWeek>,
+    val source: CloudSnapshot.Source,
+    val asOf: Long,
+) {
+    constructor(snapshot: CloudSnapshot) : this(
+        weeks = parse(snapshot),
+        denseWeeks = densify(parse(snapshot)),
+        source = snapshot.source,
+        asOf = snapshot.asOf,
+    )
+
+    companion object {
+        private fun parse(snapshot: CloudSnapshot): List<VolumeWeek> {
+            // One object per week is the reconciled normal; if an older cache
+            // holds duplicates, keep the last rather than drawing the week
+            // twice (the iOS reader's rule).
+            val byStart = LinkedHashMap<String, VolumeWeek>()
+            for (item in snapshot.items) {
+                if (item.deleted) continue
+                val week = (item.payload as? CloudPayload.VolumeWeek)?.value ?: continue
+                // A week start this client cannot read belongs to no bucket.
+                val start = week.weekStart?.let { isoDateOrNull(it) } ?: continue
+                byStart[start.toString()] = week
+            }
+            return byStart.values.sortedBy { it.weekStart ?: "" }
+        }
+
+        private fun densify(weeks: List<VolumeWeek>): List<VolumeWeek> {
+            val first = weeks.firstOrNull()?.weekStart?.let { isoDateOrNull(it) } ?: return emptyList()
+            val last = weeks.lastOrNull()?.weekStart?.let { isoDateOrNull(it) } ?: return emptyList()
+            val byStart = LinkedHashMap<String, VolumeWeek>()
+            for (week in weeks) {
+                // A reconciled snapshot normally has one object per week. If
+                // an older cache contains duplicates, keep the last one
+                // rather than wedging the chart.
+                week.weekStart?.let { byStart[it] = week }
+            }
+            val output = mutableListOf<VolumeWeek>()
+            var date = first
+            var steps = 0
+            while (!date.isAfter(last) && steps < 5000) {
+                val start = date.toString()
+                output.add(
+                    byStart[start] ?: VolumeWeek(start, hours = 0.0, tss = 0.0, distanceKm = 0.0, calories = 0.0),
+                )
+                date = date.plusDays(7)
+                steps += 1
+            }
+            return output
+        }
+    }
+
+    /** The window's weeks: the last N dense weeks, or this year's buckets. */
+    fun weeksFor(range: VolumeRange, referenceDate: LocalDate = LocalDate.now()): List<VolumeWeek> {
+        val dense = denseWeeks
+        if (dense.isEmpty()) return emptyList()
+        return when (range) {
+            VolumeRange.Last4, VolumeRange.Last12 -> dense.takeLast(range.weeks ?: 0)
+            VolumeRange.YearToDate -> {
+                // Volume is published as Monday buckets. A bucket belongs to
+                // the year of its Monday, so the first partial week of a new
+                // year is intentionally kept with the prior year's bucket.
+                val year = referenceDate.year
+                dense.filter { week ->
+                    isoDateOrNull(week.weekStart)?.year == year
+                }
+            }
+        }
+    }
+
+    /**
+     * The window of the same size immediately before [range], when both
+     * windows would be complete; empty otherwise, because an equal-length
+     * comparison across an incomplete span is noise.
+     */
+    fun previousWeeks(range: VolumeRange): List<VolumeWeek> {
+        val count = range.weeks ?: return emptyList()
+        val dense = denseWeeks
+        if (dense.size < count * 2) return emptyList()
+        val end = dense.size - count
+        return dense.subList(end - count, end)
+    }
+
+    fun summaryFor(range: VolumeRange, referenceDate: LocalDate = LocalDate.now()): VolumeSummary =
+        VolumeSummary(weeksFor(range, referenceDate))
+
+    /**
+     * The selected metric's change against the previous equal window, or
+     * null when there is no previous window to compare against -- a change
+     * out of zero is not a percentage.
+     */
+    fun change(metric: VolumeMetric, range: VolumeRange, referenceDate: LocalDate = LocalDate.now()): Double? {
+        val previous = VolumeSummary(previousWeeks(range)).valueFor(metric)
+        if (previous <= 0) return null
+        val current = summaryFor(range, referenceDate).valueFor(metric)
+        return (current - previous) / previous
+    }
+}
+
+/** The volume numbers, formatted the iOS way: one decimal for the measured totals, none for the counted ones. */
+object VolumeFormat {
+
+    fun value(value: Double, metric: VolumeMetric): String {
+        val text = when (metric) {
+            VolumeMetric.Hours, VolumeMetric.DistanceKm -> String.format(Locale.US, "%.1f", value)
+            else -> String.format(Locale.US, "%.0f", value)
+        }
+        return "$text ${metric.unit}"
+    }
+
+    fun percent(value: Double): String = String.format(Locale.US, "%+.0f%%", value * 100)
+}
