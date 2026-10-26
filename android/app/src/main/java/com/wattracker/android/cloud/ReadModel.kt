@@ -53,6 +53,14 @@ class ReadModel(
 
     override suspend fun load(route: CloudRoute): CloudSnapshot = active().load(route)
 
+    // The month overloads go to whichever backend is active: only the local
+    // adapter gives the month meaning (the cloud feed spans every month and
+    // its default ignores it), but which adapter that is is exactly what the
+    // seam is here to hide from the screens.
+    override suspend fun cached(route: CloudRoute, month: CalendarMonth?): CloudSnapshot? = active().cached(route, month)
+
+    override suspend fun load(route: CloudRoute, month: CalendarMonth?): CloudSnapshot = active().load(route, month)
+
     override suspend fun activityDetail(activityId: Int): ActivityDetail = active().activityDetail(activityId)
 
     override suspend fun activityStreams(activityId: Int): ActivityStreams = active().activityStreams(activityId)

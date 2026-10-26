@@ -6,8 +6,6 @@ import com.wattracker.android.json.opt
 import com.wattracker.android.json.optArray
 import com.wattracker.android.json.optString
 import java.net.URI
-import java.util.Calendar
-import java.util.TimeZone
 import kotlinx.coroutines.CancellationException
 
 /**
@@ -69,6 +67,17 @@ class LocalClient(
     @Volatile private var cachedState: CloudSnapshot? = null
     @Volatile private var sessionIdentity = 0
 
+    /**
+     * The calendar rows read so far, all months accumulated. The desktop
+     * answers `/api/calendar` one month at a time, so this is what lets a
+     * month already visited survive a visit to the next one (and back) --
+     * the cloud's Room cache gets that accumulation for free from its one
+     * whole-feed collection; here the adapter accumulates it.
+     */
+    @Volatile private var cachedCalendar: CloudSnapshot? = null
+    // The per-month views derived from [cachedCalendar]. Cleared with it.
+    private val calendarCache = HashMap<CalendarMonth, CloudSnapshot>()
+
     val credentials: LocalCredentials?
         get() = credentialsProvider()
 
@@ -104,6 +113,8 @@ class LocalClient(
     fun reset() {
         activeSession = null
         cachedState = null
+        cachedCalendar = null
+        synchronized(calendarCache) { calendarCache.clear() }
         lastSuccessfulRead = null
         // New credential (or none): anything read under the old one is stale.
         sessionIdentity += 1
@@ -123,8 +134,26 @@ class LocalClient(
         } else null
     }
 
-    override suspend fun cached(route: CloudRoute): CloudSnapshot? {
-        return cachedState?.takeIf { it.route == route }
+    override suspend fun cached(route: CloudRoute): CloudSnapshot? =
+        cached(route, if (route == CloudRoute.Calendar) CalendarMonth.current(clock()) else null)
+
+    /**
+     * The month-viewed cache, mirroring the iOS `LocalBackend.cached(_:month:)`:
+     * a calendar read is one month, so a screen asking for a month gets that
+     * month's rows, and asking with no month means asking for the month the
+     * rider is in right now. An empty month is no cache at all -- the screens
+     * show "no data" honestly rather than a blank grid that looks synced.
+     */
+    override suspend fun cached(route: CloudRoute, month: CalendarMonth?): CloudSnapshot? {
+        if (route != CloudRoute.Calendar) return cachedState?.takeIf { it.route == route }
+        val wanted = month ?: CalendarMonth.current(clock())
+        synchronized(calendarCache) { calendarCache[wanted] }?.let { return it }
+        val accumulated = cachedCalendar ?: return null
+        val items = accumulated.items.filter { calendarMonthOf(it) == wanted }
+        if (items.isEmpty()) return null
+        val view = CloudSnapshot(CloudRoute.Calendar, accumulated.revision, items, accumulated.source, accumulated.asOf)
+        synchronized(calendarCache) { calendarCache[wanted] = view }
+        return view
     }
 
     /**
@@ -190,9 +219,13 @@ class LocalClient(
         return cookieValue
     }
 
-    override suspend fun load(route: CloudRoute): CloudSnapshot {
+    override suspend fun load(route: CloudRoute): CloudSnapshot =
+        load(route, if (route == CloudRoute.Calendar) CalendarMonth.current(clock()) else null)
+
+    override suspend fun load(route: CloudRoute, month: CalendarMonth?): CloudSnapshot {
         val cred = requireCredentials()
         val validUrl = validateServerUrl(cred.serverUrl, isDebug)
+        val requestedMonth = if (route == CloudRoute.Calendar) month ?: CalendarMonth.current(clock()) else null
 
         val items = when (route) {
             CloudRoute.Dashboard -> loadDashboard(cred, validUrl)
@@ -200,8 +233,8 @@ class LocalClient(
             CloudRoute.Curve -> loadCurve(cred, validUrl)
             CloudRoute.Profile -> loadProfile(cred, validUrl)
             CloudRoute.Activities -> loadActivities(cred, validUrl)
-            CloudRoute.Calendar -> loadCalendar(cred, validUrl)
-            CloudRoute.Races -> loadRaces(cred, validUrl)
+            CloudRoute.Calendar -> loadCalendar(cred, validUrl, requestedMonth!!)
+            CloudRoute.Races -> loadRaces(cred, validUrl, CalendarMonth.current(clock()))
         }
 
         lastSuccessfulRead = clock()
@@ -212,7 +245,7 @@ class LocalClient(
             source = CloudSnapshot.Source.network,
             asOf = clock(),
         )
-        cachedState = snapshot
+        if (requestedMonth != null) storeCalendar(snapshot, requestedMonth) else cachedState = snapshot
         return snapshot
     }
 
@@ -352,27 +385,67 @@ class LocalClient(
         }
     }
 
-    private suspend fun loadCalendar(cred: LocalCredentials, baseUrl: String): List<CloudItem> {
-        val cal = Calendar.getInstance(TimeZone.getDefault())
-        val year = cal.get(Calendar.YEAR)
-        val month = cal.get(Calendar.MONTH) + 1
-        val json = getJson(cred, baseUrl, "/api/calendar", mapOf("year" to year.toString(), "month" to month.toString()))
+    /**
+     * One month of the desktop calendar. The desktop sends full
+     * Monday-to-Sunday weeks -- the grid, including the adjacent months'
+     * real dates -- and the month addressed by the request is kept, the way
+     * the iOS local backend keeps it: the screen's own grid logic re-supplies
+     * the edge cells from the months it has already visited, so storing them
+     * here too would double the day's rows when that month is asked for.
+     */
+    private suspend fun loadCalendar(cred: LocalCredentials, baseUrl: String, month: CalendarMonth): List<CloudItem> {
+        val json = getJson(
+            cred, baseUrl, "/api/calendar",
+            mapOf("year" to month.year.toString(), "month" to month.month.toString()),
+        )
         val weeksArr = json.optArray("weeks") ?: return emptyList()
         val days = mutableListOf<CloudItem>()
-        var dayIdx = 0
         weeksArr.forEach { weekElem ->
             (weekElem as? JsonValue.Array)?.values?.forEach { dayElem ->
                 (dayElem as? JsonValue.Object)?.let { dayObj ->
                     val cd = CalendarDay.fromJson(dayObj)
-                    days.add(CloudItem("calendar-day-${cd.date ?: dayIdx++}", CloudKind.CalendarDay, 1, deleted = false, payload = CloudPayload.CalendarDay(cd)))
+                    val date = cd.date ?: return@let
+                    if (CalendarMonth.fromISODate(date) != month) return@let
+                    days.add(
+                        CloudItem(
+                            "calendar-$date", CloudKind.CalendarDay, 1,
+                            deleted = false, payload = CloudPayload.CalendarDay(cd),
+                        ),
+                    )
                 }
             }
         }
         return days
     }
 
-    private suspend fun loadRaces(cred: LocalCredentials, baseUrl: String): List<CloudItem> {
-        val calDays = loadCalendar(cred, baseUrl)
+    /**
+     * Merge one month's read into the accumulated calendar: the months that
+     * did not take part in this request are kept exactly as they were, this
+     * month's rows are replaced by what just arrived, and only this month's
+     * derived view is refreshed (the iOS `LocalBackend.store` rule).
+     */
+    private fun storeCalendar(monthSnapshot: CloudSnapshot, month: CalendarMonth) {
+        val existing = cachedCalendar?.items ?: emptyList()
+        val retained = existing.filter { calendarMonthOf(it) != month }
+        cachedCalendar = CloudSnapshot(
+            CloudRoute.Calendar, monthSnapshot.revision, retained + monthSnapshot.items,
+            monthSnapshot.source, monthSnapshot.asOf,
+        )
+        synchronized(calendarCache) {
+            calendarCache.clear()
+            calendarCache[month] = monthSnapshot
+        }
+    }
+
+    /** The month a calendar row belongs to, or null for anything else. */
+    private fun calendarMonthOf(item: CloudItem): CalendarMonth? {
+        if (item.deleted) return null
+        val day = (item.payload as? CloudPayload.CalendarDay)?.value ?: return null
+        return CalendarMonth.fromISODate(day.date)
+    }
+
+    private suspend fun loadRaces(cred: LocalCredentials, baseUrl: String, month: CalendarMonth): List<CloudItem> {
+        val calDays = loadCalendar(cred, baseUrl, month)
         return calDays.filter { item ->
             val cd = (item.payload as? CloudPayload.CalendarDay)?.value
             cd?.race != null
