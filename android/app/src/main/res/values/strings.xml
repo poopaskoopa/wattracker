@@ -18,13 +18,9 @@
 
     <!-- Screen stubs -->
     <string name="stub_dashboard_note">Training status: CTL / ATL / TSB, load chart, current FTP and recent rides.</string>
-    <string name="stub_calendar_note">The month grid: planned workouts, completed rides, races and out-of-training phase.</string>
-    <string name="stub_volume_note">Weekly hours, TSS, distance and calories.</string>
     <string name="stub_settings_note">Backend pairing (cloud / local), device state and key type.</string>
 
     <string name="stub_issue_dashboard">#196</string>
-    <string name="stub_issue_calendar">#198</string>
-    <string name="stub_issue_volume">#198</string>
     <string name="stub_issue_settings">#195</string>
 
     <!-- Settings & Pairing Strings -->
@@ -132,6 +128,74 @@
     <!-- Ride graphs chart -->
     <string name="ride_graphs_title">Ride graphs</string>
     <string name="ride_graphs_caption">Time (min). Altitude is a faint background without an axis.</string>
+
+    <!-- Calendar (#198) -->
+    <string name="calendar_updated">Plan, rides and races · updated %1$s</string>
+    <string name="calendar_syncing">Syncing calendar…</string>
+    <string name="calendar_unpaired_title">No backend paired</string>
+    <string name="calendar_unpaired_note">Pair a cloud code or local desktop server in Settings to see your training calendar.</string>
+    <string name="calendar_removed_title">Device removed</string>
+    <string name="calendar_removed_note">This device was removed from the backend. Re-pair in Settings to continue.</string>
+    <string name="calendar_unavailable">Calendar unavailable</string>
+    <string name="calendar_no_data_title">No calendar data yet</string>
+    <string name="calendar_no_data_note">Your paired backend has not published calendar data yet.</string>
+    <string name="calendar_tap_hint">Tap a day for planned workouts and completed rides.</string>
+    <string name="calendar_prev_month">Previous month</string>
+    <string name="calendar_next_month">Next month</string>
+    <string name="calendar_weekday_mon">Mon</string>
+    <string name="calendar_weekday_tue">Tue</string>
+    <string name="calendar_weekday_wed">Wed</string>
+    <string name="calendar_weekday_thu">Thu</string>
+    <string name="calendar_weekday_fri">Fri</string>
+    <string name="calendar_weekday_sat">Sat</string>
+    <string name="calendar_weekday_sun">Sun</string>
+    <string name="calendar_ooto">Out of office</string>
+    <string name="calendar_race_label">Race</string>
+    <string name="calendar_phase_label">Training phase</string>
+    <string name="calendar_workouts_title">Planned workouts</string>
+    <string name="calendar_rides_title">Completed rides</string>
+    <string name="calendar_day_empty">Nothing planned or recorded on this day.</string>
+    <string name="calendar_status_completed">Completed</string>
+    <string name="calendar_status_missed">Missed</string>
+    <string name="calendar_status_skipped">Skipped</string>
+    <string name="calendar_status_adapted">Adapted</string>
+    <string name="calendar_status_planned">Planned</string>
+    <string name="calendar_at_ftp">at FTP %1$d W</string>
+    <string name="calendar_recorded_ride">Recorded ride</string>
+    <string name="calendar_a11y_day">Day %1$d</string>
+    <string name="calendar_a11y_adjacent_day">%1$s, adjacent month</string>
+    <string name="calendar_a11y_workouts">%1$d planned workouts</string>
+    <string name="calendar_a11y_rides">%1$d completed rides</string>
+    <string name="calendar_a11y_missed">%1$d missed workouts</string>
+    <string name="calendar_chart_time_axis">Time (s)</string>
+    <string name="calendar_chart_power_axis">Power (W)</string>
+    <string name="calendar_chart_target_axis">Target (% FTP)</string>
+    <string name="calendar_chart_ftp_label">FTP</string>
+
+    <!-- Volume (#198) -->
+    <string name="volume_syncing">Syncing volume…</string>
+    <string name="volume_unpaired_title">No backend paired</string>
+    <string name="volume_unpaired_note">Pair a cloud code or local desktop server in Settings to see your training volume.</string>
+    <string name="volume_removed_title">Device removed</string>
+    <string name="volume_removed_note">This device was removed from the backend. Re-pair in Settings to continue.</string>
+    <string name="volume_unavailable">Volume unavailable</string>
+    <string name="volume_no_data_title">No volume data yet</string>
+    <string name="volume_no_data_note">Your paired backend has not published any weekly totals yet.</string>
+    <string name="volume_metric_hours">Hours</string>
+    <string name="volume_metric_tss">TSS</string>
+    <string name="volume_metric_distance">Distance</string>
+    <string name="volume_metric_calories">Calories</string>
+    <string name="volume_range_last_4">Last 4 weeks</string>
+    <string name="volume_range_last_4_short">Last 4</string>
+    <string name="volume_range_last_12">Last 12 weeks</string>
+    <string name="volume_range_last_12_short">Last 12</string>
+    <string name="volume_range_ytd">Year to date</string>
+    <string name="volume_range_ytd_short">YTD</string>
+    <string name="volume_metric_label">Metric</string>
+    <string name="volume_totals_title">%1$s totals</string>
+    <string name="volume_no_weeks">No weeks in this range</string>
+    <string name="volume_avg_label">avg %1$s</string>
+    <string name="volume_period_title">Period summary · %1$s</string>
 
     <!-- Ride metric labels (list row and detail summary) -->
     <string name="metric_dist">DIST</string>
