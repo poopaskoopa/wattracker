@@ -292,7 +292,13 @@ private fun CalendarContent(
     onNavigateToSettings: (() -> Unit)?,
     showsOwnHeader: Boolean,
 ) {
-    val isCached = uiState.data?.source == CloudSnapshot.Source.cache
+    // The badge follows a cached paint whether it produced a grid or an empty
+    // month. The cloud's read seam answers from the cache when its network step
+    // fails, so a month that looks empty while offline is an empty the app
+    // inferred from what it already knew, and it must not read as a server
+    // answer.
+    val isCached = uiState.data?.source == CloudSnapshot.Source.cache ||
+        (uiState.monthIsEmpty && uiState.monthIsEmptyFromCache)
     Column(verticalArrangement = Arrangement.spacedBy(12.dp), modifier = Modifier.fillMaxWidth()) {
         if (showsOwnHeader) {
             Row(verticalAlignment = Alignment.CenterVertically) {

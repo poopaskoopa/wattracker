@@ -158,6 +158,7 @@ class CalendarViewModelTest {
         // backend that has published nothing at all: the sentence it prints
         // differs, and the stepper has to be painted above it.
         assertTrue("the state says 'nothing this month'", empty.monthIsEmpty)
+        assertFalse("and it came from a server answer, not from the cache", empty.monthIsEmptyFromCache)
         assertEquals(may, empty.month)
 
         vm.moveMonth(1)
@@ -165,6 +166,30 @@ class CalendarViewModelTest {
         assertEquals(CalendarMonth(2026, 6), moved.month)
         assertNotNull("the rider is not trapped in the empty month", moved.data)
         assertFalse(moved.monthIsEmpty)
+    }
+
+    /**
+     * Found on the tablet pass, offline: the cloud's read seam answers from the
+     * cache when its network step fails, so a month with nothing cached comes
+     * back as an empty snapshot rather than a failure. The sentence is right --
+     * the app has never seen a January row -- but it has to arrive with the same
+     * "Offline" badge a cached grid gets, or an inferred empty reads as a
+     * server's answer.
+     */
+    @Test
+    fun anEmptyMonthInferredFromTheCacheSaysItWasTheCache() = runTest(testDispatcher) {
+        val session = FakeReadSession(
+            loadHandler = { route, _ ->
+                CloudSnapshot(route, 1, emptyList(), CloudSnapshot.Source.cache, 1500L)
+            },
+        )
+        val vm = CalendarViewModel(session, coroutineScope = backgroundScope)
+        vm.moveMonth(monthsFromTodayTo(may))
+        val state = vm.uiState.value
+        assertNull(state.data)
+        assertTrue("an inferred empty is still an empty month", state.monthIsEmpty)
+        assertTrue("and the screen learns it was the cache", state.monthIsEmptyFromCache)
+        assertNull(state.error)
     }
 
     @Test

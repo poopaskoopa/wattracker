@@ -44,6 +44,16 @@ data class CalendarUiState(
      * at all". Without it both read the same sentence, and the first one lied.
      */
     val monthIsEmpty: Boolean = false,
+    /**
+     * That empty came out of the cache rather than out of a server answer.
+     *
+     * The cloud's read seam serves the cache when its network step fails, so a
+     * month with no cached days read while offline is an empty the app
+     * *inferred*, and the screen has to say so with the same "Offline" badge a
+     * cached grid gets. Without it "nothing planned in January 2027" looks like
+     * something the backend told us.
+     */
+    val monthIsEmptyFromCache: Boolean = false,
     val selectedDate: String? = null,
 ) {
     val selectedDay: CalendarDayEntry?
@@ -160,6 +170,7 @@ class CalendarViewModel(
                 selectedDate = null,
                 data = null,
                 monthIsEmpty = false,
+                monthIsEmptyFromCache = false,
                 // A month move is always a read, so the spinner owns the body
                 // immediately rather than for one frame the "nothing yet" card.
                 isLoading = true,
@@ -194,6 +205,7 @@ class CalendarViewModel(
                     error = null,
                     data = null,
                     monthIsEmpty = false,
+                    monthIsEmptyFromCache = false,
                     selectedDate = null,
                 )
             }
@@ -206,7 +218,9 @@ class CalendarViewModel(
         if (shownIdentity != identity) {
             shownIdentity = null
             currentFTP = null
-            _uiState.update { it.copy(data = null, monthIsEmpty = false, selectedDate = null) }
+            _uiState.update {
+                it.copy(data = null, monthIsEmpty = false, monthIsEmptyFromCache = false, selectedDate = null)
+            }
         }
 
         // 1. The month's cache first, so the network is not on the first-paint path.
@@ -332,6 +346,10 @@ class CalendarViewModel(
                     isRefreshing = false,
                     data = null,
                     monthIsEmpty = true,
+                    // A cache-served snapshot is the cloud's answer when its
+                    // network step failed, so this empty was inferred from what
+                    // was already known: the badge belongs here too.
+                    monthIsEmptyFromCache = snapshot.source == CloudSnapshot.Source.cache,
                     error = null,
                     selectedDate = null,
                 )

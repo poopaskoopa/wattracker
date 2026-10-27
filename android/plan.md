@@ -2051,11 +2051,57 @@ Verification: **310 JVM tests green** (was 302). New: `anEmptyMonthSaysSoAndStay
 `oneReadDoesNotEvictAnotherRoutesCache`, `aCalendarReadThatOutlivesAResetIsNotStored`,
 and the pinned zero percent. Each behavioural fix was mutation-proved one at a
  time: reverting it turns exactly the new test(s) red and leaves the rest green.
-`:app:assembleDebug` and `:app:assembleRelease -PallowPlaceholderHost` both
-assemble. There are no instrumented sources, so the emulator owes a re-check of
-the new states - the empty month with its stepper, the FTP line on a
-below-threshold workout, the cell labels under TalkBack, RTL chevrons - and the
-physical-device no-jank pass stays owed, as it does on #197.
+`:app:assembleDebug` and `:app:assembleRelease -PallowPlaceholderHost` assemble.
+
+**Device pass for this round (2026-10-27, `medium_tablet`, API 36).** The #456
+pass' throwaway DB is gone and `~/.wattracker/wattracker.db` holds no rider at
+all, so the check ran against the cloud harness
+(`scripts/walking_skeleton_server.py --db <copy> --codes 2`) over a scratch copy
+of the live schema seeded with one rider: FTP 250, a four-week plan from
+2026-11-02 (recovery, three endurance, sweet spot, threshold - one completed and
+linked to its ride), two September rides, a December race and a December
+out-of-office range, and **nothing whatsoever in October**, so the screen opens
+straight into the state the review said was a dead end. On screen:
+
+- the stepper paints in every paired state - grid, empty month, failed month -
+  and the empty month says "nothing planned or recorded in October 2026" while
+  the feed behind it holds September, November and December: the month-scoped
+  decision, on device;
+- a month move replaces the body rather than leaving the old grid under the new
+  header, and an offline move to an uncached month shows the offline answer, not
+  the month just left;
+- the phase-as-context fix: every day inside the plan window is unbordered and
+  dotless, while the days with a workout, the race day and the OOTO days are
+  bordered;
+- the day pane of a 60-min recovery block reads "at FTP 250 W", its axis reaches
+  300 W and the **dashed FTP line is drawn at 250 above a 162 W top target** -
+  the axis built to hold it - with the step list in the desktop's wording
+  ("5 min at 112-150 W (45%-60% FTP)", "50 min at 162 W (65% FTP)");
+- each cell is one accessibility node: "Day 12", "26 October 2026, adjacent
+  month", "3 December 2026, adjacent month", with the count badges read once;
+- in an Arabic locale the vendored chevrons mirror - previous points right, next
+  points left - and the calendar lays out right-to-left;
+- the volume chart after the label hoist: a 0.5 nice step reads "0, 0.5, 1, 1.5,
+  2" instead of the old "0, 0, 1, 1, 2", with the average rule and its "avg 0.4
+  h" label and the bars in iOS's volume blue.
+
+**One new defect this pass caught, fixed in the same round.** Offline plus a
+month with nothing cached: the cloud's `load` answers from the cache when its
+network step fails, so the empty came back as a *successful* empty snapshot and
+the screen confidently said "nothing planned or recorded in January 2027" with
+nothing to say the app had not been able to ask. `CalendarUiState` gained
+`monthIsEmptyFromCache`, the header paints the same "Offline" badge a cached grid
+gets, and `anEmptyMonthInferredFromTheCacheSaysItWasTheCache` pins it (311 JVM
+tests green, both assembles).
+
+Still unseen on device: the compact phone cell and the portrait bottom sheet (the
+flag they read is the one verified above, and the #456 pass rendered both), and
+the flat zero-change marker, which needs two complete volume windows the seed
+does not have - `VolumeDataTest.formattingVoicesMatchTheScreens` pins its text.
+Two pre-existing RTL artefacts were seen and deliberately **not** touched here:
+value strings built as "$value $unit" bidi-swap in an RTL locale ("kg 70",
+"h 4.0"), and untranslated strings staying English in a locale the app has no
+strings for. Physical-device no-jank stays owed, as it does on #197.
 
 **Preamble — server route:**
 The read-only route `GET /api/calendar?year=&month=` exists in `wattracker/server.py` (since commit `32444f7`), returning `build_calendar_month(...)` as JSON (`{"weeks": ...}`). The app's local calendar adapter is written against its test-pinned shape.
