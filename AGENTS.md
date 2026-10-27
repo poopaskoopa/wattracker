@@ -187,21 +187,7 @@ states on `main` when the PR is merge-committed. Four such commits are on
 `main` from #358 and #356 (`a04e344`, `95a6bb2`, `8d1a582`, `892b345`); if
 `git bisect` lands on one, `git bisect skip` it.
 
-1. **#451: desktop installer: rolling preview from main, single git-derived
-   version, drift check.** The installers lag `main` (the only desktop
-   release is `preview-0.1.0`, 29 commits stale) and the version is a
-   hand-duplicated `0.1.0`, so a rebuilt installer is indistinguishable from
-   the old one. This makes sync structural: every push to `main` publishes
-   a rolling unsigned preview with a git-derived version, plus a drift check
-   as a backstop for signed `v*` releases. Full spec is in the issue body;
-   GitHub wins if it differs. **Infrastructure work cannot be self-verified:**
-   codex cannot run the workflows, so state plainly what was not run (the
-   build and publish jobs, the Inno/PyInstaller/plist version acceptance on
-   CI runners). Cut the branch from fresh `main`, named for the work. The
-   `Android:` line in the PR body says no Android change. Report "ready to
-   merge".
-
-2. **#249: rotating full-suite test flakes. Still not a local-runs job.**
+1. **#249: rotating full-suite test flakes. Still not a local-runs job.**
    Nothing has changed since the re-scope. 21 consecutive clean local full
    suites stand against zero reproductions. Both known instances came from
    **taksmon's machine**. **The next step is taksmon's log and his exact
@@ -209,14 +195,15 @@ states on `main` when the PR is merge-committed. Four such commits are on
    runs on it.
 
 **Done (landed, off the active list):** #427 via #441, #429 via #439 and #442,
-#437 via #440, #438, and #443 (closed).
+#437 via #440, #438, and #443 (closed), and #451 via #453 (rolling
+preview verified on `preview-latest` 2026-10-27).
 
 **An item with an open PR stays on this list until the PR merges**, marked with
 its PR number. Dropping it while it is in flight makes it invisible if the PR is
 closed or abandoned.
 
-**When item 1 is done, the queue is empty.** #249 stays skipped pending
-taksmon's log and invocation. Do not pick up unlabelled issues or anything
+**The only queue item is #249, and it stays skipped** pending taksmon's log
+and invocation, so the queue is empty. Do not pick up unlabelled issues or anything
 below on your own. Say the queue ran out rather than inventing scope.
 
 **Not codex work, do not start:**
