@@ -65,7 +65,21 @@ data class CalendarMonth(val year: Int, val month: Int) : Comparable<CalendarMon
         }
     }
 
-    /** The month named in [locale] ("September 2026"). Locale-free arithmetic; only this reads it. */
+    /**
+     * The month named in [locale] ("September 2026"). Locale-free arithmetic;
+     * only this reads it.
+     *
+     * iOS names the same month from a localized template
+     * (`setLocalizedDateFormatFromTemplate("LLLLyyyy")`), which puts the year
+     * and the month in the order that locale wants. `java.time` has no
+     * month-year template to ask, and the Android call that does
+     * (`android.text.format.DateFormat.getBestDateTimePattern`) is a framework
+     * API this cloud-plane class cannot reach from its JVM tests. So the order
+     * here is fixed -- "LLLL yyyy", the standalone month form -- and the
+     * ordering a locale like ja would want is recorded in
+     * `docs/mobile-parity.md` rather than papered over with hand-written
+     * per-language patterns.
+     */
     fun title(locale: Locale = Locale.getDefault()): String =
         DateTimeFormatter.ofPattern("LLLL yyyy", locale).format(firstDate)
 
@@ -100,19 +114,15 @@ data class CalendarMonth(val year: Int, val month: Int) : Comparable<CalendarMon
          *
          * Strict on purpose: a malformed date on the wire must drop out of the
          * month it would otherwise land in, not join an arbitrary one. The
-         * re-format round-trip rejects what a lenient reader would otherwise
-         * accept (out-of-range months, `2025-02-29`, a short year).
+         * strictness is [isoDateOrNull]'s -- including the round trip that
+         * rejects what a lenient reader would otherwise accept (out-of-range
+         * months, `2025-02-29`, a short year) -- because every published
+         * date-only value is read through that one door; this only names the
+         * month the date lands in.
          */
         fun fromISODate(value: String?): CalendarMonth? {
-            if (value == null || value.length != 10 || value[4] != '-' || value[7] != '-') return null
-            val date = try {
-                LocalDate.parse(value, DateTimeFormatter.ISO_LOCAL_DATE)
-            } catch (_: DateTimeParseException) {
-                return null
-            }
-            // A formatter that accepted `2025-02-29` and rolled it must not: the round trip
-            // has to land on the very string it read.
-            return if (ISO_DATE.format(date) == value) CalendarMonth(date.year, date.monthValue) else null
+            val date = isoDateOrNull(value) ?: return null
+            return CalendarMonth(date.year, date.monthValue)
         }
     }
 }

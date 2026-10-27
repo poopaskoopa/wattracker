@@ -1947,6 +1947,116 @@ owed are still owed.
 
 **Emulator pass done (2026-10-27, PR #456).** The tablet was paired to a desktop server started over a throwaway DB (the server's own scan then imported this machine's real Zwift folder: 74 activities, 27 volume weeks), and a second emulator (medium_phone) to the walking-skeleton cloud harness over the same DB. Calendar: detailed cells on tablet portrait and landscape (two panes, day pane, and a ride row push opens the shared activities detail), compact cells on phone portrait (bottom sheet with the profile chart and the step list in the desktop's exact wording) and on phone landscape (nav rail, two panes, the grid fits 360 dp of height with scrolling). Volume on both backends matched `/api/volume` to the printed digit: Last 12 26.1 h / 1573 TSS / 759.3 km / 17506 kcal, Last 4 10.2 h, YTD 76.2 h, change -33%. The pass caught three defects a green unit suite had missed - phase counted as cell content (the whole plan window lit up), the screen title painted twice under the scaffold variant, and the tablet grid pane too narrow for seven detailed cells (460 -> 520dp) - all fixed with tests in `2eb06d1` (302 JVM tests green). Physical-device no-jank pass remains owed, as it does on #197.
 
+**PR #456 review (2026-10-27), addressed.** A review agent walked `c3a5b7a..3c17c7b`
+against the iOS twin and the desktop page and found defects the green unit suite
+and the emulator pass had both missed. Each claim was checked against the source
+before anything was changed, and every user-visible difference this produces went
+into `docs/mobile-parity.md` in the same PR.
+
+- **Month navigation lived inside the grid** (High). `CalendarStates` had no
+  empty-month case, so a month the backend answered empty painted "your paired
+  backend has not published calendar data yet" with **no chevrons at all**: on
+  the local backend one step past the end of the plan, or the 1st of a month with
+  no plan and no ride yet (where the screen opens), was a dead end until the rider
+  changed backend or killed the app. `CalendarUiState` gained `monthIsEmpty`, so a
+  read that came back empty says "nothing in this month", and the stepper moved
+  out of the grid panel into `CalendarContent`, painted in every paired state.
+  iOS's `.noData` panel has no chevrons either; Android differs deliberately.
+- **A month move kept the previous month's grid up while it loaded** (High).
+  `moveMonth` changed only the header, so a June header sat over May's cells with
+  May's "updated" stamp, and a failed read left that stale grid up indefinitely.
+  Header and data are one value, so no screen-side guard could have caught it.
+  `moveMonth` now clears `data` and marks the load (`isLoading = true`,
+  `error = null`): the frame between tap and answer is a named loading state,
+  never a blank grid that looks synced. iOS keeps the old grid; Android differs
+  deliberately.
+- **Phase counted as cell content** (High), and `2eb06d1` had justified its fix
+  with a claim about iOS that is not true: iOS's `CalendarDayEntry.hasContent`
+  does include `phase != nil`, and its cell border uses that flag, so iOS lights
+  up every day a plan window covers. Android now asks the two questions
+  separately - `hasContent` stays iOS-exact and decides whether the *month* has a
+  calendar, while a new `hasCellContent` (phase out) drives the border and the
+  compact dot - recorded as **Differs**.
+- **The cached FTP was a local variable** (Medium). `apply` ignored its `ftp`
+  argument and the cache-first paint never stored the FTP it had read, so a month
+  move (which never re-reads the dashboard) started from null and printed "% FTP"
+  targets where the rider should have seen watts. `apply` now stores the FTP it is
+  given, as iOS's `apply` does, and both paint paths fall back to
+  `CalendarData.currentFTP(cachedDashboard)`.
+- **One cache slot for every route** (Medium). `LocalClient.cachedState` held a
+  single snapshot, so the calendar screen's dashboard read evicted the activities
+  snapshot it had asked for moments earlier and the next month's cache-first paint
+  had no linked-ride summaries - the day cells flickered their counts. Now a
+  `HashMap<CloudRoute, CloudSnapshot>` under one `cacheLock`, iOS's per-route
+  `CachedCollection` shape.
+- **A read that outlived a re-pair was stored anyway** (Medium). The local
+  calendar accumulates rows across months, so a month belonging to a departed
+  pairing, written after `reset()`, sat in the new pairing's cache and came back
+  on every later visit. `load` captures the session identity before any network
+  work and `storeSnapshot` drops the write when it has moved; a dropped write no
+  longer counts as a successful read either.
+- **Two rounding postures had been merged into one** (Medium). `percent()` used
+  half-to-even `Math.rint` and printed "62%" where the desktop's
+  `Math.round(frac * 100)` and iOS's `.rounded()` print "63%"; it now rounds its
+  half away from zero, and the comment says which quantity takes which posture
+  (step watts stay half-to-even, the publisher's rule). Same finding, other half:
+  "at FTP %d W" truncated FTP 249.7 to "249 W" while the step lines under it were
+  built on 249.7 - new `CalendarWorkoutFormatting.ftpWatts` rounds half-to-even
+  like iOS's `Int(ftp.rounded(.toNearestOrEven))`.
+- **The profile chart could not draw its FTP line** (Medium). The y-axis was built
+  from the targets only and the `ftp in scale.lower..scale.upper` guard then
+  dropped the line for every workout below threshold - the workouts the line
+  exists to explain. The axis now takes `max(top target, FTP) * 1.1` (the
+  desktop's `maxW` starts at the FTP) and the guard is gone. The chart's empty text
+  contradicted the heading it sat under ("nothing planned or recorded on this
+  day", under a planned workout) and became "no power targets to plot for this
+  workout".
+- **Perf and nits.** `CalendarData.entry()` scanned the day list once per grid
+  cell (35-42 scans a frame) and `apply` built the model over the whole feed twice
+  to answer the content question: now a `byDate` map plus `hasContentIn(month)`,
+  which also makes the cloud's month decision honest - one feed spans every month,
+  so an empty September read as "has content" merely because October rode, and a
+  blank grid took the place of the real state. `VolumeData`'s secondary constructor
+  parsed its snapshot twice. Both charts measured every label inside the draw
+  lambda (now `remember`ed, following `RideGraphsChart`) and printed axis ticks
+  with `tick.toInt()`, which turned a 0.5 nice-step into "0, 0, 1, 1, 2" - both
+  use `chartTickLabel` now. The month chevrons are vendored vectors, so Material's
+  RTL mirroring never reached them (`Modifier.scale(-1f, 1f)` in RTL). Each day
+  cell is now one accessibility node named by its date, adjacent-month cells
+  naming their neighbour month ("every month has a 12th"). The unnamed-workout
+  fallback was the string "Activities" (`destination_activities`); it is
+  "Workout", iOS's fallback. A zero volume change printed an up arrow and "+0%"
+  where the desktop prints a flat marker with no sign. `CalendarMonth.fromISODate`
+  duplicated the ISO parser (it delegates to `isoDateOrNull` now), the weekday
+  header used `with(stringResource(...))` as a receiver trick, the wildcard
+  `kotlinx.coroutines.*` import and the framework FQNs inside source were tidied,
+  and `volume_syncing`, `optBoolean` and `Stroke` went with them.
+- **Left alone on purpose.** The per-month `.activities` re-read after a cached
+  month hits: iOS's `moveMonth` does exactly this and the cache is the fallback
+  when the re-read fails - a comment now says so. And the two localization nits:
+  `CalendarMonth.title()`'s fixed `"LLLL yyyy"` order and the fixed day pattern.
+  `java.time` has no month-year skeleton to ask, and the ICU call that reorders
+  (`android.text.format.DateFormat.getBestDateTimePattern`) is a framework API the
+  JVM-tested cloud model cannot reach without Robolectric, which the dependency
+  rule bars. iOS's `displayDate` fixes its pattern too, so the day heading matches
+  iOS exactly and only the month title's order is wrong in year-first locales -
+  both recorded in the parity matrix.
+
+Verification: **310 JVM tests green** (was 302). New: `anEmptyMonthSaysSoAndStaysNavigable`,
+`aCloudFeedSpanningTheYearStillCallsAnEmptyMonthEmpty`,
+`theCachedFtpCarriesIntoEveryMonthThatNeverReadsTheDashboard`,
+`movingToAMonthThatCannotBeReadLeavesNoGridUnderTheNewHeader`,
+`phaseIsTheMonthsContentButNotTheCells`, `aNeighboursBusyDayDoesNotMakeThisMonthLookFull`,
+`printedPercentsRoundTheirHalfAwayFromZero`, `theAtFtpLabelRoundsRatherThanTruncates`,
+`oneReadDoesNotEvictAnotherRoutesCache`, `aCalendarReadThatOutlivesAResetIsNotStored`,
+and the pinned zero percent. Each behavioural fix was mutation-proved one at a
+ time: reverting it turns exactly the new test(s) red and leaves the rest green.
+`:app:assembleDebug` and `:app:assembleRelease -PallowPlaceholderHost` both
+assemble. There are no instrumented sources, so the emulator owes a re-check of
+the new states - the empty month with its stepper, the FTP line on a
+below-threshold workout, the cell labels under TalkBack, RTL chevrons - and the
+physical-device no-jank pass stays owed, as it does on #197.
+
 **Preamble — server route:**
 The read-only route `GET /api/calendar?year=&month=` exists in `wattracker/server.py` (since commit `32444f7`), returning `build_calendar_month(...)` as JSON (`{"weeks": ...}`). The app's local calendar adapter is written against its test-pinned shape.
 that a history cutoff hides pre-cutoff activities. Full suite green per

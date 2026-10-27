@@ -27,14 +27,16 @@ import androidx.compose.runtime.produceState
 import androidx.compose.runtime.remember
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.geometry.CornerRadius
 import androidx.compose.ui.geometry.Offset
+import androidx.compose.ui.geometry.Size
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.PathEffect
-import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.text.TextStyle
 import androidx.compose.ui.text.drawText
+import androidx.compose.ui.text.TextLayoutResult
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.rememberTextMeasurer
@@ -51,7 +53,10 @@ import com.wattracker.android.WatTrackerApp
 import com.wattracker.android.cloud.CloudSession
 import com.wattracker.android.cloud.CloudSnapshot
 import com.wattracker.android.cloud.ReadModel
+import com.wattracker.android.cloud.VolumeWeek
+import com.wattracker.android.cloud.isoDateOrNull
 import com.wattracker.android.screens.activities.ChartTicks
+import com.wattracker.android.screens.activities.chartTickLabel
 import com.wattracker.android.screens.activities.updatedAt
 import com.wattracker.android.screens.volume.VolumeData
 import com.wattracker.android.screens.volume.VolumeFormat
@@ -66,6 +71,7 @@ import kotlinx.coroutines.CancellationException
 import java.time.LocalDate
 import java.time.format.DateTimeFormatter
 import java.util.Locale
+import kotlin.math.ceil
 
 /**
  * Volume (#198): weekly hours, TSS, distance and calories -- bars for a
@@ -243,8 +249,16 @@ private fun VolumeContent(
             Spacer(modifier = Modifier.weight(1f))
             val change = data.change(uiState.selectedMetric, uiState.selectedRange, LocalDate.now())
             if (change != null) {
+                // The desktop's three markers, not two: a change of exactly
+                // zero is a flat \u25ac, where an up arrow and "+0%" would read
+                // as growth on a window that did not move.
+                val marker = when {
+                    change > 0.0 -> "\u25b2 "
+                    change < 0.0 -> "\u25bc "
+                    else -> "\u25ac "
+                }
                 Text(
-                    text = (if (change >= 0) "\u25b2 " else "\u25bc ") + VolumeFormat.percent(change),
+                    text = marker + VolumeFormat.percent(change),
                     style = TextStyle(
                         fontSize = 12.sp,
                         fontWeight = FontWeight.Bold,
@@ -370,6 +384,12 @@ private fun VolumeSummaryTile(title: String, value: String, selected: Boolean, m
     }
 }
 
+private val volumeLabelStyle = TextStyle(fontSize = 9.sp, color = Palette.muted)
+private val volumeAverageStyle = TextStyle(fontSize = 9.sp, color = Palette.accent)
+
+/** One thinned week label: which slot it belongs to, and its laid-out text. */
+private data class WeekLabel(val index: Int, val result: TextLayoutResult)
+
 /**
  * The bar chart: one bar per published week (gaps filled with zero bars, so
  * a rest week sits in the spacing rather than collapsing the weeks around
@@ -383,19 +403,42 @@ private fun VolumeSummaryTile(title: String, value: String, selected: Boolean, m
  */
 @Composable
 private fun VolumeBarChart(
-    weeks: List<com.wattracker.android.cloud.VolumeWeek>,
+    weeks: List<VolumeWeek>,
     metric: VolumeMetric,
     modifier: Modifier = Modifier,
 ) {
     val textMeasurer = rememberTextMeasurer()
     val labelFormatter = remember { DateTimeFormatter.ofPattern("MMM d", Locale.getDefault()) }
-    val averageLabel = stringResource(
-        R.string.volume_avg_label,
-        VolumeFormat.value(
-            weeks.map { metric.valueFrom(it) }.average().takeIf { it.isFinite() } ?: 0.0,
-            metric,
-        ),
-    )
+
+    // The window's numbers, read once for the pass rather than per layer.
+    val values = remember(weeks, metric) { weeks.map { metric.valueFrom(it) } }
+    val average = remember(values) { values.average().takeIf { it.isFinite() } ?: 0.0 }
+    val scale = remember(values) {
+        val maxValue = (values.maxOrNull() ?: 0.0).let { if (it <= 0) 1.0 else it * 1.05 }
+        ChartTicks.nice(0.0, maxValue, 4)
+    }
+    val averageLabel = stringResource(R.string.volume_avg_label, VolumeFormat.value(average, metric))
+
+    // Labels are laid out in composition and only placed by the canvas, the way
+    // RideGraphsChart does it: measuring inside the draw lambda lays every label
+    // out again on every frame. The axis text goes through `chartTickLabel`,
+    // which keeps one decimal only when the value needs one -- a window whose
+    // busiest week is under 2 h (and a window that is all zeros) steps by 0.5,
+    // and the `toInt()` this used to print read "0, 0, 1, 1, 2".
+    val tickLabels = remember(scale, textMeasurer) {
+        scale.ticks.map { textMeasurer.measure(chartTickLabel(it), volumeLabelStyle) }
+    }
+    val averageLabelResult = remember(averageLabel, textMeasurer) {
+        textMeasurer.measure(averageLabel, volumeAverageStyle)
+    }
+    // Week-start labels are thinned to about six, and which six is decided once.
+    val labelStep = maxOf(1, ceil(weeks.size / 6.0).toInt())
+    val weekLabels = remember(weeks, labelFormatter, labelStep, textMeasurer) {
+        (weeks.indices step labelStep).mapNotNull { index ->
+            val date = isoDateOrNull(weeks[index].weekStart) ?: return@mapNotNull null
+            WeekLabel(index, textMeasurer.measure(labelFormatter.format(date), volumeLabelStyle))
+        }
+    }
 
     Canvas(modifier) {
         val barColor = Color(0xFF3987E5)
@@ -408,15 +451,11 @@ private fun VolumeBarChart(
         val plotTop = padTop
         val plotBottom = size.height - padBottom
 
-        val values = weeks.map { metric.valueFrom(it) }
-        val maxValue = (values.maxOrNull() ?: 0.0).let { if (it <= 0) 1.0 else it * 1.05 }
-        val scale = ChartTicks.nice(0.0, maxValue, 4)
-
         fun yPos(value: Double): Float =
             plotBottom - (value / scale.upper).toFloat() * (plotBottom - plotTop)
 
         // Grid and y labels.
-        for (tick in scale.ticks) {
+        scale.ticks.forEachIndexed { index, tick ->
             val y = yPos(tick)
             drawLine(
                 color = Palette.surfaceBorder,
@@ -424,10 +463,7 @@ private fun VolumeBarChart(
                 end = Offset(plotRight, y),
                 strokeWidth = 1f,
             )
-            val label = textMeasurer.measure(
-                text = "${tick.toInt()}",
-                style = TextStyle(fontSize = 9.sp, color = Palette.muted),
-            )
+            val label = tickLabels[index]
             drawText(textLayoutResult = label, topLeft = Offset(4.dp.toPx(), y - label.size.height / 2f))
         }
 
@@ -442,13 +478,12 @@ private fun VolumeBarChart(
             drawRoundRect(
                 color = barColor,
                 topLeft = Offset(center - barWidth / 2f, top),
-                size = androidx.compose.ui.geometry.Size(barWidth, plotBottom - top),
-                cornerRadius = androidx.compose.ui.geometry.CornerRadius(3f, 3f),
+                size = Size(barWidth, plotBottom - top),
+                cornerRadius = CornerRadius(3f, 3f),
             )
         }
 
         // The window's weekly average, dashed.
-        val average = values.average().takeIf { it.isFinite() } ?: 0.0
         if (count > 0 && average > 0) {
             val y = yPos(average)
             drawLine(
@@ -458,28 +493,17 @@ private fun VolumeBarChart(
                 strokeWidth = 1f,
                 pathEffect = PathEffect.dashPathEffect(floatArrayOf(10f, 8f)),
             )
-            val label = textMeasurer.measure(
-                averageLabel,
-                style = TextStyle(fontSize = 9.sp, color = Palette.accent),
-            )
             drawText(
-                textLayoutResult = label,
-                topLeft = Offset(plotRight - label.size.width, y - label.size.height - 2f),
+                textLayoutResult = averageLabelResult,
+                topLeft = Offset(plotRight - averageLabelResult.size.width, y - averageLabelResult.size.height - 2f),
             )
         }
 
-        // Week-start labels, thinned so at most about six are drawn.
-        val labelStep = maxOf(1, kotlin.math.ceil(count / 6.0).toInt())
-        for (index in weeks.indices step labelStep) {
-            val date = com.wattracker.android.cloud.isoDateOrNull(weeks[index].weekStart) ?: continue
-            val label = textMeasurer.measure(
-                text = labelFormatter.format(date),
-                style = TextStyle(fontSize = 9.sp, color = Palette.muted),
-            )
-            val center = plotLeft + slot * (index + 0.5f)
+        for (weekLabel in weekLabels) {
+            val center = plotLeft + slot * (weekLabel.index + 0.5f)
             drawText(
-                textLayoutResult = label,
-                topLeft = Offset(center - label.size.width / 2f, plotBottom + 2.dp.toPx()),
+                textLayoutResult = weekLabel.result,
+                topLeft = Offset(center - weekLabel.result.size.width / 2f, plotBottom + 2.dp.toPx()),
             )
         }
     }

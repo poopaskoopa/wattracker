@@ -10,7 +10,6 @@ import com.wattracker.android.cloud.TrainingState
 import com.wattracker.android.json.JsonValue
 import com.wattracker.android.json.opt
 import com.wattracker.android.json.optArray
-import com.wattracker.android.json.optBoolean
 import com.wattracker.android.json.optDouble
 import com.wattracker.android.json.optString
 import com.wattracker.android.screens.PublishedTime
@@ -53,14 +52,27 @@ data class CalendarDayEntry(
     val activityCount: Int get() = activities.size
 
     /**
-     * Whether this cell shows anything beyond its number. Phase is
-     * deliberately not in here, matching iOS: a plan window stamps a phase
-     * on every day it covers, so counting phase as content would light up
-     * the whole month, and the accent border would stop meaning that
-     * something happened or is planned on the day. The phase still shows
-     * in the cell and in the day view -- it is context, not content.
+     * Whether the day carries anything at all. This is the month-level
+     * "is there a calendar here" decision, and it is iOS's `hasContent`
+     * exactly -- including `phase != nil`, which its
+     * `MobileScreenData.CalendarDayEntry.hasContent` counts.
      */
     val hasContent: Boolean
+        get() = ooto || phase != null || race != null || workouts.isNotEmpty() || activities.isNotEmpty()
+
+    /**
+     * Whether this cell earns anything beyond its number: the accent border
+     * and, in a compact cell, the content dot.
+     *
+     * Phase is deliberately not in here. A plan window stamps its phase on
+     * every day it covers, so counting it would light up the whole month and
+     * the border would stop meaning that something happened or is planned on
+     * the day -- the #456 emulator pass saw exactly that on the paired
+     * tablets. iOS's cell border uses [hasContent] and does light up; this is
+     * a deliberate difference, recorded in `docs/mobile-parity.md`. The phase
+     * still shows in the cell and in the day view: it is context, not content.
+     */
+    val hasCellContent: Boolean
         get() = ooto || race != null || workouts.isNotEmpty() || activities.isNotEmpty()
 }
 
@@ -82,7 +94,25 @@ data class CalendarData(
 ) {
     val hasContent: Boolean get() = days.any { it.hasContent }
 
-    fun entry(dateISO: String): CalendarDayEntry? = days.firstOrNull { it.dateISO == dateISO }
+    /**
+     * Whether [month]'s own days carry anything.
+     *
+     * The month, never the grid: a built [CalendarData] spans the leading and
+     * trailing week's real dates (and, on the cloud, whatever the one feed
+     * holds for every month), so asking the whole list would let a neighbour's
+     * busy day make an empty month look full.
+     */
+    fun hasContentIn(month: CalendarMonth): Boolean =
+        days.any { it.hasContent && CalendarMonth.fromISODate(it.dateISO) == month }
+
+    /**
+     * Days by ISO date. The grid asks for 35-42 of them per repaint and the
+     * cloud snapshot can hold months of days, so this is a map, not a linear
+     * scan per cell.
+     */
+    private val byDate: Map<String, CalendarDayEntry> by lazy { days.associateBy { it.dateISO } }
+
+    fun entry(dateISO: String): CalendarDayEntry? = byDate[dateISO]
 
     /**
      * Build the screen's day list from a calendar snapshot, joining the
@@ -326,7 +356,16 @@ object CalendarJSON {
         return if (formatted.endsWith(".0")) formatted.dropLast(2) else formatted
     }
 
-    /** A date-only published value as "Tuesday, Sep 1, 2026"; the raw string when it is not one. */
+    /**
+     * A date-only published value as "Tuesday, Sep 1, 2026"; the raw string
+     * when it is not one.
+     *
+     * The pattern is fixed rather than localized, which is what iOS does too
+     * (`DateFormatter.dateFormat = "EEEE, MMM d, yyyy"`), so the two phones
+     * print the day alike. The ordering that fixed pattern gets wrong in a
+     * year-month-day locale (ja) is therefore a shared gap, not a drift: it is
+     * recorded once in `docs/mobile-parity.md`. Same for [displayDateTime].
+     */
     fun displayDate(value: String): String {
         val date = isoDate(value) ?: return value
         return DateTimeFormatter.ofPattern("EEEE, MMM d, yyyy", Locale.getDefault()).format(date)
@@ -413,8 +452,14 @@ object CalendarWorkoutProfileDecoder {
 /**
  * The step list under the profile chart, in the desktop's words.
  *
- * Mirrors iOS `CalendarWorkoutFormatting`: same rounding (half-to-even, via
- * `Math.rint`, as Python and Swift both do it), same interval grouping
+ * Mirrors iOS `CalendarWorkoutFormatting`: same rounding -- but the two
+ * numbers round differently and both ways are pinned here, because the
+ * comment that used to claim one posture for both was wrong. Watts are
+ * half-to-even (`Math.rint`, matching the publisher's Python `round()` and
+ * iOS's `.rounded(.toNearestOrEven)`), while a printed percent rounds its
+ * half away from zero (`Math.round`, matching the desktop calendar's
+ * `Math.round(frac * 100)` and iOS's `.rounded()`): 0.625 is "63%" on all
+ * three clients. Same interval grouping
  * (consecutive blocks sharing an `intervals` label collapse into one line,
  * but never across a segment change), same chart scaling choices (watts when
  * an FTP exists, %FTP x 100 when it does not) and the same seven opacity
@@ -509,6 +554,19 @@ object CalendarWorkoutFormatting {
         return Math.rint(fraction * ftp).roundToInt()
     }
 
+    /**
+     * The FTP as the day view prints it ("at FTP 250 W").
+     *
+     * Rounded, not truncated, and half-to-even like [target] -- because the
+     * step lines under it are computed from the unrounded FTP. Truncating
+     * would have the header say "249 W" next to steps built on 249.7.
+     * iOS does the same with `Int(ftp.rounded(.toNearestOrEven))`.
+     */
+    fun ftpWatts(ftp: Double?): Int? {
+        if (ftp == null || !ftp.isFinite() || ftp <= 0) return null
+        return Math.rint(ftp).roundToInt()
+    }
+
     /** A %FTP fraction in chart units: watts when an FTP exists, else %FTP x 100. */
     fun chartTarget(fraction: Double?, ftp: Double?): Double? {
         if (fraction == null || !fraction.isFinite()) return null
@@ -516,9 +574,14 @@ object CalendarWorkoutFormatting {
         return fraction * ftp
     }
 
+    /**
+     * A %FTP fraction as a whole percent, its half rounded away from zero:
+     * the desktop's `Math.round(frac * 100)` and iOS's `.rounded()` both do
+     * that, so 0.625 reads "63%" on every client.
+     */
     fun percent(fraction: Double?): String? {
         if (fraction == null || !fraction.isFinite()) return null
-        return "${Math.rint(fraction * 100).roundToInt()}%"
+        return "${Math.round(fraction * 100)}%"
     }
 
     /**

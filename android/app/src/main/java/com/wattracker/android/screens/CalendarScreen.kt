@@ -40,6 +40,7 @@ import androidx.compose.runtime.produceState
 import androidx.compose.runtime.remember
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.scale
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.Path
@@ -47,17 +48,20 @@ import androidx.compose.ui.graphics.PathEffect
 import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.platform.LocalConfiguration
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.platform.LocalLayoutDirection
 import androidx.compose.ui.res.stringResource
+import androidx.compose.ui.semantics.contentDescription
+import androidx.compose.ui.semantics.hideFromAccessibility
+import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.text.TextStyle
 import androidx.compose.ui.text.drawText
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.rememberTextMeasurer
 import androidx.compose.ui.text.style.TextAlign
+import androidx.compose.ui.unit.LayoutDirection
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
-import com.wattracker.android.screens.activities.ChartTicks
-import com.wattracker.android.screens.activities.TickScale
 import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.LifecycleEventObserver
 import androidx.lifecycle.ViewModel
@@ -66,10 +70,14 @@ import androidx.lifecycle.compose.LocalLifecycleOwner
 import androidx.lifecycle.viewmodel.compose.viewModel
 import com.wattracker.android.R
 import com.wattracker.android.WatTrackerApp
+import com.wattracker.android.cloud.CalendarMonth
 import com.wattracker.android.cloud.CloudSession
 import com.wattracker.android.cloud.CloudSnapshot
 import com.wattracker.android.cloud.ReadModel
 import com.wattracker.android.json.JsonValue
+import com.wattracker.android.screens.activities.ChartTicks
+import com.wattracker.android.screens.activities.TickScale
+import com.wattracker.android.screens.activities.chartTickLabel
 import com.wattracker.android.screens.activities.updatedAt
 import com.wattracker.android.screens.calendar.CalendarData
 import com.wattracker.android.screens.calendar.CalendarDayEntry
@@ -89,6 +97,7 @@ import com.wattracker.android.ui.theme.wtFlag
 import com.wattracker.android.ui.theme.wtFlight
 import com.wattracker.android.ui.theme.wtPedalBike
 import kotlinx.coroutines.CancellationException
+import kotlin.math.max
 
 /**
  * Calendar (#198): the month grid of plan, rides and races, and one day's
@@ -357,11 +366,22 @@ private fun CalendarContent(
             }
         }
 
+        // The month is navigable in every paired state -- with a grid, with an
+        // error, with the spinner, and with a month the backend answered empty.
+        val isPairedState = uiState.isPaired &&
+            uiState.deviceState != CloudSession.DeviceState.unpaired &&
+            uiState.deviceState != CloudSession.DeviceState.removed
+        if (isPairedState) {
+            CalendarMonthNavigation(
+                month = uiState.month,
+                onMoveMonth = { offset -> viewModel.moveMonth(offset) },
+            )
+        }
+
         val data = uiState.data
         if (data != null) {
-            CalendarMonthPanel(
+            CalendarMonthGrid(
                 uiState = uiState,
-                onMoveMonth = { offset -> viewModel.moveMonth(offset) },
                 onSelectDay = { iso -> viewModel.selectDay(if (iso == uiState.selectedDate) null else iso) },
             )
             Text(
@@ -376,56 +396,88 @@ private fun CalendarContent(
 }
 
 /**
- * The month: navigation row, weekday header, and the Monday-to-Sunday grid
- * in full weeks covering the month -- the desktop's own layout, pinned by
+ * The month stepper.
+ *
+ * It is painted above the month's body rather than inside the grid panel, and
+ * that placement is the whole point. It used to live in the grid panel, so a
+ * month the backend answered empty had no chevrons at all: on the local
+ * backend one step past the end of the plan -- or the 1st of a month with no
+ * plan and no ride yet, which is where the screen opens -- the rider was stuck
+ * there until they changed backend or killed the app. iOS's status panel has
+ * no chevrons either; always offering the stepper is Android's deliberate
+ * difference, recorded in `docs/mobile-parity.md`.
+ *
+ * The chevrons are vendored vectors, and Material mirrors its own icons by
+ * name -- not these. In a right-to-left locale the previous month is the one
+ * on the right, so mirroring them is ours to do.
+ */
+@Composable
+private fun CalendarMonthNavigation(month: CalendarMonth, onMoveMonth: (Int) -> Unit) {
+    val mirrored = if (LocalLayoutDirection.current == LayoutDirection.Rtl) {
+        Modifier.scale(-1f, 1f)
+    } else {
+        Modifier
+    }
+    Row(
+        modifier = Modifier.fillMaxWidth(),
+        verticalAlignment = Alignment.CenterVertically,
+        horizontalArrangement = Arrangement.spacedBy(8.dp),
+    ) {
+        IconButton(onClick = { onMoveMonth(-1) }) {
+            Icon(
+                imageVector = wtChevronLeft,
+                contentDescription = stringResource(R.string.calendar_prev_month),
+                modifier = mirrored,
+                tint = Palette.accent,
+            )
+        }
+        Text(
+            text = month.title(),
+            style = TextStyle(fontSize = 16.sp, fontWeight = FontWeight.SemiBold, color = Palette.textBright),
+            modifier = Modifier.weight(1f),
+            textAlign = TextAlign.Center,
+        )
+        IconButton(onClick = { onMoveMonth(1) }) {
+            Icon(
+                imageVector = wtChevronRight,
+                contentDescription = stringResource(R.string.calendar_next_month),
+                modifier = mirrored,
+                tint = Palette.accent,
+            )
+        }
+    }
+}
+
+/**
+ * The month grid: the weekday header and the Monday-to-Sunday grid in full
+ * weeks covering the month -- the desktop's own layout, pinned by
  * `calendar_grid_v1.json`. Rows are real weeks, cells are real dates: the
  * leading and trailing cells are the adjacent months' days, present as
  * context and receded, never blanks.
  */
 @Composable
-private fun CalendarMonthPanel(
+private fun CalendarMonthGrid(
     uiState: CalendarUiState,
-    onMoveMonth: (Int) -> Unit,
     onSelectDay: (String) -> Unit,
 ) {
     val data = uiState.data ?: return
-    val grid = uiState.month.gridDates()
+    val month = uiState.month
+    val grid = remember(month) { month.gridDates() }
+    // The two names a cell outside the month can be announced by. ISO dates
+    // sort chronologically as strings, so a date before the 1st belongs to the
+    // month before and a date after it to the month after.
+    val firstIso = remember(month) { month.isoDate(1) }
+    val previousTitle = remember(month) { month.addingMonths(-1).title() }
+    val nextTitle = remember(month) { month.addingMonths(1).title() }
     Panel(modifier = Modifier.fillMaxWidth()) {
         Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
-            Row(
-                modifier = Modifier.fillMaxWidth(),
-                verticalAlignment = Alignment.CenterVertically,
-                horizontalArrangement = Arrangement.spacedBy(8.dp),
-            ) {
-                IconButton(onClick = { onMoveMonth(-1) }) {
-                    Icon(
-                        imageVector = wtChevronLeft,
-                        contentDescription = stringResource(R.string.calendar_prev_month),
-                        tint = Palette.accent,
-                    )
-                }
-                Text(
-                    text = uiState.month.title(),
-                    style = TextStyle(fontSize = 16.sp, fontWeight = FontWeight.SemiBold, color = Palette.textBright),
-                    modifier = Modifier.weight(1f),
-                    textAlign = TextAlign.Center,
-                )
-                IconButton(onClick = { onMoveMonth(1) }) {
-                    Icon(
-                        imageVector = wtChevronRight,
-                        contentDescription = stringResource(R.string.calendar_next_month),
-                        tint = Palette.accent,
-                    )
-                }
-            }
-
             Row(modifier = Modifier.fillMaxWidth()) {
                 weekdayLabels().forEach { label ->
                     Text(
                         text = label,
                         style = TextStyle(fontSize = 10.sp, fontWeight = FontWeight.SemiBold, color = Palette.muted),
                         modifier = Modifier.weight(1f),
-                        textAlign = androidx.compose.ui.text.style.TextAlign.Center,
+                        textAlign = TextAlign.Center,
                     )
                 }
             }
@@ -440,6 +492,7 @@ private fun CalendarMonthPanel(
                                 day = cell.day,
                                 isInMonth = cell.isInMonth,
                                 entry = entry,
+                                a11yLabel = dayCellLabel(cell, firstIso, previousTitle, nextTitle),
                                 onClick = { onSelectDay(cell.isoDate) },
                             )
                         }
@@ -450,18 +503,38 @@ private fun CalendarMonthPanel(
     }
 }
 
+/**
+ * What a cell is announced as. The bare number is not enough: every month has
+ * a 12th, and an adjacent month's 1st otherwise sounds exactly like this
+ * month's, so the neighbour's month is named too.
+ */
 @Composable
-private fun weekdayLabels(): List<String> = with(androidx.compose.ui.res.stringResource(R.string.calendar_weekday_mon)) {
-    listOf(
-        this,
-        stringResource(R.string.calendar_weekday_tue),
-        stringResource(R.string.calendar_weekday_wed),
-        stringResource(R.string.calendar_weekday_thu),
-        stringResource(R.string.calendar_weekday_fri),
-        stringResource(R.string.calendar_weekday_sat),
-        stringResource(R.string.calendar_weekday_sun),
+private fun dayCellLabel(
+    cell: CalendarMonth.GridDay,
+    firstIso: String,
+    previousTitle: String,
+    nextTitle: String,
+): String = if (cell.isInMonth) {
+    stringResource(R.string.calendar_a11y_day, cell.day)
+} else {
+    stringResource(
+        R.string.calendar_a11y_adjacent_day,
+        cell.day,
+        if (cell.isoDate < firstIso) previousTitle else nextTitle,
     )
 }
+
+/** The weekday header, Monday first: the grid's first column is Monday. */
+@Composable
+private fun weekdayLabels(): List<String> = listOf(
+    stringResource(R.string.calendar_weekday_mon),
+    stringResource(R.string.calendar_weekday_tue),
+    stringResource(R.string.calendar_weekday_wed),
+    stringResource(R.string.calendar_weekday_thu),
+    stringResource(R.string.calendar_weekday_fri),
+    stringResource(R.string.calendar_weekday_sat),
+    stringResource(R.string.calendar_weekday_sun),
+)
 
 /**
  * One day. Detailed when the cell is wide enough (a landscape phone, a
@@ -476,6 +549,7 @@ private fun CalendarDayCell(
     day: Int,
     isInMonth: Boolean,
     entry: CalendarDayEntry?,
+    a11yLabel: String,
     onClick: () -> Unit,
 ) {
     BoxWithConstraints(
@@ -487,13 +561,21 @@ private fun CalendarDayCell(
             )
             .border(
                 1.dp,
-                if (entry?.hasContent == true) {
+                // The border is the cell-content flag, not the month's
+                // `hasContent`: a plan window stamps a phase on every day it
+                // covers, and bordering those made the accent mean "the coach
+                // wrote something this month" instead of "something happened
+                // here".
+                if (entry?.hasCellContent == true) {
                     Palette.accent.copy(alpha = if (isInMonth) 0.55f else 0.3f)
                 } else {
                     Palette.surfaceBorder
                 },
                 RoundedCornerShape(8.dp),
             )
+            // One thing to the rider, so one thing to TalkBack, named by its
+            // date rather than by the digits inside it.
+            .semantics { contentDescription = a11yLabel }
             .clickable(onClick = onClick)
             .padding(6.dp),
     ) {
@@ -505,13 +587,16 @@ private fun CalendarDayCell(
             ) {
                 Text(
                     text = "$day",
+                    // The cell already names the day; the bare digit would be
+                    // read a second time.
+                    modifier = Modifier.semantics { hideFromAccessibility() },
                     style = TextStyle(
                         fontSize = 12.sp,
                         fontWeight = FontWeight.SemiBold,
                         color = if (isInMonth) Palette.textBright else Palette.muted,
                     ),
                 )
-                if (entry?.hasContent == true) {
+                if (entry?.hasCellContent == true) {
                     Box(
                         modifier = Modifier
                             .size(5.dp)
@@ -532,6 +617,7 @@ private fun CalendarDayCell(
                 Row(verticalAlignment = Alignment.CenterVertically) {
                     Text(
                         text = "$day",
+                        modifier = Modifier.semantics { hideFromAccessibility() },
                         style = TextStyle(
                             fontSize = 13.sp,
                             fontWeight = FontWeight.SemiBold,
@@ -614,10 +700,14 @@ private fun CalendarDayEntry.missedCount(): Int = CalendarJSON.missedCount(worko
 // MARK: - The day's honest states (when there is no month to show)
 
 /**
- * The states shown only when there is no month on screen: the
- * unpaired/removed cards, a failed load with no cache, the waking notice,
- * the first-load spinner, and the empty month. Same order of meaning as the
- * activities list's: a failed load is never presented as "no data".
+ * The states shown in the body when there is no month grid to show: the
+ * unpaired/removed cards, a failed load with no cache, the waking notice, the
+ * first-load spinner, a month that was read and held nothing, and the
+ * nothing-ever-published case. Same order of meaning as the activities list's:
+ * a failed load is never presented as "no data", and a month with nothing in
+ * it is never presented as a backend that has published nothing. The month
+ * stepper is not part of this -- it is painted above the body in every paired
+ * state, so every one of these is a state the rider can step out of.
  */
 @Composable
 private fun CalendarStates(
@@ -671,6 +761,23 @@ private fun CalendarStates(
             contentAlignment = Alignment.Center,
         ) {
             CircularProgressIndicator(modifier = Modifier.size(24.dp), color = Palette.accent, strokeWidth = 2.dp)
+        }
+
+        // Read successfully, and this month holds nothing: a month before the
+        // first ride, or after the end of the plan. "Your paired backend has
+        // not published calendar data" would be wrong twice over here -- it has
+        // published, and this is not the only month there is.
+        uiState.monthIsEmpty -> Panel {
+            Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
+                Text(
+                    text = stringResource(R.string.calendar_month_empty_title),
+                    style = TextStyle(fontSize = 15.sp, fontWeight = FontWeight.SemiBold, color = Palette.textBright),
+                )
+                Text(
+                    text = stringResource(R.string.calendar_month_empty_note, uiState.month.title()),
+                    style = TextStyle(fontSize = 13.sp, color = Palette.muted),
+                )
+            }
         }
 
         else -> CalendarStateCard(
@@ -791,7 +898,7 @@ private fun DetailRow(label: String, value: String) {
         Text(
             text = value,
             style = TextStyle(fontSize = 13.sp, color = Palette.text),
-            textAlign = androidx.compose.ui.text.style.TextAlign.End,
+            textAlign = TextAlign.End,
         )
     }
 }
@@ -804,7 +911,10 @@ private fun CalendarWorkoutRow(workout: JsonValue, ftp: Double?) {
     Column(verticalArrangement = Arrangement.spacedBy(3.dp), modifier = Modifier.fillMaxWidth()) {
         Row(verticalAlignment = Alignment.Top, horizontalArrangement = Arrangement.spacedBy(6.dp)) {
             Text(
-                text = CalendarJSON.title(workout, fallback = stringResource(R.string.destination_activities)),
+                // "Workout", iOS's fallback: an unnamed planned block is still
+                // a workout, not the name of the screen the rider is standing
+                // in.
+                text = CalendarJSON.title(workout, fallback = stringResource(R.string.calendar_workout_default)),
                 style = TextStyle(fontSize = 14.sp, fontWeight = FontWeight.SemiBold, color = Palette.text),
                 modifier = Modifier.weight(1f),
             )
@@ -828,9 +938,12 @@ private fun CalendarWorkoutRow(workout: JsonValue, ftp: Double?) {
             }
         }
         if (blocks.isNotEmpty()) {
-            if (ftp != null && ftp.isFinite() && ftp > 0) {
+            // Rounded, not truncated: the steps under this line are computed
+            // from the unrounded FTP, so "at FTP 249 W" next to watts built on
+            // 249.7 contradicts itself two lines down.
+            CalendarWorkoutFormatting.ftpWatts(ftp)?.let { watts ->
                 Text(
-                    text = stringResource(R.string.calendar_at_ftp, ftp.toInt()),
+                    text = stringResource(R.string.calendar_at_ftp, watts),
                     style = TextStyle(fontSize = 12.sp, fontWeight = FontWeight.SemiBold, color = Palette.accent),
                 )
             }
@@ -873,6 +986,8 @@ private fun statusColor(status: WorkoutStatus): Color = when (status) {
     WorkoutStatus.Planned -> Palette.muted
 }
 
+private val profileChartLabelStyle = TextStyle(fontSize = 9.sp, color = Palette.muted)
+
 /**
  * The planned workout's power-profile chart: the published %FTP targets
  * scaled to watts when the rider has an FTP (and to %FTP x 100 when they do
@@ -881,6 +996,17 @@ private fun statusColor(status: WorkoutStatus): Color = when (status) {
  * across when it exists, and time in seconds. The shape per block: a target
  * that may step between the block's start and end, filled from the baseline
  * and outlined on top -- the same step picture the desktop paints.
+ *
+ * The axis is built to hold the FTP line, not only the targets. A Z2 ride at
+ * FTP 250 tops out near 200 W, and an axis that stops at 200 has nowhere to
+ * put the line -- while that line is the one thing that makes a workout read
+ * as under or over threshold. The desktop's own `maxW` starts at the FTP for
+ * exactly that reason (`workout_graph.js`), and iOS's chart widens for its
+ * FTP `RuleMark` the same way.
+ *
+ * What can be measured is measured in composition and remembered; the canvas
+ * only places it. `RideGraphsChart` works the same way -- measuring inside the
+ * draw lambda lays every label out again on every frame.
  */
 @Composable
 private fun CalendarWorkoutProfileChart(
@@ -895,13 +1021,38 @@ private fun CalendarWorkoutProfileChart(
     )
     val timeAxisTitle = stringResource(R.string.calendar_chart_time_axis)
     val ftpLabel = stringResource(R.string.calendar_chart_ftp_label)
+    val noTargets = stringResource(R.string.calendar_chart_no_targets)
 
-    val steps = blocks.filter {
-        !it.free &&
-            CalendarWorkoutFormatting.chartTarget(it.targetStart, ftp) != null &&
-            CalendarWorkoutFormatting.chartTarget(it.targetEnd, ftp) != null
+    val steps = remember(blocks, ftp) {
+        blocks.filter {
+            !it.free &&
+                CalendarWorkoutFormatting.chartTarget(it.targetStart, ftp) != null &&
+                CalendarWorkoutFormatting.chartTarget(it.targetEnd, ftp) != null
+        }
     }
-    val timeMax = blocks.maxOfOrNull { it.end } ?: 0.0
+    val timeMax = remember(blocks) { blocks.maxOfOrNull { it.end } ?: 0.0 }
+    val scale: TickScale = remember(steps, ftp, hasFtp) {
+        val targets = steps.flatMap {
+            listOfNotNull(
+                CalendarWorkoutFormatting.chartTarget(it.targetStart, ftp),
+                CalendarWorkoutFormatting.chartTarget(it.targetEnd, ftp),
+            )
+        }
+        val ceiling = max(targets.maxOrNull() ?: 0.0, ftp?.takeIf { it.isFinite() && it > 0 } ?: 0.0)
+        // The same headroom the targets get, so a workout whose top step *is*
+        // FTP does not print its line along the top gridline.
+        ChartTicks.nice(0.0, if (ceiling <= 0) 1.0 else ceiling * 1.1, 4)
+    }
+    // Tick text keeps one decimal only when the value needs it: a ramp whose
+    // axis steps by 0.5 must not read "0, 0, 1, 1".
+    val tickLabels = remember(scale, textMeasurer) {
+        scale.ticks.map { textMeasurer.measure(chartTickLabel(it), profileChartLabelStyle) }
+    }
+    val ftpLabelResult = remember(ftpLabel, textMeasurer) { textMeasurer.measure(ftpLabel, profileChartLabelStyle) }
+    val zeroLabel = remember(textMeasurer) { textMeasurer.measure("0", profileChartLabelStyle) }
+    val lengthLabel = remember(timeMax, textMeasurer) { textMeasurer.measure(chartTickLabel(timeMax), profileChartLabelStyle) }
+    val yTitleResult = remember(powerAxisTitle, textMeasurer) { textMeasurer.measure(powerAxisTitle, profileChartLabelStyle) }
+    val xTitleResult = remember(timeAxisTitle, textMeasurer) { textMeasurer.measure(timeAxisTitle, profileChartLabelStyle) }
 
     Box(
         modifier = modifier
@@ -909,9 +1060,12 @@ private fun CalendarWorkoutProfileChart(
             .padding(6.dp),
     ) {
         if (steps.isEmpty() || timeMax <= 0 || !timeMax.isFinite()) {
+            // This sentence sits directly under a planned workout's name, so
+            // "nothing planned or recorded on this day" is a contradiction
+            // here. The blocks exist; none of them carries a target to plot.
             Box(modifier = Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
                 Text(
-                    text = stringResource(R.string.calendar_day_empty),
+                    text = noTargets,
                     style = TextStyle(fontSize = 13.sp, color = Palette.muted),
                 )
             }
@@ -926,15 +1080,6 @@ private fun CalendarWorkoutProfileChart(
                 val plotTop = padTop
                 val plotBottom = size.height - padBottom
 
-                val targets = steps.flatMap {
-                    listOfNotNull(
-                        CalendarWorkoutFormatting.chartTarget(it.targetStart, ftp),
-                        CalendarWorkoutFormatting.chartTarget(it.targetEnd, ftp),
-                    )
-                }
-                val valueMax = (targets.maxOrNull() ?: 0.0).let { if (it <= 0) 1.0 else it * 1.1 }
-                val scale: TickScale = ChartTicks.nice(0.0, valueMax, 4)
-
                 fun xPos(seconds: Double): Float =
                     plotLeft + (seconds / timeMax).toFloat() * (plotRight - plotLeft)
 
@@ -942,7 +1087,7 @@ private fun CalendarWorkoutProfileChart(
                     plotBottom - (value / scale.upper).toFloat() * (plotBottom - plotTop)
 
                 // Grid and y labels on the nice ticks.
-                for (tick in scale.ticks) {
+                scale.ticks.forEachIndexed { index, tick ->
                     val y = yPos(tick)
                     drawLine(
                         color = Palette.surfaceBorder,
@@ -950,10 +1095,7 @@ private fun CalendarWorkoutProfileChart(
                         end = Offset(plotRight, y),
                         strokeWidth = 1f,
                     )
-                    val label = textMeasurer.measure(
-                        text = "${tick.toInt()}",
-                        style = TextStyle(fontSize = 9.sp, color = Palette.muted),
-                    )
+                    val label = tickLabels[index]
                     drawText(
                         textLayoutResult = label,
                         topLeft = Offset(4.dp.toPx(), y - label.size.height / 2f),
@@ -987,47 +1129,40 @@ private fun CalendarWorkoutProfileChart(
                 }
 
                 // FTP across the chart, dashed, in watts mode only (in %FTP
-                // mode the scale is already FTP-relative).
-                if (hasFtp && ftp in scale.lower..scale.upper) {
+                // mode the scale is already FTP-relative). The axis is built to
+                // reach it, so there is no "is it inside the plot" question to
+                // ask -- and asking it used to drop the line for every workout
+                // below threshold, which is the whole reason to draw it.
+                if (ftp != null && hasFtp) {
+                    val ftpY = yPos(ftp)
                     drawLine(
                         color = Palette.muted,
-                        start = Offset(plotLeft, yPos(ftp)),
-                        end = Offset(plotRight, yPos(ftp)),
+                        start = Offset(plotLeft, ftpY),
+                        end = Offset(plotRight, ftpY),
                         strokeWidth = 1f,
                         pathEffect = PathEffect.dashPathEffect(floatArrayOf(10f, 8f)),
                     )
-                    val label = textMeasurer.measure(
-                        text = ftpLabel,
-                        style = TextStyle(fontSize = 9.sp, color = Palette.muted),
-                    )
                     drawText(
-                        textLayoutResult = label,
-                        topLeft = Offset(plotRight - label.size.width, yPos(ftp) - label.size.height - 2f),
+                        textLayoutResult = ftpLabelResult,
+                        topLeft = Offset(plotRight - ftpLabelResult.size.width, ftpY - ftpLabelResult.size.height - 2f),
                     )
                 }
 
                 // x end labels: 0 and the profile's length in seconds.
-                val zero = textMeasurer.measure("0", style = TextStyle(fontSize = 9.sp, color = Palette.muted))
-                drawText(textLayoutResult = zero, topLeft = Offset(plotLeft, plotBottom + 2.dp.toPx()))
-                val end = textMeasurer.measure(
-                    text = "${timeMax.toInt()}",
-                    style = TextStyle(fontSize = 9.sp, color = Palette.muted),
-                )
-                drawText(textLayoutResult = end, topLeft = Offset(plotRight - end.size.width, plotBottom + 2.dp.toPx()))
-
-                // Axis titles: y at the top-left, x along the bottom.
-                val yTitle = textMeasurer.measure(
-                    powerAxisTitle,
-                    style = TextStyle(fontSize = 9.sp, color = Palette.muted),
-                )
-                drawText(textLayoutResult = yTitle, topLeft = Offset(2.dp.toPx(), 0f))
-                val xTitle = textMeasurer.measure(
-                    timeAxisTitle,
-                    style = TextStyle(fontSize = 9.sp, color = Palette.muted),
+                drawText(
+                    textLayoutResult = zeroLabel,
+                    topLeft = Offset(plotLeft, plotBottom + 2.dp.toPx()),
                 )
                 drawText(
-                    textLayoutResult = xTitle,
-                    topLeft = Offset((plotLeft + plotRight) / 2f - xTitle.size.width / 2f, size.height - xTitle.size.height - 1f),
+                    textLayoutResult = lengthLabel,
+                    topLeft = Offset(plotRight - lengthLabel.size.width, plotBottom + 2.dp.toPx()),
+                )
+
+                // Axis titles: y at the top-left, x along the bottom.
+                drawText(textLayoutResult = yTitleResult, topLeft = Offset(2.dp.toPx(), 0f))
+                drawText(
+                    textLayoutResult = xTitleResult,
+                    topLeft = Offset((plotLeft + plotRight) / 2f - xTitleResult.size.width / 2f, size.height - xTitleResult.size.height - 1f),
                 )
             }
         }

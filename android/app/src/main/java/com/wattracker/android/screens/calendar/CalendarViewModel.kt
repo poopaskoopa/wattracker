@@ -35,6 +35,15 @@ data class CalendarUiState(
     val month: CalendarMonth = CalendarMonth.current(),
     /** The month on screen; null is the honest "nothing to show" state, never a blank grid. */
     val data: CalendarData? = null,
+    /**
+     * The month on screen was read successfully and its own days held nothing.
+     *
+     * The screen needs this to say which of two very different empties it is
+     * looking at: "nothing planned or recorded in September" (the rider can
+     * step to another month) versus "your backend has published no calendar
+     * at all". Without it both read the same sentence, and the first one lied.
+     */
+    val monthIsEmpty: Boolean = false,
     val selectedDate: String? = null,
 ) {
     val selectedDay: CalendarDayEntry?
@@ -134,11 +143,29 @@ class CalendarViewModel(
      * right away, the way iOS does, and the month's own cache paints under
      * it while the network read runs; the load in flight -- the month just
      * left -- is superseded and its answer is dropped.
+     *
+     * The grid that was up goes with the old month, and the spinner takes
+     * its place until the new month's cache paints. Leaving the previous
+     * month's rows up is the blank grid that looks synced: the header says
+     * June, the cells are May's apart from the overlap week, and the
+     * "updated" stamp is May's. iOS keeps those rows here; Android is
+     * deliberately the more literal of the two about what is on screen.
      */
     fun moveMonth(offset: Int) {
         val target = _uiState.value.month.addingMonths(offset)
         if (offset == 0) return
-        _uiState.update { it.copy(month = target, selectedDate = null) }
+        _uiState.update {
+            it.copy(
+                month = target,
+                selectedDate = null,
+                data = null,
+                monthIsEmpty = false,
+                // A month move is always a read, so the spinner owns the body
+                // immediately rather than for one frame the "nothing yet" card.
+                isLoading = true,
+                error = null,
+            )
+        }
         loadJob?.cancel()
         loadIdentity = readModel.identity
         loadMonth = target
@@ -166,6 +193,7 @@ class CalendarViewModel(
                     throttledRetrySeconds = null,
                     error = null,
                     data = null,
+                    monthIsEmpty = false,
                     selectedDate = null,
                 )
             }
@@ -178,13 +206,19 @@ class CalendarViewModel(
         if (shownIdentity != identity) {
             shownIdentity = null
             currentFTP = null
-            _uiState.update { it.copy(data = null, selectedDate = null) }
+            _uiState.update { it.copy(data = null, monthIsEmpty = false, selectedDate = null) }
         }
 
         // 1. The month's cache first, so the network is not on the first-paint path.
+        // The cached dashboard rides along: iOS's `start` reads FTP from it too,
+        // which is what keeps a cold start that never finishes its dashboard
+        // read -- the rider paged months, each move superseding the last load --
+        // from painting every later month's targets as "% FTP" only.
+        val cachedDashboard = cachedOrNull(CloudRoute.Dashboard, null)
+        var dashboard = cachedDashboard
         val cached = cachedOrNull(CloudRoute.Calendar, month)
         if (cached != null && stillCurrent(generation, month)) {
-            val ftp = CalendarData.currentFTP(cachedOrNull(CloudRoute.Dashboard, null)) ?: currentFTP
+            val ftp = CalendarData.currentFTP(cachedDashboard) ?: currentFTP
             apply(generation, month, cached, cachedOrNull(CloudRoute.Activities, null), ftp)
             checkActive()
         }
@@ -208,6 +242,9 @@ class CalendarViewModel(
 
         // The linked-ride summaries. A missing activities collection must not
         // hide the calendar, but a terminal session state must not be eaten.
+        // Re-read per month, as iOS's `moveMonth` does: the summaries are what
+        // turn a completed workout into the ride row under it, and the desktop
+        // answer is one rider's history, not a paging problem.
         var activities = cachedOrNull(CloudRoute.Activities, null)
         try {
             activities = readModel.load(CloudRoute.Activities, null)
@@ -224,8 +261,7 @@ class CalendarViewModel(
 
         if (refreshDashboard) {
             try {
-                val dashboard = readModel.load(CloudRoute.Dashboard, null)
-                CalendarData.currentFTP(dashboard)?.let { currentFTP = it }
+                dashboard = readModel.load(CloudRoute.Dashboard, null)
             } catch (e: CancellationException) {
                 throw e
             } catch (e: Exception) {
@@ -234,14 +270,23 @@ class CalendarViewModel(
                     showFailure(e)
                     return
                 }
-                // A dashboard outage must not hide a usable calendar; the
-                // last FTP (if any) keeps the targets in watts.
+                // A dashboard outage must not hide a usable calendar; `dashboard`
+                // stays the cached one and the last FTP keeps the watts.
             }
         }
         if (!stillCurrent(generation, month)) return
 
         shownIdentity = identity
-        apply(generation, month, fresh, activities, currentFTP)
+        apply(
+            generation,
+            month,
+            fresh,
+            activities,
+            // iOS's `moveMonth` re-uses the FTP it already has; a month move
+            // never re-reads the dashboard, so the cached one (or the last
+            // read) is what keeps a month's steps in watts.
+            CalendarData.currentFTP(dashboard) ?: currentFTP,
+        )
         checkActive()
     }
 
@@ -267,14 +312,30 @@ class CalendarViewModel(
             ),
         )
         if (!stillCurrent(generation, month)) return
+        // The FTP the screen is painting with is now the FTP the screen has:
+        // iOS's `apply` stores what it was given, cache path included, and a
+        // month move that skips the dashboard read depends on that.
+        currentFTP = ftp
         val data = CalendarData(grid, activities, ftp)
-        // Whether the month has data at all is still decided by the month
-        // alone: adjacent-month edge cells are context, not content.
-        val monthHasContent = CalendarData(snapshot).hasContent
-        if (monthHasContent) {
-            _uiState.update { it.copy(isLoading = false, isRefreshing = false, data = data, error = null) }
+        // Whether the month has data at all is decided by the month's own days:
+        // adjacent-month edge cells are context, not content, and the cloud's
+        // one feed spans every month -- judging the month over that snapshot
+        // would call an empty September "has content" because October rode.
+        if (data.hasContentIn(month)) {
+            _uiState.update {
+                it.copy(isLoading = false, isRefreshing = false, data = data, monthIsEmpty = false, error = null)
+            }
         } else {
-            _uiState.update { it.copy(isLoading = false, isRefreshing = false, data = null, error = null, selectedDate = null) }
+            _uiState.update {
+                it.copy(
+                    isLoading = false,
+                    isRefreshing = false,
+                    data = null,
+                    monthIsEmpty = true,
+                    error = null,
+                    selectedDate = null,
+                )
+            }
         }
     }
 

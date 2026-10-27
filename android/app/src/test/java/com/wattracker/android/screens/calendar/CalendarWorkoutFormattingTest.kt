@@ -11,9 +11,11 @@ import org.junit.Test
 
 /**
  * The step list under the profile chart -- iOS `CalendarWorkoutFormatting`
- * ported case for case, including the rounding posture (half-to-even, as
- * Python's `round()` and Swift's `.toNearestOrEven` do it) so all three
- * clients name the same block the same watts.
+ * ported case for case, including both rounding postures, which are not one
+ * posture: step watts are half-to-even (the publisher's Python `round()` and
+ * iOS's `.rounded(.toNearestOrEven)`), while a printed percent rounds its half
+ * away from zero (the desktop's `Math.round` and iOS's `.rounded()`). All three
+ * clients name the same block the same watts, and print the same percent.
  */
 class CalendarWorkoutFormattingTest {
 
@@ -162,13 +164,41 @@ class CalendarWorkoutFormattingTest {
     }
 
     @Test
-    fun roundingIsHalfToEvenLikePythonAndSwift() {
+    fun stepWattsAreHalfToEvenLikePythonAndSwift() {
         // 0.5 * 5 = 2.5 -> 2, not 3. `Math.rint` is half-to-even, matching
         // `round()` in Python and `.rounded(.toNearestOrEven)` in Swift.
         assertEquals(2, CalendarWorkoutFormatting.target(0.5, 5.0))
         assertEquals(200, CalendarWorkoutFormatting.target(0.8, 250.0))
         assertNullish(CalendarWorkoutFormatting.target(0.8, 0.0))
         assertNullish(CalendarWorkoutFormatting.target(null, 250.0))
+    }
+
+    @Test
+    fun printedPercentsRoundTheirHalfAwayFromZero() {
+        // The other posture, and this is the one the port had wrong: 0.625 is
+        // 62.5%, the desktop's `Math.round(frac * 100)` prints "63%" and so
+        // does iOS's `.rounded()`, while half-to-even `Math.rint` printed
+        // "62%" -- a percentage the other two clients never show.
+        assertEquals("63%", CalendarWorkoutFormatting.percent(0.625))
+        assertEquals("13%", CalendarWorkoutFormatting.percent(0.125))
+        assertEquals("80%", CalendarWorkoutFormatting.percent(0.8))
+        assertEquals("100%", CalendarWorkoutFormatting.percent(1.0))
+        assertNullish(CalendarWorkoutFormatting.percent(null as Double?))
+    }
+
+    @Test
+    fun theAtFtpLabelRoundsRatherThanTruncates() {
+        // The step lines under "at FTP N W" are computed from the *unrounded*
+        // FTP, so the header has to round to the nearest watt or it argues with
+        // them: FTP 249.7 used to read "249 W" next to watts built on 249.7.
+        // iOS prints `Int(ftp.rounded(.toNearestOrEven))`; same posture as the
+        // step watts, one half away from even.
+        assertEquals(250, CalendarWorkoutFormatting.ftpWatts(249.7))
+        assertEquals(250, CalendarWorkoutFormatting.ftpWatts(250.0))
+        assertEquals(250, CalendarWorkoutFormatting.ftpWatts(250.5))
+        assertEquals(251, CalendarWorkoutFormatting.ftpWatts(250.6))
+        assertNullish(CalendarWorkoutFormatting.ftpWatts(0.0))
+        assertNullish(CalendarWorkoutFormatting.ftpWatts(null as Double?))
     }
 
     @Test
@@ -212,7 +242,8 @@ class CalendarWorkoutFormattingTest {
         assertFalse(blocks.any { it.kind.isEmpty() })
     }
 
-    private fun assertNullish(value: Int?) {
+    /** Used for both the watt and the percent readers, which answer different types. */
+    private fun assertNullish(value: Any?) {
         org.junit.Assert.assertNull(value)
     }
 }

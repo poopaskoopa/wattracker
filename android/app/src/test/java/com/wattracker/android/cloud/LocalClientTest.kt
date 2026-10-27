@@ -39,13 +39,24 @@ class LocalClientTest {
         var apiCalendarResponse: (String) -> LocalResponse = { url ->
             LocalResponse(status = 200, body = "{\"weeks\": []}".toByteArray(Charsets.UTF_8), url = url)
         }
+        var apiActivitiesResponse = LocalResponse(
+            status = 200,
+            body = "[]".toByteArray(Charsets.UTF_8),
+            url = "http://10.0.2.2:8000/api/activities",
+        )
+        /** Runs as a calendar request arrives, before it is answered. */
+        var onCalendarRequest: (String) -> Unit = {}
 
         override suspend fun send(request: LocalRequest): LocalResponse {
             requests.add(request)
             return when {
                 request.url.contains("/api/connector/session") -> sessionTicketResponse
                 request.url.contains("/connector/session") -> redeemResponse
-                request.url.contains("/api/calendar") -> apiCalendarResponse(request.url)
+                request.url.contains("/api/calendar") -> {
+                    onCalendarRequest(request.url)
+                    apiCalendarResponse(request.url)
+                }
+                request.url.contains("/api/activities") -> apiActivitiesResponse
                 request.url.contains("/api/state") -> apiStateResponse
                 else -> LocalResponse(status = 200, body = "{}".toByteArray(Charsets.UTF_8), url = request.url)
             }
@@ -651,5 +662,61 @@ class LocalClientTest {
         val request = transport.requests.last { it.url.contains("/api/calendar") }
         assertTrue(request.url.contains("year=2026"))
         assertTrue(request.url.contains("month=5"))
+    }
+
+    @Test
+    fun oneReadDoesNotEvictAnotherRoutesCache() = runTest {
+        // The calendar screen reads the dashboard for the FTP and then asks
+        // what is cached for the activities it read moments before. With one
+        // cache slot shared by every route, that question answered "nothing":
+        // the next month's cache-first paint had no linked-ride summaries and
+        // the day cells flickered their counts off and back on. iOS's
+        // LocalBackend keeps a collection per route, so this does too.
+        val transport = FakeLocalTransport().apply {
+            apiActivitiesResponse = LocalResponse(
+                status = 200,
+                body = "[{\"id\": 7, \"name\": \"Ride\", \"duration_s\": 3600}]".toByteArray(Charsets.UTF_8),
+                url = "http://10.0.2.2:8000/api/activities",
+            )
+        }
+        val creds = LocalCredentials("http://10.0.2.2:8000", "token")
+        val client = LocalClient(credentialsProvider = { creds }, transport = transport, isDebug = true)
+
+        client.load(CloudRoute.Activities)
+        client.load(CloudRoute.Dashboard)
+
+        val activities = client.cached(CloudRoute.Activities)
+        assertNotNull("the activities outlive the dashboard read", activities)
+        assertEquals(1, activities!!.items.size)
+        assertNotNull(client.cached(CloudRoute.Dashboard))
+    }
+
+    @Test
+    fun aCalendarReadThatOutlivesAResetIsNotStored() = runTest {
+        // A re-pair, a sign-out or a removal bumps the identity while a month
+        // read is in flight. The desktop's answer belongs to the pairing that
+        // has gone: the caller drops it, and it must not reach the accumulated
+        // calendar either, where it would sit and reappear on every later
+        // month visit under the new credential.
+        lateinit var client: LocalClient
+        val transport = FakeLocalTransport().apply {
+            apiCalendarResponse = { url ->
+                LocalResponse(
+                    status = 200,
+                    body = calendarBody(listOf("2026-05-04" to true)).toByteArray(Charsets.UTF_8),
+                    url = url,
+                )
+            }
+            onCalendarRequest = { client.reset() }
+        }
+        val creds = LocalCredentials("http://10.0.2.2:8000", "token")
+        client = LocalClient(credentialsProvider = { creds }, transport = transport, isDebug = true)
+
+        val read = client.load(CloudRoute.Calendar, CalendarMonth(2026, 5))
+        assertEquals("the caller still gets its answer to discard", 1, read.items.size)
+        assertNull(
+            "the departed pairing's rows never enter the new one's cache",
+            client.cached(CloudRoute.Calendar, CalendarMonth(2026, 5)),
+        )
     }
 }

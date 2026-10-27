@@ -79,11 +79,22 @@ data class VolumeData(
     val source: CloudSnapshot.Source,
     val asOf: Long,
 ) {
-    constructor(snapshot: CloudSnapshot) : this(
-        weeks = parse(snapshot),
-        denseWeeks = densify(parse(snapshot)),
-        source = snapshot.source,
-        asOf = snapshot.asOf,
+    /**
+     * One snapshot, read once: the dense fill works on the same list the
+     * screen shows, so parsing the snapshot twice only doubled the walk (and
+     * left two chances for the two halves to disagree).
+     */
+    constructor(snapshot: CloudSnapshot) : this(parse(snapshot), snapshot.source, snapshot.asOf)
+
+    private constructor(
+        weeks: List<VolumeWeek>,
+        source: CloudSnapshot.Source,
+        asOf: Long,
+    ) : this(
+        weeks = weeks,
+        denseWeeks = densify(weeks),
+        source = source,
+        asOf = asOf,
     )
 
     companion object {
@@ -185,5 +196,12 @@ object VolumeFormat {
         return "$text ${metric.unit}"
     }
 
-    fun percent(value: Double): String = String.format(Locale.US, "%+.0f%%", value * 100)
+    /**
+     * A change as a signed whole percent. No sign is printed for zero: the
+     * desktop prints `pct.toFixed(0)` with the "+" only when the number is
+     * above zero, and a change of exactly zero gets its own flat marker in the
+     * screen rather than a "+0%" wearing an up arrow.
+     */
+    fun percent(value: Double): String =
+        String.format(Locale.US, "%s%.0f%%", if (value > 0.0) "+" else "", value * 100)
 }

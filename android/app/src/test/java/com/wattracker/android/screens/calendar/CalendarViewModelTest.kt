@@ -10,6 +10,7 @@ import com.wattracker.android.cloud.CloudSession
 import com.wattracker.android.cloud.CloudSnapshot
 import com.wattracker.android.cloud.LocalClientException
 import com.wattracker.android.cloud.ReadSession
+import com.wattracker.android.cloud.TrainingState
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.ExperimentalCoroutinesApi
 import kotlinx.coroutines.test.UnconfinedTestDispatcher
@@ -19,6 +20,7 @@ import kotlinx.coroutines.test.setMain
 import kotlinx.coroutines.Dispatchers
 import org.junit.After
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNotNull
 import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
@@ -58,10 +60,14 @@ class CalendarViewModelTest {
     ) : ReadSession {
         val loads = mutableListOf<Pair<CloudRoute, CalendarMonth?>>()
         var retryCalls = 0
+        /** Flip off to model a cache that no longer holds anything for a route. */
+        var cacheServes = true
 
         override suspend fun cached(route: CloudRoute): CloudSnapshot? = cached(route, null)
-        override suspend fun cached(route: CloudRoute, month: CalendarMonth?): CloudSnapshot? =
-            cachedSnapshots[route to month] ?: cachedSnapshots[route to null]
+        override suspend fun cached(route: CloudRoute, month: CalendarMonth?): CloudSnapshot? {
+            if (!cacheServes) return null
+            return cachedSnapshots[route to month] ?: cachedSnapshots[route to null]
+        }
         override suspend fun load(route: CloudRoute): CloudSnapshot = load(route, null)
         override suspend fun load(route: CloudRoute, month: CalendarMonth?): CloudSnapshot {
             loads.add(route to month)
@@ -126,16 +132,133 @@ class CalendarViewModelTest {
         assertTrue(session.loads.any { it == (CloudRoute.Calendar to may) })
     }
 
+    /**
+     * An empty month is its own state, and -- the part the first version of
+     * this test did not check -- a state the rider can leave. The month
+     * chevrons used to live inside the grid, so a month the backend answered
+     * empty had no way out except changing backend or killing the app.
+     */
     @Test
-    fun emptyMonthIsTheNoDataStateNotABlankGrid() = runTest(testDispatcher) {
+    fun anEmptyMonthSaysSoAndStaysNavigable() = runTest(testDispatcher) {
         val session = FakeReadSession(
-            loadHandler = { route, _ -> CloudSnapshot(route, 1, emptyList(), CloudSnapshot.Source.network, 2000L) },
+            loadHandler = { route, month ->
+                when {
+                    route != CloudRoute.Calendar -> CloudSnapshot(route, 1, emptyList(), CloudSnapshot.Source.network, 2000L)
+                    month == may -> calendarSnapshot(emptyList())
+                    else -> calendarSnapshot(listOf(dayItem(month!!.isoDate(1))))
+                }
+            },
         )
         val vm = CalendarViewModel(session, coroutineScope = backgroundScope)
         vm.moveMonth(monthsFromTodayTo(may))
+        val empty = vm.uiState.value
+        assertNull("an empty month shows no grid", empty.data)
+        assertNull(empty.error)
+        // The screen needs to know this was a read that came back empty, not a
+        // backend that has published nothing at all: the sentence it prints
+        // differs, and the stepper has to be painted above it.
+        assertTrue("the state says 'nothing this month'", empty.monthIsEmpty)
+        assertEquals(may, empty.month)
+
+        vm.moveMonth(1)
+        val moved = vm.uiState.value
+        assertEquals(CalendarMonth(2026, 6), moved.month)
+        assertNotNull("the rider is not trapped in the empty month", moved.data)
+        assertFalse(moved.monthIsEmpty)
+    }
+
+    @Test
+    fun aCloudFeedSpanningTheYearStillCallsAnEmptyMonthEmpty() = runTest(testDispatcher) {
+        // The cloud answers every month out of one whole-feed snapshot, so the
+        // month-level decision cannot be asked of that snapshot -- it holds
+        // October as much as May. Judged over the whole feed, May painted a
+        // blank grid and the honest "nothing this month" state never appeared
+        // on the cloud at all, only on the local backend.
+        val feed = calendarSnapshot(listOf(dayItem("2026-06-10")))
+        val session = FakeReadSession(
+            loadHandler = { route, _ ->
+                if (route == CloudRoute.Calendar) feed
+                else CloudSnapshot(route, 1, emptyList(), CloudSnapshot.Source.network, 2000L)
+            },
+        )
+        val vm = CalendarViewModel(session, coroutineScope = backgroundScope)
+        vm.moveMonth(monthsFromTodayTo(may))
+        assertTrue("May is empty even though the feed is not", vm.uiState.value.monthIsEmpty)
+        assertNull(vm.uiState.value.data)
+        vm.moveMonth(1)
+        assertNotNull("June comes out of the same feed", vm.uiState.value.data)
+        assertFalse(vm.uiState.value.monthIsEmpty)
+    }
+
+    @Test
+    fun theCachedFtpCarriesIntoEveryMonthThatNeverReadsTheDashboard() = runTest(testDispatcher) {
+        // The cold-start page. Each month move supersedes the load before it,
+        // so on a cold start the first load's dashboard read may never finish,
+        // and a month move does not read the dashboard at all. The FTP has to
+        // come from the cached dashboard and then be *kept*: if it is only a
+        // local variable in the cache paint, every month after the first shows
+        // "% FTP" targets where the rider should see watts.
+        val dashboard = CloudSnapshot(
+            CloudRoute.Dashboard, 1,
+            listOf(
+                CloudItem(
+                    "training-state", CloudKind.TrainingState, 1,
+                    payload = CloudPayload.TrainingState(
+                        TrainingState(ftp = 250.0, cp = null, wprime = null, ctl = null, atl = null, tsb = null, decoupling = null),
+                    ),
+                ),
+            ),
+            CloudSnapshot.Source.cache, 1000L,
+        )
+        val session = FakeReadSession(
+            cachedSnapshots = mapOf((CloudRoute.Dashboard to null) to dashboard),
+            loadHandler = { route, month ->
+                when (route) {
+                    CloudRoute.Calendar -> calendarSnapshot(listOf(dayItem(month!!.isoDate(1))))
+                    else -> CloudSnapshot(route, 1, emptyList(), CloudSnapshot.Source.network, 2000L)
+                }
+            },
+        )
+        val vm = CalendarViewModel(session, coroutineScope = backgroundScope)
+        vm.moveMonth(monthsFromTodayTo(may))
+        assertEquals(250.0, vm.uiState.value.data?.currentFTP)
+        // And then the FTP has to be *kept*, not re-derived: a later month may
+        // find nothing cached for the dashboard, and a month move never re-reads
+        // it. iOS's `apply` stores the FTP it was given and its `moveMonth`
+        // passes that field; the screen's watts depend on both halves.
+        session.cacheServes = false
+        vm.moveMonth(1)
+        assertEquals(250.0, vm.uiState.value.data?.currentFTP)
+        assertEquals(
+            "neither month move asked the dashboard anything",
+            0,
+            session.loads.count { it.first == CloudRoute.Dashboard },
+        )
+    }
+
+    @Test
+    fun movingToAMonthThatCannotBeReadLeavesNoGridUnderTheNewHeader() = runTest(testDispatcher) {
+        // May reads; June cannot, and was never cached. Keeping May's rows up
+        // under a June header is the blank grid that looks synced: the cells
+        // are the wrong month apart from the overlap week, and the "updated"
+        // stamp is May's. The honest answer is the failure, with no grid.
+        val session = FakeReadSession(
+            loadHandler = { route, month ->
+                when {
+                    route != CloudRoute.Calendar -> CloudSnapshot(route, 1, emptyList(), CloudSnapshot.Source.network, 2000L)
+                    month == may -> calendarSnapshot(listOf(dayItem("2026-05-04")))
+                    else -> throw CloudSession.Failure.Offline()
+                }
+            },
+        )
+        val vm = CalendarViewModel(session, coroutineScope = backgroundScope)
+        vm.moveMonth(monthsFromTodayTo(may))
+        assertNotNull(vm.uiState.value.data)
+        vm.moveMonth(1)
         val state = vm.uiState.value
-        assertNull("an empty month shows no grid", state.data)
-        assertNull(state.error)
+        assertNull("June's body is not May's rows", state.data)
+        assertNotNull("and the failure says why it is empty", state.error)
+        assertFalse("an unread month is not reported as an empty one", state.monthIsEmpty)
     }
 
     @Test

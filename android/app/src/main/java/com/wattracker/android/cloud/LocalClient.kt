@@ -64,8 +64,17 @@ class LocalClient(
     @Volatile private var activeSession: ActiveSession? = null
     @Volatile private var isRevoked: Boolean = false
     @Volatile private var lastSuccessfulRead: Long? = null
-    @Volatile private var cachedState: CloudSnapshot? = null
     @Volatile private var sessionIdentity = 0
+
+    /**
+     * Everything read and kept for later: one slot **per route**, all guarded
+     * by [cacheLock]. The single slot this used to be meant the calendar
+     * screen's dashboard read (for the FTP) evicted the activities snapshot it
+     * had just asked for, so the next month's cache-first paint had no linked
+     * ride summaries and the day cells flickered their counts. iOS's
+     * `LocalBackend` keeps a `CachedCollection` per route for the same reason.
+     */
+    private val cachedRoutes = HashMap<CloudRoute, CloudSnapshot>()
 
     /**
      * The calendar rows read so far, all months accumulated. The desktop
@@ -74,9 +83,18 @@ class LocalClient(
      * the cloud's Room cache gets that accumulation for free from its one
      * whole-feed collection; here the adapter accumulates it.
      */
-    @Volatile private var cachedCalendar: CloudSnapshot? = null
-    // The per-month views derived from [cachedCalendar]. Cleared with it.
+    private var cachedCalendar: CloudSnapshot? = null
+
+    /** The per-month views derived from [cachedCalendar]. Cleared with it. */
     private val calendarCache = HashMap<CalendarMonth, CloudSnapshot>()
+
+    /**
+     * Guards the three caches above. They are read-modify-written (a month
+     * view is derived from the accumulated rows; an accumulated month is
+     * merged into what is already there), so `@Volatile` on the fields would
+     * not make those sequences safe on their own.
+     */
+    private val cacheLock = Any()
 
     val credentials: LocalCredentials?
         get() = credentialsProvider()
@@ -112,12 +130,16 @@ class LocalClient(
 
     fun reset() {
         activeSession = null
-        cachedState = null
-        cachedCalendar = null
-        synchronized(calendarCache) { calendarCache.clear() }
         lastSuccessfulRead = null
         // New credential (or none): anything read under the old one is stale.
-        sessionIdentity += 1
+        // Bumped under the cache lock, so a read that started before this and
+        // finishes after it can see it was superseded and drop its rows.
+        synchronized(cacheLock) {
+            sessionIdentity += 1
+            cachedRoutes.clear()
+            cachedCalendar = null
+            calendarCache.clear()
+        }
     }
 
     fun markRemoved() {
@@ -145,15 +167,20 @@ class LocalClient(
      * show "no data" honestly rather than a blank grid that looks synced.
      */
     override suspend fun cached(route: CloudRoute, month: CalendarMonth?): CloudSnapshot? {
-        if (route != CloudRoute.Calendar) return cachedState?.takeIf { it.route == route }
+        if (route != CloudRoute.Calendar) return synchronized(cacheLock) { cachedRoutes[route] }
         val wanted = month ?: CalendarMonth.current(clock())
-        synchronized(calendarCache) { calendarCache[wanted] }?.let { return it }
-        val accumulated = cachedCalendar ?: return null
-        val items = accumulated.items.filter { calendarMonthOf(it) == wanted }
-        if (items.isEmpty()) return null
-        val view = CloudSnapshot(CloudRoute.Calendar, accumulated.revision, items, accumulated.source, accumulated.asOf)
-        synchronized(calendarCache) { calendarCache[wanted] = view }
-        return view
+        // The derive-and-store is one step, not two: reading the accumulated
+        // rows, then writing the month view back is a read-modify-write, and
+        // splitting it across two locks let a concurrent store land between.
+        synchronized(cacheLock) {
+            calendarCache[wanted]?.let { return it }
+            val accumulated = cachedCalendar ?: return null
+            val items = accumulated.items.filter { calendarMonthOf(it) == wanted }
+            if (items.isEmpty()) return null
+            val view = CloudSnapshot(CloudRoute.Calendar, accumulated.revision, items, accumulated.source, accumulated.asOf)
+            calendarCache[wanted] = view
+            return view
+        }
     }
 
     /**
@@ -225,6 +252,12 @@ class LocalClient(
     override suspend fun load(route: CloudRoute, month: CalendarMonth?): CloudSnapshot {
         val cred = requireCredentials()
         val validUrl = validateServerUrl(cred.serverUrl, isDebug)
+        // The identity this read answers for. A re-pair, sign-out or removal
+        // during the read bumps it ([reset]), and the answer then belongs to a
+        // credential the rider has left: it still goes back to the caller,
+        // whose own identity check drops it, but it never enters a cache the
+        // new pairing reads. Captured before any network work.
+        val readIdentity = sessionIdentity
         val requestedMonth = if (route == CloudRoute.Calendar) month ?: CalendarMonth.current(clock()) else null
 
         val items = when (route) {
@@ -237,7 +270,6 @@ class LocalClient(
             CloudRoute.Races -> loadRaces(cred, validUrl, CalendarMonth.current(clock()))
         }
 
-        lastSuccessfulRead = clock()
         val snapshot = CloudSnapshot(
             route = route,
             revision = 1,
@@ -245,7 +277,7 @@ class LocalClient(
             source = CloudSnapshot.Source.network,
             asOf = clock(),
         )
-        if (requestedMonth != null) storeCalendar(snapshot, requestedMonth) else cachedState = snapshot
+        storeSnapshot(snapshot, requestedMonth, readIdentity)
         return snapshot
     }
 
@@ -419,21 +451,38 @@ class LocalClient(
     }
 
     /**
-     * Merge one month's read into the accumulated calendar: the months that
-     * did not take part in this request are kept exactly as they were, this
-     * month's rows are replaced by what just arrived, and only this month's
-     * derived view is refreshed (the iOS `LocalBackend.store` rule).
+     * Write what was just read, unless the credential behind it changed while
+     * the read was in flight -- [sessionIdentity] is the version stamp that
+     * says so.
+     *
+     * The calendar is the case that matters: its rows accumulate across month
+     * visits, so a month belonging to a pairing that has already gone, written
+     * after a re-pair, would sit in the new pairing's cache and come back on
+     * every visit afterwards. A dropped write does not count as a successful
+     * read either -- the new credential never saw that server answer.
+     *
+     * The merge rule is unchanged: months that did not take part in this
+     * request are kept exactly as they were, this month's rows are replaced by
+     * what just arrived, and only this month's derived view is refreshed (the
+     * iOS `LocalBackend.store` rule). The whole of it is one locked step, so
+     * the read of the accumulated rows and the write back cannot interleave.
      */
-    private fun storeCalendar(monthSnapshot: CloudSnapshot, month: CalendarMonth) {
-        val existing = cachedCalendar?.items ?: emptyList()
-        val retained = existing.filter { calendarMonthOf(it) != month }
-        cachedCalendar = CloudSnapshot(
-            CloudRoute.Calendar, monthSnapshot.revision, retained + monthSnapshot.items,
-            monthSnapshot.source, monthSnapshot.asOf,
-        )
-        synchronized(calendarCache) {
+    private fun storeSnapshot(snapshot: CloudSnapshot, month: CalendarMonth?, readIdentity: Int) {
+        synchronized(cacheLock) {
+            if (sessionIdentity != readIdentity) return
+            lastSuccessfulRead = snapshot.asOf
+            if (month == null) {
+                cachedRoutes[snapshot.route] = snapshot
+                return
+            }
+            val existing = cachedCalendar?.items ?: emptyList()
+            val retained = existing.filter { calendarMonthOf(it) != month }
+            cachedCalendar = CloudSnapshot(
+                CloudRoute.Calendar, snapshot.revision, retained + snapshot.items,
+                snapshot.source, snapshot.asOf,
+            )
             calendarCache.clear()
-            calendarCache[month] = monthSnapshot
+            calendarCache[month] = snapshot
         }
     }
 

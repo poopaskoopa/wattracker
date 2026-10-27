@@ -156,6 +156,10 @@ class VolumeDataTest {
         assertEquals("240 TSS", VolumeFormat.value(240.0, VolumeMetric.Tss))
         assertEquals("+100%", VolumeFormat.percent(1.0))
         assertEquals("-25%", VolumeFormat.percent(-0.25))
+        // No sign for a window that did not move. The screen pairs the number
+        // with an arrow, and the desktop prints a flat marker and a bare "0%"
+        // -- "+0%" under an up arrow reads as growth.
+        assertEquals("0%", VolumeFormat.percent(0.0))
     }
 
     /** Monday of the n-th week of May 2026, for synthetic ranges. */

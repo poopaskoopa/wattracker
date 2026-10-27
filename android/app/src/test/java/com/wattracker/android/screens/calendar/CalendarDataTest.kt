@@ -158,10 +158,16 @@ class CalendarDataTest {
     }
 
     @Test
-    fun phaseAloneIsContextNotContent() {
-        // A plan window stamps its phase on every day it covers. If that
-        // counted as content, the accent border would light up the whole
-        // month and stop meaning anything -- iOS's rule, ported.
+    fun phaseIsTheMonthsContentButNotTheCells() {
+        // Two questions, two flags, and the #456 review caught the port asking
+        // the first with the second. Does this month hold a calendar? A plan
+        // window stamps its phase on every day it covers, so yes -- iOS's
+        // `hasContent` counts `phase != nil` and decides the same way, and a
+        // month whose only content is the plan still shows its grid. Did
+        // something happen on this day? No -- and the accent border answers
+        // *that*, so counting the phase there lit up the whole window on the
+        // paired tablets. Android's border deliberately differs.
+        val may = CalendarMonth(2026, 5)
         val data = CalendarData(
             calendarSnapshot(
                 listOf(dayItem("p", "2026-05-20", phase = "build")),
@@ -169,8 +175,35 @@ class CalendarDataTest {
         )
         val day = data.days.single()
         assertEquals("build", day.phase)
-        assertFalse(day.hasContent)
-        assertFalse("the month stays a no-data month", data.hasContent)
+        assertTrue("the month has a plan in it", data.hasContent)
+        assertTrue("and that plan is this month's own", data.hasContentIn(may))
+        assertFalse("the cell stays unbordered", day.hasCellContent)
+        assertFalse("the compact dot stays off", day.hasCellContent)
+    }
+
+    @Test
+    fun aNeighboursBusyDayDoesNotMakeThisMonthLookFull() {
+        // The cloud answers every month out of one whole-feed snapshot, so the
+        // month-level decision has to be asked of the month. Judged over the
+        // list the grid was built from, an empty September read as "has
+        // content" merely because October rode, and the screen painted a blank
+        // grid instead of saying what it had found.
+        val snapshot = calendarSnapshot(
+            listOf(
+                dayItem("calendar-day-2026-10-05", "2026-10-05", workouts = listOf(workout(1.0, "Repeats"))),
+                dayItem("calendar-day-2026-09-12", "2026-09-12", phase = "base"),
+            ),
+        )
+        val data = CalendarData(snapshot)
+        assertTrue(data.hasContent)
+        assertTrue("the plan phase is September's own content", data.hasContentIn(CalendarMonth(2026, 9)))
+        assertFalse("August holds nothing of its own", data.hasContentIn(CalendarMonth(2026, 8)))
+        assertEquals(
+            "the day lookup is a map now, and finds the same rows",
+            "2026-10-05",
+            data.entry("2026-10-05")?.dateISO,
+        )
+        assertNull(data.entry("2026-08-05"))
     }
 
     @Test
