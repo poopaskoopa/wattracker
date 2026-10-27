@@ -33,7 +33,10 @@
     <string name="settings_cloud_paired_title">Cloud Device Paired</string>
     <string name="settings_cloud_unpaired_title">Pair Cloud Device</string>
     <string name="settings_cloud_unpaired_sub">Enter the 12-symbol pairing code shown in the desktop app or cloud settings.</string>
-    <string name="settings_cloud_degraded_warning">Warning: Encrypted key storage is unavailable on this device. Pairing will last for this session only and will be lost when the app closes.</string>
+    <!-- Two storage failures, not one: the first cannot save a pairing at all,
+         the second is holding one it can no longer read (#457). -->
+    <string name="settings_cloud_store_unavailable_warning">Warning: this device cannot protect a saved pairing, so pairing here lasts only until the app closes.</string>
+    <string name="settings_cloud_vault_unreadable_warning">Warning: the pairing saved on this device could not be read, so it is not in use. Pairing again replaces it.</string>
 
     <string name="settings_local_paired_title">Local Desktop Paired</string>
     <string name="settings_local_unpaired_title">Pair Local Desktop</string>

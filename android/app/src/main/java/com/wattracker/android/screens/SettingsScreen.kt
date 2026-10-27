@@ -56,6 +56,7 @@ import com.wattracker.android.cloud.PairingCode
 import com.wattracker.android.cloud.PairingFailureMessage
 import com.wattracker.android.cloud.RemoveDeviceFailureMessage
 import com.wattracker.android.cloud.RemoveDeviceResult
+import com.wattracker.android.cloud.StoreHealth
 import com.wattracker.android.shell.Panel
 import com.wattracker.android.shell.ScrollableScreenScaffold
 import com.wattracker.android.ui.theme.Palette
@@ -415,7 +416,15 @@ private fun CloudBackendPanel(
                 color = Palette.muted,
             )
 
-            if (WatTrackerApp.credentialStoreDegraded) {
+            // Two storage failures, two different things the rider can do about
+            // them: one store cannot save a pairing at all, the other is holding
+            // one it can no longer read and pairing again replaces it (#457).
+            val storeWarning = when (WatTrackerApp.credentialStoreHealth) {
+                StoreHealth.Unavailable -> R.string.settings_cloud_store_unavailable_warning
+                StoreHealth.UnreadableVault -> R.string.settings_cloud_vault_unreadable_warning
+                StoreHealth.Durable -> null
+            }
+            if (storeWarning != null) {
                 Spacer(modifier = Modifier.height(8.dp))
                 Box(
                     modifier = Modifier
@@ -425,7 +434,7 @@ private fun CloudBackendPanel(
                         .padding(12.dp),
                 ) {
                     Text(
-                        text = stringResource(R.string.settings_cloud_degraded_warning),
+                        text = stringResource(storeWarning),
                         style = MaterialTheme.typography.bodySmall,
                         color = Palette.alert,
                     )

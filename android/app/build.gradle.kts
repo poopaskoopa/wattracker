@@ -108,15 +108,16 @@ dependencies {
     implementation(libs.androidx.core.ktx)
     implementation(libs.androidx.navigation.compose)
 
-    // Step 2 (#194): the revision-keyed cloud cache and the durable credential
-    // store. Room is the AndroidX store; security-crypto backs
-    // EncryptedSharedPreferences for the bearer secrets. Both are AndroidX --
-    // within the epic's dependency rule. Their codegen and runtime only; no
-    // JSON, HTTP or DI library is introduced anywhere (HttpURLConnection +
-    // the in-project JSON model are the rest of the transport).
+    // Step 2 (#194): the revision-keyed cloud cache. Room is the AndroidX
+    // store. The credential store is not a dependency at all (#457): the cloud
+    // binding and the desktop connector token are wrapped by an Android
+    // Keystore AES-GCM key that cannot be exported, which is the property
+    // `security-crypto` used to supply through Tink -- deprecated, and now gone
+    // from the tree. No JSON, HTTP or DI library is introduced anywhere
+    // (HttpURLConnection + the in-project JSON model are the rest of the
+    // transport).
     implementation(libs.androidx.room.runtime)
     implementation(libs.androidx.room.ktx)
-    implementation(libs.androidx.security.crypto)
     implementation(libs.kotlinx.coroutines.core)
     ksp(libs.androidx.room.compiler)
 

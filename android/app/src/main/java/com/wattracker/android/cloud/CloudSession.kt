@@ -46,7 +46,7 @@ data class CloudSnapshot(
  * is a [Mutex] for the state plus a shared [CompletableDeferred] for the one
  * in-flight refresh: the mutex is held only while reading or writing state,
  * and every network call and every blocking store access (Room,
- * EncryptedSharedPreferences) runs with it released -- the network on
+ * the credential vault) runs with it released -- the network on
  * `Dispatchers.IO` in the client, the stores via [onIo] -- so concurrent
  * callers overlap instead of queuing behind a page walk.
  *
@@ -1085,7 +1085,7 @@ class CloudSession(
     }
 
     /**
-     * Run a blocking store access (Room, EncryptedSharedPreferences) off the
+     * Run a blocking store access (Room, the credential vault) off the
      * caller's thread. The session is suspend end to end, so a screen on the
      * main thread never blocks a database or crypto call; only the network
      * also does this (in the transport), and the state mutex is never held

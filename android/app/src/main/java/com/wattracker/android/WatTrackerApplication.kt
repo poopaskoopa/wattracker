@@ -12,14 +12,15 @@ import com.wattracker.android.cloud.CloudSession
 import com.wattracker.android.cloud.DataSource
 import com.wattracker.android.cloud.DeviceCredentialStore
 import com.wattracker.android.cloud.DeviceKeyStore
-import com.wattracker.android.cloud.EncryptedDeviceCredentialStore
 import com.wattracker.android.cloud.HttpUrlCloudTransport
 import com.wattracker.android.cloud.InMemoryDeviceCredentialStore
+import com.wattracker.android.cloud.KeystoreDeviceCredentialStore
 import com.wattracker.android.cloud.LocalClient
 import com.wattracker.android.cloud.LocalCredentials
 import com.wattracker.android.cloud.ReadModel
 import com.wattracker.android.cloud.RemoveDeviceResult
 import com.wattracker.android.cloud.SharedPreferencesRemovalGate
+import com.wattracker.android.cloud.StoreHealth
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineScope
@@ -34,16 +35,17 @@ import kotlinx.coroutines.withContext
 /**
  * Builds and owns the process-wide cloud session, local client, cache, and read seam.
  *
- * Setup is heavy -- two `EncryptedSharedPreferences` (Keystore + Tink keyset),
- * a Keystore key, and Room -- so it runs lazily off the main thread, never
- * synchronously in [onCreate]. The screens depend on the
+ * Setup is heavy -- a Keystore-wrapped credential vault, a Keystore signing
+ * key, and Room -- so it runs lazily off the main thread, never synchronously
+ * in [onCreate]. The screens depend on the
  * [com.wattracker.android.cloud.ReadSession] seam, so they get a [ReadModel]
  * from the suspend accessors below and read `isPaired` off it; the
  * pairing/signing/revocation machinery stays here.
  *
- * A store that will not open -- a corrupt Room file, a corrupt encrypted
- * credential prefs -- is reset rather than allowed to brick the app: the
- * result is an unpaired device, not a crash on every launch.
+ * Nothing here is allowed to brick the app: a corrupt Room file is reset to an
+ * empty cache, and a credential vault this installation cannot open leaves the
+ * device unpaired and says so through [credentialStoreHealth] rather than
+ * throwing on every launch.
  */
 class WatTrackerApplication : Application() {
     override fun onCreate() {
@@ -80,14 +82,22 @@ object WatTrackerApp {
         get() = deviceKey?.kind
 
     /**
-     * Set when the encrypted credential store will not open and the in-memory
-     * fallback is serving: a pairing then works for this launch only and is
-     * lost on the next start. #195's pairing screen must surface this instead
-     * of letting the rider pair into a void; until then this is the record.
+     * What the credential store can promise about the next launch: [StoreHealth.Durable]
+     * normally, [StoreHealth.Unavailable] when the Keystore handed over no key (or
+     * handed over one whose bytes can be read, which this app refuses) and the
+     * in-memory store is serving, and [StoreHealth.UnreadableVault] when a vault
+     * file exists that this installation cannot open -- the key behind it is gone,
+     * or the file was carried in from another device, which is what the backup
+     * rules exist to prevent.
+     *
+     * Pairing into the first two "succeeds" for this launch and is not a pairing
+     * the rider can rely on, so #195's pairing screen must say which of the two
+     * happened instead of letting a rider pair into a void; until that screen
+     * exists this is the record, shown on Settings. Read after [doInit], which
+     * constructs the session and so reads the vault once before any screen asks.
      */
-    @Volatile
-    var credentialStoreDegraded: Boolean = false
-        private set
+    val credentialStoreHealth: StoreHealth
+        get() = credentialStore?.health ?: StoreHealth.Durable
 
     /** Kick the (blocking) setup off the main thread. Idempotent. */
     fun start(context: Context) {
@@ -253,28 +263,42 @@ object WatTrackerApp {
     }
 
     private fun openCredentialStore(context: Context): DeviceCredentialStore {
+        dropLegacyEncryptedStore(context)
         return try {
-            EncryptedDeviceCredentialStore(context)
+            KeystoreDeviceCredentialStore(context)
         } catch (_: Exception) {
-            try {
-                // A corrupt encrypted-prefs file: drop the actual prefs file
-                // (shared_prefs/, not filesDir) and retry.
-                context.deleteSharedPreferences(EncryptedDeviceCredentialStore.FILE_NAME)
-                EncryptedDeviceCredentialStore(context)
-            } catch (_: Exception) {
-                // The encrypted store itself will not open (a corrupt Tink
-                // master keyset): start unpaired from memory rather than
-                // bricking the app. There is no credential to protect that is
-                // not also missing.
-                //
-                // But the fallback is not silent: with it in place a pairing
-                // "succeeds" for this launch and is lost on the next start,
-                // so the state is recorded -- #195's pairing screen must show
-                // it instead of letting the rider pair into a void.
-                credentialStoreDegraded = true
-                InMemoryDeviceCredentialStore()
-            }
+            // The Keystore itself will not take part: it hands over no AES key,
+            // or it hands over one whose bytes can be read, which this app
+            // refuses -- and without a key nothing can be wrapped. Start
+            // unpaired from memory rather than bricking the app: there is no
+            // credential to protect that is not also unusable. The fallback is
+            // not silent either -- the in-memory store reports
+            // `StoreHealth.Unavailable`, so the pairing screen can say this
+            // launch is all a pairing here lasts.
+            InMemoryDeviceCredentialStore()
         }
+    }
+
+    /**
+     * #457 took the credential store off `security-crypto`, and with that library
+     * gone nothing here can read the two files it left behind: the encrypted prefs
+     * and the Tink keyset beside them. Nothing ever shipped them -- no release has
+     * carried the encrypted store, and #199's internal testing starts on this
+     * branch -- so there is nothing to migrate and no rider re-pairs; what exists
+     * is dead bytes on developer and emulator installs, so they are dropped.
+     * Idempotent, and this call can go once no such install is in use.
+     *
+     * The orphan Keystore entry that guarded that keyset is deliberately left
+     * alone: it cannot be exported, it protects nothing now, and the Keystore
+     * takes it back with the app. Naming another library's private alias to delete
+     * it is a coupling worth less than the residue it clears.
+     */
+    private fun dropLegacyEncryptedStore(context: Context) {
+        val prefs = context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+        if (prefs.getBoolean(KEY_LEGACY_STORE_DROPPED, false)) return
+        context.deleteSharedPreferences(LEGACY_CREDENTIAL_PREFS)
+        context.deleteSharedPreferences(LEGACY_CREDENTIAL_KEYSET_PREFS)
+        prefs.edit().putBoolean(KEY_LEGACY_STORE_DROPPED, true).apply()
     }
 
     private fun openSigner(): DeviceKeyStore.DeviceKey {
@@ -287,4 +311,9 @@ object WatTrackerApp {
 
     private const val PREFS_NAME = "wattracker_app_prefs"
     private const val KEY_DATA_SOURCE = "active_data_source"
+    private const val KEY_LEGACY_STORE_DROPPED = "legacy_credential_store_dropped"
+
+    /** The names the security-crypto store wrote; see [dropLegacyEncryptedStore]. */
+    private const val LEGACY_CREDENTIAL_PREFS = "wattracker_device_credential"
+    private const val LEGACY_CREDENTIAL_KEYSET_PREFS = "wattracker_device_credential_master"
 }

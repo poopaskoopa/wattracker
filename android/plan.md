@@ -45,7 +45,18 @@ to empty instead.
 
 Step 3 context: merged via PR #376 (landed through #403). Cloud and local pairing, the Settings screen, and the removed state (#153, `markRemoved()`). The review findings and their resolutions are on PR #376; the durable ones are: every type holding a bearer secret (`LocalCredentials`, `LocalRequest`, `LocalResponse`, `ActiveSession`) redacts it in `toString()`; the connector-token field is a password field; a local session cookie is reused only for the origin and token it was minted for; a local 401 reports `removed`, not `unpaired`.
 
-Step 2 context: merged via PR #304 (`4629ed5`). `CloudSession` (single-flight refresh, conservative two-strike revocation, generation-stamped cache writes), `CloudClient` plus a capped, redirect-free transport, the Room snapshot cache keyed on the server revision, the EncryptedSharedPreferences credential store, the forward-compatible JSON value model, and `WatTrackerApplication` wiring with Tink R8 keep rules and an exported Room schema — unit-tested against scripted responses.
+Step 2 context: merged via PR #304 (`4629ed5`). `CloudSession` (single-flight refresh, conservative two-strike revocation, generation-stamped cache writes), `CloudClient` plus a capped, redirect-free transport, the Room snapshot cache keyed on the server revision, the EncryptedSharedPreferences credential store, the forward-compatible JSON value model, and `WatTrackerApplication` wiring with Tink R8 keep rules and an exported Room schema — unit-tested against scripted responses. That last clause is history rather than the tree: #457 replaced that store on 2026-10-27, below.
+
+**Revised 2026-10-27 — #457: the credential store left `security-crypto`.** `androidx.security:security-crypto` 1.1.0 is deprecated with no further releases, and the credential store was the only user of it in the app. The production store is now `KeystoreDeviceCredentialStore`: the cloud binding and the desktop connector token as one JSON vault, wrapped by a 256-bit AES-GCM key generated in the Android Keystore that never leaves it (`CredentialKeyStore`), written to `files/wattracker_device_credentials`. The property the deprecated library was actually supplying was never Tink's -- it was that the key cannot be exported -- and the Keystore gives that directly, so the app now carries no crypto of its own choosing and the Tink `-dontwarn` keep rules left with the dependency.
+
+- **Envelope** `[IV][ciphertext][tag]`, with the vault's own purpose as GCM associated data: a credential file carried onto another vault (Auto Backup, a restore, a renamed copy) refuses to open even on the device whose key it would otherwise serve. The `data_extraction_rules.xml` excludes keep the two halves of an installation together; the associated data is the backstop if that ever fails.
+- The key is deliberately **not** StrongBox, unlike the signing key: losing a signing key costs a pairing code, while losing a credential key silently unpairs a working device, and StrongBox's slot and lifetime rules make "cannot be created" a live failure mode. `assertNonExportable` refuses an exportable key rather than quietly being weaker than it claims.
+- **Durability keeps the #304 shape**: temp file, fsync, atomic rename, and a write the filesystem refuses throws `CredentialStoreException` -- the "cache first, credential second" ordering only holds if that write survives.
+- **A vault that will not open** is left exactly where it is, the device reports unpaired, and the store now answers a three-way `health` question instead of a boolean: `Durable`, `Unavailable` (nothing can be wrapped, the store is in memory) or `UnreadableVault` (the key works, the file on disk does not). `SettingsScreen` shows the "cannot protect a saved pairing" warning for the first and a new "the pairing saved here could not be read; pairing again replaces it" for the second -- the one string that existed before described only the in-memory case, and #195's pairing screen inherits the same three-way question. A pairing written over a dead vault replaces it and clears the report.
+- **No migration, and no rider re-pairs.** No shipped build ever wrote the old format (no release has carried the encrypted store, and #199's internal testing starts on this branch), so `WatTrackerApplication.dropLegacyEncryptedStore` only deletes the two unreadable prefs files a developer or emulator install may still carry. The orphan Keystore entry that guarded the Tink keyset is left alone: unexportable, protecting nothing, reclaimed with the app -- naming another library's private alias is a worse coupling than the residue it clears.
+- `CloudSession` is untouched: the two-strike 404 revocation, `markRemoved()` and the `RemovalGate` retry behave exactly as #376 left them, and none of those tests changed.
+
+Verification: 252 JVM tests green, 15 of them new (`KeystoreDeviceCredentialStoreTest`: nothing in the clear on disk; a tampered, foreign-key or foreign-purpose vault refused *and left on disk*; "never paired" distinguished from "unreadable"; a pairing over a dead vault replacing it; both refused-write shapes (a path that cannot be opened, a rename that cannot land) thrown with no envelope left behind; the store never looking inside the envelope; the in-memory store admitting it is not durable). Each rule was then proved by mutation locally, one at a time: dropping the associated data reddened only the foreign-purpose vault, deleting the vault on a refusal reddened only "the file stays put", skipping the cipher reddened only "nothing in the clear", and ignoring a failed rename reddened only its own test. `:app:assembleDebug` and `:app:assembleRelease -PallowPlaceholderHost` assemble with the keep-rule file emptied, which is itself evidence that no Tink class is referenced any more. **Not verified: anything the Android Keystore itself does** -- key load and create, non-exportability, the provider-chosen IV, the on-device round trip -- because the JVM suite cannot reach it and the dependency rule bars Robolectric. A pair, relaunch, still-paired check on an emulator and on a physical device is owed before #199's internal testing: if the provider's IV convention turned out to differ from the documented one, the failure mode is a silent unpair, which is safe but must be seen.
 Step-1 context: #266 landed via **#294 (`ff1f2aa`)**; #193 is closed
 (tablet-in-portrait screenshot confirmed), #156 closed via #274; #102 (the
 hosting decision) remains an unexecuted runbook and alone gates the "real
@@ -2298,8 +2309,9 @@ inspection).
    (flag parity with the HTML calendar on the fixture month, month wrap,
    cutoff hiding).
 7. **Dep audit:** `./gradlew :app:dependencies` reviewed — only AndroidX,
-   Kotlin stdlib, room, security-crypto (and their transitive AndroidX). Any
-   other artifact fails the review.
+   Kotlin stdlib and room (and their transitive AndroidX). Any other artifact
+   fails the review, and since #457 so does seeing `security-crypto` or any Tink
+   artifact in the graph: the credential store is Keystore-only now.
 8. **Dev-loop evidence:** the implementer (or the IDE agent) runs at least the
    Step-1 build and an install+launch through the 0.4 loop (Agent mode in
    Android Studio, and/or the terminal `gradlew` + `adb` equivalents); record
@@ -2333,7 +2345,8 @@ inspection).
   silent 401. Mitigation: vectors + unit tests before any live call; the live
   harness refresh is the final proof.
 - **Local session = full account authority.** Read-only is app-side only;
-  token leak = full login. Mitigations: EncryptedSharedPreferences, no logs,
+  token leak = full login. Mitigations: the Keystore-wrapped credential vault
+  (#457; EncryptedSharedPreferences before it), no logs,
   prominent Revoke guidance, "remove this device" copy that doesn't overclaim.
   Accepted by the owner (the connector model is the explicit request);
   document in `android/README.md`.

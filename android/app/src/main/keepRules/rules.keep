@@ -5,16 +5,9 @@
 # 'Unknown option', naming this file and line. The AGP 9 keepRules source-set
 # convention is wired; rules added here will take effect.
 
-# security-crypto drags in Tink, which references annotation types it does not
-# bundle (errorprone annotations) and the JSR-305 concurrency/nullable
-# annotations (javax.annotation.*). None of that is retained in a release APK
-# -- it is only referenced from Tink's signatures -- so the classes are
-# legitimately absent. These are exactly the lines R8 emitted in
-# build/outputs/mapping/release/missing_rules.txt; adding the classes instead
-# would only bloat the APK with annotation stubs.
--dontwarn com.google.errorprone.annotations.CanIgnoreReturnValue
--dontwarn com.google.errorprone.annotations.CheckReturnValue
--dontwarn com.google.errorprone.annotations.Immutable
--dontwarn com.google.errorprone.annotations.RestrictedApi
--dontwarn javax.annotation.Nullable
--dontwarn javax.annotation.concurrent.GuardedBy
+# No rules are needed today, and the file stays to prove the path is live (see
+# above). The block that used to be here was seven -dontwarn lines for the
+# annotation types Tink referenced without bundling -- the transitive dependency
+# of androidx.security:security-crypto. #457 removed that library, so the
+# warnings have no source and the lines went with it. Room ships its own rules;
+# the Keystore and javax.crypto classes are platform code R8 never shrinks away.

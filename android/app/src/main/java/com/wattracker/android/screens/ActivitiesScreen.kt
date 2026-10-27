@@ -81,8 +81,8 @@ fun ActivitiesScreen(
     val context = LocalContext.current
     val activeSource by WatTrackerApp.dataSourceFlow.collectAsState()
 
-    // The read model waits on the app's blocking setup (Room, Keystore,
-    // EncryptedSharedPreferences), which runs off the main thread; it is
+    // The read model waits on the app's blocking setup (Room, the signing key,
+    // the credential vault), which runs off the main thread; it is
     // awaited here, never blocked on. A setup failure is shown, not thrown
     // into composition.
     val readModelResult by produceState<Result<ReadModel>?>(initialValue = null, activeSource) {
